@@ -445,12 +445,22 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         if crate::kernel::osd::is_open() {
             crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
         }
+        // Kernel-owned device IRQs are serviced before virtual-time/audio
+        // advancement. The remaining input/guest events retain their order for
+        // console routing below.
+        let events = crate::kernel::irq_dispatch::drain(machine);
         let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
         thread.personality.advance_world(machine, &mut ctx.regs);
         stats.part(machine, 0);
-        crate::kernel::console::drain(machine, &mut ctx.regs, &mut thread.kernel, &mut thread.personality);
+        crate::kernel::console::dispatch(
+            machine,
+            &mut ctx.regs,
+            &mut thread.kernel,
+            &mut thread.personality,
+            events,
+        );
         stats.part(machine, 1);
         thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.regs);
         stats.part(machine, 2);

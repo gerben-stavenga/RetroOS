@@ -1074,8 +1074,10 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
         }
         for (i, (l, r)) in frames[..run].iter().enumerate() {
-            let l = sat16((l * out_gain) >> 16);
-            let r = sat16((r * out_gain) >> 16);
+            let l = sat16(((i64::from(*l) * i64::from(out_gain)) >> 16)
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
+            let r = sat16(((i64::from(*r) * i64::from(out_gain)) >> 16)
+                .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
             bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
             bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
         }
@@ -1144,6 +1146,9 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
                 pc.vpic.raise(pc.sb.irq);
             }
         }
+        // MSI identities are kernel-owned and never map onto the guest's ISA
+        // PIC. An unclaimed one is spurious, not a guest interrupt line.
+        Irq::Msi(_) => {}
     }
 }
 

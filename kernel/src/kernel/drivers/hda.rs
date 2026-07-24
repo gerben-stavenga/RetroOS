@@ -77,7 +77,6 @@ const RIRBCTL: usize = 0x5C; // b8: bit1 RIRBDMAEN
 const RIRBSTS: usize = 0x5D; // b8: bit0 RINTFL (response interrupt), bit2 overrun
 const RIRBSIZE: usize = 0x5E; // b8: bits1:0 size (0b10 = 256 entries)
 const INTCTL: usize = 0x20; // d32: bit31 GIE, bit30 CIE, bits0..29 per-stream SIE
-const INTSTS: usize = 0x24; // d32: bit31 GIS, bits0..29 per-stream status (W1C-ish)
 const DPLBASE: usize = 0x70; // d32: DMA position buffer base; bit0 = enable
 const DPUBASE: usize = 0x74; // d32: DMA position buffer base high
 
@@ -175,10 +174,9 @@ static HDA: Mutex<Option<Hda>> = Mutex::new(None);
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// Canonical audio-sink IRQ line this controller's MSI is programmed to raise
-/// (an otherwise-unused ISA line so it can't alias a wired IRQ). The kernel's
-/// audio-IRQ router ([`crate::kernel::sound::on_hw_irq`]) matches on it.
-pub const MSI_LINE: u8 = 11;
+/// Kernel MSI identity allocated to the HDA sink. This is not an ISA IRQ/GSI
+/// line; the arch backend delivers it as `Irq::Msi(MSI_SOURCE)`.
+pub const MSI_SOURCE: u8 = 0;
 /// Set once bring-up successfully programmed MSI (always, on any real HDA
 /// machine — bring-up fails otherwise). Read by [`msi_active`].
 static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
@@ -277,6 +275,10 @@ struct Hda {
     /// clock by construction.
     written_src: u64,
     consumed_hw: u64,
+    /// Last modular hardware DMA byte position. Completion interrupts are
+    /// wakeups; this cursor delta, not the number of queued IRQ events, is the
+    /// authoritative amount consumed.
+    last_hw_pos: u32,
     /// Sparse runtime diagnostics for real hardware bring-up.
     logged_submit: bool,
     logged_run: bool,
@@ -520,7 +522,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // machine that never existed — skip the controller loudly rather than fall
     // back to polling. There is no real hardware to serve a polled HDA path.
     let msi = machine
-        .msi_alloc(MSI_LINE)
+        .msi_alloc(MSI_SOURCE)
         .is_some_and(|(addr, data)| crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data));
     if !msi {
         crate::println!(
@@ -592,6 +594,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         resample_acc: 0,
         written_src: 0,
         consumed_hw: 0,
+        last_hw_pos: 0,
         logged_submit: false,
         logged_run: false,
         diag_buffers: 0,
@@ -881,6 +884,7 @@ impl Hda {
         self.resample_acc = 0;
         self.written_src = 0;
         self.consumed_hw = 0;
+        self.last_hw_pos = 0;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
         // underrun) it must find silence, not a replay of the previous
@@ -1519,6 +1523,7 @@ impl Hda {
             // position read.
             self.written_src = 0;
             self.consumed_hw = 0;
+            self.last_hw_pos = 0;
             }
         let fb = fmt.frame_bytes();
         if fb == 0 {
@@ -1729,22 +1734,36 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
-/// Service a buffer-completion interrupt (canonical `Irq::Hw(MSI_LINE)` routed
-/// here by `sound::on_hw_irq`). Acknowledges the stream's completion status
-/// (SDSTS.BCIS, write-1-clear) and the controller INTSTS so the device can
-/// signal the next block. For now it only accounts the interrupt; the
-/// event-loop audio track will produce a block per call in the next step.
-pub fn on_irq() {
-    HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if let Some(dev) = HDA.lock().as_mut() {
-        w8(dev.sd + SDSTS, 0x04); // BCIS write-1-clear
-        w32(INTSTS, r32(INTSTS)); // clear latched stream-interrupt-status bits
-        // One IOC per buffer: each interrupt is exactly one buffer drained. This
-        // is the consumed clock the producer paces to — no SDLPIB poll needed.
-        if dev.running {
+/// Service a buffer-completion interrupt (`Irq::Msi(MSI_SOURCE)`, routed
+/// here by `sound::on_irq`). Acknowledges the stream's completion status
+/// (SDSTS.BCIS, write-1-clear), then advances consumption from the DMA
+/// position-buffer delta. Returns false for a vector delivery with no PCM
+/// completion source.
+pub fn on_irq() -> bool {
+    let mut guard = HDA.lock();
+    let Some(dev) = guard.as_mut() else { return false };
+    let status = r8(dev.sd + SDSTS);
+    if status & 0x04 == 0 {
+        return false;
+    }
+    if dev.running {
+        let ring = (NUM_BUF * BUF_BYTES) as u32;
+        let pos = dev.dma_pos() % ring;
+        let delta = (pos + ring - dev.last_hw_pos) % ring;
+        // A BCIS with an unchanged position can occur when the position buffer
+        // write has not become visible yet. One IOC describes at least one BDL
+        // entry, so use one buffer as the conservative fallback.
+        if delta == 0 {
             dev.consumed_hw += BUF_BYTES as u64;
+            dev.last_hw_pos = (dev.last_hw_pos + BUF_BYTES as u32) % ring;
+        } else {
+            dev.consumed_hw += delta as u64;
+            dev.last_hw_pos = pos;
         }
     }
+    w8(dev.sd + SDSTS, status & 0x1C); // W1C BCIS/FIFOE/DESE sources
+    HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    true
 }
 
 /// True once the HDA sink is up and driving production by completion IRQ. The
@@ -1762,7 +1781,7 @@ pub fn position() -> Option<(u64, u64)> {
     if dev.parked {
         return None;
     }
-    // `on_irq` maintains `consumed_hw` per completed buffer — no SDLPIB poll.
+    // `on_irq` maintains `consumed_hw` from DMA-position deltas.
     if dev.src_rate == 0 || dev.rate == 0 {
         return Some((dev.written_src, 0)); // no stream session yet
     }

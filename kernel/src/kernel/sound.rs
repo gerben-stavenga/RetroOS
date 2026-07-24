@@ -85,29 +85,40 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
     machine.inw(AUDIO_SIG) == SIGNATURE
 }
 
-/// Canonical audio-sink interrupt router. A hardware `Irq::Hw(line)` drained by
-/// any personality is offered here first: if `line` is the selected sink's
-/// completion interrupt, the sink services it and this returns `true` (the
-/// event is consumed, never forwarded to a guest). Cross-personality by design
-/// — the sink belongs to the kernel, not to whichever thread is focused.
-pub fn on_hw_irq<A: crate::Arch>(machine: &mut A, line: u8) -> bool {
+/// Canonical audio-sink interrupt router. Called by the kernel-global IRQ
+/// dispatcher before personality/console routing. The interrupt is a wakeup;
+/// each driver validates its status and reads its authoritative DMA cursor.
+pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
     use crate::kernel::platform::Audio;
-    match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda if line == crate::kernel::drivers::hda::MSI_LINE => {
-            crate::kernel::drivers::hda::on_irq();
-            true
+    match (crate::kernel::platform::get().audio, event) {
+        (Audio::EmulatedHda, crate::Irq::Msi(source))
+            if source == crate::kernel::drivers::hda::MSI_SOURCE =>
+        {
+            crate::kernel::drivers::hda::on_irq()
         }
-        Audio::EmulatedAc97 if Some(line) == crate::kernel::drivers::ac97::irq_line() => {
-            crate::kernel::drivers::ac97::on_irq(machine);
-            // Level INTx: the driver cleared the source above; re-unmask the line
-            // (the PIC path masked it on receipt — a no-op in APIC edge mode).
-            machine.rearm_irq(line);
-            true
+        (Audio::EmulatedAc97, crate::Irq::Hw(line))
+            if Some(line) == crate::kernel::drivers::ac97::irq_line() =>
+        {
+            let ours = crate::kernel::drivers::ac97::on_irq(machine);
+            if ours {
+                machine.rearm_irq(line);
+            }
+            ours
         }
-        Audio::RealSb if Some(line) == crate::kernel::drivers::sb16::irq_line() => {
-            crate::kernel::drivers::sb16::on_irq(machine);
-            machine.rearm_irq(line); // re-unmask the ISA line the sink owns
-            true
+        (Audio::EmulatedAc97, crate::Irq::Msi(source))
+            if crate::kernel::drivers::ac97::msi_active()
+                && source == crate::kernel::drivers::ac97::MSI_SOURCE =>
+        {
+            crate::kernel::drivers::ac97::on_irq(machine)
+        }
+        (Audio::RealSb, crate::Irq::Hw(line))
+            if Some(line) == crate::kernel::drivers::sb16::irq_line() =>
+        {
+            let ours = crate::kernel::drivers::sb16::on_irq(machine);
+            if ours {
+                machine.rearm_irq(line);
+            }
+            ours
         }
         _ => false,
     }
@@ -182,17 +193,12 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     }
 }
 
-/// Output pipe depth (playback latency), in source frames the producer keeps
-/// queued ahead of the sink's play cursor. This is UNIVERSAL — the same depth
-/// for every hardware sink (HDA, AC97, SB16), one latency knob, not a per-driver
-/// value. Below ~one framebuffer-blit period a present stall can underrun it
-/// (crackle); higher only adds latency. The sink's own buffer size is a separate
-/// concern (completion-IRQ granularity), never the pipe.
-const PIPE_MS: u32 = 12;
+/// Desired output pipe depth (playback latency), shared by every hardware sink.
+/// Below ~one framebuffer-blit period a present stall can underrun it.
+const PIPE_MS: u32 = 30;
 
-/// The universal pipe depth [`PIPE_MS`] in frames, or `None` when the active sink
-/// has no real-time consumer clock (hosted WAV / silent) — then production is
-/// virtual-time paced. Probed once per playback session.
+/// The universal [`PIPE_MS`] depth in frames, or `None` when the active sink
+/// has no real-time consumer clock. Probed once per playback session.
 pub fn min_fill(rate: u32) -> Option<u32> {
     use crate::kernel::platform::Audio;
     let present = match crate::kernel::platform::get().audio {

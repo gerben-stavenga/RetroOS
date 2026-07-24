@@ -409,6 +409,15 @@ pub(super) fn cli() {
     }
 }
 
+#[inline]
+pub(super) fn interrupts_enabled() -> bool {
+    let flags: u32;
+    unsafe {
+        asm!("pushfd", "pop {0:e}", out(reg) flags, options(nomem));
+    }
+    flags & (1 << 9) != 0
+}
+
 /// Halt CPU until next interrupt
 #[inline]
 pub fn hlt() {

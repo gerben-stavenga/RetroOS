@@ -83,6 +83,7 @@ impl Arch for Metal {
     fn rearm_irq(&mut self, line: u8) { super::calls::arch_rearm_irq(line) }
     fn msi_alloc(&mut self, source: u8) -> Option<(u64, u32)> { super::irq::msi_target(source) }
     fn route_device_irq(&mut self, line: u8) { super::irq::route_device_irq(line) }
+    fn route_isa_irq(&mut self, line: u8) { super::irq::route_isa_irq(line) }
     fn set_debug_watch(&mut self, addrs: Option<(u32, u32)>) { super::calls::arch_set_debug_watch(addrs) }
 
     // ── Arch calls: paging / fork / LDT / DMA ──

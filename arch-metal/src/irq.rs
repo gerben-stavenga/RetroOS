@@ -25,6 +25,11 @@ pub const IRQ_OFFSET: u8 = 32;
 /// constructs and queues these.
 pub use arch_abi::Irq;
 
+/// Private IDT range reserved for kernel MSI sources. These gates are DPL0,
+/// unlike the guest-callable software-interrupt range below them.
+pub const MSI_VECTOR_BASE: u8 = 0xF8;
+pub const MSI_SOURCE_COUNT: u8 = 8;
+
 /// Global IRQ event queue for discrete events (keyboard).
 /// Timer ticks use a separate counter to avoid flooding and evicting keys.
 static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Tick);
@@ -42,9 +47,21 @@ static mut MOUSE_PACKET: [u8; 3] = [0; 3];
 static mut MOUSE_PACKET_IDX: u8 = 0;
 
 /// Drain all queued IRQ events, calling f for each.
-pub fn drain(f: impl FnMut(Irq)) {
+pub fn drain(mut f: impl FnMut(Irq)) {
+    // The ring-0 interrupt top half writes QUEUE while the ring-1 kernel drains
+    // it. Move into a local under a short interrupt mask, then restore IF before
+    // invoking arbitrary kernel callbacks.
+    let mut events = [Irq::Tick; 256];
+    let restore_if = crate::x86::interrupts_enabled();
+    crate::x86::cli();
     let q = &raw mut QUEUE;
-    unsafe { (*q).drain(f); }
+    let n = unsafe { (*q).read(&mut events) };
+    if restore_if {
+        crate::x86::sti();
+    }
+    for event in events.into_iter().take(n) {
+        f(event);
+    }
 }
 
 /// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
@@ -329,6 +346,9 @@ fn legacy_intr_and_pit() {
 const IOAPIC_PHYS: u64 = 0xFEC0_0000;
 const IOAPIC_MMIO_VA: usize = 0xFFF0_2000; // next page after LAPIC (F0000)/HPET (F1000)
 static mut IOAPIC_READY: bool = false;
+/// GSI lines configured as level-triggered PCI INTx. Their redirection entries
+/// are masked in the top half until the kernel driver clears the device source.
+static mut IOAPIC_LEVEL_LINES: u32 = 0;
 
 /// Indirect register access: select the register via IOREGSEL (+0x00), then
 /// read/write its value through IOWIN (+0x10).
@@ -336,6 +356,27 @@ fn ioapic_write(reg: u32, val: u32) {
     unsafe {
         core::ptr::write_volatile(IOAPIC_MMIO_VA as *mut u32, reg);
         core::ptr::write_volatile((IOAPIC_MMIO_VA + 0x10) as *mut u32, val);
+    }
+}
+
+fn ioapic_read(reg: u32) -> u32 {
+    unsafe {
+        core::ptr::write_volatile(IOAPIC_MMIO_VA as *mut u32, reg);
+        core::ptr::read_volatile((IOAPIC_MMIO_VA + 0x10) as *const u32)
+    }
+}
+
+fn ioapic_mask(gsi: u8, masked: bool) {
+    let restore_if = crate::x86::interrupts_enabled();
+    crate::x86::cli();
+    let idx = 0x10 + 2 * gsi as u32;
+    let low = ioapic_read(idx);
+    ioapic_write(
+        idx,
+        if masked { low | (1 << 16) } else { low & !(1 << 16) },
+    );
+    if restore_if {
+        crate::x86::sti();
     }
 }
 
@@ -356,7 +397,9 @@ fn bsp_apic_id() -> u32 {
 /// destination, edge-triggered, active-high, unmasked. ISA IRQs map 1:1 to GSIs
 /// for the keyboard (1) and mouse (12); the timer (often overridden to GSI2) is
 /// not routed here — the LAPIC timer owns the tick.
-fn ioapic_route(gsi: u8, vector: u8) {
+fn ioapic_route(gsi: u8, vector: u8, level_low: bool) {
+    let restore_if = crate::x86::interrupts_enabled();
+    crate::x86::cli();
     unsafe {
         if !IOAPIC_READY {
             map_mmio_page(IOAPIC_MMIO_VA, IOAPIC_PHYS);
@@ -366,9 +409,13 @@ fn ioapic_route(gsi: u8, vector: u8) {
     let idx = 0x10 + 2 * gsi as u32;
     // High dword: destination APIC ID in bits 56-63 (bits 24-31 of this word).
     ioapic_write(idx + 1, bsp_apic_id() << 24);
-    // Low dword: vector in bits 0-7; all other fields 0 (fixed / physical /
-    // edge / active-high) and bit 16 (mask) clear = unmasked.
-    ioapic_write(idx, vector as u32);
+    // Low dword: vector, fixed/physical delivery, unmasked. PCI INTx uses
+    // polarity-low (bit13) + level-triggered (bit15); ISA uses edge/high.
+    let electrical = if level_low { (1 << 13) | (1 << 15) } else { 0 };
+    ioapic_write(idx, vector as u32 | electrical);
+    if restore_if {
+        crate::x86::sti();
+    }
 }
 
 /// Probe whether an 8042 keyboard controller is present. A board with no i8042
@@ -429,7 +476,7 @@ pub fn init_interrupts() {
         let _ = inb(0x60);
     }
     if apic {
-        ioapic_route(1, IRQ_OFFSET + 1); // keyboard GSI1
+        ioapic_route(1, IRQ_OFFSET + 1, false); // keyboard GSI1
     } else {
         unmask_irq(1);
     }
@@ -442,9 +489,9 @@ pub fn init_interrupts() {
         // it: ISA IRQs map 1:1 to GSIs, and the IOAPIC entries are edge-
         // triggered like the 8259, so an idle line costs nothing.
         if apic {
-            ioapic_route(12, IRQ_OFFSET + 12); // mouse GSI12
-            ioapic_route(5, IRQ_OFFSET + 5);   // ISA SB (QEMU sb16 default)
-            ioapic_route(7, IRQ_OFFSET + 7);   // ISA SB alternate line
+            ioapic_route(12, IRQ_OFFSET + 12, false); // mouse GSI12
+            ioapic_route(5, IRQ_OFFSET + 5, false);   // ISA SB (QEMU sb16 default)
+            ioapic_route(7, IRQ_OFFSET + 7, false);   // ISA SB alternate line
         } else {
             unmask_irq(12);
             unmask_irq(5);
@@ -638,7 +685,18 @@ pub fn timer_selftest(screen: &mut lib::vga::Screen) {
 
 /// Handle an IRQ: PIC ACK, read hardware data, push typed event to queue.
 pub fn handle_irq(regs: &mut Regs) {
-    let irq = (regs.int_num - IRQ_OFFSET as u64) as u8;
+    let vector = regs.int_num as u8;
+    if vector >= MSI_VECTOR_BASE {
+        let source = vector - MSI_VECTOR_BASE;
+        unsafe {
+            let q = &raw mut QUEUE;
+            (*q).push(Irq::Msi(source));
+        }
+        // MSI is LAPIC-delivered and edge-triggered.
+        lapic_write(LAPIC_EOI, 0);
+        return;
+    }
+    let irq = vector - IRQ_OFFSET;
 
     // APIC mode: the tick is the LAPIC timer (vector 0x20 from the local APIC)
     // and keyboard/mouse arrive through the I/O APIC — the 8259 is bypassed
@@ -646,6 +704,14 @@ pub fn handle_irq(regs: &mut Regs) {
     // the PIC mask/ack dance below applies. (`lapic_timer_active()` is the
     // APIC-mode flag: it is set iff setup_lapic_timer succeeded.)
     if lapic_timer_active() {
+        let level_line = irq < 32
+            && unsafe { core::ptr::read_volatile(&raw const IOAPIC_LEVEL_LINES) }
+                & (1u32 << irq) != 0;
+        if level_line {
+            // Prevent a level source from immediately retriggering after EOI;
+            // the deferred kernel driver clears it, then `rearm_irq` unmasks.
+            ioapic_mask(irq, true);
+        }
         match irq {
             0 => {
                 unsafe {
@@ -726,43 +792,66 @@ pub fn handle_irq(regs: &mut Regs) {
 /// ack `Irq::Hw` line). Called from the kernel once the guest has acked
 /// the device so the next interrupt can be delivered.
 pub fn rearm_irq(irq: u8) {
-    // APIC mode delivers Hw lines edge-triggered through the IOAPIC and acks
-    // inline (LAPIC EOI in handle_irq) — nothing was masked, and the bypassed
-    // 8259's IMR is not ours to touch.
     if lapic_timer_active() {
+        if irq < 32
+            && unsafe { core::ptr::read_volatile(&raw const IOAPIC_LEVEL_LINES) }
+                & (1u32 << irq) != 0
+        {
+            ioapic_mask(irq, false);
+        }
         return;
     }
     unmask_irq(irq);
 }
 
-/// Build an MSI `(message_address, message_data)` that delivers `source` as
-/// vector `IRQ_OFFSET + source`, i.e. straight into `handle_irq`'s generic
-/// `Irq::Hw(source)` arm (APIC branch: read device, single LAPIC EOI). MSI is
+/// Build an MSI `(message_address, message_data)` that delivers `source` as a
+/// private kernel vector and queues `Irq::Msi(source)`. MSI is
 /// edge-triggered and LAPIC-delivered, so it needs no PIC mask/unmask and no
-/// IOAPIC routing — only that the LAPIC is up. `source` must be an otherwise
-/// unused line so it doesn't alias a wired ISA IRQ.
+/// IOAPIC routing — only that the LAPIC is up. `source` is an identity in the
+/// backend's private MSI namespace.
 ///
 /// xAPIC physical-mode format: address `0xFEE0_0000 | (apic_id << 12)`, data =
 /// the low-8-bit vector (delivery mode fixed, edge). Returns `None` in PIC-only
 /// mode (no LAPIC → MSI cannot be delivered; the device must fall back to a
 /// wired line or polling).
 pub fn msi_target(source: u8) -> Option<(u64, u32)> {
-    if !lapic_timer_active() {
+    if !lapic_timer_active() || source >= MSI_SOURCE_COUNT {
         return None;
     }
     let addr = LAPIC_PHYS | ((bsp_apic_id() as u64) << 12);
-    let data = (IRQ_OFFSET + source) as u32;
+    let data = (MSI_VECTOR_BASE + source) as u32;
     Some((addr, data))
 }
 
-/// Route and unmask a wired device IRQ `line` so it reaches the CPU — the same
-/// legacy path the fixed ISA lines take at init: an IOAPIC entry in APIC mode,
-/// an 8259 unmask in PIC mode. Routed edge-triggered like the ISA lines; a level
-/// PCI-INTx source is deasserted by the driver clearing its status register in
-/// its interrupt handler, so no level-trigger IOAPIC setup is needed.
+/// Route and unmask a PCI INTx line. INTx is level-triggered, active-low at the
+/// I/O APIC. The top half masks it before EOI; the deferred driver clears the
+/// device source and calls `rearm_irq` to unmask it.
 pub fn route_device_irq(line: u8) {
     if lapic_timer_active() {
-        ioapic_route(line, IRQ_OFFSET + line);
+        ioapic_route(line, IRQ_OFFSET + line, true);
+        if line < 32 {
+            unsafe {
+                let p = &raw mut IOAPIC_LEVEL_LINES;
+                core::ptr::write_volatile(p, core::ptr::read_volatile(p) | (1u32 << line));
+            }
+        }
+    } else {
+        // PCI-to-ISA bridges present INTx to the 8259 as a level-triggered IRQ.
+        // Program the Edge/Level Control Register before unmasking it.
+        let (elcr, bit) = if line < 8 {
+            (0x4D0, line)
+        } else {
+            (0x4D1, line - 8)
+        };
+        outb(elcr, inb(elcr) | (1 << bit));
+        unmask_irq(line);
+    }
+}
+
+/// Route and unmask an ISA edge-triggered, active-high line.
+pub fn route_isa_irq(line: u8) {
+    if lapic_timer_active() {
+        ioapic_route(line, IRQ_OFFSET + line, false);
     } else {
         unmask_irq(line);
     }

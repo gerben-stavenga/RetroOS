@@ -7,9 +7,9 @@
 //!
 //! It drives the real DSP for **16-bit signed-stereo auto-init DMA** on the ISA
 //! 8237 (channel 5) — the SB16's own double-buffer scheme, where each completed
-//! block raises **IRQ 5**. That block-completion interrupt IS the event-driven
-//! audio track's completion signal: one interrupt = one buffer drained/free, so
-//! `on_irq` is a plain block counter and the driver never reads a DMA position.
+//! block raises **IRQ 5**. The interrupt wakes the event-driven audio track;
+//! `on_irq` then reads the live 8237 cursor, so delayed/coalesced delivery does
+//! not turn an event count into a false playback position.
 //!
 //! Only machine *primitives* are used — port I/O (`inb`/`outb`, for the DSP,
 //! mixer, and the 8237), `dma_channel_buf` (the permanent contiguous channel-5
@@ -32,12 +32,14 @@ const DSP_RSTAT: u16 = BASE + 0x0E; // read-buffer status (bit7 = data ready) / 
 const DSP_ACK16: u16 = BASE + 0x0F; // 16-bit IRQ acknowledge
 const MIX_IDX: u16 = BASE + 0x04;
 const MIX_DATA: u16 = BASE + 0x05;
+const MIX_IRQ_STATUS: u8 = 0x82;
+const MIX_IRQ_16BIT: u8 = 1 << 1;
 
 // DSP commands.
 const CMD_SPEAKER_ON: u8 = 0xD1;
 const CMD_SET_RATE_OUT: u8 = 0x41; // output rate, big-endian 16-bit
 const CMD_16BIT_AUTO_OUT: u8 = 0xB6; // 16-bit, auto-init, FIFO, D/A
-const CMD_EXIT_AUTO_16: u8 = 0xD9; // finish the current block then stop
+const CMD_HALT_AUTO_16: u8 = 0xD5; // halt 16-bit DMA immediately
 // Mono, signed (bit4 = signed, bit5 = stereo). QEMU's sb16 does not honour the
 // DSP stereo bit on the 16-bit auto-init path — it plays the interleaved buffer
 // as mono, which comes out at half speed / doubled — so the sink downmixes to
@@ -67,7 +69,9 @@ const BUF_BYTES: usize = 0x200; // 512 B = 256 mono samples ≈ 5.8 ms @ 44.1 kH
 const BUF_FRAMES: usize = BUF_BYTES / 2;
 const NUM_BUF: usize = 32;
 const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
-/// Prime this many buffers before starting the DSP.
+/// Prime at least two completion blocks before starting the DSP. The shared
+/// 30-ms pipe normally submits five blocks on its first pass; `submit` starts
+/// only after that whole pass is in memory, rather than halfway through it.
 const PRIME_BUFS: usize = 2;
 
 struct Sb16 {
@@ -79,18 +83,23 @@ struct Sb16 {
     rate: u32,      // last programmed sample rate
     /// Pipe counters for [`position`], in source frames (the DAC runs at the
     /// source rate — no resampler). `written` = frames accepted by `submit`;
-    /// `consumed_bufs` = buffers the DSP has finished, one per completion IRQ.
+    /// `consumed_frames` comes from the live 8237 cursor whenever an IRQ wakes
+    /// the driver; IRQ event counts themselves are not trusted.
     written: u64,
-    consumed_bufs: u64,
+    consumed_frames: u64,
+    last_dma_pos: u32,
 }
 
 static SB16: Mutex<Option<Sb16>> = Mutex::new(None);
 static PRESENT: AtomicBool = AtomicBool::new(false);
+/// Diagnostic: times the play cursor caught the write cursor (underrun → the
+/// DSP replays stale ring data since auto-init has no LVI gate → a click).
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// The IRQ line the card raises on block completion (read from the mixer at
-/// bring-up), so `sound::on_hw_irq` can match it. 0xFF until up.
+/// bring-up), so `sound::on_irq` can match it. 0xFF until up.
 static IRQ_LINE: AtomicU32 = AtomicU32::new(0xFF);
 
-/// The routed completion-IRQ line, for `sound::on_hw_irq`. `None` until up.
+/// The routed completion-IRQ line, for `sound::on_irq`. `None` until up.
 pub fn irq_line() -> Option<u8> {
     match IRQ_LINE.load(Ordering::Relaxed) {
         0xFF => None,
@@ -163,6 +172,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> bool {
         return false;
     }
     let irq = read_irq(machine);
+    machine.route_isa_irq(irq);
 
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
@@ -190,7 +200,8 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> bool {
         running: false,
         rate: 0,
         written: 0,
-        consumed_bufs: 0,
+        consumed_frames: 0,
+        last_dma_pos: 0,
     });
     IRQ_LINE.store(irq as u32, Ordering::Relaxed);
     crate::println!("sb16: {:#05x} DSP up, IRQ {}, DMA {}", BASE, irq, DMA_CHANNEL);
@@ -227,6 +238,7 @@ impl Sb16 {
         machine.outb(DMA5_COUNT, (words - 1) as u8);
         machine.outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
         machine.outb(DMA5_MASK, 0x01); // unmask channel 5
+        self.last_dma_pos = 0;
 
         // DSP block length in 16-bit samples − 1 (one buffer per IRQ). Mono, so
         // a buffer is BUF_FRAMES samples.
@@ -257,10 +269,14 @@ impl Sb16 {
             if self.cur_off >= BUF_BYTES {
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
                 self.cur_off = 0;
-                if !self.running && self.cur_buf >= PRIME_BUFS {
-                    self.start(machine);
-                }
             }
+        }
+        // Do not start from inside the copy loop. QEMU is allowed to schedule
+        // DMA as soon as B6 is issued; starting after buffer two while the same
+        // call is still filling buffers three through five lets playback race
+        // the initial producer burst.
+        if !self.running && self.written >= (PRIME_BUFS * BUF_FRAMES) as u64 {
+            self.start(machine);
         }
     }
 }
@@ -273,40 +289,108 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
-/// Service a block-completion interrupt (canonical `Irq::Hw(irq_line())` routed
-/// here by `sound::on_hw_irq`). One interrupt = one buffer drained, so it just
-/// advances the consumed clock and acknowledges the DSP's 16-bit IRQ latch.
-/// No DMA counter is read — the interrupt itself is the completion signal.
-pub fn on_irq<A: crate::Arch>(machine: &mut A) {
+fn dma_count<A: crate::Arch>(machine: &mut A) -> u16 {
+    machine.outb(DMA5_CLRFF, 0);
+    let lo = machine.inb(DMA5_COUNT) as u16;
+    let hi = machine.inb(DMA5_COUNT) as u16;
+    (hi << 8) | lo
+}
+
+fn dma_pos_bytes<A: crate::Arch>(machine: &mut A) -> u32 {
+    let words = (RING_BYTES / 2) as u32;
+    // The 8237 exposes the count as two independently read bytes while DMA is
+    // live. Around a low-byte borrow, one pair can be torn and appear to jump
+    // almost a whole ring. Two nearby complete samples must differ by only a
+    // handful of transfers; retry a few times and use the newest stable one.
+    let mut count = dma_count(machine);
+    for _ in 0..3 {
+        let next = dma_count(machine);
+        let forward = (count as u32 + words - next as u32) % words;
+        count = next;
+        if forward <= 32 {
+            break;
+        }
+    }
+    ((words - 1).wrapping_sub(count as u32) % words) * 2
+}
+
+fn update_cursor<A: crate::Arch>(dev: &mut Sb16, machine: &mut A) -> (u32, u32) {
+    let ring = RING_BYTES as u32;
+    let pos = dma_pos_bytes(machine);
+    let delta = (pos + ring - dev.last_dma_pos) % ring;
+    if delta != 0 {
+        dev.consumed_frames += (delta / 2) as u64;
+        dev.last_dma_pos = pos;
+    }
+    (pos, delta)
+}
+
+/// Service a block-completion interrupt. The mixer status distinguishes our
+/// 16-bit DMA source on a potentially shared ISA line; the live 8237 cursor
+/// supplies authoritative progress when the IRQ wakes the driver.
+pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
+    machine.outb(MIX_IDX, MIX_IRQ_STATUS);
+    if machine.inb(MIX_DATA) & MIX_IRQ_16BIT == 0 {
+        return false;
+    }
     let mut g = SB16.lock();
     if let Some(dev) = g.as_mut() {
         if dev.running {
-            dev.consumed_bufs += 1;
+            // The IRQ is a wakeup, not an additional unit of elapsed time.
+            // `position()` may already have observed this exact DMA cursor;
+            // inventing a block when delta==0 moves last_dma_pos ahead of the
+            // hardware and makes the next read look like a near-full-ring wrap.
+            let (pos, delta) = update_cursor(dev, machine);
+            // Diagnostic: has the play cursor reached the write cursor? (queued
+            // buffers ≤ 0 → the next buffers the DSP plays are stale.)
+            if dev.written <= dev.consumed_frames {
+                let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 || n % 64 == 0 {
+                    crate::println!(
+                        "sb16: underrun #{} written={} consumed={} dma_pos={} delta={}",
+                        n, dev.written, dev.consumed_frames, pos, delta
+                    );
+                }
+            }
         }
     }
     let _ = machine.inb(DSP_ACK16); // acknowledge the 16-bit completion IRQ
+    true
 }
 
 /// Pipe counters for `sound::position`, in source frames: `written` accepted,
-/// and `consumed` = finished buffers × frames-per-buffer (from the IRQ count).
+/// and `consumed` from the monotonicized live 8237 DMA cursor.
 pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
-    let _ = machine;
-    let g = SB16.lock();
-    let dev = g.as_ref()?;
-    Some((dev.written, dev.consumed_bufs * BUF_FRAMES as u64))
+    let mut g = SB16.lock();
+    let dev = g.as_mut()?;
+    if dev.running {
+        // ISA DSP interrupt latches can coalesce while auto-init DMA continues.
+        // The IRQ remains the wakeup/ack path, but this cheap 8237 read prevents
+        // a delayed latch service from hiding several already-consumed blocks.
+        update_cursor(dev, machine);
+    }
+    Some((dev.written, dev.consumed_frames))
 }
 
-/// Producer went idle. `park` ends the session: stop auto-init and reset counters.
-pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
+/// Producer went idle: halt DMA, reset the DSP state machine, and start the
+/// next session from a clean, silent ring. Reset is deliberate here: a bare
+/// D5 pause leaves a subsequent B6 auto-init command dependent on clone-specific
+/// pause/continue state.
+pub fn stop<A: crate::Arch>(machine: &mut A, _park: bool) {
     let mut g = SB16.lock();
     let Some(dev) = g.as_mut() else { return };
-    if park && dev.running {
-        dsp_write(machine, CMD_EXIT_AUTO_16);
+    if dev.running {
+        dsp_write(machine, CMD_HALT_AUTO_16);
         machine.outb(DMA5_MASK, 0x05); // mask channel 5
-        dev.running = false;
-        dev.cur_buf = 0;
-        dev.cur_off = 0;
-        dev.written = 0;
-        dev.consumed_bufs = 0;
     }
+    let _ = dsp_reset(machine);
+    dsp_write(machine, CMD_SPEAKER_ON);
+    dev.running = false;
+    dev.rate = 0;
+    dev.cur_buf = 0;
+    dev.cur_off = 0;
+    dev.written = 0;
+    dev.consumed_frames = 0;
+    dev.last_dma_pos = 0;
+    unsafe { core::ptr::write_bytes(dev.dma_va as *mut u8, 0, RING_BYTES) };
 }

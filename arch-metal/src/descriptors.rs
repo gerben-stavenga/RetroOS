@@ -451,17 +451,19 @@ pub fn setup_descriptor_tables(kernel_stack_top: u32) {
         //            which are DPL=3 so user `INT3`/`INTO` can reach them. Vector
         //            5 (#BR) is CPU-raised by BOUND and stays DPL=0.
         // 0x20-0x2F: PIC IRQs (DPL=0)
-        // 0x30-0xFF: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI, 0xF0 VM86 stubs
+        // 0x30-0xF7: user-callable (DPL=3) — includes 0x80 syscall, 0x31 DPMI,
+        //             0xF0 VM86 stubs
+        // 0xF8-0xFF: kernel-only MSI vectors
         let vector_base_32 = int_vector.as_ptr() as u32;
         for i in 0..256 {
-            let dpl = if i == 3 || i == 4 || i >= 0x30 { 3 } else { 0 };
+            let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
             let handler = vector_base_32 + (i as u32) * 8;
             IDT32.entries[i] = IdtEntry32::interrupt_gate(handler, dpl);
         }
 
         // Setup 64-bit IDT entries (same vector table, same DPL policy)
         for i in 0..256 {
-            let dpl = if i == 3 || i == 4 || i >= 0x30 { 3 } else { 0 };
+            let dpl = if i == 3 || i == 4 || (0x30..0xF8).contains(&i) { 3 } else { 0 };
             let handler = vector_base_32 + (i as u32) * 8;
             IDT64.entries[i] = IdtEntry64::interrupt_gate(handler, dpl);
         }

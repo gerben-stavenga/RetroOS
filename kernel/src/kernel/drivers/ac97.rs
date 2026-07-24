@@ -44,6 +44,7 @@ const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 
 // NABM (Native Audio Bus Master, BAR1): the DMA engine. PCM-Out ("PO") channel.
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
+const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
 const PO_SR: u16 = 0x16; // 16-bit: status; bit2 LVBCI, bit3 BCIS, bit4 FIFOE (W1C)
 const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset, bit4 IOCE)
@@ -93,25 +94,34 @@ struct Ac97 {
     rate: u32,      // last programmed sample rate (Hz)
     /// Pipe counters for [`position`] (the DAC runs at the source rate — no
     /// resampler — so these are directly in source frames). `written` counts
-    /// frames accepted by `submit`; `consumed_bufs` counts completed ring
-    /// buffers, one per completion interrupt (`on_irq`).
+    /// frames accepted by `submit`; `consumed_bufs` accumulates completed ring
+    /// buffers from hardware CIV deltas observed when an IRQ wakes the driver.
     written: u64,
     consumed_bufs: u64,
+    last_civ: u8,
 }
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
 static PRESENT: AtomicBool = AtomicBool::new(false);
+/// Private kernel MSI identity used when the controller exposes MSI.
+pub const MSI_SOURCE: u8 = 1;
+static MSI_ON: AtomicBool = AtomicBool::new(false);
 /// The wired IRQ line the codec's INTx was routed to (from PCI config 0x3C), so
 /// the canonical audio-IRQ router can match it. 0xFF until bring-up. Production
 /// is always driven from this interrupt — there is no polled model.
 static IRQ_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0xFF);
 
-/// The routed completion-IRQ line, for `sound::on_hw_irq`. `None` until up.
+/// The routed completion-IRQ line, for `sound::on_irq`. `None` when MSI is used
+/// or until bring-up has selected the INTx fallback.
 pub fn irq_line() -> Option<u8> {
     match IRQ_LINE.load(Ordering::Relaxed) {
         0xFF => None,
         n => Some(n as u8),
     }
+}
+
+pub fn msi_active() -> bool {
+    MSI_ON.load(Ordering::Relaxed)
 }
 
 /// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI, via the
@@ -142,21 +152,31 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
 
-    // Discover the wired completion IRQ (PCI INTx). Firmware programmed the
-    // Interrupt Line register (config 0x3C low byte) with the line it routed the
-    // device's pin to; route+unmask it and drive production from it. If it is
-    // unprogrammed (0/0xFF), stay on the polled CIV path.
-    let line = (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
-    if !(1..=15).contains(&line) {
-        crate::println!(
-            "ac97: {:02x}:{:02x}.{} no INTx line — required for the sink; skipping",
-            bus, dev, func
-        );
-        return false;
+    // Prefer a namespace-safe MSI. Older AC'97 controllers commonly lack the
+    // capability, so retain INTx as a fallback; that path still depends on the
+    // firmware's Interrupt Line value until ACPI PCI routing is available.
+    let msi = machine
+        .msi_alloc(MSI_SOURCE)
+        .is_some_and(|(addr, data)| {
+            crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data)
+        });
+    if msi {
+        MSI_ON.store(true, Ordering::Relaxed);
+        crate::println!("ac97: {:02x}:{:02x}.{} MSI on", bus, dev, func);
+    } else {
+        let line =
+            (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
+        if !(1..=15).contains(&line) {
+            crate::println!(
+                "ac97: {:02x}:{:02x}.{} no MSI/INTx route; skipping",
+                bus, dev, func
+            );
+            return false;
+        }
+        machine.route_device_irq(line);
+        IRQ_LINE.store(line as u32, Ordering::Relaxed);
+        crate::println!("ac97: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
     }
-    machine.route_device_irq(line);
-    IRQ_LINE.store(line as u32, Ordering::Relaxed);
-    crate::println!("ac97: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
 
     let nam = (crate::kernel::pci::read32(machine, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
     let nabm = (crate::kernel::pci::read32(machine, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
@@ -216,6 +236,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         rate: 0,
         written: 0,
         consumed_bufs: 0,
+        last_civ: 0,
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
@@ -315,24 +336,32 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     if !dev.running {
         return Some((dev.written, 0));
     }
-    // `on_irq` maintains `consumed_bufs` per completed buffer, so there is no
-    // poll here — buffer-granular consumed is what the deficit producer needs.
+    // `on_irq` maintains `consumed_bufs` from CIV deltas, so position itself
+    // performs no hardware polling.
     let frames_per_buf = (BUF_BYTES / 4) as u64;
     Some((dev.written, dev.consumed_bufs * frames_per_buf))
 }
 
 /// Service a PCM-out completion interrupt (canonical `Irq::Hw(irq_line())`
-/// routed here by `sound::on_hw_irq`). Accumulates the consumed-buffer clock
-/// from the CIV delta and clears the status register so the level INTx pin
-/// deasserts (the caller then rearms the line). Robust to coalesced interrupts
-/// because it reads the true current index, not a fixed +1.
-pub fn on_irq<A: crate::Arch>(machine: &mut A) {
+/// routed here by `sound::on_irq`). The interrupt is only a wakeup:
+/// consumption comes from the hardware CIV delta, so delayed/coalesced IRQs do
+/// not permanently skew the playback clock. Returns false when a shared INTx
+/// line fired for another device.
+pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
     let mut g = AC97.lock();
-    let Some(dev) = g.as_mut() else { return };
-    if dev.running {
-        dev.consumed_bufs += 1; // one buffer per completion interrupt — no CIV poll
+    let Some(dev) = g.as_mut() else { return false };
+    let status = machine.inw(dev.nabm + PO_SR);
+    if status & PO_SR_INTR == 0 {
+        return false;
     }
-    machine.outw(dev.nabm + PO_SR, PO_SR_INTR); // clear LVBCI|BCIS|FIFOE (W1C)
+    if dev.running {
+        let civ = machine.inb(dev.nabm + PO_CIV) % NUM_BUF as u8;
+        dev.consumed_bufs +=
+            ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
+        dev.last_civ = civ;
+    }
+    machine.outw(dev.nabm + PO_SR, status & PO_SR_INTR);
+    true
 }
 
 /// Minimum pipe fill for a position-slaved producer, in source frames: the
@@ -345,4 +374,3 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) {
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
-

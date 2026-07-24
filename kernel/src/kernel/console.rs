@@ -21,35 +21,38 @@ use crate::kernel::thread;
 /// F12 scancode (press) — open the host monitor.
 pub const F12_PRESS: u8 = 0x58;
 
-/// Drain pending input into the console owner.
-pub fn drain<A: crate::Arch>(
+/// Route already-drained input/guest events into the console owner. Kernel
+/// device IRQs were consumed earlier by `irq_dispatch`.
+pub fn dispatch<A: crate::Arch>(
     machine: &mut A,
     regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
+    events: alloc::vec::Vec<crate::Irq>,
 ) {
     match personality {
         thread::Personality::Dos(dos) => {
             let blocked = kt.state == thread::ThreadState::Blocked;
-            drain_dos(machine, regs, blocked, dos);
+            dispatch_dos(machine, regs, blocked, dos, events);
         }
-        thread::Personality::Linux(linux) => drain_linux(machine, regs, kt, linux),
+        thread::Personality::Linux(linux) => {
+            dispatch_linux(machine, regs, kt, linux, events)
+        }
     }
 }
 
 /// DOS owner: `blocked` selects the stdin-pipe path (owner is wait4-parked
 /// behind a foreground Linux child).
-fn drain_dos<A: crate::Arch>(
+fn dispatch_dos<A: crate::Arch>(
     machine: &mut A,
     regs: &mut Regs,
     blocked: bool,
     dos: &mut thread::DosState<A>,
+    events: alloc::vec::Vec<crate::Irq>,
 ) {
     let dp = dos as *mut thread::DosState<A>;
     {
-        let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
-        machine.drain(&mut |evt| _events.push(evt));
-        for evt in _events {
+        for evt in events {
         if let crate::Irq::Key(sc) = evt {
             if monitor_key(machine, regs, sc, Some(unsafe { &*dp })) {
                 continue; // eaten by the F12 monitor
@@ -67,13 +70,6 @@ fn drain_dos<A: crate::Arch>(
                 unsafe { (*dp).process_key(machine, regs, sc) };
             }
         } else {
-            // A sink completion interrupt is the kernel's, not the guest's:
-            // offer every Hw line to the audio router first.
-            if let crate::Irq::Hw(line) = evt
-                && crate::kernel::sound::on_hw_irq(machine, line)
-            {
-                continue;
-            }
             if !blocked {
                 crate::kernel::dos::queue_irq(machine, unsafe { &mut *dp }, regs, evt);
             }
@@ -105,26 +101,21 @@ fn monitor_key<A: crate::Arch>(
 }
 
 /// Linux owner: keys → cooked fd input.
-fn drain_linux<A: crate::Arch>(
+fn dispatch_linux<A: crate::Arch>(
     machine: &mut A,
     regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
+    events: alloc::vec::Vec<crate::Irq>,
 ) {
     let ktp = kt as *mut thread::KernelThread<A>;
     let lp = linux as *mut thread::LinuxState;
     {
-        let mut _events: alloc::vec::Vec<crate::Irq> = alloc::vec::Vec::new();
-        machine.drain(&mut |evt| _events.push(evt));
-        for evt in _events {
+        for evt in events {
         if let crate::Irq::Key(sc) = evt {
             if !monitor_key(machine, regs, sc, None) {
                 unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
             }
-        } else if let crate::Irq::Hw(line) = evt {
-            // Same audio-sink IRQ routing as the DOS drain (see `drain_dos`):
-            // the sink is the kernel's regardless of the focused personality.
-            crate::kernel::sound::on_hw_irq(machine, line);
         }
     }
     }

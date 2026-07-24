@@ -234,11 +234,11 @@ pub trait Arch: Sized + GuestBytes {
     fn rearm_irq(&mut self, line: u8);
 
     /// Allocate an MSI target for a device that should raise the canonical
-    /// `Irq::Hw(source)` event. Returns the `(message_address, message_data)`
+    /// `Irq::Msi(source)` event. Returns the `(message_address, message_data)`
     /// pair to program into the device's PCI MSI capability, or `None` when
     /// message-signalled interrupts are unavailable (no local APIC, or a
     /// backend with no real interrupt hardware). The backend guarantees that a
-    /// write matching the returned pair delivers as `Irq::Hw(source)` through
+    /// write matching the returned pair delivers as `Irq::Msi(source)` through
     /// the ordinary `drain` path — the caller never learns the vector or APIC
     /// id, keeping interrupt delivery canonical above the arch boundary.
     fn msi_alloc(&mut self, source: u8) -> Option<(u64, u32)> {
@@ -252,6 +252,13 @@ pub trait Arch: Sized + GuestBytes {
     /// APIC mode, an 8259 unmask in PIC mode — the same legacy path the fixed ISA
     /// lines already use. No-op where there is no interrupt hardware.
     fn route_device_irq(&mut self, line: u8) {
+        let _ = line;
+    }
+
+    /// Route an ISA IRQ line (edge-triggered, active-high). Kept separate from
+    /// PCI INTx because the latter is level-triggered, active-low at the I/O
+    /// APIC; treating both as the same electrical signal loses interrupts.
+    fn route_isa_irq(&mut self, line: u8) {
         let _ = line;
     }
 

@@ -691,7 +691,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             if try_handle_page_fault(regs.err_code, legacy_mode).is_some() { return; }
             KE::PageFault { addr: x86::read_cr2() }
         }
-        32..=47 => { handle_irq(regs); KE::Irq }
+        32..=47 | 0xF8..=0xFF => { handle_irq(regs); KE::Irq }
         // Vectors 3/4 (#BP/#OF) are only reachable from user INT3/INTO, so
         // they're soft ints. Other n<32 are genuine CPU exceptions.
         3 | 4 => KE::SoftInt(int_num as u8),
@@ -746,7 +746,7 @@ fn isr_handler_ring1(regs: &mut Regs) {
                 panic_with_regs("Unhandled page fault in kernel", regs);
             }
         }
-        32..=47 => handle_irq(regs),
+        32..=47 | 0xF8..=0xFF => handle_irq(regs),
         0x80 => arch_dispatch(regs),
         _ => panic_with_regs("Unexpected interrupt in kernel", regs),
     }
@@ -928,7 +928,7 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
                 panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
             }
         }
-        32..=47 => {
+        32..=47 | 0xF8..=0xFF => {
             let mut regs = Regs::empty();
             regs.int_num = int_num;
             handle_irq(&mut regs);

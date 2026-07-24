@@ -572,4 +572,11 @@ pub enum Irq {
     /// policy-free — the kernel decides if it's a device it owns and when
     /// the line can be rearmed after the guest-visible device ack.
     Hw(u8),
+    /// A message-signalled interrupt allocated by [`Arch::msi_alloc`].
+    ///
+    /// This is deliberately distinct from [`Irq::Hw`]: an MSI source is a
+    /// kernel-owned vector identity, not an ISA IRQ/GSI line. Conflating the
+    /// two lets (for example) an HDA MSI called "11" steal a real device's
+    /// wired IRQ 11.
+    Msi(u8),
 }
