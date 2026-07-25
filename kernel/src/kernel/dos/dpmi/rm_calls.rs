@@ -233,8 +233,14 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     // DPMI 0.9 §6.1.1: DS:(E)SI must point at the RM stack location
     // where the caller's return addresses are pushed — handler reads
     // CS:IP from there. Capture before push_continuation_and_switch_to_pm_side mutates regs.
+    // 16-bit SP, not sp32(): the real-mode caller only maintains SP, and ESP's
+    // high half legally carries stale garbage (VM86 pushes/pops move SP while
+    // ESP31:16 keeps whatever an earlier PM context left there). Folding those
+    // bits in aimed DS:ESI at a kernel address — DUKE3D's DOS/16M callback
+    // handler read [ESI+0x14] and SEGV'd on the first timer tick after its
+    // music started.
     let rm_ss_sp_linear = (regs.stack_seg() as u32).wrapping_shl(4)
-        .wrapping_add(regs.sp32());
+        .wrapping_add(regs.sp32() & 0xFFFF);
 
     let pm_save_at = mode_transitions::push_continuation_and_switch_to_pm_side(machine, dos, regs, Some(struct_addr));
 

@@ -428,14 +428,26 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
         s
     } else { [0u64; 7] };
 
+    let al_in = regs.rax as u8;
     let action = int_21h(machine, kt, dos, regs);
 
     if mask16 {
+        // Pointer-returning calls hand a 32-bit LINEAR through LOW_MEM_SEL
+        // (ES:EBX / DS:ESI): there the high half IS the return value, so
+        // restoring the client's stale half would corrupt the pointer —
+        // DOS/16M's DPMILOAD stores the whole DS:ESI from AH=5D06 (LDS ESI)
+        // and dereferenced a stale-half kernel address (DUKE3D music SEGV).
+        let keep_ebx = matches!(ah, 0x2F | 0x34 | 0x52);
+        let keep_esi = ah == 0x5D && al_in == 0x06;
         regs.rax = (regs.rax & !HI) | saved_hi[0];
-        regs.rbx = (regs.rbx & !HI) | saved_hi[1];
+        if !keep_ebx {
+            regs.rbx = (regs.rbx & !HI) | saved_hi[1];
+        }
         regs.rcx = (regs.rcx & !HI) | saved_hi[2];
         regs.rdx = (regs.rdx & !HI) | saved_hi[3];
-        regs.rsi = (regs.rsi & !HI) | saved_hi[4];
+        if !keep_esi {
+            regs.rsi = (regs.rsi & !HI) | saved_hi[4];
+        }
         regs.rdi = (regs.rdi & !HI) | saved_hi[5];
         regs.rbp = (regs.rbp & !HI) | saved_hi[6];
     }
@@ -1052,7 +1064,11 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         0x34 => {
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) + INDOS_FLAG_OFFSET as u32) as u64;
+                // Full 32-bit write: the offset via LOW_MEM_SEL is a linear
+                // address, and PM clients may capture the whole register (LES
+                // EBX). A 16-bit merge leaks the caller's stale high half into
+                // the pointer (DOS/16M saved such a DS:ESI and faulted on it).
+                regs.rbx = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) + INDOS_FLAG_OFFSET as u32) as u64;
             } else {
                 regs.es = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | INDOS_FLAG_OFFSET as u64;
@@ -1116,7 +1132,9 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             let dta = dos.dta;
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | dta as u64;
+                // Full 32-bit write (see AH=34): a linear offset — and the DTA
+                // commonly exceeds 0xFFFF, which the 16-bit merge also mangled.
+                regs.rbx = dta as u64;
             } else {
                 regs.es = (dta >> 4) as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | (dta & 0x0F) as u64;
@@ -2025,7 +2043,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             let lol_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, lol) as u32;
             if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                 regs.es = dpmi::LOW_MEM_SEL as u64;
-                regs.rbx = (regs.rbx & !0xFFFF) | lol_addr as u64;
+                // Full 32-bit write (see AH=34): the offset is a linear address.
+                regs.rbx = lol_addr as u64;
             } else {
                 regs.es = (lol_addr >> 4) as u64;
                 regs.rbx = (regs.rbx & !0xFFFF) | (lol_addr & 0xF) as u64;
@@ -2289,7 +2308,11 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     let syspsp_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32;
                     if dos.dpmi.is_some() && regs.frame.rflags as u32 & machine::VM_FLAG == 0 {
                         regs.ds = dpmi::LOW_MEM_SEL as u64;
-                        regs.rsi = (regs.rsi & !0xFFFF) | syspsp_addr as u64;
+                        // Full 32-bit write (see AH=34): DOS/16M's DPMILOAD
+                        // stores this DS:ESI whole (LDS ESI) and dereferences
+                        // it later — a stale ESI31:16 became a kernel address
+                        // (the DUKE3D music-start SEGV).
+                        regs.rsi = syspsp_addr as u64;
                     } else {
                         regs.ds = (syspsp_addr >> 4) as u64;
                         regs.rsi &= !0xFFFF;

@@ -547,9 +547,11 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         0x0203 => {
             let exc = regs.rbx as u8;
             if (exc as usize) < 15 {
-                dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+                // 16-bit client: DX only — EDX-high is stale (cf. 0205/0303).
+                let off = if dpmi.client_use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
+                dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, off);
                 dos_trace!("[DPMI] 0203 set exception {:02X} = {:04X}:{:08X}",
-                    exc, regs.rcx as u16, regs.rdx as u32);
+                    exc, regs.rcx as u16, off);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -665,11 +667,25 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let slot = dpmi.callbacks.iter().position(|c| c.is_none());
             match slot {
                 Some(i) => {
+                    // 16-bit client: DS:SI / ES:DI — the high halves of
+                    // ESI/EDI are legally stale garbage and MUST NOT enter
+                    // the stored offsets (cf. 0205's use32 handling). DOS/16M
+                    // registered its RM call structure with a leftover dirty
+                    // EDI-high, making struct_addr a kernel-stack address:
+                    // every callback then read/wrote the RmCallStruct inside
+                    // the kernel stack and handed the wild ES:EDI to the
+                    // handler, which dereferenced it → the DUKE3D music-start
+                    // SEGV at [ESI+0x14].
+                    let (pm_off, struct_off) = if dpmi.client_use32 {
+                        (regs.rsi as u32, regs.rdi as u32)
+                    } else {
+                        (regs.rsi as u16 as u32, regs.rdi as u16 as u32)
+                    };
                     dpmi.callbacks[i] = Some((
                         regs.ds as u16,
-                        regs.rsi as u32,
+                        pm_off,
                         regs.es as u16,
-                        regs.rdi as u32,
+                        struct_off,
                     ));
                     // Return real-mode address: the control view of the stub
                     // array, CTRL_STUB_SEG:ctrl_slot_off(SLOT_CB_ENTRY_BASE + i).
