@@ -1000,13 +1000,19 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // frontier. Stamping incoming MIDI with it decouples note onset from block
     // size (a note lands at its true sub-block frame, not the block start).
     let pushed = mixer.pace.pushed();
-    if mixer.midi_ms == 0 {
+    if !mixer.streaming {
+        // No output session: there is no sub-block position to spread
+        // arrivals into — the next produced frame IS the arrival frame.
+        // Letting the clock free-run here stamped a program's first notes
+        // "seconds since launch" into the future, and the synth dutifully
+        // held them: Dark Forces' fanfare ~3 s after the logo, DOOM's title
+        // music ~2 s late — the GM start delay.
         mixer.midi_frame = pushed;
-        mixer.midi_ms = now;
+    } else {
+        mixer.midi_frame = (mixer.midi_frame
+            + now.saturating_sub(mixer.midi_ms) * MIX_RATE as u64 / 1000)
+            .max(pushed);
     }
-    mixer.midi_frame = (mixer.midi_frame
-        + now.saturating_sub(mixer.midi_ms) * MIX_RATE as u64 / 1000)
-        .max(pushed);
     mixer.midi_ms = now;
     // MPU-401: drain the port's MIDI bytes into the synth (stamped at the arrival
     // frame) and satisfy a bounded number of its instrument requests (a .PAT
