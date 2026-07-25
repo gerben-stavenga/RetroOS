@@ -979,6 +979,8 @@ impl Mixer {
 /// every guest-visible clock from the sink's drain position.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     let _ = regs;
+    let profiling = crate::kernel::startup::profile_enabled();
+    let prof_start = if profiling { machine.rdtsc() } else { 0 };
     let PcMachine { sb, gus, mpu, spk, vpic, mixer, .. } = pc;
     let now = machine.get_ticks();
     let dt = now.saturating_sub(mixer.last_ms).min(100);
@@ -1016,9 +1018,14 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // the pipe (tens of ms deep) had nothing to do 97% of the time. One read
     // per millisecond is two orders of magnitude inside the pipe's depth.
     if dt == 0 {
+        if profiling {
+            crate::kernel::startup::bill_audio(
+                machine.rdtsc().wrapping_sub(prof_start), 0, 0, 0, 0);
+        }
         return;
     }
     mixer.last_ms = now;
+    let prof_devices = if profiling { machine.rdtsc() } else { 0 };
 
     // ── the pump ──
     let dsp_on = sb.dsp_owns_sink();
@@ -1026,14 +1033,20 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let opl_on = sb.opl_audible(now);
     let midi_on = mpu.mixing();
     let spk_on = spk.audible(MIX_RATE);
-    if !dsp_on && !gus_on && !opl_on && !midi_on && !spk_on {
-        if mixer.streaming {
-            crate::kernel::sound::stop(machine, false); // pause, keep configured
-            mixer.streaming = false;
+    // Idle sources do NOT stop the sink: once a session streams, it stays
+    // alive and idle gaps pump silence. Stopping here paused/re-primed the
+    // hardware stream on every gap (menu→demo music transitions), and an HDA
+    // stream restarted without SRST can come back dead — freezing the drain
+    // clock every guest audio cursor and IRQ is slaved to. Warm-reboot codec
+    // safety is not this path's job: every shutdown/reboot/panic path calls
+    // `hda::emergency_quiesce`. Only a session that never started skips out.
+    if !dsp_on && !gus_on && !opl_on && !midi_on && !spk_on && !mixer.streaming {
+        if profiling {
+            crate::kernel::startup::bill_audio(
+                prof_devices.wrapping_sub(prof_start),
+                machine.rdtsc().wrapping_sub(prof_devices),
+                0, 0, 0);
         }
-        mixer.pace.reset();
-        mixer.dsp_epoch = 0;
-        mixer.midi_ms = 0; // re-seed the MIDI clock on the next active session
         return;
     }
     // Source activity does not define the output session. In particular, an
@@ -1045,7 +1058,9 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     }
     let rate = MIX_RATE;
     let mut n = mixer.pace.due(machine, rate, dt, MIX_CHUNK);
+    let generated = n;
     let mut base = mixer.pace.pushed() - n;
+    let prof_setup = if profiling { machine.rdtsc() } else { 0 };
     // Sources sum into a WIDE accumulator and the mix is clipped exactly once,
     // here, on the way out. Saturating each i16 add per source (what we used to
     // do) clips every source against every other one: a full-scale digital SFX
@@ -1086,6 +1101,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         n -= run as u64;
     }
     mixer.streaming = true;
+    let prof_pump = if profiling { machine.rdtsc() } else { 0 };
 
     // ── guest clocks & event delivery, on the drain clock ──
     // GUS events are stamped in mix frames; the DSP's cursor, DMA counts and
@@ -1101,6 +1117,15 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     sb.dsp_clock_tick(machine, vpic, to_dsp(drained), to_dsp(pushed));
     gus.deliver_events(vpic);
 
+    if profiling {
+        let prof_end = machine.rdtsc();
+        crate::kernel::startup::bill_audio(
+            prof_devices.wrapping_sub(prof_start),
+            prof_setup.wrapping_sub(prof_devices),
+            prof_pump.wrapping_sub(prof_setup),
+            prof_end.wrapping_sub(prof_pump),
+            generated);
+    }
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {

@@ -320,6 +320,18 @@ impl Pace {
         }
         if self.use_pos {
             let (written, consumed) = position(machine).unwrap_or((0, 0));
+            // Sink counters restarted under our session (another owner parked
+            // or reset the stream — e.g. a child program's exit cleanup). Our
+            // frame numbering is void; re-key so the anchor below is rebuilt
+            // from the fresh counters instead of wedging `drained` at zero.
+            if written < self.pushed {
+                self.pushed = 0;
+                self.anchor = u64::MAX;
+                self.frac = 0;
+                self.drained_from = 0;
+                self.drained_ms = 0;
+                self.drain_step = 0;
+            }
             if self.anchor == u64::MAX && self.pushed > 0 {
                 self.anchor = written.saturating_sub(self.pushed);
             }
