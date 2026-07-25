@@ -37,8 +37,6 @@ pub struct Framebuffer {
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
 /// like the portio/hostfs/socket hooks.
 static mut PRESENT: fn() = || {};
-static DAMAGE_EPOCH: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(1);
 
 pub fn set_present_hook(f: fn()) {
     unsafe { PRESENT = f };
@@ -48,36 +46,26 @@ pub fn present() {
     (unsafe { PRESENT })();
 }
 
-/// Tell the incremental blitter that something outside it wrote the display
-/// (the framebuffer console, for example), so its next frame repaints fully.
-pub fn damage() {
-    DAMAGE_EPOCH.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Scratch for the blit: the palette in framebuffer format, one source row,
-/// one stretched output row, and the previous source image for dirty spans.
+/// Scratch for the raster: the palette in framebuffer format, one rendered
+/// source row, one full device row (borders + scaled content), and the beam.
 pub struct Scratch {
     pal: lib::vga_render::Pal,
     pal_cache: [u8; 768],
     src: alloc::vec::Vec<u32>,
     row: alloc::vec::Vec<u32>,
-    prev: alloc::vec::Vec<u32>,
-    prev_w: usize,
-    prev_h: usize,
-    prev_out_w: usize,
-    prev_out_h: usize,
-    damage_epoch: u32,
-    overlay: bool,
-    input_vram: alloc::vec::Vec<u8>,
-    input_planes: alloc::vec::Vec<u8>,
-    input_mode: Option<lib::vga_render::VgaMode>,
-    input_ac: [u8; 21],
-    input_palette: [u8; 768],
-    input_cga_palette: [u32; 4],
-    input_blink: bool,
-    input_start_offset: usize,
-    input_pixel_pan: usize,
-    input_line_compare: usize,
+    /// Geometry the beam is armed for `(w, h, out_w, out_h)`; any change
+    /// restarts the sweep at the top — a mode switch repaints everything,
+    /// borders included, within one refresh period by construction.
+    geo: (usize, usize, usize, usize),
+    /// Beam position: next source row, and its output-row Bresenham state.
+    sy: usize,
+    oy: usize,
+    yerr: usize,
+    /// Fractional row credit: accrues `elapsed_ms × h`, spends `period_ms`
+    /// per source row, capped at one frame of debt (a long stall skips
+    /// frames instead of fast-forwarding the beam).
+    acc: u64,
+    last_ms: u64,
 }
 
 impl Default for Scratch {
@@ -93,23 +81,12 @@ impl Scratch {
             pal_cache: [0; 768],
             src: alloc::vec::Vec::new(),
             row: alloc::vec::Vec::new(),
-            prev: alloc::vec::Vec::new(),
-            prev_w: 0,
-            prev_h: 0,
-            prev_out_w: 0,
-            prev_out_h: 0,
-            damage_epoch: 0,
-            overlay: false,
-            input_vram: alloc::vec::Vec::new(),
-            input_planes: alloc::vec::Vec::new(),
-            input_mode: None,
-            input_ac: [0; 21],
-            input_palette: [0; 768],
-            input_cga_palette: [0; 4],
-            input_blink: false,
-            input_start_offset: 0,
-            input_pixel_pan: 0,
-            input_line_compare: 0,
+            geo: (0, 0, 0, 0),
+            sy: 0,
+            oy: 0,
+            yerr: 0,
+            acc: 0,
+            last_ms: 0,
         }
     }
 }
@@ -160,27 +137,48 @@ unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize) {
     }
 }
 
-/// Blit a frame — ANY mode — scaled into the framebuffer's 4:3 rectangle.
+/// Cheap pre-gate for [`raster`]: would the beam paint anything now? Lets the
+/// event loop skip the scanout entirely on the (vast majority of) passes
+/// where no row is due yet.
+pub fn raster_pending(s: &Scratch, now_ms: u64, period_ms: u64) -> bool {
+    let h = s.geo.1 as u64;
+    if h == 0 {
+        return true; // not armed yet: run once to arm the geometry
+    }
+    s.acc + now_ms.saturating_sub(s.last_ms) * h >= period_ms
+}
+
+/// Advance the raster beam and paint the band of device rows now due.
 ///
-/// DOS modes are authored for a 4:3 display with non-square pixels, so fitting
-/// the source to 4:3 rather than scaling both axes equally reproduces each
-/// mode's pixel aspect: 320x200 stretched 6/5 tall, 320x240 square.
+/// The frame is presented the way the hardware presented it: a beam sweeps
+/// the display top to bottom once per refresh period, re-rendering every
+/// pixel from the live VGA state as it passes — scaled content and borders
+/// alike. There is no diff, no damage tracking and no idle path: correctness
+/// never depends on knowing what changed (nothing can leak through a crash
+/// or a mode switch), and the work per call is bounded, so the event loop
+/// never stalls on a frame regardless of panel size. The games' own
+/// present model (update VRAM during vertical retrace) composes with this
+/// exactly as on a real VGA.
 ///
-/// One pass per SOURCE row: the renderer draws that row straight into the
-/// framebuffer's pixel format, it is stretched once, then copied to every
-/// output row it covers. No full-frame intermediate, no per-mode special case,
-/// and nothing recomputed per output pixel — run lengths come from a Bresenham
-/// accumulator and the fill is a fixed width with the cursor advanced by the
-/// true amount, so the overshoot is harmlessly overwritten.
-pub fn blit(
+/// DOS modes are authored for a 4:3 display with non-square pixels, so the
+/// source is fitted to the framebuffer's 4:3 rectangle: 320x200 stretched
+/// 6/5 tall, 320x240 square. One pass per SOURCE row: the renderer draws the
+/// row in the framebuffer's pixel format, it is stretched once into a full
+/// device row (black borders at both ends), and that row is copied to every
+/// output row it covers — run lengths from a Bresenham accumulator.
+///
+/// Returns `(pixels_written, wrapped)`; `wrapped` marks the beam finishing a
+/// frame — the vertical retrace — where the caller presents.
+pub fn raster(
     s: &mut Scratch,
     fb: &Framebuffer,
     frame: &lib::vga_render::Frame,
-    overlay: bool,
-) -> usize {
+    now_ms: u64,
+    period_ms: u64,
+) -> (usize, bool) {
     let (w, h) = lib::vga_render::dimensions(frame.mode);
     if w == 0 || h == 0 {
-        return 0;
+        return (0, false);
     }
     let (out_w, out_h) = if fb.width * 3 >= fb.height * 4 {
         ((fb.height * 4 / 3).min(fb.width), fb.height)
@@ -188,106 +186,88 @@ pub fn blit(
         (fb.width, (fb.width * 3 / 4).min(fb.height))
     };
     if out_w < w || out_h < h {
-        return 0; // no downscaling path
+        return (0, false); // no downscaling path
     }
-    let epoch = DAMAGE_EPOCH.load(core::sync::atomic::Ordering::Relaxed);
-    let external_damage = s.damage_epoch != epoch || (s.overlay && !overlay);
-    let same_input = s.input_mode == Some(frame.mode)
-        && s.input_blink == frame.blink
-        && s.input_start_offset == frame.start_offset
-        && s.input_pixel_pan == frame.pixel_pan
-        && s.input_line_compare == frame.line_compare
-        && s.input_cga_palette == frame.cga_palette
-        && s.input_ac == *frame.ac
-        && s.input_palette == *frame.palette
-        && s.input_vram == frame.vram
-        && s.input_planes == frame.planes;
-    if same_input && !external_damage {
-        s.overlay = overlay;
-        return 0;
-    }
-    s.input_vram.clear();
-    s.input_vram.extend_from_slice(frame.vram);
-    s.input_planes.clear();
-    s.input_planes.extend_from_slice(frame.planes);
-    s.input_mode = Some(frame.mode);
-    s.input_ac = *frame.ac;
-    s.input_palette = *frame.palette;
-    s.input_cga_palette = frame.cga_palette;
-    s.input_blink = frame.blink;
-    s.input_start_offset = frame.start_offset;
-    s.input_pixel_pan = frame.pixel_pan;
-    s.input_line_compare = frame.line_compare;
 
-    let origin = (fb.height - out_h) / 2 * fb.stride + (fb.width - out_w) / 2;
-    s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
-
-    // Each source pixel covers `xbase` or `xbase + 1` output pixels; fill the
-    // wider constant every time and step by the true amount.
+    // Each source pixel covers `xbase` or `xbase + 1` output pixels; the
+    // stretcher fills the wider constant every time and steps by the true
+    // amount, so it overshoots at most `xbase + 1` past the content edge.
     let (xbase, xrem) = (out_w / w, out_w % w);
     let (ybase, yrem) = (out_h / h, out_h % h);
-    s.src.resize(w, 0);
-    s.row.resize(out_w + xbase + 1, 0);
-    let full = s.prev_w != w
-        || s.prev_h != h
-        || s.prev_out_w != out_w
-        || s.prev_out_h != out_h
-        || s.prev.len() != w * h
-        || external_damage;
-    if s.prev.len() != w * h {
-        s.prev.resize(w * h, 0);
+    let bx = (fb.width - out_w) / 2; // left border width
+    let by = (fb.height - out_h) / 2; // top border height
+    let slack = xbase + 1;
+
+    if s.geo != (w, h, out_w, out_h) || s.row.len() != fb.width + slack {
+        s.geo = (w, h, out_w, out_h);
+        s.src.clear();
+        s.src.resize(w, 0);
+        s.row.clear();
+        s.row.resize(fb.width + slack, 0); // border pixels stay black
+        s.sy = 0;
+        s.oy = 0;
+        s.yerr = 0;
+        s.acc = 0;
+        s.last_ms = now_ms;
     }
-    s.prev_w = w;
-    s.prev_h = h;
-    s.prev_out_w = out_w;
-    s.prev_out_h = out_h;
-    s.damage_epoch = epoch;
-    s.overlay = overlay;
+
+    // Row credit from elapsed virtual time: h source rows per period, at most
+    // one frame of debt, at most a bounded band per call.
+    let dt = now_ms.saturating_sub(s.last_ms);
+    s.last_ms = now_ms;
+    s.acc = (s.acc + dt * h as u64).min(h as u64 * period_ms);
+    let due = (s.acc / period_ms) as usize;
+    let paint = due.min((h / 8).max(1));
+    if paint == 0 {
+        return (0, false);
+    }
+    s.acc -= paint as u64 * period_ms;
+
+    // Palette synced per band, not per frame: a mid-frame DAC write shears
+    // across the sweep exactly like the raster effects it was written for.
+    s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
 
     let out = unsafe {
         core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
     };
     let mut copied = 0usize;
-    let (mut oy, mut yerr) = (0usize, 0usize);
-    for sy in 0..h {
-        lib::vga_render::render_row(frame, sy, &s.pal, &mut s.src);
-        let prev = &mut s.prev[sy * w..(sy + 1) * w];
-        let changed = if full {
-            Some((0, w))
-        } else {
-            let first = s.src.iter().zip(prev.iter()).position(|(a, b)| a != b);
-            first.map(|first| {
-                let last = s.src.iter().zip(prev.iter()).rposition(|(a, b)| a != b).unwrap();
-                (first, last + 1)
-            })
-        };
-        prev.copy_from_slice(&s.src);
-
-        yerr += yrem;
-        let rows = ybase + if yerr >= h { yerr -= h; 1 } else { 0 };
-        let Some((first, end)) = changed else {
-            oy += rows;
-            continue;
-        };
-        let (mut o, mut xerr) = (0usize, 0usize);
+    let mut wrapped = false;
+    for _ in 0..paint {
+        lib::vga_render::render_row(frame, s.sy, &s.pal, &mut s.src);
+        let (mut o, mut xerr) = (bx, 0usize);
         for &v in &s.src {
             s.row[o..o + xbase + 1].fill(v);
             xerr += xrem;
             o += xbase + if xerr >= w { xerr -= w; 1 } else { 0 };
         }
-        // The scaler's Bresenham boundaries are floor(x*out_w/w). Expand only
-        // the destination span covered by changed source pixels.
-        let x0 = first * out_w / w;
-        let x1 = (end * out_w).div_ceil(w).min(out_w);
-        let len = x1 - x0;
+        // Re-blacken the stretcher's overshoot: that strip is right border.
+        s.row[bx + out_w..].fill(0);
+        s.yerr += yrem;
+        let rows = ybase + if s.yerr >= h { s.yerr -= h; 1 } else { 0 };
         for _ in 0..rows {
-            let d = origin + oy * fb.stride;
+            let d = (by + s.oy) * fb.stride;
             unsafe {
-                copy_pixels(out.as_mut_ptr().add(d + x0), s.row.as_ptr().add(x0), len);
+                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), fb.width);
             }
-            copied += len;
-            oy += 1;
+            copied += fb.width;
+            s.oy += 1;
+        }
+        s.sy += 1;
+        if s.sy == h {
+            // Letterbox bands (rare geometry — 4:3 content on a 4:3-or-wider
+            // panel pillarboxes instead, and the row copy above covers those
+            // borders every row): painted once per sweep, at the retrace.
+            for y in (0..by).chain(by + out_h..fb.height) {
+                unsafe {
+                    core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.stride), 0, fb.width);
+                }
+                copied += fb.width;
+            }
+            s.sy = 0;
+            s.oy = 0;
+            s.yerr = 0;
+            wrapped = true;
         }
     }
-    copied
+    (copied, wrapped)
 }

@@ -1685,10 +1685,10 @@ impl VgaState {
     }
 }
 
-/// VGA refresh throttle, off the same tick clock the 0x3DA vertical-retrace
-/// fabrication reads. Normal/WC displays follow the ~70-Hz VGA cadence;
-/// QEMU-TCG's strong-UC GOP mapping uses the older proven 20-Hz cap so
-/// full-frame device writes cannot consume the entire event loop.
+/// Whole-frame throttle for the hosted window sink, off the same tick clock
+/// the 0x3DA vertical-retrace fabrication reads. The direct-framebuffer path
+/// does not use this: its raster paces itself per row inside
+/// `display::raster`.
 fn frame_due(now_ticks: u64, hz: u64) -> bool {
     let frame = (now_ticks.wrapping_mul(hz) / 1000) as u32;
     static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -1711,56 +1711,64 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if vga_present() || (direct.is_none() && !vga_render::present_sink_installed()) {
         return;
     }
-    let refresh_hz = if direct.is_some_and(|fb| fb.slow) { 20 } else { 70 };
-    if !frame_due(now_ticks, refresh_hz) {
-        return;
-    }
-    crate::kernel::startup::bill_present();
     let prof = crate::kernel::startup::profile_enabled();
-    let p0 = if prof { machine.rdtsc() } else { 0 };
-    // Nothing here allocates per frame: both buffers live in PcMachine and are
-    // grown once, on the first frame of a mode. `render` clears the region it
-    // writes, so the buffer needs no pre-zeroing either.
-    let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
-    let p1 = if prof { machine.rdtsc() } else { 0 };
-    // One path for every mode: the renderer draws a source row directly in the
-    // framebuffer's pixel format, the blit stretches and copies it. No special
-    // case, no full-frame intermediate.
-    let copied;
-    if let crate::kernel::platform::Display::Framebuffer(fb) =
-        crate::kernel::platform::get().display
-    {
-        let overlay = crate::kernel::osd::is_open();
-        copied = crate::kernel::display::blit(
-            &mut pc.present_scratch2, &fb, &frame, overlay);
-        // The F12 monitor composites onto the finished frame — after the guest
-        // is drawn, before present — so it appears over any video mode.
-        if overlay {
+    if let Some(fb) = direct {
+        // Direct framebuffer: the raster beam. Bounded work per pass, every
+        // pixel repainted every period — pacing lives in `display::raster`;
+        // the pre-gate skips the scanout when no band is due.
+        let period_ms: u64 = if fb.slow { 50 } else { 14 };
+        if !crate::kernel::display::raster_pending(&pc.present_scratch2, now_ticks, period_ms) {
+            return;
+        }
+        let p0 = if prof { machine.rdtsc() } else { 0 };
+        // Nothing here allocates per band: the buffers live in PcMachine and
+        // grow once, on the first frame of a mode.
+        let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
+        let p1 = if prof { machine.rdtsc() } else { 0 };
+        let (copied, wrapped) = crate::kernel::display::raster(
+            &mut pc.present_scratch2, &fb, &frame, now_ticks, period_ms);
+        // The F12 monitor composites over whatever the beam just painted, so
+        // it stays intact across the sweep in any video mode.
+        if copied > 0 && crate::kernel::osd::is_open() {
             let out = unsafe {
                 core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
             };
             crate::kernel::osd::paint(out, fb.stride, fb.width, fb.height, fb.format);
         }
-        crate::kernel::display::present();
-    } else {
-        // Window sink (hosted): still takes a whole rendered frame.
-        let (w, h) = vga_render::dimensions(frame.mode);
-        let need = w * h;
-        copied = need;
-        if pc.present_fb.len() < need {
-            pc.present_fb.resize(need, 0);
+        if wrapped {
+            crate::kernel::startup::bill_present();
+            crate::kernel::display::present();
         }
-        let fb = &mut pc.present_fb[..need];
-        vga_render::render(&frame, fb);
-        if crate::kernel::osd::is_open() {
-            // `render` writes native 0x00RRGGBB into a tightly-packed w×h buffer.
-            crate::kernel::osd::paint(fb, w, w, h, vga_render::PixelFormat::NATIVE);
+        if prof {
+            let p4 = machine.rdtsc();
+            crate::kernel::startup::bill_display(
+                p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), copied);
         }
-        vga_render::present(w, h, fb);
+        return;
     }
+    // Window sink (hosted): still takes a whole rendered frame per period.
+    if !frame_due(now_ticks, 70) {
+        return;
+    }
+    crate::kernel::startup::bill_present();
+    let p0 = if prof { machine.rdtsc() } else { 0 };
+    let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
+    let p1 = if prof { machine.rdtsc() } else { 0 };
+    let (w, h) = vga_render::dimensions(frame.mode);
+    let need = w * h;
+    if pc.present_fb.len() < need {
+        pc.present_fb.resize(need, 0);
+    }
+    let fb = &mut pc.present_fb[..need];
+    vga_render::render(&frame, fb);
+    if crate::kernel::osd::is_open() {
+        // `render` writes native 0x00RRGGBB into a tightly-packed w×h buffer.
+        crate::kernel::osd::paint(fb, w, w, h, vga_render::PixelFormat::NATIVE);
+    }
+    vga_render::present(w, h, fb);
     if prof {
         let p4 = machine.rdtsc();
         crate::kernel::startup::bill_display(
-            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), copied);
+            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), need);
     }
 }

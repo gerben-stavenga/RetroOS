@@ -363,8 +363,6 @@ static DOS_PAINTED: core::sync::atomic::AtomicBool =
 /// `display_tick` path which presents the same aperture during runtime.
 fn flush() {
     let Some(g) = geom() else { return };
-    // Console pixels bypass the incremental DOS blitter.
-    crate::kernel::display::damage();
     // A DOS frame painted over us: wipe and repaint the whole console.
     if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
