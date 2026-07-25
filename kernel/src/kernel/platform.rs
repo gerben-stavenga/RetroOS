@@ -16,6 +16,9 @@ pub struct Platform {
     pub display: Display,
     /// What sound hardware answered (probe fact).
     pub audio_hw: AudioHw,
+    /// The real Sound Blaster's own report, when one answered: base,
+    /// generation, and (SB16 only) its strapped IRQ/DMA.
+    pub sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
     pub firmware: Firmware,
     pub audio: Audio,
     /// A host filesystem transport answered — the native backend punch-through
@@ -222,7 +225,8 @@ static mut PLATFORM: Option<Platform> = None;
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
 pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
-    let audio_hw = probe_audio(machine);
+    let mut sb_card = None;
+    let audio_hw = probe_audio(machine, &mut sb_card);
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
     // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
@@ -273,6 +277,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             display,
             firmware,
             audio_hw,
+            sb_card,
             // Policy comes later, when CONFIG.SYS is readable
             // (`apply_audio_mode`); until then, the hardware's default.
             audio: audio_hw.default_verdict(),
@@ -342,8 +347,9 @@ pub fn probed() -> bool {
 /// installed a sink. Card presence is machine-wide, so the probe uses the
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
-fn probe_audio<A: crate::Arch>(machine: &mut A) -> AudioHw {
-    if crate::kernel::drivers::sb16::scan(machine) {
+fn probe_audio<A: crate::Arch>(machine: &mut A, card: &mut Option<crate::kernel::drivers::sb16::SbCard>) -> AudioHw {
+    *card = crate::kernel::drivers::sb16::scan(machine);
+    if card.is_some() {
         return AudioHw::Sb;
     }
     if crate::kernel::drivers::hda::scan(machine).is_some() {

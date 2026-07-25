@@ -25,10 +25,7 @@ use crate::kernel::sound::Format;
 // ── SB16 DSP / mixer ports (base 0x220; the card is machine-wide, so the sink
 //    uses the canonical base, not a per-thread BLASTER relocation) ────────────
 const BASE: u16 = 0x220;
-const DSP_RESET: u16 = BASE + 0x06;
-const DSP_READ: u16 = BASE + 0x0A; // read data
 const DSP_WRITE: u16 = BASE + 0x0C; // write command/data; bit7 = busy
-const DSP_RSTAT: u16 = BASE + 0x0E; // read-buffer status (bit7 = data ready) / 8-bit IRQ ack
 const DSP_ACK16: u16 = BASE + 0x0F; // 16-bit IRQ acknowledge
 const MIX_IDX: u16 = BASE + 0x04;
 const MIX_DATA: u16 = BASE + 0x05;
@@ -115,8 +112,110 @@ pub fn present() -> bool {
 
 /// Reset the DSP and read back the 0xAA ready byte. Pure presence probe —
 /// `platform::probe` uses it for the Audio decision; an absent card reads 0xFF.
-pub fn scan<A: crate::Arch>(machine: &mut A) -> bool {
-    dsp_reset(machine)
+/// What a real Sound Blaster reported about itself. In native mode this IS
+/// the guest's card, so these values become the fabricated `BLASTER`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SbCard {
+    pub base: u16,
+    /// DSP major version: 1/2 = SB 1.x/2.0, 3 = SB Pro, 4 = SB16.
+    pub dsp_major: u8,
+    /// IRQ / 8-bit DMA / 16-bit DMA, read from the SB16 mixer. `None` below
+    /// DSP 4: those registers do not exist and jumper straps are physically
+    /// invisible to software, so the owner declares them (`SB_AUDIO=native
+    /// <irq> <dma>`). There is no default — a guessed IRQ silently loses
+    /// every completion interrupt.
+    pub wiring: Option<SbWiring>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SbWiring {
+    pub irq: u8,
+    pub dma8: u8,
+    /// 16-bit channel; `None` on pre-SB16 cards, which have no 16-bit DMA.
+    pub dma16: Option<u8>,
+}
+
+impl SbCard {
+    /// Only an SB16 can back the emulated stack: our emulated card IS an
+    /// SB16 (CT1745 mixer, 16-bit DMA) and the sink drives 16-bit
+    /// signed-stereo auto-init DMA, which an SB Pro cannot do at all.
+    pub fn can_be_sink(&self) -> bool {
+        self.dsp_major >= 4
+    }
+}
+
+/// Bases a Sound Blaster can be jumpered/PnP'd to. It answers a DSP reset
+/// with 0xAA at exactly one; empty ISA space reads 0xFF.
+const BASES: [u16; 4] = [0x220, 0x240, 0x260, 0x280];
+
+/// Find the card: sweep the legal bases, ask what it is (DSP 0xE1), and on
+/// an SB16 read how it is strapped.
+pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<SbCard> {
+    let base = BASES.into_iter().find(|&b| dsp_reset_at(machine, b))?;
+    let dsp_major = dsp_version_major(machine, base);
+    let wiring = (dsp_major >= 4).then(|| read_wiring(machine, base));
+    crate::println!(
+        "sb: DSP {}.x at {:#05x}{}",
+        dsp_major, base,
+        if wiring.is_some() { " (SB16: wiring readable)" } else { " (pre-SB16: declare SB_AUDIO wiring)" }
+    );
+    Some(SbCard { base, dsp_major, wiring })
+}
+
+/// DSP `0xE1` — get version; the major byte is the generation.
+fn dsp_version_major<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
+    dsp_write_at(machine, base, 0xE1);
+    let major = dsp_read_at(machine, base);
+    let _minor = dsp_read_at(machine, base);
+    major
+}
+
+/// SB16 mixer 0x80/0x81: the IRQ and DMA channels the card is strapped to
+/// (Creative's bit assignments).
+fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
+    machine.outb(base + 0x04, 0x80);
+    let v = machine.inb(base + 0x05);
+    let irq = if v & 0x01 != 0 { 2 } else if v & 0x02 != 0 { 5 }
+        else if v & 0x04 != 0 { 7 } else if v & 0x08 != 0 { 10 } else { 5 };
+    machine.outb(base + 0x04, 0x81);
+    let d = machine.inb(base + 0x05);
+    let dma8 = if d & 0x01 != 0 { 0 } else if d & 0x02 != 0 { 1 }
+        else if d & 0x08 != 0 { 3 } else { 1 };
+    let dma16 = if d & 0x20 != 0 { Some(5) } else if d & 0x40 != 0 { Some(6) }
+        else if d & 0x80 != 0 { Some(7) } else { None };
+    SbWiring { irq, dma8, dma16 }
+}
+
+fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
+    machine.outb(base + 0x06, 1);
+    for _ in 0..1000 {
+        core::hint::spin_loop();
+    }
+    machine.outb(base + 0x06, 0);
+    for _ in 0..100_000 {
+        if machine.inb(base + 0x0E) & 0x80 != 0 && machine.inb(base + 0x0A) == 0xAA {
+            return true;
+        }
+    }
+    false
+}
+
+fn dsp_write_at<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
+    for _ in 0..100_000 {
+        if machine.inb(base + 0x0C) & 0x80 == 0 {
+            machine.outb(base + 0x0C, byte);
+            return;
+        }
+    }
+}
+
+fn dsp_read_at<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
+    for _ in 0..100_000 {
+        if machine.inb(base + 0x0E) & 0x80 != 0 {
+            return machine.inb(base + 0x0A);
+        }
+    }
+    0xFF
 }
 
 /// Bring up the SB16 the platform probe found. Driver init only.
@@ -127,21 +226,6 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
     if bring_up(machine) {
         PRESENT.store(true, Ordering::Relaxed);
     }
-}
-
-/// Standard DSP reset: pulse `DSP_RESET` 1→0, wait for data-ready, read 0xAA.
-fn dsp_reset<A: crate::Arch>(machine: &mut A) -> bool {
-    machine.outb(DSP_RESET, 1);
-    for _ in 0..1000 {
-        core::hint::spin_loop();
-    }
-    machine.outb(DSP_RESET, 0);
-    for _ in 0..100_000 {
-        if machine.inb(DSP_RSTAT) & 0x80 != 0 && machine.inb(DSP_READ) == 0xAA {
-            return true;
-        }
-    }
-    false
 }
 
 /// Write one DSP command/data byte once the write buffer is ready (bit7 clear).
@@ -156,23 +240,11 @@ fn dsp_write<A: crate::Arch>(machine: &mut A, byte: u8) {
 
 /// Read the SB16 mixer's IRQ-select register (0x80) into an IRQ line. Bits:
 /// 1=IRQ2, 2=IRQ5, 4=IRQ7, 8=IRQ10. Defaults to 5 if the mixer is mute (0xFF).
-fn read_irq<A: crate::Arch>(machine: &mut A) -> u8 {
-    machine.outb(MIX_IDX, 0x80);
-    match machine.inb(MIX_DATA) {
-        0xFF => 5,
-        v if v & 0x04 != 0 => 7,
-        v if v & 0x08 != 0 => 10,
-        v if v & 0x01 != 0 => 2,
-        _ => 5,
-    }
-}
-
 fn bring_up<A: crate::Arch>(machine: &mut A) -> bool {
-    if !dsp_reset(machine) {
-        return false;
-    }
-    let irq = read_irq(machine);
-    machine.route_isa_irq(irq);
+
+    let Some(card) = crate::kernel::platform::get().sb_card else { return false };
+    let Some(w) = card.wiring else { return false }; // sink implies SB16
+    machine.route_isa_irq(w.irq);
 
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
@@ -203,8 +275,8 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> bool {
         consumed_frames: 0,
         last_dma_pos: 0,
     });
-    IRQ_LINE.store(irq as u32, Ordering::Relaxed);
-    crate::println!("sb16: {:#05x} DSP up, IRQ {}, DMA {}", BASE, irq, DMA_CHANNEL);
+    IRQ_LINE.store(w.irq as u32, Ordering::Relaxed);
+    crate::println!("sb16: sink on {:#05x}, IRQ {}, DMA {}", card.base, w.irq, DMA_CHANNEL);
     true
 }
 
@@ -385,7 +457,7 @@ pub fn stop<A: crate::Arch>(machine: &mut A, _park: bool) {
         dsp_write(machine, CMD_HALT_AUTO_16);
         machine.outb(DMA5_MASK, 0x05); // mask channel 5
     }
-    let _ = dsp_reset(machine);
+    let _ = dsp_reset_at(machine, BASE);
     dsp_write(machine, CMD_SPEAKER_ON);
     dev.running = false;
     dev.rate = 0;

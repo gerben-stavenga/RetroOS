@@ -1151,12 +1151,13 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             let _ = pc.mouse.apply_packet(machine, regs, dx, dy, buttons);
         }
         Irq::Hw(line) => {
-            if line != 5 {
+            if line != pc.sb.host_irq {
                 return;
             }
-            // Real QEMU sb16 is wired to host IRQ5. Relay it to the guest's
-            // BLASTER-declared IRQ line, but leave the host IRQ masked until
-            // the guest completes the virtual interrupt with a PIC EOI.
+            // The physical card's completion line (read from its mixer, or
+            // declared for a card that cannot report it). Relay it to the
+            // guest's BLASTER IRQ, leaving the host line masked until the
+            // guest completes the virtual interrupt with a PIC EOI.
             if !pc.vpic.is_requested(pc.sb.irq) {
                 pc.vpic.raise(pc.sb.irq);
             }

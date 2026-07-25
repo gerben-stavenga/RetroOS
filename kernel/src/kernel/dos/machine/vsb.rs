@@ -117,6 +117,16 @@ pub struct SoundBlaster {
     /// a guest channel-D transfer must drive *these* on the real 8237.
     pub host_dma8: u8,
     pub host_dma16: u8,
+    /// The physical card's IRQ line — what the host PIC delivers when the
+    /// real DSP completes a block. Relayed to the guest's `irq` (which in
+    /// native mode is the same number, since BLASTER is fabricated from
+    /// this card). 0xFF = unknown, nothing to relay.
+    pub host_irq: u8,
+    /// The physical card's port base — where passthrough traffic actually
+    /// goes. Equals `io_base` in native mode (BLASTER is fabricated from
+    /// this card); in mixed mode the guest's base is the owner's choice and
+    /// this is the sink's target.
+    pub io_base_host: u16,
     dsp_test_reg: u8,
     dsp_read_data: Option<u8>,
     dsp_expect_test_write: bool,
@@ -164,7 +174,11 @@ impl SoundBlaster {
         Self {
             core: sound::sb::Sb::new(),
             io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
-            host_dma8: 1, host_dma16: 5, // QEMU `-device sb16` defaults
+            // Filled from the detected card in `configure_from_env`; there
+            // is no sane default, so an undetected card simply never
+            // remaps (and says so) rather than driving someone else's
+            // channels.
+            host_dma8: 0xFF, host_dma16: 0xFF, host_irq: 0xFF, io_base_host: 0,
             dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
             dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
@@ -612,6 +626,17 @@ impl SoundBlaster {
     /// or missing tokens leave the SB16 defaults. `env` is the raw DOS
     /// environment block (NUL-separated `KEY=VAL`, double-NUL terminated).
     pub fn configure_from_env(&mut self, env: &[u8]) {
+        // Host side: what the physical card reported (SB16 mixer) or the
+        // owner declared. Only meaningful when a real card is there; the
+        // emulated-only machine leaves these unknown and never remaps.
+        if let Some(card) = crate::kernel::platform::get().sb_card {
+            self.io_base_host = card.base;
+            if let Some(w) = card.wiring {
+                self.host_irq = w.irq;
+                self.host_dma8 = w.dma8;
+                self.host_dma16 = w.dma16.unwrap_or(0xFF);
+            }
+        }
         let Some(val) = env_var(env, b"BLASTER") else { return };
         for tok in val.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
             let (key, rest) = (tok[0].to_ascii_uppercase(), &tok[1..]);

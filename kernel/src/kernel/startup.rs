@@ -77,12 +77,47 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
-    let master_env = load_master_env();
+    let mut master_env = load_master_env();
+    let sb_audio = crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
+        .map(alloc::vec::Vec::from)
+        .unwrap_or_default();
     let mixed = boot.audio_mixed
-        || crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
-            .is_some_and(|v| v.eq_ignore_ascii_case(b"mixed"));
+        || sb_audio.split(|&b| b == b' ').next().is_some_and(|m| m.eq_ignore_ascii_case(b"mixed"));
     crate::kernel::platform::apply_audio_mode(mixed);
     let platform = crate::kernel::platform::get();
+
+    // BLASTER describes THE CARD THE GUEST SEES.
+    //
+    //   mixed  — that card is our emulated SB16, so CONFIG.SYS's BLASTER
+    //            stands verbatim: the owner picks whatever settings their
+    //            games are configured for. (The real card's own wiring is
+    //            the sink driver's business, read from its mixer.)
+    //   native — that card is the physical one, so BLASTER is fabricated
+    //            from what the card reported. An SB16 reports its own
+    //            IRQ/DMA; below DSP 4 those straps are invisible to
+    //            software and the owner declares them on the SB_AUDIO line
+    //            (`SB_AUDIO=native <irq> <dma8>`). Nothing is guessed — a
+    //            wrong IRQ silently swallows every completion.
+    if platform.audio == crate::kernel::platform::Audio::NativeSb
+        && let Some(card) = platform.sb_card
+    {
+        let declared = parse_sb_wiring(&sb_audio);
+        match card.wiring.or(declared) {
+            Some(w) => {
+                let mut b = alloc::vec::Vec::new();
+                fmt_blaster(&mut b, card.base, w.irq, w.dma8, w.dma16);
+                crate::println!(
+                    "Audio: native SB — BLASTER={}",
+                    core::str::from_utf8(&b).unwrap_or("?")
+                );
+                crate::kernel::dos::set_config_var(&mut master_env, b"BLASTER", &b);
+            }
+            None => crate::println!(
+                "Audio: SB DSP {}.x at {:#05x} has no readable wiring — declare it as                  `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; sound is off until then",
+                card.dsp_major, card.base
+            ),
+        }
+    }
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
@@ -276,6 +311,44 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
         .or_else(|_| crate::kernel::exec::load_file_resolved(&boot_cfg))
         .unwrap_or_default();
     crate::kernel::dos::parse_config_env(&config)
+}
+
+/// `SB_AUDIO=native <irq> <dma8>` — the wiring an owner declares for a card
+/// that cannot report its own (pre-SB16). `None` when absent or malformed.
+fn parse_sb_wiring(v: &[u8]) -> Option<crate::kernel::drivers::sb16::SbWiring> {
+    let mut it = v.split(|&b| b == b' ').filter(|t| !t.is_empty()).skip(1);
+    let irq = parse_u8(it.next()?)?;
+    let dma8 = parse_u8(it.next()?)?;
+    Some(crate::kernel::drivers::sb16::SbWiring { irq, dma8, dma16: None })
+}
+
+fn parse_u8(s: &[u8]) -> Option<u8> {
+    let mut n: u32 = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n * 10 + (b - b'0') as u32;
+    }
+    (!s.is_empty() && n < 256).then_some(n as u8)
+}
+
+/// `A%03x I%d D%d[ H%d]` — the canonical BLASTER form. The 16-bit channel is
+/// only present on cards that have one.
+fn fmt_blaster(out: &mut alloc::vec::Vec<u8>, base: u16, irq: u8, dma8: u8, dma16: Option<u8>) {
+    use core::fmt::Write;
+    struct W<'a>(&'a mut alloc::vec::Vec<u8>);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            self.0.extend_from_slice(s.as_bytes());
+            Ok(())
+        }
+    }
+    let mut w = W(out);
+    let _ = write!(w, "A{:03X} I{} D{}", base, irq, dma8);
+    if let Some(h) = dma16 {
+        let _ = write!(w, " H{}", h);
+    }
 }
 
 /// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel
