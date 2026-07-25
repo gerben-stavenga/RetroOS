@@ -143,7 +143,7 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
             return;
         }
         Audio::EmulatedPortWindow => {}
-        Audio::EmulatedSilent => return,
+        Audio::NativeSb | Audio::EmulatedSilent => return,
     }
     if LAST_RATE.swap(rate, Ordering::Relaxed) != rate {
         machine.outw(AUDIO_SIG, rate as u16);
@@ -167,7 +167,7 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::stop(machine, park),
         Audio::RealSb => crate::kernel::drivers::sb16::stop(machine, park),
-        Audio::EmulatedAc97 | Audio::EmulatedPortWindow | Audio::EmulatedSilent => {}
+        Audio::NativeSb | Audio::EmulatedAc97 | Audio::EmulatedPortWindow | Audio::EmulatedSilent => {}
     }
 }
 
@@ -189,7 +189,7 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
         Audio::EmulatedHda => crate::kernel::drivers::hda::position(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::position(machine),
         Audio::RealSb => crate::kernel::drivers::sb16::position(machine),
-        Audio::EmulatedPortWindow | Audio::EmulatedSilent => None,
+        Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => None,
     }
 }
 
@@ -205,7 +205,7 @@ pub fn min_fill(rate: u32) -> Option<u32> {
         Audio::EmulatedHda => crate::kernel::drivers::hda::present(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::present(),
         Audio::RealSb => crate::kernel::drivers::sb16::present(),
-        Audio::EmulatedPortWindow | Audio::EmulatedSilent => false,
+        Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => false,
     };
     present.then(|| rate * PIPE_MS / 1000)
 }

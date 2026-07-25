@@ -71,11 +71,19 @@ pub enum Firmware {
 /// and sound's port-window signature cache.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Audio {
-    /// A real Sound Blaster 16 answered the DSP reset/probe (legacy metal, QEMU
-    /// `sb16`): the software SB/GUS/GM are emulated as usual and their canonical
+    /// A real Sound Blaster answered on a LEGACY machine (real VGA scanout —
+    /// the 386/486/Pentium class, and QEMU's BIOS path with `-device sb16`):
+    /// the guest owns the card NATIVELY. DSP traffic forwards straight to the
+    /// hardware, guest 8237 programming is remapped onto the real chip, the
+    /// card's IRQ reaches the guest vPIC — zero kernel mixing, no kernel
+    /// sink, and no GM bank ROM is burned. Old hardware cannot afford the
+    /// emulated stack and does not need it: the machine IS the sound card the
+    /// games were written for.
+    NativeSb,
+    /// A real Sound Blaster 16 answered on a MODERN (non-legacy-VGA) machine:
+    /// the software SB/GUS/GM are emulated as usual and their canonical
     /// PCM renders out the real SB16 as the kernel `sound` sink (`drivers::sb16`,
-    /// 16-bit auto-init DMA on channel 5, IRQ 5). (Phase B will make ownership of
-    /// the card movable — handing it to the guest for native SB playback.)
+    /// 16-bit auto-init DMA on channel 5, IRQ 5).
     RealSb,
     /// No card; the software SB16 renders through the kernel sound API into an
     /// Intel HD Audio controller found on PCI (QEMU `intel-hda`, modern metal).
@@ -97,7 +105,7 @@ impl Audio {
     /// present it is a kernel sink, not guest-owned — so this is always false.
     /// Phase B makes it dynamic (true while a DOS program drives the card).
     pub fn sb_passthrough(self) -> bool {
-        false
+        matches!(self, Audio::NativeSb)
     }
 }
 
@@ -218,6 +226,15 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             Firmware::Substitute
         };
 
+        // The audio mode follows the machine class: a real SB on a machine
+        // whose display is a real VGA is the legacy class — the guest gets
+        // the card natively (see Audio::NativeSb). The same card on a
+        // modern machine stays a kernel sink.
+        let audio = if audio == Audio::RealSb && matches!(display, Display::VgaCard) {
+            Audio::NativeSb
+        } else {
+            audio
+        };
         Platform {
             host: env.host(boot.is_qemu),
             display,
