@@ -51,7 +51,6 @@ pub fn present() {
 pub struct Scratch {
     pal: lib::vga_render::Pal,
     pal_cache: [u8; 768],
-    src: alloc::vec::Vec<u32>,
     row: alloc::vec::Vec<u32>,
     /// Geometry the beam is armed for `(w, h, out_w, out_h)`; any change
     /// restarts the sweep at the top — a mode switch repaints everything,
@@ -79,7 +78,6 @@ impl Scratch {
         Scratch {
             pal: lib::vga_render::Pal::new(),
             pal_cache: [0; 768],
-            src: alloc::vec::Vec::new(),
             row: alloc::vec::Vec::new(),
             geo: (0, 0, 0, 0),
             sy: 0,
@@ -213,19 +211,15 @@ pub fn raster(
         return (0, false); // no downscaling path
     }
 
-    // Each source pixel covers `xbase` or `xbase + 1` output pixels; the
-    // stretcher fills the wider constant every time and steps by the true
-    // amount, so it overshoots at most `xbase + 1` past the content edge.
-    let (xbase, xrem) = (out_w / w, out_w % w);
     let (ybase, yrem) = (out_h / h, out_h % h);
     let bx = (fb.width - out_w) / 2; // left border width
     let by = (fb.height - out_h) / 2; // top border height
-    let slack = xbase + 1;
+    // `render_row_stretched` overwrites a constant ceil(out_w/w) run per
+    // source pixel; the buffer carries that much slack past the content.
+    let slack = out_w.div_ceil(w);
 
     if s.geo != (w, h, out_w, out_h) || s.row.len() != out_w + slack {
         s.geo = (w, h, out_w, out_h);
-        s.src.clear();
-        s.src.resize(w, 0);
         s.row.clear();
         s.row.resize(out_w + slack, 0);
         s.sy = 0;
@@ -278,13 +272,7 @@ pub fn raster(
             }
             continue;
         }
-        lib::vga_render::render_row(frame, s.sy, &s.pal, &mut s.src);
-        let (mut o, mut xerr) = (0usize, 0usize);
-        for &v in &s.src {
-            s.row[o..o + xbase + 1].fill(v);
-            xerr += xrem;
-            o += xbase + if xerr >= w { xerr -= w; 1 } else { 0 };
-        }
+        lib::vga_render::render_row_stretched(frame, s.sy, &s.pal, &mut s.row, out_w);
         s.yerr += yrem;
         let rows = ybase + if s.yerr >= h { s.yerr -= h; 1 } else { 0 };
         for _ in 0..rows {
