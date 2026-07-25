@@ -52,6 +52,8 @@ struct Geom {
     format: PixelFormat,
     /// QEMU-TCG needs strong-UC stores for display dirty tracking.
     slow: bool,
+    /// Bare metal (no hypervisor): wide NT stores for device-row copies.
+    wide: bool,
 }
 static mut GEOM: Option<Geom> = None;
 
@@ -158,6 +160,7 @@ pub fn framebuffer() -> Option<crate::kernel::display::Framebuffer> {
         height: g.len / g.stride,
         format: g.format.to_display(),
         slow: g.slow,
+        wide: g.wide,
     })
 }
 
@@ -299,6 +302,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         len: stride * height,
         format,
         slow: qemu_tcg,
+        wide: (cpuid1_ecx >> 31) & 1 == 0, // no hypervisor = real WC aperture
     });
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel

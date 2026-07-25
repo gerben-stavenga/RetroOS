@@ -32,6 +32,12 @@ pub struct Framebuffer {
     /// Full-frame writes are unusually expensive (QEMU-TCG's strong-UC GOP
     /// mapping), so emulated VGA should use a conservative refresh cadence.
     pub slow: bool,
+    /// Bare metal: device-row copies use 16-byte non-temporal stores. Real
+    /// WC apertures never engage the CPU's fast-string path, so rep movsd
+    /// issues one 4-byte store per cycle there; under a hypervisor the
+    /// framebuffer is host-RAM-backed (effectively WB) and rep movsd's
+    /// fast-string/helper paths win instead — both measured.
+    pub wide: bool,
 }
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
@@ -106,25 +112,81 @@ retroos_fb_copy32:
     pop esi
     ret
     .size retroos_fb_copy32, .-retroos_fb_copy32
+
+    .global retroos_fb_copy32_wide
+    .type retroos_fb_copy32_wide, @function
+    /* Wide device-row copy: 16-byte non-temporal stores to the WC
+     * framebuffer — four times fewer store instructions than rep movsd.
+     * The kernel swaps FPU/SSE state only at thread switch, so the guest's
+     * live XMM registers are resident here: xmm0 is spilled around the
+     * copy. Head loop aligns the destination to 16 (movntdq requires it);
+     * the sfence keeps the NT stores ordered before the caller's
+     * present-time WC drain. */
+retroos_fb_copy32_wide:
+    push esi
+    push edi
+    mov edi, dword ptr [esp + 12]
+    mov esi, dword ptr [esp + 16]
+    mov ecx, dword ptr [esp + 20]
+    cld
+    sub esp, 16
+    movdqu [esp], xmm0
+1:  test edi, 15
+    jz 2f
+    test ecx, ecx
+    jz 4f
+    movsd
+    dec ecx
+    jmp 1b
+2:  mov eax, ecx
+    shr eax, 2
+    jz 4f
+    and ecx, 3
+3:  movdqu xmm0, [esi]
+    movntdq [edi], xmm0
+    add esi, 16
+    add edi, 16
+    dec eax
+    jnz 3b
+4:  rep movsd
+    movdqu xmm0, [esp]
+    add esp, 16
+    sfence
+    pop edi
+    pop esi
+    ret
+    .size retroos_fb_copy32_wide, .-retroos_fb_copy32_wide
 "#
 );
 
 #[cfg(target_arch = "x86")]
 unsafe extern "C" {
     fn retroos_fb_copy32(dst: *mut u32, src: *const u32, len: usize);
+    fn retroos_fb_copy32_wide(dst: *mut u32, src: *const u32, len: usize);
 }
 
 /// Copy framebuffer pixels in their native 32-bit unit. The freestanding
 /// runtime's generic `memcpy` is `rep movsb`; using MOVSD here quarters the
 /// architectural transfer count and lets x86/QEMU recognize the bulk store.
+///
+/// `wide` selects 16-byte non-temporal stores (real hardware: ERMS fast
+/// strings never engage on the WC framebuffer, so rep movsd issues one
+/// 4-byte store per cycle — the wide path quarters the issue count). Under
+/// TCG (`fb.slow`) rep movsd IS the fast path — one helper call — so the
+/// caller keeps `wide` off there.
 #[inline]
-unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize) {
+unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize, wide: bool) {
     #[cfg(target_arch = "x86")]
     unsafe {
-        retroos_fb_copy32(dst, src, len);
+        if wide {
+            retroos_fb_copy32_wide(dst, src, len);
+        } else {
+            retroos_fb_copy32(dst, src, len);
+        }
     }
     #[cfg(target_arch = "x86_64")]
     unsafe {
+        let _ = wide; // 64-bit metal: measure before adding the SSE path
         core::arch::asm!(
             "rep movsd",
             inout("rcx") len => _,
@@ -278,7 +340,7 @@ pub fn raster(
         for _ in 0..rows {
             let d = (by + s.oy) * fb.stride + bx;
             unsafe {
-                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), out_w);
+                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), out_w, fb.wide);
             }
             copied += out_w;
             s.oy += 1;
