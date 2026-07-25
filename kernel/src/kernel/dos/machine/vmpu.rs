@@ -170,7 +170,7 @@ impl Mpu {
     /// satisfy a bounded number of its instrument requests. `arrival_frame` is
     /// the current mix-frame the bytes arrived at — the synth applies each at
     /// that frame so note onset timing is independent of the mix block size.
-    pub fn tick(&mut self, arrival_frame: u64) {
+    pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
         if !self.present {
             return;
         }
@@ -195,9 +195,18 @@ impl Mpu {
             if self.denied(id) {
                 continue;
             }
+            // Timed to the wall clock: notes stay silent until their patch is
+            // resident, so a slow bank read IS an audible music-start delay.
+            let t0 = machine.get_ticks();
             if !self.load_patch(id) {
                 self.deny(id);
                 crate::dbg_println!("[mpu] no patch for id {}", id);
+            } else {
+                crate::dbg_println!(
+                    "[mpu] patch {} loaded in {} ms",
+                    id,
+                    machine.get_ticks().saturating_sub(t0)
+                );
             }
         }
     }

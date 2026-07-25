@@ -1008,7 +1008,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // MPU-401: drain the port's MIDI bytes into the synth (stamped at the arrival
     // frame) and satisfy a bounded number of its instrument requests (a .PAT
     // read per request).
-    mpu.tick(mixer.midi_frame);
+    mpu.tick(machine, mixer.midi_frame);
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
     // drives an emulated device hard (the GUS driver writes GF1 registers by
