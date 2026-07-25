@@ -137,11 +137,13 @@ unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize) {
     }
 }
 
-/// Vertical-blank length in beam steps: ~6% of the sweep, close enough to
-/// the real VGA's vertical blanking for code that races the beam or batches
-/// DAC loads into the window.
+/// Vertical-blank length in beam steps (source rows). The 70 Hz VGA CRTC
+/// scans 449 lines per frame with 400 visible and 49 blanked, so the blank
+/// tail is 49/400 of the visible height — ≈10.9% of the period, ~1.56 ms.
+/// `h·49/400` gives the hardware-exact fraction for both the 200-line
+/// (double-scanned) and 400-line mode families.
 fn vblank_rows(h: usize) -> usize {
-    (h / 16).max(1)
+    (h * 49 / 400).max(1)
 }
 
 /// The beam's guest-visible vertical-retrace state, when a beam is actively
