@@ -873,18 +873,18 @@ static mut SLICE_PARTS: [u64; 5] = [0; 5];
 /// tick+display total can be divided by the right denominator.
 static mut PRESENTS: u64 = 0;
 
-/// display_tick's internals: scanout, allocation, render, present — plus the
-/// number of destination pixels actually copied after dirty-span rejection.
-static mut DISP_PARTS: [u64; 5] = [0; 5];
+/// display_tick's internals: scanout cycles, band-pass count (one raster
+/// band or one whole window-sink frame per bill), render/copy cycles, and
+/// destination pixels written.
+static mut DISP_PARTS: [u64; 4] = [0; 4];
 
-pub fn bill_display(scanout: u64, alloc: u64, render: u64, present: u64, px: usize) {
+pub fn bill_display(scanout: u64, bands: u64, raster: u64, px: usize) {
     unsafe {
         let p = &raw mut DISP_PARTS;
         (*p)[0] = (*p)[0].wrapping_add(scanout);
-        (*p)[1] = (*p)[1].wrapping_add(alloc);
-        (*p)[2] = (*p)[2].wrapping_add(render);
-        (*p)[3] = (*p)[3].wrapping_add(present);
-        (*p)[4] = (*p)[4].wrapping_add(px as u64);
+        (*p)[1] = (*p)[1].wrapping_add(bands);
+        (*p)[2] = (*p)[2].wrapping_add(raster);
+        (*p)[3] = (*p)[3].wrapping_add(px as u64);
     }
 }
 
@@ -1222,10 +1222,14 @@ impl EventStats {
                     sp[2], np, sp[2].checked_div(np.max(1)).unwrap_or(0),
                     sp[3]);
                 let dp = unsafe { DISP_PARTS };
-                unsafe { DISP_PARTS = [0; 5] };
+                unsafe { DISP_PARTS = [0; 4] };
                 let per = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
-                crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} copied={}px",
-                    per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), per(dp[4]));
+                let slice = |v: u64| v.checked_div(dp[1].max(1)).unwrap_or(0);
+                crate::dbg_println!(
+                    "[prof]   display/frame: scanout={} raster={} copied={}px | per-slice: scanout={} raster={} ({} slices, {}% of window)",
+                    per(dp[0]), per(dp[2]), per(dp[3]),
+                    slice(dp[0]), slice(dp[2]), dp[1],
+                    pct(dp[0].wrapping_add(dp[2])));
                 let ap = unsafe { AUDIO_PARTS };
                 unsafe { AUDIO_PARTS = [0; 5] };
                 crate::dbg_println!(

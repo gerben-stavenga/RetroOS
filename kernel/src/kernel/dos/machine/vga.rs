@@ -1742,7 +1742,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         if prof {
             let p4 = machine.rdtsc();
             crate::kernel::startup::bill_display(
-                p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), copied);
+                p1.wrapping_sub(p0), 1, p4.wrapping_sub(p1), copied);
         }
         return;
     }
@@ -1769,6 +1769,6 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if prof {
         let p4 = machine.rdtsc();
         crate::kernel::startup::bill_display(
-            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), need);
+            p1.wrapping_sub(p0), 1, p4.wrapping_sub(p1), need);
     }
 }

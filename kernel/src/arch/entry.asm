@@ -39,9 +39,14 @@ dd 0, 0, 0, 0, 0
 ; Video request (flags bit 2). On UEFI-class machines (no VGA text mode) the
 ; loader hands back a linear framebuffer in the info struct; our own legacy
 ; bootloader ignores the header and boots in VGA text mode as before.
+; Width/height 0 = no preference (multiboot spec): the loader's gfxmode=auto
+; then picks the panel's NATIVE mode. A concrete request here (1024x768
+; historically) made GRUB pick a 4:3 GOP mode on the 16:10 laptop, which the
+; panel's scaler stretched to full screen — fat pixels, wrong aspect, no
+; pillarbox. Depth stays a real request: fbcon renders 32bpp only.
 dd 0          ; mode_type: 0 = linear graphics
-dd 1024       ; width  (a request — the loader picks the nearest GOP mode)
-dd 768        ; height
+dd 0          ; width  (0 = no preference -> loader picks native)
+dd 0          ; height
 dd 32         ; depth
 
 ; =============================================================================
