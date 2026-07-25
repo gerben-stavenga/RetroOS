@@ -3,7 +3,7 @@
 //! On a machine whose real sound hardware is a Sound Blaster 16, the emulated
 //! cards (`vsb`/`vgus`/`vmpu`) produce canonical PCM and the kernel `sound`
 //! layer needs somewhere to play it. This driver is that sink: `sound::play`
-//! dispatches here when the platform probe found a real SB16 (`Audio::RealSb`).
+//! dispatches here when the platform probe found a real SB16 (`Audio::SbSink`).
 //!
 //! It drives the real DSP for **16-bit signed-stereo auto-init DMA** on the ISA
 //! 8237 (channel 5) — the SB16's own double-buffer scheme, where each completed
@@ -121,7 +121,7 @@ pub fn scan<A: crate::Arch>(machine: &mut A) -> bool {
 
 /// Bring up the SB16 the platform probe found. Driver init only.
 pub fn init<A: crate::Arch>(machine: &mut A) {
-    if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::RealSb {
+    if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::SbSink {
         return;
     }
     if bring_up(machine) {

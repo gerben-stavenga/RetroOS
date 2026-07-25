@@ -80,11 +80,15 @@ pub enum Audio {
     /// emulated stack and does not need it: the machine IS the sound card the
     /// games were written for.
     NativeSb,
-    /// A real Sound Blaster 16 answered on a MODERN (non-legacy-VGA) machine:
-    /// the software SB/GUS/GM are emulated as usual and their canonical
-    /// PCM renders out the real SB16 as the kernel `sound` sink (`drivers::sb16`,
-    /// 16-bit auto-init DMA on channel 5, IRQ 5).
-    RealSb,
+    /// A real Sound Blaster on a BIOS machine that the owner chose to run
+    /// EMULATED (`audio=mixed`): the software SB/GUS/GM are emulated as usual
+    /// and their canonical PCM renders out the real card as the kernel `sound`
+    /// sink (`drivers::sb16`, 16-bit auto-init DMA on channel 5, IRQ 5). Buys
+    /// GUS/GM music on a machine that only has an SB — DOOM with wavetable
+    /// MIDI on a fast Pentium — at the cost of mixing every source in
+    /// software. Not a probe verdict: one card has one owner, so this is a
+    /// judgment about CPU budget that only the machine's owner can make.
+    SbSink,
     /// No card; the software SB16 renders through the kernel sound API into an
     /// Intel HD Audio controller found on PCI (QEMU `intel-hda`, modern metal).
     EmulatedHda,
@@ -104,6 +108,8 @@ impl Audio {
     /// vs the software DSP. Phase A always emulates — even with a real SB16
     /// present it is a kernel sink, not guest-owned — so this is always false.
     /// Phase B makes it dynamic (true while a DOS program drives the card).
+    /// The guest owns the Sound Blaster: its DSP/mixer ports are granted
+    /// through the IOPB and its DMA is remapped onto the real 8237.
     pub fn sb_passthrough(self) -> bool {
         matches!(self, Audio::NativeSb)
     }
@@ -226,14 +232,24 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             Firmware::Substitute
         };
 
-        // The audio mode follows the machine class: a real SB on a machine
-        // whose display is a real VGA is the legacy class — the guest gets
-        // the card natively (see Audio::NativeSb). The same card on a
-        // modern machine stays a kernel sink.
-        let audio = if audio == Audio::RealSb && matches!(display, Display::VgaCard) {
-            Audio::NativeSb
-        } else {
-            audio
+        // Display and sound are decided on independent axes.
+        //
+        // The DISPLAY axis is firmware: a BIOS machine has a real VGA that
+        // scans out its own memory (nothing for us to do), a UEFI machine
+        // has a dumb framebuffer we raster into. That is `display` above.
+        //
+        // The SOUND axis is the CARD. HDA and AC'97 are PCI codecs no DOS
+        // program can drive, so they are always emulated-and-mixed — true
+        // on a UEFI laptop and equally on a BIOS-era PCI machine (native
+        // VGA, emulated sound). Only a real Sound Blaster is a card the
+        // guest itself can drive, so only there is there a choice, and it
+        // is the owner's: native by default (guest owns the card, no
+        // kernel mixing, no bank ROM — what a 386/486 can afford) or
+        // emulated when they want GUS/GM music on a machine fast enough to
+        // mix it (`audio=mixed`).
+        let audio = match audio {
+            Audio::NativeSb | Audio::SbSink if boot.audio_mixed => Audio::SbSink,
+            other => other,
         };
         Platform {
             host: env.host(boot.is_qemu),
@@ -284,9 +300,11 @@ pub fn probed() -> bool {
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
 fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
-    // A real SB16 answers a DSP reset with 0xAA — it becomes the kernel sink.
+    // A real SB answers a DSP reset with 0xAA. Whether the guest owns it or
+    // the kernel mixes through it is decided by the caller (firmware class +
+    // the owner's `audio=` choice); this is only "a card is there".
     if crate::kernel::drivers::sb16::scan(machine) {
-        return Audio::RealSb;
+        return Audio::NativeSb;
     }
     if crate::kernel::drivers::hda::scan(machine).is_some() {
         return Audio::EmulatedHda;

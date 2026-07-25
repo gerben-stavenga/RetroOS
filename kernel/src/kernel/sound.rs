@@ -111,7 +111,7 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
         {
             crate::kernel::drivers::ac97::on_irq(machine)
         }
-        (Audio::RealSb, crate::Irq::Hw(line))
+        (Audio::SbSink, crate::Irq::Hw(line))
             if Some(line) == crate::kernel::drivers::sb16::irq_line() =>
         {
             let ours = crate::kernel::drivers::sb16::on_irq(machine);
@@ -138,7 +138,7 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
             crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes);
             return;
         }
-        Audio::RealSb => {
+        Audio::SbSink => {
             crate::kernel::drivers::sb16::play(machine, rate, fmt, bytes);
             return;
         }
@@ -166,7 +166,7 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     use crate::kernel::platform::Audio;
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::stop(machine, park),
-        Audio::RealSb => crate::kernel::drivers::sb16::stop(machine, park),
+        Audio::SbSink => crate::kernel::drivers::sb16::stop(machine, park),
         Audio::NativeSb | Audio::EmulatedAc97 | Audio::EmulatedPortWindow | Audio::EmulatedSilent => {}
     }
 }
@@ -188,7 +188,7 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::position(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::position(machine),
-        Audio::RealSb => crate::kernel::drivers::sb16::position(machine),
+        Audio::SbSink => crate::kernel::drivers::sb16::position(machine),
         Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => None,
     }
 }
@@ -204,7 +204,7 @@ pub fn min_fill(rate: u32) -> Option<u32> {
     let present = match crate::kernel::platform::get().audio {
         Audio::EmulatedHda => crate::kernel::drivers::hda::present(),
         Audio::EmulatedAc97 => crate::kernel::drivers::ac97::present(),
-        Audio::RealSb => crate::kernel::drivers::sb16::present(),
+        Audio::SbSink => crate::kernel::drivers::sb16::present(),
         Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => false,
     };
     present.then(|| rate * PIPE_MS / 1000)

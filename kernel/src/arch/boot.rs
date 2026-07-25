@@ -298,6 +298,10 @@ fn read_boot_config() -> crate::BootConfig {
     if let Some(n) = read_named(b"opt/debug-watch", &mut dw) {
         cfg.debug_watch = crate::parse_debug_watch(&dw[..n]);
     }
+    let mut audio = [0u8; 16];
+    if let Some(n) = read_named(b"opt/audio", &mut audio) {
+        cfg.audio_mixed = audio[..n].starts_with(b"mixed");
+    }
     cfg
 }
 

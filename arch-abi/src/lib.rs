@@ -47,6 +47,14 @@ pub struct BootConfig {
     /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
     /// real hardware, whose 0x3DA is passed through).
     pub is_qemu: bool,
+    /// `audio=mixed`: on a BIOS machine with a real Sound Blaster, run the
+    /// EMULATED sound stack (SB + OPL + GUS + GM mixed in software, rendered
+    /// out the card) instead of handing the card to the guest. Buys wavetable
+    /// GUS/GM music on an SB-only machine at the cost of mixing everything —
+    /// a CPU-budget judgment that only the machine's owner can make, so it is
+    /// a knob and never a probe heuristic. Ignored on UEFI machines, which
+    /// have no ISA card to hand over and always mix.
+    pub audio_mixed: bool,
 }
 
 impl BootConfig {
@@ -55,7 +63,7 @@ impl BootConfig {
             cmdline: [0; 4096], cmdline_len: None,
             cwd: [0; 256], cwd_len: None,
             c_root: [0; 128], c_root_len: 0,
-            debug_watch: None, is_qemu: false,
+            debug_watch: None, is_qemu: false, audio_mixed: false,
         };
         // Default C: root = "home/retroos/".
         let d = *b"home/retroos/";
