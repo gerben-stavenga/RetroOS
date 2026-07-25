@@ -72,31 +72,6 @@ pub fn config_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     machine::env_var(env, key)
 }
 
-/// Replace (or add) `KEY=VALUE` in a DOS environment block. Startup uses it
-/// to fabricate `BLASTER` from the detected card in native mode.
-pub fn set_config_var(env: &mut alloc::vec::Vec<u8>, key: &[u8], val: &[u8]) {
-    let mut out = alloc::vec::Vec::with_capacity(env.len() + key.len() + val.len() + 2);
-    let mut i = 0;
-    while i < env.len() && env[i] != 0 {
-        let end = env[i..].iter().position(|&b| b == 0).map(|p| i + p).unwrap_or(env.len());
-        let entry = &env[i..end];
-        let keep = match entry.iter().position(|&b| b == b'=') {
-            Some(eq) => !entry[..eq].eq_ignore_ascii_case(key),
-            None => true,
-        };
-        if keep {
-            out.extend_from_slice(entry);
-            out.push(0);
-        }
-        i = end + 1;
-    }
-    out.extend_from_slice(key);
-    out.push(b'=');
-    out.extend_from_slice(val);
-    out.push(0);
-    out.push(0);
-    *env = out;
-}
 
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
 // the INT handlers that own them); the `dpmi` sibling module also reads them

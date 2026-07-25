@@ -77,7 +77,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
-    let mut master_env = load_master_env();
+    let master_env = load_master_env();
     let sb_audio = crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
         .map(alloc::vec::Vec::from)
         .unwrap_or_default();
@@ -98,36 +98,52 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     //            software and the owner declares them on the SB_AUDIO line
     //            (`SB_AUDIO=native <irq> <dma8>`). Nothing is guessed — a
     //            wrong IRQ silently swallows every completion.
+    // BLASTER is authoritative in both modes — it declares the card the
+    // guest sees, and the owner sets it to whatever their games expect.
+    //
+    // In MIXED mode that card is ours, so every value is honoured as-is.
+    //
+    // In NATIVE mode the guest drives real silicon, and only one of those
+    // values is physical: the PORT is granted through the IOPB, so the
+    // guest's writes land wherever BLASTER points — the card's base or
+    // nothing at all. IRQ and DMA are labels the machine translates (the
+    // card's line is relayed onto the guest's vPIC line, its 8237 channels
+    // are remapped onto the card's), so those stay free. We verify rather
+    // than rewrite: a mismatch is the owner's to fix, and silently
+    // "correcting" it would break the games whose own configs agree with
+    // CONFIG.SYS.
     if platform.audio == crate::kernel::platform::Audio::NativeSb
         && let Some(card) = platform.sb_card
     {
+        let blaster = crate::kernel::dos::config_var(&master_env, b"BLASTER")
+            .map(alloc::vec::Vec::from)
+            .unwrap_or_default();
+        match blaster_base(&blaster) {
+            Some(b) if b == card.base => {}
+            Some(b) => crate::println!(
+                "Audio: BLASTER declares A{:03X} but the card answers at {:#05X} — the guest will \
+                 find no card there. Fix BLASTER in CONFIG.SYS (or move the card).",
+                b, card.base
+            ),
+            None => crate::println!(
+                "Audio: no BLASTER port declared, card is at {:#05X}", card.base
+            ),
+        }
         if platform.sb_wiring.is_none() {
             crate::println!(
-                "Audio: SB DSP {}.x cannot report its IRQ/DMA — declare the card's real ones as `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; sound is off until then",
+                "Audio: SB DSP {}.x cannot report its IRQ/DMA — declare the card's real ones as \
+                 `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; DMA cannot be remapped until then",
                 card.dsp_major
             );
         }
-        // The guest's BLASTER stays the owner's, verbatim: IRQ and DMA are
-        // only labels (the card's line is relayed onto the guest's vPIC
-        // line, its 8237 channels are remapped onto the card's), so a game
-        // with its own saved sound settings keeps working. The PORT is the
-        // exception — it is granted through the IOPB and the guest's writes
-        // land on the real card — so A must be the card's base, and a
-        // disagreeing CONFIG.SYS gets said out loud.
-        let cfg_blaster = crate::kernel::dos::config_var(&master_env, b"BLASTER")
-            .map(alloc::vec::Vec::from)
-            .unwrap_or_default();
-        if blaster_base(&cfg_blaster) != Some(card.base) {
+        if card.wiring.and_then(|w| w.dma16).is_none()
+            && blaster.split(|&b| b == b' ').any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
+        {
             crate::println!(
-                "Audio: CONFIG.SYS BLASTER declares A{:03X}, the card answers at {:#05X} — using the card",
-                blaster_base(&cfg_blaster).unwrap_or(0), card.base
+                "Audio: BLASTER declares a 16-bit channel but a DSP {}.x card has none",
+                card.dsp_major
             );
         }
-        let keep_h = card.wiring.and_then(|w| w.dma16).is_some();
-        let blaster = rewrite_blaster_base(&cfg_blaster, card.base, keep_h);
-        crate::println!("Audio: native SB — BLASTER={}",
-            core::str::from_utf8(&blaster).unwrap_or("?"));
-        crate::kernel::dos::set_config_var(&mut master_env, b"BLASTER", &blaster);
     }
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
@@ -356,33 +372,6 @@ fn blaster_base(v: &[u8]) -> Option<u16> {
         }
     }
     None
-}
-
-/// The owner's BLASTER with its `A` token replaced by the card's real base
-/// — the one value that cannot be relabelled. `H` is dropped when the card
-/// has no 16-bit channel to remap onto.
-fn rewrite_blaster_base(v: &[u8], base: u16, keep_h: bool) -> alloc::vec::Vec<u8> {
-    use core::fmt::Write;
-    let mut out = alloc::vec::Vec::new();
-    struct W<'a>(&'a mut alloc::vec::Vec<u8>);
-    impl core::fmt::Write for W<'_> {
-        fn write_str(&mut self, s: &str) -> core::fmt::Result {
-            self.0.extend_from_slice(s.as_bytes());
-            Ok(())
-        }
-    }
-    let _ = write!(W(&mut out), "A{:03X}", base);
-    for tok in v.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
-        match tok[0].to_ascii_uppercase() {
-            b'A' => {}
-            b'H' if !keep_h => {}
-            _ => {
-                out.push(b' ');
-                out.extend_from_slice(tok);
-            }
-        }
-    }
-    out
 }
 
 /// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel
