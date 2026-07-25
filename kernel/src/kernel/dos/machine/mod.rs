@@ -491,43 +491,31 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
     // separate path (arch::inl/outl), not this emulator.
     let port = port & 0x3FF;
     match port {
-        // VGA Input Status Register 1. Under QEMU its 0x3DA bit 3 doesn't sweep
-        // a raster in our setup (passthrough hangs Wolf3D's VL_WaitVBL), so
-        // under QEMU *only* we fabricate bit 3 and bit 0; Bochs / real hardware
-        // pass through (see the is_qemu gate below). The fabricated values:
-        //
-        //  - bit 3 (vertical retrace) — 70 Hz frame phase (mode 13h refresh,
-        //    14.286 ms / frame), asserted for 8/32 phase-steps ≈ 3.6 ms/frame.
-        //    Drives frame-level pacing (Wolf3D VL_WaitVBL, Build vsync).
-        //
-        //  - bit 0 (display-disabled / blanking) — per-read counter toggling
-        //    every 8 reads. Models *horizontal* blanking, which on real VGA
-        //    pulses at ~31.5 kHz (every scanline); frame-scale blanking
-        //    makes Build engine's per-DAC-entry snow-avoidance wait too slow. Runs of 8
-        //    ones/zeros also satisfy "6+ consecutive bit0=X" idioms
-        //    (Wolf3D's VL_SetScreen pre-CRTC-write wait, etc.) Vsync ⊂
-        //    blanking, so bit 0 is forced 1 whenever bit 3 is set.
+        // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
+        // (blanking). Where the kernel's raster beam presents the display,
+        // bit 3 is the beam's own vertical blank — genuine state of the one
+        // VGA model, not a fabrication (see `input_status1`). Where no beam
+        // sweeps, a free-running 70 Hz phase fills in; Bochs / real VGA
+        // hardware pass the register through (QEMU's own 0x3DA bit 3 doesn't
+        // sweep in our setup — a passthrough hangs Wolf3D's VL_WaitVBL).
         //
         // The real `inb(0x3DA)` is retained for its hardware side-effect:
         // resetting the VGA attribute-controller flip-flop.
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            // No card: the per-thread emulated flip-flop, fabricated status.
             if !vga::vga_present() {
                 pc.vga.ac_state.pending_data = false;
-                return fabricated_status1(machine);
+                return input_status1(machine, &pc.present_scratch2);
             }
             let real = machine.inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
-            // QEMU's 0x3DA bit 3 (vsync) doesn't sweep a raster in our setup, so
-            // a passthrough hangs Wolf3D's VL_WaitVBL — under QEMU we fabricate.
-            // Bochs and real hardware drive 0x3DA from a real raster, so use the
-            // genuine bits there (flip-flop already handled above).
+            // Bochs and real hardware drive 0x3DA from a real raster, so use
+            // the genuine bits there (flip-flop already handled above).
             if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu {
                 return real;
             }
-            fabricated_status1(machine)
+            input_status1(machine, &pc.present_scratch2)
         }
         // VGA ports — pass through to hardware, or the emulated register file
         // when no card is present (see vga::vga_present).
@@ -761,13 +749,28 @@ fn seg_base_for<A: crate::Arch>(regs: &Regs, sel: u16) -> u32 {
     }
 }
 
-/// Fabricated VGA Input Status #1 (see the `emulate_inb` 0x3DA arm for why):
-/// bit 3 = vertical retrace on a 70 Hz frame phase, bit 0 = blanking from a
-/// per-read counter, vsync forcing blanking.
-fn fabricated_status1<A: crate::Arch>(machine: &mut A) -> u8 {
+/// VGA Input Status #1 for the emulated card (see the `emulate_inb` 0x3DA
+/// arm): bit 3 = vertical retrace, bit 0 = blanking, vsync forcing blanking.
+///
+/// Bit 3 is the raster beam's OWN vertical blank whenever a beam is sweeping
+/// this display — the genuine state of the emulated VGA, not a fabrication:
+/// "in retrace" means the frame really finished painting, so retrace-raced
+/// VRAM updates and DAC loads land exactly as on hardware. Only displays
+/// without a live beam (window sink, unfocused thread) fall back to a
+/// fabricated free-running 70 Hz phase, asserted 8/32 steps ≈ 3.6 ms/frame.
+///
+/// Bit 0 (display-disabled / blanking) — per-read counter toggling every 8
+/// reads. Models *horizontal* blanking, which on real VGA pulses at
+/// ~31.5 kHz (every scanline); frame-scale blanking makes Build engine's
+/// per-DAC-entry snow-avoidance wait too slow. Runs of 8 ones/zeros also
+/// satisfy "6+ consecutive bit0=X" idioms (Wolf3D's VL_SetScreen
+/// pre-CRTC-write wait, etc.)
+fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display::Scratch) -> u8 {
     let ticks = machine.get_ticks();
-    let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
-    let vr = phase >= 24;
+    let vr = crate::kernel::display::beam_vretrace(beam, ticks).unwrap_or_else(|| {
+        let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
+        phase >= 24
+    });
     use core::sync::atomic::{AtomicU32, Ordering};
     static DA_READ_COUNT: AtomicU32 = AtomicU32::new(0);
     let hbl = (DA_READ_COUNT.fetch_add(1, Ordering::Relaxed) >> 3) & 1 != 0;

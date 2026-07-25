@@ -137,15 +137,37 @@ unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize) {
     }
 }
 
-/// Cheap pre-gate for [`raster`]: would the beam paint anything now? Lets the
+/// Vertical-blank length in beam steps: ~6% of the sweep, close enough to
+/// the real VGA's vertical blanking for code that races the beam or batches
+/// DAC loads into the window.
+fn vblank_rows(h: usize) -> usize {
+    (h / 16).max(1)
+}
+
+/// The beam's guest-visible vertical-retrace state, when a beam is actively
+/// sweeping this display: `Some(in_retrace)`. `None` when no raster is live
+/// on this scratch (window sink, unfocused thread, real VGA) — the caller
+/// falls back to its clock fabrication. This is what makes the fabricated
+/// 0x3DA truthful: "in retrace" means the frame really has finished
+/// painting, so retrace-raced VRAM updates land exactly as on hardware.
+pub fn beam_vretrace(s: &Scratch, now_ms: u64) -> Option<bool> {
+    let h = s.geo.1;
+    if h == 0 || now_ms.saturating_sub(s.last_ms) > 100 {
+        return None;
+    }
+    Some(s.sy >= h)
+}
+
+/// Cheap pre-gate for [`raster`]: would the beam step at all now? Lets the
 /// event loop skip the scanout entirely on the (vast majority of) passes
-/// where no row is due yet.
+/// where no step is due yet.
 pub fn raster_pending(s: &Scratch, now_ms: u64, period_ms: u64) -> bool {
-    let h = s.geo.1 as u64;
+    let h = s.geo.1;
     if h == 0 {
         return true; // not armed yet: run once to arm the geometry
     }
-    s.acc + now_ms.saturating_sub(s.last_ms) * h >= period_ms
+    let total = (h + vblank_rows(h)) as u64;
+    s.acc + now_ms.saturating_sub(s.last_ms) * total >= period_ms
 }
 
 /// Advance the raster beam and paint the band of device rows now due.
@@ -211,11 +233,14 @@ pub fn raster(
         s.last_ms = now_ms;
     }
 
-    // Row credit from elapsed virtual time: h source rows per period, at most
-    // one frame of debt, at most a bounded band per call.
+    // Step credit from elapsed virtual time: a sweep is `h` painted rows
+    // plus a vertical-blank tail, all steps together spanning one period —
+    // at most one frame of debt, at most a bounded band per call.
+    let vb = vblank_rows(h);
+    let total = (h + vb) as u64;
     let dt = now_ms.saturating_sub(s.last_ms);
     s.last_ms = now_ms;
-    s.acc = (s.acc + dt * h as u64).min(h as u64 * period_ms);
+    s.acc = (s.acc + dt * total).min(total * period_ms);
     let due = (s.acc / period_ms) as usize;
     let paint = due.min((h / 8).max(1));
     if paint == 0 {
@@ -233,6 +258,17 @@ pub fn raster(
     let mut copied = 0usize;
     let mut wrapped = false;
     for _ in 0..paint {
+        if s.sy >= h {
+            // Vertical blank: the beam idles below the frame. 0x3DA reads
+            // this phase via `beam_vretrace`; nothing is painted.
+            s.sy += 1;
+            if s.sy == h + vb {
+                s.sy = 0;
+                s.oy = 0;
+                s.yerr = 0;
+            }
+            continue;
+        }
         lib::vga_render::render_row(frame, s.sy, &s.pal, &mut s.src);
         let (mut o, mut xerr) = (bx, 0usize);
         for &v in &s.src {
@@ -256,16 +292,15 @@ pub fn raster(
         if s.sy == h {
             // Letterbox bands (rare geometry — 4:3 content on a 4:3-or-wider
             // panel pillarboxes instead, and the row copy above covers those
-            // borders every row): painted once per sweep, at the retrace.
+            // borders every row): painted once per sweep, entering blank.
             for y in (0..by).chain(by + out_h..fb.height) {
                 unsafe {
                     core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.stride), 0, fb.width);
                 }
                 copied += fb.width;
             }
-            s.sy = 0;
-            s.oy = 0;
-            s.yerr = 0;
+            // Frame complete: the beam enters vertical blank (the retrace
+            // 0x3DA now reports) and the caller presents.
             wrapped = true;
         }
     }
