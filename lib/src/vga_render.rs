@@ -580,7 +580,14 @@ impl<const N: usize> StretchRow<'_, N> {
         if N == 0 {
             self.out[self.o..self.o + self.base + 1].fill(v);
         } else {
-            self.out[self.o..self.o + N].copy_from_slice(&[v; N]);
+            // Plain stores, deliberately: `copy_from_slice`/`fill` on a
+            // const-width slice may still lower to a memcpy/memset CALL per
+            // pixel on a size-optimized build — measured as a 2x raster
+            // regression. A counted store loop compiles to N inline stores.
+            let run = &mut self.out[self.o..self.o + N];
+            for d in run {
+                *d = v;
+            }
         }
         self.err += self.rem;
         self.o += self.base + if self.err >= self.w { self.err -= self.w; 1 } else { 0 };
