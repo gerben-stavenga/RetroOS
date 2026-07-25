@@ -39,7 +39,6 @@ const NUM_ITEMS: usize = 6;
 /// Master volume as a percentage of unity, adjusted by ◄/► on the Volume row.
 /// 100 = unity (the level the per-source scales already balance to); attenuate
 /// only — a boost above unity would just clip against the mix-out rail.
-const VOL_MIN: u32 = 0;
 const VOL_MAX: u32 = 100;
 const VOL_STEP: u32 = 10;
 
@@ -111,11 +110,11 @@ static PICKER: AtomicBool = AtomicBool::new(false);
 /// current console owner.
 pub fn refresh_processes<A: crate::Arch>(threads: &[thread::Thread<A>], focused: usize) {
     let mut count = 0;
-    for i in 1..threads.len() {
+    for (i, t) in threads.iter().enumerate().skip(1) {
         if count >= MAX_LIST {
             break;
         }
-        let k = &threads[i].kernel;
+        let k = &t.kernel;
         let state = match k.state {
             thread::ThreadState::Running => b'R',
             thread::ThreadState::Ready => b'r',
@@ -232,7 +231,7 @@ fn adjust(up: bool) {
     let next = if up {
         (cur + VOL_STEP).min(VOL_MAX)
     } else {
-        cur.saturating_sub(VOL_STEP).max(VOL_MIN)
+        cur.saturating_sub(VOL_STEP) // saturation is the 0 floor
     };
     VOL_PCT.store(next, Ordering::Relaxed);
 }

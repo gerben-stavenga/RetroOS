@@ -112,10 +112,10 @@ fn dispatch_linux<A: crate::Arch>(
     let lp = linux as *mut thread::LinuxState;
     {
         for evt in events {
-        if let crate::Irq::Key(sc) = evt {
-            if !monitor_key(machine, regs, sc, None) {
-                unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
-            }
+        if let crate::Irq::Key(sc) = evt
+            && !monitor_key(machine, regs, sc, None)
+        {
+            unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
         }
     }
     }

@@ -334,8 +334,10 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
         return false;
     }
     let mut g = SB16.lock();
-    if let Some(dev) = g.as_mut() {
-        if dev.running {
+    if let Some(dev) = g.as_mut()
+        && dev.running
+    {
+        {
             // The IRQ is a wakeup, not an additional unit of elapsed time.
             // `position()` may already have observed this exact DMA cursor;
             // inventing a block when delta==0 moves last_dma_pos ahead of the
@@ -345,7 +347,7 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
             // buffers ≤ 0 → the next buffers the DSP plays are stale.)
             if dev.written <= dev.consumed_frames {
                 let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 3 || n % 64 == 0 {
+                if n <= 3 || n.is_multiple_of(64) {
                     crate::println!(
                         "sb16: underrun #{} written={} consumed={} dma_pos={} delta={}",
                         n, dev.written, dev.consumed_frames, pos, delta

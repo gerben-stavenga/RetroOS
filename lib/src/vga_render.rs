@@ -1154,6 +1154,7 @@ pub const OVERLAY_CELL_H: usize = 16;
 /// Fill a `rw`×`rh` rectangle at pixel (`x`,`y`) with one `0x00RRGGBB` colour,
 /// encoded through `fmt`. `out` is pitched by `stride`; `w`/`h` clip to the
 /// visible area (a GOP `stride` may exceed `w`).
+#[allow(clippy::too_many_arguments)] // flat blit params; a rect struct would be ceremony for two callers
 pub fn overlay_fill(
     out: &mut [u32], stride: usize, w: usize, h: usize,
     x: usize, y: usize, rw: usize, rh: usize, rgb: u32, fmt: PixelFormat,
@@ -1174,6 +1175,7 @@ pub fn overlay_fill(
 /// Draw a CP437 byte string at pixel (`x`,`y`) with `FONT_8X16`, `fg`/`bg` as
 /// `0x00RRGGBB` encoded through `fmt`. One 8×16 cell per byte; stops at the
 /// right/bottom clip edge.
+#[allow(clippy::too_many_arguments)] // flat blit params; a rect struct would be ceremony for two callers
 pub fn overlay_text(
     out: &mut [u32], stride: usize, w: usize, h: usize,
     x: usize, y: usize, s: &[u8], fg: u32, bg: u32, fmt: PixelFormat,

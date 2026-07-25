@@ -340,10 +340,10 @@ const GDT_TSS32: usize = 7;       // 0x38
 /// the KERNEL's ESP31:16 in the live user ESP — the classic espfix leak.
 /// 16-bit DPMI code that saves/restores full ESP (DOS/16M's stack-switch
 /// glue: `mov [slot], esp` … `lds esi, [slot]`) then stores a kernel-stack
-/// pointer and faults dereferencing it. The exit path switches to this alias
-/// + `movzx esp, sp` before the final pops, so the numeric kernel ESP at
-/// IRET is < 0x10000 and the leaked bits are 0 — what every 16-bit-era DPMI
-/// host effectively provided.
+/// pointer and faults dereferencing it. The exit path switches to this
+/// alias and does `movzx esp, sp` before the final pops, so the numeric
+/// kernel ESP at IRET is < 0x10000 and the leaked bits are 0 — what every
+/// 16-bit-era DPMI host effectively provided.
 const GDT_ESPFIX_SS: usize = 9;   // 0x48 — was reserved
 #[allow(dead_code)] const GDT_RING1_CS: usize = 10;   // 0x50
 #[allow(dead_code)] const GDT_RING1_DS: usize = 11;   // 0x58
