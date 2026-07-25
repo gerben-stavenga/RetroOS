@@ -25,10 +25,31 @@
 use super::*;
 use crate::kernel::dos::dfs::{DFS_PATH_MAX, DfsState};
 
-/// Patch reads per audio quantum. A bank load is dozens of files; letting them
-/// all land in one tick stalls the mixer, and spreading them costs only the
-/// first bar of a song.
-const LOADS_PER_TICK: usize = 2;
+/// Bytes of instrument file read per audio quantum. A bank load is megabytes;
+/// whole-file reads stalled the event loop for a real disk's latency per
+/// instrument (music started seconds late; the stall also bunched PIT ticks
+/// under DOS/4GW). One bounded chunk of one file per tick keeps every tick
+/// short while the bank streams in over a few hundred ticks.
+const LOAD_CHUNK: usize = 16 * 1024;
+
+/// The GM device models a ROM-bank instrument (an SC-55 does not stream its
+/// piano from disk), so the whole bank preloads from the first tick the
+/// synth exists — by the first note of any song the instruments are already
+/// resident. Ids above the GM melodic+percussion range have no stem and are
+/// skipped instantly.
+const PRELOAD_IDS: u16 = 256;
+
+/// One instrument file mid-read: the chunked loader's only in-flight state.
+struct PatchLoad {
+    id: u16,
+    handle: i32,
+    size: usize,
+    buf: alloc::vec::Vec<u8>,
+    start_ms: u64,
+    /// Explicitly demanded by the synth (vs background bank preload):
+    /// failures are worth a log line.
+    demanded: bool,
+}
 
 /// Where the bank lives when the guest declares no `ULTRADIR`. We ship the
 /// set at this path, so this is not a guess that could mask a bad read.
@@ -49,6 +70,13 @@ pub struct Mpu {
     /// Patch ids we tried and could not read, so a missing instrument costs
     /// one failed open rather than one per note.
     denied: [u64; 4],
+    /// Patch ids already installed in the synth (the loader's own record, so
+    /// the preload sweep skips what a demand load already brought in).
+    loaded: [u64; 4],
+    /// The chunked loader's in-flight file, if any.
+    loading: Option<PatchLoad>,
+    /// Next id the background bank preload will fetch; `PRELOAD_IDS` = done.
+    preload: u16,
 }
 
 impl Mpu {
@@ -61,6 +89,9 @@ impl Mpu {
             dir: [0; 64],
             dir_len: 0,
             denied: [0; 4],
+            loaded: [0; 4],
+            loading: None,
+            preload: PRELOAD_IDS,
         };
         m.set_dir(DEFAULT_ULTRADIR);
         m
@@ -110,6 +141,11 @@ impl Mpu {
         self.card.reset();
         self.synth = None;
         self.denied = [0; 4];
+        self.loaded = [0; 4];
+        if let Some(ld) = self.loading.take() {
+            crate::kernel::vfs::close_vfs_handle(ld.handle);
+        }
+        self.preload = PRELOAD_IDS;
         self.present = false;
     }
 
@@ -133,12 +169,22 @@ impl Mpu {
         i < self.denied.len() && self.denied[i] & (1 << (id & 63)) != 0
     }
 
-    /// Read one instrument off the disk and install it. `false` when the file
-    /// is missing or unparseable — the id is then denied and never retried.
-    fn load_patch(&mut self, id: u16) -> bool {
-        let Some(stem) = sound::midi::patch_stem(id) else {
-            return false;
-        };
+    fn mark_loaded(&mut self, id: u16) {
+        let i = (id as usize) >> 6;
+        if i < self.loaded.len() {
+            self.loaded[i] |= 1 << (id & 63);
+        }
+    }
+
+    fn is_loaded(&self, id: u16) -> bool {
+        let i = (id as usize) >> 6;
+        i < self.loaded.len() && self.loaded[i] & (1 << (id & 63)) != 0
+    }
+
+    /// Open one instrument's `.PAT` for the chunked loader. `None` when the
+    /// id has no stem or the file is missing/empty — the caller denies it.
+    fn open_patch(&mut self, id: u16) -> Option<(i32, usize)> {
+        let stem = sound::midi::patch_stem(id)?;
         // "<ULTRADIR>\MIDI\<STEM>.PAT", uppercase — DOS canonical case.
         let mut dos = [0u8; DFS_PATH_MAX];
         let mut n = 0usize;
@@ -156,14 +202,93 @@ impl Mpu {
         put(b".PAT", &mut dos, &mut n);
 
         let mut vfs_buf = [0u8; DFS_PATH_MAX];
-        let Ok(vlen) = DfsState::to_vfs_open(&dos[..n], &mut vfs_buf) else {
-            return false;
-        };
-        let Ok(bytes) = crate::kernel::exec::load_file_resolved(&vfs_buf[..vlen]) else {
-            return false;
-        };
-        let Some(synth) = self.synth.as_mut() else { return false };
-        synth.load_patch(id, &bytes)
+        let vlen = DfsState::to_vfs_open(&dos[..n], &mut vfs_buf).ok()?;
+        let handle = crate::kernel::vfs::open_to_handle(&vfs_buf[..vlen]);
+        if handle < 0 {
+            return None;
+        }
+        let size = crate::kernel::vfs::file_size_by_handle(handle) as usize;
+        if size == 0 {
+            crate::kernel::vfs::close_vfs_handle(handle);
+            return None;
+        }
+        Some((handle, size))
+    }
+
+    /// Advance the in-flight instrument read, or start the next one — the
+    /// synth's explicit requests first, then the background bank preload.
+    /// At most one bounded chunk of one file per tick: the bank streams in
+    /// without the event loop ever stalling for a whole file read.
+    fn service_loads<A: crate::Arch>(&mut self, machine: &mut A) {
+        if let Some(mut ld) = self.loading.take() {
+            let off = ld.buf.len();
+            let want = (ld.size - off).min(LOAD_CHUNK);
+            ld.buf.resize(off + want, 0);
+            let got = crate::kernel::vfs::read_by_handle(ld.handle, &mut ld.buf[off..off + want]);
+            if got != want as i32 {
+                crate::kernel::vfs::close_vfs_handle(ld.handle);
+                self.deny(ld.id);
+                crate::dbg_println!("[mpu] patch {}: short read", ld.id);
+                return;
+            }
+            if ld.buf.len() < ld.size {
+                self.loading = Some(ld);
+                return; // next chunk next tick
+            }
+            crate::kernel::vfs::close_vfs_handle(ld.handle);
+            let Some(synth) = self.synth.as_mut() else { return };
+            if synth.load_patch(ld.id, &ld.buf) {
+                self.mark_loaded(ld.id);
+                if ld.demanded {
+                    crate::dbg_println!(
+                        "[mpu] patch {} loaded in {} ms ({} KB)",
+                        ld.id,
+                        machine.get_ticks().saturating_sub(ld.start_ms),
+                        ld.size / 1024,
+                    );
+                }
+            } else {
+                self.deny(ld.id);
+                if ld.demanded {
+                    crate::dbg_println!("[mpu] no patch for id {}", ld.id);
+                }
+            }
+            return;
+        }
+        // Nothing in flight: demanded instruments jump the preload queue.
+        loop {
+            let (id, demanded) = {
+                let Some(s) = self.synth.as_mut() else { return };
+                if let Some(id) = s.take_patch_request() {
+                    (id, true)
+                } else if self.preload < PRELOAD_IDS {
+                    let id = self.preload;
+                    self.preload += 1;
+                    (id, false)
+                } else {
+                    return;
+                }
+            };
+            if self.denied(id) || self.is_loaded(id) {
+                continue;
+            }
+            let Some((handle, size)) = self.open_patch(id) else {
+                self.deny(id);
+                if demanded {
+                    crate::dbg_println!("[mpu] no patch for id {}", id);
+                }
+                continue;
+            };
+            self.loading = Some(PatchLoad {
+                id,
+                handle,
+                size,
+                buf: alloc::vec::Vec::with_capacity(size),
+                start_ms: machine.get_ticks(),
+                demanded,
+            });
+            return;
+        }
     }
 
     /// Per-quantum service: drain the port's MIDI bytes into the synth, then
@@ -183,32 +308,16 @@ impl Mpu {
             let mut s = sound::midi::Synth::new_boxed();
             s.init();
             self.synth = Some(s);
+            // ROM-bank device: start streaming the whole bank in now, so the
+            // instruments are resident before the first song's first note.
+            self.preload = 0;
         }
         while let Some(b) = self.card.take() {
             if let Some(s) = self.synth.as_mut() {
                 s.write_at(arrival_frame, b);
             }
         }
-        for _ in 0..LOADS_PER_TICK {
-            let Some(s) = self.synth.as_mut() else { break };
-            let Some(id) = s.take_patch_request() else { break };
-            if self.denied(id) {
-                continue;
-            }
-            // Timed to the wall clock: notes stay silent until their patch is
-            // resident, so a slow bank read IS an audible music-start delay.
-            let t0 = machine.get_ticks();
-            if !self.load_patch(id) {
-                self.deny(id);
-                crate::dbg_println!("[mpu] no patch for id {}", id);
-            } else {
-                crate::dbg_println!(
-                    "[mpu] patch {} loaded in {} ms",
-                    id,
-                    machine.get_ticks().saturating_sub(t0)
-                );
-            }
-        }
+        self.service_loads(machine);
     }
 
     /// Whether the synth currently owes the sink audio.
