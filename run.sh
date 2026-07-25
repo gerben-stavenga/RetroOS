@@ -741,9 +741,13 @@ launch_qemu_uefi() {
         -device nvme,drive=esp,serial=esp0
     )
 
-    DISPLAY_ARGS=()
+    # Same display policy as the BIOS branch: default to SDL, NOT the GTK
+    # default — QEMU's GTK UI only repaints when its main loop goes idle, and
+    # SB16 ISA DMA (--sound sb) keeps i8257_dma_run() spinning so the window
+    # freezes on the last frame while the guest runs fine (QEMU LP#1873769).
+    DISPLAY_ARGS=(-display "${QEMU_DISPLAY:-sdl}")
     if [ "$QEMU_HEADLESS" = 1 ]; then
-        DISPLAY_ARGS+=(-display none)
+        DISPLAY_ARGS=(-display none)
     fi
 
     # -cpu max: the default qemu64 model lacks VME, forcing the kernel's software
