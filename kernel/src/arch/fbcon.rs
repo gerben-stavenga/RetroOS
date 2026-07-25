@@ -50,6 +50,8 @@ struct Geom {
     len: usize,
     /// Convert the renderer's canonical 0x00RRGGBB pixels to the GOP layout.
     format: PixelFormat,
+    /// QEMU-TCG needs strong-UC stores for display dirty tracking.
+    slow: bool,
 }
 static mut GEOM: Option<Geom> = None;
 
@@ -155,6 +157,7 @@ pub fn framebuffer() -> Option<crate::kernel::display::Framebuffer> {
         width: g.stride,
         height: g.len / g.stride,
         format: g.format.to_display(),
+        slow: g.slow,
     })
 }
 
@@ -295,6 +298,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         origin,
         len: stride * height,
         format,
+        slow: qemu_tcg,
     });
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
@@ -359,6 +363,8 @@ static DOS_PAINTED: core::sync::atomic::AtomicBool =
 /// `display_tick` path which presents the same aperture during runtime.
 fn flush() {
     let Some(g) = geom() else { return };
+    // Console pixels bypass the incremental DOS blitter.
+    crate::kernel::display::damage();
     // A DOS frame painted over us: wipe and repaint the whole console.
     if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
     let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };

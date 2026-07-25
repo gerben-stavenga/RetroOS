@@ -1685,10 +1685,12 @@ impl VgaState {
     }
 }
 
-/// VGA refresh throttle: true at most once per ~70 Hz emulated frame, off the
-/// same tick clock the 0x3DA vertical-retrace fabrication reads.
-fn frame_due(now_ticks: u64) -> bool {
-    let frame = (now_ticks.wrapping_mul(70) / 1000) as u32;
+/// VGA refresh throttle, off the same tick clock the 0x3DA vertical-retrace
+/// fabrication reads. Normal/WC displays follow the ~70-Hz VGA cadence;
+/// QEMU-TCG's strong-UC GOP mapping uses the older proven 20-Hz cap so
+/// full-frame device writes cannot consume the entire event loop.
+fn frame_due(now_ticks: u64, hz: u64) -> bool {
+    let frame = (now_ticks.wrapping_mul(hz) / 1000) as u32;
     static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
     LAST.swap(frame, Ordering::Relaxed) != frame
 }
@@ -1709,7 +1711,8 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if vga_present() || (direct.is_none() && !vga_render::present_sink_installed()) {
         return;
     }
-    if !frame_due(now_ticks) {
+    let refresh_hz = if direct.is_some_and(|fb| fb.slow) { 20 } else { 70 };
+    if !frame_due(now_ticks, refresh_hz) {
         return;
     }
     crate::kernel::startup::bill_present();
@@ -1723,13 +1726,16 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // One path for every mode: the renderer draws a source row directly in the
     // framebuffer's pixel format, the blit stretches and copies it. No special
     // case, no full-frame intermediate.
+    let copied;
     if let crate::kernel::platform::Display::Framebuffer(fb) =
         crate::kernel::platform::get().display
     {
-        crate::kernel::display::blit(&mut pc.present_scratch2, &fb, &frame);
+        let overlay = crate::kernel::osd::is_open();
+        copied = crate::kernel::display::blit(
+            &mut pc.present_scratch2, &fb, &frame, overlay);
         // The F12 monitor composites onto the finished frame — after the guest
         // is drawn, before present — so it appears over any video mode.
-        if crate::kernel::osd::is_open() {
+        if overlay {
             let out = unsafe {
                 core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
             };
@@ -1740,6 +1746,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // Window sink (hosted): still takes a whole rendered frame.
         let (w, h) = vga_render::dimensions(frame.mode);
         let need = w * h;
+        copied = need;
         if pc.present_fb.len() < need {
             pc.present_fb.resize(need, 0);
         }
@@ -1754,6 +1761,6 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if prof {
         let p4 = machine.rdtsc();
         crate::kernel::startup::bill_display(
-            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), 0);
+            p1.wrapping_sub(p0), 0, 0, p4.wrapping_sub(p1), copied);
     }
 }
