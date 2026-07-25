@@ -284,6 +284,18 @@ struct Hda {
     logged_run: bool,
     diag_buffers: u8,
     diag_stalls: u8,
+    /// Position-poll counter + print budget for the periodic stream diagnostic.
+    diag_pos_calls: u32,
+    diag_pos_prints: u8,
+    /// Hardware-stream bytes actually written into the ring. Upper bound for
+    /// `consumed_hw`: the codec cannot have played bytes never emitted, and
+    /// `on_irq` clamps its position-delta against the in-flight difference —
+    /// one stale/backward DMA-position read otherwise aliases to a near-full-
+    /// ring forward delta and the drain clock leaps a lap.
+    emitted: u64,
+    /// Frames refused at the MAX_AHEAD ceiling and lap-resync events.
+    diag_dropped: u64,
+    diag_resyncs: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -599,6 +611,11 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         logged_run: false,
         diag_buffers: 0,
         diag_stalls: 0,
+        diag_pos_calls: 0,
+        diag_pos_prints: 0,
+        emitted: 0,
+        diag_dropped: 0,
+        diag_resyncs: 0,
     };
 
     // Link reset + codec detection, with escalating recovery. A hard reboot
@@ -884,6 +901,7 @@ impl Hda {
         self.resample_acc = 0;
         self.written_src = 0;
         self.consumed_hw = 0;
+        self.emitted = 0;
         self.last_hw_pos = 0;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
@@ -1413,15 +1431,30 @@ impl Hda {
             let civ = self.play_buf();
             let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
             if ahead >= NUM_BUF / 2 {
-                // Lapped: the codec is replaying stale ring behind us (the
-                // audible "echoes"). Resync just past the play position and
-                // zero a guard buffer so the gap plays silence, not history.
+                // Lapped: the codec ran past the write cursor (underrun — the
+                // event loop stalled longer than the pipe is deep) and is
+                // replaying stale ring (the audible "echoes"). Resync just
+                // past the play position and zero a guard buffer so the gap
+                // plays silence, not history — AND snap the drain accounting
+                // to the truth that the codec has consumed everything ever
+                // written. Moving only the cursor left `Pace` believing the
+                // pipe was still full: production then trickled at drain rate
+                // forever *behind* the play head, re-tripping this branch at
+                // every buffer boundary (a resync storm) while the stale lap
+                // replayed — and the drain clock the guest's DSP block IRQs
+                // are slaved to wedged, hanging the guest's sound driver.
+                // With the snap, Pace's deficit becomes a full pipe fill and
+                // the very next pushes re-prime cleanly ahead of the codec.
                 let guard = (civ + 1) % NUM_BUF;
                 unsafe {
                     core::ptr::write_bytes(self.buf_va(guard) as *mut u8, 0, BUF_BYTES);
                 }
                 self.cur_buf = (civ + 2) % NUM_BUF;
+                self.consumed_hw = self.emitted;
+                self.last_hw_pos = self.dma_pos() % (NUM_BUF * BUF_BYTES) as u32;
+                self.diag_resyncs = self.diag_resyncs.wrapping_add(1);
             } else if ahead >= MAX_AHEAD {
+                self.diag_dropped += 1;
                 if self.diag_stalls < 3 {
                     crate::println!(
                         "hda: stall cur_buf={} play_buf={} ahead={} lpib={} pos={}",
@@ -1441,6 +1474,7 @@ impl Hda {
             write_volatile(p as *mut u16, l as u16);
             write_volatile((p + 2) as *mut u16, r as u16);
         }
+        self.emitted += 4;
         self.cur_off += 4;
         if self.cur_off >= BUF_BYTES {
             self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
@@ -1523,6 +1557,7 @@ impl Hda {
             // position read.
             self.written_src = 0;
             self.consumed_hw = 0;
+            self.emitted = 0;
             self.last_hw_pos = 0;
             }
         let fb = fmt.frame_bytes();
@@ -1749,17 +1784,23 @@ pub fn on_irq() -> bool {
     if dev.running {
         let ring = (NUM_BUF * BUF_BYTES) as u32;
         let pos = dev.dma_pos() % ring;
-        let delta = (pos + ring - dev.last_hw_pos) % ring;
+        let raw = ((pos + ring - dev.last_hw_pos) % ring) as u64;
+        // The in-flight byte count is a hard ceiling on any position delta:
+        // the codec cannot have played bytes the producer never emitted. The
+        // modular subtraction above aliases a stale/backward position read
+        // (the position buffer is a plain DMA write racing this MMIO path —
+        // and unreliable outright on some real controllers) into a
+        // near-full-ring FORWARD delta; unclamped, one such read leaps the
+        // drain clock by ~a lap, the pacer overfills the ring to the
+        // lap-ambiguity point, and the resync/drop machinery grinds audibly
+        // (stutter, echo).
+        let in_flight = dev.emitted.saturating_sub(dev.consumed_hw);
         // A BCIS with an unchanged position can occur when the position buffer
         // write has not become visible yet. One IOC describes at least one BDL
         // entry, so use one buffer as the conservative fallback.
-        if delta == 0 {
-            dev.consumed_hw += BUF_BYTES as u64;
-            dev.last_hw_pos = (dev.last_hw_pos + BUF_BYTES as u32) % ring;
-        } else {
-            dev.consumed_hw += delta as u64;
-            dev.last_hw_pos = pos;
-        }
+        let delta = if raw == 0 { BUF_BYTES as u64 } else { raw }.min(in_flight);
+        dev.consumed_hw += delta;
+        dev.last_hw_pos = (dev.last_hw_pos + delta as u32) % ring;
     }
     w8(dev.sd + SDSTS, status & 0x1C); // W1C BCIS/FIFOE/DESE sources
     HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -1780,6 +1821,28 @@ pub fn position() -> Option<(u64, u64)> {
     let dev = g.as_mut()?;
     if dev.parked {
         return None;
+    }
+    // Metal bring-up diagnostic: `position` is polled every pump tick (~1 kHz)
+    // while a session is active, so every ~2 s report whether completion
+    // interrupts arrive and whether the two hardware cursors (SDLPIB, the DMA
+    // position buffer) actually advance — the three things QEMU gets right
+    // that real silicon may not.
+    dev.diag_pos_calls = dev.diag_pos_calls.wrapping_add(1);
+    if dev.diag_pos_calls % 2048 == 0 && dev.diag_pos_prints < 60 {
+        dev.diag_pos_prints += 1;
+        crate::println!(
+            "hda: diag irqs={} written_src={} consumed_hw={} lpib={} pos={} cur_buf={} emitted={} dropped={} resyncs={} running={}",
+            HDA_IRQS.load(core::sync::atomic::Ordering::Relaxed),
+            dev.written_src,
+            dev.consumed_hw,
+            r32(dev.sd + SDLPIB),
+            dev.dma_pos(),
+            dev.cur_buf,
+            dev.emitted,
+            dev.diag_dropped,
+            dev.diag_resyncs,
+            dev.running,
+        );
     }
     // `on_irq` maintains `consumed_hw` from DMA-position deltas.
     if dev.src_rate == 0 || dev.rate == 0 {
