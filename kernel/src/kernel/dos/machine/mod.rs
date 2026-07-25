@@ -957,11 +957,6 @@ pub struct Mixer {
     dsp_epoch: u64,
     streaming: bool,
     last_ms: u64,
-    /// MIDI-arrival frame clock: a real-time (get_ticks) counter in the mixer's
-    /// production frame numbering, never behind the production frontier. Incoming
-    /// MIDI bytes are stamped with it so note onset is independent of block size.
-    midi_frame: u64,
-    midi_ms: u64,
 }
 
 impl Mixer {
@@ -971,8 +966,6 @@ impl Mixer {
             dsp_epoch: 0,
             streaming: false,
             last_ms: 0,
-            midi_frame: 0,
-            midi_ms: 0,
         }
     }
 }
@@ -993,31 +986,18 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     sb.deliver_trigger_irq(vpic);
     sb.deliver_probe_irq(machine, vpic);
     gus.tick(machine, vpic);
-    // Advance the MIDI-arrival clock in the production frame numbering: extend it
-    // by the real time elapsed (get_ticks, ms → frames), but never behind the
-    // production frontier (`pushed`). Between production passes this spreads
-    // arrivals across the interval; at a pass boundary it re-aligns to the new
-    // frontier. Stamping incoming MIDI with it decouples note onset from block
-    // size (a note lands at its true sub-block frame, not the block start).
-    let pushed = mixer.pace.pushed();
-    if !mixer.streaming {
-        // No output session: there is no sub-block position to spread
-        // arrivals into — the next produced frame IS the arrival frame.
-        // Letting the clock free-run here stamped a program's first notes
-        // "seconds since launch" into the future, and the synth dutifully
-        // held them: Dark Forces' fanfare ~3 s after the logo, DOOM's title
-        // music ~2 s late — the GM start delay.
-        mixer.midi_frame = pushed;
-    } else {
-        mixer.midi_frame = (mixer.midi_frame
-            + now.saturating_sub(mixer.midi_ms) * MIX_RATE as u64 / 1000)
-            .max(pushed);
-    }
-    mixer.midi_ms = now;
-    // MPU-401: drain the port's MIDI bytes into the synth (stamped at the arrival
-    // frame) and satisfy a bounded number of its instrument requests (a .PAT
-    // read per request).
-    mpu.tick(machine, mixer.midi_frame);
+    // MPU-401: drain the port's MIDI bytes into the synth and advance the
+    // instrument loader. Bytes are stamped at the production frontier — the
+    // frame the NEXT produced block starts at — which is the only number
+    // line the mixer has: this tick's pump renders them immediately, so a
+    // note sounds within one millisecond of its OUT. (An arrival-clock
+    // integrator used to "spread" stamps between pumps, but the pump runs
+    // per millisecond and all of a tick's bytes share one stamp anyway; the
+    // integrator's only observable behaviour was free-running ahead while
+    // no session streamed, stamping a program's first notes seconds into
+    // the future — the GM start delay: Dark Forces' fanfare ~3 s after the
+    // logo, DOOM's title music ~2 s late.)
+    mpu.tick(machine, mixer.pace.pushed());
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
     // drives an emulated device hard (the GUS driver writes GF1 registers by
