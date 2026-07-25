@@ -1355,6 +1355,17 @@ impl Hda {
                 crate::println!("hda: alc298 amp init aborted (codec stopped responding)");
                 return;
             }
+            // Pace the replay like the reference does. The oracle (Ubuntu's
+            // rb_audio.sh) runs one hda-verb PROCESS per write — milliseconds
+            // between verbs — while a back-to-back CORB burst gives the
+            // vendor DSP microseconds. Its banked/indirect writes (the
+            // 0x23/0x26 sequences) can silently drop under that pressure:
+            // every CORB round-trip acks, but the DSP program comes up
+            // partial — amp audible, low band buried (metal played E1M5's
+            // string line at a whisper while the same PCM through Linux's
+            // fully-programmed codec was loud). ~50 µs per verb costs ~100 ms
+            // once per boot.
+            spin(100_000);
         }
         self.amp_init_done = true;
         crate::println!(
