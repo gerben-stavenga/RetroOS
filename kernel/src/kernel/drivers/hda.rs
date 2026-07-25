@@ -279,6 +279,13 @@ struct Hda {
     /// wakeups; this cursor delta, not the number of queued IRQ events, is the
     /// authoritative amount consumed.
     last_hw_pos: u32,
+    /// True once the DMA position buffer has read nonzero this stream session:
+    /// it is the preferred cursor (some QEMU builds never update SDLPIB), but
+    /// real controllers exist where it stays 0 forever while SDLPIB tracks the
+    /// stream (the ALC298 laptop's AMD controller — the split Linux's
+    /// position_fix quirk table exists for). Until it proves live, consumption
+    /// deltas come from SDLPIB.
+    posbuf_live: bool,
     /// Sparse runtime diagnostics for real hardware bring-up.
     logged_submit: bool,
     logged_run: bool,
@@ -607,6 +614,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         written_src: 0,
         consumed_hw: 0,
         last_hw_pos: 0,
+        posbuf_live: false,
         logged_submit: false,
         logged_run: false,
         diag_buffers: 0,
@@ -903,6 +911,7 @@ impl Hda {
         self.consumed_hw = 0;
         self.emitted = 0;
         self.last_hw_pos = 0;
+        self.posbuf_live = false;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
         // underrun) it must find silence, not a replay of the previous
@@ -1413,6 +1422,20 @@ impl Hda {
         unsafe { read_volatile((self.dma_va + POS_OFF + idx * 8) as *const u32) }
     }
 
+    /// The authoritative hardware byte cursor for consumption accounting:
+    /// the DMA position buffer once it has proven live this session, SDLPIB
+    /// until then (see `posbuf_live`). Consumption must come from a cursor
+    /// that actually moves — deriving deltas from a dead position buffer
+    /// turned every completion IRQ into a garbage near-full-ring delta on
+    /// the ALC298 laptop (silent output, wedged pacer).
+    fn hw_cursor(&mut self) -> u32 {
+        let pos = self.dma_pos();
+        if pos != 0 {
+            self.posbuf_live = true;
+        }
+        if self.posbuf_live { pos } else { r32(self.sd + SDLPIB) }
+    }
+
     fn stop(&mut self) {
         let ctl = r8(self.sd + SDCTL);
         w8(self.sd + SDCTL, ctl & !0x02); // clear RUN
@@ -1451,7 +1474,7 @@ impl Hda {
                 }
                 self.cur_buf = (civ + 2) % NUM_BUF;
                 self.consumed_hw = self.emitted;
-                self.last_hw_pos = self.dma_pos() % (NUM_BUF * BUF_BYTES) as u32;
+                self.last_hw_pos = self.hw_cursor() % (NUM_BUF * BUF_BYTES) as u32;
                 self.diag_resyncs = self.diag_resyncs.wrapping_add(1);
             } else if ahead >= MAX_AHEAD {
                 self.diag_dropped += 1;
@@ -1559,6 +1582,7 @@ impl Hda {
             self.consumed_hw = 0;
             self.emitted = 0;
             self.last_hw_pos = 0;
+            self.posbuf_live = false;
             }
         let fb = fmt.frame_bytes();
         if fb == 0 {
@@ -1783,7 +1807,7 @@ pub fn on_irq() -> bool {
     }
     if dev.running {
         let ring = (NUM_BUF * BUF_BYTES) as u32;
-        let pos = dev.dma_pos() % ring;
+        let pos = dev.hw_cursor() % ring;
         let raw = ((pos + ring - dev.last_hw_pos) % ring) as u64;
         // The in-flight byte count is a hard ceiling on any position delta:
         // the codec cannot have played bytes the producer never emitted. The
