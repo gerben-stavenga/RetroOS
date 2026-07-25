@@ -334,6 +334,17 @@ const GDT_TSS32: usize = 7;       // 0x38
 // extenders #GP on the seg-load. The DPMI spec allows hosts to either
 // pre-define selector 40h *or* handle the GP — pre-defining is simpler.
 #[allow(dead_code)] const GDT_BIOS_DATA: usize = 8;   // 0x40 — BIOS Data Area alias
+/// 0x48 — espfix SS: ring-0 data alias of the trap stack (ARCH_STACK, the
+/// TSS.sp0 stack; kernel.ld 64K-aligns it so it spans exactly one 64K
+/// window). IRET to a 16-bit (B=0) stack segment restores only SP and leaves
+/// the KERNEL's ESP31:16 in the live user ESP — the classic espfix leak.
+/// 16-bit DPMI code that saves/restores full ESP (DOS/16M's stack-switch
+/// glue: `mov [slot], esp` … `lds esi, [slot]`) then stores a kernel-stack
+/// pointer and faults dereferencing it. The exit path switches to this alias
+/// + `movzx esp, sp` before the final pops, so the numeric kernel ESP at
+/// IRET is < 0x10000 and the leaked bits are 0 — what every 16-bit-era DPMI
+/// host effectively provided.
+const GDT_ESPFIX_SS: usize = 9;   // 0x48 — was reserved
 #[allow(dead_code)] const GDT_RING1_CS: usize = 10;   // 0x50
 #[allow(dead_code)] const GDT_RING1_DS: usize = 11;   // 0x58
 const GDT_LDT: usize = 12;        // 0x60
@@ -430,18 +441,31 @@ static mut SYSCALL_USER_RSP: u64 = 0;
 static mut SYSCALL_KERNEL_RSP: u64 = 0;
 
 /// Setup GDT, IDT, and TSS
-pub fn setup_descriptor_tables(kernel_stack_top: u32) {
+pub fn setup_descriptor_tables(arch_stack_top: u32) {
     unsafe {
         let tss_limit = core::mem::size_of::<Tss>() as u32 - 1;
 
         // Setup TSS32 with packed SS:ESP, VGA IOPB, and interrupt redirection
-        TSS32.sp0 = ((KERNEL_DS as u64) << 32) | (kernel_stack_top as u64);
+        TSS32.sp0 = ((KERNEL_DS as u64) << 32) | (arch_stack_top as u64);
         setup_vm86_bitmaps(&raw mut TSS32);
         let tss32_addr = core::ptr::addr_of!(TSS32) as u64;
         GDT[GDT_TSS32] = GdtEntry::tss_low(tss32_addr, tss_limit);
 
+        // espfix SS (see GDT_ESPFIX_SS): alias the ring-0 trap stack (the
+        // TSS.sp0 stack — ARCH_STACK) so the exit path can make the numeric
+        // ESP small before IRET to a 16-bit-stack guest. kernel.ld 64K-aligns
+        // ARCH_STACK, so the whole stack sits in one 64K window and every
+        // ESP's low 16 bits are exactly its offset from the window base.
+        assert!(
+            arch_stack_top & 0xFFFF_0000
+                == arch_stack_top.saturating_sub(0x3FF0) & 0xFFFF_0000,
+            "espfix: trap stack straddles a 64K window (kernel.ld ARCH_STACK)"
+        );
+        GDT[GDT_ESPFIX_SS] =
+            GdtEntry::segment32(false, 0).with_base(arch_stack_top & 0xFFFF_0000);
+
         // Setup TSS64 with clean 64-bit address
-        TSS64.sp0 = kernel_stack_top as u64;
+        TSS64.sp0 = arch_stack_top as u64;
         let tss64_addr = core::ptr::addr_of!(TSS64) as u64;
         GDT[GDT_TSS64_LO] = GdtEntry::tss_low(tss64_addr, tss_limit);
         // GDT[GDT_TSS64_HI] stays null (base bits 63:32 = 0 for <4GB)

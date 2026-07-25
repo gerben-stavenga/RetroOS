@@ -248,6 +248,25 @@ isr_return:
     jmp 0x10:exit_interrupt_64
 
 exit_interrupt_32:
+    ; espfix (see GDT_ESPFIX_SS in descriptors.rs): IRET to a 16-bit (B=0)
+    ; stack segment restores only SP, leaving the kernel's ESP31:16 in the
+    ; guest's live ESP — which 16-bit DPMI code (DOS/16M stack-switch glue)
+    ; saves with `mov [slot], esp` and later dereferences. Run the pops +
+    ; IRET on the trap-stack alias segment (base = the 64K-aligned
+    ; ARCH_STACK window, kernel.ld) with a 16-bit-truncated ESP: same linear bytes,
+    ; numeric ESP < 0x10000, so the leaked half is 0. Done for every
+    ; CROSS-privilege exit — the aligned stack spans exactly one 64K window,
+    ; and 32-bit/VM86/ring-1 IRETs pop full SS:ESP so the switch is harmless
+    ; there. Same-ring ring-0 returns (saved CS RPL=0) must skip: their IRET
+    ; pops no SS:ESP, so the interrupted kernel code would resume on the
+    ; alias with a truncated ESP, breaking its flat-SS assumptions. MOV SS
+    ; blocks interrupts for the following instruction (IF is 0 here anyway).
+    test byte [esp + 200], 3    ; saved CS at Raw32 offset 200; RPL==0 → ring 0
+    jz .no_espfix
+    mov ax, 0x48                ; ESPFIX_SS_SEL (ring-0 trap-stack alias)
+    mov ss, ax
+    movzx esp, sp
+.no_espfix:
     ; ESP at Raw32 offset 0. Pop in reverse of entry_wrapper_32.
     pop gs
     pop fs

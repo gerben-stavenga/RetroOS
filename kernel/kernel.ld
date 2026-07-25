@@ -52,9 +52,16 @@ SECTIONS
         KERNEL_STACK_GUARD = .;     . += 0x1000;   /* 4 KB */
         KERNEL_STACK       = .;     . += 0x10000;  /* 64 KB */
         KERNEL_STACK_TOP   = .;
-        . = ALIGN(4K);
-        ARCH_STACK_GUARD   = .;     . += 0x1000;   /* 4 KB */
-        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB */
+        /* espfix invariant (see GDT_ESPFIX_SS in arch-metal/descriptors.rs):
+         * ARCH_STACK is the ring-0 trap stack (TSS.sp0) — 64K-ALIGN it so
+         * the whole 16 KB stack sits inside one 64K segment window and every
+         * ESP's low 16 bits equal its offset from the window base, letting
+         * the exit path truncate ESP against the aliased SS. The guard page
+         * stays directly below the aligned base. */
+        . += 0x1000;
+        . = ALIGN(64K);
+        ARCH_STACK_GUARD   = . - 0x1000;
+        ARCH_STACK         = .;     . += 0x4000;   /* 16 KB, 64K-aligned */
         ARCH_STACK_TOP     = .;
     }
     _end = .;
