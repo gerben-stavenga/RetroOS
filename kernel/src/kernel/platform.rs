@@ -14,6 +14,8 @@ use crate::println;
 pub struct Platform {
     pub host: Host,
     pub display: Display,
+    /// What sound hardware answered (probe fact).
+    pub audio_hw: AudioHw,
     pub firmware: Firmware,
     pub audio: Audio,
     /// A host filesystem transport answered — the native backend punch-through
@@ -66,9 +68,42 @@ pub enum Firmware {
     Substitute,
 }
 
-/// The audio path — exactly one of these is true, decided here. Replaces
-/// three lazy probes: vsb's `ensure_mode` (SB card), ac97's PRESENT atomic,
-/// and sound's port-window signature cache.
+/// What sound hardware answered — pure probe fact, no policy. Which of
+/// these the guest may drive itself, and what the kernel does with the rest,
+/// is [`Audio`], decided later from the boot config.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioHw {
+    /// A real Sound Blaster answered a DSP reset with 0xAA.
+    Sb,
+    /// An Intel HD Audio controller on PCI (class 04:03).
+    Hda,
+    /// An AC'97 codec on PCI.
+    Ac97,
+    /// A backend installed a sink behind the canonical port window (hosted).
+    PortWindow,
+    /// Nothing answered.
+    None,
+}
+
+impl AudioHw {
+    /// The default verdict for this hardware, before config policy: a real
+    /// SB is the guest's (only card a DOS program can drive; the cheapest
+    /// thing a slow machine can do), everything else is the kernel's to
+    /// emulate through.
+    fn default_verdict(self) -> Audio {
+        match self {
+            AudioHw::Sb => Audio::NativeSb,
+            AudioHw::Hda => Audio::EmulatedHda,
+            AudioHw::Ac97 => Audio::EmulatedAc97,
+            AudioHw::PortWindow => Audio::EmulatedPortWindow,
+            AudioHw::None => Audio::EmulatedSilent,
+        }
+    }
+}
+
+/// The audio path — who owns the sound hardware and what renders through
+/// it. Derived from [`AudioHw`] plus the boot config's `SB_AUDIO=` policy
+/// (`apply_audio_mode`), never probed directly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Audio {
     /// A real Sound Blaster answered on a LEGACY machine (real VGA scanout —
@@ -187,7 +222,7 @@ static mut PLATFORM: Option<Platform> = None;
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
 pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
-    let audio = probe_audio(machine);
+    let audio_hw = probe_audio(machine);
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
     // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
@@ -232,30 +267,15 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             Firmware::Substitute
         };
 
-        // Display and sound are decided on independent axes.
-        //
-        // The DISPLAY axis is firmware: a BIOS machine has a real VGA that
-        // scans out its own memory (nothing for us to do), a UEFI machine
-        // has a dumb framebuffer we raster into. That is `display` above.
-        //
-        // The SOUND axis is the CARD. HDA and AC'97 are PCI codecs no DOS
-        // program can drive, so they are always emulated-and-mixed — true
-        // on a UEFI laptop and equally on a BIOS-era PCI machine (native
-        // VGA, emulated sound). Only a real Sound Blaster is a card the
-        // guest itself can drive, so only there is there a choice, and it
-        // is the owner's: native by default (guest owns the card, no
-        // kernel mixing, no bank ROM — what a 386/486 can afford) or
-        // emulated when they want GUS/GM music on a machine fast enough to
-        // mix it (`audio=mixed`).
-        let audio = match audio {
-            Audio::NativeSb | Audio::SbSink if boot.audio_mixed => Audio::SbSink,
-            other => other,
-        };
+
         Platform {
             host: env.host(boot.is_qemu),
             display,
             firmware,
-            audio,
+            audio_hw,
+            // Policy comes later, when CONFIG.SYS is readable
+            // (`apply_audio_mode`); until then, the hardware's default.
+            audio: audio_hw.default_verdict(),
             hostfs,
             debug: env.debug,
         }
@@ -274,6 +294,29 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
 
 /// The frozen platform description. Panics if `probe` has not run — an init
 /// ordering bug that should be loud.
+/// Apply the boot config's sound-mode policy to the frozen probe. Called
+/// exactly once by `startup`, after the mounts make CONFIG.SYS readable and
+/// before anything reads `audio` (io_policy's IOPB build, the bank burn, the
+/// first guest).
+///
+/// The probe reports which card answered; this decides who owns it. Only a
+/// real Sound Blaster is guest-drivable, so only there is there a choice —
+/// HDA/AC'97 are PCI codecs no DOS program can address and are always
+/// emulated. `mixed` costs a software mix of every source plus the ~5 MB GM
+/// bank, and buys GUS/GM wavetable music on an SB-only machine; `native`
+/// hands the card over and costs the kernel nothing, which is what a 386/486
+/// (and the 86Box/Bochs emulations of one) can afford.
+pub fn apply_audio_mode(mixed: bool) {
+    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
+        .expect("platform::apply_audio_mode before probe");
+    p.audio = match (p.audio_hw, mixed) {
+        (AudioHw::Sb, true) => Audio::SbSink,
+        (hw, _) => hw.default_verdict(),
+    };
+    crate::println!("Audio: {:?} ({})", p.audio,
+        if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
+}
+
 pub fn get() -> &'static Platform {
     unsafe {
         (&raw const PLATFORM)
@@ -299,23 +342,20 @@ pub fn probed() -> bool {
 /// installed a sink. Card presence is machine-wide, so the probe uses the
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
-fn probe_audio<A: crate::Arch>(machine: &mut A) -> Audio {
-    // A real SB answers a DSP reset with 0xAA. Whether the guest owns it or
-    // the kernel mixes through it is decided by the caller (firmware class +
-    // the owner's `audio=` choice); this is only "a card is there".
+fn probe_audio<A: crate::Arch>(machine: &mut A) -> AudioHw {
     if crate::kernel::drivers::sb16::scan(machine) {
-        return Audio::NativeSb;
+        return AudioHw::Sb;
     }
     if crate::kernel::drivers::hda::scan(machine).is_some() {
-        return Audio::EmulatedHda;
+        return AudioHw::Hda;
     }
     if crate::kernel::drivers::ac97::scan(machine).is_some() {
-        return Audio::EmulatedAc97;
+        return AudioHw::Ac97;
     }
     if crate::kernel::sound::window_present(machine) {
-        return Audio::EmulatedPortWindow;
+        return AudioHw::PortWindow;
     }
-    Audio::EmulatedSilent
+    AudioHw::None
 }
 
 

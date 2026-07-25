@@ -65,6 +65,13 @@ pub use dos::parse_config_env;
 /// BootConfig.c_root; read by the bootfs mount and the DN/CONFIG launch paths.
 pub use dfs::{set_c_root, c_root};
 
+/// Look up `KEY` in a DOS environment block (the parsed CONFIG.SYS master
+/// env). Startup reads boot policy out of it — `SB_AUDIO=` — before any
+/// guest exists.
+pub fn config_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    machine::env_var(env, key)
+}
+
 // Stub array / slot table / IRQ-stack constants live in `dos.rs` (alongside
 // the INT handlers that own them); the `dpmi` sibling module also reads them
 // when wiring PM↔RM control flow. Re-import here so both can write

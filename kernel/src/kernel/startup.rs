@@ -72,9 +72,21 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
         .collect();
     mount_filesystems(&parts, platform.hostfs, &mut screen);
+
+    // CONFIG.SYS is readable now: apply its sound-mode policy before anything
+    // consumes the verdict (IOPB grants, the bank burn, the first guest).
+    // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
+    // for testing without editing the disk.
+    let master_env = load_master_env();
+    let mixed = boot.audio_mixed
+        || crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
+            .is_some_and(|v| v.eq_ignore_ascii_case(b"mixed"));
+    crate::kernel::platform::apply_audio_mode(mixed);
+    let platform = crate::kernel::platform::get();
+
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
-    // native-SB (legacy) machine gets no emulated GM and cannot afford the
+    // native-SB machine has no emulated GM to feed and cannot afford the
     // ~5 MB; a silent machine has nothing to render it to.
     match platform.audio {
         crate::kernel::platform::Audio::NativeSb
@@ -82,7 +94,6 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
     }
     init_device_policy(machine, platform);
-    let master_env = load_master_env();
     init_console_pipe();
 
     run(machine, boot, &master_env, &mut threads, screen)

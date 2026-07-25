@@ -8,6 +8,8 @@
 #
 #   BACKEND        qemu | bochs | 86box | hosted   (default: qemu)
 #   --firmware     bios | uefi                     (default: bios; qemu/bochs only)
+#   --sb-audio     native | mixed                  (qemu only: fw_cfg override of
+#                  CONFIG.SYS's SB_AUDIO — who owns a real SB, the guest or our mixer)
 #   --sound        sb | ac97 | hda | none          (default: sb; ac97/hda qemu only,
 #                                                   incl. qemu --firmware uefi)
 #   --arch         386 | 686 | x64                 (default: 386; qemu/bochs only)
@@ -83,6 +85,7 @@ HOSTED_TERMINAL=""
 
 # Passthrough args for the underlying emulator.
 PASS=()
+SB_AUDIO=""   # --sb-audio native|mixed: fw_cfg override of CONFIG.SYS's SB_AUDIO=
 
 # Optional leading positional BACKEND.
 case "${1:-}" in
@@ -95,6 +98,7 @@ while [ $# -gt 0 ]; do
         --backend)    BACKEND="$2"; shift 2 ;;
         --firmware)   FIRMWARE="$2"; shift 2 ;;
         --sound)      SOUND="$2"; shift 2 ;;
+        --sb-audio)   SB_AUDIO="$2"; shift 2 ;;
         --arch)       ARCH="$2"; ARCH_SET=1; shift 2 ;;
         -i|--image)   IMG="$2"; IMG_SET=1; shift 2 ;;
 
@@ -629,6 +633,7 @@ launch_qemu() {
     else
         IMAGE="$SCRIPT_DIR/bazel-bin/$IMAGE_FILE"
         FWCFG_ARGS=()
+        [ -n "$SB_AUDIO" ] && FWCFG_ARGS+=(-fw_cfg "name=opt/audio,string=$SB_AUDIO")
         FWCFG_TMPDIR=""
         # --cmd is the simple alias for the qemu cmdline (mirrors hosted --cmd),
         # so `run.sh qemu --cmd GAMES/DOOMS/DOOM.EXE` just runs it from the disk.
@@ -758,6 +763,7 @@ launch_qemu_uefi() {
     # --cmd / -r autostart (same as the BIOS path): pass the program path via
     # fw_cfg opt/cmdline; the kernel (boot.rs read_named) execs it instead of DN.
     local FWCFG_ARGS=()
+    [ -n "$SB_AUDIO" ] && FWCFG_ARGS+=(-fw_cfg "name=opt/audio,string=$SB_AUDIO")
     [ -z "$START_BIN" ] && [ -n "${HOSTED_CMD:-}" ] && START_BIN="$HOSTED_CMD"
     if [ -n "$START_BIN" ]; then
         printf '%s' "$START_BIN" > "$WORK/cmdline"
