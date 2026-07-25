@@ -68,7 +68,13 @@ pub(super) const GUS_SCALE_Q16: i32 = 17_500;
 /// over its flat pool: instruments aliased onto each other, which is both
 /// audibly wrong and 2.7x louder, and calibrating against it baked the bug
 /// into the level.
-pub(super) const GM_SCALE_Q16: i32 = 7_700;
+///
+/// Doubled from the 7,700 GUS-matched value: WAV-measured against DOOM2, GM
+/// music sat ~-6 dB under the digital SFX (RMS ~440 vs ~900) — a ratio
+/// unchanged across the ROM-bank rework, i.e. long-standing, just unmasked
+/// once the start delay and dropouts were fixed. Pending a dosemu
+/// balance-comparison pass.
+pub(super) const GM_SCALE_Q16: i32 = 15_400;
 
 /// The PC speaker, level-matched to the same reference as the other two, but
 /// *derived* rather than measured — and it can be, because a square wave's
