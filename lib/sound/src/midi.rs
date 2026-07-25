@@ -186,17 +186,69 @@ struct Resident {
     patch: Patch,
 }
 
-/// The General MIDI synthesizer.
+/// The instrument bank — parsed patches plus their shared sample pool, the
+/// GM device's ROM. Built once by the host (which owns file I/O) and shared
+/// by every synth instance by reference; the pool is exactly the GF1-DRAM
+/// shape, so the engine mixes from one `&[u8]`.
+pub struct Bank {
+    pool: Vec<u8>,
+    /// Resident instruments by patch id, `None` where the bank has no file.
+    resident: Vec<Option<Resident>>,
+}
+
+impl Default for Bank {
+    fn default() -> Bank {
+        Bank::new()
+    }
+}
+
+impl Bank {
+    pub fn new() -> Bank {
+        let mut resident = Vec::new();
+        resident.resize_with(PATCH_SLOTS, || None);
+        Bank { pool: Vec::new(), resident }
+    }
+
+    /// Install a `.PAT` file's bytes as patch `id`. Ignored if the bytes do
+    /// not parse — a corrupt or absent instrument leaves the slot empty and
+    /// its notes silent, never a panic. Returns whether it became resident.
+    pub fn load_patch(&mut self, id: u16, bytes: &[u8]) -> bool {
+        let Some(mut patch) = Patch::parse(bytes) else {
+            return false;
+        };
+        if id as usize >= PATCH_SLOTS {
+            return false;
+        }
+        let base = self.pool.len() as u32;
+        patch.relocate(base);
+        self.pool.extend_from_slice(&patch.pcm);
+        // The PCM now lives in the pool; drop the patch's private copy so a
+        // full bank does not hold every instrument twice.
+        patch.pcm = Vec::new();
+        self.resident[id as usize] = Some(Resident { patch });
+        true
+    }
+
+    pub fn has_patch(&self, id: u16) -> bool {
+        self.resident.get(id as usize).is_some_and(|r| r.is_some())
+    }
+
+    fn get(&self, id: u16) -> Option<&Resident> {
+        self.resident.get(id as usize)?.as_ref()
+    }
+
+    /// (instrument count, pool bytes) — for the host's boot summary line.
+    pub fn stats(&self) -> (usize, usize) {
+        (self.resident.iter().filter(|r| r.is_some()).count(), self.pool.len())
+    }
+}
+
+/// The General MIDI synthesizer: voices, channels and the MIDI wire. The
+/// instruments live in a shared [`Bank`]; a synth without one to reference
+/// cannot exist, which is the ROM-bank model made structural.
 pub struct Synth {
     engine: Box<Engine>,
-    /// One shared sample pool, exactly like the GF1's DRAM: every voice
-    /// addresses into this, so the engine mixes from one `&[u8]`.
-    pool: Vec<u8>,
-    /// Resident instruments by patch id, `None` until the host loads one.
-    resident: Vec<Option<Resident>>,
-    /// Patch ids wanted but not resident. A small ring: the host drains it
-    /// each tick, and a repeat request is harmless.
-    wanted: Vec<u16>,
+    bank: &'static Bank,
     channels: [Channel; 16],
     notes: [Note; MAX_VOICES],
     /// MIDI running status and the parameter bytes collected for it.
@@ -217,15 +269,11 @@ pub struct Synth {
 }
 
 impl Synth {
-    /// An empty synth: no instruments, all channels at GM power-on defaults.
-    pub fn new_boxed() -> Box<Synth> {
-        let mut resident = Vec::new();
-        resident.resize_with(PATCH_SLOTS, || None);
+    /// A synth over `bank`, all channels at GM power-on defaults.
+    pub fn new_boxed(bank: &'static Bank) -> Box<Synth> {
         Box::new(Synth {
             engine: Engine::new_boxed(),
-            pool: Vec::new(),
-            resident,
-            wanted: Vec::new(),
+            bank,
             channels: [Channel::new(); 16],
             notes: [Note::default(); MAX_VOICES],
             status: 0,
@@ -258,57 +306,6 @@ impl Synth {
         self.out_rate = rate;
         for ch in 0..16u8 {
             self.retune_channel(ch);
-        }
-    }
-
-    // ── patch residency (the host's half) ────────────────────────────────
-
-    /// A patch id the synth needs and does not have, or `None`. The host
-    /// resolves it with [`patch_stem`], reads the file, and calls
-    /// [`load_patch`](Self::load_patch). Drain until it returns `None`.
-    pub fn take_patch_request(&mut self) -> Option<u16> {
-        self.wanted.pop()
-    }
-
-    /// Install a `.PAT` file's bytes as patch `id`. Ignored if the bytes do
-    /// not parse — a corrupt or absent instrument leaves the slot empty and
-    /// its notes silent, never a panic.
-    ///
-    /// Returns whether the patch became resident, so a host can mark a failed
-    /// id and stop re-reading a file that will not parse.
-    pub fn load_patch(&mut self, id: u16, bytes: &[u8]) -> bool {
-        let Some(mut patch) = Patch::parse(bytes) else {
-            return false;
-        };
-        if id as usize >= PATCH_SLOTS {
-            return false;
-        }
-        let base = self.pool.len() as u32;
-        patch.relocate(base);
-        self.pool.extend_from_slice(&patch.pcm);
-        // The PCM now lives in the pool; drop the patch's private copy so a
-        // full bank does not hold every instrument twice.
-        patch.pcm = Vec::new();
-        self.resident[id as usize] = Some(Resident { patch });
-        true
-    }
-
-    /// Whether patch `id` is resident.
-    pub fn has_patch(&self, id: u16) -> bool {
-        self.resident
-            .get(id as usize)
-            .is_some_and(|r| r.is_some())
-    }
-
-    /// Note the host could not supply this patch, so we stop asking.
-    pub fn deny_patch(&mut self, id: u16) {
-        self.wanted.retain(|&w| w != id);
-        let _ = id;
-    }
-
-    fn want(&mut self, id: u16) {
-        if !self.has_patch(id) && !self.wanted.contains(&id) && self.wanted.len() < 16 {
-            self.wanted.push(id);
         }
     }
 
@@ -397,13 +394,7 @@ impl Synth {
             }
             0xA0 => {} // polyphonic aftertouch: not modelled
             0xB0 => self.control(ch, a, b2),
-            0xC0 => {
-                self.channels[ch].program = a & 0x7F;
-                if ch as u8 != DRUM_CH {
-                    let id = (a & 0x7F) as u16;
-                    self.want(id);
-                }
-            }
+            0xC0 => self.channels[ch].program = a & 0x7F,
             0xD0 => {} // channel pressure: not modelled
             0xE0 => {
                 let raw = ((b2 as i32) << 7 | a as i32) - 8192;
@@ -481,16 +472,15 @@ impl Synth {
 
     fn note_on(&mut self, ch: u8, key: u8, vel: u8) {
         let id = self.patch_for(ch, key);
-        if !self.has_patch(id) {
-            self.want(id);
-            return; // silent until the host supplies it — as a GUS would be
+        if !self.bank.has_patch(id) {
+            return; // absent from the ROM: this bank has no such instrument
         }
         // A sequencer retriggers a key constantly without always sending the
         // note-off first. Letting both sound leaves the older voice with no
         // note-off that will ever match it — an instrument that never dies.
         self.release_key(ch, key);
         let hz = self.note_hz_for(ch, key);
-        let Some(res) = self.resident[id as usize].as_ref() else { return };
+        let Some(res) = self.bank.get(id) else { return };
         let si = res.patch.select_index(hz);
         let s = res.patch.samples[si];
         let v = self.alloc_voice();
@@ -595,8 +585,9 @@ impl Synth {
         // wash down to the initial strike. Only an envelope-less sample has
         // nothing to end it, so there the loop must run out to the sample end.
         let n = self.notes[v];
-        let has_env = self.resident[n.patch as usize]
-            .as_ref()
+        let has_env = self
+            .bank
+            .get(n.patch)
             .is_some_and(|res| res.patch.samples[n.sample as usize].envelope);
         if !has_env {
             self.engine.voices[v].loop_mode = LoopMode::None;
@@ -617,7 +608,7 @@ impl Synth {
     /// one-segment ramp generator.
     fn start_stage(&mut self, v: usize, stage: u8) {
         let n = self.notes[v];
-        let Some(res) = self.resident[n.patch as usize].as_ref() else { return };
+        let Some(res) = self.bank.get(n.patch) else { return };
         let s = res.patch.samples[n.sample as usize];
         if !s.envelope || stage as usize >= 6 {
             // No envelope: play flat at the note's peak.
@@ -659,7 +650,7 @@ impl Synth {
                 continue;
             }
             let hz = self.note_hz_for(ch, n.key);
-            let Some(res) = self.resident[n.patch as usize].as_ref() else { continue };
+            let Some(res) = self.bank.get(n.patch) else { continue };
             let s = res.patch.samples[n.sample as usize];
             self.engine.voices[v].inc = pitch_inc(&s, hz, self.out_rate);
         }
@@ -704,7 +695,7 @@ impl Synth {
                 continue; // no voice sounding at this frame yet
             }
             let mut ev = Events::default();
-            let (l, r) = self.engine.mix_frame(&self.pool, self.out_rate, self.out_rate, &mut ev);
+            let (l, r) = self.engine.mix_frame(&self.bank.pool, self.out_rate, self.out_rate, &mut ev);
             slot.0 += (l * gain.0) >> 16;
             slot.1 += (r * gain.1) >> 16;
             if ev.ramp_irq != 0 {
@@ -828,9 +819,10 @@ mod tests {
     }
 
     fn synth() -> alloc::boxed::Box<Synth> {
-        let mut s = Synth::new_boxed();
+        let mut bank = Bank::new();
+        assert!(bank.load_patch(0, &tiny_patch()), "fixture must parse");
+        let mut s = Synth::new_boxed(alloc::boxed::Box::leak(alloc::boxed::Box::new(bank)));
         s.init();
-        assert!(s.load_patch(0, &tiny_patch()), "fixture must parse");
         s
     }
 

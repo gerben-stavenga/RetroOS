@@ -72,6 +72,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
         .collect();
     mount_filesystems(&parts, platform.hostfs, &mut screen);
+    // Burn the GM bank ROM while long work is still legal (no guest yet):
+    // the shipped bank lives under the C: root beside the GUS patches.
+    {
+        let mut dir = alloc::vec::Vec::from(crate::kernel::dos::c_root());
+        dir.extend_from_slice(b"/ULTRASND/MIDI");
+        crate::kernel::midi_bank::load(&dir);
+    }
     init_device_policy(machine, platform);
     let master_env = load_master_env();
     init_console_pipe();
