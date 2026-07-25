@@ -50,17 +50,28 @@ static mut MOUSE_PACKET_IDX: u8 = 0;
 pub fn drain(mut f: impl FnMut(Irq)) {
     // The ring-0 interrupt top half writes QUEUE while the ring-1 kernel drains
     // it. Move into a local under a short interrupt mask, then restore IF before
-    // invoking arbitrary kernel callbacks.
-    let mut events = [Irq::Tick; 256];
+    // invoking arbitrary kernel callbacks. Keep the scratch uninitialized:
+    // this path runs after every guest exit, while the queue is almost always
+    // empty. Initializing 256 fake Tick entries per exit made a polling guest
+    // write gigabytes of dead stack traffic per second.
+    let mut events = [core::mem::MaybeUninit::<Irq>::uninit(); 256];
     let restore_if = crate::x86::interrupts_enabled();
     crate::x86::cli();
     let q = &raw mut QUEUE;
-    let n = unsafe { (*q).read(&mut events) };
+    let mut n = 0;
+    unsafe {
+        while n < events.len() {
+            let Some(event) = (*q).pop() else { break };
+            events[n].write(event);
+            n += 1;
+        }
+    }
     if restore_if {
         crate::x86::sti();
     }
-    for event in events.into_iter().take(n) {
-        f(event);
+    for event in &events[..n] {
+        // Every element below `n` was initialized by the pop loop above.
+        f(unsafe { event.assume_init_read() });
     }
 }
 

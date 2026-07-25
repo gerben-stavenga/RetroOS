@@ -436,6 +436,7 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
+    let mut last_event_drain_tick = u64::MAX;
 
     loop {
         stats.slice_begin(machine);
@@ -445,15 +446,25 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         if crate::kernel::osd::is_open() {
             crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
         }
+        stats.part(machine, 0);
         // Kernel-owned device IRQs are serviced before virtual-time/audio
-        // advancement. The remaining input/guest events retain their order for
-        // console routing below.
-        let events = crate::kernel::irq_dispatch::drain(machine);
+        // advancement. Polling guests can cross this loop hundreds of times
+        // within one millisecond; the hardware queue only needs inspecting
+        // once on that same device cadence. This bounds keyboard/audio wakeup
+        // latency to 1 ms while avoiding a CLI/queue/STI round-trip per port.
+        let now_tick = machine.get_ticks();
+        let events = if now_tick != last_event_drain_tick {
+            last_event_drain_tick = now_tick;
+            crate::kernel::irq_dispatch::drain(machine)
+        } else {
+            alloc::vec::Vec::new()
+        };
+        stats.part(machine, 1);
         let thread = ctx.thread(threads);
 
         // Advance this thread's world: virtual time, console input, delivery.
         thread.personality.advance_world(machine, &mut ctx.regs);
-        stats.part(machine, 0);
+        stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
             &mut ctx.regs,
@@ -461,9 +472,10 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
             &mut thread.personality,
             events,
         );
-        stats.part(machine, 1);
+        stats.part(machine, 3);
         thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.regs);
-        stats.part(machine, 2);
+        stats.part(machine, 4);
+
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or F11 to move on.
@@ -861,8 +873,8 @@ static mut SLICE_PARTS: [u64; 5] = [0; 5];
 /// tick+display total can be divided by the right denominator.
 static mut PRESENTS: u64 = 0;
 
-/// display_tick's internals: scanout, the per-frame vec alloc+zero, render,
-/// present — plus the source pixel count.
+/// display_tick's internals: scanout, allocation, render, present — plus the
+/// number of destination pixels actually copied after dirty-span rejection.
 static mut DISP_PARTS: [u64; 5] = [0; 5];
 
 pub fn bill_display(scanout: u64, alloc: u64, render: u64, present: u64, px: usize) {
@@ -872,7 +884,23 @@ pub fn bill_display(scanout: u64, alloc: u64, render: u64, present: u64, px: usi
         (*p)[1] = (*p)[1].wrapping_add(alloc);
         (*p)[2] = (*p)[2].wrapping_add(render);
         (*p)[3] = (*p)[3].wrapping_add(present);
-        (*p)[4] = px as u64;
+        (*p)[4] = (*p)[4].wrapping_add(px as u64);
+    }
+}
+
+/// `audio_tick` internals: device maintenance/MIDI, pump setup and sink
+/// pacing, PCM source mixing/output, guest clocks/IRQ delivery, and the
+/// number of canonical PCM frames generated.
+static mut AUDIO_PARTS: [u64; 5] = [0; 5];
+
+pub fn bill_audio(devices: u64, setup: u64, pump: u64, clocks: u64, frames: u64) {
+    unsafe {
+        let p = &raw mut AUDIO_PARTS;
+        (*p)[0] = (*p)[0].wrapping_add(devices);
+        (*p)[1] = (*p)[1].wrapping_add(setup);
+        (*p)[2] = (*p)[2].wrapping_add(pump);
+        (*p)[3] = (*p)[3].wrapping_add(clocks);
+        (*p)[4] = (*p)[4].wrapping_add(frames);
     }
 }
 
@@ -957,8 +985,9 @@ struct EventStats {
     /// Cycles spent in `dispatch` per event kind — the same 11 slots as
     /// `counts`, so dividing one by the other gives cost-per-event.
     dispatch_cycles: [u64; 11],
-    /// The pre-phase, split three ways: advance_world, console drain, after_input.
-    pre_parts: [u64; 3],
+    /// Exact pre-run routine split: event bookkeeping/OSD, hardware IRQ drain,
+    /// advance_world, console dispatch, personality after_input.
+    pre_parts: [u64; 5],
     part_mark: u64,
     slice_start: u64,
     last_idx: usize,
@@ -995,7 +1024,7 @@ impl EventStats {
             pre_cycles: 0,
             post_cycles: 0,
             dispatch_cycles: [0; 11],
-            pre_parts: [0; 3],
+            pre_parts: [0; 5],
             part_mark: 0,
             slice_start: 0,
             last_idx: 0,
@@ -1033,6 +1062,11 @@ impl EventStats {
 
     /// Close out one part of the pre-phase and open the next.
     fn part<A: crate::Arch>(&mut self, machine: &mut A, i: usize) {
+        // The extra routine boundaries exist only for an active profile.
+        // Normal gameplay keeps the old event-loop instruction count.
+        if !profile_enabled() {
+            return;
+        }
         let now = machine.rdtsc();
         self.pre_parts[i] = self.pre_parts[i].wrapping_add(now.wrapping_sub(self.part_mark));
         self.part_mark = now;
@@ -1160,6 +1194,24 @@ impl EventStats {
                 crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
                     cost(3), cost(4), cost(0), cost(1));
                 let ev = self.iterations.max(1);
+                let dispatch_total = self.dispatch_cycles.iter()
+                    .fold(0u64, |sum, &v| sum.wrapping_add(v));
+                let scheduler_total = self.post_cycles.saturating_sub(dispatch_total);
+                let pct = |v: u64| {
+                    v.saturating_mul(100).checked_div(total.max(1)).unwrap_or(0)
+                };
+                crate::dbg_println!(
+                    "[prof] kernel routines: bookkeeping={} ({}%) irq_drain={} ({}%) advance_world={} ({}%) console={} ({}%) after_input={} ({}%)",
+                    self.pre_parts[0], pct(self.pre_parts[0]),
+                    self.pre_parts[1], pct(self.pre_parts[1]),
+                    self.pre_parts[2], pct(self.pre_parts[2]),
+                    self.pre_parts[3], pct(self.pre_parts[3]),
+                    self.pre_parts[4], pct(self.pre_parts[4]));
+                crate::dbg_println!(
+                    "[prof] kernel post: dispatch={} ({}%) scheduler/exit={} ({}%) | dispatch/event pf={} syscall={}",
+                    dispatch_total, pct(dispatch_total),
+                    scheduler_total, pct(scheduler_total),
+                    cost(8), cost(10));
                 let sp = unsafe { SLICE_PARTS };
                 let np = unsafe { PRESENTS };
                 unsafe { PRESENTS = 0 };
@@ -1172,11 +1224,20 @@ impl EventStats {
                 let dp = unsafe { DISP_PARTS };
                 unsafe { DISP_PARTS = [0; 5] };
                 let per = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
-                crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} (src {}px)",
-                    per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), dp[4]);
+                crate::dbg_println!("[prof]   display/frame: scanout={} alloc={} render={} present={} copied={}px",
+                    per(dp[0]), per(dp[1]), per(dp[2]), per(dp[3]), per(dp[4]));
+                let ap = unsafe { AUDIO_PARTS };
+                unsafe { AUDIO_PARTS = [0; 5] };
+                crate::dbg_println!(
+                    "[prof]   audio: devices={} ({}%) setup/pace={} ({}%) pump={} ({}%) clocks/irqs={} ({}%) generated={} frames",
+                    ap[0], pct(ap[0]), ap[1], pct(ap[1]),
+                    ap[2], pct(ap[2]), ap[3], pct(ap[3]), ap[4]);
                 unsafe { SLICE_PARTS = [0; 5] };
-                crate::dbg_println!("[prof] pre cycles/event: advance_world={} drain={} after_input={}",
-                    self.pre_parts[0] / ev, self.pre_parts[1] / ev, self.pre_parts[2] / ev);
+                crate::dbg_println!(
+                    "[prof] pre cycles/event: bookkeeping={} irq_drain={} advance_world={} console={} after_input={}",
+                    self.pre_parts[0] / ev, self.pre_parts[1] / ev,
+                    self.pre_parts[2] / ev, self.pre_parts[3] / ev,
+                    self.pre_parts[4] / ev);
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
                     p.sort_by_key(|e| core::cmp::Reverse(e.1));
@@ -1212,7 +1273,7 @@ impl EventStats {
             self.pre_cycles = 0;
             self.post_cycles = 0;
             self.dispatch_cycles = [0; 11];
-            self.pre_parts = [0; 3];
+            self.pre_parts = [0; 5];
             self.counts = [0; 11];
             self.softint_by_vec = [0; 256];
             self.ports = [(0, 0, 0); 12];

@@ -209,11 +209,18 @@ impl<A: crate::Arch> Personality<A> {
     pub fn advance_world(&mut self, machine: &mut A, regs: &mut Regs) {
         match self {
             Self::Dos(dos) => {
-                // Four rdtsc per event is ~3% of a core at this event rate, so
-                // the instrument only runs when someone is looking.
-                let prof = crate::kernel::startup::profile_enabled();
-                let t0 = if prof { machine.rdtsc() } else { 0 };
                 let ticks = machine.take_pending_ticks();
+                // Port-polling games can exit to the kernel hundreds of
+                // thousands of times between adjacent millisecond ticks.
+                // Display and audio are both driven by this tick clock, so
+                // revisiting the whole virtual machine when it did not advance
+                // is pure per-exit overhead.
+                if ticks == 0 {
+                    return;
+                }
+                // Instrument only actual world advances. Per-exit rdtsc
+                // sampling materially distorted profiles of PIT-polling games.
+                let prof = crate::kernel::startup::profile_enabled();
                 let t1 = if prof { machine.rdtsc() } else { 0 };
                 for _ in 0..ticks {
                     crate::kernel::dos::queue_tick(machine, dos);
@@ -232,7 +239,7 @@ impl<A: crate::Arch> Personality<A> {
                 if prof {
                     let t3 = machine.rdtsc();
                     crate::kernel::startup::bill_slice2(
-                        t1.wrapping_sub(t0), t1b.wrapping_sub(t1),
+                        0, t1b.wrapping_sub(t1),
                         t2.wrapping_sub(t1b), t3.wrapping_sub(t2), ticks as u64);
                 }
             }
