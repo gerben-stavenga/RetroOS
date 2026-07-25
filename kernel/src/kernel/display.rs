@@ -222,17 +222,24 @@ pub fn raster(
     let by = (fb.height - out_h) / 2; // top border height
     let slack = xbase + 1;
 
-    if s.geo != (w, h, out_w, out_h) || s.row.len() != fb.width + slack {
+    if s.geo != (w, h, out_w, out_h) || s.row.len() != out_w + slack {
         s.geo = (w, h, out_w, out_h);
         s.src.clear();
         s.src.resize(w, 0);
         s.row.clear();
-        s.row.resize(fb.width + slack, 0); // border pixels stay black
+        s.row.resize(out_w + slack, 0);
         s.sy = 0;
         s.oy = 0;
         s.yerr = 0;
         s.acc = 0;
         s.last_ms = now_ms;
+        // Mode switch: reclaim the whole panel ONCE — pillarbox bars and
+        // letterbox bands included, whatever the previous mode or a console
+        // print left there. From here the sweep copies only the picture
+        // span, so the bars cost nothing per frame.
+        unsafe {
+            core::ptr::write_bytes(fb.va as *mut u32, 0, fb.stride * fb.height);
+        }
     }
 
     // Step credit from elapsed virtual time: a sweep is `h` painted rows
@@ -272,35 +279,24 @@ pub fn raster(
             continue;
         }
         lib::vga_render::render_row(frame, s.sy, &s.pal, &mut s.src);
-        let (mut o, mut xerr) = (bx, 0usize);
+        let (mut o, mut xerr) = (0usize, 0usize);
         for &v in &s.src {
             s.row[o..o + xbase + 1].fill(v);
             xerr += xrem;
             o += xbase + if xerr >= w { xerr -= w; 1 } else { 0 };
         }
-        // Re-blacken the stretcher's overshoot: that strip is right border.
-        s.row[bx + out_w..].fill(0);
         s.yerr += yrem;
         let rows = ybase + if s.yerr >= h { s.yerr -= h; 1 } else { 0 };
         for _ in 0..rows {
-            let d = (by + s.oy) * fb.stride;
+            let d = (by + s.oy) * fb.stride + bx;
             unsafe {
-                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), fb.width);
+                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), out_w);
             }
-            copied += fb.width;
+            copied += out_w;
             s.oy += 1;
         }
         s.sy += 1;
         if s.sy == h {
-            // Letterbox bands (rare geometry — 4:3 content on a 4:3-or-wider
-            // panel pillarboxes instead, and the row copy above covers those
-            // borders every row): painted once per sweep, entering blank.
-            for y in (0..by).chain(by + out_h..fb.height) {
-                unsafe {
-                    core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.stride), 0, fb.width);
-                }
-                copied += fb.width;
-            }
             // Frame complete: the beam enters vertical blank (the retrace
             // 0x3DA now reports) and the caller presents.
             wrapped = true;
