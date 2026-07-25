@@ -33,9 +33,16 @@ impl Mpu {
         }
     }
 
-    /// Ports this device decodes, once the machine says it exists.
+    /// Ports this device decodes, once the machine says it exists. In
+    /// native-SB mode it decodes nothing: the guest is driving real
+    /// silicon, and whatever answers at the declared MPU port — an MPU-401,
+    /// a wavetable daughterboard, an external module — is the owner's
+    /// hardware, not ours to intercept. (Our synth could not sound anyway:
+    /// native burns no GM bank.)
     pub fn owns(&self, p: u16) -> bool {
-        self.present && self.card.owns(p)
+        self.present
+            && !crate::kernel::platform::get().audio.sb_passthrough()
+            && self.card.owns(p)
     }
 
     /// Apply the guest's environment: the MPU port comes from `BLASTER`'s

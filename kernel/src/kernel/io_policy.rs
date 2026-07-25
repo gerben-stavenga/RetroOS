@@ -39,6 +39,15 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
             // answers FM detection.
             if platform::get().audio.sb_passthrough() {
                 machine.allow_io_ports(0x388, 2);
+                // The MPU-401 window the guest declared (BLASTER `P`). In
+                // native mode the emulated MPU stands down, so these reach
+                // whatever the owner actually has there — a real MPU, a
+                // wavetable daughterboard, an external module.
+                if let Personality::Dos(dos) = personality
+                    && dos.pc.mpu.present
+                {
+                    machine.allow_io_ports(dos.pc.mpu.base, 2);
+                }
             }
         }
         // Linux: no ports. The deny-all baseline stands.
