@@ -972,32 +972,33 @@ impl Mixer {
 
 /// Advance emulated sound by one event-loop quantum (no-op for the parts a
 /// real card serves): deliver device IRQs, run the mixer pump, then derive
+/// Per-slice device service — the audio work whose LATENCY contract is the
+/// event-loop slice, not the millisecond pump: the SB's latched 0xF2/0xF3
+/// trigger IRQ, single-cycle DMA probe completions (MI2's driver expects
+/// the completion back-to-back; a 1 ms floor loses it — see 35e3b27), the
+/// GF1 rate timers + DMA-TC IRQ, and the MPU byte drain (stamped at the
+/// production frontier — the frame the next produced block starts at, so a
+/// note sounds within one millisecond of its OUT; a free-running arrival
+/// clock here once stamped a program's first notes seconds ahead, the GM
+/// start delay). Called on every event-loop slice, including the ticks==0
+/// fast path that skips the pump entirely.
+pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
+    let PcMachine { sb, gus, mpu, vpic, mixer, .. } = pc;
+    sb.deliver_trigger_irq(vpic);
+    sb.deliver_probe_irq(machine, vpic);
+    gus.tick(machine, vpic);
+    mpu.tick(machine, mixer.pace.pushed());
+}
+
 /// every guest-visible clock from the sink's drain position.
 pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     let _ = regs;
     let profiling = crate::kernel::startup::profile_enabled();
     let prof_start = if profiling { machine.rdtsc() } else { 0 };
+    audio_service(machine, pc);
     let PcMachine { sb, gus, mpu, spk, vpic, mixer, .. } = pc;
     let now = machine.get_ticks();
     let dt = now.saturating_sub(mixer.last_ms).min(100);
-
-    // Device ticks that run regardless of playback: the SB's latched
-    // 0xF2/0xF3 trigger IRQ, the GF1 rate timers + DMA-TC IRQ.
-    sb.deliver_trigger_irq(vpic);
-    sb.deliver_probe_irq(machine, vpic);
-    gus.tick(machine, vpic);
-    // MPU-401: drain the port's MIDI bytes into the synth and advance the
-    // instrument loader. Bytes are stamped at the production frontier — the
-    // frame the NEXT produced block starts at — which is the only number
-    // line the mixer has: this tick's pump renders them immediately, so a
-    // note sounds within one millisecond of its OUT. (An arrival-clock
-    // integrator used to "spread" stamps between pumps, but the pump runs
-    // per millisecond and all of a tick's bytes share one stamp anyway; the
-    // integrator's only observable behaviour was free-running ahead while
-    // no session streamed, stamping a program's first notes seconds into
-    // the future — the GM start delay: Dark Forces' fanfare ~3 s after the
-    // logo, DOOM's title music ~2 s late.)
-    mpu.tick(machine, mixer.pace.pushed());
 
     // The pump runs on the millisecond, not on the slice. A DOS program that
     // drives an emulated device hard (the GUS driver writes GF1 registers by

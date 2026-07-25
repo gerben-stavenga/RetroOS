@@ -212,19 +212,15 @@ impl<A: crate::Arch> Personality<A> {
                 let ticks = machine.take_pending_ticks();
                 // Port-polling games can exit to the kernel hundreds of
                 // thousands of times between adjacent millisecond ticks.
-                // Display and the audio PUMP are driven by this tick clock,
+                // Display and the audio pump are driven by this tick clock,
                 // so revisiting the whole virtual machine when it did not
-                // advance is pure per-exit overhead — but audio_tick's
-                // above-the-gate section (latched 0xF2 trigger IRQs, tiny
-                // single-cycle DMA probe completions, the GF1's fine
-                // timers) is SUB-quantum by design: MI2's driver arms a
-                // one-byte probe and expects the completion back-to-back
-                // (see the 35e3b27 fix — a 1 ms floor loses it, and a full
-                // early-out here reinstated exactly that floor). audio_tick
-                // itself returns right after that section when no
-                // millisecond has elapsed.
+                // advance is pure per-exit overhead. Device service is not:
+                // its latency contract is the slice (MI2 arms a one-byte DMA
+                // probe and expects the completion back-to-back; a 1 ms
+                // floor loses it — 35e3b27, regressed once by a full
+                // early-out here).
                 if ticks == 0 {
-                    crate::kernel::dos::audio_tick(machine, dos, regs);
+                    crate::kernel::dos::audio_service(machine, dos);
                     return;
                 }
                 // Instrument only actual world advances. Per-exit rdtsc

@@ -1103,6 +1103,12 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     machine::audio_tick(machine, &mut dos.pc, regs);
 }
 
+/// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
+/// timers, MPU drain) without the millisecond pump — the ticks==0 fast path.
+pub fn audio_service<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
+    machine::audio_service(machine, &mut dos.pc);
+}
+
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery
 /// is uniform regardless of the client's current mode: `deliver_pm_irq`
 /// snapshots the client state on a kernel IRQ stack and switches to the
