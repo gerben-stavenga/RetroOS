@@ -83,7 +83,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         .unwrap_or_default();
     let mixed = boot.audio_mixed
         || sb_audio.split(|&b| b == b' ').next().is_some_and(|m| m.eq_ignore_ascii_case(b"mixed"));
-    crate::kernel::platform::apply_audio_mode(mixed);
+    crate::kernel::platform::apply_audio_mode(mixed, parse_sb_wiring(&sb_audio));
     let platform = crate::kernel::platform::get();
 
     // BLASTER describes THE CARD THE GUEST SEES.
@@ -101,22 +101,33 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     if platform.audio == crate::kernel::platform::Audio::NativeSb
         && let Some(card) = platform.sb_card
     {
-        let declared = parse_sb_wiring(&sb_audio);
-        match card.wiring.or(declared) {
-            Some(w) => {
-                let mut b = alloc::vec::Vec::new();
-                fmt_blaster(&mut b, card.base, w.irq, w.dma8, w.dma16);
-                crate::println!(
-                    "Audio: native SB — BLASTER={}",
-                    core::str::from_utf8(&b).unwrap_or("?")
-                );
-                crate::kernel::dos::set_config_var(&mut master_env, b"BLASTER", &b);
-            }
-            None => crate::println!(
-                "Audio: SB DSP {}.x at {:#05x} has no readable wiring — declare it as                  `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; sound is off until then",
-                card.dsp_major, card.base
-            ),
+        if platform.sb_wiring.is_none() {
+            crate::println!(
+                "Audio: SB DSP {}.x cannot report its IRQ/DMA — declare the card's real ones as `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; sound is off until then",
+                card.dsp_major
+            );
         }
+        // The guest's BLASTER stays the owner's, verbatim: IRQ and DMA are
+        // only labels (the card's line is relayed onto the guest's vPIC
+        // line, its 8237 channels are remapped onto the card's), so a game
+        // with its own saved sound settings keeps working. The PORT is the
+        // exception — it is granted through the IOPB and the guest's writes
+        // land on the real card — so A must be the card's base, and a
+        // disagreeing CONFIG.SYS gets said out loud.
+        let cfg_blaster = crate::kernel::dos::config_var(&master_env, b"BLASTER")
+            .map(alloc::vec::Vec::from)
+            .unwrap_or_default();
+        if blaster_base(&cfg_blaster) != Some(card.base) {
+            crate::println!(
+                "Audio: CONFIG.SYS BLASTER declares A{:03X}, the card answers at {:#05X} — using the card",
+                blaster_base(&cfg_blaster).unwrap_or(0), card.base
+            );
+        }
+        let keep_h = card.wiring.and_then(|w| w.dma16).is_some();
+        let blaster = rewrite_blaster_base(&cfg_blaster, card.base, keep_h);
+        crate::println!("Audio: native SB — BLASTER={}",
+            core::str::from_utf8(&blaster).unwrap_or("?"));
+        crate::kernel::dos::set_config_var(&mut master_env, b"BLASTER", &blaster);
     }
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
@@ -333,10 +344,26 @@ fn parse_u8(s: &[u8]) -> Option<u8> {
     (!s.is_empty() && n < 256).then_some(n as u8)
 }
 
-/// `A%03x I%d D%d[ H%d]` — the canonical BLASTER form. The 16-bit channel is
-/// only present on cards that have one.
-fn fmt_blaster(out: &mut alloc::vec::Vec<u8>, base: u16, irq: u8, dma8: u8, dma16: Option<u8>) {
+/// The `A` token of a BLASTER string, as a port number.
+fn blaster_base(v: &[u8]) -> Option<u16> {
+    for tok in v.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        if tok[0].eq_ignore_ascii_case(&b'A') {
+            let mut n: u16 = 0;
+            for &c in &tok[1..] {
+                n = n * 16 + (c as char).to_digit(16)? as u16;
+            }
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// The owner's BLASTER with its `A` token replaced by the card's real base
+/// — the one value that cannot be relabelled. `H` is dropped when the card
+/// has no 16-bit channel to remap onto.
+fn rewrite_blaster_base(v: &[u8], base: u16, keep_h: bool) -> alloc::vec::Vec<u8> {
     use core::fmt::Write;
+    let mut out = alloc::vec::Vec::new();
     struct W<'a>(&'a mut alloc::vec::Vec<u8>);
     impl core::fmt::Write for W<'_> {
         fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -344,11 +371,18 @@ fn fmt_blaster(out: &mut alloc::vec::Vec<u8>, base: u16, irq: u8, dma8: u8, dma1
             Ok(())
         }
     }
-    let mut w = W(out);
-    let _ = write!(w, "A{:03X} I{} D{}", base, irq, dma8);
-    if let Some(h) = dma16 {
-        let _ = write!(w, " H{}", h);
+    let _ = write!(W(&mut out), "A{:03X}", base);
+    for tok in v.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        match tok[0].to_ascii_uppercase() {
+            b'A' => {}
+            b'H' if !keep_h => {}
+            _ => {
+                out.push(b' ');
+                out.extend_from_slice(tok);
+            }
+        }
     }
+    out
 }
 
 /// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel

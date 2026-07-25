@@ -629,13 +629,14 @@ impl SoundBlaster {
         // Host side: what the physical card reported (SB16 mixer) or the
         // owner declared. Only meaningful when a real card is there; the
         // emulated-only machine leaves these unknown and never remaps.
-        if let Some(card) = crate::kernel::platform::get().sb_card {
+        let plat = crate::kernel::platform::get();
+        if let Some(card) = plat.sb_card {
             self.io_base_host = card.base;
-            if let Some(w) = card.wiring {
-                self.host_irq = w.irq;
-                self.host_dma8 = w.dma8;
-                self.host_dma16 = w.dma16.unwrap_or(0xFF);
-            }
+        }
+        if let Some(w) = plat.sb_wiring {
+            self.host_irq = w.irq;
+            self.host_dma8 = w.dma8;
+            self.host_dma16 = w.dma16.unwrap_or(0xFF);
         }
         let Some(val) = env_var(env, b"BLASTER") else { return };
         for tok in val.split(|&b| b == b' ').filter(|t| !t.is_empty()) {

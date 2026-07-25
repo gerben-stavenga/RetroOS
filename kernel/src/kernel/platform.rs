@@ -19,6 +19,12 @@ pub struct Platform {
     /// The real Sound Blaster's own report, when one answered: base,
     /// generation, and (SB16 only) its strapped IRQ/DMA.
     pub sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+    /// The physical card's wiring: read from an SB16's mixer, or declared
+    /// for an early card (`SB_AUDIO=native <irq> <dma>`). This is the HOST
+    /// side — which line the PIC delivers and which 8237 channels we
+    /// reprogram. The guest's own IRQ/DMA are labels it picks in BLASTER;
+    /// the relay and the DMA remap translate between them.
+    pub sb_wiring: Option<crate::kernel::drivers::sb16::SbWiring>,
     pub firmware: Firmware,
     pub audio: Audio,
     /// A host filesystem transport answered — the native backend punch-through
@@ -278,6 +284,9 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             firmware,
             audio_hw,
             sb_card,
+            // Filled by `apply_audio_mode`, which also sees the owner's
+            // declaration for cards that cannot report their straps.
+            sb_wiring: sb_card.and_then(|c| c.wiring),
             // Policy comes later, when CONFIG.SYS is readable
             // (`apply_audio_mode`); until then, the hardware's default.
             audio: audio_hw.default_verdict(),
@@ -311,13 +320,18 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
 /// bank, and buys GUS/GM wavetable music on an SB-only machine; `native`
 /// hands the card over and costs the kernel nothing, which is what a 386/486
 /// (and the 86Box/Bochs emulations of one) can afford.
-pub fn apply_audio_mode(mixed: bool) {
+pub fn apply_audio_mode(
+    mixed: bool,
+    declared: Option<crate::kernel::drivers::sb16::SbWiring>,
+) {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::apply_audio_mode before probe");
     p.audio = match (p.audio_hw, mixed) {
         (AudioHw::Sb, true) => Audio::SbSink,
         (hw, _) => hw.default_verdict(),
     };
+    // An SB16 reports its own straps; anything older needs the owner's.
+    p.sb_wiring = p.sb_card.and_then(|c| c.wiring).or(declared);
     crate::println!("Audio: {:?} ({})", p.audio,
         if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
 }
