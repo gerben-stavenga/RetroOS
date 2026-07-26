@@ -140,6 +140,9 @@ pub struct SoundBlaster {
     /// this is the sink's target.
     pub io_base_host: u16,
     dsp_test_reg: u8,
+    /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
+    /// can answer the wiring registers from the guest's own numbers.
+    mixer_idx: u8,
     dsp_read_data: Option<u8>,
     dsp_expect_test_write: bool,
     /// Parameter bytes still expected for the in-progress passthrough DSP
@@ -191,7 +194,7 @@ impl SoundBlaster {
             // remaps (and says so) rather than driving someone else's
             // channels.
             host_dma8: 0xFF, host_dma16: 0xFF, host_irq: 0xFF, io_base_host: 0,
-            dsp_test_reg: 0, dsp_read_data: None, dsp_expect_test_write: false,
+            dsp_test_reg: 0, mixer_idx: 0, dsp_read_data: None, dsp_expect_test_write: false,
             dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
@@ -256,6 +259,30 @@ impl SoundBlaster {
     /// 0x388-0x38B. In passthrough these go straight to the real card (QEMU
     /// `sb16`/`adlib`); emulated, to the library card. Only the 8237 is
     /// virtual in passthrough.
+    /// Ports inside the DSP window that MUST trap, as a mask of offsets
+    /// from `io_base`. Everything else can be granted to the guest outright
+    /// (the IOPB is per-port), so DSP traffic on a correctly-declared card
+    /// costs no exits at all.
+    ///
+    ///  * mixer index+data (0x04/0x05) — the wiring registers are
+    ///    virtualized (see `sb_read`), always.
+    ///  * the whole window when the card is strapped somewhere other than
+    ///    BLASTER's base: every access needs `host_port` translation.
+    ///  * DSP data/status (0x0A/0x0C/0x0E) under QEMU only, where the
+    ///    E4h/E8h test register and the write-status busy flicker must be
+    ///    synthesized because QEMU's sb16 lacks them. Real silicon has
+    ///    both, so metal grants them.
+    pub fn trap_mask(&self) -> u16 {
+        if self.io_base_host != 0 && self.io_base_host != self.io_base {
+            return 0xFFFF;
+        }
+        let mut m = (1u16 << 0x04) | (1u16 << 0x05);
+        if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
+            m |= (1 << 0x0A) | (1 << 0x0C) | (1 << 0x0E);
+        }
+        m
+    }
+
     pub fn is_passthrough(&self, p: u16) -> bool {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388..=0x38B)
     }
@@ -283,6 +310,26 @@ impl SoundBlaster {
     pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
         if self.emulated() {
             return self.core.port_read(p);
+        }
+        if p == self.io_base + 0x05 {
+            // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the
+            // card is strapped to — physical facts the guest must NOT see
+            // in passthrough: it was told its own numbers by BLASTER, and
+            // the machine translates (the vPIC relays the card's line onto
+            // the guest's, the virtual 8237 remaps its channels). A guest
+            // believing the straps would hook a line we never raise. Every
+            // other mixer register is real state and passes through.
+            match self.mixer_idx {
+                0x80 => return match self.irq {
+                    2 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x02,
+                },
+                0x81 => {
+                    let lo = match self.dma8 { 0 => 0x01, 1 => 0x02, 3 => 0x08, _ => 0x02 };
+                    let hi = match self.dma16 { 5 => 0x20, 6 => 0x40, 7 => 0x80, _ => 0 };
+                    return lo | hi;
+                }
+                _ => {}
+            }
         }
         if p == self.io_base + 0x0A {
             if let Some(v) = self.dsp_read_data.take() {
@@ -392,6 +439,14 @@ impl SoundBlaster {
                     _ => {}
                 }
             }
+        }
+        if p == self.io_base + 0x04 {
+            self.mixer_idx = val;
+        } else if p == self.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {
+            // The guest may move ITS view of the wiring — the relay and the
+            // remap follow BLASTER — but the physical straps stay where the
+            // kernel found them; nothing else on the machine knows they moved.
+            return;
         }
         machine.outb(self.host_port(p), val);
     }

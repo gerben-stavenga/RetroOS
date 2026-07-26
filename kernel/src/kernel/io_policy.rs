@@ -39,6 +39,17 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
             // answers FM detection.
             if platform::get().audio.sb_passthrough() {
                 machine.allow_io_ports(0x388, 2);
+                // The DSP window, port by port: the IOPB is a bitmap, so
+                // only what genuinely needs interception traps (see
+                // `trap_mask`) and the rest reaches the card directly.
+                if let Personality::Dos(dos) = personality {
+                    let mask = dos.pc.sb.trap_mask();
+                    for off in 0..16u16 {
+                        if mask & (1 << off) == 0 {
+                            machine.allow_io_ports(dos.pc.sb.io_base + off, 1);
+                        }
+                    }
+                }
                 // The MPU-401 window the guest declared (BLASTER `P`). In
                 // native mode the emulated MPU stands down, so these reach
                 // whatever the owner actually has there — a real MPU, a
