@@ -15,7 +15,11 @@ pub use crate::kernel::linux::LinuxState;
 pub const MAX_THREADS: usize = 1024;
 
 /// Maximum file descriptors per thread
-pub const MAX_FDS: usize = 32;
+// 64: BC's project linker holds every .OBJ of the project open at once
+// (wolfsrc = 31 objs + libs + exe + map on top of the std handles); real DOS
+// lets a program raise its JFT to 255 via AH=67h. Keep below the DOS device
+// sentinels at 98/99 (EMS_DEVICE_HANDLE / NULL_FILE_HANDLE).
+pub const MAX_FDS: usize = 64;
 
 /// What a file descriptor refers to
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -23,14 +23,12 @@
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use spin::Mutex;
-use crate::kernel::thread::FdKind;
+use crate::kernel::thread::{FdKind, MAX_FDS};
 use crate::kernel::fs::grant::WriteAccess;
 
-/// Maximum simultaneous open files system-wide
-const MAX_OPEN_FILES: usize = 64;
-
-/// Maximum file descriptors per thread (must match thread::MAX_FDS)
-const MAX_FDS: usize = 32;
+/// Maximum simultaneous open files system-wide. Sized so one thread's full
+/// fd table (MAX_FDS) plus its parents' open files fit without contention.
+const MAX_OPEN_FILES: usize = 128;
 
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
@@ -748,7 +746,7 @@ impl Vfs {
         // a missing feature. Report it (EACCES) — never paper over it with a RAM
         // file, which would tell the guest its write succeeded.
         if fs.supports_create() {
-            return -5;
+            return -13; // EACCES
         }
 
         let key_len = path.len().min(PATH_KEY_MAX) as u8;
@@ -897,6 +895,14 @@ impl Vfs {
             return self.ram_files.get(key).map(|d| d.len() as u32).unwrap_or(0);
         }
         e.vnode.size
+    }
+
+    fn handle_writable(&self, handle: i32) -> bool {
+        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return false; }
+        let e = &self.file_table[handle as usize];
+        if e.refcount == 0 { return false; }
+        // RAM-overlay files are always ours (see `write_by_handle`).
+        e.vnode.handle == RAM_SENTINEL || e.writable
     }
 
     fn file_ino_by_handle(&self, handle: i32) -> u64 {
@@ -1129,6 +1135,18 @@ pub fn file_size(fd: i32, fds: &[FdKind; MAX_FDS]) -> u32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => file_size_by_handle(handle),
         Err(_) => 0,
+    }
+}
+
+/// May this open fd be written? (The verdict was decided at open/create time
+/// while the path was in hand — see `FileEntry::writable`.) Lets DOS open
+/// honor the requested access mode: a write-mode open of something not ours
+/// must fail up front with "access denied", where programs actually check,
+/// instead of surfacing per-write errors most of them ignore.
+pub fn fd_writable(fd: i32, fds: &[FdKind; MAX_FDS]) -> bool {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => VFS.lock().handle_writable(handle),
+        Err(_) => false,
     }
 }
 
