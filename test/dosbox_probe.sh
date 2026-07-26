@@ -20,8 +20,14 @@ cd "$(dirname "$0")/.."
 PROBE="${1:-SBDISC}"
 D="${DOSBOX_PROBE_DIR:-$HOME/dosbox-probe}"
 mkdir -p "$D"
-cp "bazel-out/k8-opt/bin/test/dos/sbproto/$PROBE.COM" "$D/" || {
-    echo "build it first: bazelisk build //test/dos/sbproto:all" >&2; exit 1; }
+SRC="bazel-out/k8-opt/bin/test/dos/sbproto/$PROBE.COM"
+if [ ! -f "$SRC" ]; then
+    echo "no $SRC — build it: bazelisk build //test/dos/sbproto:all" >&2
+    exit 1
+fi
+# Bazel outputs are read-only, so a plain cp onto a previous copy fails with
+# EACCES; install writes a fresh writable file.
+install -m 0644 "$SRC" "$D/$PROBE.COM" || exit 1
 rm -f "$D/$PROBE.LOG"
 
 flatpak run --filesystem=home com.dosbox_x.DOSBox-X \
