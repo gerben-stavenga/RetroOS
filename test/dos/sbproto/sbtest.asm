@@ -15,10 +15,25 @@
 ;   3. The channel current-count reads 0xFFFF (post-TC underflow) after a
 ;      completed single-cycle transfer, until the channel is restarted.
 ;
-; Prints BUSY-OK, EDGE-OK, TC-OK (all three = pass) or a FAIL-* line.
+; Prints BUSY-OK, EDGE-OK, TC-OK (all three = pass) or a FAIL-* line, AND
+; appends every line to C:\SBTEST.LOG. The file is what makes this probe
+; usable on a backend with no log to grep: 86Box is a GUI application whose
+; SB16 model is the faithful one, so the physical-configuration sweep runs
+; there and the harness reads the verdict out of the disk image afterwards
+; instead of scraping a screen.
 ; CI: test/hosted_games.sh runs this on the emulated card and asserts TC-OK.
         org 0x100
 start:
+        ; C:\SBTEST.LOG — the verdict a backend without a debug log can be
+        ; asked for after the fact. A failure to create it is not fatal:
+        ; the screen/log path still works (handle stays 0xFFFF).
+        mov ah, 0x3C
+        xor cx, cx
+        mov dx, fname
+        int 0x21
+        jc  .nolog
+        mov [fhandle], ax
+.nolog:
         ; DSP reset: base 0x220
         mov dx, 0x226
         mov al, 1
@@ -58,9 +73,8 @@ start:
         loop .busywait
         jmp fail_busy
 busy_seen:
-        mov ah, 9
         mov dx, msg_busy
-        int 0x21
+        call emit
         mov dx, 0x22C
         mov cx, 0xFFFF
 .idlewait:
@@ -70,9 +84,8 @@ busy_seen:
         loop .idlewait
         jmp fail_edge
 edge_seen:
-        mov ah, 9
         mov dx, msg_edge
-        int 0x21
+        call emit
         mov dx, 0x22C          ; stop the phase-1 transfer
         mov al, 0xD0
         out dx, al
@@ -99,32 +112,65 @@ tc_seen:
         in  al, 0x03           ; count hi
         cmp ax, 0xFFFF
         jne fail_tc
-        mov ah, 9
         mov dx, msg_tc
-        int 0x21
+        call emit
         jmp exit
 
 fail_busy:
-        mov ah, 9
         mov dx, msg_fb
-        int 0x21
+        call emit
         jmp exit
 fail_edge:
-        mov ah, 9
         mov dx, msg_fe
-        int 0x21
+        call emit
         jmp exit
 fail_tc:
-        mov ah, 9
         mov dx, msg_ft
-        int 0x21
+        call emit
 exit:
+        mov bx, [fhandle]
+        cmp bx, 0xFFFF
+        je  .noclose
+        mov ah, 0x3E
+        int 0x21
+.noclose:
         ; Park on a keypress so the harness's 1 Hz screen snapshot can catch
         ; the verdict (it treats an early guest exit as a failure).
         mov ah, 0
         int 0x16
         mov ax, 0x4C00
         int 0x21
+
+; Print DS:DX ('$'-terminated) and append the same bytes to the log file.
+emit:
+        push ax
+        push bx
+        push cx
+        push dx
+        push si
+        mov ah, 9
+        int 0x21               ; screen
+        mov bx, [fhandle]
+        cmp bx, 0xFFFF
+        je  .done
+        mov si, dx             ; measure up to the '$'
+        xor cx, cx
+.len:
+        lodsb
+        cmp al, '$'
+        je  .write
+        inc cx
+        jmp .len
+.write:
+        mov ah, 0x40           ; write CX bytes at DS:DX to BX
+        int 0x21
+.done:
+        pop si
+        pop dx
+        pop cx
+        pop bx
+        pop ax
+        ret
 
 ; start a single-cycle 8-bit transfer of AX+1 bytes at buf on 8237 ch1 + DSP
 startblk:
@@ -166,6 +212,8 @@ startblk:
         out dx, al             ; len hi
         ret
 
+fname:    db 'C:\SBTEST.LOG', 0
+fhandle:  dw 0xFFFF
 msg_busy: db 'BUSY-OK', 13, 10, '$'
 msg_edge: db 'EDGE-OK', 13, 10, '$'
 msg_tc:   db 'TC-OK', 13, 10, '$'
