@@ -10,8 +10,13 @@
 ;
 ;   RST-OK       DSP reset handshake returns 0xAA
 ;   VER-x.y      DSP version query (0xE1) — how a game picks SB / SBPro / SB16
-;   MIXRST-OK    mixer reset (index 0x00) followed by a register read-back
-;   MIXVOL-OK    a mixer volume register holds what was written to it
+;   MIXRST-OK    mixer reset (index 0x00) then a read-back of the SB16's
+;                native master volume (0x30) — not the SB Pro-era 0x22,
+;                which a real CT1745 aliases but other implementations do
+;                not (DOSBox-X returns 0xFF there)
+;   MIXVOL-OK    that register holds the 5-bit level written to it
+;   MIXALIAS-*   whether the legacy 0x22 alias exists — informational, since
+;                implementations legitimately differ
 ;   IRQSTAT-OK   mixer 0x82 reports "no interrupt pending" when idle
 ;   TRIG-OK      DSP 0xF2 raises the card's IRQ (the classic auto-detect)
 ;   ACK8-OK      reading base+0x0E acknowledges and clears that interrupt
@@ -72,10 +77,14 @@ start:
         mov dx, 0x225
         mov al, 0x00
         out dx, al
-        ; master volume (0x22) after reset must read as SOMETHING (not the
-        ; open-bus 0xFF a missing mixer gives).
+        ; Master volume after reset must read as SOMETHING (not the open-bus
+        ; 0xFF a missing mixer gives). Use the SB16's NATIVE register 0x30,
+        ; not the SB Pro-era 0x22: a real CT1745 keeps the old registers as
+        ; aliases, but implementations differ (DOSBox-X returns 0xFF for
+        ; 0x22 while answering 0x30 fine), and a conformance probe must test
+        ; the thing every SB16 has. The alias is checked separately below.
         mov dx, 0x224
-        mov al, 0x22
+        mov al, 0x30
         out dx, al
         mov dx, 0x225
         in  al, dx
@@ -86,21 +95,39 @@ start:
 
 ; ── mixer: a volume register holds what it was given ─────────────────────
         mov dx, 0x224
-        mov al, 0x22
+        mov al, 0x30
         out dx, al
         mov dx, 0x225
-        mov al, 0xCC
+        mov al, 0xC0
         out dx, al
+        mov dx, 0x224
+        mov al, 0x30
+        out dx, al
+        mov dx, 0x225
+        in  al, dx
+        and al, 0xF8           ; 0x30 is a 5-bit level in bits 7:3
+        cmp al, 0xC0
+        jne fail_mixvol
+        mov dx, m_mixvol
+        call emit
+
+        ; Legacy alias: a real CT1745 answers the SB Pro register 0x22 with
+        ; the same level 0x30 holds. INFORMATIONAL — implementations differ,
+        ; so a missing alias reports itself and does not fail the run.
         mov dx, 0x224
         mov al, 0x22
         out dx, al
         mov dx, 0x225
         in  al, dx
-        and al, 0xF0           ; low nibble is not always writable
-        cmp al, 0xC0
-        jne fail_mixvol
-        mov dx, m_mixvol
+        cmp al, 0xFF
+        je  .noalias
+        mov dx, m_mixalias
         call emit
+        jmp .aliasdone
+.noalias:
+        mov dx, m_noalias
+        call emit
+.aliasdone:
 
 ; ── mixer 0x82: no interrupt pending while idle ──────────────────────────
         mov dx, 0x224
@@ -440,6 +467,8 @@ m_ver_maj:  db '00', '.'
 m_ver_min:  db '00', 13, 10, '$'
 m_mixrst:   db 'MIXRST-OK', 13, 10, '$'
 m_mixvol:   db 'MIXVOL-OK', 13, 10, '$'
+m_mixalias: db 'MIXALIAS-OK (legacy 0x22 aliased)', 13, 10, '$'
+m_noalias:  db 'MIXALIAS-NONE (no legacy 0x22 alias)', 13, 10, '$'
 m_irqstat:  db 'IRQSTAT-OK', 13, 10, '$'
 m_spkr:     db 'SPKR-OK', 13, 10, '$'
 m_e4e8:     db 'E4E8-OK', 13, 10, '$'
