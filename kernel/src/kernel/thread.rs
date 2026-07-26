@@ -340,7 +340,9 @@ pub struct KernelThread<A: crate::Arch> {
     pub cpu_hash: u64,
     pub symbols: Option<SymbolData>,
     pub fds: [FdKind; MAX_FDS],
-    pub cloexec: u16,
+    // u64: one bit per fd slot, so it must cover MAX_FDS (was u16 — fds >= 16
+    // silently wrapped the shift in release builds).
+    pub cloexec: u64,
     /// Short program name for the F12 switch picker (DOS has no stored image
     /// path the way Linux's `exec_path` does). Set from the launch path's
     /// basename at fork-exec; empty until then. NUL-padded.
