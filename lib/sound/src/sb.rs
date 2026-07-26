@@ -654,13 +654,23 @@ impl Sb {
         raise
     }
 
-    /// A block boundary passed: advance the cursor over it and latch the
-    /// width-tagged mixer IRQ status. Putting the *line* up is the host's.
+    /// A block boundary passed: advance the cursor over it and latch what a
+    /// driver reads to identify the completion. Putting the *line* up is the
+    /// host's.
     fn block_irq(&mut self) {
         self.cursor = self.next_irq;
         self.blocks_done += 1;
         // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
         self.irq_status |= if self.bits == 16 { 0x02 } else { 0x01 };
+        // ...and the 8237's terminal-count bit for the channel. A real chip
+        // asserts TC at the end of EVERY block — in auto-init the count
+        // underflows and reloads, and the status bit latches each time —
+        // which `finish_single` did but this path did not, so an auto-init
+        // driver identifying its interrupt by `in al, 0x08` was told
+        // "not mine" forever. Auto-init is the mode Quake/Dune2/ROTT play
+        // in; the identify idiom is PoP's digi.drv.
+        let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
+        self.tc_status |= 1 << (chan & 7);
     }
 
     /// Single-cycle: one pass and stop (no loop). The 8237 side hit terminal

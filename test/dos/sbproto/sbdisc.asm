@@ -18,16 +18,7 @@
 ;   SPKR-OK      speaker on/off (0xD1/0xD3) is accepted
 ;   E4E8-OK      DSP test register round-trips a byte
 ;   AUTOINIT-OK  auto-init block (0x48 size + 0x1C) reaches terminal count
-;
-; KNOWN GAP: AUTOINIT currently FAILS on the emulated card. The virtual
-; 8237's status register is hardcoded (`vdma.rs`: `0x08 => 0x00, // status:
-; no TC, no requests pending in our model`), so the per-channel terminal-count
-; bit a real 8237 latches — and clears on read — never appears. SBTEST's
-; "TC-OK" checks the count's underflow to 0xFFFF, not this register, which is
-; why the gap survived: the behaviour was claimed in a comment and never
-; asserted. It is live surface — PoP 1.4's digi.drv ISR reads port 0x08 to
-; decide a completion IRQ is its own and chains it away otherwise, and
-; auto-init is the mode Quake/Dune2/ROTT play in.
+
 ;
 ; The same binary runs on 86Box against its faithful SB16 model, so the
 ; expected answers are validated against a reference rather than against our

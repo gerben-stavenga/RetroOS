@@ -177,7 +177,10 @@ impl Dma8237 {
                 *ff = !*ff;
                 byte
             }
-            0x08 => 0x00, // status: no TC, no requests pending in our model
+            // Status. The EMULATED card answers this itself (its own TC
+            // latch, see `Sb::take_tc_status`) and never reaches here;
+            // passthrough leaves it to the real chip's shadow.
+            0x08 => 0x00,
             _ => 0xFF,
         }
     }

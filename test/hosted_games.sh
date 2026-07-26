@@ -56,6 +56,18 @@ run "SB DSP completion protocol" \
     --cmd "TESTS/SBTEST.COM" --settle 3 --timeout 30 \
     --expect-log "BUSY-OK" --expect-log "EDGE-OK" --expect-log "TC-OK"
 
+# SB discovery/init conformance (test/dos/sbproto/sbdisc.asm): everything a
+# game does BEFORE it plays a sample — version query, mixer, IRQ status and
+# acknowledge, the 0xF2 trigger IRQ, the test register, and an auto-init
+# block reaching terminal count. The last one caught a real gap: only the
+# single-cycle path latched the 8237 TC bit, so an auto-init driver
+# identifying its own interrupt by `in al, 0x08` was told "not mine".
+run "SB discovery/init conformance" \
+    --cmd "TESTS/SBDISC.COM" --settle 3 --timeout 40 \
+    --expect-log "RST-OK" --expect-log "MIXRST-OK" --expect-log "MIXVOL-OK" \
+    --expect-log "IRQSTAT-OK" --expect-log "E4E8-OK" --expect-log "TRIG-OK" \
+    --expect-log "ACK8-OK" --expect-log "AUTOINIT-OK"
+
 # Emulated-GUS (GF1) probe (test/dos/gusproto): DRAM poke/peek detection
 # and register-file readback through the voice/register-select scheme.
 # Markers accrete as GF1 phases land (timers, DMA upload, audible voice).
