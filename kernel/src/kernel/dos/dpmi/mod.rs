@@ -190,6 +190,17 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
 /// set limit), so unconditionally tell the backend to re-materialize its
 /// descriptor tables after dispatch — cheap (INT 31h is rare vs guest
 /// instructions) and catches every early-return path in the inner dispatch.
+/// Null out any segment register still holding a just-freed selector,
+/// otherwise the IRET back to user mode reloads it and GP-faults in the
+/// exit stub. Every path that frees an LDT descriptor (0001h, 0101h) must
+/// pass through here.
+fn scrub_freed_selector(regs: &mut Regs, sel: u16) {
+    if regs.ds as u16 == sel { regs.ds = 0; }
+    if regs.es as u16 == sel { regs.es = 0; }
+    if regs.fs as u16 == sel { regs.fs = 0; }
+    if regs.gs as u16 == sel { regs.gs = 0; }
+}
+
 pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let action = dpmi_api_inner(machine, dos, regs);
     machine.on_ldt_changed();
@@ -255,12 +266,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 return thread::KernelAction::Done;
             }
             free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
-            // Null out any segment register still holding the freed selector,
-            // otherwise IRET back to user mode will GP fault.
-            if regs.ds as u16 == sel { regs.ds = 0; }
-            if regs.es as u16 == sel { regs.es = 0; }
-            if regs.fs as u16 == sel { regs.fs = 0; }
-            if regs.gs as u16 == sel { regs.gs = 0; }
+            scrub_freed_selector(regs, sel);
             clear_carry(regs);
         }
         // AX=0002h — Segment to Descriptor
@@ -472,6 +478,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 match dos::dos_free_block(machine, dos, regs, seg) {
                     Ok(()) => {
                         free_ldt(&mut dos.ldt[..], &mut dos.ldt_alloc, idx);
+                        scrub_freed_selector(regs, sel);
                         clear_carry(regs);
                     }
                     Err(err) => {
