@@ -291,8 +291,30 @@ impl VgaState {
         if self.planes.is_empty() {
             self.planes = alloc::vec![0u8; 4 * 65536];
         }
-        // Capture tracked AC state, then reset flipflop to known index state.
-        self.ac_state = unsafe { VGA_AC_STATE };
+        // Capture the AC sequencing state, then reset the flipflop to a
+        // known index state. With 0x3C0/0x3DA granted to the guest
+        // (io_policy `vga_ports_direct`), the VGA_AC_STATE tracker never saw
+        // its writes — the card is the only source of truth, and it must be
+        // read BEFORE the 0x3DA reset below destroys the phase.
+        let plat = crate::kernel::platform::get();
+        if plat.vga_ports_direct() {
+            let index = inb(0x3C0); // address-register readback (incl. PAS)
+            let pending_data = if plat.vga_readback {
+                let crtc_index = inb(0x3D4);
+                outb(0x3D4, 0x24); // Cirrus CR24: bit 7 = flip-flop phase
+                let phase = inb(0x3D5) & 0x80 != 0;
+                outb(0x3D4, crtc_index);
+                phase
+            } else {
+                // Phase not readable on this card — assume index state (the
+                // boot warning declared full restore unsupported here).
+                false
+            };
+            self.ac_state = AcState { index, pending_data };
+        } else {
+            // Trapped AC ports (QEMU): the tracker observed every access.
+            self.ac_state = unsafe { VGA_AC_STATE };
+        }
         let _ = inb(0x3DA);
 
         // Capture index registers BEFORE the save loops overwrite them.
@@ -306,6 +328,19 @@ impl VgaState {
         for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
         for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
         for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
+
+        // Data latches, via Cirrus CR22 (latch selected by GC4 read-map).
+        // Must happen before the plane copy below — every VRAM read reloads
+        // them. Without the readback the latches stay unrecoverable (see the
+        // gap comment further down).
+        if plat.vga_ports_direct() && plat.vga_readback {
+            for plane in 0..4u8 {
+                outb(0x3CE, 4); outb(0x3CF, plane);
+                outb(0x3D4, 0x22);
+                self.latches[plane as usize] = inb(0x3D5);
+            }
+            outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
+        }
         self.dac_mask = inb(0x3C6);
         // Capture program-tracked DAC index latch + read/write mode before
         // stomping it with our bulk read.
@@ -353,16 +388,16 @@ impl VgaState {
         outb(0x3CE, 5); outb(0x3CF, 0x00);
         outb(0x3CE, 6); outb(0x3CF, 0x05);
 
-        // KNOWN GAP: GC read latches (4 bytes loaded by the most recent VGA
-        // memory read) are not preserved across save/restore. The bulk reads
-        // below clobber them, and the VGA exposes no port to read latches
-        // directly — the only way to extract them is to dump them to memory
-        // via write mode 1 and read them back, which would require sacrificing
-        // 4 bytes of plane RAM at a fixed scratch offset (any prior read to
-        // capture that user data would itself destroy the latches we want).
+        // GAP (plain VGA only): GC read latches (4 bytes loaded by the most
+        // recent VGA memory read) are not preserved across save/restore —
+        // the bulk reads below clobber them, and stock VGA exposes no port
+        // to read them without a destructive VRAM access. With Cirrus
+        // readbacks (`platform::vga_readback`) they were already captured
+        // via CR22 above and are reloaded by `restore_to_hardware`.
         //
-        // Symptom: a mode-X latch blit preempted between its source read and
-        // destination write produces 4 wrong bytes when the program resumes:
+        // Symptom without readbacks: a mode-X latch blit preempted between
+        // its source read and destination write produces 4 wrong bytes when
+        // the program resumes:
         //     mov al, [esi]   ; loads latches with src plane bytes
         //     <-- preempt here -->
         //     mov [edi], al   ; write mode 1: writes (wrong) latches to dst
@@ -437,6 +472,28 @@ impl VgaState {
                     vga_window,
                     65536,
                 );
+            }
+        }
+
+        // Reload the guest's data latches (captured via Cirrus CR22 in
+        // save_from_hardware): stage the four bytes at offset 0, one read
+        // pulls all four into the latches, then put the real content back.
+        // Writes never load latches and everything below Step 2 is port
+        // I/O only, so the guest resumes with its blit state intact. Still
+        // in forced flat-planar write mode 0 here, so the staging writes
+        // land verbatim.
+        {
+            let plat = crate::kernel::platform::get();
+            if plat.vga_ports_direct() && plat.vga_readback {
+                for plane in 0..4u8 {
+                    outb(0x3C4, 2); outb(0x3C5, 1 << plane);
+                    unsafe { core::ptr::write_volatile(vga_window, self.latches[plane as usize]); }
+                }
+                unsafe { let _ = core::ptr::read_volatile(vga_window as *const u8); }
+                for plane in 0..4u8 {
+                    outb(0x3C4, 2); outb(0x3C5, 1 << plane);
+                    unsafe { core::ptr::write_volatile(vga_window, self.planes[plane as usize * 65536]); }
+                }
             }
         }
 

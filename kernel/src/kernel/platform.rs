@@ -27,6 +27,11 @@ pub struct Platform {
     pub sb_wiring: Option<crate::kernel::drivers::sb16::SbWiring>,
     pub firmware: Firmware,
     pub audio: Audio,
+    /// The real card exposes Cirrus-style save/restore readbacks (CR22
+    /// latches, CR24 AC flip-flop, CR26 AC index). With them, task
+    /// save/restore is exact without trapping 0x3C0/0x3DA; without them the
+    /// snapshot is best-effort (warned at boot). Always false off VgaCard.
+    pub vga_readback: bool,
     /// A host filesystem transport answered — the native backend punch-through
     /// (hosted) or the COM1 client (metal / the Python bridge). Whether it ends
     /// up as `/host`, as the root, or unused is `startup`'s mount policy.
@@ -180,6 +185,17 @@ impl Display {
 
 }
 
+impl Platform {
+    /// The focused DOS thread owns 0x3C0/0x3DA directly — no AC-tracking
+    /// traps. True on a real card everywhere except QEMU, whose 0x3DA
+    /// retrace is fabricated (the trap is load-bearing there). Save/restore
+    /// then recovers AC sequencing state from the card: exactly via the
+    /// Cirrus readbacks when `vga_readback`, best-effort otherwise.
+    pub fn vga_ports_direct(&self) -> bool {
+        self.display.vga_passthrough() && self.host != Host::Qemu
+    }
+}
+
 /// Environment facts only the ENTRY crate knows — injected before `probe`
 /// instead of selected by `cfg`. Metal installs `{ metal, Debugcon,
 /// fbcon::active }`; the hosted entry installs `{ interp, HostStdout,
@@ -278,10 +294,13 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
         };
 
 
+        let vga_readback = matches!(display, Display::VgaCard) && vga_readback_answers();
+
         Platform {
             host: env.host(boot.is_qemu),
             display,
             firmware,
+            vga_readback,
             audio_hw,
             sb_card,
             // Filled by `apply_audio_mode`, which also sees the owner's
@@ -303,6 +322,13 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
         "Platform: host={:?} display={:?} firmware={:?} audio={:?} hostfs={} debug={:?}",
         p.host, p.display, p.firmware, p.audio, p.hostfs, p.debug
     );
+    if p.vga_ports_direct() {
+        if p.vga_readback {
+            println!("VGA: Cirrus readbacks (CR22/24/26) — AC ports direct, exact save/restore");
+        } else {
+            println!("VGA: WARNING no readback extensions — AC ports direct, full process VGA restore NOT supported (flip-flop/latches unrecoverable)");
+        }
+    }
     p
 }
 
@@ -404,4 +430,26 @@ fn vga_card_answers() -> bool {
         outb(0x3C4, saved);
     }
     present
+}
+
+/// Cirrus-style save/restore readbacks: CR22 (data latches), CR24 (AC
+/// flip-flop), CR26 (AC index). Probed FUNCTIONALLY — toggle the AC
+/// flip-flop and watch CR24 bit 7 follow — because the capability, not a
+/// vendor ID, is what save/restore consumes. Runs at boot while the kernel
+/// owns the card, and leaves the AC in a defined state (index phase,
+/// address register restored).
+fn vga_readback_answers() -> bool {
+    use crate::kernel::portio::{inb, outb};
+    let crtc_index = inb(0x3D4);
+    let _ = inb(0x3DA); // flip-flop → index phase
+    outb(0x3D4, 0x24);
+    let at_index = inb(0x3D5) & 0x80;
+    let ac_addr = inb(0x3C0); // address register readback (incl. PAS)
+    outb(0x3C0, ac_addr); // re-latch it: flip-flop → data phase
+    let at_data = inb(0x3D5) & 0x80;
+    let _ = inb(0x3DA); // back to index phase
+    outb(0x3C0, ac_addr); // leave the index latched...
+    let _ = inb(0x3DA); // ...and the flip-flop at index phase
+    outb(0x3D4, crtc_index);
+    at_index == 0 && at_data != 0
 }

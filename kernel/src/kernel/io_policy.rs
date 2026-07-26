@@ -33,6 +33,16 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
             if focused && platform::get().display.vga_passthrough() {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
+                // 0x3C0/0x3DA go direct too when save/restore can recover
+                // the AC sequencing state from the card instead of a trap
+                // tracker (see `vga::save_from_hardware`). Trapping these
+                // costs the guest a VM86 round-trip per retrace poll — a
+                // palette fade is thousands of 0x3DA reads per frame. QEMU
+                // keeps them trapped: its 0x3DA retrace is fabricated.
+                if platform::get().vga_ports_direct() {
+                    machine.allow_io_ports(0x3C0, 1);
+                    machine.allow_io_ports(0x3DA, 1);
+                }
             }
             // A real SB implies a real OPL: FM music writes (frequent) go
             // straight to the card; emulated stays trapped so `emu_*`
