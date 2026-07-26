@@ -336,6 +336,15 @@ pub fn apply_audio_mode(
         if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
 }
 
+/// Update the acting SB wiring after a restrap (startup's native-mode
+/// BLASTER reconciliation). `sb_card` keeps the probe-time snapshot — this
+/// is the wiring the relay/remap act on.
+pub fn set_sb_wiring(w: crate::kernel::drivers::sb16::SbWiring) {
+    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
+        .expect("platform::set_sb_wiring before probe");
+    p.sb_wiring = Some(w);
+}
+
 pub fn get() -> &'static Platform {
     unsafe {
         (&raw const PLATFORM)

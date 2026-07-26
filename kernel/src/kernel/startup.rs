@@ -136,7 +136,40 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
                 card.dsp_major
             );
         }
-        if card.wiring.and_then(|w| w.dma16).is_none()
+        // An SB16's IRQ/DMA are soft-straps (mixer 0x80/0x81) — and NOT just
+        // routing labels: the 0x81 high bits ENABLE the 16-bit DMA channel.
+        // Bochs's SB16 powers up without one ("DMA 1/0"), so a guest's
+        // 16-bit auto-init never moves and its position poll spins for the
+        // whole intro (Pinball Fantasies). Strap the card to BLASTER; the
+        // relay/remap then act on what the card really accepted (readback).
+        // NOT on QEMU: its sb16 is launched deliberately misaligned (run.sh
+        // irq=5) as permanent relay/remap coverage, and its mixer accepts
+        // the strap write without rerouting the actual line. The guest can
+        // never undo this: the mixer pair always traps (vsb::trap_mask).
+        if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu
+            && let (Some(strapped), Some(want)) = (card.wiring, blaster_wiring(&blaster))
+            && strapped != want
+        {
+            let got = crate::kernel::drivers::sb16::strap_wiring(machine, card.base, want);
+            crate::kernel::platform::set_sb_wiring(got);
+            let h = |d: Option<u8>| d.map(|v| alloc::format!(" HDMA{}", v)).unwrap_or_default();
+            if got == want {
+                crate::println!(
+                    "Audio: SB16 restrapped to BLASTER (IRQ{} DMA{}{})",
+                    got.irq, got.dma8, h(got.dma16)
+                );
+            } else {
+                crate::println!(
+                    "Audio: SB16 kept IRQ{} DMA{}{} (strap write refused) — relaying to \
+                     BLASTER's IRQ{} DMA{}",
+                    got.irq, got.dma8, h(got.dma16), want.irq, want.dma8
+                );
+            }
+        }
+        // Judge the H-declaration against the acting straps, not the
+        // probe-time snapshot — the restrap just above may have enabled the
+        // 16-bit channel.
+        if crate::kernel::platform::get().sb_wiring.and_then(|w| w.dma16).is_none()
             && blaster.split(|&b| b == b' ').any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
         {
             crate::println!(
@@ -372,6 +405,30 @@ fn blaster_base(v: &[u8]) -> Option<u16> {
         }
     }
     None
+}
+
+/// BLASTER's I/D/H tokens as a wiring triple — what the owner wants the card
+/// strapped to. None if I or D is missing (H is optional: pre-SB16 declares).
+fn blaster_wiring(v: &[u8]) -> Option<crate::kernel::drivers::sb16::SbWiring> {
+    let mut irq = None;
+    let mut dma8 = None;
+    let mut dma16 = None;
+    for tok in v.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        let num = || -> Option<u8> {
+            let mut n: u8 = 0;
+            for &c in &tok[1..] {
+                n = n.checked_mul(10)?.checked_add((c as char).to_digit(10)? as u8)?;
+            }
+            Some(n)
+        };
+        match tok[0].to_ascii_uppercase() {
+            b'I' => irq = num(),
+            b'D' => dma8 = num(),
+            b'H' => dma16 = num(),
+            _ => {}
+        }
+    }
+    Some(crate::kernel::drivers::sb16::SbWiring { irq: irq?, dma8: dma8?, dma16 })
 }
 
 /// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel

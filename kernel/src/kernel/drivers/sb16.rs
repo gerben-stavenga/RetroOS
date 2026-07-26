@@ -186,6 +186,41 @@ fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
     SbWiring { irq, dma8, dma16 }
 }
 
+/// Strap an SB16 to the wanted IRQ/DMA via mixer 0x80/0x81 — the card's own
+/// soft-configuration (what Creative's DIAGNOSE wrote). This is NOT just
+/// relabeling: the 0x81 high bits ENABLE the card's 16-bit DMA channel, and
+/// cards default it off (Bochs powers up "DMA 1/0" — no 16-bit channel — and
+/// a guest's 16-bit auto-init then never moves, see Pinball Fantasies'
+/// count-poll stall). Returns what the card actually accepted (readback):
+/// an emulation that pins its wiring reports the old values, and the caller
+/// proceeds from truth, not intent.
+pub fn strap_wiring<A: crate::Arch>(machine: &mut A, base: u16, want: SbWiring) -> SbWiring {
+    let irq_bits: u8 = match want.irq {
+        2 => 0x01,
+        5 => 0x02,
+        7 => 0x04,
+        10 => 0x08,
+        _ => 0x02,
+    };
+    let mut dma_bits: u8 = match want.dma8 {
+        0 => 0x01,
+        1 => 0x02,
+        3 => 0x08,
+        _ => 0x02,
+    };
+    match want.dma16 {
+        Some(5) => dma_bits |= 0x20,
+        Some(6) => dma_bits |= 0x40,
+        Some(7) => dma_bits |= 0x80,
+        _ => {}
+    }
+    machine.outb(base + 0x04, 0x80);
+    machine.outb(base + 0x05, irq_bits);
+    machine.outb(base + 0x04, 0x81);
+    machine.outb(base + 0x05, dma_bits);
+    read_wiring(machine, base)
+}
+
 fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
     machine.outb(base + 0x06, 1);
     for _ in 0..1000 {

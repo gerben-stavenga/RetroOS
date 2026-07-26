@@ -59,6 +59,15 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
                 {
                     machine.allow_io_ports(dos.pc.mpu.base, 2);
                 }
+                // The 8237 windows are NEVER granted, in any configuration:
+                // vdma is not a channel relabeler but an ADDRESS translator —
+                // the guest programs DOS-physical buffer addresses while its
+                // pages are COW-relocated, so a direct write would make the
+                // card DMA the wrong memory. Strap alignment can make the
+                // channel numbers an identity; it cannot make the addresses
+                // one. (Tried 2026-07-26 for Pinball Fantasies' count-poll
+                // storm; it silenced the card. The poll cost is real but
+                // must be attacked inside the trap, not by ungating it.)
             }
         }
         // Linux: no ports. The deny-all baseline stands.
