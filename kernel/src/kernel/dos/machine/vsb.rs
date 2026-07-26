@@ -225,8 +225,9 @@ impl SoundBlaster {
         // this atomically; the hardware ~3 µs hold is irrelevant under
         // emulation. Puts the DSP back in its post-power-on state so the
         // next program's reset+probe behaves like the first one's.
-        machine.outb(self.io_base + 0x06, 1);
-        machine.outb(self.io_base + 0x06, 0);
+        let reset = self.host_port(self.io_base + 0x06);
+        machine.outb(reset, 1);
+        machine.outb(reset, 0);
         // Stop any in-flight host DMA cold; the next bind reprograms and
         // unmasks. host_dma8/host_dma16 are the SB16's 8-bit/16-bit lines.
         mask_real_8237(machine, self.host_dma8);
@@ -245,6 +246,23 @@ impl SoundBlaster {
     /// virtual in passthrough.
     pub fn is_passthrough(&self, p: u16) -> bool {
         (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388..=0x38B)
+    }
+
+    /// The physical port for a guest port in the DSP window. BLASTER is the
+    /// owner's declaration and the DSP window is trapped on every access
+    /// (we must see the command stream to remap DMA), so a card strapped
+    /// somewhere else costs nothing to support: same traps, different
+    /// addend. `io_base_host` is 0 before a card is detected, in which case
+    /// there is nothing to translate to.
+    #[inline]
+    fn host_port(&self, p: u16) -> u16 {
+        if self.io_base_host == 0 || self.io_base_host == self.io_base {
+            return p;
+        }
+        match p.checked_sub(self.io_base) {
+            Some(off) if off < 0x10 => self.io_base_host + off,
+            _ => p, // OPL and anything else is at a fixed address
+        }
     }
 
     /// Read an SB DSP/mixer/OPL passthrough port, with a tiny compatibility
@@ -283,7 +301,7 @@ impl SoundBlaster {
             // Auto-init transfers (8237 mode bit 4 set) are left alone: real
             // hardware keeps accepting commands between auto-init blocks, and
             // our auto-init clients (Quake, Dune2, ROTT) must not stall here.
-            let v = machine.inb(p);
+            let v = machine.inb(self.host_port(p));
             if self.dsp_single_cycle_busy(machine, dma) {
                 self.dsp_write_busy = self.dsp_write_busy.wrapping_add(1);
                 if self.dsp_write_busy & 8 != 0 {
@@ -292,7 +310,7 @@ impl SoundBlaster {
             }
             return v;
         }
-        machine.inb(p)
+        machine.inb(self.host_port(p))
     }
 
     /// True while a single-cycle DSP DMA transfer is genuinely mid-block: a
@@ -364,7 +382,7 @@ impl SoundBlaster {
                 }
             }
         }
-        machine.outb(p, val);
+        machine.outb(self.host_port(p), val);
     }
 
     /// DMA-port read. Two distinct sources of truth, never conflated:

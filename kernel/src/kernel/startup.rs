@@ -121,8 +121,8 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         match blaster_base(&blaster) {
             Some(b) if b == card.base => {}
             Some(b) => crate::println!(
-                "Audio: BLASTER declares A{:03X} but the card answers at {:#05X} — the guest will \
-                 find no card there. Fix BLASTER in CONFIG.SYS (or move the card).",
+                "Audio: BLASTER declares A{:03X}, the card answers at {:#05X} — translating (the \
+                 DSP window traps anyway, so the guest sees its declared card)",
                 b, card.base
             ),
             None => crate::println!(
