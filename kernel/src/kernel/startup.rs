@@ -731,6 +731,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let parent_cwd_len: usize;
     let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
     let parent_is_dos: bool;
+    let parent_fds = parent.kernel.fds;
     match &parent.personality {
         thread::Personality::Dos(dos) => {
             parent_is_dos = true;
@@ -831,6 +832,33 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             crate::kernel::kpipe::add_reader(cpipe);
         }
         thread::Personality::Dos(_) => {
+            // DOS EXEC semantics: the child inherits the parent's JFT —
+            // including handles the parent just redirected. Borland's IDE
+            // depends on this: it forces the transfer program's stdout into
+            // its message pipe (AH=45h/46h), EXECs, and restores after.
+            // Exit closes them again (close_all_fds), so the refcounts pair.
+            if parent_is_dos {
+                for (slot, inherited) in child.kernel.fds.iter_mut().zip(parent_fds.iter()) {
+                    *slot = match *inherited {
+                        k @ thread::FdKind::Vfs(h) => {
+                            crate::kernel::vfs::add_vfs_ref(h);
+                            k
+                        }
+                        k @ thread::FdKind::ConsoleOut => k,
+                        thread::FdKind::PipeRead(p) => {
+                            crate::kernel::kpipe::add_reader(p);
+                            thread::FdKind::PipeRead(p)
+                        }
+                        thread::FdKind::PipeWrite(p) => {
+                            crate::kernel::kpipe::add_writer(p);
+                            thread::FdKind::PipeWrite(p)
+                        }
+                        // Sockets/dirs have no DOS-handle meaning; don't
+                        // clone what the child can't address.
+                        _ => thread::FdKind::None,
+                    };
+                }
+            }
             // Only inherit the parent's screen if the parent is also DOS —
             // otherwise we'd save Linux console content into a DOS thread's
             // vga buffer, and the child would later "restore" Linux output

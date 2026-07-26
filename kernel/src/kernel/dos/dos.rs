@@ -891,6 +891,21 @@ fn psp_struct_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
     dos.current_psp
 }
 
+/// First handle AH=45h may hand out (0-2 are the std slots).
+const FIRST_USER_HANDLE: usize = 3;
+
+/// What a DOS handle refers to, for AH=45h/46h duplication. The std handles'
+/// slots are empty until something redirects them — their implicit console is
+/// made explicit here so a saved copy survives the redirect.
+fn dos_dup_fdkind<A: crate::Arch>(kt: &thread::KernelThread<A>, handle: usize) -> Option<thread::FdKind> {
+    if handle >= thread::MAX_FDS { return None; }
+    match kt.fds[handle] {
+        thread::FdKind::None if handle <= 2 => Some(thread::FdKind::ConsoleOut),
+        thread::FdKind::None => None,
+        k => Some(k),
+    }
+}
+
 /// Two error namespaces funnel through here: VFS negative errnos (2/9/13/24)
 /// and DFS path-resolution errors, which are already DOS codes (2/3/15). The
 /// value sets don't collide, and 2 means "file not found" in both.
@@ -1274,7 +1289,19 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // AH=0x3E: Close file handle (BX=handle)
         0x3E => {
             let handle = regs.rbx as u16;
-            if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
+            let hidx = handle as usize;
+            // A redirected std handle (AH=46h put a file in slot 0-2) or a
+            // dup'd console handle closes via the thread table: the VFS
+            // refcount drops there, and a std slot reverts to the console.
+            let redirected = hidx < thread::MAX_FDS
+                && ((handle <= 2 && matches!(kt.fds[hidx], thread::FdKind::Vfs(_)))
+                    || kt.fds[hidx] == thread::FdKind::ConsoleOut);
+            if redirected {
+                kt.close_fd(hidx);
+                sft_clear(machine, handle);
+                if hidx < 20 { Psp::set_jft(machine, psp_struct_seg(dos), hidx, 0xFF); }
+                regs.clear_flag32(1);
+            } else if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
                 if (handle as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), handle as usize, 0xFF); }
                 regs.clear_flag32(1);
             } else {
@@ -1295,11 +1322,20 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             let handle = regs.rbx as u16 as i32;
             let count = regs.rcx as u16 as usize;
             let buf_addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
-            if handle == 0 {
+            // A std handle redirected to a file (AH=46h) reads the file.
+            let vfs_backed = (handle as usize) < thread::MAX_FDS
+                && matches!(kt.fds[handle as usize], thread::FdKind::Vfs(_));
+            if !vfs_backed && handle == 0 {
                 // Line-buffered stdin is not implemented.
                 regs.rax &= !0xFFFF;
                 regs.clear_flag32(1);
-            } else if handle == 1 || handle == 2 {
+            } else if !vfs_backed && (handle == 1 || handle == 2) {
+                regs.rax &= !0xFFFF;
+                regs.clear_flag32(1);
+            } else if !vfs_backed && (handle as usize) < thread::MAX_FDS
+                && kt.fds[handle as usize] == thread::FdKind::ConsoleOut
+            {
+                // Dup'd console handle: nothing to read.
                 regs.rax &= !0xFFFF;
                 regs.clear_flag32(1);
             } else if handle == NULL_FILE_HANDLE as i32 {
@@ -1519,11 +1555,19 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 // AL=0x00: Get Device Information (BX=handle, returns DX=info word)
                 0x00 => {
                     let handle = regs.rbx as u16;
-                    if handle <= 2 {
+                    let hidx = handle as usize;
+                    // A redirected std handle must report FILE, not device —
+                    // it's how programs detect their output is captured.
+                    let vfs_backed = hidx < thread::MAX_FDS
+                        && matches!(kt.fds[hidx], thread::FdKind::Vfs(_));
+                    let console = !vfs_backed
+                        && (handle <= 2
+                            || (hidx < thread::MAX_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
+                    if console {
                         // stdin/stdout/stderr: bit 7=1 (device), bit 0=1 (stdin), bit 1=1 (stdout)
                         let info: u16 = 0x80 | match handle {
                             0 => 0x01, // stdin
-                            _ => 0x02, // stdout/stderr
+                            _ => 0x02, // stdout/stderr (and dup'd console handles)
                         };
                         regs.rdx = (regs.rdx & !0xFFFF) | info as u64;
                         regs.clear_flag32(1);
@@ -1559,6 +1603,54 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     dos_trace!("D21 44 (IOCTL) unsupported AL={:02X} BX={:04X} CX={:04X}",
                         al, regs.rbx as u16, regs.rcx as u16);
                     regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.set_flag32(1);
+                }
+            }
+            thread::KernelAction::Done
+        }
+        // AH=0x45: Duplicate file handle (BX=handle). Returns AX=new handle
+        // sharing the same file position. Borland's IDE uses 45h/46h to save
+        // std handles and force them into its message pipe around a transfer
+        // (TASM via TASM2MSG, FILTER.H's BI#PIP#OK protocol).
+        0x45 => {
+            let src = regs.rbx as u16 as usize;
+            match (dos_dup_fdkind(kt, src), kt.alloc_fd(FIRST_USER_HANDLE)) {
+                (Some(kind), Some(fd)) => {
+                    if let thread::FdKind::Vfs(h) = kind { crate::kernel::vfs::add_vfs_ref(h); }
+                    kt.fds[fd] = kind;
+                    if fd < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd, fd as u8); }
+                    regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                    regs.clear_flag32(1);
+                }
+                (Some(_), None) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
+                    regs.set_flag32(1);
+                }
+                (None, _) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
+                    regs.set_flag32(1);
+                }
+            }
+            thread::KernelAction::Done
+        }
+        // AH=0x46: Force duplicate (BX=src, CX=target): close target, make it
+        // refer to src's file. Redirection of the std handles happens here.
+        0x46 => {
+            let src = regs.rbx as u16 as usize;
+            let dst = regs.rcx as u16 as usize;
+            match dos_dup_fdkind(kt, src) {
+                Some(kind) if dst < thread::MAX_FDS => {
+                    if dst != src {
+                        kt.close_fd(dst);
+                        sft_clear(machine, dst as u16);
+                        if let thread::FdKind::Vfs(h) = kind { crate::kernel::vfs::add_vfs_ref(h); }
+                        kt.fds[dst] = kind;
+                        if dst < 20 { Psp::set_jft(machine, psp_struct_seg(dos), dst, dst as u8); }
+                    }
+                    regs.clear_flag32(1);
+                }
+                _ => {
+                    regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
                     regs.set_flag32(1);
                 }
             }
@@ -1606,8 +1698,16 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         0x40 => {
             let handle = regs.rbx as u16;
             let count = regs.rcx as u16;
-            // Handle 1=stdout, 2=stderr
-            if handle == 1 || handle == 2 {
+            let hidx = handle as usize;
+            // Std handles write to the console only while their fd slot is
+            // not redirected to a file; a dup'd console handle (AH=45h of an
+            // unredirected 1/2) is a console too.
+            let vfs_backed = hidx < thread::MAX_FDS
+                && matches!(kt.fds[hidx], thread::FdKind::Vfs(_));
+            let console = !vfs_backed
+                && (handle == 1 || handle == 2
+                    || (hidx < thread::MAX_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
+            if console {
                 let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = machine.read::<u8>((addr + i) as usize);

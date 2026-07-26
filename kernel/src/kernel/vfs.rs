@@ -966,8 +966,10 @@ fn alloc_fd(fds: &[FdKind; MAX_FDS]) -> Option<usize> {
 }
 
 /// Extract VFS handle from an FdKind, or return -9 (EBADF).
+// Accepts fd 0-2 too: DOS AH=46h can redirect a std handle to a VFS file, and
+// reads/writes on it must reach that file. Non-Vfs kinds still Err below.
 fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
-    if fd < FIRST_FD as i32 || fd >= MAX_FDS as i32 { return Err(-9); }
+    if fd < 0 || fd >= MAX_FDS as i32 { return Err(-9); }
     match fds[fd as usize] {
         FdKind::Vfs(idx) => Ok(idx),
         _ => Err(-9),
