@@ -891,12 +891,18 @@ fn psp_struct_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
     dos.current_psp
 }
 
+/// Two error namespaces funnel through here: VFS negative errnos (2/9/13/24)
+/// and DFS path-resolution errors, which are already DOS codes (2/3/15). The
+/// value sets don't collide, and 2 means "file not found" in both.
 fn dos_error_from_errno(err: i32) -> u16 {
     match -err {
-        2 => 2,   // file not found
-        9 => 6,   // invalid handle
-        13 => 5,  // access denied
-        24 => 4,  // too many open files
+        2 => 2,   // ENOENT / file not found
+        3 => 3,   // DFS: path not found
+        15 => 15, // DFS: invalid drive
+        9 => 6,   // EBADF -> invalid handle
+        13 => 5,  // EACCES -> access denied
+        24 => 4,  // EMFILE -> too many open files
+        30 => 5,  // EROFS (handle not writable) -> access denied
         _ => 1,   // invalid function / generic failure
     }
 }
@@ -1229,7 +1235,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let raw_name_str = core::str::from_utf8(&name[..i]).unwrap_or("?");
                 dos_trace!("D21 3D raw=\"{}\" cwd=\"{}\"", raw_name_str,
                     core::str::from_utf8(dos.dfs.get_cwd()).unwrap_or("?"));
-                let fd = match dfs_open_existing(dos, &name[..i]) {
+                let mut fd = match dfs_open_existing(dos, &name[..i]) {
                     Ok(buf) => {
                         let (ref path, len) = buf;
                         dos_trace!("D21 3D open \"{}\"", core::str::from_utf8(&path[..len]).unwrap_or("?"));
@@ -1237,6 +1243,17 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     }
                     Err(e) => -e,
                 };
+                // Honor AL access mode (0=read, 1=write, 2=read/write): real
+                // DOS refuses a write-mode open of a read-only file at OPEN
+                // time with error 5 — the check setups actually test. Leaving
+                // it to per-write errors lets apps that ignore write returns
+                // "save" without anything reaching the disk.
+                if fd >= 0 && (regs.rax as u8) & 0x03 != 0
+                    && !crate::kernel::vfs::fd_writable(fd, &kt.fds)
+                {
+                    crate::kernel::vfs::close(fd, &mut kt.fds);
+                    fd = -13; // EACCES
+                }
                 if fd >= 0 {
                     // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
@@ -1245,7 +1262,10 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
-                    regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
+                    // Report the real error: an fd-table-full open must come
+                    // back as 4 (too many open files), not 2 — "not found" for
+                    // a file that exists sends the user chasing the filesystem.
+                    regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(fd) as u64;
                     regs.set_flag32(1); // set carry
                 }
             }
@@ -1577,12 +1597,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
-                // Map the VFS errno to a DOS error: EACCES (write-protected --
-                // the file/dir isn't RetroOS's to write) is 5 "access denied",
-                // the condition every DOS program already knows. Anything else
-                // stays 4 "too many open files" (the fd-exhaustion case).
-                let ax: u16 = if fd == -5 { 5 } else { 4 };
-                regs.rax = (regs.rax & !0xFFFF) | ax as u64;
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(fd) as u64;
                 regs.set_flag32(1);
             }
             thread::KernelAction::Done
@@ -2248,6 +2263,13 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             };
             if fd >= 0 {
                 if open_exists {
+                    // Same as AH=3Dh: honor the BX access mode at open time.
+                    if (regs.rbx as u8) & 0x03 != 0 && !crate::kernel::vfs::fd_writable(fd, &kt.fds) {
+                        crate::kernel::vfs::close(fd, &mut kt.fds);
+                        regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
+                        regs.set_flag32(1);
+                        return thread::KernelAction::Done;
+                    }
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(machine, fd as u16, size);
                     if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
