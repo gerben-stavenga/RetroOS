@@ -264,19 +264,37 @@ impl SoundBlaster {
     /// (the IOPB is per-port), so DSP traffic on a correctly-declared card
     /// costs no exits at all.
     ///
-    ///  * mixer index+data (0x04/0x05) — the wiring registers are
-    ///    virtualized (see `sb_read`), always.
+    /// A port traps only where the guest's declared card DISAGREES with the
+    /// one that is there:
+    ///
     ///  * the whole window when the card is strapped somewhere other than
-    ///    BLASTER's base: every access needs `host_port` translation.
+    ///    BLASTER's base — every access needs `host_port` translation.
+    ///  * mixer index+data (0x04/0x05) when BLASTER's IRQ or DMA differ
+    ///    from the straps: registers 0x80/0x81 would otherwise report
+    ///    physical facts to a guest that was told labels, and it would hook
+    ///    a line we never raise (see `sb_read`). Where they agree, the card
+    ///    reports the guest's own numbers and needs no help.
     ///  * DSP data/status (0x0A/0x0C/0x0E) under QEMU only, where the
     ///    E4h/E8h test register and the write-status busy flicker must be
-    ///    synthesized because QEMU's sb16 lacks them. Real silicon has
-    ///    both, so metal grants them.
+    ///    synthesized because QEMU's sb16 lacks what real silicon has.
+    ///
+    /// So a BLASTER that matches the hardware on a real machine traps
+    /// nothing at all: the guest drives the card directly, exactly as it
+    /// would have on the bare metal of the era.
     pub fn trap_mask(&self) -> u16 {
         if self.io_base_host != 0 && self.io_base_host != self.io_base {
             return 0xFFFF;
         }
-        let mut m = (1u16 << 0x04) | (1u16 << 0x05);
+        let mut m = 0u16;
+        let strapped = crate::kernel::platform::get().sb_wiring;
+        let agrees = strapped.is_some_and(|w| {
+            w.irq == self.irq
+                && w.dma8 == self.dma8
+                && w.dma16.unwrap_or(0xFF) == self.dma16
+        });
+        if !agrees {
+            m |= (1 << 0x04) | (1 << 0x05);
+        }
         if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
             m |= (1 << 0x0A) | (1 << 0x0C) | (1 << 0x0E);
         }
