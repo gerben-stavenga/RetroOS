@@ -9,6 +9,18 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# Discovery/init conformance: version query, mixer, IRQ status/ack, trigger
+# IRQ, test register, auto-init block. One marker per behavior, written to
+# the screen and to C:\\SBDISC.LOG so a GUI-only backend (86Box, the
+# faithful SB16 reference) can be asserted on too.
+genrule(
+    name = "sbdisc_com",
+    srcs = ["sbdisc.asm"],
+    outs = ["SBDISC.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
 genrule(
     name = "sbdoor_com",
     srcs = ["sbdoor.asm"],

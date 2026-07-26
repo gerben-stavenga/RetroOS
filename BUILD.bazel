@@ -199,6 +199,7 @@ _EXTRA_FILES = {
     # SB single-cycle completion-protocol probes (busy flicker, status TC,
     # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
     "//test/dos/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
+    "//test/dos/sbproto:sbdisc_com":      "TESTS/SBDISC.COM",
     "//test/dos/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
     # PC speaker probe — hosted_games.sh asserts SPKTEST prints OUT-OK (the
     # PIT ch2 OUT line at port 61h bit 5); its tone sequence is the fixture
