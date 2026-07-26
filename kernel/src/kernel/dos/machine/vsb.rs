@@ -7,9 +7,21 @@
 //! the boot-time `platform::Audio` verdict.
 //!
 //!  - **Passthrough** — a real card answers (QEMU `sb16`/`adlib` on metal): DSP
-//!    traffic forwards to it, and the guest's DMA buffer is remapped contiguous
-//!    onto the real 8237 (`maybe_remap` → `arm`). No library card exists; this
-//!    is the kernel driving real hardware and cannot be anything else.
+//!    traffic forwards to it, and the guest's DMA buffer is aliased onto the
+//!    channel buffer the real 8237 transfers from (`maybe_remap` → `arm`;
+//!    the guest's pages are re-mapped, not copied, so its own writes land
+//!    where the card reads). No library card exists; this is the kernel
+//!    driving real hardware and cannot be anything else.
+//!
+//!    Note what does NOT drive that: the DSP window. `maybe_remap` runs off
+//!    the guest's 8237 port writes, and the SB is never told an address, so
+//!    passthrough could in principle grant the DSP ports outright. It stays
+//!    trapped for three things it buys instead: the write-status busy
+//!    flicker real chips pulse and QEMU's sb16 does not (Prince of Persia
+//!    spins on it), the E4h/E8h test-register answer, and — since every
+//!    access already traps — translating a guest window onto a card
+//!    strapped at a different base (`host_port`). DSP traffic is commands,
+//!    not sample data, so the exits are rare.
 //!  - **Emulated** — no card answers (the hosted interpreter, or metal with no
 //!    SB16): the library card runs the DSP command FSM and the play cursor,
 //!    and this file supplies it with everything spatial and temporal — the
@@ -249,11 +261,10 @@ impl SoundBlaster {
     }
 
     /// The physical port for a guest port in the DSP window. BLASTER is the
-    /// owner's declaration and the DSP window is trapped on every access
-    /// (we must see the command stream to remap DMA), so a card strapped
-    /// somewhere else costs nothing to support: same traps, different
-    /// addend. `io_base_host` is 0 before a card is detected, in which case
-    /// there is nothing to translate to.
+    /// owner's declaration; the window traps on every access, so a card
+    /// strapped somewhere else costs nothing to support — same traps, one
+    /// different addend. `io_base_host` is 0 before a card is detected, in
+    /// which case there is nothing to translate to.
     #[inline]
     fn host_port(&self, p: u16) -> u16 {
         if self.io_base_host == 0 || self.io_base_host == self.io_base {
