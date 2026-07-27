@@ -890,11 +890,33 @@ impl Sb {
     /// cursor, in the channel's own transfer units. The host adds `consumed`
     /// to the programmed base address for the address register.
     pub fn dma_cursor(&self) -> (u16, u16) {
+        self.dma_cursor_at(self.cursor)
+    }
+
+    /// [`dma_cursor`](Self::dma_cursor) for a caller-supplied cursor: the
+    /// host's between-pump estimator extrapolates the play position and this
+    /// converts it with the card's own geometry, so the modulo/units math
+    /// lives in exactly one place.
+    pub fn dma_cursor_at(&self, cursor: u64) -> (u16, u16) {
         let channels = if self.stereo { 2u64 } else { 1 };
         let total = (self.buf_frames as u64 * channels).max(1); // transfers
-        let consumed = (self.cursor * channels) % total;
+        let consumed = (cursor * channels) % total;
         let count = total.wrapping_sub(1).wrapping_sub(consumed) as u16;
         (count, consumed as u16)
+    }
+
+    /// The play cursor in session frames — monotonic while a transfer runs,
+    /// reset by a DSP (re)start. The basis the host's estimator anchors on.
+    pub fn cursor_frames(&self) -> u64 {
+        self.cursor
+    }
+
+    /// The next block boundary in session frames. An estimate must never
+    /// cross it: the boundary belongs to `advance_clock`, which raises the
+    /// completion IRQ as it passes — a count that crossed first would show
+    /// the guest a finished block whose interrupt hasn't happened.
+    pub fn next_irq_frames(&self) -> u64 {
+        self.next_irq
     }
 
     /// Read-and-clear the 8237 status-register TC bits this card latched.

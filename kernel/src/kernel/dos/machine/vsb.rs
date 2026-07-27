@@ -179,6 +179,23 @@ pub struct SoundBlaster {
     /// generation (its per-block re-arm), not on mask/unmask — handles
     /// single-cycle drivers that re-arm without masking.
     last_gen: [u32; 8],
+    /// Between-pump DMA-cursor estimator. The card's cursor advances only at
+    /// pump boundaries, in whole-chunk jumps — a MOD player that polls the
+    /// 8237 count to find the play position (Pinball Fantasies) sees it
+    /// frozen, then leaping ~512 transfers, and its coherency loop never
+    /// converges. Count reads instead extrapolate from the last pump on the
+    /// guest's fine clock (`rdtsc`): `est_frames` + elapsed·`est_slope`,
+    /// where the slope is measured pump-over-pump from the drain slave
+    /// itself (frames per 2^32 TSC ticks, EWMA-smoothed) — no TSC frequency
+    /// calibration anywhere. Clamped to `est_cap` (nothing past what the
+    /// sink was handed, never across an un-raised block IRQ) and monotonic
+    /// via `est_served` (a pump reconciling behind the estimate holds, never
+    /// rewinds).
+    est_frames: u64,
+    est_tsc: u64,
+    est_cap: u64,
+    est_slope: u64,
+    est_served: u64,
 }
 
 impl SoundBlaster {
@@ -199,6 +216,7 @@ impl SoundBlaster {
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
+            est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
         }
     }
 
@@ -503,7 +521,7 @@ impl SoundBlaster {
         // Emulated card: the live current-count comes from the card's play
         // cursor (there is no real 8257 to interrogate).
         if self.emulated() {
-            return self.emu_dma_read(dma, is_cnt, chan, hi_ctrl);
+            return self.emu_dma_read(machine, dma, is_cnt, chan, hi_ctrl);
         }
 
         let host = if chan == self.dma8 as usize { Some(self.host_dma8) }
@@ -892,6 +910,51 @@ impl SoundBlaster {
         if self.core.advance_clock(now, drained, pushed) && !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
         }
+        // Re-anchor the count-read estimator on the reconciled cursor and
+        // measure the frames-per-TSC slope from this pump interval. A cursor
+        // behind the previous anchor is a session restart — drop the
+        // monotonicity floor with it (the slope survives: the machine's
+        // clock ratio didn't change with the transfer).
+        let frames = self.core.cursor_frames();
+        let tsc = machine.rdtsc();
+        if self.core.playing() {
+            let df = frames.wrapping_sub(self.est_frames);
+            let dt = tsc.wrapping_sub(self.est_tsc);
+            // Sane interval only: forward, sub-second-ish, cursor moved.
+            if (1..1 << 40).contains(&dt) && (1..1 << 20).contains(&df) {
+                let slope = (((df as u128) << 32) / dt as u128) as u64;
+                self.est_slope = if self.est_slope == 0 {
+                    slope
+                } else {
+                    (self.est_slope * 3 + slope) / 4
+                };
+            }
+        }
+        if frames < self.est_frames {
+            self.est_served = 0;
+        }
+        self.est_frames = frames;
+        self.est_tsc = tsc;
+        self.est_cap = pushed.min(self.core.next_irq_frames()).max(frames);
+    }
+
+    /// The estimated play cursor for a count/address read *between* pumps:
+    /// the last reconciled position plus TSC-elapsed × measured slope,
+    /// capped and monotonic (see the `est_*` field docs). With no slope
+    /// measured yet this degrades to the pump-quantized cursor.
+    fn dma_pos_estimate<A: crate::Arch>(&mut self, machine: &mut A) -> u64 {
+        let dt = machine.rdtsc().wrapping_sub(self.est_tsc);
+        let adv = if dt < 1 << 40 {
+            ((dt as u128 * self.est_slope as u128) >> 32) as u64
+        } else {
+            0
+        };
+        let mut pos = self.est_frames.saturating_add(adv).min(self.est_cap);
+        if self.est_served > pos && self.est_served >= self.est_frames {
+            pos = self.est_served; // a lagging re-anchor holds, never rewinds
+        }
+        self.est_served = pos;
+        pos
     }
 
     /// Emulated DMA current-address/count read: serve the active SB channel's
@@ -899,7 +962,14 @@ impl SoundBlaster {
     /// channels from the captured base programming. The flip-flop and the
     /// programmed base are the controller's — ours; the cursor is the card's.
     /// Mirrors `dma_read`'s flip-flop split.
-    fn emu_dma_read(&mut self, dma: &mut Dma8237, is_cnt: bool, chan: usize, hi_ctrl: bool) -> u8 {
+    fn emu_dma_read<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        dma: &mut Dma8237,
+        is_cnt: bool,
+        chan: usize,
+        hi_ctrl: bool,
+    ) -> u8 {
         let is_active = chan == self.dma8 as usize || chan == self.dma16 as usize;
         // The guest reading the active channel's count = it serviced the block
         // (it computed where to refill). Extend the card's commit horizon.
@@ -910,8 +980,14 @@ impl SoundBlaster {
         let low = !*ff;
         *ff = !*ff;
         if self.core.playing() && is_active {
+            // Latched at the low-byte read so the lo/hi pair is coherent —
+            // the estimator must not advance between the two halves (the
+            // hi/lo tear is the very thing a driver's tolerance loop probes
+            // for). Estimated, not pump-quantized: a poll loop watching for
+            // the cursor to enter a window needs it to move smoothly.
             if low {
-                let (count, consumed) = self.core.dma_cursor();
+                let pos = self.dma_pos_estimate(machine);
+                let (count, consumed) = self.core.dma_cursor_at(pos);
                 dma.read_latch = if is_cnt {
                     count
                 } else {
