@@ -136,26 +136,17 @@ pub struct Regs {
     pub misc: u8,
 }
 
-/// Derive the renderable `VgaMode` from the captured registers. `bda_mode` is
-/// the BIOS-recorded mode byte (BDA 0x449), used only to disambiguate the
-/// linear-256 families (BIOS-set mode 13h vs a register-hacked Mode X both
-/// look "256-colour"); everything structural comes from the registers, so a
-/// game that reprograms the CRTC behind the BIOS's back classifies correctly.
-/// Returns `None` for a mode this renderer doesn't draw (e.g. a blanked or
-/// mid-reprogram state).
-pub fn classify(bda_mode: u8, r: &Regs) -> Option<VgaMode> {
+/// Derive the renderable `VgaMode` from the captured registers — REGISTERS
+/// ONLY, the way the hardware itself decides what to scan out. (The BIOS
+/// mode byte plays no part: a real VGA never consults BIOS data, and the
+/// substitute BIOS keeps this honest by programming the full canonical
+/// register file on every mode set — [`bios_mode_regs`] — so a register
+/// tweaker always starts from the same coherent state it would have found
+/// on real hardware.) Returns `None` for a mode this renderer doesn't draw.
+pub fn classify(r: &Regs) -> Option<VgaMode> {
     // GC[6] bit0: 1 = graphics, 0 = alphanumeric (text).
-    let graphics = r.gc[6] & 0x01 != 0;
-    if !graphics {
-        // Registers report text. On a real card / a BIOS that programs the
-        // GC, that's authoritative. But an emulated BIOS that only records
-        // the mode in the BDA (RetroOS's personality BIOS today) leaves the
-        // GC unprogrammed, so a BIOS-set *graphics* mode also lands here —
-        // fall back to the BDA mode byte to recover it. Genuine text and
-        // BIOS-set 13h both resolve correctly; a program that reprograms the
-        // GC for Mode X sets the graphics bit and takes the register path
-        // above instead.
-        return classify_bda(bda_mode);
+    if r.gc[6] & 0x01 == 0 {
+        return Some(VgaMode::Text80x25);
     }
 
     // Resolution from the CRTC display-end registers. Horizontal display end
@@ -183,28 +174,90 @@ pub fn classify(bda_mode: u8, r: &Regs) -> Option<VgaMode> {
         if r.seq[4] & 0x08 != 0 {
             return Some(VgaMode::Mode13h);
         }
-        // Mode X width: each char clock is 4 unchained pixels × 2 (the 256-col
-        // half-dot-clock), i.e. row_bytes*4 pixels across the 4 planes.
-        let xw = row_bytes * 4;
-        if xw != 0 {
-            w = xw;
+        // Mode X: the 256-colour half-dot clock makes each char clock 4
+        // visible pixels, so the CRTC gives the viewport directly. Height
+        // honours the full max-scanline divisor, not just double-scan —
+        // tweaked modes repeat rows via the low bits (Dyna Blaster: 464
+        // scanlines at 2 each = 232 rows). `row_bytes` stays the CRTC Offset
+        // stride, which a smooth-scroller sets wider than the viewport
+        // (Dyna Blaster pans a 256-wide window over a 512-wide playfield).
+        let mut w = chars * 4;
+        let scan_div = ((r.crtc[9] & 0x1F) as u16 + 1)
+            * if r.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let mut h = (v_end + 1) / scan_div.max(1);
+        if !(160..=800).contains(&w) {
+            w = if row_bytes != 0 { row_bytes * 4 } else { 320 };
         }
+        if !(64..=480).contains(&h) {
+            h = 200;
+        }
+        let row_bytes = if row_bytes != 0 { row_bytes } else { w / 4 };
         return Some(VgaMode::ModeX { w, h, row_bytes });
     }
 
-    // CGA 4-colour shift (GC[5] bit5): modes 4/5 at B8000.
-    if r.gc[5] & 0x20 != 0 {
-        return Some(VgaMode::Cga4);
-    }
-    if matches!(bda_mode, 0x04 | 0x05) {
-        return Some(VgaMode::Cga4);
-    }
-    if bda_mode == 0x06 {
-        return Some(VgaMode::Cga2);
+    // The CGA modes decode the B8000 window (GC[6] memory map bits 2-3 =
+    // 11b): interleaved 4-colour when the GC shift-interleave bit is on
+    // (modes 4/5), 1 bpp otherwise (mode 6).
+    if r.gc[6] & 0x0C == 0x0C {
+        return Some(if r.gc[5] & 0x20 != 0 { VgaMode::Cga4 } else { VgaMode::Cga2 });
     }
 
     // Planar 16-colour (the EGA/VGA default graphics family).
     Some(VgaMode::Planar16 { w, h, row_bytes })
+}
+
+/// The canonical register file an IBM VGA BIOS programs for a mode-set —
+/// misc/SEQ/GC/CRTC straight from the video parameter table. The substitute
+/// BIOS applies this on every INT 10h AH=00 so [`classify`] can be pure
+/// register-driven and a register tweaker (Mode X unchain, Dyna Blaster's
+/// 256×232, PF's 320×240) starts from the same coherent state it would
+/// have found after a real BIOS mode set. `None` for modes the table
+/// doesn't cover (VESA modes travel their own path).
+pub fn bios_mode_regs(mode: u8) -> Option<Regs> {
+    // CRTC timing families. Line-compare is its no-split default in every
+    // one (0x18=0xFF plus both overflow bits) — page-flippers rely on it.
+    #[rustfmt::skip]
+    const TEXT80: [u8; 25] = [0x5F,0x4F,0x50,0x82,0x55,0x81,0xBF,0x1F,0x00,0x4F,0x0D,0x0E,0,0,0,0,0x9C,0x8E,0x8F,0x28,0x1F,0x96,0xB9,0xA3,0xFF];
+    #[rustfmt::skip]
+    const TEXT40: [u8; 25] = [0x2D,0x27,0x28,0x90,0x2B,0xA0,0xBF,0x1F,0x00,0x4F,0x0D,0x0E,0,0,0,0,0x9C,0x8E,0x8F,0x14,0x1F,0x96,0xB9,0xA3,0xFF];
+    #[rustfmt::skip]
+    const CGA320: [u8; 25] = [0x2D,0x27,0x28,0x90,0x2B,0x80,0xBF,0x1F,0x00,0xC1,0,0,0,0,0,0,0x9C,0x8E,0x8F,0x14,0x00,0x96,0xB9,0xA2,0xFF];
+    #[rustfmt::skip]
+    const CGA640: [u8; 25] = [0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0xC1,0,0,0,0,0,0,0x9C,0x8E,0x8F,0x28,0x00,0x96,0xB9,0xC2,0xFF];
+    #[rustfmt::skip]
+    const EGA320: [u8; 25] = [0x2D,0x27,0x28,0x90,0x2B,0x80,0xBF,0x1F,0x00,0xC0,0,0,0,0,0,0,0x9C,0x8E,0x8F,0x14,0x00,0x96,0xB9,0xE3,0xFF];
+    #[rustfmt::skip]
+    const EGA640: [u8; 25] = [0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0xC0,0,0,0,0,0,0,0x9C,0x8E,0x8F,0x28,0x00,0x96,0xB9,0xE3,0xFF];
+    #[rustfmt::skip]
+    const EGA350: [u8; 25] = [0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0x40,0,0,0,0,0,0,0x83,0x85,0x5D,0x28,0x0F,0x63,0xBA,0xE3,0xFF];
+    #[rustfmt::skip]
+    const VGA480: [u8; 25] = [0x5F,0x4F,0x50,0x82,0x54,0x80,0x0B,0x3E,0x00,0x40,0,0,0,0,0,0,0xEA,0x8C,0xDF,0x28,0x00,0xE7,0x04,0xE3,0xFF];
+    #[rustfmt::skip]
+    const M13:    [u8; 25] = [0x5F,0x4F,0x50,0x82,0x54,0x80,0xBF,0x1F,0x00,0x41,0,0,0,0,0,0,0x9C,0x8E,0x8F,0x28,0x40,0x96,0xB9,0xA3,0xFF];
+
+    // Per mode: misc output, SEQ clocking (seq[1]) / map mask (seq[2]) /
+    // memory mode (seq[4]), GC mode (gc[5]) / miscellaneous (gc[6]) /
+    // colour-don't-care (gc[7]), CRTC family.
+    let (misc, s1, s2, s4, g5, g6, g7, crtc): (u8, u8, u8, u8, u8, u8, u8, &[u8; 25]) = match mode {
+        0x00 | 0x01 => (0x67, 0x08, 0x03, 0x02, 0x10, 0x0E, 0x00, &TEXT40),
+        0x02 | 0x03 | 0x07 => (0x67, 0x00, 0x03, 0x02, 0x10, 0x0E, 0x00, &TEXT80),
+        0x04 | 0x05 => (0x63, 0x09, 0x03, 0x02, 0x30, 0x0F, 0x00, &CGA320),
+        0x06 => (0x63, 0x01, 0x01, 0x06, 0x00, 0x0D, 0x00, &CGA640),
+        0x0D => (0x63, 0x09, 0x0F, 0x06, 0x00, 0x05, 0x0F, &EGA320),
+        0x0E => (0x63, 0x01, 0x0F, 0x06, 0x00, 0x05, 0x0F, &EGA640),
+        0x0F => (0xA2, 0x01, 0x0F, 0x06, 0x00, 0x05, 0x0F, &EGA350),
+        0x10 => (0xA3, 0x01, 0x0F, 0x06, 0x00, 0x05, 0x0F, &EGA350),
+        0x11 => (0xE3, 0x01, 0x01, 0x06, 0x00, 0x05, 0x0F, &VGA480),
+        0x12 => (0xE3, 0x01, 0x0F, 0x06, 0x00, 0x05, 0x0F, &VGA480),
+        0x13 => (0x63, 0x01, 0x0F, 0x0E, 0x40, 0x05, 0x0F, &M13),
+        _ => return None,
+    };
+    let mut gc = [0u8; 9];
+    gc[5] = g5;
+    gc[6] = g6;
+    gc[7] = g7;
+    gc[8] = 0xFF;
+    Some(Regs { crtc: *crtc, seq: [0x03, s1, s2, 0x00, s4], gc, misc })
 }
 
 /// Chain-4 deinterleave: spread a linear 64K "chained view" (mode 13h, where
@@ -337,23 +390,6 @@ pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
         r
     };
     (data, cur)
-}
-
-/// Map a BIOS mode number (BDA 0x449) to a renderable mode with that mode's
-/// standard geometry. The fallback when the GC isn't programmed (emulated
-/// BIOS); also the source of the standard `row_bytes` for the planar modes.
-fn classify_bda(bda_mode: u8) -> Option<VgaMode> {
-    Some(match bda_mode {
-        0x00 | 0x01 | 0x02 | 0x03 | 0x07 => VgaMode::Text80x25,
-        0x04 | 0x05 => VgaMode::Cga4,
-        0x06 => VgaMode::Cga2,
-        0x0D => VgaMode::Planar16 { w: 320, h: 200, row_bytes: 40 },
-        0x0E => VgaMode::Planar16 { w: 640, h: 200, row_bytes: 80 },
-        0x0F | 0x10 => VgaMode::Planar16 { w: 640, h: 350, row_bytes: 80 },
-        0x11 | 0x12 => VgaMode::Planar16 { w: 640, h: 480, row_bytes: 80 },
-        0x13 => VgaMode::Mode13h,
-        _ => return None,
-    })
 }
 
 /// The 16 standard CGA/EGA text colours as 6-bit DAC triples (R,G,B each 0..63),

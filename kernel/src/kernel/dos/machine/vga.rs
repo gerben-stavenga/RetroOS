@@ -738,15 +738,20 @@ pub fn on_set_mode<A: crate::Arch>(
     }
     // A standard mode-set leaves any active VESA SVGA mode.
     svga_leave(machine, pc);
-    // The IBM BIOS programs CRTC line-compare to its no-split default (0x3FF) on
-    // every mode set; our BIOS leaves the CRTC untouched. Without this a program
-    // that page-flips but never writes 0x18 (Doom relies on the BIOS default)
-    // inherits a stale 0, and the renderer splits the whole screen to address 0
-    // (page 0) — the screen renders page 0 for every row. A split-status-panel
-    // program overwrites these afterward (it must, the default being 0x3FF).
-    pc.vga.crtc[0x18] = 0xFF; // line-compare bits 0..7
-    pc.vga.crtc[7] |= 0x10;   // line-compare bit 8 (CRTC overflow)
-    pc.vga.crtc[9] |= 0x40;   // line-compare bit 9 (CRTC max-scan-line)
+    // Program the full canonical register file, exactly as a real BIOS does
+    // from its video parameter table. This is what keeps classification
+    // register-pure (the hardware never consults BIOS data): a tweaker
+    // starts every mode from the same coherent state a real BIOS leaves —
+    // and a mode set CLEARS the previous program's tweaks, so Jazz's
+    // unchained level mode can't leak into its menu's mode 13h (stale
+    // display-start showed the menu at the wrong offset; stale shift/chain
+    // bits later misclassified the menu as the level's Mode X entirely).
+    if let Some(r) = lib::vga_render::bios_mode_regs(mode) {
+        pc.vga.misc_output = r.misc;
+        pc.vga.seq = r.seq;
+        pc.vga.gc = r.gc;
+        pc.vga.crtc = r.crtc;
+    }
     // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
     // depends on the render path: text/CGA/mode 13h index DAC entries directly
     // and need the 16 CGA colours at entries 0..15; planar 16-colour modes map
@@ -1639,7 +1644,7 @@ impl VgaState {
                 line_compare: usize::MAX,
             });
         }
-        let mode = self.classify_mode(machine)?;
+        let mode = self.classify_mode()?;
         let (_w, h) = lib::vga_render::dimensions(mode);
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
@@ -1683,48 +1688,16 @@ impl VgaState {
         })
     }
 
-    /// Resolve the renderable mode from the live registers. An explicit unchain
-    /// (SEQ chain-4 cleared, tracked by `planar_active`) is the authoritative
-    /// Mode-Y signal `classify` can't see — our BIOS leaves the GC graphics bit
-    /// unprogrammed, so an unchained SEQ reads like the BIOS default; Doom lands
-    /// here and its resolution comes from the CRTC it programmed. Otherwise
-    /// defer to `classify`, honouring the CRTC Offset as the in-memory row
-    /// stride for smooth-scrollers (Keen's wide virtual screen).
-    fn classify_mode<A: crate::Arch>(&self, machine: &mut A) -> Option<lib::vga_render::VgaMode> {
-        use lib::vga_render::{self, VgaMode};
-        let bda_mode = machine.read::<u8>(0x449);
-        if self.a0000_trapped && bda_mode == 0x13 {
-            let row_bytes = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { 80 };
-            // CRTC Offset is the virtual stride, not the visible width: Jazz
-            // sets it to 42 words (84 bytes/plane = 336 virtual pixels) while
-            // the mode-13h viewport remains 320 pixels wide. Our BIOS does not
-            // seed HDE, so 0 means "standard mode-13h width" unless the game
-            // programmed it.
-            let mut w = if self.crtc[1] != 0 { (self.crtc[1] as u16 + 1) * 4 } else { 320 };
-            if !(160..=800).contains(&w) { w = 320; }
-            let v_end = self.crtc[0x12] as u16
-                | (((self.crtc[7] >> 1) & 1) as u16) << 8
-                | (((self.crtc[7] >> 6) & 1) as u16) << 9;
-            // CRTC[9] low bits are the maximum scanline within a character row:
-            // graphics modes with value 1 display two physical scanlines per
-            // memory row. Jazz uses v_end=397, max_scanline=1 => 199 visible
-            // rows; treating it as 398 rows shows two stacked playfields.
-            let scan_div = ((self.crtc[9] as u16 & 0x1F) + 1)
-                * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
-            let mut h = (v_end + 1) / scan_div.max(1);
-            // Mode-Y games may keep the BIOS mode-13h CRTC our BIOS never wrote
-            // (v-end ~0); fall back to the 320×200 default.
-            if !(64..=480).contains(&h) { h = 200; }
-            return Some(VgaMode::ModeX { w, h, row_bytes });
-        }
+    /// Resolve the renderable mode from the live registers — nothing else.
+    /// The substitute BIOS programs the canonical register file on every
+    /// mode set (`bios_mode_regs`), so `classify` always sees coherent
+    /// state: a BIOS-set mode reads back exactly as on real hardware, and a
+    /// tweaker's register writes (Doom's unchain, Jazz's wide-stride level,
+    /// Dyna Blaster's 256×232) land on top of that base.
+    fn classify_mode(&self) -> Option<lib::vga_render::VgaMode> {
+        use lib::vga_render;
         let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
-        match vga_render::classify(bda_mode, &rregs)? {
-            VgaMode::Planar16 { w, h, row_bytes } => {
-                let stride = if self.crtc[0x13] != 0 { self.crtc[0x13] as u16 * 2 } else { row_bytes };
-                Some(VgaMode::Planar16 { w, h, row_bytes: stride })
-            }
-            m => Some(m),
-        }
+        vga_render::classify(&rregs)
     }
 
     /// CRTC Line Compare (0x18 + overflow bits 8/9): the scanline where the

@@ -101,7 +101,11 @@ struct Bda {
     active_page: u8,
     /// 0x63: CRTC base port (0x3D4 = colour).
     crtc_base: u16,
-    _pad_65: [u8; 7],
+    /// 0x65: current CGA Mode-Control (port 0x3D8) value.
+    crt_mode_ctl: u8,
+    /// 0x66: current CGA Colour-Select (port 0x3D9) value.
+    crt_palette: u8,
+    _pad_67: [u8; 5],
     /// 0x6C: BIOS tick count (18.2 Hz), advanced by INT 08h.
     tick_count: u32,
     /// 0x70: midnight rollover flag.
@@ -134,6 +138,8 @@ const _: () = {
     assert!(offset_of!(Bda, cursor_shape) == 0x60);
     assert!(offset_of!(Bda, active_page) == 0x62);
     assert!(offset_of!(Bda, crtc_base) == 0x63);
+    assert!(offset_of!(Bda, crt_mode_ctl) == 0x65);
+    assert!(offset_of!(Bda, crt_palette) == 0x66);
     assert!(offset_of!(Bda, tick_count) == 0x6C);
     assert!(offset_of!(Bda, kb_ring_start) == 0x80);
     assert!(offset_of!(Bda, rows_minus1) == 0x84);
@@ -653,6 +659,20 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
             // Sequencer chain-4 bit, so this is the only place the trap gets
             // armed. (`clear` also blanks the planes.)
             super::machine::vga::on_set_mode(machine, &mut dos.pc, regs, mode, clear);
+            // The IBM BIOS programs the CGA compatibility registers (0x3D8
+            // Mode-Control, 0x3D9 Colour-Select) on every mode set and mirrors
+            // them in the BDA. The Colour-Select default is what gives mode 4/5
+            // its canonical cyan/magenta/white (palette 1, bright) and mode 6
+            // its white foreground — a game that wants green/red/brown must
+            // select palette 0 itself (AH=0Bh or an 0x3D9 write).
+            let mode_ctl: u8 = match mode {
+                0 => 0x2C, 1 => 0x28, 2 => 0x2D, 4 => 0x2A, 5 => 0x2E, 6 => 0x1E, _ => 0x29,
+            };
+            let palette: u8 = if mode == 6 { 0x3F } else { 0x30 };
+            bda_field!(machine, crt_mode_ctl = mode_ctl);
+            bda_field!(machine, crt_palette = palette);
+            emulate_outb(machine, &mut dos.pc, regs, 0x3D8, mode_ctl);
+            emulate_outb(machine, &mut dos.pc, regs, 0x3D9, palette);
             if clear {
                 // AL bit 7 clear: clear the framebuffer. Planar modes are
                 // cleared inside on_set_mode (their VRAM is the plane window).
@@ -661,9 +681,13 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                         machine.write::<u32>(VRAM_MODE13 + i * 4, 0);
                     }
                 } else if !matches!(mode, 0x0D..=0x12) {
+                    // Text modes blank to space-on-gray cells; the CGA graphics
+                    // modes (4-6) share the window but blank to pixel value 0 —
+                    // 0x0720 there is a red/green/brown pixel-stripe pattern.
+                    let blank: u16 = if matches!(mode, 4..=6) { 0x0000 } else { 0x0720 };
                     for i in 0..16384 {
                         // full 32K text window
-                        machine.write::<u16>(VRAM_TEXT + i * 2, 0x0720);
+                        machine.write::<u16>(VRAM_TEXT + i * 2, blank);
                     }
                 }
             }
@@ -736,6 +760,23 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     }
                 }
             }
+        }
+        0x0B => {
+            // CGA palette control, a front-end for Colour-Select (0x3D9).
+            // BH=0: background/border colour from BL bits 0-4; BH=1: the
+            // 320×200 palette from BL bit 0 (1 = cyan/magenta/white,
+            // 0 = green/red/brown). Read-modify-write via the BDA mirror —
+            // the port itself is write-only.
+            let bh = (regs.rbx >> 8) as u8;
+            let bl = regs.rbx as u8;
+            let old: u8 = bda_field!(machine, crt_palette);
+            let new = if bh == 0 {
+                (old & 0xE0) | (bl & 0x1F)
+            } else {
+                (old & !0x20) | ((bl & 1) << 5)
+            };
+            bda_field!(machine, crt_palette = new);
+            emulate_outb(machine, &mut dos.pc, regs, 0x3D9, new);
         }
         0x0E => {
             // Teletype output: write at cursor, advance. (Scroll is handled
