@@ -467,6 +467,34 @@ resolve_image() {
     esac
 }
 
+# ---------------------------------------------------------------------------
+# VGA BIOS override (BIOS path). SeaBIOS's VGA BIOS only gained VBE function
+# 09h (get/set palette data) in 1.17.0 — upstream commit 192e23b7, 2024-03-12.
+# Older ROMs, including Ubuntu noble's 1.16.3, have no `case 0x09` in their VBE
+# dispatch at all: every palette call falls through to the unimplemented
+# catch-all and returns AX=0x0100. SeaVGABIOS also advertises its modes as NOT
+# VGA-compatible, which per the VBE spec obliges applications to go through
+# 4F09h instead of poking the DAC directly — so they have no fallback and run
+# with whatever palette the mode set left behind. Duke3D at 800x600 draws
+# correct geometry in psychedelic colours; DOS Quake reports "Unable to load
+# VESA palette" and exits.
+#
+# QEMU itself needs no update — the VGA BIOS is a separate ROM blob:
+#     VGABIOS_ROM=/path/to/vgabios-stdvga.bin ./run.sh qemu ...
+# A 1.17.0+ ROM can be lifted out of Debian's package without installing it:
+#     curl -O http://deb.debian.org/debian/pool/main/s/seabios/seabios_1.17.0-1_all.deb
+#     dpkg-deb -x seabios_1.17.0-1_all.deb sb/   # sb/usr/share/seabios/
+# Unset = the system ROM, whatever QEMU picks by default.
+build_vga_rom_args() {
+    VGA_ROM_ARGS=()
+    [ -z "${VGABIOS_ROM:-}" ] && return
+    if [ ! -f "$VGABIOS_ROM" ]; then
+        echo "run.sh: VGABIOS_ROM=$VGABIOS_ROM does not exist" >&2
+        exit 1
+    fi
+    VGA_ROM_ARGS=(-device "VGA,romfile=$VGABIOS_ROM")
+}
+
 # ===========================================================================
 # launch_qemu  (BIOS path from run_qemu.sh; UEFI path from run_uefi.sh)
 # ===========================================================================
@@ -491,6 +519,7 @@ launch_qemu() {
 
     # ---- BIOS path (verbatim from run_qemu.sh) ----
     build_qemu_audio_args "$QEMU"
+    build_vga_rom_args
 
     # Display backend. Default to SDL, NOT GTK: QEMU's GTK UI only repaints
     # when the main loop goes idle, and SB16 ISA DMA keeps i8257_dma_run()
@@ -528,6 +557,7 @@ launch_qemu() {
             -boot order=d \
             -debugcon stdio \
             "${DISPLAY_ARGS[@]}" \
+            "${VGA_ROM_ARGS[@]}" \
             "${AUDIO_ARGS[@]}" \
             "${RTC_ARGS[@]}" \
             -no-reboot \
@@ -626,6 +656,7 @@ launch_qemu() {
             $APPS_DRIVE \
             $FDOS_ARGS \
             "${DISPLAY_ARGS[@]}" \
+            "${VGA_ROM_ARGS[@]}" \
             "${AUDIO_ARGS[@]}" \
             "${RTC_ARGS[@]}" \
             -no-reboot \
@@ -684,6 +715,7 @@ launch_qemu() {
             "${FWCFG_ARGS[@]}" \
             "${HOSTFS_ARGS[@]}" \
             "${DISPLAY_ARGS[@]}" \
+            "${VGA_ROM_ARGS[@]}" \
             "${AUDIO_ARGS[@]}" \
             "${RTC_ARGS[@]}" \
             -no-reboot \
