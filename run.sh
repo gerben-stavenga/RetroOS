@@ -487,12 +487,37 @@ resolve_image() {
 # Unset = the system ROM, whatever QEMU picks by default.
 build_vga_rom_args() {
     VGA_ROM_ARGS=()
-    [ -z "${VGABIOS_ROM:-}" ] && return
-    if [ ! -f "$VGABIOS_ROM" ]; then
-        echo "run.sh: VGABIOS_ROM=$VGABIOS_ROM does not exist" >&2
-        exit 1
+    local rom="${VGABIOS_ROM:-}"
+    # Repo-local drop-in, so a fetched ROM is picked up without setting the
+    # variable on every invocation. Not checked in (see .gitignore).
+    if [ -z "$rom" ] && [ -f "$SCRIPT_DIR/third_party/vgabios/vgabios-stdvga.bin" ]; then
+        rom="$SCRIPT_DIR/third_party/vgabios/vgabios-stdvga.bin"
     fi
-    VGA_ROM_ARGS=(-device "VGA,romfile=$VGABIOS_ROM")
+    if [ -n "$rom" ]; then
+        if [ ! -f "$rom" ]; then
+            echo "run.sh: VGABIOS_ROM=$rom does not exist" >&2
+            exit 1
+        fi
+        VGA_ROM_ARGS=(-device "VGA,romfile=$rom")
+        return
+    fi
+    # No override: say so when the system ROM is too old, rather than letting
+    # the guest run with silently wrong colours.
+    local sys=/usr/share/seabios/vgabios-stdvga.bin
+    [ -f "$sys" ] || return
+    local v
+    v="$(strings "$sys" | grep -oE '^1\.[0-9]+\.[0-9]+' | head -1)"
+    [ -n "$v" ] || return
+    if [ "$v" != "1.17.0" ] &&
+       [ "$(printf '%s\n1.17.0\n' "$v" | sort -V | head -1)" = "$v" ]; then
+        echo "run.sh: WARNING system VGA BIOS is SeaBIOS $v, which has no VBE 4F09h" >&2
+        echo "run.sh:   (palette data, added in 1.17.0). 8-bit SVGA games will run with" >&2
+        echo "run.sh:   the wrong palette - Duke3D at 800x600 is psychedelic. To fix:" >&2
+        echo "run.sh:     curl -O http://deb.debian.org/debian/pool/main/s/seabios/seabios_1.17.0-1_all.deb" >&2
+        echo "run.sh:     dpkg-deb -x seabios_1.17.0-1_all.deb /tmp/sb" >&2
+        echo "run.sh:     mkdir -p third_party/vgabios && cp /tmp/sb/usr/share/seabios/vgabios-stdvga.bin third_party/vgabios/" >&2
+        echo "run.sh:   or set VGABIOS_ROM=/path/to/vgabios-stdvga.bin" >&2
+    fi
 }
 
 # ===========================================================================

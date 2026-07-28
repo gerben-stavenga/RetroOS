@@ -39,3 +39,6 @@ traces/
 
 # Python bytecode (test harness)
 __pycache__/
+
+# Fetched VGA BIOS ROM (see build_vga_rom_args in run.sh)
+third_party/vgabios/
