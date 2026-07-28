@@ -6,48 +6,26 @@
 //! There is ONE VGA model: the shared text aperture at phys 0xB8000 (the
 //! kernel console keeps `lib::vga`'s cell base there — LOW_MEM_BASE + 0xB8000 —
 //! the same memory DOS programs and DN write, since `map_low_mem_user` identity-
-//! maps 0xA0-0xBF into every process). This module renders that one aperture
-//! through `lib::vga_render` and blits it via `present_dos_frame` — the same
-//! present path `display_tick` uses for DOS frames. The `set_text_flush` hook
-//! presents it immediately on kernel console writes (boot-message visibility
-//! before the event loop runs `display_tick`); at runtime `display_tick` is the
-//! presenter. Text renders at 720×400, centered/integer-scaled.
+//! maps 0xA0-0xBF into every process). This module only maps/describes the
+//! framebuffer and supplies the shared aperture to `kernel::vga`, which makes
+//! that emulated VGA visible. The kernel above this glue uses the same VGA
+//! console interface as it does on a legacy machine.
 //!
 //! Like `boot.rs`, this is metal boot glue: legacy-BIOS machines never call
 //! `init` and keep writing real B8000 text cells the hardware scans; the kernel
 //! above notices nothing either way.
 
 use arch::paging2::{self, PAGE_SIZE};
-use lib::vga_render::{self, Frame, VgaMode};
-use lib::vga_fonts::FONT_8X16;
-
-/// Cells as last rendered to pixels; `flush` re-renders only what differs.
-/// All-zero ≠ any real cell (attr 0x00 is never written), so the first flush
-/// after `init` renders the whole backlog.
-static mut SHADOW: [u16; 80 * 25] = [0; 80 * 25];
-
-/// DAC palette for attribute colors (filled from `fallback_palette` at init).
-static mut PALETTE: [u8; 768] = [0; 768];
-/// Identity Attribute-Controller palette (AC[i]=i): text rendering doesn't use
-/// the planar colour path, but `Frame` requires the field. Mode-control byte
-/// (index 0x10) left 0 = blink semantics, matching `blink: false` here.
-static FBCON_AC: [u8; 21] = {
-    let mut a = [0u8; 21];
-    let mut i = 0;
-    while i < 16 { a[i] = i as u8; i += 1; }
-    a
-};
+use lib::vga_render::PixelFormat;
 
 /// Framebuffer geometry, set once by `init` (None until then / on legacy VGA).
 struct Geom {
     /// First mapped framebuffer pixel, as a kernel VA.
     va: usize,
-    /// Row pitch in pixels (multiboot pitch is in bytes; bpp is 32 here).
-    stride: usize,
-    /// Pixel offset of the centered 720×400 text origin within the mapping.
-    origin: usize,
-    /// Total mapped pixels from `va` (bounds for the cell renderer).
-    len: usize,
+    /// Row pitch in bytes.
+    pitch: usize,
+    width: usize,
+    height: usize,
     /// Convert the renderer's canonical 0x00RRGGBB pixels to the GOP layout.
     format: PixelFormat,
     /// QEMU-TCG needs strong-UC stores for display dirty tracking.
@@ -59,83 +37,6 @@ static mut GEOM: Option<Geom> = None;
 
 const TEXT_W: usize = 720;
 const TEXT_H: usize = 400;
-const CELL_W: usize = 9;
-const CELL_H: usize = 16;
-
-#[derive(Clone, Copy)]
-struct PixelFormat {
-    red_pos: u8,
-    red_size: u8,
-    green_pos: u8,
-    green_size: u8,
-    blue_pos: u8,
-    blue_size: u8,
-}
-
-impl PixelFormat {
-    fn from_multiboot(info: &arch::MultibootInfo) -> Option<Self> {
-        if info.framebuffer_bpp != 32 {
-            return None;
-        }
-        let [red_pos, red_size, green_pos, green_size, blue_pos, blue_size] =
-            info.color_info;
-        let fields = [
-            (red_pos, red_size),
-            (green_pos, green_size),
-            (blue_pos, blue_size),
-        ];
-        let mut used = 0u32;
-        for (pos, size) in fields {
-            if size == 0 || size > 16 || pos >= 32 || pos as u16 + size as u16 > 32 {
-                return None;
-            }
-            let mask = (((1u64 << size) - 1) << pos) as u32;
-            if used & mask != 0 {
-                return None;
-            }
-            used |= mask;
-        }
-        Some(Self {
-            red_pos,
-            red_size,
-            green_pos,
-            green_size,
-            blue_pos,
-            blue_size,
-        })
-    }
-
-    /// As the kernel-side descriptor: only the channel positions matter, the
-    /// sizes are all 8 by construction (`from_multiboot` rejects anything else).
-    fn to_display(self) -> crate::kernel::display::PixelFormat {
-        crate::kernel::display::PixelFormat {
-            red_pos: self.red_pos,
-            green_pos: self.green_pos,
-            blue_pos: self.blue_pos,
-        }
-    }
-
-    fn is_native(self) -> bool {
-        (self.red_pos, self.red_size, self.green_pos, self.green_size,
-            self.blue_pos, self.blue_size) == (16, 8, 8, 8, 0, 8)
-    }
-
-    fn encode(self, rgb: u32) -> u32 {
-        fn channel(value: u32, pos: u8, size: u8) -> u32 {
-            // 8-bit channels (the usual RGBX/BGRX framebuffers) need no rescale:
-            // (value*255+127)/255 == value. Skip the divide — it dominated the
-            // present blit. The multiply/divide is only needed for 15/16-bit.
-            if size == 8 {
-                return value << pos;
-            }
-            let max = (1u64 << size) - 1;
-            ((((value as u64 * max) + 127) / 255) << pos) as u32
-        }
-        channel((rgb >> 16) & 0xFF, self.red_pos, self.red_size)
-            | channel((rgb >> 8) & 0xFF, self.green_pos, self.green_size)
-            | channel(rgb & 0xFF, self.blue_pos, self.blue_size)
-    }
-}
 
 fn geom() -> &'static mut Option<Geom> {
     let p = &raw mut GEOM;
@@ -155,10 +56,10 @@ pub fn framebuffer() -> Option<crate::kernel::display::Framebuffer> {
     let g = (*geom()).as_ref()?;
     Some(crate::kernel::display::Framebuffer {
         va: g.va,
-        stride: g.stride,
-        width: g.stride,
-        height: g.len / g.stride,
-        format: g.format.to_display(),
+        pitch: g.pitch,
+        width: g.width,
+        height: g.height,
+        format: g.format,
         slow: g.slow,
         wide: g.wide,
     })
@@ -171,7 +72,6 @@ pub fn framebuffer() -> Option<crate::kernel::display::Framebuffer> {
 /// visible immediately.
 pub fn present() {
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
-    DOS_PAINTED.store(true, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Early hook, called by `boot_kernel` before the first `println!`: if the
@@ -260,11 +160,16 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         panic!("fbcon: framebuffer type {} unsupported (need {} = RGB)",
             info.framebuffer_type, FB_TYPE_RGB);
     }
-    let Some(format) = PixelFormat::from_multiboot(info) else {
+    let bytes_per_pixel = info.framebuffer_bpp.div_ceil(8) as usize;
+    let Some(format) = PixelFormat::from_rgb(bytes_per_pixel as u8, info.color_info) else {
         blind_signal();
-        panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need 32bpp",
+        panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need packed 16/24/32-bit RGB",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs);
     };
+    if pitch < width * bytes_per_pixel {
+        blind_signal();
+        panic!("fbcon: pitch {} smaller than {} packed pixels", pitch, width);
+    }
     if width < TEXT_W || height < TEXT_H {
         blind_signal();
         panic!("fbcon: framebuffer {}x{} smaller than the {}x{} text console",
@@ -315,14 +220,11 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     }
 
     lib::screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
-    let stride = pitch / 4;
-    let origin = (height - TEXT_H) / 2 * stride + (width - TEXT_W) / 2;
-    unsafe { PALETTE = vga_render::fallback_palette(); }
     *geom() = Some(Geom {
         va: paging2::FB_WINDOW_BASE + page_off,
-        stride,
-        origin,
-        len: stride * height,
+        pitch,
+        width,
+        height,
         format,
         slow: qemu_tcg,
         wide: (cpuid1_ecx >> 31) & 1 == 0, // no hypervisor = real WC aperture
@@ -330,7 +232,13 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
     // paints) now that the console owns the pixels.
-    unsafe { core::slice::from_raw_parts_mut((paging2::FB_WINDOW_BASE + page_off) as *mut u32, stride * height).fill(0) };
+    unsafe {
+        core::slice::from_raw_parts_mut(
+            (paging2::FB_WINDOW_BASE + page_off) as *mut u8,
+            pitch * height,
+        )
+        .fill(0)
+    };
 
     // Back the VGA text aperture with real RAM. `boot_kernel` left the console's
     // cell base at LOW_MEM_BASE + 0xB8000, but on a UEFI machine that maps to the
@@ -358,101 +266,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
             .fill(0x0720);
     }
 
-    lib::vga::set_text_flush(flush);
-    // The emulated VGA's display sink: DOS screens (text or mode 13h) render
-    // kernel-side through lib::vga_render and land here for the GOP blit.
-    flush(); // render the boot backlog accumulated since `early`
-}
-
-/// Present sink for the kernel-emulated VGA: integer-scale and center the
-/// rendered DOS frame in the GOP framebuffer.
-///
-/// Unchanged frames are skipped BEFORE touching the framebuffer: the GOP
-/// mapping is uncached, so a full blit costs tens of milliseconds — at tick
-/// cadence that saturated the event loop and starved guest port I/O to ~64
-/// ins/sec (reproducer: DN's CGA snow-avoidance polls 0x3DA around every
-/// word it writes; its UI draw extrapolated to ~500 seconds). The compare
-/// runs in cached RAM and costs microseconds.
-/// Set when a DOS frame painted the framebuffer via `present_dos_frame`: the
-/// console's dirty-cell shadow no longer matches the pixels, so the next `flush`
-/// repaints the whole screen (else the kernel console stays invisible after a
-/// DOS graphics frame — the diff would think nothing changed).
-static DOS_PAINTED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
-
-
-/// Re-render the cells of the shared VGA text aperture that changed since the
-/// last flush, straight to the framebuffer. The kernel console and every DOS
-/// process share one screen at phys 0xB8000 (read through the LOW_MEM_BASE
-/// window) — `flush` reads that aperture (not a private buffer), so there is one
-/// screen. Installed as the console post-write hook for immediate boot-message
-/// visibility; cheap (a per-cell diff, no allocation), unlike the full-frame
-/// `display_tick` path which presents the same aperture during runtime.
-fn flush() {
-    let Some(g) = geom() else { return };
-    // A DOS frame painted over us: wipe and repaint the whole console.
-    if DOS_PAINTED.swap(false, core::sync::atomic::Ordering::Relaxed) {
-    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
-        out.fill(0);
-        let sp = &raw mut SHADOW;
-        unsafe { (*sp).fill(0) };
-    }
-    // The shared text aperture (real phys 0xB8000 via the low-mem window).
-    let text: &[u16] = unsafe {
-        core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u16, 80 * 25)
-    };
-    let vram: &[u8] = unsafe {
-        core::slice::from_raw_parts((paging2::LOW_MEM_BASE + 0xB8000) as *const u8, 80 * 25 * 2)
-    };
-    let shadow_p = &raw mut SHADOW;
-    let shadow = unsafe { &mut *shadow_p };
-    let palette_p = &raw const PALETTE;
-    let frame = Frame {
-        mode: VgaMode::Text80x25,
-        vram,
-        planes: &[],
-        ac: &FBCON_AC,
-        palette: unsafe { &*palette_p },
-        font: &FONT_8X16,
-        blink: false,
-        cga_palette: [0; 4],
-        start_offset: 0,
-        pixel_pan: 0,
-        line_compare: usize::MAX,
-    };
-    let out = unsafe { core::slice::from_raw_parts_mut(g.va as *mut u32, g.len) };
-    let native = g.format.is_native();
-    let mut cell_pixels = [0u32; CELL_W * CELL_H];
-    for i in 0..80 * 25 {
-        if shadow[i] != text[i] {
-            shadow[i] = text[i];
-            if native {
-                vga_render::render_text_cell(&frame, i % 80, i / 80, &mut out[g.origin..], g.stride);
-                continue;
-            }
-            let cell = i * 2;
-            let cell_frame = Frame {
-                mode: VgaMode::Text80x25,
-                vram: &vram[cell..cell + 2],
-                planes: &[],
-                ac: &FBCON_AC,
-                palette: frame.palette,
-                font: frame.font,
-                blink: frame.blink,
-                cga_palette: [0; 4],
-                start_offset: 0,
-                pixel_pan: 0,
-                line_compare: usize::MAX,
-            };
-            vga_render::render_text_cell(&cell_frame, 0, 0, &mut cell_pixels, CELL_W);
-            let x = (i % 80) * CELL_W;
-            let y = (i / 80) * CELL_H;
-            for row in 0..CELL_H {
-                let dst = g.origin + (y + row) * g.stride + x;
-                for col in 0..CELL_W {
-                    out[dst + col] = g.format.encode(cell_pixels[row * CELL_W + col]);
-                }
-            }
-        }
-    }
+    // From here on the linear framebuffer is simply the emulated VGA's sink.
+    // Kernel text output keeps using the same B8000 cells and VGA interface.
+    crate::vga::attach_framebuffer(framebuffer().unwrap());
 }

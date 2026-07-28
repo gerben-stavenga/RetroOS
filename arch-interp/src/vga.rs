@@ -11,23 +11,43 @@
 
 use std::sync::Mutex;
 
-/// Latest rendered frame: (width, height, 0x00RRGGBB pixels). Publish
-/// overwrites; take consumes; peek clones.
-static FRAME: Mutex<Option<(usize, usize, Vec<u32>)>> = Mutex::new(None);
+struct Mailbox {
+    ready: Option<(usize, usize, Vec<u32>)>,
+    spare: Vec<u32>,
+}
 
-/// Store a rendered frame as the latest (the present sink; CPU thread).
-pub fn publish(w: usize, h: usize, px: &[u32]) {
-    if let Ok(mut slot) = FRAME.lock() {
-        *slot = Some((w, h, px.to_vec()));
+/// Latest rendered frame plus a returned allocation for the CPU renderer.
+static FRAME: Mutex<Mailbox> = Mutex::new(Mailbox {
+    ready: None,
+    spare: Vec::new(),
+});
+
+/// Swap a completed frame into the mailbox (the present sink; CPU thread).
+pub fn publish(w: usize, h: usize, px: &mut Vec<u32>) {
+    if let Ok(mut mailbox) = FRAME.lock() {
+        std::mem::swap(px, &mut mailbox.spare);
+        let completed = std::mem::take(&mut mailbox.spare);
+        if let Some((_, _, old)) = mailbox.ready.replace((w, h, completed)) {
+            mailbox.spare = old;
+        }
     }
 }
 
 /// Take the most recently published frame, if any (the play window thread).
 pub fn take_frame() -> Option<(usize, usize, Vec<u32>)> {
-    FRAME.lock().ok()?.take()
+    FRAME.lock().ok()?.ready.take()
+}
+
+/// Return a consumed frame allocation for the CPU thread's next render.
+pub fn recycle_frame(px: Vec<u32>) {
+    if let Ok(mut mailbox) = FRAME.lock() {
+        if px.capacity() > mailbox.spare.capacity() {
+            mailbox.spare = px;
+        }
+    }
 }
 
 /// Clone the most recently published frame without consuming it (screenshots).
 pub fn peek_frame() -> Option<(usize, usize, Vec<u32>)> {
-    FRAME.lock().ok()?.clone()
+    FRAME.lock().ok()?.ready.clone()
 }

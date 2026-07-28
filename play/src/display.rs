@@ -139,6 +139,7 @@ pub fn run() -> ! {
             let _ = texture.update(None, bytes, w * 4);
             let _ = canvas.copy(&texture, None, None); // stretch to the window
             canvas.present();
+            arch::recycle_frame(fb);
         }
         std::thread::sleep(TICK);
     }

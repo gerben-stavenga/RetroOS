@@ -219,14 +219,15 @@ pub struct PcMachine {
     pub vga: VgaState,
     /// Present-path scratch, owned so the frame path allocates NOTHING per
     /// frame. `scanout` copies the live aperture into `present_scratch` and
-    /// hands back a `Frame` borrowing it, and `present_fb` receives the
-    /// rendered pixels — both sized once on the first frame of a mode and
+    /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
+    /// into `present_fb`. Both are sized once on the first frame of a mode and
     /// reused thereafter. They sit beside `vga` rather than inside it because
     /// `scanout` takes `&self` and lends the scratch out with the same
     /// lifetime, which a field of `VgaState` could not satisfy.
     pub present_scratch: alloc::vec::Vec<u8>,
     pub present_fb: alloc::vec::Vec<u32>,
-    /// Blit scratch: the palette in framebuffer format, and one output row.
+    /// Direct-display raster scratch: palette, one output row, a completed
+    /// WB shadow frame, and beam timing.
     pub present_scratch2: crate::kernel::display::Scratch,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it

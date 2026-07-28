@@ -95,6 +95,7 @@ fn main() {
                     out.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
                 }
                 let _ = std::fs::write(&ppm_path, out);
+                arch::recycle_frame(px);
             }
         });
     }
@@ -120,7 +121,7 @@ fn main() {
     // frame mailbox for the screenshot path. Only armed when a consumer
     // exists, so headless --cmd runs skip the render work entirely.
     if shot_armed {
-        lib::vga_render::set_present_sink(arch::publish_frame);
+        kernel::kernel::display::set_host_present_sink(arch::publish_frame);
     }
     if let Some(dir) = &host_dir {
         // Native host-fs backend (the hosted "punch-through"): /host (or the

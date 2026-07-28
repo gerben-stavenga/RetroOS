@@ -505,47 +505,86 @@ fn pal_rgb(palette: &[u8; 768], idx: u8) -> u32 {
     (c6to8(palette[o]) << 16) | (c6to8(palette[o + 1]) << 8) | c6to8(palette[o + 2])
 }
 
-// ── Present sink ─────────────────────────────────────────────────────────────
-//
-// The display half of the single-VGA design: the kernel emulates the VGA once
-// (register file + DAC in the DOS machine layer) and renders here; the
-// *platform* only supplies a place for pixels. Same shape as `lib::vga`'s
-// debug/flush sinks: a function pointer the platform installs once — the metal
-// boot glue points it at the GOP framebuffer blit (fbcon), the hosted binary
-// at the window/screenshot frame mailbox. No sink (e.g. legacy metal, where
-// the real card displays directly) means `present` is a no-op.
-
-static PRESENT_SINK: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
-/// Install the platform's frame sink (`fn(width, height, pixels)`).
-pub fn set_present_sink(f: fn(usize, usize, &[u32])) {
-    PRESENT_SINK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether a sink is installed — lets the renderer skip work entirely.
-pub fn present_sink_installed() -> bool {
-    PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed) != 0
-}
-
-/// Where a channel sits in the 32-bit framebuffer pixel. Lives here, with the
-/// renderer, because it is a property of the pixels rather than of any backend.
+/// Packed framebuffer storage and channel layout. Lives here, with the
+/// renderer, because it is a property of pixels rather than of any backend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PixelFormat {
+    /// Bytes occupied by one framebuffer pixel: 2, 3, or 4.
+    pub bytes_per_pixel: u8,
     pub red_pos: u8,
+    pub red_size: u8,
     pub green_pos: u8,
+    pub green_size: u8,
     pub blue_pos: u8,
+    pub blue_size: u8,
 }
 
 impl PixelFormat {
-    pub const NATIVE: PixelFormat = PixelFormat { red_pos: 16, green_pos: 8, blue_pos: 0 };
+    pub const NATIVE: PixelFormat = PixelFormat {
+        bytes_per_pixel: 4,
+        red_pos: 16,
+        red_size: 8,
+        green_pos: 8,
+        green_size: 8,
+        blue_pos: 0,
+        blue_size: 8,
+    };
 
-    /// Re-lay `0x00RRGGBB`. Called 256 times per palette change for indexed
-    /// modes — and per pixel only in direct-colour SVGA, which has no palette.
+    /// Validate packed RGB channel metadata from a boot framebuffer.
+    pub fn from_rgb(bytes_per_pixel: u8, fields: [u8; 6]) -> Option<PixelFormat> {
+        if !(2..=4).contains(&bytes_per_pixel) {
+            return None;
+        }
+        let [red_pos, red_size, green_pos, green_size, blue_pos, blue_size] = fields;
+        let channels = [
+            (red_pos, red_size),
+            (green_pos, green_size),
+            (blue_pos, blue_size),
+        ];
+        let storage_bits = bytes_per_pixel * 8;
+        let mut used = 0u32;
+        for (pos, size) in channels {
+            if size == 0 || size > 16 || pos >= storage_bits || pos + size > storage_bits {
+                return None;
+            }
+            let mask = (((1u64 << size) - 1) << pos) as u32;
+            if used & mask != 0 {
+                return None;
+            }
+            used |= mask;
+        }
+        Some(PixelFormat {
+            bytes_per_pixel,
+            red_pos,
+            red_size,
+            green_pos,
+            green_size,
+            blue_pos,
+            blue_size,
+        })
+    }
+
+    pub const fn is_native(self) -> bool {
+        self.bytes_per_pixel == 4
+            && self.red_pos == 16
+            && self.red_size == 8
+            && self.green_pos == 8
+            && self.green_size == 8
+            && self.blue_pos == 0
+            && self.blue_size == 8
+    }
+
+    /// Pack `0x00RRGGBB` into the framebuffer's little-endian pixel word.
+    /// This runs only 256 times when an indexed palette changes; keep the
+    /// uncommon channel widths obvious rather than micro-optimising them.
     pub fn encode(self, rgb: u32) -> u32 {
-        ((rgb >> 16) & 0xFF) << self.red_pos
-            | ((rgb >> 8) & 0xFF) << self.green_pos
-            | (rgb & 0xFF) << self.blue_pos
+        fn channel(value: u32, pos: u8, size: u8) -> u32 {
+            let max = (1u64 << size) - 1;
+            ((((value as u64 * max) + 127) / 255) << pos) as u32
+        }
+        channel((rgb >> 16) & 0xFF, self.red_pos, self.red_size)
+            | channel((rgb >> 8) & 0xFF, self.green_pos, self.green_size)
+            | channel(rgb & 0xFF, self.blue_pos, self.blue_size)
     }
 }
 
@@ -589,10 +628,9 @@ impl Pal {
 
 /// Render ONE source scanline into `out`, in the framebuffer's format.
 ///
-/// This is the whole renderer surface the present path needs: the caller
-/// walks source rows and copies each stretched row to the output rows it
-/// covers, so no full-frame intermediate is ever materialised and every mode
-/// takes the same path.
+/// The caller places each horizontally-stretched row directly in its compact
+/// `framebuffer_width × VGA_height` shadow. Presentation later expands those
+/// completed rows vertically with bulk copies; every VGA mode takes this path.
 ///
 /// Horizontal-stretch cursor, templated on `N = ceil(out_w / w)` — the
 /// constant overwrite width, so each pixel's run is N straight-line stores
@@ -602,8 +640,12 @@ impl Pal {
 /// for the last one. `N = 0` is the dynamic-width instance for ratios no
 /// constant was compiled for.
 struct StretchRow<'a, const N: usize> {
-    out: &'a mut [u32],
+    out: &'a mut [u8],
+    /// Byte offset of the next output run.
     o: usize,
+    /// Runtime packed-pixel width. The write count remains const-specialised;
+    /// this is only the branchless 2/3/4-byte pointer step.
+    step: usize,
     err: usize,
     base: usize,
     rem: usize,
@@ -613,20 +655,21 @@ struct StretchRow<'a, const N: usize> {
 impl<const N: usize> StretchRow<'_, N> {
     #[inline]
     fn put(&mut self, v: u32) {
-        if N == 0 {
-            self.out[self.o..self.o + self.base + 1].fill(v);
-        } else {
-            // Plain stores, deliberately: `copy_from_slice`/`fill` on a
-            // const-width slice may still lower to a memcpy/memset CALL per
-            // pixel on a size-optimized build — measured as a 2x raster
-            // regression. A counted store loop compiles to N inline stores.
-            let run = &mut self.out[self.o..self.o + N];
-            for d in run {
-                *d = v;
+        let writes = if N == 0 { self.base + 1 } else { N };
+        let mut p = self.o;
+        for _ in 0..writes {
+            // Always issue one overlapping dword store. For 16/24-bit pixels
+            // the following store replaces the excess high bytes; the shadow
+            // allocation carries guard bytes for the final store.
+            unsafe {
+                core::ptr::write_unaligned(self.out.as_mut_ptr().add(p) as *mut u32, v);
             }
+            p += self.step;
         }
         self.err += self.rem;
-        self.o += self.base + if self.err >= self.w { self.err -= self.w; 1 } else { 0 };
+        let carry = (self.err >= self.w) as usize;
+        self.err -= carry * self.w;
+        self.o += (self.base + carry) * self.step;
     }
 }
 
@@ -634,13 +677,14 @@ fn row_stretched<const N: usize>(
     frame: &Frame,
     sy: usize,
     pal: &Pal,
-    out: &mut [u32],
+    out: &mut [u8],
     w: usize,
     out_w: usize,
 ) {
     let st = &mut StretchRow::<N> {
         out,
         o: 0,
+        step: pal.fmt.bytes_per_pixel as usize,
         err: 0,
         base: out_w / w,
         rem: out_w % w,
@@ -662,13 +706,14 @@ fn row_stretched<const N: usize>(
 /// translation and horizontal stretch in one pass, no source-width
 /// intermediate. The decoders emit strictly left-to-right; a malformed
 /// frame may stop early, leaving the buffer's tail untouched.
-pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32], out_w: usize) {
+pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u8], out_w: usize) {
     let (w, h) = dimensions(frame.mode);
     if sy >= h || w == 0 || out_w < w {
         return;
     }
     let n = out_w.div_ceil(w);
-    if out.len() < out_w + n {
+    let step = pal.fmt.bytes_per_pixel as usize;
+    if !(2..=4).contains(&step) || out.len() < (out_w + n) * step + 3 {
         return;
     }
     // Constant-width instances for the ratios real panels produce (text
@@ -827,15 +872,6 @@ fn row_svga<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stretc
                 pal.fmt.encode((r << 16) | (g << 8) | b)
             }
         });
-    }
-}
-
-/// Hand a rendered frame (`0x00RRGGBB` pixels, row-major) to the platform.
-pub fn present(w: usize, h: usize, px: &[u32]) {
-    let p = PRESENT_SINK.load(core::sync::atomic::Ordering::Relaxed);
-    if p != 0 {
-        let f: fn(usize, usize, &[u32]) = unsafe { core::mem::transmute(p) };
-        f(w, h, px);
     }
 }
 
@@ -1188,22 +1224,30 @@ pub const OVERLAY_CELL_W: usize = 8;
 pub const OVERLAY_CELL_H: usize = 16;
 
 /// Fill a `rw`×`rh` rectangle at pixel (`x`,`y`) with one `0x00RRGGBB` colour,
-/// encoded through `fmt`. `out` is pitched by `stride`; `w`/`h` clip to the
-/// visible area (a GOP `stride` may exceed `w`).
+/// encoded through `fmt`. `out` is pitched by `stride` bytes; `w`/`h` clip to
+/// the visible area (a GOP pitch may exceed `w × bytes_per_pixel`).
+#[inline]
+fn overlay_store(out: &mut [u8], off: usize, value: u32, bytes: usize) {
+    if off + bytes > out.len() {
+        return;
+    }
+    let le = value.to_le_bytes();
+    out[off..off + bytes].copy_from_slice(&le[..bytes]);
+}
+
 #[allow(clippy::too_many_arguments)] // flat blit params; a rect struct would be ceremony for two callers
 pub fn overlay_fill(
-    out: &mut [u32], stride: usize, w: usize, h: usize,
+    out: &mut [u8], stride: usize, w: usize, h: usize,
     x: usize, y: usize, rw: usize, rh: usize, rgb: u32, fmt: PixelFormat,
 ) {
     let px = fmt.encode(rgb);
+    let bytes = fmt.bytes_per_pixel as usize;
     let x1 = (x + rw).min(w);
     let y1 = (y + rh).min(h);
     for yy in y..y1 {
         let base = yy * stride;
         for xx in x..x1 {
-            if base + xx < out.len() {
-                out[base + xx] = px;
-            }
+            overlay_store(out, base + xx * bytes, px, bytes);
         }
     }
 }
@@ -1213,11 +1257,12 @@ pub fn overlay_fill(
 /// right/bottom clip edge.
 #[allow(clippy::too_many_arguments)] // flat blit params; a rect struct would be ceremony for two callers
 pub fn overlay_text(
-    out: &mut [u32], stride: usize, w: usize, h: usize,
+    out: &mut [u8], stride: usize, w: usize, h: usize,
     x: usize, y: usize, s: &[u8], fg: u32, bg: u32, fmt: PixelFormat,
 ) {
     let fgp = fmt.encode(fg);
     let bgp = fmt.encode(bg);
+    let bytes = fmt.bytes_per_pixel as usize;
     let font = &crate::vga_fonts::FONT_8X16;
     for (i, &ch) in s.iter().enumerate() {
         let cx = x + i * OVERLAY_CELL_W;
@@ -1230,12 +1275,10 @@ pub fn overlay_text(
             if py >= h {
                 break;
             }
-            let base = py * stride + cx;
+            let base = py * stride + cx * bytes;
             for gx in 0..OVERLAY_CELL_W {
-                if base + gx >= out.len() {
-                    break;
-                }
-                out[base + gx] = if bits & (0x80 >> gx) != 0 { fgp } else { bgp };
+                let px = if bits & (0x80 >> gx) != 0 { fgp } else { bgp };
+                overlay_store(out, base + gx * bytes, px, bytes);
             }
         }
     }

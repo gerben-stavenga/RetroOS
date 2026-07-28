@@ -275,10 +275,10 @@ const PAD: usize = 8;
 const CELL_W: usize = vga_render::OVERLAY_CELL_W;
 const CELL_H: usize = vga_render::OVERLAY_CELL_H;
 
-/// Composite the panel onto a finished frame. `out` is pitched by `stride`,
+/// Composite the panel onto a finished frame. `out` is pitched by `stride` bytes,
 /// with `w`×`h` visible pixels in `fmt` (native for the hosted `present_fb`,
 /// `fb.format` for the GOP framebuffer). A no-op if the frame can't hold it.
-pub fn paint(out: &mut [u32], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
+pub fn paint(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
     if PICKER.load(Ordering::Relaxed) {
         paint_picker(out, stride, w, h, fmt);
         return;
@@ -318,7 +318,7 @@ pub fn paint(out: &mut [u32], stride: usize, w: usize, h: usize, fmt: PixelForma
 }
 
 /// Paint the Switch picker: one row per active task, `tid: name  S *`.
-fn paint_picker(out: &mut [u32], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
+fn paint_picker(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
     let count = PROC_COUNT.load(Ordering::Relaxed);
     let rows = count.max(1) + 2; // title + list (≥1 line) + footer
     let panel_w = COLS * CELL_W + PAD * 2;

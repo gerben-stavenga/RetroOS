@@ -119,4 +119,4 @@ pub use screendump::{enable_live as enable_live_console, request as request_vga_
 // design); this backend only carries pixels. The hosted `main` publishes
 // frames from the kernel's present sink; retroos-play takes them and blits;
 // screenshots peek. Presentation (SDL et al.) lives in the consuming binary.
-pub use vga::{peek_frame, publish as publish_frame, take_frame};
+pub use vga::{peek_frame, publish as publish_frame, recycle_frame, take_frame};

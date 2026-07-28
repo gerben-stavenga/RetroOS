@@ -109,7 +109,7 @@ fn main() {
         // Display: the kernel emulates the VGA and renders (single-VGA
         // design); install its present sink to park frames in the backend
         // mailbox the window thread blits from.
-        lib::vga_render::set_present_sink(arch::publish_frame);
+        kernel::kernel::display::set_host_present_sink(arch::publish_frame);
         if let Some(dir) = &host_dir {
             // Native host-fs backend (the hosted "punch-through"): /host is
             // served by direct std::fs calls, not byte-serial COM1. Install the

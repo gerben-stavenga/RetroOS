@@ -1738,14 +1738,17 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         crate::kernel::platform::Display::Framebuffer(fb) => Some(fb),
         _ => None,
     };
-    if vga_present() || (direct.is_none() && !vga_render::present_sink_installed()) {
+    if vga_present()
+        || (direct.is_none() && !crate::kernel::display::host_present_sink_installed())
+    {
         return;
     }
     let prof = crate::kernel::startup::profile_enabled();
     if let Some(fb) = direct {
-        // Direct framebuffer: the raster beam. Bounded work per pass, every
-        // pixel repainted every period — pacing lives in `display::raster`;
-        // the pre-gate skips the scanout when no band is due.
+        // Direct framebuffer: the emulated raster paints a cached shadow in
+        // bounded bands, then publishes the completed shadow at vertical
+        // blank. The physical GOP scanout is asynchronous, so intermediate
+        // bands must never be made visible there.
         let period_ms: u64 = if fb.slow { 50 } else { 14 };
         if !crate::kernel::display::raster_pending(&pc.present_scratch2, now_ticks, period_ms) {
             return;
@@ -1755,19 +1758,24 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // grow once, on the first frame of a mode.
         let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
         let p1 = if prof { machine.rdtsc() } else { 0 };
-        let (copied, wrapped) = crate::kernel::display::raster(
+        let wrapped = crate::kernel::display::raster(
             &mut pc.present_scratch2, &fb, &frame, now_ticks, period_ms);
-        // The F12 monitor composites over whatever the beam just painted, so
-        // it stays intact across the sweep in any video mode.
-        if copied > 0 && crate::kernel::osd::is_open() {
-            let out = unsafe {
-                core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
-            };
-            crate::kernel::osd::paint(out, fb.stride, fb.width, fb.height, fb.format);
-        }
+        let mut copied = 0;
         if wrapped {
+            let (vga_h, stride, shadow) =
+                crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
+                    .expect("completed VGA raster has no shadow");
+            if crate::kernel::osd::is_open() {
+                crate::kernel::osd::paint(
+                    shadow,
+                    stride,
+                    fb.width,
+                    vga_h,
+                    fb.format,
+                );
+            }
+            copied = crate::kernel::display::present(&fb, vga_h, shadow);
             crate::kernel::startup::bill_present();
-            crate::kernel::display::present();
         }
         if prof {
             let p4 = machine.rdtsc();
@@ -1793,9 +1801,13 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     vga_render::render(&frame, fb);
     if crate::kernel::osd::is_open() {
         // `render` writes native 0x00RRGGBB into a tightly-packed w×h buffer.
-        crate::kernel::osd::paint(fb, w, w, h, vga_render::PixelFormat::NATIVE);
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(fb.as_mut_ptr() as *mut u8, fb.len() * 4)
+        };
+        crate::kernel::osd::paint(bytes, w * 4, w, h, vga_render::PixelFormat::NATIVE);
     }
-    vga_render::present(w, h, fb);
+    pc.present_fb.truncate(need);
+    crate::kernel::display::present_host(w, h, &mut pc.present_fb);
     if prof {
         let p4 = machine.rdtsc();
         crate::kernel::startup::bill_display(

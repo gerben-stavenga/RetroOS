@@ -2,7 +2,7 @@
 //! binary (the test harness supplies the global allocator the `#![no_std]` lib
 //! lacks), exercising the pure render path on synthetic VGA state.
 
-use lib::vga_render::{self, Frame, VgaMode};
+use lib::vga_render::{self, Frame, PixelFormat, VgaMode};
 
 /// 6-bit DAC component → 8-bit, matching the renderer's expansion.
 fn c6to8(v: u8) -> u32 {
@@ -156,4 +156,63 @@ fn fallback_palette_has_ega_colors_first() {
     // Entry 15 is white (63,63,63); entry 1 is blue (0,0,42).
     assert_eq!((pal[15 * 3], pal[15 * 3 + 1], pal[15 * 3 + 2]), (63, 63, 63));
     assert_eq!((pal[3], pal[3 + 1], pal[3 + 2]), (0, 0, 42));
+}
+
+#[test]
+fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
+    let mut palette = [0u8; 768];
+    for i in 0..256usize {
+        palette[i * 3] = (i & 63) as u8;
+        palette[i * 3 + 1] = ((i * 3) & 63) as u8;
+        palette[i * 3 + 2] = ((i * 5) & 63) as u8;
+    }
+    let vram: Vec<u8> = (0..320).map(|x| (x & 255) as u8).collect();
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: VgaMode::Mode13h,
+        vram: &vram,
+        planes: &[],
+        ac: &ac,
+        palette: &palette,
+        font: &[],
+        blink: false,
+        cga_palette: [0; 4],
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+    };
+    let formats = [
+        PixelFormat::from_rgb(2, [11, 5, 5, 6, 0, 5]).unwrap(),
+        PixelFormat::from_rgb(3, [16, 8, 8, 8, 0, 8]).unwrap(),
+        PixelFormat::NATIVE,
+    ];
+    let out_w = 643usize; // non-integral 643/320 exercises the DDA carry
+    for fmt in formats {
+        let step = fmt.bytes_per_pixel as usize;
+        let n = out_w.div_ceil(320);
+        let mut out = vec![0u8; (out_w + n) * step + 3];
+        let mut pal = vga_render::Pal::new();
+        let mut cache = [0u8; 768];
+        pal.sync(&palette, fmt, &mut cache);
+        vga_render::render_row_stretched(&frame, 0, &pal, &mut out, out_w);
+
+        let (base, rem) = (out_w / 320, out_w % 320);
+        let (mut xout, mut err) = (0usize, 0usize);
+        for (x, &idx) in vram.iter().enumerate() {
+            err += rem;
+            let carry = (err >= 320) as usize;
+            err -= carry * 320;
+            let run = base + carry;
+            let expected = fmt.encode(pal_rgb(&palette, idx)).to_le_bytes();
+            for p in xout..xout + run {
+                assert_eq!(
+                    &out[p * step..p * step + step],
+                    &expected[..step],
+                    "{step}-byte output, source {x}, output {p}"
+                );
+            }
+            xout += run;
+        }
+        assert_eq!(xout, out_w);
+    }
 }

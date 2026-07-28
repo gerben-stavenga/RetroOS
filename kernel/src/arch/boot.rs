@@ -170,6 +170,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         kernel_high_page,
     );
 
+    // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
+    // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
+    // so the demand-paged heap can safely be enabled here.
+    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
+
     lib::screenln!(screen, "Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
     lib::screenln!(screen, "Memory regions: {}", mmap_count);
@@ -238,11 +243,6 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // the rest of the kernel's life (startup never returns).
     let mut machine = arch::Metal;
 
-    // Install the kernel heap now that paging, phys_mm, and the #PF page-backing
-    // are all up — just before startup begins allocating (today `new_arch()`
-    // above does not allocate, matching the previous order where startup() did
-    // this as its first step). Hosted installs std's allocator instead.
-    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
     lib::screenln!(screen, "Heap base: {:#x}", arch::heap_base());
 
     crate::kernel::startup::startup(&mut machine, &config, screen);

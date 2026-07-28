@@ -282,7 +282,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
         // VGA device to answer, and a metal machine that boots this way does.
         let display = if let Some(fb) = (env.framebuffer)() {
             Display::Framebuffer(fb)
-        } else if lib::vga_render::present_sink_installed() {
+        } else if crate::kernel::display::host_present_sink_installed() {
             Display::HostWindow
         } else if env.is_metal {
             Display::VgaCard

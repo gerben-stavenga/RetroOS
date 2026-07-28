@@ -1,13 +1,12 @@
 //! Where pixels go, and how a frame gets there.
 //!
-//! The backend supplies a [`Framebuffer`] — an address, a stride and a channel
+//! The backend supplies a [`Framebuffer`] — an address, a pitch and a channel
 //! layout, discovered once by the platform probe — and the kernel writes into
-//! it. The only per-frame call back to the backend is [`present`]: "frame
-//! finished, show it" (a WC drain on metal, a window upload on hosted).
+//! it. [`present`] vertically expands a completed packed metal shadow and
+//! drains WC stores; [`present_host`] transfers a native frame to a window.
 //!
-//! Always 32 bits per pixel; only the channel LAYOUT varies, and even that is
-//! consumed once per palette change rather than per pixel, because the palette
-//! table is built in the framebuffer's own format.
+//! Pixels may occupy 2, 3, or 4 bytes. Channel layout and width are consumed
+//! when the 256-entry palette is built, not in the per-pixel VGA decoder.
 
 pub use lib::vga_render::PixelFormat;
 
@@ -24,8 +23,8 @@ impl core::fmt::Debug for Framebuffer {
 pub struct Framebuffer {
     /// Kernel-virtual address of pixel (0,0).
     pub va: usize,
-    /// `u32`s per row (the pitch, which may exceed `width`).
-    pub stride: usize,
+    /// Bytes per device row (the pitch, which may exceed width × pixel size).
+    pub pitch: usize,
     pub width: usize,
     pub height: usize,
     pub format: PixelFormat,
@@ -42,30 +41,66 @@ pub struct Framebuffer {
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
 /// like the portio/hostfs/socket hooks.
-static mut PRESENT: fn() = || {};
+static mut PRESENT_HOOK: fn() = || {};
 
 pub fn set_present_hook(f: fn()) {
-    unsafe { PRESENT = f };
+    unsafe { PRESENT_HOOK = f };
 }
 
-pub fn present() {
-    (unsafe { PRESENT })();
+/// Complete writes to the platform display. VGA text and the timed VGA raster
+/// both end here; the backend decides whether that means an `sfence`, a window
+/// publication, or nothing.
+pub fn finish_present() {
+    (unsafe { PRESENT_HOOK })();
 }
 
-/// Scratch for the raster: the palette in framebuffer format, one rendered
-/// source row, one full device row (borders + scaled content), and the beam.
+/// Largest centered 4:3 VGA picture that fits a physical framebuffer.
+pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
+    if width * 3 >= height * 4 {
+        ((height * 4 / 3).min(width), height)
+    } else {
+        (width, (width * 3 / 4).min(height))
+    }
+}
+
+/// Hosted completed-frame sink. This lives in the allocating kernel rather
+/// than `lib::vga_render`, which is also linked by the allocator-free bootloader.
+static HOST_PRESENT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_host_present_sink(f: fn(usize, usize, &mut alloc::vec::Vec<u32>)) {
+    HOST_PRESENT.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn host_present_sink_installed() -> bool {
+    HOST_PRESENT.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
+pub fn present_host(w: usize, h: usize, pixels: &mut alloc::vec::Vec<u32>) {
+    let p = HOST_PRESENT.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn(usize, usize, &mut alloc::vec::Vec<u32>) =
+            unsafe { core::mem::transmute(p) };
+        f(w, h, pixels);
+    }
+}
+
+/// Scratch for the raster: the palette in framebuffer format, a compact
+/// completed-frame surface, and the beam.
 pub struct Scratch {
     pal: lib::vga_render::Pal,
     pal_cache: [u8; 768],
-    row: alloc::vec::Vec<u32>,
-    /// Geometry the beam is armed for `(w, h, out_w, out_h)`; any change
+    /// Write-back shadow with one framebuffer-width row per VGA source row.
+    /// The emulated beam paints here a band at a time; vertical stretching is
+    /// deferred to the completed-frame GOP blit.
+    surface: alloc::vec::Vec<u8>,
+    /// Geometry the beam is armed for
+    /// `(w, h, out_w, out_h, panel_w, panel_h)`; any change
     /// restarts the sweep at the top — a mode switch repaints everything,
     /// borders included, within one refresh period by construction.
-    geo: (usize, usize, usize, usize),
-    /// Beam position: next source row, and its output-row Bresenham state.
+    geo: (usize, usize, usize, usize, usize, usize),
+    /// Beam position: next source row.
     sy: usize,
-    oy: usize,
-    yerr: usize,
     /// Fractional row credit: accrues `elapsed_ms × h`, spends `period_ms`
     /// per source row, capped at one frame of debt (a long stall skips
     /// frames instead of fast-forwarding the beam).
@@ -84,11 +119,9 @@ impl Scratch {
         Scratch {
             pal: lib::vga_render::Pal::new(),
             pal_cache: [0; 768],
-            row: alloc::vec::Vec::new(),
-            geo: (0, 0, 0, 0),
+            surface: alloc::vec::Vec::new(),
+            geo: (0, 0, 0, 0, 0, 0),
             sy: 0,
-            oy: 0,
-            yerr: 0,
             acc: 0,
             last_ms: 0,
         }
@@ -120,8 +153,7 @@ retroos_fb_copy32:
      * The kernel swaps FPU/SSE state only at thread switch, so the guest's
      * live XMM registers are resident here: xmm0 is spilled around the
      * copy. Head loop aligns the destination to 16 (movntdq requires it);
-     * the sfence keeps the NT stores ordered before the caller's
-     * present-time WC drain. */
+     * the one end-of-frame present sfence drains all row copies together. */
 retroos_fb_copy32_wide:
     push esi
     push edi
@@ -151,7 +183,6 @@ retroos_fb_copy32_wide:
 4:  rep movsd
     movdqu xmm0, [esp]
     add esp, 16
-    sfence
     pop edi
     pop esi
     ret
@@ -165,23 +196,38 @@ unsafe extern "C" {
     fn retroos_fb_copy32_wide(dst: *mut u32, src: *const u32, len: usize);
 }
 
-/// Copy framebuffer pixels in their native 32-bit unit. The freestanding
-/// runtime's generic `memcpy` is `rep movsb`; using MOVSD here quarters the
-/// architectural transfer count and lets x86/QEMU recognize the bulk store.
+/// Copy one packed framebuffer row. Bulk traffic still moves in dwords; a
+/// 16/24-bit row merely has a short 0..3-byte tail.
 ///
 /// `wide` selects 16-byte non-temporal stores (real hardware: ERMS fast
 /// strings never engage on the WC framebuffer, so rep movsd issues one
 /// 4-byte store per cycle — the wide path quarters the issue count). Under
 /// TCG (`fb.slow`) rep movsd IS the fast path — one helper call — so the
-/// caller keeps `wide` off there.
+/// caller keeps `wide` off there. This deliberately does not fence each row:
+/// the caller's single end-of-frame [`present`] drains the whole blit.
 #[inline]
-unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize, wide: bool) {
+unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
+    let mut d = dst;
+    let mut s = src;
+    let mut left = len;
+
+    // The wide assembly advances in dwords while aligning to 16, so feed it an
+    // already-aligned destination: packed 16/24-bit pitches need byte heads.
+    if wide {
+        while left != 0 && d as usize & 15 != 0 {
+            unsafe { *d = *s };
+            d = unsafe { d.add(1) };
+            s = unsafe { s.add(1) };
+            left -= 1;
+        }
+    }
+    let dwords = left / 4;
     #[cfg(target_arch = "x86")]
     unsafe {
-        if wide {
-            retroos_fb_copy32_wide(dst, src, len);
+        if wide && dwords != 0 {
+            retroos_fb_copy32_wide(d as *mut u32, s as *const u32, dwords);
         } else {
-            retroos_fb_copy32(dst, src, len);
+            retroos_fb_copy32(d as *mut u32, s as *const u32, dwords);
         }
     }
     #[cfg(target_arch = "x86_64")]
@@ -189,12 +235,68 @@ unsafe fn copy_pixels(dst: *mut u32, src: *const u32, len: usize, wide: bool) {
         let _ = wide; // 64-bit metal: measure before adding the SSE path
         core::arch::asm!(
             "rep movsd",
-            inout("rcx") len => _,
-            inout("rsi") src => _,
-            inout("rdi") dst => _,
+            inout("rcx") dwords => _,
+            inout("rsi") s => _,
+            inout("rdi") d => _,
             options(nostack)
         );
     }
+    let done = dwords * 4;
+    d = unsafe { d.add(done) };
+    s = unsafe { s.add(done) };
+    left -= done;
+    while left != 0 {
+        unsafe { *d = *s };
+        d = unsafe { d.add(1) };
+        s = unsafe { s.add(1) };
+        left -= 1;
+    }
+}
+
+/// Publish a completed horizontally-stretched VGA shadow. Vertical expansion
+/// is whole-row copying only; format conversion already happened in the
+/// distributed raster pass.
+pub fn present(fb: &Framebuffer, vga_height: usize, shadow: &[u8]) -> usize {
+    let step = fb.format.bytes_per_pixel as usize;
+    let row_bytes = fb.width * step;
+    if vga_height == 0 || shadow.len() < row_bytes * vga_height {
+        return 0;
+    }
+    let (_, out_h) = fit_vga(fb.width, fb.height);
+    let by = (fb.height - out_h) / 2;
+    let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
+    let out = unsafe {
+        core::slice::from_raw_parts_mut(fb.va as *mut u8, fb.pitch * fb.height)
+    };
+
+    for y in 0..by {
+        unsafe { core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.pitch), 0, row_bytes) };
+    }
+    let mut oy = 0usize;
+    let mut yerr = 0usize;
+    for sy in 0..vga_height {
+        yerr += yrem;
+        let carry = (yerr >= vga_height) as usize;
+        let rows = ybase + carry;
+        yerr -= carry * vga_height;
+        let src = &shadow[sy * row_bytes..(sy + 1) * row_bytes];
+        for _ in 0..rows {
+            unsafe {
+                copy_bytes(
+                    out.as_mut_ptr().add((by + oy) * fb.pitch),
+                    src.as_ptr(),
+                    row_bytes,
+                    fb.wide,
+                );
+            }
+            oy += 1;
+        }
+    }
+    for y in by + out_h..fb.height {
+        unsafe { core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.pitch), 0, row_bytes) };
+    }
+    finish_present();
+    fb.width * fb.height
 }
 
 /// Vertical-blank length in beam steps (source rows). The 70 Hz VGA CRTC
@@ -235,67 +337,62 @@ pub fn raster_pending(s: &Scratch, now_ms: u64, period_ms: u64) -> bool {
 /// Advance the raster beam and paint the band of device rows now due.
 ///
 /// The frame is presented the way the hardware presented it: a beam sweeps
-/// the display top to bottom once per refresh period, re-rendering every
-/// pixel from the live VGA state as it passes — scaled content and borders
-/// alike. There is no diff, no damage tracking and no idle path: correctness
-/// never depends on knowing what changed (nothing can leak through a crash
-/// or a mode switch), and the work per call is bounded, so the event loop
-/// never stalls on a frame regardless of panel size. The games' own
-/// present model (update VRAM during vertical retrace) composes with this
-/// exactly as on a real VGA.
+/// a cached shadow top to bottom once per refresh period, re-rendering every
+/// pixel from the live VGA state as it passes. At vertical blank the completed
+/// shadow is copied to the GOP framebuffer in one burst. GOP scanout has no
+/// portable vblank/page-flip interface and runs on a clock unrelated to this
+/// emulated beam; exposing each software band directly made the physical
+/// display sample a ladder of different update times. The single publication
+/// keeps the expensive render work distributed while reducing that race to
+/// the shortest operation GOP permits.
 ///
 /// DOS modes are authored for a 4:3 display with non-square pixels, so the
 /// source is fitted to the framebuffer's 4:3 rectangle: 320x200 stretched
 /// 6/5 tall, 320x240 square. One pass per SOURCE row: the renderer draws the
-/// row in the framebuffer's pixel format, it is stretched once into a full
-/// device row (black borders at both ends), and that row is copied to every
-/// output row it covers — run lengths from a Bresenham accumulator.
+/// row in the framebuffer's pixel format and stretches it horizontally into
+/// the compact shadow (black borders included). The completion blit copies
+/// each source row to its vertically stretched output run, using a Bresenham
+/// accumulator for non-integral scale factors.
 ///
-/// Returns `(pixels_written, wrapped)`; `wrapped` marks the beam finishing a
-/// frame — the vertical retrace — where the caller presents.
+/// Returns whether a coherent shadow completed as the beam entered vertical
+/// retrace. Publication is deliberately left to the event-loop caller, which
+/// owns kernel composition such as the OSD.
 pub fn raster(
     s: &mut Scratch,
     fb: &Framebuffer,
     frame: &lib::vga_render::Frame,
     now_ms: u64,
     period_ms: u64,
-) -> (usize, bool) {
+) -> bool {
     let (w, h) = lib::vga_render::dimensions(frame.mode);
     if w == 0 || h == 0 {
-        return (0, false);
+        return false;
     }
-    let (out_w, out_h) = if fb.width * 3 >= fb.height * 4 {
-        ((fb.height * 4 / 3).min(fb.width), fb.height)
-    } else {
-        (fb.width, (fb.width * 3 / 4).min(fb.height))
-    };
+    let (out_w, out_h) = fit_vga(fb.width, fb.height);
     if out_w < w || out_h < h {
-        return (0, false); // no downscaling path
+        return false; // no downscaling path
     }
 
-    let (ybase, yrem) = (out_h / h, out_h % h);
     let bx = (fb.width - out_w) / 2; // left border width
-    let by = (fb.height - out_h) / 2; // top border height
-    // `render_row_stretched` overwrites a constant ceil(out_w/w) run per
-    // source pixel; the buffer carries that much slack past the content.
-    let slack = out_w.div_ceil(w);
+    let step = fb.format.bytes_per_pixel as usize;
+    let row_bytes = fb.width * step;
+    // Constant-N stretching and overlapping dword pixel stores may run past
+    // the last logical pixel. Intermediate rows spill into rows later
+    // repainted; this one guard protects the final row.
+    let guard = out_w.div_ceil(w) * step + 3;
 
-    if s.geo != (w, h, out_w, out_h) || s.row.len() != out_w + slack {
-        s.geo = (w, h, out_w, out_h);
-        s.row.clear();
-        s.row.resize(out_w + slack, 0);
+    let geo = (w, h, out_w, out_h, fb.width, fb.height);
+    if s.geo != geo
+        || s.surface.len() != row_bytes * h + guard
+    {
+        s.geo = geo;
+        s.surface.clear();
+        s.surface.resize(row_bytes * h + guard, 0);
         s.sy = 0;
-        s.oy = 0;
-        s.yerr = 0;
         s.acc = 0;
         s.last_ms = now_ms;
-        // Mode switch: reclaim the whole panel ONCE — pillarbox bars and
-        // letterbox bands included, whatever the previous mode or a console
-        // print left there. From here the sweep copies only the picture
-        // span, so the bars cost nothing per frame.
-        unsafe {
-            core::ptr::write_bytes(fb.va as *mut u32, 0, fb.stride * fb.height);
-        }
+        // The zeroed shadow reclaims pillarbox/letterbox bars on the first
+        // completed frame without exposing a half-cleared mode switch.
     }
 
     // Step credit from elapsed virtual time: a sweep is `h` painted rows
@@ -309,7 +406,7 @@ pub fn raster(
     let due = (s.acc / period_ms) as usize;
     let paint = due.min((h / 8).max(1));
     if paint == 0 {
-        return (0, false);
+        return false;
     }
     s.acc -= paint as u64 * period_ms;
 
@@ -317,10 +414,6 @@ pub fn raster(
     // across the sweep exactly like the raster effects it was written for.
     s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
 
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(fb.va as *mut u32, fb.stride * fb.height)
-    };
-    let mut copied = 0usize;
     let mut wrapped = false;
     for _ in 0..paint {
         if s.sy >= h {
@@ -329,28 +422,40 @@ pub fn raster(
             s.sy += 1;
             if s.sy == h + vb {
                 s.sy = 0;
-                s.oy = 0;
-                s.yerr = 0;
             }
             continue;
         }
-        lib::vga_render::render_row_stretched(frame, s.sy, &s.pal, &mut s.row, out_w);
-        s.yerr += yrem;
-        let rows = ybase + if s.yerr >= h { s.yerr -= h; 1 } else { 0 };
-        for _ in 0..rows {
-            let d = (by + s.oy) * fb.stride + bx;
-            unsafe {
-                copy_pixels(out.as_mut_ptr().add(d), s.row.as_ptr(), out_w, fb.wide);
-            }
-            copied += out_w;
-            s.oy += 1;
-        }
+        let row = s.sy * row_bytes;
+        // Reclaim this row's borders and any overlapping-store tail from the
+        // preceding row before painting its content.
+        s.surface[row..row + row_bytes].fill(0);
+        let d = row + bx * step;
+        lib::vga_render::render_row_stretched(
+            frame,
+            s.sy,
+            &s.pal,
+            &mut s.surface[d..],
+            out_w,
+        );
         s.sy += 1;
         if s.sy == h {
-            // Frame complete: the beam enters vertical blank (the retrace
-            // 0x3DA now reports) and the caller presents.
+            // Frame complete: the beam enters vertical blank. The event loop
+            // may now composite kernel UI before publishing this shadow.
             wrapped = true;
         }
     }
-    (copied, wrapped)
+    wrapped
+}
+
+/// The completed packed shadow owned by a raster scratch. Valid for
+/// composition/publication when [`raster`] has just returned `true`.
+pub fn completed_shadow(s: &mut Scratch) -> Option<(usize, usize, &mut [u8])> {
+    let h = s.geo.1;
+    let width = s.geo.4;
+    let stride = width.checked_mul(s.pal.fmt.bytes_per_pixel as usize)?;
+    let len = stride.checked_mul(h)?;
+    if h == 0 || s.surface.len() < len {
+        return None;
+    }
+    Some((h, stride, &mut s.surface[..len]))
 }
