@@ -200,10 +200,27 @@ pub fn early(info: &arch::MultibootInfo) -> bool {
 /// Map the framebuffer and start rendering. Called once paging, phys_mm and
 /// the #PF handler are up (the mapping writes demand-allocate page tables),
 /// still at ring 0 — so `paging2` is called directly, not via arch calls.
+/// Multiboot `framebuffer_type`: 0 = indexed, 1 = RGB, 2 = EGA text.
+const FB_TYPE_RGB: u8 = 1;
+const FB_TYPE_EGA_TEXT: u8 = 2;
+
 pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
-    if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0 || info.framebuffer_type != 1 {
+    // No framebuffer offered at all (our own legacy bootloader), or the loader
+    // honoured the header's EGA-text request (GRUB on a legacy BIOS, which
+    // reports type 2 with addr 0xB8000). Either way the card owns the panel and
+    // there is nothing here to drive — NOT a failure.
+    if info.flags & arch::MULTIBOOT_INFO_FRAMEBUFFER == 0
+        || info.framebuffer_type == FB_TYPE_EGA_TEXT
+    {
         return;
     }
+    // Past this point a LINEAR framebuffer was handed over: the loader has put
+    // the display somewhere only we can paint, so failing to render into it
+    // means no display at all. Panicking is the honest outcome — returning
+    // early would leave `platform::probe` unable to distinguish "no framebuffer
+    // offered" from "offered but unusable", and it would then classify a
+    // framebuffer machine as `VgaCard`/`NativeBios` and call ROM video services
+    // that cannot paint this panel. Accept more formats here to fix a panic.
     let addr = info.framebuffer_addr;
     let pitch = info.framebuffer_pitch as usize;
     let width = info.framebuffer_width as usize;
@@ -218,16 +235,12 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         "fbcon: GOP {}x{} pitch={} bpp={} R{}/{} G{}/{} B{}/{} addr={:#x}",
         width, height, pitch, info.framebuffer_bpp, rp, rs, gp, gs, bp, bs, addr
     );
-    let Some(format) = PixelFormat::from_multiboot(info) else {
-        lib::screenln!(
-            screen,
-            "fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — no display",
-            info.framebuffer_bpp, rp, rs, gp, gs, bp, bs
-        );
-        // Blind-debug signal: a machine with no debug port shows nothing at
-        // all otherwise. Map just the first stripe of the framebuffer and
-        // fill it with 0xFF bytes — white-ish on any channel order or depth
-        // — so "framebuffer handed over but format rejected" is visible.
+    // Blind-debug signal, painted BEFORE we panic: a machine with no debug port
+    // and no usable console shows nothing at all otherwise. Map the first
+    // stripe of the framebuffer and fill it with 0xFF — white-ish on any
+    // channel order or depth — so "framebuffer handed over but unusable" is
+    // visible even though the panic message below will not be.
+    let blind_signal = || {
         let stripe_bytes = (pitch * 32).min(1 << 20);
         let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes).div_ceil(PAGE_SIZE);
         for i in 0..pages {
@@ -241,11 +254,21 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         unsafe {
             core::slice::from_raw_parts_mut(base as *mut u8, stripe_bytes).fill(0xFF);
         }
-        return;
+    };
+    if info.framebuffer_type != FB_TYPE_RGB {
+        blind_signal();
+        panic!("fbcon: framebuffer type {} unsupported (need {} = RGB)",
+            info.framebuffer_type, FB_TYPE_RGB);
+    }
+    let Some(format) = PixelFormat::from_multiboot(info) else {
+        blind_signal();
+        panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need 32bpp",
+            info.framebuffer_bpp, rp, rs, gp, gs, bp, bs);
     };
     if width < TEXT_W || height < TEXT_H {
-        lib::screenln!(screen, "fbcon: framebuffer {}x{} too small — no display", width, height);
-        return;
+        blind_signal();
+        panic!("fbcon: framebuffer {}x{} smaller than the {}x{} text console",
+            width, height, TEXT_W, TEXT_H);
     }
 
     // Map the framebuffer into the FB window. A linear framebuffer wants
