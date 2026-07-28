@@ -55,8 +55,10 @@ pub enum Host {
 /// re-derived piecemeal by render/console/IOPB code.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Display {
-    /// A real VGA card answered the SEQ-register probe: guests program the
-    /// hardware directly (passthrough port window); console = VGA text.
+    /// A real VGA card drives the panel, scanning out its own memory: metal
+    /// that booted in text mode with no framebuffer handed over. Guests
+    /// program the hardware directly (passthrough port window); console = VGA
+    /// text; the ROM's video services are authoritative (see [`Firmware`]).
     VgaCard,
     /// No card, but the loader handed over a linear framebuffer (UEFI/GOP) —
     /// or a hosted window supplied one. The emulated VGA blits into it; the
@@ -262,37 +264,59 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
     let env = host_env();
     let p = {
         // Display resolution, unified across backends by precedence:
-        //   fbcon → present-sink → VGA card → headless.
-        // Each predicate is false on the backends it can't apply to (a hosted
-        // run's `fbcon_active` hook returns false and no real VGA card answers
-        // its port bus; a metal run installs no window present sink), so one
-        // ordered chain covers both. A GOP linear framebuffer (fbcon active)
-        // wins unconditionally — even when a legacy VGA card also answers its
-        // I/O ports, the GOP framebuffer, not the dead legacy register file,
-        // drives the panel (a UEFI laptop mislabelled `VgaCard` painted blank).
+        //   fbcon → present-sink → metal ⇒ VGA card, else headless.
+        //
+        // A GOP linear framebuffer (fbcon active) wins: even when a legacy VGA
+        // card also answers its I/O ports, the framebuffer — not the dead
+        // legacy register file — drives the panel (a UEFI laptop mislabelled
+        // `VgaCard` painted blank). `fbcon::init` panics rather than declining
+        // a linear framebuffer it cannot render into, so reaching this point
+        // with no framebuffer means none was OFFERED, not that one was
+        // rejected: the loader left us in VGA text mode.
+        //
+        // Which then makes the last step a fact about the backend, not a probe.
+        // Metal with no framebuffer and no present sink is a legacy PC that
+        // booted in text mode — it HAS a VGA card, by construction. The old
+        // `vga_card_answers()` (write the SEQ index, read it back) only ever
+        // confirmed what `is_metal` already implied: the hosted port bus has no
+        // VGA device to answer, and a metal machine that boots this way does.
         let display = if let Some(fb) = (env.framebuffer)() {
             Display::Framebuffer(fb)
         } else if lib::vga_render::present_sink_installed() {
             Display::HostWindow
-        } else if vga_card_answers() {
+        } else if env.is_metal {
             Display::VgaCard
         } else {
             Display::Headless
         };
 
-        // Every legacy BIOS has a far-JMP (0xEA) at the reset vector
-        // F000:FFF0. Only metal can probe it: `LOW_MEM_BASE` is a real
-        // kernel-mapped window there, but on the hosted backend it is a GUEST
-        // linear address — dereferencing it as a host pointer would SIGSEGV.
-        // A hosted run has no legacy ROM anyway, so it is always Substitute.
-        let firmware = if env.is_metal {
-            let reset_vector =
-                unsafe { core::ptr::read_volatile((crate::LOW_MEM_BASE + 0xFFFF0) as *const u8) };
-            if reset_vector == 0xEA { Firmware::NativeBios } else { Firmware::Substitute }
+        // Who owns the IVT follows from WHO DRIVES THE DISPLAY — not from a
+        // probe of the ROM. A real VGA card scanning out its own memory IS the
+        // legacy PC: such a machine has a ROM, and its video services are
+        // authoritative precisely because the card the ROM programs is the
+        // panel. That is also why we need it — the ROM drives the modes.
+        //
+        // Every other display path needs the substitute BIOS, and `install`
+        // is all-or-nothing (all 256 IVT slots), so this is one verdict:
+        //   * Framebuffer / HostWindow — the panel is OURS to paint from the
+        //     emulated `VgaState`. A ROM INT 10h here would faithfully mode-set
+        //     a card that is not the display and write VRAM nothing renders
+        //     from: the guest sees a frozen screen. The ROM must not own 10h,
+        //     hence not the IVT.
+        //   * Headless — the hosted backend, whose zeroed guest RAM has no ROM
+        //     to call in the first place.
+        //
+        // This replaced sniffing for the far-JMP (0xEA) at the reset vector
+        // F000:FFF0. That inferred "a ROM exists", which is neither what the
+        // consumer needs nor reliable: it is one opcode byte against arbitrary
+        // firmware code (OVMF has `0F 20 C0 A8 01` there), and it answered
+        // wrongly for a legacy-booted machine handed a framebuffer — real ROM
+        // present, but its video services still not authoritative.
+        let firmware = if matches!(display, Display::VgaCard) {
+            Firmware::NativeBios
         } else {
             Firmware::Substitute
         };
-
 
         let vga_readback = matches!(display, Display::VgaCard) && vga_readback_answers();
 
@@ -417,20 +441,6 @@ fn probe_audio<A: crate::Arch>(machine: &mut A, card: &mut Option<crate::kernel:
 
 
 
-
-/// Is a real VGA card on the bus? Write the SEQ index register and read it
-/// back — an absent ISA-bus port reads 0xFF (so a hosted run, whose port bus
-/// has no VGA card, answers false and falls through to Headless/HostWindow).
-fn vga_card_answers() -> bool {
-    use crate::kernel::portio::{inb, outb};
-    let saved = inb(0x3C4);
-    outb(0x3C4, 0x02);
-    let present = inb(0x3C4) == 0x02;
-    if present {
-        outb(0x3C4, saved);
-    }
-    present
-}
 
 /// Cirrus-style save/restore readbacks: CR22 (data latches), CR24 (AC
 /// flip-flop), CR26 (AC index). Probed FUNCTIONALLY — toggle the AC
