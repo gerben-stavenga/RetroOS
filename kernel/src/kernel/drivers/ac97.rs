@@ -74,13 +74,13 @@ const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
 /// 0..15, and the bus master replays them when its index runs past LVI — an
 /// audible ~ring-length echo. 32 distinct buffers, no mirror.
 const NUM_BUF: usize = 32;
-// 1 KB = 256 stereo frames ≈ 5.8 ms @ 44.1 kHz. This is the completion-IRQ
+// 2 KB = 512 stereo frames ≈ 11.6 ms @ 44.1 kHz. This is the completion-IRQ
 // granularity (one interrupt per buffer), NOT the pipe depth — the pipe is the
-// universal `sound::min_fill`. Kept ≤ half the pipe so ≥ 2 buffers are queued
-// (double-buffered event-driven refill).
-const BUF_BYTES: usize = 0x400;
-/// Prefill this many buffers before starting the bus master, so the double-
-/// buffered pipe (min_fill = 2) is full at stream start.
+// universal `sound::min_fill`. A 30-ms pipe keeps about 2.6 buffers queued,
+// leaving a complete-buffer refill margin while halving the old 256-frame
+// completion-IRQ rate.
+const BUF_BYTES: usize = 0x800;
+/// Prefill two complete buffers before starting the bus master.
 const PRIME_BUFS: usize = 2;
 
 struct Ac97 {

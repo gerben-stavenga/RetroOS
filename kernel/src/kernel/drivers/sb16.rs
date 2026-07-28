@@ -6,8 +6,9 @@
 //! dispatches here when the platform probe found a real SB16 (`Audio::SbSink`).
 //!
 //! It drives the real DSP for **16-bit signed-stereo auto-init DMA** on the ISA
-//! 8237 (channel 5) — the SB16's own double-buffer scheme, where each completed
-//! block raises **IRQ 5**. The interrupt wakes the event-driven audio track;
+//! 8237 (channel 5). The DMA region is a circular ring divided into completion
+//! blocks; each completed block raises **IRQ 5**. The interrupt wakes the
+//! event-driven audio track;
 //! `on_irq` then reads the live 8237 cursor, so delayed/coalesced delivery does
 //! not turn an event count into a false playback position.
 //!
@@ -37,11 +38,7 @@ const CMD_SPEAKER_ON: u8 = 0xD1;
 const CMD_SET_RATE_OUT: u8 = 0x41; // output rate, big-endian 16-bit
 const CMD_16BIT_AUTO_OUT: u8 = 0xB6; // 16-bit, auto-init, FIFO, D/A
 const CMD_HALT_AUTO_16: u8 = 0xD5; // halt 16-bit DMA immediately
-// Mono, signed (bit4 = signed, bit5 = stereo). QEMU's sb16 does not honour the
-// DSP stereo bit on the 16-bit auto-init path — it plays the interleaved buffer
-// as mono, which comes out at half speed / doubled — so the sink downmixes to
-// mono and programs mono output. (Stereo out is a TODO pending the QEMU quirk.)
-const MODE_SIGNED_MONO: u8 = 0x10;
+const MODE_SIGNED_STEREO: u8 = 0x30; // bit5 stereo, bit4 signed
 
 // ── 8237 channel-5 (16-bit) registers ───────────────────────────────────────
 const DMA_CHANNEL: usize = 5;
@@ -57,18 +54,18 @@ const DMA5_MODE_AUTO_READ: u8 = 0x59;
 // ── ring geometry (shares the stolen low-mem DMA window with ac97/hda) ───────
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
-/// Completion-IRQ granularity: one interrupt per buffer. ≤ half the universal
-/// pipe (see `sound::min_fill`) so ≥ 2 buffers stay queued (double-buffered).
-/// Mono: one 16-bit sample per mixed stereo frame, so a buffer holds
-/// `BUF_BYTES/2` frames.
-const BUF_BYTES: usize = 0x200; // 512 B = 256 mono samples ≈ 5.8 ms @ 44.1 kHz
-/// Playback frames (= mono samples) per buffer.
-const BUF_FRAMES: usize = BUF_BYTES / 2;
+/// Completion-IRQ granularity: one interrupt per buffer. The geometry matches
+/// AC97/HDA: 512 signed-16 stereo frames, ≈ 11.6 ms at 44.1 kHz. A 30-ms pipe
+/// keeps about 2.6 buffers queued while the larger block halves completion-IRQ
+/// pressure relative to the old 256-frame path.
+const BUF_BYTES: usize = 0x800;
+const BUF_FRAMES: usize = BUF_BYTES / 4;
 const NUM_BUF: usize = 32;
 const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
 /// Prime at least two completion blocks before starting the DSP. The shared
-/// 30-ms pipe normally submits five blocks on its first pass; `submit` starts
-/// only after that whole pass is in memory, rather than halfway through it.
+/// 30-ms pipe normally submits two-and-a-half blocks on its first pass;
+/// `submit` starts only after that whole pass is in memory, rather than halfway
+/// through it.
 const PRIME_BUFS: usize = 2;
 
 struct Sb16 {
@@ -347,11 +344,11 @@ impl Sb16 {
         machine.outb(DMA5_MASK, 0x01); // unmask channel 5
         self.last_dma_pos = 0;
 
-        // DSP block length in 16-bit samples − 1 (one buffer per IRQ). Mono, so
-        // a buffer is BUF_FRAMES samples.
-        let block_samples = BUF_FRAMES as u16;
+        // DSP block length is in 16-bit transfers, not stereo frames: every
+        // frame contributes left + right, hence BUF_BYTES/2 samples.
+        let block_samples = (BUF_BYTES / 2) as u16;
         dsp_write(machine, CMD_16BIT_AUTO_OUT);
-        dsp_write(machine, MODE_SIGNED_MONO);
+        dsp_write(machine, MODE_SIGNED_STEREO);
         dsp_write(machine, (block_samples - 1) as u8);
         dsp_write(machine, ((block_samples - 1) >> 8) as u8);
         self.running = true;
@@ -366,22 +363,22 @@ impl Sb16 {
         }
         for i in 0..bytes.len() / fb {
             let (l, r) = fmt.frame(bytes, i);
-            let m = ((l as i32 + r as i32) / 2) as i16; // downmix to mono
             let p = self.buf_va(self.cur_buf) + self.cur_off;
             unsafe {
-                core::ptr::write_volatile(p as *mut u16, m as u16);
+                core::ptr::write_volatile(p as *mut u16, l as u16);
+                core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
             }
             self.written += 1;
-            self.cur_off += 2;
+            self.cur_off += 4;
             if self.cur_off >= BUF_BYTES {
                 self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
                 self.cur_off = 0;
             }
         }
-        // Do not start from inside the copy loop. QEMU is allowed to schedule
-        // DMA as soon as B6 is issued; starting after buffer two while the same
-        // call is still filling buffers three through five lets playback race
-        // the initial producer burst.
+        // Do not start from inside the copy loop. Hardware may schedule DMA as
+        // soon as B6 is issued; starting after buffer two while the same call
+        // is still filling the remainder of the initial producer burst lets
+        // playback race that copy.
         if !self.running && self.written >= (PRIME_BUFS * BUF_FRAMES) as u64 {
             self.start(machine);
         }
@@ -426,7 +423,7 @@ fn update_cursor<A: crate::Arch>(dev: &mut Sb16, machine: &mut A) -> (u32, u32) 
     let pos = dma_pos_bytes(machine);
     let delta = (pos + ring - dev.last_dma_pos) % ring;
     if delta != 0 {
-        dev.consumed_frames += (delta / 2) as u64;
+        dev.consumed_frames += (delta / 4) as u64;
         dev.last_dma_pos = pos;
     }
     (pos, delta)

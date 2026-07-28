@@ -640,8 +640,7 @@ impl Sb {
         };
         let mut raise = false;
         while self.playing && guest_now >= self.next_irq {
-            self.block_irq();
-            raise = true;
+            raise |= self.block_irq();
             if self.single {
                 self.finish_single(now);
             } else {
@@ -655,13 +654,17 @@ impl Sb {
     }
 
     /// A block boundary passed: advance the cursor over it and latch what a
-    /// driver reads to identify the completion. Putting the *line* up is the
-    /// host's.
-    fn block_irq(&mut self) {
+    /// driver reads to identify the completion. Returns true only when the
+    /// width-specific interrupt latch transitions clear→pending: an ISA SB
+    /// produces one edge for that transition, while further completions before
+    /// the DSP acknowledge coalesce behind the already-pending latch.
+    fn block_irq(&mut self) -> bool {
         self.cursor = self.next_irq;
         self.blocks_done += 1;
         // Mixer IRQ-status bit by transfer width (16-bit drivers check this).
-        self.irq_status |= if self.bits == 16 { 0x02 } else { 0x01 };
+        let irq_bit = if self.bits == 16 { 0x02 } else { 0x01 };
+        let raise = self.irq_status & irq_bit == 0;
+        self.irq_status |= irq_bit;
         // ...and the 8237's terminal-count bit for the channel. A real chip
         // asserts TC at the end of EVERY block — in auto-init the count
         // underflows and reloads, and the status bit latches each time —
@@ -671,6 +674,7 @@ impl Sb {
         // in; the identify idiom is PoP's digi.drv.
         let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
         self.tc_status |= 1 << (chan & 7);
+        raise
     }
 
     /// Single-cycle: one pass and stop (no loop). The 8237 side hit terminal
@@ -691,9 +695,10 @@ impl Sb {
         if self.trigger_irq == 0 {
             return false;
         }
+        let raise = self.irq_status & self.trigger_irq != self.trigger_irq;
         self.irq_status |= self.trigger_irq;
         self.trigger_irq = 0;
-        true
+        raise
     }
 
     /// Complete a single-cycle transfer too short for the host's pump clock to
@@ -714,9 +719,9 @@ impl Sb {
         if self.block_frames as u64 * 1000 >= self.rate.max(1) as u64 {
             return false;
         }
-        self.block_irq();
+        let raise = self.block_irq();
         self.finish_single(now);
-        true
+        raise
     }
 
     // ── state the host's mixer pump asks about ───────────────────────────
@@ -939,4 +944,37 @@ impl Default for Sb {
 /// build it on the heap when the owner lives on a constrained stack.
 pub fn new_boxed() -> Box<Sb> {
     Box::new(Sb::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Sb;
+
+    #[test]
+    fn block_completions_coalesce_until_dsp_ack() {
+        let mut sb = Sb::new();
+        sb.playing = true;
+        sb.rate = 1_000;
+        sb.buf_frames = 100;
+        sb.block_frames = 10;
+        sb.next_irq = 10;
+        sb.slack = 0;
+        sb.single = false;
+        sb.bits = 8;
+
+        assert!(sb.advance_clock(10, 10, 100));
+        assert_eq!(sb.irq_status & 0x01, 0x01);
+
+        // A second completed block advances all accounting, but the DSP's
+        // interrupt latch is still pending and therefore produces no new edge.
+        assert!(!sb.advance_clock(20, 20, 100));
+        assert_eq!(sb.blocks_done, 2);
+
+        // Reading the 8-bit acknowledge port clears the latch. The following
+        // completion is a fresh clear→pending transition and raises one edge.
+        let ack_port = sb.io_base + 0x0E;
+        let _ = sb.port_read(ack_port);
+        assert_eq!(sb.irq_status & 0x01, 0);
+        assert!(sb.advance_clock(30, 30, 100));
+    }
 }

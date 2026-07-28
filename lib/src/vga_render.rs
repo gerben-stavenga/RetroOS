@@ -153,7 +153,7 @@ pub fn classify(r: &Regs) -> Option<VgaMode> {
     // (CRTC[1]) is in character clocks (8 px); vertical display end (CRTC[0x12]
     // plus the two overflow bits in CRTC[7]) is in scanlines.
     let chars = r.crtc[1] as u16 + 1;
-    let mut w = chars * 8;
+    let w = chars * 8;
     let v_end = r.crtc[0x12] as u16
         | (((r.crtc[7] >> 1) & 1) as u16) << 8
         | (((r.crtc[7] >> 6) & 1) as u16) << 9;
