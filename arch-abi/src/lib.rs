@@ -164,6 +164,15 @@ pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 /// meaning.
 pub const MAP_MMIO: u64 = 1 << 10;
 
+/// `Arch::map_phys_range` flag: disable caching for a present physical-device
+/// mapping. This is the safe baseline for BARs and linear framebuffers.
+pub const MAP_PHYS_CACHE_DISABLE: u64 = 1 << 4;
+
+/// `Arch::map_phys_range` flag: the mapped physical frames are externally
+/// owned and must not be returned to RetroOS's page allocator on unmap,
+/// address-space teardown, or replacement.
+pub const MAP_PHYS_FOREIGN: u64 = 1 << 11;
+
 // =============================================================================
 // Page geometry
 // =============================================================================

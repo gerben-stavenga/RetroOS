@@ -3175,6 +3175,7 @@ fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThr
 /// Restores the parent's CS:IP, SS:SP, DS, ES and clears carry (success).
 fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, parent: ExecParent,
                preserve_pm_env: bool) -> thread::KernelAction {
+    let mut parent = parent;
     crate::dbg_println!("exec_return: parent ss:sp={:04X}:{:04X} ds={:04X} es={:04X} heap={:04X} psp={:04X}",
         parent.ss, parent.sp, parent.ds, parent.es, parent.heap_seg, parent.psp);
     if !parent.pm_mode {
@@ -3228,8 +3229,17 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
     //   - TSR exit when child has no dpmi: nothing to preserve, fall back
     //     to parent's (might itself be Some if parent is the DPMI client).
     if preserve_pm_env && dos.dpmi.is_some() {
-        // Drop parent's saved PM env; keep what's already in dos.*.
+        // Drop the parent's saved PM env; release any device mappings it
+        // owned before its bookkeeping disappears.
+        if let Some(ref mut parent_dpmi) = parent.dpmi {
+            parent_dpmi.unmap_all_physical(machine);
+        }
     } else {
+        // A normal child exit drops its DPMI state. Device mappings are
+        // externally owned and therefore require explicit virtual unmapping.
+        if let Some(ref mut child_dpmi) = dos.dpmi {
+            child_dpmi.unmap_all_physical(machine);
+        }
         dos.dpmi = parent.dpmi;
         dos.pm_vectors = parent.pm_vectors;
         dos.ldt = parent.ldt;

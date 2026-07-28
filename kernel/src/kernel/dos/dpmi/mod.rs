@@ -24,8 +24,8 @@ use super::mode_transitions::{seg_base, seg_is_32};
 pub(in crate::kernel::dos) mod vif;
 pub(in crate::kernel::dos) use self::vif::DbResult;
 mod state;
-pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PSP_SEL};
-use self::state::{CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PSP_LDT_IDX};
+pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PHYS_MAP_TOP, PSP_SEL};
+use self::state::{physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
 use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc, valid_ldt_selector_idx};
@@ -933,21 +933,72 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         0x0E01 => {
             clear_carry(regs);
         }
-        // AX=0800h — Physical Address Mapping. BX:CX = physical address,
-        // SI:DI = size; returns BX:CX = linear address.
-        //
-        // We present a FLAT DPMI: the client's linear space IS the address
-        // space, and linear→physical paging lives in the RetroOS arch layer
-        // below us — not ours to remap. So there is no separate physical space
-        // to map *from*; a physical address maps to itself. Return it identity.
-        // Memory that needs real backing (the VESA LFB) is set up where it
-        // lives by whoever owns it (svga_set_mode); 0800h adds no mapping.
+        // AX=0800h — Map Physical Address.
+        // BX:CX = physical address, SI:DI = size; returns BX:CX = linear.
+        // RetroOS's synthetic SVGA happens to pre-map its LFB at its reported
+        // address, but external VBE providers (SeaBIOS and real video BIOSes)
+        // report device physical addresses that need this explicit user map.
         0x0800 => {
-            // BX:CX already hold the address; echo it back as the linear result.
+            let physical =
+                ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
+            let size =
+                ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
+            let Some(slot) = dpmi.free_phys_slot() else {
+                set_carry(regs);
+                regs.rax = (regs.rax & !0xFFFF) | 0x8012;
+                return thread::KernelAction::Done;
+            };
+            let Some((virtual_base, page_count, returned_linear)) =
+                physical_mapping_layout(dos.dpmi_phys_next, physical, size)
+            else {
+                set_carry(regs);
+                regs.rax = (regs.rax & !0xFFFF) | 0x8012;
+                return thread::KernelAction::Done;
+            };
+
+            let physical_page = (physical & !0xFFF) as u64 >> 12;
+            machine.map_phys_range(
+                (virtual_base >> 12) as usize,
+                page_count as usize,
+                physical_page,
+                arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+            );
+            dpmi.phys_mappings[slot] = Some(PhysicalMapping {
+                returned_linear,
+                virtual_page_base: virtual_base,
+                page_count,
+            });
+            dos.dpmi_phys_next = virtual_base;
+            regs.rbx =
+                (regs.rbx & !0xFFFF) | ((returned_linear >> 16) & 0xFFFF) as u64;
+            regs.rcx =
+                (regs.rcx & !0xFFFF) | (returned_linear & 0xFFFF) as u64;
+            dos_trace!(
+                "[DPMI] 0800 map phys={:#x} size={:#x} -> linear={:#x} pages={}",
+                physical, size, returned_linear, page_count
+            );
             clear_carry(regs);
         }
-        // AX=0801h — Free Physical Address Mapping (no-op, we don't track)
+        // AX=0801h — Free Physical Address Mapping. BX:CX is the exact
+        // (possibly unaligned) address previously returned by AX=0800h.
         0x0801 => {
+            let returned_linear =
+                ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
+            let Some((slot, mapping)) = dpmi.physical_mapping(returned_linear)
+            else {
+                set_carry(regs);
+                regs.rax = (regs.rax & !0xFFFF) | 0x8021;
+                return thread::KernelAction::Done;
+            };
+            machine.unmap_range(
+                (mapping.virtual_page_base >> 12) as usize,
+                mapping.page_count as usize,
+            );
+            dpmi.phys_mappings[slot] = None;
+            dos_trace!(
+                "[DPMI] 0801 unmap linear={:#x} pages={}",
+                returned_linear, mapping.page_count
+            );
             clear_carry(regs);
         }
         _ => {

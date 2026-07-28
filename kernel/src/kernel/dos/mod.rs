@@ -159,6 +159,10 @@ pub struct DosState<A: crate::Arch> {
     /// allocations still live in the same linear address space and must not
     /// overlap the parent's protected-mode stack or heap blocks.
     pub dpmi_mem_next: u32,
+    /// Downward-growing allocator for DPMI 0800h physical mappings. Shared
+    /// across nested EXEC clients because their mappings coexist in this
+    /// address space while the parent's DPMI state is suspended.
+    pub dpmi_phys_next: u32,
     /// Exact RM IVT values most recently returned through PM INT 21h/AH=35h.
     /// PM callers receive LOW_MEM_SEL:linear for addressability, but AH=25h
     /// must round-trip that value back to the original real seg:off where
@@ -249,6 +253,7 @@ impl<A: crate::Arch> DosState<A> {
             ldt_alloc: [0u32; dpmi::LDT_ENTRIES / 32],
             pm_vectors: [(0, 0); 256],
             dpmi_mem_next: dpmi::MEM_BASE,
+            dpmi_phys_next: dpmi::PHYS_MAP_TOP,
             pm_rm_vector_shadow: [(0, 0, 0); 256],
             dpmi: None,
             pm_dos: false,
@@ -268,6 +273,9 @@ impl<A: crate::Arch> DosState<A> {
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
+        if let Some(ref mut dpmi) = self.dpmi {
+            dpmi.unmap_all_physical(machine);
+        }
         if let Some(ref mut ems) = self.ems {
             ems.free_all_pages();
         }
