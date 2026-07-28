@@ -36,15 +36,27 @@ dd MULTIBOOT_CHECK
 ; Address fields — present because the video fields below follow them
 ; positionally, but unused (flags bit 16 is clear; we're a plain ELF).
 dd 0, 0, 0, 0, 0
-; Video request (flags bit 2). On UEFI-class machines (no VGA text mode) the
-; loader hands back a linear framebuffer in the info struct; our own legacy
-; bootloader ignores the header and boots in VGA text mode as before.
+; Video request (flags bit 2). Our own legacy bootloader ignores the header
+; and boots in VGA text mode; this section is what GRUB reads.
+;
+; mode_type asks for EGA TEXT, not a linear framebuffer, and the loader's
+; fallback resolves the rest — one header serving both firmware families:
+;   * legacy BIOS: GRUB has a real text console, so it honours the request and
+;     hands back framebuffer_type 2 (EGA text). `fbcon::init` declines that
+;     (it renders 32bpp RGB only), the probe sees no framebuffer and picks
+;     `Display::VgaCard` — the card scans out its own memory and DOS programs
+;     program it directly. Asking for graphics here instead demoted a working
+;     card to the emulated-VGA blit path AND left the card in whatever mode
+;     GRUB set, which the text console cannot use: a black screen.
+;   * UEFI: there is no EGA text mode for GRUB to give, so it falls back to a
+;     linear framebuffer exactly as before and fbcon takes over.
+;
 ; Width/height 0 = no preference (multiboot spec): the loader's gfxmode=auto
 ; then picks the panel's NATIVE mode. A concrete request here (1024x768
 ; historically) made GRUB pick a 4:3 GOP mode on the 16:10 laptop, which the
 ; panel's scaler stretched to full screen — fat pixels, wrong aspect, no
 ; pillarbox. Depth stays a real request: fbcon renders 32bpp only.
-dd 0          ; mode_type: 0 = linear graphics
+dd 1          ; mode_type: 1 = EGA text (UEFI falls back to linear graphics)
 dd 0          ; width  (0 = no preference -> loader picks native)
 dd 0          ; height
 dd 32         ; depth
