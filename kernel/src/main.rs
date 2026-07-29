@@ -25,7 +25,6 @@ static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new
 /// the interpreter's port/device machinery.
 fn host_log_byte(b: u8) {
     use std::io::Write;
-    kernel::kernel::klog::push_byte(b);
     if let Ok(mut g) = LOG_FILE.lock()
         && let Some(f) = g.as_mut() {
             let _ = f.write_all(&[b]);
@@ -109,6 +108,7 @@ fn main() {
         }
         arch::enable_live_console(); // paint guest 0xB8000 to this terminal
     }
+    kernel::kernel::klog::init();
     kernel::vga::set_debug_sink(host_log_byte);
     // Inject the backend into the (backend-agnostic) kernel: its port I/O for
     // the deep driver call sites (portio), and the host environment facts the

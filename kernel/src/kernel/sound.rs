@@ -96,6 +96,15 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
         {
             crate::kernel::drivers::hda::on_irq()
         }
+        (Audio::EmulatedHda, crate::Irq::Hw(line))
+            if Some(line) == crate::kernel::drivers::hda::irq_line() =>
+        {
+            let ours = crate::kernel::drivers::hda::on_irq();
+            if ours {
+                machine.rearm_irq(line);
+            }
+            ours
+        }
         (Audio::EmulatedAc97, crate::Irq::Hw(line))
             if Some(line) == crate::kernel::drivers::ac97::irq_line() =>
         {

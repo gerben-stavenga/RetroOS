@@ -14,12 +14,11 @@
 //!    stream descriptor + BDL feed PCM exactly like AC'97's bus master.
 //!
 //! Ring geometry mirrors `ac97`: a 32-entry ring of small PCM buffers in a
-//! borrowed contiguous DMA buffer, primed then run. Unlike `ac97`, HDA drives
-//! production by **MSI**: one interrupt-on-completion per buffer signals the
-//! canonical `Irq::Hw` line, and the producer refills the drained buffer from
-//! the event loop. HDA is a PCI-E-era controller, so a machine that has one
-//! always has a local APIC — there is no polled fallback (bring-up fails loudly
-//! if MSI can't be programmed).
+//! borrowed contiguous DMA buffer, primed then run. One
+//! interrupt-on-completion per buffer signals either a private MSI identity or
+//! the firmware-routed PCI INTx line, and the producer refills the drained
+//! buffer from the event loop. MSI is preferred; INTx keeps early HDA machines
+//! usable when RetroOS is running its tick from the legacy PIT.
 //!
 //! ## Topology
 //!
@@ -178,9 +177,14 @@ static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBo
 /// Kernel MSI identity allocated to the HDA sink. This is not an ISA IRQ/GSI
 /// line; the arch backend delivers it as `Irq::Msi(MSI_SOURCE)`.
 pub const MSI_SOURCE: u8 = 0;
-/// Set once bring-up successfully programmed MSI (always, on any real HDA
-/// machine — bring-up fails otherwise). Read by [`msi_active`].
+/// Set once bring-up successfully programmed MSI. False means the controller
+/// uses [`IRQ_LINE`] instead.
 static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// Firmware-routed PCI INTx line when MSI is unavailable; `u32::MAX` means
+/// none. Old ICH HDA controllers commonly live on machines where RetroOS uses
+/// the PIT and therefore cannot allocate an MSI vector.
+static IRQ_LINE: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 /// Buffer-completion interrupts serviced (bring-up diagnostic for now).
 static HDA_IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
@@ -536,23 +540,40 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
 
-    // MSI drives the sink. HDA is a PCI-E-era controller; any machine that has
-    // one has a local APIC, so MSI is always available on real hardware. If it
-    // can't be programmed — only the artificial i486 + intel-hda QEMU combo, a
-    // machine that never existed — skip the controller loudly rather than fall
-    // back to polling. There is no real hardware to serve a polled HDA path.
+    // Prefer MSI, but do not confuse "the LAPIC is our timer source" with
+    // "this HDA controller is usable". Early ICH HDA machines can boot through
+    // the legacy PIT/PIC path; their firmware-routed INTx line is a perfectly
+    // adequate completion source.
     let msi = machine
         .msi_alloc(MSI_SOURCE)
         .is_some_and(|(addr, data)| crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data));
-    if !msi {
-        crate::println!(
-            "hda: {:02x}:{:02x}.{} no MSI — HDA implies an APIC machine (use --arch 686/x64); skipping",
-            bus, dev, func
+    if msi {
+        MSI_ON.store(true, core::sync::atomic::Ordering::Relaxed);
+        crate::println!("hda: {:02x}:{:02x}.{} MSI on", bus, dev, func);
+    } else {
+        let line =
+            (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
+        if !(1..=15).contains(&line) {
+            crate::println!(
+                "hda: {:02x}:{:02x}.{} no MSI/INTx route; skipping",
+                bus, dev, func
+            );
+            return false;
+        }
+        // PCI Command bit 10 suppresses INTx while set. Firmware is allowed to
+        // leave it set for an unused device, so make the fallback explicit.
+        crate::kernel::pci::write32(
+            machine,
+            bus,
+            dev,
+            func,
+            0x04,
+            ((cmd & 0xFFFF) | 0x06) & !(1 << 10),
         );
-        return false;
+        machine.route_device_irq(line);
+        IRQ_LINE.store(line as u32, core::sync::atomic::Ordering::Relaxed);
+        crate::println!("hda: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
     }
-    MSI_ON.store(true, core::sync::atomic::Ordering::Relaxed);
-    crate::println!("hda: {:02x}:{:02x}.{} MSI on", bus, dev, func);
 
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
@@ -1805,11 +1826,10 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
-/// Service a buffer-completion interrupt (`Irq::Msi(MSI_SOURCE)`, routed
-/// here by `sound::on_irq`). Acknowledges the stream's completion status
-/// (SDSTS.BCIS, write-1-clear), then advances consumption from the DMA
-/// position-buffer delta. Returns false for a vector delivery with no PCM
-/// completion source.
+/// Service an MSI or INTx buffer-completion interrupt routed here by
+/// `sound::on_irq`. Acknowledges the stream's completion status (SDSTS.BCIS,
+/// write-1-clear), then advances consumption from the DMA position-buffer
+/// delta. Returns false for a delivery with no PCM completion source.
 pub fn on_irq() -> bool {
     let mut guard = HDA.lock();
     let Some(dev) = guard.as_mut() else { return false };
@@ -1843,10 +1863,15 @@ pub fn on_irq() -> bool {
     true
 }
 
-/// True once the HDA sink is up and driving production by completion IRQ. The
-/// producer's pacer reads this to select event-driven refill.
+/// True when HDA uses MSI rather than its firmware-routed INTx line.
 pub fn msi_active() -> bool {
     MSI_ON.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Firmware-routed INTx line used when MSI allocation was unavailable.
+pub fn irq_line() -> Option<u8> {
+    let line = IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed);
+    (line != u32::MAX).then_some(line as u8)
 }
 
 /// Pipe counters for `sound::position`: `(written, consumed)` in source

@@ -13,12 +13,6 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
-    // Allocate the in-memory kernel log now the heap is up; the debug sink tees
-    // into it so `LOG` (COMMAND.COM, INT 31h AH=07h) can surface kernel output
-    // on machines with no serial/debug port (real metal — 0xE9 goes nowhere).
-    crate::kernel::klog::init();
-
-
     // Discover every disk. The block layer reports what exists; nothing below
     // this line picks a boot disk or decides where anything mounts.
     let disks = crate::kernel::block::probe(machine);

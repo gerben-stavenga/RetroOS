@@ -13,6 +13,7 @@ rust_library(
         "-Copt-level=z",
         "-Crelocation-model=static",
     ],
+    deps = ["//klog"],
 )
 
 rust_test(

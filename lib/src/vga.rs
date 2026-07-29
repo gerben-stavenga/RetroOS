@@ -233,8 +233,7 @@ pub fn vga() -> &'static mut Vga {
 // boundary: metal installs an `out 0xE9, al` emitter, the hosted binary a
 // stderr/log-file writer, the bootloader installs nothing (sink stays null).
 // Living in `lib` lets every embedder — bootloader, kernel, and each backend
-// crate — share one sink and one set of macros. `lib::vga` itself only renders
-// the framebuffer; the byte sink is the function pointer below.
+// crate — share one sink, one allocation-free log ring, and one set of macros.
 
 /// The platform-installed debug-output sink (`fn(u8)` as its address; 0 = none,
 /// bytes dropped). Write-only and panic-safe: an atomic load + indirect call.
@@ -277,6 +276,7 @@ fn text_flush() {
 
 #[inline]
 fn stream(b: u8) {
+    klog::push_byte(b);
     let p = DEBUG_SINK.load(core::sync::atomic::Ordering::Relaxed);
     if p != 0 {
         let f: fn(u8) = unsafe { core::mem::transmute(p) };

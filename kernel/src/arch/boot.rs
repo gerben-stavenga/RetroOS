@@ -27,9 +27,6 @@ static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
 /// issuing a port op itself.
 fn log_byte_0xe9(b: u8) {
     x86::outb(0xE9, b);
-    // Also retain it in RAM: 0xE9 is unconnected on real hardware, so this is
-    // the only way to read kernel/dbg output back on metal (via COMMAND.COM LOG).
-    crate::kernel::klog::push_byte(b);
 }
 
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
@@ -107,6 +104,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     // Update VGA base for paged addressing before any println
     vga::vga().base = LOW_MEM_BASE + 0xB8000;
+
+    // The shared log ring uses kernel-owned static storage, so it is available
+    // before the heap and captures the interrupt/device bring-up below.
+    crate::kernel::klog::init();
 
     // Install the kernel's debug-log sink: on metal, a byte to the 0xE9 debug
     // port. Logging is a platform concern, not an arch call — the kernel never

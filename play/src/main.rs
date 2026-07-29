@@ -55,6 +55,7 @@ fn main() {
         usage();
     }
 
+    kernel::kernel::klog::init();
     kernel::vga::set_debug_sink(log_byte);
 
     // The bootfs (DN + COMMAND.COM, the /boot invariant) is linked into this
