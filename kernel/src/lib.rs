@@ -108,6 +108,10 @@ pub fn host_run_elf<A: Arch>(
     }
 
     dbg_println!("[host] running 32-bit Linux ELF");
+    // The bare-ELF path bypasses platform probing/startup, so establish the
+    // same display-ownership invariant that `run_program` does explicitly.
+    kernel::focus::adopt(tid);
+    kernel::linux::adopt_console_vga(kernel::platform::DisplayToken::Headless);
     kernel::startup::event_loop(machine, &mut threads, tid);
     dbg_println!("[host] guest exited");
     kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked

@@ -1826,6 +1826,30 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
+/// Recover an active stream after a synchronous kernel operation that may
+/// have outlasted the audio pipe (native VGA save/restore is the main case).
+/// The codec may have lapped the producer and started replaying stale ring
+/// contents; move the writer just ahead of the live cursor, silence the guard
+/// buffer, and snap consumption to the emitted frontier. The mixer observes
+/// the resulting deficit on its next tick and primes a clean pipe.
+pub fn recover_after_stall() {
+    let mut guard = HDA.lock();
+    let Some(dev) = guard.as_mut() else { return };
+    if !dev.running || dev.parked {
+        return;
+    }
+    let civ = dev.play_buf();
+    let silence = (civ + 1) % NUM_BUF;
+    unsafe {
+        core::ptr::write_bytes(dev.buf_va(silence) as *mut u8, 0, BUF_BYTES);
+    }
+    dev.cur_buf = (civ + 2) % NUM_BUF;
+    dev.cur_off = 0;
+    dev.consumed_hw = dev.emitted;
+    dev.last_hw_pos = dev.hw_cursor() % (NUM_BUF * BUF_BYTES) as u32;
+    dev.diag_resyncs = dev.diag_resyncs.wrapping_add(1);
+}
+
 /// Service an MSI or INTx buffer-completion interrupt routed here by
 /// `sound::on_irq`. Acknowledges the stream's completion status (SDSTS.BCIS,
 /// write-1-clear), then advances consumption from the DMA position-buffer

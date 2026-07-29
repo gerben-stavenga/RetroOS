@@ -26,6 +26,20 @@ pub fn physical_vga_present() -> bool {
         && crate::kernel::platform::get().display.vga_passthrough()
 }
 
+/// Materialize the kernel OSD's fixed native-VGA surface. Done once when F12
+/// takes the card; subsequent frames only replace the 320×200 linear aperture.
+pub fn prepare_native_osd() {
+    let mut state = VgaState::new();
+    let regs = lib::vga_render::bios_mode_regs(0x13).expect("mode 13h register table");
+    state.misc_output = regs.misc;
+    state.seq = regs.seq;
+    state.gc = regs.gc;
+    state.crtc = regs.crtc;
+    state.dac = lib::vga_render::fallback_palette();
+    state.planes.resize(4 * 0x10000, 0);
+    state.restore_to_hardware();
+}
+
 pub struct NativeVga {
     state: VgaState,
     display: crate::kernel::platform::DisplayToken,
@@ -59,7 +73,16 @@ impl EmulatedVga {
     ) -> Vga {
         match display {
             display @ crate::kernel::platform::DisplayToken::VgaCard => {
-                self.state.capture_emulated_aperture(machine);
+                // A freshly created DOS VGA has no suspended image yet. Its
+                // first attachment adopts the card exactly as the preceding
+                // visible owner left it (normally BIOS text mode plus the
+                // boot console); manufacturing a zeroed four-plane snapshot
+                // here and restoring it blanks the native display. Once this
+                // VGA has been suspended, `planes` is populated and later
+                // attachments perform the ordinary exact repaint.
+                if !self.state.planes.is_empty() {
+                    self.state.capture_emulated_aperture(machine);
+                }
                 machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
                 self.state.a0000_trapped = false;
                 self.state.restore_to_hardware();
@@ -76,6 +99,12 @@ pub enum Vga {
     Native(NativeVga),
     Emulated(EmulatedVga),
     Presented(PresentedVga),
+}
+
+impl Default for Vga {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Vga {
@@ -567,7 +596,14 @@ impl VgaState {
             }
             outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
         }
-        self.dac_mask = inb(0x3C6);
+        // QEMU reports a zero PEL mask even while its live VGA output is
+        // visibly unmasked. Treat that backend's readback as absent; real
+        // hardware keeps the exact register value.
+        self.dac_mask = if plat.host == crate::kernel::platform::Host::Qemu {
+            0xFF
+        } else {
+            inb(0x3C6)
+        };
         // Capture program-tracked DAC index latch + read/write mode before
         // stomping it with our bulk read.
         self.dac_index = inb(0x3C8);
@@ -594,9 +630,10 @@ impl VgaState {
             let _ = inb(0x3DA);
         }
 
-        crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X}",
+        crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X} dacmask={:02X}",
             self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
-            (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16);
+            (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16,
+            self.dac_mask);
 
         // Blank the display for the rest of the save. The flat-planar
         // overrides below mis-interpret the current framebuffer if the
@@ -2013,18 +2050,39 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
 /// Free when a real card scans out directly or no sink is installed.
 pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
     use lib::vga_render;
+    let (display_kind, direct) = if let Some(display) = pc.vga.display() {
+        (
+            display.kind(),
+            match display {
+                crate::kernel::platform::DisplayToken::Framebuffer(fb) => Some(*fb),
+                _ => None,
+            },
+        )
+    } else {
+        let Some(display) = crate::kernel::osd::display() else { return };
+        (
+            display.kind(),
+            match display {
+                crate::kernel::platform::DisplayToken::Framebuffer(fb) => Some(*fb),
+                _ => None,
+            },
+        )
+    };
+    if display_kind == crate::kernel::platform::Display::VgaCard {
+        if crate::kernel::osd::is_open() {
+            display_native_osd(machine, pc, regs, now_ticks);
+        }
+        return;
+    }
     // A real card scans out its own memory — nothing to do. Otherwise we need
     // somewhere to put the frame: a framebuffer we write into, or a window
     // sink. (This used to test only the sink; when fbcon stopped registering
     // one, every metal frame silently returned here.)
-    let (direct, host_window) = match pc.vga.display() {
-        Some(crate::kernel::platform::DisplayToken::Framebuffer(fb)) => (Some(*fb), false),
-        Some(crate::kernel::platform::DisplayToken::HostWindow) => (None, true),
-        Some(crate::kernel::platform::DisplayToken::Headless) | None => return,
-        Some(crate::kernel::platform::DisplayToken::VgaCard) => {
-            debug_assert!(pc.vga.is_native());
-            return;
-        }
+    let host_window = match display_kind {
+        crate::kernel::platform::Display::Framebuffer => false,
+        crate::kernel::platform::Display::HostWindow => true,
+        crate::kernel::platform::Display::Headless => return,
+        crate::kernel::platform::Display::VgaCard => unreachable!(),
     };
     if pc.vga.is_native() {
         return;
@@ -2135,4 +2193,41 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
             p3.wrapping_sub(p2), need);
     }
+}
+
+fn display_native_osd<A: crate::Arch>(
+    machine: &mut A,
+    pc: &mut PcMachine,
+    regs: &Regs,
+    now_ticks: u64,
+) {
+    // Native OSD presentation is substantially more expensive than ordinary
+    // card scanout: the running guest must be rendered to RGB, scaled,
+    // quantized into the OSD palette, then copied through the VGA aperture.
+    // Doing all of that at the card's 70 Hz cadence starves the guest and its
+    // audio clock. Keep the live preview at 10 Hz, with immediate frames for
+    // menu input; the guest and mixer still advance on every normal tick.
+    static LAST_MS: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(u32::MAX);
+    let now = now_ticks as u32;
+    let forced = crate::kernel::osd::take_repaint_request();
+    let last = LAST_MS.load(Ordering::Relaxed);
+    if !forced && now.wrapping_sub(last) < 100 {
+        return;
+    }
+    LAST_MS.store(now, Ordering::Relaxed);
+    let Some(mode) = pc.vga.current_mode() else { return };
+    let (w, h) = lib::vga_render::dimensions(mode);
+    let full = (0, h);
+    let Some(frame) =
+        pc.vga.scanout(machine, regs, &mut pc.present_scratch, full)
+    else {
+        return;
+    };
+    let need = w * h;
+    if pc.present_fb.len() < need {
+        pc.present_fb.resize(need, 0);
+    }
+    lib::vga_render::render(&frame, &mut pc.present_fb[..need]);
+    crate::kernel::osd::present_native(&pc.present_fb[..need], w, h);
 }

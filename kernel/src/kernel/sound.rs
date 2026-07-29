@@ -180,6 +180,15 @@ pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
     }
 }
 
+/// Re-anchor a real-time sink after a long synchronous display handoff.
+/// Position-less and hardware-passthrough outputs need no producer recovery.
+pub fn recover_after_display_stall() {
+    use crate::kernel::platform::Audio;
+    if crate::kernel::platform::get().audio == Audio::EmulatedHda {
+        crate::kernel::drivers::hda::recover_after_stall();
+    }
+}
+
 /// The selected output's pipe counters, in **source-rate frames**:
 /// `(written, consumed)` — frames accepted via [`play`] and frames the
 /// hardware has actually claimed for playback, both since the output's

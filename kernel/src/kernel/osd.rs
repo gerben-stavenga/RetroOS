@@ -43,9 +43,13 @@ const VOL_MAX: u32 = 100;
 const VOL_STEP: u32 = 10;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
+static REPAINT: AtomicBool = AtomicBool::new(false);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(100);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
+static mut DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
+static mut NATIVE_RGB: [u32; 320 * 200] = [0; 320 * 200];
+static mut NATIVE_IDX: [u8; 320 * 200] = [0; 320 * 200];
 
 /// Is the monitor panel currently open?
 pub fn is_open() -> bool {
@@ -53,15 +57,76 @@ pub fn is_open() -> bool {
 }
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
-pub fn open() {
+pub fn open(display: crate::kernel::platform::DisplayToken) {
+    unsafe {
+        assert!((&raw const DISPLAY).as_ref().unwrap().is_none());
+        DISPLAY = Some(display);
+    }
     SEL.store(0, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
+    REPAINT.store(true, Ordering::Relaxed);
     OPEN.store(true, Ordering::Relaxed);
+}
+
+/// Consume an immediate repaint request. Native VGA uses this to make menu
+/// input responsive without continuously rebuilding the live background.
+pub fn take_repaint_request() -> bool {
+    REPAINT.swap(false, Ordering::Relaxed)
+}
+
+pub fn display() -> Option<&'static crate::kernel::platform::DisplayToken> {
+    if !is_open() {
+        return None;
+    }
+    unsafe { (&raw const DISPLAY).as_ref().unwrap().as_ref() }
+}
+
+pub fn take_display() -> crate::kernel::platform::DisplayToken {
+    unsafe {
+        (&raw mut DISPLAY).as_mut().unwrap().take()
+            .expect("open OSD has no display token")
+    }
 }
 
 fn close() {
     PICKER.store(false, Ordering::Relaxed);
     OPEN.store(false, Ordering::Relaxed);
+}
+
+/// Scale a live guest frame into the native-VGA OSD's fixed 320×200 RGB
+/// canvas, draw the ordinary overlay there, quantize to the installed 6³
+/// palette cube, and publish it through the card's linear Mode-13h aperture.
+pub fn present_native(frame: &[u32], sw: usize, sh: usize) {
+    if sw == 0 || sh == 0 || frame.len() < sw * sh {
+        return;
+    }
+    unsafe {
+        let rgb = &mut *core::ptr::addr_of_mut!(NATIVE_RGB);
+        for y in 0..200 {
+            let sy = y * sh / 200;
+            for x in 0..320 {
+                rgb[y * 320 + x] = frame[sy * sw + x * sw / 320];
+            }
+        }
+        let bytes = core::slice::from_raw_parts_mut(rgb.as_mut_ptr() as *mut u8, rgb.len() * 4);
+        paint(bytes, 320 * 4, 320, 200, 320, PixelFormat::NATIVE);
+
+        let idx = &mut *core::ptr::addr_of_mut!(NATIVE_IDX);
+        for (dst, &c) in idx.iter_mut().zip(rgb.iter()) {
+            let r = ((c >> 16) & 0xFF) as usize;
+            let g = ((c >> 8) & 0xFF) as usize;
+            let b = (c & 0xFF) as usize;
+            let ri = (r * 5 + 127) / 255;
+            let gi = (g * 5 + 127) / 255;
+            let bi = (b * 5 + 127) / 255;
+            *dst = (32 + ri * 36 + gi * 6 + bi) as u8;
+        }
+        core::ptr::copy_nonoverlapping(
+            idx.as_ptr(),
+            (crate::LOW_MEM_BASE + 0xA0000) as *mut u8,
+            idx.len(),
+        );
+    }
 }
 
 /// The master output gain in Q16, read by the mixer pump. Unity (65536) at
@@ -172,6 +237,7 @@ pub fn key<A: crate::Arch>(machine: &mut A, regs: &mut Regs, sc: u8, dos: Option
     if sc & 0x80 != 0 {
         return; // release: swallowed, no action
     }
+    REPAINT.store(true, Ordering::Relaxed);
     if PICKER.load(Ordering::Relaxed) {
         pick_key(sc);
         return;

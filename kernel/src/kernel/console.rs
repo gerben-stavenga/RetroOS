@@ -30,13 +30,22 @@ pub fn dispatch<A: crate::Arch>(
     personality: &mut thread::Personality<A>,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
+    let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
+    for evt in events {
+        if let crate::Irq::Key(sc) = evt
+            && monitor_key(machine, regs, sc, personality)
+        {
+            continue;
+        }
+        guest_events.push(evt);
+    }
     match personality {
         thread::Personality::Dos(dos) => {
             let blocked = kt.state == thread::ThreadState::Blocked;
-            dispatch_dos(machine, regs, blocked, dos, events);
+            dispatch_dos(machine, regs, blocked, dos, guest_events);
         }
         thread::Personality::Linux(linux) => {
-            dispatch_linux(machine, regs, kt, linux, events)
+            dispatch_linux(machine, regs, kt, linux, guest_events)
         }
     }
 }
@@ -54,9 +63,6 @@ fn dispatch_dos<A: crate::Arch>(
     {
         for evt in events {
         if let crate::Irq::Key(sc) = evt {
-            if monitor_key(machine, regs, sc, Some(unsafe { &*dp })) {
-                continue; // eaten by the F12 monitor
-            }
             if blocked {
                 if crate::kernel::keyboard::update_key_state(sc) {
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
@@ -87,14 +93,36 @@ fn monitor_key<A: crate::Arch>(
     machine: &mut A,
     regs: &mut Regs,
     sc: u8,
-    dos: Option<&thread::DosState<A>>,
+    personality: &mut thread::Personality<A>,
 ) -> bool {
     if crate::kernel::osd::is_open() {
+        let dos = match &*personality {
+            thread::Personality::Dos(dos) => Some(dos),
+            thread::Personality::Linux(_) => None,
+        };
         crate::kernel::osd::key(machine, regs, sc, dos);
+        if !crate::kernel::osd::is_open() {
+            let display = crate::kernel::osd::take_display();
+            let native_vga =
+                matches!(display, crate::kernel::platform::DisplayToken::VgaCard);
+            personality.materialize(machine, display);
+            if native_vga {
+                crate::kernel::sound::recover_after_display_stall();
+                if let thread::Personality::Dos(dos) = personality {
+                    crate::kernel::dos::audio_tick(machine, dos, regs);
+                }
+            }
+            crate::kernel::io_policy::apply(machine, personality, true);
+        }
         return true;
     }
     if sc == F12_PRESS {
-        crate::kernel::osd::open();
+        let display = personality.suspend(machine);
+        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
+            crate::kernel::dos::prepare_native_osd();
+        }
+        crate::kernel::osd::open(display);
+        crate::kernel::io_policy::apply(machine, personality, true);
         return true;
     }
     false
@@ -103,7 +131,7 @@ fn monitor_key<A: crate::Arch>(
 /// Linux owner: keys → cooked fd input.
 fn dispatch_linux<A: crate::Arch>(
     machine: &mut A,
-    regs: &mut Regs,
+    _regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
     events: alloc::vec::Vec<crate::Irq>,
@@ -113,7 +141,6 @@ fn dispatch_linux<A: crate::Arch>(
     {
         for evt in events {
         if let crate::Irq::Key(sc) = evt
-            && !monitor_key(machine, regs, sc, None)
         {
             unsafe { (*lp).process_key(machine, &(*ktp).fds, sc) };
         }

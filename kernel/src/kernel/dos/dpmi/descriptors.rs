@@ -135,9 +135,11 @@ pub(super) fn trace_dpmi_desc(label: &str, sel: u16, desc: u64) {
     }
 }
 
-/// Populate the kernel-owned LDT slots and default pm_vectors. Called from
-/// `DosState::new()` so the PMDOS infrastructure is always live — HW IRQ
-/// routing can use it even before any DPMI client has called dpmi_enter.
+/// Populate the kernel-owned LDT slots and default pm_vectors immediately
+/// after a new `DosState` has been installed in its thread. Keeping this
+/// post-construction step out of `DosState::new()` lets that large state be
+/// returned directly into its destination instead of duplicated on the
+/// kernel stack.
 pub(in crate::kernel::dos) fn install_kernel_ldt_slots<A: crate::Arch>(dos: &mut thread::DosState<A>) {
     // Reserve + install each kernel slot.
     let mark = |dos: &mut thread::DosState<A>, idx: usize, desc: u64| {

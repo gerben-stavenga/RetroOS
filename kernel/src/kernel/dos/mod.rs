@@ -59,7 +59,7 @@ mod mode_transitions;
 // Re-export so the Linux personality can hold its own console snapshot — DOS
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
-pub use machine::vga::{Vga, physical_vga_present};
+pub use machine::vga::{Vga, physical_vga_present, prepare_native_osd};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the bootfs mount and the DN/CONFIG launch paths.
@@ -227,7 +227,7 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
 impl<A: crate::Arch> DosState<A> {
     pub fn new(machine: &mut A) -> Self {
         let ldt = fresh_ldt();
-        let mut dos = DosState {
+        DosState {
             pc: machine::PcMachine::new(machine),
             dta: 0,
             heap_seg: 0xA000,
@@ -258,9 +258,7 @@ impl<A: crate::Arch> DosState<A> {
             dpmi: None,
             pm_dos: false,
             pending_resume: None,
-        };
-        dpmi::install_kernel_ldt_slots(&mut dos);
-        dos
+        }
     }
 
     /// Process a raw PS/2 scancode — queue as virtual keyboard IRQ.
@@ -303,7 +301,7 @@ impl<A: crate::Arch> DosState<A> {
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
     pub fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::DisplayToken {
-        let vga = core::mem::replace(&mut self.pc.vga, Vga::new());
+        let vga = core::mem::take(&mut self.pc.vga);
         let (vga, display) = vga.into_emulated(machine);
         self.pc.vga = vga;
         display
@@ -317,7 +315,7 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         display: crate::kernel::platform::DisplayToken,
     ) {
-        let vga = core::mem::replace(&mut self.pc.vga, Vga::new());
+        let vga = core::mem::take(&mut self.pc.vga);
         self.pc.vga = vga.present(machine, display);
     }
 }
@@ -763,8 +761,6 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // Initialize a fresh DosState and seed the heap chain at heap_start so
     // the upcoming dos_alloc_block calls (env, then program block) carve
     // env_seg = heap_start + 1, psp_seg = env_seg + 0x10 = heap_start + 17.
-    let mut new_state = DosState::new(machine);
-    new_state.dfs.init_from_vfs(&parent_cwd);
     // In-place exec replaces (drops) the old DosState — release its SB
     // DMA pool binding first, else the global pool stays held forever.
     if let thread::Personality::Dos(old) = &mut current.personality {
@@ -774,7 +770,12 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         pc.mpu.reset();
         pc.spk.reset();
     }
-    current.personality = thread::Personality::Dos(new_state);
+    // Construct directly in the personality's final storage. Keeping a
+    // `new_state: DosState` local makes rustc reserve another ~16 KiB copy on
+    // the kernel stack for the whole duration of this already-deep EXEC path;
+    // a child launched by DN can then cross the 64 KiB stack guard. Do the
+    // small post-construction DFS initialization after installation instead.
+    current.personality = thread::Personality::Dos(DosState::new(machine));
     // `regs` (the thread's vcpu) and `dos_state` (its DOS personality) are
     // disjoint fields of `current`, so borrow them directly rather than via
     // `dos_mut()` — the loaders need both at once.
@@ -783,6 +784,8 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         thread::Personality::Dos(d) => d,
         _ => unreachable!("just set Dos personality"),
     };
+    dpmi::install_kernel_ldt_slots(dos_state);
+    dos_state.dfs.init_from_vfs(&parent_cwd);
     dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
 
     // Parent: env snapshot with sys's PSP as the segment, since the actual
@@ -935,8 +938,6 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
     let dos_len = dfs::vfs_to_dos(path, &mut dos_name);
     let dos_name = &dos_name[..dos_len];
 
-    let mut new_state = DosState::new(machine);
-    new_state.dfs.init_from_vfs(&cwd);
     if let thread::Personality::Dos(old) = &mut t.personality {
         old.pc.sb.release_dma_pool(machine, &mut t.kernel.vcpu);
         let pc = &mut old.pc;
@@ -944,7 +945,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
         pc.mpu.reset();
         pc.spk.reset();
     }
-    t.personality = thread::Personality::Dos(new_state);
+    t.personality = thread::Personality::Dos(DosState::new(machine));
     let loaded = {
         // `regs` and `dos_state` are disjoint fields of `t`; borrow directly.
         let regs = &mut t.kernel.vcpu;
@@ -952,6 +953,8 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::
             thread::Personality::Dos(d) => d,
             _ => unreachable!("just set Dos personality"),
         };
+        dpmi::install_kernel_ldt_slots(dos_state);
+        dos_state.dfs.init_from_vfs(&cwd);
         dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
 
         let parent = dos::boot_parent_with_env(&env);

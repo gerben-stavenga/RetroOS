@@ -518,6 +518,7 @@ fn run<A: crate::Arch>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_program_with_screen<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
@@ -539,6 +540,7 @@ fn run_program_with_screen<A: crate::Arch>(
 /// through the Linux loader (a fresh process thread); `.COM` / MZ `.EXE`
 /// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
 /// path (PSP:0080h cmdline + environment).
+#[allow(clippy::too_many_arguments)]
 fn run_program<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
