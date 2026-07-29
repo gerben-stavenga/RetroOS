@@ -42,17 +42,18 @@ unsafe extern "C" {
 /// KERNEL_PHYS), wrapping (the boot GDT's offset segments).
 const PHYS_TO_SEG: usize = paging2::KERNEL_BASE - KERNEL_PHYS;
 
-/// Copy the multiboot info + memory map out of wherever GRUB left them (anywhere
-/// below 4GB) before paging restricts us to the low-1MB window. Returns the
-/// owned info plus the number of map entries written into `mmap_out`. Both then
-/// live as `boot_kernel` locals — the only reader is the rest of `boot_kernel`,
-/// nothing consults them once boot is over, so there is no need for a global.
+/// Copy the multiboot info, memory map, and command line out of wherever GRUB
+/// left them (anywhere below 4GB) before paging restricts us to the low-1MB
+/// window. Returns the owned info plus the number of map and command-line bytes
+/// written. The copies live as `boot_kernel` locals — the only reader is the
+/// rest of `boot_kernel`, so there is no need for a global.
 /// Pre-paging only; the caller's stack frame holds the copies across the paging
 /// switch (the stack's linked address is mapped identically before and after).
 unsafe fn capture_boot_info(
     info: *const arch::MultibootInfo,
     mmap_out: &mut [MultibootMmapEntry; 128],
-) -> (arch::MultibootInfo, usize) {
+    cmdline_out: &mut [u8],
+) -> (arch::MultibootInfo, usize, usize) {
     let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo;
     let inf = unsafe { core::ptr::read_unaligned(src) };
     let mut count = 0;
@@ -65,7 +66,17 @@ unsafe fn capture_boot_info(
             *slot = unsafe { core::ptr::read_unaligned(m.add(i)) };
         }
     }
-    (inf, count)
+    let mut cmdline_len = 0;
+    if inf.flags & (1 << 2) != 0 && inf.cmdline != 0 {
+        let command = (inf.cmdline as usize).wrapping_add(PHYS_TO_SEG) as *const u8;
+        while cmdline_len < cmdline_out.len() {
+            let b = unsafe { core::ptr::read_volatile(command.add(cmdline_len)) };
+            if b == 0 { break; }
+            cmdline_out[cmdline_len] = b;
+            cmdline_len += 1;
+        }
+    }
+    (inf, count, cmdline_len)
 }
 
 /// boot_kernel - Entry point called by asm boot stub
@@ -86,7 +97,9 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // on offset segments (base = KERNEL_PHYS - KERNEL_BASE), so a physical
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
     let mut mmap_buf = [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
-    let (boot_info, mmap_count) = unsafe { capture_boot_info(info, &mut mmap_buf) };
+    let mut boot_cmdline = [0u8; 512];
+    let (boot_info, mmap_count, boot_cmdline_len) =
+        unsafe { capture_boot_info(info, &mut mmap_buf, &mut boot_cmdline) };
     let info = &boot_info;
 
     let kernel_size =
@@ -227,9 +240,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     lib::screenln!(screen);
     lib::screenln!(screen, "\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Read the boot config (QEMU fw_cfg) at the platform boundary, before
-    // handing it to the kernel — the kernel no longer pokes firmware ports.
-    let config = read_boot_config();
+    // Read platform boot configuration at the boundary, before handing it to
+    // the kernel. The Multiboot command line carries physical-machine policy;
+    // QEMU-only launch settings additionally come from fw_cfg.
+    let config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
 
     // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a
     // freeze-at-first-IRQ on real hardware is readable instead of a black hang.
@@ -249,11 +263,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     crate::kernel::startup::startup(&mut machine, &config, screen);
 }
 
-/// Read QEMU's fw_cfg interface into a `BootConfig` (headless cmdline/cwd,
-/// debug-watch, is-QEMU signature). Absent fw_cfg (Bochs / real hardware) reads
-/// 0xFF → no QEMU signature → an empty interactive config. Port I/O is a real
-/// `out`/`in` here in the metal boot glue, so the kernel never touches it.
-fn read_boot_config() -> crate::BootConfig {
+/// Read platform boot settings into a `BootConfig`. The Multiboot command line
+/// is available on real hardware; QEMU additionally supplies its headless
+/// cmdline/cwd/debug settings through fw_cfg. Port I/O remains here in the
+/// metal boot glue, so the kernel never touches firmware ports.
+fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     const SEL: u16 = 0x510;
     const DATA: u16 = 0x511;
     fn select(sel: u16) { x86::outw(SEL, sel); }
@@ -282,12 +296,16 @@ fn read_boot_config() -> crate::BootConfig {
     }
 
     let mut cfg = crate::BootConfig::empty();
+    cfg.persistent_disk_writes = multiboot_cmdline
+        .split(|b| b.is_ascii_whitespace())
+        .any(|arg| arg.eq_ignore_ascii_case(b"disk-writes=persistent"));
+
     select(0x0000); // FW_CFG_SIGNATURE
     let mut sig = [0u8; 4];
     read_bytes(&mut sig);
     cfg.is_qemu = &sig == b"QEMU";
     if !cfg.is_qemu {
-        return cfg; // no fw_cfg interface — interactive boot
+        return cfg; // no fw_cfg interface — retain Multiboot policy only
     }
     let mut buf = [0u8; 4096];
     if let Some(n) = read_named(b"opt/cmdline", &mut buf) { cfg.set_cmdline(&buf[..n]); }

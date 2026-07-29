@@ -2379,7 +2379,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 } else if replace_exists {
                     crate::kernel::vfs::close(fd, &mut kt.fds);
                     let new_fd = match dfs_create_path(dos, &name[..i]) {
-                        Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                        Ok((path, len)) => {
+                            let parent_end =
+                                path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                            dfs::ci::invalidate(&path[..parent_end]);
+                            crate::kernel::vfs::create(&path[..len], &mut kt.fds)
+                        }
                         Err(e) => -e,
                     };
                     if new_fd >= 0 {
@@ -2399,7 +2404,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 }
             } else if create_not {
                 let new_fd = match dfs_create_path(dos, &name[..i]) {
-                    Ok((path, len)) => crate::kernel::vfs::create(&path[..len], &mut kt.fds),
+                    Ok((path, len)) => {
+                        let parent_end =
+                            path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        dfs::ci::invalidate(&path[..parent_end]);
+                        crate::kernel::vfs::create(&path[..len], &mut kt.fds)
+                    }
                     Err(e) => -e,
                 };
                 if new_fd >= 0 {

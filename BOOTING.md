@@ -43,13 +43,29 @@ then `sudo update-grub` and reboot.
 - **Secure Boot must be disabled** in firmware setup: GRUB under Secure Boot
   lockdown refuses `multiboot` of unsigned binaries.
 
+## Persistent disk writes
+
+Real-hardware boots are safe by default: RetroOS places a volatile RAM overlay
+over every detected disk, so writes work during the session but disappear on
+reboot. To deliberately let writes reach the physical disks, add the explicit
+Multiboot argument:
+
+```
+multiboot /retroos/kernel.elf disk-writes=persistent
+```
+
+The boot screen prints a red `Disk writes: PERSISTENT` warning when this mode is
+active. This applies to every physical disk RetroOS detects; use it only when
+that is intentional. `CONFIG.SYS` cannot enable the mode because it is read
+from disk after the storage policy has already been installed.
+
 ## What happens
 
 GOP text console (the kernel renders into the framebuffer GRUB hands over —
-`kernel/src/arch/fbcon.rs`), then a diskless boot: a GPT disk's protective
-MBR matches no RetroOS partition types, so `/boot` is mounted from the
-embedded bootfs and DN starts from it. The machine's own disk is never
-mounted, and the NVMe driver is read-only regardless.
+`kernel/src/arch/fbcon.rs`), then storage discovery. RetroOS walks MBR or GPT
+partitions, mounts the selected ext4 root, and overlays its embedded bootfs at
+`/boot` so DN and COMMAND.COM remain available. On a default metal boot, block
+writes land in the volatile overlay rather than on the physical device.
 
 Keyboard: the i8042 path (most laptops expose one via EC emulation) feeds
 the personality BIOS's INT 09. Machines with USB-only input are handled by the
@@ -60,6 +76,7 @@ Caveats on real hardware (vs the `run_uefi.sh` mock):
 - fbcon accepts 32bpp direct-RGB framebuffers and converts its pixels using the
   channel positions and widths reported by GRUB.
 - ACPI shutdown isn't wired on metal: reboot/power off by holding the power
-  button. Nothing persists; Secure Boot can be re-enabled afterwards.
-- An old MBR-partitioned disk with a type-0x83 partition WILL be mounted
-  (read-only) as the RetroOS root — harmless, but your files appear in DN.
+  button. By default nothing persists; Secure Boot can be re-enabled afterwards.
+- An MBR- or GPT-partitioned disk containing ext4 can become the RetroOS root.
+  Its files appear in DN, but physical changes still require the explicit
+  persistent-write switch above.

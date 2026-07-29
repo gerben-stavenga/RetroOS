@@ -30,14 +30,14 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // the partition tables, by the layer that owns it.
     let platform = crate::kernel::platform::probe(machine, boot);
 
-    // Disk-write policy, applied by COMPOSITION: on real hardware the disk is
-    // someone's actual home partition, so each one is wrapped in a volatile RAM
-    // overlay and the wrapped disk becomes the only reference that exists from
-    // here on — nothing downstream can reach the platter, and no write path has
-    // to remember to check a flag. QEMU/hosted runs write through to their
-    // disposable image file. Done before the partition scan, so every Volume
-    // built below already carries the policy.
-    let disks = if platform.host == crate::kernel::platform::Host::Metal {
+    // Disk-write policy, applied by COMPOSITION: metal defaults to wrapping
+    // every physical disk in a volatile RAM overlay. The only escape hatch is
+    // the explicit early-boot `disk-writes=persistent` policy; CONFIG.SYS is
+    // deliberately too late to weaken storage safety. Done before partition
+    // scanning, so every Volume built below already carries the policy.
+    let disks = if platform.host == crate::kernel::platform::Host::Metal
+        && !boot.persistent_disk_writes
+    {
         crate::screenln!(screen, "Disk writes: volatile RAM overlay (real hardware) — changes will NOT persist");
         disks
             .into_iter()
@@ -47,6 +47,20 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
             })
             .collect()
     } else {
+        match platform.host {
+            crate::kernel::platform::Host::Metal => crate::screenln!(
+                    screen,
+                    "\x1b[91mDisk writes: PERSISTENT — physical devices are writable\x1b[0m"
+                ),
+            crate::kernel::platform::Host::Qemu => crate::screenln!(
+                    screen,
+                    "Disk writes: QEMU virtual disk (persistence is controlled by QEMU)"
+                ),
+            crate::kernel::platform::Host::Interp => crate::screenln!(
+                    screen,
+                    "Disk writes: hosted disk image"
+                ),
+        }
         disks
     };
 
