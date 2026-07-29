@@ -96,10 +96,10 @@ impl Proc {
     const EMPTY: Proc = Proc { tid: 0, state: 0, focused: false, name: [0; 16], name_len: 0 };
 }
 
-/// The picker's snapshot, rebuilt each event-loop iteration while the monitor is
-/// open — that's the one place the whole thread table is in scope. Single-
-/// threaded cooperative kernel, so a plain `static mut` behind accessors, the
-/// same discipline as the flags above.
+/// The picker's snapshot, rebuilt once per timer tick while the monitor is
+/// open — at the event-loop point where the whole thread table is borrowable.
+/// Single-threaded cooperative kernel, so a plain `static mut` behind
+/// accessors, the same discipline as the flags above.
 static mut PROCS: [Proc; MAX_LIST] = [Proc::EMPTY; MAX_LIST];
 static PROC_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PICK_SEL: AtomicUsize = AtomicUsize::new(0);

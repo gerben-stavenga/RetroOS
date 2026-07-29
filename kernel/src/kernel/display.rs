@@ -86,26 +86,30 @@ pub fn present_host(w: usize, h: usize, pixels: &mut alloc::vec::Vec<u32>) {
 }
 
 /// Scratch for the raster: the palette in framebuffer format, a compact
-/// completed-frame surface, and the beam.
+/// completed-frame surface, and how far the sweep has painted.
 pub struct Scratch {
     pal: lib::vga_render::Pal,
     pal_cache: [u8; 768],
-    /// Write-back shadow with one framebuffer-width row per VGA source row.
-    /// The emulated beam paints here a band at a time; vertical stretching is
+    /// Write-back shadow with one picture-width row per VGA source row.
+    /// The sweep paints here a band at a time; vertical stretching is
     /// deferred to the completed-frame GOP blit.
     surface: alloc::vec::Vec<u8>,
-    /// Geometry the beam is armed for
+    /// Geometry the sweep is armed for
     /// `(w, h, out_w, out_h, panel_w, panel_h)`; any change
     /// restarts the sweep at the top — a mode switch repaints everything,
     /// borders included, within one refresh period by construction.
     geo: (usize, usize, usize, usize, usize, usize),
-    /// Beam position: next source row.
+    /// How far the sweep has painted: the next source row to draw. The row
+    /// the sweep should reach is derived from `phase`.
     sy: usize,
-    /// Fractional row credit: accrues `elapsed_ms × h`, spends `period_ms`
-    /// per source row, capped at one frame of debt (a long stall skips
-    /// frames instead of fast-forwarding the beam).
-    acc: u64,
-    last_ms: u64,
+    /// Display time-slice within the current refresh. Advanced exactly once
+    /// per call; missed kernel slices delay the display rather than creating
+    /// catch-up debt.
+    phase: usize,
+    period_ticks: usize,
+    /// Last time a pass ran, for liveness only ([`beam_vretrace`] reports
+    /// nothing once the sweep has gone quiet).
+    last_tick: u64,
 }
 
 impl Default for Scratch {
@@ -122,8 +126,9 @@ impl Scratch {
             surface: alloc::vec::Vec::new(),
             geo: (0, 0, 0, 0, 0, 0),
             sy: 0,
-            acc: 0,
-            last_ms: 0,
+            phase: 0,
+            period_ticks: 0,
+            last_tick: 0,
         }
     }
 }
@@ -253,25 +258,24 @@ unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
     }
 }
 
-/// Publish a completed horizontally-stretched VGA shadow. Vertical expansion
-/// is whole-row copying only; format conversion already happened in the
-/// distributed raster pass.
+/// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
+/// PICTURE only — `out_w × vga_height` — so this is pure vertical expansion:
+/// each source row is copied to the output rows it covers, at the centered
+/// picture origin. Format conversion already happened in the raster pass, and
+/// the pillarbox/letterbox bars were painted once at the mode switch, so
+/// nothing here touches a pixel outside the picture.
 pub fn present(fb: &Framebuffer, vga_height: usize, shadow: &[u8]) -> usize {
     let step = fb.format.bytes_per_pixel as usize;
-    let row_bytes = fb.width * step;
+    let (out_w, out_h) = fit_vga(fb.width, fb.height);
+    let row_bytes = out_w * step;
     if vga_height == 0 || shadow.len() < row_bytes * vga_height {
         return 0;
     }
-    let (_, out_h) = fit_vga(fb.width, fb.height);
+    let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
-    let out = unsafe {
-        core::slice::from_raw_parts_mut(fb.va as *mut u8, fb.pitch * fb.height)
-    };
+    let origin = fb.va + by * fb.pitch + bx * step;
 
-    for y in 0..by {
-        unsafe { core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.pitch), 0, row_bytes) };
-    }
     let mut oy = 0usize;
     let mut yerr = 0usize;
     for sy in 0..vga_height {
@@ -279,24 +283,16 @@ pub fn present(fb: &Framebuffer, vga_height: usize, shadow: &[u8]) -> usize {
         let carry = (yerr >= vga_height) as usize;
         let rows = ybase + carry;
         yerr -= carry * vga_height;
-        let src = &shadow[sy * row_bytes..(sy + 1) * row_bytes];
+        let src = shadow[sy * row_bytes..(sy + 1) * row_bytes].as_ptr();
         for _ in 0..rows {
             unsafe {
-                copy_bytes(
-                    out.as_mut_ptr().add((by + oy) * fb.pitch),
-                    src.as_ptr(),
-                    row_bytes,
-                    fb.wide,
-                );
+                copy_bytes((origin + oy * fb.pitch) as *mut u8, src, row_bytes, fb.wide);
             }
             oy += 1;
         }
     }
-    for y in by + out_h..fb.height {
-        unsafe { core::ptr::write_bytes(out.as_mut_ptr().add(y * fb.pitch), 0, row_bytes) };
-    }
     finish_present();
-    fb.width * fb.height
+    out_w * out_h
 }
 
 /// Vertical-blank length in beam steps (source rows). The 70 Hz VGA CRTC
@@ -308,51 +304,66 @@ fn vblank_rows(h: usize) -> usize {
     (h * 49 / 400).max(1)
 }
 
-/// The beam's guest-visible vertical-retrace state, when a beam is actively
-/// sweeping this display: `Some(in_retrace)`. `None` when no raster is live
+/// The sweep's guest-visible vertical-retrace state, when one is actively
+/// running on this display: `Some(in_retrace)`. `None` when no raster is live
 /// on this scratch (window sink, unfocused thread, real VGA) — the caller
 /// falls back to its clock fabrication. This is what makes the fabricated
 /// 0x3DA truthful: "in retrace" means the frame really has finished
 /// painting, so retrace-raced VRAM updates land exactly as on hardware.
-pub fn beam_vretrace(s: &Scratch, now_ms: u64) -> Option<bool> {
+pub fn beam_vretrace(s: &Scratch, now_tick: u64) -> Option<bool> {
     let h = s.geo.1;
-    if h == 0 || now_ms.saturating_sub(s.last_ms) > 100 {
+    if h == 0 || now_tick.saturating_sub(s.last_tick) > 100 {
         return None;
     }
     Some(s.sy >= h)
 }
 
-/// Cheap pre-gate for [`raster`]: would the beam step at all now? Lets the
-/// event loop skip the scanout entirely on the (vast majority of) passes
-/// where no step is due yet.
-pub fn raster_pending(s: &Scratch, now_ms: u64, period_ms: u64) -> bool {
-    let h = s.geo.1;
-    if h == 0 {
-        return true; // not armed yet: run once to arm the geometry
+/// The source rows the next [`raster`] can touch, as `(first, count)` — what
+/// the caller must have in the guest snapshot before calling it. A pass paints
+/// a band, not a frame, so snapshotting the whole aperture copies several times
+/// more guest memory than the beam reads.
+///
+/// No forecast: a pass paints at most `h/8` rows by construction, so the band
+/// is the beam's current row plus that cap. The whole frame only when the beam
+/// is about to restart at row 0 — unarmed, armed for another mode, or wrapping
+/// through vertical blank into the next sweep.
+pub fn beam_band(s: &Scratch, w: usize, h: usize) -> (usize, usize) {
+    if (s.geo.0, s.geo.1) != (w, h) || h == 0 {
+        return (0, h);
     }
-    let total = (h + vblank_rows(h)) as u64;
-    s.acc + now_ms.saturating_sub(s.last_ms) * total >= period_ms
+    let cap = (h / 8).max(1);
+    if s.sy + cap > h + vblank_rows(h) {
+        return (0, h); // may wrap and resume at the top
+    }
+    let first = s.sy.min(h);
+    ((first), (first + cap).min(h) - first)
 }
 
-/// Advance the raster beam and paint the band of device rows now due.
+/// Advance one display time slice, paint its source-row band, and say whether
+/// that finished a frame.
 ///
-/// The frame is presented the way the hardware presented it: a beam sweeps
-/// a cached shadow top to bottom once per refresh period, re-rendering every
-/// pixel from the live VGA state as it passes. At vertical blank the completed
-/// shadow is copied to the GOP framebuffer in one burst. GOP scanout has no
-/// portable vblank/page-flip interface and runs on a clock unrelated to this
-/// emulated beam; exposing each software band directly made the physical
-/// display sample a ladder of different update times. The single publication
-/// keeps the expensive render work distributed while reducing that race to
-/// the shortest operation GOP permits.
+/// The frame is presented the way the hardware presented it: a sweep runs down
+/// a cached shadow once per refresh period, re-rendering every pixel from the
+/// live VGA state as it passes — so mid-frame register and palette writes shear
+/// exactly as the raster effects they were written for expect. Pacing is a
+/// small discrete counter: 14 processed kernel slices per normal refresh, 50
+/// for the conservative slow-framebuffer path. If slices are missed, refresh
+/// simply runs late; there is no wall-clock catch-up.
+///
+/// At vertical blank the completed shadow is copied to the GOP framebuffer in
+/// one burst. GOP scanout has no portable vblank/page-flip interface and runs
+/// on a clock unrelated to this sweep; exposing each software band directly
+/// made the physical display sample a ladder of different update times. The
+/// single publication keeps the expensive render work distributed while
+/// reducing that race to the shortest operation GOP permits.
 ///
 /// DOS modes are authored for a 4:3 display with non-square pixels, so the
 /// source is fitted to the framebuffer's 4:3 rectangle: 320x200 stretched
 /// 6/5 tall, 320x240 square. One pass per SOURCE row: the renderer draws the
 /// row in the framebuffer's pixel format and stretches it horizontally into
-/// the compact shadow (black borders included). The completion blit copies
-/// each source row to its vertically stretched output run, using a Bresenham
-/// accumulator for non-integral scale factors.
+/// the compact `out_w × h` shadow — the picture alone, no borders. The
+/// completion blit copies each source row to its vertically stretched output
+/// run, using a Bresenham accumulator for non-integral scale factors.
 ///
 /// Returns whether a coherent shadow completed as the beam entered vertical
 /// retrace. Publication is deliberately left to the event-loop caller, which
@@ -361,8 +372,8 @@ pub fn raster(
     s: &mut Scratch,
     fb: &Framebuffer,
     frame: &lib::vga_render::Frame,
-    now_ms: u64,
-    period_ms: u64,
+    now_tick: u64,
+    period_ticks: usize,
 ) -> bool {
     let (w, h) = lib::vga_render::dimensions(frame.mode);
     if w == 0 || h == 0 {
@@ -373,48 +384,61 @@ pub fn raster(
         return false; // no downscaling path
     }
 
-    let bx = (fb.width - out_w) / 2; // left border width
     let step = fb.format.bytes_per_pixel as usize;
-    let row_bytes = fb.width * step;
-    // Constant-N stretching and overlapping dword pixel stores may run past
-    // the last logical pixel. Intermediate rows spill into rows later
-    // repainted; this one guard protects the final row.
-    let guard = out_w.div_ceil(w) * step + 3;
+    let row_bytes = out_w * step;
+    // The stretch writes one 4-byte store per output pixel, up to N per source
+    // pixel, so the last row's final run reaches past the picture: the buffer
+    // carries N × 4 bytes for it. Earlier rows reach into the next row, which
+    // is repainted before the frame is published.
+    let slack = out_w.div_ceil(w) * 4;
 
+    if period_ticks == 0 {
+        return false;
+    }
     let geo = (w, h, out_w, out_h, fb.width, fb.height);
-    if s.geo != geo
-        || s.surface.len() != row_bytes * h + guard
-    {
+    let reset = s.geo != geo
+        || s.surface.len() != row_bytes * h + slack
+        || s.period_ticks != period_ticks;
+    if reset {
         s.geo = geo;
         s.surface.clear();
-        s.surface.resize(row_bytes * h + guard, 0);
+        s.surface.resize(row_bytes * h + slack, 0);
         s.sy = 0;
-        s.acc = 0;
-        s.last_ms = now_ms;
-        // The zeroed shadow reclaims pillarbox/letterbox bars on the first
-        // completed frame without exposing a half-cleared mode switch.
+        s.phase = 0;
+        s.period_ticks = period_ticks;
+        s.last_tick = now_tick;
+        // Mode switch: reclaim the whole panel ONCE — pillarbox bars and
+        // letterbox bands included, whatever the previous mode or a console
+        // print left there. The shadow carries the picture only, so from here
+        // every present copies the picture span and the bars cost nothing.
+        unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
     }
 
-    // Step credit from elapsed virtual time: a sweep is `h` painted rows
-    // plus a vertical-blank tail, all steps together spanning one period —
-    // at most one frame of debt, at most a bounded band per call.
+    // One call is one display time slice. Map the new phase to a beam target;
+    // the forward distance is this slice's band. The explicit phase rollover
+    // preserves the refresh edge without retaining elapsed-time debt.
     let vb = vblank_rows(h);
-    let total = (h + vb) as u64;
-    let dt = now_ms.saturating_sub(s.last_ms);
-    s.last_ms = now_ms;
-    s.acc = (s.acc + dt * total).min(total * period_ms);
-    let due = (s.acc / period_ms) as usize;
-    let paint = due.min((h / 8).max(1));
+    let total = h + vb;
+    s.last_tick = now_tick;
+    s.phase += 1;
+    if s.phase == period_ticks {
+        s.phase = 0;
+    }
+    let target = s.phase * total / period_ticks;
+    let paint = (total + target - s.sy) % total;
     if paint == 0 {
         return false;
     }
-    s.acc -= paint as u64 * period_ms;
 
     // Palette synced per band, not per frame: a mid-frame DAC write shears
     // across the sweep exactly like the raster effects it was written for.
     s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
+    if matches!(frame.mode, lib::vga_render::VgaMode::Planar16 { .. })
+        && (reset || s.phase == 0)
+    {
+        s.pal.sync_planar(frame.ac);
+    }
 
-    let mut wrapped = false;
     for _ in 0..paint {
         if s.sy >= h {
             // Vertical blank: the beam idles below the frame. 0x3DA reads
@@ -425,37 +449,33 @@ pub fn raster(
             }
             continue;
         }
-        let row = s.sy * row_bytes;
-        // Reclaim this row's borders and any overlapping-store tail from the
-        // preceding row before painting its content.
-        s.surface[row..row + row_bytes].fill(0);
-        let d = row + bx * step;
-        lib::vga_render::render_row_stretched(
-            frame,
-            s.sy,
-            &s.pal,
-            &mut s.surface[d..],
-            out_w,
-        );
+        // No pre-clear: `render_row_stretched` overwrites the row's whole
+        // `out_w` span, and the overlapping-store tail spills into the next
+        // row, which is painted before this frame is published.
+        lib::vga_render::render_row_stretched(frame, s.sy, &s.pal, &mut s.surface, out_w);
         s.sy += 1;
         if s.sy == h {
             // Frame complete: the beam enters vertical blank. The event loop
-            // may now composite kernel UI before publishing this shadow.
-            wrapped = true;
+            // must publish this coherent shadow before any next-frame row is
+            // allowed to overwrite it. Any remaining blank-time distance is
+            // harmlessly absorbed by the next display slice.
+            return true;
         }
     }
-    wrapped
+    false
 }
 
-/// The completed packed shadow owned by a raster scratch. Valid for
-/// composition/publication when [`raster`] has just returned `true`.
+/// The completed packed shadow owned by a raster scratch, as
+/// `(vga_height, out_w, pixels)` — the picture alone, `out_w × vga_height`,
+/// pitched by `out_w × bytes_per_pixel`. Valid for composition/publication
+/// when [`raster`] has just returned `true`.
 pub fn completed_shadow(s: &mut Scratch) -> Option<(usize, usize, &mut [u8])> {
     let h = s.geo.1;
-    let width = s.geo.4;
-    let stride = width.checked_mul(s.pal.fmt.bytes_per_pixel as usize)?;
+    let out_w = s.geo.2;
+    let stride = out_w.checked_mul(s.pal.fmt.bytes_per_pixel as usize)?;
     let len = stride.checked_mul(h)?;
     if h == 0 || s.surface.len() < len {
         return None;
     }
-    Some((h, stride, &mut s.surface[..len]))
+    Some((h, out_w, &mut s.surface[..len]))
 }

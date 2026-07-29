@@ -20,6 +20,20 @@ const PAGE_SIZE: usize = 4096;
 static LARGE_ALLOCS: AtomicU32 = AtomicU32::new(0);
 static LARGE_FREES: AtomicU32 = AtomicU32::new(0);
 static LARGE_REUSE: AtomicU32 = AtomicU32::new(0); // satisfied from free list (no extend)
+static ALLOCATIONS: AtomicU32 = AtomicU32::new(0);
+static DEALLOCATIONS: AtomicU32 = AtomicU32::new(0);
+
+/// Successful heap allocation and deallocation calls since boot.
+///
+/// Reading these counters performs no allocation, so they are safe to include
+/// in the profiler output. `allocations - deallocations` is the number of live
+/// allocations modulo counter wrap.
+pub fn allocation_counts() -> (u32, u32) {
+    (
+        ALLOCATIONS.load(Relaxed),
+        DEALLOCATIONS.load(Relaxed),
+    )
+}
 
 /// Free block header stored at the start of each free region.
 struct FreeBlock {
@@ -244,6 +258,7 @@ unsafe impl GlobalAlloc for DemandHeap {
 
         if let Some(ptr) = inner.alloc_from_list(size, align) {
             if size >= 100_000 { LARGE_REUSE.fetch_add(1, Relaxed); }
+            ALLOCATIONS.fetch_add(1, Relaxed);
             return ptr;
         }
 
@@ -252,7 +267,11 @@ unsafe impl GlobalAlloc for DemandHeap {
             return core::ptr::null_mut();
         }
 
-        inner.alloc_from_list(size, align).unwrap_or(core::ptr::null_mut())
+        let ptr = inner.alloc_from_list(size, align).unwrap_or(core::ptr::null_mut());
+        if !ptr.is_null() {
+            ALLOCATIONS.fetch_add(1, Relaxed);
+        }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -260,6 +279,7 @@ unsafe impl GlobalAlloc for DemandHeap {
 
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         if size >= 100_000 { LARGE_FREES.fetch_add(1, Relaxed); }
+        DEALLOCATIONS.fetch_add(1, Relaxed);
         inner.add_free_region(ptr as usize, size);
     }
 }

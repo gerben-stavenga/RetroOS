@@ -166,7 +166,9 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         palette[i * 3 + 1] = ((i * 3) & 63) as u8;
         palette[i * 3 + 2] = ((i * 5) & 63) as u8;
     }
-    let vram: Vec<u8> = (0..320).map(|x| (x & 255) as u8).collect();
+    // A full mode-13h page, so the last row reads real pixels rather than
+    // falling off the end into index 0 (which would compare black to black).
+    let vram: Vec<u8> = (0..320 * 200).map(|i| (i % 320 & 255) as u8).collect();
     let ac = identity_ac();
     let frame = Frame {
         mode: VgaMode::Mode13h,
@@ -187,18 +189,21 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         PixelFormat::NATIVE,
     ];
     let out_w = 643usize; // non-integral 643/320 exercises the DDA carry
+    let sy = 199usize; // the LAST row: its final stores land in the slack
     for fmt in formats {
         let step = fmt.bytes_per_pixel as usize;
         let n = out_w.div_ceil(320);
-        let mut out = vec![0u8; (out_w + n) * step + 3];
+        // The whole shadow, exactly as the raster allocates it.
+        let mut out = vec![0u8; out_w * step * 200 + n * 4];
         let mut pal = vga_render::Pal::new();
         let mut cache = [0u8; 768];
         pal.sync(&palette, fmt, &mut cache);
-        vga_render::render_row_stretched(&frame, 0, &pal, &mut out, out_w);
+        vga_render::render_row_stretched(&frame, sy, &pal, &mut out, out_w);
+        let row = &out[sy * out_w * step..];
 
         let (base, rem) = (out_w / 320, out_w % 320);
         let (mut xout, mut err) = (0usize, 0usize);
-        for (x, &idx) in vram.iter().enumerate() {
+        for (x, &idx) in vram[sy * 320..(sy + 1) * 320].iter().enumerate() {
             err += rem;
             let carry = (err >= 320) as usize;
             err -= carry * 320;
@@ -206,7 +211,7 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
             let expected = fmt.encode(pal_rgb(&palette, idx)).to_le_bytes();
             for p in xout..xout + run {
                 assert_eq!(
-                    &out[p * step..p * step + step],
+                    &row[p * step..p * step + step],
                     &expected[..step],
                     "{step}-byte output, source {x}, output {p}"
                 );
@@ -214,5 +219,7 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
             xout += run;
         }
         assert_eq!(xout, out_w);
+        // Only row `sy` was asked for, so every earlier row must be untouched.
+        assert!(out[..sy * out_w * step].iter().all(|&b| b == 0));
     }
 }

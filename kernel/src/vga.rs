@@ -100,27 +100,21 @@ fn scanout(fb: &Framebuffer, frame: &Frame<'_>) {
         return;
     }
 
+    // Picture-only shadow, exactly like the timed raster: the bars around it
+    // were cleared once when `fbcon` mapped the framebuffer, and every mode
+    // fits the same 4:3 rectangle, so they stay black without being rewritten.
     let step = fb.format.bytes_per_pixel as usize;
-    let row_bytes = fb.width * step;
-    let bx = (fb.width - out_w) / 2;
-    let guard = out_w.div_ceil(w) * step + 3;
+    let row_bytes = out_w * step;
+    let slack = out_w.div_ceil(w) * 4; // final run's overlapping dword stores
     let scanout_p = &raw mut SCANOUT;
     let s = unsafe { &mut *scanout_p };
-    let need = row_bytes * h + guard;
+    let need = row_bytes * h + slack;
     if s.surface.len() != need {
         s.surface.resize(need, 0);
     }
     s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
     for sy in 0..h {
-        let row = sy * row_bytes;
-        s.surface[row..row + row_bytes].fill(0);
-        lib::vga_render::render_row_stretched(
-            frame,
-            sy,
-            &s.pal,
-            &mut s.surface[row + bx * step..],
-            out_w,
-        );
+        lib::vga_render::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
     crate::kernel::display::present(fb, h, &s.surface[..row_bytes * h]);
 }

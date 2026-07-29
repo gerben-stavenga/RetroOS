@@ -112,6 +112,9 @@ pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
 /// machine should be louder or quieter.
 pub(super) const OUTPUT_GAIN_Q16: i32 = 65_536;
 
+/// One canonical 128-frame block at the SB16 maximum of 16-bit stereo.
+const DSP_SCRATCH_BYTES: usize = 128 * 4;
+
 /// Per-thread Sound Blaster card state: the BLASTER-declared channel/IRQ map,
 /// and either the passthrough remap binding or the emulated library card
 /// depending on `mode`. The generic virtual 8237 it observes is bus
@@ -196,6 +199,10 @@ pub struct SoundBlaster {
     est_cap: u64,
     est_slope: u64,
     est_served: u64,
+    /// Linearized guest DMA window for the software mixer. The emulated SB16
+    /// is capped at the canonical mix rate, so one 128-frame 16-bit stereo
+    /// block is the strict maximum. Audio mixing therefore never allocates.
+    dsp_scratch: [u8; DSP_SCRATCH_BYTES],
 }
 
 impl SoundBlaster {
@@ -217,6 +224,7 @@ impl SoundBlaster {
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
+            dsp_scratch: [0; DSP_SCRATCH_BYTES],
         }
     }
 
@@ -877,7 +885,12 @@ impl SoundBlaster {
     ) {
         if let Some(f) = self.core.dsp_fetch(rate, base, block.len()) {
             let fb = f.frame_bytes as usize;
-            let mut scratch = alloc::vec![0u8; f.source_frames * fb];
+            let need = f.source_frames * fb;
+            let Some(scratch) = self.dsp_scratch.get_mut(..need) else {
+                debug_assert!(false, "SB fetch exceeds fixed mixer block");
+                self.core.mix_fm(rate, block);
+                return;
+            };
             let mut copied = 0usize;
             while copied < f.source_frames {
                 let abs = f.first + copied as u64;
@@ -888,7 +901,7 @@ impl SoundBlaster {
                 machine.copy_from(addr, &mut scratch[lo..lo + run * fb]);
                 copied += run;
             }
-            self.core.mix_dsp(rate, base, &scratch, &f, block);
+            self.core.mix_dsp(rate, base, scratch, &f, block);
         }
         self.core.mix_fm(rate, block);
     }

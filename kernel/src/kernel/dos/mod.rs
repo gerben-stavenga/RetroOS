@@ -1107,9 +1107,8 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 }
 
 /// Render the emulated VGA to the platform display (no-op with a real card
-/// or no present sink). Called by the event loop with the absolute tick clock;
-/// presents once per emulated VGA frame on the retrace edge (see
-/// `machine::display_tick`).
+/// or no present sink). Each call is one display time slice; the absolute tick
+/// value is used only to notice when an inactive sweep has gone stale.
 pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &Regs, now_ticks: u64) {
     machine::display_tick(machine, &mut dos.pc, regs, now_ticks);
 }

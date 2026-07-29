@@ -597,6 +597,9 @@ impl PixelFormat {
 /// `fmt` instead.
 pub struct Pal {
     pub lut: [u32; 256],
+    /// Planar pixel value → Attribute Controller → DAC → packed framebuffer
+    /// pixel. Rebuilt once at the start of a planar frame.
+    planar: [u32; 16],
     pub fmt: PixelFormat,
 }
 
@@ -608,7 +611,7 @@ impl Default for Pal {
 
 impl Pal {
     pub const fn new() -> Pal {
-        Pal { lut: [0; 256], fmt: PixelFormat::NATIVE }
+        Pal { lut: [0; 256], planar: [0; 16], fmt: PixelFormat::NATIVE }
     }
 
     /// Rebuild for `palette`/`fmt`. Cheap to call every frame — it compares
@@ -624,21 +627,31 @@ impl Pal {
         }
         true
     }
+
+    /// Fold the complete 16-colour planar lookup into one tiny table. The
+    /// raster calls this once at phase zero; pixels then need only extract
+    /// their four-bit plane value and index the final packed colour.
+    pub fn sync_planar(&mut self, ac: &[u8; 21]) {
+        for val in 0..16 {
+            self.planar[val] = self.lut[planar_dac_index(ac, val as u8) as usize];
+        }
+    }
 }
 
 /// Render ONE source scanline into `out`, in the framebuffer's format.
 ///
 /// The caller places each horizontally-stretched row directly in its compact
-/// `framebuffer_width × VGA_height` shadow. Presentation later expands those
-/// completed rows vertically with bulk copies; every VGA mode takes this path.
+/// `out_w × VGA_height` shadow. Presentation later expands those completed
+/// rows vertically with bulk copies; every VGA mode takes this path.
 ///
 /// Horizontal-stretch cursor, templated on `N = ceil(out_w / w)` — the
 /// constant overwrite width, so each pixel's run is N straight-line stores
 /// with no per-pixel loop. The cursor advances by the true Bresenham run
 /// (`out_w/w` or one more), so the overwrite overshoots at most one pixel,
-/// harmlessly covered by the next run; `out` carries `N` slack past `out_w`
-/// for the last one. `N = 0` is the dynamic-width instance for ratios no
-/// constant was compiled for.
+/// harmlessly covered by the next run; `out` carries `N × 4` bytes past
+/// `out_w` for the last one, since each store is a dword whatever the pixel
+/// width. `N = 0` is the dynamic-width instance for ratios no constant was
+/// compiled for.
 struct StretchRow<'a, const N: usize> {
     out: &'a mut [u8],
     /// Byte offset of the next output run.
@@ -681,10 +694,11 @@ fn row_stretched<const N: usize>(
     w: usize,
     out_w: usize,
 ) {
+    let step = pal.fmt.bytes_per_pixel as usize;
     let st = &mut StretchRow::<N> {
         out,
-        o: 0,
-        step: pal.fmt.bytes_per_pixel as usize,
+        o: sy * out_w * step,
+        step,
         err: 0,
         base: out_w / w,
         rem: out_w % w,
@@ -701,11 +715,12 @@ fn row_stretched<const N: usize>(
     }
 }
 
-/// Colour-translate source row `sy` — ANY mode — directly into the
-/// `out_w`-wide stretch buffer `out` (sized with `ceil(out_w/w)` slack):
-/// translation and horizontal stretch in one pass, no source-width
-/// intermediate. The decoders emit strictly left-to-right; a malformed
-/// frame may stop early, leaving the buffer's tail untouched.
+/// Colour-translate source row `sy` — ANY mode — directly into row `sy` of the
+/// `out_w × h` shadow `out`: translation and horizontal stretch in one pass, no
+/// source-width intermediate. `out` is the WHOLE shadow, pitched by
+/// `out_w × bytes_per_pixel` and carrying `ceil(out_w/w) × 4` bytes of slack for
+/// the last row's final stores. The decoders emit strictly left-to-right; a
+/// malformed frame may stop early, leaving that row's tail untouched.
 pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u8], out_w: usize) {
     let (w, h) = dimensions(frame.mode);
     if sy >= h || w == 0 || out_w < w {
@@ -713,7 +728,7 @@ pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u8],
     }
     let n = out_w.div_ceil(w);
     let step = pal.fmt.bytes_per_pixel as usize;
-    if !(2..=4).contains(&step) || out.len() < (out_w + n) * step + 3 {
+    if !(2..=4).contains(&step) || out.len() < out_w * step * h + n * 4 {
         return;
     }
     // Constant-width instances for the ratios real panels produce (text
@@ -782,7 +797,7 @@ fn row_planar16<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut St
         let p3 = frame.planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
         let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
         while bit < 8 && x < w {
-            st.put(pal.lut[planar_index(frame, ((pix >> (4 * bit)) & 0xF) as u8) as usize]);
+            st.put(pal.planar[((pix >> (4 * bit)) & 0xF) as usize]);
             bit += 1;
             x += 1;
         }
@@ -1034,19 +1049,9 @@ fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
     }
 }
 
-/// Map a planar 4-bit pixel value through the Attribute Controller palette and
-/// colour-select register to a DAC index, then to RGB. AC[0..15] supply the
-/// low 6 bits; AC[0x14] (colour select) supplies bits 4-5 (P4/P5) and 6-7
-/// (P6/P7), gated by the mode-control P5P4-select bit.
-#[inline]
-fn planar_rgb(frame: &Frame, val: u8) -> u32 {
-    pal_rgb(frame.palette, planar_index(frame, val))
-}
-
 /// The DAC index a 4-bit planar value selects, through the attribute
 /// controller palette and colour-select register.
-fn planar_index(frame: &Frame, val: u8) -> u8 {
-    let ac = frame.ac;
+fn planar_dac_index(ac: &[u8; 21], val: u8) -> u8 {
     let pal = ac[(val & 0x0F) as usize] & 0x3F;
     let csel = ac[0x14];
     // Mode control (AC[0x10]) bit 7: take P4/P5 from colour-select instead of
@@ -1086,6 +1091,8 @@ static SPREAD: [u32; 256] = {
 fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: usize) {
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
+    let colours: [u32; 16] =
+        core::array::from_fn(|i| pal_rgb(frame.palette, planar_dac_index(frame.ac, i as u8)));
     for y in 0..h {
         // Below the Line Compare split the address latch resets to 0 and panning
         // is suppressed — a fixed status panel under the scrolling playfield.
@@ -1115,7 +1122,7 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
             let p3 = planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
             let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
             while bit < 8 && x < w {
-                row[x] = planar_rgb(frame, ((pix >> (4 * bit)) & 0xF) as u8);
+                row[x] = colours[((pix >> (4 * bit)) & 0xF) as usize];
                 bit += 1;
                 x += 1;
             }

@@ -485,7 +485,7 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
-    crate::screenln!(screen, "Welcome to RetroOS! F10 toggles cycle profiling, F11 switches tasks, F12 dumps the running thread's state; type `help` for DOS commands.");
+    crate::screenln!(screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
     crate::screenln!(screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
@@ -610,13 +610,18 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_event_drain_tick = u64::MAX;
+    let mut last_osd_refresh_tick = u64::MAX;
 
     loop {
         stats.slice_begin(machine);
         stats.iteration(machine);
-        // Keep the F12 switch picker's process list fresh while it's open —
-        // here, at the top, where the whole thread table is borrowable.
-        if crate::kernel::osd::is_open() {
+        let now_tick = machine.get_ticks();
+        // Keep the F12 switch picker's process list fresh while it is open,
+        // but not on every port/interrupt exit: millisecond resolution is
+        // ample for a menu and polling games can cross this loop hundreds of
+        // times per tick.
+        if crate::kernel::osd::is_open() && now_tick != last_osd_refresh_tick {
+            last_osd_refresh_tick = now_tick;
             crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
         }
         stats.part(machine, 0);
@@ -625,7 +630,6 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         // within one millisecond; the hardware queue only needs inspecting
         // once on that same device cadence. This bounds keyboard/audio wakeup
         // latency to 1 ms while avoiding a CLI/queue/STI round-trip per port.
-        let now_tick = machine.get_ticks();
         let events = if now_tick != last_event_drain_tick {
             last_event_drain_tick = now_tick;
             crate::kernel::irq_dispatch::drain(machine)
@@ -1075,17 +1079,27 @@ static mut SLICE_PARTS: [u64; 5] = [0; 5];
 static mut PRESENTS: u64 = 0;
 
 /// display_tick's internals: scanout cycles, band-pass count (one raster
-/// band or one whole window-sink frame per bill), render/copy cycles, and
-/// destination pixels written.
-static mut DISP_PARTS: [u64; 4] = [0; 4];
+/// band or one whole window-sink frame per bill), VGA render cycles, final
+/// framebuffer/window publication cycles, and destination pixels written.
+static mut DISP_PARTS: [u64; 5] = [0; 5];
+static mut DISP_MODE: lib::vga_render::VgaMode = lib::vga_render::VgaMode::Text80x25;
 
-pub fn bill_display(scanout: u64, bands: u64, raster: u64, px: usize) {
+pub fn bill_display(
+    mode: lib::vga_render::VgaMode,
+    scanout: u64,
+    bands: u64,
+    render: u64,
+    present: u64,
+    px: usize,
+) {
     unsafe {
+        core::ptr::write_volatile(&raw mut DISP_MODE, mode);
         let p = &raw mut DISP_PARTS;
         (*p)[0] = (*p)[0].wrapping_add(scanout);
         (*p)[1] = (*p)[1].wrapping_add(bands);
-        (*p)[2] = (*p)[2].wrapping_add(raster);
-        (*p)[3] = (*p)[3].wrapping_add(px as u64);
+        (*p)[2] = (*p)[2].wrapping_add(render);
+        (*p)[3] = (*p)[3].wrapping_add(present);
+        (*p)[4] = (*p)[4].wrapping_add(px as u64);
     }
 }
 
@@ -1125,13 +1139,12 @@ pub fn bill_slice2(take: u64, ticks_cyc: u64, display: u64, audio: u64, nticks: 
     }
 }
 
-/// Is the periodic `[prof]` dump on? Written by the console chord, read by
-/// the event loop — the same single-threaded volatile-flag shape as
+/// Is the periodic `[prof]` dump on? Written by the F12 monitor, read by the
+/// event loop — the same single-threaded volatile-flag shape as
 /// `thread::request_switch`.
 static mut PROFILE_DUMP: bool = false;
 
-/// Toggle the profile dump, and say which way it went — a chord with no
-/// feedback is indistinguishable from a dead key.
+/// Toggle the profile dump and report its new state.
 pub fn toggle_profile() {
     let on = unsafe {
         let v = !core::ptr::read_volatile(&raw const PROFILE_DUMP);
@@ -1194,6 +1207,8 @@ struct EventStats {
     last_idx: usize,
     last_kernel_entry: u64,
     last_profile_dump: u64,
+    last_allocations: u32,
+    last_deallocations: u32,
     counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
     /// Port I/O by PORT — a small associative table rather than a 64K array,
     /// which would not fit the kernel stack. Ports that matter are few; once
@@ -1216,6 +1231,7 @@ impl EventStats {
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let free = machine.free_page_count();
         let now = machine.rdtsc();
+        let (allocations, deallocations) = lib::heap::allocation_counts();
         EventStats {
             iterations: 0,
             min_free: free,
@@ -1231,6 +1247,8 @@ impl EventStats {
             last_idx: 0,
             last_kernel_entry: now,
             last_profile_dump: now,
+            last_allocations: allocations,
+            last_deallocations: deallocations,
             counts: [0; 11],
             ports: [(0, 0, 0); 12],
             port_other: 0,
@@ -1370,10 +1388,9 @@ impl EventStats {
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
             if profile_enabled() {
                 let total = self.user_cycles.wrapping_add(self.kernel_cycles);
-                let user_pct = self.user_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
-                let kern_pct = self.kernel_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
-                let pre_pct = self.pre_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
-                let post_pct = self.post_cycles.wrapping_mul(100).checked_div(total).unwrap_or(0);
+                let pct10 = |v: u64| {
+                    v.saturating_mul(1000).checked_div(total.max(1)).unwrap_or(0)
+                };
                 // Average dispatch cost for the two hottest event kinds.
                 let cost = |i: usize| -> u64 {
                     self.dispatch_cycles[i].checked_div(self.counts[i].max(1) as u64).unwrap_or(0)
@@ -1387,62 +1404,88 @@ impl EventStats {
                         top.sort_by_key(|e| core::cmp::Reverse(e.0));
                     }
                 }
-                crate::dbg_println!("[prof] user={}% kernel={}% (pre={}% post={}%) irq={} softint={} hlt={} in={} out={} ins={} outs={} pf={} exc={} fault={} syscall={} ticks={} at={:04X}:{:08X} ss:sp={:04X}:{:08X}",
-                    user_pct, kern_pct, pre_pct, post_pct,
-                    c[0], c[1], c[2], c[3], c[4], c[5], c[6],
-                    c[8], c[9], c[7], c[10], machine.get_ticks(),
-                    regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
-                crate::dbg_println!("[prof] dispatch cycles/event: in={} out={} irq={} softint={}",
-                    cost(3), cost(4), cost(0), cost(1));
                 let ev = self.iterations.max(1);
                 let dispatch_total = self.dispatch_cycles.iter()
                     .fold(0u64, |sum, &v| sum.wrapping_add(v));
                 let scheduler_total = self.post_cycles.saturating_sub(dispatch_total);
-                let pct = |v: u64| {
-                    v.saturating_mul(100).checked_div(total.max(1)).unwrap_or(0)
-                };
-                crate::dbg_println!(
-                    "[prof] kernel routines: bookkeeping={} ({}%) irq_drain={} ({}%) advance_world={} ({}%) console={} ({}%) after_input={} ({}%)",
-                    self.pre_parts[0], pct(self.pre_parts[0]),
-                    self.pre_parts[1], pct(self.pre_parts[1]),
-                    self.pre_parts[2], pct(self.pre_parts[2]),
-                    self.pre_parts[3], pct(self.pre_parts[3]),
-                    self.pre_parts[4], pct(self.pre_parts[4]));
-                crate::dbg_println!(
-                    "[prof] kernel post: dispatch={} ({}%) scheduler/exit={} ({}%) | dispatch/event pf={} syscall={}",
-                    dispatch_total, pct(dispatch_total),
-                    scheduler_total, pct(scheduler_total),
-                    cost(8), cost(10));
                 let sp = unsafe { SLICE_PARTS };
-                let np = unsafe { PRESENTS };
-                unsafe { PRESENTS = 0 };
-                crate::dbg_println!(
-                    "[prof] advance_world: take={} | queue_tick={} over {} ticks = {}c each | display={} over {} presents = {}c each | audio={}",
-                    sp[0],
-                    sp[1], sp[4], sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
-                    sp[2], np, sp[2].checked_div(np.max(1)).unwrap_or(0),
-                    sp[3]);
                 let dp = unsafe { DISP_PARTS };
-                unsafe { DISP_PARTS = [0; 4] };
-                let per = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
-                let slice = |v: u64| v.checked_div(dp[1].max(1)).unwrap_or(0);
-                crate::dbg_println!(
-                    "[prof]   display/frame: scanout={} raster={} copied={}px | per-slice: scanout={} raster={} ({} slices, {}% of window)",
-                    per(dp[0]), per(dp[2]), per(dp[3]),
-                    slice(dp[0]), slice(dp[2]), dp[1],
-                    pct(dp[0].wrapping_add(dp[2])));
+                let dm = unsafe { core::ptr::read_volatile(&raw const DISP_MODE) };
                 let ap = unsafe { AUDIO_PARTS };
-                unsafe { AUDIO_PARTS = [0; 5] };
+                let np = unsafe { PRESENTS };
+                let loop_total = self.pre_parts[0]
+                    .wrapping_add(self.pre_parts[3])
+                    .wrapping_add(self.pre_parts[4]);
+                let world_other = self.pre_parts[2].saturating_sub(
+                    sp[0].saturating_add(sp[1]).saturating_add(sp[2]).saturating_add(sp[3]));
+                let accounted = sp[2]
+                    .saturating_add(sp[3])
+                    .saturating_add(dispatch_total)
+                    .saturating_add(self.pre_parts[1])
+                    .saturating_add(loop_total)
+                    .saturating_add(scheduler_total)
+                    .saturating_add(world_other);
+                let other = self.kernel_cycles.saturating_sub(accounted);
+                let user = pct10(self.user_cycles);
+                let kernel = pct10(self.kernel_cycles);
                 crate::dbg_println!(
-                    "[prof]   audio: devices={} ({}%) setup/pace={} ({}%) pump={} ({}%) clocks/irqs={} ({}%) generated={} frames",
-                    ap[0], pct(ap[0]), ap[1], pct(ap[1]),
-                    ap[2], pct(ap[2]), ap[3], pct(ap[3]), ap[4]);
+                    "[prof] CPU: guest={}.{}% kernel={}.{}% ticks={} at={:04X}:{:08X}",
+                    user / 10, user % 10, kernel / 10, kernel % 10,
+                    machine.get_ticks(), regs.code_seg(), regs.ip32());
+                let display = pct10(sp[2]);
+                let audio = pct10(sp[3]);
+                let dispatch = pct10(dispatch_total);
+                let irq_drain = pct10(self.pre_parts[1]);
+                let loop_pct = pct10(loop_total);
+                let sched = pct10(scheduler_total);
+                let world = pct10(world_other);
+                let other_pct = pct10(other);
+                crate::dbg_println!(
+                    "[prof] kernel: display={}.{}% audio={}.{}% dispatch={}.{}% irq-drain={}.{}% loop={}.{}% sched={}.{}% world-other={}.{}% other={}.{}%",
+                    display / 10, display % 10, audio / 10, audio % 10,
+                    dispatch / 10, dispatch % 10, irq_drain / 10, irq_drain % 10,
+                    loop_pct / 10, loop_pct % 10, sched / 10, sched % 10,
+                    world / 10, world % 10, other_pct / 10, other_pct % 10);
+                let scanout = pct10(dp[0]);
+                let render = pct10(dp[2]);
+                let present = pct10(dp[3]);
+                let per_frame = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
+                crate::dbg_println!(
+                    "[prof] display: {:?} | {} frames, {} slices, {} px/frame | scanout={}.{}% render={}.{}% present={}.{}% | cycles/frame render={} present={}",
+                    dm, np, dp[1], dp[4].checked_div(np.max(1)).unwrap_or(0),
+                    scanout / 10, scanout % 10, render / 10, render % 10,
+                    present / 10, present % 10,
+                    per_frame(dp[2]), per_frame(dp[3]));
+                let devices = pct10(ap[0]);
+                let setup = pct10(ap[1]);
+                let pump = pct10(ap[2]);
+                let clocks = pct10(ap[3]);
+                crate::dbg_println!(
+                    "[prof] audio: pump={}.{}% devices={}.{}% setup={}.{}% clocks/irqs={}.{}% | generated={} frames",
+                    pump / 10, pump % 10, devices / 10, devices % 10,
+                    setup / 10, setup % 10, clocks / 10, clocks % 10, ap[4]);
+                crate::dbg_println!(
+                    "[prof] exits: {} total | softint={}@{}c in={}@{}c out={}@{}c irq={}@{}c pf={} syscall={}",
+                    ev, c[1], cost(1), c[3], cost(3), c[4], cost(4),
+                    c[0], cost(0), c[8], c[10]);
+                let fixed = loop_total
+                    .saturating_add(self.pre_parts[1])
+                    .checked_div(ev)
+                    .unwrap_or(0);
+                crate::dbg_println!(
+                    "[prof] per-exit fixed={}c (loop={} irq-drain={}) | world: ticks={} queue={}c/tick unclassified={} cycles",
+                    fixed, loop_total / ev, self.pre_parts[1] / ev, sp[4],
+                    sp[1].checked_div(sp[4].max(1)).unwrap_or(0), world_other);
+                let (allocations, deallocations) = lib::heap::allocation_counts();
+                crate::dbg_println!(
+                    "[prof] heap: allocations={} (+{}) deallocations={} (+{}) live={}",
+                    allocations, allocations.wrapping_sub(self.last_allocations),
+                    deallocations, deallocations.wrapping_sub(self.last_deallocations),
+                    allocations.wrapping_sub(deallocations));
                 unsafe { SLICE_PARTS = [0; 5] };
-                crate::dbg_println!(
-                    "[prof] pre cycles/event: bookkeeping={} irq_drain={} advance_world={} console={} after_input={}",
-                    self.pre_parts[0] / ev, self.pre_parts[1] / ev,
-                    self.pre_parts[2] / ev, self.pre_parts[3] / ev,
-                    self.pre_parts[4] / ev);
+                unsafe { DISP_PARTS = [0; 5] };
+                unsafe { AUDIO_PARTS = [0; 5] };
+                unsafe { PRESENTS = 0 };
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
                     p.sort_by_key(|e| core::cmp::Reverse(e.1));
@@ -1473,6 +1516,9 @@ impl EventStats {
                 }
                 crate::kernel::iostat::reset();
             }
+            let (allocations, deallocations) = lib::heap::allocation_counts();
+            self.last_allocations = allocations;
+            self.last_deallocations = deallocations;
             self.user_cycles = 0;
             self.kernel_cycles = 0;
             self.pre_cycles = 0;
@@ -1485,6 +1531,14 @@ impl EventStats {
             self.port_other = 0;
             self.last_profile_dump = now;
             self.iterations = 0;
+            // Emitting the report can be expensive (notably klog line
+            // capture). It is profiler overhead, not dispatch or scheduler
+            // work for the event that happened to cross the dump deadline.
+            // Re-open kernel timing after it so neither this event nor the
+            // next window is charged for printing the previous window.
+            if profile_enabled() {
+                self.last_kernel_entry = machine.rdtsc();
+            }
         }
     }
 }

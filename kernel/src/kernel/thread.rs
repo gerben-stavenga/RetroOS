@@ -236,9 +236,9 @@ impl<A: crate::Arch> Personality<A> {
                 }
                 let t1b = if prof { machine.rdtsc() } else { 0 };
                 if ticks > 0 {
-                    // Present is driven off the absolute tick clock (the same one
-                    // the 0x3DA vertical-retrace fabrication reads), so it fires on
-                    // the emulated VGA frame boundary rather than a private rate.
+                    // One processed world slice advances the display once.
+                    // Batched/missed timer slices deliberately do not create
+                    // display catch-up work.
                     crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
                 }
                 let t2 = if prof { machine.rdtsc() } else { 0 };

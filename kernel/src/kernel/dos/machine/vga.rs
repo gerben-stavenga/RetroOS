@@ -1604,21 +1604,56 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
 /// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
 /// VRAM is guest memory the kernel can't address as a flat region.
-fn read_aperture<'a, A: crate::Arch>(machine: &mut A, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize) -> &'a [u8] {
-    buf.clear();
-    buf.resize(len, 0);
-    machine.copy_from(addr, buf);
+/// Snapshot guest bytes `[lo, hi)` of the `len`-byte aperture at `addr` into
+/// `buf`, which keeps the aperture's FULL length so the renderer's offsets are
+/// the guest's own. Only the requested span is copied — the beam paints a band
+/// per pass, and copying the whole aperture each time moved ~14x the bytes it
+/// reads (64 KB per pass in mode 13h, megabytes in linear SVGA).
+///
+/// The buffer is resized only when the length changes: `clear()` + `resize()`
+/// would memset every byte immediately before overwriting it.
+fn read_aperture<'a, A: crate::Arch>(
+    machine: &mut A, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize,
+    lo: usize, hi: usize,
+) -> &'a [u8] {
+    if buf.len() != len {
+        buf.clear();
+        buf.resize(len, 0);
+    }
+    let (lo, hi) = (lo.min(len), hi.min(len));
+    if lo < hi {
+        machine.copy_from(addr + lo, &mut buf[lo..hi]);
+    }
     buf
 }
 
 impl VgaState {
+    /// The mode the beam is about to scan, from the registers ALONE — no VRAM
+    /// is read. Lets the caller size the band before the snapshot that band
+    /// determines.
+    fn current_mode(&self) -> Option<lib::vga_render::VgaMode> {
+        if self.svga_w != 0 {
+            let bpp8 = (self.svga_bpp as usize).div_ceil(8);
+            return Some(lib::vga_render::VgaMode::LinearSvga {
+                w: self.svga_w,
+                h: self.svga_h,
+                bpp: self.svga_bpp,
+                pitch: (self.svga_w as usize * bpp8) as u16,
+            });
+        }
+        self.classify_mode()
+    }
+
     /// Build the displayed frame from the live registers + VRAM: resolve the
     /// mode, point at the video memory, and read the display-start / pixel pan /
     /// line-compare that select the visible window. Planar modes render our own
-    /// `planes` in place (no copy); linear modes copy their guest aperture into
-    /// `scratch`. `None` for a mode the renderer doesn't draw.
-    fn scanout<'a, A: crate::Arch>(&'a self, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>)
-        -> Option<lib::vga_render::Frame<'a>>
+    /// `planes` in place (no copy); linear modes copy the `band` of their guest
+    /// aperture the beam is about to paint into `scratch`. `None` for a mode the
+    /// renderer doesn't draw.
+    fn scanout<'a, A: crate::Arch>(
+        &'a self, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
+        band: (usize, usize),
+    ) -> Option<lib::vga_render::Frame<'a>>
     {
         use lib::vga_render::{Frame, VgaMode};
         // VESA SVGA: present the kernel-side linear framebuffer directly. The
@@ -1632,7 +1667,9 @@ impl VgaState {
                 mode: VgaMode::LinearSvga {
                     w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
                 },
-                vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size),
+                // Linear rows: the band maps straight to a byte span.
+                vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size,
+                    band.0 * pitch, (band.0 + band.1) * pitch),
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
@@ -1645,15 +1682,34 @@ impl VgaState {
             });
         }
         let mode = self.classify_mode()?;
-        let (_w, h) = lib::vga_render::dimensions(mode);
+        let (w, h) = lib::vga_render::dimensions(mode);
+        // Mode 13h's rows are linear but not contiguous: a panned display-start
+        // (screen-shake) slides the origin forward, and below Line Compare the
+        // latch resets to 0 — so walk the band's rows the way `row_origin`
+        // does and take the span they cover. The buffer stays a full 64 KB
+        // window, only the copy shrinks.
+        let m13_span = || {
+            let start = (((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize) * 4;
+            let pan = (self.ac[0x13] & 0x07) as usize;
+            let lc = self.line_compare(h);
+            let (mut lo, mut hi) = (usize::MAX, 0usize);
+            for r in band.0..band.0 + band.1 {
+                let base = if r >= lc { (r - lc) * w } else { start + r * w + pan };
+                lo = lo.min(base);
+                hi = hi.max(base + w);
+            }
+            if lo > hi { (0, 0) } else { (lo, hi) }
+        };
         let (vram, planes): (&[u8], &[u8]) = match mode {
             VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
-            // Read the whole 64 KB window, not just w*h: a panned display-start
-            // (screen-shake) slides the scanout origin forward, so the visible
-            // window can reach past the nominal 320×200 = 64000 bytes.
-            VgaMode::Mode13h => (read_aperture(machine, scratch, 0xA0000, 0x10000), &[]),
-            VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2), &[]),
-            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000), &[]),
+            VgaMode::Mode13h => {
+                let (lo, hi) = m13_span();
+                (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[])
+            }
+            // 4 KB and 16 KB apertures: banding them would buy back less than
+            // the per-row address arithmetic (CGA's two interleaved banks) costs.
+            VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2, 0, 80 * 25 * 2), &[]),
+            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[]),
             VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
         };
         // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
@@ -1749,38 +1805,48 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // bounded bands, then publishes the completed shadow at vertical
         // blank. The physical GOP scanout is asynchronous, so intermediate
         // bands must never be made visible there.
-        let period_ms: u64 = if fb.slow { 50 } else { 14 };
-        if !crate::kernel::display::raster_pending(&pc.present_scratch2, now_ticks, period_ms) {
-            return;
-        }
+        let period_ticks: usize = if fb.slow { 50 } else { 14 };
         let p0 = if prof { machine.rdtsc() } else { 0 };
+        // Snapshot only the rows this pass can paint. The mode comes from the
+        // registers alone, so the band is known before the copy it sizes.
+        let Some(mode) = pc.vga.current_mode() else { return };
+        let (mw, mh) = vga_render::dimensions(mode);
+        let band = crate::kernel::display::beam_band(&pc.present_scratch2, mw, mh);
         // Nothing here allocates per band: the buffers live in PcMachine and
         // grow once, on the first frame of a mode.
-        let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
+        let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch, band) else { return };
         let p1 = if prof { machine.rdtsc() } else { 0 };
         let wrapped = crate::kernel::display::raster(
-            &mut pc.present_scratch2, &fb, &frame, now_ticks, period_ms);
+            &mut pc.present_scratch2, &fb, &frame, now_ticks, period_ticks);
+        let mut p2 = if prof { machine.rdtsc() } else { 0 };
         let mut copied = 0;
+        let mut present_cycles = 0;
         if wrapped {
-            let (vga_h, stride, shadow) =
+            let (vga_h, out_w, shadow) =
                 crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
                     .expect("completed VGA raster has no shadow");
             if crate::kernel::osd::is_open() {
+                // The shadow is the picture, so the panel centers on the
+                // picture and is stretched with it — same as hosted.
                 crate::kernel::osd::paint(
                     shadow,
-                    stride,
-                    fb.width,
+                    out_w * fb.format.bytes_per_pixel as usize,
+                    out_w,
                     vga_h,
                     fb.format,
                 );
             }
+            p2 = if prof { machine.rdtsc() } else { 0 };
             copied = crate::kernel::display::present(&fb, vga_h, shadow);
+            if prof {
+                present_cycles = machine.rdtsc().wrapping_sub(p2);
+            }
             crate::kernel::startup::bill_present();
         }
         if prof {
-            let p4 = machine.rdtsc();
             crate::kernel::startup::bill_display(
-                p1.wrapping_sub(p0), 1, p4.wrapping_sub(p1), copied);
+                frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
+                present_cycles, copied);
         }
         return;
     }
@@ -1790,7 +1856,9 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
     crate::kernel::startup::bill_present();
     let p0 = if prof { machine.rdtsc() } else { 0 };
-    let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch) else { return };
+    // Whole-frame sink: `render` walks every row, so the band is the frame.
+    let full = pc.vga.current_mode().map_or((0, 0), |m| (0, vga_render::dimensions(m).1));
+    let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch, full) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = vga_render::dimensions(frame.mode);
     let need = w * h;
@@ -1806,11 +1874,13 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         };
         crate::kernel::osd::paint(bytes, w * 4, w, h, vga_render::PixelFormat::NATIVE);
     }
+    let p2 = if prof { machine.rdtsc() } else { 0 };
     pc.present_fb.truncate(need);
     crate::kernel::display::present_host(w, h, &mut pc.present_fb);
     if prof {
-        let p4 = machine.rdtsc();
+        let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(
-            p1.wrapping_sub(p0), 1, p4.wrapping_sub(p1), need);
+            frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
+            p3.wrapping_sub(p2), need);
     }
 }

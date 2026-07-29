@@ -196,6 +196,9 @@ pub struct Fetch {
     pub source_frames: usize,
 }
 
+/// Maximum playback rate exposed by the emulated SB16 DSP.
+const MAX_OUTPUT_RATE: u32 = 44_100;
+
 /// The emulated Sound Blaster: DSP + mixer + the FM synth on the same card.
 pub struct Sb {
     // ── wiring the host strapped this card to (BLASTER), for decode/readback ──
@@ -500,9 +503,15 @@ impl Sb {
             }
             0x40 => {
                 let tc = p[0] as u32;
-                self.rate = if tc < 256 { 1_000_000 / (256 - tc) } else { 22050 };
+                // The million is the DSP time-constant clock, not a supported
+                // output ceiling. Values near 255 otherwise manufacture rates
+                // up to 1 MHz that no SB16 can play.
+                self.rate = (1_000_000 / (256 - tc)).min(MAX_OUTPUT_RATE);
             }
-            0x41 => self.rate = ((p[0] as u32) << 8) | p[1] as u32, // output rate (hi, lo)
+            0x41 => {
+                let programmed = ((p[0] as u32) << 8) | p[1] as u32;
+                self.rate = programmed.min(MAX_OUTPUT_RATE);
+            }
             0x42 => {}                                              // input rate: ignore
             0x48 => self.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
             // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
@@ -949,6 +958,21 @@ pub fn new_boxed() -> Box<Sb> {
 #[cfg(test)]
 mod tests {
     use super::Sb;
+
+    #[test]
+    fn programmed_output_rate_is_limited_to_sb16_speed() {
+        let mut sb = Sb::new();
+        let dsp = sb.io_base + 0x0C;
+
+        sb.port_write(dsp, 0x40, 0);
+        sb.port_write(dsp, 0xFF, 0);
+        assert_eq!(sb.rate, 44_100);
+
+        sb.port_write(dsp, 0x41, 0);
+        sb.port_write(dsp, 0xFF, 0);
+        sb.port_write(dsp, 0xFF, 0);
+        assert_eq!(sb.rate, 44_100);
+    }
 
     #[test]
     fn block_completions_coalesce_until_dsp_ack() {
