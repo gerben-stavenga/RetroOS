@@ -59,7 +59,7 @@ mod mode_transitions;
 // Re-export so the Linux personality can hold its own console snapshot — DOS
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
-pub use machine::vga_present;
+pub use machine::vga::{Vga, physical_vga_present};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the bootfs mount and the DN/CONFIG launch paths.
@@ -302,19 +302,23 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub fn suspend(&mut self, _machine: &mut A) {
-        if machine::vga_present() {
-            self.pc.vga.save_from_hardware();
-        }
+    pub fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::DisplayToken {
+        let vga = core::mem::replace(&mut self.pc.vga, Vga::new());
+        let (vga, display) = vga.into_emulated(machine);
+        self.pc.vga = vga;
+        display
     }
 
     /// Called when the thread regains focus. Repaints the VGA framebuffer
     /// from the suspend snapshot. CPU-binding side effects live in
     /// `on_resume` and happen on every swap-in regardless of focus.
-    pub fn materialize(&mut self, _machine: &mut A) {
-        if machine::vga_present() {
-            self.pc.vga.restore_to_hardware();
-        }
+    pub fn materialize(
+        &mut self,
+        machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) {
+        let vga = core::mem::replace(&mut self.pc.vga, Vga::new());
+        self.pc.vga = vga.present(machine, display);
     }
 }
 
@@ -718,18 +722,10 @@ pub fn handle_event<A: crate::Arch>(
 /// emulated VGA's memory actually hold data; the kernel renders it to the GOP
 /// framebuffer itself. The planar trap re-maps 0xA0000 as it arms/disarms.
 fn back_vga_window_if_emulated<A: crate::Arch>(machine: &mut A) {
-    if !machine::vga_present() {
-        // Graphics + mono-text aperture (0xA0000-0xB7FFF, 24 pages): per-process
-        // fresh RAM — planar/Mode-X trapping (disarm_planar) manages A0000 per
-        // address space, and these are zeroed so a fresh graphics buffer starts
-        // blank.
-        machine.map_fresh_range(0xA0000 >> 12, 0x18000 >> 12);
-        // Color-text aperture (0xB8000-0xBFFFF): the SHARED text screen. Every
-        // DOS process and the kernel console map the same pages, so the boot log
-        // persists into DN and a child program's output shows under its parent —
-        // exactly like VGA-text hardware, where this aperture is shared video RAM.
-        machine.map_vga_text_aperture();
-    }
+    // Every new DOS VGA starts detached, even on a machine that has a card.
+    // Focus attachment later materializes this RAM-backed device on hardware.
+    machine.map_fresh_range(0xA0000 >> 12, 0x18000 >> 12);
+    machine.map_vga_text_aperture();
 }
 
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
@@ -864,17 +860,18 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
             // range/live/DOS), then install it into ours + reap. Two
             // single-borrow steps replace the old `*mut VgaState` cross-slot
             // swap — no unsafe, no aliasing.
-            let mut taken = machine::VgaState::new();
+            let mut taken = machine::vga::Vga::new();
             let rv = thread::with_target_dos(threads, pid, |target| {
                 if target.pc.vga.planes.is_empty() { return -61; }
-                core::mem::swap(&mut taken, &mut target.pc.vga);
+                taken.swap_state(&mut target.pc.vga);
                 0
             });
             if rv >= 0 {
                 let cur = thread::get_thread(threads, tid).unwrap();
-                core::mem::swap(&mut cur.dos_mut().pc.vga, &mut taken);
-                if machine::vga_present() {
-                    cur.dos_mut().pc.vga.restore_to_hardware();
+                let dos = cur.dos_mut();
+                dos.pc.vga.swap_state(&mut taken);
+                if dos.pc.vga.is_native() {
+                    dos.pc.vga.repaint_native();
                 }
                 thread::reap(threads, machine, pid);
             }

@@ -7,6 +7,7 @@
 
 use crate::Regs;
 use super::*;
+use core::ops::{Deref, DerefMut};
 
 // ============================================================================
 // Machine-wide VGA presence
@@ -18,11 +19,154 @@ use super::*;
 /// save/restore touches hardware at all. Machine-wide today; per-thread
 /// display ownership (foreground DOS owns the card, background threads run
 /// emulated) hangs off the same Platform type later.
-pub fn vga_present() -> bool {
+pub fn physical_vga_present() -> bool {
     // No probe (bare-ELF dev path) ⇒ no card. Guards the console-VGA snapshot
     // that thread-exit takes, which would otherwise trip `get`'s panic there.
     crate::kernel::platform::probed()
         && crate::kernel::platform::get().display.vga_passthrough()
+}
+
+pub struct NativeVga {
+    state: VgaState,
+    display: crate::kernel::platform::DisplayToken,
+}
+
+pub struct EmulatedVga {
+    state: VgaState,
+}
+
+pub struct PresentedVga {
+    state: VgaState,
+    display: crate::kernel::platform::DisplayToken,
+}
+
+impl NativeVga {
+    pub fn into_emulated<A: crate::Arch>(
+        mut self,
+        machine: &mut A,
+    ) -> (EmulatedVga, crate::kernel::platform::DisplayToken) {
+        self.state.save_from_hardware();
+        self.state.materialize_emulated_aperture(machine);
+        (EmulatedVga { state: self.state }, self.display)
+    }
+}
+
+impl EmulatedVga {
+    pub fn present<A: crate::Arch>(
+        mut self,
+        machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) -> Vga {
+        match display {
+            display @ crate::kernel::platform::DisplayToken::VgaCard => {
+                self.state.capture_emulated_aperture(machine);
+                machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
+                self.state.a0000_trapped = false;
+                self.state.restore_to_hardware();
+                Vga::Native(NativeVga { state: self.state, display })
+            }
+            display => Vga::Presented(PresentedVga { state: self.state, display }),
+        }
+    }
+}
+
+/// A thread's VGA device. The variant, rather than machine capability, decides
+/// whether guest accesses reach hardware or the emulated register file.
+pub enum Vga {
+    Native(NativeVga),
+    Emulated(EmulatedVga),
+    Presented(PresentedVga),
+}
+
+impl Vga {
+    pub fn new() -> Self {
+        Self::Emulated(EmulatedVga { state: VgaState::new() })
+    }
+
+    pub fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+
+    pub fn is_emulated(&self) -> bool {
+        !self.is_native()
+    }
+
+    pub fn is_presented(&self) -> bool {
+        matches!(self, Self::Native(_) | Self::Presented(_))
+    }
+
+    /// Consume a native attachment, snapshot it, and return the emulated
+    /// device plus the released physical-card authority.
+    pub fn into_emulated<A: crate::Arch>(
+        self,
+        machine: &mut A,
+    ) -> (Self, crate::kernel::platform::DisplayToken) {
+        match self {
+            Self::Emulated(_) => panic!("detached VGA has no display token"),
+            Self::Native(vga) => {
+                let (vga, display) = vga.into_emulated(machine);
+                (Self::Emulated(vga), display)
+            }
+            Self::Presented(vga) =>
+                (Self::Emulated(EmulatedVga { state: vga.state }), vga.display),
+        }
+    }
+
+    /// Consume a detached emulated device and make it the visible owner.
+    pub fn present<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) -> Self {
+        match self {
+            Self::Emulated(vga) => vga.present(machine, display),
+            Self::Native(_) | Self::Presented(_) => panic!("VGA already owns a display"),
+        }
+    }
+
+    pub fn display(&self) -> Option<&crate::kernel::platform::DisplayToken> {
+        match self {
+            Self::Native(vga) => Some(&vga.display),
+            Self::Presented(vga) => Some(&vga.display),
+            Self::Emulated(_) => None,
+        }
+    }
+
+    pub fn snapshot_hardware_into_emulated<A: crate::Arch>(&mut self, machine: &mut A) {
+        assert!(self.is_emulated());
+        self.save_from_hardware();
+        self.materialize_emulated_aperture(machine);
+    }
+
+    pub fn swap_state(&mut self, other: &mut Self) {
+        core::mem::swap(&mut **self, &mut **other);
+    }
+
+    pub fn repaint_native(&self) {
+        assert!(self.is_native());
+        self.restore_to_hardware();
+    }
+}
+
+impl Deref for Vga {
+    type Target = VgaState;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Native(vga) => &vga.state,
+            Self::Emulated(vga) => &vga.state,
+            Self::Presented(vga) => &vga.state,
+        }
+    }
+}
+
+impl DerefMut for Vga {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Native(vga) => &mut vga.state,
+            Self::Emulated(vga) => &mut vga.state,
+            Self::Presented(vga) => &mut vga.state,
+        }
+    }
 }
 
 // ============================================================================
@@ -170,7 +314,7 @@ impl VgaState {
     }
 
     /// Emulated register-file write — the absent-card half of the VGA
-    /// passthrough-vs-emulate split (`PcMachine::vga_present == false`).
+    /// passthrough-vs-emulate split (`Vga::is_emulated`).
     /// This per-thread struct IS the hardware then: `emulate_outb` routes the
     /// 3Cx/3Dx window here instead of to real ports, and save/restore on
     /// context switch becomes a no-op because the state never leaves the
@@ -283,10 +427,92 @@ impl VgaState {
         }
     }
 
-    /// Read current VGA hardware state into this struct. Callers gate on
-    /// `PcMachine::vga_present` — with no card the per-thread struct already
-    /// *is* the live state (see `port_write`) and there is nothing to save.
-    pub fn save_from_hardware(&mut self) {
+    fn materialize_emulated_aperture<A: crate::Arch>(&mut self, machine: &mut A) {
+        use lib::vga_render::VgaMode;
+        match self.classify_mode() {
+            Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
+                machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+                self.a0000_trapped = true;
+            }
+            Some(VgaMode::Mode13h) => {
+                machine.map_fresh_range(A0000 >> 12, 16);
+                let mut chained = alloc::vec![0u8; 0x10000];
+                lib::vga_render::chain4_merge(&self.planes, &mut chained);
+                machine.copy_to(A0000, &chained);
+                self.a0000_trapped = false;
+            }
+            Some(VgaMode::Text80x25) => {
+                machine.map_fresh_range(0xB8000 >> 12, 8);
+                let mut text = alloc::vec![0u8; 0x8000];
+                for i in 0..0x4000 {
+                    text[i * 2] = self.planes.get(i).copied().unwrap_or(0);
+                    text[i * 2 + 1] =
+                        self.planes.get(0x10000 + i).copied().unwrap_or(0);
+                }
+                machine.copy_to(0xB8000, &text);
+                self.a0000_trapped = false;
+            }
+            Some(VgaMode::Cga4) => {
+                machine.map_fresh_range(0xB8000 >> 12, 8);
+                let mut cga = alloc::vec![0u8; 0x4000];
+                for i in 0..0x2000 {
+                    cga[i * 2] = self.planes.get(i).copied().unwrap_or(0);
+                    cga[i * 2 + 1] =
+                        self.planes.get(0x10000 + i).copied().unwrap_or(0);
+                }
+                machine.copy_to(0xB8000, &cga);
+                self.a0000_trapped = false;
+            }
+            Some(VgaMode::Cga2) => {
+                machine.map_fresh_range(0xB8000 >> 12, 8);
+                let n = 0x4000.min(self.planes.len());
+                machine.copy_to(0xB8000, &self.planes[..n]);
+                self.a0000_trapped = false;
+            }
+            Some(VgaMode::LinearSvga { .. }) | None => {
+                self.a0000_trapped = false;
+            }
+        }
+    }
+
+    fn capture_emulated_aperture<A: crate::Arch>(&mut self, machine: &mut A) {
+        use lib::vga_render::VgaMode;
+        if self.planes.len() != PLANES_LEN {
+            self.planes.resize(PLANES_LEN, 0);
+        }
+        match self.classify_mode() {
+            Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {}
+            Some(VgaMode::Mode13h) => {
+                let mut chained = alloc::vec![0u8; 0x10000];
+                machine.copy_from(A0000, &mut chained);
+                lib::vga_render::chain4_split(&chained, &mut self.planes);
+            }
+            Some(VgaMode::Text80x25) => {
+                let mut text = alloc::vec![0u8; 0x8000];
+                machine.copy_from(0xB8000, &mut text);
+                for i in 0..0x4000 {
+                    self.planes[i] = text[i * 2];
+                    self.planes[0x10000 + i] = text[i * 2 + 1];
+                }
+            }
+            Some(VgaMode::Cga4) => {
+                let mut cga = alloc::vec![0u8; 0x4000];
+                machine.copy_from(0xB8000, &mut cga);
+                for i in 0..0x2000 {
+                    self.planes[i] = cga[i * 2];
+                    self.planes[0x10000 + i] = cga[i * 2 + 1];
+                }
+            }
+            Some(VgaMode::Cga2) => {
+                machine.copy_from(0xB8000, &mut self.planes[..0x4000]);
+            }
+            Some(VgaMode::LinearSvga { .. }) | None => {}
+        }
+    }
+
+    /// Read current VGA hardware state into this struct. Called only by a
+    /// consuming `NativeVga -> EmulatedVga` transition.
+    pub(crate) fn save_from_hardware(&mut self) {
         use crate::kernel::portio::{inb, outb};
         if self.planes.is_empty() {
             self.planes = alloc::vec![0u8; 4 * 65536];
@@ -432,9 +658,9 @@ impl VgaState {
         outb(0x3CE, self.gc_index);
     }
 
-    /// Write this struct's state to VGA hardware. Callers gate on
-    /// `PcMachine::vga_present` (see `save_from_hardware`).
-    pub fn restore_to_hardware(&self) {
+    /// Write this struct's state to VGA hardware. Called only while acquiring
+    /// the physical lease (or repainting an already-native owner).
+    pub(crate) fn restore_to_hardware(&self) {
         if self.planes.is_empty() { return; }
         use crate::kernel::portio::{inb, outb};
 
@@ -579,7 +805,7 @@ const A0000: usize = 0xA0000;
 /// chain-4 mode or the plane-select mask. Drives the A0000 paging alias.
 /// `pc.vga` already holds the post-write register values.
 pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
-    if vga_present() {
+    if pc.vga.is_native() {
         return; // a real card does its own plane routing
     }
     let idx = pc.vga.seq_index & 0x1F;
@@ -733,7 +959,7 @@ pub fn on_set_mode<A: crate::Arch>(
     mode: u8,
     clear: bool,
 ) {
-    if vga_present() {
+    if pc.vga.is_native() {
         return; // a real card draws its own planes
     }
     // A standard mode-set leaves any active VESA SVGA mode.
@@ -1673,6 +1899,7 @@ impl VgaState {
                 planes: &[],
                 ac: &self.ac,
                 palette: &self.dac,
+                dac_mask: self.dac_mask,
                 font: &lib::vga_fonts::FONT_8X16,
                 blink: false,
                 cga_palette: [0; 4],
@@ -1735,6 +1962,7 @@ impl VgaState {
             planes,
             ac: &self.ac,
             palette: &self.dac,
+            dac_mask: self.dac_mask,
             font: &lib::vga_fonts::FONT_8X16,
             blink: self.ac[0x10] & 0x08 != 0,
             cga_palette,
@@ -1773,8 +2001,7 @@ impl VgaState {
 
 /// Whole-frame throttle for the hosted window sink, off the same tick clock
 /// the 0x3DA vertical-retrace fabrication reads. The direct-framebuffer path
-/// does not use this: its raster paces itself per row inside
-/// `display::raster`.
+/// does not use this: its render/publish state machine owns that cadence.
 fn frame_due(now_ticks: u64, hz: u64) -> bool {
     let frame = (now_ticks.wrapping_mul(hz) / 1000) as u32;
     static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
@@ -1790,73 +2017,96 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // somewhere to put the frame: a framebuffer we write into, or a window
     // sink. (This used to test only the sink; when fbcon stopped registering
     // one, every metal frame silently returned here.)
-    let direct = match crate::kernel::platform::get().display {
-        crate::kernel::platform::Display::Framebuffer(fb) => Some(fb),
-        _ => None,
+    let (direct, host_window) = match pc.vga.display() {
+        Some(crate::kernel::platform::DisplayToken::Framebuffer(fb)) => (Some(*fb), false),
+        Some(crate::kernel::platform::DisplayToken::HostWindow) => (None, true),
+        Some(crate::kernel::platform::DisplayToken::Headless) | None => return,
+        Some(crate::kernel::platform::DisplayToken::VgaCard) => {
+            debug_assert!(pc.vga.is_native());
+            return;
+        }
     };
-    if vga_present()
-        || (direct.is_none() && !crate::kernel::display::host_present_sink_installed())
-    {
+    if pc.vga.is_native() {
         return;
     }
     let prof = crate::kernel::startup::profile_enabled();
     if let Some(fb) = direct {
-        // Direct framebuffer: the emulated raster paints a cached shadow in
-        // bounded bands, then publishes the completed shadow at vertical
-        // blank. The physical GOP scanout is asynchronous, so intermediate
-        // bands must never be made visible there.
+        // Direct framebuffer: phase zero is guest-visible retrace. Its
+        // trailing edge renders one complete immutable shadow; the following
+        // tick publishes that shadow to GOP. Rendering and device traffic get
+        // separate budgets, and the physical scanout is the only visible
+        // top-to-bottom sweep.
         let period_ticks: usize = if fb.slow { 50 } else { 14 };
-        let p0 = if prof { machine.rdtsc() } else { 0 };
-        // Snapshot only the rows this pass can paint. The mode comes from the
-        // registers alone, so the band is known before the copy it sizes.
         let Some(mode) = pc.vga.current_mode() else { return };
-        let (mw, mh) = vga_render::dimensions(mode);
-        let band = crate::kernel::display::beam_band(&pc.present_scratch2, mw, mh);
-        // Nothing here allocates per band: the buffers live in PcMachine and
-        // grow once, on the first frame of a mode.
-        let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch, band) else { return };
-        let p1 = if prof { machine.rdtsc() } else { 0 };
-        let wrapped = crate::kernel::display::raster(
-            &mut pc.present_scratch2, &fb, &frame, now_ticks, period_ticks);
-        let mut p2 = if prof { machine.rdtsc() } else { 0 };
-        let mut copied = 0;
-        let mut present_cycles = 0;
-        if wrapped {
-            let (vga_h, out_w, shadow) =
-                crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
-                    .expect("completed VGA raster has no shadow");
-            if crate::kernel::osd::is_open() {
-                // The shadow is the picture, so the panel centers on the
-                // picture and is stretched with it — same as hosted.
-                crate::kernel::osd::paint(
-                    shadow,
-                    out_w * fb.format.bytes_per_pixel as usize,
-                    out_w,
-                    vga_h,
-                    fb.format,
+        match crate::kernel::display::scanout_action(
+            &mut pc.present_scratch2, &fb, mode, now_ticks, period_ticks,
+        ) {
+            crate::kernel::display::ScanoutAction::None => {}
+            crate::kernel::display::ScanoutAction::Render => {
+                let p0 = if prof { machine.rdtsc() } else { 0 };
+                let full = (0, vga_render::dimensions(mode).1);
+                // The source aperture, registers and DAC are captured once for
+                // the whole shadow; no palette generation can split the image.
+                let Some(frame) =
+                    pc.vga.scanout(machine, regs, &mut pc.present_scratch, full)
+                else {
+                    return;
+                };
+                let p1 = if prof { machine.rdtsc() } else { 0 };
+                let rendered = crate::kernel::display::render_shadow(
+                    &mut pc.present_scratch2, &fb, &frame,
                 );
+                if prof {
+                    let p2 = machine.rdtsc();
+                    crate::kernel::startup::bill_display(
+                        frame.mode,
+                        p1.wrapping_sub(p0),
+                        rendered as u64,
+                        p2.wrapping_sub(p1),
+                        0,
+                        0,
+                    );
+                }
             }
-            p2 = if prof { machine.rdtsc() } else { 0 };
-            copied = crate::kernel::display::present(&fb, vga_h, shadow);
-            if prof {
-                present_cycles = machine.rdtsc().wrapping_sub(p2);
+            crate::kernel::display::ScanoutAction::Publish => {
+                let (vga_h, out_w, shadow) =
+                    crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
+                        .expect("ready VGA shadow is missing");
+                if crate::kernel::osd::is_open() {
+                    let vga_w = vga_render::dimensions(mode).0;
+                    crate::kernel::osd::paint(
+                        shadow,
+                        out_w * fb.format.bytes_per_pixel as usize,
+                        out_w,
+                        vga_h,
+                        vga_w,
+                        fb.format,
+                    );
+                }
+                let p0 = if prof { machine.rdtsc() } else { 0 };
+                let copied = crate::kernel::display::present(&fb, vga_h, shadow);
+                let present_cycles = if prof {
+                    machine.rdtsc().wrapping_sub(p0)
+                } else {
+                    0
+                };
+                crate::kernel::startup::bill_present();
+                if prof {
+                    crate::kernel::startup::bill_display(
+                        mode, 0, 0, 0, present_cycles, copied,
+                    );
+                }
             }
-            crate::kernel::startup::bill_present();
-        }
-        if prof {
-            crate::kernel::startup::bill_display(
-                frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
-                present_cycles, copied);
         }
         return;
     }
     // Window sink (hosted): still takes a whole rendered frame per period.
-    if !frame_due(now_ticks, 70) {
+    if !host_window || !frame_due(now_ticks, 70) {
         return;
     }
     crate::kernel::startup::bill_present();
     let p0 = if prof { machine.rdtsc() } else { 0 };
-    // Whole-frame sink: `render` walks every row, so the band is the frame.
+    // Whole-frame sink: `render` walks every row, so capture the full frame.
     let full = pc.vga.current_mode().map_or((0, 0), |m| (0, vga_render::dimensions(m).1));
     let Some(frame) = pc.vga.scanout(machine, regs, &mut pc.present_scratch, full) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
@@ -1872,7 +2122,9 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(fb.as_mut_ptr() as *mut u8, fb.len() * 4)
         };
-        crate::kernel::osd::paint(bytes, w * 4, w, h, vga_render::PixelFormat::NATIVE);
+        crate::kernel::osd::paint(
+            bytes, w * 4, w, h, w, vga_render::PixelFormat::NATIVE,
+        );
     }
     let p2 = if prof { machine.rdtsc() } else { 0 };
     pc.present_fb.truncate(need);

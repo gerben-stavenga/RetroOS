@@ -30,7 +30,9 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
     machine.reset_io_bitmap();
     match personality {
         Personality::Dos(_) => {
-            if focused && platform::get().display.vga_passthrough() {
+            if focused
+                && matches!(personality, Personality::Dos(dos) if dos.pc.vga.is_native())
+            {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
                 // 0x3C0/0x3DA go direct too when save/restore can recover

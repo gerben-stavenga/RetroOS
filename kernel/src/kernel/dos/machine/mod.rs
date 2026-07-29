@@ -216,7 +216,7 @@ pub struct PcMachine {
     pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
-    pub vga: VgaState,
+    pub vga: vga::Vga,
     /// Present-path scratch, owned so the frame path allocates NOTHING per
     /// frame. `scanout` copies the live aperture into `present_scratch` and
     /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
@@ -226,8 +226,8 @@ pub struct PcMachine {
     /// lifetime, which a field of `VgaState` could not satisfy.
     pub present_scratch: alloc::vec::Vec<u8>,
     pub present_fb: alloc::vec::Vec<u32>,
-    /// Direct-display raster scratch: palette, one output row, a completed
-    /// WB shadow frame, and beam timing.
+    /// Direct-display scanout scratch: palette, a completed WB shadow frame,
+    /// and render/publish phase timing.
     pub present_scratch2: crate::kernel::display::Scratch,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
@@ -443,7 +443,7 @@ impl PcMachine {
             mouse: MouseState::new(),
             skip_irq: false,
             e0_pending: false,
-            vga: VgaState::new(),
+            vga: vga::Vga::new(),
             present_scratch: alloc::vec::Vec::new(),
             present_fb: alloc::vec::Vec::new(),
             present_scratch2: crate::kernel::display::Scratch::new(),
@@ -493,10 +493,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
     let port = port & 0x3FF;
     match port {
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
-        // (blanking). Where the kernel's raster beam presents the display,
-        // bit 3 is the beam's own vertical blank — genuine state of the one
-        // VGA model, not a fabrication (see `input_status1`). Where no beam
-        // sweeps, a free-running 70 Hz phase fills in; Bochs / real VGA
+        // (blanking). Direct framebuffer scanout drives bit 3 from the same
+        // phase clock that schedules whole-shadow render/publication. Where no
+        // such clock runs, a free-running 70 Hz phase fills in; Bochs / real VGA
         // hardware pass the register through (QEMU's own 0x3DA bit 3 doesn't
         // sweep in our setup — a passthrough hangs Wolf3D's VL_WaitVBL).
         //
@@ -505,7 +504,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            if !vga::vga_present() {
+            if pc.vga.is_emulated() {
                 pc.vga.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
@@ -519,9 +518,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             input_status1(machine, &pc.present_scratch2)
         }
         // VGA ports — pass through to hardware, or the emulated register file
-        // when no card is present (see vga::vga_present).
+        // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
-            if vga::vga_present() {
+            if pc.vga.is_native() {
                 machine.inb(port)
             } else {
                 pc.vga.port_read(port)
@@ -624,7 +623,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
-            if !vga::vga_present() {
+            if pc.vga.is_emulated() {
                 pc.vga.port_write(port, val);
                 return;
             }
@@ -637,7 +636,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
-            if vga::vga_present() {
+            if pc.vga.is_native() {
                 machine.outb(port, val);
             } else {
                 pc.vga.port_write(port, val);
@@ -753,11 +752,10 @@ fn seg_base_for<A: crate::Arch>(regs: &Regs, sel: u16) -> u32 {
 /// VGA Input Status #1 for the emulated card (see the `emulate_inb` 0x3DA
 /// arm): bit 3 = vertical retrace, bit 0 = blanking, vsync forcing blanking.
 ///
-/// Bit 3 is the raster beam's OWN vertical blank whenever a beam is sweeping
-/// this display — the genuine state of the emulated VGA, not a fabrication:
-/// "in retrace" means the frame really finished painting, so retrace-raced
-/// VRAM updates and DAC loads land exactly as on hardware. Only displays
-/// without a live beam (window sink, unfocused thread) fall back to a
+/// Bit 3 is the direct scanout clock's retrace phase. Its trailing edge
+/// captures VRAM/register/DAC state into one complete shadow, so updates made
+/// while this bit is set enter the next rendered frame. Displays without a
+/// live direct scanout clock (window sink, unfocused thread) fall back to a
 /// fabricated free-running 70 Hz phase, asserted 8/32 steps ≈ 3.6 ms/frame.
 ///
 /// Bit 0 (display-disabled / blanking) — per-read counter toggling every 8

@@ -28,7 +28,10 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
     // It no longer touches storage — the mount decision is made below, from
     // the partition tables, by the layer that owns it.
-    let platform = crate::kernel::platform::probe(machine, boot);
+    let probed = crate::kernel::platform::probe(machine, boot);
+    let platform = probed.facts;
+    let mut screen =
+        crate::kernel::platform::VisibleScreen::new(screen, probed.display);
 
     // Disk-write policy, applied by COMPOSITION: metal defaults to wrapping
     // every physical disk in a volatile RAM overlay. The only escape hatch is
@@ -248,7 +251,7 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
-    screen: &mut crate::vga::Screen,
+    screen: &mut crate::kernel::platform::VisibleScreen,
 ) {
     use crate::kernel::block::partition::PartKind;
 
@@ -452,7 +455,13 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
-fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[u8], threads: &mut [thread::Thread<A>], mut screen: crate::vga::Screen) -> ! {
+fn run<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+    master_env: &[u8],
+    threads: &mut [thread::Thread<A>],
+    mut screen: crate::kernel::platform::VisibleScreen,
+) -> ! {
     if let Some(raw) = boot.cmdline() {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
@@ -480,7 +489,10 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            run_program(machine, threads, path, tail, cwd, master_env, boot.debug_watch);
+            screen = run_program_with_screen(
+                machine, threads, path, tail, cwd, master_env, boot.debug_watch,
+                screen,
+            );
         }
         crate::screenln!(screen, "All commands done — shutting down.");
         crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
@@ -498,16 +510,45 @@ fn run<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, master_env: &[
     crate::screenln!(screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
     loop {
-        run_program(machine, threads, &dn_path, b"", b"", master_env, boot.debug_watch);
+        screen = run_program_with_screen(
+            machine, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
+            screen,
+        );
         crate::screenln!(screen, "DN exited, restarting...");
     }
+}
+
+fn run_program_with_screen<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    path: &[u8],
+    cmdline_tail: &[u8],
+    cwd: &[u8],
+    env: &[u8],
+    debug_watch: Option<(u32, u32)>,
+    screen: crate::kernel::platform::VisibleScreen,
+) -> crate::kernel::platform::VisibleScreen {
+    let (screen, display) = screen.suspend(machine);
+    let display = run_program(
+        machine, threads, path, cmdline_tail, cwd, env, debug_watch, display,
+    );
+    screen.resume(machine, display)
 }
 
 /// Load and run a single cmdline program until it exits. ELF binaries run
 /// through the Linux loader (a fresh process thread); `.COM` / MZ `.EXE`
 /// through the DOS VM86 loader. `cmdline_tail`/`env` apply only to the DOS
 /// path (PSP:0080h cmdline + environment).
-fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], path: &[u8], cmdline_tail: &[u8], cwd: &[u8], env: &[u8], debug_watch: Option<(u32, u32)>) {
+fn run_program<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    path: &[u8],
+    cmdline_tail: &[u8],
+    cwd: &[u8],
+    env: &[u8],
+    debug_watch: Option<(u32, u32)>,
+    display: crate::kernel::platform::DisplayToken,
+) -> crate::kernel::platform::DisplayToken {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -569,6 +610,12 @@ fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>
     {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
+        match &mut t.personality {
+            thread::Personality::Dos(dos) => dos.materialize(machine, display),
+            thread::Personality::Linux(_) => {
+                crate::kernel::linux::adopt_console_vga(display)
+            }
+        }
         crate::kernel::io_policy::apply(machine, &t.personality, true);
     }
 
@@ -580,7 +627,7 @@ fn run_program<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, threads, tid);
+    event_loop(machine, threads, tid)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -613,12 +660,17 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// (the CPU loan), `console` (input routing), `Personality` (the slice
 /// hooks + event dispatch), `sched` (policy), `focus` (console ownership,
 /// moved together with execution by `switch_focus_and_run` for now).
-pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], first_tid: usize) {
+pub fn event_loop<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    first_tid: usize,
+) -> crate::kernel::platform::DisplayToken {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
+    let mut display_handoff = None;
 
     loop {
         stats.slice_begin(machine);
@@ -666,7 +718,9 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         // to unblock it (above) or F11 to move on.
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
-                Some(next) => switch_focus_and_run(machine, threads, &mut ctx, next),
+                Some(next) => switch_focus_and_run(
+                    machine, threads, &mut ctx, next, &mut display_handoff,
+                ),
                 None => core::hint::spin_loop(),
             }
             continue;
@@ -680,16 +734,20 @@ pub fn event_loop<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
         stats.after_dispatch(machine);
 
         // Ask the scheduler.
-        match crate::kernel::sched::verdict(machine, threads, &mut ctx.regs, ctx.tid, action) {
+        match crate::kernel::sched::verdict(
+            machine, threads, &mut ctx.regs, ctx.tid, action, &mut display_handoff,
+        ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
-                switch_focus_and_run(machine, threads, &mut ctx, next);
+                switch_focus_and_run(
+                    machine, threads, &mut ctx, next, &mut display_handoff,
+                );
             }
             crate::kernel::sched::Verdict::AllDead => {
                 // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
                 thread::reap_all_zombies(threads, machine);
-                return;
+                return display_handoff.take().expect("dead display owner lost token");
             }
         }
     }
@@ -746,22 +804,23 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
+    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
 ) {
     if new_tid == ctx.tid {
         return;
     }
-    {
+    let display = {
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
-        let old_personality = if old.kernel.state != thread::ThreadState::Zombie {
-            Some(&mut old.personality)
+        if old.kernel.state != thread::ThreadState::Zombie {
+            assert!(display_handoff.is_none(), "stale VGA display handoff");
+            crate::kernel::focus::release(machine, &mut old.personality)
         } else {
-            None
-        };
-        crate::kernel::focus::release(machine, old_personality);
-    }
+            display_handoff.take().expect("zombie lost display handoff")
+        }
+    };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    crate::kernel::focus::acquire(machine, new_tid, &mut new.personality);
+    crate::kernel::focus::acquire(machine, new_tid, &mut new.personality, display);
     // switch_to derived the I/O bitmap before focus moved (it must — a bare
     // execution switch is valid without any focus change); now that this
     // thread holds focus, re-derive so the focused-only windows (VGA on a
@@ -877,7 +936,9 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl).is_err() {
         // Restore the parent's space and tear the half-built child down.
         let _ = machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
-        thread::exit_thread(threads, machine, child_tid, 1);
+        let mut child_handoff = None;
+        thread::exit_thread(threads, machine, child_tid, 1, &mut child_handoff);
+        assert!(child_handoff.is_none(), "unfocused child owned physical VGA");
         on_error(vcpu, 11);
         return None;
     }
@@ -935,9 +996,9 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // the child's vga empty; switch_thread's restore is a no-op on
             // empty planes, so the hardware shows whatever the previous
             // restore put up — the child draws on top.
-            if parent_is_dos && crate::kernel::dos::vga_present() {
+            if parent_is_dos && crate::kernel::dos::physical_vga_present() {
                 let dos_state = child.dos_mut();
-                dos_state.pc.vga.save_from_hardware();
+                dos_state.pc.vga.snapshot_hardware_into_emulated(machine);
             }
             machine.outb(0x3D4, 0x0E);
             let cursor_hi = machine.inb(0x3D5) as u16;
@@ -1086,8 +1147,8 @@ static mut SLICE_PARTS: [u64; 5] = [0; 5];
 /// tick+display total can be divided by the right denominator.
 static mut PRESENTS: u64 = 0;
 
-/// display_tick's internals: scanout cycles, band-pass count (one raster
-/// band or one whole window-sink frame per bill), VGA render cycles, final
+/// display_tick's internals: scanout cycles, render-pass count (one complete
+/// shadow or one whole window-sink frame per bill), VGA render cycles, final
 /// framebuffer/window publication cycles, and destination pixels written.
 static mut DISP_PARTS: [u64; 5] = [0; 5];
 static mut DISP_MODE: lib::vga_render::VgaMode = lib::vga_render::VgaMode::Text80x25;
@@ -1095,7 +1156,7 @@ static mut DISP_MODE: lib::vga_render::VgaMode = lib::vga_render::VgaMode::Text8
 pub fn bill_display(
     mode: lib::vga_render::VgaMode,
     scanout: u64,
-    bands: u64,
+    renders: u64,
     render: u64,
     present: u64,
     px: usize,
@@ -1104,7 +1165,7 @@ pub fn bill_display(
         core::ptr::write_volatile(&raw mut DISP_MODE, mode);
         let p = &raw mut DISP_PARTS;
         (*p)[0] = (*p)[0].wrapping_add(scanout);
-        (*p)[1] = (*p)[1].wrapping_add(bands);
+        (*p)[1] = (*p)[1].wrapping_add(renders);
         (*p)[2] = (*p)[2].wrapping_add(render);
         (*p)[3] = (*p)[3].wrapping_add(present);
         (*p)[4] = (*p)[4].wrapping_add(px as u64);
@@ -1459,7 +1520,7 @@ impl EventStats {
                 let present = pct10(dp[3]);
                 let per_frame = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
                 crate::dbg_println!(
-                    "[prof] display: {:?} | {} frames, {} slices, {} px/frame | scanout={}.{}% render={}.{}% present={}.{}% | cycles/frame render={} present={}",
+                    "[prof] display: {:?} | {} frames, {} renders, {} px/frame | scanout={}.{}% render={}.{}% present={}.{}% | cycles/frame render={} present={}",
                     dm, np, dp[1], dp[4].checked_div(np.max(1)).unwrap_or(0),
                     scanout / 10, scanout % 10, render / 10, render % 10,
                     present / 10, present % 10,

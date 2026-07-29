@@ -29,17 +29,23 @@ pub fn adopt(tid: usize) {
 /// state. Runs while the old thread's context is still the live one. `old`
 /// is None when the previous owner is already gone (zombie — `exit_thread`
 /// snapshotted its farewell screen before teardown).
-pub fn release<A: crate::Arch>(machine: &mut A, old: Option<&mut Personality<A>>) {
-    if let Some(old) = old {
-        old.suspend(machine);
-    }
+pub fn release<A: crate::Arch>(
+    machine: &mut A,
+    old: &mut Personality<A>,
+) -> crate::kernel::platform::DisplayToken {
+    old.suspend(machine)
 }
 
 /// Second half: repaint the incoming owner's screen state and record it as
 /// the console owner. Runs after the execution switch, with the new
 /// thread's context live — materialize ordering matches the pre-focus-API
 /// behaviour exactly.
-pub fn acquire<A: crate::Arch>(machine: &mut A, new_tid: usize, new: &mut Personality<A>) {
-    new.materialize(machine);
+pub fn acquire<A: crate::Arch>(
+    machine: &mut A,
+    new_tid: usize,
+    new: &mut Personality<A>,
+    display: crate::kernel::platform::DisplayToken,
+) {
+    new.materialize(machine, display);
     FOCUS.store(new_tid, Ordering::Relaxed);
 }

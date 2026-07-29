@@ -45,12 +45,13 @@ fn mode13h_maps_each_index_through_the_palette() {
         vram[x] = (x & 0xFF) as u8;
     }
     let ac = identity_ac();
-    let frame = Frame {
+    let mut frame = Frame {
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
         ac: &ac,
         palette: &pal,
+        dac_mask: 0xFF,
         font: &[],
         blink: false,
         cga_palette: [0; 4],
@@ -66,6 +67,11 @@ fn mode13h_maps_each_index_through_the_palette() {
     }
     // Index 0 → black everywhere on row 1.
     assert_eq!(out[320], pal_rgb(&pal, 0));
+
+    // PEL mask 0x0F aliases index 0x21 to DAC entry 0x01.
+    frame.dac_mask = 0x0F;
+    vga_render::render(&frame, &mut out);
+    assert_eq!(out[0x21], pal_rgb(&pal, 0x01));
 }
 
 #[test]
@@ -80,6 +86,7 @@ fn mode13h_tolerates_short_vram() {
         planes: &[],
         ac: &ac,
         palette: &pal,
+        dac_mask: 0xFF,
         font: &[],
         blink: false,
         cga_palette: [0; 4],
@@ -120,6 +127,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         planes: &[],
         ac: &ac,
         palette: &pal,
+        dac_mask: 0xFF,
         font: &font,
         blink: false,
         cga_palette: [0; 4],
@@ -176,6 +184,7 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         planes: &[],
         ac: &ac,
         palette: &palette,
+        dac_mask: 0xFF,
         font: &[],
         blink: false,
         cga_palette: [0; 4],
@@ -197,7 +206,7 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         let mut out = vec![0u8; out_w * step * 200 + n * 4];
         let mut pal = vga_render::Pal::new();
         let mut cache = [0u8; 768];
-        pal.sync(&palette, fmt, &mut cache);
+        pal.sync(&palette, 0xFF, fmt, &mut cache);
         vga_render::render_row_stretched(&frame, sy, &pal, &mut out, out_w);
         let row = &out[sy * out_w * step..];
 
@@ -221,5 +230,63 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         assert_eq!(xout, out_w);
         // Only row `sy` was asked for, so every earlier row must be untouched.
         assert!(out[..sy * out_w * step].iter().all(|&b| b == 0));
+    }
+}
+
+#[test]
+fn overlay_x_projection_scales_fills_and_glyph_pixels() {
+    let (w, h, logical_w) = (16usize, 16usize, 8usize);
+    let mut out = vec![0u8; w * h * 4];
+    let pixel = |buf: &[u8], x: usize, y: usize| {
+        let o = (y * w + x) * 4;
+        u32::from_le_bytes(buf[o..o + 4].try_into().unwrap())
+    };
+
+    // Logical [2,4) maps exactly to packed-shadow [4,8).
+    vga_render::overlay_fill_xscaled(
+        &mut out,
+        w * 4,
+        w,
+        h,
+        logical_w,
+        2,
+        0,
+        2,
+        1,
+        0x0012_3456,
+        PixelFormat::NATIVE,
+    );
+    assert_eq!(pixel(&out, 3, 0), 0);
+    for x in 4..8 {
+        assert_eq!(pixel(&out, x, 0), 0x0012_3456);
+    }
+    assert_eq!(pixel(&out, 8, 0), 0);
+
+    out.fill(0);
+    let ch = b'A';
+    let glyph = &lib::vga_fonts::FONT_8X16[ch as usize * 16..ch as usize * 16 + 16];
+    vga_render::overlay_text_xscaled(
+        &mut out,
+        w * 4,
+        w,
+        h,
+        logical_w,
+        0,
+        0,
+        &[ch],
+        0x00AA_5500,
+        0x0000_0011,
+        PixelFormat::NATIVE,
+    );
+    for (y, &bits) in glyph.iter().enumerate() {
+        for gx in 0..8 {
+            let want = if bits & (0x80 >> gx) != 0 {
+                0x00AA_5500
+            } else {
+                0x0000_0011
+            };
+            assert_eq!(pixel(&out, gx * 2, y), want);
+            assert_eq!(pixel(&out, gx * 2 + 1, y), want);
+        }
     }
 }

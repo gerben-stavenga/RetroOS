@@ -83,6 +83,7 @@ fn flush() {
         planes: &[],
         ac: &TEXT_AC,
         palette: unsafe { &*palette_p },
+        dac_mask: 0xFF,
         font: &FONT_8X16,
         blink: false,
         cga_palette: [0; 4],
@@ -112,7 +113,7 @@ fn scanout(fb: &Framebuffer, frame: &Frame<'_>) {
     if s.surface.len() != need {
         s.surface.resize(need, 0);
     }
-    s.pal.sync(frame.palette, fb.format, &mut s.pal_cache);
+    s.pal.sync(frame.palette, frame.dac_mask, fb.format, &mut s.pal_cache);
     for sy in 0..h {
         lib::vga_render::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }

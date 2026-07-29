@@ -64,13 +64,91 @@ pub enum Display {
     /// or a hosted window supplied one. The emulated VGA blits into it; the
     /// descriptor travels with the verdict, so nothing has to call back to
     /// find out where the pixels go.
-    Framebuffer(crate::kernel::display::Framebuffer),
+    Framebuffer,
     /// No card or framebuffer, but a host window installed a present sink
     /// (retroos-play): the emulated VGA renders into the window.
     HostWindow,
     /// Nothing to display on (headless interp run): the emulated VGA still
     /// models state — screendumps and --screenshot remain possible.
     Headless,
+}
+
+/// The unique authority to make the selected display visible. Unlike
+/// [`Display`], this is a moved resource, never stored in the global platform
+/// facts.
+pub enum DisplayToken {
+    VgaCard,
+    Framebuffer(crate::kernel::display::Framebuffer),
+    HostWindow,
+    Headless,
+}
+
+impl DisplayToken {
+    pub fn kind(&self) -> Display {
+        match self {
+            Self::VgaCard => Display::VgaCard,
+            Self::Framebuffer(_) => Display::Framebuffer,
+            Self::HostWindow => Display::HostWindow,
+            Self::Headless => Display::Headless,
+        }
+    }
+}
+
+pub struct ProbedPlatform {
+    pub facts: &'static Platform,
+    pub display: DisplayToken,
+}
+
+/// Kernel console state while it is the visible display owner.
+pub struct VisibleScreen {
+    writer: crate::vga::Screen,
+    display: DisplayToken,
+}
+
+/// Kernel console state while another owner is visible. It intentionally does
+/// not implement `fmt::Write`.
+pub struct HiddenScreen {
+    writer: crate::vga::Screen,
+    native_vga: Option<crate::kernel::dos::VgaState>,
+}
+
+impl VisibleScreen {
+    pub fn new(writer: crate::vga::Screen, display: DisplayToken) -> Self {
+        Self { writer, display }
+    }
+
+    pub fn suspend<A: crate::Arch>(self, _machine: &mut A) -> (HiddenScreen, DisplayToken) {
+        let native_vga = if matches!(self.display, DisplayToken::VgaCard) {
+            let mut vga = crate::kernel::dos::VgaState::new();
+            vga.save_from_hardware();
+            Some(vga)
+        } else {
+            None
+        };
+        (HiddenScreen { writer: self.writer, native_vga }, self.display)
+    }
+}
+
+impl HiddenScreen {
+    pub fn resume<A: crate::Arch>(
+        self,
+        _machine: &mut A,
+        display: DisplayToken,
+    ) -> VisibleScreen {
+        if matches!(display, DisplayToken::VgaCard) {
+            self.native_vga
+                .as_ref()
+                .expect("native screen lost VGA state")
+                .restore_to_hardware();
+        }
+        VisibleScreen { writer: self.writer, display }
+    }
+}
+
+impl core::fmt::Write for VisibleScreen {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        core::fmt::Write::write_str(&mut self.writer, s)
+    }
 }
 
 /// Real-mode firmware at the legacy ROM window.
@@ -248,7 +326,10 @@ static mut PLATFORM: Option<Platform> = None;
 /// Probe the machine and freeze the result. Called exactly once, early in
 /// `startup` — after the heap, before threading (still single-threaded, so
 /// the write-once static needs no lock).
-pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'static Platform {
+pub fn probe<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+) -> ProbedPlatform {
     let mut sb_card = None;
     let audio_hw = probe_audio(machine, &mut sb_card);
     // A native host backend (hosted "punch-through") means /host is available
@@ -280,14 +361,14 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
         // `vga_card_answers()` (write the SEQ index, read it back) only ever
         // confirmed what `is_metal` already implied: the hosted port bus has no
         // VGA device to answer, and a metal machine that boots this way does.
-        let display = if let Some(fb) = (env.framebuffer)() {
-            Display::Framebuffer(fb)
+        let (display, display_token) = if let Some(fb) = (env.framebuffer)() {
+            (Display::Framebuffer, DisplayToken::Framebuffer(fb))
         } else if crate::kernel::display::host_present_sink_installed() {
-            Display::HostWindow
+            (Display::HostWindow, DisplayToken::HostWindow)
         } else if env.is_metal {
-            Display::VgaCard
+            (Display::VgaCard, DisplayToken::VgaCard)
         } else {
-            Display::Headless
+            (Display::Headless, DisplayToken::Headless)
         };
 
         // Who owns the IVT follows from WHO DRIVES THE DISPLAY — not from a
@@ -320,7 +401,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
 
         let vga_readback = matches!(display, Display::VgaCard) && vga_readback_answers();
 
-        Platform {
+        (Platform {
             host: env.host(boot.is_qemu),
             display,
             firmware,
@@ -335,9 +416,10 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             audio: audio_hw.default_verdict(),
             hostfs,
             debug: env.debug,
-        }
+        }, display_token)
     };
 
+    let (p, display_token) = p;
     unsafe {
         PLATFORM = Some(p);
     }
@@ -353,7 +435,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> &'sta
             println!("VGA: WARNING no readback extensions — AC ports direct, full process VGA restore NOT supported (flip-flop/latches unrecoverable)");
         }
     }
-    p
+    ProbedPlatform { facts: p, display: display_token }
 }
 
 /// The frozen platform description. Panics if `probe` has not run — an init

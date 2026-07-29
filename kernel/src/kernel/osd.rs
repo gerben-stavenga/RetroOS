@@ -275,30 +275,45 @@ const PAD: usize = 8;
 const CELL_W: usize = vga_render::OVERLAY_CELL_W;
 const CELL_H: usize = vga_render::OVERLAY_CELL_H;
 
-/// Composite the panel onto a finished frame. `out` is pitched by `stride` bytes,
-/// with `w`×`h` visible pixels in `fmt` (native for the hosted `present_fb`,
-/// `fb.format` for the GOP framebuffer). A no-op if the frame can't hold it.
-pub fn paint(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
+/// Composite the panel onto a finished frame. X coordinates are laid out in
+/// `logical_w` VGA-source pixels and projected into the `w`-pixel packed
+/// shadow; Y is already at source-row resolution. Hosted callers pass
+/// `logical_w == w`, making the projection an identity.
+pub fn paint(
+    out: &mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    logical_w: usize,
+    fmt: PixelFormat,
+) {
     if PICKER.load(Ordering::Relaxed) {
-        paint_picker(out, stride, w, h, fmt);
+        paint_picker(out, stride, w, h, logical_w, fmt);
         return;
     }
     // Title + 6 items + footer = 8 rows.
     let rows = NUM_ITEMS + 2;
     let panel_w = COLS * CELL_W + PAD * 2;
     let panel_h = rows * CELL_H + PAD * 2;
-    if w < panel_w || h < panel_h {
+    if logical_w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (w - panel_w) / 2;
+    let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga_render::overlay_fill(out, stride, w, h, x0, y0, panel_w, panel_h, PANEL_BG, fmt);
-    vga_render::overlay_fill(out, stride, w, h, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt);
+    vga_render::overlay_fill_xscaled(
+        out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
+    );
+    vga_render::overlay_fill_xscaled(
+        out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
+    );
 
     let tx = x0 + PAD;
     let mut ty = y0 + PAD;
-    vga_render::overlay_text(out, stride, w, h, tx, ty, b"RetroOS Monitor", TITLE_FG, TITLE_BG, fmt);
+    vga_render::overlay_text_xscaled(
+        out, stride, w, h, logical_w, tx, ty,
+        b"RetroOS Monitor", TITLE_FG, TITLE_BG, fmt,
+    );
     ty += CELL_H;
 
     let sel = SEL.load(Ordering::Relaxed);
@@ -307,39 +322,64 @@ pub fn paint(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFormat
         item_line(item, &mut line);
         let selected = item == sel;
         if selected {
-            vga_render::overlay_fill(out, stride, w, h, x0 + PAD / 2, ty, panel_w - PAD, CELL_H, SEL_BG, fmt);
+            vga_render::overlay_fill_xscaled(
+                out, stride, w, h, logical_w, x0 + PAD / 2, ty,
+                panel_w - PAD, CELL_H, SEL_BG, fmt,
+            );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-        vga_render::overlay_text(out, stride, w, h, tx, ty, line.as_bytes(), fg, bg, fmt);
+        vga_render::overlay_text_xscaled(
+            out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
+        );
         ty += CELL_H;
     }
 
-    vga_render::overlay_text(out, stride, w, h, tx, ty, b"Up/Dn  Enter  <> vol  Esc", FOOT_FG, PANEL_BG, fmt);
+    vga_render::overlay_text_xscaled(
+        out, stride, w, h, logical_w, tx, ty,
+        b"Up/Dn  Enter  <> vol  Esc", FOOT_FG, PANEL_BG, fmt,
+    );
 }
 
 /// Paint the Switch picker: one row per active task, `tid: name  S *`.
-fn paint_picker(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFormat) {
+fn paint_picker(
+    out: &mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    logical_w: usize,
+    fmt: PixelFormat,
+) {
     let count = PROC_COUNT.load(Ordering::Relaxed);
     let rows = count.max(1) + 2; // title + list (≥1 line) + footer
     let panel_w = COLS * CELL_W + PAD * 2;
     let panel_h = rows * CELL_H + PAD * 2;
-    if w < panel_w || h < panel_h {
+    if logical_w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (w - panel_w) / 2;
+    let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga_render::overlay_fill(out, stride, w, h, x0, y0, panel_w, panel_h, PANEL_BG, fmt);
-    vga_render::overlay_fill(out, stride, w, h, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt);
+    vga_render::overlay_fill_xscaled(
+        out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
+    );
+    vga_render::overlay_fill_xscaled(
+        out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
+    );
 
     let tx = x0 + PAD;
     let mut ty = y0 + PAD;
-    vga_render::overlay_text(out, stride, w, h, tx, ty, b"Switch to task", TITLE_FG, TITLE_BG, fmt);
+    vga_render::overlay_text_xscaled(
+        out, stride, w, h, logical_w, tx, ty,
+        b"Switch to task", TITLE_FG, TITLE_BG, fmt,
+    );
     ty += CELL_H;
 
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
-        vga_render::overlay_text(out, stride, w, h, tx, ty, b"(no tasks)", ITEM_FG, PANEL_BG, fmt);
+        vga_render::overlay_text_xscaled(
+            out, stride, w, h, logical_w, tx, ty,
+            b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
+        );
         ty += CELL_H;
     } else {
         for idx in 0..count {
@@ -347,15 +387,23 @@ fn paint_picker(out: &mut [u8], stride: usize, w: usize, h: usize, fmt: PixelFor
             proc_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
-                vga_render::overlay_fill(out, stride, w, h, x0 + PAD / 2, ty, panel_w - PAD, CELL_H, SEL_BG, fmt);
+                vga_render::overlay_fill_xscaled(
+                    out, stride, w, h, logical_w, x0 + PAD / 2, ty,
+                    panel_w - PAD, CELL_H, SEL_BG, fmt,
+                );
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-            vga_render::overlay_text(out, stride, w, h, tx, ty, line.as_bytes(), fg, bg, fmt);
+            vga_render::overlay_text_xscaled(
+                out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
+            );
             ty += CELL_H;
         }
     }
 
-    vga_render::overlay_text(out, stride, w, h, tx, ty, b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt);
+    vga_render::overlay_text_xscaled(
+        out, stride, w, h, logical_w, tx, ty,
+        b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
+    );
 }
 
 /// One picker row: `tid: name` padded to a column, then state glyph and a `*`

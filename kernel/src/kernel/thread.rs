@@ -177,7 +177,7 @@ pub enum Personality<A: crate::Arch> {
 impl<A: crate::Arch> Personality<A> {
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
-    pub fn suspend(&mut self, machine: &mut A) {
+    pub fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::DisplayToken {
         match self {
             Self::Dos(d) => d.suspend(machine),
             Self::Linux(l) => l.suspend(machine),
@@ -188,10 +188,14 @@ impl<A: crate::Arch> Personality<A> {
     /// Visual rematerialization only — CPU-binding side effects (LDT, TLS,
     /// deferred wait_status writeout) live in `on_resume` and run
     /// independently of focus changes.
-    pub fn materialize(&mut self, machine: &mut A) {
+    pub fn materialize(
+        &mut self,
+        machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) {
         match self {
-            Self::Dos(d) => d.materialize(machine),
-            Self::Linux(l) => l.materialize(machine),
+            Self::Dos(d) => d.materialize(machine, display),
+            Self::Linux(l) => l.materialize(machine, display),
         }
     }
 
@@ -235,21 +239,23 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::dos::queue_tick(machine, dos);
                 }
                 let t1b = if prof { machine.rdtsc() } else { 0 };
+                // Service sound before display work. A GOP publication is an
+                // unavoidable synchronous device-memory burst and may consume
+                // most of a millisecond; feeding audio first keeps that burst
+                // from turning into an output underrun.
+                crate::kernel::dos::audio_tick(machine, dos, regs);
+                let t2 = if prof { machine.rdtsc() } else { 0 };
                 if ticks > 0 {
                     // One processed world slice advances the display once.
                     // Batched/missed timer slices deliberately do not create
                     // display catch-up work.
                     crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
                 }
-                let t2 = if prof { machine.rdtsc() } else { 0 };
-                // Advance audio (mix all sources, push to the sink) on the same
-                // virtual clock.
-                crate::kernel::dos::audio_tick(machine, dos, regs);
                 if prof {
                     let t3 = machine.rdtsc();
                     crate::kernel::startup::bill_slice2(
                         0, t1b.wrapping_sub(t1),
-                        t2.wrapping_sub(t1b), t3.wrapping_sub(t2), ticks as u64);
+                        t3.wrapping_sub(t2), t2.wrapping_sub(t1b), ticks as u64);
                 }
             }
             Self::Linux(_) => {}
@@ -728,7 +734,13 @@ pub fn cycle_next<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> 
 
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
-pub fn exit_thread<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, tid: usize, exit_code: i32) -> usize {
+pub fn exit_thread<A: crate::Arch>(
+    threads: &mut [Thread<A>],
+    machine: &mut A,
+    tid: usize,
+    exit_code: i32,
+    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
 
     // Tear down the dying thread (only touches threads[tid]).
@@ -738,7 +750,11 @@ pub fn exit_thread<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, t
         // unmaps 0xA0000, after which save_from_hardware would fault. The
         // snapshot stays in the zombie's slot until the parent either
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
-        thread.personality.suspend(machine);
+        if tid == crate::kernel::focus::focused() {
+            let display = thread.personality.suspend(machine);
+            assert!(display_handoff.is_none(), "unconsumed display handoff");
+            *display_handoff = Some(display);
+        }
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
             Personality::Linux(_) => {}

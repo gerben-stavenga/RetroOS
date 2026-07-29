@@ -73,6 +73,9 @@ pub struct Frame<'a> {
     /// DAC palette: 256 entries × (R,G,B), each component 6-bit (0..63) as the
     /// VGA stores it. Used by all indexed modes.
     pub palette: &'a [u8; 768],
+    /// VGA PEL mask (port 3C6h). The pixel/attribute-derived DAC address is
+    /// ANDed with this before palette lookup. Normally 0xFF.
+    pub dac_mask: u8,
     /// Resolved CGA 4-colour palette (index 0 = background/border), already
     /// expanded to 0x00RRGGBB. The CGA modes read this instead of the DAC —
     /// it comes from the Mode-Control/Colour-Select registers (see
@@ -601,6 +604,7 @@ pub struct Pal {
     /// pixel. Rebuilt once at the start of a planar frame.
     planar: [u32; 16],
     pub fmt: PixelFormat,
+    mask: u8,
 }
 
 impl Default for Pal {
@@ -611,26 +615,33 @@ impl Default for Pal {
 
 impl Pal {
     pub const fn new() -> Pal {
-        Pal { lut: [0; 256], planar: [0; 16], fmt: PixelFormat::NATIVE }
+        Pal { lut: [0; 256], planar: [0; 16], fmt: PixelFormat::NATIVE, mask: 0xFF }
     }
 
     /// Rebuild for `palette`/`fmt`. Cheap to call every frame — it compares
     /// first and only 256 entries are recomputed when the DAC actually moves.
-    pub fn sync(&mut self, palette: &[u8; 768], fmt: PixelFormat, cache: &mut [u8; 768]) -> bool {
-        if cache == palette && self.fmt == fmt {
+    pub fn sync(
+        &mut self,
+        palette: &[u8; 768],
+        mask: u8,
+        fmt: PixelFormat,
+        cache: &mut [u8; 768],
+    ) -> bool {
+        if cache == palette && self.fmt == fmt && self.mask == mask {
             return false;
         }
         *cache = *palette;
         self.fmt = fmt;
+        self.mask = mask;
         for (i, e) in self.lut.iter_mut().enumerate() {
-            *e = fmt.encode(pal_rgb(palette, i as u8));
+            *e = fmt.encode(pal_rgb(palette, i as u8 & mask));
         }
         true
     }
 
-    /// Fold the complete 16-colour planar lookup into one tiny table. The
-    /// raster calls this once at phase zero; pixels then need only extract
-    /// their four-bit plane value and index the final packed colour.
+    /// Fold the complete 16-colour planar lookup into one tiny table. Scanout
+    /// calls this once per complete shadow; pixels then need only extract their
+    /// four-bit plane value and index the final packed colour.
     pub fn sync_planar(&mut self, ac: &[u8; 21]) {
         for val in 0..16 {
             self.planar[val] = self.lut[planar_dac_index(ac, val as u8) as usize];
@@ -930,7 +941,10 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
         for (x, px) in row.iter_mut().enumerate() {
             let p = base + x * bpp8;
             *px = match bpp {
-                8 => pal_rgb(frame.palette, vram.get(p).copied().unwrap_or(0)),
+                8 => pal_rgb(
+                    frame.palette,
+                    vram.get(p).copied().unwrap_or(0) & frame.dac_mask,
+                ),
                 15 => {
                     let v = rd16(p);
                     let r = ((v >> 10) & 0x1F) as u32;
@@ -976,7 +990,10 @@ fn render_mode13(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
         let base = start + ry * w + pan;
         let row = &mut out[y * w..y * w + w];
         for (x, px) in row.iter_mut().enumerate() {
-            *px = pal_rgb(frame.palette, vram.get(base + x).copied().unwrap_or(0));
+            *px = pal_rgb(
+                frame.palette,
+                vram.get(base + x).copied().unwrap_or(0) & frame.dac_mask,
+            );
         }
     }
 }
@@ -1092,7 +1109,12 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
     let planes = frame.planes;
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
     let colours: [u32; 16] =
-        core::array::from_fn(|i| pal_rgb(frame.palette, planar_dac_index(frame.ac, i as u8)));
+        core::array::from_fn(|i| {
+            pal_rgb(
+                frame.palette,
+                planar_dac_index(frame.ac, i as u8) & frame.dac_mask,
+            )
+        });
     for y in 0..h {
         // Below the Line Compare split the address latch resets to 0 and panning
         // is suppressed — a fixed status panel under the scrolling playfield.
@@ -1151,7 +1173,7 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
             let plane = sx & 3;
             let off = start + ry * rb + sx / 4;
             let idx = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
-            out[y * w + x] = pal_rgb(frame.palette, idx);
+            out[y * w + x] = pal_rgb(frame.palette, idx & frame.dac_mask);
         }
     }
 }
@@ -1192,9 +1214,12 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     }
     let ch = frame.vram[cell] as usize;
     let attr = frame.vram[cell + 1];
-    let fg = pal_rgb(frame.palette, attr & 0x0F);
+    let fg = pal_rgb(frame.palette, (attr & 0x0F) & frame.dac_mask);
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
-    let bg = pal_rgb(frame.palette, (attr >> 4) & bg_mask);
+    let bg = pal_rgb(
+        frame.palette,
+        ((attr >> 4) & bg_mask) & frame.dac_mask,
+    );
     let glyph = &frame.font[ch * 16..ch * 16 + 16];
     // VGA 9th-dot rule: the 9th column repeats the glyph's 8th column ONLY for
     // the line-draw block 0xC0..=0xDF, so box-drawing joins seamlessly. Every
@@ -1259,6 +1284,23 @@ pub fn overlay_fill(
     }
 }
 
+/// Horizontal nearest-neighbour projection of [`overlay_fill`]. `x`/`rw` are
+/// expressed in a `logical_w`-pixel source space and mapped into the `w`-pixel
+/// packed shadow. Y is already in source-row coordinates and is left alone;
+/// direct GOP publication performs its vertical expansion later.
+#[allow(clippy::too_many_arguments)]
+pub fn overlay_fill_xscaled(
+    out: &mut [u8], stride: usize, w: usize, h: usize, logical_w: usize,
+    x: usize, y: usize, rw: usize, rh: usize, rgb: u32, fmt: PixelFormat,
+) {
+    if logical_w == 0 {
+        return;
+    }
+    let x0 = x.saturating_mul(w) / logical_w;
+    let x1 = x.saturating_add(rw).saturating_mul(w) / logical_w;
+    overlay_fill(out, stride, w, h, x0, y, x1.saturating_sub(x0), rh, rgb, fmt);
+}
+
 /// Draw a CP437 byte string at pixel (`x`,`y`) with `FONT_8X16`, `fg`/`bg` as
 /// `0x00RRGGBB` encoded through `fmt`. One 8×16 cell per byte; stops at the
 /// right/bottom clip edge.
@@ -1286,6 +1328,47 @@ pub fn overlay_text(
             for gx in 0..OVERLAY_CELL_W {
                 let px = if bits & (0x80 >> gx) != 0 { fgp } else { bgp };
                 overlay_store(out, base + gx * bytes, px, bytes);
+            }
+        }
+    }
+}
+
+/// Horizontal nearest-neighbour projection of [`overlay_text`]. Glyph layout
+/// uses logical VGA pixels; every glyph-pixel interval is mapped independently
+/// into the packed shadow so text and panel rectangles receive exactly the same
+/// X stretch. Y remains at source-row resolution for the later GOP expansion.
+#[allow(clippy::too_many_arguments)]
+pub fn overlay_text_xscaled(
+    out: &mut [u8], stride: usize, w: usize, h: usize, logical_w: usize,
+    x: usize, y: usize, s: &[u8], fg: u32, bg: u32, fmt: PixelFormat,
+) {
+    if logical_w == 0 {
+        return;
+    }
+    let fgp = fmt.encode(fg);
+    let bgp = fmt.encode(bg);
+    let bytes = fmt.bytes_per_pixel as usize;
+    let font = &crate::vga_fonts::FONT_8X16;
+    for (i, &ch) in s.iter().enumerate() {
+        let cx = x + i * OVERLAY_CELL_W;
+        if cx + OVERLAY_CELL_W > logical_w {
+            break;
+        }
+        let glyph = &font[ch as usize * 16..ch as usize * 16 + 16];
+        for (gy, &bits) in glyph.iter().enumerate() {
+            let py = y + gy;
+            if py >= h {
+                break;
+            }
+            let base = py * stride;
+            for gx in 0..OVERLAY_CELL_W {
+                let lx = cx + gx;
+                let x0 = lx.saturating_mul(w) / logical_w;
+                let x1 = (lx + 1).saturating_mul(w) / logical_w;
+                let px = if bits & (0x80 >> gx) != 0 { fgp } else { bgp };
+                for xx in x0..x1.min(w) {
+                    overlay_store(out, base + xx * bytes, px, bytes);
+                }
             }
         }
     }
@@ -1357,7 +1440,7 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
@@ -1414,7 +1497,7 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -1436,7 +1519,7 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2,
         };
@@ -1531,7 +1614,7 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal,
+            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -1552,7 +1635,7 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::Mode13h,
-            vram: &vram, planes: &[], ac: &ac, palette: &pal,
+            vram: &vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
         };
@@ -1571,7 +1654,7 @@ mod tests {
         let ac = [0u8; 21];
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
-                mode, vram, planes: &[], ac: &ac, palette: &pal,
+                mode, vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
                 font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
             };

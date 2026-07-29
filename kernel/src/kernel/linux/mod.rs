@@ -51,20 +51,23 @@ const ENOSYS: i32 = 38;
 // snapshot we save on switch-out belongs at the personality level. Lazily
 // allocated on first save (VgaState's planes are a Vec).
 static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
+static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
-/// Gated on `vga_present()`: a no-op when there is no passthrough VGA card —
-/// the interpreter backend (console goes to stdout) and UEFI-class metal alike.
-pub fn save_console_vga() {
+/// Release the shared console's display token, snapshotting VGA hardware when
+/// the selected display is the legacy card.
+pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
     unsafe {
-        if !crate::kernel::dos::vga_present() {
-            return; // no card (interp / UEFI metal): nothing to snapshot
+        let display = (&raw mut LINUX_CONSOLE_DISPLAY)
+            .as_mut().unwrap().take().expect("hidden Linux console has no display");
+        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
+            let vga = (&raw mut LINUX_CONSOLE_VGA)
+                .as_mut()
+                .unwrap()
+                .get_or_insert_with(crate::kernel::dos::VgaState::new);
+            vga.save_from_hardware();
         }
-        let vga = (&raw mut LINUX_CONSOLE_VGA)
-            .as_mut()
-            .unwrap()
-            .get_or_insert_with(crate::kernel::dos::VgaState::new);
-        vga.save_from_hardware();
+        display
     }
 }
 
@@ -72,16 +75,24 @@ pub fn save_console_vga() {
 /// activation (no snapshot yet) we clear the screen rather than inherit
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
-pub fn restore_console_vga() {
+pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
     unsafe {
-        if !crate::kernel::dos::vga_present() {
-            return;
+        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
+            if let Some(vga) = (&raw const LINUX_CONSOLE_VGA).as_ref().unwrap() {
+                vga.restore_to_hardware();
+            } else {
+                crate::vga::vga().clear();
+            }
         }
-        if let Some(vga) = (&raw const LINUX_CONSOLE_VGA).as_ref().unwrap() {
-            vga.restore_to_hardware();
-        } else {
-            crate::vga::vga().clear();
-        }
+        assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
+        LINUX_CONSOLE_DISPLAY = Some(display);
+    }
+}
+
+pub fn adopt_console_vga(display: crate::kernel::platform::DisplayToken) {
+    unsafe {
+        assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
+        LINUX_CONSOLE_DISPLAY = Some(display);
     }
 }
 
@@ -153,16 +164,22 @@ impl LinuxState {
 
     /// Called when a Linux thread loses focus. Snapshots the shared Linux
     /// console framebuffer (TTY-style — all Linux threads share it).
-    pub fn suspend<A: crate::Arch>(&mut self, _machine: &mut A) {
-        save_console_vga();
+    pub fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
+        -> crate::kernel::platform::DisplayToken
+    {
+        save_console_vga()
     }
 
     /// Called when a Linux thread regains focus. Repaints the shared
     /// console from the suspend snapshot. CPU-binding side effects (TLS,
     /// deferred wait_status writeout) live in `on_resume` and happen on
     /// every swap-in.
-    pub fn materialize<A: crate::Arch>(&mut self, _machine: &mut A) {
-        restore_console_vga();
+    pub fn materialize<A: crate::Arch>(
+        &mut self,
+        _machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) {
+        restore_console_vga(display);
     }
 
     /// Called on every swap-in (whether or not we're refocusing): rebind
@@ -1228,6 +1245,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
+    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
 ) -> Option<usize> {
     use crate::kernel::exec;
     let format = exec::detect_format(&buffer, &path);
@@ -1245,7 +1263,9 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     }
 
     if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1).is_err() {
-        return Some(thread::exit_thread(threads, machine, tid, -ENOEXEC));
+        return Some(thread::exit_thread(
+            threads, machine, tid, -ENOEXEC, display_handoff,
+        ));
     }
 
     // Reload the live frame from the rebuilt stored frame; stay on this thread.

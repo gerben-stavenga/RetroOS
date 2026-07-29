@@ -30,10 +30,11 @@ pub fn verdict<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
+    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
-    let next = match next_after(machine, threads, regs, tid, action) {
+    let next = match next_after(machine, threads, regs, tid, action, display_handoff) {
         Some(n) => Some(n),
         None => focus_request(threads, tid),
     };
@@ -52,11 +53,14 @@ fn next_after<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
+    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
 ) -> Option<usize> {
     match action {
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
-        thread::KernelAction::Exit(code) => Some(thread::exit_thread(threads, machine, tid, code)),
+        thread::KernelAction::Exit(code) => Some(thread::exit_thread(
+            threads, machine, tid, code, display_handoff,
+        )),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(machine, threads, regs, tid,
@@ -68,7 +72,9 @@ fn next_after<A: crate::Arch>(
             crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, on_done)
         }
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
-            crate::kernel::linux::handle_exec(machine, threads, regs, tid, buffer, path, args, cwd)
+            crate::kernel::linux::handle_exec(
+                machine, threads, regs, tid, buffer, path, args, cwd, display_handoff,
+            )
         }
         thread::KernelAction::Wait { pid, status_ptr } => {
             crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr)
