@@ -401,9 +401,28 @@ impl VgaState {
             0x3D4 => self.crtc_index = v,
             0x3D5 => {
                 let i = self.crtc_index as usize;
-                if i < 25 {
-                    self.crtc[i] = v;
+                if i >= 25 {
+                    return;
                 }
+                // CRTC write protect (index 11h bit 7, which every BIOS mode set
+                // leaves SET): indices 00h-07h are read-only while it holds. The
+                // one documented exception is the Line Compare bit 8 in the
+                // Overflow register, which the hardware latches regardless.
+                //
+                // Load-bearing for tweaked modes that poke the Overflow register
+                // to move the split screen: Operation Wolf's intro writes
+                // index 07h = 01h, which — applied in full — would clear bit 8 of
+                // Vertical Display End and shrink the visible area from 400
+                // scanlines to 144 (200 rows to 72), cutting off everything below
+                // the split. Real hardware ignores that write; only the split
+                // moves.
+                if i <= 0x07 && self.crtc[0x11] & 0x80 != 0 {
+                    if i == 0x07 {
+                        self.crtc[0x07] = (self.crtc[0x07] & !0x10) | (v & 0x10);
+                    }
+                    return;
+                }
+                self.crtc[i] = v;
             }
             0x3D8 => self.cga_mode_ctl = v,     // CGA Mode Control
             0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
