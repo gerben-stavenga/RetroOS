@@ -3690,6 +3690,20 @@ struct LowMem {
     /// leaves ample headroom, incl. LIFO-nested excursions. Paragraph-aligned
     /// because `host_stack` precedes it and is a multiple of 16 in size.
     rm_stack: [u8; RM_STACK_SIZE],
+
+    /// The video BIOS "static functionality table" (16 bytes) that INT 10h
+    /// AH=1Bh points its caller at. On a real machine this lives in the video
+    /// ROM; the substitute BIOS has no ROM, so it lives here — it must be at a
+    /// *fixed guest-readable address*, because AH=1Bh hands out a far pointer
+    /// the guest dereferences long after the call.
+    video_static_info: [u8; 16],
+
+    /// Glyphs 128-255 of the 8x8 character generator, published through INT 1Fh
+    /// (a *data pointer*, not a handler). The low 128 live at their hardcoded
+    /// ROM address `F000:FA6E`; this half doesn't fit below the 1 MB wall from
+    /// there, so — exactly as a real VGA BIOS keeps it out in video ROM — it
+    /// gets its own home and only the vector locates it.
+    font_8x8_upper: [u8; 1024],
 }
 
 /// Locked PM stack size (see `LowMem::host_stack`).
@@ -3727,6 +3741,17 @@ fn lm_field(field_off: usize) -> usize { LOW_MEM_BASE as usize + field_off }
 /// `heap_base_seg`.
 pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
     machine.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
+}
+
+/// Linear address of the video static functionality table (see
+/// `LowMem::video_static_info`); the substitute BIOS seeds it and INT 10h
+/// AH=1Bh publishes it as a far pointer.
+pub(super) fn font_8x8_upper_addr() -> u32 {
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, font_8x8_upper) as u32
+}
+
+pub(super) fn video_static_info_addr() -> u32 {
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, video_static_info) as u32
 }
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;

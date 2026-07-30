@@ -158,6 +158,10 @@ fn bda(field_off: usize) -> usize {
 const KB_RING_FIRST: u16 = core::mem::offset_of!(Bda, kb_ring) as u16;
 const KB_RING_END: u16 = KB_RING_FIRST + (16 * 2);
 
+/// The BIOS default text cursor: a two-scanline underline (start 6, end 7),
+/// what a mode set installs in every text mode.
+const TEXT_CURSOR_SHAPE: u16 = 0x0607;
+
 macro_rules! bda_field {
     ($machine:expr, $field:ident) => {
         $machine.read(bda(core::mem::offset_of!(Bda, $field)))
@@ -219,6 +223,32 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     // are that duplicate now, so the scan still terminates.
     let _ = DUMMY_OFF;
     seed_bda(machine);
+    install_rom_font(machine);
+}
+
+/// Publish the 8x8 character generator through the two vectors that are *data
+/// pointers*, not handlers: INT 43h → the active graphics font, INT 1Fh → its
+/// upper 128 glyphs. A game drawing its own text in a graphics mode follows
+/// them to get glyph bitmaps; with the vectors pointing at our `CD 31` stub
+/// array instead, it renders stub bytes as pixels — text comes out garbled.
+/// Plenty of games skip the vectors entirely and read the 8x8 table at its
+/// hardcoded IBM ROM address, `F000:FA6E` — so the substitute BIOS has to put
+/// glyphs there too. That address is *inside* the ROM window a real machine
+/// has and our F000 page is plain RAM, whatever the firmware left in it: on
+/// hosted it reads back as zeros (text renders blank), on a UEFI machine as
+/// leftover firmware bytes (text renders as garbage). Only the low 128 glyphs
+/// fit below the 1 MB wall from FA6E; the upper half stays reachable through
+/// INT 1Fh, which is where a real VGA BIOS keeps it as well.
+const ROM_FONT_8X8: usize = 0xF_FA6E;
+
+fn install_rom_font<A: crate::Arch>(machine: &mut A) {
+    let upper = super::dos::font_8x8_upper_addr();
+    machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
+    machine.copy_to(upper as usize, &lib::vga_fonts::FONT_8X8[1024..]);
+    for (vector, addr) in [(0x43u32, ROM_FONT_8X8 as u32), (0x1F, upper)] {
+        write_u16(machine, 0, vector * 4, (addr & 0xF) as u16);
+        write_u16(machine, 0, vector * 4 + 2, (addr >> 4) as u16);
+    }
 }
 
 /// Seed the BDA fields a real POST would have set.
@@ -238,11 +268,38 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, rows_minus1 = 24u8);
     bda_field!(machine, cell_height = 16u16);
     bda_field!(machine, equipment = 0x0001u16);
+    // A real POST leaves the text cursor shape and the CGA compatibility
+    // register mirrors set for mode 3; AH=1Bh publishes all three, and a guest
+    // reading them back as zero sees a machine with no cursor.
+    bda_field!(machine, cursor_shape = TEXT_CURSOR_SHAPE);
+    bda_field!(machine, crt_mode_ctl = 0x29u8);
+    bda_field!(machine, crt_palette = 0x30u8);
     bda_field!(machine, kb_head = KB_RING_FIRST);
     bda_field!(machine, kb_tail = KB_RING_FIRST);
     bda_field!(machine, kb_ring_start = KB_RING_FIRST);
     bda_field!(machine, kb_ring_end = KB_RING_END);
     bda_field!(machine, kb_flags3 = KB3_ENHANCED);
+    seed_video_static_info(machine);
+}
+
+/// Seed the video BIOS static functionality table AH=1Bh points at — the VGA
+/// capability set, matching what we actually emulate (all modes 0-13h, 200/350/
+/// 400-line, DAC palette + colour paging, DCC available).
+fn seed_video_static_info<A: crate::Arch>(machine: &mut A) {
+    let mut t = [0u8; 16];
+    t[0] = 0xFF; // modes 00h-07h supported
+    t[1] = 0xE0; // modes 0Dh-0Fh
+    t[2] = 0x0F; // modes 10h-13h
+    t[7] = 0x07; // scan lines: 200, 350, 400
+    t[8] = 4; // total text character blocks
+    t[9] = 2; // max active text character blocks
+    // Misc support #1: all modes on all displays, gray summing, font load,
+    // default palette load, cursor emulation, EGA palette, DAC palette,
+    // colour paging.
+    t[10] = 0xFF;
+    // Misc support #2: save/restore state, blink/intensity control, DCC.
+    t[11] = 0x0E;
+    machine.copy_to(super::dos::video_static_info_addr() as usize, &t);
 }
 
 // ============================================================================
@@ -677,6 +734,11 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
             bda_field!(machine, cell_height = match mode { 4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16, 0x0F | 0x10 => 14, _ => 16 });
             bda_field!(machine, active_page = 0u8);
             bda_field!(machine, cursor_pos = [0u16; 8]);
+            // A mode set resets the cursor to the BIOS default underline (and
+            // hides it in graphics modes) — guests read it back via AH=03 and
+            // AH=1Bh, so it must not stay at whatever the last program set.
+            bda_field!(machine, cursor_shape =
+                if is_text_mode(mode) { TEXT_CURSOR_SHAPE } else { 0x0000u16 });
             // Arm/disarm the planar VRAM trap for the EGA 16-colour family
             // (0x0D–0x12, Keen): a BIOS-set planar mode never toggles the
             // Sequencer chain-4 bit, so this is the only place the trap gets
@@ -954,9 +1016,84 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                 regs.rbx = (regs.rbx & !0xFFFF) | 0x0008; // VGA, colour analog
             }
         }
+        0x1B => state_info(machine, regs),
         0x4F => vbe(machine, dos, regs),
         _ => {}
     }
+}
+
+/// INT 10h AH=1Bh — Functionality/State Information (VGA and up): a 64-byte
+/// block at ES:DI describing the current mode plus a far pointer to the static
+/// functionality table. The *other* canonical "is this a VGA?" probe next to
+/// AX=1A00 — Operation Wolf zeroes the block, calls this, and scans it: an
+/// all-zero block (i.e. an unserviced function) means "no VGA", and it drops to
+/// its EGA path with the worse palette. With no ROM to chain to on the
+/// Substitute path, an unimplemented AH=1Bh *is* an all-zero block, which is why
+/// the game only picked EGA under UEFI.
+fn state_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    if regs.rbx as u16 != 0 {
+        return; // BX=0 is the only defined implementation type
+    }
+    let lin = es_di(regs);
+    machine.copy_to(lin, &[0u8; 64]);
+    let mode: u8 = bda_field!(machine, video_mode);
+    let columns: u16 = bda_field!(machine, columns);
+    let rows_minus1: u8 = bda_field!(machine, rows_minus1);
+    let rows = rows_minus1 + 1;
+    // Regen buffer size/start, colours and page count per mode family: text
+    // pages are 2 bytes/cell rounded to 4 KB, the CGA graphics modes share one
+    // 16 KB buffer, and 13h is a single 64000-byte page.
+    let (regen_len, colours, pages) = match mode {
+        0x13 => (0xFA00u16, 256u16, 1u8),
+        0x0D => (0x2000, 16, 8),
+        0x0E => (0x4000, 16, 4),
+        0x0F => (0x8000, 2, 2), // mono planar
+        0x10 => (0x8000, 16, 2),
+        0x11 => (0x9600, 2, 1), // mono 640x480
+        0x12 => (0x9600, 16, 1),
+        4 | 5 => (0x4000, 4, 1),
+        6 => (0x4000, 2, 1),
+        // Text: one *page*, not the whole window — 80×25×2 rounded up to 4 KB
+        // (what a real VGA BIOS reports here; 40-column pages are half that).
+        _ => (if columns > 40 { 0x1000 } else { 0x0800 }, if mode == 7 { 1 } else { 16 }, 8),
+    };
+    machine.write::<u32>(lin, super::dos::video_static_info_addr());
+    machine.write::<u8>(lin + 0x04, mode);
+    machine.write::<u16>(lin + 0x05, columns);
+    machine.write::<u16>(lin + 0x07, regen_len);
+    machine.write::<u16>(lin + 0x09, 0); // page 0 starts at the buffer base
+    for page in 0..8 {
+        let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
+        let pos: u16 = machine.read(bda(pos_off));
+        machine.write::<u16>(lin + 0x0B + page * 2, pos);
+    }
+    let shape: u16 = bda_field!(machine, cursor_shape);
+    machine.write::<u8>(lin + 0x1B, shape as u8); // cursor end line
+    machine.write::<u8>(lin + 0x1C, (shape >> 8) as u8); // cursor start line
+    machine.write::<u8>(lin + 0x1D, bda_field!(machine, active_page));
+    machine.write::<u16>(lin + 0x1E, bda_field!(machine, crtc_base));
+    machine.write::<u8>(lin + 0x20, bda_field!(machine, crt_mode_ctl));
+    machine.write::<u8>(lin + 0x21, bda_field!(machine, crt_palette));
+    machine.write::<u8>(lin + 0x22, rows);
+    machine.write::<u16>(lin + 0x23, bda_field!(machine, cell_height));
+    machine.write::<u8>(lin + 0x25, 0x08); // active display combination: VGA colour
+    machine.write::<u8>(lin + 0x26, 0x00); // no alternate display
+    machine.write::<u16>(lin + 0x27, colours);
+    machine.write::<u8>(lin + 0x29, pages);
+    // Active scan lines: 0 = 200, 1 = 350, 2 = 400, 3 = 480.
+    machine.write::<u8>(lin + 0x2A, match mode {
+        0x11 | 0x12 => 3,
+        0x0F | 0x10 => 1,
+        4..=6 | 0x0D | 0x0E | 0x13 => 0,
+        _ => 2, // BIOS text modes come up 400-line (8x16 cells)
+    });
+    machine.write::<u8>(lin + 0x2B, 0); // primary character block
+    machine.write::<u8>(lin + 0x2C, 0); // secondary character block
+    // Misc flags: all modes on all displays, plus blink/intensity control in
+    // text modes (bit 5).
+    machine.write::<u8>(lin + 0x2D, if is_text_mode(mode) { 0x21 } else { 0x01 });
+    machine.write::<u8>(lin + 0x31, 3); // 256 KB of video memory
+    regs.rax = (regs.rax & !0xFF) | 0x1B; // function supported
 }
 
 // ============================================================================
