@@ -301,6 +301,29 @@ pub(super) fn dispatch<A: crate::Arch>(
             regs.rax = (regs.rax & !0xFFFF) | kb as u64;
         }
         0x15 => match (regs.rax >> 8) as u8 {
+            // AH=84h joystick support. We expose no game port, so report all
+            // four active-low buttons released and zeroed timing counters.
+            // Leaving this call untouched is not a harmless "unsupported"
+            // result: old games commonly ignore CF and inspect AL directly;
+            // their input AX (84xx) then looks like a permanently held fire
+            // button. Dyna Blaster does exactly that in its title/menu loop.
+            0x84 => match regs.rdx as u16 {
+                0 => {
+                    regs.rax = (regs.rax & !0xFF) | 0xF0;
+                    set_iret_cf(machine, regs, false);
+                }
+                1 => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx &= !0xFFFF;
+                    regs.rcx &= !0xFFFF;
+                    regs.rdx &= !0xFFFF;
+                    set_iret_cf(machine, regs, false);
+                }
+                _ => {
+                    regs.rax = (regs.rax & !0xFF00) | 0x8600;
+                    set_iret_cf(machine, regs, true);
+                }
+            },
             // AH=87h block move: the ROM does this via a protected-mode LGDT
             // excursion (illegal under VM86). Do the copy directly instead.
             0x87 => int15_block_move(machine, regs),
