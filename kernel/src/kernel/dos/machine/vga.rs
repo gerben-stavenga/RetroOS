@@ -1429,7 +1429,61 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 /// has the LDT. Returns false (→ real SEGV) for an instruction we don't model,
 /// so a gap is loud rather than silent corruption.
 #[allow(clippy::too_many_arguments)] // planar #PF decode needs the full seg/mode context
-pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga: &mut VgaState, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
+/// What a trapped memory-window access is talking to.
+///
+/// A closed set defined by RetroOS (see `dyn` vs enum: the variants are ours,
+/// not an external standard), so it is an enum with an exhaustive match. Both
+/// devices present a window the guest writes with ordinary instructions, and
+/// both need the *same* instruction decoder below — the only difference is
+/// where the bytes land.
+pub enum MmioTarget<'a> {
+    /// The VGA planar aperture at A0000, through the graphics controller.
+    Planar(&'a mut VgaState),
+    /// The Voodoo's PCI aperture: registers, LFB and texture download.
+    Voodoo(&'a mut super::vvoodoo::VVoodoo),
+}
+
+impl MmioTarget<'_> {
+    #[inline]
+    fn write8(&mut self, off: u32, val: u8) {
+        match self {
+            Self::Planar(vga) => vram_write(vga, off, val),
+            Self::Voodoo(vd) => vd.write8(off, val),
+        }
+    }
+
+    #[inline]
+    fn read8(&mut self, off: u32) -> u8 {
+        match self {
+            Self::Planar(vga) => vram_read(vga, off),
+            Self::Voodoo(vd) => vd.read8(off),
+        }
+    }
+
+    /// End of the faulting instruction. The Voodoo commits any partial dword
+    /// here; the VGA has nothing to settle, every byte already landed.
+    #[inline]
+    fn end_instruction(&mut self) {
+        if let Self::Voodoo(vd) = self {
+            vd.flush();
+        }
+    }
+
+    /// Offset of a guest linear address within this window, if it lands there.
+    ///
+    /// String ops can have either operand inside the trapped window, so they
+    /// have to ask per byte instead of assuming A0000 the way this decoder did
+    /// when the VGA was its only caller.
+    #[inline]
+    fn offset(&self, addr: u32) -> Option<u32> {
+        match self {
+            Self::Planar(_) => (0xA0000..0xB0000).contains(&addr).then(|| addr - 0xA0000),
+            Self::Voodoo(vd) => vd.aperture_offset(addr),
+        }
+    }
+}
+
+pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, target: &mut MmioTarget<'_>, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
     let vm86 = regs.mode() == crate::UserMode::VM86;
     let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
@@ -1478,7 +1532,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let modrm = peek(i);
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
-            vram_write(vga, off, val);
+            target.write8(off, val);
         }
         // mov r/m16/32, r
         0x89 => {
@@ -1486,12 +1540,12 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
             i += modrm_len(modrm, addr32, peek, i);
-            for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(off + b, (val >> (b * 8)) as u8); }
         }
         // mov r8, r/m8 — load
         0x8A => {
             let modrm = peek(i);
-            let v = vram_read(vga, off);
+            let v = target.read8(off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -1500,7 +1554,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let modrm = peek(i);
             let sz = opsize(op32, false);
             let mut v = 0u32;
-            for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (target.read8(off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -1512,14 +1566,14 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
         0xA0 | 0xA1 => {
             let sz = opsize(op32, opcode == 0xA0);
             let mut v = 0u32;
-            for b in 0..sz { v |= (vram_read(vga, off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (target.read8(off + b) as u32) << (b * 8); }
             set_gpr(regs, 0, sz, v);
             i += if addr32 { 4 } else { 2 };
         }
         0xA2 | 0xA3 => {
             let sz = opsize(op32, opcode == 0xA2);
             let val = gpr(regs, 0, sz);
-            for b in 0..sz { vram_write(vga, off + b, (val >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(off + b, (val >> (b * 8)) as u8); }
             i += if addr32 { 4 } else { 2 };
         }
         // mov r/m8, imm8
@@ -1528,7 +1582,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let l = modrm_len(modrm, addr32, peek, i);
             let imm = peek(i + l);
             i += l + 1;
-            vram_write(vga, off, imm);
+            target.write8(off, imm);
         }
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
@@ -1538,7 +1592,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
             i += l + sz;
-            for b in 0..sz { vram_write(vga, off + b, (imm >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(off + b, (imm >> (b * 8)) as u8); }
         }
         // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
         // touch planar VRAM: the read half loads the GC latches, the write half
@@ -1551,8 +1605,8 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let ridx = (modrm >> 3) & 7;
             let regval = gpr(regs, ridx, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
-            let memval = vram_read(vga, off);
-            vram_write(vga, off, regval);
+            let memval = target.read8(off);
+            target.write8(off, regval);
             set_gpr(regs, ridx, 1, memval as u32);
         }
         // xchg r/m16/32, r — the word/dword form, byte-by-byte so each byte
@@ -1565,8 +1619,8 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             i += modrm_len(modrm, addr32, peek, i);
             let mut memval = 0u32;
             for b in 0..sz {
-                memval |= (vram_read(vga, off + b) as u32) << (b * 8);
-                vram_write(vga, off + b, (regval >> (b * 8)) as u8);
+                memval |= (target.read8(off + b) as u32) << (b * 8);
+                target.write8(off + b, (regval >> (b * 8)) as u8);
             }
             set_gpr(regs, ridx, sz, memval);
         }
@@ -1579,7 +1633,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let df = regs.frame.rflags & (1 << 10) != 0;
             for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
-                for b in 0..sz { vram_write(vga, o + b, (al >> (b * 8)) as u8); }
+                for b in 0..sz { target.write8(o + b, (al >> (b * 8)) as u8); }
             }
             // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
             // isn't drained, leave EIP on the instruction (`not_done`) to resume.
@@ -1609,7 +1663,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
                 let mut val = 0u32;
-                for b in 0..sz { val |= (vram_read(vga, o + b) as u32) << (b * 8); }
+                for b in 0..sz { val |= (target.read8(o + b) as u32) << (b * 8); }
                 set_gpr(regs, 0, sz, val);
             }
             let step = chunk * sz;
@@ -1654,13 +1708,13 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                     // through `vram_read` — which also loads the GC latches, so a
                     // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
                     // from off-screen VRAM) is the correct EGA latch copy.
-                    let byte = if (0xA0000..0xB0000).contains(&src) {
-                        vram_read(vga, src - 0xA0000)
+                    let byte = if let Some(o) = target.offset(src) {
+                        target.read8(o)
                     } else {
                         machine.read::<u8>(src as usize)
                     };
-                    if (0xA0000..0xB0000).contains(&dst) {
-                        vram_write(vga, dst - 0xA0000, byte);
+                    if let Some(o) = target.offset(dst) {
+                        target.write8(o, byte);
                     } else {
                         machine.write::<u8>(dst as usize, byte);
                     }
@@ -1700,7 +1754,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             while done_n < chunk {
                 let o = if df { off.wrapping_sub(done_n * sz) } else { off.wrapping_add(done_n * sz) };
                 let mut mem = 0u32;
-                for b in 0..sz { mem |= (vram_read(vga, o + b) as u32) << (b * 8); }
+                for b in 0..sz { mem |= (target.read8(o + b) as u32) << (b * 8); }
                 alu(regs, 7, acc, mem, sz); // CMP acc, mem — flags only
                 done_n += 1;
                 if rep {
@@ -1742,8 +1796,8 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                 for b in 0..sz {
                     let s = ds_base.wrapping_add(si).wrapping_add(b);
                     let d = es_base.wrapping_add(di).wrapping_add(b);
-                    let sb = if (0xA0000..0xB0000).contains(&s) { vram_read(vga, s - 0xA0000) } else { machine.read::<u8>(s as usize) };
-                    let db = if (0xA0000..0xB0000).contains(&d) { vram_read(vga, d - 0xA0000) } else { machine.read::<u8>(d as usize) };
+                    let sb = match target.offset(s) { Some(o) => target.read8(o), None => machine.read::<u8>(s as usize) };
+                    let db = match target.offset(d) { Some(o) => target.read8(o), None => machine.read::<u8>(d as usize) };
                     src1 |= (sb as u32) << (b * 8);
                     src2 |= (db as u32) << (b * 8);
                 }
@@ -1792,7 +1846,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (vram_read(vga, off + b) as u32) << (b * 8);
+                mem |= (target.read8(off + b) as u32) << (b * 8);
             }
             if reg_is_dst {
                 let res = alu(regs, group, reg, mem, sz);
@@ -1804,7 +1858,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                 if group != 7 {
                     // CMP: no write-back
                     for b in 0..sz {
-                        vram_write(vga, off + b, (res >> (b * 8)) as u8);
+                        target.write8(off + b, (res >> (b * 8)) as u8);
                     }
                 }
             }
@@ -1823,7 +1877,7 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (vram_read(vga, off + b) as u32) << (b * 8);
+                mem |= (target.read8(off + b) as u32) << (b * 8);
             }
             alu(regs, 4, mem, reg, sz); // group 4 = AND, result discarded
         }
@@ -1848,11 +1902,11 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
             }
             i += l + immsz;
             let mut mem = 0u32;
-            for b in 0..sz { mem |= (vram_read(vga, off + b) as u32) << (b * 8); }
+            for b in 0..sz { mem |= (target.read8(off + b) as u32) << (b * 8); }
             let res = alu(regs, group, mem, imm, sz);
             if group != 7 {
                 // CMP: flags only, no write-back
-                for b in 0..sz { vram_write(vga, off + b, (res >> (b * 8)) as u8); }
+                for b in 0..sz { target.write8(off + b, (res >> (b * 8)) as u8); }
             }
         }
         _ => {
@@ -1864,9 +1918,14 @@ pub fn handle_planar_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, vga
                 ip0,
                 &buf[..]
             );
+            target.end_instruction();
             return false;
         }
     }
+
+    // Commit anything the target buffered across this instruction (the Voodoo
+    // gathers bytes into whole register dwords).
+    target.end_instruction();
 
     // Advance EIP past the emulated instruction — unless a `rep` was capped
     // mid-string (`not_done`), in which case leave EIP on the instruction so the
@@ -2067,8 +2126,44 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
 /// Render the emulated VGA's displayed frame to the platform present sink (the
 /// GOP framebuffer on UEFI metal, the window/screenshot mailbox on hosted).
 /// Free when a real card scans out directly or no sink is installed.
+
+/// Drive the Voodoo's display: report the vertical retrace it paces swaps on,
+/// and present a frame once one is ready. Returns true when the card owns the
+/// display, so the VGA path stands down.
+///
+/// The retrace is the host's clock, handed to the card — it has none of its
+/// own, which is why a deferred `swapbufferCMD` needs this call to complete.
+fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
+    if pc.voodoo.linear_base.is_none() {
+        return false;
+    }
+    // 60 Hz, the refresh Glide programs for every resolution we serve.
+    if frame_due(now_ticks, 60) {
+        pc.voodoo.vblank();
+    }
+    if !pc.voodoo.frame_ready {
+        return true;
+    }
+    let (w, h) = pc.voodoo.dimensions();
+    let (w, h) = (w as usize, h as usize);
+    let need = w * h;
+    if pc.present_fb.len() < need {
+        pc.present_fb.resize(need, 0);
+    }
+    pc.voodoo.scanout(&mut pc.present_fb[..need], w);
+    pc.present_fb.truncate(need);
+    crate::kernel::display::present_host(w, h, &mut pc.present_fb);
+    true
+}
+
 pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
     use lib::vga_render;
+    // A Glide program that has mapped the Voodoo owns the display: the card
+    // scans out instead of the VGA, exactly as the real board's pass-through
+    // relay does when it switches out of VGA mode.
+    if voodoo_display_tick(pc, now_ticks) {
+        return;
+    }
     let (display_kind, direct) = if let Some(display) = pc.vga.display() {
         (
             display.kind(),

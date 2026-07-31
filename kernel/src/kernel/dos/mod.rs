@@ -497,6 +497,16 @@ pub fn syscall<A: crate::Arch>(
 /// kernel + lib, no arch — both backends deliver the same PageFault. Returns
 /// true if handled (resume), false → real SEGV.
 pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
+    // The Voodoo's aperture is trapped the same way, through the same decoder
+    // — a different window and a different device behind it, nothing else.
+    if let Some(off) = dos.pc.voodoo.aperture_offset(addr) {
+        crate::dbg_println!("[voodoo] fault off={:06X}", off);
+        let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
+        let mut target = machine::vga::MmioTarget::Voodoo(&mut dos.pc.voodoo);
+        return machine::vga::handle_mmio_fault(
+            machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
+        );
+    }
     if !(0xA0000..0xB0000).contains(&addr) {
         return false;
     }
@@ -511,11 +521,20 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         return true;
     }
     let off = addr - 0xA0000;
-    // Resolve CS (instruction fetch) plus the DS/ES bases a `movs` needs: source
-    // is DS:(E)SI, destination ES:(E)DI. VM86 segs are shift-by-4; PM segs index
-    // the LDT. Plumbing both is what lets the 32-bit-PM `rep movsd` blit (Doom's
-    // Mode-Y plane copy under CWSDPMI) decode instead of SEGV.
-    let (cs_base, def32, ds_base, es_base) = if regs.mode() == crate::UserMode::VM86 {
+    let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
+    let mut target = machine::vga::MmioTarget::Planar(&mut dos.pc.vga);
+    machine::vga::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
+}
+
+/// Resolve CS (instruction fetch) plus the DS/ES bases a `movs` needs: source
+/// is DS:(E)SI, destination ES:(E)DI. VM86 segs are shift-by-4; PM segs index
+/// the LDT. Plumbing both is what lets the 32-bit-PM `rep movsd` blit (Doom's
+/// Mode-Y plane copy under CWSDPMI) decode instead of SEGV.
+fn fault_segment_bases<A: crate::Arch>(
+    dos: &thread::DosState<A>,
+    regs: &Regs,
+) -> (u32, bool, u32, u32) {
+    if regs.mode() == crate::UserMode::VM86 {
         ((regs.code_seg() as u32) << 4, false, (regs.ds as u32) << 4, (regs.es as u32) << 4)
     } else {
         let cs = regs.code_seg();
@@ -526,8 +545,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             mode_transitions::seg_base(ldt, regs.ds as u16),
             mode_transitions::seg_base(ldt, regs.es as u16),
         )
-    };
-    machine::vga::handle_planar_fault(machine, regs, &mut dos.pc.vga, cs_base, def32, ds_base, es_base, off)
+    }
 }
 
 /// Single entry point the event loop calls for the DOS personality.

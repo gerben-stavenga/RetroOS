@@ -163,6 +163,7 @@ pub fn guest_flags_handler_entry(regs: &Regs) -> u32 {
 
 pub(super) mod vga;
 pub use vga::*;
+pub(super) mod vvoodoo;
 // ============================================================================
 // PcMachine — per-thread machine state
 // ============================================================================
@@ -217,6 +218,9 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: vga::Vga,
+    /// The 3dfx Voodoo board. Present in every machine but inert until a
+    /// guest finds it over PCI and maps its aperture.
+    pub voodoo: vvoodoo::VVoodoo,
     /// Present-path scratch, owned so the frame path allocates NOTHING per
     /// frame. `scanout` copies the live aperture into `present_scratch` and
     /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
@@ -444,6 +448,7 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: vga::Vga::new(),
+            voodoo: vvoodoo::VVoodoo::new(),
             present_scratch: alloc::vec::Vec::new(),
             present_fb: alloc::vec::Vec::new(),
             present_scratch2: crate::kernel::display::Scratch::new(),
@@ -778,7 +783,78 @@ fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display:
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
 /// bytes through `emulate_inb` and writes the result into `regs.rax`.
+/// Bus/device/function the emulated Voodoo answers at. Nothing else responds,
+/// so a scan sees exactly one device and every other slot reads as absent.
+const VOODOO_BDF: u32 = 0x0000_0800; // bus 0, device 1, function 0
+
+/// The latched `CONFIG_ADDRESS` value (port 0xCF8).
+static mut PCI_CONFIG_ADDRESS: u32 = 0;
+
+fn pci_addressed_device() -> Option<u8> {
+    let addr = unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) };
+    // Bit 31 enables the decode; bits 30:24 are reserved.
+    if addr & 0x8000_0000 == 0 {
+        return None;
+    }
+    ((addr & 0x00FF_FF00) == VOODOO_BDF).then(|| (addr & 0xFC) as u8)
+}
+
+/// Serve an `IN` from 0xCF8/0xCFC. `None` means "not a config port".
+fn pci_config_in(pc: &mut PcMachine, port: u16, size: u32) -> Option<u32> {
+    match port {
+        0xCF8 if size == 4 => {
+            Some(unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) })
+        }
+        // Reads narrower than a dword address within the data port.
+        0xCFC..=0xCFF => {
+            let shift = (port - 0xCFC) as u32 * 8;
+            let dword = match pci_addressed_device() {
+                Some(off) => pc.voodoo.config_read(off),
+                // No device: the bus floats high, which is how a scan knows.
+                None => 0xFFFF_FFFF,
+            };
+            Some(dword >> shift)
+        }
+        _ => None,
+    }
+}
+
+/// Serve an `OUT` to 0xCF8/0xCFC. `true` means the write was consumed.
+fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
+    match port {
+        0xCF8 if size == 4 => {
+            unsafe { core::ptr::write_volatile(&raw mut PCI_CONFIG_ADDRESS, val) };
+            true
+        }
+        0xCFC..=0xCFF => {
+            if let Some(off) = pci_addressed_device() {
+                let shift = (port - 0xCFC) as u32 * 8;
+                if size == 4 && shift == 0 {
+                    pc.voodoo.config_write(off, val);
+                } else {
+                    // Sub-dword write: merge into the current value.
+                    let width = size * 8;
+                    let mask = if width >= 32 { !0 } else { ((1u32 << width) - 1) << shift };
+                    let cur = pc.voodoo.config_read(off);
+                    pc.voodoo.config_write(off, (cur & !mask) | ((val << shift) & mask));
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+    // PCI configuration space (mechanism #1) is wide-decode: it must be served
+    // before the ISA 10-bit fold below, which would otherwise alias 0xCF8 onto
+    // 0x0F8. Glide's DOS backend reaches the card with raw `inpd`/`outpd`
+    // here, not through the PCI BIOS.
+    if let Some(val) = pci_config_in(pc, port, size) {
+        let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
+        regs.rax = (regs.rax & !mask) | (val as u64 & mask);
+        return;
+    }
     if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         let val = machine.inw(port) as u64;
         regs.rax = (regs.rax & !0xFFFF) | val;
@@ -796,6 +872,9 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
+    if pci_config_out(pc, port, size, val as u32) {
+        return;
+    }
     if size == 2 && matches!(port, 0x01CE..=0x01D0) {
         machine.outw(port, val as u16);
         return;
