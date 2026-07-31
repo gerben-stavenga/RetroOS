@@ -429,3 +429,31 @@ fn clut_recolours_scanout() {
     }
     assert_eq!(c.frame()[0], 0x00_00_00_00, "white now scans out as black");
 }
+
+/// Replay of what Glide's `test04` actually programs: a triangle whose top
+/// edge is horizontal, drawn to the FRONT buffer with dithering on and
+/// clipping off (`fbzMode = 0x300`), vertices in 12.4 straight from the
+/// registers. This reproduced a rasterizer bug the SDK test found and the
+/// hand-written triangle test above did not.
+#[test]
+fn flat_top_triangle_from_glide_registers() {
+    let mut c = Card::boot();
+    c.w(fbzColorPath, 2); // cc_rgbselect = color1
+    c.w(color1, 0x00_ff_ff_ff);
+    c.w(alphaMode, 0);
+    c.w(fogMode, 0);
+    c.w(fbzMode, 0x300); // dither + rgb write, draw buffer 0 (front)
+
+    // A=(0,0) B=(36,0) C=(0,36) in 12.4, exactly as test04 leaves them.
+    c.w(vertexAx, 0);
+    c.w(vertexAy, 0);
+    c.w(vertexBx, 576);
+    c.w(vertexBy, 0);
+    c.w(vertexCx, 0);
+    c.w(vertexCy, 576);
+    c.w(triangleCMD, 0);
+
+    let out = c.frame();
+    let lit = out.iter().filter(|p| **p != 0).count();
+    assert!(lit > 500, "the triangle covered {lit} pixels");
+}
