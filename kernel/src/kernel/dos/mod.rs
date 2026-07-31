@@ -500,7 +500,6 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // The Voodoo's aperture is trapped the same way, through the same decoder
     // — a different window and a different device behind it, nothing else.
     if let Some(off) = dos.pc.voodoo.aperture_offset(addr) {
-        crate::dbg_println!("[voodoo] fault off={:06X}", off);
         let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
         let mut target = machine::vga::MmioTarget::Voodoo(&mut dos.pc.voodoo);
         return machine::vga::handle_mmio_fault(

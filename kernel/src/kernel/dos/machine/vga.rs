@@ -1395,6 +1395,37 @@ fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     }
 }
 
+/// The 80-bit x87 extended value the backend handed us, as an `f64`.
+///
+/// The x87 stack is where an `fstp [mmio]` keeps the value it is about to
+/// store, so the MMIO decoder has to widen it itself: sign, a 15-bit exponent
+/// biased by 16383, and a 64-bit significand whose top bit is *explicit*
+/// (unlike an IEEE double's hidden bit). Denormals and NaN/infinity payloads
+/// are not worth carrying here — a driver storing a vertex coordinate has
+/// neither — so they collapse to zero and the saturated exponent.
+fn f80_to_f64(raw: [u8; 10]) -> f64 {
+    let sig = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let se = u16::from_le_bytes([raw[8], raw[9]]);
+    let sign = (se >> 15) as u64;
+    let exp = (se & 0x7fff) as i32;
+    let bits = if exp == 0 && sig == 0 {
+        sign << 63 // ±0
+    } else if exp == 0x7fff {
+        (sign << 63) | (0x7ffu64 << 52) | ((sig >> 11) & ((1 << 52) - 1))
+    } else {
+        let e = exp - 16383 + 1023;
+        if e <= 0 {
+            sign << 63 // underflows a double: flush to ±0
+        } else if e >= 0x7ff {
+            (sign << 63) | (0x7ffu64 << 52) // overflows: ±inf
+        } else {
+            // Drop the explicit integer bit, keep the top 52 significand bits.
+            (sign << 63) | ((e as u64) << 52) | ((sig >> 11) & ((1 << 52) - 1))
+        }
+    };
+    f64::from_bits(bits)
+}
+
 /// Length of the ModR/M + SIB + displacement that follows the opcode, given the
 /// first ModR/M byte and the effective address size (32-bit when `addr32`).
 fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u32 {
@@ -1907,6 +1938,34 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             if group != 7 {
                 // CMP: flags only, no write-back
                 for b in 0..sz { target.write8(off + b, (res >> (b * 8)) as u8); }
+            }
+        }
+        // x87 stores into the aperture: `fst`/`fstp` (ModR/M reg field 2 and 3)
+        // in single (0xD9), double (0xDD) and integer (0xDB dword, 0xDF word,
+        // 0xDF /7 qword) forms. A planar VGA guest never does this, but a Glide
+        // driver does nothing else: its triangle setup writes every vertex
+        // coordinate and gradient to a *register* with `fstps`, because the
+        // values are already on the x87 stack. The value being stored is in
+        // ST(0), which is not part of `Regs` — the backend hands it over, and
+        // the popping forms pop it afterwards.
+        0xD9 | 0xDB | 0xDD | 0xDF if matches!((peek(i) >> 3) & 7, 2 | 3) || (opcode == 0xDF && (peek(i) >> 3) & 7 == 7) => {
+            let modrm = peek(i);
+            let ext = (modrm >> 3) & 7;
+            i += modrm_len(modrm, addr32, peek, i);
+            let v = f80_to_f64(machine.fpu_st0());
+            let (bytes, raw): (u32, u64) = match opcode {
+                0xD9 => (4, (v as f32).to_bits() as u64),
+                0xDD => (8, v.to_bits()),
+                0xDB => (4, v as i32 as u32 as u64),
+                _ if ext == 7 => (8, v as i64 as u64),
+                _ => (2, v as i16 as u16 as u64),
+            };
+            for b in 0..bytes {
+                target.write8(off + b, (raw >> (b * 8)) as u8);
+            }
+            // Every integer store but `fist` pops, as does `fstp`.
+            if ext == 3 || ext == 7 {
+                machine.fpu_pop();
             }
         }
         _ => {

@@ -326,6 +326,18 @@ pub trait Arch: Sized + GuestBytes {
     /// A clean FPU/SSE save area for a fresh thread.
     fn clean_fx_template(&self) -> Self::Fx;
 
+    /// The guest's current x87 top-of-stack register, ST(0), as the raw 80-bit
+    /// extended value.
+    ///
+    /// The MMIO instruction decoder needs it: an x87 store (`fstp [mmio]`) to a
+    /// trapped aperture faults like any other write, and the value being stored
+    /// lives nowhere in the general registers. Reading it must not disturb the
+    /// stack — `fpu_pop` is the separate half, for the popping forms.
+    fn fpu_st0(&self) -> [u8; 10];
+
+    /// Pop the guest's x87 stack, discarding ST(0).
+    fn fpu_pop(&mut self);
+
     // ── Diagnostics & power ────────────────────────────────────────────────
 
     /// Physical free-page count (diagnostic logging).

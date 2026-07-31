@@ -123,6 +123,8 @@ impl Arch for Metal {
 
     // ── FPU/SSE state ──
     fn clean_fx_template(&self) -> FxState { super::x86::clean_fx_template() }
+    fn fpu_st0(&self) -> [u8; 10] { super::x86::fpu_st0() }
+    fn fpu_pop(&mut self) { super::x86::fpu_pop() }
 
     // ── Diagnostics & power ──
     fn free_page_count(&self) -> usize { super::phys_mm::free_page_count() }
