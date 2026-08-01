@@ -300,7 +300,7 @@ pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
 pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
     let cells = (text.len() / 2)
         .min(0x8000)
-        .min((planes.len().saturating_sub(0x10000) + 1) / 2);
+        .min(planes.len().saturating_sub(0x10000).div_ceil(2));
     for i in 0..cells {
         let off = i * 2;
         planes[off] = text[off];
@@ -313,7 +313,7 @@ pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
 pub fn text_odd_even_merge(planes: &[u8], text: &mut [u8]) {
     let cells = (text.len() / 2)
         .min(0x8000)
-        .min((planes.len().saturating_sub(0x10000) + 1) / 2);
+        .min(planes.len().saturating_sub(0x10000).div_ceil(2));
     for i in 0..cells {
         let off = i * 2;
         text[off] = planes[off];

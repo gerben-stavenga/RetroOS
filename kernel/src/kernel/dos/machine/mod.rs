@@ -801,7 +801,7 @@ fn pci_addressed_device() -> Option<u8> {
     if addr & 0x8000_0000 == 0 {
         return None;
     }
-    ((addr & 0x00FF_FF00) == VOODOO_BDF).then(|| (addr & 0xFC) as u8)
+    ((addr & 0x00FF_FF00) == VOODOO_BDF).then_some((addr & 0xFC) as u8)
 }
 
 /// Serve an `IN` from 0xCF8/0xCFC. `None` means "not a config port".

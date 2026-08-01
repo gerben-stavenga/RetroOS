@@ -1488,7 +1488,7 @@ fn f80_to_f64_bits(raw: [u8; 10]) -> u64 {
     let se = u16::from_le_bytes([raw[8], raw[9]]);
     let sign = (se >> 15) as u64;
     let exp = (se & 0x7fff) as i32;
-    let bits = if exp == 0 && sig == 0 {
+    if exp == 0 && sig == 0 {
         sign << 63 // ±0
     } else if exp == 0x7fff {
         (sign << 63) | (0x7ffu64 << 52) | ((sig >> 11) & ((1 << 52) - 1))
@@ -1502,8 +1502,7 @@ fn f80_to_f64_bits(raw: [u8; 10]) -> u64 {
             // Drop the explicit integer bit, keep the top 52 significand bits.
             (sign << 63) | ((e as u64) << 52) | ((sig >> 11) & ((1 << 52) - 1))
         }
-    };
-    bits
+    }
 }
 
 /// An 80-bit extended value as `f32` bits, by re-biasing the exponent and
@@ -1651,6 +1650,9 @@ impl MmioTarget<'_> {
     }
 }
 
+/// The segment bases and the faulting offset are all independent inputs the
+/// decoder needs; bundling them would only move the list one level down.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, target: &mut MmioTarget<'_>, cs_base: u32, def32: bool, ds_base: u32, es_base: u32, off: u32) -> bool {
     let vm86 = regs.mode() == crate::UserMode::VM86;
     let ip0 = if def32 { regs.ip32() } else { regs.ip32() & 0xFFFF };
@@ -2318,10 +2320,6 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
     static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
     LAST.swap(frame, Ordering::Relaxed) != frame
 }
-
-/// Render the emulated VGA's displayed frame to the platform present sink (the
-/// GOP framebuffer on UEFI metal, the window/screenshot mailbox on hosted).
-/// Free when a real card scans out directly or no sink is installed.
 
 /// Drive the Voodoo's display: report the vertical retrace it paces swaps on,
 /// and present a frame once one is ready. Returns true when the card owns the
