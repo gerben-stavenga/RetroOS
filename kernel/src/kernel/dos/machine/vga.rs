@@ -1403,7 +1403,10 @@ fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
 /// (unlike an IEEE double's hidden bit). Denormals and NaN/infinity payloads
 /// are not worth carrying here — a driver storing a vertex coordinate has
 /// neither — so they collapse to zero and the saturated exponent.
-fn f80_to_f64(raw: [u8; 10]) -> f64 {
+/// The same, as raw `f64` bits. Bit manipulation only, never `f64` arithmetic:
+/// this runs in the fault handler, where the guest's x87 stack is live and
+/// this target's float math IS x87 (see `voodoo::float_to_int32`).
+fn f80_to_f64_bits(raw: [u8; 10]) -> u64 {
     let sig = u64::from_le_bytes(raw[0..8].try_into().unwrap());
     let se = u16::from_le_bytes([raw[8], raw[9]]);
     let sign = (se >> 15) as u64;
@@ -1423,7 +1426,64 @@ fn f80_to_f64(raw: [u8; 10]) -> f64 {
             (sign << 63) | ((e as u64) << 52) | ((sig >> 11) & ((1 << 52) - 1))
         }
     };
-    f64::from_bits(bits)
+    bits
+}
+
+/// An 80-bit extended value as `f32` bits, by re-biasing the exponent and
+/// truncating the significand — the same shape as [`f80_to_f64_bits`].
+fn f80_to_f32_bits(raw: [u8; 10]) -> u32 {
+    let sig = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let se = u16::from_le_bytes([raw[8], raw[9]]);
+    let sign = (se >> 15) as u32;
+    let exp = (se & 0x7fff) as i32;
+    if exp == 0 && sig == 0 {
+        return sign << 31; // ±0
+    }
+    if exp == 0x7fff {
+        // Inf or NaN: keep the kind, and never let a NaN collapse to infinity.
+        let frac = ((sig >> 40) as u32) & 0x7f_ffff;
+        let frac = if sig << 1 != 0 && frac == 0 { 1 } else { frac };
+        return (sign << 31) | (0xff << 23) | frac;
+    }
+    let e = exp - 16383 + 127;
+    if e <= 0 {
+        sign << 31 // underflows a float: flush to ±0
+    } else if e >= 0xff {
+        (sign << 31) | (0xff << 23) // overflows: ±inf
+    } else {
+        // Drop the explicit integer bit, keep the top 23 significand bits.
+        (sign << 31) | ((e as u32) << 23) | (((sig >> 40) as u32) & 0x7f_ffff)
+    }
+}
+
+/// An 80-bit extended value truncated toward zero into `width` bits, the
+/// conversion `fist`/`fistp` perform (rounding mode is not honoured: the
+/// guests that store integers here store already-rounded values).
+fn f80_to_int(raw: [u8; 10], width: u32) -> i64 {
+    let sig = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let se = u16::from_le_bytes([raw[8], raw[9]]);
+    let neg = se & 0x8000 != 0;
+    let exp = (se & 0x7fff) as i32;
+    if exp == 0 || exp == 0x7fff {
+        return 0; // zero, denormal, infinity or NaN: the indefinite value
+    }
+    // The significand is 1.63 fixed point; the exponent says where the point
+    // sits relative to bit 63.
+    let shift = 16383 + 63 - exp;
+    let mag = if shift >= 64 {
+        0
+    } else if shift >= 0 {
+        sig >> shift
+    } else if -shift < 64 {
+        sig << -shift
+    } else {
+        return 0;
+    };
+    let limit = if width >= 64 { i64::MAX as u64 } else { (1u64 << (width - 1)) - 1 };
+    if mag > limit {
+        return if neg { -(limit as i64) - 1 } else { limit as i64 };
+    }
+    if neg { -(mag as i64) } else { mag as i64 }
 }
 
 /// Length of the ModR/M + SIB + displacement that follows the opcode, given the
@@ -1952,13 +2012,13 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let ext = (modrm >> 3) & 7;
             i += modrm_len(modrm, addr32, peek, i);
-            let v = f80_to_f64(machine.fpu_st0());
+            let st0 = machine.fpu_st0();
             let (bytes, raw): (u32, u64) = match opcode {
-                0xD9 => (4, (v as f32).to_bits() as u64),
-                0xDD => (8, v.to_bits()),
-                0xDB => (4, v as i32 as u32 as u64),
-                _ if ext == 7 => (8, v as i64 as u64),
-                _ => (2, v as i16 as u16 as u64),
+                0xD9 => (4, f80_to_f32_bits(st0) as u64),
+                0xDD => (8, f80_to_f64_bits(st0)),
+                0xDB => (4, f80_to_int(st0, 32) as u32 as u64),
+                _ if ext == 7 => (8, f80_to_int(st0, 64) as u64),
+                _ => (2, f80_to_int(st0, 16) as i16 as u16 as u64),
             };
             for b in 0..bytes {
                 target.write8(off + b, (raw >> (b * 8)) as u8);
@@ -2205,13 +2265,44 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
     }
     let (w, h) = pc.voodoo.dimensions();
     let (w, h) = (w as usize, h as usize);
-    let need = w * h;
-    if pc.present_fb.len() < need {
-        pc.present_fb.resize(need, 0);
+    // Where the frame goes is the display's business, not the card's. On a
+    // framebuffer the card clocks pixels straight out in the panel's own
+    // encoding and the panel takes a row copy; a window sink wants whole
+    // native-RGB frames. A real VGA card has neither entry point — the board's
+    // pass-through relay would drive the monitor directly there, and we have
+    // nothing to emulate that with, so the frame is dropped. No token at all
+    // means this thread does not own the console: a Glide program in the
+    // background still swaps, it just is not seen.
+    match pc.vga.display() {
+        Some(crate::kernel::platform::DisplayToken::Framebuffer(fb)) => {
+            let fb = *fb;
+            if pc.voodoo_scanout.arm(&fb, w, h) {
+                let (out, pitch, dac) = pc.voodoo_scanout.target();
+                pc.voodoo.scanout(out, pitch, dac);
+                pc.voodoo_scanout.publish(&fb);
+            }
+        }
+        Some(_) => {}
+        None => {
+            if crate::kernel::display::host_present_sink_installed() {
+                let need = w * h;
+                if pc.present_fb.len() < need {
+                    pc.present_fb.resize(need, 0);
+                }
+                pc.present_fb.truncate(need);
+                // The window sink takes `0x00RRGGBB` frames; that is just this
+                // buffer's bytes with the identity encoding.
+                let bytes = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        pc.present_fb.as_mut_ptr() as *mut u8,
+                        need * 4,
+                    )
+                };
+                pc.voodoo.scanout(bytes, w * 4, &voodoo::Dac::native());
+                crate::kernel::display::present_host(w, h, &mut pc.present_fb);
+            }
+        }
     }
-    pc.voodoo.scanout(&mut pc.present_fb[..need], w);
-    pc.present_fb.truncate(need);
-    crate::kernel::display::present_host(w, h, &mut pc.present_fb);
     true
 }
 

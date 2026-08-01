@@ -7,6 +7,7 @@
 //! slices down. Everything policy-shaped — where the BAR lands, what the guest
 //! is allowed to see, when a frame is presented — lives here, not in the card.
 
+use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use voodoo::{Beam, Events, Kind, Voodoo};
@@ -104,7 +105,10 @@ struct WriteCombine {
 }
 
 pub struct VVoodoo {
-    card: Voodoo,
+    /// Boxed: the card's register files are ~20 KB, and `PcMachine` is built
+    /// by value on the 64 KB kernel stack. Inline it and construction alone
+    /// overflows the guard page.
+    card: Box<Voodoo>,
     /// Video memory. The guest maps no part of it directly yet — see the
     /// module docs on the LFB fast path.
     fb: Vec<u8>,
@@ -121,7 +125,7 @@ pub struct VVoodoo {
 impl VVoodoo {
     pub fn new() -> Self {
         Self {
-            card: Voodoo::new(Kind::Voodoo1, FB_BYTES, TEX_BYTES),
+            card: Box::new(Voodoo::new(Kind::Voodoo1, FB_BYTES, TEX_BYTES)),
             fb: vec![0u8; FB_BYTES],
             tex: vec![0u8; TEX_BYTES],
             cfg: Config { command: 0, bar0: BAR_PHYS, init_enable: 0 },
@@ -213,10 +217,11 @@ impl VVoodoo {
         self.card.dimensions()
     }
 
-    /// Decode the visible buffer into `out` (0x00RRGGBB per pixel).
-    pub fn scanout(&mut self, out: &mut [u32], pitch: usize) {
+    /// Clock the visible buffer out into `out`, in whatever encoding `dac`
+    /// describes, `pitch` BYTES per row.
+    pub fn scanout(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
         self.flush();
-        self.card.render(&self.fb, out, pitch);
+        self.card.render(&self.fb, dac, out, pitch);
         self.frame_ready = false;
     }
 

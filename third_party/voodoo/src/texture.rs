@@ -253,25 +253,30 @@ impl Texture {
         &self,
         texmode: u32,
         dither_4x4: u32,
-        iters: f64,
-        itert: f64,
-        iterw: f64,
+        iters: i64,
+        itert: i64,
+        iterw: i64,
         lod: &mut i32,
         bilinear_mask: i32,
         ram: &[u8],
     ) -> Rgba {
         let (mut s, mut t);
         if texmode_enable_perspective(texmode) {
-            let recip = 256.0 / iterw;
-            s = (iters * recip) as i32;
-            t = (itert * recip) as i32;
-            *lod -= fast_log2(iterw, 32);
+            // Perspective divide: the table hands back 1/w AND log2(1/w),
+            // the latter being exactly the LOD term. `lod` arrives holding the
+            // triangle's LOD base, so adding is the C's `lod = <reciplog>;
+            // lod += LODBASE`.
+            let mut wlog = 0;
+            let oow = crate::fast_reciplog(iterw, &mut wlog);
+            s = (oow.wrapping_mul(iters) >> 29) as i32;
+            t = (oow.wrapping_mul(itert) >> 29) as i32;
+            *lod += wlog;
         } else {
-            s = (iters * (1.0 / (1 << 24) as f64)) as i32;
-            t = (itert * (1.0 / (1 << 24) as f64)) as i32;
+            s = (iters >> 14) as i32;
+            t = (itert >> 14) as i32;
         }
 
-        if texmode_clamp_neg_w(texmode) && iterw < 0.0 {
+        if texmode_clamp_neg_w(texmode) && iterw < 0 {
             s = 0;
             t = 0;
         }
@@ -295,7 +300,8 @@ impl Texture {
             || (*lod != self.lodmin && !texmode_minification_filter(texmode));
 
         if point_sampled {
-            let shift = ilod + 8;
+            // Strip the LOD and all 18 fraction bits.
+            let shift = ilod + 18;
             s >>= shift;
             t >>= shift;
             if texmode_clamp_s(texmode) {
@@ -309,8 +315,9 @@ impl Texture {
             t *= smax + 1;
             Rgba::from_argb(self.lookup_single_texel(format, texbase, s, t, ram))
         } else {
-            s >>= ilod;
-            t >>= ilod;
+            // Keep the low 8 bits of the fraction for the filter weights.
+            s >>= ilod + 10;
+            t >>= ilod + 10;
             // Subtract half a texel so (0.5,0.5) lands on a whole texel.
             s -= 0x80;
             t -= 0x80;
@@ -444,37 +451,19 @@ impl Texture {
 }
 
 /// Fractional log2 of the top 7 mantissa bits (`s_log2_table`).
-const LOG2_TABLE: [u8; 128] = [
-    0, 2, 5, 8, 11, 14, 16, 19, 22, 25, 27, 30, 33, 35, 38, 40,
-    43, 46, 48, 51, 53, 56, 58, 61, 63, 65, 68, 70, 73, 75, 77, 80,
-    82, 84, 87, 89, 91, 93, 96, 98, 100, 102, 104, 106, 109, 111, 113, 115,
-    117, 119, 121, 123, 125, 127, 129, 132, 134, 136, 138, 140, 141, 143, 145, 147,
-    149, 151, 153, 155, 157, 159, 161, 162, 164, 166, 168, 170, 172, 173, 175, 177,
-    179, 181, 182, 184, 186, 188, 189, 191, 193, 194, 196, 198, 200, 201, 203, 205,
-    206, 208, 209, 211, 213, 214, 216, 218, 219, 221, 222, 224, 225, 227, 229, 230,
-    232, 233, 235, 236, 238, 239, 241, 242, 244, 245, 247, 248, 250, 251, 253, 254,
-];
-
-/// `fast_log2` — log2 as a 24.8 fixed-point value. `fracbits` says how many
-/// fractional bits the value carried when it was converted from fixed point.
-pub fn fast_log2(value: f64, fracbits: i32) -> i32 {
-    if value < 0.0 {
-        return 0;
-    }
-    // Only the 11-bit exponent and the top 7 mantissa bits matter.
-    let ival = (value.to_bits() >> 45) as u32;
-    let exp = (ival >> 7) as i32 - 1023 - fracbits;
-    (exp << 8) | LOG2_TABLE[(ival & 127) as usize] as i32
-}
-
-/// `compute_lodbase` — the per-triangle LOD base from the S/T gradients.
+/// `compute_lodbase` — the per-triangle LOD base from the S/T gradients
+/// (`prepare_tmu` in the C).
 pub fn compute_lodbase(dsdx: i64, dsdy: i64, dtdx: i64, dtdy: i64) -> i32 {
-    let (fdsdx, fdsdy) = (dsdx as f64, dsdy as f64);
-    let (fdtdx, fdtdy) = (dtdx as f64, dtdy as f64);
-    let texdx = fdsdx * fdsdx + fdtdx * fdtdx;
-    let texdy = fdsdy * fdsdy + fdtdy * fdtdy;
-    // 64 fractional bits in the source; halve because we want the sqrt.
-    fast_log2(texdx.max(texdy), 64) / 2
+    // (ds^2 + dt^2) in X and Y as 28.36 numbers.
+    let texdx = (dsdx >> 14) * (dsdx >> 14) + (dtdx >> 14) * (dtdx >> 14);
+    let texdy = (dsdy >> 14) * (dsdy >> 14) + (dtdy >> 14) * (dtdy >> 14);
+    // Whichever is larger, shifted down to 28.20.
+    let texdx = texdx.max(texdy) >> 16;
+    // `fast_reciplog` returns the log of the RECIPROCAL, so negate it; +12 for
+    // the exponent shed above, and halve it because we want the square root.
+    let mut lodbase = 0;
+    let _ = crate::fast_reciplog(texdx, &mut lodbase);
+    (-lodbase + (12 << 8)) / 2
 }
 
 impl Texture {

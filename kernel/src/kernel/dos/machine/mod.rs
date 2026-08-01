@@ -233,6 +233,10 @@ pub struct PcMachine {
     /// Direct-display scanout scratch: palette, a completed WB shadow frame,
     /// and render/publish phase timing.
     pub present_scratch2: crate::kernel::display::Scratch,
+    /// Publication state for the Voodoo's native-RGB frames on a framebuffer
+    /// display. Separate from `present_scratch2`: that one starts from VGA
+    /// planes and a DAC, which the card's output has neither of.
+    pub voodoo_scanout: crate::kernel::display::NativeScanout,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
@@ -431,7 +435,9 @@ impl PcMachine {
         self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
     }
 
-    pub fn new<A: crate::Arch>(machine: &mut A) -> Self {
+    /// Built straight into its heap slot: the struct is far too large to pass
+    /// through a kernel stack frame (see `DosState::pc`).
+    pub fn new_boxed<A: crate::Arch>(machine: &mut A) -> alloc::boxed::Box<Self> {
         // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
         // memory by copying entries[0..16], the faithful A20-off default every
         // real machine boots with. We never un-wrap it — a VM86 guest can use
@@ -439,7 +445,7 @@ impl PcMachine {
         // nothing to toggle. Dropping it removes the shadow region, the page
         // swap, and the local/global ref-counting that used to track it.
         machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
-        Self {
+        alloc::boxed::Box::new(Self {
             vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
             vrtc: VirtualRtc::new(machine),
@@ -452,6 +458,7 @@ impl PcMachine {
             present_scratch: alloc::vec::Vec::new(),
             present_fb: alloc::vec::Vec::new(),
             present_scratch2: crate::kernel::display::Scratch::new(),
+            voodoo_scanout: crate::kernel::display::NativeScanout::new(),
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             gus: Gus::new(),
@@ -460,7 +467,7 @@ impl PcMachine {
             mixer: Mixer::new(),
             cmos_index: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
-        }
+        })
     }
 }
 

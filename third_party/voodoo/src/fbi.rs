@@ -236,16 +236,24 @@ impl Fbi {
     /// This is the whole of "what the monitor sees": the SST-1 has no text
     /// mode, no planes and no palette in the display path — video memory is
     /// already RGB565 at `rowpixels` stride.
-    pub fn scanout(&self, fb: &[u8], clut: &Clut, out: &mut [u32], out_pitch: usize) {
+    ///
+    /// `out` receives packed pixels in the destination's own encoding, one row
+    /// per visible line at `out_pitch` BYTES, exactly as the RAMDAC would clock
+    /// them at the monitor. Nothing downstream has to know a pixel format: the
+    /// gamma CLUT and the encoding are folded into one component ramp per
+    /// channel first, so the inner loop is three table reads and a store.
+    pub fn scanout(&self, fb: &[u8], clut: &Clut, dac: &Dac, out: &mut [u8], out_pitch: usize) {
         let base = self.rgboffs[self.frontbuf as usize];
         if base == NO_BUFFER {
             return;
         }
-        let width = (self.width as usize).min(out_pitch);
+        let ramp = dac.ramps(clut);
+        let step = dac.bytes as usize;
+        let width = (self.width as usize).min(out_pitch / step.max(1));
         for y in 0..self.height as usize {
             let src = base as usize + y * self.rowpixels as usize * 2;
             let dst = y * out_pitch;
-            if dst + width > out.len() {
+            if dst + width * step > out.len() {
                 break;
             }
             for x in 0..width {
@@ -255,9 +263,69 @@ impl Fbi {
                 } else {
                     0
                 };
-                out[dst + x] = clut.pen(p);
+                let enc = ramp.r[((p >> 11) & 0x1f) as usize]
+                    | ramp.g[((p >> 5) & 0x3f) as usize]
+                    | ramp.b[(p & 0x1f) as usize];
+                let bytes = enc.to_le_bytes();
+                out[dst + x * step..dst + (x + 1) * step].copy_from_slice(&bytes[..step]);
             }
         }
+    }
+}
+
+/// Where the destination keeps each colour channel in a packed pixel, and how
+/// wide that pixel is. The board's DAC drove analog RGB and knew nothing of
+/// pixel formats; this is the emulated equivalent — the host states its
+/// channel layout once and the card clocks pixels out in it.
+///
+/// Channel positions, not lookup tables: the tables this expands to are 128
+/// entries built per frame, and a table-shaped `Dac` is kilobytes that then
+/// have to live somewhere no kernel stack can hold them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Dac {
+    /// `(shift, bits)` per channel, as a packed pixel stores it.
+    pub r: (u8, u8),
+    pub g: (u8, u8),
+    pub b: (u8, u8),
+    pub bytes: u8,
+}
+
+/// The 5/6/5 component ramps for one scanout: bit-replication (what the
+/// RAMDAC does to reach 8 bits), then the gamma CLUT, then the destination
+/// encoding — 128 entries total, rebuilt per frame.
+pub struct DacRamps {
+    pub r: [u32; 32],
+    pub g: [u32; 64],
+    pub b: [u32; 32],
+}
+
+impl Dac {
+    /// An identity 8-8-8 destination: `0x00RRGGBB`, four bytes per pixel.
+    pub const fn native() -> Dac {
+        Dac { r: (16, 8), g: (8, 8), b: (0, 8), bytes: 4 }
+    }
+
+    /// One 8-bit component placed in its channel.
+    #[inline]
+    fn place(v: u32, (shift, bits): (u8, u8)) -> u32 {
+        (v >> (8 - bits as u32)) << shift
+    }
+
+    fn ramps(&self, clut: &Clut) -> DacRamps {
+        let mut ramps = DacRamps { r: [0; 32], g: [0; 64], b: [0; 32] };
+        for (i, e) in ramps.r.iter_mut().enumerate() {
+            let v = ((i as u32) << 3) | ((i as u32) >> 2);
+            *e = Self::place(clut.component(v, 16), self.r);
+        }
+        for (i, e) in ramps.g.iter_mut().enumerate() {
+            let v = ((i as u32) << 2) | ((i as u32) >> 4);
+            *e = Self::place(clut.component(v, 8), self.g);
+        }
+        for (i, e) in ramps.b.iter_mut().enumerate() {
+            let v = ((i as u32) << 3) | ((i as u32) >> 2);
+            *e = Self::place(clut.component(v, 0), self.b);
+        }
+        ramps
     }
 }
 
@@ -345,6 +413,13 @@ impl Clut {
         let i = (color >> 3) as usize;
         let frac = color & 7;
         (at(i) * (8 - frac) + at(i + 1) * frac) >> 3
+    }
+
+    /// One 8-bit component after the gamma CLUT. `shift` selects the channel
+    /// (16/8/0), matching the CLUT entries' 8-8-8 layout.
+    #[inline]
+    pub fn component(&self, v: u32, shift: u32) -> u32 {
+        if self.identity { v } else { self.interp(v, shift) }
     }
 
     /// The 8-8-8 colour a 5-6-5 framebuffer pixel scans out as.

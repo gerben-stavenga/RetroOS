@@ -108,7 +108,11 @@ use crate::Regs;
 pub struct DosState<A: crate::Arch> {
     /// Policy-free PC machine state: virtual 8259 PIC, 8253 PIT, PS/2 keyboard,
     /// VGA register set, A20 gate, HMA page tracking.
-    pub pc: machine::PcMachine,
+    ///
+    /// Boxed: `PcMachine` is tens of KB of device state (VGA, GUS, the Voodoo)
+    /// and `DosState` is built by value on the 64 KB kernel stack every time a
+    /// program is exec'd. Inline, construction alone hits the guard page.
+    pub pc: alloc::boxed::Box<machine::PcMachine>,
 
     pub dta: u32,
     pub heap_seg: u16,
@@ -228,7 +232,7 @@ impl<A: crate::Arch> DosState<A> {
     pub fn new(machine: &mut A) -> Self {
         let ldt = fresh_ldt();
         DosState {
-            pc: machine::PcMachine::new(machine),
+            pc: machine::PcMachine::new_boxed(machine),
             dta: 0,
             heap_seg: 0xA000,
             heap_base_seg: 0xA000,
@@ -650,6 +654,15 @@ pub fn handle_event<A: crate::Arch>(
             // VM86→PM toggle if needed; save.restore puts us back in
             // VM86 on the unwind.
             if dos.dpmi.is_some() {
+                // A #GP reflected to a PM client is almost always a segment
+                // limit the client thinks is wider than it is — the Glide
+                // tests fault on an aperture read whose linear address lies
+                // outside DS. The client's own handler prints registers but
+                // reads the descriptors AFTER it has restored them, so dump
+                // the live LDT view here, where it is still the fault's.
+                if n == 13 {
+                    log_pm_gp(dos, regs);
+                }
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, n as u32)
             } else if is_vm86 && matches!(n, 0 | 3 | 4) {
                 // Bare VM86 (no DPMI), #DE / #BP / #OF: same vectors as
@@ -712,6 +725,7 @@ pub fn handle_event<A: crate::Arch>(
                     bytes[0], bytes[1], bytes[2], bytes[3],
                     bytes[4], bytes[5], bytes[6], bytes[7]);
             } else if dos.dpmi.is_some() {
+                log_pm_gp(dos, regs);
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, 13)
             } else {
                 thread::KernelAction::Exit(0x0200 | 13) // #GP
@@ -1459,4 +1473,43 @@ fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
 /// for: the stub slot index IS the original vector.
 pub fn stub_seg() -> u16 {
     dos::STUB_SEG
+}
+
+/// Descriptor state at a client #GP: which selectors were loaded, what they
+/// actually covered, and where the Voodoo aperture sits — enough to say
+/// whether the faulting address was simply past a limit. First few only: a
+/// client that GPs repeatedly must not flood the log.
+fn log_pm_gp<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let seg = |sel: u16| -> (u32, u32) {
+        match dpmi::valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
+            Some(idx) => {
+                let d = dos.ldt[idx];
+                (dpmi::desc_base(d), dpmi::desc_limit(d))
+            }
+            None => (0, 0),
+        }
+    };
+    let (cs_b, cs_l) = seg(regs.code_seg());
+    let (ds_b, ds_l) = seg(regs.ds as u16);
+    let (es_b, es_l) = seg(regs.es as u16);
+    let (ss_b, ss_l) = seg(regs.stack_seg());
+    crate::println!(
+        "[#GP] cs={:04x}:{:#x} err={:#x} eax={:#x} ebx={:#x} esi={:#x}",
+        regs.code_seg(), regs.ip32(), regs.err_code, regs.rax as u32,
+        regs.rbx as u32, regs.rsi as u32
+    );
+    crate::println!(
+        "[#GP] cs={:04x} base={:#x} limit={:#x} | ds={:04x} base={:#x} limit={:#x}",
+        regs.code_seg(), cs_b, cs_l, regs.ds as u16, ds_b, ds_l
+    );
+    crate::println!(
+        "[#GP] es={:04x} base={:#x} limit={:#x} | ss={:04x} base={:#x} limit={:#x} | voodoo aperture={:x?}",
+        regs.es as u16, es_b, es_l, regs.stack_seg(), ss_b, ss_l,
+        dos.pc.voodoo.linear_base
+    );
 }

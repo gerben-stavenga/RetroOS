@@ -50,10 +50,15 @@ impl Card {
         self.v.read(&self.fb, addr, Beam::default())
     }
 
+    /// The visible frame as `0x00RRGGBB`, i.e. scanned out through an
+    /// identity destination encoding.
     fn frame(&self) -> Vec<u32> {
-        let mut out = vec![0u32; 640 * 480];
-        self.v.render(&self.fb, &mut out, 640);
-        out
+        let mut bytes = vec![0u8; 640 * 480 * 4];
+        self.v.render(&self.fb, &crate::Dac::native(), &mut bytes, 640 * 4);
+        bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     }
 }
 
@@ -456,4 +461,142 @@ fn flat_top_triangle_from_glide_registers() {
     let out = c.frame();
     let lit = out.iter().filter(|p| **p != 0).count();
     assert!(lit > 500, "the triangle covered {lit} pixels");
+}
+
+/// The two colour paths Glide's `test17` uses for its DECAL texture mode:
+/// the one it starts in, and the one it lands on after cycling the lighting
+/// modes back around. Both are decal by construction — `cc_mselect = 0` with
+/// `cc_reverse_blend` clear inverts the blend factor to 0xff, so the output is
+/// `c_other`, i.e. the texel — and the only difference between them is on the
+/// ALPHA side. The picture must therefore be identical.
+#[test]
+fn decal_colorpaths_agree_on_rgb() {
+    fn draw(fbzcp: u32) -> Vec<u32> {
+        let mut c = Card::boot();
+        // Uniform RGB565 red in texture memory: any texel address samples the
+        // same colour, so the test says nothing about filtering or addressing.
+        for t in c.tex.chunks_exact_mut(2) {
+            t.copy_from_slice(&0xf800u16.to_le_bytes());
+        }
+        // Exactly what test17 programs, minus the colour path.
+        c.w(textureMode, 0x0426_1acf);
+        c.w(tLOD, 0);
+        c.w(texBaseAddr, 0);
+        c.w(fbzMode, 0x0008_4321);
+        c.w(alphaMode, 0x0004_0400);
+        c.w(color0, 0x0000_00ff);
+        c.w(color1, 0x0000_00ff);
+        c.w(fogMode, 0);
+        c.w(fbzColorPath, fbzcp);
+        // fbzMode has clipping enabled; open it to the whole screen.
+        c.w(clipLeftRight, 640);
+        c.w(clipLowYHighY, 480);
+
+        // Constant texture coordinates: s = t = 0, w = 1.0 in 2.30.
+        c.w(startS, 0);
+        c.w(startT, 0);
+        c.w(startW, 1 << 30);
+        c.w(startA, 0xff << 12);
+
+        c.w(vertexAx, 0);
+        c.w(vertexAy, 0);
+        c.w(vertexBx, 576);
+        c.w(vertexBy, 0);
+        c.w(vertexCx, 0);
+        c.w(vertexCy, 576);
+        c.w(triangleCMD, 0);
+        // fbzMode draws to the BACK buffer; show it.
+        c.w(swapbufferCMD, 0);
+        c.frame()
+    }
+
+    let start = draw(0x0c00_0039);
+    let cycled = draw(0x0d42_0015);
+    let lit = start.iter().filter(|p| **p != 0).count();
+    assert!(lit > 500, "the textured triangle covered {lit} pixels");
+    let differing = start.iter().zip(cycled.iter()).filter(|(a, b)| a != b).count();
+    assert_eq!(
+        differing, 0,
+        "same decal, different picture: {differing} pixels differ, \
+         first {:#08x} vs {:#08x}",
+        start.iter().find(|p| **p != 0).copied().unwrap_or(0),
+        cycled.iter().zip(start.iter()).find(|(_, s)| **s != 0).map(|(c, _)| *c).unwrap_or(0),
+    );
+}
+
+/// A textured quad must actually sample ACROSS the texture. The register
+/// values are Glide's, lifted from `test17`'s decal mode: perspective on,
+/// W = 1.0, S advancing along X and T along Y. A scaling mistake anywhere in
+/// the S/T chain — the iterators, the perspective divide, or the shift that
+/// strips the fraction — collapses the whole quad onto one texel, which is
+/// what "the texture is gone, just colour bands" looks like on screen.
+#[test]
+fn textured_quad_samples_across_the_texture() {
+    let mut c = Card::boot();
+
+    // A texture whose every texel differs: value = y * 256 + x, so any two
+    // distinct coordinates give distinct colours.
+    for y in 0..256usize {
+        for x in 0..256usize {
+            // Bit 15 set so texel (0,0) is not black — a flat black quad
+            // would otherwise be indistinguishable from "nothing drawn".
+            let texel = 0x8000 | ((y as u16 & 0x7f) << 8) | x as u16;
+            let off = (y * 256 + x) * 2;
+            c.tex[off..off + 2].copy_from_slice(&texel.to_le_bytes());
+        }
+    }
+
+    c.w(fbzColorPath, 1 | (1 << 27)); // c_other = texture, texturing on
+    c.w(alphaMode, 0);
+    c.w(fogMode, 0);
+    c.w(fbzMode, 1 << 9);
+
+    let tmu0 = 0x200;
+    // Format 10 (RGB 5-6-5), perspective on, point sampled, texture-only combine.
+    let texmode = 1 | (10 << 8) | (1 << 12) | (1 << 18) | (1 << 21) | (1 << 27);
+    c.wa(((textureMode * 4) as u32) | (tmu0 << 2), texmode);
+    c.wa(((tLOD * 4) as u32) | (tmu0 << 2), 0);
+    c.wa(((texBaseAddr * 4) as u32) | (tmu0 << 2), 0);
+
+    // The internal iterators are 16.32 and the fixed registers are shifted
+    // left by 14 on the way in, so write value >> 14 to land on `value`.
+    let st = |v: i64| ((v >> 14) as u32);
+    c.wa(((startS * 4) as u32) | (tmu0 << 2), st(0x0000_0000));
+    c.wa(((dSdX * 4) as u32) | (tmu0 << 2), st(0xaa00_0000));
+    c.wa(((dSdY * 4) as u32) | (tmu0 << 2), 0);
+    c.wa(((startT * 4) as u32) | (tmu0 << 2), st(0x0000_0000));
+    c.wa(((dTdX * 4) as u32) | (tmu0 << 2), 0);
+    c.wa(((dTdY * 4) as u32) | (tmu0 << 2), st(0xe2aa_ab00));
+    // W is 2.30 on the way in: 1.0 = 1 << 30.
+    c.wa(((startW * 4) as u32) | (tmu0 << 2), 1 << 30);
+    c.wa(((dWdX * 4) as u32) | (tmu0 << 2), 0);
+    c.wa(((dWdY * 4) as u32) | (tmu0 << 2), 0);
+
+    // One big triangle: (0,0) - (320,0) - (0,240).
+    c.w(vertexAx, 0);
+    c.w(vertexAy, 0);
+    c.w(vertexBx, 320 << 4);
+    c.w(vertexBy, 0);
+    c.w(vertexCx, 0);
+    c.w(vertexCy, 240 << 4);
+    c.w(triangleCMD, 0);
+
+    let out = c.frame();
+    // Along a row well inside the triangle, S advances, so the colours must
+    // change; likewise down a column for T.
+    let row: alloc::collections::BTreeSet<u32> =
+        (10..150).map(|x| out[40 * 640 + x]).collect();
+    let col: alloc::collections::BTreeSet<u32> =
+        (10..150).map(|y| out[y * 640 + 20]).collect();
+    let lit = out.iter().filter(|p| **p != 0).count();
+    let sample: alloc::vec::Vec<u32> = (10..20).map(|x| out[40 * 640 + x]).collect();
+    let pin = c.r((fbiPixelsIn * 4) as u32);
+    let pout = c.r((fbiPixelsOut * 4) as u32);
+    let cfail = c.r((fbiChromaFail * 4) as u32);
+    let zfail = c.r((fbiZfuncFail * 4) as u32);
+    let afail = c.r((fbiAfuncFail * 4) as u32);
+    assert!(lit > 1000,
+        "only {lit} drawn: in={pin} out={pout} chroma={cfail} z={zfail} a={afail}");
+    assert!(row.len() > 8, "S does not advance: {} distinct colours in a row", row.len());
+    assert!(col.len() > 8, "T does not advance: {} distinct colours in a column", col.len());
 }

@@ -272,12 +272,12 @@ pub struct Scene<'a> {
 pub fn draw_triangle(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>) -> Stats {
     let mut stats = Stats::default();
 
-    // Sort by Y; the edge walk needs top, middle, bottom.
-    let mut v = [
-        (verts[0].0 as f32 / 16.0, verts[0].1 as f32 / 16.0),
-        (verts[1].0 as f32 / 16.0, verts[1].1 as f32 / 16.0),
-        (verts[2].0 as f32 / 16.0, verts[2].1 as f32 / 16.0),
-    ];
+    // Sort by Y; the edge walk needs top, middle, bottom. Coordinates stay in
+    // the 12.4 fixed point the vertex registers carry — the C walks edges in
+    // float, but float here is x87 on the guest's live stack (see
+    // `float_to_int32`), and 12.4 in / 16.16 slopes is exact for the range
+    // these coordinates span.
+    let mut v = verts;
     // Three-element insertion sort; `slice::sort_by` lives in `alloc`.
     if v[0].1 > v[1].1 {
         v.swap(0, 1);
@@ -296,16 +296,25 @@ pub fn draw_triangle(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>)
         return stats;
     }
 
-    let dxdy_v1v2 = if v2.1 == v1.1 { 0.0 } else { (v2.0 - v1.0) / (v2.1 - v1.1) };
-    let dxdy_v1v3 = if v3.1 == v1.1 { 0.0 } else { (v3.0 - v1.0) / (v3.1 - v1.1) };
-    let dxdy_v2v3 = if v3.1 == v2.1 { 0.0 } else { (v3.0 - v2.0) / (v3.1 - v2.1) };
+    // Edge slopes as 16.16: dx/dy = ((x2 - x1) << 16) / (y2 - y1), both 12.4
+    // so the fractions cancel.
+    let slope = |a: (i32, i32), b: (i32, i32)| -> i64 {
+        if b.1 == a.1 { 0 } else { (((b.0 - a.0) as i64) << 16) / (b.1 - a.1) as i64 }
+    };
+    let dxdy_v1v2 = slope(v1, v2);
+    let dxdy_v1v3 = slope(v1, v3);
+    let dxdy_v2v3 = slope(v2, v3);
 
+    // Walk the pixel centres: y + 0.5 is `(y << 4) + 8` in 12.4.
     for y in starty..stopy {
-        let fully = y as f32 + 0.5;
-        let (mut startx, mut stopx) = if fully < v2.1 {
-            (v1.0 + (fully - v1.1) * dxdy_v1v2, v1.0 + (fully - v1.1) * dxdy_v1v3)
+        let fully = ((y as i64) << 4) + 8;
+        let along = |from: (i32, i32), dxdy: i64| -> i32 {
+            (from.0 as i64 + (((fully - (from.1 as i64)) * dxdy) >> 16)) as i32
+        };
+        let (mut startx, mut stopx) = if fully < v2.1 as i64 {
+            (along(v1, dxdy_v1v2), along(v1, dxdy_v1v3))
         } else {
-            (v2.0 + (fully - v2.1) * dxdy_v2v3, v1.0 + (fully - v1.1) * dxdy_v1v3)
+            (along(v2, dxdy_v2v3), along(v1, dxdy_v1v3))
         };
         if startx > stopx {
             core::mem::swap(&mut startx, &mut stopx);
@@ -315,18 +324,13 @@ pub fn draw_triangle(poly: &Poly, verts: [(i32, i32); 3], scene: &mut Scene<'_>)
     stats
 }
 
-/// MAME's `round_coordinate`: floor, then round up past the half.
+/// MAME's `round_coordinate`, in 12.4: floor, then round up past the half.
+/// The floor of a fixed-point value is an arithmetic shift, which rounds
+/// toward negative infinity for exactly the negatives the float version
+/// special-cased.
 #[inline]
-fn round_coordinate(value: f32) -> i32 {
-    let result = libm_floor(value) as i32;
-    result + ((value - result as f32 > 0.5) as i32)
-}
-
-#[inline]
-fn libm_floor(v: f32) -> f32 {
-    // no_std floor for the values we see here (well inside i32 range).
-    let t = v as i32 as f32;
-    if v < 0.0 && t != v { t - 1.0 } else { t }
+fn round_coordinate(value: i32) -> i32 {
+    (value >> 4) + ((value & 0xf) > 8) as i32
 }
 
 /// One scanline of one triangle (`voodoo_renderer::rasterizer`).
@@ -380,18 +384,19 @@ pub fn rasterize_span(
     let mut iterw = (poly.startw + dy as i64 * poly.dwdy + dx as i64 * poly.dwdx) << 16;
     let iterw_delta = poly.dwdx << 16;
 
-    // Per-TMU iterators, in doubles as the C does.
-    let mut ts = [(0.0f64, 0.0f64, 0.0f64); 2];
-    let mut td = [(0.0f64, 0.0f64, 0.0f64); 2];
+    // Per-TMU iterators. Integer throughout: the perspective divide is a
+    // table lookup (`fast_reciplog`), not a division.
+    let mut ts = [(0i64, 0i64, 0i64); 2];
+    let mut td = [(0i64, 0i64, 0i64); 2];
     let mut lodbase = [0i32; 2];
     for i in 0..2 {
         if let Some(t) = poly.tex[i] {
             ts[i] = (
-                (t.starts + dy as i64 * t.dsdy + dx as i64 * t.dsdx) as f64,
-                (t.startt + dy as i64 * t.dtdy + dx as i64 * t.dtdx) as f64,
-                (t.startw + dy as i64 * t.dwdy + dx as i64 * t.dwdx) as f64,
+                t.starts + dy as i64 * t.dsdy + dx as i64 * t.dsdx,
+                t.startt + dy as i64 * t.dtdy + dx as i64 * t.dtdx,
+                t.startw + dy as i64 * t.dwdy + dx as i64 * t.dwdx,
             );
-            td[i] = (t.dsdx as f64, t.dtdx as f64, t.dwdx as f64);
+            td[i] = (t.dsdx, t.dtdx, t.dwdx);
             lodbase[i] = compute_lodbase(t.dsdx, t.dsdy, t.dtdx, t.dtdy);
         }
     }

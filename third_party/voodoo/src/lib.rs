@@ -48,6 +48,8 @@
 pub mod fbi;
 pub mod lfb;
 pub mod raster;
+mod reciplog;
+pub use reciplog::fast_reciplog;
 pub mod regs;
 pub mod rgba;
 pub mod texture;
@@ -58,6 +60,7 @@ extern crate alloc;
 mod tests;
 
 use fbi::{Clut, Fbi};
+pub use fbi::Dac;
 use raster::{FogTable, Poly, Scene, TexIter};
 use regs::*;
 use texture::Texture;
@@ -76,28 +79,40 @@ struct Setup {
 }
 
 /// `float_to_int32` — the "f" register aliases carry IEEE floats.
+///
+/// Integer only, and deliberately so: this runs inside the MMIO fault handler,
+/// where the guest's x87 stack is LIVE. This target has no SSE, so `f32`
+/// arithmetic here compiles to x87 and executes on that stack — Glide keeps
+/// its triangle gradients there across the very `fstp`s that land here, and
+/// the values it stored afterwards came back as the x87 indefinite QNaN.
+/// Shifting the mantissa by the exponent is what the C does anyway.
 #[inline]
 fn float_to_int32(data: u32, fixedbits: i32) -> i32 {
-    let v = f32::from_bits(data) * (1u64 << fixedbits) as f32;
-    if v >= i32::MAX as f32 {
-        i32::MAX
-    } else if v <= i32::MIN as f32 {
-        i32::MIN
+    const MAX_SHIFT: i32 = i32::BITS as i32;
+    let exponent = (((data >> 23) & 0xff) as i32 - 127 - 23 + fixedbits)
+        .clamp(-MAX_SHIFT, MAX_SHIFT);
+    let mantissa = ((data & 0x7f_ffff) | 0x80_0000) as i64;
+    let result = if exponent < 0 {
+        if exponent > -MAX_SHIFT { (mantissa >> -exponent) as i32 } else { 0 }
     } else {
-        v as i32
-    }
+        (mantissa << exponent).clamp(i32::MIN as i64, i32::MAX as i64) as i32
+    };
+    if data & 0x8000_0000 != 0 { result.wrapping_neg() } else { result }
 }
 
+/// The same, in the 16.32 width the S/T/W iterators are kept at.
 #[inline]
 fn float_to_int64(data: u32, fixedbits: i32) -> i64 {
-    let v = f64::from(f32::from_bits(data)) * (1u64 << fixedbits) as f64;
-    if v >= i64::MAX as f64 {
-        i64::MAX
-    } else if v <= i64::MIN as f64 {
-        i64::MIN
+    let exponent = ((data >> 23) & 0xff) as i32 - 127 - 23 + fixedbits;
+    let mantissa = ((data & 0x7f_ffff) | 0x80_0000) as i64;
+    let result = if exponent < 0 {
+        if exponent > -64 { mantissa >> -exponent } else { 0 }
+    } else if exponent < 64 {
+        mantissa << exponent
     } else {
-        v as i64
-    }
+        i64::MAX
+    };
+    if data & 0x8000_0000 != 0 { result.wrapping_neg() } else { result }
 }
 
 /// Which card this is. Only [`Kind::Voodoo1`] is implemented; the enum exists
@@ -222,8 +237,20 @@ impl Voodoo {
         data: u32,
         mask: u32,
     ) -> Events {
+        // Nothing may overtake a swap the guest has already asked for. On the
+        // board the memory FIFO holds every command behind `swapbufferCMD`
+        // until the retrace retires it; here the swap is deferred to a host
+        // vblank while the writes behind it would otherwise execute at once —
+        // so the next frame's `grBufferClear` erased the buffer about to be
+        // shown, and every other presented frame came out black. Retiring the
+        // swap first restores the order the FIFO guaranteed.
+        let mut events = Events::default();
+        if self.vblank_swap_pending {
+            self.swap_buffers();
+            events.swap = true;
+        }
         let offset = (addr >> 2) & OFFSET_MASK;
-        if offset & OFFSET_BASE == 0 {
+        let inner = if offset & OFFSET_BASE == 0 {
             self.register_w(fb, tex, offset, data)
         } else if offset & LFB_BASE == 0 {
             // The pipelined LFB path needs the same register snapshot a
@@ -234,7 +261,10 @@ impl Voodoo {
         } else {
             self.texture_w(tex, offset, data);
             Events::default()
-        }
+        };
+        events.swap |= inner.swap;
+        events.video_mode_changed |= inner.video_mode_changed;
+        events
     }
 
     /// A guest dword read. `beam` is the host's display clock — the card does
@@ -252,7 +282,7 @@ impl Voodoo {
 
     /// Decode the visible buffer into `out` as one 0x00RRGGBB word per pixel,
     /// `out_pitch` words per row. `out` is the host's; the card never keeps it.
-    pub fn render(&self, fb: &[u8], out: &mut [u32], out_pitch: usize) {
+    pub fn render(&self, fb: &[u8], dac: &Dac, out: &mut [u8], out_pitch: usize) {
         // `fbiInit1` bit 12 blanks the display without disturbing memory.
         if fbiinit1_software_blank(self.reg[fbiInit1]) {
             for p in out.iter_mut() {
@@ -260,7 +290,7 @@ impl Voodoo {
             }
             return;
         }
-        self.fbi.scanout(fb, &self.clut, out, out_pitch);
+        self.fbi.scanout(fb, &self.clut, dac, out, out_pitch);
     }
 
     /// The host tells the card a vertical retrace began. Returns the events
@@ -320,8 +350,15 @@ impl Voodoo {
         }
         let tt = (offset >> 7) & 0xff;
         // Sequential 8-bit downloads pack four texels per dword.
+        // Sequential 8-bit downloads pack four texels per dword. The masks
+        // differ per texel width and are NOT 0xff: an 8-bit row advances four
+        // texels per dword (0xfc), a 16-bit row two (0xfe).
         let seq_8 = texmode_seq_8_downld(self.tmureg[0][textureMode]);
-        let ts = (offset << if seq_8 && bytes_per_texel == 1 { 2 } else { 1 }) & 0xff;
+        let ts = if bytes_per_texel == 1 {
+            (offset << if seq_8 { 2 } else { 1 }) & 0xfc
+        } else {
+            (offset << 1) & 0xfe
+        };
 
         let addr = self.tex[tmu_num].write_offset(lod, ts, tt, bytes_per_texel) as usize;
         for i in 0..4 {
@@ -609,6 +646,7 @@ impl Voodoo {
 
         if matches!(regnum, startS | startT | dSdX | dTdX | dSdY | dTdY) {
             let v = st();
+
             for i in 0..2 {
                 if chips & (2 << i) != 0 {
                     let t = &mut self.tmuiter[i];
