@@ -292,6 +292,35 @@ pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
     }
 }
 
+/// VGA text odd/even deinterleave: split the CPU's linear B8000 view into
+/// character bytes in plane 0 and attribute bytes in plane 1. Text-mode CRTC
+/// word addressing consumes the even plane offsets: cell `i` lives at plane
+/// offset `2*i`, not `i`. The odd plane offsets and all other plane contents
+/// are deliberately left alone.
+pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
+    let cells = (text.len() / 2)
+        .min(0x8000)
+        .min((planes.len().saturating_sub(0x10000) + 1) / 2);
+    for i in 0..cells {
+        let off = i * 2;
+        planes[off] = text[off];
+        planes[0x10000 + off] = text[off + 1];
+    }
+}
+
+/// VGA text odd/even interleave: reconstruct the CPU's linear B8000 view from
+/// the even offsets of character plane 0 and attribute plane 1.
+pub fn text_odd_even_merge(planes: &[u8], text: &mut [u8]) {
+    let cells = (text.len() / 2)
+        .min(0x8000)
+        .min((planes.len().saturating_sub(0x10000) + 1) / 2);
+    for i in 0..cells {
+        let off = i * 2;
+        text[off] = planes[off];
+        text[off + 1] = planes[0x10000 + off];
+    }
+}
+
 // ============================================================================
 // VGA planar write/read logic (EGA/VGA Graphics Controller + Sequencer)
 // ============================================================================

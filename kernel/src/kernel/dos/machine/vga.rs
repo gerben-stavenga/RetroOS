@@ -35,6 +35,18 @@ pub fn prepare_native_osd() {
     state.seq = regs.seq;
     state.gc = regs.gc;
     state.crtc = regs.crtc;
+    // A physical Mode 13h scanout also requires the Attribute Controller's
+    // BIOS values: identity palette, graphics + 256-colour mode, and all
+    // colour planes enabled. The generic VgaState defaults describe text
+    // mode and can leave a strict VGA implementation blank or corrupted.
+    for i in 0..16 {
+        state.ac[i] = i as u8;
+    }
+    state.ac[0x10] = 0x41;
+    state.ac[0x11] = 0x00;
+    state.ac[0x12] = 0x0F;
+    state.ac[0x13] = 0x00;
+    state.ac[0x14] = 0x00;
     state.dac = lib::vga_render::fallback_palette();
     state.planes.resize(4 * 0x10000, 0);
     state.restore_to_hardware();
@@ -492,11 +504,7 @@ impl VgaState {
             Some(VgaMode::Text80x25) => {
                 machine.map_fresh_range(0xB8000 >> 12, 8);
                 let mut text = alloc::vec![0u8; 0x8000];
-                for i in 0..0x4000 {
-                    text[i * 2] = self.planes.get(i).copied().unwrap_or(0);
-                    text[i * 2 + 1] =
-                        self.planes.get(0x10000 + i).copied().unwrap_or(0);
-                }
+                lib::vga_render::text_odd_even_merge(&self.planes, &mut text);
                 machine.copy_to(0xB8000, &text);
                 self.a0000_trapped = false;
             }
@@ -538,10 +546,7 @@ impl VgaState {
             Some(VgaMode::Text80x25) => {
                 let mut text = alloc::vec![0u8; 0x8000];
                 machine.copy_from(0xB8000, &mut text);
-                for i in 0..0x4000 {
-                    self.planes[i] = text[i * 2];
-                    self.planes[0x10000 + i] = text[i * 2 + 1];
-                }
+                lib::vga_render::text_odd_even_split(&text, &mut self.planes);
             }
             Some(VgaMode::Cga4) => {
                 let mut cga = alloc::vec![0u8; 0x4000];
@@ -654,6 +659,43 @@ impl VgaState {
             (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16,
             self.dac_mask);
 
+        // In text mode the CPU-visible B8000 aperture is the canonical
+        // char/attribute stream.  Capture it while the guest's odd/even
+        // addressing is still active: the flat-planar reads below are useful
+        // for preserving all VGA memory, but real cards need not expose their
+        // odd/even storage with the same offsets once that addressing is
+        // disabled.
+        let native_text = if matches!(
+            self.classify_mode(),
+            Some(lib::vga_render::VgaMode::Text80x25)
+        ) {
+            let mut text = alloc::vec![0u8; 0x8000];
+            let text_window = (crate::LOW_MEM_BASE + 0xB8000) as *const u8;
+            for (i, dst) in text.iter_mut().enumerate() {
+                *dst = unsafe { core::ptr::read_volatile(text_window.add(i)) };
+            }
+            Some(text)
+        } else {
+            None
+        };
+        // Chain-4 has the same boundary problem in mode 13h: once chain-4 is
+        // disabled, the A0000 aperture no longer presents the guest's linear
+        // pixel stream. Preserve that stream before changing SEQ[4], then use
+        // it to normalize the four plane images after the flat capture.
+        let native_chain4 = if matches!(
+            self.classify_mode(),
+            Some(lib::vga_render::VgaMode::Mode13h)
+        ) {
+            let mut chained = alloc::vec![0u8; 0x10000];
+            let graphics_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
+            for (i, dst) in chained.iter_mut().enumerate() {
+                *dst = unsafe { core::ptr::read_volatile(graphics_window.add(i)) };
+            }
+            Some(chained)
+        } else {
+            None
+        };
+
         // Blank the display for the rest of the save. The flat-planar
         // overrides below mis-interpret the current framebuffer if the
         // guest was in chain-4 / chain-2 / odd-even, so without screen-off
@@ -700,6 +742,12 @@ impl VgaState {
                     65536,
                 );
             }
+        }
+        if let Some(text) = native_text.as_deref() {
+            lib::vga_render::text_odd_even_split(text, &mut self.planes);
+        }
+        if let Some(chained) = native_chain4.as_deref() {
+            lib::vga_render::chain4_split(chained, &mut self.planes);
         }
 
         // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
@@ -800,6 +848,35 @@ impl VgaState {
         for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, self.crtc[i as usize]); }
         // Graphics Controller
         for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]); }
+
+        // For chain-4, finish by replaying the canonical linear aperture
+        // through the target mode itself. The flat pass above preserves the
+        // whole 4x64K VGA store, but strict implementations can expose a
+        // different address interpretation while that pass is active. A
+        // chained write makes the card perform the definitive n&3 / n>>2
+        // routing for the visible 64K image. Keep the screen blank and force
+        // an unmodified write-mode-0 transfer, then restore the guest's exact
+        // write registers.
+        if matches!(self.classify_mode(), Some(lib::vga_render::VgaMode::Mode13h)) {
+            let mut chained = alloc::vec![0u8; 0x10000];
+            lib::vga_render::chain4_merge(&self.planes, &mut chained);
+
+            outb(0x3C4, 2); outb(0x3C5, 0x0F); // all chain-selected planes enabled
+            outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
+            outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
+            outb(0x3CE, 5); outb(0x3CF, self.gc[5] & !0x03); // write mode 0
+            outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
+
+            let chained_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
+            for (i, &src) in chained.iter().enumerate() {
+                unsafe { core::ptr::write_volatile(chained_window.add(i), src); }
+            }
+
+            outb(0x3C4, 2); outb(0x3C5, self.seq[2]);
+            for i in [1u8, 3, 5, 8] {
+                outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]);
+            }
+        }
         // Attribute Controller — write all 21 registers
         let _ = inb(0x3DA);
         for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
