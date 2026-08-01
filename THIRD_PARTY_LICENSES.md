@@ -23,6 +23,18 @@ their authors and records their licenses.
 [1] lwext4 is BSD-3-Clause except `ext4_extents.c` and `ext4_xattr.c`, which are
 GPL-2.0; since extents are required for ext4, the effective license is GPL-2.0.
 
+## Derived work in-tree
+
+| Component | Used for | License | Author / project |
+|---|---|---|---|
+| **`//third_party/voodoo`** | 3dfx Voodoo Graphics (SST-1) emulation | BSD-3-Clause | Aaron Giles — MAME `voodoo.cpp` / `voodoo_render.cpp` |
+
+Unlike everything else here this is *our* source: a Rust transliteration
+written against a different memory/ownership model, not a fetched dependency.
+It is nonetheless a derived work of Aaron Giles' BSD-3-Clause Voodoo core in
+MAME and is credited as such — see `third_party/voodoo/README.md`. None of the
+GPL-carrying DOSBox glue (threading, SDL, `PIC_`/`RENDER_` calls) is present.
+
 ## Permissive (MIT / Apache-2.0 / zlib)
 
 | Component | Used for | License |

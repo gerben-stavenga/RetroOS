@@ -129,6 +129,8 @@ impl Arch for Interp {
 
     // ── FPU/SSE state ──
     fn clean_fx_template(&self) -> Self::Fx { crate::machine::clean_fx_template() }
+    fn fpu_st0(&self) -> [u8; 10] { crate::engine::fpu_st0() }
+    fn fpu_pop(&mut self) { crate::engine::fpu_pop() }
 
     // ── Diagnostics & power ──
     fn free_page_count(&self) -> usize { crate::machine::free_page_count() }

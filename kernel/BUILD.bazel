@@ -57,6 +57,7 @@ rust_library(
         "//lib:sound",
         "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
+        "//third_party/voodoo",
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
         "@nuked_opl3//:nuked_opl3",

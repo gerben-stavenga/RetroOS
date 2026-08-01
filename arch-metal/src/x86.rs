@@ -45,6 +45,29 @@ impl FxState {
     }
 }
 
+/// The live x87 ST(0) as its raw 80-bit extended encoding.
+///
+/// On metal the *guest's* FPU is still live inside a trap handler — the kernel
+/// never touches x87 — so ST(0) is read straight off the stack. `fstpt` pops,
+/// so it is immediately pushed back: this read is non-destructive.
+pub fn fpu_st0() -> [u8; 10] {
+    let mut buf = [0u8; 10];
+    unsafe {
+        asm!(
+            "fstp tbyte ptr [{p}]",
+            "fld tbyte ptr [{p}]",
+            p = in(reg) buf.as_mut_ptr(),
+            options(nostack),
+        );
+    }
+    buf
+}
+
+/// Discard ST(0), the way a popping x87 store does.
+pub fn fpu_pop() {
+    unsafe { asm!("fstp st(0)", options(nostack)) };
+}
+
 /// Clean FPU template captured at boot after `fninit` — used to seed new
 /// threads so they don't inherit stale FPU state from whoever ran before.
 static mut CLEAN_FX: FxState = FxState::zeroed();

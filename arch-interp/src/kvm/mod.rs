@@ -36,6 +36,39 @@ pub fn reset_io_bitmap() {
     shim::iopb_reset()
 }
 
+/// The guest's x87 ST(0) as its raw 80-bit extended encoding, read out of the
+/// vcpu's FXSAVE image: the register file is physical, so ST(0) is the entry
+/// selected by `FSW` bits 13:11.
+pub fn fpu_st0() -> [u8; 10] {
+    setup::with(|k| {
+        let xsave = k.vcpu.get_xsave().expect("KVM_GET_XSAVE");
+        let bytes = unsafe {
+            core::slice::from_raw_parts(xsave.region.as_ptr() as *const u8, 512)
+        };
+        let top = (u16::from_le_bytes([bytes[2], bytes[3]]) >> 11) as usize & 7;
+        let off = 32 + top * 16;
+        let mut out = [0u8; 10];
+        out.copy_from_slice(&bytes[off..off + 10]);
+        out
+    })
+}
+
+/// Pop the guest's x87 stack by advancing `FSW`'s stack-top field.
+pub fn fpu_pop() {
+    setup::with(|k| {
+        let mut xsave = k.vcpu.get_xsave().expect("KVM_GET_XSAVE");
+        unsafe {
+            let bytes = core::slice::from_raw_parts_mut(xsave.region.as_mut_ptr() as *mut u8, 512);
+            let fsw = u16::from_le_bytes([bytes[2], bytes[3]]);
+            let top = ((fsw >> 11) & 7).wrapping_add(1) & 7;
+            let fsw = (fsw & !(7 << 11)) | (top << 11);
+            bytes[2..4].copy_from_slice(&fsw.to_le_bytes());
+        }
+        xsave.region[128] |= 0x3; // XSTATE_BV: x87 | SSE
+        unsafe { k.vcpu.set_xsave(&xsave) }.expect("KVM_SET_XSAVE");
+    })
+}
+
 /// Swap the live guest FPU/SSE state with the thread save area `fx` (metal's
 /// `arch_switch_to` fx semantics: on return `fx` holds the outgoing thread's
 /// state, the vcpu holds the incoming). The vcpu's FXSAVE image is the first

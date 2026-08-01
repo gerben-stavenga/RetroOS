@@ -276,6 +276,29 @@ fn io_with<R>(f: impl FnOnce(&mut Unicorn<'static, Ctx>) -> R) -> R {
     })
 }
 
+/// The guest's x87 ST(0) as its raw 80-bit extended encoding. Non-destructive:
+/// the software core's FPU stack is only read.
+pub fn fpu_st0() -> [u8; 10] {
+    let mut out = [0u8; 10];
+    io_with(|uc| {
+        if let Ok(bytes) = uc.reg_read_long(RegisterX86::ST0) {
+            let n = bytes.len().min(10);
+            out[..n].copy_from_slice(&bytes[..n]);
+        }
+    });
+    out
+}
+
+/// Pop the guest's x87 stack. `FPSW` bits 13:11 are the stack top, so a pop is
+/// an increment of that field — the same thing `fstp` does to `fpstt`.
+pub fn fpu_pop() {
+    io_with(|uc| {
+        let fpsw = uc.reg_read(RegisterX86::FPSW).unwrap_or(0);
+        let top = ((fpsw >> 11) & 7) + 1;
+        let _ = uc.reg_write(RegisterX86::FPSW, (fpsw & !(7 << 11)) | ((top & 7) << 11));
+    });
+}
+
 /// Run the current Vcpu (`REGS`) for one slice and return the next event.
 ///
 /// Two execution modes share one Unicorn instance: 32-bit flat protected mode

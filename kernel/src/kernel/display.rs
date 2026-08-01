@@ -432,3 +432,110 @@ pub fn completed_shadow(s: &mut Scratch) -> Option<(usize, usize, &mut [u8])> {
     }
     Some((h, out_w, &mut s.surface[..len]))
 }
+
+/// Publication state for a card that scans out its own memory — the Voodoo,
+/// whose RAMDAC clocks a complete frame at every buffer swap.
+///
+/// The card is handed the panel's own encoding (a [`voodoo::Dac`]) and writes
+/// packed destination pixels directly, exactly as the VGA path pre-encodes its
+/// DAC into `fb.format` before rendering. What arrives here is therefore just
+/// bytes, and publication is a row-per-row copy: no shadow to double-buffer
+/// (the frame is already complete), no scaling, no format conversion.
+pub struct NativeScanout {
+    /// One frame in destination format, `w × h` at `pitch` bytes. Write-back
+    /// memory: the panel is written once, by a linear copy per row.
+    surface: alloc::vec::Vec<u8>,
+    pitch: usize,
+    dac: voodoo::Dac,
+    /// Geometry the surface and the painted bars are armed for,
+    /// `(w, h, panel_w, panel_h)`.
+    geo: (usize, usize, usize, usize),
+    fmt: Option<PixelFormat>,
+}
+
+impl NativeScanout {
+    pub const fn new() -> NativeScanout {
+        NativeScanout {
+            surface: alloc::vec::Vec::new(),
+            pitch: 0,
+            dac: voodoo::Dac::native(),
+            geo: (0, 0, 0, 0),
+            fmt: None,
+        }
+    }
+
+    /// Arm for one frame of `w × h` on `fb`. False when the frame cannot be
+    /// shown — too big for the panel, which is reported once rather than
+    /// leaving a silently dead screen.
+    pub fn arm(&mut self, fb: &Framebuffer, w: usize, h: usize) -> bool {
+        let geo = (w, h, fb.width, fb.height);
+        if w == 0 || h == 0 || w > fb.width || h > fb.height {
+            if self.geo != geo {
+                self.geo = geo;
+                crate::println!(
+                    "display: {}x{} card frame does not fit the {}x{} panel — not shown",
+                    w, h, fb.width, fb.height
+                );
+            }
+            return false;
+        }
+        if self.fmt != Some(fb.format) {
+            self.fmt = Some(fb.format);
+            self.dac = dac_for(fb.format);
+        }
+        if self.geo != geo {
+            self.geo = geo;
+            self.pitch = w * fb.format.bytes_per_pixel as usize;
+            self.surface.clear();
+            self.surface.resize(self.pitch * h, 0);
+            // Same contract as the VGA scanout: the bars around the picture
+            // are painted once, when the geometry is armed.
+            unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
+        }
+        true
+    }
+
+    /// Where the card writes this frame: destination pixels, row pitch, and
+    /// the encoding its DAC should clock them out in.
+    pub fn target(&mut self) -> (&mut [u8], usize, &voodoo::Dac) {
+        (&mut self.surface, self.pitch, &self.dac)
+    }
+
+    /// Copy the armed frame to the panel, centered. One linear copy per row.
+    pub fn publish(&self, fb: &Framebuffer) {
+        let (w, h) = (self.geo.0, self.geo.1);
+        let step = fb.format.bytes_per_pixel as usize;
+        if h == 0 || self.surface.len() < self.pitch * h {
+            return;
+        }
+        let origin =
+            fb.va + ((fb.height - h) / 2) * fb.pitch + ((fb.width - w) / 2) * step;
+        for y in 0..h {
+            unsafe {
+                copy_bytes(
+                    (origin + y * fb.pitch) as *mut u8,
+                    self.surface[y * self.pitch..].as_ptr(),
+                    self.pitch,
+                    fb.wide,
+                );
+            }
+        }
+        finish_present();
+    }
+}
+
+impl Default for NativeScanout {
+    fn default() -> NativeScanout {
+        NativeScanout::new()
+    }
+}
+
+/// The panel's channel layout, as a card's DAC wants it stated.
+pub fn dac_for(fmt: PixelFormat) -> voodoo::Dac {
+    voodoo::Dac {
+        r: (fmt.red_pos, fmt.red_size),
+        g: (fmt.green_pos, fmt.green_size),
+        b: (fmt.blue_pos, fmt.blue_size),
+        bytes: fmt.bytes_per_pixel,
+    }
+}

@@ -163,6 +163,7 @@ pub fn guest_flags_handler_entry(regs: &Regs) -> u32 {
 
 pub(super) mod vga;
 pub use vga::*;
+pub(super) mod vvoodoo;
 // ============================================================================
 // PcMachine — per-thread machine state
 // ============================================================================
@@ -217,6 +218,9 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: vga::Vga,
+    /// The 3dfx Voodoo board. Present in every machine but inert until a
+    /// guest finds it over PCI and maps its aperture.
+    pub voodoo: vvoodoo::VVoodoo,
     /// Present-path scratch, owned so the frame path allocates NOTHING per
     /// frame. `scanout` copies the live aperture into `present_scratch` and
     /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
@@ -229,6 +233,10 @@ pub struct PcMachine {
     /// Direct-display scanout scratch: palette, a completed WB shadow frame,
     /// and render/publish phase timing.
     pub present_scratch2: crate::kernel::display::Scratch,
+    /// Publication state for the Voodoo's native-RGB frames on a framebuffer
+    /// display. Separate from `present_scratch2`: that one starts from VGA
+    /// planes and a DAC, which the card's output has neither of.
+    pub voodoo_scanout: crate::kernel::display::NativeScanout,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
@@ -432,7 +440,9 @@ impl PcMachine {
         self.vpic.has_deliverable() || (self.mouse.cb_mask & self.mouse.pending_cond != 0)
     }
 
-    pub fn new<A: crate::Arch>(machine: &mut A) -> Self {
+    /// Built straight into its heap slot: the struct is far too large to pass
+    /// through a kernel stack frame (see `DosState::pc`).
+    pub fn new_boxed<A: crate::Arch>(machine: &mut A) -> alloc::boxed::Box<Self> {
         // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
         // memory by copying entries[0..16], the faithful A20-off default every
         // real machine boots with. We never un-wrap it — a VM86 guest can use
@@ -440,7 +450,7 @@ impl PcMachine {
         // nothing to toggle. Dropping it removes the shadow region, the page
         // swap, and the local/global ref-counting that used to track it.
         machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
-        Self {
+        alloc::boxed::Box::new(Self {
             vpit: VirtualPit::new(machine),
             vpic: VirtualPic::new(),
             vrtc: VirtualRtc::new(machine),
@@ -449,9 +459,11 @@ impl PcMachine {
             skip_irq: false,
             e0_pending: false,
             vga: vga::Vga::new(),
+            voodoo: vvoodoo::VVoodoo::new(),
             present_scratch: alloc::vec::Vec::new(),
             present_fb: alloc::vec::Vec::new(),
             present_scratch2: crate::kernel::display::Scratch::new(),
+            voodoo_scanout: crate::kernel::display::NativeScanout::new(),
             dma: Dma8237::new(),
             sb: SoundBlaster::new(),
             gus: Gus::new(),
@@ -461,7 +473,7 @@ impl PcMachine {
             cmos_index: 0,
             native_vbe_io_rmcs: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
-        }
+        })
     }
 }
 
@@ -776,6 +788,68 @@ fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display:
     (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
 }
 
+/// Bus/device/function the emulated Voodoo answers at. Nothing else responds,
+/// so a scan sees exactly one device and every other slot reads as absent.
+const VOODOO_BDF: u32 = 0x0000_0800; // bus 0, device 1, function 0
+
+/// The latched `CONFIG_ADDRESS` value (port 0xCF8).
+static mut PCI_CONFIG_ADDRESS: u32 = 0;
+
+fn pci_addressed_device() -> Option<u8> {
+    let addr = unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) };
+    // Bit 31 enables the decode; bits 30:24 are reserved.
+    if addr & 0x8000_0000 == 0 {
+        return None;
+    }
+    ((addr & 0x00FF_FF00) == VOODOO_BDF).then_some((addr & 0xFC) as u8)
+}
+
+/// Serve an `IN` from 0xCF8/0xCFC. `None` means "not a config port".
+fn pci_config_in(pc: &mut PcMachine, port: u16, size: u32) -> Option<u32> {
+    match port {
+        0xCF8 if size == 4 => {
+            Some(unsafe { core::ptr::read_volatile(&raw const PCI_CONFIG_ADDRESS) })
+        }
+        // Reads narrower than a dword address within the data port.
+        0xCFC..=0xCFF => {
+            let shift = (port - 0xCFC) as u32 * 8;
+            let dword = match pci_addressed_device() {
+                Some(off) => pc.voodoo.config_read(off),
+                // No device: the bus floats high, which is how a scan knows.
+                None => 0xFFFF_FFFF,
+            };
+            Some(dword >> shift)
+        }
+        _ => None,
+    }
+}
+
+/// Serve an `OUT` to 0xCF8/0xCFC. `true` means the write was consumed.
+fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
+    match port {
+        0xCF8 if size == 4 => {
+            unsafe { core::ptr::write_volatile(&raw mut PCI_CONFIG_ADDRESS, val) };
+            true
+        }
+        0xCFC..=0xCFF => {
+            if let Some(off) = pci_addressed_device() {
+                let shift = (port - 0xCFC) as u32 * 8;
+                if size == 4 && shift == 0 {
+                    pc.voodoo.config_write(off, val);
+                } else {
+                    // Sub-dword write: merge into the current value.
+                    let width = size * 8;
+                    let mask = if width >= 32 { !0 } else { ((1u32 << width) - 1) << shift };
+                    let cur = pc.voodoo.config_read(off);
+                    pc.voodoo.config_write(off, (cur & !mask) | ((val << shift) & mask));
+                }
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Native option-ROM ports are width-preserving: one trapped INW/INL becomes
 /// one host INW/INL at the same port. Emulated byte devices retain their own
 /// lane behavior below; the generic dispatcher must not turn native wide I/O
@@ -823,6 +897,20 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
         regs.rax = (regs.rax & !mask) | val;
         return;
     }
+    // PCI configuration space (mechanism #1), served whole rather than through
+    // the per-byte path below: 0xCF8 is a latched dword and a config read must
+    // answer as a unit, where four ISA byte reads would each fall to the
+    // unpopulated-bus arm and report 0xFF — no card. Glide's DOS backend
+    // reaches the board with raw `inpd`/`outpd` here, not through the PCI BIOS.
+    // A native option ROM owns these ports whenever it is driving real
+    // hardware, so the emulated card answers only when it is not.
+    if !native_vbe_byte_port(pc, port)
+        && let Some(val) = pci_config_in(pc, port, size)
+    {
+        let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
+        regs.rax = (regs.rax & !mask) | (val as u64 & mask);
+        return;
+    }
 
     let mut val: u64 = 0;
     for i in 0..size {
@@ -837,6 +925,9 @@ pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
     let val = regs.rax;
     if native_atomic_port(pc, port, size) {
         native_out(machine, port, size, val as u32);
+        return;
+    }
+    if !native_vbe_byte_port(pc, port) && pci_config_out(pc, port, size, val as u32) {
         return;
     }
 

@@ -27,8 +27,8 @@ mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PHYS_MAP_TOP, PSP_SEL};
 use self::state::{physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
-pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors};
-use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc, valid_ldt_selector_idx};
+pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors, valid_ldt_selector_idx};
+use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
 mod rm_calls;
 pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
@@ -956,13 +956,40 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 return thread::KernelAction::Done;
             };
 
-            let physical_page = (physical & !0xFFF) as u64 >> 12;
-            machine.map_phys_range(
-                (virtual_base >> 12) as usize,
-                page_count as usize,
-                physical_page,
-                arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
-            );
+            // The Voodoo's BAR is emulated, not a real device: hand back the
+            // linear window but leave its pages ABSENT, so every guest access
+            // faults into the card's decoder. Same shape as the planar VGA
+            // trap at A0000 — a window the guest writes with plain stores and
+            // the kernel interprets.
+            let voodoo_bar = super::machine::vvoodoo::BAR_PHYS;
+            let is_voodoo = (voodoo_bar..voodoo_bar + super::machine::vvoodoo::BAR_SIZE)
+                .contains(&physical);
+            if is_voodoo {
+                // Arm the window the way the planar VGA aperture is armed:
+                // MAP_MMIO, i.e. present=0 PLUS the PCD marker. Leaving the
+                // pages merely absent is not the same thing — `space_demand`
+                // backs an absent page with RAM and the guest then talks to
+                // memory instead of to the card.
+                machine.map_phys_range(
+                    (virtual_base >> 12) as usize,
+                    page_count as usize,
+                    0,
+                    arch_abi::MAP_MMIO,
+                );
+                dos.pc.voodoo.linear_base = Some(returned_linear & !0xFFF);
+                dos_trace!(
+                    "[DPMI] 0800 voodoo aperture phys={:#x} -> linear={:#x} (trapped)",
+                    physical, returned_linear
+                );
+            } else {
+                let physical_page = (physical & !0xFFF) as u64 >> 12;
+                machine.map_phys_range(
+                    (virtual_base >> 12) as usize,
+                    page_count as usize,
+                    physical_page,
+                    arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+                );
+            }
             dpmi.phys_mappings[slot] = Some(PhysicalMapping {
                 returned_linear,
                 virtual_page_base: virtual_base,

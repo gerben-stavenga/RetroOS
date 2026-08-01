@@ -1,0 +1,31 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# 3dfx Voodoo Graphics (SST-1) as a passive card, derived from DOSBox
+# Staging's voodoo.cpp (Aaron Giles' MAME core). See README.md.
+#
+# opt-level 2, not z, for the same reason as //lib:sound: this is a per-pixel
+# inner loop, and the rasterizer that lands next is the hottest code we run.
+rust_library(
+    name = "voodoo",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "voodoo",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=2",
+        "-Crelocation-model=static",
+    ],
+)
+
+# bazelisk test //third_party/voodoo:voodoo_test --platforms=@platforms//host
+rust_test(
+    name = "voodoo_test",
+    crate = ":voodoo",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+)

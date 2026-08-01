@@ -243,7 +243,7 @@ pub(super) fn ldt_is_allocated(ldt_alloc: &[u32], idx: usize) -> bool {
     ldt_alloc[word] & (1 << bit) != 0
 }
 
-pub(super) fn valid_ldt_selector_idx(ldt_alloc: &[u32], sel: u16) -> Option<usize> {
+pub(in crate::kernel::dos) fn valid_ldt_selector_idx(ldt_alloc: &[u32], sel: u16) -> Option<usize> {
     if sel & 0x0004 == 0 {
         return None;
     }
