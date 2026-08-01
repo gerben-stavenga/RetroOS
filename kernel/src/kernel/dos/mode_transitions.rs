@@ -1031,6 +1031,11 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
     let current_status = regs.flags32() & STATUS_MASK;
 
     let save = pop_continuation(machine, dos, regs);
+    if dos.pc.native_vbe_io_rmcs != 0
+        && save.rm_call_struct_addr() == Some(dos.pc.native_vbe_io_rmcs)
+    {
+        dos.pc.native_vbe_io_rmcs = 0;
+    }
     let resumes_to_host_iret = save.cs as u16 == SPECIAL_STUB_SEL
         && save.eip == SYNTHETIC_HOST_IRET_EIP;
     let was_outermost = save.other_stack().is_none();
