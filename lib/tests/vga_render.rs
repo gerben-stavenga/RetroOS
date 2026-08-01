@@ -30,6 +30,52 @@ fn dimensions_match_modes() {
 }
 
 #[test]
+fn chain4_roundtrips_between_linear_aperture_and_planes() {
+    let mut chained = vec![0u8; 0x10000];
+    for (i, byte) in chained.iter_mut().enumerate().take(64000) {
+        *byte = (i % 251) as u8;
+    }
+
+    let mut planes = vec![0xA5u8; 4 * 0x10000];
+    vga_render::chain4_split(&chained, &mut planes);
+    assert_eq!(planes[0], chained[0]);
+    assert_eq!(planes[0x10000], chained[1]);
+    assert_eq!(planes[0x20000], chained[2]);
+    assert_eq!(planes[0x30000], chained[3]);
+    assert_eq!(planes[1], chained[4]);
+
+    let mut back = vec![0u8; 0x10000];
+    vga_render::chain4_merge(&planes, &mut back);
+    assert_eq!(back, chained);
+}
+
+#[test]
+fn text_odd_even_roundtrips_without_touching_other_plane_data() {
+    let mut text = vec![0u8; 0x8000];
+    for i in 0..0x4000 {
+        text[i * 2] = (i % 251) as u8;
+        text[i * 2 + 1] = (i % 16) as u8;
+    }
+
+    let mut planes = vec![0xA5u8; 4 * 0x10000];
+    vga_render::text_odd_even_split(&text, &mut planes);
+    assert_eq!(planes[0], text[0]);
+    assert_eq!(planes[0x10000], text[1]);
+    assert_eq!(planes[2], text[2]);
+    assert_eq!(planes[0x10002], text[3]);
+    assert_eq!(planes[0x7FFE], text[0x7FFE]);
+    assert_eq!(planes[0x17FFE], text[0x7FFF]);
+    assert_eq!(planes[1], 0xA5);
+    assert_eq!(planes[0x10001], 0xA5);
+    assert_eq!(planes[0x8000], 0xA5);
+    assert_eq!(planes[0x20000], 0xA5);
+
+    let mut back = vec![0u8; 0x8000];
+    vga_render::text_odd_even_merge(&planes, &mut back);
+    assert_eq!(back, text);
+}
+
+#[test]
 fn mode13h_maps_each_index_through_the_palette() {
     // A palette where index i → grey (i,i,i) keeps the mapping trivial to check.
     let mut pal = [0u8; 768];

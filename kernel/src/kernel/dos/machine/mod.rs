@@ -260,6 +260,11 @@ pub struct PcMachine {
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
 
+    /// Non-zero while an explicit DPMI INT 10h VBE call is executing the
+    /// native option ROM. The value identifies the outer RM call so native,
+    /// wide-decoded BIOS I/O is enabled only for that exact excursion.
+    pub native_vbe_io_rmcs: u32,
+
     /// PM/RM transition state. The pm-side cursor isn't a separate
     /// field — it's `regs.SS:SP` when user is on pm side, or
     /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
@@ -466,6 +471,7 @@ impl PcMachine {
             spk: sound::speaker::Speaker::new(),
             mixer: Mixer::new(),
             cmos_index: 0,
+            native_vbe_io_rmcs: 0,
             locked_stack: super::mode_transitions::LockedStackState::new(),
         })
     }
@@ -495,14 +501,9 @@ const PORT_TRACE: bool = false;
 
 /// Emulate IN from a port using the virtual peripherals.
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
-    // ISA decodes only A0-A9, so I/O ports alias mod 0x400 (e.g. a
-    // gameport at 0x208 also answers 0x608). DOS-era code relies on
-    // this; the whole DOS I/O surface is <= 0x3FF. Fold the alias
-    // once here so every handler sees the canonical 10-bit address.
-    // Wide-decode I/O (PCI/PnP/ACPI/EISA) is out of scope for the
-    // VM86 guest — we model none of it — and kernel PCI uses a
-    // separate path (arch::inl/outl), not this emulator.
-    let port = port & 0x3FF;
+    if native_vbe_byte_port(pc, port) {
+        return machine.inb(port);
+    }
     match port {
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
         // (blanking). Direct framebuffer scanout drives bit 3 from the same
@@ -545,12 +546,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
         // reads return 0xFF (floating data lines, weakly pulled high by
-        // the chipset). Full 0x200-0x20F window: gameport cards decode
-        // loosely and the canonical port is 0x201, but games hit mirrors
-        // across the whole block (and, via 10-bit aliasing folded above,
-        // 0x6xx/0xAxx images of it — e.g. Sokoban polling 0x608-0x60B).
-        // "No card on bus" for the entire window; explicit arm just
-        // suppresses the unhandled-port log during joystick probes.
+        // the chipset). Keep the canonical 0x200-0x20F window explicit to
+        // suppress diagnostics for ordinary joystick probes. Higher aliases
+        // remain unknown ports unless an emulated device explicitly owns them.
         0x200..=0x20F => 0xFF,
         // Master PIC command (read ISR)
         0x20 => pc.vpic.master_isr(),
@@ -628,8 +626,10 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 
 /// Emulate OUT to a port.
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
-    // ISA 10-bit I/O decode — fold the alias mod 0x400. See `emulate_inb`.
-    let port = port & 0x3FF;
+    if native_vbe_byte_port(pc, port) {
+        machine.outb(port, val);
+        return;
+    }
     match port {
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
         // index, which hardware can't read back), or the emulated register
@@ -788,8 +788,6 @@ fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display:
     (if vr { 0x08 } else { 0 }) | (if vr || hbl { 0x01 } else { 0 })
 }
 
-/// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up. Reads `size`
-/// bytes through `emulate_inb` and writes the result into `regs.rax`.
 /// Bus/device/function the emulated Voodoo answers at. Nothing else responds,
 /// so a scan sees exactly one device and every other slot reads as absent.
 const VOODOO_BDF: u32 = 0x0000_0800; // bus 0, device 1, function 0
@@ -852,19 +850,65 @@ fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
     }
 }
 
+/// Native option-ROM ports are width-preserving: one trapped INW/INL becomes
+/// one host INW/INL at the same port. Emulated byte devices retain their own
+/// lane behavior below; the generic dispatcher must not turn native wide I/O
+/// into accesses to adjacent ports.
+fn native_vbe_byte_port(pc: &PcMachine, port: u16) -> bool {
+    pc.native_vbe_io_rmcs != 0
+        && matches!(port, 0xCF8..=0xCFF | 0xF140..=0xF147)
+}
+
+fn port_range_contains(first: u16, last: u16, port: u16, size: u32) -> bool {
+    port >= first && (port as u32).saturating_add(size).saturating_sub(1) <= last as u32
+}
+
+fn native_atomic_port(pc: &PcMachine, port: u16, size: u32) -> bool {
+    (size == 2 && matches!(port, 0x01CE..=0x01D0))
+        || (pc.native_vbe_io_rmcs != 0
+            && matches!(size, 2 | 4)
+            && (port_range_contains(0xCF8, 0xCFF, port, size)
+                || port_range_contains(0xF140, 0xF147, port, size)))
+}
+
+fn native_in<A: crate::Arch>(machine: &mut A, port: u16, size: u32) -> u32 {
+    match size {
+        1 => machine.inb(port) as u32,
+        2 => machine.inw(port) as u32,
+        4 => machine.inl(port),
+        _ => unreachable!("invalid port-I/O width"),
+    }
+}
+
+fn native_out<A: crate::Arch>(machine: &mut A, port: u16, size: u32, val: u32) {
+    match size {
+        1 => machine.outb(port, val as u8),
+        2 => machine.outw(port, val as u16),
+        4 => machine.outl(port, val),
+        _ => unreachable!("invalid port-I/O width"),
+    }
+}
+
+/// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up.
 pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
-    // PCI configuration space (mechanism #1) is wide-decode: it must be served
-    // before the ISA 10-bit fold below, which would otherwise alias 0xCF8 onto
-    // 0x0F8. Glide's DOS backend reaches the card with raw `inpd`/`outpd`
-    // here, not through the PCI BIOS.
-    if let Some(val) = pci_config_in(pc, port, size) {
-        let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
-        regs.rax = (regs.rax & !mask) | (val as u64 & mask);
+    if native_atomic_port(pc, port, size) {
+        let val = native_in(machine, port, size) as u64;
+        let mask = if size == 2 { 0xFFFF } else { 0xFFFF_FFFF };
+        regs.rax = (regs.rax & !mask) | val;
         return;
     }
-    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
-        let val = machine.inw(port) as u64;
-        regs.rax = (regs.rax & !0xFFFF) | val;
+    // PCI configuration space (mechanism #1), served whole rather than through
+    // the per-byte path below: 0xCF8 is a latched dword and a config read must
+    // answer as a unit, where four ISA byte reads would each fall to the
+    // unpopulated-bus arm and report 0xFF — no card. Glide's DOS backend
+    // reaches the board with raw `inpd`/`outpd` here, not through the PCI BIOS.
+    // A native option ROM owns these ports whenever it is driving real
+    // hardware, so the emulated card answers only when it is not.
+    if !native_vbe_byte_port(pc, port)
+        && let Some(val) = pci_config_in(pc, port, size)
+    {
+        let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
+        regs.rax = (regs.rax & !mask) | (val as u64 & mask);
         return;
     }
 
@@ -879,11 +923,11 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
-    if pci_config_out(pc, port, size, val as u32) {
+    if native_atomic_port(pc, port, size) {
+        native_out(machine, port, size, val as u32);
         return;
     }
-    if size == 2 && matches!(port, 0x01CE..=0x01D0) {
-        machine.outw(port, val as u16);
+    if !native_vbe_byte_port(pc, port) && pci_config_out(pc, port, size, val as u32) {
         return;
     }
 
@@ -899,9 +943,16 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = regs.rdi as u32;
-    for i in 0..size {
-        let b = emulate_inb(machine, pc, port + i as u16);
-        machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
+    if native_atomic_port(pc, port, size) {
+        let bytes = native_in(machine, port, size).to_le_bytes();
+        for (i, &byte) in bytes.iter().enumerate().take(size as usize) {
+            machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i as u32))) as usize, byte);
+        }
+    } else {
+        for i in 0..size {
+            let b = emulate_inb(machine, pc, port + i as u16);
+            machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
+        }
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
@@ -915,9 +966,19 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, re
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = regs.rsi as u32;
-    for i in 0..size {
-        let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
-        emulate_outb(machine, pc, regs, port + i as u16, b);
+    if native_atomic_port(pc, port, size) {
+        let mut bytes = [0u8; 4];
+        for (i, byte) in bytes.iter_mut().enumerate().take(size as usize) {
+            *byte = machine.read::<u8>(
+                (ds_base.wrapping_add(si.wrapping_add(i as u32))) as usize,
+            );
+        }
+        native_out(machine, port, size, u32::from_le_bytes(bytes));
+    } else {
+        for i in 0..size {
+            let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
+            emulate_outb(machine, pc, regs, port + i as u16, b);
+        }
     }
     let df = regs.flags32() & (1 << 10) != 0;
     let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };

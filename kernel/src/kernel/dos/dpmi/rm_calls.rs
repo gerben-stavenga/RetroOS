@@ -42,6 +42,14 @@ pub(super) fn simulate_real_mode_int<A: crate::Arch>(machine: &mut A, dos: &mut 
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
     let rm = machine.read::<RmCallStruct>((struct_addr) as usize);
 
+    if int_num == 0x10
+        && rm.eax as u16 & 0xFF00 == 0x4F00
+        && crate::kernel::platform::get().firmware
+            == crate::kernel::platform::Firmware::NativeBios
+    {
+        dos.pc.native_vbe_io_rmcs = struct_addr;
+    }
+
     { let (ax, bx, cx, dx, ds, es, edi) =
         (rm.eax as u16, rm.ebx as u16, rm.ecx as u16, rm.edx as u16, rm.ds, rm.es, rm.edi);
       dos_trace!("[DPMI] 0300 int={:02X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} ES={:04X} EDI={:08X}",
@@ -274,6 +282,5 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     regs.fs = 0;
     regs.gs = 0;
 }
-
 
 
