@@ -1254,10 +1254,14 @@ fn vbe_mode_info<A: crate::Arch>(
         let format = if bpp == 8 {
             crate::kernel::display::FormatSpec::Indexed8
         } else {
+            // `from_rgb` takes [red_pos, red_size, green_pos, green_size,
+            // blue_pos, blue_size] — POSITION first, matching the order
+            // `parse_vbe_mode` reads them out of a real mode-info block
+            // (0x37 LinRedFieldPosition, then 0x36 LinRedMaskSize).
             let masks = match bpp {
-                15 => [5, 10, 5, 5, 5, 0],
-                16 => [5, 11, 6, 5, 5, 0],
-                _ => [8, 16, 8, 8, 8, 0],
+                15 => [10, 5, 5, 5, 0, 5], // 5:5:5
+                16 => [11, 5, 5, 6, 0, 5], // 5:6:5
+                _ => [16, 8, 8, 8, 0, 8],  // 8:8:8
             };
             crate::kernel::display::FormatSpec::Packed(
                 crate::kernel::display::PixelFormat::from_rgb(bpp.div_ceil(8), masks).unwrap()
