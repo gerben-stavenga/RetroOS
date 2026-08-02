@@ -1,7 +1,5 @@
-//! GOP linear-framebuffer text console — the kernel console on UEFI-class
-//! machines (the `run_uefi.sh` mock, modern laptops), which have no VGA text
-//! mode: the display is a dumb linear framebuffer and writes to 0xB8000 show
-//! nothing.
+//! Linear-framebuffer text console. The framebuffer may come from GOP or from
+//! a BIOS/VBE mode; above discovery they are the same pixel sink.
 //!
 //! There is ONE VGA model: the shared text aperture at phys 0xB8000 (the
 //! kernel console keeps `lib::vga`'s cell base there — LOW_MEM_BASE + 0xB8000 —
@@ -49,20 +47,27 @@ pub fn active() -> bool {
     geom().is_some()
 }
 
-/// The GOP framebuffer, as a descriptor the kernel can blit into directly.
+/// The boot framebuffer, as a sink the kernel can blit into directly.
 /// Installed into `HostEnv` by the metal entry; the platform probe freezes it
 /// into `Display::Framebuffer`.
-pub fn framebuffer() -> Option<crate::kernel::display::Framebuffer> {
+pub fn framebuffer() -> Option<crate::kernel::display::LfbDisplay> {
     let g = (*geom()).as_ref()?;
-    Some(crate::kernel::display::Framebuffer {
+    let framebuffer = crate::kernel::display::Framebuffer {
         va: g.va,
         pitch: g.pitch,
         width: g.width,
         height: g.height,
-        format: g.format,
         slow: g.slow,
         wide: g.wide,
-    })
+    };
+    // A loader-provided framebuffer is already established, whether the
+    // loader used GOP or VBE. Only a sink RetroOS creates by consuming a
+    // directly-owned card carries BiosDisplay.
+    Some(crate::kernel::display::LfbDisplay::from_framebuffer(
+        framebuffer,
+        crate::kernel::display::FormatSpec::Packed(g.format),
+        None,
+    ))
 }
 
 /// End of frame. The framebuffer is Write-Combining: stores sit in the CPU's WC
@@ -126,13 +131,13 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     let width = info.framebuffer_width as usize;
     let height = info.framebuffer_height as usize;
 
-    // The renderer emits 0x00RRGGBB. GOP commonly exposes either BGRX memory
+    // The renderer emits 0x00RRGGBB. Linear framebuffers commonly expose either BGRX memory
     // (the native little-endian representation of that value) or RGBX memory;
     // use Multiboot's channel metadata instead of assuming one firmware layout.
     let [rp, rs, gp, gs, bp, bs] = info.color_info;
     lib::screenln!(
         screen,
-        "fbcon: GOP {}x{} pitch={} bpp={} R{}/{} G{}/{} B{}/{} addr={:#x}",
+        "fbcon: boot LFB {}x{} pitch={} bpp={} R{}/{} G{}/{} B{}/{} addr={:#x}",
         width, height, pitch, info.framebuffer_bpp, rp, rs, gp, gs, bp, bs, addr
     );
     // Blind-debug signal, painted BEFORE we panic: a machine with no debug port
@@ -192,15 +197,8 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     // hardware (continuous scanout) both see WC fine. Detect plain QEMU-TCG via
     // its hypervisor signature ("TCGTCGTCGTCG") and use strong-UC there, where
     // every write is a dirty-tracked device access the display picks up.
-    let (_, hv_ebx, _, _) = arch::x86::cpuid(0x4000_0000);
-    let (_, _, cpuid1_ecx, _) = arch::x86::cpuid(1);
-    let qemu_tcg = (cpuid1_ecx >> 31) & 1 == 1 && hv_ebx == 0x5447_4354; // "TCGT"
-    let fb_cache_flag = if paging2::wc_pat_enabled() && !qemu_tcg {
-        paging2::flags::WRITE_COMBINE
-    } else {
-        paging2::flags::CACHE_DISABLE
-    };
-    if qemu_tcg {
+    let policy = paging2::framebuffer_map_policy();
+    if policy.slow {
         lib::screenln!(screen, "fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
     }
     let fb_bytes = pitch * height;
@@ -215,7 +213,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         paging2::map_user_page_phys(
             paging2::FB_WINDOW_BASE / PAGE_SIZE + i,
             ppage + i as u64,
-            fb_cache_flag,
+            policy.flags,
         );
     }
 
@@ -226,8 +224,8 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
         width,
         height,
         format,
-        slow: qemu_tcg,
-        wide: (cpuid1_ecx >> 31) & 1 == 0, // no hypervisor = real WC aperture
+        slow: policy.slow,
+        wide: policy.wide,
     });
 
     // Wipe the boot splash (the pre-paging life-sign strip boot_kernel
@@ -268,5 +266,16 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
 
     // From here on the linear framebuffer is simply the emulated VGA's sink.
     // Kernel text output keeps using the same B8000 cells and VGA interface.
-    crate::vga::attach_framebuffer(framebuffer().unwrap());
+    let g = (*geom()).as_ref().unwrap();
+    crate::vga::attach_framebuffer(
+        crate::kernel::display::Framebuffer {
+            va: g.va,
+            pitch: g.pitch,
+            width: g.width,
+            height: g.height,
+            slow: g.slow,
+            wide: g.wide,
+        },
+        g.format,
+    );
 }

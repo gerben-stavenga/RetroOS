@@ -13,6 +13,8 @@
 pub mod elf;
 pub mod exec;
 pub mod exec_ctx;
+#[path = "core_bios.rs"]
+pub mod bios_display;
 pub mod sched;
 pub mod startup;
 pub mod thread;

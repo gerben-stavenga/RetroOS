@@ -161,25 +161,52 @@ pub enum PersonalityName {
     Linux,
 }
 
-// DosState is the large central DOS personality state; Linux processes carry
-// the small LinuxState. There are only a handful of live threads, and boxing
-// DosState would force a heap allocation + indirection on the hot DOS execution
-// path (and a 17-site deref-coercion refactor), so the inline variant is the
-// deliberate choice.
-#[allow(clippy::large_enum_variant)]
 pub enum Personality<A: crate::Arch> {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
-    Dos(DosState<A>),
+    Dos(alloc::boxed::Box<DosState<A>>),
     /// Linux userspace (32 or 64-bit, distinguished by CS descriptor)
     Linux(LinuxState),
 }
 
 impl<A: crate::Arch> Personality<A> {
+    /// Give the first running personality the boot display. Unlike a later
+    /// materialization, Linux adopts the existing contents instead of
+    /// repainting its shared console snapshot.
+    pub fn adopt_display(
+        &mut self,
+        machine: &mut A,
+        display: crate::kernel::platform::DisplayToken,
+    ) {
+        match self {
+            Self::Dos(d) => d.materialize(machine, display),
+            Self::Linux(_) => crate::kernel::linux::adopt_console_vga(display),
+        }
+    }
+
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
-    pub fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::DisplayToken {
+    pub fn suspend(
+        &mut self,
+        machine: &mut A,
+        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    ) -> crate::kernel::platform::DisplayToken {
+        let display = match self {
+            Self::Dos(d) => match bios_workspace {
+                Some(workspace) => d.suspend_for_osd(machine, workspace),
+                None => d.suspend(machine),
+            },
+            Self::Linux(l) => l.suspend(machine),
+        };
+        display
+    }
+
+    pub fn suspend_for_osd(
+        &mut self,
+        machine: &mut A,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    ) -> crate::kernel::platform::DisplayToken {
         match self {
-            Self::Dos(d) => d.suspend(machine),
+            Self::Dos(d) => d.suspend_for_osd(machine, bios_workspace),
             Self::Linux(l) => l.suspend(machine),
         }
     }
@@ -191,10 +218,26 @@ impl<A: crate::Arch> Personality<A> {
     pub fn materialize(
         &mut self,
         machine: &mut A,
+        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
         display: crate::kernel::platform::DisplayToken,
     ) {
         match self {
-            Self::Dos(d) => d.materialize(machine, display),
+            Self::Dos(d) => match bios_workspace {
+                Some(workspace) => d.materialize_from_osd(machine, workspace, display),
+                None => d.materialize(machine, display),
+            },
+            Self::Linux(l) => l.materialize(machine, display),
+        }
+    }
+
+    pub fn materialize_from_osd(
+        &mut self,
+        machine: &mut A,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        display: crate::kernel::platform::DisplayToken,
+    ) {
+        match self {
+            Self::Dos(d) => d.materialize_from_osd(machine, bios_workspace, display),
             Self::Linux(l) => l.materialize(machine, display),
         }
     }
@@ -266,12 +309,13 @@ impl<A: crate::Arch> Personality<A> {
     pub fn handle_event(
         &mut self,
         machine: &mut A,
+        bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
         kt: &mut KernelThread<A>,
         regs: &mut Regs,
         kevent: crate::KernelEvent,
     ) -> KernelAction {
         match self {
-            Self::Dos(dos) => crate::kernel::dos::handle_event(machine, kt, dos, regs, kevent),
+            Self::Dos(dos) => crate::kernel::dos::handle_event(machine, bios_display, kt, dos, regs, kevent),
             Self::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
         }
     }
@@ -602,6 +646,42 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
     None
 }
 
+/// Reserve a thread whose page-table slot will be filled in place by a fork.
+/// This avoids carrying a value-sized `A::PageTable` (3 KiB on metal) through
+/// the already-deep fork/exec kernel stack merely to move it into the slot.
+pub fn create_thread_for_fork<'a, A: crate::Arch>(
+    threads: &'a mut [Thread<A>],
+    machine: &mut A,
+    parent_tid: usize,
+) -> Option<&'a mut Thread<A>> {
+    let (parent_prio, parent_tidv) = {
+        let p = &threads[parent_tid].kernel;
+        (p.priority, p.tid)
+    };
+    for (i, t) in threads.iter_mut().enumerate().take(MAX_THREADS) {
+        if t.kernel.state == ThreadState::Unused {
+            let k = &mut t.kernel;
+            k.tid = i as i32;
+            k.pid = i as i32;
+            k.priority = parent_prio;
+            k.parent_tid = parent_tidv;
+            k.state = ThreadState::Ready;
+            k.time = machine.get_ticks() as u32;
+            k.vcpu.regs = Regs::empty();
+            // `Unused` threads own an empty/default slot. Fork writes the COW
+            // root directly here before the child is activated.
+            machine.user_fork(&mut k.vcpu.space);
+            k.fx_state = machine.clean_fx_template();
+            k.exit_code = 0;
+            k.addr_hash = 0;
+            k.cpu_hash = 0;
+            t.personality = Personality::Linux(LinuxState::new());
+            return Some(t);
+        }
+    }
+    None
+}
+
 /// Initialize a thread as a 32-bit user process
 pub fn init_process_thread<A: crate::Arch>(thread: &mut Thread<A>, entry: u32, stack: u32) {
     thread.kernel.vcpu.regs.init_user_process(entry, stack);
@@ -737,6 +817,7 @@ pub fn cycle_next<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> 
 pub fn exit_thread<A: crate::Arch>(
     threads: &mut [Thread<A>],
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     tid: usize,
     exit_code: i32,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
@@ -751,7 +832,7 @@ pub fn exit_thread<A: crate::Arch>(
         // snapshot stays in the zombie's slot until the parent either
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
         if tid == crate::kernel::focus::focused() {
-            let display = thread.personality.suspend(machine);
+            let display = thread.personality.suspend(machine, bios_workspace);
             assert!(display_handoff.is_none(), "unconsumed display handoff");
             *display_handoff = Some(display);
         }

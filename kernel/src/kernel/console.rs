@@ -25,15 +25,17 @@ pub const F12_PRESS: u8 = 0x58;
 /// device IRQs were consumed earlier by `irq_dispatch`.
 pub fn dispatch<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
+    let mut bios_workspace = bios_workspace;
     let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
     for evt in events {
         if let crate::Irq::Key(sc) = evt
-            && monitor_key(machine, regs, sc, personality)
+            && monitor_key(machine, bios_workspace.as_deref_mut(), regs, sc, personality)
         {
             continue;
         }
@@ -91,41 +93,70 @@ fn dispatch_dos<A: crate::Arch>(
 /// key; when closed, only F12 (opening it) is special.
 fn monitor_key<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     regs: &mut Regs,
     sc: u8,
     personality: &mut thread::Personality<A>,
 ) -> bool {
+    let mut bios_workspace = bios_workspace;
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
-            thread::Personality::Dos(dos) => Some(dos),
+            thread::Personality::Dos(dos) => Some(&**dos),
             thread::Personality::Linux(_) => None,
         };
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
-            let display = crate::kernel::osd::take_display();
-            let native_vga =
-                matches!(display, crate::kernel::platform::DisplayToken::VgaCard);
-            personality.materialize(machine, display);
-            if native_vga {
-                crate::kernel::sound::recover_after_display_stall();
-                if let thread::Personality::Dos(dos) = personality {
-                    crate::kernel::dos::audio_tick(machine, dos, regs);
-                }
-            }
-            crate::kernel::io_policy::apply(machine, personality, true);
+            restore_from_monitor(machine, bios_workspace.as_deref_mut(), regs, personality);
         }
         return true;
     }
     if sc == F12_PRESS {
-        let display = personality.suspend(machine);
-        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
-            crate::kernel::dos::prepare_native_osd();
-        }
+        let display = match personality.suspend_for_osd(
+            machine,
+            bios_workspace.as_deref_mut().expect("OSD open without core BIOS"),
+        ) {
+            crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
+                let sink = crate::kernel::dos::prepare_bios_osd(
+                    machine,
+                    bios_workspace.as_deref_mut().expect("native VGA without core BIOS"),
+                    native,
+                );
+                crate::kernel::platform::DisplayToken::LfbDisplay(sink)
+            }
+            display => display,
+        };
         crate::kernel::osd::open(display);
-        crate::kernel::io_policy::apply(machine, personality, true);
         return true;
     }
     false
+}
+
+/// Return the monitor-held display to its focused personality. This is shared
+/// by an ordinary Esc/F12 close and forced dismissal before owner teardown.
+pub fn restore_from_monitor<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    regs: &mut Regs,
+    personality: &mut thread::Personality<A>,
+) {
+    let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
+    let display = crate::kernel::osd::take_display();
+    let (display, bios_display) = match display {
+        crate::kernel::platform::DisplayToken::LfbDisplay(sink)
+            if sink.bios_display.is_some() =>
+        {
+            let native = crate::kernel::dos::release_bios_osd(machine, bios_workspace, sink);
+            (crate::kernel::platform::DisplayToken::BiosDisplay(native), true)
+        }
+        display => (display, false),
+    };
+    personality.materialize_from_osd(machine, bios_workspace, display);
+    if bios_display {
+        crate::kernel::sound::recover_after_display_stall();
+        if let thread::Personality::Dos(dos) = personality {
+            crate::kernel::dos::audio_tick(machine, dos, regs);
+        }
+    }
 }
 
 /// Linux owner: keys → cooked fd input.

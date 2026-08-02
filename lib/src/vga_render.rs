@@ -442,8 +442,8 @@ pub const EGA16: [(u8, u8, u8); 16] = [
 /// power-on palette (which uses an HSV layout); it's a sane fallback so a
 /// mode-13h frame captured before the program loads its palette is still
 /// legible. Real games reprogram the DAC, overwriting all of this.
-pub fn fallback_palette() -> [u8; 768] {
-    let mut p = [0u8; 768];
+pub fn fill_fallback_palette(p: &mut [u8; 768]) {
+    p.fill(0);
     // 0..15: EGA colours.
     for (i, &(r, g, b)) in EGA16.iter().enumerate() {
         p[i * 3] = r;
@@ -472,6 +472,11 @@ pub fn fallback_palette() -> [u8; 768] {
             }
         }
     }
+}
+
+pub fn fallback_palette() -> [u8; 768] {
+    let mut p = [0u8; 768];
+    fill_fallback_palette(&mut p);
     p
 }
 

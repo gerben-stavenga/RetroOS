@@ -1017,6 +1017,25 @@ pub fn wc_pat_enabled() -> bool {
     unsafe { WC_PAT_ENABLED }
 }
 
+/// One authoritative cache/copy policy for every metal linear framebuffer,
+/// whether supplied by the loader or acquired later through VBE.
+pub fn framebuffer_map_policy() -> arch_abi::FramebufferMapPolicy {
+    let (_, hv_ebx, _, _) = crate::x86::cpuid(0x4000_0000);
+    let (_, _, cpuid1_ecx, _) = crate::x86::cpuid(1);
+    let hypervisor = (cpuid1_ecx >> 31) & 1 != 0;
+    let qemu_tcg = hypervisor && hv_ebx == 0x5447_4354; // "TCGT"
+    let cache = if wc_pat_enabled() && !qemu_tcg {
+        flags::WRITE_COMBINE
+    } else {
+        flags::CACHE_DISABLE
+    };
+    arch_abi::FramebufferMapPolicy {
+        flags: cache | flags::FOREIGN,
+        slow: qemu_tcg,
+        wide: wc_pat_enabled() && !hypervisor,
+    }
+}
+
 /// Reprogram PAT entry 4 (PAT=1, PCD=0, PWT=0) from its default WB to
 /// Write-Combining, so a 4 KB leaf PTE carrying `flags::WRITE_COMBINE` maps WC.
 ///

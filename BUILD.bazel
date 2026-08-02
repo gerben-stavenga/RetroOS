@@ -181,6 +181,7 @@ _EXTRA_FILES = {
     "//test/dos/stress64:stress64_elf":   "TESTS/stress64.elf",
     "//test/dos/hello_com:hello_com":     "TESTS/HELLO.COM",
     "//test/dos/gfx_com:gfx_com":         "TESTS/GFX.COM",
+    "//test/dos/svgaprobe:svgaprobe_com": "TESTS/SVGAPROBE.COM",
     "//test/dos/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
     "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",

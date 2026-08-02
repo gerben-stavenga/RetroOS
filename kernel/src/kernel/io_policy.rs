@@ -2,16 +2,15 @@
 //! replacement for ad-hoc global `allow_io_ports` pokes.
 //!
 //! The I/O bitmap is hardware mechanism (arch owns it); WHICH ports a thread
-//! may touch is kernel policy, rebuilt on every swap-in from three typed
-//! inputs — personality, [`platform::Display`], and console focus:
+//! may touch is kernel policy, rebuilt at every guest entry from the running
+//! personality's I/O capabilities and the platform:
 //!
-//!   - DOS, focused, real card: the VGA register window (0x3C0 and 0x3DA
+//!   - DOS owning the real card: the VGA register window (0x3C0 and 0x3DA
 //!     stay trapped: AC flip-flop tracking + retrace fabrication), plus any
 //!     granted device windows.
-//!   - DOS, background: granted device windows only — its VGA programming
-//!     traps into the thread's own VgaState model while the focused thread
-//!     owns the card.
-//!   - Linux / native: nothing, ever. A trapped port from Linux is a fault,
+//!   - DOS owning emulated VGA: granted device windows only — VGA programming
+//!     traps into the thread's own VgaState model.
+//!   - Linux: nothing, ever. A trapped port from Linux is a fault,
 //!     not an emulation request (the personality dispatcher exits the
 //!     process on `KE::In`/`KE::Out`).
 //!
@@ -23,15 +22,16 @@
 use crate::kernel::platform;
 use crate::kernel::thread::Personality;
 
-/// Rebuild the live I/O bitmap for a thread taking the CPU: deny-all
-/// baseline, then exactly what its personality + focus state allow. Called
-/// on every swap-in (and once for the initial program).
-pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focused: bool) {
+/// Rebuild the live I/O bitmap from the running personality's capabilities:
+/// deny everything, then open exactly the windows represented by its state.
+///
+/// Called only by the CPU-loan boundary immediately before guest execution.
+pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>) {
     machine.reset_io_bitmap();
     match personality {
         Personality::Dos(_) => {
-            if focused
-                && matches!(personality, Personality::Dos(dos) if dos.pc.vga.is_native())
+            if matches!(personality, Personality::Dos(dos)
+                if matches!(dos.pc.vga, crate::kernel::dos::BiosVga::Bios(_)))
             {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
@@ -85,4 +85,17 @@ pub fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>, focu
         // Linux: no ports. The deny-all baseline stands.
         Personality::Linux(_) => {}
     }
+}
+
+/// Execution policy for a kernel-owned video-BIOS excursion. Possession of
+/// `BiosDisplay` is the capability. The hot VGA register window goes direct;
+/// less common ROM accesses (including PCI config space) trap and are forwarded
+/// synchronously by `BiosDisplayWorkspace`. The ordinary guest-entry boundary rebuilds
+/// the next thread's narrower bitmap afterward.
+pub(crate) fn apply_bios_display<A: crate::Arch>(
+    machine: &mut A,
+    _bios_display: &platform::BiosDisplay,
+) {
+    machine.reset_io_bitmap();
+    machine.allow_io_ports(0x3C0, 0x20);
 }

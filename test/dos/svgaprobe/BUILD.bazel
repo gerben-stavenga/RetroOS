@@ -1,0 +1,7 @@
+genrule(
+    name = "svgaprobe_com",
+    srcs = ["svgaprobe.asm"],
+    outs = ["SVGAPROBE.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

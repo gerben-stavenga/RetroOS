@@ -60,7 +60,7 @@ pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
     unsafe {
         let display = (&raw mut LINUX_CONSOLE_DISPLAY)
             .as_mut().unwrap().take().expect("hidden Linux console has no display");
-        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
+        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
             let vga = (&raw mut LINUX_CONSOLE_VGA)
                 .as_mut()
                 .unwrap()
@@ -77,8 +77,8 @@ pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
 /// deterministic regardless of what was last drawn.
 pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
     unsafe {
-        if matches!(display, crate::kernel::platform::DisplayToken::VgaCard) {
-            if let Some(vga) = (&raw const LINUX_CONSOLE_VGA).as_ref().unwrap() {
+        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+            if let Some(vga) = (&raw mut LINUX_CONSOLE_VGA).as_mut().unwrap().take() {
                 vga.restore_to_hardware();
             } else {
                 crate::vga::vga().clear();
@@ -89,7 +89,7 @@ pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
     }
 }
 
-pub fn adopt_console_vga(display: crate::kernel::platform::DisplayToken) {
+pub(super) fn adopt_console_vga(display: crate::kernel::platform::DisplayToken) {
     unsafe {
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
@@ -164,7 +164,7 @@ impl LinuxState {
 
     /// Called when a Linux thread loses focus. Snapshots the shared Linux
     /// console framebuffer (TTY-style — all Linux threads share it).
-    pub fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
+    pub(super) fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
         -> crate::kernel::platform::DisplayToken
     {
         save_console_vga()
@@ -174,7 +174,7 @@ impl LinuxState {
     /// console from the suspend snapshot. CPU-binding side effects (TLS,
     /// deferred wait_status writeout) live in `on_resume` and happen on
     /// every swap-in.
-    pub fn materialize<A: crate::Arch>(
+    pub(super) fn materialize<A: crate::Arch>(
         &mut self,
         _machine: &mut A,
         display: crate::kernel::platform::DisplayToken,
@@ -1264,7 +1264,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1).is_err() {
         return Some(thread::exit_thread(
-            threads, machine, tid, -ENOEXEC, display_handoff,
+            threads, machine, None, tid, -ENOEXEC, display_handoff,
         ));
     }
 

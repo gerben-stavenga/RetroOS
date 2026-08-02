@@ -991,6 +991,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 );
             }
             dpmi.phys_mappings[slot] = Some(PhysicalMapping {
+                physical_page_base: physical & !0xFFF,
                 returned_linear,
                 virtual_page_base: virtual_base,
                 page_count,

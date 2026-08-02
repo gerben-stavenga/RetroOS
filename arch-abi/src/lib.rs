@@ -178,6 +178,16 @@ pub const MAP_PHYS_CACHE_DISABLE: u64 = 1 << 4;
 /// address-space teardown, or replacement.
 pub const MAP_PHYS_FOREIGN: u64 = 1 << 11;
 
+/// Backend-selected policy for a physical linear framebuffer mapping.
+/// Framebuffers are MMIO, but unlike register BARs they benefit enormously
+/// from write combining when the CPU/backend can publish WC stores correctly.
+#[derive(Clone, Copy, Debug)]
+pub struct FramebufferMapPolicy {
+    pub flags: u64,
+    pub slow: bool,
+    pub wide: bool,
+}
+
 // =============================================================================
 // Page geometry
 // =============================================================================

@@ -26,6 +26,7 @@ pub enum Verdict {
 /// pick a successor.
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
@@ -34,7 +35,7 @@ pub fn verdict<A: crate::Arch>(
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
-    let next = match next_after(machine, threads, regs, tid, action, display_handoff) {
+    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, display_handoff) {
         Some(n) => Some(n),
         None => focus_request(threads, tid),
     };
@@ -49,6 +50,7 @@ pub fn verdict<A: crate::Arch>(
 /// the current thread.
 fn next_after<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
@@ -59,7 +61,7 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(
-            threads, machine, tid, code, display_handoff,
+            threads, machine, bios_workspace, tid, code, display_handoff,
         )),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {

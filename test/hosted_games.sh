@@ -48,6 +48,14 @@ run "DIGGER (real-mode) + keyboard" \
 run "DOOM (shareware, DPMI) boots" \
     --cmd "GAMES/DOOMS/DOOM.EXE" --settle 2 --timeout 35
 
+# Substitute-BIOS VBE: controller/mode records, packed + direct-colour mode
+# metadata, bank switching with retained VRAM, palette data, and LFB address.
+run "VBE/SVGA controller, modes, banks, palette, LFB" \
+    --cmd "TESTS/SVGAPROBE.COM" --settle 2 --timeout 25 \
+    --expect-log "VBE-INFO-OK" --expect-log "VBE-MODES-OK" \
+    --expect-log "VBE-LFB-OK" --expect-log "VBE-BANK-OK" \
+    --expect-log "VBE-PAL-OK" --expect-log "VBE-ALL-OK"
+
 # Emulated-SB single-cycle completion protocol (test/dos/sbproto): the DSP
 # write-status busy flicker, the 8237 status TC bit, and the post-terminal
 # count underflow — each regressed or went missing at least once (PoP's

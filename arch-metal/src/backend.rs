@@ -110,6 +110,9 @@ impl Arch for Metal {
     fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64) {
         super::calls::arch_map_phys_range(vpage_start, num_pages, ppage_start, flags)
     }
+    fn framebuffer_map_policy(&self) -> arch_abi::FramebufferMapPolicy {
+        super::paging2::framebuffer_map_policy()
+    }
     fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64 {
         super::calls::arch_alloc_phys_contig(num_pages, boundary_log2)
     }

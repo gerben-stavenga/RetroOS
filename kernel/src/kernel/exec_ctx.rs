@@ -4,8 +4,9 @@
 //! frame + address-space handle (no global `REGS` on the kernel side), and
 //! `tid` names the thread it belongs to. `run` lends the CPU to user code;
 //! `switch_to` is a pure EXECUTION swap — registers, FPU, address space,
-//! per-thread CPU bindings (`on_resume`), and the I/O bitmap derived from
-//! (personality, platform, focus). Console-focus transfer is deliberately
+//! per-thread CPU bindings (`on_resume`). At the one guest-entry boundary,
+//! `run` derives the live I/O bitmap from the personality's capabilities.
+//! Console-focus transfer is deliberately
 //! NOT here: focus is a separate concept (`kernel::focus`) that today
 //! accompanies every switch (see startup's `switch_focus_and_run`) and
 //! tomorrow won't.
@@ -48,8 +49,15 @@ impl<A: crate::Arch> ExecutionContext<A> {
         thread::get_thread(threads, self.tid).expect("ExecutionContext: current thread vanished")
     }
 
-    /// Run user code until it produces a kernel event.
-    pub fn run(&mut self, machine: &mut A) -> crate::KernelEvent {
+    /// Lend the CPU to this personality. This is the only guest-entry point,
+    /// and therefore the single place where the live IOPB is reconciled with
+    /// the thread's current capabilities.
+    pub fn run(
+        &mut self,
+        machine: &mut A,
+        personality: &thread::Personality<A>,
+    ) -> crate::KernelEvent {
+        crate::kernel::io_policy::apply(machine, personality);
         machine.execute(&mut self.regs)
     }
 
@@ -81,12 +89,6 @@ impl<A: crate::Arch> ExecutionContext<A> {
         old.kernel.vcpu.space = old_space;
         old.kernel.fx_state = swap_fx;
         old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
-        // The incoming thread's port permissions: rebuilt from (personality,
-        // platform, focus) — never inherited from whoever ran last.
-        crate::kernel::io_policy::apply(machine,
-            &new.personality,
-            new_tid == crate::kernel::focus::focused(),
-        );
         new.personality.on_resume(machine);
         self.tid = new_tid;
     }

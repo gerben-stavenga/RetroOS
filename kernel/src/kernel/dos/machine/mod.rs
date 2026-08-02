@@ -217,7 +217,7 @@ pub struct PcMachine {
     pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
-    pub vga: vga::Vga,
+    pub vga: vga::BiosVga,
     /// The 3dfx Voodoo board. Present in every machine but inert until a
     /// guest finds it over PCI and maps its aperture.
     pub voodoo: vvoodoo::VVoodoo,
@@ -232,7 +232,7 @@ pub struct PcMachine {
     pub present_fb: alloc::vec::Vec<u32>,
     /// Direct-display scanout scratch: palette, a completed WB shadow frame,
     /// and render/publish phase timing.
-    pub present_scratch2: crate::kernel::display::Scratch,
+    pub present_scratch2: alloc::boxed::Box<crate::kernel::display::Scratch>,
     /// Publication state for the Voodoo's native-RGB frames on a framebuffer
     /// display. Separate from `present_scratch2`: that one starts from VGA
     /// planes and a DAC, which the card's output has neither of.
@@ -450,30 +450,41 @@ impl PcMachine {
         // nothing to toggle. Dropping it removes the shadow region, the page
         // swap, and the local/global ref-counting that used to track it.
         machine.copy_page_entries(0, HMA_PAGE, HMA_PAGE_COUNT);
-        alloc::boxed::Box::new(Self {
-            vpit: VirtualPit::new(machine),
-            vpic: VirtualPic::new(),
-            vrtc: VirtualRtc::new(machine),
-            vkbd: VirtualKeyboard::new(),
-            mouse: MouseState::new(),
-            skip_irq: false,
-            e0_pending: false,
-            vga: vga::Vga::new(),
-            voodoo: vvoodoo::VVoodoo::new(),
-            present_scratch: alloc::vec::Vec::new(),
-            present_fb: alloc::vec::Vec::new(),
-            present_scratch2: crate::kernel::display::Scratch::new(),
-            voodoo_scanout: crate::kernel::display::NativeScanout::new(),
-            dma: Dma8237::new(),
-            sb: SoundBlaster::new(),
-            gus: Gus::new(),
-            mpu: Mpu::new(),
-            spk: sound::speaker::Speaker::new(),
-            mixer: Mixer::new(),
-            cmos_index: 0,
-            native_vbe_io_rmcs: 0,
-            locked_stack: super::mode_transitions::LockedStackState::new(),
-        })
+        // `Box::new(Self { .. })` is not an in-place construction guarantee:
+        // rustc may assemble the complete aggregate on the kernel stack before
+        // copying it to the allocation. PcMachine is large enough that a tiny
+        // field-size increase then makes fork/exec cross the guard page. Write
+        // each initialized field directly into uninitialized heap storage.
+        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
+        let p = boxed.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*p).vpit).write(VirtualPit::new(machine));
+            core::ptr::addr_of_mut!((*p).vpic).write(VirtualPic::new());
+            core::ptr::addr_of_mut!((*p).vrtc).write(VirtualRtc::new(machine));
+            core::ptr::addr_of_mut!((*p).vkbd).write(VirtualKeyboard::new());
+            core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
+            core::ptr::addr_of_mut!((*p).skip_irq).write(false);
+            core::ptr::addr_of_mut!((*p).e0_pending).write(false);
+            core::ptr::addr_of_mut!((*p).vga).write(vga::BiosVga::new());
+            core::ptr::addr_of_mut!((*p).voodoo).write(vvoodoo::VVoodoo::new());
+            core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
+            core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
+            core::ptr::addr_of_mut!((*p).present_scratch2)
+                .write(crate::kernel::display::Scratch::new_boxed());
+            core::ptr::addr_of_mut!((*p).voodoo_scanout)
+                .write(crate::kernel::display::NativeScanout::new());
+            core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
+            core::ptr::addr_of_mut!((*p).sb).write(SoundBlaster::new());
+            core::ptr::addr_of_mut!((*p).gus).write(Gus::new());
+            core::ptr::addr_of_mut!((*p).mpu).write(Mpu::new());
+            core::ptr::addr_of_mut!((*p).spk).write(sound::speaker::Speaker::new());
+            core::ptr::addr_of_mut!((*p).mixer).write(Mixer::new());
+            core::ptr::addr_of_mut!((*p).cmos_index).write(0);
+            core::ptr::addr_of_mut!((*p).native_vbe_io_rmcs).write(0);
+            core::ptr::addr_of_mut!((*p).locked_stack)
+                .write(super::mode_transitions::LockedStackState::new());
+            boxed.assume_init()
+        }
     }
 }
 
@@ -517,8 +528,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            if pc.vga.is_emulated() {
-                pc.vga.ac_state.pending_data = false;
+            if let vga::BiosVga::Emulated(dev) = &mut pc.vga {
+                dev.state.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
             let real = machine.inb(0x3DA);
@@ -533,10 +544,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // VGA ports — pass through to hardware, or the emulated register file
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
-            if pc.vga.is_native() {
-                machine.inb(port)
-            } else {
-                pc.vga.port_read(port)
+            match &mut pc.vga {
+                vga::BiosVga::Emulated(dev) => dev.state.port_read(port),
+                vga::BiosVga::Bios(_) => machine.inb(port),
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
@@ -635,12 +645,12 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
-            if pc.vga.is_emulated() {
-                pc.vga.port_write(port, val);
+            if let vga::BiosVga::Emulated(dev) = &mut pc.vga {
+                dev.state.port_write(port, val);
                 return;
             }
             unsafe {
-                if !VGA_AC_STATE.pending_data {
+                if !VGA_AC_STATE.pending_data { // native card: track the flip-flop here
                     VGA_AC_STATE.index = val; // index write — latch full byte (incl. PAS)
                 }
                 VGA_AC_STATE.pending_data = !VGA_AC_STATE.pending_data;
@@ -648,15 +658,15 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
-            if pc.vga.is_native() {
+            let vga::BiosVga::Emulated(dev) = &mut pc.vga else {
                 machine.outb(port, val);
-            } else {
-                pc.vga.port_write(port, val);
-                // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
-                // select a plane — drive the A0000 paging alias.
-                if port == 0x3C5 {
-                    vga::on_seq_write(machine, pc, regs);
-                }
+                return;
+            };
+            dev.state.port_write(port, val);
+            // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
+            // select a plane — drive the A0000 paging alias.
+            if port == 0x3C5 {
+                vga::on_seq_write(machine, pc, regs);
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.

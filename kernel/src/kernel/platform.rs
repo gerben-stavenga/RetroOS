@@ -26,6 +26,10 @@ pub struct Platform {
     /// the relay and the DMA remap translate between them.
     pub sb_wiring: Option<crate::kernel::drivers::sb16::SbWiring>,
     pub firmware: Firmware,
+    /// Preferred packed linear mode advertised by the native video BIOS.
+    /// Discovered once at boot; selecting/mapping it still requires ownership
+    /// of the `BiosDisplay` capability.
+    pub vbe_mode: Option<VbeMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
     /// latches, CR24 AC flip-flop, CR26 AC index). With them, task
@@ -37,6 +41,20 @@ pub struct Platform {
     /// up as `/host`, as the root, or unused is `startup`'s mount policy.
     pub hostfs: bool,
     pub debug: DebugSink,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeMode {
+    pub number: u16,
+    pub physical_base: u32,
+    pub width: u16,
+    pub height: u16,
+    pub pitch: u16,
+    pub bits_per_pixel: u8,
+    pub format: crate::kernel::display::FormatSpec,
+    pub window_segment: u16,
+    pub window_granularity_kb: u16,
+    pub window_size_kb: u16,
 }
 
 /// What is running the kernel.
@@ -60,7 +78,7 @@ pub enum Display {
     /// program the hardware directly (passthrough port window); console = VGA
     /// text; the ROM's video services are authoritative (see [`Firmware`]).
     VgaCard,
-    /// No card, but the loader handed over a linear framebuffer (UEFI/GOP) —
+    /// The loader handed over a linear framebuffer (UEFI/GOP or BIOS/VBE) —
     /// or a hosted window supplied one. The emulated VGA blits into it; the
     /// descriptor travels with the verdict, so nothing has to call back to
     /// find out where the pixels go.
@@ -77,19 +95,61 @@ pub enum Display {
 /// [`Display`], this is a moved resource, never stored in the global platform
 /// facts.
 pub enum DisplayToken {
-    VgaCard,
-    Framebuffer(crate::kernel::display::Framebuffer),
+    BiosDisplay(BiosDisplay),
+    LfbDisplay(crate::kernel::display::LfbDisplay),
     HostWindow,
     Headless,
 }
 
-impl DisplayToken {
-    pub fn kind(&self) -> Display {
+/// The unique firmware-controlled physical display. The enum is deliberately
+/// neither `Copy` nor `Clone`: moving it transfers both card authority and the
+/// state required to reconstruct what the firmware established.
+#[derive(Debug)]
+pub enum BiosDisplay {
+    /// Register-based VGA mode. The physical card is the live state; a detach
+    /// snapshots its register file, DAC and legacy aperture.
+    Legacy,
+    /// VBE mode. Its descriptor identifies the LFB; bank selection is tracked
+    /// because it cannot be recovered from the legacy VGA register file.
+    Vesa {
+        mode: VbeMode,
+        bank: Option<VbeBank>,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeBank {
+    pub current: u16,
+    pub window_segment: u16,
+    pub granularity_kb: u16,
+    pub window_size_kb: u16,
+}
+
+impl BiosDisplay {
+    fn new() -> Self { Self::Legacy }
+
+    pub(crate) fn vbe_mode(&self) -> Option<VbeMode> {
         match self {
-            Self::VgaCard => Display::VgaCard,
-            Self::Framebuffer(_) => Display::Framebuffer,
-            Self::HostWindow => Display::HostWindow,
-            Self::Headless => Display::Headless,
+            Self::Legacy => None,
+            Self::Vesa { mode, .. } => Some(*mode),
+        }
+    }
+
+    pub(crate) fn set_legacy(&mut self) { *self = Self::Legacy; }
+
+    pub(crate) fn set_vesa(&mut self, mode: VbeMode, linear: bool) {
+        let bank = (!linear).then_some(VbeBank {
+            current: 0,
+            window_segment: mode.window_segment,
+            granularity_kb: mode.window_granularity_kb,
+            window_size_kb: mode.window_size_kb,
+        });
+        *self = Self::Vesa { mode, bank };
+    }
+
+    pub(crate) fn set_bank(&mut self, current: u16) {
+        if let Self::Vesa { bank: Some(bank), .. } = self {
+            bank.current = current;
         }
     }
 }
@@ -109,7 +169,7 @@ pub struct VisibleScreen {
 /// not implement `fmt::Write`.
 pub struct HiddenScreen {
     writer: crate::vga::Screen,
-    native_vga: Option<crate::kernel::dos::VgaState>,
+    bios_display: Option<crate::kernel::dos::VgaState>,
 }
 
 impl VisibleScreen {
@@ -117,15 +177,22 @@ impl VisibleScreen {
         Self { writer, display }
     }
 
+    pub fn bios_display(&self) -> Option<&BiosDisplay> {
+        match &self.display {
+            DisplayToken::BiosDisplay(native) => Some(native),
+            _ => None,
+        }
+    }
+
     pub fn suspend<A: crate::Arch>(self, _machine: &mut A) -> (HiddenScreen, DisplayToken) {
-        let native_vga = if matches!(self.display, DisplayToken::VgaCard) {
+        let bios_display = if matches!(self.display, DisplayToken::BiosDisplay(_)) {
             let mut vga = crate::kernel::dos::VgaState::new();
             vga.save_from_hardware();
             Some(vga)
         } else {
             None
         };
-        (HiddenScreen { writer: self.writer, native_vga }, self.display)
+        (HiddenScreen { writer: self.writer, bios_display }, self.display)
     }
 }
 
@@ -135,8 +202,8 @@ impl HiddenScreen {
         _machine: &mut A,
         display: DisplayToken,
     ) -> VisibleScreen {
-        if matches!(display, DisplayToken::VgaCard) {
-            self.native_vga
+        if matches!(display, DisplayToken::BiosDisplay(_)) {
+            self.bios_display
                 .as_ref()
                 .expect("native screen lost VGA state")
                 .restore_to_hardware();
@@ -286,7 +353,7 @@ pub struct HostEnv {
     /// The framebuffer this backend presents into, if any: a GOP framebuffer
     /// on metal, a window-sized buffer on hosted. Probed once — the kernel
     /// writes into it directly rather than through a present callback.
-    pub framebuffer: fn() -> Option<crate::kernel::display::Framebuffer>,
+    pub framebuffer: fn() -> Option<crate::kernel::display::LfbDisplay>,
     /// Where boot debug bytes were routed (recorded for policy).
     pub debug: DebugSink,
     /// True on the bare-metal backend (chooses Metal/Qemu vs Interp for host).
@@ -362,11 +429,11 @@ pub fn probe<A: crate::Arch>(
         // confirmed what `is_metal` already implied: the hosted port bus has no
         // VGA device to answer, and a metal machine that boots this way does.
         let (display, display_token) = if let Some(fb) = (env.framebuffer)() {
-            (Display::Framebuffer, DisplayToken::Framebuffer(fb))
+            (Display::Framebuffer, DisplayToken::LfbDisplay(fb))
         } else if crate::kernel::display::host_present_sink_installed() {
             (Display::HostWindow, DisplayToken::HostWindow)
         } else if env.is_metal {
-            (Display::VgaCard, DisplayToken::VgaCard)
+            (Display::VgaCard, DisplayToken::BiosDisplay(BiosDisplay::new()))
         } else {
             (Display::Headless, DisplayToken::Headless)
         };
@@ -405,6 +472,7 @@ pub fn probe<A: crate::Arch>(
             host: env.host(boot.is_qemu),
             display,
             firmware,
+            vbe_mode: None,
             vga_readback,
             audio_hw,
             sb_card,
@@ -475,6 +543,25 @@ pub fn set_sb_wiring(w: crate::kernel::drivers::sb16::SbWiring) {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::set_sb_wiring before probe");
     p.sb_wiring = Some(w);
+}
+
+/// Complete boot-time display discovery after the pristine BIOS environment
+/// exists. This records a descriptor only; it neither sets the mode nor maps
+/// the framebuffer.
+pub fn set_vbe_mode(mode: Option<VbeMode>) {
+    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
+        .expect("platform::set_vbe_mode before probe");
+    p.vbe_mode = mode;
+    match mode {
+        Some(m) => crate::println!(
+            "VBE: preferred mode {:#x} {}x{} pitch={} phys={:#x}",
+            m.number, m.width, m.height, m.pitch, m.physical_base
+        ),
+        None if p.display == Display::VgaCard => {
+            crate::println!("VBE: no usable packed linear mode; OSD will use mode 13h")
+        }
+        None => {}
+    }
 }
 
 pub fn get() -> &'static Platform {

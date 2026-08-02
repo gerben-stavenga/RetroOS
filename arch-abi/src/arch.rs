@@ -29,7 +29,7 @@
 //! — generic over the page-table type but otherwise shared, since both backends
 //! are x86 and share the `Regs` ABI.
 
-use crate::{Irq, KernelEvent, Regs};
+use crate::{FramebufferMapPolicy, Irq, KernelEvent, Regs};
 
 // =============================================================================
 // GuestBytes — access to guest memory
@@ -173,9 +173,10 @@ pub trait Arch: Sized + GuestBytes {
     fn allow_io_ports(&mut self, port: u16, count: usize);
 
     /// Reset the I/O-permission bitmap to deny-all. The kernel's io_policy
-    /// rebuilds a thread's allowed set (reset + allow_io_ports ranges) on
-    /// every swap-in; which ports a personality may touch is kernel policy,
-    /// this is only the mechanism. No-op on backends that interpret all I/O.
+    /// rebuilds the running thread's allowed set (reset + allow_io_ports
+    /// ranges) immediately before every guest entry; which ports a
+    /// personality may touch is kernel policy, this is only the mechanism.
+    /// No-op on backends that interpret all I/O.
     fn reset_io_bitmap(&mut self);
 
     // ── Execution & scheduling ─────────────────────────────────────────────
@@ -310,6 +311,15 @@ pub trait Arch: Sized + GuestBytes {
     fn on_ldt_changed(&mut self) {}
     /// Map a range of physical pages into user virtual space.
     fn map_phys_range(&mut self, vpage_start: usize, num_pages: usize, ppage_start: u64, flags: u64);
+    /// Cache/copy policy for a physical linear framebuffer owned by a display
+    /// controller. The conservative default is strong-UC.
+    fn framebuffer_map_policy(&self) -> FramebufferMapPolicy {
+        FramebufferMapPolicy {
+            flags: crate::MAP_PHYS_CACHE_DISABLE | crate::MAP_PHYS_FOREIGN,
+            slow: true,
+            wide: false,
+        }
+    }
     /// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
     /// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
     /// starting physical page number, or 0 on failure.

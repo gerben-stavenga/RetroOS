@@ -31,9 +31,10 @@ pub fn adopt(tid: usize) {
 /// snapshotted its farewell screen before teardown).
 pub fn release<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     old: &mut Personality<A>,
 ) -> crate::kernel::platform::DisplayToken {
-    old.suspend(machine)
+    old.suspend(machine, bios_workspace)
 }
 
 /// Second half: repaint the incoming owner's screen state and record it as
@@ -42,10 +43,11 @@ pub fn release<A: crate::Arch>(
 /// behaviour exactly.
 pub fn acquire<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     new_tid: usize,
     new: &mut Personality<A>,
     display: crate::kernel::platform::DisplayToken,
 ) {
-    new.materialize(machine, display);
+    new.materialize(machine, bios_workspace, display);
     FOCUS.store(new_tid, Ordering::Relaxed);
 }

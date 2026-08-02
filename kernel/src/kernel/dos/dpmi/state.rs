@@ -167,6 +167,8 @@ pub(super) struct MemBlock {
 /// One externally-owned physical-device mapping.
 #[derive(Clone, Copy)]
 pub(super) struct PhysicalMapping {
+    /// Page-aligned physical device address backing this mapping.
+    pub(super) physical_page_base: u32,
     /// Exact (possibly unaligned) linear address returned to the client.
     pub(super) returned_linear: u32,
     /// Page-aligned user virtual base.
@@ -208,6 +210,58 @@ impl DpmiState {
                     (mapping.virtual_page_base >> 12) as usize,
                     mapping.page_count as usize,
                 );
+            }
+        }
+    }
+
+    /// While OSD owns the native card, redirect every client mapping of its
+    /// LFB onto the thread's RAM shadow. The client keeps running and writing
+    /// the same linear addresses, but can no longer scribble over OSD scanout.
+    pub(in crate::kernel::dos) fn detach_vbe_lfb<A: crate::Arch>(
+        &self,
+        machine: &mut A,
+        physical_base: u32,
+        bytes: usize,
+        shadow_base: u32,
+    ) {
+        let first = physical_base & !0xFFF;
+        let pages = ((physical_base as usize & 0xFFF) + bytes).div_ceil(crate::PAGE_SIZE);
+        let end = first.saturating_add((pages * crate::PAGE_SIZE) as u32);
+        for mapping in self.phys_mappings.iter().flatten() {
+            for page in 0..mapping.page_count {
+                let phys = mapping.physical_page_base + page * crate::PAGE_SIZE as u32;
+                if (first..end).contains(&phys) {
+                    let shadow_page = (shadow_base as usize >> 12)
+                        + ((phys - first) as usize >> 12);
+                    let client_page = (mapping.virtual_page_base as usize >> 12) + page as usize;
+                    machine.copy_page_entries(shadow_page, client_page, 1);
+                }
+            }
+        }
+    }
+
+    /// Reconnect mappings redirected by `detach_vbe_lfb` to the physical LFB.
+    pub(in crate::kernel::dos) fn attach_vbe_lfb<A: crate::Arch>(
+        &self,
+        machine: &mut A,
+        physical_base: u32,
+        bytes: usize,
+    ) {
+        let first = physical_base & !0xFFF;
+        let pages = ((physical_base as usize & 0xFFF) + bytes).div_ceil(crate::PAGE_SIZE);
+        let end = first.saturating_add((pages * crate::PAGE_SIZE) as u32);
+        for mapping in self.phys_mappings.iter().flatten() {
+            for page in 0..mapping.page_count {
+                let phys = mapping.physical_page_base + page * crate::PAGE_SIZE as u32;
+                if (first..end).contains(&phys) {
+                    let client_page = (mapping.virtual_page_base as usize >> 12) + page as usize;
+                    machine.map_phys_range(
+                        client_page,
+                        1,
+                        u64::from(phys) >> 12,
+                        arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+                    );
+                }
             }
         }
     }

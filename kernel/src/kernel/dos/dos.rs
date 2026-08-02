@@ -257,7 +257,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
 /// (with the CF/ZF flag dance); every other vector is the personality BIOS —
 /// real services or the IRET/EOI defaults (`bios::dispatch`), which own
 /// their frame pop. Caller (`syscall`) has already checked CS.
-pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), STUB_SEG, "rm_vector_dispatch: CS must be STUB_SEG");
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
@@ -304,7 +304,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut threa
             }
             action
         }
-        _ => super::bios::dispatch(machine, dos, regs),
+        _ => super::bios::dispatch(machine, bios_display, dos, regs),
     }
 }
 
@@ -3924,6 +3924,7 @@ pub(crate) const SLOT_CB_ENTRY_LAST: u8 = SLOT_CB_ENTRY_END - 1;
 /// bracket-saved GP regs (HostContinuation doesn't cover them) and then
 /// unwinds the INT 33h callback via the standard continuation path.
 pub(crate) const SLOT_MOUSE_CB_RET: u8 = 0x14;
+/// Return target for guest calls chained through the native video ROM.
 /// Generic block-and-retry resume slot. A syscall that can't complete
 /// synchronously (e.g. AH=08 with no key in the buffer) stashes a closure
 /// in `dos.pending_resume` and parks user CS:IP at this stub. Each
@@ -3978,39 +3979,20 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
         machine.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
     }
 
-    // No native BIOS ROM (interp's zeroed guest RAM; UEFI metal): the
-    // personality installs its own — all 256 IVT entries into the BIOS stub
-    // array, services in `bios.rs`. The kernel-DOS redirects below then
-    // override their vectors, layered like a real machine (BIOS, DOS on top).
-    if crate::kernel::platform::get().firmware == crate::kernel::platform::Firmware::Substitute {
-        super::bios::install(machine, regs);
-    }
+    // DOS always sees the Rust substitute BIOS. Native firmware is a private
+    // implementation detail of BiosDisplayWorkspace and is never entered in
+    // a personality's address space.
+    super::bios::install(machine, regs);
 
-    // HW IRQ vectors (0x08-0x0F + 0x70-0x77) are left pointing at the
-    // original BIOS handlers — `raise_pending` delivers IRQs through the
-    // pm_vectors table (cross-mode to PM and back for VM86 clients), so the
-    // IVT never needs redirection for HW IRQ delivery.
+    // HW IRQ vectors are substitute-BIOS entries too. `raise_pending` delivers
+    // through the PM vector table when required; real-mode delivery reaches
+    // the same Rust vector stubs.
 
     // Hook the DOS/BIOS soft INTs we intercept so guest CD nn lands in our
     // dispatcher (slot index = INT vector).
     for &int_num in &[0x13u8, 0x20, 0x21, 0x25, 0x26, 0x28, 0x29, 0x2E, 0x2F, 0x33, 0x67] {
         write_u16(machine, 0, (int_num as u32) * 4, slot_offset(int_num));
         write_u16(machine, 0, (int_num as u32) * 4 + 2, STUB_SEG);
-    }
-
-    // INT 15h: the SeaBIOS ROM services AH=87h (block move) / AH=89h (switch to
-    // PM) with protected-mode code (LGDT) that #GPs under VM86. Steal the vector
-    // so our dispatcher emulates those and chains the rest back to the ROM.
-    // Native path only: the Substitute BIOS already owns 0x15, and reading it
-    // back (or a COW-inherited, already-redirected page 0) would capture our own
-    // stub and self-loop the chain — so skip if it's already STUB_SEG.
-    if crate::kernel::platform::get().firmware != crate::kernel::platform::Firmware::Substitute {
-        let seg = read_u16(machine, 0, 0x15 * 4 + 2);
-        if seg != STUB_SEG {
-            super::bios::set_native_int15(seg, read_u16(machine, 0, 0x15 * 4));
-        }
-        write_u16(machine, 0, 0x15 * 4, slot_offset(0x15));
-        write_u16(machine, 0, 0x15 * 4 + 2, STUB_SEG);
     }
 
     setup_lol_sft(machine, regs);

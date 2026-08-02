@@ -1,9 +1,9 @@
 //! The DOS personality's own BIOS — Rust services behind a per-vector stub
 //! array.
 //!
-//! On machines with no native BIOS ROM (the interpreter's empty guest RAM
-//! today; UEFI metal later), DOS guests calling INT 08/10/11/16/1A would land
-//! on a null IVT and self-corrupt. The personality installs its own firmware:
+//! DOS guests use one personality-owned firmware on every platform. Native
+//! video firmware is isolated behind `BiosDisplayWorkspace`; it is never an
+//! alternate DOS execution environment. The personality installs its IVT:
 //! every IVT entry points into the ONE 256-slot `CD 31` stub array's vector
 //! view (`STUB_SEG:vector*2`, slot index == vector), so any unhooked INT
 //! traps to the kernel and is serviced here in Rust. The control slots reach
@@ -36,25 +36,6 @@ use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
 };
 use super::dosabi::STUB_SEG;
-use core::sync::atomic::{AtomicU32, Ordering};
-
-/// The native BIOS ROM's INT 15h vector (`seg<<16 | off`), captured before we
-/// steal the vector in `setup_ivt`, so subfunctions we don't emulate can chain
-/// back to it. `NO_NATIVE` on the Substitute path — there's no ROM to chain to,
-/// and unhandled subfunctions just IRET.
-const NO_NATIVE: u32 = 0xFFFF_FFFF;
-static NATIVE_INT15: AtomicU32 = AtomicU32::new(NO_NATIVE);
-
-/// Record the ROM INT 15h vector before `setup_ivt` redirects it to our stub.
-pub(super) fn set_native_int15(seg: u16, off: u16) {
-    NATIVE_INT15.store(((seg as u32) << 16) | off as u32, Ordering::Relaxed);
-}
-fn native_int15() -> Option<(u16, u16)> {
-    match NATIVE_INT15.load(Ordering::Relaxed) {
-        NO_NATIVE => None,
-        v => Some(((v >> 16) as u16, v as u16)),
-    }
-}
 
 // ============================================================================
 // BIOS Data Area — a typed Rust projection at linear 0x400 (segment 0x40)
@@ -180,10 +161,9 @@ macro_rules! bda_field {
 /// filled by `setup_ivt` (one array serves vector and control views). The
 /// kernel-DOS IVT redirects written after this overwrite their vectors with
 /// identical values — the layering matches a real machine (BIOS first, DOS
-/// on top). Native-vs-substitute is decided by the boot-time probe
-/// (`platform::Firmware`), not sniffed here.
+/// on top). This is deliberately identical with or without a platform ROM.
 pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
-    crate::dbg_println!("DOS: no BIOS ROM — installing the personality BIOS (display {:?})",
+    crate::dbg_println!("DOS: installing substitute BIOS (display {:?})",
         crate::kernel::platform::get().display);
     // Vectors with a real service keep their own stub (slot index == vector);
     // everything unserviced shares ONE dummy cell, exactly like a real BIOS
@@ -208,9 +188,7 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
             // advertises zero free vectors: UltraMID's scan found none and
             // installed itself on INT 00h instead of INT 79h, so the game's
             // probe missed it ("UltraMID not found") and the unload left a
-            // divide-by-zero vector dangling into freed memory. Native BIOS
-            // was unaffected because `install` never runs there — the exact
-            // shape of a substitute-BIOS-only bug.
+            // divide-by-zero vector dangling into freed memory.
             write_u16(machine, 0, n * 4, 0);
             write_u16(machine, 0, n * 4 + 2, 0);
             continue;
@@ -313,6 +291,7 @@ fn seed_video_static_info<A: crate::Arch>(machine: &mut A) {
 /// the old C BIOS's `interrupt` handlers.
 pub(super) fn dispatch<A: crate::Arch>(
     machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> thread::KernelAction {
@@ -347,7 +326,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             emulate_outb(machine, &mut dos.pc, regs, 0xA0, 0x20);
             emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
         }
-        0x10 => int10(machine, dos, regs),
+        0x10 => int10(machine, bios_display, dos, regs),
         0x11 => {
             let equip: u16 = bda_field!(machine, equipment);
             regs.rax = (regs.rax & !0xFFFF) | equip as u64;
@@ -391,14 +370,7 @@ pub(super) fn dispatch<A: crate::Arch>(
                 regs.rax = (regs.rax & !0xFF00) | 0x8600;
                 set_iret_cf(machine, regs, true);
             }
-            // Everything else: on a real BIOS, hand back to the ROM (WAIT,
-            // ext-mem size, …) reusing the caller's INT frame. On Substitute
-            // there's no ROM, so fall through to a plain IRET as before.
-            _ => if let Some((seg, off)) = native_int15() {
-                machine::set_vm86_cs(regs, seg);
-                machine::set_vm86_ip(regs, off);
-                return thread::KernelAction::Done;
-            },
+            _ => {},
         },
         0x16 => {
             if int16(machine, regs, ip) == Parked::Yes {
@@ -717,7 +689,12 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
     }
 }
 
-fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
+fn int10<A: crate::Arch>(
+    machine: &mut A,
+    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) {
     let ax = regs.rax as u16;
     let ah = (ax >> 8) as u8;
     match ah {
@@ -725,6 +702,11 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
+            if let super::machine::vga::BiosVga::Bios(display) = &mut dos.pc.as_mut().vga
+                && let Some(workspace) = bios_display.as_deref_mut()
+            {
+                let _ = workspace.bios_set_mode(machine, display, u16::from(mode));
+            }
             bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
             // mode 13h) vs 80; 30 rows on the 480-line VGA modes; character cell
@@ -951,10 +933,13 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
                     // the ports like a real BIOS — one path for the emulated
                     // model and a real card alike.
                     let blink = regs.rbx & 1 != 0;
-                    let cur = dos.pc.vga.ac[0x10];
-                    let val = if blink { cur | 0x08 } else { cur & !0x08 };
                     let _ = emulate_inb(machine, &mut dos.pc, 0x3DA); // reset AC flip-flop
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, 0x10 | 0x20);
+                    // Read back through the same port path rather than the
+                    // register shadow: a native owner has no shadow, and
+                    // 0x3C1 answers from whichever side holds the state.
+                    let cur = emulate_inb(machine, &mut dos.pc, 0x3C1);
+                    let val = if blink { cur | 0x08 } else { cur & !0x08 };
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C0, val);
                 }
                 0x10 => {
@@ -1017,7 +1002,7 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
             }
         }
         0x1B => state_info(machine, regs),
-        0x4F => vbe(machine, dos, regs),
+        0x4F => vbe(machine, bios_display, dos, regs),
         _ => {}
     }
 }
@@ -1027,9 +1012,8 @@ fn int10<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
 /// functionality table. The *other* canonical "is this a VGA?" probe next to
 /// AX=1A00 — Operation Wolf zeroes the block, calls this, and scans it: an
 /// all-zero block (i.e. an unserviced function) means "no VGA", and it drops to
-/// its EGA path with the worse palette. With no ROM to chain to on the
-/// Substitute path, an unimplemented AH=1Bh *is* an all-zero block, which is why
-/// the game only picked EGA under UEFI.
+/// its EGA path with the worse palette. DOS never chains this service to a
+/// platform ROM, so an unimplemented AH=1Bh is an all-zero block.
 fn state_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     if regs.rbx as u16 != 0 {
         return; // BX=0 is the only defined implementation type
@@ -1102,35 +1086,67 @@ fn state_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 
 /// The banked SVGA modes we expose: (VBE mode#, width, height, bpp). Presented
 /// through the emulated framebuffer sink, integer-scaled/centred to the panel.
-/// 8bpp goes through the DAC palette; 15/16/32 are direct colour. Substitute
+/// 8bpp goes through the DAC palette; 15/16/24 are direct colour. Substitute
 /// path only — the native/SeaBIOS path has the card's own VBE.
 const VBE_MODES: &[(u16, u16, u16, u8)] = &[
     (0x101, 640, 480, 8),
     (0x103, 800, 600, 8),
     (0x110, 640, 480, 15),
     (0x111, 640, 480, 16),
-    (0x112, 640, 480, 32),
+    (0x112, 640, 480, 24),
 ];
 
-fn vbe<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
+fn vbe<A: crate::Arch>(
+    machine: &mut A,
+    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) {
     // Every VBE call returns AL=4Fh ("supported"); AH=00h success, 01h failed.
     let al = regs.rax as u8;
     let done = |regs: &mut Regs, ok: bool| {
         regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
     };
     match al {
-        0x00 => { vbe_controller_info(machine, regs); done(regs, true); }
-        0x01 => { let ok = vbe_mode_info(machine, regs); done(regs, ok); }
-        0x02 => { let ok = vbe_set_mode(machine, dos, regs); done(regs, ok); }
+        0x00 => {
+            let native_modes = matches!(dos.pc.vga, super::machine::vga::BiosVga::Bios(_))
+                .then(|| bios_display.as_deref().map(|workspace| workspace.modes()))
+                .flatten();
+            vbe_controller_info(machine, regs, native_modes);
+            done(regs, true);
+        }
+        0x01 => {
+            let native_mode = if matches!(dos.pc.vga, super::machine::vga::BiosVga::Bios(_)) {
+                bios_display.as_deref().and_then(|workspace| workspace.mode(regs.rcx as u16 & 0x3FFF))
+            } else {
+                None
+            };
+            let ok = vbe_mode_info(machine, regs, native_mode);
+            done(regs, ok);
+        }
+        0x02 => {
+            let ok = vbe_set_mode(machine, bios_display.as_deref_mut(), dos, regs);
+            done(regs, ok);
+        }
         0x03 => {
-            let cur = VBE_MODES.iter()
-                .find(|&&(_, w, h, b)| w == dos.pc.vga.svga_w && h == dos.pc.vga.svga_h && b == dos.pc.vga.svga_bpp)
-                .map(|&(n, ..)| n)
-                .unwrap_or(0);
+            // No emulated register file ⇒ this thread owns a real card, whose
+            // ROM answers VBE itself; report "no VBE mode set".
+            let cur = match &dos.pc.vga {
+                super::machine::vga::BiosVga::Emulated(dev) => VBE_MODES.iter()
+                    .find(|&&(_, w, h, b)| {
+                        w == dev.state.svga_w && h == dev.state.svga_h
+                            && b == dev.state.svga_bpp
+                    })
+                    .map_or(0, |&(n, ..)| n),
+                super::machine::vga::BiosVga::Bios(display) => display.vbe_mode().map_or(0, |mode| mode.number),
+            };
             regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
             done(regs, true);
         }
-        0x05 => { vbe_window(machine, dos, regs); done(regs, true); }
+        0x05 => {
+            let ok = vbe_window(machine, bios_display.as_deref_mut(), dos, regs);
+            done(regs, ok);
+        }
         0x08 => { vbe_dac_format(regs); done(regs, true); }
         0x09 => { let ok = vbe_palette(machine, dos, regs); done(regs, ok); }
         _ => done(regs, false),
@@ -1189,7 +1205,11 @@ fn es_di(regs: &Regs) -> usize {
 
 /// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
 /// block's reserved area and pointed at by VideoModePtr.
-fn vbe_controller_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn vbe_controller_info<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    native_modes: Option<&[crate::kernel::platform::VbeMode]>,
+) {
     let lin = es_di(regs);
     for i in (0..256).step_by(4) {
         machine.write::<u32>(lin + i, 0);
@@ -1204,33 +1224,63 @@ fn vbe_controller_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     machine.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
     machine.write::<u16>(lin + 0x12, 0x80); // total memory: 0x80 × 64 KB = 8 MB
     let mut p = lin + 0x20;
-    for &(num, ..) in VBE_MODES {
-        machine.write::<u16>(p, num);
-        p += 2;
+    if let Some(modes) = native_modes {
+        for mode in modes {
+            machine.write::<u16>(p, mode.number);
+            p += 2;
+        }
+    } else {
+        for &(num, ..) in VBE_MODES {
+            machine.write::<u16>(p, num);
+            p += 2;
+        }
     }
     machine.write::<u16>(p, 0xFFFF); // list terminator
 }
 
 /// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
-fn vbe_mode_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> bool {
+fn vbe_mode_info<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    native_mode: Option<crate::kernel::platform::VbeMode>,
+) -> bool {
     let want = regs.rcx as u16 & 0x1FF;
-    let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
+    let emulated = VBE_MODES.iter().find(|&&(n, ..)| n == want).copied();
+    let (w, h, bpp, pitch, physical_base, format, window_segment, granularity, window_size) = if let Some(mode) = native_mode {
+        let bpp = mode.bits_per_pixel;
+        (mode.width, mode.height, bpp, mode.pitch, mode.physical_base, mode.format,
+            mode.window_segment, mode.window_granularity_kb, mode.window_size_kb)
+    } else if let Some((_, w, h, bpp)) = emulated {
+        let format = if bpp == 8 {
+            crate::kernel::display::FormatSpec::Indexed8
+        } else {
+            let masks = match bpp {
+                15 => [5, 10, 5, 5, 5, 0],
+                16 => [5, 11, 6, 5, 5, 0],
+                _ => [8, 16, 8, 8, 8, 0],
+            };
+            crate::kernel::display::FormatSpec::Packed(
+                crate::kernel::display::PixelFormat::from_rgb(bpp.div_ceil(8), masks).unwrap()
+            )
+        };
+        (w, h, bpp, w * u16::from(bpp.div_ceil(8)), super::machine::vga::svga_lfb_base(),
+            format, 0xA000, 64, 64)
+    } else {
         return false;
     };
     let lin = es_di(regs);
     for i in (0..256).step_by(4) {
         machine.write::<u32>(lin + i, 0);
     }
-    let bpp8 = (bpp as u16).div_ceil(8);
-    let direct = bpp >= 15;
+    let direct = matches!(format, crate::kernel::display::FormatSpec::Packed(_));
     // ModeAttributes: supported|reserved|colour|graphics, banked + LFB (bit7).
     machine.write::<u16>(lin, 0x009B);
     machine.write::<u8>(lin + 0x02, 0x07); // win A: relocatable|readable|writable
     machine.write::<u8>(lin + 0x03, 0x00); // win B: not present
-    machine.write::<u16>(lin + 0x04, 64); // granularity (KB)
-    machine.write::<u16>(lin + 0x06, 64); // window size (KB)
-    machine.write::<u16>(lin + 0x08, 0xA000); // win A segment
-    machine.write::<u16>(lin + 0x10, w * bpp8); // bytes per scanline
+    machine.write::<u16>(lin + 0x04, granularity); // granularity (KB)
+    machine.write::<u16>(lin + 0x06, window_size); // window size (KB)
+    machine.write::<u16>(lin + 0x08, window_segment); // win A segment
+    machine.write::<u16>(lin + 0x10, pitch); // bytes per scanline
     machine.write::<u16>(lin + 0x12, w);
     machine.write::<u16>(lin + 0x14, h);
     machine.write::<u8>(lin + 0x16, 8); // char width
@@ -1255,13 +1305,22 @@ fn vbe_mode_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> bool {
     // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
     // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
     // mirrors the banked pitch since the framebuffer is contiguous.
-    machine.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
-    machine.write::<u16>(lin + 0x32, w * bpp8);
+    machine.write::<u32>(lin + 0x28, physical_base);
+    machine.write::<u16>(lin + 0x32, pitch);
     true
 }
 
 /// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
-fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) -> bool {
+fn vbe_set_mode<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) -> bool {
+    if let super::machine::vga::BiosVga::Bios(display) = &mut dos.pc.as_mut().vga {
+        let Some(workspace) = bios_display else { return false };
+        return workspace.bios_set_mode_request(machine, display, regs.rbx as u16).is_ok();
+    }
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
         return false;
@@ -1271,12 +1330,34 @@ fn vbe_set_mode<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, r
 }
 
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
-fn vbe_window<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
+fn vbe_window<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) -> bool {
+    if let super::machine::vga::BiosVga::Bios(display) = &mut dos.pc.as_mut().vga {
+        if (regs.rbx >> 8) as u8 == 0 {
+            let Some(workspace) = bios_display else { return false };
+            return workspace.bios_set_bank(machine, display, regs.rdx as u16).is_ok();
+        }
+        let bank = match display {
+            crate::kernel::platform::BiosDisplay::Vesa { bank: Some(bank), .. } => bank.current,
+            _ => 0,
+        };
+        regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
+        return true;
+    }
     if (regs.rbx >> 8) as u8 == 0 {
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
-        regs.rdx = (regs.rdx & !0xFFFF) | dos.pc.vga.svga_bank as u64;
+        let bank = match &dos.pc.vga {
+            super::machine::vga::BiosVga::Emulated(dev) => dev.state.svga_bank,
+            super::machine::vga::BiosVga::Bios(_) => 0,
+        };
+        regs.rdx = (regs.rdx & !0xFFFF) | bank as u64;
     }
+    true
 }
 
 // ============================================================================

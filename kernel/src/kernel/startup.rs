@@ -202,7 +202,16 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     init_device_policy(machine, platform);
     init_console_pipe();
 
-    run(machine, boot, &master_env, &mut threads, screen)
+    // Preserve one kernel-owned pristine real-mode environment. DOS worlds
+    // are cloned from it; later kernel INT 10h calls use the same unmodified
+    // IVT/BDA/ROM view rather than whichever guest happens to be stopped.
+    let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
+    let mut dos_template = crate::kernel::dos::DosTemplate::new(machine);
+    let vbe_mode = screen.bios_display()
+        .and_then(|native| bios_workspace.discover_vbe(machine, native));
+    crate::kernel::platform::set_vbe_mode(vbe_mode);
+
+    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen)
 }
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
@@ -354,9 +363,9 @@ fn mount_kernel_log_fs() {
 }
 
 /// Device policy, derived from the platform probe — not re-probed here.
-/// Port permissions are NOT set here: `io_policy::apply` rebuilds the I/O
-/// bitmap per thread on every swap-in (the VGA window follows console
-/// focus; Linux threads get nothing).
+/// Port permissions are NOT set here: the CPU-loan boundary rebuilds the
+/// I/O bitmap from the running thread's capabilities before every guest
+/// entry (Linux threads get nothing).
 fn init_device_policy<A: crate::Arch>(
     machine: &mut A,
     _platform: &'static crate::kernel::platform::Platform,
@@ -459,6 +468,8 @@ fn run<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
     master_env: &[u8],
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
     mut screen: crate::kernel::platform::VisibleScreen,
 ) -> ! {
@@ -490,7 +501,7 @@ fn run<A: crate::Arch>(
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
             screen = run_program_with_screen(
-                machine, threads, path, tail, cwd, master_env, boot.debug_watch,
+                machine, bios_workspace, dos_template, threads, path, tail, cwd, master_env, boot.debug_watch,
                 screen,
             );
         }
@@ -511,7 +522,7 @@ fn run<A: crate::Arch>(
     let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
     loop {
         screen = run_program_with_screen(
-            machine, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
+            machine, bios_workspace, dos_template, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
             screen,
         );
         crate::screenln!(screen, "DN exited, restarting...");
@@ -521,6 +532,8 @@ fn run<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 fn run_program_with_screen<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
     path: &[u8],
     cmdline_tail: &[u8],
@@ -531,7 +544,7 @@ fn run_program_with_screen<A: crate::Arch>(
 ) -> crate::kernel::platform::VisibleScreen {
     let (screen, display) = screen.suspend(machine);
     let display = run_program(
-        machine, threads, path, cmdline_tail, cwd, env, debug_watch, display,
+        machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch, display,
     );
     screen.resume(machine, display)
 }
@@ -543,6 +556,8 @@ fn run_program_with_screen<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 fn run_program<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
     path: &[u8],
     cmdline_tail: &[u8],
@@ -603,7 +618,7 @@ fn run_program<A: crate::Arch>(
     // which silently load_com'd an ELF and ran its header as VM86 garbage.)
     let tid = match exec::detect_format(&buf, path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
-        _ => dos::run_init_program(machine, threads, buf, args, cmdline_tail, cwd, env),
+        _ => dos::run_init_program(machine, dos_template, threads, buf, args, cmdline_tail, cwd, env),
     };
 
     // The initial program owns the console outright (nothing to repaint) and
@@ -612,13 +627,7 @@ fn run_program<A: crate::Arch>(
     {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
-        match &mut t.personality {
-            thread::Personality::Dos(dos) => dos.materialize(machine, display),
-            thread::Personality::Linux(_) => {
-                crate::kernel::linux::adopt_console_vga(display)
-            }
-        }
-        crate::kernel::io_policy::apply(machine, &t.personality, true);
+        t.personality.adopt_display(machine, display);
     }
 
     if let Some((addr0, addr1)) = debug_watch {
@@ -629,7 +638,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, threads, tid)
+    event_loop(machine, Some(bios_workspace), threads, tid)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -664,6 +673,7 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// moved together with execution by `switch_focus_and_run` for now).
 pub fn event_loop<A: crate::Arch>(
     machine: &mut A,
+    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
 ) -> crate::kernel::platform::DisplayToken {
@@ -706,6 +716,7 @@ pub fn event_loop<A: crate::Arch>(
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
+            bios_workspace.as_deref_mut(),
             &mut ctx.regs,
             &mut thread.kernel,
             &mut thread.personality,
@@ -721,7 +732,7 @@ pub fn event_loop<A: crate::Arch>(
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
-                    machine, threads, &mut ctx, next, &mut display_handoff,
+                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next, &mut display_handoff,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -730,19 +741,34 @@ pub fn event_loop<A: crate::Arch>(
 
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine);
-        let kevent = ctx.run(machine);
+        let kevent = ctx.run(machine, &thread.personality);
         stats.post_run(machine, &kevent, &ctx.regs);
-        let action = dispatch(machine, thread, &mut ctx.regs, kevent);
+        let action = dispatch(machine, bios_workspace.as_deref_mut(), thread, &mut ctx.regs, kevent);
         stats.after_dispatch(machine);
+
+        // The OSD, not the hidden personality, holds the display while open.
+        // Before an owner exits, return that capability so exit_thread can
+        // perform its ordinary single release into display_handoff.
+        if matches!(&action, thread::KernelAction::Exit(_))
+            && crate::kernel::osd::is_open()
+        {
+            crate::kernel::osd::dismiss();
+            crate::kernel::console::restore_from_monitor(
+                machine,
+                bios_workspace.as_deref_mut(),
+                &mut ctx.regs,
+                &mut thread.personality,
+            );
+        }
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
-            machine, threads, &mut ctx.regs, ctx.tid, action, &mut display_handoff,
+            machine, bios_workspace.as_deref_mut(), threads, &mut ctx.regs, ctx.tid, action, &mut display_handoff,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
-                    machine, threads, &mut ctx, next, &mut display_handoff,
+                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next, &mut display_handoff,
                 );
             }
             crate::kernel::sched::Verdict::AllDead => {
@@ -761,6 +787,7 @@ pub fn event_loop<A: crate::Arch>(
 /// everything else is the personality's call.
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     thread: &mut thread::Thread<A>,
     regs: &mut Regs,
     kevent: crate::KernelEvent,
@@ -788,7 +815,7 @@ fn dispatch<A: crate::Arch>(
         thread::signal_thread(thread, addr as usize);
         return thread::KernelAction::Exit(-11);
     }
-    thread.personality.handle_event(machine, &mut thread.kernel, regs, kevent)
+    thread.personality.handle_event(machine, bios_display, &mut thread.kernel, regs, kevent)
 }
 
 /// Switch console focus and execution together — today's coupling, in one
@@ -803,6 +830,7 @@ fn dispatch<A: crate::Arch>(
 /// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
 fn switch_focus_and_run<A: crate::Arch>(
     machine: &mut A,
+    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
@@ -815,19 +843,14 @@ fn switch_focus_and_run<A: crate::Arch>(
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         if old.kernel.state != thread::ThreadState::Zombie {
             assert!(display_handoff.is_none(), "stale VGA display handoff");
-            crate::kernel::focus::release(machine, &mut old.personality)
+            crate::kernel::focus::release(machine, bios_workspace.as_deref_mut(), &mut old.personality)
         } else {
             display_handoff.take().expect("zombie lost display handoff")
         }
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    crate::kernel::focus::acquire(machine, new_tid, &mut new.personality, display);
-    // switch_to derived the I/O bitmap before focus moved (it must — a bare
-    // execution switch is valid without any focus change); now that this
-    // thread holds focus, re-derive so the focused-only windows (VGA on a
-    // real card) open. Cheap: a deny-all reset + a few range enables.
-    crate::kernel::io_policy::apply(machine, &new.personality, true);
+    crate::kernel::focus::acquire(machine, bios_workspace, new_tid, &mut new.personality, display);
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -904,26 +927,25 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
         machine.free_page_count());
 
-    // COW-fork parent address space for child
-    let mut child_root = A::PageTable::default();
-    machine.user_fork(&mut child_root);
+    // Reserve the child and COW-fork directly into its owned page-table slot.
+    let child_tid = {
+        let child = match thread::create_thread_for_fork(threads, machine, parent_tid) {
+            Some(t) => t,
+            None => { on_error(vcpu, 8); return None; }
+        };
+        let child_tid = child.kernel.tid as usize;
 
-    let child = match thread::create_thread(threads, machine, Some(parent_tid), child_root, true) {
-        Some(t) => t,
-        None => { on_error(vcpu, 8); return None; }
+        // Temporarily make the child's address space the active one so ELF load /
+        // DOS setup operate on it (guest memory is the active space). The parent's
+        // space is held aside and restored below. Unlike the old vcpu-swap, this
+        // moves ONLY the space — the parent's live registers (`vcpu`) are never
+        // touched, so no save/restore of them is needed.
+        child.kernel.vcpu.space = machine.activate(
+            core::mem::take(&mut child.kernel.vcpu.space),
+            core::ptr::null_mut(), core::ptr::null_mut(),
+        );
+        child_tid
     };
-    let child_tid = child.kernel.tid as usize;
-
-    // Temporarily make the child's address space the active one so ELF load /
-    // DOS setup operate on it (guest memory is the active space). The parent's
-    // space is held aside and restored below. Unlike the old vcpu-swap, this
-    // moves ONLY the space — the parent's live registers (`vcpu`) are never
-    // touched, so no save/restore of them is needed.
-    let parent_space = machine.activate(
-        core::mem::take(&mut child.kernel.vcpu.space),
-        core::ptr::null_mut(),
-        core::ptr::null_mut(),
-    );
 
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(format, exec::BinaryFormat::Elf) {
@@ -937,9 +959,15 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
     if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl).is_err() {
         // Restore the parent's space and tear the half-built child down.
-        let _ = machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
+        {
+            let child = thread::get_thread(threads, child_tid).unwrap();
+            child.kernel.vcpu.space = machine.activate(
+                core::mem::take(&mut child.kernel.vcpu.space),
+                core::ptr::null_mut(), core::ptr::null_mut(),
+            );
+        }
         let mut child_handoff = None;
-        thread::exit_thread(threads, machine, child_tid, 1, &mut child_handoff);
+        thread::exit_thread(threads, machine, None, child_tid, 1, &mut child_handoff);
         assert!(child_handoff.is_none(), "unfocused child owned physical VGA");
         on_error(vcpu, 11);
         return None;
@@ -948,8 +976,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let child = thread::get_thread(threads, child_tid).unwrap();
     // Restore the parent's address space; the displaced child space re-parks in
     // its slot (init_thread already set the child's entry registers there).
-    let child_space = machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
-    child.kernel.vcpu.space = child_space;
+    child.kernel.vcpu.space = machine.activate(
+        core::mem::take(&mut child.kernel.vcpu.space),
+        core::ptr::null_mut(), core::ptr::null_mut(),
+    );
 
     match &mut child.personality {
         thread::Personality::Linux(lin) => {
@@ -999,8 +1029,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // empty planes, so the hardware shows whatever the previous
             // restore put up — the child draws on top.
             if parent_is_dos && crate::kernel::dos::physical_vga_present() {
-                let dos_state = child.dos_mut();
-                dos_state.pc.vga.snapshot_hardware_into_emulated(machine);
+                let vga = &mut child.dos_mut().pc.vga;
+                *vga = core::mem::take(vga).snapshot_hardware(machine);
             }
             machine.outb(0x3D4, 0x0E);
             let cursor_hi = machine.inb(0x3D5) as u16;
