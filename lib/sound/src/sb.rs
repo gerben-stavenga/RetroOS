@@ -686,12 +686,33 @@ impl Sb {
         raise
     }
 
-    /// Single-cycle: one pass and stop (no loop). The 8237 side hit terminal
-    /// count, so the current count underflows to 0xFFFF and the status TC bit
-    /// latches until read; the stream stays held open through the hangover.
+    /// Single-cycle: one pass and stop (no loop). The stream stays held open
+    /// through the hangover.
+    ///
+    /// Terminal count belongs to the 8237, NOT to us. The controller asserts
+    /// it when ITS programmed count underflows — after `buf_frames` transfers
+    /// — and a DSP that stops earlier simply leaves the controller partway
+    /// down its count with no TC at all. The two lengths are set by separate
+    /// commands (the 8237's by port 0x03, ours by the length bytes of a
+    /// `0x14`-class command) and a guest is free to disagree with itself.
+    ///
+    /// We used to latch TC unconditionally here, which made this card the only
+    /// one in the world where the DSP finishing implies the controller
+    /// finishing. Demonstrated on 86Box: an 8237 armed for 256 bytes against a
+    /// DSP told to move one transfer steps the count 00FF -> 00FE and never
+    /// latches TC — while our card reported TC and a 0xFFFF count. A DOS
+    /// program that programs the two differently, whether deliberately or by
+    /// bug, saw a completion here that real hardware never gives it.
+    ///
+    /// When the two agree — which is the normal case, and what every real
+    /// driver does — `block_frames` is clamped to `buf_frames` in `begin`, so
+    /// the cursor lands exactly on the count and TC latches as before.
     fn finish_single(&mut self, now: u64) {
         self.playing = false;
         self.done_ms = now;
+        if self.cursor < self.buf_frames as u64 {
+            return; // DSP stopped short; the controller is still counting
+        }
         self.dma_tc = true;
         let chan = if self.bits == 16 { self.dma16 } else { self.dma8 };
         self.tc_status |= 1 << (chan & 7);
@@ -957,7 +978,40 @@ pub fn new_boxed() -> Box<Sb> {
 
 #[cfg(test)]
 mod tests {
-    use super::Sb;
+    use super::{Sb, Start};
+
+    /// A DSP told to move fewer transfers than the 8237 was armed for must
+    /// NOT produce a terminal count: the controller is still counting, and on
+    /// real silicon its TC bit never latches. Regression test for a card that
+    /// declared TC whenever its own block finished, which made the emulated SB
+    /// the only one where the DSP finishing implies the controller finishing.
+    /// Found on 86Box (8237 armed for 256 bytes, DSP told 1 -> count walked
+    /// 00FF -> 00FE, no TC) while our card reported TC and a 0xFFFF count.
+    #[test]
+    fn dsp_stopping_short_of_the_dma_count_raises_no_terminal_count() {
+        let short = {
+            let mut sb = Sb::new();
+            // 8237 armed for 256 bytes; DSP command carries length-1 = 0.
+            sb.begin(Start { bits: 8, stereo: false, single: true,
+                             block_override: Some(0) }, 0x1000, 256, 0);
+            sb.cursor = sb.block_frames as u64; // the DSP's one transfer
+            sb.finish_single(1);
+            sb
+        };
+        assert!(!short.at_terminal_count(),
+                "DSP stopped at {} of {} transfers; the 8237 has not underflowed",
+                short.cursor, short.buf_frames);
+
+        // The agreeing case — every real driver — still latches TC.
+        let mut whole = Sb::new();
+        whole.begin(Start { bits: 8, stereo: false, single: true,
+                            block_override: Some(255) }, 0x1000, 256, 0);
+        whole.cursor = whole.block_frames as u64;
+        whole.finish_single(1);
+        assert!(whole.at_terminal_count(), "a full-length transfer must reach TC");
+        assert_eq!(whole.take_tc_status(false) & 0x02, 0x02,
+                   "and latch the status bit for its channel");
+    }
 
     #[test]
     fn programmed_output_rate_is_limited_to_sb16_speed() {
