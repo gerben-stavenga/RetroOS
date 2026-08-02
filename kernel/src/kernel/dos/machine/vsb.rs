@@ -245,11 +245,6 @@ impl SoundBlaster {
         real_8237_count(machine, n.dma8)
     }
 
-    /// Whether the SB is serviced by the software emulation (no real card).
-    pub fn is_emulated(&self) -> bool {
-        self.emulated()
-    }
-
     /// Whether virtual DMA channel `ch` is armed on the real chip.
     pub fn dma_ch_armed(&self, dma: &Dma8237, ch: usize) -> bool {
         ch < 8 && dma.ch[ch].armed
