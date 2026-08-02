@@ -93,17 +93,30 @@ edge_seen:
         ; ---- phase 3: TC status bit + count underflow on completion ----
         mov ax, 255            ; short block (256 bytes, ~23 ms at 11 kHz)
         call startblk
-        mov bx, 0x1000         ; bounded poll: outer x inner
-.tcouter:
-        mov cx, 0x0100
+        ; Bound the poll in TIME, not iterations. Port 0x08 is trapped by the
+        ; kernel (the 8237 windows are never granted to a guest, because the
+        ; addresses it programs are COW-relocated), so every read here is a VM
+        ; exit. The old 0x1000 x 0x100 iteration bound is ~1M exits: on a slow
+        ; backend that outlives any sane test timeout, so a card that never
+        ; raises TC was indistinguishable from a probe still running. Five BIOS
+        ; ticks is ~275 ms — an order of magnitude past the 23 ms the block
+        ; needs — and reports FAIL-TC while anyone is still watching.
+        push es
+        xor ax, ax
+        mov es, ax
+        mov ax, [es:0x46C]
+        mov bx, ax             ; t0
 .tcin:  in  al, 0x08           ; DMA1 status; reading clears the TC bits
         test al, 0x02          ; ch1 TC
-        jnz tc_seen
-        loop .tcin
-        dec bx
-        jnz .tcouter
+        jnz .tc_hit
+        mov ax, [es:0x46C]
+        sub ax, bx
+        cmp ax, 5
+        jb  .tcin
+        pop es
         jmp fail_tc
-tc_seen:
+.tc_hit:
+        pop es
         ; current count must now read the post-TC underflow value 0xFFFF
         xor al, al
         out 0x0C, al           ; clear byte-pointer flip-flop

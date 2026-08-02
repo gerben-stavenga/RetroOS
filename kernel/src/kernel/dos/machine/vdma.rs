@@ -177,9 +177,11 @@ impl Dma8237 {
                 *ff = !*ff;
                 byte
             }
-            // Status. The EMULATED card answers this itself (its own TC
-            // latch, see `Sb::take_tc_status`) and never reaches here;
-            // passthrough leaves it to the real chip's shadow.
+            // Status. Neither card reaches here: the emulated one answers
+            // from its own TC latch (`Sb::take_tc_status`) and the passthrough
+            // one from the real controller (`PassthroughSb::tc_status`), both
+            // intercepted in `SoundBlaster::dma_read`. A channel nobody owns
+            // has no terminal count to report.
             0x08 => 0x00,
             _ => 0xFF,
         }

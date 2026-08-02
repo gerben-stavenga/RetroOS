@@ -368,6 +368,8 @@ impl SoundBlaster {
             return match device {
                 SbDevice::Emulated(emu) if port == 0x08 || port == 0xD0 =>
                     emu.core.take_tc_status(port == 0xD0),
+                SbDevice::Native(pt) if port == 0x08 || port == 0xD0 =>
+                    pt.tc_status(machine, port == 0xD0),
                 _ => dma.io_read(machine, port),
             };
         };
@@ -559,6 +561,27 @@ impl PassthroughSb {
             return;
         }
         machine.outb(self.host_port(b, p), val);
+    }
+
+    /// The 8237 status register, for a guest waiting on terminal count.
+    ///
+    /// Forwarded verbatim. Passthrough means the real chip answers: the guest
+    /// programmed a transfer that the real controller is running, so the TC
+    /// and request bits it latched ARE the answer, and reading clears them on
+    /// both sides at once — which is the semantics the guest expects anyway.
+    ///
+    /// Deliberately no translation. The card is restrapped to BLASTER's own
+    /// channels at boot (`sb16::restrap`), so the guest's channel numbering
+    /// and the card's are the same numbering; re-mapping bits between them
+    /// would be inventing a difference that isn't there. Only the ADDRESS
+    /// registers need our intervention, because the guest's buffer is
+    /// COW-relocated and the real chip must be pointed at the alias.
+    ///
+    /// The virtual controller used to answer a hardcoded 0 here — a value
+    /// that never arrives. A driver waiting on TC rather than the completion
+    /// IRQ spins forever; SBTEST does exactly that.
+    fn tc_status<A: crate::Arch>(&mut self, machine: &mut A, hi: bool) -> u8 {
+        machine.inb(if hi { 0xD0 } else { 0x08 })
     }
 
     /// Serve the armed SB channel's live addr/count from the real 8237;
