@@ -18,15 +18,19 @@
 //!    where the card reads). No library card exists; this is the kernel
 //!    driving real hardware and cannot be anything else.
 //!
-//!    Note what does NOT drive that: the DSP window. `maybe_remap` runs off
-//!    the guest's 8237 port writes, and the SB is never told an address, so
-//!    passthrough could in principle grant the DSP ports outright. It stays
-//!    trapped for three things it buys instead: the write-status busy
-//!    flicker real chips pulse and QEMU's sb16 does not (Prince of Persia
-//!    spins on it), the E4h/E8h test-register answer, and — since every
-//!    access already traps — translating a guest window onto a card
-//!    strapped at a different base (`host_port`). DSP traffic is commands,
-//!    not sample data, so the exits are rare.
+//!    Note what does NOT trap: the DSP window. `maybe_remap` runs off the
+//!    guest's 8237 port writes, and the SB is never told an address, so the
+//!    DSP ports are granted outright and cost no exits. Only the mixer strap
+//!    pair stays supervised, because there the card's own truth is the wrong
+//!    answer for this guest (see `trap_mask`) — and the whole window when the
+//!    card sits at a base BLASTER did not declare, which needs translation.
+//!
+//!    Fidelity of the real card is the *backend's* job, not ours. QEMU's sb16
+//!    never pulses the write-status busy bit and does not surface the E4h/E8h
+//!    test register, and we used to synthesize both here; that made a
+//!    second-rate real card look first-rate and hid the emulated path. 86Box
+//!    is the reference for a real SB16 now, and QEMU runs the emulated card
+//!    over HDA/AC97.
 //!  - **Emulated** — no card answers (the hosted interpreter, or metal with no
 //!    SB16): the library card runs the DSP command FSM and the play cursor,
 //!    and this file supplies it with everything spatial and temporal — the
@@ -183,28 +187,9 @@ pub struct PassthroughSb {
     /// The card. Passthrough is total in this variant — there is no "maybe a
     /// card" state to guard, because the variant is the guarantee.
     pub card: NativeSb,
-    dsp_test_reg: u8,
     /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
     /// can answer the wiring registers from the guest's own numbers.
     mixer_idx: u8,
-    dsp_read_data: Option<u8>,
-    dsp_expect_test_write: bool,
-    /// Parameter bytes still expected for the in-progress passthrough DSP
-    /// command. While non-zero, a write to the command port is a parameter
-    /// (length, time constant, …), not a new opcode — so it's never decoded
-    /// as one (a length byte can equal any command code). Backs the busy-bit
-    /// synthesis.
-    dsp_param_bytes: u8,
-    /// A *single-cycle* DSP DMA transfer is in flight on the passthrough card
-    /// (a `0x14`/`0x16`/ADPCM start command was issued, or a `0xD4` continue).
-    /// Set positively by those commands and cleared by `0xD0` (pause), DSP
-    /// reset, exec/exit, or an 8237 (re)arm — so a stale/paused/reset transfer
-    /// never reads busy. Backs the synthesized write-status busy flicker (see
-    /// `sb_read`); a completed block also drops it via the live 8237 count.
-    dsp_dma_active: bool,
-    /// Read counter behind the passthrough write-status busy flicker: bit 3
-    /// alternates the busy bit every 8 reads mid-transfer.
-    dsp_write_busy: u8,
     /// Current alias binding. `bound_chan == 0xFF` ⇒ none. While bound,
     /// the guest's `bound_vpage..+bound_pages` linear pages alias DMA
     /// channel `bound_host`'s permanent buffer; `bound_gpa`/`bound_len`
@@ -269,8 +254,7 @@ impl PassthroughSb {
     fn new(card: NativeSb) -> Self {
         Self {
             card,
-            dsp_test_reg: 0, mixer_idx: 0, dsp_read_data: None, dsp_expect_test_write: false,
-            dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
+            mixer_idx: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
@@ -335,11 +319,11 @@ impl SoundBlaster {
     }
 
     /// Read an SB DSP/mixer/OPL port.
-    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
+    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, p: u16) -> u8 {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => emu.core.port_read(p),
-            SbDevice::Native(pt) => pt.read(machine, dma, blaster, p),
+            SbDevice::Native(pt) => pt.read(machine, blaster, p),
         }
     }
 
@@ -348,7 +332,7 @@ impl SoundBlaster {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => emu.write(machine, dma, blaster, p, val),
-            SbDevice::Native(pt) => pt.write(machine, dma, blaster, p, val),
+            SbDevice::Native(pt) => pt.write(machine, blaster, p, val),
         }
     }
 
@@ -465,39 +449,35 @@ impl SoundBlaster {
 // ── The real card's machine side ────────────────────────────────────────────
 
 impl PassthroughSb {
-    /// Ports inside the DSP window that MUST trap, as a mask of offsets
-    /// from `io_base`. Everything else can be granted to the guest outright
-    /// (the IOPB is per-port), so DSP traffic on a correctly-declared card
-    /// costs no exits at all. Only a real card has this question: there is
-    /// nothing to grant a guest whose card is a software model.
+    /// Ports inside the DSP window that MUST trap, as a mask of offsets from
+    /// `io_base`. Everything else is granted to the guest outright (the IOPB
+    /// is per-port), so DSP traffic on a correctly-declared card costs no
+    /// exits at all.
     ///
-    /// What traps and why:
+    /// Exactly two things trap, and only one of them is about this card:
     ///
     ///  * the whole window when the card is strapped somewhere other than
     ///    BLASTER's base — every access needs `host_port` translation.
     ///  * mixer index+data (0x04/0x05): ALWAYS. Registers 0x80/0x81 are the
-    ///    SB16's soft-straps — the kernel owns the physical wiring (its IRQ
-    ///    arming and DMA remap are derived from it), so a guest write there
-    ///    must never reach silicon (`write` drops it) and a read reports
-    ///    the guest's labels, not physical facts (`read`). On the era's
-    ///    bare metal a game COULD restrap the card; under a kernel that
-    ///    relays the line, that same write silently kills every completion.
-    ///    Mixer traffic is volume knobs — cold path, the trap costs nothing.
-    ///  * DSP data/status (0x0A/0x0C/0x0E) under QEMU only, where the
-    ///    E4h/E8h test register and the write-status busy flicker must be
-    ///    synthesized because QEMU's sb16 lacks what real silicon has.
+    ///    SB16's soft-straps, and here the card tells the TRUTH while the
+    ///    truth is wrong for this guest — it was told other numbers by
+    ///    BLASTER, and the machine translates (the vPIC relays the card's
+    ///    line onto the guest's, the virtual 8237 remaps its channels). A
+    ///    guest that believed the straps would hook a line we never raise, so
+    ///    a write there must not reach silicon (`write` drops it) and a read
+    ///    reports the guest's own labels (`read`). Mixer traffic is volume
+    ///    knobs — cold path, the trap costs nothing.
     ///
-    /// So on a correctly-declared card the hot DSP ports trap nothing —
-    /// only the mixer pair stays supervised, to guard the straps.
+    /// Nothing else is synthesized. Compensating for a *host emulator's*
+    /// imperfect card (QEMU's sb16 never pulses the write-status busy bit and
+    /// does not surface the E4h/E8h test register) used to live here too;
+    /// that is 86Box's job now, and QEMU runs the emulated SB over HDA/AC97,
+    /// which exercises the software path instead of a second-rate real one.
     pub fn trap_mask(&self, b: &Blaster) -> u16 {
         if self.card.base != b.io_base {
             return 0xFFFF;
         }
-        let mut m = (1 << 0x04) | (1 << 0x05);
-        if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
-            m |= (1 << 0x0A) | (1 << 0x0C) | (1 << 0x0E);
-        }
-        m
+        (1 << 0x04) | (1 << 0x05)
     }
 
     /// The physical port for a guest port in the DSP window. BLASTER is the
@@ -539,24 +519,17 @@ impl PassthroughSb {
         if let Some(d16) = self.card.dma16 { mask_real_8237(machine, d16); }
         self.suspended = false;
         self.last_gen = [0; 8];
-        self.dsp_param_bytes = 0;
-        self.dsp_dma_active = false;
-        self.dsp_expect_test_write = false;
     }
 
-    /// Read a DSP/mixer/OPL port off the real card, with a tiny compatibility
-    /// shim for DSP command E4h/E8h (test register write/read). Some older
-    /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
-    /// sb16 does not appear to surface that response through passthrough.
-    fn read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16) -> u8 {
+    /// Read a DSP/mixer/OPL port off the real card. Only the mixer's strap
+    /// registers are answered locally — see `trap_mask`; everything else the
+    /// card reports is the card's own truth and passes straight through.
+    fn read<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster, p: u16) -> u8 {
         if p == b.io_base + 0x05 {
-            // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the
-            // card is strapped to — physical facts the guest must NOT see
-            // in passthrough: it was told its own numbers by BLASTER, and
-            // the machine translates (the vPIC relays the card's line onto
-            // the guest's, the virtual 8237 remaps its channels). A guest
-            // believing the straps would hook a line we never raise. Every
-            // other mixer register is real state and passes through.
+            // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the card
+            // is strapped to — physical facts the guest must NOT see: it was
+            // told its own numbers by BLASTER and the machine translates.
+            // Every other mixer register is real state and passes through.
             match self.mixer_idx {
                 0x80 => return match b.irq {
                     2 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x02,
@@ -569,119 +542,20 @@ impl PassthroughSb {
                 _ => {}
             }
         }
-        if p == b.io_base + 0x0A {
-            if let Some(v) = self.dsp_read_data.take() {
-                return v;
-            }
-        } else if p == b.io_base + 0x0E && self.dsp_read_data.is_some() {
-            return 0x80;
-        } else if p == b.io_base + 0x0C {
-            // DSP write-buffer status. Bit 7 = 1 means the DSP can't yet
-            // accept a command byte. QEMU's sb16 always reports ready (0),
-            // but on the real chip the bit FLICKERS while a *single-cycle*
-            // DMA transfer is in flight — it's a per-byte buffer status,
-            // pulsing as the DSP services DMA between command bytes (which
-            // is why 0xD0/pause can be sent mid-transfer at all). Synthesize
-            // that flicker (alternate every 8 reads, DOSBox's proven model)
-            // so a driver polling for busy, or for the busy→idle edge, sees
-            // it within a few reads.
-            //
-            // Reproducer: Prince of Persia's per-frame "stop digitized sound"
-            // routine (PRINCE.EXE file off 0x19E6F: wait-until-busy,
-            // wait-until-idle, then DSP 0xD0/pause). On QEMU's always-ready
-            // status the first wait spun forever — the end-door sound
-            // repeated and the game hung. Holding busy for the whole block
-            // (this shim's first iteration) stalled that routine a full
-            // sample per game frame instead — 1 fps and staccato audio.
-            //
-            // Auto-init transfers (8237 mode bit 4 set) are left alone: real
-            // hardware keeps accepting commands between auto-init blocks, and
-            // our auto-init clients (Quake, Dune2, ROTT) must not stall here.
-            let v = machine.inb(self.host_port(b, p));
-            if self.dsp_single_cycle_busy(machine, dma, b) {
-                self.dsp_write_busy = self.dsp_write_busy.wrapping_add(1);
-                if self.dsp_write_busy & 8 != 0 {
-                    return v | 0x80;
-                }
-            }
-            return v;
-        }
         machine.inb(self.host_port(b, p))
     }
 
-    /// True while a single-cycle DSP DMA transfer is genuinely mid-block: a
-    /// start/continue command is active *and* the real 8237's live current-
-    /// count hasn't yet underflowed to the terminal 0xFFFF. Gates the DSP
-    /// write-status busy flicker in `read`. The `dsp_dma_active` flag is
-    /// checked first, so an idle/paused/completed channel costs no port I/O.
-    /// 16-bit single-cycle isn't modelled (no client polls for it); the
-    /// 8-bit/ADPCM host channel is the only one a `0x14`-class command drives.
-    /// The 8237 single-cycle mode check (bit 4 clear) keeps auto-init clients
-    /// (Quake, Dune2, ROTT) unconditionally exempt — their busy bit stays 0
-    /// even across a pause/continue — so their command polls never throttle.
-    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster) -> bool {
-        self.dsp_dma_active
-            && dma.ch[b.dma8 as usize].prog.mode & 0x10 == 0
-            && real_8237_count(machine, self.card.dma8) != 0xFFFF
-    }
-
-    /// Write a DSP/mixer/OPL port through to the real card. DSP E4h/E8h are
-    /// handled locally; all other traffic continues to the silicon.
-    ///
-    /// On the DSP command port we also run a minimal opcode/parameter tracker
-    /// — enough to keep the synthesized write-status busy bit (see `read`)
-    /// honest across the start/pause/resume of a single-cycle transfer. It
-    /// never suppresses a write: every byte still reaches the card. A DSP
-    /// reset (write to base+0x06) clears the tracker.
-    fn write<A: crate::Arch>(&mut self, machine: &mut A, _dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
-        if p == b.io_base + 0x06 {
-            // DSP reset — drop any half-decoded command / transfer state.
-            self.dsp_param_bytes = 0;
-            self.dsp_dma_active = false;
-            self.dsp_expect_test_write = false;
-        } else if p == b.io_base + 0x0C {
-            if self.dsp_expect_test_write {
-                self.dsp_test_reg = val;
-                self.dsp_expect_test_write = false;
-                return;
-            }
-            // A parameter byte of the command in progress — forward it
-            // verbatim and never re-decode it as an opcode (a length/time-
-            // constant byte can equal any command code).
-            if self.dsp_param_bytes > 0 {
-                self.dsp_param_bytes -= 1;
-            } else {
-                // Command opcode. Track parameter length and the single-cycle
-                // transfer-active flag; only commands relevant to busy-bit
-                // accuracy and the local E4/E8 shim are special-cased — the
-                // rest forward with no parameter expectation (a wrong guess
-                // could only mis-set the single-cycle busy bit, which auto-
-                // init clients never consult).
-                match val {
-                    0xE4 => { self.dsp_expect_test_write = true; return; }
-                    0xE8 => { self.dsp_read_data = Some(self.dsp_test_reg); return; }
-                    // Single-cycle DMA output start (8-bit / ADPCM): two
-                    // length bytes follow, and the DSP is now mid-transfer.
-                    0x14 | 0x16 | 0x74..=0x77 => {
-                        self.dsp_param_bytes = 2;
-                        self.dsp_dma_active = true;
-                    }
-                    0xD4 => self.dsp_dma_active = true,  // continue 8-bit DMA
-                    0xD0 => self.dsp_dma_active = false, // pause 8-bit DMA
-                    0x10 | 0x40 | 0xE0 | 0xE2 => self.dsp_param_bytes = 1,
-                    0x48 | 0x80 => self.dsp_param_bytes = 2,
-                    _ => {}
-                }
-            }
-        }
+    /// Write a DSP/mixer/OPL port through to the real card. Only the mixer
+    /// strap pair is filtered (see `trap_mask`); every other byte reaches the
+    /// silicon verbatim, because the silicon is the card.
+    fn write<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster, p: u16, val: u8) {
         if p == b.io_base + 0x04 {
             self.mixer_idx = val;
         } else if p == b.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {
             // The guest may move ITS view of the wiring — the relay and the
             // remap follow BLASTER — but the physical straps stay where the
-            // kernel found them; nothing else on the machine knows they
-            // moved. This filter is why the mixer pair is always in
-            // `trap_mask`.
+            // kernel found them; nothing else on the machine knows they moved.
+            // This filter is why the mixer pair is always in `trap_mask`.
             return;
         }
         machine.outb(self.host_port(b, p), val);
@@ -787,12 +661,6 @@ impl PassthroughSb {
            gpa: u32, len: u32, mode: u8) {
         let bufpage = machine.dma_channel_buf(host);
         if bufpage == 0 { return; }              // no reserved buffer
-        // (Re)programming the 8237 only stages the next block; the DSP isn't
-        // transferring until it gets the matching `0x14`-class start command.
-        // Drop the busy flag here so the driver's "wait for DSP ready" poll
-        // before that start (PoP re-arms the chip *then* issues 0x14 each
-        // block) doesn't see a stale busy from the block just finished.
-        self.dsp_dma_active = false;
         // The buffer sits at `off` inside its channel's 64 KB / 128 KB
         // window; the channel buffer is window-aligned, so the same `off`
         // lands it correctly. An ISA transfer never crosses the boundary.

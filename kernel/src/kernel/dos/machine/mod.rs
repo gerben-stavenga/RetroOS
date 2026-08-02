@@ -622,7 +622,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
         p if pc.sb.owns(p) => {
-            pc.sb.sb_read(machine, &pc.dma, p)
+            pc.sb.sb_read(machine, p)
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_read(machine, p),
