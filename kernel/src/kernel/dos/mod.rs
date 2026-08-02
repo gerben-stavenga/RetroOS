@@ -59,6 +59,7 @@ mod mode_transitions;
 // Re-export so the Linux personality can hold its own console snapshot — DOS
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
+pub use machine::vsb::SbDevice;
 pub use machine::vga::{BiosVga, physical_vga_present, prepare_bios_osd, release_bios_osd};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from

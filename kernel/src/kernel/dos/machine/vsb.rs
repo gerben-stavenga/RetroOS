@@ -3,8 +3,13 @@
 //! The emulated chip itself is [`sound::sb::Sb`] — a passive state machine in
 //! `//lib:sound` (DSP + CT1745 mixer + the OPL on the same card) that owns no
 //! sample memory and reaches nothing. This file is the machine around it, and
-//! it has a second job the GUS never had: the SB runs in one of two modes,
-//! the boot-time `platform::Audio` verdict.
+//! it has a second job the GUS never had: the card is EITHER real silicon this
+//! guest holds OR that software model — never both, never neither. That XOR is
+//! [`SbDevice`], settled once in `configure_from_env` from the boot probe's
+//! verdict, and every question below is answered by matching it rather than by
+//! re-asking the platform. The two payloads carry disjoint state and disjoint
+//! methods, so "is there a card?" is never a question a caller can forget to
+//! ask: it cannot name the passthrough half without having matched it.
 //!
 //!  - **Passthrough** — a real card answers (QEMU `sb16`/`adlib` on metal): DSP
 //!    traffic forwards to it, and the guest's DMA buffer is aliased onto the
@@ -115,11 +120,18 @@ pub(super) const OUTPUT_GAIN_Q16: i32 = 65_536;
 /// One canonical 128-frame block at the SB16 maximum of 16-bit stereo.
 const DSP_SCRATCH_BYTES: usize = 128 * 4;
 
-/// Per-thread Sound Blaster card state: the BLASTER-declared channel/IRQ map,
-/// and either the passthrough remap binding or the emulated library card
-/// depending on `mode`. The generic virtual 8237 it observes is bus
-/// infrastructure shared with every DMA-using card, so it lives on
-/// `PcMachine` and is passed in per call.
+/// What the guest was TOLD its card is: the `BLASTER=` declaration. Every
+/// number a DOS program uses comes from here — the ports it pokes, the vPIC
+/// line it hooks, the virtual 8237 channels it programs — and none of them
+/// need have anything to do with where a physical card actually sits. Shared
+/// by both devices below, because it describes the guest, not the silicon.
+pub struct Blaster {
+    pub io_base: u16, // BLASTER A — DSP/mixer port base the guest decodes
+    pub irq: u8,      // BLASTER I — guest vPIC IRQ injected on SB completion
+    pub dma8: u8,     // BLASTER D — guest's 8-bit vDMA channel (0..3)
+    pub dma16: u8,    // BLASTER H — guest's 16-bit vDMA channel (5..7)
+}
+
 /// The unique physical Sound Blaster, as a capability. Neither `Copy` nor
 /// `Clone`: holding it IS the authority to drive the card, and it carries the
 /// wiring the holder needs to reach it. It lives in exactly one place —
@@ -143,16 +155,34 @@ pub struct NativeSb {
     pub dma16: Option<u8>,
 }
 
-pub struct SoundBlaster {
-    /// The emulated card (used only when emulating).
-    core: sound::sb::Sb,
-    pub io_base: u16, // BLASTER A — DSP/mixer port base (passthrough target)
-    pub irq: u8,      // BLASTER I — guest vPIC IRQ to inject on SB completion
-    pub dma8: u8,     // BLASTER D — guest's 8-bit vDMA channel (0..3)
-    pub dma16: u8,    // BLASTER H — guest's 16-bit vDMA channel (5..7)
-    /// The physical card, when this guest owns it. `None` ⇒ nothing to
-    /// passthrough, relay or remap: every such path is behind this.
-    pub native: Option<NativeSb>,
+/// This card is real silicon, XOR it is a software model — never both, and
+/// never neither. Which one it is decides what the whole machine side of the
+/// SB even *means*: there is no play cursor to interpolate on a real card
+/// (the 8237 has a live count), and no DMA alias to build for an emulated one
+/// (nothing pulls the bus). So the two sets of state and the two sets of
+/// methods live on the two payloads, and a caller reaches either only by
+/// matching — which is also what proves the other one is not there.
+pub enum SbDevice {
+    /// A physical card answers: the guest's DSP traffic is forwarded to it and
+    /// its DMA buffer aliased onto the real channel.
+    Native(PassthroughSb),
+    /// No card answers: `//lib:sound`'s passive card runs, and this file feeds
+    /// it the clock, the interrupt line, the guest ring and the pipe depth.
+    Emulated(EmulatedSb),
+}
+
+/// The machine side of a REAL card: the physical card itself plus everything
+/// needed to keep a guest's illusion over it — the DSP command tracker behind
+/// the synthesized busy bit, and the guest-buffer↔channel-buffer alias.
+///
+/// None of this is state a card *has*; it is state about *this guest's* use of
+/// one, which is why it sits here and not in `NativeSb`: handing the card on
+/// to the mixer's sink moves `card` out and leaves the binding behind to be
+/// torn down.
+pub struct PassthroughSb {
+    /// The card. Passthrough is total in this variant — there is no "maybe a
+    /// card" state to guard, because the variant is the guarantee.
+    pub card: NativeSb,
     dsp_test_reg: u8,
     /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
     /// can answer the wiring registers from the guest's own numbers.
@@ -193,6 +223,14 @@ pub struct SoundBlaster {
     /// generation (its per-block re-arm), not on mask/unmask — handles
     /// single-cycle drivers that re-arm without masking.
     last_gen: [u32; 8],
+}
+
+/// The machine side of the EMULATED card: `//lib:sound`'s passive chip plus
+/// the two things a passive chip cannot own — a between-pump position
+/// estimate, and somewhere to land the guest's ring bytes.
+pub struct EmulatedSb {
+    /// The library card: DSP register file + command FSM, CT1745 mixer, OPL.
+    core: sound::sb::Sb,
     /// Between-pump DMA-cursor estimator. The card's cursor advances only at
     /// pump boundaries, in whole-chunk jumps — a MOD player that polls the
     /// 8237 count to find the play position (Pinball Fantasies) sees it
@@ -216,38 +254,52 @@ pub struct SoundBlaster {
     dsp_scratch: [u8; DSP_SCRATCH_BYTES],
 }
 
-impl SoundBlaster {
-    /// Defaults: A220 I7 D1 H5 (guest sees SB IRQ 7; the host chip stays
-    /// on its real line and the IRQ relay maps host→guest, so the two are
-    /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
-    pub fn new() -> Self {
+/// The machine's Sound Blaster: what the guest was told, and the one device
+/// that answers for it.
+pub struct SoundBlaster {
+    /// What the guest believes. Read by both devices; owned by neither.
+    pub blaster: Blaster,
+    /// Real silicon or software model — see [`SbDevice`]. Public because the
+    /// mixer and the I/O policy legitimately need to know *which*, and the
+    /// match that tells them also hands them the right receiver.
+    pub device: SbDevice,
+}
+
+impl PassthroughSb {
+    fn new(card: NativeSb) -> Self {
         Self {
-            core: sound::sb::Sb::new(),
-            io_base: 0x220, irq: 7, dma8: 1, dma16: 5,
-            // Filled from the detected card in `configure_from_env`; there
-            // is no sane default, so an undetected card simply never
-            // remaps (and says so) rather than driving someone else's
-            // channels.
-            native: None,
+            card,
             dsp_test_reg: 0, mixer_idx: 0, dsp_read_data: None, dsp_expect_test_write: false,
             dsp_param_bytes: 0, dsp_dma_active: false, dsp_write_busy: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
             suspended: false, last_gen: [0; 8],
+        }
+    }
+}
+
+impl EmulatedSb {
+    fn new() -> Self {
+        Self {
+            core: sound::sb::Sb::new(),
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         }
     }
+}
 
-    /// Current QEMU i8257 count for the SB 8-bit host channel.
-    pub fn diag_host_count8<A: crate::Arch>(&self, machine: &mut A) -> u16 {
-        let Some(n) = self.native.as_ref() else { return 0xFFFF };
-        real_8237_count(machine, n.dma8)
-    }
-
-    /// Whether virtual DMA channel `ch` is armed on the real chip.
-    pub fn dma_ch_armed(&self, dma: &Dma8237, ch: usize) -> bool {
-        ch < 8 && dma.ch[ch].armed
+impl SoundBlaster {
+    /// Defaults: A220 I7 D1 H5 (guest sees SB IRQ 7; the host chip stays
+    /// on its real line and the IRQ relay maps host→guest, so the two are
+    /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
+    ///
+    /// Starts emulated: whether this thread gets the physical card is decided
+    /// in `configure_from_env`, from what the boot probe found.
+    pub fn new() -> Self {
+        Self {
+            blaster: Blaster { io_base: 0x220, irq: 7, dma8: 1, dma16: 5 },
+            device: SbDevice::Emulated(EmulatedSb::new()),
+        }
     }
 
     /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
@@ -260,44 +312,164 @@ impl SoundBlaster {
     /// to settle" timeout branch (526 `INT 21 AH=2C` calls in the hang
     /// trace). Idempotent.
     pub fn release_dma_pool<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
-        if self.emulated() {
-            // No real card / no buffer alias in emulation: just stop the
-            // card so the next program sees a clean, idle one. Parking the
-            // sink is ours — it is shared with every other source.
-            self.core.reset_for_exit();
-            crate::kernel::sound::stop(machine, true); // session end: power down
-            return;
+        let Self { blaster, device } = self;
+        match device {
+            SbDevice::Emulated(emu) => {
+                // No real card / no buffer alias in emulation: just stop the
+                // card so the next program sees a clean, idle one. Parking the
+                // sink is ours — it is shared with every other source.
+                emu.core.reset_for_exit();
+                crate::kernel::sound::stop(machine, true); // session end: power down
+            }
+            SbDevice::Native(pt) => pt.release(machine, blaster),
         }
-        self.unbind(machine);
-        // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
-        // this atomically; the hardware ~3 µs hold is irrelevant under
-        // emulation. Puts the DSP back in its post-power-on state so the
-        // next program's reset+probe behaves like the first one's.
-        let reset = self.host_port(self.io_base + 0x06);
-        machine.outb(reset, 1);
-        machine.outb(reset, 0);
-        // Stop any in-flight host DMA cold; the next bind reprograms and
-        // unmasks. These are the card's own 8-bit/16-bit lines.
-        if let Some(n) = self.native.as_ref() {
-            mask_real_8237(machine, n.dma8);
-            if let Some(d16) = n.dma16 { mask_real_8237(machine, d16); }
-        }
-        self.suspended = false;
-        self.last_gen = [0; 8];
-        self.dsp_param_bytes = 0;
-        self.dsp_dma_active = false;
-        self.dsp_expect_test_write = false;
     }
 
-    /// SB ports this card decodes — the dispatch guard for both modes: the
+    /// SB ports this card decodes — the dispatch guard for both devices: the
     /// DSP/mixer block `[io_base, io_base+0x10)` and the OPL2/3 FM window
-    /// 0x388-0x38B. In passthrough these go straight to the real card (QEMU
-    /// `sb16`/`adlib`); emulated, to the library card. Only the 8237 is
-    /// virtual in passthrough.
+    /// 0x388-0x38B. BLASTER's declaration, so it is the same question whether
+    /// the answer will come from silicon or from the library card.
+    pub fn owns(&self, p: u16) -> bool {
+        let b = &self.blaster;
+        (p >= b.io_base && p < b.io_base + 0x10) || matches!(p, 0x388..=0x38B)
+    }
+
+    /// Read an SB DSP/mixer/OPL port.
+    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
+        let Self { blaster, device } = self;
+        match device {
+            SbDevice::Emulated(emu) => emu.core.port_read(p),
+            SbDevice::Native(pt) => pt.read(machine, dma, blaster, p),
+        }
+    }
+
+    /// Write an SB DSP/mixer/OPL port.
+    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
+        let Self { blaster, device } = self;
+        match device {
+            SbDevice::Emulated(emu) => emu.write(machine, dma, blaster, p, val),
+            SbDevice::Native(pt) => pt.write(machine, dma, blaster, p, val),
+        }
+    }
+
+    /// DMA-port read. Two distinct sources of truth, never conflated:
+    ///
+    ///  - **armed SB channel, count register** → the live current-count of
+    ///    whichever chip is actually pacing the transfer: the real 8237 under
+    ///    passthrough, the card's own play cursor when emulated. Both
+    ///    decrement during playback and underflow to 0xFFFF at terminal count
+    ///    — exactly the real-hw semantics Dune2's `0x4D8` ISR expects.
+    ///  - **everything else** (not-yet-armed = programming snapshot,
+    ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
+    ///    the captured guest programming.
+    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237, port: u16) -> u8 {
+        let Self { blaster, device } = self;
+        // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
+        // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
+        // 4-byte stride per channel due to 16-bit alignment). Control
+        // registers (0x08..=0x0F status/mask/etc., 0xD0..=0xDF for DMA2)
+        // and page-register ports don't index into ch[] — route them to
+        // io_read for the captured/synthetic control state. Without the
+        // upper bound, port 0xD0 produced chan=8 and panicked on ch[8].
+        let (is_cnt, chan, hi_ctrl) = if port <= 0x07 {
+            (port & 1 == 1, (port >> 1) as usize, false)
+        } else if (0xC0..=0xCF).contains(&port) {
+            let r = (port - 0xC0) >> 1;
+            (r & 1 == 1, 4 + (r >> 1) as usize, true)
+        } else {
+            // Emulated card: the controller status register carries the TC
+            // bits the card latched (bits 0-3, one per channel); reading
+            // clears them — real-8237 semantics completion pollers rely on.
+            // Passthrough continues to the shadow/real chip.
+            return match device {
+                SbDevice::Emulated(emu) if port == 0x08 || port == 0xD0 =>
+                    emu.core.take_tc_status(port == 0xD0),
+                _ => dma.io_read(machine, port),
+            };
+        };
+        match device {
+            SbDevice::Emulated(emu) => emu.dma_read(machine, dma, blaster, is_cnt, chan, hi_ctrl),
+            SbDevice::Native(pt) => pt.dma_read(machine, dma, blaster, port, is_cnt, chan, hi_ctrl),
+        }
+    }
+
+    /// Called after every virtual-8237 write. Only a real card needs anything
+    /// here: emulated, the virtual-8237 `prog` is already captured (io_write)
+    /// and we read the guest ring for the card at playback — there is no chip
+    /// to program and no buffer to alias.
+    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
+        let Self { blaster, device } = self;
+        if let SbDevice::Native(pt) = device {
+            pt.maybe_remap(machine, regs, dma, blaster);
+        }
+    }
+
+    /// Task switched to the background. Emulated has nothing to detach — its
+    /// "DMA" is a read of guest memory that happens only while we run it.
+    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
+        if let SbDevice::Native(pt) = &mut self.device {
+            pt.suspend(machine);
+        }
+    }
+
+    /// Task switched back to the foreground: re-materialize the binding.
+    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
+        let Self { blaster, device } = self;
+        if let SbDevice::Native(pt) = device {
+            pt.resume(machine, regs, dma, blaster);
+        }
+    }
+
+    /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string, and settle
+    /// which device answers for it. Unknown or missing tokens leave the SB16
+    /// defaults. `env` is the raw DOS environment block (NUL-separated
+    /// `KEY=VAL`, double-NUL terminated).
+    ///
+    /// This is where the card is acquired: the boot probe's verdict plus a
+    /// readable strap is the whole condition. Anything less — no card, no
+    /// wiring to relay, or an owner who asked for the mixer — and the guest
+    /// gets the library card instead. There is no third state, so no
+    /// passthrough path anywhere below has to ask whether a card is there.
+    pub fn configure_from_env(&mut self, env: &[u8]) {
+        let plat = crate::kernel::platform::get();
+        self.device = match (plat.audio.sb_passthrough(), plat.sb_card, plat.sb_wiring) {
+            (true, Some(card), Some(w)) => SbDevice::Native(PassthroughSb::new(NativeSb {
+                base: card.base, irq: w.irq, dma8: w.dma8, dma16: w.dma16,
+            })),
+            _ => SbDevice::Emulated(EmulatedSb::new()),
+        };
+        if let Some(val) = env_var(env, b"BLASTER") {
+            for tok in val.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+                let (key, rest) = (tok[0].to_ascii_uppercase(), &tok[1..]);
+                let radix = if key == b'A' || key == b'P' { 16 } else { 10 };
+                let Some(n) = parse_uint(rest, radix) else { continue };
+                match key {
+                    b'A' => self.blaster.io_base = n as u16,
+                    b'I' => self.blaster.irq = n as u8,
+                    b'D' => self.blaster.dma8 = n as u8,
+                    b'H' => self.blaster.dma16 = n as u8,
+                    _ => {}
+                }
+            }
+        }
+        // The emulated card decodes against the base and reports the IRQ/DMA
+        // numbers back through its mixer configuration registers. A real card
+        // reports its own straps and the machine translates instead.
+        if let SbDevice::Emulated(emu) = &mut self.device {
+            let b = &self.blaster;
+            emu.core.set_wiring(b.io_base, b.irq, b.dma8, b.dma16);
+        }
+    }
+}
+
+// ── The real card's machine side ────────────────────────────────────────────
+
+impl PassthroughSb {
     /// Ports inside the DSP window that MUST trap, as a mask of offsets
     /// from `io_base`. Everything else can be granted to the guest outright
     /// (the IOPB is per-port), so DSP traffic on a correctly-declared card
-    /// costs no exits at all.
+    /// costs no exits at all. Only a real card has this question: there is
+    /// nothing to grant a guest whose card is a software model.
     ///
     /// What traps and why:
     ///
@@ -306,8 +478,8 @@ impl SoundBlaster {
     ///  * mixer index+data (0x04/0x05): ALWAYS. Registers 0x80/0x81 are the
     ///    SB16's soft-straps — the kernel owns the physical wiring (its IRQ
     ///    arming and DMA remap are derived from it), so a guest write there
-    ///    must never reach silicon (`sb_write` drops it) and a read reports
-    ///    the guest's labels, not physical facts (`sb_read`). On the era's
+    ///    must never reach silicon (`write` drops it) and a read reports
+    ///    the guest's labels, not physical facts (`read`). On the era's
     ///    bare metal a game COULD restrap the card; under a kernel that
     ///    relays the line, that same write silently kills every completion.
     ///    Mixer traffic is volume knobs — cold path, the trap costs nothing.
@@ -317,8 +489,8 @@ impl SoundBlaster {
     ///
     /// So on a correctly-declared card the hot DSP ports trap nothing —
     /// only the mixer pair stays supervised, to guard the straps.
-    pub fn trap_mask(&self) -> u16 {
-        if self.native.as_ref().is_some_and(|n| n.base != self.io_base) {
+    pub fn trap_mask(&self, b: &Blaster) -> u16 {
+        if self.card.base != b.io_base {
             return 0xFFFF;
         }
         let mut m = (1 << 0x04) | (1 << 0x05);
@@ -328,36 +500,56 @@ impl SoundBlaster {
         m
     }
 
-    pub fn is_passthrough(&self, p: u16) -> bool {
-        (p >= self.io_base && p < self.io_base + 0x10) || matches!(p, 0x388..=0x38B)
-    }
-
     /// The physical port for a guest port in the DSP window. BLASTER is the
     /// owner's declaration; the window traps on every access, so a card
     /// strapped somewhere else costs nothing to support — same traps, one
-    /// different addend. With no card the guest's own base is the target, in
-    /// which case there is nothing to translate to.
+    /// different addend.
     #[inline]
-    fn host_port(&self, p: u16) -> u16 {
-        let Some(base_host) = self.native.as_ref().map(|n| n.base) else { return p };
-        if base_host == self.io_base {
+    fn host_port(&self, b: &Blaster, p: u16) -> u16 {
+        if self.card.base == b.io_base {
             return p;
         }
-        match p.checked_sub(self.io_base) {
-            Some(off) if off < 0x10 => base_host + off,
+        match p.checked_sub(b.io_base) {
+            Some(off) if off < 0x10 => self.card.base + off,
             _ => p, // OPL and anything else is at a fixed address
         }
     }
 
-    /// Read an SB DSP/mixer/OPL passthrough port, with a tiny compatibility
+    /// Release the DMA binding and quiesce the card — exec/exit cleanup.
+    /// The per-channel buffers are permanent; this just detaches the guest
+    /// alias and clears the re-arm cursor so a reused device can't dangle.
+    /// Also resets the SB DSP and masks the host SB channels so the next
+    /// program sees a clean card — without this, OMF re-launch from a
+    /// launcher inherits OMF1's mid-playback DSP / armed-8237 state and
+    /// OMF2's sound-init probe falls into a "wait for the card to settle"
+    /// timeout branch (526 `INT 21 AH=2C` calls in the hang trace).
+    /// Idempotent.
+    fn release<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster) {
+        self.unbind(machine);
+        // SB DSP reset: write 1 then 0 to io_base+6. QEMU's sb16 processes
+        // this atomically; the hardware ~3 µs hold is irrelevant under
+        // emulation. Puts the DSP back in its post-power-on state so the
+        // next program's reset+probe behaves like the first one's.
+        let reset = self.host_port(b, b.io_base + 0x06);
+        machine.outb(reset, 1);
+        machine.outb(reset, 0);
+        // Stop any in-flight host DMA cold; the next bind reprograms and
+        // unmasks. These are the card's own 8-bit/16-bit lines.
+        mask_real_8237(machine, self.card.dma8);
+        if let Some(d16) = self.card.dma16 { mask_real_8237(machine, d16); }
+        self.suspended = false;
+        self.last_gen = [0; 8];
+        self.dsp_param_bytes = 0;
+        self.dsp_dma_active = false;
+        self.dsp_expect_test_write = false;
+    }
+
+    /// Read a DSP/mixer/OPL port off the real card, with a tiny compatibility
     /// shim for DSP command E4h/E8h (test register write/read). Some older
     /// games poll base+0Eh forever waiting for E8h to produce a byte; QEMU
     /// sb16 does not appear to surface that response through passthrough.
-    pub fn sb_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16) -> u8 {
-        if self.emulated() {
-            return self.core.port_read(p);
-        }
-        if p == self.io_base + 0x05 {
+    fn read<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16) -> u8 {
+        if p == b.io_base + 0x05 {
             // Mixer data. Registers 0x80/0x81 report the IRQ and DMA the
             // card is strapped to — physical facts the guest must NOT see
             // in passthrough: it was told its own numbers by BLASTER, and
@@ -366,24 +558,24 @@ impl SoundBlaster {
             // believing the straps would hook a line we never raise. Every
             // other mixer register is real state and passes through.
             match self.mixer_idx {
-                0x80 => return match self.irq {
+                0x80 => return match b.irq {
                     2 => 0x01, 5 => 0x02, 7 => 0x04, 10 => 0x08, _ => 0x02,
                 },
                 0x81 => {
-                    let lo = match self.dma8 { 0 => 0x01, 1 => 0x02, 3 => 0x08, _ => 0x02 };
-                    let hi = match self.dma16 { 5 => 0x20, 6 => 0x40, 7 => 0x80, _ => 0 };
+                    let lo = match b.dma8 { 0 => 0x01, 1 => 0x02, 3 => 0x08, _ => 0x02 };
+                    let hi = match b.dma16 { 5 => 0x20, 6 => 0x40, 7 => 0x80, _ => 0 };
                     return lo | hi;
                 }
                 _ => {}
             }
         }
-        if p == self.io_base + 0x0A {
+        if p == b.io_base + 0x0A {
             if let Some(v) = self.dsp_read_data.take() {
                 return v;
             }
-        } else if p == self.io_base + 0x0E && self.dsp_read_data.is_some() {
+        } else if p == b.io_base + 0x0E && self.dsp_read_data.is_some() {
             return 0x80;
-        } else if p == self.io_base + 0x0C {
+        } else if p == b.io_base + 0x0C {
             // DSP write-buffer status. Bit 7 = 1 means the DSP can't yet
             // accept a command byte. QEMU's sb16 always reports ready (0),
             // but on the real chip the bit FLICKERS while a *single-cycle*
@@ -405,8 +597,8 @@ impl SoundBlaster {
             // Auto-init transfers (8237 mode bit 4 set) are left alone: real
             // hardware keeps accepting commands between auto-init blocks, and
             // our auto-init clients (Quake, Dune2, ROTT) must not stall here.
-            let v = machine.inb(self.host_port(p));
-            if self.dsp_single_cycle_busy(machine, dma) {
+            let v = machine.inb(self.host_port(b, p));
+            if self.dsp_single_cycle_busy(machine, dma, b) {
                 self.dsp_write_busy = self.dsp_write_busy.wrapping_add(1);
                 if self.dsp_write_busy & 8 != 0 {
                     return v | 0x80;
@@ -414,44 +606,40 @@ impl SoundBlaster {
             }
             return v;
         }
-        machine.inb(self.host_port(p))
+        machine.inb(self.host_port(b, p))
     }
 
     /// True while a single-cycle DSP DMA transfer is genuinely mid-block: a
     /// start/continue command is active *and* the real 8237's live current-
     /// count hasn't yet underflowed to the terminal 0xFFFF. Gates the DSP
-    /// write-status busy flicker in `sb_read`. The `dsp_dma_active` flag is
+    /// write-status busy flicker in `read`. The `dsp_dma_active` flag is
     /// checked first, so an idle/paused/completed channel costs no port I/O.
     /// 16-bit single-cycle isn't modelled (no client polls for it); the
     /// 8-bit/ADPCM host channel is the only one a `0x14`-class command drives.
     /// The 8237 single-cycle mode check (bit 4 clear) keeps auto-init clients
     /// (Quake, Dune2, ROTT) unconditionally exempt — their busy bit stays 0
     /// even across a pause/continue — so their command polls never throttle.
-    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237) -> bool {
+    fn dsp_single_cycle_busy<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster) -> bool {
         self.dsp_dma_active
-            && dma.ch[self.dma8 as usize].prog.mode & 0x10 == 0
-            && self.native.as_ref().is_some_and(|n| real_8237_count(machine, n.dma8) != 0xFFFF)
+            && dma.ch[b.dma8 as usize].prog.mode & 0x10 == 0
+            && real_8237_count(machine, self.card.dma8) != 0xFFFF
     }
 
-    /// Write an SB DSP/mixer/OPL passthrough port. DSP E4h/E8h are handled
-    /// locally; all other traffic continues to the real QEMU sb16/adlib.
+    /// Write a DSP/mixer/OPL port through to the real card. DSP E4h/E8h are
+    /// handled locally; all other traffic continues to the silicon.
     ///
     /// On the DSP command port we also run a minimal opcode/parameter tracker
-    /// — enough to keep the synthesized write-status busy bit (see `sb_read`)
+    /// — enough to keep the synthesized write-status busy bit (see `read`)
     /// honest across the start/pause/resume of a single-cycle transfer. It
-    /// never suppresses a write: every byte still reaches QEMU. A DSP reset
-    /// (write to base+0x06) clears the tracker.
-    pub fn sb_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
-        if self.emulated() {
-            self.emu_write(machine, dma, p, val);
-            return;
-        }
-        if p == self.io_base + 0x06 {
+    /// never suppresses a write: every byte still reaches the card. A DSP
+    /// reset (write to base+0x06) clears the tracker.
+    fn write<A: crate::Arch>(&mut self, machine: &mut A, _dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
+        if p == b.io_base + 0x06 {
             // DSP reset — drop any half-decoded command / transfer state.
             self.dsp_param_bytes = 0;
             self.dsp_dma_active = false;
             self.dsp_expect_test_write = false;
-        } else if p == self.io_base + 0x0C {
+        } else if p == b.io_base + 0x0C {
             if self.dsp_expect_test_write {
                 self.dsp_test_reg = val;
                 self.dsp_expect_test_write = false;
@@ -486,9 +674,9 @@ impl SoundBlaster {
                 }
             }
         }
-        if p == self.io_base + 0x04 {
+        if p == b.io_base + 0x04 {
             self.mixer_idx = val;
-        } else if p == self.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {
+        } else if p == b.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {
             // The guest may move ITS view of the wiring — the relay and the
             // remap follow BLASTER — but the physical straps stay where the
             // kernel found them; nothing else on the machine knows they
@@ -496,55 +684,24 @@ impl SoundBlaster {
             // `trap_mask`.
             return;
         }
-        machine.outb(self.host_port(p), val);
+        machine.outb(self.host_port(b, p), val);
     }
 
-    /// DMA-port read. Two distinct sources of truth, never conflated:
-    ///
-    ///  - **armed SB channel, count register** → the *real* QEMU-8257's
-    ///    live current-count (it's the actual transfer QEMU-sb16 paces):
-    ///    decrements during playback, underflows to 0xFFFF at terminal
-    ///    count — exactly real-hw semantics Dune2's `0x4D8` ISR expects.
-    ///    Served here directly (own flip-flop split, latched at the
-    ///    low-byte read so the lo/hi pair is consistent); the shadow
-    ///    `ch[].count` is left untouched so `maybe_remap`'s programming
-    ///    snapshot stays intact.
-    ///  - **everything else** (not-yet-armed = programming snapshot,
-    ///    non-SB channels, addr/page/status) → `Dma8237::io_read`, i.e.
-    ///    the captured guest programming.
-    pub fn dma_read<A: crate::Arch>(&mut self, machine: &mut A, dma: &mut Dma8237, port: u16) -> u8 {
-        // Channel-data ports only: DMA1 0x00..=0x07 (addr/count pairs for
-        // chan 0..3), DMA2 0xC0..=0xCF (addr/count pairs for chan 4..7,
-        // 4-byte stride per channel due to 16-bit alignment). Control
-        // registers (0x08..=0x0F status/mask/etc., 0xD0..=0xDF for DMA2)
-        // and page-register ports don't index into ch[] — route them to
-        // io_read for the captured/synthetic control state. Without the
-        // upper bound, port 0xD0 produced chan=8 and panicked on ch[8].
-        let (is_cnt, chan, hi_ctrl) = if port <= 0x07 {
-            (port & 1 == 1, (port >> 1) as usize, false)
-        } else if (0xC0..=0xCF).contains(&port) {
-            let r = (port - 0xC0) >> 1;
-            (r & 1 == 1, 4 + (r >> 1) as usize, true)
-        } else {
-            // Emulated card: the controller status register carries the TC
-            // bits the card latched (bits 0-3, one per channel); reading
-            // clears them — real-8237 semantics completion pollers rely on.
-            // Passthrough continues to the shadow/real chip.
-            if self.emulated() && (port == 0x08 || port == 0xD0) {
-                return self.core.take_tc_status(port == 0xD0);
-            }
-            return dma.io_read(machine, port);
-        };
-
-        // Emulated card: the live current-count comes from the card's play
-        // cursor (there is no real 8257 to interrogate).
-        if self.emulated() {
-            return self.emu_dma_read(machine, dma, is_cnt, chan, hi_ctrl);
-        }
-
-        let n = self.native.as_ref();
-        let host = if chan == self.dma8 as usize { n.map(|n| n.dma8) }
-                   else if chan == self.dma16 as usize { n.and_then(|n| n.dma16) }
+    /// Serve the armed SB channel's live addr/count from the real 8237;
+    /// everything else from the captured guest programming.
+    #[allow(clippy::too_many_arguments)]
+    fn dma_read<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        dma: &mut Dma8237,
+        b: &Blaster,
+        port: u16,
+        is_cnt: bool,
+        chan: usize,
+        hi_ctrl: bool,
+    ) -> u8 {
+        let host = if chan == b.dma8 as usize { Some(self.card.dma8) }
+                   else if chan == b.dma16 as usize { self.card.dma16 }
                    else { None };
         if dma.ch[chan].armed
             && let Some(h) = host {
@@ -559,7 +716,7 @@ impl SoundBlaster {
                     let live_count = real_8237_count(machine, h);
                     let p = dma.ch[chan].prog;
                     dma.read_latch = if is_cnt {
-                        // Count register: QEMU-8257's live current-count —
+                        // Count register: the real 8257's live current-count —
                         // decrements during playback, 0xFFFF at terminal
                         // (Dune2's 0x4D8 ISR relies on this).
                         live_count
@@ -581,20 +738,14 @@ impl SoundBlaster {
         dma.io_read(machine, port)
     }
 
-    /// Called after every virtual-8237 write. When the BLASTER channel is
-    /// (re)armed, alias the guest's DMA buffer onto that channel's
-    /// permanent host buffer and program the real 8237. A no-op until the
-    /// guest finishes a count write (the per-block re-arm signal).
-    pub fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
-        if self.emulated() {
-            // No real chip to program / no buffer to alias: the virtual-8237
-            // `prog` is already captured (io_write), and we read the guest
-            // ring for the card at playback. Nothing to remap.
-            return;
-        }
+    /// When the BLASTER channel is (re)armed, alias the guest's DMA buffer
+    /// onto that channel's permanent host buffer and program the real 8237.
+    /// A no-op until the guest finishes a count write (the per-block re-arm
+    /// signal).
+    fn maybe_remap<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237, b: &Blaster) {
         // SB uses exactly its BLASTER D (8-bit) or H (16-bit) channel.
-        let c8 = self.dma8 as usize;
-        let c16 = self.dma16 as usize;
+        let c8 = b.dma8 as usize;
+        let c16 = b.dma16 as usize;
         // Armed = unmasked. NOT `count != 0`: the 8237 count register holds
         // transfers MINUS ONE, so 0 is a legal one-transfer block — exactly
         // what a driver's minimal DMA-wiring probe arms (MONKEY2's
@@ -605,9 +756,9 @@ impl SoundBlaster {
         let armed8 = c8 < 4 && !dma.ch[c8].masked;
         let armed16 = (5..8).contains(&c16) && !dma.ch[c16].masked;
         let (chan, is16, host) = if armed16 {
-                (c16, true, self.native.as_ref().and_then(|n| n.dma16).unwrap_or(0xFF) as usize)
+                (c16, true, self.card.dma16.unwrap_or(0xFF) as usize)
             } else if armed8 {
-                (c8, false, self.native.as_ref().map_or(0xFF, |n| n.dma8) as usize)
+                (c8, false, self.card.dma8 as usize)
             } else {
                 // Idle/masked — keep the binding (reused next block).
                 return;
@@ -628,7 +779,7 @@ impl SoundBlaster {
 
     /// Alias the guest buffer at `gpa` onto host DMA channel `host`'s
     /// permanent buffer and program the real 8237. Driven from
-    /// `maybe_remap` (a guest port write) and `sb_resume` (replaying the
+    /// `maybe_remap` (a guest port write) and `resume` (replaying the
     /// virtual-8237 state after a task switch).
     #[allow(clippy::too_many_arguments)]
     fn arm<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs, dma: &mut Dma8237,
@@ -697,7 +848,7 @@ impl SoundBlaster {
         }
 
         program_real_8237(machine, host as u8, phys, len, mode, is16);
-        // Armed: the real QEMU-8257 is now authoritative for this channel's
+        // Armed: the real 8257 is now authoritative for this channel's
         // live addr/count reads (`dma_read` serves them).
         dma.ch[chan].armed = true;
     }
@@ -727,10 +878,9 @@ impl SoundBlaster {
     /// Task switched to the background: detach the alias (the channel
     /// buffer's content is saved back into the task's own memory) and mask
     /// the real 8237 channel so the card stops pulling a buffer that's no
-    /// longer ours. The virtual 8237 keeps the armed state; `sb_resume`
+    /// longer ours. The virtual 8237 keeps the armed state; `resume`
     /// replays it. Must run with this task's address space active.
-    pub fn sb_suspend<A: crate::Arch>(&mut self, machine: &mut A, _regs: &mut Regs) {
-        if self.emulated() { return; } // no real chip / alias to detach
+    fn suspend<A: crate::Arch>(&mut self, machine: &mut A) {
         if self.bound_gpa == 0 { return; }
         mask_real_8237(machine, self.bound_host);
         self.unbind(machine);
@@ -741,80 +891,38 @@ impl SoundBlaster {
     /// re-alias every channel the virtual 8237 still shows armed and
     /// reprogram the real 8237. Must run with this task's address space
     /// active.
-    pub fn sb_resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237) {
-        if self.emulated() { return; }
+    fn resume<A: crate::Arch>(&mut self, machine: &mut A, regs: &mut Regs, dma: &mut Dma8237, _b: &Blaster) {
         if !self.suspended { return; }
         self.suspended = false;
         for chan in 0..8 {
             if !dma.ch[chan].armed { continue; }
             let is16 = chan >= 4;
-            let Some(n) = self.native.as_ref() else { return };
-            let host = if is16 { n.dma16.unwrap_or(0xFF) } else { n.dma8 } as usize;
+            let host = if is16 { self.card.dma16.unwrap_or(0xFF) } else { self.card.dma8 } as usize;
             let p = dma.ch[chan].prog;
             let (gpa, len) = chan_gpa_len(&p, is16);
             self.arm(machine, regs, dma, chan, host, is16, gpa, len, p.mode);
         }
     }
+}
 
-    /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string. Unknown
-    /// or missing tokens leave the SB16 defaults. `env` is the raw DOS
-    /// environment block (NUL-separated `KEY=VAL`, double-NUL terminated).
-    pub fn configure_from_env(&mut self, env: &[u8]) {
-        // Host side: what the physical card reported (SB16 mixer) or the
-        // owner declared. Only meaningful when a real card is there; the
-        // emulated-only machine leaves these unknown and never remaps.
-        let plat = crate::kernel::platform::get();
-        // The card is a capability, minted here from what the probe found and
-        // the restrap settled on. No card, or no readable wiring, means no
-        // passthrough: there is nothing to relay to and nothing to remap onto,
-        // and every such path is behind `native`.
-        self.native = match (plat.sb_card, plat.sb_wiring) {
-            (Some(card), Some(w)) => Some(NativeSb {
-                base: card.base, irq: w.irq, dma8: w.dma8, dma16: w.dma16,
-            }),
-            _ => None,
-        };
-        let Some(val) = env_var(env, b"BLASTER") else { return };
-        for tok in val.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
-            let (key, rest) = (tok[0].to_ascii_uppercase(), &tok[1..]);
-            let radix = if key == b'A' || key == b'P' { 16 } else { 10 };
-            let Some(n) = parse_uint(rest, radix) else { continue };
-            match key {
-                b'A' => self.io_base = n as u16,
-                b'I' => self.irq = n as u8,
-                b'D' => self.dma8 = n as u8,
-                b'H' => self.dma16 = n as u8,
-                _ => {}
-            }
-        }
-        // The card decodes against the base and reports the IRQ/DMA numbers
-        // back through its mixer configuration registers.
-        self.core.set_wiring(self.io_base, self.irq, self.dma8, self.dma16);
-    }
+// ── The emulated card's machine side ────────────────────────────────────────
+//
+// The library card runs the DSP register file and command FSM; everything
+// here supplies it with what a passive card cannot have — the clock, the
+// interrupt line, the guest's DMA ring, and the sink's pipe depth. None of it
+// is reachable without matching `SbDevice::Emulated`, which is the point:
+// there is no play cursor to interpolate and no ring to fetch when a real
+// card is doing the transferring.
 
-    // ── The emulated card's machine side ────────────────────────────────
-    //
-    // Active only when no real card answers. The library card runs the DSP
-    // register file and command FSM; everything below supplies it with what a
-    // passive card cannot have — the clock, the interrupt line, the guest's
-    // DMA ring, and the sink's pipe depth.
-
-    /// Software emulation vs real-card passthrough — the boot-time platform
-    /// probe's verdict (`platform::Audio`), not probed here. The OPL window
-    /// for passthrough is part of the DOS io_policy template for the same
-    /// reason: derived, not granted at runtime.
-    fn emulated(&self) -> bool {
-        !crate::kernel::platform::get().audio.sb_passthrough()
-    }
-
+impl EmulatedSb {
     /// Emulated DSP/mixer/FM port write. The card decodes; when it decodes a
     /// start-playback command it hands it back, because only we can read the
     /// guest's DMA controller for the ring that command refers to.
-    fn emu_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
+    fn write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
         let now = machine.get_ticks();
         let Some(start) = self.core.port_write(p, val, now) else { return };
         let is16 = start.bits == 16;
-        let chan = if is16 { self.dma16 } else { self.dma8 } as usize;
+        let chan = if is16 { b.dma16 } else { b.dma8 } as usize;
         if chan >= dma.ch.len() {
             return; // BLASTER declared a channel that does not exist
         }
@@ -834,12 +942,9 @@ impl SoundBlaster {
     /// Deliver a latched 0xF2/0xF3 trigger-IRQ (the BLASTER IRQ probe). A
     /// real card answers within microseconds; the next slice is well inside
     /// any probe's poll window.
-    pub fn deliver_trigger_irq(&mut self, vpic: &mut super::vpic::VirtualPic) {
-        if !self.emulated() {
-            return;
-        }
-        if self.core.take_trigger() && !vpic.is_requested(self.irq) {
-            vpic.raise(self.irq);
+    pub fn deliver_trigger_irq(&mut self, vpic: &mut super::vpic::VirtualPic, irq: u8) {
+        if self.core.take_trigger() && !vpic.is_requested(irq) {
+            vpic.raise(irq);
         }
     }
 
@@ -850,12 +955,10 @@ impl SoundBlaster {
         &mut self,
         machine: &mut A,
         vpic: &mut super::vpic::VirtualPic,
+        irq: u8,
     ) {
-        if !self.emulated() {
-            return;
-        }
-        if self.core.take_probe(machine.get_ticks()) && !vpic.is_requested(self.irq) {
-            vpic.raise(self.irq);
+        if self.core.take_probe(machine.get_ticks()) && !vpic.is_requested(irq) {
+            vpic.raise(irq);
         }
     }
 
@@ -863,7 +966,7 @@ impl SoundBlaster {
     /// or holding the stream open through the hangover. The top of the
     /// producer priority chain (DSP > GUS > OPL).
     pub fn dsp_owns_sink(&self) -> bool {
-        self.emulated() && self.core.owns_sink()
+        self.core.owns_sink()
     }
 
     /// Rate the DSP stream runs the mixer session at.
@@ -927,15 +1030,13 @@ impl SoundBlaster {
         &mut self,
         machine: &mut A,
         vpic: &mut super::vpic::VirtualPic,
+        irq: u8,
         drained: u64,
         pushed: u64,
     ) {
-        if !self.emulated() {
-            return;
-        }
         let now = machine.get_ticks();
-        if self.core.advance_clock(now, drained, pushed) && !vpic.is_requested(self.irq) {
-            vpic.raise(self.irq);
+        if self.core.advance_clock(now, drained, pushed) && !vpic.is_requested(irq) {
+            vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and
         // measure the frames-per-TSC slope from this pump interval. A cursor
@@ -988,16 +1089,16 @@ impl SoundBlaster {
     /// live state from the card's play cursor (auto-init down-count), other
     /// channels from the captured base programming. The flip-flop and the
     /// programmed base are the controller's — ours; the cursor is the card's.
-    /// Mirrors `dma_read`'s flip-flop split.
-    fn emu_dma_read<A: crate::Arch>(
+    fn dma_read<A: crate::Arch>(
         &mut self,
         machine: &mut A,
         dma: &mut Dma8237,
+        b: &Blaster,
         is_cnt: bool,
         chan: usize,
         hi_ctrl: bool,
     ) -> u8 {
-        let is_active = chan == self.dma8 as usize || chan == self.dma16 as usize;
+        let is_active = chan == b.dma8 as usize || chan == b.dma16 as usize;
         // The guest reading the active channel's count = it serviced the block
         // (it computed where to refill). Extend the card's commit horizon.
         if is_cnt && is_active {

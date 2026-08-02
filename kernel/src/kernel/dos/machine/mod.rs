@@ -511,6 +511,15 @@ pub(super) use vkbd::*;
 const PORT_TRACE: bool = false;
 
 /// Emulate IN from a port using the virtual peripherals.
+/// Whether the *emulated* MPU-401 answers at `p`. Two conditions, and the
+/// interesting one is the SB: a thread holding the real card is driving real
+/// silicon, so whatever sits at the declared MPU port is the owner's hardware
+/// and we must not intercept it. Which card this thread has is the device
+/// variant, matched here — the MPU itself only answers the address question.
+fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
+    matches!(pc.sb.device, SbDevice::Emulated(_)) && pc.mpu.owns(p)
+}
+
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     if native_vbe_byte_port(pc, port) {
         return machine.inb(port);
@@ -612,13 +621,13 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             machine.inb(0x71)
         }
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
-        p if pc.sb.is_passthrough(p) => {
+        p if pc.sb.owns(p) => {
             pc.sb.sb_read(machine, &pc.dma, p)
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_read(machine, p),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
-        p if pc.mpu.owns(p) => pc.mpu.io_read(p),
+        p if emulated_mpu(pc, p) => pc.mpu.io_read(p),
         // Virtual 8237 DMA controller. SB channel count register is
         // served from the interpolated current-count model (drivers
         // poll it for DMA progress, not just completion).
@@ -682,18 +691,19 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 //
                 // Re-arm the passthrough card's HOST line, which `handle_irq`
                 // masked when it queued the completion and which stays masked
-                // until the guest EOIs. It is `sb.host_irq` — the line the
-                // card is really strapped to, the same value the relay matches
-                // on — NOT the guest's BLASTER line and not a constant: a
+                // until the guest EOIs. It is the card's OWN line — the same
+                // value the relay matches on — NOT the guest's BLASTER line
+                // and not a constant: a
                 // restrapped card (86Box moves to IRQ 7) would otherwise have
                 // its real line masked forever after the first completion, and
                 // every later block would silently never arrive. The emulated
                 // SB has no host line — its IRQ is purely virtual — so there is
                 // nothing to rearm there (`feedback_no_half_modelled_devices`).
-                let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
+                let guest_irq = pc.sb.blaster.irq;
+                let sb_in_service = guest_irq < 8 && pc.vpic.in_service(guest_irq);
                 pc.vpic.master_eoi();
-                if sb_in_service && let Some(n) = pc.sb.native.as_ref() {
-                    machine.rearm_irq(n.irq);
+                if sb_in_service && let SbDevice::Native(pt) = &pc.sb.device {
+                    machine.rearm_irq(pt.card.irq);
                 }
             }
         }
@@ -740,13 +750,13 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x71 if VirtualRtc::owns(pc.cmos_index) => pc.vrtc.write(machine, pc.cmos_index, val),
         0x71 => {}
         // SB DSP/mixer/OPL → straight to the real QEMU sb16/adlib.
-        p if pc.sb.is_passthrough(p) => {
+        p if pc.sb.owns(p) => {
             pc.sb.sb_write(machine, &pc.dma, p, val);
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, p, val),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
-        p if pc.mpu.owns(p) => pc.mpu.io_write(p, val),
+        p if emulated_mpu(pc, p) => pc.mpu.io_write(p, val),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.
@@ -1053,7 +1063,9 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 /// device's *tick* when the sink's drain clock crosses them — never raised
 /// from inside `mix`, which runs up to a pipe-fill ahead of the speaker.
 enum PcmSource<'a> {
-    SoundBlaster(&'a mut SoundBlaster),
+    /// `None` when this thread holds the real card: silicon mixes itself, and
+    /// there is no emulated card to ask for frames.
+    SoundBlaster(Option<&'a mut EmulatedSb>),
     Gus(&'a mut Gus),
     Midi(&'a mut Mpu),
     Speaker(&'a mut sound::speaker::Speaker),
@@ -1069,7 +1081,8 @@ impl PcmSource<'_> {
         block: &mut [(i32, i32)],
     ) {
         match self {
-            Self::SoundBlaster(sb) => sb.mix_into(machine, rate, dsp_base, block),
+            Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, dsp_base, block),
+            Self::SoundBlaster(None) => {}
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
             Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
             Self::Speaker(spk) => {
@@ -1146,8 +1159,13 @@ impl Mixer {
 /// fast path that skips the pump entirely.
 pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     let PcMachine { sb, gus, mpu, vpic, mixer, .. } = pc;
-    sb.deliver_trigger_irq(vpic);
-    sb.deliver_probe_irq(machine, vpic);
+    // Latched probe/trigger IRQs are the emulated card's business: a real one
+    // raises its own line and the relay carries it.
+    let SoundBlaster { blaster, device } = sb;
+    if let SbDevice::Emulated(emu) = device {
+        emu.deliver_trigger_irq(vpic, blaster.irq);
+        emu.deliver_probe_irq(machine, vpic, blaster.irq);
+    }
     gus.tick(machine, vpic);
     mpu.tick(machine, mixer.pace.pushed());
 }
@@ -1159,6 +1177,17 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let prof_start = if profiling { machine.rdtsc() } else { 0 };
     audio_service(machine, pc);
     let PcMachine { sb, gus, mpu, spk, vpic, mixer, .. } = pc;
+    // The pump mixes emulated sources only. A thread holding the real card
+    // has nothing here: its DSP streams from the guest ring over the ISA bus
+    // and its OPL is the card's own, so neither produces frames for us and
+    // neither has a cursor for us to clock. Bind it once — every SB question
+    // below is on the emulated payload, which is where they mean anything.
+    let SoundBlaster { blaster, device } = sb;
+    let sb_irq = blaster.irq;
+    let mut sb = match device {
+        SbDevice::Emulated(emu) => Some(emu),
+        SbDevice::Native(_) => None,
+    };
     let now = machine.get_ticks();
     let dt = now.saturating_sub(mixer.last_ms).min(100);
 
@@ -1180,9 +1209,9 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let prof_devices = if profiling { machine.rdtsc() } else { 0 };
 
     // ── the pump ──
-    let dsp_on = sb.dsp_owns_sink();
+    let dsp_on = sb.as_deref().is_some_and(|e| e.dsp_owns_sink());
     let gus_on = gus.mixing();
-    let opl_on = sb.opl_audible(now);
+    let opl_on = sb.as_deref().is_some_and(|e| e.opl_audible(now));
     let midi_on = mpu.mixing();
     let spk_on = spk.audible(MIX_RATE);
     // Idle sources do NOT stop the sink: once a session streams, it stays
@@ -1205,7 +1234,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // SB effect starting over GUS music must not reset the GUS event/drain
     // timeline while older frames are still queued in the physical sink.
     // Give only the DSP its new local frame zero on each playback restart.
-    if sb.take_restart() {
+    if sb.as_deref_mut().is_some_and(|e| e.take_restart()) {
         mixer.dsp_epoch = mixer.pace.pushed();
     }
     let rate = MIX_RATE;
@@ -1232,7 +1261,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         frames[..run].fill((0, 0));
         let dsp_base = base.saturating_sub(mixer.dsp_epoch);
         let mut sources = [
-            PcmSource::SoundBlaster(sb),
+            PcmSource::SoundBlaster(sb.as_deref_mut()),
             PcmSource::Gus(gus),
             PcmSource::Midi(mpu),
             PcmSource::Speaker(spk),
@@ -1264,9 +1293,11 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // advances evenly and production, `pushed`, and the cursor all move together.
     let drained = mixer.pace.drained();
     let pushed = mixer.pace.pushed();
-    let dsp_rate = sb.dsp_rate().max(1) as u64;
-    let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
-    sb.dsp_clock_tick(machine, vpic, to_dsp(drained), to_dsp(pushed));
+    if let Some(emu) = sb.as_deref_mut() {
+        let dsp_rate = emu.dsp_rate().max(1) as u64;
+        let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
+        emu.dsp_clock_tick(machine, vpic, sb_irq, to_dsp(drained), to_dsp(pushed));
+    }
     gus.deliver_events(vpic);
 
     if profiling {
@@ -1314,16 +1345,16 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
         }
         Irq::Hw(line) => {
             // Only the card this guest actually holds has a line to relay.
-            let Some(n) = pc.sb.native.as_ref() else { return };
-            if line != n.irq {
+            let SbDevice::Native(pt) = &pc.sb.device else { return };
+            if line != pt.card.irq {
                 return;
             }
             // The physical card's completion line (read from its mixer, or
             // declared for a card that cannot report it). Relay it to the
             // guest's BLASTER IRQ, leaving the host line masked until the
             // guest completes the virtual interrupt with a PIC EOI.
-            if !pc.vpic.is_requested(pc.sb.irq) {
-                pc.vpic.raise(pc.sb.irq);
+            if !pc.vpic.is_requested(pc.sb.blaster.irq) {
+                pc.vpic.raise(pc.sb.blaster.irq);
             }
         }
         // MSI identities are kernel-owned and never map onto the guest's ISA

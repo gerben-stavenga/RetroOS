@@ -46,29 +46,31 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
                     machine.allow_io_ports(0x3DA, 1);
                 }
             }
-            // A real SB implies a real OPL: FM music writes (frequent) go
-            // straight to the card; emulated stays trapped so `emu_*`
-            // answers FM detection.
-            if platform::get().audio.sb_passthrough() {
+            // Ports are granted to a guest that holds the REAL card, and to
+            // no other: an emulated card's window must keep trapping, or the
+            // model never sees the traffic it exists to answer. Holding the
+            // card is exactly `SbDevice::Native`, so the match that decides
+            // this also hands over the wiring the grant needs.
+            if let Personality::Dos(dos) = personality
+                && let crate::kernel::dos::SbDevice::Native(pt) = &dos.pc.sb.device
+            {
+                // A real SB implies a real OPL: FM music writes (frequent) go
+                // straight to the card.
                 machine.allow_io_ports(0x388, 2);
                 // The DSP window, port by port: the IOPB is a bitmap, so
                 // only what genuinely needs interception traps (see
                 // `trap_mask`) and the rest reaches the card directly.
-                if let Personality::Dos(dos) = personality {
-                    let mask = dos.pc.sb.trap_mask();
-                    for off in 0..16u16 {
-                        if mask & (1 << off) == 0 {
-                            machine.allow_io_ports(dos.pc.sb.io_base + off, 1);
-                        }
+                let mask = pt.trap_mask(&dos.pc.sb.blaster);
+                for off in 0..16u16 {
+                    if mask & (1 << off) == 0 {
+                        machine.allow_io_ports(dos.pc.sb.blaster.io_base + off, 1);
                     }
                 }
                 // The MPU-401 window the guest declared (BLASTER `P`). In
                 // native mode the emulated MPU stands down, so these reach
                 // whatever the owner actually has there — a real MPU, a
                 // wavetable daughterboard, an external module.
-                if let Personality::Dos(dos) = personality
-                    && dos.pc.mpu.present
-                {
+                if dos.pc.mpu.present {
                     machine.allow_io_ports(dos.pc.mpu.base, 2);
                 }
                 // The 8237 windows are NEVER granted, in any configuration:
