@@ -41,9 +41,15 @@ ln -sfn "$REPO/apps-boot/tc"              "$C/TC"
 # names differently bought nothing.
 ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
 
-# C:\CONFIG.SYS overrides the bootfs default (the kernel reads C:\CONFIG.SYS
-# first, then C:\BOOT\CONFIG.SYS). COMSPEC points at the bootfs COMMAND.COM;
-# PATH covers DN/COMMAND (C:\BOOT), Turbo C, Borland C, Borland Pascal.
+# C:\BOOT — the DOS system directory (DN, COMMAND.COM, LOADFIX.CFG,
+# SHELL.ELF). Ordinary content on C:, exactly like the packaged ext4 images
+# carry it; the kernel embeds nothing, so without this there is no shell.
+# A copy, not a symlink: these are build outputs under bazel-bin.
+"$REPO/tools/install_boot_dir.sh" "$C"
+
+# C:\CONFIG.SYS is the only config the kernel reads. COMSPEC points at
+# C:\BOOT\COMMAND.COM; PATH covers DN/COMMAND (C:\BOOT), Turbo C, Borland C,
+# Borland Pascal.
 cat > "$C/CONFIG.SYS" <<'CFG'
 COMSPEC=C:\BOOT\COMMAND.COM
 PATH=C:\;C:\BOOT;C:\TC;C:\BORLANDC\BIN;C:\BP\BIN

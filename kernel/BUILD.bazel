@@ -76,22 +76,21 @@ rust_library(
 # ============================================================================
 # Metal entry: the bootable kernel.elf, produced by rustc-linking the kernel
 # rlib (+ arch-metal, pulled transitively) with the asm entry stub and the
-# embedded bootfs object, under the kernel linker script. Replaces the old
+# under the kernel linker script. Replaces the old
 # `ld` genrule — the rlib is not self-contained, so rustc does the link.
 # ============================================================================
 
-# The asm `_start` stub and the embedded bootfs object are linked straight in
-# as native objects via `-Clink-arg` (the bare-metal CC toolchain has only a
-# dummy `ar`, so they can't go through `cc_library`). `_start` (kept by the
-# script's ENTRY) calls the kernel's `boot_kernel`; the bootfs symbols are read
-# by `kernel::bootfs()`. rust-lld pulls `boot_kernel` and the rest out of the
-# kernel rlib to satisfy the objects' undefined references.
+# The asm `_start` stub is linked straight in as a native object via
+# `-Clink-arg` (the bare-metal CC toolchain has only a dummy `ar`, so it can't
+# go through `cc_library`). `_start` (kept by the script's ENTRY) calls the
+# kernel's `boot_kernel`; rust-lld pulls `boot_kernel` and the rest out of the
+# kernel rlib to satisfy the object's undefined references.
 rust_binary(
     name = "kernel_elf_bin",
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", ":entry", ":bootfs_obj", "//third_party/lwext4:lwext4_obj"],
+    compile_data = [":kernel_ld", ":entry", "//third_party/lwext4:lwext4_obj"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -102,37 +101,9 @@ rust_binary(
         "-Clinker=rust-lld",
         "-Clink-arg=-T$(location :kernel_ld)",
         "-Clink-arg=$(location :entry)",
-        "-Clink-arg=$(location :bootfs_obj)",
         # lwext4 (writable ext4): the freestanding C object, linked straight in
         # like :entry. Its undefined externals (malloc/str*/qsort) resolve to the
         # arch-metal cshim; mem*/__udivdi3 to compiler-builtins.
-        "-Clink-arg=$(location //third_party/lwext4:lwext4_obj)",
-        "-Clink-arg=-nostdlib",
-        "-Clink-arg=-no-pie",
-    ],
-    deps = [
-        ":kernel",
-        "//arch-metal",
-    ],
-)
-
-rust_binary(
-    name = "kernel_elf_bare_bin",
-    srcs = ["metal_entry.rs"],
-    crate_name = "kernel_metal",
-    edition = "2024",
-    compile_data = [":kernel_ld", ":entry", ":bootfs_empty_obj", "//third_party/lwext4:lwext4_obj"],
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-        # Link with rustc's bundled lld (the bare CC toolchain is dummy-only),
-        # directly as ld.lld — the i686-unknown-none target's linker.
-        "-Clink-self-contained=+linker",
-        "-Clinker-flavor=ld.lld",
-        "-Clinker=rust-lld",
-        "-Clink-arg=-T$(location :kernel_ld)",
-        "-Clink-arg=$(location :entry)",
-        "-Clink-arg=$(location :bootfs_empty_obj)",
         "-Clink-arg=$(location //third_party/lwext4:lwext4_obj)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
@@ -154,14 +125,6 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-genrule(
-    name = "kernel_elf_bare",
-    srcs = [":kernel_elf_bare_bin"],
-    outs = ["kernel_bare.elf"],
-    cmd = "cp $< $@",
-    visibility = ["//visibility:public"],
-)
-
 # ============================================================================
 # Hosted entry binaries: link the SAME kernel rlib against arch-interp.
 # ============================================================================
@@ -177,7 +140,6 @@ rust_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":bootfs_host",
         ":kernel",
         "//arch-interp",
         "//lib",
@@ -199,7 +161,6 @@ rust_binary(
     ],
     visibility = ["//visibility:public"],
     deps = [
-        ":bootfs_host",
         ":kernel",
         "//arch-interp:arch-interp-kvm",
         "//lib",
@@ -208,102 +169,4 @@ rust_binary(
         "//third_party/lwext4:lwext4-sys",
         "@lwext4//:lwext4_host",
     ],
-)
-
-# The bootfs tar pinned to the canonical retro platform: its build subtree
-# (in-OS TCC → image_min → the i686 bootloader) must not follow the host
-# config that retroos-host builds in.
-retro_platform_files(
-    name = "bootfs_tar_pinned",
-    dep = "//:bootfs_tar",
-)
-
-# The embedded bootfs for the HOSTED binary: same bytes, same
-# _binary_bootfs_tar_* symbols as the metal kernel's bootfs_obj, in the
-# host object format. /boot always exists, on top of whatever the root is.
-genrule(
-    name = "bootfs_obj_host",
-    srcs = [":bootfs_tar_pinned"],
-    outs = ["bootfs_host.o"],
-    cmd = "T=$$(mktemp -d) && cp $< $$T/bootfs.tar && O=$$(pwd)/$@ && " +
-          "(cd $$T && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 " +
-          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
-          "bootfs.tar $$O) && rm -r $$T",
-)
-
-cc_library(
-    name = "bootfs_host",
-    srcs = [":bootfs_obj_host"],
-    linkstatic = True,
-    visibility = ["//visibility:public"],
-)
-
-# Empty twin for retroos-host-bare (the in-OS TCC build tool): bootfs_tar
-# contains COMMAND.COM, which is BUILT BY retroos-host — the tool must not
-# depend on its own output. Mirrors kernel_elf_bare's bootfs_empty_obj:
-# a 1024-byte zero TAR reads as end-of-archive → bootfs() returns None.
-genrule(
-    name = "bootfs_empty_obj_host",
-    outs = ["bootfs_empty_host.o"],
-    cmd = "T=$$(mktemp -d) && truncate -s 1024 $$T/bootfs.tar && O=$$(pwd)/$@ && " +
-          "(cd $$T && objcopy -I binary -O elf64-x86-64 -B i386:x86-64 " +
-          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
-          "bootfs.tar $$O) && rm -r $$T",
-)
-
-cc_library(
-    name = "bootfs_host_empty",
-    srcs = [":bootfs_empty_obj_host"],
-    linkstatic = True,
-)
-
-# The TCC-genrule tool: identical to retroos-host but with the empty
-# bootfs (see bootfs_empty_obj_host) — breaks the COMMAND.COM cycle. Tool
-# runs always boot a disk image, so /boot comes from its TAR partition.
-rust_binary(
-    name = "retroos-host-bare",
-    srcs = ["src/main.rs"],
-    crate_name = "retroos_host",
-    edition = "2024",
-    rustc_flags = [
-        "-Cpanic=abort",
-        "-Crelocation-model=static",
-    ],
-    visibility = ["//visibility:public"],
-    deps = [
-        ":bootfs_host_empty",
-        ":kernel",
-        "//arch-interp",
-        "//lib",
-        "//lib:sound",
-        "//third_party/lwext4:lwext4",
-        "//third_party/lwext4:lwext4-sys",
-        "@lwext4//:lwext4_host",
-    ],
-)
-
-# The embedded boot filesystem (DN + COMMAND.COM, see //:bootfs_tar) as a
-# linkable object: raw bytes in .rodata between _binary_bootfs_tar_{start,end}
-# (read by `kernel::bootfs()`). objcopy derives the symbol names from the
-# input path, hence the cd-to-a-fixed-name dance.
-genrule(
-    name = "bootfs_obj",
-    srcs = ["//:bootfs_tar"],
-    outs = ["bootfs.o"],
-    cmd = "T=$$(mktemp -d) && cp $< $$T/bootfs.tar && O=$$(pwd)/$@ && " +
-          "(cd $$T && objcopy -I binary -O elf32-i386 -B i386 " +
-          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
-          "bootfs.tar $$O) && rm -r $$T",
-)
-
-# Empty variant: same symbols around an empty TAR (two zero end-of-archive
-# blocks — objcopy refuses a 0-byte input; bootfs() reads a zero first block
-# as "no bootfs"). Links into kernel_elf_bare above.
-genrule(
-    name = "bootfs_empty_obj",
-    outs = ["bootfs_empty.o"],
-    cmd = "T=$$(mktemp -d) && truncate -s 1024 $$T/bootfs.tar && O=$$(pwd)/$@ && " +
-          "(cd $$T && objcopy -I binary -O elf32-i386 -B i386 " +
-          "--rename-section .data=.rodata,alloc,load,readonly,data,contents " +
-          "bootfs.tar $$O) && rm -r $$T",
 )

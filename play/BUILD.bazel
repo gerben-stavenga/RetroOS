@@ -8,10 +8,6 @@
 # features compile a static SDL2 in its build script — no system libSDL2 at
 # build or run time). Build for the host: --platforms=@platforms//host.
 #
-# Bootfs is EMBEDDED (//kernel:bootfs_host), exactly like retroos-host — so
-# the windowed launch is one host-platform build with no separate
-# //:bootfs_tar step (which would flip --platforms and discard Bazel's
-# analysis cache every run).
 load("@rules_rust//rust:defs.bzl", "rust_binary")
 
 rust_binary(
@@ -27,7 +23,6 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//arch-interp",
-        "//kernel:bootfs_host",
         "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",
@@ -50,7 +45,6 @@ rust_binary(
     visibility = ["//visibility:public"],
     deps = [
         "//arch-interp:arch-interp-kvm",
-        "//kernel:bootfs_host",
         "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",

@@ -58,12 +58,6 @@ fn main() {
     kernel::kernel::klog::init();
     kernel::vga::set_debug_sink(log_byte);
 
-    // The bootfs (DN + COMMAND.COM, the /boot invariant) is linked into this
-    // binary the same way it is into retroos-host / kernel.elf: the Bazel
-    // `bootfs_host` object supplies the `_binary_bootfs_tar_*` symbols that
-    // `bootfs()` reads — the windowed path is a single host-platform build
-    // with no separate bootfs_tar step.
-
     // CPU/kernel worker: interpreter state is thread-local, so the platform is
     // composed here, on the thread that will run it.
     std::thread::spawn(move || {
@@ -74,7 +68,8 @@ fn main() {
         // the host-environment facts the platform probe reads. `retroos-host`
         // does the identical injection in `install_hosted_backend`; without it
         // the port hooks stay `NONE`, `hdd::probe` reads garbage, and the disk
-        // is never detected (Diskless, only the embedded bootfs shows).
+        // is never detected (Diskless — and with no root there is no C:\BOOT,
+        // so no shell either).
         kernel::install_portio(kernel::PortIo {
             inb: arch::inb,
             inw: arch::inw,

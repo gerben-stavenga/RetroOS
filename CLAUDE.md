@@ -60,7 +60,7 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   - `kernel/src/kernel/{block,sound,net,console,vfs,portio,pci}.rs` - the driver/fs APIs
     the personalities call; they own the policy and dispatch downward
   - `kernel/src/kernel/drivers/` - concrete hardware only (hdd, nvme, hda, ac97, alc298_amp)
-  - `kernel/src/kernel/fs/` - filesystem backends (tarfs, hostfs, lwext4)
+  - `kernel/src/kernel/fs/` - filesystem backends (hostfs, lwext4)
   - `kernel/src/vga.rs` - the single emulated VGA model
 - `lib/` - Freestanding library (VGA render, ELF, TAR, MD5)
 - `play/` - `retroos-play` windowed host emulator (on `arch-interp`)
@@ -70,7 +70,7 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   probes they run: `test/dos/` (DOS `.COM`/ELF tests), `test/hosted/`
 - `tools/` - Build-time guest tooling: `tools/dosrt/` (in-OS TCC), `tools/command/` (COMMAND.COM)
 - `shell/` - Rust `no_std` userland shell for the Linux personality
-- `apps-boot/` - embedded bootfs (DN, TC)
+- `apps-boot/` - content shipped to `C:\BOOT` (DN) and `C:\TC`
 - `toolchain/` - Bazel toolchain configuration for bare-metal Rust
 
 ### Boot Process
@@ -81,7 +81,7 @@ existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
 1. **MBR** (`boot/mbr.asm`) - Loads rest of bootloader from sector 1
 2. **Bootloader** (`boot/src/lib.rs`) - Switches to protected mode, sets up GDT, enables A20, reads kernel from TAR filesystem, verifies MD5
 3. **Kernel Entry** (`kernel/src/arch/entry.asm` + `kernel/src/lib.rs`) - Sets up paging, IDT, remaps PIC (or APIC bringup); fbcon console on a GOP framebuffer
-4. **Init Process** - Userland init/shell (DN + COMMAND.COM, embedded as a fallback bootfs) that can fork/exec ELF and DOS programs
+4. **Init Process** - Userland init/shell (DN + COMMAND.COM, from `C:\BOOT` on the mounted root) that can fork/exec ELF and DOS programs
 
 ### Memory Layout (Virtual)
 
@@ -102,7 +102,7 @@ existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
 - **Copy-on-Write Forking**: Fork shares parent pages read-only, allocates on write fault
 - **Event Loop Kernel**: ring-3 execution always comes back as a kernel-facing event
 - **Personalities**: ELF → Linux ABI personality; DOS `.COM`/MZ `.EXE` → DOS personality (VM86 + DPMI), both layered on the same execution modes
-- **TAR Filesystem**: the boot image is a TAR archive; VFS also mounts ext (read-only) and hostfs
+- **Filesystems**: ext (via lwext4) and hostfs. The boot partition is a TAR the MBR bootloader reads to find `kernel.elf`; the kernel never mounts it
 - **One emulated VGA**: a single VGA model presented through a sink (metal GOP fbcon / hosted window); backends supply only a framebuffer
 - **Probe once**: `platform` reads the machine into typed ADTs at startup; `focus` owns singleton console hardware; `io_policy` rebuilds the TSS IOPB per swap-in
 

@@ -121,28 +121,6 @@ pub fn host_run_elf<A: Arch>(
     machine.shutdown();
 }
 
-/// The embedded boot filesystem: a TAR (DN + COMMAND.COM + fallback
-/// CONFIG.SYS) linked in as raw bytes (`//:bootfs_tar` → objcopy → the
-/// `_binary_bootfs_tar_*` symbols), so /boot ALWAYS exists, mounted on top
-/// of whatever the root is — a bare kernel.elf from someone's GRUB, an
-/// imageless hosted run, anything. Every build links a bootfs object; None
-/// only for the intentionally-empty TAR of the bare kernel (`kernel_elf_bare`
-/// / `retroos-host-bare`, used by the in-OS toolchain to break the
-/// COMMAND.COM cycle).
-pub fn bootfs() -> Option<&'static [u8]> {
-    unsafe extern "C" {
-        static _binary_bootfs_tar_start: u8;
-        static _binary_bootfs_tar_end: u8;
-    }
-    let start = (&raw const _binary_bootfs_tar_start) as usize;
-    let end = (&raw const _binary_bootfs_tar_end) as usize;
-    // A zero first byte is TAR end-of-archive: the bare kernel links an empty
-    // TAR (objcopy can't embed 0 bytes), which counts as "no bootfs".
-    if end - start < 512 || unsafe { *(start as *const u8) } == 0 {
-        return None;
-    }
-    Some(unsafe { core::slice::from_raw_parts(start as *const u8, end - start) })
-}
 
 // Metal linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're opaque

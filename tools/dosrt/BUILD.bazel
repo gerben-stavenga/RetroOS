@@ -113,9 +113,9 @@ genrule(
 # `tools`, so it builds in the exec configuration (the host platform).
 alias(
     name = "interp_host",
-    # The -bare variant: links an EMPTY embedded bootfs, because the real
-    # bootfs contains COMMAND.COM — which these genrules build (cycle).
-    actual = "//kernel:retroos-host-bare",
+    # No -bare variant is needed any more: the kernel embeds no bootfs, so it
+    # no longer depends on COMMAND.COM, which these genrules build.
+    actual = "//kernel:retroos-host",
     visibility = ["//visibility:public"],
 )
 

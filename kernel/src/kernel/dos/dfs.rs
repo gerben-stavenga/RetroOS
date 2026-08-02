@@ -103,7 +103,7 @@ pub mod ci {
             return Some(dir[i].1.original.as_slice());
         }
         // Not a backing-fs entry — but it may be a VFS mount point under this
-        // dir (e.g. C:\BOOT = the bootfs overlay, invisible to readdir).
+        // dir (a VFS mount point, invisible to the backing fs readdir).
         crate::kernel::vfs::mount_child(vfs_dir, alias)
     }
 

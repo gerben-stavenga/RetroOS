@@ -62,7 +62,7 @@ pub use machine::VgaState;
 pub use machine::vga::{BiosVga, physical_vga_present, prepare_bios_osd, release_bios_osd};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
-/// BootConfig.c_root; read by the bootfs mount and the DN/CONFIG launch paths.
+/// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{set_c_root, c_root};
 
 /// Look up `KEY` in a DOS environment block (the parsed CONFIG.SYS master

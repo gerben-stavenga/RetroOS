@@ -63,12 +63,13 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 }
 
 /// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
-pub fn init_from_tar() {
-    // Try both mount layouts (TAR at root or at tar/)
+pub fn init_from_vfs() {
+    // The bare-ELF dev path has kernel.elf at the VFS root; a disk boot has
+    // it in the DOS system directory.
     // Use handle-based VFS access (no per-thread fd slot needed)
     let mut handle = vfs::open_to_handle(b"kernel.elf");
     if handle < 0 {
-        let p = [crate::kernel::dos::c_root(), b"boot/kernel.elf"].concat();
+        let p = [crate::kernel::dos::c_root(), b"BOOT/kernel.elf"].concat();
         handle = vfs::open_to_handle(&p);
     }
     if handle < 0 {

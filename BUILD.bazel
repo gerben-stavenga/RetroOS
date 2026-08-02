@@ -102,67 +102,44 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
-genrule(
-    name = "kernel_md5_bare",
-    srcs = ["//kernel:kernel_elf_bare"],
-    outs = ["kernel_bare.elf.md5"],
-    cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
-)
-
-# DN file manager — shipped both in the boot bundle (disk boots) and in the
-# kernel's embedded bootfs (diskless boots).
-# The WHOLE directory ships — drop DN.ARH / config files in apps-boot/dn
-# and they're embedded on the next build; no hand-maintained list.
+# DN file manager, shipped into C:\BOOT\DN. The WHOLE directory ships — drop
+# DN.ARH / config files in apps-boot/dn and they appear on the next build; no
+# hand-maintained list.
 _DN_FILES = {
-    f: "DN/" + f.rsplit("/", 1)[-1]
+    f: "BOOT/DN/" + f.rsplit("/", 1)[-1]
     for f in glob(["apps-boot/dn/*"])
 }
 
-# The kernel's embedded boot filesystem: DN + COMMAND.COM + a fallback
-# CONFIG.SYS — the environment that is always there. Linked into kernel.elf
-# as raw bytes (//kernel:bootfs_obj) and mounted at /boot/ when no TAR boot
-# partition exists, so a bare kernel.elf booted from any multiboot loader
-# (someone's existing GRUB) comes up with a usable system, no RetroOS disk
-# required.
-_BOOTFS_FILES = {
-    "//tools/command:command_com": "COMMAND.COM",
-    # Per-program launch overrides, in the ALWAYS-present embedded bootfs so
-    # COMMAND.COM finds them regardless of how the ext4 root mounts (it may
-    # land at C:\DISK1 rather than C:\ — see startup.rs mount_filesystems).
-    "//tools/command:LOADFIX.CFG": "LOADFIX.CFG",
+# C:\BOOT — the DOS system directory: DN + COMMAND.COM + the launch overrides
+# COMMAND.COM reads. An ORDINARY DIRECTORY on the ext4 root, like C:\TESTS or
+# C:\GAMES. It used to be a TAR linked into kernel.elf and mounted over C:\BOOT
+# by a dedicated read-only VFS backend; the archive, the backend and the second
+# lookup path are gone. A boot with no RetroOS filesystem therefore has no DOS
+# system directory — there is no embedded fallback any more.
+_BOOT_DIR_FILES = {
+    "//tools/command:command_com": "BOOT/COMMAND.COM",
+    "//tools/command:LOADFIX.CFG": "BOOT/LOADFIX.CFG",
     # Bridge into the Linux personality: a DN-launchable ELF that execs
-    # /bin/busybox as `sh`. In the bootfs (C:\BOOT\SHELL.ELF) so it's ALWAYS
-    # present — independent of whatever's on the disk root / /home/retroos.
-    "//shell:shell_elf": "SHELL.ELF",
-    "etc/CONFIG.BOOTFS": "CONFIG.SYS",
+    # /bin/busybox as `sh`.
+    "//shell:shell_elf": "BOOT/SHELL.ELF",
 }
-_BOOTFS_FILES.update(_DN_FILES)
-
-pkg_tar(
-    name = "bootfs_tar",
-    files = _BOOTFS_FILES,
-    visibility = ["//kernel:__pkg__"],
-)
+_BOOT_DIR_FILES.update(_DN_FILES)
 
 # Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
 # source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
-# itself never mounts it: /boot is always the embedded bootfs, on top of
-# whatever the root is. Everything else lives on ext4.
+# itself never mounts it. Everything else, C:\BOOT included, lives on ext4.
 _BOOT_FILES = {
     "//boot:bootloader_bin": "A",
     ":kernel_md5": "kernel.elf.md5",
     "//kernel:kernel_elf": "kernel.elf",
 }
 
-# image_min's boot bundle: the bare kernel (no embedded bootfs). The in-OS
-# toolchain genrules (//tools/command:command_com, //tools/dosrt:stub_exe)
-# boot image_min, and the full kernel embeds COMMAND.COM — swapping in the
-# bare kernel here is what keeps that acyclic.
+# image_min's boot bundle is the same kernel. There used to be a second
+# "bare" kernel here: the full one embedded COMMAND.COM, which is built by
+# booting image_min, so image_min needed a kernel without it. Now that
+# C:\BOOT is ordinary ext4 content the kernel embeds nothing and the cycle
+# is gone with it.
 _BOOT_FILES_MIN = dict(_BOOT_FILES)
-_BOOT_FILES_MIN.pop("//kernel:kernel_elf")
-_BOOT_FILES_MIN.pop(":kernel_md5")
-_BOOT_FILES_MIN["//kernel:kernel_elf_bare"] = "kernel.elf"
-_BOOT_FILES_MIN[":kernel_md5_bare"] = "kernel.elf.md5"
 
 # Extras (live on ext4 in the boot+ext4 image, or alongside boot files in the
 # monolithic open-source image). Linux-personality binaries, test programs,
@@ -171,11 +148,9 @@ _EXTRA_FILES = {
     "etc/CONFIG.SYS": "CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
-    # COMMAND.COM itself is NOT duplicated here: it lives in the embedded bootfs
-    # at C:\BOOT\COMMAND.COM (see _BOOTFS_FILES), which is where COMSPEC points.
+    # COMMAND.COM is not here: it lives at C:\BOOT\COMMAND.COM (see
+    # _BOOT_DIR_FILES), which is where COMSPEC points.
     "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
-    # LOADFIX.CFG and shell.elf now live in the embedded bootfs (C:\BOOT) —
-    # see _BOOTFS_FILES.
     "//test/dos/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
     "//test/dos/stress:stress_elf":       "TESTS/stress.elf",
     "//test/dos/stress64:stress64_elf":   "TESTS/stress64.elf",
@@ -201,6 +176,7 @@ _EXTRA_FILES = {
     # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
     "//test/dos/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
     "//test/dos/sbproto:sbdisc_com":      "TESTS/SBDISC.COM",
+    "//test/dos/sbproto:sbirq_com":       "TESTS/SBIRQ.COM",
     "//test/dos/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
     # PC speaker probe — hosted_games.sh asserts SPKTEST prints OUT-OK (the
     # PIT ch2 OUT line at port 61h bit 5); its tone sequence is the fixture
@@ -215,6 +191,7 @@ _EXTRA_FILES = {
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.
     "//:apps/busybox/busybox":               "bin/busybox",
 }
+_EXTRA_FILES.update(_BOOT_DIR_FILES)
 
 # Minimum extras needed for the stub-build image (//tools/dosrt:stub_exe
 # boots //:image_min and runs in-OS TCC from ext4 /TC;
@@ -327,8 +304,8 @@ pkg_tar(
 # Disk image layout (used by both image and image_proprietary):
 #   sector 0           bootloader/MBR (with patched partition table)
 #   sector 1..         boot bundle TAR (kernel.elf for the MBR loader only)
-#   sector EXT4_START  ext4 partition: extras + TC + games (+ proprietary)
-# The kernel scans the MBR for the ext4 root; /boot is the embedded bootfs.
+#   sector EXT4_START  ext4 partition: extras + BOOT + TC + games (+ proprietary)
+# The kernel scans the MBR for the ext4 root; C:\BOOT is a directory on it.
 #
 # EXT4_START leaves 32 MiB of headroom for the boot bundle. Anything bigger
 # should live on ext4.
@@ -396,10 +373,8 @@ with open('$@', 'r+b') as f:
     "
 """
 
-# Stub-build image: apps-boot bundle (bare kernel+DN+TC) + just CONFIG.SYS.
-# Pulls NO dosrt artifacts and carries the bootfs-free kernel, so
-# image→bootfs→COMMAND.COM→image_min (and image→modplay→stub_exe→image_min)
-# is not a cycle (image_min's only ext4 content is CONFIG.SYS).
+# Stub-build image: the boot bundle + just CONFIG.SYS and TC. Pulls NO dosrt
+# artifacts, so image→modplay→stub_exe→image_min is not a cycle.
 genrule(
     name = "image_min",
     srcs = [":boot_bundle_min_tar", ":extras_min_tar"],
@@ -504,6 +479,30 @@ genrule(
         # Run `D:\\SETUPBC` once after booting to make BCC find its headers.
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/SETUPBC.BAT" "::SETUPBC.BAT"
     """,
+)
+
+# GRUB-booted hard-disk image: ONE ext4 partition, GRUB in the MBR gap, the
+# kernel at /boot/kernel.elf. No RetroOS bootloader and no boot-bundle
+# partition — installing on real hardware is `grub-install` plus a menuentry
+# instead of dd'ing our MBR. The legacy `image` target still builds the
+# own-bootloader layout; this is the candidate replacement.
+#
+# Needs grub-mkimage + the i386-pc modules (grub-pc-bin) and mkfs.ext4.
+genrule(
+    name = "image_grub",
+    srcs = [
+        "//kernel:kernel_elf",
+        ":extras_tar",
+        "tools/grub-hdd.cfg",
+        "tools/build_grub_hdd.py",
+    ],
+    outs = ["image_grub.bin"],
+    cmd = "python3 $(location tools/build_grub_hdd.py)" +
+          " --kernel $(location //kernel:kernel_elf)" +
+          " --extras $(location :extras_tar)" +
+          " --grub-cfg $(location tools/grub-hdd.cfg)" +
+          " --out $@",
+    visibility = ["//visibility:public"],
 )
 
 # GRUB bootable ISO (requires grub-mkrescue and mtools)

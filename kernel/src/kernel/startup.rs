@@ -3,7 +3,7 @@
 extern crate alloc;
 
 use crate::Regs;
-use crate::kernel::{vfs, fs::tarfs::TarFs, fs::lwext4::{Lwext4Fs, MountMode}};
+use crate::kernel::{vfs, fs::lwext4::{Lwext4Fs, MountMode}};
 use crate::kernel::thread;
 
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
@@ -177,6 +177,16 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
                 );
             }
         }
+        // Start delivering the card's completion line — the ACTING one, read
+        // back after any restrap above, not the probe-time snapshot and not a
+        // guess. This is the only place an SB interrupt line is enabled: the
+        // machine's other lines stay masked, so a floating IRQ 7 (LPT1's line,
+        // and the 8259's spurious vector) never reaches `handle_irq` at all.
+        if let Some(w) = crate::kernel::platform::get().sb_wiring {
+            machine.route_isa_irq(w.irq);
+            crate::println!("Audio: SB IRQ{} routed", w.irq);
+        }
+
         // Judge the H-declaration against the acting straps, not the
         // probe-time snapshot — the restrap just above may have enabled the
         // 16-bit channel.
@@ -253,10 +263,9 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
         .unwrap_or(0)
 }
 
-/// Execute the plan, then the invariant mounts.
-/// Build the mount tree. /boot is an INVARIANT: the embedded bootfs (DN +
-/// COMMAND.COM) mounted on top of whatever the root is — the disk's 0xDA
-/// boot-bundle partition is bootloader-only and never mounted.
+/// Build the mount tree. The disk's 0xDA boot-bundle partition is
+/// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
+/// ordinary directory on whatever backs C:, not a mount of its own.
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
@@ -274,8 +283,9 @@ fn mount_filesystems(
         .collect();
 
     if ext.is_empty() {
-        // No disk filesystem: the host fs IS the root if we have one, else the
-        // embedded bootfs at /boot is the whole world.
+        // No disk filesystem: the host fs IS the root if we have one. With
+        // neither disk nor host fs there is no root at all — and therefore no
+        // C:\BOOT, since it is just a directory on C:.
         if hostfs {
             vfs::mount(b"", host_fs());
             crate::screenln!(screen, "hostfs mounted as root");
@@ -333,22 +343,11 @@ fn mount_filesystems(
         }
     }
 
-    // The embedded DOS system mounts under C:\BOOT (= c_root + "boot/"). C:
-    // itself is the disk/host fs; C:\BOOT is this overlay. Both the prefix and
-    // the filesystem are leaked (one-time, boot-lifetime) to satisfy
-    // vfs::mount's &'static requirement — the same shape as the ext4 and host
-    // mounts above, so no `static mut` is involved.
-    let mut root_tarfs = TarFs::new_ram(crate::bootfs().unwrap_or(&[]));
-    if crate::bootfs().is_some() {
-        root_tarfs.build_index();
-    }
-    let bootfs_prefix: &'static [u8] = alloc::boxed::Box::leak(
-        [crate::kernel::dos::c_root(), b"boot/"].concat().into_boxed_slice());
-    vfs::mount(bootfs_prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(root_tarfs)));
-
+    // C:\BOOT is an ordinary directory on whatever backs C: — no mount, no
+    // embedded archive. A root without one simply has no DOS system directory.
     mount_kernel_log_fs();
 
-    crate::kernel::stacktrace::init_from_tar();
+    crate::kernel::stacktrace::init_from_vfs();
 }
 
 fn mount_kernel_log_fs() {
@@ -379,16 +378,12 @@ fn init_device_policy<A: crate::Arch>(
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven
-/// launches. KEY=VALUE lines, `#` comments. No root CONFIG.SYS (diskless
-/// boot) falls back to the embedded bootfs copy, whose PATH points into
-/// C:\BOOT; with neither, the env is empty.
+/// launches. KEY=VALUE lines, `#` comments. One location, C:\CONFIG.SYS —
+/// the second lookup existed only for the embedded bootfs's fallback copy.
+/// Absent, the env is empty.
 fn load_master_env() -> alloc::vec::Vec<u8> {
-    // C:\CONFIG.SYS (user override) wins; else the embedded C:\BOOT\CONFIG.SYS.
-    let cr = crate::kernel::dos::c_root();
-    let user_cfg = [cr, b"CONFIG.SYS"].concat();
-    let boot_cfg = [cr, b"boot/CONFIG.SYS"].concat();
+    let user_cfg = [crate::kernel::dos::c_root(), b"CONFIG.SYS"].concat();
     let config = crate::kernel::exec::load_file_resolved(&user_cfg)
-        .or_else(|_| crate::kernel::exec::load_file_resolved(&boot_cfg))
         .unwrap_or_default();
     crate::kernel::dos::parse_config_env(&config)
 }
@@ -511,15 +506,15 @@ fn run<A: crate::Arch>(
     }
 
     // COMMAND.COM is prebuilt (in-OS TCC at image-build time —
-    // //tools/command:command_com) and ships at C:\COMMAND.COM plus inside
-    // the embedded bootfs at C:\BOOT\COMMAND.COM. The per-boot self-build from
+    // //tools/command:command_com) and ships at C:\BOOT\COMMAND.COM, which is
+    // where COMSPEC points. The per-boot self-build from
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
     crate::screenln!(screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
     crate::screenln!(screen, "Starting DN...");
-    let dn_path = [crate::kernel::dos::c_root(), b"boot/DN/DN.COM"].concat();
+    let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
     loop {
         screen = run_program_with_screen(
             machine, bios_workspace, dos_template, threads, &dn_path, b"", b"", master_env, boot.debug_watch,

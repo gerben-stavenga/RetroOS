@@ -13,7 +13,7 @@
 #   --sound        sb | ac97 | hda | none          (default: sb; ac97/hda qemu only,
 #                                                   incl. qemu --firmware uefi)
 #   --arch         386 | 686 | x64                 (default: 386; qemu/bochs only)
-#   -i IMG         image|proprietary|ext4|grub|freedos
+#   -i IMG         image|proprietary|ext4|grub|grubhdd|freedos
 #                  Uniform across every backend AND firmware. Default: proprietary
 #                  when apps-proprietary/ is present, else image. (grub/freedos are
 #                  qemu-only; hosted accepts image|proprietary|ext4.)
@@ -462,8 +462,11 @@ resolve_image() {
         proprietary) BAZEL_TARGET="//:image_proprietary";  IMAGE_FILE="image_proprietary.bin" ;;
         ext4)        BAZEL_TARGET="//:image_ext4";          IMAGE_FILE="image_ext4.bin" ;;
         grub)        BAZEL_TARGET="//:grub_iso //:image_proprietary"; IMAGE_FILE="" ;;
+        # GRUB in the MBR gap, one ext4 partition, kernel at /boot/kernel.elf
+        # — no RetroOS bootloader (//:image_grub).
+        grubhdd)     BAZEL_TARGET="//:image_grub"; IMAGE_FILE="image_grub.bin" ;;
         freedos)     BAZEL_TARGET="//:freedos_apps";        IMAGE_FILE="freedos_apps.img" ;;
-        *)           echo "Unknown image type: $IMG (choose: image, proprietary, ext4, grub, freedos)" >&2; exit 1 ;;
+        *)           echo "Unknown image type: $IMG (choose: image, proprietary, ext4, grub, grubhdd, freedos)" >&2; exit 1 ;;
     esac
 }
 
