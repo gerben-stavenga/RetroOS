@@ -21,6 +21,18 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# Sustained completion-IRQ probe: auto-init DMA, count the interrupts, and
+# distinguish "none at all" from "the first one only". The polled probes above
+# cannot see either failure. Runs on the real card (86Box sweep) and on the
+# emulated one (test/hosted_games.sh).
+genrule(
+    name = "sbirq_com",
+    srcs = ["sbirq.asm"],
+    outs = ["SBIRQ.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
 genrule(
     name = "sbdoor_com",
     srcs = ["sbdoor.asm"],

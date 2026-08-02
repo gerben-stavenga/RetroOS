@@ -680,14 +680,20 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 // once the EOI clears the in-service bit — plain 8259
                 // behavior, no device knowledge required.
                 //
-                // Re-arm only the passthrough host IRQ5 (the real QEMU sb16
-                // line, masked until the guest EOIs). The emulated SB has no
-                // host line — its IRQ is purely virtual — so there is nothing
-                // to rearm there (`feedback_no_half_modelled_devices`).
+                // Re-arm the passthrough card's HOST line, which `handle_irq`
+                // masked when it queued the completion and which stays masked
+                // until the guest EOIs. It is `sb.host_irq` — the line the
+                // card is really strapped to, the same value the relay matches
+                // on — NOT the guest's BLASTER line and not a constant: a
+                // restrapped card (86Box moves to IRQ 7) would otherwise have
+                // its real line masked forever after the first completion, and
+                // every later block would silently never arrive. The emulated
+                // SB has no host line — its IRQ is purely virtual — so there is
+                // nothing to rearm there (`feedback_no_half_modelled_devices`).
                 let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
                 pc.vpic.master_eoi();
-                if sb_in_service && !pc.sb.is_emulated() {
-                    machine.rearm_irq(5);
+                if sb_in_service && !pc.sb.is_emulated() && pc.sb.host_irq < 16 {
+                    machine.rearm_irq(pc.sb.host_irq);
                 }
             }
         }

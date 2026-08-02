@@ -70,6 +70,12 @@ run "SB DSP completion protocol" \
 # block reaching terminal count. The last one caught a real gap: only the
 # single-cycle path latched the 8237 TC bit, so an auto-init driver
 # identifying its own interrupt by `in al, 0x08` was told "not mine".
+# NOT here: sustained completion IRQs (TESTS/SBIRQ.COM). The hosted backend
+# has no audio sink (Audio: EmulatedSilent), so nothing paces the guest's DMA
+# and no completion interrupt is ever generated — the probe would fail for a
+# reason that is not the thing under test. It runs where a card actually
+# completes blocks: test/sb_86box.sh (real SB16) and QEMU.
+
 run "SB discovery/init conformance" \
     --cmd "TESTS/SBDISC.COM" --settle 3 --timeout 40 \
     --expect-log "RST-OK" --expect-log "MIXRST-OK" --expect-log "MIXVOL-OK" \

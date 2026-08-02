@@ -495,18 +495,14 @@ pub fn init_interrupts() {
     lib::println!("IRQ: mouse probe");
     if init_mouse() {
         lib::println!("IRQ: mouse ready");
-        // The emulated legacy machine that supplies a PS/2 mouse may also
-        // supply an ISA Sound Blaster on IRQ 5 or 7. Both deliveries carry
-        // it: ISA IRQs map 1:1 to GSIs, and the IOAPIC entries are edge-
-        // triggered like the 8259, so an idle line costs nothing.
+        // Only the mouse's own line. A device's interrupt is enabled by
+        // whoever probed that device (`route_isa_irq`), never as a side
+        // effect of an unrelated probe — the SB lines used to be unmasked
+        // here on the theory that a PS/2 mouse implies a legacy ISA machine.
         if apic {
             ioapic_route(12, IRQ_OFFSET + 12, false); // mouse GSI12
-            ioapic_route(5, IRQ_OFFSET + 5, false);   // ISA SB (QEMU sb16 default)
-            ioapic_route(7, IRQ_OFFSET + 7, false);   // ISA SB alternate line
         } else {
             unmask_irq(12);
-            unmask_irq(5);
-            unmask_irq(7);
         }
     } else {
         lib::println!("IRQ: mouse unavailable");
