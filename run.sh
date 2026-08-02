@@ -10,8 +10,15 @@
 #   --firmware     bios | uefi                     (default: bios; qemu/bochs only)
 #   --sb-audio     native | mixed                  (qemu only: fw_cfg override of
 #                  CONFIG.SYS's SB_AUDIO — who owns a real SB, the guest or our mixer)
-#   --sound        sb | ac97 | hda | none          (default: sb; ac97/hda qemu only,
+#   --sound        sb | ac97 | hda | none          (default: hda on qemu, sb
+#                                                   elsewhere; ac97/hda qemu only,
 #                                                   incl. qemu --firmware uefi)
+#                  QEMU's sb16 is NOT our real-card reference: it never pulses the
+#                  DSP write-status busy bit and does not surface the E4h/E8h test
+#                  register, so passing `sb` here exercises a second-rate real card.
+#                  86Box is the reference for a physical SB16 (test/sb_86box.sh);
+#                  hda/ac97 here run our EMULATED SB, which is the path that ships
+#                  on every machine without an ISA card.
 #   --arch         386 | 686 | x64                 (default: 386; qemu/bochs only)
 #   -i IMG         image|proprietary|ext4|grub|grubhdd|freedos
 #                  Uniform across every backend AND firmware. Default: proprietary
@@ -61,7 +68,7 @@ usage() {
 
 BACKEND="qemu"
 FIRMWARE="bios"
-SOUND="sb"
+SOUND=""   # per-backend default, resolved after parsing (see below)
 ARCH="386"
 IMG=""            # resolved to a per-backend default later if empty
 ARCH_SET=0        # whether the user explicitly passed --arch (for warnings)
@@ -152,6 +159,18 @@ case "$FIRMWARE" in
     bios|uefi) ;;
     *) echo "run.sh: unknown firmware '$FIRMWARE' (bios|uefi)" >&2; exit 1 ;;
 esac
+
+# Per-backend default. QEMU gets our EMULATED SB over an HDA codec: its own
+# sb16 is not a card we hold up as real (no write-status busy pulse, no E4h/E8h
+# test register), and running the emulated path here is what ships on every
+# machine without an ISA card. bochs/86box model only an SB16, and 86Box is the
+# reference for a physical one, so they default to it.
+if [ -z "$SOUND" ]; then
+    case "$BACKEND" in
+        qemu) SOUND="hda" ;;
+        *)    SOUND="sb" ;;
+    esac
+fi
 
 case "$SOUND" in
     sb|ac97|hda|none) ;;
@@ -1135,6 +1154,30 @@ EOF
 # ===========================================================================
 # launch_86box  (verbatim from run_86box.sh)
 # ===========================================================================
+# Append a TEST= line to C:\CONFIG.SYS inside a raw disk image. debugfs cannot
+# take a partition offset, so the partition is lifted out, edited, and spliced
+# back at the same LBA. Writes only to the caller's copy of the image.
+inject_test_cmd() {
+    local img="$1" cmd="$2" off part cfg
+    command -v debugfs >/dev/null 2>&1 || return 1
+    # Partition 2, not 1: p1 is the boot TAR the MBR bootloader reads, p2 is
+    # the ext4 root that carries C:.
+    off=$(partx -g -o START -n 2 "$img" 2>/dev/null | tr -d ' ')
+    [ -n "$off" ] || return 1
+    part=$(mktemp) || return 1
+    cfg=$(mktemp)  || return 1
+    dd if="$img" bs=512 skip="$off" of="$part" status=none || return 1
+    debugfs -R "dump home/retroos/CONFIG.SYS $cfg" "$part" 2>&1 | grep -qi "not found\|Bad magic" && return 1
+    # An empty CONFIG.SYS here would mean the dump silently failed and we are
+    # about to REPLACE the guest's BLASTER/SB_AUDIO declarations with one line.
+    [ -s "$cfg" ] || return 1
+    printf 'TEST=%s\r\n' "$cmd" >> "$cfg"
+    printf 'rm home/retroos/CONFIG.SYS\nwrite %s home/retroos/CONFIG.SYS\n' "$cfg" \
+        | debugfs -w -f - "$part" 2>&1 | grep -qi "Bad magic\|error" && return 1
+    dd if="$part" of="$img" bs=512 seek="$off" conv=notrunc status=none || return 1
+    rm -f "$part" "$cfg"
+}
+
 launch_86box() {
     case "$IMG" in
         image)        BAZEL_TARGET="//:image";              IMAGE_FILE="image.bin" ;;
@@ -1166,6 +1209,15 @@ launch_86box() {
 
     mkdir -p "$VM_DIR"
     FS_GRANT=""
+    # A VM dir set from outside (test/sb_86box.sh, a scratch sweep) normally
+    # sits OUTSIDE the flatpak's own data dir, which the sandbox does not
+    # share. 86Box then finds no config at all and silently falls back to its
+    # built-in defaults — an 8086 that boots into ROM BASIC, with no error to
+    # say why. Grant it explicitly so an external dir works or fails loudly.
+    case "$VM_DIR" in
+        "${HOME}/.var/app/"*) ;;              # already inside the sandbox
+        *) FS_GRANT="--filesystem=$VM_DIR" ;;
+    esac
 
     if [ "$IMG" = "freedos" ]; then
         # ---- FreeDOS reference mode ----
@@ -1257,6 +1309,19 @@ EOF
     rm -f "${VM_DIR}/disk.img"
     cp --reflink=auto "${SCRIPT_DIR}/bazel-bin/${IMAGE_FILE}" "${VM_DIR}/disk.img"
     chmod u+rw "${VM_DIR}/disk.img"
+
+    # --cmd on a backend with no fw_cfg. 86Box cannot be handed a cmdline, so
+    # the command travels IN the image: the kernel runs CONFIG.SYS's TEST= line
+    # and shuts down after it, exactly as it does for fw_cfg's opt/cmdline.
+    # Injected into this run's private copy, never into the built image.
+    if [ -n "${HOSTED_CMD:-}" ]; then
+        inject_test_cmd "${VM_DIR}/disk.img" "$HOSTED_CMD" || {
+            echo "run.sh: could not inject TEST= into the 86Box disk image." >&2
+            echo "        Needs debugfs (e2fsprogs) and partx (util-linux)." >&2
+            exit 1
+        }
+        echo "86box: CONFIG.SYS TEST=$HOSTED_CMD (kernel shuts down when it exits)"
+    fi
 
     if [ -f "${VM_DIR}/86box.cfg" ] && ! grep -q '^\[Hard disks\]' "${VM_DIR}/86box.cfg"; then
         cat >> "${VM_DIR}/86box.cfg" <<'EOF'

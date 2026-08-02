@@ -38,7 +38,16 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // the explicit early-boot `disk-writes=persistent` policy; CONFIG.SYS is
     // deliberately too late to weaken storage safety. Done before partition
     // scanning, so every Volume built below already carries the policy.
+    // 86Box/Bochs are emulators, not the laptop: they present a PIIX-class
+    // 1990s southbridge, and what they write to is a disposable disk *image*.
+    // Overlaying them bought nothing and cost the one thing that made them
+    // useful — a guest could not leave a file behind, so a test's verdict never
+    // survived the run and the SB suite could assert nothing. Real hardware
+    // (anything with a chipset we don't recognize as emulated) keeps the
+    // overlay, because there the disk is someone's actual install.
+    let emulated_machine = emulated_southbridge(machine);
     let disks = if platform.host == crate::kernel::platform::Host::Metal
+        && !emulated_machine
         && !boot.persistent_disk_writes
     {
         crate::screenln!(screen, "Disk writes: volatile RAM overlay (real hardware) — changes will NOT persist");
@@ -457,6 +466,27 @@ fn init_console_pipe() {
     crate::kernel::thread::set_console_pipe(console_pipe);
 }
 
+/// Whether this machine's southbridge is one only an emulator presents.
+///
+/// The distinction that matters for disk-write policy is not "am I on metal"
+/// — 86Box and Bochs both are, as far as the CPU is concerned — but "is the
+/// disk behind me a real one". A PIIX/PIIX3/PIIX4 on bus 0 in 2026 means a
+/// 1990s PC being emulated, and its disk is a throwaway image file; a real
+/// machine has a chipset from this century. Whitelisted by device ID rather
+/// than inferred, so an unrecognized machine is treated as real and keeps the
+/// protective overlay — the safe direction to be wrong in.
+fn emulated_southbridge<A: crate::Arch>(machine: &mut A) -> bool {
+    const EMULATED: [u32; 4] = [
+        0x7000_8086, // 82371SB PIIX3 ISA  (QEMU i440FX, Bochs)
+        0x7110_8086, // 82371AB PIIX4 ISA  (86Box i430TX/440BX boards)
+        0x7113_8086, // 82371AB PIIX4 power management
+        0x122E_8086, // 82371FB PIIX ISA
+    ];
+    (0..32u8).any(|dev| {
+        (0..4u8).any(|func| EMULATED.contains(&crate::kernel::pci::read32(machine, 0, dev, func, 0)))
+    })
+}
+
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
 fn run<A: crate::Arch>(
@@ -468,7 +498,17 @@ fn run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     mut screen: crate::kernel::platform::VisibleScreen,
 ) -> ! {
-    if let Some(raw) = boot.cmdline() {
+    // What to run headlessly, from whichever channel the backend has. QEMU and
+    // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
+    // Bochs have NO such channel — `--cmd` was silently ignored there, so every
+    // "probe run" on the one backend that models a real SB16 faithfully booted
+    // the normal image and sat at DN. `TEST=` in CONFIG.SYS is the channel that
+    // needs no hypervisor cooperation: it travels in the image, so it works on
+    // every backend and on real metal too. Same sequence, same shutdown after.
+    let cmdline = boot
+        .cmdline()
+        .or_else(|| crate::kernel::dos::config_var(master_env, b"TEST"));
+    if let Some(raw) = cmdline {
         // CWD: explicit `opt/cwd` key wins; else fall back to each program's
         // own directory.
         let explicit_cwd = boot.cwd().map(trim_ascii);

@@ -452,8 +452,52 @@ pub fn hlt() {
 /// Shut the machine down. Writes the QEMU/Bochs ACPI shutdown ports —
 /// QEMU exits cleanly. On real hardware this is a no-op fallback to a
 /// halt loop; the user can power off manually.
+/// ACPI soft-off through a PIIX4-class southbridge, whose PM I/O block sits
+/// wherever firmware put it — so we ask the chip instead of guessing a port.
+///
+/// The three hardcoded ports below are each one *emulator's* fixed choice, and
+/// a machine that isn't that emulator simply ignores them: 86Box's i430TX
+/// boards pair with a PIIX4 whose AMI BIOS programs the PM base somewhere else
+/// entirely, so RetroOS could never power one off — it halted with the window
+/// still up, which is also why a test's output never reached the disk.
+///
+/// PIIX4 (Intel 82371AB) exposes power management as function 3 of its
+/// multi-function bridge, device 7113. PMBA is config dword 0x40 (base in bits
+/// 15:6), PMREGMISC bit 0 enables the I/O decode, and PM1_CNT lives at
+/// base+4: SLP_EN (bit 13) with SLP_TYP 0 is soft-off.
+fn piix4_soft_off() {
+    const CFG_ADDR: u16 = 0xCF8;
+    const CFG_DATA: u16 = 0xCFC;
+    let cfg_read = |dev: u32, func: u32, off: u32| -> u32 {
+        outl(CFG_ADDR, 0x8000_0000 | (dev << 11) | (func << 8) | (off & 0xFC));
+        inl(CFG_DATA)
+    };
+    let cfg_write = |dev: u32, func: u32, off: u32, val: u32| {
+        outl(CFG_ADDR, 0x8000_0000 | (dev << 11) | (func << 8) | (off & 0xFC));
+        outl(CFG_DATA, val);
+    };
+    for dev in 0..32u32 {
+        // Bus 0 only: the southbridge is never behind a bridge.
+        if cfg_read(dev, 3, 0x00) != 0x7113_8086 {
+            continue;
+        }
+        let base = (cfg_read(dev, 3, 0x40) & 0xFFC0) as u16;
+        if base == 0 {
+            return; // firmware never assigned the block; nothing to poke
+        }
+        // Enable the PM I/O decode if firmware left it off — harmless when set.
+        let misc = cfg_read(dev, 3, 0x80);
+        if misc & 1 == 0 {
+            cfg_write(dev, 3, 0x80, misc | 1);
+        }
+        outw(base + 0x04, 0x2000); // PM1_CNT: SLP_TYP=0 (soft off) + SLP_EN
+        return;
+    }
+}
+
 pub fn shutdown() -> ! {
     cli();
+    piix4_soft_off();      // 86Box (i430TX/PIIX4) and any real PIIX4 board
     outw(0x604, 0x2000);   // QEMU PIIX (i440FX) ACPI shutdown
     outw(0xB004, 0x2000);  // QEMU pre-1.7 / Bochs
     outw(0x4004, 0x3400);  // VirtualBox

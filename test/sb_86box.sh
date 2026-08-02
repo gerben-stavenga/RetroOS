@@ -20,7 +20,11 @@
 #
 # 86Box is a GUI application with no log to grep, so each probe writes its
 # verdict to a file on C: and this script reads it back out of the disk image
-# afterwards with debugfs — no screen scraping, no root.
+# afterwards with debugfs — no screen scraping, no root. Three things had to
+# be true for that to work at all, and none of them were until now: the probe
+# needs a command channel (CONFIG.SYS TEST=, since 86Box has no fw_cfg), the
+# guest's writes need to reach the image rather than the volatile RAM overlay,
+# and the VM has to power off so those writes are flushed.
 #
 # Usage:
 #   test/sb_86box.sh              run the assertions
@@ -38,23 +42,50 @@ if [ -z "$BOX86" ]; then
         [ -x "$c" ] && BOX86="$c" && break
     done
 fi
-if [ -z "$BOX86" ] && command -v flatpak >/dev/null 2>&1; then
+FLATPAK_ID=""
+if command -v flatpak >/dev/null 2>&1; then
     FLATPAK_ID=$(flatpak list --app --columns=application 2>/dev/null | grep -i 86box | head -1)
-    [ -n "$FLATPAK_ID" ] && BOX86="flatpak run $FLATPAK_ID"
 fi
-[ -n "$BOX86" ] || { echo "86Box not found; set BOX86=/path/to/86Box.AppImage" >&2; exit 2; }
+# BOX86 stays empty for a flatpak install: run.sh has its own flatpak launch
+# path (it must pass --env and --filesystem grants), and setting BOX86 to a
+# "flatpak run ..." string would bypass it.
+[ -n "$BOX86" ] || [ -n "$FLATPAK_ID" ] || {
+    echo "86Box not found; set BOX86=/path/to/86Box.AppImage" >&2; exit 2; }
 
-VM_DIR="${VM_DIR:-$HOME/.local/share/86Box/retroos-sbsweep}"
-IMG="${IMG:-bazel-bin/image.bin}"
+# The CONFIGURED VM, not a scratch one: 86Box's machine/sound setup lives in
+# its 86box.cfg, and a fresh dir would run whatever run.sh synthesizes rather
+# than the machine this suite is meant to assert against. Derived exactly as
+# run.sh does, and EXPORTED so run.sh uses the same dir we read back from.
+if [ -z "${VM_DIR:-}" ]; then
+    if [ -n "$FLATPAK_ID" ]; then
+        VM_DIR="$HOME/.var/app/$FLATPAK_ID/data/86Box/RetroOS"
+    else
+        VM_DIR="$HOME/.local/share/86Box/RetroOS"
+    fi
+fi
+export VM_DIR
+# run.sh -i takes an image KEYWORD, not a path; IMG is the file the same
+# keyword resolves to, which is what debugfs reads the verdicts back out of.
+IMG_KIND="${IMG_KIND:-image}"
+# 86Box runs a COPY inside the VM dir ($VM_DIR/disk.img), not bazel-bin's
+# image, so that copy is where a probe's verdict lands and where we read it.
+IMG="${IMG:-$VM_DIR/disk.img}"
 
 # Read a probe's verdict file out of the image the run just used. The DOS C:
 # root is an ext4 subtree, so debugfs reads it without mounting (no root).
 read_verdict() {
-    local img="$1" name="$2" part_off
-    part_off=$(partx -g -o START -n 1 "$img" 2>/dev/null | tr -d ' ')
+    local img="$1" name="$2" part_off part out
+    [ -f "$img" ] || return 1
+    # Partition 2 carries the ext4 root with C:; partition 1 is the boot TAR.
+    part_off=$(partx -g -o START -n 2 "$img" 2>/dev/null | tr -d ' ')
     [ -n "$part_off" ] || return 1
-    debugfs -R "cat home/retroos/$name" \
-        <(dd if="$img" bs=512 skip="$part_off" 2>/dev/null) 2>/dev/null
+    # A real file, not <(dd ...): debugfs seeks, and a process substitution is
+    # a pipe — it fails with "Illegal seek" and reads nothing, silently.
+    part=$(mktemp) || return 1
+    dd if="$img" bs=512 skip="$part_off" of="$part" status=none 2>/dev/null
+    out=$(debugfs -R "cat home/retroos/$name" "$part" 2>/dev/null)
+    rm -f "$part"
+    printf '%s' "$out"
 }
 
 if [ "${1:-}" = "--learn" ]; then
@@ -63,7 +94,7 @@ if [ "${1:-}" = "--learn" ]; then
     echo "set base/IRQ/DMA, then quit. The section 86Box writes is what a strap"
     echo "sweep needs:"
     echo
-    BOX86="$BOX86" ./run.sh 86box -i "$IMG" || true
+    ./run.sh 86box -i "$IMG_KIND" || true
     echo
     echo "--- per-device sections found in $VM_DIR/86box.cfg ---"
     awk '/^\[/{p=0} /Sound Blaster|SB16|sb16/{p=1} p' "$VM_DIR/86box.cfg" 2>/dev/null
@@ -72,18 +103,51 @@ fi
 
 FAILED=0
 
+# How long a single probe may take, in seconds: 86Box boots an AMI BIOS POST,
+# then RetroOS, then the program. Generous — the loop exits as soon as the
+# verdict appears, so a healthy probe costs whatever it actually needs.
+PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"
+
 # $1 = probe .COM path on C:, $2 = verdict filename, $3.. = required markers.
-# The probe is launched through the ordinary shell path (not --cmd) so the run
-# is the one a user would get; 86Box exits when the program does.
+#
+# The probe is launched through CONFIG.SYS's TEST= line (run.sh injects it into
+# this run's disk copy), which is the only command channel 86Box has — it takes
+# no fw_cfg and no command line.
+#
+# We poll for the verdict file rather than wait for the process to exit,
+# because 86Box never exits: RetroOS's `shutdown()` pokes the QEMU/Bochs/
+# VirtualBox ACPI shutdown ports and 86Box's PIIX4 PM base is elsewhere, so the
+# guest halts and the window stays up. Killing it once the verdict has landed
+# is the normal end of a probe here, not a failure.
 run_probe() {
     local prog="$1" log="$2"; shift 2
     echo "=== $prog ==="
-    BOX86="$BOX86" ./run.sh 86box -i "$IMG" --cmd "$prog" >/dev/null 2>&1 || true
 
-    local verdict
-    verdict=$(read_verdict "$IMG" "$log")
+    ./run.sh 86box -i "$IMG_KIND" --cmd "$prog" >/dev/null 2>&1 &
+    local pid=$! waited=0 verdict=""
+    while [ "$waited" -lt "$PROBE_TIMEOUT" ]; do
+        sleep 5
+        waited=$((waited + 5))
+        verdict=$(read_verdict "$IMG" "$log")
+        [ -n "$verdict" ] && break
+        # If it died on its own, stop waiting on it.
+        kill -0 "$pid" 2>/dev/null || break
+    done
+
+    # A healthy probe has already powered the VM off (the kernel's ACPI
+    # soft-off reaches 86Box's PIIX4 now), so this only catches a hung one.
+    # NOT pkill: this script's own name matches "86box" and it would kill
+    # itself.
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    sleep 1
+    # Read once more now that the VM is definitely gone: a clean power-off is
+    # what flushes the image, so on the normal path the verdict only becomes
+    # visible AFTER the loop above noticed the process exit.
+    [ -n "$verdict" ] || verdict=$(read_verdict "$IMG" "$log")
+
     if [ -z "$verdict" ]; then
-        echo "FAIL: no $log in the image — the probe did not run" >&2
+        echo "FAIL: no $log in the image after ${PROBE_TIMEOUT}s — the probe did not run" >&2
         FAILED=1
         return
     fi
