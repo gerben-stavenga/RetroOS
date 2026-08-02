@@ -32,6 +32,20 @@ SECTIONS
     _erodata = .;
     _data = .;
 
+    /* KERNEL_STACK sits at the very BOTTOM of the writable region, so the
+     * memory it grows down into is .rodata (R-- NX, and CR0.WP is set — see
+     * paging2::harden_kernel). A gradual overflow still takes the unmapped
+     * guard page; a single frame LARGER than the guard, which a `sub esp,N`
+     * with no stack probe can step clean over, lands in read-only memory and
+     * faults there instead of silently corrupting .bss. (NOLOAD) keeps the
+     * region out of the file image: it is a permission boundary, so the
+     * linker already starts a new PT_LOAD here. */
+    .kstack (NOLOAD) : ALIGN(4K) {
+        KERNEL_STACK_GUARD = .;     . += 0x1000;   /* 4 KB */
+        KERNEL_STACK       = .;     . += 0x10000;  /* 64 KB */
+        KERNEL_STACK_TOP   = .;
+    }
+
     .data ALIGN(4K) : {
         *(.data .data.*)
     }
@@ -40,18 +54,13 @@ SECTIONS
     .bss ALIGN(4K) : {
         *(.bss .bss.*)
         *(COMMON)
-        /* Stacks live at the END of .bss, each preceded by a guard page
-         * that boot.rs unmaps so overflow page-faults instead of silently
-         * corrupting adjacent memory. KERNEL_STACK overflow is caught
-         * cleanly by traps.rs (handler runs on ARCH_STACK). ARCH_STACK
-         * overflow can't be reported — #PF would be delivered on the
-         * overflowed stack itself — but the unmapped guard turns silent
-         * corruption into a triple fault, which is easy to diagnose.
+        /* ARCH_STACK lives at the END of .bss, preceded by a guard page that
+         * boot.rs unmaps. Its overflow can't be reported — #PF would be
+         * delivered on the overflowed stack itself — but the unmapped guard
+         * turns silent corruption into a triple fault, easy to diagnose.
+         * KERNEL_STACK is NOT here; see .kstack above.
          * Addresses are linker symbols — Rust references them via extern. */
         . = ALIGN(4K);
-        KERNEL_STACK_GUARD = .;     . += 0x1000;   /* 4 KB */
-        KERNEL_STACK       = .;     . += 0x10000;  /* 64 KB */
-        KERNEL_STACK_TOP   = .;
         /* espfix invariant (see GDT_ESPFIX_SS in arch-metal/descriptors.rs):
          * ARCH_STACK is the ring-0 trap stack (TSS.sp0) — 64K-ALIGN it so
          * the whole 16 KB stack sits inside one 64K segment window and every
