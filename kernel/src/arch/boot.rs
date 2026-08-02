@@ -296,9 +296,9 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     }
 
     let mut cfg = crate::BootConfig::empty();
-    cfg.persistent_disk_writes = multiboot_cmdline
+    cfg.ram_overlay = multiboot_cmdline
         .split(|b| b.is_ascii_whitespace())
-        .any(|arg| arg.eq_ignore_ascii_case(b"disk-writes=persistent"));
+        .any(|arg| arg.eq_ignore_ascii_case(b"ram-overlay"));
 
     select(0x0000); // FW_CFG_SIGNATURE
     let mut sig = [0u8; 4];

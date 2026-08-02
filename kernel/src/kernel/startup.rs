@@ -33,24 +33,29 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     let mut screen =
         crate::kernel::platform::VisibleScreen::new(screen, probed.display);
 
-    // Disk-write policy, applied by COMPOSITION: metal defaults to wrapping
-    // every physical disk in a volatile RAM overlay. The only escape hatch is
-    // the explicit early-boot `disk-writes=persistent` policy; CONFIG.SYS is
-    // deliberately too late to weaken storage safety. Done before partition
-    // scanning, so every Volume built below already carries the policy.
-    // 86Box/Bochs are emulators, not the laptop: they present a PIIX-class
-    // 1990s southbridge, and what they write to is a disposable disk *image*.
-    // Overlaying them bought nothing and cost the one thing that made them
-    // useful — a guest could not leave a file behind, so a test's verdict never
-    // survived the run and the SB suite could assert nothing. Real hardware
-    // (anything with a chipset we don't recognize as emulated) keeps the
-    // overlay, because there the disk is someone's actual install.
-    let emulated_machine = emulated_southbridge(machine);
-    let disks = if platform.host == crate::kernel::platform::Host::Metal
-        && !emulated_machine
-        && !boot.persistent_disk_writes
-    {
-        crate::screenln!(screen, "Disk writes: volatile RAM overlay (real hardware) — changes will NOT persist");
+    // Disk-write policy, applied by COMPOSITION and DECLARED, never inferred.
+    //
+    // RetroOS writes to its disk, like an operating system. A machine that
+    // wants its medium left alone asks for it, with `ram-overlay` on the
+    // kernel command line — and the machine that wants it is the one with a
+    // real install on it, which boots through GRUB, whose config its owner
+    // controls. So the protection is configured where the risk actually lives.
+    //
+    // It used to be the other way round: protect by default, on the theory
+    // that metal means "someone's real disk". That silently broke every
+    // emulator too — a DOS program could not save a game, and a test could not
+    // leave a verdict behind, which is why the 86Box SB suite could assert
+    // nothing for as long as it existed. The first repair was worse: sniff the
+    // southbridge and call a PIIX-class chipset an emulator. That gets this
+    // project's own audience exactly backwards, since a real Pentium with a
+    // PIIX4 is a first-class target and the likeliest machine to be holding
+    // someone's actual data. No heuristic can answer "is this disk precious";
+    // only its owner can, so only its owner does.
+    //
+    // Done before partition scanning, so every Volume built below already
+    // carries the policy.
+    let disks = if boot.ram_overlay {
+        crate::screenln!(screen, "Disk writes: volatile RAM overlay (ram-overlay) — changes will NOT persist");
         disks
             .into_iter()
             .map(|d| -> &'static dyn crate::kernel::block::Disk {
@@ -464,27 +469,6 @@ fn init_console_pipe() {
     let console_pipe = crate::kernel::kpipe::alloc().expect("Failed to allocate console pipe");
     crate::kernel::kpipe::add_writer(console_pipe);
     crate::kernel::thread::set_console_pipe(console_pipe);
-}
-
-/// Whether this machine's southbridge is one only an emulator presents.
-///
-/// The distinction that matters for disk-write policy is not "am I on metal"
-/// — 86Box and Bochs both are, as far as the CPU is concerned — but "is the
-/// disk behind me a real one". A PIIX/PIIX3/PIIX4 on bus 0 in 2026 means a
-/// 1990s PC being emulated, and its disk is a throwaway image file; a real
-/// machine has a chipset from this century. Whitelisted by device ID rather
-/// than inferred, so an unrecognized machine is treated as real and keeps the
-/// protective overlay — the safe direction to be wrong in.
-fn emulated_southbridge<A: crate::Arch>(machine: &mut A) -> bool {
-    const EMULATED: [u32; 4] = [
-        0x7000_8086, // 82371SB PIIX3 ISA  (QEMU i440FX, Bochs)
-        0x7110_8086, // 82371AB PIIX4 ISA  (86Box i430TX/440BX boards)
-        0x7113_8086, // 82371AB PIIX4 power management
-        0x122E_8086, // 82371FB PIIX ISA
-    ];
-    (0..32u8).any(|dev| {
-        (0..4u8).any(|func| EMULATED.contains(&crate::kernel::pci::read32(machine, 0, dev, func, 0)))
-    })
 }
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program

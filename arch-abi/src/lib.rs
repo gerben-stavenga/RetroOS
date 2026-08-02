@@ -55,10 +55,19 @@ pub struct BootConfig {
     /// a knob and never a probe heuristic. Ignored on UEFI machines, which
     /// have no ISA card to hand over and always mix.
     pub audio_mixed: bool,
-    /// Allow writes to reach physical disks on metal. False is the safe
-    /// default: startup wraps every physical disk in a volatile RAM overlay.
-    /// Set only by the explicit Multiboot argument `disk-writes=persistent`.
-    pub persistent_disk_writes: bool,
+    /// Divert every physical disk write into a volatile RAM overlay, so
+    /// nothing reaches the medium. Set only by the explicit Multiboot argument
+    /// `ram-overlay`.
+    ///
+    /// Off by default, i.e. RetroOS writes to its disk like an operating
+    /// system. The previous default was the reverse — protect unless told
+    /// otherwise — which meant every emulator silently discarded guest writes
+    /// too, so a DOS program could not save a game and a test could not leave
+    /// a verdict behind. Protection now has to be ASKED for, and the place
+    /// that asks is the boot loader entry of the machine that wants it: a
+    /// real install boots through GRUB, whose config its owner controls.
+    /// Nothing infers this from the hardware.
+    pub ram_overlay: bool,
 }
 
 impl BootConfig {
@@ -68,7 +77,7 @@ impl BootConfig {
             cwd: [0; 256], cwd_len: None,
             c_root: [0; 128], c_root_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
-            persistent_disk_writes: false,
+            ram_overlay: false,
         };
         // Default C: root = "home/retroos/".
         let d = *b"home/retroos/";
