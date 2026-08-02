@@ -91,6 +91,16 @@ edge_seen:
         out dx, al
 
         ; ---- phase 3: TC status bit + count underflow on completion ----
+        ; Phase 2 left the DSP PAUSED (it sent 0xD0 to stop that transfer), and
+        ; a real SB16 keeps honouring that pause across the next start command:
+        ; the 0x14 below arms the 8237, one already-in-flight byte moves, and
+        ; the card then stops asking. Observed on 86Box as cnt=00FE against a
+        ; programmed 0x00FF, with the TC bit never latching. Resume first.
+        ; (QEMU's sb16 does not model the pause holding across a new start,
+        ; which is why this only ever failed on the faithful card.)
+        mov dx, 0x22C
+        mov al, 0xD4           ; continue 8-bit DMA
+        out dx, al
         mov ax, 255            ; short block (256 bytes, ~23 ms at 11 kHz)
         call startblk
         ; Bound the poll in TIME, not iterations. Port 0x08 is trapped by the
@@ -114,20 +124,65 @@ edge_seen:
         cmp ax, 5
         jb  .tcin
         pop es
-        jmp fail_tc
+        ; The status bit never latched. Report the controller's CURRENT COUNT
+        ; with it: that says whether the real 8237 ran this block at all.
+        ;   ~0x00FF (what was programmed) -> it never started
+        ;   something in between          -> it is counting, TC just not seen
+        ;   0xFFFF                        -> it finished and the TC bit was lost
+        call read_count
+        mov [cnt_val], ax
+        mov dx, msg_ftbit
+        call emit
+        call emit_count
+        jmp exit
 .tc_hit:
         pop es
         ; current count must now read the post-TC underflow value 0xFFFF
+        call read_count
+        cmp ax, 0xFFFF
+        je  .tc_ok
+        mov [cnt_val], ax
+        mov dx, msg_ftcnt
+        call emit
+        call emit_count
+        jmp exit
+.tc_ok:
+        mov dx, msg_tc
+        call emit
+        jmp exit
+
+; ---------------------------------------------------------------------------
+; DMA1 ch1 current count, low byte then high, via the byte-pointer flip-flop.
+; Served by the kernel from the REAL controller in passthrough, so this is the
+; physical chip's progress, not a shadow.
+read_count:
         xor al, al
         out 0x0C, al           ; clear byte-pointer flip-flop
         in  al, 0x03           ; count lo
         mov ah, al
         in  al, 0x03           ; count hi
-        cmp ax, 0xFFFF
-        jne fail_tc
-        mov dx, msg_tc
+        xchg al, ah            ; -> ax = hi:lo
+        ret
+
+; print 'cnt=XXXX' for [cnt_val]
+emit_count:
+        mov ax, [cnt_val]
+        mov di, cnt_hex
+        mov cx, 4
+.nib:   rol ax, 4
+        push ax
+        and al, 0x0F
+        add al, '0'
+        cmp al, '9'
+        jbe .put
+        add al, 7
+.put:   mov [di], al
+        inc di
+        pop ax
+        loop .nib
+        mov dx, msg_cnt
         call emit
-        jmp exit
+        ret
 
 fail_busy:
         mov dx, msg_fb
@@ -137,9 +192,6 @@ fail_edge:
         mov dx, msg_fe
         call emit
         jmp exit
-fail_tc:
-        mov dx, msg_ft
-        call emit
 exit:
         mov bx, [fhandle]
         cmp bx, 0xFFFF
@@ -187,7 +239,8 @@ emit:
 
 ; start a single-cycle 8-bit transfer of AX+1 bytes at buf on 8237 ch1 + DSP
 startblk:
-        push ax
+        mov [blk_len], ax      ; count-1, kept somewhere the addr writes
+                               ; cannot clobber (see below)
         mov al, 0x05
         out 0x0A, al           ; mask ch1
         mov al, 0x49
@@ -205,11 +258,10 @@ startblk:
         out 0x02, al           ; addr hi
         mov ax, bx
         out 0x83, al           ; page (ch1)
-        pop ax                 ; count-1
-        out 0x03, al
+        mov ax, [blk_len]
+        out 0x03, al           ; 8237 count lo
         mov al, ah
-        out 0x03, al
-        push ax
+        out 0x03, al           ; 8237 count hi
         mov al, 0x01
         out 0x0A, al           ; unmask ch1
         mov dx, 0x22C
@@ -219,11 +271,22 @@ startblk:
         out dx, al
         mov al, 0x14           ; single-cycle 8-bit output
         out dx, al
-        pop ax
+        ; The DSP gets its OWN length, and it must be the real one. This used
+        ; to come from a `push ax` issued AFTER `mov al, ah` had already
+        ; overwritten al — so the saved value was 0x0000 and the card was told
+        ; "transfer 1 byte" while the 8237 was correctly set to 256. The chip
+        ; then moved exactly one byte per start command and never reached
+        ; terminal count: FAIL-TC-NOBIT with cnt walking 00FF -> 00FE -> 00FD.
+        ; Only a real SB16 shows it; our emulated card takes the block length
+        ; from the 8237 count instead of the DSP command, so it played the
+        ; whole buffer and passed.
+        mov ax, [blk_len]
         out dx, al             ; len lo
         mov al, ah
         out dx, al             ; len hi
         ret
+
+blk_len: dw 0
 
 fname:    db 'C:\SBTEST.LOG', 0
 fhandle:  dw 0xFFFF
@@ -232,5 +295,9 @@ msg_edge: db 'EDGE-OK', 13, 10, '$'
 msg_tc:   db 'TC-OK', 13, 10, '$'
 msg_fb:   db 'FAIL-BUSY', 13, 10, '$'
 msg_fe:   db 'FAIL-EDGE', 13, 10, '$'
-msg_ft:   db 'FAIL-TC', 13, 10, '$'
+msg_ftbit: db 'FAIL-TC-NOBIT', 13, 10, '$'
+msg_ftcnt: db 'FAIL-TC-COUNT', 13, 10, '$'
+msg_cnt:  db 'cnt='
+cnt_hex:  db '0000', 13, 10, '$'
+cnt_val:  dw 0
 buf:      times 4000 db 0x80
