@@ -692,8 +692,8 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 // nothing to rearm there (`feedback_no_half_modelled_devices`).
                 let sb_in_service = pc.sb.irq < 8 && pc.vpic.in_service(pc.sb.irq);
                 pc.vpic.master_eoi();
-                if sb_in_service && !pc.sb.is_emulated() && pc.sb.host_irq < 16 {
-                    machine.rearm_irq(pc.sb.host_irq);
+                if sb_in_service && let Some(n) = pc.sb.native.as_ref() {
+                    machine.rearm_irq(n.irq);
                 }
             }
         }
@@ -1313,7 +1313,9 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             let _ = pc.mouse.apply_packet(machine, regs, dx, dy, buttons);
         }
         Irq::Hw(line) => {
-            if line != pc.sb.host_irq {
+            // Only the card this guest actually holds has a line to relay.
+            let Some(n) = pc.sb.native.as_ref() else { return };
+            if line != n.irq {
                 return;
             }
             // The physical card's completion line (read from its mixer, or
