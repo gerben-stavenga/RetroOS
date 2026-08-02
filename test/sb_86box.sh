@@ -102,6 +102,35 @@ if [ "${1:-}" = "--learn" ]; then
 fi
 
 FAILED=0
+VM_PGID=""
+
+# Stop a launched VM, whichever way it was launched.
+#
+# Killing the job we started is NOT enough, and neither is killing its process
+# group: `flatpak run` hands the app off to the flatpak session helper, so
+# bubblewrap and 86Box end up re-parented OUTSIDE our session entirely. The
+# job exits, the emulator keeps running, and its window stays on screen — a
+# suite run used to leave one VM behind per hung probe.
+#
+# So: kill the process group (covers an AppImage or a PATH install, which do
+# stay in our session), and additionally ask flatpak to stop the app, which is
+# the only thing that reaches a re-parented one.
+kill_vm() {
+    if [ -n "$VM_PGID" ]; then
+        kill -TERM -- "-$VM_PGID" 2>/dev/null
+        wait "$VM_PGID" 2>/dev/null
+        VM_PGID=""
+    fi
+    if [ -n "$FLATPAK_ID" ]; then
+        flatpak kill "$FLATPAK_ID" >/dev/null 2>&1
+    fi
+    # Give the window server a moment to reap before the next probe copies
+    # over the disk image the VM had open.
+    sleep 1
+}
+# A ^C or a script-level timeout must not leave a VM (and its window) behind.
+trap 'kill_vm; exit 130' INT TERM
+trap 'kill_vm' EXIT
 
 # How long a single probe may take, in seconds: 86Box boots an AMI BIOS POST,
 # then RetroOS, then the program. Generous — the loop exits as soon as the
@@ -123,8 +152,9 @@ run_probe() {
     local prog="$1" log="$2"; shift 2
     echo "=== $prog ==="
 
-    ./run.sh 86box -i "$IMG_KIND" --cmd "$prog" >/dev/null 2>&1 &
+    setsid ./run.sh 86box -i "$IMG_KIND" --cmd "$prog" >/dev/null 2>&1 &
     local pid=$! waited=0 verdict=""
+    VM_PGID="$pid"
     while [ "$waited" -lt "$PROBE_TIMEOUT" ]; do
         sleep 5
         waited=$((waited + 5))
@@ -136,11 +166,9 @@ run_probe() {
 
     # A healthy probe has already powered the VM off (the kernel's ACPI
     # soft-off reaches 86Box's PIIX4 now), so this only catches a hung one.
-    # NOT pkill: this script's own name matches "86box" and it would kill
-    # itself.
-    kill "$pid" 2>/dev/null
-    wait "$pid" 2>/dev/null
-    sleep 1
+    # NOT pkill on a name pattern: this script's own name matches "86box" and
+    # it would kill itself. The process group is the precise thing to kill.
+    kill_vm
     # Read once more now that the VM is definitely gone: a clean power-off is
     # what flushes the image, so on the normal path the verdict only becomes
     # visible AFTER the loop above noticed the process exit.
