@@ -7,7 +7,13 @@
 # Usage: ./run.sh [BACKEND] [options] [-- passthrough emulator args]
 #
 #   BACKEND        qemu | bochs | 86box | hosted   (default: qemu)
-#   --firmware     bios | uefi                     (default: bios; qemu/bochs only)
+#   --firmware     bios | uefi                     (default: uefi on qemu, bios
+#                                                   elsewhere; qemu/bochs only)
+#                  QEMU's legacy VGA is not accurately emulated and the kernel
+#                  carries no compensations for it, so UEFI — where the guest
+#                  gets a linear framebuffer and never programs a card — is the
+#                  supported way to run QEMU. `--firmware bios` still works and
+#                  warns. Use 86box/bochs for a faithful legacy VGA.
 #   --sb-audio     native | mixed                  (qemu only: fw_cfg override of
 #                  CONFIG.SYS's SB_AUDIO — who owns a real SB, the guest or our mixer)
 #   --sound        sb | ac97 | hda | none          (default: hda on qemu, sb
@@ -67,7 +73,7 @@ usage() {
 # ---------------------------------------------------------------------------
 
 BACKEND="qemu"
-FIRMWARE="bios"
+FIRMWARE=""   # per-backend default, resolved after parsing (see below)
 SOUND=""   # per-backend default, resolved after parsing (see below)
 ARCH="386"
 IMG=""            # resolved to a per-backend default later if empty
@@ -154,6 +160,17 @@ case "$BACKEND" in
     qemu|bochs|86box|hosted) ;;
     *) echo "run.sh: unknown backend '$BACKEND' (qemu|bochs|86box|hosted)" >&2; exit 1 ;;
 esac
+
+# Per-backend default: see the --firmware note in the header. Only QEMU has a
+# legacy-VGA problem worth routing around, and only QEMU and bochs can do UEFI
+# at all; 86box/hosted keep bios, which is the only thing that means anything
+# for them.
+if [ -z "$FIRMWARE" ]; then
+    case "$BACKEND" in
+        qemu) FIRMWARE="uefi" ;;
+        *)    FIRMWARE="bios" ;;
+    esac
+fi
 
 case "$FIRMWARE" in
     bios|uefi) ;;
