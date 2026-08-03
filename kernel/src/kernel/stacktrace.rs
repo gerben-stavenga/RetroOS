@@ -62,23 +62,35 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
     core::ptr::addr_of_mut!(KERNEL_SYMBOLS)
 }
 
-/// Initialize kernel symbol table by loading kernel.elf from TAR filesystem
+/// Load the kernel's symbol table, for naming addresses in a backtrace.
+///
+/// `C:\BOOT\KERNEL.SYM` is the real source: `kernel.elf` is stripped, so the
+/// booted image carries no names at all. The symbol file is an ELF whose
+/// allocatable sections are NOBITS placeholders — .symtab and .strtab are the
+/// only content — which is a quarter the size of the linked binary and, more
+/// to the point, is not a second copy of the .text we already have mapped.
+///
+/// The two `kernel.elf` fallbacks are for an unstripped development build
+/// (hosted runs from the VFS root, a disk boot from the DOS system directory).
+/// They cost a megabyte of heap when they hit, which is precisely why the
+/// symbol file exists.
 pub fn init_from_vfs() {
-    // The bare-ELF dev path has kernel.elf at the VFS root; a disk boot has
-    // it in the DOS system directory.
-    // Use handle-based VFS access (no per-thread fd slot needed)
-    let mut handle = vfs::open_to_handle(b"kernel.elf");
+    let sym = [crate::kernel::dos::c_root(), b"BOOT/KERNEL.SYM"].concat();
+    let mut handle = vfs::open_to_handle(&sym);
+    if handle < 0 {
+        handle = vfs::open_to_handle(b"kernel.elf");
+    }
     if handle < 0 {
         let p = [crate::kernel::dos::c_root(), b"BOOT/kernel.elf"].concat();
         handle = vfs::open_to_handle(&p);
     }
     if handle < 0 {
-        println!("stacktrace: kernel.elf not found");
+        println!("stacktrace: no KERNEL.SYM and no kernel.elf — backtraces will be addresses only");
         return;
     }
     let size = vfs::file_size_by_handle(handle) as usize;
 
-    println!("Loading kernel.elf ({} bytes) for symbols", size);
+    println!("Loading kernel symbols ({} bytes)", size);
 
     let mut elf_data = vec![0u8; size];
     vfs::read_by_handle(handle, &mut elf_data);

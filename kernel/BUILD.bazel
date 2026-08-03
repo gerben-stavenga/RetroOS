@@ -121,7 +121,24 @@ genrule(
     name = "kernel_elf",
     srcs = [":kernel_elf_bin"],
     outs = ["kernel.elf"],
-    cmd = "cp $< $@",
+    # STRIPPED. The symbol table is a quarter of the linked binary and is not
+    # in any PT_LOAD, so no loader ever wanted it — it was pure weight on
+    # everything that carries the kernel: the boot-bundle TAR the MBR stage
+    # reads, the GRUB image, and the one file you copy onto a real machine.
+    # Symbols ship separately as :kernel_sym -> C:\BOOT\KERNEL.SYM.
+    cmd = "objcopy --strip-all $< $@",
+    visibility = ["//visibility:public"],
+)
+
+# The symbol table on its own, for the in-kernel stack tracer. `--only-keep-debug`
+# keeps .symtab/.strtab and turns the allocatable sections into NOBITS
+# placeholders, so this is ~276 KB against the linked binary's 1 MB — and the
+# tracer no longer slurps a second copy of .text it already has mapped.
+genrule(
+    name = "kernel_sym",
+    srcs = [":kernel_elf_bin"],
+    outs = ["kernel.sym"],
+    cmd = "objcopy --only-keep-debug $< $@",
     visibility = ["//visibility:public"],
 )
 

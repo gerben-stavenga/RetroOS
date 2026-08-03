@@ -118,6 +118,10 @@ _DN_FILES = {
 # system directory — there is no embedded fallback any more.
 _BOOT_DIR_FILES = {
     "//tools/command:command_com": "BOOT/COMMAND.COM",
+    # Kernel symbols for the stack tracer. kernel.elf itself is stripped, so
+    # this is where panic backtraces get their names; without it they are
+    # addresses. Ordinary content on C:, like everything else here.
+    "//kernel:kernel_sym": "BOOT/KERNEL.SYM",
     "//tools/command:LOADFIX.CFG": "BOOT/LOADFIX.CFG",
     # Bridge into the Linux personality: a DN-launchable ELF that execs
     # /bin/busybox as `sh`.
