@@ -177,6 +177,19 @@ case "$SOUND" in
     *) echo "run.sh: unknown sound '$SOUND' (sb|ac97|hda|none)" >&2; exit 1 ;;
 esac
 
+# QEMU's VGA device model is not accurate enough to drive a guest that programs
+# a real card, and the kernel no longer carries per-emulator compensations for
+# it (planes read back as plane 0 only, text odd/even offsets are compacted, the
+# PEL mask reads zero, the retrace bit does not sweep). UEFI sidesteps all of it:
+# the guest gets a linear framebuffer and never touches a legacy adapter.
+if [ "$BACKEND" = "qemu" ] && [ "$FIRMWARE" = "bios" ]; then
+    echo "run.sh: WARNING — qemu + bios drives QEMU's legacy VGA, which is not" >&2
+    echo "        accurately emulated. Expect wrong colours, corrupted text and" >&2
+    echo "        games that hang waiting on vertical retrace." >&2
+    echo "        Use '--firmware uefi' for QEMU, or 86box/bochs for a faithful" >&2
+    echo "        legacy VGA." >&2
+fi
+
 # firmware=uefi only valid for qemu and bochs.
 if [ "$FIRMWARE" = "uefi" ] && [ "$BACKEND" != "qemu" ] && [ "$BACKEND" != "bochs" ]; then
     echo "run.sh: --firmware uefi is only supported for the qemu and bochs backends (got '$BACKEND')." >&2

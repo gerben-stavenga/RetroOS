@@ -39,8 +39,9 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
                 // the AC sequencing state from the card instead of a trap
                 // tracker (see `vga::save_from_hardware`). Trapping these
                 // costs the guest a VM86 round-trip per retrace poll — a
-                // palette fade is thousands of 0x3DA reads per frame. QEMU
-                // keeps them trapped: its 0x3DA retrace is fabricated.
+                // palette fade is thousands of 0x3DA reads per frame, and a
+                // game that waits on retrace can poll tens of thousands of
+                // times before it gives up.
                 if platform::get().vga_ports_direct() {
                     machine.allow_io_ports(0x3C0, 1);
                     machine.allow_io_ports(0x3DA, 1);

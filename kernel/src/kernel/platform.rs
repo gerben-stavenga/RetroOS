@@ -60,7 +60,12 @@ pub struct VbeMode {
 /// What is running the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Host {
-    /// QEMU (the loader saw fw_cfg): synthetic-retrace fabrication etc.
+    /// QEMU (the loader saw fw_cfg). Not a VGA reference: its VGA device
+    /// model gets planes, text odd/even, the PEL mask and the retrace bit
+    /// wrong, and the kernel no longer carries compensations for any of it —
+    /// run QEMU with `--firmware uefi`, where the guest never touches a
+    /// legacy card. Kept as a fact because a few genuinely QEMU-shaped
+    /// decisions remain (the deliberately misaligned sb16 strap).
     Qemu,
     /// Real hardware — or an emulator without fw_cfg (Bochs), which earns
     /// real-hardware treatment: trust the devices.
@@ -339,7 +344,10 @@ impl Platform {
     /// then recovers AC sequencing state from the card: exactly via the
     /// Cirrus readbacks when `vga_readback`, best-effort otherwise.
     pub fn vga_ports_direct(&self) -> bool {
-        self.display.vga_passthrough() && self.host != Host::Qemu
+        // Whether a card answers, not which emulator we are on. QEMU was
+        // excluded because its 0x3DA was fabricated for the guest, so the
+        // ports had to trap; that fabrication is gone.
+        self.display.vga_passthrough()
     }
 }
 

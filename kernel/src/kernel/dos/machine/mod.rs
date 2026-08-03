@@ -526,14 +526,20 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
     }
     match port {
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
-        // (blanking). Direct framebuffer scanout drives bit 3 from the same
-        // phase clock that schedules whole-shadow render/publication. Where no
-        // such clock runs, a free-running 70 Hz phase fills in; Bochs / real VGA
-        // hardware pass the register through (QEMU's own 0x3DA bit 3 doesn't
-        // sweep in our setup — a passthrough hangs Wolf3D's VL_WaitVBL).
+        // (blanking). An EMULATED card has no raster, so the value is
+        // synthesized from the same phase clock that schedules whole-shadow
+        // render/publication. A card the guest actually holds answers for
+        // itself — it has a raster, and second-guessing it is how a poll loop
+        // ends up waiting on an edge nobody produces.
         //
-        // The real `inb(0x3DA)` is retained for its hardware side-effect:
-        // resetting the VGA attribute-controller flip-flop.
+        // QEMU's BIOS/VGA path used to be special-cased here: its 0x3DA does
+        // not sweep, so we read the real register (for the flip-flop side
+        // effect), threw the value away, and returned a fabricated one. That
+        // made every retrace poll a device exit AND a fabrication — measured
+        // at ~23,000 cycles each, and Duke3D polling 54,000 times in one
+        // profile window spent 64% of the machine in dispatch. The special
+        // case is gone: QEMU is not a VGA reference, and `--firmware uefi` is
+        // the supported way to run it (run.sh warns on the BIOS combination).
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
@@ -541,14 +547,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
                 dev.state.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
-            let real = machine.inb(0x3DA);
             unsafe { VGA_AC_STATE.pending_data = false; }
-            // Bochs and real hardware drive 0x3DA from a real raster, so use
-            // the genuine bits there (flip-flop already handled above).
-            if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu {
-                return real;
-            }
-            input_status1(machine, &pc.present_scratch2)
+            machine.inb(0x3DA)
         }
         // VGA ports — pass through to hardware, or the emulated register file
         // when this thread does not own the physical VGA lease.

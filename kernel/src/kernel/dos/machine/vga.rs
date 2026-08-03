@@ -828,14 +828,7 @@ impl VgaState {
             }
             outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
         }
-        // QEMU reports a zero PEL mask even while its live VGA output is
-        // visibly unmasked. Treat that backend's readback as absent; real
-        // hardware keeps the exact register value.
-        self.dac_mask = if plat.host == crate::kernel::platform::Host::Qemu {
-            0xFF
-        } else {
-            inb(0x3C6)
-        };
+        self.dac_mask = inb(0x3C6);
         // Capture program-tracked DAC index latch + read/write mode before
         // stomping it with our bulk read.
         self.dac_index = inb(0x3C8);
@@ -921,35 +914,11 @@ impl VgaState {
         // personality's user pages are currently mapped — Linux threads
         // don't have a 0xA0000 identity mapping at all, so a bare access
         // would fault when suspending shell.elf.
-        let text_mode = matches!(
-            self.classify_mode(),
-            Some(lib::vga_render::VgaMode::Text80x25)
-        );
-        let qemu = plat.host == crate::kernel::platform::Host::Qemu;
         let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
         for plane in 0..4u8 {
             outb(0x3CE, 4); outb(0x3CF, plane);
             let dst = &mut self.planes[plane as usize * 65536..][..65536];
-            if qemu {
-                // QEMU's VGA aperture needs byte MMIO for Read Map Select;
-                // REP/wide reads effectively expose plane 0 only.
-                for (off, byte) in dst.iter_mut().enumerate() {
-                    *byte = unsafe { core::ptr::read_volatile(vga_window.add(off)) };
-                }
-            } else {
-                unsafe { core::ptr::copy_nonoverlapping(vga_window, dst.as_mut_ptr(), 65536); }
-            }
-        }
-        if qemu && text_mode {
-            // QEMU also compacts text odd/even plane offsets when the planes
-            // are exposed through flat A0000. Canonical VGA/86Box keeps cell
-            // i at offset 2*i; normalize the emulator quirk at this boundary.
-            for plane in 0..2usize {
-                let base = plane * 65536;
-                for i in (0..0x4000usize).rev() {
-                    self.planes[base + i * 2] = self.planes[base + i];
-                }
-            }
+            unsafe { core::ptr::copy_nonoverlapping(vga_window, dst.as_mut_ptr(), 65536); }
         }
         if let Some(chained) = native_chain4.as_deref() {
             lib::vga_render::chain4_split(chained, &mut self.planes);
@@ -999,32 +968,10 @@ impl VgaState {
         // Write planes through the kernel-side low-memory mapping (see
         // save_from_hardware for the rationale).
         let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
-        let plat = crate::kernel::platform::get();
-        let qemu = plat.host == crate::kernel::platform::Host::Qemu;
-        let text_mode = matches!(
-            self.classify_mode(),
-            Some(lib::vga_render::VgaMode::Text80x25)
-        );
         for plane in 0..4u8 {
             outb(0x3C4, 2); outb(0x3C5, 1 << plane);
             let src = &self.planes[plane as usize * 65536..][..65536];
-            if qemu {
-                // See the matching QEMU byte-wide capture above.
-                for (off, &byte) in src.iter().enumerate() {
-                    unsafe { core::ptr::write_volatile(vga_window.add(off), byte); }
-                }
-                if text_mode && plane < 2 {
-                    // Denormalize canonical even text offsets into QEMU's
-                    // compact flat-plane representation.
-                    for i in 0..0x4000usize {
-                        unsafe {
-                            core::ptr::write_volatile(vga_window.add(i), src[i * 2]);
-                        }
-                    }
-                }
-            } else {
-                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), vga_window, 65536); }
-            }
+            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), vga_window, 65536); }
         }
 
         // Reload the guest's data latches (captured via Cirrus CR22 in
