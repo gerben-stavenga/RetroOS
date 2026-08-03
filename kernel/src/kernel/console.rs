@@ -113,12 +113,12 @@ fn monitor_key<A: crate::Arch>(
     if sc == F12_PRESS {
         let display = match personality.suspend_for_osd(
             machine,
-            bios_workspace.as_deref_mut().expect("OSD open without core BIOS"),
+            bios_workspace.as_mut().expect("OSD open without core BIOS"),
         ) {
             crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
                 let sink = crate::kernel::dos::prepare_bios_osd(
                     machine,
-                    bios_workspace.as_deref_mut().expect("native VGA without core BIOS"),
+                    bios_workspace.as_mut().expect("native VGA without core BIOS"),
                     native,
                 );
                 crate::kernel::platform::DisplayToken::LfbDisplay(sink)

@@ -161,10 +161,16 @@ pub enum PersonalityName {
     Linux,
 }
 
+#[allow(clippy::large_enum_variant)] // see the note on Linux below
 pub enum Personality<A: crate::Arch> {
     /// DOS mode: VM86 (real mode) or DPMI (32-bit protected mode)
     Dos(alloc::boxed::Box<DosState<A>>),
-    /// Linux userspace (32 or 64-bit, distinguished by CS descriptor)
+    /// Linux userspace (32 or 64-bit, distinguished by CS descriptor).
+    ///
+    /// Inline rather than boxed, unlike `Dos`: at ~272 bytes it sets the
+    /// enum's size, but a `Thread` holds exactly one `Personality` and threads
+    /// are already heap-allocated, so boxing would buy an indirection on every
+    /// syscall to save a few hundred bytes once per thread.
     Linux(LinuxState),
 }
 
@@ -190,14 +196,13 @@ impl<A: crate::Arch> Personality<A> {
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     ) -> crate::kernel::platform::DisplayToken {
-        let display = match self {
+        match self {
             Self::Dos(d) => match bios_workspace {
                 Some(workspace) => d.suspend_for_osd(machine, workspace),
                 None => d.suspend(machine),
             },
             Self::Linux(l) => l.suspend(machine),
-        };
-        display
+        }
     }
 
     pub fn suspend_for_osd(

@@ -1144,7 +1144,7 @@ fn vbe<A: crate::Arch>(
             done(regs, true);
         }
         0x05 => {
-            let ok = vbe_window(machine, bios_display.as_deref_mut(), dos, regs);
+            let ok = vbe_window(machine, bios_display, dos, regs);
             done(regs, ok);
         }
         0x08 => { vbe_dac_format(regs); done(regs, true); }

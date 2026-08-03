@@ -77,11 +77,18 @@ pub fn release_bios_osd<A: crate::Arch>(
         let base = fb.va & !(crate::PAGE_SIZE - 1);
         let pages = (fb.va - base + fb.pitch * fb.height).div_ceil(crate::PAGE_SIZE);
         machine.unmap_range(base / crate::PAGE_SIZE, pages);
-        let mut native = sink.try_into_bios_display().ok().expect("packed native sink lost adapter");
+        // `let ... else`, not `.expect()`: the error half is the sink itself,
+        // which is not Debug, so there is nothing to format.
+        let Ok(mut native) = sink.try_into_bios_display() else {
+            panic!("packed native sink lost adapter")
+        };
         let _ = bios_workspace.bios_set_mode(machine, &mut native, 3);
         return native;
     }
-    sink.try_into_bios_display().ok().expect("native OSD sink lost adapter")
+    let Ok(native) = sink.try_into_bios_display() else {
+        panic!("native OSD sink lost adapter")
+    };
+    native
 }
 
 fn prepare_mode13_osd(
@@ -2693,10 +2700,10 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
             if fb.packed_format().is_none() {
                 return true;
             }
-            if pc.voodoo_scanout.arm(&fb, w, h) {
+            if pc.voodoo_scanout.arm(fb, w, h) {
                 let (out, pitch, dac) = pc.voodoo_scanout.target();
                 pc.voodoo.scanout(out, pitch, dac);
-                pc.voodoo_scanout.publish(&fb);
+                pc.voodoo_scanout.publish(fb);
             }
         }
         Some(_) => {}

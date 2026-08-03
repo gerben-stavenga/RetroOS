@@ -43,6 +43,7 @@
 //! the guest's address space is ours to reach, never the card's.
 
 use crate::Regs;
+use alloc::boxed::Box;
 use super::*;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
@@ -172,7 +173,12 @@ pub enum SbDevice {
     Native(PassthroughSb),
     /// No card answers: `//lib:sound`'s passive card runs, and this file feeds
     /// it the clock, the interrupt line, the guest ring and the pipe depth.
-    Emulated(EmulatedSb),
+    ///
+    /// Boxed: the software card carries the whole DSP/mixer/OPL model plus a
+    /// mixer scratch block and is ~950 bytes against the passthrough arm's 60,
+    /// so inline it would set the size of every `SbDevice` — and of the
+    /// `PcMachine` holding one — for the benefit of one variant.
+    Emulated(Box<EmulatedSb>),
 }
 
 /// The machine side of a REAL card: the physical card itself plus everything
@@ -263,12 +269,12 @@ impl PassthroughSb {
 }
 
 impl EmulatedSb {
-    fn new() -> Self {
-        Self {
+    fn new() -> Box<Self> {
+        Box::new(Self {
             core: sound::sb::Sb::new(),
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
-        }
+        })
     }
 }
 

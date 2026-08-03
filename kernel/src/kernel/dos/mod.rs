@@ -665,7 +665,7 @@ pub fn handle_event<A: crate::Arch>(
                 // Kernel syscall — `syscall` branches on mode + CS to reach
                 // the right RM/PM dispatcher. Runs even on non-DPMI threads
                 // (HW-IRQ default reflection lands here too).
-                syscall(machine, bios_display.as_deref_mut(), kt, dos, regs)
+                syscall(machine, bios_display, kt, dos, regs)
             } else {
                 // Invariants: VM86 only ever traps INT 31h (only entry in
                 // the TSS bitmap), and the only path into PM is DPMI. So a
@@ -1086,6 +1086,7 @@ fn init_process_thread_vm86_state<A: crate::Arch>(_machine: &mut A, thread: &mut
 /// Set up the initial DOS thread for a fresh program load (no parent).
 /// Used by the boot/init path; fork+exec uses `exec_dos_into` instead.
 /// Returns the new tid; caller drives the event loop.
+#[allow(clippy::too_many_arguments)]
 pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosTemplate<A>, threads: &mut [thread::Thread<A>], buf: Vec<u8>, args: Vec<Vec<u8>>, cmdline_tail: Vec<u8>, cwd: Vec<u8>, env: Vec<u8>) -> usize {
 
     dos_template.activate_clone(machine);

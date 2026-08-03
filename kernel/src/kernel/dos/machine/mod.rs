@@ -1185,7 +1185,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let SoundBlaster { blaster, device } = sb;
     let sb_irq = blaster.irq;
     let mut sb = match device {
-        SbDevice::Emulated(emu) => Some(emu),
+        SbDevice::Emulated(emu) => Some(&mut **emu),
         SbDevice::Native(_) => None,
     };
     let now = machine.get_ticks();
@@ -1293,7 +1293,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     // advances evenly and production, `pushed`, and the cursor all move together.
     let drained = mixer.pace.drained();
     let pushed = mixer.pace.pushed();
-    if let Some(emu) = sb.as_deref_mut() {
+    if let Some(emu) = sb {
         let dsp_rate = emu.dsp_rate().max(1) as u64;
         let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
         emu.dsp_clock_tick(machine, vpic, sb_irq, to_dsp(drained), to_dsp(pushed));
