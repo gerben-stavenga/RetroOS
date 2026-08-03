@@ -60,7 +60,7 @@ mod mode_transitions;
 // machine emulation stays private otherwise.
 pub use machine::VgaState;
 pub use machine::vsb::SbDevice;
-pub use machine::vga::{BiosVga, physical_vga_present, prepare_bios_osd, release_bios_osd};
+pub use machine::vga::{BiosVga, physical_vga_present, release_bios_sink, sink_from_display};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.

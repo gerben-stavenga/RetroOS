@@ -28,7 +28,32 @@ pub fn physical_vga_present() -> bool {
 /// Materialize the universally available Mode 13 sink after F12 takes the
 /// native card. A future high-resolution path must obtain its LFB through the
 /// adapter's VBE BIOS; emulator-private display registers do not belong here.
-pub fn prepare_bios_osd<A: crate::Arch>(
+/// Make a presentable sink out of whatever the personality handed back.
+///
+/// On UEFI this is the identity: the firmware already gave us a linear
+/// framebuffer, so the token IS a sink. On BIOS the token is a `BiosDisplay`
+/// capability — authority over an adapter, not a surface — and becoming a sink
+/// means asking the video BIOS for a mode and mapping what it points at.
+///
+/// That is the ONLY difference between the two firmwares. Everything after it
+/// — render, composite, present — is one path, which is why this is sink
+/// construction and not an OSD entry point. (It used to be `prepare_bios_osd`,
+/// beside a whole second presentation pipeline that no longer exists.)
+pub fn sink_from_display<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: crate::kernel::platform::DisplayToken,
+) -> crate::kernel::platform::DisplayToken {
+    match display {
+        crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
+            crate::kernel::platform::DisplayToken::LfbDisplay(
+                acquire_bios_sink(machine, bios_workspace, native))
+        }
+        other => other,
+    }
+}
+
+fn acquire_bios_sink<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     mut bios_display: crate::kernel::platform::BiosDisplay,
@@ -67,12 +92,20 @@ pub fn prepare_bios_osd<A: crate::Arch>(
 
 const VBE_OSD_BASE: usize = 0xFC00_0000;
 
-pub fn release_bios_osd<A: crate::Arch>(
+/// Give the adapter back: the inverse of [`sink_from_display`]'s BIOS arm.
+pub fn release_bios_sink<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     sink: crate::kernel::display::LfbDisplay,
 ) -> crate::kernel::platform::BiosDisplay {
-    if matches!(sink.format, crate::kernel::display::FormatSpec::Packed(_)) {
+    // Which sink this is, is a question about what `prepare_bios_osd` DID —
+    // whether it mapped a VBE linear framebuffer at VBE_OSD_BASE, or fell back
+    // to the legacy aperture the adapter already exposes at LOW_MEM_BASE +
+    // 0xA0000. It is NOT a question about pixel format: both are packed now
+    // (mode 13h with a 3:3:2 DAC is RGB332), and testing the format here
+    // unmapped the low VGA window and forced mode 3 on the fallback path,
+    // which is why ESC did not restore the guest's screen.
+    if sink.framebuffer.va >= VBE_OSD_BASE {
         let fb = sink.framebuffer;
         let base = fb.va & !(crate::PAGE_SIZE - 1);
         let pages = (fb.va - base + fb.pitch * fb.height).div_ceil(crate::PAGE_SIZE);
@@ -112,7 +145,10 @@ fn prepare_mode13_osd(
     state.ac[0x12] = 0x0F;
     state.ac[0x13] = 0x00;
     state.ac[0x14] = 0x00;
-    state.dac = lib::vga_render::fallback_palette();
+    // 3:3:2, so this surface IS a packed RGB332 framebuffer and the ordinary
+    // render/present path drives it. The DAC here is ours — it belongs to the
+    // compositing sink we install while holding the card, not to the guest.
+    state.dac = lib::vga_render::palette_rgb332();
     state.planes.resize(4 * 0x10000, 0);
     state.restore_to_hardware();
     crate::kernel::display::LfbDisplay::from_framebuffer(
@@ -124,7 +160,9 @@ fn prepare_mode13_osd(
             slow: false,
             wide: false,
         },
-        crate::kernel::display::FormatSpec::Indexed8,
+        crate::kernel::display::FormatSpec::Packed(
+            lib::vga_render::PixelFormat::RGB332,
+        ),
         Some(bios_display),
     )
 }
@@ -2761,13 +2799,6 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         crate::kernel::platform::DisplayToken::BiosDisplay(_)
         | crate::kernel::platform::DisplayToken::Headless => return,
     };
-    // The monitor's fixed indexed aperture is composited whole, not blitted.
-    if direct.is_some_and(|sink| {
-        matches!(sink.format, crate::kernel::display::FormatSpec::Indexed8)
-    }) {
-        display_native_osd(machine, pc, regs, now_ticks);
-        return;
-    }
     let prof = crate::kernel::startup::profile_enabled();
     if let Some(sink) = direct {
         let fb = &sink.framebuffer;
@@ -2878,44 +2909,3 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
 }
 
-fn display_native_osd<A: crate::Arch>(
-    machine: &mut A,
-    pc: &mut PcMachine,
-    regs: &Regs,
-    now_ticks: u64,
-) {
-    // Native OSD presentation is substantially more expensive than ordinary
-    // card scanout: the running guest must be rendered to RGB, scaled,
-    // quantized into the OSD palette, then copied through the VGA aperture.
-    // Doing all of that at the card's 70 Hz cadence starves the guest and its
-    // audio clock. Keep the live preview at 10 Hz, with immediate frames for
-    // menu input; the guest and mixer still advance on every normal tick.
-    static LAST_MS: core::sync::atomic::AtomicU32 =
-        core::sync::atomic::AtomicU32::new(u32::MAX);
-    let now = now_ticks as u32;
-    let forced = crate::kernel::osd::take_repaint_request();
-    let last = LAST_MS.load(Ordering::Relaxed);
-    if !forced && now.wrapping_sub(last) < 100 {
-        return;
-    }
-    LAST_MS.store(now, Ordering::Relaxed);
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
-    let Some(mode) = vga.current_mode() else { return };
-    let (w, h) = lib::vga_render::dimensions(mode);
-    let full = (0, h);
-    let Some(frame) =
-        vga.scanout(machine, regs, &mut pc.present_scratch, full)
-    else {
-        return;
-    };
-    let need = w * h;
-    if pc.present_fb.len() < need {
-        pc.present_fb.resize(need, 0);
-    }
-    lib::vga_render::render(&frame, &mut pc.present_fb[..need]);
-    let Some(crate::kernel::platform::DisplayToken::LfbDisplay(sink)) =
-        crate::kernel::osd::display()
-    else { return };
-    sink.present_indexed(&pc.present_fb[..need], w, h);
-}

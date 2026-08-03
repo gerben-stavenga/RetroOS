@@ -111,20 +111,13 @@ fn monitor_key<A: crate::Arch>(
         return true;
     }
     if sc == F12_PRESS {
-        let display = match personality.suspend_for_osd(
-            machine,
-            bios_workspace.as_mut().expect("OSD open without core BIOS"),
-        ) {
-            crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
-                let sink = crate::kernel::dos::prepare_bios_osd(
-                    machine,
-                    bios_workspace.as_mut().expect("native VGA without core BIOS"),
-                    native,
-                );
-                crate::kernel::platform::DisplayToken::LfbDisplay(sink)
-            }
-            display => display,
-        };
+        // Identical on both firmwares: take the display the personality gave
+        // up, then make a sink of it. Only the BIOS arm inside does any work —
+        // a GOP token is already a sink and passes straight through.
+        let ws = bios_workspace.as_mut().expect("OSD open without core BIOS");
+        let display = personality.suspend_for_osd(machine, ws);
+        let ws = bios_workspace.as_mut().expect("OSD open without core BIOS");
+        let display = crate::kernel::dos::sink_from_display(machine, ws, display);
         crate::kernel::osd::open(display);
         return true;
     }
@@ -145,7 +138,7 @@ pub fn restore_from_monitor<A: crate::Arch>(
         crate::kernel::platform::DisplayToken::LfbDisplay(sink)
             if sink.bios_display.is_some() =>
         {
-            let native = crate::kernel::dos::release_bios_osd(machine, bios_workspace, sink);
+            let native = crate::kernel::dos::release_bios_sink(machine, bios_workspace, sink);
             (crate::kernel::platform::DisplayToken::BiosDisplay(native), true)
         }
         display => (display, false),

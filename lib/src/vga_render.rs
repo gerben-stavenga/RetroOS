@@ -474,6 +474,18 @@ pub fn fill_fallback_palette(p: &mut [u8; 768]) {
     }
 }
 
+/// The DAC ramp that makes mode 13h a packed [`PixelFormat::RGB332`] surface:
+/// entry `i` is the colour the byte `i` encodes. VGA DAC channels are 6-bit.
+pub fn palette_rgb332() -> [u8; 768] {
+    let mut p = [0u8; 768];
+    for i in 0..256usize {
+        p[i * 3] = (((i >> 5) & 0x7) * 63 / 7) as u8;
+        p[i * 3 + 1] = (((i >> 2) & 0x7) * 63 / 7) as u8;
+        p[i * 3 + 2] = ((i & 0x3) * 63 / 3) as u8;
+    }
+    p
+}
+
 pub fn fallback_palette() -> [u8; 768] {
     let mut p = [0u8; 768];
     fill_fallback_palette(&mut p);
@@ -546,7 +558,7 @@ fn pal_rgb(palette: &[u8; 768], idx: u8) -> u32 {
 /// renderer, because it is a property of pixels rather than of any backend.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct PixelFormat {
-    /// Bytes occupied by one framebuffer pixel: 2, 3, or 4.
+    /// Bytes occupied by one framebuffer pixel: 1, 2, 3, or 4.
     pub bytes_per_pixel: u8,
     pub red_pos: u8,
     pub red_size: u8,
@@ -557,6 +569,20 @@ pub struct PixelFormat {
 }
 
 impl PixelFormat {
+    /// 8bpp 3:3:2 — what mode 13h IS once its DAC holds the matching ramp
+    /// ([`palette_rgb332`]). The byte written is the colour, so a mode-13
+    /// surface we own is an ordinary packed framebuffer and needs no separate
+    /// render path, no quantiser and no intermediate buffers.
+    pub const RGB332: PixelFormat = PixelFormat {
+        bytes_per_pixel: 1,
+        red_pos: 5,
+        red_size: 3,
+        green_pos: 2,
+        green_size: 3,
+        blue_pos: 0,
+        blue_size: 2,
+    };
+
     pub const NATIVE: PixelFormat = PixelFormat {
         bytes_per_pixel: 4,
         red_pos: 16,
@@ -569,7 +595,7 @@ impl PixelFormat {
 
     /// Validate packed RGB channel metadata from a boot framebuffer.
     pub fn from_rgb(bytes_per_pixel: u8, fields: [u8; 6]) -> Option<PixelFormat> {
-        if !(2..=4).contains(&bytes_per_pixel) {
+        if !(1..=4).contains(&bytes_per_pixel) {
             return None;
         }
         let [red_pos, red_size, green_pos, green_size, blue_pos, blue_size] = fields;
@@ -768,12 +794,18 @@ fn row_stretched<const N: usize>(
 /// malformed frame may stop early, leaving that row's tail untouched.
 pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u8], out_w: usize) {
     let (w, h) = dimensions(frame.mode);
-    if sy >= h || w == 0 || out_w < w {
+    // `out_w < w` is a SHRINK, not an error: the Bresenham step below yields
+    // base = 0, so the destination pointer holds still across several source
+    // pixels and each overwrites the last — nearest-neighbour downscale, the
+    // same walk as stretching with the roles swapped. Refusing it was what
+    // made an aperture narrower than the guest image (the 320x200 mode-13 OSD
+    // sink, 266 px after aspect fit) render nothing at all.
+    if sy >= h || w == 0 || out_w == 0 {
         return;
     }
     let n = out_w.div_ceil(w);
     let step = pal.fmt.bytes_per_pixel as usize;
-    if !(2..=4).contains(&step) || out.len() < out_w * step * h + n * 4 {
+    if !(1..=4).contains(&step) || out.len() < out_w * step * h + n * 4 {
         return;
     }
     // Constant-width instances for the ratios real panels produce (text

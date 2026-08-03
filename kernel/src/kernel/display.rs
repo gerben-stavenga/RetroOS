@@ -15,8 +15,10 @@ pub use lib::vga_render::PixelFormat;
 pub enum FormatSpec {
     /// GOP, VESA true-colour LFBs and hosted memory.
     Packed(PixelFormat),
-    /// The fixed VGA mode-13 surface used while a physical adapter is held as
-    /// a compositable sink.
+    /// A paletted surface whose palette belongs to the GUEST — a VBE 8bpp mode
+    /// it selected and whose DAC it loads, so the byte is an index into a table
+    /// only the guest knows. A mode-13 surface WE own is not this: we program
+    /// its DAC to a 3:3:2 ramp, which makes it `Packed(RGB332)`.
     Indexed8,
 }
 
@@ -56,9 +58,6 @@ pub struct LfbDisplay {
     pub bios_display: Option<crate::kernel::platform::BiosDisplay>,
 }
 
-static mut INDEXED_RGB: [u32; 320 * 200] = [0; 320 * 200];
-static mut INDEXED_PIXELS: [u8; 320 * 200] = [0; 320 * 200];
-
 impl core::fmt::Debug for LfbDisplay {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("LfbDisplay")
@@ -79,6 +78,22 @@ impl LfbDisplay {
         bios_display: Option<crate::kernel::platform::BiosDisplay>,
     ) -> Self {
         Self { format, framebuffer, bios_display }
+    }
+
+    /// The output rectangle inside this framebuffer.
+    ///
+    /// `fit_vga` letterboxes to 4:3 because a GOP/LFB has SQUARE pixels and a
+    /// VGA image drawn 1:1 there would be geometrically wrong. A physical VGA
+    /// aperture is the opposite case: its pixels are not square, 320x200 IS
+    /// 4:3 on the monitor, and fitting it to 266x200 both squeezes the picture
+    /// and invents borders the hardware never had — borders that then have to
+    /// be cleared, which is the only reason the reset path zeroes the
+    /// framebuffer at all.
+    pub fn fit(&self) -> (usize, usize) {
+        match self.bios_display {
+            Some(_) => (self.framebuffer.width, self.framebuffer.height),
+            None => fit_vga(self.framebuffer.width, self.framebuffer.height),
+        }
     }
 
     pub fn packed_format(&self) -> Option<PixelFormat> {
@@ -113,54 +128,6 @@ impl LfbDisplay {
         }
     }
 
-    /// Convert a canonical RGB shadow into the fixed indexed VGA sink used by
-    /// the native-card OSD.
-    pub fn present_indexed(&self, frame: &[u32], sw: usize, sh: usize) {
-        assert!(matches!(self.format, FormatSpec::Indexed8));
-        let fb = &self.framebuffer;
-        assert!(fb.width == 320 && fb.height == 200 && fb.pitch >= 320);
-        if sw == 0 || sh == 0 || frame.len() < sw * sh {
-            return;
-        }
-        unsafe {
-            let rgb = &mut *core::ptr::addr_of_mut!(INDEXED_RGB);
-            for y in 0..200 {
-                let sy = y * sh / 200;
-                for x in 0..320 {
-                    rgb[y * 320 + x] = frame[sy * sw + x * sw / 320];
-                }
-            }
-            let bytes = core::slice::from_raw_parts_mut(
-                rgb.as_mut_ptr() as *mut u8,
-                rgb.len() * 4,
-            );
-            crate::kernel::osd::paint(
-                bytes, 320 * 4, 320, 200, 320, PixelFormat::NATIVE,
-            );
-
-            let idx = &mut *core::ptr::addr_of_mut!(INDEXED_PIXELS);
-            for (dst, &c) in idx.iter_mut().zip(rgb.iter()) {
-                let r = ((c >> 16) & 0xFF) as usize;
-                let g = ((c >> 8) & 0xFF) as usize;
-                let b = (c & 0xFF) as usize;
-                let ri = (r * 5 + 127) / 255;
-                let gi = (g * 5 + 127) / 255;
-                let bi = (b * 5 + 127) / 255;
-                *dst = (32 + ri * 36 + gi * 6 + bi) as u8;
-            }
-            for y in 0..200 {
-                copy_bytes(
-                    (fb.va + y * fb.pitch) as *mut u8,
-                    idx[y * 320..].as_ptr(),
-                    320,
-                    fb.wide,
-                );
-            }
-        }
-        // Physical VGA continuously scans this aperture. Unlike a WC GOP/LFB
-        // mapping it needs no publication fence (and legacy CPUs may not even
-        // implement SFENCE).
-    }
 }
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
@@ -411,7 +378,7 @@ fn present(sink: &LfbDisplay, vga_height: usize, shadow: &[u8]) -> usize {
     let fb = &sink.framebuffer;
     let format = sink.packed_format().expect("packed present on indexed sink");
     let step = format.bytes_per_pixel as usize;
-    let (out_w, out_h) = fit_vga(fb.width, fb.height);
+    let (out_w, out_h) = sink.fit();
     let row_bytes = out_w * step;
     if vga_height == 0 || shadow.len() < row_bytes * vga_height {
         return 0;
@@ -486,8 +453,14 @@ pub fn scanout_action(
     if w == 0 || h == 0 || period_ticks < 3 {
         return ScanoutAction::None;
     }
-    let (out_w, out_h) = fit_vga(fb.width, fb.height);
-    if out_w < w || out_h < h {
+    let (out_w, out_h) = sink.fit();
+    // A sink SMALLER than the guest image is legal: the Bresenham walk in
+    // `StretchRow` shrinks as readily as it stretches, and `present` drops
+    // source rows the same way. Refusing it here is what made the 320x200
+    // mode-13 OSD aperture (266 px after aspect fit, i.e. narrower than every
+    // guest mode including 320-wide ones) show nothing at all — and, because
+    // the reset path below zeroes the framebuffer, show it as black.
+    if out_w == 0 || out_h == 0 {
         return ScanoutAction::None;
     }
 
@@ -543,10 +516,9 @@ pub fn render_shadow(
     sink: &LfbDisplay,
     frame: &lib::vga_render::Frame,
 ) -> bool {
-    let fb = &sink.framebuffer;
     let format = sink.packed_format().expect("packed render on indexed sink");
     let (w, h) = lib::vga_render::dimensions(frame.mode);
-    let (out_w, _) = fit_vga(fb.width, fb.height);
+    let (out_w, _) = sink.fit();
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
     if s.mode != Some(frame.mode)
