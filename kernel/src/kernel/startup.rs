@@ -64,20 +64,15 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
             })
             .collect()
     } else {
-        match platform.host {
-            crate::kernel::platform::Host::Metal => crate::screenln!(
-                    screen,
-                    "\x1b[91mDisk writes: PERSISTENT — physical devices are writable\x1b[0m"
-                ),
-            crate::kernel::platform::Host::Qemu => crate::screenln!(
-                    screen,
-                    "Disk writes: QEMU virtual disk (persistence is controlled by QEMU)"
-                ),
-            crate::kernel::platform::Host::Interp => crate::screenln!(
-                    screen,
-                    "Disk writes: hosted disk image"
-                ),
-        }
+        // One line, because there is one behaviour. This used to print a
+        // different message per host — a leftover from when the host DERIVED
+        // the policy. It no longer does: the policy is `ram-overlay` or its
+        // absence, and whether the device underneath is a laptop's NVMe or a
+        // disposable image is not something the kernel knows or should claim.
+        crate::screenln!(
+            screen,
+            "\x1b[91mDisk writes: PERSISTENT\x1b[0m — pass `ram-overlay` to protect the disk"
+        );
         disks
     };
 
