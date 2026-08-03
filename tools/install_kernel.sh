@@ -1,6 +1,9 @@
 #!/bin/bash
-# Install the current build onto this machine's metal boot path. Run as root:
+# Install the current build onto this machine's metal boot path.
 #
+# Build as yourself, install as root — this script does not build:
+#
+#   bazelisk build //kernel:kernel_elf //kernel:kernel_sym
 #   sudo tools/install_kernel.sh
 #
 # Two files, and they MUST come from the same build:
@@ -14,6 +17,7 @@
 # reason this is one script rather than two steps you might do separately.
 #
 # Usage:
+#   bazelisk build //kernel:kernel_elf //kernel:kernel_sym   # as yourself
 #   sudo tools/install_kernel.sh                 # /boot/retroos + /home/retroos
 #   sudo tools/install_kernel.sh /mnt/c-root     # different C: root
 #   sudo KERNEL_DEST=/boot/other tools/install_kernel.sh
@@ -36,15 +40,19 @@ fi
 
 ELF=bazel-bin/kernel/kernel.elf
 SYM=bazel-bin/kernel/kernel.sym
-# Build as the invoking user, not as root: bazel under sudo would write a
-# root-owned output tree and cache into the wrong home, and every later
-# non-root build would fail on it.
-if [ -n "${SUDO_USER:-}" ]; then
-    sudo -u "$SUDO_USER" bazelisk build //kernel:kernel_elf //kernel:kernel_sym >/dev/null
-else
-    bazelisk build //kernel:kernel_elf //kernel:kernel_sym >/dev/null
+
+# This script INSTALLS; it does not build. Building as root would write a
+# root-owned bazel output tree and populate a cache in root's home, and every
+# later ordinary build would fail on it. (It cannot even find the toolchain:
+# bazelisk usually lives in the invoking user's ~/bin, which sudo's secure_path
+# excludes and whose $HOME is now /root.)
+#
+# Build as yourself, install as root.
+if [ ! -f "$ELF" ] || [ ! -f "$SYM" ]; then
+    echo "no build to install — run this first, as yourself:" >&2
+    echo "    bazelisk build //kernel:kernel_elf //kernel:kernel_sym" >&2
+    exit 1
 fi
-[ -f "$ELF" ] && [ -f "$SYM" ] || { echo "build produced no $ELF / $SYM" >&2; exit 1; }
 
 echo "kernel  $(stat -c%s "$ELF") bytes -> $KERNEL_DEST/kernel.elf"
 mkdir -p "$KERNEL_DEST"

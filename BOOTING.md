@@ -15,6 +15,8 @@ own. Without it the kernel boots but has no shell to start.
 
 ```bash
 sudo ./setup-cdrive.sh            # C: content, including C:\BOOT  (first time)
+
+bazelisk build //kernel:kernel_elf //kernel:kernel_sym   # as yourself
 sudo tools/install_kernel.sh      # kernel + symbols                (every rebuild)
 ```
 
