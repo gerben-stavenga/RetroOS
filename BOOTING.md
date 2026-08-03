@@ -14,11 +14,23 @@ own. Without it the kernel boots but has no shell to start.
 ## Install
 
 ```bash
-bazelisk build //kernel:kernel_elf
-sudo mkdir -p /boot/retroos
-sudo cp bazel-bin/kernel/kernel.elf /boot/retroos/
-sudo ./setup-cdrive.sh          # C: content, including C:\BOOT
+sudo ./setup-cdrive.sh            # C: content, including C:\BOOT  (first time)
+sudo tools/install_kernel.sh      # kernel + symbols                (every rebuild)
 ```
+
+`install_kernel.sh` is the one to re-run after a build. It installs **two**
+files, and they must come from the same build:
+
+| file | destination | what it is |
+|---|---|---|
+| `kernel.elf` | `/boot/retroos/kernel.elf` | what GRUB multiboots — stripped, ~763 KB |
+| `kernel.sym` | `<C:>/BOOT/KERNEL.SYM` | symbol table for panic backtraces, ~276 KB |
+
+`kernel.elf` carries no symbol table, so a backtrace is named only if
+`KERNEL.SYM` is present *and* matches. A stale symbol file is worse than a
+missing one — the addresses still resolve, to the wrong functions — which is
+why one script does both rather than two steps you might do separately. The
+boot line `Loading kernel symbols (N bytes)` confirms it took.
 
 Append to `/etc/grub.d/40_custom`:
 
