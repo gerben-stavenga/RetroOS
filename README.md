@@ -73,6 +73,14 @@ qemu-system-i386 -drive file=bazel-bin/image.bin,format=raw -debugcon stdio -no-
 
 For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOTING.md).
 
+> **On real hardware, RetroOS writes to your disk.** It mounts the machine's
+> Linux root (it probes for `/etc` + `/usr`) and takes `C:` from
+> `/home/retroos` there, so guest writes land on the filesystem you boot Linux
+> from. Pass the Multiboot argument `ram-overlay` to divert every physical
+> write into volatile RAM instead — recommended for a machine you care about.
+> The boot banner tells you which mode you got. See
+> [BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
+
 ## Architecture
 
 ### Layers
