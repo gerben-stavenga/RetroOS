@@ -55,13 +55,13 @@ const DMA5_MODE_AUTO_READ: u8 = 0x59;
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 // ── ring geometry ───────────────────────────────────────────────────────────
-// Defined by the sink engine (`sound::Ring`), which owns the ring; the device
-// needs only the two numbers it programs the hardware with.
+// Defined by the sound sink, which owns the DMA buffer; the device needs only
+// the two numbers it programs the hardware with.
 use crate::kernel::sound::{BUF_BYTES, RING_BYTES};
 
 /// What only THIS card knows. The ring, the counters and the prime/underrun
-/// bookkeeping are the sink engine's (`sound::Ring`) — shared with every other
-/// device, because none of it is Sound-Blaster-specific. What is left here is
+/// bookkeeping belong to the sound sink — shared with every other device,
+/// because none of it is Sound-Blaster-specific. What is left here is
 /// the 8237 channel-5 programming, the DSP session, and turning a possibly
 /// coalesced interrupt into the right number of played blocks.
 struct Sb16 {
@@ -548,5 +548,4 @@ fn dma_pos_bytes() -> u32 {
     }
     ((words - 1).wrapping_sub(count as u32) % words) * 2
 }
-
 

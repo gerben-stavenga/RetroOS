@@ -1,13 +1,11 @@
 //! The output side: one ring of PCM, and the whole of a sink's bookkeeping.
 //!
 //! Same contract as the cards in this crate — nothing here reaches out. The
-//! host supplies the memory and the frames — canonical i16 stereo, because a
-//! sink is the end of the path and wire formats were decoded upstream — and
-//! drives exactly two events:
-//! [`Ring::fill`] when a producer has frames, and [`Ring::on_block_played`]
-//! once per block the hardware consumed. Arming a device, reading its cursor
-//! and acknowledging its interrupt are the host's, because those are the only
-//! parts that touch a machine.
+//! host supplies the memory and the wide mixed frames; the sink applies the
+//! final Q16 gain and clips once to device-ready i16 stereo. The host drives
+//! two events: [`Sink::submit`] when a producer has frames and [`Sink::on_irq`]
+//! when the device signals completion. Arming a device, reading its cursor and
+//! acknowledging its interrupt happen through [`Device`].
 //!
 //! This used to exist three times over in the kernel — once inside each of the
 //! HDA, AC'97 and SB16 drivers, with the same counters, the same prime rule,
@@ -15,174 +13,55 @@
 //! a wakeup. None of it was device knowledge, and none of it is kernel
 //! knowledge either: it is a ring buffer and some arithmetic.
 //!
-//! A [`Device`] is the whole of what a sound card must supply: four calls,
-//! none of which mention a machine. Where the bytes go, how the ring is
-//! programmed and which interrupt line carries the completion are the host's;
-//! how many blocks have played and what to do about it are this crate's.
+//! A [`Device`] is the whole of what a sound card must supply: one rate and
+//! four operations, none of which mention a machine. Where the bytes go, how
+//! the ring is programmed and which interrupt line carries the completion are
+//! the host's; how many blocks completed and what to do about them are this
+//! crate's.
 //!
 //! There is deliberately **no clock and no cursor** in here. Playback is
-//! learned one way only: `on_block_played`, called once per block, in order,
-//! never lost, never duplicated. A host honours that by reading its device's
-//! cursor and emitting the *difference*, which is how a coalesced interrupt
-//! (two completions, one pending bit) still yields two calls. Everything else
-//! follows: free space is `written − played·block`.
+//! learned one way only: [`Sink::on_irq`], which asks the device how many
+//! blocks completed since the previous interrupt. The device obtains that
+//! number from its cursor difference, so a coalesced interrupt still accounts
+//! for every block. The producer remains frame-granular; only device
+//! completion is block-granular.
 
 /// Completion granularity: one interrupt per block. 512 signed-16 stereo
 /// frames, ~11.6 ms at 44.1 kHz — a 30 ms pipe keeps about 2.6 blocks queued,
 /// while the block size halves interrupt pressure against a 256-frame one.
 pub const BUF_BYTES: usize = 0x800;
-pub const BUF_FRAMES: usize = BUF_BYTES / 4;
+/// One device PCM frame: `[left, right]`. RetroOS targets little-endian x86,
+/// so this is also the DMA wire representation used by every hardware sink.
+pub type Frame = [i16; 2];
+pub const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<Frame>();
 pub const NUM_BUF: usize = 32;
-pub const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
+pub const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
+pub const RING_BYTES: usize = RING_FRAMES * core::mem::size_of::<Frame>();
 
 /// The play cursor caught the write cursor while a producer was feeding us.
 /// Reported rather than logged: this crate has no console, and what a host
 /// does about it (count it, print it, ignore it) is the host's business.
 #[derive(Clone, Copy, Debug)]
 pub struct Underrun {
-    pub written: u64,
-    pub played_frames: u64,
-}
-
-/// One ring of PCM: the memory, the two cursors, and the counters.
-pub struct Ring {
-    buf: &'static mut [u8],
-    /// Where the producer is writing.
-    cur_buf: usize,
-    cur_off: usize,
-    /// Source frames accepted, and blocks the hardware has played.
-    written: u64,
-    played: u64,
-    /// The rate the device is programmed for — carried so a host can tell a
-    /// rate change from a session that is merely idle.
-    rate: u32,
-    /// `written` as of the previous played block, to tell an IDLE sink from a
-    /// STARVED one. The transfer runs for the sink's whole life, so a sink
-    /// with no producer plays silence forever and would otherwise report an
-    /// underrun per block: true, useless, and drowning the real ones.
-    fed_at_last_block: u64,
-}
-
-impl Ring {
-    /// `buf` is the device's transfer ring, already mapped by the host and at
-    /// least [`RING_BYTES`] long.
-    pub fn new(buf: &'static mut [u8], rate: u32) -> Self {
-        Ring {
-            buf,
-            cur_buf: 0,
-            cur_off: 0,
-            written: 0,
-            played: 0,
-            rate,
-            fed_at_last_block: 0,
-        }
-    }
-
-    pub fn rate(&self) -> u32 {
-        self.rate
-    }
-
-    /// `(written, played)` in source frames — the pipe counters a producer
-    /// paces against.
-    pub fn position(&self) -> (u64, u64) {
-        (self.written, self.played * BUF_FRAMES as u64)
-    }
-
-    /// One block reached the DAC. The only way playback is ever observed.
-    ///
-    /// Zeroes the block that just played. A free-running transfer has no gate
-    /// — the device will come round and play these bytes again — so scrubbing
-    /// behind the play cursor is what makes "the producer stopped feeding us"
-    /// sound like silence instead of the last lap on repeat. It is also why
-    /// the transfer can simply run for the sink's whole life: an unfed ring is
-    /// a silent one, so there is no stopped state to arm out of.
-    pub fn on_block_played(&mut self) -> Option<Underrun> {
-        let played_buf = (self.played as usize) % NUM_BUF;
-        self.buf[played_buf * BUF_BYTES..(played_buf + 1) * BUF_BYTES].fill(0);
-        self.played += 1;
-        let producing = self.written > self.fed_at_last_block;
-        self.fed_at_last_block = self.written;
-        let played_frames = self.played * BUF_FRAMES as u64;
-        (producing && self.written <= played_frames).then_some(Underrun {
-            written: self.written,
-            played_frames,
-        })
-    }
-
-    /// Has anything played yet? A host's bring-up diagnostic: the difference
-    /// between "armed" and "the DAC is actually consuming".
-    pub fn silent_so_far(&self) -> bool {
-        self.played == 0
-    }
-
-    /// Copy canonical frames into the ring.
-    ///
-    /// Signed 16-bit interleaved stereo, and nothing else. A sink is the END
-    /// of the audio path: whatever wire format a card's DMA carried — 8-bit
-    /// unsigned, mono, ADPCM — was decoded by that card on its way into the
-    /// mix, which is the only place that knows what it meant. Taking a format
-    /// here would mean the mixer encoding its own samples for us to decode
-    /// again.
-    pub fn fill(&mut self, frames: &[(i16, i16)]) {
-        for &(l, r) in frames {
-            let at = self.cur_buf * BUF_BYTES + self.cur_off;
-            self.buf[at..at + 2].copy_from_slice(&(l as u16).to_le_bytes());
-            self.buf[at + 2..at + 4].copy_from_slice(&(r as u16).to_le_bytes());
-            self.written += 1;
-            self.cur_off += 4;
-            if self.cur_off >= BUF_BYTES {
-                self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
-                self.cur_off = 0;
-            }
-        }
-    }
-
-    /// Silence the whole ring — the producer went idle and the transfer keeps
-    /// running, so what it plays should be nothing.
-    pub fn silence(&mut self) {
-        self.buf.fill(0);
-    }
-
-    /// Re-key for a new session at `rate`: the device restarted, so the
-    /// counters it is relative to restart with it.
-    pub fn restart(&mut self, rate: u32) {
-        self.cur_buf = 0;
-        self.cur_off = 0;
-        self.written = 0;
-        self.played = 0;
-        self.fed_at_last_block = 0;
-        self.rate = rate;
-        self.silence();
-    }
-
-    /// Drop the write cursor onto the play cursor.
-    ///
-    /// After a stall longer than the pipe, the write cursor sits behind the
-    /// play cursor: the ring is silent (every played block is scrubbed) but
-    /// fresh audio would land in blocks that will not be played for a whole
-    /// lap. Trading that lap of latency costs nothing, because the ring is
-    /// silence either way.
-    pub fn resync(&mut self) {
-        self.cur_buf = (self.played as usize + 1) % NUM_BUF;
-        self.cur_off = 0;
-        self.written = (self.played + 1) * BUF_FRAMES as u64;
-    }
+    pub written_frames: u64,
+    pub consumed_frames: u64,
 }
 
 /// What a sound card must supply to be a sink.
 ///
-/// Four calls, and not one of them takes a machine handle: a device reaches
-/// its own hardware however its host arranged that (injected port I/O, MMIO,
-/// a hypervisor call), which is exactly the same discipline the cards in this
-/// crate follow from the other direction. Bring-up — finding the controller,
-/// mapping the transfer ring, routing the interrupt — happens before a
-/// `Device` exists and is none of this crate's business.
+/// One property and four operations, and none takes a machine handle: a
+/// device reaches its own hardware however its host arranged that (injected
+/// port I/O, MMIO, a hypervisor call), which is exactly the same discipline the
+/// cards in this crate follow from the other direction. Bring-up — finding the
+/// controller, mapping the transfer ring, routing the interrupt — happens
+/// before a `Device` exists and is none of this crate's business.
 pub trait Device {
-    /// Program the output rate. The mixer produces at whatever the device
-    /// asked for, so this is normally set once.
-    fn set_rate(&mut self, rate: u32);
+    /// The device's PCM rate. The producer renders at this rate; the ring
+    /// itself only stores and counts frames and has no clock.
+    fn rate(&self) -> u32;
 
-    /// Arm the transfer over the whole ring, and re-baseline the block count.
+    /// Program the device at [`Device::rate`], arm the transfer over the whole
+    /// ring, and re-baseline the block count.
     /// A sink is armed once, at construction, and free-runs for its life —
     /// there is no stopped state, because an unfed ring plays the silence it
     /// is scrubbed to.
@@ -209,21 +88,35 @@ pub trait Device {
 
 /// A sound output: one ring, one device.
 pub struct Sink<D: Device> {
-    ring: Ring,
     dev: D,
+    buf: &'static mut [Frame],
+    write_pos: usize,
+    written_frames: u64,
+    completed_blocks: u64,
+    /// Used to distinguish an idle sink from one that ran dry while its
+    /// producer was active.
+    written_frames_at_last_completion: u64,
 }
 
 impl<D: Device> Sink<D> {
-    /// Arm `dev` over `buf` at `rate` and start playing. Constructing a sink
-    /// starts it: silence is the ring's content, not a state of the device.
-    pub fn new(buf: &'static mut [u8], rate: u32, mut dev: D) -> Self {
-        dev.set_rate(rate);
+    /// Arm `dev` over `buf` and start playing at the device's rate.
+    /// Constructing a sink starts it: silence is the ring's content, not a
+    /// state of the device.
+    pub fn new(buf: &'static mut [Frame], mut dev: D) -> Self {
+        buf.fill([0, 0]);
         dev.start();
-        Sink { ring: Ring::new(buf, rate), dev }
+        Sink {
+            dev,
+            buf,
+            write_pos: 0,
+            written_frames: 0,
+            completed_blocks: 0,
+            written_frames_at_last_completion: 0,
+        }
     }
 
     pub fn rate(&self) -> u32 {
-        self.ring.rate()
+        self.dev.rate()
     }
 
     pub fn device(&mut self) -> &mut D {
@@ -236,31 +129,38 @@ impl<D: Device> Sink<D> {
         self.dev
     }
 
-    /// Accept produced PCM. A rate change re-arms the device, because the rate
-    /// is latched when it starts and the counters are relative to it.
-    pub fn submit(&mut self, rate: u32, frames: &[(i16, i16)]) -> Report {
-        if rate != 0 && rate != self.ring.rate() {
-            self.dev.set_rate(rate);
-            self.dev.start();
-            self.ring.restart(rate);
+    /// Apply the final Q16 gain, clip once, and write device PCM into the ring.
+    pub fn submit(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
+        for &(left, right) in frames {
+            self.buf[self.write_pos] = [scale(left, gain_q16), scale(right, gain_q16)];
+            self.write_pos = (self.write_pos + 1) % RING_FRAMES;
+            self.written_frames += 1;
         }
-        self.ring.fill(frames);
-        Report::default()
     }
 
-    /// Service the device: collect the blocks it has played and account for
-    /// them. Safe to call without an interrupt — a late or coalesced one is
-    /// exactly what the cursor difference is for.
-    pub fn service(&mut self) -> Report {
+    /// Account for a completion interrupt. The device cursor may report more
+    /// than one block when interrupts coalesce; each is delivered exactly once.
+    pub fn on_irq(&mut self) -> Report {
         let blocks = self.dev.blocks_played();
-        let mut report = Report::default();
-        for _ in 0..blocks {
-            report.first_block |= self.ring.silent_so_far();
-            if let Some(u) = self.ring.on_block_played() {
-                report.underrun = Some(u);
-            }
+        if blocks == 0 {
+            return Report::default();
         }
-        report
+
+        let first_block = self.completed_blocks == 0;
+        for block in self.completed_blocks..self.completed_blocks + blocks {
+            let slot = block as usize % NUM_BUF;
+            self.buf[slot * BUF_FRAMES..(slot + 1) * BUF_FRAMES].fill([0, 0]);
+        }
+        self.completed_blocks += blocks;
+
+        let producing = self.written_frames > self.written_frames_at_last_completion;
+        self.written_frames_at_last_completion = self.written_frames;
+        let consumed_frames = self.consumed_frames();
+        let underrun = (producing && self.written_frames <= consumed_frames).then_some(Underrun {
+            written_frames: self.written_frames,
+            consumed_frames,
+        });
+        Report { first_block, underrun }
     }
 
     /// Did this device raise the completion? Clears its status if so.
@@ -268,25 +168,16 @@ impl<D: Device> Sink<D> {
         self.dev.irq_pending()
     }
 
-    /// `(written, played)` in source frames.
-    pub fn position(&self) -> (u64, u64) {
-        self.ring.position()
-    }
-
-    /// The producer went idle. The transfer keeps running and plays the
-    /// silence the ring is scrubbed to; `park` is a real session end and stops
-    /// the hardware.
-    pub fn stop(&mut self, park: bool) {
-        self.ring.silence();
-        if park {
-            self.dev.halt();
-        }
+    /// Frames consumed by the device, at block granularity.
+    pub fn consumed_frames(&self) -> u64 {
+        self.completed_blocks * BUF_FRAMES as u64
     }
 
     /// Re-anchor after a stall longer than the pipe: drop the write cursor
     /// onto the play cursor, trading a lap of latency for nothing.
     pub fn resync(&mut self) {
-        self.ring.resync();
+        self.write_pos = ((self.completed_blocks as usize + 1) % NUM_BUF) * BUF_FRAMES;
+        self.written_frames = (self.completed_blocks + 1) * BUF_FRAMES as u64;
     }
 }
 
@@ -300,4 +191,89 @@ pub struct Report {
     /// goes wrong and which no error counter ever shows.
     pub first_block: bool,
     pub underrun: Option<Underrun>,
+}
+
+/// Apply a Q16 gain and narrow one wide mixer sample to the device format.
+pub fn scale(sample: i32, gain_q16: i32) -> i16 {
+    ((i64::from(sample) * i64::from(gain_q16)) >> 16)
+        .clamp(i16::MIN as i64, i16::MAX as i64) as i16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDevice {
+        rate: u32,
+        starts: u32,
+        played: u64,
+    }
+
+    impl Device for TestDevice {
+        fn rate(&self) -> u32 {
+            self.rate
+        }
+
+        fn start(&mut self) {
+            self.starts += 1;
+        }
+
+        fn halt(&mut self) {}
+
+        fn irq_pending(&mut self) -> bool {
+            false
+        }
+
+        fn blocks_played(&mut self) -> u64 {
+            core::mem::take(&mut self.played)
+        }
+    }
+
+    fn ring() -> &'static mut [Frame] {
+        Box::leak(vec![[0; 2]; RING_FRAMES].into_boxed_slice())
+    }
+
+    #[test]
+    fn device_owns_the_rate() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 48_000, starts: 0, played: 0 },
+        );
+        assert_eq!(sink.rate(), 48_000);
+        assert_eq!(sink.device().starts, 1);
+
+        sink.submit(&[(1, -1); 32], 1 << 16);
+        assert_eq!(sink.written_frames, 32);
+        assert_eq!(sink.consumed_frames(), 0);
+        assert_eq!(
+            sink.device().starts,
+            1,
+            "submitting frames must not reprogram the device"
+        );
+    }
+
+    #[test]
+    fn block_completions_expose_consumed_frames() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 8_000, starts: 0, played: 1 },
+        );
+        sink.submit(&[(1, 1)], 1 << 16);
+        let report = sink.on_irq();
+        assert!(report.first_block);
+        assert!(report.underrun.is_some());
+        assert_eq!(sink.written_frames, 1);
+        assert_eq!(sink.consumed_frames(), BUF_FRAMES as u64);
+    }
+
+    #[test]
+    fn fill_applies_gain_and_clips_in_the_dma_ring() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 44_100, starts: 0, played: 0 },
+        );
+        sink.submit(&[(100_000, -100_000)], 1 << 15);
+        assert_eq!(sink.buf[0], [i16::MAX, i16::MIN]);
+    }
+
 }

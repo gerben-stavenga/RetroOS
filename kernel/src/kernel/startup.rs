@@ -705,6 +705,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
     let mut display_handoff = None;
+    let mut audio_pace = crate::kernel::sound::Pace::new();
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
     // hardware with at most one guest owner, and the loop is what outlives
@@ -739,10 +740,22 @@ pub fn event_loop<A: crate::Arch>(
             alloc::vec::Vec::new()
         };
         stats.part(machine, 1);
+        let ticks = machine.take_pending_ticks();
         let thread = ctx.thread(threads);
 
-        // Advance this thread's world: virtual time, console input, delivery.
-        thread.personality.advance_world(machine, &mut ctx.regs);
+        // Advance virtual devices, then feed sound before display publication:
+        // a synchronous framebuffer write can consume most of a millisecond.
+        thread.personality.advance_world(
+            machine,
+            ticks,
+            audio_pace.pushed(),
+        );
+        if ticks != 0 {
+            crate::kernel::sound::pump(machine, &mut audio_pace, ticks as u64, |machine, span| {
+                thread.personality.audio_tick(machine, span);
+            });
+            thread.personality.display_tick(machine, &ctx.regs);
+        }
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
@@ -1221,8 +1234,8 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
 /// the periodic [prof] dump, and the free-page low-water sampling. Keeps
 /// the loop body logic, not bookkeeping.
-/// advance_world's internals, billed from `thread.rs`: (take_pending_ticks,
-/// tick+display, audio_tick). Diagnostic only — read by the profile dump.
+/// Event-loop world-advance costs, billed from `thread.rs`: timer/device work,
+/// display, audio, and tick count. Diagnostic only — read by the profile dump.
 static mut SLICE_PARTS: [u64; 5] = [0; 5];
 
 /// Count of actual frame presentations (past the frame_due gate), so the
@@ -1254,9 +1267,8 @@ pub fn bill_display(
     }
 }
 
-/// `audio_tick` internals: device maintenance/MIDI, pump setup and sink
-/// pacing, PCM source mixing/output, guest clocks/IRQ delivery, and the
-/// number of canonical PCM frames generated.
+/// Audio-pump diagnostics: device maintenance, pacing setup, source mixing and
+/// sink output, guest clocks/IRQ delivery, and canonical frames generated.
 static mut AUDIO_PARTS: [u64; 5] = [0; 5];
 
 pub fn bill_audio(devices: u64, setup: u64, pump: u64, clocks: u64, frames: u64) {
@@ -1277,8 +1289,8 @@ pub fn bill_present() {
     }
 }
 
-/// take, queue_tick loop, display_tick, audio, and the tick COUNT — so each
-/// gets divided by its own denominator instead of all by the present count.
+/// Timer acquisition, device tick loop, display, audio, and the tick count —
+/// each can be billed independently and divided by its own denominator.
 pub fn bill_slice2(take: u64, ticks_cyc: u64, display: u64, audio: u64, nticks: u64) {
     unsafe {
         let p = &raw mut SLICE_PARTS;

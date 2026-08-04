@@ -116,13 +116,6 @@ pub(super) const GM_SCALE_Q16: i32 = 15_400;
 /// derivation rather than a knob someone turned until it sounded right.
 pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
 
-/// One knob for overall loudness, applied to the summed mix just before the
-/// single clip. Unity: the headroom already lives in the per-source scales
-/// above (that is exactly what the CT1745 table ceiling buys), so rescaling
-/// here would only trade it away. This is the place to change if the whole
-/// machine should be louder or quieter.
-pub(super) const OUTPUT_GAIN_Q16: i32 = 65_536;
-
 /// One canonical 128-frame block at the SB16 maximum of 16-bit stereo.
 const DSP_SCRATCH_BYTES: usize = 128 * 4;
 
@@ -400,10 +393,10 @@ impl SoundBlaster {
         match device {
             SbDevice::Emulated(emu) => {
                 // No real card / no buffer alias in emulation: just stop the
-                // card so the next program sees a clean, idle one. Parking the
-                // sink is ours — it is shared with every other source.
+                // card so the next program sees a clean, idle one. The output
+                // sink belongs to the event loop and keeps carrying the other
+                // sources (or silence) across this program boundary.
                 emu.core.reset_for_exit();
-                crate::kernel::sound::stop(machine, true); // session end: power down
             }
             SbDevice::Native(pt) => pt.release(machine, blaster),
         }
@@ -992,13 +985,6 @@ impl EmulatedSb {
         }
     }
 
-    /// Whether the emulated DSP owns the canonical sink right now: playing,
-    /// or holding the stream open through the hangover. The top of the
-    /// producer priority chain (DSP > GUS > OPL).
-    pub fn dsp_owns_sink(&self) -> bool {
-        self.core.owns_sink()
-    }
-
     /// Rate the DSP stream runs the mixer session at.
     pub fn dsp_rate(&self) -> u32 {
         self.core.rate()
@@ -1008,12 +994,6 @@ impl EmulatedSb {
     /// re-key its session so pump frames and DSP stream frames coincide.
     pub fn take_restart(&mut self) -> bool {
         self.core.take_restart()
-    }
-
-    /// Whether the FM synth wants the canonical stream held open (voices
-    /// sounding, or the driver wrote between-notes recently).
-    pub fn opl_audible(&self, now: u64) -> bool {
-        self.core.fm_audible(now)
     }
 
     /// Mix every producer on this card into the same final PCM block.

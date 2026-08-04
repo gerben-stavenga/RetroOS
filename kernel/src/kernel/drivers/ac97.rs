@@ -70,7 +70,7 @@ const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
 /// Use the FULL 32-entry BDL — one descriptor per ring block, no mirrors.
-/// Geometry is the sink engine's (`sound::Ring`); this is the count of BDL
+/// Geometry belongs to the sound sink; this is the count of BDL
 /// entries the device programs, which must agree with it.
 use crate::kernel::sound::{BUF_BYTES, NUM_BUF};
 
