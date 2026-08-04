@@ -204,9 +204,11 @@ pub(crate) const BUF_BYTES: usize = 0x800;
 const BUF_FRAMES: usize = BUF_BYTES / 4;
 pub(crate) const NUM_BUF: usize = 32;
 pub(crate) const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
-/// The one rate the mixer produces at, and therefore the rate a sink is armed
-/// with. A source at another rate restarts the transfer.
-const MIX_RATE: u32 = 44_100;
+/// The rate a sink runs at when the device has no opinion. Every device that
+/// can be told a rate is told this one; a device that can only play its own
+/// (an HDA codec that offers 48 kHz and not 44.1) answers with that instead,
+/// and the MIXER adapts — see [`Sink::rate`].
+const DEFAULT_RATE: u32 = 44_100;
 
 /// The devices that can serve the sink. A closed set — these are the cards
 /// RetroOS drives, and adding one should break every match here on purpose.
@@ -252,10 +254,16 @@ impl Sink {
             Device::Ac97 => crate::kernel::drivers::ac97::adopt(machine),
             _ => None,
         };
-        let mut sink = Sink { device, ring: ring.map(|(va, phys)| Ring::new(va, phys, MIX_RATE)) };
+        let rate = match &device {
+            // The codec's own rate: an HDA converter may not offer 44.1 kHz at
+            // all, and adapting is the mixer's job, not a resampler's.
+            Device::Hda => crate::kernel::drivers::hda::stream_rate(),
+            _ => DEFAULT_RATE,
+        };
+        let mut sink = Sink { device, ring: ring.map(|(va, phys)| Ring::new(va, phys, rate)) };
         if let Some((va, phys)) = ring {
             let _ = va;
-            sink.dev_set_rate(machine, MIX_RATE);
+            sink.dev_set_rate(machine, rate);
             sink.dev_start(machine, phys);
         }
         sink
@@ -269,6 +277,19 @@ impl Sink {
             Device::Sb(card) => Ok((card, Sink { device: Device::Silent, ring: None })),
             device => Err(Sink { device, ring: self.ring }),
         }
+    }
+
+    /// The rate this sink plays at — what a producer should MIX at.
+    ///
+    /// The sample rate is the device's to choose, not a constant the kernel
+    /// imposes: an SB16 or an AC'97 with variable-rate audio will play
+    /// whatever it is told, while an HDA codec may only offer 48 kHz. Asking
+    /// the sink means the conversion happens once, in the mixer, where every
+    /// source is already being rate-converted anyway — instead of mixing to a
+    /// fixed 44.1 kHz and then zero-order-holding it to the codec's rate in
+    /// the driver, which is both a second conversion and the worst kind.
+    pub fn rate(&self) -> u32 {
+        self.ring.as_ref().map_or(DEFAULT_RATE, |r| r.rate)
     }
 
     /// Stream a block of source PCM (`fmt`, `rate` Hz), canonicalized to i16
@@ -522,6 +543,11 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
 
 pub fn min_fill(rate: u32) -> Option<u32> {
     SINK.lock().min_fill(rate)
+}
+
+/// The rate the active sink plays at — what a producer should mix at.
+pub fn rate() -> u32 {
+    SINK.lock().rate()
 }
 
 pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {

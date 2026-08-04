@@ -1942,6 +1942,17 @@ pub fn position() -> Option<(u64, u64)> {
 /// converted to the source rate.
 /// The sink is up and reports a play position (so `sound::min_fill` returns the
 /// universal pipe depth). The pipe latency itself is not this driver's to set.
+/// The rate this codec's stream runs at — what the mixer should produce.
+///
+/// The sink's rate is the DEVICE's to choose. A converter that offers only
+/// 48 kHz would answer 48000 here and the mixer would follow it, instead of
+/// the mixer producing 44.1 kHz and this driver zero-order-holding it up —
+/// two conversions, the second one the crudest available. 44.1 kHz is what
+/// `fmt` programs today, and the base every codec supports.
+pub fn stream_rate() -> u32 {
+    44_100
+}
+
 pub fn present() -> bool {
     let g = HDA.lock();
     g.as_ref().is_some_and(|d| !(d.parked && d.verb_failed))

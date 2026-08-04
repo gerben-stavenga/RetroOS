@@ -1114,9 +1114,10 @@ fn sat16(v: i32) -> i16 {
 /// resampled the GUS down to the effects' bandwidth — Doom's music came out
 /// of an 11 kHz pipe, band-limited to 5.5 kHz with the zero-order hold's
 /// staircase images stacked on top. Every source now renders into this clock
-/// and resamples itself; the sinks take 44.1 kHz natively, so nothing
-/// downstream resamples at all.
-const MIX_RATE: u32 = 44100;
+/// and resamples itself, at the rate the SINK asks for
+/// (`sound::rate()`) — so nothing downstream resamples at all. An HDA codec
+/// that only offers 48 kHz simply moves this clock; it does not add a second
+/// conversion behind it.
 
 /// The one mixer pump: exactly one canonical PCM stream, paced by the sink's
 /// playback position (`sound::Pace`), into which every audible `PcmSource`
@@ -1213,7 +1214,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let gus_on = gus.mixing();
     let opl_on = sb.as_deref().is_some_and(|e| e.opl_audible(now));
     let midi_on = mpu.mixing();
-    let spk_on = spk.audible(MIX_RATE);
+    let spk_on = spk.audible(crate::kernel::sound::rate());
     // Idle sources do NOT stop the sink: once a session streams, it stays
     // alive and idle gaps pump silence. Stopping here paused/re-primed the
     // hardware stream on every gap (menu→demo music transitions), and an HDA
@@ -1237,7 +1238,9 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     if sb.as_deref_mut().is_some_and(|e| e.take_restart()) {
         mixer.dsp_epoch = mixer.pace.pushed();
     }
-    let rate = MIX_RATE;
+    // The SINK's rate: mixing straight to what the device plays means one
+    // rate conversion (per source, here) instead of two.
+    let rate = crate::kernel::sound::rate();
     let mut n = mixer.pace.due(machine, rate, dt, MIX_CHUNK);
     let generated = n;
     let mut base = mixer.pace.pushed() - n;
