@@ -287,6 +287,7 @@ pub fn start<A: crate::Arch>(machine: &mut A) {
     machine.outb(d.nabm + PO_LVI, (NUM_BUF - 1) as u8);
     let cr = machine.inb(d.nabm + PO_CR);
     machine.outb(d.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
+    crate::println!("ac97: stream RUN lvi={} cr={:#x}", NUM_BUF - 1, machine.inb(d.nabm + PO_CR));
 }
 
 /// Stop the bus master.

@@ -152,6 +152,12 @@ impl Ring {
     /// transfer can simply run for the sink's whole life: an unfed ring is a
     /// silent one, so there is no stopped state to arm out of.
     fn on_block_played(&mut self) {
+        // One line, once: the difference between "armed" and "the DAC is
+        // actually consuming" — which on real hardware is where bring-up goes
+        // wrong, and is invisible in a counter that only reports problems.
+        if self.played == 0 {
+            crate::println!("sink: first block played (rate={})", self.rate);
+        }
         let played_buf = (self.played as usize) % NUM_BUF;
         unsafe {
             core::ptr::write_bytes((self.va + played_buf * BUF_BYTES) as *mut u8, 0, BUF_BYTES)
@@ -252,6 +258,7 @@ impl Sink {
         let ring = match &device {
             Device::Sb(card) => crate::kernel::drivers::sb16::adopt(machine, card),
             Device::Ac97 => crate::kernel::drivers::ac97::adopt(machine),
+            Device::Hda => crate::kernel::drivers::hda::adopt(),
             _ => None,
         };
         let rate = match &device {
@@ -296,8 +303,7 @@ impl Sink {
     /// stereo on the way.
     pub fn play<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
         match self.device {
-            Device::Hda => crate::kernel::drivers::hda::play(machine, rate, fmt, bytes),
-            Device::Ac97 | Device::Sb(_) => self.submit(machine, rate, fmt, bytes),
+            Device::Hda | Device::Ac97 | Device::Sb(_) => self.submit(machine, rate, fmt, bytes),
             Device::PortWindow => port_window_play(machine, rate, fmt, bytes),
             Device::Silent => {}
         }
@@ -327,6 +333,7 @@ impl Sink {
         match self.device {
             Device::Sb(_) => crate::kernel::drivers::sb16::set_rate(machine, rate),
             Device::Ac97 => crate::kernel::drivers::ac97::set_rate(machine, rate),
+            Device::Hda => crate::kernel::drivers::hda::set_rate(machine, rate),
             _ => {}
         }
     }
@@ -335,6 +342,7 @@ impl Sink {
         match self.device {
             Device::Sb(_) => crate::kernel::drivers::sb16::start(machine, phys),
             Device::Ac97 => crate::kernel::drivers::ac97::start(machine),
+            Device::Hda => crate::kernel::drivers::hda::start(machine, phys),
             _ => {}
         }
     }
@@ -343,6 +351,7 @@ impl Sink {
         match self.device {
             Device::Sb(_) => crate::kernel::drivers::sb16::halt(machine),
             Device::Ac97 => crate::kernel::drivers::ac97::halt(machine),
+            Device::Hda => crate::kernel::drivers::hda::halt(machine),
             _ => {}
         }
     }
@@ -360,6 +369,7 @@ impl Sink {
         match self.device {
             Device::Sb(_) => crate::kernel::drivers::sb16::poll(machine),
             Device::Ac97 => crate::kernel::drivers::ac97::poll(machine),
+            Device::Hda => crate::kernel::drivers::hda::poll(),
             _ => 0,
         }
     }
@@ -368,8 +378,7 @@ impl Sink {
     /// program cleanup): the device may power down, not just pause.
     pub fn stop<A: crate::Arch>(&mut self, machine: &mut A, park: bool) {
         match self.device {
-            Device::Hda => crate::kernel::drivers::hda::stop(machine, park),
-            Device::Sb(_) | Device::Ac97 => {
+            Device::Sb(_) | Device::Ac97 | Device::Hda => {
                 // The transfer keeps running — an idle sink plays the silence
                 // it is scrubbed to, which is what "stopped" sounds like and
                 // costs one DMA channel doing nothing audible. Only `park` (a
@@ -391,8 +400,7 @@ impl Sink {
     /// virtual time instead.
     pub fn position<A: crate::Arch>(&mut self, machine: &mut A) -> Option<(u64, u64)> {
         match self.device {
-            Device::Hda => crate::kernel::drivers::hda::position(),
-            Device::Ac97 | Device::Sb(_) => {
+            Device::Hda | Device::Ac97 | Device::Sb(_) => {
                 // Interrupts can be late as well as coalesced, so take the
                 // device's word for blocks played here too rather than only on
                 // the interrupt: same contract, same accounting, asked at the
@@ -418,7 +426,7 @@ impl Sink {
     /// has no real-time consumer clock.
     pub fn min_fill(&self, rate: u32) -> Option<u32> {
         let present = match self.device {
-            Device::Hda => crate::kernel::drivers::hda::present(),
+            Device::Hda => self.ring.is_some() && crate::kernel::drivers::hda::present(),
             Device::Ac97 => self.ring.is_some(),
             Device::Sb(_) => self.ring.is_some(),
             Device::PortWindow | Device::Silent => false,
@@ -431,9 +439,14 @@ impl Sink {
     pub fn on_irq<A: crate::Arch>(&mut self, machine: &mut A, event: crate::Irq) -> bool {
         use crate::kernel::drivers::{ac97, hda, sb16};
         match (&self.device, event) {
-            (Device::Hda, crate::Irq::Msi(source)) if source == hda::MSI_SOURCE => hda::on_irq(),
+            (Device::Hda, crate::Irq::Msi(source)) if source == hda::MSI_SOURCE => {
+                let (ours, blocks) = hda::ack();
+                self.blocks_played(blocks);
+                ours
+            }
             (Device::Hda, crate::Irq::Hw(line)) if Some(line) == hda::irq_line() => {
-                let ours = hda::on_irq();
+                let (ours, blocks) = hda::ack();
+                self.blocks_played(blocks);
                 if ours {
                     machine.rearm_irq(line);
                 }
@@ -466,11 +479,23 @@ impl Sink {
         }
     }
 
-    /// Re-anchor after a long synchronous display handoff. Position-less
-    /// devices have no producer to recover.
+    /// Re-anchor after a long synchronous display handoff.
+    ///
+    /// A stall longer than the pipe leaves the WRITE cursor behind the play
+    /// cursor: the ring is silent (every played block is scrubbed) but fresh
+    /// audio now lands in blocks that will not be played for a whole lap.
+    /// Dropping the write cursor onto the play cursor trades that lap of
+    /// latency for nothing — the ring is already silence either way.
+    ///
+    /// This used to be a per-driver servo in HDA's write path, undoing a lap
+    /// that replayed stale content. Scrubbing behind the play cursor made the
+    /// replay impossible, so what is left is one line, in one place, for every
+    /// device.
     pub fn recover_after_display_stall(&mut self) {
-        if matches!(self.device, Device::Hda) {
-            crate::kernel::drivers::hda::recover_after_stall();
+        if let Some(ring) = self.ring.as_mut() {
+            ring.cur_buf = (ring.played as usize + 1) % NUM_BUF;
+            ring.cur_off = 0;
+            ring.written = (ring.played + 1) * BUF_FRAMES as u64;
         }
     }
 }

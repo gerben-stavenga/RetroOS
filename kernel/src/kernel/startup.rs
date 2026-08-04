@@ -208,7 +208,6 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     let for_sink = (platform.audio == crate::kernel::platform::Audio::SbSink)
         .then(|| sb_card.take())
         .flatten();
-    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, for_sink));
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
@@ -220,6 +219,10 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
     }
     init_device_policy(machine, platform);
+    // AFTER the drivers are up: the sink adopts a device's ring at
+    // construction, so a controller that has not been brought up yet would
+    // hand it nothing and the sink would be silently inert.
+    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, for_sink));
     init_console_pipe();
 
     // Preserve one kernel-owned pristine real-mode environment. DOS worlds
