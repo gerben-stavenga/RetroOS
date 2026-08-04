@@ -349,6 +349,28 @@ fn dsp_read_at<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
     0xFF
 }
 
+/// Silence a channel's permanent DMA buffer.
+///
+/// The buffer is where the audio physically IS: `vsb::arm` aliases the guest's
+/// pages onto these frames, and `unbind` copies the content back out to the
+/// guest without clearing them. Leaving it loaded means an auto-init transfer
+/// that gets unmasked with nothing new written replays the last lap — there is
+/// no LVI gate to stop it — so a card handed on in silence can still be heard.
+///
+/// The fill is NOT zero on both channels. An 8-bit SB transfer is unsigned
+/// with a 0x80 bias, so zeroing it writes full-scale negative DC — a rail, not
+/// silence. 16-bit transfers are signed, where zero is exactly silence.
+pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
+    let page = machine.dma_channel_buf(chan as usize);
+    if page == 0 {
+        return;
+    }
+    // 64 KB window on an 8-bit channel, 128 KB on a 16-bit one.
+    let (pages, fill) = if chan >= 4 { (32usize, 0x00u8) } else { (16usize, 0x80u8) };
+    machine.map_phys_range(DMA_WIN_VA >> 12, pages, page, PTE_CACHE_DISABLE);
+    unsafe { core::ptr::write_bytes(DMA_WIN_VA as *mut u8, fill, pages * 0x1000) };
+}
+
 /// Take the machine's Sound Blaster as the kernel mixer's sink, for good.
 /// Called only in `Audio::SbSink` mode; the card never leaves again, which is
 /// why this takes it by value and hands nothing back.

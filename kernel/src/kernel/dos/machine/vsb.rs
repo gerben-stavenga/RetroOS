@@ -645,6 +645,14 @@ impl NativeSb {
         // unmasks. These are the card's own 8-bit/16-bit lines.
         mask_real_8237(machine, self.card.dma8);
         if let Some(d16) = self.card.dma16 { mask_real_8237(machine, d16); }
+        // Silence what the channels would transfer if anything unmasked them.
+        // The buffer still holds this program's last lap — `unbind` copied it
+        // back to the guest, it did not clear it — and an auto-init transfer
+        // has no LVI gate, so it would simply play again.
+        crate::kernel::drivers::sb16::zero_channel_buf(machine, self.card.dma8);
+        if let Some(d16) = self.card.dma16 {
+            crate::kernel::drivers::sb16::zero_channel_buf(machine, d16);
+        }
         self.suspended = false;
         self.last_gen = [0; 8];
     }
