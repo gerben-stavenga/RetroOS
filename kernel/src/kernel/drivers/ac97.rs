@@ -257,17 +257,22 @@ impl Ac97 {
 
 /// Where the engine writes PCM: the ring starts after the BDL page.
 pub fn adopt<A: crate::Arch>(machine: &mut A) -> Option<(usize, u32)> {
+    let _ = machine;
     let g = AC97.lock();
     let d = g.as_ref()?;
-    let _ = machine;
     Some((d.dma_va + BDL_BYTES, d.dma_phys + BDL_BYTES as u32))
 }
 
 /// Program the DAC rate. Variable-rate audio was enabled at bring-up, so the
 /// codec plays the source rate directly — no resampler in this path.
-pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
+pub fn set_rate(rate: u32) {
     let Some(nam) = AC97.lock().as_ref().map(|d| d.nam) else { return };
-    machine.outw(nam + NAM_PCM_DAC_RATE, rate as u16);
+    crate::kernel::portio::outw(nam + NAM_PCM_DAC_RATE, rate as u16);
+}
+
+/// Kernel VA of the ring, for rebuilding a sink around this device.
+pub fn ring_va() -> usize {
+    AC97.lock().as_ref().map_or(0, |d| d.dma_va + BDL_BYTES)
 }
 
 /// Start the bus master, and give it a full ring of runway.
@@ -278,44 +283,46 @@ pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
 /// when `CIV == LVI` (setting DCH/LVBCI/CELV) and only an LVI write restarts
 /// it, so a trailing LVI is the difference between a continuous transfer and
 /// one that stops every ring.
-pub fn start<A: crate::Arch>(machine: &mut A) {
+pub fn start() {
+    use crate::kernel::portio::{inb, outb};
     let mut g = AC97.lock();
     let Some(d) = g.as_mut() else { return };
     d.last_civ = 0;
     d.reported = 0;
     d.played = 0;
-    machine.outb(d.nabm + PO_LVI, (NUM_BUF - 1) as u8);
-    let cr = machine.inb(d.nabm + PO_CR);
-    machine.outb(d.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
-    crate::println!("ac97: stream RUN lvi={} cr={:#x}", NUM_BUF - 1, machine.inb(d.nabm + PO_CR));
+    outb(d.nabm + PO_LVI, (NUM_BUF - 1) as u8);
+    let cr = inb(d.nabm + PO_CR);
+    outb(d.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
+    crate::println!("ac97: stream RUN lvi={} cr={:#x}", NUM_BUF - 1, inb(d.nabm + PO_CR));
 }
 
 /// Stop the bus master.
-pub fn halt<A: crate::Arch>(machine: &mut A) {
+pub fn halt() {
+    use crate::kernel::portio::{inb, outb};
     let mut g = AC97.lock();
     let Some(d) = g.as_mut() else { return };
-    let cr = machine.inb(d.nabm + PO_CR);
-    machine.outb(d.nabm + PO_CR, cr & !PO_CR_RUN);
+    let cr = inb(d.nabm + PO_CR);
+    outb(d.nabm + PO_CR, cr & !PO_CR_RUN);
 }
 
 /// Is this interrupt ours, and how many blocks played since we last said?
-pub fn ack<A: crate::Arch>(machine: &mut A) -> (bool, u64) {
+pub fn irq_pending() -> bool {
+    use crate::kernel::portio::{inw, outw};
     let mut g = AC97.lock();
-    let Some(d) = g.as_mut() else { return (false, 0) };
-    let status = machine.inw(d.nabm + PO_SR);
+    let Some(d) = g.as_mut() else { return false };
+    let status = inw(d.nabm + PO_SR);
     if status & PO_SR_INTR == 0 {
-        return (false, 0);
+        return false;
     }
-    let blocks = advance(d, machine);
-    machine.outw(d.nabm + PO_SR, status & PO_SR_INTR);
-    (true, blocks)
+    outw(d.nabm + PO_SR, status & PO_SR_INTR);
+    true
 }
 
 /// Blocks played since the last report, without requiring an interrupt.
-pub fn poll<A: crate::Arch>(machine: &mut A) -> u64 {
+pub fn blocks_played() -> u64 {
     let mut g = AC97.lock();
     match g.as_mut() {
-        Some(d) => advance(d, machine),
+        Some(d) => advance(d),
         None => 0,
     }
 }
@@ -326,13 +333,14 @@ pub fn poll<A: crate::Arch>(machine: &mut A) -> u64 {
 /// that CIV caught LVI, the engine halted with DCH set, and this write is
 /// exactly what the hardware needs to resume (`CR_RPBM && DCH` → clear DCH,
 /// re-fetch the descriptor). So a late service costs a stall, never a wedge.
-fn advance<A: crate::Arch>(d: &mut Ac97, machine: &mut A) -> u64 {
-    let civ = machine.inb(d.nabm + PO_CIV) % NUM_BUF as u8;
+fn advance(d: &mut Ac97) -> u64 {
+    use crate::kernel::portio::{inb, outb};
+    let civ = inb(d.nabm + PO_CIV) % NUM_BUF as u8;
     let delta = (civ + NUM_BUF as u8 - d.last_civ) % NUM_BUF as u8;
     if delta != 0 {
         d.played += delta as u64;
         d.last_civ = civ;
-        machine.outb(d.nabm + PO_LVI, (civ + NUM_BUF as u8 - 1) % NUM_BUF as u8);
+        outb(d.nabm + PO_LVI, (civ + NUM_BUF as u8 - 1) % NUM_BUF as u8);
     }
     let fresh = d.played.saturating_sub(d.reported);
     d.reported = d.played;

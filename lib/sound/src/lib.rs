@@ -21,7 +21,12 @@
 //! register. See `SOUND_LIB_DESIGN.md` at the repo root for why each of those
 //! lines sits where it does.
 //!
-//! What deliberately stays *outside*: which sink to play into, how to pace
+//! The same discipline covers the OUTPUT side ([`sink`]): a ring of PCM plus
+//! its counters, driven by the host with "here are frames" and "a block
+//! played". A ring buffer and some arithmetic are no more machine-specific
+//! than a card's register file is.
+//!
+//! What deliberately stays *outside*: WHICH sink to play into, how to pace
 //! production, what a DMA channel points at, and how loud one card should be
 //! against another. Those are properties of a machine, not of a card.
 
@@ -29,6 +34,7 @@
 
 extern crate alloc;
 
+pub mod sink;
 pub mod engine;
 pub mod gus;
 pub mod mpu401;

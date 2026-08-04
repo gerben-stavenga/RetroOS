@@ -1094,11 +1094,6 @@ impl PcmSource<'_> {
 }
 
 /// Canonical shape the pump plays: signed 16-bit interleaved stereo.
-const MIX_CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
-    bits: 16,
-    signed: true,
-    channels: 2,
-};
 
 /// Frames per pump chunk (bounded stack buffers; a due burst loops).
 const MIX_CHUNK: usize = 128;
@@ -1258,7 +1253,7 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
     let out_gain =
         ((vsb::OUTPUT_GAIN_Q16 as i64 * crate::kernel::osd::master_gain_q16() as i64) >> 16) as i32;
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
-    let mut bytes = [0u8; MIX_CHUNK * 4];
+    let mut pcm = [(0i16, 0i16); MIX_CHUNK];
     while n > 0 {
         let run = MIX_CHUNK;
         frames[..run].fill((0, 0));
@@ -1272,15 +1267,17 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         for source in &mut sources {
             source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
         }
+        // Gain, clip once, and hand the sink canonical frames. It used to be
+        // encoded to bytes here and decoded straight back inside the sink,
+        // which is a round trip through a wire format neither side wanted.
         for (i, (l, r)) in frames[..run].iter().enumerate() {
             let l = sat16(((i64::from(*l) * i64::from(out_gain)) >> 16)
                 .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
             let r = sat16(((i64::from(*r) * i64::from(out_gain)) >> 16)
                 .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-            bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
-            bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
+            pcm[i] = (l, r);
         }
-        crate::kernel::sound::play(machine, rate, MIX_CANON, &bytes[..run * 4]);
+        crate::kernel::sound::play(machine, rate, &pcm[..run]);
         base += run as u64;
         n -= run as u64;
     }

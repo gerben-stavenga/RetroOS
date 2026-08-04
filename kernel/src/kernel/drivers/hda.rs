@@ -1618,8 +1618,7 @@ pub fn adopt() -> Option<(usize, u32)> {
 
 /// Program the converter. The mixer produces at [`stream_rate`], so this is
 /// normally the rate the codec was already set to at bring-up.
-pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
-    let _ = machine;
+pub fn set_rate(rate: u32) {
     let mut g = HDA.lock();
     let Some(d) = g.as_mut() else { return };
     let hw = Hda::hardware_rate(rate);
@@ -1636,8 +1635,7 @@ pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
 /// controller re-evaluates the codec↔stream binding with the stream number
 /// visible — a byte-0-only RUN write may leave the codec never draining the
 /// FIFO.
-pub fn start<A: crate::Arch>(machine: &mut A, _phys: u32) {
-    let _ = machine;
+pub fn start() {
     let mut g = HDA.lock();
     let Some(d) = g.as_mut() else { return };
     if d.parked && !d.unpark() {
@@ -1657,8 +1655,7 @@ pub fn start<A: crate::Arch>(machine: &mut A, _phys: u32) {
 }
 
 /// Stop the stream and park the link (`park` = a real session end).
-pub fn halt<A: crate::Arch>(machine: &mut A) {
-    let _ = machine;
+pub fn halt() {
     let mut g = HDA.lock();
     if let Some(d) = g.as_mut() {
         d.park();
@@ -1666,25 +1663,28 @@ pub fn halt<A: crate::Arch>(machine: &mut A) {
 }
 
 /// Is this interrupt ours, and how many blocks played since we last said?
-pub fn ack() -> (bool, u64) {
+pub fn irq_pending() -> bool {
     let mut g = HDA.lock();
-    let Some(d) = g.as_mut() else { return (false, 0) };
-    let status = r8(d.sd + SDSTS);
-    if status & 0x04 == 0 {
-        return (false, 0);
+    let Some(d) = g.as_mut() else { return false };
+    if r8(d.sd + SDSTS) & 0x04 == 0 {
+        return false;
     }
-    let blocks = d.advance();
     w8(d.sd + SDSTS, 0x04); // BCIS is write-1-clear
-    (true, blocks)
+    true
 }
 
 /// Blocks played since the last report, without requiring an interrupt.
-pub fn poll() -> u64 {
+pub fn blocks_played() -> u64 {
     let mut g = HDA.lock();
     match g.as_mut() {
         Some(d) => d.advance(),
         None => 0,
     }
+}
+
+/// Kernel VA of the ring, for rebuilding a sink around this device.
+pub fn ring_va() -> usize {
+    HDA.lock().as_ref().map_or(0, |d| d.dma_va + BUF_OFF)
 }
 
 /// The rate this codec's stream runs at — what the mixer should produce.

@@ -66,6 +66,8 @@ use crate::kernel::sound::{BUF_BYTES, RING_BYTES};
 /// coalesced interrupt into the right number of played blocks.
 struct Sb16 {
     base: u16,
+    /// Physical base of the transfer ring, for (re)programming the 8237.
+    phys: u32,
     /// Blocks the engine has already been told about, so a coalesced
     /// interrupt emits the difference rather than one event. Re-baselined at
     /// `start`, so a restart never reports the previous session's blocks.
@@ -79,9 +81,6 @@ struct Sb16 {
 static SB16: Mutex<Option<Sb16>> = Mutex::new(None);
 
 static PRESENT: AtomicBool = AtomicBool::new(false);
-/// Diagnostic: times the play cursor caught the write cursor (underrun → the
-/// DSP replays stale ring data since auto-init has no LVI gate → a click).
-static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// The IRQ line the card raises on block completion (read from the mixer at
 /// bring-up), so `sound::on_irq` can match it. 0xFF until up.
 static IRQ_LINE: AtomicU32 = AtomicU32::new(0xFF);
@@ -363,10 +362,10 @@ pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
         );
         return None;
     }
-    let ring = open_ring(machine, card)?;
+    let (va, phys) = open_ring(machine, card)?;
     PRESENT.store(true, Ordering::Relaxed);
-    *SB16.lock() = Some(Sb16 { base: card.base, reported: 0, last_pos: 0, consumed: 0 });
-    Some(ring)
+    *SB16.lock() = Some(Sb16 { base: card.base, phys, reported: 0, last_pos: 0, consumed: 0 });
+    Some((va, phys))
 }
 
 /// Map the permanent channel-5 buffer and wake the card up. The ring's
@@ -397,38 +396,47 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
     Some((DMA_WIN_VA, dma_phys))
 }
 
-// ── the four things the sink engine asks of a device ────────────────────────
+// ── the four things a `sound::sink::Device` must do ─────────────────────────
+//
+// None of them take a machine handle: port I/O here goes through the injected
+// surface (`kernel::portio`, the same backend functions `Arch::inb/outb` call,
+// installed by the entry crate), exactly as the ATA and PCI-config drivers
+// already reach their hardware. That is what lets the sink contract live in
+// `//lib:sound` without knowing what an `Arch` is.
 
-/// Program the output rate. The SB16 DAC runs at the SOURCE rate — there is no
-/// resampler in this path — so this is the guest's rate, not a mix rate.
-pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
+use crate::kernel::portio::{inb, outb};
+
+/// Program the output rate. The SB16 DAC runs at the rate it is given — there
+/// is no resampler in this path — so this is what the mixer produces at.
+pub fn set_rate(rate: u32) {
     let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
-    dsp_write_at(machine, base, CMD_SET_RATE_OUT);
-    dsp_write_at(machine, base, (rate >> 8) as u8);
-    dsp_write_at(machine, base, rate as u8);
+    dsp_write(base, CMD_SET_RATE_OUT);
+    dsp_write(base, (rate >> 8) as u8);
+    dsp_write(base, rate as u8);
 }
 
 /// Program the 8237 for the whole ring in 16-bit auto-init, then start the
 /// DSP's auto-init output with a per-block length. The DSP free-runs the ring
 /// from here and raises the completion IRQ every block.
 ///
-/// Re-baselines the played-block count, so the engine never sees a block from
+/// Re-baselines the played-block count, so the sink never sees a block from
 /// the previous session — a restart would otherwise look like a whole ring of
 /// sudden free space.
-pub fn start<A: crate::Arch>(machine: &mut A, phys: u32) {
+pub fn start() {
     let mut g = SB16.lock();
     let Some(dev) = g.as_mut() else { return };
+    let phys = dev.phys;
     let word_addr = (phys >> 1) & 0xFFFF;
     let words = (RING_BYTES / 2) as u32;
-    machine.outb(DMA5_MASK, 0x05); // mask channel 5
-    machine.outb(DMA5_CLRFF, 0);
-    machine.outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
-    machine.outb(DMA5_ADDR, word_addr as u8);
-    machine.outb(DMA5_ADDR, (word_addr >> 8) as u8);
-    machine.outb(DMA5_PAGE, (phys >> 16) as u8);
-    machine.outb(DMA5_COUNT, (words - 1) as u8);
-    machine.outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
-    machine.outb(DMA5_MASK, 0x01); // unmask channel 5
+    outb(DMA5_MASK, 0x05); // mask channel 5
+    outb(DMA5_CLRFF, 0);
+    outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
+    outb(DMA5_ADDR, word_addr as u8);
+    outb(DMA5_ADDR, (word_addr >> 8) as u8);
+    outb(DMA5_PAGE, (phys >> 16) as u8);
+    outb(DMA5_COUNT, (words - 1) as u8);
+    outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
+    outb(DMA5_MASK, 0x01); // unmask channel 5
     dev.last_pos = 0;
     dev.consumed = 0;
     dev.reported = 0;
@@ -437,56 +445,47 @@ pub fn start<A: crate::Arch>(machine: &mut A, phys: u32) {
     // contributes left + right, hence BUF_BYTES/2 samples.
     let block_samples = (BUF_BYTES / 2) as u16;
     let base = dev.base;
-    dsp_write_at(machine, base, CMD_16BIT_AUTO_OUT);
-    dsp_write_at(machine, base, MODE_SIGNED_STEREO);
-    dsp_write_at(machine, base, (block_samples - 1) as u8);
-    dsp_write_at(machine, base, ((block_samples - 1) >> 8) as u8);
+    dsp_write(base, CMD_16BIT_AUTO_OUT);
+    dsp_write(base, MODE_SIGNED_STEREO);
+    dsp_write(base, (block_samples - 1) as u8);
+    dsp_write(base, ((block_samples - 1) >> 8) as u8);
+    crate::println!("sb16: stream RUN base={:#05x} ring={} block={}", base, RING_BYTES, BUF_BYTES);
+}
+
+/// Kernel VA of the ring, for rebuilding a sink around this device.
+pub fn ring_va() -> usize {
+    if SB16.lock().is_some() { DMA_WIN_VA } else { 0 }
 }
 
 /// Halt the transfer and mask the channel.
-pub fn halt<A: crate::Arch>(machine: &mut A) {
+pub fn halt() {
     let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
-    dsp_write_at(machine, base, CMD_HALT_AUTO_16);
-    machine.outb(DMA5_MASK, 0x05);
-    let _ = dsp_reset_at(machine, base);
-    dsp_write_at(machine, base, CMD_SPEAKER_ON);
+    dsp_write(base, CMD_HALT_AUTO_16);
+    outb(DMA5_MASK, 0x05);
+    let _ = dsp_reset(base);
+    dsp_write(base, CMD_SPEAKER_ON);
 }
 
-/// Is this interrupt ours, and how many blocks have played since we last said?
-///
-/// The count comes from the live 8237 cursor, never from counting interrupts:
-/// a completion landing on an already-set pending bit is indistinguishable
-/// from one, so two blocks can arrive as a single interrupt. Reading the
-/// cursor turns that back into the right NUMBER of blocks, which is exactly
-/// the contract the engine relies on — `on_block_played` once per block.
-pub fn ack<A: crate::Arch>(machine: &mut A) -> (bool, u64) {
-    let mut g = SB16.lock();
-    let Some(dev) = g.as_mut() else { return (false, 0) };
-    let base = dev.base;
-    machine.outb(base + MIX_IDX, MIX_IRQ_STATUS);
-    if machine.inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
-        return (false, 0);
+/// Is a 16-bit completion of ours pending? The mixer's IRQ status register
+/// distinguishes our DMA source on a possibly shared ISA line.
+pub fn irq_pending() -> bool {
+    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return false };
+    outb(base + MIX_IDX, MIX_IRQ_STATUS);
+    if inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
+        return false;
     }
-    let blocks = advance(dev, machine);
-    let _ = machine.inb(base + DSP_ACK16); // acknowledge the 16-bit completion
-    (true, blocks)
+    let _ = inb(base + DSP_ACK16); // acknowledge the 16-bit completion
+    true
 }
 
-/// Blocks played since the last report, without requiring an interrupt — the
-/// engine's between-interrupt read, and the same accounting.
-pub fn poll<A: crate::Arch>(machine: &mut A) -> u64 {
+/// Blocks played since the last call, from the live 8237 cursor — never from
+/// counting interrupts, which is lossy: a completion landing on an already-set
+/// pending bit is indistinguishable from one.
+pub fn blocks_played() -> u64 {
     let mut g = SB16.lock();
-    match g.as_mut() {
-        Some(dev) => advance(dev, machine),
-        None => 0,
-    }
-}
-
-/// Bytes the DAC has consumed since `start`, and how many whole blocks of that
-/// the engine has not been told about yet.
-fn advance<A: crate::Arch>(dev: &mut Sb16, machine: &mut A) -> u64 {
+    let Some(dev) = g.as_mut() else { return 0 };
     let ring = RING_BYTES as u32;
-    let pos = dma_pos_bytes(machine);
+    let pos = dma_pos_bytes();
     let delta = (pos + ring - dev.last_pos) % ring;
     if delta != 0 {
         dev.consumed += delta as u64;
@@ -498,10 +497,33 @@ fn advance<A: crate::Arch>(dev: &mut Sb16, machine: &mut A) -> u64 {
     fresh
 }
 
-fn dma_count<A: crate::Arch>(machine: &mut A) -> u16 {
-    machine.outb(DMA5_CLRFF, 0);
-    let lo = machine.inb(DMA5_COUNT) as u16;
-    let hi = machine.inb(DMA5_COUNT) as u16;
+fn dsp_write(base: u16, byte: u8) {
+    for _ in 0..100_000 {
+        if inb(base + 0x0C) & 0x80 == 0 {
+            break;
+        }
+    }
+    outb(base + 0x0C, byte);
+}
+
+fn dsp_reset(base: u16) -> bool {
+    outb(base + 0x06, 1);
+    for _ in 0..1000 {
+        core::hint::spin_loop();
+    }
+    outb(base + 0x06, 0);
+    for _ in 0..100_000 {
+        if inb(base + 0x0E) & 0x80 != 0 && inb(base + 0x0A) == 0xAA {
+            return true;
+        }
+    }
+    false
+}
+
+fn dma_count() -> u16 {
+    outb(DMA5_CLRFF, 0);
+    let lo = inb(DMA5_COUNT) as u16;
+    let hi = inb(DMA5_COUNT) as u16;
     (hi << 8) | lo
 }
 
@@ -513,11 +535,11 @@ fn dma_count<A: crate::Arch>(machine: &mut A) -> u16 {
 /// nearly a whole ring. Two nearby samples must differ by a handful of
 /// transfers; retry until they do. (The guest never sees this: `vsb` serves it
 /// a properly latched pair, which is the 8237 Intel should have built.)
-fn dma_pos_bytes<A: crate::Arch>(machine: &mut A) -> u32 {
+fn dma_pos_bytes() -> u32 {
     let words = (RING_BYTES / 2) as u32;
-    let mut count = dma_count(machine);
+    let mut count = dma_count();
     for _ in 0..3 {
-        let next = dma_count(machine);
+        let next = dma_count();
         let forward = (count as u32 + words - next as u32) % words;
         count = next;
         if forward <= 32 {
@@ -527,13 +549,4 @@ fn dma_pos_bytes<A: crate::Arch>(machine: &mut A) -> u32 {
     ((words - 1).wrapping_sub(count as u32) % words) * 2
 }
 
-/// Diagnostic counter for the engine's underrun reporting.
-pub fn underruns() -> u32 {
-    UNDERRUNS.load(Ordering::Relaxed)
-}
 
-/// Count an underrun the engine detected (the play cursor caught the write
-/// cursor: with auto-init and no LVI gate, the next blocks replay stale ring).
-pub fn note_underrun() -> u32 {
-    UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1
-}
