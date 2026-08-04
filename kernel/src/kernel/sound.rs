@@ -97,7 +97,116 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
 /// business, and nothing above it should be able to ask.
 pub struct Sink {
     device: Device,
+    /// The output ring — **the** implementation, shared by every device that
+    /// has moved onto it. `None` for a device still driving its own (see
+    /// `Device`) or one with nothing to play through.
+    ring: Option<Ring>,
 }
+
+/// One ring of PCM, and the whole of the sink's bookkeeping.
+///
+/// This used to exist three times over — once in each of `hda`, `ac97` and
+/// `sb16`, with the same counters, the same prime-then-start rule and the same
+/// underrun test, and the same comment explaining that the interrupt is a
+/// wakeup. None of that is device knowledge. What a device supplies is four
+/// things: arm, halt, "is this interrupt mine", and how many blocks played.
+///
+/// The engine has NO clock and NO cursor. It learns of playback exactly one
+/// way — [`on_block_played`](Self::on_block_played), called once per block, in
+/// order, never lost, never duplicated. A device honours that contract by
+/// reading its own cursor and emitting the difference, which is how a
+/// coalesced interrupt (two blocks, one pending bit) still yields two calls.
+/// Everything the engine needs follows: free space is `written − played·block`.
+struct Ring {
+    /// Kernel VA of the ring, and the physical address the device transfers
+    /// from. The device maps it; the engine fills it.
+    va: usize,
+    phys: u32,
+    /// Where the producer is writing.
+    cur_buf: usize,
+    cur_off: usize,
+    /// Source frames accepted, and blocks the hardware has played.
+    written: u64,
+    played: u64,
+    /// Rate the device is programmed for.
+    rate: u32,
+    /// `written` as of the previous played block, to tell an IDLE sink from a
+    /// STARVED one. With the transfer always running, a sink with no producer
+    /// plays silence forever and would otherwise report an underrun per block:
+    /// true, useless, and drowning the real ones. An underrun is running dry
+    /// while someone IS feeding us.
+    fed_at_last_block: u64,
+}
+
+impl Ring {
+    fn new(va: usize, phys: u32, rate: u32) -> Self {
+        Ring { va, phys, cur_buf: 0, cur_off: 0, written: 0, played: 0, rate, fed_at_last_block: 0 }
+    }
+
+    /// One block reached the DAC. The only way playback is ever observed.
+    ///
+    /// Zeroes the block that just played. Auto-init DMA has no LVI gate — the
+    /// device will come round and play these bytes again — so scrubbing behind
+    /// the play cursor is what makes "the producer stopped feeding us" sound
+    /// like silence instead of the last lap on repeat. It is also why the
+    /// transfer can simply run for the sink's whole life: an unfed ring is a
+    /// silent one, so there is no stopped state to arm out of.
+    fn on_block_played(&mut self) {
+        let played_buf = (self.played as usize) % NUM_BUF;
+        unsafe {
+            core::ptr::write_bytes((self.va + played_buf * BUF_BYTES) as *mut u8, 0, BUF_BYTES)
+        };
+        self.played += 1;
+        let producing = self.written > self.fed_at_last_block;
+        self.fed_at_last_block = self.written;
+        // Underrun: the play cursor caught the write cursor while a producer
+        // was feeding us. Audible as a gap now rather than as a repeat, but
+        // still the thing to fix.
+        if producing && self.written <= self.played * BUF_FRAMES as u64 {
+            let n = crate::kernel::drivers::sb16::note_underrun();
+            if n <= 3 || n.is_multiple_of(64) {
+                crate::println!(
+                    "sink: underrun #{} written={} played_frames={}",
+                    n, self.written, self.played * BUF_FRAMES as u64
+                );
+            }
+        }
+    }
+
+    /// Decode `bytes` into the ring as canonical i16 stereo.
+    fn fill(&mut self, fmt: Format, bytes: &[u8]) {
+        let fb = fmt.frame_bytes();
+        if fb == 0 {
+            return;
+        }
+        for i in 0..bytes.len() / fb {
+            let (l, r) = fmt.frame(bytes, i);
+            let p = self.va + self.cur_buf * BUF_BYTES + self.cur_off;
+            unsafe {
+                core::ptr::write_volatile(p as *mut u16, l as u16);
+                core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
+            }
+            self.written += 1;
+            self.cur_off += 4;
+            if self.cur_off >= BUF_BYTES {
+                self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
+                self.cur_off = 0;
+            }
+        }
+    }
+}
+
+// ── ring geometry, one definition for every device ──────────────────────────
+/// Completion granularity: one interrupt per block. 512 signed-16 stereo
+/// frames, ~11.6 ms at 44.1 kHz — a 30 ms pipe keeps about 2.6 blocks queued
+/// while the block size halves interrupt pressure against a 256-frame one.
+pub(crate) const BUF_BYTES: usize = 0x800;
+const BUF_FRAMES: usize = BUF_BYTES / 4;
+const NUM_BUF: usize = 32;
+pub(crate) const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
+/// The one rate the mixer produces at, and therefore the rate a sink is armed
+/// with. A source at another rate restarts the transfer.
+const MIX_RATE: u32 = 44_100;
 
 /// The devices that can serve the sink. A closed set — these are the cards
 /// RetroOS drives, and adding one should break every match here on purpose.
@@ -126,10 +235,7 @@ impl Sink {
     ) -> Self {
         use crate::kernel::platform::Audio;
         let device = match (crate::kernel::platform::get().audio, card) {
-            (Audio::SbSink, Some(card)) => {
-                crate::kernel::drivers::sb16::adopt(machine, &card);
-                Device::Sb(card)
-            }
+            (Audio::SbSink, Some(card)) => Device::Sb(card),
             (Audio::EmulatedHda, _) => Device::Hda,
             (Audio::EmulatedAc97, _) => Device::Ac97,
             (Audio::EmulatedPortWindow, _) => Device::PortWindow,
@@ -137,7 +243,19 @@ impl Sink {
             // play through. Same for a mixer mode with no card to take.
             _ => Device::Silent,
         };
-        Sink { device }
+        // A constructed sink is a RUNNING sink: the ring is armed here and the
+        // device free-runs it for the sink's whole life. Nothing arms later,
+        // so there is no "not yet started" state for a cursor read to fall
+        // into, and no prime-vs-arm race to lose.
+        let ring = match &device {
+            Device::Sb(card) => crate::kernel::drivers::sb16::adopt(machine, card).map(|(va, phys)| {
+                crate::kernel::drivers::sb16::set_rate(machine, MIX_RATE);
+                crate::kernel::drivers::sb16::start(machine, phys);
+                Ring::new(va, phys, MIX_RATE)
+            }),
+            _ => None,
+        };
+        Sink { device, ring }
     }
 
     /// Hand the Sound Blaster back, if this sink is the one holding it. The
@@ -145,8 +263,8 @@ impl Sink {
     /// than a special state — `Err` is every other device, unchanged.
     pub fn try_into_sb(self) -> Result<(crate::kernel::drivers::sb16::SbCard, Self), Self> {
         match self.device {
-            Device::Sb(card) => Ok((card, Sink { device: Device::Silent })),
-            device => Err(Sink { device }),
+            Device::Sb(card) => Ok((card, Sink { device: Device::Silent, ring: None })),
+            device => Err(Sink { device, ring: self.ring }),
         }
     }
 
@@ -156,10 +274,24 @@ impl Sink {
         match self.device {
             Device::Hda => crate::kernel::drivers::hda::play(machine, rate, fmt, bytes),
             Device::Ac97 => crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes),
-            Device::Sb(_) => crate::kernel::drivers::sb16::play(machine, rate, fmt, bytes),
+            Device::Sb(_) => self.submit(machine, rate, fmt, bytes),
             Device::PortWindow => port_window_play(machine, rate, fmt, bytes),
             Device::Silent => {}
         }
+    }
+
+    /// Engine path: fill the ring, arm the device once primed.
+    fn submit<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+        let Some(ring) = self.ring.as_mut() else { return };
+        // A rate change restarts the transfer: the DAC's rate is latched by
+        // the start command, and the counters are relative to it. Rare — the
+        // mixer submits at one rate for a whole session.
+        if rate != 0 && rate != ring.rate {
+            crate::kernel::drivers::sb16::set_rate(machine, rate);
+            crate::kernel::drivers::sb16::start(machine, ring.phys);
+            *ring = Ring::new(ring.va, ring.phys, rate);
+        }
+        ring.fill(fmt, bytes);
     }
 
     /// The producer went idle. `park` marks a real session end (DSP reset /
@@ -167,7 +299,18 @@ impl Sink {
     pub fn stop<A: crate::Arch>(&mut self, machine: &mut A, park: bool) {
         match self.device {
             Device::Hda => crate::kernel::drivers::hda::stop(machine, park),
-            Device::Sb(_) => crate::kernel::drivers::sb16::stop(machine, park),
+            Device::Sb(_) => {
+                // The transfer keeps running — an idle sink plays the silence
+                // it is scrubbed to, which is what "stopped" sounds like and
+                // costs one DMA channel doing nothing audible. Only `park` (a
+                // real session end) stops the hardware.
+                if let Some(ring) = self.ring.as_mut() {
+                    unsafe { core::ptr::write_bytes(ring.va as *mut u8, 0, RING_BYTES) };
+                    if park {
+                        crate::kernel::drivers::sb16::halt(machine);
+                    }
+                }
+            }
             Device::Ac97 | Device::PortWindow | Device::Silent => {}
         }
     }
@@ -179,7 +322,24 @@ impl Sink {
         match self.device {
             Device::Hda => crate::kernel::drivers::hda::position(),
             Device::Ac97 => crate::kernel::drivers::ac97::position(machine),
-            Device::Sb(_) => crate::kernel::drivers::sb16::position(machine),
+            Device::Sb(_) => {
+                // Interrupts can be late as well as coalesced, so take the
+                // device's word for blocks played here too rather than only on
+                // the interrupt: same contract, same accounting, asked at the
+                // moment a producer wants to know.
+                //
+                // Only once armed. An unarmed channel's count register holds
+                // whatever was last there, so polling it before `start` reads
+                // a cursor for a transfer that does not exist and invents
+                // played blocks against an empty ring — which then reports an
+                // underrun per block, forever, with written=0.
+                let fresh = crate::kernel::drivers::sb16::poll(machine);
+                let ring = self.ring.as_mut()?;
+                for _ in 0..fresh {
+                    ring.on_block_played();
+                }
+                Some((ring.written, ring.played * BUF_FRAMES as u64))
+            }
             Device::PortWindow | Device::Silent => None,
         }
     }
@@ -222,8 +382,13 @@ impl Sink {
                 ac97::on_irq(machine)
             }
             (Device::Sb(_), crate::Irq::Hw(line)) if Some(line) == sb16::irq_line() => {
-                let ours = sb16::on_irq(machine);
+                let (ours, blocks) = sb16::ack(machine);
                 if ours {
+                    if let Some(ring) = self.ring.as_mut() {
+                        for _ in 0..blocks {
+                            ring.on_block_played();
+                        }
+                    }
                     machine.rearm_irq(line);
                 }
                 ours
@@ -270,7 +435,7 @@ const PIPE_MS: u32 = 30;
 /// rather than being threaded — but it is a VALUE with methods, not a global
 /// anyone matches on, and when it holds the Sound Blaster it holds it the same
 /// way a thread does: by owning it.
-static SINK: spin::Mutex<Sink> = spin::Mutex::new(Sink { device: Device::Silent });
+static SINK: spin::Mutex<Sink> = spin::Mutex::new(Sink { device: Device::Silent, ring: None });
 
 /// Install the sink the boot policy chose. Called once, from `startup`.
 pub fn install(sink: Sink) {
@@ -280,7 +445,7 @@ pub fn install(sink: Sink) {
 /// Take the Sound Blaster off the sink, if the sink is what holds it.
 pub fn take_sb_card() -> Option<crate::kernel::drivers::sb16::SbCard> {
     let mut g = SINK.lock();
-    let sink = core::mem::replace(&mut *g, Sink { device: Device::Silent });
+    let sink = core::mem::replace(&mut *g, Sink { device: Device::Silent, ring: None });
     match sink.try_into_sb() {
         Ok((card, rest)) => {
             *g = rest;

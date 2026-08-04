@@ -21,7 +21,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
-use crate::kernel::sound::Format;
 
 // ── SB16 DSP / mixer port OFFSETS from the card's base ──────────────────────
 //    The base is the card's own (`SbCard::base`), never a guess: a card
@@ -55,47 +54,26 @@ const DMA5_MODE_AUTO_READ: u8 = 0x59;
 // ── ring geometry (shares the stolen low-mem DMA window with ac97/hda) ───────
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
-/// Completion-IRQ granularity: one interrupt per buffer. The geometry matches
-/// AC97/HDA: 512 signed-16 stereo frames, ≈ 11.6 ms at 44.1 kHz. A 30-ms pipe
-/// keeps about 2.6 buffers queued while the larger block halves completion-IRQ
-/// pressure relative to the old 256-frame path.
-const BUF_BYTES: usize = 0x800;
-const BUF_FRAMES: usize = BUF_BYTES / 4;
-const NUM_BUF: usize = 32;
-const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
-/// Prime at least two completion blocks before starting the DSP. The shared
-/// 30-ms pipe normally submits two-and-a-half blocks on its first pass;
-/// `submit` starts only after that whole pass is in memory, rather than halfway
-/// through it.
-const PRIME_BUFS: usize = 2;
+// ── ring geometry ───────────────────────────────────────────────────────────
+// Defined by the sink engine (`sound::Ring`), which owns the ring; the device
+// needs only the two numbers it programs the hardware with.
+use crate::kernel::sound::{BUF_BYTES, RING_BYTES};
 
-/// This driver's live output: the ports it drives and the stream it runs.
-///
-/// It does NOT hold the card. The capability lives in `sound::Sink`, which is
-/// what makes the sink the card's owner; this is the driver state that exists
-/// only while it does. `None` means no stream — no card, or one that cannot
-/// carry 16-bit auto-init DMA, which is this sink's silence.
+/// What only THIS card knows. The ring, the counters and the prime/underrun
+/// bookkeeping are the sink engine's (`sound::Ring`) — shared with every other
+/// device, because none of it is Sound-Blaster-specific. What is left here is
+/// the 8237 channel-5 programming, the DSP session, and turning a possibly
+/// coalesced interrupt into the right number of played blocks.
 struct Sb16 {
     base: u16,
-    stream: Stream,
-}
-
-/// A running 16-bit auto-init output: the ring, the DSP session, and the pipe
-/// counters that `sound::position` reads.
-struct Stream {
-    dma_va: usize,
-    dma_phys: u32,
-    cur_buf: usize, // ring buffer currently being filled
-    cur_off: usize, // byte offset within `cur_buf`
-    running: bool,  // DSP auto-init playback started
-    rate: u32,      // last programmed sample rate
-    /// Pipe counters for [`position`], in source frames (the DAC runs at the
-    /// source rate — no resampler). `written` = frames accepted by `submit`;
-    /// `consumed_frames` comes from the live 8237 cursor whenever an IRQ wakes
-    /// the driver; IRQ event counts themselves are not trusted.
-    written: u64,
-    consumed_frames: u64,
-    last_dma_pos: u32,
+    /// Blocks the engine has already been told about, so a coalesced
+    /// interrupt emits the difference rather than one event. Re-baselined at
+    /// `start`, so a restart never reports the previous session's blocks.
+    reported: u64,
+    /// Last raw ring byte position, for accumulating across wraps.
+    last_pos: u32,
+    /// Bytes the DAC has consumed since `start`, monotonic.
+    consumed: u64,
 }
 
 static SB16: Mutex<Option<Sb16>> = Mutex::new(None);
@@ -375,23 +353,25 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
 /// Pro has nothing to run it on. Silence is the honest output — not a
 /// downgrade to some 8-bit path nobody wrote, and not a mode switch behind the
 /// owner's back.
-pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) {
+/// Returns the ring the engine will fill (kernel VA + physical base), or
+/// `None` if this card cannot be a sink — which is this sink's silence.
+pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u32)> {
     if card.dma16 != Some(DMA_CHANNEL as u8) {
         crate::println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
             DMA_CHANNEL, card.dma16
         );
-        return;
+        return None;
     }
-    let stream = open_stream(machine, card);
-    PRESENT.store(stream.is_some(), Ordering::Relaxed);
-    *SB16.lock() = stream.map(|stream| Sb16 { base: card.base, stream });
+    let ring = open_ring(machine, card)?;
+    PRESENT.store(true, Ordering::Relaxed);
+    *SB16.lock() = Some(Sb16 { base: card.base, reported: 0, last_pos: 0, consumed: 0 });
+    Some(ring)
 }
 
-/// Program the card for 16-bit signed-stereo auto-init output on channel 5 and
-/// map its ring. `None` if the machine has no channel-5 DMA buffer to give us,
-/// which is silence for the same reason as above.
-fn open_stream<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<Stream> {
+/// Map the permanent channel-5 buffer and wake the card up. The ring's
+/// CONTENT is the engine's business; this hands over where it lives.
+fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u32)> {
     machine.route_isa_irq(card.irq);
 
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
@@ -414,100 +394,108 @@ fn open_stream<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<Stream>
 
     IRQ_LINE.store(card.irq as u32, Ordering::Relaxed);
     crate::println!("sb16: sink on {:#05x}, IRQ {}, DMA {}", card.base, card.irq, DMA_CHANNEL);
-    Some(Stream {
-        dma_va: DMA_WIN_VA,
-        dma_phys,
-        cur_buf: 0,
-        cur_off: 0,
-        running: false,
-        rate: 0,
-        written: 0,
-        consumed_frames: 0,
-        last_dma_pos: 0,
-    })
+    Some((DMA_WIN_VA, dma_phys))
 }
 
-impl Stream {
-    fn buf_va(&self, i: usize) -> usize {
-        self.dma_va + i * BUF_BYTES
-    }
+// ── the four things the sink engine asks of a device ────────────────────────
 
-    fn set_rate<A: crate::Arch>(&mut self, machine: &mut A, base: u16, rate: u32) {
-        if rate != self.rate && rate != 0 {
-            dsp_write_at(machine, base, CMD_SET_RATE_OUT);
-            dsp_write_at(machine, base, (rate >> 8) as u8);
-            dsp_write_at(machine, base, rate as u8);
-            self.rate = rate;
-        }
-    }
-
-    /// Program the 8237 for the whole ring in 16-bit auto-init, then start the
-    /// DSP's 16-bit auto-init output with a per-buffer block length. Done once,
-    /// after the first buffers are primed; the DSP then free-runs the ring and
-    /// raises the completion IRQ every buffer.
-    fn start<A: crate::Arch>(&mut self, machine: &mut A, base: u16) {
-        let word_addr = (self.dma_phys >> 1) & 0xFFFF;
-        let words = (RING_BYTES / 2) as u32;
-        machine.outb(DMA5_MASK, 0x05); // mask channel 5
-        machine.outb(DMA5_CLRFF, 0);
-        machine.outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
-        machine.outb(DMA5_ADDR, word_addr as u8);
-        machine.outb(DMA5_ADDR, (word_addr >> 8) as u8);
-        machine.outb(DMA5_PAGE, (self.dma_phys >> 16) as u8);
-        machine.outb(DMA5_COUNT, (words - 1) as u8);
-        machine.outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
-        machine.outb(DMA5_MASK, 0x01); // unmask channel 5
-        self.last_dma_pos = 0;
-
-        // DSP block length is in 16-bit transfers, not stereo frames: every
-        // frame contributes left + right, hence BUF_BYTES/2 samples.
-        let block_samples = (BUF_BYTES / 2) as u16;
-        dsp_write_at(machine, base, CMD_16BIT_AUTO_OUT);
-        dsp_write_at(machine, base, MODE_SIGNED_STEREO);
-        dsp_write_at(machine, base, (block_samples - 1) as u8);
-        dsp_write_at(machine, base, ((block_samples - 1) >> 8) as u8);
-        self.running = true;
-    }
-
-    /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
-    fn submit<A: crate::Arch>(&mut self, machine: &mut A, base: u16, rate: u32, fmt: Format, bytes: &[u8]) {
-        self.set_rate(machine, base, rate);
-        let fb = fmt.frame_bytes();
-        if fb == 0 {
-            return;
-        }
-        for i in 0..bytes.len() / fb {
-            let (l, r) = fmt.frame(bytes, i);
-            let p = self.buf_va(self.cur_buf) + self.cur_off;
-            unsafe {
-                core::ptr::write_volatile(p as *mut u16, l as u16);
-                core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
-            }
-            self.written += 1;
-            self.cur_off += 4;
-            if self.cur_off >= BUF_BYTES {
-                self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
-                self.cur_off = 0;
-            }
-        }
-        // Do not start from inside the copy loop. Hardware may schedule DMA as
-        // soon as B6 is issued; starting after buffer two while the same call
-        // is still filling the remainder of the initial producer burst lets
-        // playback race that copy.
-        if !self.running && self.written >= (PRIME_BUFS * BUF_FRAMES) as u64 {
-            self.start(machine, base);
-        }
-    }
+/// Program the output rate. The SB16 DAC runs at the SOURCE rate — there is no
+/// resampler in this path — so this is the guest's rate, not a mix rate.
+pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
+    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
+    dsp_write_at(machine, base, CMD_SET_RATE_OUT);
+    dsp_write_at(machine, base, (rate >> 8) as u8);
+    dsp_write_at(machine, base, rate as u8);
 }
 
-/// Stream a block of source PCM to the SB16 (called by `sound::play`).
-pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+/// Program the 8237 for the whole ring in 16-bit auto-init, then start the
+/// DSP's auto-init output with a per-block length. The DSP free-runs the ring
+/// from here and raises the completion IRQ every block.
+///
+/// Re-baselines the played-block count, so the engine never sees a block from
+/// the previous session — a restart would otherwise look like a whole ring of
+/// sudden free space.
+pub fn start<A: crate::Arch>(machine: &mut A, phys: u32) {
     let mut g = SB16.lock();
-    // No stream, or the card is on loan: the frames are dropped. That IS the
-    // output of a sink that owns no silicon to play them through.
-    if let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) {
-        stream.submit(machine, base, rate, fmt, bytes);
+    let Some(dev) = g.as_mut() else { return };
+    let word_addr = (phys >> 1) & 0xFFFF;
+    let words = (RING_BYTES / 2) as u32;
+    machine.outb(DMA5_MASK, 0x05); // mask channel 5
+    machine.outb(DMA5_CLRFF, 0);
+    machine.outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
+    machine.outb(DMA5_ADDR, word_addr as u8);
+    machine.outb(DMA5_ADDR, (word_addr >> 8) as u8);
+    machine.outb(DMA5_PAGE, (phys >> 16) as u8);
+    machine.outb(DMA5_COUNT, (words - 1) as u8);
+    machine.outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
+    machine.outb(DMA5_MASK, 0x01); // unmask channel 5
+    dev.last_pos = 0;
+    dev.consumed = 0;
+    dev.reported = 0;
+
+    // DSP block length is in 16-bit transfers, not stereo frames: every frame
+    // contributes left + right, hence BUF_BYTES/2 samples.
+    let block_samples = (BUF_BYTES / 2) as u16;
+    let base = dev.base;
+    dsp_write_at(machine, base, CMD_16BIT_AUTO_OUT);
+    dsp_write_at(machine, base, MODE_SIGNED_STEREO);
+    dsp_write_at(machine, base, (block_samples - 1) as u8);
+    dsp_write_at(machine, base, ((block_samples - 1) >> 8) as u8);
+}
+
+/// Halt the transfer and mask the channel.
+pub fn halt<A: crate::Arch>(machine: &mut A) {
+    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
+    dsp_write_at(machine, base, CMD_HALT_AUTO_16);
+    machine.outb(DMA5_MASK, 0x05);
+    let _ = dsp_reset_at(machine, base);
+    dsp_write_at(machine, base, CMD_SPEAKER_ON);
+}
+
+/// Is this interrupt ours, and how many blocks have played since we last said?
+///
+/// The count comes from the live 8237 cursor, never from counting interrupts:
+/// a completion landing on an already-set pending bit is indistinguishable
+/// from one, so two blocks can arrive as a single interrupt. Reading the
+/// cursor turns that back into the right NUMBER of blocks, which is exactly
+/// the contract the engine relies on — `on_block_played` once per block.
+pub fn ack<A: crate::Arch>(machine: &mut A) -> (bool, u64) {
+    let mut g = SB16.lock();
+    let Some(dev) = g.as_mut() else { return (false, 0) };
+    let base = dev.base;
+    machine.outb(base + MIX_IDX, MIX_IRQ_STATUS);
+    if machine.inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
+        return (false, 0);
     }
+    let blocks = advance(dev, machine);
+    let _ = machine.inb(base + DSP_ACK16); // acknowledge the 16-bit completion
+    (true, blocks)
+}
+
+/// Blocks played since the last report, without requiring an interrupt — the
+/// engine's between-interrupt read, and the same accounting.
+pub fn poll<A: crate::Arch>(machine: &mut A) -> u64 {
+    let mut g = SB16.lock();
+    match g.as_mut() {
+        Some(dev) => advance(dev, machine),
+        None => 0,
+    }
+}
+
+/// Bytes the DAC has consumed since `start`, and how many whole blocks of that
+/// the engine has not been told about yet.
+fn advance<A: crate::Arch>(dev: &mut Sb16, machine: &mut A) -> u64 {
+    let ring = RING_BYTES as u32;
+    let pos = dma_pos_bytes(machine);
+    let delta = (pos + ring - dev.last_pos) % ring;
+    if delta != 0 {
+        dev.consumed += delta as u64;
+        dev.last_pos = pos;
+    }
+    let played = dev.consumed / BUF_BYTES as u64;
+    let fresh = played.saturating_sub(dev.reported);
+    dev.reported = played;
+    fresh
 }
 
 fn dma_count<A: crate::Arch>(machine: &mut A) -> u16 {
@@ -517,12 +505,16 @@ fn dma_count<A: crate::Arch>(machine: &mut A) -> u16 {
     (hi << 8) | lo
 }
 
+/// Where the DAC is in the ring, in bytes.
+///
+/// The 8237 exposes its 16-bit count through one 8-bit port plus a byte-pointer
+/// flip-flop, and does not latch it for reading — so around a borrow the two
+/// halves can come from different moments and the pair reads as a jump of
+/// nearly a whole ring. Two nearby samples must differ by a handful of
+/// transfers; retry until they do. (The guest never sees this: `vsb` serves it
+/// a properly latched pair, which is the 8237 Intel should have built.)
 fn dma_pos_bytes<A: crate::Arch>(machine: &mut A) -> u32 {
     let words = (RING_BYTES / 2) as u32;
-    // The 8237 exposes the count as two independently read bytes while DMA is
-    // live. Around a low-byte borrow, one pair can be torn and appear to jump
-    // almost a whole ring. Two nearby complete samples must differ by only a
-    // handful of transfers; retry a few times and use the newest stable one.
     let mut count = dma_count(machine);
     for _ in 0..3 {
         let next = dma_count(machine);
@@ -535,84 +527,13 @@ fn dma_pos_bytes<A: crate::Arch>(machine: &mut A) -> u32 {
     ((words - 1).wrapping_sub(count as u32) % words) * 2
 }
 
-fn update_cursor<A: crate::Arch>(dev: &mut Stream, machine: &mut A) -> (u32, u32) {
-    let ring = RING_BYTES as u32;
-    let pos = dma_pos_bytes(machine);
-    let delta = (pos + ring - dev.last_dma_pos) % ring;
-    if delta != 0 {
-        dev.consumed_frames += (delta / 4) as u64;
-        dev.last_dma_pos = pos;
-    }
-    (pos, delta)
+/// Diagnostic counter for the engine's underrun reporting.
+pub fn underruns() -> u32 {
+    UNDERRUNS.load(Ordering::Relaxed)
 }
 
-/// Service a block-completion interrupt. The mixer status distinguishes our
-/// 16-bit DMA source on a potentially shared ISA line; the live 8237 cursor
-/// supplies authoritative progress when the IRQ wakes the driver.
-pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
-    let mut g = SB16.lock();
-    // Nothing playing means this line is not ours to claim — with the card on
-    // loan, asking the mixer would be reading silicon we do not own.
-    let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) else { return false };
-    machine.outb(base + MIX_IDX, MIX_IRQ_STATUS);
-    if machine.inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
-        return false;
-    }
-    if stream.running {
-        // The IRQ is a wakeup, not an additional unit of elapsed time.
-        // `position()` may already have observed this exact DMA cursor;
-        // inventing a block when delta==0 moves last_dma_pos ahead of the
-        // hardware and makes the next read look like a near-full-ring wrap.
-        let (pos, delta) = update_cursor(stream, machine);
-        // Diagnostic: has the play cursor reached the write cursor? (queued
-        // buffers <= 0 -> the next buffers the DSP plays are stale.)
-        if stream.written <= stream.consumed_frames {
-            let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-            if n <= 3 || n.is_multiple_of(64) {
-                crate::println!(
-                    "sb16: underrun #{} written={} consumed={} dma_pos={} delta={}",
-                    n, stream.written, stream.consumed_frames, pos, delta
-                );
-            }
-        }
-    }
-    let _ = machine.inb(base + DSP_ACK16); // acknowledge the 16-bit completion IRQ
-    true
-}
-
-/// Pipe counters for `sound::position`, in source frames: `written` accepted,
-/// and `consumed` from the monotonicized live 8237 DMA cursor.
-pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
-    let mut g = SB16.lock();
-    let (stream, _) = g.as_mut().map(|d| (&mut d.stream, d.base))?;
-    if stream.running {
-        // ISA DSP interrupt latches can coalesce while auto-init DMA continues.
-        // The IRQ remains the wakeup/ack path, but this cheap 8237 read prevents
-        // a delayed latch service from hiding several already-consumed blocks.
-        update_cursor(stream, machine);
-    }
-    Some((stream.written, stream.consumed_frames))
-}
-
-/// Producer went idle: halt DMA, reset the DSP state machine, and start the
-/// next session from a clean, silent ring. Reset is deliberate here: a bare
-/// D5 pause leaves a subsequent B6 auto-init command dependent on clone-specific
-/// pause/continue state.
-pub fn stop<A: crate::Arch>(machine: &mut A, _park: bool) {
-    let mut g = SB16.lock();
-    let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) else { return };
-    if stream.running {
-        dsp_write_at(machine, base, CMD_HALT_AUTO_16);
-        machine.outb(DMA5_MASK, 0x05); // mask channel 5
-    }
-    let _ = dsp_reset_at(machine, base);
-    dsp_write_at(machine, base, CMD_SPEAKER_ON);
-    stream.running = false;
-    stream.rate = 0;
-    stream.cur_buf = 0;
-    stream.cur_off = 0;
-    stream.written = 0;
-    stream.consumed_frames = 0;
-    stream.last_dma_pos = 0;
-    unsafe { core::ptr::write_bytes(stream.dma_va as *mut u8, 0, RING_BYTES) };
+/// Count an underrun the engine detected (the play cursor caught the write
+/// cursor: with auto-init and no LVI gate, the next blocks replay stale ring).
+pub fn note_underrun() -> u32 {
+    UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1
 }
