@@ -1431,16 +1431,6 @@ impl Hda {
         let ring = (NUM_BUF * BUF_BYTES) as u32;
         let pos = self.hw_cursor() % ring;
         let delta = ((pos + ring - self.last_hw_pos) % ring) as u64;
-        // A completion is serviced on the millisecond event-loop cadence. A
-        // jump beyond half this 371-ms ring is not coalescing; it is a stale
-        // or slightly backward DMA-position read aliasing through modular
-        // subtraction into an almost-full forward lap. Accepting it advances
-        // block ownership into the producer, and the sink then scrubs future
-        // audio into a periodic hard-silence burst. Keep the old baseline: the
-        // next sane cursor sample accounts for the real forward movement.
-        if delta > ring as u64 / 2 {
-            return 0;
-        }
         if delta != 0 {
             self.consumed_hw += delta;
             self.last_hw_pos = pos;

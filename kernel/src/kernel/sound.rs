@@ -256,8 +256,8 @@ impl Sink {
         true
     }
 
-    /// Re-anchor after a long synchronous display handoff.
-    pub fn recover_after_display_stall(&mut self) {
+    /// Re-anchor the physical pipe after the device overtook its producer.
+    pub fn recover_from_underrun(&mut self) {
         if let Some(sink) = &mut self.card {
             sink.resync();
         }
@@ -289,7 +289,7 @@ fn say(report: sound::sink::Report) {
         let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
         if n <= 3 || n.is_multiple_of(64) {
             crate::println!(
-                "sink: underrun #{} written_frames={} consumed_frames={}",
+                "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
                 n, u.written_frames, u.consumed_frames
             );
         }
@@ -341,10 +341,6 @@ pub fn play(frames: &[(i32, i32)], gain_q16: i32) {
 
 pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
     SINK.lock().on_irq(machine, event)
-}
-
-pub fn recover_after_display_stall() {
-    SINK.lock().recover_after_display_stall();
 }
 
 /// One span the global output pump asks the active personality to mix.
@@ -453,12 +449,17 @@ pub fn pump<A: crate::Arch>(
     }
     if present {
         if written <= consumed {
-            // The producer was not running yet or genuinely missed the pipe.
-            // Catch its physical write cursor up here, on the producer side;
-            // completion accounting itself never fabricates written frames.
+            // The consumer crossed the producer frontier, so the old latency
+            // error and this pump's elapsed batch are both obsolete. Restart
+            // the physical pipe at its target rather than trying to pace back
+            // from an underrun.
             let mut sink = SINK.lock();
-            sink.recover_after_display_stall();
+            sink.recover_from_underrun();
             written = sink.counters().0;
+            producer.frac = 0;
+            producer.mix_rate = nominal_rate;
+            producer.last_consumed = consumed;
+            producer.primed = false;
         }
         if producer.primed {
             producer.update_rate(written, consumed, fill);
@@ -485,6 +486,10 @@ pub fn pump<A: crate::Arch>(
             prime -= run as u64;
         }
         producer.primed = true;
+        // Recovery establishes a new physical-time origin. Audio belonging
+        // to the missed interval cannot be replayed without recreating the
+        // overrun, so production resumes with the next CPU-time batch.
+        return;
     }
 
     producer.frac += u64::from(producer.mix_rate) * dt_ms;

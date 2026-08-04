@@ -135,15 +135,13 @@ impl<D: Device> Sink<D> {
 
     /// Apply the final Q16 gain, clip once, and write device PCM into the ring.
     pub fn submit(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
-        // A producer must never lap the device. Once its cyclic write cursor
-        // crosses the half-ring ambiguity point it can overwrite live audio;
-        // the completion scrub then erases FUTURE blocks and the result is a
-        // periodic hard-silence burst without an underrun report. Source time
-        // still advances in the caller; only frames the physical pipe cannot
-        // safely own are discarded here.
         let queued = self.written_frames.saturating_sub(self.consumed_frames());
-        let room = MAX_AHEAD_FRAMES.saturating_sub(queued) as usize;
-        for &(left, right) in frames.iter().take(room) {
+        assert!(queued <= MAX_AHEAD_FRAMES, "audio producer passed ring ceiling");
+        assert!(
+            frames.len() as u64 <= MAX_AHEAD_FRAMES - queued,
+            "audio producer overtook consumer"
+        );
+        for &(left, right) in frames {
             self.buf[self.write_pos] = [scale(left, gain_q16), scale(right, gain_q16)];
             self.write_pos = (self.write_pos + 1) % RING_FRAMES;
             self.written_frames += 1;
@@ -193,8 +191,8 @@ impl<D: Device> Sink<D> {
         self.written_frames
     }
 
-    /// Re-anchor after a stall longer than the pipe: drop the write cursor
-    /// onto the play cursor, trading a lap of latency for nothing.
+    /// Abandon an underrun's obsolete write position and resume at the first
+    /// whole block the device has not begun playing.
     pub fn resync(&mut self) {
         self.write_pos = ((self.completed_blocks as usize + 1) % NUM_BUF) * BUF_FRAMES;
         self.written_frames = (self.completed_blocks + 1) * BUF_FRAMES as u64;
@@ -302,21 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn producer_cannot_lap_and_overwrite_the_live_half_of_the_ring() {
+    #[should_panic(expected = "audio producer overtook consumer")]
+    fn producer_must_not_lap_and_overwrite_the_live_half_of_the_ring() {
         let mut sink = Sink::new(ring(), TestDevice { rate: 44_100, starts: 0, played: 0 });
         let frames = vec![(1, 1); RING_FRAMES];
         sink.submit(&frames, 1 << 16);
-        assert_eq!(sink.written_frames(), MAX_AHEAD_FRAMES);
-
-        // One completed block opens exactly one block of room.
-        sink.device().played = 1;
-        let _ = sink.on_irq();
-        sink.submit(&frames[..BUF_FRAMES * 2], 1 << 16);
-        assert_eq!(sink.written_frames(), MAX_AHEAD_FRAMES + BUF_FRAMES as u64);
-        assert_eq!(
-            sink.written_frames() - sink.consumed_frames(),
-            MAX_AHEAD_FRAMES,
-        );
     }
 
     #[test]
