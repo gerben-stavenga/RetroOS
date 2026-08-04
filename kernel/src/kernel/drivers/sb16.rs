@@ -69,20 +69,15 @@ const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
 /// through it.
 const PRIME_BUFS: usize = 2;
 
-/// The mixer sink, which exists only when it OWNS the machine's card.
+/// This driver's live output: the ports it drives and the stream it runs.
 ///
-/// `Audio::SbSink` hands the capability here at boot and never asks for it
-/// back: the kernel mixer is the card's owner for the whole run, so there is
-/// no handoff on this side. In every other mode this device is never built,
-/// and the card travels to DOS threads instead — see the `sb_handoff` value
-/// carried beside `display_handoff` through the switch path.
+/// It does NOT hold the card. The capability lives in `sound::Sink`, which is
+/// what makes the sink the card's owner; this is the driver state that exists
+/// only while it does. `None` means no stream — no card, or one that cannot
+/// carry 16-bit auto-init DMA, which is this sink's silence.
 struct Sb16 {
-    card: SbCard,
-    /// The output stream, when this card can be one. Separate from the card
-    /// because owning the silicon and streaming through it are different
-    /// facts: a card with no 16-bit DMA channel still lives here, it just
-    /// plays nothing (see [`adopt`]).
-    stream: Option<Stream>,
+    base: u16,
+    stream: Stream,
 }
 
 /// A running 16-bit auto-init output: the ring, the DSP session, and the pipe
@@ -372,26 +367,25 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
 }
 
 /// Take the machine's Sound Blaster as the kernel mixer's sink, for good.
-/// Called only in `Audio::SbSink` mode; the card never leaves again, which is
-/// why this takes it by value and hands nothing back.
+/// Called by `sound::Sink` once it owns the card — it keeps the capability,
+/// this driver keeps the stream, which is why the card comes in by reference.
 ///
-/// A card with no 16-bit DMA channel keeps its home and plays **silence**: the
-/// ring geometry here is 16-bit channel-5 specific (`DMA5_*` ports, word
-/// addressing), so an SB Pro has nothing to run it on. Silence is the honest
-/// output — not a downgrade to some 8-bit path nobody wrote, and not a mode
-/// switch behind the owner's back.
-pub fn adopt<A: crate::Arch>(machine: &mut A, card: SbCard) {
+/// A card with no 16-bit DMA channel plays **silence**: the ring geometry here
+/// is 16-bit channel-5 specific (`DMA5_*` ports, word addressing), so an SB
+/// Pro has nothing to run it on. Silence is the honest output — not a
+/// downgrade to some 8-bit path nobody wrote, and not a mode switch behind the
+/// owner's back.
+pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) {
     if card.dma16 != Some(DMA_CHANNEL as u8) {
         crate::println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
             DMA_CHANNEL, card.dma16
         );
-        *SB16.lock() = Some(Sb16 { card, stream: None });
         return;
     }
-    let stream = open_stream(machine, &card);
+    let stream = open_stream(machine, card);
     PRESENT.store(stream.is_some(), Ordering::Relaxed);
-    *SB16.lock() = Some(Sb16 { card, stream });
+    *SB16.lock() = stream.map(|stream| Sb16 { base: card.base, stream });
 }
 
 /// Program the card for 16-bit signed-stereo auto-init output on channel 5 and
@@ -431,14 +425,6 @@ fn open_stream<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<Stream>
         consumed_frames: 0,
         last_dma_pos: 0,
     })
-}
-
-impl Sb16 {
-    /// The stream and the base to drive it through — `None` when no stream was
-    /// opened, which is this sink's silence.
-    fn playing(&mut self) -> Option<(&mut Stream, u16)> {
-        Some((self.stream.as_mut()?, self.card.base))
-    }
 }
 
 impl Stream {
@@ -519,7 +505,7 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     let mut g = SB16.lock();
     // No stream, or the card is on loan: the frames are dropped. That IS the
     // output of a sink that owns no silicon to play them through.
-    if let Some((stream, base)) = g.as_mut().and_then(Sb16::playing) {
+    if let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) {
         stream.submit(machine, base, rate, fmt, bytes);
     }
 }
@@ -567,7 +553,7 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
     let mut g = SB16.lock();
     // Nothing playing means this line is not ours to claim — with the card on
     // loan, asking the mixer would be reading silicon we do not own.
-    let Some((stream, base)) = g.as_mut().and_then(Sb16::playing) else { return false };
+    let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) else { return false };
     machine.outb(base + MIX_IDX, MIX_IRQ_STATUS);
     if machine.inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
         return false;
@@ -598,7 +584,7 @@ pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
 /// and `consumed` from the monotonicized live 8237 DMA cursor.
 pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
     let mut g = SB16.lock();
-    let (stream, _) = g.as_mut().and_then(Sb16::playing)?;
+    let (stream, _) = g.as_mut().map(|d| (&mut d.stream, d.base))?;
     if stream.running {
         // ISA DSP interrupt latches can coalesce while auto-init DMA continues.
         // The IRQ remains the wakeup/ack path, but this cheap 8237 read prevents
@@ -614,7 +600,7 @@ pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
 /// pause/continue state.
 pub fn stop<A: crate::Arch>(machine: &mut A, _park: bool) {
     let mut g = SB16.lock();
-    let Some((stream, base)) = g.as_mut().and_then(Sb16::playing) else { return };
+    let Some((stream, base)) = g.as_mut().map(|d| (&mut d.stream, d.base)) else { return };
     if stream.running {
         dsp_write_at(machine, base, CMD_HALT_AUTO_16);
         machine.outb(DMA5_MASK, 0x05); // mask channel 5

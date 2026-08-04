@@ -85,75 +85,166 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
     machine.inw(AUDIO_SIG) == SIGNATURE
 }
 
-/// Canonical audio-sink interrupt router. Called by the kernel-global IRQ
-/// dispatcher before personality/console routing. The interrupt is a wakeup;
-/// each driver validates its status and reads its authoritative DMA cursor.
-pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
-    use crate::kernel::platform::Audio;
-    match (crate::kernel::platform::get().audio, event) {
-        (Audio::EmulatedHda, crate::Irq::Msi(source))
-            if source == crate::kernel::drivers::hda::MSI_SOURCE =>
-        {
-            crate::kernel::drivers::hda::on_irq()
-        }
-        (Audio::EmulatedHda, crate::Irq::Hw(line))
-            if Some(line) == crate::kernel::drivers::hda::irq_line() =>
-        {
-            let ours = crate::kernel::drivers::hda::on_irq();
-            if ours {
-                machine.rearm_irq(line);
+/// **The** kernel audio sink: one output, whichever device serves it.
+///
+/// The kernel deals only with this type. It used to ask `platform::Audio`
+/// which driver to call, in five separate matches — `play`, `stop`,
+/// `position`, `min_fill` and `on_irq` each re-deriving the same answer from
+/// a global. `Audio` is the boot-time POLICY (who owns the Sound Blaster);
+/// which device is playing is a value, and this is it.
+///
+/// [`Device`] is deliberately not public: "which sound card" is the sink's
+/// business, and nothing above it should be able to ask.
+pub struct Sink {
+    device: Device,
+}
+
+/// The devices that can serve the sink. A closed set — these are the cards
+/// RetroOS drives, and adding one should break every match here on purpose.
+enum Device {
+    /// The physical Sound Blaster, HELD: this is one of the two places the
+    /// machine's card can be (the other is a DOS thread driving it directly).
+    Sb(crate::kernel::drivers::sb16::SbCard),
+    Hda,
+    Ac97,
+    /// A backend installed a sink behind the canonical port window: the frames
+    /// are written out through `outw` and consumed instantly, so this is the
+    /// one device with no playback clock of its own.
+    PortWindow,
+    /// Nothing answers. Emulation still satisfies device detection; playback
+    /// is dropped.
+    Silent,
+}
+
+impl Sink {
+    /// Build the sink the boot policy chose. Takes the Sound Blaster when the
+    /// owner asked for the mixer (`SB_AUDIO=mixed`) — and then holds it, which
+    /// is what makes the sink its owner.
+    pub fn new<A: crate::Arch>(
+        machine: &mut A,
+        card: Option<crate::kernel::drivers::sb16::SbCard>,
+    ) -> Self {
+        use crate::kernel::platform::Audio;
+        let device = match (crate::kernel::platform::get().audio, card) {
+            (Audio::SbSink, Some(card)) => {
+                crate::kernel::drivers::sb16::adopt(machine, &card);
+                Device::Sb(card)
             }
-            ours
+            (Audio::EmulatedHda, _) => Device::Hda,
+            (Audio::EmulatedAc97, _) => Device::Ac97,
+            (Audio::EmulatedPortWindow, _) => Device::PortWindow,
+            // NativeSb: a DOS thread has the card, so the mixer has nothing to
+            // play through. Same for a mixer mode with no card to take.
+            _ => Device::Silent,
+        };
+        Sink { device }
+    }
+
+    /// Hand the Sound Blaster back, if this sink is the one holding it. The
+    /// sink survives with nothing to play through, which is the truth rather
+    /// than a special state — `Err` is every other device, unchanged.
+    pub fn try_into_sb(self) -> Result<(crate::kernel::drivers::sb16::SbCard, Self), Self> {
+        match self.device {
+            Device::Sb(card) => Ok((card, Sink { device: Device::Silent })),
+            device => Err(Sink { device }),
         }
-        (Audio::EmulatedAc97, crate::Irq::Hw(line))
-            if Some(line) == crate::kernel::drivers::ac97::irq_line() =>
-        {
-            let ours = crate::kernel::drivers::ac97::on_irq(machine);
-            if ours {
-                machine.rearm_irq(line);
+    }
+
+    /// Stream a block of source PCM (`fmt`, `rate` Hz), canonicalized to i16
+    /// stereo on the way.
+    pub fn play<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+        match self.device {
+            Device::Hda => crate::kernel::drivers::hda::play(machine, rate, fmt, bytes),
+            Device::Ac97 => crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes),
+            Device::Sb(_) => crate::kernel::drivers::sb16::play(machine, rate, fmt, bytes),
+            Device::PortWindow => port_window_play(machine, rate, fmt, bytes),
+            Device::Silent => {}
+        }
+    }
+
+    /// The producer went idle. `park` marks a real session end (DSP reset /
+    /// program cleanup): the device may power down, not just pause.
+    pub fn stop<A: crate::Arch>(&mut self, machine: &mut A, park: bool) {
+        match self.device {
+            Device::Hda => crate::kernel::drivers::hda::stop(machine, park),
+            Device::Sb(_) => crate::kernel::drivers::sb16::stop(machine, park),
+            Device::Ac97 | Device::PortWindow | Device::Silent => {}
+        }
+    }
+
+    /// Pipe counters in source-rate frames: `(written, consumed)`. `None` when
+    /// the device has no playback clock, and the producer must pace itself by
+    /// virtual time instead.
+    pub fn position<A: crate::Arch>(&mut self, machine: &mut A) -> Option<(u64, u64)> {
+        match self.device {
+            Device::Hda => crate::kernel::drivers::hda::position(),
+            Device::Ac97 => crate::kernel::drivers::ac97::position(machine),
+            Device::Sb(_) => crate::kernel::drivers::sb16::position(machine),
+            Device::PortWindow | Device::Silent => None,
+        }
+    }
+
+    /// The universal [`PIPE_MS`] depth in frames, or `None` when this device
+    /// has no real-time consumer clock.
+    pub fn min_fill(&self, rate: u32) -> Option<u32> {
+        let present = match self.device {
+            Device::Hda => crate::kernel::drivers::hda::present(),
+            Device::Ac97 => crate::kernel::drivers::ac97::present(),
+            Device::Sb(_) => crate::kernel::drivers::sb16::present(),
+            Device::PortWindow | Device::Silent => false,
+        };
+        present.then(|| rate * PIPE_MS / 1000)
+    }
+
+    /// Completion interrupt. The device decides whether the event is its own —
+    /// an MSI source or an ISA line it routed — and re-arms the line if it is.
+    pub fn on_irq<A: crate::Arch>(&mut self, machine: &mut A, event: crate::Irq) -> bool {
+        use crate::kernel::drivers::{ac97, hda, sb16};
+        match (&self.device, event) {
+            (Device::Hda, crate::Irq::Msi(source)) if source == hda::MSI_SOURCE => hda::on_irq(),
+            (Device::Hda, crate::Irq::Hw(line)) if Some(line) == hda::irq_line() => {
+                let ours = hda::on_irq();
+                if ours {
+                    machine.rearm_irq(line);
+                }
+                ours
             }
-            ours
-        }
-        (Audio::EmulatedAc97, crate::Irq::Msi(source))
-            if crate::kernel::drivers::ac97::msi_active()
-                && source == crate::kernel::drivers::ac97::MSI_SOURCE =>
-        {
-            crate::kernel::drivers::ac97::on_irq(machine)
-        }
-        (Audio::SbSink, crate::Irq::Hw(line))
-            if Some(line) == crate::kernel::drivers::sb16::irq_line() =>
-        {
-            let ours = crate::kernel::drivers::sb16::on_irq(machine);
-            if ours {
-                machine.rearm_irq(line);
+            (Device::Ac97, crate::Irq::Hw(line)) if Some(line) == ac97::irq_line() => {
+                let ours = ac97::on_irq(machine);
+                if ours {
+                    machine.rearm_irq(line);
+                }
+                ours
             }
-            ours
+            (Device::Ac97, crate::Irq::Msi(source))
+                if ac97::msi_active() && source == ac97::MSI_SOURCE =>
+            {
+                ac97::on_irq(machine)
+            }
+            (Device::Sb(_), crate::Irq::Hw(line)) if Some(line) == sb16::irq_line() => {
+                let ours = sb16::on_irq(machine);
+                if ours {
+                    machine.rearm_irq(line);
+                }
+                ours
+            }
+            _ => false,
         }
-        _ => false,
+    }
+
+    /// Re-anchor after a long synchronous display handoff. Position-less
+    /// devices have no producer to recover.
+    pub fn recover_after_display_stall(&mut self) {
+        if matches!(self.device, Device::Hda) {
+            crate::kernel::drivers::hda::recover_after_stall();
+        }
     }
 }
 
-/// Stream a block of source PCM `bytes` (`fmt`, `rate` Hz) to the canonical
-/// audio output, canonicalizing to i16 stereo on the way. The sink is the
-/// boot-time platform decision; Silent drops it.
-pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-    use crate::kernel::platform::Audio;
-    match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => {
-            crate::kernel::drivers::hda::play(machine, rate, fmt, bytes);
-            return;
-        }
-        Audio::EmulatedAc97 => {
-            crate::kernel::drivers::ac97::play(machine, rate, fmt, bytes);
-            return;
-        }
-        Audio::SbSink => {
-            crate::kernel::drivers::sb16::play(machine, rate, fmt, bytes);
-            return;
-        }
-        Audio::EmulatedPortWindow => {}
-        Audio::NativeSb | Audio::EmulatedSilent => return,
-    }
+/// The canonical audio port window: no ring, no completion interrupt, no
+/// cursor — the frames are written out and consumed by construction. The one
+/// device whose consumption is defined rather than observed.
+fn port_window_play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
     if LAST_RATE.swap(rate, Ordering::Relaxed) != rate {
         machine.outw(AUDIO_SIG, rate as u16);
     }
@@ -168,64 +259,64 @@ pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8
     }
 }
 
-/// Tell the selected canonical output that the producer went idle. `park`
-/// marks a real session end (DSP reset / program cleanup): the output may
-/// power down its hardware fully, not just pause the stream.
-pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
-    use crate::kernel::platform::Audio;
-    match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::drivers::hda::stop(machine, park),
-        Audio::SbSink => crate::kernel::drivers::sb16::stop(machine, park),
-        Audio::NativeSb | Audio::EmulatedAc97 | Audio::EmulatedPortWindow | Audio::EmulatedSilent => {}
-    }
-}
-
-/// Re-anchor a real-time sink after a long synchronous display handoff.
-/// Position-less and hardware-passthrough outputs need no producer recovery.
-pub fn recover_after_display_stall() {
-    use crate::kernel::platform::Audio;
-    if crate::kernel::platform::get().audio == Audio::EmulatedHda {
-        crate::kernel::drivers::hda::recover_after_stall();
-    }
-}
-
-/// The selected output's pipe counters, in **source-rate frames**:
-/// `(written, consumed)` — frames accepted via [`play`] and frames the
-/// hardware has actually claimed for playback, both since the output's
-/// current stream session started. `None` when the output has no real-time
-/// consumer (WAV port window, silent): there is no playback clock to read,
-/// and the producer must pace itself by virtual time instead.
-///
-/// This is the pull side of the SB pipe model: the emulated DSP slaves its
-/// guest-visible cursor (DMA counts, block IRQs) to `consumed`, so guest
-/// timing derives from real playback — the same definition a real card's
-/// DMA cursor has — instead of a free-running virtual clock that the sink
-/// then has to absorb with a deep latency cushion.
-pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
-    use crate::kernel::platform::Audio;
-    match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::drivers::hda::position(),
-        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::position(machine),
-        Audio::SbSink => crate::kernel::drivers::sb16::position(machine),
-        Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => None,
-    }
-}
-
 /// Desired output pipe depth (playback latency), shared by every hardware sink.
 /// Below ~one framebuffer-blit period a present stall can underrun it.
 const PIPE_MS: u32 = 30;
 
-/// The universal [`PIPE_MS`] depth in frames, or `None` when the active sink
-/// has no real-time consumer clock. Probed once per playback session.
+/// The machine's one audio output.
+///
+/// It has to be reachable from the IRQ dispatcher (not on the event loop's
+/// stack) and from the mixer pump deep inside a DOS thread, so it lives here
+/// rather than being threaded — but it is a VALUE with methods, not a global
+/// anyone matches on, and when it holds the Sound Blaster it holds it the same
+/// way a thread does: by owning it.
+static SINK: spin::Mutex<Sink> = spin::Mutex::new(Sink { device: Device::Silent });
+
+/// Install the sink the boot policy chose. Called once, from `startup`.
+pub fn install(sink: Sink) {
+    *SINK.lock() = sink;
+}
+
+/// Take the Sound Blaster off the sink, if the sink is what holds it.
+pub fn take_sb_card() -> Option<crate::kernel::drivers::sb16::SbCard> {
+    let mut g = SINK.lock();
+    let sink = core::mem::replace(&mut *g, Sink { device: Device::Silent });
+    match sink.try_into_sb() {
+        Ok((card, rest)) => {
+            *g = rest;
+            Some(card)
+        }
+        Err(sink) => {
+            *g = sink;
+            None
+        }
+    }
+}
+
+// ── the kernel-facing surface: one line each, straight to the sink ──────────
+
+pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
+    SINK.lock().play(machine, rate, fmt, bytes);
+}
+
+pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
+    SINK.lock().stop(machine, park);
+}
+
+pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
+    SINK.lock().position(machine)
+}
+
 pub fn min_fill(rate: u32) -> Option<u32> {
-    use crate::kernel::platform::Audio;
-    let present = match crate::kernel::platform::get().audio {
-        Audio::EmulatedHda => crate::kernel::drivers::hda::present(),
-        Audio::EmulatedAc97 => crate::kernel::drivers::ac97::present(),
-        Audio::SbSink => crate::kernel::drivers::sb16::present(),
-        Audio::NativeSb | Audio::EmulatedPortWindow | Audio::EmulatedSilent => false,
-    };
-    present.then(|| rate * PIPE_MS / 1000)
+    SINK.lock().min_fill(rate)
+}
+
+pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
+    SINK.lock().on_irq(machine, event)
+}
+
+pub fn recover_after_display_stall() {
+    SINK.lock().recover_after_display_stall();
 }
 
 /// Producer-side pacing for a *generated* PCM stream — the synth pumps (FM,

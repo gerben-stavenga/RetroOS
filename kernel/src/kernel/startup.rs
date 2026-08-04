@@ -200,17 +200,15 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
             crate::println!("Audio: BLASTER declares a 16-bit channel but this card has none");
         }
     }
-    // Reconciliation done: settle who the card belongs to. In mixer mode it
-    // goes to the sink driver for good; otherwise it travels — into whichever
-    // DOS thread holds the console, and back out when that thread gives up
-    // focus or exits, exactly as the display token does.
-    let sb_card = match (platform.audio, sb_card) {
-        (crate::kernel::platform::Audio::SbSink, Some(card)) => {
-            crate::kernel::drivers::sb16::adopt(machine, card);
-            None
-        }
-        (_, card) => card,
-    };
+    // Reconciliation done: settle who the card belongs to. In mixer mode the
+    // sink takes it and keeps it; otherwise the sink is built without one and
+    // the card travels — into whichever DOS thread holds the console, and back
+    // out when that thread gives up focus or exits, exactly as the display
+    // token does.
+    let for_sink = (platform.audio == crate::kernel::platform::Audio::SbSink)
+        .then(|| sb_card.take())
+        .flatten();
+    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, for_sink));
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
