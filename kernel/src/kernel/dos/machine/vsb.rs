@@ -116,8 +116,10 @@ pub(super) const GM_SCALE_Q16: i32 = 15_400;
 /// derivation rather than a knob someone turned until it sounded right.
 pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
 
-/// One canonical 128-frame block at the SB16 maximum of 16-bit stereo.
-const DSP_SCRATCH_BYTES: usize = 128 * 4;
+/// One mix block plus trim headroom at the SB16 maximum of 16-bit stereo.
+/// A temporarily reduced output rate can consume slightly more than one DSP
+/// source frame per output frame.
+const DSP_SCRATCH_BYTES: usize = 256 * 4;
 
 /// What the guest was TOLD its card is: the `BLASTER=` declaration. Every
 /// number a DOS program uses comes from here — the ports it pokes, the vPIC
@@ -308,13 +310,17 @@ pub struct NativeSb {
 pub struct EmulatedSb {
     /// The library card: DSP register file + command FSM, CT1745 mixer, OPL.
     core: sound::sb::Sb,
-    /// Between-pump DMA-cursor estimator. The card's cursor advances only at
-    /// pump boundaries, in whole-chunk jumps — a MOD player that polls the
+    /// Incremental DSP source position in Q32.32 frames. The output mix rate
+    /// may change to regulate physical pipe depth, so reconstructing this from
+    /// an absolute output frame and the latest rate would warp its history.
+    mix_pos_q32: u64,
+    /// Between-pump DMA-cursor estimator. The card's cursor advances at CPU
+    /// pump boundaries — a MOD player that polls the
     /// 8237 count to find the play position (Pinball Fantasies) sees it
     /// frozen, then leaping ~512 transfers, and its coherency loop never
     /// converges. Count reads instead extrapolate from the last pump on the
     /// guest's fine clock (`rdtsc`): `est_frames` + elapsed·`est_slope`,
-    /// where the slope is measured pump-over-pump from the drain slave
+    /// where the slope is measured pump-over-pump from the producer clock
     /// itself (frames per 2^32 TSC ticks, EWMA-smoothed) — no TSC frequency
     /// calibration anywhere. Clamped to `est_cap` (nothing past what the
     /// sink was handed, never across an un-raised block IRQ) and monotonic
@@ -359,6 +365,7 @@ impl EmulatedSb {
     fn new() -> Box<Self> {
         Box::new(Self {
             core: sound::sb::Sb::new(),
+            mix_pos_q32: 0,
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         })
@@ -951,9 +958,7 @@ impl EmulatedSb {
         }
         let prog = dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&prog, is16);
-        // How deep the sink's pipe runs is our policy, not the card's.
-        let min_fill = crate::kernel::sound::min_fill(self.core.rate()).unwrap_or(0);
-        self.core.begin(start, gpa, len, min_fill);
+        self.core.begin(start, gpa, len);
         if super::PORT_TRACE {
             crate::dbg_println!(
                 "[dsp] start bits={} single={} gpa={:08X} len={} chan={}",
@@ -985,15 +990,17 @@ impl EmulatedSb {
         }
     }
 
-    /// Rate the DSP stream runs the mixer session at.
-    pub fn dsp_rate(&self) -> u32 {
-        self.core.rate()
-    }
-
-    /// A DSP playback (re)started since the last call: the mixer pump must
-    /// re-key its session so pump frames and DSP stream frames coincide.
+    /// Reset the incremental producer phase when DSP playback restarts.
     pub fn take_restart(&mut self) -> bool {
-        self.core.take_restart()
+        if !self.core.take_restart() {
+            return false;
+        }
+        self.mix_pos_q32 = 0;
+        self.est_frames = 0;
+        self.est_tsc = 0;
+        self.est_cap = 0;
+        self.est_served = 0;
+        true
     }
 
     /// Mix every producer on this card into the same final PCM block.
@@ -1007,10 +1014,19 @@ impl EmulatedSb {
         &mut self,
         machine: &mut A,
         rate: u32,
-        base: u64,
         block: &mut [(i32, i32)],
     ) {
-        if let Some(f) = self.core.dsp_fetch(rate, base, block.len()) {
+        let step_q32 = ((u64::from(self.core.rate().max(1))) << 32)
+            / u64::from(rate.max(1));
+        let start_q32 = self.mix_pos_q32;
+        let last = if block.is_empty() {
+            start_q32 >> 32
+        } else {
+            start_q32
+                .wrapping_add(step_q32.wrapping_mul(block.len() as u64 - 1))
+                >> 32
+        };
+        if let Some(f) = self.core.dsp_fetch(start_q32 >> 32, last) {
             let fb = f.frame_bytes as usize;
             let need = f.source_frames * fb;
             let Some(scratch) = self.dsp_scratch.get_mut(..need) else {
@@ -1028,24 +1044,26 @@ impl EmulatedSb {
                 machine.copy_from(addr, &mut scratch[lo..lo + run * fb]);
                 copied += run;
             }
-            self.core.mix_dsp(rate, base, scratch, &f, block);
+            self.core.mix_dsp(start_q32, step_q32, scratch, &f, block);
+        }
+        if self.core.playing() {
+            self.mix_pos_q32 = self.mix_pos_q32
+                .wrapping_add(step_q32.wrapping_mul(block.len() as u64));
         }
         self.core.mix_fm(rate, block);
     }
 
-    /// Drive the emulated DSP's guest-visible clock from the mixer's drain
-    /// point and put its interrupt line up when it asks. `drained`/`pushed`
-    /// are already converted into the DSP's own frames by the pump.
+    /// Drive the emulated DSP's guest-visible clock from frames consumed by
+    /// the CPU-clocked producer and put its interrupt line up when it asks.
     pub fn dsp_clock_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
-        drained: u64,
-        pushed: u64,
     ) {
         let now = machine.get_ticks();
-        if self.core.advance_clock(now, drained, pushed) && !vpic.is_requested(irq) {
+        let produced = self.mix_pos_q32 >> 32;
+        if self.core.advance_clock(now, produced) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and
@@ -1073,7 +1091,7 @@ impl EmulatedSb {
         }
         self.est_frames = frames;
         self.est_tsc = tsc;
-        self.est_cap = pushed.min(self.core.next_irq_frames()).max(frames);
+        self.est_cap = produced.min(self.core.next_irq_frames()).max(frames);
     }
 
     /// The estimated play cursor for a count/address read *between* pumps:

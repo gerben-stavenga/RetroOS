@@ -25,17 +25,12 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // (guest `OUT`s surface as `KernelEvent::Out` and never reach this window). The
 // sample rate fits in 16 bits (every SB rate is < 65536 Hz).
 const AUDIO_SIG: u16 = 0x530; // R: signature ('RA'); W: sample rate (Hz)
-const AUDIO_LEFT: u16 = 0x532; // W: latch the left i16
-const AUDIO_RIGHT: u16 = 0x534; // W: right i16, and commit the (L,R) frame
 const SIGNATURE: u16 = 0x5241; // 'R','A' — RetroOS Audio
 
 /// The producer's wire format and the ring geometry are the library's — see
 /// `sound::sink`. Re-exported so the drivers and the mixer keep naming them
 /// through `kernel::sound`.
 pub use sound::sink::{BUF_BYTES, Frame, NUM_BUF, RING_BYTES, RING_FRAMES};
-
-/// Last rate programmed into the device, so we only re-emit `AUDIO_SIG` on change.
-static LAST_RATE: AtomicU32 = AtomicU32::new(0);
 
 /// Times the play cursor caught the write cursor while a producer was feeding
 /// us. One counter for the sink, not one per driver — it used to live in
@@ -121,21 +116,20 @@ impl sound::sink::Device for Card {
 /// The machine's audio output: a `//lib:sound` sink over one of our cards, or
 /// nothing to play through.
 ///
-/// `PortWindow` is not a card and never will be one — the hosted backend's WAV
-/// sink has no ring, no completion interrupt and no cursor, because its
-/// consumption is defined rather than observed. It stays a variant here rather
-/// than pretending to implement a contract three of its clauses cannot mean.
-enum Out {
-    Card(sound::sink::Sink<Card>),
-    PortWindow,
-    Silent,
-}
-
+/// `None` is not a mode, it is the absence of hardware: no card was found, or
+/// a DOS thread holds the machine's Sound Blaster. Everything above reads the
+/// same two counters either way and simply produces nothing when there is no
+/// sink to produce for.
 pub struct Sink {
-    out: Out,
+    card: Option<sound::sink::Sink<Card>>,
 }
 
 impl Sink {
+    /// No hardware to play through.
+    pub const fn empty() -> Self {
+        Sink { card: None }
+    }
+
     /// Build the sink the boot policy chose, taking the Sound Blaster when the
     /// owner asked for the mixer (`SB_AUDIO=mixed`) — and then holding it,
     /// which is what makes the sink its owner.
@@ -156,31 +150,37 @@ impl Sink {
             (Audio::EmulatedAc97, _) => {
                 (crate::kernel::drivers::ac97::adopt(machine), Some(Card::Ac97))
             }
-            (Audio::EmulatedPortWindow, _) => return Sink { out: Out::PortWindow },
+            // The hosted WAV sink is not wired up: it has no ring, no cursor
+            // and no completion event, so it cannot answer the `Device`
+            // contract, and the kernel-side clock that used to stand in for
+            // one was a second pacing path pretending to be a device. It comes
+            // back as a real canonical audio card, with the host generating
+            // the completions.
+            (Audio::EmulatedPortWindow, _) => return Sink::empty(),
             // NativeSb: a DOS thread has the card, so the mixer has nothing to
             // play through. Same for a mixer mode with no card to take.
             _ => (None, None),
         };
         let (Some((va, _phys)), Some(card)) = (mapped, card) else {
-            return Sink { out: Out::Silent };
+            return Sink::empty();
         };
         // The device mapped the ring; hand the library a slice of it. This is
         // the one unsafe step in the sink — everything above it is a ring
         // buffer and arithmetic, which is why it lives in `//lib:sound`.
         let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut Frame, RING_FRAMES) };
-        Sink { out: Out::Card(sound::sink::Sink::new(buf, card)) }
+        Sink { card: Some(sound::sink::Sink::new(buf, card)) }
     }
 
     /// Hand the Sound Blaster back, if this sink is the one holding it. The
     /// sink survives with nothing to play through, which is the truth rather
     /// than a special state.
     pub fn try_into_sb(self) -> Result<(crate::kernel::drivers::sb16::SbCard, Self), Self> {
-        match self.out {
-            Out::Card(sink) => match sink.into_device() {
-                Card::Sb(card) => Ok((card, Sink { out: Out::Silent })),
-                other => Err(Sink { out: Out::Card(rebuild(other)) }),
+        match self.card {
+            Some(sink) => match sink.into_device() {
+                Card::Sb(card) => Ok((card, Sink::empty())),
+                other => Err(Sink { card: Some(rebuild(other)) }),
             },
-            out => Err(Sink { out }),
+            None => Err(self),
         }
     }
 
@@ -192,37 +192,41 @@ impl Sink {
     /// means the conversion happens once, in the mixer, where every source is
     /// already being rate-converted anyway.
     pub fn rate(&self) -> u32 {
-        match &self.out {
-            Out::Card(sink) => sink.rate(),
-            _ => DEFAULT_RATE,
+        match &self.card {
+            Some(sink) => sink.rate(),
+            None => DEFAULT_RATE,
         }
     }
 
     /// Stream a block of wide mixed PCM, applying the final Q16 output gain.
-    pub fn play<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        frames: &[(i32, i32)],
-        gain_q16: i32,
-    ) {
-        match &mut self.out {
-            Out::Card(sink) => sink.submit(frames, gain_q16),
-            Out::PortWindow => port_window_play(machine, frames, gain_q16),
-            Out::Silent => {}
+    pub fn play(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
+        if let Some(sink) = &mut self.card {
+            sink.submit(frames, gain_q16);
         }
     }
 
-    /// Frames consumed by the device, or `None` when there is no playback
-    /// clock and the producer must pace itself by virtual time instead.
-    pub fn consumed(&self) -> Option<u64> {
-        let Out::Card(sink) = &self.out else { return None };
-        Some(sink.consumed_frames())
+    /// `(written, consumed)` in frames. Both are absolute and share the sink's
+    /// origin, so their difference IS the queue depth — there is no
+    /// producer-side anchor between them, and `written` is the absolute index
+    /// the next produced frame will have.
+    pub fn counters(&self) -> (u64, u64) {
+        match &self.card {
+            Some(sink) => (sink.written_frames(), sink.consumed_frames()),
+            None => (0, 0),
+        }
     }
 
-    /// The universal [`PIPE_MS`] depth in frames, or `None` when this sink has
-    /// no real-time consumer clock.
-    pub fn min_fill(&self, rate: u32) -> Option<u32> {
-        matches!(self.out, Out::Card(_)).then(|| rate * PIPE_MS / 1000)
+    /// Queue depth to keep ahead of the drain: [`PIPE_MS`] of slack against a
+    /// present stall. Nothing to fill when there is nothing to play through.
+    pub fn min_fill(&self, rate: u32) -> u32 {
+        match self.card {
+            Some(_) => rate * PIPE_MS / 1000,
+            None => 0,
+        }
+    }
+
+    pub fn present(&self) -> bool {
+        self.card.is_some()
     }
 
     /// Completion interrupt. Whether the LINE was ours is the machine's
@@ -230,7 +234,7 @@ impl Sink {
     /// identity is matched here and the card only answers for its own status.
     pub fn on_irq<A: crate::Arch>(&mut self, machine: &mut A, event: crate::Irq) -> bool {
         use crate::kernel::drivers::{ac97, hda, sb16};
-        let Out::Card(sink) = &mut self.out else { return false };
+        let Some(sink) = &mut self.card else { return false };
         let (mine, isa_line) = match (sink.device(), event) {
             (Card::Hda, crate::Irq::Msi(src)) => (src == hda::MSI_SOURCE, None),
             (Card::Hda, crate::Irq::Hw(line)) => (Some(line) == hda::irq_line(), Some(line)),
@@ -254,7 +258,7 @@ impl Sink {
 
     /// Re-anchor after a long synchronous display handoff.
     pub fn recover_after_display_stall(&mut self) {
-        if let Out::Card(sink) = &mut self.out {
+        if let Some(sink) = &mut self.card {
             sink.resync();
         }
     }
@@ -292,24 +296,6 @@ fn say(report: sound::sink::Report) {
     }
 }
 
-/// The canonical audio port window: no ring, no completion interrupt, no
-/// cursor — the frames are written out and consumed by construction. The one
-/// device whose consumption is defined rather than observed.
-fn port_window_play<A: crate::Arch>(
-    machine: &mut A,
-    frames: &[(i32, i32)],
-    gain_q16: i32,
-) {
-    let rate = DEFAULT_RATE;
-    if LAST_RATE.swap(rate, Ordering::Relaxed) != rate {
-        machine.outw(AUDIO_SIG, rate as u16);
-    }
-    for &(l, r) in frames {
-        machine.outw(AUDIO_LEFT, sound::sink::scale(l, gain_q16) as u16);
-        machine.outw(AUDIO_RIGHT, sound::sink::scale(r, gain_q16) as u16);
-    }
-}
-
 /// The rate a sink runs at when the device has no opinion.
 const DEFAULT_RATE: u32 = 44_100;
 
@@ -324,7 +310,7 @@ const PIPE_MS: u32 = 30;
 /// rather than being threaded — but it is a VALUE with methods, not a global
 /// anyone matches on, and when it holds the Sound Blaster it holds it the same
 /// way a thread does: by owning it.
-static SINK: spin::Mutex<Sink> = spin::Mutex::new(Sink { out: Out::Silent });
+static SINK: spin::Mutex<Sink> = spin::Mutex::new(Sink::empty());
 
 /// Install the sink the boot policy chose. Called once, from `startup`.
 pub fn install(sink: Sink) {
@@ -334,7 +320,7 @@ pub fn install(sink: Sink) {
 /// Take the Sound Blaster off the sink, if the sink is what holds it.
 pub fn take_sb_card() -> Option<crate::kernel::drivers::sb16::SbCard> {
     let mut g = SINK.lock();
-    let sink = core::mem::replace(&mut *g, Sink { out: Out::Silent });
+    let sink = core::mem::replace(&mut *g, Sink::empty());
     match sink.try_into_sb() {
         Ok((card, rest)) => {
             *g = rest;
@@ -349,21 +335,8 @@ pub fn take_sb_card() -> Option<crate::kernel::drivers::sb16::SbCard> {
 
 // ── the kernel-facing surface: one line each, straight to the sink ──────────
 
-pub fn play<A: crate::Arch>(machine: &mut A, frames: &[(i32, i32)], gain_q16: i32) {
-    SINK.lock().play(machine, frames, gain_q16);
-}
-
-pub fn consumed() -> Option<u64> {
-    SINK.lock().consumed()
-}
-
-pub fn min_fill(rate: u32) -> Option<u32> {
-    SINK.lock().min_fill(rate)
-}
-
-/// The rate the active sink plays at — what a producer should mix at.
-pub fn rate() -> u32 {
-    SINK.lock().rate()
+pub fn play(frames: &[(i32, i32)], gain_q16: i32) {
+    SINK.lock().play(frames, gain_q16);
 }
 
 pub fn on_irq<A: crate::Arch>(machine: &mut A, event: crate::Irq) -> bool {
@@ -374,210 +347,162 @@ pub fn recover_after_display_stall() {
     SINK.lock().recover_after_display_stall();
 }
 
-/// Producer-side pacing for a *generated* PCM stream — the synth pumps (FM,
-/// GUS wavetable) that make frames on demand rather than consuming a guest
-/// ring. Answers one question per tick: how many frames are due now?
-///
-/// Slaved to the sink's playback counter when it reports one ([`consumed`]):
-/// keep [`min_fill`] frames queued ahead of the drain point, so the pump and
-/// the codec share a clock by construction — the synth-side counterpart of
-/// the vsb pipe model, and the reason the sink needs no clock-follow servo.
-/// Paced by virtual time at the session rate otherwise (WAV window / silent
-/// sinks have no consumer clock to read).
-///
-/// A session is keyed by the active device's rate: [`due`](Self::due)
-/// re-anchors the producer if that clock changes, and [`reset`](Self::reset)
-/// parks it when the pump goes idle or is superseded.
-pub struct Pace {
-    rate: u32,
-    /// Pipe depth target in source frames; 0 = synthetic (no sink position).
-    fill: u32,
-    use_pos: bool,
-    /// Source frames pushed this session.
-    pushed: u64,
-    /// Sink consumed-frame counter at our session start. Subtracting it makes
-    /// the free-running device clock local to this producer session.
-    sink_start: Option<u64>,
-    /// Session frames the sink has consumed, as of the last [`due`] call
-    /// (synthetic: everything pushed — an instant consumer). Interpolated: the
-    /// sink confirms whole buffers per completion IRQ, and this advances smoothly
-    /// between them (see `drained_from`/`drained_ms`/`drain_step`) so both
-    /// production and the guest cursor derived from it advance evenly.
-    drained: u64,
-    /// Last buffer-granular consumed value, the ms it stepped, and the step size
-    /// (buffer, learned) — for interpolating `drained` between completions.
-    drained_from: u64,
-    drained_ms: u64,
-    drain_step: u64,
-    /// Guest-clock accumulator, frames × 1000. Production is paced on
-    /// `get_ticks` (real-time to ~1e-3); this keeps whole-frame credit so a
-    /// partial block remains here until the next complete block is due. Used on
-    /// a real sink too — the drain only sets the anchor and the wide drift band.
-    frac: u64,
+/// One span the global output pump asks the active personality to mix.
+pub struct AudioSpan<'a> {
+    /// Effective output frames per CPU second. This is gently trimmed around
+    /// the device's nominal rate to hold the physical pipe at its target
+    /// depth; sources use it for incremental phase, so their frequencies stay
+    /// expressed in the CPU clock while the sample density changes.
+    pub rate: u32,
+    pub base_frame: u64,
+    pub frames: &'a mut [(i32, i32)],
 }
 
-impl Pace {
+const MIX_CHUNK: usize = 128;
+const TRIM_PPM_PER_FRAME: i64 = 8;
+const MAX_TRIM_PPM: i64 = 25_000;
+
+/// The CPU-clocked output producer. HDA/AC'97/SB consumption does not advance
+/// this clock; it only supplies slow feedback that trims the number of output
+/// samples made per CPU second and therefore holds pipe latency steady.
+pub struct Producer {
+    nominal_rate: u32,
+    mix_rate: u32,
+    /// Fractional output frames, in frames × 1000 (the event-loop tick is ms).
+    frac: u64,
+    /// Absolute CPU-produced frame index. Physical pipe priming is downstream
+    /// silence and deliberately does not advance this source-time coordinate.
+    pushed: u64,
+    last_consumed: u64,
+    sink_present: bool,
+    primed: bool,
+}
+
+impl Producer {
     pub const fn new() -> Self {
-        Pace {
-            rate: 0, fill: 0, use_pos: false,
-            pushed: 0, sink_start: None, drained: 0, frac: 0,
-            drained_from: 0, drained_ms: 0, drain_step: 0,
+        Self {
+            nominal_rate: 0,
+            mix_rate: 0,
+            frac: 0,
+            pushed: 0,
+            last_consumed: 0,
+            sink_present: false,
+            primed: false,
         }
     }
 
-    /// Park the pacer: next [`due`] starts from a fresh sink-counter baseline.
-    /// Call when the pump stops its stream or another producer takes the sink.
-    pub fn reset(&mut self) {
-        self.rate = 0;
-        self.pushed = 0;
-        self.sink_start = None;
-        self.drained = 0;
-        self.frac = 0;
-        self.drained_from = 0;
-        self.drained_ms = 0;
-        self.drain_step = 0;
-    }
-
-    /// Force a fresh session on the next [`due`] even at an unchanged rate —
-    /// the session-identity signal (a new stream-frame numbering starts at 0).
-    pub fn rekey(&mut self) {
-        self.reset();
-    }
-
-    /// Session frames pushed so far — the absolute frame index the *next*
-    /// [`due`]'d frame will have. Producers stamp sub-block events with this.
+    /// Output-frame frontier at which an event arriving now should be stamped.
     pub fn pushed(&self) -> u64 {
         self.pushed
     }
 
-    /// Session frames consumed by the sink as of the last [`due`] — the
-    /// drain clock that guest-visible cursors and event delivery derive from.
-    pub fn drained(&self) -> u64 {
-        self.drained
+    fn set_nominal_rate(&mut self, rate: u32) {
+        if self.nominal_rate == rate {
+            return;
+        }
+        self.nominal_rate = rate;
+        self.mix_rate = rate;
+        self.frac = 0;
+        self.primed = false;
     }
 
-    /// Frames due at `rate` after `dt_ms` of virtual time. The caller must
-    /// push exactly this many frames to the sink before the next call.
-    pub fn due<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        rate: u32,
-        dt_ms: u64,
-        block_frames: usize,
-    ) -> u64 {
-        let block = block_frames.max(1) as u64;
-        if rate != self.rate {
-            // New session (first tick or a different sink rate): re-key and
-            // re-anchor the producer to the active device's counters.
-            let fill = min_fill(rate);
-            self.rate = rate;
-            self.use_pos = fill.is_some();
-            self.fill = fill.unwrap_or(0);
-            self.pushed = 0;
-            self.sink_start = None;
-            self.frac = 0;
-            self.drained_from = 0;
-            self.drain_step = 0;
+    fn update_rate(&mut self, written: u64, consumed: u64, target: u32) {
+        if consumed == self.last_consumed {
+            return;
         }
-        if self.use_pos {
-            let played = consumed().unwrap_or(0);
-            let mut start = self.sink_start.unwrap_or(played);
-            if played < start {
-                // The device restarted its counter. Re-key the producer to the
-                // new clock rather than wedging its drain at zero.
-                self.pushed = 0;
-                start = played;
-                self.frac = 0;
-                self.drained_from = 0;
-                self.drained_ms = 0;
-                self.drain_step = 0;
-            }
-            self.sink_start = Some(start);
-            let coarse = played - start;
-            // The sink confirms `consumed` one whole buffer per completion IRQ — a
-            // coarse staircase. Interpolate it with real time so `drained` advances
-            // evenly, like a real DMA cursor: re-anchor on each step, cap the
-            // fraction at the last step (the buffer, learned from the step itself)
-            // so it stays monotonic and never crosses the next, unconfirmed
-            // boundary. This one smooth drain feeds BOTH the deficit below and the
-            // guest-visible SB cursor — so production and that cursor advance
-            // evenly instead of in buffer-sized bursts (the SFX-crackle source).
-            let now = machine.get_ticks();
-            if coarse != self.drained_from {
-                self.drain_step = coarse - self.drained_from;
-                self.drained_from = coarse;
-                self.drained_ms = now;
-            }
-            let frac =
-                (now.saturating_sub(self.drained_ms) * rate as u64 / 1000).min(self.drain_step);
-            self.drained = coarse + frac;
-            // Refill the deficit to keep `fill` frames queued ahead of the drain.
-            // Production paces on this smoothed drain — real-time between the
-            // completion anchors — so it tracks consumption without the coarse
-            // buffer-step bursts (and without a get_ticks drift servo: the anchors
-            // pin it to the true drain). At startup the deficit is the whole
-            // `fill`, which primes the pipe in one go.
-            let deficit = (self.drained + self.fill as u64).saturating_sub(self.pushed);
-            let due = deficit / block * block;
-            self.pushed += due;
-            due
-        } else {
-            self.frac += rate as u64 * dt_ms;
-            let available = self.frac / 1000;
-            let due = available / block * block;
-            self.frac -= due * 1000;
-            self.pushed += due;
-            self.drained = self.pushed; // instant consumer: drained ≡ pushed
-            due
-        }
+        self.last_consumed = consumed;
+        // Sample queue error only when the device reports a completion. At
+        // that instant `consumed` is current; between completions its block
+        // staircase would otherwise look like a false latency ramp.
+        let queued = written.saturating_sub(consumed) as i64;
+        let error = i64::from(target) - queued;
+        let trim_ppm = (error * TRIM_PPM_PER_FRAME)
+            .clamp(-MAX_TRIM_PPM, MAX_TRIM_PPM);
+        self.mix_rate = ((u64::from(self.nominal_rate)
+            * (1_000_000i64 + trim_ppm) as u64)
+            / 1_000_000) as u32;
     }
 }
 
-impl Default for Pace {
+impl Default for Producer {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// One span the global output pump asks the active personality to mix.
-pub struct AudioSpan<'a> {
-    pub rate: u32,
-    pub base_frame: u64,
-    pub drained_frame: u64,
-    pub pushed_frame: u64,
-    pub frames: &'a mut [(i32, i32)],
-}
-
-const MIX_CHUNK: usize = 128;
-
-/// Advance the one physical output timeline and ask the active personality to
-/// contribute each due span. Personalities only mix; this function submits the
-/// result to the sink.
+/// Advance the CPU-clocked producer, ask the active personality for those
+/// frames, and append them to the physical sink. The sink clock only trims the
+/// effective mix rate; it never decides when an emulated device advances.
 pub fn pump<A: crate::Arch>(
     machine: &mut A,
-    pace: &mut Pace,
+    producer: &mut Producer,
     dt_ms: u64,
     mut mix: impl FnMut(&mut A, AudioSpan<'_>),
 ) {
-    let rate = rate();
-    let mut due = pace.due(machine, rate, dt_ms, MIX_CHUNK);
-    let mut base = pace.pushed() - due;
-    let drained = pace.drained();
-    let pushed = pace.pushed();
+    let (nominal_rate, mut written, consumed, fill, present) = {
+        let sink = SINK.lock();
+        let rate = sink.rate();
+        let (written, consumed) = sink.counters();
+        (rate, written, consumed, sink.min_fill(rate), sink.present())
+    };
+
+    producer.set_nominal_rate(nominal_rate);
+    if producer.sink_present != present {
+        producer.sink_present = present;
+        producer.primed = false;
+    }
+    if present {
+        if written <= consumed {
+            // The producer was not running yet or genuinely missed the pipe.
+            // Catch its physical write cursor up here, on the producer side;
+            // completion accounting itself never fabricates written frames.
+            let mut sink = SINK.lock();
+            sink.recover_after_display_stall();
+            written = sink.counters().0;
+        }
+        if producer.primed {
+            producer.update_rate(written, consumed, fill);
+        } else {
+            producer.last_consumed = consumed;
+            producer.mix_rate = nominal_rate;
+        }
+    } else {
+        producer.mix_rate = nominal_rate;
+    }
+
     let gain_q16 = crate::kernel::osd::master_gain_q16();
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
+
+    // Prime physical latency with silence, not thirty milliseconds of source
+    // time. The emulated SB and synths begin advancing only in the CPU-clocked
+    // production loop below.
+    if present && !producer.primed {
+        let mut prime = (consumed + u64::from(fill)).saturating_sub(written);
+        while prime > 0 {
+            let run = usize::try_from(prime.min(MIX_CHUNK as u64)).unwrap();
+            frames[..run].fill((0, 0));
+            play(&frames[..run], gain_q16);
+            prime -= run as u64;
+        }
+        producer.primed = true;
+    }
+
+    producer.frac += u64::from(producer.mix_rate) * dt_ms;
+    let mut due = producer.frac / 1000;
+    producer.frac -= due * 1000;
+    let mut base = producer.pushed;
+    let pushed = base + due;
     while due > 0 {
         let run = usize::try_from(due.min(MIX_CHUNK as u64)).unwrap();
         frames[..run].fill((0, 0));
         mix(machine, AudioSpan {
-            rate,
+            rate: producer.mix_rate,
             base_frame: base,
-            drained_frame: drained,
-            pushed_frame: pushed,
             frames: &mut frames[..run],
         });
-        play(machine, &frames[..run], gain_q16);
+        play(&frames[..run], gain_q16);
         base += run as u64;
         due -= run as u64;
     }
+    producer.pushed = pushed;
 }

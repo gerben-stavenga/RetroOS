@@ -352,8 +352,8 @@ fn advance(d: &mut Ac97) -> u64 {
 /// fill must always span the start prime (`PRIME_BUFS` full buffers) plus a
 /// partial buffer of slack — below that the engine halts at LVI while the
 /// producer waits for consumption, and the pipe deadlocks.
-/// The sink is up and reports a play position (so `sound::min_fill` returns the
-/// universal pipe depth). The pipe latency itself is not this driver's to set.
+/// The sink is up and can use this card's completion clock for latency feedback.
+/// The pipe latency itself is not this driver's to set.
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }

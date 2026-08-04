@@ -93,8 +93,7 @@ pub fn irq_line() -> Option<u8> {
     }
 }
 
-/// The sink is up and reports a play position (so `sound::min_fill` returns the
-/// universal pipe depth).
+/// The sink is up and can use this card's completion clock for latency feedback.
 pub fn present() -> bool {
     PRESENT.load(Ordering::Relaxed)
 }
@@ -548,4 +547,3 @@ fn dma_pos_bytes() -> u32 {
     }
     ((words - 1).wrapping_sub(count as u32) % words) * 2
 }
-
