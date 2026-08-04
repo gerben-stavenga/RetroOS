@@ -29,7 +29,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
-use crate::kernel::sound::Format;
 
 // ── PCI config space (0xCF8 address / 0xCFC data) ───────────────────────────
 
@@ -70,35 +69,25 @@ const DMA_CHANNEL: usize = 5;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
-/// Use the FULL 32-entry BDL. A shorter ring leaves entries 16..31 mirroring
-/// 0..15, and the bus master replays them when its index runs past LVI — an
-/// audible ~ring-length echo. 32 distinct buffers, no mirror.
-const NUM_BUF: usize = 32;
-// 2 KB = 512 stereo frames ≈ 11.6 ms @ 44.1 kHz. This is the completion-IRQ
-// granularity (one interrupt per buffer), NOT the pipe depth — the pipe is the
-// universal `sound::min_fill`. A 30-ms pipe keeps about 2.6 buffers queued,
-// leaving a complete-buffer refill margin while halving the old 256-frame
-// completion-IRQ rate.
-const BUF_BYTES: usize = 0x800;
-/// Prefill two complete buffers before starting the bus master.
-const PRIME_BUFS: usize = 2;
+/// Use the FULL 32-entry BDL — one descriptor per ring block, no mirrors.
+/// Geometry is the sink engine's (`sound::Ring`); this is the count of BDL
+/// entries the device programs, which must agree with it.
+use crate::kernel::sound::{BUF_BYTES, NUM_BUF};
 
+/// What only an AC'97 knows. The ring, the counters and the underrun test
+/// belong to the sink engine; this is the bus-master programming and the
+/// CIV bookkeeping that turns a completion into "N blocks played".
 struct Ac97 {
     nam: u16,       // NAM I/O base
     nabm: u16,      // NABM I/O base
     dma_va: usize,  // kernel VA of the mapped channel buffer
     dma_phys: u32,  // its physical base address (for the codec / BDL)
-    cur_buf: usize, // ring buffer currently being filled
-    cur_off: usize, // byte offset within `cur_buf`
-    running: bool,  // bus master started
-    rate: u32,      // last programmed sample rate (Hz)
-    /// Pipe counters for [`position`] (the DAC runs at the source rate — no
-    /// resampler — so these are directly in source frames). `written` counts
-    /// frames accepted by `submit`; `consumed_bufs` accumulates completed ring
-    /// buffers from hardware CIV deltas observed when an IRQ wakes the driver.
-    written: u64,
-    consumed_bufs: u64,
+    /// Last CIV seen, for accumulating block deltas across ring wraps.
     last_civ: u8,
+    /// Blocks the engine has been told about, so a coalesced interrupt emits
+    /// the difference rather than one event.
+    reported: u64,
+    played: u64,
 }
 
 static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
@@ -230,18 +219,12 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         nam, nabm,
         dma_va: DMA_WIN_VA,
         dma_phys,
-        cur_buf: 0,
-        cur_off: 0,
-        running: false,
-        rate: 0,
-        written: 0,
-        consumed_bufs: 0,
         last_civ: 0,
+        reported: 0,
+        played: 0,
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
-    machine.outb(nabm + PO_LVI, 0);
-
     *AC97.lock() = Some(d);
     true
 }
@@ -251,11 +234,6 @@ impl Ac97 {
     fn buf_phys(&self, i: usize) -> u32 {
         self.dma_phys + (BDL_BYTES + i * BUF_BYTES) as u32
     }
-    /// Kernel VA of PCM ring buffer `i`.
-    fn buf_va(&self, i: usize) -> usize {
-        self.dma_va + BDL_BYTES + i * BUF_BYTES
-    }
-
     /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Control word
     /// carries IOC — one interrupt per completed buffer drives the event-loop
     /// audio track. NUM_BUF == 32 so every entry maps a distinct buffer — no
@@ -273,95 +251,91 @@ impl Ac97 {
         }
     }
 
-    fn set_rate<A: crate::Arch>(&mut self, machine: &mut A, rate: u32) {
-        if rate != self.rate && rate != 0 {
-            machine.outw(self.nam + NAM_PCM_DAC_RATE, rate as u16);
-            self.rate = rate;
-        }
-    }
-
-    /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
-    fn submit<A: crate::Arch>(&mut self, machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-        self.set_rate(machine, rate);
-        let fb = fmt.frame_bytes();
-        if fb == 0 {
-            return;
-        }
-        for i in 0..bytes.len() / fb {
-            // No run-ahead cap needed: the deficit producer only ever pushes
-            // enough to reach `min_fill` (2 buffers) ahead of the drain.
-            let (l, r) = fmt.frame(bytes, i);
-            let p = self.buf_va(self.cur_buf) + self.cur_off;
-            unsafe {
-                core::ptr::write_volatile(p as *mut u16, l as u16);
-                core::ptr::write_volatile((p + 2) as *mut u16, r as u16);
-            }
-            self.written += 1;
-            self.cur_off += 4;
-            if self.cur_off >= BUF_BYTES {
-                // Buffer complete: make it the last valid index. Start the bus
-                // master once a small cushion is primed, then advance.
-                machine.outb(self.nabm + PO_LVI, self.cur_buf as u8);
-                if !self.running && self.cur_buf + 1 >= PRIME_BUFS {
-                    let cr = machine.inb(self.nabm + PO_CR);
-                    machine.outb(self.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
-                    self.running = true;
-                }
-                self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
-                self.cur_off = 0;
-            }
-        }
-    }
 }
 
-/// Stream a block of source PCM to the AC'97 codec (called by `sound::play` when
-/// a codec was discovered).
-pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-    let mut g = AC97.lock();
-    if let Some(dev) = g.as_mut() {
-        dev.submit(machine, rate, fmt, bytes);
-    }
-}
+// ── the primitives the sink engine asks of a device ─────────────────────────
 
-/// Pipe counters for `sound::position`: `(written, consumed)` in source
-/// frames (the DAC is programmed to the source rate — 1 frame here is 1
-/// source frame). `consumed` = completed buffers (CIV-delta accumulated)
-/// plus PICB progress inside the current one; it stalls when the bus
-/// master halts at LVI, which is exactly what the slaved producer needs
-/// to see (its clock stops until it queues more).
-pub fn position<A: crate::Arch>(machine: &mut A) -> Option<(u64, u64)> {
-    let mut g = AC97.lock();
-    let dev = g.as_mut()?;
+/// Where the engine writes PCM: the ring starts after the BDL page.
+pub fn adopt<A: crate::Arch>(machine: &mut A) -> Option<(usize, u32)> {
+    let g = AC97.lock();
+    let d = g.as_ref()?;
     let _ = machine;
-    if !dev.running {
-        return Some((dev.written, 0));
-    }
-    // `on_irq` maintains `consumed_bufs` from CIV deltas, so position itself
-    // performs no hardware polling.
-    let frames_per_buf = (BUF_BYTES / 4) as u64;
-    Some((dev.written, dev.consumed_bufs * frames_per_buf))
+    Some((d.dma_va + BDL_BYTES, d.dma_phys + BDL_BYTES as u32))
 }
 
-/// Service a PCM-out completion interrupt (canonical `Irq::Hw(irq_line())`
-/// routed here by `sound::on_irq`). The interrupt is only a wakeup:
-/// consumption comes from the hardware CIV delta, so delayed/coalesced IRQs do
-/// not permanently skew the playback clock. Returns false when a shared INTx
-/// line fired for another device.
-pub fn on_irq<A: crate::Arch>(machine: &mut A) -> bool {
+/// Program the DAC rate. Variable-rate audio was enabled at bring-up, so the
+/// codec plays the source rate directly — no resampler in this path.
+pub fn set_rate<A: crate::Arch>(machine: &mut A, rate: u32) {
+    let Some(nam) = AC97.lock().as_ref().map(|d| d.nam) else { return };
+    machine.outw(nam + NAM_PCM_DAC_RATE, rate as u16);
+}
+
+/// Start the bus master, and give it a full ring of runway.
+///
+/// LVI tracks the PLAY cursor, not the producer: it is kept one block behind
+/// CIV, so the engine has 31 blocks ahead of it and never arrives. That is
+/// what makes an AC'97 free-run like the other devices — the hardware halts
+/// when `CIV == LVI` (setting DCH/LVBCI/CELV) and only an LVI write restarts
+/// it, so a trailing LVI is the difference between a continuous transfer and
+/// one that stops every ring.
+pub fn start<A: crate::Arch>(machine: &mut A) {
     let mut g = AC97.lock();
-    let Some(dev) = g.as_mut() else { return false };
-    let status = machine.inw(dev.nabm + PO_SR);
+    let Some(d) = g.as_mut() else { return };
+    d.last_civ = 0;
+    d.reported = 0;
+    d.played = 0;
+    machine.outb(d.nabm + PO_LVI, (NUM_BUF - 1) as u8);
+    let cr = machine.inb(d.nabm + PO_CR);
+    machine.outb(d.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
+}
+
+/// Stop the bus master.
+pub fn halt<A: crate::Arch>(machine: &mut A) {
+    let mut g = AC97.lock();
+    let Some(d) = g.as_mut() else { return };
+    let cr = machine.inb(d.nabm + PO_CR);
+    machine.outb(d.nabm + PO_CR, cr & !PO_CR_RUN);
+}
+
+/// Is this interrupt ours, and how many blocks played since we last said?
+pub fn ack<A: crate::Arch>(machine: &mut A) -> (bool, u64) {
+    let mut g = AC97.lock();
+    let Some(d) = g.as_mut() else { return (false, 0) };
+    let status = machine.inw(d.nabm + PO_SR);
     if status & PO_SR_INTR == 0 {
-        return false;
+        return (false, 0);
     }
-    if dev.running {
-        let civ = machine.inb(dev.nabm + PO_CIV) % NUM_BUF as u8;
-        dev.consumed_bufs +=
-            ((civ + NUM_BUF as u8 - dev.last_civ) % NUM_BUF as u8) as u64;
-        dev.last_civ = civ;
+    let blocks = advance(d, machine);
+    machine.outw(d.nabm + PO_SR, status & PO_SR_INTR);
+    (true, blocks)
+}
+
+/// Blocks played since the last report, without requiring an interrupt.
+pub fn poll<A: crate::Arch>(machine: &mut A) -> u64 {
+    let mut g = AC97.lock();
+    match g.as_mut() {
+        Some(d) => advance(d, machine),
+        None => 0,
     }
-    machine.outw(dev.nabm + PO_SR, status & PO_SR_INTR);
-    true
+}
+
+/// Read CIV, accumulate the block delta, and keep LVI one block behind it.
+///
+/// Bumping LVI here is also the recovery path: if we were ever late enough
+/// that CIV caught LVI, the engine halted with DCH set, and this write is
+/// exactly what the hardware needs to resume (`CR_RPBM && DCH` → clear DCH,
+/// re-fetch the descriptor). So a late service costs a stall, never a wedge.
+fn advance<A: crate::Arch>(d: &mut Ac97, machine: &mut A) -> u64 {
+    let civ = machine.inb(d.nabm + PO_CIV) % NUM_BUF as u8;
+    let delta = (civ + NUM_BUF as u8 - d.last_civ) % NUM_BUF as u8;
+    if delta != 0 {
+        d.played += delta as u64;
+        d.last_civ = civ;
+        machine.outb(d.nabm + PO_LVI, (civ + NUM_BUF as u8 - 1) % NUM_BUF as u8);
+    }
+    let fresh = d.played.saturating_sub(d.reported);
+    d.reported = d.played;
+    fresh
 }
 
 /// Minimum pipe fill for a position-slaved producer, in source frames: the
