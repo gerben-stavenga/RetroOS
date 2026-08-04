@@ -189,6 +189,41 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    /// Hand this thread the machine's Sound Blaster, returning whatever it
+    /// did not take. Moves with the console, and for the same reason: it is
+    /// one piece of machine hardware and the owner is whoever the machine is
+    /// currently showing. A Linux thread has no use for it and hands it
+    /// straight back; so does a DOS thread on a machine running the card as
+    /// the kernel mixer's sink, because there the sink never let it go and
+    /// this is `None`.
+    pub fn adopt_sb<A2: crate::Arch>(
+        &mut self,
+        machine: &mut A2,
+        card: Option<crate::kernel::drivers::sb16::SbCard>,
+    ) -> Option<crate::kernel::drivers::sb16::SbCard>
+    where
+        A2: crate::Arch,
+    {
+        match (self, card) {
+            (Self::Dos(d), Some(card)) => {
+                d.pc.sb.adopt_card(machine, card);
+                None
+            }
+            (_, card) => card,
+        }
+    }
+
+    /// Take the card back off this thread, if it has it.
+    pub fn release_sb<A2: crate::Arch>(
+        &mut self,
+        machine: &mut A2,
+    ) -> Option<crate::kernel::drivers::sb16::SbCard> {
+        match self {
+            Self::Dos(d) => d.pc.sb.release_card(machine),
+            Self::Linux(_) => None,
+        }
+    }
+
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
     pub fn suspend(
@@ -826,6 +861,7 @@ pub fn exit_thread<A: crate::Arch>(
     tid: usize,
     exit_code: i32,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
 
@@ -840,6 +876,13 @@ pub fn exit_thread<A: crate::Arch>(
             let display = thread.personality.suspend(machine, bios_workspace);
             assert!(display_handoff.is_none(), "unconsumed display handoff");
             *display_handoff = Some(display);
+        }
+        // The card outlives its holder: whatever the dying thread had goes
+        // back into the handoff for the next owner, exactly as the display
+        // token does. A thread that never had it yields `None`.
+        if let Some(card) = thread.personality.release_sb(machine) {
+            assert!(sb_handoff.is_none(), "unconsumed SB handoff");
+            *sb_handoff = Some(card);
         }
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),

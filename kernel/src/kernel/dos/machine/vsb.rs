@@ -43,6 +43,7 @@
 //! the guest's address space is ours to reach, never the card's.
 
 use crate::Regs;
+use crate::kernel::drivers::sb16::SbCard;
 use alloc::boxed::Box;
 use super::*;
 
@@ -137,29 +138,6 @@ pub struct Blaster {
     pub dma16: u8,    // BLASTER H — guest's 16-bit vDMA channel (5..7)
 }
 
-/// The unique physical Sound Blaster, as a capability. Neither `Copy` nor
-/// `Clone`: holding it IS the authority to drive the card, and it carries the
-/// wiring the holder needs to reach it. It lives in exactly one place —
-/// this thread's device when the guest drives real silicon, or the mixer's
-/// sink when the mixer does.
-///
-/// Everything here used to be four fields on `SoundBlaster` with `0xFF`/`0`
-/// standing in for "no card". Presence of the value is the answer now, so the
-/// passthrough paths are total instead of sentinel-guarded.
-pub struct NativeSb {
-    /// Where the card actually decodes — the passthrough target. The guest's
-    /// own base (`Blaster.io_base`) may differ in mixed mode.
-    pub base: u16,
-    /// The line the card really asserts on completion, relayed to the guest's
-    /// BLASTER IRQ.
-    pub irq: u8,
-    /// The real 8237 channels the card is strapped to. A guest transfer on its
-    /// own BLASTER channel must drive THESE.
-    pub dma8: u8,
-    /// `None` on a pre-SB16 card, which has no 16-bit channel at all.
-    pub dma16: Option<u8>,
-}
-
 /// This card is real silicon, XOR it is a software model — never both, and
 /// never neither. Which one it is decides what the whole machine side of the
 /// SB even *means*: there is no play cursor to interpolate on a real card
@@ -169,8 +147,9 @@ pub struct NativeSb {
 /// matching — which is also what proves the other one is not there.
 pub enum SbDevice {
     /// A physical card answers: the guest's DSP traffic is forwarded to it and
-    /// its DMA buffer aliased onto the real channel.
-    Native(PassthroughSb),
+    /// its DMA buffer aliased onto the real channel. This thread HOLDS the
+    /// machine's card for as long as this variant exists.
+    Native(NativeSb),
     /// No card answers: `//lib:sound`'s passive card runs, and this file feeds
     /// it the clock, the interrupt line, the guest ring and the pipe depth.
     ///
@@ -181,18 +160,132 @@ pub enum SbDevice {
     Emulated(Box<EmulatedSb>),
 }
 
+impl SbDevice {
+    /// Snapshot the silicon into the model and release it — the SB's
+    /// `save_from_hardware`, except that nothing is read back off the card
+    /// because nothing can be: the shadow already knows, having watched every
+    /// DSP write go past.
+    ///
+    /// The card is quiesced on the way out (DSP reset, its channels masked) so
+    /// it is handed over idle rather than mid-transfer. The guest keeps
+    /// playing into the model, which resumes from exactly the rate, block size
+    /// and format the guest last programmed.
+    fn into_emulated<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        b: &Blaster,
+    ) -> (Self, Option<SbCard>) {
+        match self {
+            Self::Emulated(emu) => (Self::Emulated(emu), None),
+            Self::Native(mut pt) => {
+                pt.release(machine, b);
+                let NativeSb { card, shadow, .. } = pt;
+                (Self::Emulated(shadow), Some(card))
+            }
+        }
+    }
+
+    /// Make a card this thread has just been handed authoritative, programmed
+    /// into the model's state — the SB's `restore_to_hardware`.
+    ///
+    /// Order matters and is the card's, not ours: reset clears the DSP, then
+    /// the speaker and the stream parameters, then the start command last,
+    /// because on a real DSP the start command is what latches the format and
+    /// begins the transfer. The DMA side needs nothing here — the virtual 8237
+    /// still holds this guest's programming, and the next `maybe_remap`
+    /// re-arms the real controller from it.
+    fn present<A: crate::Arch>(self, machine: &mut A, card: SbCard) -> Self {
+        let Self::Emulated(shadow) = self else {
+            panic!("SB already owns the card");
+        };
+        let st = shadow.core.dsp_state();
+        let base = card.base;
+        dsp_reset(machine, base);
+        dsp_write(machine, base, if st.speaker { 0xD1 } else { 0xD3 });
+        // Rate: an SB16 takes it directly; anything older only understands the
+        // time constant, and 256 − 1e6/rate is its inverse.
+        if card.dma16.is_some() {
+            dsp_write(machine, base, 0x41);
+            dsp_write(machine, base, (st.rate >> 8) as u8);
+            dsp_write(machine, base, st.rate as u8);
+        } else {
+            let tc = 256u32.saturating_sub(1_000_000 / st.rate.max(1));
+            dsp_write(machine, base, 0x40);
+            dsp_write(machine, base, tc as u8);
+        }
+        dsp_write(machine, base, 0x48);
+        dsp_write(machine, base, st.block as u8);
+        dsp_write(machine, base, (st.block >> 8) as u8);
+        if st.playing {
+            // Start command: 8-bit legacy opcodes carry the format in the
+            // opcode; 16-bit ones carry it in a mode byte.
+            if st.bits == 16 {
+                dsp_write(machine, base, if st.single { 0xB0 } else { 0xB6 });
+                // bit5 stereo, bit4 signed — 16-bit DMA is always signed.
+                dsp_write(machine, base, 0x10 | if st.stereo { 0x20 } else { 0 });
+                dsp_write(machine, base, st.block as u8);
+                dsp_write(machine, base, (st.block >> 8) as u8);
+            } else {
+                dsp_write(machine, base, if st.single { 0xC0 } else { 0xC6 });
+                dsp_write(machine, base, if st.stereo { 0x20 } else { 0 });
+                dsp_write(machine, base, st.block as u8);
+                dsp_write(machine, base, (st.block >> 8) as u8);
+            }
+        }
+        crate::dbg_println!(
+            "[sb] card taken: {}Hz {}bit {} {} block={} speaker={} playing={}",
+            st.rate, st.bits, if st.stereo { "stereo" } else { "mono" },
+            if st.single { "single" } else { "auto" }, st.block, st.speaker, st.playing
+        );
+        Self::Native(NativeSb::new(card, shadow))
+    }
+}
+
+/// DSP reset: 1 then 0 to `base+6`, the power-on handshake.
+fn dsp_reset<A: crate::Arch>(machine: &mut A, base: u16) {
+    machine.outb(base + 0x06, 1);
+    machine.outb(base + 0x06, 0);
+}
+
+/// One DSP command/data byte, once the write buffer says it is ready.
+fn dsp_write<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
+    for _ in 0..100_000 {
+        if machine.inb(base + 0x0C) & 0x80 == 0 {
+            break;
+        }
+    }
+    machine.outb(base + 0x0C, byte);
+}
+
 /// The machine side of a REAL card: the physical card itself plus everything
 /// needed to keep a guest's illusion over it — the DSP command tracker behind
 /// the synthesized busy bit, and the guest-buffer↔channel-buffer alias.
 ///
 /// None of this is state a card *has*; it is state about *this guest's* use of
-/// one, which is why it sits here and not in `NativeSb`: handing the card on
+/// one, which is why it sits here and not in [`SbCard`]: handing the card on
 /// to the mixer's sink moves `card` out and leaves the binding behind to be
 /// torn down.
-pub struct PassthroughSb {
-    /// The card. Passthrough is total in this variant — there is no "maybe a
-    /// card" state to guard, because the variant is the guarantee.
-    pub card: NativeSb,
+pub struct NativeSb {
+    /// The machine's card, held. Passthrough is total in this variant — there
+    /// is no "maybe a card" state to guard, because possession is the
+    /// guarantee: this value cannot be copied or conjured, only moved in.
+    pub card: SbCard,
+    /// The library card, kept in lockstep with the silicon: every DSP write
+    /// the guest makes goes through it on the way to the hardware.
+    ///
+    /// Not a second card — the XOR still holds, and this one drives nothing.
+    /// It is the only record of what the silicon was TOLD, because a DSP will
+    /// not say: rate, block size, transfer format and speaker are all
+    /// write-only. Without it, a card that changes hands can only be restarted
+    /// from scratch; with it, [`SbDevice::into_emulated`] hands over a model
+    /// that already knows the stream, and [`SbDevice::present`] programs a
+    /// fresh card back into exactly the state its guest believes it is in.
+    ///
+    /// This is what the 8237 shadow already does for the DMA half — the
+    /// virtual controller captures every channel program, so `resume` can
+    /// replay it. The DSP half was the missing piece: it holds the *rate*,
+    /// which the 8237 has no idea about.
+    shadow: Box<EmulatedSb>,
     /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
     /// can answer the wiring registers from the guest's own numbers.
     mixer_idx: u8,
@@ -256,10 +349,11 @@ pub struct SoundBlaster {
     pub device: SbDevice,
 }
 
-impl PassthroughSb {
-    fn new(card: NativeSb) -> Self {
+impl NativeSb {
+    fn new(card: SbCard, shadow: Box<EmulatedSb>) -> Self {
         Self {
             card,
+            shadow,
             mixer_idx: 0,
             bound_chan: 0xFF, bound_host: 0xFF,
             bound_gpa: 0, bound_len: 0, bound_vpage: 0, bound_pages: 0,
@@ -315,6 +409,27 @@ impl SoundBlaster {
         }
     }
 
+    /// Take the machine's card: this thread's SB stops being a model and
+    /// becomes the silicon, programmed into the state the model was in.
+    ///
+    /// The mirror of `BiosVga::present`, and for the same reason — the guest
+    /// must not be able to tell that its card changed identity underneath it.
+    pub fn adopt_card<A: crate::Arch>(&mut self, machine: &mut A, card: SbCard) {
+        let dev = core::mem::replace(&mut self.device, SbDevice::Emulated(EmulatedSb::new()));
+        self.device = dev.present(machine, card);
+    }
+
+    /// Give the card up: snapshot it into the model and hand the silicon on.
+    /// The mirror of `BiosVga::into_emulated`. `None` if this thread never had
+    /// it, which is every thread on a machine without a card.
+    pub fn release_card<A: crate::Arch>(&mut self, machine: &mut A) -> Option<SbCard> {
+        let Self { blaster, device } = self;
+        let dev = core::mem::replace(device, SbDevice::Emulated(EmulatedSb::new()));
+        let (dev, card) = dev.into_emulated(machine, blaster);
+        *device = dev;
+        card
+    }
+
     /// SB ports this card decodes — the dispatch guard for both devices: the
     /// DSP/mixer block `[io_base, io_base+0x10)` and the OPL2/3 FM window
     /// 0x388-0x38B. BLASTER's declaration, so it is the same question whether
@@ -338,7 +453,7 @@ impl SoundBlaster {
         let Self { blaster, device } = self;
         match device {
             SbDevice::Emulated(emu) => emu.write(machine, dma, blaster, p, val),
-            SbDevice::Native(pt) => pt.write(machine, blaster, p, val),
+            SbDevice::Native(pt) => pt.write(machine, dma, blaster, p, val),
         }
     }
 
@@ -412,24 +527,18 @@ impl SoundBlaster {
         }
     }
 
-    /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string, and settle
-    /// which device answers for it. Unknown or missing tokens leave the SB16
+    /// Apply this thread's `BLASTER=Axxx Iy Dz Hw …` env string: what the
+    /// GUEST believes its card to be. Unknown or missing tokens leave the SB16
     /// defaults. `env` is the raw DOS environment block (NUL-separated
     /// `KEY=VAL`, double-NUL terminated).
     ///
-    /// This is where the card is acquired: the boot probe's verdict plus a
-    /// readable strap is the whole condition. Anything less — no card, no
-    /// wiring to relay, or an owner who asked for the mixer — and the guest
-    /// gets the library card instead. There is no third state, so no
-    /// passthrough path anywhere below has to ask whether a card is there.
+    /// Which device answers is NOT decided here. That is ownership of the
+    /// machine's one card, and it moves on the thread path
+    /// ([`adopt_card`](Self::adopt_card)/[`release_card`](Self::release_card))
+    /// beside the display, not from a program's environment block — this used
+    /// to mint a fresh copy of the physical card out of frozen platform facts
+    /// on every exec, so two threads could each believe they had it.
     pub fn configure_from_env(&mut self, env: &[u8]) {
-        let plat = crate::kernel::platform::get();
-        self.device = match (plat.audio.sb_passthrough(), plat.sb_card, plat.sb_wiring) {
-            (true, Some(card), Some(w)) => SbDevice::Native(PassthroughSb::new(NativeSb {
-                base: card.base, irq: w.irq, dma8: w.dma8, dma16: w.dma16,
-            })),
-            _ => SbDevice::Emulated(EmulatedSb::new()),
-        };
         if let Some(val) = env_var(env, b"BLASTER") {
             for tok in val.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
                 let (key, rest) = (tok[0].to_ascii_uppercase(), &tok[1..]);
@@ -456,7 +565,7 @@ impl SoundBlaster {
 
 // ── The real card's machine side ────────────────────────────────────────────
 
-impl PassthroughSb {
+impl NativeSb {
     /// Ports inside the DSP window that MUST trap, as a mask of offsets from
     /// `io_base`. Everything else is granted to the guest outright (the IOPB
     /// is per-port), so DSP traffic on a correctly-declared card costs no
@@ -485,7 +594,18 @@ impl PassthroughSb {
         if self.card.base != b.io_base {
             return 0xFFFF;
         }
-        (1 << 0x04) | (1 << 0x05)
+        // Mixer index+data, and the two DSP write ports.
+        //
+        // The DSP window used to be granted outright, which cost no exits and
+        // lost every byte that went through it. That was affordable while the
+        // card never changed hands; it is not now. `0x0C` carries every
+        // command and parameter and `0x06` is the reset that voids them, so
+        // these two are exactly what the shadow needs to stay in lockstep —
+        // and no more: the DSP READ ports (0x0A/0x0E) stay granted, so status
+        // polls and data reads, which are the hot ones in a playback loop,
+        // still cost nothing. A driver programs the DSP per block, not per
+        // sample.
+        (1 << 0x04) | (1 << 0x05) | (1 << 0x06) | (1 << 0x0C)
     }
 
     /// The physical port for a guest port in the DSP window. BLASTER is the
@@ -556,7 +676,12 @@ impl PassthroughSb {
     /// Write a DSP/mixer/OPL port through to the real card. Only the mixer
     /// strap pair is filtered (see `trap_mask`); every other byte reaches the
     /// silicon verbatim, because the silicon is the card.
-    fn write<A: crate::Arch>(&mut self, machine: &mut A, b: &Blaster, p: u16, val: u8) {
+    fn write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
+        // Lockstep first: the model sees what the guest wrote, whether or not
+        // the byte reaches silicon below (a strap write does not). It decodes
+        // into the same fields the emulated card uses, so nothing here has to
+        // know what a time constant or a block size means.
+        self.shadow.write(machine, dma, b, p, val);
         if p == b.io_base + 0x04 {
             self.mixer_idx = val;
         } else if p == b.io_base + 0x05 && matches!(self.mixer_idx, 0x80 | 0x81) {

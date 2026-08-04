@@ -15,16 +15,13 @@ pub struct Platform {
     pub host: Host,
     pub display: Display,
     /// What sound hardware answered (probe fact).
+    ///
+    /// A *fact*, not a capability: that a Sound Blaster answered is frozen
+    /// here, but the card itself is a move-only value with one owner
+    /// (`sb16::SbCard`), and `Platform` hands out `&'static`. It used to be
+    /// mirrored here as `sb_card` + `sb_wiring`, which is how every DOS
+    /// thread came to mint its own copy of the machine's one card.
     pub audio_hw: AudioHw,
-    /// The real Sound Blaster's own report, when one answered: base,
-    /// generation, and (SB16 only) its strapped IRQ/DMA.
-    pub sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
-    /// The physical card's wiring: read from an SB16's mixer, or declared
-    /// for an early card (`SB_AUDIO=native <irq> <dma>`). This is the HOST
-    /// side — which line the PIC delivers and which 8237 channels we
-    /// reprogram. The guest's own IRQ/DMA are labels it picks in BLASTER;
-    /// the relay and the DMA remap translate between them.
-    pub sb_wiring: Option<crate::kernel::drivers::sb16::SbWiring>,
     pub firmware: Firmware,
     /// Preferred packed linear mode advertised by the native video BIOS.
     /// Discovered once at boot; selecting/mapping it still requires ownership
@@ -405,8 +402,7 @@ pub fn probe<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
 ) -> ProbedPlatform {
-    let mut sb_card = None;
-    let audio_hw = probe_audio(machine, &mut sb_card);
+    let audio_hw = probe_audio(machine);
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
     // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
@@ -483,10 +479,6 @@ pub fn probe<A: crate::Arch>(
             vbe_mode: None,
             vga_readback,
             audio_hw,
-            sb_card,
-            // Filled by `apply_audio_mode`, which also sees the owner's
-            // declaration for cards that cannot report their straps.
-            sb_wiring: sb_card.and_then(|c| c.wiring),
             // Policy comes later, when CONFIG.SYS is readable
             // (`apply_audio_mode`); until then, the hardware's default.
             audio: audio_hw.default_verdict(),
@@ -528,29 +520,45 @@ pub fn probe<A: crate::Arch>(
 /// bank, and buys GUS/GM wavetable music on an SB-only machine; `native`
 /// hands the card over and costs the kernel nothing, which is what a 386/486
 /// (and the 86Box/Bochs emulations of one) can afford.
-pub fn apply_audio_mode(
+/// This is also where the machine's Sound Blaster is MINTED, because it is the
+/// first moment its wiring can be known: an SB16 reports its own straps, but a
+/// pre-SB16 card's are physical jumpers that only `SB_AUDIO=native <irq> <dma>`
+/// can describe. The capability is returned to the caller to give to an owner;
+/// `None` means no card anyone can drive, whatever the mode says.
+pub fn apply_audio_mode<A: crate::Arch>(
+    machine: &mut A,
     mixed: bool,
     declared: Option<crate::kernel::drivers::sb16::SbWiring>,
-) {
+) -> Option<crate::kernel::drivers::sb16::SbCard> {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::apply_audio_mode before probe");
-    p.audio = match (p.audio_hw, mixed) {
-        (AudioHw::Sb, true) => Audio::SbSink,
-        (hw, _) => hw.default_verdict(),
+    let card = (p.audio_hw == AudioHw::Sb)
+        .then(|| crate::kernel::drivers::sb16::scan(machine, declared))
+        .flatten();
+    // The mode is a choice only where there is a card to choose about, and
+    // `mixed` additionally needs a card that can BE the sink: the kernel mixer
+    // drives 16-bit signed-stereo auto-init, which an SB Pro cannot do at all.
+    // Refuse it loudly rather than programming 16-bit commands into a card
+    // that has no 16-bit channel and calling the resulting silence a mode.
+    p.audio = match (&card, mixed) {
+        (Some(c), true) if c.dma16.is_some() => Audio::SbSink,
+        (Some(_), true) => {
+            crate::println!(
+                "Audio: SB_AUDIO=mixed needs a 16-bit DMA channel and this card has none — \
+                 running the card natively instead"
+            );
+            Audio::NativeSb
+        }
+        (Some(_), false) => Audio::NativeSb,
+        // No card: whatever else the machine has (or silence).
+        (None, _) => match p.audio_hw {
+            AudioHw::Sb => Audio::EmulatedSilent,
+            hw => hw.default_verdict(),
+        },
     };
-    // An SB16 reports its own straps; anything older needs the owner's.
-    p.sb_wiring = p.sb_card.and_then(|c| c.wiring).or(declared);
     crate::println!("Audio: {:?} ({})", p.audio,
         if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
-}
-
-/// Update the acting SB wiring after a restrap (startup's native-mode
-/// BLASTER reconciliation). `sb_card` keeps the probe-time snapshot — this
-/// is the wiring the relay/remap act on.
-pub fn set_sb_wiring(w: crate::kernel::drivers::sb16::SbWiring) {
-    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
-        .expect("platform::set_sb_wiring before probe");
-    p.sb_wiring = Some(w);
+    card
 }
 
 /// Complete boot-time display discovery after the pristine BIOS environment
@@ -597,9 +605,11 @@ pub fn probed() -> bool {
 /// installed a sink. Card presence is machine-wide, so the probe uses the
 /// canonical SB base 0x220 (a per-thread BLASTER override relocates the
 /// guest-visible base, not the card).
-fn probe_audio<A: crate::Arch>(machine: &mut A, card: &mut Option<crate::kernel::drivers::sb16::SbCard>) -> AudioHw {
-    *card = crate::kernel::drivers::sb16::scan(machine);
-    if card.is_some() {
+fn probe_audio<A: crate::Arch>(machine: &mut A) -> AudioHw {
+    // Presence only. Minting the card needs its wiring, and a pre-SB16 card's
+    // wiring comes from CONFIG.SYS — unreadable this early — so the capability
+    // is minted later, in `apply_audio_mode`.
+    if crate::kernel::drivers::sb16::answers(machine) {
         return AudioHw::Sb;
     }
     if crate::kernel::drivers::hda::scan(machine).is_some() {

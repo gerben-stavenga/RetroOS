@@ -32,10 +32,11 @@ pub fn verdict<A: crate::Arch>(
     tid: usize,
     action: thread::KernelAction,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
-    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, display_handoff) {
+    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, display_handoff, sb_handoff) {
         Some(n) => Some(n),
         None => focus_request(threads, tid),
     };
@@ -56,12 +57,13 @@ fn next_after<A: crate::Arch>(
     tid: usize,
     action: thread::KernelAction,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     match action {
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(
-            threads, machine, bios_workspace, tid, code, display_handoff,
+            threads, machine, bios_workspace, tid, code, display_handoff, sb_handoff,
         )),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
@@ -75,7 +77,7 @@ fn next_after<A: crate::Arch>(
         }
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
             crate::kernel::linux::handle_exec(
-                machine, threads, regs, tid, buffer, path, args, cwd, display_handoff,
+                machine, threads, regs, tid, buffer, path, args, cwd, display_handoff, sb_handoff,
             )
         }
         thread::KernelAction::Wait { pid, status_ptr } => {

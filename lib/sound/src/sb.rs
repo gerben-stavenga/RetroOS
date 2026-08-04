@@ -196,6 +196,29 @@ pub struct Fetch {
     pub source_frames: usize,
 }
 
+/// The DSP state a real Sound Blaster will not tell you.
+///
+/// Every field here is set by a write-only command — rate (0x40 time constant
+/// or 0x41 direct), block size (0x48), the transfer format carried by the
+/// start command itself, and speaker enable (0xD1/0xD3). None of it reads back
+/// off silicon, so a card that changes hands can only be restored from a model
+/// that watched the writes go past. That is what this carries.
+#[derive(Clone, Copy, Debug)]
+pub struct DspState {
+    pub rate: u32,
+    /// 8 or 16 bits per sample — also which DMA channel carries it.
+    pub bits: u8,
+    pub stereo: bool,
+    /// Single-cycle vs auto-init, as the start command chose.
+    pub single: bool,
+    /// DSP block size (0x48), in transfers minus one.
+    pub block: u16,
+    pub speaker: bool,
+    /// Whether a transfer is running: the difference between "program this
+    /// card" and "program it and start it".
+    pub playing: bool,
+}
+
 /// Maximum playback rate exposed by the emulated SB16 DSP.
 const MAX_OUTPUT_RATE: u32 = 44_100;
 
@@ -238,6 +261,10 @@ pub struct Sb {
     /// (PoP 1.0 then drops sound entirely, AdLib included).
     trigger_irq: u8,
 
+    /// DSP 0xD1/0xD3 speaker enable. Write-only on real silicon — it cannot
+    /// be read back — so this model is the only record of it, and a card
+    /// handed to a new owner is programmed from here.
+    speaker: bool,
     /// True between a `start playback` command and a stop/reset.
     playing: bool,
     rate: u32,        // output sample rate (Hz)
@@ -316,6 +343,7 @@ impl Sb {
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0, test_reg: 0,
             mixer_index: 0, mixer: Mixer::new(), irq_status: 0, trigger_irq: 0,
+            speaker: false,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
@@ -493,8 +521,12 @@ impl Sb {
             0xE8 => self.push_out(self.test_reg), // read test register back
             0xF2 => self.trigger_irq |= 0x01,    // trigger 8-bit IRQ (IRQ probe)
             0xF3 => self.trigger_irq |= 0x02,    // trigger 16-bit IRQ
-            0xD1 | 0xD4 => {}                    // speaker on / continue DMA
+            0xD1 => self.speaker = true,         // speaker on
+            0xD4 => {}                           // continue DMA
             0xD0 | 0xD3 | 0xD9 | 0xDA => {
+                if cmd == 0xD3 {
+                    self.speaker = false;
+                }
                 // Pause / speaker off / exit auto-init: playback stops, but the
                 // stream is held open through the hangover — effect chains
                 // pause-and-restart every animation frame.
@@ -781,6 +813,20 @@ impl Sb {
     /// Program-exit cleanup: stop the DSP and drop the FM chip so the next
     /// program sees a power-on card. Parking the host's sink is separate —
     /// it is shared with every other card.
+    /// The write-only stream state, for handing this card's programming to a
+    /// new owner (or to real silicon — see `vsb`'s native/emulated lift).
+    pub fn dsp_state(&self) -> DspState {
+        DspState {
+            rate: self.rate,
+            bits: self.bits,
+            stereo: self.stereo,
+            single: self.single,
+            block: self.block_param,
+            speaker: self.speaker,
+            playing: self.playing,
+        }
+    }
+
     pub fn reset_for_exit(&mut self) {
         self.playing = false;
         self.stream_hold = false;

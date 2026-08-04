@@ -103,7 +103,11 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         .unwrap_or_default();
     let mixed = boot.audio_mixed
         || sb_audio.split(|&b| b == b' ').next().is_some_and(|m| m.eq_ignore_ascii_case(b"mixed"));
-    crate::kernel::platform::apply_audio_mode(mixed, parse_sb_wiring(&sb_audio));
+    // Mints the machine's one Sound Blaster, if it has a drivable one. We hold
+    // it while reconciling it against BLASTER, then leave it unclaimed for
+    // whichever owner the mode selected to take.
+    let sb_card = crate::kernel::platform::apply_audio_mode(
+        machine, mixed, parse_sb_wiring(&sb_audio));
     let platform = crate::kernel::platform::get();
 
     // BLASTER describes THE CARD THE GUEST SEES.
@@ -132,8 +136,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // than rewrite: a mismatch is the owner's to fix, and silently
     // "correcting" it would break the games whose own configs agree with
     // CONFIG.SYS.
+    let mut sb_card = sb_card;
     if platform.audio == crate::kernel::platform::Audio::NativeSb
-        && let Some(card) = platform.sb_card
+        && let Some(card) = sb_card.as_mut()
     {
         let blaster = crate::kernel::dos::config_var(&master_env, b"BLASTER")
             .map(alloc::vec::Vec::from)
@@ -149,13 +154,6 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
                 "Audio: no BLASTER port declared, card is at {:#05X}", card.base
             ),
         }
-        if platform.sb_wiring.is_none() {
-            crate::println!(
-                "Audio: SB DSP {}.x cannot report its IRQ/DMA — declare the card's real ones as \
-                 `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS; DMA cannot be remapped until then",
-                card.dsp_major
-            );
-        }
         // An SB16's IRQ/DMA are soft-straps (mixer 0x80/0x81) — and NOT just
         // routing labels: the 0x81 high bits ENABLE the 16-bit DMA channel.
         // Bochs's SB16 powers up without one ("DMA 1/0"), so a guest's
@@ -167,11 +165,10 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         // the strap write without rerouting the actual line. The guest can
         // never undo this: the mixer pair always traps (vsb::trap_mask).
         if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu
-            && let (Some(strapped), Some(want)) = (card.wiring, blaster_wiring(&blaster))
-            && strapped != want
+            && let Some(want) = blaster_wiring(&blaster)
+            && card.wiring() != want
         {
-            let got = crate::kernel::drivers::sb16::strap_wiring(machine, card.base, want);
-            crate::kernel::platform::set_sb_wiring(got);
+            let got = card.restrap(machine, want);
             let h = |d: Option<u8>| d.map(|v| alloc::format!(" HDMA{}", v)).unwrap_or_default();
             if got == want {
                 crate::println!(
@@ -186,28 +183,34 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
                 );
             }
         }
-        // Start delivering the card's completion line — the ACTING one, read
-        // back after any restrap above, not the probe-time snapshot and not a
-        // guess. This is the only place an SB interrupt line is enabled: the
-        // machine's other lines stay masked, so a floating IRQ 7 (LPT1's line,
-        // and the 8259's spurious vector) never reaches `handle_irq` at all.
-        if let Some(w) = crate::kernel::platform::get().sb_wiring {
-            machine.route_isa_irq(w.irq);
-            crate::println!("Audio: SB IRQ{} routed", w.irq);
-        }
+        // Start delivering the card's completion line — the ACTING one, which
+        // is the card's own field after any restrap above, not a snapshot kept
+        // elsewhere and not a guess. This is the only place an SB interrupt
+        // line is enabled: the machine's other lines stay masked, so a floating
+        // IRQ 7 (LPT1's line, and the 8259's spurious vector) never reaches
+        // `handle_irq` at all.
+        machine.route_isa_irq(card.irq);
+        crate::println!("Audio: SB IRQ{} routed", card.irq);
 
-        // Judge the H-declaration against the acting straps, not the
-        // probe-time snapshot — the restrap just above may have enabled the
-        // 16-bit channel.
-        if crate::kernel::platform::get().sb_wiring.and_then(|w| w.dma16).is_none()
+        // Judge the H-declaration against the acting straps — the restrap just
+        // above may have enabled the 16-bit channel.
+        if card.dma16.is_none()
             && blaster.split(|&b| b == b' ').any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
         {
-            crate::println!(
-                "Audio: BLASTER declares a 16-bit channel but a DSP {}.x card has none",
-                card.dsp_major
-            );
+            crate::println!("Audio: BLASTER declares a 16-bit channel but this card has none");
         }
     }
+    // Reconciliation done: settle who the card belongs to. In mixer mode it
+    // goes to the sink driver for good; otherwise it travels — into whichever
+    // DOS thread holds the console, and back out when that thread gives up
+    // focus or exits, exactly as the display token does.
+    let sb_card = match (platform.audio, sb_card) {
+        (crate::kernel::platform::Audio::SbSink, Some(card)) => {
+            crate::kernel::drivers::sb16::adopt(machine, card);
+            None
+        }
+        (_, card) => card,
+    };
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
@@ -230,7 +233,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         .and_then(|native| bios_workspace.discover_vbe(machine, native));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
 
-    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen)
+    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card)
 }
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
@@ -383,7 +386,6 @@ fn init_device_policy<A: crate::Arch>(
     // interpreter) leaves the sound path on its port-window fallback.
     crate::kernel::drivers::ac97::init(machine);
     crate::kernel::drivers::hda::init(machine);
-    crate::kernel::drivers::sb16::init(machine);
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven
@@ -476,6 +478,7 @@ fn run<A: crate::Arch>(
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
     mut screen: crate::kernel::platform::VisibleScreen,
+    mut sb: Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> ! {
     // What to run headlessly, from whichever channel the backend has. QEMU and
     // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
@@ -514,9 +517,9 @@ fn run<A: crate::Arch>(
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
                 core::str::from_utf8(cwd).unwrap_or("?"));
-            screen = run_program_with_screen(
+            (screen, sb) = run_program_with_screen(
                 machine, bios_workspace, dos_template, threads, path, tail, cwd, master_env, boot.debug_watch,
-                screen,
+                screen, sb,
             );
         }
         crate::screenln!(screen, "All commands done — shutting down.");
@@ -535,9 +538,9 @@ fn run<A: crate::Arch>(
     crate::screenln!(screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
     loop {
-        screen = run_program_with_screen(
+        (screen, sb) = run_program_with_screen(
             machine, bios_workspace, dos_template, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
-            screen,
+            screen, sb,
         );
         crate::screenln!(screen, "DN exited, restarting...");
     }
@@ -555,12 +558,14 @@ fn run_program_with_screen<A: crate::Arch>(
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
     screen: crate::kernel::platform::VisibleScreen,
-) -> crate::kernel::platform::VisibleScreen {
+    sb: Option<crate::kernel::drivers::sb16::SbCard>,
+) -> (crate::kernel::platform::VisibleScreen, Option<crate::kernel::drivers::sb16::SbCard>) {
     let (screen, display) = screen.suspend(machine);
-    let display = run_program(
-        machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch, display,
+    let (display, sb) = run_program(
+        machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch,
+        display, sb,
     );
-    screen.resume(machine, display)
+    (screen.resume(machine, display), sb)
 }
 
 /// Load and run a single cmdline program until it exits. ELF binaries run
@@ -579,7 +584,8 @@ fn run_program<A: crate::Arch>(
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
     display: crate::kernel::platform::DisplayToken,
-) -> crate::kernel::platform::DisplayToken {
+    sb: Option<crate::kernel::drivers::sb16::SbCard>,
+) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -652,7 +658,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, Some(bios_workspace), threads, tid)
+    event_loop(machine, Some(bios_workspace), threads, tid, sb)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -690,13 +696,22 @@ pub fn event_loop<A: crate::Arch>(
     mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
-) -> crate::kernel::platform::DisplayToken {
+    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
     let mut display_handoff = None;
+    // The machine's Sound Blaster lives in this frame for the loop's life,
+    // beside the display token and for the same reason: it is one piece of
+    // hardware with at most one guest owner, and the loop is what outlives
+    // every owner. `None` here means a thread currently holds it — or that
+    // the kernel mixer owns the card and it never travels at all.
+    let mut sb_handoff = threads
+        .get_mut(first_tid)
+        .and_then(|t| t.personality.adopt_sb(machine, sb_card));
 
     loop {
         stats.slice_begin(machine);
@@ -746,7 +761,8 @@ pub fn event_loop<A: crate::Arch>(
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
-                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next, &mut display_handoff,
+                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
+                    &mut display_handoff, &mut sb_handoff,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -777,19 +793,26 @@ pub fn event_loop<A: crate::Arch>(
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
-            machine, bios_workspace.as_deref_mut(), threads, &mut ctx.regs, ctx.tid, action, &mut display_handoff,
+            machine, bios_workspace.as_deref_mut(), threads, &mut ctx.regs, ctx.tid, action,
+            &mut display_handoff, &mut sb_handoff,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
-                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next, &mut display_handoff,
+                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
+                    &mut display_handoff, &mut sb_handoff,
                 );
             }
             crate::kernel::sched::Verdict::AllDead => {
                 // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
                 thread::reap_all_zombies(threads, machine);
-                return display_handoff.take().expect("dead display owner lost token");
+                // Every owner is gone, so both capabilities are back in this
+                // frame — hand them to whoever runs the next program.
+                return (
+                    display_handoff.take().expect("dead display owner lost token"),
+                    sb_handoff.take(),
+                );
             }
         }
     }
@@ -849,6 +872,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {
         return;
@@ -857,14 +881,23 @@ fn switch_focus_and_run<A: crate::Arch>(
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         if old.kernel.state != thread::ThreadState::Zombie {
             assert!(display_handoff.is_none(), "stale VGA display handoff");
-            crate::kernel::focus::release(machine, bios_workspace.as_deref_mut(), &mut old.personality)
+            let (display, card) = crate::kernel::focus::release(
+                machine, bios_workspace.as_deref_mut(), &mut old.personality);
+            // A live outgoing owner gives the card up here; a zombie already
+            // did, in `exit_thread`, and its card is waiting in the handoff.
+            if card.is_some() {
+                assert!(sb_handoff.is_none(), "stale SB handoff");
+                *sb_handoff = card;
+            }
+            display
         } else {
             display_handoff.take().expect("zombie lost display handoff")
         }
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    crate::kernel::focus::acquire(machine, bios_workspace, new_tid, &mut new.personality, display);
+    *sb_handoff = crate::kernel::focus::acquire(
+        machine, bios_workspace, new_tid, &mut new.personality, display, sb_handoff.take());
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -981,8 +1014,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             );
         }
         let mut child_handoff = None;
-        thread::exit_thread(threads, machine, None, child_tid, 1, &mut child_handoff);
+        let mut child_sb = None;
+        thread::exit_thread(threads, machine, None, child_tid, 1, &mut child_handoff, &mut child_sb);
         assert!(child_handoff.is_none(), "unfocused child owned physical VGA");
+        assert!(child_sb.is_none(), "half-built child owned the Sound Blaster");
         on_error(vcpu, 11);
         return None;
     }
