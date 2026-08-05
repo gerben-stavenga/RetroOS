@@ -25,7 +25,7 @@ pub(in crate::kernel::dos) mod vif;
 pub(in crate::kernel::dos) use self::vif::DbResult;
 mod state;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PHYS_MAP_TOP, PSP_SEL};
-use self::state::{physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
+use self::state::{exception_index, physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors, valid_ldt_selector_idx};
 use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
@@ -536,12 +536,11 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             clear_carry(regs);
         }
         // AX=0202h — Get Processor Exception Handler Vector
-        // BL = exception number. DPMI 0.9 only defines 0..14 (CPU exceptions);
-        // higher indices return CF=1 to match CWSDPMI.
+        // BL = exception number (00H-1FH), including CPU-reserved slots.
         0x0202 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 15 {
-                let (sel, off) = dpmi.exc_vectors[exc as usize];
+            if let Some(index) = exception_index(exc) {
+                let (sel, off) = dpmi.exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
                 clear_carry(regs);
@@ -550,13 +549,13 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             }
         }
         // AX=0203h — Set Processor Exception Handler Vector
-        // BL = exception number, CX:EDX = selector:offset. Same 0..14 range.
+        // BL = exception number (00H-1FH), CX:EDX = selector:offset.
         0x0203 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 15 {
+            if let Some(index) = exception_index(exc) {
                 // 16-bit client: DX only — EDX-high is stale (cf. 0205/0303).
                 let off = if dpmi.client_use32 { regs.rdx as u32 } else { regs.rdx as u16 as u32 };
-                dpmi.exc_vectors[exc as usize] = (regs.rcx as u16, off);
+                dpmi.exc_vectors[index] = (regs.rcx as u16, off);
                 dos_trace!("[DPMI] 0203 set exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, off);
                 clear_carry(regs);
@@ -566,11 +565,11 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         }
         // AX=0210h — Get Extended Processor Exception Handler Vector (PM)
         // BL = exception number (00H-1FH). Returns CX:(E)DX = selector:offset
-        // of the 1.0 PM handler. Range is the full 0..31, vs 0..14 for 0202H.
+        // of the 1.0 PM handler.
         0x0210 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
-                let (sel, off) = dpmi.pm_exc_vectors[exc as usize];
+            if let Some(index) = exception_index(exc) {
+                let (sel, off) = dpmi.pm_exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
                 clear_carry(regs);
@@ -584,8 +583,8 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // of the 1.0 RM handler (PM target — host does implied mode switch).
         0x0211 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
-                let (sel, off) = dpmi.rm_exc_vectors[exc as usize];
+            if let Some(index) = exception_index(exc) {
+                let (sel, off) = dpmi.rm_exc_vectors[index];
                 regs.rcx = (regs.rcx & !0xFFFF) | sel as u64;
                 regs.rdx = (regs.rdx & !0xFFFFFFFF) | off as u64;
                 clear_carry(regs);
@@ -600,8 +599,8 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // so it remains the fallback for vectors without a 1.0 handler.
         0x0212 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
-                dpmi.pm_exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+            if let Some(index) = exception_index(exc) {
+                dpmi.pm_exc_vectors[index] = (regs.rcx as u16, regs.rdx as u32);
                 dos_trace!("[DPMI] 0212 set PM exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, regs.rdx as u32);
                 clear_carry(regs);
@@ -616,8 +615,8 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // to PM to invoke the handler when a VM86-origin fault hits.
         0x0213 => {
             let exc = regs.rbx as u8;
-            if (exc as usize) < 32 {
-                dpmi.rm_exc_vectors[exc as usize] = (regs.rcx as u16, regs.rdx as u32);
+            if let Some(index) = exception_index(exc) {
+                dpmi.rm_exc_vectors[index] = (regs.rcx as u16, regs.rdx as u32);
                 dos_trace!("[DPMI] 0213 set RM exception {:02X} = {:04X}:{:08X}",
                     exc, regs.rcx as u16, regs.rdx as u32);
                 clear_carry(regs);

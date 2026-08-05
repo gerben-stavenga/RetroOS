@@ -16,6 +16,7 @@ KERNEL_PHYS equ 0x00100000
 ; External symbols defined in Rust
 extern BOOT_GDT            ; boot GDT table (descriptors.rs)
 extern KERNEL_STACK_TOP    ; top of kernel stack (kernel.ld)
+extern ARCH_STACK          ; 64K-aligned trap-stack base (kernel.ld)
 extern boot_kernel         ; Rust entry point (arch/boot.rs)
 extern isr_handler         ; ISR dispatcher (arch/traps.rs)
 extern SYSCALL_USER_RSP    ; SYSCALL scratch slot (descriptors.rs)
@@ -241,8 +242,21 @@ common_call:
     cld
     ; Set kernel data selectors. SS *must* be reloaded before any push: on
     ; the 64→32 path the same-privilege long-mode interrupt clears SS.
+    ; A fault in the 32-bit espfix IRET arrives with SS=0x48 and a truncated
+    ; numeric ESP. The CPU pushed the fault frame through the alias base, but
+    ; simply loading flat SS would reinterpret that same ESP in low memory.
+    ; Translate it back to its flat address in the MOV-SS interrupt shadow.
+    mov eax, ss
+    cmp ax, 0x48
+    jne .flat_ss
     mov eax, 0x18
     mov ss, eax
+    add esp, ARCH_STACK
+    jmp .data_segs
+.flat_ss:
+    mov eax, 0x18
+    mov ss, eax
+.data_segs:
     mov ds, eax
     mov es, eax
     mov fs, eax
@@ -498,4 +512,3 @@ align 8
 zrh_ret_ptr:
     dd zero_rsp_high.back   ; 32-bit offset (m16:32)
     dw 0x08                 ; compat code segment
-

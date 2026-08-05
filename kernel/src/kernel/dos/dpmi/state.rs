@@ -54,6 +54,15 @@ const MAX_PHYS_MAPPINGS: usize = 32;
 /// Maximum number of real-mode callbacks (INT 31h/0303h)
 const MAX_CALLBACKS: usize = 16;
 
+/// Processor exception-vector namespace exposed by DPMI services 0202H/0203H
+/// and 0210H..0213H: vectors 00H through 1FH, including CPU-reserved slots.
+pub(super) const NUM_EXCEPTION_VECTORS: usize = 32;
+
+pub(super) fn exception_index(vector: u8) -> Option<usize> {
+    let index = usize::from(vector);
+    (index < NUM_EXCEPTION_VECTORS).then_some(index)
+}
+
 /// Per-thread DPMI state (heap-allocated, attached to Thread.dpmi).
 /// The LDT and `pm_vectors` live on `DosState` — always allocated at thread
 /// init — so DPMI entry/exit doesn't have to (re)allocate them. See
@@ -68,21 +77,19 @@ pub struct DpmiState {
     /// DPMI 0.9 exception handler vectors (set via INT 31h/0203H).
     /// A 0.9 handler covers BOTH PM-origin and VM86-origin faults for
     /// the vector; it serves as the fallback whenever the matching
-    /// 1.0-specific table below has slot (0, 0). Spec-defined range
-    /// is 0..14, but we keep 32 slots so the lookup tables share an
-    /// index basis.
-    pub(super) exc_vectors: [(u16, u32); 32],
+    /// 1.0-specific table below has slot (0, 0).
+    pub(super) exc_vectors: [(u16, u32); NUM_EXCEPTION_VECTORS],
     /// DPMI 1.0 protected-mode exception handler vectors (set via
     /// INT 31h/0212H). Consulted first when a fault originated in PM
     /// (`from_vm86 == false`); takes precedence over the 0.9 fallback.
-    pub(super) pm_exc_vectors: [(u16, u32); 32],
+    pub(super) pm_exc_vectors: [(u16, u32); NUM_EXCEPTION_VECTORS],
     /// DPMI 1.0 real-mode exception handler vectors (set via INT
     /// 31h/0213H). Consulted first when a fault originated in VM86
     /// (`from_vm86 == true`); takes precedence over the 0.9 fallback.
     /// Per DPMI 1.0 §6.1.4 the handler runs in PM with an implied
     /// mode switch — the selector:offset is a PM target, not a real
     /// segment:offset.
-    pub(super) rm_exc_vectors: [(u16, u32); 32],
+    pub(super) rm_exc_vectors: [(u16, u32); NUM_EXCEPTION_VECTORS],
     /// Real-mode callbacks (INT 31h/0303h)
     /// Each entry: Some((pm_cs, pm_eip, rm_struct_sel, rm_struct_off))
     pub(super) callbacks: [Option<(u16, u32, u16, u32)>; MAX_CALLBACKS],
@@ -183,9 +190,9 @@ impl DpmiState {
             mem_blocks: [None; MAX_MEM_BLOCKS],
             mem_next: MEM_BASE,
             phys_mappings: [None; MAX_PHYS_MAPPINGS],
-            exc_vectors: [(0, 0); 32],
-            pm_exc_vectors: [(0, 0); 32],
-            rm_exc_vectors: [(0, 0); 32],
+            exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
+            pm_exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
+            rm_exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
             callbacks: [None; MAX_CALLBACKS],
             client_use32: false,
             saved_rm_psp: 0,
@@ -314,7 +321,16 @@ pub(super) fn physical_mapping_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::physical_mapping_layout;
+    use super::{exception_index, physical_mapping_layout};
+
+    #[test]
+    fn exception_vector_namespace_includes_reserved_cpu_slots() {
+        assert_eq!(exception_index(0x00), Some(0x00));
+        assert_eq!(exception_index(0x0f), Some(0x0f));
+        assert_eq!(exception_index(0x1f), Some(0x1f));
+        assert_eq!(exception_index(0x20), None);
+        assert_eq!(exception_index(0xff), None);
+    }
 
     #[test]
     fn physical_mapping_layout_aligned() {

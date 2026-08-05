@@ -296,12 +296,15 @@ impl DfsState {
             pos += 1;
         }
 
-        // Collapse `.` and `..` components in place. NC issues
+        // Canonicalize components and collapse `.` and `..` in place. DOS
+        // ignores spaces in short paths; some programs pass an 8.3 name copied
+        // directly from a space-padded field (for example `"LH66.RLE    "`).
+        // NC issues
         // INT 21 AH=3Bh with literal ".." when navigating up; DN tracks
         // cwd itself and sends the parent absolute path, which is why
         // it never tripped this. Without collapsing, we hand
         // "C:\GAMES\PRINCE\.." to the VFS and get path-not-found.
-        pos = collapse_dots(out, pos);
+        pos = canonicalize_components(out, pos);
 
         // Collapse any trailing '\' except the one right after "X:"
         while pos > 3 && out[pos-1] == b'\\' { pos -= 1; }
@@ -494,10 +497,10 @@ fn walk_components(
     Ok(())
 }
 
-/// Collapse `.` and `..` components in an absolute DOS path
-/// `"X:\..."`. `..` pops the previous component; never goes below the
-/// `"X:\"` root. Returns new length.
-fn collapse_dots(buf: &mut [u8], len: usize) -> usize {
+/// Canonicalize components in an absolute DOS path `"X:\..."`: discard
+/// spaces, collapse `.`, and let `..` pop the previous component without ever
+/// going below the `"X:\"` root. Returns the new length.
+fn canonicalize_components(buf: &mut [u8], len: usize) -> usize {
     const ROOT_END: usize = 3; // "X:\"
     if len <= ROOT_END { return len; }
     let mut write = ROOT_END;
@@ -507,10 +510,17 @@ fn collapse_dots(buf: &mut [u8], len: usize) -> usize {
         if read >= len { break; }
         let comp_start = read;
         while read < len && buf[read] != b'\\' { read += 1; }
-        let comp_len = read - comp_start;
+        let mut comp_end = comp_start;
+        for src in comp_start..read {
+            if buf[src] != b' ' {
+                buf[comp_end] = buf[src];
+                comp_end += 1;
+            }
+        }
+        let comp_len = comp_end - comp_start;
         let is_dot = comp_len == 1 && buf[comp_start] == b'.';
         let is_dotdot = comp_len == 2 && buf[comp_start] == b'.' && buf[comp_start + 1] == b'.';
-        if is_dot {
+        if comp_len == 0 || is_dot {
             // skip
         } else if is_dotdot {
             // pop last written component (and its leading '\')
@@ -530,4 +540,19 @@ fn collapse_dots(buf: &mut [u8], len: usize) -> usize {
         }
     }
     write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DfsState, DFS_PATH_MAX};
+
+    #[test]
+    fn resolve_discards_spaces_from_each_component() {
+        let dfs = DfsState::new();
+        let mut out = [0u8; DFS_PATH_MAX];
+
+        let len = dfs.resolve(b"di r   \\lh66 .rle    ", &mut out).unwrap();
+
+        assert_eq!(&out[..len], b"C:\\DIR\\LH66.RLE");
+    }
 }

@@ -49,9 +49,25 @@ impl Pic8259 {
         }
     }
 
-    /// Non-specific EOI: retire the highest-priority in-service line.
-    fn eoi(&mut self) {
-        self.isr &= self.isr.wrapping_sub(1); // clear lowest set bit
+    /// Apply an OCW2 command. Priority rotation itself is immaterial while all
+    /// DOS-visible IRQs retain the PC/AT's fixed priorities, but both rotated
+    /// EOI forms still retire the selected in-service line.
+    /// Returns the line retired by an EOI, if any.
+    fn write_ocw2(&mut self, val: u8) -> Option<u8> {
+        match val & 0xE0 {
+            0x20 | 0xA0 => {
+                let line = lowest_set(self.isr)?;
+                self.isr &= !(1 << line);
+                Some(line)
+            }
+            0x60 | 0xE0 => {
+                let line = val & 0x07;
+                let was_in_service = self.isr & (1 << line) != 0;
+                self.isr &= !(1 << line);
+                was_in_service.then_some(line)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -162,14 +178,15 @@ impl VirtualPic {
         }
     }
 
-    /// Master non-specific EOI (`out 0x20, 0x20`).
-    pub fn master_eoi(&mut self) {
-        self.master.eoi();
+    /// Write an OCW2 command to the master. Returns the IRQ retired by an EOI.
+    pub fn master_ocw2(&mut self, val: u8) -> Option<u8> {
+        self.master.write_ocw2(val)
     }
 
-    /// Slave non-specific EOI (`out 0xA0, 0x20`).
-    pub fn slave_eoi(&mut self) {
-        self.slave.eoi();
+    /// Write an OCW2 command to the slave. Returns the global IRQ retired by
+    /// an EOI; the caller must still issue the usual master cascade EOI.
+    pub fn slave_ocw2(&mut self, val: u8) -> Option<u8> {
+        self.slave.write_ocw2(val).map(|line| 8 + line)
     }
 
     /// Write the master IMR (`out 0x21`).
@@ -202,5 +219,30 @@ impl VirtualPic {
             self.master.irr, self.master.isr, self.master.imr,
             self.slave.irr, self.slave.isr, self.slave.imr,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VirtualPic;
+
+    #[test]
+    fn ocw2_accepts_specific_and_rotated_eois() {
+        let mut pic = VirtualPic::new();
+
+        pic.raise(0);
+        pic.ack(0);
+        assert_eq!(pic.master_ocw2(0x60), Some(0));
+        assert!(!pic.in_service(0));
+
+        pic.raise(5);
+        pic.ack(5);
+        assert_eq!(pic.master_ocw2(0xA0), Some(5));
+        assert!(!pic.in_service(5));
+
+        pic.raise(7);
+        pic.ack(7);
+        assert_eq!(pic.master_ocw2(0xE7), Some(7));
+        assert!(!pic.in_service(7));
     }
 }

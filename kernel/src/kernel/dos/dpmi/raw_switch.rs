@@ -12,13 +12,15 @@ use super::super::mode_transitions;
 ///   BX = new real-mode SP
 ///   SI = new real-mode CS
 ///   DI = new real-mode IP
-fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, _dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let new_ds = regs.rax as u16;
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
     let new_sp = regs.rbx as u16;
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
+    let outgoing_pm = (regs.stack_seg(), regs.sp32());
+    let in_locked_chain = dos.pc.locked_stack.other_stack.is_some();
 
     regs.frame.rflags |= (machine::VM_FLAG | machine::VIF_FLAG) as u64;
     regs.frame.cs = new_cs as u64;
@@ -29,6 +31,13 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, _dos: &mut thread::Do
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
+    // A raw switch may run inside a kernel continuation (for example, from a
+    // PM IRQ handler). `other_stack` always names the side that is not live:
+    // after moving to RM, retain the PM cursor we just left. At client level
+    // (`None`) raw switches remain untracked, as before.
+    if in_locked_chain {
+        dos.pc.locked_stack.other_stack = Some(outgoing_pm);
+    }
     dos_trace!("[DPMI] raw PM->RM {:04X}:{:04X} SS:SP={:04X}:{:04X}",
         new_cs, new_ip, new_ss, new_sp);
     thread::KernelAction::Done
@@ -125,6 +134,8 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(_machine: &m
     let new_es = regs.rcx as u16;
     let new_ss = regs.rdx as u16;
     let new_cs = regs.rsi as u16;
+    let outgoing_rm = (regs.stack_seg(), regs.sp32());
+    let in_locked_chain = dos.pc.locked_stack.other_stack.is_some();
 
     // Determine destination operand size from the target CS/SS descriptors,
     // so 16-bit clients don't pick up garbage in EBX/EDI upper bits.
@@ -146,6 +157,12 @@ pub(in crate::kernel::dos) fn raw_switch_real_to_pm<A: crate::Arch>(_machine: &m
     regs.es = new_es as u64;
     regs.fs = 0;
     regs.gs = 0;
+    // Symmetric with PM→RM above: once PM is live, the saved cursor is the
+    // RM side we just left. This keeps nested IRQ/callback entry from treating
+    // a real-mode paragraph as an LDT stack selector.
+    if in_locked_chain {
+        dos.pc.locked_stack.other_stack = Some(outgoing_rm);
+    }
     dos_trace!("[DPMI] raw RM->PM CS:EIP={:04X}:{:08X} SS:ESP={:04X}:{:08X} DS={:04X} ES={:04X}",
         new_cs, new_eip, new_ss, new_esp, new_ds, new_es);
 

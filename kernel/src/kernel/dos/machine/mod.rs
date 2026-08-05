@@ -678,12 +678,12 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x01CE..=0x01D0 => machine.outb(port, val),
         // Master PIC command
         0x20 => {
-            if val == 0x20 {
-                // Non-specific EOI. No keyboard coupling here: a scancode
-                // arriving mid-handler already latched its own IRR edge when
-                // it surfaced (vkbd::try_surface), and the PIC delivers it
-                // once the EOI clears the in-service bit — plain 8259
-                // behavior, no device knowledge required.
+            if let Some(retired_irq) = pc.vpic.master_ocw2(val) {
+                // EOI (specific or non-specific). No keyboard coupling here:
+                // a scancode arriving mid-handler already latched its own IRR
+                // edge when it surfaced (vkbd::try_surface), and the PIC
+                // delivers it once the EOI clears the in-service bit — plain
+                // 8259 behavior, no device knowledge required.
                 //
                 // Re-arm the passthrough card's HOST line, which `handle_irq`
                 // masked when it queued the completion and which stays masked
@@ -696,9 +696,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 // SB has no host line — its IRQ is purely virtual — so there is
                 // nothing to rearm there (`feedback_no_half_modelled_devices`).
                 let guest_irq = pc.sb.blaster.irq;
-                let sb_in_service = guest_irq < 8 && pc.vpic.in_service(guest_irq);
-                pc.vpic.master_eoi();
-                if sb_in_service && let SbDevice::Native(pt) = &pc.sb.device {
+                if retired_irq == guest_irq && let SbDevice::Native(pt) = &pc.sb.device {
                     machine.rearm_irq(pt.card.irq);
                 }
             }
@@ -709,9 +707,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x21 => pc.vpic.set_master_imr(val),
         // Slave PIC command
         0xA0 => {
-            if val == 0x20 {
-                pc.vpic.slave_eoi();
-            }
+            pc.vpic.slave_ocw2(val);
         }
         // Slave PIC data (write IMR)
         0xA1 => pc.vpic.set_slave_imr(val),
