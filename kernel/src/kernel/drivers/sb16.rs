@@ -6,11 +6,9 @@
 //! dispatches here when the platform probe found a real SB16 (`Audio::SbSink`).
 //!
 //! It drives the real DSP for **16-bit signed-stereo auto-init DMA** on the ISA
-//! 8237 (channel 5). The DMA region is a circular ring divided into completion
-//! blocks; each completed block raises **IRQ 5**. The interrupt wakes the
-//! event-driven audio track;
-//! `on_irq` then reads the live 8237 cursor, so delayed/coalesced delivery does
-//! not turn an event count into a false playback position.
+//! 8237 (channel 5). The DMA region is a circular ring. The kernel polls the
+//! live 8237 cursor for accounting; a sparse DSP interrupt only wakes an idle
+//! kernel and is never interpreted as a completion count.
 //!
 //! Only machine *primitives* are used — port I/O (`inb`/`outb`, for the DSP,
 //! mixer, and the 8237), `dma_channel_buf` (the permanent contiguous channel-5
@@ -55,9 +53,11 @@ const DMA5_MODE_AUTO_READ: u8 = 0x59;
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 // ── ring geometry ───────────────────────────────────────────────────────────
-// Defined by the sound sink, which owns the DMA buffer; the device needs only
-// the two numbers it programs the hardware with.
-use crate::kernel::sound::{BUF_BYTES, RING_BYTES};
+const BUF_BYTES: usize = 0x800;
+const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
+const NUM_BUF: usize = 32;
+const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
+const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 
 /// What only THIS card knows. The ring, the counters and the prime/underrun
 /// bookkeeping belong to the sound sink — shared with every other device,
@@ -440,9 +440,9 @@ pub fn start() {
     dev.consumed = 0;
     dev.reported = 0;
 
-    // DSP block length is in 16-bit transfers, not stereo frames: every frame
-    // contributes left + right, hence BUF_BYTES/2 samples.
-    let block_samples = (BUF_BYTES / 2) as u16;
+    // The IRQ is only a sparse wakeup; DMA-position polling accounts actual
+    // consumption. DSP length is in 16-bit transfers, two per stereo frame.
+    let block_samples = (RING_BYTES / 4) as u16;
     let base = dev.base;
     dsp_write(base, CMD_16BIT_AUTO_OUT);
     dsp_write(base, MODE_SIGNED_STEREO);
@@ -454,6 +454,14 @@ pub fn start() {
 /// Kernel VA of the ring, for rebuilding a sink around this device.
 pub fn ring_va() -> usize {
     if SB16.lock().is_some() { DMA_WIN_VA } else { 0 }
+}
+
+pub const fn block_frames() -> usize {
+    BUF_FRAMES
+}
+
+pub const fn ring_frames() -> usize {
+    RING_FRAMES
 }
 
 /// Halt the transfer and mask the channel.

@@ -31,21 +31,26 @@ use crate::kernel::thread;
 const ITEM_KILL: usize = 0;
 const ITEM_SWITCH: usize = 1;
 const ITEM_VOLUME: usize = 2;
-const ITEM_TRACE: usize = 3;
-const ITEM_PROFILE: usize = 4;
-const ITEM_DUMP: usize = 5;
-const NUM_ITEMS: usize = 6;
+const ITEM_LATENCY: usize = 3;
+const ITEM_TRACE: usize = 4;
+const ITEM_PROFILE: usize = 5;
+const ITEM_DUMP: usize = 6;
+const NUM_ITEMS: usize = 7;
 
 /// Master volume as a percentage of unity, adjusted by ◄/► on the Volume row.
 /// 100 = unity (the level the per-source scales already balance to); attenuate
 /// only — a boost above unity would just clip against the mix-out rail.
 const VOL_MAX: u32 = 100;
 const VOL_STEP: u32 = 10;
+const LATENCY_MIN_MS: u32 = 10;
+const LATENCY_MAX_MS: u32 = 80;
+const LATENCY_STEP_MS: u32 = 5;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
 static REPAINT: AtomicBool = AtomicBool::new(false);
 static SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(100);
+static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
 static mut DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
 
@@ -101,6 +106,13 @@ pub fn dismiss() {
 /// 100%; scales the summed mix just before its single clip.
 pub fn master_gain_q16() -> i32 {
     (VOL_PCT.load(Ordering::Relaxed) as i32 * 65536 / 100).max(0)
+}
+
+/// Requested physical output latency. The sink rounds this up to its active
+/// device's block granularity and caps it to the safe half of that device's
+/// DMA ring.
+pub fn audio_latency_ms() -> u32 {
+    LATENCY_MS.load(Ordering::Relaxed)
 }
 
 /// Consume a pending "kill the focused task" request. The event loop calls this
@@ -256,18 +268,29 @@ fn move_sel(delta: usize) {
     SEL.store(sel, Ordering::Relaxed);
 }
 
-/// ◄/► adjust the Volume row; a no-op on every other row.
+/// ◄/► adjust the selected continuous setting.
 fn adjust(up: bool) {
-    if SEL.load(Ordering::Relaxed) != ITEM_VOLUME {
-        return;
+    match SEL.load(Ordering::Relaxed) {
+        ITEM_VOLUME => {
+            let cur = VOL_PCT.load(Ordering::Relaxed);
+            let next = if up {
+                (cur + VOL_STEP).min(VOL_MAX)
+            } else {
+                cur.saturating_sub(VOL_STEP)
+            };
+            VOL_PCT.store(next, Ordering::Relaxed);
+        }
+        ITEM_LATENCY => {
+            let cur = LATENCY_MS.load(Ordering::Relaxed);
+            let next = if up {
+                (cur + LATENCY_STEP_MS).min(LATENCY_MAX_MS)
+            } else {
+                cur.saturating_sub(LATENCY_STEP_MS).max(LATENCY_MIN_MS)
+            };
+            LATENCY_MS.store(next, Ordering::Relaxed);
+        }
+        _ => {}
     }
-    let cur = VOL_PCT.load(Ordering::Relaxed);
-    let next = if up {
-        (cur + VOL_STEP).min(VOL_MAX)
-    } else {
-        cur.saturating_sub(VOL_STEP) // saturation is the 0 floor
-    };
-    VOL_PCT.store(next, Ordering::Relaxed);
 }
 
 fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&thread::DosState<A>>) {
@@ -281,8 +304,8 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
             PICK_SEL.store(0, Ordering::Relaxed);
             PICKER.store(true, Ordering::Relaxed);
         }
-        // Volume is adjusted with ◄/►; Enter on it does nothing.
-        ITEM_VOLUME => {}
+        // Continuous settings are adjusted with ◄/►; Enter does nothing.
+        ITEM_VOLUME | ITEM_LATENCY => {}
         // Toggle each diagnostic and stay open so the new state shows on the row.
         ITEM_TRACE => crate::kernel::startup::toggle_trace(),
         ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
@@ -370,7 +393,7 @@ pub fn paint(
 
     vga_render::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
-        b"Up/Dn  Enter  <> vol  Esc", FOOT_FG, PANEL_BG, fmt,
+        b"Up/Dn  Enter  <> adjust Esc", FOOT_FG, PANEL_BG, fmt,
     );
 }
 
@@ -471,6 +494,11 @@ fn item_line(item: usize, line: &mut Line) {
             line.put(b"] ");
             line.put_num(pct);
             line.put(b"%");
+        }
+        ITEM_LATENCY => {
+            line.put(b"Latency  ");
+            line.put_num(LATENCY_MS.load(Ordering::Relaxed));
+            line.put(b" ms");
         }
         ITEM_TRACE => {
             line.put(b"Trace    ");

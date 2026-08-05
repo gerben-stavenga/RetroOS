@@ -98,21 +98,19 @@ const CORB_ENTRIES: usize = 256; // 4 bytes each → 1 KB
 const RIRB_ENTRIES: usize = 256; // 8 bytes each → 2 KB
 const CORB_OFF: usize = 0x0000;
 const RIRB_OFF: usize = 0x0400;
-const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 512 bytes
-const POS_OFF: usize = 0x0E00; // 128-byte aligned; DMA position buffer (8 strm*8)
-const BUF_OFF: usize = 0x1000; // PCM ring starts on the next page
+const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 1024 bytes
+const POS_OFF: usize = 0x1000; // 128-byte aligned; DMA position buffer (8 strm*8)
+const BUF_OFF: usize = 0x2000; // PCM ring starts on the next page
 const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
-// ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
-const NUM_BUF: usize = 32;
-// 2 KB = 512 stereo frames ≈ 11.6 ms @ 44.1 kHz. This is the completion-IRQ
-// granularity (one interrupt per buffer), NOT the pipe depth — the producer's
-// universal target is shared by every sink. A 30-ms pipe keeps about
-// 2.6 buffers queued, leaving a complete-buffer refill margin while halving
-// the old 256-frame completion-IRQ rate. MIDI onset is stamped at arrival (see
-// midi.rs), so buffer size never quantises notes. The ring is larger than the
-// pipe only to guard the write cursor ahead of play.
-const BUF_BYTES: usize = 0x800;
+// ── PCM ring geometry ────────────────────────────────────────────────────────
+// Fine descriptors make cursor accounting and latency control ~2.9 ms at
+// 44.1 kHz. They do not imply an interrupt each: only two descriptors per ring
+// carry IOC, and normal accounting polls the live cursor.
+const NUM_BUF: usize = 64;
+const BUF_BYTES: usize = 0x200;
+const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
+const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
@@ -816,11 +814,11 @@ impl Hda {
     }
 
     /// Fill the BDL: entry i → PCM buffer i. Each HDA BDL entry is 16 bytes
-    /// { addr:u64, len:u32, flags:u32 }. flags bit0 = IOC, set per buffer: one
-    /// completion interrupt per buffer drives the event-loop audio track.
+    /// { addr:u64, len:u32, flags:u32 }. IOC is sparse; polling drives cursor
+    /// accounting and the interrupt only wakes an otherwise idle kernel.
     fn build_bdl(&mut self) {
-        let ioc = 1u32;
         for i in 0..NUM_BUF {
+            let ioc = u32::from(i == NUM_BUF / 2 - 1 || i == NUM_BUF - 1);
             let entry = self.dma_va + BDL_OFF + i * 16;
             unsafe {
                 write_volatile(entry as *mut u32, self.buf_phys(i)); // addr low
@@ -1685,6 +1683,14 @@ pub fn blocks_played() -> u64 {
 /// Kernel VA of the ring, for rebuilding a sink around this device.
 pub fn ring_va() -> usize {
     HDA.lock().as_ref().map_or(0, |d| d.dma_va + BUF_OFF)
+}
+
+pub const fn block_frames() -> usize {
+    BUF_FRAMES
+}
+
+pub const fn ring_frames() -> usize {
+    RING_FRAMES
 }
 
 /// The rate this codec's stream runs at — what the mixer should produce.

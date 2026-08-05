@@ -27,10 +27,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 const AUDIO_SIG: u16 = 0x530; // R: signature ('RA'); W: sample rate (Hz)
 const SIGNATURE: u16 = 0x5241; // 'R','A' — RetroOS Audio
 
-/// The producer's wire format and the ring geometry are the library's — see
-/// `sound::sink`. Re-exported so the drivers and the mixer keep naming them
-/// through `kernel::sound`.
-pub use sound::sink::{BUF_BYTES, Frame, NUM_BUF, RING_BYTES, RING_FRAMES};
+pub use sound::sink::Frame;
 
 /// Times the play cursor caught the write cursor while a producer was feeding
 /// us. One counter for the sink, not one per driver — it used to live in
@@ -70,6 +67,14 @@ impl sound::sink::Device for Card {
         }
     }
 
+    fn block_frames(&self) -> usize {
+        match self {
+            Card::Sb(_) => crate::kernel::drivers::sb16::block_frames(),
+            Card::Ac97 => crate::kernel::drivers::ac97::block_frames(),
+            Card::Hda => crate::kernel::drivers::hda::block_frames(),
+        }
+    }
+
     fn start(&mut self) {
         let rate = self.rate();
         match self {
@@ -96,19 +101,21 @@ impl sound::sink::Device for Card {
         }
     }
 
-    fn irq_pending(&mut self) -> bool {
-        match self {
-            Card::Sb(_) => crate::kernel::drivers::sb16::irq_pending(),
-            Card::Ac97 => crate::kernel::drivers::ac97::irq_pending(),
-            Card::Hda => crate::kernel::drivers::hda::irq_pending(),
-        }
-    }
-
     fn blocks_played(&mut self) -> u64 {
         match self {
             Card::Sb(_) => crate::kernel::drivers::sb16::blocks_played(),
             Card::Ac97 => crate::kernel::drivers::ac97::blocks_played(),
             Card::Hda => crate::kernel::drivers::hda::blocks_played(),
+        }
+    }
+}
+
+impl Card {
+    fn ring_frames(&self) -> usize {
+        match self {
+            Card::Sb(_) => crate::kernel::drivers::sb16::ring_frames(),
+            Card::Ac97 => crate::kernel::drivers::ac97::ring_frames(),
+            Card::Hda => crate::kernel::drivers::hda::ring_frames(),
         }
     }
 }
@@ -167,7 +174,8 @@ impl Sink {
         // The device mapped the ring; hand the library a slice of it. This is
         // the one unsafe step in the sink — everything above it is a ring
         // buffer and arithmetic, which is why it lives in `//lib:sound`.
-        let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut Frame, RING_FRAMES) };
+        let ring_frames = card.ring_frames();
+        let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut Frame, ring_frames) };
         Sink { card: Some(sound::sink::Sink::new(buf, card)) }
     }
 
@@ -216,11 +224,16 @@ impl Sink {
         }
     }
 
-    /// Queue depth to keep ahead of the drain: [`PIPE_MS`] of slack against a
-    /// present stall. Nothing to fill when there is nothing to play through.
-    pub fn min_fill(&self, rate: u32) -> u32 {
-        match self.card {
-            Some(_) => rate * PIPE_MS / 1000,
+    /// Queue depth requested by policy, rounded up to the device's own block
+    /// granularity and capped inside the ring's unambiguous producer half.
+    pub fn target_fill(&self, rate: u32, latency_ms: u32) -> u32 {
+        match &self.card {
+            Some(sink) => {
+                let block = sink.block_frames() as u64;
+                let requested = (u64::from(rate) * u64::from(latency_ms)).div_ceil(1000);
+                let aligned = requested.div_ceil(block) * block;
+                aligned.min(sink.max_ahead_frames()) as u32
+            }
             None => 0,
         }
     }
@@ -229,9 +242,8 @@ impl Sink {
         self.card.is_some()
     }
 
-    /// Completion interrupt. Whether the LINE was ours is the machine's
-    /// question — a shared INTx says nothing about which device raised it — so
-    /// identity is matched here and the card only answers for its own status.
+    /// A sparse physical-device wakeup. Consumption is polled separately; an
+    /// interrupt is only acknowledged here and never counted as a block.
     pub fn on_irq<A: crate::Arch>(&mut self, machine: &mut A, event: crate::Irq) -> bool {
         use crate::kernel::drivers::{ac97, hda, sb16};
         let Some(sink) = &mut self.card else { return false };
@@ -245,15 +257,25 @@ impl Sink {
             (Card::Sb(_), crate::Irq::Hw(line)) => (Some(line) == sb16::irq_line(), Some(line)),
             _ => (false, None),
         };
-        if !mine || !sink.irq_pending() {
+        if !mine {
             return false;
         }
-        let report = sink.on_irq();
-        say(report);
+        let pending = match sink.device() {
+            Card::Sb(_) => sb16::irq_pending(),
+            Card::Ac97 => ac97::irq_pending(),
+            Card::Hda => hda::irq_pending(),
+        };
+        if !pending {
+            return false;
+        }
         if let Some(line) = isa_line {
             machine.rearm_irq(line);
         }
         true
+    }
+
+    pub fn poll(&mut self) -> sound::sink::Report {
+        self.card.as_mut().map_or_else(sound::sink::Report::default, |sink| sink.poll())
     }
 
     /// Re-anchor the physical pipe after the device overtook its producer.
@@ -272,7 +294,8 @@ fn rebuild(card: Card) -> sound::sink::Sink<Card> {
         Card::Ac97 => crate::kernel::drivers::ac97::ring_va(),
         Card::Hda => crate::kernel::drivers::hda::ring_va(),
     };
-    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut Frame, RING_FRAMES) };
+    let ring_frames = card.ring_frames();
+    let buf = unsafe { core::slice::from_raw_parts_mut(va as *mut Frame, ring_frames) };
     sound::sink::Sink::new(buf, card)
 }
 
@@ -298,10 +321,6 @@ fn say(report: sound::sink::Report) {
 
 /// The rate a sink runs at when the device has no opinion.
 const DEFAULT_RATE: u32 = 44_100;
-
-/// Desired output pipe depth (playback latency), shared by every hardware sink.
-/// Below ~one framebuffer-blit period a present stall can underrun it.
-const PIPE_MS: u32 = 30;
 
 /// The machine's one audio output.
 ///
@@ -435,11 +454,14 @@ pub fn pump<A: crate::Arch>(
     dt_ms: u64,
     mut mix: impl FnMut(&mut A, AudioSpan<'_>),
 ) {
+    let report = SINK.lock().poll();
+    say(report);
     let (nominal_rate, mut written, consumed, fill, present) = {
         let sink = SINK.lock();
         let rate = sink.rate();
         let (written, consumed) = sink.counters();
-        (rate, written, consumed, sink.min_fill(rate), sink.present())
+        let fill = sink.target_fill(rate, crate::kernel::osd::audio_latency_ms());
+        (rate, written, consumed, fill, sink.present())
     };
 
     producer.set_nominal_rate(nominal_rate);
@@ -474,9 +496,8 @@ pub fn pump<A: crate::Arch>(
     let gain_q16 = crate::kernel::osd::master_gain_q16();
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
 
-    // Prime physical latency with silence, not thirty milliseconds of source
-    // time. The emulated SB and synths begin advancing only in the CPU-clocked
-    // production loop below.
+    // Prime physical latency with silence, not source time. The emulated SB
+    // and synths begin advancing only in the CPU-clocked production loop below.
     if present && !producer.primed {
         let mut prime = (consumed + u64::from(fill)).saturating_sub(written);
         while prime > 0 {

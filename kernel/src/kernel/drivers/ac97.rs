@@ -69,10 +69,10 @@ const DMA_CHANNEL: usize = 5;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
-/// Use the FULL 32-entry BDL — one descriptor per ring block, no mirrors.
-/// Geometry belongs to the sound sink; this is the count of BDL
-/// entries the device programs, which must agree with it.
-use crate::kernel::sound::{BUF_BYTES, NUM_BUF};
+const NUM_BUF: usize = 32;
+const BUF_BYTES: usize = 0x800;
+const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
+const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 
 /// What only an AC'97 knows. The ring, the counters and the underrun test
 /// belong to the sink engine; this is the bus-master programming and the
@@ -96,8 +96,8 @@ static PRESENT: AtomicBool = AtomicBool::new(false);
 pub const MSI_SOURCE: u8 = 1;
 static MSI_ON: AtomicBool = AtomicBool::new(false);
 /// The wired IRQ line the codec's INTx was routed to (from PCI config 0x3C), so
-/// the canonical audio-IRQ router can match it. 0xFF until bring-up. Production
-/// is always driven from this interrupt — there is no polled model.
+/// the canonical audio-IRQ router can acknowledge its sparse wakeup. 0xFF
+/// until bring-up; cursor polling drives consumption accounting.
 static IRQ_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0xFF);
 
 /// The routed completion-IRQ line, for `sound::on_irq`. `None` when MSI is used
@@ -235,12 +235,11 @@ impl Ac97 {
         self.dma_phys + (BDL_BYTES + i * BUF_BYTES) as u32
     }
     /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Control word
-    /// carries IOC — one interrupt per completed buffer drives the event-loop
-    /// audio track. NUM_BUF == 32 so every entry maps a distinct buffer — no
-    /// mirrored entries to replay.
+    /// carries sparse IOC wakeups; cursor polling, not interrupts, accounts
+    /// consumption. NUM_BUF == 32 so every entry maps a distinct buffer.
     fn build_bdl(&mut self) {
-        let ctrl = BDL_IOC;
         for i in 0..NUM_BUF {
+            let ctrl = if i == NUM_BUF / 2 - 1 || i == NUM_BUF - 1 { BDL_IOC } else { 0 };
             let entry = self.dma_va + i * 8;
             let samples = (BUF_BYTES / 2) as u16; // 16-bit samples per buffer
             unsafe {
@@ -273,6 +272,14 @@ pub fn set_rate(rate: u32) {
 /// Kernel VA of the ring, for rebuilding a sink around this device.
 pub fn ring_va() -> usize {
     AC97.lock().as_ref().map_or(0, |d| d.dma_va + BDL_BYTES)
+}
+
+pub const fn block_frames() -> usize {
+    BUF_FRAMES
+}
+
+pub const fn ring_frames() -> usize {
+    RING_FRAMES
 }
 
 /// Start the bus master, and give it a full ring of runway.
