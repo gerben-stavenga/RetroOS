@@ -115,7 +115,7 @@ pub fn host_run_elf<A: Arch>(
         let t = thread::get_thread(&mut threads, tid).expect("initial Linux thread");
         t.personality.adopt_display(machine, kernel::platform::DisplayToken::Headless);
     }
-    kernel::startup::event_loop(machine, None, &mut threads, tid);
+    kernel::startup::event_loop(machine, None, &mut threads, tid, None);
     dbg_println!("[host] guest exited");
     kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
     machine.shutdown();

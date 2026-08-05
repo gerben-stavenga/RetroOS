@@ -1,4 +1,5 @@
-//! Console focus: which thread owns the display, keyboard, and mouse.
+//! Console focus: which thread owns the display, keyboard, mouse — and the
+//! machine's Sound Blaster when a guest is driving it directly.
 //!
 //! Focus is orthogonal to scheduling — F11 moves FOCUS (a console-ownership
 //! transfer: snapshot the old owner's screen state, repaint the new
@@ -29,25 +30,33 @@ pub fn adopt(tid: usize) {
 /// state. Runs while the old thread's context is still the live one. `old`
 /// is None when the previous owner is already gone (zombie — `exit_thread`
 /// snapshotted its farewell screen before teardown).
+/// The Sound Blaster comes back with the display: one machine, one card, and
+/// the owner is whoever the machine is currently showing.
 pub fn release<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     old: &mut Personality<A>,
-) -> crate::kernel::platform::DisplayToken {
-    old.suspend(machine, bios_workspace)
+) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
+    let card = old.release_sb(machine);
+    (old.suspend(machine, bios_workspace), card)
 }
 
 /// Second half: repaint the incoming owner's screen state and record it as
 /// the console owner. Runs after the execution switch, with the new
 /// thread's context live — materialize ordering matches the pre-focus-API
 /// behaviour exactly.
+/// Returns the card the incoming owner did NOT take (a Linux thread, or any
+/// thread on a machine whose card the kernel mixer owns), so it stays in the
+/// caller's handoff rather than being dropped.
 pub fn acquire<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     new_tid: usize,
     new: &mut Personality<A>,
     display: crate::kernel::platform::DisplayToken,
-) {
+    card: Option<crate::kernel::drivers::sb16::SbCard>,
+) -> Option<crate::kernel::drivers::sb16::SbCard> {
     new.materialize(machine, bios_workspace, display);
     FOCUS.store(new_tid, Ordering::Relaxed);
+    new.adopt_sb(machine, card)
 }

@@ -193,10 +193,6 @@ impl Gus {
 
 /// The GUS as a PCM source for the mixer pump.
 impl Gus {
-    pub(super) fn mixing(&self) -> bool {
-        self.present && self.card.mixing()
-    }
-
     /// Sum wavetable output into the pump block. The scale is *mix policy*
     /// (see `vsb`'s balance constants), so it is applied here rather than in
     /// the chip: the GF1's output is the mixer's reference level — 86Box

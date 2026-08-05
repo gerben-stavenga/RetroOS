@@ -129,27 +129,21 @@ fn monitor_key<A: crate::Arch>(
 pub fn restore_from_monitor<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-    regs: &mut Regs,
+    _regs: &mut Regs,
     personality: &mut thread::Personality<A>,
 ) {
     let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
     let display = crate::kernel::osd::take_display();
-    let (display, bios_display) = match display {
+    let display = match display {
         crate::kernel::platform::DisplayToken::LfbDisplay(sink)
             if sink.bios_display.is_some() =>
         {
             let native = crate::kernel::dos::release_bios_sink(machine, bios_workspace, sink);
-            (crate::kernel::platform::DisplayToken::BiosDisplay(native), true)
+            crate::kernel::platform::DisplayToken::BiosDisplay(native)
         }
-        display => (display, false),
+        display => display,
     };
     personality.materialize_from_osd(machine, bios_workspace, display);
-    if bios_display {
-        crate::kernel::sound::recover_after_display_stall();
-        if let thread::Personality::Dos(dos) = personality {
-            crate::kernel::dos::audio_tick(machine, dos, regs);
-        }
-    }
 }
 
 /// Linux owner: keys → cooked fd input.

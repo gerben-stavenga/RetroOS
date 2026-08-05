@@ -1276,14 +1276,22 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
-pub fn audio_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    machine::audio_tick(machine, &mut dos.pc, regs);
+pub fn audio_tick<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    span: crate::kernel::sound::AudioSpan<'_>,
+) {
+    machine::audio_tick(machine, &mut dos.pc, span);
 }
 
 /// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
 /// timers, MPU drain) without the millisecond pump — the ticks==0 fast path.
-pub fn audio_service<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
-    machine::audio_service(machine, &mut dos.pc);
+pub fn audio_service<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    pushed: u64,
+) {
+    machine::audio_service(machine, &mut dos.pc, pushed);
 }
 
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery

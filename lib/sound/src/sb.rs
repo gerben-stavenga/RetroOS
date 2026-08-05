@@ -196,6 +196,29 @@ pub struct Fetch {
     pub source_frames: usize,
 }
 
+/// The DSP state a real Sound Blaster will not tell you.
+///
+/// Every field here is set by a write-only command — rate (0x40 time constant
+/// or 0x41 direct), block size (0x48), the transfer format carried by the
+/// start command itself, and speaker enable (0xD1/0xD3). None of it reads back
+/// off silicon, so a card that changes hands can only be restored from a model
+/// that watched the writes go past. That is what this carries.
+#[derive(Clone, Copy, Debug)]
+pub struct DspState {
+    pub rate: u32,
+    /// 8 or 16 bits per sample — also which DMA channel carries it.
+    pub bits: u8,
+    pub stereo: bool,
+    /// Single-cycle vs auto-init, as the start command chose.
+    pub single: bool,
+    /// DSP block size (0x48), in transfers minus one.
+    pub block: u16,
+    pub speaker: bool,
+    /// Whether a transfer is running: the difference between "program this
+    /// card" and "program it and start it".
+    pub playing: bool,
+}
+
 /// Maximum playback rate exposed by the emulated SB16 DSP.
 const MAX_OUTPUT_RATE: u32 = 44_100;
 
@@ -238,6 +261,10 @@ pub struct Sb {
     /// (PoP 1.0 then drops sound entirely, AdLib included).
     trigger_irq: u8,
 
+    /// DSP 0xD1/0xD3 speaker enable. Write-only on real silicon — it cannot
+    /// be read back — so this model is the only record of it, and a card
+    /// handed to a new owner is programmed from here.
+    speaker: bool,
     /// True between a `start playback` command and a stop/reset.
     playing: bool,
     rate: u32,        // output sample rate (Hz)
@@ -254,19 +281,14 @@ pub struct Sb {
     buf_gpa: u32,      // guest-physical base of the ring
     buf_frames: u32,   // ring length in frames
     block_frames: u32, // frames between SB IRQs (one DMA block)
-    /// Guest-visible frames played since playback start (monotonic).
-    /// The DMA down-count derives from this, and block IRQs fire as it crosses
-    /// block boundaries. Slaved to the sink's real playback position where the
-    /// host reports one — a real SB's DMA cursor IS its playback position —
-    /// leading it by [`slack`](Self::slack) so the guest's per-block refill
-    /// lands before the codec reaches the data.
+    /// Guest-visible frames produced since playback start (monotonic). The DMA
+    /// down-count derives from this, and block IRQs fire as the CPU-clocked
+    /// mixer consumes frames from the guest ring. The final speaker sink plays
+    /// those frames later; its pipe latency is not part of the emulated card.
     cursor: u64,
     next_irq: u64,    // cursor value of the next block boundary (IRQ point)
-    /// How far the guest clock leads the mixer's drain point (source frames):
-    /// only what the guest ring is too small to cover — see [`Sb::begin`].
-    slack: u32,
-    /// This DSP playback (re)started: tell the host's pump to re-key its
-    /// session so pump frames and DSP stream frames coincide.
+    /// This DSP playback (re)started: tell the host to reset its incremental
+    /// source phase to DSP frame zero.
     restarted: bool,
     /// Tiny single-cycle transfer: a DMA-wiring probe wanting its completion
     /// IRQ within milliseconds — completed on virtual time, not drain.
@@ -316,11 +338,12 @@ impl Sb {
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0, test_reg: 0,
             mixer_index: 0, mixer: Mixer::new(), irq_status: 0, trigger_irq: 0,
+            speaker: false,
             playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
-            slack: 0, restarted: false, probe: false, start_ms: 0,
+            restarted: false, probe: false, start_ms: 0,
             blocks_done: 0, blocks_acked: 0,
             write_busy: 0, dma_tc: false, tc_status: 0,
             stream_hold: false, done_ms: 0,
@@ -493,8 +516,12 @@ impl Sb {
             0xE8 => self.push_out(self.test_reg), // read test register back
             0xF2 => self.trigger_irq |= 0x01,    // trigger 8-bit IRQ (IRQ probe)
             0xF3 => self.trigger_irq |= 0x02,    // trigger 16-bit IRQ
-            0xD1 | 0xD4 => {}                    // speaker on / continue DMA
+            0xD1 => self.speaker = true,         // speaker on
+            0xD4 => {}                           // continue DMA
             0xD0 | 0xD3 | 0xD9 | 0xDA => {
+                if cmd == 0xD3 {
+                    self.speaker = false;
+                }
                 // Pause / speaker off / exit auto-init: playback stops, but the
                 // stream is held open through the hangover — effect chains
                 // pause-and-restart every animation frame.
@@ -556,10 +583,8 @@ impl Sb {
     /// of the guest's DMA controller.
     ///
     /// `gpa`/`len_bytes` are that controller's programming — the card is told
-    /// them, it does not go looking. `min_fill` is how deep the host's sink
-    /// pipe runs (0 when the sink has no playback clock), which is the only
-    /// thing the lead calculation below needs to know about the host.
-    pub fn begin(&mut self, s: Start, gpa: u32, len_bytes: u32, min_fill: u32) {
+    /// them, it does not go looking.
+    pub fn begin(&mut self, s: Start, gpa: u32, len_bytes: u32) {
         self.bits = s.bits;
         self.stereo = s.stereo;
         self.single = s.single;
@@ -586,26 +611,16 @@ impl Sb {
         self.next_irq = self.block_frames as u64;
         self.blocks_done = 0;
         self.blocks_acked = 0;
-        self.restarted = true; // host pump: re-key session numbering
+        self.restarted = true; // host: reset its incremental DSP source phase
         // A single-cycle DMA transfer has its own finite device clock: it
         // starts when the DSP command arms DRQ and reaches terminal count
         // after `buf_frames / rate`, independent of how much older music is
         // queued in the final speaker sink. Treating only sub-256-byte blocks
         // this way made Duke3D's larger 16-bit channel-5 self-test wait behind
         // the GUS output cushion and time out as "conflicting DMA channel".
-        // Auto-init rings remain slaved to the sink's continuous cursor.
+        // Auto-init rings advance through the regular CPU producer.
         self.probe = s.single;
         self.start_ms = 0;
-        // The guest clock leads the drain only by what the ring is too small
-        // to cover: with ring ≥ fill + one block, the refill a block IRQ
-        // commits always lands before the mix point reads its slot, and the
-        // cursor can track audible playback exactly (slack = 0). Single-cycle
-        // never needs a lead — its whole buffer is committed up front.
-        self.slack = if s.single {
-            0
-        } else {
-            (min_fill + self.block_frames).saturating_sub(self.buf_frames)
-        };
         self.dma_tc = false; // restart re-loads the count registers
         self.playing = self.buf_frames > 0;
         if self.playing {
@@ -618,15 +633,11 @@ impl Sb {
     /// Advance the DSP's guest-visible clock and report whether the card wants
     /// its interrupt line raised.
     ///
-    /// `drained`/`pushed` are the host sink's playback counters **in this
-    /// card's frames**: frames the codec has actually consumed, and frames
-    /// handed to it. The cursor — the DMA count and the block-boundary IRQs
-    /// both derive from it — is `drained + slack`, capped at `pushed`. A real
-    /// SB's DMA cursor IS its playback position; deriving it from what the
-    /// codec has consumed reproduces exactly that. Also ends the hangover
-    /// hold, and completes tiny probe transfers on virtual time (their IRQ
-    /// can't wait for a stream to start draining).
-    pub fn advance_clock(&mut self, now: u64, drained: u64, pushed: u64) -> bool {
+    /// `produced` is the number of this card's frames the CPU-clocked mixer has
+    /// consumed. The final HDA/AC'97/SB sink trails behind by its pipe depth and
+    /// has no bearing on this DMA cursor. Also ends the hangover hold and
+    /// completes single-cycle transfers on their CPU-time clock.
+    pub fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
         if !self.playing {
             // Hangover: the host keeps the stream fed (silence + synths) while
             // `stream_hold` keeps `owns_sink` true; effect chains re-trigger
@@ -645,7 +656,7 @@ impl Sb {
             (now.saturating_sub(self.start_ms) * self.rate.max(1) as u64 / 1000)
                 .min(self.next_irq)
         } else {
-            (drained + self.slack as u64).min(pushed)
+            produced
         };
         let mut raise = false;
         while self.playing && guest_now >= self.next_irq {
@@ -766,8 +777,8 @@ impl Sb {
         self.rate
     }
 
-    /// A DSP playback (re)started since the last call: the host's pump must
-    /// re-key its session so pump frames and DSP stream frames coincide.
+    /// A DSP playback (re)started since the last call: the host resets its
+    /// incremental DSP source phase.
     pub fn take_restart(&mut self) -> bool {
         core::mem::take(&mut self.restarted)
     }
@@ -781,6 +792,20 @@ impl Sb {
     /// Program-exit cleanup: stop the DSP and drop the FM chip so the next
     /// program sees a power-on card. Parking the host's sink is separate —
     /// it is shared with every other card.
+    /// The write-only stream state, for handing this card's programming to a
+    /// new owner (or to real silicon — see `vsb`'s native/emulated lift).
+    pub fn dsp_state(&self) -> DspState {
+        DspState {
+            rate: self.rate,
+            bits: self.bits,
+            stereo: self.stereo,
+            single: self.single,
+            block: self.block_param,
+            speaker: self.speaker,
+            playing: self.playing,
+        }
+    }
+
     pub fn reset_for_exit(&mut self) {
         self.playing = false;
         self.stream_hold = false;
@@ -806,15 +831,15 @@ impl Sb {
 
     /// Which window of the guest's ring the next mix block needs, or `None`
     /// when the DSP contributes nothing (idle, hangover, or starved past the
-    /// commit horizon). `base` is the host's mix-session frame of `block[0]`,
-    /// which — because [`begin`](Self::begin) asks for a re-key — is also this
-    /// stream's frame.
+    /// commit horizon). `first`/`last` are incremental DSP-frame positions
+    /// calculated by the host; no current output rate is applied to historical
+    /// output frames.
     ///
     /// The card cannot fetch this itself; see the module note. The host copies
     /// `source_frames` frames starting at `first`, wrapping at `buf_frames`,
     /// and passes the linear result to [`mix_dsp`](Self::mix_dsp).
-    pub fn dsp_fetch(&self, rate: u32, base: u64, block_frames: usize) -> Option<Fetch> {
-        if !self.playing || rate == 0 {
+    pub fn dsp_fetch(&self, first: u64, last: u64) -> Option<Fetch> {
+        if !self.playing {
             return None; // idle or hangover: the pump's zeros are our silence
         }
         let channels = if self.stereo { 2u32 } else { 1 };
@@ -822,9 +847,6 @@ impl Sb {
         if frame_bytes == 0 || self.buf_frames == 0 {
             return None;
         }
-        let dsp_rate = self.rate.max(1) as u64;
-        let first = base * dsp_rate / rate as u64;
-        let last = (base + block_frames.saturating_sub(1) as u64) * dsp_rate / rate as u64;
         let end = (last + 1).min(self.committed_end());
         if first >= end {
             return None; // starved: leave the pump's silence
@@ -869,20 +891,27 @@ impl Sb {
     /// host fetched. `src` is `f.source_frames` frames starting at `f.first`,
     /// linear (the host already un-wrapped the ring).
     ///
-    /// The ring is the guest's, clocked at the guest's rate; `block` is the
-    /// host's, at the canonical rate. Map each output frame back to the DSP
-    /// frame playing at that instant (zero-order hold).
-    pub fn mix_dsp(&self, rate: u32, base: u64, src: &[u8], f: &Fetch, block: &mut [(i32, i32)]) {
+    /// `position_q32` and `step_q32` are the host's incremental source phase;
+    /// changing the output mix rate changes only future steps, never the
+    /// interpretation of frames already produced.
+    pub fn mix_dsp(
+        &self,
+        mut position_q32: u64,
+        step_q32: u64,
+        src: &[u8],
+        f: &Fetch,
+        block: &mut [(i32, i32)],
+    ) {
         let (gl, gr) = self.mixer.voice_gain_q16();
-        let dsp_rate = self.rate.max(1) as u64;
-        for (i, slot) in block.iter_mut().enumerate() {
-            let s = (base + i as u64) * dsp_rate / rate as u64;
+        for slot in block.iter_mut() {
+            let s = position_q32 >> 32;
             if s >= f.end {
                 break;
             }
             let (l, r) = self.frame(src, (s - f.first) as usize);
             slot.0 += (l as i32 * gl) >> 16;
             slot.1 += (r as i32 * gr) >> 16;
+            position_q32 = position_q32.wrapping_add(step_q32);
         }
     }
 
@@ -993,7 +1022,7 @@ mod tests {
             let mut sb = Sb::new();
             // 8237 armed for 256 bytes; DSP command carries length-1 = 0.
             sb.begin(Start { bits: 8, stereo: false, single: true,
-                             block_override: Some(0) }, 0x1000, 256, 0);
+                             block_override: Some(0) }, 0x1000, 256);
             sb.cursor = sb.block_frames as u64; // the DSP's one transfer
             sb.finish_single(1);
             sb
@@ -1005,7 +1034,7 @@ mod tests {
         // The agreeing case — every real driver — still latches TC.
         let mut whole = Sb::new();
         whole.begin(Start { bits: 8, stereo: false, single: true,
-                            block_override: Some(255) }, 0x1000, 256, 0);
+                            block_override: Some(255) }, 0x1000, 256);
         whole.cursor = whole.block_frames as u64;
         whole.finish_single(1);
         assert!(whole.at_terminal_count(), "a full-length transfer must reach TC");
@@ -1036,16 +1065,15 @@ mod tests {
         sb.buf_frames = 100;
         sb.block_frames = 10;
         sb.next_irq = 10;
-        sb.slack = 0;
         sb.single = false;
         sb.bits = 8;
 
-        assert!(sb.advance_clock(10, 10, 100));
+        assert!(sb.advance_clock(10, 10));
         assert_eq!(sb.irq_status & 0x01, 0x01);
 
         // A second completed block advances all accounting, but the DSP's
         // interrupt latch is still pending and therefore produces no new edge.
-        assert!(!sb.advance_clock(20, 20, 100));
+        assert!(!sb.advance_clock(20, 20));
         assert_eq!(sb.blocks_done, 2);
 
         // Reading the 8-bit acknowledge port clears the latch. The following
@@ -1053,6 +1081,6 @@ mod tests {
         let ack_port = sb.io_base + 0x0E;
         let _ = sb.port_read(ack_port);
         assert_eq!(sb.irq_status & 0x01, 0);
-        assert!(sb.advance_clock(30, 30, 100));
+        assert!(sb.advance_clock(30, 30));
     }
 }

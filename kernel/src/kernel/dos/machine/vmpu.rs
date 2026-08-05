@@ -108,16 +108,6 @@ impl Mpu {
         }
     }
 
-    /// Whether the synth currently owes the sink audio.
-    pub(super) fn mixing(&self) -> bool {
-        // Also true while stamped bytes are still queued: they will start notes
-        // at a future frame, so the producer must keep the stream running until
-        // they are consumed (otherwise production stops before they render).
-        self.synth
-            .as_ref()
-            .is_some_and(|s| s.mixing() || s.has_pending())
-    }
-
     /// Sum the GM synth into the pump block. The scale is mix policy, like
     /// the GUS's, and is *not* the GUS's: the bank is the same, but a GM
     /// sequence drives far more simultaneous voices, so it needs its own

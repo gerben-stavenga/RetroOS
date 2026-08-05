@@ -189,6 +189,41 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    /// Hand this thread the machine's Sound Blaster, returning whatever it
+    /// did not take. Moves with the console, and for the same reason: it is
+    /// one piece of machine hardware and the owner is whoever the machine is
+    /// currently showing. A Linux thread has no use for it and hands it
+    /// straight back; so does a DOS thread on a machine running the card as
+    /// the kernel mixer's sink, because there the sink never let it go and
+    /// this is `None`.
+    pub fn adopt_sb<A2>(
+        &mut self,
+        machine: &mut A2,
+        card: Option<crate::kernel::drivers::sb16::SbCard>,
+    ) -> Option<crate::kernel::drivers::sb16::SbCard>
+    where
+        A2: crate::Arch,
+    {
+        match (self, card) {
+            (Self::Dos(d), Some(card)) => {
+                d.pc.sb.adopt_card(machine, card);
+                None
+            }
+            (_, card) => card,
+        }
+    }
+
+    /// Take the card back off this thread, if it has it.
+    pub fn release_sb<A2: crate::Arch>(
+        &mut self,
+        machine: &mut A2,
+    ) -> Option<crate::kernel::drivers::sb16::SbCard> {
+        match self {
+            Self::Dos(d) => d.pc.sb.release_card(machine),
+            Self::Linux(_) => None,
+        }
+    }
+
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
     pub fn suspend(
@@ -257,26 +292,29 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    /// Advance this thread's emulated world to the current virtual time,
-    /// BEFORE the guest is resumed and BEFORE input routing: DOS steps PIT
-    /// ticks, the display present cadence, and audio mixing. Linux threads have
-    /// no virtual devices to advance. Runs once per event-loop iteration, while
-    /// the guest is stopped (see `event_loop`).
-    pub fn advance_world(&mut self, machine: &mut A, regs: &mut Regs) {
+    /// Advance this thread's emulated devices to the current virtual time,
+    /// before audio, display, input routing, and guest resume. DOS steps its
+    /// PIT and services sound-device events; Linux currently has no virtual
+    /// devices to advance. Runs once per event-loop iteration.
+    pub fn advance_world(
+        &mut self,
+        machine: &mut A,
+        ticks: u32,
+        audio_pushed: u64,
+    ) {
         match self {
             Self::Dos(dos) => {
-                let ticks = machine.take_pending_ticks();
                 // Port-polling games can exit to the kernel hundreds of
                 // thousands of times between adjacent millisecond ticks.
-                // Display and the audio pump are driven by this tick clock,
-                // so revisiting the whole virtual machine when it did not
-                // advance is pure per-exit overhead. Device service is not:
+                // Display and output pumping are driven by this tick clock, so
+                // revisiting the whole virtual machine when it did not advance
+                // is pure per-exit overhead. Device service is not:
                 // its latency contract is the slice (MI2 arms a one-byte DMA
                 // probe and expects the completion back-to-back; a 1 ms
                 // floor loses it — 35e3b27, regressed once by a full
                 // early-out here).
                 if ticks == 0 {
-                    crate::kernel::dos::audio_service(machine, dos);
+                    crate::kernel::dos::audio_service(machine, dos, audio_pushed);
                     return;
                 }
                 // Instrument only actual world advances. Per-exit rdtsc
@@ -286,27 +324,40 @@ impl<A: crate::Arch> Personality<A> {
                 for _ in 0..ticks {
                     crate::kernel::dos::queue_tick(machine, dos);
                 }
+                crate::kernel::dos::audio_service(machine, dos, audio_pushed);
                 let t1b = if prof { machine.rdtsc() } else { 0 };
-                // Service sound before display work. A GOP publication is an
-                // unavoidable synchronous device-memory burst and may consume
-                // most of a millisecond; feeding audio first keeps that burst
-                // from turning into an output underrun.
-                crate::kernel::dos::audio_tick(machine, dos, regs);
-                let t2 = if prof { machine.rdtsc() } else { 0 };
-                if ticks > 0 {
-                    // One processed world slice advances the display once.
-                    // Batched/missed timer slices deliberately do not create
-                    // display catch-up work.
-                    crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
-                }
                 if prof {
-                    let t3 = machine.rdtsc();
                     crate::kernel::startup::bill_slice2(
                         0, t1b.wrapping_sub(t1),
-                        t3.wrapping_sub(t2), t2.wrapping_sub(t1b), ticks as u64);
+                        0, 0, ticks as u64);
                 }
             }
             Self::Linux(_) => {}
+        }
+    }
+
+    /// Mix one span requested by the event loop's output pump.
+    pub fn audio_tick(
+        &mut self,
+        machine: &mut A,
+        span: crate::kernel::sound::AudioSpan<'_>,
+    ) {
+        match self {
+            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, span),
+            Self::Linux(_) => {}
+        }
+    }
+
+    /// Advance the visible display once after audio has been fed. Batched
+    /// timer slices deliberately do not create display catch-up work.
+    pub fn display_tick(&mut self, machine: &mut A, regs: &Regs) {
+        let Self::Dos(dos) = self else { return };
+        let prof = crate::kernel::startup::profile_enabled();
+        let t0 = if prof { machine.rdtsc() } else { 0 };
+        crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
+        if prof {
+            crate::kernel::startup::bill_slice2(
+                0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);
         }
     }
 
@@ -826,6 +877,7 @@ pub fn exit_thread<A: crate::Arch>(
     tid: usize,
     exit_code: i32,
     display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
 
@@ -840,6 +892,13 @@ pub fn exit_thread<A: crate::Arch>(
             let display = thread.personality.suspend(machine, bios_workspace);
             assert!(display_handoff.is_none(), "unconsumed display handoff");
             *display_handoff = Some(display);
+        }
+        // The card outlives its holder: whatever the dying thread had goes
+        // back into the handoff for the next owner, exactly as the display
+        // token does. A thread that never had it yields `None`.
+        if let Some(card) = thread.personality.release_sb(machine) {
+            assert!(sb_handoff.is_none(), "unconsumed SB handoff");
+            *sb_handoff = Some(card);
         }
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),

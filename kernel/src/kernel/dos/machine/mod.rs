@@ -253,9 +253,6 @@ pub struct PcMachine {
     /// no configuration for — and driven entirely by the port dispatch above:
     /// PIT channel 2's reload for pitch, port 61h bits 0-1 for the gate.
     pub spk: sound::speaker::Speaker,
-    /// The mixer pump: the thread's one canonical PCM stream, every emulated
-    /// sound device summed into it, paced by the sink's playback position.
-    pub mixer: Mixer,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -478,7 +475,6 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).gus).write(Gus::new());
             core::ptr::addr_of_mut!((*p).mpu).write(Mpu::new());
             core::ptr::addr_of_mut!((*p).spk).write(sound::speaker::Speaker::new());
-            core::ptr::addr_of_mut!((*p).mixer).write(Mixer::new());
             core::ptr::addr_of_mut!((*p).cmos_index).write(0);
             core::ptr::addr_of_mut!((*p).native_vbe_io_rmcs).write(0);
             core::ptr::addr_of_mut!((*p).locked_stack)
@@ -1054,14 +1050,12 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     }
 }
 
-/// A PCM producer the mixer pump sums per block, saturating — the one shape
+/// A PCM producer the mixer pump sums per block — the one shape
 /// every emulated sound device presents: the SB DSP fills from the guest
 /// ring, OPL from nuked-opl3, the GUS from the wavetable sampler; further
 /// sampler-backed devices (GM, AWE) join by implementing this. `mix` is a
-/// pure frame generator: sub-block events (voice IRQs, block boundaries)
-/// are stamped with their session frame (`base + i`) and delivered by the
-/// device's *tick* when the sink's drain clock crosses them — never raised
-/// from inside `mix`, which runs up to a pipe-fill ahead of the speaker.
+/// pure frame generator. Its device clock is the CPU-clocked production
+/// frontier; the final speaker sink trails it by the physical pipe depth.
 enum PcmSource<'a> {
     /// `None` when this thread holds the real card: silicon mixes itself, and
     /// there is no emulated card to ask for frames.
@@ -1077,11 +1071,10 @@ impl PcmSource<'_> {
         machine: &mut A,
         rate: u32,
         base: u64,
-        dsp_base: u64,
         block: &mut [(i32, i32)],
     ) {
         match self {
-            Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, dsp_base, block),
+            Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, block),
             Self::SoundBlaster(None) => {}
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
             Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
@@ -1093,60 +1086,14 @@ impl PcmSource<'_> {
     }
 }
 
-/// Canonical shape the pump plays: signed 16-bit interleaved stereo.
-const MIX_CANON: crate::kernel::sound::Format = crate::kernel::sound::Format {
-    bits: 16,
-    signed: true,
-    channels: 2,
-};
-
-/// Frames per pump chunk (bounded stack buffers; a due burst loops).
-const MIX_CHUNK: usize = 128;
-
-/// The mix's one and only clip point.
-fn sat16(v: i32) -> i16 {
-    v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-/// The canonical mix clock. Fixed, and deliberately *not* borrowed from
+/// The nominal canonical mix rate is deliberately *not* borrowed from
 /// whichever device happens to be loudest: a DOS game commonly plays 11 kHz
 /// SB effects over 44 kHz wavetable music, and letting the DSP own the rate
 /// resampled the GUS down to the effects' bandwidth — Doom's music came out
 /// of an 11 kHz pipe, band-limited to 5.5 kHz with the zero-order hold's
 /// staircase images stacked on top. Every source now renders into this clock
-/// and resamples itself; the sinks take 44.1 kHz natively, so nothing
-/// downstream resamples at all.
-const MIX_RATE: u32 = 44100;
-
-/// The one mixer pump: exactly one canonical PCM stream, paced by the sink's
-/// playback position (`sound::Pace`), into which every audible `PcmSource`
-/// sums its frames. Owns the stream lifecycle (open while anything is
-/// audible, paused when everything goes quiet) and the session identity that
-/// event stamps and the DSP's guest clock are numbered in.
-pub struct Mixer {
-    pace: crate::kernel::sound::Pace,
-    /// Global mix-frame position at which the current DSP playback began.
-    /// The output clock stays continuous when sources come and go; the DSP's
-    /// guest-visible cursor is local to each playback, so it uses this epoch
-    /// instead of re-keying the whole mixer (which would also disrupt GUS).
-    dsp_epoch: u64,
-    streaming: bool,
-    last_ms: u64,
-}
-
-impl Mixer {
-    pub const fn new() -> Self {
-        Mixer {
-            pace: crate::kernel::sound::Pace::new(),
-            dsp_epoch: 0,
-            streaming: false,
-            last_ms: 0,
-        }
-    }
-}
-
-/// Advance emulated sound by one event-loop quantum (no-op for the parts a
-/// real card serves): deliver device IRQs, run the mixer pump, then derive
+/// and resamples itself at the producer's gently adjusted output rate. The
+/// adjustment changes sample density, not source time or pitch.
 /// Per-slice device service — the audio work whose LATENCY contract is the
 /// event-loop slice, not the millisecond pump: the SB's latched 0xF2/0xF3
 /// trigger IRQ, single-cycle DMA probe completions (MI2's driver expects
@@ -1157,8 +1104,8 @@ impl Mixer {
 /// clock here once stamped a program's first notes seconds ahead, the GM
 /// start delay). Called on every event-loop slice, including the ticks==0
 /// fast path that skips the pump entirely.
-pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
-    let PcMachine { sb, gus, mpu, vpic, mixer, .. } = pc;
+pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
+    let PcMachine { sb, gus, mpu, vpic, .. } = pc;
     // Latched probe/trigger IRQs are the emulated card's business: a real one
     // raises its own line and the relay carries it.
     let SoundBlaster { blaster, device } = sb;
@@ -1167,16 +1114,16 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
         emu.deliver_probe_irq(machine, vpic, blaster.irq);
     }
     gus.tick(machine, vpic);
-    mpu.tick(machine, mixer.pace.pushed());
+    mpu.tick(machine, pushed);
 }
 
-/// every guest-visible clock from the sink's drain position.
-pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
-    let _ = regs;
-    let profiling = crate::kernel::startup::profile_enabled();
-    let prof_start = if profiling { machine.rdtsc() } else { 0 };
-    audio_service(machine, pc);
-    let PcMachine { sb, gus, mpu, spk, vpic, mixer, .. } = pc;
+/// Mix one CPU-clocked producer span and advance producer-side device clocks.
+pub fn audio_tick<A: crate::Arch>(
+    machine: &mut A,
+    pc: &mut PcMachine,
+    span: crate::kernel::sound::AudioSpan<'_>,
+) {
+    let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
     // The pump mixes emulated sources only. A thread holding the real card
     // has nothing here: its DSP streams from the guest ring over the ISA bus
     // and its OPL is the card's own, so neither produces frames for us and
@@ -1188,127 +1135,23 @@ pub fn audio_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mu
         SbDevice::Emulated(emu) => Some(&mut **emu),
         SbDevice::Native(_) => None,
     };
-    let now = machine.get_ticks();
-    let dt = now.saturating_sub(mixer.last_ms).min(100);
+    if let Some(emu) = sb.as_deref_mut() {
+        let _ = emu.take_restart();
+    }
+    let mut sources = [
+        PcmSource::SoundBlaster(sb.as_deref_mut()),
+        PcmSource::Gus(gus),
+        PcmSource::Midi(mpu),
+        PcmSource::Speaker(spk),
+    ];
+    for source in &mut sources {
+        source.mix_into(machine, span.rate, span.base_frame, span.frames);
+    }
 
-    // The pump runs on the millisecond, not on the slice. A DOS program that
-    // drives an emulated device hard (the GUS driver writes GF1 registers by
-    // the tens of thousands per second) re-enters the event loop far faster
-    // than audio needs: the sink's position is an uncached MMIO read — a KVM
-    // exit under QEMU — and reading it per slice cost ~25% of a core while
-    // the pipe (tens of ms deep) had nothing to do 97% of the time. One read
-    // per millisecond is two orders of magnitude inside the pipe's depth.
-    if dt == 0 {
-        if profiling {
-            crate::kernel::startup::bill_audio(
-                machine.rdtsc().wrapping_sub(prof_start), 0, 0, 0, 0);
-        }
-        return;
-    }
-    mixer.last_ms = now;
-    let prof_devices = if profiling { machine.rdtsc() } else { 0 };
-
-    // ── the pump ──
-    let dsp_on = sb.as_deref().is_some_and(|e| e.dsp_owns_sink());
-    let gus_on = gus.mixing();
-    let opl_on = sb.as_deref().is_some_and(|e| e.opl_audible(now));
-    let midi_on = mpu.mixing();
-    let spk_on = spk.audible(MIX_RATE);
-    // Idle sources do NOT stop the sink: once a session streams, it stays
-    // alive and idle gaps pump silence. Stopping here paused/re-primed the
-    // hardware stream on every gap (menu→demo music transitions), and an HDA
-    // stream restarted without SRST can come back dead — freezing the drain
-    // clock every guest audio cursor and IRQ is slaved to. Warm-reboot codec
-    // safety is not this path's job: every shutdown/reboot/panic path calls
-    // `hda::emergency_quiesce`. Only a session that never started skips out.
-    if !dsp_on && !gus_on && !opl_on && !midi_on && !spk_on && !mixer.streaming {
-        if profiling {
-            crate::kernel::startup::bill_audio(
-                prof_devices.wrapping_sub(prof_start),
-                machine.rdtsc().wrapping_sub(prof_devices),
-                0, 0, 0);
-        }
-        return;
-    }
-    // Source activity does not define the output session. In particular, an
-    // SB effect starting over GUS music must not reset the GUS event/drain
-    // timeline while older frames are still queued in the physical sink.
-    // Give only the DSP its new local frame zero on each playback restart.
-    if sb.as_deref_mut().is_some_and(|e| e.take_restart()) {
-        mixer.dsp_epoch = mixer.pace.pushed();
-    }
-    let rate = MIX_RATE;
-    let mut n = mixer.pace.due(machine, rate, dt, MIX_CHUNK);
-    let generated = n;
-    let mut base = mixer.pace.pushed() - n;
-    let prof_setup = if profiling { machine.rdtsc() } else { 0 };
-    // Sources sum into a WIDE accumulator and the mix is clipped exactly once,
-    // here, on the way out. Saturating each i16 add per source (what we used to
-    // do) clips every source against every other one: a full-scale digital SFX
-    // played over FM music pinned the sum at the rail and flat-topped the music
-    // with it. Each source carries its own card-accurate scale (see vsb.rs's
-    // FM_SCALE_Q16 / DAC_SCALE_Q16 / GUS_SCALE_Q16), which is where the
-    // headroom lives, so the clamp below is a backstop, not the normal path.
-    // Card-balance headroom (unity) composed with the F12 monitor's runtime
-    // master volume, applied once at the mix-out clip below. Composed in i64 so
-    // the two Q16 factors can't overflow; the result is ≤ unity.
-    let out_gain =
-        ((vsb::OUTPUT_GAIN_Q16 as i64 * crate::kernel::osd::master_gain_q16() as i64) >> 16) as i32;
-    let mut frames = [(0i32, 0i32); MIX_CHUNK];
-    let mut bytes = [0u8; MIX_CHUNK * 4];
-    while n > 0 {
-        let run = MIX_CHUNK;
-        frames[..run].fill((0, 0));
-        let dsp_base = base.saturating_sub(mixer.dsp_epoch);
-        let mut sources = [
-            PcmSource::SoundBlaster(sb.as_deref_mut()),
-            PcmSource::Gus(gus),
-            PcmSource::Midi(mpu),
-            PcmSource::Speaker(spk),
-        ];
-        for source in &mut sources {
-            source.mix_into(machine, rate, base, dsp_base, &mut frames[..run]);
-        }
-        for (i, (l, r)) in frames[..run].iter().enumerate() {
-            let l = sat16(((i64::from(*l) * i64::from(out_gain)) >> 16)
-                .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-            let r = sat16(((i64::from(*r) * i64::from(out_gain)) >> 16)
-                .clamp(i32::MIN as i64, i32::MAX as i64) as i32);
-            bytes[i * 4..i * 4 + 2].copy_from_slice(&l.to_le_bytes());
-            bytes[i * 4 + 2..i * 4 + 4].copy_from_slice(&r.to_le_bytes());
-        }
-        crate::kernel::sound::play(machine, rate, MIX_CANON, &bytes[..run * 4]);
-        base += run as u64;
-        n -= run as u64;
-    }
-    mixer.streaming = true;
-    let prof_pump = if profiling { machine.rdtsc() } else { 0 };
-
-    // ── guest clocks & event delivery, on the drain clock ──
-    // GUS events are stamped in mix frames; the DSP's cursor, DMA counts and
-    // block IRQs are all counted in *its* frames, so the drain point converts
-    // into the DSP's rate on the way in.
-    // `drained` is already smoothed at the source (Pace interpolates the sink's
-    // per-buffer completions with real time), so the SB cursor derived from it
-    // advances evenly and production, `pushed`, and the cursor all move together.
-    let drained = mixer.pace.drained();
-    let pushed = mixer.pace.pushed();
     if let Some(emu) = sb {
-        let dsp_rate = emu.dsp_rate().max(1) as u64;
-        let to_dsp = |mix: u64| mix.saturating_sub(mixer.dsp_epoch) * dsp_rate / rate as u64;
-        emu.dsp_clock_tick(machine, vpic, sb_irq, to_dsp(drained), to_dsp(pushed));
+        emu.dsp_clock_tick(machine, vpic, sb_irq);
     }
     gus.deliver_events(vpic);
-
-    if profiling {
-        let prof_end = machine.rdtsc();
-        crate::kernel::startup::bill_audio(
-            prof_devices.wrapping_sub(prof_start),
-            prof_setup.wrapping_sub(prof_devices),
-            prof_pump.wrapping_sub(prof_setup),
-            prof_end.wrapping_sub(prof_pump),
-            generated);
-    }
 }
 
 pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, event: crate::Irq) {

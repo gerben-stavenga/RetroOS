@@ -43,7 +43,6 @@
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
-use crate::kernel::sound::Format;
 
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
@@ -99,26 +98,19 @@ const CORB_ENTRIES: usize = 256; // 4 bytes each → 1 KB
 const RIRB_ENTRIES: usize = 256; // 8 bytes each → 2 KB
 const CORB_OFF: usize = 0x0000;
 const RIRB_OFF: usize = 0x0400;
-const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 512 bytes
-const POS_OFF: usize = 0x0E00; // 128-byte aligned; DMA position buffer (8 strm*8)
-const BUF_OFF: usize = 0x1000; // PCM ring starts on the next page
+const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 1024 bytes
+const POS_OFF: usize = 0x1000; // 128-byte aligned; DMA position buffer (8 strm*8)
+const BUF_OFF: usize = 0x2000; // PCM ring starts on the next page
 const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
-// ── PCM ring geometry (mirror ac97) ──────────────────────────────────────────
-const NUM_BUF: usize = 32;
-// 2 KB = 512 stereo frames ≈ 11.6 ms @ 44.1 kHz. This is the completion-IRQ
-// granularity (one interrupt per buffer), NOT the pipe depth — the pipe is the
-// universal `sound::min_fill`, shared by every sink. A 30-ms pipe keeps about
-// 2.6 buffers queued, leaving a complete-buffer refill margin while halving
-// the old 256-frame completion-IRQ rate. MIDI onset is stamped at arrival (see
-// midi.rs), so buffer size never quantises notes. The ring is larger than the
-// pipe only to guard the write cursor ahead of play.
-const BUF_BYTES: usize = 0x800;
-const PRIME_BUFS: usize = 2;
-/// Hard drop ceiling, just under the ring's ahead/behind ambiguity point.
-/// Every producer is position-slaved (`sound::position`/`sound::Pace`) and
-/// pins its own fill, so this only catches runaway bursts.
-const MAX_AHEAD: usize = 15;
+// ── PCM ring geometry ────────────────────────────────────────────────────────
+// Fine descriptors make cursor accounting and latency control ~2.9 ms at
+// 44.1 kHz. They do not imply an interrupt each: only two descriptors per ring
+// carry IOC, and normal accounting polls the live cursor.
+const NUM_BUF: usize = 64;
+const BUF_BYTES: usize = 0x200;
+const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
+const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
@@ -185,8 +177,6 @@ static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::
 /// the PIT and therefore cannot allocate an MSI vector.
 static IRQ_LINE: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(u32::MAX);
-/// Buffer-completion interrupts serviced (bring-up diagnostic for now).
-static HDA_IRQS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 #[inline]
 fn spin(n: usize) {
@@ -263,27 +253,18 @@ struct Hda {
     pin: u32,
     pin_def: u32,
     path: OutputPath,
-    cur_buf: usize,
-    cur_off: usize,
     running: bool,
     /// Hardware stream rate currently programmed into SDFMT/the converter.
     rate: u32,
-    /// Producer/source rate currently being adapted into the hardware stream.
-    src_rate: u32,
-    /// Output-rate accumulator for zero-order-hold resampling.
-    resample_acc: u64,
-    /// Pipe counters for [`position`]: source frames accepted by `submit`,
-    /// and hardware bytes consumed (LPIB deltas accumulated across ring
-    /// wraps — LPIB itself is modular in CBL). Every producer slaves its
-    /// pacing to these (`sound::Pace` / the vsb pipe model), which is why
-    /// this driver needs no clock-follow servo: producer and codec share a
-    /// clock by construction.
-    written_src: u64,
+    /// Bytes the codec has consumed since the stream started, monotonic, and
+    /// the last modular hardware position it was accumulated from. Completion
+    /// interrupts are wakeups; this cursor delta, never the number of queued
+    /// IRQ events, is the authoritative amount consumed.
     consumed_hw: u64,
-    /// Last modular hardware DMA byte position. Completion interrupts are
-    /// wakeups; this cursor delta, not the number of queued IRQ events, is the
-    /// authoritative amount consumed.
     last_hw_pos: u32,
+    /// Blocks the engine has been told about, so a coalesced interrupt emits
+    /// the difference rather than one event.
+    reported: u64,
     /// True once the DMA position buffer has read nonzero this stream session:
     /// it is the preferred cursor (some QEMU builds never update SDLPIB), but
     /// real controllers exist where it stays 0 forever while SDLPIB tracks the
@@ -291,23 +272,6 @@ struct Hda {
     /// position_fix quirk table exists for). Until it proves live, consumption
     /// deltas come from SDLPIB.
     posbuf_live: bool,
-    /// Sparse runtime diagnostics for real hardware bring-up.
-    logged_submit: bool,
-    logged_run: bool,
-    diag_buffers: u8,
-    diag_stalls: u8,
-    /// Position-poll counter + print budget for the periodic stream diagnostic.
-    diag_pos_calls: u32,
-    diag_pos_prints: u8,
-    /// Hardware-stream bytes actually written into the ring. Upper bound for
-    /// `consumed_hw`: the codec cannot have played bytes never emitted, and
-    /// `on_irq` clamps its position-delta against the in-flight difference —
-    /// one stale/backward DMA-position read otherwise aliases to a near-full-
-    /// ring forward delta and the drain clock leaps a lap.
-    emitted: u64,
-    /// Frames refused at the MAX_AHEAD ceiling and lap-resync events.
-    diag_dropped: u64,
-    diag_resyncs: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -627,25 +591,12 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         pin: 0,
         pin_def: 0,
         path: OutputPath::EMPTY,
-        cur_buf: 0,
-        cur_off: 0,
         running: false,
         rate: 0,
-        src_rate: 0,
-        resample_acc: 0,
-        written_src: 0,
+        reported: 0,
         consumed_hw: 0,
         last_hw_pos: 0,
         posbuf_live: false,
-        logged_submit: false,
-        logged_run: false,
-        diag_buffers: 0,
-        diag_stalls: 0,
-        diag_pos_calls: 0,
-        diag_pos_prints: 0,
-        emitted: 0,
-        diag_dropped: 0,
-        diag_resyncs: 0,
     };
 
     // Link reset + codec detection, with escalating recovery. A hard reboot
@@ -861,16 +812,13 @@ impl Hda {
     fn buf_phys(&self, i: usize) -> u32 {
         self.dma_phys + (BUF_OFF + i * BUF_BYTES) as u32
     }
-    fn buf_va(&self, i: usize) -> usize {
-        self.dma_va + BUF_OFF + i * BUF_BYTES
-    }
 
     /// Fill the BDL: entry i → PCM buffer i. Each HDA BDL entry is 16 bytes
-    /// { addr:u64, len:u32, flags:u32 }. flags bit0 = IOC, set per buffer: one
-    /// completion interrupt per buffer drives the event-loop audio track.
+    /// { addr:u64, len:u32, flags:u32 }. IOC is sparse; polling drives cursor
+    /// accounting and the interrupt only wakes an otherwise idle kernel.
     fn build_bdl(&mut self) {
-        let ioc = 1u32;
         for i in 0..NUM_BUF {
+            let ioc = u32::from(i == NUM_BUF / 2 - 1 || i == NUM_BUF - 1);
             let entry = self.dma_va + BDL_OFF + i * 16;
             unsafe {
                 write_volatile(entry as *mut u32, self.buf_phys(i)); // addr low
@@ -926,13 +874,9 @@ impl Hda {
             self.stop();
             self.running = false;
         }
-        self.cur_buf = 0;
-        self.cur_off = 0;
-        self.resample_acc = 0;
-        self.written_src = 0;
         self.consumed_hw = 0;
-        self.emitted = 0;
         self.last_hw_pos = 0;
+        self.reported = 0;
         self.posbuf_live = false;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
@@ -1006,7 +950,6 @@ impl Hda {
         w32(GCTL, 0);
         self.parked = true;
         self.rate = 0; // CRST wiped SDFMT/converter state: force set_format
-        self.src_rate = 0;
     }
 
     /// Release a parked link and rebuild everything CRST wiped: controller
@@ -1443,10 +1386,6 @@ impl Hda {
         }
     }
 
-    /// Current play position as a buffer index, from the hardware byte position.
-    fn play_buf(&self) -> usize {
-        (r32(self.sd + SDLPIB) as usize / BUF_BYTES) % NUM_BUF
-    }
 
     /// Play position (bytes) from the DMA position buffer — QEMU's authoritative
     /// source on builds that don't update the SDLPIB register.
@@ -1479,176 +1418,25 @@ impl Hda {
         }
     }
 
-    fn emit_stereo(&mut self, l: i16, r: i16) -> bool {
-        // At each buffer boundary: clock-follow servo + lap resync + a hard
-        // drop ceiling. `ahead` is modular distance producer→codec; values
-        // past half the ring mean the codec lapped us (starvation).
-        if self.cur_off == 0 && self.running {
-            let civ = self.play_buf();
-            let ahead = (self.cur_buf + NUM_BUF - civ) % NUM_BUF;
-            if ahead >= NUM_BUF / 2 {
-                // Lapped: the codec ran past the write cursor (underrun — the
-                // event loop stalled longer than the pipe is deep) and is
-                // replaying stale ring (the audible "echoes"). Resync just
-                // past the play position and zero a guard buffer so the gap
-                // plays silence, not history — AND snap the drain accounting
-                // to the truth that the codec has consumed everything ever
-                // written. Moving only the cursor left `Pace` believing the
-                // pipe was still full: production then trickled at drain rate
-                // forever *behind* the play head, re-tripping this branch at
-                // every buffer boundary (a resync storm) while the stale lap
-                // replayed — and the drain clock the guest's DSP block IRQs
-                // are slaved to wedged, hanging the guest's sound driver.
-                // With the snap, Pace's deficit becomes a full pipe fill and
-                // the very next pushes re-prime cleanly ahead of the codec.
-                let guard = (civ + 1) % NUM_BUF;
-                unsafe {
-                    core::ptr::write_bytes(self.buf_va(guard) as *mut u8, 0, BUF_BYTES);
-                }
-                self.cur_buf = (civ + 2) % NUM_BUF;
-                self.consumed_hw = self.emitted;
-                self.last_hw_pos = self.hw_cursor() % (NUM_BUF * BUF_BYTES) as u32;
-                self.diag_resyncs = self.diag_resyncs.wrapping_add(1);
-            } else if ahead >= MAX_AHEAD {
-                self.diag_dropped += 1;
-                if self.diag_stalls < 3 {
-                    crate::println!(
-                        "hda: stall cur_buf={} play_buf={} ahead={} lpib={} pos={}",
-                        self.cur_buf,
-                        civ,
-                        ahead,
-                        r32(self.sd + SDLPIB),
-                        self.dma_pos(),
-                    );
-                    self.diag_stalls += 1;
-                }
-                return false;
-            }
+    /// Blocks the codec has played since we last said, from the hardware
+    /// cursor. Never from counting interrupts: a completion landing on an
+    /// already-set status bit is indistinguishable from one, and the cursor
+    /// turns a coalesced interrupt back into the right NUMBER of blocks.
+    fn advance(&mut self) -> u64 {
+        if !self.running {
+            return 0;
         }
-        let p = self.buf_va(self.cur_buf) + self.cur_off;
-        unsafe {
-            write_volatile(p as *mut u16, l as u16);
-            write_volatile((p + 2) as *mut u16, r as u16);
+        let ring = (NUM_BUF * BUF_BYTES) as u32;
+        let pos = self.hw_cursor() % ring;
+        let delta = ((pos + ring - self.last_hw_pos) % ring) as u64;
+        if delta != 0 {
+            self.consumed_hw += delta;
+            self.last_hw_pos = pos;
         }
-        self.emitted += 4;
-        self.cur_off += 4;
-        if self.cur_off >= BUF_BYTES {
-            self.cur_buf = (self.cur_buf + 1) % NUM_BUF;
-            self.cur_off = 0;
-            // Zero the buffer AHEAD of the write cursor. Nothing queued lives
-            // there (fill is capped well under a ring lap), so this only
-            // erases history — if the codec ever outruns the producer it
-            // plays a guard of silence instead of the previous lap's audio.
-            // Matters most for slaved mode's shallow fill.
-            unsafe {
-                core::ptr::write_bytes(
-                    self.buf_va((self.cur_buf + 1) % NUM_BUF) as *mut u8,
-                    0,
-                    BUF_BYTES,
-                );
-            }
-            // Start the stream once a small cushion is primed. Write RUN +
-            // stream number as ONE dword so QEMU re-evaluates the codec<->
-            // stream binding with the stream number visible (a byte-0-only
-            // RUN write may not retrigger it → codec never drains the FIFO).
-            if !self.running && self.cur_buf >= PRIME_BUFS {
-                w32(self.sd + SDCTL, 0x02 | SDCTL_IOCE | (STREAM_TAG << 20));
-                self.running = true;
-                if !self.logged_run {
-                    crate::println!(
-                        "hda: stream RUN sdctl={:#010x} sdsts={:#x} cbl={} lvi={} fmt={:#06x} lpib={} pos={}",
-                        r32(self.sd + SDCTL),
-                        r8(self.sd + 0x03),
-                        r32(self.sd + SDCBL),
-                        r16(self.sd + SDLVI),
-                        r16(self.sd + SDFMT),
-                        r32(self.sd + SDLPIB),
-                        self.dma_pos(),
-                    );
-                    self.logged_run = true;
-                }
-            }
-            // First few buffer boundaries: does the HW play position advance?
-            if self.running && self.diag_buffers < 6 {
-                crate::println!(
-                    "hda: playback cur_buf={} play_buf={} pos_buf={} lpib={} pos={} sdctl={:#x} sdsts={:#x}",
-                    self.cur_buf,
-                    self.play_buf(),
-                    (self.dma_pos() as usize / BUF_BYTES) % NUM_BUF,
-                    r32(self.sd + SDLPIB),
-                    self.dma_pos(),
-                    r32(self.sd + SDCTL),
-                    r8(self.sd + 0x03),
-                );
-                self.diag_buffers += 1;
-            }
-        }
-        true
-    }
-
-    /// Decode `bytes` (`fmt`) into canonical i16 stereo and stream into the ring.
-    fn submit(&mut self, rate: u32, fmt: Format, bytes: &[u8]) {
-        if self.parked && !self.unpark() {
-            crate::println!("hda: unpark failed, dropping playback");
-            self.parked = true;
-            return;
-        }
-        let src_rate = if rate == 0 { 44100 } else { rate };
-        let hw_rate = Self::hardware_rate(src_rate);
-        // A hardware-rate change needs a fresh format, which means stopping the
-        // stream and re-priming. DOS playback sets one rate per session, so this
-        // is rare. Source-rate changes also reset the resampler phase.
-        if hw_rate != self.rate || src_rate != self.src_rate {
-            if self.running {
-                self.stop();
-                self.running = false;
-            }
-            self.cur_buf = 0;
-            self.cur_off = 0;
-            self.set_format(hw_rate);
-            self.src_rate = src_rate;
-            self.resample_acc = 0;
-            // New stream session: pipe counters restart with it; the
-            // producer re-anchors to the fresh counters on its next
-            // position read.
-            self.written_src = 0;
-            self.consumed_hw = 0;
-            self.emitted = 0;
-            self.last_hw_pos = 0;
-            self.posbuf_live = false;
-            }
-        let fb = fmt.frame_bytes();
-        if fb == 0 {
-            return;
-        }
-        if !self.logged_submit {
-            crate::println!(
-                "hda: pcm submit src_rate={} hw_rate={} bits={} signed={} ch={} frame_bytes={} bytes={}",
-                src_rate,
-                hw_rate,
-                fmt.bits,
-                fmt.signed,
-                fmt.channels,
-                fb,
-                bytes.len(),
-            );
-            self.logged_submit = true;
-        }
-        for i in 0..bytes.len() / fb {
-            let (l, r) = fmt.frame(bytes, i);
-            self.written_src += 1;
-            // Fixed-ratio zero-order-hold resample. No clock-follow trim:
-            // producers pace by [`position`], so their rate IS the codec's
-            // rate — and a trimmed ratio would skew the consumed-counter
-            // inversion `position` performs.
-            self.resample_acc += hw_rate as u64;
-            while self.resample_acc >= src_rate as u64 {
-                if !self.emit_stereo(l, r) {
-                    return;
-                }
-                self.resample_acc -= src_rate as u64;
-            }
-        }
+        let played = self.consumed_hw / BUF_BYTES as u64;
+        let fresh = played.saturating_sub(self.reported);
+        self.reported = played;
+        fresh
     }
 
 }
@@ -1816,132 +1604,115 @@ fn dfs_output_path(
     }
 }
 
-/// Stream a block of source PCM to the HDA codec (called by `sound::play` when an
-/// HDA controller was discovered).
-pub fn play<A: crate::Arch>(machine: &mut A, rate: u32, fmt: Format, bytes: &[u8]) {
-    let _ = machine;
+// ── the primitives the sink engine asks of a device ─────────────────────────
+
+/// Where the engine writes PCM: the ring sits after the CORB/RIRB/BDL/position
+/// structures in the borrowed DMA buffer.
+pub fn adopt() -> Option<(usize, u32)> {
+    let g = HDA.lock();
+    let d = g.as_ref()?;
+    Some((d.dma_va + BUF_OFF, d.dma_phys + BUF_OFF as u32))
+}
+
+/// Program the converter. The mixer produces at [`stream_rate`], so this is
+/// normally the rate the codec was already set to at bring-up.
+pub fn set_rate(rate: u32) {
     let mut g = HDA.lock();
-    if let Some(dev) = g.as_mut() {
-        dev.submit(rate, fmt, bytes);
+    let Some(d) = g.as_mut() else { return };
+    let hw = Hda::hardware_rate(rate);
+    if hw != d.rate {
+        if d.running {
+            d.stop();
+            d.running = false;
+        }
+        d.set_format(hw);
     }
 }
 
-/// Recover an active stream after a synchronous kernel operation that may
-/// have outlasted the audio pipe (native VGA save/restore is the main case).
-/// The codec may have lapped the producer and started replaying stale ring
-/// contents; move the writer just ahead of the live cursor, silence the guard
-/// buffer, and snap consumption to the emitted frontier. The mixer observes
-/// the resulting deficit on its next tick and primes a clean pipe.
-pub fn recover_after_stall() {
-    let mut guard = HDA.lock();
-    let Some(dev) = guard.as_mut() else { return };
-    if !dev.running || dev.parked {
+/// Start the stream. RUN, the stream tag and IOCE go out as ONE dword so the
+/// controller re-evaluates the codec↔stream binding with the stream number
+/// visible — a byte-0-only RUN write may leave the codec never draining the
+/// FIFO.
+pub fn start() {
+    let mut g = HDA.lock();
+    let Some(d) = g.as_mut() else { return };
+    if d.parked && !d.unpark() {
         return;
     }
-    let civ = dev.play_buf();
-    let silence = (civ + 1) % NUM_BUF;
-    unsafe {
-        core::ptr::write_bytes(dev.buf_va(silence) as *mut u8, 0, BUF_BYTES);
-    }
-    dev.cur_buf = (civ + 2) % NUM_BUF;
-    dev.cur_off = 0;
-    dev.consumed_hw = dev.emitted;
-    dev.last_hw_pos = dev.hw_cursor() % (NUM_BUF * BUF_BYTES) as u32;
-    dev.diag_resyncs = dev.diag_resyncs.wrapping_add(1);
+    d.consumed_hw = 0;
+    d.last_hw_pos = 0;
+    d.reported = 0;
+    d.posbuf_live = false;
+    w32(d.sd + SDCTL, 0x02 | SDCTL_IOCE | (STREAM_TAG << 20));
+    d.running = true;
+    crate::println!(
+        "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={} pos={}",
+        r32(d.sd + SDCTL), r32(d.sd + SDCBL), r16(d.sd + SDLVI),
+        r16(d.sd + SDFMT), r32(d.sd + SDLPIB), d.dma_pos(),
+    );
 }
 
-/// Service an MSI or INTx buffer-completion interrupt routed here by
-/// `sound::on_irq`. Acknowledges the stream's completion status (SDSTS.BCIS,
-/// write-1-clear), then advances consumption from the DMA position-buffer
-/// delta. Returns false for a delivery with no PCM completion source.
-pub fn on_irq() -> bool {
-    let mut guard = HDA.lock();
-    let Some(dev) = guard.as_mut() else { return false };
-    let status = r8(dev.sd + SDSTS);
-    if status & 0x04 == 0 {
+/// Stop the stream and park the link (`park` = a real session end).
+pub fn halt() {
+    let mut g = HDA.lock();
+    if let Some(d) = g.as_mut() {
+        d.park();
+    }
+}
+
+/// Is this interrupt ours, and how many blocks played since we last said?
+pub fn irq_pending() -> bool {
+    let mut g = HDA.lock();
+    let Some(d) = g.as_mut() else { return false };
+    if r8(d.sd + SDSTS) & 0x04 == 0 {
         return false;
     }
-    if dev.running {
-        let ring = (NUM_BUF * BUF_BYTES) as u32;
-        let pos = dev.hw_cursor() % ring;
-        let raw = ((pos + ring - dev.last_hw_pos) % ring) as u64;
-        // The in-flight byte count is a hard ceiling on any position delta:
-        // the codec cannot have played bytes the producer never emitted. The
-        // modular subtraction above aliases a stale/backward position read
-        // (the position buffer is a plain DMA write racing this MMIO path —
-        // and unreliable outright on some real controllers) into a
-        // near-full-ring FORWARD delta; unclamped, one such read leaps the
-        // drain clock by ~a lap, the pacer overfills the ring to the
-        // lap-ambiguity point, and the resync/drop machinery grinds audibly
-        // (stutter, echo).
-        let in_flight = dev.emitted.saturating_sub(dev.consumed_hw);
-        // A BCIS with an unchanged position can occur when the position buffer
-        // write has not become visible yet. One IOC describes at least one BDL
-        // entry, so use one buffer as the conservative fallback.
-        let delta = if raw == 0 { BUF_BYTES as u64 } else { raw }.min(in_flight);
-        dev.consumed_hw += delta;
-        dev.last_hw_pos = (dev.last_hw_pos + delta as u32) % ring;
-    }
-    w8(dev.sd + SDSTS, status & 0x1C); // W1C BCIS/FIFOE/DESE sources
-    HDA_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    w8(d.sd + SDSTS, 0x04); // BCIS is write-1-clear
     true
 }
 
-/// True when HDA uses MSI rather than its firmware-routed INTx line.
-pub fn msi_active() -> bool {
-    MSI_ON.load(core::sync::atomic::Ordering::Relaxed)
-}
-
-/// Firmware-routed INTx line used when MSI allocation was unavailable.
-pub fn irq_line() -> Option<u8> {
-    let line = IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed);
-    (line != u32::MAX).then_some(line as u8)
-}
-
-/// Pipe counters for `sound::position`: `(written, consumed)` in source
-/// frames of the current stream session. `consumed` inverts the accumulated
-/// hardware byte position through the session's fixed resample ratio.
-pub fn position() -> Option<(u64, u64)> {
+/// Blocks played since the last report, without requiring an interrupt.
+pub fn blocks_played() -> u64 {
     let mut g = HDA.lock();
-    let dev = g.as_mut()?;
-    if dev.parked {
-        return None;
+    match g.as_mut() {
+        Some(d) => d.advance(),
+        None => 0,
     }
-    // Metal bring-up diagnostic: `position` is polled every pump tick (~1 kHz)
-    // while a session is active, so every ~2 s report whether completion
-    // interrupts arrive and whether the two hardware cursors (SDLPIB, the DMA
-    // position buffer) actually advance — the three things QEMU gets right
-    // that real silicon may not.
-    dev.diag_pos_calls = dev.diag_pos_calls.wrapping_add(1);
-    if dev.diag_pos_calls % 2048 == 0 && dev.diag_pos_prints < 60 {
-        dev.diag_pos_prints += 1;
-        crate::println!(
-            "hda: diag irqs={} written_src={} consumed_hw={} lpib={} pos={} cur_buf={} emitted={} dropped={} resyncs={} running={}",
-            HDA_IRQS.load(core::sync::atomic::Ordering::Relaxed),
-            dev.written_src,
-            dev.consumed_hw,
-            r32(dev.sd + SDLPIB),
-            dev.dma_pos(),
-            dev.cur_buf,
-            dev.emitted,
-            dev.diag_dropped,
-            dev.diag_resyncs,
-            dev.running,
-        );
-    }
-    // `on_irq` maintains `consumed_hw` from DMA-position deltas.
-    if dev.src_rate == 0 || dev.rate == 0 {
-        return Some((dev.written_src, 0)); // no stream session yet
-    }
-    let consumed_src = (dev.consumed_hw / 4) * dev.src_rate as u64 / dev.rate as u64;
-    Some((dev.written_src, consumed_src))
 }
 
-/// Minimum pipe fill for a position-slaved producer, in source frames:
-/// the stream-start prime plus one hardware buffer of claim-burst slack,
-/// converted to the source rate.
-/// The sink is up and reports a play position (so `sound::min_fill` returns the
-/// universal pipe depth). The pipe latency itself is not this driver's to set.
+/// Kernel VA of the ring, for rebuilding a sink around this device.
+pub fn ring_va() -> usize {
+    HDA.lock().as_ref().map_or(0, |d| d.dma_va + BUF_OFF)
+}
+
+pub const fn block_frames() -> usize {
+    BUF_FRAMES
+}
+
+pub const fn ring_frames() -> usize {
+    RING_FRAMES
+}
+
+/// The rate this codec's stream runs at — what the mixer should produce.
+///
+/// The sink's rate is the DEVICE's to choose. A converter that offers only
+/// 48 kHz would answer 48000 here and the mixer would follow it, instead of
+/// the mixer producing 44.1 kHz and this driver zero-order-holding it up —
+/// two conversions, the second the crudest there is. 44.1 kHz is what `fmt`
+/// programs, and the base every codec supports.
+pub fn stream_rate() -> u32 {
+    44_100
+}
+
+/// The routed completion-IRQ line, for the sink's interrupt match.
+pub fn irq_line() -> Option<u8> {
+    match IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed) {
+        0xFF => None,
+        n => Some(n as u8),
+    }
+}
+
+/// The device is up and can carry a stream.
 pub fn present() -> bool {
     let g = HDA.lock();
     g.as_ref().is_some_and(|d| !(d.parked && d.verb_failed))
