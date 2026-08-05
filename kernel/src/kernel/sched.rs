@@ -24,6 +24,7 @@ pub enum Verdict {
 /// Decide what runs next, given what the personality asked for and any
 /// pending F11. F11 is honored only when the action itself didn't already
 /// pick a successor.
+#[allow(clippy::too_many_arguments)]
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
@@ -49,6 +50,7 @@ pub fn verdict<A: crate::Arch>(
 
 /// Map a personality action to the next thread to run. `None` = stay on
 /// the current thread.
+#[allow(clippy::too_many_arguments)]
 fn next_after<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,

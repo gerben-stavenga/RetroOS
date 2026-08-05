@@ -1094,7 +1094,6 @@ impl PcmSource<'_> {
 /// staircase images stacked on top. Every source now renders into this clock
 /// and resamples itself at the producer's gently adjusted output rate. The
 /// adjustment changes sample density, not source time or pitch.
-
 /// Per-slice device service — the audio work whose LATENCY contract is the
 /// event-loop slice, not the millisecond pump: the SB's latched 0xF2/0xF3
 /// trigger IRQ, single-cycle DMA probe completions (MI2's driver expects

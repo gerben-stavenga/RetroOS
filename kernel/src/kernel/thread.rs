@@ -196,7 +196,7 @@ impl<A: crate::Arch> Personality<A> {
     /// straight back; so does a DOS thread on a machine running the card as
     /// the kernel mixer's sink, because there the sink never let it go and
     /// this is `None`.
-    pub fn adopt_sb<A2: crate::Arch>(
+    pub fn adopt_sb<A2>(
         &mut self,
         machine: &mut A2,
         card: Option<crate::kernel::drivers::sb16::SbCard>,
