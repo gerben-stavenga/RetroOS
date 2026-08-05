@@ -110,6 +110,15 @@ const NUM_BUF: usize = 64;
 const BUF_BYTES: usize = 0x200;
 const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
 const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
+/// The SDFMT / converter-format word this stream is programmed with, and the
+/// only place the rate enters the hardware: bit14 base (0 = 48 kHz), bits10:8
+/// divisor (0), bits6:4 bit depth (001 = 16), bits3:0 channels-1. 48 kHz is
+/// the rate every HDA codec is required to carry.
+///
+/// The rate this encodes is stated once, for everyone, as this card's arm of
+/// `sound::sink::Device::rate` — nothing hands a rate down to this driver and
+/// nothing reads one out of it.
+const STREAM_FMT: u16 = 0x0011;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
 /// Boot-time bring-up diagnostics to debugcon (flip on to debug the codec).
@@ -248,8 +257,6 @@ struct Hda {
     pin_def: u32,
     path: OutputPath,
     running: bool,
-    /// Hardware stream rate currently programmed into SDFMT/the converter.
-    rate: u32,
     /// Bytes the codec has consumed since the stream started, monotonic, and
     /// the last modular hardware position it was accumulated from. Completion
     /// interrupts are wakeups; this cursor delta, never the number of queued
@@ -578,7 +585,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         pin_def: 0,
         path: OutputPath::EMPTY,
         running: false,
-        rate: 0,
         reported: 0,
         consumed_hw: 0,
         last_hw_pos: 0,
@@ -733,8 +739,12 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     }
     d.dump_output_state();
 
-    // Bring-up leaves the controller initialized and the stream stopped.
-    // Codec command DMA is needed again only when the sink programs its format.
+    // The stream format is this card's own constant, so it is programmed here
+    // and never again: nothing above can ask for a different rate.
+    d.program_format();
+
+    // Bring-up leaves the controller initialized and the stream stopped, with
+    // codec command DMA idle until something needs a verb again.
     d.stop_corb_rirb();
 
     if DEBUG {
@@ -1256,52 +1266,19 @@ impl Hda {
         );
     }
 
-    /// Encode a 16-bit stereo stream format for `rate` (HDA SDFMT / converter
-    /// format encoding: base 44.1/48 kHz × multiple ÷ divisor). Unknown rates
-    /// fall back to 44.1 kHz (QEMU resamples internally).
-    fn fmt(rate: u32) -> u16 {
-        let (base, div): (u16, u16) = match rate {
-            44100 => (1, 0),
-            22050 => (1, 1),
-            11025 => (1, 3),
-            48000 => (0, 0),
-            24000 => (0, 1),
-            16000 => (0, 2),
-            12000 => (0, 3),
-            8000 => (0, 5),
-            // Odd SB rates (e.g. 22222 from DSP time constant 211) → nearest
-            // 44.1 kHz submultiple. divisor = round(44100/rate), field = div-1.
-            _ => {
-                let divisor = ((44100 + rate / 2) / rate).clamp(1, 8);
-                (1, (divisor - 1) as u16)
-            }
-        };
-        // bit14 base | bits10:8 div | bits6:4 bits(001=16) | bits3:0 chan-1(1=stereo)
-        (base << 14) | (div << 8) | (0b001 << 4) | 0x0001
-    }
-
-    /// (Re)program the stream + DAC converter format for `rate`. Requires the
-    /// stream to be stopped; only called from the priming path (running == false).
-    fn set_format(&mut self, rate: u32) {
-        let f = Self::fmt(rate);
-        w16(self.sd + SDFMT, f);
+    /// Program the stream descriptor and the DAC converter for [`STREAM_FMT`].
+    /// Requires the stream to be stopped, so this belongs to bring-up and to
+    /// the recovery path in [`start`] — never to a running stream.
+    fn program_format(&mut self) {
+        w16(self.sd + SDFMT, STREAM_FMT);
         let dac = self.dac;
-        self.verb(dac, (0x2 << 16) | f as u32); // Set Converter Format
+        self.verb(dac, (0x2 << 16) | STREAM_FMT as u32); // Set Converter Format
         self.stop_corb_rirb();
-        self.rate = rate;
         if DEBUG {
-            crate::println!("hda: set_format rate={} fmt={:#06x}", rate, f);
+            crate::println!("hda: format fmt={:#06x}", STREAM_FMT);
         }
     }
 
-    fn hardware_rate(src_rate: u32) -> u32 {
-        match src_rate {
-            44100 | 48000 => src_rate,
-            24000 | 16000 | 12000 | 8000 => 48000,
-            0 => 44100,
-            _ => 44100,
-        }
-    }
     fn stop(&mut self) {
         let ctl = r8(self.sd + SDCTL);
         w8(self.sd + SDCTL, ctl & !0x02); // clear RUN
@@ -1508,21 +1485,6 @@ pub fn adopt() -> Option<(usize, u32)> {
     Some((d.dma_va + BUF_OFF, d.dma_phys + BUF_OFF as u32))
 }
 
-/// Program the converter. The mixer produces at [`stream_rate`], so this is
-/// normally the rate the codec was already set to at bring-up.
-pub fn set_rate(rate: u32) {
-    let mut g = HDA.lock();
-    let Some(d) = g.as_mut() else { return };
-    let hw = Hda::hardware_rate(rate);
-    if hw != d.rate {
-        if d.running {
-            d.stop();
-            d.running = false;
-        }
-        d.set_format(hw);
-    }
-}
-
 /// Start the stream. RUN, the stream tag and IOCE go out as ONE dword so the
 /// controller re-evaluates the codec↔stream binding with the stream number
 /// visible — a byte-0-only RUN write may leave the codec never draining the
@@ -1530,12 +1492,13 @@ pub fn set_rate(rate: u32) {
 pub fn start() {
     let mut g = HDA.lock();
     let Some(d) = g.as_mut() else { return };
-    let expected_format = Hda::fmt(d.rate);
-    assert_eq!(
-        r16(d.sd + SDFMT),
-        expected_format,
-        "HDA stream format was lost before RUN"
-    );
+    // Bring-up programmed the format and nothing since had reason to clear
+    // it, but a lost SDFMT means silence rather than a wrong pitch, so repair
+    // it here rather than trusting or panicking.
+    if r16(d.sd + SDFMT) != STREAM_FMT {
+        crate::println!("hda: SDFMT lost before RUN ({:#06x}), reprogramming", r16(d.sd + SDFMT));
+        d.program_format();
+    }
     d.consumed_hw = 0;
     d.last_hw_pos = 0;
     d.reported = 0;
@@ -1589,15 +1552,6 @@ pub const fn block_frames() -> usize {
 
 pub const fn ring_frames() -> usize {
     RING_FRAMES
-}
-
-/// The rate this codec's stream runs at — what the mixer should produce.
-///
-/// The sink's rate is the DEVICE's to choose. HDA guarantees 48 kHz support,
-/// so the mixer follows that native rate instead of assuming the optional
-/// 44.1 kHz family is available from the selected converter.
-pub fn stream_rate() -> u32 {
-    48_000
 }
 
 /// The routed completion-IRQ line, for the sink's interrupt match.

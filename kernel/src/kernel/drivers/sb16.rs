@@ -58,6 +58,11 @@ const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound:
 const NUM_BUF: usize = 32;
 const RING_BYTES: usize = NUM_BUF * BUF_BYTES;
 const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
+/// The output rate this card programs into its DSP. The SB16 DAC will play
+/// any rate it is handed, so unlike the other two this is a genuine choice
+/// rather than a hardware fact — 44.1 kHz is the card's top quality mode. It
+/// is stated for everyone as this card's arm of `sound::sink::Device::rate`.
+const RATE: u32 = 44_100;
 
 /// What only THIS card knows. The ring, the counters and the prime/underrun
 /// bookkeeping belong to the sound sink — shared with every other device,
@@ -405,15 +410,6 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
 
 use crate::kernel::portio::{inb, outb};
 
-/// Program the output rate. The SB16 DAC runs at the rate it is given — there
-/// is no resampler in this path — so this is what the mixer produces at.
-pub fn set_rate(rate: u32) {
-    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
-    dsp_write(base, CMD_SET_RATE_OUT);
-    dsp_write(base, (rate >> 8) as u8);
-    dsp_write(base, rate as u8);
-}
-
 /// Program the 8237 for the whole ring in 16-bit auto-init, then start the
 /// DSP's auto-init output with a per-block length. The DSP free-runs the ring
 /// from here and raises the completion IRQ every block.
@@ -444,6 +440,11 @@ pub fn start() {
     // consumption. DSP length is in 16-bit transfers, two per stereo frame.
     let block_samples = (RING_BYTES / 4) as u16;
     let base = dev.base;
+    // The DAC plays at whatever rate it was last told, so the card programs
+    // its own — the same rate it reports as its `Device::rate`.
+    dsp_write(base, CMD_SET_RATE_OUT);
+    dsp_write(base, (RATE >> 8) as u8);
+    dsp_write(base, RATE as u8);
     dsp_write(base, CMD_16BIT_AUTO_OUT);
     dsp_write(base, MODE_SIGNED_STEREO);
     dsp_write(base, (block_samples - 1) as u8);

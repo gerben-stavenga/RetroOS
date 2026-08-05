@@ -39,7 +39,6 @@ const NAM_MASTER_VOL: u16 = 0x02;
 const NAM_PCM_OUT_VOL: u16 = 0x18;
 const NAM_EXT_CAP: u16 = 0x28; // bit0 = VRA supported
 const NAM_EXT_CTRL: u16 = 0x2A; // bit0 = VRA enable
-const NAM_PCM_DAC_RATE: u16 = 0x2C; // sample rate when VRA enabled
 
 // NABM (Native Audio Bus Master, BAR1): the DMA engine. PCM-Out ("PO") channel.
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
@@ -78,7 +77,6 @@ const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 /// belong to the sink engine; this is the bus-master programming and the
 /// CIV bookkeeping that turns a completion into "N blocks played".
 struct Ac97 {
-    nam: u16,       // NAM I/O base
     nabm: u16,      // NABM I/O base
     dma_va: usize,  // kernel VA of the mapped channel buffer
     dma_phys: u32,  // its physical base address (for the codec / BDL)
@@ -190,11 +188,16 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     machine.outw(nam + NAM_RESET, 0);
     machine.outw(nam + NAM_MASTER_VOL, 0x0000);
     machine.outw(nam + NAM_PCM_OUT_VOL, 0x0000);
-    // Enable variable-rate audio so we can play the guest's native rate without
-    // resampling (the SB emulation produces 22050/etc., not the AC'97 48 kHz).
+    // Leave variable-rate audio DISABLED: the DAC runs at the AC'97 link's
+    // fixed 48 kHz, which is this card's rate and what the mixer renders to.
+    // VRA used to be enabled here so the codec could play a guest's native
+    // rate directly, but rate conversion belongs to the mixer, which resamples
+    // every source anyway — and a VRA rate write is silently dropped by a
+    // codec that does not implement it, leaving the DAC at 48 kHz while the
+    // mixer produced 44.1 kHz (everything ~8.8% sharp).
     if machine.inw(nam + NAM_EXT_CAP) & 1 != 0 {
         let ctrl = machine.inw(nam + NAM_EXT_CTRL);
-        machine.outw(nam + NAM_EXT_CTRL, ctrl | 1);
+        machine.outw(nam + NAM_EXT_CTRL, ctrl & !1);
     }
 
     // Reset the PCM-out bus-master engine.
@@ -216,7 +219,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let dma_phys = (phys_page * 0x1000) as u32;
 
     let mut d = Ac97 {
-        nam, nabm,
+        nabm,
         dma_va: DMA_WIN_VA,
         dma_phys,
         last_civ: 0,
@@ -260,13 +263,6 @@ pub fn adopt<A: crate::Arch>(machine: &mut A) -> Option<(usize, u32)> {
     let g = AC97.lock();
     let d = g.as_ref()?;
     Some((d.dma_va + BDL_BYTES, d.dma_phys + BDL_BYTES as u32))
-}
-
-/// Program the DAC rate. Variable-rate audio was enabled at bring-up, so the
-/// codec plays the source rate directly — no resampler in this path.
-pub fn set_rate(rate: u32) {
-    let Some(nam) = AC97.lock().as_ref().map(|d| d.nam) else { return };
-    crate::kernel::portio::outw(nam + NAM_PCM_DAC_RATE, rate as u16);
 }
 
 /// Kernel VA of the ring, for rebuilding a sink around this device.

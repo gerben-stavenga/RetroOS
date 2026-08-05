@@ -60,10 +60,15 @@ enum Card {
 }
 
 impl sound::sink::Device for Card {
+    /// Each card's rate, stated here and nowhere else. A rate is a property of
+    /// the card, so it travels outward only: this is what the mixer renders to,
+    /// and no code path hands a rate back down to a driver. HDA and AC'97 are
+    /// fixed at their link's 48 kHz; the SB16 DSP plays whatever it is told and
+    /// its driver programs itself for the rate named here.
     fn rate(&self) -> u32 {
         match self {
-            Card::Hda => crate::kernel::drivers::hda::stream_rate(),
-            Card::Sb(_) | Card::Ac97 => DEFAULT_RATE,
+            Card::Hda | Card::Ac97 => 48_000,
+            Card::Sb(_) => 44_100,
         }
     }
 
@@ -76,20 +81,10 @@ impl sound::sink::Device for Card {
     }
 
     fn start(&mut self) {
-        let rate = self.rate();
         match self {
-            Card::Sb(_) => {
-                crate::kernel::drivers::sb16::set_rate(rate);
-                crate::kernel::drivers::sb16::start();
-            }
-            Card::Ac97 => {
-                crate::kernel::drivers::ac97::set_rate(rate);
-                crate::kernel::drivers::ac97::start();
-            }
-            Card::Hda => {
-                crate::kernel::drivers::hda::set_rate(rate);
-                crate::kernel::drivers::hda::start();
-            }
+            Card::Sb(_) => crate::kernel::drivers::sb16::start(),
+            Card::Ac97 => crate::kernel::drivers::ac97::start(),
+            Card::Hda => crate::kernel::drivers::hda::start(),
         }
     }
 
