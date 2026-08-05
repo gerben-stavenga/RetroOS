@@ -99,13 +99,12 @@ const RIRB_ENTRIES: usize = 256; // 8 bytes each → 2 KB
 const CORB_OFF: usize = 0x0000;
 const RIRB_OFF: usize = 0x0400;
 const BDL_OFF: usize = 0x0C00; // 128-byte aligned; NUM_BUF*16 = 1024 bytes
-const POS_OFF: usize = 0x1000; // 128-byte aligned; DMA position buffer (8 strm*8)
 const BUF_OFF: usize = 0x2000; // PCM ring starts on the next page
 const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry ────────────────────────────────────────────────────────
-// Fine descriptors make cursor accounting and latency control ~2.9 ms at
-// 44.1 kHz. They do not imply an interrupt each: only two descriptors per ring
+// Fine descriptors make cursor accounting and latency control ~2.7 ms at
+// 48 kHz. They do not imply an interrupt each: only two descriptors per ring
 // carry IOC, and normal accounting polls the live cursor.
 const NUM_BUF: usize = 64;
 const BUF_BYTES: usize = 0x200;
@@ -233,14 +232,9 @@ struct Hda {
     rirb_rp: usize,
     /// True while CORB/RIRB DMA engines are running for codec verbs.
     rings_running: bool,
-    /// True while the link is parked: controller held in reset (CRST low) so a
-    /// hard power-off cannot catch the codec in an active state. Playback
-    /// unparks (full controller + codec re-init) on demand.
-    parked: bool,
     /// Latched when a codec verb times out; bring-up abandons this controller.
     verb_failed: bool,
-    /// True once the ALC298 vendor-DSP amp sequence has been replayed this
-    /// boot (survives CRST, so park/unpark cycles don't repeat it).
+    /// True once the ALC298 vendor-DSP amp sequence has been replayed this boot.
     amp_init_done: bool,
     /// Codec address of the first present codec.
     cad: u32,
@@ -265,13 +259,6 @@ struct Hda {
     /// Blocks the engine has been told about, so a coalesced interrupt emits
     /// the difference rather than one event.
     reported: u64,
-    /// True once the DMA position buffer has read nonzero this stream session:
-    /// it is the preferred cursor (some QEMU builds never update SDLPIB), but
-    /// real controllers exist where it stays 0 forever while SDLPIB tracks the
-    /// stream (the ALC298 laptop's AMD controller — the split Linux's
-    /// position_fix quirk table exists for). Until it proves live, consumption
-    /// deltas come from SDLPIB.
-    posbuf_live: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -451,7 +438,7 @@ fn sort_hda_controllers(devices: &mut [HdaPciDevice; MAX_HDA_CONTROLLERS], n: us
 /// transition — the AMD HDA function on the ALC298 laptop sets it, so this
 /// escalation cannot recover that machine's wedge (verified from Linux
 /// 2026-07: only a cold power-off revives the codec; prevention via
-/// park/quiesce before power-off is the real fix). Still attempted for
+/// quiescing the controller before power-off is the real fix). Still attempted for
 /// hardware that resets anyway, with the NSR bit logged so the bring-up
 /// trace is honest. Returns false if the function has no PM capability.
 fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
@@ -581,7 +568,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         sd,
         rirb_rp: 0,
         rings_running: false,
-        parked: false,
         verb_failed: false,
         amp_init_done: false,
         cad: 0,
@@ -596,7 +582,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         reported: 0,
         consumed_hw: 0,
         last_hw_pos: 0,
-        posbuf_live: false,
     };
 
     // Link reset + codec detection, with escalating recovery. A hard reboot
@@ -608,7 +593,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // through PCI D3hot → D0 in the hope the codec power domain resets with
     // it. That hope is dead on the ALC298 laptop itself (its HDA function
     // sets PMCSR.No_Soft_Reset — see pci_pm_power_cycle), so prevention is
-    // the real defense: park/quiesce the link on every shutdown path.
+    // the real defense: quiesce the link on every shutdown path.
     let mut detected = false;
     for attempt in 0..3u32 {
         if attempt == 2 {
@@ -748,22 +733,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     }
     d.dump_output_state();
 
-    // Park the link until something plays, and exercise one park → unpark
-    // round trip now so a broken re-init path is caught at boot, loudly,
-    // instead of as silence at the first playback.
-    d.park();
-    if !d.unpark() {
-        crate::println!(
-            "hda: {:02x}:{:02x}.{} failed: unpark self-test (codec={:#x})",
-            bus,
-            dev,
-            func,
-            d.codec_vendor
-        );
-        d.shutdown_controller();
-        return false;
-    }
-    d.park();
+    // Bring-up leaves the controller initialized and the stream stopped.
+    // Codec command DMA is needed again only when the sink programs its format.
+    d.stop_corb_rirb();
 
     if DEBUG {
         crate::println!(
@@ -877,7 +849,6 @@ impl Hda {
         self.consumed_hw = 0;
         self.last_hw_pos = 0;
         self.reported = 0;
-        self.posbuf_live = false;
         // Clear the PCM ring: the producer restarts at buffer 0, so if the
         // hardware ever runs past the freshly primed buffers (session start,
         // underrun) it must find silence, not a replay of the previous
@@ -898,9 +869,9 @@ impl Hda {
         w32(DPUBASE, 0);
     }
 
-    /// Program the output stream descriptor: SRST pulse, position buffer, BDL
-    /// base, cyclic length, stream tag. Everything here is controller register
-    /// state, so it must rerun after every CRST (bring-up and unpark).
+    /// Program the output stream descriptor: SRST pulse, BDL base, cyclic
+    /// length and stream tag. Everything here is controller register state, so
+    /// it must rerun after every CRST during bring-up.
     fn program_stream(&mut self) {
         let sd = self.sd;
         // Reset the stream into a known state: assert SDCTL.SRST, wait for it
@@ -919,10 +890,6 @@ impl Hda {
             }
         }
 
-        // DMA position buffer (some QEMU builds advance this, not SDLPIB).
-        w32(DPLBASE, (self.dma_phys + POS_OFF as u32) | 1);
-        w32(DPUBASE, 0);
-
         // Point the stream descriptor at the BDL and cap its cyclic length.
         w32(sd + SDBDPL, self.dma_phys + BDL_OFF as u32);
         w32(sd + SDBDPU, 0);
@@ -936,56 +903,6 @@ impl Hda {
         // The per-buffer IOCE (SDCTL bit2) is set with RUN at playback start.
         let sidx = (self.sd - SD_BASE) / SD_STRIDE;
         w32(INTCTL, 0x8000_0000 | (1u32 << sidx));
-    }
-
-    /// Park the link: stop all DMA and hold the controller in reset (CRST
-    /// low). A hard power-off while parked leaves the codec in reset — the
-    /// safest state this driver can hand to the next boot (this laptop's
-    /// ALC298 stays wedged across warm reboots if reset mid-activity).
-    fn park(&mut self) {
-        self.stop_playback();
-        self.stop_corb_rirb();
-        w32(DPLBASE, 0);
-        w32(DPUBASE, 0);
-        w32(GCTL, 0);
-        self.parked = true;
-        self.rate = 0; // CRST wiped SDFMT/converter state: force set_format
-    }
-
-    /// Release a parked link and rebuild everything CRST wiped: controller
-    /// stream state and the codec output path. Returns false if the codec
-    /// did not come back.
-    fn unpark(&mut self) -> bool {
-        w16(STATESTS, 0x7FFF);
-        for _ in 0..1_000_000 {
-            if r32(GCTL) & 1 == 0 {
-                break;
-            }
-        }
-        spin(1_000_000);
-        w32(GCTL, 1);
-        let mut up = false;
-        for _ in 0..1_000_000 {
-            if r32(GCTL) & 1 != 0 {
-                up = true;
-                break;
-            }
-        }
-        if !up {
-            return false;
-        }
-        // Codecs need ≥ 521 µs after CRST before they accept verbs.
-        spin(1_000_000);
-        self.verb_failed = false;
-        self.setup_corb_rirb();
-        self.program_stream();
-        self.configure_path();
-        self.stop_corb_rirb();
-        if self.verb_failed {
-            return false;
-        }
-        self.parked = false;
-        true
     }
 
     /// Send one verb to `nid` and return the codec's 32-bit response. `verb` is
@@ -1308,8 +1225,8 @@ impl Hda {
     /// sound. The laptop speaker is silent after a COLD boot without this —
     /// the tiny coef10 poke below only helps when a previous Linux boot
     /// already ran the full Windows-driver sequence and its state survived
-    /// the warm reboot. Once per boot: DSP/COEF state rides out CRST link
-    /// resets, so unpark's configure_path re-entry skips the ~2000 verbs.
+    /// the warm reboot. The sequence is latched once per boot so any repeated
+    /// path configuration does not replay its ~2000 verbs.
     fn replay_alc298_amp_init(&mut self) {
         if self.amp_init_done {
             return;
@@ -1385,29 +1302,6 @@ impl Hda {
             _ => 44100,
         }
     }
-
-
-    /// Play position (bytes) from the DMA position buffer — QEMU's authoritative
-    /// source on builds that don't update the SDLPIB register.
-    fn dma_pos(&self) -> u32 {
-        let idx = (self.sd - SD_BASE) / SD_STRIDE;
-        unsafe { read_volatile((self.dma_va + POS_OFF + idx * 8) as *const u32) }
-    }
-
-    /// The authoritative hardware byte cursor for consumption accounting:
-    /// the DMA position buffer once it has proven live this session, SDLPIB
-    /// until then (see `posbuf_live`). Consumption must come from a cursor
-    /// that actually moves — deriving deltas from a dead position buffer
-    /// turned every completion IRQ into a garbage near-full-ring delta on
-    /// the ALC298 laptop (silent output, wedged pacer).
-    fn hw_cursor(&mut self) -> u32 {
-        let pos = self.dma_pos();
-        if pos != 0 {
-            self.posbuf_live = true;
-        }
-        if self.posbuf_live { pos } else { r32(self.sd + SDLPIB) }
-    }
-
     fn stop(&mut self) {
         let ctl = r8(self.sd + SDCTL);
         w8(self.sd + SDCTL, ctl & !0x02); // clear RUN
@@ -1427,7 +1321,7 @@ impl Hda {
             return 0;
         }
         let ring = (NUM_BUF * BUF_BYTES) as u32;
-        let pos = self.hw_cursor() % ring;
+        let pos = r32(self.sd + SDLPIB) % ring;
         let delta = ((pos + ring - self.last_hw_pos) % ring) as u64;
         if delta != 0 {
             self.consumed_hw += delta;
@@ -1606,7 +1500,7 @@ fn dfs_output_path(
 
 // ── the primitives the sink engine asks of a device ─────────────────────────
 
-/// Where the engine writes PCM: the ring sits after the CORB/RIRB/BDL/position
+/// Where the engine writes PCM: the ring sits after the CORB/RIRB/BDL
 /// structures in the borrowed DMA buffer.
 pub fn adopt() -> Option<(usize, u32)> {
     let g = HDA.lock();
@@ -1636,27 +1530,31 @@ pub fn set_rate(rate: u32) {
 pub fn start() {
     let mut g = HDA.lock();
     let Some(d) = g.as_mut() else { return };
-    if d.parked && !d.unpark() {
-        return;
-    }
+    let expected_format = Hda::fmt(d.rate);
+    assert_eq!(
+        r16(d.sd + SDFMT),
+        expected_format,
+        "HDA stream format was lost before RUN"
+    );
     d.consumed_hw = 0;
     d.last_hw_pos = 0;
     d.reported = 0;
-    d.posbuf_live = false;
     w32(d.sd + SDCTL, 0x02 | SDCTL_IOCE | (STREAM_TAG << 20));
     d.running = true;
     crate::println!(
-        "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={} pos={}",
+        "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={}",
         r32(d.sd + SDCTL), r32(d.sd + SDCBL), r16(d.sd + SDLVI),
-        r16(d.sd + SDFMT), r32(d.sd + SDLPIB), d.dma_pos(),
+        r16(d.sd + SDFMT), r32(d.sd + SDLPIB),
     );
 }
 
-/// Stop the stream and park the link (`park` = a real session end).
+/// Stop the stream without resetting the initialized controller. Controller
+/// reset is reserved for the machine shutdown path, which never restarts it.
 pub fn halt() {
     let mut g = HDA.lock();
     if let Some(d) = g.as_mut() {
-        d.park();
+        d.stop_playback();
+        d.stop_corb_rirb();
     }
 }
 
@@ -1695,13 +1593,11 @@ pub const fn ring_frames() -> usize {
 
 /// The rate this codec's stream runs at — what the mixer should produce.
 ///
-/// The sink's rate is the DEVICE's to choose. A converter that offers only
-/// 48 kHz would answer 48000 here and the mixer would follow it, instead of
-/// the mixer producing 44.1 kHz and this driver zero-order-holding it up —
-/// two conversions, the second the crudest there is. 44.1 kHz is what `fmt`
-/// programs, and the base every codec supports.
+/// The sink's rate is the DEVICE's to choose. HDA guarantees 48 kHz support,
+/// so the mixer follows that native rate instead of assuming the optional
+/// 44.1 kHz family is available from the selected converter.
 pub fn stream_rate() -> u32 {
-    44_100
+    48_000
 }
 
 /// The routed completion-IRQ line, for the sink's interrupt match.
@@ -1714,8 +1610,7 @@ pub fn irq_line() -> Option<u8> {
 
 /// The device is up and can carry a stream.
 pub fn present() -> bool {
-    let g = HDA.lock();
-    g.as_ref().is_some_and(|d| !(d.parked && d.verb_failed))
+    HDA.lock().is_some()
 }
 
 /// Panic-path quiesce: stop all controller DMA and hold the link in reset so a
@@ -1729,22 +1624,4 @@ pub fn emergency_quiesce() {
     }
     stop_controller_dma();
     w32(GCTL, 0); // assert CRST: the codec rides out the reboot in reset
-}
-
-/// Stop active HDA playback DMA after the emulated producer goes idle. With
-/// `park` (DSP reset / session end) the link is additionally held in reset so
-/// a power-button exit cannot catch the codec active; without it (pause,
-/// single-cycle block end) the configured path is kept so the producer can
-/// re-prime cheaply.
-pub fn stop<A: crate::Arch>(machine: &mut A, park: bool) {
-    let _ = machine;
-    let mut g = HDA.lock();
-    if let Some(dev) = g.as_mut() {
-        if park {
-            dev.park();
-        } else {
-            dev.stop_playback();
-            dev.stop_corb_rirb();
-        }
-    }
 }

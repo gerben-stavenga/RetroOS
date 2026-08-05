@@ -114,10 +114,18 @@ impl<D: Device> Sink<D> {
         self.dev.block_frames()
     }
 
-    /// Largest unambiguous producer lead. One block on the near half is kept
-    /// as the consumer-owned alignment margin.
+    /// Largest latency target. One block below the near half is reserved for
+    /// the consumer's deliberately hidden, incomplete completion block.
     pub fn max_ahead_frames(&self) -> u64 {
         (self.buf.len() / 2 - self.block_frames()) as u64
+    }
+
+    /// Hard producer safety ceiling. The producer overwrites live audio only
+    /// when it laps the consumer around the full ring, not when it crosses the
+    /// latency policy's half-ring cap. Completion accounting hides the current
+    /// incomplete consumer block, so keep that one whole block protected.
+    pub fn safety_ceiling_frames(&self) -> u64 {
+        (self.buf.len() - self.block_frames()) as u64
     }
 
     pub fn device(&mut self) -> &mut D {
@@ -133,11 +141,19 @@ impl<D: Device> Sink<D> {
     /// Apply the final Q16 gain, clip once, and write device PCM into the ring.
     pub fn submit(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
         let queued = self.written_frames.saturating_sub(self.consumed_frames());
-        let max_ahead = self.max_ahead_frames();
-        assert!(queued <= max_ahead, "audio producer passed ring ceiling");
+        let ceiling = self.safety_ceiling_frames();
         assert!(
-            frames.len() as u64 <= max_ahead - queued,
-            "audio producer overtook consumer"
+            queued <= ceiling,
+            "audio producer passed ring ceiling: queued={queued} max={ceiling} written={} consumed={}",
+            self.written_frames,
+            self.consumed_frames(),
+        );
+        assert!(
+            frames.len() as u64 <= ceiling - queued,
+            "audio producer overtook consumer: submit={} queued={queued} max={ceiling} written={} consumed={}",
+            frames.len(),
+            self.written_frames,
+            self.consumed_frames(),
         );
         for &(left, right) in frames {
             self.buf[self.write_pos] = [scale(left, gain_q16), scale(right, gain_q16)];
@@ -299,6 +315,7 @@ mod tests {
         assert_eq!(sink.block_frames(), 128);
         assert_eq!(sink.consumed_frames(), 384);
         assert_eq!(sink.max_ahead_frames(), 896);
+        assert_eq!(sink.safety_ceiling_frames(), 1920);
     }
 
     #[test]
@@ -317,7 +334,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "audio producer overtook consumer")]
-    fn producer_must_not_lap_and_overwrite_the_live_half_of_the_ring() {
+    fn producer_must_not_lap_and_overwrite_the_live_ring() {
         let mut sink = Sink::new(
             ring(),
             TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 0 },
