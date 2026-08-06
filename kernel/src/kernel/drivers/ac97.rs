@@ -41,6 +41,7 @@ const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
 const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
 const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset)
+const PO_PICB: u16 = 0x18; // 16-bit: position in current buffer (RO)
 const GLOB_CNT: u16 = 0x2C; // 32-bit: bit1 = AC-link out of cold reset
 const GLOB_STA: u16 = 0x30; // 32-bit: bit8 = primary codec ready
 
@@ -65,16 +66,16 @@ const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 
 /// What only an AC'97 knows. The ring, the counters and the underrun test
 /// belong to the sink engine; this is the bus-master programming and the
-/// CIV bookkeeping that turns a completion into "N blocks played".
+/// CIV/PICB bookkeeping that turns a cursor position into "N frames played".
 pub struct Ac97 {
     nabm: u16,      // NABM I/O base
     dma_va: usize,  // kernel VA of the mapped channel buffer
     dma_phys: u32,  // its physical base address (for the codec / BDL)
-    /// Last CIV seen, for accumulating block deltas across ring wraps.
-    last_civ: u8,
-    /// Blocks already reported to the sink.
-    reported: u64,
-    played: u64,
+    /// Last cursor position seen, in frames from the ring origin.
+    last_pos_frames: u64,
+    /// Frames already reported to the sink.
+    reported_frames: u64,
+    played_frames: u64,
 }
 
 // Written once during single-threaded boot, then reachable only through the
@@ -101,7 +102,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Ac97> {
 /// Bring up the codec at `bus:dev.func`.
 fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Ac97> {
     // Enable I/O space + bus-master and suppress INTx: playback progress is
-    // polled from CIV, so this sink deliberately generates no interrupts.
+    // polled from CIV/PICB, so this sink deliberately generates no interrupts.
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
     crate::kernel::pci::write32(
         machine,
@@ -169,9 +170,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         nabm,
         dma_va: DMA_WIN_VA,
         dma_phys,
-        last_civ: 0,
-        reported: 0,
-        played: 0,
+        last_pos_frames: 0,
+        reported_frames: 0,
+        played_frames: 0,
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
@@ -184,11 +185,12 @@ impl Ac97 {
         self.dma_phys + (BDL_BYTES + i * BUF_BYTES) as u32
     }
     /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Progress is
-    /// polled from CIV, so every control word disables completion interrupts.
+    /// polled from CIV/PICB, so every control word disables completion
+    /// interrupts.
     fn build_bdl(&mut self) {
         for i in 0..NUM_BUF {
             let entry = self.dma_va + i * 8;
-            let samples = (BUF_BYTES / 2) as u16; // 16-bit samples per buffer
+            let samples = (BUF_BYTES / 2) as u16; // 1024 samples = 512 stereo frames
             unsafe {
                 core::ptr::write_volatile(entry as *mut u32, self.buf_phys(i));
                 core::ptr::write_volatile((entry + 4) as *mut u16, samples);
@@ -223,9 +225,9 @@ impl sound::sink::Device for Ac97 {
 
     fn start(&mut self) {
         use crate::kernel::portio::{inb, outb};
-        self.last_civ = 0;
-        self.reported = 0;
-        self.played = 0;
+        self.last_pos_frames = 0;
+        self.reported_frames = 0;
+        self.played_frames = 0;
         outb(self.nabm + PO_LVI, (NUM_BUF - 1) as u8);
         let cr = inb(self.nabm + PO_CR);
         outb(self.nabm + PO_CR, (cr & !0x10) | PO_CR_RUN);
@@ -242,27 +244,37 @@ impl sound::sink::Device for Ac97 {
         outb(self.nabm + PO_CR, cr & !PO_CR_RUN);
     }
 
-    fn blocks_played(&mut self) -> u64 {
-        advance(self)
+    fn frames_played(&mut self) -> u64 {
+        advance_frames(self)
     }
 }
 
-/// Read CIV, accumulate the block delta, and keep LVI one block behind it.
+/// Read CIV/PICB, accumulate the frame delta, and keep LVI one descriptor
+/// behind the current cursor.
 ///
 /// Bumping LVI here is also the recovery path: if we were ever late enough
 /// that CIV caught LVI, the engine halted with DCH set, and this write is
 /// exactly what the hardware needs to resume (`CR_RPBM && DCH` → clear DCH,
 /// re-fetch the descriptor). So a late service costs a stall, never a wedge.
-fn advance(d: &mut Ac97) -> u64 {
-    use crate::kernel::portio::{inb, outb};
-    let civ = inb(d.nabm + PO_CIV) % NUM_BUF as u8;
-    let delta = (civ + NUM_BUF as u8 - d.last_civ) % NUM_BUF as u8;
+fn advance_frames(d: &mut Ac97) -> u64 {
+    use crate::kernel::portio::{inb, inw, outb};
+    let (civ, pos_frames) = loop {
+        let civ = inb(d.nabm + PO_CIV) % NUM_BUF as u8;
+        let picb = inw(d.nabm + PO_PICB) as u64;
+        if civ == inb(d.nabm + PO_CIV) % NUM_BUF as u8 {
+            let remaining_frames = (picb / 2).min(BUF_FRAMES as u64);
+            let pos_frames =
+                (civ as u64 * BUF_FRAMES as u64) + (BUF_FRAMES as u64 - remaining_frames);
+            break (civ, pos_frames % RING_FRAMES as u64);
+        }
+    };
+    let delta = (pos_frames + RING_FRAMES as u64 - d.last_pos_frames) % RING_FRAMES as u64;
     if delta != 0 {
-        d.played += delta as u64;
-        d.last_civ = civ;
+        d.played_frames += delta;
+        d.last_pos_frames = pos_frames;
         outb(d.nabm + PO_LVI, (civ + NUM_BUF as u8 - 1) % NUM_BUF as u8);
     }
-    let fresh = d.played.saturating_sub(d.reported);
-    d.reported = d.played;
+    let fresh = d.played_frames.saturating_sub(d.reported_frames);
+    d.reported_frames = d.played_frames;
     fresh
 }

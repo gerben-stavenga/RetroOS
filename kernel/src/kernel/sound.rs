@@ -131,15 +131,13 @@ impl Sink {
         }
     }
 
-    /// Queue depth requested by policy, rounded up to the device's own block
-    /// granularity and capped inside the ring's unambiguous producer half.
+    /// Queue depth requested by policy, capped inside the ring's latency
+    /// headroom.
     pub fn target_fill(&self, rate: u32, latency_ms: u32) -> u32 {
         match &self.inner {
             Some(sink) => {
-                let block = sink.block_frames() as u64;
                 let requested = (u64::from(rate) * u64::from(latency_ms)).div_ceil(1000);
-                let aligned = requested.div_ceil(block) * block;
-                aligned.min(sink.max_ahead_frames()) as u32
+                requested.min(sink.max_ahead_frames()) as u32
             }
             None => 0,
         }
@@ -164,11 +162,11 @@ impl Sink {
 /// Say out loud what the sink reported. The library has no console, and
 /// whether an underrun is worth printing is a property of the machine.
 fn say(report: sound::sink::Report) {
-    if report.first_block {
+    if report.first_frame {
         // The difference between "armed" and "the DAC is actually consuming" —
         // where metal bring-up goes wrong, and invisible in a counter that
         // only reports problems.
-        crate::println!("sink: first block played");
+        crate::println!("sink: first frame played");
     }
     if let Some(u) = report.underrun {
         let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
@@ -268,9 +266,9 @@ impl Producer {
             return;
         }
         self.last_consumed = consumed;
-        // Sample queue error only when the device reports a completion. At
-        // that instant `consumed` is current; between completions its block
-        // staircase would otherwise look like a false latency ramp.
+        // Sample queue error only when the device reports fresh cursor
+        // progress. Between polls the queue depth is still monotonic, but we
+        // only retune when hardware has actually advanced.
         let queued = written.saturating_sub(consumed) as i64;
         let error = i64::from(target) - queued;
         let trim_ppm = (error * TRIM_PPM_PER_FRAME)

@@ -16,13 +16,13 @@
 //! A [`Device`] is the whole of what a sound card must supply: its rate and
 //! block geometry plus start, stop and progress operations, none of which
 //! mention a machine. Where the bytes go and how the ring is programmed are
-//! the host's; how many blocks completed and what to do about them are this
+//! the host's; how many frames have advanced and what to do about them are this
 //! crate's.
 //!
 //! There is deliberately **no clock and no cursor** in here. Playback is
-//! learned one way only: [`Sink::poll`], which asks the device how many blocks
+//! learned one way only: [`Sink::poll`], which asks the device how many frames
 //! completed since the previous sample. The producer remains frame-granular;
-//! only device completion and safe ring reclamation are block-granular.
+//! the sink just keeps the ring and its safety margin honest.
 
 /// One device PCM frame: `[left, right]`. RetroOS targets little-endian x86,
 /// so this is also the DMA wire representation used by every hardware sink.
@@ -54,7 +54,7 @@ pub trait Device {
     fn block_frames(&self) -> usize;
 
     /// Program the device at [`Device::rate`], arm the transfer over the whole
-    /// ring, and re-baseline the block count.
+    /// ring, and re-baseline the frame count.
     /// A sink is armed once, at construction, and free-runs for its life —
     /// there is no stopped state, because an unfed ring plays the silence it
     /// is scrubbed to.
@@ -64,13 +64,13 @@ pub trait Device {
     /// this, it just stops feeding.
     fn halt(&mut self);
 
-    /// Blocks played since the last poll: exactly once per block, in order,
-    /// never lost, never duplicated during the ring's polling horizon.
+    /// Frames played since the last poll: exact cursor delta, in order, never
+    /// lost, never duplicated during the ring's polling horizon.
     ///
     /// A device honours that by reading its own cursor and returning the
     /// difference. Returning a sparse wakeup count here would be lossy, and
     /// the sink has no way to tell.
-    fn blocks_played(&mut self) -> u64;
+    fn frames_played(&mut self) -> u64;
 }
 
 impl<T: Device + ?Sized> Device for &mut T {
@@ -90,8 +90,8 @@ impl<T: Device + ?Sized> Device for &mut T {
         (**self).halt();
     }
 
-    fn blocks_played(&mut self) -> u64 {
-        (**self).blocks_played()
+    fn frames_played(&mut self) -> u64 {
+        (**self).frames_played()
     }
 }
 
@@ -101,7 +101,7 @@ pub struct Sink<D: Device> {
     buf: &'static mut [Frame],
     write_pos: usize,
     written_frames: u64,
-    completed_blocks: u64,
+    played_frames: u64,
     /// Used to distinguish an idle sink from one that ran dry while its
     /// producer was active.
     written_frames_at_last_completion: u64,
@@ -123,7 +123,7 @@ impl<D: Device> Sink<D> {
             buf,
             write_pos: 0,
             written_frames: 0,
-            completed_blocks: 0,
+            played_frames: 0,
             written_frames_at_last_completion: 0,
         }
     }
@@ -136,18 +136,15 @@ impl<D: Device> Sink<D> {
         self.dev.block_frames()
     }
 
-    /// Largest latency target. One block below the near half is reserved for
-    /// the consumer's deliberately hidden, incomplete completion block.
+    /// Largest latency target. Half the ring is reserved as recovery headroom.
     pub fn max_ahead_frames(&self) -> u64 {
-        (self.buf.len() / 2 - self.block_frames()) as u64
+        (self.buf.len() / 2) as u64
     }
 
     /// Hard producer safety ceiling. The producer overwrites live audio only
-    /// when it laps the consumer around the full ring, not when it crosses the
-    /// latency policy's half-ring cap. Completion accounting hides the current
-    /// incomplete consumer block, so keep that one whole block protected.
+    /// when it laps the consumer around the full ring.
     pub fn safety_ceiling_frames(&self) -> u64 {
-        (self.buf.len() - self.block_frames()) as u64
+        (self.buf.len() - 1) as u64
     }
 
     pub fn device(&mut self) -> &mut D {
@@ -184,21 +181,16 @@ impl<D: Device> Sink<D> {
         }
     }
 
-    /// Poll the device cursor and reclaim every newly completed block.
+    /// Poll the device cursor and reclaim every newly completed frame.
     pub fn poll(&mut self) -> Report {
-        let blocks = self.dev.blocks_played();
-        if blocks == 0 {
+        let frames = self.dev.frames_played();
+        if frames == 0 {
             return Report::default();
         }
 
-        let first_block = self.completed_blocks == 0;
-        let block_frames = self.block_frames();
-        let num_blocks = self.buf.len() / block_frames;
-        for block in self.completed_blocks..self.completed_blocks + blocks {
-            let slot = block as usize % num_blocks;
-            self.buf[slot * block_frames..(slot + 1) * block_frames].fill([0, 0]);
-        }
-        self.completed_blocks += blocks;
+        let first_frame = self.played_frames == 0;
+        self.clear_frames(self.played_frames, frames);
+        self.played_frames += frames;
 
         let producing = self.written_frames > self.written_frames_at_last_completion;
         self.written_frames_at_last_completion = self.written_frames;
@@ -208,12 +200,12 @@ impl<D: Device> Sink<D> {
             written_frames,
             consumed_frames,
         });
-        Report { first_block, underrun }
+        Report { first_frame, underrun }
     }
 
-    /// Frames consumed by the device, at block granularity.
+    /// Frames consumed by the device.
     pub fn consumed_frames(&self) -> u64 {
-        self.completed_blocks * self.block_frames() as u64
+        self.played_frames
     }
 
     /// Frames accepted from the producer. This cursor is changed only by
@@ -223,13 +215,36 @@ impl<D: Device> Sink<D> {
         self.written_frames
     }
 
-    /// Abandon an underrun's obsolete write position and resume at the first
-    /// whole block the device has not begun playing.
+    /// Abandon an underrun's obsolete write position and resume one device
+    /// block ahead of the current cursor.
     pub fn resync(&mut self) {
         let block_frames = self.block_frames();
-        let num_blocks = self.buf.len() / block_frames;
-        self.write_pos = ((self.completed_blocks as usize + 1) % num_blocks) * block_frames;
-        self.written_frames = (self.completed_blocks + 1) * block_frames as u64;
+        let ring_frames = self.buf.len();
+        self.write_pos = ((self.played_frames % ring_frames as u64) as usize + block_frames) % ring_frames;
+        self.written_frames = self.played_frames + block_frames as u64;
+    }
+
+    fn clear_frames(&mut self, start_frames: u64, len_frames: u64) {
+        if len_frames == 0 {
+            return;
+        }
+
+        let ring_frames = self.buf.len();
+        if len_frames >= ring_frames as u64 {
+            self.buf.fill([0, 0]);
+            return;
+        }
+
+        let start = (start_frames % ring_frames as u64) as usize;
+        let len = len_frames as usize;
+        let end = start + len;
+        if end <= ring_frames {
+            self.buf[start..end].fill([0, 0]);
+        } else {
+            let split = ring_frames - start;
+            self.buf[start..].fill([0, 0]);
+            self.buf[..len - split].fill([0, 0]);
+        }
     }
 }
 
@@ -238,10 +253,10 @@ impl<D: Device> Sink<D> {
 /// property of the machine, not of the ring.
 #[derive(Clone, Copy, Default)]
 pub struct Report {
-    /// The very first block reached the DAC — the difference between "armed"
+    /// The very first frame reached the DAC — the difference between "armed"
     /// and "actually consuming", which is where bring-up on real hardware
     /// goes wrong and which no error counter ever shows.
-    pub first_block: bool,
+    pub first_frame: bool,
     pub underrun: Option<Underrun>,
 }
 
@@ -280,10 +295,10 @@ mod tests {
 
         fn halt(&mut self) {}
 
-        fn blocks_played(&mut self) -> u64 {
-            core::mem::take(&mut self.played)
-        }
+    fn frames_played(&mut self) -> u64 {
+        core::mem::take(&mut self.played)
     }
+}
 
     fn ring() -> &'static mut [Frame] {
         Box::leak(vec![[0; 2]; RING_FRAMES].into_boxed_slice())
@@ -309,17 +324,17 @@ mod tests {
     }
 
     #[test]
-    fn block_completions_expose_consumed_frames() {
+    fn frame_completions_expose_consumed_frames() {
         let mut sink = Sink::new(
             ring(),
             TestDevice { rate: 8_000, block_frames: BLOCK_FRAMES, starts: 0, played: 1 },
         );
         sink.submit(&[(1, 1)], 1 << 16);
         let report = sink.poll();
-        assert!(report.first_block);
-        assert_eq!(sink.consumed_frames(), BLOCK_FRAMES as u64);
+        assert!(report.first_frame);
+        assert_eq!(sink.consumed_frames(), 1);
 
-        // A producer that fed us one frame against a whole block of drain ran
+        // A producer that fed us one frame against one frame of drain ran
         // dry. The consumer reports it but does not move the producer cursor.
         let u = report.underrun.expect("fed, and still behind the DAC");
         assert_eq!(u.written_frames, 1);
@@ -335,9 +350,9 @@ mod tests {
         );
         let _ = sink.poll();
         assert_eq!(sink.block_frames(), 128);
-        assert_eq!(sink.consumed_frames(), 384);
-        assert_eq!(sink.max_ahead_frames(), 896);
-        assert_eq!(sink.safety_ceiling_frames(), 1920);
+        assert_eq!(sink.consumed_frames(), 3);
+        assert_eq!(sink.max_ahead_frames(), 1024);
+        assert_eq!(sink.safety_ceiling_frames(), 2047);
     }
 
     #[test]
@@ -351,7 +366,7 @@ mod tests {
         let report = sink.poll();
         assert!(report.underrun.is_none());
         assert_eq!(sink.written_frames(), 0);
-        assert_eq!(sink.consumed_frames(), 3 * BLOCK_FRAMES as u64);
+        assert_eq!(sink.consumed_frames(), 3);
     }
 
     #[test]

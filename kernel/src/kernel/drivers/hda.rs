@@ -240,7 +240,7 @@ pub struct Hda {
     /// delta is the authoritative amount consumed.
     consumed_hw: u64,
     last_hw_pos: u32,
-    /// Blocks already reported to the sink.
+    /// Frames already reported to the sink.
     reported: u64,
 }
 
@@ -1230,7 +1230,7 @@ impl Hda {
         }
     }
 
-    /// Blocks the codec has played since the previous cursor poll.
+    /// Frames the codec has played since the previous cursor poll.
     fn advance(&mut self) -> u64 {
         if !self.running {
             return 0;
@@ -1242,7 +1242,7 @@ impl Hda {
             self.consumed_hw += delta;
             self.last_hw_pos = pos;
         }
-        let played = self.consumed_hw / BUF_BYTES as u64;
+        let played = self.consumed_hw / core::mem::size_of::<crate::kernel::sound::Frame>() as u64;
         let fresh = played.saturating_sub(self.reported);
         self.reported = played;
         fresh
@@ -1470,7 +1470,7 @@ impl sound::sink::Device for Hda {
         self.stop_corb_rirb();
     }
 
-    fn blocks_played(&mut self) -> u64 {
+    fn frames_played(&mut self) -> u64 {
         self.advance()
     }
 }

@@ -64,8 +64,8 @@ pub struct Sb16 {
     base: u16,
     /// Physical base of the transfer ring, for (re)programming the 8237.
     phys: u32,
-    /// Blocks already reported to the sink. Re-baselined at `start`, so a
-    /// restart never reports the previous session's blocks.
+    /// Frames already reported to the sink. Re-baselined at `start`, so a
+    /// restart never reports the previous session's frames.
     reported: u64,
     /// Last raw ring byte position, for accumulating across wraps.
     last_pos: u32,
@@ -443,7 +443,7 @@ impl sound::sink::Device for Sb16 {
         dsp_write(self.base, CMD_SPEAKER_ON);
     }
 
-    fn blocks_played(&mut self) -> u64 {
+    fn frames_played(&mut self) -> u64 {
         let ring = RING_BYTES as u32;
         let pos = dma_pos_bytes();
         let delta = (pos + ring - self.last_pos) % ring;
@@ -451,7 +451,7 @@ impl sound::sink::Device for Sb16 {
             self.consumed += delta as u64;
             self.last_pos = pos;
         }
-        let played = self.consumed / BUF_BYTES as u64;
+        let played = self.consumed / core::mem::size_of::<crate::kernel::sound::Frame>() as u64;
         let fresh = played.saturating_sub(self.reported);
         self.reported = played;
         fresh
