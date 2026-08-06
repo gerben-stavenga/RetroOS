@@ -1241,18 +1241,8 @@ pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A
     let cs_32 = mode_transitions::seg_is_32(&dos.ldt[..], regs.code_seg());
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
-    let pre = ip_lin.wrapping_sub(16);
-    let mut cp = [0u8; 32];
-    machine.copy_from(pre as usize, &mut cp);
-    crate::dbg_println!("[DBG] code @{:08x} (-16..+16):", pre);
-    crate::dbg_println!("[DBG]   {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X} | {:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-        cp[0], cp[1], cp[2], cp[3], cp[4], cp[5], cp[6], cp[7],
-        cp[8], cp[9], cp[10], cp[11], cp[12], cp[13], cp[14], cp[15],
-        cp[16], cp[17], cp[18], cp[19], cp[20], cp[21], cp[22], cp[23],
-        cp[24], cp[25], cp[26], cp[27], cp[28], cp[29], cp[30], cp[31]);
-    let sw: [u32; 8] = core::array::from_fn(|i| machine.read::<u32>(sp_lin as usize + i * 4));
-    crate::dbg_println!("[DBG] stack @{:08x}: {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
-        sp_lin, sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7]);
+    let _ = machine;
+    crate::dbg_println!("[DBG] code @{:08x} stack @{:08x}", ip_lin, sp_lin);
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.

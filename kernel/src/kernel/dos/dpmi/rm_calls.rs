@@ -4,29 +4,16 @@ use super::super::mode_transitions;
 use super::super::mode_transitions::RmCallStruct;
 
 /// INT 31h/0300h — Simulate Real Mode Interrupt
-/// Trace helper: peek 16 bytes at RM linear (ds<<4)+edx and print ASCII.
-/// Used to see what filename/buffer DOS/4GW hands to real mode.
+/// Trace helper: report the RM pointer without dereferencing it.
+///
+/// This path runs before the real-mode call has completed, so the guest
+/// pointer may be unmapped or otherwise transient. A debug trace must never
+/// turn into a kernel page fault, so we only print the computed linear
+/// address here.
 fn dump_ds_dx<A: crate::Arch>(machine: &mut A, ds: u16, edx: u32) {
     let linear = ((ds as u32) << 4).wrapping_add(edx & 0xFFFF);
-    if linear >= 0x110000 { return; } // guard against non-low memory
-    let mut bytes = [0u8; 16];
-    for (i, byte) in bytes.iter_mut().enumerate() {
-        *byte = machine.read::<u8>((linear + i as u32) as usize);
-    }
-    dos_trace!(
-        "[DPMI]   DS:DX@{:05X}: {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}  '{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}'",
-        linear,
-        bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        printable(bytes[0]), printable(bytes[1]), printable(bytes[2]), printable(bytes[3]),
-        printable(bytes[4]), printable(bytes[5]), printable(bytes[6]), printable(bytes[7]),
-        printable(bytes[8]), printable(bytes[9]), printable(bytes[10]), printable(bytes[11]),
-        printable(bytes[12]), printable(bytes[13]), printable(bytes[14]), printable(bytes[15]),
-    );
-}
-
-fn printable(b: u8) -> char {
-    if (0x20..0x7F).contains(&b) { b as char } else { '.' }
+    let _ = machine;
+    dos_trace!("[DPMI]   DS:DX={:04X}:{:08X} linear={:05X}", ds, edx, linear);
 }
 
 // ============================================================================
@@ -282,5 +269,4 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     regs.fs = 0;
     regs.gs = 0;
 }
-
 

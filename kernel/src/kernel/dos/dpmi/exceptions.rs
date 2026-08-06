@@ -20,13 +20,8 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
 }
 
 fn dump_words<A: crate::Arch>(machine: &mut A, label: &str, addr: u32) {
-    let rd = |off: u32| machine.read::<u16>((addr.wrapping_add(off)) as usize);
-    let (w0, w1, w2, w3) = (rd(0), rd(2), rd(4), rd(6));
-    let (w4, w5, w6, w7) = (rd(8), rd(10), rd(12), rd(14));
-    crate::println!(
-        "  {} @{:08X}: {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
-        label, addr, w0, w1, w2, w3, w4, w5, w6, w7,
-    );
+    let _ = machine;
+    crate::println!("  {} @{:08X}", label, addr);
 }
 
 fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
@@ -35,8 +30,7 @@ fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosSta
     let ip_addr = cs_base.wrapping_add(regs.ip32());
     let sp_addr = ss_base.wrapping_add(regs.sp32());
     let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
-    let mut bytes = [0u8; 16];
-    machine.copy_from(ip_addr as usize, &mut bytes);
+    let _ = machine;
 
     crate::println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
@@ -53,14 +47,14 @@ fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosSta
         regs.rbp as u32,
     );
     crate::println!(
-        "  DS={:04X} ES={:04X} FS={:04X} GS={:04X} SS:SP={:04X}:{:08X} code={:02X?}",
+        "  DS={:04X} ES={:04X} FS={:04X} GS={:04X} SS:SP={:04X}:{:08X} code@{:08X}",
         regs.ds as u16,
         regs.es as u16,
         regs.fs as u16,
         regs.gs as u16,
         regs.stack_seg(),
         regs.sp32(),
-        bytes,
+        ip_addr,
     );
     dump_selector("CS", dos, regs.code_seg());
     dump_selector("DS", dos, regs.ds as u16);
