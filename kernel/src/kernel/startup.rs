@@ -28,10 +28,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
     // It no longer touches storage — the mount decision is made below, from
     // the partition tables, by the layer that owns it.
-    let probed = crate::kernel::platform::probe(machine, boot);
-    let platform = probed.facts;
+    let crate::kernel::platform::ProbedPlatform {
+        facts: platform,
+        display,
+        audio,
+    } = crate::kernel::platform::probe(machine, boot);
     let mut screen =
-        crate::kernel::platform::VisibleScreen::new(screen, probed.display);
+        crate::kernel::platform::VisibleScreen::new(screen, display);
 
     // Disk-write policy, applied by COMPOSITION and DECLARED, never inferred.
     //
@@ -183,14 +186,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
                 );
             }
         }
-        // Start delivering the card's completion line — the ACTING one, which
-        // is the card's own field after any restrap above, not a snapshot kept
-        // elsewhere and not a guess. This is the only place an SB interrupt
-        // line is enabled: the machine's other lines stay masked, so a floating
-        // IRQ 7 (LPT1's line, and the 8259's spurious vector) never reaches
-        // `handle_irq` at all.
-        machine.route_isa_irq(card.irq);
-        crate::println!("Audio: SB IRQ{} routed", card.irq);
+        // Only a DOS-owned native SB needs its hardware IRQ. Mixer ownership
+        // polls DMA position, so routing its completion line would create a
+        // wakeup and acknowledgement path with no accounting purpose.
+        if matches!(platform.audio, crate::kernel::platform::Audio::NativeSb) {
+            machine.route_isa_irq(card.irq);
+            crate::println!("Audio: SB IRQ{} routed", card.irq);
+        }
 
         // Judge the H-declaration against the acting straps — the restrap just
         // above may have enabled the 16-bit channel.
@@ -218,11 +220,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         | crate::kernel::platform::Audio::EmulatedSilent => {}
         _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
     }
-    init_device_policy(machine, platform);
-    // AFTER the drivers are up: the sink adopts a device's ring at
-    // construction, so a controller that has not been brought up yet would
-    // hand it nothing and the sink would be silently inert.
-    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, for_sink));
+    // Probe and install the selected output capability. This is the sole
+    // init-time handoff from each driver's static slot into runtime ownership.
+    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, audio, for_sink));
     init_console_pipe();
 
     // Preserve one kernel-owned pristine real-mode environment. DOS worlds
@@ -372,21 +372,6 @@ fn mount_kernel_log_fs() {
             alloc::boxed::Box::leak([c_root, b"proc/"].concat().into_boxed_slice());
         vfs::mount_union(dos_proc_prefix, &crate::kernel::klog::KLOG_FS);
     }
-}
-
-/// Device policy, derived from the platform probe — not re-probed here.
-/// Port permissions are NOT set here: the CPU-loan boundary rebuilds the
-/// I/O bitmap from the running thread's capabilities before every guest
-/// entry (Linux threads get nothing).
-fn init_device_policy<A: crate::Arch>(
-    machine: &mut A,
-    _platform: &'static crate::kernel::platform::Platform,
-) {
-    // Probe for an AC'97 codec (metal). If present it becomes the kernel audio
-    // output for the emulated Sound Blaster; absent (no PCI, e.g. the
-    // interpreter) leaves the sound path on its port-window fallback.
-    crate::kernel::drivers::ac97::init(machine);
-    crate::kernel::drivers::hda::init(machine);
 }
 
 /// /CONFIG.SYS provides the master env handed to DN and any user-driven

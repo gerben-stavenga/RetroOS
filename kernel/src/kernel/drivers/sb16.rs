@@ -7,8 +7,7 @@
 //!
 //! It drives the real DSP for **16-bit signed-stereo auto-init DMA** on the ISA
 //! 8237 (channel 5). The DMA region is a circular ring. The kernel polls the
-//! live 8237 cursor for accounting; a sparse DSP interrupt only wakes an idle
-//! kernel and is never interpreted as a completion count.
+//! live 8237 cursor for accounting and leaves the DSP completion IRQ masked.
 //!
 //! Only machine *primitives* are used — port I/O (`inb`/`outb`, for the DSP,
 //! mixer, and the 8237), `dma_channel_buf` (the permanent contiguous channel-5
@@ -16,20 +15,13 @@
 //! never any machine-side driver logic. The DMA window is shared with the
 //! ac97/hda sinks (only one sink is ever active), see `ac97.rs`.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use spin::Mutex;
-
-
 // ── SB16 DSP / mixer port OFFSETS from the card's base ──────────────────────
 //    The base is the card's own (`SbCard::base`), never a guess: a card
 //    jumpered to 0x240 used to be driven through 0x220's ports, which is
 //    nobody's card. Not a per-thread BLASTER relocation either — that is the
 //    guest's declaration, and the sink is not a guest.
-const DSP_ACK16: u16 = 0x0F; // 16-bit IRQ acknowledge
 const MIX_IDX: u16 = 0x04;
 const MIX_DATA: u16 = 0x05;
-const MIX_IRQ_STATUS: u8 = 0x82;
-const MIX_IRQ_16BIT: u8 = 1 << 1;
 
 // DSP commands.
 const CMD_SPEAKER_ON: u8 = 0xD1;
@@ -66,16 +58,14 @@ const RATE: u32 = 44_100;
 
 /// What only THIS card knows. The ring, the counters and the prime/underrun
 /// bookkeeping belong to the sound sink — shared with every other device,
-/// because none of it is Sound-Blaster-specific. What is left here is
-/// the 8237 channel-5 programming, the DSP session, and turning a possibly
-/// coalesced interrupt into the right number of played blocks.
-struct Sb16 {
+/// because none of it is Sound-Blaster-specific. What is left here is the 8237
+/// channel-5 programming, the DSP session and its live DMA cursor.
+pub struct Sb16 {
     base: u16,
     /// Physical base of the transfer ring, for (re)programming the 8237.
     phys: u32,
-    /// Blocks the engine has already been told about, so a coalesced
-    /// interrupt emits the difference rather than one event. Re-baselined at
-    /// `start`, so a restart never reports the previous session's blocks.
+    /// Blocks already reported to the sink. Re-baselined at `start`, so a
+    /// restart never reports the previous session's blocks.
     reported: u64,
     /// Last raw ring byte position, for accumulating across wraps.
     last_pos: u32,
@@ -83,25 +73,9 @@ struct Sb16 {
     consumed: u64,
 }
 
-static SB16: Mutex<Option<Sb16>> = Mutex::new(None);
-
-static PRESENT: AtomicBool = AtomicBool::new(false);
-/// The IRQ line the card raises on block completion (read from the mixer at
-/// bring-up), so `sound::on_irq` can match it. 0xFF until up.
-static IRQ_LINE: AtomicU32 = AtomicU32::new(0xFF);
-
-/// The routed completion-IRQ line, for `sound::on_irq`. `None` until up.
-pub fn irq_line() -> Option<u8> {
-    match IRQ_LINE.load(Ordering::Relaxed) {
-        0xFF => None,
-        n => Some(n as u8),
-    }
-}
-
-/// The sink is up and can use this card's completion clock for latency feedback.
-pub fn present() -> bool {
-    PRESENT.load(Ordering::Relaxed)
-}
+// Written once during single-threaded boot, then reachable only through the
+// unique capability returned by `adopt`.
+static mut SB16: Option<Sb16> = None;
 
 /// **The** physical Sound Blaster, as a capability: where it lives, what it
 /// can play, and how it reaches us.
@@ -356,9 +330,8 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
 /// Pro has nothing to run it on. Silence is the honest output — not a
 /// downgrade to some 8-bit path nobody wrote, and not a mode switch behind the
 /// owner's back.
-/// Returns the ring the engine will fill (kernel VA + physical base), or
-/// `None` if this card cannot be a sink — which is this sink's silence.
-pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u32)> {
+/// Returns the unique runtime device, or `None` if this card cannot be a sink.
+pub fn adopt<A: crate::Arch>(machine: &mut A, card: SbCard) -> Option<&'static mut Sb16> {
     if card.dma16 != Some(DMA_CHANNEL as u8) {
         crate::println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
@@ -366,17 +339,19 @@ pub fn adopt<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
         );
         return None;
     }
-    let (va, phys) = open_ring(machine, card)?;
-    PRESENT.store(true, Ordering::Relaxed);
-    *SB16.lock() = Some(Sb16 { base: card.base, phys, reported: 0, last_pos: 0, consumed: 0 });
-    Some((va, phys))
+    let phys = open_ring(machine, &card)?;
+    let device = Sb16 { base: card.base, phys, reported: 0, last_pos: 0, consumed: 0 };
+    unsafe {
+        let slot = &raw mut SB16;
+        assert!((*slot).is_none(), "SB16 adopted twice");
+        *slot = Some(device);
+        (*slot).as_mut()
+    }
 }
 
 /// Map the permanent channel-5 buffer and wake the card up. The ring's
 /// CONTENT is the engine's business; this hands over where it lives.
-fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u32)> {
-    machine.route_isa_irq(card.irq);
-
+fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<u32> {
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
@@ -395,9 +370,8 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
     machine.outb(card.base + MIX_DATA, 0xFF); // full
     dsp_write_at(machine, card.base, CMD_SPEAKER_ON);
 
-    IRQ_LINE.store(card.irq as u32, Ordering::Relaxed);
-    crate::println!("sb16: sink on {:#05x}, IRQ {}, DMA {}", card.base, card.irq, DMA_CHANNEL);
-    Some((DMA_WIN_VA, dma_phys))
+    crate::println!("sb16: sink on {:#05x}, DMA {}", card.base, DMA_CHANNEL);
+    Some(dma_phys)
 }
 
 // ── the four things a `sound::sink::Device` must do ─────────────────────────
@@ -410,99 +384,78 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<(usize, u
 
 use crate::kernel::portio::{inb, outb};
 
-/// Program the 8237 for the whole ring in 16-bit auto-init, then start the
-/// DSP's auto-init output with a per-block length. The DSP free-runs the ring
-/// from here and raises the completion IRQ every block.
-///
-/// Re-baselines the played-block count, so the sink never sees a block from
-/// the previous session — a restart would otherwise look like a whole ring of
-/// sudden free space.
-pub fn start() {
-    let mut g = SB16.lock();
-    let Some(dev) = g.as_mut() else { return };
-    let phys = dev.phys;
-    let word_addr = (phys >> 1) & 0xFFFF;
-    let words = (RING_BYTES / 2) as u32;
-    outb(DMA5_MASK, 0x05); // mask channel 5
-    outb(DMA5_CLRFF, 0);
-    outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
-    outb(DMA5_ADDR, word_addr as u8);
-    outb(DMA5_ADDR, (word_addr >> 8) as u8);
-    outb(DMA5_PAGE, (phys >> 16) as u8);
-    outb(DMA5_COUNT, (words - 1) as u8);
-    outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
-    outb(DMA5_MASK, 0x01); // unmask channel 5
-    dev.last_pos = 0;
-    dev.consumed = 0;
-    dev.reported = 0;
-
-    // The IRQ is only a sparse wakeup; DMA-position polling accounts actual
-    // consumption. DSP length is in 16-bit transfers, two per stereo frame.
-    let block_samples = (RING_BYTES / 4) as u16;
-    let base = dev.base;
-    // The DAC plays at whatever rate it was last told, so the card programs
-    // its own — the same rate it reports as its `Device::rate`.
-    dsp_write(base, CMD_SET_RATE_OUT);
-    dsp_write(base, (RATE >> 8) as u8);
-    dsp_write(base, RATE as u8);
-    dsp_write(base, CMD_16BIT_AUTO_OUT);
-    dsp_write(base, MODE_SIGNED_STEREO);
-    dsp_write(base, (block_samples - 1) as u8);
-    dsp_write(base, ((block_samples - 1) >> 8) as u8);
-    crate::println!("sb16: stream RUN base={:#05x} ring={} block={}", base, RING_BYTES, BUF_BYTES);
-}
-
-/// Kernel VA of the ring, for rebuilding a sink around this device.
-pub fn ring_va() -> usize {
-    if SB16.lock().is_some() { DMA_WIN_VA } else { 0 }
-}
-
-pub const fn block_frames() -> usize {
-    BUF_FRAMES
-}
-
-pub const fn ring_frames() -> usize {
-    RING_FRAMES
-}
-
-/// Halt the transfer and mask the channel.
-pub fn halt() {
-    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return };
-    dsp_write(base, CMD_HALT_AUTO_16);
-    outb(DMA5_MASK, 0x05);
-    let _ = dsp_reset(base);
-    dsp_write(base, CMD_SPEAKER_ON);
-}
-
-/// Is a 16-bit completion of ours pending? The mixer's IRQ status register
-/// distinguishes our DMA source on a possibly shared ISA line.
-pub fn irq_pending() -> bool {
-    let Some(base) = SB16.lock().as_ref().map(|d| d.base) else { return false };
-    outb(base + MIX_IDX, MIX_IRQ_STATUS);
-    if inb(base + MIX_DATA) & MIX_IRQ_16BIT == 0 {
-        return false;
+impl Sb16 {
+    pub fn ring(&mut self) -> &'static mut [crate::kernel::sound::Frame] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                DMA_WIN_VA as *mut crate::kernel::sound::Frame,
+                RING_FRAMES,
+            )
+        }
     }
-    let _ = inb(base + DSP_ACK16); // acknowledge the 16-bit completion
-    true
 }
 
-/// Blocks played since the last call, from the live 8237 cursor — never from
-/// counting interrupts, which is lossy: a completion landing on an already-set
-/// pending bit is indistinguishable from one.
-pub fn blocks_played() -> u64 {
-    let mut g = SB16.lock();
-    let Some(dev) = g.as_mut() else { return 0 };
-    let ring = RING_BYTES as u32;
-    let pos = dma_pos_bytes();
-    let delta = (pos + ring - dev.last_pos) % ring;
-    if delta != 0 {
-        dev.consumed += delta as u64;
-        dev.last_pos = pos;
+impl sound::sink::Device for Sb16 {
+    fn rate(&self) -> u32 {
+        RATE
     }
-    let played = dev.consumed / BUF_BYTES as u64;
-    let fresh = played.saturating_sub(dev.reported);
-    dev.reported = played;
-    fresh
+
+    fn block_frames(&self) -> usize {
+        BUF_FRAMES
+    }
+
+    fn start(&mut self) {
+        let word_addr = (self.phys >> 1) & 0xFFFF;
+        let words = (RING_BYTES / 2) as u32;
+        outb(DMA5_MASK, 0x05);
+        outb(DMA5_CLRFF, 0);
+        outb(DMA5_MODE, DMA5_MODE_AUTO_READ);
+        outb(DMA5_ADDR, word_addr as u8);
+        outb(DMA5_ADDR, (word_addr >> 8) as u8);
+        outb(DMA5_PAGE, (self.phys >> 16) as u8);
+        outb(DMA5_COUNT, (words - 1) as u8);
+        outb(DMA5_COUNT, ((words - 1) >> 8) as u8);
+        outb(DMA5_MASK, 0x01);
+        self.last_pos = 0;
+        self.consumed = 0;
+        self.reported = 0;
+
+        let block_samples = (RING_BYTES / 4) as u16;
+        dsp_write(self.base, CMD_SET_RATE_OUT);
+        dsp_write(self.base, (RATE >> 8) as u8);
+        dsp_write(self.base, RATE as u8);
+        dsp_write(self.base, CMD_16BIT_AUTO_OUT);
+        dsp_write(self.base, MODE_SIGNED_STEREO);
+        dsp_write(self.base, (block_samples - 1) as u8);
+        dsp_write(self.base, ((block_samples - 1) >> 8) as u8);
+        crate::println!(
+            "sb16: stream RUN base={:#05x} ring={} block={}",
+            self.base,
+            RING_BYTES,
+            BUF_BYTES
+        );
+    }
+
+    fn halt(&mut self) {
+        dsp_write(self.base, CMD_HALT_AUTO_16);
+        outb(DMA5_MASK, 0x05);
+        let _ = dsp_reset(self.base);
+        dsp_write(self.base, CMD_SPEAKER_ON);
+    }
+
+    fn blocks_played(&mut self) -> u64 {
+        let ring = RING_BYTES as u32;
+        let pos = dma_pos_bytes();
+        let delta = (pos + ring - self.last_pos) % ring;
+        if delta != 0 {
+            self.consumed += delta as u64;
+            self.last_pos = pos;
+        }
+        let played = self.consumed / BUF_BYTES as u64;
+        let fresh = played.saturating_sub(self.reported);
+        self.reported = played;
+        fresh
+    }
 }
 
 fn dsp_write(base: u16, byte: u8) {

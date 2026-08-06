@@ -13,12 +13,10 @@
 //!    programmed by sending *verbs* over the **CORB/RIRB** DMA rings, then a
 //!    stream descriptor + BDL feed PCM exactly like AC'97's bus master.
 //!
-//! Ring geometry mirrors `ac97`: a 32-entry ring of small PCM buffers in a
-//! borrowed contiguous DMA buffer, primed then run. One
-//! interrupt-on-completion per buffer signals either a private MSI identity or
-//! the firmware-routed PCI INTx line, and the producer refills the drained
-//! buffer from the event loop. MSI is preferred; INTx keeps early HDA machines
-//! usable when RetroOS is running its tick from the legacy PIT.
+//! Ring geometry mirrors `ac97`: a ring of small PCM buffers in a borrowed
+//! contiguous DMA buffer, primed then run. The regular system tick polls
+//! SDLPIB and the producer refills every completed buffer; playback requests no
+//! completion interrupts.
 //!
 //! ## Topology
 //!
@@ -41,9 +39,6 @@
 //! so reusing the same window + DMA channel is safe.
 
 use core::ptr::{read_volatile, write_volatile};
-use spin::Mutex;
-
-
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 // ── Stolen kernel VAs (dead UMA slice of the low-mem identity window) ─────────
@@ -78,9 +73,6 @@ const INTCTL: usize = 0x20; // d32: bit31 GIE, bit30 CIE, bits0..29 per-stream S
 const DPLBASE: usize = 0x70; // d32: DMA position buffer base; bit0 = enable
 const DPUBASE: usize = 0x74; // d32: DMA position buffer base high
 
-const SDSTS: usize = 0x03; // b8 (in the SD block): bit2 BCIS (buffer-complete), W1C
-const SDCTL_IOCE: u32 = 0x04; // SDCTL bit2: interrupt-on-completion enable
-
 // Output stream descriptor register offsets (added to the descriptor base, which
 // is 0x80 + ISS*0x20 — the first output stream sits past the input streams).
 const SD_BASE: usize = 0x80;
@@ -104,20 +96,15 @@ const DMA_PAGES: usize = (BUF_OFF + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
 
 // ── PCM ring geometry ────────────────────────────────────────────────────────
 // Fine descriptors make cursor accounting and latency control ~2.7 ms at
-// 48 kHz. They do not imply an interrupt each: only two descriptors per ring
-// carry IOC, and normal accounting polls the live cursor.
+// 48 kHz. Normal accounting polls the live cursor; descriptors request no
+// completion interrupts.
 const NUM_BUF: usize = 64;
 const BUF_BYTES: usize = 0x200;
 const BUF_FRAMES: usize = BUF_BYTES / core::mem::size_of::<crate::kernel::sound::Frame>();
 const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
-/// The SDFMT / converter-format word this stream is programmed with, and the
-/// only place the rate enters the hardware: bit14 base (0 = 48 kHz), bits10:8
-/// divisor (0), bits6:4 bit depth (001 = 16), bits3:0 channels-1. 48 kHz is
-/// the rate every HDA codec is required to carry.
-///
-/// The rate this encodes is stated once, for everyone, as this card's arm of
-/// `sound::sink::Device::rate` — nothing hands a rate down to this driver and
-/// nothing reads one out of it.
+/// The complete SDFMT / converter-format word this stream is programmed with:
+/// bit14 rate base, bits13:11 multiplier, bits10:8 divisor, bits6:4 sample
+/// width and bits3:0 channels-1.
 const STREAM_FMT: u16 = 0x0011;
 /// Stream tag bound between the descriptor and the DAC converter (1..15).
 const STREAM_TAG: u32 = 1;
@@ -170,21 +157,12 @@ const REALTEK_VENDOR_NID: u32 = 0x20;
 const REALTEK_EAPD_COEF_INDEX: u32 = 0x10;
 const REALTEK_EAPD_COEF_MASK: u32 = 1 << 9;
 
-static HDA: Mutex<Option<Hda>> = Mutex::new(None);
+// Written once during single-threaded boot, then reachable only through the
+// unique capability returned by `probe`. Rust cannot express that phase
+// transition, so the unsafe proof is confined to `install` below.
+static mut HDA: Option<Hda> = None;
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Kernel MSI identity allocated to the HDA sink. This is not an ISA IRQ/GSI
-/// line; the arch backend delivers it as `Irq::Msi(MSI_SOURCE)`.
-pub const MSI_SOURCE: u8 = 0;
-/// Set once bring-up successfully programmed MSI. False means the controller
-/// uses [`IRQ_LINE`] instead.
-static MSI_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-/// Firmware-routed PCI INTx line when MSI is unavailable; `u32::MAX` means
-/// none. Old ICH HDA controllers commonly live on machines where RetroOS uses
-/// the PIT and therefore cannot allocate an MSI vector.
-static IRQ_LINE: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 #[inline]
 fn spin(n: usize) {
@@ -232,7 +210,7 @@ fn stop_controller_dma() {
     w32(DPUBASE, 0);
 }
 
-struct Hda {
+pub struct Hda {
     dma_va: usize,
     dma_phys: u32,
     /// First output stream descriptor base (0x80 + ISS*0x20).
@@ -258,13 +236,11 @@ struct Hda {
     path: OutputPath,
     running: bool,
     /// Bytes the codec has consumed since the stream started, monotonic, and
-    /// the last modular hardware position it was accumulated from. Completion
-    /// interrupts are wakeups; this cursor delta, never the number of queued
-    /// IRQ events, is the authoritative amount consumed.
+    /// the last modular hardware position accumulated into it. This cursor
+    /// delta is the authoritative amount consumed.
     consumed_hw: u64,
     last_hw_pos: u32,
-    /// Blocks the engine has been told about, so a coalesced interrupt emits
-    /// the difference rather than one event.
+    /// Blocks already reported to the sink.
     reported: u64,
 }
 
@@ -343,31 +319,30 @@ fn path_conn(path: &OutputPath, i: usize) -> u8 {
     }
 }
 
-/// Find the preferred HDA controller (class 0x04, subclass 0x03) anywhere on
-/// PCI. We do not just return the first class match: real laptops often expose
-/// GPU HDMI audio before the internal analog codec.
-pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
-    let mut devices = [HdaPciDevice::EMPTY; MAX_HDA_CONTROLLERS];
-    let n = collect_hda_controllers(machine, &mut devices);
-    if n == 0 {
-        None
-    } else {
-        sort_hda_controllers(&mut devices, n);
-        Some((devices[0].bus, devices[0].dev, devices[0].func))
-    }
-}
-
-pub fn init<A: crate::Arch>(machine: &mut A) {
-    if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedHda {
-        return;
-    }
+/// Find and initialize the preferred usable HDA controller. Real laptops often
+/// expose GPU HDMI before their analog codec, so candidates are ranked and
+/// tried in order rather than accepting the first PCI class match.
+pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Hda> {
     let mut devices = [HdaPciDevice::EMPTY; MAX_HDA_CONTROLLERS];
     let n = collect_hda_controllers(machine, &mut devices);
     sort_hda_controllers(&mut devices, n);
     for d in devices.iter().take(n) {
-        if bring_up(machine, d.bus, d.dev, d.func) {
-            return;
+        if let Some(device) = bring_up(machine, d.bus, d.dev, d.func) {
+            return Some(install(device));
         }
+    }
+    None
+}
+
+/// Publish the one device created during boot and hand out its sole mutable
+/// capability. `startup` calls `probe` once before threads exist; after this
+/// handoff no code names the slot again.
+fn install(device: Hda) -> &'static mut Hda {
+    unsafe {
+        let slot = &raw mut HDA;
+        assert!((*slot).is_none(), "HDA probed twice");
+        *slot = Some(device);
+        (*slot).as_mut().unwrap()
     }
 }
 
@@ -493,45 +468,18 @@ fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u
 
 /// Bring up the controller + codec output path at `bus:dev.func`. Returns true
 /// on success.
-fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
-    // Enable memory space + bus master in the PCI command register (bits 1, 2).
+fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Hda> {
+    // Enable memory space + bus master and suppress INTx: playback progress is
+    // polled from SDLPIB, so this sink deliberately generates no interrupts.
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
-    crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x06);
-
-    // Prefer MSI, but do not confuse "the LAPIC is our timer source" with
-    // "this HDA controller is usable". Early ICH HDA machines can boot through
-    // the legacy PIT/PIC path; their firmware-routed INTx line is a perfectly
-    // adequate completion source.
-    let msi = machine
-        .msi_alloc(MSI_SOURCE)
-        .is_some_and(|(addr, data)| crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data));
-    if msi {
-        MSI_ON.store(true, core::sync::atomic::Ordering::Relaxed);
-        crate::println!("hda: {:02x}:{:02x}.{} MSI on", bus, dev, func);
-    } else {
-        let line =
-            (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
-        if !(1..=15).contains(&line) {
-            crate::println!(
-                "hda: {:02x}:{:02x}.{} no MSI/INTx route; skipping",
-                bus, dev, func
-            );
-            return false;
-        }
-        // PCI Command bit 10 suppresses INTx while set. Firmware is allowed to
-        // leave it set for an unused device, so make the fallback explicit.
-        crate::kernel::pci::write32(
-            machine,
-            bus,
-            dev,
-            func,
-            0x04,
-            ((cmd & 0xFFFF) | 0x06) & !(1 << 10),
-        );
-        machine.route_device_irq(line);
-        IRQ_LINE.store(line as u32, core::sync::atomic::Ordering::Relaxed);
-        crate::println!("hda: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
-    }
+    crate::kernel::pci::write32(
+        machine,
+        bus,
+        dev,
+        func,
+        0x04,
+        (cmd & 0xFFFF) | 0x06 | (1 << 10),
+    );
 
     // BAR0 is a memory BAR. Read the high dword only if it is actually 64-bit
     // (type bits [2:1] == 0b10); a 32-bit BAR would make 0x14 a different reg.
@@ -544,7 +492,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let bar_phys = (hi << 32) | (bar0 & 0xFFFF_FFF0) as u64;
     if bar_phys == 0 {
         crate::println!("hda: {:02x}:{:02x}.{} skipped: no BAR", bus, dev, func);
-        return false;
+        return None;
     }
     machine.map_phys_range(
         BAR_WIN_VA >> 12,
@@ -564,7 +512,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
         crate::println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
-        return false;
+        return None;
     }
     machine.map_phys_range(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
@@ -683,7 +631,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         break;
     }
     if !detected {
-        return false;
+        return None;
     }
     if DEBUG {
         crate::println!(
@@ -696,7 +644,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             let r = d.verb(0, (0xF00 << 8) | p);
             if d.verb_failed {
                 d.shutdown_controller();
-                return false;
+                return None;
             }
             crate::println!(
                 "hda: probe param={:#04x} -> {:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
@@ -719,7 +667,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             d.verb_failed
         );
         d.shutdown_controller();
-        return false;
+        return None;
     }
 
     d.build_bdl();
@@ -735,7 +683,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
             d.codec_vendor
         );
         d.shutdown_controller();
-        return false;
+        return None;
     }
     d.dump_output_state();
 
@@ -786,8 +734,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         path_conn(&d.path, 3),
         path_conn(&d.path, 4),
     );
-    *HDA.lock() = Some(d);
-    true
+    Some(d)
 }
 
 impl Hda {
@@ -796,17 +743,16 @@ impl Hda {
     }
 
     /// Fill the BDL: entry i → PCM buffer i. Each HDA BDL entry is 16 bytes
-    /// { addr:u64, len:u32, flags:u32 }. IOC is sparse; polling drives cursor
-    /// accounting and the interrupt only wakes an otherwise idle kernel.
+    /// { addr:u64, len:u32, flags:u32 }. Progress is polled from SDLPIB, so no
+    /// descriptor requests an interrupt on completion.
     fn build_bdl(&mut self) {
         for i in 0..NUM_BUF {
-            let ioc = u32::from(i == NUM_BUF / 2 - 1 || i == NUM_BUF - 1);
             let entry = self.dma_va + BDL_OFF + i * 16;
             unsafe {
                 write_volatile(entry as *mut u32, self.buf_phys(i)); // addr low
                 write_volatile((entry + 4) as *mut u32, 0); // addr high
                 write_volatile((entry + 8) as *mut u32, BUF_BYTES as u32); // length
-                write_volatile((entry + 12) as *mut u32, ioc); // flags (IOC per buffer)
+                write_volatile((entry + 12) as *mut u32, 0); // flags: no IOC
             }
         }
     }
@@ -908,11 +854,7 @@ impl Hda {
         // Stream tag in the descriptor control byte (bits 20..23 of SDCTL).
         w8(sd + SDCTL + 2, (STREAM_TAG << 4) as u8);
 
-        // Enable delivery of this stream's completion interrupts to the CPU:
-        // global-interrupt-enable + this stream's status-interrupt-enable bit.
-        // The per-buffer IOCE (SDCTL bit2) is set with RUN at playback start.
-        let sidx = (self.sd - SD_BASE) / SD_STRIDE;
-        w32(INTCTL, 0x8000_0000 | (1u32 << sidx));
+        w32(INTCTL, 0); // cursor polling is the only completion path
     }
 
     /// Send one verb to `nid` and return the codec's 32-bit response. `verb` is
@@ -1267,8 +1209,7 @@ impl Hda {
     }
 
     /// Program the stream descriptor and the DAC converter for [`STREAM_FMT`].
-    /// Requires the stream to be stopped, so this belongs to bring-up and to
-    /// the recovery path in [`start`] — never to a running stream.
+    /// Requires the stream to be stopped and belongs exclusively to bring-up.
     fn program_format(&mut self) {
         w16(self.sd + SDFMT, STREAM_FMT);
         let dac = self.dac;
@@ -1289,10 +1230,7 @@ impl Hda {
         }
     }
 
-    /// Blocks the codec has played since we last said, from the hardware
-    /// cursor. Never from counting interrupts: a completion landing on an
-    /// already-set status bit is indistinguishable from one, and the cursor
-    /// turns a coalesced interrupt back into the right NUMBER of blocks.
+    /// Blocks the codec has played since the previous cursor poll.
     fn advance(&mut self) -> u64 {
         if !self.running {
             return 0;
@@ -1477,101 +1415,71 @@ fn dfs_output_path(
 
 // ── the primitives the sink engine asks of a device ─────────────────────────
 
-/// Where the engine writes PCM: the ring sits after the CORB/RIRB/BDL
-/// structures in the borrowed DMA buffer.
-pub fn adopt() -> Option<(usize, u32)> {
-    let g = HDA.lock();
-    let d = g.as_ref()?;
-    Some((d.dma_va + BUF_OFF, d.dma_phys + BUF_OFF as u32))
-}
-
-/// Start the stream. RUN, the stream tag and IOCE go out as ONE dword so the
-/// controller re-evaluates the codec↔stream binding with the stream number
-/// visible — a byte-0-only RUN write may leave the codec never draining the
-/// FIFO.
-pub fn start() {
-    let mut g = HDA.lock();
-    let Some(d) = g.as_mut() else { return };
-    // Bring-up programmed the format and nothing since had reason to clear
-    // it, but a lost SDFMT means silence rather than a wrong pitch, so repair
-    // it here rather than trusting or panicking.
-    if r16(d.sd + SDFMT) != STREAM_FMT {
-        crate::println!("hda: SDFMT lost before RUN ({:#06x}), reprogramming", r16(d.sd + SDFMT));
-        d.program_format();
-    }
-    d.consumed_hw = 0;
-    d.last_hw_pos = 0;
-    d.reported = 0;
-    w32(d.sd + SDCTL, 0x02 | SDCTL_IOCE | (STREAM_TAG << 20));
-    d.running = true;
-    crate::println!(
-        "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={}",
-        r32(d.sd + SDCTL), r32(d.sd + SDCBL), r16(d.sd + SDLVI),
-        r16(d.sd + SDFMT), r32(d.sd + SDLPIB),
-    );
-}
-
-/// Stop the stream without resetting the initialized controller. Controller
-/// reset is reserved for the machine shutdown path, which never restarts it.
-pub fn halt() {
-    let mut g = HDA.lock();
-    if let Some(d) = g.as_mut() {
-        d.stop_playback();
-        d.stop_corb_rirb();
+impl Hda {
+    /// Split out the DMA memory capability before handing this device to the
+    /// sink. The mapping is permanent and disjoint from the `Hda` object.
+    pub fn ring(&mut self) -> &'static mut [crate::kernel::sound::Frame] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (self.dma_va + BUF_OFF) as *mut crate::kernel::sound::Frame,
+                RING_FRAMES,
+            )
+        }
     }
 }
 
-/// Is this interrupt ours, and how many blocks played since we last said?
-pub fn irq_pending() -> bool {
-    let mut g = HDA.lock();
-    let Some(d) = g.as_mut() else { return false };
-    if r8(d.sd + SDSTS) & 0x04 == 0 {
-        return false;
+const fn stream_rate(fmt: u16) -> u32 {
+    let base = if fmt & (1 << 14) == 0 { 48_000 } else { 44_100 };
+    let multiplier = ((fmt >> 11) & 0x7) as u32 + 1;
+    let divisor = ((fmt >> 8) & 0x7) as u32 + 1;
+    base * multiplier / divisor
+}
+
+impl sound::sink::Device for Hda {
+    fn rate(&self) -> u32 {
+        stream_rate(STREAM_FMT)
     }
-    w8(d.sd + SDSTS, 0x04); // BCIS is write-1-clear
-    true
-}
 
-/// Blocks played since the last report, without requiring an interrupt.
-pub fn blocks_played() -> u64 {
-    let mut g = HDA.lock();
-    match g.as_mut() {
-        Some(d) => d.advance(),
-        None => 0,
+    fn block_frames(&self) -> usize {
+        BUF_FRAMES
     }
-}
 
-/// Kernel VA of the ring, for rebuilding a sink around this device.
-pub fn ring_va() -> usize {
-    HDA.lock().as_ref().map_or(0, |d| d.dma_va + BUF_OFF)
-}
-
-pub const fn block_frames() -> usize {
-    BUF_FRAMES
-}
-
-pub const fn ring_frames() -> usize {
-    RING_FRAMES
-}
-
-/// The routed completion-IRQ line, for the sink's interrupt match.
-pub fn irq_line() -> Option<u8> {
-    match IRQ_LINE.load(core::sync::atomic::Ordering::Relaxed) {
-        0xFF => None,
-        n => Some(n as u8),
+    /// Start the stream. RUN and the stream tag go out as one dword so the
+    /// controller re-evaluates the codec↔stream binding with the stream number
+    /// visible.
+    fn start(&mut self) {
+        assert_eq!(
+            r16(self.sd + SDFMT),
+            STREAM_FMT,
+            "HDA stream format was lost before RUN"
+        );
+        self.consumed_hw = 0;
+        self.last_hw_pos = 0;
+        self.reported = 0;
+        w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
+        self.running = true;
+        crate::println!(
+            "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={}",
+            r32(self.sd + SDCTL), r32(self.sd + SDCBL), r16(self.sd + SDLVI),
+            r16(self.sd + SDFMT), r32(self.sd + SDLPIB),
+        );
     }
-}
 
-/// The device is up and can carry a stream.
-pub fn present() -> bool {
-    HDA.lock().is_some()
+    fn halt(&mut self) {
+        self.stop_playback();
+        self.stop_corb_rirb();
+    }
+
+    fn blocks_played(&mut self) -> u64 {
+        self.advance()
+    }
 }
 
 /// Panic-path quiesce: stop all controller DMA and hold the link in reset so a
 /// hard reboot from a panic doesn't leave the codec wedged (mid-stream resets
 /// have left the ALC298 deaf to every OS until a cold power-off). Touches only
 /// MMIO — no locks, no allocation — so it is safe from the panic handler even
-/// if the HDA mutex is held.
+/// even if normal sound code was interrupted.
 pub fn emergency_quiesce() {
     if !BAR_MAPPED.load(core::sync::atomic::Ordering::Relaxed) {
         return;

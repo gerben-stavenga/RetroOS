@@ -159,6 +159,16 @@ impl BiosDisplay {
 pub struct ProbedPlatform {
     pub facts: &'static Platform,
     pub display: DisplayToken,
+    pub audio: AudioToken,
+}
+
+/// The initialized kernel-owned audio capability discovered at boot. Like the
+/// display token, this is deliberately kept out of the frozen fact table: it
+/// is unique mutable authority, carried once into its runtime owner.
+pub enum AudioToken {
+    Hda(&'static mut crate::kernel::drivers::hda::Hda),
+    Ac97(&'static mut crate::kernel::drivers::ac97::Ac97),
+    None,
 }
 
 /// Kernel console state while it is the visible display owner.
@@ -402,7 +412,7 @@ pub fn probe<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
 ) -> ProbedPlatform {
-    let audio_hw = probe_audio(machine);
+    let (audio_hw, audio_token) = probe_audio(machine);
     // A native host backend (hosted "punch-through") means /host is available
     // without COM1 — take it as hostfs-present and skip the serial probe.
     // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
@@ -503,7 +513,7 @@ pub fn probe<A: crate::Arch>(
             println!("VGA: WARNING no readback extensions — AC ports direct, full process VGA restore NOT supported (flip-flop/latches unrecoverable)");
         }
     }
-    ProbedPlatform { facts: p, display: display_token }
+    ProbedPlatform { facts: p, display: display_token, audio: audio_token }
 }
 
 /// The frozen platform description. Panics if `probe` has not run — an init
@@ -598,30 +608,26 @@ pub fn probed() -> bool {
     unsafe { (&raw const PLATFORM).as_ref().unwrap().is_some() }
 }
 
-/// The audio probe is uniform across backends: an absent ISA device reads
-/// 0xFF (so no-SB is the same answer on the interpreter's port bus and on
-/// card-less metal), PCI config reads are 0xFFFFFFFF where there is no PCI,
-/// and the canonical port window answers its signature only where a backend
-/// installed a sink. Card presence is machine-wide, so the probe uses the
-/// canonical SB base 0x220 (a per-thread BLASTER override relocates the
-/// guest-visible base, not the card).
-fn probe_audio<A: crate::Arch>(machine: &mut A) -> AudioHw {
+/// Probe audio once. PCI drivers return their initialized capability together
+/// with the fact recorded in `Platform`; SB presence is separate because its
+/// wiring and ownership policy cannot be settled until CONFIG.SYS is mounted.
+fn probe_audio<A: crate::Arch>(machine: &mut A) -> (AudioHw, AudioToken) {
     // Presence only. Minting the card needs its wiring, and a pre-SB16 card's
     // wiring comes from CONFIG.SYS — unreadable this early — so the capability
     // is minted later, in `apply_audio_mode`.
     if crate::kernel::drivers::sb16::answers(machine) {
-        return AudioHw::Sb;
+        return (AudioHw::Sb, AudioToken::None);
     }
-    if crate::kernel::drivers::hda::scan(machine).is_some() {
-        return AudioHw::Hda;
+    if let Some(device) = crate::kernel::drivers::hda::probe(machine) {
+        return (AudioHw::Hda, AudioToken::Hda(device));
     }
-    if crate::kernel::drivers::ac97::scan(machine).is_some() {
-        return AudioHw::Ac97;
+    if let Some(device) = crate::kernel::drivers::ac97::probe(machine) {
+        return (AudioHw::Ac97, AudioToken::Ac97(device));
     }
     if crate::kernel::sound::window_present(machine) {
-        return AudioHw::PortWindow;
+        return (AudioHw::PortWindow, AudioToken::None);
     }
-    AudioHw::None
+    (AudioHw::None, AudioToken::None)
 }
 
 

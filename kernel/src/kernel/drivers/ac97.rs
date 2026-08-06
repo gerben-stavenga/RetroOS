@@ -3,7 +3,7 @@
 //! On a host with an AC'97 codec but no Sound Blaster, the emulated SB
 //! (`dos/machine/vsb.rs`) produces canonical PCM and the kernel `sound` layer
 //! needs somewhere to play it. This driver is that sink on metal: `sound::play`
-//! dispatches here when [`init`] discovered a codec at boot (PCI class 04:01).
+//! dispatches here when [`probe`] discovered a codec at boot (PCI class 04:01).
 //! It uses only machine *primitives* — 32-bit port I/O (`inl`/`outl`, for PCI
 //! config + the AC'97 bus-master registers), `dma_channel_buf` (the existing
 //! contiguous DMA buffer), and `map_phys_range` (to map that buffer into kernel
@@ -26,10 +26,6 @@
 //! see memory `project_ac97_lowmem_dma_window_todo`. Until then, do NOT "restore"
 //! the `LOW_MEM_BASE + 0xC0000` window to identity — this driver owns it.
 
-use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
-
-
 // ── PCI config space (0xCF8 address / 0xCFC data) ───────────────────────────
 
 // ── AC'97 register offsets ──────────────────────────────────────────────────
@@ -44,18 +40,12 @@ const NAM_EXT_CTRL: u16 = 0x2A; // bit0 = VRA enable
 const PO_BDBAR: u16 = 0x10; // 32-bit: BDL base physical address
 const PO_CIV: u16 = 0x14; // 8-bit: current index value (RO)
 const PO_LVI: u16 = 0x15; // 8-bit: last valid index
-const PO_SR: u16 = 0x16; // 16-bit: status; bit2 LVBCI, bit3 BCIS, bit4 FIFOE (W1C)
-const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset, bit4 IOCE)
+const PO_CR: u16 = 0x1B; // 8-bit: control (bit0 run, bit1 reset)
 const GLOB_CNT: u16 = 0x2C; // 32-bit: bit1 = AC-link out of cold reset
 const GLOB_STA: u16 = 0x30; // 32-bit: bit8 = primary codec ready
 
 const PO_CR_RUN: u8 = 0x01;
 const PO_CR_RESET: u8 = 0x02;
-const PO_CR_IOCE: u8 = 0x10; // interrupt-on-completion enable
-/// BDL entry control word bit 15: interrupt on completion of this buffer.
-const BDL_IOC: u16 = 1 << 15;
-/// All three PO status interrupt bits (LVBCI | BCIS | FIFOE), write-1-to-clear.
-const PO_SR_INTR: u16 = 0x1C;
 
 // ── DMA ring geometry ───────────────────────────────────────────────────────
 /// Kernel VA we steal from the low-mem identity window (over phys
@@ -76,99 +66,56 @@ const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 /// What only an AC'97 knows. The ring, the counters and the underrun test
 /// belong to the sink engine; this is the bus-master programming and the
 /// CIV bookkeeping that turns a completion into "N blocks played".
-struct Ac97 {
+pub struct Ac97 {
     nabm: u16,      // NABM I/O base
     dma_va: usize,  // kernel VA of the mapped channel buffer
     dma_phys: u32,  // its physical base address (for the codec / BDL)
     /// Last CIV seen, for accumulating block deltas across ring wraps.
     last_civ: u8,
-    /// Blocks the engine has been told about, so a coalesced interrupt emits
-    /// the difference rather than one event.
+    /// Blocks already reported to the sink.
     reported: u64,
     played: u64,
 }
 
-static AC97: Mutex<Option<Ac97>> = Mutex::new(None);
-static PRESENT: AtomicBool = AtomicBool::new(false);
-/// Private kernel MSI identity used when the controller exposes MSI.
-pub const MSI_SOURCE: u8 = 1;
-static MSI_ON: AtomicBool = AtomicBool::new(false);
-/// The wired IRQ line the codec's INTx was routed to (from PCI config 0x3C), so
-/// the canonical audio-IRQ router can acknowledge its sparse wakeup. 0xFF
-/// until bring-up; cursor polling drives consumption accounting.
-static IRQ_LINE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0xFF);
+// Written once during single-threaded boot, then reachable only through the
+// unique capability returned by `probe`.
+static mut AC97: Option<Ac97> = None;
 
-/// The routed completion-IRQ line, for `sound::on_irq`. `None` when MSI is used
-/// or until bring-up has selected the INTx fallback.
-pub fn irq_line() -> Option<u8> {
-    match IRQ_LINE.load(Ordering::Relaxed) {
-        0xFF => None,
-        n => Some(n as u8),
-    }
-}
-
-pub fn msi_active() -> bool {
-    MSI_ON.load(Ordering::Relaxed)
-}
-
-/// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI, via the
-/// shared `pci::find_class` scan. Pure presence probe — `platform::probe` uses
-/// it for the Audio decision; on a no-PCI backend (the interpreter) every read
-/// is 0xFFFFFFFF and nothing is found.
-pub fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
+/// Find an AC'97 codec (class 0x04, subclass 0x01) anywhere on PCI.
+fn scan<A: crate::Arch>(machine: &mut A) -> Option<(u8, u8, u8)> {
     crate::kernel::pci::find_class(machine, 0x04, 0x01)
 }
 
-/// Bring up the codec the platform probe found. Driver init only — the
-/// routing decision is `platform::Audio` (EmulatedAc97); PRESENT here means
-/// "driver is actually up" and guards `play` against a failed bring-up.
-pub fn init<A: crate::Arch>(machine: &mut A) {
-    if crate::kernel::platform::get().audio != crate::kernel::platform::Audio::EmulatedAc97 {
-        return;
-    }
-    let (bus, dev, func) = scan(machine).expect("platform probe saw an AC'97 codec; scan must agree");
-    if bring_up(machine, bus, dev, func) {
-        PRESENT.store(true, Ordering::Relaxed);
+/// Bring up the selected codec and return its unique runtime capability.
+pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<&'static mut Ac97> {
+    let (bus, dev, func) = scan(machine)?;
+    let device = bring_up(machine, bus, dev, func)?;
+    unsafe {
+        let slot = &raw mut AC97;
+        assert!((*slot).is_none(), "AC97 probed twice");
+        *slot = Some(device);
+        (*slot).as_mut()
     }
 }
 
-/// Bring up the codec at `bus:dev.func`. Returns true on success.
-fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool {
-    // Enable I/O space + bus-master in the PCI command register (low 16 bits of
-    // dword 0x04). Writing 0 to the status word (high 16) is harmless (RW1C).
+/// Bring up the codec at `bus:dev.func`.
+fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<Ac97> {
+    // Enable I/O space + bus-master and suppress INTx: playback progress is
+    // polled from CIV, so this sink deliberately generates no interrupts.
     let cmd = crate::kernel::pci::read32(machine, bus, dev, func, 0x04);
-    crate::kernel::pci::write32(machine, bus, dev, func, 0x04, (cmd & 0xFFFF) | 0x05);
-
-    // Prefer a namespace-safe MSI. Older AC'97 controllers commonly lack the
-    // capability, so retain INTx as a fallback; that path still depends on the
-    // firmware's Interrupt Line value until ACPI PCI routing is available.
-    let msi = machine
-        .msi_alloc(MSI_SOURCE)
-        .is_some_and(|(addr, data)| {
-            crate::kernel::pci::msi_enable(machine, bus, dev, func, addr, data)
-        });
-    if msi {
-        MSI_ON.store(true, Ordering::Relaxed);
-        crate::println!("ac97: {:02x}:{:02x}.{} MSI on", bus, dev, func);
-    } else {
-        let line =
-            (crate::kernel::pci::read32(machine, bus, dev, func, 0x3C) & 0xFF) as u8;
-        if !(1..=15).contains(&line) {
-            crate::println!(
-                "ac97: {:02x}:{:02x}.{} no MSI/INTx route; skipping",
-                bus, dev, func
-            );
-            return false;
-        }
-        machine.route_device_irq(line);
-        IRQ_LINE.store(line as u32, Ordering::Relaxed);
-        crate::println!("ac97: {:02x}:{:02x}.{} INTx line {}", bus, dev, func, line);
-    }
+    crate::kernel::pci::write32(
+        machine,
+        bus,
+        dev,
+        func,
+        0x04,
+        (cmd & 0xFFFF) | 0x05 | (1 << 10),
+    );
 
     let nam = (crate::kernel::pci::read32(machine, bus, dev, func, 0x10) & 0xFFFC) as u16; // BAR0
     let nabm = (crate::kernel::pci::read32(machine, bus, dev, func, 0x14) & 0xFFFC) as u16; // BAR1
     if nam == 0 || nabm == 0 {
-        return false;
+        return None;
     }
 
     // Bring the AC-link out of cold reset, then wait for the primary codec.
@@ -181,7 +128,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
         }
     }
     if !ready {
-        return false;
+        return None;
     }
 
     // Reset the mixer, unmute master + PCM-out at full volume (0 = 0 dB).
@@ -212,7 +159,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     // write PCM into it; the codec reads it (and the BDL) by physical address.
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
-        return false;
+        return None;
     }
     let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
     machine.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
@@ -228,8 +175,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> bool
     };
     d.build_bdl();
     machine.outl(nabm + PO_BDBAR, dma_phys); // BDL base
-    *AC97.lock() = Some(d);
-    true
+    Some(d)
 }
 
 impl Ac97 {
@@ -237,18 +183,16 @@ impl Ac97 {
     fn buf_phys(&self, i: usize) -> u32 {
         self.dma_phys + (BDL_BYTES + i * BUF_BYTES) as u32
     }
-    /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Control word
-    /// carries sparse IOC wakeups; cursor polling, not interrupts, accounts
-    /// consumption. NUM_BUF == 32 so every entry maps a distinct buffer.
+    /// Fill the BDL: entry i → buffer i, length in 16-bit samples. Progress is
+    /// polled from CIV, so every control word disables completion interrupts.
     fn build_bdl(&mut self) {
         for i in 0..NUM_BUF {
-            let ctrl = if i == NUM_BUF / 2 - 1 || i == NUM_BUF - 1 { BDL_IOC } else { 0 };
             let entry = self.dma_va + i * 8;
             let samples = (BUF_BYTES / 2) as u16; // 16-bit samples per buffer
             unsafe {
                 core::ptr::write_volatile(entry as *mut u32, self.buf_phys(i));
                 core::ptr::write_volatile((entry + 4) as *mut u16, samples);
-                core::ptr::write_volatile((entry + 6) as *mut u16, ctrl);
+                core::ptr::write_volatile((entry + 6) as *mut u16, 0);
             }
         }
     }
@@ -257,76 +201,49 @@ impl Ac97 {
 
 // ── the primitives the sink engine asks of a device ─────────────────────────
 
-/// Where the engine writes PCM: the ring starts after the BDL page.
-pub fn adopt<A: crate::Arch>(machine: &mut A) -> Option<(usize, u32)> {
-    let _ = machine;
-    let g = AC97.lock();
-    let d = g.as_ref()?;
-    Some((d.dma_va + BDL_BYTES, d.dma_phys + BDL_BYTES as u32))
-}
-
-/// Kernel VA of the ring, for rebuilding a sink around this device.
-pub fn ring_va() -> usize {
-    AC97.lock().as_ref().map_or(0, |d| d.dma_va + BDL_BYTES)
-}
-
-pub const fn block_frames() -> usize {
-    BUF_FRAMES
-}
-
-pub const fn ring_frames() -> usize {
-    RING_FRAMES
-}
-
-/// Start the bus master, and give it a full ring of runway.
-///
-/// LVI tracks the PLAY cursor, not the producer: it is kept one block behind
-/// CIV, so the engine has 31 blocks ahead of it and never arrives. That is
-/// what makes an AC'97 free-run like the other devices — the hardware halts
-/// when `CIV == LVI` (setting DCH/LVBCI/CELV) and only an LVI write restarts
-/// it, so a trailing LVI is the difference between a continuous transfer and
-/// one that stops every ring.
-pub fn start() {
-    use crate::kernel::portio::{inb, outb};
-    let mut g = AC97.lock();
-    let Some(d) = g.as_mut() else { return };
-    d.last_civ = 0;
-    d.reported = 0;
-    d.played = 0;
-    outb(d.nabm + PO_LVI, (NUM_BUF - 1) as u8);
-    let cr = inb(d.nabm + PO_CR);
-    outb(d.nabm + PO_CR, cr | PO_CR_RUN | PO_CR_IOCE);
-    crate::println!("ac97: stream RUN lvi={} cr={:#x}", NUM_BUF - 1, inb(d.nabm + PO_CR));
-}
-
-/// Stop the bus master.
-pub fn halt() {
-    use crate::kernel::portio::{inb, outb};
-    let mut g = AC97.lock();
-    let Some(d) = g.as_mut() else { return };
-    let cr = inb(d.nabm + PO_CR);
-    outb(d.nabm + PO_CR, cr & !PO_CR_RUN);
-}
-
-/// Is this interrupt ours, and how many blocks played since we last said?
-pub fn irq_pending() -> bool {
-    use crate::kernel::portio::{inw, outw};
-    let mut g = AC97.lock();
-    let Some(d) = g.as_mut() else { return false };
-    let status = inw(d.nabm + PO_SR);
-    if status & PO_SR_INTR == 0 {
-        return false;
+impl Ac97 {
+    pub fn ring(&mut self) -> &'static mut [crate::kernel::sound::Frame] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                (self.dma_va + BDL_BYTES) as *mut crate::kernel::sound::Frame,
+                RING_FRAMES,
+            )
+        }
     }
-    outw(d.nabm + PO_SR, status & PO_SR_INTR);
-    true
 }
 
-/// Blocks played since the last report, without requiring an interrupt.
-pub fn blocks_played() -> u64 {
-    let mut g = AC97.lock();
-    match g.as_mut() {
-        Some(d) => advance(d),
-        None => 0,
+impl sound::sink::Device for Ac97 {
+    fn rate(&self) -> u32 {
+        48_000
+    }
+
+    fn block_frames(&self) -> usize {
+        BUF_FRAMES
+    }
+
+    fn start(&mut self) {
+        use crate::kernel::portio::{inb, outb};
+        self.last_civ = 0;
+        self.reported = 0;
+        self.played = 0;
+        outb(self.nabm + PO_LVI, (NUM_BUF - 1) as u8);
+        let cr = inb(self.nabm + PO_CR);
+        outb(self.nabm + PO_CR, (cr & !0x10) | PO_CR_RUN);
+        crate::println!(
+            "ac97: stream RUN lvi={} cr={:#x}",
+            NUM_BUF - 1,
+            inb(self.nabm + PO_CR)
+        );
+    }
+
+    fn halt(&mut self) {
+        use crate::kernel::portio::{inb, outb};
+        let cr = inb(self.nabm + PO_CR);
+        outb(self.nabm + PO_CR, cr & !PO_CR_RUN);
+    }
+
+    fn blocks_played(&mut self) -> u64 {
+        advance(self)
     }
 }
 
@@ -348,15 +265,4 @@ fn advance(d: &mut Ac97) -> u64 {
     let fresh = d.played.saturating_sub(d.reported);
     d.reported = d.played;
     fresh
-}
-
-/// Minimum pipe fill for a position-slaved producer, in source frames: the
-/// bus master only plays *completed* ring buffers (LVI gates it), so the
-/// fill must always span the start prime (`PRIME_BUFS` full buffers) plus a
-/// partial buffer of slack — below that the engine halts at LVI while the
-/// producer waits for consumption, and the pipe deadlocks.
-/// The sink is up and can use this card's completion clock for latency feedback.
-/// The pipe latency itself is not this driver's to set.
-pub fn present() -> bool {
-    PRESENT.load(Ordering::Relaxed)
 }

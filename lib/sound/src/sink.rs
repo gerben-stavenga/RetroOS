@@ -73,6 +73,28 @@ pub trait Device {
     fn blocks_played(&mut self) -> u64;
 }
 
+impl<T: Device + ?Sized> Device for &mut T {
+    fn rate(&self) -> u32 {
+        (**self).rate()
+    }
+
+    fn block_frames(&self) -> usize {
+        (**self).block_frames()
+    }
+
+    fn start(&mut self) {
+        (**self).start();
+    }
+
+    fn halt(&mut self) {
+        (**self).halt();
+    }
+
+    fn blocks_played(&mut self) -> u64 {
+        (**self).blocks_played()
+    }
+}
+
 /// A sound output: one ring, one device.
 pub struct Sink<D: Device> {
     dev: D,
