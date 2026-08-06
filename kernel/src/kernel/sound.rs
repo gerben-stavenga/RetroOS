@@ -28,12 +28,33 @@ const AUDIO_SIG: u16 = 0x530; // R: signature ('RA'); W: sample rate (Hz)
 const SIGNATURE: u16 = 0x5241; // 'R','A' — RetroOS Audio
 
 pub use sound::sink::Frame;
+pub use sound::{Pacer as Producer, RATE_FP_SHIFT};
 
 /// Times the play cursor caught the write cursor while a producer was feeding
 /// us. One counter for the sink, not one per driver — it used to live in
 /// `sb16` and be incremented for every device, which is the kind of thing the
 /// library boundary makes impossible.
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+static EFFECTIVE_MIX_RATE_Q16_LO: AtomicU32 = AtomicU32::new(0);
+static EFFECTIVE_MIX_RATE_Q16_HI: AtomicU32 = AtomicU32::new(0);
+
+fn load64(lo: &AtomicU32, hi: &AtomicU32) -> u64 {
+    (hi.load(Ordering::Relaxed) as u64) << 32 | lo.load(Ordering::Relaxed) as u64
+}
+
+fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
+    lo.store(v as u32, Ordering::Relaxed);
+    hi.store((v >> 32) as u32, Ordering::Relaxed);
+}
+
+fn publish_effective_mix_rate_q16(rate_q16: u64) {
+    store64(&EFFECTIVE_MIX_RATE_Q16_LO, &EFFECTIVE_MIX_RATE_Q16_HI, rate_q16);
+}
+
+/// Current effective mix rate, in frames/sec × 2^16.
+pub fn effective_mix_rate_q16() -> u64 {
+    load64(&EFFECTIVE_MIX_RATE_Q16_LO, &EFFECTIVE_MIX_RATE_Q16_HI)
+}
 
 /// Does a backend-installed sink answer behind the canonical port window?
 /// Pure probe — called once by `platform::probe`, never cached here.
@@ -170,12 +191,10 @@ fn say(report: sound::sink::Report) {
     }
     if let Some(u) = report.underrun {
         let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n.is_multiple_of(64) {
-            crate::println!(
-                "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
-                n, u.written_frames, u.consumed_frames
-            );
-        }
+        crate::println!(
+            "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
+            n, u.written_frames, u.consumed_frames
+        );
     }
 }
 
@@ -214,76 +233,6 @@ pub struct AudioSpan<'a> {
 }
 
 const MIX_CHUNK: usize = 128;
-const TRIM_PPM_PER_FRAME: i64 = 8;
-const MAX_TRIM_PPM: i64 = 25_000;
-
-/// The CPU-clocked output producer. HDA/AC'97/SB consumption does not advance
-/// this clock; it only supplies slow feedback that trims the number of output
-/// samples made per CPU second and therefore holds pipe latency steady.
-pub struct Producer {
-    nominal_rate: u32,
-    mix_rate: u32,
-    /// Fractional output frames, in frames × 1000 (the event-loop tick is ms).
-    frac: u64,
-    /// Absolute CPU-produced frame index. Physical pipe priming is downstream
-    /// silence and deliberately does not advance this source-time coordinate.
-    pushed: u64,
-    last_consumed: u64,
-    sink_present: bool,
-    primed: bool,
-}
-
-impl Producer {
-    pub const fn new() -> Self {
-        Self {
-            nominal_rate: 0,
-            mix_rate: 0,
-            frac: 0,
-            pushed: 0,
-            last_consumed: 0,
-            sink_present: false,
-            primed: false,
-        }
-    }
-
-    /// Output-frame frontier at which an event arriving now should be stamped.
-    pub fn pushed(&self) -> u64 {
-        self.pushed
-    }
-
-    fn set_nominal_rate(&mut self, rate: u32) {
-        if self.nominal_rate == rate {
-            return;
-        }
-        self.nominal_rate = rate;
-        self.mix_rate = rate;
-        self.frac = 0;
-        self.primed = false;
-    }
-
-    fn update_rate(&mut self, written: u64, consumed: u64, target: u32) {
-        if consumed == self.last_consumed {
-            return;
-        }
-        self.last_consumed = consumed;
-        // Sample queue error only when the device reports fresh cursor
-        // progress. Between polls the queue depth is still monotonic, but we
-        // only retune when hardware has actually advanced.
-        let queued = written.saturating_sub(consumed) as i64;
-        let error = i64::from(target) - queued;
-        let trim_ppm = (error * TRIM_PPM_PER_FRAME)
-            .clamp(-MAX_TRIM_PPM, MAX_TRIM_PPM);
-        self.mix_rate = ((u64::from(self.nominal_rate)
-            * (1_000_000i64 + trim_ppm) as u64)
-            / 1_000_000) as u32;
-    }
-}
-
-impl Default for Producer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Advance the CPU-clocked producer, ask the active personality for those
 /// frames, and append them to the physical sink. The sink clock only trims the
@@ -305,10 +254,8 @@ pub fn pump<A: crate::Arch>(
     };
 
     producer.set_nominal_rate(nominal_rate);
-    if producer.sink_present != present {
-        producer.sink_present = present;
-        producer.primed = false;
-    }
+    publish_effective_mix_rate_q16(producer.effective_rate_q16());
+    producer.set_sink_present(present);
     if present {
         if written <= consumed {
             // The consumer crossed the producer frontier, so the old latency
@@ -318,19 +265,12 @@ pub fn pump<A: crate::Arch>(
             let mut sink = SINK.lock();
             sink.recover_from_underrun();
             written = sink.counters().0;
-            producer.frac = 0;
-            producer.mix_rate = nominal_rate;
-            producer.last_consumed = consumed;
-            producer.primed = false;
+            producer.recover_from_underrun();
         }
-        if producer.primed {
-            producer.update_rate(written, consumed, fill);
-        } else {
-            producer.last_consumed = consumed;
-            producer.mix_rate = nominal_rate;
+        if producer.primed() {
+            producer.update_rate(written, consumed, fill, dt_ms);
+            publish_effective_mix_rate_q16(producer.effective_rate_q16());
         }
-    } else {
-        producer.mix_rate = nominal_rate;
     }
 
     let gain_q16 = crate::kernel::osd::master_gain_q16();
@@ -338,7 +278,7 @@ pub fn pump<A: crate::Arch>(
 
     // Prime physical latency with silence, not source time. The emulated SB
     // and synths begin advancing only in the CPU-clocked production loop below.
-    if present && !producer.primed {
+    if present && !producer.primed() {
         let mut prime = (consumed + u64::from(fill)).saturating_sub(written);
         while prime > 0 {
             let run = usize::try_from(prime.min(MIX_CHUNK as u64)).unwrap();
@@ -346,29 +286,28 @@ pub fn pump<A: crate::Arch>(
             play(&frames[..run], gain_q16);
             prime -= run as u64;
         }
-        producer.primed = true;
+        producer.prime();
         // Recovery establishes a new physical-time origin. Audio belonging
         // to the missed interval cannot be replayed without recreating the
         // overrun, so production resumes with the next CPU-time batch.
         return;
     }
 
-    producer.frac += u64::from(producer.mix_rate) * dt_ms;
-    let mut due = producer.frac / 1000;
-    producer.frac -= due * 1000;
-    let mut base = producer.pushed;
-    let pushed = base + due;
-    while due > 0 {
-        let run = usize::try_from(due.min(MIX_CHUNK as u64)).unwrap();
+    let due = producer.due_frames(dt_ms);
+    let mut remaining = due;
+    let mut base = producer.pushed();
+    let mix_rate = (producer.effective_rate_q16() >> RATE_FP_SHIFT) as u32;
+    while remaining > 0 {
+        let run = usize::try_from(remaining.min(MIX_CHUNK as u64)).unwrap();
         frames[..run].fill((0, 0));
         mix(machine, AudioSpan {
-            rate: producer.mix_rate,
+            rate: mix_rate,
             base_frame: base,
             frames: &mut frames[..run],
         });
         play(&frames[..run], gain_q16);
         base += run as u64;
-        due -= run as u64;
+        remaining -= run as u64;
     }
-    producer.pushed = pushed;
+    producer.advance_pushed(due);
 }

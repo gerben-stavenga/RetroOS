@@ -26,15 +26,17 @@
 //! played". A ring buffer and some arithmetic are no more machine-specific
 //! than a card's register file is.
 //!
-//! What deliberately stays *outside*: WHICH sink to play into, how to pace
-//! production, what a DMA channel points at, and how loud one card should be
-//! against another. Those are properties of a machine, not of a card.
+//! What deliberately stays *outside*: WHICH sink to play into, what a DMA
+//! channel points at, and how loud one card should be against another.
+//! Hosts that want a reusable latency controller can use [`pacer`]; choosing
+//! whether to use it and what latency to target is still host policy.
 
 #![cfg_attr(not(test), no_std)]
 
 extern crate alloc;
 
 pub mod sink;
+pub mod pacer;
 pub mod engine;
 pub mod gus;
 pub mod mpu401;
@@ -48,3 +50,4 @@ pub use engine::{
     Addressing, Engine, Events, LoopMode, MAX_VOICES, Ramp, Voice, VoiceFilter, voice,
     volume,
 };
+pub use pacer::{Pacer, RATE_FP_SHIFT};

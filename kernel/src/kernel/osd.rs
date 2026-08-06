@@ -28,14 +28,21 @@ use crate::kernel::thread;
 
 // ── Menu model ───────────────────────────────────────────────────────────────
 
-const ITEM_KILL: usize = 0;
-const ITEM_SWITCH: usize = 1;
-const ITEM_VOLUME: usize = 2;
-const ITEM_LATENCY: usize = 3;
-const ITEM_TRACE: usize = 4;
-const ITEM_PROFILE: usize = 5;
-const ITEM_DUMP: usize = 6;
-const NUM_ITEMS: usize = 7;
+const TAB_SYSTEM: usize = 0;
+const TAB_SOUND: usize = 1;
+const NUM_TABS: usize = 2;
+
+const SYSTEM_ITEM_KILL: usize = 0;
+const SYSTEM_ITEM_SWITCH: usize = 1;
+const SYSTEM_ITEM_TRACE: usize = 2;
+const SYSTEM_ITEM_PROFILE: usize = 3;
+const SYSTEM_ITEM_DUMP: usize = 4;
+const SYSTEM_NUM_ITEMS: usize = 5;
+
+const SOUND_ITEM_VOLUME: usize = 0;
+const SOUND_ITEM_LATENCY: usize = 1;
+const SOUND_ITEM_RATE: usize = 2;
+const SOUND_NUM_ITEMS: usize = 3;
 
 /// Master volume as a percentage of unity, adjusted by ◄/► on the Volume row.
 /// 100 = unity (the level the per-source scales already balance to); attenuate
@@ -48,7 +55,9 @@ const LATENCY_STEP_MS: u32 = 5;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
 static REPAINT: AtomicBool = AtomicBool::new(false);
-static SEL: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
+static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
+static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(100);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
@@ -65,7 +74,9 @@ pub fn open(display: crate::kernel::platform::DisplayToken) {
         assert!((&raw const DISPLAY).as_ref().unwrap().is_none());
         DISPLAY = Some(display);
     }
-    SEL.store(0, Ordering::Relaxed);
+    ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
+    SYSTEM_SEL.store(0, Ordering::Relaxed);
+    SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
     OPEN.store(true, Ordering::Relaxed);
@@ -113,6 +124,42 @@ pub fn master_gain_q16() -> i32 {
 /// DMA ring.
 pub fn audio_latency_ms() -> u32 {
     LATENCY_MS.load(Ordering::Relaxed)
+}
+
+fn active_tab() -> usize {
+    ACTIVE_TAB.load(Ordering::Relaxed).min(NUM_TABS - 1)
+}
+
+fn set_active_tab(tab: usize) {
+    ACTIVE_TAB.store(tab.min(NUM_TABS - 1), Ordering::Relaxed);
+}
+
+fn active_sel(tab: usize) -> usize {
+    match tab {
+        TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
+        _ => SYSTEM_SEL.load(Ordering::Relaxed),
+    }
+}
+
+fn set_active_sel(tab: usize, sel: usize) {
+    match tab {
+        TAB_SOUND => SOUND_SEL.store(sel.min(SOUND_NUM_ITEMS - 1), Ordering::Relaxed),
+        _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
+    }
+}
+
+fn active_item_count(tab: usize) -> usize {
+    match tab {
+        TAB_SOUND => SOUND_NUM_ITEMS,
+        _ => SYSTEM_NUM_ITEMS,
+    }
+}
+
+fn active_tab_name(tab: usize) -> &'static [u8] {
+    match tab {
+        TAB_SOUND => b"Sound",
+        _ => b"System",
+    }
 }
 
 /// Consume a pending "kill the focused task" request. The event loop calls this
@@ -204,6 +251,7 @@ fn proc_at(idx: usize) -> Proc {
 // simply an unmapped code we swallow while open).
 const K_ESC: u8 = 0x01;
 const K_ENTER: u8 = 0x1C;
+const K_TAB: u8 = 0x0F;
 const K_UP: u8 = 0x48;
 const K_DOWN: u8 = 0x50;
 const K_LEFT: u8 = 0x4B;
@@ -224,8 +272,9 @@ pub fn key<A: crate::Arch>(machine: &mut A, regs: &mut Regs, sc: u8, dos: Option
     }
     match sc {
         K_F12 | K_ESC => close(),
-        K_UP => move_sel(NUM_ITEMS - 1), // -1 mod NUM_ITEMS
-        K_DOWN => move_sel(1),
+        K_TAB => cycle_tab(),
+        K_UP => move_sel(true),
+        K_DOWN => move_sel(false),
         K_LEFT => adjust(false),
         K_RIGHT => adjust(true),
         K_ENTER => activate(machine, regs, dos),
@@ -263,15 +312,34 @@ fn pick_select() {
     close();
 }
 
-fn move_sel(delta: usize) {
-    let sel = (SEL.load(Ordering::Relaxed) + delta) % NUM_ITEMS;
-    SEL.store(sel, Ordering::Relaxed);
+fn cycle_tab() {
+    let next = (active_tab() + 1) % NUM_TABS;
+    set_active_tab(next);
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+fn move_sel(up: bool) {
+    let tab = active_tab();
+    let count = active_item_count(tab);
+    if count == 0 {
+        return;
+    }
+    let cur = active_sel(tab);
+    let sel = if up {
+        (cur + count - 1) % count
+    } else {
+        (cur + 1) % count
+    };
+    set_active_sel(tab, sel);
 }
 
 /// ◄/► adjust the selected continuous setting.
 fn adjust(up: bool) {
-    match SEL.load(Ordering::Relaxed) {
-        ITEM_VOLUME => {
+    if active_tab() != TAB_SOUND {
+        return;
+    }
+    match active_sel(TAB_SOUND) {
+        SOUND_ITEM_VOLUME => {
             let cur = VOL_PCT.load(Ordering::Relaxed);
             let next = if up {
                 (cur + VOL_STEP).min(VOL_MAX)
@@ -280,7 +348,7 @@ fn adjust(up: bool) {
             };
             VOL_PCT.store(next, Ordering::Relaxed);
         }
-        ITEM_LATENCY => {
+        SOUND_ITEM_LATENCY => {
             let cur = LATENCY_MS.load(Ordering::Relaxed);
             let next = if up {
                 (cur + LATENCY_STEP_MS).min(LATENCY_MAX_MS)
@@ -294,26 +362,27 @@ fn adjust(up: bool) {
 }
 
 fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&thread::DosState<A>>) {
-    match SEL.load(Ordering::Relaxed) {
-        ITEM_KILL => {
-            KILL_REQ.store(true, Ordering::Relaxed);
-            close();
-        }
-        // Open the task picker (a submode of the still-open monitor).
-        ITEM_SWITCH => {
-            PICK_SEL.store(0, Ordering::Relaxed);
-            PICKER.store(true, Ordering::Relaxed);
-        }
-        // Continuous settings are adjusted with ◄/►; Enter does nothing.
-        ITEM_VOLUME | ITEM_LATENCY => {}
-        // Toggle each diagnostic and stay open so the new state shows on the row.
-        ITEM_TRACE => crate::kernel::startup::toggle_trace(),
-        ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
-        ITEM_DUMP => {
-            crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
-            close();
-        }
-        _ => {}
+    match active_tab() {
+        TAB_SOUND => {}
+        _ => match active_sel(TAB_SYSTEM) {
+            SYSTEM_ITEM_KILL => {
+                KILL_REQ.store(true, Ordering::Relaxed);
+                close();
+            }
+            // Open the task picker (a submode of the still-open monitor).
+            SYSTEM_ITEM_SWITCH => {
+                PICK_SEL.store(0, Ordering::Relaxed);
+                PICKER.store(true, Ordering::Relaxed);
+            }
+            // Toggle each diagnostic and stay open so the new state shows on the row.
+            SYSTEM_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
+            SYSTEM_ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
+            SYSTEM_ITEM_DUMP => {
+                crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
+                close();
+            }
+            _ => {}
+        },
     }
 }
 
@@ -348,8 +417,10 @@ pub fn paint(
         paint_picker(out, stride, w, h, logical_w, fmt);
         return;
     }
-    // Title + 6 items + footer = 8 rows.
-    let rows = NUM_ITEMS + 2;
+    let tab = active_tab();
+    let count = active_item_count(tab);
+    // Title + tab bar + items + footer.
+    let rows = count + 3;
     let panel_w = COLS * CELL_W + PAD * 2;
     let panel_h = rows * CELL_H + PAD * 2;
     if logical_w < panel_w || h < panel_h {
@@ -367,16 +438,22 @@ pub fn paint(
 
     let tx = x0 + PAD;
     let mut ty = y0 + PAD;
+    let mut title = Line::new();
+    title.put(b"RetroOS Monitor  ");
+    title.put(active_tab_name(tab));
     vga_render::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
-        b"RetroOS Monitor", TITLE_FG, TITLE_BG, fmt,
+        title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H;
 
-    let sel = SEL.load(Ordering::Relaxed);
-    for item in 0..NUM_ITEMS {
+    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, fmt);
+    ty += CELL_H;
+
+    let sel = active_sel(tab);
+    for item in 0..count {
         let mut line = Line::new();
-        item_line(item, &mut line);
+        item_line(tab, item, &mut line);
         let selected = item == sel;
         if selected {
             vga_render::overlay_fill_xscaled(
@@ -393,8 +470,36 @@ pub fn paint(
 
     vga_render::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
-        b"Up/Dn  Enter  <> adjust Esc", FOOT_FG, PANEL_BG, fmt,
+        b"Up/Dn  Enter  <> adjust  Tab switch  Esc", FOOT_FG, PANEL_BG, fmt,
     );
+}
+
+fn paint_tabs(
+    out: &mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    logical_w: usize,
+    tx: usize,
+    ty: usize,
+    active: usize,
+    fmt: PixelFormat,
+) {
+    let mut x = tx;
+    for &(tab, label) in &[(TAB_SYSTEM, b"System" as &[u8]), (TAB_SOUND, b"Sound" as &[u8])] {
+        let selected = tab == active;
+        let label_w = label.len() * CELL_W + CELL_W;
+        if selected {
+            vga_render::overlay_fill_xscaled(
+                out, stride, w, h, logical_w, x, ty, label_w, CELL_H, SEL_BG, fmt,
+            );
+        }
+        let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
+        vga_render::overlay_text_xscaled(
+            out, stride, w, h, logical_w, x + CELL_W / 2, ty, label, fg, bg, fmt,
+        );
+        x += label_w + CELL_W;
+    }
 }
 
 /// Paint the Switch picker: one row per active task, `tid: name  S *`.
@@ -479,37 +584,46 @@ fn proc_line(idx: usize, line: &mut Line) {
     }
 }
 
-/// Compose one menu row's text into `line`. Volume, Trace and Profile are dynamic.
-fn item_line(item: usize, line: &mut Line) {
-    match item {
-        ITEM_KILL => line.put(b"Kill task"),
-        ITEM_SWITCH => line.put(b"Switch task"),
-        ITEM_VOLUME => {
-            let pct = VOL_PCT.load(Ordering::Relaxed);
-            line.put(b"Volume   [");
-            let filled = (pct / VOL_STEP) as usize; // 0..=10 bars
-            for i in 0..10 {
-                line.put(if i < filled { b"#" } else { b"-" });
+/// Compose one tab row's text into `line`.
+fn item_line(tab: usize, item: usize, line: &mut Line) {
+    match tab {
+        TAB_SOUND => match item {
+            SOUND_ITEM_VOLUME => {
+                let pct = VOL_PCT.load(Ordering::Relaxed);
+                line.put(b"Volume   [");
+                let filled = (pct / VOL_STEP) as usize; // 0..=10 bars
+                for i in 0..10 {
+                    line.put(if i < filled { b"#" } else { b"-" });
+                }
+                line.put(b"] ");
+                line.put_num(pct);
+                line.put(b"%");
             }
-            line.put(b"] ");
-            line.put_num(pct);
-            line.put(b"%");
-        }
-        ITEM_LATENCY => {
-            line.put(b"Latency  ");
-            line.put_num(LATENCY_MS.load(Ordering::Relaxed));
-            line.put(b" ms");
-        }
-        ITEM_TRACE => {
-            line.put(b"Trace    ");
-            line.put(if crate::kernel::startup::trace_enabled() { b"ON" } else { b"off" });
-        }
-        ITEM_PROFILE => {
-            line.put(b"Profile  ");
-            line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
-        }
-        ITEM_DUMP => line.put(b"Dump state"),
-        _ => {}
+            SOUND_ITEM_LATENCY => {
+                line.put(b"Latency  ");
+                line.put_num(LATENCY_MS.load(Ordering::Relaxed));
+                line.put(b" ms");
+            }
+            SOUND_ITEM_RATE => {
+                line.put(b"Mix rate ");
+                line.put_rate_q16(crate::kernel::sound::effective_mix_rate_q16());
+            }
+            _ => {}
+        },
+        _ => match item {
+            SYSTEM_ITEM_KILL => line.put(b"Kill task"),
+            SYSTEM_ITEM_SWITCH => line.put(b"Switch task"),
+            SYSTEM_ITEM_TRACE => {
+                line.put(b"Trace    ");
+                line.put(if crate::kernel::startup::trace_enabled() { b"ON" } else { b"off" });
+            }
+            SYSTEM_ITEM_PROFILE => {
+                line.put(b"Profile  ");
+                line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
+            }
+            SYSTEM_ITEM_DUMP => line.put(b"Dump state"),
+            _ => {}
+        },
     }
 }
 
@@ -550,6 +664,27 @@ impl Line {
                 self.len += 1;
             }
         }
+    }
+
+    fn put_3digits(&mut self, n: u32) {
+        let n = n.min(999);
+        let digits = [
+            b'0' + ((n / 100) % 10) as u8,
+            b'0' + ((n / 10) % 10) as u8,
+            b'0' + (n % 10) as u8,
+        ];
+        self.put(&digits);
+    }
+
+    fn put_rate_q16(&mut self, rate_q16: u64) {
+        let whole = (rate_q16 >> crate::kernel::sound::RATE_FP_SHIFT) as u32;
+        let frac = ((rate_q16 & ((1u64 << crate::kernel::sound::RATE_FP_SHIFT) - 1))
+            as u128 * 1_000u128
+            >> crate::kernel::sound::RATE_FP_SHIFT) as u32;
+        self.put_num(whole);
+        self.put(b".");
+        self.put_3digits(frac);
+        self.put(b" Hz");
     }
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
