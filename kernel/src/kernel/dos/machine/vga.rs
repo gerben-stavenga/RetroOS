@@ -1046,6 +1046,39 @@ impl VgaState {
                 outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]);
             }
         }
+
+        // Text mode needs the same treatment, and for the same reason: odd/even
+        // is a different address interpretation, so the flat planar pass above
+        // stores each cell where CRTC *word addressing* puts it — plane offset
+        // 2*i, not i (see `text_odd_even_split`) — and a strict card does not
+        // expose that layout through B8000 until the guest's own text mode is
+        // programmed. Replay the visible page through the target mode and let
+        // the card do its own odd/even routing.
+        //
+        // Without this, a text-mode program that follows a mode-13h one sees
+        // every cell smeared across four bytes (`00 00 char attr`): Dark Forces
+        // launched after Duke3D rendered its screen as two column-interleaved
+        // streams, while B8000 row 0 — written after the mode set — was clean.
+        if matches!(self.classify_mode(), Some(lib::vga_render::VgaMode::Text80x25)) {
+            let mut text = alloc::vec![0u8; 0x8000];
+            lib::vga_render::text_odd_even_merge(&self.planes, &mut text);
+
+            outb(0x3C4, 2); outb(0x3C5, 0x03); // char plane 0 + attribute plane 1
+            outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
+            outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
+            outb(0x3CE, 5); outb(0x3CF, self.gc[5] & !0x03); // write mode 0
+            outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
+
+            let text_window = (crate::LOW_MEM_BASE + 0xB8000) as *mut u8;
+            for (i, &src) in text.iter().enumerate() {
+                unsafe { core::ptr::write_volatile(text_window.add(i), src); }
+            }
+
+            outb(0x3C4, 2); outb(0x3C5, self.seq[2]);
+            for i in [1u8, 3, 5, 8] {
+                outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]);
+            }
+        }
         // Attribute Controller — write all 21 registers
         let _ = inb(0x3DA);
         for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
