@@ -1269,11 +1269,16 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     crate::kernel::vfs::close(fd, &mut kt.fds);
                     fd = -13; // EACCES
                 }
+                // Record the handle before anything else: a handle the JFT
+                // cannot hold is one DOS cannot give out, so it becomes a
+                // "too many open files" failure rather than an open.
+                if fd >= 0 && Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8).is_err() {
+                    crate::kernel::vfs::close(fd, &mut kt.fds);
+                    fd = -24; // EMFILE -> DOS error 4
+                }
                 if fd >= 0 {
-                    // Populate SFT entry and PSP JFT for this handle
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(machine, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.clear_flag32(1); // clear carry
                 } else {
@@ -1299,16 +1304,16 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             if redirected {
                 kt.close_fd(hidx);
                 sft_clear(machine, handle);
-                if hidx < 20 { Psp::set_jft(machine, psp_struct_seg(dos), hidx, 0xFF); }
+                Psp::clear_jft(machine, psp_struct_seg(dos), hidx);
                 regs.clear_flag32(1);
             } else if handle <= 2 || handle == NULL_FILE_HANDLE || (EMS_ENABLED && handle == EMS_DEVICE_HANDLE) {
-                if (handle as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), handle as usize, 0xFF); }
+                Psp::clear_jft(machine, psp_struct_seg(dos), handle as usize);
                 regs.clear_flag32(1);
             } else {
                 let rv = crate::kernel::vfs::close(handle as i32, &mut kt.fds);
                 if rv >= 0 {
                     sft_clear(machine, handle);
-                    if (handle as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), handle as usize, 0xFF); }
+                    Psp::clear_jft(machine, psp_struct_seg(dos), handle as usize);
                     regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rv) as u64;
@@ -1618,9 +1623,16 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 (Some(kind), Some(fd)) => {
                     if let thread::FdKind::Vfs(h) = kind { crate::kernel::vfs::add_vfs_ref(h); }
                     kt.fds[fd] = kind;
-                    if fd < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd, fd as u8); }
-                    regs.rax = (regs.rax & !0xFFFF) | fd as u64;
-                    regs.clear_flag32(1);
+                    if Psp::set_jft(machine, psp_struct_seg(dos), fd, fd as u8).is_err() {
+                        // Nowhere to record the duplicate: same answer the
+                        // no-free-fd arm below gives.
+                        kt.close_fd(fd);
+                        regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
+                        regs.set_flag32(1);
+                    } else {
+                        regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                        regs.clear_flag32(1);
+                    }
                 }
                 (Some(_), None) => {
                     regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
@@ -1641,11 +1653,19 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             match dos_dup_fdkind(kt, src) {
                 Some(kind) if dst < thread::MAX_FDS => {
                     if dst != src {
+                        // Claim the destination slot first. A destination the
+                        // JFT cannot hold is not a handle this process can
+                        // name, so report an invalid handle — and do it before
+                        // closing dst, so a rejected dup2 leaves it untouched.
+                        if Psp::set_jft(machine, psp_struct_seg(dos), dst, dst as u8).is_err() {
+                            regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
+                            regs.set_flag32(1);
+                            return thread::KernelAction::Done;
+                        }
                         kt.close_fd(dst);
                         sft_clear(machine, dst as u16);
                         if let thread::FdKind::Vfs(h) = kind { crate::kernel::vfs::add_vfs_ref(h); }
                         kt.fds[dst] = kind;
-                        if dst < 20 { Psp::set_jft(machine, psp_struct_seg(dos), dst, dst as u8); }
                     }
                     regs.clear_flag32(1);
                 }
@@ -1673,7 +1693,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 addr += 1;
                 i += 1;
             }
-            let fd = match dfs_create_path(dos, &name[..i]) {
+            let mut fd = match dfs_create_path(dos, &name[..i]) {
                 Ok((path, len)) => {
                     // Invalidate the parent dir's CI cache so the new file
                     // becomes visible to find_first/find_next on next walk.
@@ -1683,9 +1703,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 }
                 Err(e) => -e,
             };
+            if fd >= 0 && Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8).is_err() {
+                crate::kernel::vfs::close(fd, &mut kt.fds);
+                fd = -24; // EMFILE -> DOS error 4
+            }
             if fd >= 0 {
                 sft_set_file(machine, fd as u16, 0);
-                if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                 regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                 regs.clear_flag32(1);
             } else {
@@ -2214,7 +2237,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // AH=0x67: Set Handle Count
         0x67 => {
             let requested = regs.rbx as u16;
-            if requested <= 20 {
+            if requested as usize <= PSP_JFT_LEN {
                 Psp::set_max_files(machine, psp_struct_seg(dos), requested);
                 regs.clear_flag32(1);
             } else {
@@ -2370,15 +2393,20 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                         regs.set_flag32(1);
                         return thread::KernelAction::Done;
                     }
+                    if Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8).is_err() {
+                        crate::kernel::vfs::close(fd, &mut kt.fds);
+                        regs.rax = (regs.rax & !0xFFFF) | 4; // too many open files
+                        regs.set_flag32(1);
+                        return thread::KernelAction::Done;
+                    }
                     let size = crate::kernel::vfs::file_size(fd, &kt.fds);
                     sft_set_file(machine, fd as u16, size);
-                    if (fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 1; // CX=1: file opened
                     regs.clear_flag32(1);
                 } else if replace_exists {
                     crate::kernel::vfs::close(fd, &mut kt.fds);
-                    let new_fd = match dfs_create_path(dos, &name[..i]) {
+                    let mut new_fd = match dfs_create_path(dos, &name[..i]) {
                         Ok((path, len)) => {
                             let parent_end =
                                 path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
@@ -2387,9 +2415,14 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                         }
                         Err(e) => -e,
                     };
+                    if new_fd >= 0
+                        && Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8).is_err()
+                    {
+                        crate::kernel::vfs::close(new_fd, &mut kt.fds);
+                        new_fd = -24; // EMFILE -> DOS error 4
+                    }
                     if new_fd >= 0 {
                         sft_set_file(machine, new_fd as u16, 0);
-                        if (new_fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                         regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                         regs.rcx = (regs.rcx & !0xFFFF) | 3; // CX=3: file replaced
                         regs.clear_flag32(1);
@@ -2403,7 +2436,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     regs.set_flag32(1);
                 }
             } else if create_not {
-                let new_fd = match dfs_create_path(dos, &name[..i]) {
+                let mut new_fd = match dfs_create_path(dos, &name[..i]) {
                     Ok((path, len)) => {
                         let parent_end =
                             path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
@@ -2412,9 +2445,14 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     }
                     Err(e) => -e,
                 };
+                if new_fd >= 0
+                    && Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8).is_err()
+                {
+                    crate::kernel::vfs::close(new_fd, &mut kt.fds);
+                    new_fd = -24; // EMFILE -> DOS error 4
+                }
                 if new_fd >= 0 {
                     sft_set_file(machine, new_fd as u16, 0);
-                    if (new_fd as usize) < 20 { Psp::set_jft(machine, psp_struct_seg(dos), new_fd as usize, new_fd as u8); }
                     regs.rax = (regs.rax & !0xFFFF) | new_fd as u64;
                     regs.rcx = (regs.rcx & !0xFFFF) | 2; // CX=2: file created
                     regs.clear_flag32(1);
@@ -3321,6 +3359,21 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_in: &[u8])
     -> Result<([u8; dfs::DFS_PATH_MAX], usize), i32>
 {
+    // An empty name is not a file. `resolve` would fold it into the current
+    // directory and `to_vfs_open` would hand back a perfectly good handle to
+    // that *directory*, so a caller that built its filename wrongly gets a
+    // successful open and reads garbage instead of an error it can act on.
+    // Real DOS reports "file not found" here, and so do we.
+    //
+    // Seen for real: DOS/4GW passes an open's filename in a low-memory
+    // transfer buffer via a real-mode-call structure. When that structure
+    // arrives with DS=0 the buffer address resolves to the wrong linear
+    // address, which reads as an empty string — Dark Forces then opened
+    // C:\GAMES\DFORCES itself eight times and gave up. That DS=0 is a
+    // separate bug; this guard makes it fail honestly rather than silently.
+    if dos_in.is_empty() {
+        return Err(2); // DOS error 2 — file not found
+    }
     let mut abs = [0u8; dfs::DFS_PATH_MAX];
     let alen = dos.dfs.resolve(dos_in, &mut abs)?;
     let mut out = [0u8; dfs::DFS_PATH_MAX];
@@ -3514,6 +3567,30 @@ const LOW_MEM_BASE: u32 = 0x500;
 const NUM_DRIVES: u8 = 8;
 const SFT_ENTRIES: usize = 20;
 
+/// Entries in the PSP's inline Job File Table — and so the most handles a DOS
+/// process can hold without asking for an external JFT via AH=67.
+///
+/// The single definition of that limit, consulted only by [`Psp::set_jft`].
+pub(crate) const PSP_JFT_LEN: usize = 20;
+
+/// A handle with no slot in the PSP's inline Job File Table.
+///
+/// A caller that has just opened, created or duplicated a file must treat this
+/// as fatal for that handle: DOS has nowhere to record it, so as far as the
+/// program is concerned the handle cannot exist, and the call has to come back
+/// as error 4 ("too many open files"). Real DOS answers that once the table is
+/// full, and a client that gets it closes something and retries.
+///
+/// Handing the handle out anyway and merely declining to record it is what
+/// broke Dark Forces after Duke3D: DOS/4GW holds ~16 concurrent opens of the
+/// .EXE while scanning it, which just fits under 20 from a clean shell.
+/// Launched from DN after a child has run, DN is still holding DN.OVR and
+/// DN.DLG, the inherited JFT starts two slots higher, the scan ran off the end
+/// of the table, and DOS/4GW — never told to back off — bailed to its error
+/// handler instead.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JftFull;
+
 /// Program Segment Prefix (DOS 3+, 256 bytes). Only the fields we read or
 /// write are named; the rest is reserved padding so byte offsets stay stable
 /// for any guest code that walks the structure directly.
@@ -3550,9 +3627,30 @@ impl Psp {
     pub fn env_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
         machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
-    /// Set one Job File Table entry (PSP[0x18 + idx]).
-    pub fn set_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize, val: u8) {
+    /// Record one Job File Table entry (PSP[0x18 + idx]).
+    ///
+    /// `Err(JftFull)` when the handle has no slot in the table. Writing anyway
+    /// would run off the 20-byte `jft` array onto the PSP fields behind it, so
+    /// this is the one place the bound is checked — and returning it rather
+    /// than swallowing it is what makes callers that are *recording* a handle
+    /// deal with a handle DOS cannot represent.
+    pub fn set_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize, val: u8)
+        -> Result<(), JftFull>
+    {
+        if idx >= PSP_JFT_LEN { return Err(JftFull); }
         machine.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
+        Ok(())
+    }
+
+    /// Release one Job File Table slot.
+    ///
+    /// Unlike recording a handle, this genuinely may address a slot the table
+    /// does not have, and that is not an error: DOS lets a program close the
+    /// std handles and our out-of-band `NULL_FILE_HANDLE` / `EMS_DEVICE_HANDLE`
+    /// (98/99), which by construction live outside the JFT. There is nothing to
+    /// clear, so the write is skipped and the close still succeeds.
+    pub fn clear_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize) {
+        let _ = Self::set_jft(machine, psp_seg, idx, 0xFF);
     }
     /// Set the JFT size field (PSP[0x32]).
     pub fn set_max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16, n: u16) {
