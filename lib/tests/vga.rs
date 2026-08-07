@@ -1,8 +1,8 @@
-//! Tests for the reusable software-VGA renderer. These run as an ordinary std
+//! Tests for the VGA: mode classification, the plane ALU, and scanout. These run as an ordinary std
 //! binary (the test harness supplies the global allocator the `#![no_std]` lib
 //! lacks), exercising the pure render path on synthetic VGA state.
 
-use lib::vga_render::{self, Frame, PixelFormat, VgaMode};
+use vga::{self as vga_render, Frame, PixelFormat, VgaMode};
 
 /// 6-bit DAC component → 8-bit, matching the renderer's expansion.
 fn c6to8(v: u8) -> u32 {

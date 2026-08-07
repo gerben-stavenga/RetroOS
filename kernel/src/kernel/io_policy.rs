@@ -37,7 +37,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
                 // 0x3C0/0x3DA go direct too when save/restore can recover
                 // the AC sequencing state from the card instead of a trap
-                // tracker (see `vga::save_from_hardware`). Trapping these
+                // tracker (see `drivers::vga_hw::save`). Trapping these
                 // costs the guest a VM86 round-trip per retrace poll — a
                 // palette fade is thousands of 0x3DA reads per frame, and a
                 // game that waits on retrace can poll tens of thousands of
@@ -53,7 +53,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
             // card is exactly `SbDevice::Native`, so the match that decides
             // this also hands over the wiring the grant needs.
             if let Personality::Dos(dos) = personality
-                && let crate::kernel::dos::SbDevice::Native(pt) = &dos.pc.sb.device
+                && let crate::kernel::dos::SbDevice::Native { pt, .. } = &dos.pc.sb.device
             {
                 // A real SB implies a real OPL: FM music writes (frequent) go
                 // straight to the card.

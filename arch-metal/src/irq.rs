@@ -604,7 +604,7 @@ fn init_mouse() -> bool {
 ///
 /// If both pass but the kernel still freezes, the break is CPU delivery —
 /// LINT0 / virtual-wire routing through the (x2)APIC, the known UEFI failure.
-pub fn timer_selftest(screen: &mut lib::vga::Screen) {
+pub fn timer_selftest(screen: &mut lib::term::Screen) {
     // --- 1. PIT channel 0 counting? Sample the latched counter several times.
     let mut samples = [0u16; 8];
     for s in samples.iter_mut() {

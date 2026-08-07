@@ -5,7 +5,6 @@
 //! 2. boot_kernel (enables paging, initializes kernel, drops to ring 1)
 
 use arch::{paging2, phys_mm, descriptors, irq, x86};
-use crate::vga;
 use arch::MultibootMmapEntry;
 use paging2::{PAGE_SIZE, LOW_MEM_BASE};
 
@@ -116,7 +115,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     );
 
     // Update VGA base for paged addressing before any println
-    vga::vga().base = LOW_MEM_BASE + 0xB8000;
+    lib::term::term().base = LOW_MEM_BASE + 0xB8000;
 
     // The shared log ring uses kernel-owned static storage, so it is available
     // before the heap and captures the interrupt/device bring-up below.
@@ -125,7 +124,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // Install the kernel's debug-log sink: on metal, a byte to the 0xE9 debug
     // port. Logging is a platform concern, not an arch call — the kernel never
     // touches a port itself; it just hands bytes to this sink.
-    crate::vga::set_debug_sink(log_byte_0xe9);
+    lib::log::set_debug_sink(log_byte_0xe9);
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
@@ -162,7 +161,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // The screen license: constructed HERE, once, and moved down the boot
     // chain (fbcon::init → timer_selftest → startup). On-screen kernel text
     // exists only where this value is; ambient println! is log-only.
-    let mut screen = lib::vga::Screen::new();
+    let mut screen = lib::term::Screen::new();
 
     lib::screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -339,7 +338,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // screen, and nothing runs after this. Build a fresh writer and render.
     // Screen writes mirror to the log stream, so debugcon/klog get every
     // line too — no separate dbg_println! needed.
-    let mut screen = lib::vga::Screen::new();
+    let mut screen = lib::term::Screen::new();
     screen.clear();
 
     lib::screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");

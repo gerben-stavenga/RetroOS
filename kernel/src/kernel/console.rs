@@ -69,7 +69,7 @@ fn dispatch_dos<A: crate::Arch>(
                 if crate::kernel::keyboard::update_key_state(sc) {
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                     if c != 0 {
-                        crate::vga::putchar(c);
+                        crate::term::putchar(c);
                         let cpipe = thread::console_pipe();
                         crate::kernel::kpipe::write(cpipe, &[c]);
                     }

@@ -1,22 +1,21 @@
-//! Kernel VGA console and its optional packed-framebuffer scanout.
+//! Rendering the terminal onto a framebuffer.
 //!
-//! The console (framebuffer renderer + the platform-installed debug sink + the
-//! `print!`/`println!`/`dbg_*!` macros) lives in `lib`, so every embedder — the
-//! bootloader, the kernel, and each arch backend crate — shares one sink and one
-//! set of macros. This module adds the kernel's emulated scanout: framebuffer
-//! machines attach a packed-pixel sink, while legacy machines leave it
-//! unattached and let real VGA scan B8000. The macros are re-exported at the
-//! crate root (see `lib.rs`) so `crate::println!` and bare `println!` work in
-//! either case.
+//! The terminal itself — grid, cursor, ANSI parser — is `lib::term`, shared by
+//! every embedder. This module is the part only the kernel needs: on a machine
+//! with no VGA text mode, cells have to become pixels. `attach_framebuffer`
+//! points it at a mapped packed framebuffer and every write is scanned out
+//! through the VGA renderer as an 80×25 text frame; legacy machines attach
+//! nothing and let the real card scan B8000 itself.
+//!
+//! The re-scan is a known wart: the terminal keeps no grid of its own, so this
+//! reads back the cells it just wrote and re-renders all 400 rows per byte.
+//! It goes away when the terminal owns its grid.
 
-pub use lib::vga::{
-    vga, Vga, Screen,
-    set_debug_sink, debug_byte, putchar, DebugCon,
-};
+pub use lib::term::{term, Term, Screen, putchar};
 
 use crate::kernel::display::{Framebuffer, PixelFormat};
 use lib::vga_fonts::FONT_8X16;
-use lib::vga_render::{Frame, VgaMode};
+use vga::{Frame, VgaMode};
 
 /// The pixel sink attached to the emulated VGA on framebuffer-only machines.
 /// Legacy BIOS leaves this unset and the real VGA scans B8000 directly.
@@ -29,7 +28,7 @@ static mut PALETTE: [u8; 768] = [0; 768];
 /// text simply renders a complete frame synchronously because no beam-driving
 /// event loop exists yet.
 struct Scanout {
-    pal: lib::vga_render::Pal,
+    pal: vga::Pal,
     pal_cache: [u8; 768],
     surface: alloc::vec::Vec<u8>,
 }
@@ -37,7 +36,7 @@ struct Scanout {
 impl Scanout {
     const fn new() -> Scanout {
         Scanout {
-            pal: lib::vga_render::Pal::new(),
+            pal: vga::Pal::new(),
             pal_cache: [0; 768],
             surface: alloc::vec::Vec::new(),
         }
@@ -65,9 +64,9 @@ pub fn attach_framebuffer(fb: Framebuffer, format: PixelFormat) {
     unsafe {
         FRAMEBUFFER = Some(fb);
         FORMAT = Some(format);
-        PALETTE = lib::vga_render::fallback_palette();
+        PALETTE = vga::fallback_palette();
     }
-    lib::vga::set_text_flush(flush);
+    lib::term::set_text_flush(flush);
     flush();
 }
 
@@ -78,7 +77,7 @@ fn flush() {
     let format_p = &raw const FORMAT;
     let Some(format) = (unsafe { *format_p }) else { return };
     let vram = unsafe {
-        core::slice::from_raw_parts(vga().base as *const u8, 80 * 25 * 2)
+        core::slice::from_raw_parts(lib::term::term().base as *const u8, 80 * 25 * 2)
     };
     let palette_p = &raw const PALETTE;
     let frame = Frame {
@@ -99,7 +98,7 @@ fn flush() {
 }
 
 fn scanout(fb: &Framebuffer, format: PixelFormat, frame: &Frame<'_>) {
-    let (w, h) = lib::vga_render::dimensions(frame.mode);
+    let (w, h) = vga::dimensions(frame.mode);
     let (out_w, out_h) = crate::kernel::display::fit_vga(fb.width, fb.height);
     if w == 0 || h == 0 || out_w < w || out_h < h {
         return;
@@ -119,7 +118,7 @@ fn scanout(fb: &Framebuffer, format: PixelFormat, frame: &Frame<'_>) {
     }
     s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
     for sy in 0..h {
-        lib::vga_render::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
+        vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
     let sink = crate::kernel::display::LfbDisplay::from_framebuffer(
         *fb,

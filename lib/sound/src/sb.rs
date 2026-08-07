@@ -25,6 +25,27 @@
 use crate::opl;
 use alloc::boxed::Box;
 
+/// How a *guest* is wired to a Sound Blaster: the ports it decodes, the IRQ
+/// line it hooks, the DMA channels it programs. On a PC this is what the
+/// `BLASTER` environment variable declares, and it describes the guest's
+/// belief, never the silicon — a real card may sit at a different base on
+/// different straps, and whoever passes traffic through translates.
+///
+/// It lives beside the card model because both sides of the XOR need it: the
+/// emulated card decodes these ports, and a host driving real hardware needs
+/// exactly these numbers to know what to translate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Wiring {
+    /// DSP/mixer port base the guest decodes (`BLASTER A`).
+    pub io_base: u16,
+    /// IRQ raised on the guest's interrupt controller (`BLASTER I`).
+    pub irq: u8,
+    /// The guest's 8-bit DMA channel, 0..3 (`BLASTER D`).
+    pub dma8: u8,
+    /// The guest's 16-bit DMA channel, 5..7 (`BLASTER H`).
+    pub dma16: u8,
+}
+
 /// How long the DSP keeps the canonical stream open after playback stops,
 /// feeding silence (see [`Sb::owns_sink`]). Long enough to bridge
 /// per-animation-frame sound-effect re-triggers (~150 ms), short enough that

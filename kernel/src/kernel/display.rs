@@ -8,19 +8,10 @@
 //! Pixels may occupy 2, 3, or 4 bytes. Channel layout and width are consumed
 //! when the 256-entry palette is built, not in the per-pixel VGA decoder.
 
-pub use lib::vga_render::PixelFormat;
+pub use vga::PixelFormat;
 
-/// How pixels are encoded in a framebuffer sink.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FormatSpec {
-    /// GOP, VESA true-colour LFBs and hosted memory.
-    Packed(PixelFormat),
-    /// A paletted surface whose palette belongs to the GUEST — a VBE 8bpp mode
-    /// it selected and whose DAC it loads, so the byte is an index into a table
-    /// only the guest knows. A mode-13 surface WE own is not this: we program
-    /// its DAC to a 3:3:2 ramp, which makes it `Packed(RGB332)`.
-    Indexed8,
-}
+pub use vga::FormatSpec;
+
 
 /// Somewhere to write pixels. `Debug` prints just the size — the address and
 /// channel positions would drown the boot log's platform line.
@@ -155,7 +146,7 @@ pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
 }
 
 /// Hosted completed-frame sink. This lives in the allocating kernel rather
-/// than `lib::vga_render`, which is also linked by the allocator-free bootloader.
+/// than `//lib:vga`, which the allocator-free bootloader does not link.
 static HOST_PRESENT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
@@ -179,7 +170,7 @@ pub fn present_host(w: usize, h: usize, pixels: &mut alloc::vec::Vec<u32>) {
 /// Direct-framebuffer scanout state: a palette in framebuffer format, one
 /// compact completed-frame shadow, and the render/publish clock.
 pub struct Scratch {
-    pal: lib::vga_render::Pal,
+    pal: vga::Pal,
     pal_cache: [u8; 768],
     /// Write-back shadow with one picture-width row per VGA source row.
     /// A render pass fills it atomically; vertical stretching is deferred to
@@ -189,7 +180,7 @@ pub struct Scratch {
     /// `(w, h, out_w, out_h, panel_w, panel_h)`; any change
     /// discards a pending shadow and starts a fresh render.
     geo: (usize, usize, usize, usize, usize, usize),
-    mode: Option<lib::vga_render::VgaMode>,
+    mode: Option<vga::VgaMode>,
     /// Display time-slice within the current refresh. Phase zero is vertical
     /// retrace. At its trailing edge the whole shadow is rendered; the next
     /// phase publishes it.
@@ -211,7 +202,7 @@ impl Default for Scratch {
 impl Scratch {
     pub const fn new() -> Scratch {
         Scratch {
-            pal: lib::vga_render::Pal::new(),
+            pal: vga::Pal::new(),
             pal_cache: [0; 768],
             surface: alloc::vec::Vec::new(),
             geo: (0, 0, 0, 0, 0, 0),
@@ -229,7 +220,7 @@ impl Scratch {
         let mut boxed = alloc::boxed::Box::<Scratch>::new_uninit();
         let p = boxed.as_mut_ptr();
         unsafe {
-            core::ptr::addr_of_mut!((*p).pal).write(lib::vga_render::Pal::new());
+            core::ptr::addr_of_mut!((*p).pal).write(vga::Pal::new());
             core::ptr::addr_of_mut!((*p).pal_cache).write([0; 768]);
             core::ptr::addr_of_mut!((*p).surface).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).geo).write((0, 0, 0, 0, 0, 0));
@@ -444,12 +435,12 @@ pub enum ScanoutAction {
 pub fn scanout_action(
     s: &mut Scratch,
     sink: &LfbDisplay,
-    mode: lib::vga_render::VgaMode,
+    mode: vga::VgaMode,
     now_tick: u64,
     period_ticks: usize,
 ) -> ScanoutAction {
     let fb = &sink.framebuffer;
-    let (w, h) = lib::vga_render::dimensions(mode);
+    let (w, h) = vga::dimensions(mode);
     if w == 0 || h == 0 || period_ticks < 3 {
         return ScanoutAction::None;
     }
@@ -514,10 +505,10 @@ pub fn scanout_action(
 pub fn render_shadow(
     s: &mut Scratch,
     sink: &LfbDisplay,
-    frame: &lib::vga_render::Frame,
+    frame: &vga::Frame,
 ) -> bool {
     let format = sink.packed_format().expect("packed render on indexed sink");
-    let (w, h) = lib::vga_render::dimensions(frame.mode);
+    let (w, h) = vga::dimensions(frame.mode);
     let (out_w, _) = sink.fit();
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
@@ -529,11 +520,11 @@ pub fn render_shadow(
         return false;
     }
     s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
-    if matches!(frame.mode, lib::vga_render::VgaMode::Planar16 { .. }) {
+    if matches!(frame.mode, vga::VgaMode::Planar16 { .. }) {
         s.pal.sync_planar(frame.ac);
     }
     for sy in 0..h {
-        lib::vga_render::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
+        vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
     s.ready = true;
     true

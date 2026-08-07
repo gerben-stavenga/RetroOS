@@ -56,7 +56,7 @@ fn main() {
     }
 
     kernel::kernel::klog::init();
-    kernel::vga::set_debug_sink(log_byte);
+    lib::log::set_debug_sink(log_byte);
 
     // CPU/kernel worker: interpreter state is thread-local, so the platform is
     // composed here, on the thread that will run it.
@@ -146,8 +146,8 @@ fn main() {
             config.set_c_root(c.as_bytes());
         }
         let mut machine = arch::Interp;
-        // The screen license (see lib::vga::Screen): one per boot, moved in.
-        kernel::startup(&mut machine, &config, kernel::vga::Screen::new());
+        // The screen license (see lib::term::Screen): one per boot, moved in.
+        kernel::startup(&mut machine, &config, kernel::term::Screen::new());
     });
 
     display::run() // main thread: SDL loop; exits the process on window close

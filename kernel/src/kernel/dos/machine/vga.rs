@@ -1,7 +1,7 @@
 //! Virtual VGA register state (Attribute Controller + CRTC/sequencer snapshot)
 //! — and, when no card is present, the *emulated* VGA itself: the same
 //! register file becomes the live model behind `emulate_inb`/`emulate_outb`,
-//! and `display_tick` renders the screen through the shared `lib::vga_render`
+//! and `display_tick` renders the screen through the shared `//lib:vga`
 //! to the platform's present sink. One VGA, emulated once, kernel-side; the
 //! backends only supply a framebuffer.
 
@@ -128,7 +128,7 @@ fn prepare_mode13_osd(
     bios_display: crate::kernel::platform::BiosDisplay,
 ) -> crate::kernel::display::LfbDisplay {
     let mut state = VgaState::new();
-    let regs = lib::vga_render::bios_mode_regs(0x13).expect("mode 13h register table");
+    let regs = ::vga::bios_mode_regs(0x13).expect("mode 13h register table");
     state.misc_output = regs.misc;
     state.seq = regs.seq;
     state.gc = regs.gc;
@@ -148,9 +148,9 @@ fn prepare_mode13_osd(
     // 3:3:2, so this surface IS a packed RGB332 framebuffer and the ordinary
     // render/present path drives it. The DAC here is ours — it belongs to the
     // compositing sink we install while holding the card, not to the guest.
-    state.dac = lib::vga_render::palette_rgb332();
+    state.dac = ::vga::palette_rgb332();
     state.planes.resize(4 * 0x10000, 0);
-    state.restore_to_hardware();
+    crate::kernel::drivers::vga_hw::restore(&state);
     crate::kernel::display::LfbDisplay::from_framebuffer(
         crate::kernel::display::Framebuffer {
             va: crate::LOW_MEM_BASE + 0xA0000,
@@ -161,7 +161,7 @@ fn prepare_mode13_osd(
             wide: false,
         },
         crate::kernel::display::FormatSpec::Packed(
-            lib::vga_render::PixelFormat::RGB332,
+            ::vga::PixelFormat::RGB332,
         ),
         Some(bios_display),
     )
@@ -192,11 +192,11 @@ impl EmulatedVga {
                 // VGA has been suspended, `planes` is populated and later
                 // attachments perform the ordinary exact repaint.
                 if !self.state.planes.is_empty() {
-                    self.state.capture_emulated_aperture(machine);
+                    capture_emulated_aperture(&mut self.state, machine);
                 }
                 machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
                 self.state.a0000_trapped = false;
-                self.state.restore_to_hardware();
+                crate::kernel::drivers::vga_hw::restore(&self.state);
                 // Once materialized, the card is the state. Do not retain a
                 // second authoritative register/VRAM image in the thread.
                 BiosVga::Bios(native)
@@ -236,8 +236,8 @@ impl BiosVga {
         match self {
             Self::Bios(native) => {
                 let mut state = VgaState::new_boxed();
-                state.save_from_hardware();
-                state.materialize_emulated_aperture(machine);
+                crate::kernel::drivers::vga_hw::save(&mut state);
+                materialize_emulated_aperture(&mut state, machine);
                 (
                     Self::Emulated(EmulatedVga { state, display: None }),
                     crate::kernel::platform::DisplayToken::BiosDisplay(native),
@@ -265,11 +265,11 @@ impl BiosVga {
                     crate::kernel::platform::BiosDisplay::Vesa { mode, bank } => Some((*mode, *bank)),
                 };
                 let mut state = VgaState::new_boxed();
-                state.save_from_hardware();
+                crate::kernel::drivers::vga_hw::save(&mut state);
                 if let Some((mode, bank)) = detached_vbe {
                     capture_bios_vbe(machine, bios_workspace, &mut native, &mut state, mode, bank);
                 } else {
-                    state.materialize_emulated_aperture(machine);
+                    materialize_emulated_aperture(&mut state, machine);
                 }
                 (
                     Self::Emulated(EmulatedVga { state, display: None }),
@@ -308,7 +308,7 @@ impl BiosVga {
                 let request = detached.mode.number | if detached.bank.is_none() { 0x4000 } else { 0 };
                 if bios_workspace.bios_set_mode_request(machine, &mut native, request).is_ok() {
                     restore_bios_vbe(machine, bios_workspace, &mut native, &dev.state, detached);
-                    dev.state.restore_dac_to_hardware();
+                    crate::kernel::drivers::vga_hw::restore_dac(&dev.state);
                 } else {
                     crate::println!("VBE: failed to restore guest mode {:#x}", detached.mode.number);
                 }
@@ -333,8 +333,8 @@ impl BiosVga {
         match self {
             native @ Self::Bios(_) => native,
             Self::Emulated(mut dev) => {
-                dev.state.save_from_hardware();
-                dev.state.materialize_emulated_aperture(machine);
+                crate::kernel::drivers::vga_hw::save(&mut dev.state);
+                materialize_emulated_aperture(&mut dev.state, machine);
                 Self::Emulated(dev)
             }
         }
@@ -352,7 +352,7 @@ impl BiosVga {
     /// and consumes the shadow; an emulated owner keeps it for its sink.
     pub fn install_saved_state(&mut self, state: alloc::boxed::Box<VgaState>) {
         match self {
-            Self::Bios(_) => state.restore_to_hardware(),
+            Self::Bios(_) => crate::kernel::drivers::vga_hw::restore(&state),
             Self::Emulated(vga) => vga.state = state,
         }
     }
@@ -363,771 +363,89 @@ impl BiosVga {
 // VGA register state (AcState + VgaState)
 // ============================================================================
 
-/// VGA Attribute Controller port (0x3C0) state. The hardware has two
-/// independent pieces of state, neither readable from any port:
-///   - `index`:        last byte written in index state. Includes the PAS bit
-///     (bit 5) which controls screen blanking. Persistent —
-///     subsequent data writes do not change it.
-///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
-///     index byte; `true` = next 0x3C0 write is its data.
-///     `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
-#[derive(Clone, Copy)]
-pub struct AcState {
-    pub index: u8,
-    pub pending_data: bool,
-}
+// The register file, its plane memory and the port model live in
+// `//lib:vga` — a VGA is not DOS policy, and the Linux console, the display
+// handover and the real-card driver all hold one too. What stays here is the
+// part that needs a guest address space, which a passive card cannot have.
+pub use ::vga::{DetachedVbe, VgaState};
 
-impl AcState {
-    // PAS=1 (bit 5 of index) matches BIOS-default boot state where the
-    // display is enabled. The tracker is needed because the AC flip-flop
-    // can't be read from hardware. A `0` default is wrong: programs that
-    // never write AC (any program that sticks to text mode and DOS I/O)
-    // would have save_from_hardware write index=0 back to 0x3C0,
-    // clearing PAS and blanking the display. Default to `0x20` so the
-    // tracker matches HW from the moment the kernel boots.
-    const fn new() -> Self { Self { index: 0x20, pending_data: false } }
-}
-
-/// Global AC state, tracks real hardware across all processes.
-pub(super) static mut VGA_AC_STATE: AcState = AcState::new();
-
-/// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
-/// Saved/restored on context switch so each process has its own screen.
-pub struct VgaState {
-    /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
-    pub planes: alloc::vec::Vec<u8>,
-    // ── Registers ──
-    pub misc_output: u8,
-    pub feature_ctl: u8,
-    /// CGA Mode-Control (0x3D8) and Colour-Select (0x3D9). The CGA renderer
-    /// resolves its 4-colour palette from these (palette 0/1, foreground
-    /// intensity, background/border colour); real-VGA passthrough honours them
-    /// in hardware, so they matter only on the emulated (UEFI/hosted) path.
-    pub cga_mode_ctl: u8,
-    pub cga_color_select: u8,
-    pub seq: [u8; 5],
-    pub crtc: [u8; 25],
-    pub gc: [u8; 9],
-    pub ac: [u8; 21],
-    pub dac: [u8; 768],
-    pub dac_mask: u8,
-    // ── Port index / state ──
-    pub seq_index: u8,
-    pub crtc_index: u8,
-    pub gc_index: u8,
-    /// AC port flip-flop + latched index. See `VGA_AC_STATE`.
-    pub ac_state: AcState,
-    /// DAC pixel-address latch (single shared index for read & write)
-    pub dac_index: u8,
-    /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
-    pub dac_state: u8,
-    // ── Emulated-model DAC latches (absent-card port model only) ──
-    /// Real VGA keeps *separate* read and write indices; palette-cycling
-    /// effects read entries back, rotate, and rewrite them — Prince of
-    /// Persia's torch flames do exactly this, and a read answering 0xFF
-    /// turns every cycled entry permanent white. `dac_index` above stays
-    /// the write index (the save/restore contract); these carry the read
-    /// index and the per-entry R/G/B sub-positions.
-    pub dac_read_index: u8,
-    pub dac_rsub: u8,
-    pub dac_wsub: u8,
-    /// VGA read latches: the 4 plane bytes loaded by the most recent VRAM read
-    /// (one per plane). Write mode 1 (latched copy) writes these straight
-    /// through; write modes 0/2/3 ALU the new value against them. Only used on
-    /// the trapped planar write path (see `vram_write`/`vram_read`).
-    pub latches: [u8; 4],
-    // ── VESA SVGA (banked) ──
-    /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
-    /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
-    /// window is *aliased* onto its current bank (shared frames), so guest
-    /// writes land directly in it — no copy, always coherent.
-    pub svga_w: u16,
-    pub svga_h: u16,
-    pub svga_bpp: u8,
-    pub svga_pitch: u16,
-    /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
-    pub svga_bank: u16,
-    /// Descriptor captured from a native card at the OSD take boundary.
-    /// `None` for the substitute BIOS's synthetic SVGA modes.
-    pub detached_vbe: Option<DetachedVbe>,
-    /// This address space's A0000 window is mapped as the planar trap
-    /// (present=0 + MMIO marker), so kernel-side writes must route through
-    /// `vram_write` instead of raw guest-memory stores.
-    pub a0000_trapped: bool,
-}
-
-#[derive(Clone, Copy)]
-pub struct DetachedVbe {
-    pub mode: crate::kernel::platform::VbeMode,
-    pub bank: Option<crate::kernel::platform::VbeBank>,
-}
-
-impl Default for VgaState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl VgaState {
-    /// Allocate and initialize the register file in its final heap location.
-    /// `VgaState::new()` is almost 1 KiB (chiefly the DAC); embedding that call
-    /// in `PcMachine::new_boxed` made rustc materialize a temporary on the
-    /// already-deep fork/exec kernel stack before copying it into the box.
-    pub fn new_boxed() -> alloc::boxed::Box<Self> {
-        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
-        let p = boxed.as_mut_ptr();
-        unsafe {
-            core::ptr::addr_of_mut!((*p).planes).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).misc_output).write(0);
-            core::ptr::addr_of_mut!((*p).feature_ctl).write(0);
-            core::ptr::addr_of_mut!((*p).cga_mode_ctl).write(0);
-            core::ptr::addr_of_mut!((*p).cga_color_select).write(0);
-            core::ptr::addr_of_mut!((*p).seq).write([0; 5]);
-            core::ptr::addr_of_mut!((*p).crtc).write([0; 25]);
-            let mut gc = [0; 9];
-            gc[8] = 0xFF;
-            core::ptr::addr_of_mut!((*p).gc).write(gc);
-            let mut ac = [0; 21];
-            ac[0x10] = 0x08;
-            core::ptr::addr_of_mut!((*p).ac).write(ac);
-            let dac = core::ptr::addr_of_mut!((*p).dac);
-            core::ptr::write_bytes(dac.cast::<u8>(), 0, 768);
-            core::ptr::addr_of_mut!((*p).dac_mask).write(0xFF);
-            core::ptr::addr_of_mut!((*p).seq_index).write(0);
-            core::ptr::addr_of_mut!((*p).crtc_index).write(0);
-            core::ptr::addr_of_mut!((*p).gc_index).write(0);
-            core::ptr::addr_of_mut!((*p).ac_state).write(AcState::new());
-            core::ptr::addr_of_mut!((*p).dac_index).write(0);
-            core::ptr::addr_of_mut!((*p).dac_state).write(0);
-            core::ptr::addr_of_mut!((*p).dac_read_index).write(0);
-            core::ptr::addr_of_mut!((*p).dac_rsub).write(0);
-            core::ptr::addr_of_mut!((*p).dac_wsub).write(0);
-            core::ptr::addr_of_mut!((*p).latches).write([0; 4]);
-            core::ptr::addr_of_mut!((*p).svga_w).write(0);
-            core::ptr::addr_of_mut!((*p).svga_h).write(0);
-            core::ptr::addr_of_mut!((*p).svga_bpp).write(0);
-            core::ptr::addr_of_mut!((*p).svga_pitch).write(0);
-            core::ptr::addr_of_mut!((*p).svga_bank).write(0);
-            core::ptr::addr_of_mut!((*p).detached_vbe).write(None);
-            core::ptr::addr_of_mut!((*p).a0000_trapped).write(false);
-            let mut boxed = boxed.assume_init();
-            lib::vga_render::fill_fallback_palette(&mut boxed.dac);
-            boxed
+/// Present the emulated planes to the guest at A0000/B8000 — map the window
+/// and fill it from the model, or mark it trapped when the mode's writes must
+/// go through the planar ALU. Needs an address space, so it is not the card's.
+fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut A) {
+    use ::vga::VgaMode;
+    match state.classify_mode() {
+        Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
+            machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+            state.a0000_trapped = true;
         }
-    }
-
-    pub fn new() -> Self {
-        Self {
-            planes: alloc::vec::Vec::new(),
-            // EGA/text DAC defaults so the emulated model renders text in
-            // colour even though text-mode programs never program the DAC
-            // (mode 13h loads overwrite these). Harmless for the metal
-            // snapshot use: restore_to_hardware no-ops until a real save
-            // fills `planes`, which also rewrites the whole DAC.
-            misc_output: 0,
-            feature_ctl: 0,
-            cga_mode_ctl: 0,
-            cga_color_select: 0,
-            seq: [0; 5],
-            crtc: [0; 25],
-            // GC Bit Mask (index 8) resets to 0xFF — every CPU-data bit passes
-            // through; BIOS mode-set leaves it so and Mode X / EGA writes rely
-            // on it. Defaulting it to 0 masked every planar write to the latch.
-            gc: { let mut g = [0u8; 9]; g[8] = 0xFF; g },
-            // AC mode-control (reg 0x10) bit 3 set: blink semantics for
-            // attribute bit 7, the BIOS mode-3 power-on default. TUIs that
-            // want 16 background colors clear it (INT 10h AX=1003 BL=0 or a
-            // direct AC write — both land here); DN's dark-grey panels
-            // (bg=8) rendered black until this was modeled.
-            ac: { let mut a = [0u8; 21]; a[0x10] = 0x08; a },
-            dac: lib::vga_render::fallback_palette(),
-            dac_mask: 0xFF,
-            seq_index: 0,
-            crtc_index: 0,
-            gc_index: 0,
-            ac_state: AcState::new(),
-            dac_index: 0,
-            dac_state: 0,
-            dac_read_index: 0,
-            dac_rsub: 0,
-            dac_wsub: 0,
-            latches: [0; 4],
-            svga_w: 0,
-            svga_h: 0,
-            svga_bpp: 0,
-            svga_pitch: 0,
-            svga_bank: 0,
-            detached_vbe: None,
-            a0000_trapped: false,
-        }
-    }
-
-    /// Emulated register-file write — the absent-card half of the VGA
-    /// passthrough-vs-emulate split (`BiosVga::emulated`).
-    /// This per-thread struct IS the hardware then: `emulate_outb` routes the
-    /// 3Cx/3Dx window here instead of to real ports, and save/restore on
-    /// context switch becomes a no-op because the state never leaves the
-    /// struct. Index/data pairs land in the same arrays the metal
-    /// save/restore fills, so every consumer (renderer, mode queries) reads
-    /// one representation.
-    pub fn port_write(&mut self, port: u16, v: u8) {
-        match port {
-            0x3C0 => {
-                if !self.ac_state.pending_data {
-                    self.ac_state.index = v;
-                } else {
-                    let i = (self.ac_state.index & 0x1F) as usize;
-                    if i < 21 {
-                        self.ac[i] = v;
-                    }
-                }
-                self.ac_state.pending_data = !self.ac_state.pending_data;
-            }
-            0x3C2 => self.misc_output = v,
-            0x3C4 => self.seq_index = v,
-            0x3C5 => {
-                let i = (self.seq_index & 0x1F) as usize;
-                if i < 5 {
-                    self.seq[i] = v;
-                }
-            }
-            0x3C6 => self.dac_mask = v,
-            0x3C7 => {
-                self.dac_read_index = v;
-                self.dac_rsub = 0;
-                self.dac_state = 0x03;
-            }
-            0x3C8 => {
-                self.dac_index = v;
-                self.dac_wsub = 0;
-                self.dac_state = 0x00;
-            }
-            0x3C9 => {
-                let i = self.dac_index as usize * 3 + self.dac_wsub as usize;
-                self.dac[i] = v & 0x3F;
-                self.dac_wsub += 1;
-                if self.dac_wsub == 3 {
-                    self.dac_wsub = 0;
-                    self.dac_index = self.dac_index.wrapping_add(1);
-                }
-            }
-            0x3CE => self.gc_index = v,
-            0x3CF => {
-                let i = (self.gc_index & 0x0F) as usize;
-                if i < 9 {
-                    self.gc[i] = v;
-                }
-            }
-            0x3D4 => self.crtc_index = v,
-            0x3D5 => {
-                let i = self.crtc_index as usize;
-                if i >= 25 {
-                    return;
-                }
-                // CRTC write protect (index 11h bit 7, which every BIOS mode set
-                // leaves SET): indices 00h-07h are read-only while it holds. The
-                // one documented exception is the Line Compare bit 8 in the
-                // Overflow register, which the hardware latches regardless.
-                //
-                // Load-bearing for tweaked modes that poke the Overflow register
-                // to move the split screen: Operation Wolf's intro writes
-                // index 07h = 01h, which — applied in full — would clear bit 8 of
-                // Vertical Display End and shrink the visible area from 400
-                // scanlines to 144 (200 rows to 72), cutting off everything below
-                // the split. Real hardware ignores that write; only the split
-                // moves.
-                if i <= 0x07 && self.crtc[0x11] & 0x80 != 0 {
-                    if i == 0x07 {
-                        self.crtc[0x07] = (self.crtc[0x07] & !0x10) | (v & 0x10);
-                    }
-                    return;
-                }
-                self.crtc[i] = v;
-            }
-            0x3D8 => self.cga_mode_ctl = v,     // CGA Mode Control
-            0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
-            0x3DA => self.feature_ctl = v, // FCR write port (colour)
-            _ => {}
-        }
-    }
-
-    /// Emulated register-file read (see `port_write`). 0x3DA (status + AC
-    /// flip-flop reset) stays in `emulate_inb`, which fabricates the retrace
-    /// bits for emulated and QEMU cards alike.
-    pub fn port_read(&mut self, port: u16) -> u8 {
-        match port {
-            0x3C0 => self.ac_state.index,
-            0x3C1 => {
-                let i = (self.ac_state.index & 0x1F) as usize;
-                if i < 21 { self.ac[i] } else { 0 }
-            }
-            0x3C2 => 0, // input status 0: no interrupt pending, monitor present
-            0x3C4 => self.seq_index,
-            0x3C5 => {
-                let i = (self.seq_index & 0x1F) as usize;
-                if i < 5 { self.seq[i] } else { 0 }
-            }
-            0x3C6 => self.dac_mask,
-            0x3C7 => self.dac_state,
-            0x3C8 => self.dac_index,
-            0x3C9 => {
-                let v = self.dac[self.dac_read_index as usize * 3 + self.dac_rsub as usize];
-                self.dac_rsub += 1;
-                if self.dac_rsub == 3 {
-                    self.dac_rsub = 0;
-                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
-                }
-                v
-            }
-            0x3CA => self.feature_ctl,
-            0x3CC => self.misc_output,
-            0x3CE => self.gc_index,
-            0x3CF => {
-                let i = (self.gc_index & 0x0F) as usize;
-                if i < 9 { self.gc[i] } else { 0 }
-            }
-            0x3D4 => self.crtc_index,
-            0x3D5 => {
-                let i = self.crtc_index as usize;
-                if i < 25 { self.crtc[i] } else { 0 }
-            }
-            _ => 0xFF,
-        }
-    }
-
-    fn materialize_emulated_aperture<A: crate::Arch>(&mut self, machine: &mut A) {
-        use lib::vga_render::VgaMode;
-        match self.classify_mode() {
-            Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
-                machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
-                self.a0000_trapped = true;
-            }
-            Some(VgaMode::Mode13h) => {
-                machine.map_fresh_range(A0000 >> 12, 16);
-                let mut chained = alloc::vec![0u8; 0x10000];
-                lib::vga_render::chain4_merge(&self.planes, &mut chained);
-                machine.copy_to(A0000, &chained);
-                self.a0000_trapped = false;
-            }
-            Some(VgaMode::Text80x25) => {
-                machine.map_fresh_range(0xB8000 >> 12, 8);
-                let mut text = alloc::vec![0u8; 0x8000];
-                lib::vga_render::text_odd_even_merge(&self.planes, &mut text);
-                machine.copy_to(0xB8000, &text);
-                self.a0000_trapped = false;
-            }
-            Some(VgaMode::Cga4) => {
-                machine.map_fresh_range(0xB8000 >> 12, 8);
-                let mut cga = alloc::vec![0u8; 0x4000];
-                for i in 0..0x2000 {
-                    cga[i * 2] = self.planes.get(i).copied().unwrap_or(0);
-                    cga[i * 2 + 1] =
-                        self.planes.get(0x10000 + i).copied().unwrap_or(0);
-                }
-                machine.copy_to(0xB8000, &cga);
-                self.a0000_trapped = false;
-            }
-            Some(VgaMode::Cga2) => {
-                machine.map_fresh_range(0xB8000 >> 12, 8);
-                let n = 0x4000.min(self.planes.len());
-                machine.copy_to(0xB8000, &self.planes[..n]);
-                self.a0000_trapped = false;
-            }
-            Some(VgaMode::LinearSvga { .. }) | None => {
-                self.a0000_trapped = false;
-            }
-        }
-    }
-
-    fn capture_emulated_aperture<A: crate::Arch>(&mut self, machine: &mut A) {
-        use lib::vga_render::VgaMode;
-        if self.planes.len() != PLANES_LEN {
-            self.planes.resize(PLANES_LEN, 0);
-        }
-        match self.classify_mode() {
-            Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {}
-            Some(VgaMode::Mode13h) => {
-                let mut chained = alloc::vec![0u8; 0x10000];
-                machine.copy_from(A0000, &mut chained);
-                lib::vga_render::chain4_split(&chained, &mut self.planes);
-            }
-            Some(VgaMode::Text80x25) => {
-                let mut text = alloc::vec![0u8; 0x8000];
-                machine.copy_from(0xB8000, &mut text);
-                lib::vga_render::text_odd_even_split(&text, &mut self.planes);
-            }
-            Some(VgaMode::Cga4) => {
-                let mut cga = alloc::vec![0u8; 0x4000];
-                machine.copy_from(0xB8000, &mut cga);
-                for i in 0..0x2000 {
-                    self.planes[i] = cga[i * 2];
-                    self.planes[0x10000 + i] = cga[i * 2 + 1];
-                }
-            }
-            Some(VgaMode::Cga2) => {
-                machine.copy_from(0xB8000, &mut self.planes[..0x4000]);
-            }
-            Some(VgaMode::LinearSvga { .. }) | None => {}
-        }
-    }
-
-    /// Read current VGA hardware state into this struct. Called only by a
-    /// consuming `BiosDisplay -> EmulatedVga` transition.
-    pub(crate) fn save_from_hardware(&mut self) {
-        use crate::kernel::portio::{inb, outb};
-        if self.planes.is_empty() {
-            self.planes = alloc::vec![0u8; 4 * 65536];
-        }
-        // Capture the AC sequencing state, then reset the flipflop to a
-        // known index state. With 0x3C0/0x3DA granted to the guest
-        // (io_policy `vga_ports_direct`), the VGA_AC_STATE tracker never saw
-        // its writes — the card is the only source of truth, and it must be
-        // read BEFORE the 0x3DA reset below destroys the phase.
-        let plat = crate::kernel::platform::get();
-        if plat.vga_ports_direct() {
-            let index = inb(0x3C0); // address-register readback (incl. PAS)
-            let pending_data = if plat.vga_readback {
-                let crtc_index = inb(0x3D4);
-                outb(0x3D4, 0x24); // Cirrus CR24: bit 7 = flip-flop phase
-                let phase = inb(0x3D5) & 0x80 != 0;
-                outb(0x3D4, crtc_index);
-                phase
-            } else {
-                // Phase not readable on this card — assume index state (the
-                // boot warning declared full restore unsupported here).
-                false
-            };
-            self.ac_state = AcState { index, pending_data };
-        } else {
-            // Trapped AC ports (QEMU): the tracker observed every access.
-            self.ac_state = unsafe { VGA_AC_STATE };
-        }
-        let _ = inb(0x3DA);
-
-        // Capture index registers BEFORE the save loops overwrite them.
-        self.seq_index = inb(0x3C4);
-        self.crtc_index = inb(0x3D4);
-        self.gc_index = inb(0x3CE);
-
-        // Save all registers
-        self.misc_output = inb(0x3CC);
-        self.feature_ctl = inb(0x3CA);
-        for i in 0..5u8 { outb(0x3C4, i); self.seq[i as usize] = inb(0x3C5); }
-        for i in 0..25u8 { outb(0x3D4, i); self.crtc[i as usize] = inb(0x3D5); }
-        for i in 0..9u8 { outb(0x3CE, i); self.gc[i as usize] = inb(0x3CF); }
-
-        // Data latches, via Cirrus CR22 (latch selected by GC4 read-map).
-        // Must happen before the plane copy below — every VRAM read reloads
-        // them. Without the readback the latches stay unrecoverable (see the
-        // gap comment further down).
-        if plat.vga_ports_direct() && plat.vga_readback {
-            for plane in 0..4u8 {
-                outb(0x3CE, 4); outb(0x3CF, plane);
-                outb(0x3D4, 0x22);
-                self.latches[plane as usize] = inb(0x3D5);
-            }
-            outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
-        }
-        self.dac_mask = inb(0x3C6);
-        // Capture program-tracked DAC index latch + read/write mode before
-        // stomping it with our bulk read.
-        self.dac_index = inb(0x3C8);
-        self.dac_state = inb(0x3C7);
-        outb(0x3C7, 0);
-        for i in 0..768 { self.dac[i] = inb(0x3C9); }
-
-        // Attribute Controller — must reset flipflop EACH iteration.
-        // inb(0x3C1) reads the register but does NOT toggle the flipflop,
-        // so without a reset the next outb(0x3C0, i) would be a data write.
-        for i in 0..21u8 {
-            let _ = inb(0x3DA);
-            outb(0x3C0, i);
-            self.ac[i as usize] = inb(0x3C1);
-        }
-
-        // Restore hardware AC to the program's tracked state. Always write the
-        // latched index byte (carries the PAS bit, which the save loop above
-        // clobbered to 0). Then, if the program is in index state, do one more
-        // 0x3DA read to put the flipflop back.
-        let _ = inb(0x3DA);
-        outb(0x3C0, self.ac_state.index);
-        if !self.ac_state.pending_data {
-            let _ = inb(0x3DA);
-        }
-
-        crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X} dacmask={:02X}",
-            self.seq[4], self.gc[5], self.gc[6], self.crtc[0x14], self.crtc[0x17], self.ac[0x10], self.misc_output,
-            (self.crtc[0x0C] as u16) << 8 | self.crtc[0x0D] as u16,
-            self.dac_mask);
-
-        // Chain-4 has the same boundary problem in mode 13h: once chain-4 is
-        // disabled, the A0000 aperture no longer presents the guest's linear
-        // pixel stream. Preserve that stream before changing SEQ[4], then use
-        // it to normalize the four plane images after the flat capture.
-        let native_chain4 = if matches!(
-            self.classify_mode(),
-            Some(lib::vga_render::VgaMode::Mode13h)
-        ) {
+        Some(VgaMode::Mode13h) => {
+            machine.map_fresh_range(A0000 >> 12, 16);
             let mut chained = alloc::vec![0u8; 0x10000];
-            let graphics_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
-            for (i, dst) in chained.iter_mut().enumerate() {
-                *dst = unsafe { core::ptr::read_volatile(graphics_window.add(i)) };
-            }
-            Some(chained)
-        } else {
-            None
-        };
-
-        // Blank the display for the rest of the save. The flat-planar
-        // overrides below mis-interpret the current framebuffer if the
-        // guest was in chain-4 / chain-2 / odd-even, so without screen-off
-        // the user sees a brief frame of scrambled pixels.
-        // SEQ Index 1 bit 5 = "Screen Off" — DAC output forced to 0
-        // without touching any other register. Restored at the bottom.
-        outb(0x3C4, 1); outb(0x3C5, self.seq[1] | 0x20);
-
-        // Force flat planar mode for reading planes:
-        // SEQ mem mode = sequential access (no chain-4, no odd/even)
-        // GC mode = read mode 0, write mode 0
-        // GC misc = graphics mode, A0000/64K window, no chain odd/even
-        outb(0x3C4, 4); outb(0x3C5, 0x06);
-        outb(0x3CE, 5); outb(0x3CF, 0x00);
-        outb(0x3CE, 6); outb(0x3CF, 0x05);
-
-        // GAP (plain VGA only): GC read latches (4 bytes loaded by the most
-        // recent VGA memory read) are not preserved across save/restore —
-        // the bulk reads below clobber them, and stock VGA exposes no port
-        // to read them without a destructive VRAM access. With Cirrus
-        // readbacks (`platform::vga_readback`) they were already captured
-        // via CR22 above and are reloaded by `restore_to_hardware`.
-        //
-        // Symptom without readbacks: a mode-X latch blit preempted between
-        // its source read and destination write produces 4 wrong bytes when
-        // the program resumes:
-        //     mov al, [esi]   ; loads latches with src plane bytes
-        //     <-- preempt here -->
-        //     mov [edi], al   ; write mode 1: writes (wrong) latches to dst
-        // The affected window is 1–2 instructions wide, so a lost latch
-        // normally appears as one bad 4-byte stripe in one frame.
-        // Read planes through the kernel-side low-memory mapping
-        // (LOW_MEM_BASE + 0xA0000) so this works regardless of which
-        // personality's user pages are currently mapped — Linux threads
-        // don't have a 0xA0000 identity mapping at all, so a bare access
-        // would fault when suspending shell.elf.
-        let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
-        for plane in 0..4u8 {
-            outb(0x3CE, 4); outb(0x3CF, plane);
-            let dst = &mut self.planes[plane as usize * 65536..][..65536];
-            unsafe { core::ptr::copy_nonoverlapping(vga_window, dst.as_mut_ptr(), 65536); }
+            ::vga::chain4_merge(&state.planes, &mut chained);
+            machine.copy_to(A0000, &chained);
+            state.a0000_trapped = false;
         }
-        if let Some(chained) = native_chain4.as_deref() {
-            lib::vga_render::chain4_split(chained, &mut self.planes);
-        }
-
-        // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
-        outb(0x3C4, 1); outb(0x3C5, self.seq[1]);
-        outb(0x3C4, 4); outb(0x3C5, self.seq[4]);
-        outb(0x3CE, 4); outb(0x3CF, self.gc[4]);
-        outb(0x3CE, 5); outb(0x3CF, self.gc[5]);
-        outb(0x3CE, 6); outb(0x3CF, self.gc[6]);
-        // Restore the program's tracked index registers
-        outb(0x3C4, self.seq_index);
-        outb(0x3D4, self.crtc_index);
-        outb(0x3CE, self.gc_index);
-    }
-
-    /// Write this struct's state to VGA hardware. Called only while acquiring
-    /// the physical lease (or repainting an already-native owner).
-    pub(crate) fn restore_to_hardware(&self) {
-        if self.planes.is_empty() { return; }
-        use crate::kernel::portio::{inb, outb};
-
-        // Reset AC flipflop to known (index) state before any VGA register work.
-        let _ = inb(0x3DA);
-
-        // Blank the display for the entire mode-set so the user doesn't see
-        // intermediate state — the prior mode's CRTC/AC/DAC settings vs. the
-        // new mode's plane data is a parade of garbage otherwise. SEQ Index 1
-        // bit 5 = "Screen Off" forces DAC output to 0 without touching any
-        // other state. The full-mode SEQ restore below intentionally OR-s bit
-        // 5 back in (so the rest of CRTC/GC/AC/DAC reprogramming stays dark);
-        // an explicit final write of SEQ[1] unblanks once everything is set.
-        outb(0x3C4, 1);
-        outb(0x3C5, inb(0x3C5) | 0x20);
-
-        // Step 1: Write planes in forced flat planar mode.
-        // Need misc_output for clock source, but force sequential planar access.
-        outb(0x3C4, 0); outb(0x3C5, 0x01); // sync reset
-        outb(0x3C2, self.misc_output);
-        outb(0x3C4, 2); outb(0x3C5, 0x0F); // map mask: all planes
-        outb(0x3C4, 4); outb(0x3C5, 0x06); // mem mode: sequential, no chain-4
-        outb(0x3C4, 0); outb(0x3C5, 0x03); // release reset
-        outb(0x3CE, 5); outb(0x3CF, 0x00); // GC mode: write mode 0
-        outb(0x3CE, 6); outb(0x3CF, 0x05); // GC misc: graphics, A0000/64K
-
-        // Write planes through the kernel-side low-memory mapping (see
-        // save_from_hardware for the rationale).
-        let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
-        for plane in 0..4u8 {
-            outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-            let src = &self.planes[plane as usize * 65536..][..65536];
-            unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), vga_window, 65536); }
-        }
-
-        // Reload the guest's data latches (captured via Cirrus CR22 in
-        // save_from_hardware): stage the four bytes at offset 0, one read
-        // pulls all four into the latches, then put the real content back.
-        // Writes never load latches and everything below Step 2 is port
-        // I/O only, so the guest resumes with its blit state intact. Still
-        // in forced flat-planar write mode 0 here, so the staging writes
-        // land verbatim.
-        {
-            let plat = crate::kernel::platform::get();
-            if plat.vga_ports_direct() && plat.vga_readback {
-                for plane in 0..4u8 {
-                    outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-                    unsafe { core::ptr::write_volatile(vga_window, self.latches[plane as usize]); }
-                }
-                unsafe { let _ = core::ptr::read_volatile(vga_window as *const u8); }
-                for plane in 0..4u8 {
-                    outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-                    unsafe { core::ptr::write_volatile(vga_window, self.planes[plane as usize * 65536]); }
-                }
-            }
-        }
-
-        // Step 2: Set target mode registers.
-        // Bracket SEQ writes with sync reset so a dot-clock change in
-        // misc_output/seq[1] doesn't glitch the sequencer mid-cycle.
-        // Reverse iteration so SEQ[0] = self.seq[0] is the last write
-        // and naturally acts as the release.
-        outb(0x3C4, 0); outb(0x3C5, 0x01); // assert sync reset
-        outb(0x3C2, self.misc_output);
-        outb(0x3DA, self.feature_ctl); // FCR (color mode write port)
-        // SEQ restore: hold screen-off (bit 5) through SEQ[1] so the CRTC/AC/DAC
-        // reprogramming below stays dark. The final explicit SEQ[1] write at
-        // the end of this function unblanks.
-        for i in (0..5u8).rev() {
-            let v = if i == 1 { self.seq[1] | 0x20 } else { self.seq[i as usize] };
-            outb(0x3C4, i); outb(0x3C5, v);
-        }
-
-        // CRTC — unlock first (clear protect bit in reg 0x11)
-        outb(0x3D4, 0x11); outb(0x3D5, self.crtc[0x11] & 0x7F);
-        for i in 0..25u8 { outb(0x3D4, i); outb(0x3D5, self.crtc[i as usize]); }
-        // Graphics Controller
-        for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]); }
-
-        // For chain-4, finish by replaying the canonical linear aperture
-        // through the target mode itself. The flat pass above preserves the
-        // whole 4x64K VGA store, but strict implementations can expose a
-        // different address interpretation while that pass is active. A
-        // chained write makes the card perform the definitive n&3 / n>>2
-        // routing for the visible 64K image. Keep the screen blank and force
-        // an unmodified write-mode-0 transfer, then restore the guest's exact
-        // write registers.
-        if matches!(self.classify_mode(), Some(lib::vga_render::VgaMode::Mode13h)) {
-            let mut chained = alloc::vec![0u8; 0x10000];
-            lib::vga_render::chain4_merge(&self.planes, &mut chained);
-
-            outb(0x3C4, 2); outb(0x3C5, 0x0F); // all chain-selected planes enabled
-            outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
-            outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
-            outb(0x3CE, 5); outb(0x3CF, self.gc[5] & !0x03); // write mode 0
-            outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
-
-            let chained_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
-            for (i, &src) in chained.iter().enumerate() {
-                unsafe { core::ptr::write_volatile(chained_window.add(i), src); }
-            }
-
-            outb(0x3C4, 2); outb(0x3C5, self.seq[2]);
-            for i in [1u8, 3, 5, 8] {
-                outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]);
-            }
-        }
-
-        // Text mode needs the same treatment, and for the same reason: odd/even
-        // is a different address interpretation, so the flat planar pass above
-        // stores each cell where CRTC *word addressing* puts it — plane offset
-        // 2*i, not i (see `text_odd_even_split`) — and a strict card does not
-        // expose that layout through B8000 until the guest's own text mode is
-        // programmed. Replay the visible page through the target mode and let
-        // the card do its own odd/even routing.
-        //
-        // Without this, a text-mode program that follows a mode-13h one sees
-        // every cell smeared across four bytes (`00 00 char attr`): Dark Forces
-        // launched after Duke3D rendered its screen as two column-interleaved
-        // streams, while B8000 row 0 — written after the mode set — was clean.
-        if matches!(self.classify_mode(), Some(lib::vga_render::VgaMode::Text80x25)) {
+        Some(VgaMode::Text80x25) => {
+            machine.map_fresh_range(0xB8000 >> 12, 8);
             let mut text = alloc::vec![0u8; 0x8000];
-            lib::vga_render::text_odd_even_merge(&self.planes, &mut text);
-
-            outb(0x3C4, 2); outb(0x3C5, 0x03); // char plane 0 + attribute plane 1
-            outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
-            outb(0x3CE, 3); outb(0x3CF, 0x00); // no rotate/ALU operation
-            outb(0x3CE, 5); outb(0x3CF, self.gc[5] & !0x03); // write mode 0
-            outb(0x3CE, 8); outb(0x3CF, 0xFF); // pass every CPU data bit
-
-            let text_window = (crate::LOW_MEM_BASE + 0xB8000) as *mut u8;
-            for (i, &src) in text.iter().enumerate() {
-                unsafe { core::ptr::write_volatile(text_window.add(i), src); }
+            ::vga::text_odd_even_merge(&state.planes, &mut text);
+            machine.copy_to(0xB8000, &text);
+            state.a0000_trapped = false;
+        }
+        Some(VgaMode::Cga4) => {
+            machine.map_fresh_range(0xB8000 >> 12, 8);
+            let mut cga = alloc::vec![0u8; 0x4000];
+            for i in 0..0x2000 {
+                cga[i * 2] = state.planes.get(i).copied().unwrap_or(0);
+                cga[i * 2 + 1] =
+                    state.planes.get(0x10000 + i).copied().unwrap_or(0);
             }
-
-            outb(0x3C4, 2); outb(0x3C5, self.seq[2]);
-            for i in [1u8, 3, 5, 8] {
-                outb(0x3CE, i); outb(0x3CF, self.gc[i as usize]);
-            }
+            machine.copy_to(0xB8000, &cga);
+            state.a0000_trapped = false;
         }
-        // Attribute Controller — write all 21 registers
-        let _ = inb(0x3DA);
-        for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, self.ac[i as usize]); }
-        // Restore the program's AC state. Same pattern as save_from_hardware.
-        let _ = inb(0x3DA);
-        outb(0x3C0, self.ac_state.index);
-        if !self.ac_state.pending_data {
-            let _ = inb(0x3DA);
+        Some(VgaMode::Cga2) => {
+            machine.map_fresh_range(0xB8000 >> 12, 8);
+            let n = 0x4000.min(state.planes.len());
+            machine.copy_to(0xB8000, &state.planes[..n]);
+            state.a0000_trapped = false;
         }
-        unsafe { VGA_AC_STATE = self.ac_state; }
-        // DAC
-        outb(0x3C6, self.dac_mask);
-        outb(0x3C8, 0);
-        for i in 0..768 { outb(0x3C9, self.dac[i]); }
-        // Restore the program's DAC index latch + read/write mode.
-        // dac_state bits[1:0]: 0x03 = read-mode (set via 0x3C7),
-        //                      0x00 = write-mode (set via 0x3C8).
-        if self.dac_state & 3 == 3 {
-            outb(0x3C7, self.dac_index);
-        } else {
-            outb(0x3C8, self.dac_index);
+        Some(VgaMode::LinearSvga { .. }) | None => {
+            state.a0000_trapped = false;
         }
-        // Unblank: rewrite SEQ[1] with the saved (bit-5-cleared) value now
-        // that CRTC/GC/AC/DAC are all loaded. Has to happen before the index
-        // restore below, which sets SEQ index to whatever the program had.
-        outb(0x3C4, 1); outb(0x3C5, self.seq[1]);
-
-        // Restore index registers
-        outb(0x3C4, self.seq_index);
-        outb(0x3D4, self.crtc_index);
-        outb(0x3CE, self.gc_index);
     }
+}
 
-    /// Restore only the DAC portion of a detached VBE display. Replaying the
-    /// legacy sequencer/CRTC register file after a firmware VBE mode set would
-    /// destroy that mode, but indexed VBE scanout still depends on this
-    /// palette and PEL mask.
-    fn restore_dac_to_hardware(&self) {
-        use crate::kernel::portio::outb;
-        outb(0x3C6, self.dac_mask);
-        outb(0x3C8, 0);
-        for &component in &self.dac {
-            outb(0x3C9, component);
+/// The reverse: read the guest's aperture back into the planes.
+fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut A) {
+    use ::vga::VgaMode;
+    if state.planes.len() != PLANES_LEN {
+        state.planes.resize(PLANES_LEN, 0);
+    }
+    match state.classify_mode() {
+        Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {}
+        Some(VgaMode::Mode13h) => {
+            let mut chained = alloc::vec![0u8; 0x10000];
+            machine.copy_from(A0000, &mut chained);
+            ::vga::chain4_split(&chained, &mut state.planes);
         }
-        if self.dac_state & 3 == 3 {
-            outb(0x3C7, self.dac_index);
-        } else {
-            outb(0x3C8, self.dac_index);
+        Some(VgaMode::Text80x25) => {
+            let mut text = alloc::vec![0u8; 0x8000];
+            machine.copy_from(0xB8000, &mut text);
+            ::vga::text_odd_even_split(&text, &mut state.planes);
         }
+        Some(VgaMode::Cga4) => {
+            let mut cga = alloc::vec![0u8; 0x4000];
+            machine.copy_from(0xB8000, &mut cga);
+            for i in 0..0x2000 {
+                state.planes[i] = cga[i * 2];
+                state.planes[0x10000 + i] = cga[i * 2 + 1];
+            }
+        }
+        Some(VgaMode::Cga2) => {
+            machine.copy_from(0xB8000, &mut state.planes[..0x4000]);
+        }
+        Some(VgaMode::LinearSvga { .. }) | None => {}
     }
 }
 
@@ -1148,7 +466,7 @@ use core::sync::atomic::Ordering;
 
 /// The emulated VGA's plane memory: 4 planes × 64 KB, byte (plane `p`, offset
 /// `off`) at `[p*0x10000 + off]`. Lives per-thread on `VgaState::planes` (the
-/// focus-owned model) — the same buffer `save_from_hardware` fills for a real
+/// focus-owned model) — the same buffer `vga_hw::save` fills for a real
 /// card — so the planar trap and the renderer touch it directly, no global and
 /// no per-frame copy.
 const PLANES_LEN: usize = 4 * 0x10000;
@@ -1201,7 +519,7 @@ fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, seed: Option<
         vga.planes = alloc::vec![0u8; PLANES_LEN];
     }
     match seed {
-        Some(chained) => lib::vga_render::chain4_split(chained, &mut vga.planes),
+        Some(chained) => ::vga::chain4_split(chained, &mut vga.planes),
         None => vga.planes.fill(0),
     }
     machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
@@ -1216,7 +534,7 @@ fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, _regs: &mu
     machine.map_fresh_range(A0000 >> 12, 16);
     if merge {
         let mut chained = alloc::vec![0u8; 0x10000];
-        lib::vga_render::chain4_merge(&vga.planes, &mut chained);
+        ::vga::chain4_merge(&vga.planes, &mut chained);
         machine.copy_to(A0000, &chained);
     }
     vga.a0000_trapped = false;
@@ -1461,7 +779,7 @@ pub fn on_set_mode<A: crate::Arch>(
     // unchained level mode can't leak into its menu's mode 13h (stale
     // display-start showed the menu at the wrong offset; stale shift/chain
     // bits later misclassified the menu as the level's Mode X entirely).
-    if let Some(r) = lib::vga_render::bios_mode_regs(mode) {
+    if let Some(r) = ::vga::bios_mode_regs(mode) {
         vga.misc_output = r.misc;
         vga.seq = r.seq;
         vga.gc = r.gc;
@@ -1478,12 +796,12 @@ pub fn on_set_mode<A: crate::Arch>(
         // EGA modes (0Dh/0Eh) and the full 64-colour EGA DAC for 350/480-line
         // planar modes.
         vga.dac = if matches!(mode, 0x0D | 0x0E) {
-            lib::vga_render::ega_200line_dac()
+            ::vga::ega_200line_dac()
         } else {
-            lib::vga_render::ega_dac()
+            ::vga::ega_dac()
         };
     } else if clear {
-        vga.dac = lib::vga_render::fallback_palette();
+        vga.dac = ::vga::fallback_palette();
     }
     let planar = matches!(mode, 0x0D..=0x12);
     if planar {
@@ -1534,7 +852,7 @@ pub fn vram_write(vga: &mut VgaState, off: u32, byte: u8) {
     let off = (off & 0xFFFF) as usize;
     let pl = &vga.planes;
     let cur = [pl[off], pl[0x10000 + off], pl[0x20000 + off], pl[0x30000 + off]];
-    let out = lib::vga_render::planar_write(cur, vga.latches, &vga.gc, vga.seq[2] & 0x0F, byte);
+    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, vga.seq[2] & 0x0F, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
             vga.planes[p * 0x10000 + off] = out[p];
@@ -1601,7 +919,7 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
     let off = (off & 0xFFFF) as usize;
     let pl = &vga.planes;
     let cur = [pl[off], pl[0x10000 + off], pl[0x20000 + off], pl[0x30000 + off]];
-    let (data, latches) = lib::vga_render::planar_read(cur, &vga.gc);
+    let (data, latches) = ::vga::planar_read(cur, &vga.gc);
     vga.latches = latches;
     data
 }
@@ -2533,148 +1851,105 @@ fn read_aperture<'a, A: crate::Arch>(
     buf
 }
 
-impl VgaState {
-    /// The mode the beam is about to scan, from the registers ALONE — no VRAM
-    /// is read. Lets the caller size the band before the snapshot that band
-    /// determines.
-    fn current_mode(&self) -> Option<lib::vga_render::VgaMode> {
-        if self.svga_w != 0 {
-            return Some(lib::vga_render::VgaMode::LinearSvga {
-                w: self.svga_w,
-                h: self.svga_h,
-                bpp: self.svga_bpp,
-                pitch: self.svga_pitch,
-            });
-        }
-        self.classify_mode()
-    }
-
-    /// Build the displayed frame from the live registers + VRAM: resolve the
-    /// mode, point at the video memory, and read the display-start / pixel pan /
-    /// line-compare that select the visible window. Planar modes render our own
-    /// `planes` in place (no copy); linear modes copy the `band` of their guest
-    /// aperture the beam is about to paint into `scratch`. `None` for a mode the
-    /// renderer doesn't draw.
-    fn scanout<'a, A: crate::Arch>(
-        &'a self, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
-        band: (usize, usize),
-    ) -> Option<lib::vga_render::Frame<'a>>
-    {
-        use lib::vga_render::{Frame, VgaMode};
-        // VESA SVGA: present the kernel-side linear framebuffer directly. The
-        // guest filled it through the banked 0xA0000 window; `display_tick`
-        // flushes the live window into `svga_fb` just before this call.
-        if self.svga_w != 0 {
-            let pitch = self.svga_pitch as usize;
-            let size = pitch * self.svga_h as usize;
-            return Some(Frame {
-                mode: VgaMode::LinearSvga {
-                    w: self.svga_w, h: self.svga_h, bpp: self.svga_bpp, pitch: pitch as u16,
-                },
-                // Linear rows: the band maps straight to a byte span.
-                vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size,
-                    band.0 * pitch, (band.0 + band.1) * pitch),
-                planes: &[],
-                ac: &self.ac,
-                palette: &self.dac,
-                dac_mask: self.dac_mask,
-                font: &lib::vga_fonts::FONT_8X16,
-                blink: false,
-                cga_palette: [0; 4],
-                start_offset: 0,
-                pixel_pan: 0,
-                line_compare: usize::MAX,
-            });
-        }
-        let mode = self.classify_mode()?;
-        let (w, h) = lib::vga_render::dimensions(mode);
-        // Mode 13h's rows are linear but not contiguous: a panned display-start
-        // (screen-shake) slides the origin forward, and below Line Compare the
-        // latch resets to 0 — so walk the band's rows the way `row_origin`
-        // does and take the span they cover. The buffer stays a full 64 KB
-        // window, only the copy shrinks.
-        let m13_span = || {
-            let start = (((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize) * 4;
-            let pan = (self.ac[0x13] & 0x07) as usize;
-            let lc = self.line_compare(h);
-            let (mut lo, mut hi) = (usize::MAX, 0usize);
-            for r in band.0..band.0 + band.1 {
-                let base = if r >= lc { (r - lc) * w } else { start + r * w + pan };
-                lo = lo.min(base);
-                hi = hi.max(base + w);
-            }
-            if lo > hi { (0, 0) } else { (lo, hi) }
-        };
-        let (vram, planes): (&[u8], &[u8]) = match mode {
-            VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &self.planes),
-            VgaMode::Mode13h => {
-                let (lo, hi) = m13_span();
-                (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[])
-            }
-            // 4 KB and 16 KB apertures: banding them would buy back less than
-            // the per-row address arithmetic (CGA's two interleaved banks) costs.
-            VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2, 0, 80 * 25 * 2), &[]),
-            VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[]),
-            VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
-        };
-        // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
-        // line-compare (split-screen) apply to the planar families and to linear
-        // Mode 13h. The display-start latch is in word units for the planar
-        // modes (per-plane byte offset) but the address counter runs in
-        // doubleword mode under 13h, so each latch step is 4 linear pixels.
-        let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
-        let mode13 = matches!(mode, VgaMode::Mode13h);
-        let start_latch = ((self.crtc[0x0C] as usize) << 8) | self.crtc[0x0D] as usize;
-        // CGA palettes come from the Mode-Control/Colour-Select registers. The
-        // 640×200 2-colour mode's foreground is the Colour-Select low nibble
-        // (background black); the 320×200 4-colour set is the register-resolved
-        // palette. Other modes ignore this field.
-        let cga_palette = match mode {
-            VgaMode::Cga4 => lib::vga_render::cga4_palette(self.cga_mode_ctl, self.cga_color_select),
-            VgaMode::Cga2 => [0x000000, lib::vga_render::CGA16[(self.cga_color_select & 0x0F) as usize], 0, 0],
-            _ => [0; 4],
-        };
-        Some(Frame {
-            mode,
-            vram,
-            planes,
-            ac: &self.ac,
-            palette: &self.dac,
-            dac_mask: self.dac_mask,
+/// Build the displayed frame from the live registers + VRAM: resolve the
+/// mode, point at the video memory, and read the display-start / pixel pan /
+/// line-compare that select the visible window. Planar modes render our own
+/// `planes` in place (no copy); linear modes copy the `band` of their guest
+/// aperture the beam is about to paint into `scratch`. `None` for a mode the
+/// renderer doesn't draw.
+fn scanout<'a, A: crate::Arch>(
+    state: &'a VgaState, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
+    band: (usize, usize),
+) -> Option<::vga::Frame<'a>>
+{
+    use ::vga::{Frame, VgaMode};
+    // VESA SVGA: present the kernel-side linear framebuffer directly. The
+    // guest filled it through the banked 0xA0000 window; `display_tick`
+    // flushes the live window into `svga_fb` just before this call.
+    if state.svga_w != 0 {
+        let pitch = state.svga_pitch as usize;
+        let size = pitch * state.svga_h as usize;
+        return Some(Frame {
+            mode: VgaMode::LinearSvga {
+                w: state.svga_w, h: state.svga_h, bpp: state.svga_bpp, pitch: pitch as u16,
+            },
+            // Linear rows: the band maps straight to a byte span.
+            vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size,
+                band.0 * pitch, (band.0 + band.1) * pitch),
+            planes: &[],
+            ac: &state.ac,
+            palette: &state.dac,
+            dac_mask: state.dac_mask,
             font: &lib::vga_fonts::FONT_8X16,
-            blink: self.ac[0x10] & 0x08 != 0,
-            cga_palette,
-            start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
-            pixel_pan: if planar || mode13 { (self.ac[0x13] & 0x07) as usize } else { 0 },
-            line_compare: if planar || mode13 { self.line_compare(h) } else { usize::MAX },
-        })
+            blink: false,
+            cga_palette: [0; 4],
+            start_offset: 0,
+            pixel_pan: 0,
+            line_compare: usize::MAX,
+        });
     }
-
-    /// Resolve the renderable mode from the live registers — nothing else.
-    /// The substitute BIOS programs the canonical register file on every
-    /// mode set (`bios_mode_regs`), so `classify` always sees coherent
-    /// state: a BIOS-set mode reads back exactly as on real hardware, and a
-    /// tweaker's register writes (Doom's unchain, Jazz's wide-stride level,
-    /// Dyna Blaster's 256×232) land on top of that base.
-    fn classify_mode(&self) -> Option<lib::vga_render::VgaMode> {
-        use lib::vga_render;
-        let rregs = vga_render::Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
-        vga_render::classify(&rregs)
-    }
-
-    /// CRTC Line Compare (0x18 + overflow bits 8/9): the scanline where the
-    /// lower split-screen region restarts from address 0 (the locked status
-    /// panel). All-ones ⇒ no split; converted through the same max-scanline
-    /// divisor as mode height to match `h`.
-    fn line_compare(&self, h: usize) -> usize {
-        let lc = self.crtc[0x18] as usize
-            | (((self.crtc[7] >> 4) & 1) as usize) << 8
-            | (((self.crtc[9] >> 6) & 1) as usize) << 9;
-        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
-            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
-        let lc = lc / scan_div.max(1);
-        if lc < h { lc } else { usize::MAX }
-    }
+    let mode = state.classify_mode()?;
+    let (w, h) = ::vga::dimensions(mode);
+    // Mode 13h's rows are linear but not contiguous: a panned display-start
+    // (screen-shake) slides the origin forward, and below Line Compare the
+    // latch resets to 0 — so walk the band's rows the way `row_origin`
+    // does and take the span they cover. The buffer stays a full 64 KB
+    // window, only the copy shrinks.
+    let m13_span = || {
+        let start = (((state.crtc[0x0C] as usize) << 8) | state.crtc[0x0D] as usize) * 4;
+        let pan = (state.ac[0x13] & 0x07) as usize;
+        let lc = state.line_compare(h);
+        let (mut lo, mut hi) = (usize::MAX, 0usize);
+        for r in band.0..band.0 + band.1 {
+            let base = if r >= lc { (r - lc) * w } else { start + r * w + pan };
+            lo = lo.min(base);
+            hi = hi.max(base + w);
+        }
+        if lo > hi { (0, 0) } else { (lo, hi) }
+    };
+    let (vram, planes): (&[u8], &[u8]) = match mode {
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &state.planes),
+        VgaMode::Mode13h => {
+            let (lo, hi) = m13_span();
+            (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[])
+        }
+        // 4 KB and 16 KB apertures: banding them would buy back less than
+        // the per-row address arithmetic (CGA's two interleaved banks) costs.
+        VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2, 0, 80 * 25 * 2), &[]),
+        VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[]),
+        VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
+    };
+    // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
+    // line-compare (split-screen) apply to the planar families and to linear
+    // Mode 13h. The display-start latch is in word units for the planar
+    // modes (per-plane byte offset) but the address counter runs in
+    // doubleword mode under 13h, so each latch step is 4 linear pixels.
+    let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
+    let mode13 = matches!(mode, VgaMode::Mode13h);
+    let start_latch = ((state.crtc[0x0C] as usize) << 8) | state.crtc[0x0D] as usize;
+    // CGA palettes come from the Mode-Control/Colour-Select registers. The
+    // 640×200 2-colour mode's foreground is the Colour-Select low nibble
+    // (background black); the 320×200 4-colour set is the register-resolved
+    // palette. Other modes ignore this field.
+    let cga_palette = match mode {
+        VgaMode::Cga4 => ::vga::cga4_palette(state.cga_mode_ctl, state.cga_color_select),
+        VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select & 0x0F) as usize], 0, 0],
+        _ => [0; 4],
+    };
+    Some(Frame {
+        mode,
+        vram,
+        planes,
+        ac: &state.ac,
+        palette: &state.dac,
+        dac_mask: state.dac_mask,
+        font: &lib::vga_fonts::FONT_8X16,
+        blink: state.ac[0x10] & 0x08 != 0,
+        cga_palette,
+        start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
+        pixel_pan: if planar || mode13 { (state.ac[0x13] & 0x07) as usize } else { 0 },
+        line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
+    })
 }
 
 /// Whole-frame throttle for the hosted window sink, off the same tick clock
@@ -2749,7 +2024,7 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
 }
 
 pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
-    use lib::vga_render;
+    
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
@@ -2795,11 +2070,11 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                let full = (0, vga_render::dimensions(mode).1);
+                let full = (0, ::vga::dimensions(mode).1);
                 // The source aperture, registers and DAC are captured once for
                 // the whole shadow; no palette generation can split the image.
                 let Some(frame) =
-                    vga.scanout(machine, regs, &mut pc.present_scratch, full)
+                    scanout(vga, machine, regs, &mut pc.present_scratch, full)
                 else {
                     return;
                 };
@@ -2824,7 +2099,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
                         .expect("ready VGA shadow is missing");
                 if crate::kernel::osd::is_open() {
-                    let vga_w = vga_render::dimensions(mode).0;
+                    let vga_w = ::vga::dimensions(mode).0;
                     let format = sink.packed_format().expect("indexed sink reached packed OSD");
                     crate::kernel::osd::paint(
                         shadow,
@@ -2859,23 +2134,23 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     crate::kernel::startup::bill_present();
     let p0 = if prof { machine.rdtsc() } else { 0 };
     // Whole-frame sink: `render` walks every row, so capture the full frame.
-    let full = vga.current_mode().map_or((0, 0), |m| (0, vga_render::dimensions(m).1));
-    let Some(frame) = vga.scanout(machine, regs, &mut pc.present_scratch, full) else { return };
+    let full = vga.current_mode().map_or((0, 0), |m| (0, ::vga::dimensions(m).1));
+    let Some(frame) = scanout(vga, machine, regs, &mut pc.present_scratch, full) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
-    let (w, h) = vga_render::dimensions(frame.mode);
+    let (w, h) = ::vga::dimensions(frame.mode);
     let need = w * h;
     if pc.present_fb.len() < need {
         pc.present_fb.resize(need, 0);
     }
     let fb = &mut pc.present_fb[..need];
-    vga_render::render(&frame, fb);
+    ::vga::render(&frame, fb);
     if crate::kernel::osd::is_open() {
         // `render` writes native 0x00RRGGBB into a tightly-packed w×h buffer.
         let bytes = unsafe {
             core::slice::from_raw_parts_mut(fb.as_mut_ptr() as *mut u8, fb.len() * 4)
         };
         crate::kernel::osd::paint(
-            bytes, w * 4, w, h, w, vga_render::PixelFormat::NATIVE,
+            bytes, w * 4, w, h, w, ::vga::PixelFormat::NATIVE,
         );
     }
     let p2 = if prof { machine.rdtsc() } else { 0 };

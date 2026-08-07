@@ -1,22 +1,27 @@
-//! Reusable software-VGA framebuffer renderer.
+//! The VGA.
 //!
-//! Turns captured VGA state (DAC palette + video memory + mode) into a packed
-//! RGB framebuffer (`0x00RRGGBB` per pixel). It is **backend-agnostic** — no
-//! `std`, no host libraries — so exactly one renderer serves both the hosted
-//! window (the interpreter displaying an emulated VGA) and, later, a windowed-
-//! DOS compositor inside RetroOS-on-metal. This is the visual twin of the
-//! Sound Blaster's passthrough-vs-emulate split: real VGA when present, this
-//! software renderer when emulating or displaying in a window.
+//! Registers and what they mean (`Regs`, [`classify`], [`bios_mode_regs`]),
+//! the plane ALU the card runs on every CPU write to its aperture
+//! ([`planar_write`] / [`planar_read`]), how its memory is organised
+//! (chain-4, odd/even), its DAC, the state a card holds ([`VgaState`]), the
+//! port model that reads and writes that state, and the scanout that turns
+//! all of it into pixels.
 //!
-//! The caller (the kernel, which owns `VgaState` and can read guest memory)
-//! drives it; the backend only has to blit the returned pixels.
+//! Scanning out IS what a VGA does, so the renderer is not a separate thing
+//! from the card and does not live in a separate module. What a backend
+//! supplies is a framebuffer to blit into; everything above that line is
+//! here, which is why exactly one of these serves the hosted window, the
+//! metal framebuffer console, and the DOS machine's emulated card alike.
 //!
-//! Modes: mode 13h (linear 320×200×256) and text are implemented; planar
-//! EGA/VGA 16-colour and unchained mode X are TODO.
-//!
-//! The renderer is freestanding: it never allocates. The caller sizes a
-//! framebuffer (via [`dimensions`]) and passes it as `&mut [u32]`, so `lib` has
-//! no global-allocator dependency (the bootloader links `lib` without one).
+//! Passive: it never reaches. Reading a *guest's* memory needs an address
+//! space, which belongs to whoever has one — those functions stay in the
+//! kernel. This crate is `#![no_std]` but does allocate (256 KB of planes),
+//! which is why it is not part of `//lib`: the bootloader links that one
+//! without a global allocator, and it only ever wanted the text console.
+
+#![no_std]
+
+extern crate alloc;
 
 /// Which VGA mode the video memory is laid out for. The caller derives this from
 /// the CRTC/SEQ/GC registers (or the INT 10h mode set); only the renderable
@@ -1378,7 +1383,7 @@ pub fn overlay_text(
     let fgp = fmt.encode(fg);
     let bgp = fmt.encode(bg);
     let bytes = fmt.bytes_per_pixel as usize;
-    let font = &crate::vga_fonts::FONT_8X16;
+    let font = &lib::vga_fonts::FONT_8X16;
     for (i, &ch) in s.iter().enumerate() {
         let cx = x + i * OVERLAY_CELL_W;
         if cx + OVERLAY_CELL_W > w {
@@ -1414,7 +1419,7 @@ pub fn overlay_text_xscaled(
     let fgp = fmt.encode(fg);
     let bgp = fmt.encode(bg);
     let bytes = fmt.bytes_per_pixel as usize;
-    let font = &crate::vga_fonts::FONT_8X16;
+    let font = &lib::vga_fonts::FONT_8X16;
     for (i, &ch) in s.iter().enumerate() {
         let cx = x + i * OVERLAY_CELL_W;
         if cx + OVERLAY_CELL_W > logical_w {
@@ -1507,7 +1512,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -1564,7 +1569,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1586,7 +1591,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2,
         };
         let mut out = [0u32; 16];
@@ -1681,7 +1686,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1702,7 +1707,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
@@ -1721,7 +1726,7 @@ mod tests {
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
                 mode, vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
-                font: &crate::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+                font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
             };
             let (w, h) = dimensions(mode);
@@ -1739,5 +1744,410 @@ mod tests {
         let out32 = mk(VgaMode::LinearSvga { w: 2, h: 1, bpp: 32, pitch: 0 }, &px);
         assert_eq!(out32[0], 0x00332211);
         assert_eq!(out32[1], 0x00665544);
+    }
+}
+
+/// How pixels are encoded in a framebuffer sink.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormatSpec {
+    /// GOP, VESA true-colour LFBs and hosted memory.
+    Packed(PixelFormat),
+    /// A paletted surface whose palette belongs to the GUEST — a VBE 8bpp mode
+    /// it selected and whose DAC it loads, so the byte is an index into a table
+    /// only the guest knows. A mode-13 surface WE own is not this: we program
+    /// its DAC to a 3:3:2 ramp, which makes it `Packed(RGB332)`.
+    Indexed8,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeMode {
+    pub number: u16,
+    pub physical_base: u32,
+    pub width: u16,
+    pub height: u16,
+    pub pitch: u16,
+    pub bits_per_pixel: u8,
+    pub format: FormatSpec,
+    pub window_segment: u16,
+    pub window_granularity_kb: u16,
+    pub window_size_kb: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeBank {
+    pub current: u16,
+    pub window_segment: u16,
+    pub granularity_kb: u16,
+    pub window_size_kb: u16,
+}
+
+/// VGA Attribute Controller port (0x3C0) state. The hardware has two
+/// independent pieces of state, neither readable from any port:
+///   - `index`:        last byte written in index state. Includes the PAS bit
+///     (bit 5) which controls screen blanking. Persistent —
+///     subsequent data writes do not change it.
+///   - `pending_data`: flip-flop position. `false` = next 0x3C0 write is an
+///     index byte; `true` = next 0x3C0 write is its data.
+///     `inb(0x3DA)` clears `pending_data` (resets the flipflop to index state).
+#[derive(Clone, Copy)]
+pub struct AcState {
+    pub index: u8,
+    pub pending_data: bool,
+}
+
+impl AcState {
+    // PAS=1 (bit 5 of index) matches BIOS-default boot state where the
+    // display is enabled. The tracker is needed because the AC flip-flop
+    // can't be read from hardware. A `0` default is wrong: programs that
+    // never write AC (any program that sticks to text mode and DOS I/O)
+    // would have `vga_hw::save` write index=0 back to 0x3C0,
+    // clearing PAS and blanking the display. Default to `0x20` so the
+    // tracker matches HW from the moment the kernel boots.
+    pub const fn new() -> Self { Self { index: 0x20, pending_data: false } }
+}
+
+/// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
+/// Saved/restored on context switch so each process has its own screen.
+pub struct VgaState {
+    /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
+    pub planes: alloc::vec::Vec<u8>,
+    // ── Registers ──
+    pub misc_output: u8,
+    pub feature_ctl: u8,
+    /// CGA Mode-Control (0x3D8) and Colour-Select (0x3D9). The CGA renderer
+    /// resolves its 4-colour palette from these (palette 0/1, foreground
+    /// intensity, background/border colour); real-VGA passthrough honours them
+    /// in hardware, so they matter only on the emulated (UEFI/hosted) path.
+    pub cga_mode_ctl: u8,
+    pub cga_color_select: u8,
+    pub seq: [u8; 5],
+    pub crtc: [u8; 25],
+    pub gc: [u8; 9],
+    pub ac: [u8; 21],
+    pub dac: [u8; 768],
+    pub dac_mask: u8,
+    // ── Port index / state ──
+    pub seq_index: u8,
+    pub crtc_index: u8,
+    pub gc_index: u8,
+    /// AC port flip-flop + latched index. The real card's own copy is
+    /// tracked by `drivers::vga_hw`.
+    pub ac_state: AcState,
+    /// DAC pixel-address latch (single shared index for read & write)
+    pub dac_index: u8,
+    /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
+    pub dac_state: u8,
+    // ── Emulated-model DAC latches (absent-card port model only) ──
+    /// Real VGA keeps *separate* read and write indices; palette-cycling
+    /// effects read entries back, rotate, and rewrite them — Prince of
+    /// Persia's torch flames do exactly this, and a read answering 0xFF
+    /// turns every cycled entry permanent white. `dac_index` above stays
+    /// the write index (the save/restore contract); these carry the read
+    /// index and the per-entry R/G/B sub-positions.
+    pub dac_read_index: u8,
+    pub dac_rsub: u8,
+    pub dac_wsub: u8,
+    /// VGA read latches: the 4 plane bytes loaded by the most recent VRAM read
+    /// (one per plane). Write mode 1 (latched copy) writes these straight
+    /// through; write modes 0/2/3 ALU the new value against them. Only used on
+    /// the trapped planar write path (see `vram_write`/`vram_read`).
+    pub latches: [u8; 4],
+    // ── VESA SVGA (banked) ──
+    /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
+    /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
+    /// window is *aliased* onto its current bank (shared frames), so guest
+    /// writes land directly in it — no copy, always coherent.
+    pub svga_w: u16,
+    pub svga_h: u16,
+    pub svga_bpp: u8,
+    pub svga_pitch: u16,
+    /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
+    pub svga_bank: u16,
+    /// Descriptor captured from a native card at the OSD take boundary.
+    /// `None` for the substitute BIOS's synthetic SVGA modes.
+    pub detached_vbe: Option<DetachedVbe>,
+    /// This address space's A0000 window is mapped as the planar trap
+    /// (present=0 + MMIO marker), so kernel-side writes must route through
+    /// `vram_write` instead of raw guest-memory stores.
+    pub a0000_trapped: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct DetachedVbe {
+    pub mode: VbeMode,
+    pub bank: Option<VbeBank>,
+}
+
+impl Default for VgaState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VgaState {
+    /// Allocate and initialize the register file in its final heap location.
+    /// `VgaState::new()` is almost 1 KiB (chiefly the DAC); embedding that call
+    /// in `PcMachine::new_boxed` made rustc materialize a temporary on the
+    /// already-deep fork/exec kernel stack before copying it into the box.
+    pub fn new_boxed() -> alloc::boxed::Box<Self> {
+        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
+        let p = boxed.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*p).planes).write(alloc::vec::Vec::new());
+            core::ptr::addr_of_mut!((*p).misc_output).write(0);
+            core::ptr::addr_of_mut!((*p).feature_ctl).write(0);
+            core::ptr::addr_of_mut!((*p).cga_mode_ctl).write(0);
+            core::ptr::addr_of_mut!((*p).cga_color_select).write(0);
+            core::ptr::addr_of_mut!((*p).seq).write([0; 5]);
+            core::ptr::addr_of_mut!((*p).crtc).write([0; 25]);
+            let mut gc = [0; 9];
+            gc[8] = 0xFF;
+            core::ptr::addr_of_mut!((*p).gc).write(gc);
+            let mut ac = [0; 21];
+            ac[0x10] = 0x08;
+            core::ptr::addr_of_mut!((*p).ac).write(ac);
+            let dac = core::ptr::addr_of_mut!((*p).dac);
+            core::ptr::write_bytes(dac.cast::<u8>(), 0, 768);
+            core::ptr::addr_of_mut!((*p).dac_mask).write(0xFF);
+            core::ptr::addr_of_mut!((*p).seq_index).write(0);
+            core::ptr::addr_of_mut!((*p).crtc_index).write(0);
+            core::ptr::addr_of_mut!((*p).gc_index).write(0);
+            core::ptr::addr_of_mut!((*p).ac_state).write(AcState::new());
+            core::ptr::addr_of_mut!((*p).dac_index).write(0);
+            core::ptr::addr_of_mut!((*p).dac_state).write(0);
+            core::ptr::addr_of_mut!((*p).dac_read_index).write(0);
+            core::ptr::addr_of_mut!((*p).dac_rsub).write(0);
+            core::ptr::addr_of_mut!((*p).dac_wsub).write(0);
+            core::ptr::addr_of_mut!((*p).latches).write([0; 4]);
+            core::ptr::addr_of_mut!((*p).svga_w).write(0);
+            core::ptr::addr_of_mut!((*p).svga_h).write(0);
+            core::ptr::addr_of_mut!((*p).svga_bpp).write(0);
+            core::ptr::addr_of_mut!((*p).svga_pitch).write(0);
+            core::ptr::addr_of_mut!((*p).svga_bank).write(0);
+            core::ptr::addr_of_mut!((*p).detached_vbe).write(None);
+            core::ptr::addr_of_mut!((*p).a0000_trapped).write(false);
+            let mut boxed = boxed.assume_init();
+            fill_fallback_palette(&mut boxed.dac);
+            boxed
+        }
+    }
+
+    pub fn new() -> Self {
+        Self {
+            planes: alloc::vec::Vec::new(),
+            // EGA/text DAC defaults so the emulated model renders text in
+            // colour even though text-mode programs never program the DAC
+            // (mode 13h loads overwrite these). Harmless for the metal
+            // snapshot use: vga_hw::restore no-ops until a real save
+            // fills `planes`, which also rewrites the whole DAC.
+            misc_output: 0,
+            feature_ctl: 0,
+            cga_mode_ctl: 0,
+            cga_color_select: 0,
+            seq: [0; 5],
+            crtc: [0; 25],
+            // GC Bit Mask (index 8) resets to 0xFF — every CPU-data bit passes
+            // through; BIOS mode-set leaves it so and Mode X / EGA writes rely
+            // on it. Defaulting it to 0 masked every planar write to the latch.
+            gc: { let mut g = [0u8; 9]; g[8] = 0xFF; g },
+            // AC mode-control (reg 0x10) bit 3 set: blink semantics for
+            // attribute bit 7, the BIOS mode-3 power-on default. TUIs that
+            // want 16 background colors clear it (INT 10h AX=1003 BL=0 or a
+            // direct AC write — both land here); DN's dark-grey panels
+            // (bg=8) rendered black until this was modeled.
+            ac: { let mut a = [0u8; 21]; a[0x10] = 0x08; a },
+            dac: fallback_palette(),
+            dac_mask: 0xFF,
+            seq_index: 0,
+            crtc_index: 0,
+            gc_index: 0,
+            ac_state: AcState::new(),
+            dac_index: 0,
+            dac_state: 0,
+            dac_read_index: 0,
+            dac_rsub: 0,
+            dac_wsub: 0,
+            latches: [0; 4],
+            svga_w: 0,
+            svga_h: 0,
+            svga_bpp: 0,
+            svga_pitch: 0,
+            svga_bank: 0,
+            detached_vbe: None,
+            a0000_trapped: false,
+        }
+    }
+
+    /// Emulated register-file write — the absent-card half of the VGA
+    /// passthrough-vs-emulate split (`BiosVga::emulated`).
+    /// This per-thread struct IS the hardware then: `emulate_outb` routes the
+    /// 3Cx/3Dx window here instead of to real ports, and save/restore on
+    /// context switch becomes a no-op because the state never leaves the
+    /// struct. Index/data pairs land in the same arrays the metal
+    /// save/restore fills, so every consumer (renderer, mode queries) reads
+    /// one representation.
+    pub fn port_write(&mut self, port: u16, v: u8) {
+        match port {
+            0x3C0 => {
+                if !self.ac_state.pending_data {
+                    self.ac_state.index = v;
+                } else {
+                    let i = (self.ac_state.index & 0x1F) as usize;
+                    if i < 21 {
+                        self.ac[i] = v;
+                    }
+                }
+                self.ac_state.pending_data = !self.ac_state.pending_data;
+            }
+            0x3C2 => self.misc_output = v,
+            0x3C4 => self.seq_index = v,
+            0x3C5 => {
+                let i = (self.seq_index & 0x1F) as usize;
+                if i < 5 {
+                    self.seq[i] = v;
+                }
+            }
+            0x3C6 => self.dac_mask = v,
+            0x3C7 => {
+                self.dac_read_index = v;
+                self.dac_rsub = 0;
+                self.dac_state = 0x03;
+            }
+            0x3C8 => {
+                self.dac_index = v;
+                self.dac_wsub = 0;
+                self.dac_state = 0x00;
+            }
+            0x3C9 => {
+                let i = self.dac_index as usize * 3 + self.dac_wsub as usize;
+                self.dac[i] = v & 0x3F;
+                self.dac_wsub += 1;
+                if self.dac_wsub == 3 {
+                    self.dac_wsub = 0;
+                    self.dac_index = self.dac_index.wrapping_add(1);
+                }
+            }
+            0x3CE => self.gc_index = v,
+            0x3CF => {
+                let i = (self.gc_index & 0x0F) as usize;
+                if i < 9 {
+                    self.gc[i] = v;
+                }
+            }
+            0x3D4 => self.crtc_index = v,
+            0x3D5 => {
+                let i = self.crtc_index as usize;
+                if i >= 25 {
+                    return;
+                }
+                // CRTC write protect (index 11h bit 7, which every BIOS mode set
+                // leaves SET): indices 00h-07h are read-only while it holds. The
+                // one documented exception is the Line Compare bit 8 in the
+                // Overflow register, which the hardware latches regardless.
+                //
+                // Load-bearing for tweaked modes that poke the Overflow register
+                // to move the split screen: Operation Wolf's intro writes
+                // index 07h = 01h, which — applied in full — would clear bit 8 of
+                // Vertical Display End and shrink the visible area from 400
+                // scanlines to 144 (200 rows to 72), cutting off everything below
+                // the split. Real hardware ignores that write; only the split
+                // moves.
+                if i <= 0x07 && self.crtc[0x11] & 0x80 != 0 {
+                    if i == 0x07 {
+                        self.crtc[0x07] = (self.crtc[0x07] & !0x10) | (v & 0x10);
+                    }
+                    return;
+                }
+                self.crtc[i] = v;
+            }
+            0x3D8 => self.cga_mode_ctl = v,     // CGA Mode Control
+            0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
+            0x3DA => self.feature_ctl = v, // FCR write port (colour)
+            _ => {}
+        }
+    }
+
+    /// Emulated register-file read (see `port_write`). 0x3DA (status + AC
+    /// flip-flop reset) stays in `emulate_inb`, which fabricates the retrace
+    /// bits for emulated and QEMU cards alike.
+    pub fn port_read(&mut self, port: u16) -> u8 {
+        match port {
+            0x3C0 => self.ac_state.index,
+            0x3C1 => {
+                let i = (self.ac_state.index & 0x1F) as usize;
+                if i < 21 { self.ac[i] } else { 0 }
+            }
+            0x3C2 => 0, // input status 0: no interrupt pending, monitor present
+            0x3C4 => self.seq_index,
+            0x3C5 => {
+                let i = (self.seq_index & 0x1F) as usize;
+                if i < 5 { self.seq[i] } else { 0 }
+            }
+            0x3C6 => self.dac_mask,
+            0x3C7 => self.dac_state,
+            0x3C8 => self.dac_index,
+            0x3C9 => {
+                let v = self.dac[self.dac_read_index as usize * 3 + self.dac_rsub as usize];
+                self.dac_rsub += 1;
+                if self.dac_rsub == 3 {
+                    self.dac_rsub = 0;
+                    self.dac_read_index = self.dac_read_index.wrapping_add(1);
+                }
+                v
+            }
+            0x3CA => self.feature_ctl,
+            0x3CC => self.misc_output,
+            0x3CE => self.gc_index,
+            0x3CF => {
+                let i = (self.gc_index & 0x0F) as usize;
+                if i < 9 { self.gc[i] } else { 0 }
+            }
+            0x3D4 => self.crtc_index,
+            0x3D5 => {
+                let i = self.crtc_index as usize;
+                if i < 25 { self.crtc[i] } else { 0 }
+            }
+            _ => 0xFF,
+        }
+    }
+
+    /// The mode the beam is about to scan, from the registers ALONE — no VRAM
+    /// is read. Lets the caller size the band before the snapshot that band
+    /// determines.
+    pub fn current_mode(&self) -> Option<VgaMode> {
+        if self.svga_w != 0 {
+            return Some(VgaMode::LinearSvga {
+                w: self.svga_w,
+                h: self.svga_h,
+                bpp: self.svga_bpp,
+                pitch: self.svga_pitch,
+            });
+        }
+        self.classify_mode()
+    }
+
+    /// Resolve the renderable mode from the live registers — nothing else.
+    /// The substitute BIOS programs the canonical register file on every
+    /// mode set (`bios_mode_regs`), so `classify` always sees coherent
+    /// state: a BIOS-set mode reads back exactly as on real hardware, and a
+    /// tweaker's register writes (Doom's unchain, Jazz's wide-stride level,
+    /// Dyna Blaster's 256×232) land on top of that base.
+    pub fn classify_mode(&self) -> Option<VgaMode> {
+                let rregs = Regs { crtc: self.crtc, seq: self.seq, gc: self.gc, misc: self.misc_output };
+        classify(&rregs)
+    }
+
+    /// CRTC Line Compare (0x18 + overflow bits 8/9): the scanline where the
+    /// lower split-screen region restarts from address 0 (the locked status
+    /// panel). All-ones ⇒ no split; converted through the same max-scanline
+    /// divisor as mode height to match `h`.
+    pub fn line_compare(&self, h: usize) -> usize {
+        let lc = self.crtc[0x18] as usize
+            | (((self.crtc[7] >> 4) & 1) as usize) << 8
+            | (((self.crtc[9] >> 6) & 1) as usize) << 9;
+        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
+            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let lc = lc / scan_div.max(1);
+        if lc < h { lc } else { usize::MAX }
     }
 }

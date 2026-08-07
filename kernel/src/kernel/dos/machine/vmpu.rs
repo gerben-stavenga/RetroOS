@@ -4,10 +4,10 @@
 //! wire (UART mode at `P<port>`, 0x330 by convention) and
 //! [`sound::midi::Synth`] is the sound generator. The instruments are NOT
 //! this device's problem: a GM device is a ROM-bank instrument, and the ROM
-//! is burned once at boot by the kernel (`kernel::midi_bank`) — the synth
-//! here just references it, fully resident from its first byte. A boot with
-//! no bank leaves the port present and the device silent, like a module
-//! with its ROM socket empty.
+//! is burned once at boot by whoever owns boot assets and handed to this
+//! device with the rest of its wiring — the synth here just references it,
+//! fully resident from its first byte. A boot with no bank leaves the port
+//! present and the device silent, like a module with its ROM socket empty.
 
 use super::*;
 
@@ -21,6 +21,12 @@ pub struct Mpu {
     /// state; a program that never opens the port pays nothing. Instruments
     /// come from the boot ROM by reference.
     synth: Option<alloc::boxed::Box<sound::midi::Synth>>,
+    /// The ROM in the socket, handed in with the rest of this program's
+    /// wiring (see [`Mpu::configure_from_env`]). A device does not go
+    /// looking for its own ROM: the bank is burned once at boot by whoever
+    /// owns boot assets, and arrives here as a value like the port number
+    /// does. `None` is an empty socket — the port still answers, silently.
+    bank: Option<&'static sound::midi::Bank>,
 }
 
 impl Mpu {
@@ -30,6 +36,7 @@ impl Mpu {
             base: 0x330,
             card: sound::mpu401::Mpu401::new(0x330),
             synth: None,
+            bank: None,
         }
     }
 
@@ -48,7 +55,8 @@ impl Mpu {
 
     /// Apply the guest's environment: the MPU port comes from `BLASTER`'s
     /// `P<port>` token (our CONFIG.SYS ships `P330`).
-    pub fn configure_from_env(&mut self, env: &[u8]) {
+    pub fn configure_from_env(&mut self, env: &[u8], bank: Option<&'static sound::midi::Bank>) {
+        self.bank = bank;
         let Some(blaster) = env_var(env, b"BLASTER") else { return };
         for tok in blaster.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
             if tok[0].eq_ignore_ascii_case(&b'P')
@@ -96,7 +104,7 @@ impl Mpu {
             if !self.card.in_uart() {
                 return;
             }
-            let Some(bank) = crate::kernel::midi_bank::get() else { return };
+            let Some(bank) = self.bank else { return };
             let mut s = sound::midi::Synth::new_boxed(bank);
             s.init();
             self.synth = Some(s);

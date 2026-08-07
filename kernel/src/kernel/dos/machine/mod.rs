@@ -543,7 +543,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
                 dev.state.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
-            unsafe { VGA_AC_STATE.pending_data = false; }
+            crate::kernel::drivers::vga_hw::track_ac_reset();
             machine.inb(0x3DA)
         }
         // VGA ports — pass through to hardware, or the emulated register file
@@ -654,12 +654,9 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 dev.state.port_write(port, val);
                 return;
             }
-            unsafe {
-                if !VGA_AC_STATE.pending_data { // native card: track the flip-flop here
-                    VGA_AC_STATE.index = val; // index write — latch full byte (incl. PAS)
-                }
-                VGA_AC_STATE.pending_data = !VGA_AC_STATE.pending_data;
-            }
+            // Native card: the flip-flop and index are write-only in the
+            // silicon, so the card's own driver tracks them.
+            crate::kernel::drivers::vga_hw::track_ac_write(val);
             machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
@@ -696,7 +693,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 // SB has no host line — its IRQ is purely virtual — so there is
                 // nothing to rearm there (`feedback_no_half_modelled_devices`).
                 let guest_irq = pc.sb.blaster.irq;
-                if retired_irq == guest_irq && let SbDevice::Native(pt) = &pc.sb.device {
+                if retired_irq == guest_irq && let SbDevice::Native { pt, .. } = &pc.sb.device {
                     machine.rearm_irq(pt.card.irq);
                 }
             }
@@ -1129,7 +1126,7 @@ pub fn audio_tick<A: crate::Arch>(
     let sb_irq = blaster.irq;
     let mut sb = match device {
         SbDevice::Emulated(emu) => Some(&mut **emu),
-        SbDevice::Native(_) => None,
+        SbDevice::Native { .. } => None,
     };
     if let Some(emu) = sb.as_deref_mut() {
         let _ = emu.take_restart();
@@ -1184,7 +1181,7 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
         }
         Irq::Hw(line) => {
             // Only the card this guest actually holds has a line to relay.
-            let SbDevice::Native(pt) = &pc.sb.device else { return };
+            let SbDevice::Native { pt, .. } = &pc.sb.device else { return };
             if line != pt.card.irq {
                 return;
             }

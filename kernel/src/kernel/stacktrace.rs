@@ -137,7 +137,7 @@ pub fn stack_trace(out: &mut dyn Write) {
 ///   - Ring 0 (arch self-reentry): rbp is mid-asm garbage — stop.
 ///   - Ring 3 / VM86 (user): rbp points into untrusted user memory — stop.
 pub fn stack_trace_regs(regs: &crate::Regs) {
-    let mut out = lib::vga::DebugCon;
+    let mut out = lib::log::DebugCon;
     let _ = writeln!(out, "Stack trace:");
     print_frame(&mut out, 0, regs.ip());
     if (regs.frame.cs & 3) == 1 {

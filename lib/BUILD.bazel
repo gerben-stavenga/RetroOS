@@ -17,13 +17,32 @@ rust_library(
 )
 
 rust_test(
-    name = "vga_render_test",
-    srcs = ["tests/vga_render.rs"],
-    crate_name = "vga_render_test",
+    name = "vga_test",
+    srcs = ["tests/vga.rs"],
+    crate_name = "vga_test",
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
         "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [":lib", ":vga"],
+)
+
+# The VGA: registers, plane ALU, DAC, card state, port model and scanout.
+# Its own target rather than part of :lib because it allocates — and it can
+# be, because nothing outside the kernel wants a VGA. The bootloader and the
+# arch backends link :lib for the text console (:lib stays allocation-free);
+# only the kernel links this.
+rust_library(
+    name = "vga",
+    srcs = glob(["vga/src/**/*.rs"]),
+    crate_name = "vga",
+    crate_root = "vga/src/lib.rs",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     deps = [":lib"],

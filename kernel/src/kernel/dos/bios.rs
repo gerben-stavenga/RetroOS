@@ -627,6 +627,86 @@ fn is_text_mode(mode: u8) -> bool {
 /// Linear address of one text cell. A page is 0x1000 bytes in the 80-column
 /// modes and 0x800 in the 40-column ones, which the BDA's column count
 /// decides — the same rule a real BIOS applies.
+/// DOS teletype: write `ch` at the BDA cursor and advance it.
+///
+/// The one implementation, shared by INT 10h AH=0Eh and the INT 21h character
+/// output calls. There used to be a second one: INT 21h borrowed the *kernel's*
+/// terminal (`lib::term`) for its cursor and scroll, then wrote the result back
+/// to the BDA so the two agreed. That handshake was the tell — a DOS program has
+/// no console to borrow, it owns the display, and its cursor is the BDA's. Going
+/// through the machine also means this works on every backend, where the kernel
+/// terminal wrote to a host pointer that hosted had to fake.
+///
+/// `fg` is the foreground colour for graphics modes (INT 10h takes it in BL);
+/// text modes write the character byte at the cursor cell.
+///
+/// Past the bottom row a text page scrolls, as a real BIOS teletype does —
+/// INT 21h output relied on this when it went through the kernel terminal, and
+/// COMMAND.COM output longer than a screen depends on it. Graphics modes still
+/// clamp: there is no cheap cell-wise scroll there and the C BIOS left it to
+/// direct writers.
+pub(super) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, ch: u8, fg: u8) {
+    let page: u8 = bda_field!(machine, active_page);
+    let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
+    let pos: u16 = machine.read(bda(pos_off));
+    let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
+    let cols: u16 = bda_field!(machine, columns);
+    let mode: u8 = bda_field!(machine, video_mode);
+    match ch {
+        b'\r' => col = 0,
+        b'\n' => row += 1,
+        0x08 => col = col.saturating_sub(1),
+        _ => {
+            // Graphics modes have no text cell: rasterize the glyph into the
+            // framebuffer. Text modes write the char byte at the cursor cell.
+            if !super::machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, col, row, fg) {
+                let at = text_cell(machine, page, row, col);
+                machine.write::<u8>(at, ch);
+            }
+            col += 1;
+            if col >= cols as u32 {
+                col = 0;
+                row += 1;
+            }
+        }
+    }
+    let max_row: u8 = bda_field!(machine, rows_minus1);
+    if row > max_row as u32 {
+        scroll_text_page(machine, page, cols, max_row);
+        row = max_row as u32;
+    }
+    machine.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
+    // Keep the CRTC hardware cursor in step, so `vga_hw::save` captures it.
+    let offset = (row * cols as u32 + col) as u16;
+    machine.outb(0x3D4, 0x0E); machine.outb(0x3D5, (offset >> 8) as u8);
+    machine.outb(0x3D4, 0x0F); machine.outb(0x3D5, offset as u8);
+}
+
+/// Scroll a text page up one line, blanking the last. A no-op in a graphics
+/// mode, where there are no character cells to move.
+fn scroll_text_page<A: crate::Arch>(machine: &mut A, page: u8, cols: u16, max_row: u8) {
+    let mode: u8 = bda_field!(machine, video_mode);
+    if !is_text_mode(mode) {
+        return;
+    }
+    let cols = cols as usize;
+    let rows = max_row as usize + 1;
+    let base = text_cell(machine, page, 0, 0);
+    // Move rows 1..rows up one, then blank the last with the current attribute.
+    for r in 1..rows {
+        for c in 0..cols {
+            let v: u16 = machine.read(base + (r * cols + c) * 2);
+            machine.write::<u16>(base + ((r - 1) * cols + c) * 2, v);
+        }
+    }
+    // Blank with the attribute the vacated line already carried, so a coloured
+    // screen scrolls in its own colour rather than reverting to grey-on-black.
+    let attr = machine.read::<u16>(base + ((rows - 1) * cols) * 2) & 0xFF00;
+    for c in 0..cols {
+        machine.write::<u16>(base + ((rows - 1) * cols + c) * 2, attr | b' ' as u16);
+    }
+}
+
 fn text_cell<A: crate::Arch>(machine: &mut A, page: u8, row: u32, col: u32) -> usize {
     let cols: u16 = bda_field!(machine, columns);
     let page_size = if cols > 40 { 0x1000 } else { 0x800 };
@@ -846,38 +926,8 @@ fn int10<A: crate::Arch>(
             emulate_outb(machine, &mut dos.pc, regs, 0x3D9, new);
         }
         0x0E => {
-            // Teletype output: write at cursor, advance. (Scroll is handled
-            // by direct writers, matching the C BIOS.)
-            let ch = (ax & 0xFF) as u8;
-            let page: u8 = bda_field!(machine, active_page);
-            let pos_off = core::mem::offset_of!(Bda, cursor_pos) + (page & 7) as usize * 2;
-            let pos: u16 = machine.read(bda(pos_off));
-            let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
-            let cols: u16 = bda_field!(machine, columns);
-            let mode: u8 = bda_field!(machine, video_mode);
-            match ch {
-                b'\r' => col = 0,
-                b'\n' => row += 1,
-                0x08 => col = col.saturating_sub(1),
-                _ => {
-                    // Graphics modes have no text cell: rasterize the glyph into
-                    // the framebuffer (BL = foreground colour). Text modes write
-                    // the char byte at the cursor cell as before.
-                    let fg = regs.rbx as u8;
-                    if !super::machine::vga::bios_draw_glyph(machine, &mut dos.pc.vga, mode, ch, col, row, fg) {
-                        let at = text_cell(machine, page, row, col);
-                        machine.write::<u8>(at, ch);
-                    }
-                    col += 1;
-                    if col >= cols as u32 {
-                        col = 0;
-                        row += 1;
-                    }
-                }
-            }
-            let max_row: u8 = bda_field!(machine, rows_minus1);
-            row = row.min(max_row as u32);
-            machine.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
+            // Teletype output: DOS's own, on DOS's own cursor.
+            teletype(machine, dos, (ax & 0xFF) as u8, regs.rbx as u8);
         }
         0x0F => {
             // Get video mode: AL=mode, AH=columns, BH=page.

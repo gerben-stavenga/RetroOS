@@ -5,6 +5,6 @@ pub mod heap;
 pub mod md5;
 pub mod tar;
 pub mod pipe;
-pub mod vga;
+pub mod log;
+pub mod term;
 pub mod vga_fonts;
-pub mod vga_render;

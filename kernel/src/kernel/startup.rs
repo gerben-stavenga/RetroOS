@@ -9,7 +9,7 @@ use crate::kernel::thread;
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut screen: crate::vga::Screen) -> ! {
+pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut screen: crate::term::Screen) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -1231,10 +1231,10 @@ static mut PRESENTS: u64 = 0;
 /// shadow or one whole window-sink frame per bill), VGA render cycles, final
 /// framebuffer/window publication cycles, and destination pixels written.
 static mut DISP_PARTS: [u64; 5] = [0; 5];
-static mut DISP_MODE: lib::vga_render::VgaMode = lib::vga_render::VgaMode::Text80x25;
+static mut DISP_MODE: vga::VgaMode = vga::VgaMode::Text80x25;
 
 pub fn bill_display(
-    mode: lib::vga_render::VgaMode,
+    mode: vga::VgaMode,
     scanout: u64,
     renders: u64,
     render: u64,

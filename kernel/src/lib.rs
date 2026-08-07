@@ -42,10 +42,10 @@ pub mod kernel;
 pub use kernel::dos;
 pub use kernel::thread;
 
-// The text console lives in the kernel (it crosses the arch boundary for the
-// 0xE9 debug port); `print!`/`println!`/`dbg_*!` are defined there (macro_export
-// puts them at the crate root, so `crate::println!` keeps working).
-pub mod vga;
+// The terminal's framebuffer scanout lives in the kernel tree; re-exported here
+// because `kernel/src/arch/` sits outside that tree and reaches it as
+// `crate::term` (fbcon.rs attaches the framebuffer).
+pub use kernel::term;
 // The console macros live in `lib`; re-exporting them at the crate root makes
 // both bare `println!` (crate-wide, via this 2018 path import) and the explicit
 // `crate::println!` / `crate::dbg_println!` paths the kernel uses resolve.
@@ -70,7 +70,7 @@ pub use kernel::net::{install_socket_backend, socket_backend_installed, SocketHo
 /// framebuffer content itself is unused. Backend-agnostic.
 pub fn host_console_init() {
     let fb = alloc::boxed::Box::leak(alloc::vec![0u16; 80 * 25].into_boxed_slice());
-    vga::vga().base = fb.as_mut_ptr() as usize;
+    lib::term::term().base = fb.as_mut_ptr() as usize;
 }
 
 /// Hosted: run a 32-bit Linux ELF (already read into `data`) through the real

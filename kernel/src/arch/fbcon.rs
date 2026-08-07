@@ -14,7 +14,7 @@
 //! above notices nothing either way.
 
 use arch::paging2::{self, PAGE_SIZE};
-use lib::vga_render::PixelFormat;
+use vga::PixelFormat;
 
 /// Framebuffer geometry, set once by `init` (None until then / on legacy VGA).
 struct Geom {
@@ -109,7 +109,7 @@ pub fn early(info: &arch::MultibootInfo) -> bool {
 const FB_TYPE_RGB: u8 = 1;
 const FB_TYPE_EGA_TEXT: u8 = 2;
 
-pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
+pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Screen) {
     // No framebuffer offered at all (our own legacy bootloader), or the loader
     // honoured the header's EGA-text request (GRUB on a legacy BIOS, which
     // reports type 2 with addr 0xB8000). Either way the card owns the panel and
@@ -267,7 +267,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::vga::Screen) {
     // From here on the linear framebuffer is simply the emulated VGA's sink.
     // Kernel text output keeps using the same B8000 cells and VGA interface.
     let g = (*geom()).as_ref().unwrap();
-    crate::vga::attach_framebuffer(
+    crate::term::attach_framebuffer(
         crate::kernel::display::Framebuffer {
             va: g.va,
             pitch: g.pitch,

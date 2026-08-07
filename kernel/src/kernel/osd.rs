@@ -21,7 +21,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
-use lib::vga_render::{self, PixelFormat};
+use vga::{self, PixelFormat};
 
 use crate::Regs;
 use crate::kernel::thread;
@@ -411,8 +411,8 @@ const FOOT_FG: u32 = 0x0078_88A0;
 
 const COLS: usize = 30;
 const PAD: usize = 8;
-const CELL_W: usize = vga_render::OVERLAY_CELL_W;
-const CELL_H: usize = vga_render::OVERLAY_CELL_H;
+const CELL_W: usize = vga::OVERLAY_CELL_W;
+const CELL_H: usize = vga::OVERLAY_CELL_H;
 
 /// Composite the panel onto a finished frame. X coordinates are laid out in
 /// `logical_w` VGA-source pixels and projected into the `w`-pixel packed
@@ -442,10 +442,10 @@ pub fn paint(
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga_render::overlay_fill_xscaled(
+    vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga_render::overlay_fill_xscaled(
+    vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
     );
 
@@ -454,7 +454,7 @@ pub fn paint(
     let mut title = Line::new();
     title.put(b"RetroOS Monitor  ");
     title.put(active_tab_name(tab));
-    vga_render::overlay_text_xscaled(
+    vga::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
         title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
@@ -469,19 +469,19 @@ pub fn paint(
         item_line(tab, item, &mut line);
         let selected = item == sel;
         if selected {
-            vga_render::overlay_fill_xscaled(
+            vga::overlay_fill_xscaled(
                 out, stride, w, h, logical_w, x0 + PAD / 2, ty,
                 panel_w - PAD, CELL_H, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-        vga_render::overlay_text_xscaled(
+        vga::overlay_text_xscaled(
             out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
         );
         ty += CELL_H;
     }
 
-    vga_render::overlay_text_xscaled(
+    vga::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
         b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
@@ -507,12 +507,12 @@ fn paint_tabs(
         let selected = tab == active;
         let label_w = label.len() * CELL_W + CELL_W;
         if selected {
-            vga_render::overlay_fill_xscaled(
+            vga::overlay_fill_xscaled(
                 out, stride, w, h, logical_w, x, ty, label_w, CELL_H, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-        vga_render::overlay_text_xscaled(
+        vga::overlay_text_xscaled(
             out, stride, w, h, logical_w, x + CELL_W / 2, ty, label, fg, bg, fmt,
         );
         x += label_w + CELL_W;
@@ -538,16 +538,16 @@ fn paint_picker(
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga_render::overlay_fill_xscaled(
+    vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga_render::overlay_fill_xscaled(
+    vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
     );
 
     let tx = x0 + PAD;
     let mut ty = y0 + PAD;
-    vga_render::overlay_text_xscaled(
+    vga::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
         b"Switch to task", TITLE_FG, TITLE_BG, fmt,
     );
@@ -555,7 +555,7 @@ fn paint_picker(
 
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
-        vga_render::overlay_text_xscaled(
+        vga::overlay_text_xscaled(
             out, stride, w, h, logical_w, tx, ty,
             b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
         );
@@ -566,20 +566,20 @@ fn paint_picker(
             proc_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
-                vga_render::overlay_fill_xscaled(
+                vga::overlay_fill_xscaled(
                     out, stride, w, h, logical_w, x0 + PAD / 2, ty,
                     panel_w - PAD, CELL_H, SEL_BG, fmt,
                 );
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-            vga_render::overlay_text_xscaled(
+            vga::overlay_text_xscaled(
                 out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
             );
             ty += CELL_H;
         }
     }
 
-    vga_render::overlay_text_xscaled(
+    vga::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
         b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
     );

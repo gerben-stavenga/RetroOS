@@ -885,7 +885,7 @@ pub fn exit_thread<A: crate::Arch>(
     {
         let thread = &mut threads[tid];
         // Snapshot the dying thread's screen NOW — `arch_user_clean` below
-        // unmaps 0xA0000, after which save_from_hardware would fault. The
+        // unmaps 0xA0000, after which vga_hw::save would fault. The
         // snapshot stays in the zombie's slot until the parent either
         // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
         if tid == crate::kernel::focus::focused() {

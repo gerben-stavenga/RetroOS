@@ -10,7 +10,6 @@
 extern crate alloc;
 
 use crate::kernel::thread;
-use crate::vga;
 use crate::Regs;
 
 use super::{
@@ -228,7 +227,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
         // INT 29h — DOS FAST_CON_OUT: AL = char to display. Route through
         // the normal console path so VGA and debugcon stay in sync.
         0x29 => {
-            let ch = regs.rax as u8; dos_putchar(machine, ch);
+            let ch = regs.rax as u8; dos_putchar(machine, dos, ch);
             thread::KernelAction::Done
         }
         0x2E => int_2eh(machine, kt, dos, regs),
@@ -693,7 +692,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             // handler we don't chase the screen license up the (now
             // irrelevant) call chain — build a writer and render the
             // farewell over whatever the program left on screen.
-            let mut screen = crate::vga::Screen::new();
+            let mut screen = crate::term::Screen::new();
             screen.clear();
             crate::screenln!(screen, "It is now safe to turn off your computer.");
             if crate::kernel::platform::get().host == crate::kernel::platform::Host::Metal {
@@ -780,15 +779,15 @@ fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_cha
                 0x0D => {
                     machine.write::<u8>((buf_lin + 1) as usize, count);
                     machine.write::<u8>((buf_lin + 2 + count as u32) as usize, 0x0D);
-                    dos_putchar(machine, 0x0D);
-                    dos_putchar(machine, 0x0A);
+                    dos_putchar(machine, dos, 0x0D);
+                    dos_putchar(machine, dos, 0x0A);
                     None
                 }
                 0x08 => {
                     if count > 0 {
-                        dos_putchar(machine, 0x08);
-                        dos_putchar(machine, b' ');
-                        dos_putchar(machine, 0x08);
+                        dos_putchar(machine, dos, 0x08);
+                        dos_putchar(machine, dos, b' ');
+                        dos_putchar(machine, dos, 0x08);
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count - 1))
                     } else {
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count))
@@ -797,10 +796,10 @@ fn buffered_input_resume<A: crate::Arch>(_machine: &mut A, buf_lin: u32, max_cha
                 _ => {
                     if (count as u32) + 1 < max_chars as u32 {
                         machine.write::<u8>((buf_lin + 2 + count as u32) as usize, ch);
-                        dos_putchar(machine, ch);
+                        dos_putchar(machine, dos, ch);
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count + 1))
                     } else {
-                        dos_putchar(machine, 0x07); // bell — no room
+                        dos_putchar(machine, dos, 0x07); // bell — no room
                         Some(buffered_input_resume(machine, buf_lin, max_chars, count))
                     }
                 }
@@ -859,32 +858,21 @@ fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool, func: u8) -
                 dos.dos_pending_char = Some(scan);
             }
             regs.rax = (regs.rax & !0xFFFF) | ((func as u64) << 8) | ascii as u64;
-            if echo && ascii != 0 { dos_putchar(machine, ascii); }
+            if echo && ascii != 0 { dos_putchar(machine, dos, ascii); }
             None
         }))
 }
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
-fn dos_putchar<A: crate::Arch>(machine: &mut A, c: u8) {
-    // Mirror DOS console output to the debug log stream alongside VGA.
-    crate::vga::debug_byte(c);
-    // The BDA cursor (0040:0050/0051) is guest address space — go through the
-    // vcpu so the access works under any arch backend, not just a host pointer.
-    let col = machine.read::<u8>(0x450) as usize;
-    let row = machine.read::<u8>(0x451) as usize;
-    let (col, row) = {
-        let v = vga::vga();
-        v.set_cursor_pos(col, row);
-        v.putchar(c);
-        v.cursor_pos()
-    };
-    machine.write::<u8>(0x450, col as u8);
-    machine.write::<u8>(0x451, row as u8);
-    // Update CRTC hardware cursor so save_from_hardware captures it
-    let offset = (row * 80 + col) as u16;
-    machine.outb(0x3D4, 0x0E); machine.outb(0x3D5, (offset >> 8) as u8);
-    machine.outb(0x3D4, 0x0F); machine.outb(0x3D5, offset as u8);
+fn dos_putchar<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, c: u8) {
+    // Mirror to the log stream. This is the half worth keeping: the log is
+    // unowned and non-ephemeral, so a program's output survives the scroll and
+    // shows up in order next to everything else, whoever holds the screen.
+    lib::log::debug_byte(c);
+    // Render through DOS's own teletype — the same one INT 10h AH=0Eh uses,
+    // on the BDA cursor that DOS programs read directly.
+    super::bios::teletype(machine, dos, c, 0x07);
 }
 
 fn psp_struct_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
@@ -941,7 +929,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
     match ah {
         // AH=0x02: Display character (DL)
         0x02 => {
-            let ch = regs.rdx as u8; dos_putchar(machine, ch);
+            let ch = regs.rdx as u8; dos_putchar(machine, dos, ch);
             thread::KernelAction::Done
         }
         // AH=0x06: Direct console I/O (DL=0xFF=input, else output DL)
@@ -955,7 +943,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     regs.set_flag32(0x40); // set ZF = no char available
                 }
             } else {
-                dos_putchar(machine, dl);
+                dos_putchar(machine, dos, dl);
             }
             thread::KernelAction::Done
         }
@@ -980,7 +968,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             // AL=0 then the scancode on the next read).
             if let Some(ch) = dos.dos_pending_char.take() {
                 regs.rax = (regs.rax & !0xFF) | ch as u64;
-                if echo && ch != 0 { dos_putchar(machine, ch); }
+                if echo && ch != 0 { dos_putchar(machine, dos, ch); }
             } else {
                 // Real DOS services console input through INT 16h — so do we.
                 // Enter the guest's IVT[0x16] (AH=00, wait-for-key) with an
@@ -1002,7 +990,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             loop {
                 let ch = machine.read::<u8>((addr) as usize);
                 if ch == b'$' { break; }
-                dos_putchar(machine, ch);
+                dos_putchar(machine, dos, ch);
                 addr = addr.wrapping_add(1);
                 // Safety limit: cap at 64 KiB from start
                 if addr.wrapping_sub(start) > 0xFFFF { break; }
@@ -1734,7 +1722,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = machine.read::<u8>((addr + i) as usize);
-                    dos_putchar(machine, ch);
+                    dos_putchar(machine, dos, ch);
                 }
                 regs.rax = (regs.rax & !0xFFFF) | count as u64;
                 regs.clear_flag32(1);
@@ -4296,9 +4284,10 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // ULTRASND makes the (emulated) GUS exist for this program and sets its
     // base/DMA/IRQ wiring; without it the card stays absent.
     dos.pc.gus.configure_from_env(&env);
-    // BLASTER's P<port> makes the MPU-401 / General MIDI device exist, and
-    // ULTRADIR says where its .PAT bank lives (the same one the GUS plays).
-    dos.pc.mpu.configure_from_env(&env);
+    // BLASTER's P<port> makes the MPU-401 / General MIDI device exist. Its
+    // GM bank is a boot asset (the same .PAT set the GUS plays), so it is
+    // handed in here rather than fetched by the device.
+    dos.pc.mpu.configure_from_env(&env, crate::kernel::midi_bank::get());
     init_psp(machine, regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(machine, dos, regs, env_seg, psp_seg, psp_seg);

@@ -9,6 +9,10 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
+/// The VBE mode/bank descriptions a firmware probe fills in. Plain data
+/// about pixels, so they live with the card state in `//lib:vga`.
+pub use vga::{VbeBank, VbeMode};
+
 use crate::println;
 
 pub struct Platform {
@@ -40,19 +44,6 @@ pub struct Platform {
     pub debug: DebugSink,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VbeMode {
-    pub number: u16,
-    pub physical_base: u32,
-    pub width: u16,
-    pub height: u16,
-    pub pitch: u16,
-    pub bits_per_pixel: u8,
-    pub format: crate::kernel::display::FormatSpec,
-    pub window_segment: u16,
-    pub window_granularity_kb: u16,
-    pub window_size_kb: u16,
-}
 
 /// What is running the kernel.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -119,13 +110,6 @@ pub enum BiosDisplay {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VbeBank {
-    pub current: u16,
-    pub window_segment: u16,
-    pub granularity_kb: u16,
-    pub window_size_kb: u16,
-}
 
 impl BiosDisplay {
     fn new() -> Self { Self::Legacy }
@@ -173,19 +157,19 @@ pub enum AudioToken {
 
 /// Kernel console state while it is the visible display owner.
 pub struct VisibleScreen {
-    writer: crate::vga::Screen,
+    writer: crate::term::Screen,
     display: DisplayToken,
 }
 
 /// Kernel console state while another owner is visible. It intentionally does
 /// not implement `fmt::Write`.
 pub struct HiddenScreen {
-    writer: crate::vga::Screen,
-    bios_display: Option<crate::kernel::dos::VgaState>,
+    writer: crate::term::Screen,
+    bios_display: Option<vga::VgaState>,
 }
 
 impl VisibleScreen {
-    pub fn new(writer: crate::vga::Screen, display: DisplayToken) -> Self {
+    pub fn new(writer: crate::term::Screen, display: DisplayToken) -> Self {
         Self { writer, display }
     }
 
@@ -198,8 +182,8 @@ impl VisibleScreen {
 
     pub fn suspend<A: crate::Arch>(self, _machine: &mut A) -> (HiddenScreen, DisplayToken) {
         let bios_display = if matches!(self.display, DisplayToken::BiosDisplay(_)) {
-            let mut vga = crate::kernel::dos::VgaState::new();
-            vga.save_from_hardware();
+            let mut vga = vga::VgaState::new();
+            crate::kernel::drivers::vga_hw::save(&mut vga);
             Some(vga)
         } else {
             None
@@ -215,10 +199,9 @@ impl HiddenScreen {
         display: DisplayToken,
     ) -> VisibleScreen {
         if matches!(display, DisplayToken::BiosDisplay(_)) {
-            self.bios_display
-                .as_ref()
-                .expect("native screen lost VGA state")
-                .restore_to_hardware();
+            crate::kernel::drivers::vga_hw::restore(
+                self.bios_display.as_ref().expect("native screen lost VGA state"),
+            );
         }
         VisibleScreen { writer: self.writer, display }
     }

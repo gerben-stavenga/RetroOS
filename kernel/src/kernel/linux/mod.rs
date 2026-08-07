@@ -23,7 +23,7 @@ use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::thread;
 use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
-use crate::vga;
+use crate::term;
 use crate::Regs;
 use crate::println;
 
@@ -50,7 +50,7 @@ const ENOSYS: i32 = 38;
 // individual thread). All Linux threads write to the same screen, so the
 // snapshot we save on switch-out belongs at the personality level. Lazily
 // allocated on first save (VgaState's planes are a Vec).
-static mut LINUX_CONSOLE_VGA: Option<crate::kernel::dos::VgaState> = None;
+static mut LINUX_CONSOLE_VGA: Option<vga::VgaState> = None;
 static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
@@ -64,8 +64,8 @@ pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
             let vga = (&raw mut LINUX_CONSOLE_VGA)
                 .as_mut()
                 .unwrap()
-                .get_or_insert_with(crate::kernel::dos::VgaState::new);
-            vga.save_from_hardware();
+                .get_or_insert_with(vga::VgaState::new);
+            crate::kernel::drivers::vga_hw::save(vga);
         }
         display
     }
@@ -79,9 +79,9 @@ pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
     unsafe {
         if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
             if let Some(vga) = (&raw mut LINUX_CONSOLE_VGA).as_mut().unwrap().take() {
-                vga.restore_to_hardware();
+                crate::kernel::drivers::vga_hw::restore(&vga);
             } else {
-                crate::vga::vga().clear();
+                lib::term::term().clear();
             }
         }
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
@@ -937,7 +937,7 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             let mut tmp = alloc::vec![0u8; len];
             machine.copy_from(buf, &mut tmp);
             for &b in &tmp {
-                vga::putchar(b);
+                term::putchar(b);
             }
             SyscallResult::val(len as i32)
         }
@@ -1623,7 +1623,7 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
         match fd_kind {
             thread::FdKind::ConsoleOut => {
                 for &b in &iov {
-                    vga::putchar(b);
+                    term::putchar(b);
                 }
                 total += iov_len as i32;
             }

@@ -109,7 +109,7 @@ fn main() {
         arch::enable_live_console(); // paint guest 0xB8000 to this terminal
     }
     kernel::kernel::klog::init();
-    kernel::vga::set_debug_sink(host_log_byte);
+    lib::log::set_debug_sink(host_log_byte);
     // Inject the backend into the (backend-agnostic) kernel: its port I/O for
     // the deep driver call sites (portio), and the host environment facts the
     // platform probe reads (HostStdout debug, no fbcon, not metal).
@@ -208,9 +208,9 @@ fn main() {
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
 
     let mut machine = arch::Interp;
-    // The screen license (see lib::vga::Screen): hosted constructs it here,
+    // The screen license (see lib::term::Screen): hosted constructs it here,
     // mirroring the metal boot_kernel — one per boot, moved into startup.
-    kernel::startup(&mut machine, &config, kernel::vga::Screen::new());
+    kernel::startup(&mut machine, &config, kernel::term::Screen::new());
 }
 
 /// Inject the interp backend into the backend-agnostic kernel: its port I/O

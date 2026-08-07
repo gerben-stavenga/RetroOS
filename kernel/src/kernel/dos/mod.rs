@@ -55,10 +55,6 @@ mod dosabi;
 use self::dosabi as dos;
 mod mode_transitions;
 
-// VgaState is hardware-shaped (4 planes + register snapshot), not DOS policy.
-// Re-export so the Linux personality can hold its own console snapshot — DOS
-// machine emulation stays private otherwise.
-pub use machine::VgaState;
 pub use machine::vsb::SbDevice;
 pub use machine::vga::{BiosVga, physical_vga_present, release_bios_sink, sink_from_display};
 pub use dos::parse_config_env;
@@ -94,7 +90,6 @@ use dos::{
 };
 
 use crate::kernel::thread;
-use crate::vga;
 use crate::Regs;
 
 /// DOS-specific thread state: virtual hardware machine + DOS personality + optional DPMI.
@@ -1144,7 +1139,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
     }
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
 
-    let (col, row) = vga::vga().cursor_pos();
+    let (col, row) = lib::term::term().cursor_pos();
     {
         let _regs = &mut t.kernel.vcpu;
         dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdline_tail);
