@@ -30,19 +30,22 @@ use crate::kernel::thread;
 
 const TAB_SYSTEM: usize = 0;
 const TAB_SOUND: usize = 1;
-const NUM_TABS: usize = 2;
+const TAB_DEBUG: usize = 2;
+const NUM_TABS: usize = 3;
 
 const SYSTEM_ITEM_KILL: usize = 0;
 const SYSTEM_ITEM_SWITCH: usize = 1;
-const SYSTEM_ITEM_TRACE: usize = 2;
-const SYSTEM_ITEM_PROFILE: usize = 3;
-const SYSTEM_ITEM_DUMP: usize = 4;
-const SYSTEM_NUM_ITEMS: usize = 5;
+const SYSTEM_NUM_ITEMS: usize = 2;
 
 const SOUND_ITEM_VOLUME: usize = 0;
 const SOUND_ITEM_LATENCY: usize = 1;
 const SOUND_ITEM_RATE: usize = 2;
 const SOUND_NUM_ITEMS: usize = 3;
+
+const DEBUG_ITEM_TRACE: usize = 0;
+const DEBUG_ITEM_PROFILE: usize = 1;
+const DEBUG_ITEM_DUMP: usize = 2;
+const DEBUG_NUM_ITEMS: usize = 3;
 
 /// Master volume as a percentage of unity, adjusted by ◄/► on the Volume row.
 /// 100 = unity (the level the per-source scales already balance to); attenuate
@@ -58,6 +61,7 @@ static REPAINT: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
+static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(100);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
@@ -77,6 +81,7 @@ pub fn open(display: crate::kernel::platform::DisplayToken) {
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     SYSTEM_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
+    DEBUG_SEL.store(0, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
     OPEN.store(true, Ordering::Relaxed);
@@ -137,6 +142,7 @@ fn set_active_tab(tab: usize) {
 fn active_sel(tab: usize) -> usize {
     match tab {
         TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
+        TAB_DEBUG => DEBUG_SEL.load(Ordering::Relaxed),
         _ => SYSTEM_SEL.load(Ordering::Relaxed),
     }
 }
@@ -144,6 +150,7 @@ fn active_sel(tab: usize) -> usize {
 fn set_active_sel(tab: usize, sel: usize) {
     match tab {
         TAB_SOUND => SOUND_SEL.store(sel.min(SOUND_NUM_ITEMS - 1), Ordering::Relaxed),
+        TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
         _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
     }
 }
@@ -151,6 +158,7 @@ fn set_active_sel(tab: usize, sel: usize) {
 fn active_item_count(tab: usize) -> usize {
     match tab {
         TAB_SOUND => SOUND_NUM_ITEMS,
+        TAB_DEBUG => DEBUG_NUM_ITEMS,
         _ => SYSTEM_NUM_ITEMS,
     }
 }
@@ -158,6 +166,7 @@ fn active_item_count(tab: usize) -> usize {
 fn active_tab_name(tab: usize) -> &'static [u8] {
     match tab {
         TAB_SOUND => b"Sound",
+        TAB_DEBUG => b"Debug",
         _ => b"System",
     }
 }
@@ -363,7 +372,18 @@ fn adjust(up: bool) {
 
 fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&thread::DosState<A>>) {
     match active_tab() {
+        // Continuous settings are adjusted with ◄/►; Enter does nothing.
         TAB_SOUND => {}
+        TAB_DEBUG => match active_sel(TAB_DEBUG) {
+            // Toggle each diagnostic and stay open so the new state shows on the row.
+            DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
+            DEBUG_ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
+            DEBUG_ITEM_DUMP => {
+                crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
+                close();
+            }
+            _ => {}
+        },
         _ => match active_sel(TAB_SYSTEM) {
             SYSTEM_ITEM_KILL => {
                 KILL_REQ.store(true, Ordering::Relaxed);
@@ -373,13 +393,6 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
             SYSTEM_ITEM_SWITCH => {
                 PICK_SEL.store(0, Ordering::Relaxed);
                 PICKER.store(true, Ordering::Relaxed);
-            }
-            // Toggle each diagnostic and stay open so the new state shows on the row.
-            SYSTEM_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
-            SYSTEM_ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
-            SYSTEM_ITEM_DUMP => {
-                crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
-                close();
             }
             _ => {}
         },
@@ -470,7 +483,7 @@ pub fn paint(
 
     vga_render::overlay_text_xscaled(
         out, stride, w, h, logical_w, tx, ty,
-        b"Up/Dn  Enter  <> adjust  Tab switch  Esc", FOOT_FG, PANEL_BG, fmt,
+        b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
 }
 
@@ -486,7 +499,11 @@ fn paint_tabs(
     fmt: PixelFormat,
 ) {
     let mut x = tx;
-    for &(tab, label) in &[(TAB_SYSTEM, b"System" as &[u8]), (TAB_SOUND, b"Sound" as &[u8])] {
+    for &(tab, label) in &[
+        (TAB_SYSTEM, b"System" as &[u8]),
+        (TAB_SOUND, b"Sound" as &[u8]),
+        (TAB_DEBUG, b"Debug" as &[u8]),
+    ] {
         let selected = tab == active;
         let label_w = label.len() * CELL_W + CELL_W;
         if selected {
@@ -606,22 +623,25 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             }
             SOUND_ITEM_RATE => {
                 line.put(b"Mix rate ");
-                line.put_rate_q16(crate::kernel::sound::effective_mix_rate_q16());
+                line.put_rate_q16(crate::kernel::sound::mixing_rate_q16());
             }
+            _ => {}
+        },
+        TAB_DEBUG => match item {
+            DEBUG_ITEM_TRACE => {
+                line.put(b"Trace    ");
+                line.put(if crate::kernel::startup::trace_enabled() { b"ON" } else { b"off" });
+            }
+            DEBUG_ITEM_PROFILE => {
+                line.put(b"Profile  ");
+                line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
+            }
+            DEBUG_ITEM_DUMP => line.put(b"Dump state"),
             _ => {}
         },
         _ => match item {
             SYSTEM_ITEM_KILL => line.put(b"Kill task"),
             SYSTEM_ITEM_SWITCH => line.put(b"Switch task"),
-            SYSTEM_ITEM_TRACE => {
-                line.put(b"Trace    ");
-                line.put(if crate::kernel::startup::trace_enabled() { b"ON" } else { b"off" });
-            }
-            SYSTEM_ITEM_PROFILE => {
-                line.put(b"Profile  ");
-                line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
-            }
-            SYSTEM_ITEM_DUMP => line.put(b"Dump state"),
             _ => {}
         },
     }

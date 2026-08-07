@@ -691,7 +691,10 @@ pub fn event_loop<A: crate::Arch>(
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
     let mut display_handoff = None;
-    let mut audio_producer = crate::kernel::sound::Producer::new();
+    // Seeded on the first pump from the sink's own rate, and re-seeded if the
+    // card behind the sink ever changes.
+    let mut audio_producer = crate::kernel::sound::Producer::new(0);
+    let mut audio_pipe = crate::kernel::sound::Pipe::new();
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
     // hardware with at most one guest owner, and the loop is what outlives
@@ -731,9 +734,9 @@ pub fn event_loop<A: crate::Arch>(
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(machine, ticks, audio_producer.pushed());
+        thread.personality.advance_world(machine, ticks, audio_pipe.produced_frames());
         if ticks != 0 {
-            crate::kernel::sound::pump(machine, &mut audio_producer, ticks as u64, |machine, span| {
+            crate::kernel::sound::pump(machine, &mut audio_producer, &mut audio_pipe, ticks as u64, |machine, span| {
                 thread.personality.audio_tick(machine, span);
             });
             thread.personality.display_tick(machine, &ctx.regs);
