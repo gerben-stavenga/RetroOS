@@ -6,20 +6,24 @@
 /// Fixed-point shift for the effective mix rate.
 pub const RATE_FP_SHIFT: u32 = 16;
 
-/// Loop bandwidth, in milliradians/sec — the pitch-stability knob, kept at
-/// milli resolution so it can be dialled below 1 rad/s.
+/// Loop bandwidth times the latency target, `w * T`, in thousandths. This is
+/// the dimensionless form of the knob: `w` itself is not a property of the
+/// controller but of how much queue there is to work with, so it is derived
+/// per step as `w = OMEGA_TIMES_LATENCY/1000 / T`, with `T` the target depth
+/// expressed in seconds.
 ///
-/// Two paths carry `q` into the rate and they scale differently. The spring
-/// integrates, `w^2 q dt` per pump, so its noise falls quadratically with `w`.
-/// The dashpot is algebraic, `2w q`, so its noise falls only linearly and
-/// dominates: one millisecond of cursor sampling phase (~48 frames at 48 kHz)
-/// reaches the rate as `2w * 48`, which is 384 Hz at 4 rad/s and 96 Hz at 1.
+/// The latency target is what the loop is allowed to spend. A deep queue can
+/// be corrected slowly; a shallow one has to be corrected before it empties,
+/// so the same clock error is more urgent. 0.03 puts the settling time `4/w`
+/// at about 130 buffer-lengths, which is 1 rad/s at the 30 ms default — the
+/// value that sounds right on metal — and scales from ~6 rad/s at a 5 ms
+/// target to 0.5 at 60 ms.
 ///
-/// The cost of lowering it is settling time, `4/w`. This design has no droop
-/// to trade away — that was the old damper's price for a noise-free `q'` — so
-/// a slow loop costs only how long a transient takes to clear, not steady
-/// margin.
-const OMEGA_MILLIRAD_PER_SEC: i64 = 1_000;
+/// Raising it costs pitch stability, and unevenly: `q`'s noise reaches the
+/// rate through `2w` directly and through `w^2 dt` after integration, so the
+/// low-latency end of the slider is inherently the noisier one. That is not a
+/// flaw in the scaling — a small buffer genuinely cannot afford a slow loop.
+const OMEGA_TIMES_LATENCY: i64 = 30;
 
 /// State for one latency-controlled mixer.
 ///
@@ -60,6 +64,14 @@ impl Pacer {
         (whole, frac)
     }
 
+    /// Loop bandwidth for this operating point, in milliradians/sec:
+    /// `w = k/T` with `T = target/rate` seconds, so `w_milli = 1000k *
+    /// rate/target`. See [`OMEGA_TIMES_LATENCY`].
+    fn omega_millirad(rate_hz: u64, target: u32) -> u64 {
+        let target = u64::from(target).max(1);
+        ((OMEGA_TIMES_LATENCY as u64) * rate_hz / target).max(1)
+    }
+
     /// Advance the controller one pump and return the rate to mix at, in
     /// frames/sec × 2^16. Critically damped correction toward `target`.
     pub fn update_rate(&mut self, written: u64, consumed: u64, target: u32, dt_ms: u64) -> u64 {
@@ -76,7 +88,13 @@ impl Pacer {
         // Positive `q` is a queue deeper than the target.
         let anchor = consumed.saturating_add(u64::from(target));
         let q = i128::from(written) - i128::from(anchor);
-        let omega_m = i128::from(OMEGA_MILLIRAD_PER_SEC);
+        if target == 0 {
+            return self.s_q16();
+        }
+        // Bandwidth from `s`, not from the emitted rate: the latter swings with
+        // `q`, and the loop's bandwidth should not swing with it.
+        let omega_m =
+            i128::from(Self::omega_millirad(self.s_q16() >> RATE_FP_SHIFT, target));
         let one_q16 = i128::from(1u64 << RATE_FP_SHIFT);
         // s' = -w^2 q, integrated over the pump: the spring, slow and quiet.
         // The divisor carries w's milli scale twice over, and dt's once.
@@ -98,6 +116,18 @@ mod tests {
         let pacer = Pacer::new(48_000);
         assert_eq!(pacer.s_q16(), 48_000u64 << RATE_FP_SHIFT);
         assert_eq!(Pacer::rate_hz(pacer.s_q16()), (48_000, 0));
+    }
+
+    /// The knob is `w*T`, so the latency slider moves `w` and the default
+    /// operating point reproduces the 1 rad/s that was tuned by ear on metal.
+    #[test]
+    fn omega_tracks_the_latency_target() {
+        let ms = |ms: u32| 48 * ms; // frames at 48 kHz
+        assert_eq!(Pacer::omega_millirad(48_000, ms(30)), 1_000); // 1.0 rad/s
+        assert_eq!(Pacer::omega_millirad(48_000, ms(5)), 6_000); // shallow: fast
+        assert_eq!(Pacer::omega_millirad(48_000, ms(60)), 500); // deep: slow
+        // Same latency in seconds at a different card rate is the same loop.
+        assert_eq!(Pacer::omega_millirad(44_100, 44_100 * 30 / 1000), 1_000);
     }
 
     #[test]
