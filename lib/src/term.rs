@@ -30,10 +30,28 @@ enum EscState {
     Csi,     // saw ESC [
 }
 
-/// The console's own state: where it is on the screen, what attribute it is
-/// writing with, and where the cell aperture lives.
+/// A terminal: its grid, its cursor, and where (if anywhere) the cells are
+/// mirrored to hardware.
+///
+/// The grid is 4000 bytes, so nothing here tracks which cells changed — a
+/// renderer that wants the screen simply draws all of it.
+///
+/// The grid is the terminal's own and is the source of truth. That sounds
+/// obvious and was not the case: this used to keep no storage at all and write
+/// `u16`s straight into whatever address `base` held, so the VGA's memory *was*
+/// the terminal's memory. Everything downstream paid for it — a framebuffer
+/// machine had to read the cells back and re-render every row to display one
+/// character, a hosted machine had to fabricate an aperture for writes nothing
+/// would ever read, and nothing could repaint, because after the pixels were
+/// overwritten the text was simply gone.
 pub struct Term {
-    pub base: usize,
+    /// 80x25 cells, `attr << 8 | char` — the VGA text encoding, which is this
+    /// terminal's format because it is the one hardware wants verbatim.
+    grid: [u16; CELLS],
+    /// A VGA text aperture to mirror cells into as they are written, when the
+    /// machine has one. `None` on a framebuffer or hosted machine, which
+    /// render from the grid instead.
+    aperture: Option<usize>,
     cursor_x: usize,
     cursor_y: usize,
     attr: u8,
@@ -44,9 +62,10 @@ pub struct Term {
 }
 
 impl Term {
-    pub const fn new(base: usize) -> Self {
+    pub const fn new(aperture: Option<usize>) -> Self {
         Self {
-            base,
+            grid: [0x0720; CELLS],
+            aperture,
             cursor_x: 0,
             cursor_y: 0,
             attr: 0x07, // LightGray on Black
@@ -76,8 +95,44 @@ impl Term {
         }
     }
 
-    fn buffer(&mut self) -> &mut [u16] {
-        unsafe { core::slice::from_raw_parts_mut(self.base as *mut u16, CELLS) }
+    /// Write one cell into the grid and, if the machine has one, through to
+    /// the VGA aperture. Marks the row dirty for whoever renders.
+    fn put_cell(&mut self, offset: usize, cell: u16) {
+        if offset >= CELLS {
+            return;
+        }
+        self.grid[offset] = cell;
+        if let Some(base) = self.aperture {
+            unsafe { core::ptr::write_volatile((base as *mut u16).add(offset), cell) };
+        }
+    }
+
+    /// Copy the whole grid through to the aperture — after a scroll or clear,
+    /// where every cell moved.
+    fn flush_aperture(&mut self) {
+        if let Some(base) = self.aperture {
+            for (i, &cell) in self.grid.iter().enumerate() {
+                unsafe { core::ptr::write_volatile((base as *mut u16).add(i), cell) };
+            }
+        }
+    }
+
+    /// The grid, for a renderer that draws it.
+    pub fn cells(&self) -> &[u16; CELLS] {
+        &self.grid
+    }
+
+    /// The grid as bytes, in the VGA text layout a renderer expects.
+    pub fn cells_bytes(&self) -> &[u8] {
+        // `[u16; N]` to `[u8; 2N]`: same allocation, looser alignment.
+        unsafe { core::slice::from_raw_parts(self.grid.as_ptr() as *const u8, CELLS * 2) }
+    }
+
+    /// Point the terminal at a VGA text aperture (or at nothing), mirroring the
+    /// grid into it immediately so the display matches what has been printed.
+    pub fn set_aperture(&mut self, aperture: Option<usize>) {
+        self.aperture = aperture;
+        self.flush_aperture();
     }
 
     /// Returns (column, row) cursor position.
@@ -93,18 +148,17 @@ impl Term {
 
     pub fn clear(&mut self) {
         let blank = (self.attr as u16) << 8 | b' ' as u16;
-        for cell in self.buffer() {
-            *cell = blank;
-        }
+        self.grid = [blank; CELLS];
+        self.flush_aperture();
         self.cursor_x = 0;
         self.cursor_y = 0;
     }
 
     fn scroll(&mut self) {
         let blank = (self.attr as u16) << 8 | b' ' as u16;
-        let buffer = self.buffer();
-        buffer.copy_within(WIDTH.., 0);
-        buffer[CELLS - WIDTH..].fill(blank);
+        self.grid.copy_within(WIDTH.., 0);
+        self.grid[CELLS - WIDTH..].fill(blank);
+        self.flush_aperture();
     }
 
     pub fn putchar(&mut self, c: u8) {
@@ -161,7 +215,7 @@ impl Term {
             }
             _ => {
                 let offset = self.cursor_y * WIDTH + self.cursor_x;
-                self.buffer()[offset] = (self.attr as u16) << 8 | (c as u16);
+                self.put_cell(offset, (self.attr as u16) << 8 | (c as u16));
                 self.cursor_x += 1;
                 if self.cursor_x >= WIDTH {
                     self.cursor_x = 0;
@@ -190,50 +244,7 @@ impl Write for Term {
     }
 }
 
-/// The license to render kernel text on the display, tracked purely by move
-/// semantics — no flag, no registry, no global. The platform entry constructs
-/// exactly one and the boot call chain owns it (bootloader / `boot_kernel` →
-/// `startup`); while a user program runs, `startup` holds the value without
-/// writing, so kernel logs cannot trample the user's framebuffer (in CGA/EGA
-/// graphics modes the same B8000 bytes are the program's pixel data). A call
-/// site without the value simply has no way to draw: the ambient `println!` /
-/// `dbg_println!` macros feed only the log stream.
-///
-/// Diverging paths — panic, SHUTDOWN — construct their own writer instead of
-/// reaching for the holder: the ownership rules protect a *running* program's
-/// screen, and theirs is dead, never to run again.
-///
-/// A focused program's own console output (`putchar` / DOS teletype) is the
-/// program writing its own screen and takes no license.
-pub struct Screen(());
-
-impl Screen {
-    /// See the type docs: platform entry (once per boot) and diverging
-    /// paths (panic/shutdown) only.
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Screen(())
-    }
-
-    /// Reset to a blank screen. Panic/shutdown banners start clean: the cells
-    /// hold whatever the previous owner drew — raw pixel bytes, if it died in
-    /// a graphics mode.
-    pub fn clear(&mut self) {
-        let v = term();
-        v.attr = 0x07;
-        v.clear();
-    }
-}
-
-/// The console writes; a holder of the license merely delegates to it.
-impl Write for Screen {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        term().write_str(s)
-    }
-}
-
-/// Global VGA state
-static mut TERM: Term = Term::new(0xB8000);
+static mut TERM: Term = Term::new(Some(0xB8000));
 
 /// Access the global console.
 pub fn term() -> &'static mut Term {
@@ -277,8 +288,9 @@ pub fn putchar(c: u8) {
 }
 
 
-/// Print one line through an owned [`Screen`]: renders to the display and
-/// mirrors to the log stream. The only formatted path that draws on screen.
+/// Print one line to something that writes to the display — the kernel's
+/// `Console`, or a bare [`Term`] for an embedder that is alone on the machine.
+/// The only formatted path that draws on screen; everything else logs.
 #[macro_export]
 macro_rules! screenln {
     ($screen:expr) => {{

@@ -64,13 +64,15 @@ pub use kernel::portio::{install_portio, PortIo};
 pub use kernel::fs::hostfs::{install_host_backend, host_backend_installed, HostBackendHooks};
 pub use kernel::net::{install_socket_backend, socket_backend_installed, SocketHooks};
 
-/// Hosted: point the VGA console framebuffer at a scratch buffer so its writes
-/// (clear/scroll/putchar) don't dereference the unmapped `0xB8000` host
-/// address. Console output reaches stdout via the injected debug sink, so the
-/// framebuffer content itself is unused. Backend-agnostic.
+/// Hosted: the machine has no text aperture, so the terminal keeps its grid
+/// and mirrors nowhere. Output reaches stdout through the log sink.
+///
+/// This used to leak a 4000-byte scratch buffer and point the terminal at it,
+/// purely so `clear`/`scroll`/`putchar` had somewhere legal to write — a
+/// fabricated VGA aperture that nothing ever read. A terminal that owns its
+/// grid needs no such thing.
 pub fn host_console_init() {
-    let fb = alloc::boxed::Box::leak(alloc::vec![0u16; 80 * 25].into_boxed_slice());
-    lib::term::term().base = fb.as_mut_ptr() as usize;
+    lib::term::term().set_aperture(None);
 }
 
 /// Hosted: run a 32-bit Linux ELF (already read into `data`) through the real

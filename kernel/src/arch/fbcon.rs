@@ -109,7 +109,7 @@ pub fn early(info: &arch::MultibootInfo) -> bool {
 const FB_TYPE_RGB: u8 = 1;
 const FB_TYPE_EGA_TEXT: u8 = 2;
 
-pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Screen) {
+pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     // No framebuffer offered at all (our own legacy bootloader), or the loader
     // honoured the header's EGA-text request (GRUB on a legacy BIOS, which
     // reports type 2 with addr 0xB8000). Either way the card owns the panel and

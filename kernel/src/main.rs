@@ -208,9 +208,9 @@ fn main() {
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }
 
     let mut machine = arch::Interp;
-    // The screen license (see lib::term::Screen): hosted constructs it here,
+    // Hosted has no display to arbitrate until `startup` builds a Console;
     // mirroring the metal boot_kernel — one per boot, moved into startup.
-    kernel::startup(&mut machine, &config, kernel::term::Screen::new());
+    kernel::startup(&mut machine, &config);
 }
 
 /// Inject the interp backend into the backend-agnostic kernel: its port I/O

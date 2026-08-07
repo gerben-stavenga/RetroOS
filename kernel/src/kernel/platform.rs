@@ -155,63 +155,6 @@ pub enum AudioToken {
     None,
 }
 
-/// Kernel console state while it is the visible display owner.
-pub struct VisibleScreen {
-    writer: crate::term::Screen,
-    display: DisplayToken,
-}
-
-/// Kernel console state while another owner is visible. It intentionally does
-/// not implement `fmt::Write`.
-pub struct HiddenScreen {
-    writer: crate::term::Screen,
-    bios_display: Option<vga::VgaState>,
-}
-
-impl VisibleScreen {
-    pub fn new(writer: crate::term::Screen, display: DisplayToken) -> Self {
-        Self { writer, display }
-    }
-
-    pub fn bios_display(&self) -> Option<&BiosDisplay> {
-        match &self.display {
-            DisplayToken::BiosDisplay(native) => Some(native),
-            _ => None,
-        }
-    }
-
-    pub fn suspend<A: crate::Arch>(self, _machine: &mut A) -> (HiddenScreen, DisplayToken) {
-        let bios_display = if matches!(self.display, DisplayToken::BiosDisplay(_)) {
-            let mut vga = vga::VgaState::new();
-            crate::kernel::drivers::vga_hw::save(&mut vga);
-            Some(vga)
-        } else {
-            None
-        };
-        (HiddenScreen { writer: self.writer, bios_display }, self.display)
-    }
-}
-
-impl HiddenScreen {
-    pub fn resume<A: crate::Arch>(
-        self,
-        _machine: &mut A,
-        display: DisplayToken,
-    ) -> VisibleScreen {
-        if matches!(display, DisplayToken::BiosDisplay(_)) {
-            crate::kernel::drivers::vga_hw::restore(
-                self.bios_display.as_ref().expect("native screen lost VGA state"),
-            );
-        }
-        VisibleScreen { writer: self.writer, display }
-    }
-}
-
-impl core::fmt::Write for VisibleScreen {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        core::fmt::Write::write_str(&mut self.writer, s)
-    }
-}
 
 /// Real-mode firmware at the legacy ROM window.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

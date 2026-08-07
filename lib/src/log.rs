@@ -70,9 +70,10 @@ impl Write for DebugCon {
 }
 
 /// Print formatted text to the log stream (debugcon sink + klog). Never the
-/// screen: on-screen text requires holding the [`Screen`] value — use
-/// `screenln!`. (Kept alongside `dbg_print!` so the kernel's existing log
-/// call sites keep compiling; the two are now synonyms.)
+/// screen: on-screen text requires holding the kernel's `Console` (or a bare
+/// terminal, for an embedder alone on the machine) — use `screenln!`. Kept
+/// alongside `dbg_print!` so existing log call sites compile; they are
+/// synonyms.
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {{

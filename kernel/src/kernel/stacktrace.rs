@@ -113,7 +113,7 @@ pub fn init_from_vfs() {
 }
 
 /// Write a stack trace starting from the caller of this function. Used by the
-/// panic handler, which passes its rule-free `Screen` so the trace lands on
+/// panic handler, which passes the terminal directly so the trace lands on
 /// the display (and, mirrored, in the log); skips its own frame so the first
 /// line is whoever panicked. Only the metal boot path uses this entry; the
 /// hosted backend traces via `stack_trace_regs`.

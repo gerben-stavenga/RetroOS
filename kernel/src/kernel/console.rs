@@ -165,3 +165,83 @@ fn dispatch_linux<A: crate::Arch>(
     }
     }
 }
+
+// =============================================================================
+// The console role: holding the display
+// =============================================================================
+
+/// The console: the machine's own display, held.
+///
+/// Holding this value *is* the licence to draw kernel text — not by a rule
+/// written down somewhere, but because the display token is in here and there
+/// is no other way to reach it. There used to be a separate `Screen` token
+/// alongside the display for exactly this purpose; it enforced nothing,
+/// because the terminal it claimed to guard was reachable through a public
+/// global, and its own first user was the bootloader issuing itself a licence
+/// while alone on the machine.
+///
+/// There is deliberately no type for a console that is not holding the
+/// display. A console that gave up its display is not a suspended console, it
+/// is a destructed one — so [`Console::release`] consumes it and hands the
+/// pieces back, and the absence of the value is the suspended state.
+pub struct Console {
+    display: crate::kernel::platform::DisplayToken,
+}
+
+/// What a released console leaves behind: the *card's* state, not the
+/// console's. A real VGA is handed to the next owner mid-mode, so its register
+/// file and planes are snapshotted for whoever takes the display back. The
+/// text itself needs none of this — the terminal owns its grid and can simply
+/// be redrawn.
+pub struct SuspendedCard(Option<vga::VgaState>);
+
+impl Console {
+    pub fn new(display: crate::kernel::platform::DisplayToken) -> Self {
+        Self { display }
+    }
+
+    pub fn bios_display(&self) -> Option<&crate::kernel::platform::BiosDisplay> {
+        match &self.display {
+            crate::kernel::platform::DisplayToken::BiosDisplay(native) => Some(native),
+            _ => None,
+        }
+    }
+
+    /// Give up the display. The console ceases to exist; whoever takes the
+    /// token can now drive the screen, and nothing left in the kernel can
+    /// print over them.
+    pub fn release<A: crate::Arch>(
+        self,
+        _machine: &mut A,
+    ) -> (SuspendedCard, crate::kernel::platform::DisplayToken) {
+        let saved = if matches!(self.display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+            let mut card = vga::VgaState::new();
+            crate::kernel::drivers::vga_hw::save(&mut card);
+            Some(card)
+        } else {
+            None
+        };
+        (SuspendedCard(saved), self.display)
+    }
+
+    /// Take the display back and become a console again, restoring the card to
+    /// the state the previous owner found it in.
+    pub fn acquire<A: crate::Arch>(
+        _machine: &mut A,
+        card: SuspendedCard,
+        display: crate::kernel::platform::DisplayToken,
+    ) -> Self {
+        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+            crate::kernel::drivers::vga_hw::restore(
+                card.0.as_ref().expect("native console lost its card state"),
+            );
+        }
+        Self { display }
+    }
+}
+
+impl core::fmt::Write for Console {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        core::fmt::Write::write_str(lib::term::term(), s)
+    }
+}

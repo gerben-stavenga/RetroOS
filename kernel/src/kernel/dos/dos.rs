@@ -692,7 +692,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             // handler we don't chase the screen license up the (now
             // irrelevant) call chain — build a writer and render the
             // farewell over whatever the program left on screen.
-            let mut screen = crate::term::Screen::new();
+            let screen = lib::term::term();
             screen.clear();
             crate::screenln!(screen, "It is now safe to turn off your computer.");
             if crate::kernel::platform::get().host == crate::kernel::platform::Host::Metal {

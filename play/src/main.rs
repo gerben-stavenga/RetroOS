@@ -146,8 +146,7 @@ fn main() {
             config.set_c_root(c.as_bytes());
         }
         let mut machine = arch::Interp;
-        // The screen license (see lib::term::Screen): one per boot, moved in.
-        kernel::startup(&mut machine, &config, kernel::term::Screen::new());
+        kernel::startup(&mut machine, &config);
     });
 
     display::run() // main thread: SDL loop; exits the process on window close

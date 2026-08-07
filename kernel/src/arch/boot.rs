@@ -114,8 +114,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         kernel_pages,
     );
 
-    // Update VGA base for paged addressing before any println
-    lib::term::term().base = LOW_MEM_BASE + 0xB8000;
+    // The text aperture moves with paging: point the terminal at the mapped
+    // low-memory B8000 before anything prints. Its grid comes along, so what
+    // the bootloader already put on screen survives the move.
+    lib::term::term().set_aperture(Some(LOW_MEM_BASE + 0xB8000));
 
     // The shared log ring uses kernel-owned static storage, so it is available
     // before the heap and captures the interrupt/device bring-up below.
@@ -158,10 +160,10 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // are rendered as backlog.
     crate::fbcon::early(info);
 
-    // The screen license: constructed HERE, once, and moved down the boot
-    // chain (fbcon::init → timer_selftest → startup). On-screen kernel text
-    // exists only where this value is; ambient println! is log-only.
-    let mut screen = lib::term::Screen::new();
+    // Nothing else is running yet, so there is no display to arbitrate: write
+    // to the terminal directly. Once `startup` builds a `Console`, on-screen
+    // kernel text needs that value; ambient println! stays log-only throughout.
+    let mut screen = lib::term::term();
 
     lib::screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -246,7 +248,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a
     // freeze-at-first-IRQ on real hardware is readable instead of a black hang.
-    irq::timer_selftest(&mut screen);
+    irq::timer_selftest(screen);
 
     descriptors::enter_ring1();
 
@@ -259,7 +261,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     lib::screenln!(screen, "Heap base: {:#x}", arch::heap_base());
 
-    crate::kernel::startup::startup(&mut machine, &config, screen);
+    crate::kernel::startup::startup(&mut machine, &config);
 }
 
 /// Read platform boot settings into a `BootConfig`. The Multiboot command line
@@ -333,12 +335,11 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     // panic mid-stream can wedge the codec until a cold power-off.
     crate::kernel::drivers::hda::emergency_quiesce();
 
-    // The screen license lives somewhere up the dead call chain; a panic
-    // doesn't follow the ownership rules — they protect a running program's
-    // screen, and nothing runs after this. Build a fresh writer and render.
-    // Screen writes mirror to the log stream, so debugcon/klog get every
-    // line too — no separate dbg_println! needed.
-    let mut screen = lib::term::Screen::new();
+    // The console lives somewhere up the dead call chain; a panic does not
+    // follow the ownership rules — they protect a *running* program's screen,
+    // and nothing runs after this. Write straight to the terminal. Its writes
+    // mirror to the log stream, so debugcon/klog get every line too.
+    let screen = lib::term::term();
     screen.clear();
 
     lib::screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
@@ -350,7 +351,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     lib::screenln!(screen, "  {}", info.message());
     lib::screenln!(screen);
 
-    crate::kernel::stacktrace::stack_trace(&mut screen);
+    crate::kernel::stacktrace::stack_trace(screen);
 
     arch::halt_forever();
 }

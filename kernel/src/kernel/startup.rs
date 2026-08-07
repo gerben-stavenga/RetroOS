@@ -9,7 +9,7 @@ use crate::kernel::thread;
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
-pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut screen: crate::term::Screen) -> ! {
+pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -22,7 +22,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
     if disks.is_empty() {
         crate::println!("Storage: none detected");
     }
-    crate::screenln!(screen, "Block devices initialized");
+    crate::println!("Block devices initialized");
 
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
@@ -33,8 +33,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig, mut sc
         display,
         audio,
     } = crate::kernel::platform::probe(machine, boot);
-    let mut screen =
-        crate::kernel::platform::VisibleScreen::new(screen, display);
+    let mut screen = crate::kernel::console::Console::new(display);
 
     // Disk-write policy, applied by COMPOSITION and DECLARED, never inferred.
     //
@@ -282,7 +281,7 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
-    screen: &mut crate::kernel::platform::VisibleScreen,
+    screen: &mut crate::kernel::console::Console,
 ) {
     use crate::kernel::block::partition::PartKind;
 
@@ -464,7 +463,7 @@ fn run<A: crate::Arch>(
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
-    mut screen: crate::kernel::platform::VisibleScreen,
+    mut screen: crate::kernel::console::Console,
     mut sb: Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> ! {
     // What to run headlessly, from whichever channel the backend has. QEMU and
@@ -544,15 +543,15 @@ fn run_program_with_screen<A: crate::Arch>(
     cwd: &[u8],
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
-    screen: crate::kernel::platform::VisibleScreen,
+    screen: crate::kernel::console::Console,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
-) -> (crate::kernel::platform::VisibleScreen, Option<crate::kernel::drivers::sb16::SbCard>) {
-    let (screen, display) = screen.suspend(machine);
+) -> (crate::kernel::console::Console, Option<crate::kernel::drivers::sb16::SbCard>) {
+    let (card, display) = screen.release(machine);
     let (display, sb) = run_program(
         machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch,
         display, sb,
     );
-    (screen.resume(machine, display), sb)
+    (crate::kernel::console::Console::acquire(machine, card, display), sb)
 }
 
 /// Load and run a single cmdline program until it exits. ELF binaries run
@@ -611,7 +610,7 @@ fn run_program<A: crate::Arch>(
     let env = env.to_vec();
 
     // No screen handoff bookkeeping: on-screen kernel text requires the
-    // `Screen` value, which our caller holds and does not touch until this
+    // `Console` value, which our caller holds and does not touch until this
     // program's world ends — so kernel logs cannot trample user-space pixel
     // data when the program is in graphics mode (CGA modes use B8000 as a
     // pixel framebuffer, identical address to text-mode char+attr storage).

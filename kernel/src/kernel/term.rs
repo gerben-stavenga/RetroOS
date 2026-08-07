@@ -7,11 +7,12 @@
 //! through the VGA renderer as an 80×25 text frame; legacy machines attach
 //! nothing and let the real card scan B8000 itself.
 //!
-//! The re-scan is a known wart: the terminal keeps no grid of its own, so this
-//! reads back the cells it just wrote and re-renders all 400 rows per byte.
-//! It goes away when the terminal owns its grid.
+//! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. It used
+//! to read back the cells out of whatever aperture the terminal had written
+//! them to, which meant a framebuffer machine needed one even though it had no
+//! text mode, and a hosted machine had to fabricate one for the purpose.
 
-pub use lib::term::{term, Term, Screen, putchar};
+pub use lib::term::{term, Term, putchar};
 
 use crate::kernel::display::{Framebuffer, PixelFormat};
 use lib::vga_fonts::FONT_8X16;
@@ -76,9 +77,7 @@ fn flush() {
     let Some(fb) = (unsafe { *fb_p }) else { return };
     let format_p = &raw const FORMAT;
     let Some(format) = (unsafe { *format_p }) else { return };
-    let vram = unsafe {
-        core::slice::from_raw_parts(lib::term::term().base as *const u8, 80 * 25 * 2)
-    };
+    let vram = lib::term::term().cells_bytes();
     let palette_p = &raw const PALETTE;
     let frame = Frame {
         mode: VgaMode::Text80x25,

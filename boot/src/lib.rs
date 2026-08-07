@@ -308,9 +308,10 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
         }
     }
 
-    // The bootloader owns the whole machine: construct the screen license
-    // (see lib::term::Screen) for its lifetime. Clear and print the banner.
-    let mut screen = lib::term::Screen::new();
+    // The bootloader is alone on the machine — nothing to arbitrate a display
+    // against, so it writes to the terminal directly. (It used to construct a
+    // "screen licence" here: the sole inhabitant issuing one to itself.)
+    let screen = lib::term::term();
     screen.clear();
     screenln!(screen, "\x1b[92mRetroOS Rust Bootloader\x1b[0m");
 
@@ -466,11 +467,11 @@ fn full_boot_main(_nsectors_bytes: u32, drive: u32) -> ! {
 
 /// Panic handler - required for no_std. Diverging path: builds its own
 /// screen writer rather than threading the entry fn's down (see
-/// lib::term::Screen — the rules protect a running program; nothing runs
+/// the terminal directly — ownership rules protect a running program; nothing runs
 /// after this).
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let mut screen = lib::term::Screen::new();
+    let screen = lib::term::term();
     screenln!(screen);
     screenln!(screen, "\x1b[91m!!! PANIC !!!\x1b[0m");
 
