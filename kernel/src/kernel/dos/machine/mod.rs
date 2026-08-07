@@ -161,6 +161,7 @@ pub fn guest_flags_handler_entry(regs: &Regs) -> u32 {
     guest_flags(regs) & !(IF_FLAG | (1 << 8))
 }
 
+pub(crate) mod mmio;
 pub(super) mod vga;
 pub use vga::*;
 pub(super) mod vvoodoo;

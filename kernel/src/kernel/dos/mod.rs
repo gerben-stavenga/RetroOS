@@ -559,8 +559,8 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // — a different window and a different device behind it, nothing else.
     if let Some(off) = dos.pc.voodoo.aperture_offset(addr) {
         let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-        let mut target = machine::vga::MmioTarget::Voodoo(&mut dos.pc.voodoo);
-        return machine::vga::handle_mmio_fault(
+        let mut target = machine::mmio::MmioTarget::Voodoo(&mut dos.pc.voodoo);
+        return machine::mmio::handle_mmio_fault(
             machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
         );
     }
@@ -584,8 +584,8 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         return true;
     }
     let off = addr - 0xA0000;
-    let mut target = machine::vga::MmioTarget::Planar(&mut dev.state);
-    machine::vga::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
+    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.state);
+    machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 
 /// Resolve CS (instruction fetch) plus the DS/ES bases a `movs` needs: source
