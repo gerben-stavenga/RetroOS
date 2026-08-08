@@ -185,6 +185,14 @@ impl Display {
     pub fn is_vga(&self) -> bool {
         matches!(self.backend, Backend::Vbe { .. } | Backend::Vga { .. })
     }
+    /// Integer vertical enlargement needed while composing into a source-row
+    /// shadow that will later be reduced into the Mode 13h framebuffer.
+    pub(crate) fn osd_shadow_y_scale(&self, shadow_height: usize) -> usize {
+        match &self.backend {
+            Backend::Vga { framebuffer, .. } => (shadow_height / framebuffer.height).max(1),
+            _ => 1,
+        }
+    }
     pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
         match &self.backend {
             Backend::Vbe { native, .. } | Backend::Vga { native, .. } => Some(native),

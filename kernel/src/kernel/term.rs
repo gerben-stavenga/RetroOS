@@ -114,7 +114,7 @@ fn scanout(display: &mut Display, frame: &Frame<'_>) {
             row_bytes,
             out_w,
             h,
-            w,
+            display.osd_shadow_y_scale(h),
             format,
         );
     }

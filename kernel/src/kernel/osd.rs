@@ -395,20 +395,50 @@ const PAD: usize = 8;
 const CELL_W: usize = vga::OVERLAY_CELL_W;
 const CELL_H: usize = vga::OVERLAY_CELL_H;
 
-/// Composite the panel onto a finished frame. X coordinates are laid out in
-/// `logical_w` VGA-source pixels and projected into the `w`-pixel packed
-/// shadow; Y is already at source-row resolution. Hosted callers pass
-/// `logical_w == w`, making the projection an identity.
+#[allow(clippy::too_many_arguments)]
+fn paint_text(
+    out: &mut [u8], stride: usize, w: usize, h: usize,
+    x: usize, y: usize, scale_y: usize, s: &[u8], fg: u32, bg: u32,
+    fmt: PixelFormat,
+) {
+    let fgp = fmt.encode(fg).to_le_bytes();
+    let bgp = fmt.encode(bg).to_le_bytes();
+    let bytes = fmt.bytes_per_pixel as usize;
+    let font = &lib::vga_fonts::FONT_8X16;
+    for (i, &ch) in s.iter().enumerate() {
+        let cx = x + i * CELL_W;
+        if cx + CELL_W > w { break; }
+        let glyph = &font[ch as usize * CELL_H..(ch as usize + 1) * CELL_H];
+        for (gy, &bits) in glyph.iter().enumerate() {
+            for repeat in 0..scale_y {
+                let py = y + gy * scale_y + repeat;
+                if py >= h { break; }
+                for gx in 0..CELL_W {
+                    let pixel = if bits & (0x80 >> gx) != 0 { &fgp } else { &bgp };
+                    let offset = py * stride + (cx + gx) * bytes;
+                    if offset + bytes <= out.len() {
+                        out[offset..offset + bytes].copy_from_slice(&pixel[..bytes]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Composite the panel into a completed packed shadow. `scale_y` is an
+/// integer because a Mode 13h output may consume several source rows per
+/// physical row; glyph rows are repeated, never fractionally resampled.
 pub fn paint(
     out: &mut [u8],
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    scale_y: usize,
     fmt: PixelFormat,
 ) {
+    let scale_y = scale_y.max(1);
     if PICKER.load(Ordering::Relaxed) {
-        paint_picker(out, stride, w, h, logical_w, fmt);
+        paint_picker(out, stride, w, h, scale_y, fmt);
         return;
     }
     let tab = active_tab();
@@ -416,33 +446,35 @@ pub fn paint(
     // Title + tab bar + items + footer.
     let rows = count + 3;
     let panel_w = COLS * CELL_W + PAD * 2;
-    let panel_h = rows * CELL_H + PAD * 2;
-    if logical_w < panel_w || h < panel_h {
+    let base_panel_h = rows * CELL_H + PAD * 2;
+    let scale_y = scale_y.min(h / base_panel_h).max(1);
+    let panel_h = base_panel_h * scale_y;
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga::overlay_fill_xscaled(
-        out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
+    vga::overlay_fill(
+        out, stride, w, h, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga::overlay_fill_xscaled(
-        out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
+    vga::overlay_fill(
+        out, stride, w, h, x0, y0, panel_w, (CELL_H + PAD) * scale_y, TITLE_BG, fmt,
     );
 
     let tx = x0 + PAD;
-    let mut ty = y0 + PAD;
+    let mut ty = y0 + PAD * scale_y;
     let mut title = Line::new();
     title.put(b"RetroOS Monitor  ");
     title.put(active_tab_name(tab));
-    vga::overlay_text_xscaled(
-        out, stride, w, h, logical_w, tx, ty,
+    paint_text(
+        out, stride, w, h, tx, ty, scale_y,
         title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
-    ty += CELL_H;
+    ty += CELL_H * scale_y;
 
-    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, fmt);
-    ty += CELL_H;
+    paint_tabs(out, stride, w, h, tx, ty, tab, scale_y, fmt);
+    ty += CELL_H * scale_y;
 
     let sel = active_sel(tab);
     for item in 0..count {
@@ -450,20 +482,20 @@ pub fn paint(
         item_line(tab, item, &mut line);
         let selected = item == sel;
         if selected {
-            vga::overlay_fill_xscaled(
-                out, stride, w, h, logical_w, x0 + PAD / 2, ty,
-                panel_w - PAD, CELL_H, SEL_BG, fmt,
+            vga::overlay_fill(
+                out, stride, w, h, x0 + PAD / 2, ty,
+                panel_w - PAD, CELL_H * scale_y, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-        vga::overlay_text_xscaled(
-            out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
+        paint_text(
+            out, stride, w, h, tx, ty, scale_y, line.as_bytes(), fg, bg, fmt,
         );
-        ty += CELL_H;
+        ty += CELL_H * scale_y;
     }
 
-    vga::overlay_text_xscaled(
-        out, stride, w, h, logical_w, tx, ty,
+    paint_text(
+        out, stride, w, h, tx, ty, scale_y,
         b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
 }
@@ -473,10 +505,10 @@ fn paint_tabs(
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
     tx: usize,
     ty: usize,
     active: usize,
+    scale_y: usize,
     fmt: PixelFormat,
 ) {
     let mut x = tx;
@@ -488,13 +520,13 @@ fn paint_tabs(
         let selected = tab == active;
         let label_w = label.len() * CELL_W + CELL_W;
         if selected {
-            vga::overlay_fill_xscaled(
-                out, stride, w, h, logical_w, x, ty, label_w, CELL_H, SEL_BG, fmt,
+            vga::overlay_fill(
+                out, stride, w, h, x, ty, label_w, CELL_H * scale_y, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-        vga::overlay_text_xscaled(
-            out, stride, w, h, logical_w, x + CELL_W / 2, ty, label, fg, bg, fmt,
+        paint_text(
+            out, stride, w, h, x + CELL_W / 2, ty, scale_y, label, fg, bg, fmt,
         );
         x += label_w + CELL_W;
     }
@@ -506,62 +538,64 @@ fn paint_picker(
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    scale_y: usize,
     fmt: PixelFormat,
 ) {
     let count = PROC_COUNT.load(Ordering::Relaxed);
     let rows = count.max(1) + 2; // title + list (≥1 line) + footer
     let panel_w = COLS * CELL_W + PAD * 2;
-    let panel_h = rows * CELL_H + PAD * 2;
-    if logical_w < panel_w || h < panel_h {
+    let base_panel_h = rows * CELL_H + PAD * 2;
+    let scale_y = scale_y.min(h / base_panel_h).max(1);
+    let panel_h = base_panel_h * scale_y;
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
-    vga::overlay_fill_xscaled(
-        out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
+    vga::overlay_fill(
+        out, stride, w, h, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
-    vga::overlay_fill_xscaled(
-        out, stride, w, h, logical_w, x0, y0, panel_w, CELL_H + PAD, TITLE_BG, fmt,
+    vga::overlay_fill(
+        out, stride, w, h, x0, y0, panel_w, (CELL_H + PAD) * scale_y, TITLE_BG, fmt,
     );
 
     let tx = x0 + PAD;
-    let mut ty = y0 + PAD;
-    vga::overlay_text_xscaled(
-        out, stride, w, h, logical_w, tx, ty,
+    let mut ty = y0 + PAD * scale_y;
+    paint_text(
+        out, stride, w, h, tx, ty, scale_y,
         b"Switch to task", TITLE_FG, TITLE_BG, fmt,
     );
-    ty += CELL_H;
+    ty += CELL_H * scale_y;
 
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
-        vga::overlay_text_xscaled(
-            out, stride, w, h, logical_w, tx, ty,
+        paint_text(
+            out, stride, w, h, tx, ty, scale_y,
             b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
         );
-        ty += CELL_H;
+        ty += CELL_H * scale_y;
     } else {
         for idx in 0..count {
             let mut line = Line::new();
             proc_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
-                vga::overlay_fill_xscaled(
-                    out, stride, w, h, logical_w, x0 + PAD / 2, ty,
-                    panel_w - PAD, CELL_H, SEL_BG, fmt,
+                vga::overlay_fill(
+                    out, stride, w, h, x0 + PAD / 2, ty,
+                    panel_w - PAD, CELL_H * scale_y, SEL_BG, fmt,
                 );
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
-            vga::overlay_text_xscaled(
-                out, stride, w, h, logical_w, tx, ty, line.as_bytes(), fg, bg, fmt,
+            paint_text(
+                out, stride, w, h, tx, ty, scale_y, line.as_bytes(), fg, bg, fmt,
             );
-            ty += CELL_H;
+            ty += CELL_H * scale_y;
         }
     }
 
-    vga::overlay_text_xscaled(
-        out, stride, w, h, logical_w, tx, ty,
+    paint_text(
+        out, stride, w, h, tx, ty, scale_y,
         b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
     );
 }
