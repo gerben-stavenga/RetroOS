@@ -248,13 +248,19 @@ pub fn advance<A: crate::Arch>(
         fill = requested.min(output.inner.max_ahead_frames()) as u32;
         if written < consumed {
             // The consumer crossed the producer frontier. Rebase immediately
-            // and abandon the missed interval; replaying it would overrun the
-            // newly reset ring.
+            // and produce this pump at the reset cursor. Tell the pacer that
+            // the new pipe is empty so it starts rebuilding the requested
+            // depth; nominal-rate production from depth zero can otherwise
+            // lose every race with a block-granular hardware cursor. This is
+            // feedback, not priming: no silence is claimed and source time
+            // advances only by this call's elapsed interval.
             output.recover_from_underrun();
+            written = consumed;
             output.last_consumed = consumed;
             output.ms_since_cursor = 0;
-            output.rate_q16 = None;
-            elapsed_ms = 0;
+            output.rate_q16 = Some(output.producer.update_rate(
+                written, consumed, fill, elapsed_ms,
+            ));
         }
 
         // Correct only when the block-granular play cursor moves. Between
