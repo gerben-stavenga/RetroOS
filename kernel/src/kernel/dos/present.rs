@@ -262,13 +262,17 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
                         .expect("ready VGA shadow is missing");
                 if crate::kernel::osd::is_open() {
+                    let vga_w = ::vga::dimensions(mode).0;
                     let format = display.rgb;
+                    let (logical_w, scale_y) =
+                        display.osd_shadow_layout(vga_w, out_w, vga_h);
                     crate::kernel::osd::paint(
                         shadow,
                         out_w * format.bytes_per_pixel as usize,
                         out_w,
                         vga_h,
-                        display.osd_shadow_y_scale(vga_h),
+                        logical_w,
+                        scale_y,
                         format,
                     );
                 }
@@ -311,7 +315,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             core::slice::from_raw_parts_mut(fb.as_mut_ptr() as *mut u8, fb.len() * 4)
         };
         crate::kernel::osd::paint(
-            bytes, w * 4, w, h, 1, ::vga::PixelFormat::NATIVE,
+            bytes, w * 4, w, h, w, 1, ::vga::PixelFormat::NATIVE,
         );
     }
     let p2 = if prof { machine.rdtsc() } else { 0 };

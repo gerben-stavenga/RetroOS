@@ -109,12 +109,14 @@ fn scanout(display: &mut Display, frame: &Frame<'_>) {
         vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
     if crate::kernel::osd::is_open() {
+        let (logical_w, scale_y) = display.osd_shadow_layout(w, out_w, h);
         crate::kernel::osd::paint(
             &mut s.surface[..row_bytes * h],
             row_bytes,
             out_w,
             h,
-            display.osd_shadow_y_scale(h),
+            logical_w,
+            scale_y,
             format,
         );
     }

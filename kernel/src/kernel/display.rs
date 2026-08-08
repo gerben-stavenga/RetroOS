@@ -185,12 +185,22 @@ impl Display {
     pub fn is_vga(&self) -> bool {
         matches!(self.backend, Backend::Vbe { .. } | Backend::Vga { .. })
     }
-    /// Integer vertical enlargement needed while composing into a source-row
-    /// shadow that will later be reduced into the Mode 13h framebuffer.
-    pub(crate) fn osd_shadow_y_scale(&self, shadow_height: usize) -> usize {
+    /// OSD coordinates for a completed VGA shadow. Normal outputs retain the
+    /// guest's logical width so the OSD follows the same X/Y enlargement as
+    /// the picture. Mode 13h fallback instead uses the already-reduced shadow
+    /// width and an integer source-row multiplier.
+    pub(crate) fn osd_shadow_layout(
+        &self,
+        source_width: usize,
+        shadow_width: usize,
+        shadow_height: usize,
+    ) -> (usize, usize) {
         match &self.backend {
-            Backend::Vga { framebuffer, .. } => (shadow_height / framebuffer.height).max(1),
-            _ => 1,
+            Backend::Vga { framebuffer, .. } => (
+                shadow_width,
+                (shadow_height / framebuffer.height).max(1),
+            ),
+            _ => (source_width, 1),
         }
     }
     pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
