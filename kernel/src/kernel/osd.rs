@@ -4,7 +4,7 @@
 //! (nothing reaches the guest) until Esc/F12 closes it. The guest keeps
 //! RUNNING behind the panel — so a volume change is heard at once and the frame
 //! under the menu keeps updating. This replaces the old one-key-per-action
-//! chords (F10 profile / F11 switch / F12 dump): one discoverable door.
+//! debug/switch hotkeys: one discoverable door.
 //!
 //! Actions fold into machinery that already exists — Switch opens a task picker
 //! that targets the focus-switch request, Trace the shared DOS/DPMI/Linux
@@ -13,8 +13,7 @@
 //! `Exit` for the focused thread, exactly as the SEGV path does). Volume is the
 //! one new knob: a runtime master gain multiplied into the single mix-out clip.
 //!
-//! State is a handful of single-threaded atomics — the same volatile-flag shape
-//! as [`thread::request_switch`]. Input handling ([`key`]) lives here but is
+//! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
 //! called from [`console`](crate::kernel::console), which has the `machine`/
 //! `regs`/`DosState` the Dump action needs; painting ([`paint`]) is called from
 //! the DOS display tick, the one place both backends hold a finished frame.

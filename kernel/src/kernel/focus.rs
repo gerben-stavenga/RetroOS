@@ -1,8 +1,8 @@
 //! Console focus: which thread owns the display, keyboard, mouse — and the
 //! machine's Sound Blaster when a guest is driving it directly.
 //!
-//! Focus is orthogonal to scheduling — F11 moves FOCUS (a console-ownership
-//! transfer: snapshot the old owner's screen state, repaint the new
+//! Focus is orthogonal to scheduling — the F12 task picker moves FOCUS (a
+//! console-ownership transfer: snapshot the old owner's screen state, repaint the new
 //! owner's, swap the I/O bitmap so the real card follows the owner); the
 //! scheduler decides who RUNS. Today the event loop runs the focused
 //! thread, so every focus transfer is accompanied by an execution switch —
@@ -36,7 +36,7 @@ pub fn release<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     old: &mut Personality<A>,
-) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (crate::kernel::display::DisplayHandoff, Option<crate::kernel::drivers::sb16::SbCard>) {
     let card = old.release_sb(machine);
     (old.suspend(machine, bios_workspace), card)
 }
@@ -53,7 +53,7 @@ pub fn acquire<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     new_tid: usize,
     new: &mut Personality<A>,
-    display: crate::kernel::display::Display,
+    display: crate::kernel::display::DisplayHandoff,
     card: Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<crate::kernel::drivers::sb16::SbCard> {
     new.materialize(machine, bios_workspace, display);

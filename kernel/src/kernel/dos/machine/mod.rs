@@ -511,7 +511,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
             core::ptr::addr_of_mut!((*p).skip_irq).write(false);
             core::ptr::addr_of_mut!((*p).e0_pending).write(false);
-            core::ptr::addr_of_mut!((*p).vga).write(vga::DosVga::new());
+            core::ptr::addr_of_mut!((*p).vga).write(vga::DosVga::new(machine));
             core::ptr::addr_of_mut!((*p).voodoo).write(vvoodoo::VVoodoo::new());
             core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
@@ -589,7 +589,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
             if let vga::DosVga::Emulated(dev) = &mut pc.vga {
-                dev.model.ac_state.pending_data = false;
+                dev.state.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
             crate::kernel::drivers::vga_hw::track_ac_reset();
@@ -599,8 +599,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
             match &mut pc.vga {
-                vga::DosVga::Emulated(dev) => dev.model.port_read(port),
+                vga::DosVga::Emulated(dev) => dev.state.port_read(port),
                 vga::DosVga::Native(_) => machine.inb(port),
+                vga::DosVga::Transition => panic!("VGA port read during ownership transition"),
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
@@ -700,7 +701,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
             if let vga::DosVga::Emulated(dev) = &mut pc.vga {
-                dev.model.port_write(port, val);
+                dev.state.port_write(port, val);
                 return;
             }
             // Native card: the flip-flop and index are write-only in the
@@ -713,7 +714,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 machine.outb(port, val);
                 return;
             };
-            dev.model.port_write(port, val);
+            dev.state.port_write(port, val);
             // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
             // select a plane — drive the A0000 paging alias.
             if port == 0x3C5 {

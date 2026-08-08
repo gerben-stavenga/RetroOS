@@ -44,6 +44,32 @@ pub struct Display {
     backend: Backend,
 }
 
+/// Console ownership in transit. A native VGA does not become a kernel
+/// render surface merely because it moves from one DOS owner to another.
+pub enum DisplayHandoff {
+    Surface(Display),
+    NativeVga(crate::kernel::platform::NativeVga),
+}
+
+impl DisplayHandoff {
+    /// Materialize a surface only for an owner that actually renders through
+    /// [`Display`] (Linux or the kernel console).
+    pub fn into_surface<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    ) -> Display {
+        match self {
+            Self::Surface(display) => display,
+            Self::NativeVga(native) => Display::new_selected(
+                machine,
+                bios.expect("native VGA surface without BIOS workspace"),
+                native,
+            ),
+        }
+    }
+}
+
 enum Backend {
     Linear(Framebuffer),
     Vbe {
@@ -77,6 +103,25 @@ impl core::fmt::Debug for Display {
 }
 
 impl Display {
+    /// Construct the kernel display mode selected once during BIOS discovery.
+    /// `Platform::vbe_mode == None` means Mode 13h was the startup selection;
+    /// it is not a per-call recovery policy.
+    pub fn new_selected<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        mut native: crate::kernel::platform::NativeVga,
+    ) -> Self {
+        match crate::kernel::platform::get().vbe_mode {
+            Some(mode) => Self::new_vbe(machine, bios, native, mode)
+                .unwrap_or_else(|_| panic!("selected VBE display mode {:#x} failed", mode.number)),
+            None => {
+                bios.bios_set_mode(machine, &mut native, 0x13)
+                    .expect("selected Mode 13h display failed");
+                Self::new_vga(native)
+            }
+        }
+    }
+
     pub fn from_framebuffer(
         framebuffer: Framebuffer,
         format: FormatSpec,
@@ -163,7 +208,7 @@ impl Display {
             wide: policy.wide,
         };
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
-        crate::println!("OSD: VBE {}x{}x{} mode={:#x}",
+        crate::println!("Display: VBE {}x{}x{} mode={:#x}",
             mode.width, mode.height, mode.bits_per_pixel, mode.number);
         Ok(Self {
             shadow_width,
@@ -187,7 +232,7 @@ impl Display {
     }
     /// OSD coordinates for a completed VGA shadow. Normal outputs retain the
     /// guest's logical width so the OSD follows the same X/Y enlargement as
-    /// the picture. Mode 13h fallback instead uses the already-reduced shadow
+    /// the picture. A selected Mode 13h surface instead uses the already-reduced shadow
     /// width and an integer source-row multiplier.
     pub(crate) fn osd_shadow_layout(
         &self,

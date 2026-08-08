@@ -289,17 +289,17 @@ pub enum MmioTarget<'a> {
 
 impl MmioTarget<'_> {
     #[inline]
-    fn write8(&mut self, off: u32, val: u8) {
+    fn write8<A: crate::Arch>(&mut self, machine: &mut A, off: u32, val: u8) {
         match self {
-            Self::Planar(vga) => vga::vram_write(vga, off, val),
+            Self::Planar(vga) => vga::vram_write(machine, vga, off, val),
             Self::Voodoo(vd) => vd.write8(off, val),
         }
     }
 
     #[inline]
-    fn read8(&mut self, off: u32) -> u8 {
+    fn read8<A: crate::Arch>(&mut self, machine: &mut A, off: u32) -> u8 {
         match self {
-            Self::Planar(vga) => vga::vram_read(vga, off),
+            Self::Planar(vga) => vga::vram_read(machine, vga, off),
             Self::Voodoo(vd) => vd.read8(off),
         }
     }
@@ -380,7 +380,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
-            target.write8(off, val);
+            target.write8(machine, off, val);
         }
         // mov r/m16/32, r
         0x89 => {
@@ -388,12 +388,12 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let sz = opsize(op32, false);
             let val = gpr(regs, (modrm >> 3) & 7, sz);
             i += modrm_len(modrm, addr32, peek, i);
-            for b in 0..sz { target.write8(off + b, (val >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
         }
         // mov r8, r/m8 — load
         0x8A => {
             let modrm = peek(i);
-            let v = target.read8(off);
+            let v = target.read8(machine, off);
             set_gpr(regs, (modrm >> 3) & 7, 1, v as u32);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -402,7 +402,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let modrm = peek(i);
             let sz = opsize(op32, false);
             let mut v = 0u32;
-            for b in 0..sz { v |= (target.read8(off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (target.read8(machine, off + b) as u32) << (b * 8); }
             set_gpr(regs, (modrm >> 3) & 7, sz, v);
             i += modrm_len(modrm, addr32, peek, i);
         }
@@ -414,14 +414,14 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         0xA0 | 0xA1 => {
             let sz = opsize(op32, opcode == 0xA0);
             let mut v = 0u32;
-            for b in 0..sz { v |= (target.read8(off + b) as u32) << (b * 8); }
+            for b in 0..sz { v |= (target.read8(machine, off + b) as u32) << (b * 8); }
             set_gpr(regs, 0, sz, v);
             i += if addr32 { 4 } else { 2 };
         }
         0xA2 | 0xA3 => {
             let sz = opsize(op32, opcode == 0xA2);
             let val = gpr(regs, 0, sz);
-            for b in 0..sz { target.write8(off + b, (val >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
             i += if addr32 { 4 } else { 2 };
         }
         // mov r/m8, imm8
@@ -430,7 +430,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let l = modrm_len(modrm, addr32, peek, i);
             let imm = peek(i + l);
             i += l + 1;
-            target.write8(off, imm);
+            target.write8(machine, off, imm);
         }
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
@@ -440,7 +440,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let mut imm = 0u32;
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
             i += l + sz;
-            for b in 0..sz { target.write8(off + b, (imm >> (b * 8)) as u8); }
+            for b in 0..sz { target.write8(machine, off + b, (imm >> (b * 8)) as u8); }
         }
         // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
         // touch planar VRAM: the read half loads the GC latches, the write half
@@ -453,8 +453,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let ridx = (modrm >> 3) & 7;
             let regval = gpr(regs, ridx, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
-            let memval = target.read8(off);
-            target.write8(off, regval);
+            let memval = target.read8(machine, off);
+            target.write8(machine, off, regval);
             set_gpr(regs, ridx, 1, memval as u32);
         }
         // xchg r/m16/32, r — the word/dword form, byte-by-byte so each byte
@@ -467,8 +467,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             i += modrm_len(modrm, addr32, peek, i);
             let mut memval = 0u32;
             for b in 0..sz {
-                memval |= (target.read8(off + b) as u32) << (b * 8);
-                target.write8(off + b, (regval >> (b * 8)) as u8);
+                memval |= (target.read8(machine, off + b) as u32) << (b * 8);
+                target.write8(machine, off + b, (regval >> (b * 8)) as u8);
             }
             set_gpr(regs, ridx, sz, memval);
         }
@@ -481,7 +481,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let df = regs.frame.rflags & (1 << 10) != 0;
             for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
-                for b in 0..sz { target.write8(o + b, (al >> (b * 8)) as u8); }
+                for b in 0..sz { target.write8(machine, o + b, (al >> (b * 8)) as u8); }
             }
             // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
             // isn't drained, leave EIP on the instruction (`not_done`) to resume.
@@ -511,7 +511,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             for n in 0..chunk {
                 let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
                 let mut val = 0u32;
-                for b in 0..sz { val |= (target.read8(o + b) as u32) << (b * 8); }
+                for b in 0..sz { val |= (target.read8(machine, o + b) as u32) << (b * 8); }
                 set_gpr(regs, 0, sz, val);
             }
             let step = chunk * sz;
@@ -557,12 +557,12 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                     // VRAM→VRAM `rep movs` (Keen's Galaxy engine composites screens
                     // from off-screen VRAM) is the correct EGA latch copy.
                     let byte = if let Some(o) = target.offset(src) {
-                        target.read8(o)
+                        target.read8(machine, o)
                     } else {
                         machine.read::<u8>(src as usize)
                     };
                     if let Some(o) = target.offset(dst) {
-                        target.write8(o, byte);
+                        target.write8(machine, o, byte);
                     } else {
                         machine.write::<u8>(dst as usize, byte);
                     }
@@ -602,7 +602,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             while done_n < chunk {
                 let o = if df { off.wrapping_sub(done_n * sz) } else { off.wrapping_add(done_n * sz) };
                 let mut mem = 0u32;
-                for b in 0..sz { mem |= (target.read8(o + b) as u32) << (b * 8); }
+                for b in 0..sz { mem |= (target.read8(machine, o + b) as u32) << (b * 8); }
                 alu(regs, 7, acc, mem, sz); // CMP acc, mem — flags only
                 done_n += 1;
                 if rep {
@@ -644,8 +644,8 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 for b in 0..sz {
                     let s = ds_base.wrapping_add(si).wrapping_add(b);
                     let d = es_base.wrapping_add(di).wrapping_add(b);
-                    let sb = match target.offset(s) { Some(o) => target.read8(o), None => machine.read::<u8>(s as usize) };
-                    let db = match target.offset(d) { Some(o) => target.read8(o), None => machine.read::<u8>(d as usize) };
+                    let sb = match target.offset(s) { Some(o) => target.read8(machine, o), None => machine.read::<u8>(s as usize) };
+                    let db = match target.offset(d) { Some(o) => target.read8(machine, o), None => machine.read::<u8>(d as usize) };
                     src1 |= (sb as u32) << (b * 8);
                     src2 |= (db as u32) << (b * 8);
                 }
@@ -694,7 +694,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (target.read8(off + b) as u32) << (b * 8);
+                mem |= (target.read8(machine, off + b) as u32) << (b * 8);
             }
             if reg_is_dst {
                 let res = alu(regs, group, reg, mem, sz);
@@ -706,7 +706,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 if group != 7 {
                     // CMP: no write-back
                     for b in 0..sz {
-                        target.write8(off + b, (res >> (b * 8)) as u8);
+                        target.write8(machine, off + b, (res >> (b * 8)) as u8);
                     }
                 }
             }
@@ -725,7 +725,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let reg = gpr(regs, ridx, sz);
             let mut mem = 0u32;
             for b in 0..sz {
-                mem |= (target.read8(off + b) as u32) << (b * 8);
+                mem |= (target.read8(machine, off + b) as u32) << (b * 8);
             }
             alu(regs, 4, mem, reg, sz); // group 4 = AND, result discarded
         }
@@ -750,11 +750,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             }
             i += l + immsz;
             let mut mem = 0u32;
-            for b in 0..sz { mem |= (target.read8(off + b) as u32) << (b * 8); }
+            for b in 0..sz { mem |= (target.read8(machine, off + b) as u32) << (b * 8); }
             let res = alu(regs, group, mem, imm, sz);
             if group != 7 {
                 // CMP: flags only, no write-back
-                for b in 0..sz { target.write8(off + b, (res >> (b * 8)) as u8); }
+                for b in 0..sz { target.write8(machine, off + b, (res >> (b * 8)) as u8); }
             }
         }
         // x87 stores into the aperture: `fst`/`fstp` (ModR/M reg field 2 and 3)
@@ -778,7 +778,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 _ => (2, f80_to_int(st0, 16) as i16 as u16 as u64),
             };
             for b in 0..bytes {
-                target.write8(off + b, (raw >> (b * 8)) as u8);
+                target.write8(machine, off + b, (raw >> (b * 8)) as u8);
             }
             // Every integer store but `fist` pops, as does `fstp`.
             if ext == 3 || ext == 7 {

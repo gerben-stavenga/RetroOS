@@ -12,14 +12,21 @@ use alloc::vec::Vec;
 pub enum BiosError {
     NoNativeBios,
     Rejected(u16),
+    InvalidStateSize,
     UnexpectedEvent,
 }
+
+/// Opaque controller state produced by VBE 4F04h. Its layout belongs to the
+/// machine's video BIOS; the kernel only carries it between ownership turns.
+pub struct VbeState(Vec<u8>);
 
 pub struct BiosDisplayWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
     fx: A::Fx,
     modes: Vec<crate::kernel::platform::VbeMode>,
+    state_bytes: Option<usize>,
+    state_probed: bool,
 }
 
 impl<A: Arch> BiosDisplayWorkspace<A> {
@@ -36,7 +43,114 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
             bios_vcpu: Vcpu::new(Regs::empty(), bios_space),
             fx: machine.clean_fx_template(),
             modes: Vec::new(),
+            state_bytes: None,
+            state_probed: false,
         }
+    }
+
+    const STATE_BUFFER: usize = 0x70000;
+    const MAX_STATE_BYTES: usize = 0x10000;
+    // Hardware, DAC and extended-controller state. BIOS data-area state is
+    // deliberately excluded: native firmware executes in a disposable COW
+    // workspace, while the DOS personality owns its independent BDA.
+    const STATE_COMPONENTS: u64 = 0x000D;
+
+    /// Probe VBE's chipset-independent full controller save/restore service.
+    /// Framebuffer memory is deliberately not part of 4F04h; it remains
+    /// display-owner data in `VgaState`.
+    fn probe_state_size(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::NativeVga,
+    ) -> Option<usize> {
+        if crate::kernel::platform::get().firmware
+            != crate::kernel::platform::Firmware::NativeBios
+        {
+            return None;
+        }
+        let mut regs = Regs::empty();
+        self.with_bios_clone(
+            machine,
+            display,
+            &mut regs,
+            |_, regs| {
+                regs.rax = 0x4F04;
+                regs.rcx = Self::STATE_COMPONENTS;
+                regs.rdx = 0;
+            },
+            |_, regs| {
+                if regs.rax as u16 != 0x004F { return None; }
+                let bytes = usize::from(regs.rbx as u16).checked_mul(64)?;
+                (bytes != 0 && bytes <= Self::MAX_STATE_BYTES).then_some(bytes)
+            },
+        ).ok().flatten()
+    }
+
+    /// Save all firmware-visible controller state. Failure means the caller
+    /// should retain its direct-register fallback; it is not a fatal display
+    /// error because many plain VGA BIOSes predate VBE.
+    pub fn bios_save_state(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::NativeVga,
+    ) -> Option<VbeState> {
+        if !self.state_probed {
+            self.state_bytes = self.probe_state_size(machine, display);
+            self.state_probed = true;
+        }
+        let bytes = self.state_bytes?;
+        let mut regs = Regs::empty();
+        self.with_bios_clone(
+            machine,
+            display,
+            &mut regs,
+            |machine, regs| {
+                machine.copy_to(Self::STATE_BUFFER, &alloc::vec![0; bytes]);
+                regs.rax = 0x4F04;
+                regs.rcx = Self::STATE_COMPONENTS;
+                regs.rdx = 1;
+                regs.es = (Self::STATE_BUFFER >> 4) as u64;
+                regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+            },
+            |machine, regs| {
+                if regs.rax as u16 != 0x004F { return None; }
+                let mut state = alloc::vec![0; bytes];
+                machine.copy_from(Self::STATE_BUFFER, &mut state);
+                Some(VbeState(state))
+            },
+        ).ok().flatten()
+    }
+
+    /// Restore a blob returned by [`bios_save_state`](Self::bios_save_state).
+    /// Call this after restoring framebuffer memory: VBE state includes the
+    /// exact hidden VGA/SVGA sequencing state that direct memory access would
+    /// otherwise disturb.
+    pub fn bios_restore_state(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::NativeVga,
+        state: &VbeState,
+    ) -> Result<(), BiosError> {
+        if state.0.is_empty() || state.0.len() > Self::MAX_STATE_BYTES {
+            return Err(BiosError::InvalidStateSize);
+        }
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_clone(
+            machine,
+            display,
+            &mut regs,
+            |machine, regs| {
+                machine.copy_to(Self::STATE_BUFFER, &state.0);
+                regs.rax = 0x4F04;
+                regs.rcx = Self::STATE_COMPONENTS;
+                regs.rdx = 2;
+                regs.es = (Self::STATE_BUFFER >> 4) as u64;
+                regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+            },
+            |_, _| (),
+        )?;
+        let status = regs.rax as u16;
+        if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
     }
 
     /// Set a legacy (00h..FFh) or VBE (100h and above) mode through the
@@ -132,6 +246,15 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
             != crate::kernel::platform::Firmware::NativeBios
         {
             return None;
+        }
+        self.state_bytes = self.probe_state_size(machine, bios_display);
+        self.state_probed = true;
+        if let Some(bytes) = self.state_bytes {
+            crate::println!("VGA: VBE 4F04 state save/restore ({} bytes) — exact ownership handoff", bytes);
+        } else if crate::kernel::platform::get().vga_readback {
+            crate::println!("VGA: VBE 4F04 unavailable — using Cirrus CR22/24/26 readbacks");
+        } else {
+            crate::println!("VGA: WARNING no VBE state service or Cirrus readbacks — full process VGA restore NOT supported");
         }
         const INFO: usize = 0x9000;
         const MODE_INFO: usize = 0x9200;

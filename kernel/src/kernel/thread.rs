@@ -181,10 +181,13 @@ impl<A: crate::Arch> Personality<A> {
     pub fn adopt_display(
         &mut self,
         machine: &mut A,
+        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
         display: crate::kernel::display::Display,
     ) {
         match self {
-            Self::Dos(d) => d.materialize(machine, display),
+            Self::Dos(d) => d.materialize(
+                machine, bios_workspace,
+                crate::kernel::display::DisplayHandoff::Surface(display)),
             Self::Linux(_) => crate::kernel::linux::adopt_console_vga(display),
         }
     }
@@ -230,13 +233,10 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-    ) -> crate::kernel::display::Display {
+    ) -> crate::kernel::display::DisplayHandoff {
         match self {
-            Self::Dos(d) => match bios_workspace {
-                Some(workspace) => d.suspend_for_osd(machine, workspace),
-                None => d.suspend(machine),
-            },
-            Self::Linux(l) => l.suspend(machine),
+            Self::Dos(d) => d.suspend(machine, bios_workspace),
+            Self::Linux(l) => crate::kernel::display::DisplayHandoff::Surface(l.suspend(machine)),
         }
     }
 
@@ -296,14 +296,14 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-        display: crate::kernel::display::Display,
+        display: crate::kernel::display::DisplayHandoff,
     ) {
         match self {
-            Self::Dos(d) => match bios_workspace {
-                Some(workspace) => d.materialize_from_osd(machine, workspace, display),
-                None => d.materialize(machine, display),
-            },
-            Self::Linux(l) => l.materialize(machine, display),
+            Self::Dos(d) => d.materialize(machine, bios_workspace, display),
+            Self::Linux(l) => {
+                let display = display.into_surface(machine, bios_workspace);
+                l.materialize(machine, display);
+            }
         }
     }
 
@@ -861,22 +861,8 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
-/// Focus-switch request. `SWITCH_REQUESTED` is the round-robin flag; `SWITCH_TO`
-/// (a tid, else -1) is the F12 picker's targeted choice, honored ahead of it.
-static mut SWITCH_REQUESTED: bool = false;
+/// Target selected by the F12 task picker (a tid, or -1 when idle).
 static SWITCH_TO: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
-
-pub fn request_switch() {
-    unsafe { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, true); }
-}
-
-pub fn take_switch_request() -> bool {
-    unsafe {
-        let v = core::ptr::read_volatile(&raw const SWITCH_REQUESTED);
-        if v { core::ptr::write_volatile(&raw mut SWITCH_REQUESTED, false); }
-        v
-    }
-}
 
 /// Ask to focus a specific thread (the F12 picker's selection).
 pub fn request_switch_to(tid: usize) {
@@ -889,22 +875,6 @@ pub fn take_switch_target() -> Option<usize> {
     if v >= 0 { Some(v as usize) } else { None }
 }
 
-/// Round-robin: next active thread after current (skips thread 0).
-/// Includes Blocked threads — F11 refocuses a blocked parent (VGA restore)
-/// without unblocking it. Only Unused/Zombie are skipped.
-pub fn cycle_next<A: crate::Arch>(threads: &[Thread<A>], current_tid: usize) -> Option<usize> {
-    let cur = current_tid;
-    for offset in 1..MAX_THREADS {
-        let i = (cur + offset) % MAX_THREADS;
-        if i == 0 { continue; }
-        match threads[i].kernel.state {
-            ThreadState::Ready | ThreadState::Running | ThreadState::Blocked => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
-
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
 pub fn exit_thread<A: crate::Arch>(
@@ -913,7 +883,7 @@ pub fn exit_thread<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     tid: usize,
     exit_code: i32,
-    display_handoff: &mut Option<crate::kernel::display::Display>,
+    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;

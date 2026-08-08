@@ -30,6 +30,92 @@ fn dimensions_match_modes() {
 }
 
 #[test]
+fn initial_mode3_state_is_complete() {
+    let state = vga_render::VgaState::new_mode3_boxed();
+    assert_eq!(state.classify_mode(), Some(VgaMode::Text80x25));
+    assert_eq!(state.planes.len(), 4 * 0x10000);
+
+    let mut text = vec![0u8; 80 * 25 * 2];
+    vga_render::text_odd_even_merge(&state.planes, &mut text);
+    assert!(text.chunks_exact(2).all(|cell| cell == [b' ', 0x07]));
+
+    for ch in 0..256 {
+        let plane = 0x20000 + ch * 32;
+        let font = ch * 16;
+        assert_eq!(
+            &state.planes[plane..plane + 16],
+            &lib::vga_fonts::FONT_8X16[font..font + 16],
+        );
+    }
+}
+
+#[test]
+fn chain4_munge_is_an_in_place_aperture_and_reversible() {
+    let mut planes = vec![0u8; 4 * 0x10000];
+    for plane in 0..4 {
+        for off in 0..0x10000 {
+            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(61)
+                ^ (off as u8).wrapping_mul(17)
+                ^ (off >> 8) as u8;
+        }
+    }
+    let original = planes.clone();
+    let mut chained = vec![0; 0x10000];
+    vga::chain4_merge(&planes, &mut chained);
+
+    vga::chain4_munge(&mut planes);
+    assert_eq!(&planes[..0x10000], &chained);
+
+    vga::chain4_unmunge(&mut planes);
+    assert_eq!(planes, original);
+}
+
+#[test]
+fn text_odd_even_munge_is_an_in_place_aperture_and_reversible() {
+    let mut planes = vec![0u8; 4 * 0x10000];
+    for plane in 0..4 {
+        for off in 0..0x10000 {
+            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(43)
+                ^ (off as u8).wrapping_mul(29)
+                ^ (off >> 8) as u8;
+        }
+    }
+    let original = planes.clone();
+    let mut text = vec![0; 0x8000];
+    vga::text_odd_even_merge(&planes, &mut text);
+
+    vga::text_odd_even_munge(&mut planes);
+    assert_eq!(&planes[..0x8000], &text);
+
+    vga::text_odd_even_unmunge(&mut planes);
+    assert_eq!(planes, original);
+}
+
+#[test]
+fn cga4_munge_is_an_in_place_aperture_and_reversible() {
+    let mut planes = vec![0u8; 4 * 0x10000];
+    for plane in 0..4 {
+        for off in 0..0x10000 {
+            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(37)
+                ^ (off as u8).wrapping_mul(11)
+                ^ (off >> 8) as u8;
+        }
+    }
+    let original = planes.clone();
+    let mut aperture = vec![0; 0x4000];
+    for i in 0..0x2000 {
+        aperture[i * 2] = planes[i * 2];
+        aperture[i * 2 + 1] = planes[0x10000 + i * 2];
+    }
+
+    vga::cga4_munge(&mut planes);
+    assert_eq!(&planes[..0x4000], &aperture);
+
+    vga::cga4_unmunge(&mut planes);
+    assert_eq!(planes, original);
+}
+
+#[test]
 fn chain4_roundtrips_between_linear_aperture_and_planes() {
     let mut chained = vec![0u8; 0x10000];
     for (i, byte) in chained.iter_mut().enumerate().take(64000) {

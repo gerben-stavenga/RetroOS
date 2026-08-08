@@ -1,8 +1,8 @@
 //! Putting the machine's picture on the machine's display.
 //!
-//! The VGA model, the Voodoo and the OSD all produce pixels; `platform` says
+//! The emulated VGA, the Voodoo and the OSD all produce pixels; `platform` says
 //! what this machine can actually show them on. This is where those meet: when
-//! a frame is due, scan the current owner's model out into a frame, composite
+//! a frame is due, scan the current owner's VGA out into a frame, composite
 //! the overlay, and present it through whatever sink the probe handed over.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
@@ -14,7 +14,7 @@
 use crate::Regs;
 use core::sync::atomic::Ordering;
 
-use super::machine::{PcMachine, vga::{DosVga, SVGA_LFB_BASE}};
+use super::machine::{PcMachine, vga::{DosVga, SVGA_LFB_BASE, VGA_VRAM_BASE}};
 use ::vga::VgaState;
 
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
@@ -100,7 +100,8 @@ fn scanout<'a, A: crate::Arch>(
         if lo > hi { (0, 0) } else { (lo, hi) }
     };
     let (vram, planes): (&[u8], &[u8]) = match mode {
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => (&[], &state.planes),
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } =>
+            (&[], read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000)),
         VgaMode::Mode13h => {
             let (lo, hi) = m13_span();
             (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[])
@@ -183,6 +184,7 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
     let display = match &mut pc.vga {
         DosVga::Emulated(dev) => dev.display.as_mut(),
         DosVga::Native(_) => None,
+        DosVga::Transition => panic!("Voodoo scanout during VGA transition"),
     };
     if let Some(display) = display {
         if display.is_host() {
@@ -215,7 +217,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
     let DosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.model;
+    let vga = &mut dev.state;
     let Some(display) = &mut dev.display else { return };
     if display.is_headless() { return; }
     let prof = crate::kernel::startup::profile_enabled();

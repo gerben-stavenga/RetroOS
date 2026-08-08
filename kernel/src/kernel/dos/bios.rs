@@ -722,6 +722,48 @@ fn cursor_of<A: crate::Arch>(machine: &mut A, page: u8) -> (u32, u32) {
     ((pos >> 8) as u32, (pos & 0xFF) as u32)
 }
 
+/// Apply the VGA BIOS's CGA-palette compatibility mapping. Port 3D9h is a
+/// physical CGA register; EGA/VGA BIOSes emulate it by rewriting Attribute
+/// Controller palette entries. Keeping the 3D9h mirror alone is sufficient
+/// for our CGA renderer but has no visible effect on a native VGA card.
+fn set_cga_compat_palette<A: crate::Arch>(
+    machine: &mut A,
+    pc: &mut super::machine::PcMachine,
+    regs: &mut Regs,
+    function: u8,
+    value: u8,
+) {
+    let mut ac_write = |index: u8, transform: &dyn Fn(u8) -> u8| {
+        let _ = emulate_inb(machine, pc, 0x3DA);
+        emulate_outb(machine, pc, regs, 0x3C0, index);
+        let old = emulate_inb(machine, pc, 0x3C1);
+        emulate_outb(machine, pc, regs, 0x3C0, transform(old));
+    };
+    match function {
+        0 => {
+            // Border/background: AC0 gets the CGA colour; bit 4 selects
+            // foreground intensity for the remaining three entries.
+            let mut background = value & 0x0F;
+            if background & 0x08 != 0 {
+                background += 0x08;
+            }
+            ac_write(0, &|_| background);
+            for index in 1..4 {
+                ac_write(index, &|old| (old & !0x10) | (value & 0x10));
+            }
+        }
+        1 => {
+            // Palette 0/1 is encoded in bit 0 of AC entries 1..3.
+            for index in 1..4 {
+                ac_write(index, &|old| (old & !1) | (value & 1));
+            }
+        }
+        _ => return,
+    }
+    let _ = emulate_inb(machine, pc, 0x3DA);
+    emulate_outb(machine, pc, regs, 0x3C0, 0x20); // palette-address source
+}
+
 /// INT 10h AH=06/07: scroll a text window up (`up`) or down, filling the
 /// vacated lines with blanks in BH's attribute. AL = lines to scroll; 0 (or
 /// any count that covers the window) clears it outright — the "clear the
@@ -909,11 +951,9 @@ fn int10<A: crate::Arch>(
             }
         }
         0x0B => {
-            // CGA palette control, a front-end for Colour-Select (0x3D9).
-            // BH=0: background/border colour from BL bits 0-4; BH=1: the
-            // 320×200 palette from BL bit 0 (1 = cyan/magenta/white,
-            // 0 = green/red/brown). Read-modify-write via the BDA mirror —
-            // the port itself is write-only.
+            // CGA palette control. The BDA/3D9 mirror feeds the emulated CGA;
+            // VGA hardware implements the same BIOS service by changing its
+            // Attribute Controller palette entries.
             let bh = (regs.rbx >> 8) as u8;
             let bl = regs.rbx as u8;
             let old: u8 = bda_field!(machine, crt_palette);
@@ -924,6 +964,7 @@ fn int10<A: crate::Arch>(
             };
             bda_field!(machine, crt_palette = new);
             emulate_outb(machine, &mut dos.pc, regs, 0x3D9, new);
+            set_cga_compat_palette(machine, &mut dos.pc, regs, bh, bl);
         }
         0x0E => {
             // Teletype output: DOS's own, on DOS's own cursor.
@@ -1184,11 +1225,12 @@ fn vbe<A: crate::Arch>(
             let cur = match &dos.pc.vga {
                 super::machine::vga::DosVga::Emulated(dev) => VBE_MODES.iter()
                     .find(|&&(_, w, h, b)| {
-                        w == dev.model.svga_w && h == dev.model.svga_h
-                            && b == dev.model.svga_bpp
+                        w == dev.state.svga_w && h == dev.state.svga_h
+                            && b == dev.state.svga_bpp
                     })
                     .map_or(0, |&(n, ..)| n),
                 super::machine::vga::DosVga::Native(display) => display.vbe_mode().map_or(0, |mode| mode.number),
+                super::machine::vga::DosVga::Transition => panic!("VBE query during VGA transition"),
             };
             regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
             done(regs, true);
@@ -1408,8 +1450,9 @@ fn vbe_window<A: crate::Arch>(
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
         let bank = match &dos.pc.vga {
-            super::machine::vga::DosVga::Emulated(dev) => dev.model.svga_bank,
+            super::machine::vga::DosVga::Emulated(dev) => dev.state.svga_bank,
             super::machine::vga::DosVga::Native(_) => 0,
+            super::machine::vga::DosVga::Transition => panic!("VBE bank query during VGA transition"),
         };
         regs.rdx = (regs.rdx & !0xFFFF) | bank as u64;
     }

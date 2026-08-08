@@ -296,33 +296,106 @@ pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
     }
 }
 
-/// VGA text odd/even deinterleave: split the CPU's linear B8000 view into
-/// character bytes in plane 0 and attribute bytes in plane 1. Text-mode CRTC
-/// word addressing consumes the even plane offsets: cell `i` lives at plane
-/// offset `2*i`, not `i`. The odd plane offsets and all other plane contents
-/// are deliberately left alone.
-pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
-    let cells = (text.len() / 2)
-        .min(0x8000)
-        .min(planes.len().saturating_sub(0x10000).div_ceil(2));
-    for i in 0..cells {
-        let off = i * 2;
-        planes[off] = text[off];
-        planes[0x10000 + off] = text[off + 1];
+const VGA_PLANE_BYTES: usize = 0x10000;
+const CHAIN4_PLANE_BYTES: usize = VGA_PLANE_BYTES / 4;
+
+/// Re-layout four planar 64K banks in place so the first 64K is the chained
+/// CPU aperture. The three quarters of plane 0 displaced by the interleave are
+/// parked in the now-redundant 16K prefixes of planes 1, 2 and 3. No pixel
+/// bytes or second framebuffer are needed; [`chain4_unmunge`] is the exact
+/// inverse.
+pub fn chain4_munge(planes: &mut [u8]) {
+    munge_interleaved(planes, 4, CHAIN4_PLANE_BYTES);
+}
+
+/// Restore the ordinary four-plane layout produced by [`chain4_munge`].
+pub fn chain4_unmunge(planes: &mut [u8]) {
+    unmunge_interleaved(planes, 4, CHAIN4_PLANE_BYTES);
+}
+
+/// Put plane 0's relevant prefix directly into its interleaved positions,
+/// iterating backwards so source bytes are not disturbed. Then swap each
+/// other plane's prefix into its lane; those swaps park every displaced
+/// plane-0 byte in storage that became redundant in the munged layout.
+fn munge_interleaved(planes: &mut [u8], lanes: usize, lane_bytes: usize) {
+    assert!(planes.len() >= lanes * VGA_PLANE_BYTES);
+    for i in (0..lane_bytes).rev() {
+        planes.swap(i, lanes * i);
+    }
+    for plane in 1..lanes {
+        for i in 0..lane_bytes {
+            planes.swap(lanes * i + plane, plane * VGA_PLANE_BYTES + i);
+        }
     }
 }
 
-/// VGA text odd/even interleave: reconstruct the CPU's linear B8000 view from
-/// the even offsets of character plane 0 and attribute plane 1.
+/// Exact inverse of [`munge_interleaved`]: return the other lanes first, then
+/// undo plane 0's backward scatter in forward order.
+fn unmunge_interleaved(planes: &mut [u8], lanes: usize, lane_bytes: usize) {
+    assert!(planes.len() >= lanes * VGA_PLANE_BYTES);
+    for plane in (1..lanes).rev() {
+        for i in 0..lane_bytes {
+            planes.swap(lanes * i + plane, plane * VGA_PLANE_BYTES + i);
+        }
+    }
+    for i in 0..lane_bytes {
+        planes.swap(i, lanes * i);
+    }
+}
+
+/// Make plane 0's first 16K the CGA aperture. Standard modes 4/5 use the
+/// same odd/even + CRTC word addressing as text, only with a 16K window.
+pub fn cga4_munge(planes: &mut [u8]) {
+    assert!(planes.len() >= 2 * VGA_PLANE_BYTES);
+    for i in 0..0x2000 {
+        planes.swap(i * 2 + 1, VGA_PLANE_BYTES + i * 2);
+    }
+}
+
+pub fn cga4_unmunge(planes: &mut [u8]) {
+    cga4_munge(planes);
+}
+
+/// VGA text odd/even deinterleave. In CRTC word mode the displayed cell `i`
+/// occupies offset `2*i` in character plane 0 and attribute plane 1. QEMU
+/// approximates this by shifting CPU addresses, but real VGA scanout does not.
+pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
+    let cells = (text.len() / 2)
+        .min(0x8000)
+        .min(planes.len().saturating_sub(VGA_PLANE_BYTES).div_ceil(2));
+    for i in 0..cells {
+        let off = i * 2;
+        planes[off] = text[off];
+        planes[VGA_PLANE_BYTES + off] = text[off + 1];
+    }
+}
+
+/// Reconstruct the CPU's linear B8000 view from character and attribute planes.
 pub fn text_odd_even_merge(planes: &[u8], text: &mut [u8]) {
     let cells = (text.len() / 2)
         .min(0x8000)
-        .min(planes.len().saturating_sub(0x10000).div_ceil(2));
+        .min(planes.len().saturating_sub(VGA_PLANE_BYTES).div_ceil(2));
     for i in 0..cells {
         let off = i * 2;
         text[off] = planes[off];
-        text[off + 1] = planes[0x10000 + off];
+        text[off + 1] = planes[VGA_PLANE_BYTES + off];
     }
+}
+
+/// Re-layout text odd/even VRAM in place so plane 0's first 32K is the linear
+/// B8000 aperture. Character bytes already occupy plane-0 even positions;
+/// swap its odd positions with plane-1 even positions to insert attributes
+/// while parking every displaced byte. This permutation is self-inverse.
+pub fn text_odd_even_munge(planes: &mut [u8]) {
+    assert!(planes.len() >= 2 * VGA_PLANE_BYTES);
+    for i in 0..CHAIN4_PLANE_BYTES {
+        planes.swap(i * 2 + 1, VGA_PLANE_BYTES + i * 2);
+    }
+}
+
+/// Restore canonical plane-major text VRAM after [`text_odd_even_munge`].
+pub fn text_odd_even_unmunge(planes: &mut [u8]) {
+    text_odd_even_munge(planes);
 }
 
 // ============================================================================
@@ -1885,6 +1958,42 @@ impl VgaState {
             fill_fallback_palette(&mut boxed.dac);
             boxed
         }
+    }
+
+    /// A complete power-on DOS display image. This is the same mode 3 that
+    /// the substitute BIOS publishes in the BDA: registers, palette, blank
+    /// text cells and the 8x16 font plane are all present, so it can be
+    /// rendered in software or restored directly to a real VGA.
+    pub fn new_mode3_boxed() -> alloc::boxed::Box<Self> {
+        let mut state = Self::new_boxed();
+        let regs = bios_mode_regs(3).expect("mode 3 register table");
+        state.misc_output = regs.misc;
+        state.seq = regs.seq;
+        state.gc = regs.gc;
+        state.crtc = regs.crtc;
+        state.planes.resize(4 * 0x10000, 0);
+
+        for i in 0..16 {
+            state.ac[i] = i as u8;
+        }
+        state.ac[0x10] = 0x0C; // text, line-graphics ninth dot, blink
+        state.ac[0x12] = 0x0F; // all colour planes enabled
+        state.ac_state = AcState::new();
+
+        // Mode-3 clear: 80x25 spaces with light-grey-on-black attributes.
+        for cell in 0..80 * 25 {
+            let off = cell * 2;
+            state.planes[off] = b' ';
+            state.planes[0x10000 + off] = 0x07;
+        }
+        // VGA text fonts occupy plane 2 at 32 bytes per character.
+        for ch in 0..256 {
+            let dst = 0x20000 + ch * 32;
+            let src = ch * 16;
+            state.planes[dst..dst + 16]
+                .copy_from_slice(&lib::vga_fonts::FONT_8X16[src..src + 16]);
+        }
+        state
     }
 
     pub fn new() -> Self {

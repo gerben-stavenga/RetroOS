@@ -414,13 +414,6 @@ pub fn probe<A: crate::Arch>(
         "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",
         p.host, p.vga_passthrough, p.firmware, p.audio, p.hostfs, p.debug
     );
-    if p.vga_ports_direct() {
-        if p.vga_readback {
-            println!("VGA: Cirrus readbacks (CR22/24/26) — AC ports direct, exact save/restore");
-        } else {
-            println!("VGA: WARNING no readback extensions — AC ports direct, full process VGA restore NOT supported (flip-flop/latches unrecoverable)");
-        }
-    }
     ProbedPlatform { facts: p, display, audio: audio_token }
 }
 
@@ -488,11 +481,11 @@ pub fn set_vbe_mode(mode: Option<VbeMode>) {
     p.vbe_mode = mode;
     match mode {
         Some(m) => crate::println!(
-            "VBE: preferred mode {:#x} {}x{} pitch={} phys={:#x}",
+            "VBE: selected mode {:#x} {}x{} pitch={} phys={:#x}",
             m.number, m.width, m.height, m.pitch, m.physical_base
         ),
         None if p.vga_passthrough => {
-            crate::println!("VBE: no usable packed linear mode; OSD will use mode 13h")
+            crate::println!("VBE: no usable packed linear mode; selected display is Mode 13h")
         }
         None => {}
     }

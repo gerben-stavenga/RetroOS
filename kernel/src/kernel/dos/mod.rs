@@ -280,6 +280,10 @@ impl<A: crate::Arch> DosState<A> {
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
     pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
+        // The live aperture belongs to this address space. Capture it while
+        // that space is still active so the zombie retains a complete VGA
+        // state for SYNTH_VGA_TAKE.
+        self.pc.vga.suspend_state(machine);
         if let Some(ref mut dpmi) = self.dpmi {
             dpmi.unmap_all_physical(machine);
         }
@@ -309,9 +313,13 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::display::Display {
-        let vga = core::mem::take(&mut self.pc.vga);
-        let (vga, display) = vga.into_emulated(machine);
+    pub(super) fn suspend(
+        &mut self,
+        machine: &mut A,
+        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    ) -> crate::kernel::display::DisplayHandoff {
+        let vga = self.pc.vga.take_for_transition();
+        let (vga, display) = vga.into_emulated(machine, bios_workspace);
         self.pc.vga = vga;
         display
     }
@@ -330,8 +338,9 @@ impl<A: crate::Arch> DosState<A> {
                 crate::kernel::platform::NativeVga::Vbe { bank: Some(_), .. },
             )
             | machine::vga::DosVga::Emulated(_) => None,
+            machine::vga::DosVga::Transition => panic!("OSD opened during VGA transition"),
         };
-        let vga = core::mem::take(&mut self.pc.vga);
+        let vga = self.pc.vga.take_for_transition();
         let (vga, display) = vga.into_emulated_for_osd(machine, bios_workspace);
         self.pc.vga = vga;
         if let Some(mode) = linear_vbe
@@ -353,10 +362,11 @@ impl<A: crate::Arch> DosState<A> {
     pub(super) fn materialize(
         &mut self,
         machine: &mut A,
-        display: crate::kernel::display::Display,
+        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        display: crate::kernel::display::DisplayHandoff,
     ) {
-        let vga = core::mem::take(&mut self.pc.vga);
-        self.pc.vga = vga.present(machine, display);
+        let vga = self.pc.vga.take_for_transition();
+        self.pc.vga = vga.present(machine, display, bios_workspace);
     }
 
     pub(super) fn materialize_from_osd(
@@ -365,7 +375,7 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::Display,
     ) {
-        let vga = core::mem::take(&mut self.pc.vga);
+        let vga = self.pc.vga.take_for_transition();
         self.pc.vga = vga.raise_from_osd(machine, bios_workspace, display);
         let linear_vbe = match &self.pc.vga {
             machine::vga::DosVga::Native(
@@ -587,12 +597,12 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
     let machine::vga::DosVga::Emulated(dev) = &mut dos.pc.vga else { return false };
-    if dev.model.seq[4] & 0x08 != 0 {
+    if dev.state.seq[4] & 0x08 != 0 {
         machine.map_fresh_range((addr as usize) >> 12, 1);
         return true;
     }
     let off = addr - 0xA0000;
-    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.model);
+    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.state);
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 
@@ -659,7 +669,7 @@ pub fn handle_event<A: crate::Arch>(
         }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
         // must NOT yield/schedule — that would hand focus to the next Ready
-        // thread on the very first idle cycle, defeating F11. The Phase 1
+        // thread on the very first idle cycle, defeating task switching. The Phase 1
         // drain re-runs raise_pending each iteration, so any pending IRQ
         // gets injected on the next round.
         KE::Hlt => thread::KernelAction::Done,
@@ -1039,7 +1049,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
             if rv >= 0 {
                 let cur = thread::get_thread(threads, tid).unwrap();
                 let dos = cur.dos_mut();
-                dos.pc.vga.install_saved_state(taken.take().unwrap());
+                dos.pc.vga.install_saved_state(machine, taken.take().unwrap());
                 thread::reap(threads, machine, pid);
             }
             regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
@@ -1048,8 +1058,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
         Op::VgaPeekMode => {
             let rv = thread::with_target_dos(threads, pid, |target| {
                 let machine::vga::DosVga::Emulated(dev) = &target.pc.vga else { return -61 };
-                let state = &dev.model;
-                if state.planes.is_empty() { return -61; }
+                let state = &dev.state;
                 (state.gc[6] & 1) as i32
             });
             if rv < 0 {

@@ -343,7 +343,7 @@ pub fn restore(state: &VgaState) {
 
     // Text mode needs the same treatment, and for the same reason: odd/even
     // is a different address interpretation, so the flat planar pass above
-    // stores each cell where CRTC *word addressing* puts it — plane offset
+    // stores each cell where CRTC word addressing puts it — plane offset
     // 2*i, not i (see `text_odd_even_split`) — and a strict card does not
     // expose that layout through B8000 until the guest's own text mode is
     // programmed. Replay the visible page through the target mode and let

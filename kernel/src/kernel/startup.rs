@@ -33,6 +33,19 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         display,
         audio,
     } = crate::kernel::platform::probe(machine, boot);
+
+    // Select the kernel display once, before anything draws through it.
+    // Preserve a pristine real-mode environment for this and all later
+    // firmware calls; DOS personalities receive their separate substitute BIOS.
+    let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
+    let vbe_mode = display.native_vga()
+        .and_then(|native| bios_workspace.discover_vbe(machine, native));
+    crate::kernel::platform::set_vbe_mode(vbe_mode);
+    let display = match display.into_native_vga(machine) {
+        Ok(native) => crate::kernel::display::Display::new_selected(
+            machine, &mut bios_workspace, native),
+        Err(display) => display,
+    };
     let mut screen = crate::kernel::console::Console::new(display);
 
     // Disk-write policy, applied by COMPOSITION and DECLARED, never inferred.
@@ -224,14 +237,8 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     let sink = crate::kernel::sound::Sink::new(machine, audio, for_sink);
     init_console_pipe();
 
-    // Preserve one kernel-owned pristine real-mode environment. DOS worlds
-    // are cloned from it; later kernel INT 10h calls use the same unmodified
-    // IVT/BDA/ROM view rather than whichever guest happens to be stopped.
-    let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
+    // DOS worlds are cloned from their substitute-BIOS template.
     let mut dos_template = crate::kernel::dos::DosTemplate::new(machine);
-    let vbe_mode = screen.bios_display()
-        .and_then(|native| bios_workspace.discover_vbe(machine, native));
-    crate::kernel::platform::set_vbe_mode(vbe_mode);
 
     run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card, sink)
 }
@@ -636,7 +643,7 @@ fn run_program<A: crate::Arch>(
     {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
-        t.personality.adopt_display(machine, display);
+        t.personality.adopt_display(machine, Some(bios_workspace), display);
     }
 
     if let Some((addr0, addr1)) = debug_watch {
@@ -760,7 +767,7 @@ pub fn event_loop<A: crate::Arch>(
 
 
         // A blocked thread holds the console but not the CPU: wait for input
-        // to unblock it (above) or F11 to move on.
+        // to unblock it (above) or the F12 task picker to move on.
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
@@ -813,7 +820,8 @@ pub fn event_loop<A: crate::Arch>(
                 // Every owner is gone, so both capabilities are back in this
                 // frame — hand them to whoever runs the next program.
                 return (
-                    display_handoff.take().expect("dead display owner lost token"),
+                    display_handoff.take().expect("dead display owner lost token")
+                        .into_surface(machine, bios_workspace.as_deref_mut()),
                     sb_handoff.take(),
                 );
             }
@@ -874,7 +882,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
-    display_handoff: &mut Option<crate::kernel::display::Display>,
+    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {
@@ -1077,12 +1085,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // otherwise we'd save Linux console content into a DOS thread's
             // vga buffer, and the child would later "restore" Linux output
             // when focus returned to it. Cross-personality forks just leave
-            // the child's vga empty; switch_thread's restore is a no-op on
-            // empty planes, so the hardware shows whatever the previous
-            // restore put up — the child draws on top.
+            // the child at its independent initial mode-3 image.
             if parent_is_dos && crate::kernel::dos::physical_vga_present() {
                 let vga = &mut child.dos_mut().pc.vga;
-                *vga = core::mem::take(vga).snapshot_hardware(machine);
+                *vga = vga.take_for_transition().snapshot_hardware(machine);
             }
             machine.outb(0x3D4, 0x0E);
             let cursor_hi = machine.inb(0x3D5) as u16;
@@ -1293,7 +1299,7 @@ pub fn bill_slice2(take: u64, ticks_cyc: u64, display: u64, audio: u64, nticks: 
 
 /// Is the periodic `[prof]` dump on? Written by the F12 monitor, read by the
 /// event loop — the same single-threaded volatile-flag shape as
-/// `thread::request_switch`.
+/// the task picker's atomic target.
 static mut PROFILE_DUMP: bool = false;
 
 /// Toggle the profile dump and report its new state.

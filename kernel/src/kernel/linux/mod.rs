@@ -75,7 +75,7 @@ pub fn save_console_vga() -> crate::kernel::display::Display {
 
 /// Restore the Linux console buffer onto the hardware VGA. On first
 /// activation (no snapshot yet) we clear the screen rather than inherit
-/// the previous personality's framebuffer — keeps F11 into Linux
+/// the previous personality's framebuffer — keeps a task switch into Linux
 /// deterministic regardless of what was last drawn.
 pub fn restore_console_vga(mut display: crate::kernel::display::Display) {
     unsafe {
@@ -1242,7 +1242,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
-    display_handoff: &mut Option<crate::kernel::display::Display>,
+    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;

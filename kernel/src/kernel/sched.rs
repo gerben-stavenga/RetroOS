@@ -3,8 +3,8 @@
 //! Today's policy, stated in one place instead of inline in the event loop:
 //! the FOCUSED thread runs. Execution leaves it only when an action says so
 //! (exit → the waiting parent or whatever `schedule` finds; an explicit
-//! Switch; a Yield target) or when F11 moves focus (and execution follows,
-//! because focus implies execution for now). When background execution
+//! Switch; a Yield target) or when the F12 task picker moves focus (and
+//! execution follows, because focus implies execution for now). When background execution
 //! arrives, this module is the only thing that should need to change — the
 //! test of whether the factorization around it is right.
 
@@ -22,8 +22,8 @@ pub enum Verdict {
 }
 
 /// Decide what runs next, given what the personality asked for and any
-/// pending F11. F11 is honored only when the action itself didn't already
-/// pick a successor.
+/// pending task-picker request. It is honored only when the action itself
+/// didn't already pick a successor.
 #[allow(clippy::too_many_arguments)]
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
@@ -32,7 +32,7 @@ pub fn verdict<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::display::Display>,
+    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
@@ -58,7 +58,7 @@ fn next_after<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::display::Display>,
+    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     match action {
@@ -91,13 +91,11 @@ fn next_after<A: crate::Arch>(
     }
 }
 
-/// Honor a pending F11 request: focus cycles to the next thread — and with
-/// it, execution. Pure focus shift — does not wake any blocked thread or
-/// break any waitpid; the shell decides backgrounding semantics by polling
-/// SYNTH_WAITPID + reading kbd.
+/// Honor the F12 task picker's explicit target. This is a pure focus shift:
+/// it does not wake a blocked thread or break waitpid.
 pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> Option<usize> {
-    // The F12 picker's explicit choice wins over the round-robin. Ignore a
-    // stale target that is the current owner, out of range, or no longer active.
+    // Ignore a stale target that is the current owner, out of range, or no
+    // longer active.
     if let Some(target) = thread::take_switch_target() {
         if target != tid
             && target < threads.len()
@@ -110,9 +108,5 @@ pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: 
         }
         return None;
     }
-    if thread::take_switch_request() {
-        thread::cycle_next(threads, tid)
-    } else {
-        None
-    }
+    None
 }

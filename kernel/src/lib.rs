@@ -115,7 +115,7 @@ pub fn host_run_elf<A: Arch>(
     kernel::focus::adopt(tid);
     {
         let t = thread::get_thread(&mut threads, tid).expect("initial Linux thread");
-        t.personality.adopt_display(machine, kernel::display::Display::headless());
+        t.personality.adopt_display(machine, None, kernel::display::Display::headless());
     }
     kernel::startup::event_loop(machine, None, &mut threads, tid, None, None);
     dbg_println!("[host] guest exited");
