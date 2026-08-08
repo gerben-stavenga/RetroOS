@@ -45,6 +45,7 @@ mod bios;
 mod dpmi;
 mod dfs;
 mod machine;
+mod screen;
 mod xms;
 mod ems;
 // The DOS ABI core (INT 21h/33h services). Named `dosabi` rather than `dos` so
@@ -1257,7 +1258,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// or no present sink). Each call is one display time slice; the absolute tick
 /// value is used only to notice when an inactive sweep has gone stale.
 pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &Regs, now_ticks: u64) {
-    machine::display_tick(machine, &mut dos.pc, regs, now_ticks);
+    screen::display_tick(machine, &mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).

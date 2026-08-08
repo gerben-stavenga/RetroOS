@@ -163,7 +163,6 @@ pub fn guest_flags_handler_entry(regs: &Regs) -> u32 {
 
 pub(crate) mod mmio;
 pub(super) mod vga;
-pub use vga::*;
 pub(super) mod vvoodoo;
 // ============================================================================
 // PcMachine — per-thread machine state
