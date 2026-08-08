@@ -146,6 +146,21 @@ pub fn save(state: &mut VgaState) {
     } else {
         None
     };
+    // Preserve the CPU-visible text aperture before flattening odd/even.
+    // QEMU stores text planes at compact offsets while real VGA CRTC scanout
+    // uses even plane offsets; the linear B8000 view is identical on both and
+    // therefore provides the unambiguous representation at this boundary.
+    let native_text = if matches!(
+        state.classify_mode(),
+        Some(vga::VgaMode::Text { .. })
+    ) {
+        let mut text = alloc::vec![0u8; 0x8000];
+        let text_window = (crate::LOW_MEM_BASE + 0xB8000) as *const u8;
+        unsafe { core::ptr::copy_nonoverlapping(text_window, text.as_mut_ptr(), text.len()); }
+        Some(text)
+    } else {
+        None
+    };
 
     // Blank the display for the rest of the save. The flat-planar
     // overrides below mis-interpret the current framebuffer if the
@@ -191,6 +206,9 @@ pub fn save(state: &mut VgaState) {
     }
     if let Some(chained) = native_chain4.as_deref() {
         vga::chain4_split(chained, &mut state.planes);
+    }
+    if let Some(text) = native_text.as_deref() {
+        vga::text_odd_even_split(text, &mut state.planes);
     }
 
     // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
@@ -353,7 +371,7 @@ pub fn restore(state: &VgaState) {
     // every cell smeared across four bytes (`00 00 char attr`): Dark Forces
     // launched after Duke3D rendered its screen as two column-interleaved
     // streams, while B8000 row 0 — written after the mode set — was clean.
-    if matches!(state.classify_mode(), Some(vga::VgaMode::Text80x25)) {
+    if matches!(state.classify_mode(), Some(vga::VgaMode::Text { .. })) {
         let mut text = alloc::vec![0u8; 0x8000];
         vga::text_odd_even_merge(&state.planes, &mut text);
 

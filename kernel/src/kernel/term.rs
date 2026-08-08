@@ -68,7 +68,7 @@ pub fn present(display: &mut Display) {
     let vram = lib::term::term().cells_bytes();
     let palette_p = &raw const PALETTE;
     let frame = Frame {
-        mode: VgaMode::Text80x25,
+        mode: VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 },
         vram,
         planes: &[],
         ac: &TEXT_AC,

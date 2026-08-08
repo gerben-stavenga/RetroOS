@@ -1241,7 +1241,8 @@ static mut PRESENTS: u64 = 0;
 /// shadow or one whole window-sink frame per bill), VGA render cycles, final
 /// framebuffer/window publication cycles, and destination pixels written.
 static mut DISP_PARTS: [u64; 5] = [0; 5];
-static mut DISP_MODE: vga::VgaMode = vga::VgaMode::Text80x25;
+static mut DISP_MODE: vga::VgaMode =
+    vga::VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 };
 
 pub fn bill_display(
     mode: vga::VgaMode,

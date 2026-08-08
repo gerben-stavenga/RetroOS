@@ -108,7 +108,10 @@ fn scanout<'a, A: crate::Arch>(
         }
         // 4 KB and 16 KB apertures: banding them would buy back less than
         // the per-row address arithmetic (CGA's two interleaved banks) costs.
-        VgaMode::Text80x25 => (read_aperture(machine, scratch, 0xB8000, 80 * 25 * 2, 0, 80 * 25 * 2), &[]),
+        VgaMode::Text { cols, rows, .. } => {
+            let len = usize::from(cols) * usize::from(rows) * 2;
+            (read_aperture(machine, scratch, 0xB8000, len, 0, len), &[])
+        }
         VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[]),
         VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
     };
@@ -129,6 +132,11 @@ fn scanout<'a, A: crate::Arch>(
         VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select & 0x0F) as usize], 0, 0],
         _ => [0; 4],
     };
+    let font: &[u8] = match mode {
+        VgaMode::Text { cell_h: 8, .. } => &lib::vga_fonts::FONT_8X8,
+        VgaMode::Text { cell_h: 14, .. } => &lib::vga_fonts::FONT_8X14,
+        _ => &lib::vga_fonts::FONT_8X16,
+    };
     Some(Frame {
         mode,
         vram,
@@ -136,7 +144,7 @@ fn scanout<'a, A: crate::Arch>(
         ac: &state.ac,
         palette: &state.dac,
         dac_mask: state.dac_mask,
-        font: &lib::vga_fonts::FONT_8X16,
+        font,
         blink: state.ac[0x10] & 0x08 != 0,
         cga_palette,
         start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },

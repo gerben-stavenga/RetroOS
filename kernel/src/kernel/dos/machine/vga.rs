@@ -362,7 +362,7 @@ fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: 
             machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
             state.a0000_trapped = false;
         }
-        Some(VgaMode::Text80x25) => {
+        Some(VgaMode::Text { .. }) => {
             ::vga::text_odd_even_munge(&mut state.planes);
             write_live_planes(machine, &state.planes);
             machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
@@ -404,7 +404,7 @@ fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut
     match state.classify_mode() {
         Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {}
         Some(VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut state.planes),
-        Some(VgaMode::Text80x25) => ::vga::text_odd_even_unmunge(&mut state.planes),
+        Some(VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut state.planes),
         Some(VgaMode::Cga4) => ::vga::cga4_unmunge(&mut state.planes),
         Some(VgaMode::Cga2) => {}
         Some(VgaMode::LinearSvga { .. }) | None => {}
@@ -799,7 +799,7 @@ pub fn on_set_mode<A: crate::Arch>(
     let mut planes = read_live_planes(machine);
     match old_mode {
         Some(::vga::VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut planes),
-        Some(::vga::VgaMode::Text80x25) => ::vga::text_odd_even_unmunge(&mut planes),
+        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut planes),
         Some(::vga::VgaMode::Cga4) => ::vga::cga4_unmunge(&mut planes),
         _ => {}
     }
@@ -877,7 +877,7 @@ pub fn on_set_mode<A: crate::Arch>(
             machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
             vga.a0000_trapped = false;
         }
-        Some(::vga::VgaMode::Text80x25) => {
+        Some(::vga::VgaMode::Text { .. }) => {
             ::vga::text_odd_even_munge(&mut planes);
             write_live_planes(machine, &planes);
             machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
@@ -1008,7 +1008,7 @@ pub fn bios_draw_glyph<A: crate::Arch>(
         DosVga::Emulated(dev) => match dev.state.classify_mode() {
             None => return false,
             Some(mode) => match mode {
-                ::vga::VgaMode::Text80x25 => return false,
+                ::vga::VgaMode::Text { .. } => return false,
                 ::vga::VgaMode::Cga4 => 0x04,
                 ::vga::VgaMode::Cga2 => 0x06,
                 ::vga::VgaMode::Mode13h => 0x13,

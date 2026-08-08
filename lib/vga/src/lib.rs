@@ -27,9 +27,10 @@ extern crate alloc;
 /// distinctions are named here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum VgaMode {
-    /// 80×25 text: each cell is (char, attribute) at 2 bytes, rendered with the
-    /// 8×16 VGA font → 720×400. Read from the linear B8000 window.
-    Text80x25,
+    /// Alphanumeric mode: each cell is (char, attribute) at 2 bytes in the
+    /// linear B8000 window. Geometry comes entirely from the sequencer/CRTC;
+    /// notably modes 0/1 are 40 columns with doubled character dots.
+    Text { cols: u16, rows: u16, cell_w: u8, cell_h: u8 },
     /// Mode 13h: 320×200, 8-bit palette index per pixel, chained (linear) at
     /// the start of the A0000 window. Read from linear `vram`.
     Mode13h,
@@ -112,12 +113,12 @@ pub struct Frame<'a> {
     pub line_compare: usize,
 }
 
-/// Output framebuffer dimensions for a mode. Text is 80×25 cells of 9×16 px
-/// (9 because VGA stretches the 8-px glyph to a 9-dot character clock) → 720×400.
+/// Output framebuffer dimensions for a mode.
 pub const fn dimensions(mode: VgaMode) -> (usize, usize) {
     match mode {
         VgaMode::Mode13h => (320, 200),
-        VgaMode::Text80x25 => (720, 400),
+        VgaMode::Text { cols, rows, cell_w, cell_h } =>
+            (cols as usize * cell_w as usize, rows as usize * cell_h as usize),
         VgaMode::Cga4 => (320, 200),
         VgaMode::Cga2 => (640, 200),
         VgaMode::Planar16 { w, h, .. } => (w as usize, h as usize),
@@ -153,7 +154,20 @@ pub struct Regs {
 pub fn classify(r: &Regs) -> Option<VgaMode> {
     // GC[6] bit0: 1 = graphics, 0 = alphanumeric (text).
     if r.gc[6] & 0x01 == 0 {
-        return Some(VgaMode::Text80x25);
+        let cols = r.crtc[1] as u16 + 1;
+        let cell_h = (r.crtc[9] & 0x1F) + 1;
+        let v_end = r.crtc[0x12] as u16
+            | (((r.crtc[7] >> 1) & 1) as u16) << 8
+            | (((r.crtc[7] >> 6) & 1) as u16) << 9;
+        let rows = (v_end + 1) / u16::from(cell_h);
+        let dot_w = if r.seq[1] & 0x01 != 0 { 8 } else { 9 };
+        let h_repeat = if r.seq[1] & 0x08 != 0 { 2 } else { 1 };
+        return Some(VgaMode::Text {
+            cols: cols.max(1),
+            rows: rows.max(1),
+            cell_w: dot_w * h_repeat,
+            cell_h,
+        });
     }
 
     // Resolution from the CRTC display-end registers. Horizontal display end
@@ -854,7 +868,9 @@ fn row_stretched<const N: usize>(
     };
     match frame.mode {
         VgaMode::Mode13h => row_mode13(frame, sy, pal, st, w),
-        VgaMode::Text80x25 => row_text(frame, sy, pal, st, w),
+        VgaMode::Text { cols, rows, cell_w, cell_h } =>
+            row_text(frame, sy, pal, st, w, cols as usize, rows as usize,
+                cell_w as usize, cell_h as usize),
         VgaMode::Cga4 => row_cga4(frame, sy, pal, st, w),
         VgaMode::Cga2 => row_cga2(frame, sy, pal, st, w),
         VgaMode::Planar16 { row_bytes, .. } => row_planar16(frame, sy, pal, st, w, row_bytes as usize),
@@ -979,31 +995,37 @@ fn row_cga2<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stretc
     }
 }
 
-fn row_text<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize) {
-    let (trow, gy) = (sy / CELL_H, sy % CELL_H);
-    if frame.font.len() < 256 * 16 || trow >= TEXT_ROWS {
+fn row_text<const N: usize>(
+    frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize,
+    cols: usize, rows: usize, cell_w: usize, cell_h: usize,
+) {
+    let (trow, gy) = (sy / cell_h, sy % cell_h);
+    if frame.font.len() < 256 * cell_h || trow >= rows {
         return;
     }
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
-    for col in 0..TEXT_COLS {
-        let cell = (trow * TEXT_COLS + col) * 2;
+    let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
+    let repeat = cell_w / dot_w;
+    for col in 0..cols {
+        let cell = (trow * cols + col) * 2;
         let (ch, attr) = match (frame.vram.get(cell), frame.vram.get(cell + 1)) {
             (Some(&c), Some(&a)) => (c as usize, a),
             _ => return,
         };
         let fg = pal.lut[(attr & 0x0F) as usize];
         let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
-        let bits = frame.font[ch * 16 + gy];
+        let bits = frame.font[ch * cell_h + gy];
         // VGA 9th-dot rule: the 9th column repeats the 8th ONLY for the
         // line-draw block 0xC0..=0xDF, so box drawing joins seamlessly; every
         // other glyph gets a blank 9th column for inter-character spacing.
         let line_gfx = (0xC0..=0xDF).contains(&ch);
-        for gx in 0..CELL_W {
-            let x = col * CELL_W + gx;
+        for gx in 0..cell_w {
+            let dot = gx / repeat;
+            let x = col * cell_w + gx;
             if x >= w {
                 break;
             }
-            let on = if gx < 8 { bits & (0x80 >> gx) != 0 } else { line_gfx && bits & 0x01 != 0 };
+            let on = if dot < 8 { bits & (0x80 >> dot) != 0 } else { line_gfx && bits & 0x01 != 0 };
             st.put(if on { fg } else { bg });
         }
     }
@@ -1057,7 +1079,7 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
     }
     match frame.mode {
         VgaMode::Mode13h => render_mode13(frame, out, w, h),
-        VgaMode::Text80x25 => render_text(frame, out, w, h),
+        VgaMode::Text { .. } => render_text(frame, out, w, h),
         VgaMode::Cga4 => render_cga4(frame, out, w, h),
         VgaMode::Cga2 => render_cga2(frame, out, w, h),
         VgaMode::Planar16 { row_bytes, .. } => render_planar16(frame, out, w, h, row_bytes as usize),
@@ -1321,17 +1343,13 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
     }
 }
 
-const TEXT_COLS: usize = 80;
-const TEXT_ROWS: usize = 25;
-const CELL_W: usize = 9; // 8 glyph + 1 (col 8 repeats col 7 for line-draw)
-const CELL_H: usize = 16;
-
-/// 80×25 text: char+attr cells through the 8×16 font. Attribute byte:
+/// Text cells through the mode's selected ROM font. Attribute byte:
 /// bits 0-3 = foreground palette index; bits 4-6 = background; bit 7 =
 /// blink when `frame.blink`, else background intensity (16 bg colors).
 fn render_text(frame: &Frame, out: &mut [u32], w: usize, _h: usize) {
-    for row in 0..TEXT_ROWS {
-        for col in 0..TEXT_COLS {
+    let VgaMode::Text { cols, rows, .. } = frame.mode else { return };
+    for row in 0..rows as usize {
+        for col in 0..cols as usize {
             render_text_cell(frame, col, row, out, w);
         }
     }
@@ -1344,15 +1362,18 @@ fn render_text(frame: &Frame, out: &mut [u32], w: usize, _h: usize) {
 /// would overrun `out` is skipped. This is the dirty-cell primitive for
 /// incremental console rendering; the full-frame path above is built on it.
 pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], stride: usize) {
-    if frame.font.len() < 256 * 16 || col >= TEXT_COLS || row >= TEXT_ROWS {
+    let VgaMode::Text { cols, rows, cell_w, cell_h } = frame.mode else { return };
+    let (cols, rows, cell_w, cell_h) =
+        (cols as usize, rows as usize, cell_w as usize, cell_h as usize);
+    if frame.font.len() < 256 * cell_h || col >= cols || row >= rows {
         return;
     }
-    let cell = (row * TEXT_COLS + col) * 2;
+    let cell = (row * cols + col) * 2;
     if cell + 1 >= frame.vram.len() {
         return;
     }
     // Whole-cell bounds up front so the pixel loop can't overrun.
-    if (row * CELL_H + CELL_H - 1) * stride + col * CELL_W + CELL_W > out.len() {
+    if (row * cell_h + cell_h - 1) * stride + col * cell_w + cell_w > out.len() {
         return;
     }
     let ch = frame.vram[cell] as usize;
@@ -1363,7 +1384,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         frame.palette,
         ((attr >> 4) & bg_mask) & frame.dac_mask,
     );
-    let glyph = &frame.font[ch * 16..ch * 16 + 16];
+    let glyph = &frame.font[ch * cell_h..ch * cell_h + cell_h];
     // VGA 9th-dot rule: the 9th column repeats the glyph's 8th column ONLY for
     // the line-draw block 0xC0..=0xDF, so box-drawing joins seamlessly. Every
     // other glyph gets a blank 9th column for inter-character spacing —
@@ -1371,14 +1392,17 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     // its last column (M W X Z m w x * 0 _ …) onto the next cell.
     let line_gfx = (0xC0..=0xDF).contains(&ch);
     for (gy, &bits) in glyph.iter().enumerate() {
-        let py = row * CELL_H + gy;
-        for gx in 0..CELL_W {
-            let on = if gx < 8 {
-                bits & (0x80 >> gx) != 0
+        let py = row * cell_h + gy;
+        let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
+        let repeat = cell_w / dot_w;
+        for gx in 0..cell_w {
+            let dot = gx / repeat;
+            let on = if dot < 8 {
+                bits & (0x80 >> dot) != 0
             } else {
                 line_gfx && bits & 0x01 != 0
             };
-            let px = col * CELL_W + gx;
+            let px = col * cell_w + gx;
             out[py * stride + px] = if on { fg } else { bg };
         }
     }
@@ -1531,7 +1555,9 @@ mod tests {
     fn classify_text() {
         let mut r = regs();
         r.gc[6] = 0x00; // alphanumeric
-        assert_eq!(classify(0x03, &r), Some(VgaMode::Text80x25));
+        assert_eq!(classify(&r), Some(VgaMode::Text {
+            cols: 1, rows: 1, cell_w: 9, cell_h: 1,
+        }));
     }
 
     #[test]
@@ -1540,7 +1566,7 @@ mod tests {
         r.gc[6] = 0x01; // graphics
         r.gc[5] = 0x40; // 256-colour shift
         r.seq[4] = 0x08; // chain-4
-        assert_eq!(classify(0x13, &r), Some(VgaMode::Mode13h));
+        assert_eq!(classify(&r), Some(VgaMode::Mode13h));
     }
 
     #[test]
@@ -1552,7 +1578,7 @@ mod tests {
         r.crtc[0x13] = 40; // offset 40 words → 80 bytes/plane row → 320 px
         r.crtc[0x12] = 0xEF; // v-end 239
         r.crtc[7] = 0x00;
-        assert_eq!(classify(0x13, &r), Some(VgaMode::ModeX { w: 320, h: 240, row_bytes: 80 }));
+        assert_eq!(classify(&r), Some(VgaMode::ModeX { w: 320, h: 240, row_bytes: 80 }));
     }
 
     #[test]
@@ -1564,7 +1590,7 @@ mod tests {
         r.crtc[0x12] = 199;
         r.crtc[7] = 0x00; // no overflow bits
         r.crtc[0x13] = 20; // 40 bytes/row
-        match classify(0x0D, &r) {
+        match classify(&r) {
             Some(VgaMode::Planar16 { w, h, row_bytes }) => {
                 assert_eq!((w, h, row_bytes), (320, 200, 40));
             }

@@ -4,6 +4,9 @@
 
 use vga::{self as vga_render, Frame, PixelFormat, VgaMode};
 
+const TEXT80: VgaMode = VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 };
+const TEXT40: VgaMode = VgaMode::Text { cols: 40, rows: 25, cell_w: 18, cell_h: 16 };
+
 /// 6-bit DAC component → 8-bit, matching the renderer's expansion.
 fn c6to8(v: u8) -> u32 {
     let v = (v & 0x3F) as u32;
@@ -26,13 +29,20 @@ fn identity_ac() -> [u8; 21] {
 #[test]
 fn dimensions_match_modes() {
     assert_eq!(vga_render::dimensions(VgaMode::Mode13h), (320, 200));
-    assert_eq!(vga_render::dimensions(VgaMode::Text80x25), (720, 400));
+    assert_eq!(vga_render::dimensions(TEXT80), (720, 400));
+    assert_eq!(vga_render::dimensions(TEXT40), (720, 400));
+}
+
+#[test]
+fn bios_text_geometry_comes_from_registers() {
+    assert_eq!(vga_render::classify(&vga_render::bios_mode_regs(1).unwrap()), Some(TEXT40));
+    assert_eq!(vga_render::classify(&vga_render::bios_mode_regs(3).unwrap()), Some(TEXT80));
 }
 
 #[test]
 fn initial_mode3_state_is_complete() {
     let state = vga_render::VgaState::new_mode3_boxed();
-    assert_eq!(state.classify_mode(), Some(VgaMode::Text80x25));
+    assert_eq!(state.classify_mode(), Some(TEXT80));
     assert_eq!(state.planes.len(), 4 * 0x10000);
 
     let mut text = vec![0u8; 80 * 25 * 2];
@@ -254,7 +264,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
-        mode: VgaMode::Text80x25,
+        mode: TEXT80,
         vram: &vram,
         planes: &[],
         ac: &ac,
@@ -288,6 +298,29 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     }
     // A blank cell (char 0, attr 0) renders all-background = palette index 0.
     assert_eq!(out[9], pal_rgb(&pal, 0)); // cell (1,0) starts at x=9
+}
+
+#[test]
+fn text40_keeps_rows_separate_and_doubles_character_dots() {
+    let mut font = vec![0u8; 256 * 16];
+    font[16] = 0x80; // character 1: top-left glyph dot only
+    let mut vram = vec![0u8; 40 * 25 * 2];
+    let cell = (40 * 1) * 2; // row 1, column 0
+    vram[cell] = 1;
+    vram[cell + 1] = 0x0F;
+    let pal = vga_render::fallback_palette();
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: TEXT40, vram: &vram, planes: &[], ac: &ac, palette: &pal,
+        dac_mask: 0xFF, font: &font, blink: false, cga_palette: [0; 4],
+        start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+    };
+    let mut out = vec![0u32; 720 * 400];
+    vga_render::render(&frame, &mut out);
+    let fg = pal_rgb(&pal, 15);
+    assert_eq!(out[16 * 720], fg);
+    assert_eq!(out[16 * 720 + 1], fg); // one VGA dot repeated horizontally
+    assert_ne!(out[0], fg);            // row 1 was not concatenated onto row 0
 }
 
 #[test]
