@@ -337,7 +337,7 @@ impl<A: crate::Arch> DosState<A> {
         if let Some(mode) = linear_vbe
             && let Some(dpmi) = self.dpmi.as_ref()
         {
-            dpmi.redirect_vbe_lfb(
+            dpmi.redirect_physical_range(
                 machine,
                 mode.physical_base,
                 usize::from(mode.pitch) * usize::from(mode.height),
@@ -376,7 +376,7 @@ impl<A: crate::Arch> DosState<A> {
         if let Some(mode) = linear_vbe
             && let Some(dpmi) = self.dpmi.as_ref()
         {
-            dpmi.attach_vbe_lfb(
+            dpmi.restore_physical_range(
                 machine,
                 mode.physical_base,
                 usize::from(mode.pitch) * usize::from(mode.height),

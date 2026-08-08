@@ -41,8 +41,7 @@ const MAX_MEM_BLOCKS: usize = 256;
 pub(in crate::kernel::dos) const MEM_BASE: u32 = 0x0050_0000;
 
 /// Exclusive upper bound of the dedicated DPMI physical-mapping window.
-/// Keep it below the user stack at 0xC0000000 and away from the synthetic
-/// VESA framebuffer at 0x40000000. Allocations grow downward from here.
+/// Keep it below the user stack at 0xC0000000. Allocations grow downward.
 pub(in crate::kernel::dos) const PHYS_MAP_TOP: u32 = 0xB000_0000;
 
 /// Do not allow the physical-mapping window to grow below this address.
@@ -221,10 +220,8 @@ impl DpmiState {
         }
     }
 
-    /// Redirect every client mapping of one LFB onto a guest-RAM aperture.
-    /// Used both when OSD shadows a native card and when substitute VBE
-    /// allocates an emulated LFB after a client already mapped PhysBasePtr.
-    pub(in crate::kernel::dos) fn redirect_vbe_lfb<A: crate::Arch>(
+    /// Redirect the overlapping portion of client mappings onto guest RAM.
+    pub(in crate::kernel::dos) fn redirect_physical_range<A: crate::Arch>(
         &self,
         machine: &mut A,
         physical_base: u32,
@@ -247,8 +244,8 @@ impl DpmiState {
         }
     }
 
-    /// Reconnect RAM-shadowed mappings to the native physical LFB.
-    pub(in crate::kernel::dos) fn attach_vbe_lfb<A: crate::Arch>(
+    /// Reconnect the overlapping portion of client mappings to device memory.
+    pub(in crate::kernel::dos) fn restore_physical_range<A: crate::Arch>(
         &self,
         machine: &mut A,
         physical_base: u32,

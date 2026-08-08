@@ -934,9 +934,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         }
         // AX=0800h — Map Physical Address.
         // BX:CX = physical address, SI:DI = size; returns BX:CX = linear.
-        // RetroOS's synthetic SVGA happens to pre-map its LFB at its reported
-        // address, but external VBE providers (SeaBIOS and real video BIOSes)
-        // report device physical addresses that need this explicit user map.
         0x0800 => {
             let physical =
                 ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
@@ -955,58 +952,14 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 return thread::KernelAction::Done;
             };
 
-            // The Voodoo's BAR is emulated, not a real device: hand back the
-            // linear window but leave its pages ABSENT, so every guest access
-            // faults into the card's decoder. Same shape as the planar VGA
-            // trap at A0000 — a window the guest writes with plain stores and
-            // the kernel interprets.
-            let voodoo_bar = super::machine::vvoodoo::BAR_PHYS;
-            let is_voodoo = (voodoo_bar..voodoo_bar + super::machine::vvoodoo::BAR_SIZE)
-                .contains(&physical);
-            let synthetic_lfb = matches!(dos.pc.vga, super::machine::vga::DosVga::Emulated(_))
-                && super::machine::vga::svga_lfb_reserved_contains(physical, size);
-            if is_voodoo {
-                // Arm the window the way the planar VGA aperture is armed:
-                // MAP_MMIO, i.e. present=0 PLUS the PCD marker. Leaving the
-                // pages merely absent is not the same thing — `space_demand`
-                // backs an absent page with RAM and the guest then talks to
-                // memory instead of to the card.
-                machine.map_phys_range(
-                    (virtual_base >> 12) as usize,
-                    page_count as usize,
-                    0,
-                    arch_abi::MAP_MMIO,
-                );
-                dos.pc.voodoo.linear_base = Some(returned_linear & !0xFFF);
-                dos_trace!(
-                    "[DPMI] 0800 voodoo aperture phys={:#x} -> linear={:#x} (trapped)",
-                    physical, returned_linear
-                );
-            } else if synthetic_lfb {
-                // Substitute VBE's PhysBasePtr is a guest-linear aperture, not
-                // a machine physical address. If the mode already exists,
-                // alias it now; otherwise leave the client window absent and
-                // `vbe_set_mode` connects this recorded mapping after allocating
-                // the aperture. Treating the number as host physical memory
-                // makes protected-mode games draw away from the scanout.
-                if super::machine::vga::svga_ensure_lfb(
-                    machine, &mut dos.pc, physical, size,
-                ) {
-                    machine.copy_page_entries(
-                        (physical as usize & !0xFFF) >> 12,
-                        (virtual_base >> 12) as usize,
-                        page_count as usize,
-                    );
-                }
-            } else {
-                let physical_page = (physical & !0xFFF) as u64 >> 12;
-                machine.map_phys_range(
-                    (virtual_base >> 12) as usize,
-                    page_count as usize,
-                    physical_page,
-                    arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
-                );
-            }
+            dos.pc.map_physical(
+                machine,
+                physical,
+                size,
+                virtual_base,
+                page_count,
+                returned_linear,
+            );
             dpmi.phys_mappings[slot] = Some(PhysicalMapping {
                 physical_page_base: physical & !0xFFF,
                 returned_linear,
@@ -1063,9 +1016,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     thread::KernelAction::Done
 }
 
-/// Connect mappings made before mode selection, and grow the RAM aperture to
-/// the amount of video memory each protected-mode client actually mapped.
-pub(super) fn refresh_svga_lfb_mappings<A: crate::Arch>(
+/// Replay client mappings after the machine's address decoding changes, for
+/// example when a previously absent emulated aperture acquires backing.
+pub(super) fn refresh_physical_mappings<A: crate::Arch>(
     machine: &mut A,
     dos: &mut super::DosState<A>,
 ) {
@@ -1073,15 +1026,13 @@ pub(super) fn refresh_svga_lfb_mappings<A: crate::Arch>(
     for mapping in dpmi.phys_mappings.iter().flatten() {
         let physical = mapping.physical_page_base;
         let size = mapping.page_count.saturating_mul(crate::PAGE_SIZE as u32);
-        if !super::machine::vga::svga_lfb_reserved_contains(physical, size)
-            || !super::machine::vga::svga_ensure_lfb(machine, &mut dos.pc, physical, size)
-        {
-            continue;
-        }
-        machine.copy_page_entries(
-            (physical >> 12) as usize,
-            (mapping.virtual_page_base >> 12) as usize,
-            mapping.page_count as usize,
+        dos.pc.map_physical(
+            machine,
+            physical,
+            size,
+            mapping.virtual_page_base,
+            mapping.page_count,
+            mapping.returned_linear,
         );
     }
 }

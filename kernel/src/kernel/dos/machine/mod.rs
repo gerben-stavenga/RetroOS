@@ -430,6 +430,55 @@ impl MouseState {
 }
 
 impl PcMachine {
+    /// Back a DPMI client window with whatever the PC exposes at `physical`.
+    /// The DPMI host owns the linear-window allocation and bookkeeping; the
+    /// machine owns address decoding and therefore decides whether this is a
+    /// real device mapping, a trapped aperture, or aliased emulated RAM.
+    pub fn map_physical<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        physical: u32,
+        size: u32,
+        virtual_base: u32,
+        page_count: u32,
+        returned_linear: u32,
+    ) {
+        let voodoo_bar = vvoodoo::BAR_PHYS;
+        if (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical) {
+            machine.map_phys_range(
+                (virtual_base >> 12) as usize,
+                page_count as usize,
+                0,
+                arch_abi::MAP_MMIO,
+            );
+            self.voodoo.linear_base = Some(returned_linear & !0xFFF);
+            return;
+        }
+
+        if matches!(self.vga, vga::DosVga::Emulated(_))
+            && vga::svga_lfb_reserved_contains(physical, size)
+        {
+            // The substitute adapter reports a bus-looking address for RAM it
+            // owns in this guest. Before mode selection the aperture has no
+            // pages yet; replaying this mapping after the mode set connects it.
+            if vga::svga_ensure_lfb(machine, self, physical, size) {
+                machine.copy_page_entries(
+                    (physical as usize & !0xFFF) >> 12,
+                    (virtual_base >> 12) as usize,
+                    page_count as usize,
+                );
+            }
+            return;
+        }
+
+        machine.map_phys_range(
+            (virtual_base >> 12) as usize,
+            page_count as usize,
+            u64::from(physical & !0xFFF) >> 12,
+            arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+        );
+    }
+
     /// Whether a hardware IRQ or mouse callback is pending delivery — drives the
     /// interpreter's CPU INTR line via `arch::set_irq_line`, so its per-block
     /// interrupt check keeps firing until everything has been delivered.
