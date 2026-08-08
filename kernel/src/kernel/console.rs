@@ -135,11 +135,11 @@ pub fn restore_from_monitor<A: crate::Arch>(
     let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
     let display = crate::kernel::osd::take_display();
     let display = match display {
-        crate::kernel::platform::DisplayToken::LfbDisplay(sink)
-            if sink.bios_display.is_some() =>
+        crate::kernel::platform::Display::Sink(sink)
+            if sink.native.is_some() =>
         {
             let native = crate::kernel::dos::release_bios_sink(machine, bios_workspace, sink);
-            crate::kernel::platform::DisplayToken::BiosDisplay(native)
+            crate::kernel::platform::Display::Adapter(native)
         }
         display => display,
     };
@@ -185,7 +185,7 @@ fn dispatch_linux<A: crate::Arch>(
 /// is a destructed one — so [`Console::release`] consumes it and hands the
 /// pieces back, and the absence of the value is the suspended state.
 pub struct Console {
-    display: crate::kernel::platform::DisplayToken,
+    display: crate::kernel::platform::Display,
 }
 
 /// What a released console leaves behind: the *card's* state, not the
@@ -196,13 +196,13 @@ pub struct Console {
 pub struct SuspendedCard(Option<vga::VgaState>);
 
 impl Console {
-    pub fn new(display: crate::kernel::platform::DisplayToken) -> Self {
+    pub fn new(display: crate::kernel::platform::Display) -> Self {
         Self { display }
     }
 
-    pub fn bios_display(&self) -> Option<&crate::kernel::platform::BiosDisplay> {
+    pub fn bios_display(&self) -> Option<&vga::VgaAdapterMode> {
         match &self.display {
-            crate::kernel::platform::DisplayToken::BiosDisplay(native) => Some(native),
+            crate::kernel::platform::Display::Adapter(native) => Some(native),
             _ => None,
         }
     }
@@ -213,8 +213,8 @@ impl Console {
     pub fn release<A: crate::Arch>(
         self,
         _machine: &mut A,
-    ) -> (SuspendedCard, crate::kernel::platform::DisplayToken) {
-        let saved = if matches!(self.display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+    ) -> (SuspendedCard, crate::kernel::platform::Display) {
+        let saved = if matches!(self.display, crate::kernel::platform::Display::Adapter(_)) {
             let mut card = vga::VgaState::new();
             crate::kernel::drivers::vga_hw::save(&mut card);
             Some(card)
@@ -229,9 +229,9 @@ impl Console {
     pub fn acquire<A: crate::Arch>(
         _machine: &mut A,
         card: SuspendedCard,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) -> Self {
-        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
             crate::kernel::drivers::vga_hw::restore(
                 card.0.as_ref().expect("native console lost its card state"),
             );

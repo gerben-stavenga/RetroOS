@@ -51,16 +51,16 @@ const ENOSYS: i32 = 38;
 // snapshot we save on switch-out belongs at the personality level. Lazily
 // allocated on first save (VgaState's planes are a Vec).
 static mut LINUX_CONSOLE_VGA: Option<vga::VgaState> = None;
-static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
+static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::Display> = None;
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
 /// Release the shared console's display token, snapshotting VGA hardware when
 /// the selected display is the legacy card.
-pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
+pub fn save_console_vga() -> crate::kernel::platform::Display {
     unsafe {
         let display = (&raw mut LINUX_CONSOLE_DISPLAY)
             .as_mut().unwrap().take().expect("hidden Linux console has no display");
-        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
             let vga = (&raw mut LINUX_CONSOLE_VGA)
                 .as_mut()
                 .unwrap()
@@ -75,9 +75,9 @@ pub fn save_console_vga() -> crate::kernel::platform::DisplayToken {
 /// activation (no snapshot yet) we clear the screen rather than inherit
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
-pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
+pub fn restore_console_vga(display: crate::kernel::platform::Display) {
     unsafe {
-        if matches!(display, crate::kernel::platform::DisplayToken::BiosDisplay(_)) {
+        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
             if let Some(vga) = (&raw mut LINUX_CONSOLE_VGA).as_mut().unwrap().take() {
                 crate::kernel::drivers::vga_hw::restore(&vga);
             } else {
@@ -89,7 +89,7 @@ pub fn restore_console_vga(display: crate::kernel::platform::DisplayToken) {
     }
 }
 
-pub(super) fn adopt_console_vga(display: crate::kernel::platform::DisplayToken) {
+pub(super) fn adopt_console_vga(display: crate::kernel::platform::Display) {
     unsafe {
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
@@ -165,7 +165,7 @@ impl LinuxState {
     /// Called when a Linux thread loses focus. Snapshots the shared Linux
     /// console framebuffer (TTY-style — all Linux threads share it).
     pub(super) fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
-        -> crate::kernel::platform::DisplayToken
+        -> crate::kernel::platform::Display
     {
         save_console_vga()
     }
@@ -177,7 +177,7 @@ impl LinuxState {
     pub(super) fn materialize<A: crate::Arch>(
         &mut self,
         _machine: &mut A,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         restore_console_vga(display);
     }
@@ -1245,7 +1245,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
-    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    display_handoff: &mut Option<crate::kernel::platform::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;

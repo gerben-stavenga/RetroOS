@@ -11,13 +11,17 @@
 
 /// The VBE mode/bank descriptions a firmware probe fills in. Plain data
 /// about pixels, so they live with the card state in `//lib:vga`.
-pub use vga::{VbeBank, VbeMode};
+pub use vga::{VbeBank, VbeMode, VgaAdapterMode};
 
 use crate::println;
 
 pub struct Platform {
     pub host: Host,
-    pub display: Display,
+    /// Guest VGA port programming reaches a real adapter rather than the
+    /// `VgaState` register model. The four-variant `Display` fact this
+    /// replaces was only ever read as this one question — every other arm
+    /// meant "we paint it ourselves".
+    pub vga_passthrough: bool,
     /// What sound hardware answered (probe fact).
     ///
     /// A *fact*, not a capability: that a Sound Blaster answered is frozen
@@ -29,7 +33,7 @@ pub struct Platform {
     pub firmware: Firmware,
     /// Preferred packed linear mode advertised by the native video BIOS.
     /// Discovered once at boot; selecting/mapping it still requires ownership
-    /// of the `BiosDisplay` capability.
+    /// of the `VgaAdapterMode` capability.
     pub vbe_mode: Option<VbeMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
@@ -62,87 +66,23 @@ pub enum Host {
     Interp,
 }
 
-/// The display path. Exactly one of these is true, decided here — not
-/// re-derived piecemeal by render/console/IOPB code.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Display {
-    /// A real VGA card drives the panel, scanning out its own memory: metal
-    /// that booted in text mode with no framebuffer handed over. Guests
-    /// program the hardware directly (passthrough port window); console = VGA
-    /// text; the ROM's video services are authoritative (see [`Firmware`]).
-    VgaCard,
-    /// The loader handed over a linear framebuffer (UEFI/GOP or BIOS/VBE) —
-    /// or a hosted window supplied one. The emulated VGA blits into it; the
-    /// descriptor travels with the verdict, so nothing has to call back to
-    /// find out where the pixels go.
-    Framebuffer,
-    /// No card or framebuffer, but a host window installed a present sink
-    /// (retroos-play): the emulated VGA renders into the window.
-    HostWindow,
-    /// Nothing to display on (headless interp run): the emulated VGA still
-    /// models state — screendumps and --screenshot remain possible.
-    Headless,
-}
-
-/// The unique authority to make the selected display visible. Unlike
-/// [`Display`], this is a moved resource, never stored in the global platform
-/// facts.
-pub enum DisplayToken {
-    BiosDisplay(BiosDisplay),
-    LfbDisplay(crate::kernel::display::LfbDisplay),
-    HostWindow,
-    Headless,
-}
-
-/// The unique firmware-controlled physical display. The enum is deliberately
-/// neither `Copy` nor `Clone`: moving it transfers both card authority and the
-/// state required to reconstruct what the firmware established.
-#[derive(Debug)]
-pub enum BiosDisplay {
-    /// Register-based VGA mode. The physical card is the live state; a detach
-    /// snapshots its register file, DAC and legacy aperture.
-    Legacy,
-    /// VBE mode. Its descriptor identifies the LFB; bank selection is tracked
-    /// because it cannot be recovered from the legacy VGA register file.
-    Vesa {
-        mode: VbeMode,
-        bank: Option<VbeBank>,
-    },
-}
+/// The machine's display, moved. Holding one is the authority to put pixels
+/// on the panel; there is no other way to reach it, and there is exactly one.
+///
+/// Not a "token" in its name: once nothing else can reach the display, holding
+/// the value IS the ownership and the suffix says nothing extra.
+///
+/// This is the *transferable* form. A DOS thread turns it into a
+/// [`VgaAdapter`](crate::kernel::dos::VgaAdapter), which is this plus the
+/// `VgaState` it models a VGA with; the kernel console holds one of these
+/// directly, having no VGA to model — it renders a text grid.
+pub use vga::Display;
 
 
-impl BiosDisplay {
-    fn new() -> Self { Self::Legacy }
-
-    pub(crate) fn vbe_mode(&self) -> Option<VbeMode> {
-        match self {
-            Self::Legacy => None,
-            Self::Vesa { mode, .. } => Some(*mode),
-        }
-    }
-
-    pub(crate) fn set_legacy(&mut self) { *self = Self::Legacy; }
-
-    pub(crate) fn set_vesa(&mut self, mode: VbeMode, linear: bool) {
-        let bank = (!linear).then_some(VbeBank {
-            current: 0,
-            window_segment: mode.window_segment,
-            granularity_kb: mode.window_granularity_kb,
-            window_size_kb: mode.window_size_kb,
-        });
-        *self = Self::Vesa { mode, bank };
-    }
-
-    pub(crate) fn set_bank(&mut self, current: u16) {
-        if let Self::Vesa { bank: Some(bank), .. } = self {
-            bank.current = current;
-        }
-    }
-}
 
 pub struct ProbedPlatform {
     pub facts: &'static Platform,
-    pub display: DisplayToken,
+    pub display: Display,
     pub audio: AudioToken,
 }
 
@@ -260,16 +200,6 @@ pub enum DebugSink {
     HostStdout,
 }
 
-impl Display {
-    /// Guest VGA port programming reaches the real card (vs the VgaState
-    /// register model).
-    pub fn vga_passthrough(self) -> bool {
-        matches!(self, Display::VgaCard)
-    }
-
-
-}
-
 impl Platform {
     /// The focused DOS thread owns 0x3C0/0x3DA directly — no AC-tracking
     /// traps. True on a real card everywhere except QEMU, whose 0x3DA
@@ -280,7 +210,7 @@ impl Platform {
         // Whether a card answers, not which emulator we are on. QEMU was
         // excluded because its 0x3DA was fabricated for the guest, so the
         // ports had to trap; that fabrication is gone.
-        self.display.vga_passthrough()
+        self.vga_passthrough
     }
 }
 
@@ -294,7 +224,7 @@ pub struct HostEnv {
     /// The framebuffer this backend presents into, if any: a GOP framebuffer
     /// on metal, a window-sized buffer on hosted. Probed once — the kernel
     /// writes into it directly rather than through a present callback.
-    pub framebuffer: fn() -> Option<crate::kernel::display::LfbDisplay>,
+    pub framebuffer: fn() -> Option<vga::Sink>,
     /// Where boot debug bytes were routed (recorded for policy).
     pub debug: DebugSink,
     /// True on the bare-metal backend (chooses Metal/Qemu vs Interp for host).
@@ -368,14 +298,14 @@ pub fn probe<A: crate::Arch>(
         // `vga_card_answers()` (write the SEQ index, read it back) only ever
         // confirmed what `is_metal` already implied: the hosted port bus has no
         // VGA device to answer, and a metal machine that boots this way does.
-        let (display, display_token) = if let Some(fb) = (env.framebuffer)() {
-            (Display::Framebuffer, DisplayToken::LfbDisplay(fb))
+        let (vga_passthrough, display) = if let Some(fb) = (env.framebuffer)() {
+            (false, Display::Sink(fb))
         } else if crate::kernel::display::host_present_sink_installed() {
-            (Display::HostWindow, DisplayToken::HostWindow)
+            (false, Display::HostWindow)
         } else if env.is_metal {
-            (Display::VgaCard, DisplayToken::BiosDisplay(BiosDisplay::new()))
+            (true, Display::Adapter(VgaAdapterMode::new()))
         } else {
-            (Display::Headless, DisplayToken::Headless)
+            (false, Display::None)
         };
 
         // Who owns the IVT follows from WHO DRIVES THE DISPLAY — not from a
@@ -400,17 +330,17 @@ pub fn probe<A: crate::Arch>(
         // firmware code (OVMF has `0F 20 C0 A8 01` there), and it answered
         // wrongly for a legacy-booted machine handed a framebuffer — real ROM
         // present, but its video services still not authoritative.
-        let firmware = if matches!(display, Display::VgaCard) {
+        let firmware = if vga_passthrough {
             Firmware::NativeBios
         } else {
             Firmware::Substitute
         };
 
-        let vga_readback = matches!(display, Display::VgaCard) && vga_readback_answers();
+        let vga_readback = vga_passthrough && vga_readback_answers();
 
         (Platform {
             host: env.host(boot.is_qemu),
-            display,
+            vga_passthrough,
             firmware,
             vbe_mode: None,
             vga_readback,
@@ -420,17 +350,17 @@ pub fn probe<A: crate::Arch>(
             audio: audio_hw.default_verdict(),
             hostfs,
             debug: env.debug,
-        }, display_token)
+        }, display)
     };
 
-    let (p, display_token) = p;
+    let (p, display) = p;
     unsafe {
         PLATFORM = Some(p);
     }
     let p = get();
     println!(
-        "Platform: host={:?} display={:?} firmware={:?} audio={:?} hostfs={} debug={:?}",
-        p.host, p.display, p.firmware, p.audio, p.hostfs, p.debug
+        "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",
+        p.host, p.vga_passthrough, p.firmware, p.audio, p.hostfs, p.debug
     );
     if p.vga_ports_direct() {
         if p.vga_readback {
@@ -439,7 +369,7 @@ pub fn probe<A: crate::Arch>(
             println!("VGA: WARNING no readback extensions — AC ports direct, full process VGA restore NOT supported (flip-flop/latches unrecoverable)");
         }
     }
-    ProbedPlatform { facts: p, display: display_token, audio: audio_token }
+    ProbedPlatform { facts: p, display, audio: audio_token }
 }
 
 /// The frozen platform description. Panics if `probe` has not run — an init
@@ -509,7 +439,7 @@ pub fn set_vbe_mode(mode: Option<VbeMode>) {
             "VBE: preferred mode {:#x} {}x{} pitch={} phys={:#x}",
             m.number, m.width, m.height, m.pitch, m.physical_base
         ),
-        None if p.display == Display::VgaCard => {
+        None if p.vga_passthrough => {
             crate::println!("VBE: no usable packed linear mode; OSD will use mode 13h")
         }
         None => {}

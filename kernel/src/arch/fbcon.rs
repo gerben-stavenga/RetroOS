@@ -50,7 +50,7 @@ pub fn active() -> bool {
 /// The boot framebuffer, as a sink the kernel can blit into directly.
 /// Installed into `HostEnv` by the metal entry; the platform probe freezes it
 /// into `Display::Framebuffer`.
-pub fn framebuffer() -> Option<crate::kernel::display::LfbDisplay> {
+pub fn framebuffer() -> Option<vga::Sink> {
     let g = (*geom()).as_ref()?;
     let framebuffer = crate::kernel::display::Framebuffer {
         va: g.va,
@@ -62,8 +62,8 @@ pub fn framebuffer() -> Option<crate::kernel::display::LfbDisplay> {
     };
     // A loader-provided framebuffer is already established, whether the
     // loader used GOP or VBE. Only a sink RetroOS creates by consuming a
-    // directly-owned card carries BiosDisplay.
-    Some(crate::kernel::display::LfbDisplay::from_framebuffer(
+    // directly-owned card carries VgaAdapterMode.
+    Some(vga::Sink::from_framebuffer(
         framebuffer,
         crate::kernel::display::FormatSpec::Packed(g.format),
         None,

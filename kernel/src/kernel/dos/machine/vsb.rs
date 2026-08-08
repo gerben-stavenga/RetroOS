@@ -144,7 +144,7 @@ pub enum SbDevice {
         /// nothing. It is the only record of what the silicon was TOLD,
         /// because a DSP will not say: rate, block size, transfer format and
         /// speaker are all write-only. Without it, a card that changes hands
-        /// could only be restarted from scratch; with it, `into_emulated`
+        /// could only be restarted from scratch; with it, `drop_to_facade`
         /// hands over a model that already knows the stream, and the driver's
         /// `adopt` programs a fresh card into exactly the state its guest
         /// believes it is in.
@@ -175,7 +175,7 @@ impl SbDevice {
     /// it is handed over idle rather than mid-transfer. The guest keeps
     /// playing into the model, which resumes from exactly the rate, block size
     /// and format the guest last programmed.
-    fn into_emulated<A: crate::Arch>(
+    fn drop_to_facade<A: crate::Arch>(
         self,
         machine: &mut A,
         b: &Blaster,
@@ -308,7 +308,7 @@ impl SoundBlaster {
     /// Take the machine's card: this thread's SB stops being a model and
     /// becomes the silicon, programmed into the state the model was in.
     ///
-    /// The mirror of `BiosVga::present`, and for the same reason — the guest
+    /// The mirror of `VgaAdapter::present`, and for the same reason — the guest
     /// must not be able to tell that its card changed identity underneath it.
     pub fn adopt_card<A: crate::Arch>(&mut self, machine: &mut A, card: SbCard) {
         let dev = core::mem::replace(&mut self.device, SbDevice::Emulated(EmulatedSb::new()));
@@ -316,12 +316,12 @@ impl SoundBlaster {
     }
 
     /// Give the card up: snapshot it into the model and hand the silicon on.
-    /// The mirror of `BiosVga::into_emulated`. `None` if this thread never had
+    /// The mirror of `VgaAdapter::drop_to_facade`. `None` if this thread never had
     /// it, which is every thread on a machine without a card.
     pub fn release_card<A: crate::Arch>(&mut self, machine: &mut A) -> Option<SbCard> {
         let Self { blaster, device } = self;
         let dev = core::mem::replace(device, SbDevice::Emulated(EmulatedSb::new()));
-        let (dev, card) = dev.into_emulated(machine, blaster);
+        let (dev, card) = dev.drop_to_facade(machine, blaster);
         *device = dev;
         card
     }

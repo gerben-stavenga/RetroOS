@@ -1,6 +1,6 @@
 //! Where pixels go, and how a frame gets there.
 //!
-//! The backend supplies a [`LfbDisplay`] — a format, framebuffer storage and optional
+//! The backend supplies a [`Sink`] — a format, framebuffer storage and optional
 //! physical-VGA ownership — and the kernel writes into it. `present` vertically
 //! expands a completed packed metal shadow and
 //! drains WC stores; [`present_host`] transfers a native frame to a window.
@@ -13,113 +13,12 @@ pub use vga::PixelFormat;
 pub use vga::FormatSpec;
 
 
-/// Somewhere to write pixels. `Debug` prints just the size — the address and
-/// channel positions would drown the boot log's platform line.
-impl core::fmt::Debug for Framebuffer {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        write!(f, "Framebuffer {}x{}", self.width, self.height)
-    }
-}
 
-/// Framebuffer storage only. Encoding belongs to the containing [`LfbDisplay`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Framebuffer {
-    /// Kernel-virtual address of pixel (0,0).
-    pub va: usize,
-    /// Bytes per device row (the pitch, which may exceed width × pixel size).
-    pub pitch: usize,
-    pub width: usize,
-    pub height: usize,
-    /// Full-frame writes are unusually expensive (QEMU-TCG's strong-UC GOP
-    /// mapping), so emulated VGA should use a conservative refresh cadence.
-    pub slow: bool,
-    /// Bare metal: device-row copies use 16-byte non-temporal stores. Real
-    /// WC apertures never engage the CPU's fast-string path, so rep movsd
-    /// issues one 4-byte store per cycle there; under a hypervisor the
-    /// framebuffer is host-RAM-backed (effectively WB) and rep movsd's
-    /// fast-string/helper paths win instead — both measured.
-    pub wide: bool,
-}
+pub use vga::Framebuffer;
 
-/// A software-presentable display. `bios_display` is present exactly when the
-/// framebuffer belongs to a physical VGA adapter held in a fixed mode.
-pub struct LfbDisplay {
-    pub format: FormatSpec,
-    pub framebuffer: Framebuffer,
-    pub bios_display: Option<crate::kernel::platform::BiosDisplay>,
-}
 
-impl core::fmt::Debug for LfbDisplay {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.debug_struct("LfbDisplay")
-            .field("format", &self.format)
-            .field("framebuffer", &self.framebuffer)
-            .field("bios_display", &self.bios_display.is_some())
-            .finish()
-    }
-}
+pub use vga::Sink;
 
-impl LfbDisplay {
-    /// Establish a display sink from framebuffer storage, its pixel encoding,
-    /// and optional ownership of the physical VGA producing that storage.
-    /// Boot/GOP, BIOS/VBE and indexed VGA all cross this same boundary.
-    pub fn from_framebuffer(
-        framebuffer: Framebuffer,
-        format: FormatSpec,
-        bios_display: Option<crate::kernel::platform::BiosDisplay>,
-    ) -> Self {
-        Self { format, framebuffer, bios_display }
-    }
-
-    /// The output rectangle inside this framebuffer.
-    ///
-    /// `fit_vga` letterboxes to 4:3 because a GOP/LFB has SQUARE pixels and a
-    /// VGA image drawn 1:1 there would be geometrically wrong. A physical VGA
-    /// aperture is the opposite case: its pixels are not square, 320x200 IS
-    /// 4:3 on the monitor, and fitting it to 266x200 both squeezes the picture
-    /// and invents borders the hardware never had — borders that then have to
-    /// be cleared, which is the only reason the reset path zeroes the
-    /// framebuffer at all.
-    pub fn fit(&self) -> (usize, usize) {
-        match self.bios_display {
-            Some(_) => (self.framebuffer.width, self.framebuffer.height),
-            None => fit_vga(self.framebuffer.width, self.framebuffer.height),
-        }
-    }
-
-    pub fn packed_format(&self) -> Option<PixelFormat> {
-        match self.format {
-            FormatSpec::Packed(format) => Some(format),
-            FormatSpec::Indexed8 => None,
-        }
-    }
-
-    /// Only a VGA-backed sink can yield physical-VGA authority. Other sinks
-    /// are returned unchanged.
-    pub fn try_into_bios_display(
-        mut self,
-    ) -> Result<crate::kernel::platform::BiosDisplay, Self> {
-        match self.bios_display.take() {
-            Some(vga) => Ok(vga),
-            None => Err(self),
-        }
-    }
-
-    /// Convert a completed packed shadow into this sink's framebuffer.
-    pub fn present_shadow(&self, source_height: usize, shadow: &[u8]) -> usize {
-        present(self, source_height, shadow)
-    }
-
-    /// Loader-provided LFBs use the platform publication hook (SFENCE on
-    /// metal). A VGA-owned sink is scanned continuously by the adapter and
-    /// may run on a pre-SSE CPU, so it deliberately has no fence instruction.
-    fn finish_present(&self) {
-        if self.bios_display.is_none() {
-            finish_present();
-        }
-    }
-
-}
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
 /// like the portio/hostfs/socket hooks.
@@ -136,14 +35,124 @@ pub fn finish_present() {
     (unsafe { PRESENT_HOOK })();
 }
 
-/// Largest centered 4:3 VGA picture that fits a physical framebuffer.
-pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
-    if width * 3 >= height * 4 {
-        ((height * 4 / 3).min(width), height)
-    } else {
-        (width, (width * 3 / 4).min(height))
+/// Copy one packed framebuffer row. Bulk traffic still moves in dwords; a
+/// 16/24-bit row merely has a short 0..3-byte tail.
+///
+/// `wide` selects 16-byte non-temporal stores (real hardware: ERMS fast
+/// strings never engage on the WC framebuffer, so rep movsd issues one
+/// 4-byte store per cycle — the wide path quarters the issue count). Under
+/// TCG (`fb.slow`) rep movsd IS the fast path — one helper call — so the
+/// caller keeps `wide` off there. This deliberately does not fence each row:
+/// the caller's single end-of-frame [`present`] drains the whole blit.
+#[inline]
+unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
+    let mut d = dst;
+    let mut s = src;
+    let mut left = len;
+
+    // The wide assembly advances in dwords while aligning to 16, so feed it an
+    // already-aligned destination: packed 16/24-bit pitches need byte heads.
+    if wide {
+        while left != 0 && d as usize & 15 != 0 {
+            unsafe { *d = *s };
+            d = unsafe { d.add(1) };
+            s = unsafe { s.add(1) };
+            left -= 1;
+        }
+    }
+    let dwords = left / 4;
+    #[cfg(target_arch = "x86")]
+    unsafe {
+        if wide && dwords != 0 {
+            retroos_fb_copy32_wide(d as *mut u32, s as *const u32, dwords);
+        } else {
+            retroos_fb_copy32(d as *mut u32, s as *const u32, dwords);
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        let _ = wide; // 64-bit metal: measure before adding the SSE path
+        core::arch::asm!(
+            "rep movsd",
+            inout("rcx") dwords => _,
+            inout("rsi") s => _,
+            inout("rdi") d => _,
+            options(nostack)
+        );
+    }
+    let done = dwords * 4;
+    d = unsafe { d.add(done) };
+    s = unsafe { s.add(done) };
+    left -= done;
+    while left != 0 {
+        unsafe { *d = *s };
+        d = unsafe { d.add(1) };
+        s = unsafe { s.add(1) };
+        left -= 1;
     }
 }
+
+
+/// Present a finished shadow on `sink`: blit it, then tell the backend the
+/// frame is done.
+///
+/// Not a method on [`Sink`]: the sink is library data describing where pixels
+/// go, while getting them there uses hand-written non-temporal stores and a
+/// platform publication hook, both of which are this layer's business.
+/// Loader-provided LFBs use the hook (SFENCE on metal); a VGA-owned sink is
+/// scanned continuously by the adapter and may run on a pre-SSE CPU, so it
+/// deliberately gets no fence.
+pub fn present_shadow(sink: &Sink, source_height: usize, shadow: &[u8]) -> usize {
+    let painted = blit(sink, source_height, shadow);
+    if sink.native.is_none() {
+        finish_present();
+    }
+    painted
+}
+
+/// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
+/// PICTURE only — `out_w × vga_height` — so this is pure vertical expansion:
+/// each source row is copied to the output rows it covers, at the centered
+/// picture origin. Format conversion already happened in the raster pass, and
+/// the pillarbox/letterbox bars were painted once at the mode switch, so
+/// nothing here touches a pixel outside the picture.
+fn blit(sink: &Sink, vga_height: usize, shadow: &[u8]) -> usize {
+    let fb = &sink.framebuffer;
+    let format = sink.packed_format().expect("packed present on indexed sink");
+    let step = format.bytes_per_pixel as usize;
+    let (out_w, out_h) = sink.fit();
+    let row_bytes = out_w * step;
+    if vga_height == 0 || shadow.len() < row_bytes * vga_height {
+        return 0;
+    }
+    let bx = (fb.width - out_w) / 2;
+    let by = (fb.height - out_h) / 2;
+    let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
+    let origin = fb.va + by * fb.pitch + bx * step;
+
+    let mut oy = 0usize;
+    let mut yerr = 0usize;
+    for sy in 0..vga_height {
+        yerr += yrem;
+        let carry = (yerr >= vga_height) as usize;
+        let rows = ybase + carry;
+        yerr -= carry * vga_height;
+        let src = shadow[sy * row_bytes..(sy + 1) * row_bytes].as_ptr();
+        for _ in 0..rows {
+            unsafe {
+                copy_bytes((origin + oy * fb.pitch) as *mut u8, src, row_bytes, fb.wide);
+            }
+            oy += 1;
+        }
+    }
+    if sink.native.is_none() {
+        finish_present();
+    }
+    out_w * out_h
+}
+
+pub use vga::fit_vga;
+
 
 /// Hosted completed-frame sink. This lives in the allocating kernel rather
 /// than `//lib:vga`, which the allocator-free bootloader does not link.
@@ -302,101 +311,7 @@ unsafe extern "C" {
     fn retroos_fb_copy32_wide(dst: *mut u32, src: *const u32, len: usize);
 }
 
-/// Copy one packed framebuffer row. Bulk traffic still moves in dwords; a
-/// 16/24-bit row merely has a short 0..3-byte tail.
-///
-/// `wide` selects 16-byte non-temporal stores (real hardware: ERMS fast
-/// strings never engage on the WC framebuffer, so rep movsd issues one
-/// 4-byte store per cycle — the wide path quarters the issue count). Under
-/// TCG (`fb.slow`) rep movsd IS the fast path — one helper call — so the
-/// caller keeps `wide` off there. This deliberately does not fence each row:
-/// the caller's single end-of-frame [`present`] drains the whole blit.
-#[inline]
-unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
-    let mut d = dst;
-    let mut s = src;
-    let mut left = len;
 
-    // The wide assembly advances in dwords while aligning to 16, so feed it an
-    // already-aligned destination: packed 16/24-bit pitches need byte heads.
-    if wide {
-        while left != 0 && d as usize & 15 != 0 {
-            unsafe { *d = *s };
-            d = unsafe { d.add(1) };
-            s = unsafe { s.add(1) };
-            left -= 1;
-        }
-    }
-    let dwords = left / 4;
-    #[cfg(target_arch = "x86")]
-    unsafe {
-        if wide && dwords != 0 {
-            retroos_fb_copy32_wide(d as *mut u32, s as *const u32, dwords);
-        } else {
-            retroos_fb_copy32(d as *mut u32, s as *const u32, dwords);
-        }
-    }
-    #[cfg(target_arch = "x86_64")]
-    unsafe {
-        let _ = wide; // 64-bit metal: measure before adding the SSE path
-        core::arch::asm!(
-            "rep movsd",
-            inout("rcx") dwords => _,
-            inout("rsi") s => _,
-            inout("rdi") d => _,
-            options(nostack)
-        );
-    }
-    let done = dwords * 4;
-    d = unsafe { d.add(done) };
-    s = unsafe { s.add(done) };
-    left -= done;
-    while left != 0 {
-        unsafe { *d = *s };
-        d = unsafe { d.add(1) };
-        s = unsafe { s.add(1) };
-        left -= 1;
-    }
-}
-
-/// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
-/// PICTURE only — `out_w × vga_height` — so this is pure vertical expansion:
-/// each source row is copied to the output rows it covers, at the centered
-/// picture origin. Format conversion already happened in the raster pass, and
-/// the pillarbox/letterbox bars were painted once at the mode switch, so
-/// nothing here touches a pixel outside the picture.
-fn present(sink: &LfbDisplay, vga_height: usize, shadow: &[u8]) -> usize {
-    let fb = &sink.framebuffer;
-    let format = sink.packed_format().expect("packed present on indexed sink");
-    let step = format.bytes_per_pixel as usize;
-    let (out_w, out_h) = sink.fit();
-    let row_bytes = out_w * step;
-    if vga_height == 0 || shadow.len() < row_bytes * vga_height {
-        return 0;
-    }
-    let bx = (fb.width - out_w) / 2;
-    let by = (fb.height - out_h) / 2;
-    let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
-    let origin = fb.va + by * fb.pitch + bx * step;
-
-    let mut oy = 0usize;
-    let mut yerr = 0usize;
-    for sy in 0..vga_height {
-        yerr += yrem;
-        let carry = (yerr >= vga_height) as usize;
-        let rows = ybase + carry;
-        yerr -= carry * vga_height;
-        let src = shadow[sy * row_bytes..(sy + 1) * row_bytes].as_ptr();
-        for _ in 0..rows {
-            unsafe {
-                copy_bytes((origin + oy * fb.pitch) as *mut u8, src, row_bytes, fb.wide);
-            }
-            oy += 1;
-        }
-    }
-    sink.finish_present();
-    out_w * out_h
-}
 
 /// Number of scheduler phases exposed as vertical retrace. A normal 14-tick
 /// frame gets one phase; the deliberately slower TCG path keeps approximately
@@ -434,7 +349,7 @@ pub enum ScanoutAction {
 /// display performs another one.
 pub fn scanout_action(
     s: &mut Scratch,
-    sink: &LfbDisplay,
+    sink: &Sink,
     mode: vga::VgaMode,
     now_tick: u64,
     period_ticks: usize,
@@ -504,7 +419,7 @@ pub fn scanout_action(
 /// from different DAC generations.
 pub fn render_shadow(
     s: &mut Scratch,
-    sink: &LfbDisplay,
+    sink: &Sink,
     frame: &vga::Frame,
 ) -> bool {
     let format = sink.packed_format().expect("packed render on indexed sink");
@@ -579,7 +494,7 @@ impl NativeScanout {
     /// Arm for one frame of `w × h` on `fb`. False when the frame cannot be
     /// shown — too big for the panel, which is reported once rather than
     /// leaving a silently dead screen.
-    pub fn arm(&mut self, sink: &LfbDisplay, w: usize, h: usize) -> bool {
+    pub fn arm(&mut self, sink: &Sink, w: usize, h: usize) -> bool {
         let fb = &sink.framebuffer;
         let format = sink.packed_format().expect("card scanout on indexed sink");
         let geo = (w, h, fb.width, fb.height);
@@ -616,7 +531,7 @@ impl NativeScanout {
     }
 
     /// Copy the armed frame to the panel, centered. One linear copy per row.
-    pub fn publish(&self, sink: &LfbDisplay) {
+    pub fn publish(&self, sink: &Sink) {
         let fb = &sink.framebuffer;
         let format = sink.packed_format().expect("card publish on indexed sink");
         let (w, h) = (self.geo.0, self.geo.1);
@@ -636,7 +551,9 @@ impl NativeScanout {
                 );
             }
         }
-        sink.finish_present();
+        if sink.native.is_none() {
+            finish_present();
+        }
     }
 }
 

@@ -36,7 +36,7 @@ pub fn release<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     old: &mut Personality<A>,
-) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (crate::kernel::platform::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     let card = old.release_sb(machine);
     (old.suspend(machine, bios_workspace), card)
 }
@@ -53,7 +53,7 @@ pub fn acquire<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     new_tid: usize,
     new: &mut Personality<A>,
-    display: crate::kernel::platform::DisplayToken,
+    display: crate::kernel::platform::Display,
     card: Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<crate::kernel::drivers::sb16::SbCard> {
     new.materialize(machine, bios_workspace, display);

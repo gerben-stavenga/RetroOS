@@ -1979,7 +1979,7 @@ impl VgaState {
     }
 
     /// Emulated register-file write — the absent-card half of the VGA
-    /// passthrough-vs-emulate split (`BiosVga::emulated`).
+    /// passthrough-vs-facade split (`VgaAdapter`).
     /// This per-thread struct IS the hardware then: `emulate_outb` routes the
     /// 3Cx/3Dx window here instead of to real ports, and save/restore on
     /// context switch becomes a no-op because the state never leaves the
@@ -2150,4 +2150,174 @@ impl VgaState {
         let lc = lc / scan_div.max(1);
         if lc < h { lc } else { usize::MAX }
     }
+}
+
+/// What mode a real VGA-compatible adapter is in.
+///
+/// Specific to a VGA adapter on purpose: `Legacy` and `Vbe` are VGA and
+/// VESA-BIOS notions, meaningless for video hardware in general. The card and
+/// its ROM are one thing here — a VBE mode is the ROM's doing, not the
+/// silicon's, and both are what the guest is driving.
+/// The unique firmware-controlled physical display. The enum is deliberately
+/// neither `Copy` nor `Clone`: moving it transfers both card authority and the
+/// state required to reconstruct what the firmware established.
+#[derive(Debug)]
+pub enum VgaAdapterMode {
+    /// Register-programmed VGA mode. The card is the live state; dropping to a
+    /// facade snapshots its register file, DAC and legacy aperture.
+    Legacy,
+    /// A VBE mode its ROM put it in. The descriptor identifies the LFB; bank
+    /// selection is tracked because it cannot be recovered from the legacy
+    /// VGA register file.
+    Vbe {
+        mode: VbeMode,
+        bank: Option<VbeBank>,
+    },
+}
+
+
+impl VgaAdapterMode {
+    pub fn new() -> Self { Self::Legacy }
+
+    pub fn vbe_mode(&self) -> Option<VbeMode> {
+        match self {
+            Self::Legacy => None,
+            Self::Vbe { mode, .. } => Some(*mode),
+        }
+    }
+
+    pub fn set_legacy(&mut self) { *self = Self::Legacy; }
+
+    pub fn set_vesa(&mut self, mode: VbeMode, linear: bool) {
+        let bank = (!linear).then_some(VbeBank {
+            current: 0,
+            window_segment: mode.window_segment,
+            granularity_kb: mode.window_granularity_kb,
+            window_size_kb: mode.window_size_kb,
+        });
+        *self = Self::Vbe { mode, bank };
+    }
+
+    pub fn set_bank(&mut self, current: u16) {
+        if let Self::Vbe { bank: Some(bank), .. } = self {
+            bank.current = current;
+        }
+    }
+}
+
+/// Largest centered 4:3 VGA picture that fits a physical framebuffer.
+pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
+    if width * 3 >= height * 4 {
+        ((height * 4 / 3).min(width), height)
+    } else {
+        (width, (width * 3 / 4).min(height))
+    }
+}
+
+/// Framebuffer storage only. Encoding belongs to the containing [`Sink`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Framebuffer {
+    /// Kernel-virtual address of pixel (0,0).
+    pub va: usize,
+    /// Bytes per device row (the pitch, which may exceed width × pixel size).
+    pub pitch: usize,
+    pub width: usize,
+    pub height: usize,
+    /// Full-frame writes are unusually expensive (QEMU-TCG's strong-UC GOP
+    /// mapping), so emulated VGA should use a conservative refresh cadence.
+    pub slow: bool,
+    /// Bare metal: device-row copies use 16-byte non-temporal stores. Real
+    /// WC apertures never engage the CPU's fast-string path, so rep movsd
+    /// issues one 4-byte store per cycle there; under a hypervisor the
+    /// framebuffer is host-RAM-backed (effectively WB) and rep movsd's
+    /// fast-string/helper paths win instead — both measured.
+    pub wide: bool,
+}
+
+/// Somewhere to put a finished frame: pixel memory plus how pixels are
+/// encoded in it. `native` is present exactly when the framebuffer belongs to
+/// a physical VGA adapter held in a fixed mode, so it can be handed back.
+pub struct Sink {
+    pub format: FormatSpec,
+    pub framebuffer: Framebuffer,
+    pub native: Option<VgaAdapterMode>,
+}
+
+impl core::fmt::Debug for Sink {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_struct("Sink")
+            .field("format", &self.format)
+            .field("framebuffer", &self.framebuffer)
+            .field("native", &self.native.is_some())
+            .finish()
+    }
+}
+
+impl Sink {
+    /// Establish a display sink from framebuffer storage, its pixel encoding,
+    /// and optional ownership of the physical VGA producing that storage.
+    /// Boot/GOP, BIOS/VBE and indexed VGA all cross this same boundary.
+    pub fn from_framebuffer(
+        framebuffer: Framebuffer,
+        format: FormatSpec,
+        native: Option<VgaAdapterMode>,
+    ) -> Self {
+        Self { format, framebuffer, native }
+    }
+
+    /// The output rectangle inside this framebuffer.
+    ///
+    /// `fit_vga` letterboxes to 4:3 because a GOP/LFB has SQUARE pixels and a
+    /// VGA image drawn 1:1 there would be geometrically wrong. A physical VGA
+    /// aperture is the opposite case: its pixels are not square, 320x200 IS
+    /// 4:3 on the monitor, and fitting it to 266x200 both squeezes the picture
+    /// and invents borders the hardware never had — borders that then have to
+    /// be cleared, which is the only reason the reset path zeroes the
+    /// framebuffer at all.
+    pub fn fit(&self) -> (usize, usize) {
+        match self.native {
+            Some(_) => (self.framebuffer.width, self.framebuffer.height),
+            None => fit_vga(self.framebuffer.width, self.framebuffer.height),
+        }
+    }
+
+    pub fn packed_format(&self) -> Option<PixelFormat> {
+        match self.format {
+            FormatSpec::Packed(format) => Some(format),
+            FormatSpec::Indexed8 => None,
+        }
+    }
+
+    /// Only a VGA-backed sink can yield physical-VGA authority. Other sinks
+    /// are returned unchanged.
+    pub fn try_into_passthrough(
+        mut self,
+    ) -> Result<VgaAdapterMode, Self> {
+        match self.native.take() {
+            Some(vga) => Ok(vga),
+            None => Err(self),
+        }
+    }
+
+}
+
+/// The machine's display: what a picture can be put onto.
+///
+/// Three ways a machine can show a VGA, and the guest cannot tell them apart:
+/// its own adapter, a linear framebuffer we paint, or nothing at all (still
+/// modelled, so a screenshot works).
+#[derive(Debug)]
+pub enum Display {
+    /// A real VGA-compatible adapter is here, in this mode. Program its
+    /// registers, or call its ROM for VBE; the hardware holds the state.
+    Adapter(VgaAdapterMode),
+    /// Somewhere to paint a modelled VGA.
+    Sink(Sink),
+    /// A host window that installed a present sink. Folds into `Sink` once the
+    /// window carries its framebuffer descriptor instead of registering a
+    /// global — the last caller-back on the display path.
+    HostWindow,
+    /// Nothing to show on. The VGA is still modelled, which is what makes
+    /// `--screenshot` and screendumps work on a headless run.
+    None,
 }

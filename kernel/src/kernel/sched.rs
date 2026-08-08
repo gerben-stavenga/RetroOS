@@ -32,7 +32,7 @@ pub fn verdict<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    display_handoff: &mut Option<crate::kernel::platform::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
@@ -58,7 +58,7 @@ fn next_after<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    display_handoff: &mut Option<crate::kernel::platform::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     match action {

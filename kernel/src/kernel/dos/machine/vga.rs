@@ -22,7 +22,7 @@ pub fn physical_vga_present() -> bool {
     // No probe (bare-ELF dev path) ⇒ no card. Guards the console-VGA snapshot
     // that thread-exit takes, which would otherwise trip `get`'s panic there.
     crate::kernel::platform::probed()
-        && crate::kernel::platform::get().display.vga_passthrough()
+        && crate::kernel::platform::get().vga_passthrough
 }
 
 /// Materialize the universally available Mode 13 sink after F12 takes the
@@ -31,7 +31,7 @@ pub fn physical_vga_present() -> bool {
 /// Make a presentable sink out of whatever the personality handed back.
 ///
 /// On UEFI this is the identity: the firmware already gave us a linear
-/// framebuffer, so the token IS a sink. On BIOS the token is a `BiosDisplay`
+/// framebuffer, so the token IS a sink. On BIOS the token is a `VgaAdapterMode`
 /// capability — authority over an adapter, not a surface — and becoming a sink
 /// means asking the video BIOS for a mode and mapping what it points at.
 ///
@@ -42,11 +42,11 @@ pub fn physical_vga_present() -> bool {
 pub fn sink_from_display<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: crate::kernel::platform::DisplayToken,
-) -> crate::kernel::platform::DisplayToken {
+    display: crate::kernel::platform::Display,
+) -> crate::kernel::platform::Display {
     match display {
-        crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
-            crate::kernel::platform::DisplayToken::LfbDisplay(
+        crate::kernel::platform::Display::Adapter(native) => {
+            crate::kernel::platform::Display::Sink(
                 acquire_bios_sink(machine, bios_workspace, native))
         }
         other => other,
@@ -56,8 +56,8 @@ pub fn sink_from_display<A: crate::Arch>(
 fn acquire_bios_sink<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    mut bios_display: crate::kernel::platform::BiosDisplay,
-) -> crate::kernel::display::LfbDisplay {
+    mut bios_display: ::vga::VgaAdapterMode,
+) -> ::vga::Sink {
     if let Some(mode) = crate::kernel::platform::get().vbe_mode
         && bios_workspace.bios_set_mode(machine, &mut bios_display, mode.number).is_ok()
         && let crate::kernel::display::FormatSpec::Packed(format) = mode.format
@@ -74,7 +74,7 @@ fn acquire_bios_sink<A: crate::Arch>(
         );
         crate::println!("OSD: VBE sink {}x{}x{} mode={:#x}",
             mode.width, mode.height, mode.bits_per_pixel, mode.number);
-        return crate::kernel::display::LfbDisplay::from_framebuffer(
+        return ::vga::Sink::from_framebuffer(
             crate::kernel::display::Framebuffer {
                 va: VBE_OSD_BASE + offset,
                 pitch: usize::from(mode.pitch),
@@ -96,8 +96,8 @@ const VBE_OSD_BASE: usize = 0xFC00_0000;
 pub fn release_bios_sink<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    sink: crate::kernel::display::LfbDisplay,
-) -> crate::kernel::platform::BiosDisplay {
+    sink: ::vga::Sink,
+) -> ::vga::VgaAdapterMode {
     // Which sink this is, is a question about what `prepare_bios_osd` DID —
     // whether it mapped a VBE linear framebuffer at VBE_OSD_BASE, or fell back
     // to the legacy aperture the adapter already exposes at LOW_MEM_BASE +
@@ -112,21 +112,21 @@ pub fn release_bios_sink<A: crate::Arch>(
         machine.unmap_range(base / crate::PAGE_SIZE, pages);
         // `let ... else`, not `.expect()`: the error half is the sink itself,
         // which is not Debug, so there is nothing to format.
-        let Ok(mut native) = sink.try_into_bios_display() else {
+        let Ok(mut native) = sink.try_into_passthrough() else {
             panic!("packed native sink lost adapter")
         };
         let _ = bios_workspace.bios_set_mode(machine, &mut native, 3);
         return native;
     }
-    let Ok(native) = sink.try_into_bios_display() else {
+    let Ok(native) = sink.try_into_passthrough() else {
         panic!("native OSD sink lost adapter")
     };
     native
 }
 
 fn prepare_mode13_osd(
-    bios_display: crate::kernel::platform::BiosDisplay,
-) -> crate::kernel::display::LfbDisplay {
+    bios_display: ::vga::VgaAdapterMode,
+) -> ::vga::Sink {
     let mut state = VgaState::new();
     let regs = ::vga::bios_mode_regs(0x13).expect("mode 13h register table");
     state.misc_output = regs.misc;
@@ -151,7 +151,7 @@ fn prepare_mode13_osd(
     state.dac = ::vga::palette_rgb332();
     state.planes.resize(4 * 0x10000, 0);
     crate::kernel::drivers::vga_hw::restore(&state);
-    crate::kernel::display::LfbDisplay::from_framebuffer(
+    ::vga::Sink::from_framebuffer(
         crate::kernel::display::Framebuffer {
             va: crate::LOW_MEM_BASE + 0xA0000,
             pitch: 320,
@@ -169,21 +169,27 @@ fn prepare_mode13_osd(
 
 /// The emulated device: a register file plus the sink it presents into
 /// (`None` while hidden). Both fields are public because callers reach them
-/// by matching [`BiosVga`] — "does this thread own the card" is the variant, and
+/// by matching [`VgaAdapter`] — "does this thread own the card" is the variant, and
 /// destructuring it is how a caller states which case it handles.
-pub struct EmulatedVga {
-    pub state: alloc::boxed::Box<VgaState>,
-    pub display: Option<crate::kernel::platform::DisplayToken>,
+/// A VGA we present: the model, and where its picture goes.
+///
+/// `display` narrows to `Option<Sink>` once `Display::HostWindow` folds into
+/// `Display::Sink` — a facade is never an `Adapter`, so today's type is wider
+/// than the truth. It stays wide while the host window still registers a
+/// global present sink instead of carrying its framebuffer descriptor.
+pub struct Facade {
+    pub model: alloc::boxed::Box<VgaState>,
+    pub display: Option<crate::kernel::platform::Display>,
 }
 
-impl EmulatedVga {
+impl Facade {
     pub fn present<A: crate::Arch>(
         mut self,
         machine: &mut A,
-        display: crate::kernel::platform::DisplayToken,
-    ) -> BiosVga {
+        display: crate::kernel::platform::Display,
+    ) -> VgaAdapter {
         match display {
-            crate::kernel::platform::DisplayToken::BiosDisplay(native) => {
+            crate::kernel::platform::Display::Adapter(native) => {
                 // A freshly created DOS VGA has no suspended image yet. Its
                 // first attachment adopts the card exactly as the preceding
                 // visible owner left it (normally BIOS text mode plus the
@@ -191,19 +197,19 @@ impl EmulatedVga {
                 // here and restoring it blanks the native display. Once this
                 // VGA has been suspended, `planes` is populated and later
                 // attachments perform the ordinary exact repaint.
-                if !self.state.planes.is_empty() {
-                    capture_emulated_aperture(&mut self.state, machine);
+                if !self.model.planes.is_empty() {
+                    capture_emulated_aperture(&mut self.model, machine);
                 }
                 machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
-                self.state.a0000_trapped = false;
-                crate::kernel::drivers::vga_hw::restore(&self.state);
+                self.model.a0000_trapped = false;
+                crate::kernel::drivers::vga_hw::restore(&self.model);
                 // Once materialized, the card is the state. Do not retain a
                 // second authoritative register/VRAM image in the thread.
-                BiosVga::Bios(native)
+                VgaAdapter::Passthrough(native)
             }
             display => {
                 self.display = Some(display);
-                BiosVga::Emulated(self)
+                VgaAdapter::Facade(self)
             }
         }
     }
@@ -211,41 +217,45 @@ impl EmulatedVga {
 
 /// A thread's VGA device. The variant, rather than machine capability, decides
 /// whether guest accesses reach hardware or the emulated register file.
-pub enum BiosVga {
-    Bios(crate::kernel::platform::BiosDisplay),
-    Emulated(EmulatedVga),
+pub enum VgaAdapter {
+    /// A real VGA-compatible adapter, held, in this mode. The hardware IS the
+    /// state — no model is kept, because a second authoritative register and
+    /// VRAM image is exactly the thing that goes stale.
+    Passthrough(::vga::VgaAdapterMode),
+    /// No such adapter here: a VGA is presented instead. The model is the VGA.
+    Facade(Facade),
 }
 
-impl Default for BiosVga {
+impl Default for VgaAdapter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl BiosVga {
+impl VgaAdapter {
     pub fn new() -> Self {
-        Self::Emulated(EmulatedVga { state: VgaState::new_boxed(), display: None })
+        Self::Facade(Facade { model: VgaState::new_boxed(), display: None })
     }
 
     /// Consume a native attachment, snapshot it, and return the emulated
     /// device plus the released physical-card authority.
-    pub fn into_emulated<A: crate::Arch>(
+    pub fn drop_to_facade<A: crate::Arch>(
         self,
         machine: &mut A,
-    ) -> (Self, crate::kernel::platform::DisplayToken) {
+    ) -> (Self, crate::kernel::platform::Display) {
         match self {
-            Self::Bios(native) => {
+            Self::Passthrough(native) => {
                 let mut state = VgaState::new_boxed();
                 crate::kernel::drivers::vga_hw::save(&mut state);
                 materialize_emulated_aperture(&mut state, machine);
                 (
-                    Self::Emulated(EmulatedVga { state, display: None }),
-                    crate::kernel::platform::DisplayToken::BiosDisplay(native),
+                    Self::Facade(Facade { model: state, display: None }),
+                    crate::kernel::platform::Display::Adapter(native),
                 )
             }
-            Self::Emulated(mut vga) => {
+            Self::Facade(mut vga) => {
                 let display = vga.display.take().expect("hidden VGA has no display");
-                (Self::Emulated(vga), display)
+                (Self::Facade(vga), display)
             }
         }
     }
@@ -253,16 +263,16 @@ impl BiosVga {
     /// OSD take boundary. A native VBE framebuffer is card state, so query it
     /// while the capability is still here and materialize it into this
     /// thread's ordinary emulated-SVGA RAM before lending the card to OSD.
-    pub fn into_emulated_for_osd<A: crate::Arch>(
+    pub fn drop_to_facade_for_osd<A: crate::Arch>(
         self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> (Self, crate::kernel::platform::DisplayToken) {
+    ) -> (Self, crate::kernel::platform::Display) {
         match self {
-            Self::Bios(mut native) => {
+            Self::Passthrough(mut native) => {
                 let detached_vbe = match &native {
-                    crate::kernel::platform::BiosDisplay::Legacy => None,
-                    crate::kernel::platform::BiosDisplay::Vesa { mode, bank } => Some((*mode, *bank)),
+                    ::vga::VgaAdapterMode::Legacy => None,
+                    ::vga::VgaAdapterMode::Vbe { mode, bank } => Some((*mode, *bank)),
                 };
                 let mut state = VgaState::new_boxed();
                 crate::kernel::drivers::vga_hw::save(&mut state);
@@ -272,11 +282,11 @@ impl BiosVga {
                     materialize_emulated_aperture(&mut state, machine);
                 }
                 (
-                    Self::Emulated(EmulatedVga { state, display: None }),
-                    crate::kernel::platform::DisplayToken::BiosDisplay(native),
+                    Self::Facade(Facade { model: state, display: None }),
+                    crate::kernel::platform::Display::Adapter(native),
                 )
             }
-            other => other.into_emulated(machine),
+            other => other.drop_to_facade(machine),
         }
     }
 
@@ -284,45 +294,45 @@ impl BiosVga {
     pub fn present<A: crate::Arch>(
         self,
         machine: &mut A,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) -> Self {
         match self {
-            Self::Emulated(vga) => vga.present(machine, display),
-            Self::Bios(_) => panic!("VGA already owns native hardware"),
+            Self::Facade(vga) => vga.present(machine, display),
+            Self::Passthrough(_) => panic!("VGA already owns native hardware"),
         }
     }
 
-    /// Inverse of `into_emulated_for_osd`: restore a captured native VBE mode
+    /// Inverse of `drop_to_facade_for_osd`: restore a captured native VBE mode
     /// and its pixels before making the card authoritative again.
-    pub fn present_from_osd<A: crate::Arch>(
+    pub fn raise_from_osd<A: crate::Arch>(
         self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) -> Self {
         match (self, display) {
-            (Self::Emulated(mut dev), crate::kernel::platform::DisplayToken::BiosDisplay(mut native))
-                if dev.state.detached_vbe.is_some() =>
+            (Self::Facade(mut dev), crate::kernel::platform::Display::Adapter(mut native))
+                if dev.model.detached_vbe.is_some() =>
             {
-                let detached = dev.state.detached_vbe.take().unwrap();
+                let detached = dev.model.detached_vbe.take().unwrap();
                 let request = detached.mode.number | if detached.bank.is_none() { 0x4000 } else { 0 };
                 if bios_workspace.bios_set_mode_request(machine, &mut native, request).is_ok() {
-                    restore_bios_vbe(machine, bios_workspace, &mut native, &dev.state, detached);
-                    crate::kernel::drivers::vga_hw::restore_dac(&dev.state);
+                    restore_bios_vbe(machine, bios_workspace, &mut native, &dev.model, detached);
+                    crate::kernel::drivers::vga_hw::restore_dac(&dev.model);
                 } else {
                     crate::println!("VBE: failed to restore guest mode {:#x}", detached.mode.number);
                 }
-                discard_emulated_svga(machine, &mut dev.state);
-                Self::Bios(native)
+                discard_emulated_svga(machine, &mut dev.model);
+                Self::Passthrough(native)
             }
             (vga, display) => vga.present(machine, display),
         }
     }
 
-    pub fn display(&self) -> Option<&crate::kernel::platform::DisplayToken> {
+    pub fn display(&self) -> Option<&crate::kernel::platform::Display> {
         match self {
-            Self::Bios(_) => None,
-            Self::Emulated(vga) => vga.display.as_ref(),
+            Self::Passthrough(_) => None,
+            Self::Facade(vga) => vga.display.as_ref(),
         }
     }
 
@@ -331,20 +341,20 @@ impl BiosVga {
     /// already IS the card and passes through untouched.
     pub fn snapshot_hardware<A: crate::Arch>(self, machine: &mut A) -> Self {
         match self {
-            native @ Self::Bios(_) => native,
-            Self::Emulated(mut dev) => {
-                crate::kernel::drivers::vga_hw::save(&mut dev.state);
-                materialize_emulated_aperture(&mut dev.state, machine);
-                Self::Emulated(dev)
+            native @ Self::Passthrough(_) => native,
+            Self::Facade(mut dev) => {
+                crate::kernel::drivers::vga_hw::save(&mut dev.model);
+                materialize_emulated_aperture(&mut dev.model, machine);
+                Self::Facade(dev)
             }
         }
     }
 
     pub fn take_saved_state(&mut self) -> Option<alloc::boxed::Box<VgaState>> {
         match self {
-            Self::Emulated(vga) if !vga.state.planes.is_empty() =>
-                Some(core::mem::replace(&mut vga.state, VgaState::new_boxed())),
-            Self::Emulated(_) | Self::Bios(_) => None,
+            Self::Facade(vga) if !vga.model.planes.is_empty() =>
+                Some(core::mem::replace(&mut vga.model, VgaState::new_boxed())),
+            Self::Facade(_) | Self::Passthrough(_) => None,
         }
     }
 
@@ -352,8 +362,8 @@ impl BiosVga {
     /// and consumes the shadow; an emulated owner keeps it for its sink.
     pub fn install_saved_state(&mut self, state: alloc::boxed::Box<VgaState>) {
         match self {
-            Self::Bios(_) => crate::kernel::drivers::vga_hw::restore(&state),
-            Self::Emulated(vga) => vga.state = state,
+            Self::Passthrough(_) => crate::kernel::drivers::vga_hw::restore(&state),
+            Self::Facade(vga) => vga.model = state,
         }
     }
 
@@ -476,8 +486,8 @@ const A0000: usize = 0xA0000;
 /// `pc.vga` already holds the post-write register values.
 pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs) {
     // A real card does its own plane routing.
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     let idx = vga.seq_index & 0x1F;
     match idx {
         4 => {
@@ -564,7 +574,7 @@ fn svga_shadow_pages(pitch: u16, height: u16) -> usize {
 fn capture_bios_vbe<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::platform::BiosDisplay,
+    display: &mut ::vga::VgaAdapterMode,
     state: &mut VgaState,
     mode: crate::kernel::platform::VbeMode,
     bank: Option<crate::kernel::platform::VbeBank>,
@@ -604,7 +614,7 @@ fn capture_bios_vbe<A: crate::Arch>(
 fn restore_bios_vbe<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::platform::BiosDisplay,
+    display: &mut ::vga::VgaAdapterMode,
     state: &VgaState,
     detached: DetachedVbe,
 ) {
@@ -633,7 +643,7 @@ fn restore_bios_vbe<A: crate::Arch>(
 fn copy_banked_from_card<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::platform::BiosDisplay,
+    display: &mut ::vga::VgaAdapterMode,
     window: crate::kernel::platform::VbeBank,
     pixels: &mut [u8],
 ) {
@@ -652,7 +662,7 @@ fn copy_banked_from_card<A: crate::Arch>(
 fn copy_banked_to_card<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::platform::BiosDisplay,
+    display: &mut ::vga::VgaAdapterMode,
     window: crate::kernel::platform::VbeBank,
     pixels: &[u8],
 ) {
@@ -700,8 +710,8 @@ pub const fn svga_lfb_base() -> u32 {
 pub fn svga_set_mode<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, w: u16, h: u16, bpp: u8) {
     // The synthetic framebuffer is the emulated model's; a real card runs its
     // own VBE through the ROM.
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     let pages = svga_banks(w, h, bpp) * WINDOW_PAGES;
     machine.map_fresh_range(SVGA_LFB_BASE >> 12, pages);
     machine.copy_page_entries(SVGA_LFB_BASE >> 12, A0000 >> 12, WINDOW_PAGES);
@@ -718,8 +728,8 @@ pub fn svga_set_mode<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, w: u16
 /// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
 /// framebuffer. No copy — the window simply shares the bank's frames.
 pub fn svga_set_bank<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, bank: u16) {
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     if vga.svga_w == 0 {
         return;
     }
@@ -731,8 +741,8 @@ pub fn svga_set_bank<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, bank: 
 /// Leave SVGA for a standard VGA mode: detach the window alias and free the
 /// framebuffer region.
 pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     if vga.svga_w == 0 {
         return;
     }
@@ -768,8 +778,8 @@ pub fn on_set_mode<A: crate::Arch>(
     // A standard mode-set leaves any active VESA SVGA mode.
     svga_leave(machine, pc);
     // A real card draws its own planes from its own register file.
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     // Program the full canonical register file, exactly as a real BIOS does
     // from its video parameter table. This is what keeps classification
     // register-pure (the hardware never consults BIOS data): a tweaker
@@ -864,14 +874,14 @@ pub fn vram_write(vga: &mut VgaState, off: u32, byte: u8) {
 /// file/device data straight into video memory; on a real VGA those CPU stores
 /// still honour map mask/write-mode/latches, while the emulated path has A0000
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
-pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut BiosVga, addr: usize, src: &[u8]) {
-    let BiosVga::Emulated(vga) = vga else {
+pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut VgaAdapter, addr: usize, src: &[u8]) {
+    let VgaAdapter::Facade(vga) = vga else {
         // A native thread's CPU stores already target the card aperture; no
         // emulated planar trap or shadow state participates.
         machine.copy_to(addr, src);
         return;
     };
-    let vga = &mut vga.state;
+    let vga = &mut vga.model;
     const A0000_END: usize = A0000 + 0x10000;
     if vga.a0000_trapped {
         let bda_mode = machine.read::<u8>(0x449);
@@ -937,9 +947,9 @@ pub fn vram_read(vga: &mut VgaState, off: u32) -> u8 {
 /// IBM 8×8 (200-line modes + 13h), 8×14 (EGA 350-line), or 8×16 (VGA 480-line).
 /// A native owner is answered by its own ROM and has no register file to
 /// rasterize through, so it takes the caller's text-cell path.
-pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, device: &mut BiosVga, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
-    let BiosVga::Emulated(dev) = device else { return false };
-    let vga = &mut dev.state;
+pub fn bios_draw_glyph<A: crate::Arch>(machine: &mut A, device: &mut VgaAdapter, mode: u8, ch: u8, col: u32, row: u32, fg: u8) -> bool {
+    let VgaAdapter::Facade(dev) = device else { return false };
+    let vga = &mut dev.model;
     let (cell_h, font): (u32, &[u8]) = match mode {
         0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
         0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),

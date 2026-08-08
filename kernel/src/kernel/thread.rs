@@ -181,7 +181,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn adopt_display(
         &mut self,
         machine: &mut A,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         match self {
             Self::Dos(d) => d.materialize(machine, display),
@@ -230,7 +230,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-    ) -> crate::kernel::platform::DisplayToken {
+    ) -> crate::kernel::platform::Display {
         match self {
             Self::Dos(d) => match bios_workspace {
                 Some(workspace) => d.suspend_for_osd(machine, workspace),
@@ -244,7 +244,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::platform::DisplayToken {
+    ) -> crate::kernel::platform::Display {
         match self {
             Self::Dos(d) => d.suspend_for_osd(machine, bios_workspace),
             Self::Linux(l) => l.suspend(machine),
@@ -259,7 +259,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         match self {
             Self::Dos(d) => match bios_workspace {
@@ -274,7 +274,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         match self {
             Self::Dos(d) => d.materialize_from_osd(machine, bios_workspace, display),
@@ -876,7 +876,7 @@ pub fn exit_thread<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     tid: usize,
     exit_code: i32,
-    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    display_handoff: &mut Option<crate::kernel::platform::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;

@@ -569,9 +569,9 @@ fn run_program<A: crate::Arch>(
     cwd: &[u8],
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
-    display: crate::kernel::platform::DisplayToken,
+    display: crate::kernel::platform::Display,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
-) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (crate::kernel::platform::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -683,7 +683,7 @@ pub fn event_loop<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
     sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
-) -> (crate::kernel::platform::DisplayToken, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (crate::kernel::platform::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
@@ -869,7 +869,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
-    display_handoff: &mut Option<crate::kernel::platform::DisplayToken>,
+    display_handoff: &mut Option<crate::kernel::platform::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {

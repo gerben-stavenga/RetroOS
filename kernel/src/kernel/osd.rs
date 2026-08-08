@@ -65,7 +65,7 @@ static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(100);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
-static mut DISPLAY: Option<crate::kernel::platform::DisplayToken> = None;
+static mut DISPLAY: Option<crate::kernel::platform::Display> = None;
 
 /// Is the monitor panel currently open?
 pub fn is_open() -> bool {
@@ -73,7 +73,7 @@ pub fn is_open() -> bool {
 }
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
-pub fn open(display: crate::kernel::platform::DisplayToken) {
+pub fn open(display: crate::kernel::platform::Display) {
     unsafe {
         assert!((&raw const DISPLAY).as_ref().unwrap().is_none());
         DISPLAY = Some(display);
@@ -93,14 +93,14 @@ pub fn take_repaint_request() -> bool {
     REPAINT.swap(false, Ordering::Relaxed)
 }
 
-pub fn display() -> Option<&'static crate::kernel::platform::DisplayToken> {
+pub fn display() -> Option<&'static crate::kernel::platform::Display> {
     if !is_open() {
         return None;
     }
     unsafe { (&raw const DISPLAY).as_ref().unwrap().as_ref() }
 }
 
-pub fn take_display() -> crate::kernel::platform::DisplayToken {
+pub fn take_display() -> crate::kernel::platform::Display {
     unsafe {
         (&raw mut DISPLAY).as_mut().unwrap().take()
             .expect("open OSD has no display token")

@@ -9,7 +9,7 @@
 //! `machine.rs`, and XMS/EMS/UMA in their own files.
 //!
 //! DOS always boots from a COW template containing the Rust substitute BIOS.
-//! Native video firmware is not part of a DOS address space; `BiosVga::Bios`
+//! Native video firmware is not part of a DOS address space; `VgaAdapter::Passthrough`
 //! delegates only physical display operations to the kernel-owned
 //! `BiosDisplayWorkspace`.
 
@@ -45,7 +45,7 @@ mod bios;
 mod dpmi;
 mod dfs;
 mod machine;
-mod screen;
+mod present;
 mod xms;
 mod ems;
 // The DOS ABI core (INT 21h/33h services). Named `dosabi` rather than `dos` so
@@ -57,7 +57,7 @@ use self::dosabi as dos;
 mod mode_transitions;
 
 pub use machine::vsb::SbDevice;
-pub use machine::vga::{BiosVga, physical_vga_present, release_bios_sink, sink_from_display};
+pub use machine::vga::{VgaAdapter, physical_vga_present, release_bios_sink, sink_from_display};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
@@ -187,7 +187,7 @@ pub struct DosState<A: crate::Arch> {
     /// that can't complete synchronously (e.g. AH=08 with no keystroke
     /// ready). While set, the user's CS:IP is parked at `SLOT_RESUME` —
     /// every event-loop iteration re-traps and re-invokes the closure.
-    /// The closure returns `Some(next)` to stay parked with a new state,
+    /// The closure returns `Some(next)` to stay parked with a new model,
     /// or `None` to signal completion (SLOT_RESUME then unwinds via the
     /// standard soft-INT iret-frame pop). The return-based contract makes
     /// the "still waiting vs done" decision explicit at every call site
@@ -309,9 +309,9 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::DisplayToken {
+    pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::Display {
         let vga = core::mem::take(&mut self.pc.vga);
-        let (vga, display) = vga.into_emulated(machine);
+        let (vga, display) = vga.drop_to_facade(machine);
         self.pc.vga = vga;
         display
     }
@@ -320,12 +320,12 @@ impl<A: crate::Arch> DosState<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::platform::DisplayToken {
+    ) -> crate::kernel::platform::Display {
         let vga = core::mem::take(&mut self.pc.vga);
-        let (vga, display) = vga.into_emulated_for_osd(machine, bios_workspace);
+        let (vga, display) = vga.drop_to_facade_for_osd(machine, bios_workspace);
         self.pc.vga = vga;
-        if let machine::vga::BiosVga::Emulated(dev) = &self.pc.vga
-            && let Some(detached) = dev.state.detached_vbe
+        if let machine::vga::VgaAdapter::Facade(dev) = &self.pc.vga
+            && let Some(detached) = dev.model.detached_vbe
             && detached.bank.is_none()
             && let Some(dpmi) = self.dpmi.as_ref()
         {
@@ -346,7 +346,7 @@ impl<A: crate::Arch> DosState<A> {
     pub(super) fn materialize(
         &mut self,
         machine: &mut A,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         let vga = core::mem::take(&mut self.pc.vga);
         self.pc.vga = vga.present(machine, display);
@@ -356,14 +356,14 @@ impl<A: crate::Arch> DosState<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::platform::DisplayToken,
+        display: crate::kernel::platform::Display,
     ) {
         let detached_vbe = match &self.pc.vga {
-            machine::vga::BiosVga::Emulated(dev) => dev.state.detached_vbe,
-            machine::vga::BiosVga::Bios(_) => None,
+            machine::vga::VgaAdapter::Facade(dev) => dev.model.detached_vbe,
+            machine::vga::VgaAdapter::Passthrough(_) => None,
         };
         let vga = core::mem::take(&mut self.pc.vga);
-        self.pc.vga = vga.present_from_osd(machine, bios_workspace, display);
+        self.pc.vga = vga.raise_from_osd(machine, bios_workspace, display);
         if let Some(detached) = detached_vbe
             && detached.bank.is_none()
             && let Some(dpmi) = self.dpmi.as_ref()
@@ -579,13 +579,13 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-    let machine::vga::BiosVga::Emulated(dev) = &mut dos.pc.vga else { return false };
-    if dev.state.seq[4] & 0x08 != 0 {
+    let machine::vga::VgaAdapter::Facade(dev) = &mut dos.pc.vga else { return false };
+    if dev.model.seq[4] & 0x08 != 0 {
         machine.map_fresh_range((addr as usize) >> 12, 1);
         return true;
     }
     let off = addr - 0xA0000;
-    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.state);
+    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.model);
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 
@@ -1040,8 +1040,8 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
         }
         Op::VgaPeekMode => {
             let rv = thread::with_target_dos(threads, pid, |target| {
-                let machine::vga::BiosVga::Emulated(dev) = &target.pc.vga else { return -61 };
-                let state = &dev.state;
+                let machine::vga::VgaAdapter::Facade(dev) = &target.pc.vga else { return -61 };
+                let state = &dev.model;
                 if state.planes.is_empty() { return -61; }
                 (state.gc[6] & 1) as i32
             });
@@ -1258,7 +1258,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// or no present sink). Each call is one display time slice; the absolute tick
 /// value is used only to notice when an inactive sweep has gone stale.
 pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &Regs, now_ticks: u64) {
-    screen::display_tick(machine, &mut dos.pc, regs, now_ticks);
+    present::display_tick(machine, &mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).

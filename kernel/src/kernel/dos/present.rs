@@ -1,4 +1,4 @@
-//! Putting the machine's screen on the machine's display.
+//! Putting the machine's picture on the machine's display.
 //!
 //! The VGA model, the Voodoo and the OSD all produce pixels; `platform` says
 //! what this machine can actually show them on. This is where those meet: when
@@ -6,15 +6,15 @@
 //! the overlay, and present it through whatever sink the probe handed over.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
-//! cards. Everything it names on the display side — `DisplayToken`,
-//! `LfbDisplay`, `Scratch`, `NativeScanout`, the OSD — is a capability or a
+//! cards. Everything it names on the display side — `Display`,
+//! `Sink`, `Scratch`, `NativeScanout`, the OSD — is a capability or a
 //! sink the kernel owns; the machine below produces a picture and has no
 //! opinion about where it goes.
 
 use crate::Regs;
 use core::sync::atomic::Ordering;
 
-use super::machine::{PcMachine, vga::{BiosVga, SVGA_LFB_BASE}};
+use super::machine::{PcMachine, vga::{VgaAdapter, SVGA_LFB_BASE}};
 use ::vga::VgaState;
 
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
@@ -181,7 +181,7 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
     // means this thread does not own the console: a Glide program in the
     // background still swaps, it just is not seen.
     match pc.vga.display() {
-        Some(crate::kernel::platform::DisplayToken::LfbDisplay(fb)) => {
+        Some(crate::kernel::platform::Display::Sink(fb)) => {
             if fb.packed_format().is_none() {
                 return true;
             }
@@ -225,8 +225,8 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
-    let BiosVga::Emulated(dev) = &mut pc.vga else { return };
-    let vga = &mut dev.state;
+    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.model;
     // Hidden devices have no sink of their own; while the monitor holds the
     // card, its sink is where this thread's preview goes.
     let display = match &dev.display {
@@ -241,10 +241,10 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     // to test only the sink; when fbcon stopped registering one, every metal
     // frame silently returned here.)
     let (direct, host_window) = match display {
-        crate::kernel::platform::DisplayToken::LfbDisplay(sink) => (Some(sink), false),
-        crate::kernel::platform::DisplayToken::HostWindow => (None, true),
-        crate::kernel::platform::DisplayToken::BiosDisplay(_)
-        | crate::kernel::platform::DisplayToken::Headless => return,
+        crate::kernel::platform::Display::Sink(sink) => (Some(sink), false),
+        crate::kernel::platform::Display::HostWindow => (None, true),
+        crate::kernel::platform::Display::Adapter(_)
+        | crate::kernel::platform::Display::None => return,
     };
     let prof = crate::kernel::startup::profile_enabled();
     if let Some(sink) = direct {
@@ -303,7 +303,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     );
                 }
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                let copied = sink.present_shadow(vga_h, shadow);
+                let copied = crate::kernel::display::present_shadow(&sink, vga_h, shadow);
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {

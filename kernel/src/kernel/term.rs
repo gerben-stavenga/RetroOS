@@ -119,10 +119,10 @@ fn scanout(fb: &Framebuffer, format: PixelFormat, frame: &Frame<'_>) {
     for sy in 0..h {
         vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
-    let sink = crate::kernel::display::LfbDisplay::from_framebuffer(
+    let sink = vga::Sink::from_framebuffer(
         *fb,
         crate::kernel::display::FormatSpec::Packed(format),
         None,
     );
-    sink.present_shadow(h, &s.surface[..row_bytes * h]);
+    crate::kernel::display::present_shadow(&sink, h, &s.surface[..row_bytes * h]);
 }
