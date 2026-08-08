@@ -221,10 +221,10 @@ impl DpmiState {
         }
     }
 
-    /// While OSD owns the native card, redirect every client mapping of its
-    /// LFB onto the thread's RAM shadow. The client keeps running and writing
-    /// the same linear addresses, but can no longer scribble over OSD scanout.
-    pub(in crate::kernel::dos) fn detach_vbe_lfb<A: crate::Arch>(
+    /// Redirect every client mapping of one LFB onto a guest-RAM aperture.
+    /// Used both when OSD shadows a native card and when substitute VBE
+    /// allocates an emulated LFB after a client already mapped PhysBasePtr.
+    pub(in crate::kernel::dos) fn redirect_vbe_lfb<A: crate::Arch>(
         &self,
         machine: &mut A,
         physical_base: u32,
@@ -247,7 +247,7 @@ impl DpmiState {
         }
     }
 
-    /// Reconnect mappings redirected by `detach_vbe_lfb` to the physical LFB.
+    /// Reconnect RAM-shadowed mappings to the native physical LFB.
     pub(in crate::kernel::dos) fn attach_vbe_lfb<A: crate::Arch>(
         &self,
         machine: &mut A,

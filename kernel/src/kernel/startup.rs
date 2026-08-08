@@ -219,9 +219,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         | crate::kernel::platform::Audio::EmulatedSilent => {}
         _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
     }
-    // Probe and install the selected output capability. This is the sole
-    // init-time handoff from each driver's static slot into runtime ownership.
-    crate::kernel::sound::install(crate::kernel::sound::Sink::new(machine, audio, for_sink));
+    // Take the selected output capability into runtime ownership. `None` is a
+    // silent runtime, not a dummy sink.
+    let sink = crate::kernel::sound::Sink::new(machine, audio, for_sink);
     init_console_pipe();
 
     // Preserve one kernel-owned pristine real-mode environment. DOS worlds
@@ -233,7 +233,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .and_then(|native| bios_workspace.discover_vbe(machine, native));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
 
-    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card)
+    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card, sink)
 }
 
 /// The host filesystem (COM1 transport). Mounted at /host beside a disk
@@ -465,6 +465,7 @@ fn run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     mut screen: crate::kernel::console::Console,
     mut sb: Option<crate::kernel::drivers::sb16::SbCard>,
+    mut sink: Option<crate::kernel::sound::Sink>,
 ) -> ! {
     // What to run headlessly, from whichever channel the backend has. QEMU and
     // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
@@ -505,7 +506,7 @@ fn run<A: crate::Arch>(
                 core::str::from_utf8(cwd).unwrap_or("?"));
             (screen, sb) = run_program_with_screen(
                 machine, bios_workspace, dos_template, threads, path, tail, cwd, master_env, boot.debug_watch,
-                screen, sb,
+                screen, sb, sink.as_mut(),
             );
         }
         crate::screenln!(screen, "All commands done — shutting down.");
@@ -526,7 +527,7 @@ fn run<A: crate::Arch>(
     loop {
         (screen, sb) = run_program_with_screen(
             machine, bios_workspace, dos_template, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
-            screen, sb,
+            screen, sb, sink.as_mut(),
         );
         crate::screenln!(screen, "DN exited, restarting...");
     }
@@ -545,11 +546,12 @@ fn run_program_with_screen<A: crate::Arch>(
     debug_watch: Option<(u32, u32)>,
     screen: crate::kernel::console::Console,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
+    sink: Option<&mut crate::kernel::sound::Sink>,
 ) -> (crate::kernel::console::Console, Option<crate::kernel::drivers::sb16::SbCard>) {
     let (card, display) = screen.release(machine);
     let (display, sb) = run_program(
         machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch,
-        display, sb,
+        display, sb, sink,
     );
     (crate::kernel::console::Console::acquire(machine, card, display), sb)
 }
@@ -569,9 +571,10 @@ fn run_program<A: crate::Arch>(
     cwd: &[u8],
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
-    display: crate::kernel::platform::Display,
+    display: crate::kernel::display::Display,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
-) -> (crate::kernel::platform::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
+    sink: Option<&mut crate::kernel::sound::Sink>,
+) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -644,7 +647,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, Some(bios_workspace), threads, tid, sb)
+    event_loop(machine, Some(bios_workspace), threads, tid, sb, sink)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -683,17 +686,15 @@ pub fn event_loop<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
     sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
-) -> (crate::kernel::platform::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
+    mut sink: Option<&mut crate::kernel::sound::Sink>,
+) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
     let mut display_handoff = None;
-    // Seeded on the first pump from the sink's own rate, and re-seeded if the
-    // card behind the sink ever changes.
-    let mut audio_producer = crate::kernel::sound::Producer::new(0);
-    let mut audio_pipe = crate::kernel::sound::Pipe::new();
+    let mut audio_clock = crate::kernel::sound::Clock::new();
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
     // hardware with at most one guest owner, and the loop is what outlives
@@ -733,11 +734,15 @@ pub fn event_loop<A: crate::Arch>(
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(machine, ticks, audio_pipe.produced_frames());
+        thread.personality.advance_world(machine, ticks, audio_clock.produced_frames());
         if ticks != 0 {
-            crate::kernel::sound::pump(machine, &mut audio_producer, &mut audio_pipe, ticks as u64, |machine, span| {
-                thread.personality.audio_tick(machine, span);
-            });
+            crate::kernel::sound::advance(
+                machine,
+                &mut audio_clock,
+                sink.as_deref_mut(),
+                ticks as u64,
+                |machine, span| thread.personality.audio_tick(machine, span),
+            );
             thread.personality.display_tick(machine, &ctx.regs);
         }
         stats.part(machine, 2);
@@ -869,7 +874,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
-    display_handoff: &mut Option<crate::kernel::platform::Display>,
+    display_handoff: &mut Option<crate::kernel::display::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {

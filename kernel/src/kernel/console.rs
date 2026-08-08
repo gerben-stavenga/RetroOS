@@ -177,7 +177,7 @@ fn dispatch_linux<A: crate::Arch>(
 /// is a destructed one — so [`Console::release`] consumes it and hands the
 /// pieces back, and the absence of the value is the suspended state.
 pub struct Console {
-    display: crate::kernel::platform::Display,
+    display: crate::kernel::display::Display,
 }
 
 /// What a released console leaves behind: the *card's* state, not the
@@ -188,7 +188,7 @@ pub struct Console {
 pub struct SuspendedCard;
 
 impl Console {
-    pub fn new(display: crate::kernel::platform::Display) -> Self {
+    pub fn new(display: crate::kernel::display::Display) -> Self {
         Self { display }
     }
 
@@ -202,7 +202,7 @@ impl Console {
     pub fn release<A: crate::Arch>(
         self,
         _machine: &mut A,
-    ) -> (SuspendedCard, crate::kernel::platform::Display) {
+    ) -> (SuspendedCard, crate::kernel::display::Display) {
         (SuspendedCard, self.display)
     }
 
@@ -211,7 +211,7 @@ impl Console {
     pub fn acquire<A: crate::Arch>(
         _machine: &mut A,
         _card: SuspendedCard,
-        mut display: crate::kernel::platform::Display,
+        mut display: crate::kernel::display::Display,
     ) -> Self {
         crate::kernel::term::present(&mut display);
         Self { display }

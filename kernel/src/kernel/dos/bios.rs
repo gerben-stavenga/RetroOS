@@ -1364,7 +1364,8 @@ fn vbe_mode_info<A: crate::Arch>(
     true
 }
 
-/// VBE 4F02h — set mode (BX). Ignores the LFB bit (we only do banked).
+/// VBE 4F02h — set mode (BX). The substitute exposes both the bank window and
+/// its RAM-backed PhysBasePtr; native firmware receives the request unchanged.
 fn vbe_set_mode<A: crate::Arch>(
     machine: &mut A,
     bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
@@ -1380,6 +1381,7 @@ fn vbe_set_mode<A: crate::Arch>(
         return false;
     };
     super::machine::vga::svga_set_mode(machine, &mut dos.pc, w, h, bpp);
+    super::dpmi::refresh_svga_lfb_mappings(machine, dos);
     true
 }
 

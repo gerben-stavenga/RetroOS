@@ -309,7 +309,7 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::Display {
+    pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::display::Display {
         let vga = core::mem::take(&mut self.pc.vga);
         let (vga, display) = vga.into_emulated(machine);
         self.pc.vga = vga;
@@ -320,17 +320,24 @@ impl<A: crate::Arch> DosState<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::platform::Display {
+    ) -> crate::kernel::display::Display {
+        let linear_vbe = match &self.pc.vga {
+            machine::vga::DosVga::Native(
+                crate::kernel::platform::NativeVga::Vbe { mode, bank: None },
+            ) => Some(*mode),
+            machine::vga::DosVga::Native(crate::kernel::platform::NativeVga::Legacy)
+            | machine::vga::DosVga::Native(
+                crate::kernel::platform::NativeVga::Vbe { bank: Some(_), .. },
+            )
+            | machine::vga::DosVga::Emulated(_) => None,
+        };
         let vga = core::mem::take(&mut self.pc.vga);
         let (vga, display) = vga.into_emulated_for_osd(machine, bios_workspace);
         self.pc.vga = vga;
-        if let machine::vga::DosVga::Emulated(dev) = &self.pc.vga
-            && let Some(detached) = dev.detached_vbe
-            && detached.bank.is_none()
+        if let Some(mode) = linear_vbe
             && let Some(dpmi) = self.dpmi.as_ref()
         {
-            let mode = detached.mode;
-            dpmi.detach_vbe_lfb(
+            dpmi.redirect_vbe_lfb(
                 machine,
                 mode.physical_base,
                 usize::from(mode.pitch) * usize::from(mode.height),
@@ -346,7 +353,7 @@ impl<A: crate::Arch> DosState<A> {
     pub(super) fn materialize(
         &mut self,
         machine: &mut A,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         let vga = core::mem::take(&mut self.pc.vga);
         self.pc.vga = vga.present(machine, display);
@@ -356,19 +363,19 @@ impl<A: crate::Arch> DosState<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
-        let detached_vbe = match &self.pc.vga {
-            machine::vga::DosVga::Emulated(dev) => dev.detached_vbe,
-            machine::vga::DosVga::Native(_) => None,
-        };
         let vga = core::mem::take(&mut self.pc.vga);
         self.pc.vga = vga.raise_from_osd(machine, bios_workspace, display);
-        if let Some(detached) = detached_vbe
-            && detached.bank.is_none()
+        let linear_vbe = match &self.pc.vga {
+            machine::vga::DosVga::Native(
+                crate::kernel::platform::NativeVga::Vbe { mode, bank: None },
+            ) => Some(*mode),
+            _ => None,
+        };
+        if let Some(mode) = linear_vbe
             && let Some(dpmi) = self.dpmi.as_ref()
         {
-            let mode = detached.mode;
             dpmi.attach_vbe_lfb(
                 machine,
                 mode.physical_base,
@@ -1261,7 +1268,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<
     present::display_tick(machine, &mut dos.pc, regs, now_ticks);
 }
 
-/// Advance emulated Sound Blaster playback (no-op unless the SB is emulated).
+/// Advance emulated audio playback and its guest-visible device events.
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,

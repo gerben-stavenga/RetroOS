@@ -1043,11 +1043,12 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     }
 }
 
-/// A PCM producer the mixer pump sums per block — the one shape
+/// A PCM producer the source clock advances per block — the one shape
 /// every emulated sound device presents: the SB DSP fills from the guest
 /// ring, OPL from nuked-opl3, the GUS from the wavetable sampler; further
-/// sampler-backed devices (GM, AWE) join by implementing this. `mix` is a
-/// pure frame generator. Its device clock is the CPU-clocked production
+/// sampler-backed devices (GM, AWE) join by implementing this. Rendering also
+/// advances the device: the destination may be a physical sink or a discard
+/// buffer, but its clock is always the CPU-clocked production
 /// frontier; the final speaker sink trails it by the physical pipe depth.
 enum PcmSource<'a> {
     /// `None` when this thread holds the real card: silicon mixes itself, and
@@ -1117,7 +1118,7 @@ pub fn audio_tick<A: crate::Arch>(
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
     let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
-    // The pump mixes emulated sources only. A thread holding the real card
+    // The source clock advances emulated sources only. A thread holding the real card
     // has nothing here: its DSP streams from the guest ring over the ISA bus
     // and its OPL is the card's own, so neither produces frames for us and
     // neither has a cursor for us to clock. Bind it once — every SB question

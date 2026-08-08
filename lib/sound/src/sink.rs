@@ -215,13 +215,14 @@ impl<D: Device> Sink<D> {
         self.written_frames
     }
 
-    /// Abandon an underrun's obsolete write position and resume one device
-    /// block ahead of the current cursor.
+    /// Abandon an obsolete write position and resume at the device cursor.
+    /// The DMA ring is already zeroed behind the cursor; claiming a block of
+    /// that silence here would be hidden priming and would reduce the space
+    /// available to the first real submission.
     pub fn resync(&mut self) {
-        let block_frames = self.block_frames();
         let ring_frames = self.buf.len();
-        self.write_pos = ((self.played_frames % ring_frames as u64) as usize + block_frames) % ring_frames;
-        self.written_frames = self.played_frames + block_frames as u64;
+        self.write_pos = (self.played_frames % ring_frames as u64) as usize;
+        self.written_frames = self.played_frames;
     }
 
     fn clear_frames(&mut self, start_frames: u64, len_frames: u64) {
@@ -367,6 +368,22 @@ mod tests {
         assert!(report.underrun.is_none());
         assert_eq!(sink.written_frames(), 0);
         assert_eq!(sink.consumed_frames(), 3);
+    }
+
+    #[test]
+    fn resync_reanchors_without_claiming_priming_silence() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 3 },
+        );
+        let _ = sink.poll();
+        sink.resync();
+        assert_eq!(sink.written_frames(), 3);
+        assert_eq!(sink.consumed_frames(), 3);
+
+        sink.submit(&[(7, 7)], 1 << 16);
+        assert_eq!(sink.written_frames(), 4);
+        assert_eq!(sink.buf[3], [7, 7]);
     }
 
     #[test]

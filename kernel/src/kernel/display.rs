@@ -46,6 +46,11 @@ pub struct Display {
 
 enum Backend {
     Linear(Framebuffer),
+    Vbe {
+        framebuffer: Framebuffer,
+        native: crate::kernel::platform::NativeVga,
+        pages: usize,
+    },
     Vga {
         framebuffer: Framebuffer,
         native: crate::kernel::platform::NativeVga,
@@ -62,6 +67,7 @@ impl core::fmt::Debug for Display {
             .field("rgb", &self.rgb)
             .field("backend", &match self.backend {
                 Backend::Linear(_) => "linear",
+                Backend::Vbe { .. } => "vbe",
                 Backend::Vga { .. } => "vga",
                 Backend::Host => "host",
                 Backend::Headless => "headless",
@@ -85,7 +91,12 @@ impl Display {
     /// Establish the VGA adapter as a known packed linear Mode 13h display.
     pub fn new_vga(native: crate::kernel::platform::NativeVga) -> Self {
         let mut saved = vga::VgaState::new_boxed();
-        crate::kernel::drivers::vga_hw::save(&mut saved);
+        // A legacy owner must be restored register-for-register. A VBE owner
+        // is restored by its firmware mode set and framebuffer handoff; running
+        // the legacy save algorithm over a live banked VBE mode corrupts it.
+        if native.vbe_mode().is_none() {
+            crate::kernel::drivers::vga_hw::save(&mut saved);
+        }
         let mut state = vga::VgaState::new();
         let regs = vga::bios_mode_regs(0x13).expect("mode 13h register table");
         state.misc_output = regs.misc;
@@ -116,6 +127,51 @@ impl Display {
         }
     }
 
+    /// Select and map a packed linear firmware mode. On failure, return the
+    /// still-owned adapter so the caller can fall back to legacy VGA.
+    pub fn new_vbe<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        mut native: crate::kernel::platform::NativeVga,
+        mode: crate::kernel::platform::VbeMode,
+    ) -> Result<Self, crate::kernel::platform::NativeVga> {
+        let FormatSpec::Packed(rgb) = mode.format else { return Err(native) };
+        if mode.physical_base == 0 {
+            return Err(native);
+        }
+        let offset = mode.physical_base as usize & (crate::PAGE_SIZE - 1);
+        let bytes = usize::from(mode.pitch) * usize::from(mode.height);
+        let pages = (offset + bytes).div_ceil(crate::PAGE_SIZE);
+        if arch_abi::FB_WINDOW_BASE + pages * crate::PAGE_SIZE > arch_abi::FB_WINDOW_END
+            || bios.bios_set_mode(machine, &mut native, mode.number).is_err()
+        {
+            return Err(native);
+        }
+        let policy = machine.framebuffer_map_policy();
+        machine.map_phys_range(
+            arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE,
+            pages,
+            u64::from(mode.physical_base) / crate::PAGE_SIZE as u64,
+            policy.flags,
+        );
+        let framebuffer = Framebuffer {
+            va: arch_abi::FB_WINDOW_BASE + offset,
+            pitch: usize::from(mode.pitch),
+            width: usize::from(mode.width),
+            height: usize::from(mode.height),
+            slow: policy.slow,
+            wide: policy.wide,
+        };
+        let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
+        crate::println!("OSD: VBE {}x{}x{} mode={:#x}",
+            mode.width, mode.height, mode.bits_per_pixel, mode.number);
+        Ok(Self {
+            shadow_width,
+            rgb,
+            backend: Backend::Vbe { framebuffer, native, pages },
+        })
+    }
+
     pub fn host() -> Self {
         Self { shadow_width: 720, rgb: PixelFormat::NATIVE, backend: Backend::Host }
     }
@@ -126,14 +182,28 @@ impl Display {
 
     pub fn is_headless(&self) -> bool { matches!(self.backend, Backend::Headless) }
     pub fn is_host(&self) -> bool { matches!(self.backend, Backend::Host) }
-    pub fn is_vga(&self) -> bool { matches!(self.backend, Backend::Vga { .. }) }
-    pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
-        match &self.backend { Backend::Vga { native, .. } => Some(native), _ => None }
+    pub fn is_vga(&self) -> bool {
+        matches!(self.backend, Backend::Vbe { .. } | Backend::Vga { .. })
     }
-    pub fn into_native_vga(self) -> Result<crate::kernel::platform::NativeVga, Self> {
+    pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
+        match &self.backend {
+            Backend::Vbe { native, .. } | Backend::Vga { native, .. } => Some(native),
+            _ => None,
+        }
+    }
+    pub fn into_native_vga<A: crate::Arch>(
+        self,
+        machine: &mut A,
+    ) -> Result<crate::kernel::platform::NativeVga, Self> {
         match self.backend {
+            Backend::Vbe { native, pages, .. } => {
+                machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
+                Ok(native)
+            }
             Backend::Vga { native, saved, .. } => {
-                crate::kernel::drivers::vga_hw::restore(&saved);
+                if native.vbe_mode().is_none() {
+                    crate::kernel::drivers::vga_hw::restore(&saved);
+                }
                 Ok(native)
             }
             _ => Err(self),
@@ -141,18 +211,26 @@ impl Display {
     }
     fn framebuffer(&self) -> Option<&Framebuffer> {
         match &self.backend {
-            Backend::Linear(fb) | Backend::Vga { framebuffer: fb, .. } => Some(fb),
+            Backend::Linear(fb)
+            | Backend::Vbe { framebuffer: fb, .. }
+            | Backend::Vga { framebuffer: fb, .. } => Some(fb),
             _ => None,
         }
     }
     fn fit(&self) -> (usize, usize) {
         let Some(fb) = self.framebuffer() else { return (self.shadow_width, 0) };
-        if self.is_vga() { (fb.width, fb.height) } else { fit_vga(fb.width, fb.height) }
+        if matches!(self.backend, Backend::Vga { .. }) {
+            (fb.width, fb.height)
+        } else {
+            fit_vga(fb.width, fb.height)
+        }
     }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
     pub fn present(&mut self, height: usize, shadow: &[u8]) -> usize {
         match self.backend {
-            Backend::Linear(_) | Backend::Vga { .. } => blit(self, height, shadow),
+            Backend::Linear(_) | Backend::Vbe { .. } | Backend::Vga { .. } => {
+                blit(self, height, shadow)
+            }
             Backend::Host => present_host_shadow(self.shadow_width, height, self.rgb, shadow),
             Backend::Headless => 0,
         }

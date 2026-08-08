@@ -963,6 +963,8 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             let voodoo_bar = super::machine::vvoodoo::BAR_PHYS;
             let is_voodoo = (voodoo_bar..voodoo_bar + super::machine::vvoodoo::BAR_SIZE)
                 .contains(&physical);
+            let synthetic_lfb = matches!(dos.pc.vga, super::machine::vga::DosVga::Emulated(_))
+                && super::machine::vga::svga_lfb_reserved_contains(physical, size);
             if is_voodoo {
                 // Arm the window the way the planar VGA aperture is armed:
                 // MAP_MMIO, i.e. present=0 PLUS the PCD marker. Leaving the
@@ -980,6 +982,22 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     "[DPMI] 0800 voodoo aperture phys={:#x} -> linear={:#x} (trapped)",
                     physical, returned_linear
                 );
+            } else if synthetic_lfb {
+                // Substitute VBE's PhysBasePtr is a guest-linear aperture, not
+                // a machine physical address. If the mode already exists,
+                // alias it now; otherwise leave the client window absent and
+                // `vbe_set_mode` connects this recorded mapping after allocating
+                // the aperture. Treating the number as host physical memory
+                // makes protected-mode games draw away from the scanout.
+                if super::machine::vga::svga_ensure_lfb(
+                    machine, &mut dos.pc, physical, size,
+                ) {
+                    machine.copy_page_entries(
+                        (physical as usize & !0xFFF) >> 12,
+                        (virtual_base >> 12) as usize,
+                        page_count as usize,
+                    );
+                }
             } else {
                 let physical_page = (physical & !0xFFF) as u64 >> 12;
                 machine.map_phys_range(
@@ -1043,6 +1061,29 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
     trace_client_selector_leak("dpmi_int31.exit", regs);
     thread::KernelAction::Done
+}
+
+/// Connect mappings made before mode selection, and grow the RAM aperture to
+/// the amount of video memory each protected-mode client actually mapped.
+pub(super) fn refresh_svga_lfb_mappings<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut super::DosState<A>,
+) {
+    let Some(dpmi) = dos.dpmi.as_ref() else { return };
+    for mapping in dpmi.phys_mappings.iter().flatten() {
+        let physical = mapping.physical_page_base;
+        let size = mapping.page_count.saturating_mul(crate::PAGE_SIZE as u32);
+        if !super::machine::vga::svga_lfb_reserved_contains(physical, size)
+            || !super::machine::vga::svga_ensure_lfb(machine, &mut dos.pc, physical, size)
+        {
+            continue;
+        }
+        machine.copy_page_entries(
+            (physical >> 12) as usize,
+            (mapping.virtual_page_base >> 12) as usize,
+            mapping.page_count as usize,
+        );
+    }
 }
 
 // ============================================================================

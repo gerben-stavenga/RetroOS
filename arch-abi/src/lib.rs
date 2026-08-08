@@ -204,6 +204,10 @@ pub struct FramebufferMapPolicy {
 /// Page size in bytes.
 pub const PAGE_SIZE: usize = 4096;
 
+/// Kernel virtual window reserved for physical framebuffer mappings.
+pub const FB_WINDOW_BASE: usize = 0xFC00_0000;
+pub const FB_WINDOW_END: usize = 0xFFF0_0000;
+
 /// Low memory (first 1MB) is mapped here for VGA/BIOS/VM86 on the metal
 /// backend; the interpreter reuses the same constant value.
 pub const LOW_MEM_BASE: usize = 0xC0A0_0000;

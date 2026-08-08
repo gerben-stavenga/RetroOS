@@ -38,10 +38,8 @@ use crate::println;
 
 pub struct Platform {
     pub host: Host,
-    /// Guest VGA port programming reaches a real adapter rather than the
-    /// `VgaState` register model. The four-variant `Display` fact this
-    /// replaces was only ever read as this one question — every other arm
-    /// meant "we paint it ourselves".
+    /// Guest VGA port programming reaches a real adapter rather than an
+    /// emulated `VgaState`. Runtime ownership lives in `NativeVga`/`Display`.
     pub vga_passthrough: bool,
     /// What sound hardware answered (probe fact).
     ///
@@ -128,17 +126,9 @@ impl NativeVga {
     }
 }
 
-/// The machine's transferable display authority. A DOS thread folds this into
-/// its `DosVga`; the kernel console holds it directly while rendering its
-/// text grid. It is kept out of the frozen [`Platform`] facts because it has
-/// exactly one runtime owner.
-pub use crate::kernel::display::Display;
-
-
-
 pub struct ProbedPlatform {
     pub facts: &'static Platform,
-    pub display: Display,
+    pub display: crate::kernel::display::Display,
     pub audio: AudioToken,
 }
 
@@ -355,13 +345,16 @@ pub fn probe<A: crate::Arch>(
         // confirmed what `is_metal` already implied: the hosted port bus has no
         // VGA device to answer, and a metal machine that boots this way does.
         let (vga_passthrough, display) = if let Some(fb) = (env.framebuffer)() {
-            (false, fb)
+            (false, Some(fb))
         } else if crate::kernel::display::host_present_sink_installed() {
-            (false, Display::host())
+            (false, Some(crate::kernel::display::Display::host()))
         } else if env.is_metal {
-            (true, Display::new_vga(NativeVga::new()))
+            // Constructing the VGA display saves and mode-sets the card. The
+            // driver needs the platform's direct-port/readback facts, so defer
+            // that operation until those facts have been published below.
+            (true, None)
         } else {
-            (false, Display::headless())
+            (false, Some(crate::kernel::display::Display::headless()))
         };
 
         // Who owns the IVT follows from WHO DRIVES THE DISPLAY — not from a
@@ -414,6 +407,9 @@ pub fn probe<A: crate::Arch>(
         PLATFORM = Some(p);
     }
     let p = get();
+    let display = display.unwrap_or_else(|| {
+        crate::kernel::display::Display::new_vga(NativeVga::new())
+    });
     println!(
         "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",
         p.host, p.vga_passthrough, p.firmware, p.audio, p.hostfs, p.debug

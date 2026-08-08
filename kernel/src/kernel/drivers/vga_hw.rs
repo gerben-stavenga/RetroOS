@@ -103,13 +103,7 @@ pub fn save(state: &mut VgaState) {
         }
         outb(0x3CE, 4); outb(0x3CF, state.gc[4]);
     }
-    state.dac_mask = inb(0x3C6);
-    // Capture program-tracked DAC index latch + read/write mode before
-    // stomping it with our bulk read.
-    state.dac_index = inb(0x3C8);
-    state.dac_state = inb(0x3C7);
-    outb(0x3C7, 0);
-    for i in 0..768 { state.dac[i] = inb(0x3C9); }
+    save_dac(state);
 
     // Attribute Controller — must reset flipflop EACH iteration.
     // inb(0x3C1) reads the register but does NOT toggle the flipflop,
@@ -209,6 +203,30 @@ pub fn save(state: &mut VgaState) {
     outb(0x3C4, state.seq_index);
     outb(0x3D4, state.crtc_index);
     outb(0x3CE, state.gc_index);
+}
+
+/// Capture only the palette state shared by legacy VGA and indexed VBE.
+/// Unlike [`save`], this never touches sequencer, CRTC, graphics-controller or
+/// aperture state, so it is safe while a firmware VBE mode is scanning out.
+pub fn save_dac(state: &mut VgaState) {
+    use crate::kernel::portio::{inb, outb};
+    let dac_mask = inb(0x3C6);
+    // QEMU's legacy VGA returns zero for the standard PEL-mask read even when
+    // scanout is using the normal all-bits mask. Replaying that fabricated
+    // zero during a display handoff makes every indexed VBE pixel select DAC
+    // entry zero. A zero mask is therefore unknowable on this backend.
+    state.dac_mask = if crate::kernel::platform::get().host
+        == crate::kernel::platform::Host::Qemu
+        && dac_mask == 0
+    {
+        0xFF
+    } else {
+        dac_mask
+    };
+    state.dac_index = inb(0x3C8);
+    state.dac_state = inb(0x3C7);
+    outb(0x3C7, 0);
+    for i in 0..768 { state.dac[i] = inb(0x3C9); }
 }
 
 /// Program `state` back into the live card: registers, DAC, and plane

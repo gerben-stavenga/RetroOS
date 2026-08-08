@@ -50,7 +50,7 @@ const ENOSYS: i32 = 38;
 // individual thread). All Linux threads write to the same screen, so the
 // snapshot we save on switch-out belongs at the personality level. Lazily
 // allocated on first save (VgaState's planes are a Vec).
-static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::Display> = None;
+static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::display::Display> = None;
 
 fn present_console() {
     unsafe {
@@ -65,7 +65,7 @@ pub fn repaint_console() { present_console(); }
 /// Snapshot the current hardware VGA into the Linux console buffer.
 /// Release the shared console's display token, snapshotting VGA hardware when
 /// the selected display is the legacy card.
-pub fn save_console_vga() -> crate::kernel::platform::Display {
+pub fn save_console_vga() -> crate::kernel::display::Display {
     unsafe {
         let display = (&raw mut LINUX_CONSOLE_DISPLAY)
             .as_mut().unwrap().take().expect("hidden Linux console has no display");
@@ -77,7 +77,7 @@ pub fn save_console_vga() -> crate::kernel::platform::Display {
 /// activation (no snapshot yet) we clear the screen rather than inherit
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
-pub fn restore_console_vga(mut display: crate::kernel::platform::Display) {
+pub fn restore_console_vga(mut display: crate::kernel::display::Display) {
     unsafe {
         crate::kernel::term::present(&mut display);
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
@@ -85,7 +85,7 @@ pub fn restore_console_vga(mut display: crate::kernel::platform::Display) {
     }
 }
 
-pub(super) fn adopt_console_vga(display: crate::kernel::platform::Display) {
+pub(super) fn adopt_console_vga(display: crate::kernel::display::Display) {
     unsafe {
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
@@ -161,7 +161,7 @@ impl LinuxState {
     /// Called when a Linux thread loses focus. Snapshots the shared Linux
     /// console framebuffer (TTY-style — all Linux threads share it).
     pub(super) fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
-        -> crate::kernel::platform::Display
+        -> crate::kernel::display::Display
     {
         save_console_vga()
     }
@@ -173,7 +173,7 @@ impl LinuxState {
     pub(super) fn materialize<A: crate::Arch>(
         &mut self,
         _machine: &mut A,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         restore_console_vga(display);
     }
@@ -1242,7 +1242,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
-    display_handoff: &mut Option<crate::kernel::platform::Display>,
+    display_handoff: &mut Option<crate::kernel::display::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;

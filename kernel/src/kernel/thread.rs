@@ -181,7 +181,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn adopt_display(
         &mut self,
         machine: &mut A,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         match self {
             Self::Dos(d) => d.materialize(machine, display),
@@ -230,7 +230,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-    ) -> crate::kernel::platform::Display {
+    ) -> crate::kernel::display::Display {
         match self {
             Self::Dos(d) => match bios_workspace {
                 Some(workspace) => d.suspend_for_osd(machine, workspace),
@@ -244,7 +244,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::platform::Display {
+    ) -> crate::kernel::display::Display {
         match self {
             Self::Dos(d) => d.suspend_for_osd(machine, bios_workspace),
             Self::Linux(l) => l.suspend(machine),
@@ -255,7 +255,7 @@ impl<A: crate::Arch> Personality<A> {
     /// that personality's ordinary output. The OSD owns no display token.
     pub fn hold_display_for_osd(
         &mut self,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         match self {
             Self::Dos(dos) => {
@@ -270,7 +270,7 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Temporarily move the focused personality's display through the close
     /// transition. It is immediately materialized back into the same owner.
-    pub fn take_display_for_osd(&mut self) -> crate::kernel::platform::Display {
+    pub fn take_display_for_osd(&mut self) -> crate::kernel::display::Display {
         match self {
             Self::Dos(dos) => {
                 let crate::kernel::dos::DosVga::Emulated(vga) = &mut dos.pc.vga else {
@@ -296,7 +296,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         match self {
             Self::Dos(d) => match bios_workspace {
@@ -311,7 +311,7 @@ impl<A: crate::Arch> Personality<A> {
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::platform::Display,
+        display: crate::kernel::display::Display,
     ) {
         match self {
             Self::Dos(d) => d.materialize_from_osd(machine, bios_workspace, display),
@@ -373,7 +373,7 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    /// Mix one span requested by the event loop's output pump.
+    /// Advance one emulated-audio span; its samples may be output or discarded.
     pub fn audio_tick(
         &mut self,
         machine: &mut A,
@@ -913,7 +913,7 @@ pub fn exit_thread<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     tid: usize,
     exit_code: i32,
-    display_handoff: &mut Option<crate::kernel::platform::Display>,
+    display_handoff: &mut Option<crate::kernel::display::Display>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
