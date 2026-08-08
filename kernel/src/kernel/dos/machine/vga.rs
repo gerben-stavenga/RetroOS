@@ -134,10 +134,10 @@ impl EmulatedVga {
             let _ = bios.bios_set_mode(machine, &mut native, 3);
         }
         crate::kernel::drivers::vga_hw::restore(&self.state);
-        if let (Some(bios), Some(state)) = (bios, self.firmware_state.as_ref()) {
-            if let Err(error) = bios.bios_restore_state(machine, &native, state) {
-                crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
-            }
+        if let (Some(bios), Some(state)) = (bios, self.firmware_state.as_ref())
+            && let Err(error) = bios.bios_restore_state(machine, &native, state)
+        {
+            crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
         }
         DosVga::Native(native)
     }

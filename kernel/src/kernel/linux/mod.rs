@@ -67,9 +67,8 @@ pub fn repaint_console() { present_console(); }
 /// the selected display is the legacy card.
 pub fn save_console_vga() -> crate::kernel::display::Display {
     unsafe {
-        let display = (&raw mut LINUX_CONSOLE_DISPLAY)
-            .as_mut().unwrap().take().expect("hidden Linux console has no display");
-        display
+        (&raw mut LINUX_CONSOLE_DISPLAY)
+            .as_mut().unwrap().take().expect("hidden Linux console has no display")
     }
 }
 

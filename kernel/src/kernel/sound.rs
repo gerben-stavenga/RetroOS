@@ -198,6 +198,10 @@ pub struct Clock {
     produced_q16: u64,
 }
 
+impl Default for Clock {
+    fn default() -> Self { Self::new() }
+}
+
 impl Clock {
     pub const fn new() -> Self {
         Self { produced_q16: 0 }

@@ -163,7 +163,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // Nothing else is running yet, so there is no display to arbitrate: write
     // to the terminal directly. Once `startup` builds a `Console`, on-screen
     // kernel text needs that value; ambient println! stays log-only throughout.
-    let mut screen = lib::term::term();
+    let screen = lib::term::term();
 
     lib::screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
@@ -206,7 +206,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // faults, phys_mm for the frames) — so every later init phase can paint
     // its panics. The mappings land in the dual-use PDPT page that the
     // compat-mode toggle below reuses, so they survive the switch.
-    crate::fbcon::init(info, &mut screen);
+    crate::fbcon::init(info, screen);
 
     irq::init_interrupts();
     lib::screenln!(screen, "Interrupts initialized");

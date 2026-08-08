@@ -3,7 +3,7 @@
 //! A machine has one VGA, and more than one thing wants the screen — a DOS
 //! program, a Linux program, the kernel console. Whoever is not holding the
 //! card keeps its screen as a *model* ([`VgaState`], a passive register file
-//! + 4 plane images that belongs to the machine model, not here), and the
+//! and four plane images that belongs to the machine model, not here), and the
 //! two functions below are the only code that moves state between that model
 //! and the silicon. `save` reads the card into a model; `restore` programs a
 //! model into the card.

@@ -97,6 +97,10 @@ pub enum NativeVga {
     },
 }
 
+impl Default for NativeVga {
+    fn default() -> Self { Self::new() }
+}
+
 impl NativeVga {
     pub fn new() -> Self { Self::Legacy }
 

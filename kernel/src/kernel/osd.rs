@@ -509,6 +509,7 @@ pub fn paint(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_tabs(
     out: &mut [u8],
     stride: usize,
@@ -728,8 +729,8 @@ impl Line {
 
     fn put_rate_q16(&mut self, rate_q16: u64) {
         let whole = (rate_q16 >> crate::kernel::sound::RATE_FP_SHIFT) as u32;
-        let frac = ((rate_q16 & ((1u64 << crate::kernel::sound::RATE_FP_SHIFT) - 1))
-            as u128 * 1_000u128
+        let frac = (((rate_q16 & ((1u64 << crate::kernel::sound::RATE_FP_SHIFT) - 1))
+            as u128 * 1_000u128)
             >> crate::kernel::sound::RATE_FP_SHIFT) as u32;
         self.put_num(whole);
         self.put(b".");

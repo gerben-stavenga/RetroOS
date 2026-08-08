@@ -31,7 +31,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //lib:sound_test //lib:vga_render_test \
+        //lib:sound_test //lib:vga_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
 unit_kvm() { bz test --platforms=@platforms//host //arch-interp:arch-interp-kvm-test; }

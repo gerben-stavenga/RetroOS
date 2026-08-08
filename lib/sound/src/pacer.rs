@@ -58,8 +58,8 @@ impl Pacer {
     /// A rate in whole frames/sec plus microframes.
     pub fn rate_hz(rate_q16: u64) -> (u64, u64) {
         let whole = rate_q16 >> RATE_FP_SHIFT;
-        let frac = ((rate_q16 & ((1u64 << RATE_FP_SHIFT) - 1))
-            as u128 * 1_000_000u128
+        let frac = (((rate_q16 & ((1u64 << RATE_FP_SHIFT) - 1))
+            as u128 * 1_000_000u128)
             >> RATE_FP_SHIFT) as u64;
         (whole, frac)
     }

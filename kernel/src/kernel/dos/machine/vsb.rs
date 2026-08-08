@@ -743,7 +743,6 @@ impl EmulatedSb {
 /// Serve the armed SB channel's live addr/count from the real 8237;
 /// everything else from the captured guest programming.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn native_dma_read<A: crate::Arch>(
 pt: &mut NativeSb,
 machine: &mut A,
