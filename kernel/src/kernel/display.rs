@@ -93,21 +93,29 @@ unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
 }
 
 
+/// Tell the backend a frame is complete on `sink`.
+///
+/// Loader-provided LFBs use the platform publication hook (an SFENCE on
+/// metal). A sink the VGA adapter owns is scanned continuously by that
+/// adapter and may run on a pre-SSE CPU, so it deliberately gets no fence.
+///
+/// A free function rather than a method: `Sink` is library data now, and this
+/// is the one place the rule is written down.
+fn publish(sink: &Sink) {
+    if sink.native.is_none() {
+        finish_present();
+    }
+}
+
 /// Present a finished shadow on `sink`: blit it, then tell the backend the
 /// frame is done.
 ///
 /// Not a method on [`Sink`]: the sink is library data describing where pixels
 /// go, while getting them there uses hand-written non-temporal stores and a
 /// platform publication hook, both of which are this layer's business.
-/// Loader-provided LFBs use the hook (SFENCE on metal); a VGA-owned sink is
-/// scanned continuously by the adapter and may run on a pre-SSE CPU, so it
-/// deliberately gets no fence.
+/// `blit` publishes on the way out — see [`publish`].
 pub fn present_shadow(sink: &Sink, source_height: usize, shadow: &[u8]) -> usize {
-    let painted = blit(sink, source_height, shadow);
-    if sink.native.is_none() {
-        finish_present();
-    }
-    painted
+    blit(sink, source_height, shadow)
 }
 
 /// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
@@ -145,9 +153,7 @@ fn blit(sink: &Sink, vga_height: usize, shadow: &[u8]) -> usize {
             oy += 1;
         }
     }
-    if sink.native.is_none() {
-        finish_present();
-    }
+    publish(sink);
     out_w * out_h
 }
 
@@ -551,9 +557,7 @@ impl NativeScanout {
                 );
             }
         }
-        if sink.native.is_none() {
-            finish_present();
-        }
+        publish(sink);
     }
 }
 
