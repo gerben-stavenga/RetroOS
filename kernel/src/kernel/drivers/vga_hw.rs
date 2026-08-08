@@ -47,7 +47,7 @@ pub fn track_ac_reset() {
 
 /// Read the live card's whole register file, DAC and plane memory into
 /// `state`. Called when a thread stops owning the physical display and its
-/// screen must survive as a model (`VgaAdapterMode -> Facade`).
+/// screen must survive as a model (`NativeVga -> EmulatedVga`).
 pub fn save(state: &mut VgaState) {
     use crate::kernel::portio::{inb, outb};
     if state.planes.is_empty() {
@@ -405,4 +405,3 @@ pub fn restore_dac(state: &VgaState) {
         outb(0x3C8, state.dac_index);
     }
 }
-

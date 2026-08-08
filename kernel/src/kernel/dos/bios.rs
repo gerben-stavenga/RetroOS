@@ -782,7 +782,7 @@ fn int10<A: crate::Arch>(
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            if let super::machine::vga::VgaAdapter::Passthrough(display) = &mut dos.pc.as_mut().vga
+            if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.as_mut().vga
                 && let Some(workspace) = bios_display.as_deref_mut()
             {
                 let _ = workspace.bios_set_mode(machine, display, u16::from(mode));
@@ -1159,14 +1159,14 @@ fn vbe<A: crate::Arch>(
     };
     match al {
         0x00 => {
-            let native_modes = matches!(dos.pc.vga, super::machine::vga::VgaAdapter::Passthrough(_))
+            let native_modes = matches!(dos.pc.vga, super::machine::vga::DosVga::Native(_))
                 .then(|| bios_display.as_deref().map(|workspace| workspace.modes()))
                 .flatten();
             vbe_controller_info(machine, regs, native_modes);
             done(regs, true);
         }
         0x01 => {
-            let native_mode = if matches!(dos.pc.vga, super::machine::vga::VgaAdapter::Passthrough(_)) {
+            let native_mode = if matches!(dos.pc.vga, super::machine::vga::DosVga::Native(_)) {
                 bios_display.as_deref().and_then(|workspace| workspace.mode(regs.rcx as u16 & 0x3FFF))
             } else {
                 None
@@ -1182,13 +1182,13 @@ fn vbe<A: crate::Arch>(
             // No emulated register file ⇒ this thread owns a real card, whose
             // ROM answers VBE itself; report "no VBE mode set".
             let cur = match &dos.pc.vga {
-                super::machine::vga::VgaAdapter::Facade(dev) => VBE_MODES.iter()
+                super::machine::vga::DosVga::Emulated(dev) => VBE_MODES.iter()
                     .find(|&&(_, w, h, b)| {
                         w == dev.model.svga_w && h == dev.model.svga_h
                             && b == dev.model.svga_bpp
                     })
                     .map_or(0, |&(n, ..)| n),
-                super::machine::vga::VgaAdapter::Passthrough(display) => display.vbe_mode().map_or(0, |mode| mode.number),
+                super::machine::vga::DosVga::Native(display) => display.vbe_mode().map_or(0, |mode| mode.number),
             };
             regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
             done(regs, true);
@@ -1371,7 +1371,7 @@ fn vbe_set_mode<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    if let super::machine::vga::VgaAdapter::Passthrough(display) = &mut dos.pc.as_mut().vga {
+    if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.as_mut().vga {
         let Some(workspace) = bios_display else { return false };
         return workspace.bios_set_mode_request(machine, display, regs.rbx as u16).is_ok();
     }
@@ -1390,13 +1390,13 @@ fn vbe_window<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    if let super::machine::vga::VgaAdapter::Passthrough(display) = &mut dos.pc.as_mut().vga {
+    if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.as_mut().vga {
         if (regs.rbx >> 8) as u8 == 0 {
             let Some(workspace) = bios_display else { return false };
             return workspace.bios_set_bank(machine, display, regs.rdx as u16).is_ok();
         }
         let bank = match display {
-            vga::VgaAdapterMode::Vbe { bank: Some(bank), .. } => bank.current,
+            crate::kernel::platform::NativeVga::Vbe { bank: Some(bank), .. } => bank.current,
             _ => 0,
         };
         regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
@@ -1406,8 +1406,8 @@ fn vbe_window<A: crate::Arch>(
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
         let bank = match &dos.pc.vga {
-            super::machine::vga::VgaAdapter::Facade(dev) => dev.model.svga_bank,
-            super::machine::vga::VgaAdapter::Passthrough(_) => 0,
+            super::machine::vga::DosVga::Emulated(dev) => dev.model.svga_bank,
+            super::machine::vga::DosVga::Native(_) => 0,
         };
         regs.rdx = (regs.rdx & !0xFFFF) | bank as u64;
     }

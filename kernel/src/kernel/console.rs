@@ -107,18 +107,19 @@ fn monitor_key<A: crate::Arch>(
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
             restore_from_monitor(machine, bios_workspace.as_deref_mut(), regs, personality);
+        } else {
+            personality.repaint_osd();
         }
         return true;
     }
     if sc == F12_PRESS {
-        // Identical on both firmwares: take the display the personality gave
-        // up, then make a sink of it. Only the BIOS arm inside does any work —
-        // a GOP token is already a sink and passes straight through.
+        // The personality already hands back a renderable display. A native
+        // VGA display is Mode 13h-backed just like every other packed output.
         let ws = bios_workspace.as_mut().expect("OSD open without core BIOS");
         let display = personality.suspend_for_osd(machine, ws);
-        let ws = bios_workspace.as_mut().expect("OSD open without core BIOS");
-        let display = crate::kernel::dos::sink_from_display(machine, ws, display);
-        crate::kernel::osd::open(display);
+        personality.hold_display_for_osd(display);
+        crate::kernel::osd::open();
+        personality.repaint_osd();
         return true;
     }
     false
@@ -133,16 +134,7 @@ pub fn restore_from_monitor<A: crate::Arch>(
     personality: &mut thread::Personality<A>,
 ) {
     let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
-    let display = crate::kernel::osd::take_display();
-    let display = match display {
-        crate::kernel::platform::Display::Sink(sink)
-            if sink.native.is_some() =>
-        {
-            let native = crate::kernel::dos::release_bios_sink(machine, bios_workspace, sink);
-            crate::kernel::platform::Display::Adapter(native)
-        }
-        display => display,
-    };
+    let display = personality.take_display_for_osd();
     personality.materialize_from_osd(machine, bios_workspace, display);
 }
 
@@ -193,18 +185,15 @@ pub struct Console {
 /// file and planes are snapshotted for whoever takes the display back. The
 /// text itself needs none of this — the terminal owns its grid and can simply
 /// be redrawn.
-pub struct SuspendedCard(Option<vga::VgaState>);
+pub struct SuspendedCard;
 
 impl Console {
     pub fn new(display: crate::kernel::platform::Display) -> Self {
         Self { display }
     }
 
-    pub fn bios_display(&self) -> Option<&vga::VgaAdapterMode> {
-        match &self.display {
-            crate::kernel::platform::Display::Adapter(native) => Some(native),
-            _ => None,
-        }
+    pub fn bios_display(&self) -> Option<&crate::kernel::platform::NativeVga> {
+        self.display.native_vga()
     }
 
     /// Give up the display. The console ceases to exist; whoever takes the
@@ -214,34 +203,25 @@ impl Console {
         self,
         _machine: &mut A,
     ) -> (SuspendedCard, crate::kernel::platform::Display) {
-        let saved = if matches!(self.display, crate::kernel::platform::Display::Adapter(_)) {
-            let mut card = vga::VgaState::new();
-            crate::kernel::drivers::vga_hw::save(&mut card);
-            Some(card)
-        } else {
-            None
-        };
-        (SuspendedCard(saved), self.display)
+        (SuspendedCard, self.display)
     }
 
     /// Take the display back and become a console again, restoring the card to
     /// the state the previous owner found it in.
     pub fn acquire<A: crate::Arch>(
         _machine: &mut A,
-        card: SuspendedCard,
-        display: crate::kernel::platform::Display,
+        _card: SuspendedCard,
+        mut display: crate::kernel::platform::Display,
     ) -> Self {
-        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
-            crate::kernel::drivers::vga_hw::restore(
-                card.0.as_ref().expect("native console lost its card state"),
-            );
-        }
+        crate::kernel::term::present(&mut display);
         Self { display }
     }
 }
 
 impl core::fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        core::fmt::Write::write_str(lib::term::term(), s)
+        core::fmt::Write::write_str(lib::term::term(), s)?;
+        crate::kernel::term::present(&mut self.display);
+        Ok(())
     }
 }

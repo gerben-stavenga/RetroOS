@@ -49,8 +49,8 @@ pub fn active() -> bool {
 
 /// The boot framebuffer, as a sink the kernel can blit into directly.
 /// Installed into `HostEnv` by the metal entry; the platform probe freezes it
-/// into `Display::Framebuffer`.
-pub fn framebuffer() -> Option<vga::Sink> {
+/// into a linear `Display`.
+pub fn framebuffer() -> Option<crate::kernel::display::Display> {
     let g = (*geom()).as_ref()?;
     let framebuffer = crate::kernel::display::Framebuffer {
         va: g.va,
@@ -62,11 +62,10 @@ pub fn framebuffer() -> Option<vga::Sink> {
     };
     // A loader-provided framebuffer is already established, whether the
     // loader used GOP or VBE. Only a sink RetroOS creates by consuming a
-    // directly-owned card carries VgaAdapterMode.
-    Some(vga::Sink::from_framebuffer(
+    // directly-owned card is constructed separately from `NativeVga`.
+    Some(crate::kernel::display::Display::from_framebuffer(
         framebuffer,
         crate::kernel::display::FormatSpec::Packed(g.format),
-        None,
     ))
 }
 
@@ -264,18 +263,6 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
             .fill(0x0720);
     }
 
-    // From here on the linear framebuffer is simply the emulated VGA's sink.
-    // Kernel text output keeps using the same B8000 cells and VGA interface.
-    let g = (*geom()).as_ref().unwrap();
-    crate::term::attach_framebuffer(
-        crate::kernel::display::Framebuffer {
-            va: g.va,
-            pitch: g.pitch,
-            width: g.width,
-            height: g.height,
-            slow: g.slow,
-            wide: g.wide,
-        },
-        g.format,
-    );
+    // The mapped framebuffer is adopted by `platform::probe`; only the owning
+    // `Display` can present into it from this point on.
 }

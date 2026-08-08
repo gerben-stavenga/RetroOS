@@ -2,7 +2,7 @@
 //!
 //! DOS always runs the Rust substitute BIOS. Native video firmware executes
 //! only in this kernel-owned pristine COW workspace, synchronously servicing
-//! operations on a move-only `VgaAdapterMode`.
+//! operations on a move-only `NativeVga`.
 
 use crate::{Arch, Regs, Vcpu};
 use arch_abi::IoSize;
@@ -47,18 +47,18 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_set_mode(
         &mut self,
         machine: &mut A,
-        bios_display: &mut vga::VgaAdapterMode,
+        bios_display: &mut crate::kernel::platform::NativeVga,
         mode: u16,
     ) -> Result<(), BiosError> {
         self.bios_set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
     }
 
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
-    /// bit so VgaAdapterMode can distinguish an LFB from a banked window.
+    /// bit so NativeVga can distinguish an LFB from a banked window.
     pub fn bios_set_mode_request(
         &mut self,
         machine: &mut A,
-        bios_display: &mut vga::VgaAdapterMode,
+        bios_display: &mut crate::kernel::platform::NativeVga,
         request: u16,
     ) -> Result<(), BiosError> {
         if crate::kernel::platform::get().firmware
@@ -104,7 +104,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_set_bank(
         &mut self,
         machine: &mut A,
-        display: &mut vga::VgaAdapterMode,
+        display: &mut crate::kernel::platform::NativeVga,
         bank: u16,
     ) -> Result<(), BiosError> {
         let mut regs = self.bios_vcpu.regs;
@@ -126,7 +126,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn discover_vbe(
         &mut self,
         machine: &mut A,
-        bios_display: &vga::VgaAdapterMode,
+        bios_display: &crate::kernel::platform::NativeVga,
     ) -> Option<crate::kernel::platform::VbeMode> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
@@ -210,7 +210,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     fn with_bios_clone<T, F, G>(
         &mut self,
         machine: &mut A,
-        bios_display: &vga::VgaAdapterMode,
+        bios_display: &crate::kernel::platform::NativeVga,
         regs: &mut Regs,
         configure: F,
         collect: G,

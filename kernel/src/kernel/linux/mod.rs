@@ -50,8 +50,17 @@ const ENOSYS: i32 = 38;
 // individual thread). All Linux threads write to the same screen, so the
 // snapshot we save on switch-out belongs at the personality level. Lazily
 // allocated on first save (VgaState's planes are a Vec).
-static mut LINUX_CONSOLE_VGA: Option<vga::VgaState> = None;
 static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::platform::Display> = None;
+
+fn present_console() {
+    unsafe {
+        if let Some(display) = (&raw mut LINUX_CONSOLE_DISPLAY).as_mut().unwrap().as_mut() {
+            crate::kernel::term::present(display);
+        }
+    }
+}
+
+pub fn repaint_console() { present_console(); }
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
 /// Release the shared console's display token, snapshotting VGA hardware when
@@ -60,13 +69,6 @@ pub fn save_console_vga() -> crate::kernel::platform::Display {
     unsafe {
         let display = (&raw mut LINUX_CONSOLE_DISPLAY)
             .as_mut().unwrap().take().expect("hidden Linux console has no display");
-        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
-            let vga = (&raw mut LINUX_CONSOLE_VGA)
-                .as_mut()
-                .unwrap()
-                .get_or_insert_with(vga::VgaState::new);
-            crate::kernel::drivers::vga_hw::save(vga);
-        }
         display
     }
 }
@@ -75,15 +77,9 @@ pub fn save_console_vga() -> crate::kernel::platform::Display {
 /// activation (no snapshot yet) we clear the screen rather than inherit
 /// the previous personality's framebuffer — keeps F11 into Linux
 /// deterministic regardless of what was last drawn.
-pub fn restore_console_vga(display: crate::kernel::platform::Display) {
+pub fn restore_console_vga(mut display: crate::kernel::platform::Display) {
     unsafe {
-        if matches!(display, crate::kernel::platform::Display::Adapter(_)) {
-            if let Some(vga) = (&raw mut LINUX_CONSOLE_VGA).as_mut().unwrap().take() {
-                crate::kernel::drivers::vga_hw::restore(&vga);
-            } else {
-                lib::term::term().clear();
-            }
-        }
+        crate::kernel::term::present(&mut display);
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
     }
@@ -939,6 +935,7 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             for &b in &tmp {
                 term::putchar(b);
             }
+            present_console();
             SyscallResult::val(len as i32)
         }
         thread::FdKind::PipeWrite(idx) => {
@@ -1625,6 +1622,7 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
                 for &b in &iov {
                     term::putchar(b);
                 }
+                present_console();
                 total += iov_len as i32;
             }
             thread::FdKind::PipeWrite(idx) => {

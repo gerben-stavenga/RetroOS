@@ -259,13 +259,21 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     let c0 = lapic_read(LAPIC_CUR_COUNT);
     while hpet_read(0xF0).wrapping_sub(t0) < window {}
     let c1 = lapic_read(LAPIC_CUR_COUNT);
+    let t1 = hpet_read(0xF0);
     lapic_write(LAPIC_INIT_COUNT, 0); // stop
 
     let elapsed = c0.wrapping_sub(c1); // counts down
-    if elapsed == 0 {
+    let hpet_elapsed = t1.wrapping_sub(t0);
+    if elapsed == 0 || hpet_elapsed == 0 {
         return None;
     }
-    let lapic_hz = elapsed as u64 * 100;
+    // Use the interval we actually observed. The vCPU can be preempted by the
+    // host after the 10 ms deadline but before it samples the counters again;
+    // treating such an overshot window as exactly 10 ms overestimates the
+    // LAPIC frequency and makes the programmed system tick proportionally
+    // slow. This was visible as a 44.1 kHz sink requiring a ~56 kHz numerical
+    // mix rate to stay full on intermittent KVM boots.
+    let lapic_hz = (elapsed as u128 * hpet_hz as u128 / hpet_elapsed as u128) as u64;
     Some(((lapic_hz / 1000).max(1)) as u32)
 }
 

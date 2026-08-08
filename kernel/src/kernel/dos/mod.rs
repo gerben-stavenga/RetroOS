@@ -9,7 +9,7 @@
 //! `machine.rs`, and XMS/EMS/UMA in their own files.
 //!
 //! DOS always boots from a COW template containing the Rust substitute BIOS.
-//! Native video firmware is not part of a DOS address space; `VgaAdapter::Passthrough`
+//! Native video firmware is not part of a DOS address space; `DosVga::Native`
 //! delegates only physical display operations to the kernel-owned
 //! `BiosDisplayWorkspace`.
 
@@ -57,7 +57,7 @@ use self::dosabi as dos;
 mod mode_transitions;
 
 pub use machine::vsb::SbDevice;
-pub use machine::vga::{VgaAdapter, physical_vga_present, release_bios_sink, sink_from_display};
+pub use machine::vga::{DosVga, physical_vga_present};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
@@ -311,7 +311,7 @@ impl<A: crate::Arch> DosState<A> {
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
     pub(super) fn suspend(&mut self, machine: &mut A) -> crate::kernel::platform::Display {
         let vga = core::mem::take(&mut self.pc.vga);
-        let (vga, display) = vga.drop_to_facade(machine);
+        let (vga, display) = vga.into_emulated(machine);
         self.pc.vga = vga;
         display
     }
@@ -322,10 +322,10 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::platform::Display {
         let vga = core::mem::take(&mut self.pc.vga);
-        let (vga, display) = vga.drop_to_facade_for_osd(machine, bios_workspace);
+        let (vga, display) = vga.into_emulated_for_osd(machine, bios_workspace);
         self.pc.vga = vga;
-        if let machine::vga::VgaAdapter::Facade(dev) = &self.pc.vga
-            && let Some(detached) = dev.model.detached_vbe
+        if let machine::vga::DosVga::Emulated(dev) = &self.pc.vga
+            && let Some(detached) = dev.detached_vbe
             && detached.bank.is_none()
             && let Some(dpmi) = self.dpmi.as_ref()
         {
@@ -359,8 +359,8 @@ impl<A: crate::Arch> DosState<A> {
         display: crate::kernel::platform::Display,
     ) {
         let detached_vbe = match &self.pc.vga {
-            machine::vga::VgaAdapter::Facade(dev) => dev.model.detached_vbe,
-            machine::vga::VgaAdapter::Passthrough(_) => None,
+            machine::vga::DosVga::Emulated(dev) => dev.detached_vbe,
+            machine::vga::DosVga::Native(_) => None,
         };
         let vga = core::mem::take(&mut self.pc.vga);
         self.pc.vga = vga.raise_from_osd(machine, bios_workspace, display);
@@ -579,7 +579,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-    let machine::vga::VgaAdapter::Facade(dev) = &mut dos.pc.vga else { return false };
+    let machine::vga::DosVga::Emulated(dev) = &mut dos.pc.vga else { return false };
     if dev.model.seq[4] & 0x08 != 0 {
         machine.map_fresh_range((addr as usize) >> 12, 1);
         return true;
@@ -1040,7 +1040,7 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
         }
         Op::VgaPeekMode => {
             let rv = thread::with_target_dos(threads, pid, |target| {
-                let machine::vga::VgaAdapter::Facade(dev) = &target.pc.vga else { return -61 };
+                let machine::vga::DosVga::Emulated(dev) = &target.pc.vga else { return -61 };
                 let state = &dev.model;
                 if state.planes.is_empty() { return -61; }
                 (state.gc[6] & 1) as i32

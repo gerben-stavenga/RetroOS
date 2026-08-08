@@ -1,23 +1,163 @@
 //! Where pixels go, and how a frame gets there.
 //!
-//! The backend supplies a [`Sink`] — a format, framebuffer storage and optional
-//! physical-VGA ownership — and the kernel writes into it. `present` vertically
+//! A [`Display`] owns one output backend. Callers only know the packed shadow
+//! width and pixel encoding and hand completed shadows to [`Display::present`].
+//! `present` vertically
 //! expands a completed packed metal shadow and
-//! drains WC stores; [`present_host`] transfers a native frame to a window.
+//! drains WC stores; the host backend transfers a native frame to a window.
 //!
 //! Pixels may occupy 2, 3, or 4 bytes. Channel layout and width are consumed
 //! when the 256-entry palette is built, not in the per-pixel VGA decoder.
 
 pub use vga::PixelFormat;
 
-pub use vga::FormatSpec;
+/// Encoding of a kernel display surface.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FormatSpec {
+    Packed(PixelFormat),
+    /// A paletted VBE surface whose palette belongs to the guest.
+    Indexed8,
+}
 
+/// Kernel mapping of physical framebuffer storage. The VGA library never sees
+/// this address or the mapping/publication policy attached to it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Framebuffer {
+    /// Kernel-virtual address of pixel (0,0).
+    pub va: usize,
+    /// Bytes per device row (the pitch, which may exceed width × pixel size).
+    pub pitch: usize,
+    pub width: usize,
+    pub height: usize,
+    /// Full-frame writes are unusually expensive (QEMU-TCG's strong-UC GOP
+    /// mapping), so emulated VGA should use a conservative refresh cadence.
+    pub slow: bool,
+    /// Select the measured wide-store path for real WC apertures.
+    pub wide: bool,
+}
 
+/// The only display interface visible to renderers. Physical geometry, pitch,
+/// mappings, publication policy and VGA ownership stay in the backend.
+pub struct Display {
+    pub shadow_width: usize,
+    pub rgb: PixelFormat,
+    backend: Backend,
+}
 
-pub use vga::Framebuffer;
+enum Backend {
+    Linear(Framebuffer),
+    Vga {
+        framebuffer: Framebuffer,
+        native: crate::kernel::platform::NativeVga,
+        saved: alloc::boxed::Box<vga::VgaState>,
+    },
+    Host,
+    Headless,
+}
 
+impl core::fmt::Debug for Display {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.debug_struct("Display")
+            .field("shadow_width", &self.shadow_width)
+            .field("rgb", &self.rgb)
+            .field("backend", &match self.backend {
+                Backend::Linear(_) => "linear",
+                Backend::Vga { .. } => "vga",
+                Backend::Host => "host",
+                Backend::Headless => "headless",
+            })
+            .finish()
+    }
+}
 
-pub use vga::Sink;
+impl Display {
+    pub fn from_framebuffer(
+        framebuffer: Framebuffer,
+        format: FormatSpec,
+    ) -> Self {
+        let FormatSpec::Packed(rgb) = format else {
+            panic!("indexed framebuffer cannot be a kernel display")
+        };
+        let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
+        Self { shadow_width, rgb, backend: Backend::Linear(framebuffer) }
+    }
+
+    /// Establish the VGA adapter as a known packed linear Mode 13h display.
+    pub fn new_vga(native: crate::kernel::platform::NativeVga) -> Self {
+        let mut saved = vga::VgaState::new_boxed();
+        crate::kernel::drivers::vga_hw::save(&mut saved);
+        let mut state = vga::VgaState::new();
+        let regs = vga::bios_mode_regs(0x13).expect("mode 13h register table");
+        state.misc_output = regs.misc;
+        state.seq = regs.seq;
+        state.gc = regs.gc;
+        state.crtc = regs.crtc;
+        for i in 0..16 { state.ac[i] = i as u8; }
+        state.ac[0x10] = 0x41;
+        state.ac[0x12] = 0x0f;
+        state.dac = vga::palette_rgb332();
+        state.planes.resize(4 * 0x10000, 0);
+        crate::kernel::drivers::vga_hw::restore(&state);
+        Self {
+            shadow_width: 320,
+            rgb: PixelFormat::RGB332,
+            backend: Backend::Vga {
+                framebuffer: Framebuffer {
+                    va: crate::LOW_MEM_BASE + 0xA0000,
+                    pitch: 320,
+                    width: 320,
+                    height: 200,
+                    slow: false,
+                    wide: false,
+                },
+                native,
+                saved,
+            },
+        }
+    }
+
+    pub fn host() -> Self {
+        Self { shadow_width: 720, rgb: PixelFormat::NATIVE, backend: Backend::Host }
+    }
+
+    pub fn headless() -> Self {
+        Self { shadow_width: 0, rgb: PixelFormat::NATIVE, backend: Backend::Headless }
+    }
+
+    pub fn is_headless(&self) -> bool { matches!(self.backend, Backend::Headless) }
+    pub fn is_host(&self) -> bool { matches!(self.backend, Backend::Host) }
+    pub fn is_vga(&self) -> bool { matches!(self.backend, Backend::Vga { .. }) }
+    pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
+        match &self.backend { Backend::Vga { native, .. } => Some(native), _ => None }
+    }
+    pub fn into_native_vga(self) -> Result<crate::kernel::platform::NativeVga, Self> {
+        match self.backend {
+            Backend::Vga { native, saved, .. } => {
+                crate::kernel::drivers::vga_hw::restore(&saved);
+                Ok(native)
+            }
+            _ => Err(self),
+        }
+    }
+    fn framebuffer(&self) -> Option<&Framebuffer> {
+        match &self.backend {
+            Backend::Linear(fb) | Backend::Vga { framebuffer: fb, .. } => Some(fb),
+            _ => None,
+        }
+    }
+    fn fit(&self) -> (usize, usize) {
+        let Some(fb) = self.framebuffer() else { return (self.shadow_width, 0) };
+        if self.is_vga() { (fb.width, fb.height) } else { fit_vga(fb.width, fb.height) }
+    }
+    pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
+    pub fn present(&mut self, height: usize, shadow: &[u8]) -> usize {
+        match self.backend {
+            Backend::Linear(_) | Backend::Vga { .. } => blit(self, height, shadow),
+            Backend::Host => present_host_shadow(self.shadow_width, height, self.rgb, shadow),
+            Backend::Headless => 0,
+        }
+    }
+}
 
 
 /// Backend hook: the frame is finished, show it. Installed by the entry crate
@@ -93,29 +233,17 @@ unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
 }
 
 
-/// Tell the backend a frame is complete on `sink`.
+/// Tell the backend a frame is complete.
 ///
 /// Loader-provided LFBs use the platform publication hook (an SFENCE on
 /// metal). A sink the VGA adapter owns is scanned continuously by that
 /// adapter and may run on a pre-SSE CPU, so it deliberately gets no fence.
 ///
-/// A free function rather than a method: `Sink` is library data now, and this
-/// is the one place the rule is written down.
-fn publish(sink: &Sink) {
-    if sink.native.is_none() {
+/// This is the one place the framebuffer publication rule is written down.
+fn publish(display: &Display) {
+    if !display.is_vga() {
         finish_present();
     }
-}
-
-/// Present a finished shadow on `sink`: blit it, then tell the backend the
-/// frame is done.
-///
-/// Not a method on [`Sink`]: the sink is library data describing where pixels
-/// go, while getting them there uses hand-written non-temporal stores and a
-/// platform publication hook, both of which are this layer's business.
-/// `blit` publishes on the way out — see [`publish`].
-pub fn present_shadow(sink: &Sink, source_height: usize, shadow: &[u8]) -> usize {
-    blit(sink, source_height, shadow)
 }
 
 /// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
@@ -124,11 +252,11 @@ pub fn present_shadow(sink: &Sink, source_height: usize, shadow: &[u8]) -> usize
 /// picture origin. Format conversion already happened in the raster pass, and
 /// the pillarbox/letterbox bars were painted once at the mode switch, so
 /// nothing here touches a pixel outside the picture.
-fn blit(sink: &Sink, vga_height: usize, shadow: &[u8]) -> usize {
-    let fb = &sink.framebuffer;
-    let format = sink.packed_format().expect("packed present on indexed sink");
+fn blit(display: &Display, vga_height: usize, shadow: &[u8]) -> usize {
+    let fb = display.framebuffer().expect("linear display lost framebuffer");
+    let format = display.rgb;
     let step = format.bytes_per_pixel as usize;
-    let (out_w, out_h) = sink.fit();
+    let (out_w, out_h) = display.fit();
     let row_bytes = out_w * step;
     if vga_height == 0 || shadow.len() < row_bytes * vga_height {
         return 0;
@@ -153,11 +281,18 @@ fn blit(sink: &Sink, vga_height: usize, shadow: &[u8]) -> usize {
             oy += 1;
         }
     }
-    publish(sink);
+    publish(display);
     out_w * out_h
 }
 
-pub use vga::fit_vga;
+/// Largest centered 4:3 VGA picture that fits a physical framebuffer.
+pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
+    if width * 3 >= height * 4 {
+        ((height * 4 / 3).min(width), height)
+    } else {
+        (width, (width * 3 / 4).min(height))
+    }
+}
 
 
 /// Hosted completed-frame sink. This lives in the allocating kernel rather
@@ -180,6 +315,32 @@ pub fn present_host(w: usize, h: usize, pixels: &mut alloc::vec::Vec<u32>) {
             unsafe { core::mem::transmute(p) };
         f(w, h, pixels);
     }
+}
+
+fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> usize {
+    let step = rgb.bytes_per_pixel as usize;
+    let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(step)) else { return 0 };
+    if shadow.len() < bytes { return 0; }
+    let mut pixels = alloc::vec::Vec::with_capacity(w * h);
+    for p in shadow[..bytes].chunks_exact(step) {
+        let raw = match step {
+            1 => u32::from(p[0]),
+            2 => u32::from(u16::from_le_bytes([p[0], p[1]])),
+            3 => u32::from(p[0]) | u32::from(p[1]) << 8 | u32::from(p[2]) << 16,
+            4 => u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+            _ => return 0,
+        };
+        let channel = |shift: u8, width: u8| -> u32 {
+            if width == 0 { return 0; }
+            let value = raw >> shift & ((1u32 << width) - 1);
+            value * 255 / ((1u32 << width) - 1)
+        };
+        pixels.push(channel(rgb.red_pos, rgb.red_size) << 16
+            | channel(rgb.green_pos, rgb.green_size) << 8
+            | channel(rgb.blue_pos, rgb.blue_size));
+    }
+    present_host(w, h, &mut pixels);
+    w * h
 }
 
 /// Direct-framebuffer scanout state: a palette in framebuffer format, one
@@ -355,17 +516,17 @@ pub enum ScanoutAction {
 /// display performs another one.
 pub fn scanout_action(
     s: &mut Scratch,
-    sink: &Sink,
+    display: &Display,
     mode: vga::VgaMode,
     now_tick: u64,
     period_ticks: usize,
 ) -> ScanoutAction {
-    let fb = &sink.framebuffer;
+    let fb = match display.framebuffer() { Some(fb) => fb, None => return ScanoutAction::None };
     let (w, h) = vga::dimensions(mode);
     if w == 0 || h == 0 || period_ticks < 3 {
         return ScanoutAction::None;
     }
-    let (out_w, out_h) = sink.fit();
+    let (out_w, out_h) = display.fit();
     // A sink SMALLER than the guest image is legal: the Bresenham walk in
     // `StretchRow` shrinks as readily as it stretches, and `present` drops
     // source rows the same way. Refusing it here is what made the 320x200
@@ -376,7 +537,7 @@ pub fn scanout_action(
         return ScanoutAction::None;
     }
 
-    let format = sink.packed_format().expect("packed scanout on indexed sink");
+    let format = display.rgb;
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
     // The stretch writes one 4-byte store per output pixel, up to N per source
@@ -425,12 +586,12 @@ pub fn scanout_action(
 /// from different DAC generations.
 pub fn render_shadow(
     s: &mut Scratch,
-    sink: &Sink,
+    display: &Display,
     frame: &vga::Frame,
 ) -> bool {
-    let format = sink.packed_format().expect("packed render on indexed sink");
+    let format = display.rgb;
     let (w, h) = vga::dimensions(frame.mode);
-    let (out_w, _) = sink.fit();
+    let (out_w, _) = display.fit();
     let step = format.bytes_per_pixel as usize;
     let row_bytes = out_w * step;
     if s.mode != Some(frame.mode)
@@ -500,9 +661,9 @@ impl NativeScanout {
     /// Arm for one frame of `w × h` on `fb`. False when the frame cannot be
     /// shown — too big for the panel, which is reported once rather than
     /// leaving a silently dead screen.
-    pub fn arm(&mut self, sink: &Sink, w: usize, h: usize) -> bool {
-        let fb = &sink.framebuffer;
-        let format = sink.packed_format().expect("card scanout on indexed sink");
+    pub fn arm(&mut self, display: &Display, w: usize, h: usize) -> bool {
+        let Some(fb) = display.framebuffer() else { return false };
+        let format = display.rgb;
         let geo = (w, h, fb.width, fb.height);
         if w == 0 || h == 0 || w > fb.width || h > fb.height {
             if self.geo != geo {
@@ -537,9 +698,9 @@ impl NativeScanout {
     }
 
     /// Copy the armed frame to the panel, centered. One linear copy per row.
-    pub fn publish(&self, sink: &Sink) {
-        let fb = &sink.framebuffer;
-        let format = sink.packed_format().expect("card publish on indexed sink");
+    pub fn publish(&self, display: &Display) {
+        let Some(fb) = display.framebuffer() else { return };
+        let format = display.rgb;
         let (w, h) = (self.geo.0, self.geo.1);
         let step = format.bytes_per_pixel as usize;
         if h == 0 || self.surface.len() < self.pitch * h {
@@ -557,7 +718,7 @@ impl NativeScanout {
                 );
             }
         }
-        publish(sink);
+        publish(display);
     }
 }
 

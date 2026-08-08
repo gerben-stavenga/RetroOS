@@ -31,7 +31,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
     match personality {
         Personality::Dos(_) => {
             if matches!(personality, Personality::Dos(dos)
-                if matches!(dos.pc.vga, crate::kernel::dos::VgaAdapter::Passthrough(_)))
+                if matches!(dos.pc.vga, crate::kernel::dos::DosVga::Native(_)))
             {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
@@ -91,13 +91,13 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
 }
 
 /// Execution policy for a kernel-owned video-BIOS excursion. Possession of
-/// `VgaAdapterMode` is the capability. The hot VGA register window goes direct;
+/// `NativeVga` is the capability. The hot VGA register window goes direct;
 /// less common ROM accesses (including PCI config space) trap and are forwarded
 /// synchronously by `BiosDisplayWorkspace`. The ordinary guest-entry boundary rebuilds
 /// the next thread's narrower bitmap afterward.
 pub(crate) fn apply_bios_display<A: crate::Arch>(
     machine: &mut A,
-    _bios_display: &vga::VgaAdapterMode,
+    _bios_display: &crate::kernel::platform::NativeVga,
 ) {
     machine.reset_io_bitmap();
     machine.allow_io_ports(0x3C0, 0x20);

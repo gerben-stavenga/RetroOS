@@ -251,6 +251,43 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    /// Keep the display with its focused personality while the OSD overlays
+    /// that personality's ordinary output. The OSD owns no display token.
+    pub fn hold_display_for_osd(
+        &mut self,
+        display: crate::kernel::platform::Display,
+    ) {
+        match self {
+            Self::Dos(dos) => {
+                let crate::kernel::dos::DosVga::Emulated(vga) = &mut dos.pc.vga else {
+                    panic!("native DOS VGA was not suspended for OSD")
+                };
+                assert!(vga.display.replace(display).is_none(), "DOS VGA already has a display");
+            }
+            Self::Linux(_) => crate::kernel::linux::restore_console_vga(display),
+        }
+    }
+
+    /// Temporarily move the focused personality's display through the close
+    /// transition. It is immediately materialized back into the same owner.
+    pub fn take_display_for_osd(&mut self) -> crate::kernel::platform::Display {
+        match self {
+            Self::Dos(dos) => {
+                let crate::kernel::dos::DosVga::Emulated(vga) = &mut dos.pc.vga else {
+                    panic!("OSD close found native DOS VGA")
+                };
+                vga.display.take().expect("OSD-visible DOS VGA lost its display")
+            }
+            Self::Linux(_) => crate::kernel::linux::save_console_vga(),
+        }
+    }
+
+    pub fn repaint_osd(&mut self) {
+        if matches!(self, Self::Linux(_)) {
+            crate::kernel::linux::repaint_console();
+        }
+    }
+
     /// In-focus hook: repaint the suspended screen state to hardware.
     /// Visual rematerialization only — CPU-binding side effects (LDT, TLS,
     /// deferred wait_status writeout) live in `on_resume` and run

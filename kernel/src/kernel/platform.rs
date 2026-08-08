@@ -9,9 +9,30 @@
 //! private `static` verdict. Adding an enum variant breaks every policy
 //! site at compile time — deliberately.
 
-/// The VBE mode/bank descriptions a firmware probe fills in. Plain data
-/// about pixels, so they live with the card state in `//lib:vga`.
-pub use vga::{VbeBank, VbeMode, VgaAdapterMode};
+/// A mode advertised by the machine's physical video BIOS. Its physical base,
+/// bank window and firmware mode number are kernel platform facts, not state
+/// of the VGA emulator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeMode {
+    pub number: u16,
+    pub physical_base: u32,
+    pub width: u16,
+    pub height: u16,
+    pub pitch: u16,
+    pub bits_per_pixel: u8,
+    pub format: crate::kernel::display::FormatSpec,
+    pub window_segment: u16,
+    pub window_granularity_kb: u16,
+    pub window_size_kb: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeBank {
+    pub current: u16,
+    pub window_segment: u16,
+    pub granularity_kb: u16,
+    pub window_size_kb: u16,
+}
 
 use crate::println;
 
@@ -33,7 +54,7 @@ pub struct Platform {
     pub firmware: Firmware,
     /// Preferred packed linear mode advertised by the native video BIOS.
     /// Discovered once at boot; selecting/mapping it still requires ownership
-    /// of the `VgaAdapterMode` capability.
+    /// of the `NativeVga` capability.
     pub vbe_mode: Option<VbeMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
@@ -66,17 +87,52 @@ pub enum Host {
     Interp,
 }
 
-/// The machine's display, moved. Holding one is the authority to put pixels
-/// on the panel; there is no other way to reach it, and there is exactly one.
-///
-/// Not a "token" in its name: once nothing else can reach the display, holding
-/// the value IS the ownership and the suffix says nothing extra.
-///
-/// This is the *transferable* form. A DOS thread turns it into a
-/// [`VgaAdapter`](crate::kernel::dos::VgaAdapter), which is this plus the
-/// `VgaState` it models a VGA with; the kernel console holds one of these
-/// directly, having no VGA to model — it renders a text grid.
-pub use vga::Display;
+/// Kernel record of the mode established on the physical VGA adapter. This is
+/// deliberately outside `//lib:vga`: the library models a VGA and has no
+/// knowledge of hardware ownership or firmware-controlled devices.
+#[derive(Debug)]
+pub enum NativeVga {
+    Legacy,
+    Vbe {
+        mode: VbeMode,
+        bank: Option<VbeBank>,
+    },
+}
+
+impl NativeVga {
+    pub fn new() -> Self { Self::Legacy }
+
+    pub fn vbe_mode(&self) -> Option<VbeMode> {
+        match self {
+            Self::Legacy => None,
+            Self::Vbe { mode, .. } => Some(*mode),
+        }
+    }
+
+    pub fn set_legacy(&mut self) { *self = Self::Legacy; }
+
+    pub fn set_vesa(&mut self, mode: VbeMode, linear: bool) {
+        let bank = (!linear).then_some(VbeBank {
+            current: 0,
+            window_segment: mode.window_segment,
+            granularity_kb: mode.window_granularity_kb,
+            window_size_kb: mode.window_size_kb,
+        });
+        *self = Self::Vbe { mode, bank };
+    }
+
+    pub fn set_bank(&mut self, current: u16) {
+        if let Self::Vbe { bank: Some(bank), .. } = self {
+            bank.current = current;
+        }
+    }
+}
+
+/// The machine's transferable display authority. A DOS thread folds this into
+/// its `DosVga`; the kernel console holds it directly while rendering its
+/// text grid. It is kept out of the frozen [`Platform`] facts because it has
+/// exactly one runtime owner.
+pub use crate::kernel::display::Display;
 
 
 
@@ -224,7 +280,7 @@ pub struct HostEnv {
     /// The framebuffer this backend presents into, if any: a GOP framebuffer
     /// on metal, a window-sized buffer on hosted. Probed once — the kernel
     /// writes into it directly rather than through a present callback.
-    pub framebuffer: fn() -> Option<vga::Sink>,
+    pub framebuffer: fn() -> Option<crate::kernel::display::Display>,
     /// Where boot debug bytes were routed (recorded for policy).
     pub debug: DebugSink,
     /// True on the bare-metal backend (chooses Metal/Qemu vs Interp for host).
@@ -299,13 +355,13 @@ pub fn probe<A: crate::Arch>(
         // confirmed what `is_metal` already implied: the hosted port bus has no
         // VGA device to answer, and a metal machine that boots this way does.
         let (vga_passthrough, display) = if let Some(fb) = (env.framebuffer)() {
-            (false, Display::Sink(fb))
+            (false, fb)
         } else if crate::kernel::display::host_present_sink_installed() {
-            (false, Display::HostWindow)
+            (false, Display::host())
         } else if env.is_metal {
-            (true, Display::Adapter(VgaAdapterMode::new()))
+            (true, Display::new_vga(NativeVga::new()))
         } else {
-            (false, Display::None)
+            (false, Display::headless())
         };
 
         // Who owns the IVT follows from WHO DRIVES THE DISPLAY — not from a

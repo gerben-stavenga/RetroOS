@@ -217,7 +217,7 @@ pub struct PcMachine {
     pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
-    pub vga: vga::VgaAdapter,
+    pub vga: vga::DosVga,
     /// The 3dfx Voodoo board. Present in every machine but inert until a
     /// guest finds it over PCI and maps its aperture.
     pub voodoo: vvoodoo::VVoodoo,
@@ -462,7 +462,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
             core::ptr::addr_of_mut!((*p).skip_irq).write(false);
             core::ptr::addr_of_mut!((*p).e0_pending).write(false);
-            core::ptr::addr_of_mut!((*p).vga).write(vga::VgaAdapter::new());
+            core::ptr::addr_of_mut!((*p).vga).write(vga::DosVga::new());
             core::ptr::addr_of_mut!((*p).voodoo).write(vvoodoo::VVoodoo::new());
             core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
@@ -539,7 +539,7 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            if let vga::VgaAdapter::Facade(dev) = &mut pc.vga {
+            if let vga::DosVga::Emulated(dev) = &mut pc.vga {
                 dev.model.ac_state.pending_data = false;
                 return input_status1(machine, &pc.present_scratch2);
             }
@@ -550,8 +550,8 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
             match &mut pc.vga {
-                vga::VgaAdapter::Facade(dev) => dev.model.port_read(port),
-                vga::VgaAdapter::Passthrough(_) => machine.inb(port),
+                vga::DosVga::Emulated(dev) => dev.model.port_read(port),
+                vga::DosVga::Native(_) => machine.inb(port),
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
@@ -650,7 +650,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
-            if let vga::VgaAdapter::Facade(dev) = &mut pc.vga {
+            if let vga::DosVga::Emulated(dev) = &mut pc.vga {
                 dev.model.port_write(port, val);
                 return;
             }
@@ -660,7 +660,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
-            let vga::VgaAdapter::Facade(dev) = &mut pc.vga else {
+            let vga::DosVga::Emulated(dev) = &mut pc.vga else {
                 machine.outb(port, val);
                 return;
             };

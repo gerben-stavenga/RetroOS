@@ -14,7 +14,7 @@
 use crate::Regs;
 use core::sync::atomic::Ordering;
 
-use super::machine::{PcMachine, vga::{VgaAdapter, SVGA_LFB_BASE}};
+use super::machine::{PcMachine, vga::{DosVga, SVGA_LFB_BASE}};
 use ::vga::VgaState;
 
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
@@ -180,36 +180,25 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
     // nothing to emulate that with, so the frame is dropped. No token at all
     // means this thread does not own the console: a Glide program in the
     // background still swaps, it just is not seen.
-    match pc.vga.display() {
-        Some(crate::kernel::platform::Display::Sink(fb)) => {
-            if fb.packed_format().is_none() {
-                return true;
-            }
-            if pc.voodoo_scanout.arm(fb, w, h) {
+    let display = match &mut pc.vga {
+        DosVga::Emulated(dev) => dev.display.as_mut(),
+        DosVga::Native(_) => None,
+    };
+    if let Some(display) = display {
+        if display.is_host() {
+            display.shadow_width = w;
+            let need = w * h;
+            pc.present_fb.resize(need, 0);
+            pc.present_fb.truncate(need);
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(pc.present_fb.as_mut_ptr() as *mut u8, need * 4)
+            };
+            pc.voodoo.scanout(bytes, w * 4, &voodoo::Dac::native());
+            display.present(h, bytes);
+        } else if pc.voodoo_scanout.arm(display, w, h) {
                 let (out, pitch, dac) = pc.voodoo_scanout.target();
                 pc.voodoo.scanout(out, pitch, dac);
-                pc.voodoo_scanout.publish(fb);
-            }
-        }
-        Some(_) => {}
-        None => {
-            if crate::kernel::display::host_present_sink_installed() {
-                let need = w * h;
-                if pc.present_fb.len() < need {
-                    pc.present_fb.resize(need, 0);
-                }
-                pc.present_fb.truncate(need);
-                // The window sink takes `0x00RRGGBB` frames; that is just this
-                // buffer's bytes with the identity encoding.
-                let bytes = unsafe {
-                    core::slice::from_raw_parts_mut(
-                        pc.present_fb.as_mut_ptr() as *mut u8,
-                        need * 4,
-                    )
-                };
-                pc.voodoo.scanout(bytes, w * 4, &voodoo::Dac::native());
-                crate::kernel::display::present_host(w, h, &mut pc.present_fb);
-            }
+                pc.voodoo_scanout.publish(display);
         }
     }
     true
@@ -225,39 +214,21 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
-    let VgaAdapter::Facade(dev) = &mut pc.vga else { return };
+    let DosVga::Emulated(dev) = &mut pc.vga else { return };
     let vga = &mut dev.model;
-    // Hidden devices have no sink of their own; while the monitor holds the
-    // card, its sink is where this thread's preview goes.
-    let display = match &dev.display {
-        Some(display) => display,
-        None => {
-            let Some(display) = crate::kernel::osd::display() else { return };
-            display
-        }
-    };
-    // Where the frame goes: a sink we blit into, a window, or nowhere. A card
-    // scanning out its own VRAM needs no software present at all. (This used
-    // to test only the sink; when fbcon stopped registering one, every metal
-    // frame silently returned here.)
-    let (direct, host_window) = match display {
-        crate::kernel::platform::Display::Sink(sink) => (Some(sink), false),
-        crate::kernel::platform::Display::HostWindow => (None, true),
-        crate::kernel::platform::Display::Adapter(_)
-        | crate::kernel::platform::Display::None => return,
-    };
+    let Some(display) = &mut dev.display else { return };
+    if display.is_headless() { return; }
     let prof = crate::kernel::startup::profile_enabled();
-    if let Some(sink) = direct {
-        let fb = &sink.framebuffer;
+    if !display.is_host() {
         // Direct framebuffer: phase zero is guest-visible retrace. Its
         // trailing edge renders one complete immutable shadow; the following
         // tick publishes that shadow to GOP. Rendering and device traffic get
         // separate budgets, and the physical scanout is the only visible
         // top-to-bottom sweep.
-        let period_ticks: usize = if fb.slow { 50 } else { 14 };
+        let period_ticks: usize = if display.slow() { 50 } else { 14 };
         let Some(mode) = vga.current_mode() else { return };
         match crate::kernel::display::scanout_action(
-            &mut pc.present_scratch2, sink, mode, now_ticks, period_ticks,
+            &mut pc.present_scratch2, display, mode, now_ticks, period_ticks,
         ) {
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
@@ -272,7 +243,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 };
                 let p1 = if prof { machine.rdtsc() } else { 0 };
                 let rendered = crate::kernel::display::render_shadow(
-                    &mut pc.present_scratch2, sink, &frame,
+                    &mut pc.present_scratch2, display, &frame,
                 );
                 if prof {
                     let p2 = machine.rdtsc();
@@ -292,7 +263,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                         .expect("ready VGA shadow is missing");
                 if crate::kernel::osd::is_open() {
                     let vga_w = ::vga::dimensions(mode).0;
-                    let format = sink.packed_format().expect("indexed sink reached packed OSD");
+                    let format = display.rgb;
                     crate::kernel::osd::paint(
                         shadow,
                         out_w * format.bytes_per_pixel as usize,
@@ -303,7 +274,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     );
                 }
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                let copied = crate::kernel::display::present_shadow(&sink, vga_h, shadow);
+                let copied = display.present(vga_h, shadow);
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {
@@ -320,7 +291,7 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         return;
     }
     // Window sink (hosted): still takes a whole rendered frame per period.
-    if !host_window || !frame_due(now_ticks, 70) {
+    if !frame_due(now_ticks, 70) {
         return;
     }
     crate::kernel::startup::bill_present();
@@ -347,7 +318,11 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
     let p2 = if prof { machine.rdtsc() } else { 0 };
     pc.present_fb.truncate(need);
-    crate::kernel::display::present_host(w, h, &mut pc.present_fb);
+    display.shadow_width = w;
+    let bytes = unsafe {
+        core::slice::from_raw_parts(pc.present_fb.as_ptr() as *const u8, need * 4)
+    };
+    display.present(h, bytes);
     if prof {
         let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(
@@ -355,4 +330,3 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             p3.wrapping_sub(p2), need);
     }
 }
-
