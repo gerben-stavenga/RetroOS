@@ -633,21 +633,23 @@ fn isr_handler_ring3(regs: &mut Regs) {
     let int_num = regs.int_num;
     let legacy_mode = is_vm86(regs) || (regs.frame.cs & 4) != 0;
     let kevent: KE = match int_num {
-        // #DB: a virtual-IF single-step. One instruction retired under TF —
-        // either a learning step or a tagged POPF/IRET that just loaded TF.
-        // Reflect it to `dpmi::vif` (the policy lives in dos). For anything but
-        // a PM client (no virtual IF there), defensively clear TF and resume —
-        // nothing in the kernel arms it, but a stale bit would loop.
+        // #DB has two owners. PM clients use TF for virtual-IF learning, while
+        // VM86 programs may deliberately single-step through a hooked INT 1
+        // vector (ST3's packer does this). Preserve the latter as a guest CPU
+        // exception so DOS can reflect it through the real-mode IVT.
         1 => {
             let dr6 = unsafe { x86::read_dr6() };
             if debug_watch_trap(regs, dr6, false) {
                 return;
             }
-            if regs.mode() != UserMode::Mode32 {
-                regs.clear_flag32(1 << 8); // clear TF
-                return;
+            match regs.mode() {
+                UserMode::VM86 => KE::Exception(1),
+                UserMode::Mode32 => KE::VifStep,
+                _ => {
+                    regs.clear_flag32(1 << 8); // stale internal TF
+                    return;
+                }
             }
-            KE::VifStep
         }
         13 => {
             // VME raises #GP with VIF=1 && VIP=1 to ask the host to inject the

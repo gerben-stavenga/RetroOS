@@ -355,7 +355,8 @@ fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: 
     match state.classify_mode() {
         Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
             write_live_planes(machine, &state.planes);
-            machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+            let (base, len) = planar_window(state.gc[6]);
+            machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
             state.a0000_trapped = true;
         }
         Some(VgaMode::Mode13h) => {
@@ -434,6 +435,14 @@ fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut
 /// no per-frame copy.
 const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
+pub fn planar_window(gc6: u8) -> (u32, u32) {
+    match (gc6 >> 2) & 3 {
+        0 => (0xA0000, 0x20000),
+        1 => (0xA0000, 0x10000),
+        2 => (0xB0000, 0x08000),
+        _ => (0xB8000, 0x08000),
+    }
+}
 /// Private, per-address-space backing of the emulated card's four VRAM planes.
 /// CPU apertures alias pages from here; this is the one live pixel store.
 pub(crate) const VGA_VRAM_BASE: usize = 0x4100_0000;
@@ -449,7 +458,7 @@ fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
 }
 
 /// React to a Sequencer register write (port 0x3C5) that may change the
-/// chain-4 mode or the plane-select mask. Drives the A0000 paging alias.
+/// chain-4 mode or the plane-select mask. Drives the GC[6]-selected aperture.
 /// `pc.vga` already holds the post-write register values.
 pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _regs: &mut Regs) {
     // A real card does its own plane routing.
@@ -458,16 +467,29 @@ pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _regs: 
     let idx = vga.seq_index & 0x1F;
     match idx {
         4 => {
-            // Memory Mode bit 3 = chain-4. Set ⇒ chained (mode 13h linear);
-            // clear ⇒ unchained (Mode X planes). The chain→unchain hop seeds the
-            // planes from the current chained A0000 image (a 13h frame the game
-            // unchains into Mode X mid-stream); the reverse merges them back.
-            let unchained = vga.seq[4] & 0x08 == 0;
+            // Memory Mode bit 2 disables text odd/even addressing; bit 3
+            // enables chain-4. Only (odd/even disabled, chain-4 disabled) is
+            // the sequential plane aperture that needs the A0000 trap. That
+            // includes Mode X/EGA drawing and temporary text-font access.
+            // Entering from text must undo the B800 odd/even packing; entering
+            // from mode 13h must undo chain-4. They are different layouts.
+            let sequential = vga.seq[4] & 0x0C == 0x04;
             let currently_planar = vga.a0000_trapped;
-            if unchained && !currently_planar {
-                arm_planar(machine, vga, true);
-            } else if !unchained && currently_planar {
-                disarm_planar(machine, vga);
+            if sequential && !currently_planar {
+                let source = if vga.gc[6] & 0x01 == 0 {
+                    PlanarSource::TextOddEven
+                } else if vga.gc[5] & 0x40 != 0 {
+                    PlanarSource::Chain4
+                } else {
+                    PlanarSource::Canonical
+                };
+                arm_planar(machine, vga, source);
+            } else if !sequential && currently_planar {
+                if vga.seq[4] & 0x08 != 0 {
+                    disarm_planar_to_chain4(machine, vga);
+                } else if vga.gc[6] & 0x01 == 0 {
+                    disarm_planar_to_text(machine, vga);
+                }
             }
         }
         2 => {
@@ -482,30 +504,122 @@ pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _regs: 
     }
 }
 
-/// Map A0000 as MMIO (present=0 + trap marker) so every guest store/load into
-/// A0000 faults into `handle_planar_fault` — the only way one CPU store can fan
-/// into 4 planes and honour the latches, write modes, and map mask. The planes
-/// live in the per-address-space page-backed VRAM. `preserve` unmunges an
-/// existing chained layout (the Mode-X chain→unchain hop); otherwise the
-/// canonical planes are cleared for a fresh BIOS mode set.
-fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, preserve: bool) {
-    let mut planes = if preserve { read_live_planes(machine) } else { alloc::vec![0; PLANES_LEN] };
-    if preserve {
-        ::vga::chain4_unmunge(&mut planes);
+/// GC Miscellaneous register (index 6) selects which legacy address window
+/// the VGA decodes. Programs are free to program it before or after switching
+/// the sequencer to sequential-plane access. Keep the MMIO trap on the newly
+/// selected window in either order; leaving it on the old text window loses
+/// plane-2 font writes (Impulse Tracker does this ordering).
+pub fn on_gc_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, old_gc6: u8) {
+    let DosVga::Emulated(dev) = &mut pc.vga else { return };
+    let vga = &mut dev.state;
+    if !vga.a0000_trapped || (old_gc6 & 0x0C) == (vga.gc[6] & 0x0C) {
+        return;
+    }
+
+    let (old_base, old_len) = planar_window(old_gc6);
+    // The old aperture contains no independent bytes while trapped: the
+    // canonical image is in VGA_VRAM_BASE. Restore ordinary guest RAM beneath
+    // it, then place the device trap over the newly selected decode window.
+    machine.map_fresh_range(old_base as usize >> 12, old_len as usize >> 12);
+    let (new_base, new_len) = planar_window(vga.gc[6]);
+    machine.map_phys_range(
+        new_base as usize >> 12,
+        new_len as usize >> 12,
+        0,
+        arch_abi::MAP_MMIO,
+    );
+}
+
+/// Map the GC[6]-selected VGA window as MMIO (present=0 + trap marker) so every
+/// guest access reaches the planar ALU. Graphics normally selects A0000, while
+/// text character-generator access may select B0000 or B8000.
+#[derive(Clone, Copy)]
+enum PlanarSource {
+    Canonical,
+    Chain4,
+    TextOddEven,
+}
+
+fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, source: PlanarSource) {
+    let mut planes = read_live_planes(machine);
+    match source {
+        PlanarSource::Canonical => {}
+        PlanarSource::Chain4 => ::vga::chain4_unmunge(&mut planes),
+        PlanarSource::TextOddEven => ::vga::text_odd_even_unmunge(&mut planes),
     }
     write_live_planes(machine, &planes);
-    machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+    let (base, len) = planar_window(vga.gc[6]);
+    machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
     vga.a0000_trapped = true;
 }
 
 /// Leave planar access for chain-4: munge the one VRAM store and alias its
 /// first 64K as the linear A0000 aperture.
-fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState) {
+fn disarm_planar_to_chain4<A: crate::Arch>(machine: &mut A, vga: &mut VgaState) {
     let mut planes = read_live_planes(machine);
     ::vga::chain4_munge(&mut planes);
     write_live_planes(machine, &planes);
     machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
     vga.a0000_trapped = false;
+}
+
+/// Return from sequential plane/font access to the text odd/even B8000 view.
+fn disarm_planar_to_text<A: crate::Arch>(machine: &mut A, vga: &mut VgaState) {
+    let mut planes = read_live_planes(machine);
+    ::vga::text_odd_even_munge(&mut planes);
+    write_live_planes(machine, &planes);
+    machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
+    vga.a0000_trapped = false;
+}
+
+/// BIOS character-generator services operate on plane 2 regardless of the
+/// CPU-visible text odd/even layout. Normalize the live page-backed image,
+/// update the requested 8-KB map, then restore its current layout.
+pub fn bios_load_font<A: crate::Arch>(
+    machine: &mut A,
+    device: &mut DosVga,
+    map: usize,
+    first: usize,
+    font: &[u8],
+    glyph_h: usize,
+) {
+    let DosVga::Emulated(dev) = device else { return };
+    let vga = &mut dev.state;
+    let mode = vga.classify_mode();
+    let mut planes = read_live_planes(machine);
+    match mode {
+        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut planes),
+        Some(::vga::VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut planes),
+        Some(::vga::VgaMode::Cga4) => ::vga::cga4_unmunge(&mut planes),
+        _ => {}
+    }
+    ::vga::load_font_glyphs(&mut planes, map, first, font, glyph_h);
+    match mode {
+        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_munge(&mut planes),
+        Some(::vga::VgaMode::Mode13h) => ::vga::chain4_munge(&mut planes),
+        Some(::vga::VgaMode::Cga4) => ::vga::cga4_munge(&mut planes),
+        _ => {}
+    }
+    write_live_planes(machine, &planes);
+}
+
+/// Apply the text geometry selected by INT 10h AX=111xh. The 14-line ROM font
+/// selects the VGA's 350-line text timing; 8- and 16-line fonts use 400 lines.
+pub fn bios_set_text_height(device: &mut DosVga, glyph_h: u8) {
+    let DosVga::Emulated(dev) = device else { return };
+    let visible = if glyph_h == 14 { 350u16 } else { 400u16 };
+    let end = visible - 1;
+    dev.state.crtc[9] = (dev.state.crtc[9] & 0xE0) | (glyph_h - 1);
+    dev.state.crtc[0x12] = end as u8;
+    dev.state.crtc[7] = (dev.state.crtc[7] & !0x42)
+        | (((end >> 8) as u8 & 1) << 1)
+        | (((end >> 9) as u8 & 1) << 6);
+}
+
+pub fn bios_set_font_map_select(device: &mut DosVga, select: u8) {
+    if let DosVga::Emulated(dev) = device {
+        dev.state.seq[3] = select;
+    }
 }
 
 // ============================================================================
@@ -867,10 +981,18 @@ pub fn on_set_mode<A: crate::Arch>(
         vga.ac[0x14] = 0x00; // colour select high bits
     }
     if clear { planes.fill(0); }
+    // A VGA BIOS text-mode set reloads the ROM character generator even when
+    // AL bit 7 asks it to preserve display memory. Once scanout uses the real
+    // plane-2 font, omitting this leaves every ordinary BIOS text screen with
+    // an all-zero character map after the plane clear above.
+    if matches!(mode, 0..=3 | 7) {
+        ::vga::load_font_map(&mut planes, 0, &lib::vga_fonts::FONT_8X16, 16);
+    }
     match vga.classify_mode() {
         Some(::vga::VgaMode::Planar16 { .. } | ::vga::VgaMode::ModeX { .. }) => {
             write_live_planes(machine, &planes);
-            machine.map_phys_range(A0000 >> 12, 16, 0, arch_abi::MAP_MMIO);
+            let (base, len) = planar_window(vga.gc[6]);
+            machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
             vga.a0000_trapped = true;
         }
         Some(::vga::VgaMode::Mode13h) => {
@@ -932,38 +1054,42 @@ pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DosVga, addr: us
         return;
     };
     let vga = &mut vga.state;
-    const A0000_END: usize = A0000 + 0x10000;
+    let (window_base, window_len) = planar_window(vga.gc[6]);
+    let window_base = window_base as usize;
+    let window_end = window_base + window_len as usize;
     if vga.a0000_trapped {
-        let bda_mode = machine.read::<u8>(0x449);
-        let planar_mode =
-            matches!(bda_mode, 0x0D..=0x12) || (bda_mode == 0x13 && vga.seq[4] & 0x08 == 0);
-        assert!(planar_mode, "planar aperture active for non-planar VGA state");
+        // The register file, not the BDA mode byte, is the VGA hardware
+        // truth. Tweaked-mode programs (Impulse Tracker among them) unchain
+        // the sequencer directly without updating 40:49. This is the same
+        // chain-4 test that arms the aperture and handles its page faults.
+        assert_eq!(vga.seq[4] & 0x08, 0,
+            "planar aperture active while VGA chain-4 is enabled");
     }
     if src.is_empty()
         || !vga.a0000_trapped
-        || addr >= A0000_END
-        || addr.saturating_add(src.len()) <= A0000
+        || addr >= window_end
+        || addr.saturating_add(src.len()) <= window_base
     {
         machine.copy_to(addr, src);
         return;
     }
 
     let mut pos = 0;
-    if addr < A0000 {
-        let n = (A0000 - addr).min(src.len());
+    if addr < window_base {
+        let n = (window_base - addr).min(src.len());
         machine.copy_to(addr, &src[..n]);
         pos = n;
     }
 
     while pos < src.len() {
         let cur = addr + pos;
-        if cur >= A0000_END {
+        if cur >= window_end {
             machine.copy_to(cur, &src[pos..]);
             break;
         }
-        let n = (A0000_END - cur).min(src.len() - pos);
+        let n = (window_end - cur).min(src.len() - pos);
         for (i, &byte) in src[pos..pos + n].iter().enumerate() {
-            vram_write(machine, vga, (cur + i - A0000) as u32, byte);
+            vram_write(machine, vga, (cur + i - window_base) as u32, byte);
         }
         pos += n;
     }
@@ -999,14 +1125,14 @@ pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) 
 pub fn bios_draw_glyph<A: crate::Arch>(
     machine: &mut A,
     device: &mut DosVga,
-    bda_mode: u8,
+    bios_mode: u8,
     ch: u8,
     col: u32,
     row: u32,
     fg: u8,
 ) -> bool {
     let mode = match device {
-        DosVga::Native(_) => bda_mode,
+        DosVga::Native(_) => bios_mode,
         DosVga::Emulated(dev) => match dev.state.classify_mode() {
             None => return false,
             Some(mode) => match mode {

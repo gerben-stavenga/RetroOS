@@ -269,7 +269,7 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
     len
 }
 
-/// Decode and emulate the faulting A0000 access at offset `off`. `cs_base`/
+/// Decode and emulate a faulting device-window access at offset `off`. `cs_base`/
 /// `def32` (default operand & address size) are resolved by the caller, which
 /// has the LDT. Returns false (→ real SEGV) for an instruction we don't model,
 /// so a gap is loud rather than silent corruption.
@@ -282,8 +282,9 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 /// both need the *same* instruction decoder below — the only difference is
 /// where the bytes land.
 pub enum MmioTarget<'a> {
-    /// The VGA planar aperture at A0000, through the graphics controller.
-    Planar(&'a mut VgaState),
+    /// The VGA planar aperture selected by GC[6], through the graphics
+    /// controller. Text-font access commonly selects B8000 rather than A0000.
+    Planar { vga: &'a mut VgaState, base: u32, len: u32 },
     /// The Voodoo's PCI aperture: registers, LFB and texture download.
     Voodoo(&'a mut super::vvoodoo::VVoodoo),
 }
@@ -292,7 +293,7 @@ impl MmioTarget<'_> {
     #[inline]
     fn write8<A: crate::Arch>(&mut self, machine: &mut A, off: u32, val: u8) {
         match self {
-            Self::Planar(vga) => vga::vram_write(machine, vga, off, val),
+            Self::Planar { vga, .. } => vga::vram_write(machine, vga, off, val),
             Self::Voodoo(vd) => vd.write8(off, val),
         }
     }
@@ -300,7 +301,7 @@ impl MmioTarget<'_> {
     #[inline]
     fn read8<A: crate::Arch>(&mut self, machine: &mut A, off: u32) -> u8 {
         match self {
-            Self::Planar(vga) => vga::vram_read(machine, vga, off),
+            Self::Planar { vga, .. } => vga::vram_read(machine, vga, off),
             Self::Voodoo(vd) => vd.read8(off),
         }
     }
@@ -322,7 +323,8 @@ impl MmioTarget<'_> {
     #[inline]
     fn offset(&self, addr: u32) -> Option<u32> {
         match self {
-            Self::Planar(_) => (0xA0000..0xB0000).contains(&addr).then(|| addr - 0xA0000),
+            Self::Planar { base, len, .. } =>
+                (*base..base.saturating_add(*len)).contains(&addr).then(|| addr - *base),
             Self::Voodoo(vd) => vd.aperture_offset(addr),
         }
     }

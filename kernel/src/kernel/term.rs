@@ -75,6 +75,7 @@ pub fn present(display: &mut Display) {
         palette: unsafe { &*palette_p },
         dac_mask: 0xFF,
         font: &FONT_8X16,
+        font_b: &FONT_8X16,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,

@@ -42,6 +42,7 @@ macro_rules! dos_trace {
 }
 
 mod bios;
+pub(crate) use bios::Bda;
 mod dpmi;
 mod dfs;
 mod machine;
@@ -582,27 +583,28 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
         );
     }
-    if !(0xA0000..0xB0000).contains(&addr) {
-        return false;
-    }
     // Decide planar vs chained from THIS process's Sequencer Memory Mode
-    // (chain-4 bit), never the GLOBAL planar flag: A0000's mapping is
+    // (chain-4 bit), never the GLOBAL planar flag: the VGA window's mapping is
     // per-address-space, so after an exec/process switch a still-trap-marked
     // A0000 in the resumed space met a stale global "not planar" and SEGV'd
     // (Epic Pinball's launcher exec). chain-4 set ⇒ chained linear RAM (a stale
     // marking is just remapped + retried); clear ⇒ unchained Mode X ⇒ decode.
-    // A native owner has no trap marker and no register file: its A0000 is
+    // A native owner has no trap marker and no register file: its aperture is
     // plain card memory, so a fault there is not ours to decode.
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
     let machine::vga::DosVga::Emulated(dev) = &mut dos.pc.vga else { return false };
+    let (base, len) = machine::vga::planar_window(dev.state.gc[6]);
+    if !(base..base + len).contains(&addr) {
+        return false;
+    }
     if dev.state.seq[4] & 0x08 != 0 {
         machine.map_fresh_range((addr as usize) >> 12, 1);
         return true;
     }
-    let off = addr - 0xA0000;
-    let mut target = machine::mmio::MmioTarget::Planar(&mut dev.state);
+    let off = addr - base;
+    let mut target = machine::mmio::MmioTarget::Planar { vga: &mut dev.state, base, len };
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 
@@ -687,16 +689,19 @@ pub fn handle_event<A: crate::Arch>(
                 // RM IVT[n] without trapping; the only VM86 soft-INTs
                 // that *do* land here are the DPL=3 IDT vectors (3 and
                 // 4 — `int3` debugger, `into` overflow). DOS's default
-                // IVT[3]/[4] entry is a bare `IRET`, and the CPU already
-                // saved IP-after-the-instruction in regs.eip during the
-                // ring-3→ring-0 trap, so a no-op return is equivalent
-                // to executing that default IRET in user mode. Compilers
-                // that emit `INTO` for unchecked overflow detection
-                // (Borland TP/TC) rely on exactly that behaviour when
-                // no debugger has hooked the vector.
+                // IVT[3]/[4] entry is normally our bare `IRET`, and the CPU
+                // already reports IP-after-the-instruction, so a no-op is
+                // equivalent to executing that default handler. A guest may
+                // hook either vector, though: Future Crew's ST3 packer uses
+                // an INT 3 handler as part of its self-decryption. Reflect
+                // hooked vectors with the already-advanced IP on the frame.
                 if is_vm86 {
                     debug_assert!(matches!(n, 3 | 4),
                         "VM86 SoftInt({:#x}) bubbled to dos — only INT 3/4 should trap from VM86", n);
+                    let ivt_seg = machine.read::<u16>((n as usize) * 4 + 2);
+                    if ivt_seg != dos::STUB_SEG {
+                        arch_abi::monitor::sw_reflect_vm86_int(regs, machine, n);
+                    }
                     thread::KernelAction::Done
                 } else {
                     debug_assert!(dos.dpmi.is_some(),
@@ -742,13 +747,19 @@ pub fn handle_event<A: crate::Arch>(
                     log_pm_gp(dos, regs);
                 }
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, n as u32)
-            } else if is_vm86 && matches!(n, 0 | 3 | 4) {
-                // Bare VM86 (no DPMI), #DE / #BP / #OF: same vectors as
-                // software INTs 0/3/4. Real-mode CPU delivers to IVT[n];
-                // programs (e.g. Test Drive 1) install their own INT 0
-                // handler that fixes up DX:AX and advances EIP past the
-                // DIV. Reflect instead of killing — this matches what
-                // FreeDOS does.
+            } else if is_vm86 && matches!(n, 0..=7 | 16 | 17 | 19)
+                && machine.read::<u16>((n as usize) * 4 + 2) != dos::STUB_SEG
+            {
+                // Bare VM86 (no DPMI): reflect the CPU exceptions that a
+                // real-mode program can handle through the same-numbered IVT
+                // vector. This includes #UD: DOS programs may deliberately
+                // execute invalid encodings during CPU detection and
+                // repair/advance the saved IP in their INT 6 handler. Only
+                // guest-hooked vectors are reflected: returning
+                // through the substitute BIOS's default IRET stub would retry
+                // same fault forever. #GP and #PF remain monitor/paging events,
+                // while protected-mode-only selector faults cannot originate
+                // from ordinary VM86 instructions.
                 arch_abi::monitor::sw_reflect_vm86_int(regs, machine, n);
                 thread::KernelAction::Done
             } else {
@@ -1160,8 +1171,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
     {
         let _regs = &mut t.kernel.vcpu;
         dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdline_tail);
-        machine.write::<u8>(0x450, col as u8);
-        machine.write::<u8>(0x451, row as u8);
+        Bda::set_page0_cursor(machine, col as u8, row as u8);
     }
     // (The event loop seeds its live vcpu from this thread's saved state, so no
     // separate "set current vcpu" is needed here.)

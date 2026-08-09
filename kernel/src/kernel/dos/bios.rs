@@ -48,7 +48,7 @@ use super::dosabi::STUB_SEG;
 /// below); guests read the same bytes by hardcoded offset, so the layout is
 /// ABI, not style.
 #[repr(C, packed)]
-struct Bda {
+pub(crate) struct Bda {
     /// 0x00: COM1-4 + LPT1-3 port addresses, EBDA segment.
     io_ports: [u16; 8],
     /// 0x10: equipment word. Bits 4-5 = 00 mean "EGA/VGA with its own BIOS" —
@@ -127,12 +127,69 @@ const _: () = {
     assert!(offset_of!(Bda, kb_flags3) == 0x96);
 };
 
-const BDA_BASE: usize = 0x400;
+impl Bda {
+    const BASE: usize = 0x400;
+
+    #[inline]
+    fn addr(field_off: usize) -> usize {
+        Self::BASE + field_off
+    }
+
+    pub(crate) fn video_mode<A: crate::Arch>(machine: &A) -> u8 {
+        machine.read(Self::addr(core::mem::offset_of!(Self, video_mode)))
+    }
+
+    pub(crate) fn tick_count<A: crate::Arch>(machine: &A) -> u32 {
+        machine.read(Self::addr(core::mem::offset_of!(Self, tick_count)))
+    }
+
+    pub(crate) fn set_page0_cursor<A: crate::Arch>(machine: &mut A, col: u8, row: u8) {
+        let addr = Self::addr(core::mem::offset_of!(Self, cursor_pos));
+        machine.write::<u16>(addr, u16::from_le_bytes([col, row]));
+    }
+
+    pub(crate) fn keyboard_buffer_nonempty<A: crate::Arch>(machine: &A) -> bool {
+        let head: u16 = machine.read(Self::addr(core::mem::offset_of!(Self, kb_head)));
+        let tail: u16 = machine.read(Self::addr(core::mem::offset_of!(Self, kb_tail)));
+        head != tail
+    }
+
+    pub(crate) fn clear_keyboard_buffer<A: crate::Arch>(machine: &mut A) {
+        let first = core::mem::offset_of!(Self, kb_ring) as u16;
+        machine.write::<u16>(Self::addr(core::mem::offset_of!(Self, kb_head)), first);
+        machine.write::<u16>(Self::addr(core::mem::offset_of!(Self, kb_tail)), first);
+        machine.copy_to(Self::addr(core::mem::offset_of!(Self, kb_ring)), &[0; 32]);
+    }
+
+    pub(crate) fn pop_keyboard_word<A: crate::Arch>(machine: &mut A) -> Option<u16> {
+        let head_addr = Self::addr(core::mem::offset_of!(Self, kb_head));
+        let tail_addr = Self::addr(core::mem::offset_of!(Self, kb_tail));
+        let head: u16 = machine.read(head_addr);
+        let tail: u16 = machine.read(tail_addr);
+        if head == tail {
+            return None;
+        }
+        let first = core::mem::offset_of!(Self, kb_ring) as u16;
+        let end = first + core::mem::size_of::<[u16; 16]>() as u16;
+        let word = machine.read::<u16>(Self::BASE + head as usize);
+        let next = if head + 2 >= end { first } else { head + 2 };
+        machine.write::<u16>(head_addr, next);
+        Some(word)
+    }
+
+    pub(crate) fn keyboard_flags<A: crate::Arch>(machine: &A) -> u8 {
+        machine.read(Self::addr(core::mem::offset_of!(Self, kb_flags)))
+    }
+
+    pub(crate) fn set_keyboard_flags<A: crate::Arch>(machine: &mut A, flags: u8) {
+        machine.write(Self::addr(core::mem::offset_of!(Self, kb_flags)), flags);
+    }
+}
 
 /// Linear address of a `Bda` field: `bda(offset_of!(Bda, tick_count))`.
 #[inline]
 fn bda(field_off: usize) -> usize {
-    BDA_BASE + field_off
+    Bda::addr(field_off)
 }
 
 /// Ring head/tail values as the guest stores them: segment-0x40 offsets.
@@ -178,8 +235,14 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     // segment.
     const DUMMY_OFF: u16 = 0xFF * 2;
     for n in 0..256u32 {
+        // INT 4Bh (VDS) needs a callable default even though VDS is absent
+        // (40:7B bit 5 remains clear). Some DOS extenders unconditionally
+        // balance an earlier "disable DMA translation" with AX=810Ch during
+        // teardown. A real BIOS/DOS dummy handler simply IRETs; a NULL vector
+        // transfers control to 0000:0000 and turns that harmless cleanup call
+        // into execution of the IVT itself.
         let serviced = matches!(n,
-            0x00..=0x33 | 0x40..=0x46 | 0x4A | 0x67 | 0x70..=0x77);
+            0x00..=0x33 | 0x40..=0x46 | 0x4A..=0x4B | 0x67 | 0x70..=0x77);
         if !serviced {
             // NULL, not a dummy stub — a real BIOS leaves the unused vectors
             // (the 0x60-0x67 and 0x78-0x7F user ranges especially) at
@@ -235,7 +298,7 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     // whatever the firmware left behind (a real POST cleared it), and guests
     // read unseeded fields directly — DOS/4GW #DE'd converting a leftover
     // 0xFFF1xxxx at 40:6C to a time of day.
-    machine.copy_to(0x400, &[0u8; 0x100]);
+    machine.copy_to(Bda::BASE, &[0u8; 0x100]);
     // Tick-of-day counter: a real POST seeds 40:6C from the RTC.
     let ticks = super::dos::rtc_ticks_today(machine);
     bda_field!(machine, tick_count = ticks);
@@ -491,7 +554,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
                 machine::set_vm86_ip(regs, stub_ip.wrapping_sub(2));
                 return Parked::Yes;
             }
-            let key: u16 = machine.read(BDA_BASE + head as usize);
+            let key: u16 = machine.read(Bda::BASE + head as usize);
             let mut next = head + 2;
             if next >= KB_RING_END {
                 next = KB_RING_FIRST;
@@ -509,7 +572,7 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
                 flags |= 0x40;
             } else {
                 flags &= !0x40;
-                let key: u16 = machine.read(BDA_BASE + head as usize);
+                let key: u16 = machine.read(Bda::BASE + head as usize);
                 let key = if ah == 0x01 { conventional(key) } else { key };
                 regs.rax = (regs.rax & !0xFFFF) | key as u64;
             }
@@ -604,7 +667,7 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
     let head: u16 = bda_field!(machine, kb_head);
     if next != head {
         // ring not full
-        machine.write::<u16>(BDA_BASE + tail as usize, word);
+        machine.write::<u16>(Bda::BASE + tail as usize, word);
         bda_field!(machine, kb_tail = next);
     }
     emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
@@ -622,6 +685,70 @@ const VRAM_MODE13: usize = 0xA0000;
 /// (`vga::bios_draw_glyph`) instead of writing cells.
 fn is_text_mode(mode: u8) -> bool {
     matches!(mode, 0..=3 | 7)
+}
+
+/// INT 10h AH=11h — VGA character generator. Besides loading plane-2 fonts,
+/// the 11h/12h/14h variants select 25/50-row text geometry. ST3 uses AX=1112
+/// to enter 80x50; ignoring it leaves its 4,000 character cells interpreted as
+/// 25 rows of 16-line glyphs, which appears as a screen of garbage symbols.
+fn font_service<A: crate::Arch>(
+    machine: &mut A,
+    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) {
+    let subfn = regs.rax as u8;
+    let map = usize::from(regs.rbx as u8 & 7);
+    let set_geometry = matches!(subfn, 0x10 | 0x11 | 0x12 | 0x14);
+
+    let mut owned = alloc::vec::Vec::new();
+    let (first, glyph_h, font): (usize, usize, &[u8]) = match subfn {
+        0x00 | 0x10 => {
+            let glyph_h = usize::from((regs.rbx >> 8) as u8);
+            let count = match regs.rcx as u16 { 0 => 256, n => usize::from(n) };
+            let first = usize::from(regs.rdx as u16);
+            if glyph_h == 0 || glyph_h > 32 || first + count > 256 { return; }
+            owned.resize(count * glyph_h, 0);
+            let src = es_offset(dos, regs, regs.rbp as u16 as u32);
+            machine.copy_from(src, &mut owned);
+            (first, glyph_h, &owned)
+        }
+        0x01 | 0x11 => (0, 14, &lib::vga_fonts::FONT_8X14),
+        0x02 | 0x12 => (0, 8, &lib::vga_fonts::FONT_8X8),
+        0x04 | 0x14 => (0, 16, &lib::vga_fonts::FONT_8X16),
+        0x03 => {
+            if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.vga
+                && let Some(workspace) = bios_display.as_deref_mut()
+            {
+                let _ = workspace.bios_font_call(machine, display, regs, None);
+            } else {
+                super::machine::vga::bios_set_font_map_select(&mut dos.pc.vga, regs.rbx as u8);
+            }
+            return;
+        }
+        _ => return,
+    };
+
+    if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.vga {
+        if let Some(workspace) = bios_display.as_deref_mut() {
+            let buffer = matches!(subfn, 0x00 | 0x10).then_some(font);
+            let _ = workspace.bios_font_call(machine, display, regs, buffer);
+        }
+    } else {
+        super::machine::vga::bios_load_font(
+            machine, &mut dos.pc.vga, map, first, font, glyph_h,
+        );
+        if set_geometry {
+            super::machine::vga::bios_set_text_height(&mut dos.pc.vga, glyph_h as u8);
+        }
+    }
+
+    if set_geometry {
+        let rows = if glyph_h == 8 { 50 } else { 25 };
+        bda_field!(machine, rows_minus1 = rows - 1);
+        bda_field!(machine, cell_height = glyph_h as u16);
+        bda_field!(machine, cursor_shape = ((glyph_h as u16 - 2) << 8) | (glyph_h as u16 - 1));
+    }
 }
 
 /// Linear address of one text cell. A page is 0x1000 bytes in the 80-column
@@ -651,7 +778,7 @@ pub(super) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
     let pos: u16 = machine.read(bda(pos_off));
     let (mut row, mut col) = ((pos >> 8) as u32, (pos & 0xFF) as u32);
     let cols: u16 = bda_field!(machine, columns);
-    let mode: u8 = bda_field!(machine, video_mode);
+    let mode = Bda::video_mode(machine);
     match ch {
         b'\r' => col = 0,
         b'\n' => row += 1,
@@ -685,7 +812,7 @@ pub(super) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
 /// Scroll a text page up one line, blanking the last. A no-op in a graphics
 /// mode, where there are no character cells to move.
 fn scroll_text_page<A: crate::Arch>(machine: &mut A, page: u8, cols: u16, max_row: u8) {
-    let mode: u8 = bda_field!(machine, video_mode);
+    let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
     }
@@ -772,7 +899,7 @@ fn set_cga_compat_palette<A: crate::Arch>(
 /// Graphics modes are left alone: scrolling a pixel buffer needs the mode's
 /// plane layout, and no guest we serve asks for it.
 fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
-    let mode: u8 = bda_field!(machine, video_mode);
+    let mode = Bda::video_mode(machine);
     if !is_text_mode(mode) {
         return;
     }
@@ -906,7 +1033,7 @@ pub(super) fn int10<A: crate::Arch>(
             // Read the character + attribute under the cursor (BH = page).
             let page = ((regs.rbx >> 8) & 7) as u8;
             let (row, col) = cursor_of(machine, page);
-            let mode: u8 = bda_field!(machine, video_mode);
+            let mode = Bda::video_mode(machine);
             let cell = if is_text_mode(mode) {
                 let at = text_cell(machine, page, row, col);
                 machine.read::<u16>(at)
@@ -927,7 +1054,7 @@ pub(super) fn int10<A: crate::Arch>(
             let attr = regs.rbx as u8;
             let count = ((regs.rcx as u16).max(1)) as u32;
             let (row, col) = cursor_of(machine, page);
-            let mode: u8 = bda_field!(machine, video_mode);
+            let mode = Bda::video_mode(machine);
             let cols: u16 = bda_field!(machine, columns);
             let rows: u8 = bda_field!(machine, rows_minus1);
             let (cols, rows) = (cols as u32, rows as u32 + 1);
@@ -972,7 +1099,7 @@ pub(super) fn int10<A: crate::Arch>(
         }
         0x0F => {
             // Get video mode: AL=mode, AH=columns, BH=page.
-            let mode: u8 = bda_field!(machine, video_mode);
+            let mode = Bda::video_mode(machine);
             let cols: u16 = bda_field!(machine, columns);
             let page: u8 = bda_field!(machine, active_page);
             regs.rax = (regs.rax & !0xFFFF) | ((cols << 8) | mode as u16) as u64;
@@ -1124,6 +1251,7 @@ pub(super) fn int10<A: crate::Arch>(
                 _ => {}
             }
         }
+        0x11 => font_service(machine, bios_display, dos, regs),
         0x12 => {
             if (regs.rbx & 0xFF) as u8 == 0x10 {
                 // EGA info: BH=colour, BL=mem, CL=switches.
@@ -1157,7 +1285,7 @@ fn state_info<A: crate::Arch>(machine: &mut A, dos: &super::DosState<A>, regs: &
     }
     let lin = es_offset(dos, regs, regs.rdi as u16 as u32);
     machine.copy_to(lin, &[0u8; 64]);
-    let mode: u8 = bda_field!(machine, video_mode);
+    let mode = Bda::video_mode(machine);
     let columns: u16 = bda_field!(machine, columns);
     let rows_minus1: u8 = bda_field!(machine, rows_minus1);
     let rows = rows_minus1 + 1;

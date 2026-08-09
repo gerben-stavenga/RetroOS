@@ -73,6 +73,7 @@ fn scanout<'a, A: crate::Arch>(
             palette: &state.dac,
             dac_mask: state.dac_mask,
             font: &lib::vga_fonts::FONT_8X16,
+            font_b: &lib::vga_fonts::FONT_8X16,
             blink: false,
             cga_palette: [0; 4],
             start_offset: 0,
@@ -99,21 +100,77 @@ fn scanout<'a, A: crate::Arch>(
         }
         if lo > hi { (0, 0) } else { (lo, hi) }
     };
-    let (vram, planes): (&[u8], &[u8]) = match mode {
+    let fallback_font: &[u8] = match mode {
+        VgaMode::Text { cell_h: 8, .. } => &lib::vga_fonts::FONT_8X8,
+        VgaMode::Text { cell_h: 14, .. } => &lib::vga_fonts::FONT_8X14,
+        _ => &lib::vga_fonts::FONT_8X16,
+    };
+    let (vram, planes, font, font_b): (&[u8], &[u8], &[u8], &[u8]) = match mode {
         VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } =>
-            (&[], read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000)),
+            (&[], read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000), fallback_font, fallback_font),
         VgaMode::Mode13h => {
             let (lo, hi) = m13_span();
-            (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[])
+            (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[], fallback_font, fallback_font)
+        }
+        VgaMode::Text { cols, rows, cell_h, .. } => {
+            // Text cells live at B8000, but their glyphs are programmable VGA
+            // memory in plane 2: 32 bytes per character, with only `cell_h`
+            // scanlines displayed. Trackers and DOS shells load custom fonts
+            // there and then use otherwise meaningless character codes as UI
+            // tiles. Repack the selected VGA character map into the compact
+            // 256*cell_h layout consumed by the renderer.
+            let text_len = usize::from(cols) * usize::from(rows) * 2;
+            let glyph_h = usize::from(cell_h);
+            let font_len = 256 * glyph_h;
+            const VGA_MAP_LEN: usize = 0x2000;
+            if scratch.len() != text_len + 2 * VGA_MAP_LEN {
+                scratch.clear();
+                scratch.resize(text_len + 2 * VGA_MAP_LEN, 0);
+            }
+            if state.a0000_trapped {
+                // During character-generator access GC[6] may turn B8000 into
+                // the sequential plane aperture. On metal that window is an
+                // intentional MMIO page fault, so kernel scanout must not
+                // dereference it. The text image is canonical at this point:
+                // characters in plane 0, attributes in plane 1, both at even
+                // CRTC word offsets.
+                for cell in 0..text_len / 2 {
+                    let off = cell * 2;
+                    scratch[cell * 2] = machine.read(VGA_VRAM_BASE + off);
+                    scratch[cell * 2 + 1] =
+                        machine.read(VGA_VRAM_BASE + 0x10000 + off);
+                }
+            } else {
+                machine.copy_from(0xB8000, &mut scratch[..text_len]);
+            }
+            // Sequencer Character Map Select: B uses bits 1:0 plus bit 4;
+            // A uses bits 3:2 plus bit 5. The encoded selector is reordered
+            // into the physical 8-KB map number by moving its high bit low.
+            let map_b = usize::from((state.seq[3] & 0x03) << 1 | (state.seq[3] >> 4) & 1);
+            let map_a = usize::from(((state.seq[3] >> 2) & 0x03) << 1
+                | (state.seq[3] >> 5) & 1);
+            for (map, dst_base) in [(map_a, text_len), (map_b, text_len + VGA_MAP_LEN)] {
+                let font_base = VGA_VRAM_BASE + 2 * 0x10000 + map * 0x2000;
+                machine.copy_from(font_base, &mut scratch[dst_base..dst_base + VGA_MAP_LEN]);
+                // VGA reserves 32 bytes per glyph. Compact the selected map
+                // in place for the renderer; walking forward is safe because
+                // every destination begins at or below its source.
+                for ch in 0..256 {
+                    let src = dst_base + ch * 32;
+                    let dst = dst_base + ch * glyph_h;
+                    scratch.copy_within(src..src + glyph_h, dst);
+                }
+            }
+            let (vram, fonts) = scratch.split_at(text_len);
+            let font = &fonts[..font_len];
+            let font_b = &fonts[VGA_MAP_LEN..VGA_MAP_LEN + font_len];
+            (vram, &[], font, font_b)
         }
         // 4 KB and 16 KB apertures: banding them would buy back less than
         // the per-row address arithmetic (CGA's two interleaved banks) costs.
-        VgaMode::Text { cols, rows, .. } => {
-            let len = usize::from(cols) * usize::from(rows) * 2;
-            (read_aperture(machine, scratch, 0xB8000, len, 0, len), &[])
-        }
-        VgaMode::Cga4 | VgaMode::Cga2 => (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[]),
-        VgaMode::LinearSvga { .. } => (&[], &[]), // handled by the short-circuit above
+        VgaMode::Cga4 | VgaMode::Cga2 =>
+            (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[], fallback_font, fallback_font),
+        VgaMode::LinearSvga { .. } => (&[], &[], fallback_font, fallback_font), // handled by the short-circuit above
     };
     // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
     // line-compare (split-screen) apply to the planar families and to linear
@@ -132,11 +189,6 @@ fn scanout<'a, A: crate::Arch>(
         VgaMode::Cga2 => [0x000000, ::vga::CGA16[(state.cga_color_select & 0x0F) as usize], 0, 0],
         _ => [0; 4],
     };
-    let font: &[u8] = match mode {
-        VgaMode::Text { cell_h: 8, .. } => &lib::vga_fonts::FONT_8X8,
-        VgaMode::Text { cell_h: 14, .. } => &lib::vga_fonts::FONT_8X14,
-        _ => &lib::vga_fonts::FONT_8X16,
-    };
     Some(Frame {
         mode,
         vram,
@@ -145,6 +197,7 @@ fn scanout<'a, A: crate::Arch>(
         palette: &state.dac,
         dac_mask: state.dac_mask,
         font,
+        font_b,
         blink: state.ac[0x10] & 0x08 != 0,
         cga_palette,
         start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },

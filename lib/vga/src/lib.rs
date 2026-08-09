@@ -86,9 +86,13 @@ pub struct Frame<'a> {
     /// it comes from the Mode-Control/Colour-Select registers (see
     /// [`cga4_palette`]). Ignored by every non-CGA mode.
     pub cga_palette: [u32; 4],
-    /// 8×16 glyph bitmap, 256 chars × 16 bytes (one bit per pixel). Required for
-    /// text mode; ignored otherwise.
+    /// VGA character map A, packed as 256 glyphs × the mode's character
+    /// height. Attribute bit 3 selects this map; ignored outside text mode.
     pub font: &'a [u8],
+    /// VGA character map B. Attribute bit 3 clear selects this map. BIOS text
+    /// modes normally point A and B at the same font, while trackers commonly
+    /// use the two maps as an extra bank of UI tiles.
+    pub font_b: &'a [u8],
     /// Attribute bit 7 semantics (AC mode-control bit 3): `true` = blink
     /// (bit 7 ignored here — not animated), `false` = 16 background colors.
     /// TUIs (DN, NC) disable blink via INT 10h AX=1003 to get bright
@@ -410,6 +414,35 @@ pub fn text_odd_even_munge(planes: &mut [u8]) {
 /// Restore canonical plane-major text VRAM after [`text_odd_even_munge`].
 pub fn text_odd_even_unmunge(planes: &mut [u8]) {
     text_odd_even_munge(planes);
+}
+
+/// Load a compact 256-glyph font into one VGA plane-2 character map. VGA
+/// reserves 32 bytes per glyph regardless of the displayed character height.
+pub fn load_font_glyphs(
+    planes: &mut [u8],
+    map: usize,
+    first: usize,
+    font: &[u8],
+    glyph_h: usize,
+) {
+    assert!(map < 8 && glyph_h <= 32);
+    assert!(planes.len() >= 3 * VGA_PLANE_BYTES);
+    assert!(first <= 256 && font.len() % glyph_h == 0);
+    let count = font.len() / glyph_h;
+    assert!(first + count <= 256);
+    let map_base = 2 * VGA_PLANE_BYTES + map * 0x2000;
+    for i in 0..count {
+        let ch = first + i;
+        let dst = map_base + ch * 32;
+        planes[dst..dst + 32].fill(0);
+        let src = i * glyph_h;
+        planes[dst..dst + glyph_h].copy_from_slice(&font[src..src + glyph_h]);
+    }
+}
+
+pub fn load_font_map(planes: &mut [u8], map: usize, font: &[u8], glyph_h: usize) {
+    assert!(font.len() >= 256 * glyph_h);
+    load_font_glyphs(planes, map, 0, &font[..256 * glyph_h], glyph_h);
 }
 
 // ============================================================================
@@ -1000,7 +1033,7 @@ fn row_text<const N: usize>(
     cols: usize, rows: usize, cell_w: usize, cell_h: usize,
 ) {
     let (trow, gy) = (sy / cell_h, sy % cell_h);
-    if frame.font.len() < 256 * cell_h || trow >= rows {
+    if frame.font.len() < 256 * cell_h || frame.font_b.len() < 256 * cell_h || trow >= rows {
         return;
     }
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
@@ -1014,7 +1047,10 @@ fn row_text<const N: usize>(
         };
         let fg = pal.lut[(attr & 0x0F) as usize];
         let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
-        let bits = frame.font[ch * cell_h + gy];
+        // VGA Character Map A is selected by attribute bit 3 set; Character
+        // Map B is selected when it is clear (Sequencer register 3).
+        let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
+        let bits = font[ch * cell_h + gy];
         // VGA 9th-dot rule: the 9th column repeats the 8th ONLY for the
         // line-draw block 0xC0..=0xDF, so box drawing joins seamlessly; every
         // other glyph gets a blank 9th column for inter-character spacing.
@@ -1365,7 +1401,9 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let VgaMode::Text { cols, rows, cell_w, cell_h } = frame.mode else { return };
     let (cols, rows, cell_w, cell_h) =
         (cols as usize, rows as usize, cell_w as usize, cell_h as usize);
-    if frame.font.len() < 256 * cell_h || col >= cols || row >= rows {
+    if frame.font.len() < 256 * cell_h || frame.font_b.len() < 256 * cell_h
+        || col >= cols || row >= rows
+    {
         return;
     }
     let cell = (row * cols + col) * 2;
@@ -1384,7 +1422,8 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         frame.palette,
         ((attr >> 4) & bg_mask) & frame.dac_mask,
     );
-    let glyph = &frame.font[ch * cell_h..ch * cell_h + cell_h];
+    let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
+    let glyph = &font[ch * cell_h..ch * cell_h + cell_h];
     // VGA 9th-dot rule: the 9th column repeats the glyph's 8th column ONLY for
     // the line-draw block 0xC0..=0xDF, so box-drawing joins seamlessly. Every
     // other glyph gets a blank 9th column for inter-character spacing —
@@ -1610,7 +1649,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -1667,7 +1706,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1689,7 +1728,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2,
         };
         let mut out = [0u32; 16];
@@ -1784,7 +1823,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1805,7 +1844,7 @@ mod tests {
         let frame = Frame {
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
@@ -1824,7 +1863,7 @@ mod tests {
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
                 mode, vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
-                font: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+                font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
             };
             let (w, h) = dimensions(mode);
@@ -2012,13 +2051,7 @@ impl VgaState {
             state.planes[off] = b' ';
             state.planes[0x10000 + off] = 0x07;
         }
-        // VGA text fonts occupy plane 2 at 32 bytes per character.
-        for ch in 0..256 {
-            let dst = 0x20000 + ch * 32;
-            let src = ch * 16;
-            state.planes[dst..dst + 16]
-                .copy_from_slice(&lib::vga_fonts::FONT_8X16[src..src + 16]);
-        }
+        load_font_map(&mut state.planes, 0, &lib::vga_fonts::FONT_8X16, 16);
         state
     }
 

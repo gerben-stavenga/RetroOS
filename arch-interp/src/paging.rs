@@ -109,6 +109,10 @@ pub fn space_map_mmio(vpage: usize, count: usize) {
                 write_entry(pd, pde_i, ((pt as u32) << 12) | ENTRY_FLAGS);
                 pt
             };
+            let old = read_entry(pt, pte_index(vaddr));
+            if old & PRESENT != 0 {
+                phys::free_frames((old >> 12) as u64, 1);
+            }
             write_entry(pt, pte_index(vaddr), CACHE_DISABLE); // present=0 + PCD
         }
     });

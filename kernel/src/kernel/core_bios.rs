@@ -312,6 +312,49 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         Ok(())
     }
 
+    /// Execute INT 10h AH=11h in the native BIOS workspace. User-font calls
+    /// carry their glyph buffer in ES:BP, so the guest pointer is bounced into
+    /// the workspace just like palette tables, but with the font convention.
+    pub fn bios_font_call(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::NativeVga,
+        caller: &mut Regs,
+        font: Option<&[u8]>,
+    ) -> Result<(), BiosError> {
+        if crate::kernel::platform::get().firmware
+            != crate::kernel::platform::Firmware::NativeBios
+        {
+            return Err(BiosError::NoNativeBios);
+        }
+        let len = font.map_or(0, <[u8]>::len);
+        if len > Self::MAX_STATE_BYTES {
+            return Err(BiosError::InvalidStateSize);
+        }
+        let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let data = font.map(<[u8]>::to_vec);
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_clone(
+            machine,
+            display,
+            &mut regs,
+            |machine, regs| {
+                regs.rax = input[0];
+                regs.rbx = input[1];
+                regs.rcx = input[2];
+                regs.rdx = input[3];
+                if let Some(data) = data.as_deref() {
+                    machine.copy_to(Self::STATE_BUFFER, data);
+                    regs.es = (Self::STATE_BUFFER >> 4) as u64;
+                    regs.rbp = (Self::STATE_BUFFER & 0xF) as u64;
+                }
+            },
+            |_, _| (),
+        )?;
+        caller.rax = regs.rax;
+        Ok(())
+    }
+
     /// Publish a compact packed shadow through a VBE bank window. One
     /// disposable BIOS execution space is kept active for the whole frame, so
     /// the only repeated firmware operation is 4F05 itself; the address-space

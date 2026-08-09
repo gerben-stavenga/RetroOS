@@ -195,6 +195,7 @@ fn mode13h_maps_each_index_through_the_palette() {
         palette: &pal,
         dac_mask: 0xFF,
         font: &[],
+        font_b: &[],
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -230,6 +231,7 @@ fn mode13h_tolerates_short_vram() {
         palette: &pal,
         dac_mask: 0xFF,
         font: &[],
+        font_b: &[],
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -271,6 +273,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         palette: &pal,
         dac_mask: 0xFF,
         font: &font,
+        font_b: &font,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -301,6 +304,42 @@ fn text_renders_glyph_pixels_with_fg_bg() {
 }
 
 #[test]
+fn text_attribute_bit_three_selects_character_map() {
+    let mut font_a = vec![0u8; 256 * 16];
+    let mut font_b = vec![0u8; 256 * 16];
+    font_a[16] = 0x80; // map A: leftmost dot
+    font_b[16] = 0x40; // map B: next dot
+    let mut vram = vec![0u8; 80 * 25 * 2];
+    vram[0] = 1;
+    vram[1] = 0x0F; // attribute bit 3 set selects map A
+    vram[2] = 1;
+    vram[3] = 0x07; // attribute bit 3 clear selects map B
+    let pal = vga_render::fallback_palette();
+    let ac = identity_ac();
+    let frame = Frame {
+        mode: TEXT80,
+        vram: &vram,
+        planes: &[],
+        ac: &ac,
+        palette: &pal,
+        dac_mask: 0xFF,
+        font: &font_a,
+        font_b: &font_b,
+        blink: false,
+        cga_palette: [0; 4],
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+    };
+    let mut out = vec![0u32; 720 * 400];
+    vga_render::render(&frame, &mut out);
+    assert_eq!(out[0], pal_rgb(&pal, 15));
+    assert_eq!(out[1], pal_rgb(&pal, 0));
+    assert_eq!(out[9], pal_rgb(&pal, 0));
+    assert_eq!(out[10], pal_rgb(&pal, 7));
+}
+
+#[test]
 fn text40_keeps_rows_separate_and_doubles_character_dots() {
     let mut font = vec![0u8; 256 * 16];
     font[16] = 0x80; // character 1: top-left glyph dot only
@@ -312,7 +351,7 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
     let ac = identity_ac();
     let frame = Frame {
         mode: TEXT40, vram: &vram, planes: &[], ac: &ac, palette: &pal,
-        dac_mask: 0xFF, font: &font, blink: false, cga_palette: [0; 4],
+        dac_mask: 0xFF, font: &font, font_b: &font, blink: false, cga_palette: [0; 4],
         start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
@@ -351,6 +390,7 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         palette: &palette,
         dac_mask: 0xFF,
         font: &[],
+        font_b: &[],
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,

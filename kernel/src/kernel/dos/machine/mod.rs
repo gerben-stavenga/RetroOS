@@ -732,11 +732,16 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 machine.outb(port, val);
                 return;
             };
+            let old_gc6 = (port == 0x3CF && dev.state.gc_index & 0x0F == 6)
+                .then_some(dev.state.gc[6]);
             dev.state.port_write(port, val);
             // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
             // select a plane — drive the A0000 paging alias.
             if port == 0x3C5 {
                 vga::on_seq_write(machine, pc, regs);
+            }
+            if let Some(old_gc6) = old_gc6 {
+                vga::on_gc_write(machine, pc, old_gc6);
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.

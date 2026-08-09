@@ -46,7 +46,7 @@ fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
     // of approximating the tick rate as 18 Hz. (BDA = guest address space.)
-    let ticks = machine.read::<u32>(0x46C) as u64;
+    let ticks = super::Bda::tick_count(machine) as u64;
     let total_centis = ticks
         .saturating_mul(BIOS_TICK_DIVISOR)
         .saturating_mul(100)
@@ -1038,9 +1038,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // Some Borland C builds back kbhit() with this rather than INT 16h
         // AH=01h, so a hardcoded "no char" silently breaks polling.
         0x0B => {
-            let head = read_u16(machine, 0x40, 0x1A);
-            let tail = read_u16(machine, 0x40, 0x1C);
-            let al = if head != tail { 0xFFu8 } else { 0u8 };
+            let al = if super::Bda::keyboard_buffer_nonempty(machine) { 0xFFu8 } else { 0u8 };
             regs.rax = (regs.rax & !0xFF) | al as u64;
             thread::KernelAction::Done
         }
@@ -3286,7 +3284,14 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
         if preserve_pm_env && dos.dpmi.is_some() { "kept" } else { "restored" });
     regs.set_ss32(parent.ss as u32);
     regs.set_sp32(parent.sp as u32);
-    regs.clear_flag32(1);
+    // The live frame still belongs to the exiting child until the real-mode
+    // dispatch stub consumes the parent's saved IRET frame below SS:SP.  DPMI
+    // virtual-IF tracking may have armed TF in that child frame; carrying it
+    // across EXEC return single-steps the dispatcher and eventually delivers
+    // the child's #DB in the restored parent (Zone 66 exits this way).
+    // Clear child CF and TF here.  A parent that was genuinely tracing keeps
+    // TF in its saved FLAGS word and the dispatch IRET restores it normally.
+    regs.clear_flag32(1 | (1 << 8));
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
     // Restore parent's mode. The child was always VM86; if the parent
@@ -4170,8 +4175,8 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // renders them as digits ('8'/'2') instead of navigation — and a laptop
     // keyboard may have no NumLock key to clear it. 86box boots NumLock on;
     // QEMU/Bochs boot it off, which is why arrows worked there.
-    let kbd_flags = read_u16(machine, 0x40, 0x17) & !0x0020;
-    write_u16(machine, 0x40, 0x17, kbd_flags);
+    let kbd_flags = super::Bda::keyboard_flags(machine) & !0x20;
+    super::Bda::set_keyboard_flags(machine, kbd_flags);
 }
 
 fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {

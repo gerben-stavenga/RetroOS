@@ -1135,10 +1135,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // BDA 0040:0050 — the page-0 cursor position the child's BIOS
             // sees. Must go through the Vcpu guest accessor: a guest address
             // is a host address only on metal's low-mem identity window — on
-            // the interp backend a raw 0x450 deref is the host null page
-            // (SEGV'd on DN→PRINCE.EXE, the first task-spawn EXEC on interp).
-            machine.write::<u8>(0x450, col);
-            machine.write::<u8>(0x451, row);
+            // the interp backend treating the guest address as a host pointer
+            // hits the host null page (SEGV'd on DN→PRINCE.EXE, the first
+            // task-spawn EXEC on interp).
+            crate::kernel::dos::Bda::set_page0_cursor(machine, col, row);
         }
     }
 
@@ -1176,7 +1176,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
         // interpreter) — raw `lin as *const u8` would fault on the interp.
         let mut b = [0u8; 8];
         machine.copy_from(lin as usize, &mut b);
-        let ticks = machine.read::<u32>(0x46C);
+        let ticks = crate::kernel::dos::Bda::tick_count(machine);
         crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(), regs.ip32(),
             regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,

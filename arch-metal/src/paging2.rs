@@ -1727,25 +1727,51 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
 
 /// Map a physical page into the user address space.
 pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
+    use crate::phys_mm;
+    // Replacing an owned user mapping drops that mapping's reference.  Device
+    // windows are frequently rebound in place (the VGA switches B8000 between
+    // a linear alias and an MMIO trap); merely overwriting the PTE leaked one
+    // reference on every transition until PAGE_REFS overflowed.
+    let release_old = |raw: u64, present: bool| {
+        if present && raw & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
+            phys_mm::free_phys_page((raw & !0xFFF) >> 12);
+        }
+    };
     // MAP_MMIO: an emulated device aperture — present=0 + Cache-Disable (PCD),
     // the not-present twin of the present+PCD passthrough device mappings. A #PF
     // here is a device trap the kernel decodes (planar VGA, future emulated
     // BARs), not demand-paged RAM; try_handle_page_fault recognises the PCD.
     if extra_flags & arch_abi::MAP_MMIO != 0 {
         match entries() {
-            Entries::E32(e) => { let mut x = Entry32::default(); x.set_raw(flags::CACHE_DISABLE | flags::USER); e[vpage] = x; }
-            Entries::E64(e) => { let mut x = Entry64::default(); x.set_raw(flags::CACHE_DISABLE | flags::USER); e[vpage] = x; }
+            Entries::E32(e) => {
+                let old = e[vpage];
+                release_old(old.raw(), old.present());
+                let mut x = Entry32::default();
+                x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                e[vpage] = x;
+            }
+            Entries::E64(e) => {
+                let old = e[vpage];
+                release_old(old.raw(), old.present());
+                let mut x = Entry64::default();
+                x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                e[vpage] = x;
+            }
         }
         flush_tlb();
         return;
     }
     match entries() {
         Entries::E32(e) => {
+            let old = e[vpage];
+            release_old(old.raw(), old.present());
             let mut entry = Entry32::new(ppage, true, true);
             entry.set_raw(entry.raw() | extra_flags);
             e[vpage] = entry;
         }
         Entries::E64(e) => {
+            let old = e[vpage];
+            release_old(old.raw(), old.present());
             let mut entry = Entry64::new(ppage, true, true);
             entry.set_raw(entry.raw() | extra_flags);
             e[vpage] = entry;
