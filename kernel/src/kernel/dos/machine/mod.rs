@@ -1001,7 +1001,7 @@ pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
-    let di = regs.rdi as u32;
+    let di = string_index(regs.rdi, addr32);
     if native_atomic_port(pc, port, size) {
         let bytes = native_in(machine, port, size).to_le_bytes();
         for (i, &byte) in bytes.iter().enumerate().take(size as usize) {
@@ -1014,8 +1014,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
         }
     }
     let df = regs.flags32() & (1 << 10) != 0;
-    let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
-    regs.rdi = regs.rdi.wrapping_add(delta);
+    advance_string_index(&mut regs.rdi, size, addr32, df);
     if rep { dec_rep_count(regs, addr32); }
 }
 
@@ -1024,7 +1023,7 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
-    let si = regs.rsi as u32;
+    let si = string_index(regs.rsi, addr32);
     if native_atomic_port(pc, port, size) {
         let mut bytes = [0u8; 4];
         for (i, byte) in bytes.iter_mut().enumerate().take(size as usize) {
@@ -1040,9 +1039,37 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, re
         }
     }
     let df = regs.flags32() & (1 << 10) != 0;
-    let delta = if df { (size as u64).wrapping_neg() } else { size as u64 };
-    regs.rsi = regs.rsi.wrapping_add(delta);
+    advance_string_index(&mut regs.rsi, size, addr32, df);
     if rep { dec_rep_count(regs, addr32); }
+}
+
+/// Select and advance an offset register at the instruction's effective
+/// address width. Shared by trapped INS/OUTS and fault-decoded MMIO strings:
+/// the host-side `Regs` width must not leak into 16/32-bit guest addressing.
+#[inline]
+fn string_index(index: u64, addr32: bool) -> u32 {
+    if addr32 { index as u32 } else { index as u16 as u32 }
+}
+
+#[inline]
+fn set_string_index(index: &mut u64, value: u32, addr32: bool) {
+    if addr32 {
+        *index = (*index & !0xFFFF_FFFF) | value as u64;
+    } else {
+        *index = (*index & !0xFFFF) | (value as u16 as u64);
+    }
+}
+
+#[inline]
+fn step_string_index(index: u32, step: u32, addr32: bool, decrement: bool) -> u32 {
+    let value = if decrement { index.wrapping_sub(step) } else { index.wrapping_add(step) };
+    if addr32 { value } else { value as u16 as u32 }
+}
+
+#[inline]
+fn advance_string_index(index: &mut u64, size: u32, addr32: bool, decrement: bool) {
+    let value = step_string_index(string_index(*index, addr32), size, addr32, decrement);
+    set_string_index(index, value, addr32);
 }
 
 /// Decrement the `rep` counter after one string-I/O element. The monitor only
@@ -1051,7 +1078,8 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, re
 /// resume. `addr32` picks ECX vs the 16-bit CX (upper bits preserved).
 fn dec_rep_count(regs: &mut Regs, addr32: bool) {
     if addr32 {
-        regs.rcx = regs.rcx.wrapping_sub(1);
+        let ecx = (regs.rcx as u32).wrapping_sub(1);
+        regs.rcx = (regs.rcx & !0xFFFF_FFFF) | ecx as u64;
     } else {
         let cx = (regs.rcx as u16).wrapping_sub(1);
         regs.rcx = (regs.rcx & !0xFFFF) | cx as u64;
@@ -1336,3 +1364,28 @@ pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
 // GP-fault monitor lives in `arch/monitor.rs` now. Kernel only sees the
 // resulting `KernelEvent`s via `do_arch_execute()`; the completion helpers
 // for In/Out/Ins/Outs live at the top of this file (handle_in_event, etc.).
+
+#[cfg(test)]
+mod tests {
+    use super::{advance_string_index, string_index};
+
+    #[test]
+    fn string_io_16bit_ignores_and_preserves_garbage_high_half() {
+        let mut si = 0xDEAD_BEEF_1234_FFFF;
+        assert_eq!(string_index(si, false), 0xFFFF);
+        advance_string_index(&mut si, 1, false, false);
+        assert_eq!(si, 0xDEAD_BEEF_1234_0000);
+        advance_string_index(&mut si, 1, false, true);
+        assert_eq!(si, 0xDEAD_BEEF_1234_FFFF);
+    }
+
+    #[test]
+    fn string_io_32bit_wraps_without_changing_upper_register_bits() {
+        let mut esi = 0xCAFE_BABE_FFFF_FFFE;
+        assert_eq!(string_index(esi, true), 0xFFFF_FFFE);
+        advance_string_index(&mut esi, 4, true, false);
+        assert_eq!(esi, 0xCAFE_BABE_0000_0002);
+        advance_string_index(&mut esi, 4, true, true);
+        assert_eq!(esi, 0xCAFE_BABE_FFFF_FFFE);
+    }
+}

@@ -198,7 +198,7 @@ fn advance_ip(regs: &mut Regs, cs_32: bool, n: u32) {
 /// already 0 there is nothing to do: skip the instruction and resume.
 fn string_io(regs: &mut Regs, cs_32: bool, advance: u32, rep: bool, addr32: bool, ev: KernelEvent) -> MonitorResult {
     if rep {
-        let count = if addr32 { regs.rcx } else { regs.rcx & 0xFFFF };
+        let count = if addr32 { regs.rcx as u32 as u64 } else { regs.rcx & 0xFFFF };
         if count == 0 {
             advance_ip(regs, cs_32, advance);
             return MonitorResult::Resume;

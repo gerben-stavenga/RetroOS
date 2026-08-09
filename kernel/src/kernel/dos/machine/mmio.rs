@@ -22,6 +22,7 @@
 
 use crate::Regs;
 use super::vga::{self, VgaState};
+use super::{set_string_index, step_string_index, string_index};
 
 // Planar #PF decode is a kernel-side trap with no arch involvement: A0000 is
 // left unmapped while planar logic is needed, so the guest store/load faults,
@@ -479,15 +480,23 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let chunk = total.min(REP_CHUNK);
             let al = regs.rax as u32;
             let df = regs.frame.rflags & (1 << 10) != 0;
-            for n in 0..chunk {
-                let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
-                for b in 0..sz { target.write8(machine, o + b, (al >> (b * 8)) as u8); }
+            let mut di = string_index(regs.rdi, addr32);
+            for _ in 0..chunk {
+                let addr = es_base.wrapping_add(di);
+                for b in 0..sz {
+                    let byte = (al >> (b * 8)) as u8;
+                    let byte_addr = addr.wrapping_add(b);
+                    if let Some(o) = target.offset(byte_addr) {
+                        target.write8(machine, o, byte);
+                    } else {
+                        machine.write::<u8>(byte_addr as usize, byte);
+                    }
+                }
+                di = step_string_index(di, sz, addr32, df);
             }
             // Advance DI by the chunk; on `rep`, drop CX by the chunk and, if it
             // isn't drained, leave EIP on the instruction (`not_done`) to resume.
-            let step = chunk * sz;
-            let di = if df { regs.rdi.wrapping_sub(step as u64) } else { regs.rdi.wrapping_add(step as u64) };
-            regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
+            set_string_index(&mut regs.rdi, di, addr32);
             if rep {
                 let rem = total - chunk;
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
@@ -508,15 +517,23 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
             // `rep lods` with CX=0 is a no-op — leave the accumulator untouched.
-            for n in 0..chunk {
-                let o = if df { off.wrapping_sub(n * sz) } else { off.wrapping_add(n * sz) };
+            let mut si = string_index(regs.rsi, addr32);
+            for _ in 0..chunk {
+                let addr = ds_base.wrapping_add(si);
                 let mut val = 0u32;
-                for b in 0..sz { val |= (target.read8(machine, o + b) as u32) << (b * 8); }
+                for b in 0..sz {
+                    let byte_addr = addr.wrapping_add(b);
+                    let byte = if let Some(o) = target.offset(byte_addr) {
+                        target.read8(machine, o)
+                    } else {
+                        machine.read::<u8>(byte_addr as usize)
+                    };
+                    val |= (byte as u32) << (b * 8);
+                }
                 set_gpr(regs, 0, sz, val);
+                si = step_string_index(si, sz, addr32, df);
             }
-            let step = chunk * sz;
-            let si = if df { regs.rsi.wrapping_sub(step as u64) } else { regs.rsi.wrapping_add(step as u64) };
-            regs.rsi = if addr32 { si } else { (regs.rsi & !0xFFFF) | (si & 0xFFFF) };
+            set_string_index(&mut regs.rsi, si, addr32);
             if rep {
                 let rem = total - chunk;
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
@@ -541,12 +558,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         // it).
         0xA4 | 0xA5 => {
             let sz = opsize(op32, opcode == 0xA4);
-            let amask: u32 = if addr32 { 0xFFFF_FFFF } else { 0xFFFF };
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
-            let mut si = regs.rsi as u32 & amask;
-            let mut di = regs.rdi as u32 & amask;
+            let mut si = string_index(regs.rsi, addr32);
+            let mut di = string_index(regs.rdi, addr32);
             for _ in 0..chunk {
                 for b in 0..sz {
                     let src = ds_base.wrapping_add(si).wrapping_add(b);
@@ -567,16 +583,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                         machine.write::<u8>(dst as usize, byte);
                     }
                 }
-                if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
-                else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
+                si = step_string_index(si, sz, addr32, df);
+                di = step_string_index(di, sz, addr32, df);
             }
-            let step = chunk * sz;
-            let adj = |v: u64| {
-                let nv = if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) };
-                if addr32 { nv as u64 } else { (v & !0xFFFF) | (nv as u64 & 0xFFFF) }
-            };
-            regs.rsi = adj(regs.rsi);
-            regs.rdi = adj(regs.rdi);
+            set_string_index(&mut regs.rsi, si, addr32);
+            set_string_index(&mut regs.rdi, di, addr32);
             if rep {
                 let rem = total - chunk;
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
@@ -597,13 +608,23 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
             let acc = regs.rax as u32;
+            let mut di = string_index(regs.rdi, addr32);
             let mut done_n = 0u32;
             let mut stop = false;
             while done_n < chunk {
-                let o = if df { off.wrapping_sub(done_n * sz) } else { off.wrapping_add(done_n * sz) };
+                let addr = es_base.wrapping_add(di);
                 let mut mem = 0u32;
-                for b in 0..sz { mem |= (target.read8(machine, o + b) as u32) << (b * 8); }
+                for b in 0..sz {
+                    let byte_addr = addr.wrapping_add(b);
+                    let byte = if let Some(o) = target.offset(byte_addr) {
+                        target.read8(machine, o)
+                    } else {
+                        machine.read::<u8>(byte_addr as usize)
+                    };
+                    mem |= (byte as u32) << (b * 8);
+                }
                 alu(regs, 7, acc, mem, sz); // CMP acc, mem — flags only
+                di = step_string_index(di, sz, addr32, df);
                 done_n += 1;
                 if rep {
                     // repe (F3) continues while ZF=1; repne (F2) while ZF=0.
@@ -611,9 +632,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                     if zf == repne { stop = true; break; }
                 }
             }
-            let step = done_n * sz;
-            let di = if df { regs.rdi.wrapping_sub(step as u64) } else { regs.rdi.wrapping_add(step as u64) };
-            regs.rdi = if addr32 { di } else { (regs.rdi & !0xFFFF) | (di & 0xFFFF) };
+            set_string_index(&mut regs.rdi, di, addr32);
             if rep {
                 let rem = total - done_n;
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
@@ -630,12 +649,11 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         // `repe`/`repne` ZF termination as scas.
         0xA6 | 0xA7 => {
             let sz = opsize(op32, opcode == 0xA6);
-            let amask: u32 = if addr32 { 0xFFFF_FFFF } else { 0xFFFF };
             let total = if rep { gpr(regs, 1, if addr32 { 4 } else { 2 }) } else { 1 };
             let chunk = total.min(REP_CHUNK);
             let df = regs.frame.rflags & (1 << 10) != 0;
-            let mut si = regs.rsi as u32 & amask;
-            let mut di = regs.rdi as u32 & amask;
+            let mut si = string_index(regs.rsi, addr32);
+            let mut di = string_index(regs.rdi, addr32);
             let mut done_n = 0u32;
             let mut stop = false;
             while done_n < chunk {
@@ -650,21 +668,16 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                     src2 |= (db as u32) << (b * 8);
                 }
                 alu(regs, 7, src1, src2, sz); // CMP [si], [di] — flags only
-                if df { si = si.wrapping_sub(sz); di = di.wrapping_sub(sz); }
-                else  { si = si.wrapping_add(sz); di = di.wrapping_add(sz); }
+                si = step_string_index(si, sz, addr32, df);
+                di = step_string_index(di, sz, addr32, df);
                 done_n += 1;
                 if rep {
                     let zf = regs.frame.rflags & (1 << 6) != 0;
                     if zf == repne { stop = true; break; }
                 }
             }
-            let step = done_n * sz;
-            let adj = |v: u64| {
-                let nv = if df { (v as u32).wrapping_sub(step) } else { (v as u32).wrapping_add(step) };
-                if addr32 { nv as u64 } else { (v & !0xFFFF) | (nv as u64 & 0xFFFF) }
-            };
-            regs.rsi = adj(regs.rsi);
-            regs.rdi = adj(regs.rdi);
+            set_string_index(&mut regs.rsi, si, addr32);
+            set_string_index(&mut regs.rdi, di, addr32);
             if rep {
                 let rem = total - done_n;
                 regs.rcx = if addr32 { (regs.rcx & !0xFFFF_FFFF) | rem as u64 }
@@ -812,4 +825,22 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
     if vm86 { regs.set_ip32((cur_ip & !0xFFFF) | (new_ip & 0xFFFF)); }
     else { regs.set_ip32(new_ip); }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{set_string_index, step_string_index, string_index};
+
+    #[test]
+    fn interpreted_string_indices_obey_address_width() {
+        let mut index = 0xCAFE_BEEF_1234_FFFE;
+        assert_eq!(string_index(index, false), 0xFFFE);
+        let wrapped = step_string_index(0xFFFE, 4, false, false);
+        assert_eq!(wrapped, 2);
+        set_string_index(&mut index, wrapped, false);
+        assert_eq!(index, 0xCAFE_BEEF_1234_0002);
+
+        assert_eq!(step_string_index(1, 4, false, true), 0xFFFD);
+        assert_eq!(step_string_index(0xFFFF_FFFE, 4, true, false), 2);
+    }
 }
