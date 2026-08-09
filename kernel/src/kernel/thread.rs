@@ -268,17 +268,24 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    /// Temporarily move the focused personality's display through the close
-    /// transition. It is immediately materialized back into the same owner.
-    pub fn take_display_for_osd(&mut self) -> crate::kernel::display::Display {
+    /// Temporarily move the focused personality's OSD surface through the
+    /// close transition. `None` means the personality already owns native VGA:
+    /// there is no borrowed `Display` to return. This can occur when a forced
+    /// scheduler/focus transition dismisses a monitor at the ownership edge.
+    pub fn take_display_for_osd(&mut self) -> Option<crate::kernel::display::Display> {
         match self {
             Self::Dos(dos) => {
-                let crate::kernel::dos::DosVga::Emulated(vga) = &mut dos.pc.vga else {
-                    panic!("OSD close found native DOS VGA")
-                };
-                vga.display.take().expect("OSD-visible DOS VGA lost its display")
+                match &mut dos.pc.vga {
+                    crate::kernel::dos::DosVga::Emulated(vga) => Some(
+                        vga.display.take().expect("OSD-visible DOS VGA lost its display"),
+                    ),
+                    crate::kernel::dos::DosVga::Native(_) => None,
+                    crate::kernel::dos::DosVga::Transition => {
+                        panic!("OSD closed during VGA transition")
+                    }
+                }
             }
-            Self::Linux(_) => crate::kernel::linux::save_console_vga(),
+            Self::Linux(_) => Some(crate::kernel::linux::save_console_vga()),
         }
     }
 
@@ -387,11 +394,17 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Advance the visible display once after audio has been fed. Batched
     /// timer slices deliberately do not create display catch-up work.
-    pub fn display_tick(&mut self, machine: &mut A, regs: &Regs) {
+    pub fn display_tick(
+        &mut self,
+        machine: &mut A,
+        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        regs: &Regs,
+    ) {
         let Self::Dos(dos) = self else { return };
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
-        crate::kernel::dos::display_tick(machine, dos, regs, machine.get_ticks());
+        let now_ticks = machine.get_ticks();
+        crate::kernel::dos::display_tick(machine, bios, dos, regs, now_ticks);
         if prof {
             crate::kernel::startup::bill_slice2(
                 0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);

@@ -61,7 +61,7 @@ impl DisplayHandoff {
     ) -> Display {
         match self {
             Self::Surface(display) => display,
-            Self::NativeVga(native) => Display::new_selected(
+            Self::NativeVga(native) => Display::new_console(
                 machine,
                 bios.expect("native VGA surface without BIOS workspace"),
                 native,
@@ -76,6 +76,9 @@ enum Backend {
         framebuffer: Framebuffer,
         native: crate::kernel::platform::NativeVga,
         pages: usize,
+    },
+    VbeBanked {
+        native: crate::kernel::platform::NativeVga,
     },
     Vga {
         framebuffer: Framebuffer,
@@ -94,6 +97,7 @@ impl core::fmt::Debug for Display {
             .field("backend", &match self.backend {
                 Backend::Linear(_) => "linear",
                 Backend::Vbe { .. } => "vbe",
+                Backend::VbeBanked { .. } => "vbe-banked",
                 Backend::Vga { .. } => "vga",
                 Backend::Host => "host",
                 Backend::Headless => "headless",
@@ -112,14 +116,36 @@ impl Display {
         mut native: crate::kernel::platform::NativeVga,
     ) -> Self {
         match crate::kernel::platform::get().vbe_mode {
-            Some(mode) => Self::new_vbe(machine, bios, native, mode)
+            Some(mode) if mode.physical_base != 0 => Self::new_vbe(machine, bios, native, mode)
                 .unwrap_or_else(|_| panic!("selected VBE display mode {:#x} failed", mode.number)),
+            Some(mode) => Self::new_banked_vbe(machine, bios, native, mode)
+                .unwrap_or_else(|_| panic!("selected banked VBE display mode {:#x} failed", mode.number)),
             None => {
                 bios.bios_set_mode(machine, &mut native, 0x13)
                     .expect("selected Mode 13h display failed");
                 Self::new_vga(native)
             }
         }
+    }
+
+    /// Materialize a surface which can be updated without executing firmware.
+    /// The boot/terminal console writes through `fmt::Write`, where no machine
+    /// execution context exists. A selected banked VBE mode is therefore used
+    /// by the DOS/OSD presenter, while this console surface remains Mode 13h.
+    pub fn new_console<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        mut native: crate::kernel::platform::NativeVga,
+    ) -> Self {
+        if let Some(mode) = crate::kernel::platform::get().vbe_mode
+            && mode.physical_base != 0
+        {
+            return Self::new_vbe(machine, bios, native, mode)
+                .unwrap_or_else(|_| panic!("selected VBE console mode {:#x} failed", mode.number));
+        }
+        bios.bios_set_mode(machine, &mut native, 0x13)
+            .expect("Mode 13h console display failed");
+        Self::new_vga(native)
     }
 
     pub fn from_framebuffer(
@@ -217,6 +243,28 @@ impl Display {
         })
     }
 
+    /// Select a packed VBE mode whose pixels are published through its banked
+    /// A000 window. The completed frame remains an ordinary compact Display
+    /// shadow; firmware-owned bank selection happens only at `present_native`.
+    pub fn new_banked_vbe<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        mut native: crate::kernel::platform::NativeVga,
+        mode: crate::kernel::platform::VbeMode,
+    ) -> Result<Self, crate::kernel::platform::NativeVga> {
+        let FormatSpec::Packed(rgb) = mode.format else { return Err(native) };
+        if mode.physical_base != 0 || mode.window_segment == 0
+            || mode.window_granularity_kb == 0 || mode.window_size_kb == 0
+            || bios.bios_set_mode_request(machine, &mut native, mode.number).is_err()
+        {
+            return Err(native);
+        }
+        let (shadow_width, _) = fit_vga(usize::from(mode.width), usize::from(mode.height));
+        crate::println!("Display: banked VBE {}x{}x{} mode={:#x}",
+            mode.width, mode.height, mode.bits_per_pixel, mode.number);
+        Ok(Self { shadow_width, rgb, backend: Backend::VbeBanked { native } })
+    }
+
     pub fn host() -> Self {
         Self { shadow_width: 720, rgb: PixelFormat::NATIVE, backend: Backend::Host }
     }
@@ -228,7 +276,7 @@ impl Display {
     pub fn is_headless(&self) -> bool { matches!(self.backend, Backend::Headless) }
     pub fn is_host(&self) -> bool { matches!(self.backend, Backend::Host) }
     pub fn is_vga(&self) -> bool {
-        matches!(self.backend, Backend::Vbe { .. } | Backend::Vga { .. })
+        matches!(self.backend, Backend::Vbe { .. } | Backend::VbeBanked { .. } | Backend::Vga { .. })
     }
     /// OSD coordinates for a completed VGA shadow. Normal outputs retain the
     /// guest's logical width so the OSD follows the same X/Y enlargement as
@@ -250,7 +298,9 @@ impl Display {
     }
     pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
         match &self.backend {
-            Backend::Vbe { native, .. } | Backend::Vga { native, .. } => Some(native),
+            Backend::Vbe { native, .. }
+            | Backend::VbeBanked { native, .. }
+            | Backend::Vga { native, .. } => Some(native),
             _ => None,
         }
     }
@@ -263,6 +313,7 @@ impl Display {
                 machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
                 Ok(native)
             }
+            Backend::VbeBanked { native, .. } => Ok(native),
             Backend::Vga { native, saved, .. } => {
                 if native.vbe_mode().is_none() {
                     crate::kernel::drivers::vga_hw::restore(&saved);
@@ -270,6 +321,19 @@ impl Display {
                 Ok(native)
             }
             _ => Err(self),
+        }
+    }
+    /// Upgrade an already-owned native VGA surface to the platform's selected
+    /// OSD mode. Non-VGA sinks (host window, linear boot framebuffer) remain
+    /// exactly the surface they already are.
+    pub fn into_selected<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    ) -> Self {
+        match self.into_native_vga(machine) {
+            Ok(native) => Self::new_selected(machine, bios, native),
+            Err(display) => display,
         }
     }
     fn framebuffer(&self) -> Option<&Framebuffer> {
@@ -281,6 +345,10 @@ impl Display {
         }
     }
     fn fit(&self) -> (usize, usize) {
+        if let Backend::VbeBanked { ref native } = self.backend {
+            let mode = native.vbe_mode().expect("banked VBE display lost its mode");
+            return fit_vga(usize::from(mode.width), usize::from(mode.height));
+        }
         let Some(fb) = self.framebuffer() else { return (self.shadow_width, 0) };
         if matches!(self.backend, Backend::Vga { .. }) {
             (fb.width, fb.height)
@@ -294,8 +362,30 @@ impl Display {
             Backend::Linear(_) | Backend::Vbe { .. } | Backend::Vga { .. } => {
                 blit(self, height, shadow)
             }
+            Backend::VbeBanked { .. } => {
+                panic!("banked VBE present without BIOS display driver")
+            }
             Backend::Host => present_host_shadow(self.shadow_width, height, self.rgb, shadow),
             Backend::Headless => 0,
+        }
+    }
+
+    /// Publish one completed packed shadow. Most backends are plain memory
+    /// sinks; a banked native VBE mode delegates the hardware operation to the
+    /// BIOS display driver which owns the real-mode execution workspace.
+    pub fn present_native<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        height: usize,
+        shadow: &[u8],
+    ) -> usize {
+        match &mut self.backend {
+            Backend::VbeBanked { native } => bios
+                .expect("banked VBE display without BIOS workspace")
+                .present(machine, native, height, shadow)
+                .unwrap_or_else(|error| panic!("banked VBE present failed: {:?}", error)),
+            _ => self.present(height, shadow),
         }
     }
 }
@@ -662,7 +752,6 @@ pub fn scanout_action(
     now_tick: u64,
     period_ticks: usize,
 ) -> ScanoutAction {
-    let fb = match display.framebuffer() { Some(fb) => fb, None => return ScanoutAction::None };
     let (w, h) = vga::dimensions(mode);
     if w == 0 || h == 0 || period_ticks < 3 {
         return ScanoutAction::None;
@@ -687,7 +776,7 @@ pub fn scanout_action(
     // is repainted before the frame is published.
     let slack = out_w.div_ceil(w) * 4;
 
-    let geo = (w, h, out_w, out_h, fb.width, fb.height);
+    let geo = (w, h, out_w, out_h, out_w, out_h);
     let reset = s.geo != geo
         || s.mode != Some(mode)
         || s.surface.len() != row_bytes * h + slack
@@ -703,7 +792,9 @@ pub fn scanout_action(
         s.phase = vretrace_ticks(period_ticks);
         s.ready = false;
         s.last_tick = now_tick;
-        unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
+        if let Some(fb) = display.framebuffer() {
+            unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
+        }
         return ScanoutAction::Render;
     }
 
@@ -766,107 +857,6 @@ pub fn completed_shadow(s: &mut Scratch) -> Option<(usize, usize, &mut [u8])> {
         return None;
     }
     Some((h, out_w, &mut s.surface[..len]))
-}
-
-/// Publication state for a card that scans out its own memory — the Voodoo,
-/// whose RAMDAC clocks a complete frame at every buffer swap.
-///
-/// The card is handed the panel's own encoding (a [`voodoo::Dac`]) and writes
-/// packed destination pixels directly, exactly as the VGA path pre-encodes its
-/// DAC into the sink format before rendering. What arrives here is therefore just
-/// bytes, and publication is a row-per-row copy: no shadow to double-buffer
-/// (the frame is already complete), no scaling, no format conversion.
-pub struct NativeScanout {
-    /// One frame in destination format, `w × h` at `pitch` bytes. Write-back
-    /// memory: the panel is written once, by a linear copy per row.
-    surface: alloc::vec::Vec<u8>,
-    pitch: usize,
-    dac: voodoo::Dac,
-    /// Geometry the surface and the painted bars are armed for,
-    /// `(w, h, panel_w, panel_h)`.
-    geo: (usize, usize, usize, usize),
-    fmt: Option<PixelFormat>,
-}
-
-impl NativeScanout {
-    pub const fn new() -> NativeScanout {
-        NativeScanout {
-            surface: alloc::vec::Vec::new(),
-            pitch: 0,
-            dac: voodoo::Dac::native(),
-            geo: (0, 0, 0, 0),
-            fmt: None,
-        }
-    }
-
-    /// Arm for one frame of `w × h` on `fb`. False when the frame cannot be
-    /// shown — too big for the panel, which is reported once rather than
-    /// leaving a silently dead screen.
-    pub fn arm(&mut self, display: &Display, w: usize, h: usize) -> bool {
-        let Some(fb) = display.framebuffer() else { return false };
-        let format = display.rgb;
-        let geo = (w, h, fb.width, fb.height);
-        if w == 0 || h == 0 || w > fb.width || h > fb.height {
-            if self.geo != geo {
-                self.geo = geo;
-                crate::println!(
-                    "display: {}x{} card frame does not fit the {}x{} panel — not shown",
-                    w, h, fb.width, fb.height
-                );
-            }
-            return false;
-        }
-        if self.fmt != Some(format) {
-            self.fmt = Some(format);
-            self.dac = dac_for(format);
-        }
-        if self.geo != geo {
-            self.geo = geo;
-            self.pitch = w * format.bytes_per_pixel as usize;
-            self.surface.clear();
-            self.surface.resize(self.pitch * h, 0);
-            // Same contract as the VGA scanout: the bars around the picture
-            // are painted once, when the geometry is armed.
-            unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
-        }
-        true
-    }
-
-    /// Where the card writes this frame: destination pixels, row pitch, and
-    /// the encoding its DAC should clock them out in.
-    pub fn target(&mut self) -> (&mut [u8], usize, &voodoo::Dac) {
-        (&mut self.surface, self.pitch, &self.dac)
-    }
-
-    /// Copy the armed frame to the panel, centered. One linear copy per row.
-    pub fn publish(&self, display: &Display) {
-        let Some(fb) = display.framebuffer() else { return };
-        let format = display.rgb;
-        let (w, h) = (self.geo.0, self.geo.1);
-        let step = format.bytes_per_pixel as usize;
-        if h == 0 || self.surface.len() < self.pitch * h {
-            return;
-        }
-        let origin =
-            fb.va + ((fb.height - h) / 2) * fb.pitch + ((fb.width - w) / 2) * step;
-        for y in 0..h {
-            unsafe {
-                copy_bytes(
-                    (origin + y * fb.pitch) as *mut u8,
-                    self.surface[y * self.pitch..].as_ptr(),
-                    self.pitch,
-                    fb.wide,
-                );
-            }
-        }
-        publish(display);
-    }
-}
-
-impl Default for NativeScanout {
-    fn default() -> NativeScanout {
-        NativeScanout::new()
-    }
 }
 
 /// The panel's channel layout, as a card's DAC wants it stated.

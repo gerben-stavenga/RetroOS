@@ -13,6 +13,7 @@ pub enum BiosError {
     NoNativeBios,
     Rejected(u16),
     InvalidStateSize,
+    InvalidFrame,
     UnexpectedEvent,
 }
 
@@ -235,8 +236,119 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         Ok(())
     }
 
+    /// Publish a compact packed shadow through a VBE bank window. One
+    /// disposable BIOS execution space is kept active for the whole frame, so
+    /// the only repeated firmware operation is 4F05 itself; the address-space
+    /// fork/activation cost is paid once, not once per 64-KiB window.
+    pub fn present(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::NativeVga,
+        shadow_height: usize,
+        shadow: &[u8],
+    ) -> Result<usize, BiosError> {
+        let mode = match display {
+            crate::kernel::platform::NativeVga::Vbe { mode, bank: Some(_) } => *mode,
+            _ => return Err(BiosError::InvalidFrame),
+        };
+        let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
+            return Err(BiosError::InvalidFrame);
+        };
+        let (shadow_width, _) = crate::kernel::display::fit_vga(
+            usize::from(mode.width), usize::from(mode.height),
+        );
+        let step = usize::from(rgb.bytes_per_pixel);
+        let row_bytes = shadow_width.checked_mul(step).ok_or(BiosError::InvalidFrame)?;
+        let needed = row_bytes.checked_mul(shadow_height).ok_or(BiosError::InvalidFrame)?;
+        let panel_w = usize::from(mode.width);
+        let panel_h = usize::from(mode.height);
+        let pitch = usize::from(mode.pitch);
+        let granularity = usize::from(mode.window_granularity_kb) * 1024;
+        let window_size = usize::from(mode.window_size_kb) * 1024;
+        if shadow_height == 0 || shadow.len() < needed
+            || shadow_width > panel_w || row_bytes > pitch
+            || granularity == 0 || window_size == 0 || window_size % granularity != 0
+            || mode.window_segment == 0
+        {
+            return Err(BiosError::InvalidFrame);
+        }
+
+        let caller_space = machine.activate(
+            core::mem::take(&mut self.bios_vcpu.space),
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+        let mut call_space = A::PageTable::default();
+        machine.user_fork(&mut call_space);
+        let mut call_fx = machine.clean_fx_template();
+        self.bios_vcpu.space = machine.activate(
+            call_space,
+            &mut call_fx,
+            core::ptr::null_mut(),
+        );
+        crate::kernel::io_policy::apply_bios_display(machine, display);
+
+        let result = (|| {
+            let (out_w, out_h) = crate::kernel::display::fit_vga(panel_w, panel_h);
+            if shadow_width != out_w { return Err(BiosError::InvalidFrame); }
+            let bx = (panel_w - out_w) / 2;
+            let by = (panel_h - out_h) / 2;
+            let (ybase, yrem) = (out_h / shadow_height, out_h % shadow_height);
+            let aperture = usize::from(mode.window_segment) * 16;
+            let mut current_bank = None;
+            let mut oy = 0usize;
+            let mut yerr = 0usize;
+
+            for sy in 0..shadow_height {
+                yerr += yrem;
+                let carry = usize::from(yerr >= shadow_height);
+                let rows = ybase + carry;
+                yerr -= carry * shadow_height;
+                let src = &shadow[sy * row_bytes..(sy + 1) * row_bytes];
+                for _ in 0..rows {
+                    let mut source = src;
+                    let mut offset = (by + oy) * pitch + bx * step;
+                    while !source.is_empty() {
+                        let window_base = offset / window_size * window_size;
+                        let bank_usize = window_base / granularity;
+                        let bank = u16::try_from(bank_usize).map_err(|_| BiosError::InvalidFrame)?;
+                        if current_bank != Some(bank) {
+                            let mut regs = self.bios_vcpu.regs;
+                            crate::kernel::dos::prepare_bios_int10(machine, &mut regs);
+                            regs.rax = 0x4F05;
+                            regs.rbx = 0;
+                            regs.rdx = u64::from(bank);
+                            run_bios_int10(machine, &mut regs)?;
+                            let status = regs.rax as u16;
+                            if status != 0x004F { return Err(BiosError::Rejected(status)); }
+                            display.set_bank(bank);
+                            current_bank = Some(bank);
+                        }
+                        let inside = offset - window_base;
+                        let count = source.len().min(window_size - inside);
+                        machine.copy_to(aperture + inside, &source[..count]);
+                        source = &source[count..];
+                        offset += count;
+                    }
+                    oy += 1;
+                }
+            }
+            Ok(out_w * out_h)
+        })();
+
+        machine.free_user_pages();
+        let mut call_space = machine.activate(
+            caller_space,
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+        machine.destroy_space(&mut call_space);
+        machine.reset_io_bitmap();
+        result
+    }
+
     /// Enumerate the native ROM's VBE modes and choose a conservative packed
-    /// LFB for the host monitor. Discovery does not change the current mode.
+    /// display for the host monitor. Discovery does not change the current mode.
     pub fn discover_vbe(
         &mut self,
         machine: &mut A,
@@ -311,7 +423,10 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
             }
         }
 
-        // The OSD needs a useful packed surface, not the card's largest mode.
+        // The OSD needs a useful packed high-resolution surface. Within that
+        // class an LFB is strictly preferable to a bank window; only after the
+        // publication mechanism is chosen do we minimize framebuffer traffic.
+        // An indexed 8-bit mode never displaces a packed high-resolution mode.
         // Prefer the smallest mode that can contain every legacy VGA source.
         // Text scanout is 720 pixels wide because VGA repeats the ninth glyph
         // column; choosing a 640-wide VBE mode makes the direct scanout reject
@@ -319,15 +434,38 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         // usual VBE catalogue this selects 800x600, while still avoiding the
         // needless traffic of a 1024x768 surface on an old uncached LFB.
         self.modes = candidates;
-        self.modes.iter().copied()
+        let selected = self.modes.iter().copied()
             .filter(|m| matches!(m.format, crate::kernel::display::FormatSpec::Packed(_)))
-            .filter(|m| m.physical_base != 0)
             .filter(|m| m.width >= 720 && m.height >= 480)
-            .min_by_key(|m| u32::from(m.width) * u32::from(m.height))
+            .min_by_key(|m| (
+                m.physical_base == 0,
+                u32::from(m.pitch) * u32::from(m.height),
+            ))
             .or_else(|| self.modes.iter().copied()
                 .filter(|m| matches!(m.format, crate::kernel::display::FormatSpec::Packed(_)))
-                .filter(|m| m.physical_base != 0)
-                .min_by_key(|m| u32::from(m.width) * u32::from(m.height)))
+                .min_by_key(|m| (
+                    m.physical_base == 0,
+                    u32::from(m.pitch) * u32::from(m.height),
+                )));
+
+        crate::println!("VBE: {} available modes (* selected)", self.modes.len());
+        for mode in &self.modes {
+            crate::println!(
+                "VBE: {} {:#05x} {}x{}x{} pitch={} format={:?} phys={:#010x} bank={:04x}:{}K/{}K",
+                if Some(*mode) == selected { '*' } else { ' ' },
+                mode.number,
+                mode.width,
+                mode.height,
+                mode.bits_per_pixel,
+                mode.pitch,
+                mode.format,
+                mode.physical_base,
+                mode.window_segment,
+                mode.window_granularity_kb,
+                mode.window_size_kb,
+            );
+        }
+        selected
     }
 
     fn with_bios_clone<T, F, G>(
@@ -362,31 +500,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         crate::kernel::dos::prepare_bios_int10(machine, regs);
         configure(machine, regs);
         crate::kernel::io_policy::apply_bios_display(machine, bios_display);
-        let completed = loop {
-            let event = machine.execute(regs);
-            if crate::kernel::dos::bios_int10_returned(regs, &event) {
-                break Ok(());
-            }
-            match event {
-                // A hardware interrupt is merely a scheduling exit. The BIOS
-                // call is deliberately non-interruptible at the Rust level.
-                crate::KernelEvent::Irq => continue,
-                crate::KernelEvent::In { port, size } => {
-                    let (mask, value) = match size {
-                        IoSize::Byte => (0xFF, u64::from(machine.inb(port))),
-                        IoSize::Word => (0xFFFF, u64::from(machine.inw(port))),
-                        IoSize::Dword => (0xFFFF_FFFF, u64::from(machine.inl(port))),
-                    };
-                    regs.rax = (regs.rax & !mask) | value;
-                }
-                crate::KernelEvent::Out { port, size } => match size {
-                    IoSize::Byte => machine.outb(port, regs.rax as u8),
-                    IoSize::Word => machine.outw(port, regs.rax as u16),
-                    IoSize::Dword => machine.outl(port, regs.rax as u32),
-                },
-                _ => break Err(BiosError::UnexpectedEvent),
-            }
-        };
+        let completed = run_bios_int10(machine, regs);
 
         let result = completed.map(|()| collect(machine, regs));
 
@@ -405,6 +519,34 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     }
 }
 
+fn run_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) -> Result<(), BiosError> {
+    loop {
+        let event = machine.execute(regs);
+        if crate::kernel::dos::bios_int10_returned(regs, &event) {
+            return Ok(());
+        }
+        match event {
+            // A hardware interrupt is merely a scheduling exit. The BIOS call
+            // is deliberately non-interruptible at the Rust level.
+            crate::KernelEvent::Irq => {}
+            crate::KernelEvent::In { port, size } => {
+                let (mask, value) = match size {
+                    IoSize::Byte => (0xFF, u64::from(machine.inb(port))),
+                    IoSize::Word => (0xFFFF, u64::from(machine.inw(port))),
+                    IoSize::Dword => (0xFFFF_FFFF, u64::from(machine.inl(port))),
+                };
+                regs.rax = (regs.rax & !mask) | value;
+            }
+            crate::KernelEvent::Out { port, size } => match size {
+                IoSize::Byte => machine.outb(port, regs.rax as u8),
+                IoSize::Word => machine.outw(port, regs.rax as u16),
+                IoSize::Dword => machine.outl(port, regs.rax as u32),
+            },
+            _ => return Err(BiosError::UnexpectedEvent),
+        }
+    }
+}
+
 fn parse_vbe_mode<A: Arch>(
     machine: &A,
     address: usize,
@@ -418,9 +560,15 @@ fn parse_vbe_mode<A: Arch>(
     let width = machine.read::<u16>(address + 0x12);
     let height = machine.read::<u16>(address + 0x14);
     let bpp = machine.read::<u8>(address + 0x19);
-    let physical_base = machine.read::<u32>(address + 0x28);
+    let physical_base_raw = machine.read::<u32>(address + 0x28);
+    let linear = attributes & 0x0080 != 0 && physical_base_raw != 0;
+    let physical_base = if linear { physical_base_raw } else { 0 };
     let linear_pitch = machine.read::<u16>(address + 0x32);
-    let pitch = if linear_pitch != 0 { linear_pitch } else { machine.read::<u16>(address + 0x10) };
+    let pitch = if linear && linear_pitch != 0 {
+        linear_pitch
+    } else {
+        machine.read::<u16>(address + 0x10)
+    };
     let linear_fields = [
         machine.read::<u8>(address + 0x37), machine.read::<u8>(address + 0x36),
         machine.read::<u8>(address + 0x39), machine.read::<u8>(address + 0x38),
@@ -431,7 +579,7 @@ fn parse_vbe_mode<A: Arch>(
         machine.read::<u8>(address + 0x22), machine.read::<u8>(address + 0x21),
         machine.read::<u8>(address + 0x24), machine.read::<u8>(address + 0x23),
     ];
-    let fields = if linear_fields[1] != 0 { linear_fields } else { legacy_fields };
+    let fields = if linear && linear_fields[1] != 0 { linear_fields } else { legacy_fields };
     let format = if memory_model == 4 && bpp == 8 {
         crate::kernel::display::FormatSpec::Indexed8
     } else {
@@ -444,7 +592,13 @@ fn parse_vbe_mode<A: Arch>(
         crate::kernel::display::FormatSpec::Indexed8 => 1,
     };
     let window_segment = machine.read::<u16>(address + 0x08);
+    let window_attributes = machine.read::<u8>(address + 0x02);
+    let window_granularity_kb = machine.read::<u16>(address + 0x04);
+    let window_size_kb = machine.read::<u16>(address + 0x06);
     if width == 0 || height == 0 || (physical_base == 0 && window_segment == 0)
+        || (physical_base == 0
+            && (window_attributes & 0x05 != 0x05
+                || window_granularity_kb == 0 || window_size_kb == 0))
         || usize::from(pitch) < usize::from(width) * usize::from(bytes_per_pixel)
     {
         return None;
@@ -452,7 +606,7 @@ fn parse_vbe_mode<A: Arch>(
     Some(crate::kernel::platform::VbeMode {
         number, physical_base, width, height, pitch, bits_per_pixel: bpp, format,
         window_segment,
-        window_granularity_kb: machine.read::<u16>(address + 0x04),
-        window_size_kb: machine.read::<u16>(address + 0x06),
+        window_granularity_kb,
+        window_size_kb,
     })
 }

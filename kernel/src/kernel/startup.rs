@@ -42,7 +42,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .and_then(|native| bios_workspace.discover_vbe(machine, native));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
     let display = match display.into_native_vga(machine) {
-        Ok(native) => crate::kernel::display::Display::new_selected(
+        Ok(native) => crate::kernel::display::Display::new_console(
             machine, &mut bios_workspace, native),
         Err(display) => display,
     };
@@ -750,7 +750,9 @@ pub fn event_loop<A: crate::Arch>(
                 ticks as u64,
                 |machine, span| thread.personality.audio_tick(machine, span),
             );
-            thread.personality.display_tick(machine, &ctx.regs);
+            thread.personality.display_tick(
+                machine, bios_workspace.as_deref_mut(), &ctx.regs,
+            );
         }
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
@@ -845,7 +847,18 @@ fn dispatch<A: crate::Arch>(
     // Exit so `exit_thread` does all teardown and hands focus back to the
     // parent, the same path SEGV takes below.
     if crate::kernel::osd::take_kill_request() {
-        return thread::KernelAction::Exit(-9);
+        // DOS parents inspect AH=4Dh's termination type before deciding
+        // whether to adopt the child's farewell VGA snapshot. A Unix -9
+        // becomes FFF7h there, which looks neither normal nor like the 02h
+        // abnormal termination DN recognizes; it consequently adopted the
+        // killed program's incomplete screen over its own panels. Preserve
+        // Unix status for Linux, but encode a DOS critical termination so the
+        // parent reaps the child without replacing its display state.
+        let code = match thread.personality {
+            thread::Personality::Dos(_) => 0x0200,
+            thread::Personality::Linux(_) => -9,
+        };
+        return thread::KernelAction::Exit(code);
     }
     if let crate::KernelEvent::PageFault { addr } = kevent {
         // A VGA planar-trap access (A0000 unmapped while unchained graphics
@@ -860,8 +873,12 @@ fn dispatch<A: crate::Arch>(
             regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp, regs.frame.rsp);
         crate::println!("  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
             regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15);
+        let code = match thread.personality {
+            thread::Personality::Dos(_) => 0x020E, // type 02h, vector 0Eh (#PF)
+            thread::Personality::Linux(_) => -11,
+        };
         thread::signal_thread(thread, addr as usize);
-        return thread::KernelAction::Exit(-11);
+        return thread::KernelAction::Exit(code);
     }
     thread.personality.handle_event(machine, bios_display, &mut thread.kernel, regs, kevent)
 }
@@ -887,6 +904,24 @@ fn switch_focus_and_run<A: crate::Arch>(
 ) {
     if new_tid == ctx.tid {
         return;
+    }
+    // The monitor is tied to one console owner. A yield/scheduler switch can
+    // otherwise move focus while OPEN remains global: the incoming DOS owner
+    // materializes as Native, then the next monitor key tries to take an OSD
+    // Display from it and double-closes the ownership transition. Close and
+    // return the old owner's surface before the ordinary release/acquire.
+    if crate::kernel::osd::is_open() {
+        crate::kernel::osd::dismiss();
+        let old = thread::get_thread(threads, ctx.tid)
+            .expect("OSD dismissal: invalid old thread");
+        if old.kernel.state != thread::ThreadState::Zombie {
+            crate::kernel::console::restore_from_monitor(
+                machine,
+                bios_workspace.as_deref_mut(),
+                &mut ctx.regs,
+                &mut old.personality,
+            );
+        }
     }
     let display = {
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");

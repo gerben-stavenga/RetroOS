@@ -134,8 +134,9 @@ pub fn restore_from_monitor<A: crate::Arch>(
     personality: &mut thread::Personality<A>,
 ) {
     let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
-    let display = personality.take_display_for_osd();
-    personality.materialize_from_osd(machine, bios_workspace, display);
+    if let Some(display) = personality.take_display_for_osd() {
+        personality.materialize_from_osd(machine, bios_workspace, display);
+    }
 }
 
 /// Linux owner: keys → cooked fd input.

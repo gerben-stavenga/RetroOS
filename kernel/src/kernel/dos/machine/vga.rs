@@ -237,7 +237,9 @@ impl DosVga {
             }
             other => {
                 let (vga, display) = other.into_emulated(machine, Some(bios_workspace));
-                (vga, display.into_surface(machine, Some(bios_workspace)))
+                let display = display.into_surface(machine, Some(bios_workspace))
+                    .into_selected(machine, bios_workspace);
+                (vga, display)
             }
         }
     }

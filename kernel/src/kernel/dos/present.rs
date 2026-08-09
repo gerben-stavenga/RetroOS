@@ -7,7 +7,7 @@
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
 //! cards. Everything it names on the display side — `Display`,
-//! `Sink`, `Scratch`, `NativeScanout`, the OSD — is a capability or a
+//! `Sink`, `Scratch`, the OSD — is a capability or a
 //! sink the kernel owns; the machine below produces a picture and has no
 //! opinion about where it goes.
 
@@ -162,21 +162,99 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
     LAST.swap(frame, Ordering::Relaxed) != frame
 }
 
+/// The one completed-frame boundary for DOS display producers. A producer
+/// supplies packed pixels in the display's encoding; composition and
+/// publication are deliberately inseparable here so a new card cannot grow a
+/// private path which forgets the host monitor.
+fn present_shadow<A: crate::Arch>(
+    machine: &mut A,
+    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    display: &mut crate::kernel::display::Display,
+    shadow: &mut [u8],
+    width: usize,
+    height: usize,
+    osd_layout: (usize, usize),
+) -> usize {
+    debug_assert_eq!(display.shadow_width, width);
+    let format = display.rgb;
+    let stride = width * format.bytes_per_pixel as usize;
+    if crate::kernel::osd::is_open() {
+        let (logical_width, scale_y) = osd_layout;
+        crate::kernel::osd::paint(
+            shadow, stride, width, height, logical_width, scale_y, format,
+        );
+    }
+    display.present_native(machine, bios, height, shadow)
+}
+
+/// Use the allocation-free `Vec<u32>` frame store as packed 16/24/32-bit
+/// storage. The extra bytes in the final word are outside the returned frame.
+fn packed_frame(storage: &mut alloc::vec::Vec<u32>, bytes: usize) -> &mut [u8] {
+    storage.resize(bytes.div_ceil(4), 0);
+    unsafe {
+        core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, bytes)
+    }
+}
+
+/// Nearest-neighbour horizontal fit from a card-native packed frame into the
+/// display shadow. Vertical fitting remains `Display::present`'s job, exactly
+/// as it is for a VGA shadow.
+fn stretch_packed_rows(
+    src: &[u8],
+    src_w: usize,
+    dst: &mut [u8],
+    dst_w: usize,
+    height: usize,
+    step: usize,
+) {
+    let src_stride = src_w * step;
+    let dst_stride = dst_w * step;
+    if src_w == dst_w {
+        dst[..dst_stride * height].copy_from_slice(&src[..src_stride * height]);
+        return;
+    }
+    let base = src_w / dst_w;
+    let rem = src_w % dst_w;
+    for y in 0..height {
+        let src_row = &src[y * src_stride..(y + 1) * src_stride];
+        let dst_row = &mut dst[y * dst_stride..(y + 1) * dst_stride];
+        let (mut sx, mut err) = (0usize, 0usize);
+        for pixel in dst_row.chunks_exact_mut(step) {
+            pixel.copy_from_slice(&src_row[sx * step..(sx + 1) * step]);
+            sx += base;
+            err += rem;
+            if err >= dst_w {
+                sx += 1;
+                err -= dst_w;
+            }
+        }
+    }
+}
+
 /// Drive the Voodoo's display: report the vertical retrace it paces swaps on,
 /// and present a frame once one is ready. Returns true when the card owns the
 /// display, so the VGA path stands down.
 ///
 /// The retrace is the host's clock, handed to the card — it has none of its
 /// own, which is why a deferred `swapbufferCMD` needs this call to complete.
-fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
-    if pc.voodoo.linear_base.is_none() {
+fn voodoo_display_tick<A: crate::Arch>(
+    machine: &mut A,
+    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    pc: &mut PcMachine,
+    now_ticks: u64,
+) -> bool {
+    if !pc.voodoo.active() {
         return false;
     }
     // 60 Hz, the refresh Glide programs for every resolution we serve.
-    if frame_due(now_ticks, 60) {
+    let refresh_due = frame_due(now_ticks, 60);
+    if refresh_due {
         pc.voodoo.vblank();
     }
-    if !pc.voodoo.frame_ready {
+    // A newly opened or edited OSD must repaint even when the guest is
+    // sitting on a completed front buffer and no longer swapping.
+    let osd_open = crate::kernel::osd::is_open();
+    if !pc.voodoo.frame_ready && !(osd_open && refresh_due) {
         return true;
     }
     let (w, h) = pc.voodoo.dimensions();
@@ -195,31 +273,47 @@ fn voodoo_display_tick(pc: &mut PcMachine, now_ticks: u64) -> bool {
         DosVga::Transition => panic!("Voodoo scanout during VGA transition"),
     };
     if let Some(display) = display {
+        // Hosted windows track the card's native geometry. A framebuffer's
+        // shadow width was selected with its display mode and remains shared
+        // with VGA, so both sources receive the same physical fit.
         if display.is_host() {
             display.shadow_width = w;
-            let need = w * h;
-            pc.present_fb.resize(need, 0);
-            pc.present_fb.truncate(need);
-            let bytes = unsafe {
-                core::slice::from_raw_parts_mut(pc.present_fb.as_mut_ptr() as *mut u8, need * 4)
-            };
-            pc.voodoo.scanout(bytes, w * 4, &voodoo::Dac::native());
-            display.present(h, bytes);
-        } else if pc.voodoo_scanout.arm(display, w, h) {
-                let (out, pitch, dac) = pc.voodoo_scanout.target();
-                pc.voodoo.scanout(out, pitch, dac);
-                pc.voodoo_scanout.publish(display);
         }
+        let out_w = display.shadow_width;
+        let step = display.rgb.bytes_per_pixel as usize;
+        if out_w == 0 || w == 0 || h == 0 {
+            return true;
+        }
+
+        let dac = crate::kernel::display::dac_for(display.rgb);
+        let shadow_len = out_w * h * step;
+        let shadow = packed_frame(&mut pc.present_fb, shadow_len);
+        if out_w == w {
+            pc.voodoo.scanout(shadow, out_w * step, &dac);
+        } else {
+            let native_len = w * h * step;
+            pc.present_scratch.resize(native_len, 0);
+            pc.voodoo.scanout(&mut pc.present_scratch, w * step, &dac);
+            stretch_packed_rows(&pc.present_scratch, w, shadow, out_w, h, step);
+        }
+        let (logical_w, scale_y) = display.osd_shadow_layout(w, out_w, h);
+        present_shadow(machine, bios, display, shadow, out_w, h, (logical_w, scale_y));
     }
     true
 }
 
-pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &Regs, now_ticks: u64) {
+pub fn display_tick<A: crate::Arch>(
+    machine: &mut A,
+    mut bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    pc: &mut PcMachine,
+    regs: &Regs,
+    now_ticks: u64,
+) {
     
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
-    if voodoo_display_tick(pc, now_ticks) {
+    if voodoo_display_tick(machine, bios.as_deref_mut(), pc, now_ticks) {
         return;
     }
     // A real card scans out its own VRAM: there is no register file to read
@@ -271,23 +365,14 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 let (vga_h, out_w, shadow) =
                     crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
                         .expect("ready VGA shadow is missing");
-                if crate::kernel::osd::is_open() {
-                    let vga_w = ::vga::dimensions(mode).0;
-                    let format = display.rgb;
-                    let (logical_w, scale_y) =
-                        display.osd_shadow_layout(vga_w, out_w, vga_h);
-                    crate::kernel::osd::paint(
-                        shadow,
-                        out_w * format.bytes_per_pixel as usize,
-                        out_w,
-                        vga_h,
-                        logical_w,
-                        scale_y,
-                        format,
-                    );
-                }
+                let vga_w = ::vga::dimensions(mode).0;
+                let (logical_w, scale_y) =
+                    display.osd_shadow_layout(vga_w, out_w, vga_h);
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                let copied = display.present(vga_h, shadow);
+                let copied = present_shadow(
+                    machine, bios.as_deref_mut(), display, shadow,
+                    out_w, vga_h, (logical_w, scale_y),
+                );
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {
@@ -320,21 +405,13 @@ pub fn display_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     }
     let fb = &mut pc.present_fb[..need];
     ::vga::render(&frame, fb);
-    if crate::kernel::osd::is_open() {
-        let bytes = unsafe {
-            core::slice::from_raw_parts_mut(fb.as_mut_ptr() as *mut u8, fb.len() * 4)
-        };
-        crate::kernel::osd::paint(
-            bytes, w * 4, w, h, w, 1, ::vga::PixelFormat::NATIVE,
-        );
-    }
     let p2 = if prof { machine.rdtsc() } else { 0 };
     pc.present_fb.truncate(need);
     display.shadow_width = w;
     let bytes = unsafe {
-        core::slice::from_raw_parts(pc.present_fb.as_ptr() as *const u8, need * 4)
+        core::slice::from_raw_parts_mut(pc.present_fb.as_mut_ptr() as *mut u8, need * 4)
     };
-    display.present(h, bytes);
+    present_shadow(machine, bios, display, bytes, w, h, (w, 1));
     if prof {
         let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(

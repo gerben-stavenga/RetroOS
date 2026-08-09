@@ -233,10 +233,6 @@ pub struct PcMachine {
     /// Direct-display scanout scratch: palette, a completed WB shadow frame,
     /// and render/publish phase timing.
     pub present_scratch2: alloc::boxed::Box<crate::kernel::display::Scratch>,
-    /// Publication state for the Voodoo's native-RGB frames on a framebuffer
-    /// display. Separate from `present_scratch2`: that one starts from VGA
-    /// planes and a DAC, which the card's output has neither of.
-    pub voodoo_scanout: crate::kernel::display::NativeScanout,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
@@ -517,8 +513,6 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_scratch2)
                 .write(crate::kernel::display::Scratch::new_boxed());
-            core::ptr::addr_of_mut!((*p).voodoo_scanout)
-                .write(crate::kernel::display::NativeScanout::new());
             core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
             core::ptr::addr_of_mut!((*p).sb).write(SoundBlaster::new());
             core::ptr::addr_of_mut!((*p).gus).write(Gus::new());

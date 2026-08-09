@@ -50,7 +50,8 @@ pub struct Platform {
     /// thread came to mint its own copy of the machine's one card.
     pub audio_hw: AudioHw,
     pub firmware: Firmware,
-    /// Preferred packed linear mode advertised by the native video BIOS.
+    /// Preferred packed mode advertised by the native video BIOS. It may be a
+    /// linear framebuffer or a firmware-banked aperture.
     /// Discovered once at boot; selecting/mapping it still requires ownership
     /// of the `NativeVga` capability.
     pub vbe_mode: Option<VbeMode>,
@@ -485,11 +486,12 @@ pub fn set_vbe_mode(mode: Option<VbeMode>) {
     p.vbe_mode = mode;
     match mode {
         Some(m) => crate::println!(
-            "VBE: selected mode {:#x} {}x{} pitch={} phys={:#x}",
-            m.number, m.width, m.height, m.pitch, m.physical_base
+            "VBE: selected mode {:#x} {}x{} pitch={} phys={:#x} bank={:04x}:{}K/{}K",
+            m.number, m.width, m.height, m.pitch, m.physical_base,
+            m.window_segment, m.window_granularity_kb, m.window_size_kb,
         ),
         None if p.vga_passthrough => {
-            crate::println!("VBE: no usable packed linear mode; selected display is Mode 13h")
+            crate::println!("VBE: no usable packed mode; selected display is Mode 13h")
         }
         None => {}
     }

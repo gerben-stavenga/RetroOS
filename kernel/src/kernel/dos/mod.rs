@@ -1273,8 +1273,14 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// Render the emulated VGA to the platform display (no-op with a real card
 /// or no present sink). Each call is one display time slice; the absolute tick
 /// value is used only to notice when an inactive sweep has gone stale.
-pub fn display_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &Regs, now_ticks: u64) {
-    present::display_tick(machine, &mut dos.pc, regs, now_ticks);
+pub fn display_tick<A: crate::Arch>(
+    machine: &mut A,
+    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut thread::DosState<A>,
+    regs: &Regs,
+    now_ticks: u64,
+) {
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ticks);
 }
 
 /// Advance emulated audio playback and its guest-visible device events.
