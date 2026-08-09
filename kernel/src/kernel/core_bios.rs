@@ -236,6 +236,82 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         Ok(())
     }
 
+    /// Execute a native video-BIOS palette call with an optional caller buffer.
+    /// The ROM can only address its private real-mode workspace, so protected-
+    /// mode DOS buffers are bounced through [`STATE_BUFFER`]. `offset_in_di`
+    /// selects VBE's ES:DI convention; legacy AH=10h uses ES:DX.
+    pub fn bios_palette_call(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::NativeVga,
+        caller: &mut Regs,
+        buffer: Option<&mut [u8]>,
+        copy_to_bios: bool,
+        offset_in_di: bool,
+    ) -> Result<(), BiosError> {
+        if crate::kernel::platform::get().firmware
+            != crate::kernel::platform::Firmware::NativeBios
+        {
+            return Err(BiosError::NoNativeBios);
+        }
+        let len = buffer.as_ref().map_or(0, |b| b.len());
+        if len > Self::MAX_STATE_BYTES {
+            return Err(BiosError::InvalidStateSize);
+        }
+
+        let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let input_data = if copy_to_bios {
+            buffer.as_ref().map(|b| b.to_vec())
+        } else {
+            None
+        };
+        let mut regs = self.bios_vcpu.regs;
+        let output = self.with_bios_clone(
+            machine,
+            display,
+            &mut regs,
+            |machine, regs| {
+                regs.rax = input[0];
+                regs.rbx = input[1];
+                regs.rcx = input[2];
+                regs.rdx = input[3];
+                if len != 0 {
+                    if let Some(data) = input_data.as_deref() {
+                        machine.copy_to(Self::STATE_BUFFER, data);
+                    }
+                    regs.es = (Self::STATE_BUFFER >> 4) as u64;
+                    if offset_in_di {
+                        regs.rdi = (Self::STATE_BUFFER & 0xF) as u64;
+                    } else {
+                        regs.rdx = (Self::STATE_BUFFER & 0xF) as u64;
+                    }
+                }
+            },
+            |machine, _| {
+                let mut data = alloc::vec![0; len];
+                if len != 0 && !copy_to_bios {
+                    machine.copy_from(Self::STATE_BUFFER, &mut data);
+                }
+                data
+            },
+        )?;
+
+        // VBE reports status in AX. Legacy AH=10h/AL=15h additionally returns
+        // one DAC entry in DH/CH/CL. Do not leak the bounce-buffer offset back
+        // through DX/DI for pointer-bearing calls.
+        caller.rax = regs.rax;
+        if input[0] as u16 == 0x1015 {
+            caller.rcx = regs.rcx;
+            caller.rdx = regs.rdx;
+        }
+        if let Some(dst) = buffer
+            && !copy_to_bios
+        {
+            dst.copy_from_slice(&output);
+        }
+        Ok(())
+    }
+
     /// Publish a compact packed shadow through a VBE bank window. One
     /// disposable BIOS execution space is kept active for the whole frame, so
     /// the only repeated firmware operation is 4F05 itself; the address-space

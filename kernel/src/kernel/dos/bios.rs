@@ -811,7 +811,7 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
     }
 }
 
-fn int10<A: crate::Arch>(
+pub(super) fn int10<A: crate::Arch>(
     machine: &mut A,
     mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     dos: &mut super::DosState<A>,
@@ -979,9 +979,55 @@ fn int10<A: crate::Arch>(
             regs.rbx = (regs.rbx & !0xFF00) | ((page as u64) << 8);
         }
         0x10 => {
-            // Palette/DAC — forward to the AC/DAC ports so the platform's
-            // palette capture (and a real card on metal) sees one path.
-            match (ax & 0xFF) as u8 {
+            // A native card's firmware owns palette semantics: an SVGA or
+            // unusual legacy mode need not expose a plain VGA-compatible DAC.
+            // Bounce pointer-bearing PM calls through the ROM's private RM
+            // workspace. The substitute/emulated path below owns its ports.
+            let subfn = (ax & 0xFF) as u8;
+            if matches!(dos.pc.vga, super::machine::vga::DosVga::Native(_)) {
+                let (mut buffer, copy_to_bios, guest_dst) = match subfn {
+                    0x02 => {
+                        let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
+                        let mut data = alloc::vec![0; 17];
+                        machine.copy_from(tbl, &mut data);
+                        (data, true, None)
+                    }
+                    0x12 => {
+                        let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
+                        let mut data = alloc::vec![0; regs.rcx as u16 as usize * 3];
+                        machine.copy_from(tbl, &mut data);
+                        (data, true, None)
+                    }
+                    0x17 => {
+                        let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
+                        (alloc::vec![0; regs.rcx as u16 as usize * 3], false, Some(tbl))
+                    }
+                    _ => (alloc::vec![], true, None),
+                };
+                let called = if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.vga
+                    && let Some(workspace) = bios_display.as_deref_mut()
+                {
+                    workspace
+                        .bios_palette_call(
+                            machine,
+                            display,
+                            regs,
+                            (!buffer.is_empty()).then_some(buffer.as_mut_slice()),
+                            copy_to_bios,
+                            false,
+                        )
+                        .is_ok()
+                } else {
+                    false
+                };
+                if called
+                    && let Some(dst) = guest_dst
+                {
+                    machine.copy_to(dst, &buffer);
+                }
+                return;
+            }
+            match subfn {
                 0x00 => {
                     // Set one EGA palette (Attribute Controller) register:
                     // BL = register 0..15, BH = colour value. Keen recolours its
@@ -1006,7 +1052,7 @@ fn int10<A: crate::Arch>(
                     // Set all 16 palette registers + overscan: ES:DX → 17 bytes
                     // (0..15 = palette, 16 = overscan). Keen loads its title
                     // palette in one shot here.
-                    let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
+                    let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
                     let _ = emulate_inb(machine, &mut dos.pc, 0x3DA);
                     for i in 0..16u8 {
                         let b: u8 = machine.read(tbl + i as usize);
@@ -1043,7 +1089,7 @@ fn int10<A: crate::Arch>(
                 }
                 0x12 => {
                     // Set DAC block: BX=first, CX=count, ES:DX=RGB triples.
-                    let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
+                    let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
                     let n = (regs.rcx as u16 as usize) * 3;
                     let bx = regs.rbx as u8;
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C8, bx);
@@ -1066,7 +1112,7 @@ fn int10<A: crate::Arch>(
                 }
                 0x17 => {
                     // Read DAC block: BX=first, CX=count → ES:DX RGB triples.
-                    let tbl = ((regs.es as u16 as usize) << 4) + regs.rdx as u16 as usize;
+                    let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
                     let n = (regs.rcx as u16 as usize) * 3;
                     let bx = regs.rbx as u8;
                     emulate_outb(machine, &mut dos.pc, regs, 0x3C7, bx);
@@ -1092,7 +1138,7 @@ fn int10<A: crate::Arch>(
                 regs.rbx = (regs.rbx & !0xFFFF) | 0x0008; // VGA, colour analog
             }
         }
-        0x1B => state_info(machine, regs),
+        0x1B => state_info(machine, dos, regs),
         0x4F => vbe(machine, bios_display, dos, regs),
         _ => {}
     }
@@ -1105,11 +1151,11 @@ fn int10<A: crate::Arch>(
 /// all-zero block (i.e. an unserviced function) means "no VGA", and it drops to
 /// its EGA path with the worse palette. DOS never chains this service to a
 /// platform ROM, so an unimplemented AH=1Bh is an all-zero block.
-fn state_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+fn state_info<A: crate::Arch>(machine: &mut A, dos: &super::DosState<A>, regs: &mut Regs) {
     if regs.rbx as u16 != 0 {
         return; // BX=0 is the only defined implementation type
     }
-    let lin = es_di(regs);
+    let lin = es_offset(dos, regs, regs.rdi as u16 as u32);
     machine.copy_to(lin, &[0u8; 64]);
     let mode: u8 = bda_field!(machine, video_mode);
     let columns: u16 = bda_field!(machine, columns);
@@ -1203,7 +1249,7 @@ fn vbe<A: crate::Arch>(
             let native_modes = matches!(dos.pc.vga, super::machine::vga::DosVga::Native(_))
                 .then(|| bios_display.as_deref().map(|workspace| workspace.modes()))
                 .flatten();
-            vbe_controller_info(machine, regs, native_modes);
+            vbe_controller_info(machine, dos, regs, native_modes);
             done(regs, true);
         }
         0x01 => {
@@ -1212,7 +1258,7 @@ fn vbe<A: crate::Arch>(
             } else {
                 None
             };
-            let ok = vbe_mode_info(machine, regs, native_mode);
+            let ok = vbe_mode_info(machine, dos, regs, native_mode);
             done(regs, ok);
         }
         0x02 => {
@@ -1240,7 +1286,10 @@ fn vbe<A: crate::Arch>(
             done(regs, ok);
         }
         0x08 => { vbe_dac_format(regs); done(regs, true); }
-        0x09 => { let ok = vbe_palette(machine, dos, regs); done(regs, ok); }
+        0x09 => {
+            let ok = vbe_palette(machine, bios_display.as_deref_mut(), dos, regs);
+            done(regs, ok);
+        }
         _ => done(regs, false),
     }
 }
@@ -1254,10 +1303,46 @@ fn vbe_dac_format(regs: &mut Regs) {
 /// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
 /// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
 /// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
-fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) -> bool {
+fn vbe_palette<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) -> bool {
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u8;
-    let tbl = es_di(regs);
+    let tbl = es_offset(dos, regs, regs.rdi as u32);
+    if matches!(dos.pc.vga, super::machine::vga::DosVga::Native(_)) {
+        let copy_to_bios = match regs.rbx as u8 {
+            0x00 | 0x80 => true,
+            0x01 => false,
+            _ => return false,
+        };
+        let mut data = alloc::vec![0; count * 4];
+        if copy_to_bios {
+            machine.copy_from(tbl, &mut data);
+        }
+        let ok = if let super::machine::vga::DosVga::Native(display) = &mut dos.pc.vga
+            && let Some(workspace) = bios_display
+        {
+            workspace
+                .bios_palette_call(
+                    machine,
+                    display,
+                    regs,
+                    (!data.is_empty()).then_some(data.as_mut_slice()),
+                    copy_to_bios,
+                    true,
+                )
+                .is_ok()
+        } else {
+            false
+        };
+        if ok && !copy_to_bios {
+            machine.copy_to(tbl, &data);
+        }
+        return ok;
+    }
     match regs.rbx as u8 {
         0x00 | 0x80 => {
             // Set (00h) / set-during-retrace (80h): we apply immediately.
@@ -1290,19 +1375,27 @@ fn vbe_palette<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, re
     }
 }
 
-/// Linear address of the caller's ES:DI block (real-mode VBE buffers).
-fn es_di(regs: &Regs) -> usize {
-    ((regs.es as usize & 0xFFFF) << 4) + (regs.rdi as usize & 0xFFFF)
+/// Resolve an INT 10h ES:offset buffer. Real-mode callers pass paragraphs;
+/// protected-mode callers reach the direct-service vector with their selector
+/// intact, so use its LDT descriptor base.
+fn es_offset<A: crate::Arch>(dos: &super::DosState<A>, regs: &Regs, off: u32) -> usize {
+    if regs.mode() == crate::UserMode::VM86 {
+        (((regs.es as u16 as u32) << 4).wrapping_add(off & 0xFFFF) & !(1 << 20)) as usize
+    } else {
+        super::mode_transitions::seg_base(&dos.ldt[..], regs.es as u16)
+            .wrapping_add(off) as usize
+    }
 }
 
 /// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
 /// block's reserved area and pointed at by VideoModePtr.
 fn vbe_controller_info<A: crate::Arch>(
     machine: &mut A,
+    dos: &super::DosState<A>,
     regs: &mut Regs,
     native_modes: Option<&[crate::kernel::platform::VbeMode]>,
 ) {
-    let lin = es_di(regs);
+    let lin = es_offset(dos, regs, regs.rdi as u32);
     for i in (0..256).step_by(4) {
         machine.write::<u32>(lin + i, 0);
     }
@@ -1333,6 +1426,7 @@ fn vbe_controller_info<A: crate::Arch>(
 /// VBE 4F01h — mode info for CX into ES:DI. Returns false for an unknown mode.
 fn vbe_mode_info<A: crate::Arch>(
     machine: &mut A,
+    dos: &super::DosState<A>,
     regs: &mut Regs,
     native_mode: Option<crate::kernel::platform::VbeMode>,
 ) -> bool {
@@ -1364,7 +1458,7 @@ fn vbe_mode_info<A: crate::Arch>(
     } else {
         return false;
     };
-    let lin = es_di(regs);
+    let lin = es_offset(dos, regs, regs.rdi as u32);
     for i in (0..256).step_by(4) {
         machine.write::<u32>(lin + i, 0);
     }

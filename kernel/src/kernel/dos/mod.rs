@@ -83,7 +83,7 @@ use dos::{
     SLOT_RAW_REAL_TO_PM,
     SLOT_CB_ENTRY_BASE, SLOT_CB_ENTRY_END,
     SLOT_SAVE_RESTORE, SLOT_EXCEPTION_RET, SLOT_EXCEPTION_RET_V10, SLOT_PM_TO_REAL,
-    SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
+    SLOT_PMDOS_INT10, SLOT_PMDOS_INT21, SLOT_PMDOS_INT33, SLOT_MOUSE_CB_RET,
     slot_offset, ctrl_slot_off,
     host_stack_base, host_stack_size, host_stack_empty_sp,
     EXC_STACK_TOP, EXC_STACK_SLOT,
@@ -562,7 +562,7 @@ pub fn syscall<A: crate::Arch>(
         (UserMode::VM86, dos::CTRL_STUB_SEG)    => dos::rm_ctrl_dispatch(machine, kt, dos, regs),
         (UserMode::VM86, _)                     => dos::rm_native_syscall(machine, kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
-        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, kt, dos, regs),
+        (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, bios_display, kt, dos, regs),
         _                                       => dpmi::dpmi_api(machine, dos, regs),
     }
 }

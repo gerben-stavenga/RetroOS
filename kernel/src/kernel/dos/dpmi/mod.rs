@@ -140,6 +140,14 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
         dos::STUB_BASE + dos::slot_offset(dos::SLOT_PMDOS_INT33) as u32,
     );
 
+    // Video BIOS calls also need their PM register image intact: pointer-
+    // bearing functions pass protected-mode selectors in ES. Direct service
+    // lets INT 10h resolve those buffers through the client LDT.
+    dos.pm_vectors[0x10] = (
+        super::mode_transitions::SPECIAL_STUB_SEL,
+        dos::STUB_BASE + dos::slot_offset(dos::SLOT_PMDOS_INT10) as u32,
+    );
+
     // No arch_load_ldt here: `dos.ldt` is a fixed per-thread buffer allocated
     // at thread init, and the context switch into this thread already pointed
     // LDTR at it. Mutations to `dos.ldt[CLIENT_CS/DS/SS]` are visible to the

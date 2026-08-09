@@ -474,6 +474,23 @@ pub(super) fn pmdos_int33_handler<A: crate::Arch>(machine: &mut A, dos: &mut thr
     thread::KernelAction::Done
 }
 
+/// PM INT 10h direct-service path. Video BIOS calls commonly carry buffers in
+/// ES:DI or ES:DX; keeping the client in protected mode lets the BIOS handler
+/// resolve those selectors through the LDT instead of mistaking them for
+/// real-mode paragraphs during generic interrupt reflection.
+pub(super) fn pmdos_int10_handler<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    super::bios::int10(machine, bios_display, dos, regs);
+    if dos.pending_resume.is_none() {
+        finish_dos_call(machine, dos, regs);
+    }
+    thread::KernelAction::Done
+}
+
 /// Resume the user after a kernel-serviced DOS call. Mode-aware: the call
 /// might have flipped mode (AH=4B EXEC sets up a VM86 child, AH=4C/31
 /// restores parent which may be VM86 or PM), so check `regs.mode()`
@@ -4048,6 +4065,8 @@ pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
 /// records `cb_is_pm`) and read `ES:DX` as a real selector:offset. The RM-side
 /// INT 33h still routes through STUB_SEG slot 0x33 (the IVT redirect).
 pub(crate) const SLOT_PMDOS_INT33: u8 = 0xFA;
+/// PM INT 10h direct service; see [`pmdos_int10_handler`].
+pub(crate) const SLOT_PMDOS_INT10: u8 = 0xF9;
 /// Single continuation return target. Reflected INTs, explicit DPMI RM calls,
 /// PM callback returns, and PM IRQ unwind all land here after their far return
 /// or IRET. `mode_transitions::resume_continuation_from_stub` pops the captured
