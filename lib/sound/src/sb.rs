@@ -219,11 +219,11 @@ pub struct Fetch {
 
 /// The DSP state a real Sound Blaster will not tell you.
 ///
-/// Every field here is set by a write-only command — rate (0x40 time constant
-/// or 0x41 direct), block size (0x48), the transfer format carried by the
-/// start command itself, and speaker enable (0xD1/0xD3). None of it reads back
-/// off silicon, so a card that changes hands can only be restored from a model
-/// that watched the writes go past. That is what this carries.
+/// Rate (0x40 time constant or 0x41 direct), block size (0x48), and the
+/// transfer format carried by the start command do not read back off silicon.
+/// The D1h/D3h status flag is the lone exception (D8h reports it). A card that
+/// changes hands can therefore only be restored from a model that watched the
+/// writes go past. That is what this carries.
 #[derive(Clone, Copy, Debug)]
 pub struct DspState {
     pub rate: u32,
@@ -282,12 +282,15 @@ pub struct Sb {
     /// (PoP 1.0 then drops sound entirely, AdLib included).
     trigger_irq: u8,
 
-    /// DSP 0xD1/0xD3 speaker enable. Write-only on real silicon — it cannot
-    /// be read back — so this model is the only record of it, and a card
-    /// handed to a new owner is programmed from here.
+    /// DSP 0xD1/0xD3 speaker-status flag. On the DSP 4.xx we expose it has no
+    /// effect on PCM output; D8h merely reports it. It is write-only except
+    /// through that command, so retain it when a card changes owner.
     speaker: bool,
     /// True between a `start playback` command and a stop/reset.
     playing: bool,
+    /// Paused by D0h/D5h and eligible for D4h/D6h continuation. This is not
+    /// synonymous with idle: an exited auto-init transfer must stay stopped.
+    paused: bool,
     rate: u32,        // output sample rate (Hz)
     bits: u8,         // 8 or 16
     stereo: bool,     // false = mono, true = interleaved L/R
@@ -360,7 +363,8 @@ impl Sb {
             reset_prev: 0, test_reg: 0,
             mixer_index: 0, mixer: Mixer::new(), irq_status: 0, trigger_irq: 0,
             speaker: false,
-            playing: false, rate: 22050, bits: 8, stereo: false, block_param: 0,
+            playing: false, paused: false,
+            rate: 22050, bits: 8, stereo: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
@@ -475,6 +479,7 @@ impl Sb {
                 // DSP reset: a 1→0 edge triggers the reset handshake.
                 if self.reset_prev == 1 && val == 0 {
                     self.playing = false;
+                    self.paused = false;
                     self.stream_hold = false;
                     // This resets only the SB DSP. The canonical sink is
                     // shared: GUS music or OPL may still be contributing, so
@@ -537,16 +542,27 @@ impl Sb {
             0xE8 => self.push_out(self.test_reg), // read test register back
             0xF2 => self.trigger_irq |= 0x01,    // trigger 8-bit IRQ (IRQ probe)
             0xF3 => self.trigger_irq |= 0x02,    // trigger 16-bit IRQ
-            0xD1 => self.speaker = true,         // speaker on
-            0xD4 => {}                           // continue DMA
-            0xD0 | 0xD3 | 0xD9 | 0xDA => {
-                if cmd == 0xD3 {
-                    self.speaker = false;
+            // On DSP 4.xx these only change the flag reported by D8h; unlike
+            // older cards, neither command gates output or pauses DMA.
+            0xD1 => self.speaker = true,
+            0xD3 => self.speaker = false,
+            0xD8 => self.push_out(if self.speaker { 0xFF } else { 0x00 }),
+            0xD0 | 0xD5 => {                     // pause 8-/16-bit DMA
+                if self.playing {
+                    self.playing = false;
+                    self.paused = true;
                 }
-                // Pause / speaker off / exit auto-init: playback stops, but the
-                // stream is held open through the hangover — effect chains
-                // pause-and-restart every animation frame.
+            }
+            0xD4 | 0xD6 => {                     // continue 8-/16-bit DMA
+                if self.paused {
+                    self.playing = true;
+                    self.paused = false;
+                    self.stream_hold = true;
+                }
+            }
+            0xD9 | 0xDA => {                     // exit 16-/8-bit auto-init
                 self.playing = false;
+                self.paused = false;
                 self.done_ms = now;
             }
             0x40 => {
@@ -577,13 +593,15 @@ impl Sb {
             0x91 => {
                 return Some(Start { bits: 8, stereo: false, single: true, block_override: None });
             }
-            // SB16 8-/16-bit output: mode byte + 16-bit length; bit1 = auto-init,
-            // its absence = single-cycle. (0xC8.., 0xB8.. are input/ADC — ignored.)
+            // SB16 8-/16-bit output: mode byte + 16-bit length. Opcode bit 2
+            // selects auto-init; bit 1 independently enables FIFO. HMI uses
+            // B4h (auto-init without FIFO), while newer drivers often use B6h.
+            // (0xC8.., 0xB8.. are input/ADC — ignored.)
             0xC0..=0xC7 => {
                 return Some(Start {
                     bits: 8,
                     stereo: p[0] & 0x20 != 0,
-                    single: cmd & 0x02 == 0,
+                    single: cmd & 0x04 == 0,
                     block_override: Some((p[1] as u16) | ((p[2] as u16) << 8)),
                 });
             }
@@ -591,7 +609,7 @@ impl Sb {
                 return Some(Start {
                     bits: 16,
                     stereo: p[0] & 0x20 != 0,
-                    single: cmd & 0x02 == 0,
+                    single: cmd & 0x04 == 0,
                     block_override: Some((p[1] as u16) | ((p[2] as u16) << 8)),
                 });
             }
@@ -609,6 +627,7 @@ impl Sb {
         self.bits = s.bits;
         self.stereo = s.stereo;
         self.single = s.single;
+        self.paused = false;
         if let Some(b) = s.block_override {
             self.block_param = b;
         }
@@ -741,6 +760,7 @@ impl Sb {
     /// the cursor lands exactly on the count and TC latches as before.
     fn finish_single(&mut self, now: u64) {
         self.playing = false;
+        self.paused = false;
         self.done_ms = now;
         if self.cursor < self.buf_frames as u64 {
             return; // DSP stopped short; the controller is still counting
@@ -829,6 +849,7 @@ impl Sb {
 
     pub fn reset_for_exit(&mut self) {
         self.playing = false;
+        self.paused = false;
         self.stream_hold = false;
         self.out_len = 0;
         self.cmd = None;
@@ -1029,6 +1050,66 @@ pub fn new_boxed() -> Box<Sb> {
 #[cfg(test)]
 mod tests {
     use super::{Sb, Start};
+
+    fn sb16_command(sb: &mut Sb, command: u8) -> Start {
+        let dsp = sb.io_base + 0x0C;
+        assert!(sb.port_write(dsp, command, 0).is_none());
+        assert!(sb.port_write(dsp, 0x30, 0).is_none()); // signed stereo
+        assert!(sb.port_write(dsp, 0xFF, 0).is_none());
+        sb.port_write(dsp, 0x03, 0).expect("SB16 start command did not complete")
+    }
+
+    #[test]
+    fn sb16_auto_init_bit_is_independent_of_fifo_bit() {
+        let mut sb = Sb::new();
+        let hmi = sb16_command(&mut sb, 0xB4); // auto-init, FIFO disabled
+        assert_eq!(hmi.bits, 16);
+        assert!(!hmi.single, "HMI B4h must remain an auto-init stream");
+
+        let fifo_single = sb16_command(&mut sb, 0xB2); // single-cycle, FIFO enabled
+        assert!(fifo_single.single, "FIFO enable must not imply auto-init");
+
+        let auto8 = sb16_command(&mut sb, 0xC4);
+        assert_eq!(auto8.bits, 8);
+        assert!(!auto8.single);
+    }
+
+    #[test]
+    fn hmi_16_bit_pause_and_continue_preserve_the_stream() {
+        let mut sb = Sb::new();
+        let start = sb16_command(&mut sb, 0xB4);
+        sb.begin(start, 0x1000, 4096);
+        assert!(sb.playing());
+
+        let dsp = sb.io_base + 0x0C;
+        sb.port_write(dsp, 0xD3, 1);
+        assert!(sb.playing(), "speaker-off must not stop DMA");
+        sb.port_write(dsp, 0xD8, 1);
+        assert_eq!(sb.port_read(sb.io_base + 0x0A), 0x00);
+
+        // DSP 4.xx keeps producing PCM while its legacy speaker-status flag
+        // is off. Tomb's HMI driver starts its B4h stream before a later D1h.
+        let fetch = sb.dsp_fetch(0, 0).expect("running stream must fetch");
+        let mut mixed = [(0, 0)];
+        sb.mix_dsp(
+            0,
+            1 << 32,
+            &[0xFF, 0x7F, 0xFF, 0x7F],
+            &fetch,
+            &mut mixed,
+        );
+        assert_ne!(mixed[0], (0, 0), "D3h must not mute DSP 4.xx PCM");
+
+        sb.port_write(dsp, 0xD5, 2);
+        assert!(!sb.playing());
+        sb.port_write(dsp, 0xD6, 3);
+        assert!(sb.playing());
+
+        sb.port_write(dsp, 0xD9, 4);
+        assert!(!sb.playing());
+        sb.port_write(dsp, 0xD6, 5);
+        assert!(!sb.playing(), "continue must not resurrect an exited auto-init stream");
+    }
 
     /// A DSP told to move fewer transfers than the 8237 was armed for must
     /// NOT produce a terminal count: the controller is still counting, and on
