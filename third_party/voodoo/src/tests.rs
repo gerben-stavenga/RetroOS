@@ -463,6 +463,30 @@ fn flat_top_triangle_from_glide_registers() {
     assert!(lit > 500, "the triangle covered {lit} pixels");
 }
 
+#[test]
+fn float_vertices_have_the_physical_12_4_register_width() {
+    let mut c = Card::boot();
+    c.w(fbzColorPath, 2); // cc_rgbselect = color1
+    c.w(color1, 0x00_ff_ff_ff);
+    c.w(alphaMode, 0);
+    c.w(fogMode, 0);
+    c.w(fbzMode, 1 << 9); // RGB write to the front buffer
+
+    // The Glide splash pre-biases coordinates this way to snap them. SST-1
+    // discards the bias when FvA/B/C enter their 16-bit 12.4 registers.
+    let bias = (3 << 18) as f32;
+    c.w(fvertexAx, (bias + 10.0).to_bits());
+    c.w(fvertexAy, (bias + 10.0).to_bits());
+    c.w(fvertexBx, (bias + 50.0).to_bits());
+    c.w(fvertexBy, (bias + 10.0).to_bits());
+    c.w(fvertexCx, (bias + 10.0).to_bits());
+    c.w(fvertexCy, (bias + 50.0).to_bits());
+    c.w(ftriangleCMD, 1.0f32.to_bits());
+
+    let lit = c.frame().iter().filter(|p| **p != 0).count();
+    assert!(lit > 700, "the biased triangle covered {lit} pixels");
+}
+
 /// The two colour paths Glide's `test17` uses for its DECAL texture mode:
 /// the one it starts in, and the one it lands on after cycling the lighting
 /// modes back around. Both are decal by construction — `cc_mselect = 0` with

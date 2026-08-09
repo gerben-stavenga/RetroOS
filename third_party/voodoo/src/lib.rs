@@ -433,7 +433,11 @@ impl Voodoo {
             // Vertex data is 12.4 fixed point.
             vertexAx..=vertexCy | fvertexAx..=fvertexCy => {
                 let (regnum, v) = if regnum >= fvertexAx {
-                    (regnum - 0x20, float_to_int32(data, 4))
+                    // The floating aliases feed the same physical 16-bit
+                    // 12.4 registers. Glide relies on that width for its
+                    // snapping trick: it adds 3<<18 to a coordinate and the
+                    // bias disappears at this truncation boundary.
+                    (regnum - 0x20, float_to_int32(data, 4) as i16 as i32)
                 } else {
                     (regnum, data as i16 as i32)
                 };
