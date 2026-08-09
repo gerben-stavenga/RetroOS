@@ -295,6 +295,10 @@ struct Vfs {
     /// Global file table — slot is free when refcount == 0.
     file_table: [FileEntry; MAX_OPEN_FILES],
     dir_cache: DirCache,
+    /// Changes whenever directory-visible metadata may have changed. DOS's
+    /// 8.3 cache keys off this so a file grown after create is not forever
+    /// reported with its original zero size.
+    dir_generation: u64,
 }
 
 impl Vfs {
@@ -315,6 +319,7 @@ impl Vfs {
             ram_files: BTreeMap::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
             dir_cache: DirCache::new(),
+            dir_generation: 0,
         }
     }
 
@@ -546,6 +551,7 @@ impl Vfs {
 
     fn invalidate_dir_cache(&mut self) {
         self.dir_cache.valid = false;
+        self.dir_generation = self.dir_generation.wrapping_add(1);
     }
 
     /// Populate the directory cache for `dir` (single pass). Layers, top to
@@ -840,6 +846,7 @@ impl Vfs {
                 let new_size = file_data.len() as u32;
                 self.file_table[h].offset = end as u32;
                 self.file_table[h].vnode.size = new_size;
+                self.invalidate_dir_cache();
                 return data.len() as i32;
             }
             return -9;
@@ -857,6 +864,7 @@ impl Vfs {
             let e = &mut self.file_table[h];
             e.offset += n as u32;
             if e.offset > e.vnode.size { e.vnode.size = e.offset; }
+            self.invalidate_dir_cache();
         }
         n
     }
@@ -1163,6 +1171,11 @@ pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
 /// Enumerate directory entries at index. Uses a single-pass cache.
 pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
     VFS.lock().readdir(dir, index)
+}
+
+/// Namespace/metadata generation used by personality-level directory caches.
+pub fn directory_generation() -> u64 {
+    VFS.lock().dir_generation
 }
 
 /// Check if a directory exists on a mounted filesystem.

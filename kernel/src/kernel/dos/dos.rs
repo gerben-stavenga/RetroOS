@@ -2241,10 +2241,39 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         }
         // AH=0x67: Set Handle Count
         0x67 => {
-            let requested = regs.rbx as u16;
-            if requested as usize <= PSP_JFT_LEN {
-                Psp::set_max_files(machine, psp_struct_seg(dos), requested);
+            let requested = (regs.rbx as u16) as usize;
+            let psp_seg = psp_struct_seg(dos);
+            // The PSP always has room for its original 20 handles. DOS treats
+            // requests at or below that size as successful no-ops.
+            if requested <= PSP_JFT_LEN {
                 regs.clear_flag32(1);
+            } else if requested <= thread::MAX_FDS {
+                let old_count = Psp::max_files(machine, psp_seg) as usize;
+                let old_addr = Psp::jft_addr(machine, psp_seg);
+                let old_external_seg = Psp::external_jft_seg(machine, psp_seg);
+                let paras = requested.div_ceil(16) as u16;
+
+                match dos_alloc_block(machine, dos, regs, paras) {
+                    Ok(new_seg) => {
+                        let new_addr = (new_seg as usize) << 4;
+                        for i in 0..requested {
+                            machine.write::<u8>(new_addr + i, 0xFF);
+                        }
+                        for i in 0..old_count.min(requested) {
+                            let entry = machine.read::<u8>(old_addr + i);
+                            machine.write::<u8>(new_addr + i, entry);
+                        }
+                        Psp::set_jft_location(machine, psp_seg, requested as u16, 0, new_seg);
+                        if let Some(old_seg) = old_external_seg {
+                            let _ = dos_free_block(machine, dos, regs, old_seg);
+                        }
+                        regs.clear_flag32(1);
+                    }
+                    Err(_) => {
+                        regs.rax = (regs.rax & !0xFFFF) | 8;
+                        regs.set_flag32(1);
+                    }
+                }
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 8; // insufficient memory for an external JFT
                 regs.set_flag32(1);
@@ -3572,13 +3601,11 @@ const LOW_MEM_BASE: u32 = 0x500;
 const NUM_DRIVES: u8 = 8;
 const SFT_ENTRIES: usize = 20;
 
-/// Entries in the PSP's inline Job File Table — and so the most handles a DOS
-/// process can hold without asking for an external JFT via AH=67.
-///
-/// The single definition of that limit, consulted only by [`Psp::set_jft`].
+/// Entries in the PSP's inline Job File Table. AH=67h can replace it with an
+/// allocated external table and update PSP:34h to point there.
 pub(crate) const PSP_JFT_LEN: usize = 20;
 
-/// A handle with no slot in the PSP's inline Job File Table.
+/// A handle with no slot in the process's active Job File Table.
 ///
 /// A caller that has just opened, created or duplicated a file must treat this
 /// as fatal for that handle: DOS has nowhere to record it, so as far as the
@@ -3632,18 +3659,46 @@ impl Psp {
     pub fn env_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
         machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, env_seg))
     }
-    /// Record one Job File Table entry (PSP[0x18 + idx]).
+    /// Linear address of the process's active Job File Table.
+    pub fn jft_addr<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> usize {
+        let base = Self::base(psp_seg);
+        let off = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_off)) as usize;
+        let seg = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_seg)) as usize;
+        (seg << 4) + off
+    }
+
+    /// Current capacity of the active JFT.
+    pub fn max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> u16 {
+        machine.read::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files))
+    }
+
+    /// Segment of an AH=67h-allocated JFT, if the inline table is not active.
+    pub fn external_jft_seg<A: crate::Arch>(machine: &mut A, psp_seg: u16) -> Option<u16> {
+        let base = Self::base(psp_seg);
+        let off = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_off));
+        let seg = machine.read::<u16>(base + core::mem::offset_of!(Self, jft_far_seg));
+        if off == 0x0018 && seg == psp_seg { None } else { Some(seg) }
+    }
+
+    /// Select a new active JFT and publish its capacity in the PSP.
+    pub fn set_jft_location<A: crate::Arch>(machine: &mut A, psp_seg: u16, count: u16, off: u16, seg: u16) {
+        let base = Self::base(psp_seg);
+        machine.write::<u16>(base + core::mem::offset_of!(Self, max_files), count);
+        machine.write::<u16>(base + core::mem::offset_of!(Self, jft_far_off), off);
+        machine.write::<u16>(base + core::mem::offset_of!(Self, jft_far_seg), seg);
+    }
+
+    /// Record one entry in the process's active Job File Table.
     ///
-    /// `Err(JftFull)` when the handle has no slot in the table. Writing anyway
-    /// would run off the 20-byte `jft` array onto the PSP fields behind it, so
-    /// this is the one place the bound is checked — and returning it rather
-    /// than swallowing it is what makes callers that are *recording* a handle
-    /// deal with a handle DOS cannot represent.
+    /// `Err(JftFull)` when the handle has no slot in the table. This is the one
+    /// place the active table's bound is checked, so callers that are recording
+    /// a handle must deal with a handle DOS cannot represent.
     pub fn set_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize, val: u8)
         -> Result<(), JftFull>
     {
-        if idx >= PSP_JFT_LEN { return Err(JftFull); }
-        machine.write::<u8>(Self::base(psp_seg) + core::mem::offset_of!(Self, jft) + idx, val);
+        if idx >= Self::max_files(machine, psp_seg) as usize { return Err(JftFull); }
+        let addr = Self::jft_addr(machine, psp_seg) + idx;
+        machine.write::<u8>(addr, val);
         Ok(())
     }
 
@@ -3656,10 +3711,6 @@ impl Psp {
     /// clear, so the write is skipped and the close still succeeds.
     pub fn clear_jft<A: crate::Arch>(machine: &mut A, psp_seg: u16, idx: usize) {
         let _ = Self::set_jft(machine, psp_seg, idx, 0xFF);
-    }
-    /// Set the JFT size field (PSP[0x32]).
-    pub fn set_max_files<A: crate::Arch>(machine: &mut A, psp_seg: u16, n: u16) {
-        machine.write::<u16>(Self::base(psp_seg) + core::mem::offset_of!(Self, max_files), n);
     }
     /// Install a command-tail at PSP[0x80] (length byte + bytes + CR).
     pub fn set_cmdline<A: crate::Arch>(machine: &mut A, psp_seg: u16, tail: &[u8]) {

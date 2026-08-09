@@ -51,6 +51,7 @@ pub mod ci {
     type DirCi = Vec<(Vec<u8>, Entry)>;
 
     static mut CI_CACHE: BTreeMap<Vec<u8>, DirCi> = BTreeMap::new();
+    static mut CI_GENERATION: u64 = u64::MAX;
 
     fn cache() -> &'static mut BTreeMap<Vec<u8>, DirCi> {
         let p = &raw mut CI_CACHE;
@@ -86,6 +87,12 @@ pub mod ci {
     }
 
     fn ensure_cached(vfs_dir: &[u8]) -> &'static DirCi {
+        let generation = vfs::directory_generation();
+        let generation_ptr = &raw mut CI_GENERATION;
+        if unsafe { *generation_ptr } != generation {
+            cache().clear();
+            unsafe { *generation_ptr = generation };
+        }
         let key = norm(vfs_dir);
         let c = cache();
         if !c.contains_key(key) {
