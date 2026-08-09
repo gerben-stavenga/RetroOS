@@ -324,10 +324,22 @@ pub(super) fn pop_continuation_at<A: crate::Arch>(machine: &mut A, ldt: &[u64], 
 }
 
 pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, save: HostContinuation) {
+    // An attached RMCS on a continuation captured from VM86 identifies an
+    // allocated real-mode callback. Unlike 0300/01/02 calls, its handler owns
+    // the returned registers and control image; the host retains ownership of
+    // the internal real-mode stack used to enter and leave the callback.
+    let callback_return = save.eflags & machine::VM_FLAG != 0
+        && save.rm_call_struct_addr().is_some();
     let saved_regs = save.rm_call_struct_addr().map(|addr| {
-        let current = RmCallStruct::capture(machine, regs);
         let saved = machine.read::<RmCallStruct>((addr) as usize);
-        machine.write::<RmCallStruct>((addr) as usize, current);
+        if !callback_return {
+            // 0300/01/02 return results through the caller's register block.
+            // An allocated callback is the opposite direction: its PM handler
+            // has already edited this block to define the RM continuation, and
+            // extender cleanup code may read it again after the mode switch.
+            let current = RmCallStruct::capture(machine, regs);
+            machine.write::<RmCallStruct>((addr) as usize, current);
+        }
         saved
     });
 
@@ -336,7 +348,30 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
 
     if let Some(saved) = saved_regs {
         saved.restore_gp(regs);
-        if regs.mode() == crate::UserMode::VM86 {
+        if callback_return {
+            let (ip, cs, flags, ds, es, fs, gs) =
+                (saved.ip, saved.cs, saved.flags,
+                 saved.ds, saved.es, saved.fs, saved.gs);
+            // Compatibility behavior, not a general statement that RMCS SS:SP
+            // is scratch: CWSDPMI resumes on its internally saved RM stack,
+            // whereas HDPMI honors returned RMCS SS:SP. Our flat DS:ESI entry
+            // makes DOS/4GW write SP as a flat pointer just past the host entry
+            // frame while leaving SS unchanged. Translate that pointer onto
+            // our saved RM stack; loading it literally addresses unrelated
+            // memory. DPMI_REAL_MODE_CALLBACKS.md documents why this fixes
+            // Raptor and what remains missing for spec/HDPMI semantics.
+            let rm_ss = save.ss as u16;
+            let rm_sp = saved.sp.wrapping_sub(rm_ss.wrapping_shl(4));
+            machine::set_vm86_ip(regs, ip);
+            machine::set_vm86_cs(regs, cs);
+            regs.frame.ss = rm_ss as u64;
+            machine::set_vm86_sp(regs, rm_sp);
+            machine::set_vm86_flags(regs, flags as u32);
+            regs.ds = ds as u64;
+            regs.es = es as u64;
+            regs.fs = fs as u64;
+            regs.gs = gs as u64;
+        } else if regs.mode() == crate::UserMode::VM86 {
             let ret_ip = machine::vm86_pop(machine, regs);
             let ret_cs = machine::vm86_pop(machine, regs);
             machine::set_vm86_ip(regs, ret_ip);

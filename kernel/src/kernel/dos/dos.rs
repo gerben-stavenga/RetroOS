@@ -2645,8 +2645,7 @@ fn int_2fh<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Regs) -> t
 /// INT 33h — Microsoft Mouse Driver API. Minimal implementation covering
 /// the subfunctions DOS games actually use: install check, show/hide cursor
 /// (counter only — we don't draw), get/set position, button press/release
-/// info (degenerate: returns current state, no history), set range, read
-/// motion counters.
+/// history, set range, read motion counters.
 ///
 /// Mouse hardware state lives on `dos.pc.mouse` and is updated by the IRQ 12
 /// packet stream queued through `machine::queue_irq`.
@@ -2685,14 +2684,25 @@ fn int_33h<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs:
             m.render_if_visible(machine, regs);
         }
         // AX=0005h — get button press info. BX=button (0=left, 1=right, 2=mid).
-        // Returns AX=button mask, BX=press count since last call (degenerate
-        // 0 — we don't track press history), CX=x at last press, DX=y.
+        // Returns AX=button mask, BX=transition count since the last query for
+        // this button, CX=x and DX=y at the last transition. Reading consumes
+        // only the selected button's counter.
         // AX=0006h — same shape for button release.
         0x0005 | 0x0006 => {
+            let button = (regs.rbx as u16) as usize;
             regs.rax = (regs.rax & !0xFFFF) | m.buttons as u64;
-            regs.rbx &= !0xFFFF;
-            regs.rcx = (regs.rcx & !0xFFFF) | (m.x as u16) as u64;
-            regs.rdx = (regs.rdx & !0xFFFF) | (m.y as u16) as u64;
+            let (count, x, y) = if button < 3 && ax == 0x0005 {
+                let count = core::mem::take(&mut m.press_count[button]);
+                (count, m.last_press_x[button], m.last_press_y[button])
+            } else if button < 3 {
+                let count = core::mem::take(&mut m.release_count[button]);
+                (count, m.last_release_x[button], m.last_release_y[button])
+            } else {
+                (0, m.x, m.y)
+            };
+            regs.rbx = (regs.rbx & !0xFFFF) | count as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | (x as u16) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF) | (y as u16) as u64;
         }
         // AX=0007h — set horizontal range. CX=min, DX=max.
         0x0007 => {

@@ -3,6 +3,13 @@ use super::*;
 use super::super::mode_transitions;
 use super::super::mode_transitions::RmCallStruct;
 
+// Real-mode callback stack semantics are subtle and the current implementation
+// deliberately follows a CWSDPMI/DOS4GW compatibility path. Before changing
+// callback entry or return, read DPMI_REAL_MODE_CALLBACKS.md at the repository
+// root; it records the specification contract, the different CWSDPMI and
+// HDPMI implementations, the Raptor failure that exposed this path, and the
+// remaining Windows test.
+
 /// INT 31h/0300h — Simulate Real Mode Interrupt
 /// Trace helper: report the RM pointer without dereferencing it.
 ///
@@ -242,22 +249,33 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     // Plant an iret-frame above the continuation: the PM callback handler
     // IRETs to SPECIAL_STUB_SEL:SLOT_RESUME_CONTINUATION, which dispatches
     // `resume_continuation_from_stub` for writeback, GP restore, and RM-caller return.
-    // Per DPMI 0.9 §6.1.1 the PM callback procedure must execute IRET.
-    let handler_use32 = mode_transitions::seg_is_32(&dos.ldt[..], pm_cs);
+    // Per DPMI 0.9 §6.1.1 the PM callback procedure must execute IRET. The
+    // frame width follows the client type, not the callback selector's D bit:
+    // 32-bit DOS extenders commonly put callback thunks in a D=0 segment and
+    // return with an explicit operand-size override (`66 CF`).
+    let client_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
     regs.frame.rsp = pm_save_at.1 as u64;
     mode_transitions::push_iret_frame(machine, 
-        &dos.ldt[..], regs, handler_use32,
+        &dos.ldt[..], regs, client_use32,
         dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32,
         mode_transitions::SPECIAL_STUB_SEL,
         0x202, // IF=1
     );
 
-    // DS:(E)SI = pointer to RM SS:SP (where IRET frame is pushed) — via
-    // the flat low-mem selector so the handler can both read the caller's
-    // CS:IP and modify the RM stack if needed.
+    // DS:(E)SI = pointer to RM SS:SP (where the caller's return frame lives).
+    // This is the CWSDPMI representation: flat low-memory DS plus a linear
+    // ESI. HDPMI instead aliases the current RM SS with a callback-specific
+    // selector and passes ESI=SP. Both point to the correct entry byte, but
+    // they lead DOS/4GW to encode the returned RMCS SP differently. See
+    // DPMI_REAL_MODE_CALLBACKS.md before changing either side of this path.
     // ES:(E)DI = pointer to PM register structure.
     regs.frame.cs = pm_cs as u64;
     regs.set_ip32(pm_eip);
+    // Match the established CWSDPMI callback wrapper: EAX identifies an
+    // allocated user callback (type zero), while the real-mode AX value lives
+    // in the register structure at ES:(E)DI. Some extender callback thunks use
+    // this otherwise-unspecified live value to select their wrapper path.
+    regs.rax = 0;
     regs.ds = LOW_MEM_SEL as u64;
     regs.rsi = rm_ss_sp_linear as u64;
     regs.es = rm_struct_sel as u64;
@@ -269,4 +287,3 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     regs.fs = 0;
     regs.gs = 0;
 }
-

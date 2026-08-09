@@ -273,6 +273,14 @@ pub struct MouseState {
     pub y: i16,
     /// Current button state. bit 0 = left, 1 = right, 2 = middle.
     pub buttons: u8,
+    /// Function 5/6 transition history. Counts are cleared individually when
+    /// the client queries that button; coordinates describe its last event.
+    pub press_count: [u16; 3],
+    pub release_count: [u16; 3],
+    pub last_press_x: [i16; 3],
+    pub last_press_y: [i16; 3],
+    pub last_release_x: [i16; 3],
+    pub last_release_y: [i16; 3],
     /// User-set clip range. Defaults match a 640×200 mode.
     pub min_x: i16, pub max_x: i16,
     pub min_y: i16, pub max_y: i16,
@@ -326,6 +334,9 @@ const VGA_TEXT_BASE: u32 = 0xB8000;
 impl MouseState {
     pub const fn new() -> Self {
         Self { x: 0, y: 0, buttons: 0,
+               press_count: [0; 3], release_count: [0; 3],
+               last_press_x: [0; 3], last_press_y: [0; 3],
+               last_release_x: [0; 3], last_release_y: [0; 3],
                min_x: 0, max_x: 639, min_y: 0, max_y: 199,
                accum_dx: 0, accum_dy: 0,
                show_count: 1, drawn_at: None, saved_attr: 0,
@@ -362,6 +373,19 @@ impl MouseState {
         if dx != 0 || dy != 0 { cond |= 0x01; }
         let pressed = !prev & cur;
         let released = prev & !cur;
+        for button in 0..3 {
+            let bit = 1u8 << button;
+            if pressed & bit != 0 {
+                self.press_count[button] = self.press_count[button].saturating_add(1);
+                self.last_press_x[button] = self.x;
+                self.last_press_y[button] = self.y;
+            }
+            if released & bit != 0 {
+                self.release_count[button] = self.release_count[button].saturating_add(1);
+                self.last_release_x[button] = self.x;
+                self.last_release_y[button] = self.y;
+            }
+        }
         if pressed  & 0x01 != 0 { cond |= 0x02; }
         if released & 0x01 != 0 { cond |= 0x04; }
         if pressed  & 0x02 != 0 { cond |= 0x08; }
