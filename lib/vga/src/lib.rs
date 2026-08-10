@@ -231,6 +231,24 @@ pub fn classify(r: &Regs) -> Option<VgaMode> {
     Some(VgaMode::Planar16 { w, h, row_bytes })
 }
 
+/// Whether `r` describes the conventional colour 80x25 text environment a
+/// DOS shell may safely return to without resetting the adapter. This is
+/// intentionally narrower than merely `VgaMode::Text`: 40-column, monochrome,
+/// 80x50 and tweaked alphanumeric modes are valid VGA modes, but not the
+/// standard B8000 odd/even screen expected by a caller such as DOS Navigator.
+pub fn is_standard_text(r: &Regs) -> bool {
+    matches!(
+        classify(r),
+        Some(VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 })
+    )
+        && r.misc & 0x01 != 0          // colour CRTC / B800 family
+        && r.seq[0] & 0x03 == 0x03     // sequencer running
+        && r.seq[1] & 0x20 == 0        // scanout enabled
+        && r.seq[4] & 0x0C == 0        // odd/even text, not chain-4
+        && r.gc[5] & 0x10 != 0         // GC odd/even addressing
+        && r.gc[6] & 0x0D == 0x0C      // alphanumeric, B8000 32K map
+}
+
 /// The canonical register file an IBM VGA BIOS programs for a mode-set —
 /// misc/SEQ/GC/CRTC straight from the video parameter table. The substitute
 /// BIOS applies this on every INT 10h AH=00 so [`classify`] can be pure

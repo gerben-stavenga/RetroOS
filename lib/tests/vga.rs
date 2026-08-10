@@ -40,6 +40,19 @@ fn bios_text_geometry_comes_from_registers() {
 }
 
 #[test]
+fn standard_text_requires_live_mode3_environment() {
+    let r = vga_render::bios_mode_regs(3).unwrap();
+    assert!(vga_render::is_standard_text(&r));
+    assert!(!vga_render::is_standard_text(
+        &vga_render::bios_mode_regs(0x13).unwrap(),
+    ));
+
+    let mut screen_off = r;
+    screen_off.seq[1] |= 0x20;
+    assert!(!vga_render::is_standard_text(&screen_off));
+}
+
+#[test]
 fn initial_mode3_state_is_complete() {
     let state = vga_render::VgaState::new_mode3_boxed();
     assert_eq!(state.classify_mode(), Some(TEXT80));

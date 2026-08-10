@@ -280,11 +280,14 @@ impl<A: crate::Arch> DosState<A> {
     /// state. The screen snapshot is handled by `suspend`, which `exit_thread`
     /// calls separately before `arch_user_clean` unmaps the 0xA0000
     /// framebuffer. Called from `thread::exit_thread`.
-    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs) {
-        // The live aperture belongs to this address space. Capture it while
-        // that space is still active so the zombie retains a complete VGA
-        // state for SYNTH_VGA_TAKE.
-        self.pc.vga.suspend_state(machine);
+    pub fn on_exit(&mut self, machine: &mut A, regs: &mut Regs, capture_vga: bool) {
+        if capture_vga {
+            // The live aperture belongs to this address space. Complete the
+            // detached snapshot before the address space disappears. Normal
+            // DOS return has already moved NativeVga directly and deliberately
+            // skips this readback path.
+            self.pc.vga.suspend_state(machine);
+        }
         if let Some(ref mut dpmi) = self.dpmi {
             dpmi.unmap_all_physical(machine);
         }
@@ -323,6 +326,21 @@ impl<A: crate::Arch> DosState<A> {
         let (vga, display) = vga.into_emulated(machine, bios_workspace);
         self.pc.vga = vga;
         display
+    }
+
+    /// Normal DOS child return: move the live adapter capability out without
+    /// saving or changing any VGA state. The dying personality is never run
+    /// again and remains in `Transition` until its zombie slot is reaped.
+    pub(crate) fn release_live_display(
+        &mut self,
+    ) -> crate::kernel::display::DisplayHandoff {
+        match self.pc.vga.take_for_transition() {
+            machine::vga::DosVga::Native(native) =>
+                crate::kernel::display::DisplayHandoff::NativeVga(native),
+            machine::vga::DosVga::Emulated(_) =>
+                panic!("normal VGA return from a non-native child"),
+            machine::vga::DosVga::Transition => panic!("VGA return re-entered"),
+        }
     }
 
     pub(super) fn suspend_for_osd(
@@ -732,6 +750,31 @@ pub fn handle_event<A: crate::Arch>(
             // boundary (metal: the #GP monitor; interp: the exception path in
             // cpu.rs) — the kernel sees identical events from both backends.
             //
+            // A DPMI virtual-IF learning window can cross onto the client's
+            // VM86 side. Its TF-generated #DB still belongs to `vif`, not to
+            // the client's protected-mode exception table. Conversely, a
+            // bare VM86 program may deliberately hook INT 1 and single-step
+            // itself (ST3's packer). Ownership state, rather than CPU mode,
+            // separates those cases.
+            if n == 1 && is_vm86 {
+                let vif_owns_db = dos.dpmi.as_ref().is_some_and(|d| d.vif.owns_db());
+                if vif_owns_db {
+                    return match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
+                        Some(dpmi::DbResult::Event(ev)) =>
+                            handle_event(machine, bios_display.as_deref_mut(), kt, dos, regs, ev),
+                        _ => thread::KernelAction::Done,
+                    };
+                }
+                if machine.read::<u16>(1 * 4 + 2) != dos::STUB_SEG {
+                    arch_abi::monitor::sw_reflect_vm86_int(regs, machine, 1);
+                } else {
+                    // No guest handler owns this trace. Avoid restoring TF and
+                    // trapping forever on the next VM86 instruction.
+                    regs.clear_flag32(1 << 8);
+                }
+                return thread::KernelAction::Done;
+            }
+
             // DPMI session active: route to client's exception handler
             // regardless of current mode. push_continuation_and_switch_to_pm_side handles the
             // VM86→PM toggle if needed; save.restore puts us back in
@@ -1013,7 +1056,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 }
 
 /// Executor for `KernelAction::DosSynthChild`: the cross-thread half of the
-/// INT-31 synth ops (reap / waitpid-probe / VGA take or peek), run after the
+/// INT-31 synth ops (reap / waitpid probe), run after the
 /// caller's `dos`/`kt` borrow releases. Writes the AX/BX/CF result into the
 /// live frame and stays on the caller (`None`).
 pub(crate) fn handle_synth_child<A: crate::Arch>(
@@ -1043,41 +1086,6 @@ pub(crate) fn handle_synth_child<A: crate::Arch>(
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | (-ctid) as u64;
                 regs.set_flag32(1);
-            }
-        }
-        Op::VgaTake => {
-            // Pull the child's farewell screen out (with_target_dos validates
-            // range/live/DOS), then install it into ours + reap. Two
-            // single-borrow steps replace the old `*mut VgaState` cross-slot
-            // swap — no unsafe, no aliasing.
-            let mut taken = None;
-            let rv = thread::with_target_dos(threads, pid, |target| {
-                match target.pc.vga.take_saved_state() {
-                    Some(state) => { taken = Some(state); 0 }
-                    None => -61,
-                }
-            });
-            if rv >= 0 {
-                let cur = thread::get_thread(threads, tid).unwrap();
-                let dos = cur.dos_mut();
-                dos.pc.vga.install_saved_state(machine, taken.take().unwrap());
-                thread::reap(threads, machine, pid);
-            }
-            regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
-            if rv < 0 { regs.set_flag32(1); } else { regs.clear_flag32(1); }
-        }
-        Op::VgaPeekMode => {
-            let rv = thread::with_target_dos(threads, pid, |target| {
-                let machine::vga::DosVga::Emulated(dev) = &target.pc.vga else { return -61 };
-                let state = &dev.state;
-                (state.gc[6] & 1) as i32
-            });
-            if rv < 0 {
-                regs.rax = (regs.rax & !0xFFFF) | ((rv as i16 as u16) as u64);
-                regs.set_flag32(1);
-            } else {
-                regs.rax = (regs.rax & !0xFF) | (rv as u64);
-                regs.clear_flag32(1);
             }
         }
     }
@@ -1442,9 +1450,11 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mu
         machine.write::<u8>(addr as usize, sig);
         machine.write::<u16>(addr as usize + 1, ow);
         machine.write::<u16>(addr as usize + 3, paras);
-        for off in 5..16 {
-            machine.write::<u8>(addr as usize + off, 0);
-        }
+        // Bytes 5..15 are not structural chain fields. In particular, do not
+        // clear them while splitting a block: a caller may have its INT 21h
+        // return frame in the paragraph that becomes the new free MCB. DOS
+        // updates the MCB header in place; callers may rely on the remainder
+        // of that paragraph surviving AH=4Ah.
     }
 }
 

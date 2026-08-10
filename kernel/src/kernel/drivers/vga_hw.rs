@@ -21,9 +21,10 @@ use vga::{AcState, VgaState};
 
 /// The real card's Attribute-Controller flip-flop and latched index.
 ///
-/// Neither is readable from any port, so tracking is the only way to know
-/// them — and because they belong to the *card*, the tracker is global
-/// rather than per-thread (a thread's own AC state lives in its `VgaState`).
+/// The flip-flop phase is not port-readable, so it must be tracked. The
+/// latched address (including PAS) is readable only on some VGA-compatible
+/// hardware. Because both belong to the *card*, the tracker is global rather
+/// than per-thread (a thread's own AC state lives in its `VgaState`).
 /// The guest's own 0x3C0 writes reach it through [`track_ac_write`] when the
 /// port is passed through to a native card.
 static mut AC: AcState = AcState::new();
@@ -43,6 +44,42 @@ pub fn track_ac_write(val: u8) {
 /// Note the flip-flop reset that reading 0x3DA performs on the real card.
 pub fn track_ac_reset() {
     unsafe { AC.pending_data = false; }
+}
+
+/// Read only the register subset that determines the current VGA mode. Index
+/// latches are restored, no sequencer reset is asserted, and VRAM/DAC/AC are
+/// untouched, so COMMAND.COM can decide whether a mode-3 BIOS call is needed
+/// without disturbing a child's implicit text-screen return value.
+pub fn read_mode_regs() -> vga::Regs {
+    use crate::kernel::portio::{inb, outb};
+    let seq_index = inb(0x3C4);
+    let gc_index = inb(0x3CE);
+    let misc = inb(0x3CC);
+    let crtc_port = if misc & 1 != 0 { 0x3D4 } else { 0x3B4 };
+    let crtc_index = inb(crtc_port);
+    let mut seq = [0u8; 5];
+    let mut gc = [0u8; 9];
+    let mut crtc = [0u8; 25];
+    for i in 0..5u8 {
+        outb(0x3C4, i);
+        seq[i as usize] = inb(0x3C5);
+    }
+    for i in 0..9u8 {
+        outb(0x3CE, i);
+        gc[i as usize] = inb(0x3CF);
+    }
+    for i in 0..25u8 {
+        outb(crtc_port, i);
+        crtc[i as usize] = inb(crtc_port + 1);
+    }
+    outb(0x3C4, seq_index);
+    outb(0x3CE, gc_index);
+    outb(crtc_port, crtc_index);
+    vga::Regs { crtc, seq, gc, misc }
+}
+
+pub fn is_standard_text_mode() -> bool {
+    vga::is_standard_text(&read_mode_regs())
 }
 
 /// Read the live card's whole register file, DAC and plane memory into
@@ -221,6 +258,15 @@ pub fn save(state: &mut VgaState) {
     outb(0x3C4, state.seq_index);
     outb(0x3D4, state.crtc_index);
     outb(0x3CE, state.gc_index);
+
+    // SeaVGABIOS traffic can bypass the trapped-port AC tracker, leaving its
+    // PAS bit stale even though the outgoing owner was visibly scanning out.
+    // The save boundary must be observational: a fork hands this still-live
+    // adapter directly to its child, so repair QEMU's palette-enable latch
+    // without touching registers, VRAM, palette or mode.
+    if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
+        enable_palette_output(state);
+    }
 }
 
 /// Capture only the palette state shared by legacy VGA and indexed VBE.
@@ -422,6 +468,25 @@ pub fn restore(state: &VgaState) {
     outb(0x3C4, state.seq_index);
     outb(0x3D4, state.crtc_index);
     outb(0x3CE, state.gc_index);
+}
+
+/// Re-enable Attribute Controller palette output after a broken firmware
+/// state restore. SeaVGABIOS/QEMU restores the AC address latch with PAS clear
+/// even though the saved display was visible. The register contents and
+/// flip-flop phase remain those of `state`; only the display-enable bit is
+/// normalized at this ownership boundary.
+pub fn enable_palette_output(state: &VgaState) {
+    use crate::kernel::portio::{inb, outb};
+    let ac_state = AcState {
+        index: state.ac_state.index | 0x20,
+        pending_data: state.ac_state.pending_data,
+    };
+    let _ = inb(0x3DA);
+    outb(0x3C0, ac_state.index);
+    if !ac_state.pending_data {
+        let _ = inb(0x3DA);
+    }
+    unsafe { AC = ac_state; }
 }
 
 /// Restore only the DAC portion of a detached VBE display. Replaying the

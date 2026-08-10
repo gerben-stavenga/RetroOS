@@ -536,20 +536,6 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
 pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
-        // AH=00h — SYNTH_VGA_TAKE: adopt a (still-zombie) child's farewell
-        // screen, then reap the slot.
-        // Input:  BX = child pid (must be a zombie of the caller)
-        // Output: AX = 0 on success, errno on failure; CF reflects error.
-        // The child's on_exit() snapshotted its VGA into its DosState; this
-        // call swaps it into ours, restores it to hardware, and recycles
-        // the thread slot. Pair with AH=04 SYNTH_WAITPID (peek), then call
-        // this once the peek reports "exited".
-        0x00 => {
-            // Touches a *child* thread (swap its farewell VGA into ours, reap)
-            // → defer to the executor, off this thread's `dos`/`kt` borrow.
-            let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::VgaTake }
-        }
         // AH=01h — SYNTH_FORK_EXEC: fork+exec program. Non-blocking.
         // Input:  DS:DX -> ASCIIZ program filename (no shell parsing here)
         //         ES:BX -> ASCIIZ command tail (use "" for no args; kernel
@@ -608,9 +594,9 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         //   CF=1, AX=errno: bad pid (-ECHILD, EAGAIN-but-no-children, etc).
         //
         // The focused thread is always running (event loop), so polling here
-        // is just a status query — no kernel-side blocking, no spurious-wake
-        // plumbing. command.com loops AH=04 + INT 21h AH=06 (kbd poll) and
-        // owns the policy for what to do on user input.
+        // is just a status query — no kernel-side blocking or spurious-wake
+        // plumbing. If OSD returns focus to command.com while the child is
+        // still alive, AX=1 is itself the signal to release the DOS caller.
         0x04 => {
             // Scans the caller's children → executor (peek + AX/BX/CF writeback).
             let pid = regs.rbx as i16 as i32;
@@ -625,11 +611,9 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // AH=05h — SYNTH_REAP: reap a zombie child without touching VGA.
-        // Use after AH=04h waitpid reports CF=0/AX=0 when the caller doesn't
-        // want to adopt the child's farewell screen — typically because the
-        // child terminated by fault (last_child_exit_status high byte = 0x02)
-        // and its VGA state is suspect. BX = child pid.
+        // AH=05h — SYNTH_REAP: recycle a zombie child. Display disposition
+        // already happened at exit: live transfer on success, parent snapshot
+        // restoration on error. BX = child pid.
         0x05 => {
             let pid = (regs.rbx & 0xFFFF) as i16 as i32;
             thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::Reap }
@@ -654,18 +638,17 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // AH=06h — SYNTH_VGA_PEEK_MODE: query the saved VGA state of a
-        // zombie child without taking it. BX = child pid.
-        // Output: AL = 0 if text mode, 1 if graphics, CF=0; CF=1/AX=errno.
-        // GC[6] bit 0 is the VGA Misc/Graphics-Mode register's alpha-graphics
-        // select: 0 = text (alphanumeric), 1 = graphics. The caller (typically
-        // COMMAND.COM) uses this to decide whether the child's farewell
-        // screen is worth adopting — graphics-mode garbage left over after,
-        // e.g., a Ctrl-Y abort doesn't compose with the next program's
-        // text-mode redraw.
+        // AH=06h — SYNTH_VGA_NEEDS_TEXT_MODE: inspect the caller's CURRENT
+        // live VGA, after a normal child has handed the adapter back.
+        // Output: AL=0 if it is conventional colour 80x25 text; AL=1 if
+        // COMMAND.COM should invoke BIOS mode 3 before returning to its caller.
+        // This reads mode-defining registers only: the child's exit text,
+        // attributes, cursor, palette and display page remain untouched.
         0x06 => {
-            let pid = (regs.rbx & 0xFFFF) as i16 as i32;
-            thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::VgaPeekMode }
+            let needs_mode3 = !super::machine::vga::is_standard_text(&dos.pc.vga);
+            regs.rax = (regs.rax & !0xFF) | needs_mode3 as u64;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
         }
         // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log so a
         // booted system with no serial/debug port (real metal) can surface

@@ -131,8 +131,8 @@ pub enum KernelAction {
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.
     Wait { pid: i32, status_ptr: usize },
-    /// DOS INT-31 synth op on a *child* thread (reap / waitpid-probe / adopt or
-    /// peek its farewell VGA). Run in the executor so the cross-thread table
+    /// DOS INT-31 synth op on a *child* thread (reap / waitpid probe). Run in
+    /// the executor so the cross-thread table
     /// access happens off the caller's `dos`/`kt` borrow. The executor writes
     /// the AX/BX/CF result into the live frame.
     DosSynthChild { pid: i32, op: DosChildOp },
@@ -145,10 +145,6 @@ pub enum DosChildOp {
     Reap,
     /// AH=04 SYNTH_WAITPID: non-blocking exit probe.
     Waitpid,
-    /// AH=00 SYNTH_VGA_TAKE: swap the child's farewell screen into ours, reap.
-    VgaTake,
-    /// AH=06 SYNTH_VGA_PEEK_MODE: report the child's saved VGA text/graphics bit.
-    VgaPeekMode,
 }
 
 /// OS personality — determines event loop dispatch and carries OS-specific state
@@ -900,16 +896,32 @@ pub fn exit_thread<A: crate::Arch>(
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
+    let term_type = ((exit_code >> 8) & 0xFF) as u8;
+    // A successful DOS child returns the live adapter to its DOS parent. The
+    // parent's detached VGA is an error/background-switch recovery image, not
+    // something to replay on the normal DOS EXEC return path. Ctrl-Break and
+    // fault termination restore it; normal exit and TSR retain live VGA state.
+    let return_live_vga = tid == crate::kernel::focus::focused()
+        && matches!(term_type, 0x00 | 0x03)
+        && matches!(threads[tid].personality, Personality::Dos(_))
+        && parent_tid >= 0
+        && (parent_tid as usize) < MAX_THREADS
+        && matches!(threads[parent_tid as usize].personality, Personality::Dos(_));
 
     // Tear down the dying thread (only touches threads[tid]).
     {
         let thread = &mut threads[tid];
-        // Snapshot the dying thread's screen NOW — `arch_user_clean` below
-        // unmaps 0xA0000, after which vga_hw::save would fault. The
-        // snapshot stays in the zombie's slot until the parent either
-        // explicitly takes it (SYNTH_VGA_TAKE) or it's discarded on reap.
+        // Release the dying thread's display NOW — `arch_user_clean` below
+        // unmaps 0xA0000, after which native VGA capture would fault. A normal
+        // DOS parent adopts the unchanged live token; other successors restore
+        // their own detached model.
         if tid == crate::kernel::focus::focused() {
-            let display = thread.personality.suspend(machine, bios_workspace);
+            let display = if return_live_vga {
+                let Personality::Dos(dos) = &mut thread.personality else { unreachable!() };
+                dos.release_live_display()
+            } else {
+                thread.personality.suspend(machine, bios_workspace)
+            };
             assert!(display_handoff.is_none(), "unconsumed display handoff");
             *display_handoff = Some(display);
         }
@@ -921,7 +933,8 @@ pub fn exit_thread<A: crate::Arch>(
             *sb_handoff = Some(card);
         }
         match &mut thread.personality {
-            Personality::Dos(dos) => dos.on_exit(machine, &mut thread.kernel.vcpu),
+            Personality::Dos(dos) => dos.on_exit(
+                machine, &mut thread.kernel.vcpu, !return_live_vga),
             Personality::Linux(_) => {}
         }
         thread.kernel.close_all_fds();
@@ -935,6 +948,10 @@ pub fn exit_thread<A: crate::Arch>(
     let mut woke_parent = false;
     if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS && parent_tid as usize != tid {
         let (thread, parent) = get_two_threads(threads, tid, parent_tid as usize);
+        if return_live_vga {
+            let Personality::Dos(dos) = &mut parent.personality else { unreachable!() };
+            dos.pc.vga.adopt_live_on_next_present();
+        }
         let was_waiting = parent.kernel.state == ThreadState::Blocked;
         if was_waiting {
             parent.kernel.state = ThreadState::Ready;

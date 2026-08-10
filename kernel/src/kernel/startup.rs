@@ -847,13 +847,10 @@ fn dispatch<A: crate::Arch>(
     // Exit so `exit_thread` does all teardown and hands focus back to the
     // parent, the same path SEGV takes below.
     if crate::kernel::osd::take_kill_request() {
-        // DOS parents inspect AH=4Dh's termination type before deciding
-        // whether to adopt the child's farewell VGA snapshot. A Unix -9
-        // becomes FFF7h there, which looks neither normal nor like the 02h
-        // abnormal termination DN recognizes; it consequently adopted the
-        // killed program's incomplete screen over its own panels. Preserve
-        // Unix status for Linux, but encode a DOS critical termination so the
-        // parent reaps the child without replacing its display state.
+        // DOS exit type decides the VGA return contract: normal termination
+        // transfers the live adapter, while type 02h restores the parent's
+        // pre-child recovery image. Preserve Unix status for Linux, but encode
+        // an OSD kill as DOS critical termination.
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x0200,
             thread::Personality::Linux(_) => -9,
@@ -889,10 +886,10 @@ fn dispatch<A: crate::Arch>(
 /// the old context live; acquire: in-focus repaint with the new context
 /// live). When the scheduler decouples them, this helper is what splits.
 ///
-/// Zombies skip the release because `exit_thread` already snapshotted
-/// before `arch_user_clean` unmapped 0xA0000 (re-reading would fault). If
-/// a parent wants the dying child's farewell screen to persist, it calls
-/// `SYNTH_VGA_TAKE` explicitly — the kernel makes no inheritance policy.
+/// Zombies skip the release because `exit_thread` already released the
+/// display before `arch_user_clean` unmapped 0xA0000. On normal DOS return,
+/// the incoming parent is marked to adopt that still-live adapter; on an
+/// error or ordinary background switch it restores its detached snapshot.
 fn switch_focus_and_run<A: crate::Arch>(
     machine: &mut A,
     mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
@@ -1068,6 +1065,18 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         return None;
     }
 
+    // A DOS child inherits the live adapter, not a reconstructed copy. The
+    // ordinary focus release below snapshots the parent and produces the
+    // move-only NativeVga token; marking the child here makes acquire consume
+    // that token without programming the card. Thus fork performs one save
+    // for the parent's recovery image and zero mode/framebuffer restores.
+    if parent_is_dos && crate::kernel::dos::physical_vga_present() {
+        let child = thread::get_thread(threads, child_tid).unwrap();
+        if let thread::Personality::Dos(dos) = &mut child.personality {
+            dos.pc.vga.adopt_live_on_next_present();
+        }
+    }
+
     let child = thread::get_thread(threads, child_tid).unwrap();
     // Restore the parent's address space; the displaced child space re-parks in
     // its slot (init_thread already set the child's entry registers there).
@@ -1115,15 +1124,6 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                         _ => thread::FdKind::None,
                     };
                 }
-            }
-            // Only inherit the parent's screen if the parent is also DOS —
-            // otherwise we'd save Linux console content into a DOS thread's
-            // vga buffer, and the child would later "restore" Linux output
-            // when focus returned to it. Cross-personality forks just leave
-            // the child at its independent initial mode-3 image.
-            if parent_is_dos && crate::kernel::dos::physical_vga_present() {
-                let vga = &mut child.dos_mut().pc.vga;
-                *vga = vga.take_for_transition().snapshot_hardware(machine);
             }
             machine.outb(0x3D4, 0x0E);
             let cursor_hi = machine.inb(0x3D5) as u16;

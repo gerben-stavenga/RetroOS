@@ -93,6 +93,14 @@ impl VifMap {
         VifMap { sites: SiteTable::new(), active: None, stats: [0; 4] }
     }
 
+    /// Whether the next #DB belongs to an interrupts-off window currently
+    /// being learned or closed. This remains authoritative while the DPMI
+    /// client is temporarily executing its VM86 side: CPU mode alone cannot
+    /// distinguish this host-owned trace from a real-mode program's INT 1.
+    pub fn owns_db(&self) -> bool {
+        self.active.is_some()
+    }
+
     /// A `CLI` `#GP`'d: virtual IF just went 1→0, a window opens at `cli_ip`.
     /// `arch` gives guest memory + segment bases; `regs` is the fault frame.
     pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32) {

@@ -40,6 +40,10 @@ pub struct EmulatedVga {
     /// Firmware transition needed when closing OSD. This is a resume
     /// instruction, not a second claim about current hardware state.
     resume_vbe: Option<VbeResume>,
+    /// The next native display handoff is already the screen this thread must
+    /// run on. Fork and normal child return transfer the live adapter; they do
+    /// not reconstruct it from this detached recovery image.
+    adopt_live: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -81,6 +85,7 @@ impl EmulatedVga {
                 firmware_state,
                 svga_pages,
                 resume_vbe,
+                adopt_live: false,
             },
             native,
         )
@@ -96,6 +101,16 @@ impl EmulatedVga {
         // incoming DOS address space, including B8000 text memory.
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
         self.state.a0000_trapped = false;
+        if self.adopt_live {
+            // The token names the adapter that is already scanning out the
+            // desired screen. Drop our old recovery image and inherit the live
+            // device exactly as DOS EXEC does; programming it here would both
+            // lose implicit exit text and impose a slow mode transition.
+            if self.state.svga_w != 0 {
+                discard_emulated_svga(machine, &mut self);
+            }
+            return DosVga::Native(native);
+        }
         if let Some(resume) = self.resume_vbe.take()
             && self.state.svga_w != 0
         {
@@ -134,10 +149,16 @@ impl EmulatedVga {
             let _ = bios.bios_set_mode(machine, &mut native, 3);
         }
         crate::kernel::drivers::vga_hw::restore(&self.state);
-        if let (Some(bios), Some(state)) = (bios, self.firmware_state.as_ref())
-            && let Err(error) = bios.bios_restore_state(machine, &native, state)
-        {
-            crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
+        if let (Some(bios), Some(state)) = (bios, self.firmware_state.as_ref()) {
+            if let Err(error) = bios.bios_restore_state(machine, &native, state) {
+                crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
+            } else if crate::kernel::platform::get().host
+                == crate::kernel::platform::Host::Qemu
+            {
+                // SeaVGABIOS/QEMU can return from 4F04 with AC PAS clear,
+                // blanking an otherwise fully restored legacy screen.
+                crate::kernel::drivers::vga_hw::enable_palette_output(&self.state);
+            }
         }
         DosVga::Native(native)
     }
@@ -183,6 +204,7 @@ impl DosVga {
             firmware_state: None,
             svga_pages: 0,
             resume_vbe: None,
+            adopt_live: false,
         })
     }
 
@@ -279,18 +301,14 @@ impl DosVga {
         }
     }
 
-    /// Seed this device from what the card is currently showing — the fork
-    /// path, where a child inherits the parent's screen. A native device
-    /// already IS the card and passes through untouched.
-    pub fn snapshot_hardware<A: crate::Arch>(self, machine: &mut A) -> Self {
+    /// Arrange for the next native display capability to be adopted without
+    /// touching the adapter. Used when the live VGA itself crosses an EXEC
+    /// boundary; this detached state is only the fallback for restoration.
+    pub fn adopt_live_on_next_present(&mut self) {
         match self {
-            native @ Self::Native(_) => native,
-            Self::Emulated(mut dev) => {
-                crate::kernel::drivers::vga_hw::save(&mut dev.state);
-                materialize_emulated_aperture(&mut dev.state, machine);
-                Self::Emulated(dev)
-            }
-            Self::Transition => panic!("missing VGA during hardware snapshot"),
+            Self::Emulated(dev) => dev.adopt_live = true,
+            Self::Native(_) => panic!("live VGA already owned"),
+            Self::Transition => panic!("missing VGA while marking live adoption"),
         }
     }
 
@@ -301,33 +319,6 @@ impl DosVga {
             Self::Emulated(vga) => capture_emulated_aperture(&mut vga.state, machine),
             Self::Native(_) => panic!("native VGA was not detached before exit"),
             Self::Transition => panic!("missing VGA during suspension"),
-        }
-    }
-
-    pub fn take_saved_state(&mut self) -> Option<alloc::boxed::Box<VgaState>> {
-        match self {
-            Self::Emulated(vga) => {
-                Some(core::mem::replace(&mut vga.state, VgaState::new_mode3_boxed()))
-            }
-            Self::Native(_) => None,
-            Self::Transition => panic!("missing VGA state"),
-        }
-    }
-
-    /// Adopt a captured screen. A native owner materializes it immediately
-    /// and consumes the shadow; an emulated owner keeps it for its sink.
-    pub fn install_saved_state<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        state: alloc::boxed::Box<VgaState>,
-    ) {
-        match self {
-            Self::Native(_) => crate::kernel::drivers::vga_hw::restore(&state),
-            Self::Emulated(vga) => {
-                vga.state = state;
-                materialize_emulated_aperture(&mut vga.state, machine);
-            }
-            Self::Transition => panic!("missing VGA while installing state"),
         }
     }
 
@@ -342,6 +333,24 @@ impl DosVga {
 // handover and the real-card driver all hold one too. What stays here is the
 // part that needs a guest address space, which a passive card cannot have.
 pub use ::vga::VgaState;
+
+/// Non-destructively decide whether the currently owned VGA is already the
+/// conventional colour 80x25 text screen expected when COMMAND.COM returns.
+pub fn is_standard_text(device: &DosVga) -> bool {
+    match device {
+        DosVga::Native(_) => crate::kernel::drivers::vga_hw::is_standard_text_mode(),
+        DosVga::Emulated(dev) => {
+            dev.state.svga_w == 0
+                && ::vga::is_standard_text(&::vga::Regs {
+                    crtc: dev.state.crtc,
+                    seq: dev.state.seq,
+                    gc: dev.state.gc,
+                    misc: dev.state.misc_output,
+                })
+        }
+        DosVga::Transition => panic!("VGA mode queried during ownership transition"),
+    }
+}
 
 /// Present the emulated planes to the guest at A0000/B8000 — map the window
 /// and fill it from suspended state, or mark it trapped when writes must

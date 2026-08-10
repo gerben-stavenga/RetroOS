@@ -12,9 +12,9 @@
  *                            ES:BX -> ASCIIZ args (use "" for none)
  *                            -> CF=0 AX=0 BX=child_pid; CF=1 AX=errno
  *   AH=04h SYNTH_WAITPID     BX=pid -> CF=0 AX=0 exited / AX=1 alive
- *                            (peek only; slot stays Zombie until AH=00).
- *   AH=00h SYNTH_VGA_TAKE    BX=pid -> adopt the zombie child's farewell
- *                            screen and reap the slot.
+ *                            (peek only; slot stays Zombie until AH=05).
+ *   AH=05h SYNTH_REAP        BX=pid -> recycle an exited child.
+ *   AH=06h VGA_NEEDS_MODE3   -> AL=0 standard text / AL=1 normalize.
  *   AH=02/03h TRACE_ON/OFF
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in
@@ -437,22 +437,25 @@ static int synth_waitpid(int pid) {
     return (int)r.x.ax;   /* 0 = exited, 1 = still alive */
 }
 
-static void vga_take(int pid) {
-    r.h.ah = 0x00;
-    r.x.bx = (unsigned)pid;
-    int86(0x31, &r, &r);
-}
-
-/* INT 31h AH=06h: peek the zombie child's VGA mode without taking it.
- * Returns 0 = text, 1 = graphics, -1 = error. Used to skip vga_take when
- * the child exited in graphics mode (the leftover planar framebuffer
- * doesn't compose with a fresh text-mode redraw by the next program). */
-static int synth_vga_is_graphics(int pid) {
+/* INT 31h AH=06h: inspect our current live VGA without changing it. A normal
+ * child return handed us the adapter itself, so its text screen is already
+ * the implicit return value; no zombie snapshot needs adopting. */
+static int synth_vga_needs_mode3(void) {
     r.h.ah = 0x06;
-    r.x.bx = (unsigned)pid;
     int86(0x31, &r, &r);
     if (r.x.cflag) return -1;
     return (int)r.h.al;
+}
+
+/* COMMAND.COM is a function inside its DOS caller, not another RetroOS
+ * address space. Preserve a proper child exit-text screen verbatim; only ask
+ * the BIOS for mode 3 when the live adapter is not a conventional 80x25
+ * colour-text environment the caller can paint into. */
+static void ensure_standard_text_mode(void) {
+    if (synth_vga_needs_mode3() != 0) {
+        r.x.ax = 0x0003;
+        int86(0x10, &r, &r);
+    }
 }
 
 /* INT 31h AH=05h: reap a zombie child without touching VGA. Use this
@@ -497,9 +500,10 @@ static void refresh_bda_clock(void) {
 /* Fork-exec a child and wait for it. argv[0] = program path,
  * argv[1..argc-1] = args. The args are joined into the cmdline tail
  * right here at the synth call boundary so callers stay tokenised.
- * `poll_kbd` enables the Ctrl-Z = background gesture used by the
- * interactive launcher path; batch lines pass 0. */
-static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char viopl) {
+ * `interactive` means that being scheduled again while the child is still
+ * alive is an OSD task switch back to our caller, so release it immediately.
+ * Batch lines pass 0 and continue waiting for their child. */
+static int run_external_raw(char **argv, int argc, int interactive, unsigned char viopl) {
     char tail[128];
     int pid, rc;
     join_args(tail, sizeof(tail), argv, 1, argc);
@@ -512,13 +516,10 @@ static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char v
         rc = synth_waitpid(pid);
         if (rc < 0) return 255;          /* no such child / EINVAL */
         if (rc == 0) break;              /* exited */
-        if (poll_kbd) {
-            while (kbhit()) {
-                if (getch() == 0x1A) {
-                    puts("[Backgrounded]");
-                    return 0;
-                }
-            }
+        if (interactive) {
+            puts("[Backgrounded]");
+            ensure_standard_text_mode();
+            return 0;
         }
     }
     refresh_bda_clock();
@@ -527,25 +528,19 @@ static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char v
         unsigned char term_type = (unsigned char)(status >> 8);
         unsigned char exit_al   = (unsigned char)(status & 0xFF);
         if (term_type == 0x02) {
-            /* Critical error / fault: skip vga_take (the dying child's
-             * VGA is suspect), just reap. Our own VGA context (already
-             * text mode from when we were suspended) gets restored by
-             * the kernel's materialize on the next thread-switch. */
-            printf("Aborted (critical error)\r\n");
+            /* Critical error/fault restored our pre-child recovery screen. */
             synth_reap(pid);
+            ensure_standard_text_mode();
+            printf("Aborted (critical error)\r\n");
             printf("Reaped child %d with exit status %02Xh\r\n", pid, exit_al);
             return 1;
         }
-        /* Only adopt the farewell screen if the child exited in text
-         * mode. Graphics-mode leftovers (e.g. Alley Cat aborted with
-         * Ctrl-Y) don't compose with the next program's text redraw —
-         * the planar framebuffer interprets text bytes as pixels and
-         * the user sees tiled garbage. */
-        if (synth_vga_is_graphics(pid) == 0) {
-            vga_take(pid);
-        } else {
-            synth_reap(pid);
-        }
+        /* Normal/TSR exit transferred the live VGA to us; Ctrl-Break already
+         * restored our recovery image. Reaping only frees bookkeeping; then
+         * preserve valid text output or normalize graphics once, immediately
+         * before returning to our in-process caller. */
+        synth_reap(pid);
+        ensure_standard_text_mode();
         return (int)exit_al;
     }
 }
@@ -563,7 +558,7 @@ static int run_external_raw(char **argv, int argc, int poll_kbd, unsigned char v
  *
  * No copy: the trampoline-prefix injection writes back into the caller's
  * own argv slots and we hand a pointer slice to run_external_raw. */
-static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) {
+static int dispatch_external(char **argv, int prog_idx, int argc, int interactive) {
     char resolved[80];
     unsigned char flags;
     unsigned char viopl;
@@ -592,7 +587,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
         argv[prog_idx] = command_com_path;
         argv[prog_idx + 1] = "/B";
         argv[prog_idx + 2] = resolved;
-        return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, 1);
+        return run_external_raw(&argv[prog_idx], argc - prog_idx, interactive, 1);
     }
     argv[prog_idx] = resolved;
     flags = lookup_flags(resolved);
@@ -664,7 +659,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
         refresh_bda_clock();
         return rc;
     }
-    return run_external_raw(&argv[prog_idx], argc - prog_idx, poll_kbd, viopl);
+    return run_external_raw(&argv[prog_idx], argc - prog_idx, interactive, viopl);
 }
 
 /* ----- built-ins -----
@@ -680,7 +675,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int poll_kbd) 
  * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
  * caller-reserved scratch slots that dispatch_external may overwrite for
  * trampoline-prefix injection. Returns the command's exit code. */
-static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
+static int run_command(char **argv, int prog_idx, int argc, int interactive) {
     const char *name;
     int args = prog_idx + 1;            /* index of first argument token */
     int nargs = argc - args;            /* number of argument tokens */
@@ -767,7 +762,7 @@ static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
             return 1;
         }
         trace(1);
-        rc = run_command(argv, args, argc, poll_kbd);
+        rc = run_command(argv, args, argc, interactive);
         trace(0);
         return rc;
     }
@@ -789,7 +784,7 @@ static int run_command(char **argv, int prog_idx, int argc, int poll_kbd) {
     }
 
     /* Tail: not a built-in -- spawn as external program. */
-    return dispatch_external(argv, prog_idx, argc, poll_kbd);
+    return dispatch_external(argv, prog_idx, argc, interactive);
 }
 
 /* ----- batch interpreter ----- */
@@ -891,6 +886,7 @@ int main(int argc, char *argv[]) {
 
     /* /C path: argv[2] is the program/builtin, argv[3..] are its args.
      * argv[0] and argv[1] are guaranteed scratch for trampoline prefixes.
-     * Interactive launcher mode -- poll kbd so Ctrl-Z backgrounds. */
+     * Interactive launcher mode -- an OSD switch back to this task releases
+     * the still-running child and returns directly to the caller. */
     return run_command(argv, 2, argc, 1);
 }
