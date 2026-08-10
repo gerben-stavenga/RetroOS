@@ -16,23 +16,25 @@ own. Without it the kernel boots but has no shell to start.
 ```bash
 sudo ./setup-cdrive.sh            # C: content, including C:\BOOT  (first time)
 
-bazelisk build //kernel:kernel_elf //kernel:kernel_sym   # as yourself
-sudo tools/install_kernel.sh      # kernel + symbols                (every rebuild)
+bazelisk build //kernel:kernel_elf //kernel:kernel_sym //tools/command:command_com
+sudo tools/install_kernel.sh      # kernel + symbols + COMMAND.COM  (every rebuild)
 ```
 
-`install_kernel.sh` is the one to re-run after a build. It installs **two**
+`install_kernel.sh` is the one to re-run after a build. It installs **three**
 files, and they must come from the same build:
 
 | file | destination | what it is |
 |---|---|---|
 | `kernel.elf` | `/boot/retroos/kernel.elf` | what GRUB multiboots — stripped, ~763 KB |
 | `kernel.sym` | `<C:>/BOOT/KERNEL.SYM` | symbol table for panic backtraces, ~276 KB |
+| `COMMAND.COM` | `<C:>/BOOT/COMMAND.COM` | DOS launcher and OSD task-return policy |
 
 `kernel.elf` carries no symbol table, so a backtrace is named only if
 `KERNEL.SYM` is present *and* matches. A stale symbol file is worse than a
-missing one — the addresses still resolve, to the wrong functions — which is
-why one script does both rather than two steps you might do separately. The
-boot line `Loading kernel symbols (N bytes)` confirms it took.
+missing one — the addresses still resolve, to the wrong functions. A stale
+COMMAND.COM can likewise make task handoff semantics disagree with the kernel,
+which is why one script installs all three. The boot line
+`Loading kernel symbols (N bytes)` confirms the symbol file was loaded.
 
 Append to `/etc/grub.d/40_custom`:
 

@@ -517,8 +517,10 @@ static int run_external_raw(char **argv, int argc, int interactive, unsigned cha
         if (rc < 0) return 255;          /* no such child / EINVAL */
         if (rc == 0) break;              /* exited */
         if (interactive) {
-            puts("[Backgrounded]");
-            ensure_standard_text_mode();
+            /* OSD already restored the caller's VGA snapshot when it moved
+             * focus back here. This is a pure function return: touching the
+             * mode or framebuffer would destroy screens (DN in particular)
+             * whose contents are the caller's saved execution state. */
             return 0;
         }
     }
