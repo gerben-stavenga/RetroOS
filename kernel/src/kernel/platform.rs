@@ -53,7 +53,7 @@ pub struct Platform {
     /// Preferred packed mode advertised by the native video BIOS. It may be a
     /// linear framebuffer or a firmware-banked aperture.
     /// Discovered once at boot; selecting/mapping it still requires ownership
-    /// of the `NativeVga` capability.
+    /// of the move-only `VgaCap`.
     pub vbe_mode: Option<VbeMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
@@ -86,11 +86,11 @@ pub enum Host {
     Interp,
 }
 
-/// Kernel record of the mode established on the physical VGA adapter. This is
-/// deliberately outside `//lib:vga`: the library models a VGA and has no
-/// knowledge of hardware ownership or firmware-controlled devices.
+/// Move-only physical VGA/display capability plus the firmware mode metadata
+/// needed to operate it. This deliberately says nothing about whether the
+/// adapter's registers and VRAM are an authoritative VGA state.
 #[derive(Debug)]
-pub enum NativeVga {
+pub enum VgaCap {
     Legacy,
     Vbe {
         mode: VbeMode,
@@ -98,13 +98,32 @@ pub enum NativeVga {
     },
 }
 
+/// A physical VGA whose registers and VRAM are the authoritative VGA state.
+/// Removing the wrapper explicitly marks that state captured/dirty and leaves
+/// only the move-only display capability.
+#[derive(Debug)]
+pub struct NativeVga(VgaCap);
+
 impl Default for NativeVga {
     fn default() -> Self { Self::new() }
 }
 
 impl NativeVga {
-    pub fn new() -> Self { Self::Legacy }
+    pub fn new() -> Self { Self(VgaCap::Legacy) }
 
+    pub fn discard_state(self) -> VgaCap {
+        self.0
+    }
+
+    pub fn vbe_mode(&self) -> Option<VbeMode> {
+        self.0.vbe_mode()
+    }
+
+    pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
+    pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
+}
+
+impl VgaCap {
     pub fn vbe_mode(&self) -> Option<VbeMode> {
         match self {
             Self::Legacy => None,
@@ -129,6 +148,10 @@ impl NativeVga {
             bank.current = current;
         }
     }
+
+    /// Mark the hardware state authoritative again after a complete software
+    /// VGA has been restored into the adapter.
+    pub(crate) fn restored(self) -> NativeVga { NativeVga(self) }
 }
 
 pub struct ProbedPlatform {
@@ -413,7 +436,7 @@ pub fn probe<A: crate::Arch>(
     }
     let p = get();
     let display = display.unwrap_or_else(|| {
-        crate::kernel::display::Display::new_vga(NativeVga::new())
+        crate::kernel::display::Display::new_vga(NativeVga::new().discard_state())
     });
     println!(
         "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",

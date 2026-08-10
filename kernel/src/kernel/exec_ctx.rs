@@ -70,7 +70,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
             return;
         }
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
-        verify_cpu_hash(new, "switch-in");
+        verify_kernel_cpu_hash(&new.kernel, "switch-in");
         // Registers are plain data: park the outgoing set, load the incoming.
         old.kernel.vcpu.regs = self.regs;
         self.regs = new.kernel.vcpu.regs;
@@ -94,11 +94,9 @@ impl<A: crate::Arch> ExecutionContext<A> {
     }
 }
 
-/// Verify that a thread's saved cpu_state still matches the hash recorded on
-/// the last switch-out. Print a diff-style dump on mismatch.
-/// `tag` is printed in the header ("switch-in" / "reblock" / ...).
-pub(crate) fn verify_cpu_hash<A: crate::Arch>(t: &thread::Thread<A>, tag: &str) {
-    let k = &t.kernel;
+/// Verify that saved CPU state still matches the hash recorded on the last
+/// switch-out. Print a diff-style dump on mismatch.
+fn verify_kernel_cpu_hash<A: crate::Arch>(k: &thread::KernelThread<A>, tag: &str) {
     if k.cpu_hash == 0 { return; }
     let actual = thread::hash_regs(&k.vcpu.regs);
     if actual == k.cpu_hash { return; }

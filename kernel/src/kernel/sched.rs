@@ -32,12 +32,12 @@ pub fn verdict<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
-    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, display_handoff, sb_handoff) {
+    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, exiting_display, sb_handoff) {
         Some(n) => Some(n),
         None => focus_request(threads, tid),
     };
@@ -53,23 +53,24 @@ pub fn verdict<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 fn next_after<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     match action {
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(
-            threads, machine, bios_workspace, tid, code, display_handoff, sb_handoff,
+            threads, machine, bios_workspace.as_deref_mut(), tid, code, exiting_display, sb_handoff,
         )),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
-            crate::kernel::startup::handle_fork_exec(machine, threads, regs, tid,
+            crate::kernel::startup::handle_fork_exec(
+                machine, bios_workspace.as_deref_mut(), threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
                 on_error, on_success,
             )
@@ -79,7 +80,7 @@ fn next_after<A: crate::Arch>(
         }
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
             crate::kernel::linux::handle_exec(
-                machine, threads, regs, tid, buffer, path, args, cwd, display_handoff, sb_handoff,
+                machine, threads, regs, tid, buffer, path, args, cwd, exiting_display, sb_handoff,
             )
         }
         thread::KernelAction::Wait { pid, status_ptr } => {

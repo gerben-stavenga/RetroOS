@@ -62,7 +62,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     fn probe_state_size(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::NativeVga,
+        display: &crate::kernel::platform::VgaCap,
     ) -> Option<usize> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
@@ -93,7 +93,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_save_state(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::NativeVga,
+        display: &crate::kernel::platform::VgaCap,
     ) -> Option<VbeState> {
         if !self.state_probed {
             self.state_bytes = self.probe_state_size(machine, display);
@@ -129,7 +129,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_restore_state(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::NativeVga,
+        display: &crate::kernel::platform::VgaCap,
         state: &VbeState,
     ) -> Result<(), BiosError> {
         if state.0.is_empty() || state.0.len() > Self::MAX_STATE_BYTES {
@@ -162,7 +162,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_set_mode(
         &mut self,
         machine: &mut A,
-        bios_display: &mut crate::kernel::platform::NativeVga,
+        bios_display: &mut crate::kernel::platform::VgaCap,
         mode: u16,
     ) -> Result<(), BiosError> {
         self.bios_set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
@@ -173,7 +173,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_set_mode_request(
         &mut self,
         machine: &mut A,
-        bios_display: &mut crate::kernel::platform::NativeVga,
+        bios_display: &mut crate::kernel::platform::VgaCap,
         request: u16,
     ) -> Result<(), BiosError> {
         if crate::kernel::platform::get().firmware
@@ -219,7 +219,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_set_bank(
         &mut self,
         machine: &mut A,
-        display: &mut crate::kernel::platform::NativeVga,
+        display: &mut crate::kernel::platform::VgaCap,
         bank: u16,
     ) -> Result<(), BiosError> {
         let mut regs = self.bios_vcpu.regs;
@@ -243,7 +243,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_palette_call(
         &mut self,
         machine: &mut A,
-        display: &mut crate::kernel::platform::NativeVga,
+        display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
         buffer: Option<&mut [u8]>,
         copy_to_bios: bool,
@@ -318,7 +318,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn bios_font_call(
         &mut self,
         machine: &mut A,
-        display: &mut crate::kernel::platform::NativeVga,
+        display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
         font: Option<&[u8]>,
     ) -> Result<(), BiosError> {
@@ -362,12 +362,12 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn present(
         &mut self,
         machine: &mut A,
-        display: &mut crate::kernel::platform::NativeVga,
+        display: &mut crate::kernel::platform::VgaCap,
         shadow_height: usize,
         shadow: &[u8],
     ) -> Result<usize, BiosError> {
         let mode = match display {
-            crate::kernel::platform::NativeVga::Vbe { mode, bank: Some(_) } => *mode,
+            crate::kernel::platform::VgaCap::Vbe { mode, bank: Some(_) } => *mode,
             _ => return Err(BiosError::InvalidFrame),
         };
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
@@ -471,7 +471,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     pub fn discover_vbe(
         &mut self,
         machine: &mut A,
-        bios_display: &crate::kernel::platform::NativeVga,
+        bios_display: &crate::kernel::platform::VgaCap,
     ) -> Option<crate::kernel::platform::VbeMode> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
@@ -590,7 +590,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     fn with_bios_clone<T, F, G>(
         &mut self,
         machine: &mut A,
-        bios_display: &crate::kernel::platform::NativeVga,
+        bios_display: &crate::kernel::platform::VgaCap,
         regs: &mut Regs,
         configure: F,
         collect: G,

@@ -14,7 +14,7 @@
 use crate::Regs;
 use core::sync::atomic::Ordering;
 
-use super::machine::{PcMachine, vga::{DosVga, SVGA_LFB_BASE, VGA_VRAM_BASE}};
+use super::machine::{PcMachine, vga::{DisplayedVga, DosVga, SVGA_LFB_BASE, VGA_VRAM_BASE}};
 use ::vga::VgaState;
 
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
@@ -321,9 +321,8 @@ fn voodoo_display_tick<A: crate::Arch>(
     // means this thread does not own the console: a Glide program in the
     // background still swaps, it just is not seen.
     let display = match &mut pc.vga {
-        DosVga::Emulated(dev) => dev.display.as_mut(),
-        DosVga::Native(_) => None,
-        DosVga::Transition => panic!("Voodoo scanout during VGA transition"),
+        DosVga::Displayed(DisplayedVga::Emulated(_, display)) => Some(display),
+        DosVga::Displayed(DisplayedVga::Native(_)) | DosVga::Hidden(_) => None,
     };
     if let Some(display) = display {
         // Hosted windows track the card's native geometry. A framebuffer's
@@ -371,9 +370,10 @@ pub fn display_tick<A: crate::Arch>(
     }
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
-    let DosVga::Emulated(dev) = &mut pc.vga else { return };
+    let DosVga::Displayed(DisplayedVga::Emulated(dev, display)) = &mut pc.vga else {
+        return;
+    };
     let vga = &mut dev.state;
-    let Some(display) = &mut dev.display else { return };
     if display.is_headless() { return; }
     let prof = crate::kernel::startup::profile_enabled();
     if !display.is_host() {

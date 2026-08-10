@@ -255,10 +255,7 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         match self {
             Self::Dos(dos) => {
-                let crate::kernel::dos::DosVga::Emulated(vga) = &mut dos.pc.vga else {
-                    panic!("native DOS VGA was not suspended for OSD")
-                };
-                assert!(vga.display.replace(display).is_none(), "DOS VGA already has a display");
+                dos.pc.vga.hold_surface(display);
             }
             Self::Linux(_) => crate::kernel::linux::restore_console_vga(display),
         }
@@ -271,15 +268,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn take_display_for_osd(&mut self) -> Option<crate::kernel::display::Display> {
         match self {
             Self::Dos(dos) => {
-                match &mut dos.pc.vga {
-                    crate::kernel::dos::DosVga::Emulated(vga) => Some(
-                        vga.display.take().expect("OSD-visible DOS VGA lost its display"),
-                    ),
-                    crate::kernel::dos::DosVga::Native(_) => None,
-                    crate::kernel::dos::DosVga::Transition => {
-                        panic!("OSD closed during VGA transition")
-                    }
-                }
+                dos.pc.vga.take_surface()
             }
             Self::Linux(_) => Some(crate::kernel::linux::save_console_vga()),
         }
@@ -892,7 +881,7 @@ pub fn exit_thread<A: crate::Arch>(
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     tid: usize,
     exit_code: i32,
-    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
@@ -901,12 +890,36 @@ pub fn exit_thread<A: crate::Arch>(
     // parent's detached VGA is an error/background-switch recovery image, not
     // something to replay on the normal DOS EXEC return path. Ctrl-Break and
     // fault termination restore it; normal exit and TSR retain live VGA state.
-    let return_live_vga = tid == crate::kernel::focus::focused()
-        && matches!(term_type, 0x00 | 0x03)
+    let return_dos_vga = matches!(term_type, 0x00 | 0x03)
         && matches!(threads[tid].personality, Personality::Dos(_))
         && parent_tid >= 0
         && (parent_tid as usize) < MAX_THREADS
         && matches!(threads[parent_tid as usize].personality, Personality::Dos(_));
+
+    // DOS EXEC return transfers the complete VGA ownership state, not a
+    // display-shaped subset. A focused child gives the parent DisplayedVga;
+    // a hidden child gives it EmulatedVga. The parent's saved recovery VGA
+    // moves into the dying slot and is simply discarded with that slot.
+    if return_dos_vga {
+        let child_was_focused = tid == crate::kernel::focus::focused();
+        let (child, parent) = get_two_threads(threads, tid, parent_tid as usize);
+        let (Personality::Dos(child_dos), Personality::Dos(parent_dos)) =
+            (&mut child.personality, &mut parent.personality)
+        else { unreachable!() };
+        child_dos.pc.vga.prepare_thread_transfer(machine);
+        match (&child_dos.pc.vga, &parent_dos.pc.vga) {
+            (crate::kernel::dos::DosVga::Displayed(_), crate::kernel::dos::DosVga::Hidden(_))
+            | (crate::kernel::dos::DosVga::Hidden(_), crate::kernel::dos::DosVga::Hidden(_)) => {}
+            (crate::kernel::dos::DosVga::Displayed(_), crate::kernel::dos::DosVga::Displayed(_)) =>
+                panic!("DOS child and parent both own a displayed VGA"),
+            (crate::kernel::dos::DosVga::Hidden(_), crate::kernel::dos::DosVga::Displayed(_)) =>
+                panic!("hidden DOS child returned to displayed parent"),
+        }
+        core::mem::swap(&mut child_dos.pc.vga, &mut parent_dos.pc.vga);
+        if child_was_focused {
+            crate::kernel::focus::adopt(parent_tid as usize);
+        }
+    }
 
     // Tear down the dying thread (only touches threads[tid]).
     {
@@ -916,14 +929,9 @@ pub fn exit_thread<A: crate::Arch>(
         // DOS parent adopts the unchanged live token; other successors restore
         // their own detached model.
         if tid == crate::kernel::focus::focused() {
-            let display = if return_live_vga {
-                let Personality::Dos(dos) = &mut thread.personality else { unreachable!() };
-                dos.release_live_display()
-            } else {
-                thread.personality.suspend(machine, bios_workspace)
-            };
-            assert!(display_handoff.is_none(), "unconsumed display handoff");
-            *display_handoff = Some(display);
+            let display = thread.personality.suspend(machine, bios_workspace);
+            assert!(exiting_display.is_none(), "unconsumed exiting display");
+            *exiting_display = Some(display);
         }
         // The card outlives its holder: whatever the dying thread had goes
         // back into the handoff for the next owner, exactly as the display
@@ -934,7 +942,7 @@ pub fn exit_thread<A: crate::Arch>(
         }
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(
-                machine, &mut thread.kernel.vcpu, !return_live_vga),
+                machine, &mut thread.kernel.vcpu, !return_dos_vga),
             Personality::Linux(_) => {}
         }
         thread.kernel.close_all_fds();
@@ -948,10 +956,6 @@ pub fn exit_thread<A: crate::Arch>(
     let mut woke_parent = false;
     if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS && parent_tid as usize != tid {
         let (thread, parent) = get_two_threads(threads, tid, parent_tid as usize);
-        if return_live_vga {
-            let Personality::Dos(dos) = &mut parent.personality else { unreachable!() };
-            dos.pc.vga.adopt_live_on_next_present();
-        }
         let was_waiting = parent.kernel.state == ThreadState::Blocked;
         if was_waiting {
             parent.kernel.state = ThreadState::Ready;

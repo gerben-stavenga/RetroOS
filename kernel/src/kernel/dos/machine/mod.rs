@@ -475,7 +475,9 @@ impl PcMachine {
             return;
         }
 
-        if matches!(self.vga, vga::DosVga::Emulated(_))
+        if matches!(self.vga,
+            vga::DosVga::Hidden(_) |
+            vga::DosVga::Displayed(vga::DisplayedVga::Emulated(_, _)))
             && vga::svga_lfb_reserved_contains(physical, size)
         {
             // The substitute adapter reports a bus-looking address for RAM it
@@ -606,9 +608,13 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         0x3DA => {
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
-            if let vga::DosVga::Emulated(dev) = &mut pc.vga {
-                dev.state.ac_state.pending_data = false;
-                return input_status1(machine, &pc.present_scratch2);
+            match &mut pc.vga {
+                vga::DosVga::Hidden(dev)
+                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => {
+                    dev.state.ac_state.pending_data = false;
+                    return input_status1(machine, &pc.present_scratch2);
+                }
+                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {}
             }
             crate::kernel::drivers::vga_hw::track_ac_reset();
             machine.inb(0x3DA)
@@ -617,9 +623,10 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
             match &mut pc.vga {
-                vga::DosVga::Emulated(dev) => dev.state.port_read(port),
-                vga::DosVga::Native(_) => machine.inb(port),
-                vga::DosVga::Transition => panic!("VGA port read during ownership transition"),
+                vga::DosVga::Hidden(dev)
+                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) =>
+                    dev.state.port_read(port),
+                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => machine.inb(port),
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
@@ -718,9 +725,13 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
-            if let vga::DosVga::Emulated(dev) = &mut pc.vga {
-                dev.state.port_write(port, val);
-                return;
+            match &mut pc.vga {
+                vga::DosVga::Hidden(dev)
+                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => {
+                    dev.state.port_write(port, val);
+                    return;
+                }
+                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {}
             }
             // Native card: the flip-flop and index are write-only in the
             // silicon, so the card's own driver tracks them.
@@ -728,9 +739,13 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
-            let vga::DosVga::Emulated(dev) = &mut pc.vga else {
-                machine.outb(port, val);
-                return;
+            let dev = match &mut pc.vga {
+                vga::DosVga::Hidden(dev)
+                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => dev,
+                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {
+                    machine.outb(port, val);
+                    return;
+                }
             };
             let old_gc6 = (port == 0x3CF && dev.state.gc_index & 0x0F == 6)
                 .then_some(dev.state.gc[6]);

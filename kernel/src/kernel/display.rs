@@ -44,16 +44,15 @@ pub struct Display {
     backend: Backend,
 }
 
-/// Console ownership in transit. A native VGA does not become a kernel
-/// render surface merely because it moves from one DOS owner to another.
+/// Scanout ownership between two complete VGA/personality states. `Vga` is
+/// only the physical display capability; the authoritative VGA state remains
+/// in the outgoing/incoming `EmulatedVga` during the handoff.
 pub enum DisplayHandoff {
     Surface(Display),
-    NativeVga(crate::kernel::platform::NativeVga),
+    Vga(crate::kernel::platform::VgaCap),
 }
 
 impl DisplayHandoff {
-    /// Materialize a surface only for an owner that actually renders through
-    /// [`Display`] (Linux or the kernel console).
     pub fn into_surface<A: crate::Arch>(
         self,
         machine: &mut A,
@@ -61,7 +60,7 @@ impl DisplayHandoff {
     ) -> Display {
         match self {
             Self::Surface(display) => display,
-            Self::NativeVga(native) => Display::new_console(
+            Self::Vga(native) => Display::new_console(
                 machine,
                 bios.expect("native VGA surface without BIOS workspace"),
                 native,
@@ -74,15 +73,15 @@ enum Backend {
     Linear(Framebuffer),
     Vbe {
         framebuffer: Framebuffer,
-        native: crate::kernel::platform::NativeVga,
+        native: crate::kernel::platform::VgaCap,
         pages: usize,
     },
     VbeBanked {
-        native: crate::kernel::platform::NativeVga,
+        native: crate::kernel::platform::VgaCap,
     },
     Vga {
         framebuffer: Framebuffer,
-        native: crate::kernel::platform::NativeVga,
+        native: crate::kernel::platform::VgaCap,
         saved: alloc::boxed::Box<vga::VgaState>,
     },
     Host,
@@ -113,7 +112,7 @@ impl Display {
     pub fn new_selected<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        mut native: crate::kernel::platform::NativeVga,
+        mut native: crate::kernel::platform::VgaCap,
     ) -> Self {
         match crate::kernel::platform::get().vbe_mode {
             Some(mode) if mode.physical_base != 0 => Self::new_vbe(machine, bios, native, mode)
@@ -135,7 +134,7 @@ impl Display {
     pub fn new_console<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        mut native: crate::kernel::platform::NativeVga,
+        mut native: crate::kernel::platform::VgaCap,
     ) -> Self {
         if let Some(mode) = crate::kernel::platform::get().vbe_mode
             && mode.physical_base != 0
@@ -160,7 +159,7 @@ impl Display {
     }
 
     /// Establish the VGA adapter as a known packed linear Mode 13h display.
-    pub fn new_vga(native: crate::kernel::platform::NativeVga) -> Self {
+    pub fn new_vga(native: crate::kernel::platform::VgaCap) -> Self {
         let mut saved = vga::VgaState::new_boxed();
         // A legacy owner must be restored register-for-register. A VBE owner
         // is restored by its firmware mode set and framebuffer handoff; running
@@ -203,9 +202,9 @@ impl Display {
     pub fn new_vbe<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        mut native: crate::kernel::platform::NativeVga,
+        mut native: crate::kernel::platform::VgaCap,
         mode: crate::kernel::platform::VbeMode,
-    ) -> Result<Self, crate::kernel::platform::NativeVga> {
+    ) -> Result<Self, crate::kernel::platform::VgaCap> {
         let FormatSpec::Packed(rgb) = mode.format else { return Err(native) };
         if mode.physical_base == 0 {
             return Err(native);
@@ -249,9 +248,9 @@ impl Display {
     pub fn new_banked_vbe<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        mut native: crate::kernel::platform::NativeVga,
+        mut native: crate::kernel::platform::VgaCap,
         mode: crate::kernel::platform::VbeMode,
-    ) -> Result<Self, crate::kernel::platform::NativeVga> {
+    ) -> Result<Self, crate::kernel::platform::VgaCap> {
         let FormatSpec::Packed(rgb) = mode.format else { return Err(native) };
         if mode.physical_base != 0 || mode.window_segment == 0
             || mode.window_granularity_kb == 0 || mode.window_size_kb == 0
@@ -296,7 +295,7 @@ impl Display {
             _ => (source_width, 1),
         }
     }
-    pub fn native_vga(&self) -> Option<&crate::kernel::platform::NativeVga> {
+    pub fn vga_capability(&self) -> Option<&crate::kernel::platform::VgaCap> {
         match &self.backend {
             Backend::Vbe { native, .. }
             | Backend::VbeBanked { native, .. }
@@ -304,10 +303,10 @@ impl Display {
             _ => None,
         }
     }
-    pub fn into_native_vga<A: crate::Arch>(
+    pub fn into_native_capability<A: crate::Arch>(
         self,
         machine: &mut A,
-    ) -> Result<crate::kernel::platform::NativeVga, Self> {
+    ) -> Result<crate::kernel::platform::VgaCap, Self> {
         match self.backend {
             Backend::Vbe { native, pages, .. } => {
                 machine.unmap_range(arch_abi::FB_WINDOW_BASE / crate::PAGE_SIZE, pages);
@@ -331,7 +330,7 @@ impl Display {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> Self {
-        match self.into_native_vga(machine) {
+        match self.into_native_capability(machine) {
             Ok(native) => Self::new_selected(machine, bios, native),
             Err(display) => display,
         }

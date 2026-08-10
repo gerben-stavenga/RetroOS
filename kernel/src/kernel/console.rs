@@ -193,8 +193,8 @@ impl Console {
         Self { display }
     }
 
-    pub fn bios_display(&self) -> Option<&crate::kernel::platform::NativeVga> {
-        self.display.native_vga()
+    pub fn bios_display(&self) -> Option<&crate::kernel::platform::VgaCap> {
+        self.display.vga_capability()
     }
 
     /// Give up the display. The console ceases to exist; whoever takes the

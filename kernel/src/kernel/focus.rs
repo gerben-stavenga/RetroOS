@@ -26,12 +26,7 @@ pub fn adopt(tid: usize) {
     FOCUS.store(tid, Ordering::Relaxed);
 }
 
-/// First half of a console handoff: snapshot the outgoing owner's screen
-/// state. Runs while the old thread's context is still the live one. `old`
-/// is None when the previous owner is already gone (zombie — `exit_thread`
-/// snapshotted its farewell screen before teardown).
-/// The Sound Blaster comes back with the display: one machine, one card, and
-/// the owner is whoever the machine is currently showing.
+/// Detach the outgoing display while its guest address space is active.
 pub fn release<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
@@ -41,13 +36,7 @@ pub fn release<A: crate::Arch>(
     (old.suspend(machine, bios_workspace), card)
 }
 
-/// Second half: repaint the incoming owner's screen state and record it as
-/// the console owner. Runs after the execution switch, with the new
-/// thread's context live — materialize ordering matches the pre-focus-API
-/// behaviour exactly.
-/// Returns the card the incoming owner did NOT take (a Linux thread, or any
-/// thread on a machine whose card the kernel mixer owns), so it stays in the
-/// caller's handoff rather than being dropped.
+/// Attach the incoming display after its guest address space is active.
 pub fn acquire<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,

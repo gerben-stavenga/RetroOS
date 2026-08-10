@@ -9,7 +9,7 @@
 //! `machine.rs`, and XMS/EMS/UMA in their own files.
 //!
 //! DOS always boots from a COW template containing the Rust substitute BIOS.
-//! Native video firmware is not part of a DOS address space; `DosVga::Native`
+//! Native video firmware is not part of a DOS address space; a native `DisplayedVga`
 //! delegates only physical display operations to the kernel-owned
 //! `BiosDisplayWorkspace`.
 
@@ -58,7 +58,7 @@ use self::dosabi as dos;
 mod mode_transitions;
 
 pub use machine::vsb::SbDevice;
-pub use machine::vga::{DosVga, physical_vga_present};
+pub use machine::vga::{DisplayedVga, DosVga, physical_vga_present};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
@@ -309,7 +309,8 @@ impl<A: crate::Arch> DosState<A> {
     /// DOS thread. Encapsulates any per-resume side effects (right now: point
     /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
-    pub fn on_resume(&self, machine: &mut A) {
+    pub fn on_resume(&mut self, machine: &mut A) {
+        self.pc.vga.on_address_space_active(machine);
         machine.load_ldt(&self.ldt[..]);
     }
 
@@ -322,25 +323,7 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     ) -> crate::kernel::display::DisplayHandoff {
-        let vga = self.pc.vga.take_for_transition();
-        let (vga, display) = vga.into_emulated(machine, bios_workspace);
-        self.pc.vga = vga;
-        display
-    }
-
-    /// Normal DOS child return: move the live adapter capability out without
-    /// saving or changing any VGA state. The dying personality is never run
-    /// again and remains in `Transition` until its zombie slot is reaped.
-    pub(crate) fn release_live_display(
-        &mut self,
-    ) -> crate::kernel::display::DisplayHandoff {
-        match self.pc.vga.take_for_transition() {
-            machine::vga::DosVga::Native(native) =>
-                crate::kernel::display::DisplayHandoff::NativeVga(native),
-            machine::vga::DosVga::Emulated(_) =>
-                panic!("normal VGA return from a non-native child"),
-            machine::vga::DosVga::Transition => panic!("VGA return re-entered"),
-        }
+        machine::vga::release_display(&mut self.pc.vga, machine, bios_workspace)
     }
 
     pub(super) fn suspend_for_osd(
@@ -349,19 +332,17 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::Display {
         let linear_vbe = match &self.pc.vga {
-            machine::vga::DosVga::Native(
-                crate::kernel::platform::NativeVga::Vbe { mode, bank: None },
-            ) => Some(*mode),
-            machine::vga::DosVga::Native(crate::kernel::platform::NativeVga::Legacy)
-            | machine::vga::DosVga::Native(
-                crate::kernel::platform::NativeVga::Vbe { bank: Some(_), .. },
-            )
-            | machine::vga::DosVga::Emulated(_) => None,
-            machine::vga::DosVga::Transition => panic!("OSD opened during VGA transition"),
+            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Native(native)) =>
+                match native.cap() {
+                    crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
+                    crate::kernel::platform::VgaCap::Legacy
+                    | crate::kernel::platform::VgaCap::Vbe { bank: Some(_), .. } => None,
+                },
+            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Emulated(_, _))
+            | machine::vga::DosVga::Hidden(_) => None,
         };
-        let vga = self.pc.vga.take_for_transition();
-        let (vga, display) = vga.into_emulated_for_osd(machine, bios_workspace);
-        self.pc.vga = vga;
+        let display = self.pc.vga.map(|vga|
+            vga.into_emulated_for_osd(machine, bios_workspace));
         if let Some(mode) = linear_vbe
             && let Some(dpmi) = self.dpmi.as_ref()
         {
@@ -384,8 +365,8 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
-        let vga = self.pc.vga.take_for_transition();
-        self.pc.vga = vga.present(machine, display, bios_workspace);
+        machine::vga::acquire_display(
+            &mut self.pc.vga, machine, bios_workspace, display);
     }
 
     pub(super) fn materialize_from_osd(
@@ -394,12 +375,14 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::Display,
     ) {
-        let vga = self.pc.vga.take_for_transition();
-        self.pc.vga = vga.raise_from_osd(machine, bios_workspace, display);
+        self.pc.vga.map(|vga|
+            (vga.raise_from_osd(machine, bios_workspace, display), ()));
         let linear_vbe = match &self.pc.vga {
-            machine::vga::DosVga::Native(
-                crate::kernel::platform::NativeVga::Vbe { mode, bank: None },
-            ) => Some(*mode),
+            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Native(native)) =>
+                match native.cap() {
+                    crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
+                    _ => None,
+                },
             _ => None,
         };
         if let Some(mode) = linear_vbe
@@ -612,7 +595,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-    let machine::vga::DosVga::Emulated(dev) = &mut dos.pc.vga else { return false };
+    let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
     let (base, len) = machine::vga::planar_window(dev.state.gc[6]);
     if !(base..base + len).contains(&addr) {
         return false;

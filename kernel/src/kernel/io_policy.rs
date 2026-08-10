@@ -31,7 +31,9 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
     match personality {
         Personality::Dos(_) => {
             if matches!(personality, Personality::Dos(dos)
-                if matches!(dos.pc.vga, crate::kernel::dos::DosVga::Native(_)))
+                if matches!(dos.pc.vga,
+                    crate::kernel::dos::DosVga::Displayed(
+                        crate::kernel::dos::DisplayedVga::Native(_))))
             {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
@@ -97,7 +99,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
 /// the next thread's narrower bitmap afterward.
 pub(crate) fn apply_bios_display<A: crate::Arch>(
     machine: &mut A,
-    _bios_display: &crate::kernel::platform::NativeVga,
+    _bios_display: &crate::kernel::platform::VgaCap,
 ) {
     machine.reset_io_bitmap();
     machine.allow_io_ports(0x3C0, 0x20);

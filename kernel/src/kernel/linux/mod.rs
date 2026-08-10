@@ -1241,7 +1241,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
-    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;
@@ -1261,7 +1261,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1).is_err() {
         return Some(thread::exit_thread(
-            threads, machine, None, tid, -ENOEXEC, display_handoff, sb_handoff,
+            threads, machine, None, tid, -ENOEXEC, exiting_display, sb_handoff,
         ));
     }
 

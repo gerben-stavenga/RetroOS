@@ -38,10 +38,10 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // Preserve a pristine real-mode environment for this and all later
     // firmware calls; DOS personalities receive their separate substitute BIOS.
     let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
-    let vbe_mode = display.native_vga()
+    let vbe_mode = display.vga_capability()
         .and_then(|native| bios_workspace.discover_vbe(machine, native));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
-    let display = match display.into_native_vga(machine) {
+    let display = match display.into_native_capability(machine) {
         Ok(native) => crate::kernel::display::Display::new_console(
             machine, &mut bios_workspace, native),
         Err(display) => display,
@@ -700,7 +700,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut stats = EventStats::new(machine);
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
-    let mut display_handoff = None;
+    let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
@@ -774,7 +774,7 @@ pub fn event_loop<A: crate::Arch>(
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
                     machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
-                    &mut display_handoff, &mut sb_handoff,
+                    &mut exiting_display, &mut sb_handoff,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -790,7 +790,7 @@ pub fn event_loop<A: crate::Arch>(
 
         // The OSD, not the hidden personality, holds the display while open.
         // Before an owner exits, return that capability so exit_thread can
-        // perform its ordinary single release into display_handoff.
+        // perform its ordinary single release into `exiting_display`.
         if matches!(&action, thread::KernelAction::Exit(_))
             && crate::kernel::osd::is_open()
         {
@@ -806,13 +806,13 @@ pub fn event_loop<A: crate::Arch>(
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
             machine, bios_workspace.as_deref_mut(), threads, &mut ctx.regs, ctx.tid, action,
-            &mut display_handoff, &mut sb_handoff,
+            &mut exiting_display, &mut sb_handoff,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
                     machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
-                    &mut display_handoff, &mut sb_handoff,
+                    &mut exiting_display, &mut sb_handoff,
                 );
             }
             crate::kernel::sched::Verdict::AllDead => {
@@ -822,7 +822,7 @@ pub fn event_loop<A: crate::Arch>(
                 // Every owner is gone, so both capabilities are back in this
                 // frame — hand them to whoever runs the next program.
                 return (
-                    display_handoff.take().expect("dead display owner lost token")
+                    exiting_display.take().expect("dead display owner lost token")
                         .into_surface(machine, bios_workspace.as_deref_mut()),
                     sb_handoff.take(),
                 );
@@ -896,10 +896,24 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
-    display_handoff: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {
+        return;
+    }
+    // DOS fork/return can move complete VGA ownership between the two thread
+    // records before execution switches. Focus already names the incoming
+    // owner; transfer only CPU and sound here.
+    if crate::kernel::focus::focused() == new_tid {
+        let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
+        if let Some(card) = old.personality.release_sb(machine) {
+            assert!(sb_handoff.is_none(), "stale SB handoff");
+            *sb_handoff = Some(card);
+        }
+        ctx.switch_to(threads, machine, new_tid);
+        let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
+        *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         return;
     }
     // The monitor is tied to one console owner. A yield/scheduler switch can
@@ -920,27 +934,27 @@ fn switch_focus_and_run<A: crate::Arch>(
             );
         }
     }
-    let display = {
+
+    let old_is_zombie = thread::get_thread(threads, ctx.tid)
+        .expect("switch: invalid old thread").kernel.state == thread::ThreadState::Zombie;
+    let display = if !old_is_zombie {
+        assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
-        if old.kernel.state != thread::ThreadState::Zombie {
-            assert!(display_handoff.is_none(), "stale VGA display handoff");
-            let (display, card) = crate::kernel::focus::release(
-                machine, bios_workspace.as_deref_mut(), &mut old.personality);
-            // A live outgoing owner gives the card up here; a zombie already
-            // did, in `exit_thread`, and its card is waiting in the handoff.
-            if card.is_some() {
-                assert!(sb_handoff.is_none(), "stale SB handoff");
-                *sb_handoff = card;
-            }
-            display
-        } else {
-            display_handoff.take().expect("zombie lost display handoff")
+        let (display, card) = crate::kernel::focus::release(
+            machine, bios_workspace.as_deref_mut(), &mut old.personality);
+        if card.is_some() {
+            assert!(sb_handoff.is_none(), "stale SB handoff");
+            *sb_handoff = card;
         }
+        display
+    } else {
+        exiting_display.take().expect("zombie lost display")
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
     *sb_handoff = crate::kernel::focus::acquire(
-        machine, bios_workspace, new_tid, &mut new.personality, display, sb_handoff.take());
+        machine, bios_workspace, new_tid, &mut new.personality,
+        display, sb_handoff.take());
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -948,6 +962,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
+    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     vcpu: &mut Regs,
     parent_tid: usize,
@@ -1065,18 +1080,6 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         return None;
     }
 
-    // A DOS child inherits the live adapter, not a reconstructed copy. The
-    // ordinary focus release below snapshots the parent and produces the
-    // move-only NativeVga token; marking the child here makes acquire consume
-    // that token without programming the card. Thus fork performs one save
-    // for the parent's recovery image and zero mode/framebuffer restores.
-    if parent_is_dos && crate::kernel::dos::physical_vga_present() {
-        let child = thread::get_thread(threads, child_tid).unwrap();
-        if let thread::Personality::Dos(dos) = &mut child.personality {
-            dos.pc.vga.adopt_live_on_next_present();
-        }
-    }
-
     let child = thread::get_thread(threads, child_tid).unwrap();
     // Restore the parent's address space; the displaced child space re-parks in
     // its slot (init_thread already set the child's entry registers there).
@@ -1139,6 +1142,26 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             // hits the host null page (SEGV'd on DN→PRINCE.EXE, the first
             // task-spawn EXEC on interp).
             crate::kernel::dos::Bda::set_page0_cursor(machine, col, row);
+        }
+    }
+
+    // Thread ownership changes here, as part of DOS fork itself. Snapshot the
+    // parent's authoritative hardware VGA into its recovery state and move the
+    // unchanged NativeVga directly into the child's thread record. The child
+    // maps its physical aperture from `on_resume` when its space becomes live.
+    if parent_is_dos && crate::kernel::dos::physical_vga_present() {
+        let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
+        if let (thread::Personality::Dos(parent), thread::Personality::Dos(child)) =
+            (&mut parent.personality, &mut child.personality)
+        {
+            crate::kernel::dos::DosVga::fork_native_to(
+                &mut parent.pc.vga,
+                &mut child.pc.vga,
+                machine,
+                bios_workspace.as_deref_mut()
+                    .expect("native VGA fork without BIOS workspace"),
+            );
+            crate::kernel::focus::adopt(child_tid);
         }
     }
 
