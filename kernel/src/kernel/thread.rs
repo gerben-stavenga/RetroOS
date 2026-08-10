@@ -177,7 +177,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn adopt_display(
         &mut self,
         machine: &mut A,
-        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::Display,
     ) {
         match self {
@@ -228,7 +228,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn suspend(
         &mut self,
         machine: &mut A,
-        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::DisplayHandoff {
         match self {
             Self::Dos(d) => d.suspend(machine, bios_workspace),
@@ -287,7 +287,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn materialize(
         &mut self,
         machine: &mut A,
-        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
         match self {
@@ -382,7 +382,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn display_tick(
         &mut self,
         machine: &mut A,
-        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         regs: &Regs,
     ) {
         let Self::Dos(dos) = self else { return };
@@ -400,7 +400,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn handle_event(
         &mut self,
         machine: &mut A,
-        bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         kt: &mut KernelThread<A>,
         regs: &mut Regs,
         kevent: crate::KernelEvent,
@@ -878,7 +878,7 @@ pub fn take_switch_target() -> Option<usize> {
 pub fn exit_thread<A: crate::Arch>(
     threads: &mut [Thread<A>],
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     tid: usize,
     exit_code: i32,
     exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,

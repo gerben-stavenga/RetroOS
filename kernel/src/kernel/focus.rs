@@ -29,7 +29,7 @@ pub fn adopt(tid: usize) {
 /// Detach the outgoing display while its guest address space is active.
 pub fn release<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     old: &mut Personality<A>,
 ) -> (crate::kernel::display::DisplayHandoff, Option<crate::kernel::drivers::sb16::SbCard>) {
     let card = old.release_sb(machine);
@@ -39,7 +39,7 @@ pub fn release<A: crate::Arch>(
 /// Attach the incoming display after its guest address space is active.
 pub fn acquire<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     new_tid: usize,
     new: &mut Personality<A>,
     display: crate::kernel::display::DisplayHandoff,

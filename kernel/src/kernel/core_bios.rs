@@ -73,7 +73,13 @@ impl EmulatedVga {
     }
 }
 
-pub struct BiosDisplayWorkspace<A: Arch> {
+/// Runtime native-video firmware service. The object is always present so it
+/// can flow through backend-independent scheduling code; only a native-BIOS
+/// platform has an execution workspace inside it. The interior is deliberately
+/// private and can only be opened by a [`VgaCap`](crate::kernel::platform::VgaCap).
+pub struct BiosDisplayWorkspace<A: Arch>(Option<NativeBiosWorkspace<A>>);
+
+struct NativeBiosWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
     fx: A::Fx,
@@ -83,9 +89,22 @@ pub struct BiosDisplayWorkspace<A: Arch> {
 }
 
 impl<A: Arch> BiosDisplayWorkspace<A> {
+    pub fn new(machine: &mut A) -> Self {
+        let native = (crate::kernel::platform::get().firmware
+            == crate::kernel::platform::Firmware::NativeBios)
+            .then(|| NativeBiosWorkspace::new(machine));
+        Self(native)
+    }
+
+    /// Backend paths which deliberately bypass platform probing (the hosted
+    /// bare-ELF runner) have no native video firmware.
+    pub(crate) fn absent() -> Self { Self(None) }
+}
+
+impl<A: Arch> NativeBiosWorkspace<A> {
     /// Build the real-mode template in the currently active address space,
     /// park a COW snapshot of it, then return the live space to a clean state.
-    pub fn new(machine: &mut A) -> Self {
+    fn new(machine: &mut A) -> Self {
         // Snapshot the firmware view before the DOS substitute BIOS replaces
         // the IVT. This address space is never handed to a personality.
         machine.map_low_mem();
@@ -142,7 +161,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// Save all firmware-visible controller state. Failure means the caller
     /// should retain its direct-register fallback; it is not a fatal display
     /// error because many plain VGA BIOSes predate VBE.
-    pub fn bios_save_state(
+    fn save_state(
         &mut self,
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
@@ -174,11 +193,11 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         ).ok().flatten()
     }
 
-    /// Restore a blob returned by [`bios_save_state`](Self::bios_save_state).
+    /// Restore a blob returned by [`save_state`](Self::save_state).
     /// Call this after restoring framebuffer memory: VBE state includes the
     /// exact hidden VGA/SVGA sequencing state that direct memory access would
     /// otherwise disturb.
-    pub fn bios_restore_state(
+    fn restore_state(
         &mut self,
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
@@ -211,18 +230,18 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// synchronous Rust call: the stopped guest's address space and FPU state
     /// are restored before it returns. The ROM runs in a disposable COW clone,
     /// so neither guest mutations nor BIOS scratch writes touch the template.
-    pub fn bios_set_mode(
+    fn set_mode(
         &mut self,
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
         mode: u16,
     ) -> Result<(), BiosError> {
-        self.bios_set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
+        self.set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
     }
 
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
     /// bit so NativeVga can distinguish an LFB from a banked window.
-    pub fn bios_set_mode_request(
+    fn set_mode_request(
         &mut self,
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
@@ -268,7 +287,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
 
     pub fn modes(&self) -> &[crate::kernel::platform::VbeMode] { &self.modes }
 
-    pub fn bios_set_bank(
+    fn set_bank(
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
@@ -292,7 +311,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// The ROM can only address its private real-mode workspace, so protected-
     /// mode DOS buffers are bounced through [`STATE_BUFFER`]. `offset_in_di`
     /// selects VBE's ES:DI convention; legacy AH=10h uses ES:DX.
-    pub fn bios_palette_call(
+    fn palette_call(
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
@@ -367,7 +386,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// Execute INT 10h AH=11h in the native BIOS workspace. User-font calls
     /// carry their glyph buffer in ES:BP, so the guest pointer is bounced into
     /// the workspace just like palette tables, but with the font convention.
-    pub fn bios_font_call(
+    fn font_call(
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
@@ -411,7 +430,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// disposable BIOS execution space is kept active for the whole frame, so
     /// the only repeated firmware operation is 4F05 itself; the address-space
     /// fork/activation cost is paid once, not once per 64-KiB window.
-    pub fn present(
+    fn present_banked(
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
@@ -520,7 +539,7 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
 
     /// Enumerate the native ROM's VBE modes and choose a conservative packed
     /// display for the host monitor. Discovery does not change the current mode.
-    pub fn discover_vbe(
+    fn discover_vbe(
         &mut self,
         machine: &mut A,
         bios_display: &crate::kernel::platform::VgaCap,
@@ -687,6 +706,126 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         machine.destroy_space(&mut call_space);
         machine.reset_io_bitmap();
         result
+    }
+}
+
+/// Native video-ROM operations are methods on the physical VGA capability:
+/// the receiver proves that the caller owns the adapter, while the workspace
+/// is only the isolated real-mode execution engine.
+impl crate::kernel::platform::VgaCap {
+    fn bios<'a, A: Arch>(
+        &self,
+        bios: &'a mut BiosDisplayWorkspace<A>,
+    ) -> Result<&'a mut NativeBiosWorkspace<A>, BiosError> {
+        bios.0.as_mut().ok_or(BiosError::NoNativeBios)
+    }
+
+    fn bios_ref<'a, A: Arch>(
+        &self,
+        bios: &'a BiosDisplayWorkspace<A>,
+    ) -> Result<&'a NativeBiosWorkspace<A>, BiosError> {
+        bios.0.as_ref().ok_or(BiosError::NoNativeBios)
+    }
+
+    pub fn bios_mode<A: Arch>(
+        &self,
+        bios: &BiosDisplayWorkspace<A>,
+        number: u16,
+    ) -> Option<crate::kernel::platform::VbeMode> {
+        self.bios_ref(bios).ok()?.mode(number)
+    }
+
+    pub fn bios_modes<'a, A: Arch>(
+        &self,
+        bios: &'a BiosDisplayWorkspace<A>,
+    ) -> Option<&'a [crate::kernel::platform::VbeMode]> {
+        Some(self.bios_ref(bios).ok()?.modes())
+    }
+
+    pub fn bios_save_state<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+    ) -> Option<VbeState> {
+        self.bios(bios).ok()?.save_state(machine, self)
+    }
+
+    pub fn bios_restore_state<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        state: &VbeState,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.restore_state(machine, self, state)
+    }
+
+    pub fn bios_set_mode<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        mode: u16,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.set_mode(machine, self, mode)
+    }
+
+    pub fn bios_set_mode_request<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        request: u16,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.set_mode_request(machine, self, request)
+    }
+
+    pub fn bios_set_bank<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        bank: u16,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.set_bank(machine, self, bank)
+    }
+
+    pub fn bios_palette_call<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        caller: &mut Regs,
+        buffer: Option<&mut [u8]>,
+        copy_to_bios: bool,
+        offset_in_di: bool,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.palette_call(
+            machine, self, caller, buffer, copy_to_bios, offset_in_di,
+        )
+    }
+
+    pub fn bios_font_call<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        caller: &mut Regs,
+        font: Option<&[u8]>,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.font_call(machine, self, caller, font)
+    }
+
+    pub fn bios_present<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        shadow_height: usize,
+        shadow: &[u8],
+    ) -> Result<usize, BiosError> {
+        self.bios(bios)?.present_banked(machine, self, shadow_height, shadow)
+    }
+
+    pub fn bios_discover_vbe<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+    ) -> Option<crate::kernel::platform::VbeMode> {
+        self.bios(bios).ok()?.discover_vbe(machine, self)
     }
 }
 

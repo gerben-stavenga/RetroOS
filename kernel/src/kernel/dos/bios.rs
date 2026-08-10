@@ -355,7 +355,7 @@ fn seed_video_static_info<A: crate::Arch>(machine: &mut A) {
 /// the old C BIOS's `interrupt` handlers.
 pub(super) fn dispatch<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> thread::KernelAction {
@@ -694,7 +694,7 @@ fn is_text_mode(mode: u8) -> bool {
 /// 25 rows of 16-line glyphs, which appears as a screen of garbage symbols.
 fn font_service<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) {
@@ -718,10 +718,8 @@ fn font_service<A: crate::Arch>(
         0x02 | 0x12 => (0, 8, &lib::vga_fonts::FONT_8X8),
         0x04 | 0x14 => (0, 16, &lib::vga_fonts::FONT_8X16),
         0x03 => {
-            if let DisplayedVga::Native(display) = &mut dos.pc.vga
-                && let Some(workspace) = bios_display
-            {
-                let _ = workspace.bios_font_call(machine, display.cap_mut(), regs, None);
+            if let DisplayedVga::Native(display) = &mut dos.pc.vga {
+                let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, None);
             } else {
                 super::machine::vga::bios_set_font_map_select(&mut dos.pc.vga, regs.rbx as u8);
             }
@@ -731,10 +729,8 @@ fn font_service<A: crate::Arch>(
     };
 
     if let DisplayedVga::Native(display) = &mut dos.pc.vga {
-        if let Some(workspace) = bios_display {
-            let buffer = matches!(subfn, 0x00 | 0x10).then_some(font);
-            let _ = workspace.bios_font_call(machine, display.cap_mut(), regs, buffer);
-        }
+        let buffer = matches!(subfn, 0x00 | 0x10).then_some(font);
+        let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, buffer);
     } else {
         super::machine::vga::bios_load_font(
             machine, &mut dos.pc.vga, map, first, font, glyph_h,
@@ -941,7 +937,7 @@ fn scroll_window<A: crate::Arch>(machine: &mut A, regs: &mut Regs, up: bool) {
 
 pub(super) fn int10<A: crate::Arch>(
     machine: &mut A,
-    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) {
@@ -952,10 +948,8 @@ pub(super) fn int10<A: crate::Arch>(
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga
-                && let Some(workspace) = bios_display.as_deref_mut()
-            {
-                let _ = workspace.bios_set_mode(machine, display.cap_mut(), u16::from(mode));
+            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
+                let _ = display.cap_mut().bios_set_mode(machine, bios_display, u16::from(mode));
             }
             bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
@@ -1132,13 +1126,11 @@ pub(super) fn int10<A: crate::Arch>(
                     }
                     _ => (alloc::vec![], true, None),
                 };
-                let called = if let DisplayedVga::Native(display) = &mut dos.pc.vga
-                    && let Some(workspace) = bios_display.as_deref_mut()
-                {
-                    workspace
+                let called = if let DisplayedVga::Native(display) = &mut dos.pc.vga {
+                    display.cap_mut()
                         .bios_palette_call(
                             machine,
-                            display.cap_mut(),
+                            bios_display,
                             regs,
                             (!buffer.is_empty()).then_some(buffer.as_mut_slice()),
                             copy_to_bios,
@@ -1364,7 +1356,7 @@ const VBE_MODES: &[(u16, u16, u16, u8)] = &[
 
 fn vbe<A: crate::Arch>(
     machine: &mut A,
-    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) {
@@ -1375,23 +1367,24 @@ fn vbe<A: crate::Arch>(
     };
     match al {
         0x00 => {
-            let native_modes = matches!(dos.pc.vga, DisplayedVga::Native(_))
-                .then(|| bios_display.as_deref().map(|workspace| workspace.modes()))
-                .flatten();
+            let native_modes = match &dos.pc.vga {
+                DisplayedVga::Native(display) => display.cap().bios_modes(bios_display),
+                _ => None,
+            };
             vbe_controller_info(machine, dos, regs, native_modes);
             done(regs, true);
         }
         0x01 => {
-            let native_mode = if matches!(dos.pc.vga, DisplayedVga::Native(_)) {
-                bios_display.as_deref().and_then(|workspace| workspace.mode(regs.rcx as u16 & 0x3FFF))
-            } else {
-                None
+            let native_mode = match &dos.pc.vga {
+                DisplayedVga::Native(display) =>
+                    display.cap().bios_mode(bios_display, regs.rcx as u16 & 0x3FFF),
+                _ => None,
             };
             let ok = vbe_mode_info(machine, dos, regs, native_mode);
             done(regs, ok);
         }
         0x02 => {
-            let ok = vbe_set_mode(machine, bios_display.as_deref_mut(), dos, regs);
+            let ok = vbe_set_mode(machine, bios_display, dos, regs);
             done(regs, ok);
         }
         0x03 => {
@@ -1433,7 +1426,7 @@ fn vbe_dac_format(regs: &mut Regs) {
 /// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
 fn vbe_palette<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
@@ -1450,13 +1443,11 @@ fn vbe_palette<A: crate::Arch>(
         if copy_to_bios {
             machine.copy_from(tbl, &mut data);
         }
-        let ok = if let DisplayedVga::Native(display) = &mut dos.pc.vga
-            && let Some(workspace) = bios_display
-        {
-            workspace
+        let ok = if let DisplayedVga::Native(display) = &mut dos.pc.vga {
+            display.cap_mut()
                 .bios_palette_call(
                     machine,
-                    display.cap_mut(),
+                    bios_display,
                     regs,
                     (!data.is_empty()).then_some(data.as_mut_slice()),
                     copy_to_bios,
@@ -1632,13 +1623,14 @@ fn vbe_mode_info<A: crate::Arch>(
 /// its RAM-backed PhysBasePtr; native firmware receives the request unchanged.
 fn vbe_set_mode<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
-        let Some(workspace) = bios_display else { return false };
-        return workspace.bios_set_mode_request(machine, display.cap_mut(), regs.rbx as u16).is_ok();
+        return display.cap_mut()
+            .bios_set_mode_request(machine, bios_display, regs.rbx as u16)
+            .is_ok();
     }
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
@@ -1652,14 +1644,15 @@ fn vbe_set_mode<A: crate::Arch>(
 /// VBE 4F05h — window control. BH=0 set / 1 get; BL=window (we only do A); DX=bank.
 fn vbe_window<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
         if (regs.rbx >> 8) as u8 == 0 {
-            let Some(workspace) = bios_display else { return false };
-            return workspace.bios_set_bank(machine, display.cap_mut(), regs.rdx as u16).is_ok();
+            return display.cap_mut()
+                .bios_set_bank(machine, bios_display, regs.rdx as u16)
+                .is_ok();
         }
         let bank = match display.cap() {
             crate::kernel::platform::VgaCap::Vbe { bank: Some(bank), .. } => bank.current,

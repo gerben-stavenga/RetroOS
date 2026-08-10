@@ -39,7 +39,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // firmware calls; DOS personalities receive their separate substitute BIOS.
     let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
     let vbe_mode = display.vga_capability()
-        .and_then(|native| bios_workspace.discover_vbe(machine, native));
+        .and_then(|native| native.bios_discover_vbe(machine, &mut bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
     let display = match display.into_native_capability(machine) {
         Ok(native) => crate::kernel::display::Display::new_console(
@@ -643,7 +643,7 @@ fn run_program<A: crate::Arch>(
     {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
-        t.personality.adopt_display(machine, Some(bios_workspace), display);
+        t.personality.adopt_display(machine, bios_workspace, display);
     }
 
     if let Some((addr0, addr1)) = debug_watch {
@@ -654,7 +654,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, Some(bios_workspace), threads, tid, sb, sink)
+    event_loop(machine, bios_workspace, threads, tid, sb, sink)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -689,7 +689,7 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// moved together with execution by `switch_focus_and_run` for now).
 pub fn event_loop<A: crate::Arch>(
     machine: &mut A,
-    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
     sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
@@ -751,13 +751,13 @@ pub fn event_loop<A: crate::Arch>(
                 |machine, span| thread.personality.audio_tick(machine, span),
             );
             thread.personality.display_tick(
-                machine, bios_workspace.as_deref_mut(), &ctx.regs,
+                machine, &mut *bios_workspace, &ctx.regs,
             );
         }
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
-            bios_workspace.as_deref_mut(),
+            &mut *bios_workspace,
             &mut ctx.regs,
             &mut thread.kernel,
             &mut thread.personality,
@@ -773,7 +773,7 @@ pub fn event_loop<A: crate::Arch>(
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
-                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
+                    machine, &mut *bios_workspace, threads, &mut ctx, next,
                     &mut exiting_display, &mut sb_handoff,
                 ),
                 None => core::hint::spin_loop(),
@@ -785,7 +785,7 @@ pub fn event_loop<A: crate::Arch>(
         stats.pre_run(machine);
         let kevent = ctx.run(machine, &thread.personality);
         stats.post_run(machine, &kevent, &ctx.regs);
-        let action = dispatch(machine, bios_workspace.as_deref_mut(), thread, &mut ctx.regs, kevent);
+        let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
         stats.after_dispatch(machine);
 
         // The OSD holds foreground scanout while the personality targets its
@@ -798,7 +798,7 @@ pub fn event_loop<A: crate::Arch>(
             crate::kernel::osd::dismiss();
             crate::kernel::console::restore_from_monitor(
                 machine,
-                bios_workspace.as_deref_mut(),
+                &mut *bios_workspace,
                 &mut ctx.regs,
                 &mut thread.personality,
             );
@@ -806,13 +806,13 @@ pub fn event_loop<A: crate::Arch>(
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
-            machine, bios_workspace.as_deref_mut(), threads, &mut ctx.regs, ctx.tid, action,
+            machine, &mut *bios_workspace, threads, &mut ctx.regs, ctx.tid, action,
             &mut exiting_display, &mut sb_handoff,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
-                    machine, bios_workspace.as_deref_mut(), threads, &mut ctx, next,
+                    machine, &mut *bios_workspace, threads, &mut ctx, next,
                     &mut exiting_display, &mut sb_handoff,
                 );
             }
@@ -824,7 +824,7 @@ pub fn event_loop<A: crate::Arch>(
                 // frame — hand them to whoever runs the next program.
                 return (
                     exiting_display.take().expect("dead display owner lost token")
-                        .into_surface(machine, bios_workspace.as_deref_mut()),
+                        .into_surface(machine, &mut *bios_workspace),
                     sb_handoff.take(),
                 );
             }
@@ -838,7 +838,7 @@ pub fn event_loop<A: crate::Arch>(
 /// everything else is the personality's call.
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     thread: &mut thread::Thread<A>,
     regs: &mut Regs,
     kevent: crate::KernelEvent,
@@ -893,7 +893,7 @@ fn dispatch<A: crate::Arch>(
 /// error or ordinary background switch it restores its detached snapshot.
 fn switch_focus_and_run<A: crate::Arch>(
     machine: &mut A,
-    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
@@ -929,7 +929,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         if old.kernel.state != thread::ThreadState::Zombie {
             crate::kernel::console::restore_from_monitor(
                 machine,
-                bios_workspace.as_deref_mut(),
+                &mut *bios_workspace,
                 &mut ctx.regs,
                 &mut old.personality,
             );
@@ -942,7 +942,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         let (display, card) = crate::kernel::focus::release(
-            machine, bios_workspace.as_deref_mut(), &mut old.personality);
+            machine, &mut *bios_workspace, &mut old.personality);
         if card.is_some() {
             assert!(sb_handoff.is_none(), "stale SB handoff");
             *sb_handoff = card;
@@ -963,7 +963,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     vcpu: &mut Regs,
     parent_tid: usize,
@@ -1095,7 +1095,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         }
         let mut child_handoff = None;
         let mut child_sb = None;
-        thread::exit_thread(threads, machine, None, child_tid, 1, &mut child_handoff, &mut child_sb);
+        thread::exit_thread(threads, machine, bios_workspace, child_tid, 1, &mut child_handoff, &mut child_sb);
         assert!(child_handoff.is_none(), "unfocused child owned physical VGA");
         assert!(child_sb.is_none(), "half-built child owned the Sound Blaster");
         on_error(vcpu, 11);

@@ -49,7 +49,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::Dos
 /// Slot = (EIP - STUB_BASE - 2) / 2.
 pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,

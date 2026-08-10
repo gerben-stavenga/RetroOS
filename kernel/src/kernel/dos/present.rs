@@ -222,7 +222,7 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
 /// private path which forgets the host monitor.
 fn present_shadow<A: crate::Arch>(
     machine: &mut A,
-    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::display::Display,
     shadow: &mut [u8],
     width: usize,
@@ -293,7 +293,7 @@ fn stretch_packed_rows(
 /// own, which is why a deferred `swapbufferCMD` needs this call to complete.
 fn voodoo_display_tick<A: crate::Arch>(
     machine: &mut A,
-    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
     now_ticks: u64,
 ) -> bool {
@@ -357,7 +357,7 @@ fn voodoo_display_tick<A: crate::Arch>(
 
 pub fn display_tick<A: crate::Arch>(
     machine: &mut A,
-    mut bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
     regs: &Regs,
     now_ticks: u64,
@@ -366,7 +366,7 @@ pub fn display_tick<A: crate::Arch>(
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
-    if voodoo_display_tick(machine, bios.as_deref_mut(), pc, now_ticks) {
+    if voodoo_display_tick(machine, &mut *bios, pc, now_ticks) {
         return;
     }
     // A real card scans out its own VRAM: there is no register file to read
@@ -424,7 +424,7 @@ pub fn display_tick<A: crate::Arch>(
                     display.osd_shadow_layout(vga_w, out_w, vga_h);
                 let p0 = if prof { machine.rdtsc() } else { 0 };
                 let copied = present_shadow(
-                    machine, bios.as_deref_mut(), display, shadow,
+                    machine, &mut *bios, display, shadow,
                     out_w, vga_h, (logical_w, scale_y),
                 );
                 let present_cycles = if prof {

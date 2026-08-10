@@ -25,17 +25,16 @@ pub const F12_PRESS: u8 = 0x58;
 /// device IRQs were consumed earlier by `irq_dispatch`.
 pub fn dispatch<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
-    let mut bios_workspace = bios_workspace;
     let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
     for evt in events {
         if let crate::Irq::Key(sc) = evt
-            && monitor_key(machine, bios_workspace.as_deref_mut(), regs, sc, personality)
+            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality)
         {
             continue;
         }
@@ -93,12 +92,11 @@ fn dispatch_dos<A: crate::Arch>(
 /// key; when closed, only F12 (opening it) is special.
 fn monitor_key<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     regs: &mut Regs,
     sc: u8,
     personality: &mut thread::Personality<A>,
 ) -> bool {
-    let mut bios_workspace = bios_workspace;
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
             thread::Personality::Dos(dos) => Some(&**dos),
@@ -106,7 +104,7 @@ fn monitor_key<A: crate::Arch>(
         };
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
-            restore_from_monitor(machine, bios_workspace.as_deref_mut(), regs, personality);
+            restore_from_monitor(machine, &mut *bios_workspace, regs, personality);
         } else {
             personality.repaint_osd();
         }
@@ -115,8 +113,7 @@ fn monitor_key<A: crate::Arch>(
     if sc == F12_PRESS {
         // The personality already hands back a renderable display. A native
         // VGA display is Mode 13h-backed just like every other packed output.
-        let ws = bios_workspace.as_mut().expect("OSD open without core BIOS");
-        let display = personality.suspend_for_osd(machine, ws);
+        let display = personality.suspend_for_osd(machine, bios_workspace);
         personality.hold_display_for_osd(display);
         crate::kernel::osd::open();
         personality.repaint_osd();
@@ -129,11 +126,10 @@ fn monitor_key<A: crate::Arch>(
 /// by an ordinary Esc/F12 close and forced dismissal before owner teardown.
 pub fn restore_from_monitor<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     _regs: &mut Regs,
     personality: &mut thread::Personality<A>,
 ) {
-    let bios_workspace = bios_workspace.expect("OSD close without core BIOS");
     if let Some(display) = personality.take_display_for_osd() {
         personality.materialize_from_osd(machine, bios_workspace, display);
     }

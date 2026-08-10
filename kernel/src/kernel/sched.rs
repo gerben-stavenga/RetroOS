@@ -27,7 +27,7 @@ pub enum Verdict {
 #[allow(clippy::too_many_arguments)]
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
@@ -53,7 +53,7 @@ pub fn verdict<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 fn next_after<A: crate::Arch>(
     machine: &mut A,
-    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
@@ -80,7 +80,8 @@ fn next_after<A: crate::Arch>(
         }
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
             crate::kernel::linux::handle_exec(
-                machine, threads, regs, tid, buffer, path, args, cwd, exiting_display, sb_handoff,
+                machine, bios_workspace, threads, regs, tid, buffer, path, args, cwd,
+                exiting_display, sb_handoff,
             )
         }
         thread::KernelAction::Wait { pid, status_ptr } => {

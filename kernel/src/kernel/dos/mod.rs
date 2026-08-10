@@ -322,7 +322,7 @@ impl<A: crate::Arch> DosState<A> {
     pub(super) fn suspend(
         &mut self,
         machine: &mut A,
-        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::DisplayHandoff {
         machine::vga::release_display(&mut self.pc.vga, machine, bios_workspace)
     }
@@ -362,7 +362,7 @@ impl<A: crate::Arch> DosState<A> {
     pub(super) fn materialize(
         &mut self,
         machine: &mut A,
-        bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
         machine::vga::acquire_display(
@@ -551,7 +551,7 @@ fn linear<A: crate::Arch>(_machine: &mut A, dos: &thread::DosState<A>, regs: &Re
 /// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
 pub fn syscall<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -642,7 +642,7 @@ fn fault_segment_bases<A: crate::Arch>(
 /// access to the full `Thread` (for `signal_thread`).
 pub fn handle_event<A: crate::Arch>(
     machine: &mut A,
-    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -668,7 +668,7 @@ pub fn handle_event<A: crate::Arch>(
         }
         KE::VifStep => {
             match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
-                Some(dpmi::DbResult::Event(ev)) => handle_event(machine, bios_display.as_deref_mut(), kt, dos, regs, ev),
+                Some(dpmi::DbResult::Event(ev)) => handle_event(machine, &mut *bios_display, kt, dos, regs, ev),
                 _ => thread::KernelAction::Done,
             }
         }
@@ -1284,7 +1284,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
 /// value is used only to notice when an inactive sweep has gone stale.
 pub fn display_tick<A: crate::Arch>(
     machine: &mut A,
-    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
     regs: &Regs,
     now_ticks: u64,

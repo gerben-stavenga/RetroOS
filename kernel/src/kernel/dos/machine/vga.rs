@@ -37,7 +37,7 @@ impl EmulatedVga {
         native: &mut crate::kernel::platform::NativeVga,
     ) -> Self {
         let mut model = VgaState::new_boxed();
-        let firmware_state = bios.bios_save_state(machine, native.cap());
+        let firmware_state = native.cap().bios_save_state(machine, bios);
         let resume_vbe = match native.cap() {
             crate::kernel::platform::VgaCap::Vbe { mode, bank } => Some(VbeResume {
                 request: mode.number | if bank.is_none() { 0x4000 } else { 0 },
@@ -77,7 +77,7 @@ impl EmulatedVga {
         mut self,
         machine: &mut A,
         mut native: crate::kernel::platform::VgaCap,
-        mut bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> DisplayedVga {
         // Native ownership means the complete VGA aperture is physical in the
         // incoming DOS address space, including B8000 text memory.
@@ -86,11 +86,10 @@ impl EmulatedVga {
         if let Some(resume) = self.resume_vbe.take()
             && self.state.svga_w != 0
         {
-            let bios = bios.expect("native VBE handoff without BIOS workspace");
             let exact = self.firmware_state.as_ref().is_some_and(|state| {
-                match bios.bios_restore_state(machine, &native, state) {
+                match native.bios_restore_state(machine, &mut *bios, state) {
                     Ok(()) => {
-                        if let Some(mode) = bios.mode(resume.request & 0x3FFF) {
+                        if let Some(mode) = native.bios_mode(bios, resume.request & 0x3FFF) {
                             native.set_vesa(mode, resume.request & 0x4000 != 0);
                         }
                         true
@@ -102,7 +101,7 @@ impl EmulatedVga {
                 }
             });
             let mode_ready = exact
-                || bios.bios_set_mode_request(machine, &mut native, resume.request).is_ok();
+                || native.bios_set_mode_request(machine, &mut *bios, resume.request).is_ok();
             if mode_ready {
                 restore_native_vbe(machine, bios, &mut native, &self.state, resume);
             } else {
@@ -115,14 +114,12 @@ impl EmulatedVga {
         // representation before converting the complete device to hardware.
         capture_emulated_aperture(&mut self.state, machine);
         // An OSD VBE surface must be left before direct legacy restoration.
-        if native.vbe_mode().is_some()
-            && let Some(bios) = bios.as_deref_mut()
-        {
-            let _ = bios.bios_set_mode(machine, &mut native, 3);
+        if native.vbe_mode().is_some() {
+            let _ = native.bios_set_mode(machine, &mut *bios, 3);
         }
         crate::kernel::drivers::vga_hw::restore(&self.state);
-        if let (Some(bios), Some(state)) = (bios, self.firmware_state.as_ref()) {
-            if let Err(error) = bios.bios_restore_state(machine, &native, state) {
+        if let Some(state) = self.firmware_state.as_ref() {
+            if let Err(error) = native.bios_restore_state(machine, bios, state) {
                 crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
             } else if crate::kernel::platform::get().host
                 == crate::kernel::platform::Host::Qemu
@@ -139,7 +136,7 @@ impl EmulatedVga {
         self,
         machine: &mut A,
         display: crate::kernel::display::Display,
-        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> DisplayedVga {
         match display.into_native_capability(machine) {
             Ok(native) => self.attach_native(machine, native, bios),
@@ -187,12 +184,10 @@ impl DisplayedVga {
     pub fn fork_for_child<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> Self {
         match self {
             Self::Native(native) => {
-                let bios = bios
-                    .expect("native VGA fork without BIOS workspace");
                 let parent = EmulatedVga::snapshot_native(machine, bios, native);
                 core::mem::replace(self, Self::Emulated(
                     parent, crate::kernel::display::Display::headless()))
@@ -278,7 +273,7 @@ impl DisplayedVga {
             (Self::Emulated(dev, _), Err(display)) =>
                 Self::Emulated(dev, display),
             (Self::Emulated(dev, _), Ok(native)) =>
-                dev.attach_native(machine, native, Some(bios_workspace)),
+                dev.attach_native(machine, native, bios_workspace),
             (native @ Self::Native(_), _) => native,
         }
     }
@@ -290,11 +285,10 @@ impl DisplayedVga {
 pub fn release_display<A: crate::Arch>(
     vga: &mut DisplayedVga,
     machine: &mut A,
-    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> crate::kernel::display::DisplayHandoff {
     vga.map(|vga| match vga {
         DisplayedVga::Native(native) => {
-            let bios = bios.expect("native VGA release without BIOS workspace");
             let (vga, native) = EmulatedVga::detach_native(machine, bios, native);
             (DisplayedVga::Emulated(vga, crate::kernel::display::Display::headless()),
              crate::kernel::display::DisplayHandoff::Vga(native))
@@ -310,7 +304,7 @@ pub fn release_display<A: crate::Arch>(
 pub fn acquire_display<A: crate::Arch>(
     vga: &mut DisplayedVga,
     machine: &mut A,
-    bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: crate::kernel::display::DisplayHandoff,
 ) {
     vga.map(|vga| match (vga, display) {
@@ -765,11 +759,11 @@ fn copy_banked_from_card<A: crate::Arch>(
     let address = usize::from(window.window_segment) << 4;
     for offset in (0..pixels.len()).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if bios.bios_set_bank(machine, display, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
         let count = window_bytes.min(pixels.len() - offset);
         machine.copy_from(address, &mut pixels[offset..offset + count]);
     }
-    let _ = bios.bios_set_bank(machine, display, window.current);
+    let _ = display.bios_set_bank(machine, bios, window.current);
 }
 
 fn copy_banked_to_card<A: crate::Arch>(
@@ -784,11 +778,11 @@ fn copy_banked_to_card<A: crate::Arch>(
     let address = usize::from(window.window_segment) << 4;
     for offset in (0..pixels.len()).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if bios.bios_set_bank(machine, display, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
         let count = window_bytes.min(pixels.len() - offset);
         machine.copy_to(address, &pixels[offset..offset + count]);
     }
-    let _ = bios.bios_set_bank(machine, display, window.current);
+    let _ = display.bios_set_bank(machine, bios, window.current);
 }
 
 fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {

@@ -56,13 +56,13 @@ impl DisplayHandoff {
     pub fn into_surface<A: crate::Arch>(
         self,
         machine: &mut A,
-        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> Display {
         match self {
             Self::Surface(display) => display,
             Self::Vga(native) => Display::new_console(
                 machine,
-                bios.expect("native VGA surface without BIOS workspace"),
+                bios,
                 native,
             ),
         }
@@ -120,7 +120,7 @@ impl Display {
             Some(mode) => Self::new_banked_vbe(machine, bios, native, mode)
                 .unwrap_or_else(|_| panic!("selected banked VBE display mode {:#x} failed", mode.number)),
             None => {
-                bios.bios_set_mode(machine, &mut native, 0x13)
+                native.bios_set_mode(machine, bios, 0x13)
                     .expect("selected Mode 13h display failed");
                 Self::new_vga(native)
             }
@@ -142,7 +142,7 @@ impl Display {
             return Self::new_vbe(machine, bios, native, mode)
                 .unwrap_or_else(|_| panic!("selected VBE console mode {:#x} failed", mode.number));
         }
-        bios.bios_set_mode(machine, &mut native, 0x13)
+        native.bios_set_mode(machine, bios, 0x13)
             .expect("Mode 13h console display failed");
         Self::new_vga(native)
     }
@@ -213,7 +213,7 @@ impl Display {
         let bytes = usize::from(mode.pitch) * usize::from(mode.height);
         let pages = (offset + bytes).div_ceil(crate::PAGE_SIZE);
         if arch_abi::FB_WINDOW_BASE + pages * crate::PAGE_SIZE > arch_abi::FB_WINDOW_END
-            || bios.bios_set_mode(machine, &mut native, mode.number).is_err()
+            || native.bios_set_mode(machine, bios, mode.number).is_err()
         {
             return Err(native);
         }
@@ -254,7 +254,7 @@ impl Display {
         let FormatSpec::Packed(rgb) = mode.format else { return Err(native) };
         if mode.physical_base != 0 || mode.window_segment == 0
             || mode.window_granularity_kb == 0 || mode.window_size_kb == 0
-            || bios.bios_set_mode_request(machine, &mut native, mode.number).is_err()
+            || native.bios_set_mode_request(machine, bios, mode.number).is_err()
         {
             return Err(native);
         }
@@ -375,14 +375,18 @@ impl Display {
     pub fn present_native<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        bios: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         height: usize,
         shadow: &[u8],
     ) -> usize {
         match &mut self.backend {
-            Backend::VbeBanked { native } => bios
-                .expect("banked VBE display without BIOS workspace")
-                .present(machine, native, height, shadow)
+            Backend::VbeBanked { native } => native
+                .bios_present(
+                    machine,
+                    bios,
+                    height,
+                    shadow,
+                )
                 .unwrap_or_else(|error| panic!("banked VBE present failed: {:?}", error)),
             _ => self.present(height, shadow),
         }

@@ -256,7 +256,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
 /// (with the CF/ZF flag dance); every other vector is the personality BIOS —
 /// real services or the IRET/EOI defaults (`bios::dispatch`), which own
 /// their frame pop. Caller (`syscall`) has already checked CS.
-pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), STUB_SEG, "rm_vector_dispatch: CS must be STUB_SEG");
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
@@ -480,7 +480,7 @@ pub(super) fn pmdos_int33_handler<A: crate::Arch>(machine: &mut A, dos: &mut thr
 /// real-mode paragraphs during generic interrupt reflection.
 pub(super) fn pmdos_int10_handler<A: crate::Arch>(
     machine: &mut A,
-    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
 ) -> thread::KernelAction {

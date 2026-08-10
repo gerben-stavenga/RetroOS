@@ -1234,6 +1234,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_exec<A: crate::Arch>(
     machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     vcpu: &mut Regs,
     tid: usize,
@@ -1267,7 +1268,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     };
     if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1, exec_vga).is_err() {
         return Some(thread::exit_thread(
-            threads, machine, None, tid, -ENOEXEC, exiting_display, sb_handoff,
+            threads, machine, bios_workspace, tid, -ENOEXEC, exiting_display, sb_handoff,
         ));
     }
 
