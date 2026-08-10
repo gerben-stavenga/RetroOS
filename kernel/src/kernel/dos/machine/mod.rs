@@ -16,6 +16,7 @@
 extern crate alloc;
 
 use crate::Regs;
+use crate::kernel::bios_display::DisplayedVga;
 
 pub const IF_FLAG: u32 = 1 << 9;
 /// VIF — the guest's virtual interrupt flag (EFLAGS bit 19). The DOS layer's
@@ -217,7 +218,7 @@ pub struct PcMachine {
     pub mouse: MouseState,
     pub skip_irq: bool,
     pub e0_pending: bool,
-    pub vga: vga::DosVga,
+    pub vga: DisplayedVga,
     /// The 3dfx Voodoo board. Present in every machine but inert until a
     /// guest finds it over PCI and maps its aperture.
     pub voodoo: vvoodoo::VVoodoo,
@@ -475,9 +476,7 @@ impl PcMachine {
             return;
         }
 
-        if matches!(self.vga,
-            vga::DosVga::Hidden(_) |
-            vga::DosVga::Displayed(vga::DisplayedVga::Emulated(_, _)))
+        if matches!(self.vga, DisplayedVga::Emulated(_, _))
             && vga::svga_lfb_reserved_contains(physical, size)
         {
             // The substitute adapter reports a bus-looking address for RAM it
@@ -510,7 +509,10 @@ impl PcMachine {
 
     /// Built straight into its heap slot: the struct is far too large to pass
     /// through a kernel stack frame (see `DosState::pc`).
-    pub fn new_boxed<A: crate::Arch>(machine: &mut A) -> alloc::boxed::Box<Self> {
+    pub fn new_boxed<A: crate::Arch>(
+        machine: &mut A,
+        vga: DisplayedVga,
+    ) -> alloc::boxed::Box<Self> {
         // A20 is permanently wrapped: HMA_PAGE aliases the user's private low
         // memory by copying entries[0..16], the faithful A20-off default every
         // real machine boots with. We never un-wrap it — a VM86 guest can use
@@ -533,7 +535,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).mouse).write(MouseState::new());
             core::ptr::addr_of_mut!((*p).skip_irq).write(false);
             core::ptr::addr_of_mut!((*p).e0_pending).write(false);
-            core::ptr::addr_of_mut!((*p).vga).write(vga::DosVga::new(machine));
+            core::ptr::addr_of_mut!((*p).vga).write(vga);
             core::ptr::addr_of_mut!((*p).voodoo).write(vvoodoo::VVoodoo::new());
             core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
@@ -609,12 +611,11 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
             // Reading 0x3DA returns Input Status #1 AND resets the attribute-
             // controller write flip-flop — mirror that side effect either way.
             match &mut pc.vga {
-                vga::DosVga::Hidden(dev)
-                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => {
+                DisplayedVga::Emulated(dev, _) => {
                     dev.state.ac_state.pending_data = false;
                     return input_status1(machine, &pc.present_scratch2);
                 }
-                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {}
+                DisplayedVga::Native(_) => {}
             }
             crate::kernel::drivers::vga_hw::track_ac_reset();
             machine.inb(0x3DA)
@@ -623,10 +624,9 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
             match &mut pc.vga {
-                vga::DosVga::Hidden(dev)
-                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) =>
+                DisplayedVga::Emulated(dev, _) =>
                     dev.state.port_read(port),
-                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => machine.inb(port),
+                DisplayedVga::Native(_) => machine.inb(port),
             }
         }
         // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
@@ -726,12 +726,11 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
             match &mut pc.vga {
-                vga::DosVga::Hidden(dev)
-                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => {
+                DisplayedVga::Emulated(dev, _) => {
                     dev.state.port_write(port, val);
                     return;
                 }
-                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {}
+                DisplayedVga::Native(_) => {}
             }
             // Native card: the flip-flop and index are write-only in the
             // silicon, so the card's own driver tracks them.
@@ -740,9 +739,8 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         }
         0x3C1..=0x3DF => {
             let dev = match &mut pc.vga {
-                vga::DosVga::Hidden(dev)
-                | vga::DosVga::Displayed(vga::DisplayedVga::Emulated(dev, _)) => dev,
-                vga::DosVga::Displayed(vga::DisplayedVga::Native(_)) => {
+                DisplayedVga::Emulated(dev, _) => dev,
+                DisplayedVga::Native(_) => {
                     machine.outb(port, val);
                     return;
                 }

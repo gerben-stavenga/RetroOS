@@ -788,7 +788,8 @@ pub fn event_loop<A: crate::Arch>(
         let action = dispatch(machine, bios_workspace.as_deref_mut(), thread, &mut ctx.regs, kevent);
         stats.after_dispatch(machine);
 
-        // The OSD, not the hidden personality, holds the display while open.
+        // The OSD holds foreground scanout while the personality targets its
+        // headless display.
         // Before an owner exits, return that capability so exit_thread can
         // perform its ordinary single release into `exiting_display`.
         if matches!(&action, thread::KernelAction::Exit(_))
@@ -962,7 +963,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
-    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     vcpu: &mut Regs,
     parent_tid: usize,
@@ -976,6 +977,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     use crate::kernel::exec;
 
     let parent = thread::get_thread(threads, parent_tid).expect("fork_exec: invalid parent");
+    let parent_was_focused = crate::kernel::focus::focused() == parent_tid;
 
     // Snapshot the parent's cwd and (DOS-only) env block while we're still in
     // the parent's address space. The COW fork + arch_user_clean inside
@@ -1038,8 +1040,29 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             Some(t) => t,
             None => { on_error(vcpu, 8); return None; }
         };
-        let child_tid = child.kernel.tid as usize;
+        child.kernel.tid as usize
+    };
 
+    // VGA is a process-creation input, not something DosState invents. A DOS
+    // parent forks its complete device state while its address space is still
+    // active; a cross-personality DOS launch explicitly starts from mode 3.
+    let exec_vga = match format {
+        exec::BinaryFormat::Elf => exec::ExecVga::None,
+        _ if parent_is_dos => {
+            let parent = thread::get_thread(threads, parent_tid).unwrap();
+            let thread::Personality::Dos(parent) = &mut parent.personality else {
+                unreachable!("parent_is_dos without DOS personality")
+            };
+            exec::ExecVga::Dos(parent.pc.vga.fork_for_child(
+                machine, bios_workspace))
+        }
+        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DisplayedVga::Emulated(
+            crate::kernel::bios_display::EmulatedVga::initial_mode3(),
+            crate::kernel::display::Display::headless())),
+    };
+
+    {
+        let child = thread::get_thread(threads, child_tid).unwrap();
         // Temporarily make the child's address space the active one so ELF load /
         // DOS setup operate on it (guest memory is the active space). The parent's
         // space is held aside and restored below. Unlike the old vcpu-swap, this
@@ -1049,8 +1072,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             core::mem::take(&mut child.kernel.vcpu.space),
             core::ptr::null_mut(), core::ptr::null_mut(),
         );
-        child_tid
-    };
+    }
 
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(format, exec::BinaryFormat::Elf) {
@@ -1062,7 +1084,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl).is_err() {
+    if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl, exec_vga).is_err() {
         // Restore the parent's space and tear the half-built child down.
         {
             let child = thread::get_thread(threads, child_tid).unwrap();
@@ -1145,24 +1167,12 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         }
     }
 
-    // Thread ownership changes here, as part of DOS fork itself. Snapshot the
-    // parent's authoritative hardware VGA into its recovery state and move the
-    // unchanged NativeVga directly into the child's thread record. The child
-    // maps its physical aperture from `on_resume` when its space becomes live.
-    if parent_is_dos && crate::kernel::dos::physical_vga_present() {
-        let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
-        if let (thread::Personality::Dos(parent), thread::Personality::Dos(child)) =
-            (&mut parent.personality, &mut child.personality)
-        {
-            crate::kernel::dos::DosVga::fork_native_to(
-                &mut parent.pc.vga,
-                &mut child.pc.vga,
-                machine,
-                bios_workspace.as_deref_mut()
-                    .expect("native VGA fork without BIOS workspace"),
-            );
-            crate::kernel::focus::adopt(child_tid);
-        }
+    // A DOS fork already moved display ownership into the child VGA record.
+    if parent_was_focused
+        && parent_is_dos
+        && matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com)
+    {
+        crate::kernel::focus::adopt(child_tid);
     }
 
     // Switch focus to child. Parent stays Ready; it'll poll SYNTH_WAITPID

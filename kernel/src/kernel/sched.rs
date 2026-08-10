@@ -53,7 +53,7 @@ pub fn verdict<A: crate::Arch>(
 #[allow(clippy::too_many_arguments)]
 fn next_after<A: crate::Arch>(
     machine: &mut A,
-    mut bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_workspace: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     threads: &mut [thread::Thread<A>],
     regs: &mut Regs,
     tid: usize,
@@ -65,12 +65,12 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
         thread::KernelAction::Exit(code) => Some(thread::exit_thread(
-            threads, machine, bios_workspace.as_deref_mut(), tid, code, exiting_display, sb_handoff,
+            threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff,
         )),
         thread::KernelAction::Switch(next) => Some(next),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
-                machine, bios_workspace.as_deref_mut(), threads, regs, tid,
+                machine, bios_workspace, threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
                 on_error, on_success,
             )

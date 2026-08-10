@@ -1259,7 +1259,13 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         machine.free_user_pages();
     }
 
-    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1).is_err() {
+    let exec_vga = match format {
+        exec::BinaryFormat::Elf => exec::ExecVga::None,
+        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DisplayedVga::Emulated(
+            crate::kernel::bios_display::EmulatedVga::initial_mode3(),
+            crate::kernel::display::Display::headless())),
+    };
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1, exec_vga).is_err() {
         return Some(thread::exit_thread(
             threads, machine, None, tid, -ENOEXEC, exiting_display, sb_handoff,
         ));

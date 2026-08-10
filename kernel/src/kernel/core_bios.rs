@@ -19,7 +19,59 @@ pub enum BiosError {
 
 /// Opaque controller state produced by VBE 4F04h. Its layout belongs to the
 /// machine's video BIOS; the kernel only carries it between ownership turns.
+#[derive(Clone)]
 pub struct VbeState(Vec<u8>);
+
+/// Software VGA state owned by the core INT 10h/video-BIOS driver.
+pub struct EmulatedVga {
+    pub state: alloc::boxed::Box<vga::VgaState>,
+    /// Opaque controller state saved by native video firmware.
+    pub(crate) firmware_state: Option<VbeState>,
+    /// Guest pages backing the substitute-VBE aperture.
+    pub svga_pages: usize,
+    /// Firmware transition needed when returning to native VGA ownership.
+    pub(crate) resume_vbe: Option<VbeResume>,
+    /// The device snapshot awaits publication in the active guest space.
+    pub(crate) rematerialize_aperture: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct VbeResume {
+    pub(crate) request: u16,
+    pub(crate) bank: Option<u16>,
+}
+
+/// A VGA paired with an output target. Native VGA intrinsically owns physical
+/// scanout; an emulated VGA targets a real, composited, hosted, or headless
+/// display.
+pub enum DisplayedVga {
+    Native(crate::kernel::platform::NativeVga),
+    Emulated(EmulatedVga, crate::kernel::display::Display),
+}
+
+impl EmulatedVga {
+    /// Construct the conventional initial PC text display image without
+    /// publishing it into any particular guest address space.
+    pub fn initial_mode3() -> Self {
+        Self {
+            state: vga::VgaState::new_mode3_boxed(),
+            firmware_state: None,
+            svga_pages: 0,
+            resume_vbe: None,
+            rematerialize_aperture: true,
+        }
+    }
+
+    pub(crate) fn clone_for_fork(&self) -> Self {
+        Self {
+            state: alloc::boxed::Box::new((*self.state).clone()),
+            firmware_state: self.firmware_state.clone(),
+            svga_pages: self.svga_pages,
+            resume_vbe: self.resume_vbe,
+            rematerialize_aperture: self.rematerialize_aperture,
+        }
+    }
+}
 
 pub struct BiosDisplayWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.

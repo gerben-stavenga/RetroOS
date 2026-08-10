@@ -7,6 +7,14 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+
+/// Device ownership supplied by the process-creation path. Binary detection
+/// and device construction are deliberately separate: DOS fork hands in its
+/// cloned VGA, while a non-DOS image must not carry one at all.
+pub enum ExecVga {
+    None,
+    Dos(crate::kernel::bios_display::DisplayedVga),
+}
 use crate::kernel::vfs;
 
 // ── File loading ────────────────────────────────────────────────────────
@@ -87,21 +95,23 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
 #[allow(clippy::too_many_arguments)]
-pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8) -> Result<(), i32> {
+pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8, exec_vga: ExecVga) -> Result<(), i32> {
     // Name the thread for the F12 switch picker — the one path every launch
     // (boot init and fork-exec) flows through, so every task is named.
     threads[tid].kernel.set_comm(path);
     match detect_format(&data, path) {
-        BinaryFormat::Elf => {
+        BinaryFormat::Elf if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)
         }
+        BinaryFormat::Elf => Err(-8),
         fmt => {
+            let ExecVga::Dos(vga) = exec_vga else { return Err(-8) };
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
             // `args[0]` is already a DOS path when the launcher was DOS
             // (personality_name == Some(Dos)); otherwise it's VFS and exec_dos_into
             // dosifies it (the cross-personality / boot fallback).
             let args0_is_dos = personality_name == Some(crate::kernel::thread::PersonalityName::Dos);
-            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, viopl);
+            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, viopl, vga);
             Ok(())
         }
     }

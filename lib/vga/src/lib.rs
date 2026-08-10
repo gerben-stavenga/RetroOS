@@ -1929,6 +1929,7 @@ impl AcState {
 
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
+#[derive(Clone)]
 pub struct VgaState {
     /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
     pub planes: alloc::vec::Vec<u8>,

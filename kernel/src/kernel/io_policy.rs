@@ -32,8 +32,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
         Personality::Dos(_) => {
             if matches!(personality, Personality::Dos(dos)
                 if matches!(dos.pc.vga,
-                    crate::kernel::dos::DosVga::Displayed(
-                        crate::kernel::dos::DisplayedVga::Native(_))))
+                    crate::kernel::bios_display::DisplayedVga::Native(_)))
             {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF

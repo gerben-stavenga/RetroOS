@@ -31,6 +31,7 @@
 //! forever).
 
 use crate::Regs;
+use crate::kernel::bios_display::DisplayedVga;
 use crate::kernel::thread;
 use super::machine::{
     self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
@@ -693,7 +694,7 @@ fn is_text_mode(mode: u8) -> bool {
 /// 25 rows of 16-line glyphs, which appears as a screen of garbage symbols.
 fn font_service<A: crate::Arch>(
     machine: &mut A,
-    mut bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
+    bios_display: Option<&mut crate::kernel::bios_display::BiosDisplayWorkspace<A>>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) {
@@ -717,10 +718,8 @@ fn font_service<A: crate::Arch>(
         0x02 | 0x12 => (0, 8, &lib::vga_fonts::FONT_8X8),
         0x04 | 0x14 => (0, 16, &lib::vga_fonts::FONT_8X16),
         0x03 => {
-            if let super::machine::vga::DosVga::Displayed(
-                super::machine::vga::DisplayedVga::Native(display),
-            ) = &mut dos.pc.vga
-                && let Some(workspace) = bios_display.as_deref_mut()
+            if let DisplayedVga::Native(display) = &mut dos.pc.vga
+                && let Some(workspace) = bios_display
             {
                 let _ = workspace.bios_font_call(machine, display.cap_mut(), regs, None);
             } else {
@@ -731,10 +730,8 @@ fn font_service<A: crate::Arch>(
         _ => return,
     };
 
-    if let super::machine::vga::DosVga::Displayed(
-        super::machine::vga::DisplayedVga::Native(display),
-    ) = &mut dos.pc.vga {
-        if let Some(workspace) = bios_display.as_deref_mut() {
+    if let DisplayedVga::Native(display) = &mut dos.pc.vga {
+        if let Some(workspace) = bios_display {
             let buffer = matches!(subfn, 0x00 | 0x10).then_some(font);
             let _ = workspace.bios_font_call(machine, display.cap_mut(), regs, buffer);
         }
@@ -955,9 +952,7 @@ pub(super) fn int10<A: crate::Arch>(
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            if let super::machine::vga::DosVga::Displayed(
-                super::machine::vga::DisplayedVga::Native(display),
-            ) = &mut dos.pc.as_mut().vga
+            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga
                 && let Some(workspace) = bios_display.as_deref_mut()
             {
                 let _ = workspace.bios_set_mode(machine, display.cap_mut(), u16::from(mode));
@@ -1117,8 +1112,7 @@ pub(super) fn int10<A: crate::Arch>(
             // Bounce pointer-bearing PM calls through the ROM's private RM
             // workspace. The substitute/emulated path below owns its ports.
             let subfn = (ax & 0xFF) as u8;
-            if matches!(dos.pc.vga, super::machine::vga::DosVga::Displayed(
-                super::machine::vga::DisplayedVga::Native(_))) {
+            if matches!(dos.pc.vga, DisplayedVga::Native(_)) {
                 let (mut buffer, copy_to_bios, guest_dst) = match subfn {
                     0x02 => {
                         let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
@@ -1138,9 +1132,7 @@ pub(super) fn int10<A: crate::Arch>(
                     }
                     _ => (alloc::vec![], true, None),
                 };
-                let called = if let super::machine::vga::DosVga::Displayed(
-                    super::machine::vga::DisplayedVga::Native(display),
-                ) = &mut dos.pc.vga
+                let called = if let DisplayedVga::Native(display) = &mut dos.pc.vga
                     && let Some(workspace) = bios_display.as_deref_mut()
                 {
                     workspace
@@ -1383,16 +1375,14 @@ fn vbe<A: crate::Arch>(
     };
     match al {
         0x00 => {
-            let native_modes = matches!(dos.pc.vga, super::machine::vga::DosVga::Displayed(
-                super::machine::vga::DisplayedVga::Native(_)))
+            let native_modes = matches!(dos.pc.vga, DisplayedVga::Native(_))
                 .then(|| bios_display.as_deref().map(|workspace| workspace.modes()))
                 .flatten();
             vbe_controller_info(machine, dos, regs, native_modes);
             done(regs, true);
         }
         0x01 => {
-            let native_mode = if matches!(dos.pc.vga, super::machine::vga::DosVga::Displayed(
-                super::machine::vga::DisplayedVga::Native(_))) {
+            let native_mode = if matches!(dos.pc.vga, DisplayedVga::Native(_)) {
                 bios_display.as_deref().and_then(|workspace| workspace.mode(regs.rcx as u16 & 0x3FFF))
             } else {
                 None
@@ -1408,13 +1398,8 @@ fn vbe<A: crate::Arch>(
             // No emulated register file ⇒ this thread owns a real card, whose
             // ROM answers VBE itself; report "no VBE mode set".
             let cur = match &dos.pc.vga {
-                super::machine::vga::DosVga::Displayed(
-                    super::machine::vga::DisplayedVga::Native(display),
-                ) => display.vbe_mode().map_or(0, |mode| mode.number),
-                super::machine::vga::DosVga::Hidden(dev)
-                | super::machine::vga::DosVga::Displayed(
-                    super::machine::vga::DisplayedVga::Emulated(dev, _),
-                ) => VBE_MODES.iter()
+                DisplayedVga::Native(display) => display.vbe_mode().map_or(0, |mode| mode.number),
+                DisplayedVga::Emulated(dev, _) => VBE_MODES.iter()
                     .find(|&&(_, w, h, b)| {
                         w == dev.state.svga_w && h == dev.state.svga_h
                             && b == dev.state.svga_bpp
@@ -1430,7 +1415,7 @@ fn vbe<A: crate::Arch>(
         }
         0x08 => { vbe_dac_format(regs); done(regs, true); }
         0x09 => {
-            let ok = vbe_palette(machine, bios_display.as_deref_mut(), dos, regs);
+            let ok = vbe_palette(machine, bios_display, dos, regs);
             done(regs, ok);
         }
         _ => done(regs, false),
@@ -1455,8 +1440,7 @@ fn vbe_palette<A: crate::Arch>(
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u8;
     let tbl = es_offset(dos, regs, regs.rdi as u32);
-    if matches!(dos.pc.vga, super::machine::vga::DosVga::Displayed(
-        super::machine::vga::DisplayedVga::Native(_))) {
+    if matches!(dos.pc.vga, DisplayedVga::Native(_)) {
         let copy_to_bios = match regs.rbx as u8 {
             0x00 | 0x80 => true,
             0x01 => false,
@@ -1466,9 +1450,7 @@ fn vbe_palette<A: crate::Arch>(
         if copy_to_bios {
             machine.copy_from(tbl, &mut data);
         }
-        let ok = if let super::machine::vga::DosVga::Displayed(
-            super::machine::vga::DisplayedVga::Native(display),
-        ) = &mut dos.pc.vga
+        let ok = if let DisplayedVga::Native(display) = &mut dos.pc.vga
             && let Some(workspace) = bios_display
         {
             workspace
@@ -1654,9 +1636,7 @@ fn vbe_set_mode<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    if let super::machine::vga::DosVga::Displayed(
-        super::machine::vga::DisplayedVga::Native(display),
-    ) = &mut dos.pc.as_mut().vga {
+    if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
         let Some(workspace) = bios_display else { return false };
         return workspace.bios_set_mode_request(machine, display.cap_mut(), regs.rbx as u16).is_ok();
     }
@@ -1676,9 +1656,7 @@ fn vbe_window<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    if let super::machine::vga::DosVga::Displayed(
-        super::machine::vga::DisplayedVga::Native(display),
-    ) = &mut dos.pc.as_mut().vga {
+    if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
         if (regs.rbx >> 8) as u8 == 0 {
             let Some(workspace) = bios_display else { return false };
             return workspace.bios_set_bank(machine, display.cap_mut(), regs.rdx as u16).is_ok();
@@ -1693,7 +1671,10 @@ fn vbe_window<A: crate::Arch>(
     if (regs.rbx >> 8) as u8 == 0 {
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
-        let bank = dos.pc.vga.emulated().map_or(0, |dev| dev.state.svga_bank);
+        let DisplayedVga::Emulated(dev, _) = &dos.pc.vga else {
+            return false;
+        };
+        let bank = dev.state.svga_bank;
         regs.rdx = (regs.rdx & !0xFFFF) | bank as u64;
     }
     true

@@ -896,10 +896,9 @@ pub fn exit_thread<A: crate::Arch>(
         && (parent_tid as usize) < MAX_THREADS
         && matches!(threads[parent_tid as usize].personality, Personality::Dos(_));
 
-    // DOS EXEC return transfers the complete VGA ownership state, not a
-    // display-shaped subset. A focused child gives the parent DisplayedVga;
-    // a hidden child gives it EmulatedVga. The parent's saved recovery VGA
-    // moves into the dying slot and is simply discarded with that slot.
+    // DOS EXEC return transfers the complete guest VGA. The parent's recovery
+    // VGA (normally emulated into a headless target) moves into the dying slot
+    // and is discarded with it.
     if return_dos_vga {
         let child_was_focused = tid == crate::kernel::focus::focused();
         let (child, parent) = get_two_threads(threads, tid, parent_tid as usize);
@@ -907,14 +906,6 @@ pub fn exit_thread<A: crate::Arch>(
             (&mut child.personality, &mut parent.personality)
         else { unreachable!() };
         child_dos.pc.vga.prepare_thread_transfer(machine);
-        match (&child_dos.pc.vga, &parent_dos.pc.vga) {
-            (crate::kernel::dos::DosVga::Displayed(_), crate::kernel::dos::DosVga::Hidden(_))
-            | (crate::kernel::dos::DosVga::Hidden(_), crate::kernel::dos::DosVga::Hidden(_)) => {}
-            (crate::kernel::dos::DosVga::Displayed(_), crate::kernel::dos::DosVga::Displayed(_)) =>
-                panic!("DOS child and parent both own a displayed VGA"),
-            (crate::kernel::dos::DosVga::Hidden(_), crate::kernel::dos::DosVga::Displayed(_)) =>
-                panic!("hidden DOS child returned to displayed parent"),
-        }
         core::mem::swap(&mut child_dos.pc.vga, &mut parent_dos.pc.vga);
         if child_was_focused {
             crate::kernel::focus::adopt(parent_tid as usize);

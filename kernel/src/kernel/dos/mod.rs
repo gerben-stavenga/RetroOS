@@ -58,7 +58,8 @@ use self::dosabi as dos;
 mod mode_transitions;
 
 pub use machine::vsb::SbDevice;
-pub use machine::vga::{DisplayedVga, DosVga, physical_vga_present};
+pub use machine::vga::physical_vga_present;
+use crate::kernel::bios_display::{DisplayedVga, EmulatedVga};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
@@ -227,7 +228,7 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
 }
 
 impl<A: crate::Arch> DosState<A> {
-    pub fn new_boxed(machine: &mut A) -> alloc::boxed::Box<Self> {
+    pub fn new_boxed(machine: &mut A, vga: DisplayedVga) -> alloc::boxed::Box<Self> {
         let ldt = fresh_ldt();
         // Allocate first and initialize fields at their final addresses. A
         // conventional `Box::new(DosState { .. })` makes rustc materialize
@@ -237,7 +238,7 @@ impl<A: crate::Arch> DosState<A> {
         let mut state = alloc::boxed::Box::<Self>::new_uninit();
         let p = state.as_mut_ptr();
         unsafe {
-            core::ptr::addr_of_mut!((*p).pc).write(machine::PcMachine::new_boxed(machine));
+            core::ptr::addr_of_mut!((*p).pc).write(machine::PcMachine::new_boxed(machine, vga));
             core::ptr::addr_of_mut!((*p).dta).write(0);
             core::ptr::addr_of_mut!((*p).heap_seg).write(0xA000);
             core::ptr::addr_of_mut!((*p).heap_base_seg).write(0xA000);
@@ -332,14 +333,13 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::Display {
         let linear_vbe = match &self.pc.vga {
-            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Native(native)) =>
+            DisplayedVga::Native(native) =>
                 match native.cap() {
                     crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
                     crate::kernel::platform::VgaCap::Legacy
                     | crate::kernel::platform::VgaCap::Vbe { bank: Some(_), .. } => None,
                 },
-            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Emulated(_, _))
-            | machine::vga::DosVga::Hidden(_) => None,
+            DisplayedVga::Emulated(_, _) => None,
         };
         let display = self.pc.vga.map(|vga|
             vga.into_emulated_for_osd(machine, bios_workspace));
@@ -378,7 +378,7 @@ impl<A: crate::Arch> DosState<A> {
         self.pc.vga.map(|vga|
             (vga.raise_from_osd(machine, bios_workspace, display), ()));
         let linear_vbe = match &self.pc.vga {
-            machine::vga::DosVga::Displayed(machine::vga::DisplayedVga::Native(native)) =>
+            DisplayedVga::Native(native) =>
                 match native.cap() {
                     crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
                     _ => None,
@@ -595,7 +595,9 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-    let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
+    let DisplayedVga::Emulated(dev, _) = &mut dos.pc.vga else {
+        return false;
+    };
     let (base, len) = machine::vga::planar_window(dev.state.gc[6]);
     if !(base..base + len).contains(&addr) {
         return false;
@@ -744,11 +746,11 @@ pub fn handle_event<A: crate::Arch>(
                 if vif_owns_db {
                     return match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
                         Some(dpmi::DbResult::Event(ev)) =>
-                            handle_event(machine, bios_display.as_deref_mut(), kt, dos, regs, ev),
+                            handle_event(machine, bios_display, kt, dos, regs, ev),
                         _ => thread::KernelAction::Done,
                     };
                 }
-                if machine.read::<u16>(1 * 4 + 2) != dos::STUB_SEG {
+                if machine.read::<u16>(4 + 2) != dos::STUB_SEG {
                     arch_abi::monitor::sw_reflect_vm86_int(regs, machine, 1);
                 } else {
                     // No guest handler owns this trace. Avoid restoring TF and
@@ -944,7 +946,7 @@ pub(crate) fn bios_int10_returned(regs: &Regs, event: &crate::KernelEvent) -> bo
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8) {
+pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8, vga: DisplayedVga) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
@@ -988,7 +990,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // the kernel stack for the whole duration of this already-deep EXEC path;
     // a child launched by DN can then cross the 64 KiB stack guard. Do the
     // small post-construction DFS initialization after installation instead.
-    current.personality = thread::Personality::Dos(DosState::new_boxed(machine));
+    current.personality = thread::Personality::Dos(DosState::new_boxed(machine, vga));
     // `regs` (the thread's vcpu) and `dos_state` (its DOS personality) are
     // disjoint fields of `current`, so borrow them directly rather than via
     // `dos_mut()` — the loaders need both at once.
@@ -997,6 +999,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         thread::Personality::Dos(d) => d,
         _ => unreachable!("just set Dos personality"),
     };
+    dos_state.pc.vga.on_address_space_active(machine);
     dpmi::install_kernel_ldt_slots(dos_state);
     dos_state.dfs.init_from_vfs(&parent_cwd);
     dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
@@ -1121,7 +1124,11 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
         pc.mpu.reset();
         pc.spk.reset();
     }
-    t.personality = thread::Personality::Dos(DosState::new_boxed(machine));
+    let vga = DisplayedVga::Emulated(
+        EmulatedVga::initial_mode3(),
+        crate::kernel::display::Display::headless(),
+    );
+    t.personality = thread::Personality::Dos(DosState::new_boxed(machine, vga));
     let loaded = {
         // `regs` and `dos_state` are disjoint fields of `t`; borrow directly.
         let regs = &mut t.kernel.vcpu;
@@ -1129,6 +1136,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
             thread::Personality::Dos(d) => d,
             _ => unreachable!("just set Dos personality"),
         };
+        dos_state.pc.vga.on_address_space_active(machine);
         dpmi::install_kernel_ldt_slots(dos_state);
         dos_state.dfs.init_from_vfs(&cwd);
         dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
