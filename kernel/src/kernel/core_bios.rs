@@ -1,7 +1,7 @@
 //! Private native video-BIOS execution environment.
 //!
 //! DOS always runs the Rust substitute BIOS. Native video firmware executes
-//! only in this kernel-owned pristine COW workspace, synchronously servicing
+//! only in this kernel-owned persistent workspace, synchronously servicing
 //! operations on a move-only `NativeVga`.
 
 use crate::{Arch, Regs, Vcpu};
@@ -102,8 +102,8 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
 }
 
 impl<A: Arch> NativeBiosWorkspace<A> {
-    /// Build the real-mode template in the currently active address space,
-    /// park a COW snapshot of it, then return the live space to a clean state.
+    /// Build the persistent real-mode driver address space from the original
+    /// firmware view and park it outside every personality.
     fn new(machine: &mut A) -> Self {
         // Snapshot the firmware view before the DOS substitute BIOS replaces
         // the IVT. This address space is never handed to a personality.
@@ -123,8 +123,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     const STATE_BUFFER: usize = 0x70000;
     const MAX_STATE_BYTES: usize = 0x10000;
     // Hardware, DAC and extended-controller state. BIOS data-area state is
-    // deliberately excluded: native firmware executes in a disposable COW
-    // workspace, while the DOS personality owns its independent BDA.
+    // deliberately excluded: it persists in the native driver's address
+    // space, while each DOS personality owns its independent substitute BDA.
     const STATE_COMPONENTS: u64 = 0x000D;
 
     /// Probe VBE's chipset-independent full controller save/restore service.
@@ -141,7 +141,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return None;
         }
         let mut regs = Regs::empty();
-        self.with_bios_clone(
+        self.with_bios_workspace(
             machine,
             display,
             &mut regs,
@@ -172,7 +172,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }
         let bytes = self.state_bytes?;
         let mut regs = Regs::empty();
-        self.with_bios_clone(
+        self.with_bios_workspace(
             machine,
             display,
             &mut regs,
@@ -207,7 +207,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::InvalidStateSize);
         }
         let mut regs = self.bios_vcpu.regs;
-        self.with_bios_clone(
+        self.with_bios_workspace(
             machine,
             display,
             &mut regs,
@@ -228,8 +228,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     /// Set a legacy (00h..FFh) or VBE (100h and above) mode through the
     /// machine's own video BIOS. This is a regular
     /// synchronous Rust call: the stopped guest's address space and FPU state
-    /// are restored before it returns. The ROM runs in a disposable COW clone,
-    /// so neither guest mutations nor BIOS scratch writes touch the template.
+    /// are restored before it returns. The ROM runs in its isolated persistent
+    /// driver address space, so guest memory remains unreachable while the
+    /// firmware's own BDA and scratch state remain coherent with native VGA.
     fn set_mode(
         &mut self,
         machine: &mut A,
@@ -259,7 +260,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::Rejected(0x014F));
         }
         let mut regs = self.bios_vcpu.regs;
-        self.with_bios_clone(machine, bios_display, &mut regs, |_, regs| {
+        self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
             if number <= 0xFF {
                 regs.rax = u64::from(number);
             } else {
@@ -296,14 +297,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        mode: crate::kernel::platform::VbeMode,
         bank: u16,
     ) -> Result<(), BiosError> {
         let mut regs = self.bios_vcpu.regs;
-        self.with_bios_clone(machine, display, &mut regs, |_, regs| {
-            regs.rax = 0x4F05;
-            regs.rbx = 0;
-            regs.rdx = u64::from(bank);
-        }, |_, _| ())?;
+        let caller_space = machine.activate(
+            core::mem::take(&mut self.bios_vcpu.space),
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+        let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
+        crate::kernel::io_policy::apply_bios_display(machine, display);
+        let completed = run_bios_until(machine, &mut regs, return_ip);
+        self.bios_vcpu.space = machine.activate(
+            caller_space,
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+        machine.reset_io_bitmap();
+        completed?;
         let status = regs.rax as u16;
         if status != 0x004F {
             return Err(BiosError::Rejected(status));
@@ -341,7 +353,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             None
         };
         let mut regs = self.bios_vcpu.regs;
-        let output = self.with_bios_clone(
+        let output = self.with_bios_workspace(
             machine,
             display,
             &mut regs,
@@ -409,7 +421,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
         let data = font.map(<[u8]>::to_vec);
         let mut regs = self.bios_vcpu.regs;
-        self.with_bios_clone(
+        self.with_bios_workspace(
             machine,
             display,
             &mut regs,
@@ -430,10 +442,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         Ok(())
     }
 
-    /// Publish a compact packed shadow through a VBE bank window. One
-    /// disposable BIOS execution space is kept active for the whole frame, so
-    /// the only repeated firmware operation is 4F05 itself; the address-space
-    /// fork/activation cost is paid once, not once per 64-KiB window.
+    /// Publish a compact packed shadow through a VBE bank window. The native
+    /// BIOS workspace already owns the live VGA state, so keep that persistent
+    /// workspace active for the whole frame; only 4F05 itself repeats.
     fn present_banked(
         &mut self,
         machine: &mut A,
@@ -470,14 +481,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        let mut call_space = A::PageTable::default();
-        machine.user_fork(&mut call_space);
-        let mut call_fx = machine.clean_fx_template();
-        self.bios_vcpu.space = machine.activate(
-            call_space,
-            &mut call_fx,
-            core::ptr::null_mut(),
-        );
         crate::kernel::io_policy::apply_bios_display(machine, display);
 
         let result = (|| {
@@ -506,11 +509,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                         let bank = u16::try_from(bank_usize).map_err(|_| BiosError::InvalidFrame)?;
                         if current_bank != Some(bank) {
                             let mut regs = self.bios_vcpu.regs;
-                            crate::kernel::dos::prepare_bios_int10(machine, &mut regs);
-                            regs.rax = 0x4F05;
-                            regs.rbx = 0;
-                            regs.rdx = u64::from(bank);
-                            run_bios_int10(machine, &mut regs)?;
+                            let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
+                            run_bios_until(machine, &mut regs, return_ip)?;
                             let status = regs.rax as u16;
                             if status != 0x004F { return Err(BiosError::Rejected(status)); }
                             *bank_state = bank;
@@ -528,13 +528,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             Ok(out_w * out_h)
         })();
 
-        machine.free_user_pages();
-        let mut call_space = machine.activate(
+        self.bios_vcpu.space = machine.activate(
             caller_space,
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        machine.destroy_space(&mut call_space);
         machine.reset_io_bitmap();
         result
     }
@@ -564,7 +562,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         const MODE_INFO: usize = 0x9200;
 
         let mut regs = Regs::empty();
-        let modes = self.with_bios_clone(
+        let modes = self.with_bios_workspace(
             machine,
             bios_display,
             &mut regs,
@@ -594,7 +592,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let mut candidates = Vec::new();
         for number in modes {
             let mut regs = Regs::empty();
-            let mode = self.with_bios_clone(
+            let mode = self.with_bios_workspace(
                 machine,
                 bios_display,
                 &mut regs,
@@ -660,7 +658,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         selected
     }
 
-    fn with_bios_clone<T, F, G>(
+    fn with_bios_workspace<T, F, G>(
         &mut self,
         machine: &mut A,
         bios_display: &crate::kernel::platform::VgaCap,
@@ -672,20 +670,15 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         F: FnOnce(&mut A, &mut Regs),
         G: FnOnce(&mut A, &Regs) -> T,
     {
-        // Activate the pristine template and retain the caller's live state in
-        // `self.fx`, then fork a disposable execution copy.
+        // The ROM owns one persistent private real-mode workspace, just as it
+        // does on a physical PC. It is isolated from every guest address space,
+        // but BIOS scratch/BDA state intentionally survives between calls.
+        // Keeping that workspace parked here also makes high-frequency VBE
+        // operations (notably 4F05h bank switching) ordinary BIOS executions
+        // instead of a COW fork + full page-table teardown per bank.
         let caller_space = machine.activate(
             core::mem::take(&mut self.bios_vcpu.space),
             &mut self.fx,
-            core::ptr::null_mut(),
-        );
-        let mut call_space = A::PageTable::default();
-        machine.user_fork(&mut call_space);
-
-        let mut call_fx = machine.clean_fx_template();
-        self.bios_vcpu.space = machine.activate(
-            call_space,
-            &mut call_fx,
             core::ptr::null_mut(),
         );
 
@@ -696,16 +689,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
         let result = completed.map(|()| collect(machine, regs));
 
-        // `self.fx` currently contains the caller's displaced FPU image, so
-        // this restores both caller resources in one activation. The returned
-        // call space is disposable; the pristine template is parked already.
-        machine.free_user_pages();
-        let mut call_space = machine.activate(
+        // `self.fx` contains the caller's displaced FPU image. Restore both
+        // caller resources and park the BIOS workspace/FPU state for next time.
+        self.bios_vcpu.space = machine.activate(
             caller_space,
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        machine.destroy_space(&mut call_space);
         machine.reset_io_bitmap();
         result
     }
@@ -805,9 +795,10 @@ impl crate::kernel::platform::VgaCap {
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
+        mode: crate::kernel::platform::VbeMode,
         bank: u16,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.set_bank(machine, self, bank)
+        self.bios(bios)?.set_bank(machine, self, mode, bank)
     }
 
     pub fn bios_palette_call<A: Arch>(
@@ -858,9 +849,27 @@ impl crate::kernel::platform::VgaCap {
 }
 
 fn run_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) -> Result<(), BiosError> {
+    run_bios(machine, regs, crate::kernel::dos::bios_int10_returned)
+}
+
+fn run_bios_until<A: Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    return_ip: u32,
+) -> Result<(), BiosError> {
+    run_bios(machine, regs, |regs, event| {
+        crate::kernel::dos::bios_thunk_returned(regs, event, return_ip)
+    })
+}
+
+fn run_bios<A: Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    returned: impl Fn(&Regs, &crate::KernelEvent) -> bool,
+) -> Result<(), BiosError> {
     loop {
         let event = machine.execute(regs);
-        if crate::kernel::dos::bios_int10_returned(regs, &event) {
+        if returned(regs, &event) {
             return Ok(());
         }
         match event {
@@ -883,6 +892,25 @@ fn run_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) -> Result<(), BiosE
             _ => return Err(BiosError::UnexpectedEvent),
         }
     }
+}
+
+fn prepare_bank_call<A: Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    mode: crate::kernel::platform::VbeMode,
+    bank: u16,
+) -> u32 {
+    let return_ip = if mode.window_function == 0 {
+        crate::kernel::dos::prepare_bios_int10(machine, regs);
+        // INT 10h; INT 31h occupies two adjacent two-byte vector slots.
+        crate::kernel::dos::bios_int10_return_ip()
+    } else {
+        crate::kernel::dos::prepare_bios_window_call(machine, regs, mode.window_function)
+    };
+    regs.rax = 0x4F05;
+    regs.rbx = 0;
+    regs.rdx = u64::from(bank);
+    return_ip
 }
 
 fn parse_vbe_mode<A: Arch>(
@@ -933,6 +961,7 @@ fn parse_vbe_mode<A: Arch>(
     let window_attributes = machine.read::<u8>(address + 0x02);
     let window_granularity_kb = machine.read::<u16>(address + 0x04);
     let window_size_kb = machine.read::<u16>(address + 0x06);
+    let window_function = machine.read::<u32>(address + 0x0C);
     if width == 0 || height == 0 || (physical_base == 0 && window_segment == 0)
         || (physical_base == 0
             && (window_attributes & 0x05 != 0x05
@@ -946,5 +975,6 @@ fn parse_vbe_mode<A: Arch>(
         window_segment,
         window_granularity_kb,
         window_size_kb,
+        window_function,
     })
 }

@@ -24,6 +24,9 @@ pub struct VbeMode {
     pub window_segment: u16,
     pub window_granularity_kb: u16,
     pub window_size_kb: u16,
+    /// VBE ModeInfoBlock.WinFuncPtr: the firmware's real-mode far entry for
+    /// fast window changes, or zero when only INT 10h Function 05h is offered.
+    pub window_function: u32,
 }
 
 use crate::println;
@@ -253,20 +256,6 @@ pub enum DebugSink {
     Debugcon,
     /// The host process's stdout (hosted backend).
     HostStdout,
-}
-
-impl Platform {
-    /// The focused DOS thread owns 0x3C0/0x3DA directly — no AC-tracking
-    /// traps. True on a real card everywhere except QEMU, whose 0x3DA
-    /// retrace is fabricated (the trap is load-bearing there). Save/restore
-    /// then recovers AC sequencing state from the card: exactly via the
-    /// Cirrus readbacks when `vga_readback`, best-effort otherwise.
-    pub fn vga_ports_direct(&self) -> bool {
-        // Whether a card answers, not which emulator we are on. QEMU was
-        // excluded because its 0x3DA was fabricated for the guest, so the
-        // ports had to trap; that fabrication is gone.
-        self.vga_passthrough
-    }
 }
 
 /// Environment facts only the ENTRY crate knows — injected before `probe`

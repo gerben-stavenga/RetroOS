@@ -47,18 +47,22 @@ in Git history.
 
 ## DOS compatibility
 
+- [ ] **Pace native DOS CPU execution independently of display work.** F22's
+  startup calibrates a `DEC ECX` busy loop against a timer counter. On KVM with
+  native VGA, even a nearly full 32-bit count completes below its 120-tick
+  threshold, the count wraps, and calibration retries for minutes. QEMU/UEFI
+  and the OSD mask this by spending time on software rendering; TCG masks it
+  through interpreter overhead. Add an explicit DOS CPU-speed/throttling policy
+  so timing never depends on the display backend. Do not special-case F22,
+  joystick port `0x201`, or restore needless native-VGA presentation.
 - [ ] **Ironman Off-Road Racing:** fix the timer ISR's polling of port `0x3DA`.
   It requires a runtime-derived number of consecutive samples and can grind
   to a halt when emulated retrace advances independently of guest polling.
-- [ ] **Settlers (DOS/4GW):** mouse clicks can trigger a kernel #GP. Trace the
-  callback/selector transition rather than applying another selector-as-
-  paragraph workaround.
-- [ ] **Indiana Jones and the Fate of Atlantis:** mouse clicks are not
-  delivered.
-- [ ] **Indiana Jones and the Last Crusade:** divide-by-zero on startup.
 - [ ] **Aladdin:** sound degrades and graphics eventually become corrupt.
 - [ ] **Golden Axe:** missing keyboard keys prevent selection.
+- [ ] **Comanche/F22:** no arrow key response.
 - [ ] **Pinball Illusions:** add the required pMAX protected-mode support.
+- [ ] **Civilization:** introscreen crawls
 
 ## Emulator-specific reference issues
 

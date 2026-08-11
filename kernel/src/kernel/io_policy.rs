@@ -5,9 +5,8 @@
 //! may touch is kernel policy, rebuilt at every guest entry from the running
 //! personality's I/O capabilities and the platform:
 //!
-//!   - DOS owning the real card: the VGA register window (0x3C0 and 0x3DA
-//!     stay trapped: AC flip-flop tracking + retrace fabrication), plus any
-//!     granted device windows.
+//!   - DOS owning the real card: the complete VGA register window is direct,
+//!     including 0x3C0 and 0x3DA, plus any granted device windows.
 //!   - DOS owning emulated VGA: granted device windows only — VGA programming
 //!     traps into the thread's own VgaState model.
 //!   - Linux: nothing, ever. A trapped port from Linux is a fault,
@@ -19,7 +18,6 @@
 //! background FM music keeps playing; the display does not follow focus,
 //! audio does not follow it either.
 
-use crate::kernel::platform;
 use crate::kernel::thread::Personality;
 
 /// Rebuild the live I/O bitmap from the running personality's capabilities:
@@ -36,17 +34,11 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
             {
                 machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
                 machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
-                // 0x3C0/0x3DA go direct too when save/restore can recover
-                // the AC sequencing state from the card instead of a trap
-                // tracker (see `drivers::vga_hw::save`). Trapping these
-                // costs the guest a VM86 round-trip per retrace poll — a
-                // palette fade is thousands of 0x3DA reads per frame, and a
-                // game that waits on retrace can poll tens of thousands of
-                // times before it gives up.
-                if platform::get().vga_ports_direct() {
-                    machine.allow_io_ports(0x3C0, 1);
-                    machine.allow_io_ports(0x3DA, 1);
-                }
+                // Native ownership means the card is the source of truth,
+                // including the attribute-controller flip-flop side effect of
+                // 0x3DA. These two ports must therefore bypass emulation too.
+                machine.allow_io_ports(0x3C0, 1);
+                machine.allow_io_ports(0x3DA, 1);
             }
             // Ports are granted to a guest that holds the REAL card, and to
             // no other: an emulated card's window must keep trapping, or the
@@ -101,5 +93,10 @@ pub(crate) fn apply_bios_display<A: crate::Arch>(
     _bios_display: &crate::kernel::platform::VgaCap,
 ) {
     machine.reset_io_bitmap();
+    // Native VBE firmware may use the Bochs/QEMU-compatible DISPI index/data
+    // window. The BIOS workspace is trusted and isolated; trapping these
+    // instructions back through the kernel turns every bank change into nested
+    // monitor exits. Three byte ports cover word accesses at 1CEh and 1CFh.
+    machine.allow_io_ports(0x1CE, 3);
     machine.allow_io_ports(0x3C0, 0x20);
 }

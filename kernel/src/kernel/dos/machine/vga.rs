@@ -51,10 +51,10 @@ impl EmulatedVga {
             }),
         };
         let svga_pages = if resume_vbe.is_some() {
-            crate::kernel::drivers::vga_hw::save_dac(&mut model);
+            crate::kernel::drivers::vga_hw::save_dac(native.cap(), &mut model);
             capture_native_vbe(machine, bios, native.cap_mut(), native_mode, &mut model)
         } else {
-            crate::kernel::drivers::vga_hw::save(&mut model);
+            crate::kernel::drivers::vga_hw::save(native.cap(), &mut model);
             materialize_emulated_aperture(&mut model, machine);
             0
         };
@@ -128,7 +128,7 @@ impl EmulatedVga {
             let mode = native.cap_mut().bios_set_mode(machine, &mut *bios, 3);
             *native.mode_mut() = mode;
         }
-        crate::kernel::drivers::vga_hw::restore(&self.state);
+        crate::kernel::drivers::vga_hw::restore(native.cap(), &self.state);
         if let Some(state) = self.firmware_state.as_ref() {
             if let Err(error) = native.cap().bios_restore_state(machine, bios, state) {
                 crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
@@ -137,7 +137,7 @@ impl EmulatedVga {
             {
                 // SeaVGABIOS/QEMU can return from 4F04 with AC PAS clear,
                 // blanking an otherwise fully restored legacy screen.
-                crate::kernel::drivers::vga_hw::enable_palette_output(&self.state);
+                crate::kernel::drivers::vga_hw::enable_palette_output(native.cap(), &self.state);
             }
         }
         *native.mode_mut() = crate::kernel::platform::NativeVgaMode::Legacy;
@@ -342,8 +342,8 @@ pub use ::vga::VgaState;
 /// conventional colour 80x25 text screen expected when COMMAND.COM returns.
 pub fn is_standard_text(device: &DisplayedVga) -> bool {
     match device {
-        DisplayedVga::Native(_) =>
-            crate::kernel::drivers::vga_hw::is_standard_text_mode(),
+        DisplayedVga::Native(native) =>
+            crate::kernel::drivers::vga_hw::is_standard_text_mode(native.cap()),
         DisplayedVga::Emulated(dev, _) => {
             dev.state.svga_w == 0
                 && ::vga::is_standard_text(&::vga::Regs {
@@ -759,7 +759,7 @@ fn restore_native_vbe<A: crate::Arch>(
             machine, bios, display, mode, resume.bank.unwrap_or(0), &pixels,
         );
     }
-    crate::kernel::drivers::vga_hw::restore_dac(state);
+    crate::kernel::drivers::vga_hw::restore_dac(display, state);
     crate::println!("VBE: restored guest mode {:#x} from shadow", mode.number);
 }
 
@@ -776,11 +776,11 @@ fn copy_banked_from_card<A: crate::Arch>(
     let address = usize::from(mode.window_segment) << 4;
     for offset in (0..pixels.len()).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, mode, bank).is_err() { break; }
         let count = window_bytes.min(pixels.len() - offset);
         machine.copy_from(address, &mut pixels[offset..offset + count]);
     }
-    let _ = display.bios_set_bank(machine, bios, current_bank);
+    let _ = display.bios_set_bank(machine, bios, mode, current_bank);
 }
 
 fn copy_banked_to_card<A: crate::Arch>(
@@ -796,11 +796,11 @@ fn copy_banked_to_card<A: crate::Arch>(
     let address = usize::from(mode.window_segment) << 4;
     for offset in (0..pixels.len()).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, mode, bank).is_err() { break; }
         let count = window_bytes.min(pixels.len() - offset);
         machine.copy_to(address, &pixels[offset..offset + count]);
     }
-    let _ = display.bios_set_bank(machine, bios, current_bank);
+    let _ = display.bios_set_bank(machine, bios, mode, current_bank);
 }
 
 fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {

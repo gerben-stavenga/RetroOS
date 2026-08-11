@@ -78,42 +78,37 @@ pub fn read_mode_regs() -> vga::Regs {
     vga::Regs { crtc, seq, gc, misc }
 }
 
-pub fn is_standard_text_mode() -> bool {
+pub fn is_standard_text_mode(_cap: &crate::kernel::platform::VgaCap) -> bool {
     vga::is_standard_text(&read_mode_regs())
 }
 
 /// Read the live card's whole register file, DAC and plane memory into
 /// `state`. Called when a thread stops owning the physical display and its
 /// screen must survive as a model (`NativeVga -> EmulatedVga`).
-pub fn save(state: &mut VgaState) {
+pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     use crate::kernel::portio::{inb, outb};
     if state.planes.is_empty() {
         state.planes = alloc::vec![0u8; 4 * 65536];
     }
     // Capture the AC sequencing state, then reset the flipflop to a
     // known index state. With 0x3C0/0x3DA granted to the guest
-    // (io_policy `vga_ports_direct`), the VGA_AC_STATE tracker never saw
+    // (io_policy's `DisplayedVga::Native` arm), the VGA_AC_STATE tracker never saw
     // its writes — the card is the only source of truth, and it must be
     // read BEFORE the 0x3DA reset below destroys the phase.
     let plat = crate::kernel::platform::get();
-    if plat.vga_ports_direct() {
-        let index = inb(0x3C0); // address-register readback (incl. PAS)
-        let pending_data = if plat.vga_readback {
-            let crtc_index = inb(0x3D4);
-            outb(0x3D4, 0x24); // Cirrus CR24: bit 7 = flip-flop phase
-            let phase = inb(0x3D5) & 0x80 != 0;
-            outb(0x3D4, crtc_index);
-            phase
-        } else {
-            // Phase not readable on this card — assume index state (the
-            // boot warning declared full restore unsupported here).
-            false
-        };
-        state.ac_state = AcState { index, pending_data };
+    let index = inb(0x3C0); // address-register readback (incl. PAS)
+    let pending_data = if plat.vga_readback {
+        let crtc_index = inb(0x3D4);
+        outb(0x3D4, 0x24); // Cirrus CR24: bit 7 = flip-flop phase
+        let phase = inb(0x3D5) & 0x80 != 0;
+        outb(0x3D4, crtc_index);
+        phase
     } else {
-        // Trapped AC ports (QEMU): the tracker observed every access.
-        state.ac_state = unsafe { AC };
-    }
+        // Phase not readable on this card — assume index state (the boot
+        // warning declared full restore unsupported here).
+        false
+    };
+    state.ac_state = AcState { index, pending_data };
     let _ = inb(0x3DA);
 
     // Capture index registers BEFORE the save loops overwrite them.
@@ -132,7 +127,7 @@ pub fn save(state: &mut VgaState) {
     // Must happen before the plane copy below — every VRAM read reloads
     // them. Without the readback the latches stay unrecoverable (see the
     // gap comment further down).
-    if plat.vga_ports_direct() && plat.vga_readback {
+    if plat.vga_readback {
         for plane in 0..4u8 {
             outb(0x3CE, 4); outb(0x3CF, plane);
             outb(0x3D4, 0x22);
@@ -140,7 +135,7 @@ pub fn save(state: &mut VgaState) {
         }
         outb(0x3CE, 4); outb(0x3CF, state.gc[4]);
     }
-    save_dac(state);
+    save_dac(cap, state);
 
     // Attribute Controller — must reset flipflop EACH iteration.
     // inb(0x3C1) reads the register but does NOT toggle the flipflop,
@@ -265,14 +260,14 @@ pub fn save(state: &mut VgaState) {
     // adapter directly to its child, so repair QEMU's palette-enable latch
     // without touching registers, VRAM, palette or mode.
     if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
-        enable_palette_output(state);
+        enable_palette_output(cap, state);
     }
 }
 
 /// Capture only the palette state shared by legacy VGA and indexed VBE.
 /// Unlike [`save`], this never touches sequencer, CRTC, graphics-controller or
 /// aperture state, so it is safe while a firmware VBE mode is scanning out.
-pub fn save_dac(state: &mut VgaState) {
+pub fn save_dac(_cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     use crate::kernel::portio::{inb, outb};
     let dac_mask = inb(0x3C6);
     // QEMU's legacy VGA returns zero for the standard PEL-mask read even when
@@ -296,7 +291,7 @@ pub fn save_dac(state: &mut VgaState) {
 /// Program `state` back into the live card: registers, DAC, and plane
 /// memory. Called while acquiring the physical lease, or when repainting an
 /// owner that already holds it.
-pub fn restore(state: &VgaState) {
+pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     if state.planes.is_empty() { return; }
     use crate::kernel::portio::{inb, outb};
 
@@ -341,7 +336,7 @@ pub fn restore(state: &VgaState) {
     // land verbatim.
     {
         let plat = crate::kernel::platform::get();
-        if plat.vga_ports_direct() && plat.vga_readback {
+        if plat.vga_readback {
             for plane in 0..4u8 {
                 outb(0x3C4, 2); outb(0x3C5, 1 << plane);
                 unsafe { core::ptr::write_volatile(vga_window, state.latches[plane as usize]); }
@@ -475,7 +470,10 @@ pub fn restore(state: &VgaState) {
 /// even though the saved display was visible. The register contents and
 /// flip-flop phase remain those of `state`; only the display-enable bit is
 /// normalized at this ownership boundary.
-pub fn enable_palette_output(state: &VgaState) {
+pub fn enable_palette_output(
+    _cap: &crate::kernel::platform::VgaCap,
+    state: &VgaState,
+) {
     use crate::kernel::portio::{inb, outb};
     let ac_state = AcState {
         index: state.ac_state.index | 0x20,
@@ -493,7 +491,7 @@ pub fn enable_palette_output(state: &VgaState) {
 /// legacy sequencer/CRTC register file after a firmware VBE mode set would
 /// destroy that mode, but indexed VBE scanout still depends on this
 /// palette and PEL mask.
-pub fn restore_dac(state: &VgaState) {
+pub fn restore_dac(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     use crate::kernel::portio::outb;
     outb(0x3C6, state.dac_mask);
     outb(0x3C8, 0);

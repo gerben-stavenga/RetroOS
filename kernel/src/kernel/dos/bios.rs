@@ -1414,6 +1414,9 @@ fn vbe<A: crate::Arch>(
             let ok = vbe_palette(machine, bios_display, dos, regs);
             done(regs, ok);
         }
+        0x0A => {
+            done(regs, false);
+        }
         _ => done(regs, false),
     }
 }
@@ -1659,8 +1662,12 @@ fn vbe_window<A: crate::Arch>(
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
         if (regs.rbx >> 8) as u8 == 0 {
+            let mode = match display.mode() {
+                crate::kernel::platform::NativeVgaMode::VbeBanked { mode, .. } => mode,
+                _ => return false,
+            };
             if display.cap_mut().bios_set_bank(
-                machine, bios_display, regs.rdx as u16).is_err()
+                machine, bios_display, mode, regs.rdx as u16).is_err()
             {
                 return false;
             }

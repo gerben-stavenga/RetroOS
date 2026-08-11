@@ -150,7 +150,7 @@ impl Display {
         // A legacy owner must be restored register-for-register. A VBE owner
         // is restored by its firmware mode set and framebuffer handoff; running
         // the legacy save algorithm over a live banked VBE mode corrupts it.
-        crate::kernel::drivers::vga_hw::save(&mut saved);
+        crate::kernel::drivers::vga_hw::save(&native, &mut saved);
         let mut state = vga::VgaState::new();
         let regs = vga::bios_mode13_regs();
         state.misc_output = regs.misc;
@@ -162,7 +162,7 @@ impl Display {
         state.ac[0x12] = 0x0f;
         state.dac = vga::palette_rgb332();
         state.planes.resize(4 * 0x10000, 0);
-        crate::kernel::drivers::vga_hw::restore(&state);
+        crate::kernel::drivers::vga_hw::restore(&native, &state);
         Self {
             shadow_width: 320,
             rgb: PixelFormat::RGB332,
@@ -301,7 +301,7 @@ impl Display {
             Backend::Vga { native, scanout } => {
                 let mode = match scanout {
                     VgaScanout::Mode13 { saved, saved_mode, .. } => {
-                        crate::kernel::drivers::vga_hw::restore(&saved);
+                        crate::kernel::drivers::vga_hw::restore(&native, &saved);
                         return Ok(crate::kernel::platform::NativeVga::restored(native, saved_mode));
                     }
                     VgaScanout::VbeLinear { pages, mode, .. } => {

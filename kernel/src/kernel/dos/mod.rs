@@ -919,8 +919,8 @@ pub(crate) fn initialize_dos_template<A: crate::Arch>(machine: &mut A, regs: &mu
 
 /// Point a cleared register set at a two-instruction kernel video-BIOS thunk:
 /// `INT 10h; INT 31h`. The native workspace predates the substitute stub
-/// array, so both instructions are written explicitly into its disposable COW
-/// call clone.
+/// array, so both instructions are written explicitly into its private driver
+/// address space.
 pub(crate) fn prepare_bios_int10<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     const THUNK_SLOT: u8 = 0xFE;
     let thunk = (usize::from(dos::STUB_SEG) << 4) + usize::from(dos::slot_offset(THUNK_SLOT));
@@ -935,10 +935,46 @@ pub(crate) fn prepare_bios_int10<A: crate::Arch>(machine: &mut A, regs: &mut Reg
     };
 }
 
-pub(crate) fn bios_int10_returned(regs: &Regs, event: &crate::KernelEvent) -> bool {
+/// Replace the ordinary INT 10h thunk with the VBE ModeInfoBlock.WinFuncPtr
+/// far call. VBE defines this entry precisely so repeated bank changes avoid
+/// the firmware interrupt dispatcher while retaining Function 05h's register
+/// convention and status result.
+pub(crate) fn prepare_bios_window_call<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    target: u32,
+) -> u32 {
+    const THUNK_SLOT: u8 = 0xFE;
+    prepare_bios_int10(machine, regs);
+    let offset = target as u16;
+    let segment = (target >> 16) as u16;
+    let thunk_offset = dos::slot_offset(THUNK_SLOT);
+    let thunk = (usize::from(dos::STUB_SEG) << 4) + usize::from(thunk_offset);
+    machine.write::<[u8; 7]>(thunk, [
+        0x9A,
+        offset as u8, (offset >> 8) as u8,
+        segment as u8, (segment >> 8) as u8,
+        0xCD, 0x31,
+    ]);
+    u32::from(thunk_offset) + 7
+}
+
+pub(crate) fn bios_thunk_returned(
+    regs: &Regs,
+    event: &crate::KernelEvent,
+    return_ip: u32,
+) -> bool {
     matches!(event, crate::KernelEvent::SoftInt(0x31))
         && regs.code_seg() == dos::STUB_SEG
-        && regs.ip32() == dos::slot_offset(0xFF) as u32 + 2
+        && regs.ip32() == return_ip
+}
+
+pub(crate) fn bios_int10_returned(regs: &Regs, event: &crate::KernelEvent) -> bool {
+    bios_thunk_returned(regs, event, bios_int10_return_ip())
+}
+
+pub(crate) const fn bios_int10_return_ip() -> u32 {
+    dos::slot_offset(0xFF) as u32 + 2
 }
 
 /// Handles full address space setup: clean + low mem + IVT + binary load + thread init.
