@@ -263,6 +263,21 @@ pkg_tar(
     package_dir = "home/retroos",
 )
 
+# Raw ext4 images consumed directly by GRUB's Multiboot module command. The
+# image root is the declared mount point; no partition table or boot label is
+# part of this transport.
+pkg_tar(
+    name = "root_module_base_tar",
+    files = _DOS_EXTRA,
+    deps = [":bin_tar", ":ultrasnd_tar", ":tc_tar", ":tp70_tar"],
+    package_dir = "home/retroos",
+)
+
+pkg_tar(
+    name = "games_module_tar",
+    files = {":" + s: s[len(_GAMES_PREFIX):].upper() for s in _GAME_SRCS},
+)
+
 # Extras populated into the ext4 partition: the /bin busybox userland plus the
 # /home/retroos DOS world.
 pkg_tar(
@@ -483,6 +498,58 @@ genrule(
         # Run `D:\\SETUPBC` once after booting to make BCC find its headers.
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/SETUPBC.BAT" "::SETUPBC.BAT"
     """,
+)
+
+# Diskless Multiboot module images are plain raw ext4 volumes.
+genrule(
+    name = "root_module_base_image",
+    srcs = [":root_module_base_tar", "tools/build_module_image.py"],
+    outs = ["retroos-base.img"],
+    cmd = "python3 $(location tools/build_module_image.py)" +
+          " --contents $(location :root_module_base_tar) --size-mb 32 --out $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "root_module_base_gzip",
+    srcs = [":root_module_base_image"],
+    outs = ["retroos-base.img.gz"],
+    cmd = "gzip -9 -n -c $(location :root_module_base_image) > $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "root_module_games_image",
+    srcs = [":games_module_tar", "tools/build_module_image.py"],
+    outs = ["retroos-games.img"],
+    cmd = "python3 $(location tools/build_module_image.py)" +
+          " --contents $(location :games_module_tar) --size-mb 96 --writable-root --out $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "root_module_games_gzip",
+    srcs = [":root_module_games_image"],
+    outs = ["retroos-games.img.gz"],
+    cmd = "gzip -9 -n -c $(location :root_module_games_image) > $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "grub_module_iso",
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg"],
+    outs = ["retroos_grub_module.iso"],
+    cmd = """
+        DIR=$$(mktemp -d)
+        mkdir -p "$$DIR/boot/grub"
+        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
+        cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
+        cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
+        cp $(location tools/grub-module.cfg) "$$DIR/boot/grub/grub.cfg"
+        grub-mkrescue -o $@ "$$DIR"
+        rm -rf "$$DIR"
+    """,
+    visibility = ["//visibility:public"],
 )
 
 # GRUB-booted hard-disk image: ONE ext4 partition, GRUB in the MBR gap, the

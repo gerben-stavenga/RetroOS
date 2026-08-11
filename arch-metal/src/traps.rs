@@ -106,6 +106,7 @@ pub mod arch_call {
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
+    pub const REMAP_PHYSICAL_APERTURE: u64 = 0x120; // EDX/ECX=physical base low/high
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -248,6 +249,11 @@ fn arch_dispatch(regs: &mut Regs) {
             for i in 0..num_pages {
                 paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
             }
+        }
+        arch_call::REMAP_PHYSICAL_APERTURE => {
+            let physical_base = (regs.rdx as u32 as u64)
+                | ((regs.rcx as u32 as u64) << 32);
+            regs.rax = crate::aperture::remap(physical_base) as u64;
         }
         arch_call::ALLOC_PHYS_CONTIG => {
             regs.rax = crate::phys_mm::alloc_phys_contig(

@@ -52,7 +52,7 @@ unsafe fn capture_boot_info(
     info: *const arch::MultibootInfo,
     mmap_out: &mut [MultibootMmapEntry; 128],
     cmdline_out: &mut [u8],
-) -> (arch::MultibootInfo, usize, usize) {
+) -> (arch::MultibootInfo, usize, usize, [Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES]) {
     let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo;
     let inf = unsafe { core::ptr::read_unaligned(src) };
     let mut count = 0;
@@ -75,7 +75,28 @@ unsafe fn capture_boot_info(
             cmdline_len += 1;
         }
     }
-    (inf, count, cmdline_len)
+    let modules = unsafe {
+        crate::multiboot::capture_modules(
+            inf.flags,
+            inf.mods_count,
+            inf.mods_addr,
+            |index| {
+                let src = (inf.mods_addr as usize).wrapping_add(PHYS_TO_SEG)
+                    as *const [u32; 4];
+                core::ptr::read_unaligned(src.add(index as usize))
+            },
+            |string, out| {
+                let src = (string as usize).wrapping_add(PHYS_TO_SEG) as *const u8;
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let byte = core::ptr::read_volatile(src.add(i));
+                    if byte == 0 { return Some(i); }
+                    *slot = byte;
+                }
+                None
+            },
+        )
+    };
+    (inf, count, cmdline_len, modules)
 }
 
 /// boot_kernel - Entry point called by asm boot stub
@@ -97,7 +118,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
     let mut mmap_buf = [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
     let mut boot_cmdline = [0u8; 512];
-    let (boot_info, mmap_count, boot_cmdline_len) =
+    let (boot_info, mmap_count, boot_cmdline_len, boot_modules_raw) =
         unsafe { capture_boot_info(info, &mut mmap_buf, &mut boot_cmdline) };
     let info = &boot_info;
 
@@ -184,11 +205,17 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         kernel_low_page,
         kernel_high_page,
     );
+    crate::multiboot::reserve_modules(&boot_modules_raw, |start, end| {
+        phys_mm::mark_reserved(start, end)
+    });
 
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
     // so the demand-paged heap can safely be enabled here.
     ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
+    arch::aperture::init();
+
+    let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
 
     lib::screenln!(screen, "Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
@@ -244,7 +271,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // Read platform boot configuration at the boundary, before handing it to
     // the kernel. The Multiboot command line carries physical-machine policy;
     // QEMU-only launch settings additionally come from fw_cfg.
-    let config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
+    let mut config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
+    config.boot_modules = boot_modules;
+    if config.boot_modules.iter().any(Option::is_some) {
+        config.boot_physical_reader = Some(arch::aperture::copy_from_physical);
+    }
 
     // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a
     // freeze-at-first-IRQ on real hardware is readable instead of a black hang.

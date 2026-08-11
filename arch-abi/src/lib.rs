@@ -22,6 +22,35 @@ pub use arch::{Arch, GuestBytes, Vcpu};
 
 pub mod monitor;
 
+/// Maximum number of RetroOS Multiboot modules accepted by the boot handoff.
+pub const MAX_BOOT_MODULES: usize = 4;
+pub const BOOT_MODULE_MOUNT_MAX: usize = 128;
+
+/// A loader-supplied disk image retained at a physical address by the loader.
+#[derive(Clone, Copy, Debug)]
+pub struct BootModule {
+    pub physical_start: u64,
+    pub len: usize,
+    mount: [u8; BOOT_MODULE_MOUNT_MAX],
+    mount_len: usize,
+}
+
+impl BootModule {
+    pub const fn new(
+        physical_start: u64,
+        len: usize,
+        mount: [u8; BOOT_MODULE_MOUNT_MAX],
+        mount_len: usize,
+    ) -> Self {
+        Self { physical_start, len, mount, mount_len }
+    }
+
+    pub fn mount(&self) -> &[u8] { &self.mount[..self.mount_len] }
+}
+
+/// Backend-provided copy operation for a loader-owned physical range.
+pub type BootPhysicalReader = fn(u64, &mut [u8]) -> bool;
+
 /// Boot-time platform configuration, read once by the platform entry point and
 /// handed to `startup` — instead of the kernel poking firmware ports itself.
 ///
@@ -68,6 +97,10 @@ pub struct BootConfig {
     /// real install boots through GRUB, whose config its owner controls.
     /// Nothing infers this from the hardware.
     pub ram_overlay: bool,
+    /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
+    pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
+    /// Metal's temporary physical-memory reader. Hosted entries leave this empty.
+    pub boot_physical_reader: Option<BootPhysicalReader>,
 }
 
 impl BootConfig {
@@ -78,6 +111,8 @@ impl BootConfig {
             c_root: [0; 128], c_root_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
+            boot_modules: [None; MAX_BOOT_MODULES],
+            boot_physical_reader: None,
         };
         // Default C: root = "home/retroos/".
         let d = *b"home/retroos/";
