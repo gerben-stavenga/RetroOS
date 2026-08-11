@@ -38,6 +38,8 @@ pub mod fbcon;
 // event_loop, thread creation, the Linux ELF loader, kpipe, ...).
 pub mod kernel;
 
+mod multiboot;
+
 // Re-export kernel submodules so arch/ code can use crate::thread, crate::dos, etc.
 pub use kernel::dos;
 pub use kernel::thread;

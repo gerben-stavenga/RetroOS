@@ -112,7 +112,7 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 /// within it — but the window itself is a memory-layout fact (the ceiling, and
 /// the base = first page past the kernel image's linker `_end`), owned here, not
 /// allocator policy.
-pub const HEAP_END: usize = FB_WINDOW_BASE;
+pub const HEAP_END: usize = crate::aperture::APERTURE_BASE;
 
 /// VA window for physical framebuffers. Carved off the top of the heap window.
 pub use arch_abi::{FB_WINDOW_BASE, FB_WINDOW_END};
@@ -1275,6 +1275,80 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
 /// pre-paging 32-bit code cannot address at all). The boot life-sign strip is
 /// painted through this and the window is torn down again immediately.
 static mut EARLY_FB_PD: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
+
+/// Ensure the recursive page-table view can represent a kernel virtual range.
+pub(crate) fn prepare_kernel_mapping(vpage_start: usize, count: usize) {
+    let end = vpage_start.checked_add(count).expect("kernel mapping range overflow");
+    assert!(end <= NUM_PAGES, "kernel mapping range outside page tables");
+    match entries() {
+        Entries::E32(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count),
+        Entries::E64(entries) => prepare_kernel_mapping_entries(entries, vpage_start, count),
+    }
+}
+
+fn prepare_kernel_mapping_entries<E: Entry>(entries: &mut [E], vpage_start: usize, count: usize) {
+    let mut changed = false;
+    for vpage in vpage_start..vpage_start + count {
+        let parent = parent_index::<E>(vpage);
+        assert!(parent < NUM_PAGES, "kernel mapping parent outside page tables");
+        if !entries[parent].present() {
+            let page_table = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                RawPage([0; PAGE_SIZE])));
+            let table_phys = physical_page(page_table as *const RawPage as usize);
+            let _ = replace_entry(&mut entries[parent], E::new(table_phys, true, false));
+            changed = true;
+        }
+    }
+    if changed {
+        flush_tlb();
+    }
+}
+
+/// Map externally owned physical pages into the fixed kernel aperture.
+///
+/// The caller must have prepared the parent page table. All entries are
+/// installed before one TLB flush, so a multi-page aperture remap does not
+/// flush once per page.
+pub(crate) fn map_kernel_foreign_range(
+    vpage_start: usize,
+    ppage_start: u64,
+    count: usize,
+) -> bool {
+    match vpage_start.checked_add(count) {
+        Some(end) if end <= NUM_PAGES => {}
+        _ => return false,
+    }
+    let ppage_end = match ppage_start.checked_add(count as u64) {
+        Some(end) => end,
+        None => return false,
+    };
+    if (!is_pae() && ppage_end > (1 << 20)) || ppage_end > (1 << 40) {
+        return false;
+    }
+    prepare_kernel_mapping(vpage_start, count);
+    match entries() {
+        Entries::E32(entries) => {
+            for i in 0..count {
+                let mut entry = Entry32::new(ppage_start + i as u64, false, false);
+                entry.set_writable(false);
+                entry.set_no_execute(true);
+                entry.set_raw(entry.raw() | flags::FOREIGN);
+                replace_mapping(&mut entries[vpage_start + i], entry);
+            }
+        }
+        Entries::E64(entries) => {
+            for i in 0..count {
+                let mut entry = Entry64::new(ppage_start + i as u64, false, false);
+                entry.set_writable(false);
+                entry.set_no_execute(true);
+                entry.set_raw(entry.raw() | flags::FOREIGN);
+                replace_mapping(&mut entries[vpage_start + i], entry);
+            }
+        }
+    }
+    flush_tlb();
+    true
+}
 
 /// Map 64MB around `fb_phys` and return its VA. PAE/long boot path only
 /// (legacy returns None — pre-PAE machines have a real VGA anyway).

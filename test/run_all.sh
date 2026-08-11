@@ -21,6 +21,8 @@ declare -a failed=()
 have()      { command -v "$1" >/dev/null 2>&1; }
 kvm()       { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }
 qemu_prop() { have qemu-system-i386 && [ -e apps-proprietary ]; }
+module_tools() { have bazelisk && have debugfs && have mkfs.ext4; }
+module_qemu() { module_tools && have qemu-system-i386; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
@@ -31,7 +33,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //lib:sound_test //lib:vga_test \
+        //kernel:kernel_unit_test //lib:sound_test //lib:vga_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
 unit_kvm() { bz test --platforms=@platforms//host //arch-interp:arch-interp-kvm-test; }
@@ -55,6 +57,8 @@ run() {
 
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
+run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
+run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
 run hosted_games -         bash test/hosted_games.sh
 run dpmi_hx      -         bash test/dpmi_hx.sh
