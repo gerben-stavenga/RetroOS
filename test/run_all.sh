@@ -59,6 +59,7 @@ run() {
 run unit         -         unit
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
+run module_program module_qemu   bash test/grub_module_program.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
 run hosted_games -         bash test/hosted_games.sh
 run dpmi_hx      -         bash test/dpmi_hx.sh
