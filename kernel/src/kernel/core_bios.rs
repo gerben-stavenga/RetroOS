@@ -235,18 +235,18 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
         mode: u16,
-    ) -> Result<(), BiosError> {
+    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
         self.set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
     }
 
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
-    /// bit so NativeVga can distinguish an LFB from a banked window.
+    /// bit; the returned state records whether hardware is linear or banked.
     fn set_mode_request(
         &mut self,
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
         request: u16,
-    ) -> Result<(), BiosError> {
+    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
         {
@@ -268,14 +268,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             }
         }, |_, _| ())?;
         if number <= 0xFF {
-            bios_display.set_legacy();
-            return Ok(());
+            return Ok(crate::kernel::platform::NativeVgaMode::Legacy);
         }
         let status = regs.rax as u16;
         if status == 0x004F {
             let descriptor = descriptor.expect("VBE descriptor checked before firmware call");
-            bios_display.set_vesa(descriptor, request & 0x4000 != 0);
-            Ok(())
+            Ok(if request & 0x4000 != 0 {
+                crate::kernel::platform::NativeVgaMode::VbeLinear(descriptor)
+            } else {
+                crate::kernel::platform::NativeVgaMode::VbeBanked {
+                    mode: descriptor,
+                    current_bank: 0,
+                }
+            })
         } else {
             Err(BiosError::Rejected(status))
         }
@@ -303,7 +308,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if status != 0x004F {
             return Err(BiosError::Rejected(status));
         }
-        display.set_bank(bank);
         Ok(())
     }
 
@@ -434,13 +438,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        mode: crate::kernel::platform::VbeMode,
+        bank_state: &mut u16,
         shadow_height: usize,
         shadow: &[u8],
     ) -> Result<usize, BiosError> {
-        let mode = match display {
-            crate::kernel::platform::VgaCap::Vbe { mode, bank: Some(_) } => *mode,
-            _ => return Err(BiosError::InvalidFrame),
-        };
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
             return Err(BiosError::InvalidFrame);
         };
@@ -511,7 +513,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                             run_bios_int10(machine, &mut regs)?;
                             let status = regs.rax as u16;
                             if status != 0x004F { return Err(BiosError::Rejected(status)); }
-                            display.set_bank(bank);
+                            *bank_state = bank;
                             current_bank = Some(bank);
                         }
                         let inside = offset - window_base;
@@ -764,8 +766,9 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         mode: u16,
-    ) -> Result<(), BiosError> {
-        self.bios(bios)?.set_mode(machine, self, mode)
+    ) -> crate::kernel::platform::NativeVgaMode {
+        self.guest_bios_set_mode(machine, bios, mode)
+            .unwrap_or_else(|error| panic!("native BIOS mode {:#x} failed: {:?}", mode, error))
     }
 
     pub fn bios_set_mode_request<A: Arch>(
@@ -773,7 +776,28 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         request: u16,
-    ) -> Result<(), BiosError> {
+    ) -> crate::kernel::platform::NativeVgaMode {
+        self.guest_bios_set_mode_request(machine, bios, request)
+            .unwrap_or_else(|error| panic!("native BIOS mode request {:#x} failed: {:?}", request, error))
+    }
+
+    /// Guest INT 10h mode selection may legitimately be rejected by firmware.
+    pub fn guest_bios_set_mode<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        mode: u16,
+    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
+        self.bios(bios)?.set_mode(machine, self, mode)
+    }
+
+    /// Guest VBE 4F02h preserves the complete request and reports failure in AX.
+    pub fn guest_bios_set_mode_request<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        request: u16,
+    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
         self.bios(bios)?.set_mode_request(machine, self, request)
     }
 
@@ -814,10 +838,14 @@ impl crate::kernel::platform::VgaCap {
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
+        mode: crate::kernel::platform::VbeMode,
+        current_bank: &mut u16,
         shadow_height: usize,
         shadow: &[u8],
     ) -> Result<usize, BiosError> {
-        self.bios(bios)?.present_banked(machine, self, shadow_height, shadow)
+        self.bios(bios)?.present_banked(
+            machine, self, mode, current_bank, shadow_height, shadow,
+        )
     }
 
     pub fn bios_discover_vbe<A: Arch>(

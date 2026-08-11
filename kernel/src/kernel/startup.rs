@@ -42,7 +42,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .and_then(|native| native.bios_discover_vbe(machine, &mut bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
     let display = match display.into_native_capability(machine) {
-        Ok(native) => crate::kernel::display::Display::new_console(
+        Ok(native) => crate::kernel::display::Display::new_selected(
             machine, &mut bios_workspace, native),
         Err(display) => display,
     };
@@ -555,7 +555,7 @@ fn run_program_with_screen<A: crate::Arch>(
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
     sink: Option<&mut crate::kernel::sound::Sink>,
 ) -> (crate::kernel::console::Console, Option<crate::kernel::drivers::sb16::SbCard>) {
-    let (card, display) = screen.release(machine);
+    let (card, display) = screen.release(machine, bios_workspace);
     let (display, sb) = run_program(
         machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch,
         display, sb, sink,

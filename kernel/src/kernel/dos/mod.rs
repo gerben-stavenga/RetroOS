@@ -334,10 +334,10 @@ impl<A: crate::Arch> DosState<A> {
     ) -> crate::kernel::display::Display {
         let linear_vbe = match &self.pc.vga {
             DisplayedVga::Native(native) =>
-                match native.cap() {
-                    crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
-                    crate::kernel::platform::VgaCap::Legacy
-                    | crate::kernel::platform::VgaCap::Vbe { bank: Some(_), .. } => None,
+                match native.mode() {
+                    crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => Some(mode),
+                    crate::kernel::platform::NativeVgaMode::Legacy
+                    | crate::kernel::platform::NativeVgaMode::VbeBanked { .. } => None,
                 },
             DisplayedVga::Emulated(_, _) => None,
         };
@@ -379,8 +379,8 @@ impl<A: crate::Arch> DosState<A> {
             (vga.raise_from_osd(machine, bios_workspace, display), ()));
         let linear_vbe = match &self.pc.vga {
             DisplayedVga::Native(native) =>
-                match native.cap() {
-                    crate::kernel::platform::VgaCap::Vbe { mode, bank: None } => Some(*mode),
+                match native.mode() {
+                    crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => Some(mode),
                     _ => None,
                 },
             _ => None,

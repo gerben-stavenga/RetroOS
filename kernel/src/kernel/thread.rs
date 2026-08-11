@@ -385,11 +385,15 @@ impl<A: crate::Arch> Personality<A> {
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         regs: &Regs,
     ) {
-        let Self::Dos(dos) = self else { return };
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
-        let now_ticks = machine.get_ticks();
-        crate::kernel::dos::display_tick(machine, bios, dos, regs, now_ticks);
+        match self {
+            Self::Dos(dos) => {
+                let now_ticks = machine.get_ticks();
+                crate::kernel::dos::display_tick(machine, bios, dos, regs, now_ticks);
+            }
+            Self::Linux(_) => crate::kernel::linux::display_tick(machine, bios),
+        }
         if prof {
             crate::kernel::startup::bill_slice2(
                 0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);

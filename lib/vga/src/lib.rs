@@ -303,6 +303,17 @@ pub fn bios_mode_regs(mode: u8) -> Option<Regs> {
     Some(Regs { crtc: *crtc, seq: [0x03, s1, s2, 0x00, s4], gc, misc })
 }
 
+fn required_bios_mode_regs(mode: u8) -> Regs {
+    bios_mode_regs(mode)
+        .unwrap_or_else(|| panic!("required BIOS mode {:#x} has no register table", mode))
+}
+
+/// Canonical standard 80x25 text-mode register file.
+pub fn bios_mode3_regs() -> Regs { required_bios_mode_regs(3) }
+
+/// Canonical standard 320x200x256 graphics-mode register file.
+pub fn bios_mode13_regs() -> Regs { required_bios_mode_regs(0x13) }
+
 /// Chain-4 deinterleave: spread a linear 64K "chained view" (mode 13h, where
 /// the CPU sees byte `n` as pixel `n`) into the 4 planes the way real VGA
 /// chain-4 hardware does — byte `n` lives in plane `n & 3` at offset `n >> 2`.
@@ -2050,7 +2061,7 @@ impl VgaState {
     /// rendered in software or restored directly to a real VGA.
     pub fn new_mode3_boxed() -> alloc::boxed::Box<Self> {
         let mut state = Self::new_boxed();
-        let regs = bios_mode_regs(3).expect("mode 3 register table");
+        let regs = bios_mode3_regs();
         state.misc_output = regs.misc;
         state.seq = regs.seq;
         state.gc = regs.gc;

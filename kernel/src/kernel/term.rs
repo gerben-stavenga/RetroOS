@@ -15,6 +15,7 @@
 pub use lib::term::{term, Term, putchar};
 
 use crate::kernel::display::Display;
+use core::sync::atomic::{AtomicBool, Ordering};
 use lib::vga_fonts::FONT_8X16;
 use vga::{Frame, VgaMode};
 
@@ -22,10 +23,9 @@ use vga::{Frame, VgaMode};
 /// Legacy BIOS leaves this unset and the real VGA scans B8000 directly.
 static mut PALETTE: [u8; 768] = [0; 768];
 
-/// Immediate scanout state for the boot console. This is the same packed,
-/// horizontally-stretched VGA shadow used by the timed graphics raster; boot
-/// text simply renders a complete frame synchronously because no beam-driving
-/// event loop exists yet.
+/// Packed terminal shadow. Terminal writes only dirty the grid; the event-loop
+/// display tick renders this buffer (the boot console flushes at its handoff),
+/// after which the shared display boundary composites the OSD and publishes it.
 struct Scanout {
     pal: vga::Pal,
     pal_cache: [u8; 768],
@@ -43,6 +43,12 @@ impl Scanout {
 }
 
 static mut SCANOUT: Scanout = Scanout::new();
+static DIRTY: AtomicBool = AtomicBool::new(true);
+
+/// Request a terminal/OSD frame at the next event-loop display tick.
+pub fn mark_dirty() {
+    DIRTY.store(true, Ordering::Release);
+}
 
 /// Identity Attribute-Controller palette. Text rendering consumes the first
 /// sixteen entries; mode control remains zero for normal text semantics.
@@ -56,12 +62,14 @@ static TEXT_AC: [u8; 21] = {
     ac
 };
 
-/// Make a mapped packed framebuffer the display side of the emulated VGA.
-/// Once attached, console writes still target the ordinary B8000 aperture;
-/// the VGA flush hook turns changed cells into pixels.
-/// Scan the VGA text aperture through the ordinary all-mode renderer.
-pub fn present(display: &mut Display) {
-    if display.shadow_width == 0 { return; }
+/// Render the terminal grid into shadow RAM and pass the completed frame to
+/// the shared OSD/display boundary.
+pub fn present<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: &mut Display,
+) {
+    if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 { return; }
     unsafe {
         if PALETTE == [0; 768] { PALETTE = vga::fallback_palette(); }
     }
@@ -82,10 +90,15 @@ pub fn present(display: &mut Display) {
         pixel_pan: 0,
         line_compare: usize::MAX,
     };
-    scanout(display, &frame);
+    scanout(machine, bios, display, &frame);
 }
 
-fn scanout(display: &mut Display, frame: &Frame<'_>) {
+fn scanout<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: &mut Display,
+    frame: &Frame<'_>,
+) {
     let (w, h) = vga::dimensions(frame.mode);
     let out_w = display.shadow_width;
     if w == 0 || h == 0 || out_w == 0 {
@@ -109,17 +122,5 @@ fn scanout(display: &mut Display, frame: &Frame<'_>) {
     for sy in 0..h {
         vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
-    if crate::kernel::osd::is_open() {
-        let (logical_w, scale_y) = display.osd_shadow_layout(w, out_w, h);
-        crate::kernel::osd::paint(
-            &mut s.surface[..row_bytes * h],
-            row_bytes,
-            out_w,
-            h,
-            logical_w,
-            scale_y,
-            format,
-        );
-    }
-    display.present(h, &s.surface[..row_bytes * h]);
+    display.present(machine, bios, h, &mut s.surface[..row_bytes * h]);
 }

@@ -216,31 +216,6 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
     LAST.swap(frame, Ordering::Relaxed) != frame
 }
 
-/// The one completed-frame boundary for DOS display producers. A producer
-/// supplies packed pixels in the display's encoding; composition and
-/// publication are deliberately inseparable here so a new card cannot grow a
-/// private path which forgets the host monitor.
-fn present_shadow<A: crate::Arch>(
-    machine: &mut A,
-    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::display::Display,
-    shadow: &mut [u8],
-    width: usize,
-    height: usize,
-    osd_layout: (usize, usize),
-) -> usize {
-    debug_assert_eq!(display.shadow_width, width);
-    let format = display.rgb;
-    let stride = width * format.bytes_per_pixel as usize;
-    if crate::kernel::osd::is_open() {
-        let (logical_width, scale_y) = osd_layout;
-        crate::kernel::osd::paint(
-            shadow, stride, width, height, logical_width, scale_y, format,
-        );
-    }
-    display.present_native(machine, bios, height, shadow)
-}
-
 /// Use the allocation-free `Vec<u32>` frame store as packed 16/24/32-bit
 /// storage. The extra bytes in the final word are outside the returned frame.
 fn packed_frame(storage: &mut alloc::vec::Vec<u32>, bytes: usize) -> &mut [u8] {
@@ -349,8 +324,7 @@ fn voodoo_display_tick<A: crate::Arch>(
             pc.voodoo.scanout(&mut pc.present_scratch, w * step, &dac);
             stretch_packed_rows(&pc.present_scratch, w, shadow, out_w, h, step);
         }
-        let (logical_w, scale_y) = display.osd_shadow_layout(w, out_w, h);
-        present_shadow(machine, bios, display, shadow, out_w, h, (logical_w, scale_y));
+        display.present(machine, bios, h, shadow);
     }
     true
 }
@@ -419,14 +393,9 @@ pub fn display_tick<A: crate::Arch>(
                 let (vga_h, out_w, shadow) =
                     crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
                         .expect("ready VGA shadow is missing");
-                let vga_w = ::vga::dimensions(mode).0;
-                let (logical_w, scale_y) =
-                    display.osd_shadow_layout(vga_w, out_w, vga_h);
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                let copied = present_shadow(
-                    machine, &mut *bios, display, shadow,
-                    out_w, vga_h, (logical_w, scale_y),
-                );
+                debug_assert_eq!(display.shadow_width, out_w);
+                let copied = display.present(machine, &mut *bios, vga_h, shadow);
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {
@@ -465,7 +434,7 @@ pub fn display_tick<A: crate::Arch>(
     let bytes = unsafe {
         core::slice::from_raw_parts_mut(pc.present_fb.as_mut_ptr() as *mut u8, need * 4)
     };
-    present_shadow(machine, bios, display, bytes, w, h, (w, 1));
+    display.present(machine, bios, h, bytes);
     if prof {
         let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(

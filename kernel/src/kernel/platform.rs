@@ -26,14 +26,6 @@ pub struct VbeMode {
     pub window_size_kb: u16,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct VbeBank {
-    pub current: u16,
-    pub window_segment: u16,
-    pub granularity_kb: u16,
-    pub window_size_kb: u16,
-}
-
 use crate::println;
 
 pub struct Platform {
@@ -86,72 +78,61 @@ pub enum Host {
     Interp,
 }
 
-/// Move-only physical VGA/display capability plus the firmware mode metadata
-/// needed to operate it. This deliberately says nothing about whether the
-/// adapter's registers and VRAM are an authoritative VGA state.
+/// Move-only proof of exclusive access to the physical VGA adapter.
 #[derive(Debug)]
-pub enum VgaCap {
+pub struct VgaCap {
+    _private: (),
+}
+
+/// Bookkeeping for the VGA state which is currently authoritative in hardware.
+/// VBE descriptor data belongs to that state, never to the access capability.
+#[derive(Clone, Copy, Debug)]
+pub enum NativeVgaMode {
     Legacy,
-    Vbe {
-        mode: VbeMode,
-        bank: Option<VbeBank>,
-    },
+    VbeLinear(VbeMode),
+    VbeBanked { mode: VbeMode, current_bank: u16 },
 }
 
 /// A physical VGA whose registers and VRAM are the authoritative VGA state.
 /// Removing the wrapper explicitly marks that state captured/dirty and leaves
 /// only the move-only display capability.
 #[derive(Debug)]
-pub struct NativeVga(VgaCap);
+pub struct NativeVga {
+    cap: VgaCap,
+    mode: NativeVgaMode,
+}
 
 impl Default for NativeVga {
     fn default() -> Self { Self::new() }
 }
 
 impl NativeVga {
-    pub fn new() -> Self { Self(VgaCap::Legacy) }
+    pub fn new() -> Self {
+        Self { cap: VgaCap { _private: () }, mode: NativeVgaMode::Legacy }
+    }
 
-    pub fn discard_state(self) -> VgaCap {
-        self.0
+    pub(crate) fn into_parts(self) -> (VgaCap, NativeVgaMode) {
+        (self.cap, self.mode)
     }
 
     pub fn vbe_mode(&self) -> Option<VbeMode> {
-        self.0.vbe_mode()
-    }
-
-    pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
-    pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
-}
-
-impl VgaCap {
-    pub fn vbe_mode(&self) -> Option<VbeMode> {
-        match self {
-            Self::Legacy => None,
-            Self::Vbe { mode, .. } => Some(*mode),
+        match self.mode {
+            NativeVgaMode::Legacy => None,
+            NativeVgaMode::VbeLinear(mode)
+            | NativeVgaMode::VbeBanked { mode, .. } => Some(mode),
         }
     }
 
-    pub fn set_legacy(&mut self) { *self = Self::Legacy; }
-
-    pub fn set_vesa(&mut self, mode: VbeMode, linear: bool) {
-        let bank = (!linear).then_some(VbeBank {
-            current: 0,
-            window_segment: mode.window_segment,
-            granularity_kb: mode.window_granularity_kb,
-            window_size_kb: mode.window_size_kb,
-        });
-        *self = Self::Vbe { mode, bank };
-    }
-
-    pub fn set_bank(&mut self, current: u16) {
-        if let Self::Vbe { bank: Some(bank), .. } = self {
-            bank.current = current;
-        }
-    }
+    pub fn mode(&self) -> NativeVgaMode { self.mode }
+    pub(crate) fn mode_mut(&mut self) -> &mut NativeVgaMode { &mut self.mode }
+    pub(crate) fn cap(&self) -> &VgaCap { &self.cap }
+    pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.cap }
 
     /// Mark the hardware state authoritative again after a complete software
     /// VGA has been restored into the adapter.
-    pub(crate) fn restored(self) -> NativeVga { NativeVga(self) }
+    pub(crate) fn restored(cap: VgaCap, mode: NativeVgaMode) -> NativeVga {
+        NativeVga { cap, mode }
+    }
 }
 
 pub struct ProbedPlatform {
@@ -436,7 +417,7 @@ pub fn probe<A: crate::Arch>(
     }
     let p = get();
     let display = display.unwrap_or_else(|| {
-        crate::kernel::display::Display::new_vga(NativeVga::new().discard_state())
+        crate::kernel::display::Display::new_vga(NativeVga::new())
     });
     println!(
         "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",

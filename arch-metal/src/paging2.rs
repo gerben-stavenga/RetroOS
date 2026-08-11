@@ -166,7 +166,7 @@ impl RootPageTable {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
                     for i in 0..user_count {
-                        unsafe { self.e32[i] = e[root + i]; }
+                        unsafe { let _ = replace_entry(&mut self.e32[i], e[root + i]); }
                     }
                 }
             }
@@ -175,12 +175,12 @@ impl RootPageTable {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
                     for i in 0..user_count {
-                        unsafe { self.e64[i] = e[root + i]; }
+                        unsafe { let _ = replace_entry(&mut self.e64[i], e[root + i]); }
                     }
                     // Always save PML4 phys (from PDPT[4] back-pointer),
                     // so cr3() works regardless of which mode we restore in.
                     let pml4_page = e[root + 4].page();
-                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
+                    unsafe { let _ = replace_entry(&mut self.e64[3], Entry64(pml4_page * PAGE_SIZE as u64)); }
                 }
             }
         }
@@ -196,7 +196,7 @@ impl RootPageTable {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
                     for i in 0..user_count {
-                        e[root + i] = unsafe { self.e32[i] };
+                        let _ = replace_entry(&mut e[root + i], unsafe { self.e32[i] });
                     }
                 }
             }
@@ -205,7 +205,7 @@ impl RootPageTable {
                     let root = root_base();
                     let user_count = recursive_idx() - root;
                     for i in 0..user_count {
-                        e[root + i] = unsafe { self.e64[i] };
+                        let _ = replace_entry(&mut e[root + i], unsafe { self.e64[i] });
                     }
                     // Debug removed
                 }
@@ -236,7 +236,7 @@ impl RootPageTable {
                         unsafe { core::mem::swap(&mut self.e64[i], &mut e[root + i]); }
                     }
                     // self.e64[3] now has PML4 phys from before swap; update to live root's
-                    unsafe { self.e64[3] = Entry64(pml4_page * PAGE_SIZE as u64); }
+                    unsafe { let _ = replace_entry(&mut self.e64[3], Entry64(pml4_page * PAGE_SIZE as u64)); }
                 }
             }
         }
@@ -352,6 +352,42 @@ pub trait Entry: Copy + Sized + Default + 'static {
         e.set_user(user);
         e
     }
+}
+
+/// Replace one hardware entry and return the displaced bits.  The store is
+/// deliberately the first ownership-visible operation: writing a recursively
+/// mapped page-table page may COW-fault, and the outgoing mapping must remain
+/// alive until that store has completed.
+#[inline]
+#[must_use]
+pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
+    core::mem::replace(slot, incoming)
+}
+
+#[inline]
+fn owns_frame<E: Entry>(entry: E) -> bool {
+    entry.present() && entry.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0
+}
+
+/// Install an already-owned mapping, then release the mapping displaced from
+/// the slot.  Fresh frames arrive with one allocator reference; callers which
+/// install an alias must retain the incoming mapping first.
+#[inline]
+pub(crate) fn replace_mapping<E: Entry>(slot: &mut E, incoming: E) {
+    let outgoing = replace_entry(slot, incoming);
+    if owns_frame(outgoing) {
+        crate::phys_mm::free_phys_page(outgoing.page());
+    }
+}
+
+/// Create the additional allocator reference required before installing a
+/// second PTE containing these bits.
+#[inline]
+fn retain_mapping<E: Entry>(entry: E) -> E {
+    if owns_frame(entry) {
+        let _ = crate::phys_mm::inc_shared_count(entry.page());
+    }
+    entry
 }
 
 #[derive(Copy, Clone, Default)]
@@ -493,11 +529,11 @@ pub fn setup_long_mode_tables() {
     let pml4_phys = physical_page((&raw const PML4) as usize);
 
     // PML4[0] = PDPT (so long mode uses same mappings)
-    unsafe { PML4[0] = Entry64::new(pdpt_phys >> 12, true, true); }
+    unsafe { let _ = replace_entry(&mut PML4[0], Entry64::new(pdpt_phys >> 12, true, true)); }
 
     // PDPT[4] = PML4 (back-pointer so PML4 is visible in recursive mapping)
     if let Entries::E64(e) = entries() {
-        e[root_base() + 4] = Entry64::new(pml4_phys, true, false);
+        let _ = replace_entry(&mut e[root_base() + 4], Entry64::new(pml4_phys, true, false));
     }
 }
 
@@ -876,8 +912,8 @@ pub const fn page_idx(vaddr: usize) -> usize {
 pub fn unmap_kernel_page(vaddr: usize) {
     let idx = page_idx(vaddr);
     match entries() {
-        Entries::E32(e) => { e[idx] = Entry32(0); }
-        Entries::E64(e) => { e[idx] = Entry64(0); }
+        Entries::E32(e) => replace_mapping(&mut e[idx], Entry32(0)),
+        Entries::E64(e) => replace_mapping(&mut e[idx], Entry64(0)),
     }
     crate::x86::invlpg(vaddr);
 }
@@ -930,7 +966,7 @@ pub fn flush_tlb() {
 ///
 /// Clears the first root entry (PD[0] for legacy, PDPT[0] for PAE)
 fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
-    entries[root_base()] = E::default();
+    let _ = replace_entry(&mut entries[root_base()], E::default());
     invalidate_tlb();
 }
 
@@ -1101,7 +1137,7 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
     let kpages = unsafe { KERNEL_PAGES.legacy() };
     // Identity map first 4MB (1024 pages) using scratch page
     for i in 0..1024 {
-        scratch[i] = Entry32::new(i as u64, true, false);
+        let _ = replace_entry(&mut scratch[i], Entry32::new(i as u64, true, false));
     }
 
     // Map low memory (first 1MB) at LOW_MEM_BASE (0xC0A00000)
@@ -1112,7 +1148,7 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
         if (0xA0..0xC0).contains(&i) {
             e.set_raw(e.raw() | flags::CACHE_DISABLE);
         }
-        kpages.pt_kernel[512 + i] = e;
+        let _ = replace_entry(&mut kpages.pt_kernel[512 + i], e);
     }
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
@@ -1122,24 +1158,25 @@ pub fn enable_legacy(scratch: &mut PageTable32, kernel_phys: usize, kernel_pages
     for i in 0..kernel_pages.min(256 + 1024) {
         let e = Entry32::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
         if i < 256 {
-            kpages.pt_kernel[768 + i] = e;
+            let _ = replace_entry(&mut kpages.pt_kernel[768 + i], e);
         } else {
-            kpages.pt_kernel2[i - 256] = e;
+            let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
         }
     }
 
     // Setup page directory
     // PD[0] = identity (first 4MB) using scratch
-    kpages.pd[0] = Entry32::new(boot_phys_page(&scratch.0), true, false);
+    let _ = replace_entry(&mut kpages.pd[0], Entry32::new(boot_phys_page(&scratch.0), true, false));
 
     // PD[768] = recursive (0xC0000000 >> 22 = 768)
-    kpages.pd[768] = Entry32::new(boot_phys_page(&kpages.pd.0), true, false);
+    let pd_page = boot_phys_page(&kpages.pd.0);
+    let _ = replace_entry(&mut kpages.pd[768], Entry32::new(pd_page, true, false));
 
     // PD[770] = kernel region (0xC0800000 >> 22 = 770)
-    kpages.pd[770] = Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
+    let _ = replace_entry(&mut kpages.pd[770], Entry32::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
 
     // PD[771] = kernel overflow (0xC0C00000-0xC0FFFFFF)
-    kpages.pd[771] = Entry32::new(boot_phys_page(&kpages.pt_kernel2.0), true, false);
+    let _ = replace_entry(&mut kpages.pd[771], Entry32::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
 
     unsafe {
         crate::x86::write_cr3(boot_phys_addr(&kpages.pd.0) as u32);
@@ -1164,14 +1201,15 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     let kpages = unsafe { KERNEL_PAGES.pae() };
     // Identity map using scratch as PD: scratch[0] = scratch (self-ref PT for 0-2MB),
     // scratch[1] = pt_pml4 (PT for 2-4MB, temporarily borrowed)
-    scratch[0] = Entry64::new(boot_phys_page(&scratch.0), true, false);
-    scratch[1] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
+    let scratch_page = boot_phys_page(&scratch.0);
+    let _ = replace_entry(&mut scratch[0], Entry64::new(scratch_page, true, false));
+    let _ = replace_entry(&mut scratch[1], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
     for i in 2..512 {
-        scratch[i] = Entry64::new(i as u64, true, false);
+        let _ = replace_entry(&mut scratch[i], Entry64::new(i as u64, true, false));
     }
     // pt_pml4 temporarily serves as identity PT for 2-4MB
     for i in 0..512 {
-        kpages.pt_pml4[i] = Entry64::new((512 + i) as u64, true, false);
+        let _ = replace_entry(&mut kpages.pt_pml4[i], Entry64::new((512 + i) as u64, true, false));
     }
     // Note: page 0xF is preserved in remove_identity_mapping() for mode switching trampoline
 
@@ -1182,7 +1220,7 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
         if (0xA0..0xC0).contains(&i) {
             e.set_raw(e.raw() | flags::CACHE_DISABLE);
         }
-        kpages.pt_kernel[i] = e;
+        let _ = replace_entry(&mut kpages.pt_kernel[i], e);
     }
 
     // Map kernel at KERNEL_BASE (0xC0B00000)
@@ -1192,21 +1230,22 @@ pub fn enable_pae(scratch: &mut PageTable64, kernel_phys: usize, kernel_pages: u
     for i in 0..kernel_pages.min(256 + 1024) {
         let e = Entry64::new((kernel_phys / PAGE_SIZE + i) as u64, true, false);
         if i < 256 {
-            kpages.pt_kernel[256 + i] = e;
+            let _ = replace_entry(&mut kpages.pt_kernel[256 + i], e);
         } else if i < 256 + 512 {
-            kpages.pt_kernel2[i - 256] = e;
+            let _ = replace_entry(&mut kpages.pt_kernel2[i - 256], e);
         } else {
-            kpages.pt_kernel3[i - 256 - 512] = e;
+            let _ = replace_entry(&mut kpages.pt_kernel3[i - 256 - 512], e);
         }
     }
 
     // Setup PDPT (virtual root — has R/W bits for COW tracking)
-    kpages.pdpt[0] = Entry64::new(boot_phys_page(&scratch.0), true, false);
-    kpages.pdpt[3] = Entry64::new(boot_phys_page(&kpages.pdpt.0), true, false);
-    kpages.pdpt[4] = Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false);
-    kpages.pdpt[5] = Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false);
-    kpages.pdpt[6] = Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false);
-    kpages.pdpt[7] = Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false);
+    let _ = replace_entry(&mut kpages.pdpt[0], Entry64::new(boot_phys_page(&scratch.0), true, false));
+    let pdpt_page = boot_phys_page(&kpages.pdpt.0);
+    let _ = replace_entry(&mut kpages.pdpt[3], Entry64::new(pdpt_page, true, false));
+    let _ = replace_entry(&mut kpages.pdpt[4], Entry64::new(boot_phys_page(&kpages.pt_pml4.0), true, false));
+    let _ = replace_entry(&mut kpages.pdpt[5], Entry64::new(boot_phys_page(&kpages.pt_kernel.0), true, false));
+    let _ = replace_entry(&mut kpages.pdpt[6], Entry64::new(boot_phys_page(&kpages.pt_kernel2.0), true, false));
+    let _ = replace_entry(&mut kpages.pdpt[7], Entry64::new(boot_phys_page(&kpages.pt_kernel3.0), true, false));
 
     // The hardware PAE PDPT has a stricter format than the virtual root:
     // bits 1 (R/W) and 2 (U/S) are reserved in PDPTEs. Keep the full entries
@@ -1249,12 +1288,12 @@ pub fn map_early_fb(fb_phys: u64) -> Option<usize> {
     let (pd, kpages) = unsafe { (&mut EARLY_FB_PD, KERNEL_PAGES.pae()) };
     for i in 0..32u64 {
         // PS (2MB page) + present + write + cache-disable (MMIO).
-        pd[i as usize] = Entry64(
+        let _ = replace_entry(&mut pd[i as usize], Entry64(
             (base + i * TWO_MB) | flags::PRESENT | flags::READ_WRITE
                 | flags::PAGE_SIZE_BIT | flags::CACHE_DISABLE,
-        );
+        ));
     }
-    kpages.pdpt[2] = Entry64::new(boot_phys_page(&pd.0), true, false);
+    let _ = replace_entry(&mut kpages.pdpt[2], Entry64::new(boot_phys_page(&pd.0), true, false));
     flush_tlb();
     Some(0x8000_0000usize + (fb_phys - base) as usize)
 }
@@ -1266,7 +1305,7 @@ pub fn unmap_early_fb() {
     }
     #[allow(static_mut_refs)]
     let kpages = unsafe { KERNEL_PAGES.pae() };
-    kpages.pdpt[2] = Entry64::default();
+    let _ = replace_entry(&mut kpages.pdpt[2], Entry64::default());
     flush_tlb();
 }
 
@@ -1308,14 +1347,10 @@ pub fn temp_swap(page: u64) -> u64 {
     let old_page = unsafe {
         if is_pae() {
             let entries = PAGE_TABLE_BASE as *mut Entry64;
-            let old = (*entries.add(vpage)).page();
-            *entries.add(vpage) = Entry64::new(page, true, false);
-            old
+            replace_entry(&mut *entries.add(vpage), Entry64::new(page, true, false)).page()
         } else {
             let entries = PAGE_TABLE_BASE as *mut Entry32;
-            let old = (*entries.add(vpage)).page();
-            *entries.add(vpage) = Entry32::new(page, true, false);
-            old
+            replace_entry(&mut *entries.add(vpage), Entry32::new(page, true, false)).page()
         }
     };
     invalidate_tlb();
@@ -1371,14 +1406,14 @@ pub fn fork_current(child_root: &mut RootPageTable) {
             let mut buf = [Entry32::default(); PAGE_SIZE / core::mem::size_of::<Entry32>()];
             fork_generic(e, &mut buf);
             for (i, item) in buf.iter().enumerate().take(user_count) {
-                unsafe { child_root.e32[i] = *item; }
+                unsafe { let _ = replace_entry(&mut child_root.e32[i], *item); }
             }
         }
         Entries::E64(e) => {
             let mut buf = [Entry64::default(); PAGE_SIZE / core::mem::size_of::<Entry64>()];
             fork_generic(e, &mut buf);
             for (i, item) in buf.iter().enumerate().take(user_count) {
-                unsafe { child_root.e64[i] = *item; }
+                unsafe { let _ = replace_entry(&mut child_root.e64[i], *item); }
             }
         }
     }
@@ -1433,7 +1468,9 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
             src[i].set_hw_writable(false);
             phys_mm::inc_shared_count(src[i].page());
         }
-        dst[i] = e;
+        // `dst` is either fresh physical storage (whose prior bytes carry no
+        // mappings) or a plain stack snapshot, so displaced bits own nothing.
+        let _ = replace_entry(&mut dst[i], e);
     }
 
     invalidate_tlb();
@@ -1470,7 +1507,8 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
         // the old page as src and share_and_copy into the recursive view.
         let user = entries[idx].user();
         let p = phys_mm::alloc_phys_page().expect("Out of memory during COW");
-        entries[idx] = E::new(p, true, user);
+        let displaced = replace_entry(&mut entries[idx], E::new(p, true, user));
+        debug_assert_eq!(displaced.page(), old_phys);
         invalidate_tlb();
         let saved = temp_swap(old_phys);
         let src = unsafe { let tp = &raw mut TEMP_PAGE; core::slice::from_raw_parts_mut((*tp).0.as_mut_ptr() as *mut E, epp) };
@@ -1502,8 +1540,7 @@ pub fn cow_entry<E: Entry>(entries: &mut [E], idx: usize) {
     };
 
     let user = entries[idx].user();
-    entries[idx] = E::new(new_phys, true, user);
-    phys_mm::free_phys_page(old_phys);
+    replace_mapping(&mut entries[idx], E::new(new_phys, true, user));
     invalidate_tlb();
 }
 
@@ -1543,15 +1580,12 @@ pub fn free_user_pages() {
 /// If sole-owned, walk children: recurse for intermediate levels,
 /// free directly for leaf pages.
 fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
-    use crate::phys_mm;
-
     if !entries[parent_idx].present() {
         return;
     }
 
     let epp = entries_per_page::<E>();
-    let phys = entries[parent_idx].page();
-    let ref_count = phys_mm::get_ref_count(phys);
+    let ref_count = crate::phys_mm::get_ref_count(entries[parent_idx].page());
 
     if ref_count == 1 {
         // Sole owner — walk children
@@ -1562,20 +1596,13 @@ fn free_subtree<E: Entry>(entries: &mut [E], parent_idx: usize) {
                 // Intermediate level — recurse
                 free_subtree(entries, child);
             } else if entries[child].present() {
-                // Leaf page — free unless MMIO (cache-disabled)
-                if entries[child].raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                    phys_mm::free_phys_page(entries[child].page());
-                }
-                entries[child] = E::default();
+                replace_mapping(&mut entries[child], E::default());
             }
         }
-        phys_mm::free_phys_page(phys);
-    } else {
-        // Shared — just decrement ref count
-        phys_mm::free_phys_page(phys);
     }
-
-    entries[parent_idx] = E::default();
+    // For a shared subtree this drops only our table-page reference. For a
+    // sole-owned subtree the children have already been drained above.
+    replace_mapping(&mut entries[parent_idx], E::default());
 }
 
 // =============================================================================
@@ -1611,10 +1638,10 @@ pub fn ensure_trampoline_mapped() -> u64 {
         let saved = e[root].0;
         #[allow(static_mut_refs)]
         unsafe {
-            TRAMPOLINE_PT[page] = Entry64::new(page as u64, true, false);
-            TRAMPOLINE_PT[page + 1] = Entry64::new(page as u64 + 1, true, false);
-            TRAMPOLINE_PD[0] = Entry64::new(boot_phys_page(&TRAMPOLINE_PT.0), true, false);
-            e[root] = Entry64::new(boot_phys_page(&TRAMPOLINE_PD.0), true, false);
+            let _ = replace_entry(&mut TRAMPOLINE_PT[page], Entry64::new(page as u64, true, false));
+            let _ = replace_entry(&mut TRAMPOLINE_PT[page + 1], Entry64::new(page as u64 + 1, true, false));
+            let _ = replace_entry(&mut TRAMPOLINE_PD[0], Entry64::new(boot_phys_page(&TRAMPOLINE_PT.0), true, false));
+            let _ = replace_entry(&mut e[root], Entry64::new(boot_phys_page(&TRAMPOLINE_PD.0), true, false));
         }
         // Needed when the target is PAE; harmless when the target is compat.
         sync_hw_pdpt();
@@ -1630,7 +1657,7 @@ pub fn ensure_trampoline_mapped() -> u64 {
 /// Restore PDPT[0] after a mode toggle.
 pub fn clear_trampoline(saved: u64) {
     if let Entries::E64(e) = entries() {
-        e[root_base()] = Entry64(saved);
+        let _ = replace_entry(&mut e[root_base()], Entry64(saved));
     }
     sync_hw_pdpt();
     crate::x86::flush_tlb();
@@ -1668,7 +1695,7 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
             PAGE_SIZE,
         );
     }
-    entries[0] = E::new(temp_swap(saved), true, true);
+    replace_mapping(&mut entries[0], E::new(temp_swap(saved), true, true));
 
     // Pages 1..0x10 (low 64KB excluding page 0): eager-alloc as zero pages
     // so the A20-disabled HMA wrap (PcMachine::new copies entries[0..0x10]
@@ -1690,7 +1717,7 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
             );
         }
         let new_phys = temp_swap(saved2);
-        *slot = E::new(new_phys, true, true);
+        replace_mapping(slot, E::new(new_phys, true, true));
     }
 
     // Pages 0x10-0x9F: conventional memory — left unmapped (demand-paged zero)
@@ -1702,13 +1729,13 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
     for (i, slot) in entries.iter_mut().enumerate().take(0xC0usize).skip(0xA0) {
         let mut e = E::new(i as u64, true, true);
         e.set_raw(e.raw() | flags::CACHE_DISABLE);
-        *slot = e;
+        replace_mapping(slot, e);
     }
 
     // Pages 0xC0-0xFF: ROM/BIOS area — identity mapped RO by default.
     // UMB and EMS pages are cleared to not-present later by scan_uma().
     for (i, slot) in entries.iter_mut().enumerate().take(0x100usize).skip(0xC0) {
-        *slot = E::new(i as u64, false, true);
+        replace_mapping(slot, E::new(i as u64, false, true));
     }
 
     // HMA (virt 0x100000..0x10FFFF) is set up by `PcMachine::new` in the DOS
@@ -1727,16 +1754,6 @@ fn map_low_mem_user_generic<E: Entry>(entries: &mut [E]) {
 
 /// Map a physical page into the user address space.
 pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
-    use crate::phys_mm;
-    // Replacing an owned user mapping drops that mapping's reference.  Device
-    // windows are frequently rebound in place (the VGA switches B8000 between
-    // a linear alias and an MMIO trap); merely overwriting the PTE leaked one
-    // reference on every transition until PAGE_REFS overflowed.
-    let release_old = |raw: u64, present: bool| {
-        if present && raw & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-            phys_mm::free_phys_page((raw & !0xFFF) >> 12);
-        }
-    };
     // MAP_MMIO: an emulated device aperture — present=0 + Cache-Disable (PCD),
     // the not-present twin of the present+PCD passthrough device mappings. A #PF
     // here is a device trap the kernel decodes (planar VGA, future emulated
@@ -1744,18 +1761,14 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     if extra_flags & arch_abi::MAP_MMIO != 0 {
         match entries() {
             Entries::E32(e) => {
-                let old = e[vpage];
-                release_old(old.raw(), old.present());
                 let mut x = Entry32::default();
                 x.set_raw(flags::CACHE_DISABLE | flags::USER);
-                e[vpage] = x;
+                replace_mapping(&mut e[vpage], x);
             }
             Entries::E64(e) => {
-                let old = e[vpage];
-                release_old(old.raw(), old.present());
                 let mut x = Entry64::default();
                 x.set_raw(flags::CACHE_DISABLE | flags::USER);
-                e[vpage] = x;
+                replace_mapping(&mut e[vpage], x);
             }
         }
         flush_tlb();
@@ -1763,18 +1776,14 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     }
     match entries() {
         Entries::E32(e) => {
-            let old = e[vpage];
-            release_old(old.raw(), old.present());
             let mut entry = Entry32::new(ppage, true, true);
             entry.set_raw(entry.raw() | extra_flags);
-            e[vpage] = entry;
+            replace_mapping(&mut e[vpage], entry);
         }
         Entries::E64(e) => {
-            let old = e[vpage];
-            release_old(old.raw(), old.present());
             let mut entry = Entry64::new(ppage, true, true);
             entry.set_raw(entry.raw() | extra_flags);
-            e[vpage] = entry;
+            replace_mapping(&mut e[vpage], entry);
         }
     }
     flush_tlb();
@@ -1831,8 +1840,8 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
     }
     let phys = temp_swap(saved);
     match entries() {
-        Entries::E32(e) => { e[page_idx] = Entry32::new(phys, true, true); }
-        Entries::E64(e) => { e[page_idx] = Entry64::new(phys, true, true); }
+        Entries::E32(e) => replace_mapping(&mut e[page_idx], Entry32::new(phys, true, true)),
+        Entries::E64(e) => replace_mapping(&mut e[page_idx], Entry64::new(phys, true, true)),
     }
     flush_tlb();
 }
@@ -1842,29 +1851,14 @@ pub fn map_user_page(page_idx: usize, data: &[u8]) {
 /// When enabled: virtual 0x100000-0x10FFFF → the thread's saved HMA mappings.
 /// Copy page table entries from src range to dst range.
 pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
-    use crate::phys_mm;
     match entries() {
         Entries::E32(e) => { for i in 0..count {
-            // A copy into a live mapping must drop the reference it held, or the
-            // clobbered frame's refcount never reaches zero and it leaks (mirror
-            // unmap_range). Skip MMIO / externally-owned frames.
-            let old = e[dst_vpage + i];
-            if old.present() && old.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                phys_mm::free_phys_page(old.addr() >> 12);
-            }
-            e[dst_vpage + i] = e[src_vpage + i];
-            if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
+            let incoming = retain_mapping(e[src_vpage + i]);
+            replace_mapping(&mut e[dst_vpage + i], incoming);
         }}
         Entries::E64(e) => { for i in 0..count {
-            // A copy into a live mapping must drop the reference it held, or the
-            // clobbered frame's refcount never reaches zero and it leaks (mirror
-            // unmap_range). Skip MMIO / externally-owned frames.
-            let old = e[dst_vpage + i];
-            if old.present() && old.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                phys_mm::free_phys_page(old.addr() >> 12);
-            }
-            e[dst_vpage + i] = e[src_vpage + i];
-            if e[src_vpage + i].present() { phys_mm::inc_shared_count(e[src_vpage + i].page()); }
+            let incoming = retain_mapping(e[src_vpage + i]);
+            replace_mapping(&mut e[dst_vpage + i], incoming);
         }}
     }
     flush_tlb();
@@ -1889,26 +1883,15 @@ pub fn swap_page_entries(a_vpage: usize, b_vpage: usize, count: usize) {
 
 /// Clear page entries to absent (enables demand paging on next access).
 pub fn unmap_range(base_page: usize, num_pages: usize) {
-    use crate::phys_mm;
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
-                let ent = e[base_page + i];
-                // MMIO / externally-owned (cache-disabled) frames are not
-                // ours to free — same rule as the address-space teardown.
-                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                    phys_mm::free_phys_page(ent.addr() >> 12);
-                }
-                e[base_page + i] = Entry32::default();
+                replace_mapping(&mut e[base_page + i], Entry32::default());
             }
         }
         Entries::E64(e) => {
             for i in 0..num_pages {
-                let ent = e[base_page + i];
-                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                    phys_mm::free_phys_page(ent.addr() >> 12);
-                }
-                e[base_page + i] = Entry64::default();
+                replace_mapping(&mut e[base_page + i], Entry64::default());
             }
         }
     }
@@ -1924,22 +1907,14 @@ pub fn map_fresh_range(base_page: usize, num_pages: usize) {
     match entries() {
         Entries::E32(e) => {
             for i in 0..num_pages {
-                let ent = e[base_page + i];
-                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                    phys_mm::free_phys_page(ent.addr() >> 12);
-                }
                 let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
-                e[base_page + i] = Entry32::new(fresh, true, true);
+                replace_mapping(&mut e[base_page + i], Entry32::new(fresh, true, true));
             }
         }
         Entries::E64(e) => {
             for i in 0..num_pages {
-                let ent = e[base_page + i];
-                if ent.present() && ent.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
-                    phys_mm::free_phys_page(ent.addr() >> 12);
-                }
                 let fresh = phys_mm::alloc_phys_page().unwrap_or(0);
-                e[base_page + i] = Entry64::new(fresh, true, true);
+                replace_mapping(&mut e[base_page + i], Entry64::new(fresh, true, true));
             }
         }
     }

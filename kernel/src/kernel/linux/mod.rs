@@ -52,15 +52,20 @@ const ENOSYS: i32 = 38;
 // allocated on first save (VgaState's planes are a Vec).
 static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::display::Display> = None;
 
-fn present_console() {
+pub fn repaint_console() { crate::kernel::term::mark_dirty(); }
+
+/// Render the shared terminal into its packed shadow, composite the OSD, and
+/// publish that completed frame through the focused Linux display.
+pub fn display_tick<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) {
     unsafe {
         if let Some(display) = (&raw mut LINUX_CONSOLE_DISPLAY).as_mut().unwrap().as_mut() {
-            crate::kernel::term::present(display);
+            crate::kernel::term::present(machine, bios, display);
         }
     }
 }
-
-pub fn repaint_console() { present_console(); }
 
 /// Snapshot the current hardware VGA into the Linux console buffer.
 /// Release the shared console's display token, snapshotting VGA hardware when
@@ -76,12 +81,12 @@ pub fn save_console_vga() -> crate::kernel::display::Display {
 /// activation (no snapshot yet) we clear the screen rather than inherit
 /// the previous personality's framebuffer — keeps a task switch into Linux
 /// deterministic regardless of what was last drawn.
-pub fn restore_console_vga(mut display: crate::kernel::display::Display) {
+pub fn restore_console_vga(display: crate::kernel::display::Display) {
     unsafe {
-        crate::kernel::term::present(&mut display);
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
     }
+    crate::kernel::term::mark_dirty();
 }
 
 pub(super) fn adopt_console_vga(display: crate::kernel::display::Display) {
@@ -89,6 +94,7 @@ pub(super) fn adopt_console_vga(display: crate::kernel::display::Display) {
         assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
         LINUX_CONSOLE_DISPLAY = Some(display);
     }
+    crate::kernel::term::mark_dirty();
 }
 
 /// Linux-specific thread state
@@ -934,7 +940,7 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             for &b in &tmp {
                 term::putchar(b);
             }
-            present_console();
+            crate::kernel::term::mark_dirty();
             SyscallResult::val(len as i32)
         }
         thread::FdKind::PipeWrite(idx) => {
@@ -1628,7 +1634,7 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
                 for &b in &iov {
                     term::putchar(b);
                 }
-                present_console();
+                crate::kernel::term::mark_dirty();
                 total += iov_len as i32;
             }
             thread::FdKind::PipeWrite(idx) => {

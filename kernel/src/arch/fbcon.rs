@@ -65,7 +65,7 @@ pub fn framebuffer() -> Option<crate::kernel::display::Display> {
     // directly-owned card is constructed separately from `NativeVga`.
     Some(crate::kernel::display::Display::from_framebuffer(
         framebuffer,
-        crate::kernel::display::FormatSpec::Packed(g.format),
+        g.format,
     ))
 }
 

@@ -877,7 +877,8 @@ fn set_page_flags_entry<E: paging2::Entry>(entries: &mut [E], vaddr: usize, writ
         let mut entry = E::new(phys, writable, true);
         entry.set_writable(writable);
         entry.set_no_execute(!executable);
-        entries[page] = entry;
+        let displaced = paging2::replace_entry(&mut entries[page], entry);
+        debug_assert_eq!(displaced.page(), phys);
         x86::invlpg(vaddr & !(paging2::PAGE_SIZE - 1));
     }
 }
@@ -896,7 +897,7 @@ fn demand_page<E: paging2::Entry>(
     if use_nx && page_index < PAGE_TABLE_BASE_IDX {
         e.set_no_execute(true);
     }
-    entries[page_index] = e;
+    paging2::replace_mapping(&mut entries[page_index], e);
     paging2::flush_tlb();
 }
 
@@ -911,10 +912,16 @@ fn demand_page_kernel(fault_addr: usize) {
     let page_index = paging2::page_idx(fault_addr);
     match paging2::entries() {
         paging2::Entries::E32(e) => {
-            e[page_index] = paging2::Entry32::new(phys, true, false);
+            paging2::replace_mapping(
+                &mut e[page_index],
+                paging2::Entry32::new(phys, true, false),
+            );
         }
         paging2::Entries::E64(e) => {
-            e[page_index] = paging2::Entry64::new(phys, true, false);
+            paging2::replace_mapping(
+                &mut e[page_index],
+                paging2::Entry64::new(phys, true, false),
+            );
         }
     }
     paging2::flush_tlb();

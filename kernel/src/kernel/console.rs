@@ -69,6 +69,7 @@ fn dispatch_dos<A: crate::Arch>(
                     let c = crate::kernel::keyboard::scancode_to_ascii(sc);
                     if c != 0 {
                         crate::term::putchar(c);
+                        crate::kernel::term::mark_dirty();
                         let cpipe = thread::console_pipe();
                         crate::kernel::kpipe::write(cpipe, &[c]);
                     }
@@ -197,9 +198,11 @@ impl Console {
     /// token can now drive the screen, and nothing left in the kernel can
     /// print over them.
     pub fn release<A: crate::Arch>(
-        self,
-        _machine: &mut A,
+        mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> (SuspendedCard, crate::kernel::display::Display) {
+        crate::kernel::term::present(machine, bios, &mut self.display);
         (SuspendedCard, self.display)
     }
 
@@ -208,9 +211,9 @@ impl Console {
     pub fn acquire<A: crate::Arch>(
         _machine: &mut A,
         _card: SuspendedCard,
-        mut display: crate::kernel::display::Display,
+        display: crate::kernel::display::Display,
     ) -> Self {
-        crate::kernel::term::present(&mut display);
+        crate::kernel::term::mark_dirty();
         Self { display }
     }
 }
@@ -218,7 +221,7 @@ impl Console {
 impl core::fmt::Write for Console {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         core::fmt::Write::write_str(lib::term::term(), s)?;
-        crate::kernel::term::present(&mut self.display);
+        crate::kernel::term::mark_dirty();
         Ok(())
     }
 }

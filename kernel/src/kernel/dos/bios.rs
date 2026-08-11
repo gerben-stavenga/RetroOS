@@ -948,8 +948,11 @@ pub(super) fn int10<A: crate::Arch>(
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
-                let _ = display.cap_mut().bios_set_mode(machine, bios_display, u16::from(mode));
+            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga
+                && let Ok(native_mode) = display.cap_mut().guest_bios_set_mode(
+                    machine, bios_display, u16::from(mode))
+            {
+                *display.mode_mut() = native_mode;
             }
             bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
@@ -1628,9 +1631,15 @@ fn vbe_set_mode<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
-        return display.cap_mut()
-            .bios_set_mode_request(machine, bios_display, regs.rbx as u16)
-            .is_ok();
+        return match display.cap_mut()
+            .guest_bios_set_mode_request(machine, bios_display, regs.rbx as u16)
+        {
+            Ok(mode) => {
+                *display.mode_mut() = mode;
+                true
+            }
+            Err(_) => false,
+        };
     }
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
@@ -1650,12 +1659,21 @@ fn vbe_window<A: crate::Arch>(
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
         if (regs.rbx >> 8) as u8 == 0 {
-            return display.cap_mut()
-                .bios_set_bank(machine, bios_display, regs.rdx as u16)
-                .is_ok();
+            if display.cap_mut().bios_set_bank(
+                machine, bios_display, regs.rdx as u16).is_err()
+            {
+                return false;
+            }
+            if let crate::kernel::platform::NativeVgaMode::VbeBanked {
+                current_bank, ..
+            } = display.mode_mut()
+            {
+                *current_bank = regs.rdx as u16;
+            }
+            return true;
         }
-        let bank = match display.cap() {
-            crate::kernel::platform::VgaCap::Vbe { bank: Some(bank), .. } => bank.current,
+        let bank = match display.mode() {
+            crate::kernel::platform::NativeVgaMode::VbeBanked { current_bank, .. } => current_bank,
             _ => 0,
         };
         regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
