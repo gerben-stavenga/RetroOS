@@ -267,10 +267,15 @@ pkg_tar(
 # image root is the declared mount point; no partition table or boot label is
 # part of this transport.
 pkg_tar(
-    name = "root_module_base_tar",
+    name = "root_module_dos_tar",
     files = _DOS_EXTRA,
-    deps = [":bin_tar", ":ultrasnd_tar", ":tc_tar", ":tp70_tar"],
+    deps = [":ultrasnd_tar", ":tc_tar", ":tp70_tar"],
     package_dir = "home/retroos",
+)
+
+pkg_tar(
+    name = "root_module_base_tar",
+    deps = [":bin_tar", ":root_module_dos_tar"],
 )
 
 pkg_tar(

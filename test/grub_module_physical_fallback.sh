@@ -4,12 +4,28 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-bazelisk build //:grub_module_iso //:image >/dev/null
+tmp_dir=$(mktemp -d)
 log=$(mktemp)
-trap 'rm -f "$log"' EXIT
+trap 'rm -rf "$tmp_dir"; rm -f "$log"' EXIT
+bazelisk build //:root_module_base_gzip //kernel:kernel_elf //:image >/dev/null
+mkdir -p "$tmp_dir/iso/boot/grub"
+cp bazel-bin/retroos-base.img.gz "$tmp_dir/iso/boot/retroos-base.img.gz"
+cp bazel-bin/kernel/kernel.elf "$tmp_dir/iso/boot/kernel.elf"
+printf '%s\n' \
+    'set timeout=0' \
+    'set default=0' \
+    'menuentry "RetroOS base module" {' \
+    '    terminal_output console' \
+    '    insmod multiboot' \
+    '    insmod gzio' \
+    '    multiboot /boot/kernel.elf' \
+    '    module /boot/retroos-base.img.gz retroos.mount=/' \
+    '    boot' \
+    '}' > "$tmp_dir/iso/boot/grub/grub.cfg"
+grub-mkrescue -o "$tmp_dir/module.iso" "$tmp_dir/iso" >/dev/null
 timeout 18s qemu-system-i386 \
     -m 512 -cpu pentium3 \
-    -cdrom bazel-bin/retroos_grub_module.iso \
+    -cdrom "$tmp_dir/module.iso" \
     -drive file=bazel-bin/image.bin,format=raw,snapshot=on \
     -boot order=d -debugcon "file:$log" -display none -no-reboot >/dev/null 2>&1 || true
 

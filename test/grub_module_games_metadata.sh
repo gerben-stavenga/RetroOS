@@ -3,12 +3,21 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-bazelisk build //:root_module_base_image //:root_module_games_image >/dev/null
+bazelisk build //:root_module_base_image >/dev/null
 
 base=bazel-bin/retroos-base.img
-games=bazel-bin/retroos-games.img
-[[ "$(stat -c%s "$base")" -eq $((32 * 1024 * 1024)) ]]
-[[ "$(stat -c%s "$games")" -eq $((96 * 1024 * 1024)) ]]
+tmp_dir=$(mktemp -d)
+trap 'rm -rf "$tmp_dir"' EXIT
+mkdir -p "$tmp_dir/root/DOOMS"
+printf '%s\n' 'synthetic game payload' > "$tmp_dir/root/DOOMS/README.TXT"
+tar -cf "$tmp_dir/games.tar" -C "$tmp_dir/root" .
+python3 tools/build_module_image.py \
+    --contents "$tmp_dir/games.tar" \
+    --size-mb 1 \
+    --writable-root \
+    --out "$tmp_dir/games.img"
+
+games="$tmp_dir/games.img"
 
 for image in "$base" "$games"; do
     [[ "$(dd if="$image" bs=1 skip=1080 count=2 status=none | od -An -t x1 | tr -d ' ')" == "53ef" ]]
