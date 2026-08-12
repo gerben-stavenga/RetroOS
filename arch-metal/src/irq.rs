@@ -40,6 +40,16 @@ static mut TIMER_TICKS: u64 = 0;
 /// Pending timer ticks for VM86 delivery (separate from queue to avoid evicting keys)
 static mut PENDING_TICKS: u32 = 0;
 
+/// HPET wall-clock state retained after LAPIC calibration. A periodic LAPIC
+/// interrupt can be coalesced while firmware holds the CPU in SMM (notably USB
+/// legacy keyboard emulation), but the HPET main counter keeps advancing. On
+/// each delivered timer wakeup we use it to restore any missing milliseconds.
+/// A zero frequency leaves the legacy PIT counter path unchanged.
+static mut HPET_HZ: u64 = 0;
+static mut HPET_COUNTER_MASK: u64 = 0;
+static mut HPET_LAST_COUNTER: u64 = 0;
+static mut HPET_ELAPSED_COUNTERS: u64 = 0;
+
 /// PS/2 mouse 3-byte packet assembly state. Packets stream in over IRQ 12;
 /// we accumulate three bytes, decode to dx/dy/buttons, push one Irq::Mouse,
 /// and reset.
@@ -86,9 +96,33 @@ pub fn push_key(sc: u8) {
 /// Take pending tick count (returns count and resets to 0).
 pub fn take_pending_ticks() -> u32 {
     unsafe {
-        let t = core::ptr::read_volatile(&raw const PENDING_TICKS);
-        core::ptr::write_volatile(&raw mut PENDING_TICKS, 0);
-        t
+        let pending = core::ptr::read_volatile(&raw const PENDING_TICKS);
+        if pending == 0 {
+            return 0;
+        }
+
+        let mut total = u64::from(pending);
+        if let Some(hpet_ms) = hpet_elapsed_ms() {
+            let delivered = core::ptr::read_volatile(&raw const TIMER_TICKS);
+            let missing = hpet_ms.saturating_sub(delivered);
+            if missing != 0 {
+                core::ptr::write_volatile(
+                    &raw mut TIMER_TICKS,
+                    delivered.saturating_add(missing),
+                );
+                total = total.saturating_add(missing);
+            }
+        }
+
+        // Bound one device/audio catch-up pass, but retain any remainder for
+        // following event-loop iterations rather than discarding elapsed time.
+        const MAX_BATCH_MS: u64 = 64;
+        let batch = total.min(MAX_BATCH_MS);
+        core::ptr::write_volatile(
+            &raw mut PENDING_TICKS,
+            total.saturating_sub(batch).min(u64::from(u32::MAX)) as u32,
+        );
+        batch as u32
     }
 }
 
@@ -228,6 +262,46 @@ fn map_mmio_page(va: usize, phys: u64) {
     );
 }
 
+/// Read the HPET main counter without tearing on a 32-bit CPU. A 32-bit HPET
+/// has no meaningful high half; a 64-bit counter is sampled high/low/high and
+/// retried if the low half wrapped between reads.
+fn hpet_counter(mask: u64) -> u64 {
+    let lo = (HPET_MMIO_VA + 0xF0) as *const u32;
+    if mask == u64::from(u32::MAX) {
+        return u64::from(unsafe { core::ptr::read_volatile(lo) });
+    }
+    let hi = (HPET_MMIO_VA + 0xF4) as *const u32;
+    loop {
+        let hi0 = unsafe { core::ptr::read_volatile(hi) };
+        let low = unsafe { core::ptr::read_volatile(lo) };
+        let hi1 = unsafe { core::ptr::read_volatile(hi) };
+        if hi0 == hi1 {
+            return (u64::from(hi0) << 32) | u64::from(low);
+        }
+    }
+}
+
+/// Milliseconds elapsed on the HPET since LAPIC calibration completed.
+/// Called only when a timer wakeup is pending, so polling guests keep the
+/// existing cheap static-counter fast path between millisecond boundaries.
+unsafe fn hpet_elapsed_ms() -> Option<u64> {
+    let hz = unsafe { core::ptr::read_volatile(&raw const HPET_HZ) };
+    if hz == 0 {
+        return None;
+    }
+    let mask = unsafe { core::ptr::read_volatile(&raw const HPET_COUNTER_MASK) };
+    let now = hpet_counter(mask);
+    let last = unsafe { core::ptr::read_volatile(&raw const HPET_LAST_COUNTER) };
+    let delta = now.wrapping_sub(last) & mask;
+    let elapsed = unsafe { core::ptr::read_volatile(&raw const HPET_ELAPSED_COUNTERS) }
+        .saturating_add(delta);
+    unsafe {
+        core::ptr::write_volatile(&raw mut HPET_LAST_COUNTER, now);
+        core::ptr::write_volatile(&raw mut HPET_ELAPSED_COUNTERS, elapsed);
+    }
+    Some((u128::from(elapsed) * 1000 / u128::from(hz)) as u64)
+}
+
 /// Measure the LAPIC timer input frequency against the HPET (a fixed,
 /// self-describing clock) and return the periodic initial-count for ~1000 Hz.
 /// Returns None when no usable HPET is present (then there is no fixed
@@ -239,11 +313,17 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     };
     // GEN_CAP_ID[63:32] = main-counter period in femtoseconds. A valid HPET
     // period is non-zero and at most 100 ns (10 MHz minimum per the spec).
-    let period_fs = (hpet_read(0x00) >> 32) as u32;
+    let capabilities = hpet_read(0x00);
+    let period_fs = (capabilities >> 32) as u32;
     if period_fs == 0 || period_fs > 100_000_000 {
         return None;
     }
     let hpet_hz = 1_000_000_000_000_000u64 / period_fs as u64;
+    let counter_mask = if capabilities & (1 << 13) != 0 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
     // Enable the HPET main counter (GEN_CONF bit 0).
     let conf = hpet_read(0x10);
     unsafe { core::ptr::write_volatile((HPET_MMIO_VA + 0x10) as *mut u64, conf | 1); }
@@ -255,15 +335,15 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
 
     // Count LAPIC ticks over a 10 ms HPET window.
     let window = hpet_hz / 100;
-    let t0 = hpet_read(0xF0);
+    let t0 = hpet_counter(counter_mask);
     let c0 = lapic_read(LAPIC_CUR_COUNT);
-    while hpet_read(0xF0).wrapping_sub(t0) < window {}
+    while (hpet_counter(counter_mask).wrapping_sub(t0) & counter_mask) < window {}
     let c1 = lapic_read(LAPIC_CUR_COUNT);
-    let t1 = hpet_read(0xF0);
+    let t1 = hpet_counter(counter_mask);
     lapic_write(LAPIC_INIT_COUNT, 0); // stop
 
     let elapsed = c0.wrapping_sub(c1); // counts down
-    let hpet_elapsed = t1.wrapping_sub(t0);
+    let hpet_elapsed = t1.wrapping_sub(t0) & counter_mask;
     if elapsed == 0 || hpet_elapsed == 0 {
         return None;
     }
@@ -274,6 +354,14 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     // slow. This was visible as a 44.1 kHz sink requiring a ~56 kHz numerical
     // mix rate to stay full on intermittent KVM boots.
     let lapic_hz = (elapsed as u128 * hpet_hz as u128 / hpet_elapsed as u128) as u64;
+    unsafe {
+        core::ptr::write_volatile(&raw mut HPET_COUNTER_MASK, counter_mask);
+        core::ptr::write_volatile(&raw mut HPET_LAST_COUNTER, t1);
+        core::ptr::write_volatile(&raw mut HPET_ELAPSED_COUNTERS, 0);
+        // Publish the frequency last: nonzero means every other field above is
+        // initialized and the reconciliation path may read the counter.
+        core::ptr::write_volatile(&raw mut HPET_HZ, hpet_hz);
+    }
     Some(((lapic_hz / 1000).max(1)) as u32)
 }
 
