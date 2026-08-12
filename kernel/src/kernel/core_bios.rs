@@ -276,6 +276,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 regs.rax = u64::from(number);
             }, |_, _| ())?;
             bios_display.mark_legacy();
+            crate::println!("video: native mode change complete mode={:#06x}", number);
             return Ok(());
         }
         let Some(mode) = self.mode(number) else {
@@ -290,6 +291,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if status == 0x004F {
             let indexed = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8);
             bios_display.mark_vbe(number, indexed, mode.vga_compatible);
+            crate::println!("video: native mode change complete request={:#06x}", request);
             Ok(())
         } else {
             Err(BiosError::Rejected(status))
@@ -902,6 +904,9 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         mode: u16,
     ) -> Result<(), BiosError> {
+        self.bios(bios)?;
+        crate::println!("video: native mode change mode={:#06x}", mode);
+        crate::kernel::blocking::before_blocking_operation();
         self.bios(bios)?.set_mode(machine, self, mode)
     }
 
@@ -912,6 +917,9 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         request: u16,
     ) -> Result<(), BiosError> {
+        self.bios(bios)?;
+        crate::println!("video: native mode change request={:#06x}", request);
+        crate::kernel::blocking::before_blocking_operation();
         self.bios(bios)?.set_mode_request(machine, self, request)
     }
 

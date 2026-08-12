@@ -84,6 +84,12 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
 
 type Device = &'static mut (dyn sound::sink::Device + Send);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PlaybackState {
+    PreRoll,
+    Running,
+}
+
 /// The machine's audio output: a `//lib:sound` sink over one of our cards.
 /// Absence is represented by `Option<Sink>` at the ownership site; every
 /// value of this type owns a real device and meaningful hardware cursors.
@@ -94,6 +100,8 @@ pub struct Sink {
     ms_since_cursor: u64,
     rate_q16: Option<u64>,
     census: Census,
+    playback: PlaybackState,
+    has_produced_audio: bool,
 }
 
 impl Sink {
@@ -135,47 +143,77 @@ impl Sink {
         let (buf, device) = selected?;
         let inner = sound::sink::Sink::new(buf, device);
         let rate = inner.rate();
-        Some(Sink {
+        let output = Sink {
             inner,
             producer: sound::Pacer::new(rate),
             last_consumed: 0,
             ms_since_cursor: 0,
             rate_q16: None,
             census: Census::default(),
-        })
+            playback: PlaybackState::PreRoll,
+            has_produced_audio: false,
+        };
+        crate::println!(
+            "sound: sink initialized stopped rate={} preroll_frames={}",
+            rate,
+            preroll_target(&output.inner),
+        );
+        Some(output)
     }
 
     /// Stream a block of wide mixed PCM, applying the final Q16 output gain.
     fn play(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
         self.inner.submit(frames, gain_q16);
+        if !frames.is_empty() && !self.has_produced_audio {
+            self.has_produced_audio = true;
+            crate::println!(
+                "sound: first mixer block submitted frames={} queued={}",
+                frames.len(),
+                self.inner.written_frames(),
+            );
+        }
     }
 
-    fn poll(&mut self) -> sound::sink::Report {
-        self.inner.poll()
+    fn enter_preroll(&mut self, reason: &str) {
+        let written = self.inner.written_frames();
+        let consumed = self.inner.consumed_frames();
+        let count = if reason == "underrun" {
+            UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            UNDERRUNS.load(Ordering::Relaxed)
+        };
+        crate::println!(
+            "sound: playback recovery reason={} underruns={} written={} consumed={}",
+            reason, count, written, consumed,
+        );
+        self.inner.pause_and_reset();
+        self.producer = sound::Pacer::new(self.inner.rate());
+        self.last_consumed = 0;
+        self.ms_since_cursor = 0;
+        self.rate_q16 = None;
+        self.playback = PlaybackState::PreRoll;
     }
 
-    /// Re-anchor the physical pipe after the device overtook its producer.
-    fn recover_from_underrun(&mut self) {
-        self.inner.resync();
+    /// Prepare the device before another subsystem enters a synchronous
+    /// operation that may stall the machine for an indeterminate duration.
+    /// The caller intentionally does not identify the source of the stall.
+    pub(crate) fn prepare_for_blocking_operation(&mut self) {
+        crate::println!("sound: pre-roll reset before blocking operation");
+        self.inner.pause_and_reset();
+        self.producer = sound::Pacer::new(self.inner.rate());
+        self.last_consumed = 0;
+        self.ms_since_cursor = 0;
+        self.rate_q16 = None;
+        self.playback = PlaybackState::PreRoll;
     }
 }
 
-/// Say out loud what the sink reported. The library has no console, and
-/// whether an underrun is worth printing is a property of the machine.
-fn say(report: sound::sink::Report) {
-    if report.first_frame {
-        // The difference between "armed" and "the DAC is actually consuming" —
-        // where metal bring-up goes wrong, and invisible in a counter that
-        // only reports problems.
-        crate::println!("sink: first frame played");
-    }
-    if let Some(u) = report.underrun {
-        let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::println!(
-            "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
-            n, u.written_frames, u.consumed_frames
-        );
-    }
+/// Adapter for the generic BIOS blocking-operation hook. The opaque context
+/// points at the event loop's long-lived sink for the duration of the kernel.
+pub(crate) fn prepare_for_blocking_operation(context: *mut ()) {
+    // SAFETY: startup installs this pointer from the sink owned by `run`, and
+    // the kernel never returns from that event loop while the hook is active.
+    unsafe { (&mut *(context.cast::<Sink>())).prepare_for_blocking_operation(); }
 }
 
 /// Source-time rate used when there is no sink.
@@ -195,6 +233,16 @@ pub struct AudioSpan<'a> {
 }
 
 const MIX_CHUNK: usize = 128;
+const MAX_PREROLL_GAP_MS: u64 = 15;
+
+fn preroll_target(inner: &sound::sink::Sink<Device>) -> u64 {
+    let requested = (u64::from(inner.rate())
+        * u64::from(crate::kernel::osd::audio_latency_ms()))
+        .div_ceil(1000);
+    requested
+        .max(inner.block_frames() as u64)
+        .min(inner.max_ahead_frames())
+}
 
 /// The emulated devices' frame clock. It exists with or without an output:
 /// DOS hardware must continue consuming DMA and raising completion IRQs on a
@@ -251,60 +299,72 @@ pub fn advance<A: crate::Arch>(
     let mut fill = 0;
     let mut drained = 0;
     let rate_q16 = if let Some(output) = sink.as_deref_mut() {
-        say(output.poll());
+        output.inner.service();
         let rate = output.inner.rate();
+        let nominal_rate_q16 = u64::from(rate) << RATE_FP_SHIFT;
         let requested = (u64::from(rate)
             * u64::from(crate::kernel::osd::audio_latency_ms()))
             .div_ceil(1000);
-        written = output.inner.written_frames();
-        consumed = output.inner.consumed_frames();
         fill = requested.min(output.inner.max_ahead_frames()) as u32;
-        if written < consumed {
-            // The consumer crossed the producer frontier. Rebase immediately
-            // and produce this pump at the reset cursor. Tell the pacer that
-            // the new pipe is empty so it starts rebuilding the requested
-            // depth; nominal-rate production from depth zero can otherwise
-            // lose every race with a block-granular hardware cursor. This is
-            // feedback, not priming: no silence is claimed and source time
-            // advances only by this call's elapsed interval.
-            output.recover_from_underrun();
-            written = consumed;
-            output.last_consumed = consumed;
-            output.ms_since_cursor = 0;
-            output.rate_q16 = Some(output.producer.update_rate(
-                written, consumed, fill, elapsed_ms,
-            ));
+        if output.playback == PlaybackState::PreRoll {
+            written = output.inner.written_frames();
+            if elapsed_ms > MAX_PREROLL_GAP_MS {
+                if written != 0 {
+                    crate::println!(
+                        "sound: preroll reset gap_ms={} discarded_frames={}",
+                        elapsed_ms, written,
+                    );
+                }
+                output.inner.pause_and_reset();
+                output.producer = sound::Pacer::new(rate);
+                output.last_consumed = 0;
+                output.ms_since_cursor = 0;
+                output.rate_q16 = None;
+                elapsed_ms = 0;
+            }
+            nominal_rate_q16
+        } else {
+            let report = output.inner.poll();
+            if report.first_frame {
+                crate::println!("sink: first frame played");
+            }
+            if report.underrun.is_some() {
+                output.enter_preroll("underrun");
+                elapsed_ms = 0;
+                nominal_rate_q16
+            } else {
+                written = output.inner.written_frames();
+                consumed = output.inner.consumed_frames();
+                if written < consumed {
+                    output.enter_preroll("producer_behind");
+                    elapsed_ms = 0;
+                    nominal_rate_q16
+                } else {
+                    output.ms_since_cursor += elapsed_ms;
+                    drained = consumed.saturating_sub(output.last_consumed);
+                    if drained > 0 {
+                        output.rate_q16 = Some(output.producer.update_rate(
+                            written, consumed, fill, output.ms_since_cursor,
+                        ));
+                        output.last_consumed = consumed;
+                        output.ms_since_cursor = 0;
+                    }
+                    output.rate_q16.unwrap_or_else(|| output.producer.s_q16())
+                }
+            }
         }
-
-        // Correct only when the block-granular play cursor moves. Between
-        // completions its stale value is not a new latency measurement.
-        output.ms_since_cursor += elapsed_ms;
-        drained = consumed.saturating_sub(output.last_consumed);
-        if drained > 0 {
-            output.rate_q16 = Some(output.producer.update_rate(
-                written, consumed, fill, output.ms_since_cursor,
-            ));
-            output.last_consumed = consumed;
-            output.ms_since_cursor = 0;
-        }
-        output.rate_q16.unwrap_or_else(|| output.producer.s_q16())
     } else {
         u64::from(DEFAULT_RATE) << RATE_FP_SHIFT
     };
 
-    if let Some(output) = sink.as_deref_mut() {
+    if let Some(output) = sink.as_deref_mut()
+        && output.playback == PlaybackState::Running
+    {
         let queued = output.inner.written_frames()
             .saturating_sub(output.inner.consumed_frames());
         let available = output.inner.safety_ceiling_frames().saturating_sub(queued);
         if clock.frames_for(rate_q16, elapsed_ms) > available {
-            // A delayed kernel tick, or a device cursor which stopped moving,
-            // cannot be caught up through a finite DMA ring. Re-anchor at the
-            // consumer and discard this elapsed batch before asking sources to
-            // render it; the next ordinary tick starts at the reset cursor.
-            output.recover_from_underrun();
-            output.last_consumed = output.inner.consumed_frames();
-            output.ms_since_cursor = 0;
-            output.rate_q16 = None;
+            output.enter_preroll("ring_capacity");
             elapsed_ms = 0;
         }
     }
@@ -354,6 +414,24 @@ pub fn advance<A: crate::Arch>(
         }
         base += run as u64;
         remaining -= run as u64;
+    }
+    if let Some(output) = sink.as_deref_mut()
+        && output.playback == PlaybackState::PreRoll
+    {
+        let target = preroll_target(&output.inner);
+        let queued = output.inner.written_frames();
+        if queued >= target {
+            output.producer = sound::Pacer::new(output.inner.rate());
+            output.last_consumed = 0;
+            output.ms_since_cursor = 0;
+            output.rate_q16 = None;
+            output.inner.start();
+            output.playback = PlaybackState::Running;
+            crate::println!(
+                "sound: playback start preroll_frames={} target_frames={}",
+                queued, target,
+            );
+        }
     }
     // Publish the pitch timebase, not the effective frame-count rate. The OSD
     // "Mix rate" reads this, and after the pitch/count split it is `s` that the

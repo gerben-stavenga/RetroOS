@@ -14,7 +14,7 @@
 //! knowledge either: it is a ring buffer and some arithmetic.
 //!
 //! A [`Device`] is the whole of what a sound card must supply: its rate and
-//! block geometry plus start, stop and progress operations, none of which
+//! block geometry plus start, pause, stop and progress operations, none of which
 //! mention a machine. Where the bytes go and how the ring is programmed are
 //! the host's; how many frames have advanced and what to do about them are this
 //! crate's.
@@ -54,14 +54,19 @@ pub trait Device {
     fn block_frames(&self) -> usize;
 
     /// Program the device at [`Device::rate`], arm the transfer over the whole
-    /// ring, and re-baseline the frame count.
-    /// A sink is armed once, at construction, and free-runs for its life —
-    /// there is no stopped state, because an unfed ring plays the silence it
-    /// is scrubbed to.
+    /// ring, and re-baseline the frame count. This is a playback transition;
+    /// the device may be started more than once during a sink's lifetime.
     fn start(&mut self);
 
-    /// Stop the transfer. A real session end; an idle producer does not need
-    /// this, it just stops feeding.
+    /// Stop only PCM playback while leaving the device initialized and
+    /// restartable by [`Device::start`]. This must be safe when already paused.
+    fn pause(&mut self);
+
+    /// Service device-side control changes which are independent of PCM
+    /// playback, such as output routing.
+    fn service(&mut self) {}
+
+    /// Stop the transfer and tear down the device for session end.
     fn halt(&mut self);
 
     /// Frames played since the last poll: exact cursor delta, in order, never
@@ -86,6 +91,10 @@ impl<T: Device + ?Sized> Device for &mut T {
         (**self).start();
     }
 
+    fn pause(&mut self) {
+        (**self).pause();
+    }
+
     fn halt(&mut self) {
         (**self).halt();
     }
@@ -105,19 +114,17 @@ pub struct Sink<D: Device> {
     /// Used to distinguish an idle sink from one that ran dry while its
     /// producer was active.
     written_frames_at_last_completion: u64,
+    running: bool,
 }
 
 impl<D: Device> Sink<D> {
-    /// Arm `dev` over `buf` and start playing at the device's rate.
-    /// Constructing a sink starts it: silence is the ring's content, not a
-    /// state of the device.
-    pub fn new(buf: &'static mut [Frame], mut dev: D) -> Self {
+    /// Prepare `dev` and clear the ring without starting physical playback.
+    pub fn new(buf: &'static mut [Frame], dev: D) -> Self {
         let block_frames = dev.block_frames();
         assert!(block_frames != 0, "audio device has zero-sized blocks");
         assert!(buf.len() >= block_frames * 4, "audio device ring is too short");
         assert!(buf.len().is_multiple_of(block_frames), "audio ring is not block-aligned");
         buf.fill([0, 0]);
-        dev.start();
         Sink {
             dev,
             buf,
@@ -125,7 +132,37 @@ impl<D: Device> Sink<D> {
             written_frames: 0,
             played_frames: 0,
             written_frames_at_last_completion: 0,
+            running: false,
         }
+    }
+
+    /// Start playback after the caller has queued enough real audio.
+    pub fn start(&mut self) {
+        if self.running {
+            return;
+        }
+        debug_assert!(self.written_frames != 0, "cannot start an empty audio sink");
+        assert!(self.written_frames != 0, "cannot start an empty audio sink");
+        self.dev.start();
+        self.running = true;
+    }
+
+    /// Stop playback and discard all queued audio while retaining device
+    /// ownership for a later fresh start.
+    pub fn pause_and_reset(&mut self) {
+        if self.running {
+            self.dev.pause();
+            self.running = false;
+        }
+        self.buf.fill([0, 0]);
+        self.write_pos = 0;
+        self.written_frames = 0;
+        self.played_frames = 0;
+        self.written_frames_at_last_completion = 0;
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
     }
 
     pub fn rate(&self) -> u32 {
@@ -183,6 +220,9 @@ impl<D: Device> Sink<D> {
 
     /// Poll the device cursor and reclaim every newly completed frame.
     pub fn poll(&mut self) -> Report {
+        if !self.running {
+            return Report::default();
+        }
         let frames = self.dev.frames_played();
         if frames == 0 {
             return Report::default();
@@ -201,6 +241,11 @@ impl<D: Device> Sink<D> {
             consumed_frames,
         });
         Report { first_frame, underrun }
+    }
+
+    /// Service controls even while playback is paused or in pre-roll.
+    pub fn service(&mut self) {
+        self.dev.service();
     }
 
     /// Frames consumed by the device.
@@ -278,6 +323,8 @@ mod tests {
         rate: u32,
         block_frames: usize,
         starts: u32,
+        pauses: u32,
+        halts: u32,
         played: u64,
     }
 
@@ -294,7 +341,13 @@ mod tests {
             self.starts += 1;
         }
 
-        fn halt(&mut self) {}
+        fn pause(&mut self) {
+            self.pauses += 1;
+        }
+
+        fn halt(&mut self) {
+            self.halts += 1;
+        }
 
     fn frames_played(&mut self) -> u64 {
         core::mem::take(&mut self.played)
@@ -309,28 +362,34 @@ mod tests {
     fn device_owns_the_rate() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 48_000, block_frames: BLOCK_FRAMES, starts: 0, played: 0 },
+            TestDevice { rate: 48_000, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 0 },
         );
         assert_eq!(sink.rate(), 48_000);
-        assert_eq!(sink.device().starts, 1);
+        assert!(!sink.is_running());
+        assert_eq!(sink.device().starts, 0);
 
         sink.submit(&[(1, -1); 32], 1 << 16);
         assert_eq!(sink.written_frames, 32);
         assert_eq!(sink.consumed_frames(), 0);
         assert_eq!(
             sink.device().starts,
-            1,
-            "submitting frames must not reprogram the device"
+            0,
+            "submitting frames must not start the device"
         );
+        sink.start();
+        assert_eq!(sink.device().starts, 1);
+        sink.start();
+        assert_eq!(sink.device().starts, 1);
     }
 
     #[test]
     fn frame_completions_expose_consumed_frames() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 8_000, block_frames: BLOCK_FRAMES, starts: 0, played: 1 },
+            TestDevice { rate: 8_000, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 1 },
         );
         sink.submit(&[(1, 1)], 1 << 16);
+        sink.start();
         let report = sink.poll();
         assert!(report.first_frame);
         assert_eq!(sink.consumed_frames(), 1);
@@ -347,8 +406,10 @@ mod tests {
         let buf = Box::leak(vec![[0; 2]; 16 * 128].into_boxed_slice());
         let mut sink = Sink::new(
             buf,
-            TestDevice { rate: 48_000, block_frames: 128, starts: 0, played: 3 },
+            TestDevice { rate: 48_000, block_frames: 128, starts: 0, pauses: 0, halts: 0, played: 3 },
         );
+        sink.submit(&[(0, 0)], 1 << 16);
+        sink.start();
         let _ = sink.poll();
         assert_eq!(sink.block_frames(), 128);
         assert_eq!(sink.consumed_frames(), 3);
@@ -360,22 +421,24 @@ mod tests {
     fn an_idle_sink_does_not_move_the_producer_cursor_or_fault() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 3 },
+            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 3 },
         );
-        // Nothing was ever submitted: the ring drains its initial silence,
-        // which is not an underrun and does not count as production.
+        // Nothing was ever submitted: playback is stopped and the device
+        // cursor is not queried.
         let report = sink.poll();
         assert!(report.underrun.is_none());
         assert_eq!(sink.written_frames(), 0);
-        assert_eq!(sink.consumed_frames(), 3);
+        assert_eq!(sink.consumed_frames(), 0);
     }
 
     #[test]
     fn resync_reanchors_without_claiming_priming_silence() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 3 },
+            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 3 },
         );
+        sink.submit(&[(7, 7)], 1 << 16);
+        sink.start();
         let _ = sink.poll();
         sink.resync();
         assert_eq!(sink.written_frames(), 3);
@@ -391,7 +454,7 @@ mod tests {
     fn producer_must_not_lap_and_overwrite_the_live_ring() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 0 },
+            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 0 },
         );
         let frames = vec![(1, 1); RING_FRAMES];
         sink.submit(&frames, 1 << 16);
@@ -401,10 +464,41 @@ mod tests {
     fn fill_applies_gain_and_clips_in_the_dma_ring() {
         let mut sink = Sink::new(
             ring(),
-            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, played: 0 },
+            TestDevice { rate: 44_100, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 0 },
         );
         sink.submit(&[(100_000, -100_000)], 1 << 15);
         assert_eq!(sink.buf[0], [i16::MAX, i16::MIN]);
+    }
+
+    #[test]
+    fn pause_and_reset_discards_audio_and_restarts_cleanly() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 48_000, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 0 },
+        );
+        sink.submit(&[(1, 1); 32], 1 << 16);
+        sink.start();
+        sink.pause_and_reset();
+        assert!(!sink.is_running());
+        assert_eq!(sink.device().pauses, 1);
+        assert_eq!(sink.written_frames(), 0);
+        assert_eq!(sink.consumed_frames(), 0);
+        sink.pause_and_reset();
+        assert_eq!(sink.device().pauses, 1);
+        sink.submit(&[(2, 2); 32], 1 << 16);
+        sink.start();
+        assert_eq!(sink.device().starts, 2);
+    }
+
+    #[test]
+    fn stopped_poll_does_not_query_device() {
+        let mut sink = Sink::new(
+            ring(),
+            TestDevice { rate: 48_000, block_frames: BLOCK_FRAMES, starts: 0, pauses: 0, halts: 0, played: 7 },
+        );
+        let report = sink.poll();
+        assert!(!report.first_frame);
+        assert_eq!(sink.consumed_frames(), 0);
     }
 
 }

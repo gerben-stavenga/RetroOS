@@ -235,6 +235,23 @@ fn parse_output_route(raw: &[u8]) -> Option<OutputRoute> {
     }
 }
 
+fn log_available_output_routes(prefix: &str, available: u8) {
+    let mut any = false;
+    for route in OutputRoute::ALL {
+        if available & route.bit() != 0 {
+            any = true;
+            crate::println!(
+                "hda: {} {}",
+                prefix,
+                core::str::from_utf8(route.label()).unwrap_or("?")
+            );
+        }
+    }
+    if !any {
+        crate::println!("hda: {} none", prefix);
+    }
+}
+
 pub fn configure_output_route(raw: Option<&[u8]>) {
     let route = match raw {
         None => OutputRoute::Speaker,
@@ -256,7 +273,10 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
 }
 
 pub fn output_route_label() -> &'static [u8] {
-    OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed)).label()
+    // The OSD reflects the user's current selection immediately. Hardware
+    // programming may be deferred until the next device service point, but
+    // that must not make the control appear stuck while playback is paused.
+    OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed)).label()
 }
 
 pub fn cycle_output_route(forward: bool) {
@@ -346,6 +366,8 @@ pub struct Hda {
     pin: u32,
     pin_def: u32,
     path: OutputPath,
+    output_paths: [OutputPath; OutputRoute::ALL.len()],
+    output_pin_defs: [u32; OutputRoute::ALL.len()],
     output_route: OutputRoute,
     running: bool,
     /// Bytes the codec has consumed since the stream started, monotonic, and
@@ -645,6 +667,8 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         pin: 0,
         pin_def: 0,
         path: OutputPath::EMPTY,
+        output_paths: [OutputPath::EMPTY; OutputRoute::ALL.len()],
+        output_pin_defs: [0; OutputRoute::ALL.len()],
         output_route: DEFAULT_OUTPUT_ROUTE,
         running: false,
         reported: 0,
@@ -772,7 +796,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         }
     }
     let requested = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
-    if !d.select_output_path(requested) || d.verb_failed {
+    if !d.discover_output_paths(requested) || d.verb_failed {
         crate::println!(
             "hda: {:02x}:{:02x}.{} failed: no output path (codec={:#x}, verb_failed={})",
             bus,
@@ -803,6 +827,14 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     OUTPUT_ROUTE.store(d.output_route as u8, Ordering::Relaxed);
     REQUESTED_OUTPUT_ROUTE.store(d.output_route as u8, Ordering::Relaxed);
     OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
+    log_available_output_routes(
+        "available output",
+        AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed),
+    );
+    crate::println!(
+        "hda: selected output {}",
+        core::str::from_utf8(d.output_route.label()).unwrap_or("?")
+    );
     d.dump_output_state();
 
     // The stream format is this card's own constant, so it is programmed here
@@ -1023,7 +1055,7 @@ impl Hda {
 
     /// Walk the codec graph, cache the routes which have usable paths, and
     /// choose the requested route (or the best real fallback when unavailable).
-    fn select_output_path(&mut self, requested: OutputRoute) -> bool {
+    fn discover_output_paths(&mut self, requested: OutputRoute) -> bool {
         let mut widgets = [Widget::EMPTY; MAX_WIDGETS];
         let count = self.enumerate_widgets(&mut widgets);
         let mut best_any = OutputPath::EMPTY;
@@ -1073,6 +1105,13 @@ impl Hda {
                 mask | u8::from(path.len != 0) << index
             });
         AVAILABLE_OUTPUT_ROUTES.store(available, Ordering::Relaxed);
+        self.output_paths = best_by_route;
+        self.output_pin_defs = [0; OutputRoute::ALL.len()];
+        for (index, path) in best_by_route.iter().enumerate() {
+            if let Some(pin) = find_widget(&widgets, count, path.nodes[0]) {
+                self.output_pin_defs[index] = widgets[pin].def_cfg;
+            }
+        }
 
         let requested_path = best_by_route[requested as usize];
         let mut best = if requested_path.len != 0 {
@@ -1098,6 +1137,21 @@ impl Hda {
         if let Some(pin) = find_widget(&widgets, count, self.pin) {
             self.pin_def = widgets[pin].def_cfg;
         }
+        true
+    }
+
+    /// Select one of the paths discovered during initial codec enumeration.
+    /// Runtime route changes must not re-walk the codec graph.
+    fn select_cached_output_path(&mut self, requested: OutputRoute) -> bool {
+        let path = self.output_paths[requested as usize];
+        if path.len == 0 {
+            return false;
+        }
+        self.output_route = requested;
+        self.path = path;
+        self.pin_def = self.output_pin_defs[requested as usize];
+        self.pin = path.nodes[0];
+        self.dac = path.nodes[path.len - 1];
         true
     }
 
@@ -1400,8 +1454,15 @@ impl Hda {
         let old_available = AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed);
         let requested = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
 
+        crate::println!(
+            "hda: reprogram output {} -> {}",
+            core::str::from_utf8(old_route.label()).unwrap_or("?"),
+            core::str::from_utf8(requested.label()).unwrap_or("?")
+        );
+        log_available_output_routes("available output", old_available);
+
         self.setup_corb_rirb();
-        if !self.select_output_path(requested) || self.verb_failed {
+        if !self.select_cached_output_path(requested) || self.verb_failed {
             self.pin = old_pin;
             self.dac = old_dac;
             self.pin_def = old_pin_def;
@@ -1410,7 +1471,11 @@ impl Hda {
             AVAILABLE_OUTPUT_ROUTES.store(old_available, Ordering::Relaxed);
             REQUESTED_OUTPUT_ROUTE.store(old_route as u8, Ordering::Relaxed);
             self.stop_corb_rirb();
-            crate::println!("hda: output route change found no usable path");
+            crate::println!(
+                "hda: output route {} unavailable; retaining {}",
+                core::str::from_utf8(requested.label()).unwrap_or("?"),
+                core::str::from_utf8(old_route.label()).unwrap_or("?")
+            );
             return;
         }
 
@@ -1448,9 +1513,17 @@ impl Hda {
             self.verb(self.dac, (0x2 << 16) | STREAM_FMT as u32);
             self.stop_corb_rirb();
             if self.verb_failed {
-                crate::println!("hda: output route change and rollback timed out");
+                crate::println!(
+                    "hda: output route {} reprogram failed; rollback failed; retaining {}",
+                    core::str::from_utf8(requested.label()).unwrap_or("?"),
+                    core::str::from_utf8(old_route.label()).unwrap_or("?")
+                );
             } else {
-                crate::println!("hda: output route change timed out; previous route restored");
+                crate::println!(
+                    "hda: output route {} reprogram timed out; restored {}",
+                    core::str::from_utf8(requested.label()).unwrap_or("?"),
+                    core::str::from_utf8(old_route.label()).unwrap_or("?")
+                );
             }
         } else {
             OUTPUT_ROUTE.store(self.output_route as u8, Ordering::Relaxed);
@@ -1714,7 +1787,6 @@ impl sound::sink::Device for Hda {
     /// controller re-evaluates the codec↔stream binding with the stream number
     /// visible.
     fn start(&mut self) {
-        self.apply_pending_output_route();
         assert_eq!(
             r16(self.sd + SDFMT),
             STREAM_FMT,
@@ -1732,13 +1804,20 @@ impl sound::sink::Device for Hda {
         );
     }
 
+    fn pause(&mut self) {
+        self.stop_playback();
+    }
+
+    fn service(&mut self) {
+        self.apply_pending_output_route();
+    }
+
     fn halt(&mut self) {
         self.stop_playback();
         self.stop_corb_rirb();
     }
 
     fn frames_played(&mut self) -> u64 {
-        self.apply_pending_output_route();
         self.advance()
     }
 }

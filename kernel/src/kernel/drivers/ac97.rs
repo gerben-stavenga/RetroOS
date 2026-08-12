@@ -244,6 +244,12 @@ impl sound::sink::Device for Ac97 {
         outb(self.nabm + PO_CR, cr & !PO_CR_RUN);
     }
 
+    fn pause(&mut self) {
+        use crate::kernel::portio::{inb, outb};
+        let cr = inb(self.nabm + PO_CR);
+        outb(self.nabm + PO_CR, cr & !PO_CR_RUN);
+    }
+
     fn frames_played(&mut self) -> u64 {
         advance_frames(self)
     }

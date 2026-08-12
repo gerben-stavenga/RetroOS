@@ -489,6 +489,13 @@ fn run<A: crate::Arch>(
     mut sb: Option<crate::kernel::drivers::sb16::SbCard>,
     mut sink: Option<crate::kernel::sound::Sink>,
 ) -> ! {
+    if let Some(sink) = sink.as_mut() {
+        crate::kernel::blocking::install(crate::kernel::blocking::BlockingOperationHook::new(
+            crate::kernel::sound::prepare_for_blocking_operation,
+            core::ptr::from_mut(sink).cast(),
+        ));
+    }
+
     // What to run headlessly, from whichever channel the backend has. QEMU and
     // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
     // Bochs have NO such channel — `--cmd` was silently ignored there, so every

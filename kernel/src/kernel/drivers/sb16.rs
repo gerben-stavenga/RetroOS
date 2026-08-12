@@ -443,6 +443,13 @@ impl sound::sink::Device for Sb16 {
         dsp_write(self.base, CMD_SPEAKER_ON);
     }
 
+    fn pause(&mut self) {
+        dsp_write(self.base, CMD_HALT_AUTO_16);
+        outb(DMA5_MASK, 0x05);
+        let _ = dsp_reset(self.base);
+        dsp_write(self.base, CMD_SPEAKER_ON);
+    }
+
     fn frames_played(&mut self) -> u64 {
         let ring = RING_BYTES as u32;
         let pos = dma_pos_bytes();
