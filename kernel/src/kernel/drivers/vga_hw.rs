@@ -46,6 +46,60 @@ pub fn track_ac_reset() {
     unsafe { AC.pending_data = false; }
 }
 
+/// Destructively read the AC register selected by a captured state. The caller
+/// brackets this with a firmware checkpoint restore, so resetting the
+/// flip-flop here does not become process-visible.
+pub fn read_selected_ac(state: &VgaState) -> u8 {
+    use crate::kernel::portio::{inb, outb};
+    let _ = inb(0x3DA);
+    outb(0x3C0, state.ac_state.index & 0x1F);
+    inb(0x3C1)
+}
+
+/// Convert the two hidden pieces of generic VGA state into explicit model
+/// bytes after a firmware checkpoint has restored the original hardware.
+///
+/// AC phase is used as an oracle: one controlled 3C0 write either changes the
+/// selected register (data phase) or merely changes the index (index phase).
+/// The four GC latches are spilled through write mode 1 into one scratch VRAM
+/// offset, then read plane by plane. The caller restores the checkpoint once
+/// more afterward, so none of these probes remain live on the card.
+pub fn extract_hidden_state(
+    _cap: &crate::kernel::platform::VgaCap,
+    state: &mut VgaState,
+    selected_ac_value: u8,
+) {
+    use crate::kernel::portio::{inb, outb};
+
+    let probe = !selected_ac_value;
+    outb(0x3C0, probe);
+    let _ = inb(0x3DA);
+    outb(0x3C0, state.ac_state.index & 0x1F);
+    state.ac_state.pending_data = inb(0x3C1) == probe;
+
+    const SCRATCH: usize = 0xFFFF;
+    // Preserve the latch contents while selecting a flat A0000 view. VGA
+    // register writes do not reload the latches; only the memory read below
+    // does, after write mode 1 has already copied them to all four planes.
+    outb(0x3C4, 2); outb(0x3C5, 0x0F);
+    outb(0x3C4, 4); outb(0x3C5, 0x06);
+    outb(0x3CE, 5); outb(0x3CF, 0x01);
+    outb(0x3CE, 6); outb(0x3CF, 0x05);
+    let p = (crate::LOW_MEM_BASE + 0xA0000 + SCRATCH) as *mut u8;
+    unsafe { core::ptr::write_volatile(p, 0); }
+    for plane in 0..4u8 {
+        outb(0x3CE, 4); outb(0x3CF, plane);
+        state.latches[plane as usize] = unsafe { core::ptr::read_volatile(p) };
+    }
+    state.latches_valid = true;
+}
+
+/// Synchronize the software tracker after the BIOS has restored the exact AC
+/// index and phase discovered by [`extract_hidden_state`].
+pub fn checkpoint_restored(state: &VgaState) {
+    unsafe { AC = state.ac_state; }
+}
+
 /// Read only the register subset that determines the current VGA mode. Index
 /// latches are restored, no sequencer reset is asserted, and VRAM/DAC/AC are
 /// untouched, so COMMAND.COM can decide whether a mode-3 BIOS call is needed
@@ -90,6 +144,7 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     if state.planes.is_empty() {
         state.planes = alloc::vec![0u8; 4 * 65536];
     }
+    state.latches_valid = false;
     // Capture the AC sequencing state, then reset the flipflop to a
     // known index state. With 0x3C0/0x3DA granted to the guest
     // (io_policy's `DisplayedVga::Native` arm), the VGA_AC_STATE tracker never saw
@@ -109,6 +164,7 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
         false
     };
     state.ac_state = AcState { index, pending_data };
+    state.ac_pas_valid = plat.host != crate::kernel::platform::Host::Qemu;
     let _ = inb(0x3DA);
 
     // Capture index registers BEFORE the save loops overwrite them.
@@ -134,6 +190,7 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
             state.latches[plane as usize] = inb(0x3D5);
         }
         outb(0x3CE, 4); outb(0x3CF, state.gc[4]);
+        state.latches_valid = true;
     }
     save_dac(cap, state);
 
@@ -270,7 +327,7 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     // The save boundary must be observational: a fork hands this still-live
     // adapter directly to its child, so repair QEMU's palette-enable latch
     // without touching registers, VRAM, palette or mode.
-    if crate::kernel::platform::get().host == crate::kernel::platform::Host::Qemu {
+    if !state.ac_pas_valid {
         enable_palette_output(cap, state);
     }
 }
@@ -349,8 +406,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // in forced flat-planar write mode 0 here, so the staging writes
     // land verbatim.
     {
-        let plat = crate::kernel::platform::get();
-        if plat.vga_readback {
+        if state.latches_valid {
             for plane in 0..4u8 {
                 outb(0x3C4, 2); outb(0x3C5, 1 << plane);
                 unsafe { core::ptr::write_volatile(vga_window, state.latches[plane as usize]); }
@@ -460,11 +516,19 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     for i in 0..21u8 { outb(0x3C0, i); outb(0x3C0, state.ac[i as usize]); }
     // Restore the program's AC state. Same pattern as `save`.
     let _ = inb(0x3DA);
-    outb(0x3C0, state.ac_state.index);
+    let ac_index = if state.ac_pas_valid {
+        state.ac_state.index
+    } else {
+        // The adapter could not report PAS. A captured display owner is
+        // restored visible; the invalidity remains explicit in VgaState
+        // instead of leaking a platform quirk into ownership code.
+        state.ac_state.index | 0x20
+    };
+    outb(0x3C0, ac_index);
     if !state.ac_state.pending_data {
         let _ = inb(0x3DA);
     }
-    unsafe { AC = state.ac_state; }
+    unsafe { AC = AcState { index: ac_index, pending_data: state.ac_state.pending_data }; }
     // DAC
     outb(0x3C6, state.dac_mask);
     outb(0x3C8, 0);

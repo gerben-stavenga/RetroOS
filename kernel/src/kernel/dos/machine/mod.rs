@@ -618,6 +618,21 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
     if native_vbe_byte_port(pc, port) {
         return machine.inb(port);
     }
+    if matches!(&pc.vga, DisplayedVga::Native(native) if native.is_vbe()) {
+        return match port {
+            0x3C6..=0x3C9
+                if matches!(&pc.vga,
+                    DisplayedVga::Native(native) if native.vbe_dac_access()) =>
+                machine.inb(port),
+            0x3DA => input_status1(machine, &pc.present_scratch2),
+            0x3C0..=0x3DF | 0x01CE..=0x01D0 => 0xFF,
+            _ => emulate_inb_non_vga(machine, pc, port),
+        };
+    }
+    emulate_inb_non_vga(machine, pc, port)
+}
+
+fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     match port {
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
         // (blanking). An EMULATED card has no raster, so the value is
@@ -745,6 +760,17 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
     if native_vbe_byte_port(pc, port) {
         machine.outb(port, val);
+        return;
+    }
+    if matches!(&pc.vga, DisplayedVga::Native(native) if native.is_vbe())
+        && matches!(port, 0x3C0..=0x3DF | 0x01CE..=0x01D0)
+    {
+        if matches!(port, 0x3C6..=0x3C9)
+            && matches!(&pc.vga,
+                DisplayedVga::Native(native) if native.vbe_dac_access())
+        {
+            machine.outb(port, val);
+        }
         return;
     }
     match port {

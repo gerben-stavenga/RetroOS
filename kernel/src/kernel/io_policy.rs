@@ -28,17 +28,23 @@ pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> a
     let mut policy = arch_abi::IoPolicy::deny_all();
     match personality {
         Personality::Dos(_) => {
-            if matches!(personality, Personality::Dos(dos)
-                if matches!(dos.pc.vga,
-                    crate::kernel::bios_display::DisplayedVga::Native(_)))
+            if let Personality::Dos(dos) = personality
+                && let crate::kernel::bios_display::DisplayedVga::Native(native) = &dos.pc.vga
             {
-                policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
-                policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
-                // Native ownership means the card is the source of truth,
-                // including the attribute-controller flip-flop side effect of
-                // 0x3DA. These two ports must therefore bypass emulation too.
-                policy.allow(0x3C0, 1);
-                policy.allow(0x3DA, 1);
+                if native.is_vbe() {
+                    // Generic RetroOS VBE exposes framebuffer memory and, for
+                    // indexed modes, the standard DAC only. Mode/controller
+                    // programming remains behind INT 10h regardless of the
+                    // physical card's vendor register set.
+                    if native.vbe_dac_access() {
+                        policy.allow(0x3C6, 4);
+                    }
+                } else {
+                    policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
+                    policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
+                    policy.allow(0x3C0, 1);
+                    policy.allow(0x3DA, 1);
+                }
             }
             // Ports are granted to a guest that holds the REAL card, and to
             // no other: an emulated card's window must keep trapping, or the

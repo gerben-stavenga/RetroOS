@@ -313,7 +313,13 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
 /// as PM's `pm_stub_dispatch` over `SPECIAL_STUB_SEL`. Far-call entries
 /// (XMS, save/restore) have a CS/IP frame to pop; everything else either
 /// switches mode outright or owns its unwind.
-pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
     let ip = vm86_ip(regs);
     debug_assert_eq!(vm86_cs(regs), CTRL_STUB_SEG, "rm_ctrl_dispatch: CS must be CTRL_STUB_SEG");
     let slot = ((ip.wrapping_sub(STUB_BASE as u16 + 2)) / 2) as u8;
@@ -344,6 +350,13 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread:
             // save/restore procedures are NOPs (matches CWSDPMI's
             // STUB_NOP). The far-call return frame is popped below by
             // the `matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE)` arm.
+            thread::KernelAction::Done
+        }
+        SLOT_VBE_WINDOW => {
+            let ok = super::bios::vbe_window_entry(
+                machine, bios_display, dos, regs,
+            );
+            regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
             thread::KernelAction::Done
         }
         SLOT_MOUSE_CB_RET => {
@@ -384,7 +397,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(machine: &mut A, kt: &mut thread:
     // CS/IP. Mode-switching stubs (DPMI entry, raw switch, callbacks)
     // replace all regs; SLOT_RESUME/SLOT_RESUME_CONTINUATION own their
     // unwind — skip.
-    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE) {
+    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE | SLOT_VBE_WINDOW) {
         let ret_ip = vm86_pop(machine, regs);
         let ret_cs = vm86_pop(machine, regs);
         set_vm86_ip(regs, ret_ip);
@@ -4076,6 +4089,14 @@ pub(crate) const SLOT_CB_ENTRY_LAST: u8 = SLOT_CB_ENTRY_END - 1;
 /// bracket-saved GP regs (HostContinuation doesn't cover them) and then
 /// unwinds the INT 33h callback via the standard continuation path.
 pub(crate) const SLOT_MOUSE_CB_RET: u8 = 0x14;
+/// VBE ModeInfoBlock.WinFuncPtr. This is RetroOS code, not a firmware pointer:
+/// the far-call convention is Function 05h's BX/DX register ABI, while the
+/// control-slot dispatcher routes the operation to the current process VGA.
+pub(crate) const SLOT_VBE_WINDOW: u8 = 0x15;
+
+pub(crate) const fn vbe_window_ptr() -> u32 {
+    ctrl_slot_off(SLOT_VBE_WINDOW) as u32
+}
 /// Return target for guest calls chained through the native video ROM.
 /// Generic block-and-retry resume slot. A syscall that can't complete
 /// synchronously (e.g. AH=08 with no key in the buffer) stashes a closure

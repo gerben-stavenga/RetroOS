@@ -18,12 +18,22 @@ pub struct VbeMode {
     pub physical_base: u32,
     pub width: u16,
     pub height: u16,
+    /// Preferred/native linear pitch, retained for physical display setup.
     pub pitch: u16,
+    pub banked_pitch: u16,
+    pub linear_pitch: u16,
     pub bits_per_pixel: u8,
     pub format: crate::kernel::display::FormatSpec,
     pub window_segment: u16,
     pub window_granularity_kb: u16,
     pub window_size_kb: u16,
+    /// Additional complete images advertised by the BIOS (zero means one
+    /// visible image total). The guest may use every advertised image for
+    /// page flipping, so ownership capture covers all of them.
+    pub banked_image_pages: u8,
+    pub linear_image_pages: u8,
+    /// Exact byte span occupied by all advertised images at this mode's pitch.
+    pub framebuffer_bytes: u32,
     /// VBE ModeInfoBlock.WinFuncPtr: the firmware's real-mode far entry for
     /// fast window changes, or zero when only INT 10h Function 05h is offered.
     pub window_function: u32,
@@ -138,11 +148,14 @@ pub enum Host {
 #[derive(Debug)]
 pub struct VgaCap {
     _private: (),
+    vbe_mode: Option<u16>,
+    vbe_indexed: bool,
 }
 
 /// A physical VGA whose registers and VRAM are the authoritative VGA state.
 /// The adapter and persistent firmware workspace are the source of truth;
-/// mode and bank are queried rather than duplicated in this ownership token.
+/// the token retains only the legacy/VBE class and indexed-DAC access policy,
+/// while exact mode, bank and display start are queried at a release boundary.
 #[derive(Debug)]
 pub struct NativeVga(VgaCap);
 
@@ -152,16 +165,31 @@ impl Default for NativeVga {
 
 impl NativeVga {
     pub fn new() -> Self {
-        Self(VgaCap { _private: () })
+        Self(VgaCap { _private: (), vbe_mode: None, vbe_indexed: false })
     }
 
     pub(crate) fn into_cap(self) -> VgaCap { self.0 }
     pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
     pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
+    pub fn is_vbe(&self) -> bool { self.0.vbe_mode.is_some() }
+    pub fn vbe_dac_access(&self) -> bool {
+        self.0.vbe_mode.is_some() && self.0.vbe_indexed
+    }
 
     /// Mark the hardware state authoritative again after a complete software
     /// VGA has been restored into the adapter.
     pub(crate) fn restored(cap: VgaCap) -> NativeVga { NativeVga(cap) }
+}
+
+impl VgaCap {
+    pub(crate) fn mark_legacy(&mut self) {
+        self.vbe_mode = None;
+        self.vbe_indexed = false;
+    }
+    pub(crate) fn mark_vbe(&mut self, mode: u16, indexed: bool) {
+        self.vbe_mode = Some(mode);
+        self.vbe_indexed = indexed;
+    }
 }
 
 pub struct ProbedPlatform {

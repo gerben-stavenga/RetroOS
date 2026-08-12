@@ -86,7 +86,7 @@ fn read_aperture<'a, A: crate::Arch>(
 /// renderer doesn't draw.
 fn scanout<'a, A: crate::Arch>(
     state: &'a VgaState, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
-    band: (usize, usize),
+    band: (usize, usize), svga_start: usize,
 ) -> Option<::vga::Frame<'a>>
 {
     use ::vga::{Frame, VgaMode};
@@ -101,7 +101,7 @@ fn scanout<'a, A: crate::Arch>(
                 w: state.svga_w, h: state.svga_h, bpp: state.svga_bpp, pitch: pitch as u16,
             },
             // Linear rows: the band maps straight to a byte span.
-            vram: read_aperture(machine, scratch, SVGA_LFB_BASE, size,
+            vram: read_aperture(machine, scratch, SVGA_LFB_BASE + svga_start, size,
                 band.0 * pitch, (band.0 + band.1) * pitch),
             planes: &[],
             ac: &state.ac,
@@ -417,6 +417,13 @@ pub fn display_tick<A: crate::Arch>(
         return;
     };
     let display = external.unwrap_or(owned_display);
+    let svga_start = match dev.resume {
+        crate::kernel::bios_display::VideoResume::Vbe {
+            mode, display_start: (x, y), logical_pitch, ..
+        } => usize::from(y) * usize::from(logical_pitch)
+            + usize::from(x) * usize::from(mode.bits_per_pixel.div_ceil(8)),
+        crate::kernel::bios_display::VideoResume::Legacy { .. } => 0,
+    };
     let vga = &mut dev.state;
     if display.is_headless() { return; }
     let prof = crate::kernel::startup::profile_enabled();
@@ -438,7 +445,7 @@ pub fn display_tick<A: crate::Arch>(
                 // The source aperture, registers and DAC are captured once for
                 // the whole shadow; no palette generation can split the image.
                 let Some(frame) =
-                    scanout(vga, machine, regs, &mut pc.present_scratch, full)
+                    scanout(vga, machine, regs, &mut pc.present_scratch, full, svga_start)
                 else {
                     return;
                 };
@@ -494,7 +501,9 @@ pub fn display_tick<A: crate::Arch>(
     let p0 = if prof { machine.rdtsc() } else { 0 };
     // Whole-frame sink: `render` walks every row, so capture the full frame.
     let full = vga.current_mode().map_or((0, 0), |m| (0, ::vga::dimensions(m).1));
-    let Some(frame) = scanout(vga, machine, regs, &mut pc.present_scratch, full) else { return };
+    let Some(frame) = scanout(
+        vga, machine, regs, &mut pc.present_scratch, full, svga_start,
+    ) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = ::vga::dimensions(frame.mode);
     let need = w * h;

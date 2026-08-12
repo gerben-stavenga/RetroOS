@@ -17,33 +17,35 @@ pub enum BiosError {
     UnexpectedEvent,
 }
 
-/// Opaque controller state produced by VBE 4F04h. Its layout belongs to the
-/// machine's video BIOS; the kernel only carries it between ownership turns.
-#[derive(Clone)]
-pub struct VbeState(Vec<u8>);
+/// Short-lived controller checkpoint produced by VBE 4F04h. Its layout belongs
+/// to the machine's video BIOS. It may bracket destructive hardware inspection
+/// but must never become runnable process state.
+pub(crate) struct FirmwareCheckpoint(Vec<u8>);
+
+#[derive(Clone, Copy)]
+pub enum VideoResume {
+    Legacy {
+        bios_mode: u8,
+    },
+    Vbe {
+        mode: crate::kernel::platform::VbeMode,
+        request: u16,
+        bank: Option<u16>,
+        display_start: (u16, u16),
+        logical_pitch: u16,
+    },
+}
 
 /// Software VGA state owned by the core INT 10h/video-BIOS driver.
 pub struct EmulatedVga {
     pub state: alloc::boxed::Box<vga::VgaState>,
-    /// Opaque controller state saved by native video firmware.
-    pub(crate) firmware_state: Option<VbeState>,
     /// Guest pages backing the substitute-VBE aperture.
     pub svga_pages: usize,
-    /// Firmware transition needed when returning to native VGA ownership.
-    pub(crate) resume_vbe: Option<VbeResume>,
+    /// Complete, interpretable transition used to materialize this process.
+    pub(crate) resume: VideoResume,
     /// Physical framebuffer whose aliases target `SVGA_LFB_BASE` while this
     /// VGA is detached from the adapter.
     pub(crate) physical_lfb: Option<u32>,
-    /// Legacy BIOS mode whose persistent BDA state must be re-established
-    /// before restoring direct-register state. Meaningful when `resume_vbe`
-    /// is absent.
-    pub(crate) resume_legacy_mode: u8,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct VbeResume {
-    pub(crate) request: u16,
-    pub(crate) bank: Option<u16>,
 }
 
 /// A VGA paired with an output target. Native VGA intrinsically owns physical
@@ -60,22 +62,18 @@ impl EmulatedVga {
     pub fn initial_mode3() -> Self {
         Self {
             state: vga::VgaState::new_mode3_boxed(),
-            firmware_state: None,
             svga_pages: 0,
-            resume_vbe: None,
+            resume: VideoResume::Legacy { bios_mode: 3 },
             physical_lfb: None,
-            resume_legacy_mode: 3,
         }
     }
 
     pub(crate) fn clone_for_fork(&self) -> Self {
         Self {
             state: alloc::boxed::Box::new((*self.state).clone()),
-            firmware_state: self.firmware_state.clone(),
             svga_pages: self.svga_pages,
-            resume_vbe: self.resume_vbe,
+            resume: self.resume,
             physical_lfb: self.physical_lfb,
-            resume_legacy_mode: self.resume_legacy_mode,
         }
     }
 }
@@ -106,6 +104,16 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
     /// Backend paths which deliberately bypass platform probing (the hosted
     /// bare-ELF runner) have no native video firmware.
     pub(crate) fn absent() -> Self { Self(None) }
+
+    /// Immutable, sanitized mode catalogue discovered at boot. Consulting it
+    /// does not operate the adapter and therefore requires no live `VgaCap`.
+    pub fn curated_mode(&self, number: u16) -> Option<crate::kernel::platform::VbeMode> {
+        self.0.as_ref()?.mode(number)
+    }
+
+    pub fn curated_modes(&self) -> Option<&[crate::kernel::platform::VbeMode]> {
+        Some(self.0.as_ref()?.modes())
+    }
 }
 
 impl<A: Arch> NativeBiosWorkspace<A> {
@@ -168,11 +176,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     /// Save all firmware-visible controller state. Failure means the caller
     /// should retain its direct-register fallback; it is not a fatal display
     /// error because many plain VGA BIOSes predate VBE.
-    fn save_state(
+    fn checkpoint(
         &mut self,
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
-    ) -> Option<VbeState> {
+    ) -> Option<FirmwareCheckpoint> {
         if !self.state_probed {
             self.state_bytes = self.probe_state_size(machine, display);
             self.state_probed = true;
@@ -195,20 +203,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 if regs.rax as u16 != 0x004F { return None; }
                 let mut state = alloc::vec![0; bytes];
                 machine.copy_from(Self::STATE_BUFFER, &mut state);
-                Some(VbeState(state))
+                Some(FirmwareCheckpoint(state))
             },
         ).ok().flatten()
     }
 
-    /// Restore a blob returned by [`save_state`](Self::save_state).
-    /// Call this after restoring framebuffer memory: VBE state includes the
-    /// exact hidden VGA/SVGA sequencing state that direct memory access would
-    /// otherwise disturb.
-    fn restore_state(
+    /// Restore a blob returned by [`checkpoint`](Self::checkpoint). The blob
+    /// exists only long enough to undo destructive inspection of the adapter;
+    /// it is never retained as process state.
+    fn restore_checkpoint(
         &mut self,
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
-        state: &VbeState,
+        state: &FirmwareCheckpoint,
     ) -> Result<(), BiosError> {
         if state.0.is_empty() || state.0.len() > Self::MAX_STATE_BYTES {
             return Err(BiosError::InvalidStateSize);
@@ -268,6 +275,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
                 regs.rax = u64::from(number);
             }, |_, _| ())?;
+            bios_display.mark_legacy();
             return Ok(());
         }
         let Some(_) = self.mode(number) else {
@@ -279,7 +287,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             regs.rbx = u64::from(request);
         }, |_, _| ())?;
         let status = regs.rax as u16;
-        if status == 0x004F { Ok(()) } else {
+        if status == 0x004F {
+            let indexed = self.mode(number).is_some_and(|mode| matches!(
+                mode.format, crate::kernel::display::FormatSpec::Indexed8,
+            ));
+            bios_display.mark_vbe(number, indexed);
+            Ok(())
+        } else {
             Err(BiosError::Rejected(status))
         }
     }
@@ -319,6 +333,55 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             regs.rax = 0x0F00;
         }, |_, _| ())?;
         Ok(regs.rax as u8)
+    }
+
+    /// Forward VBE 4F07h (set/get display start).  This call has no pointer
+    /// parameters, so the native firmware remains authoritative without
+    /// exposing any address from its private workspace to the DOS client.
+    fn display_start(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::VgaCap,
+        caller: &mut Regs,
+    ) -> Result<(), BiosError> {
+        let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
+            regs.rax = input[0];
+            regs.rbx = input[1];
+            regs.rcx = input[2];
+            regs.rdx = input[3];
+        }, |_, _| ())?;
+        let status = regs.rax as u16;
+        caller.rax = regs.rax;
+        caller.rbx = regs.rbx;
+        caller.rcx = regs.rcx;
+        caller.rdx = regs.rdx;
+        if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
+    }
+
+    /// Forward VBE 4F06h logical scan-line control. It has no guest pointers;
+    /// the modeled result is copied back into the caller registers.
+    fn scan_line_length(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::VgaCap,
+        caller: &mut Regs,
+    ) -> Result<(), BiosError> {
+        let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
+            regs.rax = input[0];
+            regs.rbx = input[1];
+            regs.rcx = input[2];
+            regs.rdx = input[3];
+        }, |_, _| ())?;
+        let status = regs.rax as u16;
+        caller.rax = regs.rax;
+        caller.rbx = regs.rbx;
+        caller.rcx = regs.rcx;
+        caller.rdx = regs.rdx;
+        if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
     }
 
     /// Forward VBE 4F05h to the same persistent firmware instance. This is
@@ -603,7 +666,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.state_bytes = self.probe_state_size(machine, bios_display);
         self.state_probed = true;
         if let Some(bytes) = self.state_bytes {
-            crate::println!("VGA: VBE 4F04 state save/restore ({} bytes) — exact ownership handoff", bytes);
+            crate::println!("VGA: VBE 4F04 capture checkpoint available ({} bytes)", bytes);
         } else if crate::kernel::platform::get().vga_readback {
             crate::println!("VGA: VBE 4F04 unavailable — using Cirrus CR22/24/26 readbacks");
         } else {
@@ -790,21 +853,25 @@ impl crate::kernel::platform::VgaCap {
         Some(self.bios_ref(bios).ok()?.modes())
     }
 
-    pub fn bios_save_state<A: Arch>(
+    pub(crate) fn bios_checkpoint<A: Arch>(
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
-    ) -> Option<VbeState> {
-        self.bios(bios).ok()?.save_state(machine, self)
+    ) -> Option<FirmwareCheckpoint> {
+        self.bios(bios).ok()?.checkpoint(machine, self)
     }
 
-    pub fn bios_restore_state<A: Arch>(
+    pub(crate) fn bios_restore_checkpoint<A: Arch>(
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
-        state: &VbeState,
-    ) -> Result<(), BiosError> {
-        self.bios(bios)?.restore_state(machine, self, state)
+        state: &FirmwareCheckpoint,
+    ) {
+        self.bios(bios)
+            .and_then(|bios| bios.restore_checkpoint(machine, self, state))
+            .unwrap_or_else(|error| panic!(
+                "native video BIOS failed to restore capture checkpoint: {:?}", error,
+            ));
     }
 
     pub fn bios_set_mode<A: Arch>(
@@ -880,6 +947,24 @@ impl crate::kernel::platform::VgaCap {
         set: Option<u16>,
     ) -> Result<u16, BiosError> {
         self.bios(bios)?.window(machine, self, set)
+    }
+
+    pub fn guest_bios_display_start<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        caller: &mut Regs,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.display_start(machine, self, caller)
+    }
+
+    pub fn guest_bios_scan_line_length<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        caller: &mut Regs,
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.scan_line_length(machine, self, caller)
     }
 
     pub fn bios_palette_call<A: Arch>(
@@ -1016,12 +1101,10 @@ fn parse_vbe_mode<A: Arch>(
     let physical_base_raw = machine.read::<u32>(address + 0x28);
     let linear = attributes & 0x0080 != 0 && physical_base_raw != 0;
     let physical_base = if linear { physical_base_raw } else { 0 };
-    let linear_pitch = machine.read::<u16>(address + 0x32);
-    let pitch = if linear && linear_pitch != 0 {
-        linear_pitch
-    } else {
-        machine.read::<u16>(address + 0x10)
-    };
+    let banked_pitch = machine.read::<u16>(address + 0x10);
+    let linear_pitch_raw = machine.read::<u16>(address + 0x32);
+    let linear_pitch = if linear_pitch_raw != 0 { linear_pitch_raw } else { banked_pitch };
+    let pitch = if linear { linear_pitch } else { banked_pitch };
     let linear_fields = [
         machine.read::<u8>(address + 0x37), machine.read::<u8>(address + 0x36),
         machine.read::<u8>(address + 0x39), machine.read::<u8>(address + 0x38),
@@ -1036,9 +1119,21 @@ fn parse_vbe_mode<A: Arch>(
     let format = if memory_model == 4 && bpp == 8 {
         crate::kernel::display::FormatSpec::Indexed8
     } else {
-        crate::kernel::display::FormatSpec::Packed(
-            crate::kernel::display::PixelFormat::from_rgb(bpp.div_ceil(8), fields)?
-        )
+        let format = crate::kernel::display::PixelFormat::from_rgb(
+            bpp.div_ceil(8), fields,
+        )?;
+        let supported = match bpp {
+            15 => crate::kernel::display::PixelFormat::RGB555,
+            16 => crate::kernel::display::PixelFormat::RGB565,
+            24 => crate::kernel::display::PixelFormat::RGB888,
+            32 => crate::kernel::display::PixelFormat::NATIVE,
+            _ => return None,
+        };
+        // The software OSD renderer deliberately implements only these
+        // canonical packed layouts. An otherwise valid vendor-specific mask
+        // is not a mode RetroOS can faithfully composite.
+        if format != supported { return None; }
+        crate::kernel::display::FormatSpec::Packed(format)
     };
     let bytes_per_pixel = match format {
         crate::kernel::display::FormatSpec::Packed(format) => format.bytes_per_pixel,
@@ -1049,19 +1144,34 @@ fn parse_vbe_mode<A: Arch>(
     let window_granularity_kb = machine.read::<u16>(address + 0x04);
     let window_size_kb = machine.read::<u16>(address + 0x06);
     let window_function = machine.read::<u32>(address + 0x0C);
+    let banked_image_pages = machine.read::<u8>(address + 0x1D);
+    let linear_image_pages = machine.read::<u8>(address + 0x35);
+    let banked_bytes = u32::from(banked_pitch)
+        .checked_mul(u32::from(height))?
+        .checked_mul(u32::from(banked_image_pages) + 1)?;
+    let linear_bytes = u32::from(linear_pitch)
+        .checked_mul(u32::from(height))?
+        .checked_mul(u32::from(linear_image_pages) + 1)?;
+    let framebuffer_bytes = banked_bytes.max(linear_bytes);
     if width == 0 || height == 0 || (physical_base == 0 && window_segment == 0)
         || (physical_base == 0
             && (window_attributes & 0x05 != 0x05
                 || window_granularity_kb == 0 || window_size_kb == 0))
-        || usize::from(pitch) < usize::from(width) * usize::from(bytes_per_pixel)
+        || usize::from(banked_pitch) < usize::from(width) * usize::from(bytes_per_pixel)
+        || usize::from(linear_pitch) < usize::from(width) * usize::from(bytes_per_pixel)
+        || framebuffer_bytes as usize > 16 * 1024 * 1024
     {
         return None;
     }
     Some(crate::kernel::platform::VbeMode {
-        number, physical_base, width, height, pitch, bits_per_pixel: bpp, format,
+        number, physical_base, width, height, pitch, banked_pitch, linear_pitch,
+        bits_per_pixel: bpp, format,
         window_segment,
         window_granularity_kb,
         window_size_kb,
+        banked_image_pages,
+        linear_image_pages,
+        framebuffer_bytes,
         window_function,
     })
 }

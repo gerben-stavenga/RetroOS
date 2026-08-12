@@ -2003,6 +2003,10 @@ pub struct VgaState {
     /// AC port flip-flop + latched index. The real card's own copy is
     /// tracked by `drivers::vga_hw`.
     pub ac_state: AcState,
+    /// Whether the captured adapter could faithfully read AC index bit 5
+    /// (Palette Address Source/display enable). A software VGA always can;
+    /// deficient hardware models may require the driver's visible default.
+    pub ac_pas_valid: bool,
     /// DAC pixel-address latch (single shared index for read & write)
     pub dac_index: u8,
     /// DAC state byte from inb(0x3C7): 0x00 = write-mode, 0x03 = read-mode
@@ -2022,6 +2026,11 @@ pub struct VgaState {
     /// through; write modes 0/2/3 ALU the new value against them. Only used on
     /// the trapped planar write path (see `vram_write`/`vram_read`).
     pub latches: [u8; 4],
+    /// Whether `latches` came from the live card/model rather than the
+    /// zero-filled construction fallback. Emulated reads make it valid;
+    /// hardware capture does so only when the card or firmware checkpoint
+    /// provides an exact extraction path.
+    pub latches_valid: bool,
     // ── VESA SVGA (banked) ──
     /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
     /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
@@ -2070,12 +2079,14 @@ impl VgaState {
             core::ptr::addr_of_mut!((*p).crtc_index).write(0);
             core::ptr::addr_of_mut!((*p).gc_index).write(0);
             core::ptr::addr_of_mut!((*p).ac_state).write(AcState::new());
+            core::ptr::addr_of_mut!((*p).ac_pas_valid).write(true);
             core::ptr::addr_of_mut!((*p).dac_index).write(0);
             core::ptr::addr_of_mut!((*p).dac_state).write(0);
             core::ptr::addr_of_mut!((*p).dac_read_index).write(0);
             core::ptr::addr_of_mut!((*p).dac_rsub).write(0);
             core::ptr::addr_of_mut!((*p).dac_wsub).write(0);
             core::ptr::addr_of_mut!((*p).latches).write([0; 4]);
+            core::ptr::addr_of_mut!((*p).latches_valid).write(true);
             core::ptr::addr_of_mut!((*p).svga_w).write(0);
             core::ptr::addr_of_mut!((*p).svga_h).write(0);
             core::ptr::addr_of_mut!((*p).svga_bpp).write(0);
@@ -2153,12 +2164,14 @@ impl VgaState {
             crtc_index: 0,
             gc_index: 0,
             ac_state: AcState::new(),
+            ac_pas_valid: true,
             dac_index: 0,
             dac_state: 0,
             dac_read_index: 0,
             dac_rsub: 0,
             dac_wsub: 0,
             latches: [0; 4],
+            latches_valid: true,
             svga_w: 0,
             svga_h: 0,
             svga_bpp: 0,
