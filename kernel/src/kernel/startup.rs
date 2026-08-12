@@ -117,6 +117,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     crate::kernel::drivers::hda::configure_output_route(
         crate::kernel::dos::config_var(&master_env, b"HDA_OUTPUT"),
     );
+    crate::kernel::osd::configure_master_volume(
+        crate::kernel::dos::config_var(&master_env, b"AUDIO_VOLUME"),
+    );
     let sb_audio = crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
         .map(alloc::vec::Vec::from)
         .unwrap_or_default();
