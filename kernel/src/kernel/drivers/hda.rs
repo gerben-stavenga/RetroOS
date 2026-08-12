@@ -203,6 +203,38 @@ static OUTPUT_ROUTE_PENDING: AtomicBool = AtomicBool::new(false);
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+fn parse_output_route(raw: &[u8]) -> Option<OutputRoute> {
+    if raw.eq_ignore_ascii_case(b"Speaker") {
+        Some(OutputRoute::Speaker)
+    } else if raw.eq_ignore_ascii_case(b"Jack") {
+        Some(OutputRoute::Jack)
+    } else if raw.eq_ignore_ascii_case(b"Headphone") {
+        Some(OutputRoute::Headphone)
+    } else {
+        None
+    }
+}
+
+pub fn configure_output_route(raw: Option<&[u8]>) {
+    let route = match raw {
+        None => OutputRoute::Speaker,
+        Some(value) => match parse_output_route(value) {
+            Some(route) => route,
+            None => {
+                OUTPUT_ROUTE.store(DEFAULT_OUTPUT_ROUTE as u8, Ordering::Relaxed);
+                OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
+                crate::println!(
+                    "hda: invalid HDA_OUTPUT={}",
+                    core::str::from_utf8(value).unwrap_or("<non-UTF8>")
+                );
+                return;
+            }
+        },
+    };
+    OUTPUT_ROUTE.store(route as u8, Ordering::Relaxed);
+    OUTPUT_ROUTE_PENDING.store(route != DEFAULT_OUTPUT_ROUTE, Ordering::Relaxed);
+}
+
 pub fn output_route_label() -> &'static [u8] {
     OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed)).label()
 }
@@ -1642,6 +1674,20 @@ mod tests {
         assert_eq!(OutputRoute::Speaker.next(false), OutputRoute::Headphone);
         assert_eq!(OutputRoute::Headphone.next(false), OutputRoute::Jack);
         assert_eq!(OutputRoute::Jack.next(false), OutputRoute::Speaker);
+    }
+
+    #[test]
+    fn output_route_parser_accepts_canonical_and_mixed_case_values() {
+        assert_eq!(parse_output_route(b"Speaker"), Some(OutputRoute::Speaker));
+        assert_eq!(parse_output_route(b"jAcK"), Some(OutputRoute::Jack));
+        assert_eq!(parse_output_route(b"HEADPHONE"), Some(OutputRoute::Headphone));
+    }
+
+    #[test]
+    fn output_route_parser_rejects_non_values() {
+        for value in [b"".as_slice(), b"Auto", b"1", b" Speaker", b"Jack ", b"Headphones", b"speaker=foo"] {
+            assert_eq!(parse_output_route(value), None);
+        }
     }
 
     #[test]
