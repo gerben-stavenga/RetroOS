@@ -149,7 +149,7 @@ fn parse_volume_percent(raw: &[u8]) -> Option<u32> {
         }
         value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
     }
-    (value <= VOL_MAX && value % VOL_STEP == 0).then_some(value)
+    (value <= VOL_MAX && value.is_multiple_of(VOL_STEP)).then_some(value)
 }
 
 pub fn configure_master_volume(raw: Option<&[u8]>) {
