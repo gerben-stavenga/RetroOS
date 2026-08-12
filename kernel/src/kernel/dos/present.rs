@@ -219,7 +219,7 @@ fn scanout<'a, A: crate::Arch>(
             if super::machine::vga::trapped_aperture(state).is_some() {
                 scratch.resize(0x4000, 0);
                 let layout = state.layout();
-                for address in 0..0x4000 {
+                for (address, byte) in scratch.iter_mut().enumerate() {
                     let (plane, offset) = if matches!(mode, VgaMode::Cga4) {
                         // Modes 4/5 scan the same odd/even plane-0/1 stream
                         // that the CPU sees at B8000.
@@ -228,7 +228,7 @@ fn scanout<'a, A: crate::Arch>(
                         // Mode 6 is sequential plane 0 (SEQ map mask = 1).
                         (0, address)
                     };
-                    scratch[address] = machine.read(
+                    *byte = machine.read(
                         VGA_VRAM_BASE + layout.index(plane, offset),
                     );
                 }

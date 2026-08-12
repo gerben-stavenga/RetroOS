@@ -16,7 +16,10 @@ run_program() {
     local name="$1" command="$2" log="$tmp_dir/$1.log"
     echo "=== $name ==="
 
-    timeout 35s qemu-system-i386 \
+    # The guest may remain interactive after reporting success.  The harness
+    # must therefore terminate QEMU, and must escalate if QEMU does not
+    # handle SIGTERM promptly.
+    timeout --kill-after=5s 35s qemu-system-i386 \
         -m 512 -cpu pentium3 \
         -cdrom bazel-bin/retroos_grub_module.iso \
         -boot order=d \

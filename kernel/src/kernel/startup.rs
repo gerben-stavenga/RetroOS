@@ -114,6 +114,12 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
     let master_env = load_master_env();
+    crate::kernel::drivers::hda::configure_output_route(
+        crate::kernel::dos::config_var(&master_env, b"HDA_OUTPUT"),
+    );
+    crate::kernel::osd::configure_master_volume(
+        crate::kernel::dos::config_var(&master_env, b"AUDIO_VOLUME"),
+    );
     let sb_audio = crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
         .map(alloc::vec::Vec::from)
         .unwrap_or_default();
@@ -1448,8 +1454,8 @@ pub fn bill_audio_service(sb: u64, gus: u64, mpu: u64) {
 pub fn bill_audio_sources(parts: [u64; 4]) {
     unsafe {
         let p = &raw mut AUDIO_SOURCE_PARTS;
-        for i in 0..4 {
-            (*p)[i] = (*p)[i].wrapping_add(parts[i]);
+        for (i, part) in parts.into_iter().enumerate() {
+            (*p)[i] = (*p)[i].wrapping_add(part);
         }
     }
 }

@@ -61,18 +61,24 @@ const SYSTEM_NUM_ITEMS: usize = 2;
 const SOUND_ITEM_VOLUME: usize = 0;
 const SOUND_ITEM_LATENCY: usize = 1;
 const SOUND_ITEM_RATE: usize = 2;
-const SOUND_NUM_ITEMS: usize = 3;
+const SOUND_ITEM_HDA_OUTPUT: usize = 3;
+const SOUND_NUM_ITEMS_BASE: usize = 3;
+const SOUND_NUM_ITEMS_WITH_HDA_OUTPUT: usize = 4;
 
 const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
 const DEBUG_ITEM_DUMP: usize = 2;
 const DEBUG_NUM_ITEMS: usize = 3;
 
-/// Master volume as a percentage of unity, adjusted by ◄/► on the Volume row.
-/// 100 = unity (the level the per-source scales already balance to); attenuate
-/// only — a boost above unity would just clip against the mix-out rail.
+/// Master volume step, adjusted by ◄/► on the Volume row. The displayed
+/// percentage selects a perceptual gain step; 100 is unity.
 const VOL_MAX: u32 = 100;
 const VOL_STEP: u32 = 10;
+const DEFAULT_VOLUME_PCT: u32 = 50;
+const VOLUME_GAIN_Q16: [i32; 11] = [
+    0, 1039, 1646, 2609, 4135, 6554,
+    10387, 16462, 26090, 41350, 65536,
+];
 const LATENCY_MIN_MS: u32 = 10;
 const LATENCY_MAX_MS: u32 = 80;
 const LATENCY_STEP_MS: u32 = 5;
@@ -83,7 +89,7 @@ static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
-static VOL_PCT: AtomicU32 = AtomicU32::new(100);
+static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
 
@@ -124,7 +130,43 @@ pub fn dismiss() {
 /// The master output gain in Q16, read by the mixer pump. Unity (65536) at
 /// 100%; scales the summed mix just before its single clip.
 pub fn master_gain_q16() -> i32 {
-    (VOL_PCT.load(Ordering::Relaxed) as i32 * 65536 / 100).max(0)
+    volume_gain_q16(VOL_PCT.load(Ordering::Relaxed))
+}
+
+fn volume_gain_q16(percent: u32) -> i32 {
+    let index = (percent / VOL_STEP) as usize;
+    VOLUME_GAIN_Q16[index.min(VOLUME_GAIN_Q16.len() - 1)]
+}
+
+fn parse_volume_percent(raw: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    if raw.is_empty() {
+        return None;
+    }
+    for &byte in raw {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    (value <= VOL_MAX && value.is_multiple_of(VOL_STEP)).then_some(value)
+}
+
+pub fn configure_master_volume(raw: Option<&[u8]>) {
+    let value = match raw {
+        None => DEFAULT_VOLUME_PCT,
+        Some(raw) => match parse_volume_percent(raw) {
+            Some(value) => value,
+            None => {
+                crate::println!(
+                    "audio: invalid AUDIO_VOLUME={}",
+                    core::str::from_utf8(raw).unwrap_or("<non-UTF8>")
+                );
+                DEFAULT_VOLUME_PCT
+            }
+        },
+    };
+    VOL_PCT.store(value, Ordering::Relaxed);
 }
 
 /// Requested physical output latency. The sink rounds this up to its active
@@ -152,7 +194,7 @@ fn active_sel(tab: usize) -> usize {
 
 fn set_active_sel(tab: usize, sel: usize) {
     match tab {
-        TAB_SOUND => SOUND_SEL.store(sel.min(SOUND_NUM_ITEMS - 1), Ordering::Relaxed),
+        TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
         _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
     }
@@ -160,10 +202,21 @@ fn set_active_sel(tab: usize, sel: usize) {
 
 fn active_item_count(tab: usize) -> usize {
     match tab {
-        TAB_SOUND => SOUND_NUM_ITEMS,
+        TAB_SOUND => sound_item_count(),
         TAB_DEBUG => DEBUG_NUM_ITEMS,
         _ => SYSTEM_NUM_ITEMS,
     }
+}
+
+fn sound_item_count_for(audio: crate::kernel::platform::Audio) -> usize {
+    match audio {
+        crate::kernel::platform::Audio::EmulatedHda => SOUND_NUM_ITEMS_WITH_HDA_OUTPUT,
+        _ => SOUND_NUM_ITEMS_BASE,
+    }
+}
+
+fn sound_item_count() -> usize {
+    sound_item_count_for(crate::kernel::platform::get().audio)
 }
 
 fn active_tab_name(tab: usize) -> &'static [u8] {
@@ -369,6 +422,7 @@ fn adjust(up: bool) {
             };
             LATENCY_MS.store(next, Ordering::Relaxed);
         }
+        SOUND_ITEM_HDA_OUTPUT => crate::kernel::drivers::hda::cycle_output_route(up),
         _ => {}
     }
 }
@@ -679,6 +733,10 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                 line.put(b"Mix rate ");
                 line.put_rate_q16(crate::kernel::sound::mixing_rate_q16());
             }
+            SOUND_ITEM_HDA_OUTPUT => {
+                line.put(b"HDA out  ");
+                line.put(crate::kernel::drivers::hda::output_route_label());
+            }
             _ => {}
         },
         TAB_DEBUG => match item {
@@ -762,5 +820,64 @@ impl Line {
     }
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sound_item_count_is_conditional_on_hda() {
+        use crate::kernel::platform::Audio;
+
+        assert_eq!(sound_item_count_for(Audio::EmulatedHda), 4);
+        assert_eq!(sound_item_count_for(Audio::NativeSb), 3);
+        assert_eq!(sound_item_count_for(Audio::SbSink), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedAc97), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedPortWindow), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedSilent), 3);
+    }
+
+    #[test]
+    fn volume_gain_uses_the_perceptual_table() {
+        assert_eq!(DEFAULT_VOLUME_PCT, 50);
+        for (index, &gain) in VOLUME_GAIN_Q16.iter().enumerate() {
+            assert_eq!(volume_gain_q16((index as u32) * VOL_STEP), gain);
+        }
+        assert_eq!(volume_gain_q16(0), 0);
+        assert_eq!(volume_gain_q16(100), 65_536);
+        assert_eq!(volume_gain_q16(101), 65_536);
+        for pair in VOLUME_GAIN_Q16.windows(2) {
+            assert!(pair[0] < pair[1]);
+        }
+    }
+
+    #[test]
+    fn volume_parser_accepts_only_displayed_steps() {
+        for (text, value) in [
+            (b"0".as_slice(), 0),
+            (b"10".as_slice(), 10),
+            (b"20".as_slice(), 20),
+            (b"30".as_slice(), 30),
+            (b"40".as_slice(), 40),
+            (b"50".as_slice(), 50),
+            (b"60".as_slice(), 60),
+            (b"70".as_slice(), 70),
+            (b"80".as_slice(), 80),
+            (b"90".as_slice(), 90),
+            (b"100".as_slice(), 100),
+        ] {
+            assert_eq!(parse_volume_percent(text), Some(value));
+        }
+        assert_eq!(parse_volume_percent(b"00"), Some(0));
+        assert_eq!(parse_volume_percent(b"050"), Some(50));
+        assert_eq!(parse_volume_percent(b"0100"), Some(100));
+        for value in [
+            b"".as_slice(), b"+50", b"-50", b" 50", b"50 ", b"50%", b"55", b"110",
+            b"abc", b"999999999999999999999999999999",
+        ] {
+            assert_eq!(parse_volume_percent(value), None);
+        }
     }
 }

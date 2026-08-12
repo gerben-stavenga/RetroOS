@@ -133,14 +133,11 @@ impl EmulatedVga {
         // Native ownership means the complete VGA aperture is physical in the
         // incoming DOS address space, including B8000 text memory.
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
-        if let VideoResume::Vbe { mode, request, bank, display_start, logical_pitch } = self.resume
+        if let VideoResume::Vbe { request, .. } = self.resume
             && self.state.svga_w != 0
         {
             native.bios_set_mode_request(machine, &mut *bios, request);
-            restore_native_vbe(
-                machine, bios, &mut native, mode,
-                request & 0x4000 == 0, &self.state, bank,
-                display_start, logical_pitch);
+            restore_native_vbe(machine, bios, &mut native, self.resume, &self.state);
             if let Some(physical_base) = self.physical_lfb {
                 machine.redirect_physical_aliases(
                     u64::from(physical_base) >> 12,
@@ -659,13 +656,13 @@ fn restore_native_vbe<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    mode: crate::kernel::platform::VbeMode,
-    banked: bool,
+    resume: VideoResume,
     state: &VgaState,
-    bank: Option<u16>,
-    display_start: (u16, u16),
-    logical_pitch: u16,
 ) {
+    let VideoResume::Vbe { mode, request, bank, display_start, logical_pitch } = resume else {
+        unreachable!("legacy VGA state passed to VBE restore")
+    };
+    let banked = request & 0x4000 == 0;
     let native_pitch = if banked { mode.banked_pitch } else { mode.linear_pitch };
     if logical_pitch != native_pitch {
         let mut regs = Regs::empty();

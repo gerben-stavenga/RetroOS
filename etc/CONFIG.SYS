@@ -11,6 +11,10 @@ PATH=C:\;C:\BOOT;C:\TC;C:\BORLANDC\BIN
 # buys wavetable GUS/GM music on an SB-only machine if the CPU can spare it.
 # Machines without a real SB (HDA/AC'97) always mix and ignore this.
 SB_AUDIO=native
+# HDA output preference: Speaker, Jack, or Headphone.
+HDA_OUTPUT=Speaker
+# Kernel-mixed master volume: 0 to 100 in steps of 10.
+AUDIO_VOLUME=50
 
 ADLIB=A388
 BLASTER=A220 I7 D1 H5 P330 T6
