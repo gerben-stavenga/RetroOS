@@ -180,10 +180,12 @@ const DEFAULT_RATE: u32 = 44_100;
 
 /// One span the source clock asks the active personality to advance and mix.
 pub struct AudioSpan<'a> {
-    /// Effective output frames per CPU second. This is gently trimmed around
-    /// the device's nominal rate to hold the physical pipe at its target
-    /// depth; sources use it for incremental phase, so their frequencies stay
-    /// expressed in the CPU clock while the sample density changes.
+    /// Output frames per second a source expresses its phase against: the
+    /// pacer's learned consumption rate `s`, i.e. the DAC's true steady rate.
+    /// It deliberately is *not* the effective, latency-trimmed rate — that one
+    /// swings with the queue and would bend every source's pitch as the loop
+    /// hunts. The per-pump frame *count* still rides the trimmed rate (see
+    /// [`advance`]); only the pitch timebase is pinned here so tuning holds.
     pub rate: u32,
     pub base_frame: u64,
     pub frames: &'a mut [(i32, i32)],
@@ -306,7 +308,25 @@ pub fn advance<A: crate::Arch>(
 
     let gain_q16 = sink.as_ref().map(|_| crate::kernel::osd::master_gain_q16());
     let setup_end = if prof { machine.rdtsc() } else { 0 };
-    let mix_rate = (rate_q16 >> RATE_FP_SHIFT) as u32;
+    // Two different rates come out of the controller, and conflating them is
+    // what detunes the mix. `rate_q16` is the effective rate `s - 2w q`: it
+    // carries the dashpot's queue-noise on purpose, and its job is to set how
+    // many frames this pump produces so the pipe holds its latency target.
+    // Source *phase*, though, must be expressed against the DAC's true
+    // consumption rate — the fixed hardware clock every produced frame is
+    // ultimately played out at. A source resamples its voices by
+    // `voice_rate / mix_rate` and the DAC replays the result at `c'`, so the
+    // audible pitch is `voice_rate * c' / mix_rate`; feeding it the swinging
+    // `rate_q16` bends every pitch by `c'/rate_q16` as the loop hunts. The
+    // pacer's `s` is exactly the learned, dashpot-free estimate of `c'`, so it
+    // is the timebase pitch must ride — the frame count still varies to fix
+    // latency, but the DMA cursor that count drives only fluctuates within a
+    // fraction of a percent and averages back onto the guest's programmed rate.
+    let pitch_rate_q16 = sink
+        .as_ref()
+        .map(|o| o.producer.s_q16())
+        .unwrap_or(u64::from(DEFAULT_RATE) << RATE_FP_SHIFT);
+    let mix_rate = (pitch_rate_q16 >> RATE_FP_SHIFT) as u32;
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
     let mut base = clock.produced_frames();
     let mut remaining = clock.produce(rate_q16, elapsed_ms);
