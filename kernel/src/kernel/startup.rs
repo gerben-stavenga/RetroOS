@@ -106,7 +106,8 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .iter()
         .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
         .collect();
-    mount_filesystems(&parts, platform.hostfs, &mut screen);
+    let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
+    mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
 
     // CONFIG.SYS is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
@@ -289,6 +290,7 @@ fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
+    modules: crate::multiboot::ModuleMountSummary,
 ) {
     use crate::kernel::block::partition::PartKind;
 
@@ -301,10 +303,17 @@ fn mount_filesystems(
         .filter(crate::kernel::fs::lwext4::is_ext)
         .collect();
 
-    if ext.is_empty() {
-        // No disk filesystem: the host fs IS the root if we have one. With
-        // neither disk nor host fs there is no root at all — and therefore no
-        // C:\BOOT, since it is just a directory on C:.
+    if modules.has_root {
+        // A Multiboot root owns `/`; physical filesystems remain available as
+        // read-only fallback mounts below `/diskN`.
+        crate::multiboot::mount_physical_fallbacks(
+            &ext, modules.next_ext_slot, MAX_EXT_MOUNTS, screen);
+        if hostfs {
+            vfs::mount(b"host/", host_fs());
+            crate::screenln!(screen, "hostfs mounted at /host");
+        }
+    } else if ext.is_empty() {
+        // No module or disk filesystem: the host fs is the root if available.
         if hostfs {
             vfs::mount(b"", host_fs());
             crate::screenln!(screen, "hostfs mounted as root");
@@ -312,7 +321,7 @@ fn mount_filesystems(
     } else {
         let root = root_index(&ext);
         crate::screenln!(screen, "ext4 root ({} MB)", ext[root].sectors / 2048);
-        match Lwext4Fs::new(ext[root], 0, MountMode::ReadWrite) {
+        match Lwext4Fs::new(ext[root], modules.next_ext_slot, MountMode::ReadWrite) {
             Ok(fs) => {
                 let fs: &'static dyn vfs::Filesystem =
                     alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
@@ -328,7 +337,7 @@ fn mount_filesystems(
         // Every other ext filesystem mounts read-only at /disk1, /disk2, …
         // (Linux-visible, not under C:). An unreadable one is logged and
         // skipped, never fatal — the root is already up.
-        let mut slot = 0usize;
+        let mut slot = modules.next_ext_slot;
         for (i, &vol) in ext.iter().enumerate() {
             if i == root {
                 continue;

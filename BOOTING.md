@@ -152,6 +152,37 @@ since a real Pentium with a PIIX4 is a first-class RetroOS target and the
 likeliest machine to be holding someone's data. Only the owner knows, so only
 the owner says.
 
+## Booting GRUB Multiboot module images
+
+For a diskless boot, build `//:grub_module_iso`. Its GRUB menu contains a
+base-only entry and a base-plus-games entry. The module artifacts are raw ext4
+images, not partitioned disks; GRUB expands the reproducible gzip files before
+the Multiboot handoff:
+
+```text
+multiboot /boot/kernel.elf
+module /boot/retroos-base.img.gz retroos.mount=/
+module /boot/retroos-games.img.gz retroos.mount=/home/retroos/GAMES
+boot
+```
+
+The only module declaration is `retroos.mount=<absolute-vfs-path>`. Modules
+use replacement mounts, and the boot log derives the displayed volume identity
+from that path. Each module has its own volatile RAM overlay; physical ext4
+fallback filesystems remain read-only at `/disk1`, `/disk2`, and so on.
+
+Module images remain resident in the physical RAM where GRUB loaded them, but
+they are not permanently mapped into a size-matched kernel virtual window.
+Reads use a reusable 64 KiB physical aperture immediately below the
+framebuffer. Legacy 32-bit paging and PAE both support module reads; available
+physical RAM and the Multiboot address format remain the practical limits.
+Boot directly with QEMU, for example:
+
+```sh
+bazelisk build //:grub_module_iso
+qemu-system-i386 -cdrom bazel-bin/retroos_grub_module.iso
+```
+
 ## Booting from a GRUB hard disk (`//:image_grub`)
 
 This is for a *self-contained* disk — one you write to a spare drive or a USB

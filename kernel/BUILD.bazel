@@ -1,5 +1,5 @@
 # Build kernel using rules_rust and rules_nasm
-load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
 
@@ -72,6 +72,18 @@ rust_library(
             "@crates//:spin",
         ],
     }),
+)
+
+# Host unit coverage for the Multiboot capsule and its pure parser/storage
+# tests. The metal-only boot entry remains cfg-gated out of this test.
+rust_test(
+    name = "kernel_unit_test",
+    crate = ":kernel",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
 )
 
 # ============================================================================
