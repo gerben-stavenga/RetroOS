@@ -379,63 +379,28 @@ pub fn is_standard_text(device: &DisplayedVga) -> bool {
 /// and fill it from suspended state, or mark it trapped when writes must
 /// go through the planar ALU. Needs an address space, so it is not the card's.
 fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut A) {
-    use ::vga::VgaMode;
     if state.planes.len() != PLANES_LEN {
         state.planes.resize(PLANES_LEN, 0);
     }
     machine.map_fresh_range(VGA_VRAM_BASE >> 12, PLANES_LEN >> 12);
-    match state.classify_mode() {
-        Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
-            write_live_planes(machine, &state.planes);
-            map_trapped_aperture(machine, state);
-        }
-        Some(VgaMode::Mode13h) => {
-            ::vga::chain4_munge(&mut state.planes);
-            write_live_planes(machine, &state.planes);
-            map_direct_aperture(machine, state, 16);
-        }
-        Some(VgaMode::Text { .. }) => {
-            ::vga::text_odd_even_munge(&mut state.planes);
-            write_live_planes(machine, &state.planes);
-            map_direct_aperture(machine, state, 8);
-        }
-        Some(VgaMode::Cga4) => {
-            ::vga::cga4_munge(&mut state.planes);
-            write_live_planes(machine, &state.planes);
-            map_direct_aperture(machine, state, 4);
-        }
-        Some(VgaMode::Cga2) => {
-            write_live_planes(machine, &state.planes);
-            map_direct_aperture(machine, state, 4);
-        }
-        Some(VgaMode::LinearSvga { .. }) => {
-            write_live_planes(machine, &state.planes);
-            machine.copy_page_entries(
-                (SVGA_LFB_BASE >> 12) + usize::from(state.svga_bank) * WINDOW_PAGES,
-                A0000 >> 12,
-                WINDOW_PAGES,
-            );
-        }
-        None => {
-            write_live_planes(machine, &state.planes);
-        }
+    let planes = core::mem::take(&mut state.planes);
+    write_live_planes(machine, &planes);
+    if state.svga_w != 0 {
+        machine.copy_page_entries(
+            (SVGA_LFB_BASE >> 12) + usize::from(state.svga_bank) * WINDOW_PAGES,
+            A0000 >> 12,
+            WINDOW_PAGES,
+        );
+    } else {
+        install_aperture(machine, state.cpu_aperture());
     }
-    // A live emulated VGA owns page-backed VRAM, never a shadow Vec.
-    state.planes.clear();
+    // A live emulated VGA owns page-backed VRAM, never a shadow Vec. `planes`
+    // drops here after its representation has been recorded by VgaState.
 }
 
 /// The reverse: read the guest's aperture back into the planes.
 fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut A) {
-    use ::vga::VgaMode;
     state.planes = read_live_planes(machine);
-    match state.classify_mode() {
-        Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {}
-        Some(VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut state.planes),
-        Some(VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut state.planes),
-        Some(VgaMode::Cga4) => ::vga::cga4_unmunge(&mut state.planes),
-        Some(VgaMode::Cga2) => {}
-        Some(VgaMode::LinearSvga { .. }) | None => {}
-    }
 }
 
 
@@ -452,55 +417,23 @@ fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut
 // (chain4 split/merge). Interp and metal use the same trap marker contract.
 
 
-/// The emulated VGA's plane memory: 4 planes × 64 KB, byte (plane `p`, offset
-/// `off`) at `[p*0x10000 + off]`. Lives per-thread on `VgaState::planes` (the
+/// The emulated VGA's complete 4-plane memory. `VgaState::layout()` maps
+/// logical `(plane, offset)` to its physical byte. It lives per-thread on
+/// `VgaState::planes` (the
 /// focus-owned model) — the same buffer `vga_hw::save` fills for a real
 /// card — so the planar trap and the renderer touch it directly, no global and
 /// no per-frame copy.
 const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
-fn decoded_aperture(gc6: u8) -> core::ops::Range<u16> {
-    match (gc6 >> 2) & 3 {
-        0 => 0xA0..0xC0,
-        1 => 0xA0..0xB0,
-        2 => 0xB0..0xB8,
-        _ => 0xB8..0xC0,
-    }
-}
-
-fn trapped_aperture_for(seq4: u8, gc6: u8, svga_w: u16) -> Option<core::ops::Range<u16>> {
-    if svga_w != 0 || seq4 & 0x0C != 0x04 {
-        return None;
-    }
-    Some(decoded_aperture(gc6))
-}
 
 /// Guest page range whose CPU accesses must pass through the emulated VGA's
-/// planar ALU. This is derived entirely from the authoritative register file;
-/// native VGA never uses it because the physical adapter performs the routing.
+/// planar ALU. The card derives this together with its VRAM layout.
 pub fn trapped_aperture(vga: &VgaState) -> Option<core::ops::Range<u16>> {
-    trapped_aperture_for(vga.seq[4], vga.gc[6], vga.svga_w)
-}
-
-fn map_trapped_aperture<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
-    if let Some(pages) = trapped_aperture(vga) {
-        machine.map_phys_range(
-            usize::from(pages.start),
-            usize::from(pages.end - pages.start),
-            0,
-            arch_abi::MAP_MMIO,
-        );
+    match vga.cpu_aperture() {
+        ::vga::CpuAperture::Trapped { range } =>
+            Some(range.start_page..range.end_page),
+        _ => None,
     }
-}
-
-fn map_direct_aperture<A: crate::Arch>(machine: &mut A, vga: &VgaState, max_pages: usize) {
-    let pages = decoded_aperture(vga.gc[6]);
-    let count = usize::from(pages.end - pages.start).min(max_pages);
-    machine.copy_page_entries(
-        VGA_VRAM_BASE >> 12,
-        usize::from(pages.start),
-        count,
-    );
 }
 /// Private, per-address-space backing of the emulated card's four VRAM planes.
 /// CPU apertures alias pages from here; this is the one live pixel store.
@@ -516,125 +449,67 @@ fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
     machine.copy_to(VGA_VRAM_BASE, planes);
 }
 
-/// React to a Sequencer register write (port 0x3C5) that may change the
-/// chain-4 mode or the plane-select mask. Drives the GC[6]-selected aperture.
-/// `pc.vga` already holds the post-write register values.
-pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, old_seq4: u8) {
-    // A real card does its own plane routing.
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
-    let vga = &mut dev.state;
-    let old = trapped_aperture_for(old_seq4, vga.gc[6], vga.svga_w);
-    let new = trapped_aperture(vga);
-    match (old, new) {
-        (None, Some(_)) => {
-            // Entering from text must undo B800 odd/even packing; entering
-            // from mode 13h must undo chain-4. They are different layouts.
-            let source = if vga.gc[6] & 0x01 == 0 {
-                PlanarSource::TextOddEven
-            } else if vga.gc[5] & 0x40 != 0 {
-                PlanarSource::Chain4
-            } else {
-                PlanarSource::Canonical
-            };
-            arm_planar(machine, vga, source);
-        }
-        (Some(_), None) => disarm_planar(machine, vga),
-        _ => {}
+fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> {
+    match aperture {
+        ::vga::CpuAperture::Direct { range, .. }
+        | ::vga::CpuAperture::Trapped { range } => Some(range),
+        ::vga::CpuAperture::None => None,
     }
 }
 
-/// GC Miscellaneous register (index 6) selects which legacy address window
-/// the VGA decodes. Programs are free to program it before or after switching
-/// the sequencer to sequential-plane access. Keep the MMIO trap on the newly
-/// selected window in either order; leaving it on the old text window loses
-/// plane-2 font writes (Impulse Tracker does this ordering).
-pub fn on_gc_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, old_gc6: u8) {
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
-    let vga = &mut dev.state;
-    let old = trapped_aperture_for(vga.seq[4], old_gc6, vga.svga_w);
-    let new = trapped_aperture(vga);
-    if old == new {
+fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuAperture) {
+    match aperture {
+        ::vga::CpuAperture::None => {}
+        ::vga::CpuAperture::Direct { range, pages } => machine.copy_page_entries(
+            VGA_VRAM_BASE >> 12,
+            usize::from(range.start_page),
+            usize::from(pages.min(range.end_page - range.start_page)),
+        ),
+        ::vga::CpuAperture::Trapped { range } => machine.map_phys_range(
+            usize::from(range.start_page),
+            usize::from(range.end_page - range.start_page),
+            0,
+            arch_abi::MAP_MMIO,
+        ),
+    }
+}
+
+fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite) {
+    if write.old_aperture == write.new_aperture {
         return;
     }
-
-    // The old aperture contains no independent bytes while trapped: the
-    // canonical image is in VGA_VRAM_BASE. Restore ordinary guest RAM beneath
-    // it, then place the device trap over the newly selected decode window.
-    if let Some(old) = old {
+    // Remove the complete old view even when the decoded range did not move.
+    // A direct view can shrink (16 pages to 8), or change into a trap over the
+    // same range; merely installing the new prefix would leave stale aliases.
+    if let Some(old) = aperture_range(write.old_aperture) {
         machine.map_fresh_range(
-            usize::from(old.start), usize::from(old.end - old.start));
+            usize::from(old.start_page),
+            usize::from(old.end_page - old.start_page),
+        );
     }
-    map_trapped_aperture(machine, vga);
+    install_aperture(machine, write.new_aperture);
 }
 
-/// Map the GC[6]-selected VGA window as MMIO (present=0 + trap marker) so every
-/// guest access reaches the planar ALU. Graphics normally selects A0000, while
-/// text character-generator access may select B0000 or B8000.
-#[derive(Clone, Copy)]
-enum PlanarSource {
-    Canonical,
-    Chain4,
-    TextOddEven,
-}
-
-fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, source: PlanarSource) {
-    let mut planes = read_live_planes(machine);
-    match source {
-        PlanarSource::Canonical => {}
-        PlanarSource::Chain4 => ::vga::chain4_unmunge(&mut planes),
-        PlanarSource::TextOddEven => ::vga::text_odd_even_unmunge(&mut planes),
+/// One complete VGA port operation: `lib/vga` updates registers and VRAM
+/// representation together; the kernel merely applies its returned mapping.
+pub fn port_write<A: crate::Arch>(
+    machine: &mut A,
+    state: &mut VgaState,
+    port: u16,
+    value: u8,
+) {
+    let write = state.port_write(port, value);
+    if let Some(transition) = write.vram_transition {
+        let mut planes = read_live_planes(machine);
+        transition.apply(&mut planes);
+        write_live_planes(machine, &planes);
     }
-    write_live_planes(machine, &planes);
-    map_trapped_aperture(machine, vga);
-}
-
-/// Leave planar access for chain-4: munge the one VRAM store and alias its
-/// first 64K through the GC[6]-selected linear aperture.
-fn disarm_planar_to_chain4<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
-    let mut planes = read_live_planes(machine);
-    ::vga::chain4_munge(&mut planes);
-    write_live_planes(machine, &planes);
-    map_direct_aperture(machine, vga, 16);
-}
-
-/// Return from sequential plane/font access to the text odd/even view.
-fn disarm_planar_to_text<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
-    let mut planes = read_live_planes(machine);
-    ::vga::text_odd_even_munge(&mut planes);
-    write_live_planes(machine, &planes);
-    map_direct_aperture(machine, vga, 8);
-}
-
-fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
-    match vga.classify_mode() {
-        Some(::vga::VgaMode::Text { .. }) => disarm_planar_to_text(machine, vga),
-        Some(::vga::VgaMode::Cga4) => {
-            let mut planes = read_live_planes(machine);
-            ::vga::cga4_munge(&mut planes);
-            write_live_planes(machine, &planes);
-            map_direct_aperture(machine, vga, 4);
-        }
-        Some(::vga::VgaMode::Cga2) => {
-            map_direct_aperture(machine, vga, 4);
-        }
-        // Chain-4 is also the safest direct representation for an unknown
-        // tweaked graphics state: unlike a stale MMIO marker it remains a
-        // usable VGA aperture while subsequent register writes converge.
-        Some(::vga::VgaMode::Mode13h) | None => disarm_planar_to_chain4(machine, vga),
-        Some(::vga::VgaMode::Planar16 { .. } | ::vga::VgaMode::ModeX { .. }
-            | ::vga::VgaMode::LinearSvga { .. }) => {}
-    }
+    apply_aperture_write(machine, write);
 }
 
 /// BIOS character-generator services operate on plane 2 regardless of the
-/// CPU-visible text odd/even layout. Normalize the live page-backed image,
-/// update the requested 8-KB map, then restore its current layout.
+/// CPU-visible layout. The font service addresses logical plane 2 directly;
+/// no representation transition is needed for a trapped operation.
 pub fn bios_load_font<A: crate::Arch>(
     machine: &mut A,
     device: &mut DisplayedVga,
@@ -648,21 +523,15 @@ pub fn bios_load_font<A: crate::Arch>(
         DisplayedVga::Native(_) => return,
     };
     let vga = &mut dev.state;
-    let mode = vga.classify_mode();
     let mut planes = read_live_planes(machine);
-    match mode {
-        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut planes),
-        Some(::vga::VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut planes),
-        Some(::vga::VgaMode::Cga4) => ::vga::cga4_unmunge(&mut planes),
-        _ => {}
-    }
-    ::vga::load_font_glyphs(&mut planes, map, first, font, glyph_h);
-    match mode {
-        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_munge(&mut planes),
-        Some(::vga::VgaMode::Mode13h) => ::vga::chain4_munge(&mut planes),
-        Some(::vga::VgaMode::Cga4) => ::vga::cga4_munge(&mut planes),
-        _ => {}
-    }
+    ::vga::load_font_glyphs(
+        &mut planes,
+        vga.layout(),
+        map,
+        first,
+        font,
+        glyph_h,
+    );
     write_live_planes(machine, &planes);
 }
 
@@ -966,13 +835,10 @@ pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     dev.svga_pages = 0;
 }
 
-/// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
-/// family (0x0D–0x12, e.g. Commander Keen) draws through the 4 planes via the
-/// map mask + write modes exactly like Mode X, but a game sets it via the BIOS
-/// and never toggles the Sequencer chain-4 bit — so `on_seq_write` never fires
-/// and the planar trap would stay disarmed, leaving the plane window empty
-/// (a black screen). Arm it here on entry to a planar mode, and disarm on a
-/// return to text/linear. `clear` (AL bit 7 clear) zeroes the planes.
+/// React to a BIOS INT 10h AH=00 video mode set. Register programming and VRAM
+/// layout are committed as one operation: first normalize the old CPU view,
+/// then install the new register file, then ask the card model for the new CPU
+/// view and aperture mapping. `clear` (AL bit 7 clear) zeroes the planes.
 pub fn on_set_mode<A: crate::Arch>(
     machine: &mut A,
     pc: &mut PcMachine,
@@ -988,14 +854,8 @@ pub fn on_set_mode<A: crate::Arch>(
         DisplayedVga::Native(_) => return,
     };
     let vga = &mut dev.state;
-    let old_mode = vga.classify_mode();
     let mut planes = read_live_planes(machine);
-    match old_mode {
-        Some(::vga::VgaMode::Mode13h) => ::vga::chain4_unmunge(&mut planes),
-        Some(::vga::VgaMode::Text { .. }) => ::vga::text_odd_even_unmunge(&mut planes),
-        Some(::vga::VgaMode::Cga4) => ::vga::cga4_unmunge(&mut planes),
-        _ => {}
-    }
+    let old_layout = vga.layout();
     // Program the full canonical register file, exactly as a real BIOS does
     // from its video parameter table. This is what keeps classification
     // register-pure (the hardware never consults BIOS data): a tweaker
@@ -1009,6 +869,10 @@ pub fn on_set_mode<A: crate::Arch>(
         vga.seq = r.seq;
         vga.gc = r.gc;
         vga.crtc = r.crtc;
+    }
+    let new_layout = vga.layout();
+    if old_layout != new_layout {
+        ::vga::VramTransition::between(old_layout, new_layout).apply(&mut planes);
     }
     // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
     // depends on the render path: text/CGA/mode 13h index DAC entries directly
@@ -1063,36 +927,16 @@ pub fn on_set_mode<A: crate::Arch>(
     // plane-2 font, omitting this leaves every ordinary BIOS text screen with
     // an all-zero character map after the plane clear above.
     if matches!(mode, 0..=3 | 7) {
-        ::vga::load_font_map(&mut planes, 0, &lib::vga_fonts::FONT_8X16, 16);
+        ::vga::load_font_map(
+            &mut planes,
+            vga.layout(),
+            0,
+            &lib::vga_fonts::FONT_8X16,
+            16,
+        );
     }
-    match vga.classify_mode() {
-        Some(::vga::VgaMode::Planar16 { .. } | ::vga::VgaMode::ModeX { .. }) => {
-            write_live_planes(machine, &planes);
-            map_trapped_aperture(machine, vga);
-        }
-        Some(::vga::VgaMode::Mode13h) => {
-            ::vga::chain4_munge(&mut planes);
-            write_live_planes(machine, &planes);
-            map_direct_aperture(machine, vga, 16);
-        }
-        Some(::vga::VgaMode::Text { .. }) => {
-            ::vga::text_odd_even_munge(&mut planes);
-            write_live_planes(machine, &planes);
-            map_direct_aperture(machine, vga, 8);
-        }
-        Some(::vga::VgaMode::Cga4) => {
-            ::vga::cga4_munge(&mut planes);
-            write_live_planes(machine, &planes);
-            map_direct_aperture(machine, vga, 4);
-        }
-        Some(::vga::VgaMode::Cga2) => {
-            write_live_planes(machine, &planes);
-            map_direct_aperture(machine, vga, 4);
-        }
-        _ => {
-            write_live_planes(machine, &planes);
-        }
-    }
+    write_live_planes(machine, &planes);
+    install_aperture(machine, vga.cpu_aperture());
 }
 
 /// Trapped planar VRAM write: run the Graphics Controller write-mode logic for a
@@ -1101,12 +945,15 @@ pub fn on_set_mode<A: crate::Arch>(
 /// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
 /// write. Latches must have been loaded by a prior `vram_read`.
 pub fn vram_write<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32, byte: u8) {
-    let off = (off & 0xFFFF) as usize;
-    let cur = core::array::from_fn(|p| machine.read::<u8>(VGA_VRAM_BASE + p * 0x10000 + off));
-    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, vga.seq[2] & 0x0F, byte);
+    let (off, map_mask) = vga.cpu_write_address(off as usize);
+    let layout = vga.layout();
+    let cur = core::array::from_fn(|p| {
+        machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
+    });
+    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, map_mask, byte);
     for p in 0..4 {
         if out[p] != cur[p] {
-            machine.write::<u8>(VGA_VRAM_BASE + p * 0x10000 + off, out[p]);
+            machine.write::<u8>(VGA_VRAM_BASE + layout.index(p, off), out[p]);
         }
     }
 }
@@ -1163,9 +1010,14 @@ pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DisplayedVga, ad
 /// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
 /// `off` and return the byte the CPU sees (read map select, or color compare).
 pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) -> u8 {
-    let off = (off & 0xFFFF) as usize;
-    let cur = core::array::from_fn(|p| machine.read::<u8>(VGA_VRAM_BASE + p * 0x10000 + off));
-    let (data, latches) = ::vga::planar_read(cur, &vga.gc);
+    let (off, read_plane) = vga.cpu_read_address(off as usize);
+    let layout = vga.layout();
+    let cur = core::array::from_fn(|p| {
+        machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
+    });
+    let mut gc = vga.gc;
+    gc[4] = read_plane as u8;
+    let (data, latches) = ::vga::planar_read(cur, &gc);
     vga.latches = latches;
     data
 }

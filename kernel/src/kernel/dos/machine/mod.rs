@@ -754,7 +754,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         0x3C0 => {
             match &mut pc.vga {
                 DisplayedVga::Emulated(dev, _) => {
-                    dev.state.port_write(port, val);
+                    vga::port_write(machine, &mut dev.state, port, val);
                     return;
                 }
                 DisplayedVga::Native(_) => {}
@@ -772,19 +772,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     return;
                 }
             };
-            let old_gc6 = (port == 0x3CF && dev.state.gc_index & 0x0F == 6)
-                .then_some(dev.state.gc[6]);
-            let old_seq4 = (port == 0x3C5 && dev.state.seq_index & 0x1F == 4)
-                .then_some(dev.state.seq[4]);
-            dev.state.port_write(port, val);
-            // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
-            // select a plane — drive the A0000 paging alias.
-            if let Some(old_seq4) = old_seq4 {
-                vga::on_seq_write(machine, pc, old_seq4);
-            }
-            if let Some(old_gc6) = old_gc6 {
-                vga::on_gc_write(machine, pc, old_gc6);
-            }
+            vga::port_write(machine, &mut dev.state, port, val);
         }
         // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
         0x01CE..=0x01D0 => machine.outb(port, val),
@@ -1243,6 +1231,8 @@ impl PcmSource<'_> {
 /// fast path that skips the pump entirely.
 pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
     let PcMachine { sb, gus, mpu, vpic, .. } = pc;
+    let prof = crate::kernel::startup::profile_enabled();
+    let t0 = if prof { machine.rdtsc() } else { 0 };
     // Latched probe/trigger IRQs are the emulated card's business: a real one
     // raises its own line and the relay carries it.
     let SoundBlaster { blaster, device } = sb;
@@ -1250,8 +1240,15 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed
         emu.deliver_trigger_irq(vpic, blaster.irq);
         emu.deliver_probe_irq(machine, vpic, blaster.irq);
     }
+    let t1 = if prof { machine.rdtsc() } else { 0 };
     gus.tick(machine, vpic);
+    let t2 = if prof { machine.rdtsc() } else { 0 };
     mpu.tick(machine, pushed);
+    if prof {
+        let t3 = machine.rdtsc();
+        crate::kernel::startup::bill_audio_service(
+            t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2));
+    }
 }
 
 /// Mix one CPU-clocked producer span and advance producer-side device clocks.
@@ -1281,8 +1278,17 @@ pub fn audio_tick<A: crate::Arch>(
         PcmSource::Midi(mpu),
         PcmSource::Speaker(spk),
     ];
-    for source in &mut sources {
+    let prof = crate::kernel::startup::profile_enabled();
+    let mut source_cycles = [0u64; 4];
+    for (i, source) in sources.iter_mut().enumerate() {
+        let t0 = if prof { machine.rdtsc() } else { 0 };
         source.mix_into(machine, span.rate, span.base_frame, span.frames);
+        if prof {
+            source_cycles[i] = machine.rdtsc().wrapping_sub(t0);
+        }
+    }
+    if prof {
+        crate::kernel::startup::bill_audio_sources(source_cycles);
     }
 
     if let Some(emu) = sb {

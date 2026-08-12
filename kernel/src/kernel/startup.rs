@@ -782,7 +782,7 @@ pub fn event_loop<A: crate::Arch>(
         }
 
         // Lend the CPU; canonicalize the outcome into an action.
-        stats.pre_run(machine);
+        stats.pre_run(machine, &ctx.regs);
         let kevent = ctx.run(machine, &thread.personality);
         stats.post_run(machine, &kevent, &ctx.regs);
         let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
@@ -1410,6 +1410,11 @@ pub fn bill_display(
 /// Audio-pump diagnostics: device maintenance, pacing setup, source mixing and
 /// sink output, guest clocks/IRQ delivery, and canonical frames generated.
 static mut AUDIO_PARTS: [u64; 5] = [0; 5];
+/// `audio_service` split: Sound Blaster, GUS, MPU-401. This runs outside the
+/// sample pump and used to disappear into `world-other` on zero-tick exits.
+static mut AUDIO_SERVICE_PARTS: [u64; 3] = [0; 3];
+/// Mixer source split: Sound Blaster, GUS, MPU/GM synth, PC speaker.
+static mut AUDIO_SOURCE_PARTS: [u64; 4] = [0; 4];
 
 pub fn bill_audio(devices: u64, setup: u64, pump: u64, clocks: u64, frames: u64) {
     unsafe {
@@ -1419,6 +1424,24 @@ pub fn bill_audio(devices: u64, setup: u64, pump: u64, clocks: u64, frames: u64)
         (*p)[2] = (*p)[2].wrapping_add(pump);
         (*p)[3] = (*p)[3].wrapping_add(clocks);
         (*p)[4] = (*p)[4].wrapping_add(frames);
+    }
+}
+
+pub fn bill_audio_service(sb: u64, gus: u64, mpu: u64) {
+    unsafe {
+        let p = &raw mut AUDIO_SERVICE_PARTS;
+        (*p)[0] = (*p)[0].wrapping_add(sb);
+        (*p)[1] = (*p)[1].wrapping_add(gus);
+        (*p)[2] = (*p)[2].wrapping_add(mpu);
+    }
+}
+
+pub fn bill_audio_sources(parts: [u64; 4]) {
+    unsafe {
+        let p = &raw mut AUDIO_SOURCE_PARTS;
+        for i in 0..4 {
+            (*p)[i] = (*p)[i].wrapping_add(parts[i]);
+        }
     }
 }
 
@@ -1509,6 +1532,17 @@ struct EventStats {
     slice_start: u64,
     last_idx: usize,
     last_kernel_entry: u64,
+    guest_entry_cs: u16,
+    guest_entry_ip: u32,
+    guest_entry_flags: u32,
+    longest_guest_cycles: u64,
+    longest_guest_entry_cs: u16,
+    longest_guest_entry_ip: u32,
+    longest_guest_entry_flags: u32,
+    longest_guest_exit_cs: u16,
+    longest_guest_exit_ip: u32,
+    longest_guest_exit_flags: u32,
+    longest_guest_exit_kind: usize,
     last_profile_dump: u64,
     last_allocations: u32,
     last_deallocations: u32,
@@ -1549,6 +1583,17 @@ impl EventStats {
             slice_start: 0,
             last_idx: 0,
             last_kernel_entry: now,
+            guest_entry_cs: 0,
+            guest_entry_ip: 0,
+            guest_entry_flags: 0,
+            longest_guest_cycles: 0,
+            longest_guest_entry_cs: 0,
+            longest_guest_entry_ip: 0,
+            longest_guest_entry_flags: 0,
+            longest_guest_exit_cs: 0,
+            longest_guest_exit_ip: 0,
+            longest_guest_exit_flags: 0,
+            longest_guest_exit_kind: 0,
             last_profile_dump: now,
             last_allocations: allocations,
             last_deallocations: deallocations,
@@ -1605,7 +1650,7 @@ impl EventStats {
         }
     }
 
-    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A) {
+    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A, regs: &Regs) {
         let now = machine.rdtsc();
         self.pre_cycles = self
             .pre_cycles
@@ -1614,6 +1659,11 @@ impl EventStats {
             .kernel_cycles
             .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
         self.last_kernel_entry = now;
+        if profile_enabled() {
+            self.guest_entry_cs = regs.code_seg();
+            self.guest_entry_ip = regs.ip32();
+            self.guest_entry_flags = regs.flags32();
+        }
     }
 
     /// Tally one port access. Linear scan of a 12-entry table: shorter than a
@@ -1650,9 +1700,10 @@ impl EventStats {
     ) {
         use crate::KernelEvent as KE;
         let now = machine.rdtsc();
+        let guest_cycles = now.wrapping_sub(self.last_kernel_entry);
         self.user_cycles = self
             .user_cycles
-            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
+            .wrapping_add(guest_cycles);
         self.last_kernel_entry = now;
         let idx = match kevent {
             KE::Irq => 0,
@@ -1686,6 +1737,16 @@ impl EventStats {
             KE::Syscall => 10,
             KE::VifWindow { .. } | KE::VifStep => 1,
         };
+        if profile_enabled() && guest_cycles > self.longest_guest_cycles {
+            self.longest_guest_cycles = guest_cycles;
+            self.longest_guest_entry_cs = self.guest_entry_cs;
+            self.longest_guest_entry_ip = self.guest_entry_ip;
+            self.longest_guest_entry_flags = self.guest_entry_flags;
+            self.longest_guest_exit_cs = regs.code_seg();
+            self.longest_guest_exit_ip = regs.ip32();
+            self.longest_guest_exit_flags = regs.flags32();
+            self.longest_guest_exit_kind = idx;
+        }
         self.counts[idx] += 1;
         self.last_idx = idx;
         if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
@@ -1715,6 +1776,8 @@ impl EventStats {
                 let dp = unsafe { DISP_PARTS };
                 let dm = unsafe { core::ptr::read_volatile(&raw const DISP_MODE) };
                 let ap = unsafe { AUDIO_PARTS };
+                let asp = unsafe { AUDIO_SERVICE_PARTS };
+                let asrc = unsafe { AUDIO_SOURCE_PARTS };
                 let np = unsafe { PRESENTS };
                 let loop_total = self.pre_parts[0]
                     .wrapping_add(self.pre_parts[3])
@@ -1768,9 +1831,29 @@ impl EventStats {
                     pump / 10, pump % 10, devices / 10, devices % 10,
                     setup / 10, setup % 10, clocks / 10, clocks % 10, ap[4]);
                 crate::dbg_println!(
+                    "[prof] audio service: sb={}c gus={}c mpu={}c",
+                    asp[0], asp[1], asp[2]);
+                crate::dbg_println!(
+                    "[prof] audio sources: sb={}c gus={}c mpu={}c speaker={}c",
+                    asrc[0], asrc[1], asrc[2], asrc[3]);
+                crate::dbg_println!(
                     "[prof] exits: {} total | softint={}@{}c in={}@{}c out={}@{}c irq={}@{}c pf={} syscall={}",
                     ev, c[1], cost(1), c[3], cost(3), c[4], cost(4),
                     c[0], cost(0), c[8], c[10]);
+                let event_names = [
+                    "irq", "softint/vif", "hlt", "in", "out", "ins",
+                    "outs", "fault", "page-fault", "exception", "syscall",
+                ];
+                crate::dbg_println!(
+                    "[prof] longest guest={}c entry={:04X}:{:08X} flags={:08X} (VIF={}) exit={:04X}:{:08X} flags={:08X} (VIF={}) via {}",
+                    self.longest_guest_cycles,
+                    self.longest_guest_entry_cs, self.longest_guest_entry_ip,
+                    self.longest_guest_entry_flags,
+                    (self.longest_guest_entry_flags >> 19) & 1,
+                    self.longest_guest_exit_cs, self.longest_guest_exit_ip,
+                    self.longest_guest_exit_flags,
+                    (self.longest_guest_exit_flags >> 19) & 1,
+                    event_names[self.longest_guest_exit_kind]);
                 let fixed = loop_total
                     .saturating_add(self.pre_parts[1])
                     .checked_div(ev)
@@ -1788,6 +1871,8 @@ impl EventStats {
                 unsafe { SLICE_PARTS = [0; 5] };
                 unsafe { DISP_PARTS = [0; 5] };
                 unsafe { AUDIO_PARTS = [0; 5] };
+                unsafe { AUDIO_SERVICE_PARTS = [0; 3] };
+                unsafe { AUDIO_SOURCE_PARTS = [0; 4] };
                 unsafe { PRESENTS = 0 };
                 if c[3] + c[4] > 0 {
                     let mut p = self.ports;
@@ -1832,6 +1917,7 @@ impl EventStats {
             self.softint_by_vec = [0; 256];
             self.ports = [(0, 0, 0); 12];
             self.port_other = 0;
+            self.longest_guest_cycles = 0;
             self.last_profile_dump = now;
             self.iterations = 0;
             // Emitting the report can be expensive (notably klog line

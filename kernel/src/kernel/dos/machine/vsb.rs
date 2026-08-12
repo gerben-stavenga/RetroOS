@@ -49,23 +49,16 @@ use alloc::boxed::Box;
 use super::*;
 
 
-/// Level-matched to FM so a game's SFX balance does not depend on which music
-/// device it picked. The GF1 has no guest-visible master volume (its per-voice
-/// ramps carry it) and 86Box's `gus_get_buffer` adds `gus->buffer[]` straight
-/// in, so this used to be unity — but the GF1 sums 32 voices where OPL has 9,
-/// and measured on the same track (DOOM E1M8, 2 min of steady music) GUS came
-/// out **3.74x / +11.5 dB above OPL** (rms 2719 vs 727). Digital SFX are scaled
-/// for the FM balance, so under GUS music they were simply buried.
+/// The GF1 output enters the machine mix at unity. Its per-voice ramps are the
+/// card's volume controls, and the physical card has no guest-visible master
+/// attenuation after them. This also matches 86Box's `gus_get_buffer`, which
+/// adds the rendered GF1 buffer directly to the machine mix.
 ///
-/// 65536/3.74: brings GUS music to the FM music level, leaving the DAC-vs-music
-/// balance the same whichever music device the game selects. Re-measure with the
-/// same method if either source's level changes.
-///
-/// This is *cross-card* balance, which is why it lives up here in the machine
-/// and not in either card: how loud a GUS sits against a Sound Blaster is a
-/// property of the mix, not of either chip. (The FM-vs-DAC balance *within*
-/// the SB is the card's own, and moved into `//lib:sound` with it.)
-pub(super) const GUS_SCALE_Q16: i32 = 17_500;
+/// Do not normalize this from one program's music RMS. DOOM uses the GF1 as a
+/// many-voice wavetable synth, while trackers such as FT2 upload an already
+/// mixed stream and play it through one or two voices. A fixed attenuation
+/// measured from the former made the latter quieter by 11.5 dB.
+pub(super) const GUS_SCALE_Q16: i32 = 65_536;
 
 /// The General MIDI synth, level-matched the same way and for the same reason.
 ///

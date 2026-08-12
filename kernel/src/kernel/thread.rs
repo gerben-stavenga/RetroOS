@@ -322,6 +322,8 @@ impl<A: crate::Arch> Personality<A> {
         ticks: u32,
         audio_pushed: u64,
     ) {
+        let prof = crate::kernel::startup::profile_enabled();
+        let t0 = if prof { machine.rdtsc() } else { 0 };
         match self {
             Self::Dos(dos) => {
                 // Port-polling games can exit to the kernel hundreds of
@@ -335,24 +337,18 @@ impl<A: crate::Arch> Personality<A> {
                 // early-out here).
                 if ticks == 0 {
                     crate::kernel::dos::audio_service(machine, dos, audio_pushed);
-                    return;
-                }
-                // Instrument only actual world advances. Per-exit rdtsc
-                // sampling materially distorted profiles of PIT-polling games.
-                let prof = crate::kernel::startup::profile_enabled();
-                let t1 = if prof { machine.rdtsc() } else { 0 };
-                for _ in 0..ticks {
-                    crate::kernel::dos::queue_tick(machine, dos);
-                }
-                crate::kernel::dos::audio_service(machine, dos, audio_pushed);
-                let t1b = if prof { machine.rdtsc() } else { 0 };
-                if prof {
-                    crate::kernel::startup::bill_slice2(
-                        0, t1b.wrapping_sub(t1),
-                        0, 0, ticks as u64);
+                } else {
+                    for _ in 0..ticks {
+                        crate::kernel::dos::queue_tick(machine, dos);
+                    }
+                    crate::kernel::dos::audio_service(machine, dos, audio_pushed);
                 }
             }
             Self::Linux(_) => {}
+        }
+        if prof {
+            crate::kernel::startup::bill_slice2(
+                0, machine.rdtsc().wrapping_sub(t0), 0, 0, ticks as u64);
         }
     }
 

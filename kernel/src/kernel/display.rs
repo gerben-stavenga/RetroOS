@@ -784,13 +784,16 @@ pub fn scanout_action<'a>(
         s.mode = Some(mode);
         s.period_ticks = period_ticks;
         // A mode switch gets a complete shadow immediately and publishes it
-        // on the following tick; there is no useful old frame to preserve.
+        // on the following tick. Keep the old complete physical frame until
+        // then: scanout is double-buffered, so reconfiguring the write-back
+        // side must never destroy the frame the display is still scanning.
+        // This matters especially while software briefly changes VGA memory-
+        // access registers to update fonts; those writes can make mode
+        // classification transiently change even though the visible timing
+        // has not.
         s.phase = vretrace_ticks(period_ticks);
         s.ready = false;
         s.last_tick = now_tick;
-        if let Some(fb) = display.framebuffer() {
-            unsafe { core::ptr::write_bytes(fb.va as *mut u8, 0, fb.pitch * fb.height) };
-        }
         return ScanoutAction::Render;
     }
 
@@ -853,6 +856,23 @@ pub fn render_shadow(
     }
     s.ready = true;
     true
+}
+
+/// Cheap diagnostic signature of the completed packed shadow. Sampling one
+/// byte per cache-line-sized span is enough to distinguish IT's all-black
+/// frames from its populated text UI without adding another full-frame walk.
+pub fn shadow_sample(s: &Scratch) -> (usize, u32) {
+    let len = s.geo.2
+        .saturating_mul(s.geo.1)
+        .saturating_mul(s.pal.fmt.bytes_per_pixel as usize)
+        .min(s.surface.len());
+    let mut nonzero = 0usize;
+    let mut hash = 0x811C9DC5u32;
+    for &b in s.surface[..len].iter().step_by(64) {
+        nonzero += usize::from(b != 0);
+        hash = (hash ^ u32::from(b)).wrapping_mul(0x01000193);
+    }
+    (nonzero, hash)
 }
 
 /// The panel's channel layout, as a card's DAC wants it stated.

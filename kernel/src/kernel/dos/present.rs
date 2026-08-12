@@ -18,6 +18,40 @@ use core::sync::atomic::Ordering;
 use super::machine::{PcMachine, vga::{SVGA_LFB_BASE, VGA_VRAM_BASE}};
 use ::vga::VgaState;
 
+static mut LAST_DIAG_MODE: Option<::vga::VgaMode> = None;
+static mut LAST_DIAG_BLACK: Option<bool> = None;
+static DIAG_LINES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static DIAG_RENDERS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash: u32) {
+    if !crate::kernel::startup::profile_enabled() {
+        return;
+    }
+    let black = nonzero == 0;
+    let old_mode = unsafe { core::ptr::read_volatile(&raw const LAST_DIAG_MODE) };
+    let old_black = unsafe { core::ptr::read_volatile(&raw const LAST_DIAG_BLACK) };
+    let changed = old_mode != Some(mode) || old_black != Some(black);
+    let render = DIAG_RENDERS.fetch_add(1, Ordering::Relaxed) + 1;
+    if !changed && !render.is_multiple_of(32) {
+        return;
+    }
+    unsafe {
+        core::ptr::write_volatile(&raw mut LAST_DIAG_MODE, Some(mode));
+        core::ptr::write_volatile(&raw mut LAST_DIAG_BLACK, Some(black));
+    }
+    if DIAG_LINES.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    crate::dbg_println!(
+        "[vgascan] mode={:?} black={} nz={} hash={:08X} seq={:02X?} gc5={:02X} gc6={:02X} acidx={:02X} ac10={:02X} dacmask={:02X}",
+        mode, black as u8, nonzero, hash, state.seq,
+        state.gc[5], state.gc[6], state.ac_state.index,
+        state.ac[0x10], state.dac_mask,
+    );
+}
+
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
 /// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
 /// VRAM is guest memory the kernel can't address as a flat region.
@@ -107,8 +141,16 @@ fn scanout<'a, A: crate::Arch>(
         _ => &lib::vga_fonts::FONT_8X16,
     };
     let (vram, planes, font, font_b): (&[u8], &[u8], &[u8], &[u8]) = match mode {
-        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } =>
-            (&[], read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000), fallback_font, fallback_font),
+        VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => {
+            read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000);
+            if state.layout() != ::vga::VramLayout::PlaneMinor {
+                ::vga::VramTransition::between(
+                    state.layout(),
+                    ::vga::VramLayout::PlaneMinor,
+                ).apply(scratch);
+            }
+            (&[], scratch.as_slice(), fallback_font, fallback_font)
+        }
         VgaMode::Mode13h => {
             let (lo, hi) = m13_span();
             (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[], fallback_font, fallback_font)
@@ -136,10 +178,11 @@ fn scanout<'a, A: crate::Arch>(
                 // characters in plane 0, attributes in plane 1, both at even
                 // CRTC word offsets.
                 for cell in 0..text_len / 2 {
-                    let off = cell * 2;
-                    scratch[cell * 2] = machine.read(VGA_VRAM_BASE + off);
+                    scratch[cell * 2] = machine.read(
+                        VGA_VRAM_BASE + state.layout().index(0, cell),
+                    );
                     scratch[cell * 2 + 1] =
-                        machine.read(VGA_VRAM_BASE + 0x10000 + off);
+                        machine.read(VGA_VRAM_BASE + state.layout().index(1, cell));
                 }
             } else {
                 machine.copy_from(0xB8000, &mut scratch[..text_len]);
@@ -151,8 +194,11 @@ fn scanout<'a, A: crate::Arch>(
             let map_a = usize::from(((state.seq[3] >> 2) & 0x03) << 1
                 | (state.seq[3] >> 5) & 1);
             for (map, dst_base) in [(map_a, text_len), (map_b, text_len + VGA_MAP_LEN)] {
-                let font_base = VGA_VRAM_BASE + 2 * 0x10000 + map * 0x2000;
-                machine.copy_from(font_base, &mut scratch[dst_base..dst_base + VGA_MAP_LEN]);
+                for n in 0..VGA_MAP_LEN {
+                    scratch[dst_base + n] = machine.read(
+                        VGA_VRAM_BASE + state.layout().index(2, map * 0x2000 + n),
+                    );
+                }
                 // VGA reserves 32 bytes per glyph. Compact the selected map
                 // in place for the renderer; walking forward is safe because
                 // every destination begins at or below its source.
@@ -169,8 +215,28 @@ fn scanout<'a, A: crate::Arch>(
         }
         // 4 KB and 16 KB apertures: banding them would buy back less than
         // the per-row address arithmetic (CGA's two interleaved banks) costs.
-        VgaMode::Cga4 | VgaMode::Cga2 =>
-            (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[], fallback_font, fallback_font),
+        mode @ (VgaMode::Cga4 | VgaMode::Cga2) => {
+            if super::machine::vga::trapped_aperture(state).is_some() {
+                scratch.resize(0x4000, 0);
+                let layout = state.layout();
+                for address in 0..0x4000 {
+                    let (plane, offset) = if matches!(mode, VgaMode::Cga4) {
+                        // Modes 4/5 scan the same odd/even plane-0/1 stream
+                        // that the CPU sees at B8000.
+                        (address & 1, address >> 1)
+                    } else {
+                        // Mode 6 is sequential plane 0 (SEQ map mask = 1).
+                        (0, address)
+                    };
+                    scratch[address] = machine.read(
+                        VGA_VRAM_BASE + layout.index(plane, offset),
+                    );
+                }
+                (scratch.as_slice(), &[], fallback_font, fallback_font)
+            } else {
+                (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[], fallback_font, fallback_font)
+            }
+        }
         VgaMode::LinearSvga { .. } => (&[], &[], fallback_font, fallback_font), // handled by the short-circuit above
     };
     // Display-start (page-flip front buffer), pixel pan (smooth scroll) and
@@ -380,6 +446,11 @@ pub fn display_tick<A: crate::Arch>(
                 let rendered = crate::kernel::display::render_shadow(
                     &mut pc.present_scratch2, display, &frame,
                 );
+                if rendered && prof {
+                    let (nonzero, hash) =
+                        crate::kernel::display::shadow_sample(&pc.present_scratch2);
+                    diagnose_shadow(vga, frame.mode, nonzero, hash);
+                }
                 if prof {
                     let p2 = machine.rdtsc();
                     crate::kernel::startup::bill_display(

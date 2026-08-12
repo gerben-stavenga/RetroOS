@@ -178,10 +178,9 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     } else {
         None
     };
-    // Preserve the CPU-visible text aperture before flattening odd/even.
-    // QEMU stores text planes at compact offsets while real VGA CRTC scanout
-    // uses even plane offsets; the linear B8000 view is identical on both and
-    // therefore provides the unambiguous representation at this boundary.
+    // Preserve the CPU-visible text aperture before flattening odd/even. The
+    // linear B8000 view is identical across implementations and therefore
+    // provides the unambiguous representation at this hardware boundary.
     let native_text = if matches!(
         state.classify_mode(),
         Some(vga::VgaMode::Text { .. })
@@ -231,17 +230,29 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     // don't have a 0xA0000 identity mapping at all, so a bare access
     // would fault when suspending shell.elf.
     let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *const u8;
+    let layout = state.layout();
+    let mut plane_bytes = alloc::vec![0u8; 65536];
     for plane in 0..4u8 {
         outb(0x3CE, 4); outb(0x3CF, plane);
-        let dst = &mut state.planes[plane as usize * 65536..][..65536];
-        unsafe { core::ptr::copy_nonoverlapping(vga_window, dst.as_mut_ptr(), 65536); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(vga_window, plane_bytes.as_mut_ptr(), 65536);
+        }
+        for (offset, &byte) in plane_bytes.iter().enumerate() {
+            state.planes[layout.index(plane as usize, offset)] = byte;
+        }
     }
     if let Some(chained) = native_chain4.as_deref() {
-        vga::chain4_split(chained, &mut state.planes);
+        for (address, &byte) in chained.iter().enumerate() {
+            state.planes[layout.index(address & 3, address >> 2)] = byte;
+        }
     }
     if let Some(text) = native_text.as_deref() {
-        vga::text_odd_even_split(text, &mut state.planes);
+        for (address, &byte) in text.iter().enumerate() {
+            state.planes[layout.index(address & 1, address >> 1)] = byte;
+        }
     }
+    // Registers were captured first, so the forced-flat read and repairs write
+    // directly into the ordering implied by this exact saved VGA state.
 
     // Restore registers we temporarily changed (incl. SEQ[1] to unblank)
     outb(0x3C4, 1); outb(0x3C5, state.seq[1]);
@@ -321,10 +332,13 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // Write planes through the kernel-side low-memory mapping (see
     // `save` for the rationale).
     let vga_window = (crate::LOW_MEM_BASE + 0xA0000) as *mut u8;
+    let mut plane_bytes = alloc::vec![0u8; 65536];
     for plane in 0..4u8 {
         outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-        let src = &state.planes[plane as usize * 65536..][..65536];
-        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), vga_window, 65536); }
+        for (offset, byte) in plane_bytes.iter_mut().enumerate() {
+            *byte = state.planes[state.layout().index(plane as usize, offset)];
+        }
+        unsafe { core::ptr::copy_nonoverlapping(plane_bytes.as_ptr(), vga_window, 65536); }
     }
 
     // Reload the guest's data latches (captured via Cirrus CR22 in
@@ -344,7 +358,12 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
             unsafe { let _ = core::ptr::read_volatile(vga_window as *const u8); }
             for plane in 0..4u8 {
                 outb(0x3C4, 2); outb(0x3C5, 1 << plane);
-                unsafe { core::ptr::write_volatile(vga_window, state.planes[plane as usize * 65536]); }
+                unsafe {
+                    core::ptr::write_volatile(
+                        vga_window,
+                        state.planes[state.layout().index(plane as usize, 0)],
+                    );
+                }
             }
         }
     }
@@ -371,7 +390,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // Graphics Controller
     for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, state.gc[i as usize]); }
 
-    // For chain-4, finish by replaying the canonical linear aperture
+    // For chain-4, finish by replaying the linear CPU aperture
     // through the target mode itstate. The flat pass above preserves the
     // whole 4x64K VGA store, but strict implementations can expose a
     // different address interpretation while that pass is active. A
@@ -381,7 +400,9 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // write registers.
     if matches!(state.classify_mode(), Some(vga::VgaMode::Mode13h)) {
         let mut chained = alloc::vec![0u8; 0x10000];
-        vga::chain4_merge(&state.planes, &mut chained);
+        for (address, byte) in chained.iter_mut().enumerate() {
+            *byte = state.planes[state.layout().index(address & 3, address >> 2)];
+        }
 
         outb(0x3C4, 2); outb(0x3C5, 0x0F); // all chain-selected planes enabled
         outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset
@@ -402,11 +423,9 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
 
     // Text mode needs the same treatment, and for the same reason: odd/even
     // is a different address interpretation, so the flat planar pass above
-    // stores each cell where CRTC word addressing puts it — plane offset
-    // 2*i, not i (see `text_odd_even_split`) — and a strict card does not
-    // expose that layout through B8000 until the guest's own text mode is
-    // programmed. Replay the visible page through the target mode and let
-    // the card do its own odd/even routing.
+    // writes plane bytes without exercising the target odd/even address
+    // routing. Replay the visible page through the target mode and let the
+    // card perform the definitive A0 plane selection itself.
     //
     // Without this, a text-mode program that follows a mode-13h one sees
     // every cell smeared across four bytes (`00 00 char attr`): Dark Forces
@@ -414,7 +433,11 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // streams, while B8000 row 0 — written after the mode set — was clean.
     if matches!(state.classify_mode(), Some(vga::VgaMode::Text { .. })) {
         let mut text = alloc::vec![0u8; 0x8000];
-        vga::text_odd_even_merge(&state.planes, &mut text);
+        for (address, byte) in text.iter_mut().enumerate() {
+            *byte = state.planes[
+                state.layout().index(address & 1, address >> 1)
+            ];
+        }
 
         outb(0x3C4, 2); outb(0x3C5, 0x03); // char plane 0 + attribute plane 1
         outb(0x3CE, 1); outb(0x3CF, 0x00); // disable set/reset

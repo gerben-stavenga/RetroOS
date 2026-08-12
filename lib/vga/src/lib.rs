@@ -42,7 +42,7 @@ pub enum VgaMode {
     Cga2,
     /// Planar 16-colour (EGA/VGA modes 0Dh/0Eh/10h/12h): 4 bit-planes, one bit
     /// per pixel per plane assembled into a 4-bit attribute → AC palette → DAC.
-    /// Read from `planes` (the 4×64K plane-major VGA model). `row_bytes` is the
+    /// Read from `planes` (the complete 4×64K VGA model). `row_bytes` is the
     /// per-plane bytes per scanline (CRTC offset × 2).
     Planar16 { w: u16, h: u16, row_bytes: u16 },
     /// Unchained 256-colour ("Mode X", 320×240 etc.): 4 planes, pixel x uses
@@ -64,8 +64,8 @@ pub struct Frame<'a> {
     /// (text, CGA). Used by the chained/linear modes; planar modes read
     /// `planes` instead. Empty slice is fine for planar-only frames.
     pub vram: &'a [u8],
-    /// The 4-plane VGA model: plane-major, plane `p` byte `n` at
-    /// `planes[p*0x10000 + n]`. Filled by the emulated VRAM-trap write path
+    /// The complete 4-plane VGA model in plane-minor render order. Filled by
+    /// the emulated VRAM-trap write path
     /// (or a real-card capture). Used by `Planar16`/`ModeX`; empty for the
     /// linear modes.
     pub planes: &'a [u8],
@@ -314,164 +314,83 @@ pub fn bios_mode3_regs() -> Regs { required_bios_mode_regs(3) }
 /// Canonical standard 320x200x256 graphics-mode register file.
 pub fn bios_mode13_regs() -> Regs { required_bios_mode_regs(0x13) }
 
-/// Chain-4 deinterleave: spread a linear 64K "chained view" (mode 13h, where
-/// the CPU sees byte `n` as pixel `n`) into the 4 planes the way real VGA
-/// chain-4 hardware does — byte `n` lives in plane `n & 3` at offset `n >> 2`.
-/// Called on a chain→unchain hop so pixels drawn in mode 13h survive into a
-/// Mode X view (and on a real-card capture, to normalise either representation
-/// into the planes the renderer reads). `chained` is 64K; `planes` is 4×64K
-/// plane-major.
+/// Copy a standard chained 64K aperture into plane-minor VRAM. In plane-minor
+/// order byte `n` is already plane `n&3`, offset `n>>2`, so this is a prefix
+/// copy; the named helper documents the physical-VGA boundary.
 pub fn chain4_split(chained: &[u8], planes: &mut [u8]) {
-    let n = chained.len().min(0x10000);
-    for (i, &src) in chained.iter().enumerate().take(n) {
-        let plane = i & 3;
-        let off = i >> 2;
-        if plane * 0x10000 + off < planes.len() {
-            planes[plane * 0x10000 + off] = src;
-        }
-    }
+    let n = chained.len().min(0x10000).min(planes.len());
+    planes[..n].copy_from_slice(&chained[..n]);
 }
 
 /// Chain-4 interleave: the inverse of [`chain4_split`] — gather the 4 planes
 /// back into the linear chained view on an unchain→chain hop.
 pub fn chain4_merge(planes: &[u8], chained: &mut [u8]) {
-    let n = chained.len().min(0x10000);
-    for (i, dst) in chained.iter_mut().enumerate().take(n) {
-        let plane = i & 3;
-        let off = i >> 2;
-        *dst = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
-    }
+    let n = chained.len().min(0x10000).min(planes.len());
+    chained[..n].copy_from_slice(&planes[..n]);
 }
 
 const VGA_PLANE_BYTES: usize = 0x10000;
-const CHAIN4_PLANE_BYTES: usize = VGA_PLANE_BYTES / 4;
 
-/// Re-layout four planar 64K banks in place so the first 64K is the chained
-/// CPU aperture. The three quarters of plane 0 displaced by the interleave are
-/// parked in the now-redundant 16K prefixes of planes 1, 2 and 3. No pixel
-/// bytes or second framebuffer are needed; [`chain4_unmunge`] is the exact
-/// inverse.
-pub fn chain4_munge(planes: &mut [u8]) {
-    munge_interleaved(planes, 4, CHAIN4_PLANE_BYTES);
-}
-
-/// Restore the ordinary four-plane layout produced by [`chain4_munge`].
-pub fn chain4_unmunge(planes: &mut [u8]) {
-    unmunge_interleaved(planes, 4, CHAIN4_PLANE_BYTES);
-}
-
-/// Put plane 0's relevant prefix directly into its interleaved positions,
-/// iterating backwards so source bytes are not disturbed. Then swap each
-/// other plane's prefix into its lane; those swaps park every displaced
-/// plane-0 byte in storage that became redundant in the munged layout.
-fn munge_interleaved(planes: &mut [u8], lanes: usize, lane_bytes: usize) {
-    assert!(planes.len() >= lanes * VGA_PLANE_BYTES);
-    for i in (0..lane_bytes).rev() {
-        planes.swap(i, lanes * i);
-    }
-    for plane in 1..lanes {
-        for i in 0..lane_bytes {
-            planes.swap(lanes * i + plane, plane * VGA_PLANE_BYTES + i);
-        }
-    }
-}
-
-/// Exact inverse of [`munge_interleaved`]: return the other lanes first, then
-/// undo plane 0's backward scatter in forward order.
-fn unmunge_interleaved(planes: &mut [u8], lanes: usize, lane_bytes: usize) {
-    assert!(planes.len() >= lanes * VGA_PLANE_BYTES);
-    for plane in (1..lanes).rev() {
-        for i in 0..lane_bytes {
-            planes.swap(lanes * i + plane, plane * VGA_PLANE_BYTES + i);
-        }
-    }
-    for i in 0..lane_bytes {
-        planes.swap(i, lanes * i);
-    }
-}
-
-/// Make plane 0's first 16K the CGA aperture. Standard modes 4/5 use the
-/// same odd/even + CRTC word addressing as text, only with a 16K window.
-pub fn cga4_munge(planes: &mut [u8]) {
-    assert!(planes.len() >= 2 * VGA_PLANE_BYTES);
-    for i in 0..0x2000 {
-        planes.swap(i * 2 + 1, VGA_PLANE_BYTES + i * 2);
-    }
-}
-
-pub fn cga4_unmunge(planes: &mut [u8]) {
-    cga4_munge(planes);
-}
-
-/// VGA text odd/even deinterleave. In CRTC word mode the displayed cell `i`
-/// occupies offset `2*i` in character plane 0 and attribute plane 1. QEMU
-/// approximates this by shifting CPU addresses, but real VGA scanout does not.
+/// VGA text odd/even deinterleave into plane-minor storage. CPU address A0
+/// selects character/attribute plane and the remaining address bits select the
+/// compact offset within that plane.
 pub fn text_odd_even_split(text: &[u8], planes: &mut [u8]) {
-    let cells = (text.len() / 2)
-        .min(0x8000)
-        .min(planes.len().saturating_sub(VGA_PLANE_BYTES).div_ceil(2));
-    for i in 0..cells {
-        let off = i * 2;
-        planes[off] = text[off];
-        planes[VGA_PLANE_BYTES + off] = text[off + 1];
+    for (address, &byte) in text.iter().take(0x20000).enumerate() {
+        let index = VramLayout::PlaneMinor.index(address & 1, address >> 1);
+        if let Some(dst) = planes.get_mut(index) {
+            *dst = byte;
+        }
     }
 }
 
 /// Reconstruct the CPU's linear B8000 view from character and attribute planes.
 pub fn text_odd_even_merge(planes: &[u8], text: &mut [u8]) {
-    let cells = (text.len() / 2)
-        .min(0x8000)
-        .min(planes.len().saturating_sub(VGA_PLANE_BYTES).div_ceil(2));
-    for i in 0..cells {
-        let off = i * 2;
-        text[off] = planes[off];
-        text[off + 1] = planes[VGA_PLANE_BYTES + off];
+    for (address, byte) in text.iter_mut().take(0x20000).enumerate() {
+        *byte = planes
+            .get(VramLayout::PlaneMinor.index(address & 1, address >> 1))
+            .copied()
+            .unwrap_or(0);
     }
-}
-
-/// Re-layout text odd/even VRAM in place so plane 0's first 32K is the linear
-/// B8000 aperture. Character bytes already occupy plane-0 even positions;
-/// swap its odd positions with plane-1 even positions to insert attributes
-/// while parking every displaced byte. This permutation is self-inverse.
-pub fn text_odd_even_munge(planes: &mut [u8]) {
-    assert!(planes.len() >= 2 * VGA_PLANE_BYTES);
-    for i in 0..CHAIN4_PLANE_BYTES {
-        planes.swap(i * 2 + 1, VGA_PLANE_BYTES + i * 2);
-    }
-}
-
-/// Restore canonical plane-major text VRAM after [`text_odd_even_munge`].
-pub fn text_odd_even_unmunge(planes: &mut [u8]) {
-    text_odd_even_munge(planes);
 }
 
 /// Load a compact 256-glyph font into one VGA plane-2 character map. VGA
 /// reserves 32 bytes per glyph regardless of the displayed character height.
 pub fn load_font_glyphs(
-    planes: &mut [u8],
+    vram: &mut [u8],
+    layout: VramLayout,
     map: usize,
     first: usize,
     font: &[u8],
     glyph_h: usize,
 ) {
     assert!(map < 8 && glyph_h <= 32);
-    assert!(planes.len() >= 3 * VGA_PLANE_BYTES);
+    assert!(vram.len() >= 4 * VGA_PLANE_BYTES);
     assert!(first <= 256 && font.len() % glyph_h == 0);
     let count = font.len() / glyph_h;
     assert!(first + count <= 256);
-    let map_base = 2 * VGA_PLANE_BYTES + map * 0x2000;
+    let map_base = map * 0x2000;
     for i in 0..count {
         let ch = first + i;
         let dst = map_base + ch * 32;
-        planes[dst..dst + 32].fill(0);
+        for row in 0..32 {
+            vram[layout.index(2, dst + row)] = 0;
+        }
         let src = i * glyph_h;
-        planes[dst..dst + glyph_h].copy_from_slice(&font[src..src + glyph_h]);
+        for row in 0..glyph_h {
+            vram[layout.index(2, dst + row)] = font[src + row];
+        }
     }
 }
 
-pub fn load_font_map(planes: &mut [u8], map: usize, font: &[u8], glyph_h: usize) {
+pub fn load_font_map(
+    vram: &mut [u8],
+    layout: VramLayout,
+    map: usize,
+    font: &[u8],
+    glyph_h: usize,
+) {
     assert!(font.len() >= 256 * glyph_h);
-    load_font_glyphs(planes, map, 0, &font[..256 * glyph_h], glyph_h);
+    load_font_glyphs(vram, layout, map, 0, &font[..256 * glyph_h], glyph_h);
 }
 
 // ============================================================================
@@ -1038,7 +957,11 @@ fn row_modex<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stret
     for x in 0..w {
         let sx = x + pan;
         let off = start + ry * rb + sx / 4;
-        let idx = frame.planes.get((sx & 3) * 0x10000 + off).copied().unwrap_or(0);
+        let idx = frame
+            .planes
+            .get(VramLayout::PlaneMinor.index(sx & 3, off))
+            .copied()
+            .unwrap_or(0);
         st.put(pal.lut[idx as usize]);
     }
 }
@@ -1053,10 +976,10 @@ fn row_planar16<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut St
     let (mut x, mut bit, mut sbyte) = (0usize, pan & 7, pan / 8);
     while x < w {
         let off = base + sbyte;
-        let p0 = frame.planes.get(off).copied().unwrap_or(0) as usize;
-        let p1 = frame.planes.get(0x10000 + off).copied().unwrap_or(0) as usize;
-        let p2 = frame.planes.get(0x20000 + off).copied().unwrap_or(0) as usize;
-        let p3 = frame.planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
+        let p0 = frame.planes.get(VramLayout::PlaneMinor.index(0, off)).copied().unwrap_or(0) as usize;
+        let p1 = frame.planes.get(VramLayout::PlaneMinor.index(1, off)).copied().unwrap_or(0) as usize;
+        let p2 = frame.planes.get(VramLayout::PlaneMinor.index(2, off)).copied().unwrap_or(0) as usize;
+        let p3 = frame.planes.get(VramLayout::PlaneMinor.index(3, off)).copied().unwrap_or(0) as usize;
         let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
         while bit < 8 && x < w {
             st.put(pal.planar[((pix >> (4 * bit)) & 0xF) as usize]);
@@ -1398,10 +1321,10 @@ fn render_planar16(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes
         let mut sbyte = pan / 8;
         while x < w {
             let off = base + sbyte;
-            let p0 = planes.get(off).copied().unwrap_or(0) as usize;
-            let p1 = planes.get(0x10000 + off).copied().unwrap_or(0) as usize;
-            let p2 = planes.get(0x20000 + off).copied().unwrap_or(0) as usize;
-            let p3 = planes.get(0x30000 + off).copied().unwrap_or(0) as usize;
+            let p0 = planes.get(VramLayout::PlaneMinor.index(0, off)).copied().unwrap_or(0) as usize;
+            let p1 = planes.get(VramLayout::PlaneMinor.index(1, off)).copied().unwrap_or(0) as usize;
+            let p2 = planes.get(VramLayout::PlaneMinor.index(2, off)).copied().unwrap_or(0) as usize;
+            let p3 = planes.get(VramLayout::PlaneMinor.index(3, off)).copied().unwrap_or(0) as usize;
             let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
             while bit < 8 && x < w {
                 row[x] = colours[((pix >> (4 * bit)) & 0xF) as usize];
@@ -1432,7 +1355,10 @@ fn render_modex(frame: &Frame, out: &mut [u32], w: usize, h: usize, row_bytes: u
             let sx = x + pan;
             let plane = sx & 3;
             let off = start + ry * rb + sx / 4;
-            let idx = planes.get(plane * 0x10000 + off).copied().unwrap_or(0);
+            let idx = planes
+                .get(VramLayout::PlaneMinor.index(plane, off))
+                .copied()
+                .unwrap_or(0);
             out[y * w + x] = pal_rgb(frame.palette, idx & frame.dac_mask);
         }
     }
@@ -1701,13 +1627,14 @@ mod tests {
         // Pixel 0 = colour 5 (planes 0 and 2 set at bit 7).
         let mut planes = vec![0u8; 4 * 0x10000];
         planes[0] = 0x80; // plane 0 bit 7
-        planes[2 * 0x10000] = 0x80; // plane 2 bit 7
+        planes[VramLayout::PlaneMinor.index(2, 0)] = 0x80; // plane 2 bit 7
         let mut ac = [0u8; 21];
         for i in 0..16 { ac[i] = i as u8; }
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
+            vram: &[], planes: &planes,
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 8];
@@ -1746,10 +1673,10 @@ mod tests {
         chain4_split(&chained, &mut planes);
         // Byte n must land in plane n&3 at n>>2.
         assert_eq!(planes[0], chained[0]);
-        assert_eq!(planes[0x10000], chained[1]);
-        assert_eq!(planes[2 * 0x10000], chained[2]);
-        assert_eq!(planes[3 * 0x10000], chained[3]);
-        assert_eq!(planes[1], chained[4]);
+        assert_eq!(planes[1], chained[1]);
+        assert_eq!(planes[2], chained[2]);
+        assert_eq!(planes[3], chained[3]);
+        assert_eq!(planes[4], chained[4]);
         let mut back = vec![0u8; 0x10000];
         chain4_merge(&planes, &mut back);
         assert_eq!(&back[..64000], &chained[..64000]);
@@ -1759,12 +1686,13 @@ mod tests {
     fn modex_plane_select() {
         // Pixels 0..4 live in planes 0..3 at byte 0; set pixel 2 (plane 2) = 7.
         let mut planes = vec![0u8; 4 * 0x10000];
-        planes[2 * 0x10000] = 7;
+        planes[VramLayout::PlaneMinor.index(2, 0)] = 7;
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
+            vram: &[], planes: &planes,
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -1786,7 +1714,8 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
+            vram: &[], planes: &planes,
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2,
         };
@@ -1876,12 +1805,15 @@ mod tests {
         // Plane bytes 0..3 hold pixels 0..3; pan=2 shifts the display left 2, so
         // displayed pixel 0 reads source pixel 2 (plane 2).
         let mut planes = vec![0u8; 4 * 0x10000];
-        for p in 0..4 { planes[p * 0x10000] = (p as u8 + 1) * 16; } // plane p = 0x10*(p+1)
+        for p in 0..4 {
+            planes[VramLayout::PlaneMinor.index(p, 0)] = (p as u8 + 1) * 16;
+        }
         let ac = [0u8; 21];
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
-            vram: &[], planes: &planes, ac: &ac, palette: &pal, dac_mask: 0xFF,
+            vram: &[], planes: &planes,
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
         };
         let mut out = [0u32; 4];
@@ -1902,7 +1834,8 @@ mod tests {
         let pal = fallback_palette();
         let frame = Frame {
             mode: VgaMode::Mode13h,
-            vram: &vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
+            vram: &vram, planes: &[],
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
         };
@@ -1921,7 +1854,8 @@ mod tests {
         let ac = [0u8; 21];
         let mk = |mode, vram: &[u8]| {
             let frame = Frame {
-                mode, vram, planes: &[], ac: &ac, palette: &pal, dac_mask: 0xFF,
+                mode, vram, planes: &[],
+                ac: &ac, palette: &pal, dac_mask: 0xFF,
                 font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
             };
@@ -1966,6 +1900,79 @@ impl AcState {
     // clearing PAS and blanking the display. Default to `0x20` so the
     // tracker matches HW from the moment the kernel boots.
     pub const fn new() -> Self { Self { index: 0x20, pending_data: false } }
+}
+
+/// Physical representation currently stored in the VGA's 256 KiB VRAM
+/// backing. This is state, not something callers may infer from registers:
+/// the register write and the byte permutation form one atomic card operation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VramLayout {
+    /// Four adjacent bytes are the four maps at one offset:
+    /// `index = 4 * offset + plane`. Chain-4's standard 64K window is the
+    /// first 64K of this ordering.
+    PlaneMinor,
+    /// Two complete 128K plane sets. Set 0 interleaves maps 0/1 and set 1
+    /// interleaves maps 2/3:
+    /// `index = (plane >> 1) * 128K + 2 * offset + (plane & 1)`.
+    OddEven,
+}
+
+impl VramLayout {
+    #[inline]
+    pub const fn index(self, plane: usize, offset: usize) -> usize {
+        match self {
+            Self::PlaneMinor => 4 * offset + plane,
+            Self::OddEven => (plane >> 1) * 0x20000 + 2 * offset + (plane & 1),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VramTransition {
+    from: VramLayout,
+    to: VramLayout,
+}
+
+impl VramTransition {
+    pub const fn between(from: VramLayout, to: VramLayout) -> Self {
+        Self { from, to }
+    }
+
+    /// Reorder all 256K. Every logical `(plane, offset)` appears exactly once
+    /// in either ordering, so no bytes are discarded or parked in holes.
+    pub fn apply(self, vram: &mut [u8]) {
+        assert!(vram.len() >= 4 * VGA_PLANE_BYTES);
+        if self.from == self.to {
+            return;
+        }
+        let old = vram[..4 * VGA_PLANE_BYTES].to_vec();
+        for offset in 0..VGA_PLANE_BYTES {
+            for plane in 0..4 {
+                vram[self.to.index(plane, offset)] =
+                    old[self.from.index(plane, offset)];
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ApertureRange {
+    pub start_page: u16,
+    pub end_page: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CpuAperture {
+    None,
+    Direct { range: ApertureRange, pages: u16 },
+    Trapped { range: ApertureRange },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortWrite {
+    pub old_aperture: CpuAperture,
+    pub new_aperture: CpuAperture,
+    pub vram_transition: Option<VramTransition>,
 }
 
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
@@ -2101,12 +2108,18 @@ impl VgaState {
         state.ac_state = AcState::new();
 
         // Mode-3 clear: 80x25 spaces with light-grey-on-black attributes.
+        let layout = state.layout();
         for cell in 0..80 * 25 {
-            let off = cell * 2;
-            state.planes[off] = b' ';
-            state.planes[0x10000 + off] = 0x07;
+            state.planes[layout.index(0, cell)] = b' ';
+            state.planes[layout.index(1, cell)] = 0x07;
         }
-        load_font_map(&mut state.planes, 0, &lib::vga_fonts::FONT_8X16, 16);
+        load_font_map(
+            &mut state.planes,
+            layout,
+            0,
+            &lib::vga_fonts::FONT_8X16,
+            16,
+        );
         state
     }
 
@@ -2154,6 +2167,106 @@ impl VgaState {
         }
     }
 
+    fn decoded_aperture(&self) -> ApertureRange {
+        let (start_page, end_page) = match (self.gc[6] >> 2) & 3 {
+            0 => (0xA0, 0xC0),
+            1 => (0xA0, 0xB0),
+            2 => (0xB0, 0xB8),
+            _ => (0xB8, 0xC0),
+        };
+        ApertureRange { start_page, end_page }
+    }
+
+    /// Complete physical ordering implied by the sequencer memory-mode
+    /// register. Chain-4 and sequential access use plane-minor storage;
+    /// odd/even access interleaves the selected plane pair into its 128K set.
+    pub const fn layout(&self) -> VramLayout {
+        if self.seq[4] & 0x08 != 0 || self.seq[4] & 0x04 != 0 {
+            VramLayout::PlaneMinor
+        } else {
+            VramLayout::OddEven
+        }
+    }
+
+    /// Resolve one CPU read in the decoded VGA aperture to the logical plane
+    /// byte selected by the sequencer/graphics-controller addressing mode.
+    /// The returned offset is always an offset *within a plane*; callers then
+    /// use `layout()` to locate that byte in the physical backing.
+    pub fn cpu_read_address(&self, address: usize) -> (usize, usize) {
+        if self.seq[4] & 0x08 != 0 {
+            return ((address >> 2) & 0xFFFF, address & 3);
+        }
+        if self.gc[5] & 0x10 != 0 {
+            return ((address >> 1) & 0xFFFF, usize::from(self.gc[4] & 2) | (address & 1));
+        }
+        (address & 0xFFFF, usize::from(self.gc[4] & 3))
+    }
+
+    /// Resolve one CPU write to its logical per-plane offset and effective map
+    /// mask. Chain-4 selects one map with A1:A0; odd/even selects one map from
+    /// each pair with A0; sequential addressing leaves the sequencer map mask
+    /// untouched.
+    pub fn cpu_write_address(&self, address: usize) -> (usize, u8) {
+        let map_mask = self.seq[2] & 0x0F;
+        if self.seq[4] & 0x08 != 0 {
+            let plane = address & 3;
+            return ((address >> 2) & 0xFFFF, map_mask & (1 << plane));
+        }
+        if self.seq[4] & 0x04 == 0 {
+            let parity_mask = if address & 1 == 0 { 0x05 } else { 0x0A };
+            return ((address >> 1) & 0xFFFF, map_mask & parity_mask);
+        }
+        (address & 0xFFFF, map_mask)
+    }
+
+    fn simple_alu(&self) -> bool {
+        self.gc[5] & 0x0B == 0
+            && self.gc[3] & 0x1F == 0
+            && self.gc[1] & 0x0F == 0
+            && self.gc[8] == 0xFF
+    }
+
+    fn direct_layout(&self) -> Option<VramLayout> {
+        if self.svga_w != 0 || !self.simple_alu() {
+            return None;
+        }
+        // Chain-4 overrides both odd/even controls. A standard VGA exposes
+        // only one 64K chained page even when GC6 decodes 128K.
+        if self.seq[4] & 0x08 != 0 {
+            return (self.seq[2] & 0x0F == 0x0F).then_some(self.layout());
+        }
+        // A direct odd/even alias is valid only for the conventional matched
+        // read/write setup and plane set 0. Other legal combinations remain
+        // trapped and use layout-aware logical indexing.
+        let write_oe = self.seq[4] & 0x04 == 0;
+        let read_oe = self.gc[5] & 0x10 != 0;
+        if write_oe && read_oe
+            && self.seq[2] & 0x0F == 0x03
+            && self.gc[4] & 0x02 == 0
+        {
+            return Some(self.layout());
+        }
+        None
+    }
+
+    pub fn cpu_aperture(&self) -> CpuAperture {
+        if self.svga_w != 0 {
+            return CpuAperture::None;
+        }
+        let range = self.decoded_aperture();
+        match self.direct_layout() {
+            Some(VramLayout::PlaneMinor) => CpuAperture::Direct {
+                range,
+                pages: 16.min(range.end_page - range.start_page),
+            },
+            Some(VramLayout::OddEven) => CpuAperture::Direct {
+                range,
+                pages: (range.end_page - range.start_page).min(32),
+            },
+            None => CpuAperture::Trapped { range },
+        }
+    }
+
     /// Emulated register-file write — the absent-card half of the VGA
     /// passthrough-vs-facade split (`VgaAdapter`).
     /// This per-thread struct IS the hardware then: `emulate_outb` routes the
@@ -2162,7 +2275,9 @@ impl VgaState {
     /// struct. Index/data pairs land in the same arrays the metal
     /// save/restore fills, so every consumer (renderer, mode queries) reads
     /// one representation.
-    pub fn port_write(&mut self, port: u16, v: u8) {
+    pub fn port_write(&mut self, port: u16, v: u8) -> PortWrite {
+        let old_aperture = self.cpu_aperture();
+        let old_layout = self.layout();
         match port {
             0x3C0 => {
                 if !self.ac_state.pending_data {
@@ -2214,7 +2329,11 @@ impl VgaState {
             0x3D5 => {
                 let i = self.crtc_index as usize;
                 if i >= 25 {
-                    return;
+                    return PortWrite {
+                        old_aperture,
+                        new_aperture: old_aperture,
+                        vram_transition: None,
+                    };
                 }
                 // CRTC write protect (index 11h bit 7, which every BIOS mode set
                 // leaves SET): indices 00h-07h are read-only while it holds. The
@@ -2232,7 +2351,11 @@ impl VgaState {
                     if i == 0x07 {
                         self.crtc[0x07] = (self.crtc[0x07] & !0x10) | (v & 0x10);
                     }
-                    return;
+                    return PortWrite {
+                        old_aperture,
+                        new_aperture: old_aperture,
+                        vram_transition: None,
+                    };
                 }
                 self.crtc[i] = v;
             }
@@ -2240,6 +2363,14 @@ impl VgaState {
             0x3D9 => self.cga_color_select = v, // CGA Colour Select (palette/bg)
             0x3DA => self.feature_ctl = v, // FCR write port (colour)
             _ => {}
+        }
+        let new_layout = self.layout();
+        let vram_transition = (old_layout != new_layout)
+            .then_some(VramTransition::between(old_layout, new_layout));
+        PortWrite {
+            old_aperture,
+            new_aperture: self.cpu_aperture(),
+            vram_transition,
         }
     }
 

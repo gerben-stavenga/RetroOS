@@ -2,7 +2,7 @@
 //! binary (the test harness supplies the global allocator the `#![no_std]` lib
 //! lacks), exercising the pure render path on synthetic VGA state.
 
-use vga::{self as vga_render, Frame, PixelFormat, VgaMode};
+use vga::{self as vga_render, Frame, PixelFormat, VgaMode, VramLayout, VramTransition};
 
 const TEXT80: VgaMode = VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 };
 const TEXT40: VgaMode = VgaMode::Text { cols: 40, rows: 25, cell_w: 18, cell_h: 16 };
@@ -59,83 +59,173 @@ fn initial_mode3_state_is_complete() {
     assert_eq!(state.planes.len(), 4 * 0x10000);
 
     let mut text = vec![0u8; 80 * 25 * 2];
-    vga_render::text_odd_even_merge(&state.planes, &mut text);
+    text.copy_from_slice(&state.planes[..80 * 25 * 2]);
     assert!(text.chunks_exact(2).all(|cell| cell == [b' ', 0x07]));
 
     for ch in 0..256 {
-        let plane = 0x20000 + ch * 32;
         let font = ch * 16;
-        assert_eq!(
-            &state.planes[plane..plane + 16],
-            &lib::vga_fonts::FONT_8X16[font..font + 16],
-        );
+        for row in 0..16 {
+            assert_eq!(
+                state.planes[state.layout().index(2, ch * 32 + row)],
+                lib::vga_fonts::FONT_8X16[font + row],
+            );
+        }
     }
 }
 
 #[test]
-fn chain4_munge_is_an_in_place_aperture_and_reversible() {
+fn complete_layout_transition_is_reversible() {
     let mut planes = vec![0u8; 4 * 0x10000];
     for plane in 0..4 {
         for off in 0..0x10000 {
-            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(61)
+            planes[VramLayout::PlaneMinor.index(plane, off)] = (plane as u8).wrapping_mul(61)
                 ^ (off as u8).wrapping_mul(17)
                 ^ (off >> 8) as u8;
         }
     }
     let original = planes.clone();
-    let mut chained = vec![0; 0x10000];
-    vga::chain4_merge(&planes, &mut chained);
-
-    vga::chain4_munge(&mut planes);
-    assert_eq!(&planes[..0x10000], &chained);
-
-    vga::chain4_unmunge(&mut planes);
+    VramTransition::between(VramLayout::PlaneMinor, VramLayout::OddEven)
+        .apply(&mut planes);
+    for plane in 0..4 {
+        for off in 0..0x10000 {
+            assert_eq!(
+                planes[VramLayout::OddEven.index(plane, off)],
+                original[VramLayout::PlaneMinor.index(plane, off)],
+            );
+        }
+    }
+    VramTransition::between(VramLayout::OddEven, VramLayout::PlaneMinor)
+        .apply(&mut planes);
     assert_eq!(planes, original);
 }
 
 #[test]
-fn text_odd_even_munge_is_an_in_place_aperture_and_reversible() {
-    let mut planes = vec![0u8; 4 * 0x10000];
-    for plane in 0..4 {
-        for off in 0..0x10000 {
-            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(43)
-                ^ (off as u8).wrapping_mul(29)
-                ^ (off >> 8) as u8;
+fn both_layouts_are_complete_bijections() {
+    for layout in [VramLayout::PlaneMinor, VramLayout::OddEven] {
+        let mut seen = vec![false; 4 * 0x10000];
+        for plane in 0..4 {
+            for off in 0..0x10000 {
+                let index = layout.index(plane, off);
+                assert!(index < seen.len() && !seen[index]);
+                seen[index] = true;
+            }
         }
+        assert!(seen.into_iter().all(|v| v));
     }
-    let original = planes.clone();
-    let mut text = vec![0; 0x8000];
-    vga::text_odd_even_merge(&planes, &mut text);
-
-    vga::text_odd_even_munge(&mut planes);
-    assert_eq!(&planes[..0x8000], &text);
-
-    vga::text_odd_even_unmunge(&mut planes);
-    assert_eq!(planes, original);
 }
 
 #[test]
-fn cga4_munge_is_an_in_place_aperture_and_reversible() {
-    let mut planes = vec![0u8; 4 * 0x10000];
-    for plane in 0..4 {
-        for off in 0..0x10000 {
-            planes[plane * 0x10000 + off] = (plane as u8).wrapping_mul(37)
-                ^ (off as u8).wrapping_mul(11)
-                ^ (off >> 8) as u8;
-        }
-    }
-    let original = planes.clone();
-    let mut aperture = vec![0; 0x4000];
-    for i in 0..0x2000 {
-        aperture[i * 2] = planes[i * 2];
-        aperture[i * 2 + 1] = planes[0x10000 + i * 2];
+fn register_writes_move_vram_with_the_cpu_aperture() {
+    let mut state = *vga::VgaState::new_mode3_boxed();
+    let mut vram = state.planes.clone();
+    // Materializing mode 3 produces the complete odd/even ordering. Its first
+    // 32K is exactly the B800 CPU view, while plane set 2/3 remains preserved
+    // in the second 128K.
+    assert_eq!(state.layout(), VramLayout::OddEven);
+    for cell in 0..80 * 25 {
+        assert_eq!(vram[cell * 2], b' ');
+        assert_eq!(vram[cell * 2 + 1], 0x07);
     }
 
-    vga::cga4_munge(&mut planes);
-    assert_eq!(&planes[..0x4000], &aperture);
+    // IT temporarily selects sequential plane access while loading character
+    // maps. Trapping can address the current complete ordering directly, so a
+    // register write does not reorder all VRAM.
+    state.port_write(0x3C4, 4);
+    let write = state.port_write(0x3C5, 0x04);
+    assert!(matches!(write.new_aperture, vga::CpuAperture::Trapped { .. }));
+    assert_eq!(write.vram_transition, Some(VramTransition::between(
+        VramLayout::OddEven,
+        VramLayout::PlaneMinor,
+    )));
+    write.vram_transition.unwrap().apply(&mut vram);
+    assert_eq!(state.layout(), VramLayout::PlaneMinor);
 
-    vga::cga4_unmunge(&mut planes);
-    assert_eq!(planes, original);
+    // Returning to odd/even addressing is immediately direct again and needs
+    // no representation change because the trapped access preserved layout.
+    let mode3_seq4 = vga::bios_mode_regs(3).unwrap().seq[4];
+    let write = state.port_write(0x3C5, mode3_seq4);
+    assert!(matches!(write.new_aperture, vga::CpuAperture::Direct { pages: 8, .. }));
+    assert_eq!(write.vram_transition, Some(VramTransition::between(
+        VramLayout::PlaneMinor,
+        VramLayout::OddEven,
+    )));
+}
+
+#[test]
+fn trapped_addressing_is_independent_of_backing_layout() {
+    let mut state = *vga::VgaState::new_mode3_boxed();
+    let mut vram = state.planes.clone();
+    assert_eq!(state.layout(), VramLayout::OddEven);
+
+    // Conventional odd/even: A0 selects plane 0/1 and the remaining address
+    // bits select a compact byte offset within that plane.
+    assert_eq!(state.cpu_read_address(6), (3, 0));
+    assert_eq!(state.cpu_read_address(7), (3, 1));
+    assert_eq!(state.cpu_write_address(6), (3, 0x01));
+    assert_eq!(state.cpu_write_address(7), (3, 0x02));
+
+    // Sequential plane access traps and changes the register-derived complete
+    // ordering to plane-minor.
+    state.port_write(0x3C4, 4);
+    let write = state.port_write(0x3C5, 0x04);
+    assert_eq!(write.vram_transition, Some(VramTransition::between(
+        VramLayout::OddEven,
+        VramLayout::PlaneMinor,
+    )));
+    write.vram_transition.unwrap().apply(&mut vram);
+    assert_eq!(state.cpu_write_address(7), (7, 0x03));
+    assert_eq!(state.cpu_read_address(7), (3, 1));
+
+    // Chain-4 uses A1:A0 as the plane and the upper address bits as offset.
+    state.port_write(0x3C4, 2);
+    state.port_write(0x3C5, 0x0F);
+    state.port_write(0x3C4, 4);
+    let write = state.port_write(0x3C5, 0x0E);
+    assert_eq!(state.cpu_read_address(7), (1, 3));
+    assert_eq!(state.cpu_write_address(7), (1, 0x08));
+    assert!(write.vram_transition.is_none());
+}
+
+#[test]
+fn odd_even_map_zero_exposes_the_full_128k_aperture() {
+    let mut state = vga::VgaState::new();
+    let regs = vga::bios_mode_regs(3).unwrap();
+    state.seq = regs.seq;
+    state.gc = regs.gc;
+    // GC6 memory map 00 decodes A0000..BFFFF. With the standard plane-0/1
+    // odd/even selection, that whole 128K is one direct prefix of OddEven.
+    state.gc[6] &= !0x0C;
+    assert_eq!(state.layout(), VramLayout::OddEven);
+    assert_eq!(
+        state.cpu_aperture(),
+        vga::CpuAperture::Direct {
+            range: vga::ApertureRange { start_page: 0xA0, end_page: 0xC0 },
+            pages: 32,
+        },
+    );
+}
+
+#[test]
+fn mode6_is_sequential_plane_zero_and_trapped() {
+    let mut state = vga::VgaState::new();
+    let regs = vga::bios_mode_regs(6).unwrap();
+    state.seq = regs.seq;
+    state.gc = regs.gc;
+    assert_eq!(state.classify_mode(), Some(VgaMode::Cga2));
+    assert_eq!(state.layout(), VramLayout::PlaneMinor);
+    assert_eq!(
+        state.cpu_aperture(),
+        vga::CpuAperture::Trapped {
+            range: vga::ApertureRange { start_page: 0xB8, end_page: 0xC0 },
+        },
+    );
+    assert_eq!(state.cpu_write_address(0x2345), (0x2345, 0x01));
+    assert_eq!(state.cpu_read_address(0x2345), (0x2345, 0));
+
+    // Sequential mode obeys the sequencer map mask without hidden special
+    // cases: selecting plane 2 routes the same offset only to plane 2.
+    state.seq[2] = 0x04;
+    assert_eq!(state.cpu_write_address(0x2345), (0x2345, 0x04));
 }
 
 #[test]
@@ -148,10 +238,10 @@ fn chain4_roundtrips_between_linear_aperture_and_planes() {
     let mut planes = vec![0xA5u8; 4 * 0x10000];
     vga_render::chain4_split(&chained, &mut planes);
     assert_eq!(planes[0], chained[0]);
-    assert_eq!(planes[0x10000], chained[1]);
-    assert_eq!(planes[0x20000], chained[2]);
-    assert_eq!(planes[0x30000], chained[3]);
-    assert_eq!(planes[1], chained[4]);
+    assert_eq!(planes[1], chained[1]);
+    assert_eq!(planes[2], chained[2]);
+    assert_eq!(planes[3], chained[3]);
+    assert_eq!(planes[4], chained[4]);
 
     let mut back = vec![0u8; 0x10000];
     vga_render::chain4_merge(&planes, &mut back);
@@ -169,15 +259,12 @@ fn text_odd_even_roundtrips_without_touching_other_plane_data() {
     let mut planes = vec![0xA5u8; 4 * 0x10000];
     vga_render::text_odd_even_split(&text, &mut planes);
     assert_eq!(planes[0], text[0]);
-    assert_eq!(planes[0x10000], text[1]);
-    assert_eq!(planes[2], text[2]);
-    assert_eq!(planes[0x10002], text[3]);
-    assert_eq!(planes[0x7FFE], text[0x7FFE]);
-    assert_eq!(planes[0x17FFE], text[0x7FFF]);
-    assert_eq!(planes[1], 0xA5);
-    assert_eq!(planes[0x10001], 0xA5);
-    assert_eq!(planes[0x8000], 0xA5);
-    assert_eq!(planes[0x20000], 0xA5);
+    assert_eq!(planes[1], text[1]);
+    assert_eq!(planes[4], text[2]);
+    assert_eq!(planes[5], text[3]);
+    assert_eq!(planes[VramLayout::PlaneMinor.index(0, 0x3FFF)], text[0x7FFE]);
+    assert_eq!(planes[VramLayout::PlaneMinor.index(1, 0x3FFF)], text[0x7FFF]);
+    assert_eq!(planes[VramLayout::PlaneMinor.index(2, 0)], 0xA5);
 
     let mut back = vec![0u8; 0x8000];
     vga_render::text_odd_even_merge(&planes, &mut back);
@@ -363,7 +450,8 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
-        mode: TEXT40, vram: &vram, planes: &[], ac: &ac, palette: &pal,
+        mode: TEXT40, vram: &vram, planes: &[],
+        ac: &ac, palette: &pal,
         dac_mask: 0xFF, font: &font, font_b: &font, blink: false, cga_palette: [0; 4],
         start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
     };
