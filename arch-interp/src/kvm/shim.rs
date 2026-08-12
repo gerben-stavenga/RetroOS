@@ -209,7 +209,7 @@ pub(crate) fn write_shim() {
     // TSS: only ss0/esp0 (the CPL3→CPL0 stack switch) and the IOPB matter.
     // iopb_offset = 0x88; bitmap all-1s = every port denied → IN/OUT at
     // CPL3/IOPL1 #GPs into the shared monitor, identical to the TCG engine and
-    // the metal default. `allow_io_ports` clears bits per kernel policy.
+    // the metal default. The per-entry policy clears permitted bits.
     let tss = sys_ptr(TSS_ADDR);
     unsafe {
         core::ptr::write_bytes(tss, 0, 0x1000);
@@ -234,7 +234,7 @@ pub(crate) fn write_shim() {
 /// grants lives below 0x3E0). Everything above stays permanently denied.
 const IOPB_PORTS: u16 = 0x3E0;
 
-/// One-time shim init shared by setup and the IOPB hooks: `allow_io_ports`
+/// One-time shim init shared by setup and IOPB policy installation.
 /// can be called by the kernel's per-swap-in policy BEFORE the first
 /// `execute()` builds the vcpu, and `write_shim`'s all-deny fill must not
 /// clobber grants made through that path.
@@ -273,6 +273,19 @@ pub(super) fn iopb_reset() {
     for tss in [TSS_ADDR, TSS64_ADDR] {
         unsafe {
             core::ptr::write_bytes(sys_ptr(tss + 0x88), 0xFF, (IOPB_PORTS / 8) as usize);
+        }
+    }
+}
+
+pub(super) fn iopb_install(policy: &arch_abi::IoPolicy) {
+    ensure_shim();
+    for tss in [TSS_ADDR, TSS64_ADDR] {
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                policy.denied_bytes().as_ptr(),
+                sys_ptr(tss + 0x88),
+                arch_abi::IO_POLICY_BYTES,
+            );
         }
     }
 }

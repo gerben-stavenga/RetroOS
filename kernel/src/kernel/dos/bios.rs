@@ -948,11 +948,9 @@ pub(super) fn int10<A: crate::Arch>(
             // Set video mode — record it, set BDA geometry, clear VRAM.
             let mode = (ax & 0x7F) as u8;
             let clear = ax & 0x80 == 0;
-            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga
-                && let Ok(native_mode) = display.cap_mut().guest_bios_set_mode(
-                    machine, bios_display, u16::from(mode))
-            {
-                *display.mode_mut() = native_mode;
+            if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
+                let _ = display.cap_mut().guest_bios_set_mode(
+                    machine, bios_display, u16::from(mode));
             }
             bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
@@ -1391,10 +1389,14 @@ fn vbe<A: crate::Arch>(
             done(regs, ok);
         }
         0x03 => {
-            // No emulated register file ⇒ this thread owns a real card, whose
-            // ROM answers VBE itself; report "no VBE mode set".
             let cur = match &dos.pc.vga {
-                DisplayedVga::Native(display) => display.vbe_mode().map_or(0, |mode| mode.number),
+                DisplayedVga::Native(display) => match display.cap()
+                    .bios_current_vbe_mode(machine, bios_display)
+                {
+                    Ok(Some((mode, linear))) => mode.number | if linear { 0x4000 } else { 0 },
+                    Ok(None) => 0,
+                    Err(_) => { done(regs, false); return; }
+                },
                 DisplayedVga::Emulated(dev, _) => VBE_MODES.iter()
                     .find(|&&(_, w, h, b)| {
                         w == dev.state.svga_w && h == dev.state.svga_h
@@ -1565,18 +1567,15 @@ fn vbe_mode_info<A: crate::Arch>(
         let format = if bpp == 8 {
             crate::kernel::display::FormatSpec::Indexed8
         } else {
-            // `from_rgb` takes [red_pos, red_size, green_pos, green_size,
-            // blue_pos, blue_size] — POSITION first, matching the order
-            // `parse_vbe_mode` reads them out of a real mode-info block
-            // (0x37 LinRedFieldPosition, then 0x36 LinRedMaskSize).
-            let masks = match bpp {
-                15 => [10, 5, 5, 5, 0, 5], // 5:5:5
-                16 => [11, 5, 5, 6, 0, 5], // 5:6:5
-                _ => [16, 8, 8, 8, 0, 8],  // 8:8:8
+            // Substitute-BIOS modes have fixed layouts; unlike descriptors
+            // parsed from native firmware, these require no validation.
+            let format = match bpp {
+                15 => crate::kernel::display::PixelFormat::RGB555,
+                16 => crate::kernel::display::PixelFormat::RGB565,
+                24 => crate::kernel::display::PixelFormat::RGB888,
+                _ => return false,
             };
-            crate::kernel::display::FormatSpec::Packed(
-                crate::kernel::display::PixelFormat::from_rgb(bpp.div_ceil(8), masks).unwrap()
-            )
+            crate::kernel::display::FormatSpec::Packed(format)
         };
         (w, h, bpp, w * u16::from(bpp.div_ceil(8)), super::machine::vga::svga_lfb_base(),
             format, 0xA000, 64, 64)
@@ -1634,15 +1633,9 @@ fn vbe_set_mode<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
-        return match display.cap_mut()
+        return display.cap_mut()
             .guest_bios_set_mode_request(machine, bios_display, regs.rbx as u16)
-        {
-            Ok(mode) => {
-                *display.mode_mut() = mode;
-                true
-            }
-            Err(_) => false,
-        };
+            .is_ok();
     }
     let want = regs.rbx as u16 & 0x1FF;
     let Some(&(_, w, h, bpp)) = VBE_MODES.iter().find(|&&(n, ..)| n == want) else {
@@ -1661,30 +1654,14 @@ fn vbe_window<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     if let DisplayedVga::Native(display) = &mut dos.pc.as_mut().vga {
-        if (regs.rbx >> 8) as u8 == 0 {
-            let mode = match display.mode() {
-                crate::kernel::platform::NativeVgaMode::VbeBanked { mode, .. } => mode,
-                _ => return false,
-            };
-            if display.cap_mut().bios_set_bank(
-                machine, bios_display, mode, regs.rdx as u16).is_err()
-            {
-                return false;
+        let set = ((regs.rbx >> 8) as u8 == 0).then_some(regs.rdx as u16);
+        return match display.cap().guest_bios_window(machine, bios_display, set) {
+            Ok(bank) => {
+                regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
+                true
             }
-            if let crate::kernel::platform::NativeVgaMode::VbeBanked {
-                current_bank, ..
-            } = display.mode_mut()
-            {
-                *current_bank = regs.rdx as u16;
-            }
-            return true;
-        }
-        let bank = match display.mode() {
-            crate::kernel::platform::NativeVgaMode::VbeBanked { current_bank, .. } => current_bank,
-            _ => 0,
+            Err(_) => false,
         };
-        regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
-        return true;
     }
     if (regs.rbx >> 8) as u8 == 0 {
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);

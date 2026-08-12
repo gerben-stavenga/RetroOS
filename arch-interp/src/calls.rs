@@ -35,6 +35,7 @@ pub mod arch_call {
     pub const REARM_IRQ: u64 = 0x11C;
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;
     pub const MAP_FRESH_RANGE: u64 = 0x11E;
+    pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120;
 }
 
 /// Resume the current Vcpu on the software core and return the next event.
@@ -83,6 +84,17 @@ pub fn arch_map_low_mem() {
 pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
     crate::mmu::copy_entries(src_vpage, dst_vpage, count);
     crate::engine::invalidate_pages(dst_vpage, count);
+}
+
+pub fn arch_redirect_physical_aliases(
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    count: usize,
+    redirect: bool,
+) {
+    crate::paging::space_redirect_physical_aliases(
+        physical_ppage, shadow_vpage, count, redirect);
+    crate::engine::flush();
 }
 
 /// Swap page-table entries a↔b.

@@ -53,6 +53,16 @@ pub fn arch_switch_to(
     }
 }
 
+pub fn arch_switch_fx(fx: &mut crate::FxState) {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch_call::SWITCH_FX as u32,
+            in("edx") fx as *mut _ as u32,
+        );
+    }
+}
+
 /// COW fork the current address space. Fills child root.
 /// Caller must save parent root after (fork modifies entries for COW).
 pub fn arch_user_fork(child_root: &mut super::RootPageTable) {
@@ -119,6 +129,28 @@ pub fn arch_copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) 
             in("edx") src_vpage as u32,
             in("ecx") dst_vpage as u32,
             in("ebx") count as u32,
+        );
+    }
+}
+
+pub fn arch_redirect_physical_aliases(
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    count: usize,
+    redirect: bool,
+) {
+    unsafe {
+        core::arch::asm!(
+            "push esi",
+            "mov esi, {hi:e}",
+            "int 0x80",
+            "pop esi",
+            hi = in(reg) (physical_ppage >> 32) as u32,
+            in("eax") crate::arch_call::REDIRECT_PHYSICAL_ALIASES as u32,
+            in("edx") physical_ppage as u32,
+            in("ecx") shadow_vpage as u32,
+            in("ebx") count as u32,
+            in("edi") redirect as u32,
         );
     }
 }

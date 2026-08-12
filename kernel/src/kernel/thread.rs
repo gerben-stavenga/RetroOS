@@ -181,7 +181,7 @@ impl<A: crate::Arch> Personality<A> {
         display: crate::kernel::display::Display,
     ) {
         match self {
-            Self::Dos(d) => d.materialize(
+            Self::Dos(d) => d.acquire_display_restore(
                 machine, bios_workspace,
                 crate::kernel::display::DisplayHandoff::Surface(display)),
             Self::Linux(_) => crate::kernel::linux::adopt_console_vga(display),
@@ -225,13 +225,13 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Out-focus hook: snapshot whatever state lives only in hardware (VGA
     /// framebuffer + register set, shared TTY console buffer).
-    pub fn suspend(
+    pub fn release_display(
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::DisplayHandoff {
         match self {
-            Self::Dos(d) => d.suspend(machine, bios_workspace),
+            Self::Dos(d) => d.release_display(machine, bios_workspace),
             Self::Linux(l) => crate::kernel::display::DisplayHandoff::Surface(l.suspend(machine)),
         }
     }
@@ -243,34 +243,7 @@ impl<A: crate::Arch> Personality<A> {
     ) -> crate::kernel::display::Display {
         match self {
             Self::Dos(d) => d.suspend_for_osd(machine, bios_workspace),
-            Self::Linux(l) => l.suspend(machine),
-        }
-    }
-
-    /// Keep the display with its focused personality while the OSD overlays
-    /// that personality's ordinary output. The OSD owns no display token.
-    pub fn hold_display_for_osd(
-        &mut self,
-        display: crate::kernel::display::Display,
-    ) {
-        match self {
-            Self::Dos(dos) => {
-                dos.pc.vga.hold_surface(display);
-            }
-            Self::Linux(_) => crate::kernel::linux::restore_console_vga(display),
-        }
-    }
-
-    /// Temporarily move the focused personality's OSD surface through the
-    /// close transition. `None` means the personality already owns native VGA:
-    /// there is no borrowed `Display` to return. This can occur when a forced
-    /// scheduler/focus transition dismisses a monitor at the ownership edge.
-    pub fn take_display_for_osd(&mut self) -> Option<crate::kernel::display::Display> {
-        match self {
-            Self::Dos(dos) => {
-                dos.pc.vga.take_surface()
-            }
-            Self::Linux(_) => Some(crate::kernel::linux::save_console_vga()),
+            Self::Linux(_) => crate::kernel::linux::save_console_vga(),
         }
     }
 
@@ -284,14 +257,32 @@ impl<A: crate::Arch> Personality<A> {
     /// Visual rematerialization only — CPU-binding side effects (LDT, TLS,
     /// deferred wait_status writeout) live in `on_resume` and run
     /// independently of focus changes.
-    pub fn materialize(
+    pub fn acquire_display_restore(
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
         match self {
-            Self::Dos(d) => d.materialize(machine, bios_workspace, display),
+            Self::Dos(d) => d.acquire_display_restore(machine, bios_workspace, display),
+            Self::Linux(l) => {
+                let display = display.into_surface(machine, bios_workspace);
+                l.materialize(machine, display);
+            }
+        }
+    }
+
+    /// Attach a handoff whose current contents are authoritative. DOS binds
+    /// the live adapter without replaying its recovery snapshot; a surface
+    /// display is already value state, so Linux's ordinary attach is replace.
+    pub fn acquire_display_replace(
+        &mut self,
+        machine: &mut A,
+        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        display: crate::kernel::display::DisplayHandoff,
+    ) {
+        match self {
+            Self::Dos(d) => d.acquire_display_replace(machine, display),
             Self::Linux(l) => {
                 let display = display.into_surface(machine, bios_workspace);
                 l.materialize(machine, display);
@@ -387,13 +378,14 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
-        match self {
+        crate::kernel::osd::with_display(|external| match self {
             Self::Dos(dos) => {
                 let now_ticks = machine.get_ticks();
-                crate::kernel::dos::display_tick(machine, bios, dos, regs, now_ticks);
+                crate::kernel::dos::display_tick(
+                    machine, bios, dos, regs, now_ticks, external);
             }
-            Self::Linux(_) => crate::kernel::linux::display_tick(machine, bios),
-        }
+            Self::Linux(_) => crate::kernel::linux::display_tick(machine, bios, external),
+        });
         if prof {
             crate::kernel::startup::bill_slice2(
                 0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);
@@ -741,10 +733,10 @@ pub fn create_thread<'a, A: crate::Arch>(threads: &'a mut [Thread<A>], machine: 
     None
 }
 
-/// Reserve a thread whose page-table slot will be filled in place by a fork.
-/// This avoids carrying a value-sized `A::PageTable` (3 KiB on metal) through
-/// the already-deep fork/exec kernel stack merely to move it into the slot.
-pub fn create_thread_for_fork<'a, A: crate::Arch>(
+/// Reserve the child record while leaving the current address space live.
+/// The caller COW-forks that live space into the parent's now-parked slot;
+/// this fresh child's empty slot then denotes the still-live address space.
+pub fn reserve_live_child<'a, A: crate::Arch>(
     threads: &'a mut [Thread<A>],
     machine: &mut A,
     parent_tid: usize,
@@ -763,9 +755,6 @@ pub fn create_thread_for_fork<'a, A: crate::Arch>(
             k.state = ThreadState::Ready;
             k.time = machine.get_ticks() as u32;
             k.vcpu.regs = Regs::empty();
-            // `Unused` threads own an empty/default slot. Fork writes the COW
-            // root directly here before the child is activated.
-            machine.user_fork(&mut k.vcpu.space);
             k.fx_state = machine.clean_fx_template();
             k.exit_code = 0;
             k.addr_hash = 0;
@@ -885,7 +874,7 @@ pub fn exit_thread<A: crate::Arch>(
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     tid: usize,
     exit_code: i32,
-    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
@@ -900,17 +889,16 @@ pub fn exit_thread<A: crate::Arch>(
         && (parent_tid as usize) < MAX_THREADS
         && matches!(threads[parent_tid as usize].personality, Personality::Dos(_));
 
-    // DOS EXEC return transfers the complete guest VGA. The parent's recovery
-    // VGA (normally emulated into a headless target) moves into the dying slot
-    // and is discarded with it.
+    // DOS EXEC return transfers the complete child VGA through the event loop;
+    // the parked parent's recovery image remains in its own record until the
+    // parent address space is active and can consume the replacement.
     if return_dos_vga {
         let child_was_focused = tid == crate::kernel::focus::focused();
-        let (child, parent) = get_two_threads(threads, tid, parent_tid as usize);
-        let (Personality::Dos(child_dos), Personality::Dos(parent_dos)) =
-            (&mut child.personality, &mut parent.personality)
-        else { unreachable!() };
-        child_dos.pc.vga.prepare_thread_transfer(machine);
-        core::mem::swap(&mut child_dos.pc.vga, &mut parent_dos.pc.vga);
+        let child = &mut threads[tid];
+        let Personality::Dos(child_dos) = &mut child.personality else { unreachable!() };
+        let returned = child_dos.pc.vga.release_for_parent_replace(machine);
+        assert!(exiting_display.is_none(), "unconsumed exiting display");
+        *exiting_display = Some(crate::kernel::display::ExitDisplay::DosReplace(returned));
         if child_was_focused {
             crate::kernel::focus::adopt(parent_tid as usize);
         }
@@ -924,9 +912,9 @@ pub fn exit_thread<A: crate::Arch>(
         // DOS parent adopts the unchanged live token; other successors restore
         // their own detached model.
         if tid == crate::kernel::focus::focused() {
-            let display = thread.personality.suspend(machine, bios_workspace);
+            let display = thread.personality.release_display(machine, bios_workspace);
             assert!(exiting_display.is_none(), "unconsumed exiting display");
-            *exiting_display = Some(display);
+            *exiting_display = Some(crate::kernel::display::ExitDisplay::Restore(display));
         }
         // The card outlives its holder: whatever the dying thread had goes
         // back into the handoff for the next owner, exactly as the display

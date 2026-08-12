@@ -27,13 +27,6 @@ impl Arch for Metal {
     fn outb(&mut self, port: u16, val: u8) { super::x86::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { super::x86::outw(port, val) }
     fn outl(&mut self, port: u16, val: u32) { super::x86::outl(port, val) }
-    fn allow_io_ports(&mut self, port: u16, count: usize) {
-        super::descriptors::allow_io_ports(port, count)
-    }
-    fn reset_io_bitmap(&mut self) {
-        super::descriptors::reset_io_bitmap()
-    }
-
     // ── Execution & scheduling ──
     //
     // Metal keeps the live frame in `traps::REGS` (the int-0x80 trap save area).
@@ -50,7 +43,8 @@ impl Arch for Metal {
     }
 
     #[allow(clippy::deref_addrof)]
-    fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
+    fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        super::descriptors::install_io_policy(io);
         // Bridge the loop-owned registers to the live trap frame for the run
         // (the active SPACE already lives in `REGS.space`), then read them back.
         let live = unsafe { &mut *(&raw mut super::traps::REGS) };
@@ -70,6 +64,9 @@ impl Arch for Metal {
         let mut buf = Vcpu::<Self>::new(cur_regs, incoming);
         super::calls::arch_switch_to(&mut buf, hash_ptr, fx_ptr);
         buf.space
+    }
+    fn switch_fx(&mut self, fx: &mut Self::Fx) {
+        super::calls::arch_switch_fx(fx);
     }
 
     // ── Timer ──
@@ -100,6 +97,12 @@ impl Arch for Metal {
     fn map_vga_text_aperture(&mut self) { super::calls::arch_map_vga_text_aperture() }
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize) {
         super::calls::arch_copy_page_entries(src_vpage, dst_vpage, count)
+    }
+    fn redirect_physical_aliases(
+        &mut self, physical_ppage: u64, shadow_vpage: usize, count: usize, redirect: bool,
+    ) {
+        super::calls::arch_redirect_physical_aliases(
+            physical_ppage, shadow_vpage, count, redirect)
     }
     fn swap_page_entries(&mut self, a_vpage: usize, b_vpage: usize, count: usize) {
         super::calls::arch_swap_page_entries(a_vpage, b_vpage, count)

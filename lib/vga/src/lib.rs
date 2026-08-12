@@ -736,6 +736,36 @@ impl PixelFormat {
         blue_size: 2,
     };
 
+    pub const RGB555: PixelFormat = PixelFormat {
+        bytes_per_pixel: 2,
+        red_pos: 10,
+        red_size: 5,
+        green_pos: 5,
+        green_size: 5,
+        blue_pos: 0,
+        blue_size: 5,
+    };
+
+    pub const RGB565: PixelFormat = PixelFormat {
+        bytes_per_pixel: 2,
+        red_pos: 11,
+        red_size: 5,
+        green_pos: 5,
+        green_size: 6,
+        blue_pos: 0,
+        blue_size: 5,
+    };
+
+    pub const RGB888: PixelFormat = PixelFormat {
+        bytes_per_pixel: 3,
+        red_pos: 16,
+        red_size: 8,
+        green_pos: 8,
+        green_size: 8,
+        blue_pos: 0,
+        blue_size: 8,
+    };
+
     pub const NATIVE: PixelFormat = PixelFormat {
         bytes_per_pixel: 4,
         red_pos: 16,
@@ -1996,10 +2026,6 @@ pub struct VgaState {
     pub svga_pitch: u16,
     /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
     pub svga_bank: u16,
-    /// This address space's A0000 window is mapped as the planar trap
-    /// (present=0 + MMIO marker), so kernel-side writes must route through
-    /// `vram_write` instead of raw guest-memory stores.
-    pub a0000_trapped: bool,
 }
 
 impl Default for VgaState {
@@ -2048,7 +2074,6 @@ impl VgaState {
             core::ptr::addr_of_mut!((*p).svga_bpp).write(0);
             core::ptr::addr_of_mut!((*p).svga_pitch).write(0);
             core::ptr::addr_of_mut!((*p).svga_bank).write(0);
-            core::ptr::addr_of_mut!((*p).a0000_trapped).write(false);
             let mut boxed = boxed.assume_init();
             fill_fallback_palette(&mut boxed.dac);
             boxed
@@ -2126,7 +2151,6 @@ impl VgaState {
             svga_bpp: 0,
             svga_pitch: 0,
             svga_bank: 0,
-            a0000_trapped: false,
         }
     }
 

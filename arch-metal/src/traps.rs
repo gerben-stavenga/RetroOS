@@ -86,6 +86,7 @@ pub(crate) static mut REGS: Vcpu = Vcpu::new(Regs::empty(), paging2::RootPageTab
 pub mod arch_call {
     pub const EXECUTE: u64 = 0x100;      // Swap kernel↔user regs
     pub const SWITCH_TO: u64 = 0x101;    // Thread switch: EDX=out_regs, ECX=out_root, EBX=in_regs, ESI=in_root
+    pub const SWITCH_FX: u64 = 0x102;    // Swap live FPU/SSE with EDX save area
     pub const FORK: u64 = 0x105;         // COW fork. EDX=out RootPageTable. Returns new root phys in EAX.
     pub const CLEAN: u64 = 0x106;        // Free all user pages + flush TLB
     pub const SET_PAGE_FLAGS: u64 = 0x108; // EDX=start_vpage, ECX=count, EBX=flags (bit0=W, bit1=X)
@@ -106,6 +107,7 @@ pub mod arch_call {
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
     pub const MAP_FRESH_RANGE: u64 = 0x11E;   // EDX=vpage_start, ECX=count — replace range with fresh anon frames
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
+    pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120; // ESI:EDX=phys page ECX=shadow vpage EBX=count EDI=redirect
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -198,6 +200,13 @@ fn arch_dispatch(regs: &mut Regs) {
             regs.frame.rflags &= !(1 << 14); // HACK: strip NT
         }
         arch_call::SWITCH_TO => arch_switch_to(regs),
+        arch_call::SWITCH_FX => {
+            let fx = regs.rdx as u32 as *mut crate::x86::FxState;
+            let mut tmp = crate::x86::FxState::zeroed();
+            tmp.save();
+            unsafe { (*fx).restore(); }
+            unsafe { *fx = tmp; }
+        }
         // FORK: EDX=child_root out. COW fork, fill child, free temp page.
         arch_call::FORK => {
             let child_root = regs.rdx as usize as *mut paging2::RootPageTable;
@@ -230,6 +239,12 @@ fn arch_dispatch(regs: &mut Regs) {
         arch_call::MAP_VGA_TEXT_APERTURE => paging2::map_vga_text_aperture_user(),
         arch_call::COPY_PAGE_ENTRIES => {
             paging2::copy_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
+        }
+        arch_call::REDIRECT_PHYSICAL_ALIASES => {
+            let physical_ppage = (regs.rdx as u32 as u64)
+                | ((regs.rsi as u32 as u64) << 32);
+            paging2::redirect_physical_aliases(
+                physical_ppage, regs.rcx as usize, regs.rbx as usize, regs.rdi != 0);
         }
         arch_call::SWAP_PAGE_ENTRIES => {
             paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);

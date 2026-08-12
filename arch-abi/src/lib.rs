@@ -22,6 +22,37 @@ pub use arch::{Arch, GuestBytes, Vcpu};
 
 pub mod monitor;
 
+/// Number of scalar x86 I/O ports covered by the guest TSS bitmap. Ports at
+/// and above this limit remain denied permanently.
+pub const IO_POLICY_PORTS: usize = 0x3E0;
+pub const IO_POLICY_BYTES: usize = IO_POLICY_PORTS / 8;
+
+/// Complete thread-derived scalar-port policy. x86 IOPB semantics are used
+/// directly: a set bit denies/traps the port, a clear bit permits it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IoPolicy {
+    denied: [u8; IO_POLICY_BYTES],
+}
+
+impl IoPolicy {
+    pub const fn deny_all() -> Self {
+        Self { denied: [0xFF; IO_POLICY_BYTES] }
+    }
+
+    pub fn allow(&mut self, port: u16, count: usize) {
+        let end = usize::from(port).saturating_add(count).min(IO_POLICY_PORTS);
+        for p in usize::from(port)..end {
+            self.denied[p / 8] &= !(1 << (p % 8));
+        }
+    }
+
+    pub fn denied_bytes(&self) -> &[u8; IO_POLICY_BYTES] { &self.denied }
+}
+
+impl Default for IoPolicy {
+    fn default() -> Self { Self::deny_all() }
+}
+
 /// Boot-time platform configuration, read once by the platform entry point and
 /// handed to `startup` — instead of the kernel poking firmware ports itself.
 ///

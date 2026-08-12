@@ -476,6 +476,33 @@ impl PcMachine {
             return;
         }
 
+        let detached_lfb = match &self.vga {
+            DisplayedVga::Emulated(vga, _) => vga.physical_lfb
+                .map(|base| (base & !0xFFF, vga.svga_pages)),
+            DisplayedVga::Native(_) => None,
+        };
+        if let Some((lfb_base, lfb_pages)) = detached_lfb {
+            let mapping_start = u64::from(physical & !0xFFF);
+            let mapping_end = mapping_start + u64::from(page_count) * crate::PAGE_SIZE as u64;
+            let lfb_start = u64::from(lfb_base);
+            let lfb_end = lfb_start + lfb_pages as u64 * crate::PAGE_SIZE as u64;
+            if mapping_start < lfb_end && lfb_start < mapping_end {
+                machine.map_phys_range(
+                    (virtual_base >> 12) as usize,
+                    page_count as usize,
+                    mapping_start >> 12,
+                    arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+                );
+                machine.redirect_physical_aliases(
+                    lfb_start >> 12,
+                    vga::svga_lfb_base() as usize >> 12,
+                    lfb_pages,
+                    true,
+                );
+                return;
+            }
+        }
+
         if matches!(self.vga, DisplayedVga::Emulated(_, _))
             && vga::svga_lfb_reserved_contains(physical, size)
         {
@@ -747,11 +774,13 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             };
             let old_gc6 = (port == 0x3CF && dev.state.gc_index & 0x0F == 6)
                 .then_some(dev.state.gc[6]);
+            let old_seq4 = (port == 0x3C5 && dev.state.seq_index & 0x1F == 4)
+                .then_some(dev.state.seq[4]);
             dev.state.port_write(port, val);
             // A Sequencer data write may flip chain-4 (mode 13h↔Mode X) or
             // select a plane — drive the A0000 paging alias.
-            if port == 0x3C5 {
-                vga::on_seq_write(machine, pc, regs);
+            if let Some(old_seq4) = old_seq4 {
+                vga::on_seq_write(machine, pc, old_seq4);
             }
             if let Some(old_gc6) = old_gc6 {
                 vga::on_gc_write(machine, pc, old_gc6);

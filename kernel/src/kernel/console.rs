@@ -115,8 +115,7 @@ fn monitor_key<A: crate::Arch>(
         // The personality already hands back a renderable display. A native
         // VGA display is Mode 13h-backed just like every other packed output.
         let display = personality.suspend_for_osd(machine, bios_workspace);
-        personality.hold_display_for_osd(display);
-        crate::kernel::osd::open();
+        crate::kernel::osd::open(crate::kernel::osd::OsdDisplay::new(display));
         personality.repaint_osd();
         return true;
     }
@@ -131,8 +130,8 @@ pub fn restore_from_monitor<A: crate::Arch>(
     _regs: &mut Regs,
     personality: &mut thread::Personality<A>,
 ) {
-    if let Some(display) = personality.take_display_for_osd() {
-        personality.materialize_from_osd(machine, bios_workspace, display);
+    if let Some(display) = crate::kernel::osd::take_display() {
+        personality.materialize_from_osd(machine, bios_workspace, display.into_inner());
     }
 }
 

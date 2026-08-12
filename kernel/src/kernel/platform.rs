@@ -29,6 +29,59 @@ pub struct VbeMode {
     pub window_function: u32,
 }
 
+/// A BIOS mode already validated for use as the kernel display.
+///
+/// The raw mode list remains [`VbeMode`] because DOS must see everything the
+/// firmware advertises. Only the BIOS driver can mint this narrower type, so
+/// `Display` never has to reject a selected mode or recover its VGA token.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct VbeDisplayMode {
+    mode: VbeMode,
+    rgb: crate::kernel::display::PixelFormat,
+    scanout: VbeDisplayScanout,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum VbeDisplayScanout {
+    Linear { offset: usize, pages: usize },
+    Banked,
+}
+
+impl VbeDisplayMode {
+    pub(crate) fn try_from_bios_mode(mode: VbeMode) -> Option<Self> {
+        let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
+            return None;
+        };
+        if mode.physical_base != 0 {
+            let offset = mode.physical_base as usize & (crate::PAGE_SIZE - 1);
+            let bytes = usize::from(mode.pitch).checked_mul(usize::from(mode.height))?;
+            let pages = offset.checked_add(bytes)?.div_ceil(crate::PAGE_SIZE);
+            let end = arch_abi::FB_WINDOW_BASE
+                .checked_add(pages.checked_mul(crate::PAGE_SIZE)?)?;
+            (end <= arch_abi::FB_WINDOW_END).then_some(Self {
+                mode,
+                rgb,
+                scanout: VbeDisplayScanout::Linear { offset, pages },
+            })
+        } else if mode.window_segment != 0
+            && mode.window_granularity_kb != 0
+            && mode.window_size_kb != 0
+        {
+            Some(Self { mode, rgb, scanout: VbeDisplayScanout::Banked })
+        } else {
+            None
+        }
+    }
+
+    pub fn mode(self) -> VbeMode { self.mode }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (VbeMode, crate::kernel::display::PixelFormat, VbeDisplayScanout) {
+        (self.mode, self.rgb, self.scanout)
+    }
+}
+
 use crate::println;
 
 pub struct Platform {
@@ -49,7 +102,7 @@ pub struct Platform {
     /// linear framebuffer or a firmware-banked aperture.
     /// Discovered once at boot; selecting/mapping it still requires ownership
     /// of the move-only `VgaCap`.
-    pub vbe_mode: Option<VbeMode>,
+    pub vbe_mode: Option<VbeDisplayMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
     /// latches, CR24 AC flip-flop, CR26 AC index). With them, task
@@ -87,23 +140,11 @@ pub struct VgaCap {
     _private: (),
 }
 
-/// Bookkeeping for the VGA state which is currently authoritative in hardware.
-/// VBE descriptor data belongs to that state, never to the access capability.
-#[derive(Clone, Copy, Debug)]
-pub enum NativeVgaMode {
-    Legacy,
-    VbeLinear(VbeMode),
-    VbeBanked { mode: VbeMode, current_bank: u16 },
-}
-
 /// A physical VGA whose registers and VRAM are the authoritative VGA state.
-/// Removing the wrapper explicitly marks that state captured/dirty and leaves
-/// only the move-only display capability.
+/// The adapter and persistent firmware workspace are the source of truth;
+/// mode and bank are queried rather than duplicated in this ownership token.
 #[derive(Debug)]
-pub struct NativeVga {
-    cap: VgaCap,
-    mode: NativeVgaMode,
-}
+pub struct NativeVga(VgaCap);
 
 impl Default for NativeVga {
     fn default() -> Self { Self::new() }
@@ -111,31 +152,16 @@ impl Default for NativeVga {
 
 impl NativeVga {
     pub fn new() -> Self {
-        Self { cap: VgaCap { _private: () }, mode: NativeVgaMode::Legacy }
+        Self(VgaCap { _private: () })
     }
 
-    pub(crate) fn into_parts(self) -> (VgaCap, NativeVgaMode) {
-        (self.cap, self.mode)
-    }
-
-    pub fn vbe_mode(&self) -> Option<VbeMode> {
-        match self.mode {
-            NativeVgaMode::Legacy => None,
-            NativeVgaMode::VbeLinear(mode)
-            | NativeVgaMode::VbeBanked { mode, .. } => Some(mode),
-        }
-    }
-
-    pub fn mode(&self) -> NativeVgaMode { self.mode }
-    pub(crate) fn mode_mut(&mut self) -> &mut NativeVgaMode { &mut self.mode }
-    pub(crate) fn cap(&self) -> &VgaCap { &self.cap }
-    pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.cap }
+    pub(crate) fn into_cap(self) -> VgaCap { self.0 }
+    pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
+    pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
 
     /// Mark the hardware state authoritative again after a complete software
     /// VGA has been restored into the adapter.
-    pub(crate) fn restored(cap: VgaCap, mode: NativeVgaMode) -> NativeVga {
-        NativeVga { cap, mode }
-    }
+    pub(crate) fn restored(cap: VgaCap) -> NativeVga { NativeVga(cap) }
 }
 
 pub struct ProbedPlatform {
@@ -406,7 +432,7 @@ pub fn probe<A: crate::Arch>(
     }
     let p = get();
     let display = display.unwrap_or_else(|| {
-        crate::kernel::display::Display::new_vga(NativeVga::new())
+        crate::kernel::display::Display::new_vga(NativeVga::new().into_cap())
     });
     println!(
         "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",
@@ -473,16 +499,19 @@ pub fn apply_audio_mode<A: crate::Arch>(
 /// Complete boot-time display discovery after the pristine BIOS environment
 /// exists. This records a descriptor only; it neither sets the mode nor maps
 /// the framebuffer.
-pub fn set_vbe_mode(mode: Option<VbeMode>) {
+pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::set_vbe_mode before probe");
     p.vbe_mode = mode;
     match mode {
-        Some(m) => crate::println!(
+        Some(selected) => {
+            let m = selected.mode();
+            crate::println!(
             "VBE: selected mode {:#x} {}x{} pitch={} phys={:#x} bank={:04x}:{}K/{}K",
             m.number, m.width, m.height, m.pitch, m.physical_base,
             m.window_segment, m.window_granularity_kb, m.window_size_kb,
-        ),
+            )
+        },
         None if p.vga_passthrough => {
             crate::println!("VBE: no usable packed mode; selected display is Mode 13h")
         }

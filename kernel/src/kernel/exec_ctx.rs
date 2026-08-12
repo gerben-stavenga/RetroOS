@@ -57,8 +57,8 @@ impl<A: crate::Arch> ExecutionContext<A> {
         machine: &mut A,
         personality: &thread::Personality<A>,
     ) -> crate::KernelEvent {
-        crate::kernel::io_policy::apply(machine, personality);
-        machine.execute(&mut self.regs)
+        let io = crate::kernel::io_policy::for_personality(personality);
+        machine.execute(&mut self.regs, &io)
     }
 
     /// Execution swap: make `new_tid` the running thread. No-op when it already
@@ -91,6 +91,17 @@ impl<A: crate::Arch> ExecutionContext<A> {
         old.kernel.cpu_hash = thread::hash_regs(&old.kernel.vcpu.regs);
         new.personality.on_resume(machine);
         self.tid = new_tid;
+    }
+
+    /// Relabel an unchanged live address space after fork/exec. The fork path
+    /// has already parked the parent's registers/FPU and installed the
+    /// child's, so no CR3 transition is permitted here.
+    pub fn continue_as(&mut self, threads: &mut [thread::Thread<A>], machine: &mut A, tid: usize) {
+        thread::get_thread(threads, tid)
+            .expect("continue_as: invalid child")
+            .personality
+            .on_resume(machine);
+        self.tid = tid;
     }
 }
 

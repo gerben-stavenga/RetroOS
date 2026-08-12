@@ -128,7 +128,7 @@ fn scanout<'a, A: crate::Arch>(
                 scratch.clear();
                 scratch.resize(text_len + 2 * VGA_MAP_LEN, 0);
             }
-            if state.a0000_trapped {
+            if super::machine::vga::trapped_aperture(state).is_some() {
                 // During character-generator access GC[6] may turn B8000 into
                 // the sequential plane aperture. On metal that window is an
                 // intentional MMIO page fault, so kernel scanout must not
@@ -271,6 +271,7 @@ fn voodoo_display_tick<A: crate::Arch>(
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
     now_ticks: u64,
+    external: Option<&mut crate::kernel::display::Display>,
 ) -> bool {
     if !pc.voodoo.active() {
         return false;
@@ -296,10 +297,10 @@ fn voodoo_display_tick<A: crate::Arch>(
     // nothing to emulate that with, so the frame is dropped. No token at all
     // means this thread does not own the console: a Glide program in the
     // background still swaps, it just is not seen.
-    let display = match &mut pc.vga {
+    let display = external.or(match &mut pc.vga {
         DisplayedVga::Emulated(_, display) => Some(display),
         DisplayedVga::Native(_) => None,
-    };
+    });
     if let Some(display) = display {
         // Hosted windows track the card's native geometry. A framebuffer's
         // shadow width was selected with its display mode and remains shared
@@ -335,19 +336,21 @@ pub fn display_tick<A: crate::Arch>(
     pc: &mut PcMachine,
     regs: &Regs,
     now_ticks: u64,
+    mut external: Option<&mut crate::kernel::display::Display>,
 ) {
     
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
-    if voodoo_display_tick(machine, &mut *bios, pc, now_ticks) {
+    if voodoo_display_tick(machine, &mut *bios, pc, now_ticks, external.as_deref_mut()) {
         return;
     }
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
-    let DisplayedVga::Emulated(dev, display) = &mut pc.vga else {
+    let DisplayedVga::Emulated(dev, owned_display) = &mut pc.vga else {
         return;
     };
+    let display = external.unwrap_or(owned_display);
     let vga = &mut dev.state;
     if display.is_headless() { return; }
     let prof = crate::kernel::startup::profile_enabled();
@@ -389,10 +392,11 @@ pub fn display_tick<A: crate::Arch>(
                     );
                 }
             }
-            crate::kernel::display::ScanoutAction::Publish => {
-                let (vga_h, out_w, shadow) =
-                    crate::kernel::display::completed_shadow(&mut pc.present_scratch2)
-                        .expect("ready VGA shadow is missing");
+            crate::kernel::display::ScanoutAction::Publish {
+                vga_height: vga_h,
+                out_width: out_w,
+                shadow,
+            } => {
                 let p0 = if prof { machine.rdtsc() } else { 0 };
                 debug_assert_eq!(display.shadow_width, out_w);
                 let copied = display.present(machine, &mut *bios, vga_h, shadow);

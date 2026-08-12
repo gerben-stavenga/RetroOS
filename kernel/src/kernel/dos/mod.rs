@@ -287,7 +287,7 @@ impl<A: crate::Arch> DosState<A> {
             // detached snapshot before the address space disappears. Normal
             // DOS return has already moved NativeVga directly and deliberately
             // skips this readback path.
-            self.pc.vga.suspend_state(machine);
+            self.pc.vga.capture_address_space_vram(machine);
         }
         if let Some(ref mut dpmi) = self.dpmi {
             dpmi.unmap_all_physical(machine);
@@ -311,7 +311,6 @@ impl<A: crate::Arch> DosState<A> {
     /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
     pub fn on_resume(&mut self, machine: &mut A) {
-        self.pc.vga.on_address_space_active(machine);
         machine.load_ldt(&self.ldt[..]);
     }
 
@@ -319,7 +318,7 @@ impl<A: crate::Arch> DosState<A> {
     /// register set so the screen can be repainted on materialize. With no
     /// card there is nothing to do: the per-thread register file already IS
     /// the live state (the emulated port model), and VRAM lives in guest RAM.
-    pub(super) fn suspend(
+    pub(super) fn release_display(
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -332,34 +331,14 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::Display {
-        let linear_vbe = match &self.pc.vga {
-            DisplayedVga::Native(native) =>
-                match native.mode() {
-                    crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => Some(mode),
-                    crate::kernel::platform::NativeVgaMode::Legacy
-                    | crate::kernel::platform::NativeVgaMode::VbeBanked { .. } => None,
-                },
-            DisplayedVga::Emulated(_, _) => None,
-        };
-        let display = self.pc.vga.map(|vga|
-            vga.into_emulated_for_osd(machine, bios_workspace));
-        if let Some(mode) = linear_vbe
-            && let Some(dpmi) = self.dpmi.as_ref()
-        {
-            dpmi.redirect_physical_range(
-                machine,
-                mode.physical_base,
-                usize::from(mode.pitch) * usize::from(mode.height),
-                machine::vga::svga_lfb_base(),
-            );
-        }
-        display
+        self.release_display(machine, bios_workspace)
+            .into_surface(machine, bios_workspace)
     }
 
     /// Called when the thread regains focus. Repaints the VGA framebuffer
     /// from the suspend snapshot. CPU-binding side effects live in
     /// `on_resume` and happen on every swap-in regardless of focus.
-    pub(super) fn materialize(
+    pub(super) fn acquire_display_restore(
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -369,31 +348,25 @@ impl<A: crate::Arch> DosState<A> {
             &mut self.pc.vga, machine, bios_workspace, display);
     }
 
+    /// Acquire a handoff while preserving the adapter's current state. Unlike
+    /// `materialize`, this deliberately discards the receiver's recovery
+    /// image and performs no mode set or framebuffer restore.
+    pub(super) fn acquire_display_replace(
+        &mut self,
+        machine: &mut A,
+        display: crate::kernel::display::DisplayHandoff,
+    ) {
+        machine::vga::acquire_display_replace(&mut self.pc.vga, machine, display);
+    }
+
     pub(super) fn materialize_from_osd(
         &mut self,
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::Display,
     ) {
-        self.pc.vga.map(|vga|
-            (vga.raise_from_osd(machine, bios_workspace, display), ()));
-        let linear_vbe = match &self.pc.vga {
-            DisplayedVga::Native(native) =>
-                match native.mode() {
-                    crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => Some(mode),
-                    _ => None,
-                },
-            _ => None,
-        };
-        if let Some(mode) = linear_vbe
-            && let Some(dpmi) = self.dpmi.as_ref()
-        {
-            dpmi.restore_physical_range(
-                machine,
-                mode.physical_base,
-                usize::from(mode.pitch) * usize::from(mode.height),
-            );
-        }
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(display, machine);
+        self.acquire_display_restore(machine, bios_workspace, handoff);
     }
 }
 
@@ -584,27 +557,21 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
             machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
         );
     }
-    // Decide planar vs chained from THIS process's Sequencer Memory Mode
-    // (chain-4 bit), never the GLOBAL planar flag: the VGA window's mapping is
-    // per-address-space, so after an exec/process switch a still-trap-marked
-    // A0000 in the resumed space met a stale global "not planar" and SEGV'd
-    // (Epic Pinball's launcher exec). chain-4 set ⇒ chained linear RAM (a stale
-    // marking is just remapped + retried); clear ⇒ unchained Mode X ⇒ decode.
-    // A native owner has no trap marker and no register file: its aperture is
-    // plain card memory, so a fault there is not ours to decode.
+    // The emulated register file is the sole aperture authority. A native
+    // owner has no software trap: its adapter performs plane routing itself.
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
     let DisplayedVga::Emulated(dev, _) = &mut dos.pc.vga else {
         return false;
     };
-    let (base, len) = machine::vga::planar_window(dev.state.gc[6]);
+    let Some(pages) = machine::vga::trapped_aperture(&dev.state) else {
+        return false;
+    };
+    let base = u32::from(pages.start) << 12;
+    let len = u32::from(pages.end - pages.start) << 12;
     if !(base..base + len).contains(&addr) {
         return false;
-    }
-    if dev.state.seq[4] & 0x08 != 0 {
-        machine.map_fresh_range((addr as usize) >> 12, 1);
-        return true;
     }
     let off = addr - base;
     let mut target = machine::mmio::MmioTarget::Planar { vga: &mut dev.state, base, len };
@@ -1035,7 +1002,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         thread::Personality::Dos(d) => d,
         _ => unreachable!("just set Dos personality"),
     };
-    dos_state.pc.vga.on_address_space_active(machine);
+    dos_state.pc.vga.initialize_active_address_space(machine);
     dpmi::install_kernel_ldt_slots(dos_state);
     dos_state.dfs.init_from_vfs(&parent_cwd);
     dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
@@ -1172,7 +1139,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
             thread::Personality::Dos(d) => d,
             _ => unreachable!("just set Dos personality"),
         };
-        dos_state.pc.vga.on_address_space_active(machine);
+        dos_state.pc.vga.initialize_active_address_space(machine);
         dpmi::install_kernel_ldt_slots(dos_state);
         dos_state.dfs.init_from_vfs(&cwd);
         dos_reset_blocks(machine, dos_state, regs, dos::heap_start());
@@ -1324,8 +1291,9 @@ pub fn display_tick<A: crate::Arch>(
     dos: &mut thread::DosState<A>,
     regs: &Regs,
     now_ticks: u64,
+    display: Option<&mut crate::kernel::display::Display>,
 ) {
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ticks);
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ticks, display);
 }
 
 /// Advance emulated audio playback and its guest-visible device events.

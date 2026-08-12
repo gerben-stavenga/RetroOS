@@ -254,7 +254,7 @@ impl Tss {
 /// Set up TSS bitmaps for VM86:
 /// - IOPB: deny (trap) ALL ports by default — including VGA. Passthrough is
 ///   kernel policy, not an arch default: the kernel re-opens 0x3C1-0x3D9 +
-///   0x3DB-0x3DF via `allow_io_ports` only when a real card answers the
+///   0x3DB-0x3DF through the per-entry policy only when a real card answers the
 ///   probe (`vga_present`). On a card-less machine (UEFI metal) the traps
 ///   route the whole register file into the kernel-emulated VGA — with the
 ///   old static allowance, a game's DAC loads went straight to dead
@@ -282,28 +282,14 @@ unsafe fn setup_vm86_bitmaps(tss: *mut Tss) {
     }
 }
 
-/// Clear the IOPB bits for ports `[port, port+count)` so the guest accesses
-/// them directly (pass-through) instead of trapping to the monitor. Used once
-/// passthrough is detected to drop the per-write trap on the OPL ports (frequent
-/// during music) when a real card is present. Ports must lie within the IOPB
-/// (< 0x3E8); anything beyond is already denied and left as-is.
-pub fn allow_io_ports(port: u16, count: usize) {
+/// Install one complete thread-derived policy immediately before guest entry.
+pub fn install_io_policy(policy: &arch_abi::IoPolicy) {
     unsafe {
-        for p in port..port.saturating_add(count as u16) {
-            let byte = (p / 8) as usize;
-            if byte < IOPB_SIZE {
-                TSS32.iopb[byte] &= !(1u8 << (p % 8));
-            }
-        }
-    }
-}
-
-/// Deny-all I/O bitmap baseline (every byte 0xFF, terminator included).
-/// The kernel re-opens a thread's allowed ranges via `allow_io_ports` on
-/// swap-in — per-personality port policy lives there, not here.
-pub fn reset_io_bitmap() {
-    unsafe {
-        TSS32.iopb = [0xFF; IOPB_SIZE];
+        TSS32.iopb[..arch_abi::IO_POLICY_BYTES]
+            .copy_from_slice(policy.denied_bytes());
+        // Architectural terminator byte: ports outside the represented window
+        // remain denied even if the CPU probes one byte past the bitmap.
+        TSS32.iopb[arch_abi::IO_POLICY_BYTES..].fill(0xFF);
     }
 }
 

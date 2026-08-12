@@ -308,6 +308,10 @@ pub mod flags {
     /// MMIO branch and mapped the page NOT PRESENT — the console's first write
     /// then faulted.
     pub const FOREIGN: u64 = 1 << 11;
+    /// This leaf temporarily aliases an address-space-owned shadow in place of
+    /// a physical-device mapping. Its remaining flag bits are the original
+    /// mapping's bits, allowing the physical mapping to be restored exactly.
+    pub const REDIRECTED_ALIAS: u64 = 1 << 10;
     /// Software read-only flag - page is semantically read-only
     /// When set, page can never become writable (e.g., .text, .rodata)
     /// When clear (default), page is semantically writable
@@ -366,7 +370,8 @@ pub(crate) fn replace_entry<E: Entry>(slot: &mut E, incoming: E) -> E {
 
 #[inline]
 fn owns_frame<E: Entry>(entry: E) -> bool {
-    entry.present() && entry.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0
+    entry.present() && (entry.raw() & flags::REDIRECTED_ALIAS != 0
+        || entry.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0)
 }
 
 /// Install an already-owned mapping, then release the mapping displaced from
@@ -1463,7 +1468,7 @@ fn share_and_copy<E: Entry>(src: &mut [E], dst: &mut [E]) {
 
     for i in 0..src.len() {
         let mut e = src[i];
-        if e.present() && e.raw() & (flags::CACHE_DISABLE | flags::FOREIGN) == 0 {
+        if owns_frame(e) {
             e.set_hw_writable(false);
             src[i].set_hw_writable(false);
             phys_mm::inc_shared_count(src[i].page());
@@ -1862,6 +1867,95 @@ pub fn copy_page_entries(src_vpage: usize, dst_vpage: usize, count: usize) {
         }}
     }
     flush_tlb();
+}
+
+/// Redirect all aliases of a physical range onto per-address-space shadow
+/// pages, or restore exactly the aliases marked by the redirect. The recursive
+/// walk is deliberately below DOS/DPMI: physical identity, not the API which
+/// created a mapping, determines whether it follows the device ownership.
+pub fn redirect_physical_aliases(
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    count: usize,
+    redirect: bool,
+) {
+    match entries() {
+        Entries::E32(e) => redirect_physical_aliases_generic(
+            e, physical_ppage, shadow_vpage, count, redirect),
+        Entries::E64(e) => redirect_physical_aliases_generic(
+            e, physical_ppage, shadow_vpage, count, redirect),
+    }
+    flush_tlb();
+}
+
+fn redirect_physical_aliases_generic<E: Entry>(
+    entries: &mut [E],
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    count: usize,
+    redirect: bool,
+) {
+    let shadow: alloc::vec::Vec<E> = (0..count)
+        .map(|i| entries[shadow_vpage + i])
+        .collect();
+    let root = root_base();
+    let user_count = recursive_idx() - root;
+    for i in 0..user_count {
+        let idx = root + i;
+        if entries[idx].present() {
+            redirect_aliases_subtree(
+                entries, idx, physical_ppage, shadow_vpage, &shadow, redirect);
+        }
+    }
+}
+
+fn redirect_aliases_subtree<E: Entry>(
+    entries: &mut [E],
+    idx: usize,
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    shadow: &[E],
+    redirect: bool,
+) {
+    if idx >= PAGE_TABLE_BASE_IDX {
+        let child_base = (idx - PAGE_TABLE_BASE_IDX) * entries_per_page::<E>();
+        for child in child_base..child_base + entries_per_page::<E>() {
+            if entries[child].present() {
+                redirect_aliases_subtree(
+                    entries, child, physical_ppage, shadow_vpage, shadow, redirect);
+            }
+        }
+        return;
+    }
+
+    if (shadow_vpage..shadow_vpage + shadow.len()).contains(&idx) {
+        return;
+    }
+    let old = entries[idx];
+    let offset = if redirect {
+        old.page().checked_sub(physical_ppage)
+            .filter(|offset| (*offset as usize) < shadow.len())
+            .map(|offset| offset as usize)
+    } else if old.raw() & flags::REDIRECTED_ALIAS != 0 {
+        shadow.iter().position(|entry| entry.present() && entry.page() == old.page())
+    } else {
+        None
+    };
+    let Some(offset) = offset else { return };
+    if redirect && !shadow[offset].present() {
+        return;
+    }
+
+    let page = if redirect { shadow[offset].page() } else { physical_ppage + offset as u64 };
+    let mut incoming = old;
+    incoming.set_raw((old.raw() & !E::ADDR_MASK) | (page << 12));
+    incoming.set_flag(flags::REDIRECTED_ALIAS, redirect);
+    if redirect {
+        let incoming = retain_mapping(incoming);
+        replace_mapping(&mut entries[idx], incoming);
+    } else {
+        replace_mapping(&mut entries[idx], incoming);
+    }
 }
 
 /// Swap page table entries between two ranges (no refcount changes).

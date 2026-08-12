@@ -166,19 +166,6 @@ pub trait Arch: Sized + GuestBytes {
     fn outw(&mut self, port: u16, val: u16);
     fn outl(&mut self, port: u16, val: u32);
 
-    /// Let the guest access ports `[port, port+count)` directly — clear them in
-    /// the I/O-permission bitmap so they no longer trap to the kernel. The DOS
-    /// layer uses this to drop the per-write trap on the OPL ports once it finds
-    /// a real card (passthrough). No-op on backends that interpret all I/O.
-    fn allow_io_ports(&mut self, port: u16, count: usize);
-
-    /// Reset the I/O-permission bitmap to deny-all. The kernel's io_policy
-    /// rebuilds the running thread's allowed set (reset + allow_io_ports
-    /// ranges) immediately before every guest entry; which ports a
-    /// personality may touch is kernel policy, this is only the mechanism.
-    /// No-op on backends that interpret all I/O.
-    fn reset_io_bitmap(&mut self);
-
     // ── Execution & scheduling ─────────────────────────────────────────────
     //
     // The backend owns THE active context: the one active address space (and the
@@ -191,7 +178,7 @@ pub trait Arch: Sized + GuestBytes {
 
     /// Resume the active space with `regs` and return the next kernel-visible
     /// event, leaving `regs` holding the post-run register state.
-    fn execute(&mut self, regs: &mut Regs) -> KernelEvent;
+    fn execute(&mut self, regs: &mut Regs, io: &crate::IoPolicy) -> KernelEvent;
 
     /// Whether this backend can run 64-bit user code (`UserMode::Mode64`).
     /// On metal this is a CPU fact (long mode available); the hosted machine
@@ -212,6 +199,11 @@ pub trait Arch: Sized + GuestBytes {
         fx_ptr: *mut Self::Fx,
         hash_ptr: *mut u64,
     ) -> Self::PageTable;
+
+    /// Swap only the live FPU/SSE image with `fx`.  This is used when process
+    /// creation keeps the current address space live but changes which thread
+    /// owns that live execution context.
+    fn switch_fx(&mut self, fx: &mut Self::Fx);
 
     // ── Timer ──────────────────────────────────────────────────────────────
 
@@ -289,6 +281,17 @@ pub trait Arch: Sized + GuestBytes {
     fn map_low_mem(&mut self);
     /// Copy `count` page-table entries `src → dst`.
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize);
+    /// Redirect every user mapping of `physical_ppage..+count` onto the
+    /// corresponding pages at `shadow_vpage`, or undo exactly those redirects.
+    /// This is address-space policy: callers need not know which API originally
+    /// created an alias of the physical range.
+    fn redirect_physical_aliases(
+        &mut self,
+        physical_ppage: u64,
+        shadow_vpage: usize,
+        count: usize,
+        redirect: bool,
+    );
     /// Swap `count` page-table entries between two ranges.
     fn swap_page_entries(&mut self, a_vpage: usize, b_vpage: usize, count: usize);
     /// Clear page entries to absent (re-enables demand paging on next access).

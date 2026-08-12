@@ -31,8 +31,13 @@ pub struct EmulatedVga {
     pub svga_pages: usize,
     /// Firmware transition needed when returning to native VGA ownership.
     pub(crate) resume_vbe: Option<VbeResume>,
-    /// The device snapshot awaits publication in the active guest space.
-    pub(crate) rematerialize_aperture: bool,
+    /// Physical framebuffer whose aliases target `SVGA_LFB_BASE` while this
+    /// VGA is detached from the adapter.
+    pub(crate) physical_lfb: Option<u32>,
+    /// Legacy BIOS mode whose persistent BDA state must be re-established
+    /// before restoring direct-register state. Meaningful when `resume_vbe`
+    /// is absent.
+    pub(crate) resume_legacy_mode: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +63,8 @@ impl EmulatedVga {
             firmware_state: None,
             svga_pages: 0,
             resume_vbe: None,
-            rematerialize_aperture: true,
+            physical_lfb: None,
+            resume_legacy_mode: 3,
         }
     }
 
@@ -68,7 +74,8 @@ impl EmulatedVga {
             firmware_state: self.firmware_state.clone(),
             svga_pages: self.svga_pages,
             resume_vbe: self.resume_vbe,
-            rematerialize_aperture: self.rematerialize_aperture,
+            physical_lfb: self.physical_lfb,
+            resume_legacy_mode: self.resume_legacy_mode,
         }
     }
 }
@@ -236,18 +243,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
         mode: u16,
-    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
+    ) -> Result<(), BiosError> {
         self.set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
     }
 
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
-    /// bit; the returned state records whether hardware is linear or banked.
+    /// bit. The persistent firmware workspace remains the authority for the
+    /// resulting current mode.
     fn set_mode_request(
         &mut self,
         machine: &mut A,
         bios_display: &mut crate::kernel::platform::VgaCap,
         request: u16,
-    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
+    ) -> Result<(), BiosError> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
         {
@@ -255,36 +263,81 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }
 
         let number = request & 0x3FFF;
-        let descriptor = (number >= 0x100).then(|| self.mode(number)).flatten();
-        if number >= 0x100 && descriptor.is_none() {
-            return Err(BiosError::Rejected(0x014F));
+        if number <= 0xFF {
+            let mut regs = self.bios_vcpu.regs;
+            self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
+                regs.rax = u64::from(number);
+            }, |_, _| ())?;
+            return Ok(());
         }
+        let Some(_) = self.mode(number) else {
+            return Err(BiosError::Rejected(0x014F));
+        };
         let mut regs = self.bios_vcpu.regs;
         self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
-            if number <= 0xFF {
-                regs.rax = u64::from(number);
-            } else {
-                regs.rax = 0x4F02;
-                regs.rbx = u64::from(request);
-            }
+            regs.rax = 0x4F02;
+            regs.rbx = u64::from(request);
         }, |_, _| ())?;
-        if number <= 0xFF {
-            return Ok(crate::kernel::platform::NativeVgaMode::Legacy);
-        }
         let status = regs.rax as u16;
-        if status == 0x004F {
-            let descriptor = descriptor.expect("VBE descriptor checked before firmware call");
-            Ok(if request & 0x4000 != 0 {
-                crate::kernel::platform::NativeVgaMode::VbeLinear(descriptor)
-            } else {
-                crate::kernel::platform::NativeVgaMode::VbeBanked {
-                    mode: descriptor,
-                    current_bank: 0,
-                }
-            })
-        } else {
+        if status == 0x004F { Ok(()) } else {
             Err(BiosError::Rejected(status))
         }
+    }
+
+    /// Ask the persistent firmware instance which VBE mode currently owns the
+    /// adapter. Legacy modes return `None`; VBE returns its descriptor and the
+    /// LFB bit reported by 4F03h.
+    fn current_vbe_mode(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::VgaCap,
+    ) -> Result<Option<(crate::kernel::platform::VbeMode, bool)>, BiosError> {
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
+            regs.rax = 0x4F03;
+        }, |_, _| ())?;
+        let status = regs.rax as u16;
+        if status != 0x004F {
+            return Err(BiosError::Rejected(status));
+        }
+        let request = regs.rbx as u16;
+        let number = request & 0x3FFF;
+        if number <= 0xFF {
+            return Ok(None);
+        }
+        let mode = self.mode(number).ok_or(BiosError::Rejected(0x014F))?;
+        Ok(Some((mode, request & 0x4000 != 0)))
+    }
+
+    fn current_legacy_mode(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::VgaCap,
+    ) -> Result<u8, BiosError> {
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
+            regs.rax = 0x0F00;
+        }, |_, _| ())?;
+        Ok(regs.rax as u8)
+    }
+
+    /// Forward VBE 4F05h to the same persistent firmware instance. This is
+    /// authoritative even when a program used a firmware window-function
+    /// entry rather than the substitute BIOS path.
+    fn window(
+        &mut self,
+        machine: &mut A,
+        display: &crate::kernel::platform::VgaCap,
+        set: Option<u16>,
+    ) -> Result<u16, BiosError> {
+        let mut regs = self.bios_vcpu.regs;
+        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
+            regs.rax = 0x4F05;
+            regs.rbx = if set.is_some() { 0 } else { 0x0100 };
+            regs.rdx = u64::from(set.unwrap_or(0));
+        }, |_, _| ())?;
+        let status = regs.rax as u16;
+        if status == 0x004F { Ok(regs.rdx as u16) } else { Err(BiosError::Rejected(status)) }
     }
 
     pub fn mode(&self, number: u16) -> Option<crate::kernel::platform::VbeMode> {
@@ -307,14 +360,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             core::ptr::null_mut(),
         );
         let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
-        crate::kernel::io_policy::apply_bios_display(machine, display);
-        let completed = run_bios_until(machine, &mut regs, return_ip);
+        let io = crate::kernel::io_policy::bios_display(display);
+        let completed = run_bios_until(machine, &mut regs, return_ip, &io);
         self.bios_vcpu.space = machine.activate(
             caller_space,
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        machine.reset_io_bitmap();
         completed?;
         let status = regs.rax as u16;
         if status != 0x004F {
@@ -481,7 +533,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        crate::kernel::io_policy::apply_bios_display(machine, display);
+        let io = crate::kernel::io_policy::bios_display(display);
 
         let result = (|| {
             let (out_w, out_h) = crate::kernel::display::fit_vga(panel_w, panel_h);
@@ -510,7 +562,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                         if current_bank != Some(bank) {
                             let mut regs = self.bios_vcpu.regs;
                             let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
-                            run_bios_until(machine, &mut regs, return_ip)?;
+                            run_bios_until(machine, &mut regs, return_ip, &io)?;
                             let status = regs.rax as u16;
                             if status != 0x004F { return Err(BiosError::Rejected(status)); }
                             *bank_state = bank;
@@ -533,7 +585,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        machine.reset_io_bitmap();
         result
     }
 
@@ -543,7 +594,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         bios_display: &crate::kernel::platform::VgaCap,
-    ) -> Option<crate::kernel::platform::VbeMode> {
+    ) -> Option<crate::kernel::platform::VbeDisplayMode> {
         if crate::kernel::platform::get().firmware
             != crate::kernel::platform::Firmware::NativeBios
         {
@@ -638,11 +689,17 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                     u32::from(m.pitch) * u32::from(m.height),
                 )));
 
+        let selected = selected.map(|mode| {
+            crate::kernel::platform::VbeDisplayMode::try_from_bios_mode(mode)
+                .unwrap_or_else(|| panic!(
+                    "BIOS selected unusable VBE display mode {:#x}", mode.number
+                ))
+        });
         crate::println!("VBE: {} available modes (* selected)", self.modes.len());
         for mode in &self.modes {
             crate::println!(
                 "VBE: {} {:#05x} {}x{}x{} pitch={} format={:?} phys={:#010x} bank={:04x}:{}K/{}K",
-                if Some(*mode) == selected { '*' } else { ' ' },
+                if selected.is_some_and(|selected| selected.mode() == *mode) { '*' } else { ' ' },
                 mode.number,
                 mode.width,
                 mode.height,
@@ -684,8 +741,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
         crate::kernel::dos::prepare_bios_int10(machine, regs);
         configure(machine, regs);
-        crate::kernel::io_policy::apply_bios_display(machine, bios_display);
-        let completed = run_bios_int10(machine, regs);
+        let io = crate::kernel::io_policy::bios_display(bios_display);
+        let completed = run_bios_int10(machine, regs, &io);
 
         let result = completed.map(|()| collect(machine, regs));
 
@@ -696,7 +753,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        machine.reset_io_bitmap();
         result
     }
 }
@@ -756,7 +812,7 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         mode: u16,
-    ) -> crate::kernel::platform::NativeVgaMode {
+    ) {
         self.guest_bios_set_mode(machine, bios, mode)
             .unwrap_or_else(|error| panic!("native BIOS mode {:#x} failed: {:?}", mode, error))
     }
@@ -766,7 +822,7 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         request: u16,
-    ) -> crate::kernel::platform::NativeVgaMode {
+    ) {
         self.guest_bios_set_mode_request(machine, bios, request)
             .unwrap_or_else(|error| panic!("native BIOS mode request {:#x} failed: {:?}", request, error))
     }
@@ -777,7 +833,7 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         mode: u16,
-    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
+    ) -> Result<(), BiosError> {
         self.bios(bios)?.set_mode(machine, self, mode)
     }
 
@@ -787,7 +843,7 @@ impl crate::kernel::platform::VgaCap {
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         request: u16,
-    ) -> Result<crate::kernel::platform::NativeVgaMode, BiosError> {
+    ) -> Result<(), BiosError> {
         self.bios(bios)?.set_mode_request(machine, self, request)
     }
 
@@ -799,6 +855,31 @@ impl crate::kernel::platform::VgaCap {
         bank: u16,
     ) -> Result<(), BiosError> {
         self.bios(bios)?.set_bank(machine, self, mode, bank)
+    }
+
+    pub fn bios_current_vbe_mode<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+    ) -> Result<Option<(crate::kernel::platform::VbeMode, bool)>, BiosError> {
+        self.bios(bios)?.current_vbe_mode(machine, self)
+    }
+
+    pub fn bios_current_legacy_mode<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+    ) -> Result<u8, BiosError> {
+        self.bios(bios)?.current_legacy_mode(machine, self)
+    }
+
+    pub fn guest_bios_window<A: Arch>(
+        &self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        set: Option<u16>,
+    ) -> Result<u16, BiosError> {
+        self.bios(bios)?.window(machine, self, set)
     }
 
     pub fn bios_palette_call<A: Arch>(
@@ -843,21 +924,26 @@ impl crate::kernel::platform::VgaCap {
         &self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
-    ) -> Option<crate::kernel::platform::VbeMode> {
+    ) -> Option<crate::kernel::platform::VbeDisplayMode> {
         self.bios(bios).ok()?.discover_vbe(machine, self)
     }
 }
 
-fn run_bios_int10<A: Arch>(machine: &mut A, regs: &mut Regs) -> Result<(), BiosError> {
-    run_bios(machine, regs, crate::kernel::dos::bios_int10_returned)
+fn run_bios_int10<A: Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    io: &arch_abi::IoPolicy,
+) -> Result<(), BiosError> {
+    run_bios(machine, regs, io, crate::kernel::dos::bios_int10_returned)
 }
 
 fn run_bios_until<A: Arch>(
     machine: &mut A,
     regs: &mut Regs,
     return_ip: u32,
+    io: &arch_abi::IoPolicy,
 ) -> Result<(), BiosError> {
-    run_bios(machine, regs, |regs, event| {
+    run_bios(machine, regs, io, |regs, event| {
         crate::kernel::dos::bios_thunk_returned(regs, event, return_ip)
     })
 }
@@ -865,10 +951,11 @@ fn run_bios_until<A: Arch>(
 fn run_bios<A: Arch>(
     machine: &mut A,
     regs: &mut Regs,
+    io: &arch_abi::IoPolicy,
     returned: impl Fn(&Regs, &crate::KernelEvent) -> bool,
 ) -> Result<(), BiosError> {
     loop {
-        let event = machine.execute(regs);
+        let event = machine.execute(regs, io);
         if returned(regs, &event) {
             return Ok(());
         }

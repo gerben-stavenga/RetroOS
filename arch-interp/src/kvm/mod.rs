@@ -36,6 +36,10 @@ pub fn reset_io_bitmap() {
     shim::iopb_reset()
 }
 
+pub fn install_io_policy(policy: &arch_abi::IoPolicy) {
+    shim::iopb_install(policy)
+}
+
 /// The guest's x87 ST(0) as its raw 80-bit extended encoding, read out of the
 /// vcpu's FXSAVE image: the register file is physical, so ST(0) is the entry
 /// selected by `FSW` bits 13:11.

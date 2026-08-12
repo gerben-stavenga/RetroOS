@@ -816,6 +816,9 @@ pub fn event_loop<A: crate::Arch>(
                     &mut exiting_display, &mut sb_handoff,
                 );
             }
+            crate::kernel::sched::Verdict::ContinueAs(next) => {
+                ctx.continue_as(threads, machine, next);
+            }
             crate::kernel::sched::Verdict::AllDead => {
                 // The loop's contract: no thread resources survive it —
                 // callers never inherit zombies.
@@ -897,23 +900,36 @@ fn switch_focus_and_run<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
-    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {
         return;
     }
-    // DOS fork/return can move complete VGA ownership between the two thread
-    // records before execution switches. Focus already names the incoming
-    // owner; transfer only CPU and sound here.
+    // Normal DOS return has already named the parent as focus, but the child
+    // VGA remains in the explicit exit transaction until the parent space is
+    // active.
     if crate::kernel::focus::focused() == new_tid {
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         if let Some(card) = old.personality.release_sb(machine) {
             assert!(sb_handoff.is_none(), "stale SB handoff");
             *sb_handoff = Some(card);
         }
+        let transfer = exiting_display.take();
         ctx.switch_to(threads, machine, new_tid);
         let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
+        match transfer {
+            Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
+                let thread::Personality::Dos(dos) = &mut new.personality else {
+                    unreachable!("DOS VGA returned to non-DOS parent")
+                };
+                dos.pc.vga.acquire_parent_replace(machine, returned);
+            }
+            Some(crate::kernel::display::ExitDisplay::Restore(display)) => {
+                new.personality.acquire_display_restore(machine, bios_workspace, display);
+            }
+            None => {}
+        }
         *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         return;
     }
@@ -938,7 +954,7 @@ fn switch_focus_and_run<A: crate::Arch>(
 
     let old_is_zombie = thread::get_thread(threads, ctx.tid)
         .expect("switch: invalid old thread").kernel.state == thread::ThreadState::Zombie;
-    let display = if !old_is_zombie {
+    let transfer = if !old_is_zombie {
         assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
         let (display, card) = crate::kernel::focus::release(
@@ -947,15 +963,27 @@ fn switch_focus_and_run<A: crate::Arch>(
             assert!(sb_handoff.is_none(), "stale SB handoff");
             *sb_handoff = card;
         }
-        display
+        crate::kernel::display::ExitDisplay::Restore(display)
     } else {
         exiting_display.take().expect("zombie lost display")
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    *sb_handoff = crate::kernel::focus::acquire(
-        machine, bios_workspace, new_tid, &mut new.personality,
-        display, sb_handoff.take());
+    match transfer {
+        crate::kernel::display::ExitDisplay::Restore(display) => {
+            *sb_handoff = crate::kernel::focus::acquire(
+                machine, bios_workspace, new_tid, &mut new.personality,
+                display, sb_handoff.take());
+        }
+        crate::kernel::display::ExitDisplay::DosReplace(returned) => {
+            let thread::Personality::Dos(dos) = &mut new.personality else {
+                unreachable!("DOS VGA returned to non-DOS parent")
+            };
+            dos.pc.vga.acquire_parent_replace(machine, returned);
+            crate::kernel::focus::adopt(new_tid);
+            *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
+        }
+    }
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -973,6 +1001,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     viopl: u8,
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;
 
@@ -1034,18 +1063,22 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
         machine.free_page_count());
 
-    // Reserve the child and COW-fork directly into its owned page-table slot.
-    let child_tid = {
-        let child = match thread::create_thread_for_fork(threads, machine, parent_tid) {
-            Some(t) => t,
-            None => { on_error(vcpu, 8); return None; }
-        };
-        child.kernel.tid as usize
-    };
+    // Release while the parent's address space is live. The returned token is
+    // the only physical display ownership during construction; the parent's
+    // record is now a complete emulated recovery image.
+    let fork_display = parent_was_focused.then(|| {
+        let parent = thread::get_thread(threads, parent_tid).unwrap();
+        parent.personality.release_display(machine, bios_workspace)
+    });
+    let mut fork_sb = if parent_was_focused { sb_handoff.take() } else { None };
+    if parent_was_focused
+        && let Some(card) = thread::get_thread(threads, parent_tid).unwrap()
+            .personality.release_sb(machine)
+    {
+        assert!(fork_sb.is_none(), "two Sound Blaster owners at fork");
+        fork_sb = Some(card);
+    }
 
-    // VGA is a process-creation input, not something DosState invents. A DOS
-    // parent forks its complete device state while its address space is still
-    // active; a cross-personality DOS launch explicitly starts from mode 3.
     let exec_vga = match format {
         exec::BinaryFormat::Elf => exec::ExecVga::None,
         _ if parent_is_dos => {
@@ -1053,25 +1086,40 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let thread::Personality::Dos(parent) = &mut parent.personality else {
                 unreachable!("parent_is_dos without DOS personality")
             };
-            exec::ExecVga::Dos(parent.pc.vga.fork_for_child(
-                machine, bios_workspace))
+            let vga = parent.pc.vga.clone_detached_for_child(machine).unwrap_or_else(||
+                crate::kernel::bios_display::DisplayedVga::Emulated(
+                    crate::kernel::bios_display::EmulatedVga::initial_mode3(),
+                    crate::kernel::display::Display::headless()));
+            exec::ExecVga::Dos(vga)
         }
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DisplayedVga::Emulated(
             crate::kernel::bios_display::EmulatedVga::initial_mode3(),
             crate::kernel::display::Display::headless())),
     };
 
+    // Reserve a child record, then COW the live address space into the parent
+    // continuation. The unchanged live address space is henceforth the child.
+    let child_tid = {
+        let child = match thread::reserve_live_child(threads, machine, parent_tid) {
+            Some(t) => t,
+            None => {
+                if let Some(display) = fork_display {
+                    thread::get_thread(threads, parent_tid).unwrap().personality
+                        .acquire_display_restore(machine, bios_workspace, display);
+                }
+                if parent_was_focused {
+                    *sb_handoff = thread::get_thread(threads, parent_tid).unwrap()
+                        .personality.adopt_sb(machine, fork_sb);
+                }
+                on_error(vcpu, 8);
+                return None;
+            }
+        };
+        child.kernel.tid as usize
+    };
     {
-        let child = thread::get_thread(threads, child_tid).unwrap();
-        // Temporarily make the child's address space the active one so ELF load /
-        // DOS setup operate on it (guest memory is the active space). The parent's
-        // space is held aside and restored below. Unlike the old vcpu-swap, this
-        // moves ONLY the space — the parent's live registers (`vcpu`) are never
-        // touched, so no save/restore of them is needed.
-        child.kernel.vcpu.space = machine.activate(
-            core::mem::take(&mut child.kernel.vcpu.space),
-            core::ptr::null_mut(), core::ptr::null_mut(),
-        );
+        let parent = thread::get_thread(threads, parent_tid).unwrap();
+        machine.user_fork(&mut parent.kernel.vcpu.space);
     }
 
     // ELF needs user pages freed before loading; DOS handles its own address space
@@ -1085,30 +1133,54 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
     if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl, exec_vga).is_err() {
-        // Restore the parent's space and tear the half-built child down.
+        // Tear down the half-built live child before returning to the parked
+        // parent, then restore the parent's saved display image.
         {
             let child = thread::get_thread(threads, child_tid).unwrap();
-            child.kernel.vcpu.space = machine.activate(
-                core::mem::take(&mut child.kernel.vcpu.space),
-                core::ptr::null_mut(), core::ptr::null_mut(),
-            );
+            if let thread::Personality::Dos(dos) = &mut child.personality {
+                dos.on_exit(machine, &mut child.kernel.vcpu, false);
+            }
+            child.kernel.close_all_fds();
         }
-        let mut child_handoff = None;
-        let mut child_sb = None;
-        thread::exit_thread(threads, machine, bios_workspace, child_tid, 1, &mut child_handoff, &mut child_sb);
-        assert!(child_handoff.is_none(), "unfocused child owned physical VGA");
-        assert!(child_sb.is_none(), "half-built child owned the Sound Blaster");
+        machine.free_user_pages();
+        let parent_space = {
+            let parent = thread::get_thread(threads, parent_tid).unwrap();
+            core::mem::take(&mut parent.kernel.vcpu.space)
+        };
+        let discarded_child = machine.activate(
+            parent_space, core::ptr::null_mut(), core::ptr::null_mut());
+        {
+            let child = thread::get_thread(threads, child_tid).unwrap();
+            child.kernel.vcpu.space = discarded_child;
+            machine.destroy_space(&mut child.kernel.vcpu.space);
+            child.personality = thread::Personality::Linux(
+                crate::kernel::linux::LinuxState::new());
+            child.kernel.state = thread::ThreadState::Unused;
+        }
+        let parent = thread::get_thread(threads, parent_tid).unwrap();
+        parent.personality.on_resume(machine);
+        if let Some(display) = fork_display {
+            parent.personality.acquire_display_restore(machine, bios_workspace, display);
+        }
+        if parent_was_focused {
+            *sb_handoff = parent.personality.adopt_sb(machine, fork_sb);
+        }
         on_error(vcpu, 11);
         return None;
     }
 
+    // Hardware/current surface wins on successful EXEC. Bind it to the live
+    // child without replaying the parent's recovery image.
+    if let Some(display) = fork_display {
+        thread::get_thread(threads, child_tid).unwrap().personality
+            .acquire_display_replace(machine, bios_workspace, display);
+    }
+    if parent_was_focused {
+        *sb_handoff = thread::get_thread(threads, child_tid).unwrap()
+            .personality.adopt_sb(machine, fork_sb);
+    }
+
     let child = thread::get_thread(threads, child_tid).unwrap();
-    // Restore the parent's address space; the displaced child space re-parks in
-    // its slot (init_thread already set the child's entry registers there).
-    child.kernel.vcpu.space = machine.activate(
-        core::mem::take(&mut child.kernel.vcpu.space),
-        core::ptr::null_mut(), core::ptr::null_mut(),
-    );
 
     match &mut child.personality {
         thread::Personality::Linux(lin) => {
@@ -1167,11 +1239,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         }
     }
 
-    // A DOS fork already moved display ownership into the child VGA record.
-    if parent_was_focused
-        && parent_is_dos
-        && matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com)
-    {
+    if parent_was_focused {
         crate::kernel::focus::adopt(child_tid);
     }
 
@@ -1180,6 +1248,14 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // runs continuously, so polling is just a status query.
     crate::dbg_println!("  child tid={}, parent tid={} continues without blocking", child_tid, parent_tid);
     on_success(vcpu, child_tid as i32);
+    {
+        let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
+        parent.kernel.vcpu.regs = *vcpu;
+        let mut clean_child_fx = machine.clean_fx_template();
+        machine.switch_fx(&mut clean_child_fx);
+        parent.kernel.fx_state = clean_child_fx;
+        *vcpu = child.kernel.vcpu.regs;
+    }
     Some(child_tid)
 }
 

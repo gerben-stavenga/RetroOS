@@ -59,11 +59,15 @@ pub fn repaint_console() { crate::kernel::term::mark_dirty(); }
 pub fn display_tick<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    external: Option<&mut crate::kernel::display::Display>,
 ) {
-    unsafe {
+    if let Some(display) = external {
+        crate::kernel::term::present(machine, bios, display);
+    } else { unsafe {
         if let Some(display) = (&raw mut LINUX_CONSOLE_DISPLAY).as_mut().unwrap().as_mut() {
             crate::kernel::term::present(machine, bios, display);
         }
+    }
     }
 }
 
@@ -1248,7 +1252,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
-    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<usize> {
     use crate::kernel::exec;

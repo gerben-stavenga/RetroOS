@@ -25,6 +25,28 @@ use vga::{self, PixelFormat};
 use crate::Regs;
 use crate::kernel::thread;
 
+/// Output exclusively owned by the kernel monitor while it is open. For a
+/// legacy machine the contained display carries the physical `VgaCap`; the
+/// focused personality has already been reduced to headless `EmulatedVga`.
+pub struct OsdDisplay {
+    display: crate::kernel::display::Display,
+}
+
+impl OsdDisplay {
+    pub fn new(display: crate::kernel::display::Display) -> Self { Self { display } }
+    pub fn into_inner(self) -> crate::kernel::display::Display { self.display }
+}
+
+static mut OSD_DISPLAY: Option<OsdDisplay> = None;
+
+pub fn with_display<R>(f: impl FnOnce(Option<&mut crate::kernel::display::Display>) -> R) -> R {
+    unsafe { f((&raw mut OSD_DISPLAY).as_mut().and_then(Option::as_mut).map(|o| &mut o.display)) }
+}
+
+pub fn take_display() -> Option<OsdDisplay> {
+    unsafe { (&raw mut OSD_DISPLAY).as_mut().and_then(Option::take) }
+}
+
 // ── Menu model ───────────────────────────────────────────────────────────────
 
 const TAB_SYSTEM: usize = 0;
@@ -71,7 +93,8 @@ pub fn is_open() -> bool {
 }
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
-pub fn open() {
+pub fn open(display: OsdDisplay) {
+    unsafe { OSD_DISPLAY = Some(display); }
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     SYSTEM_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);

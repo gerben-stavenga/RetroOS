@@ -38,32 +38,45 @@ impl EmulatedVga {
     ) -> Self {
         let mut model = VgaState::new_boxed();
         let firmware_state = native.cap().bios_save_state(machine, bios);
-        let native_mode = native.mode();
-        let resume_vbe = match native_mode {
-            crate::kernel::platform::NativeVgaMode::Legacy => None,
-            crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => Some(VbeResume {
-                request: mode.number | 0x4000,
-                bank: None,
-            }),
-            crate::kernel::platform::NativeVgaMode::VbeBanked { mode, current_bank } => Some(VbeResume {
-                request: mode.number,
-                bank: Some(current_bank),
-            }),
-        };
+        let current = native.cap().bios_current_vbe_mode(machine, bios)
+            .unwrap_or_else(|error| panic!("native BIOS current-mode query failed: {:?}", error));
+        let current_bank = current.and_then(|(_, linear)| (!linear).then(|| {
+            native.cap().guest_bios_window(machine, bios, None)
+                .unwrap_or_else(|error| panic!("native BIOS current-bank query failed: {:?}", error))
+        }));
+        let resume_vbe = current.map(|(mode, linear)| VbeResume {
+            request: mode.number | if linear { 0x4000 } else { 0 },
+            bank: current_bank,
+        });
+        let physical_lfb = current.and_then(|(mode, linear)| linear.then_some(mode.physical_base));
+        let resume_legacy_mode = if current.is_none() {
+            native.cap().bios_current_legacy_mode(machine, bios)
+                .unwrap_or_else(|error| panic!("native BIOS legacy-mode query failed: {:?}", error))
+        } else { 3 };
         let svga_pages = if resume_vbe.is_some() {
             crate::kernel::drivers::vga_hw::save_dac(native.cap(), &mut model);
-            capture_native_vbe(machine, bios, native.cap_mut(), native_mode, &mut model)
+            let (mode, _) = current.expect("VBE resume without current mode");
+            capture_native_vbe(machine, bios, native.cap_mut(), mode, current_bank, &mut model)
         } else {
             crate::kernel::drivers::vga_hw::save(native.cap(), &mut model);
             materialize_emulated_aperture(&mut model, machine);
             0
         };
+        if let Some(physical_base) = physical_lfb {
+            machine.redirect_physical_aliases(
+                u64::from(physical_base) >> 12,
+                SVGA_LFB_BASE >> 12,
+                svga_pages,
+                true,
+            );
+        }
         Self {
             state: model,
             firmware_state,
             svga_pages,
             resume_vbe,
-            rematerialize_aperture: false,
+            physical_lfb,
+            resume_legacy_mode,
         }
     }
 
@@ -73,75 +86,101 @@ impl EmulatedVga {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         mut native: crate::kernel::platform::NativeVga,
-    ) -> (Self, crate::kernel::platform::NativeVga) {
+    ) -> (Self, crate::kernel::platform::VgaCap) {
         let vga = Self::snapshot_native(machine, bios, &mut native);
-        (vga, native)
+        (vga, native.into_cap())
     }
 
     fn attach_native<A: crate::Arch>(
         mut self,
         machine: &mut A,
-        mut native: crate::kernel::platform::NativeVga,
+        mut native: crate::kernel::platform::VgaCap,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> DisplayedVga {
         // Native ownership means the complete VGA aperture is physical in the
         // incoming DOS address space, including B8000 text memory.
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
-        self.state.a0000_trapped = false;
         if let Some(resume) = self.resume_vbe.take()
             && self.state.svga_w != 0
         {
-            let exact = self.firmware_state.as_ref().is_some_and(|state| {
-                match native.cap().bios_restore_state(machine, &mut *bios, state) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
-                        false
-                    }
-                }
-            });
-            let mode = if exact {
-                native.cap().bios_mode(bios, resume.request & 0x3FFF).map(|mode| {
-                    if resume.request & 0x4000 != 0 {
-                        crate::kernel::platform::NativeVgaMode::VbeLinear(mode)
-                    } else {
-                        crate::kernel::platform::NativeVgaMode::VbeBanked {
-                            mode,
-                            current_bank: resume.bank.unwrap_or(0),
-                        }
-                    }
-                }).unwrap_or_else(|| native.cap_mut().bios_set_mode_request(
-                    machine, &mut *bios, resume.request))
-            } else {
-                native.cap_mut().bios_set_mode_request(machine, &mut *bios, resume.request)
-            };
-            restore_native_vbe(machine, bios, native.cap_mut(), mode, &self.state, resume);
+            let mode = native.bios_mode(bios, resume.request & 0x3FFF)
+                .unwrap_or_else(|| panic!("restored VBE mode {:#x} disappeared", resume.request));
+            // Re-establish the persistent firmware BDA as well as the card's
+            // public mode before restoring framebuffer and opaque controller
+            // state. 4F04 deliberately excludes the BDA.
+            native.bios_set_mode_request(machine, &mut *bios, resume.request);
+            restore_native_vbe(
+                machine, bios, &mut native, mode,
+                resume.request & 0x4000 == 0, &self.state, resume);
+            if let Some(state) = self.firmware_state.as_ref()
+                && let Err(error) = native.bios_restore_state(machine, &mut *bios, state)
+            {
+                crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
+            }
+            if let Some(physical_base) = self.physical_lfb {
+                machine.redirect_physical_aliases(
+                    u64::from(physical_base) >> 12,
+                    SVGA_LFB_BASE >> 12,
+                    self.svga_pages,
+                    false,
+                );
+            }
             discard_emulated_svga(machine, &mut self);
-            *native.mode_mut() = mode;
-            return DisplayedVga::Native(native);
+            return DisplayedVga::Native(crate::kernel::platform::NativeVga::restored(native));
         }
         // A live emulated VGA's aperture is its VRAM. Capture the linear
         // representation before converting the complete device to hardware.
         capture_emulated_aperture(&mut self.state, machine);
-        // An OSD VBE surface must be left before direct legacy restoration.
-        if native.vbe_mode().is_some() {
-            let mode = native.cap_mut().bios_set_mode(machine, &mut *bios, 3);
-            *native.mode_mut() = mode;
-        }
-        crate::kernel::drivers::vga_hw::restore(native.cap(), &self.state);
+        // Restore the persistent firmware's legacy-mode bookkeeping first;
+        // direct register restoration below may describe a tweaked/unchained
+        // mode which no BIOS mode number can express exactly.
+        native.bios_set_mode(machine, &mut *bios, u16::from(self.resume_legacy_mode));
+        crate::kernel::drivers::vga_hw::restore(&native, &self.state);
         if let Some(state) = self.firmware_state.as_ref() {
-            if let Err(error) = native.cap().bios_restore_state(machine, bios, state) {
+            if let Err(error) = native.bios_restore_state(machine, bios, state) {
                 crate::println!("VGA: VBE 4F04 restore failed: {:?}", error);
             } else if crate::kernel::platform::get().host
                 == crate::kernel::platform::Host::Qemu
             {
                 // SeaVGABIOS/QEMU can return from 4F04 with AC PAS clear,
                 // blanking an otherwise fully restored legacy screen.
-                crate::kernel::drivers::vga_hw::enable_palette_output(native.cap(), &self.state);
+                crate::kernel::drivers::vga_hw::enable_palette_output(&native, &self.state);
             }
         }
-        *native.mode_mut() = crate::kernel::platform::NativeVgaMode::Legacy;
+        DisplayedVga::Native(crate::kernel::platform::NativeVga::restored(native))
+    }
+
+    /// Bind an already-live adapter to this address space without restoring
+    /// the saved software image. The hardware state wins: normal DOS return
+    /// uses this so the parent's screen continues exactly where the child left
+    /// it, with no firmware mode set or visible repaint.
+    fn attach_native_replace<A: crate::Arch>(
+        mut self,
+        machine: &mut A,
+        native: crate::kernel::platform::NativeVga,
+    ) -> DisplayedVga {
+        machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
+        if let Some(physical_base) = self.physical_lfb {
+            machine.redirect_physical_aliases(
+                u64::from(physical_base) >> 12,
+                SVGA_LFB_BASE >> 12,
+                self.svga_pages,
+                false,
+            );
+        }
+        if self.svga_pages != 0 {
+            discard_emulated_svga(machine, &mut self);
+        }
         DisplayedVga::Native(native)
+    }
+
+    fn attach_capability_replace<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        native: crate::kernel::platform::VgaCap,
+    ) -> DisplayedVga {
+        self.attach_native_replace(
+            machine, crate::kernel::platform::NativeVga::restored(native))
     }
 
     pub fn present<A: crate::Arch>(
@@ -160,6 +199,24 @@ impl EmulatedVga {
 }
 
 impl DisplayedVga {
+    pub fn into_handoff(self) -> crate::kernel::display::DisplayHandoff {
+        match self {
+            Self::Native(native) => crate::kernel::display::DisplayHandoff::Vga(native.into_cap()),
+            Self::Emulated(_, display) => crate::kernel::display::DisplayHandoff::Surface(display),
+        }
+    }
+
+    /// Install a newly constructed emulated VGA into the current address
+    /// space. This is construction, not context-switch reconciliation.
+    pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
+        match self {
+            Self::Emulated(vga, _) => {
+                materialize_emulated_aperture(&mut vga.state, machine);
+            }
+            Self::Native(_) => machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0),
+        }
+    }
+
     /// Apply one ownership transaction. All kernel targets are panic=abort,
     /// so the closure cannot unwind across the brief move out of `self`; no
     /// empty or transition state exists in the type or can be observed.
@@ -175,119 +232,65 @@ impl DisplayedVga {
         }
     }
 
-    pub fn hold_surface(&mut self, display: crate::kernel::display::Display) {
+    /// Clone the detached VGA model for a child.  `release_display` must have
+    /// run first, so the parent's record is a complete recovery image and the
+    /// physical display capability is held separately by the caller.
+    pub fn clone_detached_for_child<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Self> {
         match self {
-            Self::Emulated(_, output) => { *output = display; }
-            Self::Native(_) => panic!("native VGA already owns physical scanout"),
-        }
-    }
-
-    pub fn take_surface(&mut self) -> Option<crate::kernel::display::Display> {
-        match self {
-            Self::Emulated(_, output) => Some(core::mem::replace(
-                output, crate::kernel::display::Display::headless())),
             Self::Native(_) => None,
-        }
-    }
-
-    /// Clone this thread's complete VGA ownership for a child. The parent
-    /// keeps an emulated recovery image targeting headless output while the
-    /// child receives the live display state.
-    pub fn fork_for_child<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> Self {
-        match self {
-            Self::Native(native) => {
-                let parent = EmulatedVga::snapshot_native(machine, bios, native);
-                core::mem::replace(self, Self::Emulated(
-                    parent, crate::kernel::display::Display::headless()))
-            }
             Self::Emulated(vga, _) => {
                 capture_emulated_aperture(&mut vga.state, machine);
-                let parent = vga.clone_for_fork();
-                vga.rematerialize_aperture = true;
-                core::mem::replace(self, Self::Emulated(
-                    parent, crate::kernel::display::Display::headless()))
+                Some(Self::Emulated(
+                    vga.clone_for_fork(),
+                    crate::kernel::display::Display::headless(),
+                ))
             }
         }
     }
 
-    pub fn suspend_state<A: crate::Arch>(&mut self, machine: &mut A) {
+    /// Capture VRAM whose authoritative bytes live in this guest address
+    /// space before that address space is destroyed. Native VGA needs no
+    /// action: its authoritative bytes live on the card, not in guest pages.
+    pub fn capture_address_space_vram<A: crate::Arch>(&mut self, machine: &mut A) {
         match self {
             Self::Emulated(vga, _) =>
                 capture_emulated_aperture(&mut vga.state, machine),
-            Self::Native(_) =>
-                panic!("native VGA was not detached before exit"),
-        }
-    }
-
-    /// Capture address-space-backed VRAM before moving this complete VGA to a
-    /// different DOS thread at normal EXEC return.
-    pub fn prepare_thread_transfer<A: crate::Arch>(&mut self, machine: &mut A) {
-        match self {
-            Self::Emulated(vga, _) => {
-                capture_emulated_aperture(&mut vga.state, machine);
-                vga.rematerialize_aperture = true;
-            }
             Self::Native(_) => {}
         }
     }
 
-    /// Reconcile VGA memory with the address space which just became active.
-    pub fn on_address_space_active<A: crate::Arch>(&mut self, machine: &mut A) {
-        match self {
-            Self::Native(_) => {
-                machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
+    /// Move the dying child's complete VGA out while its address space is
+    /// active. The replacement is inert and is never guest-visible.
+    pub fn release_for_parent_replace<A: crate::Arch>(&mut self, machine: &mut A) -> Self {
+        self.map(|mut returned| {
+            if let Self::Emulated(vga, _) = &mut returned {
+                capture_emulated_aperture(&mut vga.state, machine);
             }
-            Self::Emulated(vga, _) if vga.rematerialize_aperture =>
-            {
-                materialize_emulated_aperture(&mut vga.state, machine);
-                vga.rematerialize_aperture = false;
-            }
-            Self::Emulated(_, _) => {}
-        }
+            (Self::Emulated(
+                EmulatedVga::initial_mode3(),
+                crate::kernel::display::Display::headless(),
+            ), returned)
+        })
     }
 
-    /// OSD take boundary. A native VBE framebuffer is card state, so query it
-    /// while the capability is still here and materialize it into this
-    /// thread's ordinary emulated-SVGA RAM before lending the card to OSD.
-    pub fn into_emulated_for_osd<A: crate::Arch>(
-        self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> (Self, crate::kernel::display::Display) {
-        match self {
-            Self::Native(native) => {
-                let (vga, native) = EmulatedVga::detach_native(
-                    machine, bios_workspace, native);
-                let display = crate::kernel::display::Display::new_selected(
-                    machine, bios_workspace, native);
-                (Self::Emulated(vga, crate::kernel::display::Display::headless()), display)
+    /// Complete normal child return after the parent's address space is live.
+    /// The returned child state wins; the parent's value is only recovery.
+    pub fn acquire_parent_replace<A: crate::Arch>(&mut self, machine: &mut A, returned: Self) {
+        self.map(|parent| match (parent, returned) {
+            (Self::Emulated(saved, _), Self::Native(native)) =>
+                (saved.attach_native_replace(machine, native), ()),
+            (_, Self::Emulated(mut child, display)) => {
+                materialize_emulated_aperture(&mut child.state, machine);
+                (Self::Emulated(child, display), ())
             }
-            Self::Emulated(vga, display) => {
-                let display = display.into_selected(machine, bios_workspace);
-                (Self::Emulated(vga, crate::kernel::display::Display::headless()), display)
+            (native @ Self::Native(_), returned) => {
+                // Two physical VGA owners cannot be constructed: a returned
+                // Native token is the unique token. Preserve the current
+                // owner defensively if a future caller violates sequencing.
+                drop(returned);
+                (native, ())
             }
-        }
-    }
-
-    /// Inverse of `into_emulated_for_osd`: restore a captured native VBE mode
-    /// and its pixels before making the card authoritative again.
-    pub fn raise_from_osd<A: crate::Arch>(
-        self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::display::Display,
-    ) -> Self {
-        match (self, display.into_native_capability(machine)) {
-            (Self::Emulated(dev, _), Err(display)) =>
-                Self::Emulated(dev, display),
-            (Self::Emulated(dev, _), Ok(native)) =>
-                dev.attach_native(machine, native, bios_workspace),
-            (native @ Self::Native(_), _) => native,
-        }
+        });
     }
 
 }
@@ -324,6 +327,22 @@ pub fn acquire_display<A: crate::Arch>(
             (vga.attach_native(machine, native, bios), ()),
         (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
             (vga.present(machine, display, bios), ()),
+        (native @ DisplayedVga::Native(_), _) => (native, ()),
+    });
+}
+
+/// Acquire a live physical VGA without restoring the receiver's recovery
+/// image. This is the normal child→parent DOS return operation.
+pub fn acquire_display_replace<A: crate::Arch>(
+    vga: &mut DisplayedVga,
+    machine: &mut A,
+    display: crate::kernel::display::DisplayHandoff,
+) {
+    vga.map(|vga| match (vga, display) {
+        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Vga(native)) =>
+            (vga.attach_capability_replace(machine, native), ()),
+        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
+            (DisplayedVga::Emulated(vga, display), ()),
         (native @ DisplayedVga::Native(_), _) => (native, ()),
     });
 }
@@ -368,32 +387,26 @@ fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: 
     match state.classify_mode() {
         Some(VgaMode::Planar16 { .. } | VgaMode::ModeX { .. }) => {
             write_live_planes(machine, &state.planes);
-            let (base, len) = planar_window(state.gc[6]);
-            machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
-            state.a0000_trapped = true;
+            map_trapped_aperture(machine, state);
         }
         Some(VgaMode::Mode13h) => {
             ::vga::chain4_munge(&mut state.planes);
             write_live_planes(machine, &state.planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
-            state.a0000_trapped = false;
+            map_direct_aperture(machine, state, 16);
         }
         Some(VgaMode::Text { .. }) => {
             ::vga::text_odd_even_munge(&mut state.planes);
             write_live_planes(machine, &state.planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
-            state.a0000_trapped = false;
+            map_direct_aperture(machine, state, 8);
         }
         Some(VgaMode::Cga4) => {
             ::vga::cga4_munge(&mut state.planes);
             write_live_planes(machine, &state.planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 4);
-            state.a0000_trapped = false;
+            map_direct_aperture(machine, state, 4);
         }
         Some(VgaMode::Cga2) => {
             write_live_planes(machine, &state.planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 4);
-            state.a0000_trapped = false;
+            map_direct_aperture(machine, state, 4);
         }
         Some(VgaMode::LinearSvga { .. }) => {
             write_live_planes(machine, &state.planes);
@@ -402,11 +415,9 @@ fn materialize_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: 
                 A0000 >> 12,
                 WINDOW_PAGES,
             );
-            state.a0000_trapped = false;
         }
         None => {
             write_live_planes(machine, &state.planes);
-            state.a0000_trapped = false;
         }
     }
     // A live emulated VGA owns page-backed VRAM, never a shadow Vec.
@@ -448,13 +459,48 @@ fn capture_emulated_aperture<A: crate::Arch>(state: &mut VgaState, machine: &mut
 /// no per-frame copy.
 const PLANES_LEN: usize = 4 * 0x10000;
 const A0000: usize = 0xA0000;
-pub fn planar_window(gc6: u8) -> (u32, u32) {
+fn decoded_aperture(gc6: u8) -> core::ops::Range<u16> {
     match (gc6 >> 2) & 3 {
-        0 => (0xA0000, 0x20000),
-        1 => (0xA0000, 0x10000),
-        2 => (0xB0000, 0x08000),
-        _ => (0xB8000, 0x08000),
+        0 => 0xA0..0xC0,
+        1 => 0xA0..0xB0,
+        2 => 0xB0..0xB8,
+        _ => 0xB8..0xC0,
     }
+}
+
+fn trapped_aperture_for(seq4: u8, gc6: u8, svga_w: u16) -> Option<core::ops::Range<u16>> {
+    if svga_w != 0 || seq4 & 0x0C != 0x04 {
+        return None;
+    }
+    Some(decoded_aperture(gc6))
+}
+
+/// Guest page range whose CPU accesses must pass through the emulated VGA's
+/// planar ALU. This is derived entirely from the authoritative register file;
+/// native VGA never uses it because the physical adapter performs the routing.
+pub fn trapped_aperture(vga: &VgaState) -> Option<core::ops::Range<u16>> {
+    trapped_aperture_for(vga.seq[4], vga.gc[6], vga.svga_w)
+}
+
+fn map_trapped_aperture<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
+    if let Some(pages) = trapped_aperture(vga) {
+        machine.map_phys_range(
+            usize::from(pages.start),
+            usize::from(pages.end - pages.start),
+            0,
+            arch_abi::MAP_MMIO,
+        );
+    }
+}
+
+fn map_direct_aperture<A: crate::Arch>(machine: &mut A, vga: &VgaState, max_pages: usize) {
+    let pages = decoded_aperture(vga.gc[6]);
+    let count = usize::from(pages.end - pages.start).min(max_pages);
+    machine.copy_page_entries(
+        VGA_VRAM_BASE >> 12,
+        usize::from(pages.start),
+        count,
+    );
 }
 /// Private, per-address-space backing of the emulated card's four VRAM planes.
 /// CPU apertures alias pages from here; this is the one live pixel store.
@@ -473,49 +519,29 @@ fn write_live_planes<A: crate::Arch>(machine: &mut A, planes: &[u8]) {
 /// React to a Sequencer register write (port 0x3C5) that may change the
 /// chain-4 mode or the plane-select mask. Drives the GC[6]-selected aperture.
 /// `pc.vga` already holds the post-write register values.
-pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _regs: &mut Regs) {
+pub fn on_seq_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, old_seq4: u8) {
     // A real card does its own plane routing.
     let dev = match &mut pc.vga {
         DisplayedVga::Emulated(dev, _) => dev,
         DisplayedVga::Native(_) => return,
     };
     let vga = &mut dev.state;
-    let idx = vga.seq_index & 0x1F;
-    match idx {
-        4 => {
-            // Memory Mode bit 2 disables text odd/even addressing; bit 3
-            // enables chain-4. Only (odd/even disabled, chain-4 disabled) is
-            // the sequential plane aperture that needs the A0000 trap. That
-            // includes Mode X/EGA drawing and temporary text-font access.
-            // Entering from text must undo the B800 odd/even packing; entering
+    let old = trapped_aperture_for(old_seq4, vga.gc[6], vga.svga_w);
+    let new = trapped_aperture(vga);
+    match (old, new) {
+        (None, Some(_)) => {
+            // Entering from text must undo B800 odd/even packing; entering
             // from mode 13h must undo chain-4. They are different layouts.
-            let sequential = vga.seq[4] & 0x0C == 0x04;
-            let currently_planar = vga.a0000_trapped;
-            if sequential && !currently_planar {
-                let source = if vga.gc[6] & 0x01 == 0 {
-                    PlanarSource::TextOddEven
-                } else if vga.gc[5] & 0x40 != 0 {
-                    PlanarSource::Chain4
-                } else {
-                    PlanarSource::Canonical
-                };
-                arm_planar(machine, vga, source);
-            } else if !sequential && currently_planar {
-                if vga.seq[4] & 0x08 != 0 {
-                    disarm_planar_to_chain4(machine, vga);
-                } else if vga.gc[6] & 0x01 == 0 {
-                    disarm_planar_to_text(machine, vga);
-                }
-            }
+            let source = if vga.gc[6] & 0x01 == 0 {
+                PlanarSource::TextOddEven
+            } else if vga.gc[5] & 0x40 != 0 {
+                PlanarSource::Chain4
+            } else {
+                PlanarSource::Canonical
+            };
+            arm_planar(machine, vga, source);
         }
-        2 => {
-            // Map Mask = plane select. Nothing to remap: while planar, A0000
-            // stays unmapped and the map mask is honoured by the planar trap
-            // (`handle_planar_fault` → `planar_write`), which writes exactly the
-            // selected planes — including the multi-plane EGA fan-out the old
-            // single-plane alias couldn't do.
-            let _ = ();
-        }
+        (Some(_), None) => disarm_planar(machine, vga),
         _ => {}
     }
 }
@@ -531,22 +557,20 @@ pub fn on_gc_write<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, old_gc6:
         DisplayedVga::Native(_) => return,
     };
     let vga = &mut dev.state;
-    if !vga.a0000_trapped || (old_gc6 & 0x0C) == (vga.gc[6] & 0x0C) {
+    let old = trapped_aperture_for(vga.seq[4], old_gc6, vga.svga_w);
+    let new = trapped_aperture(vga);
+    if old == new {
         return;
     }
 
-    let (old_base, old_len) = planar_window(old_gc6);
     // The old aperture contains no independent bytes while trapped: the
     // canonical image is in VGA_VRAM_BASE. Restore ordinary guest RAM beneath
     // it, then place the device trap over the newly selected decode window.
-    machine.map_fresh_range(old_base as usize >> 12, old_len as usize >> 12);
-    let (new_base, new_len) = planar_window(vga.gc[6]);
-    machine.map_phys_range(
-        new_base as usize >> 12,
-        new_len as usize >> 12,
-        0,
-        arch_abi::MAP_MMIO,
-    );
+    if let Some(old) = old {
+        machine.map_fresh_range(
+            usize::from(old.start), usize::from(old.end - old.start));
+    }
+    map_trapped_aperture(machine, vga);
 }
 
 /// Map the GC[6]-selected VGA window as MMIO (present=0 + trap marker) so every
@@ -567,28 +591,45 @@ fn arm_planar<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, source: Plana
         PlanarSource::TextOddEven => ::vga::text_odd_even_unmunge(&mut planes),
     }
     write_live_planes(machine, &planes);
-    let (base, len) = planar_window(vga.gc[6]);
-    machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
-    vga.a0000_trapped = true;
+    map_trapped_aperture(machine, vga);
 }
 
 /// Leave planar access for chain-4: munge the one VRAM store and alias its
-/// first 64K as the linear A0000 aperture.
-fn disarm_planar_to_chain4<A: crate::Arch>(machine: &mut A, vga: &mut VgaState) {
+/// first 64K through the GC[6]-selected linear aperture.
+fn disarm_planar_to_chain4<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
     let mut planes = read_live_planes(machine);
     ::vga::chain4_munge(&mut planes);
     write_live_planes(machine, &planes);
-    machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
-    vga.a0000_trapped = false;
+    map_direct_aperture(machine, vga, 16);
 }
 
-/// Return from sequential plane/font access to the text odd/even B8000 view.
-fn disarm_planar_to_text<A: crate::Arch>(machine: &mut A, vga: &mut VgaState) {
+/// Return from sequential plane/font access to the text odd/even view.
+fn disarm_planar_to_text<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
     let mut planes = read_live_planes(machine);
     ::vga::text_odd_even_munge(&mut planes);
     write_live_planes(machine, &planes);
-    machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
-    vga.a0000_trapped = false;
+    map_direct_aperture(machine, vga, 8);
+}
+
+fn disarm_planar<A: crate::Arch>(machine: &mut A, vga: &VgaState) {
+    match vga.classify_mode() {
+        Some(::vga::VgaMode::Text { .. }) => disarm_planar_to_text(machine, vga),
+        Some(::vga::VgaMode::Cga4) => {
+            let mut planes = read_live_planes(machine);
+            ::vga::cga4_munge(&mut planes);
+            write_live_planes(machine, &planes);
+            map_direct_aperture(machine, vga, 4);
+        }
+        Some(::vga::VgaMode::Cga2) => {
+            map_direct_aperture(machine, vga, 4);
+        }
+        // Chain-4 is also the safest direct representation for an unknown
+        // tweaked graphics state: unlike a stale MMIO marker it remains a
+        // usable VGA aperture while subsequent register writes converge.
+        Some(::vga::VgaMode::Mode13h) | None => disarm_planar_to_chain4(machine, vga),
+        Some(::vga::VgaMode::Planar16 { .. } | ::vga::VgaMode::ModeX { .. }
+            | ::vga::VgaMode::LinearSvga { .. }) => {}
+    }
 }
 
 /// BIOS character-generator services operate on plane 2 regardless of the
@@ -695,15 +736,10 @@ fn capture_native_vbe<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    native_mode: crate::kernel::platform::NativeVgaMode,
+    mode: crate::kernel::platform::VbeMode,
+    current_bank: Option<u16>,
     state: &mut VgaState,
 ) -> usize {
-    let (mode, current_bank) = match native_mode {
-        crate::kernel::platform::NativeVgaMode::Legacy => return 0,
-        crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => (mode, None),
-        crate::kernel::platform::NativeVgaMode::VbeBanked { mode, current_bank } =>
-            (mode, Some(current_bank)),
-    };
     let bytes = usize::from(mode.pitch) * usize::from(mode.height);
     let pages = svga_shadow_pages(mode.pitch, mode.height);
     machine.map_fresh_range(SVGA_LFB_BASE >> 12, pages);
@@ -728,7 +764,6 @@ fn capture_native_vbe<A: crate::Arch>(
         A0000 >> 12,
         WINDOW_PAGES,
     );
-    state.a0000_trapped = false;
     crate::println!("VBE: detached guest mode {:#x} {}x{}x{} into shadow",
         mode.number, mode.width, mode.height, state.svga_bpp);
     pages
@@ -738,15 +773,11 @@ fn restore_native_vbe<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    native_mode: crate::kernel::platform::NativeVgaMode,
+    mode: crate::kernel::platform::VbeMode,
+    banked: bool,
     state: &VgaState,
     resume: VbeResume,
 ) {
-    let (mode, banked) = match native_mode {
-        crate::kernel::platform::NativeVgaMode::Legacy => return,
-        crate::kernel::platform::NativeVgaMode::VbeLinear(mode) => (mode, false),
-        crate::kernel::platform::NativeVgaMode::VbeBanked { mode, .. } => (mode, true),
-    };
     let bytes = usize::from(mode.pitch) * usize::from(mode.height);
     let mut pixels = alloc::vec![0; bytes];
     machine.copy_from(SVGA_LFB_BASE, &mut pixels);
@@ -892,8 +923,6 @@ pub fn svga_set_mode<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, w: u16
     vga.svga_pitch = w * (bpp as u16).div_ceil(8);
     vga.svga_bank = 0;
     dev.svga_pages = pages;
-    // A VBE set-mode bypasses on_set_mode, so clear any stale planar marker.
-    vga.a0000_trapped = false;
 }
 
 /// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
@@ -935,7 +964,6 @@ pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     vga.svga_pitch = 0;
     vga.svga_bank = 0;
     dev.svga_pages = 0;
-    vga.a0000_trapped = false;
 }
 
 /// React to a BIOS INT 10h AH=00 video mode set. The EGA/VGA 16-colour planar
@@ -1040,36 +1068,29 @@ pub fn on_set_mode<A: crate::Arch>(
     match vga.classify_mode() {
         Some(::vga::VgaMode::Planar16 { .. } | ::vga::VgaMode::ModeX { .. }) => {
             write_live_planes(machine, &planes);
-            let (base, len) = planar_window(vga.gc[6]);
-            machine.map_phys_range(base as usize >> 12, len as usize >> 12, 0, arch_abi::MAP_MMIO);
-            vga.a0000_trapped = true;
+            map_trapped_aperture(machine, vga);
         }
         Some(::vga::VgaMode::Mode13h) => {
             ::vga::chain4_munge(&mut planes);
             write_live_planes(machine, &planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, A0000 >> 12, 16);
-            vga.a0000_trapped = false;
+            map_direct_aperture(machine, vga, 16);
         }
         Some(::vga::VgaMode::Text { .. }) => {
             ::vga::text_odd_even_munge(&mut planes);
             write_live_planes(machine, &planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 8);
-            vga.a0000_trapped = false;
+            map_direct_aperture(machine, vga, 8);
         }
         Some(::vga::VgaMode::Cga4) => {
             ::vga::cga4_munge(&mut planes);
             write_live_planes(machine, &planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 4);
-            vga.a0000_trapped = false;
+            map_direct_aperture(machine, vga, 4);
         }
         Some(::vga::VgaMode::Cga2) => {
             write_live_planes(machine, &planes);
-            machine.copy_page_entries(VGA_VRAM_BASE >> 12, 0xB8000 >> 12, 4);
-            vga.a0000_trapped = false;
+            map_direct_aperture(machine, vga, 4);
         }
         _ => {
             write_live_planes(machine, &planes);
-            vga.a0000_trapped = false;
         }
     }
 }
@@ -1104,19 +1125,13 @@ pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DisplayedVga, ad
         }
     };
     let vga = &mut vga.state;
-    let (window_base, window_len) = planar_window(vga.gc[6]);
-    let window_base = window_base as usize;
-    let window_end = window_base + window_len as usize;
-    if vga.a0000_trapped {
-        // The register file, not the BDA mode byte, is the VGA hardware
-        // truth. Tweaked-mode programs (Impulse Tracker among them) unchain
-        // the sequencer directly without updating 40:49. This is the same
-        // chain-4 test that arms the aperture and handles its page faults.
-        assert_eq!(vga.seq[4] & 0x08, 0,
-            "planar aperture active while VGA chain-4 is enabled");
-    }
+    let Some(pages) = trapped_aperture(vga) else {
+        machine.copy_to(addr, src);
+        return;
+    };
+    let window_base = usize::from(pages.start) << 12;
+    let window_end = usize::from(pages.end) << 12;
     if src.is_empty()
-        || !vga.a0000_trapped
         || addr >= window_end
         || addr.saturating_add(src.len()) <= window_base
     {

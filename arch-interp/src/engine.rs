@@ -24,8 +24,7 @@ mod imp {
         crate::cpu::invalidate_uc(vpage, count)
     }
     /// All I/O is interpreted; there is no IOPB fast path on this engine.
-    pub fn allow_io_ports(_port: u16, _count: usize) {}
-    pub fn reset_io_bitmap() {}
+    pub fn install_io_policy(_policy: &arch_abi::IoPolicy) {}
     /// FPU state lives inside the software core; cross-switch save/restore
     /// is not wired on this engine (pre-existing status).
     pub fn fx_switch(_fx: &mut crate::machine::FxState) {}
@@ -33,7 +32,7 @@ mod imp {
 
 #[cfg(feature = "kvm")]
 mod imp {
-    pub use crate::kvm::{allow_io_ports, execute, fpu_pop, fpu_st0, fx_switch, reset_io_bitmap};
+    pub use crate::kvm::{execute, fpu_pop, fpu_st0, fx_switch, install_io_policy};
     /// The guest TLB is real: mark it dirty so the next entry flushes it.
     pub fn flush() {
         crate::kvm::mark_tlb_dirty()

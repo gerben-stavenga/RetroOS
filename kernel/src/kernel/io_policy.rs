@@ -24,21 +24,21 @@ use crate::kernel::thread::Personality;
 /// deny everything, then open exactly the windows represented by its state.
 ///
 /// Called only by the CPU-loan boundary immediately before guest execution.
-pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A>) {
-    machine.reset_io_bitmap();
+pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> arch_abi::IoPolicy {
+    let mut policy = arch_abi::IoPolicy::deny_all();
     match personality {
         Personality::Dos(_) => {
             if matches!(personality, Personality::Dos(dos)
                 if matches!(dos.pc.vga,
                     crate::kernel::bios_display::DisplayedVga::Native(_)))
             {
-                machine.allow_io_ports(0x3C1, 25); // 0x3C1..=0x3D9
-                machine.allow_io_ports(0x3DB, 5); // 0x3DB..=0x3DF
+                policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
+                policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
                 // Native ownership means the card is the source of truth,
                 // including the attribute-controller flip-flop side effect of
                 // 0x3DA. These two ports must therefore bypass emulation too.
-                machine.allow_io_ports(0x3C0, 1);
-                machine.allow_io_ports(0x3DA, 1);
+                policy.allow(0x3C0, 1);
+                policy.allow(0x3DA, 1);
             }
             // Ports are granted to a guest that holds the REAL card, and to
             // no other: an emulated card's window must keep trapping, or the
@@ -50,14 +50,14 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
             {
                 // A real SB implies a real OPL: FM music writes (frequent) go
                 // straight to the card.
-                machine.allow_io_ports(0x388, 2);
+                policy.allow(0x388, 2);
                 // The DSP window, port by port: the IOPB is a bitmap, so
                 // only what genuinely needs interception traps (see
                 // `trap_mask`) and the rest reaches the card directly.
                 let mask = pt.trap_mask(&dos.pc.sb.blaster);
                 for off in 0..16u16 {
                     if mask & (1 << off) == 0 {
-                        machine.allow_io_ports(dos.pc.sb.blaster.io_base + off, 1);
+                        policy.allow(dos.pc.sb.blaster.io_base + off, 1);
                     }
                 }
                 // The MPU-401 window the guest declared (BLASTER `P`). In
@@ -65,7 +65,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
                 // whatever the owner actually has there — a real MPU, a
                 // wavetable daughterboard, an external module.
                 if dos.pc.mpu.present {
-                    machine.allow_io_ports(dos.pc.mpu.base, 2);
+                    policy.allow(dos.pc.mpu.base, 2);
                 }
                 // The 8237 windows are NEVER granted, in any configuration:
                 // vdma is not a channel relabeler but an ADDRESS translator —
@@ -81,6 +81,7 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
         // Linux: no ports. The deny-all baseline stands.
         Personality::Linux(_) => {}
     }
+    policy
 }
 
 /// Execution policy for a kernel-owned video-BIOS excursion. Possession of
@@ -88,15 +89,15 @@ pub(super) fn apply<A: crate::Arch>(machine: &mut A, personality: &Personality<A
 /// less common ROM accesses (including PCI config space) trap and are forwarded
 /// synchronously by `BiosDisplayWorkspace`. The ordinary guest-entry boundary rebuilds
 /// the next thread's narrower bitmap afterward.
-pub(crate) fn apply_bios_display<A: crate::Arch>(
-    machine: &mut A,
+pub(crate) fn bios_display(
     _bios_display: &crate::kernel::platform::VgaCap,
-) {
-    machine.reset_io_bitmap();
+) -> arch_abi::IoPolicy {
+    let mut policy = arch_abi::IoPolicy::deny_all();
     // Native VBE firmware may use the Bochs/QEMU-compatible DISPI index/data
     // window. The BIOS workspace is trusted and isolated; trapping these
     // instructions back through the kernel turns every bank change into nested
     // monitor exits. Three byte ports cover word accesses at 1CEh and 1CFh.
-    machine.allow_io_ports(0x1CE, 3);
-    machine.allow_io_ports(0x3C0, 0x20);
+    policy.allow(0x1CE, 3);
+    policy.allow(0x3C0, 0x20);
+    policy
 }

@@ -25,9 +25,6 @@ impl Arch for Interp {
     fn outb(&mut self, port: u16, val: u8) { crate::machine::outb(port, val) }
     fn outw(&mut self, port: u16, val: u16) { crate::machine::outw(port, val) }
     fn outl(&mut self, port: u16, val: u32) { crate::machine::outl(port, val) }
-    fn allow_io_ports(&mut self, port: u16, count: usize) { crate::engine::allow_io_ports(port, count) }
-    fn reset_io_bitmap(&mut self) { crate::engine::reset_io_bitmap() }
-
     // ── Execution & scheduling ──
     //
     // The interp still keeps an internal live frame (`vcpu::REGS`) that its CPU
@@ -44,7 +41,8 @@ impl Arch for Interp {
     }
 
     #[allow(clippy::deref_addrof)]
-    fn execute(&mut self, regs: &mut Regs) -> KernelEvent {
+    fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        crate::engine::install_io_policy(io);
         // Bridge the loop-owned registers to the backend's live frame for the
         // run (the active SPACE already lives in `REGS.space`), then read them
         // back. Swap, not copy — `Regs` is Copy but swap keeps a single source.
@@ -77,6 +75,10 @@ impl Arch for Interp {
         old
     }
 
+    fn switch_fx(&mut self, fx: &mut Self::Fx) {
+        crate::engine::fx_switch(fx);
+    }
+
     fn on_ldt_changed(&mut self) {
         crate::desc::mark_ldt_dirty();
     }
@@ -106,6 +108,12 @@ impl Arch for Interp {
     fn map_vga_text_aperture(&mut self) { crate::calls::arch_map_vga_text_aperture() }
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize) {
         crate::calls::arch_copy_page_entries(src_vpage, dst_vpage, count)
+    }
+    fn redirect_physical_aliases(
+        &mut self, physical_ppage: u64, shadow_vpage: usize, count: usize, redirect: bool,
+    ) {
+        crate::calls::arch_redirect_physical_aliases(
+            physical_ppage, shadow_vpage, count, redirect)
     }
     fn swap_page_entries(&mut self, a_vpage: usize, b_vpage: usize, count: usize) {
         crate::calls::arch_swap_page_entries(a_vpage, b_vpage, count)

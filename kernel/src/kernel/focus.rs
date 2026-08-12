@@ -33,7 +33,7 @@ pub fn release<A: crate::Arch>(
     old: &mut Personality<A>,
 ) -> (crate::kernel::display::DisplayHandoff, Option<crate::kernel::drivers::sb16::SbCard>) {
     let card = old.release_sb(machine);
-    (old.suspend(machine, bios_workspace), card)
+    (old.release_display(machine, bios_workspace), card)
 }
 
 /// Attach the incoming display after its guest address space is active.
@@ -45,7 +45,7 @@ pub fn acquire<A: crate::Arch>(
     display: crate::kernel::display::DisplayHandoff,
     card: Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Option<crate::kernel::drivers::sb16::SbCard> {
-    new.materialize(machine, bios_workspace, display);
+    new.acquire_display_restore(machine, bios_workspace, display);
     FOCUS.store(new_tid, Ordering::Relaxed);
     new.adopt_sb(machine, card)
 }

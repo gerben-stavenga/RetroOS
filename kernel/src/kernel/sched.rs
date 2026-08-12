@@ -17,6 +17,9 @@ pub enum Verdict {
     Stay,
     /// Switch to this thread (focus follows, for now).
     Switch(usize),
+    /// The current address space was retained and relabelled as this child;
+    /// only the event-loop's ownership label changes.
+    ContinueAs(usize),
     /// No runnable threads remain — the event loop is done.
     AllDead,
 }
@@ -32,13 +35,14 @@ pub fn verdict<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
     let next = match next_after(machine, bios_workspace, threads, regs, tid, action, exiting_display, sb_handoff) {
-        Some(n) => Some(n),
+        Some(Verdict::Switch(0)) => return Verdict::AllDead,
+        Some(n) => return n,
         None => focus_request(threads, tid),
     };
     match next {
@@ -58,37 +62,40 @@ fn next_after<A: crate::Arch>(
     regs: &mut Regs,
     tid: usize,
     action: thread::KernelAction,
-    exiting_display: &mut Option<crate::kernel::display::DisplayHandoff>,
+    exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
-) -> Option<usize> {
+) -> Option<Verdict> {
     match action {
         thread::KernelAction::Done => None,
-        thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs),
-        thread::KernelAction::Exit(code) => Some(thread::exit_thread(
+        thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs).map(Verdict::Switch),
+        thread::KernelAction::Exit(code) => Some(Verdict::Switch(thread::exit_thread(
             threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff,
-        )),
-        thread::KernelAction::Switch(next) => Some(next),
+        ))),
+        thread::KernelAction::Switch(next) => Some(Verdict::Switch(next)),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
                 machine, bios_workspace, threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
-                on_error, on_success,
-            )
+                on_error, on_success, sb_handoff,
+            ).map(Verdict::ContinueAs)
         }
         thread::KernelAction::Fork { on_done, child_stack } => {
             crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, on_done)
+                .map(Verdict::Switch)
         }
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
             crate::kernel::linux::handle_exec(
                 machine, bios_workspace, threads, regs, tid, buffer, path, args, cwd,
                 exiting_display, sb_handoff,
-            )
+            ).map(Verdict::Switch)
         }
         thread::KernelAction::Wait { pid, status_ptr } => {
             crate::kernel::linux::handle_wait(machine, threads, regs, tid, pid, status_ptr)
+                .map(Verdict::Switch)
         }
         thread::KernelAction::DosSynthChild { pid, op } => {
             crate::kernel::dos::handle_synth_child(machine, threads, regs, tid, pid, op)
+                .map(Verdict::Switch)
         }
     }
 }

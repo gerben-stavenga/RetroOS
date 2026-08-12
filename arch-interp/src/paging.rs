@@ -29,6 +29,9 @@ const ENTRY_FLAGS: u32 = PRESENT | WRITABLE | USER;
 /// a copy-on-write page. Such a page is mapped PRESENT|USER read-only (W=0), so
 /// a write #PFs; `space_cow_fault` then privatises the frame and clears COW.
 const COW: u32 = 1 << 9;
+/// Physical-device alias temporarily redirected onto an owned shadow page.
+/// The other PTE flags remain unchanged so the mapping can be restored.
+const REDIRECTED_ALIAS: u32 = 1 << 10;
 
 #[inline]
 fn pde_index(vaddr: u32) -> usize {
@@ -735,6 +738,61 @@ pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
     });
 }
 
+/// Redirect aliases by their physical frames rather than by the higher-level
+/// API which happened to create them. Tagged aliases can later be restored
+/// without disturbing unrelated aliases of the shadow pages.
+pub fn space_redirect_physical_aliases(
+    physical_ppage: u64,
+    shadow_vpage: usize,
+    count: usize,
+    redirect: bool,
+) {
+    with_active_pd(|pd| {
+        let shadow: Vec<u32> = (0..count)
+            .map(|i| pte_raw(pd, ((shadow_vpage + i) * 4096) as u32))
+            .collect();
+        for pde_i in 0..768 {
+            let pde = read_entry(pd, pde_i);
+            if pde & PRESENT == 0 { continue; }
+            let pt = (pde >> 12) as u64;
+            for pte_i in 0..1024 {
+                let vpage = pde_i * 1024 + pte_i;
+                if (shadow_vpage..shadow_vpage + count).contains(&vpage) {
+                    continue;
+                }
+                let old = read_entry(pt, pte_i);
+                if old & PRESENT == 0 { continue; }
+                let old_page = (old >> 12) as u64;
+                let offset = if redirect {
+                    old_page.checked_sub(physical_ppage)
+                        .filter(|offset| (*offset as usize) < count)
+                        .map(|offset| offset as usize)
+                } else if old & REDIRECTED_ALIAS != 0 {
+                    shadow.iter().position(|entry| {
+                        entry & PRESENT != 0 && u64::from(entry >> 12) == old_page
+                    })
+                } else {
+                    None
+                };
+                let Some(offset) = offset else { continue };
+                if redirect && shadow[offset] & PRESENT == 0 { continue; }
+
+                if redirect {
+                    let frame = u64::from(shadow[offset] >> 12);
+                    phys::inc_ref(frame);
+                    write_entry(pt, pte_i,
+                        (old & 0xFFF) | ((frame as u32) << 12) | REDIRECTED_ALIAS);
+                } else {
+                    write_entry(pt, pte_i,
+                        (old & 0xFFF & !REDIRECTED_ALIAS)
+                            | (((physical_ppage + offset as u64) as u32) << 12));
+                    phys::free_frames(old_page, 1);
+                }
+            }
+        }
+    });
+}
+
 /// Swap `count` page mappings a↔b (PTE swap — no content move needed since each
 /// VA already owns its frame).
 pub fn space_swap_entries(a: usize, b: usize, count: usize) {
@@ -986,6 +1044,31 @@ mod space_ops {
         let pml4c = active_pml4();
         let pa = translate64(pml4c, 0x10_000).expect("still mapped");
         assert_eq!(pa >> 12, space_translate(0x10_000).unwrap() as u64 >> 12);
+    }
+
+    #[test]
+    fn physical_aliases_follow_shadow_and_restore_exactly() {
+        space_init();
+        let s = space_new();
+        space_switch(s);
+        let physical = phys::alloc_frames(2);
+        space_map_phys(0x20, 2, physical, true);
+        space_map_fresh(0x40, 2);
+        space_copy_entries(0x40, 0x30, 2); // unrelated aliases of the shadow
+        let shadow = [
+            space_translate(0x40_000).unwrap() >> 12,
+            space_translate(0x41_000).unwrap() >> 12,
+        ];
+
+        space_redirect_physical_aliases(physical, 0x40, 2, true);
+        assert_eq!(space_translate(0x20_000).unwrap() >> 12, shadow[0]);
+        assert_eq!(space_translate(0x21_000).unwrap() >> 12, shadow[1]);
+
+        space_redirect_physical_aliases(physical, 0x40, 2, false);
+        assert_eq!(space_translate(0x20_000).unwrap() as u64 >> 12, physical);
+        assert_eq!(space_translate(0x21_000).unwrap() as u64 >> 12, physical + 1);
+        assert_eq!(space_translate(0x30_000).unwrap() >> 12, shadow[0]);
+        assert_eq!(space_translate(0x31_000).unwrap() >> 12, shadow[1]);
     }
 
     #[test]
