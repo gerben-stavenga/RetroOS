@@ -71,6 +71,28 @@ IMG_KIND="${IMG_KIND:-image}"
 # image, so that copy is where a probe's verdict lands and where we read it.
 IMG="${IMG:-$VM_DIR/disk.img}"
 
+# Only one probe may use this VM directory at a time.  This also prevents a
+# second test runner from copying a new disk image underneath an active 86Box.
+mkdir -p "$VM_DIR"
+if ! exec 9>"$VM_DIR/.retroos-test.lock"; then
+    echo "Cannot create the 86Box test lock in: $VM_DIR" >&2
+    exit 2
+fi
+if ! flock -n 9; then
+    echo "86Box test VM is already in use: $VM_DIR" >&2
+    exit 2
+fi
+# A VM left behind by an interrupted older run does not hold the lock above.
+# Refuse to start another copy against that same disk; silently sharing it can
+# make the result file appear to belong to the wrong probe.
+existing_vm=$(pgrep -af -- "--vmpath[[:space:]]+$VM_DIR([[:space:]]|$)" || true)
+if [ -n "$existing_vm" ]; then
+    echo "86Box test VM already has a running instance:" >&2
+    echo "$existing_vm" >&2
+    echo "Close that instance before rerunning the test." >&2
+    exit 2
+fi
+
 # Read a probe's verdict file out of the image the run just used. The DOS C:
 # root is an ext4 subtree, so debugfs reads it without mounting (no root).
 read_verdict() {
@@ -118,7 +140,18 @@ VM_PGID=""
 kill_vm() {
     if [ -n "$VM_PGID" ]; then
         kill -TERM -- "-$VM_PGID" 2>/dev/null
-        wait "$VM_PGID" 2>/dev/null
+        # Do not wait forever if the emulator ignores TERM or its GUI helper
+        # keeps the process group alive.  Give it a short grace period, then
+        # forcibly reap the complete group before the next probe starts.
+        local i
+        for i in 1 2 3 4 5; do
+            kill -0 -- "-$VM_PGID" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 -- "-$VM_PGID" 2>/dev/null; then
+            kill -KILL -- "-$VM_PGID" 2>/dev/null
+        fi
+        wait "$VM_PGID" 2>/dev/null || true
         VM_PGID=""
     fi
     if [ -n "$FLATPAK_ID" ]; then

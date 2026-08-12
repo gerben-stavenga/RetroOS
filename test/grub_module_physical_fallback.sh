@@ -23,7 +23,9 @@ printf '%s\n' \
     '    boot' \
     '}' > "$tmp_dir/iso/boot/grub/grub.cfg"
 grub-mkrescue -o "$tmp_dir/module.iso" "$tmp_dir/iso" >/dev/null
-timeout 18s qemu-system-i386 \
+# The boot probe may remain in its shell after reporting success; always reap
+# QEMU even if it does not exit promptly after the timeout signal.
+timeout --kill-after=5s 18s qemu-system-i386 \
     -m 512 -cpu pentium3 \
     -cdrom "$tmp_dir/module.iso" \
     -drive file=bazel-bin/image.bin,format=raw,snapshot=on \
