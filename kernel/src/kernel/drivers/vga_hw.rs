@@ -356,6 +356,40 @@ pub fn save_dac(_cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     for i in 0..768 { state.dac[i] = inb(0x3C9); }
 }
 
+/// RetroOS VBE 4F09h over an indexed native mode. VBE palette entries are
+/// B,G,R,reserved while the VGA DAC consumes R,G,B; components are six-bit.
+pub fn set_vbe_palette(
+    _cap: &crate::kernel::platform::VgaCap,
+    start: u8,
+    entries: &[u8],
+) {
+    debug_assert_eq!(entries.len() % 4, 0);
+    use crate::kernel::portio::outb;
+    outb(0x3C8, start);
+    for entry in entries.chunks_exact(4) {
+        outb(0x3C9, entry[2]);
+        outb(0x3C9, entry[1]);
+        outb(0x3C9, entry[0]);
+    }
+}
+
+/// Read native indexed-DAC entries back in VBE's B,G,R,reserved layout.
+pub fn get_vbe_palette(
+    _cap: &crate::kernel::platform::VgaCap,
+    start: u8,
+    entries: &mut [u8],
+) {
+    debug_assert_eq!(entries.len() % 4, 0);
+    use crate::kernel::portio::{inb, outb};
+    outb(0x3C7, start);
+    for entry in entries.chunks_exact_mut(4) {
+        let r = inb(0x3C9);
+        let g = inb(0x3C9);
+        let b = inb(0x3C9);
+        entry.copy_from_slice(&[b, g, r, 0]);
+    }
+}
+
 /// Program `state` back into the live card: registers, DAC, and plane
 /// memory. Called while acquiring the physical lease, or when repainting an
 /// owner that already holds it.

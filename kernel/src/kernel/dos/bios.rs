@@ -1480,7 +1480,7 @@ fn vbe_dac_format(regs: &mut Regs) {
 /// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
 fn vbe_palette<A: crate::Arch>(
     machine: &mut A,
-    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    _bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
@@ -1494,35 +1494,30 @@ fn vbe_palette<A: crate::Arch>(
     if !indexed { return false; }
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u8;
+    if count > 256 - usize::from(start) { return false; }
     let tbl = es_offset(dos, regs, regs.rdi as u32);
-    if matches!(dos.pc.vga, DisplayedVga::Native(_)) {
-        let copy_to_bios = match regs.rbx as u8 {
-            0x00 | 0x80 => true,
-            0x01 => false,
-            _ => return false,
-        };
+    if let DisplayedVga::Native(display) = &mut dos.pc.vga {
+        // The guest sees a RetroOS VBE adapter, not the physical ROM's API.
+        // Implement its indexed-palette service directly on the VGA DAC so a
+        // card BIOS that has modes but no 4F09h (notably the Cirrus GD5446
+        // ROM in 86Box) cannot make our advertised service a false success.
         let mut data = alloc::vec![0; count * 4];
-        if copy_to_bios {
-            machine.copy_from(tbl, &mut data);
+        match regs.rbx as u8 {
+            0x00 | 0x80 => {
+                machine.copy_from(tbl, &mut data);
+                crate::kernel::drivers::vga_hw::set_vbe_palette(
+                    display.cap(), start, &data,
+                );
+            }
+            0x01 => {
+                crate::kernel::drivers::vga_hw::get_vbe_palette(
+                    display.cap(), start, &mut data,
+                );
+                machine.copy_to(tbl, &data);
+            }
+            _ => return false,
         }
-        let ok = if let DisplayedVga::Native(display) = &mut dos.pc.vga {
-            display.cap_mut()
-                .bios_palette_call(
-                    machine,
-                    bios_display,
-                    regs,
-                    (!data.is_empty()).then_some(data.as_mut_slice()),
-                    copy_to_bios,
-                    true,
-                )
-                .is_ok()
-        } else {
-            false
-        };
-        if ok && !copy_to_bios {
-            machine.copy_to(tbl, &data);
-        }
-        return ok;
+        return true;
     }
     match regs.rbx as u8 {
         0x00 | 0x80 => {
