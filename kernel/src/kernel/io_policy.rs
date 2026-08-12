@@ -30,13 +30,12 @@ pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> a
         Personality::Dos(_) => {
             if let Personality::Dos(dos) = personality
                 && let crate::kernel::bios_display::DisplayedVga::Native(native) = &dos.pc.vga
+                && !native.is_vbe()
             {
-                if !native.is_vbe() {
-                    policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
-                    policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
-                    policy.allow(0x3C0, 1);
-                    policy.allow(0x3DA, 1);
-                }
+                policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
+                policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
+                policy.allow(0x3C0, 1);
+                policy.allow(0x3DA, 1);
             }
             // Ports are granted to a guest that holds the REAL card, and to
             // no other: an emulated card's window must keep trapping, or the

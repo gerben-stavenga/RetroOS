@@ -1454,8 +1454,8 @@ pub fn bill_audio_service(sb: u64, gus: u64, mpu: u64) {
 pub fn bill_audio_sources(parts: [u64; 4]) {
     unsafe {
         let p = &raw mut AUDIO_SOURCE_PARTS;
-        for i in 0..4 {
-            (*p)[i] = (*p)[i].wrapping_add(parts[i]);
+        for (i, part) in parts.into_iter().enumerate() {
+            (*p)[i] = (*p)[i].wrapping_add(part);
         }
     }
 }
