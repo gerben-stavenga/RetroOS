@@ -52,8 +52,8 @@ struct Census {
     drained: u64,
     produced: u64,
 }
-static EFFECTIVE_MIX_RATE_Q16_LO: AtomicU32 = AtomicU32::new(0);
-static EFFECTIVE_MIX_RATE_Q16_HI: AtomicU32 = AtomicU32::new(0);
+static PITCH_MIX_RATE_Q16_LO: AtomicU32 = AtomicU32::new(0);
+static PITCH_MIX_RATE_Q16_HI: AtomicU32 = AtomicU32::new(0);
 
 fn load64(lo: &AtomicU32, hi: &AtomicU32) -> u64 {
     (hi.load(Ordering::Relaxed) as u64) << 32 | lo.load(Ordering::Relaxed) as u64
@@ -64,13 +64,16 @@ fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
     hi.store((v >> 32) as u32, Ordering::Relaxed);
 }
 
-fn publish_mixing_rate_q16(rate_q16: u64) {
-    store64(&EFFECTIVE_MIX_RATE_Q16_LO, &EFFECTIVE_MIX_RATE_Q16_HI, rate_q16);
+fn publish_mixing_rate_q16(pitch_rate_q16: u64) {
+    store64(&PITCH_MIX_RATE_Q16_LO, &PITCH_MIX_RATE_Q16_HI, pitch_rate_q16);
 }
 
-/// The rate the mixer is currently running at, in frames/sec × 2^16.
+/// The rate the audio is currently pitched to, in frames/sec × 2^16: the
+/// pacer's steady `s`, the timebase sources render against — not the effective
+/// frame-count rate, which swings with the latency servo and is audible in
+/// nothing. Backs the OSD "Mix rate" readout.
 pub fn mixing_rate_q16() -> u64 {
-    load64(&EFFECTIVE_MIX_RATE_Q16_LO, &EFFECTIVE_MIX_RATE_Q16_HI)
+    load64(&PITCH_MIX_RATE_Q16_LO, &PITCH_MIX_RATE_Q16_HI)
 }
 
 /// Does a backend-installed sink answer behind the canonical port window?
@@ -352,7 +355,12 @@ pub fn advance<A: crate::Arch>(
         base += run as u64;
         remaining -= run as u64;
     }
-    publish_mixing_rate_q16(rate_q16);
+    // Publish the pitch timebase, not the effective frame-count rate. The OSD
+    // "Mix rate" reads this, and after the pitch/count split it is `s` that the
+    // audio actually plays at; `rate_q16` swings with the latency servo and no
+    // longer describes anything audible. The instantaneous rate and its
+    // deviation from `s` stay visible through the trace/census diagnostics.
+    publish_mixing_rate_q16(pitch_rate_q16);
 
     if prof {
         let profile_end = machine.rdtsc();
