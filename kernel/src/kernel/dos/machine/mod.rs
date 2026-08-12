@@ -620,10 +620,6 @@ pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u1
     }
     if matches!(&pc.vga, DisplayedVga::Native(native) if native.is_vbe()) {
         return match port {
-            0x3C6..=0x3C9
-                if matches!(&pc.vga,
-                    DisplayedVga::Native(native) if native.vbe_dac_access()) =>
-                machine.inb(port),
             0x3DA => input_status1(machine, &pc.present_scratch2),
             0x3C0..=0x3DF | 0x01CE..=0x01D0 => 0xFF,
             _ => emulate_inb_non_vga(machine, pc, port),
@@ -765,12 +761,6 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
     if matches!(&pc.vga, DisplayedVga::Native(native) if native.is_vbe())
         && matches!(port, 0x3C0..=0x3DF | 0x01CE..=0x01D0)
     {
-        if matches!(port, 0x3C6..=0x3C9)
-            && matches!(&pc.vga,
-                DisplayedVga::Native(native) if native.vbe_dac_access())
-        {
-            machine.outb(port, val);
-        }
         return;
     }
     match port {

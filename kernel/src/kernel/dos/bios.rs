@@ -1376,6 +1376,9 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
     let image_pages = (image_count - 1) as u8;
     Some(crate::kernel::platform::VbeMode {
         number,
+        // This is an implementation detail of the RAM-backed substitute mode;
+        // its public ModeInfo still deliberately says not VGA compatible.
+        vga_compatible: false,
         physical_base: super::machine::vga::svga_lfb_base(),
         width,
         height,
@@ -1485,7 +1488,7 @@ fn vbe_palette<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     let indexed = match &dos.pc.vga {
-        DisplayedVga::Native(display) => display.vbe_dac_access(),
+        DisplayedVga::Native(display) => display.is_indexed_vbe(),
         DisplayedVga::Emulated(dev, _) => matches!(dev.resume,
             crate::kernel::bios_display::VideoResume::Vbe { mode, .. }
                 if matches!(mode.format,
@@ -1502,6 +1505,21 @@ fn vbe_palette<A: crate::Arch>(
         // card BIOS that has modes but no 4F09h (notably the Cirrus GD5446
         // ROM in 86Box) cannot make our advertised service a false success.
         let mut data = alloc::vec![0; count * 4];
+        if !display.physical_vbe_dac_access() {
+            let copy_to_bios = matches!(regs.rbx as u8, 0x00 | 0x80);
+            if !copy_to_bios && regs.rbx as u8 != 0x01 { return false; }
+            if copy_to_bios { machine.copy_from(tbl, &mut data); }
+            let ok = display.cap_mut().bios_palette_call(
+                machine,
+                _bios_display,
+                regs,
+                (!data.is_empty()).then_some(data.as_mut_slice()),
+                copy_to_bios,
+                true,
+            ).is_ok();
+            if ok && !copy_to_bios { machine.copy_to(tbl, &data); }
+            return ok;
+        }
         match regs.rbx as u8 {
             0x00 | 0x80 => {
                 machine.copy_from(tbl, &mut data);

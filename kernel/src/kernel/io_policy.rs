@@ -31,15 +31,7 @@ pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> a
             if let Personality::Dos(dos) = personality
                 && let crate::kernel::bios_display::DisplayedVga::Native(native) = &dos.pc.vga
             {
-                if native.is_vbe() {
-                    // Generic RetroOS VBE exposes framebuffer memory and, for
-                    // indexed modes, the standard DAC only. Mode/controller
-                    // programming remains behind INT 10h regardless of the
-                    // physical card's vendor register set.
-                    if native.vbe_dac_access() {
-                        policy.allow(0x3C6, 4);
-                    }
-                } else {
+                if !native.is_vbe() {
                     policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
                     policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
                     policy.allow(0x3C0, 1);

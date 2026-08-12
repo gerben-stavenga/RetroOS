@@ -15,6 +15,10 @@
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VbeMode {
     pub number: u16,
+    /// The physical mode permits standard VGA register/DAC access. RetroOS
+    /// deliberately does not expose this promise to applications; it uses it
+    /// only to choose how its substitute VBE services drive the real card.
+    pub vga_compatible: bool,
     pub physical_base: u32,
     pub width: u16,
     pub height: u16,
@@ -150,6 +154,7 @@ pub struct VgaCap {
     _private: (),
     vbe_mode: Option<u16>,
     vbe_indexed: bool,
+    vbe_vga_compatible: bool,
 }
 
 /// A physical VGA whose registers and VRAM are the authoritative VGA state.
@@ -165,15 +170,21 @@ impl Default for NativeVga {
 
 impl NativeVga {
     pub fn new() -> Self {
-        Self(VgaCap { _private: (), vbe_mode: None, vbe_indexed: false })
+        Self(VgaCap {
+            _private: (), vbe_mode: None, vbe_indexed: false,
+            vbe_vga_compatible: false,
+        })
     }
 
     pub(crate) fn into_cap(self) -> VgaCap { self.0 }
     pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
     pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
     pub fn is_vbe(&self) -> bool { self.0.vbe_mode.is_some() }
-    pub fn vbe_dac_access(&self) -> bool {
+    pub fn is_indexed_vbe(&self) -> bool {
         self.0.vbe_mode.is_some() && self.0.vbe_indexed
+    }
+    pub(crate) fn physical_vbe_dac_access(&self) -> bool {
+        self.is_indexed_vbe() && self.0.vbe_vga_compatible
     }
 
     /// Mark the hardware state authoritative again after a complete software
@@ -185,10 +196,12 @@ impl VgaCap {
     pub(crate) fn mark_legacy(&mut self) {
         self.vbe_mode = None;
         self.vbe_indexed = false;
+        self.vbe_vga_compatible = false;
     }
-    pub(crate) fn mark_vbe(&mut self, mode: u16, indexed: bool) {
+    pub(crate) fn mark_vbe(&mut self, mode: u16, indexed: bool, vga_compatible: bool) {
         self.vbe_mode = Some(mode);
         self.vbe_indexed = indexed;
+        self.vbe_vga_compatible = vga_compatible;
     }
 }
 

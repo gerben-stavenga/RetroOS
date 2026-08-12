@@ -278,7 +278,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             bios_display.mark_legacy();
             return Ok(());
         }
-        let Some(_) = self.mode(number) else {
+        let Some(mode) = self.mode(number) else {
             return Err(BiosError::Rejected(0x014F));
         };
         let mut regs = self.bios_vcpu.regs;
@@ -288,10 +288,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }, |_, _| ())?;
         let status = regs.rax as u16;
         if status == 0x004F {
-            let indexed = self.mode(number).is_some_and(|mode| matches!(
-                mode.format, crate::kernel::display::FormatSpec::Indexed8,
-            ));
-            bios_display.mark_vbe(number, indexed);
+            let indexed = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8);
+            bios_display.mark_vbe(number, indexed, mode.vga_compatible);
             Ok(())
         } else {
             Err(BiosError::Rejected(status))
@@ -354,6 +352,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }, |_, _| ())?;
         let status = regs.rax as u16;
         caller.rax = regs.rax;
+        if input[0] as u16 == 0x4F09 && regs.rax as u16 != 0x004F {
+            return Err(BiosError::Rejected(regs.rax as u16));
+        }
         caller.rbx = regs.rbx;
         caller.rcx = regs.rcx;
         caller.rdx = regs.rdx;
@@ -1164,7 +1165,8 @@ fn parse_vbe_mode<A: Arch>(
         return None;
     }
     Some(crate::kernel::platform::VbeMode {
-        number, physical_base, width, height, pitch, banked_pitch, linear_pitch,
+        number, vga_compatible: attributes & 0x0020 == 0,
+        physical_base, width, height, pitch, banked_pitch, linear_pitch,
         bits_per_pixel: bpp, format,
         window_segment,
         window_granularity_kb,
