@@ -61,7 +61,9 @@ const SYSTEM_NUM_ITEMS: usize = 2;
 const SOUND_ITEM_VOLUME: usize = 0;
 const SOUND_ITEM_LATENCY: usize = 1;
 const SOUND_ITEM_RATE: usize = 2;
-const SOUND_NUM_ITEMS: usize = 3;
+const SOUND_ITEM_HDA_OUTPUT: usize = 3;
+const SOUND_NUM_ITEMS_BASE: usize = 3;
+const SOUND_NUM_ITEMS_WITH_HDA_OUTPUT: usize = 4;
 
 const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
@@ -152,7 +154,7 @@ fn active_sel(tab: usize) -> usize {
 
 fn set_active_sel(tab: usize, sel: usize) {
     match tab {
-        TAB_SOUND => SOUND_SEL.store(sel.min(SOUND_NUM_ITEMS - 1), Ordering::Relaxed),
+        TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
         _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
     }
@@ -160,10 +162,21 @@ fn set_active_sel(tab: usize, sel: usize) {
 
 fn active_item_count(tab: usize) -> usize {
     match tab {
-        TAB_SOUND => SOUND_NUM_ITEMS,
+        TAB_SOUND => sound_item_count(),
         TAB_DEBUG => DEBUG_NUM_ITEMS,
         _ => SYSTEM_NUM_ITEMS,
     }
+}
+
+fn sound_item_count_for(audio: crate::kernel::platform::Audio) -> usize {
+    match audio {
+        crate::kernel::platform::Audio::EmulatedHda => SOUND_NUM_ITEMS_WITH_HDA_OUTPUT,
+        _ => SOUND_NUM_ITEMS_BASE,
+    }
+}
+
+fn sound_item_count() -> usize {
+    sound_item_count_for(crate::kernel::platform::get().audio)
 }
 
 fn active_tab_name(tab: usize) -> &'static [u8] {
@@ -369,6 +382,7 @@ fn adjust(up: bool) {
             };
             LATENCY_MS.store(next, Ordering::Relaxed);
         }
+        SOUND_ITEM_HDA_OUTPUT => crate::kernel::drivers::hda::cycle_output_route(up),
         _ => {}
     }
 }
@@ -679,6 +693,10 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                 line.put(b"Mix rate ");
                 line.put_rate_q16(crate::kernel::sound::mixing_rate_q16());
             }
+            SOUND_ITEM_HDA_OUTPUT => {
+                line.put(b"HDA out  ");
+                line.put(crate::kernel::drivers::hda::output_route_label());
+            }
             _ => {}
         },
         TAB_DEBUG => match item {
@@ -762,5 +780,22 @@ impl Line {
     }
     fn as_bytes(&self) -> &[u8] {
         &self.buf[..self.len]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sound_item_count_is_conditional_on_hda() {
+        use crate::kernel::platform::Audio;
+
+        assert_eq!(sound_item_count_for(Audio::EmulatedHda), 4);
+        assert_eq!(sound_item_count_for(Audio::NativeSb), 3);
+        assert_eq!(sound_item_count_for(Audio::SbSink), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedAc97), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedPortWindow), 3);
+        assert_eq!(sound_item_count_for(Audio::EmulatedSilent), 3);
     }
 }

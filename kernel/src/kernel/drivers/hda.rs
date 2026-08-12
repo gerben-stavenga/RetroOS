@@ -24,8 +24,8 @@
 //! then the internal analog codec later on a high PCI bus. We rank PCI HDA
 //! candidates before bring-up, then enumerate the selected codec's widget graph
 //! and choose a real output route. Pins whose default config says "not
-//! connected" are ignored; internal speakers beat headphones, headphones beat
-//! line-out, and digital-only paths are de-prioritized. This keeps QEMU's tiny
+//! connected" are ignored; valid paths are ranked by the selected output
+//! preference, and digital-only paths are de-prioritized. This keeps QEMU's tiny
 //! graph working while steering an AMD/Realtek laptop toward its analog speaker
 //! codec instead of an HDMI function.
 //!
@@ -39,6 +39,7 @@
 //! so reusing the same window + DMA channel is safe.
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 // ── Stolen kernel VAs (dead UMA slice of the low-mem identity window) ─────────
@@ -161,8 +162,61 @@ const REALTEK_EAPD_COEF_MASK: u32 = 1 << 9;
 // unique capability returned by `probe`. Rust cannot express that phase
 // transition, so the unsafe proof is confined to `install` below.
 static mut HDA: Option<Hda> = None;
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+enum OutputRoute {
+    Speaker = 0,
+    Jack = 1,
+    Headphone = 2,
+}
+
+const DEFAULT_OUTPUT_ROUTE: OutputRoute = OutputRoute::Speaker;
+
+impl OutputRoute {
+    const ALL: [Self; 3] = [Self::Speaker, Self::Jack, Self::Headphone];
+
+    fn from_raw(raw: u8) -> Self {
+        Self::ALL.get(raw as usize).copied().unwrap_or(DEFAULT_OUTPUT_ROUTE)
+    }
+
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::Speaker => b"Speaker",
+            Self::Jack => b"Jack",
+            Self::Headphone => b"Headphone",
+        }
+    }
+
+    fn next(self, forward: bool) -> Self {
+        let current = self as usize;
+        let next = if forward {
+            (current + 1) % Self::ALL.len()
+        } else {
+            (current + Self::ALL.len() - 1) % Self::ALL.len()
+        };
+        Self::ALL[next]
+    }
+}
+
+static OUTPUT_ROUTE: AtomicU8 = AtomicU8::new(DEFAULT_OUTPUT_ROUTE as u8);
+static OUTPUT_ROUTE_PENDING: AtomicBool = AtomicBool::new(false);
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn output_route_label() -> &'static [u8] {
+    OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed)).label()
+}
+
+pub fn cycle_output_route(forward: bool) {
+    let current = OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed));
+    let next = current.next(forward);
+    OUTPUT_ROUTE.store(next as u8, Ordering::Relaxed);
+    OUTPUT_ROUTE_PENDING.store(true, Ordering::Relaxed);
+    crate::println!(
+        "hda: requested output route {}",
+        core::str::from_utf8(next.label()).unwrap_or("?")
+    );
+}
 
 #[inline]
 fn spin(n: usize) {
@@ -762,6 +816,8 @@ impl Hda {
         // Stop both engines before reprogramming their bases.
         w8(CORBCTL, 0);
         w8(RIRBCTL, 0);
+        w8(RIRBSTS, 0x05);
+        self.verb_failed = false;
 
         let corb_phys = self.dma_phys + CORB_OFF as u32;
         w32(CORBLBASE, corb_phys);
@@ -905,13 +961,14 @@ impl Hda {
     fn select_output_path(&mut self) -> bool {
         let mut widgets = [Widget::EMPTY; MAX_WIDGETS];
         let count = self.enumerate_widgets(&mut widgets);
+        let route = OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed));
         let mut best = OutputPath::EMPTY;
         for i in 0..count {
             let w = widgets[i];
             if w.typ != WTYPE_PIN_COMPLEX {
                 continue;
             }
-            let pin_score = output_pin_score(&w);
+            let pin_score = output_pin_score(&w, route);
             if pin_score <= 0 {
                 continue;
             }
@@ -1230,6 +1287,47 @@ impl Hda {
         }
     }
 
+    fn apply_pending_output_route(&mut self) {
+        if !OUTPUT_ROUTE_PENDING.swap(false, Ordering::Relaxed) {
+            return;
+        }
+
+        let old_pin = self.pin;
+        let old_dac = self.dac;
+        let old_pin_def = self.pin_def;
+        let old_path = self.path;
+
+        self.setup_corb_rirb();
+        if !self.select_output_path() || self.verb_failed {
+            self.pin = old_pin;
+            self.dac = old_dac;
+            self.pin_def = old_pin_def;
+            self.path = old_path;
+            self.stop_corb_rirb();
+            crate::println!("hda: output route change found no usable path");
+            return;
+        }
+
+        if old_pin != self.pin {
+            self.verb(old_pin, VERB_SET_PIN_WIDGET_CONTROL << 8);
+        }
+        if old_dac != self.dac {
+            self.verb(old_dac, VERB_SET_CONV_STREAM_CHAN << 8);
+        }
+        self.configure_path();
+        self.verb(self.dac, (0x2 << 16) | STREAM_FMT as u32);
+        self.stop_corb_rirb();
+
+        if self.verb_failed {
+            crate::println!("hda: output route change codec verb timeout");
+        } else {
+            crate::println!(
+                "hda: output route selected pin=nid{} dac=nid{}",
+                self.pin, self.dac
+            );
+        }
+    }
+
     /// Frames the codec has played since the previous cursor poll.
     fn advance(&mut self) -> u64 {
         if !self.running {
@@ -1262,7 +1360,7 @@ fn default_device(def_cfg: u32) -> u32 {
     (def_cfg >> 20) & 0xF
 }
 
-fn output_pin_score(w: &Widget) -> i32 {
+fn output_pin_score(w: &Widget, route: OutputRoute) -> i32 {
     if w.pin_caps & PIN_CAP_OUT == 0 || default_port(w.def_cfg) == DEFAULT_PORT_NONE {
         return -1;
     }
@@ -1275,6 +1373,28 @@ fn output_pin_score(w: &Widget) -> i32 {
     }
     if default_port(w.def_cfg) == DEFAULT_PORT_FIXED {
         score += 80;
+    }
+    match route {
+        OutputRoute::Speaker => {
+            if default_device(w.def_cfg) == DEFAULT_DEVICE_SPEAKER {
+                score += 2_000;
+            }
+            if default_port(w.def_cfg) == DEFAULT_PORT_FIXED {
+                score += 2_000;
+            }
+        }
+        OutputRoute::Jack => {
+            if default_port(w.def_cfg) != DEFAULT_PORT_FIXED {
+                score += 4_000;
+            }
+        }
+        OutputRoute::Headphone => {
+            if default_device(w.def_cfg) == DEFAULT_DEVICE_HP_OUT {
+                score += 5_000;
+            } else if default_port(w.def_cfg) != DEFAULT_PORT_FIXED {
+                score += 3_000;
+            }
+        }
     }
     let assoc = (w.def_cfg >> 4) & 0xF;
     if assoc != 0 && assoc != 0xF {
@@ -1448,6 +1568,7 @@ impl sound::sink::Device for Hda {
     /// controller re-evaluates the codec↔stream binding with the stream number
     /// visible.
     fn start(&mut self) {
+        self.apply_pending_output_route();
         assert_eq!(
             r16(self.sd + SDFMT),
             STREAM_FMT,
@@ -1471,6 +1592,7 @@ impl sound::sink::Device for Hda {
     }
 
     fn frames_played(&mut self) -> u64 {
+        self.apply_pending_output_route();
         self.advance()
     }
 }
@@ -1486,4 +1608,64 @@ pub fn emergency_quiesce() {
     }
     stop_controller_dma();
     w32(GCTL, 0); // assert CRST: the codec rides out the reboot in reset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn widget(pin_caps: u32, port: u32, device: u32) -> Widget {
+        Widget {
+            pin_caps,
+            def_cfg: (port << 30) | (device << 20),
+            ..Widget::EMPTY
+        }
+    }
+
+    #[test]
+    fn output_route_defaults_and_labels() {
+        assert_eq!(DEFAULT_OUTPUT_ROUTE, OutputRoute::Speaker);
+        assert_eq!(OutputRoute::from_raw(0), OutputRoute::Speaker);
+        assert_eq!(OutputRoute::from_raw(1), OutputRoute::Jack);
+        assert_eq!(OutputRoute::from_raw(2), OutputRoute::Headphone);
+        assert_eq!(OutputRoute::from_raw(3), OutputRoute::Speaker);
+        assert_eq!(OutputRoute::Speaker.label(), b"Speaker");
+        assert_eq!(OutputRoute::Jack.label(), b"Jack");
+        assert_eq!(OutputRoute::Headphone.label(), b"Headphone");
+    }
+
+    #[test]
+    fn output_route_cycles_in_both_directions() {
+        assert_eq!(OutputRoute::Speaker.next(true), OutputRoute::Jack);
+        assert_eq!(OutputRoute::Jack.next(true), OutputRoute::Headphone);
+        assert_eq!(OutputRoute::Headphone.next(true), OutputRoute::Speaker);
+        assert_eq!(OutputRoute::Speaker.next(false), OutputRoute::Headphone);
+        assert_eq!(OutputRoute::Headphone.next(false), OutputRoute::Jack);
+        assert_eq!(OutputRoute::Jack.next(false), OutputRoute::Speaker);
+    }
+
+    #[test]
+    fn output_pin_score_rejects_invalid_pins() {
+        let no_output = widget(0, DEFAULT_PORT_FIXED, DEFAULT_DEVICE_SPEAKER);
+        let disconnected = widget(PIN_CAP_OUT, DEFAULT_PORT_NONE, DEFAULT_DEVICE_SPEAKER);
+        for route in OutputRoute::ALL {
+            assert_eq!(output_pin_score(&no_output, route), -1);
+            assert_eq!(output_pin_score(&disconnected, route), -1);
+        }
+    }
+
+    #[test]
+    fn output_route_preferences_rank_expected_pins() {
+        let fixed_speaker = widget(PIN_CAP_OUT, DEFAULT_PORT_FIXED, DEFAULT_DEVICE_SPEAKER);
+        let external_line = widget(PIN_CAP_OUT, 0, DEFAULT_DEVICE_LINE_OUT);
+        let external_headphone = widget(PIN_CAP_OUT, 0, DEFAULT_DEVICE_HP_OUT);
+
+        assert!(output_pin_score(&fixed_speaker, OutputRoute::Speaker)
+            > output_pin_score(&external_line, OutputRoute::Speaker));
+        assert!(output_pin_score(&external_line, OutputRoute::Jack)
+            > output_pin_score(&fixed_speaker, OutputRoute::Jack));
+        assert!(output_pin_score(&external_headphone, OutputRoute::Headphone)
+            > output_pin_score(&external_line, OutputRoute::Headphone));
+        assert!(output_pin_score(&external_line, OutputRoute::Headphone) > 0);
+    }
 }
