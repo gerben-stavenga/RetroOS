@@ -37,6 +37,33 @@ pub enum RenderMode {
     AdvanceOnly,
 }
 
+/// Convert the existing system-tick cadence into a lower-rate audio-service
+/// wakeup. It is a scheduling aid only; callers still use `AudioTime` to
+/// determine the actual elapsed interval.
+pub struct ServiceDivider {
+    period_ticks: u32,
+    phase: u32,
+}
+
+impl ServiceDivider {
+    pub const fn new(input_hz: u32, service_hz: u32) -> Self {
+        let period_ticks = if service_hz == 0 || input_hz / service_hz == 0 {
+            1
+        } else {
+            input_hz / service_hz
+        };
+        Self { period_ticks, phase: 0 }
+    }
+
+    /// Return how many service opportunities became due.
+    pub fn advance(&mut self, ticks: u32) -> u32 {
+        let total = self.phase.saturating_add(ticks);
+        let due = total / self.period_ticks;
+        self.phase = total % self.period_ticks;
+        due
+    }
+}
+
 /// Convert logical microseconds to a sample-frame position without floating
 /// point arithmetic. Saturation avoids wrapping on malformed/future times.
 pub const fn audio_time_to_frame(time: AudioTime, sample_rate: u32) -> u64 {
@@ -61,5 +88,14 @@ mod tests {
             AudioTime::from_micros(10).saturating_duration_since(AudioTime::from_micros(20)),
             0
         );
+    }
+
+    #[test]
+    fn service_divider_preserves_batched_ticks() {
+        let mut divider = ServiceDivider::new(1_000, 500);
+        assert_eq!(divider.advance(1), 0);
+        assert_eq!(divider.advance(1), 1);
+        assert_eq!(divider.advance(5), 2);
+        assert_eq!(divider.advance(1), 1);
     }
 }
