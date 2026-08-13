@@ -120,7 +120,10 @@ pub fn host_run_elf<A: Arch>(
         let t = thread::get_thread(&mut threads, tid).expect("initial Linux thread");
         t.personality.adopt_display(machine, &mut bios_workspace, kernel::display::Display::headless());
     }
-    kernel::startup::event_loop(machine, &mut bios_workspace, &mut threads, tid, None, None);
+    let mut audio_runtime = kernel::sound::AudioRuntime::new(None);
+    kernel::startup::event_loop(
+        machine, &mut bios_workspace, &mut threads, tid, None, &mut audio_runtime,
+    );
     dbg_println!("[host] guest exited");
     kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
     machine.shutdown();

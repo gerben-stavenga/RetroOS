@@ -374,6 +374,7 @@ pub struct AudioRuntime {
     clock: Clock,
     fractional_micros: u64,
     scheduler: SchedulerCensus,
+    sink: Option<Sink>,
 }
 
 #[derive(Default)]
@@ -395,13 +396,18 @@ pub struct AudioRuntimeStats {
 }
 
 impl AudioRuntime {
-    pub const fn new() -> Self {
+    pub fn new(sink: Option<Sink>) -> Self {
         Self {
             timeline: AudioTimeline::new(),
             clock: Clock::new(),
             fractional_micros: 0,
             scheduler: SchedulerCensus::new(),
+            sink,
         }
+    }
+
+    pub fn sink_mut(&mut self) -> Option<&mut Sink> {
+        self.sink.as_mut()
     }
 
     pub fn produced_frames(&self) -> u64 {
@@ -426,13 +432,11 @@ impl AudioRuntime {
         &mut self,
         machine: &mut A,
         now: sound::timeline::AudioTime,
-        sink: Option<&mut Sink>,
         mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
         self.service_mode(
             machine,
             now,
-            sink,
             sound::timeline::RenderMode::ProducePcm,
             mix,
         );
@@ -445,7 +449,6 @@ impl AudioRuntime {
         &mut self,
         machine: &mut A,
         now: sound::timeline::AudioTime,
-        sink: Option<&mut Sink>,
         mode: sound::timeline::RenderMode,
         mut mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
@@ -469,7 +472,7 @@ impl AudioRuntime {
             return;
         }
         if mode == sound::timeline::RenderMode::ProducePcm {
-            advance(machine, &mut self.clock, sink, elapsed_ms, |machine, span| {
+            advance(machine, &mut self.clock, self.sink.as_mut(), elapsed_ms, |machine, span| {
                 mix(machine, AudioSpan {
                     rate: span.rate,
                     base_frame: span.base_frame,
@@ -477,7 +480,7 @@ impl AudioRuntime {
                 });
             });
         } else {
-            let _ = (sink, &mut mix);
+            let _ = &mut mix;
         }
         if let Some(start) = service_tsc {
             let end = machine.rdtsc();
@@ -518,7 +521,7 @@ impl SchedulerCensus {
 }
 
 impl Default for AudioRuntime {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self { Self::new(None) }
 }
 
 /// Advance emulated audio and, when present, feed the physical output. Without
