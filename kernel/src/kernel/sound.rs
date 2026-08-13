@@ -300,14 +300,38 @@ impl Clock {
 /// The logical audio runtime boundary. It owns source time and derives the
 /// render interval from the architecture audio clock; the existing mixer and
 /// sink remain below this boundary for now.
-pub struct AudioRuntime {
-    clock: Clock,
+pub struct AudioTimeline {
     last_time: Option<sound::timeline::AudioTime>,
+}
+
+impl AudioTimeline {
+    pub const fn new() -> Self { Self { last_time: None } }
+
+    /// Return whole milliseconds elapsed since the previous service and move
+    /// the logical service frontier to `now`. The legacy renderer currently
+    /// consumes milliseconds; the final frame-based runtime can replace this
+    /// adapter without changing source ownership.
+    pub fn elapsed_millis(&mut self, now: sound::timeline::AudioTime) -> u64 {
+        let elapsed = self.last_time
+            .map(|previous| now.saturating_duration_since(previous) / 1_000)
+            .unwrap_or(0);
+        self.last_time = Some(now);
+        elapsed
+    }
+}
+
+impl Default for AudioTimeline {
+    fn default() -> Self { Self::new() }
+}
+
+pub struct AudioRuntime {
+    timeline: AudioTimeline,
+    clock: Clock,
 }
 
 impl AudioRuntime {
     pub const fn new() -> Self {
-        Self { clock: Clock::new(), last_time: None }
+        Self { timeline: AudioTimeline::new(), clock: Clock::new() }
     }
 
     pub fn produced_frames(&self) -> u64 {
@@ -324,10 +348,7 @@ impl AudioRuntime {
         sink: Option<&mut Sink>,
         mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
-        let elapsed_ms = self.last_time
-            .map(|previous| now.saturating_duration_since(previous) / 1_000)
-            .unwrap_or(0);
-        self.last_time = Some(now);
+        let elapsed_ms = self.timeline.elapsed_millis(now);
         advance(machine, &mut self.clock, sink, elapsed_ms, mix);
     }
 }
