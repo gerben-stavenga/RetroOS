@@ -102,6 +102,21 @@ pub struct Sink {
     census: Census,
     playback: PlaybackState,
     has_produced_audio: bool,
+    min_headroom: u64,
+    max_headroom: u64,
+    preroll_starts: u64,
+    recoveries: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SinkStats {
+    pub written_frames: u64,
+    pub consumed_frames: u64,
+    pub min_headroom: u64,
+    pub max_headroom: u64,
+    pub preroll_starts: u64,
+    pub recoveries: u64,
+    pub underruns: u32,
 }
 
 impl Sink {
@@ -152,6 +167,10 @@ impl Sink {
             census: Census::default(),
             playback: PlaybackState::PreRoll,
             has_produced_audio: false,
+            min_headroom: u64::MAX,
+            max_headroom: 0,
+            preroll_starts: 1,
+            recoveries: 0,
         };
         crate::println!(
             "sound: sink initialized stopped rate={} preroll_frames={}",
@@ -182,6 +201,8 @@ impl Sink {
         } else {
             UNDERRUNS.load(Ordering::Relaxed)
         };
+        self.preroll_starts = self.preroll_starts.saturating_add(1);
+        self.recoveries = self.recoveries.saturating_add(1);
         crate::println!(
             "sound: playback recovery reason={} underruns={} written={} consumed={}",
             reason, count, written, consumed,
@@ -192,6 +213,25 @@ impl Sink {
         self.ms_since_cursor = 0;
         self.rate_q16 = None;
         self.playback = PlaybackState::PreRoll;
+    }
+
+    pub(crate) fn stats(&self) -> SinkStats {
+        SinkStats {
+            written_frames: self.inner.written_frames(),
+            consumed_frames: self.inner.consumed_frames(),
+            min_headroom: self.min_headroom,
+            max_headroom: self.max_headroom,
+            preroll_starts: self.preroll_starts,
+            recoveries: self.recoveries,
+            underruns: UNDERRUNS.load(Ordering::Relaxed),
+        }
+    }
+
+    fn record_headroom(&mut self) {
+        let headroom = self.inner.written_frames()
+            .saturating_sub(self.inner.consumed_frames());
+        self.min_headroom = self.min_headroom.min(headroom);
+        self.max_headroom = self.max_headroom.max(headroom);
     }
 
     /// Prepare the device before another subsystem enters a synchronous
@@ -540,6 +580,9 @@ pub fn advance<A: crate::Arch>(
             );
         }
     }
+    if let Some(output) = sink.as_deref_mut() {
+        output.record_headroom();
+    }
     // Publish the pitch timebase, not the effective frame-count rate. The OSD
     // "Mix rate" reads this, and after the pitch/count split it is `s` that the
     // audio actually plays at; `rate_q16` swings with the latency servo and no
@@ -567,6 +610,7 @@ pub fn advance<A: crate::Arch>(
     // what matters is the RATIO of dt_sum to the window and of produced to
     // drained, both of which are unit-free.
     if crate::kernel::startup::trace_enabled() {
+        let sink_stats = output.stats();
         let c = &mut output.census;
         let now = machine.rdtsc();
         if c.tsc0 == 0 {
@@ -579,9 +623,11 @@ pub fn advance<A: crate::Arch>(
         // ~3e9 TSC ticks: a few seconds on any plausible clock.
         if now.wrapping_sub(c.tsc0) > 3_000_000_000 {
             crate::println!(
-                "census: tsc={} calls={} dt_sum={} drained={} produced={} rate={} s={}",
+                "census: tsc={} calls={} dt_sum={} drained={} produced={} rate={} s={} headroom={}..{} preroll={} recoveries={} underruns={}",
                 now - c.tsc0, c.calls, c.dt_sum, c.drained, c.produced,
                 rate_q16 >> RATE_FP_SHIFT, output.producer.s_q16() >> RATE_FP_SHIFT,
+                sink_stats.min_headroom, sink_stats.max_headroom,
+                sink_stats.preroll_starts, sink_stats.recoveries, sink_stats.underruns,
             );
             *c = Census { tsc0: now, ..Census::default() };
         }
