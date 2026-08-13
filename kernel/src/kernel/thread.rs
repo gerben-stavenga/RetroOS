@@ -364,13 +364,6 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    pub fn audio_midi_service(&mut self, machine: &mut A, pushed: u64) {
-        match self {
-            Self::Dos(dos) => crate::kernel::dos::audio_midi_service(machine, dos, pushed),
-            Self::Linux(_) => {}
-        }
-    }
-
     /// Advance the visible display once after audio has been fed. Batched
     /// timer slices deliberately do not create display catch-up work.
     pub fn display_tick(

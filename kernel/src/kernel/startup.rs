@@ -777,10 +777,6 @@ pub fn event_loop<A: crate::Arch>(
             ticks != 0 && midi_service_divider.advance(ticks) != 0
         };
         if audio_service_due {
-            thread.personality.audio_midi_service(
-                machine, audio_runtime.produced_frames());
-        }
-        if audio_service_due {
             let audio_now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
             audio_runtime.service(
                 machine,

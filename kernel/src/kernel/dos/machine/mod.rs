@@ -1275,14 +1275,6 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _pushe
     }
 }
 
-/// Service the timestamped MPU history at the deterministic audio cadence.
-/// This is intentionally separate from the per-slice SB/GUS device service;
-/// the latter remains latency-sensitive for guest-visible DMA and IRQ
-/// protocols, while MIDI replay is governed by AudioTime.
-pub fn audio_midi_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
-    pc.mpu.service(machine, pushed);
-}
-
 /// Mix one CPU-clocked producer span and advance producer-side device clocks.
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
@@ -1290,6 +1282,10 @@ pub fn audio_tick<A: crate::Arch>(
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
     let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
+    // Replay belongs to the source render boundary: the runtime now owns the
+    // complete deterministic sequence from timestamp consumption through
+    // source mixing and sink submission.
+    mpu.service(machine, span.base_frame);
     // The source clock advances emulated sources only. A thread holding the real card
     // has nothing here: its DSP streams from the guest ring over the ISA bus
     // and its OPL is the card's own, so neither produces frames for us and
