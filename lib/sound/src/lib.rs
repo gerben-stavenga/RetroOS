@@ -36,6 +36,8 @@
 extern crate alloc;
 
 pub mod sink;
+pub mod event_queue;
+pub mod timeline;
 pub mod pacer;
 pub mod engine;
 pub mod gus;
