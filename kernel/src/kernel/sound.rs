@@ -307,14 +307,20 @@ pub struct AudioTimeline {
 impl AudioTimeline {
     pub const fn new() -> Self { Self { last_time: None } }
 
-    /// Return whole milliseconds elapsed since the previous service and move
-    /// the logical service frontier to `now`. The legacy renderer currently
-    /// consumes milliseconds; the final frame-based runtime can replace this
-    /// adapter without changing source ownership.
-    pub fn elapsed_millis(&mut self, now: sound::timeline::AudioTime) -> u64 {
-        let elapsed = self.last_time
-            .map(|previous| now.saturating_duration_since(previous) / 1_000)
-            .unwrap_or(0);
+    /// Return elapsed microseconds since the previous service and move the
+    /// logical service frontier to `now`. The caller retains any sub-ms
+    /// remainder while adapting to the legacy millisecond renderer.
+    pub fn elapsed_micros(
+        &mut self,
+        now: sound::timeline::AudioTime,
+        remainder: &mut u64,
+    ) -> u64 {
+        let elapsed = remainder.saturating_add(
+            self.last_time
+                .map(|previous| now.saturating_duration_since(previous))
+                .unwrap_or(0),
+        );
+        *remainder = elapsed % 1_000;
         self.last_time = Some(now);
         elapsed
     }
@@ -327,11 +333,16 @@ impl Default for AudioTimeline {
 pub struct AudioRuntime {
     timeline: AudioTimeline,
     clock: Clock,
+    fractional_micros: u64,
 }
 
 impl AudioRuntime {
     pub const fn new() -> Self {
-        Self { timeline: AudioTimeline::new(), clock: Clock::new() }
+        Self {
+            timeline: AudioTimeline::new(),
+            clock: Clock::new(),
+            fractional_micros: 0,
+        }
     }
 
     pub fn produced_frames(&self) -> u64 {
@@ -348,7 +359,10 @@ impl AudioRuntime {
         sink: Option<&mut Sink>,
         mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
-        let elapsed_ms = self.timeline.elapsed_millis(now);
+        let elapsed_ms = self.timeline.elapsed_micros(now, &mut self.fractional_micros) / 1_000;
+        if elapsed_ms == 0 {
+            return;
+        }
         advance(machine, &mut self.clock, sink, elapsed_ms, mix);
     }
 }
