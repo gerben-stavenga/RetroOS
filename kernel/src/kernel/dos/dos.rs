@@ -4377,6 +4377,8 @@ fn populate_program<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: &mut 
     // GM bank is a boot asset (the same .PAT set the GUS plays), so it is
     // handed in here rather than fetched by the device.
     dos.pc.mpu.configure_from_env(&env, crate::kernel::midi_bank::get());
+    dos.pc.midi_only_audio = machine::env_var(&env, b"AUDIO_VALIDATION")
+        .is_some_and(|value| value.eq_ignore_ascii_case(b"MIDI"));
     init_psp(machine, regs, psp_seg, env_seg, parent.psp_seg);
     dos.current_psp = psp_seg;
     dos_set_program_block_owner(machine, dos, regs, env_seg, psp_seg, psp_seg);

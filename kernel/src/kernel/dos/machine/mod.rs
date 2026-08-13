@@ -250,6 +250,9 @@ pub struct PcMachine {
     /// no configuration for — and driven entirely by the port dispatch above:
     /// PIT channel 2's reload for pitch, port 61h bits 0-1 for the gate.
     pub spk: sound::speaker::Speaker,
+    /// Validation-only source policy. Device protocols remain emulated, but
+    /// `MIDI` excludes non-MIDI PCM sources from the canonical mix.
+    pub midi_only_audio: bool,
     /// Last value written to CMOS index port 0x70 (NMI bit masked off).
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
@@ -573,6 +576,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).gus).write(Gus::new());
             core::ptr::addr_of_mut!((*p).mpu).write(Mpu::new());
             core::ptr::addr_of_mut!((*p).spk).write(sound::speaker::Speaker::new());
+            core::ptr::addr_of_mut!((*p).midi_only_audio).write(false);
             core::ptr::addr_of_mut!((*p).cmos_index).write(0);
             core::ptr::addr_of_mut!((*p).native_vbe_io_rmcs).write(0);
             core::ptr::addr_of_mut!((*p).locked_stack)
@@ -1201,6 +1205,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
 /// buffer, but its clock is always the CPU-clocked production
 /// frontier; the final speaker sink trails it by the physical pipe depth.
 enum PcmSource<'a> {
+    Silent,
     /// `None` when this thread holds the real card: silicon mixes itself, and
     /// there is no emulated card to ask for frames.
     SoundBlaster(Option<&'a mut EmulatedSb>),
@@ -1223,6 +1228,7 @@ impl<A: crate::Arch> crate::kernel::sound::AudioSource<A> for PcmSource<'_> {
         let base = span.base_frame;
         let block = span.frames;
         match self {
+            Self::Silent => {}
             Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, block),
             Self::SoundBlaster(None) => {}
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
@@ -1299,12 +1305,21 @@ pub fn audio_tick<A: crate::Arch>(
     if let Some(emu) = sb.as_deref_mut() {
         let _ = emu.take_restart();
     }
-    let mut sources = [
-        PcmSource::SoundBlaster(sb.as_deref_mut()),
-        PcmSource::Gus(gus),
-        PcmSource::Midi(mpu),
-        PcmSource::Speaker(spk),
-    ];
+    let mut sources = if pc.midi_only_audio {
+        [
+            PcmSource::Silent,
+            PcmSource::Silent,
+            PcmSource::Midi(mpu),
+            PcmSource::Silent,
+        ]
+    } else {
+        [
+            PcmSource::SoundBlaster(sb.as_deref_mut()),
+            PcmSource::Gus(gus),
+            PcmSource::Midi(mpu),
+            PcmSource::Speaker(spk),
+        ]
+    };
     let prof = crate::kernel::startup::profile_enabled();
     let mut source_cycles = [0u64; 4];
     for (i, source) in sources.iter_mut().enumerate() {

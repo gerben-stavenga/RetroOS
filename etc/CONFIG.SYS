@@ -15,6 +15,7 @@ SB_AUDIO=native
 HDA_OUTPUT=Speaker
 # Kernel-mixed master volume: 0 to 100 in steps of 10.
 AUDIO_VOLUME=50
+AUDIO_VALIDATION=MIDI
 
 ADLIB=A388
 BLASTER=A220 I7 D1 H5 P330 T6
