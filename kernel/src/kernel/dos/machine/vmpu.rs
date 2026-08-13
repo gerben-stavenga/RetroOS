@@ -19,6 +19,20 @@ pub enum MpuEvent {
     CommandWrite(u8),
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MpuStats {
+    pub queue_depth: usize,
+    pub queue_high_water: usize,
+    pub queue_overflows: u64,
+    pub data_writes: u64,
+    pub command_writes: u64,
+    pub events_consumed: u64,
+    pub midi_bytes_accepted: u64,
+    pub midi_bytes_ignored: u64,
+    pub max_event_age_micros: u64,
+    pub frames_rendered: u64,
+}
+
 pub struct Mpu {
     /// `BLASTER=... P<port>` declared an MPU-401. Absent hardware stays
     /// absent: `owns` gates on this, so probes read floating.
@@ -38,6 +52,7 @@ pub struct Mpu {
     /// owns boot assets, and arrives here as a value like the port number
     /// does. `None` is an empty socket — the port still answers, silently.
     bank: Option<&'static sound::midi::Bank>,
+    stats: MpuStats,
 }
 
 impl Mpu {
@@ -51,6 +66,7 @@ impl Mpu {
             rate: 44_100,
             synth: None,
             bank: None,
+            stats: MpuStats::default(),
         }
     }
 
@@ -102,6 +118,15 @@ impl Mpu {
         self.present = false;
     }
 
+    pub fn stats(&self) -> MpuStats {
+        MpuStats {
+            queue_depth: self.events.len(),
+            queue_high_water: self.events.high_water(),
+            queue_overflows: self.events.overflows(),
+            ..self.stats
+        }
+    }
+
     pub fn io_read(&mut self, p: u16) -> u8 {
         self.card.port_in(p)
     }
@@ -109,8 +134,10 @@ impl Mpu {
     pub fn io_write(&mut self, p: u16, val: u8, at: sound::timeline::AudioTime) {
         self.card.port_out(p, val);
         let event = if p == self.base {
+            self.stats.data_writes += 1;
             MpuEvent::DataWrite(val)
         } else {
+            self.stats.command_writes += 1;
             MpuEvent::CommandWrite(val)
         };
         if self.events.push(sound::timeline::TimedEvent { at, event }).is_err() {
@@ -128,11 +155,16 @@ impl Mpu {
         }
         let now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
         while let Some(timed) = self.events.pop_through(now) {
+            self.stats.events_consumed += 1;
+            self.stats.max_event_age_micros = self.stats.max_event_age_micros.max(
+                now.saturating_duration_since(timed.at),
+            );
             match timed.event {
                 MpuEvent::CommandWrite(0xFF) => self.replay_uart = false,
                 MpuEvent::CommandWrite(0x3F) => self.replay_uart = true,
                 MpuEvent::CommandWrite(_) => {}
                 MpuEvent::DataWrite(b) if self.replay_uart => {
+                    self.stats.midi_bytes_accepted += 1;
                     let elapsed = now.saturating_duration_since(timed.at);
                     let late_frames = elapsed.saturating_mul(u64::from(self.rate)) / 1_000_000;
                     let frame = arrival_frame.saturating_sub(late_frames);
@@ -140,7 +172,9 @@ impl Mpu {
                         s.write_at(frame, b);
                     }
                 }
-                MpuEvent::DataWrite(_) => {}
+                MpuEvent::DataWrite(_) => {
+                    self.stats.midi_bytes_ignored += 1;
+                }
             }
         }
     }
@@ -159,6 +193,8 @@ impl Mpu {
         let g = super::vsb::GM_SCALE_Q16;
         if let Some(s) = self.synth.as_mut() {
             self.rate = rate;
+            self.stats.frames_rendered = self.stats.frames_rendered
+                .saturating_add(block.len() as u64);
             s.mix_into(rate, base, (g, g), block);
         }
     }
