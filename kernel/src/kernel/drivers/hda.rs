@@ -236,20 +236,22 @@ fn parse_output_route(raw: &[u8]) -> Option<OutputRoute> {
 }
 
 fn log_available_output_routes(prefix: &str, available: u8) {
+    crate::print!("hda: {} ", prefix);
     let mut any = false;
     for route in OutputRoute::ALL {
-        if available & route.bit() != 0 {
-            any = true;
-            crate::println!(
-                "hda: {} {}",
-                prefix,
-                core::str::from_utf8(route.label()).unwrap_or("?")
-            );
+        if available & route.bit() == 0 {
+            continue;
         }
+        if any {
+            crate::print!(", ");
+        }
+        crate::print!("{}", core::str::from_utf8(route.label()).unwrap_or("?"));
+        any = true;
     }
     if !any {
-        crate::println!("hda: {} none", prefix);
+        crate::print!("none");
     }
+    crate::print!("\n");
 }
 
 pub fn configure_output_route(raw: Option<&[u8]>) {
@@ -280,7 +282,7 @@ pub fn output_route_label() -> &'static [u8] {
 }
 
 pub fn cycle_output_route(forward: bool) {
-    let current = OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed));
+    let current = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
     let next = current.next_available(
         forward,
         AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed),
@@ -290,10 +292,6 @@ pub fn cycle_output_route(forward: bool) {
     }
     REQUESTED_OUTPUT_ROUTE.store(next as u8, Ordering::Relaxed);
     OUTPUT_ROUTE_PENDING.store(true, Ordering::Relaxed);
-    crate::println!(
-        "hda: requested output route {}",
-        core::str::from_utf8(next.label()).unwrap_or("?")
-    );
 }
 
 #[inline]
@@ -828,7 +826,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     REQUESTED_OUTPUT_ROUTE.store(d.output_route as u8, Ordering::Relaxed);
     OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
     log_available_output_routes(
-        "available output",
+        "available outputs",
         AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed),
     );
     crate::println!(
@@ -1454,12 +1452,7 @@ impl Hda {
         let old_available = AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed);
         let requested = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
 
-        crate::println!(
-            "hda: reprogram output {} -> {}",
-            core::str::from_utf8(old_route.label()).unwrap_or("?"),
-            core::str::from_utf8(requested.label()).unwrap_or("?")
-        );
-        log_available_output_routes("available output", old_available);
+        log_available_output_routes("available outputs", old_available);
 
         self.setup_corb_rirb();
         if !self.select_cached_output_path(requested) || self.verb_failed {
@@ -1787,6 +1780,11 @@ impl sound::sink::Device for Hda {
     /// controller re-evaluates the codec↔stream binding with the stream number
     /// visible.
     fn start(&mut self) {
+        // A pause stops RUN but does not necessarily rewind LPIB. Reset the
+        // stream descriptor so the hardware cursor starts at byte zero, which
+        // is also where the generic sink starts writing after its reset.
+        self.program_stream();
+        w16(self.sd + SDFMT, STREAM_FMT);
         assert_eq!(
             r16(self.sd + SDFMT),
             STREAM_FMT,

@@ -736,6 +736,7 @@ pub fn event_loop<A: crate::Arch>(
     loop {
         stats.slice_begin(machine);
         stats.iteration(machine);
+        lib::log::set_timestamp_ms(machine.get_ticks());
         let now_tick = machine.get_ticks();
         // Keep the F12 switch picker's process list fresh while it is open,
         // but not on every port/interrupt exit: millisecond resolution is
@@ -760,6 +761,10 @@ pub fn event_loop<A: crate::Arch>(
         stats.part(machine, 1);
         let ticks = machine.take_pending_ticks();
         let thread = ctx.thread(threads);
+
+        if let Some(output) = sink.as_deref_mut() {
+            output.service_controls();
+        }
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.

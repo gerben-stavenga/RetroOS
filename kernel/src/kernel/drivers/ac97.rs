@@ -224,7 +224,18 @@ impl sound::sink::Device for Ac97 {
     }
 
     fn start(&mut self) {
-        use crate::kernel::portio::{inb, outb};
+        use crate::kernel::portio::{inb, outb, outl};
+        // Stopping RUN does not guarantee that the PCM engine's CIV/PICB
+        // position returns to zero. Reset the channel before rebasing the
+        // software cursor, otherwise the first poll after restart can report
+        // stale playback as a false underrun.
+        outb(self.nabm + PO_CR, PO_CR_RESET);
+        for _ in 0..1_000_000 {
+            if inb(self.nabm + PO_CR) & PO_CR_RESET == 0 {
+                break;
+            }
+        }
+        outl(self.nabm + PO_BDBAR, self.dma_phys);
         self.last_pos_frames = 0;
         self.reported_frames = 0;
         self.played_frames = 0;

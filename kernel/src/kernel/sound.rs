@@ -206,6 +206,12 @@ impl Sink {
         self.rate_q16 = None;
         self.playback = PlaybackState::PreRoll;
     }
+
+    /// Service device controls independently of PCM playback and virtual
+    /// audio time, including while the event loop has no elapsed tick.
+    pub(crate) fn service_controls(&mut self) {
+        self.inner.service();
+    }
 }
 
 /// Adapter for the generic BIOS blocking-operation hook. The opaque context
