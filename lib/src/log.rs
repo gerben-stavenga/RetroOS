@@ -17,6 +17,7 @@
 //! `screenln!` touches a terminal.
 
 use core::fmt::{self, Write};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // =============================================================================
 // Debug-output sink + the console macros
@@ -35,6 +36,16 @@ use core::fmt::{self, Write};
 static DEBUG_SINK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Monotonic milliseconds supplied by the embedding kernel. A 32-bit value
+/// is sufficient on the 32-bit target and avoids requiring 64-bit atomics.
+static TIMESTAMP_MS: AtomicU32 = AtomicU32::new(0);
+static LINE_START: AtomicBool = AtomicBool::new(true);
+
+/// Update the monotonic timestamp used for subsequent log lines.
+pub fn set_timestamp_ms(ms: u64) {
+    TIMESTAMP_MS.store(ms as u32, Ordering::Relaxed);
+}
+
 /// Install the platform debug-output sink. Called once, early, by the platform
 /// entry point (metal `boot_kernel`, hosted `main`) before anything logs.
 pub fn set_debug_sink(f: fn(u8)) {
@@ -50,11 +61,52 @@ pub fn debug_byte(b: u8) {
 /// Mirror one byte into the ring and the platform sink.
 #[inline]
 pub fn stream(b: u8) {
+    if b != b'\n' && LINE_START.swap(false, Ordering::Relaxed) {
+        emit_timestamp(TIMESTAMP_MS.load(Ordering::Relaxed));
+    }
     klog::push_byte(b);
     let p = DEBUG_SINK.load(core::sync::atomic::Ordering::Relaxed);
     if p != 0 {
         let f: fn(u8) = unsafe { core::mem::transmute(p) };
         f(b);
+    }
+    if b == b'\n' {
+        LINE_START.store(true, Ordering::Relaxed);
+    }
+}
+
+fn emit_timestamp(ms: u32) {
+    let seconds = ms / 1000;
+    let millis = ms % 1000;
+    let mut out = [b' '; 14];
+    out[0] = b'[';
+    out[9] = b'.';
+    out[13] = b']';
+    let mut value = seconds;
+    for i in (1..=8).rev() {
+        if value != 0 || i == 8 {
+            out[i] = b'0' + (value % 10) as u8;
+        }
+        value /= 10;
+    }
+    out[10] = b'0' + (millis / 100) as u8;
+    out[11] = b'0' + ((millis / 10) % 10) as u8;
+    out[12] = b'0' + (millis % 10) as u8;
+    for byte in out {
+        klog::push_byte(byte);
+        let p = DEBUG_SINK.load(Ordering::Relaxed);
+        if p != 0 {
+            let f: fn(u8) = unsafe { core::mem::transmute(p) };
+            f(byte);
+        }
+    }
+    // The separator is part of the prefix but is emitted through the same
+    // raw path to avoid recursively generating another timestamp.
+    klog::push_byte(b' ');
+    let p = DEBUG_SINK.load(Ordering::Relaxed);
+    if p != 0 {
+        let f: fn(u8) = unsafe { core::mem::transmute(p) };
+        f(b' ');
     }
 }
 
