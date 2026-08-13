@@ -780,13 +780,15 @@ pub fn event_loop<A: crate::Arch>(
             thread.personality.audio_midi_service(
                 machine, audio_runtime.produced_frames());
         }
-        let audio_now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
-        audio_runtime.service(
-            machine,
-            audio_now,
-            sink.as_deref_mut(),
-            |machine, span| thread.personality.audio_tick(machine, span),
-        );
+        if audio_service_due {
+            let audio_now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
+            audio_runtime.service(
+                machine,
+                audio_now,
+                sink.as_deref_mut(),
+                |machine, span| thread.personality.audio_tick(machine, span),
+            );
+        }
         if ticks != 0 {
             thread.personality.display_tick(
                 machine, &mut *bios_workspace, &ctx.regs,
