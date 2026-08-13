@@ -252,7 +252,6 @@ pub trait AudioSource<A: crate::Arch> {
 }
 
 const MIX_CHUNK: usize = 128;
-const MAX_PREROLL_GAP_MS: u64 = 15;
 
 fn preroll_target(inner: &sound::sink::Sink<Device>) -> u64 {
     let requested = (u64::from(inner.rate())
@@ -430,21 +429,6 @@ pub fn advance<A: crate::Arch>(
             .div_ceil(1000);
         fill = requested.min(output.inner.max_ahead_frames()) as u32;
         if output.playback == PlaybackState::PreRoll {
-            written = output.inner.written_frames();
-            if elapsed_ms > MAX_PREROLL_GAP_MS {
-                if written != 0 {
-                    crate::println!(
-                        "sound: preroll reset gap_ms={} discarded_frames={}",
-                        elapsed_ms, written,
-                    );
-                }
-                output.inner.pause_and_reset();
-                output.producer = sound::Pacer::new(rate);
-                output.last_consumed = 0;
-                output.ms_since_cursor = 0;
-                output.rate_q16 = None;
-                elapsed_ms = 0;
-            }
             nominal_rate_q16
         } else {
             let report = output.inner.poll();
