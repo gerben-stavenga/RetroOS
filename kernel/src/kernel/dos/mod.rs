@@ -1302,8 +1302,18 @@ pub fn audio_tick<A: crate::Arch>(
     machine::audio_tick(machine, &mut dos.pc, span);
 }
 
-/// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
-/// timers, MPU drain) without the millisecond pump — the ticks==0 fast path.
+/// Replay timestamped MPU operations at the deterministic audio cadence.
+pub fn audio_midi_service<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    pushed: u64,
+) {
+    machine::audio_midi_service(machine, &mut dos.pc, pushed);
+}
+
+/// Per-slice audio device service (trigger IRQs, DMA-probe completions, and
+/// GF1 timers) without the millisecond pump — the ticks==0 fast path. MPU
+/// replay is handled separately at the deterministic audio cadence.
 pub fn audio_service<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,

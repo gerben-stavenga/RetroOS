@@ -1242,14 +1242,15 @@ impl PcmSource<'_> {
 /// event-loop slice, not the millisecond pump: the SB's latched 0xF2/0xF3
 /// trigger IRQ, single-cycle DMA probe completions (MI2's driver expects
 /// the completion back-to-back; a 1 ms floor loses it — see 35e3b27), the
-/// GF1 rate timers + DMA-TC IRQ, and the MPU byte drain (stamped at the
+/// GF1 rate timers + DMA-TC IRQ. MPU replay is serviced separately at the
+/// deterministic audio cadence (stamped at the
 /// production frontier — the frame the next produced block starts at, so a
 /// note sounds within one millisecond of its OUT; a free-running arrival
 /// clock here once stamped a program's first notes seconds ahead, the GM
 /// start delay). Called on every event-loop slice, including the ticks==0
 /// fast path that skips the pump entirely.
-pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
-    let PcMachine { sb, gus, mpu, vpic, .. } = pc;
+pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, _pushed: u64) {
+    let PcMachine { sb, gus, vpic, .. } = pc;
     let prof = crate::kernel::startup::profile_enabled();
     let t0 = if prof { machine.rdtsc() } else { 0 };
     // Latched probe/trigger IRQs are the emulated card's business: a real one
@@ -1262,12 +1263,19 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed
     let t1 = if prof { machine.rdtsc() } else { 0 };
     gus.tick(machine, vpic);
     let t2 = if prof { machine.rdtsc() } else { 0 };
-    mpu.tick(machine, pushed);
     if prof {
         let t3 = machine.rdtsc();
         crate::kernel::startup::bill_audio_service(
             t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2));
     }
+}
+
+/// Service the timestamped MPU history at the deterministic audio cadence.
+/// This is intentionally separate from the per-slice SB/GUS device service;
+/// the latter remains latency-sensitive for guest-visible DMA and IRQ
+/// protocols, while MIDI replay is governed by AudioTime.
+pub fn audio_midi_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
+    pc.mpu.service(machine, pushed);
 }
 
 /// Mix one CPU-clocked producer span and advance producer-side device clocks.

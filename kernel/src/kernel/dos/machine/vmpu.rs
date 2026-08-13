@@ -118,10 +118,11 @@ impl Mpu {
         }
     }
 
-    /// Per-quantum service: drain the port's MIDI bytes into the synth.
+    /// Deterministic service: replay all timestamped MIDI operations visible
+    /// at the current architecture-provided audio time.
     /// `arrival_frame` is the mix-frame the bytes arrived at — the synth
     /// applies each at that frame.
-    pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
+    pub fn service<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
         if !self.present {
             return;
         }
