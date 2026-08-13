@@ -268,29 +268,51 @@ pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     install_rom_font(machine);
 }
 
-/// Publish the 8x8 character generator through the two vectors that are *data
-/// pointers*, not handlers: INT 43h → the active graphics font, INT 1Fh → its
-/// upper 128 glyphs. A game drawing its own text in a graphics mode follows
-/// them to get glyph bitmaps; with the vectors pointing at our `CD 31` stub
-/// array instead, it renders stub bytes as pixels — text comes out garbled.
+/// Publish the standard VGA character generators through the interfaces that
+/// are *data pointers*, not handlers: INT 43h → the active graphics font,
+/// INT 1Fh → the upper 128 glyphs of 8x8, and INT 10h AX=1130h → any standard
+/// ROM font. A game drawing its own text in a graphics mode follows one of
+/// these pointers; stale register or interrupt-vector contents become pixels
+/// and text comes out garbled.
 /// Plenty of games skip the vectors entirely and read the 8x8 table at its
 /// hardcoded IBM ROM address, `F000:FA6E` — so the substitute BIOS has to put
 /// glyphs there too. That address is *inside* the ROM window a real machine
 /// has and our F000 page is plain RAM, whatever the firmware left in it: on
 /// hosted it reads back as zeros (text renders blank), on a UEFI machine as
 /// leftover firmware bytes (text renders as garbage). Only the low 128 glyphs
-/// fit below the 1 MB wall from FA6E; the upper half stays reachable through
-/// INT 1Fh, which is where a real VGA BIOS keeps it as well.
+/// fit below the 1 MB wall from FA6E; complete guest-readable copies live in
+/// the substitute BIOS's fixed low-memory data area.
 const ROM_FONT_8X8: usize = 0xF_FA6E;
 
-fn install_rom_font<A: crate::Arch>(machine: &mut A) {
-    let upper = super::dos::font_8x8_upper_addr();
-    machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
-    machine.copy_to(upper as usize, &lib::vga_fonts::FONT_8X8[1024..]);
-    for (vector, addr) in [(0x43u32, ROM_FONT_8X8 as u32), (0x1F, upper)] {
-        write_u16(machine, 0, vector * 4, (addr & 0xF) as u16);
-        write_u16(machine, 0, vector * 4 + 2, (addr >> 4) as u16);
+fn set_data_vector<A: crate::Arch>(machine: &mut A, vector: u32, addr: u32) {
+    write_u16(machine, 0, vector * 4, (addr & 0xF) as u16);
+    write_u16(machine, 0, vector * 4 + 2, (addr >> 4) as u16);
+}
+
+fn rom_font_addr(glyph_h: u8) -> u32 {
+    match glyph_h {
+        8 => super::dos::font_8x8_addr(),
+        14 => super::dos::font_8x14_addr(),
+        _ => super::dos::font_8x16_addr(),
     }
+}
+
+/// INT 43h is the active graphics character generator, so it changes along
+/// with the mode's character height rather than permanently naming 8x8.
+fn publish_active_font<A: crate::Arch>(machine: &mut A, glyph_h: u8) {
+    set_data_vector(machine, 0x43, rom_font_addr(glyph_h));
+}
+
+fn install_rom_font<A: crate::Arch>(machine: &mut A) {
+    let font8 = super::dos::font_8x8_addr();
+    let font14 = super::dos::font_8x14_addr();
+    let font16 = super::dos::font_8x16_addr();
+    machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
+    machine.copy_to(font8 as usize, &lib::vga_fonts::FONT_8X8);
+    machine.copy_to(font14 as usize, &lib::vga_fonts::FONT_8X14);
+    machine.copy_to(font16 as usize, &lib::vga_fonts::FONT_8X16);
+    set_data_vector(machine, 0x1F, font8 + 128 * 8);
+    publish_active_font(machine, 16); // POST starts in 80x25, 8x16 mode 3.
 }
 
 /// Seed the BDA fields a real POST would have set.
@@ -692,6 +714,42 @@ fn is_text_mode(mode: u8) -> bool {
 /// the 11h/12h/14h variants select 25/50-row text geometry. ST3 uses AX=1112
 /// to enter 80x50; ignoring it leaves its 4,000 character cells interpreted as
 /// 25 rows of 16-line glyphs, which appears as a screen of garbage symbols.
+fn get_font_info<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    let bh = (regs.rbx >> 8) as u8;
+    let addr = match bh {
+        // Current upper/current active font are the same data pointers exposed
+        // through INT 1Fh/43h. Read the vectors rather than duplicating their
+        // selection policy here.
+        0x00 => {
+            let off: u16 = machine.read(0x1F * 4);
+            let seg: u16 = machine.read(0x1F * 4 + 2);
+            (u32::from(seg) << 4) + u32::from(off)
+        }
+        0x01 => {
+            let off: u16 = machine.read(0x43 * 4);
+            let seg: u16 = machine.read(0x43 * 4 + 2);
+            (u32::from(seg) << 4) + u32::from(off)
+        }
+        0x02 => super::dos::font_8x14_addr(),
+        0x03 => super::dos::font_8x8_addr(),
+        0x04 => super::dos::font_8x8_addr() + 128 * 8,
+        // VGA defines alternate 9-dot 14/16-line selections here. Character
+        // generator rows are still eight stored bits wide (the adapter makes
+        // the ninth column), and our canonical ROM faces are the compatible
+        // substitute when no separate alternate face is supplied.
+        0x05 => super::dos::font_8x14_addr(),
+        0x06 => super::dos::font_8x16_addr(),
+        0x07 => super::dos::font_8x16_addr(),
+        _ => return,
+    };
+    regs.es = u64::from(addr >> 4);
+    regs.rbp = (regs.rbp & !0xFFFF) | u64::from(addr & 0xF);
+    let glyph_h: u16 = bda_field!(machine, cell_height);
+    regs.rcx = (regs.rcx & !0xFFFF) | u64::from(glyph_h & 0xFF);
+    let rows_minus1: u8 = bda_field!(machine, rows_minus1);
+    regs.rdx = (regs.rdx & !0xFF) | u64::from(rows_minus1);
+}
+
 fn font_service<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -699,6 +757,10 @@ fn font_service<A: crate::Arch>(
     regs: &mut Regs,
 ) {
     let subfn = regs.rax as u8;
+    if subfn == 0x30 {
+        get_font_info(machine, regs);
+        return;
+    }
     let map = usize::from(regs.rbx as u8 & 7);
     let set_geometry = matches!(subfn, 0x10 | 0x11 | 0x12 | 0x14);
 
@@ -745,6 +807,7 @@ fn font_service<A: crate::Arch>(
         bda_field!(machine, rows_minus1 = rows - 1);
         bda_field!(machine, cell_height = glyph_h as u16);
         bda_field!(machine, cursor_shape = ((glyph_h as u16 - 2) << 8) | (glyph_h as u16 - 1));
+        publish_active_font(machine, glyph_h as u8);
     }
 }
 
@@ -958,7 +1021,13 @@ pub(super) fn int10<A: crate::Arch>(
             // height 8 (200-line + 13h), 14 (350-line EGA), or 16 (text/480-line).
             bda_field!(machine, columns = match mode { 0 | 1 | 4 | 5 | 0x0D | 0x13 => 40u16, _ => 80 });
             bda_field!(machine, rows_minus1 = if matches!(mode, 0x11 | 0x12) { 29u8 } else { 24 });
-            bda_field!(machine, cell_height = match mode { 4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16, 0x0F | 0x10 => 14, _ => 16 });
+            let cell_height = match mode {
+                4 | 5 | 6 | 0x0D | 0x0E | 0x13 => 8u16,
+                0x0F | 0x10 => 14,
+                _ => 16,
+            };
+            bda_field!(machine, cell_height = cell_height);
+            publish_active_font(machine, cell_height as u8);
             bda_field!(machine, active_page = 0u8);
             bda_field!(machine, cursor_pos = [0u16; 8]);
             // A mode set resets the cursor to the BIOS default underline (and

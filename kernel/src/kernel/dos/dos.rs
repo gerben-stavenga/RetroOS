@@ -3863,12 +3863,14 @@ struct LowMem {
     /// the guest dereferences long after the call.
     video_static_info: [u8; 16],
 
-    /// Glyphs 128-255 of the 8x8 character generator, published through INT 1Fh
-    /// (a *data pointer*, not a handler). The low 128 live at their hardcoded
-    /// ROM address `F000:FA6E`; this half doesn't fit below the 1 MB wall from
-    /// there, so — exactly as a real VGA BIOS keeps it out in video ROM — it
-    /// gets its own home and only the vector locates it.
-    font_8x8_upper: [u8; 1024],
+    /// Guest-readable copies of the standard VGA ROM fonts. The substitute
+    /// BIOS publishes these through INT 10h AX=1130h and points INT 43h at the
+    /// font selected by the current mode. The low half of 8x8 is additionally
+    /// mirrored at IBM's hardcoded `F000:FA6E` address for old software which
+    /// bypasses both interfaces.
+    font_8x8: [u8; 256 * 8],
+    font_8x14: [u8; 256 * 14],
+    font_8x16: [u8; 256 * 16],
 }
 
 /// Locked PM stack size (see `LowMem::host_stack`).
@@ -3908,13 +3910,22 @@ pub(super) fn set_first_mcb_seg<A: crate::Arch>(machine: &mut A, seg: u16) {
     machine.write::<u16>(lm_field(core::mem::offset_of!(LowMem, first_mcb_seg)), seg);
 }
 
+/// Linear addresses of the substitute BIOS's guest-readable ROM-font copies.
+pub(super) fn font_8x8_addr() -> u32 {
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, font_8x8) as u32
+}
+
+pub(super) fn font_8x14_addr() -> u32 {
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, font_8x14) as u32
+}
+
+pub(super) fn font_8x16_addr() -> u32 {
+    LOW_MEM_BASE + core::mem::offset_of!(LowMem, font_8x16) as u32
+}
+
 /// Linear address of the video static functionality table (see
 /// `LowMem::video_static_info`); the substitute BIOS seeds it and INT 10h
 /// AH=1Bh publishes it as a far pointer.
-pub(super) fn font_8x8_upper_addr() -> u32 {
-    LOW_MEM_BASE + core::mem::offset_of!(LowMem, font_8x8_upper) as u32
-}
-
 pub(super) fn video_static_info_addr() -> u32 {
     LOW_MEM_BASE + core::mem::offset_of!(LowMem, video_static_info) as u32
 }

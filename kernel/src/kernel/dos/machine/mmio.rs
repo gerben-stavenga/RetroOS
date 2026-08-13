@@ -150,6 +150,15 @@ fn alu(regs: &mut Regs, alu: u8, a: u32, b: u32, sz: u32) -> u32 {
     }
 }
 
+/// Increment or decrement an operand while preserving CF, the one flag these
+/// operations deliberately do not share with ADD/SUB.
+fn inc_dec(regs: &mut Regs, value: u32, decrement: bool, sz: u32) -> u32 {
+    let carry = regs.frame.rflags & 1;
+    let res = alu(regs, if decrement { 5 } else { 0 }, value, 1, sz);
+    regs.frame.rflags = (regs.frame.rflags & !1) | carry;
+    res
+}
+
 /// The 80-bit x87 extended value the backend handed us, as an `f64`.
 ///
 /// The x87 stack is where an `fstp [mmio]` keeps the value it is about to
@@ -772,6 +781,20 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
                 for b in 0..sz { target.write8(machine, off + b, (res >> (b * 8)) as u8); }
             }
         }
+        // Grp4: INC/DEC r/m8. A planar blitter uses `inc byte es:[di]`
+        // (26 FE /0) to update a byte in its off-screen buffer. These are true
+        // read-modify-write operations: the read first loads the VGA latches,
+        // then the result passes through the planar write logic. INC and DEC
+        // update the arithmetic status flags exactly like ADD/SUB by one, with
+        // the architectural exception that they preserve CF.
+        0xFE if (peek(i) >> 3) & 7 <= 1 => {
+            let modrm = peek(i);
+            let ext = (modrm >> 3) & 7;
+            i += modrm_len(modrm, addr32, peek, i);
+            let mem = u32::from(target.read8(machine, off));
+            let res = inc_dec(regs, mem, ext == 1, 1);
+            target.write8(machine, off, res as u8);
+        }
         // x87 stores into the aperture: `fst`/`fstp` (ModR/M reg field 2 and 3)
         // in single (0xD9), double (0xDD) and integer (0xDB dword, 0xDF word,
         // 0xDF /7 qword) forms. A planar VGA guest never does this, but a Glide
@@ -831,7 +854,9 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
 
 #[cfg(test)]
 mod tests {
+    use super::inc_dec;
     use super::super::{set_string_index, step_string_index, string_index};
+    use crate::Regs;
 
     #[test]
     fn interpreted_string_indices_obey_address_width() {
@@ -844,5 +869,23 @@ mod tests {
 
         assert_eq!(step_string_index(1, 4, false, true), 0xFFFD);
         assert_eq!(step_string_index(0xFFFF_FFFE, 4, true, false), 2);
+    }
+
+    #[test]
+    fn byte_inc_dec_flags_can_preserve_carry() {
+        let mut regs = Regs::empty();
+        regs.frame.rflags = 1; // CF set before INC
+        let incremented = inc_dec(&mut regs, 0x7f, false, 1);
+        assert_eq!(incremented, 0x80);
+        assert_eq!(regs.frame.rflags & 1, 1); // INC preserves CF
+        assert_ne!(regs.frame.rflags & (1 << 11), 0); // signed overflow
+        assert_ne!(regs.frame.rflags & (1 << 4), 0); // auxiliary carry
+
+        regs.frame.rflags = 0; // CF clear before DEC
+        let decremented = inc_dec(&mut regs, 0x80, true, 1);
+        assert_eq!(decremented, 0x7f);
+        assert_eq!(regs.frame.rflags & 1, 0); // DEC preserves CF
+        assert_ne!(regs.frame.rflags & (1 << 11), 0); // signed overflow
+        assert_ne!(regs.frame.rflags & (1 << 4), 0); // auxiliary borrow
     }
 }
