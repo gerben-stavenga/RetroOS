@@ -723,7 +723,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
     let mut exiting_display = None;
-    let mut audio_clock = crate::kernel::sound::Clock::new();
+    let mut audio_runtime = crate::kernel::sound::AudioRuntime::new();
     let mut midi_service_phase = 0u32;
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
@@ -769,21 +769,21 @@ pub fn event_loop<A: crate::Arch>(
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(machine, ticks, audio_clock.produced_frames());
+        thread.personality.advance_world(machine, ticks, audio_runtime.produced_frames());
         if ticks != 0 {
             midi_service_phase = midi_service_phase.wrapping_add(ticks);
             if midi_service_phase >= 2 {
                 midi_service_phase %= 2;
                 thread.personality.audio_midi_service(
-                    machine, audio_clock.produced_frames());
+                    machine, audio_runtime.produced_frames());
             }
         }
         if ticks != 0 {
-            crate::kernel::sound::advance(
+            let audio_now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
+            audio_runtime.service(
                 machine,
-                &mut audio_clock,
+                audio_now,
                 sink.as_deref_mut(),
-                ticks as u64,
                 |machine, span| thread.personality.audio_tick(machine, span),
             );
             thread.personality.display_tick(

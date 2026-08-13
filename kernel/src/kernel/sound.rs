@@ -284,6 +284,45 @@ impl Clock {
     }
 }
 
+/// The logical audio runtime boundary. It owns source time and derives the
+/// render interval from the architecture audio clock; the existing mixer and
+/// sink remain below this boundary for now.
+pub struct AudioRuntime {
+    clock: Clock,
+    last_time: Option<sound::timeline::AudioTime>,
+}
+
+impl AudioRuntime {
+    pub const fn new() -> Self {
+        Self { clock: Clock::new(), last_time: None }
+    }
+
+    pub fn produced_frames(&self) -> u64 {
+        self.clock.produced_frames()
+    }
+
+    /// Service the existing renderer using elapsed logical audio time. The
+    /// first call establishes the epoch and intentionally renders no catch-up
+    /// audio from before the runtime was published.
+    pub fn service<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        now: sound::timeline::AudioTime,
+        sink: Option<&mut Sink>,
+        mix: impl FnMut(&mut A, AudioSpan<'_>),
+    ) {
+        let elapsed_ms = self.last_time
+            .map(|previous| now.saturating_duration_since(previous) / 1_000)
+            .unwrap_or(0);
+        self.last_time = Some(now);
+        advance(machine, &mut self.clock, sink, elapsed_ms, mix);
+    }
+}
+
+impl Default for AudioRuntime {
+    fn default() -> Self { Self::new() }
+}
+
 /// Advance emulated audio and, when present, feed the physical output. Without
 /// a sink the same device clocks run at the canonical rate and their samples
 /// are discarded; SB DMA, GF1 voices, MIDI envelopes, and completion events
