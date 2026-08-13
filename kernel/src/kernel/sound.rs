@@ -373,6 +373,25 @@ pub struct AudioRuntime {
     timeline: AudioTimeline,
     clock: Clock,
     fractional_micros: u64,
+    scheduler: SchedulerCensus,
+}
+
+#[derive(Default)]
+struct SchedulerCensus {
+    report_tsc: u64,
+    last_service_time: Option<sound::timeline::AudioTime>,
+    service_count: u64,
+    max_audio_gap_micros: u64,
+    service_cost_total: u64,
+    max_service_cost: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AudioRuntimeStats {
+    pub service_count: u64,
+    pub max_audio_gap_micros: u64,
+    pub average_service_cost: u64,
+    pub max_service_cost: u64,
 }
 
 impl AudioRuntime {
@@ -381,11 +400,23 @@ impl AudioRuntime {
             timeline: AudioTimeline::new(),
             clock: Clock::new(),
             fractional_micros: 0,
+            scheduler: SchedulerCensus::new(),
         }
     }
 
     pub fn produced_frames(&self) -> u64 {
         self.clock.produced_frames()
+    }
+
+    pub fn stats(&self) -> AudioRuntimeStats {
+        AudioRuntimeStats {
+            service_count: self.scheduler.service_count,
+            max_audio_gap_micros: self.scheduler.max_audio_gap_micros,
+            average_service_cost: self.scheduler.service_cost_total
+                .checked_div(self.scheduler.service_count.max(1))
+                .unwrap_or(0),
+            max_service_cost: self.scheduler.max_service_cost,
+        }
     }
 
     /// Service the existing renderer using elapsed logical audio time. The
@@ -418,8 +449,23 @@ impl AudioRuntime {
         mode: sound::timeline::RenderMode,
         mut mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
+        let tracing = crate::kernel::startup::trace_enabled();
+        let service_tsc = tracing.then(|| machine.rdtsc());
+        if tracing {
+            self.scheduler.service_count += 1;
+            if let Some(previous) = self.scheduler.last_service_time {
+                self.scheduler.max_audio_gap_micros = self.scheduler.max_audio_gap_micros.max(
+                    now.saturating_duration_since(previous),
+                );
+            }
+            self.scheduler.last_service_time = Some(now);
+        }
         let elapsed_ms = self.timeline.elapsed_micros(now, &mut self.fractional_micros) / 1_000;
         if elapsed_ms == 0 {
+            if let Some(start) = service_tsc {
+                let end = machine.rdtsc();
+                self.record_service_cost(end.wrapping_sub(start), end);
+            }
             return;
         }
         if mode == sound::timeline::RenderMode::ProducePcm {
@@ -431,7 +477,42 @@ impl AudioRuntime {
                 });
             });
         } else {
-            let _ = (machine, sink, &mut mix);
+            let _ = (sink, &mut mix);
+        }
+        if let Some(start) = service_tsc {
+            let end = machine.rdtsc();
+            self.record_service_cost(end.wrapping_sub(start), end);
+        }
+    }
+
+    fn record_service_cost(&mut self, cost: u64, now_tsc: u64) {
+        self.scheduler.service_cost_total = self.scheduler.service_cost_total.saturating_add(cost);
+        self.scheduler.max_service_cost = self.scheduler.max_service_cost.max(cost);
+        if self.scheduler.report_tsc == 0 {
+            self.scheduler.report_tsc = now_tsc;
+        } else if now_tsc.wrapping_sub(self.scheduler.report_tsc) > 3_000_000_000 {
+            let stats = self.stats();
+            crate::println!(
+                "audio: scheduler services={} max_gap_us={} avg_cost={} max_cost={}",
+                stats.service_count,
+                stats.max_audio_gap_micros,
+                stats.average_service_cost,
+                stats.max_service_cost,
+            );
+            self.scheduler.report_tsc = now_tsc;
+        }
+    }
+}
+
+impl SchedulerCensus {
+    const fn new() -> Self {
+        Self {
+            report_tsc: 0,
+            last_service_time: None,
+            service_count: 0,
+            max_audio_gap_micros: 0,
+            service_cost_total: 0,
+            max_service_cost: 0,
         }
     }
 }
