@@ -216,6 +216,9 @@ pub trait Arch: Sized + GuestBytes {
     }
     /// Consume and return ticks accumulated since the last call.
     fn take_pending_ticks(&mut self) -> u32;
+    /// Consume timer-owned audio service opportunities. The interrupt side
+    /// only increments this counter; rendering remains in safe kernel context.
+    fn take_audio_service_wakeups(&mut self) -> u32 { 0 }
     /// Drain queued hardware-IRQ events, calling `f` for each.
     fn drain(&mut self, f: &mut dyn FnMut(Irq));
     /// Read the CPU timestamp counter.

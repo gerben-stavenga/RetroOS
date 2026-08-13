@@ -39,6 +39,10 @@ static mut TIMER_TICKS: u64 = 0;
 
 /// Pending timer ticks for VM86 delivery (separate from queue to avoid evicting keys)
 static mut PENDING_TICKS: u32 = 0;
+/// Audio wakeups are separate from guest timer delivery. The timer ISR only
+/// records opportunities; AudioRuntime consumes them outside IRQ context.
+static mut PENDING_AUDIO_WAKEUPS: u32 = 0;
+static mut AUDIO_WAKEUP_PHASE: u32 = 0;
 
 /// HPET wall-clock state retained after LAPIC calibration. A periodic LAPIC
 /// interrupt can be coalesced while firmware holds the CPU in SMM (notably USB
@@ -124,6 +128,28 @@ pub fn take_pending_ticks() -> u32 {
             total.saturating_sub(batch).min(u64::from(u32::MAX)) as u32,
         );
         batch as u32
+    }
+}
+
+pub fn take_audio_service_wakeups() -> u32 {
+    unsafe {
+        let pending = core::ptr::read_volatile(&raw const PENDING_AUDIO_WAKEUPS);
+        core::ptr::write_volatile(&raw mut PENDING_AUDIO_WAKEUPS, 0);
+        pending
+    }
+}
+
+#[inline]
+fn note_audio_timer_tick() {
+    unsafe {
+        let phase = core::ptr::read_volatile(&raw const AUDIO_WAKEUP_PHASE) + 1;
+        if phase >= 2 {
+            let pending = core::ptr::read_volatile(&raw const PENDING_AUDIO_WAKEUPS);
+            core::ptr::write_volatile(&raw mut PENDING_AUDIO_WAKEUPS, pending.saturating_add(1));
+            core::ptr::write_volatile(&raw mut AUDIO_WAKEUP_PHASE, 0);
+        } else {
+            core::ptr::write_volatile(&raw mut AUDIO_WAKEUP_PHASE, phase);
+        }
     }
 }
 
@@ -825,6 +851,7 @@ pub fn handle_irq(regs: &mut Regs) {
                     let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
                     core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
                 }
+                note_audio_timer_tick();
                 // Poll the USB-HID keyboard (if any) into the same key queue.
                 crate::xhci::poll();
             }
@@ -872,6 +899,7 @@ pub fn handle_irq(regs: &mut Regs) {
                 let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
                 core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
             }
+            note_audio_timer_tick();
             None // ticks use PENDING_TICKS counter, not the queue
         }
         1 => Some(Irq::Key(inb(0x60))),

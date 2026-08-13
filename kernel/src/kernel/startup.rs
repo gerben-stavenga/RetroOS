@@ -761,6 +761,7 @@ pub fn event_loop<A: crate::Arch>(
         };
         stats.part(machine, 1);
         let ticks = machine.take_pending_ticks();
+        let audio_wakeups = machine.take_audio_service_wakeups();
         let thread = ctx.thread(threads);
 
         if let Some(output) = sink.as_deref_mut() {
@@ -770,7 +771,12 @@ pub fn event_loop<A: crate::Arch>(
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
         thread.personality.advance_world(machine, ticks, audio_runtime.produced_frames());
-        if ticks != 0 && midi_service_divider.advance(ticks) != 0 {
+        let audio_service_due = if audio_wakeups != 0 {
+            true
+        } else {
+            ticks != 0 && midi_service_divider.advance(ticks) != 0
+        };
+        if audio_service_due {
             thread.personality.audio_midi_service(
                 machine, audio_runtime.produced_frames());
         }
