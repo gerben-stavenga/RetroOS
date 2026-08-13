@@ -26,6 +26,23 @@ impl<T, const N: usize> FixedEventQueue<T, N> {
         }
     }
 
+    /// Construct the queue directly in its heap allocation. This matters for
+    /// large queues embedded in kernel device state: returning `Self` by value
+    /// would briefly materialize the whole backing array on a small stack.
+    pub fn new_boxed() -> alloc::boxed::Box<Self> {
+        let mut boxed = alloc::boxed::Box::<Self>::new_uninit();
+        let p = boxed.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*p).storage)
+                .write([const { MaybeUninit::uninit() }; N]);
+            core::ptr::addr_of_mut!((*p).head).write(0);
+            core::ptr::addr_of_mut!((*p).len).write(0);
+            core::ptr::addr_of_mut!((*p).high_water).write(0);
+            core::ptr::addr_of_mut!((*p).overflows).write(0);
+            boxed.assume_init()
+        }
+    }
+
     pub const fn capacity(&self) -> usize { N }
 
     pub const fn is_empty(&self) -> bool { self.len == 0 }

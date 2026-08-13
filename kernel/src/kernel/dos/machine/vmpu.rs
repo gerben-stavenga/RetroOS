@@ -25,8 +25,8 @@ pub struct Mpu {
     pub present: bool,
     pub base: u16,
     card: sound::mpu401::Mpu401,
-    events: sound::event_queue::FixedEventQueue<
-        sound::timeline::TimedEvent<MpuEvent>, MPU_EVENT_QUEUE>,
+    events: alloc::boxed::Box<sound::event_queue::FixedEventQueue<
+        sound::timeline::TimedEvent<MpuEvent>, MPU_EVENT_QUEUE>>,
     replay_uart: bool,
     rate: u32,
     /// Persistent MIDI synthesis state for the DOS personality. It is built
@@ -42,21 +42,15 @@ pub struct Mpu {
 
 impl Mpu {
     pub fn new() -> Self {
-        let bank = crate::kernel::midi_bank::get();
-        let synth = bank.map(|bank| {
-            let mut synth = sound::midi::Synth::new_boxed(bank);
-            synth.init();
-            synth
-        });
         Mpu {
             present: false,
             base: 0x330,
             card: sound::mpu401::Mpu401::new(0x330),
-            events: sound::event_queue::FixedEventQueue::new(),
+            events: sound::event_queue::FixedEventQueue::new_boxed(),
             replay_uart: false,
             rate: 44_100,
-            synth,
-            bank,
+            synth: None,
+            bank: None,
         }
     }
 
