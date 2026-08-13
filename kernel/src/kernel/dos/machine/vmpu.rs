@@ -29,9 +29,8 @@ pub struct Mpu {
         sound::timeline::TimedEvent<MpuEvent>, MPU_EVENT_QUEUE>,
     replay_uart: bool,
     rate: u32,
-    /// Built on first use — the synth carries 32 voices and the MIDI wire
-    /// state; a program that never opens the port pays nothing. Instruments
-    /// come from the boot ROM by reference.
+    /// Persistent MIDI synthesis state for the DOS personality. It is built
+    /// before guest execution/audio servicing, not on the first MIDI byte.
     synth: Option<alloc::boxed::Box<sound::midi::Synth>>,
     /// The ROM in the socket, handed in with the rest of this program's
     /// wiring (see [`Mpu::configure_from_env`]). A device does not go
@@ -43,6 +42,12 @@ pub struct Mpu {
 
 impl Mpu {
     pub fn new() -> Self {
+        let bank = crate::kernel::midi_bank::get();
+        let synth = bank.map(|bank| {
+            let mut synth = sound::midi::Synth::new_boxed(bank);
+            synth.init();
+            synth
+        });
         Mpu {
             present: false,
             base: 0x330,
@@ -50,8 +55,8 @@ impl Mpu {
             events: sound::event_queue::FixedEventQueue::new(),
             replay_uart: false,
             rate: 44_100,
-            synth: None,
-            bank: None,
+            synth,
+            bank,
         }
     }
 
@@ -72,6 +77,11 @@ impl Mpu {
     /// `P<port>` token (our CONFIG.SYS ships `P330`).
     pub fn configure_from_env(&mut self, env: &[u8], bank: Option<&'static sound::midi::Bank>) {
         self.bank = bank;
+        if self.synth.is_none() && let Some(bank) = self.bank {
+            let mut synth = sound::midi::Synth::new_boxed(bank);
+            synth.init();
+            self.synth = Some(synth);
+        }
         let Some(blaster) = env_var(env, b"BLASTER") else { return };
         for tok in blaster.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
             if tok[0].eq_ignore_ascii_case(&b'P')
@@ -120,19 +130,6 @@ impl Mpu {
     pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
         if !self.present {
             return;
-        }
-        // Only build the synth once the guest actually drives the port —
-        // detection alone (reset/ACK) must not cost the voice engine. A
-        // bankless boot never builds one: the wire still ACKs (the port
-        // exists), but there is nothing to sound.
-        if self.synth.is_none() {
-            if !self.card.in_uart() {
-                return;
-            }
-            let Some(bank) = self.bank else { return };
-            let mut s = sound::midi::Synth::new_boxed(bank);
-            s.init();
-            self.synth = Some(s);
         }
         let now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
         while let Some(timed) = self.events.pop_through(now) {
