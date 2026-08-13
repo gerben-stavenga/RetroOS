@@ -39,7 +39,7 @@
 //! so reusing the same window + DMA channel is safe.
 
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 // ── Stolen kernel VAs (dead UMA slice of the low-mem identity window) ─────────
@@ -219,7 +219,6 @@ static OUTPUT_ROUTE: AtomicU8 = AtomicU8::new(DEFAULT_OUTPUT_ROUTE as u8);
 static REQUESTED_OUTPUT_ROUTE: AtomicU8 = AtomicU8::new(DEFAULT_OUTPUT_ROUTE as u8);
 /// Routes backed by a usable pin-to-DAC path on the active codec.
 static AVAILABLE_OUTPUT_ROUTES: AtomicU8 = AtomicU8::new(0);
-static OUTPUT_ROUTE_PENDING: AtomicBool = AtomicBool::new(false);
 /// True once the controller BAR is mapped at `BAR_WIN_VA` (panic-path guard).
 static BAR_MAPPED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
@@ -261,7 +260,6 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
             Some(route) => route,
             None => {
                 REQUESTED_OUTPUT_ROUTE.store(DEFAULT_OUTPUT_ROUTE as u8, Ordering::Relaxed);
-                OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
                 crate::println!(
                     "hda: invalid HDA_OUTPUT={}",
                     core::str::from_utf8(value).unwrap_or("<non-UTF8>")
@@ -271,7 +269,6 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
         },
     };
     REQUESTED_OUTPUT_ROUTE.store(route as u8, Ordering::Relaxed);
-    OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
 }
 
 pub fn output_route_label() -> &'static [u8] {
@@ -291,7 +288,7 @@ pub fn cycle_output_route(forward: bool) {
         return;
     }
     REQUESTED_OUTPUT_ROUTE.store(next as u8, Ordering::Relaxed);
-    OUTPUT_ROUTE_PENDING.store(true, Ordering::Relaxed);
+    crate::kernel::sound::request_deferred_reset();
 }
 
 #[inline]
@@ -824,7 +821,6 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     }
     OUTPUT_ROUTE.store(d.output_route as u8, Ordering::Relaxed);
     REQUESTED_OUTPUT_ROUTE.store(d.output_route as u8, Ordering::Relaxed);
-    OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
     log_available_output_routes(
         "available outputs",
         AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed),
@@ -1439,11 +1435,7 @@ impl Hda {
         }
     }
 
-    fn apply_pending_output_route(&mut self) {
-        if !OUTPUT_ROUTE_PENDING.swap(false, Ordering::Relaxed) {
-            return;
-        }
-
+    fn reset_output_route(&mut self) {
         let old_pin = self.pin;
         let old_dac = self.dac;
         let old_pin_def = self.pin_def;
@@ -1451,6 +1443,11 @@ impl Hda {
         let old_route = self.output_route;
         let old_available = AVAILABLE_OUTPUT_ROUTES.load(Ordering::Relaxed);
         let requested = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
+
+        self.stop_playback();
+        if requested == old_route {
+            return;
+        }
 
         log_available_output_routes("available outputs", old_available);
 
@@ -1806,8 +1803,8 @@ impl sound::sink::Device for Hda {
         self.stop_playback();
     }
 
-    fn service(&mut self) {
-        self.apply_pending_output_route();
+    fn reset(&mut self) {
+        self.reset_output_route();
     }
 
     fn halt(&mut self) {

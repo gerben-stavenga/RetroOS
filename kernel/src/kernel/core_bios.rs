@@ -909,7 +909,6 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?;
         lib::log::set_timestamp_ms(machine.get_ticks());
         crate::println!("video: native mode change mode={:#06x}", mode);
-        crate::kernel::blocking::before_blocking_operation();
         self.bios(bios)?.set_mode(machine, self, mode)
     }
 
@@ -923,7 +922,6 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?;
         lib::log::set_timestamp_ms(machine.get_ticks());
         crate::println!("video: native mode change request={:#06x}", request);
-        crate::kernel::blocking::before_blocking_operation();
         self.bios(bios)?.set_mode_request(machine, self, request)
     }
 

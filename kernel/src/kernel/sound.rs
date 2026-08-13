@@ -18,7 +18,7 @@
 //! where one was found, the port window where a backend installed a sink,
 //! nowhere otherwise — `play` just matches the type.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 // RetroOS canonical audio device — a kernel-private ISA port window. It is
 // *never* guest-visible: only the kernel addresses it, through `machine.outw`
@@ -37,6 +37,18 @@ pub use sound::RATE_FP_SHIFT;
 static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
 /// Times the dashpot pushed the mixing rate far from `s`; see [`advance`].
 static RATE_SPIKES: AtomicU32 = AtomicU32::new(0);
+/// A device control change needs the generic sink and the device cursor to be
+/// reset together before the next control service. Producers set this flag;
+/// the event loop consumes it through [`Sink::service_controls`].
+static SINK_RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Request a deferred audio reset before the next device-control service.
+///
+/// This is intentionally a generic audio operation: HDA, AC'97, and future
+/// devices may request it without reaching into sink bookkeeping directly.
+pub fn request_deferred_reset() {
+    SINK_RESET_REQUESTED.store(true, Ordering::Release);
+}
 
 /// One real-time window's worth of pump accounting, for when the mix rate
 /// wanders and the sampled spike log cannot say why. Reported per ~3s of TSC;
@@ -234,12 +246,11 @@ impl Sink {
         self.max_headroom = self.max_headroom.max(headroom);
     }
 
-    /// Prepare the device before another subsystem enters a synchronous
-    /// operation that may stall the machine for an indeterminate duration.
-    /// The caller intentionally does not identify the source of the stall.
-    pub(crate) fn prepare_for_blocking_operation(&mut self) {
-        crate::println!("sound: pre-roll reset before blocking operation");
-        self.inner.pause_and_reset();
+    /// Reset device and sink state together, then wait for a fresh pre-roll
+    /// before playback resumes.
+    pub(crate) fn perform_reset(&mut self) {
+        crate::println!("sound: sink reset, entering pre-roll");
+        self.inner.reset();
         self.producer = sound::Pacer::new(self.inner.rate());
         self.last_consumed = 0;
         self.ms_since_cursor = 0;
@@ -250,16 +261,18 @@ impl Sink {
     /// Service device controls independently of PCM playback and virtual
     /// audio time, including while the event loop has no elapsed tick.
     pub(crate) fn service_controls(&mut self) {
-        self.inner.service();
+        if SINK_RESET_REQUESTED.swap(false, Ordering::Acquire) {
+            self.perform_reset();
+        }
     }
 }
 
 /// Adapter for the generic BIOS blocking-operation hook. The opaque context
 /// points at the event loop's long-lived sink for the duration of the kernel.
-pub(crate) fn prepare_for_blocking_operation(context: *mut ()) {
+pub(crate) fn request_reset(context: *mut ()) {
     // SAFETY: startup installs this pointer from the sink owned by `run`, and
     // the kernel never returns from that event loop while the hook is active.
-    unsafe { (&mut *(context.cast::<Sink>())).prepare_for_blocking_operation(); }
+    unsafe { (&mut *(context.cast::<Sink>())).perform_reset(); }
 }
 
 /// Source-time rate used when there is no sink.
@@ -452,6 +465,9 @@ impl AudioRuntime {
         mode: sound::timeline::RenderMode,
         mut mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
+        if let Some(output) = self.sink.as_mut() {
+            output.service_controls();
+        }
         let tracing = crate::kernel::startup::trace_enabled();
         let service_tsc = tracing.then(|| machine.rdtsc());
         if tracing {
@@ -545,7 +561,6 @@ pub fn advance<A: crate::Arch>(
     let mut fill = 0;
     let mut drained = 0;
     let rate_q16 = if let Some(output) = sink.as_deref_mut() {
-        output.inner.service();
         let rate = output.inner.rate();
         let nominal_rate_q16 = u64::from(rate) << RATE_FP_SHIFT;
         let requested = (u64::from(rate)

@@ -492,7 +492,7 @@ fn run<A: crate::Arch>(
     let mut audio_runtime = crate::kernel::sound::AudioRuntime::new(sink);
     if let Some(sink) = audio_runtime.sink_mut() {
         crate::kernel::blocking::install(crate::kernel::blocking::BlockingOperationHook::new(
-            crate::kernel::sound::prepare_for_blocking_operation,
+            crate::kernel::sound::request_reset,
             core::ptr::from_mut(sink).cast(),
         ));
     }
@@ -762,10 +762,6 @@ pub fn event_loop<A: crate::Arch>(
         let ticks = machine.take_pending_ticks();
         let audio_wakeups = machine.take_audio_service_wakeups();
         let thread = ctx.thread(threads);
-
-        if let Some(output) = audio_runtime.sink_mut() {
-            output.service_controls();
-        }
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.

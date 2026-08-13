@@ -62,9 +62,12 @@ pub trait Device {
     /// restartable by [`Device::start`]. This must be safe when already paused.
     fn pause(&mut self);
 
-    /// Service device-side control changes which are independent of PCM
-    /// playback, such as output routing.
-    fn service(&mut self) {}
+    /// Reset playback and device-side state as one restartable transition.
+    /// Devices may apply pending control changes before the generic sink
+    /// clears its ring and cursors.
+    fn reset(&mut self) {
+        self.pause();
+    }
 
     /// Stop the transfer and tear down the device for session end.
     fn halt(&mut self);
@@ -93,6 +96,10 @@ impl<T: Device + ?Sized> Device for &mut T {
 
     fn pause(&mut self) {
         (**self).pause();
+    }
+
+    fn reset(&mut self) {
+        (**self).reset();
     }
 
     fn halt(&mut self) {
@@ -159,6 +166,19 @@ impl<D: Device> Sink<D> {
         self.written_frames = 0;
         self.played_frames = 0;
         self.written_frames_at_last_completion = 0;
+    }
+
+    /// Reset device-specific playback state together with the generic sink
+    /// bookkeeping. The device reset runs first so hardware and software
+    /// cursors share the same restart boundary.
+    pub fn reset(&mut self) {
+        self.dev.reset();
+        self.buf.fill([0, 0]);
+        self.write_pos = 0;
+        self.written_frames = 0;
+        self.played_frames = 0;
+        self.written_frames_at_last_completion = 0;
+        self.running = false;
     }
 
     pub fn is_running(&self) -> bool {
@@ -241,11 +261,6 @@ impl<D: Device> Sink<D> {
             consumed_frames,
         });
         Report { first_frame, underrun }
-    }
-
-    /// Service controls even while playback is paused or in pre-roll.
-    pub fn service(&mut self) {
-        self.dev.service();
     }
 
     /// Frames consumed by the device.
