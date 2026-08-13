@@ -238,6 +238,19 @@ pub struct AudioSpan<'a> {
     pub frames: &'a mut [(i32, i32)],
 }
 
+/// Common rendering boundary for emulated audio producers. The runtime owns
+/// the clock, mixer, and sink; a source only advances its own state and writes
+/// canonical PCM into the supplied span. Future SB/OPL/GUS sources can use
+/// this same interface without teaching the runtime their device details.
+pub trait AudioSource<A: crate::Arch> {
+    fn render(
+        &mut self,
+        machine: &mut A,
+        mode: sound::timeline::RenderMode,
+        span: AudioSpan<'_>,
+    );
+}
+
 const MIX_CHUNK: usize = 128;
 const MAX_PREROLL_GAP_MS: u64 = 15;
 

@@ -1209,14 +1209,19 @@ enum PcmSource<'a> {
     Speaker(&'a mut sound::speaker::Speaker),
 }
 
-impl PcmSource<'_> {
-    fn mix_into<A: crate::Arch>(
+impl<A: crate::Arch> crate::kernel::sound::AudioSource<A> for PcmSource<'_> {
+    fn render(
         &mut self,
         machine: &mut A,
-        rate: u32,
-        base: u64,
-        block: &mut [(i32, i32)],
+        mode: sound::timeline::RenderMode,
+        span: crate::kernel::sound::AudioSpan<'_>,
     ) {
+        if mode == sound::timeline::RenderMode::AdvanceOnly {
+            return;
+        }
+        let rate = span.rate;
+        let base = span.base_frame;
+        let block = span.frames;
         match self {
             Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, block),
             Self::SoundBlaster(None) => {}
@@ -1309,7 +1314,16 @@ pub fn audio_tick<A: crate::Arch>(
     let mut source_cycles = [0u64; 4];
     for (i, source) in sources.iter_mut().enumerate() {
         let t0 = if prof { machine.rdtsc() } else { 0 };
-        source.mix_into(machine, span.rate, span.base_frame, span.frames);
+        crate::kernel::sound::AudioSource::render(
+            source,
+            machine,
+            sound::timeline::RenderMode::ProducePcm,
+            crate::kernel::sound::AudioSpan {
+                rate: span.rate,
+                base_frame: span.base_frame,
+                frames: span.frames,
+            },
+        );
         if prof {
             source_cycles[i] = machine.rdtsc().wrapping_sub(t0);
         }
