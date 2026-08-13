@@ -359,11 +359,41 @@ impl AudioRuntime {
         sink: Option<&mut Sink>,
         mix: impl FnMut(&mut A, AudioSpan<'_>),
     ) {
+        self.service_mode(
+            machine,
+            now,
+            sink,
+            sound::timeline::RenderMode::ProducePcm,
+            mix,
+        );
+    }
+
+    /// Service the runtime with an explicit source-rendering mode. The
+    /// current sink path uses `ProducePcm`; `AdvanceOnly` establishes the
+    /// future deadline-safe path without requiring a second runtime API.
+    pub fn service_mode<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        now: sound::timeline::AudioTime,
+        sink: Option<&mut Sink>,
+        mode: sound::timeline::RenderMode,
+        mut mix: impl FnMut(&mut A, AudioSpan<'_>),
+    ) {
         let elapsed_ms = self.timeline.elapsed_micros(now, &mut self.fractional_micros) / 1_000;
         if elapsed_ms == 0 {
             return;
         }
-        advance(machine, &mut self.clock, sink, elapsed_ms, mix);
+        if mode == sound::timeline::RenderMode::ProducePcm {
+            advance(machine, &mut self.clock, sink, elapsed_ms, |machine, span| {
+                mix(machine, AudioSpan {
+                    rate: span.rate,
+                    base_frame: span.base_frame,
+                    frames: span.frames,
+                });
+            });
+        } else {
+            let _ = (machine, sink, &mut mix);
+        }
     }
 }
 
