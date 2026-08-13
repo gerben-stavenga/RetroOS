@@ -49,6 +49,7 @@ static mut HPET_HZ: u64 = 0;
 static mut HPET_COUNTER_MASK: u64 = 0;
 static mut HPET_LAST_COUNTER: u64 = 0;
 static mut HPET_ELAPSED_COUNTERS: u64 = 0;
+static mut HPET_AUDIO_BASE_COUNTER: u64 = 0;
 
 /// PS/2 mouse 3-byte packet assembly state. Packets stream in over IRQ 12;
 /// we accumulate three bytes, decode to dx/dy/buttons, push one Irq::Mouse,
@@ -358,6 +359,7 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
         core::ptr::write_volatile(&raw mut HPET_COUNTER_MASK, counter_mask);
         core::ptr::write_volatile(&raw mut HPET_LAST_COUNTER, t1);
         core::ptr::write_volatile(&raw mut HPET_ELAPSED_COUNTERS, 0);
+        core::ptr::write_volatile(&raw mut HPET_AUDIO_BASE_COUNTER, t1);
         // Publish the frequency last: nonzero means every other field above is
         // initialized and the reconciliation path may read the counter.
         core::ptr::write_volatile(&raw mut HPET_HZ, hpet_hz);
@@ -963,6 +965,22 @@ pub fn route_isa_irq(line: u8) {
 /// Get timer ticks
 pub fn get_ticks() -> u64 {
     unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }
+}
+
+/// Read the retained monotonic audio clock without consuming timer-delivery
+/// state. Guest timer behavior therefore remains independent of audio timing.
+pub fn audio_time_micros() -> u64 {
+    unsafe {
+        let hz = core::ptr::read_volatile(&raw const HPET_HZ);
+        if hz != 0 {
+            let mask = core::ptr::read_volatile(&raw const HPET_COUNTER_MASK);
+            let base = core::ptr::read_volatile(&raw const HPET_AUDIO_BASE_COUNTER);
+            let now = hpet_counter(mask);
+            let elapsed = now.wrapping_sub(base) & mask;
+            return (u128::from(elapsed) * 1_000_000 / u128::from(hz)) as u64;
+        }
+        core::ptr::read_volatile(&raw const TIMER_TICKS).saturating_mul(1_000)
+    }
 }
 
 /// Feed one byte from the 8042 AUX data port into the 3-byte PS/2 packet

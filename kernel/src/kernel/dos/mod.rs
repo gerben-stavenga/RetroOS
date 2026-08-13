@@ -302,7 +302,6 @@ impl<A: crate::Arch> DosState<A> {
         self.pc.sb.release_dma_pool(machine, regs);
         let pc = &mut self.pc;
         pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
         pc.spk.reset();
     }
 
@@ -985,7 +984,6 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         old.pc.sb.release_dma_pool(machine, &mut current.kernel.vcpu);
         let pc = &mut old.pc;
         pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
         pc.spk.reset();
     }
     // Construct directly in the personality's final storage. Keeping a
@@ -1124,7 +1122,6 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
         old.pc.sb.release_dma_pool(machine, &mut t.kernel.vcpu);
         let pc = &mut old.pc;
         pc.gus.reset(machine, &mut pc.vpic);
-        pc.mpu.reset();
         pc.spk.reset();
     }
     let vga = DisplayedVga::Emulated(

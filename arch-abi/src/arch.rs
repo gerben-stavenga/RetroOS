@@ -209,6 +209,11 @@ pub trait Arch: Sized + GuestBytes {
 
     /// Monotonic tick count (PIT/virtual time).
     fn get_ticks(&self) -> u64;
+    /// Monotonic audio clock in microseconds. Backends with a retained
+    /// hardware reference may provide finer elapsed time than guest ticks.
+    fn audio_time_micros(&self) -> u64 {
+        self.get_ticks().saturating_mul(1_000)
+    }
     /// Consume and return ticks accumulated since the last call.
     fn take_pending_ticks(&mut self) -> u32;
     /// Drain queued hardware-IRQ events, calling `f` for each.

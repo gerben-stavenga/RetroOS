@@ -11,12 +11,24 @@
 
 use super::*;
 
+const MPU_EVENT_QUEUE: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MpuEvent {
+    DataWrite(u8),
+    CommandWrite(u8),
+}
+
 pub struct Mpu {
     /// `BLASTER=... P<port>` declared an MPU-401. Absent hardware stays
     /// absent: `owns` gates on this, so probes read floating.
     pub present: bool,
     pub base: u16,
     card: sound::mpu401::Mpu401,
+    events: sound::event_queue::FixedEventQueue<
+        sound::timeline::TimedEvent<MpuEvent>, MPU_EVENT_QUEUE>,
+    replay_uart: bool,
+    rate: u32,
     /// Built on first use — the synth carries 32 voices and the MIDI wire
     /// state; a program that never opens the port pays nothing. Instruments
     /// come from the boot ROM by reference.
@@ -35,6 +47,9 @@ impl Mpu {
             present: false,
             base: 0x330,
             card: sound::mpu401::Mpu401::new(0x330),
+            events: sound::event_queue::FixedEventQueue::new(),
+            replay_uart: false,
+            rate: 44_100,
             synth: None,
             bank: None,
         }
@@ -76,6 +91,9 @@ impl Mpu {
     /// program starts from a power-on device. The ROM, being ROM, stays.
     pub fn reset(&mut self) {
         self.card.reset();
+        self.events.clear();
+        self.replay_uart = false;
+        self.rate = 44_100;
         self.synth = None;
         self.present = false;
     }
@@ -84,15 +102,22 @@ impl Mpu {
         self.card.port_in(p)
     }
 
-    pub fn io_write(&mut self, p: u16, val: u8) {
+    pub fn io_write(&mut self, p: u16, val: u8, at: sound::timeline::AudioTime) {
         self.card.port_out(p, val);
+        let event = if p == self.base {
+            MpuEvent::DataWrite(val)
+        } else {
+            MpuEvent::CommandWrite(val)
+        };
+        if self.events.push(sound::timeline::TimedEvent { at, event }).is_err() {
+            crate::dbg_println!("audio: MPU event queue overflow");
+        }
     }
 
     /// Per-quantum service: drain the port's MIDI bytes into the synth.
     /// `arrival_frame` is the mix-frame the bytes arrived at — the synth
     /// applies each at that frame.
     pub fn tick<A: crate::Arch>(&mut self, machine: &mut A, arrival_frame: u64) {
-        let _ = machine;
         if !self.present {
             return;
         }
@@ -109,9 +134,21 @@ impl Mpu {
             s.init();
             self.synth = Some(s);
         }
-        while let Some(b) = self.card.take() {
-            if let Some(s) = self.synth.as_mut() {
-                s.write_at(arrival_frame, b);
+        let now = sound::timeline::AudioTime::from_micros(machine.audio_time_micros());
+        while let Some(timed) = self.events.pop_through(now) {
+            match timed.event {
+                MpuEvent::CommandWrite(0xFF) => self.replay_uart = false,
+                MpuEvent::CommandWrite(0x3F) => self.replay_uart = true,
+                MpuEvent::CommandWrite(_) => {}
+                MpuEvent::DataWrite(b) if self.replay_uart => {
+                    let elapsed = now.saturating_duration_since(timed.at);
+                    let late_frames = elapsed.saturating_mul(u64::from(self.rate)) / 1_000_000;
+                    let frame = arrival_frame.saturating_sub(late_frames);
+                    if let Some(s) = self.synth.as_mut() {
+                        s.write_at(frame, b);
+                    }
+                }
+                MpuEvent::DataWrite(_) => {}
             }
         }
     }
@@ -129,6 +166,7 @@ impl Mpu {
     ) {
         let g = super::vsb::GM_SCALE_Q16;
         if let Some(s) = self.synth.as_mut() {
+            self.rate = rate;
             s.mix_into(rate, base, (g, g), block);
         }
     }

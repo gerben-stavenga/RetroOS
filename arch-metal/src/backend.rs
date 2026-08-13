@@ -71,6 +71,7 @@ impl Arch for Metal {
 
     // ── Timer ──
     fn get_ticks(&self) -> u64 { super::irq::get_ticks() }
+    fn audio_time_micros(&self) -> u64 { super::irq::audio_time_micros() }
     fn take_pending_ticks(&mut self) -> u32 { super::irq::take_pending_ticks() }
     fn drain(&mut self, f: &mut dyn FnMut(Irq)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }

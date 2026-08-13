@@ -864,7 +864,10 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
         p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, p, val),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
-        p if emulated_mpu(pc, p) => pc.mpu.io_write(p, val),
+        p if emulated_mpu(pc, p) => pc.mpu.io_write(
+            p, val,
+            sound::timeline::AudioTime::from_micros(machine.audio_time_micros()),
+        ),
         // Virtual 8237 DMA controller (generic). After capturing the
         // write, re-check whether the BLASTER channel just armed and, if
         // so, remap the guest buffer contiguous + program the real 8237.

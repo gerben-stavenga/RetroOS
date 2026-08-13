@@ -68,6 +68,10 @@ impl<T, const N: usize> FixedEventQueue<T, N> {
         self.len -= 1;
         Some(value)
     }
+
+    pub fn clear(&mut self) {
+        while self.pop().is_some() {}
+    }
 }
 
 impl<T, const N: usize> Default for FixedEventQueue<T, N> {

@@ -14,13 +14,8 @@
 //! and pick another device — the correct outcome, and far better than
 //! pretending and then mistiming its music.
 //!
-//! Passive: bytes the guest writes queue up for the host to drain into a
-//! synth. The card holds no synth, no clock, and no interrupt policy.
-
-/// Depth of the guest→host MIDI byte queue. A dense SysEx bank dump is the
-/// worst case; a full queue drops the oldest byte rather than growing without
-/// bound, and a dropped byte costs one note, never the stream.
-const QUEUE: usize = 1024;
+//! Passive: the card models the guest-visible wire protocol. Timestamped
+//! guest writes are queued by the owning runtime, not by this protocol card.
 
 /// Status-register bits. Active low, both of them.
 #[allow(dead_code)] // documents the bit we deliberately always leave clear
@@ -39,10 +34,6 @@ pub struct Mpu401 {
     pub base: u16,
     /// UART mode entered (command 0x3F). Out of it, data writes are ignored.
     uart: bool,
-    /// Bytes the guest has written, waiting for the host to drain.
-    out: [u8; QUEUE],
-    out_head: usize,
-    out_len: usize,
     /// Bytes the guest can read back — only ever command acknowledges, since
     /// nothing on our side originates MIDI.
     ack_pending: u8,
@@ -53,9 +44,6 @@ impl Mpu401 {
         Mpu401 {
             base,
             uart: false,
-            out: [0; QUEUE],
-            out_head: 0,
-            out_len: 0,
             ack_pending: 0,
         }
     }
@@ -88,9 +76,6 @@ impl Mpu401 {
     /// Guest OUT.
     pub fn port_out(&mut self, p: u16, val: u8) {
         if p == self.base {
-            if self.uart {
-                self.push(val);
-            }
             return;
         }
         match val {
@@ -98,8 +83,6 @@ impl Mpu401 {
                 // Reset acknowledges and leaves UART mode. Detection routines
                 // send this twice and expect an ACK each time.
                 self.uart = false;
-                self.out_len = 0;
-                self.out_head = 0;
                 self.ack_pending = self.ack_pending.saturating_add(1);
             }
             CMD_UART => {
@@ -112,28 +95,6 @@ impl Mpu401 {
         }
     }
 
-    fn push(&mut self, b: u8) {
-        if self.out_len == QUEUE {
-            // Full: drop the oldest so the newest still lands.
-            self.out_head = (self.out_head + 1) % QUEUE;
-            self.out_len -= 1;
-        }
-        let tail = (self.out_head + self.out_len) % QUEUE;
-        self.out[tail] = b;
-        self.out_len += 1;
-    }
-
-    /// Drain one queued MIDI byte for the host to feed a synth, or `None`.
-    pub fn take(&mut self) -> Option<u8> {
-        if self.out_len == 0 {
-            return None;
-        }
-        let b = self.out[self.out_head];
-        self.out_head = (self.out_head + 1) % QUEUE;
-        self.out_len -= 1;
-        Some(b)
-    }
-
     /// Whether the guest has put the port into UART mode — the host's cue
     /// that this device is the one the program chose.
     pub fn in_uart(&self) -> bool {
@@ -143,8 +104,6 @@ impl Mpu401 {
     /// Drop all state: program exit.
     pub fn reset(&mut self) {
         self.uart = false;
-        self.out_len = 0;
-        self.out_head = 0;
         self.ack_pending = 0;
     }
 }
@@ -188,44 +147,23 @@ mod tests {
     fn data_is_ignored_until_uart_mode() {
         let mut m = card();
         m.port_out(0x330, 0x90); // before the handshake
-        assert_eq!(m.take(), None);
+        assert!(!m.in_uart());
         m.port_out(0x331, CMD_UART);
         m.port_out(0x330, 0x90);
         m.port_out(0x330, 0x40);
         m.port_out(0x330, 0x7F);
-        assert_eq!(m.take(), Some(0x90));
-        assert_eq!(m.take(), Some(0x40));
-        assert_eq!(m.take(), Some(0x7F));
-        assert_eq!(m.take(), None);
+        assert!(m.in_uart());
     }
 
     #[test]
-    fn reset_leaves_uart_mode_and_clears_the_queue() {
+    fn reset_leaves_uart_mode_and_ack_state_clear() {
         let mut m = card();
         m.port_out(0x331, CMD_UART);
-        m.port_out(0x330, 0x90);
         m.port_out(0x331, CMD_RESET);
         assert!(!m.in_uart());
-        assert_eq!(m.take(), None, "queued bytes die with the reset");
-        m.port_out(0x330, 0x90);
-        assert_eq!(m.take(), None, "and data is ignored again");
-    }
-
-    #[test]
-    fn a_full_queue_drops_the_oldest_not_the_newest() {
-        let mut m = card();
-        m.port_out(0x331, CMD_UART);
-        for i in 0..(QUEUE + 10) {
-            m.port_out(0x330, (i & 0x7F) as u8);
-        }
-        // The first ten are gone; the queue holds the most recent QUEUE bytes.
-        let first = m.take().unwrap();
-        assert_eq!(first, (10 & 0x7F) as u8);
-        let mut n = 1;
-        while m.take().is_some() {
-            n += 1;
-        }
-        assert_eq!(n, QUEUE);
+        assert_eq!(m.port_in(0x330), ACK);
+        assert_eq!(m.port_in(0x330), ACK);
+        assert_eq!(m.port_in(0x331) & ST_INPUT_EMPTY, ST_INPUT_EMPTY);
     }
 
     #[test]
