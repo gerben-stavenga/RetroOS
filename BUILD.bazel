@@ -188,6 +188,16 @@ _EXTRA_FILES = {
     "//test/dos/spkproto:spktest_com":    "TESTS/SPKTEST.COM",
     # GUS (GF1) emulation probe — hosted_games.sh asserts its G*-OK markers.
     "//test/dos/gusproto:gustest_exe":    "TESTS/GUSTEST.EXE",
+    # DOSMid and its MIDI fixtures are kept together because DOSMid ships
+    # with documentation/configuration alongside the executable.
+    "test/dosmid/DOSMID.EXE":             "TESTS/DOSMID/DOSMID.EXE",
+    "test/dosmid/DOSMIDLT.EXE":           "TESTS/DOSMID/DOSMIDLT.EXE",
+    "test/dosmid/DOSMID.TXT":             "TESTS/DOSMID/DOSMID.TXT",
+    "test/dosmid/DOSMID.CFG":             "TESTS/DOSMID/DOSMID.CFG",
+    "test/dosmid/HISTORY.TXT":            "TESTS/DOSMID/HISTORY.TXT",
+    "test/dosmid/README.TXT":             "TESTS/DOSMID/README.TXT",
+    "test/dosmid/WALLRAG.MID":            "TESTS/DOSMID/WALLRAG.MID",
+    "test/dosmid/BRAHMS3.MID":            "TESTS/DOSMID/BRAHMS3.MID",
     "//tools/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
     "//tools/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
