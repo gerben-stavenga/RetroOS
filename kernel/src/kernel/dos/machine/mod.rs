@@ -1226,7 +1226,10 @@ impl<A: crate::Arch> crate::kernel::sound::AudioSource<A> for PcmSource<'_> {
             Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, block),
             Self::SoundBlaster(None) => {}
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
-            Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
+            Self::Midi(mpu) => {
+                mpu.service(machine, base);
+                mpu.mix_into(machine, rate, base, block);
+            }
             Self::Speaker(spk) => {
                 let g = vsb::SPEAKER_SCALE_Q16;
                 spk.mix_into(rate, (g, g), block)
@@ -1282,10 +1285,6 @@ pub fn audio_tick<A: crate::Arch>(
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
     let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
-    // Replay belongs to the source render boundary: the runtime now owns the
-    // complete deterministic sequence from timestamp consumption through
-    // source mixing and sink submission.
-    mpu.service(machine, span.base_frame);
     // The source clock advances emulated sources only. A thread holding the real card
     // has nothing here: its DSP streams from the guest ring over the ISA bus
     // and its OPL is the card's own, so neither produces frames for us and
