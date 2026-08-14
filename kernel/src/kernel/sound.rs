@@ -269,7 +269,7 @@ impl Sink {
 
 /// Adapter for the generic BIOS blocking-operation hook. The opaque context
 /// points at the event loop's long-lived sink for the duration of the kernel.
-pub(crate) fn request_reset(context: *mut ()) {
+pub(crate) fn perform_sink_reset_immediate(context: *mut ()) {
     // SAFETY: startup installs this pointer from the sink owned by `run`, and
     // the kernel never returns from that event loop while the hook is active.
     unsafe { (&mut *(context.cast::<Sink>())).perform_reset(); }

@@ -492,7 +492,7 @@ fn run<A: crate::Arch>(
     let mut audio_runtime = crate::kernel::sound::AudioRuntime::new(sink);
     if let Some(sink) = audio_runtime.sink_mut() {
         crate::kernel::blocking::install(crate::kernel::blocking::BlockingOperationHook::new(
-            crate::kernel::sound::request_reset,
+            crate::kernel::sound::perform_sink_reset_immediate,
             core::ptr::from_mut(sink).cast(),
         ));
     }
