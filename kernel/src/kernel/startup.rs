@@ -41,6 +41,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     let vbe_mode = display.vga_capability()
         .and_then(|native| native.bios_discover_vbe(machine, &mut bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
+    crate::kernel::platform::set_voodoo_vbe_mode(bios_workspace.curated_modes());
     let display = match display.into_native_capability(machine) {
         Ok(native) => crate::kernel::display::Display::new_selected(
             machine, &mut bios_workspace, native),

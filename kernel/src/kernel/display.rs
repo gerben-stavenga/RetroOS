@@ -91,6 +91,19 @@ impl DisplayHandoff {
         }
     }
 
+    /// Materialize the dedicated packed surface chosen for SST-1 scanout.
+    /// Non-VGA surfaces (UEFI/hosted) are already in their native format.
+    pub fn into_voodoo_surface<A: crate::Arch>(
+        self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    ) -> Display {
+        match self {
+            Self::Surface(display) => display,
+            Self::Vga(native) => Display::new_voodoo_selected(machine, bios, native),
+        }
+    }
+
     pub fn from_surface<A: crate::Arch>(display: Display, machine: &mut A) -> Self {
         match display.into_native_capability(machine) {
             Ok(native) => Self::Vga(native),
@@ -148,9 +161,33 @@ impl Display {
     pub fn new_selected<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        mut native: crate::kernel::platform::VgaCap,
+        native: crate::kernel::platform::VgaCap,
     ) -> Self {
-        match crate::kernel::platform::get().vbe_mode.map(|mode| mode.into_parts()) {
+        Self::new_selected_mode(
+            machine, bios, native, crate::kernel::platform::get().vbe_mode,
+        )
+    }
+
+    pub fn new_voodoo_selected<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        native: crate::kernel::platform::VgaCap,
+    ) -> Self {
+        Self::new_selected_mode(
+            machine,
+            bios,
+            native,
+            crate::kernel::platform::get().voodoo_vbe_mode,
+        )
+    }
+
+    fn new_selected_mode<A: crate::Arch>(
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        mut native: crate::kernel::platform::VgaCap,
+        selected: Option<crate::kernel::platform::VbeDisplayMode>,
+    ) -> Self {
+        match selected.map(|mode| mode.into_parts()) {
             Some((mode, rgb, crate::kernel::platform::VbeDisplayScanout::Linear {
                 offset, pages,
             })) => Self::new_vbe(machine, bios, native, mode, rgb, offset, pages),

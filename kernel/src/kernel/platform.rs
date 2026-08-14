@@ -117,6 +117,10 @@ pub struct Platform {
     /// Discovered once at boot; selecting/mapping it still requires ownership
     /// of the move-only `VgaCap`.
     pub vbe_mode: Option<VbeDisplayMode>,
+    /// Packed 640x480 mode reserved for software Voodoo scanout. RGB565 is a
+    /// direct match for the SST-1 front buffer; another two-byte layout is
+    /// still usable because the Voodoo DAC path packs through its channel map.
+    pub voodoo_vbe_mode: Option<VbeDisplayMode>,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
     /// latches, CR24 AC flip-flop, CR26 AC index). With them, task
@@ -457,6 +461,7 @@ pub fn probe<A: crate::Arch>(
             vga_passthrough,
             firmware,
             vbe_mode: None,
+            voodoo_vbe_mode: None,
             vga_readback,
             audio_hw,
             // Policy comes later, when CONFIG.SYS is readable
@@ -556,6 +561,38 @@ pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
         None if p.vga_passthrough => {
             crate::println!("VBE: no usable packed mode; selected display is Mode 13h")
         }
+        None => {}
+    }
+}
+
+/// Select and freeze the packed BIOS surface used when the software Voodoo
+/// takes display ownership. Discovery has already parsed the ROM catalogue;
+/// this is policy over those immutable facts, not another firmware probe.
+pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>) {
+    let selected = modes.and_then(|modes| {
+        let candidates = || modes.iter().copied()
+            .filter(|mode| mode.width == 640 && mode.height == 480)
+            .filter_map(VbeDisplayMode::try_from_bios_mode);
+        candidates()
+            .filter(|mode| mode.rgb == crate::kernel::display::PixelFormat::RGB565)
+            .min_by_key(|mode| mode.scanout == VbeDisplayScanout::Banked)
+            .or_else(|| candidates()
+                .filter(|mode| mode.rgb.bytes_per_pixel == 2)
+                .min_by_key(|mode| mode.scanout == VbeDisplayScanout::Banked))
+    });
+    let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
+        .expect("platform::set_voodoo_vbe_mode before probe");
+    p.voodoo_vbe_mode = selected;
+    match selected {
+        Some(selected) => {
+            let m = selected.mode();
+            crate::println!(
+                "VBE: Voodoo mode {:#x} {}x{}x{} format={:?}",
+                m.number, m.width, m.height, m.bits_per_pixel, selected.rgb,
+            );
+        }
+        None if p.vga_passthrough =>
+            crate::println!("VBE: no packed 640x480 Voodoo display mode"),
         None => {}
     }
 }

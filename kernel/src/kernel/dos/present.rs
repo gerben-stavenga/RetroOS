@@ -404,7 +404,26 @@ pub fn display_tick<A: crate::Arch>(
     now_ticks: u64,
     mut external: Option<&mut crate::kernel::display::Display>,
 ) {
-    
+    // A physical Voodoo board takes the monitor away from the VGA card with
+    // its pass-through relay.  Our Voodoo is a software producer, so on a
+    // native-VGA machine it instead needs the adapter converted into a packed
+    // Display sink before it can own scanout.  Preserve the guest's complete
+    // VGA/VBE state in EmulatedVga; that same state is then ready to render
+    // again when Glide switches the relay back to VGA.
+    //
+    // Do this only on the Native -> Emulated edge.  Once detached, the Display
+    // remains beside the emulated VGA and both VGA and Voodoo can select it
+    // without further firmware mode changes or ownership transactions.
+    if pc.voodoo.active() && matches!(pc.vga, DisplayedVga::Native(_)) {
+        let handoff = super::machine::vga::release_display(&mut pc.vga, machine, &mut *bios);
+        let display = handoff.into_voodoo_surface(machine, &mut *bios);
+        pc.vga.map(|vga| match vga {
+            DisplayedVga::Emulated(vga, _) => (DisplayedVga::Emulated(vga, display), ()),
+            DisplayedVga::Native(_) => unreachable!("Voodoo display detach left native VGA active"),
+        });
+        crate::println!("Display: Voodoo acquired packed scanout from native VGA");
+    }
+
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
