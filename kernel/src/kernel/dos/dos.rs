@@ -3896,19 +3896,34 @@ fn dos_to_unix_datetime(time: u16, date: u16) -> Option<u32> {
     let leap = |y: u32| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
     let max_day = MONTH_DAYS[month as usize - 1] + u32::from(month == 2 && leap(year));
     if day > max_day { return None; }
-    let mut days = 0u32;
-    for y in 1970..year { days += if leap(y) { 366 } else { 365 }; }
-    for m in 1..month {
-        days += MONTH_DAYS[m as usize - 1] + u32::from(m == 2 && leap(year));
-    }
-    days += day - 1;
+    let days = epoch_days_fast(year, month, day);
     days.checked_mul(86_400)?
         .checked_add(hour * 3_600 + minute * 60 + second)
 }
 
+/// Branchless Gregorian Y/M/D -> days since 1970-01-01. This is the
+/// power-of-two month-polynomial formulation from
+/// https://blog.reverberate.org/2020/05/12/optimizing-date-algorithms.html
+fn epoch_days_fast(year: u32, month: u32, day: u32) -> u32 {
+    const YEAR_BASE: u32 = 4800;
+    let month_adjusted = month.wrapping_sub(3);
+    let carry = u32::from(month_adjusted > month);
+    let adjusted_year = year + YEAR_BASE - carry;
+    let month_days = ((month_adjusted + carry * 12) * 62_719 + 769) >> 11;
+    let leap_days = adjusted_year / 4 - adjusted_year / 100 + adjusted_year / 400;
+    adjusted_year * 365 + leap_days + month_days + day - 1 - 2_472_632
+}
+
 #[cfg(test)]
 mod file_api_tests {
-    use super::{dos_to_unix_datetime, unix_to_dos_datetime};
+    use super::{dos_to_unix_datetime, epoch_days_fast, unix_to_dos_datetime};
+
+    #[test]
+    fn branchless_epoch_days_matches_known_dates() {
+        assert_eq!(epoch_days_fast(1970, 1, 1), 0);
+        assert_eq!(epoch_days_fast(2000, 1, 1), 10_957);
+        assert_eq!(epoch_days_fast(2020, 4, 29), 18_381);
+    }
 
     #[test]
     fn dos_datetime_round_trips_at_two_second_resolution() {
