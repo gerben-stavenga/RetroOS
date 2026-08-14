@@ -30,16 +30,47 @@ pub use arch_abi::Irq;
 pub const MSI_VECTOR_BASE: u8 = 0xF8;
 pub const MSI_SOURCE_COUNT: u8 = 8;
 
-/// Global IRQ event queue for discrete events (keyboard).
-/// Timer ticks use a separate counter to avoid flooding and evicting keys.
-static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Tick);
+/// Global IRQ event queue for discrete events (keyboard and device IRQs).
+/// Timer wakeups carry no event: the interrupt itself returns to the loop.
+static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Hw(0));
+/// Coalesce periodic wakeups: IRQ0 says only that the kernel should resample
+/// its clock, never how many milliseconds elapsed.
+static mut IRQ0_QUEUED: bool = false;
 
-/// Timer tick counter (incremented immediately for get_ticks/sleep_ticks)
-static mut TIMER_TICKS: u64 = 0;
+const PIT_INPUT_HZ: u64 = 1_193_182;
+const PIT_CHANNEL2: u16 = 0x42;
+const PIT_COMMAND: u16 = 0x43;
+const NS_SHIFT: u32 = 32;
 
-/// Pending timer ticks for VM86 delivery (separate from queue to avoid evicting keys)
-static mut PENDING_TICKS: u32 = 0;
+#[derive(Clone, Copy)]
+enum ClockSource {
+    Uninitialized,
+    Tsc,
+    Hpet,
+    Pit2,
+}
 
+/// Frozen clocksource selection and conversion facts. Initialized once before
+/// interrupts are enabled, then read normally; none of these fields is live
+/// interrupt state.
+#[derive(Clone, Copy)]
+struct Clock {
+    source: ClockSource,
+    /// 32.32 fixed-point nanoseconds per source cycle.
+    ns_mult: u64,
+    epoch: u64,
+    /// HPET remains the LAPIC calibration reference even when TSC is selected.
+    hpet_hz: u64,
+    hpet_mask: u64,
+}
+
+static mut CLOCK: Clock = Clock {
+    source: ClockSource::Uninitialized,
+    ns_mult: 0,
+    epoch: 0,
+    hpet_hz: 0,
+    hpet_mask: 0,
+};
 /// PS/2 mouse 3-byte packet assembly state. Packets stream in over IRQ 12;
 /// we accumulate three bytes, decode to dx/dy/buttons, push one Irq::Mouse,
 /// and reset.
@@ -52,7 +83,7 @@ pub fn drain(mut f: impl FnMut(Irq)) {
     // it. Move into a local under a short interrupt mask, then restore IF before
     // invoking arbitrary kernel callbacks. Keep the scratch uninitialized:
     // this path runs after every guest exit, while the queue is almost always
-    // empty. Initializing 256 fake Tick entries per exit made a polling guest
+    // empty. Initializing 256 fake entries per exit made a polling guest
     // write gigabytes of dead stack traffic per second.
     let mut events = [core::mem::MaybeUninit::<Irq>::uninit(); 256];
     let restore_if = crate::x86::interrupts_enabled();
@@ -60,6 +91,10 @@ pub fn drain(mut f: impl FnMut(Irq)) {
     let q = &raw mut QUEUE;
     let mut n = 0;
     unsafe {
+        // A full ring may have discarded the queued IRQ0. Either way this
+        // drain consumes the current wakeup epoch and permits the next IRQ0
+        // to enqueue another one.
+        IRQ0_QUEUED = false;
         while n < events.len() {
             let Some(event) = (*q).pop() else { break };
             events[n].write(event);
@@ -75,21 +110,22 @@ pub fn drain(mut f: impl FnMut(Irq)) {
     }
 }
 
+/// Queue one coalesced clock-resample request from IRQ0.
+unsafe fn queue_irq0_wakeup() {
+    if !unsafe { core::ptr::read_volatile(&raw const IRQ0_QUEUED) } {
+        unsafe {
+            (*(&raw mut QUEUE)).push(Irq::Hw(0));
+            core::ptr::write_volatile(&raw mut IRQ0_QUEUED, true);
+        }
+    }
+}
+
 /// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
 /// USB-HID keyboard `poll()`. Same sink the i8042 IRQ1 handler feeds, so the
 /// kernel sees one uniform key-event stream regardless of the source.
 pub fn push_key(sc: u8) {
     let q = &raw mut QUEUE;
     unsafe { (*q).push(Irq::Key(sc)); }
-}
-
-/// Take pending tick count (returns count and resets to 0).
-pub fn take_pending_ticks() -> u32 {
-    unsafe {
-        let t = core::ptr::read_volatile(&raw const PENDING_TICKS);
-        core::ptr::write_volatile(&raw mut PENDING_TICKS, 0);
-        t
-    }
 }
 
 // ============================================================================
@@ -134,6 +170,23 @@ pub fn init_pit(frequency: u32) {
     outb(PIT_CHANNEL0, (divisor >> 8) as u8);
 }
 
+/// Reserve physical PIT channel 2 as a free-running 16-bit clock. DOS sees a
+/// fully virtual PIT/speaker, so the real speaker is disconnected and its
+/// counter can use the maximum 65,536-cycle period (~54.9 ms).
+fn init_pit2_clock() {
+    outb(PIT_COMMAND, 0xB4); // channel 2, lo/hi, mode 2 rate generator
+    outb(PIT_CHANNEL2, 0);
+    outb(PIT_CHANNEL2, 0);   // zero encodes 65,536
+    outb(0x61, (inb(0x61) | 0x01) & !0x02); // gate on, speaker disconnected
+}
+
+/// Atomically latch channel 2, then read its low/high count bytes.
+fn pit2_count() -> u16 {
+    outb(PIT_COMMAND, 0x80); // latch channel 2
+    let lo = inb(PIT_CHANNEL2) as u16;
+    lo | ((inb(PIT_CHANNEL2) as u16) << 8)
+}
+
 /// Unmask an IRQ on the PIC
 fn unmask_irq(irq: u8) {
     let (port, bit) = if irq < 8 {
@@ -153,8 +206,8 @@ fn unmask_irq(irq: u8) {
 // fires and the event loop's first hlt-on-tick freezes the boot (reproduced as
 // the "hangs at Starting DN" symptom on an AMD Razer laptop; locally with QEMU
 // `-M q35,pit=off`). The local APIC timer is always present; we run it as the
-// system tick, feeding the same TIMER_TICKS/PENDING_TICKS counters the PIC IRQ0
-// path fed. The HPET (fixed, self-describing frequency at the de-facto-standard
+// periodic wakeup, returning control to the event loop without manufacturing
+// elapsed time. The HPET (fixed, self-describing frequency at the de-facto-standard
 // base 0xFED00000) is the calibration reference — with no PIT there is no other
 // fixed clock to derive the rate from.
 
@@ -172,8 +225,8 @@ const LVT_TIMER_PERIODIC: u32 = 1 << 17;   // LVT timer: periodic mode
 const LVT_MASKED: u32 = 1 << 16;
 const LVT_DELIVERY_EXTINT: u32 = 7 << 8;   // LVT delivery mode = ExtINT
 const LAPIC_DIV_1: u32 = 0b1011;           // divide-config: bus clock / 1
-// Tick vector reuses the IRQ0 slot (32) so the existing `32..=47 => handle_irq`
-// dispatch and Irq::Tick semantics apply unchanged.
+// The timer vector reuses the IRQ0 slot (32) so the existing `32..=47 =>
+// handle_irq` dispatch applies unchanged.
 const LAPIC_TIMER_VECTOR: u32 = IRQ_OFFSET as u32;
 // Spurious-interrupt vector: low nibble must be 0xF on P6/early CPUs, and 0x2F
 // lands in the PIC range where handle_irq's spurious-IRQ15 check returns
@@ -228,25 +281,133 @@ fn map_mmio_page(va: usize, phys: u64) {
     );
 }
 
+/// Read the HPET main counter without tearing on this 32-bit kernel.
+fn hpet_counter(mask: u64) -> u64 {
+    let lo = (HPET_MMIO_VA + 0xF0) as *const u32;
+    if mask == u64::from(u32::MAX) {
+        return u64::from(unsafe { core::ptr::read_volatile(lo) });
+    }
+    let hi = (HPET_MMIO_VA + 0xF4) as *const u32;
+    loop {
+        let hi0 = unsafe { core::ptr::read_volatile(hi) };
+        let low = unsafe { core::ptr::read_volatile(lo) };
+        let hi1 = unsafe { core::ptr::read_volatile(hi) };
+        if hi0 == hi1 {
+            return (u64::from(hi0) << 32) | u64::from(low);
+        }
+    }
+}
+
+/// Enable and describe the architectural HPET when the fixed PC mapping
+/// answers. `None` leaves both the clock and LAPIC calibration on PIT paths.
+fn init_hpet() -> Option<(u64, u64)> {
+    map_mmio_page(HPET_MMIO_VA, HPET_PHYS);
+    let capabilities = unsafe {
+        core::ptr::read_volatile(HPET_MMIO_VA as *const u64)
+    };
+    let period_fs = (capabilities >> 32) as u32;
+    if period_fs == 0 || period_fs > 100_000_000 {
+        return None;
+    }
+    let hz = 1_000_000_000_000_000u64 / u64::from(period_fs);
+    let mask = if capabilities & (1 << 13) != 0 {
+        u64::MAX
+    } else {
+        u64::from(u32::MAX)
+    };
+    let conf = unsafe {
+        core::ptr::read_volatile((HPET_MMIO_VA + 0x10) as *const u64)
+    };
+    unsafe {
+        core::ptr::write_volatile((HPET_MMIO_VA + 0x10) as *mut u64, conf | 1);
+    }
+    Some((hz, mask))
+}
+
+fn invariant_tsc() -> bool {
+    let (max, _, _, _) = crate::x86::cpuid(0x8000_0000);
+    max >= 0x8000_0007 && crate::x86::cpuid(0x8000_0007).3 & (1 << 8) != 0
+}
+
+/// A hypervisor owns the virtual CPU's TSC and this kernel runs only one CPU,
+/// so there is neither package skew nor migration between counters. Calibrate
+/// it against HPET just like an invariant hardware TSC, even when the virtual
+/// CPU model neglects to advertise CPUID.80000007H:EDX.invariant_tsc.
+fn stable_tsc() -> bool {
+    invariant_tsc() || crate::x86::cpuid(1).2 & (1 << 31) != 0
+}
+
+fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
+    if let Some((hpet_hz, mask)) = hpet {
+        let window = (hpet_hz / 100).max(1);
+        let h0 = hpet_counter(mask);
+        let t0 = crate::x86::rdtsc();
+        let h1 = loop {
+            let h = hpet_counter(mask);
+            if h.wrapping_sub(h0) & mask >= window { break h; }
+        };
+        let t1 = crate::x86::rdtsc();
+        let elapsed = h1.wrapping_sub(h0) & mask;
+        return (elapsed != 0).then(||
+            (u128::from(t1.wrapping_sub(t0)) * u128::from(hpet_hz)
+                / u128::from(elapsed)) as u64);
+    }
+
+    // No HPET: channel 2 still provides a fixed calibration interval. The
+    // 10 ms window is well below its 54.9 ms wrap, so modular subtraction is
+    // unambiguous even when the initial count is near zero.
+    let window = (PIT_INPUT_HZ / 100) as u16;
+    let p0 = pit2_count();
+    let t0 = crate::x86::rdtsc();
+    let p1 = loop {
+        let p = pit2_count();
+        if p0.wrapping_sub(p) >= window { break p; }
+    };
+    let t1 = crate::x86::rdtsc();
+    let elapsed = u64::from(p0.wrapping_sub(p1));
+    (elapsed != 0).then(||
+        (u128::from(t1.wrapping_sub(t0)) * u128::from(PIT_INPUT_HZ)
+            / u128::from(elapsed)) as u64)
+}
+
+fn init_monotonic_clock() {
+    init_pit2_clock();
+    let hpet = init_hpet();
+    let tsc_hz = stable_tsc().then(|| calibrate_tsc(hpet)).flatten();
+    let (source, hz) = if let Some(hz) = tsc_hz.filter(|&hz| hz != 0) {
+        (ClockSource::Tsc, hz)
+    } else if let Some((hz, _)) = hpet {
+        (ClockSource::Hpet, hz)
+    } else {
+        (ClockSource::Pit2, PIT_INPUT_HZ)
+    };
+    unsafe {
+        CLOCK = Clock {
+            source,
+            ns_mult: ((u128::from(1_000_000_000u64) << NS_SHIFT) / u128::from(hz)) as u64,
+            epoch: 0,
+            hpet_hz: hpet.map_or(0, |(hpet_hz, _)| hpet_hz),
+            hpet_mask: hpet.map_or(0, |(_, mask)| mask),
+        };
+    }
+    let _ = now(true);
+    lib::println!("Clock: {} {} Hz", match source {
+        ClockSource::Tsc => "stable TSC",
+        ClockSource::Hpet => "HPET",
+        ClockSource::Pit2 => "PIT channel 2",
+        ClockSource::Uninitialized => "uninitialized",
+    }, hz);
+}
+
 /// Measure the LAPIC timer input frequency against the HPET (a fixed,
 /// self-describing clock) and return the periodic initial-count for ~1000 Hz.
 /// Returns None when no usable HPET is present (then there is no fixed
 /// reference and the caller falls back to the PIT).
 fn calibrate_lapic_via_hpet() -> Option<u32> {
-    map_mmio_page(HPET_MMIO_VA, HPET_PHYS);
-    let hpet_read = |off: usize| -> u64 {
-        unsafe { core::ptr::read_volatile((HPET_MMIO_VA + off) as *const u64) }
-    };
-    // GEN_CAP_ID[63:32] = main-counter period in femtoseconds. A valid HPET
-    // period is non-zero and at most 100 ns (10 MHz minimum per the spec).
-    let period_fs = (hpet_read(0x00) >> 32) as u32;
-    if period_fs == 0 || period_fs > 100_000_000 {
-        return None;
-    }
-    let hpet_hz = 1_000_000_000_000_000u64 / period_fs as u64;
-    // Enable the HPET main counter (GEN_CONF bit 0).
-    let conf = hpet_read(0x10);
-    unsafe { core::ptr::write_volatile((HPET_MMIO_VA + 0x10) as *mut u64, conf | 1); }
+    let clock = unsafe { CLOCK };
+    let hpet_hz = clock.hpet_hz;
+    let counter_mask = clock.hpet_mask;
+    if hpet_hz == 0 { return None; }
 
     // One-shot, divide-by-1, masked, max count — just a free-running down-counter.
     lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
@@ -255,15 +416,15 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
 
     // Count LAPIC ticks over a 10 ms HPET window.
     let window = hpet_hz / 100;
-    let t0 = hpet_read(0xF0);
+    let t0 = hpet_counter(counter_mask);
     let c0 = lapic_read(LAPIC_CUR_COUNT);
-    while hpet_read(0xF0).wrapping_sub(t0) < window {}
+    while (hpet_counter(counter_mask).wrapping_sub(t0) & counter_mask) < window {}
     let c1 = lapic_read(LAPIC_CUR_COUNT);
-    let t1 = hpet_read(0xF0);
+    let t1 = hpet_counter(counter_mask);
     lapic_write(LAPIC_INIT_COUNT, 0); // stop
 
     let elapsed = c0.wrapping_sub(c1); // counts down
-    let hpet_elapsed = t1.wrapping_sub(t0);
+    let hpet_elapsed = t1.wrapping_sub(t0) & counter_mask;
     if elapsed == 0 || hpet_elapsed == 0 {
         return None;
     }
@@ -449,6 +610,7 @@ fn i8042_present() -> bool {
 pub fn init_interrupts() {
     lib::println!("IRQ: PIC");
     remap_pic();
+    init_monotonic_clock();
 
     // Pick the interrupt mode ONCE: LAPIC timer succeeds ⇒ APIC mode (IOAPIC
     // routes device IRQs, LAPIC EOI); else the legacy 8259 path (PIT tick, PIC
@@ -729,12 +891,12 @@ pub fn handle_irq(regs: &mut Regs) {
         }
         match irq {
             0 => {
-                unsafe {
-                    let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
-                    core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
-                    let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
-                    core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
+                // The interrupt is a wakeup, not a unit of time. Extend the
+                // fallback clock while we are guaranteed to run at 1 kHz.
+                if matches!(unsafe { CLOCK.source }, ClockSource::Pit2) {
+                    let _ = now(false);
                 }
+                unsafe { queue_irq0_wakeup(); }
                 // Poll the USB-HID keyboard (if any) into the same key queue.
                 crate::xhci::poll();
             }
@@ -776,13 +938,11 @@ pub fn handle_irq(regs: &mut Regs) {
     // path re-arms the line.
     let event = match irq {
         0 => {
-            unsafe {
-                let t = core::ptr::read_volatile(&raw const TIMER_TICKS);
-                core::ptr::write_volatile(&raw mut TIMER_TICKS, t + 1);
-                let p = core::ptr::read_volatile(&raw const PENDING_TICKS);
-                core::ptr::write_volatile(&raw mut PENDING_TICKS, p + 1);
+            if matches!(unsafe { CLOCK.source }, ClockSource::Pit2) {
+                let _ = now(false);
             }
-            None // ticks use PENDING_TICKS counter, not the queue
+            unsafe { queue_irq0_wakeup(); }
+            None // the IRQ merely returns control to the event loop
         }
         1 => Some(Irq::Key(inb(0x60))),
         12 => mouse_packet_byte(inb(0x60)),
@@ -872,9 +1032,78 @@ pub fn route_isa_irq(line: u8) {
     }
 }
 
-/// Get timer ticks
-pub fn get_ticks() -> u64 {
-    unsafe { core::ptr::read_volatile(&raw const TIMER_TICKS) }
+/// High-resolution monotonic time in nanoseconds. TSC and HPET have no IRQ-side
+/// writer; only PIT2 shares extension state with IRQ0 and needs the single-CPU
+/// interrupt-masked critical section.
+pub fn now(init: bool) -> u64 {
+    static mut PIT2_LAST_COUNT: u16 = 0;
+    static mut PIT2_CYCLES: u64 = 0;
+    static mut HPET_LAST_COUNTER: u64 = 0;
+    static mut HPET_CYCLES: u64 = 0;
+
+    let clock = unsafe { CLOCK };
+    if init {
+        unsafe {
+            match clock.source {
+                ClockSource::Tsc => CLOCK.epoch = crate::x86::rdtsc(),
+                ClockSource::Hpet if clock.hpet_mask == u64::MAX =>
+                    CLOCK.epoch = hpet_counter(clock.hpet_mask),
+                ClockSource::Hpet => {
+                    HPET_LAST_COUNTER = hpet_counter(clock.hpet_mask);
+                    HPET_CYCLES = 0;
+                }
+                ClockSource::Pit2 => {
+                    PIT2_LAST_COUNT = pit2_count();
+                    PIT2_CYCLES = 0;
+                }
+                ClockSource::Uninitialized => {}
+            }
+        }
+        return 0;
+    }
+
+    let ticks = match clock.source {
+        ClockSource::Tsc => crate::x86::rdtsc().wrapping_sub(clock.epoch),
+        ClockSource::Hpet if clock.hpet_mask == u64::MAX =>
+            hpet_counter(clock.hpet_mask).wrapping_sub(clock.epoch),
+        ClockSource::Hpet => unsafe {
+            let count = hpet_counter(clock.hpet_mask);
+            let elapsed = count.wrapping_sub(HPET_LAST_COUNTER) & clock.hpet_mask;
+            HPET_LAST_COUNTER = count;
+            HPET_CYCLES = HPET_CYCLES.wrapping_add(elapsed);
+            HPET_CYCLES
+        },
+        ClockSource::Pit2 => {
+            let restore_if = crate::x86::interrupts_enabled();
+            crate::x86::cli();
+            let count = pit2_count();
+            let total = unsafe {
+                let elapsed = PIT2_LAST_COUNT.wrapping_sub(count) as u64;
+                PIT2_LAST_COUNT = count;
+                PIT2_CYCLES = PIT2_CYCLES.wrapping_add(elapsed);
+                PIT2_CYCLES
+            };
+            if restore_if { crate::x86::sti(); }
+            total
+        }
+        ClockSource::Uninitialized => 0,
+    };
+    mul_u64_u64_shr32(ticks, clock.ns_mult)
+}
+
+/// Low 64 bits of `(a * b) >> 32`, using only the i686 CPU's native
+/// 32x32->64 multiply. Expressing this as `u128` pulls a general wide-multiply
+/// routine into every `now()` call and is prohibitively expensive under TCG.
+#[inline]
+fn mul_u64_u64_shr32(a: u64, b: u64) -> u64 {
+    let a0 = u64::from(a as u32);
+    let a1 = a >> 32;
+    let b0 = u64::from(b as u32);
+    let b1 = b >> 32;
+    (a0 * b0 >> 32)
+        .wrapping_add(a0 * b1)
+        .wrapping_add(a1 * b0)
+        .wrapping_add((a1 * b1) << 32)
 }
 
 /// Feed one byte from the 8042 AUX data port into the 3-byte PS/2 packet

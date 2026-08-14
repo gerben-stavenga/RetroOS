@@ -1177,11 +1177,11 @@ fn dec_rep_count(regs: &mut Regs, addr32: bool) {
 /// is separate from `queue_irq` (which runs inside the input-queue drain, where
 /// `machine` is borrowed). Edge-triggered: the IRR coalesces repeated ticks into
 /// one pending line, so a slow guest loses ticks rather than flooding.
-pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
-    if pc.vpit.take_pending_irqs(machine) > 0 {
+pub fn queue_tick(pc: &mut PcMachine, now_ticks: u64) {
+    if pc.vpit.take_pending_irqs(now_ticks) > 0 {
         pc.vpic.raise(0);
     }
-    if pc.vrtc.take_pending_irqs(machine) > 0 {
+    if pc.vrtc.take_pending_irqs(now_ticks) > 0 {
         pc.vpic.raise(8);
     }
     // The 8042's serial clock: surface at most one queued scancode per
@@ -1190,7 +1190,7 @@ pub fn queue_tick<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     // not a reliable measure under heavy loads"): if the host deschedules us
     // mid-INT 9 for longer than the pacing period, the next byte must still
     // wait — a byte surfacing mid-handler is exactly the lost-release bug.
-    if !pc.vpic.in_service(1) && pc.vkbd.try_surface(machine.get_ticks()) {
+    if !pc.vpic.in_service(1) && pc.vkbd.try_surface(now_ticks) {
         pc.vpic.raise(1);
     }
 }
@@ -1250,7 +1250,12 @@ impl PcmSource<'_> {
 /// clock here once stamped a program's first notes seconds ahead, the GM
 /// start delay). Called on every event-loop slice, including the ticks==0
 /// fast path that skips the pump entirely.
-pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed: u64) {
+pub fn audio_service<A: crate::Arch>(
+    machine: &mut A,
+    pc: &mut PcMachine,
+    now_ticks: u64,
+    pushed: u64,
+) {
     let PcMachine { sb, gus, mpu, vpic, .. } = pc;
     let prof = crate::kernel::startup::profile_enabled();
     let t0 = if prof { machine.rdtsc() } else { 0 };
@@ -1259,10 +1264,10 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed
     let SoundBlaster { blaster, device } = sb;
     if let SbDevice::Emulated(emu) = device {
         emu.deliver_trigger_irq(vpic, blaster.irq);
-        emu.deliver_probe_irq(machine, vpic, blaster.irq);
+        emu.deliver_probe_irq(now_ticks, vpic, blaster.irq);
     }
     let t1 = if prof { machine.rdtsc() } else { 0 };
-    gus.tick(machine, vpic);
+    gus.tick(now_ticks, vpic);
     let t2 = if prof { machine.rdtsc() } else { 0 };
     mpu.tick(machine, pushed);
     if prof {
@@ -1276,6 +1281,7 @@ pub fn audio_service<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, pushed
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
     pc: &mut PcMachine,
+    now_ticks: u64,
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
     let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
@@ -1313,7 +1319,7 @@ pub fn audio_tick<A: crate::Arch>(
     }
 
     if let Some(emu) = sb {
-        emu.dsp_clock_tick(machine, vpic, sb_irq);
+        emu.dsp_clock_tick(machine, now_ticks, vpic, sb_irq);
     }
     gus.deliver_events(vpic);
 }
@@ -1337,10 +1343,6 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             // as on real hardware.
             pc.vkbd.push(sc);
         }
-        // Ticks carry no host payload and need the machine timer, so they come
-        // through `queue_tick` (which has `&mut machine`), never here — the
-        // input-queue drain only ever delivers Key/Mouse events.
-        Irq::Tick => {}
         Irq::Mouse { dx, dy, buttons } => {
             // No physical mouse hardware is modelled (no PS/2 ports, no
             // IRQ 12 line) and every DOS program reaches the mouse through

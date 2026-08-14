@@ -219,7 +219,10 @@ impl VirtualPit {
     }
 
     fn sync<A: crate::Arch>(&mut self, machine: &mut A) {
-        let now = machine.get_ticks();
+        self.sync_at(machine.get_ticks());
+    }
+
+    fn sync_at(&mut self, now: u64) {
         let delta_ticks = now.saturating_sub(self.last_host_tick);
         if delta_ticks == 0 {
             return;
@@ -269,8 +272,8 @@ impl VirtualPit {
         self.ch2.output(self.input_cycles)
     }
 
-    pub fn take_pending_irqs<A: crate::Arch>(&mut self, machine: &mut A) -> u32 {
-        self.sync(machine);
+    pub fn take_pending_irqs(&mut self, now_ticks: u64) -> u32 {
+        self.sync_at(now_ticks);
         self.ch0.take_irqs(self.input_cycles)
     }
 
@@ -285,4 +288,3 @@ impl VirtualPit {
         )
     }
 }
-

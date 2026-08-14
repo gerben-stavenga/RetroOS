@@ -2,7 +2,9 @@
 //! analogue of `kernel/src/arch/x86.rs` + the timer/IRQ bits of `irq.rs`.
 
 use arch_abi::Irq;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "tcg")]
+use core::sync::atomic::AtomicU64;
 
 /// FPU/SSE save area. Same 512-byte FXSAVE-shaped blob the kernel saves and
 /// restores opaquely. On the interpreter the live FPU state lives inside the
@@ -92,12 +94,10 @@ pub fn halt_forever() -> ! {
 
 // ── Timer / IRQ queue ────────────────────────────────────────────────────
 //
-// On metal `get_ticks` reads `TIMER_TICKS`, a 1 kHz counter the real PIT ISR
-// bumps; `take_pending_ticks` reports how many of those host ticks the event
-// loop hasn't consumed. The virtual PIT (`vpit.rs`) and RTC (`vrtc.rs`) read
-// `get_ticks` to compute elapsed input cycles, so the guest sees IRQ0 at its
-// programmed rate (18.2 Hz by default) and the BIOS INT 8 stub (`calls.rs`)
-// advances `0040:006C`.
+// Every backend exposes one high-resolution monotonic `now()`. Periodic timer
+// delivery merely returns control to the kernel; the event loop derives elapsed
+// time from consecutive samples. The virtual PIT and RTC retain a millisecond
+// compatibility view while their internal contracts are migrated.
 //
 // The interpreter has no PIT ISR. We must NOT derive this clock from wall time:
 // the interpreter runs the guest at full host speed (hundreds of MIPS) with no
@@ -133,11 +133,12 @@ pub fn advance_virtual_time(instructions: u64) {
     VIRT_CYCLES.fetch_add(instructions, Ordering::Relaxed);
 }
 
-/// Guest-perceived milliseconds — the interpreter's 1 kHz host tick clock,
-/// derived from retired instructions.
+/// High-resolution deterministic time derived directly from retired guest
+/// instructions. The rational conversion avoids quantizing TCG to 1 ms.
 #[cfg(feature = "tcg")]
-pub fn get_ticks() -> u64 {
-    VIRT_CYCLES.load(Ordering::Relaxed) / VIRT_INSTR_PER_MS
+pub fn now() -> u64 {
+    let cycles = VIRT_CYCLES.load(Ordering::Relaxed);
+    (u128::from(cycles) * 1_000_000 / u128::from(VIRT_INSTR_PER_MS)) as u64
 }
 
 /// Guest-perceived milliseconds on the KVM engine: real elapsed time. The
@@ -147,18 +148,10 @@ pub fn get_ticks() -> u64 {
 /// counts real milliseconds; DOS calibration loops behave as on real (fast)
 /// hardware.
 #[cfg(feature = "kvm")]
-pub fn get_ticks() -> u64 {
+pub fn now() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
-}
-
-/// Host ticks (ms) elapsed since the previous call. Drives the event loop's
-/// `Irq::Tick` pump; the vpit coalesces a burst into one pending IRQ0.
-pub fn take_pending_ticks() -> u32 {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = get_ticks();
-    let last = LAST.swap(now, Ordering::Relaxed);
-    now.saturating_sub(last).min(64) as u32
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos()
+        .min(u128::from(u64::MAX)) as u64
 }
 
 // Host-posted input events (keyboard, …) awaiting delivery to the kernel event

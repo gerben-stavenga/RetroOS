@@ -84,8 +84,7 @@ impl Arch for Interp {
     }
 
     // ── Timer ──
-    fn get_ticks(&self) -> u64 { crate::machine::get_ticks() }
-    fn take_pending_ticks(&mut self) -> u32 { crate::machine::take_pending_ticks() }
+    fn now(&self) -> u64 { crate::machine::now() }
     fn drain(&mut self, f: &mut dyn FnMut(Irq)) { crate::machine::drain(f) }
     fn rdtsc(&self) -> u64 { crate::machine::rdtsc() }
 

@@ -671,7 +671,6 @@ impl KernelEvent {
 /// Typed IRQ event. Each hardware IRQ captures its data and pushes one of these.
 #[derive(Clone, Copy)]
 pub enum Irq {
-    Tick,
     Key(u8), // raw PS/2 scancode (press and release)
     /// One PS/2 mouse motion/button packet decoded into deltas + button mask.
     /// `dx` / `dy` are signed motion since the previous packet (PS/2 reports
@@ -679,9 +678,8 @@ pub enum Irq {
     /// bit 1 right, bit 2 middle. Consumer is responsible for accumulating
     /// position and clamping to a screen range.
     Mouse { dx: i16, dy: i16, buttons: u8 },
-    /// Any other unmasked hardware IRQ line, forwarded raw. Arch stays
-    /// policy-free — the kernel decides if it's a device it owns and when
-    /// the line can be rearmed after the guest-visible device ack.
+    /// An unmasked hardware IRQ line. IRQ0 is the kernel clock-resample
+    /// wakeup; other lines are forwarded to their device owner.
     Hw(u8),
     /// A message-signalled interrupt allocated by [`Arch::msi_alloc`].
     ///

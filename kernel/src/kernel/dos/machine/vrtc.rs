@@ -111,7 +111,7 @@ impl VirtualRtc {
     /// enabled. When non-zero it latches PF/IRQF for the next reg C read. Like
     /// the PIT, repeated intervals coalesce into a single edge at the vPIC — a
     /// slow guest loses intervals rather than flooding, matching real hardware.
-    pub fn take_pending_irqs<A: crate::Arch>(&mut self, machine: &mut A) -> u32 {
+    pub fn take_pending_irqs(&mut self, now: u64) -> u32 {
         if self.reg_b & 0x40 == 0 {
             return 0; // PIE disabled
         }
@@ -119,7 +119,6 @@ impl VirtualRtc {
         if hz == 0 {
             return 0;
         }
-        let now = machine.get_ticks();
         let delta = now.saturating_sub(self.last_host_tick);
         if delta == 0 {
             return 0;

@@ -207,10 +207,13 @@ pub trait Arch: Sized + GuestBytes {
 
     // ── Timer ──────────────────────────────────────────────────────────────
 
-    /// Monotonic tick count (PIT/virtual time).
-    fn get_ticks(&self) -> u64;
-    /// Consume and return ticks accumulated since the last call.
-    fn take_pending_ticks(&mut self) -> u32;
+    /// Monotonic time in nanoseconds. The periodic timer is only a wakeup: it
+    /// forces `execute` to return, while this clock remains the sole authority
+    /// for how much time elapsed.
+    fn now(&self) -> u64;
+    /// Millisecond compatibility view for devices not yet converted to the
+    /// high-resolution timeline.
+    fn get_ticks(&self) -> u64 { self.now() / 1_000_000 }
     /// Drain queued hardware-IRQ events, calling `f` for each.
     fn drain(&mut self, f: &mut dyn FnMut(Irq));
     /// Read the CPU timestamp counter.

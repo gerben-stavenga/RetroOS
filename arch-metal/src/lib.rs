@@ -143,7 +143,7 @@ pub fn halt_forever() -> ! {
 pub use x86::{inb, outb, inw, outw, inl, outl, insw, outsw};
 pub use x86::rdtsc;
 pub use x86::{FxState, clean_fx_template};
-pub use irq::{get_ticks, take_pending_ticks, drain};
+pub use irq::{now, drain};
 
 /// Assert/deassert the CPU INTR line from the virtual PIC. On metal the real
 /// 8259 drives INTR in hardware, so this is a no-op; the interpreter backend

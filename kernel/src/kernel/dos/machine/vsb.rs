@@ -544,13 +544,13 @@ impl EmulatedSb {
     /// Complete a single-cycle transfer too short for the pump clock to see
     /// (see the card's `take_probe`), on the slice alongside 0xF2's latched
     /// trigger IRQ.
-    pub fn deliver_probe_irq<A: crate::Arch>(
+    pub fn deliver_probe_irq(
         &mut self,
-        machine: &mut A,
+        now_ticks: u64,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
-        if self.core.take_probe(machine.get_ticks()) && !vpic.is_requested(irq) {
+        if self.core.take_probe(now_ticks) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
     }
@@ -623,12 +623,12 @@ impl EmulatedSb {
     pub fn dsp_clock_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
+        now_ticks: u64,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
-        let now = machine.get_ticks();
         let produced = self.mix_pos_q32 >> 32;
-        if self.core.advance_clock(now, produced) && !vpic.is_requested(irq) {
+        if self.core.advance_clock(now_ticks, produced) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and

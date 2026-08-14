@@ -89,7 +89,7 @@ fn init() -> KvmCpu {
 /// THIS thread (SIGEV_THREAD_ID) with SIGURG. The handler is a no-op installed
 /// WITHOUT SA_RESTART, so a signal landing during `KVM_RUN` bounces the ioctl
 /// out with EINTR — the engine returns `KernelEvent::Irq` and the kernel pumps
-/// its timer from `get_ticks()` deltas. A signal landing while host code runs
+/// its timer from monotonic `now()` deltas. A signal landing while host code runs
 /// is consumed harmlessly (nothing is lost: ticks are derived from elapsed
 /// time, not from counting kicks). 1 ms matches metal's 1 kHz PIT grid.
 fn arm_timer_kick() {

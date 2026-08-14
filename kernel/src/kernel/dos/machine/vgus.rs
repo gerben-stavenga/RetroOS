@@ -123,12 +123,12 @@ impl Gus {
     /// clock for its rate timers, then assert the line for the one-shot
     /// sources (timer expiry, DMA terminal count). Playback runs through the
     /// mixer pump (the common PCM-source path).
-    pub fn tick<A: crate::Arch>(
+    pub fn tick(
         &mut self,
-        machine: &mut A,
+        now_ticks: u64,
         vpic: &mut super::vpic::VirtualPic,
     ) {
-        self.card.tick(machine.get_ticks());
+        self.card.tick(now_ticks);
         if self.card.take_irq() {
             self.raise(vpic);
         }

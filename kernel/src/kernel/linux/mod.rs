@@ -2228,7 +2228,7 @@ fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThrea
     }
 }
 
-/// clock_gettime(265) — monotonic from tick counter
+/// clock_gettime(265) — monotonic from the backend clock
 fn sys_clock_gettime<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
     let _clock_id = a.a0 as u32;
     let tp = a.a1 as usize;

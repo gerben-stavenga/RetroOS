@@ -1281,8 +1281,8 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
 /// a period boundary. Separate from `queue_irq` because the tick queries
 /// `machine` (it has no host payload), and `queue_irq` runs inside the input
 /// drain where `machine` is already borrowed.
-pub fn queue_tick<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
-    machine::queue_tick(machine, &mut dos.pc);
+pub fn queue_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, now_ticks: u64) {
+    machine::queue_tick(&mut dos.pc, now_ticks);
 }
 
 /// Render the emulated VGA to the platform display (no-op with a real card
@@ -1303,9 +1303,10 @@ pub fn display_tick<A: crate::Arch>(
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
+    now_ticks: u64,
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
-    machine::audio_tick(machine, &mut dos.pc, span);
+    machine::audio_tick(machine, &mut dos.pc, now_ticks, span);
 }
 
 /// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
@@ -1313,9 +1314,10 @@ pub fn audio_tick<A: crate::Arch>(
 pub fn audio_service<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
+    now_ticks: u64,
     pushed: u64,
 ) {
-    machine::audio_service(machine, &mut dos.pc, pushed);
+    machine::audio_service(machine, &mut dos.pc, now_ticks, pushed);
 }
 
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery

@@ -319,6 +319,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn advance_world(
         &mut self,
         machine: &mut A,
+        now_ticks: u64,
         ticks: u32,
         audio_pushed: u64,
     ) {
@@ -336,12 +337,12 @@ impl<A: crate::Arch> Personality<A> {
                 // floor loses it — 35e3b27, regressed once by a full
                 // early-out here).
                 if ticks == 0 {
-                    crate::kernel::dos::audio_service(machine, dos, audio_pushed);
+                    crate::kernel::dos::audio_service(machine, dos, now_ticks, audio_pushed);
                 } else {
                     for _ in 0..ticks {
-                        crate::kernel::dos::queue_tick(machine, dos);
+                        crate::kernel::dos::queue_tick(dos, now_ticks);
                     }
-                    crate::kernel::dos::audio_service(machine, dos, audio_pushed);
+                    crate::kernel::dos::audio_service(machine, dos, now_ticks, audio_pushed);
                 }
             }
             Self::Linux(_) => {}
@@ -356,10 +357,11 @@ impl<A: crate::Arch> Personality<A> {
     pub fn audio_tick(
         &mut self,
         machine: &mut A,
+        now_ticks: u64,
         span: crate::kernel::sound::AudioSpan<'_>,
     ) {
         match self {
-            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, span),
+            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, now_ticks, span),
             Self::Linux(_) => {}
         }
     }
@@ -371,12 +373,12 @@ impl<A: crate::Arch> Personality<A> {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         regs: &Regs,
+        now_ticks: u64,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
         crate::kernel::osd::with_display(|external| match self {
             Self::Dos(dos) => {
-                let now_ticks = machine.get_ticks();
                 crate::kernel::dos::display_tick(
                     machine, bios, dos, regs, now_ticks, external);
             }

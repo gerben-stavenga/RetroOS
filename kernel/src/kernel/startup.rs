@@ -716,8 +716,12 @@ pub fn event_loop<A: crate::Arch>(
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
-    let mut last_event_drain_tick = u64::MAX;
     let mut last_osd_refresh_tick = u64::MAX;
+    let mut last_world_ns = machine.now();
+    let mut pending_world_ns = 0u64;
+    // Metal IRQ0 queues Irq::Hw(0); hosted KVM's timer signal returns
+    // KernelEvent::Irq. Either is only permission to resample the real clock.
+    let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
     // The machine's Sound Blaster lives in this frame for the loop's life,
@@ -732,7 +736,17 @@ pub fn event_loop<A: crate::Arch>(
     loop {
         stats.slice_begin(machine);
         stats.iteration(machine);
-        let now_tick = machine.get_ticks();
+        let mut events = crate::kernel::irq_dispatch::drain(machine);
+        stats.part(machine, 1);
+        let tick_wakeup = events.iter().any(|event| matches!(event, crate::Irq::Hw(0)));
+        events.retain(|event| !matches!(event, crate::Irq::Hw(0)));
+        let world_now_ns = if tick_wakeup || irq_clock_wakeup {
+            irq_clock_wakeup = false;
+            machine.now()
+        } else {
+            last_world_ns
+        };
+        let now_tick = world_now_ns / 1_000_000;
         // Keep the F12 switch picker's process list fresh while it is open,
         // but not on every port/interrupt exit: millisecond resolution is
         // ample for a menu and polling games can cross this loop hundreds of
@@ -742,34 +756,31 @@ pub fn event_loop<A: crate::Arch>(
             crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
         }
         stats.part(machine, 0);
-        // Kernel-owned device IRQs are serviced before virtual-time/audio
-        // advancement. Polling guests can cross this loop hundreds of times
-        // within one millisecond; the hardware queue only needs inspecting
-        // once on that same device cadence. This bounds keyboard/audio wakeup
-        // latency to 1 ms while avoiding a CLI/queue/STI round-trip per port.
-        let events = if now_tick != last_event_drain_tick {
-            last_event_drain_tick = now_tick;
-            crate::kernel::irq_dispatch::drain(machine)
-        } else {
-            alloc::vec::Vec::new()
-        };
-        stats.part(machine, 1);
-        let ticks = machine.take_pending_ticks();
+        // The queue is cheap to drain when empty and carries the IRQ0 wakeup
+        // which gates clock sampling, so it cannot itself be clock-gated.
+        pending_world_ns = pending_world_ns.saturating_add(
+            world_now_ns.saturating_sub(last_world_ns));
+        last_world_ns = world_now_ns;
+        // Bound one service pass while retaining both whole-millisecond
+        // backlog and the sub-millisecond remainder for following exits.
+        let ticks = (pending_world_ns / 1_000_000).min(64) as u32;
+        pending_world_ns -= u64::from(ticks) * 1_000_000;
         let thread = ctx.thread(threads);
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(machine, ticks, audio_clock.produced_frames());
+        thread.personality.advance_world(
+            machine, now_tick, ticks, audio_clock.produced_frames());
         if ticks != 0 {
             crate::kernel::sound::advance(
                 machine,
                 &mut audio_clock,
                 sink.as_deref_mut(),
                 ticks as u64,
-                |machine, span| thread.personality.audio_tick(machine, span),
+                |machine, span| thread.personality.audio_tick(machine, now_tick, span),
             );
             thread.personality.display_tick(
-                machine, &mut *bios_workspace, &ctx.regs,
+                machine, &mut *bios_workspace, &ctx.regs, now_tick,
             );
         }
         stats.part(machine, 2);
@@ -802,6 +813,11 @@ pub fn event_loop<A: crate::Arch>(
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine, &ctx.regs);
         let kevent = ctx.run(machine, &thread.personality);
+        if matches!(&kevent, crate::KernelEvent::Irq) {
+            // Hosted backends express their periodic preemption kick directly
+            // as KernelEvent::Irq rather than through the metal IRQ queue.
+            irq_clock_wakeup = true;
+        }
         stats.post_run(machine, &kevent, &ctx.regs);
         let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
         stats.after_dispatch(machine);
@@ -1821,6 +1837,9 @@ impl EventStats {
                 let dispatch = pct10(dispatch_total);
                 let irq_drain = pct10(self.pre_parts[1]);
                 let loop_pct = pct10(loop_total);
+                let clock_pct = pct10(self.pre_parts[0]);
+                let console_pct = pct10(self.pre_parts[3]);
+                let after_input_pct = pct10(self.pre_parts[4]);
                 let sched = pct10(scheduler_total);
                 let world = pct10(world_other);
                 let other_pct = pct10(other);
@@ -1830,6 +1849,11 @@ impl EventStats {
                     dispatch / 10, dispatch % 10, irq_drain / 10, irq_drain % 10,
                     loop_pct / 10, loop_pct % 10, sched / 10, sched % 10,
                     world / 10, world % 10, other_pct / 10, other_pct % 10);
+                crate::dbg_println!(
+                    "[prof] loop: clock={}.{}% console={}.{}% after-input={}.{}%",
+                    clock_pct / 10, clock_pct % 10,
+                    console_pct / 10, console_pct % 10,
+                    after_input_pct / 10, after_input_pct % 10);
                 let scanout = pct10(dp[0]);
                 let render = pct10(dp[2]);
                 let present = pct10(dp[3]);
