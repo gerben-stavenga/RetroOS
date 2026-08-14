@@ -550,9 +550,12 @@ pub fn syscall<A: crate::Arch>(
 pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, addr: u32) -> bool {
     // The Voodoo's aperture is trapped the same way, through the same decoder
     // — a different window and a different device behind it, nothing else.
-    if let Some(off) = dos.pc.voodoo.aperture_offset(addr) {
+    if let Some(off) = dos.pc.voodoo.as_ref()
+        .and_then(|voodoo| voodoo.aperture_offset(addr))
+    {
         let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-        let mut target = machine::mmio::MmioTarget::Voodoo(&mut dos.pc.voodoo);
+        let voodoo = dos.pc.voodoo.as_mut().unwrap();
+        let mut target = machine::mmio::MmioTarget::Voodoo(voodoo);
         return machine::mmio::handle_mmio_fault(
             machine, regs, &mut target, cs_base, def32, ds_base, es_base, off,
         );
@@ -1672,6 +1675,6 @@ fn log_pm_gp<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) {
     crate::println!(
         "[#GP] es={:04x} base={:#x} limit={:#x} | ss={:04x} base={:#x} limit={:#x} | voodoo aperture={:x?}",
         regs.es as u16, es_b, es_l, regs.stack_seg(), ss_b, ss_l,
-        dos.pc.voodoo.linear_base
+        dos.pc.voodoo.as_ref().and_then(|voodoo| voodoo.linear_base)
     );
 }

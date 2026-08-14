@@ -225,6 +225,17 @@ impl VVoodoo {
         self.frame_ready = false;
     }
 
+    pub fn scanout_raw(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
+        self.flush();
+        self.card.render_raw(&self.fb, dac, out, pitch);
+        self.frame_ready = false;
+    }
+
+    pub fn vbe_ramp(&mut self, out: &mut [u8; 256 * 4]) -> u64 {
+        self.flush();
+        self.card.vbe_ramp(out)
+    }
+
     /// Which region an aperture offset addresses, for logging and for the
     /// LFB fast path when it lands.
     pub fn is_register(&self, off: u32) -> bool {

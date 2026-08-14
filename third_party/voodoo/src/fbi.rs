@@ -241,7 +241,10 @@ impl Fbi {
     /// per visible line at `out_pitch` BYTES, exactly as the RAMDAC would clock
     /// them at the monitor. Nothing downstream has to know a pixel format: the
     /// gamma CLUT and the encoding are folded into one component ramp per
-    /// channel first, so the inner loop is three table reads and a store.
+    /// channel first, so the inner loop is three table reads and one four-byte
+    /// store. For 16/24-bit destinations the following pixel overwrites the
+    /// surplus bytes; the caller provides three writable padding bytes after
+    /// the logical frame for the final pixel.
     pub fn scanout(&self, fb: &[u8], clut: &Clut, dac: &Dac, out: &mut [u8], out_pitch: usize) {
         let base = self.rgboffs[self.frontbuf as usize];
         if base == NO_BUFFER {
@@ -253,7 +256,7 @@ impl Fbi {
         for y in 0..self.height as usize {
             let src = base as usize + y * self.rowpixels as usize * 2;
             let dst = y * out_pitch;
-            if dst + width * step > out.len() {
+            if width != 0 && dst + (width - 1) * step + 4 > out.len() {
                 break;
             }
             for x in 0..width {
@@ -266,8 +269,13 @@ impl Fbi {
                 let enc = ramp.r[((p >> 11) & 0x1f) as usize]
                     | ramp.g[((p >> 5) & 0x3f) as usize]
                     | ramp.b[(p & 0x1f) as usize];
-                let bytes = enc.to_le_bytes();
-                out[dst + x * step..dst + (x + 1) * step].copy_from_slice(&bytes[..step]);
+                // The destination can be unaligned (notably 24bpp). Writing
+                // the complete packed table value avoids a dynamic 2/3/4-byte
+                // slice copy in the hottest scanout loop.
+                unsafe {
+                    (out.as_mut_ptr().add(dst + x * step) as *mut u32)
+                        .write_unaligned(enc.to_le());
+                }
             }
         }
     }
@@ -369,6 +377,7 @@ pub struct Clut {
     entries: [u32; 33],
     /// Set while the CLUT is the identity, which lets scanout skip it.
     identity: bool,
+    generation: u64,
 }
 
 impl Default for Clut {
@@ -385,7 +394,7 @@ impl Clut {
             *e = (v << 16) | (v << 8) | v;
         }
         entries[32] = 0x00ff_ffff;
-        Self { entries, identity: true }
+        Self { entries, identity: true, generation: 0 }
     }
 
     /// `reg_clut_w` — index in bits 24-31, colour in the low 24.
@@ -394,6 +403,23 @@ impl Clut {
         if index <= 32 {
             self.entries[index] = data & 0xff_ffff;
             self.identity = false;
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
+    pub fn generation(&self) -> u64 { self.generation }
+
+    /// Expand the SST-1's 33 control points into VBE 4F09h's 256-entry
+    /// B,G,R,reserved direct-colour ramp.
+    pub fn vbe_ramp(&self, out: &mut [u8; 256 * 4]) {
+        for (v, entry) in out.chunks_exact_mut(4).enumerate() {
+            let v = v as u32;
+            entry.copy_from_slice(&[
+                self.component(v, 0) as u8,
+                self.component(v, 8) as u8,
+                self.component(v, 16) as u8,
+                0,
+            ]);
         }
     }
 

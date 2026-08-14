@@ -283,11 +283,14 @@ fn frame_due(now_ticks: u64, hz: u64) -> bool {
 }
 
 /// Use the allocation-free `Vec<u32>` frame store as packed 16/24/32-bit
-/// storage. The extra bytes in the final word are outside the returned frame.
+/// storage. Voodoo scanout deliberately stores four bytes per pixel even for
+/// 16/24-bit destinations: the following pixel overwrites the surplus, and
+/// these three writable padding bytes receive the final pixel's tail.
 fn packed_frame(storage: &mut alloc::vec::Vec<u32>, bytes: usize) -> &mut [u8] {
-    storage.resize(bytes.div_ceil(4), 0);
+    let padded = bytes + 3;
+    storage.resize(padded.div_ceil(4), 0);
     unsafe {
-        core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, bytes)
+        core::slice::from_raw_parts_mut(storage.as_mut_ptr() as *mut u8, padded)
     }
 }
 
@@ -339,21 +342,24 @@ fn voodoo_display_tick<A: crate::Arch>(
     now_ticks: u64,
     external: Option<&mut crate::kernel::display::Display>,
 ) -> bool {
-    if !pc.voodoo.active() {
+    let Some(voodoo) = pc.voodoo.as_mut() else {
+        return false;
+    };
+    if !voodoo.active() {
         return false;
     }
     // 60 Hz, the refresh Glide programs for every resolution we serve.
     let refresh_due = frame_due(now_ticks, 60);
     if refresh_due {
-        pc.voodoo.vblank();
+        voodoo.vblank();
     }
     // A newly opened or edited OSD must repaint even when the guest is
     // sitting on a completed front buffer and no longer swapping.
     let osd_open = crate::kernel::osd::is_open();
-    if !pc.voodoo.frame_ready && !(osd_open && refresh_due) {
+    if !voodoo.frame_ready && !(osd_open && refresh_due) {
         return true;
     }
-    let (w, h) = pc.voodoo.dimensions();
+    let (w, h) = voodoo.dimensions();
     let (w, h) = (w as usize, h as usize);
     // Where the frame goes is the display's business, not the card's. On a
     // framebuffer the card clocks pixels straight out in the panel's own
@@ -381,14 +387,27 @@ fn voodoo_display_tick<A: crate::Arch>(
         }
 
         let dac = crate::kernel::display::dac_for(display.rgb);
+        let mut ramp = [0u8; 256 * 4];
+        let generation = voodoo.vbe_ramp(&mut ramp);
+        let hardware_gamma = display.program_voodoo_ramp(
+            machine, bios, generation, &mut ramp,
+        );
         let shadow_len = out_w * h * step;
         let shadow = packed_frame(&mut pc.present_fb, shadow_len);
         if out_w == w {
-            pc.voodoo.scanout(shadow, out_w * step, &dac);
+            if hardware_gamma {
+                voodoo.scanout_raw(shadow, out_w * step, &dac);
+            } else {
+                voodoo.scanout(shadow, out_w * step, &dac);
+            }
         } else {
             let native_len = w * h * step;
-            pc.present_scratch.resize(native_len, 0);
-            pc.voodoo.scanout(&mut pc.present_scratch, w * step, &dac);
+            pc.present_scratch.resize(native_len + 3, 0);
+            if hardware_gamma {
+                voodoo.scanout_raw(&mut pc.present_scratch, w * step, &dac);
+            } else {
+                voodoo.scanout(&mut pc.present_scratch, w * step, &dac);
+            }
             stretch_packed_rows(&pc.present_scratch, w, shadow, out_w, h, step);
         }
         display.present(machine, bios, h, shadow);
@@ -414,7 +433,9 @@ pub fn display_tick<A: crate::Arch>(
     // Do this only on the Native -> Emulated edge.  Once detached, the Display
     // remains beside the emulated VGA and both VGA and Voodoo can select it
     // without further firmware mode changes or ownership transactions.
-    if pc.voodoo.active() && matches!(pc.vga, DisplayedVga::Native(_)) {
+    if pc.voodoo.as_ref().is_some_and(|voodoo| voodoo.active())
+        && matches!(pc.vga, DisplayedVga::Native(_))
+    {
         let handoff = super::machine::vga::release_display(&mut pc.vga, machine, &mut *bios);
         let display = handoff.into_voodoo_surface(machine, &mut *bios);
         pc.vga.map(|vga| match vga {
@@ -436,6 +457,7 @@ pub fn display_tick<A: crate::Arch>(
         return;
     };
     let display = external.unwrap_or(owned_display);
+    display.restore_voodoo_ramp(machine, bios);
     let svga_start = match dev.resume {
         crate::kernel::bios_display::VideoResume::Vbe {
             mode, display_start: (x, y), logical_pitch, ..

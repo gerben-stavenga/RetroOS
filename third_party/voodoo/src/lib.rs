@@ -293,6 +293,21 @@ impl Voodoo {
         self.fbi.scanout(fb, &self.clut, dac, out, out_pitch);
     }
 
+    /// Scan out without applying the SST-1 CLUT. Used when a programmable
+    /// physical RAMDAC applies the expanded CLUT after reading the surface.
+    pub fn render_raw(&self, fb: &[u8], dac: &Dac, out: &mut [u8], out_pitch: usize) {
+        if fbiinit1_software_blank(self.reg[fbiInit1]) {
+            out.fill(0);
+            return;
+        }
+        self.fbi.scanout(fb, &Clut::new(), dac, out, out_pitch);
+    }
+
+    pub fn vbe_ramp(&self, out: &mut [u8; 256 * 4]) -> u64 {
+        self.clut.vbe_ramp(out);
+        self.clut.generation()
+    }
+
     /// The host tells the card a vertical retrace began. Returns the events
     /// it caused — a deferred `swapbufferCMD` completing, most of the time.
     pub fn vblank(&mut self) -> Events {

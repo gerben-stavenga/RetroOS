@@ -433,6 +433,29 @@ fn clut_recolours_scanout() {
         c.w(clutData, (i << 24) | (v << 16) | (v << 8) | v);
     }
     assert_eq!(c.frame()[0], 0x00_00_00_00, "white now scans out as black");
+
+    let mut ramp = [0u8; 256 * 4];
+    assert_eq!(c.v.vbe_ramp(&mut ramp), 33);
+    assert_eq!(&ramp[255 * 4..256 * 4], &[0, 0, 0, 0]);
+
+    let mut raw = vec![0u8; 640 * 480 * 4];
+    c.v.render_raw(&c.fb, &Dac::native(), &mut raw, 640 * 4);
+    assert_eq!(&raw[..4], &[0xff, 0xff, 0xff, 0]);
+}
+
+#[test]
+fn packed_rgb565_scanout_uses_padded_four_byte_stores() {
+    let mut c = Card::boot();
+    c.w(lfbMode, 0);
+    c.wa(LFB_APERTURE, 0xffff | (0xf800 << 16)); // white, red
+    let logical = 640 * 480 * 2;
+    let mut out = vec![0xaau8; logical + 3];
+    let rgb565 = Dac {
+        r: (11, 5), g: (5, 6), b: (0, 5), bytes: 2,
+    };
+    c.v.render(&c.fb, &rgb565, &mut out, 640 * 2);
+    assert_eq!(&out[..4], &[0xff, 0xff, 0x00, 0xf8]);
+    assert_eq!(&out[logical..], &[0, 0, 0xaa]);
 }
 
 /// Replay of what Glide's `test04` actually programs: a triangle whose top

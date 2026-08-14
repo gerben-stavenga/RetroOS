@@ -219,9 +219,9 @@ pub struct PcMachine {
     pub skip_irq: bool,
     pub e0_pending: bool,
     pub vga: DisplayedVga,
-    /// The 3dfx Voodoo board. Present in every machine but inert until a
-    /// guest finds it over PCI and maps its aperture.
-    pub voodoo: vvoodoo::VVoodoo,
+    /// The 3dfx Voodoo board. Native-BIOS machines expose it only when boot
+    /// discovery found a display mode capable of showing its output.
+    pub voodoo: Option<vvoodoo::VVoodoo>,
     /// Present-path scratch, owned so the frame path allocates NOTHING per
     /// frame. `scanout` copies the live aperture into `present_scratch` and
     /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
@@ -465,14 +465,16 @@ impl PcMachine {
         returned_linear: u32,
     ) {
         let voodoo_bar = vvoodoo::BAR_PHYS;
-        if (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical) {
+        if self.voodoo.is_some()
+            && (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical)
+        {
             machine.map_phys_range(
                 (virtual_base >> 12) as usize,
                 page_count as usize,
                 0,
                 arch_abi::MAP_MMIO,
             );
-            self.voodoo.linear_base = Some(returned_linear & !0xFFF);
+            self.voodoo.as_mut().unwrap().linear_base = Some(returned_linear & !0xFFF);
             return;
         }
 
@@ -563,7 +565,9 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).skip_irq).write(false);
             core::ptr::addr_of_mut!((*p).e0_pending).write(false);
             core::ptr::addr_of_mut!((*p).vga).write(vga);
-            core::ptr::addr_of_mut!((*p).voodoo).write(vvoodoo::VVoodoo::new());
+            let voodoo = crate::kernel::platform::get().voodoo_emulation
+                .then(vvoodoo::VVoodoo::new);
+            core::ptr::addr_of_mut!((*p).voodoo).write(voodoo);
             core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_scratch2)
@@ -948,7 +952,8 @@ fn pci_config_in(pc: &mut PcMachine, port: u16, size: u32) -> Option<u32> {
         0xCFC..=0xCFF => {
             let shift = (port - 0xCFC) as u32 * 8;
             let dword = match pci_addressed_device() {
-                Some(off) => pc.voodoo.config_read(off),
+                Some(off) => pc.voodoo.as_ref()
+                    .map_or(0xFFFF_FFFF, |voodoo| voodoo.config_read(off)),
                 // No device: the bus floats high, which is how a scan knows.
                 None => 0xFFFF_FFFF,
             };
@@ -966,16 +971,16 @@ fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
             true
         }
         0xCFC..=0xCFF => {
-            if let Some(off) = pci_addressed_device() {
+            if let (Some(off), Some(voodoo)) = (pci_addressed_device(), pc.voodoo.as_mut()) {
                 let shift = (port - 0xCFC) as u32 * 8;
                 if size == 4 && shift == 0 {
-                    pc.voodoo.config_write(off, val);
+                    voodoo.config_write(off, val);
                 } else {
                     // Sub-dword write: merge into the current value.
                     let width = size * 8;
                     let mask = if width >= 32 { !0 } else { ((1u32 << width) - 1) << shift };
-                    let cur = pc.voodoo.config_read(off);
-                    pc.voodoo.config_write(off, (cur & !mask) | ((val << shift) & mask));
+                    let cur = voodoo.config_read(off);
+                    voodoo.config_write(off, (cur & !mask) | ((val << shift) & mask));
                 }
             }
             true

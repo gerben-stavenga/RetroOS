@@ -1456,6 +1456,9 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
         linear_pitch: pitch,
         bits_per_pixel,
         format,
+        // The RAM-backed substitute surface has no independent output
+        // RAMDAC; Voodoo applies its CLUT while rendering into the host sink.
+        programmable_ramp: false,
         window_segment: 0xA000,
         window_granularity_kb: 64,
         window_size_kb: 64,

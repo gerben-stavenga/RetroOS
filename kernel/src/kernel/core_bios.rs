@@ -503,6 +503,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         // one DAC entry in DH/CH/CL. Do not leak the bounce-buffer offset back
         // through DX/DI for pointer-bearing calls.
         caller.rax = regs.rax;
+        if input[0] as u16 == 0x4F09 && regs.rax as u16 != 0x004F {
+            return Err(BiosError::Rejected(regs.rax as u16));
+        }
         if input[0] as u16 == 0x1015 {
             caller.rcx = regs.rcx;
             caller.rdx = regs.rdx;
@@ -1099,6 +1102,7 @@ fn parse_vbe_mode<A: Arch>(
     let width = machine.read::<u16>(address + 0x12);
     let height = machine.read::<u16>(address + 0x14);
     let bpp = machine.read::<u8>(address + 0x19);
+    let programmable_ramp = machine.read::<u8>(address + 0x27) & 0x01 != 0;
     let physical_base_raw = machine.read::<u32>(address + 0x28);
     let linear = attributes & 0x0080 != 0 && physical_base_raw != 0;
     let physical_base = if linear { physical_base_raw } else { 0 };
@@ -1167,7 +1171,7 @@ fn parse_vbe_mode<A: Arch>(
     Some(crate::kernel::platform::VbeMode {
         number, vga_compatible: attributes & 0x0020 == 0,
         physical_base, width, height, pitch, banked_pitch, linear_pitch,
-        bits_per_pixel: bpp, format,
+        bits_per_pixel: bpp, format, programmable_ramp,
         window_segment,
         window_granularity_kb,
         window_size_kb,

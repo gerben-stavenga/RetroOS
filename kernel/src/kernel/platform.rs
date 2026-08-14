@@ -28,6 +28,9 @@ pub struct VbeMode {
     pub linear_pitch: u16,
     pub bits_per_pixel: u8,
     pub format: crate::kernel::display::FormatSpec,
+    /// VBE ModeInfoBlock.DirectColorModeInfo D0: the direct-colour lookup
+    /// ramp may be programmed through VBE 4F09h.
+    pub programmable_ramp: bool,
     pub window_segment: u16,
     pub window_granularity_kb: u16,
     pub window_size_kb: u16,
@@ -117,10 +120,14 @@ pub struct Platform {
     /// Discovered once at boot; selecting/mapping it still requires ownership
     /// of the move-only `VgaCap`.
     pub vbe_mode: Option<VbeDisplayMode>,
-    /// Packed 640x480 mode reserved for software Voodoo scanout. RGB565 is a
-    /// direct match for the SST-1 front buffer; another two-byte layout is
-    /// still usable because the Voodoo DAC path packs through its channel map.
+    /// Packed mode reserved for software Voodoo scanout. Exact 640x480 comes
+    /// first; programmable 16-bit modes can put the SST-1 CLUT in the physical
+    /// RAMDAC, while fixed-ramp modes require CPU-side colour conversion.
     pub voodoo_vbe_mode: Option<VbeDisplayMode>,
+    /// Whether a DOS personality gets an SST-1 on its PCI bus. Native VGA
+    /// requires a selected VBE sink; GOP/host surfaces work directly; a
+    /// headless machine exposes no card whose output it cannot present.
+    pub voodoo_emulation: bool,
     pub audio: Audio,
     /// The real card exposes Cirrus-style save/restore readbacks (CR22
     /// latches, CR24 AC flip-flop, CR26 AC index). With them, task
@@ -462,6 +469,7 @@ pub fn probe<A: crate::Arch>(
             firmware,
             vbe_mode: None,
             voodoo_vbe_mode: None,
+            voodoo_emulation: false,
             vga_readback,
             audio_hw,
             // Policy comes later, when CONFIG.SYS is readable
@@ -568,31 +576,49 @@ pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
 /// Select and freeze the packed BIOS surface used when the software Voodoo
 /// takes display ownership. Discovery has already parsed the ROM catalogue;
 /// this is policy over those immutable facts, not another firmware probe.
-pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>) {
+pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
     let selected = modes.and_then(|modes| {
-        let candidates = || modes.iter().copied()
-            .filter(|mode| mode.width == 640 && mode.height == 480)
-            .filter_map(VbeDisplayMode::try_from_bios_mode);
-        candidates()
-            .filter(|mode| mode.rgb == crate::kernel::display::PixelFormat::RGB565)
-            .min_by_key(|mode| mode.scanout == VbeDisplayScanout::Banked)
-            .or_else(|| candidates()
-                .filter(|mode| mode.rgb.bytes_per_pixel == 2)
-                .min_by_key(|mode| mode.scanout == VbeDisplayScanout::Banked))
+        modes.iter().copied()
+            .filter_map(VbeDisplayMode::try_from_bios_mode)
+            .filter(|mode| mode.mode.width >= 640 && mode.mode.height >= 480)
+            .filter_map(|mode| {
+                use crate::kernel::display::PixelFormat;
+                let format_rank = match (mode.rgb, mode.mode.programmable_ramp) {
+                    (PixelFormat::RGB565, true) => 0,
+                    (PixelFormat::RGB555, true) => 1,
+                    (PixelFormat::RGB888, _) => 2,
+                    (PixelFormat::NATIVE, _) => 3,
+                    (PixelFormat::RGB565, false) => 4,
+                    (PixelFormat::RGB555, false) => 5,
+                    _ => return None,
+                };
+                let exact = mode.mode.width == 640 && mode.mode.height == 480;
+                Some((mode, (!exact, format_rank,
+                    u32::from(mode.mode.width) * u32::from(mode.mode.height),
+                    mode.scanout == VbeDisplayScanout::Banked)))
+            })
+            .min_by_key(|&(_, key)| key)
+            .map(|(mode, _)| mode)
     });
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::set_voodoo_vbe_mode before probe");
     p.voodoo_vbe_mode = selected;
+    p.voodoo_emulation = if p.vga_passthrough {
+        selected.is_some()
+    } else {
+        surface_available
+    };
     match selected {
         Some(selected) => {
             let m = selected.mode();
             crate::println!(
-                "VBE: Voodoo mode {:#x} {}x{}x{} format={:?}",
+                "VBE: Voodoo mode {:#x} {}x{}x{} format={:?} ramp={}",
                 m.number, m.width, m.height, m.bits_per_pixel, selected.rgb,
+                if m.programmable_ramp { "programmable" } else { "fixed" },
             );
         }
         None if p.vga_passthrough =>
-            crate::println!("VBE: no packed 640x480 Voodoo display mode"),
+            crate::println!("VBE: no supported display mode; Voodoo disabled"),
         None => {}
     }
 }

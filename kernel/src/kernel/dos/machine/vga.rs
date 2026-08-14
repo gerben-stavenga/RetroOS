@@ -45,7 +45,9 @@ impl EmulatedVga {
         }));
         let physical_lfb = current.and_then(|(mode, linear)| linear.then_some(mode.physical_base));
         let (resume, svga_pages) = if let Some((mode, linear)) = current {
-            if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8) {
+            if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                || mode.programmable_ramp
+            {
                 capture_native_vbe_palette(
                     machine, bios, native.cap_mut(), mode, &mut model,
                 );
@@ -683,7 +685,9 @@ fn restore_native_vbe<A: crate::Arch>(
             machine, bios, display, mode, bank.unwrap_or(0), &pixels,
         );
     }
-    if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8) {
+    if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
+        || mode.programmable_ramp
+    {
         restore_native_vbe_palette(machine, bios, display, mode, state);
     }
     let mut regs = Regs::empty();
@@ -699,13 +703,9 @@ fn capture_native_vbe_palette<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    mode: crate::kernel::platform::VbeMode,
+    _mode: crate::kernel::platform::VbeMode,
     state: &mut VgaState,
 ) {
-    if mode.vga_compatible {
-        crate::kernel::drivers::vga_hw::save_dac(display, state);
-        return;
-    }
     let mut entries = alloc::vec![0; 256 * 4];
     let mut regs = Regs::empty();
     regs.rax = 0x4F09;
@@ -714,7 +714,7 @@ fn capture_native_vbe_palette<A: crate::Arch>(
     display.bios_palette_call(
         machine, bios, &mut regs, Some(&mut entries), false, true,
     ).unwrap_or_else(|error| panic!(
-        "native non-VGA-compatible indexed mode has no palette read service: {:?}",
+        "native VBE mode has no palette/ramp read service: {:?}",
         error,
     ));
     for (rgb, entry) in state.dac.chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
@@ -729,13 +729,9 @@ fn restore_native_vbe_palette<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    mode: crate::kernel::platform::VbeMode,
+    _mode: crate::kernel::platform::VbeMode,
     state: &VgaState,
 ) {
-    if mode.vga_compatible {
-        crate::kernel::drivers::vga_hw::restore_dac(display, state);
-        return;
-    }
     let mut entries = alloc::vec![0; 256 * 4];
     for (entry, rgb) in entries.chunks_exact_mut(4).zip(state.dac.chunks_exact(3)) {
         entry.copy_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
@@ -747,7 +743,7 @@ fn restore_native_vbe_palette<A: crate::Arch>(
     display.bios_palette_call(
         machine, bios, &mut regs, Some(&mut entries), true, true,
     ).unwrap_or_else(|error| panic!(
-        "native non-VGA-compatible indexed mode has no palette write service: {:?}",
+        "native VBE mode has no palette/ramp write service: {:?}",
         error,
     ));
 }

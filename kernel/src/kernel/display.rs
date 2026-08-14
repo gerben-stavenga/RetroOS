@@ -41,6 +41,8 @@ pub struct Framebuffer {
 pub struct Display {
     pub shadow_width: usize,
     pub rgb: PixelFormat,
+    programmable_ramp: bool,
+    voodoo_ramp_generation: Option<u64>,
     backend: Backend,
 }
 
@@ -205,7 +207,8 @@ impl Display {
         rgb: PixelFormat,
     ) -> Self {
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
-        Self { shadow_width, rgb, backend: Backend::Linear(framebuffer) }
+        Self { shadow_width, rgb, programmable_ramp: false,
+            voodoo_ramp_generation: None, backend: Backend::Linear(framebuffer) }
     }
 
     /// Establish the VGA adapter as a known packed linear Mode 13h display.
@@ -230,6 +233,8 @@ impl Display {
         Self {
             shadow_width: 320,
             rgb: PixelFormat::RGB332,
+            programmable_ramp: false,
+            voodoo_ramp_generation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::Mode13 {
@@ -279,6 +284,8 @@ impl Display {
         Self {
             shadow_width,
             rgb,
+            programmable_ramp: mode.programmable_ramp,
+            voodoo_ramp_generation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeLinear { framebuffer, pages },
@@ -303,6 +310,8 @@ impl Display {
         Self {
             shadow_width,
             rgb,
+            programmable_ramp: mode.programmable_ramp,
+            voodoo_ramp_generation: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank: 0 },
@@ -311,17 +320,74 @@ impl Display {
     }
 
     pub fn host() -> Self {
-        Self { shadow_width: 720, rgb: PixelFormat::NATIVE, backend: Backend::Host }
+        Self { shadow_width: 720, rgb: PixelFormat::NATIVE,
+            programmable_ramp: false, voodoo_ramp_generation: None,
+            backend: Backend::Host }
     }
 
     pub fn headless() -> Self {
-        Self { shadow_width: 0, rgb: PixelFormat::NATIVE, backend: Backend::Headless }
+        Self { shadow_width: 0, rgb: PixelFormat::NATIVE,
+            programmable_ramp: false, voodoo_ramp_generation: None,
+            backend: Backend::Headless }
     }
 
     pub fn is_headless(&self) -> bool { matches!(self.backend, Backend::Headless) }
     pub fn is_host(&self) -> bool { matches!(self.backend, Backend::Host) }
     pub fn is_vga(&self) -> bool {
         matches!(self.backend, Backend::Vga { .. })
+    }
+
+    /// Install the SST-1 gamma table in a programmable direct-colour VBE
+    /// mode. A rejected firmware call permanently selects the CPU fallback.
+    pub fn program_voodoo_ramp<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        generation: u64,
+        ramp: &mut [u8; 256 * 4],
+    ) -> bool {
+        if !self.programmable_ramp { return false; }
+        if self.voodoo_ramp_generation == Some(generation) { return true; }
+        let Backend::Vga { native, .. } = &mut self.backend else { return false };
+        let mut regs = crate::Regs::empty();
+        regs.rax = 0x4F09;
+        regs.rbx = 0;
+        regs.rcx = 256;
+        regs.rdx = 0;
+        let ok = native.bios_palette_call(
+            machine, bios, &mut regs, Some(ramp), true, true,
+        ).is_ok() && regs.rax as u16 == 0x004F;
+        if ok {
+            self.voodoo_ramp_generation = Some(generation);
+        } else {
+            self.programmable_ramp = false;
+            crate::println!("VBE: programmable direct-colour ramp rejected; using CPU gamma");
+        }
+        ok
+    }
+
+    /// VGA software rendering expects an identity output ramp after Voodoo
+    /// gives the display back.
+    pub fn restore_voodoo_ramp<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    ) {
+        if self.voodoo_ramp_generation.is_none() { return; }
+        let mut ramp = [0u8; 256 * 4];
+        for (v, entry) in ramp.chunks_exact_mut(4).enumerate() {
+            entry.copy_from_slice(&[v as u8, v as u8, v as u8, 0]);
+        }
+        let Backend::Vga { native, .. } = &mut self.backend else { return };
+        let mut regs = crate::Regs::empty();
+        regs.rax = 0x4F09;
+        regs.rcx = 256;
+        if native.bios_palette_call(
+            machine, bios, &mut regs, Some(&mut ramp), true, true,
+        ).is_ok() && regs.rax as u16 == 0x004F
+        {
+            self.voodoo_ramp_generation = None;
+        }
     }
     /// Vertical OSD enlargement needed before a Mode 13h sink downsamples the
     /// completed shadow. Horizontal OSD coordinates always belong to the
