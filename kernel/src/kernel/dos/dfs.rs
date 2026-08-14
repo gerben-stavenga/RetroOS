@@ -214,25 +214,60 @@ fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> 
 
 /// Per-thread DOS filesystem state.
 pub struct DfsState {
-    cwd: [u8; DFS_CWD_MAX],
-    cwd_len: u8,
+    cwd: [[u8; DFS_CWD_MAX]; 3],
+    cwd_len: [u8; 3],
+    current_drive: u8,
 }
 
 impl DfsState {
     pub const fn new() -> Self {
-        Self { cwd: [0; DFS_CWD_MAX], cwd_len: 0 }
+        Self { cwd: [[0; DFS_CWD_MAX]; 3], cwd_len: [0; 3], current_drive: b'C' }
+    }
+
+    fn drive_slot(drive: u8) -> Option<usize> {
+        match drive.to_ascii_uppercase() {
+            b'C' => Some(0),
+            b'D' => Some(1),
+            b'H' => Some(2),
+            _ => None,
+        }
     }
 
     /// Cwd per AH=47 convention: no drive, no leading `\`, no trailing `\`.
     pub fn get_cwd(&self) -> &[u8] {
-        &self.cwd[..self.cwd_len as usize]
+        self.get_cwd_for(self.current_drive).unwrap_or(b"")
+    }
+
+    pub fn get_cwd_for(&self, drive: u8) -> Option<&[u8]> {
+        let slot = Self::drive_slot(drive)?;
+        Some(&self.cwd[slot][..self.cwd_len[slot] as usize])
     }
 
     /// Overwrite cwd with `new_cwd` (expected already in AH=47 form).
     pub fn set_cwd(&mut self, new_cwd: &[u8]) {
+        self.set_cwd_for(self.current_drive, new_cwd);
+    }
+
+    fn set_cwd_for(&mut self, drive: u8, new_cwd: &[u8]) {
+        let Some(slot) = Self::drive_slot(drive) else { return };
         let n = new_cwd.len().min(DFS_CWD_MAX);
-        self.cwd[..n].copy_from_slice(&new_cwd[..n]);
-        self.cwd_len = n as u8;
+        self.cwd[slot][..n].copy_from_slice(&new_cwd[..n]);
+        self.cwd_len[slot] = n as u8;
+    }
+
+    /// Select C:, the CD-ROM D: slot, or host filesystem H:.
+    pub fn select_drive(&mut self, drive: u8) -> bool {
+        let drive = drive.to_ascii_uppercase();
+        if Self::drive_slot(drive).is_none() {
+            return false;
+        }
+        self.current_drive = drive;
+        true
+    }
+
+    /// DOS zero-based drive number (A=0, C=2, D=3).
+    pub fn current_drive_number(&self) -> u8 {
+        self.current_drive - b'A'
     }
 
     /// Initialize DFS cwd from a VFS-form path (lowercase, forward-slash).
@@ -254,9 +289,9 @@ impl DfsState {
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
         let n = s.len().min(DFS_CWD_MAX);
         for (i, &b) in s.iter().enumerate().take(n) {
-            self.cwd[i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+            self.cwd[0][i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
         }
-        self.cwd_len = n as u8;
+        self.cwd_len[0] = n as u8;
     }
 
     /// Resolve a DOS input path to absolute DOS form `"X:\UPPER\PATH"`.
@@ -266,7 +301,7 @@ impl DfsState {
     ///   - other           → current drive's cwd + path
     ///
     /// All `/` become `\`, all letters uppercased.
-    /// Currently only drive C has a tracked cwd; all other drives start at root.
+    /// C:, CD-ROM D:, and hostfs H: retain independent current directories.
     pub fn resolve(&self, dos_in: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
         let mut pos: usize = 0;
 
@@ -274,8 +309,9 @@ impl DfsState {
         let (drive, rest) = if dos_in.len() >= 2 && dos_in[1] == b':' {
             (dos_in[0].to_ascii_uppercase(), &dos_in[2..])
         } else {
-            (b'C', dos_in)
+            (self.current_drive, dos_in)
         };
+        if Self::drive_slot(drive).is_none() { return Err(15); }
 
         // Emit "X:\"
         if pos + 3 > out.len() { return Err(3); }
@@ -285,8 +321,8 @@ impl DfsState {
         let absolute = !rest.is_empty() && (rest[0] == b'\\' || rest[0] == b'/');
         let rest = if absolute { &rest[1..] } else { rest };
 
-        if !absolute && drive == b'C' {
-            let cwd = self.get_cwd();
+        if !absolute {
+            let cwd = self.get_cwd_for(drive).unwrap_or(b"");
             for &b in cwd {
                 if pos >= out.len() { return Err(3); }
                 out[pos] = b; pos += 1;
@@ -340,16 +376,12 @@ impl DfsState {
     }
 
     /// Change directory to `dos_in`. Returns 0 on success, else DOS error.
-    /// Only drive C is supported.
     pub fn chdir(&mut self, dos_in: &[u8]) -> i32 {
         let mut abs = [0u8; DFS_PATH_MAX];
         let alen = match self.resolve(dos_in, &mut abs) {
             Ok(n) => n,
             Err(e) => return e,
         };
-        // Only drive C can be current-dir'd (H: has no CDS slot yet).
-        if abs[0] != b'C' { return 15; }
-
         // Walk the path as an existing directory.
         let mut vfs_buf = [0u8; DFS_PATH_MAX];
         let vlen = match Self::to_vfs_open(&abs[..alen], &mut vfs_buf) {
@@ -358,10 +390,10 @@ impl DfsState {
         };
         if !vfs::dir_exists(&vfs_buf[..vlen]) { return 3; }
 
-        // Store new cwd as the chunk after "C:\", converted to AH=47 form.
+        // Store this drive's cwd as the chunk after "X:\", converted to AH=47 form.
         // `abs[3..alen]` is already uppercase backslash DOS form.
         let new_cwd = &abs[3..alen];
-        self.set_cwd(new_cwd);
+        self.set_cwd_for(abs[0], new_cwd);
         0
     }
 }
@@ -425,6 +457,8 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
     }
     let prefix: &[u8] = match abs_dos[0] {
         b'C' => c_root(),
+        b'D' => b"cdrom/",
+        b'H' => b"host/",
         _ => return Err(15),
     };
     // c_root carries a trailing slash (for path concat); the component walk
@@ -551,7 +585,7 @@ fn canonicalize_components(buf: &mut [u8], len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DfsState, DFS_PATH_MAX};
+    use super::{DfsState, DFS_PATH_MAX, strip_drive_prefix};
 
     #[test]
     fn resolve_discards_spaces_from_each_component() {
@@ -561,5 +595,34 @@ mod tests {
         let len = dfs.resolve(b"di r   \\lh66 .rle    ", &mut out).unwrap();
 
         assert_eq!(&out[..len], b"C:\\DIR\\LH66.RLE");
+    }
+
+    #[test]
+    fn drive_d_maps_to_the_cdrom_slot() {
+        let mut dfs = DfsState::new();
+        let mut dos = [0u8; DFS_PATH_MAX];
+        let mut vfs = [0u8; DFS_PATH_MAX];
+
+        let len = dfs.resolve(b"D:\\DATA\\DESCENT.HOG", &mut dos).unwrap();
+        let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
+        assert_eq!(&vfs[..prefix_len], b"cdrom");
+        assert_eq!(rest, b"DATA\\DESCENT.HOG");
+
+        assert!(dfs.select_drive(b'D'));
+        assert_eq!(dfs.current_drive_number(), 3);
+        let len = dfs.resolve(b"README.TXT", &mut dos).unwrap();
+        assert_eq!(&dos[..len], b"D:\\README.TXT");
+    }
+
+    #[test]
+    fn drive_h_maps_to_hostfs() {
+        let mut dfs = DfsState::new();
+        let mut dos = [0u8; DFS_PATH_MAX];
+        let mut vfs = [0u8; DFS_PATH_MAX];
+        assert!(dfs.select_drive(b'H'));
+        let len = dfs.resolve(b"SOURCE\\MAIN.C", &mut dos).unwrap();
+        let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
+        assert_eq!(&vfs[..prefix_len], b"host");
+        assert_eq!(rest, b"SOURCE\\MAIN.C");
     }
 }

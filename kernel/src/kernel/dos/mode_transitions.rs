@@ -1096,8 +1096,6 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
     }
     if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(machine, regs), resume_other);
 
-    dos_trace!("[DPMI] RESUME_CONTINUATION_STUB -> {:04x}:{:#x} SS:ESP={:04x}:{:#x}",
-        regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32());
 }
 
 

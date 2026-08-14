@@ -20,7 +20,7 @@
 //! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
 //! `fs.open` is safe.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
@@ -106,6 +106,19 @@ pub trait Filesystem {
     /// exist.
     fn supports_create(&self) -> bool { false }
 
+    /// Create a directory. Returns 0 on success, negative errno on failure.
+    fn mkdir(&self, _path: &[u8]) -> i32 { -38 }
+
+    /// Does this backend implement directory creation?
+    fn supports_mkdir(&self) -> bool { false }
+
+    fn rmdir(&self, _path: &[u8]) -> i32 { -38 }
+    fn rename(&self, _path: &[u8], _new_path: &[u8]) -> i32 { -38 }
+    fn supports_directory_mutation(&self) -> bool { false }
+    fn flush(&self, _path: &[u8]) -> i32 { 0 }
+    fn mtime(&self, _path: &[u8]) -> Option<u32> { None }
+    fn set_mtime(&self, _path: &[u8], _mtime: u32) -> bool { false }
+
     /// Write to a file identified by handle at given byte offset (Twrite).
     /// Returns bytes written, or negative errno. Default = R/O (silently accept).
     fn write(&self, _handle: u64, _offset: u32, data: &[u8]) -> i32 {
@@ -188,10 +201,21 @@ pub struct FileEntry {
     /// RetroOS write through this handle? `write` only receives a handle, so
     /// the verdict has to be remembered rather than re-derived.
     pub writable: bool,
+    pub access: OpenAccess,
+    pub share: SharePolicy,
     /// For RAM-backed files: normalized path key into the RAM overlay
     pub ram_key: [u8; PATH_KEY_MAX],
     pub ram_key_len: u8,
 }
+
+#[derive(Clone, Copy)]
+struct FileLock { ino: u64, owner: i32, start: u32, len: u32 }
+
+#[derive(Clone, Copy)]
+pub enum OpenAccess { Read, Write, ReadWrite }
+
+#[derive(Clone, Copy)]
+pub enum SharePolicy { Compatibility, DenyAll, DenyWrite, DenyRead, DenyNone }
 
 /// How a mount composes with any bindings already at its prefix — Plan 9's
 /// mount modes, trimmed to the two we use:
@@ -292,6 +316,12 @@ struct Vfs {
     next_seq: u32,
     /// Writable file overlay — persists across open/close cycles.
     ram_files: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// RAM-overlay directories created over read-only filesystems.
+    ram_dirs: BTreeSet<Vec<u8>>,
+    /// Metadata for RAM-overlay objects and backends which cannot persist it.
+    modes: BTreeMap<Vec<u8>, u32>,
+    mtimes: BTreeMap<Vec<u8>, u32>,
+    locks: Vec<FileLock>,
     /// Global file table — slot is free when refcount == 0.
     file_table: [FileEntry; MAX_OPEN_FILES],
     dir_cache: DirCache,
@@ -310,6 +340,8 @@ impl Vfs {
             refcount: 0,
             mount_idx: 0,
             writable: false,
+            access: OpenAccess::Read,
+            share: SharePolicy::DenyNone,
             ram_key: [0; PATH_KEY_MAX],
             ram_key_len: 0,
         };
@@ -317,6 +349,10 @@ impl Vfs {
             mounts: Vec::new(),
             next_seq: 0,
             ram_files: BTreeMap::new(),
+            ram_dirs: BTreeSet::new(),
+            modes: BTreeMap::new(),
+            mtimes: BTreeMap::new(),
+            locks: Vec::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
             dir_cache: DirCache::new(),
             dir_generation: 0,
@@ -533,6 +569,7 @@ impl Vfs {
         if self.file_table[i].refcount == 0 { return; }
         self.file_table[i].refcount -= 1;
         if self.file_table[i].refcount == 0 {
+            self.locks.retain(|l| l.owner != idx);
             let handle = self.file_table[i].vnode.handle;
             if handle != RAM_SENTINEL {
                 let midx = self.file_table[i].mount_idx;
@@ -574,6 +611,20 @@ impl Vfs {
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
                     is_dir: false, mode: 0o644, mtime: 0,
+                };
+                de.name[..len].copy_from_slice(&basename[..len]);
+                entries.push(de);
+            }
+        }
+
+        // RAM overlay directories.
+        for key in self.ram_dirs.iter() {
+            if let Some(basename) = entry_in_ram_dir(key, dir)
+                && !dir_entries_has(&entries, basename) {
+                let len = basename.len().min(100);
+                let mut de = DirEntry {
+                    name: [0; 100], name_len: len, size: 0,
+                    is_dir: true, mode: 0o755, mtime: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -635,6 +686,9 @@ impl Vfs {
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
+        if self.ram_dirs.contains(path) {
+            return true;
+        }
         // True if any member of the group has this dir. A mount root (and the
         // VFS root) is structurally a directory — a member with an empty
         // subpath answers true without querying the backing fs, which avoids
@@ -643,6 +697,27 @@ impl Vfs {
         self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
             if subpath.is_empty() || fs.dir_exists(subpath) { Some(()) } else { None }
         }).is_some()
+    }
+
+    fn mkdir(&mut self, path: &[u8]) -> i32 {
+        if self.dir_exists(path) {
+            return -17; // EEXIST
+        }
+        let (midx, fs, subpath) = self.resolve_head(path);
+        if fs.supports_mkdir() {
+            if !self.may_write_parent(midx, subpath) {
+                return -13;
+            }
+            let rc = fs.mkdir(subpath);
+            if rc < 0 {
+                return rc;
+            }
+            self.claim(midx, subpath);
+        } else {
+            self.ram_dirs.insert(path.to_vec());
+        }
+        self.invalidate_dir_cache();
+        0
     }
 
     // ── open / create / read / write / seek ──────────────────────────────
@@ -667,6 +742,8 @@ impl Vfs {
                 ram_key,
                 ram_key_len: key_len,
                 writable: true, // RAM overlay files are always ours
+                access: OpenAccess::Read,
+                share: SharePolicy::DenyNone,
             };
             return table_idx as i32;
         }
@@ -690,17 +767,22 @@ impl Vfs {
             Some(i) => i,
             None => return -24,
         };
+        let key_len = path.len().min(PATH_KEY_MAX) as u8;
+        let mut path_key = [0u8; PATH_KEY_MAX];
+        path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         self.file_table[table_idx] = FileEntry {
             vnode,
             ino: path_ino(path),
             offset: 0,
             refcount: 1,
             mount_idx: midx,
-            ram_key: [0; PATH_KEY_MAX],
-            ram_key_len: 0,
+            ram_key: path_key,
+            ram_key_len: key_len,
             // Decide now, while the path is still in hand — `write` receives
             // only a handle.
             writable: self.may_write(midx, &sub),
+            access: OpenAccess::Read,
+            share: SharePolicy::DenyNone,
         };
         table_idx as i32
     }
@@ -734,15 +816,20 @@ impl Vfs {
                 Some(i) => i,
                 None => return -24,
             };
+            let key_len = path.len().min(PATH_KEY_MAX) as u8;
+            let mut path_key = [0u8; PATH_KEY_MAX];
+            path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
             self.file_table[table_idx] = FileEntry {
                 vnode,
                 ino: path_ino(path),
                 offset: 0,
                 refcount: 1,
                 mount_idx: midx,
-                ram_key: [0; PATH_KEY_MAX],
-                ram_key_len: 0,
+                ram_key: path_key,
+                ram_key_len: key_len,
                 writable: true, // the permission check above already passed
+                access: OpenAccess::Read,
+                share: SharePolicy::DenyNone,
             };
             self.invalidate_dir_cache();
             return table_idx as i32;
@@ -772,10 +859,156 @@ impl Vfs {
             refcount: 1,
             mount_idx: 0,
             writable: true, // RAM overlay files are always ours
+            access: OpenAccess::Read,
+            share: SharePolicy::DenyNone,
             ram_key,
             ram_key_len: key_len,
         };
         table_idx as i32
+    }
+
+    fn rmdir(&mut self, path: &[u8]) -> i32 {
+        if self.ram_dirs.contains(path) {
+            let mut prefix = path.to_vec();
+            prefix.push(b'/');
+            if self.ram_dirs.iter().any(|p| p.starts_with(&prefix))
+                || self.ram_files.keys().any(|p| p.starts_with(&prefix)) {
+                return -39; // ENOTEMPTY
+            }
+            self.ram_dirs.remove(path);
+            self.modes.remove(path);
+            self.mtimes.remove(path);
+            self.invalidate_dir_cache();
+            return 0;
+        }
+        let (midx, fs, subpath) = self.resolve_head(path);
+        if !fs.supports_directory_mutation() { return -38; }
+        if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath) {
+            return -13;
+        }
+        let rc = fs.rmdir(subpath);
+        if rc >= 0 {
+            self.modes.remove(path);
+            self.mtimes.remove(path);
+            self.invalidate_dir_cache();
+        }
+        rc
+    }
+
+    fn rename(&mut self, old: &[u8], new: &[u8]) -> i32 {
+        if self.path_exists(new) { return -17; }
+        if self.ram_files.contains_key(old) {
+            let data = self.ram_files.remove(old).unwrap();
+            self.ram_files.insert(new.to_vec(), data);
+            self.rekey_open_paths(old, new);
+        } else if self.ram_dirs.contains(old) {
+            let mut old_prefix = old.to_vec(); old_prefix.push(b'/');
+            let mut new_prefix = new.to_vec(); new_prefix.push(b'/');
+            let dirs: Vec<Vec<u8>> = self.ram_dirs.iter()
+                .filter(|p| *p == old || p.starts_with(&old_prefix)).cloned().collect();
+            let files: Vec<Vec<u8>> = self.ram_files.keys()
+                .filter(|p| p.starts_with(&old_prefix)).cloned().collect();
+            for src in dirs {
+                self.ram_dirs.remove(&src);
+                let dst = if src == old { new.to_vec() } else {
+                    let mut p = new_prefix.clone(); p.extend_from_slice(&src[old_prefix.len()..]); p
+                };
+                self.ram_dirs.insert(dst);
+            }
+            for src in files {
+                let data = self.ram_files.remove(&src).unwrap();
+                let mut dst = new_prefix.clone(); dst.extend_from_slice(&src[old_prefix.len()..]);
+                self.ram_files.insert(dst.clone(), data);
+                self.rekey_open_paths(&src, &dst);
+            }
+        } else {
+            let (old_idx, old_fs, old_sub) = self.resolve_head(old);
+            let (new_idx, _new_fs, new_sub) = self.resolve_head(new);
+            if old_idx != new_idx { return -18; } // EXDEV
+            if !old_fs.supports_directory_mutation() { return -38; }
+            if !self.may_write(old_idx, old_sub)
+                || !self.may_write_parent(old_idx, old_sub)
+                || !self.may_write_parent(new_idx, new_sub) { return -13; }
+            let rc = old_fs.rename(old_sub, new_sub);
+            if rc < 0 { return rc; }
+            self.rekey_open_paths(old, new);
+        }
+        if let Some(v) = self.modes.remove(old) { self.modes.insert(new.to_vec(), v); }
+        if let Some(v) = self.mtimes.remove(old) { self.mtimes.insert(new.to_vec(), v); }
+        self.invalidate_dir_cache();
+        0
+    }
+
+    fn rekey_open_paths(&mut self, old: &[u8], new: &[u8]) {
+        for e in &mut self.file_table {
+            let len = e.ram_key_len as usize;
+            if e.refcount != 0 && &e.ram_key[..len] == old && new.len() <= PATH_KEY_MAX {
+                e.ram_key[..new.len()].copy_from_slice(new);
+                e.ram_key_len = new.len() as u8;
+            }
+        }
+    }
+
+    fn path_exists(&self, path: &[u8]) -> bool {
+        if self.ram_files.contains_key(path) || self.ram_dirs.contains(path) { return true; }
+        if self.dir_exists(path) { return true; }
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            fs.open(subpath).map(|v| { fs.clunk(v.handle); })
+        }).is_some()
+    }
+
+    fn path_mode(&self, path: &[u8]) -> Option<(u32, bool)> {
+        if !self.path_exists(path) { return None; }
+        let is_dir = self.dir_exists(path);
+        if let Some(&mode) = self.modes.get(path) { return Some((mode, is_dir)); }
+        if self.ram_files.contains_key(path) { return Some((0o644, false)); }
+        if self.ram_dirs.contains(path) { return Some((0o755, true)); }
+        let (_idx, fs, subpath) = self.resolve_head(path);
+        if let Some(m) = fs.meta(subpath) { return Some((m.mode, is_dir)); }
+        if is_dir { return Some((0o555, true)); }
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            fs.open(subpath).map(|v| { let mode = v.mode as u32; fs.clunk(v.handle); (mode, false) })
+        })
+    }
+
+    fn set_path_mode(&mut self, path: &[u8], mode: u32) -> i32 {
+        if !self.path_exists(path) { return -2; }
+        let (midx, fs, subpath) = self.resolve_head(path);
+        if fs.meta(subpath).is_some() && !self.may_write(midx, subpath) { return -13; }
+        if let Some(m) = fs.meta(subpath)
+            && !fs.set_meta(subpath, m.uid, m.gid, mode) { return -13; }
+        self.modes.insert(path.to_vec(), mode);
+        self.invalidate_dir_cache();
+        0
+    }
+
+    fn handle_path(&self, handle: i32) -> Option<&[u8]> {
+        let e = self.file_table.get(handle as usize)?;
+        if e.refcount == 0 { return None; }
+        Some(&e.ram_key[..e.ram_key_len as usize])
+    }
+
+    fn flush_handle(&mut self, handle: i32) -> i32 {
+        let Some(path) = self.handle_path(handle).map(|p| p.to_vec()) else { return -9; };
+        let (_idx, fs, subpath) = self.resolve_head(&path);
+        fs.flush(subpath)
+    }
+
+    fn handle_mtime(&self, handle: i32) -> Option<u32> {
+        let path = self.handle_path(handle)?;
+        if let Some(&t) = self.mtimes.get(path) { return Some(t); }
+        let (_idx, fs, subpath) = self.resolve_head(path);
+        fs.mtime(subpath)
+    }
+
+    fn set_handle_mtime(&mut self, handle: i32, mtime: u32) -> i32 {
+        let Some(path) = self.handle_path(handle).map(|p| p.to_vec()) else { return -9; };
+        let (midx, fs, subpath) = self.resolve_head(&path);
+        if fs.meta(subpath).is_some() && !self.may_write(midx, subpath) { return -13; }
+        if fs.meta(subpath).is_some() && !fs.set_mtime(subpath, mtime) { return -13; }
+        self.mtimes.insert(path, mtime);
+        self.invalidate_dir_cache();
+        0
     }
 
     fn delete(&mut self, path: &[u8]) -> i32 {
@@ -911,6 +1144,49 @@ impl Vfs {
         if e.refcount == 0 { return false; }
         // RAM-overlay files are always ours (see `write_by_handle`).
         e.vnode.handle == RAM_SENTINEL || e.writable
+    }
+
+    fn configure_open(&mut self, handle: i32, access: OpenAccess, share: SharePolicy) -> i32 {
+        let Some(entry) = self.file_table.get(handle as usize) else { return -9; };
+        if entry.refcount == 0 { return -9; }
+        let ino = entry.ino;
+        let reads = |a: OpenAccess| !matches!(a, OpenAccess::Write);
+        let writes = |a: OpenAccess| !matches!(a, OpenAccess::Read);
+        let denied = |s: SharePolicy, a: OpenAccess| match s {
+            SharePolicy::DenyAll => reads(a) || writes(a),
+            SharePolicy::DenyWrite => writes(a),
+            SharePolicy::DenyRead => reads(a),
+            _ => false,
+        };
+        for (idx, other) in self.file_table.iter().enumerate() {
+            if idx != handle as usize && other.refcount != 0 && other.ino == ino
+                && (denied(other.share, access) || denied(share, other.access)) {
+                return -13;
+            }
+        }
+        self.file_table[handle as usize].access = access;
+        self.file_table[handle as usize].share = share;
+        0
+    }
+
+    fn lock_range(&mut self, handle: i32, unlock: bool, start: u32, len: u32) -> i32 {
+        let Some(entry) = self.file_table.get(handle as usize) else { return -9; };
+        if entry.refcount == 0 { return -9; }
+        let ino = entry.ino;
+        if unlock {
+            if let Some(i) = self.locks.iter().position(|l| l.owner == handle && l.start == start && l.len == len) {
+                self.locks.remove(i);
+                return 0;
+            }
+            return -33;
+        }
+        let end = start.saturating_add(len);
+        if self.locks.iter().any(|l| l.ino == ino && l.owner != handle
+            && start < l.start.saturating_add(l.len) && l.start < end) {
+            return -33;
+        }
+        self.locks.push(FileLock { ino, owner: handle, start, len });
+        0
     }
 
     fn file_ino_by_handle(&self, handle: i32) -> u64 {
@@ -1127,6 +1403,36 @@ pub fn create_to_handle(path: &[u8]) -> i32 {
     VFS.lock().create_to_handle(path)
 }
 
+/// Create a directory, using a real writable backend when available and the
+/// RAM overlay otherwise.
+pub fn mkdir(path: &[u8]) -> i32 {
+    VFS.lock().mkdir(path)
+}
+
+pub fn rmdir(path: &[u8]) -> i32 { VFS.lock().rmdir(path) }
+pub fn rename(old: &[u8], new: &[u8]) -> i32 { VFS.lock().rename(old, new) }
+pub fn path_exists(path: &[u8]) -> bool { VFS.lock().path_exists(path) }
+pub fn path_mode(path: &[u8]) -> Option<(u32, bool)> { VFS.lock().path_mode(path) }
+pub fn set_path_mode(path: &[u8], mode: u32) -> i32 { VFS.lock().set_path_mode(path, mode) }
+
+pub fn flush(fd: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => VFS.lock().flush_handle(handle),
+        Err(e) => e,
+    }
+}
+
+pub fn handle_mtime(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<u32> {
+    vfs_handle(fds, fd).ok().and_then(|h| VFS.lock().handle_mtime(h))
+}
+
+pub fn set_handle_mtime(fd: i32, mtime: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => VFS.lock().set_handle_mtime(handle, mtime),
+        Err(e) => e,
+    }
+}
+
 /// Write to an open file descriptor.
 pub fn write<A: crate::Arch>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
@@ -1160,6 +1466,25 @@ pub fn fd_writable(fd: i32, fds: &[FdKind; MAX_FDS]) -> bool {
     }
 }
 
+pub fn configure_open(
+    fd: i32,
+    access: OpenAccess,
+    share: SharePolicy,
+    fds: &[FdKind; MAX_FDS],
+) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => VFS.lock().configure_open(handle, access, share),
+        Err(e) => e,
+    }
+}
+
+pub fn lock_range(fd: i32, unlock: bool, start: u32, len: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
+    match vfs_handle(fds, fd) {
+        Ok(handle) => VFS.lock().lock_range(handle, unlock, start, len),
+        Err(e) => e,
+    }
+}
+
 /// Seek on an open file descriptor. whence: 0=SET, 1=CUR, 2=END
 pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
@@ -1176,6 +1501,12 @@ pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
 /// Namespace/metadata generation used by personality-level directory caches.
 pub fn directory_generation() -> u64 {
     VFS.lock().dir_generation
+}
+
+/// A mounted proxy changed the directory tree it serves without changing the
+/// mount table itself (for example CD insertion/ejection).
+pub fn mounted_media_changed() {
+    VFS.lock().invalidate_dir_cache();
 }
 
 /// Check if a directory exists on a mounted filesystem.

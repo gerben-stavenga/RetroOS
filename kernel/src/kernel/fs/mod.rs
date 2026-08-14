@@ -9,4 +9,6 @@
 
 pub mod grant;
 pub mod hostfs;
+pub mod cdrom;
+pub mod iso9660;
 pub mod lwext4;

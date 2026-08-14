@@ -111,6 +111,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .collect();
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
     mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    // A permanent empty proxy keeps the mount table stable while the OSD
+    // inserts/ejects images discovered under DOS's C:\CD directory.
+    crate::kernel::fs::cdrom::init();
 
     // CONFIG.SYS is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
@@ -325,6 +328,8 @@ fn mount_filesystems(
         // No module or disk filesystem: the host fs is the root if available.
         if hostfs {
             vfs::mount(b"", host_fs());
+            // Keep the DOS H: mapping stable even when hostfs is also `/`.
+            vfs::mount(b"host/", host_fs());
             crate::screenln!(screen, "hostfs mounted as root");
         }
     } else {

@@ -84,14 +84,6 @@ http_archive(
     build_file = "//stdlib:crc.BUILD",
 )
 
-http_archive(
-    name = "spin",
-    url = "https://static.crates.io/crates/spin/spin-0.9.8.crate",
-    type = "tar.gz",
-    strip_prefix = "spin-0.9.8",
-    build_file = "//stdlib:spin.BUILD",
-)
-
 # OPL2/OPL3 FM synthesis (DOS AdLib/SB music). Patched no_std so ONE archive
 # serves both kernel flavours (metal and hosted) — the crate is zero-dep, so
 # it skips the crates.io pin entirely.
@@ -206,6 +198,11 @@ cc_library(
 # bindgen build-dependency tree is never built.
 crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
 
+crate.render_config(
+    repositories = ["crates"],
+    generate_target_compatible_with = False,
+)
+
 # Hosted backend (arch-interp).
 crate.spec(package = "libc", version = "0.2")
 crate.spec(package = "unicorn-engine", version = "=2.1.5")  # tcg engine
@@ -220,11 +217,22 @@ crate.spec(
 crate.spec(package = "rustc-demangle", version = "0.1.24")
 crate.spec(
     package = "spin",
-    version = "0.9",
+    # Match Hadris so the kernel has one spin implementation/version.
+    version = "0.12",
     default_features = False,
     features = [
         "mutex",
         "spin_mutex",
+    ],
+)
+crate.spec(
+    package = "hadris-iso",
+    version = "=2.0.0",
+    default_features = False,
+    features = [
+        "read",
+        "alloc",
+        "sync",
     ],
 )
 
@@ -254,5 +262,12 @@ crate.annotation(
     deps = ["@@//third_party/unicorn"],
     patch_args = ["-p1"],
     patches = ["//toolchain:unicorn-sys-pregen-bindings.patch"],
+)
+crate.annotation(
+    crate = "zerocopy",
+    # Its build script only emits compiler-version compatibility cfgs.  Running
+    # it makes rules_rust probe our custom bare-metal target with stable rustc,
+    # which rejects custom target JSON before the actual nightly compile.
+    gen_build_script = "off",
 )
 use_repo(crate, "crates")

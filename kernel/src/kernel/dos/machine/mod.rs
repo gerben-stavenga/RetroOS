@@ -465,7 +465,7 @@ impl PcMachine {
         returned_linear: u32,
     ) {
         let voodoo_bar = vvoodoo::BAR_PHYS;
-        if self.voodoo.is_some()
+        if let Some(voodoo) = self.voodoo.as_mut()
             && (voodoo_bar..voodoo_bar + vvoodoo::BAR_SIZE).contains(&physical)
         {
             machine.map_phys_range(
@@ -474,7 +474,7 @@ impl PcMachine {
                 0,
                 arch_abi::MAP_MMIO,
             );
-            self.voodoo.as_mut().unwrap().linear_base = Some(returned_linear & !0xFFF);
+            voodoo.linear_base = Some(returned_linear & !0xFFF);
             return;
         }
 

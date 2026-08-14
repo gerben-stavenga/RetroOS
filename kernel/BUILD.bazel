@@ -1,6 +1,7 @@
 # Build kernel using rules_rust and rules_nasm
 load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:host_transition.bzl", "host_platform_test")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
 
 # Bare-metal (os:none) vs host build selector. The one kernel library and the
@@ -59,17 +60,17 @@ rust_library(
         "//third_party/lwext4:lwext4",
         "//third_party/lwext4:lwext4-sys",
         "//third_party/voodoo",
+        "@crates//:hadris-iso",
+        "@crates//:spin",
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
         "@nuked_opl3//:nuked_opl3",
     ] + select({
         ":metal": [
             "//arch-metal",
-            "@spin//:spin",
         ],
         "//conditions:default": [
             "@crates//:rustc-demangle",
-            "@crates//:spin",
         ],
     }),
 )
@@ -77,13 +78,18 @@ rust_library(
 # Host unit coverage for the Multiboot capsule and its pure parser/storage
 # tests. The metal-only boot entry remains cfg-gated out of this test.
 rust_test(
-    name = "kernel_unit_test",
+    name = "kernel_unit_test_host",
     crate = ":kernel",
     rustc_flags = [
         "-Cpanic=abort",
         "-Zpanic_abort_tests",
         "-Crelocation-model=static",
     ],
+)
+
+host_platform_test(
+    name = "kernel_unit_test",
+    test = ":kernel_unit_test_host",
 )
 
 # ============================================================================

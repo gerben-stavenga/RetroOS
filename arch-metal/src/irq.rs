@@ -114,7 +114,7 @@ pub fn drain(mut f: impl FnMut(Irq)) {
 unsafe fn queue_irq0_wakeup() {
     if !unsafe { core::ptr::read_volatile(&raw const IRQ0_QUEUED) } {
         unsafe {
-            (*(&raw mut QUEUE)).push(Irq::Hw(0));
+            (&raw mut QUEUE).as_mut().unwrap().push(Irq::Hw(0));
             core::ptr::write_volatile(&raw mut IRQ0_QUEUED, true);
         }
     }
@@ -1100,7 +1100,7 @@ fn mul_u64_u64_shr32(a: u64, b: u64) -> u64 {
     let a1 = a >> 32;
     let b0 = u64::from(b as u32);
     let b1 = b >> 32;
-    (a0 * b0 >> 32)
+    ((a0 * b0) >> 32)
         .wrapping_add(a0 * b1)
         .wrapping_add(a1 * b0)
         .wrapping_add((a1 * b1) << 32)

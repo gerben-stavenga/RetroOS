@@ -9,7 +9,7 @@
 //! Actions fold into machinery that already exists — Switch opens a task picker
 //! that targets the focus-switch request, Trace the shared DOS/DPMI/Linux
 //! syscall-trace gate, Profile the profile-dump toggle, Dump the register/VGA
-//! dump, Kill the ordinary exit path (a pending flag the event loop turns into
+//! dump, Disk lists the CD images shipped in `C:\CD`, Kill the ordinary exit path (a pending flag the event loop turns into
 //! `Exit` for the focused thread, exactly as the SEGV path does). Volume is the
 //! one new knob: a runtime master gain multiplied into the single mix-out clip.
 //!
@@ -51,8 +51,9 @@ pub fn take_display() -> Option<OsdDisplay> {
 
 const TAB_SYSTEM: usize = 0;
 const TAB_SOUND: usize = 1;
-const TAB_DEBUG: usize = 2;
-const NUM_TABS: usize = 3;
+const TAB_DISK: usize = 2;
+const TAB_DEBUG: usize = 3;
+const NUM_TABS: usize = 4;
 
 const SYSTEM_ITEM_KILL: usize = 0;
 const SYSTEM_ITEM_SWITCH: usize = 1;
@@ -88,6 +89,7 @@ static REPAINT: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
+static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
@@ -100,10 +102,12 @@ pub fn is_open() -> bool {
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
 pub fn open(display: OsdDisplay) {
+    crate::kernel::fs::cdrom::refresh_catalog();
     unsafe { OSD_DISPLAY = Some(display); }
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     SYSTEM_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
+    DISK_SEL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
@@ -187,6 +191,7 @@ fn set_active_tab(tab: usize) {
 fn active_sel(tab: usize) -> usize {
     match tab {
         TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
+        TAB_DISK => DISK_SEL.load(Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.load(Ordering::Relaxed),
         _ => SYSTEM_SEL.load(Ordering::Relaxed),
     }
@@ -195,6 +200,7 @@ fn active_sel(tab: usize) -> usize {
 fn set_active_sel(tab: usize, sel: usize) {
     match tab {
         TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
+        TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
         _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
     }
@@ -203,6 +209,7 @@ fn set_active_sel(tab: usize, sel: usize) {
 fn active_item_count(tab: usize) -> usize {
     match tab {
         TAB_SOUND => sound_item_count(),
+        TAB_DISK => disk_item_count(),
         TAB_DEBUG => DEBUG_NUM_ITEMS,
         _ => SYSTEM_NUM_ITEMS,
     }
@@ -219,9 +226,15 @@ fn sound_item_count() -> usize {
     sound_item_count_for(crate::kernel::platform::get().audio)
 }
 
+/// Eject is always the first row, followed by the images in C:\CD.
+fn disk_item_count() -> usize {
+    1 + crate::kernel::fs::cdrom::catalog_count()
+}
+
 fn active_tab_name(tab: usize) -> &'static [u8] {
     match tab {
         TAB_SOUND => b"Sound",
+        TAB_DISK => b"Disk",
         TAB_DEBUG => b"Debug",
         _ => b"System",
     }
@@ -431,6 +444,14 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
     match active_tab() {
         // Continuous settings are adjusted with ◄/►; Enter does nothing.
         TAB_SOUND => {}
+        TAB_DISK => {
+            let item = active_sel(TAB_DISK);
+            if item == 0 {
+                crate::kernel::fs::cdrom::eject();
+            } else if let Err(error) = crate::kernel::fs::cdrom::insert(item - 1) {
+                crate::println!("CD-ROM: insert failed: {:?}", error);
+            }
+        }
         TAB_DEBUG => match active_sel(TAB_DEBUG) {
             // Toggle each diagnostic and stay open so the new state shows on the row.
             DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
@@ -603,6 +624,7 @@ fn paint_tabs(
     for &(tab, label) in &[
         (TAB_SYSTEM, b"System" as &[u8]),
         (TAB_SOUND, b"Sound" as &[u8]),
+        (TAB_DISK, b"Disk" as &[u8]),
         (TAB_DEBUG, b"Debug" as &[u8]),
     ] {
         let selected = tab == active;
@@ -739,6 +761,22 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             }
             _ => {}
         },
+        TAB_DISK => {
+            if item == 0 {
+                line.put(b"Eject CD");
+                if !crate::kernel::fs::cdrom::is_inserted() {
+                    line.put(b"  [empty]");
+                }
+            } else {
+                let index = item - 1;
+                let mut name = [0_u8; 32];
+                let len = crate::kernel::fs::cdrom::catalog_name(index, &mut name);
+                line.put(&name[..len]);
+                if crate::kernel::fs::cdrom::selected(index) {
+                    line.put(b"  [in]");
+                }
+            }
+        }
         TAB_DEBUG => match item {
             DEBUG_ITEM_TRACE => {
                 line.put(b"Trace    ");

@@ -126,6 +126,10 @@ unsafe extern "C" {
     pub fn ext4_fseek(file: *mut Ext4File, offset: i64, origin: u32) -> i32;
     pub fn ext4_fsize(file: *mut Ext4File) -> u64;
     pub fn ext4_fremove(path: *const u8) -> i32;
+    pub fn ext4_frename(path: *const u8, new_path: *const u8) -> i32;
+    pub fn ext4_cache_flush(path: *const u8) -> i32;
+    pub fn ext4_dir_mk(path: *const u8) -> i32;
+    pub fn ext4_dir_rm(path: *const u8) -> i32;
     pub fn ext4_dir_open(dir: *mut Ext4Dir, path: *const u8) -> i32;
     pub fn ext4_dir_close(dir: *mut Ext4Dir) -> i32;
     pub fn ext4_dir_entry_next(dir: *mut Ext4Dir) -> *const Ext4Direntry;
@@ -133,6 +137,7 @@ unsafe extern "C" {
     pub fn ext4_mode_set(path: *const u8, mode: u32) -> i32;
     pub fn ext4_owner_get(path: *const u8, uid: *mut u32, gid: *mut u32) -> i32;
     pub fn ext4_owner_set(path: *const u8, uid: u32, gid: u32) -> i32;
+    pub fn ext4_mtime_set(path: *const u8, mtime: u32) -> i32;
     pub fn ext4_readlink(path: *const u8, buf: *mut u8, bufsize: usize, rcnt: *mut usize) -> i32;
     pub fn ext4_umount(mount_point: *const u8) -> i32;
     pub fn ext4_device_unregister(dev_name: *const u8) -> i32;

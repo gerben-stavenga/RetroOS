@@ -360,6 +360,53 @@ impl Filesystem for Lwext4Fs {
         true
     }
 
+    fn mkdir(&self, path: &[u8]) -> i32 {
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else { return -22; };
+        match lwext4::mkdir(cpath) {
+            Ok(()) => 0,
+            Err(e) => -e.abs(),
+        }
+    }
+
+    fn supports_mkdir(&self) -> bool {
+        true
+    }
+
+    fn rmdir(&self, path: &[u8]) -> i32 {
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else { return -22; };
+        lwext4::rmdir(cpath).map(|()| 0).unwrap_or_else(|e| -e.abs())
+    }
+
+    fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
+        let mut old_buf = [0u8; 320];
+        let mut new_buf = [0u8; 320];
+        let Some(old) = self.cpath(path, &mut old_buf) else { return -22; };
+        let Some(new) = self.cpath(new_path, &mut new_buf) else { return -22; };
+        lwext4::rename(old, new).map(|()| 0).unwrap_or_else(|e| -e.abs())
+    }
+
+    fn supports_directory_mutation(&self) -> bool { true }
+
+    fn flush(&self, path: &[u8]) -> i32 {
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else { return -22; };
+        lwext4::flush(cpath).map(|()| 0).unwrap_or_else(|e| -e.abs())
+    }
+
+    fn mtime(&self, path: &[u8]) -> Option<u32> {
+        let mut buf = [0u8; 320];
+        let cpath = self.cpath(path, &mut buf)?;
+        lwext4::stat(cpath).map(|s| s.mtime)
+    }
+
+    fn set_mtime(&self, path: &[u8], mtime: u32) -> bool {
+        let mut buf = [0u8; 320];
+        let Some(cpath) = self.cpath(path, &mut buf) else { return false; };
+        lwext4::mtime_set(cpath, mtime).is_ok()
+    }
+
     fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
         // Resolve the directory ONCE per batch, not once per entry.
         //
@@ -485,4 +532,3 @@ impl Filesystem for Lwext4Fs {
         }
     }
 }
-

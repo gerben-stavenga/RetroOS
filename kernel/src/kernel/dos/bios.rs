@@ -620,7 +620,7 @@ const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJ
 
 /// The kernel raises IRQ1 with a scancode readable at port 0x60 (the
 /// virtual 8042 on interp, the real one on metal). Translate to ASCII,
-/// track shift/ctrl in the BDA flag byte, push (scancode:ascii) into the
+/// track shift/ctrl/alt in the BDA flag byte, push (scancode:ascii) into the
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
 fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
     let sc = emulate_inb(machine, &mut dos.pc, 0x60);
@@ -640,11 +640,13 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
     let key = sc & 0x7F;
     let mut flags: u8 = bda_field!(machine, kb_flags);
 
-    // Shift / Ctrl are modifiers: update the BDA flag byte, don't enqueue.
+    // Shift / Ctrl / Alt are modifiers: update the BDA flag byte, don't
+    // enqueue. These are the conventional INT 16h AH=02h flag bits.
     let modifier_bit = match key {
         0x2A => Some(0x02u8), // left shift
         0x36 => Some(0x01),   // right shift
         0x1D => Some(0x04),   // ctrl
+        0x38 => Some(0x08),   // alt (left Alt, or E0-prefixed right Alt)
         _ => None,
     };
     if let Some(bit) = modifier_bit {
@@ -673,12 +675,19 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
     // scancodes), and the two gray keys that do have an ASCII code — Enter and
     // `/` — put the 0xE0 in the scancode slot instead. `int16` folds all of
     // this back for the conventional AH=00/01 reads.
-    let word = if e0 {
-        match key {
-            0x1C => 0xE00D, // gray Enter
-            0x35 => 0xE02F, // gray /
-            _ => ((key as u16) << 8) | 0x00E0,
-        }
+    let word = if flags & 0x08 != 0 {
+        // The original BIOS assigns distinct scan codes to Alt+Fn. Programs
+        // such as DOS Navigator use these words for their panel drive menus;
+        // returning the unmodified F-key would make Alt+F1 look like Help.
+        alt_function_key_word(key).unwrap_or_else(|| {
+            if e0 {
+                enhanced_key_word(key)
+            } else {
+                ((key as u16) << 8) | asc as u16
+            }
+        })
+    } else if e0 {
+        enhanced_key_word(key)
     } else {
         ((key as u16) << 8) | asc as u16
     };
@@ -694,6 +703,38 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
         bda_field!(machine, kb_tail = next);
     }
     emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
+}
+
+fn enhanced_key_word(key: u8) -> u16 {
+    match key {
+        0x1C => 0xE00D, // gray Enter
+        0x35 => 0xE02F, // gray /
+        _ => ((key as u16) << 8) | 0x00E0,
+    }
+}
+
+fn alt_function_key_word(key: u8) -> Option<u16> {
+    match key {
+        0x3B..=0x44 => Some((u16::from(0x68 + key - 0x3B)) << 8), // Alt+F1..F10
+        0x57 => Some(0x8B00),                                    // Alt+F11
+        0x58 => Some(0x8C00),                                    // Alt+F12
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    use super::alt_function_key_word;
+
+    #[test]
+    fn bios_alt_function_scan_codes() {
+        assert_eq!(alt_function_key_word(0x3B), Some(0x6800));
+        assert_eq!(alt_function_key_word(0x3C), Some(0x6900));
+        assert_eq!(alt_function_key_word(0x44), Some(0x7100));
+        assert_eq!(alt_function_key_word(0x57), Some(0x8B00));
+        assert_eq!(alt_function_key_word(0x58), Some(0x8C00));
+        assert_eq!(alt_function_key_word(0x1C), None);
+    }
 }
 
 // ============================================================================

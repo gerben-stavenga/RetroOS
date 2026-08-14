@@ -51,6 +51,26 @@ pub fn remove(path: &CStr) -> Result<()> {
     check(unsafe { sys::ext4_fremove(path.as_ptr().cast()) })
 }
 
+pub fn mkdir(path: &CStr) -> Result<()> {
+    check(unsafe { sys::ext4_dir_mk(path.as_ptr().cast()) })
+}
+
+pub fn rmdir(path: &CStr) -> Result<()> {
+    check(unsafe { sys::ext4_dir_rm(path.as_ptr().cast()) })
+}
+
+pub fn rename(path: &CStr, new_path: &CStr) -> Result<()> {
+    check(unsafe { sys::ext4_frename(path.as_ptr().cast(), new_path.as_ptr().cast()) })
+}
+
+pub fn flush(path: &CStr) -> Result<()> {
+    check(unsafe { sys::ext4_cache_flush(path.as_ptr().cast()) })
+}
+
+pub fn mtime_set(path: &CStr, mtime: u32) -> Result<()> {
+    check(unsafe { sys::ext4_mtime_set(path.as_ptr().cast(), mtime) })
+}
+
 /// POSIX mode bits, or `None` if the path can't be stat'ed.
 /// Everything a directory listing needs about one file.
 pub struct Stat {

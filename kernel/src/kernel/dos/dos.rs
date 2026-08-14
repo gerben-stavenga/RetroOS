@@ -11,6 +11,7 @@ extern crate alloc;
 
 use crate::kernel::thread;
 use crate::Regs;
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use super::{
     ExecParent,
@@ -31,6 +32,7 @@ use super::machine::{
 
 /// Dummy file handle returned for /dev/null semantics.
 const NULL_FILE_HANDLE: u16 = 99;
+static TEMP_FILE_SEQUENCE: AtomicU16 = AtomicU16::new(0);
 
 /// .COM entry IP (relative to its PSP segment). Equivalent to `(psp+0x10):0000`.
 const COM_OFFSET: u16 = 0x0100;
@@ -231,7 +233,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
             thread::KernelAction::Done
         }
         0x2E => int_2eh(machine, kt, dos, regs),
-        0x2F => int_2fh(dos, regs),
+        0x2F => int_2fh(machine, dos, regs),
         0x67 => {
             if !EMS_ENABLED {
                 // No EMS host: AH=80 ("invalid function in handle") so
@@ -915,12 +917,35 @@ fn dos_error_from_errno(err: i32) -> u16 {
         2 => 2,   // ENOENT / file not found
         3 => 3,   // DFS: path not found
         15 => 15, // DFS: invalid drive
+        17 => 5,  // EEXIST -> access denied (directory already exists)
+        18 => 17, // EXDEV -> not same device
+        38 => 1,  // ENOSYS -> invalid function
+        39 => 5,  // ENOTEMPTY -> access denied
         9 => 6,   // EBADF -> invalid handle
         13 => 5,  // EACCES -> access denied
         24 => 4,  // EMFILE -> too many open files
         30 => 5,  // EROFS (handle not writable) -> access denied
         _ => 1,   // invalid function / generic failure
     }
+}
+
+fn open_policies(mode: u8) -> Option<(crate::kernel::vfs::OpenAccess, crate::kernel::vfs::SharePolicy)> {
+    use crate::kernel::vfs::{OpenAccess, SharePolicy};
+    let access = match mode & 3 {
+        0 => OpenAccess::Read,
+        1 => OpenAccess::Write,
+        2 => OpenAccess::ReadWrite,
+        _ => return None,
+    };
+    let share = match (mode >> 4) & 7 {
+        0 => SharePolicy::Compatibility,
+        1 => SharePolicy::DenyAll,
+        2 => SharePolicy::DenyWrite,
+        3 => SharePolicy::DenyRead,
+        4 => SharePolicy::DenyNone,
+        _ => return None,
+    };
+    Some((access, share))
 }
 
 // ============================================================================
@@ -1100,25 +1125,27 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // DL: 0=default, 1=A, 2=B, 3=C
         0x47 => {
             let dl = regs.rdx as u8;
-            let drive = if dl == 0 { 3 } else { dl };
-            if drive != 3 {
-                // Invalid drive (A:/B:)
-                regs.rax = (regs.rax & !0xFFFF) | 0x0F;
-                regs.set_flag32(1);
+            let drive = if dl == 0 {
+                b'A' + dos.dfs.current_drive_number()
             } else {
+                b'A' + (dl - 1)
+            };
+            if let Some(cwd) = dos.dfs.get_cwd_for(drive) {
                 let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
-                let cwd = dos.dfs.get_cwd();
                 machine.copy_to(addr, cwd);
                 machine.write::<u8>(addr + cwd.len(), 0);
                 dos_trace!("D21 47 DL={:02X} out=\"{}\"",
                     dl, core::str::from_utf8(cwd).unwrap_or("?"));
                 regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | 0x0F;
+                regs.set_flag32(1);
             }
             thread::KernelAction::Done
         }
-        // AH=0x19: Get current default drive (returns AL=drive, 0=A, 2=C)
+        // AH=0x19: Get current default drive (returns AL=drive, 0=A, 2=C, 3=D)
         0x19 => {
-            regs.rax = (regs.rax & !0xFF) | 2; // C:
+            regs.rax = (regs.rax & !0xFF) | dos.dfs.current_drive_number() as u64;
             thread::KernelAction::Done
         }
         // AH=0x0C: Flush input buffer then execute function in AL
@@ -1207,6 +1234,70 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
+        // AH=0x39: Create directory (DS:DX=ASCIIZ path)
+        0x39 => {
+            let mut addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
+            let mut i = 0;
+            while i < dfs::DFS_PATH_MAX - 1 {
+                let ch = machine.read::<u8>(addr as usize);
+                if ch == 0 { break; }
+                name[i] = ch;
+                addr += 1;
+                i += 1;
+            }
+            let rc = match dfs_create_path(dos, &name[..i]) {
+                Ok((path, len)) => {
+                    // CD-ROM media is immutable even though read-only archive
+                    // mounts normally accept scratch files in the RAM overlay.
+                    if path[..len] == *b"cdrom" || path[..len].starts_with(b"cdrom/") {
+                        -30
+                    } else {
+                        let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        dfs::ci::invalidate(&path[..parent_end]);
+                        crate::kernel::vfs::mkdir(&path[..len])
+                    }
+                }
+                Err(e) => -e,
+            };
+            dos_trace!("D21 39 raw={:?} rc={}",
+                core::str::from_utf8(&name[..i]).unwrap_or("<non-utf8>"), rc);
+            if rc == 0 {
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
+        // AH=0x3A: Remove directory (DS:DX=ASCIIZ path)
+        0x3A => {
+            let mut addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
+            let mut i = 0;
+            while i < dfs::DFS_PATH_MAX - 1 {
+                let ch = machine.read::<u8>(addr as usize);
+                if ch == 0 { break; }
+                name[i] = ch; addr += 1; i += 1;
+            }
+            let rc = match dfs_open_existing(dos, &name[..i]) {
+                Ok((path, len)) => {
+                    if path[..len] == *b"cdrom" || path[..len].starts_with(b"cdrom/") { -30 }
+                    else {
+                        let parent = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        dfs::ci::invalidate(&path[..parent]);
+                        crate::kernel::vfs::rmdir(&path[..len])
+                    }
+                }
+                Err(e) => -e,
+            };
+            if rc == 0 { regs.clear_flag32(1); }
+            else {
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
         0x3B => {
             let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
@@ -1231,6 +1322,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         }
         // AH=0x3D: Open file (DS:DX=ASCIIZ filename, AL=access mode)
         0x3D => {
+            let open_mode = regs.rax as u8;
             let mut addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
@@ -1267,6 +1359,14 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 {
                     crate::kernel::vfs::close(fd, &mut kt.fds);
                     fd = -13; // EACCES
+                }
+                if fd >= 0 {
+                    let rc = open_policies(open_mode).map_or(-22, |(access, share)|
+                        crate::kernel::vfs::configure_open(fd, access, share, &kt.fds));
+                    if rc < 0 {
+                        crate::kernel::vfs::close(fd, &mut kt.fds);
+                        fd = rc;
+                    }
                 }
                 // Record the handle before anything else: a handle the JFT
                 // cannot hold is one DOS cannot give out, so it becomes a
@@ -1595,12 +1695,24 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 // AL=0x08: Check if block device is removable (BL=drive, 0=default,1=A,3=C)
                 0x08 => {
                     // AX=0 = removable, AX=1 = fixed
-                    regs.rax = (regs.rax & !0xFFFF) | 1; // fixed disk
+                    let drive = regs.rbx as u8;
+                    let drive = if drive == 0 {
+                        dos.dfs.current_drive_number() + 1
+                    } else {
+                        drive
+                    };
+                    regs.rax = (regs.rax & !0xFFFF) | u64::from(drive != 4);
                     regs.clear_flag32(1); // clear CF
                 }
                 // AL=0x09: Check if block device is remote (BL=drive)
                 0x09 => {
-                    regs.rdx &= !0xFFFF; // bit 12=0 = local
+                    let drive = regs.rbx as u8;
+                    let drive = if drive == 0 {
+                        dos.dfs.current_drive_number() + 1
+                    } else {
+                        drive
+                    };
+                    regs.rdx = (regs.rdx & !0xFFFF) | if drive == 8 { 0x1000 } else { 0 };
                     regs.clear_flag32(1);
                 }
                 _ => {
@@ -1675,9 +1787,11 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             }
             thread::KernelAction::Done
         }
-        // AH=0x0E: Select disk (DL=drive, 0=A, 2=C)
+        // AH=0x0E: Select disk (DL=drive, 0=A, 2=C, 3=D)
         0x0E => {
-            regs.rax = (regs.rax & !0xFF) | 3; // AL = number of logical drives
+            let drive = b'A'.wrapping_add(regs.rdx as u8);
+            let _ = dos.dfs.select_drive(drive);
+            regs.rax = (regs.rax & !0xFF) | 8; // AL = LASTDRIVE (H:)
             thread::KernelAction::Done
         }
         // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
@@ -1799,30 +1913,48 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 addr += 1;
                 i += 1;
             }
-            let fd = match dfs_open_existing(dos, &name[..i]) {
-                Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
-                Err(e) => -e,
-            };
-            if fd >= 0 {
-                crate::kernel::vfs::close(fd, &mut kt.fds);
-                match al {
-                    0 => {
-                        // Get attributes: return 0x20 (archive) in CX
-                        regs.rcx = (regs.rcx & !0xFFFF) | 0x20;
+            let resolved = (|| {
+                let mut abs = [0u8; dfs::DFS_PATH_MAX];
+                let alen = dos.dfs.resolve(&name[..i], &mut abs)?;
+                let mut path = [0u8; dfs::DFS_PATH_MAX];
+                let len = dfs::DfsState::to_vfs_open(&abs[..alen], &mut path)?;
+                Ok::<_, i32>((path, len))
+            })();
+            match (al, resolved) {
+                (0, Ok((path, len))) => match crate::kernel::vfs::path_mode(&path[..len]) {
+                    Some((mode, is_dir)) => {
+                        let attrs = if is_dir { 0x10 } else { 0x20 }
+                            | if mode & 0o222 == 0 { 0x01 } else { 0 };
+                        regs.rcx = (regs.rcx & !0xFFFF) | attrs as u64;
                         regs.clear_flag32(1);
                     }
-                    1 => {
-                        regs.rax = (regs.rax & !0xFFFF) | 5; // access denied: attrs are not mutable
+                    None => {
+                        regs.rax = (regs.rax & !0xFFFF) | 2;
                         regs.set_flag32(1);
                     }
-                    _ => {
-                        regs.rax = (regs.rax & !0xFFFF) | 1;
+                },
+                (1, Ok((path, len))) => {
+                    let rc = match crate::kernel::vfs::path_mode(&path[..len]) {
+                        Some((mode, _)) => {
+                            let new_mode = if regs.rcx as u8 & 1 != 0 { mode & !0o222 } else { mode | 0o200 };
+                            crate::kernel::vfs::set_path_mode(&path[..len], new_mode)
+                        }
+                        None => -2,
+                    };
+                    if rc == 0 { regs.clear_flag32(1); }
+                    else {
+                        regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
                         regs.set_flag32(1);
                     }
                 }
-            } else {
-                regs.rax = (regs.rax & !0xFFFF) | 2; // file not found
-                regs.set_flag32(1);
+                (_, Err(e)) => {
+                    regs.rax = (regs.rax & !0xFFFF) | e as u64;
+                    regs.set_flag32(1);
+                }
+                _ => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.set_flag32(1);
+                }
             }
             thread::KernelAction::Done
         }
@@ -2096,19 +2228,67 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             regs.rdx = (regs.rdx & !0xFFFF) | ((secs as u64) << 8) | centisecs as u64;
             thread::KernelAction::Done
         }
+        // AH=0x56: Rename file or directory (DS:DX=old, ES:DI=new)
+        0x56 => {
+            let old_addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let new_addr = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
+            let mut old = [0u8; dfs::DFS_PATH_MAX];
+            let mut new = [0u8; dfs::DFS_PATH_MAX];
+            let mut old_len = 0;
+            let mut new_len = 0;
+            while old_len < dfs::DFS_PATH_MAX - 1 {
+                let ch = machine.read::<u8>((old_addr + old_len as u32) as usize);
+                if ch == 0 { break; }
+                old[old_len] = ch; old_len += 1;
+            }
+            while new_len < dfs::DFS_PATH_MAX - 1 {
+                let ch = machine.read::<u8>((new_addr + new_len as u32) as usize);
+                if ch == 0 { break; }
+                new[new_len] = ch; new_len += 1;
+            }
+            let rc = match (dfs_open_existing(dos, &old[..old_len]), dfs_create_path(dos, &new[..new_len])) {
+                (Ok((old_path, olen)), Ok((new_path, nlen))) => {
+                    let old_cd = old_path[..olen] == *b"cdrom" || old_path[..olen].starts_with(b"cdrom/");
+                    let new_cd = new_path[..nlen] == *b"cdrom" || new_path[..nlen].starts_with(b"cdrom/");
+                    if old_cd || new_cd { -30 }
+                    else {
+                        let op = old_path[..olen].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        let np = new_path[..nlen].iter().rposition(|&b| b == b'/').unwrap_or(0);
+                        dfs::ci::invalidate(&old_path[..op]);
+                        dfs::ci::invalidate(&new_path[..np]);
+                        crate::kernel::vfs::rename(&old_path[..olen], &new_path[..nlen])
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => -e,
+            };
+            if rc == 0 { regs.clear_flag32(1); }
+            else {
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x57: Get/Set File Date and Time (AL=0: get, AL=1: set, BX=handle)
         0x57 => {
             let al = regs.rax as u8;
             if al == 0 {
-                // DOS time: bits 15-11=hours, 10-5=minutes, 4-0=seconds/2
-                // DOS date: bits 15-9=year-1980, 8-5=month, 4-0=day
-                let (time, date) = current_dos_timestamp(machine, regs);
+                let (time, date) = match crate::kernel::vfs::handle_mtime(regs.rbx as u16 as i32, &kt.fds) {
+                    Some(unix) if unix != 0 => unix_to_dos_datetime(unix),
+                    _ => current_dos_timestamp(machine, regs),
+                };
                 regs.rcx = (regs.rcx & !0xFFFF) | time as u64;
                 regs.rdx = (regs.rdx & !0xFFFF) | date as u64;
                 regs.clear_flag32(1);
             } else if al == 1 {
-                regs.rax = (regs.rax & !0xFFFF) | 5; // access denied: timestamps are not mutable
-                regs.set_flag32(1);
+                let rc = match dos_to_unix_datetime(regs.rcx as u16, regs.rdx as u16) {
+                    Some(unix) => crate::kernel::vfs::set_handle_mtime(regs.rbx as u16 as i32, unix, &kt.fds),
+                    None => -22,
+                };
+                if rc == 0 { regs.clear_flag32(1); }
+                else {
+                    regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
+                    regs.set_flag32(1);
+                }
             } else {
                 regs.rax = (regs.rax & !0xFFFF) | 1;
                 regs.set_flag32(1);
@@ -2134,7 +2314,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 dos_trace!("D21 60 in=\"{}\" cs:ip={:04X}:{:08X}",
                     core::str::from_utf8(&name[..len]).unwrap_or("?"), cs, ip);
             }
-            // Build canonical path: if no drive letter, prepend "C:\"
+            // Build canonical path: if no drive letter, prepend the current drive.
             let mut out = [0u8; 128];
             let mut pos;
             if len >= 2 && name[1] == b':' {
@@ -2150,8 +2330,9 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     pos += 1;
                 }
             } else {
-                // Relative — prepend C:\ + CWD (DFS already in DOS form).
-                out[0] = b'C'; out[1] = b':'; out[2] = b'\\';
+                // Relative — prepend current X:\ + its CWD (already DOS form).
+                out[0] = b'A' + dos.dfs.current_drive_number();
+                out[1] = b':'; out[2] = b'\\';
                 pos = 3;
                 let cwds = dos.dfs.get_cwd();
                 for &ch in cwds {
@@ -2194,15 +2375,31 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // On error: AX=0xFFFF
         0x36 => {
             let dl = regs.rdx as u8;
-            // Map drive: 0=default(C), 1=A, 2=B, 3=C
-            let drive = if dl == 0 { 3 } else { dl };
+            // Map drive: 0=default, 1=A, 2=B, 3=C, 4=D
+            let drive = if dl == 0 { dos.dfs.current_drive_number() + 1 } else { dl };
             if drive == 3 {
-                // C: drive — report fake 16MB disk, 8MB free
-                // 512 bytes/sector, 8 sectors/cluster (4KB), 4096 total clusters = 16MB
+                // C: drive — report a synthetic 128MB disk with 96MB free.
+                // VFS has no capacity query, but installers use this call to
+                // reject destinations that cannot hold their selected payload.
+                // 512 bytes/sector * 8 sectors/cluster * 32768 clusters = 128MB.
                 regs.rax = (regs.rax & !0xFFFF) | 8;    // AX = sectors per cluster
-                regs.rbx = (regs.rbx & !0xFFFF) | 2048; // BX = free clusters
+                regs.rbx = (regs.rbx & !0xFFFF) | 24576; // BX = free clusters (96MB)
                 regs.rcx = (regs.rcx & !0xFFFF) | 512;  // CX = bytes per sector
-                regs.rdx = (regs.rdx & !0xFFFF) | 4096; // DX = total clusters
+                regs.rdx = (regs.rdx & !0xFFFF) | 32768; // DX = total clusters
+            } else if drive == 4 && crate::kernel::fs::cdrom::is_inserted() {
+                // Read-only CD-ROM. DOS's free-space API has no read-only bit;
+                // report the conventional 2048-byte sector geometry and zero free.
+                regs.rax = (regs.rax & !0xFFFF) | 1;
+                regs.rbx &= !0xFFFF;
+                regs.rcx = (regs.rcx & !0xFFFF) | 2048;
+                regs.rdx = (regs.rdx & !0xFFFF) | 0xFFFF;
+            } else if drive == 8 && crate::kernel::vfs::dir_exists(b"host") {
+                // Hostfs has no portable capacity query; report the same
+                // synthetic geometry as C: while marking it remote via 4409h.
+                regs.rax = (regs.rax & !0xFFFF) | 8;
+                regs.rbx = (regs.rbx & !0xFFFF) | 24576;
+                regs.rcx = (regs.rcx & !0xFFFF) | 512;
+                regs.rdx = (regs.rdx & !0xFFFF) | 32768;
             } else {
                 // A:/B: or unknown — invalid drive
                 regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
@@ -2316,6 +2513,99 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
+        // AH=5Ah: Create temporary file. DS:DX names a directory/prefix; DOS
+        // appends a unique 8.3 name in the caller's buffer and returns a handle.
+        0x5A => {
+            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let mut prefix = [0u8; dfs::DFS_PATH_MAX];
+            let mut plen = 0;
+            while plen < dfs::DFS_PATH_MAX - 13 {
+                let ch = machine.read::<u8>((addr + plen as u32) as usize);
+                if ch == 0 { break; }
+                prefix[plen] = ch; plen += 1;
+            }
+            if plen > 0 && prefix[plen - 1] != b'\\' && prefix[plen - 1] != b'/' {
+                prefix[plen] = b'\\'; plen += 1;
+            }
+            let mut created = -17;
+            let mut final_len = plen;
+            for _ in 0..u16::MAX {
+                let seq = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                let hex = b"0123456789ABCDEF";
+                let suffix = [
+                    b'T', b'M', b'P',
+                    hex[(seq >> 12) as usize], hex[((seq >> 8) & 15) as usize],
+                    hex[((seq >> 4) & 15) as usize], hex[(seq & 15) as usize],
+                    b'.', b'$', b'$', b'$',
+                ];
+                prefix[plen..plen + suffix.len()].copy_from_slice(&suffix);
+                final_len = plen + suffix.len();
+                let Ok((path, len)) = dfs_create_path(dos, &prefix[..final_len]) else { created = -3; break; };
+                if crate::kernel::vfs::path_exists(&path[..len]) { continue; }
+                created = crate::kernel::vfs::create(&path[..len], &mut kt.fds);
+                break;
+            }
+            if created >= 0 {
+                machine.copy_to(addr as usize, &prefix[..final_len]);
+                machine.write::<u8>((addr + final_len as u32) as usize, 0);
+                if Psp::set_jft(machine, psp_struct_seg(dos), created as usize, created as u8).is_ok() {
+                    sft_set_file(machine, created as u16, 0);
+                    regs.rax = (regs.rax & !0xFFFF) | created as u64;
+                    regs.clear_flag32(1);
+                } else {
+                    crate::kernel::vfs::close(created, &mut kt.fds);
+                    regs.rax = (regs.rax & !0xFFFF) | 4;
+                    regs.set_flag32(1);
+                }
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(created) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
+        // AH=5Bh: Create new file, failing with error 80 if it already exists.
+        0x5B => {
+            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let mut name = [0u8; dfs::DFS_PATH_MAX];
+            let mut len = 0;
+            while len < dfs::DFS_PATH_MAX - 1 {
+                let ch = machine.read::<u8>((addr + len as u32) as usize);
+                if ch == 0 { break; }
+                name[len] = ch; len += 1;
+            }
+            let mut fd = match dfs_create_path(dos, &name[..len]) {
+                Ok((path, plen)) if crate::kernel::vfs::path_exists(&path[..plen]) => -80,
+                Ok((path, plen)) => crate::kernel::vfs::create(&path[..plen], &mut kt.fds),
+                Err(e) => -e,
+            };
+            if fd >= 0 && Psp::set_jft(machine, psp_struct_seg(dos), fd as usize, fd as u8).is_err() {
+                crate::kernel::vfs::close(fd, &mut kt.fds); fd = -24;
+            }
+            if fd >= 0 {
+                sft_set_file(machine, fd as u16, 0);
+                regs.rax = (regs.rax & !0xFFFF) | fd as u64;
+                regs.clear_flag32(1);
+            } else {
+                regs.rax = (regs.rax & !0xFFFF) | if fd == -80 { 80 } else { dos_error_from_errno(fd) } as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
+        // AH=5Ch: Lock/unlock byte range.
+        0x5C => {
+            let al = regs.rax as u8;
+            let start = ((regs.rcx as u16 as u32) << 16) | regs.rdx as u16 as u32;
+            let len = ((regs.rsi as u16 as u32) << 16) | regs.rdi as u16 as u32;
+            let rc = if al <= 1 {
+                crate::kernel::vfs::lock_range(regs.rbx as u16 as i32, al == 1, start, len, &kt.fds)
+            } else { -22 };
+            if rc == 0 { regs.clear_flag32(1); }
+            else {
+                regs.rax = (regs.rax & !0xFFFF) | if rc == -33 { 33 } else { dos_error_from_errno(rc) } as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x58: DOS 5+ allocation strategy / UMB link state
         0x58 => {
             let al = regs.rax as u8;
@@ -2388,11 +2678,25 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 bx, cs, ip);
             thread::KernelAction::Done
         }
+        // AH=68h/6Ah: Commit file. VFS writes are synchronous; the backend
+        // hook additionally drains any filesystem cache when it has one.
+        0x68 | 0x6A => {
+            let handle = regs.rbx as u16 as i32;
+            let rc = if handle == NULL_FILE_HANDLE as i32 { 0 }
+                else { crate::kernel::vfs::flush(handle, &kt.fds) };
+            if rc == 0 { regs.clear_flag32(1); }
+            else {
+                regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(rc) as u64;
+                regs.set_flag32(1);
+            }
+            thread::KernelAction::Done
+        }
         // AH=0x6C: Extended Open/Create (DOS 4.0+)
         // BX=mode, CX=attributes, DX=action, DS:SI=ASCIIZ filename
         // Action: bit0=open-if-exists, bit1=replace-if-exists, bit4=create-if-not-exists
         0x6C => {
             let action = regs.rdx as u16;
+            let open_mode = regs.rbx as u16;
             let mut addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
             let mut name = [0u8; dfs::DFS_PATH_MAX];
             let mut i = 0;
@@ -2418,6 +2722,14 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     if (regs.rbx as u8) & 0x03 != 0 && !crate::kernel::vfs::fd_writable(fd, &kt.fds) {
                         crate::kernel::vfs::close(fd, &mut kt.fds);
                         regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
+                        regs.set_flag32(1);
+                        return thread::KernelAction::Done;
+                    }
+                    let share_rc = open_policies(open_mode as u8).map_or(-22, |(access, share)|
+                        crate::kernel::vfs::configure_open(fd, access, share, &kt.fds));
+                    if share_rc < 0 {
+                        crate::kernel::vfs::close(fd, &mut kt.fds);
+                        regs.rax = (regs.rax & !0xFFFF) | dos_error_from_errno(share_rc) as u64;
                         regs.set_flag32(1);
                         return thread::KernelAction::Done;
                     }
@@ -2593,12 +2905,57 @@ fn dpmi_install_check(regs: &mut Regs) {
     regs.rdi = (regs.rdi & !0xFFFF) | ctrl_slot_off(SLOT_DPMI_ENTRY) as u64;
 }
 
-fn int_2fh<A: crate::Arch>(_dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ax = regs.rax as u16;
     dos_trace!("D2F {:04X} BX={:04X} CX={:04X} DX={:04X} cs:ip={:04X}:{:04X}",
         ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
         regs.code_seg(), regs.ip32() as u16);
     match ax {
+        // AX=1500h — MSCDEX installation check. The CD-ROM drive remains
+        // installed while its media slot is empty, just like a physical
+        // drive; an empty slot affects readiness, not driver detection.
+        0x1500 => {
+            regs.rbx = (regs.rbx & !0xFFFF) | 1; // one CD-ROM drive
+            regs.rcx = (regs.rcx & !0xFFFF) | 3; // first drive is D: (A:=0)
+            regs.rax = (regs.rax & !0xFF) | 0xFF; // conventional installed marker
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AX=1501h — one five-byte record: subunit byte followed by the
+        // far address of its DOS device header. Some installers use this
+        // header, rather than 150Bh, to verify their current drive is a CD.
+        0x1501 => {
+            let dest = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32) as usize;
+            let header = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_header) as u32;
+            let far_ptr = ((header >> 4) << 16) | (header & 0xF);
+            machine.write::<u8>(dest, 0); // driver subunit zero
+            machine.write::<u32>(dest + 1, far_ptr);
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AX=150Bh — MSCDEX v2+ drive check. BX is the MSCDEX signature;
+        // AX is nonzero only for the requested CD-ROM drive.
+        0x150B => {
+            regs.rbx = (regs.rbx & !0xFFFF) | 0xADAD;
+            let supported = regs.rcx as u16 == 3;
+            regs.rax = (regs.rax & !0xFFFF) | if supported { 0x5AD8 } else { 0 };
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AX=150Ch — report the MSCDEX 2.00 interface level. Do not advertise
+        // the v2.10 device-request extensions until AX=1510h is implemented.
+        0x150C => {
+            regs.rbx = (regs.rbx & !0xFFFF) | 0x0200;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AX=150Dh — return one byte per installed CD-ROM drive at ES:BX.
+        0x150D => {
+            let dest = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32);
+            machine.write::<u8>(dest as usize, 3); // D: (A:=0)
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
         // AX=1687h — DPMI installation check
         0x1687 => {
             dpmi_install_check(regs);
@@ -3525,6 +3882,49 @@ fn unix_to_dos_datetime(unix: u32) -> (u16, u16) {
     (dos_time as u16, dos_date as u16)
 }
 
+fn dos_to_unix_datetime(time: u16, date: u16) -> Option<u32> {
+    let year = 1980u32 + ((date >> 9) & 0x7F) as u32;
+    let month = ((date >> 5) & 0x0F) as u32;
+    let day = (date & 0x1F) as u32;
+    let hour = ((time >> 11) & 0x1F) as u32;
+    let minute = ((time >> 5) & 0x3F) as u32;
+    let second = ((time & 0x1F) as u32) * 2;
+    if month == 0 || month > 12 || day == 0 || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    const MONTH_DAYS: [u32; 12] = [31,28,31,30,31,30,31,31,30,31,30,31];
+    let leap = |y: u32| y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400));
+    let max_day = MONTH_DAYS[month as usize - 1] + u32::from(month == 2 && leap(year));
+    if day > max_day { return None; }
+    let mut days = 0u32;
+    for y in 1970..year { days += if leap(y) { 366 } else { 365 }; }
+    for m in 1..month {
+        days += MONTH_DAYS[m as usize - 1] + u32::from(m == 2 && leap(year));
+    }
+    days += day - 1;
+    days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)
+}
+
+#[cfg(test)]
+mod file_api_tests {
+    use super::{dos_to_unix_datetime, unix_to_dos_datetime};
+
+    #[test]
+    fn dos_datetime_round_trips_at_two_second_resolution() {
+        for unix in [315_532_800, 946_684_800, 1_709_251_198, 4_102_444_798] {
+            let (time, date) = unix_to_dos_datetime(unix);
+            assert_eq!(dos_to_unix_datetime(time, date), Some(unix));
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_dos_dates() {
+        assert_eq!(dos_to_unix_datetime(0, 0), None);
+        assert_eq!(dos_to_unix_datetime(0, (44 << 9) | (2 << 5) | 30), None);
+    }
+}
+
 /// FindFirst/FindNext helper: resume the search this DTA identifies, writing
 /// the match into the DTA and advancing the cursor kept there.
 fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
@@ -3801,6 +4201,26 @@ impl Default for CdsEntry {
     fn default() -> Self { unsafe { core::mem::zeroed() } }
 }
 
+/// DOS block-device header published through MSCDEX AX=1501h.
+///
+/// The strategy and interrupt offsets name a shared RETF stub in the same
+/// segment. CD-specific requests will eventually use AX=1510h; keeping these
+/// entry points valid prevents software which inspects the driver chain from
+/// finding a dangling header meanwhile.
+#[repr(C, packed)]
+#[derive(Clone, Copy)]
+struct CdromDeviceHeader {
+    next: u32,
+    attributes: u16,
+    strategy: u16,
+    interrupt: u16,
+    name: [u8; 8],
+    reserved: u16,
+    drive_letter: u8,
+    subunits: u8,
+}
+const _: () = assert!(core::mem::size_of::<CdromDeviceHeader>() == 22);
+
 /// Fixed kernel-owned region in conventional memory.
 ///
 /// The CD 31 stub array, the *system program* (a Program — env + PSP — that
@@ -3828,6 +4248,8 @@ struct LowMem {
     lol:       Lol,                    // 0x902
     sft:       Sft,
     cds:       [CdsEntry; NUM_DRIVES as usize],
+    cdrom_header: CdromDeviceHeader,
+    cdrom_retf: u8,
     /// DPMI 0.9 §3.1.2 locked PM stack (referred to as "host_stack" in
     /// the implementation). 4 KB host-provided buffer used for HW IRQ /
     /// exception / RM-callback handling in PM. Switched onto on the
@@ -4197,6 +4619,8 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
 fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     let sft_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, sft) as u32;
     let cds_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cds) as u32;
+    let cdrom_header_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_header) as u32;
+    let cdrom_retf_addr = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_retf) as u32;
     let boot_seg = ((LOW_MEM_BASE + core::mem::offset_of!(LowMem, boot_psp) as u32) >> 4) as u16;
 
     // Bootstrap sentinel PSP: self-referencing parent_psp terminates any
@@ -4216,7 +4640,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         sft_seg: (sft_addr >> 4) as u16,
         cds_off: (cds_addr & 0xF) as u16,
         cds_seg: (cds_addr >> 4) as u16,
-        block_devs: 1,
+        block_devs: 2,
         last_drive: NUM_DRIVES,
         ..Default::default()
     };
@@ -4234,7 +4658,9 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     }
     machine.write::<Sft>(lm_field(core::mem::offset_of!(LowMem, sft)), sft);
 
-    // CDS: drive 2 = C:\, drive 7 = H:\ (hostfs). Others stay invalid.
+    // CDS: C: is the data disk, D: the hot-swappable CD-ROM, H: hostfs.
+    // Programs such as Dos Navigator read this table directly rather than
+    // deriving drive validity from AH=0Eh, so it must agree with DFS.
     let mk = |drive_letter: u8| -> CdsEntry {
         let mut e = CdsEntry::default();
         e.path[0] = drive_letter;
@@ -4246,8 +4672,30 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     };
     let mut cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
     cds[2] = mk(b'C');
-    cds[7] = mk(b'H');
+    cds[3] = mk(b'D');
+    if crate::kernel::platform::get().hostfs {
+        cds[7] = mk(b'H');
+    }
     machine.write::<[CdsEntry; NUM_DRIVES as usize]>(lm_field(core::mem::offset_of!(LowMem, cds)), cds);
+
+    // MSCDEX 1501h exposes this header. The two request entry offsets are
+    // valid far-call targets even before the full device request API exists.
+    let header_segment_base = cdrom_header_addr & !0xF;
+    let retf_off = (cdrom_retf_addr - header_segment_base) as u16;
+    machine.write::<CdromDeviceHeader>(
+        cdrom_header_addr as usize,
+        CdromDeviceHeader {
+            next: u32::MAX,
+            attributes: 0xC800, // character, IOCTL, open/close, CD-ROM
+            strategy: retf_off,
+            interrupt: retf_off,
+            name: *b"MSCD001 ",
+            reserved: 0,
+            drive_letter: 4, // DOS block-device numbering: D: == 4
+            subunits: 1,
+        },
+    );
+    machine.write::<u8>(cdrom_retf_addr as usize, 0xCB);
 }
 
 
