@@ -276,8 +276,8 @@ fn scanout<'a, A: crate::Arch>(
 /// Whole-frame throttle for the hosted window sink, off the same tick clock
 /// the 0x3DA vertical-retrace fabrication reads. The direct-framebuffer path
 /// does not use this: its render/publish state machine owns that cadence.
-fn frame_due(now_ticks: u64, hz: u64) -> bool {
-    let frame = (now_ticks.wrapping_mul(hz) / 1000) as u32;
+fn frame_due(now_ns: u64, hz: u64) -> bool {
+    let frame = (u128::from(now_ns) * u128::from(hz) / 1_000_000_000) as u32;
     static LAST: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
     LAST.swap(frame, Ordering::Relaxed) != frame
 }
@@ -339,7 +339,7 @@ fn voodoo_display_tick<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
-    now_ticks: u64,
+    now_ns: u64,
     external: Option<&mut crate::kernel::display::Display>,
 ) -> bool {
     let Some(voodoo) = pc.voodoo.as_mut() else {
@@ -349,7 +349,7 @@ fn voodoo_display_tick<A: crate::Arch>(
         return false;
     }
     // 60 Hz, the refresh Glide programs for every resolution we serve.
-    let refresh_due = frame_due(now_ticks, 60);
+    let refresh_due = frame_due(now_ns, 60);
     if refresh_due {
         voodoo.vblank();
     }
@@ -420,7 +420,7 @@ pub fn display_tick<A: crate::Arch>(
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     pc: &mut PcMachine,
     regs: &Regs,
-    now_ticks: u64,
+    now_ns: u64,
     mut external: Option<&mut crate::kernel::display::Display>,
 ) {
     // A physical Voodoo board takes the monitor away from the VGA card with
@@ -448,7 +448,7 @@ pub fn display_tick<A: crate::Arch>(
     // A Glide program that has mapped the Voodoo owns the display: the card
     // scans out instead of the VGA, exactly as the real board's pass-through
     // relay does when it switches out of VGA mode.
-    if voodoo_display_tick(machine, &mut *bios, pc, now_ticks, external.as_deref_mut()) {
+    if voodoo_display_tick(machine, &mut *bios, pc, now_ns, external.as_deref_mut()) {
         return;
     }
     // A real card scans out its own VRAM: there is no register file to read
@@ -474,10 +474,10 @@ pub fn display_tick<A: crate::Arch>(
         // tick publishes that shadow to GOP. Rendering and device traffic get
         // separate budgets, and the physical scanout is the only visible
         // top-to-bottom sweep.
-        let period_ticks: usize = if display.slow() { 50 } else { 14 };
+        let refresh_hz: u32 = if display.slow() { 20 } else { 70 };
         let Some(mode) = vga.current_mode() else { return };
         match crate::kernel::display::scanout_action(
-            &mut pc.present_scratch2, display, mode, now_ticks, period_ticks,
+            &mut pc.present_scratch2, display, mode, now_ns, refresh_hz,
         ) {
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
@@ -535,7 +535,7 @@ pub fn display_tick<A: crate::Arch>(
         return;
     }
     // Window sink (hosted): still takes a whole rendered frame per period.
-    if !frame_due(now_ticks, 70) {
+    if !frame_due(now_ns, 70) {
         return;
     }
     crate::kernel::startup::bill_present();

@@ -42,7 +42,7 @@ static RATE_SPIKES: AtomicU32 = AtomicU32::new(0);
 /// wanders and the sampled spike log cannot say why. Reported per ~3s of TSC;
 /// read it against the sink itself rather than a TSC frequency, which is not
 /// known here: `drained / 48000` IS the real elapsed time, so comparing it to
-/// `dt_sum` says whether our clock is honest, and `produced` vs `drained` says
+/// `dt_sum` (nanoseconds) says whether our clock is honest, and `produced` vs `drained` says
 /// whether frames are going missing. Enabled with Trace (F12 → Debug).
 #[derive(Default)]
 struct Census {
@@ -91,7 +91,7 @@ pub struct Sink {
     inner: sound::sink::Sink<Device>,
     producer: sound::Pacer,
     last_consumed: u64,
-    ms_since_cursor: u64,
+    ns_since_cursor: u64,
     rate_q16: Option<u64>,
     census: Census,
 }
@@ -139,7 +139,7 @@ impl Sink {
             inner,
             producer: sound::Pacer::new(rate),
             last_consumed: 0,
-            ms_since_cursor: 0,
+            ns_since_cursor: 0,
             rate_q16: None,
             census: Census::default(),
         })
@@ -217,15 +217,16 @@ impl Clock {
         self.produced_q16 >> RATE_FP_SHIFT
     }
 
-    fn produce(&mut self, rate_q16: u64, dt_ms: u64) -> u64 {
+    fn produce(&mut self, rate_q16: u64, dt_ns: u64) -> u64 {
         let before = self.produced_frames();
-        self.produced_q16 += (rate_q16 as u128 * dt_ms as u128 / 1000) as u64;
+        self.produced_q16 +=
+            (rate_q16 as u128 * dt_ns as u128 / 1_000_000_000) as u64;
         self.produced_frames() - before
     }
 
-    fn frames_for(&self, rate_q16: u64, dt_ms: u64) -> u64 {
+    fn frames_for(&self, rate_q16: u64, dt_ns: u64) -> u64 {
         let after = self.produced_q16 as u128
-            + rate_q16 as u128 * dt_ms as u128 / 1000;
+            + rate_q16 as u128 * dt_ns as u128 / 1_000_000_000;
         (after >> RATE_FP_SHIFT) as u64 - self.produced_frames()
     }
 }
@@ -238,14 +239,14 @@ pub fn advance<A: crate::Arch>(
     machine: &mut A,
     clock: &mut Clock,
     mut sink: Option<&mut Sink>,
-    dt_ms: u64,
+    dt_ns: u64,
     mut mix: impl FnMut(&mut A, AudioSpan<'_>),
 ) {
     let prof = crate::kernel::startup::profile_enabled();
     let profile_start = if prof { machine.rdtsc() } else { 0 };
     let mut device_cycles = 0u64;
     let mut output_cycles = 0u64;
-    let mut elapsed_ms = dt_ms;
+    let mut elapsed_ns = dt_ns;
     let mut written = 0;
     let mut consumed = 0;
     let mut fill = 0;
@@ -270,22 +271,22 @@ pub fn advance<A: crate::Arch>(
             output.recover_from_underrun();
             written = consumed;
             output.last_consumed = consumed;
-            output.ms_since_cursor = 0;
+            output.ns_since_cursor = 0;
             output.rate_q16 = Some(output.producer.update_rate(
-                written, consumed, fill, elapsed_ms,
+                written, consumed, fill, elapsed_ns,
             ));
         }
 
         // Correct only when the block-granular play cursor moves. Between
         // completions its stale value is not a new latency measurement.
-        output.ms_since_cursor += elapsed_ms;
+        output.ns_since_cursor += elapsed_ns;
         drained = consumed.saturating_sub(output.last_consumed);
         if drained > 0 {
             output.rate_q16 = Some(output.producer.update_rate(
-                written, consumed, fill, output.ms_since_cursor,
+                written, consumed, fill, output.ns_since_cursor,
             ));
             output.last_consumed = consumed;
-            output.ms_since_cursor = 0;
+            output.ns_since_cursor = 0;
         }
         output.rate_q16.unwrap_or_else(|| output.producer.s_q16())
     } else {
@@ -296,16 +297,16 @@ pub fn advance<A: crate::Arch>(
         let queued = output.inner.written_frames()
             .saturating_sub(output.inner.consumed_frames());
         let available = output.inner.safety_ceiling_frames().saturating_sub(queued);
-        if clock.frames_for(rate_q16, elapsed_ms) > available {
+        if clock.frames_for(rate_q16, elapsed_ns) > available {
             // A delayed kernel tick, or a device cursor which stopped moving,
             // cannot be caught up through a finite DMA ring. Re-anchor at the
             // consumer and discard this elapsed batch before asking sources to
             // render it; the next ordinary tick starts at the reset cursor.
             output.recover_from_underrun();
             output.last_consumed = output.inner.consumed_frames();
-            output.ms_since_cursor = 0;
+            output.ns_since_cursor = 0;
             output.rate_q16 = None;
-            elapsed_ms = 0;
+            elapsed_ns = 0;
         }
     }
 
@@ -332,7 +333,7 @@ pub fn advance<A: crate::Arch>(
     let mix_rate = (pitch_rate_q16 >> RATE_FP_SHIFT) as u32;
     let mut frames = [(0i32, 0i32); MIX_CHUNK];
     let mut base = clock.produced_frames();
-    let mut remaining = clock.produce(rate_q16, elapsed_ms);
+    let mut remaining = clock.produce(rate_q16, elapsed_ns);
     let produced = remaining;
     while remaining > 0 {
         let run = usize::try_from(remaining.min(MIX_CHUNK as u64)).unwrap();
@@ -388,13 +389,13 @@ pub fn advance<A: crate::Arch>(
             c.tsc0 = now;
         }
         c.calls += 1;
-        c.dt_sum += elapsed_ms;
+        c.dt_sum += elapsed_ns;
         c.drained += drained;
         c.produced += produced;
         // ~3e9 TSC ticks: a few seconds on any plausible clock.
         if now.wrapping_sub(c.tsc0) > 3_000_000_000 {
             crate::println!(
-                "census: tsc={} calls={} dt_sum={} drained={} produced={} rate={} s={}",
+                "census: tsc={} calls={} dt_ns={} drained={} produced={} rate={} s={}",
                 now - c.tsc0, c.calls, c.dt_sum, c.drained, c.produced,
                 rate_q16 >> RATE_FP_SHIFT, output.producer.s_q16() >> RATE_FP_SHIFT,
             );
@@ -412,14 +413,14 @@ pub fn advance<A: crate::Arch>(
         let n = RATE_SPIKES.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(256) {
             crate::println!(
-                "audio: rate={} s={} depth={} target={} drained={} dt={} ms={} (spike #{})",
+                "audio: rate={} s={} depth={} target={} drained={} dt_ns={} cursor_ns={} (spike #{})",
                 rate_hz,
                 s_hz,
                 written as i64 - consumed as i64,
                 fill,
                 drained,
-                elapsed_ms,
-                output.ms_since_cursor,
+                elapsed_ns,
+                output.ns_since_cursor,
                 n,
             );
         }

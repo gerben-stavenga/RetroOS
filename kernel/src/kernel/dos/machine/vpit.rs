@@ -5,7 +5,7 @@
 // ============================================================================
 
 const PIT_INPUT_HZ: u64 = 1_193_182;
-const HOST_TIMER_HZ: u64 = 1000;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 #[derive(Clone, Copy)]
 struct VirtualPitChannel {
@@ -184,7 +184,7 @@ impl VirtualPitChannel {
 /// and port 61h bit 4 already fakes the refresh line for the games that poll
 /// it (see `vkbd::read_port61`).
 pub struct VirtualPit {
-    last_host_tick: u64,
+    last_host_ns: u64,
     frac_accum: u64,
     input_cycles: u64,
     /// The system timer: the only channel wired to an IRQ line.
@@ -199,9 +199,9 @@ pub struct VirtualPit {
 
 impl VirtualPit {
     pub(crate) fn new<A: crate::Arch>(machine: &mut A) -> Self {
-        let now = machine.get_ticks();
+        let now = machine.now();
         Self {
-            last_host_tick: now,
+            last_host_ns: now,
             frac_accum: 0,
             input_cycles: 0,
             ch0: VirtualPitChannel::new(),
@@ -219,18 +219,18 @@ impl VirtualPit {
     }
 
     fn sync<A: crate::Arch>(&mut self, machine: &mut A) {
-        self.sync_at(machine.get_ticks());
+        self.sync_at(machine.now());
     }
 
     fn sync_at(&mut self, now: u64) {
-        let delta_ticks = now.saturating_sub(self.last_host_tick);
-        if delta_ticks == 0 {
+        let delta_ns = now.saturating_sub(self.last_host_ns);
+        if delta_ns == 0 {
             return;
         }
-        self.last_host_tick = now;
-        let total = self.frac_accum.saturating_add(delta_ticks.saturating_mul(PIT_INPUT_HZ));
-        self.input_cycles = self.input_cycles.saturating_add(total / HOST_TIMER_HZ);
-        self.frac_accum = total % HOST_TIMER_HZ;
+        self.last_host_ns = now;
+        let total = self.frac_accum.saturating_add(delta_ns.saturating_mul(PIT_INPUT_HZ));
+        self.input_cycles = self.input_cycles.saturating_add(total / NANOS_PER_SECOND);
+        self.frac_accum = total % NANOS_PER_SECOND;
     }
 
     pub(crate) fn read_counter<A: crate::Arch>(&mut self, machine: &mut A, channel: u8) -> u8 {
@@ -272,8 +272,8 @@ impl VirtualPit {
         self.ch2.output(self.input_cycles)
     }
 
-    pub fn take_pending_irqs(&mut self, now_ticks: u64) -> u32 {
-        self.sync_at(now_ticks);
+    pub fn take_pending_irqs(&mut self, now_ns: u64) -> u32 {
+        self.sync_at(now_ns);
         self.ch0.take_irqs(self.input_cycles)
     }
 

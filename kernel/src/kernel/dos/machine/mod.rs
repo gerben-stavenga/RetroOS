@@ -706,12 +706,12 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
         // INT 9 drain loop to a single scancode per interrupt: during a
         // µs-scale handler the next byte "hasn't arrived on the wire yet".
         // The in-service sentinel backstops that when the host deschedules
-        // us mid-handler (see queue_tick). Poll-driven guests (IRQ1 masked,
+        // us mid-handler (see advance_timers). Poll-driven guests (IRQ1 masked,
         // never in service) advance through the FIFO here at the paced rate;
         // a surfaced byte still raises its IRQ1 edge (harmlessly latched in
         // the masked IRR, exactly like hardware).
         0x64 => {
-            if !pc.vpic.in_service(1) && pc.vkbd.try_surface(machine.get_ticks()) {
+            if !pc.vpic.in_service(1) && pc.vkbd.try_surface(machine.now()) {
                 pc.vpic.raise(1);
             }
             if pc.vkbd.has_data() { 1 } else { 0 }
@@ -1177,11 +1177,11 @@ fn dec_rep_count(regs: &mut Regs, addr32: bool) {
 /// is separate from `queue_irq` (which runs inside the input-queue drain, where
 /// `machine` is borrowed). Edge-triggered: the IRR coalesces repeated ticks into
 /// one pending line, so a slow guest loses ticks rather than flooding.
-pub fn queue_tick(pc: &mut PcMachine, now_ticks: u64) {
-    if pc.vpit.take_pending_irqs(now_ticks) > 0 {
+pub fn advance_timers(pc: &mut PcMachine, now_ns: u64) {
+    if pc.vpit.take_pending_irqs(now_ns) > 0 {
         pc.vpic.raise(0);
     }
-    if pc.vrtc.take_pending_irqs(now_ticks) > 0 {
+    if pc.vrtc.take_pending_irqs(now_ns) > 0 {
         pc.vpic.raise(8);
     }
     // The 8042's serial clock: surface at most one queued scancode per
@@ -1190,7 +1190,7 @@ pub fn queue_tick(pc: &mut PcMachine, now_ticks: u64) {
     // not a reliable measure under heavy loads"): if the host deschedules us
     // mid-INT 9 for longer than the pacing period, the next byte must still
     // wait — a byte surfacing mid-handler is exactly the lost-release bug.
-    if !pc.vpic.in_service(1) && pc.vkbd.try_surface(now_ticks) {
+    if !pc.vpic.in_service(1) && pc.vkbd.try_surface(now_ns) {
         pc.vpic.raise(1);
     }
 }
@@ -1248,12 +1248,13 @@ impl PcmSource<'_> {
 /// production frontier — the frame the next produced block starts at, so a
 /// note sounds within one millisecond of its OUT; a free-running arrival
 /// clock here once stamped a program's first notes seconds ahead, the GM
-/// start delay). Called on every event-loop slice, including the ticks==0
-/// fast path that skips the pump entirely.
+/// start delay). Called on every event-loop slice, including between clock
+/// wakeups when the PCM mixer does not run.
 pub fn audio_service<A: crate::Arch>(
     machine: &mut A,
     pc: &mut PcMachine,
-    now_ticks: u64,
+    now_ns: u64,
+    dt_ns: u64,
     pushed: u64,
 ) {
     let PcMachine { sb, gus, mpu, vpic, .. } = pc;
@@ -1264,10 +1265,12 @@ pub fn audio_service<A: crate::Arch>(
     let SoundBlaster { blaster, device } = sb;
     if let SbDevice::Emulated(emu) = device {
         emu.deliver_trigger_irq(vpic, blaster.irq);
-        emu.deliver_probe_irq(now_ticks, vpic, blaster.irq);
+        emu.deliver_probe_irq(now_ns, vpic, blaster.irq);
     }
     let t1 = if prof { machine.rdtsc() } else { 0 };
-    gus.tick(now_ticks, vpic);
+    if dt_ns != 0 {
+        gus.advance(dt_ns, vpic);
+    }
     let t2 = if prof { machine.rdtsc() } else { 0 };
     mpu.tick(machine, pushed);
     if prof {
@@ -1281,7 +1284,7 @@ pub fn audio_service<A: crate::Arch>(
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
     pc: &mut PcMachine,
-    now_ticks: u64,
+    now_ns: u64,
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
     let PcMachine { sb, gus, mpu, spk, vpic, .. } = pc;
@@ -1319,7 +1322,7 @@ pub fn audio_tick<A: crate::Arch>(
     }
 
     if let Some(emu) = sb {
-        emu.dsp_clock_tick(machine, now_ticks, vpic, sb_irq);
+        emu.dsp_clock_tick(machine, now_ns, vpic, sb_irq);
     }
     gus.deliver_events(vpic);
 }
@@ -1338,7 +1341,7 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
             }
             // Queue only — the byte travels "over the serial link" and
             // surfaces (with its own IRQ1 edge) through the pacing clock in
-            // `queue_tick` / the 0x64 poll path. No PIC-state peeking here:
+            // `advance_timers` / the 0x64 poll path. No PIC-state peeking here:
             // the edge-per-surfaced-byte model lets IRR/ISR do the ordering,
             // as on real hardware.
             pc.vkbd.push(sc);

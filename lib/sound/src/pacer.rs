@@ -73,9 +73,11 @@ impl Pacer {
     }
 
     /// Advance the controller one pump and return the rate to mix at, in
-    /// frames/sec × 2^16. Critically damped correction toward `target`.
-    pub fn update_rate(&mut self, written: u64, consumed: u64, target: u32, dt_ms: u64) -> u64 {
-        if dt_ms == 0 {
+    /// frames/sec × 2^16. `dt_ns` is the exact elapsed interval for this
+    /// pump; invocation cadence may still be batched at millisecond scale.
+    /// Critically damped correction toward `target`.
+    pub fn update_rate(&mut self, written: u64, consumed: u64, target: u32, dt_ns: u64) -> u64 {
+        if dt_ns == 0 {
             return self.s_q16();
         }
 
@@ -97,8 +99,9 @@ impl Pacer {
             i128::from(Self::omega_millirad(self.s_q16() >> RATE_FP_SHIFT, target));
         let one_q16 = i128::from(1u64 << RATE_FP_SHIFT);
         // s' = -w^2 q, integrated over the pump: the spring, slow and quiet.
-        // The divisor carries w's milli scale twice over, and dt's once.
-        self.s_q16 -= q * omega_m * omega_m * one_q16 * i128::from(dt_ms) / 1_000_000_000;
+        // The divisor carries w's milli scale twice and nanoseconds once.
+        self.s_q16 -= q * omega_m * omega_m * one_q16 * i128::from(dt_ns)
+            / 1_000_000_000_000_000;
         // rate = s - 2w q: the dashpot, instant and carrying q's noise.
         // Together these are rate' = -[2w (rate - y') + w^2 (p - y)], since
         // rate - y' is q' — which is why q never has to be differentiated.
@@ -135,11 +138,11 @@ mod tests {
         let target = 1_440;
         // Queue 100 frames deeper than asked for: mix slower until it drains.
         let mut pacer = Pacer::new(48_000);
-        let slow = pacer.update_rate(1_540, 0, target, 1);
+        let slow = pacer.update_rate(1_540, 0, target, 1_000_000);
         assert!(slow < 48_000u64 << RATE_FP_SHIFT, "slow = {slow}");
         // 100 frames short: mix faster.
         let mut pacer = Pacer::new(48_000);
-        let fast = pacer.update_rate(1_340, 0, target, 1);
+        let fast = pacer.update_rate(1_340, 0, target, 1_000_000);
         assert!(fast > 48_000u64 << RATE_FP_SHIFT, "fast = {fast}");
     }
 }

@@ -684,11 +684,14 @@ pub struct Scratch {
     /// discards a pending shadow and starts a fresh render.
     geo: (usize, usize, usize, usize, usize, usize),
     mode: Option<vga::VgaMode>,
-    /// Display time-slice within the current refresh. Phase zero is vertical
-    /// retrace. At its trailing edge the whole shadow is rendered; the next
-    /// phase publishes it.
+    /// Beam phase within the current refresh, scaled to 449 steps. Phase zero
+    /// is vertical retrace. At its trailing edge the whole shadow is rendered;
+    /// the next clock wakeup publishes it.
     phase: usize,
-    period_ticks: usize,
+    refresh_hz: u32,
+    /// Refresh containing the most recent render. This prevents the 1 ms work
+    /// cadence from becoming the display clock.
+    frame: u64,
     /// A complete shadow exists and has not yet been published.
     ready: bool,
     /// Last time the clock ran, for liveness only ([`beam_vretrace`] reports
@@ -711,7 +714,8 @@ impl Scratch {
             geo: (0, 0, 0, 0, 0, 0),
             mode: None,
             phase: 0,
-            period_ticks: 0,
+            refresh_hz: 0,
+            frame: 0,
             ready: false,
             last_tick: 0,
         }
@@ -729,7 +733,8 @@ impl Scratch {
             core::ptr::addr_of_mut!((*p).geo).write((0, 0, 0, 0, 0, 0));
             core::ptr::addr_of_mut!((*p).mode).write(None);
             core::ptr::addr_of_mut!((*p).phase).write(0);
-            core::ptr::addr_of_mut!((*p).period_ticks).write(0);
+            core::ptr::addr_of_mut!((*p).refresh_hz).write(0);
+            core::ptr::addr_of_mut!((*p).frame).write(0);
             core::ptr::addr_of_mut!((*p).ready).write(false);
             core::ptr::addr_of_mut!((*p).last_tick).write(0);
             boxed.assume_init()
@@ -807,23 +812,31 @@ unsafe extern "C" {
 
 
 
-/// Number of scheduler phases exposed as vertical retrace. A normal 14-tick
-/// frame gets one phase; the deliberately slower TCG path keeps approximately
-/// the same 49/449 VGA blanking fraction.
-fn vretrace_ticks(period_ticks: usize) -> usize {
-    (period_ticks * 49 / 449).max(1).min(period_ticks.saturating_sub(2).max(1))
+const BEAM_STEPS: u64 = 449;
+const VRETRACE_STEPS: usize = 49;
+
+/// Exact rational refresh identity and beam phase. Reducing `now_ns` to the
+/// current second first keeps every multiplication in `u64` even after years
+/// of uptime.
+fn beam_time(now_ns: u64, refresh_hz: u32) -> (u64, usize) {
+    let seconds = now_ns / 1_000_000_000;
+    let ns = now_ns % 1_000_000_000;
+    let within_second = ns * u64::from(refresh_hz);
+    let frame = seconds * u64::from(refresh_hz) + within_second / 1_000_000_000;
+    let phase = ((within_second % 1_000_000_000) * BEAM_STEPS / 1_000_000_000) as usize;
+    (frame, phase)
 }
 
 /// Guest-visible vertical retrace for an active direct scanout. `None` when
 /// no scanout is live (window sink, unfocused thread, real VGA), so the caller
 /// can use its free-running fallback.
 pub fn beam_vretrace(s: &Scratch, now_tick: u64) -> Option<bool> {
-    if s.geo.1 == 0 || s.period_ticks == 0
+    if s.geo.1 == 0 || s.refresh_hz == 0
         || now_tick.saturating_sub(s.last_tick) > 100
     {
         return None;
     }
-    Some(s.phase < vretrace_ticks(s.period_ticks))
+    Some(s.phase < VRETRACE_STEPS)
 }
 
 pub enum ScanoutAction<'a> {
@@ -848,13 +861,14 @@ pub fn scanout_action<'a>(
     s: &'a mut Scratch,
     display: &Display,
     mode: vga::VgaMode,
-    now_tick: u64,
-    period_ticks: usize,
+    now_ns: u64,
+    refresh_hz: u32,
 ) -> ScanoutAction<'a> {
     let (w, h) = vga::dimensions(mode);
-    if w == 0 || h == 0 || period_ticks < 3 {
+    if w == 0 || h == 0 || refresh_hz == 0 {
         return ScanoutAction::None;
     }
+    let (frame, phase) = beam_time(now_ns, refresh_hz);
     let (out_w, out_h) = display.fit();
     // A sink SMALLER than the guest image is legal: the Bresenham walk in
     // `StretchRow` shrinks as readily as it stretches, and `present` drops
@@ -879,13 +893,13 @@ pub fn scanout_action<'a>(
     let reset = s.geo != geo
         || s.mode != Some(mode)
         || s.surface.len() != row_bytes * h + slack
-        || s.period_ticks != period_ticks;
+        || s.refresh_hz != refresh_hz;
     if reset {
         s.geo = geo;
         s.surface.clear();
         s.surface.resize(row_bytes * h + slack, 0);
         s.mode = Some(mode);
-        s.period_ticks = period_ticks;
+        s.refresh_hz = refresh_hz;
         // A mode switch gets a complete shadow immediately and publishes it
         // on the following tick. Keep the old complete physical frame until
         // then: scanout is double-buffered, so reconfiguring the write-back
@@ -894,20 +908,16 @@ pub fn scanout_action<'a>(
         // access registers to update fonts; those writes can make mode
         // classification transiently change even though the visible timing
         // has not.
-        s.phase = vretrace_ticks(period_ticks);
+        s.phase = phase;
+        s.frame = frame;
         s.ready = false;
-        s.last_tick = now_tick;
+        s.last_tick = now_ns / 1_000_000;
         return ScanoutAction::Render;
     }
 
-    s.last_tick = now_tick;
-    s.phase = (s.phase + 1) % period_ticks;
-    let render_phase = vretrace_ticks(period_ticks);
-    let publish_phase = render_phase + 1;
-    if s.phase == render_phase {
-        s.ready = false;
-        ScanoutAction::Render
-    } else if s.phase == publish_phase && s.ready {
+    s.last_tick = now_ns / 1_000_000;
+    s.phase = phase;
+    if s.ready {
         s.ready = false;
         let h = s.geo.1;
         let out_w = s.geo.2;
@@ -925,6 +935,10 @@ pub fn scanout_action<'a>(
             out_width: out_w,
             shadow,
         }
+    } else if frame != s.frame && phase >= VRETRACE_STEPS {
+        s.frame = frame;
+        s.ready = false;
+        ScanoutAction::Render
     } else {
         ScanoutAction::None
     }

@@ -32,7 +32,7 @@ pub(super) const KBD_TRACE: bool = false;
 ///  - a byte arriving while INT 9 is in service waits its turn and arrives
 ///    as its own IRQ1 afterwards, so releases are never coalesced away.
 ///
-/// The PUMP (queue_tick / the 0x64 poll path) additionally refuses to
+/// The timer advance (or the 0x64 poll path) additionally refuses to
 /// surface a byte while IRQ1 is in service — dosemu2's KBD_PIC_HACK
 /// sentinel (kbd.c: "timing is not a reliable measure under heavy loads"):
 /// host scheduling can stretch a µs-scale handler past any pacing period,
@@ -47,8 +47,8 @@ pub struct VirtualKeyboard {
     pub port61: u8,
     /// Output Buffer Full flag — port 0x64 bit 0
     pub obf: bool,
-    /// Millisecond tick when the last byte surfaced (the serial pacing).
-    last_surface_ms: u64,
+    /// Nanosecond timestamp when the last byte surfaced (serial pacing).
+    last_surface_ns: u64,
     /// Set after a multi-byte keyboard command (0xED/0xF0/0xF3) consumed its
     /// opcode and is waiting for the parameter byte. The parameter is ACKed
     /// but otherwise discarded — we don't actually drive LEDs, change scancode
@@ -60,7 +60,7 @@ impl VirtualKeyboard {
     pub const fn new() -> Self {
         Self {
             buffer: [0; KBD_BUF_SIZE], head: 0, tail: 0, port60: 0, port61: 0, obf: false,
-            last_surface_ms: 0, awaiting_cmd_param: false,
+            last_surface_ns: 0, awaiting_cmd_param: false,
         }
     }
 
@@ -89,23 +89,25 @@ impl VirtualKeyboard {
     }
 
     /// The 8042's serial clock: move the next queued byte into the output
-    /// buffer iff the buffer is free and the last byte surfaced on an earlier
-    /// millisecond tick (`now_ms` = `get_ticks()`, 1 kHz on every backend).
+    /// buffer iff the buffer is free and at least one millisecond has elapsed
+    /// since the previous byte surfaced.
     /// Returns true when a byte surfaced — the caller raises the IRQ1 edge:
     /// exactly one edge per byte, blind to whatever the guest's handler is
     /// doing (the PIC's IRR/ISR takes it from there, as on real hardware).
-    pub fn try_surface(&mut self, now_ms: u64) -> bool {
-        if self.obf || self.head == self.tail || now_ms == self.last_surface_ms {
+    pub fn try_surface(&mut self, now_ns: u64) -> bool {
+        if self.obf || self.head == self.tail
+            || now_ns.saturating_sub(self.last_surface_ns) < 1_000_000
+        {
             return false;
         }
         let sc = self.buffer[self.head];
         self.head = (self.head + 1) % KBD_BUF_SIZE;
         self.port60 = sc;
         self.obf = true;
-        self.last_surface_ms = now_ms;
+        self.last_surface_ns = now_ns;
         if KBD_TRACE {
             crate::dbg_println!("[kbd] surface {:02X}{} t={} buf={}",
-                sc, if sc & 0x80 != 0 { " REL" } else { "" }, now_ms, self.depth());
+                sc, if sc & 0x80 != 0 { " REL" } else { "" }, now_ns, self.depth());
         }
         true
     }
@@ -194,7 +196,7 @@ impl VirtualKeyboard {
         self.port60 = 0;
         self.port61 = 0;
         self.obf = false;
-        self.last_surface_ms = 0;
+        self.last_surface_ns = 0;
         self.awaiting_cmd_param = false;
     }
 

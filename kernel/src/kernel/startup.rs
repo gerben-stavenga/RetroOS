@@ -718,7 +718,6 @@ pub fn event_loop<A: crate::Arch>(
     let mut stats = EventStats::new(machine);
     let mut last_osd_refresh_tick = u64::MAX;
     let mut last_world_ns = machine.now();
-    let mut pending_world_ns = 0u64;
     // Metal IRQ0 queues Irq::Hw(0); hosted KVM's timer signal returns
     // KernelEvent::Irq. Either is only permission to resample the real clock.
     let mut irq_clock_wakeup = false;
@@ -758,29 +757,27 @@ pub fn event_loop<A: crate::Arch>(
         stats.part(machine, 0);
         // The queue is cheap to drain when empty and carries the IRQ0 wakeup
         // which gates clock sampling, so it cannot itself be clock-gated.
-        pending_world_ns = pending_world_ns.saturating_add(
-            world_now_ns.saturating_sub(last_world_ns));
+        let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
-        // Bound one service pass while retaining both whole-millisecond
-        // backlog and the sub-millisecond remainder for following exits.
-        let ticks = (pending_world_ns / 1_000_000).min(64) as u32;
-        pending_world_ns -= u64::from(ticks) * 1_000_000;
         let thread = ctx.thread(threads);
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
         thread.personality.advance_world(
-            machine, now_tick, ticks, audio_clock.produced_frames());
-        if ticks != 0 {
+            machine, world_now_ns, elapsed_ns,
+            audio_clock.produced_frames());
+        if elapsed_ns != 0 {
             crate::kernel::sound::advance(
                 machine,
                 &mut audio_clock,
                 sink.as_deref_mut(),
-                ticks as u64,
-                |machine, span| thread.personality.audio_tick(machine, now_tick, span),
+                elapsed_ns,
+                |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
             );
+        }
+        if elapsed_ns != 0 {
             thread.personality.display_tick(
-                machine, &mut *bios_workspace, &ctx.regs, now_tick,
+                machine, &mut *bios_workspace, &ctx.regs, world_now_ns,
             );
         }
         stats.part(machine, 2);
@@ -1488,14 +1485,14 @@ pub fn bill_present() {
 
 /// Timer acquisition, device tick loop, display, audio, and the tick count —
 /// each can be billed independently and divided by its own denominator.
-pub fn bill_slice2(take: u64, ticks_cyc: u64, display: u64, audio: u64, nticks: u64) {
+pub fn bill_slice2(take: u64, timer_cyc: u64, display: u64, audio: u64, advances: u64) {
     unsafe {
         let p = &raw mut SLICE_PARTS;
         (*p)[0] = (*p)[0].wrapping_add(take);
-        (*p)[1] = (*p)[1].wrapping_add(ticks_cyc);
+        (*p)[1] = (*p)[1].wrapping_add(timer_cyc);
         (*p)[2] = (*p)[2].wrapping_add(display);
         (*p)[3] = (*p)[3].wrapping_add(audio);
-        (*p)[4] = (*p)[4].wrapping_add(nticks);
+        (*p)[4] = (*p)[4].wrapping_add(advances);
     }
 }
 
@@ -1901,7 +1898,7 @@ impl EventStats {
                     .checked_div(ev)
                     .unwrap_or(0);
                 crate::dbg_println!(
-                    "[prof] per-exit fixed={}c (loop={} irq-drain={}) | world: ticks={} queue={}c/tick unclassified={} cycles",
+                    "[prof] per-exit fixed={}c (loop={} irq-drain={}) | world: advances={} timer={}c/advance unclassified={} cycles",
                     fixed, loop_total / ev, self.pre_parts[1] / ev, sp[4],
                     sp[1].checked_div(sp[4].max(1)).unwrap_or(0), world_other);
                 let (allocations, deallocations) = lib::heap::allocation_counts();

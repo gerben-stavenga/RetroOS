@@ -319,8 +319,8 @@ impl<A: crate::Arch> Personality<A> {
     pub fn advance_world(
         &mut self,
         machine: &mut A,
-        now_ticks: u64,
-        ticks: u32,
+        now_ns: u64,
+        dt_ns: u64,
         audio_pushed: u64,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
@@ -329,27 +329,24 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(dos) => {
                 // Port-polling games can exit to the kernel hundreds of
                 // thousands of times between adjacent millisecond ticks.
-                // Display and output pumping are driven by this tick clock, so
-                // revisiting the whole virtual machine when it did not advance
+                // Display and output pumping are driven by clock wakeups, so
+                // revisiting the timed devices when time did not advance
                 // is pure per-exit overhead. Device service is not:
                 // its latency contract is the slice (MI2 arms a one-byte DMA
                 // probe and expects the completion back-to-back; a 1 ms
                 // floor loses it — 35e3b27, regressed once by a full
                 // early-out here).
-                if ticks == 0 {
-                    crate::kernel::dos::audio_service(machine, dos, now_ticks, audio_pushed);
-                } else {
-                    for _ in 0..ticks {
-                        crate::kernel::dos::queue_tick(dos, now_ticks);
-                    }
-                    crate::kernel::dos::audio_service(machine, dos, now_ticks, audio_pushed);
+                if dt_ns != 0 {
+                    crate::kernel::dos::advance_timers(dos, now_ns);
                 }
+                crate::kernel::dos::audio_service(
+                    machine, dos, now_ns, dt_ns, audio_pushed);
             }
             Self::Linux(_) => {}
         }
         if prof {
             crate::kernel::startup::bill_slice2(
-                0, machine.rdtsc().wrapping_sub(t0), 0, 0, ticks as u64);
+                0, machine.rdtsc().wrapping_sub(t0), 0, 0, u64::from(dt_ns != 0));
         }
     }
 
@@ -357,11 +354,11 @@ impl<A: crate::Arch> Personality<A> {
     pub fn audio_tick(
         &mut self,
         machine: &mut A,
-        now_ticks: u64,
+        now_ns: u64,
         span: crate::kernel::sound::AudioSpan<'_>,
     ) {
         match self {
-            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, now_ticks, span),
+            Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, now_ns, span),
             Self::Linux(_) => {}
         }
     }
@@ -373,14 +370,14 @@ impl<A: crate::Arch> Personality<A> {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         regs: &Regs,
-        now_ticks: u64,
+        now_ns: u64,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
         crate::kernel::osd::with_display(|external| match self {
             Self::Dos(dos) => {
                 crate::kernel::dos::display_tick(
-                    machine, bios, dos, regs, now_ticks, external);
+                    machine, bios, dos, regs, now_ns, external);
             }
             Self::Linux(_) => crate::kernel::linux::display_tick(machine, bios, external),
         });

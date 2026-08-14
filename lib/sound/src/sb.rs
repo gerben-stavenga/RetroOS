@@ -50,7 +50,7 @@ pub struct Wiring {
 /// feeding silence (see [`Sb::owns_sink`]). Long enough to bridge
 /// per-animation-frame sound-effect re-triggers (~150 ms), short enough that
 /// FM music isn't held at the DSP rate for long once effects go quiet.
-const DSP_HANGOVER_MS: u64 = 300;
+const DSP_HANGOVER_NS: u64 = 300_000_000;
 
 /// CT1745 (SB16) mixer attenuation table: a 5-bit level in bits 7:3 of the
 /// volume register, 2 dB per step, as a linear amplitude out of 32767. Taken
@@ -318,7 +318,7 @@ pub struct Sb {
     /// IRQ within milliseconds — completed on virtual time, not drain.
     probe: bool,
     /// Host clock at the first tick of a probe transfer.
-    start_ms: u64,
+    start_ns: u64,
     /// Block IRQs raised / serviced (guest read the DMA count or status port —
     /// poll-bool/poll-dma/irq-mix all do). Their gap is the commit horizon: a
     /// serviced block means the guest has refilled its slot, so the ring is
@@ -330,13 +330,13 @@ pub struct Sb {
     write_busy: u8,
     /// The DSP owns the canonical sink beyond `playing`: after a single-cycle
     /// sample completes (or the guest pauses), the stream is held open for
-    /// [`DSP_HANGOVER_MS`] feeding silence (FM still mixed in) instead of being
+    /// [`DSP_HANGOVER_NS`] feeding silence (FM still mixed in) instead of being
     /// torn down. Sound-effect chains re-trigger every ~150 ms (PoP's gate
     /// grinding); stopping the sink per sample meant a stream park/re-prime —
     /// and a rate flip against the FM free-run — around every effect.
     stream_hold: bool,
     /// Host clock when playback last stopped (hangover anchor).
-    done_ms: u64,
+    done_ns: u64,
     /// The last single-cycle transfer ran to terminal count: the guest-visible
     /// current-count reads 0xFFFF (the real 8237's post-TC underflow) until the
     /// channel is restarted. Completion pollers key on this (PoP 1.4's digi.drv
@@ -368,10 +368,10 @@ impl Sb {
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
-            restarted: false, probe: false, start_ms: 0,
+            restarted: false, probe: false, start_ns: 0,
             blocks_done: 0, blocks_acked: 0,
             write_busy: 0, dma_tc: false, tc_status: 0,
-            stream_hold: false, done_ms: 0,
+            stream_hold: false, done_ns: 0,
             opl: None,
         }
     }
@@ -563,7 +563,7 @@ impl Sb {
             0xD9 | 0xDA => {                     // exit 16-/8-bit auto-init
                 self.playing = false;
                 self.paused = false;
-                self.done_ms = now;
+                self.done_ns = now;
             }
             0x40 => {
                 let tc = p[0] as u32;
@@ -660,7 +660,7 @@ impl Sb {
         // the GUS output cushion and time out as "conflicting DMA channel".
         // Auto-init rings advance through the regular CPU producer.
         self.probe = s.single;
-        self.start_ms = 0;
+        self.start_ns = 0;
         self.dma_tc = false; // restart re-loads the count registers
         self.playing = self.buf_frames > 0;
         if self.playing {
@@ -682,7 +682,7 @@ impl Sb {
             // Hangover: the host keeps the stream fed (silence + synths) while
             // `stream_hold` keeps `owns_sink` true; effect chains re-trigger
             // onto a hot stream instead of a park/re-prime.
-            if self.stream_hold && now.saturating_sub(self.done_ms) >= DSP_HANGOVER_MS {
+            if self.stream_hold && now.saturating_sub(self.done_ns) >= DSP_HANGOVER_NS {
                 self.stream_hold = false;
             }
             return false;
@@ -690,10 +690,11 @@ impl Sb {
         let guest_now = if self.probe {
             // Single-cycle DMA advances continuously on the DSP's virtual
             // sample clock, independent of final-speaker stream priming.
-            if self.start_ms == 0 {
-                self.start_ms = now;
+            if self.start_ns == 0 {
+                self.start_ns = now;
             }
-            (now.saturating_sub(self.start_ms) * self.rate.max(1) as u64 / 1000)
+            ((u128::from(now.saturating_sub(self.start_ns))
+                * u128::from(self.rate.max(1)) / 1_000_000_000) as u64)
                 .min(self.next_irq)
         } else {
             produced
@@ -761,7 +762,7 @@ impl Sb {
     fn finish_single(&mut self, now: u64) {
         self.playing = false;
         self.paused = false;
-        self.done_ms = now;
+        self.done_ns = now;
         if self.cursor < self.buf_frames as u64 {
             return; // DSP stopped short; the controller is still counting
         }
@@ -798,7 +799,9 @@ impl Sb {
             return false;
         }
         // Frames the pump clock cannot resolve: shorter than its 1 ms turn.
-        if self.block_frames as u64 * 1000 >= self.rate.max(1) as u64 {
+        if self.block_frames as u64 * 1_000_000_000
+            >= self.rate.max(1) as u64 * 1_000_000
+        {
             return false;
         }
         let raise = self.block_irq();

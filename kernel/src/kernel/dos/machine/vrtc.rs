@@ -15,7 +15,7 @@
 //! completes and the guest hangs on a black screen — this is the Monkey Island
 //! / SCUMM startup-splash hang.
 
-const HOST_TIMER_HZ: u64 = 1000;
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
 
 pub struct VirtualRtc {
     /// Status register A: rate-select nibble (bits 3-0) + divider (bits 6-4).
@@ -31,9 +31,9 @@ pub struct VirtualRtc {
     /// register clears it, exactly as the real chip does — that read is how the
     /// ISR identifies the periodic interrupt and re-arms the next one.
     reg_c: u8,
-    /// Host-tick timestamp of the last periodic accumulation.
-    last_host_tick: u64,
-    /// Fractional periodic-cycle accumulator, in units of `HOST_TIMER_HZ`.
+    /// Host nanosecond timestamp of the last periodic accumulation.
+    last_host_ns: u64,
+    /// Fractional periodic-cycle accumulator, in nanosecond units.
     frac_accum: u64,
 }
 
@@ -45,7 +45,7 @@ impl VirtualRtc {
             reg_a: 0x26,
             reg_b: 0x02,
             reg_c: 0,
-            last_host_tick: machine.get_ticks(),
+            last_host_ns: machine.now(),
             frac_accum: 0,
         }
     }
@@ -84,7 +84,7 @@ impl VirtualRtc {
                 // tick lands a full period later rather than immediately —
                 // otherwise stale elapsed host time would fire a burst at once.
                 if now_pie && !was_pie {
-                    self.last_host_tick = machine.get_ticks();
+                    self.last_host_ns = machine.now();
                     self.frac_accum = 0;
                 }
             }
@@ -119,14 +119,14 @@ impl VirtualRtc {
         if hz == 0 {
             return 0;
         }
-        let delta = now.saturating_sub(self.last_host_tick);
+        let delta = now.saturating_sub(self.last_host_ns);
         if delta == 0 {
             return 0;
         }
-        self.last_host_tick = now;
+        self.last_host_ns = now;
         let total = self.frac_accum.saturating_add(delta.saturating_mul(hz));
-        let count = total / HOST_TIMER_HZ;
-        self.frac_accum = total % HOST_TIMER_HZ;
+        let count = total / NANOS_PER_SECOND;
+        self.frac_accum = total % NANOS_PER_SECOND;
         if count > 0 {
             self.reg_c |= 0xC0; // IRQF | PF
         }

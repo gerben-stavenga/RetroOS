@@ -514,7 +514,7 @@ impl EmulatedSb {
     /// start-playback command it hands it back, because only we can read the
     /// guest's DMA controller for the ring that command refers to.
     fn write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, b: &Blaster, p: u16, val: u8) {
-        let now = machine.get_ticks();
+        let now = machine.now();
         let Some(start) = self.core.port_write(p, val, now) else { return };
         let is16 = start.bits == 16;
         let chan = if is16 { b.dma16 } else { b.dma8 } as usize;
@@ -546,11 +546,11 @@ impl EmulatedSb {
     /// trigger IRQ.
     pub fn deliver_probe_irq(
         &mut self,
-        now_ticks: u64,
+        now_ns: u64,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
-        if self.core.take_probe(now_ticks) && !vpic.is_requested(irq) {
+        if self.core.take_probe(now_ns) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
     }
@@ -623,12 +623,12 @@ impl EmulatedSb {
     pub fn dsp_clock_tick<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        now_ticks: u64,
+        now_ns: u64,
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
         let produced = self.mix_pos_q32 >> 32;
-        if self.core.advance_clock(now_ticks, produced) && !vpic.is_requested(irq) {
+        if self.core.advance_clock(now_ns, produced) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and

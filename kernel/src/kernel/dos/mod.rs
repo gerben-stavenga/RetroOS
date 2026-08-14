@@ -1277,12 +1277,10 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
     machine::queue_irq(machine, &mut dos.pc, regs, irq);
 }
 
-/// Advance the virtual PIT/RTC against the machine timer and raise IRQ0/IRQ8 on
-/// a period boundary. Separate from `queue_irq` because the tick queries
-/// `machine` (it has no host payload), and `queue_irq` runs inside the input
-/// drain where `machine` is already borrowed.
-pub fn queue_tick<A: crate::Arch>(dos: &mut thread::DosState<A>, now_ticks: u64) {
-    machine::queue_tick(&mut dos.pc, now_ticks);
+/// Advance the virtual PIT/RTC to `now_ns` and raise IRQ0/IRQ8 when periods
+/// elapsed. The physical IRQ0 wakeup supplies cadence, not elapsed units.
+pub fn advance_timers<A: crate::Arch>(dos: &mut thread::DosState<A>, now_ns: u64) {
+    machine::advance_timers(&mut dos.pc, now_ns);
 }
 
 /// Render the emulated VGA to the platform display (no-op with a real card
@@ -1293,31 +1291,32 @@ pub fn display_tick<A: crate::Arch>(
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
     regs: &Regs,
-    now_ticks: u64,
+    now_ns: u64,
     display: Option<&mut crate::kernel::display::Display>,
 ) {
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ticks, display);
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, display);
 }
 
 /// Advance emulated audio playback and its guest-visible device events.
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
-    now_ticks: u64,
+    now_ns: u64,
     span: crate::kernel::sound::AudioSpan<'_>,
 ) {
-    machine::audio_tick(machine, &mut dos.pc, now_ticks, span);
+    machine::audio_tick(machine, &mut dos.pc, now_ns, span);
 }
 
 /// Per-slice audio device service (trigger IRQs, DMA-probe completions, GF1
-/// timers, MPU drain) without the millisecond pump — the ticks==0 fast path.
+/// timers and MPU drain) without running the PCM mixer.
 pub fn audio_service<A: crate::Arch>(
     machine: &mut A,
     dos: &mut thread::DosState<A>,
-    now_ticks: u64,
+    now_ns: u64,
+    dt_ns: u64,
     pushed: u64,
 ) {
-    machine::audio_service(machine, &mut dos.pc, now_ticks, pushed);
+    machine::audio_service(machine, &mut dos.pc, now_ns, dt_ns, pushed);
 }
 
 /// Try to deliver one pending interrupt from the virtual PIC. IRQ delivery

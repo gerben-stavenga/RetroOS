@@ -19,7 +19,7 @@
 //!
 //! Passive, per the crate contract: the chip never reads a clock, never
 //! touches an interrupt controller, and never learns where its DMA channel
-//! points. [`Gf1::tick`] is handed the time, [`Gf1::take_irq`] reports that
+//! points. [`Gf1::advance`] is handed elapsed time, [`Gf1::take_irq`] reports that
 //! the line went active, and [`Gf1::dma_write`] takes bytes the host already
 //! fetched. Which port base, IRQ and DMA channel the card is strapped to is
 //! host configuration (the guest's `ULTRASND=` contract); only `base` is
@@ -133,8 +133,6 @@ struct Core {
     /// the lowest set voice. Fed by the engine's Events at playback.
     wave_pending: u32,
     ramp_pending: u32,
-    /// Host clock at the last [`Gf1::tick`] (pacing anchor for the timers).
-    last_ms: u64,
     /// The line went active for a reason that is *not* a standing condition:
     /// a rate-timer expiry or a DMA terminal count. Drained by
     /// [`Gf1::take_irq`]; the voice/ramp masks are level-like and reported
@@ -167,8 +165,8 @@ struct Timer {
     /// Latched expiry — the AdLib-style status flag, cleared by the timer-
     /// control reset write (2X9 index 4, bit 7).
     expired: bool,
-    /// µs accumulated toward the next expiry.
-    acc_us: u32,
+    /// Nanoseconds accumulated toward the next expiry.
+    acc_ns: u64,
 }
 
 impl Core {
@@ -191,7 +189,6 @@ impl Core {
             timers: [Timer::default(); 2],
             wave_pending: 0,
             ramp_pending: 0,
-            last_ms: 0,
             irq_edge: false,
             dma_armed: false,
             dma_dest: 0,
@@ -402,18 +399,17 @@ impl Gf1 {
         }
     }
 
-    /// Advance the rate timers to `now_ms` (host clock, milliseconds).
+    /// Advance the rate timers by `dt_ns` monotonic nanoseconds.
     ///
     /// The GF1's two timers are rate generators: T1 counts 80 µs units, T2
     /// 320 µs, and the count register holds 256 − n. Multiple expiries inside
     /// one tick coalesce — an unserviced edge-latched line coalesces on
     /// hardware too.
-    pub fn tick(&mut self, now_ms: u64) {
+    pub fn advance(&mut self, dt_ns: u64) {
         let Some(c) = self.core.as_mut() else { return };
-        // First tick / long background gap: don't synthesize a backlog.
-        let dt = now_ms.saturating_sub(c.last_ms).min(100) as u32;
-        c.last_ms = now_ms;
-        if dt == 0 {
+        // A long background gap coalesces rather than synthesizing a backlog.
+        let dt_ns = dt_ns.min(100_000_000);
+        if dt_ns == 0 {
             return;
         }
         let (reg45, reg46, reg47) = (c.reg45, c.reg46, c.reg47);
@@ -422,15 +418,15 @@ impl Gf1 {
         let mut want_irq = core::mem::take(&mut c.dma_irq_latch);
         for (i, t) in c.timers.iter_mut().enumerate() {
             if !t.running {
-                t.acc_us = 0;
+                t.acc_ns = 0;
                 continue;
             }
-            let unit = if i == 0 { 80u32 } else { 320 };
+            let unit_ns = if i == 0 { 80_000u64 } else { 320_000 };
             let count = if i == 0 { reg46 } else { reg47 };
-            let period = unit * (256 - count as u32);
-            t.acc_us += dt * 1000;
-            if t.acc_us >= period {
-                t.acc_us %= period;
+            let period_ns = unit_ns * u64::from(256 - u16::from(count));
+            t.acc_ns += dt_ns;
+            if t.acc_ns >= period_ns {
+                t.acc_ns %= period_ns;
                 t.expired = true;
                 if reg45 & (0x04 << i) != 0 {
                     want_irq = true;
