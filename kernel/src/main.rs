@@ -137,6 +137,7 @@ fn main() {
             write: arch::host_write,
             clunk: arch::host_clunk,
             remove: arch::host_remove,
+            mkdir: arch::host_mkdir,
         });
     }
     if let Some(path) = wav {

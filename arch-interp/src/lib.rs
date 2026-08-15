@@ -99,8 +99,8 @@ pub use devices::{
 // the root; the `host_*` fns are the primitive hooks the kernel's
 // `install_host_backend` points at (direct std::fs, no COM1).
 pub use hostfs::{
-    host_clunk, host_create, host_dir_exists, host_open, host_read, host_readdir,
-    host_remove, host_write, install_native_hostfs,
+    host_clunk, host_create, host_dir_exists, host_mkdir, host_open, host_read,
+    host_readdir, host_remove, host_write, install_native_hostfs,
 };
 // Native socket backend (hosted "punch-through"): `install_native_sockets`
 // enables it; the `host_sock_*` fns are the primitive hooks the kernel's

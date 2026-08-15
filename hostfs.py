@@ -18,6 +18,7 @@ Commands:
   0x05 READDIR: path_len(u16) path index(u32) → status(i32) name_len(u8) name size(u32) is_dir(u8) mtime(u32)
   0x06 CREATE:  path_len(u16) path          → status(i32) handle(u32)
   0x07 WRITE:   handle(u32) offset(u32) len(u32) data → status(i32) written(u32)
+  0x08 MKDIR:   path_len(u16) path          → status(i32)
 """
 
 import os
@@ -28,6 +29,7 @@ import sys
 CMD_OPEN = 0x01
 CMD_READ = 0x02
 CMD_CLOSE = 0x03
+CMD_MKDIR = 0x08
 CMD_STAT = 0x04
 CMD_READDIR = 0x05
 CMD_CREATE = 0x06
@@ -178,6 +180,22 @@ class HostFs:
         self.handles[h] = f
         conn.sendall(struct.pack('<iI', 0, h))
 
+    def handle_mkdir(self, conn):
+        path_len = struct.unpack('<H', recvall(conn, 2))[0]
+        path = recvall(conn, path_len)
+        full = self._resolve(path, allow_missing_last=True)
+        print(f" {path!r} -> {full}", file=sys.stderr)
+        if full is None:
+            conn.sendall(struct.pack('<i', -2))
+            return
+        try:
+            os.mkdir(full)
+            conn.sendall(struct.pack('<i', 0))
+        except FileExistsError:
+            conn.sendall(struct.pack('<i', -17))
+        except OSError:
+            conn.sendall(struct.pack('<i', -13))
+
     def handle_write(self, conn):
         handle, offset, length = struct.unpack('<III', recvall(conn, 12))
         data = recvall(conn, length) if length > 0 else b''
@@ -196,7 +214,7 @@ class HostFs:
 
     def dispatch(self, conn):
         CMD_NAMES = {1: 'OPEN', 2: 'READ', 3: 'CLOSE', 4: 'STAT',
-                     5: 'READDIR', 6: 'CREATE', 7: 'WRITE'}
+                     5: 'READDIR', 6: 'CREATE', 7: 'WRITE', 8: 'MKDIR'}
         while True:
             cmd_byte = conn.recv(1)
             if not cmd_byte:
@@ -217,6 +235,8 @@ class HostFs:
                 self.handle_create(conn)
             elif cmd == CMD_WRITE:
                 self.handle_write(conn)
+            elif cmd == CMD_MKDIR:
+                self.handle_mkdir(conn)
             else:
                 print(f"\nUnknown command: 0x{cmd:02x}", file=sys.stderr)
                 break

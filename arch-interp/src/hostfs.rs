@@ -255,6 +255,17 @@ impl HostFs {
         }
     }
 
+    /// mkdir → 0 on success, negative errno. Without this every DOS MKDIR on
+    /// the hosted root becomes a RAM-ghost directory whose files evaporate on
+    /// shutdown (the Tomb Raider install vanished this way).
+    pub fn n_mkdir(&self, path: &[u8]) -> i32 {
+        match fs::create_dir(self.resolve(path)) {
+            Ok(()) => 0,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => -17,
+            Err(_) => -13,
+        }
+    }
+
     /// write → bytes written, or negative errno.
     pub fn n_write(&mut self, handle: u64, offset: u32, data: &[u8]) -> i32 {
         let ok = self.handles.get(&(handle as u32)).and_then(|p| {
@@ -322,6 +333,9 @@ pub fn host_clunk(handle: u64) {
 }
 pub fn host_remove(path: &[u8]) -> i32 {
     NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-1, |fs| fs.n_remove(path)))
+}
+pub fn host_mkdir(path: &[u8]) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-5, |fs| fs.n_mkdir(path)))
 }
 
 /// Return the `index`-th directory entry as `(name_bytes, size, is_dir, mtime)`.

@@ -122,6 +122,7 @@ const CMD_STAT: u8 = 0x04;
 const CMD_READDIR: u8 = 0x05;
 const CMD_CREATE: u8 = 0x06;
 const CMD_WRITE: u8 = 0x07;
+const CMD_MKDIR: u8 = 0x08;
 
 pub struct HostFs;
 
@@ -261,6 +262,17 @@ impl Filesystem for HostFs {
         send_byte(CMD_CLOSE);
         send_u32(handle as u32);
     }
+
+    fn mkdir(&self, path: &[u8]) -> i32 {
+        send_byte(CMD_MKDIR);
+        send_u16(path.len() as u16);
+        send_bytes(path);
+        recv_i32()
+    }
+
+    fn supports_mkdir(&self) -> bool {
+        true
+    }
 }
 
 // ── Injected native host backend (hosted "punch-through") ─────────────────
@@ -273,6 +285,7 @@ impl Filesystem for HostFs {
 ///   `readdir` → (status, name, name_len, size, is_dir, mtime); status < 0 = end.
 ///   `create`→ (status, handle); status < 0 = fail.
 ///   `write` → bytes written, or negative errno.
+///   `mkdir` → 0 on success, negative errno.
 #[derive(Clone, Copy)]
 #[allow(clippy::type_complexity)] // the readdir hook's tuple reply is documented above
 pub struct HostBackendHooks {
@@ -284,6 +297,7 @@ pub struct HostBackendHooks {
     pub write: fn(u64, u32, &[u8]) -> i32,
     pub clunk: fn(u64),
     pub remove: fn(&[u8]) -> i32,
+    pub mkdir: fn(&[u8]) -> i32,
 }
 
 static mut HOST_BACKEND: Option<HostBackendHooks> = None;
@@ -365,5 +379,17 @@ impl Filesystem for InjectedHostFs {
 
     fn remove(&self, path: &[u8]) -> i32 {
         (backend().remove)(path)
+    }
+
+    /// Real directories on the real host fs. Without this, MKDIR falls into
+    /// the VFS RAM-ghost path and every file later created inside the "new"
+    /// directory silently lands in RAM and vanishes on shutdown (how a whole
+    /// Tomb Raider install evaporated).
+    fn mkdir(&self, path: &[u8]) -> i32 {
+        (backend().mkdir)(path)
+    }
+
+    fn supports_mkdir(&self) -> bool {
+        true
     }
 }
