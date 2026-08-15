@@ -14,7 +14,10 @@ use super::iso9660::{CueSheet, DiscFormat, Iso9660Fs, MediaError, RandomAccess};
 use crate::kernel::vfs::{self, DirEntry, Filesystem, Vnode};
 
 const SLOT_PREFIX: &[u8] = b"cdrom/";
-const MAX_IMAGE_BYTES: u32 = 128 * 1024 * 1024;
+/// Real CD capacity (700MB media). The image is held in RAM; on a machine
+/// without that much memory `insert` refuses cleanly (`read_image_file`
+/// reserves with `try_reserve_exact`) rather than aborting.
+const MAX_IMAGE_BYTES: u32 = 700 * 1024 * 1024;
 
 struct MemoryImage(Vec<u8>);
 

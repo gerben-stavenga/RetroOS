@@ -1838,9 +1838,23 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x80;
                         regs.clear_flag32(1);
                     } else {
-                        // File handle: bit 7=0 (file), bit 6=1 (not written via
-                        // this handle since open), bits 5-0=drive (2=C:).
-                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0042;
+                        // File handle: bit 7=0 (file), bit 6=1 (not written
+                        // via this handle since open), bits 5-0 = the drive
+                        // the file actually lives on, bit 15 = remote.
+                        // Installers cross-check both against the drive they
+                        // opened from (Tomb Raider scans X:\data\title.phd,
+                        // then asks the handle which drive answered) — and a
+                        // CD-ROM under MSCDEX is a network-REDIRECTOR drive,
+                        // so its files must report remote; hostfs really is.
+                        let info = crate::kernel::vfs::mount_prefix(handle as i32, &kt.fds)
+                            .map_or(2u64, |prefix| match prefix {
+                                b"floppya/" => 0,
+                                b"floppyb/" => 1,
+                                b"cdrom/" => 0x8000 | 3,
+                                b"host/" => 0x8000 | 7,
+                                _ => 2, // every C: backing (ext4/hostfs root)
+                            });
+                        regs.rdx = (regs.rdx & !0xFFFF) | 0x0040 | info;
                         regs.clear_flag32(1);
                     }
                 }
@@ -1966,6 +1980,12 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 i += 1;
             }
             let mut fd = match dfs_create_path(dos, &name[..i]) {
+                // Immutable removable media must refuse CREATE with a real
+                // error rather than the RAM-scratch substitution read-only
+                // archive mounts get: CD installers write-test the drive to
+                // tell a CD from a hard disk (Tomb Raider creates and
+                // deletes a random D:\ name; success = "not a CD").
+                Ok((path, len)) if immutable_media_path(&path[..len]) => -13,
                 Ok((path, len)) => {
                     // Invalidate the parent dir's CI cache so the new file
                     // becomes visible to find_first/find_next on next walk.
@@ -2659,6 +2679,10 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 i += 1;
             }
             match dfs_open_existing(dos, &name[..i]) {
+                Ok((path, len)) if immutable_media_path(&path[..len]) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 5; // access denied
+                    regs.set_flag32(1);
+                }
                 Ok((path, len)) => {
                     // Invalidate parent dir CI cache before delete so a stale
                     // alias→missing-file mapping doesn't confuse later lookups.

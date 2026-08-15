@@ -1623,6 +1623,24 @@ pub fn file_size_by_handle(handle: i32) -> u32 {
     VFS.lock().file_size_by_handle(handle)
 }
 
+/// Mount prefix of the filesystem behind an open fd — `b"cdrom/"` for the CD
+/// slot, `b"floppya/"`/`b"floppyb/"` for the floppy slots, `b""` for the root
+/// mount. The DOS layer maps this to the drive number IOCTL 4400h reports;
+/// installers verify a just-opened file really lives on the drive they are
+/// probing (Tomb Raider's CD check).
+pub fn mount_prefix(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<&'static [u8]> {
+    let handle = vfs_handle(fds, fd).ok()?;
+    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES {
+        return None;
+    }
+    let vfs = VFS.lock();
+    let entry = &vfs.file_table[handle as usize];
+    if entry.refcount == 0 {
+        return None;
+    }
+    Some(vfs.mounts.get(entry.mount_idx as usize)?.prefix)
+}
+
 /// Stable inode for an open handle — fstat's st_ino (dynamic-linker dedup).
 pub fn file_ino_by_handle(handle: i32) -> u64 {
     VFS.lock().file_ino_by_handle(handle)
