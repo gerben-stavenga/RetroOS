@@ -4,6 +4,10 @@
 //! the filesystem held behind this proxy, so VFS mount indices remain stable.
 //! Images are discovered through VFS, making the same catalogue work from the
 //! proprietary disk on hosted, emulated, and physical machines.
+//!
+//! Media is the catalogue image FILE, read through a [`vfs::BackingFile`] —
+//! not a RAM copy, so a full 700MB disc costs no memory and needs no size
+//! cap. Caching, if ever needed, is the VFS's job at that seam.
 
 use alloc::boxed::Box;
 use alloc::string::String;
@@ -11,33 +15,39 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::iso9660::{CueSheet, DiscFormat, Iso9660Fs, MediaError, RandomAccess};
-use crate::kernel::vfs::{self, DirEntry, Filesystem, Vnode};
+use crate::kernel::vfs::{self, BackingFile, DirEntry, Filesystem, Vnode};
 
 const SLOT_PREFIX: &[u8] = b"cdrom/";
-/// Real CD capacity (700MB media). The image is held in RAM; on a machine
-/// without that much memory `insert` refuses cleanly (`read_image_file`
-/// reserves with `try_reserve_exact`) rather than aborting.
-const MAX_IMAGE_BYTES: u32 = 700 * 1024 * 1024;
+/// Cue SHEETS (small text files) are still slurped for parsing.
+const MAX_CUE_BYTES: u32 = 1024 * 1024;
 
-struct MemoryImage(Vec<u8>);
+/// The image file as the disc: positional reads straight to the backing fs.
+/// The slot closes the handle on eject; `Iso9660Fs` only ever reads.
+struct FileImage(BackingFile);
 
-impl RandomAccess for MemoryImage {
-    fn len(&self) -> u64 { self.0.len() as u64 }
+impl RandomAccess for FileImage {
+    fn len(&self) -> u64 { self.0.size() as u64 }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, MediaError> {
-        let offset = usize::try_from(offset).map_err(|_| MediaError::OutOfBounds)?;
-        if offset > self.0.len() {
+        let offset = u32::try_from(offset).map_err(|_| MediaError::OutOfBounds)?;
+        if offset > self.0.size() {
             return Err(MediaError::OutOfBounds);
         }
-        let n = buf.len().min(self.0.len() - offset);
-        buf[..n].copy_from_slice(&self.0[offset..offset + n]);
-        Ok(n)
+        let want = buf.len().min((self.0.size() - offset) as usize);
+        let n = self.0.read_at(offset, &mut buf[..want]);
+        if n < 0 {
+            return Err(MediaError::Io);
+        }
+        Ok(n as usize)
     }
 }
 
 struct SlotState {
     generation: u32,
     media: Option<Box<Iso9660Fs>>,
+    /// The slot owns the backing handle's lifecycle (closed on eject/swap);
+    /// `media`'s `FileImage` holds a working copy of the same handle.
+    backing: Option<BackingFile>,
     label: Vec<u8>,
 }
 
@@ -46,7 +56,12 @@ struct CdSlot {
 }
 
 static CD_SLOT: CdSlot = CdSlot {
-    state: Mutex::new(SlotState { generation: 0, media: None, label: Vec::new() }),
+    state: Mutex::new(SlotState {
+        generation: 0,
+        media: None,
+        backing: None,
+        label: Vec::new(),
+    }),
 };
 
 fn split_handle(handle: u64) -> (u32, u64) {
@@ -163,17 +178,21 @@ pub fn selected(index: usize) -> bool {
 
 pub fn eject() {
     {
+        let _fs = vfs::serialize_fs(); // backing close outside a VFS op
         let mut slot = CD_SLOT.state.lock();
         slot.generation = slot.generation.wrapping_add(1);
         slot.media = None;
+        if let Some(backing) = slot.backing.take() {
+            backing.close();
+        }
         slot.label.clear();
     }
     vfs::mounted_media_changed();
     crate::println!("CD-ROM: ejected");
 }
 
-fn read_vfs_file(path: &[u8]) -> Result<Vec<u8>, MediaError> {
-    super::read_image_file(path, MAX_IMAGE_BYTES).map_err(|e| match e {
+fn read_cue_file(path: &[u8]) -> Result<Vec<u8>, MediaError> {
+    super::read_image_file(path, MAX_CUE_BYTES).map_err(|e| match e {
         super::ImageReadError::TooBig => MediaError::InvalidImage,
         super::ImageReadError::Io => MediaError::Io,
     })
@@ -186,27 +205,47 @@ fn sibling_path(path: &[u8], filename: &[u8]) -> Vec<u8> {
     result
 }
 
-/// Load one catalogue entry and insert it into the fixed slot.
+/// Insert one catalogue entry into the fixed slot: the image FILE becomes
+/// the disc (a .CUE's small sheet is parsed from RAM; its .BIN is the disc).
 pub fn insert(index: usize) -> Result<(), MediaError> {
     let entry = CATALOG.lock().get(index).cloned().ok_or(MediaError::OutOfBounds)?;
     let is_cue = entry.name.rsplit(|byte| *byte == b'.').next()
         .is_some_and(|ext| ext.eq_ignore_ascii_case(b"CUE"));
 
-    let filesystem = if is_cue {
-        let cue = read_vfs_file(&entry.path)?;
-        let sheet = CueSheet::parse(&cue)?;
-        let bin_path = sibling_path(&entry.path, &sheet.bin_file);
-        let bin = read_vfs_file(&bin_path)?;
-        Iso9660Fs::open(Box::new(MemoryImage(bin)), DiscFormat::Cue(&cue))?
-    } else {
-        let iso = read_vfs_file(&entry.path)?;
-        Iso9660Fs::open(Box::new(MemoryImage(iso)), DiscFormat::Iso)?
+    // Resolve everything through the VFS first (cue slurp, backing open) —
+    // these are ordinary VFS operations and must NOT run under the guard.
+    let cue = if is_cue { Some(read_cue_file(&entry.path)?) } else { None };
+    let disc_path = match &cue {
+        Some(cue) => {
+            let sheet = CueSheet::parse(cue)?;
+            sibling_path(&entry.path, &sheet.bin_file)
+        }
+        None => entry.path.clone(),
     };
+    let backing = vfs::open_backing(&disc_path).ok_or(MediaError::Io)?;
 
     {
+        // Backing I/O (descriptor parse) and the swap (old handle close)
+        // happen outside a VFS op: serialization guard until after the
+        // swap, released before mounted_media_changed re-enters the VFS.
+        let _fs = vfs::serialize_fs();
+        let format = match &cue {
+            Some(cue) => DiscFormat::Cue(cue),
+            None => DiscFormat::Iso,
+        };
+        let filesystem = match Iso9660Fs::open(Box::new(FileImage(backing)), format) {
+            Ok(fs) => fs,
+            Err(e) => {
+                backing.close();
+                return Err(e);
+            }
+        };
         let mut slot = CD_SLOT.state.lock();
         slot.generation = slot.generation.wrapping_add(1);
         slot.media = Some(Box::new(filesystem));
+        if let Some(old) = slot.backing.replace(backing) {
+            old.close();
+        }
         slot.label = entry.name.clone();
     }
     vfs::mounted_media_changed();

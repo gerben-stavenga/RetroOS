@@ -1,5 +1,5 @@
 ; INT 13h floppy probe: AH=08 params, AH=02 boot-sector read + 55AA check,
-; AH=16 change line twice, AH=03 write must report write-protect.
+; AH=16 change line twice, AH=03 write-back of the boot sector + re-read.
 org 0x100
 start:
     ; AH=08: drive params for A:
@@ -51,16 +51,25 @@ start:
     call printhex
     call newline
 
-    ; AH=03: write one sector — must fail with AH=03 write-protected
+    ; AH=03: write the just-read boot sector back unchanged — media is
+    ; writable (write-through to the image file), so this must succeed.
     mov ax, 0x0301
     mov cx, 0x0001
     mov dx, 0x0000
     mov bx, buf
     int 0x13
-    jnc failwr
-    mov al, ah
-    call printhex
-    mov dx, msgwp
+    jc  failwr
+    ; wipe the buffer, re-read, and confirm the signature survived
+    mov word [buf+510], 0
+    mov ax, 0x0201
+    mov cx, 0x0001
+    mov dx, 0x0000
+    mov bx, buf
+    int 0x13
+    jc  fail2
+    cmp word [buf+510], 0xAA55
+    jne failsig
+    mov dx, msgwr
     call print
     call newline
     int 0x20
@@ -98,11 +107,11 @@ nib:    and al, 0x0F
 
 msg8ok: db 'PARAMS OK TYPE+SPT=$'
 msg2ok: db 'BOOTSECT 55AA OK$'
-msgwp:  db '=WRITEPROT OK$'
+msgwr:  db 'WRITE+READBACK OK$'
 msgf8:  db 'FAIL AH08$'
 msgf2:  db 'FAIL AH02$'
 msgfs:  db 'FAIL SIG$'
-msgfw:  db 'FAIL WRITE ACCEPTED$'
+msgfw:  db 'FAIL WRITE REFUSED$'
 crlf:   db 13, 10, '$'
 drtype: db 0
 spt:    db 0

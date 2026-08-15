@@ -44,20 +44,15 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
-/// True for VFS paths on immutable removable media (the CD-ROM and floppy
-/// slot mounts): metadata mutation must fail rather than fall through to
-/// the RAM-overlay scratch path that read-only archive mounts get.
+/// True for VFS paths on immutable removable media — the CD-ROM slot mount:
+/// mutation must fail rather than fall through to the RAM-overlay scratch
+/// path that read-only archive mounts get (CD installers write-test drives
+/// to tell a disc from a hard disk). Floppies are NOT here: their slots are
+/// genuinely writable, straight through to the image file.
 fn immutable_media_path(path: &[u8]) -> bool {
-    for prefix in [b"cdrom".as_slice(), b"floppya", b"floppyb"] {
-        if path == prefix
-            || (path.len() > prefix.len()
-                && path.starts_with(prefix)
-                && path[prefix.len()] == b'/')
-        {
-            return true;
-        }
-    }
-    false
+    let prefix = b"cdrom";
+    path == prefix
+        || (path.len() > prefix.len() && path.starts_with(prefix) && path[prefix.len()] == b'/')
 }
 
 fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, u8) {
@@ -754,7 +749,6 @@ static FLOPPY_LAST_STATUS: [core::sync::atomic::AtomicU8; 2] =
 /// INT 13h error codes used below.
 const DISK_OK: u8 = 0x00;
 const DISK_ERR_INVALID: u8 = 0x01; // invalid function/parameter
-const DISK_ERR_WRITE_PROTECT: u8 = 0x03;
 const DISK_ERR_SECTOR_NOT_FOUND: u8 = 0x04;
 const DISK_ERR_CHANGED: u8 = 0x06; // change line active
 const DISK_ERR_NOT_READY: u8 = 0x80;
@@ -834,37 +828,39 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
             }
             return; // does not overwrite AH or the stored status below
         }
-        // AH=02h read / AH=04h verify: CHS against the inserted image.
-        0x02 | 0x04 => match floppy_chs_to_lba(regs, drive) {
+        // AH=02h read / AH=03h write / AH=04h verify: CHS against the
+        // inserted image (writes go through to the image file).
+        0x02 | 0x03 | 0x04 => match floppy_chs_to_lba(regs, drive) {
             Ok((lba, count)) => {
-                if ah == 0x02 {
-                    let mut addr = (regs.es as usize) * 16 + (regs.rbx as u16) as usize;
-                    let mut sector = [0u8; 512];
-                    for i in 0..count {
-                        match floppy::read_sector(drive, lba + i as u32, &mut sector) {
+                let mut addr = (regs.es as usize) * 16 + (regs.rbx as u16) as usize;
+                let mut sector = [0u8; 512];
+                for i in 0..count {
+                    let ok = match ah {
+                        0x02 => match floppy::read_sector(drive, lba + i as u32, &mut sector) {
                             Ok(()) => {
                                 machine.copy_to(addr, &sector);
-                                addr += 512;
+                                true
                             }
-                            Err(_) => {
-                                status = DISK_ERR_SECTOR_NOT_FOUND;
-                                regs.rax = (regs.rax & !0xFF) | i as u64; // AL = done
-                                break;
+                            Err(_) => false,
+                        },
+                        0x03 => {
+                            for (j, byte) in sector.iter_mut().enumerate() {
+                                *byte = machine.read::<u8>(addr + j);
                             }
+                            floppy::write_sector(drive, lba + i as u32, &sector).is_ok()
                         }
+                        _ => true, // verify: the range check above suffices
+                    };
+                    if !ok {
+                        status = DISK_ERR_SECTOR_NOT_FOUND;
+                        regs.rax = (regs.rax & !0xFF) | i as u64; // AL = done
+                        break;
                     }
+                    addr += 512;
                 }
             }
             Err(e) => status = e,
         },
-        // AH=03h write: the slot is write-protected media for now.
-        0x03 => {
-            status = if floppy::chs_geometry(drive).is_some() {
-                DISK_ERR_WRITE_PROTECT
-            } else {
-                DISK_ERR_NOT_READY
-            };
-        }
         // AH=08h get drive parameters — answers for the drive, media or not.
         0x08 => {
             let (cylinders, heads, spt, drive_type) = match floppy::chs_geometry(drive) {
@@ -2557,14 +2553,14 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             // Map drive: 0=default, 1=A, 2=B, 3=C, 4=D
             let drive = if dl == 0 { dos.dfs.current_drive_number() + 1 } else { dl };
             if matches!(drive, 1 | 2) {
-                // A:/B: — real geometry from the inserted FAT image; free
-                // clusters 0 because the slot is write-protected. An empty
-                // drive is AX=FFFF (invalid drive; the not-ready critical
-                // error needs INT 24h plumbing that does not exist yet).
+                // A:/B: — real geometry and free space from the inserted FAT
+                // image. An empty drive is AX=FFFF (invalid drive; the
+                // not-ready critical error needs INT 24h plumbing that does
+                // not exist yet).
                 match crate::kernel::fs::floppy::geometry(drive as usize - 1) {
-                    Some((spc, bps, total)) => {
+                    Some((spc, bps, total, free)) => {
                         regs.rax = (regs.rax & !0xFFFF) | spc as u64;
-                        regs.rbx &= !0xFFFF;
+                        regs.rbx = (regs.rbx & !0xFFFF) | free as u64;
                         regs.rcx = (regs.rcx & !0xFFFF) | bps as u64;
                         regs.rdx = (regs.rdx & !0xFFFF) | total as u64;
                     }

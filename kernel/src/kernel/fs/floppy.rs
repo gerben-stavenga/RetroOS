@@ -4,54 +4,49 @@
 //! Same shape as the CD-ROM slot: each drive is mounted once (`floppya/`,
 //! `floppyb/`); inserting media replaces only the FAT filesystem held behind
 //! the proxy, so VFS mount indices stay stable, and a generation counter
-//! invalidates handles from before a swap. Media is a whole image in RAM —
-//! at floppy sizes (≤2.88M) that is cheap on any machine that also affords
-//! an image catalogue; real FDC hardware would plug in below this proxy as
-//! a different `RandomAccess`-style backing, not a different filesystem.
+//! invalidates handles from before a swap.
 //!
-//! Read-only for now: the slot denies writes at the VFS boundary, so DOS
-//! sees a write-protected disk. The FAT layer is rust-fatfs, which already
-//! knows how to write — lifting the protection later is a policy change
-//! plus a flush-back of the RAM image to the catalogue file.
+//! Media is the catalogue image FILE, not a RAM copy: every read and write
+//! goes through a [`vfs::BackingFile`] straight to the image, so guest
+//! writes persist by construction (no flush-back lifecycle) and a 4MB
+//! machine pays for no image buffer — caching, if ever needed, is the
+//! VFS's job at that seam. Writes are LIVE: rust-fatfs allocates clusters
+//! and updates directories in place on the image.
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::kernel::vfs::{self, DirEntry, Filesystem, Vnode};
+use crate::kernel::vfs::{self, BackingFile, DirEntry, Filesystem, Vnode};
 
 pub const DRIVES: usize = 2;
 const SLOT_PREFIXES: [&[u8]; DRIVES] = [b"floppya/", b"floppyb/"];
 const DRIVE_LETTERS: [u8; DRIVES] = [b'A', b'B'];
-/// 2.88M ED media is 2,949,120 bytes; anything past 4M is not a floppy image.
-const MAX_IMAGE_BYTES: u32 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertError {
     OutOfBounds,
-    TooBig,
     Io,
     /// The image did not parse as a FAT volume.
     BadFilesystem,
 }
 
-// ── RAM image behind fatfs's byte-stream io traits ──────────────────────────
+// ── The image file behind fatfs's byte-stream io traits ─────────────────────
 
-/// The raw image bytes, shared between the FAT layer (through `ImageCursor`)
-/// and the sector layer (INT 13h CHS reads) — one copy, two views. The outer
-/// slot mutex serializes all users, so this inner lock is never contended;
-/// it exists to give each view a safe borrow.
-type RawImage = Arc<Mutex<Vec<u8>>>;
-
-/// `std::io::Cursor` semantics over the in-RAM image: seeks anywhere ≥ 0,
-/// reads past the end return 0 bytes. Writes land in the Vec (rust-fatfs may
-/// touch the dirty flag even on a read-mounted volume); they are invisible
-/// outside this slot and vanish on eject.
+/// `std::io::Cursor` semantics over the backing image file: seeks anywhere
+/// ≥ 0, reads past the end return 0 bytes. Writes go straight through to the
+/// image file; the media size is fixed (a floppy cannot grow), so writing
+/// past the end is an error rather than an extension.
 struct ImageCursor {
-    data: RawImage,
+    file: BackingFile,
     pos: u64,
+}
+
+impl ImageCursor {
+    fn len(&self) -> u64 {
+        self.file.size() as u64
+    }
 }
 
 impl fatfs::IoBase for ImageCursor {
@@ -60,32 +55,32 @@ impl fatfs::IoBase for ImageCursor {
 
 impl fatfs::Read for ImageCursor {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
-        let data = self.data.lock();
-        let pos = usize::try_from(self.pos).map_err(|_| ())?;
-        if pos >= data.len() {
+        if self.pos >= self.len() {
             return Ok(0);
         }
-        let n = buf.len().min(data.len() - pos);
-        buf[..n].copy_from_slice(&data[pos..pos + n]);
+        let avail = (self.len() - self.pos) as usize;
+        let want = buf.len().min(avail);
+        let n = self.file.read_at(self.pos as u32, &mut buf[..want]);
+        if n < 0 {
+            return Err(());
+        }
         self.pos += n as u64;
-        Ok(n)
+        Ok(n as usize)
     }
 }
 
 impl fatfs::Write for ImageCursor {
     fn write(&mut self, buf: &[u8]) -> Result<usize, ()> {
-        let mut data = self.data.lock();
-        let pos = usize::try_from(self.pos).map_err(|_| ())?;
-        let end = pos.checked_add(buf.len()).ok_or(())?;
-        if end > data.len() {
-            if end > MAX_IMAGE_BYTES as usize {
-                return Err(());
-            }
-            data.resize(end, 0);
+        let end = self.pos.checked_add(buf.len() as u64).ok_or(())?;
+        if end > self.len() {
+            return Err(());
         }
-        data[pos..end].copy_from_slice(buf);
-        self.pos = end as u64;
-        Ok(buf.len())
+        let n = self.file.write_at(self.pos as u32, buf);
+        if n <= 0 && !buf.is_empty() {
+            return Err(());
+        }
+        self.pos += n as u64;
+        Ok(n as usize)
     }
 
     fn flush(&mut self) -> Result<(), ()> {
@@ -97,9 +92,7 @@ impl fatfs::Seek for ImageCursor {
     fn seek(&mut self, pos: fatfs::SeekFrom) -> Result<u64, ()> {
         let new = match pos {
             fatfs::SeekFrom::Start(n) => Some(n),
-            fatfs::SeekFrom::End(n) => {
-                (self.data.lock().len() as u64).checked_add_signed(n)
-            }
+            fatfs::SeekFrom::End(n) => self.len().checked_add_signed(n),
             fatfs::SeekFrom::Current(n) => self.pos.checked_add_signed(n),
         };
         match new {
@@ -130,7 +123,8 @@ pub struct ChsGeometry {
     pub drive_type: u8,
 }
 
-fn parse_chs(image: &[u8]) -> Option<ChsGeometry> {
+fn parse_chs(boot_sector: &[u8]) -> Option<ChsGeometry> {
+    let image = boot_sector;
     if image.len() < 512 {
         return None;
     }
@@ -185,15 +179,32 @@ pub fn chs_geometry(drive: usize) -> Option<ChsGeometry> {
 /// One 512-byte sector by LBA, for INT 13h CHS reads (the caller does the
 /// CHS→LBA arithmetic against `chs_geometry`).
 pub fn read_sector(drive: usize, lba: u32, out: &mut [u8; 512]) -> Result<(), SectorError> {
+    let _fs = vfs::serialize_fs(); // backing access from outside a VFS op
     let state = slot(drive).state.lock();
-    let raw = state.raw.as_ref().ok_or(SectorError::NoMedia)?;
-    let data = raw.lock();
-    let start = (lba as usize).checked_mul(512).ok_or(SectorError::OutOfRange)?;
-    let end = start.checked_add(512).ok_or(SectorError::OutOfRange)?;
-    if end > data.len() {
+    let file = state.backing.as_ref().ok_or(SectorError::NoMedia)?;
+    let start = lba.checked_mul(512).ok_or(SectorError::OutOfRange)?;
+    if start.checked_add(512).is_none_or(|end| end > file.size()) {
         return Err(SectorError::OutOfRange);
     }
-    out.copy_from_slice(&data[start..end]);
+    if file.read_at(start, out) != 512 {
+        return Err(SectorError::OutOfRange);
+    }
+    Ok(())
+}
+
+/// Sector write for INT 13h AH=03h — straight through to the image file,
+/// coherent with the FAT layer (same backing handle).
+pub fn write_sector(drive: usize, lba: u32, data: &[u8; 512]) -> Result<(), SectorError> {
+    let _fs = vfs::serialize_fs(); // backing access from outside a VFS op
+    let state = slot(drive).state.lock();
+    let file = state.backing.as_ref().ok_or(SectorError::NoMedia)?;
+    let start = lba.checked_mul(512).ok_or(SectorError::OutOfRange)?;
+    if start.checked_add(512).is_none_or(|end| end > file.size()) {
+        return Err(SectorError::OutOfRange);
+    }
+    if file.write_at(start, data) != 512 {
+        return Err(SectorError::OutOfRange);
+    }
     Ok(())
 }
 
@@ -208,17 +219,18 @@ pub fn take_change_line(drive: usize) -> bool {
 struct SlotState {
     generation: u32,
     media: Option<Media>,
-    /// Second view of the same bytes `media`'s cursor reads — for the
-    /// sector layer (INT 13h).
-    raw: Option<RawImage>,
+    /// Second view of the same image file `media`'s cursor uses — for the
+    /// sector layer (INT 13h). The slot owns the close (on eject); this and
+    /// the cursor's copy share the one backing-fs handle.
+    backing: Option<BackingFile>,
     geom: Option<ChsGeometry>,
     label: Vec<u8>,
     /// BIOS change line: set by insert/eject, cleared when INT 13h AH=16h
     /// reports it.
     change_pending: bool,
-    /// Open handles → paths. Reads re-resolve by path; at RAM-image speeds
-    /// the double walk is free and it keeps the borrow of `media` inside
-    /// each call (fatfs `File`s borrow the `FileSystem`).
+    /// Open handles → paths. Reads/writes re-resolve by path; it keeps the
+    /// borrow of `media` inside each call (fatfs `File`s borrow the
+    /// `FileSystem`).
     opens: BTreeMap<u32, Vec<u8>>,
     next_handle: u32,
 }
@@ -234,7 +246,7 @@ const fn empty_slot(drive: usize) -> FloppySlot {
         state: Mutex::new(SlotState {
             generation: 0,
             media: None,
-            raw: None,
+            backing: None,
             geom: None,
             label: Vec::new(),
             change_pending: false,
@@ -305,7 +317,7 @@ impl Filesystem for FloppySlot {
         Some(Vnode {
             handle: (generation as u64) << 32 | handle as u64,
             size,
-            mode: 0o444,
+            mode: 0o644,
         })
     }
 
@@ -385,10 +397,87 @@ impl Filesystem for FloppySlot {
         }
     }
 
-    /// Write-protected media: `create` keeps the default `None` with
-    /// `supports_create` false, which the VFS treats as read-only backing.
-    fn write(&self, _handle: u64, _offset: u32, _data: &[u8]) -> i32 {
-        -1
+    fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
+        let (generation, inner) = split_handle(handle);
+        let state = self.state.lock();
+        if generation != state.generation {
+            return -5;
+        }
+        let Some(path) = state.opens.get(&inner) else { return -9 };
+        let Some(media) = state.media.as_ref() else { return -5 };
+        let Some(path) = path_str(path) else { return -5 };
+        let Ok(mut file) = media.root_dir().open_file(path) else { return -5 };
+        if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
+            return -5;
+        }
+        let mut done = 0;
+        while done < data.len() {
+            match fatfs::Write::write(&mut file, &data[done..]) {
+                Ok(0) => break, // media full / fixed size reached
+                Ok(n) => done += n,
+                Err(_) => return if done == 0 { -28 } else { done as i32 },
+            }
+        }
+        if fatfs::Write::flush(&mut file).is_err() {
+            return -5;
+        }
+        done as i32
+    }
+
+    fn create(&self, path: &[u8]) -> Option<Vnode> {
+        let mut state = self.state.lock();
+        let generation = state.generation;
+        let media = state.media.as_ref()?;
+        let mut file = media.root_dir().create_file(path_str(path)?).ok()?;
+        file.truncate().ok()?; // DOS AH=3Ch create-or-truncate semantics
+        drop(file);
+        let handle = state.next_handle;
+        state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
+        state.opens.insert(handle, path.to_vec());
+        Some(Vnode {
+            handle: (generation as u64) << 32 | handle as u64,
+            size: 0,
+            mode: 0o644,
+        })
+    }
+
+    fn supports_create(&self) -> bool {
+        true
+    }
+
+    fn remove(&self, path: &[u8]) -> i32 {
+        let state = self.state.lock();
+        let Some(media) = state.media.as_ref() else { return -5 };
+        let Some(path) = path_str(path) else { return -5 };
+        if media.root_dir().remove(path).is_ok() { 0 } else { -2 }
+    }
+
+    fn mkdir(&self, path: &[u8]) -> i32 {
+        let state = self.state.lock();
+        let Some(media) = state.media.as_ref() else { return -5 };
+        let Some(path) = path_str(path) else { return -5 };
+        if media.root_dir().create_dir(path).is_ok() { 0 } else { -13 }
+    }
+
+    fn supports_mkdir(&self) -> bool {
+        true
+    }
+
+    fn rmdir(&self, path: &[u8]) -> i32 {
+        // fatfs `remove` handles empty directories; a non-empty one errors.
+        self.remove(path)
+    }
+
+    fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
+        let state = self.state.lock();
+        let Some(media) = state.media.as_ref() else { return -5 };
+        let (Some(src), Some(dst)) = (path_str(path), path_str(new_path)) else { return -5 };
+        let root = media.root_dir();
+        if root.rename(src, &root, dst).is_ok() { 0 } else { -2 }
+    }
+
+    fn supports_directory_mutation(&self) -> bool {
+        true
     }
 }
 
@@ -467,10 +556,13 @@ pub fn selected(drive: usize, index: usize) -> bool {
 
 pub fn eject(drive: usize) {
     {
+        let _fs = vfs::serialize_fs(); // media drop may flush to backing
         let mut state = slot(drive).state.lock();
         state.generation = state.generation.wrapping_add(1);
-        state.media = None;
-        state.raw = None;
+        state.media = None; // fatfs Drop flushes its fs state to the image
+        if let Some(backing) = state.backing.take() {
+            backing.close();
+        }
         state.geom = None;
         state.label.clear();
         state.opens.clear();
@@ -480,23 +572,32 @@ pub fn eject(drive: usize) {
     crate::println!("Floppy {}: ejected", DRIVE_LETTERS[drive] as char);
 }
 
-/// Load one catalogue entry and insert it into a drive's slot.
+/// Insert one catalogue entry into a drive's slot: open the image FILE as
+/// the medium (reads and writes go through to it; nothing is copied).
 pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
     let entry = CATALOG.lock().get(index).cloned().ok_or(InsertError::OutOfBounds)?;
-    let image = super::read_image_file(&entry.path, MAX_IMAGE_BYTES).map_err(|e| match e {
-        super::ImageReadError::TooBig => InsertError::TooBig,
-        super::ImageReadError::Io => InsertError::Io,
-    })?;
-    let geom = parse_chs(&image);
-    let raw: RawImage = Arc::new(Mutex::new(image));
-    let cursor = ImageCursor { data: raw.clone(), pos: 0 };
-    let media = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new())
-        .map_err(|_| InsertError::BadFilesystem)?;
+    let backing = vfs::open_backing(&entry.path).ok_or(InsertError::Io)?;
     {
+        // Backing I/O (BPB read, fatfs mount, old media's flush-on-drop)
+        // outside a VFS op: hold the serialization guard, release it before
+        // mounted_media_changed re-enters the VFS.
+        let _fs = vfs::serialize_fs();
+        let mut boot = [0u8; 512];
+        let geom = if backing.read_at(0, &mut boot) == 512 { parse_chs(&boot) } else { None };
+        let cursor = ImageCursor { file: backing, pos: 0 };
+        let media = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
+            Ok(media) => media,
+            Err(_) => {
+                backing.close();
+                return Err(InsertError::BadFilesystem);
+            }
+        };
         let mut state = slot(drive).state.lock();
         state.generation = state.generation.wrapping_add(1);
-        state.media = Some(media);
-        state.raw = Some(raw);
+        state.media = Some(media); // old media drops (flushes), then...
+        if let Some(old) = state.backing.replace(backing) {
+            old.close(); // ...its backing closes
+        }
         state.geom = geom;
         state.label = entry.name.clone();
         state.opens.clear();
@@ -512,17 +613,20 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
 }
 
 /// Cluster geometry for INT 21h AH=36h: (sectors/cluster, bytes/sector,
-/// total clusters). `None` while the drive is empty. FAT floppy media is
-/// 512 bytes/sector without exception; fatfs keeps the raw BPB private.
-pub fn geometry(drive: usize) -> Option<(u16, u16, u16)> {
+/// total clusters, free clusters). `None` while the drive is empty. FAT
+/// floppy media is 512 bytes/sector without exception; fatfs keeps the raw
+/// BPB private.
+pub fn geometry(drive: usize) -> Option<(u16, u16, u16, u16)> {
+    let _fs = vfs::serialize_fs(); // stats() may read FAT sectors from backing
     let state = slot(drive).state.lock();
     let media = state.media.as_ref()?;
     let sectors_per_cluster = (media.cluster_size() / 512).max(1);
-    let total = media.stats().ok()?.total_clusters();
+    let stats = media.stats().ok()?;
     Some((
         u16::try_from(sectors_per_cluster).unwrap_or(1),
         512,
-        u16::try_from(total).unwrap_or(u16::MAX),
+        u16::try_from(stats.total_clusters()).unwrap_or(u16::MAX),
+        u16::try_from(stats.free_clusters()).unwrap_or(u16::MAX),
     ))
 }
 

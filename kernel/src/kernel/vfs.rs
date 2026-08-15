@@ -1623,6 +1623,80 @@ pub fn file_size_by_handle(handle: i32) -> u32 {
     VFS.lock().file_size_by_handle(handle)
 }
 
+/// A direct line to the filesystem behind one file, resolved once at open.
+///
+/// The media slots (CD-ROM, floppy) read and write their backing image
+/// through this WITHOUT re-entering the VFS: slot I/O runs *inside* VFS
+/// operations (guest reads D:\FOO → VFS → slot → image file), and the
+/// global VFS lock is not reentrant. `Filesystem` calls are positional
+/// (pread/pwrite-style), so no offset state lives here either.
+///
+/// Deliberately `Copy` with an explicit [`BackingFile::close`]: the slot
+/// owns the lifecycle (clunk once, on eject), while its cursor types hold
+/// working copies. If the VFS ever grows a block cache, it belongs behind
+/// this seam.
+#[derive(Clone, Copy)]
+pub struct BackingFile {
+    fs: &'static dyn Filesystem,
+    handle: u64,
+    size: u32,
+}
+
+// Same soundness rule as `unsafe impl Send for Vfs`: every backing-fs call
+// happens with the VFS lock held — implicitly when a slot method runs inside
+// a VFS operation, explicitly via [`serialize_fs`] when media code reaches
+// the backing from outside (INT 13h sector I/O, insert/eject). No filesystem
+// is ever entered by two cores at once.
+unsafe impl Send for BackingFile {}
+unsafe impl Sync for BackingFile {}
+
+/// Hold the VFS lock without performing a VFS operation — the serialization
+/// guard for direct [`BackingFile`] access from OUTSIDE a VFS call path.
+/// Acquire it BEFORE any slot-internal lock (the lock order everywhere is
+/// VFS → slot). Never take it inside a `Filesystem` implementation: those
+/// run under the lock already.
+pub struct FsSerial(#[allow(dead_code)] spin::MutexGuard<'static, Vfs>);
+
+pub fn serialize_fs() -> FsSerial {
+    FsSerial(VFS.lock())
+}
+
+impl BackingFile {
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    /// Read at an absolute offset. Returns bytes read or negative errno.
+    pub fn read_at(&self, offset: u32, buf: &mut [u8]) -> i32 {
+        self.fs.read(self.handle, offset, buf, buf.len() as u32)
+    }
+
+    /// Write at an absolute offset. Returns bytes written or negative errno.
+    pub fn write_at(&self, offset: u32, data: &[u8]) -> i32 {
+        self.fs.write(self.handle, offset, data)
+    }
+
+    /// Release the backing fs's per-open state.
+    pub fn close(self) {
+        self.fs.clunk(self.handle);
+    }
+}
+
+/// Open `path` directly on its backing mount for media use. The resolution
+/// holds the VFS lock; the returned handle never touches it again.
+///
+/// Only real files on a Server mount resolve (a RAM-overlay scratch file
+/// does not) — media images are real catalogue files by construction.
+pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
+    let (fs, subpath_start) = {
+        let vfs = VFS.lock();
+        let (_midx, fs, subpath) = vfs.resolve_head(path);
+        (fs, path.len() - subpath.len())
+    };
+    let vnode = fs.open(&path[subpath_start..])?;
+    Some(BackingFile { fs, handle: vnode.handle, size: vnode.size })
+}
+
 /// Mount prefix of the filesystem behind an open fd — `b"cdrom/"` for the CD
 /// slot, `b"floppya/"`/`b"floppyb/"` for the floppy slots, `b""` for the root
 /// mount. The DOS layer maps this to the drive number IOCTL 4400h reports;

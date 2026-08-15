@@ -1,6 +1,6 @@
 # INT 13h floppy probe: AH=08h drive parameters, AH=02h CHS boot-sector read
 # (checks the 55AA signature), AH=16h change-line report-once, AH=03h
-# write-protect. Run with an image inserted in A: via the F12 Disk tab;
+# write-back. Run with an image inserted in A: via the F12 Disk tab;
 # empty-drive runs exercise the not-ready path (prints FAIL AH02).
 genrule(
     name = "int13_com",
