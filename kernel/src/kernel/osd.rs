@@ -653,35 +653,34 @@ const CELL_H: usize = 8;
 const _: () = assert!(COLS * CELL_W + 2 * PAD <= 320, "panel wider than the smallest mode");
 const _: () = assert!(MAX_ROWS * CELL_H + 2 * PAD <= 200, "panel taller than the smallest mode");
 
-/// Two glyph scales with distinct meanings. `sy` carries the sink's
-/// mandatory vertical enlargement (a Mode 13h sink later downsamples rows,
-/// so glyphs must be pre-stretched vertically on the 320-wide shadow) TIMES
-/// the readability factor; `sx` carries the readability factor alone. On a
-/// panel-sized shadow both equal the same uniform factor — scaling only
-/// vertically there made the panel 8px-narrow with N·16-tall glyphs.
+/// The two axes are scaled differently on purpose. VERTICAL is coarse:
+/// `sy` shadow rows per glyph row, and the present step multiplies by its
+/// own stretch afterward — we only get to pick from `8·sy` row steps. An
+/// even `sy` upgrades to the 8x16 font at half row scale (real
+/// letterforms). HORIZONTAL is fine-grained: the shadow is already at
+/// output width, so the cell width `cw` is free in PIXELS — glyph columns
+/// are distributed over `cw` Bresenham-style, letting the cell take the
+/// font's natural aspect at whatever height the vertical quantization
+/// produced instead of snapping to multiples of 8.
 #[allow(clippy::too_many_arguments)]
 fn paint_text(
     out: &mut [u8], stride: usize, w: usize, h: usize,
-    logical_w: usize, x: usize, y: usize, sx: usize, sy: usize,
+    logical_w: usize, x: usize, y: usize, cw: usize, sy: usize,
     s: &[u8], fg: u32, bg: u32,
     fmt: PixelFormat,
 ) {
-    if logical_w == 0 { return; }
+    if logical_w == 0 || cw == 0 { return; }
     let fgp = fmt.encode(fg).to_le_bytes();
     let bgp = fmt.encode(bg).to_le_bytes();
     let bytes = fmt.bytes_per_pixel as usize;
-    // The cell is 8x8; at an even row scale the 8x16 font fits the same
-    // cell at half the row scale — full text-font detail (real descenders)
-    // at the identical footprint. Shadow rows ARE content rows here (the
-    // vertical stretch happens after paint, uniformly, preserving detail).
     let (font, rows, row_scale): (&[u8], usize, usize) = if sy % 2 == 0 {
         (&lib::vga_fonts::FONT_8X16, 16, sy / 2)
     } else {
         (&lib::vga_fonts::FONT_8X8, 8, sy)
     };
     for (i, &ch) in s.iter().enumerate() {
-        let cx = x + i * CELL_W * sx;
-        if cx + CELL_W * sx > logical_w { break; }
+        let cx = x + i * cw;
+        if cx + cw > logical_w { break; }
         let glyph = &font[ch as usize * rows..(ch as usize + 1) * rows];
         for (gy, &bits) in glyph.iter().enumerate() {
             for repeat in 0..row_scale {
@@ -689,8 +688,10 @@ fn paint_text(
                 if py >= h { break; }
                 for gx in 0..CELL_W {
                     let pixel = if bits & (0x80 >> gx) != 0 { &fgp } else { &bgp };
-                    for sub in 0..sx {
-                        let lx = cx + gx * sx + sub;
+                    // Column gx spans its share of the cw-wide cell.
+                    let lx0 = cx + gx * cw / CELL_W;
+                    let lx1 = cx + (gx + 1) * cw / CELL_W;
+                    for lx in lx0..lx1 {
                         let x0 = lx.saturating_mul(w) / logical_w;
                         let x1 = (lx + 1).saturating_mul(w) / logical_w;
                         for xx in x0..x1.min(w) {
@@ -706,34 +707,33 @@ fn paint_text(
     }
 }
 
-/// Choose the cell scales `(sx, sy)` from the physical result backwards.
+/// Choose the cell geometry `(cw, sy)` — VERTICAL FIRST, because that is
+/// the coarse axis. The shadow is wide-and-short: rows are already
+/// stretched to output width, but the mode's ROW COUNT is kept and the
+/// present step expands rows by `stretch_y` AFTERWARD (a 320x200 game on
+/// a 480-line output is a 640x200 shadow stretched x2.4 after we paint),
+/// so cell heights only exist in steps of `8·stretch_y` screen pixels.
 ///
-/// The shadow is wide-and-short: rows are already stretched to the output
-/// width, but the mode's ROW COUNT is kept and the present step expands
-/// rows by `stretch_y` AFTERWARD (a 320x200 game on a 480-line output is
-/// a 640x200 shadow stretched x2.4 after we paint). So:
+/// - VERTICAL: `sy` targets ~26 text lines of the shadow's row space
+///   (`round(rows/208)`), snapped down until the panel's rows fit. Even
+///   `sy` renders the 8x16 font.
+/// - HORIZONTAL: fine-grained — the cell width `cw` (in pixels, any
+///   value) takes the chosen font's natural aspect at the realized
+///   screen height: 8x16 → half the height, 8x8 → equal. Clamped to fit.
 ///
-/// - HORIZONTAL: the panel targets ~3/4 of the shadow width; `sx` is the
-///   nearest integer glyph scale (floor under-shoots: a 640-wide shadow
-///   would stay 1x when 2x spans a nicer 80%), clamped to fit.
-/// - VERTICAL: on-screen cell height is `8 * sy * stretch_y`, so square
-///   means `sy = sx / stretch_y`, rounded to nearest and floored at 1 —
-///   then snapped down if the needed rows would overflow the shadow.
-///
-/// An even `sy` lets `paint_text` honor the 8x16 font inside the same
-/// 8x8 cell (full text-font detail at half the row scale).
+/// `rows_needed` is the panel's total character rows.
 fn paint_scales(
-    stretch_y: usize, logical_w: usize, h: usize, base_w: usize, base_h: usize,
+    stretch_y: usize, logical_w: usize, h: usize, rows_needed: usize,
 ) -> (usize, usize) {
     let stretch_y = stretch_y.max(1);
-    let sx = ((logical_w * 3 + 2 * base_w) / (4 * base_w))
-        .min(logical_w / base_w)
-        .max(1);
-    let mut sy = ((sx + stretch_y / 2) / stretch_y).max(1);
-    while sy > 1 && base_h * sy > h {
+    let mut sy = ((h + 104) / 208).max(1);
+    while sy > 1 && rows_needed * CELL_H * sy + 2 * PAD > h {
         sy -= 1;
     }
-    (sx, sy)
+    let screen_cell_h = CELL_H * sy * stretch_y;
+    let cw = if sy % 2 == 0 { screen_cell_h / 2 } else { screen_cell_h };
+    let cw = cw.clamp(CELL_W, (logical_w.saturating_sub(2 * PAD)) / COLS.max(1)).max(1);
+    (cw, sy)
 }
 
 /// Composite the panel into a completed packed shadow. `scale_y` is an
@@ -764,17 +764,15 @@ pub fn paint(
     let subtab_rows = usize::from(tab == TAB_DISK);
     // Title + tab bar + (device sub-tabs) + items + footer.
     let rows = visible + subtab_rows + 3;
-    let base_panel_w = COLS * CELL_W + PAD * 2;
-    let base_panel_h = rows * CELL_H + PAD * 2;
-    let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
-    let panel_w = base_panel_w * sx;
-    let panel_h = base_panel_h * sy;
+    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (pad_x, pad_y) = (cw, PAD * sy);
+    let panel_w = COLS * cw + pad_x * 2;
+    let panel_h = rows * CELL_H * sy + pad_y * 2;
     if logical_w < panel_w || h < panel_h {
         return;
     }
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
-    let (pad_x, pad_y) = (PAD * sx, PAD * sy);
 
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
@@ -790,16 +788,16 @@ pub fn paint(
     title.put(b"RetroOS Monitor  ");
     title.put(active_tab_name(tab));
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy,
+        out, stride, w, h, logical_w, tx, ty, cw, sy,
         title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H * sy;
 
-    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, sx, sy, fmt);
+    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, cw, sy, fmt);
     ty += CELL_H * sy;
 
     if tab == TAB_DISK {
-        paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, sx, sy, fmt);
+        paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, cw, sy, fmt);
         ty += CELL_H * sy;
     }
 
@@ -817,24 +815,24 @@ pub fn paint(
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, sx, sy,
+            out, stride, w, h, logical_w, tx, ty, cw, sy,
             line.as_bytes(), fg, bg, fmt,
         );
         // Scroller continuation markers in the rightmost column.
-        let marker_x = x0 + panel_w - pad_x - CELL_W * sx;
+        let marker_x = x0 + panel_w - pad_x - cw;
         if row == 0 && scroll > 0 {
-            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, cw, sy,
                 b"\x18", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
         }
         if row + 1 == visible && scroll + visible < count {
-            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, cw, sy,
                 b"\x19", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
         }
         ty += CELL_H * sy;
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy,
+        out, stride, w, h, logical_w, tx, ty, cw, sy,
         b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
 }
@@ -850,15 +848,15 @@ fn paint_disk_subtabs(
     logical_w: usize,
     tx: usize,
     ty: usize,
-    sx: usize,
+    cw: usize,
     sy: usize,
     fmt: PixelFormat,
 ) {
     let active = disk_device();
-    let mut x = tx + CELL_W * sx;
+    let mut x = tx + cw;
     for dev in 0..DISK_DEVICES {
         let label = disk_device_label(dev);
-        let label_w = (label.len() + 1) * CELL_W * sx;
+        let label_w = (label.len() + 1) * cw;
         let selected = dev == active;
         if selected {
             vga::overlay_fill_xscaled(
@@ -867,10 +865,10 @@ fn paint_disk_subtabs(
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty, sx, sy,
+            out, stride, w, h, logical_w, x + cw / 2, ty, cw, sy,
             label, fg, bg, fmt,
         );
-        x += label_w + CELL_W * sx;
+        x += label_w + cw;
     }
 }
 
@@ -884,7 +882,7 @@ fn paint_tabs(
     tx: usize,
     ty: usize,
     active: usize,
-    sx: usize,
+    cw: usize,
     sy: usize,
     fmt: PixelFormat,
 ) {
@@ -896,7 +894,7 @@ fn paint_tabs(
         (TAB_DEBUG, b"Debug" as &[u8]),
     ] {
         let selected = tab == active;
-        let label_w = (label.len() + 1) * CELL_W * sx;
+        let label_w = (label.len() + 1) * cw;
         if selected {
             vga::overlay_fill_xscaled(
                 out, stride, w, h, logical_w, x, ty,
@@ -905,10 +903,10 @@ fn paint_tabs(
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty,
-            sx, sy, label, fg, bg, fmt,
+            out, stride, w, h, logical_w, x + cw / 2, ty,
+            cw, sy, label, fg, bg, fmt,
         );
-        x += label_w + CELL_W * sx;
+        x += label_w + cw;
     }
 }
 
@@ -926,17 +924,15 @@ fn paint_picker(
     // Character budget: the list shares MAX_ROWS with title + footer.
     let visible = count.clamp(1, MAX_ROWS - 2);
     let rows = visible + 2;
-    let base_panel_w = COLS * CELL_W + PAD * 2;
-    let base_panel_h = rows * CELL_H + PAD * 2;
-    let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
-    let panel_w = base_panel_w * sx;
-    let panel_h = base_panel_h * sy;
+    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (pad_x, pad_y) = (cw, PAD * sy);
+    let panel_w = COLS * cw + pad_x * 2;
+    let panel_h = rows * CELL_H * sy + pad_y * 2;
     if logical_w < panel_w || h < panel_h {
         return;
     }
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
-    let (pad_x, pad_y) = (PAD * sx, PAD * sy);
 
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
@@ -949,7 +945,7 @@ fn paint_picker(
     let tx = x0 + pad_x;
     let mut ty = y0 + pad_y;
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy,
+        out, stride, w, h, logical_w, tx, ty, cw, sy,
         b"Switch to task", TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H * sy;
@@ -957,7 +953,7 @@ fn paint_picker(
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, sx, sy,
+            out, stride, w, h, logical_w, tx, ty, cw, sy,
             b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
         );
         ty += CELL_H * sy;
@@ -976,7 +972,7 @@ fn paint_picker(
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
             paint_text(
-                out, stride, w, h, logical_w, tx, ty, sx, sy,
+                out, stride, w, h, logical_w, tx, ty, cw, sy,
                 line.as_bytes(), fg, bg, fmt,
             );
             ty += CELL_H * sy;
@@ -984,7 +980,7 @@ fn paint_picker(
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy,
+        out, stride, w, h, logical_w, tx, ty, cw, sy,
         b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
     );
 }
