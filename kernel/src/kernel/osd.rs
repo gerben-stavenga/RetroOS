@@ -90,6 +90,10 @@ static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
+/// Which media device the Disk tab is showing: 0=A:, 1=B:, 2=CD (◄/►).
+static DISK_DEV: AtomicUsize = AtomicUsize::new(0);
+/// First visible row of the Disk tab's scroller.
+static DISK_SCROLL: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
@@ -109,6 +113,7 @@ pub fn open(display: OsdDisplay) {
     SYSTEM_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
     DISK_SEL.store(0, Ordering::Relaxed);
+    DISK_SCROLL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
@@ -227,35 +232,127 @@ fn sound_item_count() -> usize {
     sound_item_count_for(crate::kernel::platform::get().audio)
 }
 
-/// Three media sections. Each starts with its Eject row, followed by the
-/// images the drive can load: the CD-ROM slot with C:\CD, then floppy A:
-/// and B:, both drawing from the shared C:\FLOPPY catalogue.
-#[derive(Clone, Copy)]
-enum DiskItem {
-    CdEject,
-    CdImage(usize),
-    FloppyEject(usize),
-    FloppyImage(usize, usize),
+/// The Disk tab shows ONE device at a time — A:, B:, or CD, cycled with
+/// ◄/► — as a scrolling list that always fits the panel (the old
+/// all-devices-at-once list outgrew a 200-line mode and the whole OSD
+/// vanished). An empty device lists its catalogue (insert on Enter); a
+/// loaded device lists "Eject <name>" first, then the OTHER images as swap
+/// targets — the in-use image is not offered.
+const DISK_DEVICES: usize = 3;
+/// Rows of the Disk scroller visible at once — derived from the panel's
+/// character budget (see `MAX_ROWS`): everything but title, tab bar,
+/// device sub-tabs, and footer.
+const DISK_VISIBLE: usize = MAX_ROWS - 4;
+
+fn disk_device() -> usize {
+    DISK_DEV.load(Ordering::Relaxed)
 }
 
-fn disk_item(item: usize) -> DiskItem {
-    let cd = 1 + crate::kernel::fs::cdrom::catalog_count();
-    let per_floppy = 1 + crate::kernel::fs::floppy::catalog_count();
-    if item < cd {
-        if item == 0 { DiskItem::CdEject } else { DiskItem::CdImage(item - 1) }
-    } else {
-        let item = item - cd;
-        let drive = item / per_floppy;
-        match item % per_floppy {
-            0 => DiskItem::FloppyEject(drive),
-            n => DiskItem::FloppyImage(drive, n - 1),
-        }
+fn disk_device_label(dev: usize) -> &'static [u8] {
+    match dev {
+        0 => b"A:",
+        1 => b"B:",
+        _ => b"CD",
     }
 }
 
+fn disk_catalog_count(dev: usize) -> usize {
+    if dev == 2 {
+        crate::kernel::fs::cdrom::catalog_count()
+    } else {
+        crate::kernel::fs::floppy::catalog_count()
+    }
+}
+
+fn disk_inserted(dev: usize) -> bool {
+    if dev == 2 {
+        crate::kernel::fs::cdrom::is_inserted()
+    } else {
+        crate::kernel::fs::floppy::is_inserted(dev)
+    }
+}
+
+fn disk_entry_in_use(dev: usize, index: usize) -> bool {
+    if dev == 2 {
+        crate::kernel::fs::cdrom::selected(index)
+    } else {
+        crate::kernel::fs::floppy::selected(dev, index)
+    }
+}
+
+fn disk_catalog_name(dev: usize, index: usize, out: &mut [u8]) -> usize {
+    if dev == 2 {
+        crate::kernel::fs::cdrom::catalog_name(index, out)
+    } else {
+        crate::kernel::fs::floppy::catalog_name(index, out)
+    }
+}
+
+fn disk_label(dev: usize, out: &mut [u8]) -> usize {
+    if dev == 2 {
+        crate::kernel::fs::cdrom::label(out)
+    } else {
+        crate::kernel::fs::floppy::label(dev, out)
+    }
+}
+
+/// One row of the current device's list.
+#[derive(Clone, Copy)]
+enum DiskRow {
+    /// "Eject <name>" — only when media is inserted, always row 0.
+    Eject,
+    /// Insert/swap to this catalogue index.
+    Insert(usize),
+    /// "(no images)" placeholder for an empty device + empty catalogue.
+    NoImages,
+}
+
+fn disk_row(item: usize) -> DiskRow {
+    let dev = disk_device();
+    let inserted = disk_inserted(dev);
+    if inserted && item == 0 {
+        return DiskRow::Eject;
+    }
+    let want = if inserted { item - 1 } else { item };
+    let mut seen = 0;
+    for i in 0..disk_catalog_count(dev) {
+        if inserted && disk_entry_in_use(dev, i) {
+            continue; // the in-use image is not a swap target
+        }
+        if seen == want {
+            return DiskRow::Insert(i);
+        }
+        seen += 1;
+    }
+    DiskRow::NoImages
+}
+
 fn disk_item_count() -> usize {
-    1 + crate::kernel::fs::cdrom::catalog_count()
-        + crate::kernel::fs::floppy::DRIVES * (1 + crate::kernel::fs::floppy::catalog_count())
+    let dev = disk_device();
+    let catalog = disk_catalog_count(dev);
+    if disk_inserted(dev) {
+        1 + catalog.saturating_sub(1) // Eject + swap targets
+    } else {
+        catalog.max(1) // list, or the "(no images)" row
+    }
+}
+
+/// Keep the Disk selection visible: slide the scroll window after any
+/// selection or device change.
+fn disk_follow_scroll() {
+    let sel = DISK_SEL.load(Ordering::Relaxed);
+    let mut scroll = DISK_SCROLL.load(Ordering::Relaxed);
+    let count = disk_item_count();
+    let max_scroll = count.saturating_sub(DISK_VISIBLE);
+    if scroll > max_scroll {
+        scroll = max_scroll;
+    }
+    if sel < scroll {
+        scroll = sel;
+    } else if sel >= scroll + DISK_VISIBLE {
+        scroll = sel + 1 - DISK_VISIBLE;
+    }
+    DISK_SCROLL.store(scroll, Ordering::Relaxed);
 }
 
 fn active_tab_name(tab: usize) -> &'static [u8] {
@@ -436,10 +533,22 @@ fn move_sel(up: bool) {
         (cur + 1) % count
     };
     set_active_sel(tab, sel);
+    if tab == TAB_DISK {
+        disk_follow_scroll();
+    }
 }
 
-/// ◄/► adjust the selected continuous setting.
+/// ◄/► adjust the selected continuous setting — and on the Disk tab,
+/// cycle the device sub-tab (A: / B: / CD).
 fn adjust(up: bool) {
+    if active_tab() == TAB_DISK {
+        let cur = DISK_DEV.load(Ordering::Relaxed);
+        let next = if up { (cur + 1) % DISK_DEVICES } else { (cur + DISK_DEVICES - 1) % DISK_DEVICES };
+        DISK_DEV.store(next, Ordering::Relaxed);
+        DISK_SEL.store(0, Ordering::Relaxed);
+        DISK_SCROLL.store(0, Ordering::Relaxed);
+        return;
+    }
     if active_tab() != TAB_SOUND {
         return;
     }
@@ -471,20 +580,31 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
     match active_tab() {
         // Continuous settings are adjusted with ◄/►; Enter does nothing.
         TAB_SOUND => {}
-        TAB_DISK => match disk_item(active_sel(TAB_DISK)) {
-            DiskItem::CdEject => crate::kernel::fs::cdrom::eject(),
-            DiskItem::CdImage(index) => {
-                if let Err(error) = crate::kernel::fs::cdrom::insert(index) {
-                    crate::println!("CD-ROM: insert failed: {:?}", error);
+        TAB_DISK => {
+            let dev = disk_device();
+            match disk_row(active_sel(TAB_DISK)) {
+                DiskRow::Eject => {
+                    if dev == 2 {
+                        crate::kernel::fs::cdrom::eject();
+                    } else {
+                        crate::kernel::fs::floppy::eject(dev);
+                    }
                 }
-            }
-            DiskItem::FloppyEject(drive) => crate::kernel::fs::floppy::eject(drive),
-            DiskItem::FloppyImage(drive, index) => {
-                if let Err(error) = crate::kernel::fs::floppy::insert(drive, index) {
-                    crate::println!("Floppy: insert failed: {:?}", error);
+                DiskRow::Insert(index) => {
+                    if dev == 2 {
+                        if let Err(error) = crate::kernel::fs::cdrom::insert(index) {
+                            crate::println!("CD-ROM: insert failed: {:?}", error);
+                        }
+                    } else if let Err(error) = crate::kernel::fs::floppy::insert(dev, index) {
+                        crate::println!("Floppy: insert failed: {:?}", error);
+                    }
                 }
+                DiskRow::NoImages => {}
             }
-        },
+            // Eject/insert changes the row model: re-clamp selection + scroll.
+            set_active_sel(TAB_DISK, active_sel(TAB_DISK));
+            disk_follow_scroll();
+        }
         TAB_DEBUG => match active_sel(TAB_DEBUG) {
             // Toggle each diagnostic and stay open so the new state shows on the row.
             DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
@@ -520,15 +640,28 @@ const SEL_BG: u32 = 0x00F0_B000;
 const SEL_FG: u32 = 0x0020_1000;
 const FOOT_FG: u32 = 0x0078_88A0;
 
+// The panel is a FIXED character grid sized to fit the smallest mode
+// (320x200) with the 8x16 font at scale 1; larger shadows scale the whole
+// grid uniformly (see `paint_scales`). 320x200 with 8px padding affords
+// 38x11 cells; we use 30 columns and the full 11 rows.
 const COLS: usize = 30;
+const MAX_ROWS: usize = 11;
 const PAD: usize = 8;
 const CELL_W: usize = vga::OVERLAY_CELL_W;
 const CELL_H: usize = vga::OVERLAY_CELL_H;
+const _: () = assert!(COLS * CELL_W + 2 * PAD <= 320, "panel wider than the smallest mode");
+const _: () = assert!(MAX_ROWS * CELL_H + 2 * PAD <= 200, "panel taller than the smallest mode");
 
+/// Two glyph scales with distinct meanings. `sy` carries the sink's
+/// mandatory vertical enlargement (a Mode 13h sink later downsamples rows,
+/// so glyphs must be pre-stretched vertically on the 320-wide shadow) TIMES
+/// the readability factor; `sx` carries the readability factor alone. On a
+/// panel-sized shadow both equal the same uniform factor — scaling only
+/// vertically there made the panel 8px-narrow with N·16-tall glyphs.
 #[allow(clippy::too_many_arguments)]
 fn paint_text(
     out: &mut [u8], stride: usize, w: usize, h: usize,
-    logical_w: usize, x: usize, y: usize, scale_y: usize,
+    logical_w: usize, x: usize, y: usize, sx: usize, sy: usize,
     s: &[u8], fg: u32, bg: u32,
     fmt: PixelFormat,
 ) {
@@ -538,28 +671,46 @@ fn paint_text(
     let bytes = fmt.bytes_per_pixel as usize;
     let font = &lib::vga_fonts::FONT_8X16;
     for (i, &ch) in s.iter().enumerate() {
-        let cx = x + i * CELL_W;
-        if cx + CELL_W > logical_w { break; }
+        let cx = x + i * CELL_W * sx;
+        if cx + CELL_W * sx > logical_w { break; }
         let glyph = &font[ch as usize * CELL_H..(ch as usize + 1) * CELL_H];
         for (gy, &bits) in glyph.iter().enumerate() {
-            for repeat in 0..scale_y {
-                let py = y + gy * scale_y + repeat;
+            for repeat in 0..sy {
+                let py = y + gy * sy + repeat;
                 if py >= h { break; }
                 for gx in 0..CELL_W {
                     let pixel = if bits & (0x80 >> gx) != 0 { &fgp } else { &bgp };
-                    let lx = cx + gx;
-                    let x0 = lx.saturating_mul(w) / logical_w;
-                    let x1 = (lx + 1).saturating_mul(w) / logical_w;
-                    for xx in x0..x1.min(w) {
-                        let offset = py * stride + xx * bytes;
-                        if offset + bytes <= out.len() {
-                            out[offset..offset + bytes].copy_from_slice(&pixel[..bytes]);
+                    for sub in 0..sx {
+                        let lx = cx + gx * sx + sub;
+                        let x0 = lx.saturating_mul(w) / logical_w;
+                        let x1 = (lx + 1).saturating_mul(w) / logical_w;
+                        for xx in x0..x1.min(w) {
+                            let offset = py * stride + xx * bytes;
+                            if offset + bytes <= out.len() {
+                                out[offset..offset + bytes].copy_from_slice(&pixel[..bytes]);
+                            }
                         }
                     }
                 }
             }
         }
     }
+}
+
+/// Split the paint scales: `sink_y` is the display's mandatory vertical
+/// factor; the uniform readability factor grows the panel on BOTH axes as
+/// far as the shadow allows, capped so the panel stays a monitor overlay
+/// (~80% of screen height with the 11-row grid) rather than a full-screen
+/// takeover on large text-mode shadows. Returns `(sx, sy)`.
+fn paint_scales(
+    sink_y: usize, logical_w: usize, h: usize, base_w: usize, base_h: usize,
+) -> (usize, usize) {
+    let sink_y = sink_y.max(1);
+    let uniform = (h / (base_h * sink_y))
+        .min(logical_w / base_w)
+        .min((h / (240 * sink_y)).max(1))
+        .max(1);
+    (uniform, sink_y * uniform)
 }
 
 /// Composite the panel into a completed packed shadow. `scale_y` is an
@@ -574,70 +725,130 @@ pub fn paint(
     scale_y: usize,
     fmt: PixelFormat,
 ) {
-    let scale_y = scale_y.max(1);
     if PICKER.load(Ordering::Relaxed) {
         paint_picker(out, stride, w, h, logical_w, scale_y, fmt);
         return;
     }
     let tab = active_tab();
     let count = active_item_count(tab);
-    // Title + tab bar + items + footer.
-    let rows = count + 3;
-    let panel_w = COLS * CELL_W + PAD * 2;
+    // The Disk tab is a fixed-height scroller (device sub-tab row + window);
+    // other tabs list all their items.
+    let (visible, scroll) = if tab == TAB_DISK {
+        (count.min(DISK_VISIBLE), DISK_SCROLL.load(Ordering::Relaxed))
+    } else {
+        (count, 0)
+    };
+    let subtab_rows = usize::from(tab == TAB_DISK);
+    // Title + tab bar + (device sub-tabs) + items + footer.
+    let rows = visible + subtab_rows + 3;
+    let base_panel_w = COLS * CELL_W + PAD * 2;
     let base_panel_h = rows * CELL_H + PAD * 2;
-    let scale_y = scale_y.min(h / base_panel_h).max(1);
-    let panel_h = base_panel_h * scale_y;
+    let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
+    let panel_w = base_panel_w * sx;
+    let panel_h = base_panel_h * sy;
     if logical_w < panel_w || h < panel_h {
         return;
     }
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
+    let (pad_x, pad_y) = (PAD * sx, PAD * sy);
 
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w,
-        (CELL_H + PAD) * scale_y, TITLE_BG, fmt,
+        CELL_H * sy + pad_y, TITLE_BG, fmt,
     );
 
-    let tx = x0 + PAD;
-    let mut ty = y0 + PAD * scale_y;
+    let tx = x0 + pad_x;
+    let mut ty = y0 + pad_y;
     let mut title = Line::new();
     title.put(b"RetroOS Monitor  ");
     title.put(active_tab_name(tab));
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, scale_y,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
-    ty += CELL_H * scale_y;
+    ty += CELL_H * sy;
 
-    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, scale_y, fmt);
-    ty += CELL_H * scale_y;
+    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, sx, sy, fmt);
+    ty += CELL_H * sy;
+
+    if tab == TAB_DISK {
+        paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, sx, sy, fmt);
+        ty += CELL_H * sy;
+    }
 
     let sel = active_sel(tab);
-    for item in 0..count {
+    for row in 0..visible {
+        let item = scroll + row;
         let mut line = Line::new();
         item_line(tab, item, &mut line);
         let selected = item == sel;
         if selected {
             vga::overlay_fill_xscaled(
-                out, stride, w, h, logical_w, x0 + PAD / 2, ty,
-                panel_w - PAD, CELL_H * scale_y, SEL_BG, fmt,
+                out, stride, w, h, logical_w, x0 + pad_x / 2, ty,
+                panel_w - pad_x, CELL_H * sy, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, scale_y,
+            out, stride, w, h, logical_w, tx, ty, sx, sy,
             line.as_bytes(), fg, bg, fmt,
         );
-        ty += CELL_H * scale_y;
+        // Scroller continuation markers in the rightmost column.
+        let marker_x = x0 + panel_w - pad_x - CELL_W * sx;
+        if row == 0 && scroll > 0 {
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
+                b"\x18", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
+        }
+        if row + 1 == visible && scroll + visible < count {
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
+                b"\x19", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
+        }
+        ty += CELL_H * sy;
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, scale_y,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
+}
+
+/// The Disk tab's device row: `A:  B:  CD`, current device highlighted,
+/// switched with ◄/►.
+#[allow(clippy::too_many_arguments)]
+fn paint_disk_subtabs(
+    out: &mut [u8],
+    stride: usize,
+    w: usize,
+    h: usize,
+    logical_w: usize,
+    tx: usize,
+    ty: usize,
+    sx: usize,
+    sy: usize,
+    fmt: PixelFormat,
+) {
+    let active = disk_device();
+    let mut x = tx + CELL_W * sx;
+    for dev in 0..DISK_DEVICES {
+        let label = disk_device_label(dev);
+        let label_w = (label.len() + 1) * CELL_W * sx;
+        let selected = dev == active;
+        if selected {
+            vga::overlay_fill_xscaled(
+                out, stride, w, h, logical_w, x, ty, label_w, CELL_H * sy, SEL_BG, fmt,
+            );
+        }
+        let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
+        paint_text(
+            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty, sx, sy,
+            label, fg, bg, fmt,
+        );
+        x += label_w + CELL_W * sx;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -650,7 +861,8 @@ fn paint_tabs(
     tx: usize,
     ty: usize,
     active: usize,
-    scale_y: usize,
+    sx: usize,
+    sy: usize,
     fmt: PixelFormat,
 ) {
     let mut x = tx;
@@ -661,19 +873,19 @@ fn paint_tabs(
         (TAB_DEBUG, b"Debug" as &[u8]),
     ] {
         let selected = tab == active;
-        let label_w = label.len() * CELL_W + CELL_W;
+        let label_w = (label.len() + 1) * CELL_W * sx;
         if selected {
             vga::overlay_fill_xscaled(
                 out, stride, w, h, logical_w, x, ty,
-                label_w, CELL_H * scale_y, SEL_BG, fmt,
+                label_w, CELL_H * sy, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, x + CELL_W / 2, ty,
-            scale_y, label, fg, bg, fmt,
+            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty,
+            sx, sy, label, fg, bg, fmt,
         );
-        x += label_w + CELL_W;
+        x += label_w + CELL_W * sx;
     }
 }
 
@@ -688,62 +900,68 @@ fn paint_picker(
     fmt: PixelFormat,
 ) {
     let count = PROC_COUNT.load(Ordering::Relaxed);
-    let rows = count.max(1) + 2; // title + list (≥1 line) + footer
-    let panel_w = COLS * CELL_W + PAD * 2;
+    // Character budget: the list shares MAX_ROWS with title + footer.
+    let visible = count.clamp(1, MAX_ROWS - 2);
+    let rows = visible + 2;
+    let base_panel_w = COLS * CELL_W + PAD * 2;
     let base_panel_h = rows * CELL_H + PAD * 2;
-    let scale_y = scale_y.min(h / base_panel_h).max(1);
-    let panel_h = base_panel_h * scale_y;
+    let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
+    let panel_w = base_panel_w * sx;
+    let panel_h = base_panel_h * sy;
     if logical_w < panel_w || h < panel_h {
         return;
     }
     let x0 = (logical_w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
+    let (pad_x, pad_y) = (PAD * sx, PAD * sy);
 
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w, panel_h, PANEL_BG, fmt,
     );
     vga::overlay_fill_xscaled(
         out, stride, w, h, logical_w, x0, y0, panel_w,
-        (CELL_H + PAD) * scale_y, TITLE_BG, fmt,
+        CELL_H * sy + pad_y, TITLE_BG, fmt,
     );
 
-    let tx = x0 + PAD;
-    let mut ty = y0 + PAD * scale_y;
+    let tx = x0 + pad_x;
+    let mut ty = y0 + pad_y;
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, scale_y,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Switch to task", TITLE_FG, TITLE_BG, fmt,
     );
-    ty += CELL_H * scale_y;
+    ty += CELL_H * sy;
 
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, scale_y,
+            out, stride, w, h, logical_w, tx, ty, sx, sy,
             b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
         );
-        ty += CELL_H * scale_y;
+        ty += CELL_H * sy;
     } else {
-        for idx in 0..count {
+        // Window follows the selection so it stays visible.
+        let start = sel.saturating_sub(visible - 1).min(count - visible);
+        for idx in start..start + visible {
             let mut line = Line::new();
             proc_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
                 vga::overlay_fill_xscaled(
-                    out, stride, w, h, logical_w, x0 + PAD / 2, ty,
-                    panel_w - PAD, CELL_H * scale_y, SEL_BG, fmt,
+                    out, stride, w, h, logical_w, x0 + pad_x / 2, ty,
+                    panel_w - pad_x, CELL_H * sy, SEL_BG, fmt,
                 );
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
             paint_text(
-                out, stride, w, h, logical_w, tx, ty, scale_y,
+                out, stride, w, h, logical_w, tx, ty, sx, sy,
                 line.as_bytes(), fg, bg, fmt,
             );
-            ty += CELL_H * scale_y;
+            ty += CELL_H * sy;
         }
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, scale_y,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
     );
 }
@@ -794,36 +1012,20 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             }
             _ => {}
         },
-        TAB_DISK => match disk_item(item) {
-            DiskItem::CdEject => {
-                line.put(b"Eject CD");
-                if !crate::kernel::fs::cdrom::is_inserted() {
-                    line.put(b"  [empty]");
-                }
-            }
-            DiskItem::CdImage(index) => {
-                let mut name = [0_u8; 32];
-                let len = crate::kernel::fs::cdrom::catalog_name(index, &mut name);
+        TAB_DISK => match disk_row(item) {
+            DiskRow::Eject => {
+                let dev = disk_device();
+                line.put(b"Eject ");
+                let mut name = [0_u8; 24];
+                let len = disk_label(dev, &mut name);
                 line.put(&name[..len]);
-                if crate::kernel::fs::cdrom::selected(index) {
-                    line.put(b"  [in]");
-                }
             }
-            DiskItem::FloppyEject(drive) => {
-                line.put(if drive == 0 { b"Eject A:" } else { b"Eject B:" });
-                if !crate::kernel::fs::floppy::is_inserted(drive) {
-                    line.put(b"  [empty]");
-                }
-            }
-            DiskItem::FloppyImage(drive, index) => {
-                line.put(if drive == 0 { b"A: " } else { b"B: " });
-                let mut name = [0_u8; 32];
-                let len = crate::kernel::fs::floppy::catalog_name(index, &mut name);
+            DiskRow::Insert(index) => {
+                let mut name = [0_u8; 28];
+                let len = disk_catalog_name(disk_device(), index, &mut name);
                 line.put(&name[..len]);
-                if crate::kernel::fs::floppy::selected(drive, index) {
-                    line.put(b"  [in]");
-                }
             }
+            DiskRow::NoImages => line.put(b"(no images)"),
         },
         TAB_DEBUG => match item {
             DEBUG_ITEM_TRACE => {

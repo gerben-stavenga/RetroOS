@@ -548,6 +548,15 @@ pub fn is_inserted(drive: usize) -> bool {
     slot(drive).state.lock().media.is_some()
 }
 
+/// Name of the inserted image (for the OSD's "Eject <name>" row). Returns
+/// bytes written; 0 while the drive is empty.
+pub fn label(drive: usize, out: &mut [u8]) -> usize {
+    let state = slot(drive).state.lock();
+    let n = state.label.len().min(out.len());
+    out[..n].copy_from_slice(&state.label[..n]);
+    n
+}
+
 pub fn selected(drive: usize, index: usize) -> bool {
     let catalog = CATALOG.lock();
     let Some(entry) = catalog.get(index) else { return false };

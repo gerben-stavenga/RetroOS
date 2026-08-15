@@ -170,6 +170,15 @@ pub fn is_inserted() -> bool {
     CD_SLOT.state.lock().media.is_some()
 }
 
+/// Name of the inserted image (for the OSD's "Eject <name>" row). Returns
+/// bytes written; 0 while the slot is empty.
+pub fn label(out: &mut [u8]) -> usize {
+    let slot = CD_SLOT.state.lock();
+    let n = slot.label.len().min(out.len());
+    out[..n].copy_from_slice(&slot.label[..n]);
+    n
+}
+
 pub fn selected(index: usize) -> bool {
     let catalog = CATALOG.lock();
     let Some(entry) = catalog.get(index) else { return false };
