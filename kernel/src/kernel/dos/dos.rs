@@ -44,6 +44,22 @@ const EXEC_SAVED_IVT_VECTORS: [u8; 11] =
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const BIOS_TICK_DIVISOR: u64 = 65_536;
 
+/// True for VFS paths on immutable removable media (the CD-ROM and floppy
+/// slot mounts): metadata mutation must fail rather than fall through to
+/// the RAM-overlay scratch path that read-only archive mounts get.
+fn immutable_media_path(path: &[u8]) -> bool {
+    for prefix in [b"cdrom".as_slice(), b"floppya", b"floppyb"] {
+        if path == prefix
+            || (path.len() > prefix.len()
+                && path.starts_with(prefix)
+                && path[prefix.len()] == b'/')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn bios_time_of_day<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8, u8) {
     // BIOS tick count at 0040:006C advances at PIT_INPUT_HZ / 65536 Hz.
     // DOS AH=2Ch returns hundredths, so convert through centiseconds instead
@@ -1248,9 +1264,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             }
             let rc = match dfs_create_path(dos, &name[..i]) {
                 Ok((path, len)) => {
-                    // CD-ROM media is immutable even though read-only archive
-                    // mounts normally accept scratch files in the RAM overlay.
-                    if path[..len] == *b"cdrom" || path[..len].starts_with(b"cdrom/") {
+                    if immutable_media_path(&path[..len]) {
                         -30
                     } else {
                         let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
@@ -1282,7 +1296,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             }
             let rc = match dfs_open_existing(dos, &name[..i]) {
                 Ok((path, len)) => {
-                    if path[..len] == *b"cdrom" || path[..len].starts_with(b"cdrom/") { -30 }
+                    if immutable_media_path(&path[..len]) { -30 }
                     else {
                         let parent = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
                         dfs::ci::invalidate(&path[..parent]);
@@ -1701,7 +1715,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                     } else {
                         drive
                     };
-                    regs.rax = (regs.rax & !0xFFFF) | u64::from(drive != 4);
+                    // Removable: A: (1), B: (2), and the CD-ROM D: (4).
+                    regs.rax = (regs.rax & !0xFFFF) | u64::from(!matches!(drive, 1 | 2 | 4));
                     regs.clear_flag32(1); // clear CF
                 }
                 // AL=0x09: Check if block device is remote (BL=drive)
@@ -2248,8 +2263,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             }
             let rc = match (dfs_open_existing(dos, &old[..old_len]), dfs_create_path(dos, &new[..new_len])) {
                 (Ok((old_path, olen)), Ok((new_path, nlen))) => {
-                    let old_cd = old_path[..olen] == *b"cdrom" || old_path[..olen].starts_with(b"cdrom/");
-                    let new_cd = new_path[..nlen] == *b"cdrom" || new_path[..nlen].starts_with(b"cdrom/");
+                    let old_cd = immutable_media_path(&old_path[..olen]);
+                    let new_cd = immutable_media_path(&new_path[..nlen]);
                     if old_cd || new_cd { -30 }
                     else {
                         let op = old_path[..olen].iter().rposition(|&b| b == b'/').unwrap_or(0);
@@ -2377,7 +2392,23 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
             let dl = regs.rdx as u8;
             // Map drive: 0=default, 1=A, 2=B, 3=C, 4=D
             let drive = if dl == 0 { dos.dfs.current_drive_number() + 1 } else { dl };
-            if drive == 3 {
+            if matches!(drive, 1 | 2) {
+                // A:/B: — real geometry from the inserted FAT image; free
+                // clusters 0 because the slot is write-protected. An empty
+                // drive is AX=FFFF (invalid drive; the not-ready critical
+                // error needs INT 24h plumbing that does not exist yet).
+                match crate::kernel::fs::floppy::geometry(drive as usize - 1) {
+                    Some((spc, bps, total)) => {
+                        regs.rax = (regs.rax & !0xFFFF) | spc as u64;
+                        regs.rbx &= !0xFFFF;
+                        regs.rcx = (regs.rcx & !0xFFFF) | bps as u64;
+                        regs.rdx = (regs.rdx & !0xFFFF) | total as u64;
+                    }
+                    None => {
+                        regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
+                    }
+                }
+            } else if drive == 3 {
                 // C: drive — report a synthetic 128MB disk with 96MB free.
                 // VFS has no capacity query, but installers use this call to
                 // reject destinations that cannot hold their selected payload.
@@ -2401,7 +2432,7 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 regs.rcx = (regs.rcx & !0xFFFF) | 512;
                 regs.rdx = (regs.rdx & !0xFFFF) | 32768;
             } else {
-                // A:/B: or unknown — invalid drive
+                // Unknown — invalid drive
                 regs.rax = (regs.rax & !0xFFFF) | 0xFFFF;
             }
             thread::KernelAction::Done
@@ -4686,6 +4717,10 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         e
     };
     let mut cds = [(); NUM_DRIVES as usize].map(|_| CdsEntry::default());
+    // A:/B: are valid drives with or without media (MS-DOS binds letters to
+    // drive units, not disks); an empty slot errors at access time instead.
+    cds[0] = mk(b'A');
+    cds[1] = mk(b'B');
     cds[2] = mk(b'C');
     cds[3] = mk(b'D');
     if crate::kernel::platform::get().hostfs {

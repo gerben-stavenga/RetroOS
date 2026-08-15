@@ -103,6 +103,7 @@ pub fn is_open() -> bool {
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
 pub fn open(display: OsdDisplay) {
     crate::kernel::fs::cdrom::refresh_catalog();
+    crate::kernel::fs::floppy::refresh_catalog();
     unsafe { OSD_DISPLAY = Some(display); }
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     SYSTEM_SEL.store(0, Ordering::Relaxed);
@@ -226,9 +227,35 @@ fn sound_item_count() -> usize {
     sound_item_count_for(crate::kernel::platform::get().audio)
 }
 
-/// Eject is always the first row, followed by the images in C:\CD.
+/// Three media sections. Each starts with its Eject row, followed by the
+/// images the drive can load: the CD-ROM slot with C:\CD, then floppy A:
+/// and B:, both drawing from the shared C:\FLOPPY catalogue.
+#[derive(Clone, Copy)]
+enum DiskItem {
+    CdEject,
+    CdImage(usize),
+    FloppyEject(usize),
+    FloppyImage(usize, usize),
+}
+
+fn disk_item(item: usize) -> DiskItem {
+    let cd = 1 + crate::kernel::fs::cdrom::catalog_count();
+    let per_floppy = 1 + crate::kernel::fs::floppy::catalog_count();
+    if item < cd {
+        if item == 0 { DiskItem::CdEject } else { DiskItem::CdImage(item - 1) }
+    } else {
+        let item = item - cd;
+        let drive = item / per_floppy;
+        match item % per_floppy {
+            0 => DiskItem::FloppyEject(drive),
+            n => DiskItem::FloppyImage(drive, n - 1),
+        }
+    }
+}
+
 fn disk_item_count() -> usize {
     1 + crate::kernel::fs::cdrom::catalog_count()
+        + crate::kernel::fs::floppy::DRIVES * (1 + crate::kernel::fs::floppy::catalog_count())
 }
 
 fn active_tab_name(tab: usize) -> &'static [u8] {
@@ -444,14 +471,20 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
     match active_tab() {
         // Continuous settings are adjusted with ◄/►; Enter does nothing.
         TAB_SOUND => {}
-        TAB_DISK => {
-            let item = active_sel(TAB_DISK);
-            if item == 0 {
-                crate::kernel::fs::cdrom::eject();
-            } else if let Err(error) = crate::kernel::fs::cdrom::insert(item - 1) {
-                crate::println!("CD-ROM: insert failed: {:?}", error);
+        TAB_DISK => match disk_item(active_sel(TAB_DISK)) {
+            DiskItem::CdEject => crate::kernel::fs::cdrom::eject(),
+            DiskItem::CdImage(index) => {
+                if let Err(error) = crate::kernel::fs::cdrom::insert(index) {
+                    crate::println!("CD-ROM: insert failed: {:?}", error);
+                }
             }
-        }
+            DiskItem::FloppyEject(drive) => crate::kernel::fs::floppy::eject(drive),
+            DiskItem::FloppyImage(drive, index) => {
+                if let Err(error) = crate::kernel::fs::floppy::insert(drive, index) {
+                    crate::println!("Floppy: insert failed: {:?}", error);
+                }
+            }
+        },
         TAB_DEBUG => match active_sel(TAB_DEBUG) {
             // Toggle each diagnostic and stay open so the new state shows on the row.
             DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
@@ -761,14 +794,14 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             }
             _ => {}
         },
-        TAB_DISK => {
-            if item == 0 {
+        TAB_DISK => match disk_item(item) {
+            DiskItem::CdEject => {
                 line.put(b"Eject CD");
                 if !crate::kernel::fs::cdrom::is_inserted() {
                     line.put(b"  [empty]");
                 }
-            } else {
-                let index = item - 1;
+            }
+            DiskItem::CdImage(index) => {
                 let mut name = [0_u8; 32];
                 let len = crate::kernel::fs::cdrom::catalog_name(index, &mut name);
                 line.put(&name[..len]);
@@ -776,7 +809,22 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                     line.put(b"  [in]");
                 }
             }
-        }
+            DiskItem::FloppyEject(drive) => {
+                line.put(if drive == 0 { b"Eject A:" } else { b"Eject B:" });
+                if !crate::kernel::fs::floppy::is_inserted(drive) {
+                    line.put(b"  [empty]");
+                }
+            }
+            DiskItem::FloppyImage(drive, index) => {
+                line.put(if drive == 0 { b"A: " } else { b"B: " });
+                let mut name = [0_u8; 32];
+                let len = crate::kernel::fs::floppy::catalog_name(index, &mut name);
+                line.put(&name[..len]);
+                if crate::kernel::fs::floppy::selected(drive, index) {
+                    line.put(b"  [in]");
+                }
+            }
+        },
         TAB_DEBUG => match item {
             DEBUG_ITEM_TRACE => {
                 line.put(b"Trace    ");

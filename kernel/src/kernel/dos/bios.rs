@@ -331,7 +331,9 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, crtc_base = 0x03D4u16);
     bda_field!(machine, rows_minus1 = 24u8);
     bda_field!(machine, cell_height = 16u16);
-    bda_field!(machine, equipment = 0x0001u16);
+    // Bit 0: diskette drives present; bits 7-6: drive count minus one.
+    // Two floppy units (the A:/B: image slots), matching the CDS.
+    bda_field!(machine, equipment = 0x0041u16);
     // A real POST leaves the text cursor shape and the CGA compatibility
     // register mirrors set for mode 3; AH=1Bh publishes all three, and a guest
     // reading them back as zero sees a machine with no cursor.

@@ -170,32 +170,10 @@ pub fn eject() {
 }
 
 fn read_vfs_file(path: &[u8]) -> Result<Vec<u8>, MediaError> {
-    let handle = vfs::open_to_handle(path);
-    if handle < 0 {
-        return Err(MediaError::Io);
-    }
-    let size = vfs::file_size_by_handle(handle);
-    if size > MAX_IMAGE_BYTES {
-        vfs::close_vfs_handle(handle);
-        return Err(MediaError::InvalidImage);
-    }
-    let mut data = Vec::new();
-    if data.try_reserve_exact(size as usize).is_err() {
-        vfs::close_vfs_handle(handle);
-        return Err(MediaError::Io);
-    }
-    data.resize(size as usize, 0);
-    let mut offset = 0;
-    while offset < data.len() {
-        let n = vfs::read_by_handle(handle, &mut data[offset..]);
-        if n <= 0 {
-            vfs::close_vfs_handle(handle);
-            return Err(MediaError::Io);
-        }
-        offset += n as usize;
-    }
-    vfs::close_vfs_handle(handle);
-    Ok(data)
+    super::read_image_file(path, MAX_IMAGE_BYTES).map_err(|e| match e {
+        super::ImageReadError::TooBig => MediaError::InvalidImage,
+        super::ImageReadError::Io => MediaError::Io,
+    })
 }
 
 fn sibling_path(path: &[u8], filename: &[u8]) -> Vec<u8> {

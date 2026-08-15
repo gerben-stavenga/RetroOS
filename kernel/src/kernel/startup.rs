@@ -111,9 +111,10 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .collect();
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
     mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
-    // A permanent empty proxy keeps the mount table stable while the OSD
-    // inserts/ejects images discovered under DOS's C:\CD directory.
+    // Permanent empty proxies keep the mount table stable while the OSD
+    // inserts/ejects images discovered under DOS's C:\CD and C:\FLOPPY.
     crate::kernel::fs::cdrom::init();
+    crate::kernel::fs::floppy::init();
 
     // CONFIG.SYS is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).

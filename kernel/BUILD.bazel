@@ -65,6 +65,9 @@ rust_library(
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
         "@nuked_opl3//:nuked_opl3",
+        # http_archive (not @crates): the crates.io release only does no_std
+        # via the dead `core_io` crate; this is a pinned master (0.4) commit.
+        "@fatfs//:fatfs",
     ] + select({
         ":metal": [
             "//arch-metal",

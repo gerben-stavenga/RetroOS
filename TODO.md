@@ -62,14 +62,12 @@ in Git history.
   useful `INT 13h` disk services and DOS absolute-sector interfaces against
   mounted media. Keep access mediated by the DOS machine rather than exposing
   host block devices directly.
-- [ ] **Mount FAT filesystems from floppy images.** The OSD floppy slot only
-  supplies a sector image; DOS file APIs also need a filesystem layer over it.
-  Implement BPB parsing and FAT12 first, including subdirectories, allocation,
-  create/write/delete/rename, timestamps and attributes, media-change handling,
-  and safe writeback on eject. Add FAT16 for larger floppy/superfloppy images
-  and tolerate common nonstandard geometries when the BPB is self-consistent.
-  Long filenames belong to the separate LFN work; short-name FAT access must
-  work independently.
+- [x] **Mount FAT filesystems from floppy images.** (read side) Two OSD
+  floppy slots (A:/B:) mount rust-fatfs over RAM images from `C:\FLOPPY`,
+  with FAT12/16, subdirectories, timestamps, and media-change handling via
+  slot generations. Remaining: the write side — allocation,
+  create/write/delete/rename through the slot, and safe writeback of the
+  RAM image to the catalogue file on eject.
 - [ ] **Add CD-ROM and MSCDEX compatibility over OSD media slots.** Keep
   persistent floppy and CD drive slots whose inserted media can change while
   the drive remains registered. Provide a synthetic MSCDEX interface, drive

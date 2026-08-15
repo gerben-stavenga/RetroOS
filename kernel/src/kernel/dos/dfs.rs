@@ -4,7 +4,13 @@
 //! form, case-insensitive lookup) over the case-sensitive VFS. Mirrors
 //! DOSBox: the underlying filesystem is Linux-style; DFS walks it
 //! component-by-component to map each DOS component to the real on-disk
-//! case name. Drive `C:` is the default DOS root; `H:` maps to the `host/` mount.
+//! case name. Drive `C:` is the default DOS root; `A:`/`B:` map to the
+//! floppy slots and `H:` to the `host/` mount.
+//!
+//! Letters are valid per DRIVE, not per media (MS-DOS semantics): A: with
+//! no image inserted selects fine and fails at access time, like a real
+//! empty drive — the slot mounts are permanent, so resolution always has
+//! somewhere to land.
 //!
 //! All DOS INT 21h path-bearing handlers must route through DFS — never
 //! touch the raw VFS directly from the DOS layer.
@@ -214,14 +220,14 @@ fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> 
 
 /// Per-thread DOS filesystem state.
 pub struct DfsState {
-    cwd: [[u8; DFS_CWD_MAX]; 3],
-    cwd_len: [u8; 3],
+    cwd: [[u8; DFS_CWD_MAX]; 5],
+    cwd_len: [u8; 5],
     current_drive: u8,
 }
 
 impl DfsState {
     pub const fn new() -> Self {
-        Self { cwd: [[0; DFS_CWD_MAX]; 3], cwd_len: [0; 3], current_drive: b'C' }
+        Self { cwd: [[0; DFS_CWD_MAX]; 5], cwd_len: [0; 5], current_drive: b'C' }
     }
 
     fn drive_slot(drive: u8) -> Option<usize> {
@@ -229,6 +235,8 @@ impl DfsState {
             b'C' => Some(0),
             b'D' => Some(1),
             b'H' => Some(2),
+            b'A' => Some(3),
+            b'B' => Some(4),
             _ => None,
         }
     }
@@ -456,6 +464,8 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
         return Err(3);
     }
     let prefix: &[u8] = match abs_dos[0] {
+        b'A' => b"floppya/",
+        b'B' => b"floppyb/",
         b'C' => c_root(),
         b'D' => b"cdrom/",
         b'H' => b"host/",
@@ -624,5 +634,26 @@ mod tests {
         let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
         assert_eq!(&vfs[..prefix_len], b"host");
         assert_eq!(rest, b"SOURCE\\MAIN.C");
+    }
+
+    #[test]
+    fn drives_a_and_b_map_to_the_floppy_slots() {
+        let mut dfs = DfsState::new();
+        let mut dos = [0u8; DFS_PATH_MAX];
+        let mut vfs = [0u8; DFS_PATH_MAX];
+
+        let len = dfs.resolve(b"A:\\SUBDIR\\README.TXT", &mut dos).unwrap();
+        let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
+        assert_eq!(&vfs[..prefix_len], b"floppya");
+        assert_eq!(rest, b"SUBDIR\\README.TXT");
+
+        // Letters are valid per drive, not per media: selection succeeds
+        // with nothing inserted, and each drive keeps its own cwd.
+        assert!(dfs.select_drive(b'B'));
+        assert_eq!(dfs.current_drive_number(), 1);
+        let len = dfs.resolve(b"GAME.SAV", &mut dos).unwrap();
+        assert_eq!(&dos[..len], b"B:\\GAME.SAV");
+        let (prefix_len, _) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
+        assert_eq!(&vfs[..prefix_len], b"floppyb");
     }
 }
