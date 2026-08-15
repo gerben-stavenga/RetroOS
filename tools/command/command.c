@@ -671,9 +671,9 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
  * keeps tokenisation in a single place (the BAT-line / cmdline parser). */
 
 /* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
- * Built-ins (REM/ECHO/CD/CLS/TYPE/LOG/PAUSE/TRACE/EXIT/SHUTDOWN) are matched
- * first and handled inline; if none match, dispatch_external takes over at
- * the tail.
+ * Built-ins (drive switch "X:", REM/ECHO/CD/CLS/TYPE/LOG/PAUSE/TRACE/EXIT/
+ * SHUTDOWN) are matched first and handled inline; if none match,
+ * dispatch_external takes over at the tail.
  * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
  * caller-reserved scratch slots that dispatch_external may overwrite for
  * trampoline-prefix injection. Returns the command's exit code. */
@@ -684,6 +684,20 @@ static int run_command(char **argv, int prog_idx, int argc, int interactive) {
 
     if (prog_idx >= argc) return 0;
     name = argv[prog_idx];
+
+    /* Bare "X:" switches the current drive. AH=0Eh reports LASTDRIVE rather
+     * than an error for a bad letter, so read the drive back (AH=19h) to
+     * detect one. */
+    if (isalpha((unsigned char)name[0]) && name[1] == ':' && name[2] == 0) {
+        unsigned char want = (unsigned char)(toupper((unsigned char)name[0]) - 'A');
+        r.h.ah = 0x0E;
+        r.h.dl = want;
+        int86(0x21, &r, &r);
+        r.h.ah = 0x19;
+        int86(0x21, &r, &r);
+        if (r.h.al != want) { puts("Invalid drive specification"); return 1; }
+        return 0;
+    }
 
     if (stricmp(name, "REM") == 0) return 0;
     if (stricmp(name, "ECHO") == 0) {
