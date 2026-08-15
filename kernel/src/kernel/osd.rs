@@ -511,7 +511,27 @@ fn pick_select() {
     if sel < PROC_COUNT.load(Ordering::Relaxed) {
         thread::request_switch_to(proc_at(sel).tid as usize);
     }
-    close();
+    // Stay open: the switch path re-parks the display of the newly focused
+    // owner into the monitor (see switch_focus_and_run), so the picker
+    // survives the hop and further switches need no reopening.
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+/// Re-park a display into the ALREADY-OPEN monitor — the focus switch took
+/// the old owner's display back and suspended the new owner; menu state
+/// (tab, selection, scroll) survives, unlike `open`.
+pub fn repark_display(display: OsdDisplay) {
+    unsafe {
+        OSD_DISPLAY = Some(display);
+    }
+    refresh_processes_marker();
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+/// After a switch the focused-task marker in the picker is stale until the
+/// event loop's next snapshot; nudge a repaint so it corrects promptly.
+fn refresh_processes_marker() {
+    REPAINT.store(true, Ordering::Relaxed);
 }
 
 fn cycle_tab() {

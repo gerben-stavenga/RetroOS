@@ -106,7 +106,12 @@ pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: 
     // Ignore a stale target that is the current owner, out of range, or no
     // longer active.
     if let Some(target) = thread::take_switch_target() {
-        if target != tid
+        // `target == tid` is still meaningful when the CONSOLE is elsewhere:
+        // the picker chose the thread that happens to be running while
+        // another thread owns the display (a `/C` parent polls its wait, so
+        // it is scheduled round-robin and may consume the request meant to
+        // focus itself). That case is a focus-only handoff downstream.
+        if (target != tid || crate::kernel::focus::focused() != target)
             && target < threads.len()
             && matches!(
                 threads[target].kernel.state,

@@ -941,6 +941,44 @@ fn switch_focus_and_run<A: crate::Arch>(
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
     if new_tid == ctx.tid {
+        let focused = crate::kernel::focus::focused();
+        if focused == new_tid {
+            return;
+        }
+        // Focus-only handoff: the picker chose the thread that is already
+        // RUNNING while another thread owns the console (a `/C` parent
+        // polling its wait). Move the display without touching execution
+        // state — through the monitor's custody when it is open.
+        let owner_zombie = thread::get_thread(threads, focused)
+            .is_none_or(|t| t.kernel.state == thread::ThreadState::Zombie);
+        if owner_zombie {
+            return; // exit transaction owns the display; nothing to move here
+        }
+        let mut repark_osd = false;
+        if crate::kernel::osd::is_open() {
+            let owner = thread::get_thread(threads, focused).expect("focus handoff: owner");
+            crate::kernel::console::restore_from_monitor(
+                machine, &mut *bios_workspace, &mut ctx.regs, &mut owner.personality,
+            );
+            repark_osd = true;
+        }
+        let owner = thread::get_thread(threads, focused).expect("focus handoff: owner");
+        let (display, card) =
+            crate::kernel::focus::release(machine, &mut *bios_workspace, &mut owner.personality);
+        if card.is_some() {
+            assert!(sb_handoff.is_none(), "stale SB handoff");
+            *sb_handoff = card;
+        }
+        let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
+        *sb_handoff = crate::kernel::focus::acquire(
+            machine, bios_workspace, new_tid, &mut new.personality, display, sb_handoff.take(),
+        );
+        if repark_osd {
+            crate::dbg_println!("[osd] repark across focus handoff -> tid {}", new_tid);
+            let display = new.personality.suspend_for_osd(machine, bios_workspace);
+            crate::kernel::osd::repark_display(crate::kernel::osd::OsdDisplay::new(display));
+            new.personality.repaint_osd();
+        }
         return;
     }
     // Normal DOS return has already named the parent as focus, but the child
@@ -970,15 +1008,18 @@ fn switch_focus_and_run<A: crate::Arch>(
         *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         return;
     }
-    // The monitor is tied to one console owner. A yield/scheduler switch can
-    // otherwise move focus while OPEN remains global: the incoming DOS owner
-    // materializes as Native, then the next monitor key tries to take an OSD
-    // Display from it and double-closes the ownership transition. Close and
-    // return the old owner's surface before the ordinary release/acquire.
+    // The monitor is tied to one console owner, so a focus switch while it
+    // is open must move the display THROUGH the ordinary release/acquire:
+    // give it back to the old owner first, transfer normally, then suspend
+    // the NEW owner into the still-open monitor. Leaving OPEN global while
+    // the display transferred underneath used to double-close the ownership
+    // transition — hence this explicit re-park. A zombie old owner cannot
+    // take the display back; the monitor closes in that case (its exit
+    // already dismissed it on the ordinary path).
+    let mut repark_osd = false;
     if crate::kernel::osd::is_open() {
-        crate::kernel::osd::dismiss();
         let old = thread::get_thread(threads, ctx.tid)
-            .expect("OSD dismissal: invalid old thread");
+            .expect("OSD re-park: invalid old thread");
         if old.kernel.state != thread::ThreadState::Zombie {
             crate::kernel::console::restore_from_monitor(
                 machine,
@@ -986,6 +1027,9 @@ fn switch_focus_and_run<A: crate::Arch>(
                 &mut ctx.regs,
                 &mut old.personality,
             );
+            repark_osd = true;
+        } else {
+            crate::kernel::osd::dismiss();
         }
     }
 
@@ -1020,6 +1064,14 @@ fn switch_focus_and_run<A: crate::Arch>(
             crate::kernel::focus::adopt(new_tid);
             *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         }
+    }
+    // The monitor stayed open across the hop: suspend the freshly focused
+    // owner and park its display back under the panel, menu state intact.
+    if repark_osd {
+        crate::dbg_println!("[osd] repark across focus switch -> tid {}", new_tid);
+        let display = new.personality.suspend_for_osd(machine, bios_workspace);
+        crate::kernel::osd::repark_display(crate::kernel::osd::OsdDisplay::new(display));
+        new.personality.repaint_osd();
     }
 }
 
