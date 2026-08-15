@@ -662,7 +662,7 @@ const _: () = assert!(MAX_ROWS * CELL_H + 2 * PAD <= 200, "panel taller than the
 #[allow(clippy::too_many_arguments)]
 fn paint_text(
     out: &mut [u8], stride: usize, w: usize, h: usize,
-    logical_w: usize, x: usize, y: usize, sx: usize, sy: usize, sink_y: usize,
+    logical_w: usize, x: usize, y: usize, sx: usize, sy: usize,
     s: &[u8], fg: u32, bg: u32,
     fmt: PixelFormat,
 ) {
@@ -670,13 +670,11 @@ fn paint_text(
     let fgp = fmt.encode(fg).to_le_bytes();
     let bgp = fmt.encode(bg).to_le_bytes();
     let bytes = fmt.bytes_per_pixel as usize;
-    // The cell is 8x8; when it spans at least 16 CONTENT lines, the 8x16
-    // font fits the same cell at half the row scale — full text-font detail
-    // (real descenders) at the identical square footprint. Content lines,
-    // not shadow rows: a Mode 13h sink discards `sink_y-1` of every
-    // `sink_y` rows, so sink-induced evenness must NOT pick the tall font
-    // (half of every glyph would be thrown away at downsample).
-    let (font, rows, row_scale): (&[u8], usize, usize) = if sy % (2 * sink_y.max(1)) == 0 {
+    // The cell is 8x8; at an even row scale the 8x16 font fits the same
+    // cell at half the row scale — full text-font detail (real descenders)
+    // at the identical footprint. Shadow rows ARE content rows here (the
+    // vertical stretch happens after paint, uniformly, preserving detail).
+    let (font, rows, row_scale): (&[u8], usize, usize) = if sy % 2 == 0 {
         (&lib::vga_fonts::FONT_8X16, 16, sy / 2)
     } else {
         (&lib::vga_fonts::FONT_8X8, 8, sy)
@@ -708,31 +706,32 @@ fn paint_text(
     }
 }
 
-/// Choose the cell scales `(sx, sy)` from the physical result backwards:
+/// Choose the cell scales `(sx, sy)` from the physical result backwards.
 ///
-/// - HORIZONTAL: the panel should span a good fraction (~3/4) of the
-///   shadow width — that fixes the on-screen cell width, so `sx` is that
-///   target rounded down to an integer glyph scale (and clamped to fit).
-/// - VERTICAL: the cell should approximate a square in CONTENT pixels;
-///   one content line costs `sink_y` shadow rows (a Mode 13h sink later
-///   downsamples by that), so the square target is `sy = sx * sink_y`,
-///   then snapped DOWN in `sink_y` steps until the needed rows fit the
-///   shadow — cells go squat before the panel refuses to paint.
+/// The shadow is wide-and-short: rows are already stretched to the output
+/// width, but the mode's ROW COUNT is kept and the present step expands
+/// rows by `stretch_y` AFTERWARD (a 320x200 game on a 480-line output is
+/// a 640x200 shadow stretched x2.4 after we paint). So:
+///
+/// - HORIZONTAL: the panel targets ~3/4 of the shadow width; `sx` is the
+///   nearest integer glyph scale (floor under-shoots: a 640-wide shadow
+///   would stay 1x when 2x spans a nicer 80%), clamped to fit.
+/// - VERTICAL: on-screen cell height is `8 * sy * stretch_y`, so square
+///   means `sy = sx / stretch_y`, rounded to nearest and floored at 1 —
+///   then snapped down if the needed rows would overflow the shadow.
 ///
 /// An even `sy` lets `paint_text` honor the 8x16 font inside the same
 /// 8x8 cell (full text-font detail at half the row scale).
 fn paint_scales(
-    sink_y: usize, logical_w: usize, h: usize, base_w: usize, base_h: usize,
+    stretch_y: usize, logical_w: usize, h: usize, base_w: usize, base_h: usize,
 ) -> (usize, usize) {
-    let sink_y = sink_y.max(1);
-    // Nearest integer to the 3/4-width target (floor under-shoots badly:
-    // a 640-wide shadow would stay at 1x when 2x spans a nicer 80%).
+    let stretch_y = stretch_y.max(1);
     let sx = ((logical_w * 3 + 2 * base_w) / (4 * base_w))
         .min(logical_w / base_w)
         .max(1);
-    let mut sy = sx * sink_y;
-    while sy > sink_y && base_h * sy > h {
-        sy -= sink_y;
+    let mut sy = ((sx + stretch_y / 2) / stretch_y).max(1);
+    while sy > 1 && base_h * sy > h {
+        sy -= 1;
     }
     (sx, sy)
 }
@@ -767,7 +766,6 @@ pub fn paint(
     let rows = visible + subtab_rows + 3;
     let base_panel_w = COLS * CELL_W + PAD * 2;
     let base_panel_h = rows * CELL_H + PAD * 2;
-    let sink = scale_y.max(1);
     let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
     let panel_w = base_panel_w * sx;
     let panel_h = base_panel_h * sy;
@@ -792,16 +790,16 @@ pub fn paint(
     title.put(b"RetroOS Monitor  ");
     title.put(active_tab_name(tab));
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         title.as_bytes(), TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H * sy;
 
-    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, sx, sy, sink, fmt);
+    paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, sx, sy, fmt);
     ty += CELL_H * sy;
 
     if tab == TAB_DISK {
-        paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, sx, sy, sink, fmt);
+        paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, sx, sy, fmt);
         ty += CELL_H * sy;
     }
 
@@ -819,24 +817,24 @@ pub fn paint(
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+            out, stride, w, h, logical_w, tx, ty, sx, sy,
             line.as_bytes(), fg, bg, fmt,
         );
         // Scroller continuation markers in the rightmost column.
         let marker_x = x0 + panel_w - pad_x - CELL_W * sx;
         if row == 0 && scroll > 0 {
-            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy, sink,
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
                 b"\x18", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
         }
         if row + 1 == visible && scroll + visible < count {
-            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy, sink,
+            paint_text(out, stride, w, h, logical_w, marker_x, ty, sx, sy,
                 b"\x19", FOOT_FG, if selected { SEL_BG } else { PANEL_BG }, fmt);
         }
         ty += CELL_H * sy;
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Up/Dn Enter <>adjust Tab Esc", FOOT_FG, PANEL_BG, fmt,
     );
 }
@@ -854,7 +852,6 @@ fn paint_disk_subtabs(
     ty: usize,
     sx: usize,
     sy: usize,
-    sink: usize,
     fmt: PixelFormat,
 ) {
     let active = disk_device();
@@ -870,7 +867,7 @@ fn paint_disk_subtabs(
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty, sx, sy, sink,
+            out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty, sx, sy,
             label, fg, bg, fmt,
         );
         x += label_w + CELL_W * sx;
@@ -889,7 +886,6 @@ fn paint_tabs(
     active: usize,
     sx: usize,
     sy: usize,
-    sink: usize,
     fmt: PixelFormat,
 ) {
     let mut x = tx;
@@ -910,7 +906,7 @@ fn paint_tabs(
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
             out, stride, w, h, logical_w, x + (CELL_W * sx) / 2, ty,
-            sx, sy, sink, label, fg, bg, fmt,
+            sx, sy, label, fg, bg, fmt,
         );
         x += label_w + CELL_W * sx;
     }
@@ -932,7 +928,6 @@ fn paint_picker(
     let rows = visible + 2;
     let base_panel_w = COLS * CELL_W + PAD * 2;
     let base_panel_h = rows * CELL_H + PAD * 2;
-    let sink = scale_y.max(1);
     let (sx, sy) = paint_scales(scale_y, logical_w, h, base_panel_w, base_panel_h);
     let panel_w = base_panel_w * sx;
     let panel_h = base_panel_h * sy;
@@ -954,7 +949,7 @@ fn paint_picker(
     let tx = x0 + pad_x;
     let mut ty = y0 + pad_y;
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Switch to task", TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H * sy;
@@ -962,7 +957,7 @@ fn paint_picker(
     let sel = PICK_SEL.load(Ordering::Relaxed);
     if count == 0 {
         paint_text(
-            out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+            out, stride, w, h, logical_w, tx, ty, sx, sy,
             b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
         );
         ty += CELL_H * sy;
@@ -981,7 +976,7 @@ fn paint_picker(
             }
             let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
             paint_text(
-                out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+                out, stride, w, h, logical_w, tx, ty, sx, sy,
                 line.as_bytes(), fg, bg, fmt,
             );
             ty += CELL_H * sy;
@@ -989,7 +984,7 @@ fn paint_picker(
     }
 
     paint_text(
-        out, stride, w, h, logical_w, tx, ty, sx, sy, sink,
+        out, stride, w, h, logical_w, tx, ty, sx, sy,
         b"Up/Dn  Enter  Esc back", FOOT_FG, PANEL_BG, fmt,
     );
 }

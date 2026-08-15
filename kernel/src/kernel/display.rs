@@ -389,16 +389,16 @@ impl Display {
             self.voodoo_ramp_generation = None;
         }
     }
-    /// Vertical OSD enlargement needed before a Mode 13h sink downsamples the
-    /// completed shadow. Horizontal OSD coordinates always belong to the
-    /// packed shadow itself, independent of the frame producer.
-    fn osd_scale_y(&self, shadow_height: usize) -> usize {
-        match &self.backend {
-            Backend::Vga {
-                scanout: VgaScanout::Mode13 { framebuffer, .. }, ..
-            } => (shadow_height / framebuffer.height).max(1),
-            _ => 1,
-        }
+    /// The vertical stretch the present step applies AFTER the OSD is
+    /// painted. The shadow is wide-and-short: `render_shadow` stretches
+    /// each mode row HORIZONTALLY to the output width, but keeps the
+    /// mode's row count — a 320x200 game on a 480-line output is a
+    /// 640x200 shadow whose rows the sink expands x2.4 afterward. The
+    /// OSD must divide its cell height by this factor or its glyphs
+    /// come out tall-and-narrow on every scaled-up low mode.
+    fn osd_stretch_y(&self, shadow_height: usize) -> usize {
+        let (_, out_h) = self.fit();
+        (out_h / shadow_height.max(1)).max(1)
     }
     pub fn vga_capability(&self) -> Option<&crate::kernel::platform::VgaCap> {
         match &self.backend {
@@ -469,7 +469,7 @@ impl Display {
                 self.shadow_width,
                 height,
                 self.shadow_width,
-                self.osd_scale_y(height),
+                self.osd_stretch_y(height),
                 format,
             );
         }
