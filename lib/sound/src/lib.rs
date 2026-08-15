@@ -40,6 +40,7 @@ pub mod pacer;
 pub mod engine;
 pub mod gus;
 pub mod mpu401;
+pub mod mt32;
 pub mod opl;
 pub mod midi;
 pub mod pat;

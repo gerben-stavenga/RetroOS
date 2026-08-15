@@ -21,6 +21,11 @@ pub struct Mpu {
     /// state; a program that never opens the port pays nothing. Instruments
     /// come from the boot ROM by reference.
     synth: Option<alloc::boxed::Box<sound::midi::Synth>>,
+    /// MT-32 stream detection and translation for pre-GM games: watches the
+    /// SysEx addressee and, when the guest is talking to an MT-32, remaps
+    /// its programs/pan/key-shifts to their GM approximations before the
+    /// bytes reach the synth. GM streams pass through untouched.
+    mt32: alloc::boxed::Box<sound::mt32::Mt32Filter>,
     /// The ROM in the socket, handed in with the rest of this program's
     /// wiring (see [`Mpu::configure_from_env`]). A device does not go
     /// looking for its own ROM: the bank is burned once at boot by whoever
@@ -36,6 +41,7 @@ impl Mpu {
             base: 0x330,
             card: sound::mpu401::Mpu401::new(0x330),
             synth: None,
+            mt32: alloc::boxed::Box::new(sound::mt32::Mt32Filter::new()),
             bank: None,
         }
     }
@@ -77,6 +83,7 @@ impl Mpu {
     pub fn reset(&mut self) {
         self.card.reset();
         self.synth = None;
+        self.mt32.reset();
         self.present = false;
     }
 
@@ -111,8 +118,13 @@ impl Mpu {
         }
         while let Some(b) = self.card.take() {
             if let Some(s) = self.synth.as_mut() {
-                s.write_at(arrival_frame, b);
+                for &out in self.mt32.push(b) {
+                    s.write_at(arrival_frame, out);
+                }
             }
+        }
+        if let Some(note) = self.mt32.take_latch_note() {
+            crate::dbg_println!("[mpu] {}", note);
         }
     }
 
