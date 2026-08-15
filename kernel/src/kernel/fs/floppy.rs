@@ -16,6 +16,7 @@
 
 use alloc::collections::BTreeMap;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
@@ -38,12 +39,18 @@ pub enum InsertError {
 
 // ── RAM image behind fatfs's byte-stream io traits ──────────────────────────
 
+/// The raw image bytes, shared between the FAT layer (through `ImageCursor`)
+/// and the sector layer (INT 13h CHS reads) — one copy, two views. The outer
+/// slot mutex serializes all users, so this inner lock is never contended;
+/// it exists to give each view a safe borrow.
+type RawImage = Arc<Mutex<Vec<u8>>>;
+
 /// `std::io::Cursor` semantics over the in-RAM image: seeks anywhere ≥ 0,
 /// reads past the end return 0 bytes. Writes land in the Vec (rust-fatfs may
 /// touch the dirty flag even on a read-mounted volume); they are invisible
 /// outside this slot and vanish on eject.
 struct ImageCursor {
-    data: Vec<u8>,
+    data: RawImage,
     pos: u64,
 }
 
@@ -53,12 +60,13 @@ impl fatfs::IoBase for ImageCursor {
 
 impl fatfs::Read for ImageCursor {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, ()> {
+        let data = self.data.lock();
         let pos = usize::try_from(self.pos).map_err(|_| ())?;
-        if pos >= self.data.len() {
+        if pos >= data.len() {
             return Ok(0);
         }
-        let n = buf.len().min(self.data.len() - pos);
-        buf[..n].copy_from_slice(&self.data[pos..pos + n]);
+        let n = buf.len().min(data.len() - pos);
+        buf[..n].copy_from_slice(&data[pos..pos + n]);
         self.pos += n as u64;
         Ok(n)
     }
@@ -66,15 +74,16 @@ impl fatfs::Read for ImageCursor {
 
 impl fatfs::Write for ImageCursor {
     fn write(&mut self, buf: &[u8]) -> Result<usize, ()> {
+        let mut data = self.data.lock();
         let pos = usize::try_from(self.pos).map_err(|_| ())?;
         let end = pos.checked_add(buf.len()).ok_or(())?;
-        if end > self.data.len() {
+        if end > data.len() {
             if end > MAX_IMAGE_BYTES as usize {
                 return Err(());
             }
-            self.data.resize(end, 0);
+            data.resize(end, 0);
         }
-        self.data[pos..end].copy_from_slice(buf);
+        data[pos..end].copy_from_slice(buf);
         self.pos = end as u64;
         Ok(buf.len())
     }
@@ -88,7 +97,9 @@ impl fatfs::Seek for ImageCursor {
     fn seek(&mut self, pos: fatfs::SeekFrom) -> Result<u64, ()> {
         let new = match pos {
             fatfs::SeekFrom::Start(n) => Some(n),
-            fatfs::SeekFrom::End(n) => (self.data.len() as u64).checked_add_signed(n),
+            fatfs::SeekFrom::End(n) => {
+                (self.data.lock().len() as u64).checked_add_signed(n)
+            }
             fatfs::SeekFrom::Current(n) => self.pos.checked_add_signed(n),
         };
         match new {
@@ -103,12 +114,108 @@ impl fatfs::Seek for ImageCursor {
 
 type Media = fatfs::FileSystem<ImageCursor>;
 
+// ── CHS shape of the inserted medium (the INT 13h view) ─────────────────────
+
+/// Read from the image's BPB — every DOS FORMAT and mkfs writes real
+/// sectors-per-track/head counts there, so no size→geometry guess table
+/// is needed for the shape itself.
+#[derive(Clone, Copy)]
+pub struct ChsGeometry {
+    pub cylinders: u16,
+    pub heads: u8,
+    pub sectors_per_track: u8,
+    pub total_sectors: u32,
+    /// BIOS drive type (INT 13h AH=08h BL): 1=360K, 2=1.2M, 3=720K,
+    /// 4=1.44M, 5=2.88M.
+    pub drive_type: u8,
+}
+
+fn parse_chs(image: &[u8]) -> Option<ChsGeometry> {
+    if image.len() < 512 {
+        return None;
+    }
+    let word = |o: usize| u16::from_le_bytes([image[o], image[o + 1]]);
+    let sectors_per_track = word(24);
+    let heads = word(26);
+    let total16 = word(19);
+    let total = if total16 != 0 {
+        total16 as u32
+    } else {
+        u32::from_le_bytes([image[32], image[33], image[34], image[35]])
+    };
+    if !(1..=63).contains(&sectors_per_track) || !(1..=16).contains(&heads) || total == 0 {
+        return None;
+    }
+    let cylinders = total / (sectors_per_track as u32 * heads as u32);
+    if cylinders == 0 || cylinders > u16::MAX as u32 {
+        return None;
+    }
+    let drive_type = match total * 512 {
+        368_640 => 1,
+        1_228_800 => 2,
+        737_280 => 3,
+        1_474_560 => 4,
+        2_949_120 => 5,
+        // Nonstandard sizes: nearest standard drive class by capacity.
+        n if n <= 409_600 => 1,
+        n if n <= 819_200 => 3,
+        n if n <= 1_310_720 => 2,
+        _ => 4,
+    };
+    Some(ChsGeometry {
+        cylinders: cylinders as u16,
+        heads: heads as u8,
+        sectors_per_track: sectors_per_track as u8,
+        total_sectors: total,
+        drive_type,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectorError {
+    NoMedia,
+    OutOfRange,
+}
+
+/// The inserted medium's CHS shape; `None` while the drive is empty.
+pub fn chs_geometry(drive: usize) -> Option<ChsGeometry> {
+    slot(drive).state.lock().geom
+}
+
+/// One 512-byte sector by LBA, for INT 13h CHS reads (the caller does the
+/// CHS→LBA arithmetic against `chs_geometry`).
+pub fn read_sector(drive: usize, lba: u32, out: &mut [u8; 512]) -> Result<(), SectorError> {
+    let state = slot(drive).state.lock();
+    let raw = state.raw.as_ref().ok_or(SectorError::NoMedia)?;
+    let data = raw.lock();
+    let start = (lba as usize).checked_mul(512).ok_or(SectorError::OutOfRange)?;
+    let end = start.checked_add(512).ok_or(SectorError::OutOfRange)?;
+    if end > data.len() {
+        return Err(SectorError::OutOfRange);
+    }
+    out.copy_from_slice(&data[start..end]);
+    Ok(())
+}
+
+/// BIOS change line: true once after each insert/eject, then cleared —
+/// INT 13h AH=16h report-once semantics.
+pub fn take_change_line(drive: usize) -> bool {
+    core::mem::replace(&mut slot(drive).state.lock().change_pending, false)
+}
+
 // ── The per-drive slot proxy ────────────────────────────────────────────────
 
 struct SlotState {
     generation: u32,
     media: Option<Media>,
+    /// Second view of the same bytes `media`'s cursor reads — for the
+    /// sector layer (INT 13h).
+    raw: Option<RawImage>,
+    geom: Option<ChsGeometry>,
     label: Vec<u8>,
+    /// BIOS change line: set by insert/eject, cleared when INT 13h AH=16h
+    /// reports it.
+    change_pending: bool,
     /// Open handles → paths. Reads re-resolve by path; at RAM-image speeds
     /// the double walk is free and it keeps the borrow of `media` inside
     /// each call (fatfs `File`s borrow the `FileSystem`).
@@ -127,7 +234,10 @@ const fn empty_slot(drive: usize) -> FloppySlot {
         state: Mutex::new(SlotState {
             generation: 0,
             media: None,
+            raw: None,
+            geom: None,
             label: Vec::new(),
+            change_pending: false,
             opens: BTreeMap::new(),
             next_handle: 1,
         }),
@@ -360,8 +470,11 @@ pub fn eject(drive: usize) {
         let mut state = slot(drive).state.lock();
         state.generation = state.generation.wrapping_add(1);
         state.media = None;
+        state.raw = None;
+        state.geom = None;
         state.label.clear();
         state.opens.clear();
+        state.change_pending = true;
     }
     vfs::mounted_media_changed();
     crate::println!("Floppy {}: ejected", DRIVE_LETTERS[drive] as char);
@@ -374,15 +487,20 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
         super::ImageReadError::TooBig => InsertError::TooBig,
         super::ImageReadError::Io => InsertError::Io,
     })?;
-    let cursor = ImageCursor { data: image, pos: 0 };
+    let geom = parse_chs(&image);
+    let raw: RawImage = Arc::new(Mutex::new(image));
+    let cursor = ImageCursor { data: raw.clone(), pos: 0 };
     let media = fatfs::FileSystem::new(cursor, fatfs::FsOptions::new())
         .map_err(|_| InsertError::BadFilesystem)?;
     {
         let mut state = slot(drive).state.lock();
         state.generation = state.generation.wrapping_add(1);
         state.media = Some(media);
+        state.raw = Some(raw);
+        state.geom = geom;
         state.label = entry.name.clone();
         state.opens.clear();
+        state.change_pending = true;
     }
     vfs::mounted_media_changed();
     crate::println!(
@@ -419,6 +537,23 @@ mod tests {
         assert!(supported_name(b"BOOT.VFD"));
         assert!(!supported_name(b"README.TXT"));
         assert!(!supported_name(b"CD.ISO"));
+    }
+
+    #[test]
+    fn bpb_geometry_parses_standard_and_rejects_junk() {
+        let mut bpb = [0u8; 512];
+        bpb[19..21].copy_from_slice(&2880u16.to_le_bytes()); // total sectors
+        bpb[24..26].copy_from_slice(&18u16.to_le_bytes()); // sectors/track
+        bpb[26..28].copy_from_slice(&2u16.to_le_bytes()); // heads
+        let g = super::parse_chs(&bpb).unwrap();
+        assert_eq!(
+            (g.cylinders, g.heads, g.sectors_per_track, g.drive_type),
+            (80, 2, 18, 4)
+        );
+
+        bpb[24..26].copy_from_slice(&0u16.to_le_bytes()); // spt 0 = no geometry
+        assert!(super::parse_chs(&bpb).is_none());
+        assert!(super::parse_chs(&[0u8; 512]).is_none());
     }
 
     #[test]
