@@ -731,8 +731,18 @@ fn paint_scales(
         sy -= 1;
     }
     let screen_cell_h = CELL_H * sy * stretch_y;
-    let cw = if sy % 2 == 0 { screen_cell_h / 2 } else { screen_cell_h };
-    let cw = cw.clamp(CELL_W, (logical_w.saturating_sub(2 * PAD)) / COLS.max(1)).max(1);
+    let natural = if sy % 2 == 0 { screen_cell_h / 2 } else { screen_cell_h };
+    // The font-natural width, BOUNDED by a width budget: ~60% of the
+    // screen for the 30 columns. Without the bound the square 8x8 aspect
+    // blows the panel to full width exactly when a big vertical stretch
+    // denies the tall font (sy=1 over a 320x200 game on a large panel);
+    // with it, cells there get mildly narrow glyphs instead — the same
+    // trade every 40-column-era UI made. The 8px floor keeps genuine
+    // low-res modes at their authentic full-density fit.
+    let budget = (logical_w * 3 / 5) / COLS.max(1);
+    let cw = natural
+        .min(budget)
+        .clamp(CELL_W, ((logical_w.saturating_sub(2 * PAD)) / COLS.max(1)).max(CELL_W));
     (cw, sy)
 }
 
