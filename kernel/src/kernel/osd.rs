@@ -641,14 +641,15 @@ const SEL_FG: u32 = 0x0020_1000;
 const FOOT_FG: u32 = 0x0078_88A0;
 
 // The panel is a FIXED character grid sized to fit the smallest mode
-// (320x200) with the 8x16 font at scale 1; larger shadows scale the whole
-// grid uniformly (see `paint_scales`). 320x200 with 8px padding affords
-// 38x11 cells; we use 30 columns and the full 11 rows.
+// (320x200) at scale 1; larger shadows scale the whole grid uniformly
+// (see `paint_scales`). The font is 8x8: in a 200-line mode with 1.2:1
+// pixel aspect an 8x16 text-mode glyph displays ~1:2.4 tall-and-narrow —
+// low-res-era UIs used 8x8 for exactly this reason.
 const COLS: usize = 30;
-const MAX_ROWS: usize = 11;
+const MAX_ROWS: usize = 16;
 const PAD: usize = 8;
-const CELL_W: usize = vga::OVERLAY_CELL_W;
-const CELL_H: usize = vga::OVERLAY_CELL_H;
+const CELL_W: usize = 8;
+const CELL_H: usize = 8;
 const _: () = assert!(COLS * CELL_W + 2 * PAD <= 320, "panel wider than the smallest mode");
 const _: () = assert!(MAX_ROWS * CELL_H + 2 * PAD <= 200, "panel taller than the smallest mode");
 
@@ -669,7 +670,7 @@ fn paint_text(
     let fgp = fmt.encode(fg).to_le_bytes();
     let bgp = fmt.encode(bg).to_le_bytes();
     let bytes = fmt.bytes_per_pixel as usize;
-    let font = &lib::vga_fonts::FONT_8X16;
+    let font = &lib::vga_fonts::FONT_8X8;
     for (i, &ch) in s.iter().enumerate() {
         let cx = x + i * CELL_W * sx;
         if cx + CELL_W * sx > logical_w { break; }
