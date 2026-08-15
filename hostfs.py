@@ -13,9 +13,9 @@ Protocol (little-endian):
 Commands:
   0x01 OPEN:    path_len(u16) path          → status(i32) handle(u32) size(u32)
   0x02 READ:    handle(u32) offset(u32) len(u32) → status(i32) data_len(u32) data
-  0x03 CLOSE:   handle(u32)                 → status(i32)
+  0x03 CLOSE:   handle(u32)                 → (no reply; guest fire-and-forgets)
   0x04 STAT:    path_len(u16) path          → status(i32) size(u32) is_dir(u8)
-  0x05 READDIR: path_len(u16) path index(u32) → status(i32) name_len(u8) name size(u32) is_dir(u8)
+  0x05 READDIR: path_len(u16) path index(u32) → status(i32) name_len(u8) name size(u32) is_dir(u8) mtime(u32)
   0x06 CREATE:  path_len(u16) path          → status(i32) handle(u32)
   0x07 WRITE:   handle(u32) offset(u32) len(u32) data → status(i32) written(u32)
 """
@@ -111,13 +111,12 @@ class HostFs:
         conn.sendall(data)
 
     def handle_close(self, conn):
+        # No reply: the guest's clunk is fire-and-forget, so any bytes sent
+        # here would be misread as the next command's status.
         handle = struct.unpack('<I', recvall(conn, 4))[0]
         f = self.handles.pop(handle, None)
         if f:
             f.close()
-            conn.sendall(struct.pack('<i', 0))
-        else:
-            conn.sendall(struct.pack('<i', -9))
 
     def handle_stat(self, conn):
         path_len = struct.unpack('<H', recvall(conn, 2))[0]
@@ -153,9 +152,13 @@ class HostFs:
         entry_path = os.path.join(full, entries[index])
         is_dir = 1 if os.path.isdir(entry_path) else 0
         size = os.path.getsize(entry_path) if not is_dir else 0
+        try:
+            mtime = int(os.path.getmtime(entry_path))
+        except OSError:
+            mtime = 0
         conn.sendall(struct.pack('<iB', 0, len(name)))
         conn.sendall(name)
-        conn.sendall(struct.pack('<IB', size & 0xFFFFFFFF, is_dir))
+        conn.sendall(struct.pack('<IBI', size & 0xFFFFFFFF, is_dir, mtime & 0xFFFFFFFF))
 
     def handle_create(self, conn):
         path_len = struct.unpack('<H', recvall(conn, 2))[0]
@@ -255,6 +258,16 @@ def main():
             time.sleep(0.5)
 
     print("hostfs: connected to QEMU")
+    # The guest sends this magic when it claims COM1; anything before it is
+    # firmware console noise (OVMF mirrors its console to the serial port as
+    # PC-ANSI escape sequences), not protocol.
+    window = b''
+    while window != b'RHFS':
+        b = conn.recv(1)
+        if not b:
+            print("hostfs: EOF before guest handshake")
+            return
+        window = (window + b)[-4:]
     try:
         fs.dispatch(conn)
     except (ConnectionError, OSError) as e:

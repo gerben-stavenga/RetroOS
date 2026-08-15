@@ -421,6 +421,25 @@ build_qemu_audio_args() {
     fi
 }
 
+# Hostfs plumbing shared by the qemu BIOS and UEFI paths: guest COM1 bridged
+# to hostfs.py over a Unix socket (QEMU is the socket server; hostfs.py
+# retries until it appears). Fills HOSTFS_ARGS and, when -h was given, starts
+# the server in the background (HOSTFS_PID). The server self-terminates when
+# QEMU closes the socket, so no cleanup trap is required after exec.
+build_hostfs_args() {
+    HOSTFS_ARGS=()
+    HOSTFS_PID=""
+    if [ "$HOSTFS_DIR_SET" = 1 ]; then
+        HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
+        HOSTFS_ARGS=(
+            -serial chardev:hostfs
+            -chardev "socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=off"
+        )
+        "$SCRIPT_DIR/hostfs.py" "$HOSTFS_DIR" "$HOSTFS_SOCK" &
+        HOSTFS_PID=$!
+    fi
+}
+
 # Build the standalone-GRUB ESP shared by qemu-uefi and bochs-uefi.
 # $1 = destination ESP path, $2 = kernel.elf path, $3 = working dir,
 # $4 = "all_video" to additionally `insmod all_video` (bochs path).
@@ -764,16 +783,8 @@ launch_qemu() {
                 FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
             fi
         fi
-        HOSTFS_ARGS=()
-        if [ "$HOSTFS_DIR_SET" = 1 ]; then
-            HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
-            HOSTFS_ARGS=(
-                -serial chardev:hostfs
-                -chardev "socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=off"
-            )
-            # Launch hostfs server in background, kill on exit
-            "$SCRIPT_DIR/hostfs.py" "$HOSTFS_DIR" "$HOSTFS_SOCK" &
-            HOSTFS_PID=$!
+        build_hostfs_args
+        if [ -n "$HOSTFS_PID" ]; then
             trap "kill $HOSTFS_PID 2>/dev/null; [ -n \"$FWCFG_TMPDIR\" ] && rm -rf \"$FWCFG_TMPDIR\"" EXIT
         elif [ -n "$FWCFG_TMPDIR" ]; then
             trap "rm -rf $FWCFG_TMPDIR" EXIT
@@ -881,6 +892,9 @@ launch_qemu_uefi() {
         [ "$START_CWD" = "." ] && START_CWD=""
         FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
     fi
+    # -h hostfs dir: same COM1 bridge as the BIOS path. q35 honors explicit
+    # -serial under -nodefaults, so the guest sees an isa-serial at 0x3F8.
+    build_hostfs_args
     exec qemu-system-x86_64 \
         -M q35 -m 512 $ACCEL_CPU \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
@@ -900,6 +914,7 @@ launch_qemu_uefi() {
         -device qemu-xhci \
         -debugcon stdio \
         -no-reboot \
+        "${HOSTFS_ARGS[@]}" \
         "${DISPLAY_ARGS[@]}" \
         "${AUDIO_ARGS[@]}" \
         "${PASS[@]}"

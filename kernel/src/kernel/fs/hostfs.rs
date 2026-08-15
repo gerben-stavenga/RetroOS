@@ -42,6 +42,11 @@ pub fn init() -> bool {
     if msr & 0x30 == 0 {
         return false; // No peer
     }
+    // Session start. Firmware may have chatted on COM1 before the kernel
+    // claimed it (OVMF mirrors its console there as PC-ANSI), so the server
+    // discards everything up to this magic and starts the protocol at a
+    // known byte boundary.
+    send_bytes(b"RHFS");
     true
 }
 
