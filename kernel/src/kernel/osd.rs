@@ -645,7 +645,7 @@ const FOOT_FG: u32 = 0x0078_88A0;
 // (see `paint_scales`). The font is 8x8: in a 200-line mode with 1.2:1
 // pixel aspect an 8x16 text-mode glyph displays ~1:2.4 tall-and-narrow —
 // low-res-era UIs used 8x8 for exactly this reason.
-const COLS: usize = 30;
+const COLS: usize = 28;
 const MAX_ROWS: usize = 16;
 const PAD: usize = 8;
 const CELL_W: usize = 8;
@@ -781,7 +781,9 @@ pub fn paint(
     // Title + tab bar + (device sub-tabs) + items + footer.
     let rows = visible + subtab_rows + 3;
     let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
-    let (pad_x, pad_y) = (cw, PAD * sy);
+    // Tight box: a two-glyph-pixel margin, just enough to keep strokes
+    // off the panel edge (a glyph pixel is cw/8 wide, sy rows tall).
+    let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
     if logical_w < panel_w || h < panel_h {
@@ -941,7 +943,7 @@ fn paint_picker(
     let visible = count.clamp(1, MAX_ROWS - 2);
     let rows = visible + 2;
     let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
-    let (pad_x, pad_y) = (cw, PAD * sy);
+    let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
     if logical_w < panel_w || h < panel_h {
@@ -1051,7 +1053,7 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             DiskRow::Eject => {
                 let dev = disk_device();
                 line.put(b"Eject ");
-                let mut name = [0_u8; 24];
+                let mut name = [0_u8; 22];
                 let len = disk_label(dev, &mut name);
                 line.put(&name[..len]);
             }
