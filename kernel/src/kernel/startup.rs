@@ -1053,7 +1053,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // cwd lives in the personality state (`DfsState` for DOS, `LinuxState`
     // for Linux); convert to common VFS-form (lowercase, forward-slash) for
     // child init.
-    let mut parent_cwd_buf = [0u8; 64];
+    let mut parent_cwd_buf = [0u8; 66];
     let parent_cwd_len: usize;
     let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
     let parent_is_dos: bool;
@@ -1061,12 +1061,18 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     match &parent.personality {
         thread::Personality::Dos(dos) => {
             parent_is_dos = true;
+            // Drive-qualified ("D:", "C:BOOT"): the child inherits the
+            // parent's CURRENT DRIVE, not just the path within it — a
+            // program launched from D:\ must resolve relative opens
+            // against D:\ (init_from_vfs decodes the "X:" prefix).
             let dos_cwd = dos.dfs.get_cwd();
-            let n = dos_cwd.len().min(parent_cwd_buf.len());
+            parent_cwd_buf[0] = b'A' + dos.dfs.current_drive_number();
+            parent_cwd_buf[1] = b':';
+            let n = dos_cwd.len().min(parent_cwd_buf.len() - 2);
             for i in 0..n {
-                parent_cwd_buf[i] = if dos_cwd[i] == b'\\' { b'/' } else { dos_cwd[i] };
+                parent_cwd_buf[2 + i] = if dos_cwd[i] == b'\\' { b'/' } else { dos_cwd[i] };
             }
-            parent_cwd_len = n;
+            parent_cwd_len = 2 + n;
 
             parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(machine, vcpu, dos));
         }

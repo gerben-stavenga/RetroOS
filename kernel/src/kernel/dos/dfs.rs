@@ -281,25 +281,44 @@ impl DfsState {
     /// Initialize DFS cwd from a VFS-form path (lowercase, forward-slash).
     /// Strips leading/trailing `/`, uppercases, converts `/` to `\`.
     /// Called when a DOS thread is spawned by non-DOS code.
+    ///
+    /// A DOS→DOS fork passes the parent's DRIVE-QUALIFIED cwd instead
+    /// (`"D:"`, `"C:BOOT"`): the child must inherit the parent's current
+    /// drive, or a program started from D:\ resolves its relative opens
+    /// against C:\ (the DOS/4GW stub failed to find dos4gw.exe this way).
+    /// The prefix is unambiguous — VFS-form paths never contain a colon.
     pub fn init_from_vfs(&mut self, vfs_cwd: &[u8]) {
         let mut s = vfs_cwd;
+        if s.len() >= 2 && s[1] == b':' && s[0].is_ascii_alphabetic() {
+            let drive = s[0].to_ascii_uppercase();
+            if let Some(slot) = Self::drive_slot(drive) {
+                self.current_drive = drive;
+                self.store_cwd_slot(slot, &s[2..]);
+                return;
+            }
+        }
         while s.first() == Some(&b'/') { s = &s[1..]; }
         // Strip the C: root prefix (c_root) so the cwd is stored relative to C:\
         // (e.g. "home/retroos/boot" → "boot" → "BOOT"), not the raw VFS path —
         // otherwise the DOS cwd is a driveless "HOME\RETROOS\BOOT" and every
-        // cwd-relative open fails. Paths already C:-relative (a DOS→DOS fork
-        // passes "BOOT") don't match c_root and pass through unchanged.
+        // cwd-relative open fails.
         let cr = c_root();
         if s.len() >= cr.len() && &s[..cr.len()] == cr {
             s = &s[cr.len()..];
         }
+        self.store_cwd_slot(0, s);
+    }
+
+    /// Store a forward-slash path as `cwd[slot]` in AH=47 form (uppercase,
+    /// backslashes, no leading/trailing separator).
+    fn store_cwd_slot(&mut self, slot: usize, mut s: &[u8]) {
         while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
         let n = s.len().min(DFS_CWD_MAX);
         for (i, &b) in s.iter().enumerate().take(n) {
-            self.cwd[0][i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+            self.cwd[slot][i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
         }
-        self.cwd_len[0] = n as u8;
+        self.cwd_len[slot] = n as u8;
     }
 
     /// Resolve a DOS input path to absolute DOS form `"X:\UPPER\PATH"`.
@@ -634,6 +653,32 @@ mod tests {
         let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
         assert_eq!(&vfs[..prefix_len], b"host");
         assert_eq!(rest, b"SOURCE\\MAIN.C");
+    }
+
+    #[test]
+    fn fork_child_inherits_the_parent_drive() {
+        let mut dfs = DfsState::new();
+        let mut dos = [0u8; DFS_PATH_MAX];
+
+        // A DOS→DOS fork passes a drive-qualified cwd; the child must
+        // resolve relative names against the parent's drive (the DOS/4GW
+        // stub execs a bare "dos4gw.exe" from D:\).
+        dfs.init_from_vfs(b"D:");
+        assert_eq!(dfs.current_drive_number(), 3);
+        let len = dfs.resolve(b"dos4gw.exe", &mut dos).unwrap();
+        assert_eq!(&dos[..len], b"D:\\DOS4GW.EXE");
+
+        let mut dfs = DfsState::new();
+        dfs.init_from_vfs(b"C:BOOT");
+        assert_eq!(dfs.current_drive_number(), 2);
+        let len = dfs.resolve(b"X.TXT", &mut dos).unwrap();
+        assert_eq!(&dos[..len], b"C:\\BOOT\\X.TXT");
+
+        // Linux-parent form (no colon) still lands on C: via c_root strip.
+        let mut dfs = DfsState::new();
+        dfs.init_from_vfs(b"boot");
+        assert_eq!(dfs.current_drive_number(), 2);
+        assert_eq!(dfs.get_cwd(), b"BOOT");
     }
 
     #[test]
