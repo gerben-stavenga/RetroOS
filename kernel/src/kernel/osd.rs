@@ -730,6 +730,12 @@ fn paint_scales(
     while sy > 1 && rows_needed * CELL_H * sy + 2 * PAD > h {
         sy -= 1;
     }
+    // Prefer the detailed 8x16 font whenever the rows allow it: an odd
+    // sy > 1 (e.g. 3 on an 800x600 shadow) would fall back to chunky 8x8
+    // when one step down buys real letterforms at a slightly smaller cell.
+    if sy > 1 && sy % 2 == 1 {
+        sy -= 1;
+    }
     let screen_cell_h = CELL_H * sy * stretch_y;
     let natural = if sy % 2 == 0 { screen_cell_h / 2 } else { screen_cell_h };
     // The font-natural width, BOUNDED by a width budget: ~60% of the
