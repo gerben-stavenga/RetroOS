@@ -116,11 +116,12 @@ pub fn host_run_elf<A: Arch>(
     // same display-ownership invariant that `run_program` does explicitly.
     kernel::focus::adopt(tid);
     let mut bios_workspace = kernel::bios_display::BiosDisplayWorkspace::absent();
-    {
+    let display = {
         let t = thread::get_thread(&mut threads, tid).expect("initial Linux thread");
-        t.personality.adopt_display(machine, &mut bios_workspace, kernel::display::Display::headless());
-    }
-    kernel::startup::event_loop(machine, &mut bios_workspace, &mut threads, tid, None, None);
+        t.personality.adopt_display(
+            machine, &mut bios_workspace, kernel::display::Display::headless())
+    };
+    kernel::startup::event_loop(machine, &mut bios_workspace, &mut threads, tid, None, None, display);
     dbg_println!("[host] guest exited");
     kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
     machine.shutdown();

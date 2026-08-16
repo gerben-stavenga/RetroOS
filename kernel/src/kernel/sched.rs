@@ -37,10 +37,11 @@ pub fn verdict<A: crate::Arch>(
     action: thread::KernelAction,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
     // borrow of `threads` ends cleanly before `focus_request` reborrows it.
-    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, exiting_display, sb_handoff) {
+    let next = match next_after(machine, bios_workspace, threads, regs, tid, action, exiting_display, sb_handoff, display) {
         Some(Verdict::Switch(0)) => return Verdict::AllDead,
         Some(n) => return n,
         None => focus_request(threads, tid),
@@ -64,19 +65,20 @@ fn next_after<A: crate::Arch>(
     action: thread::KernelAction,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<Verdict> {
     match action {
         thread::KernelAction::Done => None,
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs).map(Verdict::Switch),
         thread::KernelAction::Exit(code) => Some(Verdict::Switch(thread::exit_thread(
-            threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff,
+            threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff, display,
         ))),
         thread::KernelAction::Switch(next) => Some(Verdict::Switch(next)),
         thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
                 machine, bios_workspace, threads, regs, tid,
                 &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
-                on_error, on_success, sb_handoff,
+                on_error, on_success, sb_handoff, display,
             ).map(Verdict::ContinueAs)
         }
         thread::KernelAction::Fork { on_done, child_stack } => {
@@ -86,7 +88,7 @@ fn next_after<A: crate::Arch>(
         thread::KernelAction::Exec { buffer, path, args, cwd } => {
             crate::kernel::linux::handle_exec(
                 machine, bios_workspace, threads, regs, tid, buffer, path, args, cwd,
-                exiting_display, sb_handoff,
+                exiting_display, sb_handoff, display,
             ).map(Verdict::Switch)
         }
         thread::KernelAction::Wait { pid, status_ptr } => {

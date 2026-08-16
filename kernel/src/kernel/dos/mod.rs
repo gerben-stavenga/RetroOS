@@ -9,7 +9,7 @@
 //! `machine.rs`, and XMS/EMS/UMA in their own files.
 //!
 //! DOS always boots from a COW template containing the Rust substitute BIOS.
-//! Native video firmware is not part of a DOS address space; a native `DisplayedVga`
+//! Native video firmware is not part of a DOS address space; a native `FullscreenVga`
 //! delegates only physical display operations to the kernel-owned
 //! `BiosDisplayWorkspace`.
 
@@ -59,7 +59,8 @@ mod mode_transitions;
 
 pub use machine::vsb::SbDevice;
 pub use machine::vga::physical_vga_present;
-use crate::kernel::bios_display::{DisplayedVga, EmulatedVga};
+pub(crate) use machine::vga::release_fullscreen;
+use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
@@ -228,7 +229,7 @@ pub(crate) fn fresh_ldt() -> alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]> {
 }
 
 impl<A: crate::Arch> DosState<A> {
-    pub fn new_boxed(machine: &mut A, vga: DisplayedVga) -> alloc::boxed::Box<Self> {
+    pub fn new_boxed(machine: &mut A, vga: DosVideo) -> alloc::boxed::Box<Self> {
         let ldt = fresh_ldt();
         // Allocate first and initialize fields at their final addresses. A
         // conventional `Box::new(DosState { .. })` makes rustc materialize
@@ -323,16 +324,7 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::DisplayHandoff {
-        machine::vga::release_display(&mut self.pc.vga, machine, bios_workspace)
-    }
-
-    pub(super) fn suspend_for_osd(
-        &mut self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::display::Display {
-        self.release_display(machine, bios_workspace)
-            .into_surface(machine, bios_workspace)
+        machine::vga::release_fullscreen(&mut self.pc.vga, machine, bios_workspace)
     }
 
     /// Called when the thread regains focus. Repaints the VGA framebuffer
@@ -344,7 +336,7 @@ impl<A: crate::Arch> DosState<A> {
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
-        machine::vga::acquire_display(
+        machine::vga::acquire_fullscreen(
             &mut self.pc.vga, machine, bios_workspace, display);
     }
 
@@ -356,18 +348,9 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         display: crate::kernel::display::DisplayHandoff,
     ) {
-        machine::vga::acquire_display_replace(&mut self.pc.vga, machine, display);
+        machine::vga::acquire_fullscreen_replace(&mut self.pc.vga, machine, display);
     }
 
-    pub(super) fn materialize_from_osd(
-        &mut self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::display::Display,
-    ) {
-        let handoff = crate::kernel::display::DisplayHandoff::from_surface(display, machine);
-        self.acquire_display_restore(machine, bios_workspace, handoff);
-    }
 }
 
 /// How many AH=4Eh enumerations may be live at once.
@@ -565,7 +548,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     // Resolved before the device is borrowed, so the decode below needs only
     // one match: the bases come from the register frame, not from the VGA.
     let (cs_base, def32, ds_base, es_base) = fault_segment_bases(dos, regs);
-    let DisplayedVga::Emulated(dev, _) = &mut dos.pc.vga else {
+    let Some(dev) = dos.pc.vga.emulated_mut() else {
         return false;
     };
     let Some(pages) = machine::vga::trapped_aperture(&dev.state) else {
@@ -952,7 +935,7 @@ pub(crate) const fn bios_int10_return_ip() -> u32 {
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8, vga: DisplayedVga) {
+pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
@@ -1130,10 +1113,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
         pc.mpu.reset();
         pc.spk.reset();
     }
-    let vga = DisplayedVga::Emulated(
-        EmulatedVga::initial_mode3(),
-        crate::kernel::display::Display::headless(),
-    );
+    let vga = DosVideo::Vga(EmulatedVga::initial_mode3());
     t.personality = thread::Personality::Dos(DosState::new_boxed(machine, vga));
     let loaded = {
         // `regs` and `dos_state` are disjoint fields of `t`; borrow directly.
@@ -1283,18 +1263,30 @@ pub fn advance_timers<A: crate::Arch>(dos: &mut thread::DosState<A>, now_ns: u64
     machine::advance_timers(&mut dos.pc, now_ns);
 }
 
-/// Render the emulated VGA to the platform display (no-op with a real card
-/// or no present sink). Each call is one display time slice; the absolute tick
-/// value is used only to notice when an inactive sweep has gone stale.
-pub fn display_tick<A: crate::Arch>(
+/// Pump a fullscreen DOS video device. Native VGA scans itself out; an
+/// emulated fullscreen VGA actively renders into the display it owns.
+pub fn pump_fullscreen<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut thread::DosState<A>,
     regs: &Regs,
     now_ns: u64,
-    display: Option<&mut crate::kernel::display::Display>,
 ) {
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, display);
+    debug_assert!(dos.pc.vga.is_fullscreen());
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, None);
+}
+
+/// Render state-only DOS VGA through the event loop's compositor display.
+pub fn render<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &Regs,
+    now_ns: u64,
+    display: &mut crate::kernel::display::Display,
+) {
+    debug_assert!(!dos.pc.vga.is_fullscreen());
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, Some(display));
 }
 
 /// Advance emulated audio playback and its guest-visible device events.

@@ -147,7 +147,7 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     state.latches_valid = false;
     // Capture the AC sequencing state, then reset the flipflop to a
     // known index state. With 0x3C0/0x3DA granted to the guest
-    // (io_policy's `DisplayedVga::Native` arm), the VGA_AC_STATE tracker never saw
+    // (io_policy's `FullscreenVga::Native` arm), the VGA_AC_STATE tracker never saw
     // its writes — the card is the only source of truth, and it must be
     // read BEFORE the 0x3DA reset below destroys the phase.
     let plat = crate::kernel::platform::get();

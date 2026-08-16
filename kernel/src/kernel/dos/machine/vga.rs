@@ -7,7 +7,7 @@
 
 use crate::Regs;
 use super::*;
-use crate::kernel::bios_display::{DisplayedVga, EmulatedVga};
+use crate::kernel::bios_display::{DosVideo, FullscreenVga, EmulatedVga};
 use crate::kernel::bios_display::VideoResume;
 
 // ============================================================================
@@ -131,7 +131,7 @@ impl EmulatedVga {
         machine: &mut A,
         mut native: crate::kernel::platform::VgaCap,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> DisplayedVga {
+    ) -> FullscreenVga {
         // Native ownership means the complete VGA aperture is physical in the
         // incoming DOS address space, including B8000 text memory.
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
@@ -149,7 +149,7 @@ impl EmulatedVga {
                 );
             }
             discard_emulated_svga(machine, &mut self);
-            return DisplayedVga::Native(crate::kernel::platform::NativeVga::restored(native));
+            return FullscreenVga::Native(crate::kernel::platform::NativeVga::restored(native));
         }
         // A live emulated VGA's aperture is its VRAM. Capture the linear
         // representation before converting the complete device to hardware.
@@ -162,7 +162,7 @@ impl EmulatedVga {
         };
         native.bios_set_mode(machine, &mut *bios, u16::from(bios_mode));
         crate::kernel::drivers::vga_hw::restore(&native, &self.state);
-        DisplayedVga::Native(crate::kernel::platform::NativeVga::restored(native))
+        FullscreenVga::Native(crate::kernel::platform::NativeVga::restored(native))
     }
 
     /// Bind an already-live adapter to this address space without restoring
@@ -173,7 +173,7 @@ impl EmulatedVga {
         mut self,
         machine: &mut A,
         native: crate::kernel::platform::NativeVga,
-    ) -> DisplayedVga {
+    ) -> FullscreenVga {
         machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0);
         if let Some(physical_base) = self.physical_lfb {
             machine.redirect_physical_aliases(
@@ -186,14 +186,14 @@ impl EmulatedVga {
         if self.svga_pages != 0 {
             discard_emulated_svga(machine, &mut self);
         }
-        DisplayedVga::Native(native)
+        FullscreenVga::Native(native)
     }
 
     fn attach_capability_replace<A: crate::Arch>(
         self,
         machine: &mut A,
         native: crate::kernel::platform::VgaCap,
-    ) -> DisplayedVga {
+    ) -> FullscreenVga {
         self.attach_native_replace(
             machine, crate::kernel::platform::NativeVga::restored(native))
     }
@@ -203,24 +203,17 @@ impl EmulatedVga {
         machine: &mut A,
         display: crate::kernel::display::Display,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> DisplayedVga {
+    ) -> FullscreenVga {
         match display.into_native_capability(machine) {
             Ok(native) => self.attach_native(machine, native, bios),
             Err(display) => {
-                DisplayedVga::Emulated(self, display)
+                FullscreenVga::Emulated(self, display)
             }
         }
     }
 }
 
-impl DisplayedVga {
-    pub fn into_handoff(self) -> crate::kernel::display::DisplayHandoff {
-        match self {
-            Self::Native(native) => crate::kernel::display::DisplayHandoff::Vga(native.into_cap()),
-            Self::Emulated(_, display) => crate::kernel::display::DisplayHandoff::Surface(display),
-        }
-    }
-
+impl FullscreenVga {
     /// Install a newly constructed emulated VGA into the current address
     /// space. This is construction, not context-switch reconciliation.
     pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
@@ -247,84 +240,137 @@ impl DisplayedVga {
         }
     }
 
-    /// Clone the detached VGA model for a child.  `release_display` must have
-    /// run first, so the parent's record is a complete recovery image and the
-    /// physical display capability is held separately by the caller.
+}
+
+impl DosVideo {
+    /// Apply one ownership transition without ever exposing an empty thread
+    /// video slot. Kernel targets are panic=abort, so the closure cannot unwind
+    /// across the brief move.
+    pub(crate) fn map<R>(&mut self, f: impl FnOnce(Self) -> (Self, R)) -> R {
+        unsafe {
+            let old = core::ptr::read(self);
+            let (new, result) = f(old);
+            core::ptr::write(self, new);
+            result
+        }
+    }
+
+    pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
+        match self {
+            Self::Vga(vga) => materialize_emulated_aperture(&mut vga.state, machine),
+            Self::Fullscreen(vga) => vga.initialize_active_address_space(machine),
+        }
+    }
+
     pub fn clone_detached_for_child<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Self> {
-        match self {
-            Self::Native(_) => None,
-            Self::Emulated(vga, _) => {
-                capture_emulated_aperture(&mut vga.state, machine);
-                Some(Self::Emulated(
-                    vga.clone_for_fork(),
-                    crate::kernel::display::Display::headless(),
-                ))
-            }
-        }
+        let Self::Vga(vga) = self else { return None };
+        capture_emulated_aperture(&mut vga.state, machine);
+        Some(Self::Vga(vga.clone_for_fork()))
     }
 
-    /// Capture VRAM whose authoritative bytes live in this guest address
-    /// space before that address space is destroyed. Native VGA needs no
-    /// action: its authoritative bytes live on the card, not in guest pages.
     pub fn capture_address_space_vram<A: crate::Arch>(&mut self, machine: &mut A) {
-        match self {
-            Self::Emulated(vga, _) =>
-                capture_emulated_aperture(&mut vga.state, machine),
-            Self::Native(_) => {}
+        if let Some(vga) = self.emulated_mut() {
+            capture_emulated_aperture(&mut vga.state, machine);
         }
     }
 
-    /// Move the dying child's complete VGA out while its address space is
-    /// active. The replacement is inert and is never guest-visible.
     pub fn release_for_parent_replace<A: crate::Arch>(&mut self, machine: &mut A) -> Self {
         self.map(|mut returned| {
-            if let Self::Emulated(vga, _) = &mut returned {
+            if let Some(vga) = returned.emulated_mut() {
                 capture_emulated_aperture(&mut vga.state, machine);
             }
-            (Self::Emulated(
-                EmulatedVga::initial_mode3(),
-                crate::kernel::display::Display::headless(),
-            ), returned)
+            (Self::Vga(EmulatedVga::initial_mode3()), returned)
         })
     }
 
-    /// Complete normal child return after the parent's address space is live.
-    /// The returned child state wins; the parent's value is only recovery.
     pub fn acquire_parent_replace<A: crate::Arch>(&mut self, machine: &mut A, returned: Self) {
-        self.map(|parent| match (parent, returned) {
-            (Self::Emulated(saved, _), Self::Native(native)) =>
-                (saved.attach_native_replace(machine, native), ()),
-            (_, Self::Emulated(mut child, display)) => {
-                materialize_emulated_aperture(&mut child.state, machine);
-                (Self::Emulated(child, display), ())
-            }
-            (native @ Self::Native(_), returned) => {
-                // Two physical VGA owners cannot be constructed: a returned
-                // Native token is the unique token. Preserve the current
-                // owner defensively if a future caller violates sequencing.
-                drop(returned);
-                (native, ())
-            }
+        self.map(|parent| {
+            let Self::Vga(saved) = parent else {
+                return (parent, ());
+            };
+            let replacement = match returned {
+                Self::Fullscreen(FullscreenVga::Native(native)) =>
+                    Self::Fullscreen(saved.attach_native_replace(machine, native)),
+                Self::Fullscreen(FullscreenVga::Emulated(mut child, display)) => {
+                    materialize_emulated_aperture(&mut child.state, machine);
+                    Self::Fullscreen(FullscreenVga::Emulated(child, display))
+                }
+                Self::Vga(mut child) => {
+                    materialize_emulated_aperture(&mut child.state, machine);
+                    Self::Vga(child)
+                }
+            };
+            (replacement, ())
         });
     }
+}
 
+/// Suspend the foreground VGA into state-only form and release its output.
+pub fn release_fullscreen<A: crate::Arch>(
+    video: &mut DosVideo,
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) -> crate::kernel::display::DisplayHandoff {
+    video.map(|video| {
+        let DosVideo::Fullscreen(mut fullscreen) = video else {
+            panic!("display release from non-fullscreen DOS VGA")
+        };
+        let handoff = release_display(&mut fullscreen, machine, bios);
+        let FullscreenVga::Emulated(vga, headless) = fullscreen else {
+            unreachable!("fullscreen release did not detach native VGA")
+        };
+        debug_assert!(headless.is_headless());
+        (DosVideo::Vga(vga), handoff)
+    })
+}
+
+/// Combine stored VGA state with an output handoff into a fullscreen VGA.
+pub fn acquire_fullscreen<A: crate::Arch>(
+    video: &mut DosVideo,
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: crate::kernel::display::DisplayHandoff,
+) {
+    video.map(|video| {
+        let DosVideo::Vga(vga) = video else {
+            panic!("display acquire by already-fullscreen DOS VGA")
+        };
+        let mut fullscreen = FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless());
+        acquire_display(&mut fullscreen, machine, bios, display);
+        (DosVideo::Fullscreen(fullscreen), ())
+    });
+}
+
+pub fn acquire_fullscreen_replace<A: crate::Arch>(
+    video: &mut DosVideo,
+    machine: &mut A,
+    display: crate::kernel::display::DisplayHandoff,
+) {
+    video.map(|video| {
+        let DosVideo::Vga(vga) = video else {
+            panic!("replacement display acquire by already-fullscreen DOS VGA")
+        };
+        let mut fullscreen = FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless());
+        acquire_display_replace(&mut fullscreen, machine, display);
+        (DosVideo::Fullscreen(fullscreen), ())
+    });
 }
 
 /// Replace the current output with a headless sink and release the foreground
 /// scanout target: either a render surface or a state-free VGA capability.
 pub fn release_display<A: crate::Arch>(
-    vga: &mut DisplayedVga,
+    vga: &mut FullscreenVga,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> crate::kernel::display::DisplayHandoff {
     vga.map(|vga| match vga {
-        DisplayedVga::Native(native) => {
+        FullscreenVga::Native(native) => {
             let (vga, native) = EmulatedVga::detach_native(machine, bios, native);
-            (DisplayedVga::Emulated(vga, crate::kernel::display::Display::headless()),
+            (FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless()),
              crate::kernel::display::DisplayHandoff::Vga(native))
         }
-        DisplayedVga::Emulated(vga, display) =>
-            (DisplayedVga::Emulated(vga, crate::kernel::display::Display::headless()),
+        FullscreenVga::Emulated(vga, display) =>
+            (FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless()),
              crate::kernel::display::DisplayHandoff::Surface(display)),
     })
 }
@@ -332,33 +378,33 @@ pub fn release_display<A: crate::Arch>(
 /// Replace an emulated VGA's current output target. A bare VgaCap is upgraded
 /// to NativeVga only after the complete software state is restored.
 pub fn acquire_display<A: crate::Arch>(
-    vga: &mut DisplayedVga,
+    vga: &mut FullscreenVga,
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: crate::kernel::display::DisplayHandoff,
 ) {
     vga.map(|vga| match (vga, display) {
-        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Vga(native)) =>
+        (FullscreenVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Vga(native)) =>
             (vga.attach_native(machine, native, bios), ()),
-        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
+        (FullscreenVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
             (vga.present(machine, display, bios), ()),
-        (native @ DisplayedVga::Native(_), _) => (native, ()),
+        (native @ FullscreenVga::Native(_), _) => (native, ()),
     });
 }
 
 /// Acquire a live physical VGA without restoring the receiver's recovery
 /// image. This is the normal child→parent DOS return operation.
 pub fn acquire_display_replace<A: crate::Arch>(
-    vga: &mut DisplayedVga,
+    vga: &mut FullscreenVga,
     machine: &mut A,
     display: crate::kernel::display::DisplayHandoff,
 ) {
     vga.map(|vga| match (vga, display) {
-        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Vga(native)) =>
+        (FullscreenVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Vga(native)) =>
             (vga.attach_capability_replace(machine, native), ()),
-        (DisplayedVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
-            (DisplayedVga::Emulated(vga, display), ()),
-        (native @ DisplayedVga::Native(_), _) => (native, ()),
+        (FullscreenVga::Emulated(vga, _), crate::kernel::display::DisplayHandoff::Surface(display)) =>
+            (FullscreenVga::Emulated(vga, display), ()),
+        (native @ FullscreenVga::Native(_), _) => (native, ()),
     });
 }
 
@@ -374,11 +420,11 @@ pub use ::vga::VgaState;
 
 /// Non-destructively decide whether the currently owned VGA is already the
 /// conventional colour 80x25 text screen expected when COMMAND.COM returns.
-pub fn is_standard_text(device: &DisplayedVga) -> bool {
+pub fn is_standard_text(device: &DosVideo) -> bool {
     match device {
-        DisplayedVga::Native(native) =>
+        DosVideo::Fullscreen(FullscreenVga::Native(native)) =>
             crate::kernel::drivers::vga_hw::is_standard_text_mode(native.cap()),
-        DisplayedVga::Emulated(dev, _) => {
+        DosVideo::Vga(dev) | DosVideo::Fullscreen(FullscreenVga::Emulated(dev, _)) => {
             dev.state.svga_w == 0
                 && ::vga::is_standard_text(&::vga::Regs {
                     crtc: dev.state.crtc,
@@ -527,16 +573,13 @@ pub fn port_write<A: crate::Arch>(
 /// no representation transition is needed for a trapped operation.
 pub fn bios_load_font<A: crate::Arch>(
     machine: &mut A,
-    device: &mut DisplayedVga,
+    device: &mut DosVideo,
     map: usize,
     first: usize,
     font: &[u8],
     glyph_h: usize,
 ) {
-    let dev = match device {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+    let Some(dev) = device.emulated_mut() else { return };
     let vga = &mut dev.state;
     let mut planes = read_live_planes(machine);
     ::vga::load_font_glyphs(
@@ -552,11 +595,8 @@ pub fn bios_load_font<A: crate::Arch>(
 
 /// Apply the text geometry selected by INT 10h AX=111xh. The 14-line ROM font
 /// selects the VGA's 350-line text timing; 8- and 16-line fonts use 400 lines.
-pub fn bios_set_text_height(device: &mut DisplayedVga, glyph_h: u8) {
-    let dev = match device {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
+    let Some(dev) = device.emulated_mut() else { return };
     let visible = if glyph_h == 14 { 350u16 } else { 400u16 };
     let end = visible - 1;
     dev.state.crtc[9] = (dev.state.crtc[9] & 0xE0) | (glyph_h - 1);
@@ -566,8 +606,8 @@ pub fn bios_set_text_height(device: &mut DisplayedVga, glyph_h: u8) {
         | (((end >> 9) as u8 & 1) << 6);
 }
 
-pub fn bios_set_font_map_select(device: &mut DisplayedVga, select: u8) {
-    if let DisplayedVga::Emulated(dev, _) = device {
+pub fn bios_set_font_map_select(device: &mut DosVideo, select: u8) {
+    if let Some(dev) = device.emulated_mut() {
         dev.state.seq[3] = select;
     }
 }
@@ -827,10 +867,7 @@ pub(crate) fn svga_ensure_lfb<A: crate::Arch>(
     addr: u32,
     size: u32,
 ) -> bool {
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return false,
-    };
+    let Some(dev) = pc.vga.emulated_mut() else { return false };
     if dev.state.svga_w == 0 || !svga_lfb_reserved_contains(addr, size) {
         return false;
     }
@@ -856,10 +893,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     request: u16,
 ) {
     svga_leave(machine, pc);
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+    let Some(dev) = pc.vga.emulated_mut() else { return };
     let pages = (mode.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
     machine.map_fresh_range(SVGA_LFB_BASE >> 12, pages);
     dev.state.svga_w = mode.width;
@@ -896,10 +930,7 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
 /// VBE 4F05h window control: alias the 0xA0000 window onto `bank` of the
 /// framebuffer. No copy — the window simply shares the bank's frames.
 pub fn svga_set_bank<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, bank: u16) {
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+    let Some(dev) = pc.vga.emulated_mut() else { return };
     let vga = &mut dev.state;
     if vga.svga_w == 0 {
         return;
@@ -927,10 +958,7 @@ pub fn svga_set_bank<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, bank: 
 /// Leave SVGA for a standard VGA mode: detach the window alias and free the
 /// framebuffer region.
 pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+    let Some(dev) = pc.vga.emulated_mut() else { return };
     let vga = &mut dev.state;
     if vga.svga_w == 0 {
         return;
@@ -971,10 +999,7 @@ pub fn on_set_mode<A: crate::Arch>(
     // A standard mode-set leaves any active VESA SVGA mode.
     svga_leave(machine, pc);
     // A real card draws its own planes from its own register file.
-    let dev = match &mut pc.vga {
-        DisplayedVga::Emulated(dev, _) => dev,
-        DisplayedVga::Native(_) => return,
-    };
+    let Some(dev) = pc.vga.emulated_mut() else { return };
     // A BIOS mode set while the VGA is detached (OSD/background execution)
     // starts a new hardware state. The opaque 4F04 image belongs to the old
     // mode; the canonical register file and VRAM below become the complete
@@ -1090,13 +1115,10 @@ pub fn vram_write<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32,
 /// file/device data straight into video memory; on a real VGA those CPU stores
 /// still honour map mask/write-mode/latches, while the emulated path has A0000
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
-pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DisplayedVga, addr: usize, src: &[u8]) {
-    let vga = match vga {
-        DisplayedVga::Emulated(vga, _) => vga,
-        DisplayedVga::Native(_) => {
-            machine.copy_to(addr, src);
-            return;
-        }
+pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
+    let Some(vga) = vga.emulated_mut() else {
+        machine.copy_to(addr, src);
+        return;
     };
     let vga = &mut vga.state;
     let Some(pages) = trapped_aperture(vga) else {
@@ -1169,7 +1191,7 @@ pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) 
 /// aperture, whose packed mode-4/6 and mode-13 layouts are standardized.
 pub fn bios_draw_glyph<A: crate::Arch>(
     machine: &mut A,
-    device: &mut DisplayedVga,
+    device: &mut DosVideo,
     bios_mode: u8,
     ch: u8,
     col: u32,
@@ -1177,8 +1199,8 @@ pub fn bios_draw_glyph<A: crate::Arch>(
     fg: u8,
 ) -> bool {
     let mode = match device {
-        DisplayedVga::Native(_) => bios_mode,
-        DisplayedVga::Emulated(dev, _) =>
+        DosVideo::Fullscreen(FullscreenVga::Native(_)) => bios_mode,
+        DosVideo::Vga(dev) | DosVideo::Fullscreen(FullscreenVga::Emulated(dev, _)) =>
             match dev.state.classify_mode() {
             None => return false,
             Some(mode) => match mode {
@@ -1260,10 +1282,7 @@ pub fn bios_draw_glyph<A: crate::Arch>(
         0x0D..=0x12 => {
             // Native planar drawing must go through the adapter's GC/latches;
             // this software plane store exists only for the emulated card.
-            let dev = match device {
-                DisplayedVga::Emulated(dev, _) => dev,
-                DisplayedVga::Native(_) => return false,
-            };
+            let Some(dev) = device.emulated_mut() else { return false };
             let vga = &mut dev.state;
             let width: u32 = if mode == 0x0D { 320 } else { 640 };
             let rb = if vga.crtc[0x13] != 0 { vga.crtc[0x13] as u32 * 2 } else { width / 8 };

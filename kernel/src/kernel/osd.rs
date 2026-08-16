@@ -15,8 +15,8 @@
 //!
 //! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
 //! called from [`console`](crate::kernel::console), which has the `machine`/
-//! `regs`/`DosState` the Dump action needs; painting ([`paint`]) is called from
-//! the DOS display tick, the one place both backends hold a finished frame.
+//! `regs`/`DosState` the Dump action needs; painting ([`paint`]) happens at the
+//! shared display publication boundary after a personality has rendered.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
@@ -24,28 +24,6 @@ use vga::{self, PixelFormat};
 
 use crate::Regs;
 use crate::kernel::thread;
-
-/// Output exclusively owned by the kernel monitor while it is open. For a
-/// legacy machine the contained display carries the physical `VgaCap`; the
-/// focused personality has already been reduced to headless `EmulatedVga`.
-pub struct OsdDisplay {
-    display: crate::kernel::display::Display,
-}
-
-impl OsdDisplay {
-    pub fn new(display: crate::kernel::display::Display) -> Self { Self { display } }
-    pub fn into_inner(self) -> crate::kernel::display::Display { self.display }
-}
-
-static mut OSD_DISPLAY: Option<OsdDisplay> = None;
-
-pub fn with_display<R>(f: impl FnOnce(Option<&mut crate::kernel::display::Display>) -> R) -> R {
-    unsafe { f((&raw mut OSD_DISPLAY).as_mut().and_then(Option::as_mut).map(|o| &mut o.display)) }
-}
-
-pub fn take_display() -> Option<OsdDisplay> {
-    unsafe { (&raw mut OSD_DISPLAY).as_mut().and_then(Option::take) }
-}
 
 // ── Menu model ───────────────────────────────────────────────────────────────
 
@@ -105,10 +83,9 @@ pub fn is_open() -> bool {
 }
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
-pub fn open(display: OsdDisplay) {
+pub fn open() {
     crate::kernel::fs::cdrom::refresh_catalog();
     crate::kernel::fs::floppy::refresh_catalog();
-    unsafe { OSD_DISPLAY = Some(display); }
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     SYSTEM_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
@@ -517,23 +494,8 @@ fn pick_select() {
     REPAINT.store(true, Ordering::Relaxed);
 }
 
-/// Re-park a display into the ALREADY-OPEN monitor — the focus switch took
-/// the old owner's display back and suspended the new owner; menu state
-/// (tab, selection, scroll) survives, unlike `open`.
-pub fn repark_display(display: OsdDisplay) {
-    unsafe {
-        OSD_DISPLAY = Some(display);
-    }
-    refresh_processes_marker();
-    REPAINT.store(true, Ordering::Relaxed);
-}
-
 /// After a switch the focused-task marker in the picker is stale until the
 /// event loop's next snapshot; nudge a repaint so it corrects promptly.
-fn refresh_processes_marker() {
-    REPAINT.store(true, Ordering::Relaxed);
-}
-
 fn cycle_tab() {
     let next = (active_tab() + 1) % NUM_TABS;
     set_active_tab(next);

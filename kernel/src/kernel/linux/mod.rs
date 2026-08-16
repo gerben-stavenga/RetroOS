@@ -46,59 +46,16 @@ const ESPIPE: i32 = 29;
 const EPIPE: i32 = 32;
 const ENOSYS: i32 = 38;
 
-// Shared TTY-style console VGA, owned by the Linux personality (not by any
-// individual thread). All Linux threads write to the same screen, so the
-// snapshot we save on switch-out belongs at the personality level. Lazily
-// allocated on first save (VgaState's planes are a Vec).
-static mut LINUX_CONSOLE_DISPLAY: Option<crate::kernel::display::Display> = None;
-
 pub fn repaint_console() { crate::kernel::term::mark_dirty(); }
 
 /// Render the shared terminal into its packed shadow, composite the OSD, and
 /// publish that completed frame through the focused Linux display.
-pub fn display_tick<A: crate::Arch>(
+pub fn render<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    external: Option<&mut crate::kernel::display::Display>,
+    display: &mut crate::kernel::display::Display,
 ) {
-    if let Some(display) = external {
-        crate::kernel::term::present(machine, bios, display);
-    } else { unsafe {
-        if let Some(display) = (&raw mut LINUX_CONSOLE_DISPLAY).as_mut().unwrap().as_mut() {
-            crate::kernel::term::present(machine, bios, display);
-        }
-    }
-    }
-}
-
-/// Snapshot the current hardware VGA into the Linux console buffer.
-/// Release the shared console's display token, snapshotting VGA hardware when
-/// the selected display is the legacy card.
-pub fn save_console_vga() -> crate::kernel::display::Display {
-    unsafe {
-        (&raw mut LINUX_CONSOLE_DISPLAY)
-            .as_mut().unwrap().take().expect("hidden Linux console has no display")
-    }
-}
-
-/// Restore the Linux console buffer onto the hardware VGA. On first
-/// activation (no snapshot yet) we clear the screen rather than inherit
-/// the previous personality's framebuffer — keeps a task switch into Linux
-/// deterministic regardless of what was last drawn.
-pub fn restore_console_vga(display: crate::kernel::display::Display) {
-    unsafe {
-        assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
-        LINUX_CONSOLE_DISPLAY = Some(display);
-    }
-    crate::kernel::term::mark_dirty();
-}
-
-pub(super) fn adopt_console_vga(display: crate::kernel::display::Display) {
-    unsafe {
-        assert!((&raw const LINUX_CONSOLE_DISPLAY).as_ref().unwrap().is_none());
-        LINUX_CONSOLE_DISPLAY = Some(display);
-    }
-    crate::kernel::term::mark_dirty();
+    crate::kernel::term::present(machine, bios, display);
 }
 
 /// Linux-specific thread state
@@ -165,26 +122,6 @@ impl LinuxState {
         let n = path.len().min(self.exec_path.len());
         self.exec_path[..n].copy_from_slice(&path[..n]);
         self.exec_path_len = n;
-    }
-
-    /// Called when a Linux thread loses focus. Snapshots the shared Linux
-    /// console framebuffer (TTY-style — all Linux threads share it).
-    pub(super) fn suspend<A: crate::Arch>(&mut self, _machine: &mut A)
-        -> crate::kernel::display::Display
-    {
-        save_console_vga()
-    }
-
-    /// Called when a Linux thread regains focus. Repaints the shared
-    /// console from the suspend snapshot. CPU-binding side effects (TLS,
-    /// deferred wait_status writeout) live in `on_resume` and happen on
-    /// every swap-in.
-    pub(super) fn materialize<A: crate::Arch>(
-        &mut self,
-        _machine: &mut A,
-        display: crate::kernel::display::Display,
-    ) {
-        restore_console_vga(display);
     }
 
     /// Called on every swap-in (whether or not we're refocusing): rebind
@@ -1254,6 +1191,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     cwd: alloc::vec::Vec<u8>,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<usize> {
     use crate::kernel::exec;
     let format = exec::detect_format(&buffer, &path);
@@ -1272,13 +1210,12 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     let exec_vga = match format {
         exec::BinaryFormat::Elf => exec::ExecVga::None,
-        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DisplayedVga::Emulated(
-            crate::kernel::bios_display::EmulatedVga::initial_mode3(),
-            crate::kernel::display::Display::headless())),
+        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
+            crate::kernel::bios_display::EmulatedVga::initial_mode3())),
     };
     if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1, exec_vga).is_err() {
         return Some(thread::exit_thread(
-            threads, machine, bios_workspace, tid, -ENOEXEC, exiting_display, sb_handoff,
+            threads, machine, bios_workspace, tid, -ENOEXEC, exiting_display, sb_handoff, display,
         ));
     }
 

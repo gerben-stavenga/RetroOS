@@ -12,7 +12,7 @@
 //! opinion about where it goes.
 
 use crate::Regs;
-use crate::kernel::bios_display::DisplayedVga;
+use crate::kernel::bios_display::{DosVideo, FullscreenVga};
 use core::sync::atomic::Ordering;
 
 use super::machine::{PcMachine, vga::{SVGA_LFB_BASE, VGA_VRAM_BASE}};
@@ -370,8 +370,8 @@ fn voodoo_display_tick<A: crate::Arch>(
     // means this thread does not own the console: a Glide program in the
     // background still swaps, it just is not seen.
     let display = external.or(match &mut pc.vga {
-        DisplayedVga::Emulated(_, display) => Some(display),
-        DisplayedVga::Native(_) => None,
+        DosVideo::Fullscreen(FullscreenVga::Emulated(_, display)) => Some(display),
+        DosVideo::Vga(_) | DosVideo::Fullscreen(FullscreenVga::Native(_)) => None,
     });
     if let Some(display) = display {
         // Hosted windows track the card's native geometry. A framebuffer's
@@ -434,13 +434,16 @@ pub fn display_tick<A: crate::Arch>(
     // remains beside the emulated VGA and both VGA and Voodoo can select it
     // without further firmware mode changes or ownership transactions.
     if pc.voodoo.as_ref().is_some_and(|voodoo| voodoo.active())
-        && matches!(pc.vga, DisplayedVga::Native(_))
+        && pc.vga.is_native()
     {
-        let handoff = super::machine::vga::release_display(&mut pc.vga, machine, &mut *bios);
+        let handoff = super::machine::vga::release_fullscreen(&mut pc.vga, machine, &mut *bios);
         let display = handoff.into_voodoo_surface(machine, &mut *bios);
         pc.vga.map(|vga| match vga {
-            DisplayedVga::Emulated(vga, _) => (DisplayedVga::Emulated(vga, display), ()),
-            DisplayedVga::Native(_) => unreachable!("Voodoo display detach left native VGA active"),
+            DosVideo::Vga(vga) => (
+                DosVideo::Fullscreen(FullscreenVga::Emulated(vga, display)),
+                (),
+            ),
+            DosVideo::Fullscreen(_) => unreachable!("Voodoo display detach left fullscreen VGA active"),
         });
         crate::println!("Display: Voodoo acquired packed scanout from native VGA");
     }
@@ -453,10 +456,14 @@ pub fn display_tick<A: crate::Arch>(
     }
     // A real card scans out its own VRAM: there is no register file to read
     // and nothing for a software present to do.
-    let DisplayedVga::Emulated(dev, owned_display) = &mut pc.vga else {
-        return;
+    let (dev, display) = match &mut pc.vga {
+        DosVideo::Vga(dev) => {
+            let Some(display) = external else { return };
+            (dev, display)
+        }
+        DosVideo::Fullscreen(FullscreenVga::Emulated(dev, display)) => (dev, display),
+        DosVideo::Fullscreen(FullscreenVga::Native(_)) => return,
     };
-    let display = external.unwrap_or(owned_display);
     display.restore_voodoo_ramp(machine, bios);
     let svga_start = match dev.resume {
         crate::kernel::bios_display::VideoResume::Vbe {

@@ -61,7 +61,7 @@ pub enum DisplayHandoff {
 /// parent's recovery image after the parent space is active.
 pub enum ExitDisplay {
     Restore(DisplayHandoff),
-    DosReplace(crate::kernel::bios_display::DisplayedVga),
+    DosReplace(crate::kernel::bios_display::DosVideo),
 }
 
 impl ExitDisplay {
@@ -72,7 +72,10 @@ impl ExitDisplay {
     ) -> Display {
         match self {
             Self::Restore(display) => display.into_surface(machine, bios),
-            Self::DosReplace(vga) => vga.into_handoff().into_surface(machine, bios),
+            Self::DosReplace(mut vga) => {
+                crate::kernel::dos::release_fullscreen(&mut vga, machine, bios)
+                    .into_surface(machine, bios)
+            }
         }
     }
 }

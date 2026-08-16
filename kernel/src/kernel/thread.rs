@@ -179,13 +179,24 @@ impl<A: crate::Arch> Personality<A> {
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::Display,
-    ) {
+    ) -> Option<crate::kernel::display::Display> {
         match self {
-            Self::Dos(d) => d.acquire_display_restore(
-                machine, bios_workspace,
-                crate::kernel::display::DisplayHandoff::Surface(display)),
-            Self::Linux(_) => crate::kernel::linux::adopt_console_vga(display),
+            Self::Dos(d) => {
+                d.acquire_display_restore(
+                    machine, bios_workspace,
+                    crate::kernel::display::DisplayHandoff::Surface(display));
+                None
+            }
+            Self::Linux(_) => {
+                crate::kernel::linux::repaint_console();
+                Some(display)
+            }
         }
+    }
+
+    pub fn uses_compositor(&self) -> bool {
+        matches!(self, Self::Linux(_))
+            || matches!(self, Self::Dos(d) if !d.pc.vga.is_fullscreen())
     }
 
     /// Hand this thread the machine's Sound Blaster, returning whatever it
@@ -232,18 +243,7 @@ impl<A: crate::Arch> Personality<A> {
     ) -> crate::kernel::display::DisplayHandoff {
         match self {
             Self::Dos(d) => d.release_display(machine, bios_workspace),
-            Self::Linux(l) => crate::kernel::display::DisplayHandoff::Surface(l.suspend(machine)),
-        }
-    }
-
-    pub fn suspend_for_osd(
-        &mut self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    ) -> crate::kernel::display::Display {
-        match self {
-            Self::Dos(d) => d.suspend_for_osd(machine, bios_workspace),
-            Self::Linux(_) => crate::kernel::linux::save_console_vga(),
+            Self::Linux(_) => panic!("Linux display is owned by the event loop"),
         }
     }
 
@@ -265,10 +265,7 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         match self {
             Self::Dos(d) => d.acquire_display_restore(machine, bios_workspace, display),
-            Self::Linux(l) => {
-                let display = display.into_surface(machine, bios_workspace);
-                l.materialize(machine, display);
-            }
+            Self::Linux(_) => panic!("Linux cannot acquire a fullscreen display"),
         }
     }
 
@@ -278,27 +275,12 @@ impl<A: crate::Arch> Personality<A> {
     pub fn acquire_display_replace(
         &mut self,
         machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        _bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         display: crate::kernel::display::DisplayHandoff,
     ) {
         match self {
             Self::Dos(d) => d.acquire_display_replace(machine, display),
-            Self::Linux(l) => {
-                let display = display.into_surface(machine, bios_workspace);
-                l.materialize(machine, display);
-            }
-        }
-    }
-
-    pub fn materialize_from_osd(
-        &mut self,
-        machine: &mut A,
-        bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        display: crate::kernel::display::Display,
-    ) {
-        match self {
-            Self::Dos(d) => d.materialize_from_osd(machine, bios_workspace, display),
-            Self::Linux(l) => l.materialize(machine, display),
+            Self::Linux(_) => panic!("Linux cannot acquire a fullscreen display"),
         }
     }
 
@@ -319,6 +301,8 @@ impl<A: crate::Arch> Personality<A> {
     pub fn advance_world(
         &mut self,
         machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        regs: &Regs,
         now_ns: u64,
         dt_ns: u64,
         audio_pushed: u64,
@@ -341,6 +325,9 @@ impl<A: crate::Arch> Personality<A> {
                 }
                 crate::kernel::dos::audio_service(
                     machine, dos, now_ns, dt_ns, audio_pushed);
+                if dt_ns != 0 && dos.pc.vga.is_fullscreen() {
+                    crate::kernel::dos::pump_fullscreen(machine, bios, dos, regs, now_ns);
+                }
             }
             Self::Linux(_) => {}
         }
@@ -363,24 +350,23 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
-    /// Advance the visible display once after audio has been fed. Batched
-    /// timer slices deliberately do not create display catch-up work.
-    pub fn display_tick(
+    /// Render compositor-owned personality state into the event loop's output.
+    pub fn render(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         regs: &Regs,
         now_ns: u64,
+        display: &mut crate::kernel::display::Display,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
-        crate::kernel::osd::with_display(|external| match self {
+        match self {
             Self::Dos(dos) => {
-                crate::kernel::dos::display_tick(
-                    machine, bios, dos, regs, now_ns, external);
+                crate::kernel::dos::render(machine, bios, dos, regs, now_ns, display);
             }
-            Self::Linux(_) => crate::kernel::linux::display_tick(machine, bios, external),
-        });
+            Self::Linux(_) => crate::kernel::linux::render(machine, bios, display),
+        }
         if prof {
             crate::kernel::startup::bill_slice2(
                 0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);
@@ -863,6 +849,7 @@ pub fn take_switch_target() -> Option<usize> {
 
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
+#[allow(clippy::too_many_arguments)]
 pub fn exit_thread<A: crate::Arch>(
     threads: &mut [Thread<A>],
     machine: &mut A,
@@ -871,6 +858,7 @@ pub fn exit_thread<A: crate::Arch>(
     exit_code: i32,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    event_display: &mut Option<crate::kernel::display::Display>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;
     let term_type = ((exit_code >> 8) & 0xFF) as u8;
@@ -906,7 +894,7 @@ pub fn exit_thread<A: crate::Arch>(
         // unmaps 0xA0000, after which native VGA capture would fault. A normal
         // DOS parent adopts the unchanged live token; other successors restore
         // their own detached model.
-        if tid == crate::kernel::focus::focused() {
+        if tid == crate::kernel::focus::focused() && event_display.is_none() {
             let display = thread.personality.release_display(machine, bios_workspace);
             assert!(exiting_display.is_none(), "unconsumed exiting display");
             *exiting_display = Some(crate::kernel::display::ExitDisplay::Restore(display));

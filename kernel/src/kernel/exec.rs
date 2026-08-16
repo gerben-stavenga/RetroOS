@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 /// cloned VGA, while a non-DOS image must not carry one at all.
 pub enum ExecVga {
     None,
-    Dos(crate::kernel::bios_display::DisplayedVga),
+    Dos(crate::kernel::bios_display::DosVideo),
 }
 use crate::kernel::vfs;
 

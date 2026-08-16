@@ -29,12 +29,13 @@ pub fn dispatch<A: crate::Arch>(
     regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
+    display: &mut Option<crate::kernel::display::Display>,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
     let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
     for evt in events {
         if let crate::Irq::Key(sc) = evt
-            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality)
+            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality, display)
         {
             continue;
         }
@@ -97,6 +98,7 @@ fn monitor_key<A: crate::Arch>(
     regs: &mut Regs,
     sc: u8,
     personality: &mut thread::Personality<A>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) -> bool {
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
@@ -105,17 +107,18 @@ fn monitor_key<A: crate::Arch>(
         };
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
-            restore_from_monitor(machine, &mut *bios_workspace, regs, personality);
+            restore_from_monitor(machine, &mut *bios_workspace, personality, display);
         } else {
             personality.repaint_osd();
         }
         return true;
     }
     if sc == F12_PRESS {
-        // The personality already hands back a renderable display. A native
-        // VGA display is Mode 13h-backed just like every other packed output.
-        let display = personality.suspend_for_osd(machine, bios_workspace);
-        crate::kernel::osd::open(crate::kernel::osd::OsdDisplay::new(display));
+        if display.is_none() {
+            let handoff = personality.release_display(machine, bios_workspace);
+            *display = Some(handoff.into_surface(machine, bios_workspace));
+        }
+        crate::kernel::osd::open();
         personality.repaint_osd();
         return true;
     }
@@ -127,11 +130,15 @@ fn monitor_key<A: crate::Arch>(
 pub fn restore_from_monitor<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    _regs: &mut Regs,
     personality: &mut thread::Personality<A>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) {
-    if let Some(display) = crate::kernel::osd::take_display() {
-        personality.materialize_from_osd(machine, bios_workspace, display.into_inner());
+    if matches!(personality, thread::Personality::Dos(_)) {
+        let display = display.take().expect("closing OSD without compositor display");
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(display, machine);
+        personality.acquire_display_restore(
+            machine, bios_workspace, handoff,
+        );
     }
 }
 

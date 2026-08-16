@@ -664,11 +664,11 @@ fn run_program<A: crate::Arch>(
     // The initial program owns the console outright (nothing to repaint) and
     // gets its port permissions from policy, not from boot-time leftovers.
     crate::kernel::focus::adopt(tid);
-    {
+    let display = {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
-        t.personality.adopt_display(machine, bios_workspace, display);
-    }
+        t.personality.adopt_display(machine, bios_workspace, display)
+    };
 
     if let Some((addr0, addr1)) = debug_watch {
         machine.set_debug_watch(Some((addr0, addr1)));
@@ -678,7 +678,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, bios_workspace, threads, tid, sb, sink)
+    event_loop(machine, bios_workspace, threads, tid, sb, sink, display)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -710,7 +710,9 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
 /// scheduler. Every concept lives behind its seam — `ExecutionContext`
 /// (the CPU loan), `console` (input routing), `Personality` (the slice
 /// hooks + event dispatch), `sched` (policy), `focus` (console ownership,
-/// moved together with execution by `switch_focus_and_run` for now).
+/// moved together with execution by `switch_focus_and_run` for now). The
+/// loop's `display` is `Some` exactly while it is compositing Linux, OSD, or
+/// state-only DOS VGA; fullscreen DOS owns the output and leaves it `None`.
 pub fn event_loop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -718,6 +720,7 @@ pub fn event_loop<A: crate::Arch>(
     first_tid: usize,
     sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
     mut sink: Option<&mut crate::kernel::sound::Sink>,
+    mut display: Option<crate::kernel::display::Display>,
 ) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
@@ -766,11 +769,16 @@ pub fn event_loop<A: crate::Arch>(
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
         let thread = ctx.thread(threads);
+        debug_assert_eq!(
+            display.is_some(),
+            thread.personality.uses_compositor(),
+            "event-loop display ownership disagrees with personality video state",
+        );
 
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
         thread.personality.advance_world(
-            machine, world_now_ns, elapsed_ns,
+            machine, &mut *bios_workspace, &ctx.regs, world_now_ns, elapsed_ns,
             audio_clock.produced_frames());
         if elapsed_ns != 0 {
             crate::kernel::sound::advance(
@@ -781,9 +789,9 @@ pub fn event_loop<A: crate::Arch>(
                 |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
             );
         }
-        if elapsed_ns != 0 {
-            thread.personality.display_tick(
-                machine, &mut *bios_workspace, &ctx.regs, world_now_ns,
+        if elapsed_ns != 0 && let Some(display) = display.as_mut() {
+            thread.personality.render(
+                machine, &mut *bios_workspace, &ctx.regs, world_now_ns, display,
             );
         }
         stats.part(machine, 2);
@@ -793,6 +801,7 @@ pub fn event_loop<A: crate::Arch>(
             &mut ctx.regs,
             &mut thread.kernel,
             &mut thread.personality,
+            &mut display,
             events,
         );
         stats.part(machine, 3);
@@ -806,7 +815,7 @@ pub fn event_loop<A: crate::Arch>(
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
                     machine, &mut *bios_workspace, threads, &mut ctx, next,
-                    &mut exiting_display, &mut sb_handoff,
+                    &mut exiting_display, &mut sb_handoff, &mut display,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -836,25 +845,37 @@ pub fn event_loop<A: crate::Arch>(
             crate::kernel::console::restore_from_monitor(
                 machine,
                 &mut *bios_workspace,
-                &mut ctx.regs,
                 &mut thread.personality,
+                &mut display,
             );
         }
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
             machine, &mut *bios_workspace, threads, &mut ctx.regs, ctx.tid, action,
-            &mut exiting_display, &mut sb_handoff,
+            &mut exiting_display, &mut sb_handoff, &mut display,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
                     machine, &mut *bios_workspace, threads, &mut ctx, next,
-                    &mut exiting_display, &mut sb_handoff,
+                    &mut exiting_display, &mut sb_handoff, &mut display,
                 );
             }
             crate::kernel::sched::Verdict::ContinueAs(next) => {
                 ctx.continue_as(threads, machine, next);
+                let thread = ctx.thread(threads);
+                if !crate::kernel::osd::is_open()
+                    && matches!(thread.personality, thread::Personality::Dos(_))
+                    && let Some(surface) = display.take()
+                {
+                    let handoff = crate::kernel::display::DisplayHandoff::from_surface(
+                        surface, machine,
+                    );
+                    thread.personality.acquire_display_restore(
+                        machine, &mut *bios_workspace, handoff,
+                    );
+                }
             }
             crate::kernel::sched::Verdict::AllDead => {
                 // The loop's contract: no thread resources survive it —
@@ -863,8 +884,11 @@ pub fn event_loop<A: crate::Arch>(
                 // Every owner is gone, so both capabilities are back in this
                 // frame — hand them to whoever runs the next program.
                 return (
-                    exiting_display.take().expect("dead display owner lost token")
-                        .into_surface(machine, &mut *bios_workspace),
+                    match display.take() {
+                        Some(display) => display,
+                        None => exiting_display.take().expect("dead display owner lost token")
+                            .into_surface(machine, &mut *bios_workspace),
+                    },
                     sb_handoff.take(),
                 );
             }
@@ -931,6 +955,7 @@ fn dispatch<A: crate::Arch>(
 /// display before `arch_user_clean` unmapped 0xA0000. On normal DOS return,
 /// the incoming parent is marked to adopt that still-live adapter; on an
 /// error or ordinary background switch it restores its detached snapshot.
+#[allow(clippy::too_many_arguments)]
 fn switch_focus_and_run<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -939,46 +964,38 @@ fn switch_focus_and_run<A: crate::Arch>(
     new_tid: usize,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    display: &mut Option<crate::kernel::display::Display>,
 ) {
     if new_tid == ctx.tid {
         let focused = crate::kernel::focus::focused();
         if focused == new_tid {
             return;
         }
-        // Focus-only handoff: the picker chose the thread that is already
-        // RUNNING while another thread owns the console (a `/C` parent
-        // polling its wait). Move the display without touching execution
-        // state — through the monitor's custody when it is open.
+        // Focus-only handoff: move the output without changing address space.
         let owner_zombie = thread::get_thread(threads, focused)
             .is_none_or(|t| t.kernel.state == thread::ThreadState::Zombie);
         if owner_zombie {
             return; // exit transaction owns the display; nothing to move here
         }
-        let mut repark_osd = false;
-        if crate::kernel::osd::is_open() {
-            let owner = thread::get_thread(threads, focused).expect("focus handoff: owner");
-            crate::kernel::console::restore_from_monitor(
-                machine, &mut *bios_workspace, &mut ctx.regs, &mut owner.personality,
-            );
-            repark_osd = true;
-        }
         let owner = thread::get_thread(threads, focused).expect("focus handoff: owner");
-        let (display, card) =
-            crate::kernel::focus::release(machine, &mut *bios_workspace, &mut owner.personality);
+        let handoff = match display.take() {
+            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+            None => owner.personality.release_display(machine, bios_workspace),
+        };
+        let card = owner.personality.release_sb(machine);
         if card.is_some() {
             assert!(sb_handoff.is_none(), "stale SB handoff");
             *sb_handoff = card;
         }
         let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
-        *sb_handoff = crate::kernel::focus::acquire(
-            machine, bios_workspace, new_tid, &mut new.personality, display, sb_handoff.take(),
-        );
-        if repark_osd {
-            crate::dbg_println!("[osd] repark across focus handoff -> tid {}", new_tid);
-            let display = new.personality.suspend_for_osd(machine, bios_workspace);
-            crate::kernel::osd::repark_display(crate::kernel::osd::OsdDisplay::new(display));
+        if crate::kernel::osd::is_open() || matches!(new.personality, thread::Personality::Linux(_)) {
+            *display = Some(handoff.into_surface(machine, bios_workspace));
             new.personality.repaint_osd();
+        } else {
+            new.personality.acquire_display_restore(machine, bios_workspace, handoff);
         }
+        crate::kernel::focus::adopt(new_tid);
+        *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         return;
     }
     // Normal DOS return has already named the parent as focus, but the child
@@ -1000,79 +1017,68 @@ fn switch_focus_and_run<A: crate::Arch>(
                 };
                 dos.pc.vga.acquire_parent_replace(machine, returned);
             }
-            Some(crate::kernel::display::ExitDisplay::Restore(display)) => {
-                new.personality.acquire_display_restore(machine, bios_workspace, display);
+            Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
+                if crate::kernel::osd::is_open()
+                    || matches!(new.personality, thread::Personality::Linux(_))
+                {
+                    *display = Some(handoff.into_surface(machine, bios_workspace));
+                } else {
+                    new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+                }
             }
             None => {}
         }
         *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         return;
     }
-    // The monitor is tied to one console owner, so a focus switch while it
-    // is open must move the display THROUGH the ordinary release/acquire:
-    // give it back to the old owner first, transfer normally, then suspend
-    // the NEW owner into the still-open monitor. Leaving OPEN global while
-    // the display transferred underneath used to double-close the ownership
-    // transition — hence this explicit re-park. A zombie old owner cannot
-    // take the display back; the monitor closes in that case (its exit
-    // already dismissed it on the ordinary path).
-    let mut repark_osd = false;
-    if crate::kernel::osd::is_open() {
-        let old = thread::get_thread(threads, ctx.tid)
-            .expect("OSD re-park: invalid old thread");
-        if old.kernel.state != thread::ThreadState::Zombie {
-            crate::kernel::console::restore_from_monitor(
-                machine,
-                &mut *bios_workspace,
-                &mut ctx.regs,
-                &mut old.personality,
-            );
-            repark_osd = true;
-        } else {
-            crate::kernel::osd::dismiss();
-        }
-    }
-
     let old_is_zombie = thread::get_thread(threads, ctx.tid)
         .expect("switch: invalid old thread").kernel.state == thread::ThreadState::Zombie;
     let transfer = if !old_is_zombie {
         assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
-        let (display, card) = crate::kernel::focus::release(
-            machine, &mut *bios_workspace, &mut old.personality);
+        let handoff = match display.take() {
+            Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+            None => old.personality.release_display(machine, bios_workspace),
+        };
+        let card = old.personality.release_sb(machine);
         if card.is_some() {
             assert!(sb_handoff.is_none(), "stale SB handoff");
             *sb_handoff = card;
         }
-        crate::kernel::display::ExitDisplay::Restore(display)
+        Some(crate::kernel::display::ExitDisplay::Restore(handoff))
     } else {
-        exiting_display.take().expect("zombie lost display")
+        exiting_display.take()
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
     match transfer {
-        crate::kernel::display::ExitDisplay::Restore(display) => {
-            *sb_handoff = crate::kernel::focus::acquire(
-                machine, bios_workspace, new_tid, &mut new.personality,
-                display, sb_handoff.take());
+        Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
+            if crate::kernel::osd::is_open()
+                || matches!(new.personality, thread::Personality::Linux(_))
+            {
+                *display = Some(handoff.into_surface(machine, bios_workspace));
+                new.personality.repaint_osd();
+            } else {
+                new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+            }
         }
-        crate::kernel::display::ExitDisplay::DosReplace(returned) => {
+        Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
             let thread::Personality::Dos(dos) = &mut new.personality else {
                 unreachable!("DOS VGA returned to non-DOS parent")
             };
             dos.pc.vga.acquire_parent_replace(machine, returned);
-            crate::kernel::focus::adopt(new_tid);
-            *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
         }
+        None => assert!(display.is_some(), "zombie lost display"),
     }
-    // The monitor stayed open across the hop: suspend the freshly focused
-    // owner and park its display back under the panel, menu state intact.
-    if repark_osd {
-        crate::dbg_println!("[osd] repark across focus switch -> tid {}", new_tid);
-        let display = new.personality.suspend_for_osd(machine, bios_workspace);
-        crate::kernel::osd::repark_display(crate::kernel::osd::OsdDisplay::new(display));
-        new.personality.repaint_osd();
+    if !crate::kernel::osd::is_open()
+        && matches!(new.personality, thread::Personality::Dos(_))
+        && let Some(surface) = display.take()
+    {
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
+        new.personality.acquire_display_restore(machine, bios_workspace, handoff);
     }
+    crate::kernel::focus::adopt(new_tid);
+    *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -1091,6 +1097,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    event_display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<usize> {
     use crate::kernel::exec;
 
@@ -1161,9 +1168,12 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // Release while the parent's address space is live. The returned token is
     // the only physical display ownership during construction; the parent's
     // record is now a complete emulated recovery image.
-    let fork_display = parent_was_focused.then(|| {
-        let parent = thread::get_thread(threads, parent_tid).unwrap();
-        parent.personality.release_display(machine, bios_workspace)
+    let fork_display = parent_was_focused.then(|| match event_display.take() {
+        Some(display) => crate::kernel::display::DisplayHandoff::from_surface(display, machine),
+        None => {
+            let parent = thread::get_thread(threads, parent_tid).unwrap();
+            parent.personality.release_display(machine, bios_workspace)
+        }
     });
     let mut fork_sb = if parent_was_focused { sb_handoff.take() } else { None };
     if parent_was_focused
@@ -1182,14 +1192,12 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                 unreachable!("parent_is_dos without DOS personality")
             };
             let vga = parent.pc.vga.clone_detached_for_child(machine).unwrap_or_else(||
-                crate::kernel::bios_display::DisplayedVga::Emulated(
-                    crate::kernel::bios_display::EmulatedVga::initial_mode3(),
-                    crate::kernel::display::Display::headless()));
+                crate::kernel::bios_display::DosVideo::Vga(
+                    crate::kernel::bios_display::EmulatedVga::initial_mode3()));
             exec::ExecVga::Dos(vga)
         }
-        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DisplayedVga::Emulated(
-            crate::kernel::bios_display::EmulatedVga::initial_mode3(),
-            crate::kernel::display::Display::headless())),
+        _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
+            crate::kernel::bios_display::EmulatedVga::initial_mode3())),
     };
 
     // Reserve a child record, then COW the live address space into the parent
@@ -1199,8 +1207,16 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             Some(t) => t,
             None => {
                 if let Some(display) = fork_display {
-                    thread::get_thread(threads, parent_tid).unwrap().personality
-                        .acquire_display_restore(machine, bios_workspace, display);
+                    let parent = thread::get_thread(threads, parent_tid).unwrap();
+                    if crate::kernel::osd::is_open()
+                        || matches!(parent.personality, thread::Personality::Linux(_))
+                    {
+                        *event_display = Some(display.into_surface(machine, bios_workspace));
+                    } else {
+                        parent.personality.acquire_display_restore(
+                            machine, bios_workspace, display,
+                        );
+                    }
                 }
                 if parent_was_focused {
                     *sb_handoff = thread::get_thread(threads, parent_tid).unwrap()
@@ -1255,7 +1271,13 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_resume(machine);
         if let Some(display) = fork_display {
-            parent.personality.acquire_display_restore(machine, bios_workspace, display);
+            if crate::kernel::osd::is_open()
+                || matches!(parent.personality, thread::Personality::Linux(_))
+            {
+                *event_display = Some(display.into_surface(machine, bios_workspace));
+            } else {
+                parent.personality.acquire_display_restore(machine, bios_workspace, display);
+            }
         }
         if parent_was_focused {
             *sb_handoff = parent.personality.adopt_sb(machine, fork_sb);
@@ -1267,8 +1289,14 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // Hardware/current surface wins on successful EXEC. Bind it to the live
     // child without replaying the parent's recovery image.
     if let Some(display) = fork_display {
-        thread::get_thread(threads, child_tid).unwrap().personality
-            .acquire_display_replace(machine, bios_workspace, display);
+        let child = thread::get_thread(threads, child_tid).unwrap();
+        if crate::kernel::osd::is_open()
+            || matches!(child.personality, thread::Personality::Linux(_))
+        {
+            *event_display = Some(display.into_surface(machine, bios_workspace));
+        } else {
+            child.personality.acquire_display_replace(machine, bios_workspace, display);
+        }
     }
     if parent_was_focused {
         *sb_handoff = thread::get_thread(threads, child_tid).unwrap()

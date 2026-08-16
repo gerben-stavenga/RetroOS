@@ -51,9 +51,50 @@ pub struct EmulatedVga {
 /// A VGA paired with an output target. Native VGA intrinsically owns physical
 /// scanout; an emulated VGA targets a real, composited, hosted, or headless
 /// display.
-pub enum DisplayedVga {
+pub enum FullscreenVga {
     Native(crate::kernel::platform::NativeVga),
     Emulated(EmulatedVga, crate::kernel::display::Display),
+}
+
+/// VGA state stored by a DOS personality. A plain VGA participates in the
+/// event-loop compositor; a fullscreen VGA owns the machine's output and is
+/// the only state which can be handed from one foreground thread to another.
+pub enum DosVideo {
+    Vga(EmulatedVga),
+    Fullscreen(FullscreenVga),
+}
+
+impl DosVideo {
+    pub fn emulated(&self) -> Option<&EmulatedVga> {
+        match self {
+            Self::Vga(vga) | Self::Fullscreen(FullscreenVga::Emulated(vga, _)) => Some(vga),
+            Self::Fullscreen(FullscreenVga::Native(_)) => None,
+        }
+    }
+
+    pub fn emulated_mut(&mut self) -> Option<&mut EmulatedVga> {
+        match self {
+            Self::Vga(vga) | Self::Fullscreen(FullscreenVga::Emulated(vga, _)) => Some(vga),
+            Self::Fullscreen(FullscreenVga::Native(_)) => None,
+        }
+    }
+
+    pub fn native(&self) -> Option<&crate::kernel::platform::NativeVga> {
+        match self {
+            Self::Fullscreen(FullscreenVga::Native(native)) => Some(native),
+            _ => None,
+        }
+    }
+
+    pub fn native_mut(&mut self) -> Option<&mut crate::kernel::platform::NativeVga> {
+        match self {
+            Self::Fullscreen(FullscreenVga::Native(native)) => Some(native),
+            _ => None,
+        }
+    }
+
+    pub fn is_native(&self) -> bool { self.native().is_some() }
+    pub fn is_fullscreen(&self) -> bool { matches!(self, Self::Fullscreen(_)) }
 }
 
 impl EmulatedVga {
