@@ -33,7 +33,8 @@
 use crate::Regs;
 use crate::kernel::thread;
 use super::machine::{
-    self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_sp, vm86_ss, read_u16, write_u16,
+    self, emulate_inb, emulate_outb, vm86_ip, vm86_pop, vm86_push, vm86_sp, vm86_ss,
+    read_u16, write_u16,
 };
 use super::dosabi::STUB_SEG;
 
@@ -406,7 +407,11 @@ pub(super) fn dispatch<A: crate::Arch>(
                 return thread::KernelAction::Done;
             }
         }
-        0x09 => int09(machine, dos, regs),
+        0x09 => {
+            if int09(machine, dos, regs) {
+                return thread::KernelAction::Done;
+            }
+        }
         0x0A..=0x0F => emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20), // master-PIC IRQ default: EOI
         0x70..=0x77 => {
             // Slave-PIC IRQ default: EOI both.
@@ -623,8 +628,56 @@ const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJ
 /// virtual 8042 on interp, the real one on metal). Translate to ASCII,
 /// track shift/ctrl/alt in the BDA flag byte, push (scancode:ascii) into the
 /// ring for INT 16h. Extended keys (arrows, F-keys) push ascii=0.
-fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) {
+/// Start BIOS INT 9 processing. Returns true when a guest INT 15h/AH=4Fh
+/// intercept was launched and will finish through SLOT_KBD_INTERCEPT_RETURN.
+fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &mut Regs) -> bool {
     let sc = emulate_inb(machine, &mut dos.pc, 0x60);
+    let int15_off = read_u16(machine, 0, 0x15 * 4);
+    let int15_seg = read_u16(machine, 0, 0x15 * 4 + 2);
+    if int15_seg != STUB_SEG {
+        // IBM-compatible BIOSes offer every keyboard byte to INT 15h/AH=4Fh
+        // before translating it. CF enters set; the hook may replace AL and
+        // returns CF set to continue normal BIOS handling, clear to consume.
+        regs.rax = (regs.rax & !0xFFFF) | u64::from(0x4F00 | u16::from(sc));
+        let flags = (machine::vm86_flags(regs) as u16) | 1;
+        vm86_push(machine, regs, flags);
+        vm86_push(machine, regs, super::dos::CTRL_STUB_SEG);
+        vm86_push(machine, regs,
+            super::dos::ctrl_slot_off(super::dos::SLOT_KBD_INTERCEPT_RETURN));
+        machine::set_vm86_cs(regs, int15_seg);
+        machine::set_vm86_ip(regs, int15_off);
+        regs.set_flag32(1);
+        return true;
+    }
+    finish_int09(machine, dos, regs, sc, true);
+    false
+}
+
+/// Continue INT 9 after the guest's INT 15h/AH=4Fh hook returns.
+pub(super) fn int09_intercept_return<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) {
+    let accepted = machine::vm86_flags(regs) & 1 != 0;
+    let sc = regs.rax as u8;
+    finish_int09(machine, dos, regs, sc, accepted);
+    // The nested INT 15 frame was consumed on entry to this slot; unwind the
+    // original hardware INT 9 frame after completing BIOS processing.
+    pop_iret_frame(machine, regs);
+}
+
+fn finish_int09<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+    sc: u8,
+    accepted: bool,
+) {
+    if !accepted {
+        emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
+        return;
+    }
     // The E0 prefix arrives as its own byte with its own IRQ1 (real 8042, and
     // `vkbd` queues it the same way). It is not a keystroke — latch it in the
     // BDA flag that exists for exactly this and wait for the code it prefixes.

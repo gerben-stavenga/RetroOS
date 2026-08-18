@@ -202,6 +202,47 @@ fn park_at_slot_resume<A: crate::Arch>(_machine: &mut A, regs: &mut Regs) {
     regs.frame.rflags |= machine::VIF_FLAG as u64;
 }
 
+/// Arithmetic status bits returned by DOS calls. Control flags such as DF and
+/// the caller's interrupt-enable state come from the saved interrupt frame.
+const DOS_STATUS_MASK: u32 = 0x08D5; // CF, PF, AF, ZF, SF, OF
+
+fn merge_dos_status(saved_flags: u32, completed_flags: u32) -> u32 {
+    (saved_flags & !DOS_STATUS_MASK) | (completed_flags & DOS_STATUS_MASK)
+}
+
+/// Poll one operation parked at `SLOT_RESUME`. The resume slot is a HLT rather
+/// than a tight `INT 31h` loop: the architecture advances IP past HLT and
+/// returns `KernelEvent::Hlt`, then the DOS event loop calls this function.
+/// Pending IRQs are still delivered normally between polls.
+pub(super) fn poll_pending_resume<A: crate::Arch>(
+    machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    let cb = dos.pending_resume.pop()
+        .expect("SLOT_RESUME fired without pending_resume");
+    match (cb.0)(machine, kt, dos, regs) {
+        Some(next) => {
+            dos.pending_resume.push(next);
+            park_at_slot_resume(machine, regs);
+        }
+        None => {
+            let completed_flags = machine::vm86_flags(regs);
+            let ret_ip = vm86_pop(machine, regs);
+            let ret_cs = vm86_pop(machine, regs);
+            let ret_flags = vm86_pop(machine, regs);
+            machine::set_vm86_ip(regs, ret_ip);
+            machine::set_vm86_cs(regs, ret_cs);
+            machine::set_vm86_flags(
+                regs,
+                merge_dos_status(ret_flags as u32, completed_flags),
+            );
+        }
+    }
+    thread::KernelAction::Done
+}
+
 // ============================================================================
 // RM INT 31h dispatch — routes from the unified CD 31 array by slot number
 // ============================================================================
@@ -217,18 +258,19 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
     vector: u8,
-) -> thread::KernelAction {
-    match vector {
+) -> (thread::KernelAction, bool) {
+    let mut suspended_here = false;
+    let action = match vector {
         0x08 => thread::KernelAction::Done, // timer — handled via VM86 IRQ reflect path
         0x13 => int_13h(machine, regs),
         0x20 => {
             if let Some(parent) = dos.exec_parent.take() {
                 dos.last_child_exit_status = 0x0000;
-                return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
+                return (exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false), false);
             }
             thread::KernelAction::Exit(0)
         }
-        0x21 => int_21h(machine, kt, dos, regs),
+        0x21 => int_21h(machine, kt, dos, regs, &mut suspended_here),
         0x33 => int_33h(machine, dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
@@ -252,7 +294,7 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
                 // frame") see a plain failure instead of getting a stale
                 // page-frame paragraph back.
                 regs.rax = (regs.rax & !0xFF00) | 0x80_00;
-                return thread::KernelAction::Done;
+                return (thread::KernelAction::Done, false);
             }
             int_67h(machine, dos, regs)
         }
@@ -260,7 +302,8 @@ pub(crate) fn dispatch_kernel_syscall<A: crate::Arch>(
             dos_trace!("dispatch_kernel_syscall: unhandled vector {:#04x}", vector);
             thread::KernelAction::Done
         }
-    }
+    };
+    (action, suspended_here)
 }
 
 /// Dispatch INT 31h from the stub array's VECTOR view (CS == `STUB_SEG`):
@@ -281,7 +324,8 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             // restores the handler's result to the caller.
             let caller_flags = read_u16(machine, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
-            let action = dispatch_kernel_syscall(machine, kt, dos, regs, vector);
+            let (action, suspended_here) =
+                dispatch_kernel_syscall(machine, kt, dos, regs, vector);
             // Exit replaces thread state outright — skip the iret-frame
             // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
             // leaves the issuing thread alive and needs regs.CS:EIP
@@ -307,11 +351,10 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             // the PM parent's SS:SP and clears VM_FLAG. We're then logically
             // resuming a PM caller and must pop the iret-frame
             // `deliver_pm_int` planted on the parent's PM stack, not a
-            // VM86-style frame. A pending resume means the handler
-            // intentionally parked CS:IP at SLOT_RESUME to block (AH=01/07/
-            // 08/0A waiting on the keyboard) — popping here would clobber
-            // the redirect; SLOT_RESUME owns the unwind once input arrives.
-            if dos.pending_resume.is_none() {
+            // VM86-style frame. A handler that suspended itself retains this
+            // frame until SLOT_RESUME completes it; every other call pops the
+            // frame it entered with, independent of any outer parked call.
+            if !suspended_here {
                 finish_dos_call(machine, dos, regs);
             }
             action
@@ -372,33 +415,18 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
             regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
             thread::KernelAction::Done
         }
+        SLOT_KBD_INTERCEPT_RETURN => {
+            super::bios::int09_intercept_return(machine, dos, regs);
+            thread::KernelAction::Done
+        }
         SLOT_MOUSE_CB_RET => {
             mouse_callback_return(machine, dos, regs);
             thread::KernelAction::Done
         }
         SLOT_RESUME => {
-            // Take the parked closure and call it (FnOnce). It returns
-            // `Some(next)` to stay parked (we re-store, rewind IP to the
-            // CD 31 so the next fetch re-traps here), or `None` to signal
-            // completion (we run the soft-INT iret-frame pop the original
-            // slot would have done, unwinding the chain naturally).
-            let cb = dos.pending_resume.take()
-                .expect("SLOT_RESUME fired without pending_resume");
-            match (cb.0)(machine, kt, dos, regs) {
-                Some(next) => {
-                    dos.pending_resume = Some(next);
-                    park_at_slot_resume(machine, regs);
-                }
-                None => {
-                    let ret_ip = vm86_pop(machine, regs);
-                    let ret_cs = vm86_pop(machine, regs);
-                    let ret_flags = vm86_pop(machine, regs);
-                    machine::set_vm86_ip(regs, ret_ip);
-                    machine::set_vm86_cs(regs, ret_cs);
-                    machine::set_vm86_flags(regs, ret_flags as u32);
-                }
-            }
-            thread::KernelAction::Done
+            // Compatibility fallback for an old in-memory stub image. New
+            // stubs use HLT and reach the same helper through KE::Hlt.
+            poll_pending_resume(machine, kt, dos, regs)
         }
         _ => {
             panic!("VM86: INT 31h unknown control slot {:#04x} CS:IP={:04x}:{:#06x}",
@@ -454,7 +482,8 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
     } else { [0u64; 7] };
 
     let al_in = regs.rax as u8;
-    let action = int_21h(machine, kt, dos, regs);
+    let mut suspended_here = false;
+    let action = int_21h(machine, kt, dos, regs, &mut suspended_here);
 
     if mask16 {
         // Pointer-returning calls hand a 32-bit LINEAR through LOW_MEM_SEL
@@ -478,7 +507,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
     }
 
     if !matches!(action, thread::KernelAction::Done) { return action; }
-    if dos.pending_resume.is_none() {
+    if !suspended_here {
         finish_dos_call(machine, dos, regs);
     }
     thread::KernelAction::Done
@@ -494,9 +523,10 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
 /// mode-aware iret-frame pop.
 pub(super) fn pmdos_int33_handler<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let _ = int_33h(machine, dos, regs);
-    if dos.pending_resume.is_none() {
-        finish_dos_call(machine, dos, regs);
-    }
+    // INT 33h itself never blocks. A pending DOS operation may belong to an
+    // outer call interrupted while parked; it must not suppress this nested
+    // call's IRET-frame pop.
+    finish_dos_call(machine, dos, regs);
     thread::KernelAction::Done
 }
 
@@ -511,9 +541,8 @@ pub(super) fn pmdos_int10_handler<A: crate::Arch>(
     regs: &mut Regs,
 ) -> thread::KernelAction {
     super::bios::int10(machine, bios_display, dos, regs);
-    if dos.pending_resume.is_none() {
-        finish_dos_call(machine, dos, regs);
-    }
+    // INT 10h itself never blocks; see the nested-call ownership note above.
+    finish_dos_call(machine, dos, regs);
     thread::KernelAction::Done
 }
 
@@ -529,9 +558,6 @@ pub(super) fn pmdos_int10_handler<A: crate::Arch>(
 ///   - PM: pop the IRET frame `deliver_pm_int` planted on the PM
 ///     stack and merge DOS status flags so CF/AX results survive.
 fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    // Arithmetic status flags only: CF, PF, AF, ZF, SF, OF. DF (bit 10)
-    // is a control flag — handler-set CLD/STD must not leak into caller.
-    const STATUS_MASK: u32 = 0x08D5;
     if regs.mode() == crate::UserMode::VM86 {
         let ret_ip = vm86_pop(machine, regs);
         let ret_cs = vm86_pop(machine, regs);
@@ -540,7 +566,7 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
         set_vm86_cs(regs, ret_cs);
         machine::set_vm86_flags(regs, ret_flags as u32);
     } else {
-        let post_handler_status = regs.flags32() & STATUS_MASK;
+        let post_handler_status = regs.flags32() & DOS_STATUS_MASK;
         let client_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
         let (ret_eip, ret_cs, ret_flags) =
             super::mode_transitions::pop_iret_frame(machine, &dos.ldt[..], regs, client_use32);
@@ -553,7 +579,10 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
         // else happens to set it (Duke3D's demo loop wedged exactly this way,
         // its tick-wait starved right after an INT 21h). `apply_guest_flags`
         // maps the image's IF slot back to VIF.
-        machine::apply_guest_flags(regs, (ret_flags & !STATUS_MASK) | post_handler_status);
+        machine::apply_guest_flags(
+            regs,
+            (ret_flags & !DOS_STATUS_MASK) | post_handler_status,
+        );
     }
 }
 
@@ -661,6 +690,17 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             };
             let f = &mut regs.frame.rflags;
             *f = (*f & !(3u64 << 12)) | (mode << 12);
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AH=0Ah — SYNTH_LOG_BYTE: mirror AL to the ambient kernel log only.
+        // This is the non-VGA half of DOS console output, used by COMMAND.COM
+        // for diagnostics from `COPY ... >NUL`: installers keep their screen
+        // intact while retroos.log and the in-memory LOG builtin retain the
+        // suppressed command output.
+        0x0A => {
+            lib::log::debug_byte(regs.rax as u8);
+            regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1034,6 +1074,63 @@ fn int16_finish_resume<A: crate::Arch>(_machine: &mut A, echo: bool, func: u8) -
         }))
 }
 
+fn finish_file_read<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+    handle: i32,
+    requested: usize,
+    buf_addr: u32,
+    buf: &[u8],
+) {
+    let got = buf.len();
+    machine::vga::copy_to_guest(machine, &mut dos.pc.vga, buf_addr as usize, buf);
+    // An overlay reload can drop fresh code onto a page that a prior CLI
+    // window was learned at; discard those stale entries.
+    if got > 0 && let Some(dpmi) = dos.dpmi.as_mut() {
+        for page in (buf_addr >> 12)..=((buf_addr + got as u32 - 1) >> 12) {
+            dpmi.vif.invalidate_page(page);
+        }
+    }
+    if got < requested {
+        dos_trace!("D21 3F SHORT h={} req={} got={}", handle, requested, got);
+    }
+    let dump_n = got.min(16);
+    let mut hex = [0u8; 16];
+    hex[..dump_n].copy_from_slice(&buf[..dump_n]);
+    dos_trace!(
+        "D21 3F h={} req={} got={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+        handle, requested, got,
+        hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7],
+        hex[8], hex[9], hex[10], hex[11], hex[12], hex[13], hex[14], hex[15]);
+    regs.rax = (regs.rax & !0xFFFF) | got as u64;
+    regs.clear_flag32(1);
+}
+
+/// Complete an image-backed CD read only after its modeled transfer deadline.
+/// The guest remains parked, not the kernel: normal PIT advancement and IRQ0
+/// delivery continue while the DOS call is outstanding.
+fn cdrom_read_resume<A: crate::Arch>(
+    _machine: &mut A,
+    deadline_ns: u64,
+    handle: i32,
+    requested: usize,
+    buf_addr: u32,
+    buf: alloc::vec::Vec<u8>,
+) -> super::ResumeCallback<A> {
+    super::ResumeCallback(alloc::boxed::Box::new(move |machine: &mut A,
+              _kt: &mut thread::KernelThread<A>,
+              dos: &mut thread::DosState<A>,
+              regs: &mut Regs| -> Option<super::ResumeCallback<A>> {
+        if machine.now() < deadline_ns {
+            return Some(cdrom_read_resume(
+                machine, deadline_ns, handle, requested, buf_addr, buf));
+        }
+        finish_file_read(machine, dos, regs, handle, requested, buf_addr, &buf);
+        None
+    }))
+}
+
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
 fn dos_putchar<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, c: u8) {
@@ -1108,7 +1205,13 @@ fn open_policies(mode: u8) -> Option<(crate::kernel::vfs::OpenAccess, crate::ker
 // DOS INT 21h — DOS services
 // ============================================================================
 
-fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+fn int_21h<A: crate::Arch>(
+    machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+    suspended_here: &mut bool,
+) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     // Skip per-call trace for noisy/chatty AHs: 2C/2A (timer/date polled by
     // running clients), 02/06/09 (character/string output — exception
@@ -1173,7 +1276,8 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 // unhooked guest just runs the BIOS INT 16h, reading the same
                 // 40:1A the old fast path did.
                 launch_int16_read(machine, regs);
-                dos.pending_resume = Some(int16_finish_resume(machine, echo, ah));
+                dos.pending_resume.push(int16_finish_resume(machine, echo, ah));
+                *suspended_here = true;
             }
             thread::KernelAction::Done
         }
@@ -1206,8 +1310,9 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 machine.write::<u8>((buf_lin + 1) as usize, 0);
                 return thread::KernelAction::Done;
             }
-            dos.pending_resume = Some(buffered_input_resume(machine, buf_lin, max_chars, 0));
+            dos.pending_resume.push(buffered_input_resume(machine, buf_lin, max_chars, 0));
             park_at_slot_resume(machine, regs);
+            *suspended_here = true;
             thread::KernelAction::Done
         }
         // AH=0x0B: Check Standard Input Status — AL=0 no char, 0xFF char ready.
@@ -1604,40 +1709,34 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
                 regs.rax &= !0xFFFF;
                 regs.clear_flag32(1);
             } else {
+                let cdrom = crate::kernel::vfs::mount_prefix(handle, &kt.fds)
+                    == Some(b"cdrom/" as &[u8]);
                 let mut buf = alloc::vec![0u8; count];
+                let read_started = machine.now();
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
                 if n >= 0 {
                     let got = (n as usize).min(count);
-                    machine::vga::copy_to_guest(
-                        machine,
-                        &mut dos.pc.vga,
-                        buf_addr as usize,
-                        &buf[..got],
-                    );
-                    // An overlay reload can drop fresh code onto a page that a
-                    // prior CLI window was learned at; drop those stale entries so
-                    // dpmi::vif re-learns instead of running free on a wrong exit.
-                    // PM clients run flat (EIP == linear), so `buf_addr` shares the
-                    // site keys' page basis. (Over-invalidation of a data read just
-                    // costs one re-learn — retain scans a 64-slot table.)
-                    if got > 0
-                        && let Some(dpmi) = dos.dpmi.as_mut()
+                    buf.truncate(got);
+                    let cdrom_delay = if cdrom {
+                        crate::kernel::fs::cdrom::transfer_ns(got)
+                    } else {
+                        None
+                    };
+                    if got > 0 && regs.mode() == crate::UserMode::VM86
+                        && let Some(delay) = cdrom_delay
                     {
-                        for page in (buf_addr >> 12)..=((buf_addr + got as u32 - 1) >> 12) {
-                            dpmi.vif.invalidate_page(page);
-                        }
+                        // Count time already spent fetching the backing image;
+                        // the setting is a minimum total transfer duration, not
+                        // an extra delay added after slow physical storage.
+                        let deadline = read_started.saturating_add(delay);
+                        dos.pending_resume.push(cdrom_read_resume(
+                            machine, deadline, handle, count, buf_addr, buf));
+                        park_at_slot_resume(machine, regs);
+                        *suspended_here = true;
+                    } else {
+                        finish_file_read(
+                            machine, dos, regs, handle, count, buf_addr, &buf);
                     }
-                    if (n as usize) < count { dos_trace!("D21 3F SHORT h={} req={} got={}", handle, count, n); }
-                    let dump_n = (n as usize).min(16);
-                    let mut hex = [0u8; 16];
-                    hex[..dump_n].copy_from_slice(&buf[..dump_n]);
-                    dos_trace!(
-                        "D21 3F h={} req={} got={} bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
-                        handle, count, n,
-                        hex[0], hex[1], hex[2], hex[3], hex[4], hex[5], hex[6], hex[7],
-                        hex[8], hex[9], hex[10], hex[11], hex[12], hex[13], hex[14], hex[15]);
-                    regs.rax = (regs.rax & !0xFFFF) | n as u64;
-                    regs.clear_flag32(1);
                 } else {
                     regs.rax = (regs.rax & !0xFFFF) | 6; // invalid handle
                     regs.set_flag32(1);
@@ -1959,8 +2058,15 @@ fn int_21h<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
         // AH=0x0E: Select disk (DL=drive, 0=A, 2=C, 3=D)
         0x0E => {
             let drive = b'A'.wrapping_add(regs.rdx as u8);
-            let _ = dos.dfs.select_drive(drive);
-            regs.rax = (regs.rax & !0xFF) | 8; // AL = LASTDRIVE (H:)
+            // H: exists only when the platform actually mounted hostfs. A
+            // reserved CDS slot is not a drive: accepting it here makes DOS
+            // installers offer a phantom destination on machines without a
+            // hostfs peer.
+            if drive != b'H' || crate::kernel::platform::get().hostfs {
+                let _ = dos.dfs.select_drive(drive);
+            }
+            let last_drive = if crate::kernel::platform::get().hostfs { 8 } else { 4 };
+            regs.rax = (regs.rax & !0xFF) | last_drive;
             thread::KernelAction::Done
         }
         // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
@@ -4111,7 +4217,21 @@ fn epoch_days_fast(year: u32, month: u32, day: u32) -> u32 {
 
 #[cfg(test)]
 mod file_api_tests {
-    use super::{dos_to_unix_datetime, epoch_days_fast, unix_to_dos_datetime};
+    use super::{
+        dos_to_unix_datetime, epoch_days_fast, merge_dos_status,
+        unix_to_dos_datetime,
+    };
+
+    #[test]
+    fn resumed_dos_call_uses_completed_carry_status() {
+        // A caller may enter DOS with CF set. A successful deferred operation
+        // clears it without changing control flags from the saved frame.
+        let saved = 0x0000_0347;
+        let completed = saved & !1;
+        let merged = merge_dos_status(saved, completed);
+        assert_eq!(merged & 1, 0);
+        assert_eq!(merged & !super::DOS_STATUS_MASK, saved & !super::DOS_STATUS_MASK);
+    }
 
     #[test]
     fn branchless_epoch_days_matches_known_dates() {
@@ -4740,6 +4860,8 @@ pub(crate) const SLOT_MOUSE_CB_RET: u8 = 0x14;
 /// the far-call convention is Function 05h's BX/DX register ABI, while the
 /// control-slot dispatcher routes the operation to the current process VGA.
 pub(crate) const SLOT_VBE_WINDOW: u8 = 0x15;
+/// Return point for the INT 15h/AH=4Fh hook invoked by BIOS INT 9.
+pub(crate) const SLOT_KBD_INTERCEPT_RETURN: u8 = 0x16;
 
 pub(crate) const fn vbe_window_ptr() -> u32 {
     ctrl_slot_off(SLOT_VBE_WINDOW) as u32
@@ -4800,6 +4922,15 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     for i in 0..256 {
         machine.write::<[u8; 2]>(stubs + i * 2, [0xCD, STUB_INT]);
     }
+    // A blocked DOS operation must stop executing guest instructions until
+    // the event loop polls it again. HLT traps uniformly in VM86 and PM and
+    // avoids turning a modeled CD delay into millions of nested INT 31h
+    // entries. The second byte is another HLT for defensive fall-through;
+    // `poll_pending_resume` rewinds to byte zero while still waiting.
+    machine.write::<[u8; 2]>(
+        stubs + SLOT_RESUME as usize * 2,
+        [0xF4, 0xF4],
+    );
 
     // DOS always sees the Rust substitute BIOS. Native firmware is a private
     // implementation detail of BiosDisplayWorkspace and is never entered in
@@ -4849,13 +4980,14 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         ..Default::default()
     });
 
+    let last_drive = if crate::kernel::platform::get().hostfs { 8 } else { 4 };
     let lol = Lol {
         sft_off: (sft_addr & 0xF) as u16,
         sft_seg: (sft_addr >> 4) as u16,
         cds_off: (cds_addr & 0xF) as u16,
         cds_seg: (cds_addr >> 4) as u16,
         block_devs: 2,
-        last_drive: NUM_DRIVES,
+        last_drive,
         ..Default::default()
     };
     machine.write::<Lol>(lm_field(core::mem::offset_of!(LowMem, lol)), lol);

@@ -338,7 +338,10 @@ _DISK_CMD = """
     set -euo pipefail
 
     EXT4_START=65536               # 32 MiB / 512
-    EXT4_SECTORS=$$((1024 * 2048)) # 1 GiB / 512
+    # The proprietary payload is now just over 1000 MiB before ext4 metadata.
+    # A 1 GiB partition leaves mkfs no room for its inode tables, journal, and
+    # allocation metadata (the failure commonly surfaces on TARGET.FLZ).
+    EXT4_SECTORS=$$((1280 * 2048)) # 1.25 GiB / 512
 
     # Strip the leading TAR header for "A" so byte 0 of the partition
     # is the bootloader (which embeds the MBR + partition table at the

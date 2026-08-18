@@ -186,16 +186,17 @@ pub struct DosState<A: crate::Arch> {
     /// reflect-to-RM behaviour for INT 21 hooks installed in the IVT.
     pub pm_dos: bool,
 
-    /// Pending in-kernel "block-and-retry" callback. Set by syscall handlers
-    /// that can't complete synchronously (e.g. AH=08 with no keystroke
-    /// ready). While set, the user's CS:IP is parked at `SLOT_RESUME` —
-    /// every event-loop iteration re-traps and re-invokes the closure.
+    /// LIFO stack of in-kernel "block-and-retry" callbacks. A syscall handler
+    /// that cannot complete synchronously pushes its own continuation and
+    /// leaves its own interrupt frame on the guest stack. This remains proper
+    /// stack discipline if an IRQ handler starts another blocking DOS call.
+    /// While nonempty, the user's CS:IP is parked at `SLOT_RESUME`.
     /// The closure returns `Some(next)` to stay parked with a new model,
     /// or `None` to signal completion (SLOT_RESUME then unwinds via the
     /// standard soft-INT iret-frame pop). The return-based contract makes
     /// the "still waiting vs done" decision explicit at every call site
-    /// instead of leaning on a side-channel into `dos.pending_resume`.
-    pub pending_resume: Option<ResumeCallback<A>>,
+    /// instead of leaning on unrelated process state.
+    pub pending_resume: alloc::vec::Vec<ResumeCallback<A>>,
 }
 
 /// The boxed retry closure inside a [`ResumeCallback`].
@@ -268,7 +269,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_rm_vector_shadow), 0, 1);
             core::ptr::addr_of_mut!((*p).dpmi).write(None);
             core::ptr::addr_of_mut!((*p).pm_dos).write(false);
-            core::ptr::addr_of_mut!((*p).pending_resume).write(None);
+            core::ptr::addr_of_mut!((*p).pending_resume).write(alloc::vec::Vec::new());
             state.assume_init()
         }
     }
@@ -630,7 +631,17 @@ pub fn handle_event<A: crate::Arch>(
         // thread on the very first idle cycle, defeating task switching. The Phase 1
         // drain re-runs raise_pending each iteration, so any pending IRQ
         // gets injected on the next round.
-        KE::Hlt => thread::KernelAction::Done,
+        KE::Hlt => {
+            let at_resume_hlt = !dos.pending_resume.is_empty()
+                && is_vm86
+                && regs.code_seg() == dos::CTRL_STUB_SEG
+                && regs.ip32() == dos::ctrl_slot_off(dos::SLOT_RESUME) as u32 + 1;
+            if at_resume_hlt {
+                dos::poll_pending_resume(machine, kt, dos, regs)
+            } else {
+                thread::KernelAction::Done
+            }
+        }
         KE::SoftInt(n) => {
             if n == 0x31 {
                 // Kernel syscall — `syscall` branches on mode + CS to reach

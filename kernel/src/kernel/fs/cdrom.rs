@@ -12,6 +12,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use spin::Mutex;
 
 use super::iso9660::{CueSheet, DiscFormat, Iso9660Fs, MediaError, RandomAccess};
@@ -20,6 +21,48 @@ use crate::kernel::vfs::{self, BackingFile, DirEntry, Filesystem, Vnode};
 const SLOT_PREFIX: &[u8] = b"cdrom/";
 /// Cue SHEETS (small text files) are still slurped for parsing.
 const MAX_CUE_BYTES: u32 = 1024 * 1024;
+
+/// Runtime drive-speed model selected in the OSD. Index zero means no
+/// throttling; the remaining entries model the original 150 KiB/s CD-ROM
+/// multiples. Keep 2x as the default for compatibility with the installer
+/// timing that motivated the model.
+const SPEED_BYTES_PER_SECOND: [u64; 4] = [0, 150 * 1024, 300 * 1024, 600 * 1024];
+const SPEED_LABELS: [&[u8]; 4] = [b"None", b"1x", b"2x", b"4x"];
+const DEFAULT_SPEED: u32 = 2;
+static SPEED: AtomicU32 = AtomicU32::new(DEFAULT_SPEED);
+
+fn speed_index() -> usize {
+    (SPEED.load(Ordering::Relaxed) as usize).min(SPEED_BYTES_PER_SECOND.len() - 1)
+}
+
+/// Time a successful transfer should occupy. `None` means an unthrottled
+/// virtual drive, so callers complete the read immediately.
+pub fn transfer_ns(bytes: usize) -> Option<u64> {
+    let bytes_per_second = SPEED_BYTES_PER_SECOND[speed_index()];
+    if bytes_per_second == 0 {
+        return None;
+    }
+    let numerator = (bytes as u128) * 1_000_000_000u128;
+    Some(
+        numerator.div_ceil(bytes_per_second as u128)
+            .min(u128::from(u64::MAX)) as u64,
+    )
+}
+
+pub fn speed_label() -> &'static [u8] {
+    SPEED_LABELS[speed_index()]
+}
+
+pub fn cycle_speed(forward: bool) {
+    let count = SPEED_BYTES_PER_SECOND.len();
+    let current = speed_index();
+    let next = if forward {
+        (current + 1) % count
+    } else {
+        (current + count - 1) % count
+    };
+    SPEED.store(next as u32, Ordering::Relaxed);
+}
 
 /// The image file as the disc: positional reads straight to the backing fs.
 /// The slot closes the handle on eject; `Iso9660Fs` only ever reads.
@@ -264,7 +307,8 @@ pub fn insert(index: usize) -> Result<(), MediaError> {
 
 #[cfg(test)]
 mod tests {
-    use super::supported_name;
+    use super::{SPEED, supported_name, transfer_ns};
+    use core::sync::atomic::Ordering;
 
     #[test]
     fn catalogue_accepts_iso_and_cue_only() {
@@ -272,5 +316,19 @@ mod tests {
         assert!(supported_name(b"game.cue"));
         assert!(!supported_name(b"track.bin"));
         assert!(!supported_name(b"README.TXT"));
+    }
+
+    #[test]
+    fn drive_speed_models_cdrom_multiples_and_none() {
+        let saved = SPEED.load(Ordering::Relaxed);
+        SPEED.store(0, Ordering::Relaxed);
+        assert_eq!(transfer_ns(300 * 1024), None);
+        SPEED.store(1, Ordering::Relaxed);
+        assert_eq!(transfer_ns(300 * 1024), Some(2_000_000_000));
+        SPEED.store(2, Ordering::Relaxed);
+        assert_eq!(transfer_ns(300 * 1024), Some(1_000_000_000));
+        SPEED.store(3, Ordering::Relaxed);
+        assert_eq!(transfer_ns(300 * 1024), Some(500_000_000));
+        SPEED.store(saved, Ordering::Relaxed);
     }
 }

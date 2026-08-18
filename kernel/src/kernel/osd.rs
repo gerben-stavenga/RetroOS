@@ -276,7 +276,9 @@ fn disk_label(dev: usize, out: &mut [u8]) -> usize {
 /// One row of the current device's list.
 #[derive(Clone, Copy)]
 enum DiskRow {
-    /// "Eject <name>" — only when media is inserted, always row 0.
+    /// Runtime CD-ROM transfer-speed control, always row 0 on the CD tab.
+    Speed,
+    /// "Eject <name>" — first media row when media is inserted.
     Eject,
     /// Insert/swap to this catalogue index.
     Insert(usize),
@@ -286,6 +288,10 @@ enum DiskRow {
 
 fn disk_row(item: usize) -> DiskRow {
     let dev = disk_device();
+    if dev == 2 && item == 0 {
+        return DiskRow::Speed;
+    }
+    let item = item - usize::from(dev == 2);
     let inserted = disk_inserted(dev);
     if inserted && item == 0 {
         return DiskRow::Eject;
@@ -307,11 +313,12 @@ fn disk_row(item: usize) -> DiskRow {
 fn disk_item_count() -> usize {
     let dev = disk_device();
     let catalog = disk_catalog_count(dev);
-    if disk_inserted(dev) {
+    let media_rows = if disk_inserted(dev) {
         1 + catalog.saturating_sub(1) // Eject + swap targets
     } else {
         catalog.max(1) // list, or the "(no images)" row
-    }
+    };
+    media_rows + usize::from(dev == 2) // CD also has its speed row
 }
 
 /// Keep the Disk selection visible: slide the scroll window after any
@@ -524,6 +531,10 @@ fn move_sel(up: bool) {
 /// cycle the device sub-tab (A: / B: / CD).
 fn adjust(up: bool) {
     if active_tab() == TAB_DISK {
+        if disk_device() == 2 && matches!(disk_row(active_sel(TAB_DISK)), DiskRow::Speed) {
+            crate::kernel::fs::cdrom::cycle_speed(up);
+            return;
+        }
         let cur = DISK_DEV.load(Ordering::Relaxed);
         let next = if up { (cur + 1) % DISK_DEVICES } else { (cur + DISK_DEVICES - 1) % DISK_DEVICES };
         DISK_DEV.store(next, Ordering::Relaxed);
@@ -565,6 +576,7 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
         TAB_DISK => {
             let dev = disk_device();
             match disk_row(active_sel(TAB_DISK)) {
+                DiskRow::Speed => {}
                 DiskRow::Eject => {
                     if dev == 2 {
                         crate::kernel::fs::cdrom::eject();
@@ -1032,6 +1044,10 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             _ => {}
         },
         TAB_DISK => match disk_row(item) {
+            DiskRow::Speed => {
+                line.put(b"Speed    ");
+                line.put(crate::kernel::fs::cdrom::speed_label());
+            }
             DiskRow::Eject => {
                 let dev = disk_device();
                 line.put(b"Eject ");

@@ -427,7 +427,12 @@ build_qemu_audio_args() {
 # the server in the background (HOSTFS_PID). The server self-terminates when
 # QEMU closes the socket, so no cleanup trap is required after exec.
 build_hostfs_args() {
-    HOSTFS_ARGS=()
+    # QEMU's machine defaults include a COM1 UART whose disconnected/default
+    # chardev can nevertheless assert CTS/DSR.  The kernel interprets those
+    # modem-status bits as a connected hostfs peer.  Remove the default UART
+    # unless -h explicitly wires it to hostfs.py; otherwise a phantom H:
+    # appears and blocks forever on its first protocol read.
+    HOSTFS_ARGS=(-serial none)
     HOSTFS_PID=""
     if [ "$HOSTFS_DIR_SET" = 1 ]; then
         HOSTFS_SOCK="/tmp/retroos-hostfs.sock"

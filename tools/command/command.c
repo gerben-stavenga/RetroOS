@@ -16,6 +16,7 @@
  *   AH=05h SYNTH_REAP        BX=pid -> recycle an exited child.
  *   AH=06h VGA_NEEDS_MODE3   -> AL=0 standard text / AL=1 normalize.
  *   AH=02/03h TRACE_ON/OFF
+ *   AH=0Ah LOG_BYTE          AL=byte (kernel log only, never VGA)
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in
  * dispatch all live here.
@@ -33,6 +34,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <alloc.h>
 
 /* Keep this shell small. A .COM is handed a whole 64 KB segment, and the
  * tiny-model startup honours these to SETBLOCK it back down (measured: the
@@ -690,10 +693,56 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
  * here (every copy is a byte-for-byte binary copy), no verify pass, and an
  * existing destination is always overwritten. */
 
-/* One sector. Deliberately small: this is BSS in a shell whose footprint is
- * memory a batch line's in-process EXEC does not get (see _stklen above), and
- * an installer's copies are not throughput-critical. */
-static char copy_buf[512];
+/* Keep only a one-sector fallback resident: BSS in this shell is memory a
+ * batch line's in-process EXEC cannot use (see _stklen above).  During COPY,
+ * borrow a separate 16 KiB DOS block from the far heap.  Large installer
+ * resources otherwise cross the INT 21h/emulator boundary twice per 512-byte
+ * sector, turning a 20 MiB install into roughly 80,000 syscalls. */
+#define COPY_BUF_SIZE 16384U
+static char copy_fallback_buf[512];
+static int copy_quiet = 0;       /* COPY ... >NUL: keep installer UIs intact */
+
+/* Normal COPY output goes through DOS stdout, whose console path also mirrors
+ * it into the kernel log.  For >NUL keep only that second half via the
+ * LOG_BYTE synth call, so diagnostics remain in retroos.log without painting
+ * over the caller's VGA text UI. */
+static void copy_report(const char *fmt, ...) {
+    char msg[128];
+    char *p;
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf(msg, fmt, ap);
+    va_end(ap);
+    if (!copy_quiet) {
+        fputs(msg, stdout);
+        return;
+    }
+    for (p = msg; *p; p++) {
+        r.h.ah = 0x0A;
+        r.h.al = (unsigned char)*p;
+        int86(0x31, &r, &r);
+    }
+}
+
+static int copy_read(int fd, void far *buf, unsigned count) {
+    r.h.ah = 0x3F;
+    r.x.bx = (unsigned)fd;
+    r.x.cx = count;
+    r.x.dx = FP_OFF(buf);
+    s.ds = FP_SEG(buf);
+    int86x(0x21, &r, &r, &s);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+static int copy_write(int fd, const void far *buf, unsigned count) {
+    r.h.ah = 0x40;
+    r.x.bx = (unsigned)fd;
+    r.x.cx = count;
+    r.x.dx = FP_OFF(buf);
+    s.ds = FP_SEG(buf);
+    int86x(0x21, &r, &r, &s);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
 
 /* INT 21h AX=4300h -- attribute word, or 0 when the path does not exist. */
 static int dos_file_attr(const char *path, unsigned *attr) {
@@ -817,8 +866,19 @@ static int copy_same_file(const char *a, const char *b) {
  * into a single named destination. Returns 1 on success. */
 static int copy_file(const char *src, const char *dst, int append) {
     int in, out, n;
+    unsigned buflen = COPY_BUF_SIZE;
+    void far *buf = farmalloc((unsigned long)COPY_BUF_SIZE);
+    int far_buf = buf != 0;
+    if (!buf) {
+        buf = copy_fallback_buf;
+        buflen = sizeof(copy_fallback_buf);
+    }
     in = open(src, O_RDONLY | O_BINARY);
-    if (in < 0) { printf("Cannot open %s\r\n", src); return 0; }
+    if (in < 0) {
+        if (far_buf) farfree(buf);
+        copy_report("Cannot open %s\r\n", src);
+        return 0;
+    }
     out = -1;
     if (append) {
         out = open(dst, O_WRONLY | O_BINARY);
@@ -827,20 +887,23 @@ static int copy_file(const char *src, const char *dst, int append) {
     if (out < 0) out = _creat(dst, 0);
     if (out < 0) {
         close(in);
-        printf("Cannot create %s\r\n", dst);
+        if (far_buf) farfree(buf);
+        copy_report("Cannot create %s\r\n", dst);
         return 0;
     }
-    while ((n = read(in, copy_buf, sizeof(copy_buf))) > 0) {
-        if (write(out, copy_buf, (unsigned)n) != n) {
+    while ((n = copy_read(in, buf, buflen)) > 0) {
+        if (copy_write(out, buf, (unsigned)n) != n) {
             close(in);
             close(out);
-            printf("Insufficient disk space\r\n");
+            if (far_buf) farfree(buf);
+            copy_report("Insufficient disk space\r\n");
             return 0;
         }
     }
     close(in);
     close(out);
-    if (n < 0) { printf("Read error - %s\r\n", src); return 0; }
+    if (far_buf) farfree(buf);
+    if (n < 0) { copy_report("Read error - %s\r\n", src); return 0; }
     return 1;
 }
 
@@ -861,7 +924,10 @@ static int copy_source(const char *src, const char *destdir, const char *destpat
     /* A bare directory source means every file in it, as DOS expands it. */
     if (!strpbrk(spec, "*?") && dos_file_attr(spec, &attr) && (attr & FA_DIREC)) {
         size_t n = strlen(spec);
-        if (n + 5 >= MAXPATH) { printf("Invalid path - %s\r\n", src); return 1; }
+        if (n + 5 >= MAXPATH) {
+            copy_report("Invalid path - %s\r\n", src);
+            return 1;
+        }
         if (n > 0 && !strchr("\\/:", spec[n - 1])) spec[n++] = '\\';
         strcpy(spec + n, "*.*");
     }
@@ -869,7 +935,10 @@ static int copy_source(const char *src, const char *destdir, const char *destpat
     copy_dir_prefix(spec, srcdir);
 
     done = findfirst(spec, &ff, 0);
-    if (done != 0) { printf("File not found - %s\r\n", src); return 1; }
+    if (done != 0) {
+        copy_report("File not found - %s\r\n", src);
+        return 1;
+    }
     for (; done == 0; done = findnext(&ff)) {
         if (ff.ff_attrib & FA_DIREC) continue;
         copy_join(from, srcdir, ff.ff_name);
@@ -881,12 +950,12 @@ static int copy_source(const char *src, const char *destdir, const char *destpat
             copy_path(to, destfile);
         }
         if (copy_same_file(from, to)) {
-            printf("File cannot be copied onto itself - %s\r\n", from);
+            copy_report("File cannot be copied onto itself - %s\r\n", from);
             rc = 1;
             continue;
         }
         /* DOS lists the sources of a multi-file copy as it walks them. */
-        if (wild) puts(ff.ff_name);
+        if (wild) copy_report("%s\r\n", ff.ff_name);
         if (!copy_file(from, to, destpat == 0 && *opened)) { rc = 1; continue; }
         if (destpat == 0) *opened = 1;
         (*copied)++;
@@ -914,7 +983,10 @@ static int copy_cmd(char **argv, int args, int argc) {
             t = plus ? plus + 1 : 0;
         }
     }
-    if (ntok == 0) { puts("Required parameter missing"); return 1; }
+    if (ntok == 0) {
+        copy_report("Required parameter missing\r\n");
+        return 1;
+    }
 
     if (ntok == 1) {
         /* No destination: the current directory, same names. */
@@ -942,8 +1014,42 @@ static int copy_cmd(char **argv, int args, int argc) {
     for (i = 0; i < ntok; i++) {
         rc |= copy_source(toks[i], destdir, destpat, destfile, &copied, &opened);
     }
-    printf("%8d file(s) copied\r\n", copied);
+    copy_report("%8d file(s) copied\r\n", copied);
     return (rc || copied == 0) ? 1 : 0;
+}
+
+/* The shell does not yet redirect handles, but redirection syntax must still
+ * be consumed by the shell rather than handed to a builtin or child as an
+ * ordinary filename.  In particular, Gremlin's installer appends ` >NUL` to
+ * every COPY command.  Treating that token as COPY's destination copied the
+ * source into a literal NUL~1 file, then treated the intended destination as
+ * another source.  A bare operator consumes the following filename; an
+ * attached operator such as >NUL or 2>LOG consumes only its own token. */
+static int strip_redirections(char **argv, int prog_idx, int argc,
+                              int *stdout_nul) {
+    int i = prog_idx + 1;
+    while (i < argc) {
+        char *p = argv[i];
+        int separate;
+        int skip;
+        if (isdigit((unsigned char)*p) && (p[1] == '>' || p[1] == '<')) p++;
+        if (*p != '>' && *p != '<') { i++; continue; }
+        separate = p[1] == 0 || (p[0] == '>' && p[1] == '>' && p[2] == 0);
+        if (*p == '>') {
+            char *target = p + 1;
+            if (*target == '>') target++;
+            if (*target == 0 && i + 1 < argc) target = argv[i + 1];
+            if (stricmp(target, "NUL") == 0) *stdout_nul = 1;
+        }
+        skip = separate && i + 1 < argc ? 2 : 1;
+        while (i + skip < argc) {
+            argv[i] = argv[i + skip];
+            i++;
+        }
+        argc -= skip;
+        i = prog_idx + 1;
+    }
+    return argc;
 }
 
 /* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
@@ -955,10 +1061,14 @@ static int copy_cmd(char **argv, int args, int argc) {
  * trampoline-prefix injection. Returns the command's exit code. */
 static int run_command(char **argv, int prog_idx, int argc, int interactive) {
     const char *name;
-    int args = prog_idx + 1;            /* index of first argument token */
-    int nargs = argc - args;            /* number of argument tokens */
+    int args;
+    int nargs;
+    int stdout_nul = 0;
 
     if (prog_idx >= argc) return 0;
+    argc = strip_redirections(argv, prog_idx, argc, &stdout_nul);
+    args = prog_idx + 1;                /* index of first argument token */
+    nargs = argc - args;                /* number of argument tokens */
     name = argv[prog_idx];
 
     /* Bare "X:" switches the current drive. AH=0Eh reports LASTDRIVE rather
@@ -1017,7 +1127,13 @@ static int run_command(char **argv, int prog_idx, int argc, int interactive) {
         fclose(f);
         return 0;
     }
-    if (stricmp(name, "COPY") == 0) return copy_cmd(argv, args, argc);
+    if (stricmp(name, "COPY") == 0) {
+        int rc;
+        copy_quiet = stdout_nul;
+        rc = copy_cmd(argv, args, argc);
+        copy_quiet = 0;
+        return rc;
+    }
     if (stricmp(name, "LOG") == 0) {
         /* Dump the in-memory kernel log (INT 31h AH=07h, line by line). On real
          * metal this is the only way to read kernel/dbg_println output back --
