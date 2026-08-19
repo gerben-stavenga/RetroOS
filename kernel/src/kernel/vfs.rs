@@ -1724,3 +1724,54 @@ pub fn file_ino_by_handle(handle: i32) -> u64 {
 pub fn file_mode_by_handle(handle: i32) -> u16 {
     VFS.lock().file_mode_by_handle(handle)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DirEntry, Filesystem, Vfs, Vnode, WriteAccess};
+    use alloc::vec::Vec;
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static CREATE_CALLED: AtomicBool = AtomicBool::new(false);
+
+    struct FailingCreateFs;
+    static FAILING_CREATE_FS: FailingCreateFs = FailingCreateFs;
+
+    impl Filesystem for FailingCreateFs {
+        fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
+
+        fn read(&self, _handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 {
+            -5
+        }
+
+        fn readdir(
+            &self,
+            _dir: &[u8],
+            _cookie: u64,
+            _out: &mut Vec<DirEntry>,
+            _max: usize,
+        ) -> Option<u64> {
+            None
+        }
+
+        fn dir_exists(&self, _path: &[u8]) -> bool { false }
+
+        fn create(&self, _path: &[u8]) -> Option<Vnode> {
+            CREATE_CALLED.store(true, Ordering::Relaxed);
+            None
+        }
+
+        fn supports_create(&self) -> bool { true }
+    }
+
+    #[test]
+    fn failed_supported_create_does_not_create_ram_overlay_file() {
+        CREATE_CALLED.store(false, Ordering::Relaxed);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &FAILING_CREATE_FS);
+        vfs.mounts[0].access = WriteAccess::Delegated;
+
+        assert_eq!(vfs.create_to_handle(b"failed.txt"), -13);
+        assert!(CREATE_CALLED.load(Ordering::Relaxed));
+        assert!(!vfs.ram_files.contains_key(b"failed.txt".as_slice()));
+    }
+}

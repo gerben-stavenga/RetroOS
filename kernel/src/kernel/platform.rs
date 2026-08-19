@@ -391,11 +391,19 @@ pub fn probe<A: crate::Arch>(
     boot: &crate::BootConfig,
 ) -> ProbedPlatform {
     let (audio_hw, audio_token) = probe_audio(machine);
-    // A native host backend (hosted "punch-through") means /host is available
-    // without COM1 — take it as hostfs-present and skip the serial probe.
-    // Otherwise fall back to the COM1 transport (metal, or the Python bridge).
-    let hostfs = crate::kernel::fs::hostfs::host_backend_installed()
-        || crate::kernel::fs::hostfs::init();
+    // HostFS is opt-in. The boot parameter selects the UART on metal; hosted
+    // entries use the same feature gate for their injected backend.
+    let hostfs = match boot.hostfs_port {
+        None => false,
+        Some(port) => {
+            crate::kernel::fs::hostfs::configure(port);
+            crate::kernel::fs::hostfs::host_backend_installed()
+                || crate::kernel::fs::hostfs::init()
+                // Keep the selected COM-backed filesystem mounted when its
+                // server is absent; operations retry the handshake on demand.
+                || crate::kernel::fs::hostfs::uart_present()
+        }
+    };
 
     // Metal: ask the hardware. Hosted: the answers are properties of the
     // backend itself — the interp port bus has no VGA device and its zeroed

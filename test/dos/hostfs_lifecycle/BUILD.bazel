@@ -1,0 +1,15 @@
+genrule(
+    name = "hostfs_recover_com",
+    srcs = ["hostfs_recover.asm"],
+    outs = ["HFSRECV.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "hostfs_probe_com",
+    srcs = ["hostfs_probe.asm"],
+    outs = ["HFS_PROBE.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

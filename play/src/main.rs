@@ -137,6 +137,7 @@ fn main() {
         }
         let mut config = kernel::BootConfig::empty();
         config.is_qemu = true; // no real VGA raster: fabricate 0x3DA, like QEMU
+        if host_dir.is_some() { config.set_hostfs_from_cmdline(b"hostfs=com1"); }
         if let Some(c) = &cmd {
             config.set_cmdline(c.as_bytes());
         }

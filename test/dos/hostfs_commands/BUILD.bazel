@@ -1,0 +1,7 @@
+genrule(
+    name = "hostfs_commands_com",
+    srcs = ["hostfs_commands.asm"],
+    outs = ["HFSOPS.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
