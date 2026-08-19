@@ -830,7 +830,7 @@ fn floppy_int13<A: crate::Arch>(machine: &mut A, regs: &mut Regs, ah: u8, dl: u8
         }
         // AH=02h read / AH=03h write / AH=04h verify: CHS against the
         // inserted image (writes go through to the image file).
-        0x02 | 0x03 | 0x04 => match floppy_chs_to_lba(regs, drive) {
+        0x02..=0x04 => match floppy_chs_to_lba(regs, drive) {
             Ok((lba, count)) => {
                 let mut addr = (regs.es as usize) * 16 + (regs.rbx as u16) as usize;
                 let mut sector = [0u8; 512];

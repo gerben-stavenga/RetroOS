@@ -497,11 +497,11 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
-#[allow(clippy::too_many_arguments)]
 fn is_kernel_launch_directive(key: &[u8]) -> bool {
     arch_abi::cmdline::key_eq(key, b"hostfs")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,

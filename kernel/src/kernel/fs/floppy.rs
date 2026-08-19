@@ -22,7 +22,7 @@ use crate::kernel::vfs::{self, BackingFile, DirEntry, Filesystem, Vnode};
 
 pub const DRIVES: usize = 2;
 const SLOT_PREFIXES: [&[u8]; DRIVES] = [b"floppya/", b"floppyb/"];
-const DRIVE_LETTERS: [u8; DRIVES] = [b'A', b'B'];
+const DRIVE_LETTERS: [u8; DRIVES] = *b"AB";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertError {
@@ -236,13 +236,11 @@ struct SlotState {
 }
 
 pub struct FloppySlot {
-    drive: usize,
     state: Mutex<SlotState>,
 }
 
-const fn empty_slot(drive: usize) -> FloppySlot {
+const fn empty_slot() -> FloppySlot {
     FloppySlot {
-        drive,
         state: Mutex::new(SlotState {
             generation: 0,
             media: None,
@@ -256,8 +254,8 @@ const fn empty_slot(drive: usize) -> FloppySlot {
     }
 }
 
-static SLOT_A: FloppySlot = empty_slot(0);
-static SLOT_B: FloppySlot = empty_slot(1);
+static SLOT_A: FloppySlot = empty_slot();
+static SLOT_B: FloppySlot = empty_slot();
 
 fn slot(drive: usize) -> &'static FloppySlot {
     if drive == 0 { &SLOT_A } else { &SLOT_B }
