@@ -20,7 +20,10 @@
 mod arch;
 pub use arch::{Arch, GuestBytes, Vcpu};
 
+pub mod cmdline;
 pub mod monitor;
+pub mod serial;
+pub use serial::ComPort;
 
 /// Number of scalar x86 I/O ports covered by the guest TSS bitmap. Ports at
 /// and above this limit remain denied permanently.
@@ -82,6 +85,7 @@ impl BootModule {
 /// Backend-provided copy operation for a loader-owned physical range.
 pub type BootPhysicalReader = fn(u64, &mut [u8]) -> bool;
 
+
 /// Boot-time platform configuration, read once by the platform entry point and
 /// handed to `startup` — instead of the kernel poking firmware ports itself.
 ///
@@ -128,6 +132,8 @@ pub struct BootConfig {
     /// real install boots through GRUB, whose config its owner controls.
     /// Nothing infers this from the hardware.
     pub ram_overlay: bool,
+    /// Optional HostFS COM port. `None` leaves HostFS disabled.
+    pub hostfs_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
     /// Metal's temporary physical-memory reader. Hosted entries leave this empty.
@@ -142,6 +148,7 @@ impl BootConfig {
             c_root: [0; 128], c_root_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
+            hostfs_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
             boot_physical_reader: None,
         };
@@ -152,8 +159,21 @@ impl BootConfig {
         cfg.c_root_len = d.len();
         cfg
     }
+    /// Enable HostFS when a `hostfs=com1` or `hostfs=com2` directive is
+    /// present in a boot command line. Invalid values leave the current setting
+    /// unchanged so the default remains disabled.
+    pub fn set_hostfs_from_cmdline(&mut self, s: &[u8]) {
+        cmdline::for_each_key_value(s, |key, value| {
+            if !cmdline::key_eq(key, b"hostfs") { return; }
+            if let Some(port) = ComPort::parse_ascii(value) {
+                self.hostfs_port = Some(port);
+            }
+        });
+    }
+
     /// Record the headless command line (semicolon-separated program list).
     pub fn set_cmdline(&mut self, s: &[u8]) {
+        self.set_hostfs_from_cmdline(s);
         let n = s.len().min(self.cmdline.len());
         self.cmdline[..n].copy_from_slice(&s[..n]);
         self.cmdline_len = Some(n);
@@ -181,6 +201,35 @@ impl BootConfig {
     }
     /// The DOS C: root as a VFS prefix (e.g. `home/retroos/`, or `` for root).
     pub fn c_root(&self) -> &[u8] { &self.c_root[..self.c_root_len] }
+}
+
+#[cfg(test)]
+mod boot_config_tests {
+    use super::{BootConfig, ComPort};
+
+    #[test]
+    fn hostfs_directives_are_case_insensitive_and_last_valid_wins() {
+        let mut config = BootConfig::empty();
+        assert_eq!(config.hostfs_port, None);
+        config.set_cmdline(b"TESTS/X.COM;HOSTFS=COM1 hostfs=COM2 hostfs=invalid");
+        assert_eq!(config.hostfs_port, Some(ComPort::Com2));
+    }
+
+    #[test]
+    fn program_entries_and_boot_directives_share_one_parser() {
+        let mut config = BootConfig::empty();
+        config.set_cmdline(b"hostfs=com1;retroos.mount=/data;TESTS/X.COM arg");
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert_eq!(config.cmdline(), Some(&b"hostfs=com1;retroos.mount=/data;TESTS/X.COM arg"[..]));
+    }
+
+    #[test]
+    fn hosted_hostfs_directive_is_preserved_before_program_setup() {
+        let mut config = BootConfig::empty();
+        config.set_hostfs_from_cmdline(b"hostfs=com1");
+        config.set_cmdline(b"TC/TCC.EXE -ms STUB.C");
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+    }
 }
 
 /// Parse an `opt/debug-watch` value (`"addr0[,addr1]"`, hex with optional `0x`)

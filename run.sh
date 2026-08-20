@@ -84,6 +84,11 @@ IMG_SET=0         # whether the user explicitly passed -i/--image (hosted defaul
 START_BIN=""
 HOSTFS_DIR="$HOME"
 HOSTFS_DIR_SET=0
+HOSTFS_TMPDIR=""
+HOSTFS_SOCK=""
+FWCFG_TMPDIR=""
+WORK=""
+QEMU_PID=""
 QEMU_HEADLESS=0
 KVM=0             # --kvm: run on the host CPU via -accel kvm -cpu host (qemu only)
 GPT=0             # --gpt: single GPT disk (ESP+ext4) like a real UEFI machine (qemu/uefi)
@@ -422,21 +427,98 @@ build_qemu_audio_args() {
 }
 
 # Hostfs plumbing shared by the qemu BIOS and UEFI paths: guest COM1 bridged
-# to hostfs.py over a Unix socket (QEMU is the socket server; hostfs.py
-# retries until it appears). Fills HOSTFS_ARGS and, when -h was given, starts
-# the server in the background (HOSTFS_PID). The server self-terminates when
-# QEMU closes the socket, so no cleanup trap is required after exec.
+# to hostfs.py over a Unix socket (QEMU is the socket server). `wait=on`
+# keeps the guest from booting and emitting the RHFS handshake before the
+# Python client has accepted the socket. Fills HOSTFS_ARGS and, when -h was
+# given, starts the server in the background (HOSTFS_PID).
 build_hostfs_args() {
     HOSTFS_ARGS=()
     HOSTFS_PID=""
+    HOSTFS_TMPDIR=""
+    HOSTFS_SOCK=""
     if [ "$HOSTFS_DIR_SET" = 1 ]; then
-        HOSTFS_SOCK="/tmp/retroos-hostfs.sock"
+        # Interactive launches treat an invalid or immediately failing HostFS
+        # server as a fatal startup error rather than letting QEMU wait forever
+        # on its wait=on chardev. A valid server may still wait for QEMU to
+        # create the socket; that connection gate preserves guest ordering.
+        if [ ! -d "$HOSTFS_DIR" ]; then
+            echo "run.sh: HostFS export is not a directory: $HOSTFS_DIR" >&2
+            return 1
+        fi
+        HOSTFS_TMPDIR=$(mktemp -d -t retroos-hostfs.XXXXXX)
+        HOSTFS_SOCK="$HOSTFS_TMPDIR/hostfs.sock"
         HOSTFS_ARGS=(
             -serial chardev:hostfs
-            -chardev "socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=off"
+            -chardev "socket,id=hostfs,path=$HOSTFS_SOCK,server=on,wait=on"
         )
         "$SCRIPT_DIR/hostfs.py" "$HOSTFS_DIR" "$HOSTFS_SOCK" &
         HOSTFS_PID=$!
+        # QEMU waits for the socket peer, so fail before starting it if the
+        # server could not survive its initial validation/startup.
+        sleep 0.1
+        if ! kill -0 "$HOSTFS_PID" 2>/dev/null; then
+            wait "$HOSTFS_PID" 2>/dev/null || true
+            echo "run.sh: HostFS server exited during startup" >&2
+            return 1
+        fi
+    fi
+}
+
+cleanup_qemu_runtime() {
+    local status="${1:-$?}"
+    if [ -n "${QEMU_PID:-}" ]; then
+        kill "$QEMU_PID" 2>/dev/null || true
+        wait "$QEMU_PID" 2>/dev/null || true
+        QEMU_PID=""
+    fi
+    if [ -n "${HOSTFS_PID:-}" ]; then
+        kill "$HOSTFS_PID" 2>/dev/null || true
+        wait "$HOSTFS_PID" 2>/dev/null || true
+    fi
+    [ -n "${HOSTFS_TMPDIR:-}" ] && rm -rf "$HOSTFS_TMPDIR"
+    [ -n "${FWCFG_TMPDIR:-}" ] && rm -rf "$FWCFG_TMPDIR"
+    [ -n "${WORK:-}" ] && rm -rf "$WORK"
+    exit "$status"
+}
+
+# Keep the launcher shell as QEMU's parent so the EXIT trap can stop the
+# persistent HostFS client and remove per-run temporary files.
+run_qemu_with_cleanup() {
+    local status
+    "$@" &
+    QEMU_PID=$!
+    if wait "$QEMU_PID"; then
+        status=0
+    else
+        status=$?
+    fi
+    QEMU_PID=""
+    return "$status"
+}
+
+# Compute the fw_cfg directives shared by qemu BIOS and UEFI paths. The
+# caller supplies a writable command-line file path; QEMU construction remains
+# firmware-specific below. Sets START_DIRECTIVES and never starts HostFS.
+build_start_directives() {
+    local cmdline_path="${1:-}"
+    START_DIRECTIVES=()
+    if [ -n "$START_BIN" ]; then
+        if [ "$HOSTFS_DIR_SET" = 1 ]; then
+            printf 'hostfs=com1;%s' "$START_BIN" > "$cmdline_path"
+        else
+            printf '%s' "$START_BIN" > "$cmdline_path"
+        fi
+        START_DIRECTIVES+=(-fw_cfg "name=opt/cmdline,file=$cmdline_path")
+        local start_cwd
+        if [ "$HOSTFS_DIR_SET" = 1 ]; then
+            start_cwd="H:"
+        else
+            start_cwd="$(dirname "${START_BIN%% *}")"
+            [ "$start_cwd" = "." ] && start_cwd=""
+        fi
+        START_DIRECTIVES+=(-fw_cfg "name=opt/cwd,string=$start_cwd")
+    elif [ "$HOSTFS_DIR_SET" = 1 ]; then
+        START_DIRECTIVES+=(-fw_cfg "name=opt/cmdline,string=hostfs=com1")
     fi
 }
 
@@ -600,6 +682,7 @@ launch_qemu() {
         686)  QEMU=qemu-system-i386;   CPU="" ;;
         x64)  QEMU=qemu-system-x86_64; CPU="" ;;
     esac
+    QEMU="${RETROOS_QEMU_BIN:-$QEMU}"
 
     # --kvm: run on the real host CPU (VT-x/AMD-V) — near-metal semantics for
     # reproducing bugs that TCG's lenient emulation hides. -cpu host wins over
@@ -766,30 +849,14 @@ launch_qemu() {
         # so `run.sh qemu --cmd GAMES/DOOMS/DOOM.EXE` just runs it from the disk.
         [ -z "$START_BIN" ] && [ -n "${HOSTED_CMD:-}" ] && START_BIN="$HOSTED_CMD"
         if [ -n "$START_BIN" ]; then
-            # Write the cmdline to a tempfile and use fw_cfg's file= form. The
-            # string= form word-splits on commas, which collide with TLINK's
-            # arg separator.
+            # fw_cfg's string= form word-splits on commas, so use a file.
             FWCFG_TMPDIR=$(mktemp -d -t retroos-fwcfg.XXXXXX)
-            printf '%s' "$START_BIN" > "$FWCFG_TMPDIR/cmdline"
-            FWCFG_ARGS+=(-fw_cfg "name=opt/cmdline,file=$FWCFG_TMPDIR/cmdline")
-            # cwd: with explicit -h, host/ (resolve against the host workspace);
-            # otherwise the program's OWN directory on the disk, so e.g.
-            # GAMES/DOOMS/DOOM.EXE runs with cwd=GAMES/DOOMS and finds its WAD.
-            if [ "$HOSTFS_DIR_SET" = 1 ]; then
-                FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=host/")
-            else
-                START_CWD="$(dirname "${START_BIN%% *}")"
-                [ "$START_CWD" = "." ] && START_CWD=""
-                FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
-            fi
         fi
+        build_start_directives "${FWCFG_TMPDIR:+$FWCFG_TMPDIR/cmdline}"
+        FWCFG_ARGS+=("${START_DIRECTIVES[@]}")
+        trap 'cleanup_qemu_runtime "$?"' EXIT
         build_hostfs_args
-        if [ -n "$HOSTFS_PID" ]; then
-            trap "kill $HOSTFS_PID 2>/dev/null; [ -n \"$FWCFG_TMPDIR\" ] && rm -rf \"$FWCFG_TMPDIR\"" EXIT
-        elif [ -n "$FWCFG_TMPDIR" ]; then
-            trap "rm -rf $FWCFG_TMPDIR" EXIT
-        fi
-        exec env -i \
+        run_qemu_with_cleanup env -i \
             PATH="/usr/bin:/bin:/usr/local/bin" \
             HOME="$HOME" \
             DISPLAY="${DISPLAY:-}" \
@@ -816,6 +883,7 @@ launch_qemu_uefi() {
     # Image selection is uniform with the BIOS path: -i picks the keyword, the
     # central default rule supplies it when unset. resolve_image maps it to the
     # on-disk file, then we build it if needed (same as the BIOS path).
+    QEMU="${RETROOS_QEMU_BIN:-$QEMU}"
     resolve_image
     IMAGE="bazel-bin/$IMAGE_FILE"
     if [ -n "$BAZEL_TARGET" ]; then
@@ -885,17 +953,13 @@ launch_qemu_uefi() {
     local FWCFG_ARGS=()
     [ -n "$SB_AUDIO" ] && FWCFG_ARGS+=(-fw_cfg "name=opt/audio,string=$SB_AUDIO")
     [ -z "$START_BIN" ] && [ -n "${HOSTED_CMD:-}" ] && START_BIN="$HOSTED_CMD"
-    if [ -n "$START_BIN" ]; then
-        printf '%s' "$START_BIN" > "$WORK/cmdline"
-        FWCFG_ARGS+=(-fw_cfg "name=opt/cmdline,file=$WORK/cmdline")
-        local START_CWD; START_CWD="$(dirname "${START_BIN%% *}")"
-        [ "$START_CWD" = "." ] && START_CWD=""
-        FWCFG_ARGS+=(-fw_cfg "name=opt/cwd,string=$START_CWD")
-    fi
+    build_start_directives "$WORK/cmdline"
+    FWCFG_ARGS+=("${START_DIRECTIVES[@]}")
     # -h hostfs dir: same COM1 bridge as the BIOS path. q35 honors explicit
     # -serial under -nodefaults, so the guest sees an isa-serial at 0x3F8.
+    trap 'cleanup_qemu_runtime "$?"' EXIT
     build_hostfs_args
-    exec qemu-system-x86_64 \
+    run_qemu_with_cleanup "$QEMU" \
         -M q35 -m 512 $ACCEL_CPU \
         -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
         -drive if=pflash,format=raw,file="$WORK/vars.fd" \

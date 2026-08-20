@@ -21,8 +21,12 @@ declare -a failed=()
 have()      { command -v "$1" >/dev/null 2>&1; }
 kvm()       { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }
 qemu_prop() { have qemu-system-i386 && [ -e apps-proprietary ]; }
+bazel_tool() { have bazelisk || have bazel; }
 module_tools() { have bazelisk && have debugfs && have mkfs.ext4; }
 module_qemu() { module_tools && have qemu-system-i386; }
+python3_test() { have python3; }
+qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
+qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
@@ -66,7 +70,15 @@ run dpmi_hx      -         bash test/dpmi_hx.sh
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm
-# --- QEMU + proprietary assets (image_proprietary) -------------------------
+# --- HostFS launcher and protocol tests -------------------------------------
+
+run hostfs_protocol python3_test python3 test/hostfs_protocol.py
+run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
+
+# --- QEMU HostFS integration (requires QEMU and Python) ---------------------
+run qemu_hostfs_lifecycle_com1 qemu_hostfs bash test/qemu_hostfs_lifecycle.sh com1
+run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
+
 run dpmi_smoke   qemu_prop bash test/dpmi_smoke.sh   # qemu + BORLANDC/BCC
 run dark_smoke   qemu_prop bash test/dark_smoke.sh   # qemu + DFORCES
 # --- Real Sound Blaster 16: 86Box is the only faithful one -----------------

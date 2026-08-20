@@ -13,8 +13,6 @@ use crate::kernel::block::{Disk, Volume};
 use crate::kernel::fs::lwext4::{is_ext, Lwext4Fs, MountMode};
 use crate::kernel::{console::Console, vfs};
 
-#[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
-const PREFIX: &[u8] = b"retroos.mount=";
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -49,7 +47,8 @@ struct ParsedMount {
 /// unrelated to RetroOS and must not consume a slot or validate its payload.
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 fn parse_mount(command: &[u8]) -> Option<ParsedMount> {
-    let path = command.strip_prefix(PREFIX)?;
+    let (key, path) = arch_abi::cmdline::parse_key_value(command)?;
+    if !arch_abi::cmdline::key_eq(key, b"retroos.mount") { return None; }
     assert!(!path.is_empty(), "retroos.mount path must be absolute");
     assert_eq!(path[0], b'/', "retroos.mount path must be absolute");
     assert!(!path.contains(&b' '), "retroos.mount accepts one token only");

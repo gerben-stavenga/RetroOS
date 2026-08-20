@@ -24,6 +24,21 @@
 use crate::kernel::vfs;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// Startup sets this before DOS personalities are constructed. Each DfsState
+// snapshots it into owned state, so path operations do not consult mutable
+// process-global state after construction.
+static HOSTFS_DRIVE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable the DOS H: drive to match the VFS HostFS mount.
+pub fn set_hostfs_enabled(enabled: bool) {
+    HOSTFS_DRIVE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn hostfs_enabled() -> bool {
+    HOSTFS_DRIVE_ENABLED.load(Ordering::Relaxed)
+}
 
 pub const DFS_PATH_MAX: usize = 128;
 pub const DFS_CWD_MAX: usize = 64;
@@ -223,11 +238,16 @@ pub struct DfsState {
     cwd: [[u8; DFS_CWD_MAX]; 5],
     cwd_len: [u8; 5],
     current_drive: u8,
+    hostfs_enabled: bool,
 }
 
 impl DfsState {
     pub const fn new() -> Self {
-        Self { cwd: [[0; DFS_CWD_MAX]; 5], cwd_len: [0; 5], current_drive: b'C' }
+        Self::new_with_hostfs(false)
+    }
+
+    pub const fn new_with_hostfs(hostfs_enabled: bool) -> Self {
+        Self { cwd: [[0; DFS_CWD_MAX]; 5], cwd_len: [0; 5], current_drive: b'C', hostfs_enabled }
     }
 
     fn drive_slot(drive: u8) -> Option<usize> {
@@ -247,6 +267,7 @@ impl DfsState {
     }
 
     pub fn get_cwd_for(&self, drive: u8) -> Option<&[u8]> {
+        if !self.drive_available(drive) { return None; }
         let slot = Self::drive_slot(drive)?;
         Some(&self.cwd[slot][..self.cwd_len[slot] as usize])
     }
@@ -257,16 +278,22 @@ impl DfsState {
     }
 
     fn set_cwd_for(&mut self, drive: u8, new_cwd: &[u8]) {
+        if !self.drive_available(drive) { return; }
         let Some(slot) = Self::drive_slot(drive) else { return };
         let n = new_cwd.len().min(DFS_CWD_MAX);
         self.cwd[slot][..n].copy_from_slice(&new_cwd[..n]);
         self.cwd_len[slot] = n as u8;
     }
 
+    fn drive_available(&self, drive: u8) -> bool {
+        let drive = drive.to_ascii_uppercase();
+        Self::drive_slot(drive).is_some() && (drive != b'H' || self.hostfs_enabled)
+    }
+
     /// Select C:, the CD-ROM D: slot, or host filesystem H:.
     pub fn select_drive(&mut self, drive: u8) -> bool {
         let drive = drive.to_ascii_uppercase();
-        if Self::drive_slot(drive).is_none() {
+        if !self.drive_available(drive) {
             return false;
         }
         self.current_drive = drive;
@@ -291,7 +318,9 @@ impl DfsState {
         let mut s = vfs_cwd;
         if s.len() >= 2 && s[1] == b':' && s[0].is_ascii_alphabetic() {
             let drive = s[0].to_ascii_uppercase();
-            if let Some(slot) = Self::drive_slot(drive) {
+            if self.drive_available(drive)
+                && let Some(slot) = Self::drive_slot(drive)
+            {
                 self.current_drive = drive;
                 self.store_cwd_slot(slot, &s[2..]);
                 return;
@@ -338,7 +367,9 @@ impl DfsState {
         } else {
             (self.current_drive, dos_in)
         };
-        if Self::drive_slot(drive).is_none() { return Err(15); }
+        if !self.drive_available(drive) {
+            return Err(15);
+        }
 
         // Emit "X:\"
         if pos + 3 > out.len() { return Err(3); }
@@ -645,7 +676,7 @@ mod tests {
 
     #[test]
     fn drive_h_maps_to_hostfs() {
-        let mut dfs = DfsState::new();
+        let mut dfs = DfsState::new_with_hostfs(true);
         let mut dos = [0u8; DFS_PATH_MAX];
         let mut vfs = [0u8; DFS_PATH_MAX];
         assert!(dfs.select_drive(b'H'));
@@ -653,6 +684,16 @@ mod tests {
         let (prefix_len, rest) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
         assert_eq!(&vfs[..prefix_len], b"host");
         assert_eq!(rest, b"SOURCE\\MAIN.C");
+    }
+
+    #[test]
+    fn disabled_hostfs_hides_h_drive_from_all_path_operations() {
+        let mut dfs = DfsState::new_with_hostfs(false);
+        let mut out = [0u8; DFS_PATH_MAX];
+        assert!(!dfs.select_drive(b'H'));
+        assert_eq!(dfs.resolve(b"H:\\FILE.TXT", &mut out), Err(15));
+        dfs.init_from_vfs(b"H:DIR");
+        assert_eq!(dfs.current_drive_number(), 2);
     }
 
     #[test]

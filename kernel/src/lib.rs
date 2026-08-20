@@ -56,7 +56,7 @@ pub use lib::{print, println, dbg_print, dbg_println, screenln};
 // The backend-agnostic arch contract, re-exported at the crate root: the
 // kernel is written against exactly this surface.
 pub use arch_abi::{
-    Arch, BootConfig, Frame64, GuestBytes, Irq, KernelEvent, Regs, UserMode, Vcpu,
+    Arch, BootConfig, ComPort, Frame64, GuestBytes, Irq, KernelEvent, Regs, UserMode, Vcpu,
     parse_debug_watch, LOW_MEM_BASE, PAGE_SIZE, RawPage,
 };
 

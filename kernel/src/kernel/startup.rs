@@ -102,6 +102,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
 
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
+    crate::kernel::dos::set_hostfs_enabled(platform.hostfs);
 
     // Read every disk's partition table, then decide the mount tree from what
     // they declare. `plan_mounts` is a pure function of those facts.
@@ -110,7 +111,12 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
         .collect();
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
-    mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    let hostfs_is_root = mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    // A root mount must have an established backend/session. Later filesystem
+    // operations retain their normal operation-driven reconnect behavior.
+    if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
+        panic!("hostfs: mounted as root but its server is unavailable");
+    }
     // Permanent empty proxies keep the mount table stable while the OSD
     // inserts/ejects images discovered under DOS's C:\CD and C:\FLOPPY.
     crate::kernel::fs::cdrom::init();
@@ -257,13 +263,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card, sink)
 }
 
-/// The host filesystem (COM1 transport). Mounted at /host beside a disk
-/// root, or AS the root under `Media::HostRoot`.
+/// The host filesystem on the selected serial transport. Mounted at /host
+/// beside a disk root, or as the root when no other root is available.
 static HOSTFS: crate::kernel::fs::hostfs::HostFs = crate::kernel::fs::hostfs::HostFs::new();
 
 /// The host fs to mount: the injected native `std::fs` backend when the entry
-/// installed one (hosted "punch-through" — direct calls, no COM1), else the
-/// COM1 `HOSTFS` client (metal / the Python bridge).
+/// installed one (hosted "punch-through" — direct calls, no serial), else the
+/// selected-port `HOSTFS` client (metal / the Python bridge).
 fn host_fs() -> &'static dyn vfs::Filesystem {
     if crate::kernel::fs::hostfs::host_backend_installed() {
         &crate::kernel::fs::hostfs::INJECTED_HOSTFS
@@ -304,7 +310,7 @@ fn mount_filesystems(
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     modules: crate::multiboot::ModuleMountSummary,
-) {
+) -> bool {
     use crate::kernel::block::partition::PartKind;
 
     // Ask the filesystem, don't trust the table: a partition holds ext when it
@@ -316,6 +322,7 @@ fn mount_filesystems(
         .filter(crate::kernel::fs::lwext4::is_ext)
         .collect();
 
+    let mut hostfs_is_root = false;
     if modules.has_root {
         // A Multiboot root owns `/`; physical filesystems remain available as
         // read-only fallback mounts below `/diskN`.
@@ -323,7 +330,7 @@ fn mount_filesystems(
             &ext, modules.next_ext_slot, MAX_EXT_MOUNTS, screen);
         if hostfs {
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs mounted at /host");
+            crate::screenln!(screen, "hostfs: mounted at /host");
         }
     } else if ext.is_empty() {
         // No module or disk filesystem: the host fs is the root if available.
@@ -331,7 +338,10 @@ fn mount_filesystems(
             vfs::mount(b"", host_fs());
             // Keep the DOS H: mapping stable even when hostfs is also `/`.
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs mounted as root");
+            crate::screenln!(screen, "hostfs: mounted as root");
+            hostfs_is_root = true;
+        } else {
+            panic!("No root filesystem available");
         }
     } else {
         let root = root_index(&ext);
@@ -382,7 +392,7 @@ fn mount_filesystems(
 
         if hostfs {
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs mounted at /host");
+            crate::screenln!(screen, "hostfs: mounted at /host");
         }
     }
 
@@ -391,6 +401,7 @@ fn mount_filesystems(
     mount_kernel_log_fs();
 
     crate::kernel::stacktrace::init_from_vfs();
+    hostfs_is_root
 }
 
 fn mount_kernel_log_fs() {
@@ -486,6 +497,10 @@ fn init_console_pipe() {
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
 /// sequence (shut down after), or the interactive DN loop.
+fn is_kernel_launch_directive(key: &[u8]) -> bool {
+    arch_abi::cmdline::key_eq(key, b"hostfs")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run<A: crate::Arch>(
     machine: &mut A,
@@ -513,16 +528,16 @@ fn run<A: crate::Arch>(
         // own directory.
         let explicit_cwd = boot.cwd().map(trim_ascii);
 
-        for one in raw.split(|&b| b == b';') {
-            let cmdline = trim_ascii(one);
-            if cmdline.is_empty() { continue; }
-            // First token = program path, rest = cmdline tail (PSP:0080h).
-            let split = cmdline.iter().position(|&b| b == b' ').unwrap_or(cmdline.len());
-            let prog = &cmdline[..split];
-            let tail_raw = if split < cmdline.len() { &cmdline[split + 1..] } else { &[][..] };
-            let tail = trim_ascii(tail_raw);
+        for segment in arch_abi::cmdline::segments(raw) {
+            let Some(launch) = arch_abi::cmdline::launch(segment, is_kernel_launch_directive) else { continue; };
+            let path = launch.program();
 
-            let path = prog;
+            // Build the DOS PSP tail from the filtered token stream. The
+            // protocol reserves 126 bytes for the tail; Psp::set_cmdline
+            // applies the same bound when installing it.
+            let mut tail_buf = [0u8; 126];
+            let tail_len = launch.write_arguments(&mut tail_buf);
+            let tail = &tail_buf[..tail_len];
 
             let cwd: &[u8] = match explicit_cwd {
                 Some(c) => c,

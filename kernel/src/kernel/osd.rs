@@ -655,7 +655,7 @@ fn paint_text(
     let fgp = fmt.encode(fg).to_le_bytes();
     let bgp = fmt.encode(bg).to_le_bytes();
     let bytes = fmt.bytes_per_pixel as usize;
-    let (font, rows, row_scale): (&[u8], usize, usize) = if sy % 2 == 0 {
+    let (font, rows, row_scale): (&[u8], usize, usize) = if sy.is_multiple_of(2) {
         (&lib::vga_fonts::FONT_8X16, 16, sy / 2)
     } else {
         (&lib::vga_fonts::FONT_8X8, 8, sy)
@@ -719,7 +719,7 @@ fn paint_scales(
         sy -= 1;
     }
     let screen_cell_h = CELL_H * sy * stretch_y;
-    let natural = if sy % 2 == 0 { screen_cell_h / 2 } else { screen_cell_h };
+    let natural = if sy.is_multiple_of(2) { screen_cell_h / 2 } else { screen_cell_h };
     // The font-natural width, BOUNDED by a width budget: ~60% of the
     // screen for the 30 columns. Without the bound the square 8x8 aspect
     // blows the panel to full width exactly when a big vertical stretch
