@@ -45,6 +45,12 @@ Useful targets:
 - `//kernel:kernel_elf` - kernel ELF
 - `//boot:bootloader_bin` - bootloader binary
 
+Host prerequisites: a C/C++ toolchain, `python3`, and `mkfs.ext4` (e2fsprogs).
+`//:image` additionally builds the hosted interpreter, because `COMMAND.COM`
+and `STUB.EXE` are compiled by running Turbo C inside RetroOS on it — that
+pulls in CMake and a C compiler for Unicorn. `//kernel:kernel_elf` needs none
+of that, so it is the quicker target to check a fresh toolchain against.
+
 ## Run
 
 Everything goes through one launcher, `run.sh`, which picks the backend,
@@ -139,7 +145,7 @@ RetroOS/
 ├── play/           # retroos-play windowed host emulator
 ├── lib/            # Shared freestanding library (VGA render, ELF, TAR, MD5)
 ├── apps/           # Userspace ELF binaries and DOS programs
-├── apps-boot/      # Programs embedded into kernel.elf (DN, COMMAND.COM)
+├── apps-boot/      # DOS system programs shipped to C:\BOOT (DN, COMMAND.COM)
 ├── stdlib/         # core + compiler_builtins from rust-src
 └── toolchain/      # Bazel toolchain definitions
 ```

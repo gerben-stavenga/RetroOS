@@ -30,7 +30,7 @@ thin shims that forward to it.
 
 Build outputs (via Bazel):
 - `bazel-bin/boot/bootloader.bin` - MBR bootloader
-- `bazel-bin/kernel/kernel.elf` - Kernel ELF (self-contained: embeds DN + COMMAND.COM)
+- `bazel-bin/kernel/kernel.elf` - Kernel ELF (multiboot-loadable; DN and COMMAND.COM ship on the ext4 root at `C:\BOOT`, not embedded)
 - `bazel-bin/image.bin` - Final bootable disk image
 - `bazel-bin/image_proprietary.bin` - Local image with proprietary assets when present
 

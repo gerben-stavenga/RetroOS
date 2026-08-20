@@ -43,6 +43,34 @@ def run(cmd):
     subprocess.run(cmd, check=True)
 
 
+# Feature names outside lwext4's supported masks (EXT4_SUPPORTED_FINCOM /
+# _FRO_COM). An unsupported incompat bit makes lwext4 refuse the mount; an
+# unsupported ro_compat bit silently forces read-only. Full rationale in
+# //BUILD.bazel, the ext4_root genrule.
+UNSUPPORTED_FEATURES = (
+    "metadata_csum_seed",
+    "orphan_file",
+    "bigalloc",
+    "quota",
+    "project",
+    "verity",
+    "shared_blocks",
+    "encrypt",
+    "casefold",
+    "inline_data",
+    "largedir",
+)
+
+def feature_opts(img):
+    """`-O ^feature` for each name this mke2fs recognises (dry run, no write)."""
+    opts = []
+    for f in UNSUPPORTED_FEATURES:
+        probe = subprocess.run(["mkfs.ext4", "-n", "-q", "-O", f"^{f}", img],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if probe.returncode == 0:
+            opts += ["-O", f"^{f}"]
+    return opts
+
 def embed_grub(disk, grub_dir, prefix):
     """Write boot.img to sector 0 and a freshly built core.img from sector 1."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -110,7 +138,8 @@ def main():
         ext4 = os.path.join(tmp, "ext4.img")
         with open(ext4, "wb") as f:
             f.truncate(part_sectors * SECTOR)
-        run(["mkfs.ext4", "-q", "-b", "4096", "-L", "RetroOS", "-d", root, ext4])
+        run(["mkfs.ext4", "-q", "-b", "4096", "-L", "RetroOS"]
+            + feature_opts(ext4) + ["-d", root, ext4])
 
         with open(args.out, "wb") as f:
             f.truncate((PART_START + part_sectors) * SECTOR)

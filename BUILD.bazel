@@ -394,7 +394,25 @@ _DISK_CMD = """
         chmod -R g+w "$$EXTRACT_DIR/home/retroos"
     fi
     truncate -s $$(( EXT4_SECTORS * 512 )) "$$EXT4_IMG"
-    mkfs.ext4 -q -b 4096 -L "RetroOS" -d "$$EXTRACT_DIR" "$$EXT4_IMG"
+    # Pin the feature set instead of inheriting whatever this builder's
+    # /etc/mke2fs.conf and e2fsprogs version happen to default to. lwext4
+    # hard-fails the mount on ANY incompat bit it does not implement
+    # (ext4_fs_check_features -> ENOTSUP, surfacing as "ext4 mount failed") and
+    # silently drops to read-only on an unknown ro_compat bit, which turns
+    # every later write into a permission error. Its supported masks are small
+    # and fixed (EXT4_SUPPORTED_FINCOM / _FRO_COM in include/ext4_types.h), so
+    # clear everything outside them rather than tracking distro defaults: the
+    # image's on-disk format should follow what RetroOS can read, not the
+    # packager's config. Each name is cleared only when the local mke2fs knows
+    # it -- older releases reject an unknown ^feature outright, and the -n dry
+    # run is how we ask without writing anything.
+    MKFS_OPTS=""
+    for f in metadata_csum_seed orphan_file bigalloc quota project verity shared_blocks encrypt casefold inline_data largedir; do
+        if mkfs.ext4 -n -q -O "^$$f" "$$EXT4_IMG" >/dev/null 2>&1; then
+            MKFS_OPTS="$$MKFS_OPTS -O ^$$f"
+        fi
+    done
+    mkfs.ext4 -q -b 4096 $$MKFS_OPTS -L "RetroOS" -d "$$EXTRACT_DIR" "$$EXT4_IMG"
     rm -rf "$$EXTRACT_DIR"
     dd if="$$EXT4_IMG" of=$@ bs=512 seek=$$EXT4_START conv=notrunc 2>/dev/null
     rm "$$EXT4_IMG"

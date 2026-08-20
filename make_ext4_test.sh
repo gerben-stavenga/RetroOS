@@ -45,7 +45,16 @@ printf '\xB4\x09\xBA\x0A\x01\xCD\x21\xB8\x00\x4C\xCD\x21Hello from ext4!\x24' > 
 # Create ext4 filesystem image with -d (populate from directory, no root needed)
 EXT4_IMG=$(mktemp)
 dd if=/dev/zero of="$EXT4_IMG" bs=512 count=$EXT4_SECTORS 2>/dev/null
-mkfs.ext4 -q -b 1024 -L "RetroTest" -d "$POPULATE" "$EXT4_IMG"
+# Pin the feature set to what lwext4 can actually mount (full rationale in
+# //BUILD.bazel, the ext4_root genrule). Names the local mke2fs does not know
+# are skipped by the -n dry run.
+MKFS_OPTS=""
+for f in metadata_csum_seed orphan_file bigalloc quota project verity shared_blocks encrypt casefold inline_data largedir; do
+    if mkfs.ext4 -n -q -O "^$f" "$EXT4_IMG" >/dev/null 2>&1; then
+        MKFS_OPTS="$MKFS_OPTS -O ^$f"
+    fi
+done
+mkfs.ext4 -q -b 1024 $MKFS_OPTS -L "RetroTest" -d "$POPULATE" "$EXT4_IMG"
 rm -rf "$POPULATE"
 
 # Write ext4 data into the disk image at the right offset
