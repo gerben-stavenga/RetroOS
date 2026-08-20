@@ -56,6 +56,13 @@ pub fn dispatch<A: crate::Arch>(
                 }
             }
         }
+        thread::Personality::Windows(windows) => {
+            for evt in guest_events {
+                if let crate::Irq::Key(scancode) = evt {
+                    windows.process_key(&kt.fds, scancode);
+                }
+            }
+        }
     }
 }
 
@@ -110,7 +117,7 @@ fn monitor_key<A: crate::Arch>(
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
             thread::Personality::Dos(dos) => Some(&**dos),
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) => None,
+            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => None,
         };
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {

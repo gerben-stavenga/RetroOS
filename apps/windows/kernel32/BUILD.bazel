@@ -1,0 +1,29 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows_dll")
+
+nasm_library(
+    name = "kernel32_obj",
+    srcs = ["kernel32.asm"],
+    copts = ["-fwin32"],
+)
+
+windows_dll(
+    name = "kernel32_dll",
+    obj = ":kernel32_obj",
+    out = "KERNEL32.DLL",
+    module_name = "KERNEL32",
+    exports = [
+        "CloseHandle", "CreateEventA", "CreateFileA", "ExitProcess",
+        "FlushFileBuffers", "GetACP", "GetCPInfo", "GetCommandLineA",
+        "GetCommandLineW", "GetConsoleMode", "GetCurrentThreadId",
+        "GetFileType", "GetLastError", "GetModuleFileNameA",
+        "GetModuleFileNameW", "GetModuleHandleA", "GetOEMCP",
+        "GetProcAddress", "GetStdHandle", "GetVersion", "LoadLibraryA",
+        "MultiByteToWideChar", "ReadConsoleInputA", "ReadFile",
+        "SetConsoleCtrlHandler", "SetConsoleMode", "SetEnvironmentVariableA",
+        "SetFilePointer", "SetStdHandle", "SetUnhandledExceptionFilter",
+        "UnhandledExceptionFilter", "VirtualAlloc", "VirtualFree",
+        "VirtualQuery", "WideCharToMultiByte", "WriteConsoleA", "WriteFile",
+    ],
+    visibility = ["//visibility:public"],
+)

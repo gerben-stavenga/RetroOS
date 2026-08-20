@@ -13,3 +13,8 @@ filegroup(
         "lib386/**",
     ]),
 )
+
+alias(
+    name = "c_runtime",
+    actual = ":os2_c_runtime",
+)

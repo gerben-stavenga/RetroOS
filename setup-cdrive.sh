@@ -15,7 +15,7 @@ echo "Repo:   $REPO"
 echo "C: root: $C"
 
 mkdir -p "$C/GAMES"
-mkdir -p "$C/OS2/DLL" "$C/OS2/APPS"
+mkdir -p "$C/OS2/DLL" "$C/OS2/APPS" "$C/WINDOWS/SYSTEM32" "$C/WINDOWS/APPS"
 
 # Games: one symlink per game directory, shareware + proprietary, merged into
 # C:\GAMES (the */ glob skips loose files like BUILD.bazel).
@@ -44,6 +44,17 @@ cp -f "$REPO/bazel-bin/apps/os2/viocalls/VIOCALLS.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/apps/os2/nls/NLS.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/test/os2/hello/hello_lx.exe" "$C/OS2/APPS/HELLO.EXE"
 cp -f "$REPO/bazel-bin/test/os2/watcom_io/watcom_io.exe" "$C/OS2/APPS/WATCIO.EXE"
+
+# Native Win32 replacement DLLs and console acceptance programs.
+bazelisk build \
+    //apps/windows/kernel32:kernel32_dll \
+    //apps/windows/user32:user32_dll \
+    //test/windows/hello:hello \
+    //test/windows/watcom_io:watcom_io
+cp -f "$REPO/bazel-bin/apps/windows/kernel32/KERNEL32.DLL" "$C/WINDOWS/SYSTEM32/"
+cp -f "$REPO/bazel-bin/apps/windows/user32/USER32.DLL" "$C/WINDOWS/SYSTEM32/"
+cp -f "$REPO/bazel-bin/test/windows/hello/hello.exe" "$C/WINDOWS/APPS/HELLO.EXE"
+cp -f "$REPO/bazel-bin/test/windows/watcom_io/watcom_io.exe" "$C/WINDOWS/APPS/WATCIO.EXE"
 
 # C:\ULTRASND — the GUS instrument patches ULTRADIR (below) points at. The
 # disk image gets these from //:ultrasnd_tar; this drive needs them too, or

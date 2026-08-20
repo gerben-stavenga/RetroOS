@@ -675,6 +675,7 @@ fn run_program<A: crate::Arch>(
     let tid = match exec::detect_format(&buf, path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, path),
+        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, path),
         _ => dos::run_init_program(machine, dos_template, threads, buf, args, cmdline_tail, cwd, env),
     };
 
@@ -733,6 +734,24 @@ fn launch_os2<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None)
         .unwrap_or_else(|e| panic!("OS/2 LX exec failed ({}): errno {}",
+            core::str::from_utf8(path).unwrap_or("?"), e));
+    tid
+}
+
+/// Launch a native 32-bit Windows PE image as a fresh process.
+fn launch_windows<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: alloc::vec::Vec<u8>, path: &[u8]) -> usize {
+    let cpipe = thread::console_pipe();
+    let tid = {
+        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+            .expect("create Windows thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    crate::kernel::kpipe::add_reader(cpipe);
+    crate::kernel::windows::exec_pe_into(machine, threads, tid, buf, path, b"", None)
+        .unwrap_or_else(|e| panic!("Windows PE exec failed ({}): errno {}",
             core::str::from_utf8(path).unwrap_or("?"), e));
     tid
 }
@@ -953,7 +972,7 @@ fn dispatch<A: crate::Arch>(
         // an OSD kill as DOS critical termination.
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x0200,
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) => -9,
+            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => -9,
         };
         return thread::KernelAction::Exit(code);
     }
@@ -972,7 +991,7 @@ fn dispatch<A: crate::Arch>(
             regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15);
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x020E, // type 02h, vector 0Eh (#PF)
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) => -11,
+            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => -11,
         };
         thread::signal_thread(thread, addr as usize);
         return thread::KernelAction::Exit(code);
@@ -1023,7 +1042,7 @@ fn switch_focus_and_run<A: crate::Arch>(
             *sb_handoff = card;
         }
         let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
-        if crate::kernel::osd::is_open() || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_)) {
+        if crate::kernel::osd::is_open() || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_)) {
             *display = Some(handoff.into_surface(machine, bios_workspace));
             new.personality.repaint_osd();
         } else {
@@ -1054,7 +1073,7 @@ fn switch_focus_and_run<A: crate::Arch>(
             }
             Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
                 if crate::kernel::osd::is_open()
-                    || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_))
+                    || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
                 {
                     *display = Some(handoff.into_surface(machine, bios_workspace));
                 } else {
@@ -1089,7 +1108,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     match transfer {
         Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
             if crate::kernel::osd::is_open()
-                || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_))
+                || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
             {
                 *display = Some(handoff.into_surface(machine, bios_workspace));
                 new.personality.repaint_osd();
@@ -1184,6 +1203,13 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             parent_cwd_len = cwd.len();
             parent_env_snapshot = None;
         }
+        thread::Personality::Windows(windows) => {
+            parent_is_dos = false;
+            let cwd = windows.cwd_str();
+            parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
+            parent_cwd_len = cwd.len();
+            parent_env_snapshot = None;
+        }
     }
 
     // `path` is in the launcher's namespace. For a DOS launcher it's a DOS path
@@ -1204,7 +1230,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let format = exec::detect_format(&buf, path);
     crate::dbg_println!("handle_fork_exec: {:?} size={} format={} free_pages={}",
         core::str::from_utf8(path), buf.len(),
-        match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::Lx => "lx", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
+        match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::Lx => "lx", exec::BinaryFormat::Pe => "pe", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
         machine.free_page_count());
 
     // Release while the parent's address space is live. The returned token is
@@ -1227,7 +1253,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     let exec_vga = match format {
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx => exec::ExecVga::None,
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => exec::ExecVga::None,
         _ if parent_is_dos => {
             let parent = thread::get_thread(threads, parent_tid).unwrap();
             let thread::Personality::Dos(parent) = &mut parent.personality else {
@@ -1251,7 +1277,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                 if let Some(display) = fork_display {
                     let parent = thread::get_thread(threads, parent_tid).unwrap();
                     if crate::kernel::osd::is_open()
-                        || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_))
+                        || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
                     {
                         *event_display = Some(display.into_surface(machine, bios_workspace));
                     } else {
@@ -1276,7 +1302,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     // ELF needs user pages freed before loading; DOS handles its own address space
-    if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx) {
+    if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe) {
         crate::dbg_println!("  fork done, loading protected-mode image...");
         machine.free_user_pages();
     }
@@ -1314,7 +1340,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         parent.personality.on_resume(machine);
         if let Some(display) = fork_display {
             if crate::kernel::osd::is_open()
-                || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_))
+                || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
             {
                 *event_display = Some(display.into_surface(machine, bios_workspace));
             } else {
@@ -1333,7 +1359,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     if let Some(display) = fork_display {
         let child = thread::get_thread(threads, child_tid).unwrap();
         if crate::kernel::osd::is_open()
-            || matches!(child.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_))
+            || matches!(child.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
         {
             *event_display = Some(display.into_surface(machine, bios_workspace));
         } else {
@@ -1363,6 +1389,16 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let n = parent_cwd_len.min(os2.cwd.len());
             os2.cwd[..n].copy_from_slice(&parent_cwd_buf[..n]);
             os2.cwd_len = n;
+            let cpipe = thread::console_pipe();
+            child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+            child.kernel.fds[1] = thread::FdKind::ConsoleOut;
+            child.kernel.fds[2] = thread::FdKind::ConsoleOut;
+            crate::kernel::kpipe::add_reader(cpipe);
+        }
+        thread::Personality::Windows(windows) => {
+            let n = parent_cwd_len.min(windows.cwd.len());
+            windows.cwd[..n].copy_from_slice(&parent_cwd_buf[..n]);
+            windows.cwd_len = n;
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
             child.kernel.fds[1] = thread::FdKind::ConsoleOut;

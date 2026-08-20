@@ -11,6 +11,7 @@ use crate::Regs;
 pub use crate::kernel::dos::DosState;
 pub use crate::kernel::linux::LinuxState;
 pub use crate::kernel::os2::Os2State;
+pub use crate::kernel::windows::WindowsState;
 
 /// Maximum number of threads
 pub const MAX_THREADS: usize = 1024;
@@ -157,6 +158,7 @@ pub enum PersonalityName {
     Dos,
     Linux,
     Os2,
+    Windows,
 }
 
 #[allow(clippy::large_enum_variant)] // see the note on Linux below
@@ -172,6 +174,8 @@ pub enum Personality<A: crate::Arch> {
     Linux(LinuxState),
     /// Native 32-bit OS/2 LX userspace.
     Os2(Os2State),
+    /// Native 32-bit Windows PE userspace.
+    Windows(WindowsState),
 }
 
 impl<A: crate::Arch> Personality<A> {
@@ -191,7 +195,7 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::display::DisplayHandoff::Surface(display));
                 None
             }
-            Self::Linux(_) | Self::Os2(_) => {
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {
                 crate::kernel::linux::repaint_console();
                 Some(display)
             }
@@ -199,7 +203,7 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     pub fn uses_compositor(&self) -> bool {
-        matches!(self, Self::Linux(_) | Self::Os2(_))
+        matches!(self, Self::Linux(_) | Self::Os2(_) | Self::Windows(_))
             || matches!(self, Self::Dos(d) if !d.pc.vga.is_fullscreen())
     }
 
@@ -234,7 +238,7 @@ impl<A: crate::Arch> Personality<A> {
     ) -> Option<crate::kernel::drivers::sb16::SbCard> {
         match self {
             Self::Dos(d) => d.pc.sb.release_card(machine),
-            Self::Linux(_) | Self::Os2(_) => None,
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
         }
     }
 
@@ -247,12 +251,12 @@ impl<A: crate::Arch> Personality<A> {
     ) -> crate::kernel::display::DisplayHandoff {
         match self {
             Self::Dos(d) => d.release_display(machine, bios_workspace),
-            Self::Linux(_) | Self::Os2(_) => panic!("composited display is owned by the event loop"),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => panic!("composited display is owned by the event loop"),
         }
     }
 
     pub fn repaint_osd(&mut self) {
-        if matches!(self, Self::Linux(_) | Self::Os2(_)) {
+        if matches!(self, Self::Linux(_) | Self::Os2(_) | Self::Windows(_)) {
             crate::kernel::linux::repaint_console();
         }
     }
@@ -269,7 +273,7 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         match self {
             Self::Dos(d) => d.acquire_display_restore(machine, bios_workspace, display),
-            Self::Linux(_) | Self::Os2(_) => panic!("composited personality cannot acquire a fullscreen display"),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => panic!("composited personality cannot acquire a fullscreen display"),
         }
     }
 
@@ -284,7 +288,7 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         match self {
             Self::Dos(d) => d.acquire_display_replace(machine, display),
-            Self::Linux(_) | Self::Os2(_) => panic!("composited personality cannot acquire a fullscreen display"),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => panic!("composited personality cannot acquire a fullscreen display"),
         }
     }
 
@@ -296,6 +300,7 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(d) => d.on_resume(machine),
             Self::Linux(l) => l.on_resume(machine),
             Self::Os2(o) => o.on_resume(machine),
+            Self::Windows(w) => w.on_resume(machine),
         }
     }
 
@@ -334,7 +339,7 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::dos::pump_fullscreen(machine, bios, dos, regs, now_ns);
                 }
             }
-            Self::Linux(_) | Self::Os2(_) => {}
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {}
         }
         if prof {
             crate::kernel::startup::bill_slice2(
@@ -351,7 +356,7 @@ impl<A: crate::Arch> Personality<A> {
     ) {
         match self {
             Self::Dos(dos) => crate::kernel::dos::audio_tick(machine, dos, now_ns, span),
-            Self::Linux(_) | Self::Os2(_) => {}
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {}
         }
     }
 
@@ -370,7 +375,7 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(dos) => {
                 crate::kernel::dos::render(machine, bios, dos, regs, now_ns, display);
             }
-            Self::Linux(_) | Self::Os2(_) => crate::kernel::linux::render(machine, bios, display),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => crate::kernel::linux::render(machine, bios, display),
         }
         if prof {
             crate::kernel::startup::bill_slice2(
@@ -391,6 +396,7 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(dos) => crate::kernel::dos::handle_event(machine, bios_display, kt, dos, regs, kevent),
             Self::Linux(linux) => crate::kernel::linux::handle_event(machine, kt, linux, regs, kevent),
             Self::Os2(os2) => crate::kernel::os2::handle_event(machine, kt, os2, regs, kevent),
+            Self::Windows(windows) => crate::kernel::windows::handle_event(machine, kt, windows, regs, kevent),
         }
     }
 
@@ -431,7 +437,7 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::linux::complete_pending_io(machine, kt, linux, regs);
                 }
             }
-            Self::Os2(_) => {}
+            Self::Os2(_) | Self::Windows(_) => {}
         }
     }
 }
@@ -916,7 +922,7 @@ pub fn exit_thread<A: crate::Arch>(
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(
                 machine, &mut thread.kernel.vcpu, !return_dos_vga),
-            Personality::Linux(_) | Personality::Os2(_) => {}
+            Personality::Linux(_) | Personality::Os2(_) | Personality::Windows(_) => {}
         }
         thread.kernel.close_all_fds();
         thread.kernel.symbols = None;
@@ -944,6 +950,9 @@ pub fn exit_thread<A: crate::Arch>(
                     linux.wait_exit_code = exit_code;
                 }
                 Personality::Os2(_) => {
+                    parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
+                }
+                Personality::Windows(_) => {
                     parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
                 }
             }

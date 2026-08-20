@@ -54,3 +54,4 @@ pub mod fs;
 pub mod dos;
 pub mod linux;
 pub mod os2;
+pub mod windows;

@@ -2,7 +2,8 @@
 
 RetroOS is an experimental x86 operating system written mostly in Rust and built
 with Bazel. It has a small ring-0 `arch` layer, a ring-1 kernel event loop, and
-user execution support for 32-bit ELF, 64-bit ELF, native 32-bit OS/2 LX, and VM86/DOS programs
+user execution support for 32-bit ELF, 64-bit ELF, native 32-bit OS/2 LX,
+native Win32 PE console programs, and VM86/DOS programs
 (including DPMI — it runs Quake, Commander Keen, Borland C++ self-builds, and
 other real DOS software).
 
@@ -91,7 +92,8 @@ For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOT
 - `arch-interp` - the hosted backend: the same interface implemented over a
   software x86 core (Unicorn), running guest code interpreted in a host process
 - `kernel` - ring-1 policy code: scheduler, syscalls, VFS, ELF loading,
-  VM86/DOS/DPMI runtime, OS/2 LX personality, emulated VGA, sound, platform/focus/io-policy
+  VM86/DOS/DPMI runtime, OS/2 LX and Win32 PE personalities, emulated VGA,
+  sound, platform/focus/io-policy
 - `apps` - user programs and DOS test binaries
 - `play` - `retroos-play`, the windowed host emulator built on `arch-interp`
 

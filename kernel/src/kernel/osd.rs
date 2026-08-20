@@ -402,6 +402,7 @@ pub fn refresh_processes<A: crate::Arch>(threads: &[thread::Thread<A>], focused:
         let name: &[u8] = match &threads[i].personality {
             thread::Personality::Linux(l) => thread::basename(l.exec_path_str()),
             thread::Personality::Os2(o) => thread::basename(o.exec_path_str()),
+            thread::Personality::Windows(w) => thread::basename(w.exec_path_str()),
             thread::Personality::Dos(_) => {
                 let c = k.comm_str();
                 if c.is_empty() { b"DOS" } else { c }

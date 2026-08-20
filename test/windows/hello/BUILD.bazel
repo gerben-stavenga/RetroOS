@@ -1,0 +1,7 @@
+load("//toolchain:windows_watcom.bzl", "windows_watcom_binary")
+
+windows_watcom_binary(
+    name = "hello",
+    src = "hello.c",
+    visibility = ["//visibility:public"],
+)

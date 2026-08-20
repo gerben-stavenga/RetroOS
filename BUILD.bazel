@@ -179,6 +179,10 @@ _EXTRA_FILES = {
     "//apps/os2/nls:nls_dll":           "OS2/DLL/NLS.DLL",
     "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
     "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
+    "//apps/windows/kernel32:kernel32_dll": "WINDOWS/SYSTEM32/KERNEL32.DLL",
+    "//apps/windows/user32:user32_dll":     "WINDOWS/SYSTEM32/USER32.DLL",
+    "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
+    "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
     # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).

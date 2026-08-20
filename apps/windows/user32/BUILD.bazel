@@ -1,0 +1,17 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows_dll")
+
+nasm_library(
+    name = "user32_obj",
+    srcs = ["user32.asm"],
+    copts = ["-fwin32"],
+)
+
+windows_dll(
+    name = "user32_dll",
+    obj = ":user32_obj",
+    out = "USER32.DLL",
+    module_name = "USER32",
+    exports = ["CharUpperA"],
+    visibility = ["//visibility:public"],
+)

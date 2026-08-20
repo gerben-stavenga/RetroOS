@@ -76,7 +76,7 @@ pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> a
             }
         }
         // Linux: no ports. The deny-all baseline stands.
-        Personality::Linux(_) | Personality::Os2(_) => {}
+        Personality::Linux(_) | Personality::Os2(_) | Personality::Windows(_) => {}
     }
     policy
 }
