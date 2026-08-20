@@ -1214,6 +1214,16 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         .map(|n| out[..n].to_vec())
 }
 
+/// Map an absolute DOS path to its VFS form while permitting the final path
+/// component not to exist yet. File-creation APIs use this variant; parent
+/// directories must still resolve normally.
+pub fn dos_abs_to_vfs_create(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    dfs::DfsState::to_vfs_create(dos_abs, &mut out)
+        .ok()
+        .map(|n| out[..n].to_vec())
+}
+
 /// Snapshot a DOS env block (variable strings up to and including the
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs

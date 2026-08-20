@@ -1,0 +1,12 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(name = "kbdcalls_obj", srcs = ["kbdcalls.asm"], copts = ["-fobj"])
+os2_dll(
+    name = "kbdcalls_dll",
+    obj = ":kbdcalls_obj",
+    out = "KBDCALLS.DLL",
+    module_name = "KBDCALLS",
+    exports = ["KbdCharIn.4"],
+    visibility = ["//visibility:public"],
+)

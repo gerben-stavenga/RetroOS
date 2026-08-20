@@ -171,6 +171,14 @@ _EXTRA_FILES = {
     "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",
     "//test/dos/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
+    # DOS and OS/2 share C:. The OS/2 personality changes the executable/API
+    # environment, not the filesystem namespace.
+    "//apps/os2/doscalls:doscalls_dll": "OS2/DLL/DOSCALLS.DLL",
+    "//apps/os2/kbdcalls:kbdcalls_dll": "OS2/DLL/KBDCALLS.DLL",
+    "//apps/os2/viocalls:viocalls_dll":   "OS2/DLL/VIOCALLS.DLL",
+    "//apps/os2/nls:nls_dll":           "OS2/DLL/NLS.DLL",
+    "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
+    "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
     # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).

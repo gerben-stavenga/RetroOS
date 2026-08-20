@@ -1,0 +1,44 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "doscalls_obj",
+    srcs = ["doscalls.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "doscalls_dll",
+    obj = ":doscalls_obj",
+    out = "DOSCALLS.DLL",
+    module_name = "DOSCALLS",
+    exports = [
+        "DosQueryHType.224",
+        "DosExit.234",
+        "DosResetBuffer.254",
+        "DosSetFilePtr.256",
+        "DosClose.257",
+        "DosOpen.273",
+        "DosRead.281",
+        "DosWrite.282",
+        "DosQueryCp.291",
+        "DosAllocMem.299",
+        "DosFreeMem.304",
+        "DosQueryModuleHandle.319",
+        "DosQueryProcAddr.321",
+        "DosQuerySysInfo.348",
+        "DosSetRelMaxFH.382",
+        "DosFlatToSel.425",
+        "DosSelToFlat.426",
+        "DosOpenL.981",
+        "DosSetFileLocksL.986",
+        "DosSetFilePtrL.988",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "doscalls_sources",
+    srcs = ["doscalls.asm"],
+    visibility = ["//visibility:public"],
+)

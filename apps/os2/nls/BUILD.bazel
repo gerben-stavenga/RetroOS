@@ -1,0 +1,12 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(name = "nls_obj", srcs = ["nls.asm"], copts = ["-fobj"])
+os2_dll(
+    name = "nls_dll",
+    obj = ":nls_obj",
+    out = "NLS.DLL",
+    module_name = "NLS",
+    exports = ["DosQueryDBCSEnv.6"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,12 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(name = "viocalls_obj", srcs = ["viocalls.asm"], copts = ["-fobj"])
+os2_dll(
+    name = "viocalls_dll",
+    obj = ":viocalls_obj",
+    out = "VIOCALLS.DLL",
+    module_name = "VIOCALLS",
+    exports = ["VioGetConfig.19"],
+    visibility = ["//visibility:public"],
+)

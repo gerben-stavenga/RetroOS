@@ -49,6 +49,13 @@ pub fn dispatch<A: crate::Arch>(
         thread::Personality::Linux(linux) => {
             dispatch_linux(machine, regs, kt, linux, guest_events)
         }
+        thread::Personality::Os2(os2) => {
+            for evt in guest_events {
+                if let crate::Irq::Key(scancode) = evt {
+                    os2.process_key(&kt.fds, scancode);
+                }
+            }
+        }
     }
 }
 
@@ -103,7 +110,7 @@ fn monitor_key<A: crate::Arch>(
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
             thread::Personality::Dos(dos) => Some(&**dos),
-            thread::Personality::Linux(_) => None,
+            thread::Personality::Linux(_) | thread::Personality::Os2(_) => None,
         };
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {

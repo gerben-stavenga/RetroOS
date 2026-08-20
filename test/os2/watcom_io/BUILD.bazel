@@ -1,0 +1,7 @@
+load("//toolchain:os2_watcom.bzl", "os2_watcom_binary")
+
+os2_watcom_binary(
+    name = "watcom_io",
+    src = "watcom_io.c",
+    visibility = ["//visibility:public"],
+)

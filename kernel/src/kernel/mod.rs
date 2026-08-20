@@ -53,3 +53,4 @@ pub mod fs;
 // ── Personalities ───────────────────────────────────────────────────────
 pub mod dos;
 pub mod linux;
+pub mod os2;

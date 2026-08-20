@@ -30,6 +30,15 @@ register_toolchains("@rust_toolchains//:all")
 # Download rustc toolchain
 http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
 
+# Linux-hosted Open Watcom cross-tools. The official snapshot is intended for
+# automated installation; these tools emit native 32-bit OS/2 LX binaries.
+http_archive(
+    name = "open_watcom",
+    urls = ["https://github.com/open-watcom/open-watcom-v2/releases/download/2026-07-13-Build/ow-snapshot.tar.xz"],
+    sha256 = "35e9c56ca93234ba0b8b596387815399317ea0548aeac1318f0674dca3921314",
+    build_file = "//toolchain:open_watcom.BUILD",
+)
+
 http_archive(
     name = "rust_toolchain_x86_64_linux",
     url = "https://static.rust-lang.org/dist/2026-05-19/rust-nightly-x86_64-unknown-linux-gnu.tar.xz",

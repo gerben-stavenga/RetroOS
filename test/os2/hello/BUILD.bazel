@@ -1,0 +1,13 @@
+load("//toolchain:os2_watcom.bzl", "os2_watcom_binary")
+
+os2_watcom_binary(
+    name = "hello_lx",
+    src = "hello.c",
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
+    name = "hello_sources",
+    srcs = ["hello.c"],
+    visibility = ["//visibility:public"],
+)

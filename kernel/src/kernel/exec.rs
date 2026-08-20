@@ -45,6 +45,7 @@ pub fn load_file_resolved(path: &[u8]) -> Result<Vec<u8>, i32> {
 /// Binary format detected from magic bytes and file extension.
 pub enum BinaryFormat {
     Elf,
+    Lx,
     MzExe,
     Com,
 }
@@ -54,6 +55,9 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
     if data.len() >= 4 && data[0..4] == [0x7F, b'E', b'L', b'F'] {
         return BinaryFormat::Elf;
     }
+    if is_lx(data) {
+        return BinaryFormat::Lx;
+    }
     if data.len() >= 2 && data[0] == b'M' && data[1] == b'Z' {
         return BinaryFormat::MzExe;
     }
@@ -61,6 +65,13 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
         return BinaryFormat::MzExe;
     }
     BinaryFormat::Com
+}
+
+fn is_lx(data: &[u8]) -> bool {
+    if data.get(0..2) == Some(b"LX") { return true; }
+    if data.get(0..2) != Some(b"MZ") || data.len() < 0x40 { return false; }
+    let at = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    data.get(at..at.saturating_add(2)) == Some(b"LX")
 }
 
 fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
@@ -104,6 +115,11 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
             crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)
         }
         BinaryFormat::Elf => Err(-8),
+        BinaryFormat::Lx if matches!(exec_vga, ExecVga::None) => {
+            crate::kernel::os2::exec_lx_into(
+                machine, threads, tid, data, path, &parent_cwd, personality_name)
+        }
+        BinaryFormat::Lx => Err(-8),
         fmt => {
             let ExecVga::Dos(vga) = exec_vga else { return Err(-8) };
             let is_exe = matches!(fmt, BinaryFormat::MzExe);
