@@ -3,7 +3,7 @@
  * Invoked one-shot as `COMMAND.COM /C cmdline` (or `COMMAND.COM cmdline`).
  * Reads its arguments through ANSI `int main(int argc, char *argv[])` (the
  * Borland C startup parses the PSP tail into argv); then either:
- *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/PAUSE/TRACE/EXIT),
+ *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/COPY/PAUSE/TRACE/EXIT),
  *   - interprets a .BAT file line by line,
  *   - or fork+execs an external program and waits for it.
  *
@@ -16,6 +16,7 @@
  *   AH=05h SYNTH_REAP        BX=pid -> recycle an exited child.
  *   AH=06h VGA_NEEDS_MODE3   -> AL=0 standard text / AL=1 normalize.
  *   AH=02/03h TRACE_ON/OFF
+ *   AH=0Ah LOG_BYTE          AL=byte (kernel log only, never VGA)
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in
  * dispatch all live here.
@@ -27,10 +28,14 @@
 #include <dos.h>
 #include <dir.h>
 #include <conio.h>
+#include <fcntl.h>
+#include <io.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
+#include <alloc.h>
 
 /* Keep this shell small. A .COM is handed a whole 64 KB segment, and the
  * tiny-model startup honours these to SETBLOCK it back down (measured: the
@@ -670,8 +675,385 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
  * argv[1..argc-1] are the arguments). Mirrors the int main() convention,
  * keeps tokenisation in a single place (the BAT-line / cmdline parser). */
 
+/* ----- COPY -----
+ *
+ * COPY is internal to COMMAND.COM on real DOS -- there is no COPY.EXE -- so a
+ * missing built-in surfaces as "Bad command or file name", which is how an
+ * installer shelling out to COPY fails. The forms installers actually emit:
+ *
+ *   COPY SRC DEST          file -> file
+ *   COPY SRC DIR           file -> directory (keeps the name)
+ *   COPY A:\*.* C:\GAME    wildcard fan-out into a directory
+ *   COPY A:\*.* C:\GAME\*.*  same, with the redundant pattern spelled out
+ *   COPY A:\SUBDIR C:\DST  a bare directory source means SUBDIR\*.*
+ *   COPY A+B+C DEST        concatenation (also `COPY A + B DEST`)
+ *   COPY SRC               into the current directory
+ *
+ * /A /B /V /Y /-Y are accepted and ignored: there is no ASCII/binary split
+ * here (every copy is a byte-for-byte binary copy), no verify pass, and an
+ * existing destination is always overwritten. */
+
+/* Keep only a one-sector fallback resident: BSS in this shell is memory a
+ * batch line's in-process EXEC cannot use (see _stklen above).  During COPY,
+ * borrow a separate 16 KiB DOS block from the far heap.  Large installer
+ * resources otherwise cross the INT 21h/emulator boundary twice per 512-byte
+ * sector, turning a 20 MiB install into roughly 80,000 syscalls. */
+#define COPY_BUF_SIZE 16384U
+static char copy_fallback_buf[512];
+static int copy_quiet = 0;       /* COPY ... >NUL: keep installer UIs intact */
+
+/* Normal COPY output goes through DOS stdout, whose console path also mirrors
+ * it into the kernel log.  For >NUL keep only that second half via the
+ * LOG_BYTE synth call, so diagnostics remain in retroos.log without painting
+ * over the caller's VGA text UI. */
+static void copy_report(const char *fmt, ...) {
+    char msg[128];
+    char *p;
+    va_list ap;
+    va_start(ap, fmt);
+    vsprintf(msg, fmt, ap);
+    va_end(ap);
+    if (!copy_quiet) {
+        fputs(msg, stdout);
+        return;
+    }
+    for (p = msg; *p; p++) {
+        r.h.ah = 0x0A;
+        r.h.al = (unsigned char)*p;
+        int86(0x31, &r, &r);
+    }
+}
+
+static int copy_read(int fd, void far *buf, unsigned count) {
+    r.h.ah = 0x3F;
+    r.x.bx = (unsigned)fd;
+    r.x.cx = count;
+    r.x.dx = FP_OFF(buf);
+    s.ds = FP_SEG(buf);
+    int86x(0x21, &r, &r, &s);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+static int copy_write(int fd, const void far *buf, unsigned count) {
+    r.h.ah = 0x40;
+    r.x.bx = (unsigned)fd;
+    r.x.cx = count;
+    r.x.dx = FP_OFF(buf);
+    s.ds = FP_SEG(buf);
+    int86x(0x21, &r, &r, &s);
+    return r.x.cflag ? -1 : (int)r.x.ax;
+}
+
+/* INT 21h AX=4300h -- attribute word, or 0 when the path does not exist. */
+static int dos_file_attr(const char *path, unsigned *attr) {
+    const char far *fpath = path;
+    r.x.ax = 0x4300;
+    r.x.dx = FP_OFF(fpath);
+    s.ds   = FP_SEG(fpath);
+    s.es   = FP_SEG(fpath);
+    int86x(0x21, &r, &r, &s);
+    if (r.x.cflag) return 0;
+    *attr = r.x.cx;
+    return 1;
+}
+
+/* Directory part of `path` including its trailing separator; "" if none. */
+static void copy_dir_prefix(const char *path, char *out) {
+    const char *base = basename_of(path);
+    size_t n = (size_t)(base - path);
+    if (n > MAXPATH - 1) n = MAXPATH - 1;
+    memcpy(out, path, n);
+    out[n] = 0;
+}
+
+static void copy_join(char *out, const char *dir, const char *name) {
+    size_t dlen = strlen(dir);
+    if (dlen > MAXPATH - 1) dlen = MAXPATH - 1;
+    memcpy(out, dir, dlen);
+    out[dlen] = 0;
+    strncat(out, name, MAXPATH - 1 - dlen);
+}
+
+/* Is the destination a place to put files rather than a name to give them? */
+static int copy_dest_is_dir(const char *dest) {
+    unsigned attr;
+    size_t n = strlen(dest);
+    if (n == 0) return 1;
+    if (strchr("\\/:", dest[n - 1])) return 1;      /* "C:\DIR\", "C:", "\" */
+    if (strcmp(dest, ".") == 0 || strcmp(dest, "..") == 0) return 1;
+    if (strpbrk(dest, "*?")) return 0;              /* a renaming pattern */
+    return dos_file_attr(dest, &attr) && (attr & FA_DIREC);
+}
+
+/* Destination directory as a prefix, i.e. carrying its trailing separator.
+ * "." collapses to an empty prefix so `COPY F .` builds the same path as F
+ * itself and is caught as a copy-onto-itself instead of truncating it. */
+static void copy_dest_dir(char *out, const char *dest) {
+    size_t n = strlen(dest);
+    if (n == 0 || strcmp(dest, ".") == 0) { out[0] = 0; return; }
+    if (n > MAXPATH - 2) n = MAXPATH - 2;
+    memcpy(out, dest, n);
+    out[n] = 0;
+    if (!strchr("\\/:", out[n - 1])) { out[n] = '\\'; out[n + 1] = 0; }
+}
+
+/* Split a DOS name into its 8-char stem and 3-char extension. */
+static void copy_split_name(const char *s, char *base, char *ext) {
+    const char *dot = strchr(s, '.');
+    size_t n;
+    if (dot) {
+        n = (size_t)(dot - s);
+        if (n > 8) n = 8;
+        memcpy(base, s, n);
+        base[n] = 0;
+        strncpy(ext, dot + 1, 3);
+        ext[3] = 0;
+    } else {
+        strncpy(base, s, 8);
+        base[8] = 0;
+        ext[0] = 0;
+    }
+}
+
+/* Map one field (stem or extension) of `src` through wildcard `pat`: '*' takes
+ * the rest of the source field, '?' takes one source character, anything else
+ * is a literal that consumes a source character. */
+static void copy_map_field(const char *pat, const char *src, char *out, int max) {
+    int pi = 0, si = 0, oi = 0;
+    while (pat[pi] && oi < max) {
+        if (pat[pi] == '*') {
+            while (src[si] && oi < max) out[oi++] = src[si++];
+            break;
+        }
+        if (pat[pi] == '?') {
+            if (src[si]) out[oi++] = src[si++];
+        } else {
+            out[oi++] = pat[pi];
+            if (src[si]) si++;
+        }
+        pi++;
+    }
+    out[oi] = 0;
+}
+
+/* Destination name for source `name` under destination pattern `pattern`:
+ * "*.*" leaves it alone, "*.BAK" keeps the stem, "NEW.*" keeps the extension. */
+static void copy_map_name(const char *pattern, const char *name, char *out) {
+    char pbase[13], pext[5], sbase[13], sext[5], obase[13], oext[5];
+    copy_split_name(pattern, pbase, pext);
+    copy_split_name(name, sbase, sext);
+    /* A pattern with no dot ("DIR\*") means "any extension", as DOS reads it;
+     * taking the empty field literally would silently drop extensions. */
+    if (!strchr(pattern, '.')) strcpy(pext, "*");
+    copy_map_field(pbase, sbase, obase, 8);
+    copy_map_field(pext, sext, oext, 3);
+    if (oext[0]) sprintf(out, "%s.%s", obase, oext);
+    else strcpy(out, obase);
+}
+
+/* Textual same-file test. Both sides are made absolute first so `COPY F .`
+ * and `COPY C:\DIR\F F` from C:\DIR are recognised before the destination is
+ * created -- creating it truncates, so this check must precede it. */
+static int copy_same_file(const char *a, const char *b) {
+    char pa[MAXPATH], pb[MAXPATH];
+    if (!make_abs_path(a, pa)) copy_path(pa, a);
+    if (!make_abs_path(b, pb)) copy_path(pb, b);
+    return stricmp(pa, pb) == 0;
+}
+
+/* Byte-for-byte copy of one file. `append` seeks an existing destination to
+ * its end instead of truncating -- that is how several sources accumulate
+ * into a single named destination. Returns 1 on success. */
+static int copy_file(const char *src, const char *dst, int append) {
+    int in, out, n;
+    unsigned buflen = COPY_BUF_SIZE;
+    void far *buf = farmalloc((unsigned long)COPY_BUF_SIZE);
+    int far_buf = buf != 0;
+    if (!buf) {
+        buf = copy_fallback_buf;
+        buflen = sizeof(copy_fallback_buf);
+    }
+    in = open(src, O_RDONLY | O_BINARY);
+    if (in < 0) {
+        if (far_buf) farfree(buf);
+        copy_report("Cannot open %s\r\n", src);
+        return 0;
+    }
+    out = -1;
+    if (append) {
+        out = open(dst, O_WRONLY | O_BINARY);
+        if (out >= 0 && lseek(out, 0L, SEEK_END) < 0L) { close(out); out = -1; }
+    }
+    if (out < 0) out = _creat(dst, 0);
+    if (out < 0) {
+        close(in);
+        if (far_buf) farfree(buf);
+        copy_report("Cannot create %s\r\n", dst);
+        return 0;
+    }
+    while ((n = copy_read(in, buf, buflen)) > 0) {
+        if (copy_write(out, buf, (unsigned)n) != n) {
+            close(in);
+            close(out);
+            if (far_buf) farfree(buf);
+            copy_report("Insufficient disk space\r\n");
+            return 0;
+        }
+    }
+    close(in);
+    close(out);
+    if (far_buf) farfree(buf);
+    if (n < 0) { copy_report("Read error - %s\r\n", src); return 0; }
+    return 1;
+}
+
+/* Copy everything matching one source spec. `destpat` non-NULL means "into
+ * destdir, naming files through this pattern"; NULL means "the single file
+ * destfile", in which case sources after the first append to it. */
+static int copy_source(const char *src, const char *destdir, const char *destpat,
+                       const char *destfile, int *copied, int *opened) {
+    struct ffblk ff;
+    char spec[MAXPATH];
+    char srcdir[MAXPATH];
+    char from[MAXPATH];
+    char to[MAXPATH];
+    unsigned attr;
+    int wild, done, rc = 0;
+
+    copy_path(spec, src);
+    /* A bare directory source means every file in it, as DOS expands it. */
+    if (!strpbrk(spec, "*?") && dos_file_attr(spec, &attr) && (attr & FA_DIREC)) {
+        size_t n = strlen(spec);
+        if (n + 5 >= MAXPATH) {
+            copy_report("Invalid path - %s\r\n", src);
+            return 1;
+        }
+        if (n > 0 && !strchr("\\/:", spec[n - 1])) spec[n++] = '\\';
+        strcpy(spec + n, "*.*");
+    }
+    wild = strpbrk(spec, "*?") != 0;
+    copy_dir_prefix(spec, srcdir);
+
+    done = findfirst(spec, &ff, 0);
+    if (done != 0) {
+        copy_report("File not found - %s\r\n", src);
+        return 1;
+    }
+    for (; done == 0; done = findnext(&ff)) {
+        if (ff.ff_attrib & FA_DIREC) continue;
+        copy_join(from, srcdir, ff.ff_name);
+        if (destpat) {
+            char name[13];
+            copy_map_name(destpat, ff.ff_name, name);
+            copy_join(to, destdir, name);
+        } else {
+            copy_path(to, destfile);
+        }
+        if (copy_same_file(from, to)) {
+            copy_report("File cannot be copied onto itself - %s\r\n", from);
+            rc = 1;
+            continue;
+        }
+        /* DOS lists the sources of a multi-file copy as it walks them. */
+        if (wild) copy_report("%s\r\n", ff.ff_name);
+        if (!copy_file(from, to, destpat == 0 && *opened)) { rc = 1; continue; }
+        if (destpat == 0) *opened = 1;
+        (*copied)++;
+    }
+    return rc;
+}
+
+static int copy_cmd(char **argv, int args, int argc) {
+    char *toks[MAX_ARGV];
+    char destdir[MAXPATH];
+    const char *destpat;
+    const char *destfile;
+    int ntok = 0, i, copied = 0, opened = 0, rc = 0;
+
+    /* Drop switches, then split any attached "A+B+C" chain into its members.
+     * A standalone "+" (from `COPY A + B DEST`) falls out as an empty token. */
+    for (i = args; i < argc; i++) {
+        char *t = argv[i];
+        if (t[0] == '/') continue;
+        if (t[0] == '-' && (t[1] == 'Y' || t[1] == 'y') && t[2] == 0) continue;
+        while (t != 0 && ntok < MAX_ARGV) {
+            char *plus = strchr(t, '+');
+            if (plus) *plus = 0;
+            if (*t) toks[ntok++] = t;
+            t = plus ? plus + 1 : 0;
+        }
+    }
+    if (ntok == 0) {
+        copy_report("Required parameter missing\r\n");
+        return 1;
+    }
+
+    if (ntok == 1) {
+        /* No destination: the current directory, same names. */
+        destdir[0] = 0;
+        destpat = "*.*";
+        destfile = 0;
+    } else {
+        const char *dest = toks[--ntok];
+        const char *base = basename_of(dest);
+        if (copy_dest_is_dir(dest)) {
+            copy_dest_dir(destdir, dest);
+            destpat = "*.*";
+            destfile = 0;
+        } else if (strpbrk(base, "*?")) {
+            copy_dir_prefix(dest, destdir);
+            destpat = base;
+            destfile = 0;
+        } else {
+            destdir[0] = 0;
+            destpat = 0;
+            destfile = dest;
+        }
+    }
+
+    for (i = 0; i < ntok; i++) {
+        rc |= copy_source(toks[i], destdir, destpat, destfile, &copied, &opened);
+    }
+    copy_report("%8d file(s) copied\r\n", copied);
+    return (rc || copied == 0) ? 1 : 0;
+}
+
+/* The shell does not yet redirect handles, but redirection syntax must still
+ * be consumed by the shell rather than handed to a builtin or child as an
+ * ordinary filename.  In particular, Gremlin's installer appends ` >NUL` to
+ * every COPY command.  Treating that token as COPY's destination copied the
+ * source into a literal NUL~1 file, then treated the intended destination as
+ * another source.  A bare operator consumes the following filename; an
+ * attached operator such as >NUL or 2>LOG consumes only its own token. */
+static int strip_redirections(char **argv, int prog_idx, int argc,
+                              int *stdout_nul) {
+    int i = prog_idx + 1;
+    while (i < argc) {
+        char *p = argv[i];
+        int separate;
+        int skip;
+        if (isdigit((unsigned char)*p) && (p[1] == '>' || p[1] == '<')) p++;
+        if (*p != '>' && *p != '<') { i++; continue; }
+        separate = p[1] == 0 || (p[0] == '>' && p[1] == '>' && p[2] == 0);
+        if (*p == '>') {
+            char *target = p + 1;
+            if (*target == '>') target++;
+            if (*target == 0 && i + 1 < argc) target = argv[i + 1];
+            if (stricmp(target, "NUL") == 0) *stdout_nul = 1;
+        }
+        skip = separate && i + 1 < argc ? 2 : 1;
+        while (i + skip < argc) {
+            argv[i] = argv[i + skip];
+            i++;
+        }
+        argc -= skip;
+        i = prog_idx + 1;
+    }
+    return argc;
+}
+
 /* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
- * Built-ins (drive switch "X:", REM/ECHO/CD/CLS/TYPE/LOG/PAUSE/TRACE/EXIT/
+ * Built-ins (drive switch "X:", REM/ECHO/CD/CLS/TYPE/COPY/LOG/PAUSE/TRACE/EXIT/
  * SHUTDOWN) are matched first and handled inline; if none match,
  * dispatch_external takes over at the tail.
  * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
@@ -679,10 +1061,14 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
  * trampoline-prefix injection. Returns the command's exit code. */
 static int run_command(char **argv, int prog_idx, int argc, int interactive) {
     const char *name;
-    int args = prog_idx + 1;            /* index of first argument token */
-    int nargs = argc - args;            /* number of argument tokens */
+    int args;
+    int nargs;
+    int stdout_nul = 0;
 
     if (prog_idx >= argc) return 0;
+    argc = strip_redirections(argv, prog_idx, argc, &stdout_nul);
+    args = prog_idx + 1;                /* index of first argument token */
+    nargs = argc - args;                /* number of argument tokens */
     name = argv[prog_idx];
 
     /* Bare "X:" switches the current drive. AH=0Eh reports LASTDRIVE rather
@@ -740,6 +1126,13 @@ static int run_command(char **argv, int prog_idx, int argc, int interactive) {
         }
         fclose(f);
         return 0;
+    }
+    if (stricmp(name, "COPY") == 0) {
+        int rc;
+        copy_quiet = stdout_nul;
+        rc = copy_cmd(argv, args, argc);
+        copy_quiet = 0;
+        return rc;
     }
     if (stricmp(name, "LOG") == 0) {
         /* Dump the in-memory kernel log (INT 31h AH=07h, line by line). On real

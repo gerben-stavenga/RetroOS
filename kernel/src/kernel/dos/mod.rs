@@ -186,16 +186,17 @@ pub struct DosState<A: crate::Arch> {
     /// reflect-to-RM behaviour for INT 21 hooks installed in the IVT.
     pub pm_dos: bool,
 
-    /// Pending in-kernel "block-and-retry" callback. Set by syscall handlers
-    /// that can't complete synchronously (e.g. AH=08 with no keystroke
-    /// ready). While set, the user's CS:IP is parked at `SLOT_RESUME` —
-    /// every event-loop iteration re-traps and re-invokes the closure.
+    /// LIFO stack of suspended DOS continuations. A syscall that cannot finish
+    /// synchronously moves its original return frame here with its callback,
+    /// then returns its active interrupt frame normally to `SLOT_RESUME`.
+    /// Nested IRQs therefore see a balanced guest stack and may suspend in the
+    /// same way; while nonempty, the active continuation waits at the stub.
     /// The closure returns `Some(next)` to stay parked with a new model,
-    /// or `None` to signal completion (SLOT_RESUME then unwinds via the
-    /// standard soft-INT iret-frame pop). The return-based contract makes
+    /// or `None` to signal completion (SLOT_RESUME then enters the stored
+    /// return computation). The return-based contract makes
     /// the "still waiting vs done" decision explicit at every call site
-    /// instead of leaning on a side-channel into `dos.pending_resume`.
-    pub pending_resume: Option<ResumeCallback<A>>,
+    /// instead of leaning on unrelated process state.
+    pub suspended_calls: alloc::vec::Vec<SuspendedCall<A>>,
 }
 
 /// The boxed retry closure inside a [`ResumeCallback`].
@@ -206,9 +207,25 @@ type ResumeFn<A> = dyn FnOnce(
     &mut Regs,
 ) -> Option<ResumeCallback<A>>;
 
-/// Block-and-retry closure for `dos.pending_resume`. Wrapped in a newtype
+/// Block-and-retry closure stored in a [`SuspendedCall`]. Wrapped in a newtype
 /// so the FnOnce can return another `ResumeCallback` (recursive type).
 pub struct ResumeCallback<A: crate::Arch>(pub alloc::boxed::Box<ResumeFn<A>>);
+
+/// The guest computation following a suspended interrupt. The original frame
+/// has already returned to the mode-appropriate `SLOT_RESUME`; completion
+/// restores this target directly instead of reaching into the guest stack.
+#[derive(Clone, Copy)]
+pub enum DosReturnFrame {
+    Vm86 { ip: u16, cs: u16, flags: u16 },
+    Protected { eip: u32, cs: u16, eflags: u32 },
+}
+
+/// One delimited DOS continuation: delayed work plus the computation to enter
+/// when that work completes. Nested suspensions naturally form a LIFO stack.
+pub struct SuspendedCall<A: crate::Arch> {
+    pub callback: ResumeCallback<A>,
+    pub return_frame: DosReturnFrame,
+}
 
 #[derive(Clone, Copy)]
 pub struct DosMemBlock {
@@ -268,7 +285,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_rm_vector_shadow), 0, 1);
             core::ptr::addr_of_mut!((*p).dpmi).write(None);
             core::ptr::addr_of_mut!((*p).pm_dos).write(false);
-            core::ptr::addr_of_mut!((*p).pending_resume).write(None);
+            core::ptr::addr_of_mut!((*p).suspended_calls).write(alloc::vec::Vec::new());
             state.assume_init()
         }
     }
@@ -630,7 +647,26 @@ pub fn handle_event<A: crate::Arch>(
         // thread on the very first idle cycle, defeating task switching. The Phase 1
         // drain re-runs raise_pending each iteration, so any pending IRQ
         // gets injected on the next round.
-        KE::Hlt => thread::KernelAction::Done,
+        KE::Hlt => {
+            let resume_ip = if is_vm86 {
+                dos::ctrl_slot_off(dos::SLOT_RESUME) as u32 + 1
+            } else {
+                dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME) as u32 + 1
+            };
+            let resume_cs = if is_vm86 {
+                dos::CTRL_STUB_SEG
+            } else {
+                mode_transitions::SPECIAL_STUB_SEL
+            };
+            let at_resume_hlt = !dos.suspended_calls.is_empty()
+                && regs.code_seg() == resume_cs
+                && regs.ip32() == resume_ip;
+            if at_resume_hlt {
+                dos::poll_suspended_call(machine, kt, dos, regs)
+            } else {
+                thread::KernelAction::Done
+            }
+        }
         KE::SoftInt(n) => {
             if n == 0x31 {
                 // Kernel syscall — `syscall` branches on mode + CS to reach

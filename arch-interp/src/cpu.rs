@@ -175,6 +175,38 @@ fn build() -> Unicorn<'static, Ctx> {
         // #PF (14/8) is excluded above (the paging backend's). PM faults bubble.
         let _ = is_int;
         let in_vm86 = uc.reg_read(RegisterX86::EFLAGS).unwrap_or(0) & VM_FLAG != 0;
+        if vector == 0 && in_vm86 {
+            // VM86 exceptions normally stay inside the arch backend: reflect
+            // straight through IVT[0] so a real-mode runtime's own handler can
+            // print its diagnostic.  Record #DE before that reflection or the
+            // kernel never gets to see the faulting DIV/IDIV and operands.
+            let cs = uc.reg_read(RegisterX86::CS).unwrap_or(0) as u16;
+            let ip = uc.reg_read(RegisterX86::EIP).unwrap_or(0) as u16;
+            let lin = (u32::from(cs) << 4).wrapping_add(u32::from(ip));
+            let ss = uc.reg_read(RegisterX86::SS).unwrap_or(0) as u16;
+            let sp = uc.reg_read(RegisterX86::ESP).unwrap_or(0) as u16;
+            let stack_lin = (u32::from(ss) << 4).wrapping_add(u32::from(sp));
+            let mut code = [0u8; 12];
+            let mut stack = [0u16; 12];
+            let mem = crate::vcpu::mem();
+            for (i, byte) in code.iter_mut().enumerate() {
+                *byte = mem.read::<u8>(lin.wrapping_add(i as u32) as usize);
+            }
+            for (i, word) in stack.iter_mut().enumerate() {
+                *word = mem.read::<u16>(stack_lin.wrapping_add((i * 2) as u32) as usize);
+            }
+            eprintln!("[VM86 #DE] {cs:04X}:{ip:04X} linear={lin:05X} SS:SP={ss:04X}:{sp:04X} bytes={code:02x?}");
+            eprintln!("[VM86 #DE] EAX={:08X} EDX={:08X} EBX={:08X} ECX={:08X} ESI={:08X} EDI={:08X} EBP={:08X} ESP={:08X}",
+                uc.reg_read(RegisterX86::EAX).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::EDX).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::EBX).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::ECX).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::ESI).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::EDI).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::EBP).unwrap_or(0) as u32,
+                uc.reg_read(RegisterX86::ESP).unwrap_or(0) as u32);
+            eprintln!("[VM86 #DE] stack={stack:04x?}");
+        }
         if vector != 3 && vector != 4 && vector != 13
             && in_vm86
             && !crate::desc::int_intercepted(vector)
