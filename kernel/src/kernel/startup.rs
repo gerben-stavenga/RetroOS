@@ -13,6 +13,8 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
+    crate::println!("{}", crate::build_info::VersionBanner);
+
     // Discover every disk. The block layer reports what exists; nothing below
     // this line picks a boot disk or decides where anything mounts.
     let disks = crate::kernel::block::probe(machine);

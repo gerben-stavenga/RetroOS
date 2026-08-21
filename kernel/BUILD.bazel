@@ -3,6 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:host_transition.bzl", "host_platform_test")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
+load(":build_info.bzl", "retroos_build_info")
 
 # Bare-metal (os:none) vs host build selector. The one kernel library and the
 # metal ELF binary use this to pick platform-specific deps / linker flags.
@@ -27,6 +28,11 @@ genrule(
     cmd = "cp $< $@",
 )
 
+retroos_build_info(
+    name = "build_info_generated",
+    stamp = 1,
+)
+
 # THE kernel: ONE backend-agnostic rust_library (rlib), linked by every entry
 # binary below. The source gates its metal-only glue (boot.rs, fbcon, the
 # `arch_metal` backend) with `#[cfg(target_arch = "x86")]`, so the same crate
@@ -38,6 +44,10 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     crate_name = "kernel",
     edition = "2024",
+    compile_data = [":build_info_generated"],
+    rustc_env = {
+        "RETROOS_BUILD_INFO_RS": "$(location :build_info_generated)",
+    },
     visibility = ["//visibility:public"],
     rustc_flags = [
         "-Cpanic=abort",
