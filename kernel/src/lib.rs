@@ -36,6 +36,7 @@ pub mod fbcon;
 
 // The kernel tree. Public: the entry crates compose from it (startup,
 // event_loop, thread creation, the Linux ELF loader, kpipe, ...).
+pub mod build_info;
 pub mod kernel;
 
 mod multiboot;

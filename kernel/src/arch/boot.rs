@@ -375,6 +375,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     screen.clear();
 
     lib::screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
+    lib::screenln!(screen, "{}", crate::build_info::VersionBanner);
     if let Some(location) = info.location() {
         lib::screenln!(screen, "at {}:{}", location.file(), location.line());
     } else {
