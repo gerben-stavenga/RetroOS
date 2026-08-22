@@ -5,7 +5,10 @@
 
 use crate::checksum::Checksum;
 use crate::ondisk::{self, le16, le32};
-use crate::{Corrupt, Error, Ext4, Inode, InodeMetadataUpdate, Storage, Timestamp, Unsupported};
+use crate::{
+    Corrupt, DirectoryEntry, Error, Ext4, Inode, InodeMetadataUpdate, Storage, Timestamp,
+    Unsupported,
+};
 use alloc::vec::Vec;
 
 pub(crate) struct DirtyBlock {
@@ -158,12 +161,7 @@ impl<'a> InodeEditor<'a> {
     }
 
     fn finish(self) {
-        update_inode_checksum(
-            self.checksum_seed,
-            self.number,
-            self.generation,
-            self.raw,
-        );
+        update_inode_checksum(self.checksum_seed, self.number, self.generation, self.raw);
     }
 }
 
@@ -230,9 +228,7 @@ impl MetadataMutation {
     }
 
     fn get_mut(&mut self, number: u64) -> Result<&mut [u8], Corrupt> {
-        let index = self
-            .index(number)
-            .map_err(|_| Corrupt::InvalidDirectory)?;
+        let index = self.index(number).map_err(|_| Corrupt::InvalidDirectory)?;
         Ok(&mut self.blocks[index].bytes)
     }
 
@@ -339,18 +335,13 @@ impl DirectoryTree {
                 return Err(Corrupt::InvalidDirectory.into());
             }
             let bytes = transaction.read_owned_block(physical)?;
-            let kind = transaction.filesystem.directory_block_kind(
-                inode,
-                logical,
-                bytes.len(),
-                &bytes,
-            );
-            transaction.filesystem.verify_directory_checksum(
-                inode,
-                kind,
-                bytes.len(),
-                &bytes,
-            )?;
+            let kind =
+                transaction
+                    .filesystem
+                    .directory_block_kind(inode, logical, bytes.len(), &bytes);
+            transaction
+                .filesystem
+                .verify_directory_checksum(inode, kind, bytes.len(), &bytes)?;
             nodes.push(DirectoryNode {
                 logical,
                 kind,
@@ -551,7 +542,14 @@ impl<'a> DirectoryEditor<'a> {
     }
 
     fn insert<E>(&mut self, number: u32, name: &[u8], kind: u8) -> Result<(), Error<E>> {
-        insert_directory_entry(self.checksum_seed, self.inode, self.bytes, number, name, kind)
+        insert_directory_entry(
+            self.checksum_seed,
+            self.inode,
+            self.bytes,
+            number,
+            name,
+            kind,
+        )
     }
 
     fn remove<E>(&mut self, number: u32, name: &[u8]) -> Result<(), Error<E>> {
@@ -638,9 +636,7 @@ impl FileGrowth<'_> {
             Self::Write { offset, data } => Ok((
                 *offset,
                 offset
-                    .checked_add(
-                        u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?,
-                    )
+                    .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
                     .ok_or(Corrupt::AddressOverflow)?,
             )),
             Self::ZeroFill { new_size } => Ok((old_size, *new_size)),
@@ -654,14 +650,14 @@ impl FileGrowth<'_> {
         write_start: u64,
         write_end: u64,
     ) -> Result<(), Error<E>> {
-        let within = usize::try_from(write_start - block_start)
-            .map_err(|_| Corrupt::AddressOverflow)?;
+        let within =
+            usize::try_from(write_start - block_start).map_err(|_| Corrupt::AddressOverflow)?;
         let amount =
             usize::try_from(write_end - write_start).map_err(|_| Corrupt::AddressOverflow)?;
         match self {
             Self::Write { offset, data } => {
-                let source = usize::try_from(write_start - offset)
-                    .map_err(|_| Corrupt::AddressOverflow)?;
+                let source =
+                    usize::try_from(write_start - offset).map_err(|_| Corrupt::AddressOverflow)?;
                 block[within..within + amount].copy_from_slice(&data[source..source + amount]);
             }
             Self::ZeroFill { .. } => block[within..within + amount].fill(0),
@@ -722,9 +718,7 @@ impl FileEditor {
             core::cmp::Ordering::Greater => transaction
                 .extend_file(&self.inode, FileGrowth::ZeroFill { new_size })
                 .map(|_| ()),
-            core::cmp::Ordering::Less => transaction
-                .shrink_file(&self.inode, new_size)
-                .map(|_| ()),
+            core::cmp::Ordering::Less => transaction.shrink_file(&self.inode, new_size).map(|_| ()),
         }
     }
 }
@@ -762,7 +756,7 @@ enum ReleaseKind {
 /// writes cannot fail from allocation. Reads and modifications can still fail
 /// when loading an unchanged block from storage.
 pub struct Transaction<'a, S> {
-    filesystem: &'a mut Ext4<S>,
+    pub(crate) filesystem: &'a mut Ext4<S>,
     dirty: Vec<DirtyBlock>,
     available: Vec<Vec<u8>>,
 }
@@ -845,9 +839,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
     ///
     /// This is the layout-free primitive beneath policy-shaped APIs such as
     /// [`Self::chmod`], [`Self::chown`], and [`Self::set_times`].
-    pub fn set_metadata(
+    pub fn update_metadata(
         &mut self,
-        path: &str,
+        inode: &Inode,
         update: InodeMetadataUpdate,
     ) -> Result<(), Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 2;
@@ -858,7 +852,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if update == InodeMetadataUpdate::default() {
             return Ok(());
         }
-        let inode = self.filesystem.resolve(path)?;
+        let inode = self.filesystem.refresh(inode)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
         let mut metadata = MetadataMutation::new();
@@ -868,9 +862,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Change permission and special bits while preserving the inode type.
-    pub fn chmod(&mut self, path: &str, permissions: u16) -> Result<(), Error<S::Error>> {
-        self.set_metadata(
-            path,
+    pub fn chmod_inode(&mut self, inode: &Inode, permissions: u16) -> Result<(), Error<S::Error>> {
+        self.update_metadata(
+            inode,
             InodeMetadataUpdate {
                 permissions: Some(permissions),
                 ..InodeMetadataUpdate::default()
@@ -879,14 +873,14 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Change either owner ID; `None` preserves that field.
-    pub fn chown(
+    pub fn chown_inode(
         &mut self,
-        path: &str,
+        inode: &Inode,
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<(), Error<S::Error>> {
-        self.set_metadata(
-            path,
+        self.update_metadata(
+            inode,
             InodeMetadataUpdate {
                 uid,
                 gid,
@@ -896,15 +890,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Set any subset of access, modification, and status-change timestamps.
-    pub fn set_times(
+    pub fn set_inode_times(
         &mut self,
-        path: &str,
+        inode: &Inode,
         accessed: Option<Timestamp>,
         modified: Option<Timestamp>,
         changed: Option<Timestamp>,
     ) -> Result<(), Error<S::Error>> {
-        self.set_metadata(
-            path,
+        self.update_metadata(
+            inode,
             InodeMetadataUpdate {
                 accessed,
                 modified,
@@ -918,16 +912,16 @@ impl<'a, S: Storage> Transaction<'a, S> {
     ///
     /// Sparse gaps are deliberately a separate `resize` concern: `offset` may
     /// equal EOF but may not skip beyond it.
-    pub fn write_at(
+    pub fn write_inode(
         &mut self,
-        path: &str,
+        inode: &Inode,
         offset: u64,
         data: &[u8],
     ) -> Result<(), Error<S::Error>> {
         if !self.dirty.is_empty() {
             return Err(Error::ReservationExhausted);
         }
-        let file = FileEditor::new(self.filesystem.resolve(path)?)?;
+        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
         file.write_at(self, offset, data).map(|_| ())
     }
 
@@ -937,21 +931,23 @@ impl<'a, S: Storage> Transaction<'a, S> {
     /// this operation deliberately refuses either rather than partially
     /// writing. The unchanged superblock is included because JBD2 activation
     /// and cleanup manage its recovery flag.
-    pub fn overwrite(
+    pub fn overwrite_inode_range(
         &mut self,
-        path: &str,
+        inode: &Inode,
         offset: u64,
         data: &[u8],
     ) -> Result<(), Error<S::Error>> {
         if data.is_empty() {
             return Ok(());
         }
-        let inode = self.filesystem.resolve(path)?;
+        let inode = self.filesystem.refresh(inode)?;
         offset
             .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .filter(|end| *end <= inode.size)
             .ok_or(Unsupported::ExtentMutation)?;
-        FileEditor::new(inode)?.write_at(self, offset, data).map(|_| ())
+        FileEditor::new(inode)?
+            .write_at(self, offset, data)
+            .map(|_| ())
     }
 
     fn overwrite_inode(
@@ -1023,12 +1019,12 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Compatibility wrapper for writing one zero-filled block to an empty file.
-    pub fn append_zeroed_block(&mut self, path: &str) -> Result<u64, Error<S::Error>> {
+    pub fn append_zeroed_inode_block(&mut self, inode: &Inode) -> Result<u64, Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 5;
         if self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
-        let file = FileEditor::new(self.filesystem.resolve(path)?)?;
+        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
         if file.inode.size != 0 || file.inode.blocks_512 != 0 {
             return Err(Unsupported::ExtentMutation.into());
         }
@@ -1039,8 +1035,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Fill an empty extent-formatted file with an arbitrary multi-block value.
-    pub fn initialize_file(&mut self, path: &str, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.resolve(path)?)?;
+    pub fn initialize_inode(&mut self, inode: &Inode, data: &[u8]) -> Result<(), Error<S::Error>> {
+        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
         if file.inode.size != 0 || file.inode.blocks_512 != 0 {
             return Err(Unsupported::ExtentMutation.into());
         }
@@ -1048,8 +1044,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Append bytes using the general file editor.
-    pub fn append(&mut self, path: &str, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.resolve(path)?)?;
+    pub fn append_inode(&mut self, inode: &Inode, data: &[u8]) -> Result<(), Error<S::Error>> {
+        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
         file.write_at(self, file.inode.size, data).map(|_| ())
     }
 
@@ -1090,9 +1086,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Unsupported::ExtentMutation.into());
         }
         let expected_sectors = old_blocks
-            .checked_add(
-                u64::try_from(existing_nodes.len()).map_err(|_| Corrupt::AddressOverflow)?,
-            )
+            .checked_add(u64::try_from(existing_nodes.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .ok_or(Corrupt::AddressOverflow)?
             .checked_mul(block_size / 512)
             .ok_or(Corrupt::AddressOverflow)?;
@@ -1171,8 +1165,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
         let mut payloads = Vec::new();
         let first_touched = offset / block_size;
-        let touched_blocks = usize::try_from(new_blocks - first_touched)
-            .map_err(|_| Corrupt::AddressOverflow)?;
+        let touched_blocks =
+            usize::try_from(new_blocks - first_touched).map_err(|_| Corrupt::AddressOverflow)?;
         payloads
             .try_reserve_exact(touched_blocks + required_nodes)
             .map_err(|_| Error::OutOfMemory)?;
@@ -1235,12 +1229,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             inode.number,
             inode.generation,
         )?;
-        editor.set_extent_mapping(
-            &physical_blocks,
-            new_size,
-            block_size,
-            &mut extent_nodes,
-        )?;
+        editor.set_extent_mapping(&physical_blocks, new_size, block_size, &mut extent_nodes)?;
         editor.finish();
         for node in extent_nodes {
             payloads.push(node);
@@ -1263,38 +1252,37 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Create an empty regular file in a checked mutable directory.
-    pub fn create_empty_file(
+    pub fn create_file(
         &mut self,
-        directory_path: &str,
-        name: &str,
+        directory: &Inode,
+        name: &[u8],
         permissions: u16,
     ) -> Result<u32, Error<S::Error>> {
-        self.create_inode_entry(directory_path, name, permissions, 1, |editor, permissions| {
+        self.create_inode_entry(directory, name, permissions, 1, |editor, permissions| {
             editor.initialize_regular(permissions);
             Ok(())
         })
     }
 
     /// Create an inline (fast) symbolic link.
-    pub fn symlink(&mut self, target: &str, new_path: &str) -> Result<u32, Error<S::Error>> {
-        if target.is_empty() || target.len() > 60 || target.as_bytes().contains(&0) {
+    pub fn create_symlink(
+        &mut self,
+        directory: &Inode,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<u32, Error<S::Error>> {
+        if target.is_empty() || target.len() > 60 || target.contains(&0) {
             return Err(Error::InvalidArgument);
         }
-        let new = super::normalize_absolute_path(new_path)?;
-        let (directory_path, name) = split_parent_name(&new)?;
-        self.create_inode_entry(
-            directory_path,
-            name,
-            0o777,
-            7,
-            |editor, _| editor.initialize_fast_symlink(target.as_bytes()),
-        )
+        self.create_inode_entry(directory, name, 0o777, 7, |editor, _| {
+            editor.initialize_fast_symlink(target)
+        })
     }
 
     fn create_inode_entry<F>(
         &mut self,
-        directory_path: &str,
-        name: &str,
+        directory: &Inode,
+        name: &[u8],
         permissions: u16,
         file_type: u8,
         initialize: F,
@@ -1309,17 +1297,17 @@ impl<'a, S: Storage> Transaction<'a, S> {
         }
         if name.is_empty()
             || name.len() > 255
-            || name == "."
-            || name == ".."
-            || name.as_bytes().contains(&b'/')
-            || name.as_bytes().contains(&0)
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || name.contains(&0)
             || permissions & !0o777 != 0
             || !matches!(file_type, 1 | 7)
         {
             return Err(Error::InvalidArgument);
         }
 
-        let directory = self.filesystem.resolve(directory_path)?;
+        let directory = self.filesystem.refresh(directory)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         let mut directory_tree = DirectoryTree::load(self, &directory)?;
 
@@ -1351,7 +1339,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             &mut directory_tree,
             &mut allocation.resources,
             inode_number,
-            name.as_bytes(),
+            name,
             file_type,
         )?;
         let descriptor_blocks = self.descriptor_blocks(&allocation.resources.groups)?;
@@ -1392,17 +1380,19 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Create another directory entry for an existing non-directory inode.
-    pub fn link(&mut self, existing_path: &str, new_path: &str) -> Result<(), Error<S::Error>> {
+    pub fn create_link(
+        &mut self,
+        inode: &Inode,
+        parent: &Inode,
+        name: &[u8],
+    ) -> Result<(), Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 3;
         self.validate_mutation_profile()?;
         if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
 
-        let existing = super::normalize_absolute_path(existing_path)?;
-        let new = super::normalize_absolute_path(new_path)?;
-        let (parent_path, name) = split_parent_name(&new)?;
-        let inode = self.filesystem.resolve_nofollow(&existing)?;
+        let inode = self.filesystem.refresh(inode)?;
         if inode.is_directory() || inode.links == u16::MAX {
             return Err(Error::InvalidArgument);
         }
@@ -1411,13 +1401,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             0xa000 => 7,
             _ => return Err(Unsupported::MutationProfile.into()),
         };
-        match self.filesystem.resolve_nofollow(&new) {
-            Ok(_) => return Err(Error::AlreadyExists),
-            Err(Error::NotFound) => {}
-            Err(error) => return Err(error),
-        }
-
-        let parent = self.filesystem.resolve(parent_path)?;
+        let parent = self.filesystem.refresh(parent)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         let mut directory_tree = DirectoryTree::load(self, &parent)?;
         let mut resources = Allocation {
@@ -1428,7 +1412,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             &mut directory_tree,
             &mut resources,
             inode.number,
-            name.as_bytes(),
+            name,
             file_type,
         )?;
         let descriptor_blocks = self.descriptor_blocks(&resources.groups)?;
@@ -1461,10 +1445,10 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Create a checked directory below a mutable directory.
-    pub fn mkdir(
+    pub fn create_directory(
         &mut self,
-        parent_path: &str,
-        name: &str,
+        parent: &Inode,
+        name: &[u8],
         permissions: u16,
     ) -> Result<u32, Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 8;
@@ -1474,16 +1458,16 @@ impl<'a, S: Storage> Transaction<'a, S> {
         }
         if name.is_empty()
             || name.len() > 255
-            || name == "."
-            || name == ".."
-            || name.as_bytes().contains(&b'/')
-            || name.as_bytes().contains(&0)
+            || name == b"."
+            || name == b".."
+            || name.contains(&b'/')
+            || name.contains(&0)
             || permissions & !0o777 != 0
         {
             return Err(Error::InvalidArgument);
         }
 
-        let parent = self.filesystem.resolve(parent_path)?;
+        let parent = self.filesystem.refresh(parent)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         if !parent.is_directory() || parent.links == u16::MAX {
             return Err(Unsupported::MutationProfile.into());
@@ -1530,7 +1514,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             &mut parent_tree,
             &mut allocation.resources,
             allocation.number,
-            name.as_bytes(),
+            name,
             2,
         )?;
         let descriptor_blocks = self.descriptor_blocks(&allocation.resources.groups)?;
@@ -1546,18 +1530,17 @@ impl<'a, S: Storage> Transaction<'a, S> {
         )?;
 
         let mut metadata = MetadataMutation::new();
-        metadata.adopt(inode_block_number, self.read_owned_block(inode_block_number)?)?;
+        metadata.adopt(
+            inode_block_number,
+            self.read_owned_block(inode_block_number)?,
+        )?;
         let mut editor = InodeEditor::new(
             &mut metadata.get_mut(inode_block_number)?[inode_offset..inode_offset + inode_size],
             self.filesystem.superblock.checksum_seed,
             allocation.number,
             0,
         )?;
-        editor.initialize_directory(
-            permissions,
-            directory_block_number,
-            block_size,
-        )?;
+        editor.initialize_directory(permissions, directory_block_number, block_size)?;
         editor.finish();
         metadata.edit_inode(self, &parent, |editor| {
             editor.set_links(parent.links + 1);
@@ -1578,7 +1561,10 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
         metadata.adopt(superblock_block_number, superblock_block)?;
         metadata.adopt_blocks(descriptor_blocks)?;
-        metadata.adopt(allocation.inode_bitmap.number, allocation.inode_bitmap.bytes)?;
+        metadata.adopt(
+            allocation.inode_bitmap.number,
+            allocation.inode_bitmap.bytes,
+        )?;
         metadata.adopt_group_edits(allocation.resources.groups)?;
         metadata.adopt(directory_block_number, directory_block)?;
         metadata.adopt_blocks(parent_tree.into_dirty_blocks())?;
@@ -1587,24 +1573,21 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Remove a link-count-one regular file with checked initialized extents.
-    pub fn unlink(&mut self, path: &str) -> Result<(), Error<S::Error>> {
+    pub fn remove_entry(
+        &mut self,
+        directory: &Inode,
+        entry: &DirectoryEntry,
+    ) -> Result<(), Error<S::Error>> {
         self.validate_mutation_profile()?;
         if !self.dirty.is_empty() {
             return Err(Error::ReservationExhausted);
         }
 
-        let normalized = super::normalize_absolute_path(path)?;
-        let (parent_path, name) = normalized.rsplit_once('/').ok_or(Error::InvalidArgument)?;
-        if name.is_empty() || name == "." || name == ".." {
+        if entry.name.is_empty() || entry.name == b"." || entry.name == b".." {
             return Err(Error::InvalidArgument);
         }
-        let parent_path = if parent_path.is_empty() {
-            "/"
-        } else {
-            parent_path
-        };
-        let directory = self.filesystem.resolve(parent_path)?;
-        let inode = self.filesystem.resolve_nofollow(&normalized)?;
+        let directory = self.filesystem.refresh(directory)?;
+        let inode = self.filesystem.refresh(&entry.inode)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         if !directory.is_directory()
             || inode.links == 0
@@ -1613,7 +1596,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Unsupported::MutationProfile.into());
         }
         let mut directory_tree = DirectoryTree::load(self, &directory)?;
-        directory_tree.remove(inode.number, name.as_bytes())?;
+        directory_tree.remove(inode.number, &entry.name)?;
         if inode.links > 1 {
             let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
             let superblock = self.read_owned_block(superblock_number)?;
@@ -1636,74 +1619,78 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Remove a checked empty directory from a mutable parent directory.
-    pub fn rmdir(&mut self, path: &str) -> Result<(), Error<S::Error>> {
+    pub fn remove_directory(
+        &mut self,
+        parent: &Inode,
+        entry: &DirectoryEntry,
+    ) -> Result<(), Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 7;
         self.validate_mutation_profile()?;
         if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
-        let normalized = super::normalize_absolute_path(path)?;
-        let (parent_path, name) = normalized.rsplit_once('/').ok_or(Error::InvalidArgument)?;
-        if name.is_empty() || name == "." || name == ".." {
+        if entry.name.is_empty() || entry.name == b"." || entry.name == b".." {
             return Err(Error::InvalidArgument);
         }
-        let parent_path = if parent_path.is_empty() {
-            "/"
-        } else {
-            parent_path
-        };
-        let parent = self.filesystem.resolve(parent_path)?;
-        let directory = self.filesystem.resolve_nofollow(&normalized)?;
+        let parent = self.filesystem.refresh(parent)?;
+        let directory = self.filesystem.refresh(&entry.inode)?;
         if !parent.is_directory() || parent.links == 0 {
             return Err(Unsupported::MutationProfile.into());
         }
         let mut parent_tree = DirectoryTree::load(self, &parent)?;
         let release = self.prepare_empty_directory_release(&directory, parent.number)?;
-        parent_tree.remove(directory.number, name.as_bytes())?;
-        self.stage_replaced_directory(
-            release,
-            parent_tree.into_dirty_blocks(),
-            &parent,
-        )
+        parent_tree.remove(directory.number, &entry.name)?;
+        self.stage_replaced_directory(release, parent_tree.into_dirty_blocks(), &parent)
     }
 
     /// Rename between checked directories, reclaiming a replaced regular file.
-    pub fn rename(&mut self, old_path: &str, new_path: &str) -> Result<(), Error<S::Error>> {
+    pub fn move_entry(
+        &mut self,
+        old_parent: &Inode,
+        source: &DirectoryEntry,
+        new_parent: &Inode,
+        new_name: &[u8],
+        destination: Option<&DirectoryEntry>,
+    ) -> Result<(), Error<S::Error>> {
         const REQUIRED_DIRTY_BLOCKS: usize = 3;
         self.validate_mutation_profile()?;
         if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
-        let old = super::normalize_absolute_path(old_path)?;
-        let new = super::normalize_absolute_path(new_path)?;
-        let (old_parent_path, old_name) = split_parent_name(&old)?;
-        let (new_parent_path, new_name) = split_parent_name(&new)?;
-        if old == new {
+        if new_name.is_empty()
+            || new_name.len() > 255
+            || new_name == b"."
+            || new_name == b".."
+            || new_name.contains(&b'/')
+            || new_name.contains(&0)
+        {
+            return Err(Error::InvalidArgument);
+        }
+        if old_parent.number == new_parent.number && source.name == new_name {
             return Ok(());
         }
 
-        let old_parent = self.filesystem.resolve(old_parent_path)?;
-        let source = self.filesystem.resolve_nofollow(&old)?;
-        let new_parent = self.filesystem.resolve(new_parent_path)?;
-        let destination = match self.filesystem.resolve_nofollow(&new) {
-            Ok(destination) if destination.number == source.number => return Ok(()),
-            Ok(destination) => Some(destination),
-            Err(Error::NotFound) => None,
-            Err(error) => return Err(error),
+        let old_parent = self.filesystem.refresh(old_parent)?;
+        let source_inode = self.filesystem.refresh(&source.inode)?;
+        let new_parent = self.filesystem.refresh(new_parent)?;
+        let destination = match destination {
+            Some(destination) if destination.inode.number == source_inode.number => return Ok(()),
+            Some(destination) => Some(self.filesystem.refresh(&destination.inode)?),
+            None => None,
         };
         if !old_parent.is_directory() || !new_parent.is_directory() {
             return Err(Unsupported::MutationProfile.into());
         }
-        let file_type = match source.mode & 0xf000 {
+        let file_type = match source_inode.mode & 0xf000 {
             0x8000 => 1,
             0x4000 => 2,
             0xa000 => 7,
             _ => return Err(Unsupported::MutationProfile.into()),
         };
         if file_type == 2 && old_parent.number != new_parent.number {
-            self.ensure_directory_move_acyclic(source.number, &new_parent)?;
+            self.ensure_directory_move_acyclic(source_inode.number, &new_parent)?;
         }
-        if file_type == 2 && (source.links < 2 || old_parent.links == 0) {
+        if file_type == 2 && (source_inode.links < 2 || old_parent.links == 0) {
             return Err(Unsupported::MutationProfile.into());
         }
 
@@ -1715,11 +1702,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
                         self.prepare_empty_directory_release(&destination, new_parent.number)?;
                     old_tree.replace(
                         destination.number,
-                        source.number,
-                        new_name.as_bytes(),
+                        source_inode.number,
+                        new_name,
                         file_type,
                     )?;
-                    old_tree.remove(source.number, old_name.as_bytes())?;
+                    old_tree.remove(source_inode.number, &source.name)?;
                     return self.stage_replaced_directory(
                         release,
                         old_tree.into_dirty_blocks(),
@@ -1727,16 +1714,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
                     );
                 }
                 let release = self.prepare_inode_release(&destination, ReleaseKind::Regular)?;
-                old_tree.replace(
-                    destination.number,
-                    source.number,
-                    new_name.as_bytes(),
-                    file_type,
-                )?;
-                old_tree.remove(source.number, old_name.as_bytes())?;
+                old_tree.replace(destination.number, source_inode.number, new_name, file_type)?;
+                old_tree.remove(source_inode.number, &source.name)?;
                 return self.stage_inode_release(release, old_tree.into_dirty_blocks());
             }
-            old_tree.remove(source.number, old_name.as_bytes())?;
+            old_tree.remove(source_inode.number, &source.name)?;
             let mut resources = Allocation {
                 blocks: Vec::new(),
                 groups: Vec::new(),
@@ -1744,8 +1726,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
             let growth = self.insert_into_directory(
                 &mut old_tree,
                 &mut resources,
-                source.number,
-                new_name.as_bytes(),
+                source_inode.number,
+                new_name,
                 file_type,
             )?;
             let mut metadata = MetadataMutation::new();
@@ -1762,35 +1744,21 @@ impl<'a, S: Storage> Transaction<'a, S> {
             if file_type == 2 {
                 let release =
                     self.prepare_empty_directory_release(&destination, new_parent.number)?;
-                let mut source_tree = DirectoryTree::load(self, &source)?;
+                let mut source_tree = DirectoryTree::load(self, &source_inode)?;
                 source_tree.set_parent(old_parent.number, new_parent.number)?;
-                new_tree.replace(
-                    destination.number,
-                    source.number,
-                    new_name.as_bytes(),
-                    file_type,
-                )?;
-                old_tree.remove(source.number, old_name.as_bytes())?;
+                new_tree.replace(destination.number, source_inode.number, new_name, file_type)?;
+                old_tree.remove(source_inode.number, &source.name)?;
                 let mut namespace = old_tree.into_dirty_blocks();
                 namespace
                     .try_reserve(new_tree.nodes.len() + source_tree.nodes.len())
                     .map_err(|_| Error::OutOfMemory)?;
                 namespace.extend(new_tree.into_dirty_blocks());
                 namespace.extend(source_tree.into_dirty_blocks());
-                return self.stage_replaced_directory(
-                    release,
-                    namespace,
-                    &old_parent,
-                );
+                return self.stage_replaced_directory(release, namespace, &old_parent);
             }
             let release = self.prepare_inode_release(&destination, ReleaseKind::Regular)?;
-            new_tree.replace(
-                destination.number,
-                source.number,
-                new_name.as_bytes(),
-                file_type,
-            )?;
-            old_tree.remove(source.number, old_name.as_bytes())?;
+            new_tree.replace(destination.number, source_inode.number, new_name, file_type)?;
+            old_tree.remove(source_inode.number, &source.name)?;
             let mut namespace = old_tree.into_dirty_blocks();
             namespace
                 .try_reserve(new_tree.nodes.len())
@@ -1802,11 +1770,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
             if new_parent.links == u16::MAX {
                 return Err(Unsupported::MutationProfile.into());
             }
-            let mut source_tree = DirectoryTree::load(self, &source)?;
+            let mut source_tree = DirectoryTree::load(self, &source_inode)?;
             source_tree.set_parent(old_parent.number, new_parent.number)?;
 
             let mut metadata = MetadataMutation::new();
-            old_tree.remove(source.number, old_name.as_bytes())?;
+            old_tree.remove(source_inode.number, &source.name)?;
             let mut resources = Allocation {
                 blocks: Vec::new(),
                 groups: Vec::new(),
@@ -1814,8 +1782,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
             let growth = self.insert_into_directory(
                 &mut new_tree,
                 &mut resources,
-                source.number,
-                new_name.as_bytes(),
+                source_inode.number,
+                new_name,
                 file_type,
             )?;
             self.apply_block_allocation(&mut metadata, resources)?;
@@ -1836,7 +1804,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             metadata.stage(self)?;
             return Ok(());
         }
-        old_tree.remove(source.number, old_name.as_bytes())?;
+        old_tree.remove(source_inode.number, &source.name)?;
         let mut resources = Allocation {
             blocks: Vec::new(),
             groups: Vec::new(),
@@ -1844,8 +1812,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let growth = self.insert_into_directory(
             &mut new_tree,
             &mut resources,
-            source.number,
-            new_name.as_bytes(),
+            source_inode.number,
+            new_name,
             file_type,
         )?;
         let mut metadata = MetadataMutation::new();
@@ -1859,14 +1827,14 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Resize a regular file through its allocation-aware editor.
-    pub fn resize(&mut self, path: &str, new_size: u64) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.resolve(path)?)?;
+    pub fn resize_inode(&mut self, inode: &Inode, new_size: u64) -> Result<(), Error<S::Error>> {
+        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
         file.resize(self, new_size)
     }
 
     /// Release checked initialized extents and reduce a regular file to size 0.
-    pub fn truncate_to_zero(&mut self, path: &str) -> Result<u64, Error<S::Error>> {
-        let inode = self.filesystem.resolve(path)?;
+    pub fn truncate_inode(&mut self, inode: &Inode) -> Result<u64, Error<S::Error>> {
+        let inode = self.filesystem.refresh(inode)?;
         if inode.size == 0 && inode.blocks_512 == 0 {
             return Ok(0);
         }
@@ -1885,8 +1853,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
         let ownership = self.read_extent_ownership(inode)?;
         let existing_nodes = ownership.tree;
-        let old_blocks_usize =
-            usize::try_from(old_blocks).map_err(|_| Corrupt::AddressOverflow)?;
+        let old_blocks_usize = usize::try_from(old_blocks).map_err(|_| Corrupt::AddressOverflow)?;
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(old_blocks_usize)
@@ -1981,8 +1948,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if !new_size.is_multiple_of(block_size) {
             let last = physical[kept - 1];
             let mut block = self.read_owned_block(last)?;
-            let tail = usize::try_from(new_size % block_size)
-                .map_err(|_| Corrupt::AddressOverflow)?;
+            let tail =
+                usize::try_from(new_size % block_size).map_err(|_| Corrupt::AddressOverflow)?;
             block[tail..].fill(0);
             metadata.adopt(last, block)?;
         }
@@ -1990,8 +1957,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let (inode_block, inode_offset) = self.inode_location(inode.number)?;
         let inode_size = usize::from(self.filesystem.superblock.inode_size);
         metadata.load(self, inode_block)?;
-        let raw = &mut metadata.get_mut(inode_block)?
-            [inode_offset..inode_offset + inode_size];
+        let raw = &mut metadata.get_mut(inode_block)?[inode_offset..inode_offset + inode_size];
         let mut editor = InodeEditor::new(
             raw,
             self.filesystem.superblock.checksum_seed,
@@ -2015,11 +1981,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     /// Read one filesystem block through this transaction's private view.
-    pub fn read_block(
-        &mut self,
-        number: u64,
-        dst: &mut [u8],
-    ) -> Result<(), Error<S::Error>> {
+    pub fn read_block(&mut self, number: u64, dst: &mut [u8]) -> Result<(), Error<S::Error>> {
         if number >= self.filesystem.superblock.blocks_count
             || dst.len() != self.filesystem.superblock.block_size as usize
         {
@@ -2821,10 +2783,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
     /// Return every block owned by a fully allocated extent inode, separating
     /// file data from extent-tree metadata.  Namespace mutation consumes this
     /// one checked description instead of knowing which tree depth was used.
-    fn read_extent_ownership(
-        &mut self,
-        inode: &Inode,
-    ) -> Result<ExtentOwnership, Error<S::Error>> {
+    fn read_extent_ownership(&mut self, inode: &Inode) -> Result<ExtentOwnership, Error<S::Error>> {
         let root = &inode.block_map;
         validate_extent_header(root, 4)?;
         let depth = le16(root, 6);
@@ -2891,14 +2850,12 @@ impl<'a, S: Storage> Transaction<'a, S> {
         for index in 0..entries {
             let at = 12 + index * 12;
             let logical = u64::from(le32(node, at));
-            if previous.is_some_and(|value| logical <= value)
-                || logical != ownership.logical_blocks
+            if previous.is_some_and(|value| logical <= value) || logical != ownership.logical_blocks
             {
                 return Err(Corrupt::InvalidExtentTree.into());
             }
             previous = Some(logical);
-            let number = u64::from(le32(node, at + 4))
-                | (u64::from(le16(node, at + 8)) << 32);
+            let number = u64::from(le32(node, at + 4)) | (u64::from(le16(node, at + 8)) << 32);
             if number == 0
                 || number >= self.filesystem.superblock.blocks_count
                 || levels.iter().any(|level| level.contains(&number))
@@ -2920,13 +2877,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
                 &child,
                 self.filesystem.superblock.has_metadata_checksums(),
             )?;
-            self.collect_extent_ownership_node(
-                &child,
-                child_depth,
-                inode,
-                ownership,
-                levels,
-            )?;
+            self.collect_extent_ownership_node(&child, child_depth, inode, ownership, levels)?;
             levels[usize::from(child_depth)]
                 .try_reserve(1)
                 .map_err(|_| Error::OutOfMemory)?;
@@ -3616,10 +3567,7 @@ fn verify_extent_block_checksum<E>(
     Ok(())
 }
 
-fn collect_extent_leaf<E>(
-    node: &[u8],
-    ownership: &mut ExtentOwnership,
-) -> Result<(), Error<E>> {
+fn collect_extent_leaf<E>(node: &[u8], ownership: &mut ExtentOwnership) -> Result<(), Error<E>> {
     let entries = usize::from(le16(node, 2));
     ownership
         .data
@@ -3629,10 +3577,7 @@ fn collect_extent_leaf<E>(
         let at = 12 + index * 12;
         let logical = u64::from(le32(node, at));
         let encoded_length = le16(node, at + 4);
-        if encoded_length == 0
-            || encoded_length > 32_768
-            || logical != ownership.logical_blocks
-        {
+        if encoded_length == 0 || encoded_length > 32_768 || logical != ownership.logical_blocks {
             return Err(Unsupported::ExtentMutation.into());
         }
         let length = u64::from(encoded_length);
@@ -3709,10 +3654,7 @@ fn write_extent_mapping<E>(
         summaries
             .try_reserve_exact(shape[0])
             .map_err(|_| Error::OutOfMemory)?;
-        for (block, chunk) in nodes[..shape[0]]
-            .iter_mut()
-            .zip(runs.chunks(node_capacity))
-        {
+        for (block, chunk) in nodes[..shape[0]].iter_mut().zip(runs.chunks(node_capacity)) {
             initialize_extent_node(&mut block.bytes, chunk.len(), node_capacity, 0);
             write_extent_entries(&mut block.bytes, chunk)?;
             checksum_extent_node(&mut block.bytes, node_capacity, identity);
@@ -3732,12 +3674,7 @@ fn write_extent_mapping<E>(
                 .iter_mut()
                 .zip(summaries.chunks(node_capacity))
             {
-                initialize_extent_node(
-                    &mut block.bytes,
-                    chunk.len(),
-                    node_capacity,
-                    level as u16,
-                );
+                initialize_extent_node(&mut block.bytes, chunk.len(), node_capacity, level as u16);
                 write_extent_indexes(&mut block.bytes, chunk)?;
                 checksum_extent_node(&mut block.bytes, node_capacity, identity);
                 parents.push(ExtentIndex {
@@ -3915,10 +3852,7 @@ fn initialize_empty_inode(inode: &mut [u8], permissions: u16) {
     }
 }
 
-fn initialize_fast_symlink<E>(
-    inode: &mut [u8],
-    target: &[u8],
-) -> Result<(), Error<E>> {
+fn initialize_fast_symlink<E>(inode: &mut [u8], target: &[u8]) -> Result<(), Error<E>> {
     if target.is_empty() || target.len() > 60 || inode.len() < 0x84 {
         return Err(Error::InvalidArgument);
     }
@@ -4064,14 +3998,6 @@ fn replace_directory_parent<E>(
     checksum.update(&block[..tail]);
     put_le32(block, tail + 8, checksum.finalize());
     Ok(())
-}
-
-fn split_parent_name<E>(path: &str) -> Result<(&str, &str), Error<E>> {
-    let (parent, name) = path.rsplit_once('/').ok_or(Error::InvalidArgument)?;
-    if name.is_empty() || name == "." || name == ".." {
-        return Err(Error::InvalidArgument);
-    }
-    Ok((if parent.is_empty() { "/" } else { parent }, name))
 }
 
 fn insert_directory_entry<E>(
@@ -4358,7 +4284,7 @@ fn put_le32(bytes: &mut [u8], offset: usize, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::ModelStorage;
+    use crate::test_support::{ModelStorage, PathExt4};
     use alloc::vec;
 
     #[test]
@@ -4510,18 +4436,12 @@ mod tests {
     #[test]
     fn growing_a_level_inserts_new_nodes_at_their_level_boundary() {
         assert_eq!(
-            merge_extent_node_numbers::<()>(&[4], &[5, 1], &[10, 11, 12, 13], &[20, 21])
-                .unwrap(),
+            merge_extent_node_numbers::<()>(&[4], &[5, 1], &[10, 11, 12, 13], &[20, 21]).unwrap(),
             vec![10, 11, 12, 13, 20, 21]
         );
         assert_eq!(
-            merge_extent_node_numbers::<()>(
-                &[5, 1],
-                &[6, 1],
-                &[10, 11, 12, 13, 14, 30],
-                &[20],
-            )
-            .unwrap(),
+            merge_extent_node_numbers::<()>(&[5, 1], &[6, 1], &[10, 11, 12, 13, 14, 30], &[20],)
+                .unwrap(),
             vec![10, 11, 12, 13, 14, 20, 30]
         );
     }

@@ -53,6 +53,7 @@ rust_library(
     }),
     deps = [
         "//arch-abi",
+        "//ext4",
         "//klog",
         "//lib",
         "//lib:vga",
@@ -83,6 +84,10 @@ rust_library(
 rust_test(
     name = "kernel_unit_test_host",
     crate = ":kernel",
+    data = ["//ext4:modern_image"],
+    rustc_env = {
+        "EXT4_MODERN_IMAGE": "$(rlocationpath //ext4:modern_image)",
+    },
     rustc_flags = [
         "-Cpanic=abort",
         "-Zpanic_abort_tests",

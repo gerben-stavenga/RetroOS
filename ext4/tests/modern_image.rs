@@ -1,4 +1,6 @@
-use portable_ext4::test_support::{EffectKind, Inject, ModelError, ModelStorage};
+use portable_ext4::test_support::{
+    EffectKind, Inject, ModelError, ModelStorage, PathExt4, PathTransaction,
+};
 use portable_ext4::{Corrupt, Error, Ext4, Timestamp};
 
 fn image() -> Vec<u8> {
@@ -64,8 +66,8 @@ fn update_fragmentation_checksums(bytes: &mut [u8]) {
     let block_size = 1024usize << le32(bytes, SUPERBLOCK + 0x18);
     let descriptor = block_size;
     let descriptor_size = usize::from(le16(bytes, SUPERBLOCK + 0xfe));
-    let bitmap_block = (u64::from(le32(bytes, descriptor + 0x20)) << 32)
-        | u64::from(le32(bytes, descriptor));
+    let bitmap_block =
+        (u64::from(le32(bytes, descriptor + 0x20)) << 32) | u64::from(le32(bytes, descriptor));
     let bitmap = bitmap_block as usize * block_size;
     let bitmap_bytes = le32(bytes, SUPERBLOCK + 0x20).div_ceil(8) as usize;
     let incompat = le32(bytes, SUPERBLOCK + 0x60);
@@ -96,8 +98,8 @@ fn add_artificial_fragmentation(bytes: &mut [u8], gaps: usize) -> Vec<u64> {
     let block_size = 1024usize << le32(bytes, SUPERBLOCK + 0x18);
     let descriptor = block_size;
     let blocks_per_group = u64::from(le32(bytes, SUPERBLOCK + 0x20));
-    let bitmap_block = (u64::from(le32(bytes, descriptor + 0x20)) << 32)
-        | u64::from(le32(bytes, descriptor));
+    let bitmap_block =
+        (u64::from(le32(bytes, descriptor + 0x20)) << 32) | u64::from(le32(bytes, descriptor));
     let bitmap = bitmap_block as usize * block_size;
     let mut marked = Vec::with_capacity(gaps);
     let mut leave_next = true;
@@ -128,8 +130,8 @@ fn remove_artificial_fragmentation(bytes: &mut [u8], marked: &[u64]) {
     const SUPERBLOCK: usize = 1024;
     let block_size = 1024usize << le32(bytes, SUPERBLOCK + 0x18);
     let descriptor = block_size;
-    let bitmap_block = (u64::from(le32(bytes, descriptor + 0x20)) << 32)
-        | u64::from(le32(bytes, descriptor));
+    let bitmap_block =
+        (u64::from(le32(bytes, descriptor + 0x20)) << 32) | u64::from(le32(bytes, descriptor));
     let bitmap = bitmap_block as usize * block_size;
     for &block in marked {
         let byte = bitmap + block as usize / 8;
@@ -538,9 +540,7 @@ fn writes_across_eof_and_resizes_through_one_file_editor() {
     let mut remounted = Ext4::mount(ModelStorage::new(durable.clone())).unwrap();
     let mut actual = vec![0; expected.len()];
     assert_eq!(
-        remounted
-            .read("/root-empty.bin", 0, &mut actual)
-            .unwrap(),
+        remounted.read("/root-empty.bin", 0, &mut actual).unwrap(),
         actual.len()
     );
     assert_eq!(actual, expected);
@@ -1257,7 +1257,10 @@ fn unlinks_file_with_external_extent_leaf() {
     let mut durable = fs.into_storage().durable_bytes().to_vec();
     remove_artificial_fragmentation(&mut durable, &artificial);
     let mut remounted = Ext4::mount(ModelStorage::new(durable.clone())).unwrap();
-    assert_eq!(remounted.stat("/root-empty.bin").unwrap_err(), Error::NotFound);
+    assert_eq!(
+        remounted.stat("/root-empty.bin").unwrap_err(),
+        Error::NotFound
+    );
     let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("unlinked-external-extent-leaf.img");
     std::fs::write(&output_path, durable).unwrap();
@@ -1485,7 +1488,9 @@ fn creates_hard_links_and_fast_symlinks() {
     {
         let mut transaction = fs.begin_transaction();
         transaction.reserve_blocks(5).unwrap();
-        transaction.symlink("root-data.bin", "/root-data-link").unwrap();
+        transaction
+            .symlink("root-data.bin", "/root-data-link")
+            .unwrap();
         transaction.commit().unwrap();
     }
 
@@ -1529,7 +1534,9 @@ fn unlinks_hard_links_and_fast_symlinks() {
     {
         let mut transaction = fs.begin_transaction();
         transaction.reserve_blocks(5).unwrap();
-        transaction.symlink("root-data.bin", "/root-data-link").unwrap();
+        transaction
+            .symlink("root-data.bin", "/root-data-link")
+            .unwrap();
         transaction.commit().unwrap();
     }
     {
@@ -1547,9 +1554,18 @@ fn unlinks_hard_links_and_fast_symlinks() {
 
     let durable = fs.into_storage().durable_bytes().to_vec();
     let mut remounted = Ext4::mount(ModelStorage::new(durable.clone())).unwrap();
-    assert_eq!(remounted.stat("/root-data-link.bin").unwrap_err(), Error::NotFound);
-    assert_eq!(remounted.stat("/root-data-link").unwrap_err(), Error::NotFound);
-    assert_eq!(remounted.stat("/root-data.bin").unwrap().links, original_links);
+    assert_eq!(
+        remounted.stat("/root-data-link.bin").unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        remounted.stat("/root-data-link").unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        remounted.stat("/root-data.bin").unwrap().links,
+        original_links
+    );
 
     let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("unlinked-links.img");
@@ -1578,14 +1594,16 @@ fn every_link_creation_read_is_fallible_before_dirtying() {
                 .link("/root-data.bin", "/root-data-link.bin")
                 .unwrap();
         } else {
-            transaction.symlink("root-data.bin", "/root-data-link").unwrap();
+            transaction
+                .symlink("root-data.bin", "/root-data-link")
+                .unwrap();
         }
         drop(transaction);
         let effects = successful.storage().effects().len();
 
         for sequence in 0..effects {
-            let storage = ModelStorage::new(original.clone())
-                .with_injection(Inject::IoErrorAt(sequence));
+            let storage =
+                ModelStorage::new(original.clone()).with_injection(Inject::IoErrorAt(sequence));
             match Ext4::mount(storage) {
                 Err(Error::Storage(ModelError::InjectedIo)) => {}
                 Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
@@ -1820,8 +1838,14 @@ fn unlinks_regular_file_and_symlink_from_indexed_directory() {
     }
     let durable = fs.into_storage().durable_bytes().to_vec();
     let mut remounted = Ext4::mount(ModelStorage::new(durable.clone())).unwrap();
-    assert_eq!(remounted.stat("/dir/hello.link").unwrap_err(), Error::NotFound);
-    assert_eq!(remounted.stat("/dir/hello.txt").unwrap_err(), Error::NotFound);
+    assert_eq!(
+        remounted.stat("/dir/hello.link").unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        remounted.stat("/dir/hello.txt").unwrap_err(),
+        Error::NotFound
+    );
     let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("indexed-directory-unlink.img");
     std::fs::write(&output_path, durable).unwrap();
@@ -1868,8 +1892,14 @@ fn mutates_entries_across_multiblock_linear_directory() {
     let mut remounted = Ext4::mount(ModelStorage::new(durable.clone())).unwrap();
     assert!(remounted.stat("/linear/created.bin").is_ok());
     assert!(remounted.stat("/linear/renamed-499").is_ok());
-    assert_eq!(remounted.stat("/linear/file-499").unwrap_err(), Error::NotFound);
-    assert_eq!(remounted.stat("/linear/file-498").unwrap_err(), Error::NotFound);
+    assert_eq!(
+        remounted.stat("/linear/file-499").unwrap_err(),
+        Error::NotFound
+    );
+    assert_eq!(
+        remounted.stat("/linear/file-498").unwrap_err(),
+        Error::NotFound
+    );
     let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("multiblock-linear-directory.img");
     std::fs::write(&output_path, durable).unwrap();
@@ -2293,7 +2323,10 @@ fn directory_rename_replaces_empty_directory() {
         remounted.stat("/move-left/branch").unwrap_err(),
         Error::NotFound
     );
-    assert_eq!(remounted.stat("/root-empty-dir").unwrap().number, source.number);
+    assert_eq!(
+        remounted.stat("/root-empty-dir").unwrap().number,
+        source.number
+    );
     assert_eq!(
         remounted.stat("/move-left").unwrap().links,
         old_parent_links - 1

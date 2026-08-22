@@ -4,6 +4,13 @@
 no dependency on RetroOS, libc, threads, or an async executor. Its storage
 trait is the only place persistent effects may occur.
 
+The production interface is inode-based. `root` supplies the starting inode,
+`list` streams checked directory entries, and file operations consume the
+inodes returned by those operations. Path splitting, component traversal,
+mount crossings, symlink policy, and lookup caching belong to the caller's
+VFS. Path-shaped conveniences exist only in `test_support` for the image and
+power-loss corpus.
+
 The implementation is intentionally incremental. The current read milestone
 supports bounded ext images using inode tables, linear or HTree-indexed
 directories, ext4 extent trees, legacy direct and single/double/triple-indirect
@@ -84,12 +91,13 @@ regular file; the replaced inode and fragmented cross-group extents are
 reclaimed in the same transaction. Directory moves walk the destination's
 on-disk `..` ancestry to reject cycles, rewrite `..`, and transfer the parent
 link count. Rename stages the unchanged superblock required by the JBD2 recovery
-protocol. `FileEditor::write_at` selects in-place block replacement or extent
-growth, including writes which begin inside the file and cross EOF.
-`FileEditor::resize` zero-fills growth and shrinks by retaining the physical
+protocol. The inode-based file writer selects in-place block replacement or
+extent growth, including writes which begin inside the file and cross EOF. Its
+resize operation zero-fills growth and shrinks by retaining the physical
 prefix, releasing the suffix and surplus extent nodes, and rebuilding the
-smaller depth-N tree. `initialize_file`, `append`, `overwrite`, and
-`truncate_to_zero` are compatibility contracts over those two primitives.
+smaller depth-N tree. Path-shaped initialization, append, overwrite, and
+truncate helpers are confined to the test-support facade over those two
+primitives.
 Each operation updates the
 relevant bitmaps, counters, and metadata checksums, while all resulting blocks
 remain private until committed. Tests apply those blocks to disposable images,
