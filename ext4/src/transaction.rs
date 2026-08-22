@@ -734,12 +734,19 @@ struct ExtentOwnership {
     logical_blocks: u64,
 }
 
+struct ReleasedInodeBlocks {
+    groups: Vec<GroupEdit>,
+    released: u64,
+    retained_xattr_block: Option<DirtyBlock>,
+}
+
 struct PreparedInodeRelease {
     superblock: DirtyBlock,
     descriptors: Vec<DirtyBlock>,
     block_bitmaps: Vec<DirtyBlock>,
     inode_bitmap: DirtyBlock,
     inode_block: DirtyBlock,
+    retained_xattr_block: Option<DirtyBlock>,
 }
 
 #[derive(Clone, Copy)]
@@ -2640,25 +2647,54 @@ impl<'a, S: Storage> Transaction<'a, S> {
     fn release_inode_root_blocks(
         &mut self,
         inode: &Inode,
-    ) -> Result<(Vec<GroupEdit>, u64), Error<S::Error>> {
+    ) -> Result<ReleasedInodeBlocks, Error<S::Error>> {
         let ownership = self.read_extent_ownership(inode)?;
         let block_size = u64::from(self.filesystem.superblock.block_size);
         let logical_blocks = ownership.logical_blocks;
         let mut ranges = ownership.data;
+        let owned_blocks = ranges
+            .iter()
+            .try_fold(ownership.tree.len() as u64, |total, range| {
+                total.checked_add(range.1).ok_or(Corrupt::AddressOverflow)
+            })?;
         ranges
-            .try_reserve_exact(ownership.tree.len())
+            .try_reserve_exact(ownership.tree.len() + usize::from(inode.external_xattr_block != 0))
             .map_err(|_| Error::OutOfMemory)?;
         ranges.extend(ownership.tree.into_iter().map(|number| (number, 1)));
+        let mut retained_xattr_block = None;
+        if inode.external_xattr_block != 0 {
+            let mut block = self.filesystem.read_external_xattr_block(inode)?;
+            let references = le32(&block, 4);
+            if references == 1 {
+                ranges.push((inode.external_xattr_block, 1));
+            } else {
+                put_le32(&mut block, 4, references - 1);
+                super::update_external_xattr_checksum(
+                    self.filesystem.superblock.checksum_seed,
+                    inode.external_xattr_block,
+                    &mut block,
+                );
+                retained_xattr_block = Some(DirtyBlock {
+                    number: inode.external_xattr_block,
+                    bytes: block,
+                });
+            }
+        }
         let (groups, released) = self.release_blocks(&ranges)?;
         if logical_blocks != inode.size.div_ceil(block_size)
             || inode.blocks_512
-                != released
-                    .checked_mul(block_size / 512)
+                != owned_blocks
+                    .checked_add(u64::from(inode.external_xattr_block != 0))
+                    .and_then(|blocks| blocks.checked_mul(block_size / 512))
                     .ok_or(Corrupt::AddressOverflow)?
         {
             return Err(Unsupported::ExtentMutation.into());
         }
-        Ok((groups, released))
+        Ok(ReleasedInodeBlocks {
+            groups,
+            released,
+            retained_xattr_block,
+        })
     }
 
     fn release_blocks(
@@ -2914,12 +2950,21 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Unsupported::MutationProfile.into());
         }
         let block_size = u64::from(self.filesystem.superblock.block_size);
-        let (mut groups, released_blocks) = match kind {
-            ReleaseKind::FastSymlink => (Vec::new(), 0),
+        let released = match kind {
+            ReleaseKind::FastSymlink => ReleasedInodeBlocks {
+                groups: Vec::new(),
+                released: 0,
+                retained_xattr_block: None,
+            },
             ReleaseKind::Regular | ReleaseKind::Directory => {
                 self.release_inode_root_blocks(inode)?
             }
         };
+        let ReleasedInodeBlocks {
+            mut groups,
+            released: released_blocks,
+            retained_xattr_block,
+        } = released;
         let zero_based = inode
             .number
             .checked_sub(1)
@@ -3035,6 +3080,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
                 number: inode_block_number,
                 bytes: inode_block,
             },
+            retained_xattr_block,
         })
     }
 
@@ -3089,6 +3135,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
         metadata.adopt_blocks(release.block_bitmaps)?;
         metadata.adopt_block(release.inode_bitmap)?;
         metadata.adopt_block(release.inode_block)?;
+        if let Some(block) = release.retained_xattr_block {
+            metadata.adopt_block(block)?;
+        }
         metadata.adopt_blocks(namespace)?;
         metadata.stage(self)
     }
@@ -3105,6 +3154,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
         metadata.adopt_blocks(release.block_bitmaps)?;
         metadata.adopt_block(release.inode_bitmap)?;
         metadata.adopt_block(release.inode_block)?;
+        if let Some(block) = release.retained_xattr_block {
+            metadata.adopt_block(block)?;
+        }
         metadata.adopt_blocks(namespace)?;
         metadata.edit_inode(self, old_parent, |editor| {
             editor.set_links(old_parent.links - 1);
@@ -3234,6 +3286,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
             | 0x0020 // dir_nlink
             | 0x0040 // extra_isize
             | ondisk::RO_COMPAT_METADATA_CSUM;
+        const ALLOWED_INCOMPAT: u32 = ondisk::INCOMPAT_FILETYPE
+            | ondisk::INCOMPAT_EXTENTS
+            | ondisk::INCOMPAT_64BIT
+            | ondisk::INCOMPAT_FLEX_BG
+            | ondisk::INCOMPAT_CSUM_SEED;
         let superblock = &self.filesystem.superblock;
         if superblock.block_size != 4096
             || superblock.descriptor_size != 64
@@ -3242,6 +3299,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             || superblock.feature_incompat & ondisk::INCOMPAT_64BIT == 0
             || superblock.feature_ro_compat & ondisk::RO_COMPAT_BIGALLOC != 0
             || superblock.feature_ro_compat & !ALLOWED_RO_COMPAT != 0
+            || superblock.feature_incompat & !ALLOWED_INCOMPAT != 0
             || superblock.first_data_block != 0
             || u64::from(superblock.blocks_per_group) > u64::from(superblock.block_size) * 8
             || u64::from(superblock.inodes_per_group) > u64::from(superblock.block_size) * 8
