@@ -106,6 +106,24 @@ pub enum Error<E> {
     NotEmpty,
 }
 
+/// Failures from transaction preparation that perform no storage I/O.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FsError {
+    OutOfMemory,
+    InvalidArgument,
+    ReservationExhausted,
+}
+
+impl<E> From<FsError> for Error<E> {
+    fn from(value: FsError) -> Self {
+        match value {
+            FsError::OutOfMemory => Self::OutOfMemory,
+            FsError::InvalidArgument => Self::InvalidArgument,
+            FsError::ReservationExhausted => Self::ReservationExhausted,
+        }
+    }
+}
+
 impl<E> From<Corrupt> for Error<E> {
     fn from(value: Corrupt) -> Self {
         Self::Corrupt(value)
@@ -233,23 +251,24 @@ fn decode_inode_timestamp<E>(
     })
 }
 
-/// A mounted filesystem that owns its storage object.
-pub struct Ext4<S> {
-    storage: S,
+/// Interpreted state for a mounted filesystem.
+///
+/// Storage is caller-owned and supplied explicitly to every operation that
+/// can perform I/O.
+pub struct Ext4 {
     superblock: Superblock,
     overlay: Vec<(u64, Vec<u8>)>,
 }
 
-impl<S: Storage> Ext4<S> {
-    pub fn mount(mut storage: S) -> Result<Self, Error<S::Error>> {
-        let superblock = Superblock::load(&mut storage)?;
+impl Ext4 {
+    pub fn mount<S: Storage>(storage: &mut S) -> Result<Self, Error<S::Error>> {
+        let superblock = Superblock::load(storage)?;
         let mut filesystem = Self {
-            storage,
             superblock,
             overlay: Vec::new(),
         };
         if filesystem.superblock.needs_recovery() {
-            filesystem.replay_journal()?;
+            filesystem.replay_journal(storage)?;
         }
         Ok(filesystem)
     }
@@ -263,15 +282,8 @@ impl<S: Storage> Ext4<S> {
     pub fn superblock(&self) -> &Superblock {
         &self.superblock
     }
-    pub fn storage(&self) -> &S {
-        &self.storage
-    }
-    pub fn into_storage(self) -> S {
-        self.storage
-    }
-
     /// Begin an isolated block transaction. Dropping it performs no writes.
-    pub fn begin_transaction(&mut self) -> Transaction<'_, S> {
+    pub fn begin_transaction(&mut self) -> Transaction<'_> {
         Transaction::new(self)
     }
 
@@ -280,8 +292,13 @@ impl<S: Storage> Ext4<S> {
         self.overlay.len()
     }
 
-    fn read_storage(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Error<S::Error>> {
-        checked_read(&mut self.storage, offset, dst)?;
+    fn read_storage<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Error<S::Error>> {
+        checked_read(storage, offset, dst)?;
         if dst.is_empty() {
             return Ok(());
         }
@@ -320,46 +337,56 @@ impl<S: Storage> Ext4<S> {
     }
 
     /// Return the filesystem's well-known starting inode.
-    pub fn root(&mut self) -> Result<Inode, Error<S::Error>> {
-        self.load_inode(ROOT_INODE)
+    pub fn root<S: Storage>(&mut self, storage: &mut S) -> Result<Inode, Error<S::Error>> {
+        self.load_inode(storage, ROOT_INODE)
     }
 
     /// Reload an inode identity from disk, rejecting a reused identity.
-    pub fn refresh(&mut self, inode: &Inode) -> Result<Inode, Error<S::Error>> {
-        let current = self.load_inode(inode.number)?;
+    pub fn refresh<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<Inode, Error<S::Error>> {
+        let current = self.load_inode(storage, inode.number)?;
         if current.generation != inode.generation {
             return Err(Error::NotFound);
         }
         Ok(current)
     }
 
-    pub fn read_inode(
+    pub fn read_inode<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize, Error<S::Error>> {
-        let inode = self.refresh(inode)?;
-        self.read_inode_data(&inode, offset, dst)
+        let inode = self.refresh(storage, inode)?;
+        self.read_inode_data(storage, &inode, offset, dst)
     }
 
     /// Read the target bytes stored in a symbolic-link inode.
-    pub fn read_symlink(&mut self, inode: &Inode) -> Result<Vec<u8>, Error<S::Error>> {
-        let inode = self.refresh(inode)?;
+    pub fn read_symlink<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let inode = self.refresh(storage, inode)?;
         if !inode.is_symlink() {
             return Err(Error::InvalidArgument);
         }
-        self.read_symlink_inode(&inode)
+        self.read_symlink_inode(storage, &inode)
     }
 
     /// Return every inode-body and external-block extended attribute.
     /// Namespace access policy and prefix mapping belong to the caller.
-    pub fn extended_attributes(
+    pub fn extended_attributes<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
     ) -> Result<Vec<ExtendedAttribute>, Error<S::Error>> {
-        let current = self.refresh(inode)?;
-        let raw = self.read_raw_inode(current.number)?;
+        let current = self.refresh(storage, inode)?;
+        let raw = self.read_raw_inode(storage, current.number)?;
         let mut pending = Vec::new();
         if raw.len() >= 0x84 {
             let header = 128usize
@@ -378,7 +405,7 @@ impl<S: Storage> Ext4<S> {
         }
 
         if current.external_xattr_block != 0 {
-            let block = self.read_external_xattr_block(&current)?;
+            let block = self.read_external_xattr_block(storage, &current)?;
             parse_extended_attributes(current.number, &block, 32, 0, &mut pending)?;
         }
         let mut attributes = Vec::new();
@@ -389,7 +416,7 @@ impl<S: Storage> Ext4<S> {
             let value = match attribute.value {
                 PendingExtendedAttributeValue::Inline(value) => value,
                 PendingExtendedAttributeValue::Inode { number, size } => {
-                    self.read_extended_attribute_inode(number, size)?
+                    self.read_extended_attribute_inode(storage, number, size)?
                 }
             };
             attributes.push(ExtendedAttribute {
@@ -401,16 +428,17 @@ impl<S: Storage> Ext4<S> {
         Ok(attributes)
     }
 
-    fn read_extended_attribute_inode(
+    fn read_extended_attribute_inode<S: Storage>(
         &mut self,
+        storage: &mut S,
         number: u32,
         size: usize,
     ) -> Result<Vec<u8>, Error<S::Error>> {
         if self.superblock.feature_incompat & ondisk::INCOMPAT_EA_INODE == 0 {
             return Err(Corrupt::InvalidExtendedAttributes(number).into());
         }
-        let raw = self.read_raw_inode(number)?;
-        let inode = self.load_inode(number)?;
+        let raw = self.read_raw_inode(storage, number)?;
+        let inode = self.load_inode(storage, number)?;
         if inode.mode & MODE_TYPE_MASK != MODE_REGULAR
             || inode.flags & EA_INODE_FL == 0
             || inode.size != size as u64
@@ -423,7 +451,7 @@ impl<S: Storage> Ext4<S> {
             .try_reserve_exact(size)
             .map_err(|_| Error::OutOfMemory)?;
         value.resize(size, 0);
-        if self.read_inode_data(&inode, 0, &mut value)? != size {
+        if self.read_inode_data(storage, &inode, 0, &mut value)? != size {
             return Err(Corrupt::InvalidExtendedAttributes(number).into());
         }
         let mut checksum = checksum::Checksum::with_seed(self.superblock.checksum_seed);
@@ -434,13 +462,18 @@ impl<S: Storage> Ext4<S> {
         Ok(value)
     }
 
-    fn read_external_xattr_block(&mut self, inode: &Inode) -> Result<Vec<u8>, Error<S::Error>> {
+    fn read_external_xattr_block<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         let number = inode.external_xattr_block;
         if number == 0 || number >= self.superblock.blocks_count {
             return Err(Corrupt::InvalidExtendedAttributes(inode.number).into());
         }
         let mut block = self.new_block_buffer()?;
         self.read_storage(
+            storage,
             number
                 .checked_mul(u64::from(self.superblock.block_size))
                 .ok_or(Corrupt::AddressOverflow)?,
@@ -465,7 +498,11 @@ impl<S: Storage> Ext4<S> {
         Ok(block)
     }
 
-    fn read_symlink_inode(&mut self, inode: &Inode) -> Result<Vec<u8>, Error<S::Error>> {
+    fn read_symlink_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         let len = usize::try_from(inode.size).map_err(|_| Corrupt::AddressOverflow)?;
         let mut target = Vec::new();
         target
@@ -476,7 +513,7 @@ impl<S: Storage> Ext4<S> {
             target.copy_from_slice(&inode.block_map[..len]);
             return Ok(target);
         }
-        if self.read_inode_data(inode, 0, &mut target)? != len {
+        if self.read_inode_data(storage, inode, 0, &mut target)? != len {
             return Err(Corrupt::InvalidInode(inode.number).into());
         }
         Ok(target)
@@ -484,8 +521,9 @@ impl<S: Storage> Ext4<S> {
 
     /// Append at most `max` checked directory entries, resuming from an opaque
     /// byte cookie returned by the previous call. `None` means end of directory.
-    pub fn list(
+    pub fn list<S: Storage>(
         &mut self,
+        storage: &mut S,
         directory: &Inode,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
@@ -494,7 +532,7 @@ impl<S: Storage> Ext4<S> {
         if max == 0 {
             return Err(Error::InvalidArgument);
         }
-        let directory = self.refresh(directory)?;
+        let directory = self.refresh(storage, directory)?;
         if !directory.is_directory() {
             return Err(Error::NotDirectory);
         }
@@ -502,7 +540,7 @@ impl<S: Storage> Ext4<S> {
             return Err(Error::InvalidArgument);
         }
         if directory.flags & INLINE_DATA_FL != 0 {
-            return self.list_inline_directory(&directory, cookie, output, max);
+            return self.list_inline_directory(storage, &directory, cookie, output, max);
         }
         let initial_len = output.len();
         output.try_reserve(max).map_err(|_| Error::OutOfMemory)?;
@@ -518,7 +556,7 @@ impl<S: Storage> Ext4<S> {
             let block_offset = logical
                 .checked_mul(block_size)
                 .ok_or(Corrupt::AddressOverflow)?;
-            let count = self.read_inode_data(&directory, block_offset, &mut block)?;
+            let count = self.read_inode_data(storage, &directory, block_offset, &mut block)?;
             let kind = self.directory_block_kind(&directory, logical, count, &block);
             if self.superblock.has_metadata_checksums() {
                 self.verify_directory_checksum(&directory, kind, count, &block)?;
@@ -564,7 +602,7 @@ impl<S: Storage> Ext4<S> {
                             .try_reserve_exact(name_len)
                             .map_err(|_| Error::OutOfMemory)?;
                         owned_name.extend_from_slice(name);
-                        let inode = self.load_inode(number)?;
+                        let inode = self.load_inode(storage, number)?;
                         output.push(DirectoryEntry {
                             name: owned_name,
                             file_type: block[cursor + 7],
@@ -588,8 +626,9 @@ impl<S: Storage> Ext4<S> {
         Ok(None)
     }
 
-    fn list_inline_directory(
+    fn list_inline_directory<S: Storage>(
         &mut self,
+        storage: &mut S,
         directory: &Inode,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
@@ -633,7 +672,7 @@ impl<S: Storage> Ext4<S> {
                 output.push(DirectoryEntry {
                     name,
                     file_type: data[cursor + 7],
-                    inode: self.load_inode(number)?,
+                    inode: self.load_inode(storage, number)?,
                 });
                 if output.len() - initial_len == max {
                     return Ok(Some(next as u64));
@@ -647,7 +686,7 @@ impl<S: Storage> Ext4<S> {
         Ok(None)
     }
 
-    fn new_block_buffer(&self) -> Result<Vec<u8>, Error<S::Error>> {
+    fn new_block_buffer<E>(&self) -> Result<Vec<u8>, Error<E>> {
         let len = self.superblock.block_size as usize;
         let mut result = Vec::new();
         result
@@ -657,7 +696,11 @@ impl<S: Storage> Ext4<S> {
         Ok(result)
     }
 
-    fn read_group_descriptor(&mut self, group: u32) -> Result<Vec<u8>, Error<S::Error>> {
+    fn read_group_descriptor<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        group: u32,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         if group >= self.superblock.group_count() {
             return Err(Corrupt::InvalidGroup(group).into());
         }
@@ -671,7 +714,7 @@ impl<S: Storage> Ext4<S> {
             .try_reserve_exact(len)
             .map_err(|_| Error::OutOfMemory)?;
         descriptor.resize(len, 0);
-        self.read_storage(offset, &mut descriptor)?;
+        self.read_storage(storage, offset, &mut descriptor)?;
         if self.superblock.has_metadata_checksums() {
             let expected = le16(&descriptor, 0x1e);
             let mut checksum = checksum::Checksum::with_seed(self.superblock.checksum_seed);
@@ -693,14 +736,18 @@ impl<S: Storage> Ext4<S> {
         Ok(descriptor)
     }
 
-    fn read_raw_inode(&mut self, number: u32) -> Result<Vec<u8>, Error<S::Error>> {
+    fn read_raw_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        number: u32,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
         if number == 0 || number > self.superblock.inodes_count {
             return Err(Corrupt::InvalidInode(number).into());
         }
         let zero_based = number - 1;
         let group = zero_based / self.superblock.inodes_per_group;
         let index = zero_based % self.superblock.inodes_per_group;
-        let descriptor = self.read_group_descriptor(group)?;
+        let descriptor = self.read_group_descriptor(storage, group)?;
         let mut inode_table = u64::from(le32(&descriptor, 8));
         if self.superblock.feature_incompat & ondisk::INCOMPAT_64BIT != 0 {
             inode_table |= u64::from(le32(&descriptor, 40)) << 32;
@@ -716,7 +763,7 @@ impl<S: Storage> Ext4<S> {
         let mut raw = Vec::new();
         raw.try_reserve_exact(len).map_err(|_| Error::OutOfMemory)?;
         raw.resize(len, 0);
-        self.read_storage(offset, &mut raw)?;
+        self.read_storage(storage, offset, &mut raw)?;
 
         let generation = le32(&raw, 0x64);
         if self.superblock.has_metadata_checksums() {
@@ -744,8 +791,12 @@ impl<S: Storage> Ext4<S> {
         Ok(raw)
     }
 
-    pub(crate) fn load_inode(&mut self, number: u32) -> Result<Inode, Error<S::Error>> {
-        let raw = self.read_raw_inode(number)?;
+    pub(crate) fn load_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        number: u32,
+    ) -> Result<Inode, Error<S::Error>> {
+        let raw = self.read_raw_inode(storage, number)?;
         let generation = le32(&raw, 0x64);
         let mode = le16(&raw, 0);
         if mode == 0 {
@@ -823,13 +874,13 @@ impl<S: Storage> Ext4<S> {
         }
     }
 
-    fn verify_directory_checksum(
+    fn verify_directory_checksum<E>(
         &self,
         directory: &Inode,
         kind: DirectoryBlockKind,
         count: usize,
         block: &[u8],
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<(), Error<E>> {
         if count != block.len() {
             return Err(Corrupt::InvalidDirectory.into());
         }
@@ -881,8 +932,9 @@ impl<S: Storage> Ext4<S> {
         Ok(())
     }
 
-    fn read_inode_data(
+    fn read_inode_data<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
         offset: u64,
         dst: &mut [u8],
@@ -914,13 +966,13 @@ impl<S: Storage> Ext4<S> {
             let logical = position / block_size;
             let within = position % block_size;
             let amount = (wanted - done).min((block_size - within) as usize);
-            match self.map_file_block(inode, logical)? {
+            match self.map_file_block(storage, inode, logical)? {
                 Some(physical) => {
                     let disk_offset = physical
                         .checked_mul(block_size)
                         .and_then(|v| v.checked_add(within))
                         .ok_or(Corrupt::AddressOverflow)?;
-                    self.read_storage(disk_offset, &mut dst[done..done + amount])?;
+                    self.read_storage(storage, disk_offset, &mut dst[done..done + amount])?;
                 }
                 None => dst[done..done + amount].fill(0),
             }
@@ -929,20 +981,22 @@ impl<S: Storage> Ext4<S> {
         Ok(done)
     }
 
-    fn map_file_block(
+    fn map_file_block<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
         logical: u64,
     ) -> Result<Option<u64>, Error<S::Error>> {
         if inode.flags & EXTENTS_FL == 0 {
-            return self.map_legacy_block(inode, logical);
+            return self.map_legacy_block(storage, inode, logical);
         }
         let root = inode.block_map;
-        self.map_extent_node(&root, logical, 0, inode, false)
+        self.map_extent_node(storage, &root, logical, 0, inode, false)
     }
 
-    fn map_legacy_block(
+    fn map_legacy_block<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
         logical: u64,
     ) -> Result<Option<u64>, Error<S::Error>> {
@@ -961,12 +1015,16 @@ impl<S: Storage> Ext4<S> {
             .ok_or(Corrupt::AddressOverflow)?;
         let mut remaining = logical - DIRECT_BLOCKS;
         if remaining < pointers {
-            return self
-                .follow_legacy_indirect(u64::from(le32(&inode.block_map, 12 * 4)), &[remaining]);
+            return self.follow_legacy_indirect(
+                storage,
+                u64::from(le32(&inode.block_map, 12 * 4)),
+                &[remaining],
+            );
         }
         remaining -= pointers;
         if remaining < double_capacity {
             return self.follow_legacy_indirect(
+                storage,
                 u64::from(le32(&inode.block_map, 13 * 4)),
                 &[remaining / pointers, remaining % pointers],
             );
@@ -974,6 +1032,7 @@ impl<S: Storage> Ext4<S> {
         remaining -= double_capacity;
         if remaining < triple_capacity {
             return self.follow_legacy_indirect(
+                storage,
                 u64::from(le32(&inode.block_map, 14 * 4)),
                 &[
                     remaining / double_capacity,
@@ -985,8 +1044,9 @@ impl<S: Storage> Ext4<S> {
         Err(Corrupt::InvalidLegacyBlockMap.into())
     }
 
-    fn follow_legacy_indirect(
+    fn follow_legacy_indirect<S: Storage>(
         &mut self,
+        storage: &mut S,
         mut physical: u64,
         indexes: &[u64],
     ) -> Result<Option<u64>, Error<S::Error>> {
@@ -1001,6 +1061,7 @@ impl<S: Storage> Ext4<S> {
                 return Err(Corrupt::InvalidLegacyBlockMap.into());
             }
             self.read_storage(
+                storage,
                 physical
                     .checked_mul(block_size)
                     .ok_or(Corrupt::AddressOverflow)?,
@@ -1014,7 +1075,7 @@ impl<S: Storage> Ext4<S> {
         self.validate_legacy_pointer(physical)
     }
 
-    fn validate_legacy_pointer(&self, physical: u64) -> Result<Option<u64>, Error<S::Error>> {
+    fn validate_legacy_pointer<E>(&self, physical: u64) -> Result<Option<u64>, Error<E>> {
         if physical == 0 {
             Ok(None)
         } else if physical < self.superblock.blocks_count {
@@ -1024,8 +1085,9 @@ impl<S: Storage> Ext4<S> {
         }
     }
 
-    fn map_extent_node(
+    fn map_extent_node<S: Storage>(
         &mut self,
+        storage: &mut S,
         node: &[u8],
         logical: u64,
         traversed: u16,
@@ -1118,6 +1180,7 @@ impl<S: Storage> Ext4<S> {
         }
         let mut bytes = self.new_block_buffer()?;
         self.read_storage(
+            storage,
             child
                 .checked_mul(u64::from(self.superblock.block_size))
                 .ok_or(Corrupt::AddressOverflow)?,
@@ -1126,7 +1189,7 @@ impl<S: Storage> Ext4<S> {
         if le16(&bytes, 6).checked_add(1) != Some(depth) {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        self.map_extent_node(&bytes, logical, traversed + 1, inode, true)
+        self.map_extent_node(storage, &bytes, logical, traversed + 1, inode, true)
     }
 
     fn inode_checksum_base(&self, inode: &Inode) -> checksum::Checksum {
@@ -1338,6 +1401,12 @@ mod tests {
     use crate::ondisk::{EXT4_MAGIC, SUPERBLOCK_OFFSET};
     use crate::test_support::{EffectKind, Inject, ModelError, ModelStorage, PathExt4};
 
+    fn mounted(image: Vec<u8>) -> (Ext4, ModelStorage) {
+        let mut storage = ModelStorage::new(image);
+        let filesystem = Ext4::mount(&mut storage).unwrap();
+        (filesystem, storage)
+    }
+
     fn put16(image: &mut [u8], offset: usize, value: u16) {
         image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1532,19 +1601,19 @@ mod tests {
 
     #[test]
     fn mounts_and_reads_extent_file() {
-        let mut fs = Ext4::mount(ModelStorage::new(image())).unwrap();
+        let (mut fs, mut storage) = mounted(image());
         assert_eq!(fs.block_size(), 1024);
         let mut output = [0; 8];
-        assert_eq!(fs.read("/hello", 0, &mut output).unwrap(), 5);
+        assert_eq!(fs.read(&mut storage, "/hello", 0, &mut output).unwrap(), 5);
         assert_eq!(&output[..5], b"hello");
-        assert_eq!(fs.stat("/").unwrap().number, ROOT_INODE);
+        assert_eq!(fs.stat(&mut storage, "/").unwrap().number, ROOT_INODE);
     }
 
     #[test]
     fn reads_legacy_direct_block_file() {
-        let mut fs = Ext4::mount(ModelStorage::new(legacy_image())).unwrap();
+        let (mut fs, mut storage) = mounted(legacy_image());
         let mut output = [0; 8];
-        assert_eq!(fs.read("/hello", 0, &mut output).unwrap(), 5);
+        assert_eq!(fs.read(&mut storage, "/hello", 0, &mut output).unwrap(), 5);
         assert_eq!(&output[..5], b"hello");
     }
 
@@ -1566,17 +1635,30 @@ mod tests {
         put32(&mut image, 19 * BLOCK, 20);
         put32(&mut image, 20 * BLOCK, 21);
 
-        let mut fs = Ext4::mount(ModelStorage::new(image)).unwrap();
-        let inode = fs.load_inode(3).unwrap();
-        assert_eq!(fs.map_file_block(&inode, 0).unwrap(), Some(11));
-        assert_eq!(fs.map_file_block(&inode, 12).unwrap(), Some(13));
-        assert_eq!(fs.map_file_block(&inode, 12 + 255).unwrap(), Some(14));
-        assert_eq!(fs.map_file_block(&inode, 12 + 256).unwrap(), Some(17));
+        let (mut fs, mut storage) = mounted(image);
+        let inode = fs.load_inode(&mut storage, 3).unwrap();
         assert_eq!(
-            fs.map_file_block(&inode, 12 + 256 + 256 * 256).unwrap(),
+            fs.map_file_block(&mut storage, &inode, 0).unwrap(),
+            Some(11)
+        );
+        assert_eq!(
+            fs.map_file_block(&mut storage, &inode, 12).unwrap(),
+            Some(13)
+        );
+        assert_eq!(
+            fs.map_file_block(&mut storage, &inode, 12 + 255).unwrap(),
+            Some(14)
+        );
+        assert_eq!(
+            fs.map_file_block(&mut storage, &inode, 12 + 256).unwrap(),
+            Some(17)
+        );
+        assert_eq!(
+            fs.map_file_block(&mut storage, &inode, 12 + 256 + 256 * 256)
+                .unwrap(),
             Some(21)
         );
-        assert_eq!(fs.map_file_block(&inode, 13).unwrap(), None);
+        assert_eq!(fs.map_file_block(&mut storage, &inode, 13).unwrap(), None);
     }
 
     #[test]
@@ -1584,26 +1666,27 @@ mod tests {
         const BLOCK: usize = 1024;
         let mut image = legacy_image();
         put32(&mut image, 5 * BLOCK + 256 + 0x28, 32);
-        let mut fs = Ext4::mount(ModelStorage::new(image)).unwrap();
-        let inode = fs.load_inode(3).unwrap();
+        let (mut fs, mut storage) = mounted(image);
+        let inode = fs.load_inode(&mut storage, 3).unwrap();
         assert_eq!(
-            fs.map_file_block(&inode, 0).unwrap_err(),
+            fs.map_file_block(&mut storage, &inode, 0).unwrap_err(),
             Error::Corrupt(Corrupt::InvalidLegacyBlockMap)
         );
 
         let mut image = legacy_image();
         put32(&mut image, 5 * BLOCK + 256 + 0x28 + 12 * 4, 32);
-        let mut fs = Ext4::mount(ModelStorage::new(image)).unwrap();
-        let inode = fs.load_inode(3).unwrap();
+        let (mut fs, mut storage) = mounted(image);
+        let inode = fs.load_inode(&mut storage, 3).unwrap();
         assert_eq!(
-            fs.map_file_block(&inode, 12).unwrap_err(),
+            fs.map_file_block(&mut storage, &inode, 12).unwrap_err(),
             Error::Corrupt(Corrupt::InvalidLegacyBlockMap)
         );
 
         let pointers = (BLOCK / 4) as u64;
         let past_capacity = 12 + pointers + pointers * pointers + pointers * pointers * pointers;
         assert_eq!(
-            fs.map_file_block(&inode, past_capacity).unwrap_err(),
+            fs.map_file_block(&mut storage, &inode, past_capacity)
+                .unwrap_err(),
             Error::Corrupt(Corrupt::InvalidLegacyBlockMap)
         );
     }
@@ -1611,28 +1694,28 @@ mod tests {
     #[test]
     fn committed_journal_data_is_a_read_overlay() {
         let original = journal_image(true, false);
-        let mut fs = Ext4::mount(ModelStorage::new(original.clone())).unwrap();
+        let (mut fs, mut storage) = mounted(original.clone());
         let mut output = [0; 5];
-        assert_eq!(fs.read("/hello", 0, &mut output).unwrap(), 5);
+        assert_eq!(fs.read(&mut storage, "/hello", 0, &mut output).unwrap(), 5);
         assert_eq!(&output, b"new!!");
         assert_eq!(fs.recovered_blocks(), 1);
-        assert_eq!(fs.into_storage().durable_bytes(), original);
+        assert_eq!(storage.durable_bytes(), original);
     }
 
     #[test]
     fn incomplete_transaction_never_becomes_visible() {
-        let mut fs = Ext4::mount(ModelStorage::new(journal_image(false, false))).unwrap();
+        let (mut fs, mut storage) = mounted(journal_image(false, false));
         let mut output = [0; 5];
-        fs.read("/hello", 0, &mut output).unwrap();
+        fs.read(&mut storage, "/hello", 0, &mut output).unwrap();
         assert_eq!(&output, b"hello");
         assert_eq!(fs.recovered_blocks(), 0);
     }
 
     #[test]
     fn later_committed_revoke_suppresses_replay() {
-        let mut fs = Ext4::mount(ModelStorage::new(journal_image(true, true))).unwrap();
+        let (mut fs, mut storage) = mounted(journal_image(true, true));
         let mut output = [0; 5];
-        fs.read("/hello", 0, &mut output).unwrap();
+        fs.read(&mut storage, "/hello", 0, &mut output).unwrap();
         assert_eq!(&output, b"hello");
         assert_eq!(fs.recovered_blocks(), 0);
     }
@@ -1640,9 +1723,9 @@ mod tests {
     #[test]
     fn checksum_v3_validates_super_descriptor_data_and_commit() {
         let image = checksummed_journal_image();
-        let mut fs = Ext4::mount(ModelStorage::new(image.clone())).unwrap();
+        let (mut fs, mut storage) = mounted(image.clone());
         let mut output = [0; 5];
-        fs.read("/hello", 0, &mut output).unwrap();
+        fs.read(&mut storage, "/hello", 0, &mut output).unwrap();
         assert_eq!(&output, b"new!!");
 
         for offset in [
@@ -1653,8 +1736,9 @@ mod tests {
         ] {
             let mut corrupt = image.clone();
             corrupt[offset] ^= 1;
+            let mut storage = ModelStorage::new(corrupt);
             assert!(matches!(
-                Ext4::mount(ModelStorage::new(corrupt)),
+                Ext4::mount(&mut storage),
                 Err(Error::Corrupt(Corrupt::JournalChecksum))
             ));
         }
@@ -1663,14 +1747,14 @@ mod tests {
     #[test]
     fn every_journal_read_effect_can_fail_cleanly() {
         let image = journal_image(true, false);
-        let successful = Ext4::mount(ModelStorage::new(image.clone())).unwrap();
-        let effects = successful.storage().effects().len();
+        let (_successful, storage) = mounted(image.clone());
+        let effects = storage.effects().len();
         assert!(effects >= 8);
         for sequence in 0..effects {
+            let mut storage =
+                ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
             assert!(matches!(
-                Ext4::mount(
-                    ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence))
-                ),
+                Ext4::mount(&mut storage),
                 Err(Error::Storage(ModelError::InjectedIo))
             ));
         }
@@ -1678,19 +1762,22 @@ mod tests {
 
     #[test]
     fn every_read_effect_can_fail_cleanly() {
-        let mut successful = Ext4::mount(ModelStorage::new(image())).unwrap();
+        let (mut successful, mut successful_storage) = mounted(image());
         let mut output = [0; 5];
-        successful.read("/hello", 0, &mut output).unwrap();
-        let effects = successful.storage().effects().len();
+        successful
+            .read(&mut successful_storage, "/hello", 0, &mut output)
+            .unwrap();
+        let effects = successful_storage.effects().len();
         assert!(effects >= 6);
 
         for sequence in 0..effects {
-            let storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
-            match Ext4::mount(storage) {
+            let mut storage =
+                ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
+            match Ext4::mount(&mut storage) {
                 Err(Error::Storage(ModelError::InjectedIo)) => {}
                 Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
                 Ok(mut fs) => {
-                    let error = fs.read("/hello", 0, &mut output).unwrap_err();
+                    let error = fs.read(&mut storage, "/hello", 0, &mut output).unwrap_err();
                     assert_eq!(error, Error::Storage(ModelError::InjectedIo));
                 }
             }
@@ -1717,8 +1804,8 @@ mod tests {
     #[test]
     fn transaction_dirty_blocks_are_private_and_preallocated() {
         const BLOCK: usize = 1024;
-        let mut fs = Ext4::mount(ModelStorage::new(image())).unwrap();
-        let effects_before = fs.storage().effects().len();
+        let (mut fs, mut storage) = mounted(image());
+        let effects_before = storage.effects().len();
         {
             let mut transaction = fs.begin_transaction();
             transaction.reserve_blocks(1).unwrap();
@@ -1734,77 +1821,83 @@ mod tests {
             replacement[..5].copy_from_slice(b"again");
             transaction.write_block(11, &replacement).unwrap();
             let mut visible = vec![0; BLOCK];
-            transaction.read_block(11, &mut visible).unwrap();
+            transaction
+                .read_block(&mut storage, 11, &mut visible)
+                .unwrap();
             assert_eq!(&visible[..5], b"again");
         }
 
-        assert_eq!(fs.storage().effects().len(), effects_before);
+        assert_eq!(storage.effects().len(), effects_before);
         assert!(
-            fs.storage()
+            storage
                 .effects()
                 .iter()
                 .all(|effect| effect.kind != EffectKind::Write)
         );
         let mut contents = [0; 5];
-        fs.read("/hello", 0, &mut contents).unwrap();
+        fs.read(&mut storage, "/hello", 0, &mut contents).unwrap();
         assert_eq!(&contents, b"hello");
     }
 
     #[test]
     fn transaction_modify_loads_once_and_reads_its_own_write() {
         const BLOCK: usize = 1024;
-        let mut fs = Ext4::mount(ModelStorage::new(image())).unwrap();
-        let effects_before = fs.storage().effects().len();
+        let (mut fs, mut storage) = mounted(image());
+        let effects_before = storage.effects().len();
         {
             let mut transaction = fs.begin_transaction();
             transaction.reserve_blocks(1).unwrap();
             transaction
-                .modify_block(11, |block| block[..5].copy_from_slice(b"new!!"))
+                .modify_block(&mut storage, 11, |block| {
+                    block[..5].copy_from_slice(b"new!!")
+                })
                 .unwrap();
             let mut contents = vec![0; BLOCK];
-            transaction.read_block(11, &mut contents).unwrap();
+            transaction
+                .read_block(&mut storage, 11, &mut contents)
+                .unwrap();
             assert_eq!(&contents[..5], b"new!!");
         }
-        assert_eq!(fs.storage().effects().len(), effects_before + 1);
-        assert_eq!(
-            fs.storage().effects().last().unwrap().kind,
-            EffectKind::Read
-        );
+        assert_eq!(storage.effects().len(), effects_before + 1);
+        assert_eq!(storage.effects().last().unwrap().kind, EffectKind::Read);
     }
 
     #[test]
     fn transaction_enforces_reservations_and_block_bounds() {
         const BLOCK: usize = 1024;
-        let mut fs = Ext4::mount(ModelStorage::new(image())).unwrap();
+        let (mut fs, mut storage) = mounted(image());
         let mut transaction = fs.begin_transaction();
         let block = vec![0; BLOCK];
         assert_eq!(
             transaction.write_block(11, &block).unwrap_err(),
-            Error::ReservationExhausted
+            FsError::ReservationExhausted
         );
         assert_eq!(
-            transaction.read_block(32, &mut [0; BLOCK]).unwrap_err(),
+            transaction
+                .read_block(&mut storage, 32, &mut [0; BLOCK])
+                .unwrap_err(),
             Error::InvalidArgument
         );
         assert_eq!(
             transaction.write_block(11, &[0; 4]).unwrap_err(),
-            Error::InvalidArgument
+            FsError::InvalidArgument
         );
         assert_eq!(transaction.dirty_blocks(), 0);
     }
 
     #[test]
     fn failed_transaction_load_returns_its_reserved_buffer() {
-        let successful = Ext4::mount(ModelStorage::new(image())).unwrap();
-        let next_effect = successful.storage().effects().len();
-        drop(successful);
+        let (_successful, successful_storage) = mounted(image());
+        let next_effect = successful_storage.effects().len();
 
-        let storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(next_effect));
-        let mut fs = Ext4::mount(storage).unwrap();
+        let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(next_effect));
+        let mut fs = Ext4::mount(&mut storage).unwrap();
         let mut transaction = fs.begin_transaction();
         transaction.reserve_blocks(1).unwrap();
         assert_eq!(
-            transaction.modify_block(11, |_| {}).unwrap_err(),
+            transaction
+                .modify_block(&mut storage, 11, |_| {})
+                .unwrap_err(),
             Error::Storage(ModelError::InjectedIo)
         );
         assert_eq!(transaction.dirty_blocks(), 0);
@@ -1826,8 +1919,9 @@ mod tests {
         let mut image = image();
         let sb = SUPERBLOCK_OFFSET as usize;
         put32(&mut image, sb + 0x64, ondisk::RO_COMPAT_METADATA_CSUM);
+        let mut storage = ModelStorage::new(image);
         assert_eq!(
-            Ext4::mount(ModelStorage::new(image)).err(),
+            Ext4::mount(&mut storage).err(),
             Some(Error::Corrupt(Corrupt::SuperblockChecksum)),
         );
     }

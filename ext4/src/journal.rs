@@ -94,8 +94,12 @@ struct Tag {
     checksum: u32,
 }
 
-impl<S: Storage> Ext4<S> {
-    pub(crate) fn commit_journal(&mut self, dirty: &[DirtyBlock]) -> Result<(), Error<S::Error>> {
+impl Ext4 {
+    pub(crate) fn commit_journal<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        dirty: &[DirtyBlock],
+    ) -> Result<(), Error<S::Error>> {
         if dirty.is_empty() {
             return Ok(());
         }
@@ -106,11 +110,11 @@ impl<S: Storage> Ext4<S> {
             return Err(Unsupported::JournalWriteProfile.into());
         }
 
-        let journal = self.load_inode(self.superblock.journal_inode)?;
+        let journal = self.load_inode(storage, self.superblock.journal_inode)?;
         if journal.mode & 0xf000 != 0x8000 {
             return Err(Corrupt::InvalidJournal.into());
         }
-        let format = self.load_journal_format(&journal)?;
+        let format = self.load_journal_format(storage, &journal)?;
         if format.start != 0
             || (!format.csum_v3() && format.has_checksums())
             || format.incompat & INCOMPAT_ASYNC_COMMIT != 0
@@ -145,7 +149,7 @@ impl<S: Storage> Ext4<S> {
         let superblock_offset = superblock_target
             .checked_mul(u64::from(self.superblock.block_size))
             .ok_or(Corrupt::AddressOverflow)?;
-        self.read_storage(superblock_offset, &mut activation_superblock)?;
+        self.read_storage(storage, superblock_offset, &mut activation_superblock)?;
         set_recovery_flag(&mut activation_superblock, true)?;
         let mut checkpoint_superblock = clone_bytes::<S::Error>(&final_superblock.bytes)?;
         set_recovery_flag(&mut checkpoint_superblock, true)?;
@@ -220,7 +224,7 @@ impl<S: Storage> Ext4<S> {
             update_commit_checksum(format, &mut commit);
         }
 
-        let mut active_journal_superblock = self.read_journal_block(&journal, 0)?;
+        let mut active_journal_superblock = self.read_journal_block(storage, &journal, 0)?;
         put_be32(&mut active_journal_superblock, 0x18, format.sequence);
         put_be32(&mut active_journal_superblock, 0x1c, format.first);
         if format.has_checksums() {
@@ -246,7 +250,7 @@ impl<S: Storage> Ext4<S> {
                 continue;
             }
             let physical = self
-                .map_file_block(&journal, u64::from(logical))?
+                .map_file_block(storage, &journal, u64::from(logical))?
                 .ok_or(Corrupt::InvalidJournal)?;
             if physical >= self.superblock.blocks_count
                 || dirty.iter().any(|block| block.number == physical)
@@ -264,20 +268,24 @@ impl<S: Storage> Ext4<S> {
         let commit_physical = *journal_offsets.last().ok_or(Corrupt::InvalidJournal)?;
 
         // Prepare an ignored transaction while the journal is still clean.
-        self.write_physical_block(descriptor_physical, &descriptor)?;
+        self.write_physical_block(storage, descriptor_physical, &descriptor)?;
         for (index, bytes) in journal_data.iter().enumerate() {
-            self.write_physical_block(journal_offsets[index + 2], bytes)?;
+            self.write_physical_block(storage, journal_offsets[index + 2], bytes)?;
         }
-        self.flush_storage()?;
+        self.flush_storage(storage)?;
 
         // Activate recovery only after every descriptor and data block is durable.
-        self.write_physical_block(superblock_target, &activation_superblock)?;
-        self.write_physical_block(journal_superblock_physical, &active_journal_superblock)?;
-        self.flush_storage()?;
+        self.write_physical_block(storage, superblock_target, &activation_superblock)?;
+        self.write_physical_block(
+            storage,
+            journal_superblock_physical,
+            &active_journal_superblock,
+        )?;
+        self.flush_storage(storage)?;
 
         // The commit block is the atomic visibility boundary.
-        self.write_physical_block(commit_physical, &commit)?;
-        self.flush_storage()?;
+        self.write_physical_block(storage, commit_physical, &commit)?;
+        self.flush_storage(storage)?;
 
         // Keep needs_recovery set until every home block is durable.
         for block in dirty {
@@ -286,23 +294,30 @@ impl<S: Storage> Ext4<S> {
             } else {
                 &block.bytes
             };
-            self.write_physical_block(block.number, bytes)?;
+            self.write_physical_block(storage, block.number, bytes)?;
         }
-        self.flush_storage()?;
+        self.flush_storage(storage)?;
 
         // The checkpoint is complete, so either cleanup write may reach media first.
-        self.write_physical_block(superblock_target, &final_superblock.bytes)?;
-        self.write_physical_block(journal_superblock_physical, &clean_journal_superblock)?;
-        self.flush_storage()?;
+        self.write_physical_block(storage, superblock_target, &final_superblock.bytes)?;
+        self.write_physical_block(
+            storage,
+            journal_superblock_physical,
+            &clean_journal_superblock,
+        )?;
+        self.flush_storage(storage)?;
         Ok(())
     }
 
-    pub(super) fn replay_journal(&mut self) -> Result<(), Error<S::Error>> {
-        let journal = self.load_inode(self.superblock.journal_inode)?;
+    pub(super) fn replay_journal<S: Storage>(
+        &mut self,
+        storage: &mut S,
+    ) -> Result<(), Error<S::Error>> {
+        let journal = self.load_inode(storage, self.superblock.journal_inode)?;
         if journal.mode & 0xf000 != 0x8000 {
             return Err(Corrupt::InvalidJournal.into());
         }
-        let format = self.load_journal_format(&journal)?;
+        let format = self.load_journal_format(storage, &journal)?;
         if format.start == 0 {
             return Ok(());
         }
@@ -316,7 +331,7 @@ impl<S: Storage> Ext4<S> {
         let mut visited = 0u32;
 
         while visited < format.max_len - format.first {
-            let bytes = self.read_journal_block(&journal, block)?;
+            let bytes = self.read_journal_block(storage, &journal, block)?;
             visited += 1;
             if be32(&bytes, 0) != MAGIC || be32(&bytes, 8) != sequence {
                 break;
@@ -330,7 +345,7 @@ impl<S: Storage> Ext4<S> {
                         if visited >= format.max_len - format.first {
                             return Err(Corrupt::InvalidJournal.into());
                         }
-                        let mut data = self.read_journal_block(&journal, block)?;
+                        let mut data = self.read_journal_block(storage, &journal, block)?;
                         visited += 1;
                         verify_data_checksum(format, sequence, &tag, &data)?;
                         if tag.flags & FLAG_ESCAPE != 0 {
@@ -393,8 +408,12 @@ impl<S: Storage> Ext4<S> {
         Ok(())
     }
 
-    fn load_journal_format(&mut self, inode: &Inode) -> Result<Format, Error<S::Error>> {
-        let bytes = self.read_journal_block(inode, 0)?;
+    fn load_journal_format<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<Format, Error<S::Error>> {
+        let bytes = self.read_journal_block(storage, inode, 0)?;
         if be32(&bytes, 0) != MAGIC || be32(&bytes, 4) != SUPERBLOCK_V2 {
             return Err(Corrupt::InvalidJournal.into());
         }
@@ -478,8 +497,9 @@ impl<S: Storage> Ext4<S> {
         Ok(format)
     }
 
-    fn read_journal_block(
+    fn read_journal_block<S: Storage>(
         &mut self,
+        storage: &mut S,
         inode: &Inode,
         logical: u32,
     ) -> Result<Vec<u8>, Error<S::Error>> {
@@ -487,13 +507,18 @@ impl<S: Storage> Ext4<S> {
         let offset = u64::from(logical)
             .checked_mul(u64::from(self.superblock.block_size))
             .ok_or(Corrupt::AddressOverflow)?;
-        if self.read_inode_data(inode, offset, &mut bytes)? != bytes.len() {
+        if self.read_inode_data(storage, inode, offset, &mut bytes)? != bytes.len() {
             return Err(Corrupt::InvalidJournal.into());
         }
         Ok(bytes)
     }
 
-    fn write_physical_block(&mut self, physical: u64, bytes: &[u8]) -> Result<(), Error<S::Error>> {
+    fn write_physical_block<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        physical: u64,
+        bytes: &[u8],
+    ) -> Result<(), Error<S::Error>> {
         if physical >= self.superblock.blocks_count
             || bytes.len() != self.superblock.block_size as usize
         {
@@ -502,11 +527,11 @@ impl<S: Storage> Ext4<S> {
         let offset = physical
             .checked_mul(u64::from(self.superblock.block_size))
             .ok_or(Corrupt::AddressOverflow)?;
-        self.storage.write(offset, bytes).map_err(Error::Storage)
+        storage.write(offset, bytes).map_err(Error::Storage)
     }
 
-    fn flush_storage(&mut self) -> Result<(), Error<S::Error>> {
-        self.storage.flush().map_err(Error::Storage)
+    fn flush_storage<S: Storage>(&mut self, storage: &mut S) -> Result<(), Error<S::Error>> {
+        storage.flush().map_err(Error::Storage)
     }
 }
 
