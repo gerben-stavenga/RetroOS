@@ -26,7 +26,6 @@ rust_binary(
         "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",
-        "@lwext4//:lwext4_host",
     ],
 )
 
@@ -48,6 +47,5 @@ rust_binary(
         "//kernel:kernel",
         "//lib",
         "@crates//:sdl2",
-        "@lwext4//:lwext4_host",
     ],
 )

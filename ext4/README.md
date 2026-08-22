@@ -162,5 +162,5 @@ contract and testing torn control records is the next durability step.
    writer done; circular reuse, revokes, and torn-control-record handling remain.
 6. Validate every operation and crash point against `e2fsck` and Linux.
 
-RetroOS uses this engine for its root ext filesystem. Additional read-only
-volumes retain an lwext4 fallback while compatibility work continues.
+RetroOS uses this engine for every ext filesystem; there is no second ext
+implementation or compatibility fallback in the kernel.

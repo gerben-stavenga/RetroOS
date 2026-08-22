@@ -10,8 +10,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::kernel::block::{Disk, Volume};
-use crate::kernel::fs::lwext4::{Lwext4Fs, MountMode, is_ext};
-use crate::kernel::fs::portable_ext4::PortableExt4Fs;
+use crate::kernel::fs::portable_ext4::{PortableExt4Fs, is_ext};
 use crate::kernel::{console::Console, vfs};
 
 #[repr(C)]
@@ -217,19 +216,7 @@ pub(crate) fn mount_physical_fallbacks(
                 );
                 slot += 1;
             }
-            Err(_) => match Lwext4Fs::new(volume, slot, MountMode::ReadOnly) {
-                Ok(fs) => {
-                    vfs::mount(prefix, Box::leak(Box::new(fs)));
-                    crate::screenln!(
-                        screen,
-                        "lwext4 fallback partition ({} MB) → /{}",
-                        volume.sectors / 2048,
-                        core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?")
-                    );
-                    slot += 1;
-                }
-                Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
-            },
+            Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
         }
     }
     slot
@@ -319,7 +306,7 @@ pub fn mount_modules(
         )
     };
     for module in modules {
-        assert!(slot < 8, "too many ext4 mounts (lwext4 allows 8 slots)");
+        assert!(slot < 8, "too many ext4 mounts (maximum 8)");
         let disk = ModuleDisk::from_boot_module(module, reader.expect("missing module reader"))
             .expect("invalid Multiboot module");
         let disk: &'static dyn Disk = Box::leak(Box::new(disk));
