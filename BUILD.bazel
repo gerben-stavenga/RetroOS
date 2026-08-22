@@ -384,7 +384,7 @@ _DISK_CMD = """
 
     # RetroOS writes a file only when it belongs to RetroOS's group (the gid of
     # its own C: root) AND carries the group-write bit -- ordinary Unix
-    # permissions, checked against the ext4 inode (see lwext4::writable). The
+    # permissions, checked against the ext4 inode. The
     # tar arrives 0555/0755, so without this the image would be honestly
     # read-only and every savegame would fail with "access denied". Extraction
     # as the build user already gives the whole tree one consistent gid, which

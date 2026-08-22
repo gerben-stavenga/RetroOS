@@ -60,7 +60,7 @@ backends — `arch-metal` (real CPU, `no_std`/Bazel) and `arch-interp` (Unicorn,
   - `kernel/src/kernel/{block,sound,net,console,vfs,portio,pci}.rs` - the driver/fs APIs
     the personalities call; they own the policy and dispatch downward
   - `kernel/src/kernel/drivers/` - concrete hardware only (hdd, nvme, hda, ac97, alc298_amp)
-  - `kernel/src/kernel/fs/` - filesystem backends (hostfs, lwext4)
+  - `kernel/src/kernel/fs/` - filesystem backends (hostfs, portable ext4)
   - `kernel/src/vga.rs` - the single emulated VGA model
 - `lib/` - Freestanding library (VGA render, ELF, TAR, MD5)
 - `play/` - `retroos-play` windowed host emulator (on `arch-interp`)
@@ -102,7 +102,7 @@ existing GRUB (`kernel.elf` is multiboot-loadable — see BOOTING.md).
 - **Copy-on-Write Forking**: Fork shares parent pages read-only, allocates on write fault
 - **Event Loop Kernel**: ring-3 execution always comes back as a kernel-facing event
 - **Personalities**: ELF → Linux ABI personality; DOS `.COM`/MZ `.EXE` → DOS personality (VM86 + DPMI), both layered on the same execution modes
-- **Filesystems**: ext (via lwext4) and hostfs. The boot partition is a TAR the MBR bootloader reads to find `kernel.elf`; the kernel never mounts it
+- **Filesystems**: ext (via the portable Rust engine in `//ext4`) and hostfs. The boot partition is a TAR the MBR bootloader reads to find `kernel.elf`; the kernel never mounts it
 - **One emulated VGA**: a single VGA model presented through a sink (metal GOP fbcon / hosted window); backends supply only a framebuffer
 - **Probe once**: `platform` reads the machine into typed ADTs at startup; `focus` owns singleton console hardware; `io_policy` rebuilds the TSS IOPB per swap-in
 

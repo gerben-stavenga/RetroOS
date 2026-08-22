@@ -1,0 +1,8 @@
+The portable ext4 implementation's read-side checksum and validation
+conventions were cross-checked against ext4-view:
+
+    https://github.com/nicholasbishop/ext4-view-rs
+
+ext4-view source files are Copyright 2024-2025 Google LLC and are available
+under the Apache License 2.0 or MIT license. RetroOS's implementation has a
+different public API, ownership model, storage contract, and fault model.

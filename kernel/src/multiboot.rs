@@ -10,9 +10,8 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::kernel::block::{Disk, Volume};
-use crate::kernel::fs::lwext4::{is_ext, Lwext4Fs, MountMode};
+use crate::kernel::fs::portable_ext4::{PortableExt4Fs, is_ext};
 use crate::kernel::{console::Console, vfs};
-
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,23 +47,41 @@ struct ParsedMount {
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
 fn parse_mount(command: &[u8]) -> Option<ParsedMount> {
     let (key, path) = arch_abi::cmdline::parse_key_value(command)?;
-    if !arch_abi::cmdline::key_eq(key, b"retroos.mount") { return None; }
+    if !arch_abi::cmdline::key_eq(key, b"retroos.mount") {
+        return None;
+    }
     assert!(!path.is_empty(), "retroos.mount path must be absolute");
     assert_eq!(path[0], b'/', "retroos.mount path must be absolute");
-    assert!(!path.contains(&b' '), "retroos.mount accepts one token only");
+    assert!(
+        !path.contains(&b' '),
+        "retroos.mount accepts one token only"
+    );
 
     let mut out = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
     let path = &path[1..];
-    if path.is_empty() { return Some(ParsedMount { bytes: out, len: 0 }) }
-    assert_ne!(*path.last().unwrap(), b'/', "retroos.mount path may not end in '/'");
+    if path.is_empty() {
+        return Some(ParsedMount { bytes: out, len: 0 });
+    }
+    assert_ne!(
+        *path.last().unwrap(),
+        b'/',
+        "retroos.mount path may not end in '/'"
+    );
     let mut len = 0;
     for component in path.split(|&b| b == b'/') {
-        assert!(!component.is_empty(), "retroos.mount path has an empty component");
-        assert!(component != b"." && component != b"..",
-            "retroos.mount path may not contain '.' or '..'");
+        assert!(
+            !component.is_empty(),
+            "retroos.mount path has an empty component"
+        );
+        assert!(
+            component != b"." && component != b"..",
+            "retroos.mount path may not contain '.' or '..'"
+        );
         for &b in component {
-            assert!(b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'),
-                "retroos.mount path contains an unsupported character");
+            assert!(
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'),
+                "retroos.mount path contains an unsupported character"
+            );
             assert!(len + 1 < out.len(), "retroos.mount path is too long");
             out[len] = b;
             len += 1;
@@ -89,26 +106,45 @@ where
     ReadCommand: FnMut(u32, &mut [u8]) -> Option<usize>,
 {
     let mut accepted = [None; arch_abi::MAX_BOOT_MODULES];
-    if flags & MULTIBOOT_INFO_MODULES == 0 || mods_addr == 0 { return accepted; }
+    if flags & MULTIBOOT_INFO_MODULES == 0 || mods_addr == 0 {
+        return accepted;
+    }
     for index in 0..(mods_count as usize).min(32) {
         let words = read_descriptor(index as u32);
         let descriptor = MultibootModule {
-            mod_start: words[0], mod_end: words[1], string: words[2], reserved: words[3],
+            mod_start: words[0],
+            mod_end: words[1],
+            string: words[2],
+            reserved: words[3],
         };
-        if descriptor.string == 0 { continue; }
-        let mut command = [0u8; 256];
-        let Some(len_command) = read_command(descriptor.string, &mut command) else { continue };
-        let Some(mount) = parse_mount(&command[..len_command]) else { continue };
-        assert!(descriptor.mod_end > descriptor.mod_start,
-            "Multiboot module has an empty or wrapped range");
-        let len = (descriptor.mod_end - descriptor.mod_start) as usize;
-        assert!(len != 0 && len.is_multiple_of(512),
-            "Multiboot module size is not sector-aligned");
-        for prior in accepted.iter().flatten() {
-            assert!(prior.mount[..prior.mount_len] != mount.bytes[..mount.len],
-                "duplicate retroos.mount path");
+        if descriptor.string == 0 {
+            continue;
         }
-        let slot = accepted.iter().position(Option::is_none)
+        let mut command = [0u8; 256];
+        let Some(len_command) = read_command(descriptor.string, &mut command) else {
+            continue;
+        };
+        let Some(mount) = parse_mount(&command[..len_command]) else {
+            continue;
+        };
+        assert!(
+            descriptor.mod_end > descriptor.mod_start,
+            "Multiboot module has an empty or wrapped range"
+        );
+        let len = (descriptor.mod_end - descriptor.mod_start) as usize;
+        assert!(
+            len != 0 && len.is_multiple_of(512),
+            "Multiboot module size is not sector-aligned"
+        );
+        for prior in accepted.iter().flatten() {
+            assert!(
+                prior.mount[..prior.mount_len] != mount.bytes[..mount.len],
+                "duplicate retroos.mount path"
+            );
+        }
+        let slot = accepted
+            .iter()
+            .position(Option::is_none)
             .expect("too many RetroOS Multiboot modules (maximum 4)");
         accepted[slot] = Some(AcceptedModule {
             start: descriptor.mod_start as u64,
@@ -126,8 +162,10 @@ pub(crate) fn reserve_modules(
     mut reserve: impl FnMut(u64, u64),
 ) {
     for module in modules.iter().flatten() {
-        reserve(module.start / arch_abi::PAGE_SIZE as u64,
-            (module.start + module.len as u64).div_ceil(arch_abi::PAGE_SIZE as u64));
+        reserve(
+            module.start / arch_abi::PAGE_SIZE as u64,
+            (module.start + module.len as u64).div_ceil(arch_abi::PAGE_SIZE as u64),
+        );
     }
 }
 
@@ -139,7 +177,11 @@ pub(crate) fn handoff_modules(
     for (slot, module) in modules.into_iter().enumerate() {
         let Some(module) = module else { continue };
         result[slot] = Some(arch_abi::BootModule::new(
-            module.start, module.len, module.mount, module.mount_len));
+            module.start,
+            module.len,
+            module.mount,
+            module.mount_len,
+        ));
     }
     result
 }
@@ -155,18 +197,23 @@ pub(crate) fn mount_physical_fallbacks(
 ) -> usize {
     let mut slot = first_slot;
     for (disk_number, &volume) in (1usize..).zip(ext.iter()) {
-        if slot >= max_slots { break; }
+        if slot >= max_slots {
+            break;
+        }
         let mut prefix = Vec::new();
         prefix.extend_from_slice(b"disk");
         prefix.extend_from_slice(disk_number.to_string().as_bytes());
         prefix.push(b'/');
         let prefix: &'static [u8] = Box::leak(prefix.into_boxed_slice());
-        match Lwext4Fs::new(volume, slot, MountMode::ReadOnly) {
+        match PortableExt4Fs::new(volume) {
             Ok(fs) => {
                 vfs::mount(prefix, Box::leak(Box::new(fs)));
-                crate::screenln!(screen, "ext4 partition ({} MB) → /{}",
+                crate::screenln!(
+                    screen,
+                    "portable ext4 partition ({} MB) → /{}",
                     volume.sectors / 2048,
-                    core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?"));
+                    core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?")
+                );
                 slot += 1;
             }
             Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
@@ -186,7 +233,9 @@ impl ModuleDisk {
         module: arch_abi::BootModule,
         read_physical: arch_abi::BootPhysicalReader,
     ) -> Option<Self> {
-        if module.len == 0 || !module.len.is_multiple_of(512) { return None; }
+        if module.len == 0 || !module.len.is_multiple_of(512) {
+            return None;
+        }
         Some(Self {
             physical_start: module.physical_start,
             len: module.len,
@@ -201,22 +250,36 @@ impl Disk for ModuleDisk {
         let n = self.sectors().saturating_sub(lba).min(want);
         let count = n as usize * 512;
         if count != 0 {
-            let offset = lba.checked_mul(512)
+            let offset = lba
+                .checked_mul(512)
                 .expect("Multiboot module LBA offset overflow");
-            let physical = self.physical_start.checked_add(offset)
+            let physical = self
+                .physical_start
+                .checked_add(offset)
                 .expect("Multiboot module physical offset overflow");
-            assert!((self.read_physical)(physical, &mut buf[..count]),
-                "Multiboot module physical read failed");
+            assert!(
+                (self.read_physical)(physical, &mut buf[..count]),
+                "Multiboot module physical read failed"
+            );
         }
         buf[count..].fill(0);
         n as u32
     }
-    fn write(&self, _: u64, _: &[u8]) -> u32 { 0 }
-    fn sectors(&self) -> u64 { (self.len / 512) as u64 }
-    fn name(&self) -> &str { "multiboot-module" }
+    fn write(&self, _: u64, _: &[u8]) -> u32 {
+        0
+    }
+    fn sectors(&self) -> u64 {
+        (self.len / 512) as u64
+    }
+    fn name(&self) -> &str {
+        "multiboot-module"
+    }
 }
 
-pub struct ModuleMountSummary { pub has_root: bool, pub next_ext_slot: usize }
+pub struct ModuleMountSummary {
+    pub has_root: bool,
+    pub next_ext_slot: usize,
+}
 
 /// Mount each module as an independent volatile writable session. Raw ext4
 /// images are treated as whole disks; partition scanning is intentionally not
@@ -237,59 +300,110 @@ pub fn mount_modules(
     let reader = if modules.is_empty() {
         None
     } else {
-        Some(boot.boot_physical_reader.expect(
-            "Multiboot modules require a physical-memory reader"))
+        Some(
+            boot.boot_physical_reader
+                .expect("Multiboot modules require a physical-memory reader"),
+        )
     };
     for module in modules {
-        assert!(slot < 8, "too many ext4 mounts (lwext4 allows 8 slots)");
+        assert!(slot < 8, "too many ext4 mounts (maximum 8)");
         let disk = ModuleDisk::from_boot_module(module, reader.expect("missing module reader"))
             .expect("invalid Multiboot module");
         let disk: &'static dyn Disk = Box::leak(Box::new(disk));
-        let disk: &'static dyn Disk = Box::leak(Box::new(crate::kernel::block::overlay::RamOverlay::wrap(disk)));
+        let disk: &'static dyn Disk = Box::leak(Box::new(
+            crate::kernel::block::overlay::RamOverlay::wrap(disk),
+        ));
         let volume = Volume::whole(disk);
         assert!(is_ext(&volume), "Multiboot module is not a raw ext4 image");
-        let fs = Lwext4Fs::new(volume, slot, MountMode::ReadWrite)
-            .unwrap_or_else(|e| panic!("Multiboot ext4 mount failed: {}", e));
+        let fs = PortableExt4Fs::new(volume)
+            .unwrap_or_else(|error| panic!("portable Multiboot ext4 mount failed: {}", error));
         let fs: &'static dyn vfs::Filesystem = Box::leak(Box::new(fs));
         let mount = module.mount();
         let mount: &'static [u8] = Box::leak(mount.to_vec().into_boxed_slice());
-        vfs::mount_writable(mount, fs, if mount.is_empty() { crate::kernel::dos::c_root() } else { b"" });
+        vfs::mount_writable(
+            mount,
+            fs,
+            if mount.is_empty() {
+                crate::kernel::dos::c_root()
+            } else {
+                b""
+            },
+        );
         if mount.is_empty() {
-            crate::screenln!(screen, "Multiboot ext4 ({} MB, volatile overlay) → /", volume.sectors / 2048);
+            crate::screenln!(
+                screen,
+                "Multiboot ext4 ({} MB, volatile overlay) → /",
+                volume.sectors / 2048
+            );
         } else {
-            crate::screenln!(screen, "Multiboot ext4 ({} MB, volatile overlay) → /{}",
+            crate::screenln!(
+                screen,
+                "Multiboot ext4 ({} MB, volatile overlay) → /{}",
                 volume.sectors / 2048,
-                core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?"));
+                core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?")
+            );
         }
         has_root |= mount.is_empty();
         slot += 1;
     }
-    ModuleMountSummary { has_root, next_ext_slot: slot }
+    ModuleMountSummary {
+        has_root,
+        next_ext_slot: slot,
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{capture_modules, handoff_modules, parse_mount, Disk, ModuleDisk};
-    #[test] fn root_is_empty() { assert_eq!(parse_mount(b"retroos.mount=/").unwrap().len, 0); }
-    #[test] fn nested_is_normalized() { let p = parse_mount(b"retroos.mount=/home/retroos/GAMES").unwrap(); assert_eq!(&p.bytes[..p.len], b"home/retroos/GAMES/"); }
-    #[test] fn unrelated_is_ignored() { assert!(parse_mount(b"initrd /boot/initrd").is_none()); }
-    #[test] #[should_panic] fn extra_token_is_rejected() { parse_mount(b"retroos.mount=/ x"); }
-    #[test] #[should_panic] fn traversal_is_rejected() { parse_mount(b"retroos.mount=/a/../b"); }
+    use super::{Disk, ModuleDisk, capture_modules, handoff_modules, parse_mount};
+    #[test]
+    fn root_is_empty() {
+        assert_eq!(parse_mount(b"retroos.mount=/").unwrap().len, 0);
+    }
+    #[test]
+    fn nested_is_normalized() {
+        let p = parse_mount(b"retroos.mount=/home/retroos/GAMES").unwrap();
+        assert_eq!(&p.bytes[..p.len], b"home/retroos/GAMES/");
+    }
+    #[test]
+    fn unrelated_is_ignored() {
+        assert!(parse_mount(b"initrd /boot/initrd").is_none());
+    }
+    #[test]
+    #[should_panic]
+    fn extra_token_is_rejected() {
+        parse_mount(b"retroos.mount=/ x");
+    }
+    #[test]
+    #[should_panic]
+    fn traversal_is_rejected() {
+        parse_mount(b"retroos.mount=/a/../b");
+    }
 
     #[test]
     fn unrelated_modules_do_not_consume_accepted_slots() {
         let descriptors = [
-            [1, 0, 1, 0], [0, 0, 2, 0], [3, 2, 3, 0],
-            [4, 5, 4, 0], [4096, 4608, 5, 0],
+            [1, 0, 1, 0],
+            [0, 0, 2, 0],
+            [3, 2, 3, 0],
+            [4, 5, 4, 0],
+            [4096, 4608, 5, 0],
         ];
         let accepted = unsafe {
-            capture_modules(1 << 3, 5, 1,
+            capture_modules(
+                1 << 3,
+                5,
+                1,
                 |index| descriptors[index as usize],
                 |string, out| {
-                    let command: &[u8] = if string == 5 { b"retroos.mount=/" } else { b"initrd" };
+                    let command: &[u8] = if string == 5 {
+                        b"retroos.mount=/"
+                    } else {
+                        b"initrd"
+                    };
                     out[..command.len()].copy_from_slice(command);
                     Some(command.len())
-                })
+                },
+            )
         };
         assert_eq!(accepted.iter().flatten().count(), 1);
     }
@@ -299,13 +413,17 @@ mod tests {
     fn duplicate_mounts_fail_before_acceptance_completes() {
         let descriptors = [[0, 512, 1, 0], [1024, 1536, 2, 0]];
         let _ = unsafe {
-            capture_modules(1 << 3, 2, 1,
+            capture_modules(
+                1 << 3,
+                2,
+                1,
                 |index| descriptors[index as usize],
                 |_string, out| {
                     let command = b"retroos.mount=/";
                     out[..command.len()].copy_from_slice(command);
                     Some(command.len())
-                })
+                },
+            )
         };
     }
 
@@ -313,11 +431,17 @@ mod tests {
     #[should_panic(expected = "too many RetroOS Multiboot modules")]
     fn fifth_accepted_module_is_rejected() {
         let descriptors = [
-            [0, 512, 1, 0], [512, 1024, 2, 0], [1024, 1536, 3, 0],
-            [1536, 2048, 4, 0], [2048, 2560, 5, 0],
+            [0, 512, 1, 0],
+            [512, 1024, 2, 0],
+            [1024, 1536, 3, 0],
+            [1536, 2048, 4, 0],
+            [2048, 2560, 5, 0],
         ];
         let _ = unsafe {
-            capture_modules(1 << 3, 5, 1,
+            capture_modules(
+                1 << 3,
+                5,
+                1,
                 |index| descriptors[index as usize],
                 |string, out| {
                     let mut command = [0u8; 32];
@@ -325,7 +449,8 @@ mod tests {
                     command[15] = b'a' + (string as u8 - 1);
                     out[..16].copy_from_slice(&command[..16]);
                     Some(16)
-                })
+                },
+            )
         };
     }
 
@@ -333,7 +458,10 @@ mod tests {
     fn reservation_rounds_outward_and_handoff_preserves_physical_order() {
         let descriptors = [[0x123, 0x323, 1, 0], [0x1000, 0x1200, 2, 0]];
         let modules = unsafe {
-            capture_modules(1 << 3, 2, 1,
+            capture_modules(
+                1 << 3,
+                2,
+                1,
                 |index| descriptors[index as usize],
                 |string, out| {
                     let command: &[u8] = if string == 1 {
@@ -343,7 +471,8 @@ mod tests {
                     };
                     out[..command.len()].copy_from_slice(command);
                     Some(command.len())
-                })
+                },
+            )
         };
         let mut ranges = [(99, 99); 2];
         let mut range_count = 0;
@@ -371,14 +500,15 @@ mod tests {
         true
     }
 
-    fn fail_physical_read(_: u64, _: &mut [u8]) -> bool { false }
+    fn fail_physical_read(_: u64, _: &mut [u8]) -> bool {
+        false
+    }
 
     #[test]
     fn module_disk_reads_and_zero_fills() {
         static IMAGE: [u8; 1024] = [0x11; 1024];
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
-        let module = arch_abi::BootModule::new(
-            IMAGE.as_ptr() as u64, IMAGE.len(), mount, 0);
+        let module = arch_abi::BootModule::new(IMAGE.as_ptr() as u64, IMAGE.len(), mount, 0);
         let disk = ModuleDisk::from_boot_module(module, read_host_physical).unwrap();
         let mut output = [0xff; 1024];
         assert_eq!(disk.read(1, &mut output), 1);
@@ -391,8 +521,7 @@ mod tests {
     fn module_disk_reads_from_physical_offset() {
         static IMAGE: [u8; 2048] = [0x22; 2048];
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
-        let module = arch_abi::BootModule::new(
-            IMAGE.as_ptr() as u64 - 512, IMAGE.len(), mount, 0);
+        let module = arch_abi::BootModule::new(IMAGE.as_ptr() as u64 - 512, IMAGE.len(), mount, 0);
         let disk = ModuleDisk::from_boot_module(module, read_host_physical).unwrap();
         let mut output = [0xff; 512];
         assert_eq!(disk.read(1, &mut output), 1);

@@ -102,7 +102,7 @@ def main():
         run(["cp", args.grub_cfg, os.path.join(root, "boot", "grub", "grub.cfg")])
 
         # Same rule as the legacy image: RetroOS writes a file only when it
-        # belongs to the C: root's group AND carries g+w (lwext4::writable).
+        # belongs to the C: root's group AND carries g+w.
         retroos = os.path.join(root, "home", "retroos")
         if os.path.isdir(retroos):
             run(["chmod", "-R", "g+w", retroos])

@@ -27,7 +27,7 @@ tar xf bazel-bin/extras_tar.tar -C "$TMP" home/retroos/BOOT
 rm -rf "$C_ROOT/BOOT"
 cp -r "$TMP/home/retroos/BOOT" "$C_ROOT/BOOT"
 # RetroOS writes a file only when it belongs to the C: root's group AND carries
-# g+w (see lwext4::writable); DN rewrites its own .cfg/.ini in place.
+# g+w; DN rewrites its own .cfg/.ini in place.
 chmod -R g+w "$C_ROOT/BOOT"
 
 echo "installed $C_ROOT/BOOT ($(find "$C_ROOT/BOOT" -type f | wc -l) files)"
