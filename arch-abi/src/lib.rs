@@ -134,6 +134,8 @@ pub struct BootConfig {
     pub ram_overlay: bool,
     /// Optional HostFS COM port. `None` leaves HostFS disabled.
     pub hostfs_port: Option<ComPort>,
+    /// Optional kernel serial-console port. `None` leaves UART logging disabled.
+    pub serial_console_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
     /// Metal's temporary physical-memory reader. Hosted entries leave this empty.
@@ -149,6 +151,7 @@ impl BootConfig {
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
             hostfs_port: None,
+            serial_console_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
             boot_physical_reader: None,
         };
@@ -171,9 +174,21 @@ impl BootConfig {
         });
     }
 
+    /// Select the kernel serial console from `serial=com1` or `serial=com2`.
+    /// Invalid values leave the current selection unchanged.
+    pub fn set_serial_console_from_cmdline(&mut self, s: &[u8]) {
+        cmdline::for_each_key_value(s, |key, value| {
+            if !cmdline::key_eq(key, b"serial") { return; }
+            if let Some(port) = ComPort::parse_ascii(value) {
+                self.serial_console_port = Some(port);
+            }
+        });
+    }
+
     /// Record the headless command line (semicolon-separated program list).
     pub fn set_cmdline(&mut self, s: &[u8]) {
         self.set_hostfs_from_cmdline(s);
+        self.set_serial_console_from_cmdline(s);
         let n = s.len().min(self.cmdline.len());
         self.cmdline[..n].copy_from_slice(&s[..n]);
         self.cmdline_len = Some(n);
@@ -229,6 +244,22 @@ mod boot_config_tests {
         config.set_hostfs_from_cmdline(b"hostfs=com1");
         config.set_cmdline(b"TC/TCC.EXE -ms STUB.C");
         assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+    }
+
+    #[test]
+    fn serial_directives_are_case_insensitive_and_last_valid_wins() {
+        let mut config = BootConfig::empty();
+        assert_eq!(config.serial_console_port, None);
+        config.set_cmdline(b"SERIAL=COM1 serial=COM2 serial=invalid");
+        assert_eq!(config.serial_console_port, Some(ComPort::Com2));
+    }
+
+    #[test]
+    fn hostfs_and_serial_ports_are_parsed_independently() {
+        let mut config = BootConfig::empty();
+        config.set_cmdline(b"hostfs=com1 serial=com2;TESTS/X.COM");
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert_eq!(config.serial_console_port, Some(ComPort::Com2));
     }
 }
 

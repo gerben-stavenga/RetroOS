@@ -501,6 +501,24 @@ fn init_console_pipe() {
 /// sequence (shut down after), or the interactive DN loop.
 fn is_kernel_launch_directive(key: &[u8]) -> bool {
     arch_abi::cmdline::key_eq(key, b"hostfs")
+        || arch_abi::cmdline::key_eq(key, b"serial")
+}
+
+#[cfg(test)]
+mod launch_directive_tests {
+    use super::is_kernel_launch_directive;
+
+    #[test]
+    fn serial_directive_is_not_treated_as_a_program() {
+        let segment = arch_abi::cmdline::segments(b"serial=com2;TESTS/X.COM arg")
+            .nth(1)
+            .unwrap();
+        let launch = arch_abi::cmdline::launch(segment, is_kernel_launch_directive).unwrap();
+        assert_eq!(launch.program(), b"TESTS/X.COM");
+        let mut args = [0u8; 8];
+        let len = launch.write_arguments(&mut args);
+        assert_eq!(&args[..len], b"arg");
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
