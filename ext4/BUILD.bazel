@@ -1,0 +1,174 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+
+package(default_visibility = ["//visibility:public"])
+
+# A portable, synchronous ext2/3/4 engine.  It deliberately has no dependency
+# on RetroOS, libc, an executor, or a particular block layer.
+rust_library(
+    name = "ext4",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "portable_ext4",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    deps = ["@crc//:crc"],
+)
+
+rust_test(
+    name = "ext4_test",
+    crate = ":ext4",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+)
+
+# An independently generated modern image catches mistakes that a synthetic
+# fixture could accidentally share with the parser. Keep the journal clean and
+# disable only orphan_file, whose incompatible layout is not read yet.
+genrule(
+    name = "modern_image",
+    srcs = ["testdata/hello.txt"],
+    outs = ["modern.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/modern-image-root"
+mkdir -p "$$ROOT/dir"
+mkdir -p "$$ROOT/root-empty-dir"
+mkdir -p "$$ROOT/replace-dir"
+truncate -s 0 "$$ROOT/replace-dir/victim.bin"
+mkdir -p "$$ROOT/move-left/branch" "$$ROOT/move-right"
+cp $(location testdata/hello.txt) "$$ROOT/dir/hello.txt"
+cp $(location testdata/hello.txt) "$$ROOT/root-data.bin"
+truncate -s 0 "$$ROOT/dir/empty.bin"
+truncate -s 0 "$$ROOT/root-empty.bin"
+ln -s hello.txt "$$ROOT/dir/hello.link"
+ln -s dir "$$ROOT/dir.link"
+i=0
+while [ "$$i" -lt 300 ]; do
+  cp $(location testdata/hello.txt) "$$ROOT/dir/file-$$i"
+  i=$$((i + 1))
+done
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -O ^orphan_file -d "$$ROOT" "$@"
+/usr/sbin/e2fsck -fyD "$@" >/dev/null
+""",
+)
+
+# A compact four-group image. Population leaves two group-0 data blocks free
+# while group 1 retains BLOCK_UNINIT, so a three-block allocation must both
+# cross the group boundary and materialize group 1's implicit bitmap.
+genrule(
+    name = "multi_group_image",
+    outs = ["multi-group.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/multi-group-image-root"
+mkdir -p "$$ROOT"
+dd if=/dev/zero bs=4096 count=687 status=none | tr '\\000' x > "$$ROOT/filler.bin"
+truncate -s 0 "$$ROOT/target.bin"
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -O ^orphan_file -d "$$ROOT" "$@"
+""",
+)
+
+# Exhaust group 0's inode bitmap while leaving group 1 lazily initialized.
+# Creating one more file must materialize both of group 1's implicit bitmaps.
+genrule(
+    name = "inode_group_image",
+    outs = ["inode-group.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/inode-group-image-root"
+mkdir -p "$$ROOT/create" "$$ROOT/bulk"
+i=0
+while [ "$$i" -lt 1011 ]; do
+  truncate -s 0 "$$ROOT/bulk/f-$$i"
+  i=$$((i + 1))
+done
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -O ^orphan_file -d "$$ROOT" "$@"
+""",
+)
+
+genrule(
+    name = "linear_directory_image",
+    outs = ["linear-directory.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/linear-directory-image-root"
+mkdir -p "$$ROOT/linear"
+i=0
+while [ "$$i" -lt 500 ]; do
+  printf x > "$$ROOT/linear/file-$$i"
+  i=$$((i + 1))
+done
+truncate -s 0 "$$ROOT/linear/empty.bin"
+truncate -s 32M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -O ^dir_index,^orphan_file -d "$$ROOT" "$@"
+""",
+)
+
+rust_test(
+    name = "modern_image_test",
+    srcs = ["tests/modern_image.rs"],
+    crate_name = "modern_image_test",
+    data = [
+        ":inode_group_image",
+        ":linear_directory_image",
+        ":modern_image",
+        ":multi_group_image",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "EXT4_MODERN_IMAGE": "$(rlocationpath :modern_image)",
+        "EXT4_INODE_GROUP_IMAGE": "$(rlocationpath :inode_group_image)",
+        "EXT4_LINEAR_DIRECTORY_IMAGE": "$(rlocationpath :linear_directory_image)",
+        "EXT4_MULTI_GROUP_IMAGE": "$(rlocationpath :multi_group_image)",
+    },
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [":ext4"],
+)
+
+# A sparse ext2 file with data beyond the single-indirect range exercises the
+# legacy double-indirect map using an image generated independently by mke2fs.
+genrule(
+    name = "legacy_image",
+    srcs = ["testdata/hello.txt"],
+    outs = ["legacy.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/legacy-image-root"
+mkdir -p "$$ROOT"
+cp $(location testdata/hello.txt) "$$ROOT/hello.txt"
+truncate -s 400K "$$ROOT/large.bin"
+dd if=$(location testdata/hello.txt) of="$$ROOT/large.bin" bs=1 seek=$$((300 * 1024)) conv=notrunc status=none
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext2 -q -F -b 1024 -d "$$ROOT" "$@"
+/usr/sbin/e2fsck -fy "$@" >/dev/null
+""",
+)
+
+rust_test(
+    name = "legacy_image_test",
+    srcs = ["tests/legacy_image.rs"],
+    crate_name = "legacy_image_test",
+    data = [":legacy_image"],
+    edition = "2024",
+    rustc_env = {
+        "EXT4_LEGACY_IMAGE": "$(rlocationpath :legacy_image)",
+    },
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [":ext4"],
+)
