@@ -179,6 +179,14 @@ compatibility_image(
     features = "orphan_file",
 )
 
+# Upstream e2fsprogs 1.47.3+ defaults, shipped by current Arch Linux. Spell
+# the complete ext4 profile out so this fixture stays modern even when CI's
+# host mke2fs and /etc/mke2fs.conf are older.
+compatibility_image(
+    name = "modern_defaults",
+    features = "sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr,has_journal,extent,huge_file,flex_bg,metadata_csum,metadata_csum_seed,64bit,dir_nlink,extra_isize,orphan_file",
+)
+
 # 1 KiB blocks put only sixteen 64-byte descriptors in each descriptor
 # block. Four hundred files force enumeration to load inodes beyond group 16,
 # exercising the relocated second GDT block rather than merely its feature bit.
@@ -284,6 +292,7 @@ rust_test(
         ":meta_bg_image",
         ":modern_incompat_image",
         ":modern_layout_image",
+        ":modern_defaults_image",
         ":orphan_file_image",
     ],
     edition = "2024",
@@ -296,6 +305,7 @@ rust_test(
         "EXT4_META_BG_IMAGE": "$(rlocationpath :meta_bg_image)",
         "EXT4_MODERN_INCOMPAT_IMAGE": "$(rlocationpath :modern_incompat_image)",
         "EXT4_MODERN_LAYOUT_IMAGE": "$(rlocationpath :modern_layout_image)",
+        "EXT4_MODERN_DEFAULTS_IMAGE": "$(rlocationpath :modern_defaults_image)",
         "EXT4_ORPHAN_FILE_IMAGE": "$(rlocationpath :orphan_file_image)",
     },
     rustc_flags = [

@@ -633,14 +633,18 @@ mod tests {
         }
     }
 
-    fn filesystem() -> PortableExt4Fs {
-        let image = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
-            .join(env!("EXT4_MODERN_IMAGE"));
+    fn filesystem_from(relative: &str) -> PortableExt4Fs {
+        let image =
+            std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap()).join(relative);
         let bytes = std::fs::read(image).unwrap();
         let disk: &'static dyn Disk = Box::leak(Box::new(ImageDisk {
             bytes: RefCell::new(bytes),
         }));
         PortableExt4Fs::new(Volume::whole(disk)).unwrap()
+    }
+
+    fn filesystem() -> PortableExt4Fs {
+        filesystem_from(env!("EXT4_MODERN_IMAGE"))
     }
 
     fn volume(bytes: Vec<u8>) -> Volume {
@@ -656,6 +660,18 @@ mod tests {
         image[1024 + 56..1024 + 58].copy_from_slice(&[0x53, 0xef]);
         assert!(is_ext(&volume(image)));
         assert!(!is_ext(&volume(vec![0; 2048])));
+    }
+
+    #[test]
+    fn vfs_adapter_mounts_current_distro_default_profile() {
+        let filesystem = filesystem_from(env!("EXT4_MODERN_DEFAULTS_IMAGE"));
+        let file = filesystem.open(b"file-0.txt").unwrap();
+        let mut contents = [0; 14];
+        assert_eq!(
+            filesystem.read(file.handle, 0, &mut contents, file.size),
+            14
+        );
+        assert_eq!(&contents, b"portable ext4\n");
     }
 
     #[test]
