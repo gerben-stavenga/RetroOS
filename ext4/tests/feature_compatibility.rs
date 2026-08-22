@@ -34,6 +34,44 @@ fn mounts_orphan_file_filesystem() {
 }
 
 #[test]
+fn reads_and_writes_current_distro_default_profile() {
+    let mut filesystem =
+        Ext4::mount(ModelStorage::new(image(env!("EXT4_MODERN_DEFAULTS_IMAGE")))).unwrap();
+    let mut contents = [0; 14];
+    assert_eq!(
+        filesystem.read("/file-0.txt", 0, &mut contents).unwrap(),
+        14
+    );
+    assert_eq!(&contents, b"portable ext4\n");
+
+    {
+        let mut transaction = filesystem.begin_transaction();
+        transaction.reserve_blocks(8).unwrap();
+        transaction.overwrite("/file-0.txt", 0, b"modern").unwrap();
+        transaction.commit().unwrap();
+    }
+    assert_eq!(
+        filesystem.read("/file-0.txt", 0, &mut contents).unwrap(),
+        14
+    );
+    assert_eq!(&contents, b"modernle ext4\n");
+
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("modern-defaults-write.img");
+    std::fs::write(&output, filesystem.into_storage().durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "e2fsck rejected modern-default write:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
 fn reads_descriptors_from_later_meta_block_groups() {
     mounts_and_enumerates(env!("EXT4_META_BG_IMAGE"), 401);
 }
