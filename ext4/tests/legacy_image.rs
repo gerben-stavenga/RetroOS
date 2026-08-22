@@ -1,4 +1,4 @@
-use portable_ext4::test_support::{Inject, ModelError, ModelStorage};
+use portable_ext4::test_support::{Inject, ModelError, ModelStorage, PathExt4};
 use portable_ext4::{Error, Ext4};
 
 fn image() -> Vec<u8> {

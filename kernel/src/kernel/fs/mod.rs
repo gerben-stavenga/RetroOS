@@ -7,12 +7,13 @@
 //!
 //! Backends read blocks through `kernel::block`, never a driver directly.
 
-pub mod grant;
-pub mod hostfs;
 pub mod cdrom;
 pub mod floppy;
+pub mod grant;
+pub mod hostfs;
 pub mod iso9660;
 pub mod lwext4;
+pub mod portable_ext4;
 
 use alloc::vec::Vec;
 

@@ -17,7 +17,6 @@ pub mod test_support;
 mod transaction;
 
 use alloc::vec::Vec;
-use alloc::{format, string::String};
 use core::fmt;
 pub use ondisk::Superblock;
 use ondisk::{checked_read, le16, le32};
@@ -206,33 +205,6 @@ fn decode_inode_timestamp<E>(
     })
 }
 
-fn normalize_absolute_path<E>(path: &str) -> Result<String, Error<E>> {
-    if !path.starts_with('/') || path.as_bytes().contains(&0) {
-        return Err(Corrupt::InvalidPath.into());
-    }
-    let mut components = Vec::new();
-    components
-        .try_reserve(path.matches('/').count() + 1)
-        .map_err(|_| Error::OutOfMemory)?;
-    for component in path.split('/') {
-        match component {
-            "" | "." => {}
-            ".." => {
-                components.pop();
-            }
-            component if component.len() <= 255 => components.push(component),
-            _ => return Err(Corrupt::InvalidPath.into()),
-        }
-    }
-    let mut normalized = String::new();
-    normalized
-        .try_reserve(path.len().max(1))
-        .map_err(|_| Error::OutOfMemory)?;
-    normalized.push('/');
-    normalized.push_str(&components.join("/"));
-    Ok(normalized)
-}
-
 /// A mounted filesystem that owns its storage object.
 pub struct Ext4<S> {
     storage: S,
@@ -319,23 +291,33 @@ impl<S: Storage> Ext4<S> {
         Ok(())
     }
 
-    pub fn stat(&mut self, path: &str) -> Result<Inode, Error<S::Error>> {
-        self.resolve(path)
+    /// Return the filesystem's well-known starting inode.
+    pub fn root(&mut self) -> Result<Inode, Error<S::Error>> {
+        self.load_inode(ROOT_INODE)
     }
 
-    pub fn read(
+    /// Reload an inode identity from disk, rejecting a reused identity.
+    pub fn refresh(&mut self, inode: &Inode) -> Result<Inode, Error<S::Error>> {
+        let current = self.load_inode(inode.number)?;
+        if current.generation != inode.generation {
+            return Err(Error::NotFound);
+        }
+        Ok(current)
+    }
+
+    pub fn read_inode(
         &mut self,
-        path: &str,
+        inode: &Inode,
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize, Error<S::Error>> {
-        let inode = self.resolve(path)?;
+        let inode = self.refresh(inode)?;
         self.read_inode_data(&inode, offset, dst)
     }
 
     /// Read the target bytes stored in a symbolic-link inode.
-    pub fn read_link(&mut self, path: &str) -> Result<Vec<u8>, Error<S::Error>> {
-        let inode = self.resolve_nofollow(path)?;
+    pub fn read_symlink(&mut self, inode: &Inode) -> Result<Vec<u8>, Error<S::Error>> {
+        let inode = self.refresh(inode)?;
         if !inode.is_symlink() {
             return Err(Error::InvalidArgument);
         }
@@ -361,9 +343,9 @@ impl<S: Storage> Ext4<S> {
 
     /// Append at most `max` checked directory entries, resuming from an opaque
     /// byte cookie returned by the previous call. `None` means end of directory.
-    pub fn read_dir(
+    pub fn list(
         &mut self,
-        path: &str,
+        directory: &Inode,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
         max: usize,
@@ -371,7 +353,7 @@ impl<S: Storage> Ext4<S> {
         if max == 0 {
             return Err(Error::InvalidArgument);
         }
-        let directory = self.resolve(path)?;
+        let directory = self.refresh(directory)?;
         if !directory.is_directory() {
             return Err(Error::NotDirectory);
         }
@@ -502,7 +484,7 @@ impl<S: Storage> Ext4<S> {
         Ok(descriptor)
     }
 
-    fn load_inode(&mut self, number: u32) -> Result<Inode, Error<S::Error>> {
+    pub(crate) fn load_inode(&mut self, number: u32) -> Result<Inode, Error<S::Error>> {
         if number == 0 || number > self.superblock.inodes_count {
             return Err(Corrupt::InvalidInode(number).into());
         }
@@ -579,105 +561,6 @@ impl<S: Storage> Ext4<S> {
             blocks_512,
             block_map,
         })
-    }
-
-    fn resolve(&mut self, path: &str) -> Result<Inode, Error<S::Error>> {
-        self.resolve_following(path, true)
-    }
-
-    fn resolve_nofollow(&mut self, path: &str) -> Result<Inode, Error<S::Error>> {
-        self.resolve_following(path, false)
-    }
-
-    fn resolve_following(
-        &mut self,
-        path: &str,
-        follow_final: bool,
-    ) -> Result<Inode, Error<S::Error>> {
-        if !path.starts_with('/') || path.as_bytes().contains(&0) {
-            return Err(Corrupt::InvalidPath.into());
-        }
-        let mut current = normalize_absolute_path(path)?;
-        for _ in 0..40 {
-            let components: Vec<&str> =
-                current.split('/').filter(|part| !part.is_empty()).collect();
-            let mut inode = self.load_inode(ROOT_INODE)?;
-            let mut followed = false;
-            for (index, component) in components.iter().enumerate() {
-                if component.len() > 255 {
-                    return Err(Corrupt::InvalidPath.into());
-                }
-                if !inode.is_directory() {
-                    return Err(Error::NotDirectory);
-                }
-                let child = self.lookup_child(&inode, component.as_bytes())?;
-                inode = self.load_inode(child)?;
-                if inode.is_symlink() && (follow_final || index + 1 != components.len()) {
-                    let target = self.read_symlink_inode(&inode)?;
-                    let target = core::str::from_utf8(&target).map_err(|_| Corrupt::InvalidPath)?;
-                    let parent = if index == 0 {
-                        "/".into()
-                    } else {
-                        format!("/{}/", components[..index].join("/"))
-                    };
-                    let remainder = components[index + 1..].join("/");
-                    let expanded = if target.starts_with('/') {
-                        format!("{target}/{remainder}")
-                    } else {
-                        format!("{parent}{target}/{remainder}")
-                    };
-                    current = normalize_absolute_path(&expanded)?;
-                    followed = true;
-                    break;
-                }
-            }
-            if !followed {
-                return Ok(inode);
-            }
-        }
-        Err(Corrupt::InvalidPath.into())
-    }
-
-    fn lookup_child(&mut self, directory: &Inode, name: &[u8]) -> Result<u32, Error<S::Error>> {
-        let block_size = u64::from(self.superblock.block_size);
-        let blocks = directory.size.div_ceil(block_size);
-        let mut block = self.new_block_buffer()?;
-        for logical in 0..blocks {
-            block.fill(0);
-            let offset = logical * block_size;
-            let count = self.read_inode_data(directory, offset, &mut block)?;
-            let kind = self.directory_block_kind(directory, logical, count, &block);
-            if self.superblock.has_metadata_checksums() {
-                self.verify_directory_checksum(directory, kind, count, &block)?;
-            }
-            // HTree index nodes contain fake directory entries surrounding
-            // their hash table. Names live only in leaf blocks; scanning all
-            // checked leaves is a deliberately simple correct baseline.
-            if kind != DirectoryBlockKind::Leaf {
-                continue;
-            }
-            let mut cursor = 0;
-            while cursor < count {
-                if count - cursor < 8 {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let inode = le32(&block, cursor);
-                let record_len = usize::from(le16(&block, cursor + 4));
-                let name_len = usize::from(block[cursor + 6]);
-                if record_len < 8
-                    || !record_len.is_multiple_of(4)
-                    || record_len > count - cursor
-                    || name_len > record_len - 8
-                {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                if inode != 0 && &block[cursor + 8..cursor + 8 + name_len] == name {
-                    return Ok(inode);
-                }
-                cursor += record_len;
-            }
-        }
-        Err(Error::NotFound)
     }
 
     fn directory_block_kind(
@@ -1001,7 +884,7 @@ impl<S: Storage> Ext4<S> {
 mod tests {
     use super::*;
     use crate::ondisk::{EXT4_MAGIC, SUPERBLOCK_OFFSET};
-    use crate::test_support::{EffectKind, Inject, ModelError, ModelStorage};
+    use crate::test_support::{EffectKind, Inject, ModelError, ModelStorage, PathExt4};
 
     fn put16(image: &mut [u8], offset: usize, value: u16) {
         image[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
