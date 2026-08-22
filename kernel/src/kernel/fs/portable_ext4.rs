@@ -1,8 +1,7 @@
 //! RetroOS VFS adapter for the portable ext4 engine.
 //!
-//! This lives beside the active lwext4 backend while feature and mutation
-//! parity is completed. Keeping the adapter real and build-tested prevents the
-//! portable engine from drifting away from the kernel's block and VFS APIs.
+//! This is the active root-filesystem backend. Additional read-only volumes
+//! retain an lwext4 fallback while feature compatibility is completed.
 
 extern crate alloc;
 
@@ -121,7 +120,7 @@ struct OpenFile {
     inode: Inode,
 }
 
-/// Writable replacement candidate for [`super::lwext4::Lwext4Fs`].
+/// Writable VFS adapter for the portable ext4 engine.
 pub struct PortableExt4Fs {
     filesystem: RefCell<Ext4<VolumeStorage>>,
     open_files: RefCell<BTreeMap<u64, OpenFile>>,

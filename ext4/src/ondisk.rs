@@ -10,8 +10,14 @@ pub(crate) const INCOMPAT_RECOVER: u32 = 0x0004;
 pub(crate) const INCOMPAT_META_BG: u32 = 0x0010;
 pub(crate) const INCOMPAT_EXTENTS: u32 = 0x0040;
 pub(crate) const INCOMPAT_64BIT: u32 = 0x0080;
+pub(crate) const INCOMPAT_MMP: u32 = 0x0100;
 pub(crate) const INCOMPAT_FLEX_BG: u32 = 0x0200;
+pub(crate) const INCOMPAT_EA_INODE: u32 = 0x0400;
 pub(crate) const INCOMPAT_CSUM_SEED: u32 = 0x2000;
+pub(crate) const INCOMPAT_LARGE_DIR: u32 = 0x4000;
+pub(crate) const INCOMPAT_INLINE_DATA: u32 = 0x8000;
+pub(crate) const INCOMPAT_ENCRYPT: u32 = 0x1_0000;
+pub(crate) const INCOMPAT_CASEFOLD: u32 = 0x2_0000;
 pub(crate) const COMPAT_HAS_JOURNAL: u32 = 0x0004;
 pub(crate) const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
 
@@ -21,10 +27,17 @@ pub(crate) const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 
 const READ_INCOMPAT: u32 = INCOMPAT_FILETYPE
     | INCOMPAT_RECOVER
+    | INCOMPAT_META_BG
     | INCOMPAT_EXTENTS
     | INCOMPAT_64BIT
+    | INCOMPAT_MMP
     | INCOMPAT_FLEX_BG
-    | INCOMPAT_CSUM_SEED;
+    | INCOMPAT_EA_INODE
+    | INCOMPAT_CSUM_SEED
+    | INCOMPAT_LARGE_DIR
+    | INCOMPAT_INLINE_DATA
+    | INCOMPAT_ENCRYPT
+    | INCOMPAT_CASEFOLD;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Superblock {
@@ -45,6 +58,7 @@ pub struct Superblock {
     pub journal_inode: u32,
     pub(crate) reserved_gdt_blocks: u16,
     pub(crate) backup_bgs: [u32; 2],
+    pub(crate) first_meta_bg: u32,
 }
 
 impl Superblock {
@@ -69,17 +83,11 @@ impl Superblock {
         let feature_incompat = le32(b, 0x60);
         let feature_ro_compat = le32(b, 0x64);
 
-        if feature_incompat & INCOMPAT_META_BG != 0 {
-            return Err(Unsupported::MetaBlockGroups.into());
-        }
         let unknown = feature_incompat & !READ_INCOMPAT;
         if unknown != 0 {
             return Err(Unsupported::IncompatibleFeatures(unknown).into());
         }
         let has_metadata_checksums = feature_ro_compat & RO_COMPAT_METADATA_CSUM != 0;
-        if !has_metadata_checksums && feature_ro_compat & RO_COMPAT_GDT_CSUM != 0 {
-            return Err(Unsupported::LegacyGroupChecksums.into());
-        }
         if feature_incompat & INCOMPAT_CSUM_SEED != 0 && !has_metadata_checksums {
             return Err(Corrupt::InvalidFeatureCombination.into());
         }
@@ -162,6 +170,13 @@ impl Superblock {
         let journal_inode = le32(b, 0xe0);
         let reserved_gdt_blocks = le16(b, 0xce);
         let backup_bgs = [le32(b, 0x24c), le32(b, 0x250)];
+        let first_meta_bg = le32(b, 0x104);
+        let descriptors_per_block = block_size / u32::from(descriptor_size);
+        let descriptor_blocks = block_groups.div_ceil(u64::from(descriptors_per_block));
+        if feature_incompat & INCOMPAT_META_BG != 0 && u64::from(first_meta_bg) > descriptor_blocks
+        {
+            return Err(Corrupt::InvalidGeometry.into());
+        }
         if feature_incompat & INCOMPAT_RECOVER != 0 {
             if feature_compat & COMPAT_HAS_JOURNAL == 0 {
                 return Err(Corrupt::InvalidFeatureCombination.into());
@@ -188,6 +203,7 @@ impl Superblock {
             journal_inode,
             reserved_gdt_blocks,
             backup_bgs,
+            first_meta_bg,
         })
     }
 
@@ -201,6 +217,43 @@ impl Superblock {
         (u64::from(self.first_data_block) + 1) * u64::from(self.block_size)
     }
 
+    /// Locate one descriptor in either the original contiguous GDT or the
+    /// descriptor block at the head of its meta block group.
+    pub(crate) fn descriptor_offset(&self, group: u32) -> Option<u64> {
+        let descriptor_size = u64::from(self.descriptor_size);
+        let descriptors_per_block = u64::from(self.block_size) / descriptor_size;
+        let descriptor_block = u64::from(group) / descriptors_per_block;
+        let within = u64::from(group) % descriptors_per_block;
+        let block = if self.feature_incompat & INCOMPAT_META_BG == 0
+            || descriptor_block < u64::from(self.first_meta_bg)
+        {
+            u64::from(self.first_data_block)
+                .checked_add(1)?
+                .checked_add(descriptor_block)?
+        } else {
+            let first_group = descriptor_block.checked_mul(descriptors_per_block)?;
+            let first_block = u64::from(self.first_data_block)
+                .checked_add(first_group.checked_mul(u64::from(self.blocks_per_group))?)?;
+            first_block.checked_add(u64::from(self.group_has_super(first_group as u32)))?
+        };
+        block
+            .checked_mul(u64::from(self.block_size))?
+            .checked_add(within.checked_mul(descriptor_size)?)
+    }
+
+    pub(crate) fn group_has_super(&self, group: u32) -> bool {
+        if group == 0 {
+            return true;
+        }
+        if self.feature_compat & COMPAT_SPARSE_SUPER2 != 0 {
+            return self.backup_bgs.contains(&group);
+        }
+        if self.feature_ro_compat & 0x0001 == 0 {
+            return true;
+        }
+        group == 1 || is_power_of(group, 3) || is_power_of(group, 5) || is_power_of(group, 7)
+    }
+
     pub(crate) fn has_metadata_checksums(&self) -> bool {
         self.feature_ro_compat & RO_COMPAT_METADATA_CSUM != 0
     }
@@ -208,6 +261,16 @@ impl Superblock {
     pub(crate) fn needs_recovery(&self) -> bool {
         self.feature_incompat & INCOMPAT_RECOVER != 0
     }
+}
+
+fn is_power_of(mut value: u32, base: u32) -> bool {
+    if value < 1 {
+        return false;
+    }
+    while value.is_multiple_of(base) {
+        value /= base;
+    }
+    value == 1
 }
 
 pub(crate) fn checked_read<S: Storage>(

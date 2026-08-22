@@ -11,25 +11,33 @@ mount crossings, symlink policy, and lookup caching belong to the caller's
 VFS. Path-shaped conveniences exist only in `test_support` for the image and
 power-loss corpus.
 
-The implementation is intentionally incremental. The current read milestone
-supports bounded ext images using inode tables, linear or HTree-indexed
+The current reader supports bounded ext images using inode tables, linear or HTree-indexed
 directories, ext4 extent trees, legacy direct and single/double/triple-indirect
 block maps, and read-only recovery of an internal JBD2 journal. Recovery stages
 complete transactions in memory and exposes committed, non-revoked blocks
-through a volatile overlay; mounting never modifies the image. JBD2 checksum
-v2/v3, 32/64-bit tags, circular logs, and escaped blocks are validated. Legacy
+through a volatile overlay; mounting never modifies the image. It understands
+contiguous and `meta_bg` descriptor placement, metadata and legacy GDT
+checksums, and inline regular files and directories. Layout-neutral modern
+features such as orphan files, MMP, large directories, EA inodes, encryption,
+and casefold no longer reject an otherwise readable filesystem; encrypted
+contents remain unavailable without a key. Inode-body, external-block, shared,
+and EA-inode extended attributes use one checked reader; external-block and
+EA-inode value checksums are validated. JBD2 checksum v2/v3, 32/64-bit
+tags, circular logs, and escaped blocks are validated. Legacy
 indirect blocks have no checksum in the on-disk format, so their pointers are
 strictly bounds-checked. Indexed lookup currently scans validated leaf blocks
 rather than using the hash index. It rejects rather than guesses when an image
 requires:
 
 - an external journal, JBD2 checksum v1, or fast commits;
-- the legacy pre-`metadata_csum` group-descriptor checksum format;
-- `meta_bg` descriptor placement;
 - any unknown incompatible feature.
 
-That strictness is part of the API contract: unsupported is different from
-corrupt, and neither is silently mounted.
+Read compatibility and mutation compatibility are deliberately separate.
+Readonly-compatible feature bits do not prevent mounting, while every mutation
+passes a narrow exact feature-profile check. Thus a modern filesystem can be
+used for boot and ordinary reads without accidentally permitting a writer that
+does not understand its allocation, namespace, or recovery rules. Unsupported
+is different from corrupt, and neither is silently ignored.
 
 ## Storage contract
 
@@ -88,7 +96,9 @@ used-directory count. `rename` supports regular files, symlinks, and directories
 between checked parents and grows a full linear destination. Non-directory
 sources may replace a link-count-one
 regular file; the replaced inode and fragmented cross-group extents are
-reclaimed in the same transaction. Directory moves walk the destination's
+reclaimed in the same transaction. Exclusive external xattr blocks are
+reclaimed with the inode, while shared blocks receive a checksummed reference
+count decrement. Directory moves walk the destination's
 on-disk `..` ancestry to reject cycles, rewrite `..`, and transfer the parent
 link count. Rename stages the unchanged superblock required by the JBD2 recovery
 protocol. The inode-based file writer selects in-place block replacement or
@@ -152,5 +162,5 @@ contract and testing torn control records is the next durability step.
    writer done; circular reuse, revokes, and torn-control-record handling remain.
 6. Validate every operation and crash point against `e2fsck` and Linux.
 
-The existing lwext4 backend remains active until this engine reaches the
-required write and compatibility milestones.
+RetroOS uses this engine for its root ext filesystem. Additional read-only
+volumes retain an lwext4 fallback while compatibility work continues.

@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load(":compatibility_images.bzl", "compatibility_image")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -27,8 +28,8 @@ rust_test(
 )
 
 # An independently generated modern image catches mistakes that a synthetic
-# fixture could accidentally share with the parser. Keep the journal clean and
-# disable only orphan_file, whose incompatible layout is not read yet.
+# fixture could accidentally share with the parser. Keep the journal clean;
+# current mke2fs defaults, including orphan_file, are part of the corpus.
 genrule(
     name = "modern_image",
     srcs = ["testdata/hello.txt"],
@@ -53,7 +54,7 @@ while [ "$$i" -lt 300 ]; do
   i=$$((i + 1))
 done
 truncate -s 16M "$@"
-/usr/sbin/mkfs.ext4 -q -F -O ^orphan_file -d "$$ROOT" "$@"
+/usr/sbin/mkfs.ext4 -q -F -d "$$ROOT" "$@"
 /usr/sbin/e2fsck -fyD "$@" >/dev/null
 """,
 )
@@ -71,7 +72,7 @@ mkdir -p "$$ROOT"
 dd if=/dev/zero bs=4096 count=687 status=none | tr '\\000' x > "$$ROOT/filler.bin"
 truncate -s 0 "$$ROOT/target.bin"
 truncate -s 16M "$@"
-/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -O ^orphan_file -d "$$ROOT" "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -d "$$ROOT" "$@"
 """,
 )
 
@@ -90,7 +91,7 @@ while [ "$$i" -lt 1011 ]; do
   i=$$((i + 1))
 done
 truncate -s 16M "$@"
-/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -O ^orphan_file -d "$$ROOT" "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -g 1024 -d "$$ROOT" "$@"
 """,
 )
 
@@ -108,7 +109,7 @@ while [ "$$i" -lt 500 ]; do
 done
 truncate -s 0 "$$ROOT/linear/empty.bin"
 truncate -s 32M "$@"
-/usr/sbin/mkfs.ext4 -q -F -b 4096 -O ^dir_index,^orphan_file -d "$$ROOT" "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 4096 -O ^dir_index -d "$$ROOT" "$@"
 """,
 )
 
@@ -164,6 +165,138 @@ rust_test(
     edition = "2024",
     rustc_env = {
         "EXT4_LEGACY_IMAGE": "$(rlocationpath :legacy_image)",
+    },
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [":ext4"],
+)
+
+compatibility_image(
+    name = "orphan_file",
+    features = "orphan_file",
+)
+
+# 1 KiB blocks put only sixteen 64-byte descriptors in each descriptor
+# block. Four hundred files force enumeration to load inodes beyond group 16,
+# exercising the relocated second GDT block rather than merely its feature bit.
+compatibility_image(
+    name = "meta_bg",
+    extra_args = "-b 1024 -g 1024 -N 1024",
+    features = "meta_bg,^resize_inode,^flex_bg",
+    files = 400,
+)
+
+compatibility_image(
+    name = "legacy_gdt_csum",
+    features = "uninit_bg,^metadata_csum,^orphan_file",
+)
+
+compatibility_image(
+    name = "modern_incompat",
+    features = "mmp,large_dir,ea_inode,encrypt,casefold,^orphan_file",
+)
+
+compatibility_image(
+    name = "modern_layout",
+    extra_args = "-C 16384",
+    features = "bigalloc,metadata_csum_seed,sparse_super2,^resize_inode,^orphan_file",
+)
+
+compatibility_image(
+    name = "inline_data",
+    features = "inline_data,^orphan_file",
+    repetitions = 6,
+)
+
+genrule(
+    name = "inline_directory_image",
+    outs = ["inline-directory.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/inline-directory-root"
+mkdir -p "$$ROOT/tiny"
+i=0
+while [ "$$i" -lt 6 ]; do
+  printf x > "$$ROOT/tiny/child-$$i"
+  i=$$((i + 1))
+done
+ln -s 012345678901234567890123456789012345678901234567890123456789012345678901234567890123 "$${ROOT}/long-link"
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -O inline_data,^orphan_file -d "$$ROOT" "$@"
+""",
+)
+
+genrule(
+    name = "extended_attributes_image",
+    srcs = ["testdata/hello.txt"],
+    outs = ["extended-attributes.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/extended-attributes-root"
+mkdir -p "$$ROOT"
+cp $(location testdata/hello.txt) "$$ROOT/attributed.txt"
+cp $(location testdata/hello.txt) "$$ROOT/shared-a.txt"
+cp $(location testdata/hello.txt) "$$ROOT/shared-b.txt"
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -O ^orphan_file -d "$$ROOT" "$@"
+printf small-value > "$(@D)/small-xattr"
+dd if=/dev/zero bs=1000 count=1 status=none | tr '\\000' x > "$(@D)/large-xattr"
+/usr/sbin/debugfs -w -R "ea_set -f $(@D)/small-xattr /attributed.txt user.small" "$@" >/dev/null
+/usr/sbin/debugfs -w -R "ea_set -f $(@D)/large-xattr /attributed.txt security.large" "$@" >/dev/null
+/usr/sbin/debugfs -w -R "ea_set -f $(@D)/large-xattr /shared-a.txt security.shared" "$@" >/dev/null
+/usr/sbin/debugfs -w -R "ea_set -f $(@D)/large-xattr /shared-b.txt security.shared" "$@" >/dev/null
+SHARED_BLOCK=$$(/usr/sbin/debugfs -R "stat /shared-a.txt" "$@" 2>/dev/null | awk '/File ACL:/ {print $$3}')
+/usr/sbin/debugfs -w -R "set_inode_field /shared-b.txt file_acl $$SHARED_BLOCK" "$@" >/dev/null
+/usr/sbin/e2fsck -fy "$@" >/dev/null || /usr/sbin/e2fsck -fy "$@" >/dev/null
+""",
+)
+
+genrule(
+    name = "ea_inode_image",
+    srcs = ["testdata/hello.txt"],
+    outs = ["ea-inode.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/ea-inode-root"
+mkdir -p "$$ROOT"
+cp $(location testdata/hello.txt) "$$ROOT/attributed.txt"
+truncate -s 16M "$@"
+/usr/sbin/mkfs.ext4 -q -F -O ea_inode,^orphan_file -d "$$ROOT" "$@"
+dd if=/dev/zero bs=6000 count=1 status=none | tr '\\000' z > "$(@D)/ea-inode-value"
+/usr/sbin/debugfs -w -R "ea_set -f $(@D)/ea-inode-value /attributed.txt user.large" "$@" >/dev/null
+/usr/sbin/e2fsck -fy "$@" >/dev/null || /usr/sbin/e2fsck -fy "$@" >/dev/null
+""",
+)
+
+rust_test(
+    name = "feature_compatibility_test",
+    srcs = ["tests/feature_compatibility.rs"],
+    crate_name = "feature_compatibility_test",
+    data = [
+        ":legacy_gdt_csum_image",
+        ":inline_data_image",
+        ":inline_directory_image",
+        ":extended_attributes_image",
+        ":ea_inode_image",
+        ":meta_bg_image",
+        ":modern_incompat_image",
+        ":modern_layout_image",
+        ":orphan_file_image",
+    ],
+    edition = "2024",
+    rustc_env = {
+        "EXT4_LEGACY_GDT_CSUM_IMAGE": "$(rlocationpath :legacy_gdt_csum_image)",
+        "EXT4_INLINE_DATA_IMAGE": "$(rlocationpath :inline_data_image)",
+        "EXT4_INLINE_DIRECTORY_IMAGE": "$(rlocationpath :inline_directory_image)",
+        "EXT4_EXTENDED_ATTRIBUTES_IMAGE": "$(rlocationpath :extended_attributes_image)",
+        "EXT4_EA_INODE_IMAGE": "$(rlocationpath :ea_inode_image)",
+        "EXT4_META_BG_IMAGE": "$(rlocationpath :meta_bg_image)",
+        "EXT4_MODERN_INCOMPAT_IMAGE": "$(rlocationpath :modern_incompat_image)",
+        "EXT4_MODERN_LAYOUT_IMAGE": "$(rlocationpath :modern_layout_image)",
+        "EXT4_ORPHAN_FILE_IMAGE": "$(rlocationpath :orphan_file_image)",
     },
     rustc_flags = [
         "-Cpanic=abort",
