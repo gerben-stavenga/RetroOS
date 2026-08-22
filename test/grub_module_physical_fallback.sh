@@ -42,6 +42,6 @@ timeout --kill-after=5s 18s qemu-system-i386 \
     -boot order=d -debugcon "file:$log" -display none -no-reboot >/dev/null 2>&1 || true
 
 grep -q 'Multiboot ext4 (32 MB, volatile overlay) → /$' "$log"
-grep -Eq 'ext4 partition \([0-9]+ MB\) → /disk1$' "$log"
+grep -Eq 'portable ext4 partition \([0-9]+ MB\) → /disk1$' "$log"
 ! grep -q 'ext4 root (' "$log"
 echo "PASS: module root wins and physical ext4 is /disk1 fallback"
