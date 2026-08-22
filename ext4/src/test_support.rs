@@ -15,228 +15,338 @@ use alloc::vec::Vec;
 ///
 /// Production users deliberately see only inode and directory-entry APIs.
 pub trait PathExt4 {
-    type StorageError;
-
-    fn stat(&mut self, path: &str) -> Result<Inode, Error<Self::StorageError>>;
-    fn read(
+    fn stat<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<Inode, Error<S::Error>>;
+    fn read<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         offset: u64,
         dst: &mut [u8],
-    ) -> Result<usize, Error<Self::StorageError>>;
-    fn read_link(&mut self, path: &str) -> Result<Vec<u8>, Error<Self::StorageError>>;
-    fn read_dir(
+    ) -> Result<usize, Error<S::Error>>;
+    fn read_link<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<Vec<u8>, Error<S::Error>>;
+    fn read_dir<S: Storage>(
+        &mut self,
+        storage: &mut S,
         path: &str,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
         max: usize,
-    ) -> Result<Option<u64>, Error<Self::StorageError>>;
+    ) -> Result<Option<u64>, Error<S::Error>>;
 }
 
-impl<S: Storage> PathExt4 for Ext4<S> {
-    type StorageError = S::Error;
-
-    fn stat(&mut self, path: &str) -> Result<Inode, Error<S::Error>> {
-        resolve_path(self, path, true)
+impl PathExt4 for Ext4 {
+    fn stat<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<Inode, Error<S::Error>> {
+        resolve_path(self, storage, path, true)
     }
 
-    fn read(&mut self, path: &str, offset: u64, dst: &mut [u8]) -> Result<usize, Error<S::Error>> {
-        let inode = resolve_path(self, path, true)?;
-        self.read_inode(&inode, offset, dst)
-    }
-
-    fn read_link(&mut self, path: &str) -> Result<Vec<u8>, Error<S::Error>> {
-        let inode = resolve_path(self, path, false)?;
-        self.read_symlink(&inode)
-    }
-
-    fn read_dir(
+    fn read<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, Error<S::Error>> {
+        let inode = resolve_path(self, storage, path, true)?;
+        self.read_inode(storage, &inode, offset, dst)
+    }
+
+    fn read_link<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<Vec<u8>, Error<S::Error>> {
+        let inode = resolve_path(self, storage, path, false)?;
+        self.read_symlink(storage, &inode)
+    }
+
+    fn read_dir<S: Storage>(
+        &mut self,
+        storage: &mut S,
         path: &str,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
         max: usize,
     ) -> Result<Option<u64>, Error<S::Error>> {
-        let inode = resolve_path(self, path, true)?;
-        self.list(&inode, cookie, output, max)
+        let inode = resolve_path(self, storage, path, true)?;
+        self.list(storage, &inode, cookie, output, max)
     }
 }
 
 pub trait PathTransaction {
-    type StorageError;
-
-    fn set_metadata(
+    fn set_metadata<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         update: InodeMetadataUpdate,
-    ) -> Result<(), Error<Self::StorageError>>;
-    fn chmod(&mut self, path: &str, permissions: u16) -> Result<(), Error<Self::StorageError>>;
-    fn chown(
+    ) -> Result<(), Error<S::Error>>;
+    fn chmod<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+        permissions: u16,
+    ) -> Result<(), Error<S::Error>>;
+    fn chown<S: Storage>(
+        &mut self,
+        storage: &mut S,
         path: &str,
         uid: Option<u32>,
         gid: Option<u32>,
-    ) -> Result<(), Error<Self::StorageError>>;
-    fn set_times(
+    ) -> Result<(), Error<S::Error>>;
+    fn set_times<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         accessed: Option<Timestamp>,
         modified: Option<Timestamp>,
         changed: Option<Timestamp>,
-    ) -> Result<(), Error<Self::StorageError>>;
-    fn write_at(
+    ) -> Result<(), Error<S::Error>>;
+    fn write_at<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         offset: u64,
         data: &[u8],
-    ) -> Result<(), Error<Self::StorageError>>;
-    fn overwrite(
+    ) -> Result<(), Error<S::Error>>;
+    fn overwrite<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         offset: u64,
         data: &[u8],
-    ) -> Result<(), Error<Self::StorageError>>;
-    fn append_zeroed_block(&mut self, path: &str) -> Result<u64, Error<Self::StorageError>>;
-    fn initialize_file(&mut self, path: &str, data: &[u8])
-    -> Result<(), Error<Self::StorageError>>;
-    fn append(&mut self, path: &str, data: &[u8]) -> Result<(), Error<Self::StorageError>>;
-    fn create_empty_file(
+    ) -> Result<(), Error<S::Error>>;
+    fn append_zeroed_block<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<u64, Error<S::Error>>;
+    fn initialize_file<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>>;
+    fn append<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>>;
+    fn create_empty_file<S: Storage>(
+        &mut self,
+        storage: &mut S,
         parent: &str,
         name: &str,
         permissions: u16,
-    ) -> Result<u32, Error<Self::StorageError>>;
-    fn symlink(&mut self, target: &str, path: &str) -> Result<u32, Error<Self::StorageError>>;
-    fn link(&mut self, existing: &str, path: &str) -> Result<(), Error<Self::StorageError>>;
-    fn mkdir(
+    ) -> Result<u32, Error<S::Error>>;
+    fn symlink<S: Storage>(
         &mut self,
+        storage: &mut S,
+        target: &str,
+        path: &str,
+    ) -> Result<u32, Error<S::Error>>;
+    fn link<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        existing: &str,
+        path: &str,
+    ) -> Result<(), Error<S::Error>>;
+    fn mkdir<S: Storage>(
+        &mut self,
+        storage: &mut S,
         parent: &str,
         name: &str,
         permissions: u16,
-    ) -> Result<u32, Error<Self::StorageError>>;
-    fn unlink(&mut self, path: &str) -> Result<(), Error<Self::StorageError>>;
-    fn rmdir(&mut self, path: &str) -> Result<(), Error<Self::StorageError>>;
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), Error<Self::StorageError>>;
-    fn resize(&mut self, path: &str, size: u64) -> Result<(), Error<Self::StorageError>>;
-    fn truncate_to_zero(&mut self, path: &str) -> Result<u64, Error<Self::StorageError>>;
+    ) -> Result<u32, Error<S::Error>>;
+    fn unlink<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<(), Error<S::Error>>;
+    fn rmdir<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<(), Error<S::Error>>;
+    fn rename<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        old: &str,
+        new: &str,
+    ) -> Result<(), Error<S::Error>>;
+    fn resize<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        size: u64,
+    ) -> Result<(), Error<S::Error>>;
+    fn truncate_to_zero<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<u64, Error<S::Error>>;
 }
 
-impl<S: Storage> PathTransaction for Transaction<'_, S> {
-    type StorageError = S::Error;
-
-    fn set_metadata(
+impl PathTransaction for Transaction<'_> {
+    fn set_metadata<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         update: InodeMetadataUpdate,
     ) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.update_metadata(&inode, update)
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.update_metadata(storage, &inode, update)
     }
 
-    fn chmod(&mut self, path: &str, permissions: u16) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.chmod_inode(&inode, permissions)
-    }
-
-    fn chown(
+    fn chmod<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+        permissions: u16,
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.chmod_inode(storage, &inode, permissions)
+    }
+
+    fn chown<S: Storage>(
+        &mut self,
+        storage: &mut S,
         path: &str,
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.chown_inode(&inode, uid, gid)
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.chown_inode(storage, &inode, uid, gid)
     }
 
-    fn set_times(
+    fn set_times<S: Storage>(
         &mut self,
+        storage: &mut S,
         path: &str,
         accessed: Option<Timestamp>,
         modified: Option<Timestamp>,
         changed: Option<Timestamp>,
     ) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.set_inode_times(&inode, accessed, modified, changed)
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.set_inode_times(storage, &inode, accessed, modified, changed)
     }
 
-    fn write_at(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.write_inode(&inode, offset, data)
-    }
-
-    fn overwrite(&mut self, path: &str, offset: u64, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.overwrite_inode_range(&inode, offset, data)
-    }
-
-    fn append_zeroed_block(&mut self, path: &str) -> Result<u64, Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.append_zeroed_inode_block(&inode)
-    }
-
-    fn initialize_file(&mut self, path: &str, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.initialize_inode(&inode, data)
-    }
-
-    fn append(&mut self, path: &str, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.append_inode(&inode, data)
-    }
-
-    fn create_empty_file(
+    fn write_at<S: Storage>(
         &mut self,
+        storage: &mut S,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.write_inode(storage, &inode, offset, data)
+    }
+
+    fn overwrite<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.overwrite_inode_range(storage, &inode, offset, data)
+    }
+
+    fn append_zeroed_block<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<u64, Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.append_zeroed_inode_block(storage, &inode)
+    }
+
+    fn initialize_file<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.initialize_inode(storage, &inode, data)
+    }
+
+    fn append<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.append_inode(storage, &inode, data)
+    }
+
+    fn create_empty_file<S: Storage>(
+        &mut self,
+        storage: &mut S,
         parent: &str,
         name: &str,
         permissions: u16,
     ) -> Result<u32, Error<S::Error>> {
-        let parent = resolve_path(self.filesystem, parent, true)?;
-        self.create_file(&parent, name.as_bytes(), permissions)
+        let parent = resolve_path(self.filesystem, storage, parent, true)?;
+        self.create_file(storage, &parent, name.as_bytes(), permissions)
     }
 
-    fn symlink(&mut self, target: &str, path: &str) -> Result<u32, Error<S::Error>> {
-        let normalized = normalize(path)?;
-        let (parent, name) = split_parent(&normalized)?;
-        let parent = resolve_path(self.filesystem, parent, true)?;
-        self.create_symlink(&parent, name.as_bytes(), target.as_bytes())
-    }
-
-    fn link(&mut self, existing: &str, path: &str) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, existing, false)?;
-        let normalized = normalize(path)?;
-        let (parent, name) = split_parent(&normalized)?;
-        let parent = resolve_path(self.filesystem, parent, true)?;
-        self.create_link(&inode, &parent, name.as_bytes())
-    }
-
-    fn mkdir(
+    fn symlink<S: Storage>(
         &mut self,
+        storage: &mut S,
+        target: &str,
+        path: &str,
+    ) -> Result<u32, Error<S::Error>> {
+        let normalized = normalize(path)?;
+        let (parent, name) = split_parent(&normalized)?;
+        let parent = resolve_path(self.filesystem, storage, parent, true)?;
+        self.create_symlink(storage, &parent, name.as_bytes(), target.as_bytes())
+    }
+
+    fn link<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        existing: &str,
+        path: &str,
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, existing, false)?;
+        let normalized = normalize(path)?;
+        let (parent, name) = split_parent(&normalized)?;
+        let parent = resolve_path(self.filesystem, storage, parent, true)?;
+        self.create_link(storage, &inode, &parent, name.as_bytes())
+    }
+
+    fn mkdir<S: Storage>(
+        &mut self,
+        storage: &mut S,
         parent: &str,
         name: &str,
         permissions: u16,
     ) -> Result<u32, Error<S::Error>> {
-        let parent = resolve_path(self.filesystem, parent, true)?;
-        self.create_directory(&parent, name.as_bytes(), permissions)
+        let parent = resolve_path(self.filesystem, storage, parent, true)?;
+        self.create_directory(storage, &parent, name.as_bytes(), permissions)
     }
 
-    fn unlink(&mut self, path: &str) -> Result<(), Error<S::Error>> {
-        let (parent, entry) = resolve_parent_entry(self.filesystem, path)?;
-        self.remove_entry(&parent, &entry)
+    fn unlink<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<(), Error<S::Error>> {
+        let (parent, entry) = resolve_parent_entry(self.filesystem, storage, path)?;
+        self.remove_entry(storage, &parent, &entry)
     }
 
-    fn rmdir(&mut self, path: &str) -> Result<(), Error<S::Error>> {
-        let (parent, entry) = resolve_parent_entry(self.filesystem, path)?;
-        self.remove_directory(&parent, &entry)
+    fn rmdir<S: Storage>(&mut self, storage: &mut S, path: &str) -> Result<(), Error<S::Error>> {
+        let (parent, entry) = resolve_parent_entry(self.filesystem, storage, path)?;
+        self.remove_directory(storage, &parent, &entry)
     }
 
-    fn rename(&mut self, old: &str, new: &str) -> Result<(), Error<S::Error>> {
-        let (old_parent, source) = resolve_parent_entry(self.filesystem, old)?;
+    fn rename<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        old: &str,
+        new: &str,
+    ) -> Result<(), Error<S::Error>> {
+        let (old_parent, source) = resolve_parent_entry(self.filesystem, storage, old)?;
         let normalized = normalize(new)?;
         let (new_parent_path, new_name) = split_parent(&normalized)?;
-        let new_parent = resolve_path(self.filesystem, new_parent_path, true)?;
-        let destination = find_entry(self.filesystem, &new_parent, new_name.as_bytes())?;
+        let new_parent = resolve_path(self.filesystem, storage, new_parent_path, true)?;
+        let destination = find_entry(self.filesystem, storage, &new_parent, new_name.as_bytes())?;
         self.move_entry(
+            storage,
             &old_parent,
             &source,
             &new_parent,
@@ -245,14 +355,23 @@ impl<S: Storage> PathTransaction for Transaction<'_, S> {
         )
     }
 
-    fn resize(&mut self, path: &str, size: u64) -> Result<(), Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.resize_inode(&inode, size)
+    fn resize<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+        size: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.resize_inode(storage, &inode, size)
     }
 
-    fn truncate_to_zero(&mut self, path: &str) -> Result<u64, Error<S::Error>> {
-        let inode = resolve_path(self.filesystem, path, true)?;
-        self.truncate_inode(&inode)
+    fn truncate_to_zero<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        path: &str,
+    ) -> Result<u64, Error<S::Error>> {
+        let inode = resolve_path(self.filesystem, storage, path, true)?;
+        self.truncate_inode(storage, &inode)
     }
 }
 
@@ -283,14 +402,15 @@ fn split_parent<E>(path: &str) -> Result<(&str, &str), Error<E>> {
 }
 
 fn find_entry<S: Storage>(
-    filesystem: &mut Ext4<S>,
+    filesystem: &mut Ext4,
+    storage: &mut S,
     directory: &Inode,
     name: &[u8],
 ) -> Result<Option<DirectoryEntry>, Error<S::Error>> {
     let mut cookie = 0;
     loop {
         let mut entries = Vec::new();
-        let next = filesystem.list(directory, cookie, &mut entries, 64)?;
+        let next = filesystem.list(storage, directory, cookie, &mut entries, 64)?;
         if let Some(entry) = entries.into_iter().find(|entry| entry.name == name) {
             return Ok(Some(entry));
         }
@@ -302,18 +422,21 @@ fn find_entry<S: Storage>(
 }
 
 fn resolve_parent_entry<S: Storage>(
-    filesystem: &mut Ext4<S>,
+    filesystem: &mut Ext4,
+    storage: &mut S,
     path: &str,
 ) -> Result<(Inode, DirectoryEntry), Error<S::Error>> {
     let normalized = normalize(path)?;
     let (parent, name) = split_parent(&normalized)?;
-    let parent = resolve_path(filesystem, parent, true)?;
-    let entry = find_entry(filesystem, &parent, name.as_bytes())?.ok_or(Error::NotFound)?;
+    let parent = resolve_path(filesystem, storage, parent, true)?;
+    let entry =
+        find_entry(filesystem, storage, &parent, name.as_bytes())?.ok_or(Error::NotFound)?;
     Ok((parent, entry))
 }
 
 fn resolve_path<S: Storage>(
-    filesystem: &mut Ext4<S>,
+    filesystem: &mut Ext4,
+    storage: &mut S,
     path: &str,
     follow_final: bool,
 ) -> Result<Inode, Error<S::Error>> {
@@ -324,17 +447,17 @@ fn resolve_path<S: Storage>(
             .filter(|component| !component.is_empty())
             .map(ToString::to_string)
             .collect();
-        let mut inode = filesystem.root()?;
+        let mut inode = filesystem.root(storage)?;
         let mut followed = false;
         for (index, component) in owned_components.iter().enumerate() {
             if !inode.is_directory() {
                 return Err(Error::NotDirectory);
             }
-            let entry =
-                find_entry(filesystem, &inode, component.as_bytes())?.ok_or(Error::NotFound)?;
+            let entry = find_entry(filesystem, storage, &inode, component.as_bytes())?
+                .ok_or(Error::NotFound)?;
             inode = entry.inode;
             if inode.is_symlink() && (follow_final || index + 1 != owned_components.len()) {
-                let target = filesystem.read_symlink(&inode)?;
+                let target = filesystem.read_symlink(storage, &inode)?;
                 let target = core::str::from_utf8(&target).map_err(|_| Corrupt::InvalidPath)?;
                 let parent = if index == 0 {
                     "/".to_string()

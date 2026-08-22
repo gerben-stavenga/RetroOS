@@ -9,14 +9,20 @@ fn image() -> Vec<u8> {
 
 #[test]
 fn reads_direct_and_double_indirect_data_from_mke2fs_image() {
-    let mut fs = Ext4::mount(ModelStorage::new(image())).unwrap();
+    let mut storage = ModelStorage::new(image());
+    let mut fs = Ext4::mount(&mut storage).unwrap();
     let mut contents = [0; 14];
-    assert_eq!(fs.read("/hello.txt", 0, &mut contents).unwrap(), 14);
+    assert_eq!(
+        fs.read(&mut storage, "/hello.txt", 0, &mut contents)
+            .unwrap(),
+        14
+    );
     assert_eq!(&contents, b"portable ext4\n");
 
     contents.fill(0);
     assert_eq!(
-        fs.read("/large.bin", 300 * 1024, &mut contents).unwrap(),
+        fs.read(&mut storage, "/large.bin", 300 * 1024, &mut contents)
+            .unwrap(),
         14
     );
     assert_eq!(&contents, b"portable ext4\n");
@@ -24,20 +30,26 @@ fn reads_direct_and_double_indirect_data_from_mke2fs_image() {
 
 #[test]
 fn every_legacy_lookup_effect_is_fallible() {
-    let mut successful = Ext4::mount(ModelStorage::new(image())).unwrap();
+    let mut successful_storage = ModelStorage::new(image());
+    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
     let mut contents = [0; 14];
     successful
-        .read("/large.bin", 300 * 1024, &mut contents)
+        .read(
+            &mut successful_storage,
+            "/large.bin",
+            300 * 1024,
+            &mut contents,
+        )
         .unwrap();
-    let effects = successful.storage().effects().len();
+    let effects = successful_storage.effects().len();
 
     for sequence in 0..effects {
-        let storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(storage) {
+        let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
+        match Ext4::mount(&mut storage) {
             Err(Error::Storage(ModelError::InjectedIo)) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => assert_eq!(
-                fs.read("/large.bin", 300 * 1024, &mut contents)
+                fs.read(&mut storage, "/large.bin", 300 * 1024, &mut contents)
                     .unwrap_err(),
                 Error::Storage(ModelError::InjectedIo),
             ),

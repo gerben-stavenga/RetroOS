@@ -122,17 +122,19 @@ struct OpenFile {
 
 /// Writable VFS adapter for the portable ext4 engine.
 pub struct PortableExt4Fs {
-    filesystem: RefCell<Ext4<VolumeStorage>>,
+    filesystem: RefCell<Ext4>,
+    storage: RefCell<VolumeStorage>,
     open_files: RefCell<BTreeMap<u64, OpenFile>>,
     next_handle: Cell<u64>,
 }
 
 impl PortableExt4Fs {
     pub fn new(volume: Volume) -> Result<Self, &'static str> {
-        let filesystem =
-            Ext4::mount(VolumeStorage::new(volume)).map_err(|_| "portable ext4 mount failed")?;
+        let mut storage = VolumeStorage::new(volume);
+        let filesystem = Ext4::mount(&mut storage).map_err(|_| "portable ext4 mount failed")?;
         Ok(Self {
             filesystem: RefCell::new(filesystem),
+            storage: RefCell::new(storage),
             open_files: RefCell::new(BTreeMap::new()),
             next_handle: Cell::new(1),
         })
@@ -168,7 +170,8 @@ impl PortableExt4Fs {
     }
 
     fn find_entry(
-        filesystem: &mut Ext4<VolumeStorage>,
+        filesystem: &mut Ext4,
+        storage: &mut VolumeStorage,
         directory: &Inode,
         name: &[u8],
     ) -> Result<Option<ExtDirectoryEntry>, ()> {
@@ -176,7 +179,7 @@ impl PortableExt4Fs {
         loop {
             let mut entries = Vec::new();
             let next = filesystem
-                .list(directory, cookie, &mut entries, 64)
+                .list(storage, directory, cookie, &mut entries, 64)
                 .map_err(|_| ())?;
             if let Some(entry) = entries.into_iter().find(|entry| entry.name == name) {
                 return Ok(Some(entry));
@@ -189,7 +192,8 @@ impl PortableExt4Fs {
     }
 
     fn resolve_in(
-        filesystem: &mut Ext4<VolumeStorage>,
+        filesystem: &mut Ext4,
+        storage: &mut VolumeStorage,
         path: &str,
         follow_final: bool,
     ) -> Result<Inode, ()> {
@@ -200,17 +204,17 @@ impl PortableExt4Fs {
                 .filter(|component| !component.is_empty() && *component != ".")
                 .map(ToString::to_string)
                 .collect();
-            let mut inode = filesystem.root().map_err(|_| ())?;
+            let mut inode = filesystem.root(storage).map_err(|_| ())?;
             let mut followed = false;
             for (index, component) in components.iter().enumerate() {
                 if component == ".." || !inode.is_directory() {
                     return Err(());
                 }
-                inode = Self::find_entry(filesystem, &inode, component.as_bytes())?
+                inode = Self::find_entry(filesystem, storage, &inode, component.as_bytes())?
                     .ok_or(())?
                     .inode;
                 if inode.is_symlink() && (follow_final || index + 1 != components.len()) {
-                    let target = filesystem.read_symlink(&inode).map_err(|_| ())?;
+                    let target = filesystem.read_symlink(storage, &inode).map_err(|_| ())?;
                     let target = core::str::from_utf8(&target).map_err(|_| ())?;
                     let parent = if index == 0 {
                         "/".to_string()
@@ -235,14 +239,21 @@ impl PortableExt4Fs {
     }
 
     fn resolve(&self, path: &str, follow_final: bool) -> Result<Inode, ()> {
-        Self::resolve_in(&mut self.filesystem.borrow_mut(), path, follow_final)
+        Self::resolve_in(
+            &mut self.filesystem.borrow_mut(),
+            &mut self.storage.borrow_mut(),
+            path,
+            follow_final,
+        )
     }
 
     fn parent_entry(&self, path: &str) -> Result<(Inode, ExtDirectoryEntry), ()> {
         let (parent_path, name) = Self::split_parent(path).ok_or(())?;
         let mut filesystem = self.filesystem.borrow_mut();
-        let parent = Self::resolve_in(&mut filesystem, parent_path, true)?;
-        let entry = Self::find_entry(&mut filesystem, &parent, name.as_bytes())?.ok_or(())?;
+        let mut storage = self.storage.borrow_mut();
+        let parent = Self::resolve_in(&mut filesystem, &mut storage, parent_path, true)?;
+        let entry =
+            Self::find_entry(&mut filesystem, &mut storage, &parent, name.as_bytes())?.ok_or(())?;
         Ok((parent, entry))
     }
 
@@ -250,14 +261,16 @@ impl PortableExt4Fs {
         &self,
         reserve: usize,
         operation: impl FnOnce(
-            &mut portable_ext4::Transaction<'_, VolumeStorage>,
+            &mut portable_ext4::Transaction<'_>,
+            &mut VolumeStorage,
         ) -> Result<(), portable_ext4::Error<VolumeError>>,
     ) -> bool {
         let mut filesystem = self.filesystem.borrow_mut();
+        let mut storage = self.storage.borrow_mut();
         let mut transaction = filesystem.begin_transaction();
         transaction.reserve_blocks(reserve).is_ok()
-            && operation(&mut transaction).is_ok()
-            && transaction.commit().is_ok()
+            && operation(&mut transaction, &mut storage).is_ok()
+            && transaction.commit(&mut *storage).is_ok()
     }
 }
 
@@ -305,7 +318,12 @@ impl Filesystem for PortableExt4Fs {
         };
         self.filesystem
             .borrow_mut()
-            .read_inode(&inode, u64::from(offset), buffer)
+            .read_inode(
+                &mut *self.storage.borrow_mut(),
+                &inode,
+                u64::from(offset),
+                buffer,
+            )
             .map_or(-5, |count| count as i32)
     }
 
@@ -318,14 +336,18 @@ impl Filesystem for PortableExt4Fs {
             file.inode.clone()
         };
         let offset = u64::from(offset);
-        let current = match self.filesystem.borrow_mut().refresh(&inode) {
+        let current = match self
+            .filesystem
+            .borrow_mut()
+            .refresh(&mut *self.storage.borrow_mut(), &inode)
+        {
             Ok(inode) => inode,
             Err(_) => return -5,
         };
         if offset > current.size
             && !self.commit(
                 Self::reserve_for_data((offset - current.size) as usize),
-                |transaction| transaction.resize_inode(&current, offset),
+                |transaction, storage| transaction.resize_inode(storage, &current, offset),
             )
         {
             return -5;
@@ -333,13 +355,18 @@ impl Filesystem for PortableExt4Fs {
         if data.is_empty() {
             return 0;
         }
-        let inode = match self.filesystem.borrow_mut().refresh(&inode) {
+        let inode = match self
+            .filesystem
+            .borrow_mut()
+            .refresh(&mut *self.storage.borrow_mut(), &inode)
+        {
             Ok(inode) => inode,
             Err(_) => return -5,
         };
-        if self.commit(Self::reserve_for_data(data.len()), |transaction| {
-            transaction.write_inode(&inode, offset, data)
-        }) {
+        if self.commit(
+            Self::reserve_for_data(data.len()),
+            |transaction, storage| transaction.write_inode(storage, &inode, offset, data),
+        ) {
             data.len() as i32
         } else {
             -5
@@ -351,13 +378,15 @@ impl Filesystem for PortableExt4Fs {
         let exists = self.resolve(&path, true).ok();
         let success = if let Some(inode) = exists {
             !inode.is_directory()
-                && self.commit(64, |transaction| transaction.resize_inode(&inode, 0))
+                && self.commit(64, |transaction, storage| {
+                    transaction.resize_inode(storage, &inode, 0)
+                })
         } else {
             let (parent, name) = Self::split_parent(&path)?;
             let parent = self.resolve(parent, true).ok()?;
-            self.commit(64, |transaction| {
+            self.commit(64, |transaction, storage| {
                 transaction
-                    .create_file(&parent, name.as_bytes(), 0o664)
+                    .create_file(storage, &parent, name.as_bytes(), 0o664)
                     .map(|_| ())
             })
         };
@@ -386,9 +415,9 @@ impl Filesystem for PortableExt4Fs {
         let Ok(parent) = self.resolve(parent, true) else {
             return -2;
         };
-        if self.commit(64, |transaction| {
+        if self.commit(64, |transaction, storage| {
             transaction
-                .create_directory(&parent, name.as_bytes(), 0o775)
+                .create_directory(storage, &parent, name.as_bytes(), 0o775)
                 .map(|_| ())
         }) {
             0
@@ -408,8 +437,8 @@ impl Filesystem for PortableExt4Fs {
         let Ok((parent, entry)) = self.parent_entry(&path) else {
             return -2;
         };
-        if self.commit(64, |transaction| {
-            transaction.remove_directory(&parent, &entry)
+        if self.commit(64, |transaction, storage| {
+            transaction.remove_directory(storage, &parent, &entry)
         }) {
             0
         } else {
@@ -432,13 +461,20 @@ impl Filesystem for PortableExt4Fs {
         };
         let destination = {
             let mut filesystem = self.filesystem.borrow_mut();
-            match Self::find_entry(&mut filesystem, &new_parent, new_name.as_bytes()) {
+            let mut storage = self.storage.borrow_mut();
+            match Self::find_entry(
+                &mut filesystem,
+                &mut storage,
+                &new_parent,
+                new_name.as_bytes(),
+            ) {
                 Ok(entry) => entry,
                 Err(()) => return -5,
             }
         };
-        if !self.commit(96, |transaction| {
+        if !self.commit(96, |transaction, storage| {
             transaction.move_entry(
+                storage,
                 &old_parent,
                 &source,
                 &new_parent,
@@ -472,7 +508,13 @@ impl Filesystem for PortableExt4Fs {
         let next = self
             .filesystem
             .borrow_mut()
-            .list(&directory, cookie, &mut entries, max)
+            .list(
+                &mut *self.storage.borrow_mut(),
+                &directory,
+                cookie,
+                &mut entries,
+                max,
+            )
             .ok()?;
         for entry in entries {
             let name_len = entry.name.len().min(100);
@@ -515,8 +557,9 @@ impl Filesystem for PortableExt4Fs {
         let Ok(inode) = self.resolve(&path, true) else {
             return false;
         };
-        self.commit(4, |transaction| {
+        self.commit(4, |transaction, storage| {
             transaction.set_inode_times(
+                storage,
                 &inode,
                 None,
                 Some(Timestamp {
@@ -548,8 +591,9 @@ impl Filesystem for PortableExt4Fs {
         let Ok(inode) = self.resolve(&path, true) else {
             return false;
         };
-        self.commit(4, |transaction| {
+        self.commit(4, |transaction, storage| {
             transaction.update_metadata(
+                storage,
                 &inode,
                 InodeMetadataUpdate {
                     permissions: Some(permissions),
@@ -576,7 +620,9 @@ impl Filesystem for PortableExt4Fs {
         {
             return -16;
         }
-        if self.commit(64, |transaction| transaction.remove_entry(&parent, &entry)) {
+        if self.commit(64, |transaction, storage| {
+            transaction.remove_entry(storage, &parent, &entry)
+        }) {
             0
         } else {
             -5

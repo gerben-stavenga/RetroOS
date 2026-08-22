@@ -6,7 +6,7 @@
 use crate::checksum::Checksum;
 use crate::ondisk::{self, le16, le32};
 use crate::{
-    Corrupt, DirectoryEntry, Error, Ext4, Inode, InodeMetadataUpdate, Storage, Timestamp,
+    Corrupt, DirectoryEntry, Error, Ext4, FsError, Inode, InodeMetadataUpdate, Storage, Timestamp,
     Unsupported,
 };
 use alloc::vec::Vec;
@@ -182,7 +182,7 @@ impl MetadataMutation {
 
     fn load<S: Storage>(
         &mut self,
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
         number: u64,
     ) -> Result<(), Error<S::Error>> {
         let Err(index) = self.index(number) else {
@@ -234,7 +234,7 @@ impl MetadataMutation {
 
     fn edit_inode<S: Storage, F>(
         &mut self,
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
         inode: &Inode,
         edit: F,
     ) -> Result<(), Error<S::Error>>
@@ -259,7 +259,7 @@ impl MetadataMutation {
 
     fn stage<S: Storage>(
         self,
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
     ) -> Result<(), Error<S::Error>> {
         if transaction.available.len() < self.blocks.len() {
             return Err(Error::ReservationExhausted);
@@ -307,7 +307,7 @@ struct DirectoryTree {
 
 impl DirectoryTree {
     fn load<S: Storage>(
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
         inode: &Inode,
     ) -> Result<Self, Error<S::Error>> {
         if !inode.is_directory() {
@@ -325,7 +325,6 @@ impl DirectoryTree {
             .map_err(|_| Error::OutOfMemory)?;
         for logical in 0..count {
             let physical = transaction
-                .filesystem
                 .map_file_block(inode, logical)?
                 .ok_or(Corrupt::InvalidDirectory)?;
             if nodes
@@ -676,7 +675,7 @@ impl FileEditor {
 
     fn write_at<S: Storage>(
         &self,
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
         offset: u64,
         data: &[u8],
     ) -> Result<FileEditResult, Error<S::Error>> {
@@ -707,7 +706,7 @@ impl FileEditor {
 
     fn resize<S: Storage>(
         &self,
-        transaction: &mut Transaction<'_, S>,
+        transaction: &mut TransactionIo<'_, '_, S>,
         new_size: u64,
     ) -> Result<(), Error<S::Error>> {
         if !transaction.dirty.is_empty() {
@@ -762,14 +761,33 @@ enum ReleaseKind {
 /// every allocation needed to consume those slots, so subsequent full-block
 /// writes cannot fail from allocation. Reads and modifications can still fail
 /// when loading an unchanged block from storage.
-pub struct Transaction<'a, S> {
-    pub(crate) filesystem: &'a mut Ext4<S>,
+pub struct Transaction<'a> {
+    pub(crate) filesystem: &'a mut Ext4,
     dirty: Vec<DirtyBlock>,
     available: Vec<Vec<u8>>,
 }
 
-impl<'a, S: Storage> Transaction<'a, S> {
-    pub(crate) fn new(filesystem: &'a mut Ext4<S>) -> Self {
+struct TransactionIo<'a, 'f, S> {
+    transaction: &'a mut Transaction<'f>,
+    storage: &'a mut S,
+}
+
+impl<'f, S> core::ops::Deref for TransactionIo<'_, 'f, S> {
+    type Target = Transaction<'f>;
+
+    fn deref(&self) -> &Self::Target {
+        self.transaction
+    }
+}
+
+impl<'f, S> core::ops::DerefMut for TransactionIo<'_, 'f, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.transaction
+    }
+}
+
+impl<'a> Transaction<'a> {
+    pub(crate) fn new(filesystem: &'a mut Ext4) -> Self {
         Self {
             filesystem,
             dirty: Vec::new(),
@@ -777,40 +795,44 @@ impl<'a, S: Storage> Transaction<'a, S> {
         }
     }
 
-    /// Fallibly reserve `additional` unique dirty-block slots.
-    pub fn reserve_blocks(&mut self, additional: usize) -> Result<(), Error<S::Error>> {
+    fn io<'s, S: Storage>(&'s mut self, storage: &'s mut S) -> TransactionIo<'s, 'a, S> {
+        TransactionIo {
+            transaction: self,
+            storage,
+        }
+    }
+
+    pub fn reserve_blocks(&mut self, additional: usize) -> Result<(), FsError> {
         let total = self
             .dirty
             .len()
             .checked_add(self.available.len())
             .and_then(|value| value.checked_add(additional))
-            .ok_or(Error::InvalidArgument)?;
-        if u64::try_from(total).map_err(|_| Error::InvalidArgument)?
+            .ok_or(FsError::InvalidArgument)?;
+        if u64::try_from(total).map_err(|_| FsError::InvalidArgument)?
             > self.filesystem.superblock.blocks_count
         {
-            return Err(Error::InvalidArgument);
+            return Err(FsError::InvalidArgument);
         }
-
         let block_size = self.filesystem.superblock.block_size as usize;
         let mut buffers = Vec::new();
         buffers
             .try_reserve_exact(additional)
-            .map_err(|_| Error::OutOfMemory)?;
+            .map_err(|_| FsError::OutOfMemory)?;
         for _ in 0..additional {
             let mut block = Vec::new();
             block
                 .try_reserve_exact(block_size)
-                .map_err(|_| Error::OutOfMemory)?;
+                .map_err(|_| FsError::OutOfMemory)?;
             block.resize(block_size, 0);
             buffers.push(block);
         }
-
         self.dirty
             .try_reserve(self.available.len() + additional)
-            .map_err(|_| Error::OutOfMemory)?;
+            .map_err(|_| FsError::OutOfMemory)?;
         self.available
             .try_reserve(additional)
-            .map_err(|_| Error::OutOfMemory)?;
+            .map_err(|_| FsError::OutOfMemory)?;
         self.available.append(&mut buffers);
         Ok(())
     }
@@ -824,22 +846,246 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     pub fn is_dirty(&self, number: u64) -> bool {
-        self.dirty_index(number).is_ok()
+        self.dirty
+            .binary_search_by_key(&number, |block| block.number)
+            .is_ok()
     }
 
-    /// Borrow the underlying storage for diagnostics and effect accounting.
-    pub fn storage(&self) -> &S {
-        &self.filesystem.storage
+    pub fn commit<S: Storage>(self, storage: &mut S) -> Result<(), Error<S::Error>> {
+        self.filesystem.commit_journal(storage, &self.dirty)
     }
 
-    /// Atomically publish the private dirty blocks through the internal JBD2
-    /// journal, checkpoint them, and leave both journals clean.
-    ///
-    /// This initial writer accepts only the constrained journal format
-    /// documented by [`crate::Ext4`]. The transaction is consumed because an
-    /// I/O error may leave a recoverable on-disk transaction in progress.
-    pub fn commit(self) -> Result<(), Error<S::Error>> {
-        self.filesystem.commit_journal(&self.dirty)
+    pub fn update_metadata<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        update: InodeMetadataUpdate,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).update_metadata(inode, update)
+    }
+
+    pub fn chmod_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        permissions: u16,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).chmod_inode(inode, permissions)
+    }
+
+    pub fn chown_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).chown_inode(inode, uid, gid)
+    }
+
+    pub fn set_inode_times<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        accessed: Option<Timestamp>,
+        modified: Option<Timestamp>,
+        changed: Option<Timestamp>,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage)
+            .set_inode_times(inode, accessed, modified, changed)
+    }
+
+    pub fn write_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).write_inode(inode, offset, data)
+    }
+
+    pub fn overwrite_inode_range<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).overwrite_inode_range(inode, offset, data)
+    }
+
+    pub fn append_zeroed_inode_block<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<u64, Error<S::Error>> {
+        self.io(storage).append_zeroed_inode_block(inode)
+    }
+
+    pub fn initialize_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).initialize_inode(inode, data)
+    }
+
+    pub fn append_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        data: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).append_inode(inode, data)
+    }
+
+    pub fn create_file<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        directory: &Inode,
+        name: &[u8],
+        permissions: u16,
+    ) -> Result<u32, Error<S::Error>> {
+        self.io(storage).create_file(directory, name, permissions)
+    }
+
+    pub fn create_symlink<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        directory: &Inode,
+        name: &[u8],
+        target: &[u8],
+    ) -> Result<u32, Error<S::Error>> {
+        self.io(storage).create_symlink(directory, name, target)
+    }
+
+    pub fn create_link<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        parent: &Inode,
+        name: &[u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).create_link(inode, parent, name)
+    }
+
+    pub fn create_directory<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        parent: &Inode,
+        name: &[u8],
+        permissions: u16,
+    ) -> Result<u32, Error<S::Error>> {
+        self.io(storage).create_directory(parent, name, permissions)
+    }
+
+    pub fn remove_entry<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        directory: &Inode,
+        entry: &DirectoryEntry,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).remove_entry(directory, entry)
+    }
+
+    pub fn remove_directory<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        parent: &Inode,
+        entry: &DirectoryEntry,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).remove_directory(parent, entry)
+    }
+
+    pub fn move_entry<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        old_parent: &Inode,
+        source: &DirectoryEntry,
+        new_parent: &Inode,
+        new_name: &[u8],
+        destination: Option<&DirectoryEntry>,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage)
+            .move_entry(old_parent, source, new_parent, new_name, destination)
+    }
+
+    pub fn resize_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+        new_size: u64,
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).resize_inode(inode, new_size)
+    }
+
+    pub fn truncate_inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        inode: &Inode,
+    ) -> Result<u64, Error<S::Error>> {
+        self.io(storage).truncate_inode(inode)
+    }
+
+    pub fn read_block<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        number: u64,
+        dst: &mut [u8],
+    ) -> Result<(), Error<S::Error>> {
+        self.io(storage).read_block(number, dst)
+    }
+
+    pub fn write_block(&mut self, number: u64, src: &[u8]) -> Result<(), FsError> {
+        if number >= self.filesystem.superblock.blocks_count
+            || src.len() != self.filesystem.superblock.block_size as usize
+        {
+            return Err(FsError::InvalidArgument);
+        }
+        match self
+            .dirty
+            .binary_search_by_key(&number, |block| block.number)
+        {
+            Ok(index) => self.dirty[index].bytes.copy_from_slice(src),
+            Err(index) => {
+                let bytes = self.available.pop().ok_or(FsError::ReservationExhausted)?;
+                self.dirty.insert(index, DirtyBlock { number, bytes });
+                self.dirty[index].bytes.copy_from_slice(src);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn modify_block<S: Storage, F>(
+        &mut self,
+        storage: &mut S,
+        number: u64,
+        modify: F,
+    ) -> Result<(), Error<S::Error>>
+    where
+        F: FnOnce(&mut [u8]),
+    {
+        self.io(storage).modify_block(number, modify)
+    }
+}
+
+impl<S: Storage> TransactionIo<'_, '_, S> {
+    fn map_file_block(
+        &mut self,
+        inode: &Inode,
+        logical: u64,
+    ) -> Result<Option<u64>, Error<S::Error>> {
+        self.transaction
+            .filesystem
+            .map_file_block(self.storage, inode, logical)
+    }
+
+    fn read_external_xattr_block(&mut self, inode: &Inode) -> Result<Vec<u8>, Error<S::Error>> {
+        self.transaction
+            .filesystem
+            .read_external_xattr_block(self.storage, inode)
     }
 
     /// Apply filesystem-independent inode metadata as one checked edit.
@@ -859,8 +1105,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if update == InodeMetadataUpdate::default() {
             return Ok(());
         }
-        let inode = self.filesystem.refresh(inode)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let inode = self.transaction.filesystem.refresh(self.storage, inode)?;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
         let mut metadata = MetadataMutation::new();
         metadata.load(self, superblock_number)?;
@@ -928,7 +1174,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if !self.dirty.is_empty() {
             return Err(Error::ReservationExhausted);
         }
-        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
+        let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
         file.write_at(self, offset, data).map(|_| ())
     }
 
@@ -947,7 +1193,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if data.is_empty() {
             return Ok(());
         }
-        let inode = self.filesystem.refresh(inode)?;
+        let inode = self.transaction.filesystem.refresh(self.storage, inode)?;
         offset
             .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .filter(|end| *end <= inode.size)
@@ -966,7 +1212,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let end = offset
             .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .ok_or(Corrupt::AddressOverflow)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let first = offset / block_size;
         let last = (end - 1) / block_size;
         let block_count =
@@ -982,7 +1228,6 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let mut copied = 0usize;
         for logical in first..=last {
             let physical = self
-                .filesystem
                 .map_file_block(inode, logical)?
                 .ok_or(Unsupported::ExtentMutation)?;
             if physical == 0
@@ -1031,7 +1276,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
-        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
+        let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
         if file.inode.size != 0 || file.inode.blocks_512 != 0 {
             return Err(Unsupported::ExtentMutation.into());
         }
@@ -1043,7 +1288,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     /// Fill an empty extent-formatted file with an arbitrary multi-block value.
     pub fn initialize_inode(&mut self, inode: &Inode, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
+        let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
         if file.inode.size != 0 || file.inode.blocks_512 != 0 {
             return Err(Unsupported::ExtentMutation.into());
         }
@@ -1052,7 +1297,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     /// Append bytes using the general file editor.
     pub fn append_inode(&mut self, inode: &Inode, data: &[u8]) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
+        let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
         file.write_at(self, file.inode.size, data).map(|_| ())
     }
 
@@ -1066,7 +1311,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if offset > inode.size {
             return Err(Unsupported::ExtentMutation.into());
         }
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
         if new_size <= inode.size {
             return Err(Unsupported::ExtentMutation.into());
@@ -1101,8 +1346,12 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Unsupported::ExtentMutation.into());
         }
 
-        let inode_group = (inode.number - 1) / self.filesystem.superblock.inodes_per_group;
-        let inode_descriptor = self.filesystem.read_group_descriptor(inode_group)?;
+        let inode_group =
+            (inode.number - 1) / self.transaction.filesystem.superblock.inodes_per_group;
+        let inode_descriptor = self
+            .transaction
+            .filesystem
+            .read_group_descriptor(self.storage, inode_group)?;
         let inode_table = u64::from(le32(&inode_descriptor, 8))
             | (u64::from(le32(&inode_descriptor, 0x28)) << 32);
         let mut allocation = self.allocate_blocks(added_blocks_usize)?;
@@ -1149,17 +1398,19 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let descriptor_blocks = self.descriptor_blocks(&allocation_groups)?;
         let superblock_block_number = ondisk::SUPERBLOCK_OFFSET / block_size;
         let inode_index =
-            u64::from((inode.number - 1) % self.filesystem.superblock.inodes_per_group);
+            u64::from((inode.number - 1) % self.transaction.filesystem.superblock.inodes_per_group);
         let inode_byte = inode_table
             .checked_mul(block_size)
             .and_then(|offset| {
-                offset.checked_add(inode_index * u64::from(self.filesystem.superblock.inode_size))
+                offset.checked_add(
+                    inode_index * u64::from(self.transaction.filesystem.superblock.inode_size),
+                )
             })
             .ok_or(Corrupt::AddressOverflow)?;
         let inode_block_number = inode_byte / block_size;
         let inode_offset =
             usize::try_from(inode_byte % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
         let mut superblock_block = self.read_owned_block(superblock_block_number)?;
         let mut inode_block = self.read_owned_block(inode_block_number)?;
         if inode_offset
@@ -1232,7 +1483,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let raw_inode = &mut inode_block[inode_offset..inode_offset + inode_size];
         let mut editor = InodeEditor::new(
             raw_inode,
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             inode.number,
             inode.generation,
         )?;
@@ -1314,8 +1565,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Error::InvalidArgument);
         }
 
-        let directory = self.filesystem.refresh(directory)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let directory = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, directory)?;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let mut directory_tree = DirectoryTree::load(self, &directory)?;
 
         let mut allocation = self.allocate_inode()?;
@@ -1327,15 +1581,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .checked_mul(block_size)
             .and_then(|offset| {
                 offset.checked_add(
-                    allocation.index * u64::from(self.filesystem.superblock.inode_size),
+                    allocation.index * u64::from(self.transaction.filesystem.superblock.inode_size),
                 )
             })
             .ok_or(Corrupt::AddressOverflow)?;
         let inode_block_number = inode_byte / block_size;
         let inode_offset =
             usize::try_from(inode_byte % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
-        if inode_offset + inode_size > self.filesystem.superblock.block_size as usize {
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
+        if inode_offset + inode_size > self.transaction.filesystem.superblock.block_size as usize {
             return Err(Unsupported::MutationProfile.into());
         }
 
@@ -1363,7 +1617,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let raw_inode = &mut inode_block[inode_offset..inode_offset + inode_size];
         let mut editor = InodeEditor::new(
             raw_inode,
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             inode_number,
             0,
         )?;
@@ -1399,7 +1653,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Error::ReservationExhausted);
         }
 
-        let inode = self.filesystem.refresh(inode)?;
+        let inode = self.transaction.filesystem.refresh(self.storage, inode)?;
         if inode.is_directory() || inode.links == u16::MAX {
             return Err(Error::InvalidArgument);
         }
@@ -1408,8 +1662,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
             0xa000 => 7,
             _ => return Err(Unsupported::MutationProfile.into()),
         };
-        let parent = self.filesystem.refresh(parent)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let parent = self.transaction.filesystem.refresh(self.storage, parent)?;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let mut directory_tree = DirectoryTree::load(self, &parent)?;
         let mut resources = Allocation {
             blocks: Vec::new(),
@@ -1474,8 +1728,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Err(Error::InvalidArgument);
         }
 
-        let parent = self.filesystem.refresh(parent)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let parent = self.transaction.filesystem.refresh(self.storage, parent)?;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         if !parent.is_directory() || parent.links == u16::MAX {
             return Err(Unsupported::MutationProfile.into());
         }
@@ -1491,20 +1745,20 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .map_err(|_| Corrupt::InvalidGroup(allocation.group_number))?;
         increment_descriptor_used_directories(
             &mut allocation.resources.groups[inode_group].descriptor,
-            u64::from(self.filesystem.superblock.inodes_per_group),
+            u64::from(self.transaction.filesystem.superblock.inodes_per_group),
         )?;
         update_group_descriptor_checksum(
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             allocation.group_number,
             &mut allocation.resources.groups[inode_group].descriptor,
         );
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
         let inode_byte = allocation
             .inode_table
             .checked_mul(block_size)
             .and_then(|offset| {
                 offset.checked_add(
-                    allocation.index * u64::from(self.filesystem.superblock.inode_size),
+                    allocation.index * u64::from(self.transaction.filesystem.superblock.inode_size),
                 )
             })
             .ok_or(Corrupt::AddressOverflow)?;
@@ -1529,7 +1783,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .map_err(|_| Corrupt::AddressOverflow)?;
         let mut directory_block = self.zero_block()?;
         initialize_directory_block(
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             allocation.number,
             0,
             parent.number,
@@ -1543,7 +1797,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         )?;
         let mut editor = InodeEditor::new(
             &mut metadata.get_mut(inode_block_number)?[inode_offset..inode_offset + inode_size],
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             allocation.number,
             0,
         )?;
@@ -1593,9 +1847,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if entry.name.is_empty() || entry.name == b"." || entry.name == b".." {
             return Err(Error::InvalidArgument);
         }
-        let directory = self.filesystem.refresh(directory)?;
-        let inode = self.filesystem.refresh(&entry.inode)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let directory = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, directory)?;
+        let inode = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, &entry.inode)?;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         if !directory.is_directory()
             || inode.links == 0
             || !matches!(inode.mode & 0xf000, 0x8000 | 0xa000)
@@ -1639,8 +1899,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if entry.name.is_empty() || entry.name == b"." || entry.name == b".." {
             return Err(Error::InvalidArgument);
         }
-        let parent = self.filesystem.refresh(parent)?;
-        let directory = self.filesystem.refresh(&entry.inode)?;
+        let parent = self.transaction.filesystem.refresh(self.storage, parent)?;
+        let directory = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, &entry.inode)?;
         if !parent.is_directory() || parent.links == 0 {
             return Err(Unsupported::MutationProfile.into());
         }
@@ -1677,12 +1940,25 @@ impl<'a, S: Storage> Transaction<'a, S> {
             return Ok(());
         }
 
-        let old_parent = self.filesystem.refresh(old_parent)?;
-        let source_inode = self.filesystem.refresh(&source.inode)?;
-        let new_parent = self.filesystem.refresh(new_parent)?;
+        let old_parent = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, old_parent)?;
+        let source_inode = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, &source.inode)?;
+        let new_parent = self
+            .transaction
+            .filesystem
+            .refresh(self.storage, new_parent)?;
         let destination = match destination {
             Some(destination) if destination.inode.number == source_inode.number => return Ok(()),
-            Some(destination) => Some(self.filesystem.refresh(&destination.inode)?),
+            Some(destination) => Some(
+                self.transaction
+                    .filesystem
+                    .refresh(self.storage, &destination.inode)?,
+            ),
             None => None,
         };
         if !old_parent.is_directory() || !new_parent.is_directory() {
@@ -1835,13 +2111,13 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     /// Resize a regular file through its allocation-aware editor.
     pub fn resize_inode(&mut self, inode: &Inode, new_size: u64) -> Result<(), Error<S::Error>> {
-        let file = FileEditor::new(self.filesystem.refresh(inode)?)?;
+        let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
         file.resize(self, new_size)
     }
 
     /// Release checked initialized extents and reduce a regular file to size 0.
     pub fn truncate_inode(&mut self, inode: &Inode) -> Result<u64, Error<S::Error>> {
-        let inode = self.filesystem.refresh(inode)?;
+        let inode = self.transaction.filesystem.refresh(self.storage, inode)?;
         if inode.size == 0 && inode.blocks_512 == 0 {
             return Ok(0);
         }
@@ -1850,7 +2126,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     fn shrink_file(&mut self, inode: &Inode, new_size: u64) -> Result<u64, Error<S::Error>> {
         self.validate_mutation_profile()?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
         let old_blocks = inode.size.div_ceil(block_size);
         let kept_blocks = new_size.div_ceil(block_size);
@@ -1946,7 +2222,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         increment_superblock_free_blocks(
             raw_superblock,
             released,
-            self.filesystem.superblock.blocks_count,
+            self.transaction.filesystem.superblock.blocks_count,
         )?;
         update_superblock_checksum(raw_superblock);
         metadata.adopt_blocks(descriptor_blocks)?;
@@ -1962,12 +2238,12 @@ impl<'a, S: Storage> Transaction<'a, S> {
         }
 
         let (inode_block, inode_offset) = self.inode_location(inode.number)?;
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
         metadata.load(self, inode_block)?;
         let raw = &mut metadata.get_mut(inode_block)?[inode_offset..inode_offset + inode_size];
         let mut editor = InodeEditor::new(
             raw,
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             inode.number,
             inode.generation,
         )?;
@@ -1989,8 +2265,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     /// Read one filesystem block through this transaction's private view.
     pub fn read_block(&mut self, number: u64, dst: &mut [u8]) -> Result<(), Error<S::Error>> {
-        if number >= self.filesystem.superblock.blocks_count
-            || dst.len() != self.filesystem.superblock.block_size as usize
+        if number >= self.transaction.filesystem.superblock.blocks_count
+            || dst.len() != self.transaction.filesystem.superblock.block_size as usize
         {
             return Err(Error::InvalidArgument);
         }
@@ -1998,7 +2274,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
             Ok(index) => dst.copy_from_slice(&self.dirty[index].bytes),
             Err(_) => {
                 let offset = self.block_offset(number)?;
-                self.filesystem.read_storage(offset, dst)?;
+                self.transaction
+                    .filesystem
+                    .read_storage(self.storage, offset, dst)?;
             }
         }
         Ok(())
@@ -2006,8 +2284,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     /// Replace one complete filesystem block in the private dirty set.
     pub fn write_block(&mut self, number: u64, src: &[u8]) -> Result<(), Error<S::Error>> {
-        if number >= self.filesystem.superblock.blocks_count
-            || src.len() != self.filesystem.superblock.block_size as usize
+        if number >= self.transaction.filesystem.superblock.blocks_count
+            || src.len() != self.transaction.filesystem.superblock.block_size as usize
         {
             return Err(Error::InvalidArgument);
         }
@@ -2026,7 +2304,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
     where
         F: FnOnce(&mut [u8]),
     {
-        if number >= self.filesystem.superblock.blocks_count {
+        if number >= self.transaction.filesystem.superblock.blocks_count {
             return Err(Error::InvalidArgument);
         }
         let index = match self.dirty_index(number) {
@@ -2034,7 +2312,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
             Err(index) => {
                 let mut bytes = self.available.pop().ok_or(Error::ReservationExhausted)?;
                 let offset = self.block_offset(number)?;
-                if let Err(error) = self.filesystem.read_storage(offset, &mut bytes) {
+                if let Err(error) =
+                    self.transaction
+                        .filesystem
+                        .read_storage(self.storage, offset, &mut bytes)
+                {
                     self.available.push(bytes);
                     return Err(error);
                 }
@@ -2059,7 +2341,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
     fn block_offset(&self, number: u64) -> Result<u64, Error<S::Error>> {
         number
-            .checked_mul(u64::from(self.filesystem.superblock.block_size))
+            .checked_mul(u64::from(self.transaction.filesystem.superblock.block_size))
             .ok_or(Corrupt::AddressOverflow.into())
     }
 
@@ -2090,7 +2372,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if tree.inode.flags & super::DIRECTORY_INDEX_FL != 0 {
             return Err(Unsupported::MutationProfile.into());
         }
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
         let ownership = self.read_extent_ownership(&tree.inode)?;
         let existing_nodes = ownership.tree;
@@ -2151,7 +2433,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
 
         let mut leaf = self.zero_block()?;
         initialize_empty_directory_leaf(
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             tree.inode.number,
             tree.inode.generation,
             &mut leaf,
@@ -2184,9 +2466,9 @@ impl<'a, S: Storage> Transaction<'a, S> {
         mut growth: DirectoryGrowth,
     ) -> Result<(), Error<S::Error>> {
         let (block_number, offset) = self.inode_location(growth.inode.number)?;
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
-        let checksum_seed = self.filesystem.superblock.checksum_seed;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
+        let checksum_seed = self.transaction.filesystem.superblock.checksum_seed;
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         metadata.load(self, block_number)?;
         let block = metadata.get_mut(block_number)?;
         let end = offset
@@ -2215,7 +2497,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         metadata: &mut MetadataMutation,
         resources: Allocation,
     ) -> Result<(), Error<S::Error>> {
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
         metadata.load(self, superblock_number)?;
         if !resources.blocks.is_empty() {
@@ -2262,11 +2544,11 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .map_err(|_| Error::OutOfMemory)?;
         allocation
             .groups
-            .try_reserve_exact(self.filesystem.superblock.group_count() as usize)
+            .try_reserve_exact(self.transaction.filesystem.superblock.group_count() as usize)
             .map_err(|_| Error::OutOfMemory)?;
-        let first_data = u64::from(self.filesystem.superblock.first_data_block);
-        let blocks_per_group = u64::from(self.filesystem.superblock.blocks_per_group);
-        let group_count = self.filesystem.superblock.group_count();
+        let first_data = u64::from(self.transaction.filesystem.superblock.first_data_block);
+        let blocks_per_group = u64::from(self.transaction.filesystem.superblock.blocks_per_group);
+        let group_count = self.transaction.filesystem.superblock.group_count();
         let mut group_order = Vec::new();
         group_order
             .try_reserve_exact(group_count as usize)
@@ -2308,7 +2590,10 @@ impl<'a, S: Storage> Transaction<'a, S> {
                     (edit.descriptor, bitmap)
                 }
                 Err(_) => {
-                    let mut descriptor = self.filesystem.read_group_descriptor(group)?;
+                    let mut descriptor = self
+                        .transaction
+                        .filesystem
+                        .read_group_descriptor(self.storage, group)?;
                     let bitmap_number = u64::from(le32(&descriptor, 0))
                         | (u64::from(le32(&descriptor, 0x20)) << 32);
                     let bitmap = if le16(&descriptor, 0x12) & 0x0002 != 0 {
@@ -2402,7 +2687,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             put_le16(&mut descriptor, 0x18, checksum as u16);
             put_le16(&mut descriptor, 0x38, (checksum >> 16) as u16);
             update_group_descriptor_checksum(
-                self.filesystem.superblock.checksum_seed,
+                self.transaction.filesystem.superblock.checksum_seed,
                 group,
                 &mut descriptor,
             );
@@ -2435,7 +2720,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         group_start: u64,
         group_blocks: u64,
     ) -> Result<(Vec<u8>, u64), Error<S::Error>> {
-        let superblock = &self.filesystem.superblock;
+        let superblock = &self.transaction.filesystem.superblock;
         let mut bitmap = self.zero_block()?;
         let has_super = if group == 0 {
             true
@@ -2511,15 +2796,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     fn allocate_inode(&mut self) -> Result<InodeAllocation, Error<S::Error>> {
-        let inodes_per_group = u64::from(self.filesystem.superblock.inodes_per_group);
-        let bitmap_bits = u64::from(self.filesystem.superblock.block_size) * 8;
-        let group_count = self.filesystem.superblock.group_count();
-        let inodes_count = u64::from(self.filesystem.superblock.inodes_count);
-        let blocks_count = self.filesystem.superblock.blocks_count;
-        let first_data_block = u64::from(self.filesystem.superblock.first_data_block);
-        let blocks_per_group = u64::from(self.filesystem.superblock.blocks_per_group);
-        let first_inode = u64::from(self.filesystem.superblock.first_inode);
-        let checksum_seed = self.filesystem.superblock.checksum_seed;
+        let inodes_per_group = u64::from(self.transaction.filesystem.superblock.inodes_per_group);
+        let bitmap_bits = u64::from(self.transaction.filesystem.superblock.block_size) * 8;
+        let group_count = self.transaction.filesystem.superblock.group_count();
+        let inodes_count = u64::from(self.transaction.filesystem.superblock.inodes_count);
+        let blocks_count = self.transaction.filesystem.superblock.blocks_count;
+        let first_data_block = u64::from(self.transaction.filesystem.superblock.first_data_block);
+        let blocks_per_group = u64::from(self.transaction.filesystem.superblock.blocks_per_group);
+        let first_inode = u64::from(self.transaction.filesystem.superblock.first_inode);
+        let checksum_seed = self.transaction.filesystem.superblock.checksum_seed;
         for group_number in 0..group_count {
             let group_first = u64::from(group_number) * inodes_per_group;
             let group_inodes = inodes_count
@@ -2529,7 +2814,10 @@ impl<'a, S: Storage> Transaction<'a, S> {
             if group_inodes == 0 {
                 break;
             }
-            let mut descriptor = self.filesystem.read_group_descriptor(group_number)?;
+            let mut descriptor = self
+                .transaction
+                .filesystem
+                .read_group_descriptor(self.storage, group_number)?;
             let free =
                 u64::from(le16(&descriptor, 0x0e)) | (u64::from(le16(&descriptor, 0x2e)) << 16);
             if free == 0 {
@@ -2649,7 +2937,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         inode: &Inode,
     ) -> Result<ReleasedInodeBlocks, Error<S::Error>> {
         let ownership = self.read_extent_ownership(inode)?;
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let logical_blocks = ownership.logical_blocks;
         let mut ranges = ownership.data;
         let owned_blocks = ranges
@@ -2663,14 +2951,14 @@ impl<'a, S: Storage> Transaction<'a, S> {
         ranges.extend(ownership.tree.into_iter().map(|number| (number, 1)));
         let mut retained_xattr_block = None;
         if inode.external_xattr_block != 0 {
-            let mut block = self.filesystem.read_external_xattr_block(inode)?;
+            let mut block = self.read_external_xattr_block(inode)?;
             let references = le32(&block, 4);
             if references == 1 {
                 ranges.push((inode.external_xattr_block, 1));
             } else {
                 put_le32(&mut block, 4, references - 1);
                 super::update_external_xattr_checksum(
-                    self.filesystem.superblock.checksum_seed,
+                    self.transaction.filesystem.superblock.checksum_seed,
                     inode.external_xattr_block,
                     &mut block,
                 );
@@ -2706,15 +2994,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .try_reserve_exact(ranges.len())
             .map_err(|_| Error::OutOfMemory)?;
         let mut released = 0u64;
-        let first_data = u64::from(self.filesystem.superblock.first_data_block);
-        let blocks_per_group = u64::from(self.filesystem.superblock.blocks_per_group);
+        let first_data = u64::from(self.transaction.filesystem.superblock.first_data_block);
+        let blocks_per_group = u64::from(self.transaction.filesystem.superblock.blocks_per_group);
         for &(physical, length) in ranges {
             released = released
                 .checked_add(length)
                 .ok_or(Corrupt::AddressOverflow)?;
             let end = physical
                 .checked_add(length)
-                .filter(|end| *end <= self.filesystem.superblock.blocks_count)
+                .filter(|end| *end <= self.transaction.filesystem.superblock.blocks_count)
                 .ok_or(Corrupt::InvalidExtentTree)?;
             for number in physical..end {
                 let relative = number
@@ -2756,13 +3044,16 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .try_reserve_exact(releases.len())
             .map_err(|_| Error::OutOfMemory)?;
         for release in releases {
-            let mut descriptor = self.filesystem.read_group_descriptor(release.group)?;
+            let mut descriptor = self
+                .transaction
+                .filesystem
+                .read_group_descriptor(self.storage, release.group)?;
             if le16(&descriptor, 0x12) & 0x0002 != 0 {
                 return Err(Corrupt::InvalidBlockBitmap.into());
             }
             let bitmap_number =
                 u64::from(le32(&descriptor, 0)) | (u64::from(le32(&descriptor, 0x20)) << 32);
-            if bitmap_number >= self.filesystem.superblock.blocks_count {
+            if bitmap_number >= self.transaction.filesystem.superblock.blocks_count {
                 return Err(Corrupt::InvalidBlockBitmap.into());
             }
             let group_start = first_data
@@ -2801,7 +3092,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             put_le16(&mut descriptor, 0x18, checksum as u16);
             put_le16(&mut descriptor, 0x38, (checksum >> 16) as u16);
             update_group_descriptor_checksum(
-                self.filesystem.superblock.checksum_seed,
+                self.transaction.filesystem.superblock.checksum_seed,
                 release.group,
                 &mut descriptor,
             );
@@ -2856,7 +3147,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if ownership.data.iter().any(|(start, length)| {
             start
                 .checked_add(*length)
-                .is_none_or(|end| end > self.filesystem.superblock.blocks_count)
+                .is_none_or(|end| end > self.transaction.filesystem.superblock.blocks_count)
         }) {
             return Err(Corrupt::InvalidExtentTree.into());
         }
@@ -2893,7 +3184,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             previous = Some(logical);
             let number = u64::from(le32(node, at + 4)) | (u64::from(le16(node, at + 8)) << 32);
             if number == 0
-                || number >= self.filesystem.superblock.blocks_count
+                || number >= self.transaction.filesystem.superblock.blocks_count
                 || levels.iter().any(|level| level.contains(&number))
                 || ownership
                     .data
@@ -2908,10 +3199,13 @@ impl<'a, S: Storage> Transaction<'a, S> {
                 return Err(Corrupt::InvalidExtentTree.into());
             }
             verify_extent_block_checksum(
-                self.filesystem.superblock.checksum_seed,
+                self.transaction.filesystem.superblock.checksum_seed,
                 inode,
                 &child,
-                self.filesystem.superblock.has_metadata_checksums(),
+                self.transaction
+                    .filesystem
+                    .superblock
+                    .has_metadata_checksums(),
             )?;
             self.collect_extent_ownership_node(&child, child_depth, inode, ownership, levels)?;
             levels[usize::from(child_depth)]
@@ -2949,7 +3243,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         if !valid {
             return Err(Unsupported::MutationProfile.into());
         }
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let released = match kind {
             ReleaseKind::FastSymlink => ReleasedInodeBlocks {
                 groups: Vec::new(),
@@ -2969,12 +3263,16 @@ impl<'a, S: Storage> Transaction<'a, S> {
             .number
             .checked_sub(1)
             .ok_or(Corrupt::InvalidInode(inode.number))?;
-        let inode_group = zero_based / self.filesystem.superblock.inodes_per_group;
-        let inode_index = u64::from(zero_based % self.filesystem.superblock.inodes_per_group);
+        let inode_group = zero_based / self.transaction.filesystem.superblock.inodes_per_group;
+        let inode_index =
+            u64::from(zero_based % self.transaction.filesystem.superblock.inodes_per_group);
         let position = match groups.binary_search_by_key(&inode_group, |group| group.number) {
             Ok(position) => position,
             Err(position) => {
-                let descriptor = self.filesystem.read_group_descriptor(inode_group)?;
+                let descriptor = self
+                    .transaction
+                    .filesystem
+                    .read_group_descriptor(self.storage, inode_group)?;
                 groups.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
                 groups.insert(
                     position,
@@ -2995,8 +3293,8 @@ impl<'a, S: Storage> Transaction<'a, S> {
             u64::from(le32(descriptor, 4)) | (u64::from(le32(descriptor, 0x24)) << 32);
         let inode_table =
             u64::from(le32(descriptor, 8)) | (u64::from(le32(descriptor, 0x28)) << 32);
-        if inode_bitmap_number >= self.filesystem.superblock.blocks_count
-            || inode_table >= self.filesystem.superblock.blocks_count
+        if inode_bitmap_number >= self.transaction.filesystem.superblock.blocks_count
+            || inode_table >= self.transaction.filesystem.superblock.blocks_count
         {
             return Err(Corrupt::InvalidInodeTable.into());
         }
@@ -3009,19 +3307,19 @@ impl<'a, S: Storage> Transaction<'a, S> {
         inode_bitmap[bit / 8] &= !(1 << (bit % 8));
         increment_descriptor_free_inodes(
             descriptor,
-            u64::from(self.filesystem.superblock.inodes_per_group),
+            u64::from(self.transaction.filesystem.superblock.inodes_per_group),
         )?;
         if matches!(kind, ReleaseKind::Directory) {
             decrement_descriptor_used_directories(
                 descriptor,
-                u64::from(self.filesystem.superblock.inodes_per_group),
+                u64::from(self.transaction.filesystem.superblock.inodes_per_group),
             )?;
         }
         let checksum = self.inode_bitmap_checksum(&inode_bitmap);
         put_le16(descriptor, 0x1a, checksum as u16);
         put_le16(descriptor, 0x3a, (checksum >> 16) as u16);
         update_group_descriptor_checksum(
-            self.filesystem.superblock.checksum_seed,
+            self.transaction.filesystem.superblock.checksum_seed,
             inode_group,
             descriptor,
         );
@@ -3030,13 +3328,15 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let inode_byte = inode_table
             .checked_mul(block_size)
             .and_then(|offset| {
-                offset.checked_add(inode_index * u64::from(self.filesystem.superblock.inode_size))
+                offset.checked_add(
+                    inode_index * u64::from(self.transaction.filesystem.superblock.inode_size),
+                )
             })
             .ok_or(Corrupt::AddressOverflow)?;
         let inode_block_number = inode_byte / block_size;
         let inode_offset =
             usize::try_from(inode_byte % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        let inode_size = usize::from(self.filesystem.superblock.inode_size);
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
         let mut inode_block = self.read_owned_block(inode_block_number)?;
         if inode_offset + inode_size > inode_block.len() {
             return Err(Corrupt::InvalidInodeTable.into());
@@ -3048,11 +3348,14 @@ impl<'a, S: Storage> Transaction<'a, S> {
         let superblock_offset = usize::try_from(ondisk::SUPERBLOCK_OFFSET % block_size)
             .map_err(|_| Corrupt::AddressOverflow)?;
         let raw = &mut superblock[superblock_offset..superblock_offset + ondisk::SUPERBLOCK_SIZE];
-        increment_superblock_free_inodes(raw, u64::from(self.filesystem.superblock.inodes_count))?;
+        increment_superblock_free_inodes(
+            raw,
+            u64::from(self.transaction.filesystem.superblock.inodes_count),
+        )?;
         increment_superblock_free_blocks(
             raw,
             released_blocks,
-            self.filesystem.superblock.blocks_count,
+            self.transaction.filesystem.superblock.blocks_count,
         )?;
         update_superblock_checksum(raw);
 
@@ -3169,9 +3472,13 @@ impl<'a, S: Storage> Transaction<'a, S> {
         &mut self,
         groups: &[GroupEdit],
     ) -> Result<Vec<DirtyBlock>, Error<S::Error>> {
-        let block_size = u64::from(self.filesystem.superblock.block_size);
-        let descriptor_size = u64::from(self.filesystem.superblock.descriptor_size);
-        let table = self.filesystem.superblock.descriptor_table_offset();
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
+        let descriptor_size = u64::from(self.transaction.filesystem.superblock.descriptor_size);
+        let table = self
+            .transaction
+            .filesystem
+            .superblock
+            .descriptor_table_offset();
         let mut blocks: Vec<DirtyBlock> = Vec::new();
         blocks
             .try_reserve_exact(groups.len())
@@ -3209,26 +3516,32 @@ impl<'a, S: Storage> Transaction<'a, S> {
     fn inode_location(&mut self, number: u32) -> Result<(u64, usize), Error<S::Error>> {
         let zero_based = number
             .checked_sub(1)
-            .filter(|number| *number < self.filesystem.superblock.inodes_count)
+            .filter(|number| *number < self.transaction.filesystem.superblock.inodes_count)
             .ok_or(Corrupt::InvalidInode(number))?;
-        let group = zero_based / self.filesystem.superblock.inodes_per_group;
-        let index = u64::from(zero_based % self.filesystem.superblock.inodes_per_group);
-        let descriptor = self.filesystem.read_group_descriptor(group)?;
+        let group = zero_based / self.transaction.filesystem.superblock.inodes_per_group;
+        let index = u64::from(zero_based % self.transaction.filesystem.superblock.inodes_per_group);
+        let descriptor = self
+            .transaction
+            .filesystem
+            .read_group_descriptor(self.storage, group)?;
         let table = u64::from(le32(&descriptor, 8)) | (u64::from(le32(&descriptor, 0x28)) << 32);
-        if table >= self.filesystem.superblock.blocks_count {
+        if table >= self.transaction.filesystem.superblock.blocks_count {
             return Err(Corrupt::InvalidInodeTable.into());
         }
-        let block_size = u64::from(self.filesystem.superblock.block_size);
+        let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let byte = table
             .checked_mul(block_size)
             .and_then(|offset| {
-                offset.checked_add(index * u64::from(self.filesystem.superblock.inode_size))
+                offset.checked_add(
+                    index * u64::from(self.transaction.filesystem.superblock.inode_size),
+                )
             })
             .ok_or(Corrupt::AddressOverflow)?;
         let block = byte / block_size;
         let offset = usize::try_from(byte % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        if block >= self.filesystem.superblock.blocks_count
-            || offset + usize::from(self.filesystem.superblock.inode_size) > block_size as usize
+        if block >= self.transaction.filesystem.superblock.blocks_count
+            || offset + usize::from(self.transaction.filesystem.superblock.inode_size)
+                > block_size as usize
         {
             return Err(Corrupt::InvalidInodeTable.into());
         }
@@ -3241,7 +3554,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
         new_parent: &Inode,
     ) -> Result<(), Error<S::Error>> {
         let mut current = new_parent.clone();
-        for _ in 0..self.filesystem.superblock.inodes_count {
+        for _ in 0..self.transaction.filesystem.superblock.inodes_count {
             if current.number == source_number {
                 return Err(Error::InvalidArgument);
             }
@@ -3252,7 +3565,10 @@ impl<'a, S: Storage> Transaction<'a, S> {
             if parent_number == current.number {
                 return Err(Corrupt::InvalidDirectory.into());
             }
-            current = self.filesystem.load_inode(parent_number)?;
+            current = self
+                .transaction
+                .filesystem
+                .load_inode(self.storage, parent_number)?;
             if !current.is_directory() {
                 return Err(Corrupt::InvalidDirectory.into());
             }
@@ -3261,20 +3577,20 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     fn directory_parent_number(&mut self, directory: &Inode) -> Result<u32, Error<S::Error>> {
-        let block_size = usize::try_from(self.filesystem.superblock.block_size)
+        let block_size = usize::try_from(self.transaction.filesystem.superblock.block_size)
             .map_err(|_| Corrupt::AddressOverflow)?;
         if !directory.is_directory() || directory.size < block_size as u64 {
             return Err(Corrupt::InvalidDirectory.into());
         }
         let number = self
-            .filesystem
             .map_file_block(directory, 0)?
             .ok_or(Corrupt::InvalidDirectory)?;
         let block = self.read_owned_block(number)?;
         let kind = self
             .filesystem
             .directory_block_kind(directory, 0, block_size, &block);
-        self.filesystem
+        self.transaction
+            .filesystem
             .verify_directory_checksum(directory, kind, block_size, &block)?;
         directory_parent_entry(&block, directory.number)
     }
@@ -3291,7 +3607,7 @@ impl<'a, S: Storage> Transaction<'a, S> {
             | ondisk::INCOMPAT_64BIT
             | ondisk::INCOMPAT_FLEX_BG
             | ondisk::INCOMPAT_CSUM_SEED;
-        let superblock = &self.filesystem.superblock;
+        let superblock = &self.transaction.filesystem.superblock;
         if superblock.block_size != 4096
             || superblock.descriptor_size != 64
             || !superblock.has_metadata_checksums()
@@ -3316,28 +3632,42 @@ impl<'a, S: Storage> Transaction<'a, S> {
     }
 
     fn read_owned_block(&mut self, number: u64) -> Result<Vec<u8>, Error<S::Error>> {
-        let mut block = self.filesystem.new_block_buffer()?;
+        let mut block = self.transaction.filesystem.new_block_buffer()?;
         self.read_block(number, &mut block)?;
         Ok(block)
     }
 
     fn zero_block(&self) -> Result<Vec<u8>, Error<S::Error>> {
-        self.filesystem.new_block_buffer()
+        self.transaction.filesystem.new_block_buffer()
     }
 
     fn block_bitmap_checksum(&self, bitmap: &[u8]) -> u32 {
-        let bytes = usize::try_from(self.filesystem.superblock.blocks_per_group.div_ceil(8))
-            .unwrap_or(bitmap.len())
-            .min(bitmap.len());
-        let mut checksum = Checksum::with_seed(self.filesystem.superblock.checksum_seed);
+        let bytes = usize::try_from(
+            self.transaction
+                .filesystem
+                .superblock
+                .blocks_per_group
+                .div_ceil(8),
+        )
+        .unwrap_or(bitmap.len())
+        .min(bitmap.len());
+        let mut checksum =
+            Checksum::with_seed(self.transaction.filesystem.superblock.checksum_seed);
         checksum.update(&bitmap[..bytes]);
         checksum.finalize()
     }
 
     fn inode_bitmap_checksum(&self, bitmap: &[u8]) -> u32 {
-        let bytes = usize::try_from(self.filesystem.superblock.inodes_per_group.div_ceil(8))
-            .unwrap_or(bitmap.len());
-        let mut checksum = Checksum::with_seed(self.filesystem.superblock.checksum_seed);
+        let bytes = usize::try_from(
+            self.transaction
+                .filesystem
+                .superblock
+                .inodes_per_group
+                .div_ceil(8),
+        )
+        .unwrap_or(bitmap.len());
+        let mut checksum =
+            Checksum::with_seed(self.transaction.filesystem.superblock.checksum_seed);
         checksum.update(&bitmap[..bytes]);
         checksum.finalize()
     }
@@ -4531,10 +4861,14 @@ mod tests {
         put_le16(&mut image, leaf + 16, 1);
         put_le32(&mut image, leaf + 20, 11);
 
-        let mut filesystem = Ext4::mount(ModelStorage::new(image)).unwrap();
-        let inode = filesystem.stat("/hello").unwrap();
+        let mut storage = ModelStorage::new(image);
+        let mut filesystem = Ext4::mount(&mut storage).unwrap();
+        let inode = filesystem.stat(&mut storage, "/hello").unwrap();
         let mut transaction = filesystem.begin_transaction();
-        let ownership = transaction.read_extent_ownership(&inode).unwrap();
+        let ownership = transaction
+            .io(&mut storage)
+            .read_extent_ownership(&inode)
+            .unwrap();
         assert_eq!(ownership.data, vec![(11, 1)]);
         assert_eq!(ownership.tree, vec![21, 20]);
         assert_eq!(ownership.logical_blocks, 1);
