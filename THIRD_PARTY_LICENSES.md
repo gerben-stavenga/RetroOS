@@ -28,6 +28,7 @@ GPL-2.0; since extents are required for ext4, the effective license is GPL-2.0.
 | Component | Used for | License | Author / project |
 |---|---|---|---|
 | **`//third_party/voodoo`** | 3dfx Voodoo Graphics (SST-1) emulation | BSD-3-Clause | Aaron Giles — MAME `voodoo.cpp` / `voodoo_render.cpp` |
+| **`//ext4` read validation** | portable ext4 checksum and on-disk validation conventions | MIT OR Apache-2.0 | Nicholas Bishop / Google — `ext4-view` |
 
 Unlike everything else here this is *our* source: a Rust transliteration
 written against a different memory/ownership model, not a fetched dependency.
