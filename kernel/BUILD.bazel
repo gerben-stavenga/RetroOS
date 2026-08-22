@@ -58,8 +58,6 @@ rust_library(
         "//lib",
         "//lib:vga",
         "//lib:sound",
-        "//third_party/lwext4:lwext4",
-        "//third_party/lwext4:lwext4-sys",
         "//third_party/voodoo",
         "@crates//:hadris-iso",
         "@crates//:spin",
@@ -117,7 +115,7 @@ rust_binary(
     srcs = ["metal_entry.rs"],
     crate_name = "kernel_metal",
     edition = "2024",
-    compile_data = [":kernel_ld", ":entry", "//third_party/lwext4:lwext4_obj"],
+    compile_data = [":kernel_ld", ":entry"],
     rustc_flags = [
         "-Cpanic=abort",
         "-Crelocation-model=static",
@@ -128,10 +126,6 @@ rust_binary(
         "-Clinker=rust-lld",
         "-Clink-arg=-T$(location :kernel_ld)",
         "-Clink-arg=$(location :entry)",
-        # lwext4 (writable ext4): the freestanding C object, linked straight in
-        # like :entry. Its undefined externals (malloc/str*/qsort) resolve to the
-        # arch-metal cshim; mem*/__udivdi3 to compiler-builtins.
-        "-Clink-arg=$(location //third_party/lwext4:lwext4_obj)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
     ],
@@ -189,9 +183,6 @@ rust_binary(
         "//lib",
         "//lib:vga",
         "//lib:sound",
-        "//third_party/lwext4:lwext4",
-        "//third_party/lwext4:lwext4-sys",
-        "@lwext4//:lwext4_host",
     ],
 )
 
@@ -211,8 +202,5 @@ rust_binary(
         "//lib",
         "//lib:vga",
         "//lib:sound",
-        "//third_party/lwext4:lwext4",
-        "//third_party/lwext4:lwext4-sys",
-        "@lwext4//:lwext4_host",
     ],
 )

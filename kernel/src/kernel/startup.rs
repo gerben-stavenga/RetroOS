@@ -5,10 +5,7 @@ extern crate alloc;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::{
-    fs::{
-        lwext4::{Lwext4Fs, MountMode},
-        portable_ext4::PortableExt4Fs,
-    },
+    fs::portable_ext4::PortableExt4Fs,
     vfs,
 };
 
@@ -318,10 +315,7 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
     }
 }
 
-/// lwext4's device and mount-point registries are fixed-size arrays in the C
-/// library, sized by CONFIG_EXT4_{BLOCKDEVS,MOUNTPOINTS}_COUNT — we build it
-/// with 8 (upstream defaults to 2, which would cap us at a root plus one).
-/// Keep this in step with //third_party/lwext4 and MODULE.bazel.
+/// Keep the boot-time mount namespace in the single-digit `/diskN` range.
 const MAX_EXT_MOUNTS: usize = 8;
 
 /// Which ext filesystem is the root: the one that looks like a Linux root
@@ -331,14 +325,13 @@ const MAX_EXT_MOUNTS: usize = 8;
 /// mechanically — so it is the only part worth naming. A disk can carry
 /// several ext partitions (a data partition AND the real root) and the table
 /// order says nothing about which is which. Only sniff when ambiguous: a lone
-/// ext partition IS the root, and probing it would mean a needless lwext4
-/// mount/unmount.
+/// ext partition IS the root, and probing it would mean a needless mount.
 fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
     if ext.len() < 2 {
         return 0;
     }
     ext.iter()
-        .position(crate::kernel::fs::lwext4::is_linux_root)
+        .position(crate::kernel::fs::portable_ext4::is_linux_root)
         .unwrap_or(0)
 }
 
@@ -359,7 +352,7 @@ fn mount_filesystems(
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
         .map(|p| p.volume)
-        .filter(crate::kernel::fs::lwext4::is_ext)
+        .filter(crate::kernel::fs::portable_ext4::is_ext)
         .collect();
 
     let mut hostfs_is_root = false;
@@ -412,7 +405,7 @@ fn mount_filesystems(
             if slot >= MAX_EXT_MOUNTS {
                 // Never drop a filesystem silently — say how many and why.
                 crate::println!(
-                    "ext4: {} further partition(s) not mounted (lwext4 allows {})",
+                    "ext4: {} further partition(s) not mounted (limit {})",
                     ext.len() - slot,
                     MAX_EXT_MOUNTS
                 );
@@ -433,18 +426,7 @@ fn mount_filesystems(
                         slot
                     );
                 }
-                Err(_) => match Lwext4Fs::new(vol, slot, MountMode::ReadOnly) {
-                    Ok(fs) => {
-                        vfs::mount(prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(fs)));
-                        crate::screenln!(
-                            screen,
-                            "lwext4 fallback partition ({} MB) → /disk{}",
-                            vol.sectors / 2048,
-                            slot
-                        );
-                    }
-                    Err(e) => crate::screenln!(screen, "ext4 partition skipped: {}", e),
-                },
+                Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
             }
         }
 
@@ -2647,26 +2629,14 @@ impl EventStats {
                         top[2].0
                     );
                 }
-                // Disk I/O per directory entry — the ratio that says whether a
-                // slow listing is MANY reads (cache) or SLOW reads (driver).
+                // Disk I/O volume and average request size.
                 let io = crate::kernel::iostat::snapshot();
-                if io.vol_reads > 0 || io.dirents > 0 {
-                    let per = |v: u64| v.checked_div(io.dirents.max(1)).unwrap_or(0);
+                if io.vol_reads > 0 {
                     crate::dbg_println!(
-                        "[io] reads={} ({} sectors, {} sec/read) bread={} | readdir: opens={} entries={} => {} reads/entry | resolve={} symprobe={} ({} probes/resolve) stat={}",
+                        "[io] reads={} ({} sectors, {} sec/read)",
                         io.vol_reads,
                         io.vol_sectors,
-                        io.vol_sectors.checked_div(io.vol_reads.max(1)).unwrap_or(0),
-                        io.breads,
-                        io.dir_opens,
-                        io.dirents,
-                        per(io.vol_reads),
-                        io.resolves,
-                        io.symlink_probes,
-                        io.symlink_probes
-                            .checked_div(io.resolves.max(1))
-                            .unwrap_or(0),
-                        io.stats
+                        io.vol_sectors.checked_div(io.vol_reads).unwrap_or(0),
                     );
                 }
                 crate::kernel::iostat::reset();

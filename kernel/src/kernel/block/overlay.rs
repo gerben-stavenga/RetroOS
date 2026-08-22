@@ -3,7 +3,7 @@
 //! On real hardware the boot disk is someone's actual home partition, so
 //! writes must not reach it. Wrapping the device diverts every write into a
 //! kernel-heap map that later reads see through: the filesystems above stay
-//! fully writable (lwext4 journals, savegames, configs) while the platter is
+//! fully writable (ext4 journals, savegames, configs) while the platter is
 //! never touched, and power-off discards everything.
 //!
 //! This is deliberately NOT a mode flag on the block layer. Wrapping happens
@@ -26,7 +26,7 @@ pub struct RamOverlay {
     /// Device-absolute sector → its shadowed contents.
     ///
     /// `RefCell` rather than a lock: the fs layer is single-threaded (the same
-    /// invariant `vfs` and `lwext4` already rely on), and no interrupt path
+    /// invariant `vfs` and the filesystem backends already rely on), and no interrupt path
     /// reaches a disk.
     map: RefCell<BTreeMap<u64, Box<[u8; 512]>>>,
 }

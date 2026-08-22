@@ -39,7 +39,7 @@ const RAM_SENTINEL: u64 = u64::MAX;
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
-/// Filesystem trait — implemented by TarFs, Lwext4Fs, etc. POSIX-strict; the
+/// Filesystem trait — implemented by PortableExt4Fs, HostFs, etc. POSIX-strict; the
 /// DOS personality wraps this layer with its own case-folding cache (DFS).
 ///
 /// This is 9P-shaped: `open(path)` is a fused Twalk+Topen returning a fid
@@ -73,7 +73,7 @@ pub trait Filesystem {
     /// (`READDIR_START` begins a fresh enumeration). Returns the cookie to
     /// resume from, or `None` once the directory is exhausted.
     ///
-    /// The cookie is OPAQUE and filesystem-defined — lwext4 uses its raw
+    /// The cookie is OPAQUE and filesystem-defined — a backend may use its raw
     /// directory byte offset, tarfs a logical entry index. A caller may only
     /// ever pass back a value this same filesystem handed it; synthesizing
     /// one, or doing arithmetic on one, is meaningless.
@@ -100,7 +100,7 @@ pub trait Filesystem {
     /// This distinguishes the two very different meanings of `create → None`:
     /// a read-only backend (tarfs, klog — the default) has no create, so the
     /// VFS substitutes a RAM-backed file and the guest can scribble on C:\BOOT
-    /// harmlessly. A backend that DOES create (lwext4, hostfs) returning `None`
+    /// harmlessly. A backend that DOES create (portable ext4, hostfs) returning `None`
     /// means DENIED, and must surface to the guest as an error — silently
     /// handing it a RAM file would report success for a write that will never
     /// exist.
@@ -128,7 +128,7 @@ pub trait Filesystem {
     /// Release a fid (Tclunk). Called by the VFS when the last reference to an
     /// open file closes (`close_handle`). Default = no-op, for backends whose
     /// handle owns no per-open resource (TarFs's archive offset). Backends that
-    /// allocate per-open server state — lwext4's file handle, hostfs's COM1 /
+    /// allocate per-open server state — an ext inode, hostfs's COM1 /
     /// native fid, a future 9P client — override this to free it.
     fn clunk(&self, _handle: u64) {}
 
@@ -1205,8 +1205,8 @@ impl Vfs {
 }
 
 // `Vfs` holds `&'static dyn Filesystem`, and some backends are not thread-safe
-// in isolation (the lwext4 wrapper uses `RefCell`, and lwext4's C state is
-// single-threaded). This `Send` is nonetheless sound — and SMP-correct, not a
+// in isolation (the portable ext4 wrapper uses `RefCell`). This `Send` is
+// nonetheless sound — and SMP-correct, not a
 // single-core assumption — because *every* filesystem access goes through
 // `&mut self` while the VFS `spin::Mutex` is held, so no filesystem (and no
 // `Rc` refcount) is ever touched by two cores at once. The lock serializes all

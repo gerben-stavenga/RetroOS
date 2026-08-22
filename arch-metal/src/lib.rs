@@ -14,7 +14,6 @@ extern crate alloc;
 mod backend;
 mod calls;
 pub mod mem;
-mod cshim;
 pub mod descriptors;
 pub mod irq;
 pub mod monitor;

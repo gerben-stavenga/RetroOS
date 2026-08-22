@@ -1,7 +1,7 @@
 //! RetroOS VFS adapter for the portable ext4 engine.
 //!
-//! This is the active root-filesystem backend. Additional read-only volumes
-//! retain an lwext4 fallback while feature compatibility is completed.
+//! This is RetroOS's ext2/3/4 filesystem backend for both writable roots and
+//! additional read-only volumes.
 
 extern crate alloc;
 
@@ -259,6 +259,26 @@ impl PortableExt4Fs {
             && operation(&mut transaction).is_ok()
             && transaction.commit().is_ok()
     }
+}
+
+/// Does `volume` contain an ext superblock?
+///
+/// Partition type bytes and GUIDs are only declarations. Probe the on-disk
+/// magic so an ext filesystem is found regardless of how its partition was
+/// labelled, while unsupported ext features still produce a useful mount
+/// error instead of making the filesystem disappear from discovery.
+pub fn is_ext(volume: &Volume) -> bool {
+    let mut storage = VolumeStorage::new(*volume);
+    let mut magic = [0u8; 2];
+    storage.read(1024 + 56, &mut magic).is_ok() && magic == [0x53, 0xef]
+}
+
+/// Does this ext volume look like a Linux root (`/etc` and `/usr`)?
+///
+/// Used only to disambiguate disks containing more than one ext partition.
+pub fn is_linux_root(volume: &Volume) -> bool {
+    PortableExt4Fs::new(*volume)
+        .is_ok_and(|filesystem| filesystem.dir_exists(b"etc") && filesystem.dir_exists(b"usr"))
 }
 
 impl Filesystem for PortableExt4Fs {
@@ -572,7 +592,7 @@ impl Filesystem for PortableExt4Fs {
 mod tests {
     extern crate std;
 
-    use super::{Filesystem, PortableExt4Fs};
+    use super::{Filesystem, PortableExt4Fs, is_ext};
     use crate::kernel::block::{Disk, Volume};
     use alloc::boxed::Box;
     use alloc::vec;
@@ -621,6 +641,21 @@ mod tests {
             bytes: RefCell::new(bytes),
         }));
         PortableExt4Fs::new(Volume::whole(disk)).unwrap()
+    }
+
+    fn volume(bytes: Vec<u8>) -> Volume {
+        let disk: &'static dyn Disk = Box::leak(Box::new(ImageDisk {
+            bytes: RefCell::new(bytes),
+        }));
+        Volume::whole(disk)
+    }
+
+    #[test]
+    fn ext_probe_reads_the_superblock_magic() {
+        let mut image = vec![0; 2048];
+        image[1024 + 56..1024 + 58].copy_from_slice(&[0x53, 0xef]);
+        assert!(is_ext(&volume(image)));
+        assert!(!is_ext(&volume(vec![0; 2048])));
     }
 
     #[test]
