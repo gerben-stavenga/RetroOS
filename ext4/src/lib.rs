@@ -10,6 +10,7 @@
 extern crate alloc;
 
 mod checksum;
+mod extent_tree;
 mod journal;
 mod ondisk;
 mod storage;

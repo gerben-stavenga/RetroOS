@@ -4,6 +4,7 @@
 //! through the internal JBD2 journal.
 
 use crate::checksum::Checksum;
+use crate::extent_tree::{Extent, ExtentIdentity, ExtentState, ExtentTree};
 use crate::ondisk::{self, le16, le32};
 use crate::{
     Corrupt, DirectoryEntry, Error, Ext4, FsError, Inode, InodeMetadataUpdate, Storage, Timestamp,
@@ -49,40 +50,59 @@ impl<'a> InodeEditor<'a> {
         put_le16(self.raw, 0x1a, links);
     }
 
-    fn set_extent_mapping<E>(
+    fn set_extent_tree<E>(
         &mut self,
-        physical: &[u64],
+        tree: &ExtentTree,
         size: u64,
         block_size: u64,
-        nodes: &mut [DirtyBlock],
-    ) -> Result<(), Error<E>> {
-        write_extent_mapping(
-            self.raw,
-            physical,
-            size,
-            block_size,
-            (self.checksum_seed, self.number, self.generation),
-            nodes,
-        )
-    }
-
-    fn clear_extent_mapping<E>(&mut self) -> Result<(), Error<E>> {
+        metadata_checksums: bool,
+        extra_owned_blocks: u64,
+    ) -> Result<Vec<DirtyBlock>, Error<E>> {
         let root = self
             .raw
-            .get(0x28..0x64)
+            .get_mut(0x28..0x64)
             .ok_or(Corrupt::InvalidInode(self.number))?;
-        if le16(root, 0) != super::EXTENT_MAGIC {
-            return Err(Unsupported::ExtentMutation.into());
+        tree.write_root(root)?;
+        put_le32(self.raw, 4, size as u32);
+        put_le32(self.raw, 0x6c, (size >> 32) as u32);
+        let data_blocks = tree
+            .data_extents()?
+            .into_iter()
+            .try_fold(0u64, |total, extent| {
+                total
+                    .checked_add(u64::from(extent.length))
+                    .ok_or(Corrupt::AddressOverflow)
+            })?;
+        let tree_blocks = u64::try_from(tree.external_blocks_by_level()?.len())
+            .map_err(|_| Corrupt::AddressOverflow)?;
+        let sectors = data_blocks
+            .checked_add(tree_blocks)
+            .and_then(|blocks| blocks.checked_add(extra_owned_blocks))
+            .and_then(|blocks| blocks.checked_mul(block_size / 512))
+            .filter(|sectors| *sectors < (1_u64 << 48))
+            .ok_or(Corrupt::AddressOverflow)?;
+        put_le32(self.raw, 0x1c, sectors as u32);
+        put_le16(self.raw, 0x74, (sectors >> 32) as u16);
+        let serialized = tree.serialize_dirty(
+            usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?,
+            ExtentIdentity {
+                checksum_seed: self.checksum_seed,
+                inode: self.number,
+                generation: self.generation,
+                metadata_checksums,
+            },
+        )?;
+        let mut nodes = Vec::new();
+        nodes
+            .try_reserve_exact(serialized.len())
+            .map_err(|_| Error::OutOfMemory)?;
+        for node in serialized {
+            nodes.push(DirtyBlock {
+                number: node.number,
+                bytes: node.bytes,
+            });
         }
-        put_le32(self.raw, 4, 0);
-        put_le32(self.raw, 0x6c, 0);
-        put_le32(self.raw, 0x1c, 0);
-        put_le16(self.raw, 0x74, 0);
-        let root = &mut self.raw[0x28..0x64];
-        root.fill(0);
-        put_le16(root, 0, super::EXTENT_MAGIC);
-        put_le16(root, 4, 4);
-        Ok(())
+        Ok(nodes)
     }
 
     fn initialize_regular(&mut self, permissions: u16) {
@@ -606,9 +626,8 @@ struct InodeAllocation {
 
 struct DirectoryGrowth {
     inode: Inode,
-    physical: Vec<u64>,
+    tree: ExtentTree,
     size: u64,
-    extent_nodes: Vec<DirtyBlock>,
 }
 
 /// Filesystem-independent mutation view of one regular file.
@@ -694,14 +713,17 @@ impl FileEditor {
             .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .ok_or(Corrupt::AddressOverflow)?;
         if end <= self.inode.size {
-            transaction
-                .overwrite_inode(&self.inode, offset, data)
-                .map(|()| FileEditResult {
-                    first_allocated: None,
-                })
-        } else {
-            transaction.extend_file(&self.inode, FileGrowth::Write { offset, data })
+            match transaction.overwrite_inode(&self.inode, offset, data) {
+                Ok(()) => {
+                    return Ok(FileEditResult {
+                        first_allocated: None,
+                    });
+                }
+                Err(Error::Unsupported(Unsupported::ExtentMutation)) => {}
+                Err(error) => return Err(error),
+            }
         }
+        transaction.extend_file(&self.inode, FileGrowth::Write { offset, data })
     }
 
     fn resize<S: Storage>(
@@ -725,12 +747,6 @@ impl FileEditor {
 struct BlockRelease {
     group: u32,
     indices: Vec<u64>,
-}
-
-struct ExtentOwnership {
-    data: Vec<(u64, u64)>,
-    tree: Vec<u64>,
-    logical_blocks: u64,
 }
 
 struct ReleasedInodeBlocks {
@@ -1198,9 +1214,7 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             .checked_add(u64::try_from(data.len()).map_err(|_| Corrupt::AddressOverflow)?)
             .filter(|end| *end <= inode.size)
             .ok_or(Unsupported::ExtentMutation)?;
-        FileEditor::new(inode)?
-            .write_at(self, offset, data)
-            .map(|_| ())
+        self.overwrite_inode(&inode, offset, data)
     }
 
     fn overwrite_inode(
@@ -1307,205 +1321,152 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
         growth: FileGrowth<'_>,
     ) -> Result<FileEditResult, Error<S::Error>> {
         self.validate_mutation_profile()?;
-        let (offset, new_size) = growth.range(inode.size)?;
-        if offset > inode.size {
+        let (offset, requested_end) = growth.range(inode.size)?;
+        let new_size = match growth {
+            FileGrowth::Write { .. } => inode.size.max(requested_end),
+            FileGrowth::ZeroFill { .. } => requested_end,
+        };
+        if offset > inode.size
+            || matches!(growth, FileGrowth::ZeroFill { .. }) && new_size <= inode.size
+        {
             return Err(Unsupported::ExtentMutation.into());
         }
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
-        let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        if new_size <= inode.size {
-            return Err(Unsupported::ExtentMutation.into());
-        }
         let old_blocks = inode.size.div_ceil(block_size);
         let new_blocks = new_size.div_ceil(block_size);
-        let added_blocks = new_blocks - old_blocks;
-        let added_blocks_usize =
-            usize::try_from(added_blocks).map_err(|_| Corrupt::AddressOverflow)?;
-        let ownership = self.read_extent_ownership(inode)?;
-        let existing_nodes = ownership.tree;
-        let old_blocks_usize = usize::try_from(old_blocks).map_err(|_| Corrupt::AddressOverflow)?;
-        let all_blocks_usize = usize::try_from(new_blocks).map_err(|_| Corrupt::AddressOverflow)?;
-        let mut physical_blocks = Vec::new();
-        physical_blocks
-            .try_reserve_exact(all_blocks_usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        for (physical, length) in ownership.data {
-            for number in physical..physical + length {
-                physical_blocks.push(number);
-            }
-        }
-        if physical_blocks.len() != old_blocks_usize {
+        if new_blocks > (1_u64 << 32) {
             return Err(Unsupported::ExtentMutation.into());
         }
-        let expected_sectors = old_blocks
-            .checked_add(u64::try_from(existing_nodes.len()).map_err(|_| Corrupt::AddressOverflow)?)
-            .ok_or(Corrupt::AddressOverflow)?
-            .checked_mul(block_size / 512)
+        let mut tree = self.read_extent_tree(inode)?;
+        let existing = tree.data_extents()?;
+        if existing
+            .last()
+            .is_some_and(|extent| extent.logical_end() > old_blocks)
+        {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        let data_blocks = existing.iter().try_fold(0u64, |total, extent| {
+            total
+                .checked_add(u64::from(extent.length))
+                .ok_or(Corrupt::AddressOverflow)
+        })?;
+        let tree_blocks = u64::try_from(tree.external_blocks_by_level()?.len())
+            .map_err(|_| Corrupt::AddressOverflow)?;
+        let expected_sectors = data_blocks
+            .checked_add(tree_blocks)
+            .and_then(|blocks| blocks.checked_add(u64::from(inode.external_xattr_block != 0)))
+            .and_then(|blocks| blocks.checked_mul(block_size / 512))
             .ok_or(Corrupt::AddressOverflow)?;
         if inode.blocks_512 != expected_sectors {
             return Err(Unsupported::ExtentMutation.into());
         }
 
-        let inode_group =
-            (inode.number - 1) / self.transaction.filesystem.superblock.inodes_per_group;
-        let inode_descriptor = self
-            .transaction
-            .filesystem
-            .read_group_descriptor(self.storage, inode_group)?;
-        let inode_table = u64::from(le32(&inode_descriptor, 8))
-            | (u64::from(le32(&inode_descriptor, 0x28)) << 32);
-        let mut allocation = self.allocate_blocks(added_blocks_usize)?;
-        if allocation
-            .blocks
-            .iter()
-            .any(|physical| physical_blocks.contains(physical))
-        {
+        let (first_touched, last_touched) = match growth {
+            FileGrowth::Write { .. } => (offset / block_size, requested_end.div_ceil(block_size)),
+            FileGrowth::ZeroFill { .. } => (new_blocks, new_blocks),
+        };
+        tree.set_state(first_touched, last_touched, ExtentState::Written)?;
+        let mut missing = 0usize;
+        for logical in first_touched..last_touched {
+            match tree.lookup(u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?) {
+                None => missing = missing.checked_add(1).ok_or(Corrupt::AddressOverflow)?,
+                Some((_, ExtentState::Written)) => {}
+                Some((_, ExtentState::Unwritten)) => unreachable!(),
+            }
+        }
+
+        let mut allocation = self.allocate_blocks(missing)?;
+        let mut next_data = allocation.blocks.iter().copied();
+        for logical in first_touched..last_touched {
+            let logical = u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?;
+            if tree.lookup(logical).is_none() {
+                tree.insert(Extent::new(
+                    logical,
+                    next_data.next().ok_or(Corrupt::InvalidBlockBitmap)?,
+                    1,
+                    ExtentState::Written,
+                )?)?;
+            }
+        }
+        if next_data.next().is_some() {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
-        physical_blocks.extend_from_slice(&allocation.blocks);
-        let node_capacity = (block_size_usize - 16) / 12;
-        let old_run_count = extent_count(&physical_blocks[..old_blocks_usize])?;
-        let old_shape = extent_tree_shape(old_run_count, 4, node_capacity)?;
-        let old_nodes = extent_tree_node_count(&old_shape)?;
-        if old_nodes != existing_nodes.len() {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        let run_count = extent_count(&physical_blocks)?;
-        let shape = extent_tree_shape(run_count, 4, node_capacity)?;
-        let required_nodes = extent_tree_node_count(&shape)?;
-        if required_nodes < existing_nodes.len()
-            || shape
-                .iter()
-                .enumerate()
-                .any(|(level, count)| *count < old_shape.get(level).copied().unwrap_or(0))
-        {
-            return Err(Unsupported::ExtentMutation.into());
-        }
-        let new_nodes = required_nodes - existing_nodes.len();
-        self.extend_allocation(&mut allocation, new_nodes)?;
-        let mut allocated = allocation.blocks;
-        let allocated_node_numbers = allocated.split_off(added_blocks_usize);
-        let first_allocated = allocated.first().copied();
-        let allocation_groups = allocation.groups;
-
-        let node_numbers = merge_extent_node_numbers(
-            &old_shape,
-            &shape,
-            &existing_nodes,
-            &allocated_node_numbers,
-        )?;
-
-        let descriptor_blocks = self.descriptor_blocks(&allocation_groups)?;
-        let superblock_block_number = ondisk::SUPERBLOCK_OFFSET / block_size;
-        let inode_index =
-            u64::from((inode.number - 1) % self.transaction.filesystem.superblock.inodes_per_group);
-        let inode_byte = inode_table
-            .checked_mul(block_size)
-            .and_then(|offset| {
-                offset.checked_add(
-                    inode_index * u64::from(self.transaction.filesystem.superblock.inode_size),
-                )
-            })
-            .ok_or(Corrupt::AddressOverflow)?;
-        let inode_block_number = inode_byte / block_size;
-        let inode_offset =
-            usize::try_from(inode_byte % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
-        let mut superblock_block = self.read_owned_block(superblock_block_number)?;
-        let mut inode_block = self.read_owned_block(inode_block_number)?;
-        if inode_offset
-            .checked_add(inode_size)
-            .filter(|end| *end <= inode_block.len())
-            .is_none()
-        {
-            return Err(Corrupt::InvalidInode(inode.number).into());
-        }
+        let metadata_blocks = tree.unassigned_blocks();
+        self.extend_allocation(&mut allocation, metadata_blocks)?;
+        tree.assign_blocks(&allocation.blocks[missing..])?;
+        let first_allocated = allocation.blocks.first().copied().filter(|_| missing != 0);
 
         let mut payloads = Vec::new();
-        let first_touched = offset / block_size;
-        let touched_blocks =
-            usize::try_from(new_blocks - first_touched).map_err(|_| Corrupt::AddressOverflow)?;
         payloads
-            .try_reserve_exact(touched_blocks + required_nodes)
+            .try_reserve_exact(
+                usize::try_from(last_touched - first_touched)
+                    .map_err(|_| Corrupt::AddressOverflow)?,
+            )
             .map_err(|_| Error::OutOfMemory)?;
-        for logical in first_touched..new_blocks {
-            let physical = physical_blocks
-                .get(usize::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?)
-                .copied()
+        for logical in first_touched..last_touched {
+            let physical = tree
+                .lookup(u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?)
+                .filter(|(_, state)| *state == ExtentState::Written)
+                .map(|(physical, _)| physical)
                 .ok_or(Corrupt::InvalidExtentTree)?;
-            let mut block = if logical < old_blocks {
-                self.read_owned_block(physical)?
-            } else {
-                self.zero_block()?
-            };
+            let originally_unwritten = existing.iter().any(|extent| {
+                extent.state == ExtentState::Unwritten
+                    && u64::from(extent.logical) <= logical
+                    && logical < extent.logical_end()
+            });
+            let mut block =
+                if allocation.blocks[..missing].contains(&physical) || originally_unwritten {
+                    self.zero_block()?
+                } else {
+                    self.read_owned_block(physical)?
+                };
             let block_start = logical
                 .checked_mul(block_size)
                 .ok_or(Corrupt::AddressOverflow)?;
-            let write_start = offset.max(block_start);
-            let write_end = new_size.min(
-                block_start
-                    .checked_add(block_size)
-                    .ok_or(Corrupt::AddressOverflow)?,
-            );
-            growth.apply(&mut block, block_start, write_start, write_end)?;
+            growth.apply(
+                &mut block,
+                block_start,
+                offset.max(block_start),
+                requested_end.min(
+                    block_start
+                        .checked_add(block_size)
+                        .ok_or(Corrupt::AddressOverflow)?,
+                ),
+            )?;
             payloads.push(DirtyBlock {
                 number: physical,
                 bytes: block,
             });
         }
 
-        let superblock_offset = usize::try_from(ondisk::SUPERBLOCK_OFFSET % block_size)
-            .map_err(|_| Corrupt::AddressOverflow)?;
-        let raw_superblock =
-            &mut superblock_block[superblock_offset..superblock_offset + ondisk::SUPERBLOCK_SIZE];
-        decrement_superblock_free_blocks_by(
-            raw_superblock,
-            added_blocks
-                .checked_add(new_nodes as u64)
-                .ok_or(Corrupt::AddressOverflow)?,
-        )?;
-        update_superblock_checksum(raw_superblock);
-
-        let mut extent_nodes = Vec::new();
-        extent_nodes
-            .try_reserve_exact(required_nodes)
-            .map_err(|_| Error::OutOfMemory)?;
-        for number in node_numbers {
-            extent_nodes.push(DirtyBlock {
-                number,
-                bytes: if existing_nodes.contains(&number) {
-                    self.read_owned_block(number)?
-                } else {
-                    self.zero_block()?
-                },
-            });
+        let mut metadata = MetadataMutation::new();
+        self.apply_block_allocation(&mut metadata, allocation)?;
+        for payload in payloads {
+            metadata.adopt_block(payload)?;
         }
-        let raw_inode = &mut inode_block[inode_offset..inode_offset + inode_size];
+        let (inode_block, inode_offset) = self.inode_location(inode.number)?;
+        let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
+        metadata.load(self, inode_block)?;
+        let raw = &mut metadata.get_mut(inode_block)?[inode_offset..inode_offset + inode_size];
         let mut editor = InodeEditor::new(
-            raw_inode,
+            raw,
             self.transaction.filesystem.superblock.checksum_seed,
             inode.number,
             inode.generation,
         )?;
-        editor.set_extent_mapping(&physical_blocks, new_size, block_size, &mut extent_nodes)?;
-        editor.finish();
-        for node in extent_nodes {
-            payloads.push(node);
-        }
-
-        self.stage_file_allocation(
-            DirtyBlock {
-                number: superblock_block_number,
-                bytes: superblock_block,
-            },
-            DirtyBlock {
-                number: inode_block_number,
-                bytes: inode_block,
-            },
-            descriptor_blocks,
-            allocation_groups,
-            payloads,
+        let extent_nodes = editor.set_extent_tree(
+            &tree,
+            new_size,
+            block_size,
+            self.transaction
+                .filesystem
+                .superblock
+                .has_metadata_checksums(),
+            u64::from(inode.external_xattr_block != 0),
         )?;
+        editor.finish();
+        metadata.adopt_blocks(extent_nodes)?;
+        metadata.stage(self)?;
         Ok(FileEditResult { first_allocated })
     }
 
@@ -2127,90 +2088,48 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
     fn shrink_file(&mut self, inode: &Inode, new_size: u64) -> Result<u64, Error<S::Error>> {
         self.validate_mutation_profile()?;
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
-        let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
         let old_blocks = inode.size.div_ceil(block_size);
         let kept_blocks = new_size.div_ceil(block_size);
         if new_size >= inode.size || kept_blocks > old_blocks {
             return Err(Error::InvalidArgument);
         }
 
-        let ownership = self.read_extent_ownership(inode)?;
-        let existing_nodes = ownership.tree;
-        let old_blocks_usize = usize::try_from(old_blocks).map_err(|_| Corrupt::AddressOverflow)?;
-        let mut physical = Vec::new();
-        physical
-            .try_reserve_exact(old_blocks_usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        for (start, length) in ownership.data {
-            for number in start..start + length {
-                physical.push(number);
-            }
-        }
-        if physical.len() != old_blocks_usize || ownership.logical_blocks != old_blocks {
+        let mut tree = self.read_extent_tree(inode)?;
+        let extents = tree.data_extents()?;
+        if extents
+            .last()
+            .is_some_and(|extent| extent.logical_end() > old_blocks)
+        {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        let expected_sectors = u64::try_from(physical.len() + existing_nodes.len())
-            .map_err(|_| Corrupt::AddressOverflow)?
-            .checked_mul(block_size / 512)
+        let data_blocks = extents.iter().try_fold(0u64, |total, extent| {
+            total
+                .checked_add(u64::from(extent.length))
+                .ok_or(Corrupt::AddressOverflow)
+        })?;
+        let tree_blocks = u64::try_from(tree.external_blocks_by_level()?.len())
+            .map_err(|_| Corrupt::AddressOverflow)?;
+        let expected_sectors = data_blocks
+            .checked_add(tree_blocks)
+            .and_then(|blocks| blocks.checked_add(u64::from(inode.external_xattr_block != 0)))
+            .and_then(|blocks| blocks.checked_mul(block_size / 512))
             .ok_or(Corrupt::AddressOverflow)?;
         if inode.blocks_512 != expected_sectors {
             return Err(Unsupported::ExtentMutation.into());
         }
-
-        let node_capacity = (block_size_usize - 16) / 12;
-        let old_shape = extent_tree_shape(extent_count(&physical)?, 4, node_capacity)?;
-        let kept = usize::try_from(kept_blocks).map_err(|_| Corrupt::AddressOverflow)?;
-        let new_shape = extent_tree_shape(extent_count(&physical[..kept])?, 4, node_capacity)?;
-        if extent_tree_node_count(&old_shape)? != existing_nodes.len()
-            || new_shape.len() > old_shape.len()
-        {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-
-        let mut retained_nodes = Vec::new();
-        let mut released_nodes = Vec::new();
-        retained_nodes
-            .try_reserve_exact(extent_tree_node_count(&new_shape)?)
-            .map_err(|_| Error::OutOfMemory)?;
-        released_nodes
-            .try_reserve_exact(existing_nodes.len() - extent_tree_node_count(&new_shape)?)
-            .map_err(|_| Error::OutOfMemory)?;
-        let mut old_offset = 0usize;
-        for (level, &old_count) in old_shape.iter().enumerate() {
-            let retain = new_shape.get(level).copied().unwrap_or(0);
-            if retain > old_count {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            retained_nodes.extend_from_slice(&existing_nodes[old_offset..old_offset + retain]);
-            released_nodes
-                .extend_from_slice(&existing_nodes[old_offset + retain..old_offset + old_count]);
-            old_offset += old_count;
-        }
-
-        let released_runs = extent_runs(&physical[kept..])?;
+        let removed = tree.remove(kept_blocks, 1_u64 << 32)?;
         let mut ranges = Vec::new();
         ranges
-            .try_reserve_exact(released_runs.len() + released_nodes.len())
+            .try_reserve_exact(removed.len() + tree.released_blocks().len())
             .map_err(|_| Error::OutOfMemory)?;
         ranges.extend(
-            released_runs
+            removed
                 .into_iter()
-                .map(|run| (run.physical, u64::from(run.length))),
+                .map(|extent| (extent.physical, u64::from(extent.length))),
         );
-        ranges.extend(released_nodes.into_iter().map(|number| (number, 1)));
+        ranges.extend(tree.released_blocks().iter().map(|number| (*number, 1)));
         let (groups, released) = self.release_blocks(&ranges)?;
         let descriptor_blocks = self.descriptor_blocks(&groups)?;
-
-        let mut extent_nodes = Vec::new();
-        extent_nodes
-            .try_reserve_exact(retained_nodes.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for number in retained_nodes {
-            extent_nodes.push(DirtyBlock {
-                number,
-                bytes: self.read_owned_block(number)?,
-            });
-        }
 
         let mut metadata = MetadataMutation::new();
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
@@ -2228,13 +2147,15 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
         metadata.adopt_blocks(descriptor_blocks)?;
         metadata.adopt_group_edits(groups)?;
 
-        if !new_size.is_multiple_of(block_size) {
-            let last = physical[kept - 1];
-            let mut block = self.read_owned_block(last)?;
-            let tail =
-                usize::try_from(new_size % block_size).map_err(|_| Corrupt::AddressOverflow)?;
-            block[tail..].fill(0);
-            metadata.adopt(last, block)?;
+        if !new_size.is_multiple_of(block_size) && kept_blocks != 0 {
+            let logical = u32::try_from(kept_blocks - 1).map_err(|_| Corrupt::AddressOverflow)?;
+            if let Some((last, ExtentState::Written)) = tree.lookup(logical) {
+                let mut block = self.read_owned_block(last)?;
+                let tail =
+                    usize::try_from(new_size % block_size).map_err(|_| Corrupt::AddressOverflow)?;
+                block[tail..].fill(0);
+                metadata.adopt(last, block)?;
+            }
         }
 
         let (inode_block, inode_offset) = self.inode_location(inode.number)?;
@@ -2247,16 +2168,16 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             inode.number,
             inode.generation,
         )?;
-        if kept == 0 {
-            editor.clear_extent_mapping()?;
-        } else {
-            editor.set_extent_mapping(
-                &physical[..kept],
-                new_size,
-                block_size,
-                &mut extent_nodes,
-            )?;
-        }
+        let extent_nodes = editor.set_extent_tree(
+            &tree,
+            new_size,
+            block_size,
+            self.transaction
+                .filesystem
+                .superblock
+                .has_metadata_checksums(),
+            u64::from(inode.external_xattr_block != 0),
+        )?;
         editor.finish();
         metadata.adopt_blocks(extent_nodes)?;
         metadata.stage(self)?;
@@ -2373,63 +2294,29 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             return Err(Unsupported::MutationProfile.into());
         }
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
-        let block_size_usize = usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?;
-        let ownership = self.read_extent_ownership(&tree.inode)?;
-        let existing_nodes = ownership.tree;
-        let mut physical = Vec::new();
-        physical
-            .try_reserve_exact(tree.nodes.len() + 1)
-            .map_err(|_| Error::OutOfMemory)?;
-        for (start, length) in ownership.data {
-            for number in start..start + length {
-                physical.push(number);
-            }
-        }
-        if ownership.logical_blocks != tree.nodes.len() as u64
-            || physical.len() != tree.nodes.len()
-            || physical
-                .iter()
-                .zip(&tree.nodes)
-                .any(|(physical, node)| *physical != node.block.number)
+        let mut extent_tree = self.read_extent_tree(&tree.inode)?;
+        if extent_tree
+            .data_extents()?
+            .last()
+            .is_some_and(|extent| extent.logical_end() > tree.nodes.len() as u64)
+            || tree.nodes.iter().any(|node| {
+                u32::try_from(node.logical)
+                    .ok()
+                    .and_then(|logical| extent_tree.lookup(logical))
+                    != Some((node.block.number, ExtentState::Written))
+            })
         {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-
-        let old_runs = extent_count(&physical)?;
-        let node_capacity = (block_size_usize - 16) / 12;
-        let old_shape = extent_tree_shape(old_runs, 4, node_capacity)?;
-        if extent_tree_node_count(&old_shape)? != existing_nodes.len() {
             return Err(Corrupt::InvalidExtentTree.into());
         }
 
         let allocation_start = resources.blocks.len();
         self.extend_allocation(resources, 1)?;
         let leaf_number = resources.blocks[allocation_start];
-        physical.push(leaf_number);
-        let new_shape = extent_tree_shape(extent_count(&physical)?, 4, node_capacity)?;
-        let required_nodes = extent_tree_node_count(&new_shape)?;
-        if required_nodes < existing_nodes.len() {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        self.extend_allocation(resources, required_nodes - existing_nodes.len())?;
-        let node_numbers = merge_extent_node_numbers(
-            &old_shape,
-            &new_shape,
-            &existing_nodes,
-            &resources.blocks[allocation_start + 1..],
-        )?;
-        let mut extent_nodes = Vec::new();
-        extent_nodes
-            .try_reserve_exact(node_numbers.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for number in node_numbers {
-            let bytes = if existing_nodes.contains(&number) {
-                self.read_owned_block(number)?
-            } else {
-                self.zero_block()?
-            };
-            extent_nodes.push(DirtyBlock { number, bytes });
-        }
+        let logical = u32::try_from(tree.nodes.len()).map_err(|_| Corrupt::AddressOverflow)?;
+        extent_tree.insert(Extent::new(logical, leaf_number, 1, ExtentState::Written)?)?;
+        let new_nodes = extent_tree.unassigned_blocks();
+        self.extend_allocation(resources, new_nodes)?;
+        extent_tree.assign_blocks(&resources.blocks[allocation_start + 1..])?;
 
         let mut leaf = self.zero_block()?;
         initialize_empty_directory_leaf(
@@ -2438,9 +2325,8 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             tree.inode.generation,
             &mut leaf,
         )?;
-        let logical = u64::try_from(tree.nodes.len()).map_err(|_| Corrupt::AddressOverflow)?;
         tree.nodes.push(DirectoryNode {
-            logical,
+            logical: u64::from(logical),
             kind: crate::DirectoryBlockKind::Leaf,
             block: DirtyBlock {
                 number: leaf_number,
@@ -2448,22 +2334,21 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             },
             dirty: true,
         });
-        let size = logical
+        let size = u64::from(logical)
             .checked_add(1)
             .and_then(|blocks| blocks.checked_mul(block_size))
             .ok_or(Corrupt::AddressOverflow)?;
         Ok(DirectoryGrowth {
             inode: tree.inode.clone(),
-            physical,
+            tree: extent_tree,
             size,
-            extent_nodes,
         })
     }
 
     fn apply_directory_growth(
         &mut self,
         metadata: &mut MetadataMutation,
-        mut growth: DirectoryGrowth,
+        growth: DirectoryGrowth,
     ) -> Result<(), Error<S::Error>> {
         let (block_number, offset) = self.inode_location(growth.inode.number)?;
         let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
@@ -2482,14 +2367,18 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             growth.inode.number,
             growth.inode.generation,
         )?;
-        editor.set_extent_mapping(
-            &growth.physical,
+        let extent_nodes = editor.set_extent_tree(
+            &growth.tree,
             growth.size,
             block_size,
-            &mut growth.extent_nodes,
+            self.transaction
+                .filesystem
+                .superblock
+                .has_metadata_checksums(),
+            u64::from(growth.inode.external_xattr_block != 0),
         )?;
         editor.finish();
-        metadata.adopt_blocks(growth.extent_nodes)
+        metadata.adopt_blocks(extent_nodes)
     }
 
     fn apply_block_allocation(
@@ -2936,19 +2825,35 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
         &mut self,
         inode: &Inode,
     ) -> Result<ReleasedInodeBlocks, Error<S::Error>> {
-        let ownership = self.read_extent_ownership(inode)?;
+        let tree = self.read_extent_tree(inode)?;
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
-        let logical_blocks = ownership.logical_blocks;
-        let mut ranges = ownership.data;
-        let owned_blocks = ranges
+        let extents = tree.data_extents()?;
+        if extents
+            .last()
+            .is_some_and(|extent| extent.logical_end() > inode.size.div_ceil(block_size))
+        {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        let tree_blocks = tree.external_blocks_by_level()?;
+        let owned_blocks = extents
             .iter()
-            .try_fold(ownership.tree.len() as u64, |total, range| {
-                total.checked_add(range.1).ok_or(Corrupt::AddressOverflow)
+            .try_fold(tree_blocks.len() as u64, |total, extent| {
+                total
+                    .checked_add(u64::from(extent.length))
+                    .ok_or(Corrupt::AddressOverflow)
             })?;
+        let mut ranges = Vec::new();
         ranges
-            .try_reserve_exact(ownership.tree.len() + usize::from(inode.external_xattr_block != 0))
+            .try_reserve_exact(
+                extents.len() + tree_blocks.len() + usize::from(inode.external_xattr_block != 0),
+            )
             .map_err(|_| Error::OutOfMemory)?;
-        ranges.extend(ownership.tree.into_iter().map(|number| (number, 1)));
+        ranges.extend(
+            extents
+                .into_iter()
+                .map(|extent| (extent.physical, u64::from(extent.length))),
+        );
+        ranges.extend(tree_blocks.into_iter().map(|number| (number, 1)));
         let mut retained_xattr_block = None;
         if inode.external_xattr_block != 0 {
             let mut block = self.read_external_xattr_block(inode)?;
@@ -2969,12 +2874,11 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
             }
         }
         let (groups, released) = self.release_blocks(&ranges)?;
-        if logical_blocks != inode.size.div_ceil(block_size)
-            || inode.blocks_512
-                != owned_blocks
-                    .checked_add(u64::from(inode.external_xattr_block != 0))
-                    .and_then(|blocks| blocks.checked_mul(block_size / 512))
-                    .ok_or(Corrupt::AddressOverflow)?
+        if inode.blocks_512
+            != owned_blocks
+                .checked_add(u64::from(inode.external_xattr_block != 0))
+                .and_then(|blocks| blocks.checked_mul(block_size / 512))
+                .ok_or(Corrupt::AddressOverflow)?
         {
             return Err(Unsupported::ExtentMutation.into());
         }
@@ -3107,113 +3011,25 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
         }
         Ok((groups, released))
     }
-    /// Return every block owned by a fully allocated extent inode, separating
-    /// file data from extent-tree metadata.  Namespace mutation consumes this
-    /// one checked description instead of knowing which tree depth was used.
-    fn read_extent_ownership(&mut self, inode: &Inode) -> Result<ExtentOwnership, Error<S::Error>> {
-        let root = &inode.block_map;
-        validate_extent_header(root, 4)?;
-        let depth = le16(root, 6);
-        if depth > 5 {
-            return Err(Unsupported::ExtentTreeTooDeep.into());
-        }
-        let mut ownership = ExtentOwnership {
-            data: Vec::new(),
-            tree: Vec::new(),
-            logical_blocks: 0,
+    fn read_extent_tree(&mut self, inode: &Inode) -> Result<ExtentTree, Error<S::Error>> {
+        let block_size = self.transaction.filesystem.superblock.block_size as usize;
+        let identity = ExtentIdentity {
+            checksum_seed: self.transaction.filesystem.superblock.checksum_seed,
+            inode: inode.number,
+            generation: inode.generation,
+            metadata_checksums: self
+                .transaction
+                .filesystem
+                .superblock
+                .has_metadata_checksums(),
         };
-        let mut levels = Vec::new();
-        levels
-            .try_reserve_exact(usize::from(depth))
-            .map_err(|_| Error::OutOfMemory)?;
-        levels.resize_with(usize::from(depth), Vec::new);
-        self.collect_extent_ownership_node(root, depth, inode, &mut ownership, &mut levels)?;
-        for level in levels {
-            ownership
-                .tree
-                .try_reserve_exact(level.len())
-                .map_err(|_| Error::OutOfMemory)?;
-            ownership.tree.extend(level);
-        }
-        for &tree in &ownership.tree {
-            if ownership
-                .data
-                .iter()
-                .any(|(start, length)| *start <= tree && tree < *start + *length)
-            {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-        }
-        if ownership.data.iter().any(|(start, length)| {
-            start
-                .checked_add(*length)
-                .is_none_or(|end| end > self.transaction.filesystem.superblock.blocks_count)
-        }) {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        Ok(ownership)
-    }
-
-    fn collect_extent_ownership_node(
-        &mut self,
-        node: &[u8],
-        depth: u16,
-        inode: &Inode,
-        ownership: &mut ExtentOwnership,
-        levels: &mut [Vec<u64>],
-    ) -> Result<(), Error<S::Error>> {
-        if le16(node, 6) != depth {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        if depth == 0 {
-            return collect_extent_leaf(node, ownership);
-        }
-        let entries = usize::from(le16(node, 2));
-        if entries == 0 {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        let child_depth = depth - 1;
-        let mut previous = None;
-        for index in 0..entries {
-            let at = 12 + index * 12;
-            let logical = u64::from(le32(node, at));
-            if previous.is_some_and(|value| logical <= value) || logical != ownership.logical_blocks
-            {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            previous = Some(logical);
-            let number = u64::from(le32(node, at + 4)) | (u64::from(le16(node, at + 8)) << 32);
-            if number == 0
-                || number >= self.transaction.filesystem.superblock.blocks_count
-                || levels.iter().any(|level| level.contains(&number))
-                || ownership
-                    .data
-                    .iter()
-                    .any(|(start, length)| *start <= number && number < *start + *length)
-            {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            let child = self.read_owned_block(number)?;
-            validate_extent_header(&child, (child.len() - 12) / 12)?;
-            if le16(&child, 6) != child_depth {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            verify_extent_block_checksum(
-                self.transaction.filesystem.superblock.checksum_seed,
-                inode,
-                &child,
-                self.transaction
-                    .filesystem
-                    .superblock
-                    .has_metadata_checksums(),
-            )?;
-            self.collect_extent_ownership_node(&child, child_depth, inode, ownership, levels)?;
-            levels[usize::from(child_depth)]
-                .try_reserve(1)
-                .map_err(|_| Error::OutOfMemory)?;
-            levels[usize::from(child_depth)].push(number);
-        }
-        Ok(())
+        ExtentTree::load(
+            &inode.block_map,
+            block_size,
+            self.transaction.filesystem.superblock.blocks_count,
+            identity,
+            |number| self.read_owned_block(number),
+        )
     }
 
     fn prepare_inode_release(
@@ -3397,23 +3213,6 @@ impl<S: Storage> TransactionIo<'_, '_, S> {
         }
         DirectoryTree::load(self, directory)?.validate_empty(parent_number)?;
         self.prepare_inode_release(directory, ReleaseKind::Directory)
-    }
-
-    fn stage_file_allocation(
-        &mut self,
-        superblock: DirtyBlock,
-        inode: DirtyBlock,
-        descriptors: Vec<DirtyBlock>,
-        groups: Vec<GroupEdit>,
-        payloads: Vec<DirtyBlock>,
-    ) -> Result<(), Error<S::Error>> {
-        let mut metadata = MetadataMutation::new();
-        metadata.adopt_block(superblock)?;
-        metadata.adopt_block(inode)?;
-        metadata.adopt_blocks(descriptors)?;
-        metadata.adopt_group_edits(groups)?;
-        metadata.adopt_blocks(payloads)?;
-        metadata.stage(self)
     }
 
     fn stage_overwrite(
@@ -3859,356 +3658,6 @@ fn update_superblock_checksum(superblock: &mut [u8]) {
     let mut checksum = Checksum::new();
     checksum.update(&superblock[..0x3fc]);
     put_le32(superblock, 0x3fc, checksum.finalize());
-}
-
-fn extent_count<E>(allocated: &[u64]) -> Result<usize, Error<E>> {
-    Ok(extent_runs(allocated)?.len())
-}
-
-#[derive(Clone, Copy)]
-struct ExtentRun {
-    logical: u64,
-    physical: u64,
-    length: u16,
-}
-
-#[derive(Clone, Copy)]
-struct ExtentIndex {
-    logical: u64,
-    physical: u64,
-}
-
-fn extent_runs<E>(allocated: &[u64]) -> Result<Vec<ExtentRun>, Error<E>> {
-    let mut extents = Vec::new();
-    extents
-        .try_reserve_exact(allocated.len())
-        .map_err(|_| Error::OutOfMemory)?;
-    let mut count = 0usize;
-    let mut run = 0usize;
-    let mut previous = None;
-    let mut start = 0u64;
-    for (logical, &physical) in allocated.iter().enumerate() {
-        if previous.and_then(|value: u64| value.checked_add(1)) != Some(physical) || run == 32_768 {
-            count = count.checked_add(1).ok_or(Corrupt::AddressOverflow)?;
-            if run != 0 {
-                extents.push(ExtentRun {
-                    logical: logical as u64 - run as u64,
-                    physical: start,
-                    length: run as u16,
-                });
-            }
-            start = physical;
-            run = 0;
-        }
-        run += 1;
-        previous = Some(physical);
-    }
-    if run != 0 {
-        extents.push(ExtentRun {
-            logical: allocated.len() as u64 - run as u64,
-            physical: start,
-            length: run as u16,
-        });
-    }
-    debug_assert_eq!(count, extents.len());
-    Ok(extents)
-}
-
-fn validate_extent_header<E>(node: &[u8], capacity: usize) -> Result<(), Error<E>> {
-    if node.len() < 12 || le16(node, 0) != super::EXTENT_MAGIC {
-        return Err(Corrupt::InvalidExtentHeader.into());
-    }
-    let entries = usize::from(le16(node, 2));
-    let max = usize::from(le16(node, 4));
-    if entries > max || max > capacity {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-    Ok(())
-}
-
-fn verify_extent_block_checksum<E>(
-    seed: u32,
-    inode: &Inode,
-    node: &[u8],
-    enabled: bool,
-) -> Result<(), Error<E>> {
-    if !enabled {
-        return Ok(());
-    }
-    let checksum_offset = 12usize
-        .checked_add(
-            usize::from(le16(node, 4))
-                .checked_mul(12)
-                .ok_or(Corrupt::AddressOverflow)?,
-        )
-        .ok_or(Corrupt::AddressOverflow)?;
-    if checksum_offset + 4 > node.len() {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(inode.number);
-    checksum.update_u32_le(inode.generation);
-    checksum.update(&node[..checksum_offset]);
-    if checksum.finalize() != le32(node, checksum_offset) {
-        return Err(Corrupt::ExtentChecksum(inode.number).into());
-    }
-    Ok(())
-}
-
-fn collect_extent_leaf<E>(node: &[u8], ownership: &mut ExtentOwnership) -> Result<(), Error<E>> {
-    let entries = usize::from(le16(node, 2));
-    ownership
-        .data
-        .try_reserve_exact(entries)
-        .map_err(|_| Error::OutOfMemory)?;
-    for index in 0..entries {
-        let at = 12 + index * 12;
-        let logical = u64::from(le32(node, at));
-        let encoded_length = le16(node, at + 4);
-        if encoded_length == 0 || encoded_length > 32_768 || logical != ownership.logical_blocks {
-            return Err(Unsupported::ExtentMutation.into());
-        }
-        let length = u64::from(encoded_length);
-        let physical = u64::from(le32(node, at + 8)) | (u64::from(le16(node, at + 6)) << 32);
-        let end = physical
-            .checked_add(length)
-            .ok_or(Corrupt::AddressOverflow)?;
-        if ownership
-            .data
-            .iter()
-            .any(|(start, existing)| physical < *start + *existing && *start < end)
-        {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        ownership.data.push((physical, length));
-        ownership.logical_blocks = ownership
-            .logical_blocks
-            .checked_add(length)
-            .ok_or(Corrupt::AddressOverflow)?;
-    }
-    Ok(())
-}
-
-fn write_extent_mapping<E>(
-    inode: &mut [u8],
-    allocated: &[u64],
-    size: u64,
-    block_size: u64,
-    identity: (u32, u32, u32),
-    nodes: &mut [DirtyBlock],
-) -> Result<(), Error<E>> {
-    let root = inode.get_mut(0x28..0x64).ok_or(Corrupt::InvalidInode(0))?;
-    let runs = extent_runs(allocated)?;
-    if allocated.is_empty() || le16(root, 0) != super::EXTENT_MAGIC {
-        return Err(Unsupported::ExtentMutation.into());
-    }
-
-    let root_capacity = usize::from(le16(root, 4));
-    let node_capacity = usize::try_from(
-        block_size
-            .checked_sub(16)
-            .ok_or(Corrupt::InvalidExtentTree)?
-            / 12,
-    )
-    .map_err(|_| Corrupt::AddressOverflow)?;
-    let shape = extent_tree_shape(runs.len(), root_capacity, node_capacity)?;
-    let required_nodes = shape.iter().try_fold(0usize, |total, count| {
-        total.checked_add(*count).ok_or(Corrupt::AddressOverflow)
-    })?;
-    if nodes.len() != required_nodes
-        || nodes.iter().enumerate().any(|(index, node)| {
-            node.number == 0
-                || node.number >> 48 != 0
-                || node.bytes.len() != block_size as usize
-                || nodes[..index]
-                    .iter()
-                    .any(|previous| previous.number == node.number)
-                || allocated.contains(&node.number)
-        })
-    {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-
-    root[12..].fill(0);
-    if shape.is_empty() {
-        if runs.len() > root_capacity {
-            return Err(Unsupported::ExtentMutation.into());
-        }
-        put_le16(root, 2, runs.len() as u16);
-        put_le16(root, 6, 0);
-        write_extent_entries(root, &runs)?;
-    } else {
-        let mut summaries = Vec::new();
-        summaries
-            .try_reserve_exact(shape[0])
-            .map_err(|_| Error::OutOfMemory)?;
-        for (block, chunk) in nodes[..shape[0]].iter_mut().zip(runs.chunks(node_capacity)) {
-            initialize_extent_node(&mut block.bytes, chunk.len(), node_capacity, 0);
-            write_extent_entries(&mut block.bytes, chunk)?;
-            checksum_extent_node(&mut block.bytes, node_capacity, identity);
-            summaries.push(ExtentIndex {
-                logical: chunk[0].logical,
-                physical: block.number,
-            });
-        }
-
-        let mut node_offset = shape[0];
-        for (level, &node_count) in shape.iter().enumerate().skip(1) {
-            let mut parents = Vec::new();
-            parents
-                .try_reserve_exact(node_count)
-                .map_err(|_| Error::OutOfMemory)?;
-            for (block, chunk) in nodes[node_offset..node_offset + node_count]
-                .iter_mut()
-                .zip(summaries.chunks(node_capacity))
-            {
-                initialize_extent_node(&mut block.bytes, chunk.len(), node_capacity, level as u16);
-                write_extent_indexes(&mut block.bytes, chunk)?;
-                checksum_extent_node(&mut block.bytes, node_capacity, identity);
-                parents.push(ExtentIndex {
-                    logical: chunk[0].logical,
-                    physical: block.number,
-                });
-            }
-            summaries = parents;
-            node_offset += node_count;
-        }
-
-        put_le16(root, 2, summaries.len() as u16);
-        put_le16(root, 4, 4);
-        put_le16(root, 6, shape.len() as u16);
-        write_extent_indexes(root, &summaries)?;
-    }
-    put_le32(inode, 4, size as u32);
-    put_le32(inode, 0x6c, (size >> 32) as u32);
-
-    let sectors = u64::try_from(allocated.len() + nodes.len())
-        .map_err(|_| Corrupt::AddressOverflow)?
-        .checked_mul(block_size / 512)
-        .filter(|sectors| *sectors < (1u64 << 48))
-        .ok_or(Corrupt::AddressOverflow)?;
-    put_le32(inode, 0x1c, sectors as u32);
-    put_le16(inode, 0x74, (sectors >> 32) as u16);
-    Ok(())
-}
-
-fn extent_tree_shape<E>(
-    entries: usize,
-    root_capacity: usize,
-    node_capacity: usize,
-) -> Result<Vec<usize>, Error<E>> {
-    if root_capacity == 0 || node_capacity == 0 {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-    let mut shape = Vec::new();
-    let mut count = entries;
-    while count > root_capacity {
-        count = count.div_ceil(node_capacity);
-        shape.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        shape.push(count);
-        if shape.len() > 5 {
-            return Err(Unsupported::ExtentTreeTooDeep.into());
-        }
-    }
-    Ok(shape)
-}
-
-fn extent_tree_node_count<E>(shape: &[usize]) -> Result<usize, Error<E>> {
-    shape.iter().try_fold(0usize, |total, count| {
-        total
-            .checked_add(*count)
-            .ok_or(Corrupt::AddressOverflow.into())
-    })
-}
-
-fn merge_extent_node_numbers<E>(
-    old_shape: &[usize],
-    new_shape: &[usize],
-    existing: &[u64],
-    allocated: &[u64],
-) -> Result<Vec<u64>, Error<E>> {
-    let required = extent_tree_node_count(new_shape)?;
-    if extent_tree_node_count(old_shape)? != existing.len()
-        || required != existing.len() + allocated.len()
-        || old_shape.len() > new_shape.len()
-        || old_shape
-            .iter()
-            .enumerate()
-            .any(|(level, count)| *count > new_shape[level])
-    {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-    let mut nodes = Vec::new();
-    nodes
-        .try_reserve_exact(required)
-        .map_err(|_| Error::OutOfMemory)?;
-    let mut old_offset = 0usize;
-    let mut new_offset = 0usize;
-    for (level, &count) in new_shape.iter().enumerate() {
-        let retained = old_shape.get(level).copied().unwrap_or(0);
-        if retained > count {
-            return Err(Unsupported::ExtentMutation.into());
-        }
-        nodes.extend_from_slice(&existing[old_offset..old_offset + retained]);
-        old_offset += retained;
-        let added = count - retained;
-        nodes.extend_from_slice(&allocated[new_offset..new_offset + added]);
-        new_offset += added;
-    }
-    if old_offset != existing.len() || new_offset != allocated.len() {
-        return Err(Corrupt::InvalidExtentTree.into());
-    }
-    Ok(nodes)
-}
-
-fn initialize_extent_node(bytes: &mut [u8], entries: usize, max: usize, depth: u16) {
-    bytes.fill(0);
-    put_le16(bytes, 0, super::EXTENT_MAGIC);
-    put_le16(bytes, 2, entries as u16);
-    put_le16(bytes, 4, max as u16);
-    put_le16(bytes, 6, depth);
-}
-
-fn checksum_extent_node(bytes: &mut [u8], capacity: usize, identity: (u32, u32, u32)) {
-    let checksum_offset = 12 + capacity * 12;
-    let (seed, number, generation) = identity;
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(number);
-    checksum.update_u32_le(generation);
-    checksum.update(&bytes[..checksum_offset]);
-    put_le32(bytes, checksum_offset, checksum.finalize());
-}
-
-fn write_extent_entries<E>(target: &mut [u8], runs: &[ExtentRun]) -> Result<(), Error<E>> {
-    for (entry, run) in runs.iter().enumerate() {
-        if run.physical >> 48 != 0 {
-            return Err(Unsupported::ExtentMutation.into());
-        }
-        let logical = u32::try_from(run.logical).map_err(|_| Corrupt::AddressOverflow)?;
-        let at = 12 + entry * 12;
-        put_le32(target, at, logical);
-        put_le16(target, at + 4, run.length);
-        put_le16(target, at + 6, (run.physical >> 32) as u16);
-        put_le32(target, at + 8, run.physical as u32);
-    }
-    Ok(())
-}
-
-fn write_extent_indexes<E>(target: &mut [u8], indexes: &[ExtentIndex]) -> Result<(), Error<E>> {
-    for (entry, index) in indexes.iter().enumerate() {
-        if index.physical == 0 || index.physical >> 48 != 0 {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        let at = 12 + entry * 12;
-        put_le32(
-            target,
-            at,
-            u32::try_from(index.logical).map_err(|_| Corrupt::AddressOverflow)?,
-        );
-        put_le32(target, at + 4, index.physical as u32);
-        put_le16(target, at + 8, (index.physical >> 32) as u16);
-    }
-    Ok(())
 }
 
 fn update_inode_checksum(seed: u32, number: u32, generation: u32, inode: &mut [u8]) {
@@ -4667,210 +4116,4 @@ fn put_le16(bytes: &mut [u8], offset: usize, value: u16) {
 
 fn put_le32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::{ModelStorage, PathExt4};
-    use alloc::vec;
-
-    #[test]
-    fn extent_writer_splits_full_leaf_and_checksums_each_child() {
-        const BLOCK_SIZE: u64 = 4096;
-        const SEED: u32 = 0x1234_5678;
-        const INODE_NUMBER: u32 = 37;
-        const GENERATION: u32 = 9;
-
-        let mut inode = vec![0; 256];
-        put_le16(&mut inode, 0x28, super::super::EXTENT_MAGIC);
-        put_le16(&mut inode, 0x2c, 4);
-        let physical: Vec<u64> = (0..341).map(|index| 1000 + index * 2).collect();
-        let mut leaves = vec![
-            DirtyBlock {
-                number: 800,
-                bytes: vec![0; BLOCK_SIZE as usize],
-            },
-            DirtyBlock {
-                number: 801,
-                bytes: vec![0; BLOCK_SIZE as usize],
-            },
-        ];
-
-        let mut editor = InodeEditor::new(&mut inode, SEED, INODE_NUMBER, GENERATION).unwrap();
-        editor
-            .set_extent_mapping::<()>(
-                &physical,
-                physical.len() as u64 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                &mut leaves,
-            )
-            .unwrap();
-        editor.finish();
-
-        let root = &inode[0x28..0x64];
-        assert_eq!(le16(root, 2), 2);
-        assert_eq!(le16(root, 6), 1);
-        assert_eq!(le32(root, 12), 0);
-        assert_eq!(le32(root, 24), 340);
-        assert_eq!(le16(&leaves[0].bytes, 2), 340);
-        assert_eq!(le16(&leaves[1].bytes, 2), 1);
-        assert_eq!(le32(&leaves[1].bytes, 12), 340);
-        assert_eq!(le32(&leaves[1].bytes, 20), physical[340] as u32);
-
-        for leaf in &leaves {
-            let checksum_offset = 4092;
-            let mut checksum = Checksum::with_seed(SEED);
-            checksum.update_u32_le(INODE_NUMBER);
-            checksum.update_u32_le(GENERATION);
-            checksum.update(&leaf.bytes[..checksum_offset]);
-            assert_eq!(le32(&leaf.bytes, checksum_offset), checksum.finalize());
-        }
-        assert_eq!(
-            u64::from(le32(&inode, 0x1c)) | (u64::from(le16(&inode, 0x74)) << 32),
-            343 * (BLOCK_SIZE / 512)
-        );
-    }
-
-    #[test]
-    fn extent_writer_grows_existing_full_leaf_without_changing_its_identity() {
-        const BLOCK_SIZE: u64 = 4096;
-        let mut inode = vec![0; 256];
-        put_le16(&mut inode, 0x28, super::super::EXTENT_MAGIC);
-        put_le16(&mut inode, 0x2c, 4);
-        let mut physical: Vec<u64> = (0..340).map(|index| 2000 + index * 2).collect();
-        let mut leaves = vec![DirtyBlock {
-            number: 900,
-            bytes: vec![0; BLOCK_SIZE as usize],
-        }];
-        let mut editor = InodeEditor::new(&mut inode, 7, 41, 3).unwrap();
-        editor
-            .set_extent_mapping::<()>(
-                &physical,
-                physical.len() as u64 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                &mut leaves,
-            )
-            .unwrap();
-        editor.finish();
-        let original_number = leaves[0].number;
-
-        physical.push(4000);
-        leaves.push(DirtyBlock {
-            number: 901,
-            bytes: vec![0; BLOCK_SIZE as usize],
-        });
-        let mut editor = InodeEditor::new(&mut inode, 7, 41, 3).unwrap();
-        editor
-            .set_extent_mapping::<()>(
-                &physical,
-                physical.len() as u64 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                &mut leaves,
-            )
-            .unwrap();
-        editor.finish();
-
-        let root = &inode[0x28..0x64];
-        assert_eq!(le16(root, 2), 2);
-        assert_eq!(le32(root, 16), original_number as u32);
-        assert_eq!(le32(root, 28), 901);
-        assert_eq!(le32(root, 24), 340);
-        assert_eq!(le16(&leaves[0].bytes, 2), 340);
-        assert_eq!(le16(&leaves[1].bytes, 2), 1);
-    }
-
-    #[test]
-    fn extent_writer_builds_depth_two_with_the_same_bottom_up_loop() {
-        const BLOCK_SIZE: u64 = 4096;
-        let mut inode = vec![0; 256];
-        put_le16(&mut inode, 0x28, super::super::EXTENT_MAGIC);
-        put_le16(&mut inode, 0x2c, 4);
-        let physical: Vec<u64> = (0..1361).map(|index| 5000 + index * 2).collect();
-        let mut nodes: Vec<DirtyBlock> = (0..6)
-            .map(|index| DirtyBlock {
-                number: 1000 + index,
-                bytes: vec![0; BLOCK_SIZE as usize],
-            })
-            .collect();
-
-        let mut editor = InodeEditor::new(&mut inode, 11, 43, 5).unwrap();
-        editor
-            .set_extent_mapping::<()>(
-                &physical,
-                physical.len() as u64 * BLOCK_SIZE,
-                BLOCK_SIZE,
-                &mut nodes,
-            )
-            .unwrap();
-        editor.finish();
-
-        let root = &inode[0x28..0x64];
-        assert_eq!(le16(root, 2), 1);
-        assert_eq!(le16(root, 6), 2);
-        assert_eq!(le32(root, 16), 1005);
-        assert_eq!(le16(&nodes[0].bytes, 6), 0);
-        assert_eq!(le16(&nodes[0].bytes, 2), 340);
-        assert_eq!(le16(&nodes[4].bytes, 2), 1);
-        assert_eq!(le16(&nodes[5].bytes, 6), 1);
-        assert_eq!(le16(&nodes[5].bytes, 2), 5);
-        for index in 0..5 {
-            let at = 12 + index * 12;
-            assert_eq!(le32(&nodes[5].bytes, at), (index * 340) as u32);
-            assert_eq!(le32(&nodes[5].bytes, at + 4), 1000 + index as u32);
-        }
-    }
-
-    #[test]
-    fn growing_a_level_inserts_new_nodes_at_their_level_boundary() {
-        assert_eq!(
-            merge_extent_node_numbers::<()>(&[4], &[5, 1], &[10, 11, 12, 13], &[20, 21]).unwrap(),
-            vec![10, 11, 12, 13, 20, 21]
-        );
-        assert_eq!(
-            merge_extent_node_numbers::<()>(&[5, 1], &[6, 1], &[10, 11, 12, 13, 14, 30], &[20],)
-                .unwrap(),
-            vec![10, 11, 12, 13, 14, 20, 30]
-        );
-    }
-
-    #[test]
-    fn ownership_walk_flattens_a_depth_two_tree_by_level() {
-        const BLOCK: usize = 1024;
-        let mut image = crate::tests::image();
-        let inode = 5 * BLOCK + 256;
-        image[inode + 0x28..inode + 0x64].fill(0);
-        put_le16(&mut image, inode + 0x28, super::super::EXTENT_MAGIC);
-        put_le16(&mut image, inode + 0x2a, 1);
-        put_le16(&mut image, inode + 0x2c, 4);
-        put_le16(&mut image, inode + 0x2e, 2);
-        put_le32(&mut image, inode + 0x38, 20);
-
-        let index = 20 * BLOCK;
-        put_le16(&mut image, index, super::super::EXTENT_MAGIC);
-        put_le16(&mut image, index + 2, 1);
-        put_le16(&mut image, index + 4, 84);
-        put_le16(&mut image, index + 6, 1);
-        put_le32(&mut image, index + 16, 21);
-
-        let leaf = 21 * BLOCK;
-        put_le16(&mut image, leaf, super::super::EXTENT_MAGIC);
-        put_le16(&mut image, leaf + 2, 1);
-        put_le16(&mut image, leaf + 4, 84);
-        put_le16(&mut image, leaf + 6, 0);
-        put_le16(&mut image, leaf + 16, 1);
-        put_le32(&mut image, leaf + 20, 11);
-
-        let mut storage = ModelStorage::new(image);
-        let mut filesystem = Ext4::mount(&mut storage).unwrap();
-        let inode = filesystem.stat(&mut storage, "/hello").unwrap();
-        let mut transaction = filesystem.begin_transaction();
-        let ownership = transaction
-            .io(&mut storage)
-            .read_extent_ownership(&inode)
-            .unwrap();
-        assert_eq!(ownership.data, vec![(11, 1)]);
-        assert_eq!(ownership.tree, vec![21, 20]);
-        assert_eq!(ownership.logical_blocks, 1);
-    }
 }

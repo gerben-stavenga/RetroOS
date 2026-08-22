@@ -27,6 +27,12 @@ fn linear_directory_image() -> Vec<u8> {
     std::fs::read(image_path).unwrap()
 }
 
+fn extent_mutation_image() -> Vec<u8> {
+    let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
+        .join(env!("EXT4_EXTENT_MUTATION_IMAGE"));
+    std::fs::read(image_path).unwrap()
+}
+
 fn le16(bytes: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
 }
@@ -630,6 +636,75 @@ fn writes_across_eof_and_resizes_through_one_file_editor() {
 }
 
 #[test]
+fn writes_sparse_and_unwritten_extents_from_e2fsprogs() {
+    let mut storage = ModelStorage::new(extent_mutation_image());
+    let mut fs = Ext4::mount(&mut storage).unwrap();
+
+    let mut unwritten_before = vec![0x55; 32_768];
+    assert_eq!(
+        fs.read(&mut storage, "/unwritten.bin", 0, &mut unwritten_before)
+            .unwrap(),
+        unwritten_before.len()
+    );
+    assert!(unwritten_before.iter().all(|byte| *byte == 0));
+
+    let sparse_write = b"mapped-inside-a-hole";
+    let unwritten_write = b"initialized-subrange";
+    {
+        let mut transaction = fs.begin_transaction();
+        transaction.reserve_blocks(16).unwrap();
+        transaction
+            .write_at(&mut storage, "/sparse.bin", 1_000, sparse_write)
+            .unwrap();
+        transaction.commit(&mut storage).unwrap();
+    }
+    {
+        let mut transaction = fs.begin_transaction();
+        transaction.reserve_blocks(16).unwrap();
+        transaction
+            .write_at(&mut storage, "/unwritten.bin", 5_000, unwritten_write)
+            .unwrap();
+        transaction.commit(&mut storage).unwrap();
+    }
+
+    let durable = storage.durable_bytes().to_vec();
+    let mut remounted_storage = ModelStorage::new(durable.clone());
+    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
+    let mut sparse = vec![0; 65_536];
+    remounted
+        .read(&mut remounted_storage, "/sparse.bin", 0, &mut sparse)
+        .unwrap();
+    assert_eq!(&sparse[1_000..1_000 + sparse_write.len()], sparse_write);
+    assert_eq!(&sparse[60_000..60_011], b"sparse-tail");
+    let mut unwritten = vec![0; 32_768];
+    remounted
+        .read(&mut remounted_storage, "/unwritten.bin", 0, &mut unwritten)
+        .unwrap();
+    assert_eq!(
+        &unwritten[5_000..5_000 + unwritten_write.len()],
+        unwritten_write
+    );
+    assert!(unwritten[..5_000].iter().all(|byte| *byte == 0));
+    assert!(unwritten[5_000 + unwritten_write.len()..]
+        .iter()
+        .all(|byte| *byte == 0));
+
+    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("sparse-unwritten.img");
+    std::fs::write(&output_path, durable).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "e2fsck rejected sparse/unwritten mutations:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
 fn allocates_one_transaction_across_two_block_groups() {
     let original = multi_group_image();
     let descriptor_table = 4096usize;
@@ -984,16 +1059,12 @@ fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
     }
     let effects = successful_storage.effects().to_vec();
     let commit_end = effects.len();
-    assert!(
-        effects[commit_start..]
-            .iter()
-            .any(|effect| effect.kind == EffectKind::Write)
-    );
-    assert!(
-        effects[commit_start..]
-            .iter()
-            .any(|effect| effect.kind == EffectKind::Flush)
-    );
+    assert!(effects[commit_start..]
+        .iter()
+        .any(|effect| effect.kind == EffectKind::Write));
+    assert!(effects[commit_start..]
+        .iter()
+        .any(|effect| effect.kind == EffectKind::Flush));
 
     for sequence in commit_start..commit_end {
         let mut storage =
@@ -1124,11 +1195,9 @@ fn stages_checked_bitmap_and_root_extent_mutation() {
             staged[offset..offset + 4096].copy_from_slice(&block);
         }
     }
-    assert!(
-        fs_storage.effects()[effects_before..]
-            .iter()
-            .all(|effect| effect.kind == portable_ext4::test_support::EffectKind::Read)
-    );
+    assert!(fs_storage.effects()[effects_before..]
+        .iter()
+        .all(|effect| effect.kind == portable_ext4::test_support::EffectKind::Read));
     assert_eq!(fs.stat(&mut fs_storage, "/dir/empty.bin").unwrap().size, 0);
     assert_eq!(fs_storage.durable_bytes(), image);
 
@@ -2147,16 +2216,12 @@ fn mutates_entries_across_multiblock_linear_directory() {
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
     let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/created.bin")
-            .is_ok()
-    );
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/renamed-499")
-            .is_ok()
-    );
+    assert!(remounted
+        .stat(&mut remounted_storage, "/linear/created.bin")
+        .is_ok());
+    assert!(remounted
+        .stat(&mut remounted_storage, "/linear/renamed-499")
+        .is_ok());
     assert_eq!(
         remounted
             .stat(&mut remounted_storage, "/linear/file-499")
@@ -2208,11 +2273,9 @@ fn grows_a_full_multiblock_linear_directory() {
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
     let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/growth-00")
-            .is_ok()
-    );
+    assert!(remounted
+        .stat(&mut remounted_storage, "/linear/growth-00")
+        .is_ok());
     assert!(
         remounted
             .stat(&mut remounted_storage, "/linear")
@@ -2348,12 +2411,10 @@ fn removes_checked_empty_directory_and_restores_parent_links() {
     let mut probe_storage = ModelStorage::new(image.clone());
     let mut probe = Ext4::mount(&mut probe_storage).unwrap();
     let root_links = probe.stat(&mut probe_storage, "/").unwrap().links;
-    assert!(
-        probe
-            .stat(&mut probe_storage, "/root-empty-dir")
-            .unwrap()
-            .is_directory()
-    );
+    assert!(probe
+        .stat(&mut probe_storage, "/root-empty-dir")
+        .unwrap()
+        .is_directory());
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
