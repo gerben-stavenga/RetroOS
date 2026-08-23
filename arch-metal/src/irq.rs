@@ -128,6 +128,14 @@ pub fn push_key(sc: u8) {
     unsafe { (*q).push(Irq::Key(sc)); }
 }
 
+/// Push one already-decoded pointing-device report. USB HID and i8042 use the
+/// same canonical event, so focus routing and the DOS INT 33h implementation do
+/// not depend on which physical bus supplied the mouse.
+pub fn push_mouse(dx: i16, dy: i16, buttons: u8) {
+    let q = &raw mut QUEUE;
+    unsafe { (*q).push(Irq::Mouse { dx, dy, buttons }); }
+}
+
 // ============================================================================
 // PIC initialization
 // ============================================================================
@@ -623,16 +631,15 @@ pub fn init_interrupts() {
         legacy_intr_and_pit();
     }
 
-    // Probe the xHCI controller (the USB-HID keyboard source on legacy-free
-    // machines). WIP: reports the controller for now; once the HID read path
-    // lands it becomes the keyboard when no i8042 answers below.
+    // Probe xHCI for USB-HID keyboard and mouse input. It feeds the same typed
+    // event queue as i8042 and is polled from the timer top half below.
     crate::xhci::init();
 
     // Keyboard/mouse SOURCE is a separate axis from delivery: PROBE the i8042
     // rather than guessing "no keyboard" from x2APIC. A real controller (many
     // laptops expose the internal keyboard as PS/2 via the EC) is used either
     // way — routed through the IOAPIC in APIC mode, the PIC otherwise. A truly
-    // legacy-free box (no i8042) needs the xHCI USB-HID driver (not yet here).
+    // legacy-free box (no i8042) uses the xHCI USB-HID driver above.
     if !i8042_present() {
         // Legacy-free laptop: no PS/2 controller. The keyboard comes from the
         // xHCI USB-HID driver (initialised above), polled from the timer IRQ —

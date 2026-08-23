@@ -721,11 +721,10 @@ impl KernelEvent {
 #[derive(Clone, Copy)]
 pub enum Irq {
     Key(u8), // raw PS/2 scancode (press and release)
-    /// One PS/2 mouse motion/button packet decoded into deltas + button mask.
-    /// `dx` / `dy` are signed motion since the previous packet (PS/2 reports
-    /// +Y as up; we flip so `+dy` means screen-down). `buttons`: bit 0 left,
-    /// bit 1 right, bit 2 middle. Consumer is responsible for accumulating
-    /// position and clamping to a screen range.
+    /// One physical mouse report decoded into deltas + button mask. `dx` / `dy`
+    /// are signed motion since the previous report, normalized so `+dy` means
+    /// screen-down. `buttons`: bit 0 left, bit 1 right, bit 2 middle. Consumer
+    /// is responsible for accumulating position and clamping to a screen range.
     Mouse { dx: i16, dy: i16, buttons: u8 },
     /// An unmasked hardware IRQ line. IRQ0 is the kernel clock-resample
     /// wakeup; other lines are forwarded to their device owner.
