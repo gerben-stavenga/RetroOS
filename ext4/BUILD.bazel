@@ -38,16 +38,23 @@ genrule(
 set -eu
 ROOT="$(@D)/modern-image-root"
 mkdir -p "$$ROOT/dir"
+LONG_DIR="directory-with-a-name-long-enough-to-force-block-backed-symbolic-links"
+mkdir -p "$$ROOT/$$LONG_DIR"
 mkdir -p "$$ROOT/root-empty-dir"
 mkdir -p "$$ROOT/replace-dir"
 truncate -s 0 "$$ROOT/replace-dir/victim.bin"
 mkdir -p "$$ROOT/move-left/branch" "$$ROOT/move-right"
 cp $(location testdata/hello.txt) "$$ROOT/dir/hello.txt"
 cp $(location testdata/hello.txt) "$$ROOT/root-data.bin"
+cp $(location testdata/hello.txt) "$$ROOT/$$LONG_DIR/hello.txt"
 truncate -s 0 "$$ROOT/dir/empty.bin"
 truncate -s 0 "$$ROOT/root-empty.bin"
 ln -s hello.txt "$$ROOT/dir/hello.link"
+ln -s ../root-data.bin "$$ROOT/dir/parent.link"
+ln -s /root-data.bin "$$ROOT/dir/absolute.link"
+ln -s parent.link "$$ROOT/dir/chained.link"
 ln -s dir "$$ROOT/dir.link"
+ln -s "/$$LONG_DIR" "$$ROOT/long-dir.link"
 i=0
 while [ "$$i" -lt 300 ]; do
   cp $(location testdata/hello.txt) "$$ROOT/dir/file-$$i"

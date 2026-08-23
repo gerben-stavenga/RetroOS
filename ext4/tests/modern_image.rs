@@ -329,9 +329,9 @@ fn iterates_indexed_directory_with_opaque_cookies_and_reads_symlink() {
             None => break,
         }
     }
-    assert_eq!(entries.len(), 303);
+    assert_eq!(entries.len(), 306);
     entries.sort_by(|left, right| left.name.cmp(&right.name));
-    assert_eq!(entries[0].name, b"empty.bin");
+    assert!(entries.iter().any(|entry| entry.name == b"empty.bin"));
     assert!(entries.iter().any(|entry| entry.name == b"file-299"));
     let link = entries
         .iter()

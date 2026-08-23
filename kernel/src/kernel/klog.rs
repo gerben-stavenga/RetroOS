@@ -67,6 +67,7 @@ impl Filesystem for KLogFs {
                 name_len: len,
                 size: klog::byte_len(),
                 is_dir: false,
+                is_symlink: false,
                 mode: 0o444,
                 mtime: 0,
             };

@@ -66,6 +66,43 @@ pub trait Filesystem {
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
 
+    /// Read a symbolic link without following its final component.
+    /// Returns the number of target bytes copied (there is no trailing NUL).
+    fn readlink(&self, _path: &[u8], _out: &mut [u8]) -> Option<usize> {
+        None
+    }
+
+    /// Look up an object without allocating a persistent open handle.  This
+    /// keeps stat/lstat from doing separate directory, symlink, and file
+    /// probes, which is especially expensive for block-backed filesystems.
+    fn stat(&self, path: &[u8], follow_final: bool) -> Option<Stat> {
+        if !follow_final {
+            let mut target = [0u8; DIR_PATH_MAX];
+            if let Some(size) = self.readlink(path, &mut target) {
+                return Some(Stat {
+                    size: size as u32,
+                    mode: 0o777,
+                    is_dir: false,
+                    is_symlink: true,
+                    ino: 0,
+                });
+            }
+        }
+        if self.dir_exists(path) {
+            return Some(Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 });
+        }
+        let vnode = self.open(path)?;
+        let result = Stat {
+            size: vnode.size,
+            mode: vnode.mode,
+            is_dir: false,
+            is_symlink: false,
+            ino: 0,
+        };
+        self.clunk(vnode.handle);
+        Some(result)
+    }
+
     /// Read from a file identified by handle at given byte offset (Tread).
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
@@ -162,12 +199,28 @@ pub struct Vnode {
     pub mode: u16,
 }
 
+/// Path metadata used by stat-like calls. Unlike `Vnode`, this does not own a
+/// filesystem handle and can describe directories and symbolic links.
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub size: u32,
+    pub mode: u16,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    /// Stable VFS inode. Backends may leave this zero; the namespace layer
+    /// fills it from the resolved path.
+    pub ino: u64,
+}
+
 /// Directory entry returned by readdir
 pub struct DirEntry {
     pub name: [u8; 100],
     pub name_len: usize,
     pub size: u32,
     pub is_dir: bool,
+    /// The entry itself is a symbolic link. `is_dir` describes the entry,
+    /// not its target; personalities may choose whether links are transparent.
+    pub is_symlink: bool,
     /// POSIX permission bits (same convention as `Vnode::mode`).
     pub mode: u16,
     /// Last-modified time, seconds since the Unix epoch. `0` = unknown, which
@@ -610,7 +663,7 @@ impl Vfs {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
-                    is_dir: false, mode: 0o644, mtime: 0,
+                    is_dir: false, is_symlink: false, mode: 0o644, mtime: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -624,7 +677,7 @@ impl Vfs {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: 0,
-                    is_dir: true, mode: 0o755, mtime: 0,
+                    is_dir: true, is_symlink: false, mode: 0o755, mtime: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -663,7 +716,8 @@ impl Vfs {
                 && !dir_entries_has(&entries, name) {
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
-                    name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
+                    name: [0; 100], name_len, size: 0, is_dir: true,
+                    is_symlink: false, mode: 0o755,
                     mtime: 0,
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
@@ -697,6 +751,48 @@ impl Vfs {
         self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
             if subpath.is_empty() || fs.dir_exists(subpath) { Some(()) } else { None }
         }).is_some()
+    }
+
+    fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            fs.readlink(subpath, out)
+        })
+    }
+
+    fn stat(&self, path: &[u8], follow_final: bool) -> Option<Stat> {
+        if let Some(data) = self.ram_files.get(path) {
+            return Some(Stat {
+                size: data.len().min(u32::MAX as usize) as u32,
+                mode: self.modes.get(path).copied().unwrap_or(0o644) as u16,
+                is_dir: false,
+                is_symlink: false,
+                ino: path_ino(path),
+            });
+        }
+        if self.ram_dirs.contains(path) {
+            return Some(Stat {
+                size: 0,
+                mode: self.modes.get(path).copied().unwrap_or(0o755) as u16,
+                is_dir: true,
+                is_symlink: false,
+                ino: path_ino(path),
+            });
+        }
+        let override_mode = self.modes.get(path).copied();
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            let mut stat = if subpath.is_empty() {
+                Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 }
+            } else {
+                fs.stat(subpath, follow_final)?
+            };
+            if let Some(mode) = override_mode {
+                stat.mode = mode as u16;
+            }
+            if stat.ino == 0 {
+                stat.ino = path_ino(path);
+            }
+            Some(stat)
+        })
     }
 
     fn mkdir(&mut self, path: &[u8]) -> i32 {
@@ -1272,6 +1368,7 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         name_len: e.name_len,
         size: e.size,
         is_dir: e.is_dir,
+        is_symlink: e.is_symlink,
         mode: e.mode,
         mtime: e.mtime,
     }
@@ -1512,6 +1609,17 @@ pub fn mounted_media_changed() {
 /// Check if a directory exists on a mounted filesystem.
 pub fn dir_exists(path: &[u8]) -> bool {
     VFS.lock().dir_exists(path)
+}
+
+/// Read a symbolic-link target without following the final path component.
+pub fn readlink(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    VFS.lock().readlink(path, out)
+}
+
+/// Fetch path metadata with either stat (follow final link) or lstat
+/// semantics in one backing-filesystem lookup.
+pub fn stat(path: &[u8], follow_final: bool) -> Option<Stat> {
+    VFS.lock().stat(path, follow_final)
 }
 
 /// If `parent/<name>` (case-insensitive) is a mount point, return its directory
