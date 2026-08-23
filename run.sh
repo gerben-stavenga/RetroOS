@@ -1519,6 +1519,19 @@ fdd_02_type = none
 EOF
         echo "Created default 86box config at $VM_DIR/86box.cfg"
     fi
+
+    # The image grows as bundled software is added. 86Box persists an explicit
+    # CHS geometry, so refresh it for every copied image; otherwise the tail is
+    # invisible and a filesystem that fills the partition correctly appears to
+    # extend past the emulated disk. CHS cannot describe a partial cylinder:
+    # round up and zero-pad this private VM copy to the exact declared capacity
+    # so 86Box does not try to resize the backing file itself.
+    IMAGE_SECTORS=$(( ($(stat -c%s "${VM_DIR}/disk.img") + 511) / 512 ))
+    IMAGE_CYLINDERS=$(( (IMAGE_SECTORS + 63 * 16 - 1) / (63 * 16) ))
+    truncate -s $((IMAGE_CYLINDERS * 63 * 16 * 512)) "${VM_DIR}/disk.img"
+    IMAGE_GEOM="63, 16, $IMAGE_CYLINDERS"
+    sed -i "s|^hdd_01_parameters = .*|hdd_01_parameters = $IMAGE_GEOM, 0, ide|" \
+        "${VM_DIR}/86box.cfg"
     fi  # end image-vs-freedos setup
 
     # 86box is a Qt app. The flatpak only shares the X11 socket (sockets=x11),
