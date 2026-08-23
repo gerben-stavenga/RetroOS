@@ -476,12 +476,10 @@ impl Display {
                 format,
             );
         }
+        if matches!(self.backend, Backend::Linear(_)) {
+            return self.present_linear(height, shadow).unwrap_or(0);
+        }
         match &mut self.backend {
-            Backend::Linear(framebuffer) => {
-                let copied = blit(framebuffer, format, out_w, out_h, height, shadow);
-                finish_present();
-                copied
-            }
             Backend::Vga {
                 scanout: VgaScanout::Mode13 { framebuffer, .. }
                     | VgaScanout::VbeLinear { framebuffer, .. },
@@ -495,7 +493,25 @@ impl Display {
             Backend::Host => present_host_shadow(
                 self.shadow_width, height, format, shadow),
             Backend::Headless => 0,
+            Backend::Linear(_) => unreachable!(),
         }
+    }
+
+    fn present_linear(&mut self, height: usize, shadow: &[u8]) -> Option<usize> {
+        let format = self.rgb;
+        let (out_w, out_h) = self.fit();
+        let Backend::Linear(framebuffer) = &mut self.backend else { return None };
+        let copied = blit(framebuffer, format, out_w, out_h, height, shadow);
+        finish_present();
+        Some(copied)
+    }
+
+    /// Best-effort publication after the kernel has already failed.  A panic
+    /// cannot recover the `Arch` and BIOS workspace values held by the dead
+    /// stack, but a loader-provided linear framebuffer needs neither: use the
+    /// same blit as the normal [`Self::present`] path and publish it directly.
+    pub fn panic_present(&mut self, height: usize, shadow: &[u8]) -> usize {
+        self.present_linear(height, shadow).unwrap_or(0)
     }
 }
 

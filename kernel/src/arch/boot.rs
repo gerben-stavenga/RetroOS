@@ -399,5 +399,10 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 
     crate::kernel::stacktrace::stack_trace(screen);
 
+    // The normal display owner is somewhere in the dead call chain.  Seize
+    // the already-mapped framebuffer and make one best-effort publication of
+    // the panic terminal before stopping the machine.
+    crate::fbcon::panic_present();
+
     arch::halt_forever();
 }

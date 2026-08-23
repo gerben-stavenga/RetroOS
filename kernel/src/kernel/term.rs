@@ -70,6 +70,21 @@ pub fn present<A: crate::Arch>(
     display: &mut Display,
 ) {
     if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 { return; }
+    let Some((height, shadow)) = render(display) else { return };
+    display.present(machine, bios, height, shadow);
+}
+
+/// Best-effort terminal publication for the panic handler.  The system is no
+/// longer live, so deliberately seize the global scanout even if the failed
+/// call chain had borrowed it.
+pub fn panic_present(display: &mut Display) {
+    if let Some((height, shadow)) = render(display) {
+        display.panic_present(height, shadow);
+    }
+}
+
+fn render(display: &Display) -> Option<(usize, &'static mut [u8])> {
+    if display.shadow_width == 0 { return None; }
     unsafe {
         if PALETTE == [0; 768] { PALETTE = vga::fallback_palette(); }
     }
@@ -90,19 +105,17 @@ pub fn present<A: crate::Arch>(
         pixel_pan: 0,
         line_compare: usize::MAX,
     };
-    scanout(machine, bios, display, &frame);
+    render_frame(display, &frame)
 }
 
-fn scanout<A: crate::Arch>(
-    machine: &mut A,
-    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut Display,
+fn render_frame(
+    display: &Display,
     frame: &Frame<'_>,
-) {
+) -> Option<(usize, &'static mut [u8])> {
     let (w, h) = vga::dimensions(frame.mode);
     let out_w = display.shadow_width;
     if w == 0 || h == 0 || out_w == 0 {
-        return;
+        return None;
     }
 
     // Picture-only shadow, exactly like the timed raster: the bars around it
@@ -122,5 +135,5 @@ fn scanout<A: crate::Arch>(
     for sy in 0..h {
         vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
-    display.present(machine, bios, h, &mut s.surface[..row_bytes * h]);
+    Some((h, &mut s.surface[..row_bytes * h]))
 }
