@@ -30,14 +30,16 @@ fn resolve_child(base: &[u8], want: &[u8], want_dir: bool) -> Option<alloc::vec:
     let mut index = 0;
     while let Some(e) = crate::kernel::vfs::readdir(base, index) {
         index += 1;
-        if e.is_dir == want_dir
-            && crate::kernel::vfs::eq_ignore_case(&e.name[..e.name_len], want)
-        {
+        if crate::kernel::vfs::eq_ignore_case(&e.name[..e.name_len], want) {
             let mut path = alloc::vec::Vec::with_capacity(base.len() + e.name_len + 1);
             path.extend_from_slice(base);
             path.push(b'/');
             path.extend_from_slice(&e.name[..e.name_len]);
-            return Some(path);
+            let is_dir = e.is_dir
+                || (e.is_symlink && crate::kernel::vfs::dir_exists(&path));
+            if is_dir == want_dir {
+                return Some(path);
+            }
         }
     }
     None
