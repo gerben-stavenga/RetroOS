@@ -204,7 +204,7 @@ fn main() {
     // cmdline/cwd, so there's no fw_cfg port round-trip.
     let mut config = kernel::BootConfig::empty();
     config.is_qemu = true;
-    if host_dir.is_some() { config.set_hostfs_from_cmdline(b"hostfs=com1"); }
+    if host_dir.is_some() { config.set_serial_services_from_cmdline(b"hostfs=com1"); }
     if let Some(c) = &cmd { config.set_cmdline(c.as_bytes()); }
     if let Some(c) = &cwd { config.set_cwd(c.as_bytes()); }
     if let Some(c) = &c_root { config.set_c_root(c.as_bytes()); }

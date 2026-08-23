@@ -340,8 +340,7 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     }
 
     let mut cfg = crate::BootConfig::empty();
-    cfg.set_hostfs_from_cmdline(multiboot_cmdline);
-    cfg.set_serial_console_from_cmdline(multiboot_cmdline);
+    cfg.set_serial_services_from_cmdline(multiboot_cmdline);
     cfg.ram_overlay = multiboot_cmdline
         .split(|b| b.is_ascii_whitespace())
         .any(|arg| arg.eq_ignore_ascii_case(b"ram-overlay"));
