@@ -166,32 +166,28 @@ mod tests {
 
     #[test]
     fn visits_all_key_value_tokens_without_semantic_filtering() {
-        let mut keys = [&[][..]; 3];
-        let mut values = [&[][..]; 3];
+        let expected_keys = [b"arg".as_slice(), b"hostfs", b"retroos.mount"];
+        let expected_values = [b"one".as_slice(), b"com1", b"/data"];
         let mut count = 0;
         for_each_key_value(b"TESTS/X.COM arg=one;hostfs=com1 retroos.mount=/data", |key, value| {
-            keys[count] = key;
-            values[count] = value;
+            assert_eq!(key, expected_keys[count]);
+            assert_eq!(value, expected_values[count]);
             count += 1;
         });
         assert_eq!(count, 3);
-        assert_eq!(keys[0], b"arg");
-        assert_eq!(values[0], b"one");
-        assert_eq!(keys[1], b"hostfs");
-        assert_eq!(values[1], b"com1");
-        assert_eq!(keys[2], b"retroos.mount");
-        assert_eq!(values[2], b"/data");
     }
 
     #[test]
     fn filters_only_the_consumer_owned_directive() {
-        let launch = launch(
+        let parsed = launch(
             b"hostfs=com1 TESTS/X.COM arg=one retroos.mount=/data",
             hostfs_directive,
         ).unwrap();
-        assert_eq!(launch.program(), b"TESTS/X.COM");
-        let args: alloc::vec::Vec<_> = launch.arguments().collect();
-        assert_eq!(args, [&b"arg=one"[..], &b"retroos.mount=/data"[..]]);
+        assert_eq!(parsed.program(), b"TESTS/X.COM");
+        let mut args = parsed.arguments();
+        assert_eq!(args.next(), Some(&b"arg=one"[..]));
+        assert_eq!(args.next(), Some(&b"retroos.mount=/data"[..]));
+        assert_eq!(args.next(), None);
     }
 
     #[test]
@@ -201,14 +197,14 @@ mod tests {
 
     #[test]
     fn writes_arguments_with_bounded_space_separation() {
-        let launch = launch(b"TESTS/X.COM one two", hostfs_directive).unwrap();
+        let parsed = launch(b"TESTS/X.COM one two", hostfs_directive).unwrap();
         let mut output = [0u8; 7];
-        let len = launch.write_arguments(&mut output);
+        let len = parsed.write_arguments(&mut output);
         assert_eq!(&output[..len], b"one two");
 
-        let launch = launch(b"TESTS/X.COM abc def", hostfs_directive).unwrap();
+        let parsed = launch(b"TESTS/X.COM abc def", hostfs_directive).unwrap();
         let mut output = [0u8; 5];
-        let len = launch.write_arguments(&mut output);
+        let len = parsed.write_arguments(&mut output);
         assert_eq!(&output[..len], b"abc d");
     }
 }

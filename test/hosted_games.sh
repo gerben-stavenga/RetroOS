@@ -13,8 +13,6 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 IMG=bazel-bin/image.bin          # the open-source image carries the committed games
-[ -f "$IMG" ] || { echo "no $IMG — run: bazelisk build //:image"; exit 1; }
-
 HOST_BIN=bazel-bin/kernel/retroos-host
 if [ "${ENGINE:-tcg}" = kvm ]; then
     # Probe by actually opening the device — `test -w` misses ACL grants.
@@ -24,7 +22,8 @@ if [ "${ENGINE:-tcg}" = kvm ]; then
     fi
     HOST_BIN=bazel-bin/kernel/retroos-host-kvm
 fi
-[ -f "$HOST_BIN" ] || { echo "no $HOST_BIN — run: bazelisk build //kernel:$(basename "$HOST_BIN") --platforms=@platforms//host"; exit 1; }
+bazelisk build //:image >/dev/null
+bazelisk build "//kernel:$(basename "$HOST_BIN")" --platforms=@platforms//host >/dev/null
 
 PY="python3 test/hosted_test.py --host-bin $HOST_BIN --image $IMG"
 fail=0

@@ -506,8 +506,6 @@ fn configure_endpoint(
     slot: u32,
     lane: usize,
     pipe: usize,
-    port: u32,
-    speed: u32,
     ep_num: u32,
     mps: u32,
     interval: u32,
@@ -526,7 +524,6 @@ fn configure_endpoint(
         // transactions to a full-speed device on the high-speed root hub; a fresh
         // slot context (speed/port only) zeroes those, and the re-evaluation then
         // leaves the endpoint "Running" but never polled — no transfers at all.
-        let _ = (speed, port);
         let slotc = inctx + stride;
         core::ptr::copy_nonoverlapping(
             (DMA_VA + device_context_off(lane)) as *const u8,
@@ -974,9 +971,7 @@ fn configure_hid(
     } else {
         (3 + (31 - ep.interval.max(1).leading_zeros())).clamp(3, 10)
     };
-    if !configure_endpoint(
-        slot, dev.lane, pipe, dev.port, dev.speed, ep.ep, ep.mps, interval, stride,
-    ) {
+    if !configure_endpoint(slot, dev.lane, pipe, ep.ep, ep.mps, interval, stride) {
         return false;
     }
     unsafe {

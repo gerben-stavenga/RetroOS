@@ -1,5 +1,6 @@
 # Build arch-abi crate (backend-agnostic arch↔kernel contract) using rules_rust
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//toolchain:host_transition.bzl", "host_platform_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -13,4 +14,19 @@ rust_library(
         "-Copt-level=z",
         "-Crelocation-model=static",
     ],
+)
+
+rust_test(
+    name = "arch_abi_test_host",
+    crate = ":arch-abi",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+)
+
+host_platform_test(
+    name = "arch_abi_test",
+    test = ":arch_abi_test_host",
 )

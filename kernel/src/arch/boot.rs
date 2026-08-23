@@ -21,11 +21,14 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 #[global_allocator]
 static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
 
-/// Metal debug-log sink: emit one byte to the 0xE9 debug port. Installed into
-/// the kernel console via `set_debug_sink` so the kernel logs without ever
-/// issuing a port op itself.
-fn log_byte_0xe9(b: u8) {
+/// Metal log sink: preserve the emulator debug port and mirror to the optional
+/// physical serial logger. The kernel only hands bytes to this platform sink.
+fn log_byte(b: u8) {
+    // Preserve the emulator debug console sink; harmless on real hardware.
     x86::outb(0xE9, b);
+
+    // Mirror to the configured physical serial console once it is active.
+    crate::kernel::serial_log::write_byte(b);
 }
 
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
@@ -144,10 +147,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // before the heap and captures the interrupt/device bring-up below.
     crate::kernel::klog::init();
 
-    // Install the kernel's debug-log sink: on metal, a byte to the 0xE9 debug
-    // port. Logging is a platform concern, not an arch call — the kernel never
-    // touches a port itself; it just hands bytes to this sink.
-    lib::log::set_debug_sink(log_byte_0xe9);
+    // Install the kernel's metal log sink before any normal startup output.
+    lib::log::set_debug_sink(log_byte);
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
@@ -155,6 +156,19 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
         inb: arch::inb, inw: arch::inw, inl: arch::inl, insw: arch::insw,
         outb: arch::outb, outw: arch::outw, outl: arch::outl, outsw: arch::outsw,
     });
+
+    // Read the base boot configuration before normal startup output. The
+    // Multiboot command line was copied before paging; fw_cfg uses direct PIO,
+    // and this read needs neither the heap nor interrupts.
+    let mut config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
+    if let Some(port) = config.serial_console_port {
+        if crate::kernel::serial_log::init(port) {
+            crate::println!("serial: {:?} logging enabled at 115200 8N1", port);
+        } else {
+            crate::println!("serial: {:?} unavailable", port);
+        }
+    }
+
     crate::kernel::display::set_present_hook(crate::fbcon::present);
     crate::set_host_env(crate::HostEnv {
         framebuffer: crate::fbcon::framebuffer,
@@ -268,10 +282,8 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     lib::screenln!(screen);
     lib::screenln!(screen, "\x1b[92mHello from Rust kernel!\x1b[0m");
 
-    // Read platform boot configuration at the boundary, before handing it to
-    // the kernel. The Multiboot command line carries physical-machine policy;
-    // QEMU-only launch settings additionally come from fw_cfg.
-    let mut config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
+    // Complete the boot configuration with loader-owned module data now that
+    // the later handoff has produced it.
     config.boot_modules = boot_modules;
     if config.boot_modules.iter().any(Option::is_some) {
         config.boot_physical_reader = Some(arch::aperture::copy_from_physical);
@@ -328,7 +340,7 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     }
 
     let mut cfg = crate::BootConfig::empty();
-    cfg.set_hostfs_from_cmdline(multiboot_cmdline);
+    cfg.set_serial_services_from_cmdline(multiboot_cmdline);
     cfg.ram_overlay = multiboot_cmdline
         .split(|b| b.is_ascii_whitespace())
         .any(|arg| arg.eq_ignore_ascii_case(b"ram-overlay"));

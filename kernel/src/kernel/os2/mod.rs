@@ -760,7 +760,7 @@ fn dispatch_api<A: crate::Arch>(
             let out = arg32(machine, regs, 2) as usize;
             let size = arg32(machine, regs, 3) as usize;
             let count = last.checked_sub(first).map_or(usize::MAX, |n| n as usize + 1);
-            if count.checked_mul(4).map_or(true, |n| n > size) { return ERROR_INVALID_PARAMETER; }
+            if count.checked_mul(4).is_none_or(|n| n > size) { return ERROR_INVALID_PARAMETER; }
             for i in 0..count {
                 let index = first + i as u32;
                 let value = match index {

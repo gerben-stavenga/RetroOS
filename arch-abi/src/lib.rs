@@ -134,6 +134,8 @@ pub struct BootConfig {
     pub ram_overlay: bool,
     /// Optional HostFS COM port. `None` leaves HostFS disabled.
     pub hostfs_port: Option<ComPort>,
+    /// Optional kernel serial-console port. `None` leaves UART logging disabled.
+    pub serial_console_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
     /// Metal's temporary physical-memory reader. Hosted entries leave this empty.
@@ -149,6 +151,7 @@ impl BootConfig {
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
             hostfs_port: None,
+            serial_console_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
             boot_physical_reader: None,
         };
@@ -159,21 +162,29 @@ impl BootConfig {
         cfg.c_root_len = d.len();
         cfg
     }
-    /// Enable HostFS when a `hostfs=com1` or `hostfs=com2` directive is
-    /// present in a boot command line. Invalid values leave the current setting
-    /// unchanged so the default remains disabled.
-    pub fn set_hostfs_from_cmdline(&mut self, s: &[u8]) {
+    /// Apply `hostfs=com1|com2` and `serial=com1|com2` assignments in command
+    /// line order. Each service owns at most one port and each port has at most
+    /// one owner; assigning a shared port evicts its previous owner.
+    pub fn set_serial_services_from_cmdline(&mut self, s: &[u8]) {
         cmdline::for_each_key_value(s, |key, value| {
-            if !cmdline::key_eq(key, b"hostfs") { return; }
-            if let Some(port) = ComPort::parse_ascii(value) {
+            let Some(port) = ComPort::parse_ascii(value) else { return };
+            if cmdline::key_eq(key, b"hostfs") {
+                if self.serial_console_port == Some(port) {
+                    self.serial_console_port = None;
+                }
                 self.hostfs_port = Some(port);
+            } else if cmdline::key_eq(key, b"serial") {
+                if self.hostfs_port == Some(port) {
+                    self.hostfs_port = None;
+                }
+                self.serial_console_port = Some(port);
             }
         });
     }
 
     /// Record the headless command line (semicolon-separated program list).
     pub fn set_cmdline(&mut self, s: &[u8]) {
-        self.set_hostfs_from_cmdline(s);
+        self.set_serial_services_from_cmdline(s);
         let n = s.len().min(self.cmdline.len());
         self.cmdline[..n].copy_from_slice(&s[..n]);
         self.cmdline_len = Some(n);
@@ -226,9 +237,37 @@ mod boot_config_tests {
     #[test]
     fn hosted_hostfs_directive_is_preserved_before_program_setup() {
         let mut config = BootConfig::empty();
-        config.set_hostfs_from_cmdline(b"hostfs=com1");
+        config.set_serial_services_from_cmdline(b"hostfs=com1");
         config.set_cmdline(b"TC/TCC.EXE -ms STUB.C");
         assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+    }
+
+    #[test]
+    fn serial_directives_are_case_insensitive_and_last_valid_wins() {
+        let mut config = BootConfig::empty();
+        assert_eq!(config.serial_console_port, None);
+        config.set_cmdline(b"SERIAL=COM1 serial=COM2 serial=invalid");
+        assert_eq!(config.serial_console_port, Some(ComPort::Com2));
+    }
+
+    #[test]
+    fn hostfs_and_serial_ports_are_parsed_independently() {
+        let mut config = BootConfig::empty();
+        config.set_cmdline(b"hostfs=com1 serial=com2;TESTS/X.COM");
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert_eq!(config.serial_console_port, Some(ComPort::Com2));
+    }
+
+    #[test]
+    fn last_assignment_owns_a_shared_port() {
+        let mut config = BootConfig::empty();
+        config.set_cmdline(b"hostfs=com1 serial=com1");
+        assert_eq!(config.hostfs_port, None);
+        assert_eq!(config.serial_console_port, Some(ComPort::Com1));
+
+        config.set_cmdline(b"serial=com2 hostfs=com2");
+        assert_eq!(config.serial_console_port, None);
+        assert_eq!(config.hostfs_port, Some(ComPort::Com2));
     }
 }
 

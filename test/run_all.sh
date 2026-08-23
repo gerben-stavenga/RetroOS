@@ -27,6 +27,7 @@ module_qemu() { module_tools && have qemu-system-i386; }
 python3_test() { have python3; }
 qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
+qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
@@ -37,7 +38,8 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //kernel:kernel_unit_test //lib:sound_test //lib:vga_test \
+        //arch-abi:arch_abi_test //kernel:kernel_unit_test \
+        //lib:sound_test //lib:vga_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
 unit_kvm() { bz test --platforms=@platforms//host //arch-interp:arch-interp-kvm-test; }
@@ -78,6 +80,7 @@ run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
 # --- QEMU HostFS integration (requires QEMU and Python) ---------------------
 run qemu_hostfs_lifecycle_com1 qemu_hostfs bash test/qemu_hostfs_lifecycle.sh com1
 run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
+run qemu_serial_logging qemu_serial bash test/qemu_serial_logging.sh
 
 run dpmi_smoke   qemu_prop bash test/dpmi_smoke.sh   # qemu + BORLANDC/BCC
 run dark_smoke   qemu_prop bash test/dark_smoke.sh   # qemu + DFORCES
