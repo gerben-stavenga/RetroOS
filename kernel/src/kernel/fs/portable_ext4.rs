@@ -326,6 +326,23 @@ impl Filesystem for PortableExt4Fs {
         })
     }
 
+    fn open_node(&self, node: u64) -> Option<Vnode> {
+        let number = u32::try_from(node).ok()?;
+        let inode = self
+            .filesystem
+            .borrow_mut()
+            .inode(&mut *self.storage.borrow_mut(), number)
+            .ok()?;
+        if inode.is_directory() {
+            return None;
+        }
+        Some(Vnode {
+            handle: self.allocate_handle(inode.clone()),
+            size: inode.size.min(u64::from(u32::MAX)) as u32,
+            mode: inode.mode & 0x0fff,
+        })
+    }
+
     fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
         let path = Self::path(path)?;
         let inode = self.resolve(&path, false).ok()?;
@@ -573,6 +590,8 @@ impl Filesystem for PortableExt4Fs {
                 is_symlink: entry.inode.is_symlink(),
                 mode: entry.inode.mode & 0x0fff,
                 mtime: u32::try_from(entry.inode.modified.seconds).unwrap_or(0),
+                node: u64::from(entry.inode.number),
+                mount_idx: 0,
             };
             result.name[..name_len].copy_from_slice(&entry.name[..name_len]);
             output.push(result);

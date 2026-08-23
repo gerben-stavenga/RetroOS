@@ -342,6 +342,16 @@ impl Ext4 {
         self.load_inode(storage, ROOT_INODE)
     }
 
+    /// Load an inode by the identity returned from a directory listing.
+    /// Name resolution belongs to the caller; this does not search a directory.
+    pub fn inode<S: Storage>(
+        &mut self,
+        storage: &mut S,
+        number: u32,
+    ) -> Result<Inode, Error<S::Error>> {
+        self.load_inode(storage, number)
+    }
+
     /// Reload an inode identity from disk, rejecting a reused identity.
     pub fn refresh<S: Storage>(
         &mut self,

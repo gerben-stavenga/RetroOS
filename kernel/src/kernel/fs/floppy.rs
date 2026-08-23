@@ -371,6 +371,8 @@ impl Filesystem for FloppySlot {
                 is_symlink: false,
                 mode: if entry.is_dir() { 0o555 } else { 0o444 },
                 mtime: unix_from_datetime(&entry.modified()),
+                node: 0,
+                mount_idx: 0,
             };
             de.name[..name_len].copy_from_slice(&short[..name_len]);
             out.push(de);

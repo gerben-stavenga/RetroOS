@@ -79,6 +79,8 @@ impl Filesystem for InjectedHostFs {
                 is_symlink: false,
                 mode: if is_dir { 0o755 } else { 0o644 },
                 mtime,
+                node: 0,
+                mount_idx: 0,
             });
             index += 1;
         }

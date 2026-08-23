@@ -66,6 +66,10 @@ pub trait Filesystem {
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
 
+    /// Open an opaque node identity previously returned by `readdir`.
+    /// Backends without stable node identities retain path-based lookup.
+    fn open_node(&self, _node: u64) -> Option<Vnode> { None }
+
     /// Read a symbolic link without following its final component.
     /// Returns the number of target bytes copied (there is no trailing NUL).
     fn readlink(&self, _path: &[u8], _out: &mut [u8]) -> Option<usize> {
@@ -228,6 +232,11 @@ pub struct DirEntry {
     /// hostfs wire) report; DOS renders that as an empty date rather than as
     /// 1970, which would look like a real timestamp.
     pub mtime: u32,
+    /// Opaque identity supplied by the backing filesystem. A zero identity
+    /// means that this backend supports path-based lookup only.
+    pub(crate) node: u64,
+    /// Filled by the VFS while merging a directory's mounted layers.
+    pub(crate) mount_idx: u8,
 }
 
 /// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
@@ -331,19 +340,21 @@ pub const READDIR_START: u64 = 0;
 /// far fewer opens: a 341-entry directory takes 6 calls instead of 341.
 const READDIR_BATCH: usize = 64;
 
-/// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
-/// readdir). One directory cached at a time, growable so a flat dir with
-/// hundreds of entries doesn't get truncated.
+/// A directory listing owned by the namespace layer. Backends enumerate;
+/// name lookup is performed against these retained listings.
 struct DirCache {
-    dir: [u8; 96],
-    dir_len: usize,
+    dir: Vec<u8>,
     entries: Vec<DirEntry>,
-    valid: bool,
+    names: BTreeMap<Vec<u8>, usize>,
 }
 
 impl DirCache {
-    const fn new() -> Self {
-        DirCache { dir: [0; 96], dir_len: 0, entries: Vec::new(), valid: false }
+    fn new(dir: &[u8], entries: Vec<DirEntry>) -> Self {
+        let mut names = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            names.insert(entry.name[..entry.name_len].to_vec(), index);
+        }
+        Self { dir: dir.to_vec(), entries, names }
     }
 }
 
@@ -377,7 +388,7 @@ struct Vfs {
     locks: Vec<FileLock>,
     /// Global file table — slot is free when refcount == 0.
     file_table: [FileEntry; MAX_OPEN_FILES],
-    dir_cache: DirCache,
+    dir_cache: Vec<DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
     /// reported with its original zero size.
@@ -407,7 +418,7 @@ impl Vfs {
             mtimes: BTreeMap::new(),
             locks: Vec::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
-            dir_cache: DirCache::new(),
+            dir_cache: Vec::new(),
             dir_generation: 0,
         }
     }
@@ -640,7 +651,7 @@ impl Vfs {
     // ── dir cache ────────────────────────────────────────────────────────
 
     fn invalidate_dir_cache(&mut self) {
-        self.dir_cache.valid = false;
+        self.dir_cache.clear();
         self.dir_generation = self.dir_generation.wrapping_add(1);
     }
 
@@ -650,20 +661,18 @@ impl Vfs {
     /// RAM-first check), then the union stack of mounted filesystems (most-
     /// recent first), then synthesized mount/bind-point directories.
     fn populate_dir_cache(&mut self, dir: &[u8]) {
-        let dlen = dir.len().min(self.dir_cache.dir.len());
-        self.dir_cache.dir[..dlen].copy_from_slice(&dir[..dlen]);
-        self.dir_cache.dir_len = dlen;
-
         let mut entries: Vec<DirEntry> = Vec::new();
+        let mut visible_names: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
         // RAM overlay files (writable layer, highest priority).
         for (key, data) in self.ram_files.iter() {
             if let Some(basename) = entry_in_ram_dir(key, dir)
-                && !dir_entries_has(&entries, basename) {
+                && claim_visible_name(&mut visible_names, basename) {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
                     is_dir: false, is_symlink: false, mode: 0o644, mtime: 0,
+                    node: 0, mount_idx: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -673,11 +682,12 @@ impl Vfs {
         // RAM overlay directories.
         for key in self.ram_dirs.iter() {
             if let Some(basename) = entry_in_ram_dir(key, dir)
-                && !dir_entries_has(&entries, basename) {
+                && claim_visible_name(&mut visible_names, basename) {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: 0,
                     is_dir: true, is_symlink: false, mode: 0o755, mtime: 0,
+                    node: 0, mount_idx: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -687,14 +697,15 @@ impl Vfs {
         // Union merge: visit every member of the group in priority order (most
         // recent first); an upper layer shadows a lower one on a name clash.
         // For a Replace group this is just the one backing fs (== old behavior).
-        self.resolve_members(dir, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+        self.resolve_members(dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
             let mut batch: Vec<DirEntry> = Vec::new();
             let mut cookie = READDIR_START;
             loop {
                 batch.clear();
                 let next = fs.readdir(subpath, cookie, &mut batch, READDIR_BATCH);
-                for e in batch.drain(..) {
-                    if !dir_entries_has(&entries, &e.name[..e.name_len]) {
+                for mut e in batch.drain(..) {
+                    e.mount_idx = idx;
+                    if claim_visible_name(&mut visible_names, &e.name[..e.name_len]) {
                         entries.push(e);
                     }
                 }
@@ -713,30 +724,62 @@ impl Vfs {
         // Synthesize mount/bind-point directories that live directly under `dir`.
         for b in &self.mounts {
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
-                && !dir_entries_has(&entries, name) {
+                && claim_visible_name(&mut visible_names, name) {
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len, size: 0, is_dir: true,
                     is_symlink: false, mode: 0o755,
                     mtime: 0,
+                    node: 0,
+                    mount_idx: 0,
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
                 entries.push(de);
             }
         }
 
-        self.dir_cache.entries = entries;
-        self.dir_cache.valid = true;
+        self.dir_cache.push(DirCache::new(dir, entries));
     }
 
     fn readdir(&mut self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        let stale = !self.dir_cache.valid
-            || self.dir_cache.dir_len != dir.len()
-            || self.dir_cache.dir[..self.dir_cache.dir_len] != *dir;
-        if stale {
+        if !self.dir_cache.iter().any(|cached| cached.dir == dir) {
             self.populate_dir_cache(dir);
         }
-        self.dir_cache.entries.get(index).map(clone_dir_entry)
+        self.dir_cache
+            .iter()
+            .find(|cached| cached.dir == dir)
+            .and_then(|cached| cached.entries.get(index))
+            .map(clone_dir_entry)
+    }
+
+    /// Resolve the last path component from VFS-owned directory listings and,
+    /// when the backend supplied a stable identity, open it without asking the
+    /// backend to repeat name lookup.
+    fn open_cached_node(&mut self, path: &[u8]) -> Option<(u8, Vnode, Vec<u8>)> {
+        let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(separator) => (&path[..separator], &path[separator + 1..]),
+            None => (&b""[..], path),
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let entry = {
+            if !self.dir_cache.iter().any(|cached| cached.dir == parent) {
+                self.populate_dir_cache(parent);
+            }
+            let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
+            clone_dir_entry(cached.entries.get(*cached.names.get(name)?)?)
+        };
+        // Directories are not openable files, and a final symlink must still
+        // pass through the backend's link-following path operation.
+        if entry.node == 0 || entry.is_dir || entry.is_symlink {
+            return None;
+        }
+        let subpath = self.resolve_members(path, ALIAS_DEPTH, &mut |idx, _fs, subpath| {
+            (idx == entry.mount_idx).then(|| subpath.to_vec())
+        })?;
+        let vnode = self.mount_fs(entry.mount_idx).open_node(entry.node)?;
+        Some((entry.mount_idx, vnode, subpath))
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
@@ -852,9 +895,12 @@ impl Vfs {
         // Carry the subpath out too: the write verdict must be taken against
         // the member that actually opened the file, not against whatever
         // `resolve_head` would pick.
-        let (midx, vnode, sub) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
-            fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
-        }) {
+        let resolved = self.open_cached_node(path).or_else(|| {
+            self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+                fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
+            })
+        });
+        let (midx, vnode, sub) = match resolved {
             Some(x) => x,
             None => return -2,
         };
@@ -1356,10 +1402,10 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
     }
 }
 
-/// Case-insensitive membership test over already-collected dir entries — the
-/// union-merge shadow rule (a name from a higher layer hides it below).
-fn dir_entries_has(entries: &[DirEntry], name: &[u8]) -> bool {
-    entries.iter().any(|e| eq_ignore_case(&e.name[..e.name_len], name))
+/// Claim a case-folded name for union merging. The first (highest) layer wins.
+fn claim_visible_name(names: &mut BTreeMap<Vec<u8>, ()>, name: &[u8]) -> bool {
+    let folded = name.iter().map(u8::to_ascii_lowercase).collect();
+    names.insert(folded, ()).is_none()
 }
 
 fn clone_dir_entry(e: &DirEntry) -> DirEntry {
@@ -1371,6 +1417,8 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         is_symlink: e.is_symlink,
         mode: e.mode,
         mtime: e.mtime,
+        node: e.node,
+        mount_idx: e.mount_idx,
     }
 }
 
@@ -1837,9 +1885,12 @@ pub fn file_mode_by_handle(handle: i32) -> u16 {
 mod tests {
     use super::{DirEntry, Filesystem, Vfs, Vnode, WriteAccess};
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static CREATE_CALLED: AtomicBool = AtomicBool::new(false);
+    static READDIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PATH_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NODE_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     struct FailingCreateFs;
     static FAILING_CREATE_FS: FailingCreateFs = FailingCreateFs;
@@ -1881,5 +1932,62 @@ mod tests {
         assert_eq!(vfs.create_to_handle(b"failed.txt"), -13);
         assert!(CREATE_CALLED.load(Ordering::Relaxed));
         assert!(!vfs.ram_files.contains_key(b"failed.txt".as_slice()));
+    }
+
+    struct NodeFs;
+    static NODE_FS: NodeFs = NodeFs;
+
+    impl Filesystem for NodeFs {
+        fn open(&self, _path: &[u8]) -> Option<Vnode> {
+            PATH_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        fn open_node(&self, node: u64) -> Option<Vnode> {
+            NODE_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(Vnode { handle: node, size: 1, mode: 0o444 })
+        }
+
+        fn read(&self, _handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 { 0 }
+
+        fn readdir(
+            &self,
+            dir: &[u8],
+            cookie: u64,
+            out: &mut Vec<DirEntry>,
+            _max: usize,
+        ) -> Option<u64> {
+            READDIR_CALLS.fetch_add(1, Ordering::Relaxed);
+            if !dir.is_empty() || cookie != 0 {
+                return None;
+            }
+            for (name, node) in [(b"one".as_slice(), 11), (b"two".as_slice(), 12)] {
+                let mut entry = DirEntry {
+                    name: [0; 100], name_len: name.len(), size: 1,
+                    is_dir: false, is_symlink: false, mode: 0o444, mtime: 0,
+                    node, mount_idx: 0,
+                };
+                entry.name[..name.len()].copy_from_slice(name);
+                out.push(entry);
+            }
+            None
+        }
+
+        fn dir_exists(&self, path: &[u8]) -> bool { path.is_empty() }
+    }
+
+    #[test]
+    fn opens_nodes_from_one_vfs_owned_directory_listing() {
+        READDIR_CALLS.store(0, Ordering::Relaxed);
+        PATH_OPEN_CALLS.store(0, Ordering::Relaxed);
+        NODE_OPEN_CALLS.store(0, Ordering::Relaxed);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &NODE_FS);
+
+        assert!(vfs.open_to_handle(b"one") >= 0);
+        assert!(vfs.open_to_handle(b"two") >= 0);
+        assert_eq!(READDIR_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(NODE_OPEN_CALLS.load(Ordering::Relaxed), 2);
     }
 }

@@ -70,6 +70,8 @@ impl Filesystem for KLogFs {
                 is_symlink: false,
                 mode: 0o444,
                 mtime: 0,
+                node: 0,
+                mount_idx: 0,
             };
             de.name[..len].copy_from_slice(&name[..len]);
             out.push(de);

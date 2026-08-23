@@ -462,6 +462,8 @@ impl Filesystem for Iso9660Fs {
                 is_symlink: false,
                 mode: if entry.is_directory() { 0o555 } else { 0o444 },
                 mtime: 0,
+                node: 0,
+                mount_idx: 0,
             };
             result.name[..name_len].copy_from_slice(&bytes[..name_len]);
             out.push(result);
