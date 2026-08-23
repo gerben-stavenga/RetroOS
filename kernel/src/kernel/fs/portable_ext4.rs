@@ -6,8 +6,7 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell};
 
@@ -168,24 +167,6 @@ impl PortableExt4Fs {
         data_len.div_ceil(4096).saturating_add(64)
     }
 
-    fn normalize(path: &str) -> Result<String, ()> {
-        if !path.starts_with('/') || path.as_bytes().contains(&0) {
-            return Err(());
-        }
-        let mut components = Vec::new();
-        for component in path.split('/') {
-            match component {
-                "" | "." => {}
-                ".." => {
-                    components.pop();
-                }
-                component if component.len() <= 255 => components.push(component),
-                _ => return Err(()),
-            }
-        }
-        Ok(format!("/{}", components.join("/")))
-    }
-
     fn find_entry(
         filesystem: &mut Ext4,
         storage: &mut VolumeStorage,
@@ -208,60 +189,36 @@ impl PortableExt4Fs {
         }
     }
 
+    /// Walk an already-canonical path without assigning semantics to symlink
+    /// payloads. A symlink in a non-final component naturally fails the next
+    /// directory step; VFS must expand it before calling the backend.
     fn resolve_in(
         filesystem: &mut Ext4,
         storage: &mut VolumeStorage,
         path: &str,
-        follow_final: bool,
     ) -> Result<Inode, ()> {
-        let mut current = Self::normalize(path)?;
-        for _ in 0..40 {
-            let components: Vec<String> = current
-                .split('/')
-                .filter(|component| !component.is_empty() && *component != ".")
-                .map(ToString::to_string)
-                .collect();
-            let mut inode = filesystem.root(storage).map_err(|_| ())?;
-            let mut followed = false;
-            for (index, component) in components.iter().enumerate() {
-                if !inode.is_directory() {
-                    return Err(());
-                }
-                inode = Self::find_entry(filesystem, storage, &inode, component.as_bytes())?
-                    .ok_or(())?
-                    .inode;
-                if inode.is_symlink() && (follow_final || index + 1 != components.len()) {
-                    let target = filesystem.read_symlink(storage, &inode).map_err(|_| ())?;
-                    let target = core::str::from_utf8(&target).map_err(|_| ())?;
-                    let parent = if index == 0 {
-                        "/".to_string()
-                    } else {
-                        format!("/{}/", components[..index].join("/"))
-                    };
-                    let remainder = components[index + 1..].join("/");
-                    let expanded = if target.starts_with('/') {
-                        format!("{target}/{remainder}")
-                    } else {
-                        format!("{parent}{target}/{remainder}")
-                    };
-                    current = Self::normalize(&expanded)?;
-                    followed = true;
-                    break;
-                }
-            }
-            if !followed {
-                return Ok(inode);
-            }
+        if !path.starts_with('/') || path.as_bytes().contains(&0) {
+            return Err(());
         }
-        Err(())
+        let mut inode = filesystem.root(storage).map_err(|_| ())?;
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            if component == "." || component == ".." || component.len() > 255
+                || !inode.is_directory()
+            {
+                return Err(());
+            }
+            inode = Self::find_entry(filesystem, storage, &inode, component.as_bytes())?
+                .ok_or(())?
+                .inode;
+        }
+        Ok(inode)
     }
 
-    fn resolve(&self, path: &str, follow_final: bool) -> Result<Inode, ()> {
+    fn resolve(&self, path: &str) -> Result<Inode, ()> {
         Self::resolve_in(
             &mut self.filesystem.borrow_mut(),
             &mut self.storage.borrow_mut(),
             path,
-            follow_final,
         )
     }
 
@@ -269,7 +226,7 @@ impl PortableExt4Fs {
         let (parent_path, name) = Self::split_parent(path).ok_or(())?;
         let mut filesystem = self.filesystem.borrow_mut();
         let mut storage = self.storage.borrow_mut();
-        let parent = Self::resolve_in(&mut filesystem, &mut storage, parent_path, true)?;
+        let parent = Self::resolve_in(&mut filesystem, &mut storage, parent_path)?;
         let entry =
             Self::find_entry(&mut filesystem, &mut storage, &parent, name.as_bytes())?.ok_or(())?;
         Ok((parent, entry))
@@ -289,6 +246,29 @@ impl PortableExt4Fs {
         transaction.reserve_blocks(reserve).is_ok()
             && operation(&mut transaction, &mut storage).is_ok()
             && transaction.commit(&mut *storage).is_ok()
+    }
+
+    fn append_directory_entries(output: &mut Vec<DirEntry>, entries: Vec<ExtDirectoryEntry>) {
+        for entry in entries {
+            let name_len = entry.name.len().min(100);
+            let mut result = DirEntry {
+                name: [0; 100],
+                name_len,
+                size: if entry.inode.is_directory() {
+                    0
+                } else {
+                    entry.inode.size.min(u64::from(u32::MAX)) as u32
+                },
+                is_dir: entry.inode.is_directory(),
+                is_symlink: entry.inode.is_symlink(),
+                mode: entry.inode.mode & 0x0fff,
+                mtime: u32::try_from(entry.inode.modified.seconds).unwrap_or(0),
+                node: u64::from(entry.inode.number),
+                mount_idx: 0,
+            };
+            result.name[..name_len].copy_from_slice(&entry.name[..name_len]);
+            output.push(result);
+        }
     }
 }
 
@@ -313,10 +293,18 @@ pub fn is_linux_root(volume: &Volume) -> bool {
 }
 
 impl Filesystem for PortableExt4Fs {
+    fn root_node(&self) -> Option<u64> {
+        self.filesystem
+            .borrow_mut()
+            .root(&mut *self.storage.borrow_mut())
+            .ok()
+            .map(|inode| u64::from(inode.number))
+    }
+
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let path = Self::path(path)?;
-        let inode = self.resolve(&path, true).ok()?;
-        if inode.is_directory() {
+        let inode = self.resolve(&path).ok()?;
+        if inode.is_directory() || inode.is_symlink() {
             return None;
         }
         Some(Vnode {
@@ -333,7 +321,7 @@ impl Filesystem for PortableExt4Fs {
             .borrow_mut()
             .inode(&mut *self.storage.borrow_mut(), number)
             .ok()?;
-        if inode.is_directory() {
+        if inode.is_directory() || inode.is_symlink() {
             return None;
         }
         Some(Vnode {
@@ -343,9 +331,12 @@ impl Filesystem for PortableExt4Fs {
         })
     }
 
-    fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
-        let path = Self::path(path)?;
-        let inode = self.resolve(&path, false).ok()?;
+    fn readlink_node(&self, node: u64, out: &mut [u8]) -> Option<usize> {
+        let inode = self
+            .filesystem
+            .borrow_mut()
+            .inode(&mut *self.storage.borrow_mut(), u32::try_from(node).ok()?)
+            .ok()?;
         let target = self
             .filesystem
             .borrow_mut()
@@ -356,9 +347,40 @@ impl Filesystem for PortableExt4Fs {
         Some(len)
     }
 
-    fn stat(&self, path: &[u8], follow_final: bool) -> Option<Stat> {
+    fn readdir_node(
+        &self,
+        node: u64,
+        cookie: u64,
+        output: &mut Vec<DirEntry>,
+        max: usize,
+    ) -> Option<u64> {
+        let mut filesystem = self.filesystem.borrow_mut();
+        let mut storage = self.storage.borrow_mut();
+        let directory = filesystem.inode(&mut *storage, u32::try_from(node).ok()?).ok()?;
+        let mut entries = Vec::new();
+        let next = filesystem
+            .list(&mut *storage, &directory, cookie, &mut entries, max)
+            .ok()?;
+        Self::append_directory_entries(output, entries);
+        next
+    }
+
+    fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
         let path = Self::path(path)?;
-        let inode = self.resolve(&path, follow_final).ok()?;
+        let inode = self.resolve(&path).ok()?;
+        let target = self
+            .filesystem
+            .borrow_mut()
+            .read_symlink(&mut *self.storage.borrow_mut(), &inode)
+            .ok()?;
+        let len = target.len().min(out.len());
+        out[..len].copy_from_slice(&target[..len]);
+        Some(len)
+    }
+
+    fn stat(&self, path: &[u8], _follow_final: bool) -> Option<Stat> {
+        let path = Self::path(path)?;
+        let inode = self.resolve(&path).ok()?;
         Some(Stat {
             size: inode.size.min(u64::from(u32::MAX)) as u32,
             mode: inode.mode & 0x0fff,
@@ -435,7 +457,7 @@ impl Filesystem for PortableExt4Fs {
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let path = Self::path(path)?;
-        let exists = self.resolve(&path, true).ok();
+        let exists = self.resolve(&path).ok();
         let success = if let Some(inode) = exists {
             !inode.is_directory()
                 && self.commit(64, |transaction, storage| {
@@ -443,7 +465,7 @@ impl Filesystem for PortableExt4Fs {
                 })
         } else {
             let (parent, name) = Self::split_parent(&path)?;
-            let parent = self.resolve(parent, true).ok()?;
+            let parent = self.resolve(parent).ok()?;
             self.commit(64, |transaction, storage| {
                 transaction
                     .create_file(storage, &parent, name.as_bytes(), 0o664)
@@ -453,7 +475,7 @@ impl Filesystem for PortableExt4Fs {
         if !success {
             return None;
         }
-        let inode = self.resolve(&path, true).ok()?;
+        let inode = self.resolve(&path).ok()?;
         Some(Vnode {
             handle: self.allocate_handle(inode),
             size: 0,
@@ -472,7 +494,7 @@ impl Filesystem for PortableExt4Fs {
         let Some((parent, name)) = Self::split_parent(&path) else {
             return -22;
         };
-        let Ok(parent) = self.resolve(parent, true) else {
+        let Ok(parent) = self.resolve(parent) else {
             return -2;
         };
         if self.commit(64, |transaction, storage| {
@@ -516,7 +538,7 @@ impl Filesystem for PortableExt4Fs {
         let Some((new_parent_path, new_name)) = Self::split_parent(&new_path) else {
             return -22;
         };
-        let Ok(new_parent) = self.resolve(new_parent_path, true) else {
+        let Ok(new_parent) = self.resolve(new_parent_path) else {
             return -2;
         };
         let destination = {
@@ -563,7 +585,7 @@ impl Filesystem for PortableExt4Fs {
         max: usize,
     ) -> Option<u64> {
         let path = Self::path(directory)?;
-        let directory = self.resolve(&path, true).ok()?;
+        let directory = self.resolve(&path).ok()?;
         let mut entries = Vec::new();
         let next = self
             .filesystem
@@ -576,39 +598,20 @@ impl Filesystem for PortableExt4Fs {
                 max,
             )
             .ok()?;
-        for entry in entries {
-            let name_len = entry.name.len().min(100);
-            let mut result = DirEntry {
-                name: [0; 100],
-                name_len,
-                size: if entry.inode.is_directory() {
-                    0
-                } else {
-                    entry.inode.size.min(u64::from(u32::MAX)) as u32
-                },
-                is_dir: entry.inode.is_directory(),
-                is_symlink: entry.inode.is_symlink(),
-                mode: entry.inode.mode & 0x0fff,
-                mtime: u32::try_from(entry.inode.modified.seconds).unwrap_or(0),
-                node: u64::from(entry.inode.number),
-                mount_idx: 0,
-            };
-            result.name[..name_len].copy_from_slice(&entry.name[..name_len]);
-            output.push(result);
-        }
+        Self::append_directory_entries(output, entries);
         next
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         Self::path(path).is_some_and(|path| {
-            self.resolve(&path, true)
+            self.resolve(&path)
                 .is_ok_and(|inode| inode.is_directory())
         })
     }
 
     fn mtime(&self, path: &[u8]) -> Option<u32> {
         let path = Self::path(path)?;
-        self.resolve(&path, true)
+        self.resolve(&path)
             .ok()
             .and_then(|inode| u32::try_from(inode.modified.seconds).ok())
     }
@@ -617,7 +620,7 @@ impl Filesystem for PortableExt4Fs {
         let Some(path) = Self::path(path) else {
             return false;
         };
-        let Ok(inode) = self.resolve(&path, true) else {
+        let Ok(inode) = self.resolve(&path) else {
             return false;
         };
         self.commit(4, |transaction, storage| {
@@ -636,7 +639,7 @@ impl Filesystem for PortableExt4Fs {
 
     fn meta(&self, path: &[u8]) -> Option<Meta> {
         let path = Self::path(path)?;
-        let inode = self.resolve(&path, true).ok()?;
+        let inode = self.resolve(&path).ok()?;
         Some(Meta {
             uid: inode.uid,
             gid: inode.gid,
@@ -651,7 +654,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok(permissions) = u16::try_from(mode & 0x0fff) else {
             return false;
         };
-        let Ok(inode) = self.resolve(&path, true) else {
+        let Ok(inode) = self.resolve(&path) else {
             return false;
         };
         self.commit(4, |transaction, storage| {
@@ -792,11 +795,7 @@ mod tests {
             &b"dir/absolute.link"[..],
             &b"dir/chained.link"[..],
         ] {
-            let vnode = fs.open(path).unwrap();
-            let mut contents = [0; 14];
-            assert_eq!(fs.read(vnode.handle, 0, &mut contents, vnode.size), 14);
-            assert_eq!(&contents, b"portable ext4\n");
-            fs.clunk(vnode.handle);
+            assert!(fs.open(path).is_none());
         }
         let mut target = [0; 32];
         let len = fs.readlink(b"dir/parent.link", &mut target).unwrap();
@@ -809,17 +808,12 @@ mod tests {
         assert!(!link_stat.is_dir);
         assert_eq!(link_stat.size, b"../root-data.bin".len() as u32);
         let target_stat = fs.stat(b"dir/parent.link", true).unwrap();
-        assert!(!target_stat.is_symlink);
-        assert!(!target_stat.is_dir);
-        assert_eq!(target_stat.size, 14);
+        assert!(target_stat.is_symlink);
+        assert_eq!(target_stat.size, b"../root-data.bin".len() as u32);
 
         let long_path = b"long-dir.link/hello.txt";
-        let vnode = fs.open(long_path).unwrap();
-        let mut contents = [0; 14];
-        assert_eq!(fs.read(vnode.handle, 0, &mut contents, vnode.size), 14);
-        assert_eq!(&contents, b"portable ext4\n");
-        fs.clunk(vnode.handle);
-        assert!(fs.dir_exists(b"long-dir.link"));
+        assert!(fs.open(long_path).is_none());
+        assert!(!fs.dir_exists(b"long-dir.link"));
 
         let mut root_entries = Vec::new();
         fs.readdir(b"", 0, &mut root_entries, 32);
@@ -829,7 +823,7 @@ mod tests {
             .unwrap();
         assert!(directory_link.is_symlink);
         assert!(!directory_link.is_dir);
-        assert!(fs.dir_exists(b"dir.link"));
+        assert!(!fs.dir_exists(b"dir.link"));
         let long_directory_link = root_entries
             .iter()
             .find(|entry| &entry.name[..entry.name_len] == b"long-dir.link")
