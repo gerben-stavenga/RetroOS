@@ -105,12 +105,11 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         );
         disks
     };
-
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let mut threads = crate::kernel::thread::init_threading();
-    crate::screenln!(screen, "Threading initialized");
+    crate::screenln!(screen => machine, &mut bios_workspace; "Threading initialized");
 
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
@@ -126,6 +125,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         .collect();
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
     let hostfs_is_root = mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    screen.present(machine, &mut bios_workspace);
     // A root mount must have an established backend/session. Later filesystem
     // operations retain their normal operation-driven reconnect behavior.
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
@@ -279,7 +279,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     match platform.audio {
         crate::kernel::platform::Audio::NativeSb
         | crate::kernel::platform::Audio::EmulatedSilent => {}
-        _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
+        _ => {
+            crate::screenln!(screen => machine, &mut bios_workspace;
+                "Loading General MIDI bank...");
+            crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+            crate::screenln!(screen => machine, &mut bios_workspace;
+                "General MIDI bank load complete");
+        }
     }
     // Take the selected output capability into runtime ownership. `None` is a
     // silent runtime, not a dummy sink.

@@ -210,6 +210,17 @@ impl Console {
         Self { display }
     }
 
+    /// Publish pending terminal cells immediately. Startup has no event loop
+    /// yet, so leaving the console merely dirty can keep every boot message in
+    /// shadow RAM until the display is handed to the first DOS program.
+    pub fn present<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    ) {
+        crate::kernel::term::present(machine, bios, &mut self.display);
+    }
+
     pub fn bios_display(&self) -> Option<&crate::kernel::platform::VgaCap> {
         self.display.vga_capability()
     }
@@ -222,7 +233,7 @@ impl Console {
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> (SuspendedCard, crate::kernel::display::Display) {
-        crate::kernel::term::present(machine, bios, &mut self.display);
+        self.present(machine, bios);
         (SuspendedCard, self.display)
     }
 

@@ -293,6 +293,16 @@ pub fn putchar(c: u8) {
 /// The only formatted path that draws on screen; everything else logs.
 #[macro_export]
 macro_rules! screenln {
+    ($screen:expr => $machine:expr, $bios:expr) => {{
+        use core::fmt::Write;
+        let _ = ::core::writeln!($screen);
+        $screen.present($machine, $bios);
+    }};
+    ($screen:expr => $machine:expr, $bios:expr; $($arg:tt)*) => {{
+        use core::fmt::Write;
+        let _ = ::core::writeln!($screen, $($arg)*);
+        $screen.present($machine, $bios);
+    }};
     ($screen:expr) => {{
         use core::fmt::Write;
         let _ = ::core::writeln!($screen);
@@ -302,4 +312,3 @@ macro_rules! screenln {
         let _ = ::core::writeln!($screen, $($arg)*);
     }};
 }
-
