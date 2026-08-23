@@ -81,7 +81,9 @@ impl WindowsState {
     pub fn process_key(&self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
         let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
-        if c != 0 { if let thread::FdKind::PipeRead(p) = fds[0] { crate::kernel::kpipe::write(p, &[c]); } }
+        if c != 0 && let thread::FdKind::PipeRead(p) = fds[0] {
+            crate::kernel::kpipe::write(p, &[c]);
+        }
     }
 }
 
