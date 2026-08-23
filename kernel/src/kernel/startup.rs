@@ -117,14 +117,25 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
 
     // Read every disk's partition table, then decide the mount tree from what
     // they declare. `plan_mounts` is a pure function of those facts.
+    crate::screenln!(screen => machine, &mut bios_workspace;
+        "Filesystems: scanning partition tables...");
     let parts: alloc::vec::Vec<_> = disks
         .iter()
         .flat_map(|&d| {
             crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d))
         })
         .collect();
+    crate::screenln!(screen => machine, &mut bios_workspace;
+        "Filesystems: {} partition(s) found", parts.len());
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
-    let hostfs_is_root = mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    let hostfs_is_root = mount_filesystems(
+        machine,
+        &mut bios_workspace,
+        &parts,
+        platform.hostfs,
+        &mut screen,
+        modules,
+    );
     screen.present(machine, &mut bios_workspace);
     // A root mount must have an established backend/session. Later filesystem
     // operations retain their normal operation-driven reconnect behavior.
@@ -346,7 +357,9 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
 /// Build the mount tree. The disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
 /// ordinary directory on whatever backs C:, not a mount of its own.
-fn mount_filesystems(
+fn mount_filesystems<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
@@ -356,6 +369,8 @@ fn mount_filesystems(
 
     // Ask the filesystem, don't trust the table: a partition holds ext when it
     // has an ext superblock, whatever type byte or GUID it carries.
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: probing ext superblocks...");
     let ext: alloc::vec::Vec<_> = parts
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
@@ -363,6 +378,8 @@ fn mount_filesystems(
         .map(crate::kernel::block::cache::volume)
         .filter(crate::kernel::fs::portable_ext4::is_ext)
         .collect();
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: {} ext partition(s)", ext.len());
 
     let mut hostfs_is_root = false;
     if modules.has_root {
@@ -391,9 +408,11 @@ fn mount_filesystems(
         }
     } else {
         let root = root_index(&ext);
-        crate::screenln!(screen, "ext4 root ({} MB)", ext[root].sectors / 2048);
+        crate::screenln!(screen => machine, bios_workspace;
+            "Mounting ext4 root ({} MB)...", ext[root].sectors / 2048);
         let fs = PortableExt4Fs::new(ext[root])
             .unwrap_or_else(|error| panic!("portable ext4 root mount failed: {}", error));
+        crate::screenln!(screen => machine, bios_workspace; "ext4 root mounted");
         let fs: &'static dyn vfs::Filesystem =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
         // The write grant is RetroOS's identity — the group owning its
