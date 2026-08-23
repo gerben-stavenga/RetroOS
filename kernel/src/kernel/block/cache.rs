@@ -18,10 +18,14 @@ const PAGE_LIMIT: usize = 512;
 /// Reused pages live here; the remainder is a probation window for one-pass
 /// traffic. A sequential file read therefore cannot evict hot metadata.
 const PROTECTED_LIMIT: usize = 384;
+/// Periodically decay frequency so a page that was hot during boot does not
+/// remain immortal after its workload has disappeared.
+const FREQUENCY_AGE_INTERVAL: u64 = PAGE_LIMIT as u64;
 
 struct Page {
     data: Box<[u8]>,
     used: u64,
+    hits: u16,
     protected: bool,
 }
 
@@ -75,6 +79,11 @@ impl CachedDisk {
         let now = self.clock.get().wrapping_add(1);
         self.clock.set(now);
         let mut pages = self.pages.borrow_mut();
+        if now.is_multiple_of(FREQUENCY_AGE_INTERVAL) {
+            for cached in pages.values_mut() {
+                cached.hits = (cached.hits / 2).max(1);
+            }
+        }
         if pages.contains_key(&page) {
             let promote = !pages.get(&page).is_some_and(|cached| cached.protected);
             if promote
@@ -82,13 +91,14 @@ impl CachedDisk {
                 && let Some(oldest) = pages
                     .iter()
                     .filter(|(candidate, cached)| **candidate != page && cached.protected)
-                    .min_by_key(|(_, cached)| cached.used)
+                    .min_by_key(|(_, cached)| (cached.hits, cached.used))
                     .map(|(&candidate, _)| candidate)
             {
                 pages.get_mut(&oldest).unwrap().protected = false;
             }
             let cached = pages.get_mut(&page).unwrap();
             cached.used = now;
+            cached.hits = cached.hits.saturating_add(1);
             cached.protected = true;
             return true;
         }
@@ -119,16 +129,17 @@ impl CachedDisk {
         if pages.len() == PAGE_LIMIT
             && let Some(oldest) = pages
                 .iter()
-                // Prefer one-touch pages. Only fall back to protected LRU if
-                // the cache has not accumulated a probation segment yet.
+                // Prefer low-frequency probation pages. Only fall back to the
+                // protected segment if no probation page exists; recency
+                // breaks ties between equally frequent pages.
                 .filter(|(_, cached)| !cached.protected)
-                .min_by_key(|(_, cached)| cached.used)
-                .or_else(|| pages.iter().min_by_key(|(_, cached)| cached.used))
+                .min_by_key(|(_, cached)| (cached.hits, cached.used))
+                .or_else(|| pages.iter().min_by_key(|(_, cached)| (cached.hits, cached.used)))
                 .map(|(&page, _)| page)
         {
             pages.remove(&oldest);
         }
-        pages.insert(page, Page { data, used: now, protected: false });
+        pages.insert(page, Page { data, used: now, hits: 1, protected: false });
         true
     }
 
@@ -196,7 +207,7 @@ impl Disk for CachedDisk {
 mod tests {
     extern crate std;
 
-    use super::{CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE};
+    use super::{CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE, PROTECTED_LIMIT};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -277,5 +288,33 @@ mod tests {
         let reads = inner.reads.get();
         assert_eq!(cache.read(0, &mut sector), 1);
         assert_eq!(inner.reads.get(), reads);
+    }
+
+    #[test]
+    fn frequency_outweighs_recency_when_protected_segment_is_full() {
+        let inner = Box::leak(Box::new(MemoryDisk {
+            bytes: RefCell::new(vec![0; (PROTECTED_LIMIT + 1) * PAGE_SIZE]),
+            reads: Cell::new(0),
+        }));
+        let cache = CachedDisk::wrap(inner);
+        let mut sector = [0; 512];
+
+        // Make page zero genuinely hot, then leave it older than every other
+        // protected page. Pure LRU would select it for demotion.
+        for _ in 0..20 {
+            assert_eq!(cache.read(0, &mut sector), 1);
+        }
+        for page in 1..PROTECTED_LIMIT {
+            let lba = page as u64 * PAGE_SECTORS;
+            assert_eq!(cache.read(lba, &mut sector), 1);
+            assert_eq!(cache.read(lba, &mut sector), 1);
+        }
+
+        // Promoting one more page forces a protected-page demotion. The old
+        // but frequently used page must win over newer two-touch pages.
+        let newcomer = PROTECTED_LIMIT as u64 * PAGE_SECTORS;
+        assert_eq!(cache.read(newcomer, &mut sector), 1);
+        assert_eq!(cache.read(newcomer, &mut sector), 1);
+        assert!(cache.pages.borrow().get(&0).is_some_and(|page| page.protected));
     }
 }
