@@ -20,7 +20,7 @@
 //! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
 //! `fs.open` is safe.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
@@ -39,7 +39,7 @@ const RAM_SENTINEL: u64 = u64::MAX;
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
-/// Filesystem trait — implemented by TarFs, Lwext4Fs, etc. POSIX-strict; the
+/// Filesystem trait — implemented by PortableExt4Fs, HostFs, etc. POSIX-strict; the
 /// DOS personality wraps this layer with its own case-folding cache (DFS).
 ///
 /// This is 9P-shaped: `open(path)` is a fused Twalk+Topen returning a fid
@@ -66,6 +66,64 @@ pub trait Filesystem {
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
 
+    /// Open an opaque node identity previously returned by `readdir`.
+    /// Backends without stable node identities retain path-based lookup.
+    fn open_node(&self, _node: u64) -> Option<Vnode> { None }
+
+    /// Decode the content of a symlink node. This exposes filesystem format;
+    /// interpreting the returned path belongs to the VFS.
+    fn readlink_node(&self, _node: u64, _out: &mut [u8]) -> Option<usize> { None }
+
+    /// Root identity and inode-based directory enumeration for filesystems
+    /// whose native interface is node-oriented.
+    fn root_node(&self) -> Option<u64> { None }
+    fn readdir_node(
+        &self,
+        _node: u64,
+        _cookie: u64,
+        _out: &mut Vec<DirEntry>,
+        _max: usize,
+    ) -> Option<u64> {
+        None
+    }
+
+    /// Read a symbolic link without following its final component.
+    /// Returns the number of target bytes copied (there is no trailing NUL).
+    fn readlink(&self, _path: &[u8], _out: &mut [u8]) -> Option<usize> {
+        None
+    }
+
+    /// Look up an object without allocating a persistent open handle.  This
+    /// keeps stat/lstat from doing separate directory, symlink, and file
+    /// probes, which is especially expensive for block-backed filesystems.
+    fn stat(&self, path: &[u8], follow_final: bool) -> Option<Stat> {
+        if !follow_final {
+            let mut target = [0u8; DIR_PATH_MAX];
+            if let Some(size) = self.readlink(path, &mut target) {
+                return Some(Stat {
+                    size: size as u32,
+                    mode: 0o777,
+                    is_dir: false,
+                    is_symlink: true,
+                    ino: 0,
+                });
+            }
+        }
+        if self.dir_exists(path) {
+            return Some(Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 });
+        }
+        let vnode = self.open(path)?;
+        let result = Stat {
+            size: vnode.size,
+            mode: vnode.mode,
+            is_dir: false,
+            is_symlink: false,
+            ino: 0,
+        };
+        self.clunk(vnode.handle);
+        Some(result)
+    }
+
     /// Read from a file identified by handle at given byte offset (Tread).
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32;
 
@@ -73,7 +131,7 @@ pub trait Filesystem {
     /// (`READDIR_START` begins a fresh enumeration). Returns the cookie to
     /// resume from, or `None` once the directory is exhausted.
     ///
-    /// The cookie is OPAQUE and filesystem-defined — lwext4 uses its raw
+    /// The cookie is OPAQUE and filesystem-defined — a backend may use its raw
     /// directory byte offset, tarfs a logical entry index. A caller may only
     /// ever pass back a value this same filesystem handed it; synthesizing
     /// one, or doing arithmetic on one, is meaningless.
@@ -100,7 +158,7 @@ pub trait Filesystem {
     /// This distinguishes the two very different meanings of `create → None`:
     /// a read-only backend (tarfs, klog — the default) has no create, so the
     /// VFS substitutes a RAM-backed file and the guest can scribble on C:\BOOT
-    /// harmlessly. A backend that DOES create (lwext4, hostfs) returning `None`
+    /// harmlessly. A backend that DOES create (portable ext4, hostfs) returning `None`
     /// means DENIED, and must surface to the guest as an error — silently
     /// handing it a RAM file would report success for a write that will never
     /// exist.
@@ -128,7 +186,7 @@ pub trait Filesystem {
     /// Release a fid (Tclunk). Called by the VFS when the last reference to an
     /// open file closes (`close_handle`). Default = no-op, for backends whose
     /// handle owns no per-open resource (TarFs's archive offset). Backends that
-    /// allocate per-open server state — lwext4's file handle, hostfs's COM1 /
+    /// allocate per-open server state — an ext inode, hostfs's COM1 /
     /// native fid, a future 9P client — override this to free it.
     fn clunk(&self, _handle: u64) {}
 
@@ -162,12 +220,28 @@ pub struct Vnode {
     pub mode: u16,
 }
 
+/// Path metadata used by stat-like calls. Unlike `Vnode`, this does not own a
+/// filesystem handle and can describe directories and symbolic links.
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub size: u32,
+    pub mode: u16,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    /// Stable VFS inode. Backends may leave this zero; the namespace layer
+    /// fills it from the resolved path.
+    pub ino: u64,
+}
+
 /// Directory entry returned by readdir
 pub struct DirEntry {
     pub name: [u8; 100],
     pub name_len: usize,
     pub size: u32,
     pub is_dir: bool,
+    /// The entry itself is a symbolic link. `is_dir` describes the entry,
+    /// not its target; personalities may choose whether links are transparent.
+    pub is_symlink: bool,
     /// POSIX permission bits (same convention as `Vnode::mode`).
     pub mode: u16,
     /// Last-modified time, seconds since the Unix epoch. `0` = unknown, which
@@ -175,6 +249,11 @@ pub struct DirEntry {
     /// hostfs wire) report; DOS renders that as an empty date rather than as
     /// 1970, which would look like a real timestamp.
     pub mtime: u32,
+    /// Opaque identity supplied by the backing filesystem. A zero identity
+    /// means that this backend supports path-based lookup only.
+    pub(crate) node: u64,
+    /// Filled by the VFS while merging a directory's mounted layers.
+    pub(crate) mount_idx: u8,
 }
 
 /// Stable inode from a path (FNV-1a, forced nonzero). Same path → same ino,
@@ -278,19 +357,21 @@ pub const READDIR_START: u64 = 0;
 /// far fewer opens: a 341-entry directory takes 6 calls instead of 341.
 const READDIR_BATCH: usize = 64;
 
-/// Single-directory readdir cache (avoids O(n²) re-scanning for sequential
-/// readdir). One directory cached at a time, growable so a flat dir with
-/// hundreds of entries doesn't get truncated.
+/// A directory listing owned by the namespace layer. Backends enumerate;
+/// name lookup is performed against these retained listings.
 struct DirCache {
-    dir: [u8; 96],
-    dir_len: usize,
+    dir: Vec<u8>,
     entries: Vec<DirEntry>,
-    valid: bool,
+    names: BTreeMap<Vec<u8>, usize>,
 }
 
 impl DirCache {
-    const fn new() -> Self {
-        DirCache { dir: [0; 96], dir_len: 0, entries: Vec::new(), valid: false }
+    fn new(dir: &[u8], entries: Vec<DirEntry>) -> Self {
+        let mut names = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            names.insert(entry.name[..entry.name_len].to_vec(), index);
+        }
+        Self { dir: dir.to_vec(), entries, names }
     }
 }
 
@@ -324,7 +405,7 @@ struct Vfs {
     locks: Vec<FileLock>,
     /// Global file table — slot is free when refcount == 0.
     file_table: [FileEntry; MAX_OPEN_FILES],
-    dir_cache: DirCache,
+    dir_cache: Vec<DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
     /// reported with its original zero size.
@@ -354,7 +435,7 @@ impl Vfs {
             mtimes: BTreeMap::new(),
             locks: Vec::new(),
             file_table: [EMPTY; MAX_OPEN_FILES],
-            dir_cache: DirCache::new(),
+            dir_cache: Vec::new(),
             dir_generation: 0,
         }
     }
@@ -587,8 +668,16 @@ impl Vfs {
     // ── dir cache ────────────────────────────────────────────────────────
 
     fn invalidate_dir_cache(&mut self) {
-        self.dir_cache.valid = false;
+        self.dir_cache.clear();
         self.dir_generation = self.dir_generation.wrapping_add(1);
+    }
+
+    fn cached_directory_node(&self, dir: &[u8], mount_idx: u8) -> Option<u64> {
+        let (parent, name) = split_parent_bytes(dir)?;
+        let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
+        let entry = cached.entries.get(*cached.names.get(name)?)?;
+        (entry.mount_idx == mount_idx && entry.node != 0 && entry.is_dir)
+            .then_some(entry.node)
     }
 
     /// Populate the directory cache for `dir` (single pass). Layers, top to
@@ -597,20 +686,18 @@ impl Vfs {
     /// RAM-first check), then the union stack of mounted filesystems (most-
     /// recent first), then synthesized mount/bind-point directories.
     fn populate_dir_cache(&mut self, dir: &[u8]) {
-        let dlen = dir.len().min(self.dir_cache.dir.len());
-        self.dir_cache.dir[..dlen].copy_from_slice(&dir[..dlen]);
-        self.dir_cache.dir_len = dlen;
-
         let mut entries: Vec<DirEntry> = Vec::new();
+        let mut visible_names: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
 
         // RAM overlay files (writable layer, highest priority).
         for (key, data) in self.ram_files.iter() {
             if let Some(basename) = entry_in_ram_dir(key, dir)
-                && !dir_entries_has(&entries, basename) {
+                && claim_visible_name(&mut visible_names, basename) {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: data.len() as u32,
-                    is_dir: false, mode: 0o644, mtime: 0,
+                    is_dir: false, is_symlink: false, mode: 0o644, mtime: 0,
+                    node: 0, mount_idx: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -620,11 +707,12 @@ impl Vfs {
         // RAM overlay directories.
         for key in self.ram_dirs.iter() {
             if let Some(basename) = entry_in_ram_dir(key, dir)
-                && !dir_entries_has(&entries, basename) {
+                && claim_visible_name(&mut visible_names, basename) {
                 let len = basename.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len: len, size: 0,
-                    is_dir: true, mode: 0o755, mtime: 0,
+                    is_dir: true, is_symlink: false, mode: 0o755, mtime: 0,
+                    node: 0, mount_idx: 0,
                 };
                 de.name[..len].copy_from_slice(&basename[..len]);
                 entries.push(de);
@@ -634,14 +722,24 @@ impl Vfs {
         // Union merge: visit every member of the group in priority order (most
         // recent first); an upper layer shadows a lower one on a name clash.
         // For a Replace group this is just the one backing fs (== old behavior).
-        self.resolve_members(dir, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+        self.resolve_members(dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
             let mut batch: Vec<DirEntry> = Vec::new();
             let mut cookie = READDIR_START;
+            let directory_node = if subpath.is_empty() {
+                fs.root_node()
+            } else {
+                self.cached_directory_node(dir, idx)
+            };
             loop {
                 batch.clear();
-                let next = fs.readdir(subpath, cookie, &mut batch, READDIR_BATCH);
-                for e in batch.drain(..) {
-                    if !dir_entries_has(&entries, &e.name[..e.name_len]) {
+                let next = if let Some(node) = directory_node {
+                    fs.readdir_node(node, cookie, &mut batch, READDIR_BATCH)
+                } else {
+                    fs.readdir(subpath, cookie, &mut batch, READDIR_BATCH)
+                };
+                for mut e in batch.drain(..) {
+                    e.mount_idx = idx;
+                    if claim_visible_name(&mut visible_names, &e.name[..e.name_len]) {
                         entries.push(e);
                     }
                 }
@@ -660,34 +758,157 @@ impl Vfs {
         // Synthesize mount/bind-point directories that live directly under `dir`.
         for b in &self.mounts {
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
-                && !dir_entries_has(&entries, name) {
+                && claim_visible_name(&mut visible_names, name) {
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
-                    name: [0; 100], name_len, size: 0, is_dir: true, mode: 0o755,
+                    name: [0; 100], name_len, size: 0, is_dir: true,
+                    is_symlink: false, mode: 0o755,
                     mtime: 0,
+                    node: 0,
+                    mount_idx: 0,
                 };
                 de.name[..name_len].copy_from_slice(&name[..name_len]);
                 entries.push(de);
             }
         }
 
-        self.dir_cache.entries = entries;
-        self.dir_cache.valid = true;
+        self.dir_cache.push(DirCache::new(dir, entries));
     }
 
     fn readdir(&mut self, dir: &[u8], index: usize) -> Option<DirEntry> {
-        let stale = !self.dir_cache.valid
-            || self.dir_cache.dir_len != dir.len()
-            || self.dir_cache.dir[..self.dir_cache.dir_len] != *dir;
-        if stale {
+        if !self.dir_cache.iter().any(|cached| cached.dir == dir) {
             self.populate_dir_cache(dir);
         }
-        self.dir_cache.entries.get(index).map(clone_dir_entry)
+        self.dir_cache
+            .iter()
+            .find(|cached| cached.dir == dir)
+            .and_then(|cached| cached.entries.get(index))
+            .map(clone_dir_entry)
     }
 
-    fn dir_exists(&self, path: &[u8]) -> bool {
+    fn cached_child(&mut self, parent: &[u8], name: &[u8]) -> Option<DirEntry> {
+        if !self.dir_cache.iter().any(|cached| cached.dir == parent) {
+            self.populate_dir_cache(parent);
+        }
+        let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
+        Some(clone_dir_entry(cached.entries.get(*cached.names.get(name)?)?))
+    }
+
+    fn readlink_entry(&self, path: &[u8], entry: &DirEntry, out: &mut [u8]) -> Option<usize> {
+        if entry.node != 0
+            && let Some(len) = self.mount_fs(entry.mount_idx).readlink_node(entry.node, out)
+        {
+            return Some(len);
+        }
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            fs.readlink(subpath, out)
+        })
+    }
+
+    /// Expand symlinks as namespace objects. Backends only expose link bytes;
+    /// relative/absolute interpretation, `..`, mount crossing, and the loop
+    /// limit all live here.
+    fn resolve_symlinks(&mut self, path: &[u8], follow_final: bool) -> Option<Vec<u8>> {
+        if path.contains(&0) {
+            return None;
+        }
+        let mut resolved: Vec<Vec<u8>> = Vec::new();
+        let mut pending: VecDeque<Vec<u8>> = path
+            .split(|byte| *byte == b'/')
+            .filter(|component| !component.is_empty() && *component != b".")
+            .map(|component| component.to_vec())
+            .collect();
+        let mut links = 0;
+        while !pending.is_empty() {
+            let component = pending.pop_front()?;
+            if component == b".." {
+                resolved.pop();
+                continue;
+            }
+            let parent = join_path_components(&resolved);
+            let entry = self.cached_child(&parent, &component)?;
+            let is_final = pending.is_empty();
+            if entry.is_symlink && (follow_final || !is_final) {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let mut candidate = parent;
+                if !candidate.is_empty() {
+                    candidate.push(b'/');
+                }
+                candidate.extend_from_slice(&entry.name[..entry.name_len]);
+                let mut target = [0u8; DIR_PATH_MAX];
+                let len = self.readlink_entry(&candidate, &entry, &mut target)?;
+                if len == 0 || target[..len].contains(&0) {
+                    return None;
+                }
+                if target[..len].first() == Some(&b'/') {
+                    resolved.clear();
+                }
+                let mut expanded: VecDeque<Vec<u8>> = target[..len]
+                    .split(|byte| *byte == b'/')
+                    .filter(|part| !part.is_empty() && *part != b".")
+                    .map(|part| part.to_vec())
+                    .collect();
+                expanded.append(&mut pending);
+                pending = expanded;
+                continue;
+            }
+            resolved.push(entry.name[..entry.name_len].to_vec());
+        }
+        Some(join_path_components(&resolved))
+    }
+
+    fn resolve_parent_symlinks(&mut self, path: &[u8]) -> Option<Vec<u8>> {
+        let (parent, name) = split_parent_bytes(path)?;
+        if name.is_empty() || name == b"." || name == b".." {
+            return None;
+        }
+        let mut resolved = self.resolve_symlinks(parent, true)?;
+        if !resolved.is_empty() {
+            resolved.push(b'/');
+        }
+        resolved.extend_from_slice(name);
+        Some(resolved)
+    }
+
+    /// Resolve the last path component from VFS-owned directory listings and,
+    /// when the backend supplied a stable identity, open it without asking the
+    /// backend to repeat name lookup.
+    fn open_cached_node(&mut self, path: &[u8]) -> Option<(u8, Vnode, Vec<u8>)> {
+        let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(separator) => (&path[..separator], &path[separator + 1..]),
+            None => (&b""[..], path),
+        };
+        if name.is_empty() {
+            return None;
+        }
+        let entry = {
+            self.cached_child(parent, name)?
+        };
+        // Resolution has already removed followed links. Directories are not
+        // openable files; an unfollowed final link belongs to lstat/readlink.
+        if entry.node == 0 || entry.is_dir || entry.is_symlink {
+            return None;
+        }
+        let subpath = self.resolve_members(path, ALIAS_DEPTH, &mut |idx, _fs, subpath| {
+            (idx == entry.mount_idx).then(|| subpath.to_vec())
+        })?;
+        let vnode = self.mount_fs(entry.mount_idx).open_node(entry.node)?;
+        Some((entry.mount_idx, vnode, subpath))
+    }
+
+    fn dir_exists(&mut self, path: &[u8]) -> bool {
+        let Some(path) = self.resolve_symlinks(path, true) else { return false };
+        let path = path.as_slice();
         if self.ram_dirs.contains(path) {
             return true;
+        }
+        if let Some((parent, name)) = split_parent_bytes(path)
+            && let Some(entry) = self.cached_child(parent, name)
+        {
+            return entry.is_dir;
         }
         // True if any member of the group has this dir. A mount root (and the
         // VFS root) is structurally a directory — a member with an empty
@@ -699,10 +920,74 @@ impl Vfs {
         }).is_some()
     }
 
+    fn readlink(&mut self, path: &[u8], out: &mut [u8]) -> Option<usize> {
+        let resolved = self.resolve_symlinks(path, false)?;
+        let (parent, name) = split_parent_bytes(&resolved)?;
+        let entry = self.cached_child(parent, name)?;
+        if !entry.is_symlink {
+            return None;
+        }
+        self.readlink_entry(&resolved, &entry, out)
+    }
+
+    fn stat(&mut self, path: &[u8], follow_final: bool) -> Option<Stat> {
+        let resolved = self.resolve_symlinks(path, follow_final)?;
+        let path = resolved.as_slice();
+        if let Some(data) = self.ram_files.get(path) {
+            return Some(Stat {
+                size: data.len().min(u32::MAX as usize) as u32,
+                mode: self.modes.get(path).copied().unwrap_or(0o644) as u16,
+                is_dir: false,
+                is_symlink: false,
+                ino: path_ino(path),
+            });
+        }
+        if self.ram_dirs.contains(path) {
+            return Some(Stat {
+                size: 0,
+                mode: self.modes.get(path).copied().unwrap_or(0o755) as u16,
+                is_dir: true,
+                is_symlink: false,
+                ino: path_ino(path),
+            });
+        }
+        let override_mode = self.modes.get(path).copied();
+        if let Some((parent, name)) = split_parent_bytes(path)
+            && let Some(entry) = self.cached_child(parent, name)
+        {
+            return Some(Stat {
+                size: entry.size,
+                mode: override_mode.unwrap_or(u32::from(entry.mode)) as u16,
+                is_dir: entry.is_dir,
+                is_symlink: entry.is_symlink,
+                ino: path_ino(path),
+            });
+        }
+        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
+            let mut stat = if subpath.is_empty() {
+                Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 }
+            } else {
+                fs.stat(subpath, false)?
+            };
+            if let Some(mode) = override_mode {
+                stat.mode = mode as u16;
+            }
+            if stat.ino == 0 {
+                stat.ino = path_ino(path);
+            }
+            Some(stat)
+        })
+    }
+
     fn mkdir(&mut self, path: &[u8]) -> i32 {
         if self.dir_exists(path) {
             return -17; // EEXIST
         }
+        let resolved = match self.resolve_parent_symlinks(path) {
+            Some(path) => path,
+            None => return -2,
+        };
+        let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
         if fs.supports_mkdir() {
             if !self.may_write_parent(midx, subpath) {
@@ -723,6 +1008,12 @@ impl Vfs {
     // ── open / create / read / write / seek ──────────────────────────────
 
     fn open_to_handle(&mut self, path: &[u8]) -> i32 {
+        let original_ino = path_ino(path);
+        let resolved_path = match self.resolve_symlinks(path, true) {
+            Some(path) => path,
+            None => return -2,
+        };
+        let path = resolved_path.as_slice();
         // Check RAM overlay first.
         if let Some(data) = self.ram_files.get(path) {
             let size = data.len() as u32;
@@ -735,7 +1026,7 @@ impl Vfs {
             ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
             self.file_table[table_idx] = FileEntry {
                 vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
-                ino: path_ino(path),
+                ino: original_ino,
                 offset: 0,
                 refcount: 1,
                 mount_idx: 0,
@@ -756,9 +1047,12 @@ impl Vfs {
         // Carry the subpath out too: the write verdict must be taken against
         // the member that actually opened the file, not against whatever
         // `resolve_head` would pick.
-        let (midx, vnode, sub) = match self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
-            fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
-        }) {
+        let resolved = self.open_cached_node(path).or_else(|| {
+            self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+                fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
+            })
+        });
+        let (midx, vnode, sub) = match resolved {
             Some(x) => x,
             None => return -2,
         };
@@ -772,7 +1066,7 @@ impl Vfs {
         path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         self.file_table[table_idx] = FileEntry {
             vnode,
-            ino: path_ino(path),
+            ino: original_ino,
             offset: 0,
             refcount: 1,
             mount_idx: midx,
@@ -788,6 +1082,12 @@ impl Vfs {
     }
 
     fn create_to_handle(&mut self, path: &[u8]) -> i32 {
+        let original_ino = path_ino(path);
+        let resolved = self
+            .resolve_symlinks(path, true)
+            .or_else(|| self.resolve_parent_symlinks(path));
+        let Some(resolved) = resolved else { return -2 };
+        let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
         // The check applies only to filesystems that can really create. One
         // that cannot (a TAR) falls through to the RAM overlay below, exactly
@@ -821,7 +1121,7 @@ impl Vfs {
             path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
             self.file_table[table_idx] = FileEntry {
                 vnode,
-                ino: path_ino(path),
+                ino: original_ino,
                 offset: 0,
                 refcount: 1,
                 mount_idx: midx,
@@ -854,7 +1154,7 @@ impl Vfs {
         ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
         self.file_table[table_idx] = FileEntry {
             vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
-            ino: path_ino(path),
+            ino: original_ino,
             offset: 0,
             refcount: 1,
             mount_idx: 0,
@@ -868,6 +1168,8 @@ impl Vfs {
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
+        let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
+        let path = resolved.as_slice();
         if self.ram_dirs.contains(path) {
             let mut prefix = path.to_vec();
             prefix.push(b'/');
@@ -896,6 +1198,10 @@ impl Vfs {
     }
 
     fn rename(&mut self, old: &[u8], new: &[u8]) -> i32 {
+        let Some(old_resolved) = self.resolve_parent_symlinks(old) else { return -2 };
+        let Some(new_resolved) = self.resolve_parent_symlinks(new) else { return -2 };
+        let old = old_resolved.as_slice();
+        let new = new_resolved.as_slice();
         if self.path_exists(new) { return -17; }
         if self.ram_files.contains_key(old) {
             let data = self.ram_files.remove(old).unwrap();
@@ -949,16 +1255,25 @@ impl Vfs {
         }
     }
 
-    fn path_exists(&self, path: &[u8]) -> bool {
+    fn path_exists(&mut self, path: &[u8]) -> bool {
+        let Some(resolved) = self.resolve_symlinks(path, true) else { return false };
+        let path = resolved.as_slice();
         if self.ram_files.contains_key(path) || self.ram_dirs.contains(path) { return true; }
-        if self.dir_exists(path) { return true; }
+        if let Some((parent, name)) = split_parent_bytes(path)
+            && self.cached_child(parent, name).is_some()
+        {
+            return true;
+        }
+        if path.is_empty() { return true; }
         self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
             fs.open(subpath).map(|v| { fs.clunk(v.handle); })
         }).is_some()
     }
 
-    fn path_mode(&self, path: &[u8]) -> Option<(u32, bool)> {
+    fn path_mode(&mut self, path: &[u8]) -> Option<(u32, bool)> {
         if !self.path_exists(path) { return None; }
+        let resolved = self.resolve_symlinks(path, true)?;
+        let path = resolved.as_slice();
         let is_dir = self.dir_exists(path);
         if let Some(&mode) = self.modes.get(path) { return Some((mode, is_dir)); }
         if self.ram_files.contains_key(path) { return Some((0o644, false)); }
@@ -973,6 +1288,8 @@ impl Vfs {
 
     fn set_path_mode(&mut self, path: &[u8], mode: u32) -> i32 {
         if !self.path_exists(path) { return -2; }
+        let Some(resolved) = self.resolve_symlinks(path, true) else { return -2 };
+        let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
         if fs.meta(subpath).is_some() && !self.may_write(midx, subpath) { return -13; }
         if let Some(m) = fs.meta(subpath)
@@ -1012,6 +1329,8 @@ impl Vfs {
     }
 
     fn delete(&mut self, path: &[u8]) -> i32 {
+        let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
+        let path = resolved.as_slice();
         if self.ram_files.remove(path).is_some() {
             self.invalidate_dir_cache();
             return 0;
@@ -1205,8 +1524,8 @@ impl Vfs {
 }
 
 // `Vfs` holds `&'static dyn Filesystem`, and some backends are not thread-safe
-// in isolation (the lwext4 wrapper uses `RefCell`, and lwext4's C state is
-// single-threaded). This `Send` is nonetheless sound — and SMP-correct, not a
+// in isolation (the portable ext4 wrapper uses `RefCell`). This `Send` is
+// nonetheless sound — and SMP-correct, not a
 // single-core assumption — because *every* filesystem access goes through
 // `&mut self` while the VFS `spin::Mutex` is held, so no filesystem (and no
 // `Rc` refcount) is ever touched by two cores at once. The lock serializes all
@@ -1260,10 +1579,10 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
     }
 }
 
-/// Case-insensitive membership test over already-collected dir entries — the
-/// union-merge shadow rule (a name from a higher layer hides it below).
-fn dir_entries_has(entries: &[DirEntry], name: &[u8]) -> bool {
-    entries.iter().any(|e| eq_ignore_case(&e.name[..e.name_len], name))
+/// Claim a case-folded name for union merging. The first (highest) layer wins.
+fn claim_visible_name(names: &mut BTreeMap<Vec<u8>, ()>, name: &[u8]) -> bool {
+    let folded = name.iter().map(u8::to_ascii_lowercase).collect();
+    names.insert(folded, ()).is_none()
 }
 
 fn clone_dir_entry(e: &DirEntry) -> DirEntry {
@@ -1272,28 +1591,50 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         name_len: e.name_len,
         size: e.size,
         is_dir: e.is_dir,
+        is_symlink: e.is_symlink,
         mode: e.mode,
         mtime: e.mtime,
+        node: e.node,
+        mount_idx: e.mount_idx,
     }
+}
+
+fn join_path_components(components: &[Vec<u8>]) -> Vec<u8> {
+    let capacity = components.iter().map(Vec::len).sum::<usize>()
+        .saturating_add(components.len().saturating_sub(1));
+    let mut path = Vec::with_capacity(capacity);
+    for component in components {
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(component);
+    }
+    path
+}
+
+fn split_parent_bytes(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    if path.is_empty() {
+        return None;
+    }
+    Some(match path.iter().rposition(|byte| *byte == b'/') {
+        Some(separator) => (&path[..separator], &path[separator + 1..]),
+        None => (&b""[..], path),
+    })
 }
 
 /// If a mount prefix is a direct child of `dir`, return the child name.
 /// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
 fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    if prefix.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&prefix[..dir.len()], dir) { return None; }
-    let rest = &prefix[dir.len()..];
-    let name = rest.strip_suffix(b"/")?;
-    if name.is_empty() || name.contains(&b'/') { return None; }
-    Some(name)
+    let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+    let (parent, name) = split_parent_bytes(prefix)?;
+    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
 }
 
 fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    if entry_name.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
-    let rest = &entry_name[dir.len()..];
-    if rest.contains(&b'/') { return None; }
-    Some(rest)
+    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+    let (parent, name) = split_parent_bytes(entry_name)?;
+    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
 }
 
 // ============================================================================
@@ -1495,7 +1836,9 @@ pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
 
 /// Enumerate directory entries at index. Uses a single-pass cache.
 pub fn readdir(dir: &[u8], index: usize) -> Option<DirEntry> {
-    VFS.lock().readdir(dir, index)
+    let mut vfs = VFS.lock();
+    let resolved = vfs.resolve_symlinks(dir, true)?;
+    vfs.readdir(&resolved, index)
 }
 
 /// Namespace/metadata generation used by personality-level directory caches.
@@ -1512,6 +1855,17 @@ pub fn mounted_media_changed() {
 /// Check if a directory exists on a mounted filesystem.
 pub fn dir_exists(path: &[u8]) -> bool {
     VFS.lock().dir_exists(path)
+}
+
+/// Read a symbolic-link target without following the final path component.
+pub fn readlink(path: &[u8], out: &mut [u8]) -> Option<usize> {
+    VFS.lock().readlink(path, out)
+}
+
+/// Fetch path metadata with either stat (follow final link) or lstat
+/// semantics in one backing-filesystem lookup.
+pub fn stat(path: &[u8], follow_final: bool) -> Option<Stat> {
+    VFS.lock().stat(path, follow_final)
 }
 
 /// If `parent/<name>` (case-insensitive) is a mount point, return its directory
@@ -1688,12 +2042,17 @@ impl BackingFile {
 /// Only real files on a Server mount resolve (a RAM-overlay scratch file
 /// does not) — media images are real catalogue files by construction.
 pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
-    let (fs, subpath_start) = {
-        let vfs = VFS.lock();
-        let (_midx, fs, subpath) = vfs.resolve_head(path);
-        (fs, path.len() - subpath.len())
-    };
-    let vnode = fs.open(&path[subpath_start..])?;
+    let mut vfs = VFS.lock();
+    let resolved = vfs.resolve_symlinks(path, true)?;
+    if let Some((mount_idx, vnode, _)) = vfs.open_cached_node(&resolved) {
+        return Some(BackingFile {
+            fs: vfs.mount_fs(mount_idx),
+            handle: vnode.handle,
+            size: vnode.size,
+        });
+    }
+    let (_mount_idx, fs, subpath) = vfs.resolve_head(&resolved);
+    let vnode = fs.open(subpath)?;
     Some(BackingFile { fs, handle: vnode.handle, size: vnode.size })
 }
 
@@ -1727,11 +2086,17 @@ pub fn file_mode_by_handle(handle: i32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirEntry, Filesystem, Vfs, Vnode, WriteAccess};
+    use super::{
+        DirEntry, Filesystem, Vfs, Vnode, WriteAccess, entry_in_ram_dir,
+        mount_child_in_dir,
+    };
     use alloc::vec::Vec;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     static CREATE_CALLED: AtomicBool = AtomicBool::new(false);
+    static READDIR_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static PATH_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static NODE_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     struct FailingCreateFs;
     static FAILING_CREATE_FS: FailingCreateFs = FailingCreateFs;
@@ -1773,5 +2138,137 @@ mod tests {
         assert_eq!(vfs.create_to_handle(b"failed.txt"), -13);
         assert!(CREATE_CALLED.load(Ordering::Relaxed));
         assert!(!vfs.ram_files.contains_key(b"failed.txt".as_slice()));
+    }
+
+    #[test]
+    fn nested_mounts_and_ram_entries_accept_normalized_directory_paths() {
+        assert_eq!(
+            mount_child_in_dir(b"home/retroos/proc/", b"home/retroos"),
+            Some(&b"proc"[..]),
+        );
+        assert_eq!(
+            mount_child_in_dir(b"home/retroos/proc/", b"home/retroos/"),
+            Some(&b"proc"[..]),
+        );
+        assert_eq!(
+            entry_in_ram_dir(b"home/retroos/scratch", b"home/retroos"),
+            Some(&b"scratch"[..]),
+        );
+    }
+
+    struct NodeFs;
+    static NODE_FS: NodeFs = NodeFs;
+
+    impl Filesystem for NodeFs {
+        fn root_node(&self) -> Option<u64> { Some(2) }
+
+        fn open(&self, _path: &[u8]) -> Option<Vnode> {
+            PATH_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+
+        fn open_node(&self, node: u64) -> Option<Vnode> {
+            NODE_OPEN_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(Vnode { handle: node, size: 1, mode: 0o444 })
+        }
+
+        fn readlink_node(&self, node: u64, out: &mut [u8]) -> Option<usize> {
+            let target = match node {
+                13 => b"one".as_slice(),
+                21 => b"dir".as_slice(),
+                _ => return None,
+            };
+            if out.len() < target.len() { return None; }
+            out[..target.len()].copy_from_slice(target);
+            Some(target.len())
+        }
+
+        fn read(&self, _handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 { 0 }
+
+        fn readdir(
+            &self,
+            dir: &[u8],
+            cookie: u64,
+            out: &mut Vec<DirEntry>,
+            _max: usize,
+        ) -> Option<u64> {
+            READDIR_CALLS.fetch_add(1, Ordering::Relaxed);
+            if cookie != 0 {
+                return None;
+            }
+            let entries: &[(&[u8], u64, bool, bool)] = match dir {
+                b"" => &[
+                    (b"one", 11, false, false),
+                    (b"two", 12, false, false),
+                    (b"link", 13, true, false),
+                    (b"dir", 20, false, true),
+                    (b"dlink", 21, true, false),
+                ],
+                b"dir" => &[(b"child", 22, false, false)],
+                _ => return None,
+            };
+            for &(name, node, is_symlink, is_dir) in entries {
+                let mut entry = DirEntry {
+                    name: [0; 100], name_len: name.len(), size: 1,
+                    is_dir, is_symlink, mode: 0o444, mtime: 0,
+                    node, mount_idx: 0,
+                };
+                entry.name[..name.len()].copy_from_slice(name);
+                out.push(entry);
+            }
+            None
+        }
+
+        fn readdir_node(
+            &self,
+            node: u64,
+            cookie: u64,
+            out: &mut Vec<DirEntry>,
+            max: usize,
+        ) -> Option<u64> {
+            match node {
+                2 => self.readdir(b"", cookie, out, max),
+                20 => self.readdir(b"dir", cookie, out, max),
+                _ => None,
+            }
+        }
+
+        fn dir_exists(&self, path: &[u8]) -> bool { path.is_empty() }
+    }
+
+    #[test]
+    fn opens_nodes_from_one_vfs_owned_directory_listing() {
+        READDIR_CALLS.store(0, Ordering::Relaxed);
+        PATH_OPEN_CALLS.store(0, Ordering::Relaxed);
+        NODE_OPEN_CALLS.store(0, Ordering::Relaxed);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &NODE_FS);
+
+        assert!(vfs.open_to_handle(b"one") >= 0);
+        assert!(vfs.open_to_handle(b"two") >= 0);
+        assert_eq!(READDIR_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(NODE_OPEN_CALLS.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn vfs_interprets_symlink_content_and_opens_its_target_node() {
+        READDIR_CALLS.store(0, Ordering::Relaxed);
+        PATH_OPEN_CALLS.store(0, Ordering::Relaxed);
+        NODE_OPEN_CALLS.store(0, Ordering::Relaxed);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &NODE_FS);
+
+        let handle = vfs.open_to_handle(b"link");
+        assert!(handle >= 0);
+        assert_eq!(vfs.file_table[handle as usize].vnode.handle, 11);
+        assert_eq!(READDIR_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(NODE_OPEN_CALLS.load(Ordering::Relaxed), 1);
+
+        let nested = vfs.open_to_handle(b"dlink/child");
+        assert!(nested >= 0);
+        assert_eq!(vfs.file_table[nested as usize].vnode.handle, 22);
+        assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
     }
 }

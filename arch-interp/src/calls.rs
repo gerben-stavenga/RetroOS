@@ -150,7 +150,7 @@ pub fn arch_set_tls_entry(index: i32, base: u32, limit: u32, _limit_in_pages: bo
     crate::desc::set_tls_entry(index, base, limit)
 }
 
-/// Allocate ISA-DMA-safe physically-contiguous pages; returns start page or 0.
+/// Allocate physically contiguous DMA pages; returns start page or 0.
 pub fn arch_alloc_phys_contig(num_pages: usize, _boundary_log2: u32) -> u64 {
     // The phys backing is a sparse memfd with a bump allocator; boundary
     // alignment is irrelevant (no real DMA engine reads these on the interp).

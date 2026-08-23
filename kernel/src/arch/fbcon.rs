@@ -78,6 +78,15 @@ pub fn present() {
     unsafe { core::arch::asm!("sfence", options(nostack, preserves_flags)) };
 }
 
+/// Best-effort panic publication.  Reconstructing this immutable view does
+/// not participate in normal display ownership: the running system is already
+/// gone, and the panic handler only needs the mapped linear sink.
+pub fn panic_present() {
+    if let Some(mut display) = framebuffer() {
+        crate::kernel::term::panic_present(&mut display);
+    }
+}
+
 /// Early hook, called by `boot_kernel` before the first `println!`: if the
 /// bootloader handed us a linear RGB framebuffer (i.e. there is no VGA text
 /// mode to write to), repoint the console's cell buffer at RAM. The pixel

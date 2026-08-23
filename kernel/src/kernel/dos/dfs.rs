@@ -95,10 +95,23 @@ pub mod ci {
         while let Some(e) = vfs::readdir(&readdir_key, idx) {
             let original = e.name[..e.name_len].to_vec();
             let alias = compute_alias_8_3(&original, &entries);
+            // DOS has no symbolic-link file type. Present a link to a
+            // directory as the directory it resolves to, otherwise file
+            // managers such as DN/NC render it as a file and refuse to enter
+            // it even though CHDIR on the same path succeeds.
+            let is_dir = if e.is_dir {
+                true
+            } else if e.is_symlink {
+                let mut child = readdir_key.clone();
+                child.extend_from_slice(&original);
+                vfs::dir_exists(&child)
+            } else {
+                false
+            };
             entries.push((alias, Entry {
                 original,
                 size: e.size,
-                is_dir: e.is_dir,
+                is_dir,
                 mtime: e.mtime,
             }));
             idx += 1;

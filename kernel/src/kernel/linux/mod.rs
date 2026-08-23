@@ -329,12 +329,12 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         180 => sys_pread64(machine, kt, a),
         55  => sys_fcntl(kt, a),
         63  => sys_dup2(kt, a),
-        85  => sys_readlink(machine, &mut kt.vcpu, a),
+        85  => sys_readlink(machine, linux, a),
         // Old i386 struct stat — 64-byte layout. busybox/uclibc still uses
         // these and falls back from stat64; without them mode comes back
         // zero and access(X_OK) reports "Permission denied".
-        106 => sys_stat_old(machine, &mut kt.vcpu, linux, a),
-        107 => sys_stat_old(machine, &mut kt.vcpu, linux, a), // lstat — no symlinks, treat as stat
+        106 => sys_stat_old(machine, &mut kt.vcpu, linux, a, true),
+        107 => sys_stat_old(machine, &mut kt.vcpu, linux, a, false),
         108 => sys_fstat_old(machine, kt, a),
         91  => sys_munmap(linux, a),
         114 => sys_wait4(machine, kt, a, regs),
@@ -352,8 +352,8 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         183 => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         186 => SyscallResult::val(0),
         192 => sys_mmap2(machine, kt, linux, a, (a.a5 as usize) << 12), // mmap2: offset in 4K pages
-        195 => sys_stat64(machine, &mut kt.vcpu, linux, a, false),
-        196 => sys_stat64(machine, &mut kt.vcpu, linux, a, false),
+        195 => sys_stat64(machine, &mut kt.vcpu, linux, a, false, true),
+        196 => sys_stat64(machine, &mut kt.vcpu, linux, a, false, false),
         197 => sys_fstat64(machine, kt, a, false),
         220 => sys_getdents64(machine, kt, linux, a),
         221 => sys_fcntl(kt, a),
@@ -386,9 +386,9 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         1   => sys_write(machine, kt, a),
         2   => sys_open(machine, kt, linux, a),
         3   => sys_close(kt, a),
-        4   => sys_stat64(machine, &mut kt.vcpu, linux, a, true),
+        4   => sys_stat64(machine, &mut kt.vcpu, linux, a, true, true),
         5   => sys_fstat64(machine, kt, a, true),
-        6   => sys_stat64(machine, &mut kt.vcpu, linux, a, true),
+        6   => sys_stat64(machine, &mut kt.vcpu, linux, a, true, false),
         7   => sys_poll(machine, kt, linux, a, regs),
         8   => sys_lseek(kt, a),
         9   => sys_mmap2(machine, kt, linux, a, a.a5 as usize), // mmap: offset in bytes
@@ -424,7 +424,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
-        89  => SyscallResult::val(-ENOENT),
+        89  => sys_readlink(machine, linux, a),
         96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
@@ -446,7 +446,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         234 => sys_exit(machine, tid, a),
         257 => sys_openat(machine, kt, linux, a),
         262 => sys_fstatat64(machine, kt, linux, a, true),
-        267 => SyscallResult::val(-ENOENT),
+        267 => sys_readlinkat(machine, kt, linux, a),
         269 => sys_faccessat(machine, linux, a),
         273 => SyscallResult::val(0),       // set_robust_list — no threads share
         293 => sys_pipe(machine, kt, a, true),
@@ -1314,14 +1314,15 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     }
 }
 
-/// readlink(85) — minimal stub: only resolves /proc/self/exe (used by
-/// static-busybox to find its own re-exec path). Everything else returns
-/// EINVAL since we have no symlinks.
-fn sys_readlink<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
-    let buf = a.a1 as usize;
-    let bufsz = a.a2 as usize;
+fn readlink_at<A: crate::Arch>(
+    machine: &mut A,
+    path_ptr: usize,
+    base: &[u8],
+    buf: usize,
+    bufsz: usize,
+) -> SyscallResult {
     let mut self_exe_buf = [0u8; 256];
-    let self_exe_len = machine.copy_cstr(a.a0 as usize, &mut self_exe_buf);
+    let self_exe_len = machine.copy_cstr(path_ptr, &mut self_exe_buf);
     let is_self_exe = &self_exe_buf[..self_exe_len] == b"/proc/self/exe";
     if is_self_exe {
         let target: &[u8] = b"/bin/busybox";
@@ -1329,7 +1330,50 @@ fn sys_readlink<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> 
         machine.copy_to(buf, &target[..n]);
         return SyscallResult::val(n as i32);
     }
-    SyscallResult::val(-EINVAL)
+
+    let mut resolved_buf = [0u8; vfs::DIR_PATH_MAX];
+    let resolved = resolve_path(&self_exe_buf[..self_exe_len], base, &mut resolved_buf);
+    let mut target = [0u8; vfs::DIR_PATH_MAX];
+    match vfs::readlink(resolved, &mut target[..bufsz.min(vfs::DIR_PATH_MAX)]) {
+        Some(n) => {
+            machine.copy_to(buf, &target[..n]);
+            SyscallResult::val(n as i32)
+        }
+        None => SyscallResult::val(-EINVAL),
+    }
+}
+
+/// readlink(85/89) — read the target without following the final component.
+fn sys_readlink<A: crate::Arch>(
+    machine: &mut A,
+    linux: &LinuxState,
+    a: &Args,
+) -> SyscallResult {
+    readlink_at(
+        machine,
+        a.a0 as usize,
+        linux.cwd_str(),
+        a.a1 as usize,
+        a.a2 as usize,
+    )
+}
+
+/// readlinkat(267), with the same dirfd handling as the other `*at` calls.
+fn sys_readlinkat<A: crate::Arch>(
+    machine: &mut A,
+    kt: &thread::KernelThread<A>,
+    linux: &LinuxState,
+    a: &Args,
+) -> SyscallResult {
+    let mut dir_buf = [0u8; vfs::DIR_PATH_MAX];
+    let base = at_base(kt, linux, a.a0 as i32, &mut dir_buf);
+    readlink_at(
+        machine,
+        a.a1 as usize,
+        base,
+        a.a2 as usize,
+        a.a3 as usize,
+    )
 }
 
 /// access(33) — check file existence via VFS stat
@@ -1815,18 +1859,22 @@ fn sys_mremap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args)
 /// stat data (full st_mode incl. file type, size, ino) for a resolved VFS
 /// path — the lookup shared by stat/fstatat/statx.
 fn stat_lookup(resolved: &[u8]) -> Option<(u32, u32, u64)> {
-    if vfs::dir_exists(resolved) {
-        return Some((0o40755, 0, 0));
-    }
-    let handle = vfs::open_to_handle(resolved);
-    if handle < 0 {
-        return None;
-    }
-    let size = vfs::file_size_by_handle(handle);
-    let mode = vfs::file_mode_by_handle(handle);
-    let ino = vfs::file_ino_by_handle(handle);
-    vfs::close_vfs_handle(handle);
-    Some((0o100000 | mode as u32, size, ino))
+    let stat = vfs::stat(resolved, true)?;
+    let kind = if stat.is_dir { 0o040000 } else { 0o100000 };
+    Some((kind | u32::from(stat.mode), stat.size, stat.ino))
+}
+
+/// Like `stat_lookup`, but preserve a symbolic link as the final object.
+fn lstat_lookup(resolved: &[u8]) -> Option<(u32, u32, u64)> {
+    let stat = vfs::stat(resolved, false)?;
+    let kind = if stat.is_symlink {
+        0o120000
+    } else if stat.is_dir {
+        0o040000
+    } else {
+        0o100000
+    };
+    Some((kind | u32::from(stat.mode), stat.size, stat.ino))
 }
 
 /// Base directory for `*at()` path resolution: a dirfd naming a directory
@@ -1850,7 +1898,7 @@ fn at_base<'a, A: crate::Arch>(
 }
 
 /// stat64(195) / lstat64(196)
-fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool) -> SyscallResult {
+fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args, want_64: bool, follow_final: bool) -> SyscallResult {
     let path_ptr = a.a0 as usize;
     let stat_buf = a.a1 as usize;
     let mut path_buf = [0u8; 256];
@@ -1860,7 +1908,8 @@ fn sys_stat64<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxSt
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
 
-    match stat_lookup(resolved) {
+    let stat = if follow_final { stat_lookup(resolved) } else { lstat_lookup(resolved) };
+    match stat {
         Some((mode, size, ino)) => {
             write_stat64(machine, stat_buf, mode, size, ino, want_64);
             SyscallResult::val(0)
@@ -1903,7 +1952,13 @@ fn sys_statx<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     let base = at_base(kt, linux, dirfd, &mut dbuf);
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, base, &mut pbuf);
-    match stat_lookup(resolved) {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let stat = if a.a3 & AT_SYMLINK_NOFOLLOW == 0 {
+        stat_lookup(resolved)
+    } else {
+        lstat_lookup(resolved)
+    };
+    match stat {
         Some((mode, size, ino)) => {
             write_statx(machine, statx_buf, mode, size, ino);
             SyscallResult::val(0)
@@ -1970,7 +2025,13 @@ fn sys_fstatat64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<
     let base = at_base(kt, linux, dirfd, &mut dbuf);
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, base, &mut pbuf);
-    match stat_lookup(resolved) {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    let stat = if a.a3 & AT_SYMLINK_NOFOLLOW == 0 {
+        stat_lookup(resolved)
+    } else {
+        lstat_lookup(resolved)
+    };
+    match stat {
         Some((mode, size, ino)) => {
             write_stat64(machine, stat_buf, mode, size, ino, want_64);
             SyscallResult::val(0)
@@ -2018,26 +2079,22 @@ fn write_stat_old<A: crate::Arch>(machine: &mut A, buf: usize, mode: u32, size: 
     machine.write::<u32>(buf + 0x1c, size.div_ceil(512));   // st_blocks
 }
 
-/// stat(106) / lstat(107) — old struct stat layout. We have no symlinks so
-/// lstat falls through to stat.
-fn sys_stat_old<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args) -> SyscallResult {
+/// stat(106) / lstat(107) — old struct stat layout.
+fn sys_stat_old<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &LinuxState, a: &Args, follow_final: bool) -> SyscallResult {
     let mut path_buf = [0u8; 256];
     let path_len = machine.copy_cstr(a.a0 as usize, &mut path_buf);
     let path = &path_buf[..path_len];
     let stat_buf = a.a1 as usize;
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, linux.cwd_str(), &mut pbuf);
-    if vfs::dir_exists(resolved) {
-        write_stat_old(machine, stat_buf, 0o40755, 0);
-        return SyscallResult::val(0);
+    let stat = if follow_final { stat_lookup(resolved) } else { lstat_lookup(resolved) };
+    match stat {
+        Some((mode, size, _)) => {
+            write_stat_old(machine, stat_buf, mode, size);
+            SyscallResult::val(0)
+        }
+        None => SyscallResult::val(-ENOENT),
     }
-    let handle = vfs::open_to_handle(resolved);
-    if handle < 0 { return SyscallResult::val(-ENOENT); }
-    let size = vfs::file_size_by_handle(handle);
-    let mode = vfs::file_mode_by_handle(handle);
-    vfs::close_vfs_handle(handle);
-    write_stat_old(machine, stat_buf, 0o100000 | mode as u32, size);
-    SyscallResult::val(0)
 }
 
 /// fstat(108) — old struct stat layout.
@@ -2103,7 +2160,14 @@ fn sys_getdents64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         machine.write::<u64>(base, index as u64);         // d_ino
         machine.write::<u64>(base + 8, index as u64);     // d_off
         machine.write::<u16>(base + 16, reclen as u16);   // d_reclen
-        machine.write::<u8>(base + 18, if entry.is_dir { 4 } else { 8 }); // d_type: DT_DIR/DT_REG
+        let file_type = if entry.is_dir {
+            4 // DT_DIR
+        } else if entry.is_symlink {
+            10 // DT_LNK
+        } else {
+            8 // DT_REG
+        };
+        machine.write::<u8>(base + 18, file_type);
         machine.copy_to(base + 19, name);
         offset += reclen;
     }

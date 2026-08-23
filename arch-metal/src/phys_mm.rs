@@ -75,6 +75,20 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
         // Start searching after kernel
         NEXT_FREE = kernel_high as usize;
 
+    }
+}
+
+/// Carve the permanent low-memory DMA regions after loader-owned memory has
+/// been reserved. Recording these addresses during `init_phys_mm` allowed a
+/// pool to select pages later identified as a Multiboot module; HDA would then
+/// DMA directly over the module-backed filesystem.
+pub fn reserve_dma_regions() {
+    unsafe {
+        let pr = &raw mut PAGE_REFS;
+        DMA_POOL_START = 0;
+        DMA_BUFS_BASE = 0;
+        DMA_POOL_BUSY = false;
+
         // Reserve a low-memory ISA-DMA pool. ISA DMA needs a physically
         // contiguous, < 16 MB, boundary-non-crossing buffer; the general
         // allocator walks upward and fragments the whole < 16 MB region
@@ -251,15 +265,17 @@ pub fn dma_channel_buf(ch: usize) -> u64 {
     (base + off) as u64
 }
 
-/// Hand out the reserved ISA-DMA pool for a buffer of `num_pages`
-/// (≤ `DMA_POOL_PAGES`). Returns the pool's start page, or None if the
-/// pool is unavailable, busy, or the buffer is too large. `boundary_log2`
-/// is satisfied by construction: the pool is 64 KB-aligned and ≤ 64 KB,
-/// so no 8-bit (64 KB) or 16-bit (128 KB) boundary is ever crossed.
+/// Allocate physically contiguous DMA memory. With no boundary constraint,
+/// use the general pool. A nonzero `boundary_log2` selects the reserved
+/// ISA-DMA pool (≤ `DMA_POOL_PAGES`), whose placement satisfies both the
+/// 64 KB 8-bit and 128 KB 16-bit DMA boundaries by construction.
 ///
 /// Release with `free_phys_contig`. Pages are NOT zeroed — the DMA-remap
 /// path copies the guest buffer in.
-pub fn alloc_phys_contig(num_pages: usize, _boundary_log2: u32) -> Option<u64> {
+pub fn alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> Option<u64> {
+    if boundary_log2 == 0 {
+        return alloc_contig(num_pages);
+    }
     unsafe {
         if DMA_POOL_START == 0 || DMA_POOL_BUSY
             || num_pages == 0 || num_pages > DMA_POOL_PAGES {
@@ -270,12 +286,20 @@ pub fn alloc_phys_contig(num_pages: usize, _boundary_log2: u32) -> Option<u64> {
     }
 }
 
-/// Release the DMA pool (back to available, not to the general allocator —
-/// the pool pages stay RESERVED for the next SB buffer).
-pub fn free_phys_contig(start_page: u64, _num_pages: usize) {
+/// Release a DMA allocation. The ISA pool stays reserved for reuse; ordinary
+/// contiguous pages return to the general allocator.
+pub fn free_phys_contig(start_page: u64, num_pages: usize) {
     unsafe {
         if start_page as usize == DMA_POOL_START {
             DMA_POOL_BUSY = false;
+        } else if start_page as usize >= 256
+            && (start_page as usize).saturating_add(num_pages) <= MAX_PAGES
+        {
+            let pr = &raw mut PAGE_REFS;
+            for slot in (*pr).iter_mut().skip(start_page as usize).take(num_pages) {
+                debug_assert_eq!(*slot, RESERVED);
+                *slot = 0;
+            }
         }
     }
 }
@@ -284,10 +308,9 @@ pub fn free_phys_contig(start_page: u64, _num_pages: usize) {
 /// marked RESERVED (a permanent driver-owned region — never freed). Returns the
 /// start page, or None if no contiguous run is free.
 ///
-/// Distinct from `alloc_phys_contig`, which hands out the single ISA-DMA pool
-/// (low, 64 KB-aligned — for the Sound Blaster). 64-bit PCI bus-master devices
-/// (NVMe, xHCI) have no such constraint and each get an independent block here,
-/// so they don't fight over one pool.
+/// This backs unconstrained `alloc_phys_contig` requests and direct ring-0
+/// users such as xHCI. PCI bus-master devices have no ISA boundary constraint
+/// and each get an independent block here.
 pub fn alloc_contig(num_pages: usize) -> Option<u64> {
     if num_pages == 0 {
         return None;
@@ -321,5 +344,3 @@ pub fn free_page_count() -> usize {
     }
     count
 }
-
-

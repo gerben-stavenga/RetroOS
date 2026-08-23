@@ -158,62 +158,6 @@ http_archive(
 )""",
 )
 
-# ---- lwext4: the C ext4 filesystem library (writable ext4) -----------------
-# gerben-stavenga/lwext4, a fork of gkostka/lwext4 pinned at our own commit.
-# Compiled freestanding for i686 by //third_party/lwext4 (host clang via
-# genrule, --target=i686-unknown-none-elf fixes codegen). GPLv2
-# (ext4_extents.c) — fetched at build time, never in the repo, so RetroOS's own
-# sources stay permissive; binaries built with the `lwext4` feature are GPLv2
-# as distributed. See //third_party/lwext4.
-#
-# The fork exists because upstream is dormant: master's last commit is
-# September 2022, its maintainer's last activity anywhere in the repo is the
-# same day, and PRs have sat unread for three years. It carries one commit —
-# ext4_fread() zero-filling unwritten ranges on the aligned and tail paths,
-# which upstream only guards on the head path, so reading a sparse file
-# returns superblock bytes where zeros belong (it surfaced as garbage pixels
-# in sparse game assets). Two other downstreams, RT-Thread-packages and
-# extremscorner, fixed part of the same bug independently.
-#
-# Rebasing on upstream is a non-issue while it stays dead; if it revives,
-# `git rebase upstream/master` on the fork and re-pin.
-http_archive(
-    name = "lwext4",
-    url = "https://github.com/gerben-stavenga/lwext4/archive/b66afa465cb1b947a31d5276ad14cd64ebf5788e.tar.gz",
-    sha256 = "d4120a8d742a4a852d69c65de31e4f5056b38526e55a7eead9efa50ac7911454",
-    strip_prefix = "lwext4-b66afa465cb1b947a31d5276ad14cd64ebf5788e",
-    build_file_content = """
-filegroup(
-    name = "srcs",
-    srcs = glob(["src/**", "include/**"]),
-    visibility = ["//visibility:public"],
-)
-
-# Host build: a normal cc_library (the HOST cc toolchain has a real `ar`,
-# unlike the bare-metal one). Linked into the hosted entry binaries so the
-# kernel's backend-agnostic Lwext4Fs resolves ext4_* on hosted too (the fs
-# library is linked into both backends). On host, lwext4 uses the system libc,
-# so no cshim is needed (that's metal-only, in arch-metal).
-cc_library(
-    name = "lwext4_host",
-    srcs = glob(["src/*.c"]),
-    hdrs = glob(["include/**/*.h"]),
-    includes = ["include"],
-    copts = [
-        "-DCONFIG_USE_DEFAULT_CFG=1",
-        "-DCONFIG_DEBUG_PRINTF=0",
-        "-DCONFIG_DEBUG_ASSERT=0",
-        # Must match //third_party/lwext4 (the metal build) — upstream defaults
-        # to 2, which caps us at a root plus one extra partition.
-        "-DCONFIG_EXT4_BLOCKDEVS_COUNT=8",
-        "-DCONFIG_EXT4_MOUNTPOINTS_COUNT=8",
-        "-w",
-    ],
-    visibility = ["//visibility:public"],
-)
-""",
-)
-
 # ---- crate_universe: third-party Rust dependencies (Bazel-only) -----------
 # Third-party crates, declared directly (no cargo, no Cargo.toml manifests):
 # `crate.spec` + `crate.from_specs` resolve against crates.io and pin in

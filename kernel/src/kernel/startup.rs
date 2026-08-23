@@ -3,8 +3,11 @@
 extern crate alloc;
 
 use crate::Regs;
-use crate::kernel::{vfs, fs::lwext4::{Lwext4Fs, MountMode}};
 use crate::kernel::thread;
+use crate::kernel::{
+    fs::portable_ext4::PortableExt4Fs,
+    vfs,
+};
 
 /// Startup: the kernel's ordered init spine — probe, then derive, then run.
 /// Each phase is a named function below; this stays short enough to read as
@@ -40,15 +43,18 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // Preserve a pristine real-mode environment for this and all later
     // firmware calls; DOS personalities receive their separate substitute BIOS.
     let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
-    let vbe_mode = display.vga_capability()
+    let vbe_mode = display
+        .vga_capability()
         .and_then(|native| native.bios_discover_vbe(machine, &mut bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
     crate::kernel::platform::set_voodoo_vbe_mode(
-        bios_workspace.curated_modes(), !display.is_headless(),
+        bios_workspace.curated_modes(),
+        !display.is_headless(),
     );
     let display = match display.into_native_capability(machine) {
-        Ok(native) => crate::kernel::display::Display::new_selected(
-            machine, &mut bios_workspace, native),
+        Ok(native) => {
+            crate::kernel::display::Display::new_selected(machine, &mut bios_workspace, native)
+        }
         Err(display) => display,
     };
     let mut screen = crate::kernel::console::Console::new(display);
@@ -75,12 +81,16 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // Done before partition scanning, so every Volume built below already
     // carries the policy.
     let disks = if boot.ram_overlay {
-        crate::screenln!(screen, "Disk writes: volatile RAM overlay (ram-overlay) — changes will NOT persist");
+        crate::screenln!(
+            screen,
+            "Disk writes: volatile RAM overlay (ram-overlay) — changes will NOT persist"
+        );
         disks
             .into_iter()
             .map(|d| -> &'static dyn crate::kernel::block::Disk {
                 alloc::boxed::Box::leak(alloc::boxed::Box::new(
-                    crate::kernel::block::overlay::RamOverlay::wrap(d)))
+                    crate::kernel::block::overlay::RamOverlay::wrap(d),
+                ))
             })
             .collect()
     } else {
@@ -95,12 +105,11 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         );
         disks
     };
-
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let mut threads = crate::kernel::thread::init_threading();
-    crate::screenln!(screen, "Threading initialized");
+    crate::screenln!(screen => machine, &mut bios_workspace; "Threading initialized");
 
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
     crate::kernel::dos::set_c_root(boot.c_root());
@@ -108,12 +117,26 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
 
     // Read every disk's partition table, then decide the mount tree from what
     // they declare. `plan_mounts` is a pure function of those facts.
+    crate::screenln!(screen => machine, &mut bios_workspace;
+        "Filesystems: scanning partition tables...");
     let parts: alloc::vec::Vec<_> = disks
         .iter()
-        .flat_map(|&d| crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d)))
+        .flat_map(|&d| {
+            crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d))
+        })
         .collect();
+    crate::screenln!(screen => machine, &mut bios_workspace;
+        "Filesystems: {} partition(s) found", parts.len());
     let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
-    let hostfs_is_root = mount_filesystems(&parts, platform.hostfs, &mut screen, modules);
+    let hostfs_is_root = mount_filesystems(
+        machine,
+        &mut bios_workspace,
+        &parts,
+        platform.hostfs,
+        &mut screen,
+        modules,
+    );
+    screen.present(machine, &mut bios_workspace);
     // A root mount must have an established backend/session. Later filesystem
     // operations retain their normal operation-driven reconnect behavior.
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
@@ -129,22 +152,27 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
     let master_env = load_master_env();
-    crate::kernel::drivers::hda::configure_output_route(
-        crate::kernel::dos::config_var(&master_env, b"HDA_OUTPUT"),
-    );
-    crate::kernel::osd::configure_master_volume(
-        crate::kernel::dos::config_var(&master_env, b"AUDIO_VOLUME"),
-    );
+    crate::kernel::drivers::hda::configure_output_route(crate::kernel::dos::config_var(
+        &master_env,
+        b"HDA_OUTPUT",
+    ));
+    crate::kernel::osd::configure_master_volume(crate::kernel::dos::config_var(
+        &master_env,
+        b"AUDIO_VOLUME",
+    ));
     let sb_audio = crate::kernel::dos::config_var(&master_env, b"SB_AUDIO")
         .map(alloc::vec::Vec::from)
         .unwrap_or_default();
     let mixed = boot.audio_mixed
-        || sb_audio.split(|&b| b == b' ').next().is_some_and(|m| m.eq_ignore_ascii_case(b"mixed"));
+        || sb_audio
+            .split(|&b| b == b' ')
+            .next()
+            .is_some_and(|m| m.eq_ignore_ascii_case(b"mixed"));
     // Mints the machine's one Sound Blaster, if it has a drivable one. We hold
     // it while reconciling it against BLASTER, then leave it unclaimed for
     // whichever owner the mode selected to take.
-    let sb_card = crate::kernel::platform::apply_audio_mode(
-        machine, mixed, parse_sb_wiring(&sb_audio));
+    let sb_card =
+        crate::kernel::platform::apply_audio_mode(machine, mixed, parse_sb_wiring(&sb_audio));
     let platform = crate::kernel::platform::get();
 
     // BLASTER describes THE CARD THE GUEST SEES.
@@ -185,10 +213,12 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
             Some(b) => crate::println!(
                 "Audio: BLASTER declares A{:03X}, the card answers at {:#05X} — translating (the \
                  DSP window traps anyway, so the guest sees its declared card)",
-                b, card.base
+                b,
+                card.base
             ),
             None => crate::println!(
-                "Audio: no BLASTER port declared, card is at {:#05X}", card.base
+                "Audio: no BLASTER port declared, card is at {:#05X}",
+                card.base
             ),
         }
         // An SB16's IRQ/DMA are soft-straps (mixer 0x80/0x81) — and NOT just
@@ -210,13 +240,19 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
             if got == want {
                 crate::println!(
                     "Audio: SB16 restrapped to BLASTER (IRQ{} DMA{}{})",
-                    got.irq, got.dma8, h(got.dma16)
+                    got.irq,
+                    got.dma8,
+                    h(got.dma16)
                 );
             } else {
                 crate::println!(
                     "Audio: SB16 kept IRQ{} DMA{}{} (strap write refused) — relaying to \
                      BLASTER's IRQ{} DMA{}",
-                    got.irq, got.dma8, h(got.dma16), want.irq, want.dma8
+                    got.irq,
+                    got.dma8,
+                    h(got.dma16),
+                    want.irq,
+                    want.dma8
                 );
             }
         }
@@ -231,7 +267,9 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
         // Judge the H-declaration against the acting straps — the restrap just
         // above may have enabled the 16-bit channel.
         if card.dma16.is_none()
-            && blaster.split(|&b| b == b' ').any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
+            && blaster
+                .split(|&b| b == b' ')
+                .any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
         {
             crate::println!("Audio: BLASTER declares a 16-bit channel but this card has none");
         }
@@ -252,7 +290,13 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     match platform.audio {
         crate::kernel::platform::Audio::NativeSb
         | crate::kernel::platform::Audio::EmulatedSilent => {}
-        _ => crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root()),
+        _ => {
+            crate::screenln!(screen => machine, &mut bios_workspace;
+                "Loading General MIDI bank...");
+            crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+            crate::screenln!(screen => machine, &mut bios_workspace;
+                "General MIDI bank load complete");
+        }
     }
     // Take the selected output capability into runtime ownership. `None` is a
     // silent runtime, not a dummy sink.
@@ -262,7 +306,17 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // DOS worlds are cloned from their substitute-BIOS template.
     let mut dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
-    run(machine, boot, &master_env, &mut bios_workspace, &mut dos_template, &mut threads, screen, sb_card, sink)
+    run(
+        machine,
+        boot,
+        &master_env,
+        &mut bios_workspace,
+        &mut dos_template,
+        &mut threads,
+        screen,
+        sb_card,
+        sink,
+    )
 }
 
 /// The host filesystem on the selected serial transport. Mounted at /host
@@ -280,10 +334,7 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
     }
 }
 
-/// lwext4's device and mount-point registries are fixed-size arrays in the C
-/// library, sized by CONFIG_EXT4_{BLOCKDEVS,MOUNTPOINTS}_COUNT — we build it
-/// with 8 (upstream defaults to 2, which would cap us at a root plus one).
-/// Keep this in step with //third_party/lwext4 and MODULE.bazel.
+/// Keep the boot-time mount namespace in the single-digit `/diskN` range.
 const MAX_EXT_MOUNTS: usize = 8;
 
 /// Which ext filesystem is the root: the one that looks like a Linux root
@@ -293,21 +344,22 @@ const MAX_EXT_MOUNTS: usize = 8;
 /// mechanically — so it is the only part worth naming. A disk can carry
 /// several ext partitions (a data partition AND the real root) and the table
 /// order says nothing about which is which. Only sniff when ambiguous: a lone
-/// ext partition IS the root, and probing it would mean a needless lwext4
-/// mount/unmount.
+/// ext partition IS the root, and probing it would mean a needless mount.
 fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
     if ext.len() < 2 {
         return 0;
     }
     ext.iter()
-        .position(crate::kernel::fs::lwext4::is_linux_root)
+        .position(crate::kernel::fs::portable_ext4::is_linux_root)
         .unwrap_or(0)
 }
 
 /// Build the mount tree. The disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
 /// ordinary directory on whatever backs C:, not a mount of its own.
-fn mount_filesystems(
+fn mount_filesystems<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
@@ -317,19 +369,28 @@ fn mount_filesystems(
 
     // Ask the filesystem, don't trust the table: a partition holds ext when it
     // has an ext superblock, whatever type byte or GUID it carries.
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: probing ext superblocks...");
     let ext: alloc::vec::Vec<_> = parts
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
         .map(|p| p.volume)
-        .filter(crate::kernel::fs::lwext4::is_ext)
+        .map(crate::kernel::block::cache::volume)
+        .filter(crate::kernel::fs::portable_ext4::is_ext)
         .collect();
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: {} ext partition(s)", ext.len());
 
     let mut hostfs_is_root = false;
     if modules.has_root {
         // A Multiboot root owns `/`; physical filesystems remain available as
         // read-only fallback mounts below `/diskN`.
         crate::multiboot::mount_physical_fallbacks(
-            &ext, modules.next_ext_slot, MAX_EXT_MOUNTS, screen);
+            &ext,
+            modules.next_ext_slot,
+            MAX_EXT_MOUNTS,
+            screen,
+        );
         if hostfs {
             vfs::mount(b"host/", host_fs());
             crate::screenln!(screen, "hostfs: mounted at /host");
@@ -347,19 +408,18 @@ fn mount_filesystems(
         }
     } else {
         let root = root_index(&ext);
-        crate::screenln!(screen, "ext4 root ({} MB)", ext[root].sectors / 2048);
-        match Lwext4Fs::new(ext[root], modules.next_ext_slot, MountMode::ReadWrite) {
-            Ok(fs) => {
-                let fs: &'static dyn vfs::Filesystem =
-                    alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-                // The write grant is RetroOS's identity — the group owning its
-                // home. C: is a DOS-side notion only this layer knows, and the
-                // VFS enforces the rule from here on. Extra mounts get no
-                // grant, so nothing on them is writable.
-                vfs::mount_writable(b"", fs, crate::kernel::dos::c_root());
-            }
-            Err(e) => panic!("ext4 mount failed: {}", e),
-        }
+        crate::screenln!(screen => machine, bios_workspace;
+            "Mounting ext4 root ({} MB)...", ext[root].sectors / 2048);
+        let fs = PortableExt4Fs::new(ext[root])
+            .unwrap_or_else(|error| panic!("portable ext4 root mount failed: {}", error));
+        crate::screenln!(screen => machine, bios_workspace; "ext4 root mounted");
+        let fs: &'static dyn vfs::Filesystem =
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
+        // The write grant is RetroOS's identity — the group owning its
+        // home. C: is a DOS-side notion only this layer knows, and the
+        // VFS enforces the rule from here on. Extra mounts get no
+        // grant, so nothing on them is writable.
+        vfs::mount_writable(b"", fs, crate::kernel::dos::c_root());
 
         // Every other ext filesystem mounts read-only at /disk1, /disk2, …
         // (Linux-visible, not under C:). An unreadable one is logged and
@@ -373,8 +433,10 @@ fn mount_filesystems(
             if slot >= MAX_EXT_MOUNTS {
                 // Never drop a filesystem silently — say how many and why.
                 crate::println!(
-                    "ext4: {} further partition(s) not mounted (lwext4 allows {})",
-                    ext.len() - slot, MAX_EXT_MOUNTS);
+                    "ext4: {} further partition(s) not mounted (limit {})",
+                    ext.len() - slot,
+                    MAX_EXT_MOUNTS
+                );
                 break;
             }
             let mut prefix = alloc::vec::Vec::new();
@@ -382,13 +444,17 @@ fn mount_filesystems(
             prefix.push(b'0' + slot as u8);
             prefix.push(b'/');
             let prefix: &'static [u8] = alloc::boxed::Box::leak(prefix.into_boxed_slice());
-            match Lwext4Fs::new(vol, slot, MountMode::ReadOnly) {
+            match PortableExt4Fs::new(vol) {
                 Ok(fs) => {
                     vfs::mount(prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(fs)));
-                    crate::screenln!(screen, "ext4 partition ({} MB) → /disk{}",
-                        vol.sectors / 2048, slot);
+                    crate::screenln!(
+                        screen,
+                        "portable ext4 partition ({} MB) → /disk{}",
+                        vol.sectors / 2048,
+                        slot
+                    );
                 }
-                Err(e) => crate::screenln!(screen, "ext4 partition skipped: {}", e),
+                Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
             }
         }
 
@@ -423,8 +489,7 @@ fn mount_kernel_log_fs() {
 /// Absent, the env is empty.
 fn load_master_env() -> alloc::vec::Vec<u8> {
     let user_cfg = [crate::kernel::dos::c_root(), b"CONFIG.SYS"].concat();
-    let config = crate::kernel::exec::load_file_resolved(&user_cfg)
-        .unwrap_or_default();
+    let config = crate::kernel::exec::load_file_resolved(&user_cfg).unwrap_or_default();
     crate::kernel::dos::parse_config_env(&config)
 }
 
@@ -434,7 +499,11 @@ fn parse_sb_wiring(v: &[u8]) -> Option<crate::kernel::drivers::sb16::SbWiring> {
     let mut it = v.split(|&b| b == b' ').filter(|t| !t.is_empty()).skip(1);
     let irq = parse_u8(it.next()?)?;
     let dma8 = parse_u8(it.next()?)?;
-    Some(crate::kernel::drivers::sb16::SbWiring { irq, dma8, dma16: None })
+    Some(crate::kernel::drivers::sb16::SbWiring {
+        irq,
+        dma8,
+        dma16: None,
+    })
 }
 
 fn parse_u8(s: &[u8]) -> Option<u8> {
@@ -472,7 +541,9 @@ fn blaster_wiring(v: &[u8]) -> Option<crate::kernel::drivers::sb16::SbWiring> {
         let num = || -> Option<u8> {
             let mut n: u8 = 0;
             for &c in &tok[1..] {
-                n = n.checked_mul(10)?.checked_add((c as char).to_digit(10)? as u8)?;
+                n = n
+                    .checked_mul(10)?
+                    .checked_add((c as char).to_digit(10)? as u8)?;
             }
             Some(n)
         };
@@ -483,7 +554,11 @@ fn blaster_wiring(v: &[u8]) -> Option<crate::kernel::drivers::sb16::SbWiring> {
             _ => {}
         }
     }
-    Some(crate::kernel::drivers::sb16::SbWiring { irq: irq?, dma8: dma8?, dma16 })
+    Some(crate::kernel::drivers::sb16::SbWiring {
+        irq: irq?,
+        dma8: dma8?,
+        dma16,
+    })
 }
 
 /// Allocate the console stdin pipe (keyboard → Linux stdin). The kernel
@@ -549,7 +624,10 @@ fn run<A: crate::Arch>(
         let explicit_cwd = boot.cwd().map(trim_ascii);
 
         for segment in arch_abi::cmdline::segments(raw) {
-            let Some(launch) = arch_abi::cmdline::launch(segment, is_kernel_launch_directive) else { continue; };
+            let Some(launch) = arch_abi::cmdline::launch(segment, is_kernel_launch_directive)
+            else {
+                continue;
+            };
             let path = launch.program();
 
             // Build the DOS PSP tail from the filtered token stream. The
@@ -566,13 +644,26 @@ fn run<A: crate::Arch>(
                     &path[..cwd_end]
                 }
             };
-            crate::screenln!(screen, "Starting {} {} (cwd={})...",
+            crate::screenln!(
+                screen,
+                "Starting {} {} (cwd={})...",
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
-                core::str::from_utf8(cwd).unwrap_or("?"));
+                core::str::from_utf8(cwd).unwrap_or("?")
+            );
             (screen, sb) = run_program_with_screen(
-                machine, bios_workspace, dos_template, threads, path, tail, cwd, master_env, boot.debug_watch,
-                screen, sb, sink.as_mut(),
+                machine,
+                bios_workspace,
+                dos_template,
+                threads,
+                path,
+                tail,
+                cwd,
+                master_env,
+                boot.debug_watch,
+                screen,
+                sb,
+                sink.as_mut(),
             );
         }
         crate::screenln!(screen, "All commands done — shutting down.");
@@ -592,8 +683,18 @@ fn run<A: crate::Arch>(
     let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
     loop {
         (screen, sb) = run_program_with_screen(
-            machine, bios_workspace, dos_template, threads, &dn_path, b"", b"", master_env, boot.debug_watch,
-            screen, sb, sink.as_mut(),
+            machine,
+            bios_workspace,
+            dos_template,
+            threads,
+            &dn_path,
+            b"",
+            b"",
+            master_env,
+            boot.debug_watch,
+            screen,
+            sb,
+            sink.as_mut(),
         );
         crate::screenln!(screen, "DN exited, restarting...");
     }
@@ -613,13 +714,29 @@ fn run_program_with_screen<A: crate::Arch>(
     screen: crate::kernel::console::Console,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
     sink: Option<&mut crate::kernel::sound::Sink>,
-) -> (crate::kernel::console::Console, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (
+    crate::kernel::console::Console,
+    Option<crate::kernel::drivers::sb16::SbCard>,
+) {
     let (card, display) = screen.release(machine, bios_workspace);
     let (display, sb) = run_program(
-        machine, bios_workspace, dos_template, threads, path, cmdline_tail, cwd, env, debug_watch,
-        display, sb, sink,
+        machine,
+        bios_workspace,
+        dos_template,
+        threads,
+        path,
+        cmdline_tail,
+        cwd,
+        env,
+        debug_watch,
+        display,
+        sb,
+        sink,
     );
-    (crate::kernel::console::Console::acquire(machine, card, display), sb)
+    (
+        crate::kernel::console::Console::acquire(machine, card, display),
+        sb,
+    )
 }
 
 /// Load and run a single cmdline program until it exits. ELF binaries run
@@ -640,7 +757,10 @@ fn run_program<A: crate::Arch>(
     display: crate::kernel::display::Display,
     sb: Option<crate::kernel::drivers::sb16::SbCard>,
     sink: Option<&mut crate::kernel::sound::Sink>,
-) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (
+    crate::kernel::display::Display,
+    Option<crate::kernel::drivers::sb16::SbCard>,
+) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -696,7 +816,16 @@ fn run_program<A: crate::Arch>(
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, path),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, path),
-        _ => dos::run_init_program(machine, dos_template, threads, buf, args, cmdline_tail, cwd, env),
+        _ => dos::run_init_program(
+            machine,
+            dos_template,
+            threads,
+            buf,
+            args,
+            cmdline_tail,
+            cwd,
+            env,
+        ),
     };
 
     // The initial program owns the console outright (nothing to repaint) and
@@ -705,13 +834,18 @@ fn run_program<A: crate::Arch>(
     let display = {
         let t = thread::get_thread(threads, tid).expect("init program thread");
         t.kernel.set_comm(path); // name the boot program for the F12 picker
-        t.personality.adopt_display(machine, bios_workspace, display)
+        t.personality
+            .adopt_display(machine, bios_workspace, display)
     };
 
     if let Some((addr0, addr1)) = debug_watch {
         machine.set_debug_watch(Some((addr0, addr1)));
         if addr1 != 0 {
-            crate::dbg_println!("[WATCH] armed write watchpoints at {:08X} and {:08X}", addr0, addr1);
+            crate::dbg_println!(
+                "[WATCH] armed write watchpoints at {:08X} and {:08X}",
+                addr0,
+                addr1
+            );
         } else {
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
@@ -723,7 +857,13 @@ fn run_program<A: crate::Arch>(
 /// the shared console pipe, stdout/stderr go to the console — mirroring the
 /// hosted bare-ELF path (`host_run_elf`). The fresh empty address space is
 /// already clean, so the ELF loader can write straight into it.
-fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: alloc::vec::Vec<u8>, path: &[u8], args: alloc::vec::Vec<alloc::vec::Vec<u8>>) -> usize {
+fn launch_elf<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    buf: alloc::vec::Vec<u8>,
+    path: &[u8],
+    args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
         let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
@@ -734,14 +874,25 @@ fn launch_elf<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args)
-        .unwrap_or_else(|e| panic!("ELF exec failed ({}): errno {}",
-            core::str::from_utf8(path).unwrap_or("?"), e));
+    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args).unwrap_or_else(
+        |e| {
+            panic!(
+                "ELF exec failed ({}): errno {}",
+                core::str::from_utf8(path).unwrap_or("?"),
+                e
+            )
+        },
+    );
     tid
 }
 
 /// Launch a native 32-bit OS/2 LX image as a fresh process.
-fn launch_os2<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: alloc::vec::Vec<u8>, path: &[u8]) -> usize {
+fn launch_os2<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    buf: alloc::vec::Vec<u8>,
+    path: &[u8],
+) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
         let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
@@ -752,14 +903,25 @@ fn launch_os2<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>]
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None)
-        .unwrap_or_else(|e| panic!("OS/2 LX exec failed ({}): errno {}",
-            core::str::from_utf8(path).unwrap_or("?"), e));
+    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None).unwrap_or_else(
+        |e| {
+            panic!(
+                "OS/2 LX exec failed ({}): errno {}",
+                core::str::from_utf8(path).unwrap_or("?"),
+                e
+            )
+        },
+    );
     tid
 }
 
 /// Launch a native 32-bit Windows PE image as a fresh process.
-fn launch_windows<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], buf: alloc::vec::Vec<u8>, path: &[u8]) -> usize {
+fn launch_windows<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    buf: alloc::vec::Vec<u8>,
+    path: &[u8],
+) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
         let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
@@ -771,8 +933,13 @@ fn launch_windows<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread
     };
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::windows::exec_pe_into(machine, threads, tid, buf, path, b"", None)
-        .unwrap_or_else(|e| panic!("Windows PE exec failed ({}): errno {}",
-            core::str::from_utf8(path).unwrap_or("?"), e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "Windows PE exec failed ({}): errno {}",
+                core::str::from_utf8(path).unwrap_or("?"),
+                e
+            )
+        });
     tid
 }
 
@@ -795,7 +962,10 @@ pub fn event_loop<A: crate::Arch>(
     sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
     mut sink: Option<&mut crate::kernel::sound::Sink>,
     mut display: Option<crate::kernel::display::Display>,
-) -> (crate::kernel::display::Display, Option<crate::kernel::drivers::sb16::SbCard>) {
+) -> (
+    crate::kernel::display::Display,
+    Option<crate::kernel::drivers::sb16::SbCard>,
+) {
     crate::dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
@@ -820,7 +990,9 @@ pub fn event_loop<A: crate::Arch>(
         stats.iteration(machine);
         let mut events = crate::kernel::irq_dispatch::drain(machine);
         stats.part(machine, 1);
-        let tick_wakeup = events.iter().any(|event| matches!(event, crate::Irq::Hw(0)));
+        let tick_wakeup = events
+            .iter()
+            .any(|event| matches!(event, crate::Irq::Hw(0)));
         events.retain(|event| !matches!(event, crate::Irq::Hw(0)));
         let world_now_ns = if tick_wakeup || irq_clock_wakeup {
             irq_clock_wakeup = false;
@@ -852,8 +1024,13 @@ pub fn event_loop<A: crate::Arch>(
         // Advance virtual devices, then feed sound before display publication:
         // a synchronous framebuffer write can consume most of a millisecond.
         thread.personality.advance_world(
-            machine, &mut *bios_workspace, &ctx.regs, world_now_ns, elapsed_ns,
-            audio_clock.produced_frames());
+            machine,
+            &mut *bios_workspace,
+            &ctx.regs,
+            world_now_ns,
+            elapsed_ns,
+            audio_clock.produced_frames(),
+        );
         if elapsed_ns != 0 {
             crate::kernel::sound::advance(
                 machine,
@@ -863,9 +1040,15 @@ pub fn event_loop<A: crate::Arch>(
                 |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
             );
         }
-        if elapsed_ns != 0 && let Some(display) = display.as_mut() {
+        if elapsed_ns != 0
+            && let Some(display) = display.as_mut()
+        {
             thread.personality.render(
-                machine, &mut *bios_workspace, &ctx.regs, world_now_ns, display,
+                machine,
+                &mut *bios_workspace,
+                &ctx.regs,
+                world_now_ns,
+                display,
             );
         }
         stats.part(machine, 2);
@@ -879,17 +1062,24 @@ pub fn event_loop<A: crate::Arch>(
             events,
         );
         stats.part(machine, 3);
-        thread.personality.after_input(machine, &mut thread.kernel, &mut ctx.regs);
+        thread
+            .personality
+            .after_input(machine, &mut thread.kernel, &mut ctx.regs);
         stats.part(machine, 4);
-
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 task picker to move on.
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
-                    machine, &mut *bios_workspace, threads, &mut ctx, next,
-                    &mut exiting_display, &mut sb_handoff, &mut display,
+                    machine,
+                    &mut *bios_workspace,
+                    threads,
+                    &mut ctx,
+                    next,
+                    &mut exiting_display,
+                    &mut sb_handoff,
+                    &mut display,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -912,9 +1102,7 @@ pub fn event_loop<A: crate::Arch>(
         // headless display.
         // Before an owner exits, return that capability so exit_thread can
         // perform its ordinary single release into `exiting_display`.
-        if matches!(&action, thread::KernelAction::Exit(_))
-            && crate::kernel::osd::is_open()
-        {
+        if matches!(&action, thread::KernelAction::Exit(_)) && crate::kernel::osd::is_open() {
             crate::kernel::osd::dismiss();
             crate::kernel::console::restore_from_monitor(
                 machine,
@@ -926,14 +1114,27 @@ pub fn event_loop<A: crate::Arch>(
 
         // Ask the scheduler.
         match crate::kernel::sched::verdict(
-            machine, &mut *bios_workspace, threads, &mut ctx.regs, ctx.tid, action,
-            &mut exiting_display, &mut sb_handoff, &mut display,
+            machine,
+            &mut *bios_workspace,
+            threads,
+            &mut ctx.regs,
+            ctx.tid,
+            action,
+            &mut exiting_display,
+            &mut sb_handoff,
+            &mut display,
         ) {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(
-                    machine, &mut *bios_workspace, threads, &mut ctx, next,
-                    &mut exiting_display, &mut sb_handoff, &mut display,
+                    machine,
+                    &mut *bios_workspace,
+                    threads,
+                    &mut ctx,
+                    next,
+                    &mut exiting_display,
+                    &mut sb_handoff,
+                    &mut display,
                 );
             }
             crate::kernel::sched::Verdict::ContinueAs(next) => {
@@ -943,11 +1144,12 @@ pub fn event_loop<A: crate::Arch>(
                     && matches!(thread.personality, thread::Personality::Dos(_))
                     && let Some(surface) = display.take()
                 {
-                    let handoff = crate::kernel::display::DisplayHandoff::from_surface(
-                        surface, machine,
-                    );
+                    let handoff =
+                        crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
                     thread.personality.acquire_display_restore(
-                        machine, &mut *bios_workspace, handoff,
+                        machine,
+                        &mut *bios_workspace,
+                        handoff,
                     );
                 }
             }
@@ -960,7 +1162,9 @@ pub fn event_loop<A: crate::Arch>(
                 return (
                     match display.take() {
                         Some(display) => display,
-                        None => exiting_display.take().expect("dead display owner lost token")
+                        None => exiting_display
+                            .take()
+                            .expect("dead display owner lost token")
                             .into_surface(machine, &mut *bios_workspace),
                     },
                     sb_handoff.take(),
@@ -992,7 +1196,9 @@ fn dispatch<A: crate::Arch>(
         // an OSD kill as DOS critical termination.
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x0200,
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => -9,
+            thread::Personality::Linux(_)
+            | thread::Personality::Os2(_)
+            | thread::Personality::Windows(_) => -9,
         };
         return thread::KernelAction::Exit(code);
     }
@@ -1003,20 +1209,46 @@ fn dispatch<A: crate::Arch>(
         if thread.personality.try_vga_fault(machine, regs, addr) {
             return thread::KernelAction::Done;
         }
-        crate::println!("  fault rip={:#x} addr={:#x} err={:#x}",
-            regs.frame.rip, addr, regs.err_code);
-        crate::println!("  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
-            regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp, regs.frame.rsp);
-        crate::println!("  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
-            regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15);
+        crate::println!(
+            "  fault rip={:#x} addr={:#x} err={:#x}",
+            regs.frame.rip,
+            addr,
+            regs.err_code
+        );
+        crate::println!(
+            "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
+            regs.rax,
+            regs.rbx,
+            regs.rcx,
+            regs.rdx,
+            regs.rsi,
+            regs.rdi,
+            regs.rbp,
+            regs.frame.rsp
+        );
+        crate::println!(
+            "  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+            regs.r8,
+            regs.r9,
+            regs.r10,
+            regs.r11,
+            regs.r12,
+            regs.r13,
+            regs.r14,
+            regs.r15
+        );
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x020E, // type 02h, vector 0Eh (#PF)
-            thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => -11,
+            thread::Personality::Linux(_)
+            | thread::Personality::Os2(_)
+            | thread::Personality::Windows(_) => -11,
         };
         thread::signal_thread(thread, addr as usize);
         return thread::KernelAction::Exit(code);
     }
-    thread.personality.handle_event(machine, bios_display, &mut thread.kernel, regs, kevent)
+    thread
+        .personality
+        .handle_event(machine, bios_display, &mut thread.kernel, regs, kevent)
 }
 
 /// Switch console focus and execution together — today's coupling, in one
@@ -1062,11 +1294,19 @@ fn switch_focus_and_run<A: crate::Arch>(
             *sb_handoff = card;
         }
         let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
-        if crate::kernel::osd::is_open() || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_)) {
+        if crate::kernel::osd::is_open()
+            || matches!(
+                new.personality,
+                thread::Personality::Linux(_)
+                    | thread::Personality::Os2(_)
+                    | thread::Personality::Windows(_)
+            )
+        {
             *display = Some(handoff.into_surface(machine, bios_workspace));
             new.personality.repaint_osd();
         } else {
-            new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+            new.personality
+                .acquire_display_restore(machine, bios_workspace, handoff);
         }
         crate::kernel::focus::adopt(new_tid);
         *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
@@ -1093,11 +1333,17 @@ fn switch_focus_and_run<A: crate::Arch>(
             }
             Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
                 if crate::kernel::osd::is_open()
-                    || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+                    || matches!(
+                        new.personality,
+                        thread::Personality::Linux(_)
+                            | thread::Personality::Os2(_)
+                            | thread::Personality::Windows(_)
+                    )
                 {
                     *display = Some(handoff.into_surface(machine, bios_workspace));
                 } else {
-                    new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+                    new.personality
+                        .acquire_display_restore(machine, bios_workspace, handoff);
                 }
             }
             None => {}
@@ -1106,7 +1352,10 @@ fn switch_focus_and_run<A: crate::Arch>(
         return;
     }
     let old_is_zombie = thread::get_thread(threads, ctx.tid)
-        .expect("switch: invalid old thread").kernel.state == thread::ThreadState::Zombie;
+        .expect("switch: invalid old thread")
+        .kernel
+        .state
+        == thread::ThreadState::Zombie;
     let transfer = if !old_is_zombie {
         assert!(exiting_display.is_none(), "stale exiting display");
         let old = thread::get_thread(threads, ctx.tid).expect("switch: invalid old thread");
@@ -1128,12 +1377,18 @@ fn switch_focus_and_run<A: crate::Arch>(
     match transfer {
         Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
             if crate::kernel::osd::is_open()
-                || matches!(new.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+                || matches!(
+                    new.personality,
+                    thread::Personality::Linux(_)
+                        | thread::Personality::Os2(_)
+                        | thread::Personality::Windows(_)
+                )
             {
                 *display = Some(handoff.into_surface(machine, bios_workspace));
                 new.personality.repaint_osd();
             } else {
-                new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+                new.personality
+                    .acquire_display_restore(machine, bios_workspace, handoff);
             }
         }
         Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
@@ -1149,7 +1404,8 @@ fn switch_focus_and_run<A: crate::Arch>(
         && let Some(surface) = display.take()
     {
         let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
-        new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+        new.personality
+            .acquire_display_restore(machine, bios_workspace, handoff);
     }
     crate::kernel::focus::adopt(new_tid);
     *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
@@ -1203,7 +1459,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             parent_cwd_buf[1] = b':';
             let n = dos_cwd.len().min(parent_cwd_buf.len() - 2);
             for i in 0..n {
-                parent_cwd_buf[2 + i] = if dos_cwd[i] == b'\\' { b'/' } else { dos_cwd[i] };
+                parent_cwd_buf[2 + i] = if dos_cwd[i] == b'\\' {
+                    b'/'
+                } else {
+                    dos_cwd[i]
+                };
             }
             parent_cwd_len = 2 + n;
 
@@ -1238,20 +1498,35 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let read_path: alloc::vec::Vec<u8> = match personality_name {
         Some(thread::PersonalityName::Dos) => match crate::kernel::dos::dos_abs_to_vfs(path) {
             Some(v) => v,
-            None => { on_error(vcpu, 2); return None; }
+            None => {
+                on_error(vcpu, 2);
+                return None;
+            }
         },
         _ => path.to_vec(),
     };
     let buf = match exec::load_file_resolved(&read_path) {
         Ok(b) => b,
-        Err(_) => { on_error(vcpu, 2); return None; }
+        Err(_) => {
+            on_error(vcpu, 2);
+            return None;
+        }
     };
 
     let format = exec::detect_format(&buf, path);
-    crate::dbg_println!("handle_fork_exec: {:?} size={} format={} free_pages={}",
-        core::str::from_utf8(path), buf.len(),
-        match format { exec::BinaryFormat::Elf => "elf", exec::BinaryFormat::Lx => "lx", exec::BinaryFormat::Pe => "pe", exec::BinaryFormat::MzExe => "exe", exec::BinaryFormat::Com => "com" },
-        machine.free_page_count());
+    crate::dbg_println!(
+        "handle_fork_exec: {:?} size={} format={} free_pages={}",
+        core::str::from_utf8(path),
+        buf.len(),
+        match format {
+            exec::BinaryFormat::Elf => "elf",
+            exec::BinaryFormat::Lx => "lx",
+            exec::BinaryFormat::Pe => "pe",
+            exec::BinaryFormat::MzExe => "exe",
+            exec::BinaryFormat::Com => "com",
+        },
+        machine.free_page_count()
+    );
 
     // Release while the parent's address space is live. The returned token is
     // the only physical display ownership during construction; the parent's
@@ -1263,29 +1538,44 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             parent.personality.release_display(machine, bios_workspace)
         }
     });
-    let mut fork_sb = if parent_was_focused { sb_handoff.take() } else { None };
+    let mut fork_sb = if parent_was_focused {
+        sb_handoff.take()
+    } else {
+        None
+    };
     if parent_was_focused
-        && let Some(card) = thread::get_thread(threads, parent_tid).unwrap()
-            .personality.release_sb(machine)
+        && let Some(card) = thread::get_thread(threads, parent_tid)
+            .unwrap()
+            .personality
+            .release_sb(machine)
     {
         assert!(fork_sb.is_none(), "two Sound Blaster owners at fork");
         fork_sb = Some(card);
     }
 
     let exec_vga = match format {
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => exec::ExecVga::None,
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => {
+            exec::ExecVga::None
+        }
         _ if parent_is_dos => {
             let parent = thread::get_thread(threads, parent_tid).unwrap();
             let thread::Personality::Dos(parent) = &mut parent.personality else {
                 unreachable!("parent_is_dos without DOS personality")
             };
-            let vga = parent.pc.vga.clone_detached_for_child(machine).unwrap_or_else(||
-                crate::kernel::bios_display::DosVideo::Vga(
-                    crate::kernel::bios_display::EmulatedVga::initial_mode3()));
+            let vga = parent
+                .pc
+                .vga
+                .clone_detached_for_child(machine)
+                .unwrap_or_else(|| {
+                    crate::kernel::bios_display::DosVideo::Vga(
+                        crate::kernel::bios_display::EmulatedVga::initial_mode3(),
+                    )
+                });
             exec::ExecVga::Dos(vga)
         }
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
-            crate::kernel::bios_display::EmulatedVga::initial_mode3())),
+            crate::kernel::bios_display::EmulatedVga::initial_mode3(),
+        )),
     };
 
     // Reserve a child record, then COW the live address space into the parent
@@ -1297,18 +1587,27 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                 if let Some(display) = fork_display {
                     let parent = thread::get_thread(threads, parent_tid).unwrap();
                     if crate::kernel::osd::is_open()
-                        || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+                        || matches!(
+                            parent.personality,
+                            thread::Personality::Linux(_)
+                                | thread::Personality::Os2(_)
+                                | thread::Personality::Windows(_)
+                        )
                     {
                         *event_display = Some(display.into_surface(machine, bios_workspace));
                     } else {
                         parent.personality.acquire_display_restore(
-                            machine, bios_workspace, display,
+                            machine,
+                            bios_workspace,
+                            display,
                         );
                     }
                 }
                 if parent_was_focused {
-                    *sb_handoff = thread::get_thread(threads, parent_tid).unwrap()
-                        .personality.adopt_sb(machine, fork_sb);
+                    *sb_handoff = thread::get_thread(threads, parent_tid)
+                        .unwrap()
+                        .personality
+                        .adopt_sb(machine, fork_sb);
                 }
                 on_error(vcpu, 8);
                 return None;
@@ -1322,7 +1621,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     // ELF needs user pages freed before loading; DOS handles its own address space
-    if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe) {
+    if matches!(
+        format,
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe
+    ) {
         crate::dbg_println!("  fork done, loading protected-mode image...");
         machine.free_user_pages();
     }
@@ -1331,7 +1633,22 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
-    if exec::init_thread(machine, threads, child_tid, buf, path, args, cmdtail, env, cwd, personality_name, viopl, exec_vga).is_err() {
+    if exec::init_thread(
+        machine,
+        threads,
+        child_tid,
+        buf,
+        path,
+        args,
+        cmdtail,
+        env,
+        cwd,
+        personality_name,
+        viopl,
+        exec_vga,
+    )
+    .is_err()
+    {
         // Tear down the half-built live child before returning to the parked
         // parent, then restore the parent's saved display image.
         {
@@ -1346,25 +1663,31 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let parent = thread::get_thread(threads, parent_tid).unwrap();
             core::mem::take(&mut parent.kernel.vcpu.space)
         };
-        let discarded_child = machine.activate(
-            parent_space, core::ptr::null_mut(), core::ptr::null_mut());
+        let discarded_child =
+            machine.activate(parent_space, core::ptr::null_mut(), core::ptr::null_mut());
         {
             let child = thread::get_thread(threads, child_tid).unwrap();
             child.kernel.vcpu.space = discarded_child;
             machine.destroy_space(&mut child.kernel.vcpu.space);
-            child.personality = thread::Personality::Linux(
-                crate::kernel::linux::LinuxState::new());
+            child.personality = thread::Personality::Linux(crate::kernel::linux::LinuxState::new());
             child.kernel.state = thread::ThreadState::Unused;
         }
         let parent = thread::get_thread(threads, parent_tid).unwrap();
         parent.personality.on_resume(machine);
         if let Some(display) = fork_display {
             if crate::kernel::osd::is_open()
-                || matches!(parent.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+                || matches!(
+                    parent.personality,
+                    thread::Personality::Linux(_)
+                        | thread::Personality::Os2(_)
+                        | thread::Personality::Windows(_)
+                )
             {
                 *event_display = Some(display.into_surface(machine, bios_workspace));
             } else {
-                parent.personality.acquire_display_restore(machine, bios_workspace, display);
+                parent
+                    .personality
+                    .acquire_display_restore(machine, bios_workspace, display);
             }
         }
         if parent_was_focused {
@@ -1379,16 +1702,25 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     if let Some(display) = fork_display {
         let child = thread::get_thread(threads, child_tid).unwrap();
         if crate::kernel::osd::is_open()
-            || matches!(child.personality, thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+            || matches!(
+                child.personality,
+                thread::Personality::Linux(_)
+                    | thread::Personality::Os2(_)
+                    | thread::Personality::Windows(_)
+            )
         {
             *event_display = Some(display.into_surface(machine, bios_workspace));
         } else {
-            child.personality.acquire_display_replace(machine, bios_workspace, display);
+            child
+                .personality
+                .acquire_display_replace(machine, bios_workspace, display);
         }
     }
     if parent_was_focused {
-        *sb_handoff = thread::get_thread(threads, child_tid).unwrap()
-            .personality.adopt_sb(machine, fork_sb);
+        *sb_handoff = thread::get_thread(threads, child_tid)
+            .unwrap()
+            .personality
+            .adopt_sb(machine, fork_sb);
     }
 
     let child = thread::get_thread(threads, child_tid).unwrap();
@@ -1477,7 +1809,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // Switch focus to child. Parent stays Ready; it'll poll SYNTH_WAITPID
     // when focus returns to it. No kernel-side blocking — the focused thread
     // runs continuously, so polling is just a status query.
-    crate::dbg_println!("  child tid={}, parent tid={} continues without blocking", child_tid, parent_tid);
+    crate::dbg_println!(
+        "  child tid={}, parent tid={} continues without blocking",
+        child_tid,
+        parent_tid
+    );
     on_success(vcpu, child_tid as i32);
     {
         let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
@@ -1490,8 +1826,6 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     Some(child_tid)
 }
 
-
-
 /// F12 handler: dump the user thread state that was interrupted when F12 was
 /// pressed. `regs` is always a user frame — the kernel event loop is never
 /// interrupted by hardware IRQs.
@@ -1501,11 +1835,19 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 ///
 /// `dos` (when present) adds virtual PIC/PIT state — useful for diagnosing
 /// stuck IRQ delivery (e.g. an in-service bit never cleared by a missed EOI).
-pub fn arch_dump_exception<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+pub fn arch_dump_exception<A: crate::Arch>(
+    machine: &mut A,
+    dos: &thread::DosState<A>,
+    regs: &Regs,
+) {
     dump_interrupted_thread(machine, regs, Some(dos));
 }
 
-pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Regs, dos: Option<&thread::DosState<A>>) {
+pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
+    machine: &mut A,
+    regs: &Regs,
+    dos: Option<&thread::DosState<A>>,
+) {
     let vm86 = regs.flags32() & (1 << 17) != 0;
     if vm86 {
         // The guest's interrupt flag is VIF (bit 19); canonical bit 9 is
@@ -1517,13 +1859,32 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
         let mut b = [0u8; 8];
         machine.copy_from(lin as usize, &mut b);
         let ticks = crate::kernel::dos::Bda::tick_count(machine);
-        crate::dbg_println!("[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-            regs.code_seg(), regs.ip32(),
-            regs.rax as u16, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-            regs.ds as u16, regs.stack_seg(), regs.sp32(),
-            regs.flags32() as u16, vif as u8, ticks,
-            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]);
-        if let Some(d) = dos { dump_virtual_hw(d); }
+        crate::dbg_println!(
+            "[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+            regs.code_seg(),
+            regs.ip32(),
+            regs.rax as u16,
+            regs.rbx as u16,
+            regs.rcx as u16,
+            regs.rdx as u16,
+            regs.ds as u16,
+            regs.stack_seg(),
+            regs.sp32(),
+            regs.flags32() as u16,
+            vif as u8,
+            ticks,
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7]
+        );
+        if let Some(d) = dos {
+            dump_virtual_hw(d);
+        }
         // Dump VGA hardware register state (which one differs vs working
         // is the first thing to check when buffer paints but screen is
         // black — most often SEQ[1] bit 5 = screen-off, GC[6] framebuffer
@@ -1533,22 +1894,61 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
             let _ = inb(0x3DA);
             let misc = inb(0x3CC);
             let mut seq = [0u8; 5];
-            for i in 0..5u8 { outb(0x3C4, i); seq[i as usize] = inb(0x3C5); }
+            for i in 0..5u8 {
+                outb(0x3C4, i);
+                seq[i as usize] = inb(0x3C5);
+            }
             let mut crtc = [0u8; 25];
-            for i in 0..25u8 { outb(0x3D4, i); crtc[i as usize] = inb(0x3D5); }
+            for i in 0..25u8 {
+                outb(0x3D4, i);
+                crtc[i as usize] = inb(0x3D5);
+            }
             let mut gc = [0u8; 9];
-            for i in 0..9u8 { outb(0x3CE, i); gc[i as usize] = inb(0x3CF); }
+            for i in 0..9u8 {
+                outb(0x3CE, i);
+                gc[i as usize] = inb(0x3CF);
+            }
             let _ = inb(0x3DA);
             let mut ac = [0u8; 21];
-            for i in 0..21u8 { let _ = inb(0x3DA); outb(0x3C0, i | 0x20); ac[i as usize] = inb(0x3C1); }
+            for i in 0..21u8 {
+                let _ = inb(0x3DA);
+                outb(0x3C0, i | 0x20);
+                ac[i as usize] = inb(0x3C1);
+            }
             let _ = inb(0x3DA);
-            outb(0x3C0, 0x20);   // re-enable display by setting PAS
-            crate::dbg_println!("[VGA HW] misc={:02X} seq=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
-                misc, seq[0], seq[1], seq[2], seq[3], seq[4]);
-            crate::dbg_println!("[VGA HW] gc=[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",
-                gc[0], gc[1], gc[2], gc[3], gc[4], gc[5], gc[6], gc[7], gc[8]);
-            crate::dbg_println!("[VGA HW] ac[10..14]={:02X} {:02X} {:02X} {:02X}  crtc[0C..0F]={:02X} {:02X} {:02X} {:02X}",
-                ac[0x10], ac[0x11], ac[0x12], ac[0x13], crtc[0x0C], crtc[0x0D], crtc[0x0E], crtc[0x0F]);
+            outb(0x3C0, 0x20); // re-enable display by setting PAS
+            crate::dbg_println!(
+                "[VGA HW] misc={:02X} seq=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
+                misc,
+                seq[0],
+                seq[1],
+                seq[2],
+                seq[3],
+                seq[4]
+            );
+            crate::dbg_println!(
+                "[VGA HW] gc=[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",
+                gc[0],
+                gc[1],
+                gc[2],
+                gc[3],
+                gc[4],
+                gc[5],
+                gc[6],
+                gc[7],
+                gc[8]
+            );
+            crate::dbg_println!(
+                "[VGA HW] ac[10..14]={:02X} {:02X} {:02X} {:02X}  crtc[0C..0F]={:02X} {:02X} {:02X} {:02X}",
+                ac[0x10],
+                ac[0x11],
+                ac[0x12],
+                ac[0x13],
+                crtc[0x0C],
+                crtc[0x0D],
+                crtc[0x0E],
+                crtc[0x0F]
+            );
         }
         // Dump VGA text buffer (80x25, char+attr interleaved at 0xB8000).
         // Through arch::mem() so it works on both backends — `0xB8000` is a
@@ -1562,18 +1962,41 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
                 let ch = vga[(row * 80 + col) * 2];
                 line[col] = if (0x20..0x7F).contains(&ch) { ch } else { b'.' };
             }
-            crate::dbg_println!("[VGA {:02}] {}", row,
-                core::str::from_utf8(&line).unwrap_or("???"));
+            crate::dbg_println!(
+                "[VGA {:02}] {}",
+                row,
+                core::str::from_utf8(&line).unwrap_or("???")
+            );
         }
     } else {
         let fl = regs.flags32();
-        crate::dbg_println!("[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={} vIOPL={}",
-            regs.code_seg(), regs.ip32(), regs.stack_seg(), regs.sp32(), fl, (fl >> 19) & 1, (fl >> 12) & 3);
-        crate::dbg_println!("[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
-            regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
-            regs.rsi as u32, regs.rdi as u32, regs.rbp as u32);
-        crate::dbg_println!("[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
-            regs.ds as u16, regs.es as u16, regs.fs as u16, regs.gs as u16);
+        crate::dbg_println!(
+            "[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={} vIOPL={}",
+            regs.code_seg(),
+            regs.ip32(),
+            regs.stack_seg(),
+            regs.sp32(),
+            fl,
+            (fl >> 19) & 1,
+            (fl >> 12) & 3
+        );
+        crate::dbg_println!(
+            "[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
+            regs.rax as u32,
+            regs.rbx as u32,
+            regs.rcx as u32,
+            regs.rdx as u32,
+            regs.rsi as u32,
+            regs.rdi as u32,
+            regs.rbp as u32
+        );
+        crate::dbg_println!(
+            "[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
+            regs.ds as u16,
+            regs.es as u16,
+            regs.fs as u16,
+            regs.gs as u16
+        );
         if let Some(d) = dos {
             crate::kernel::dos::dump_dpmi_state(machine, d, regs);
             dump_virtual_hw(d);
@@ -1588,18 +2011,31 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(machine: &mut A, regs: &Re
 /// requested-but-masked line.
 fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
-    crate::dbg_println!("[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
-        mirr, misr, mimr, sirr, sisr, simr);
+    crate::dbg_println!(
+        "[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
+        mirr,
+        misr,
+        mimr,
+        sirr,
+        sisr,
+        simr
+    );
 
     let (en, mode, reload, now, next) = dos.pc.vpit.debug_state();
     let delta = (next as i64).wrapping_sub(now as i64);
-    crate::dbg_println!("[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
-        en, mode, reload, now, next, delta);
+    crate::dbg_println!(
+        "[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
+        en,
+        mode,
+        reload,
+        now,
+        next,
+        delta
+    );
 
     crate::kernel::dos::dump_if_ring();
     crate::kernel::dos::dump_gus_ring();
 }
-
 
 /// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
 /// the periodic [prof] dump, and the free-page low-water sampling. Keeps
@@ -1616,8 +2052,12 @@ static mut PRESENTS: u64 = 0;
 /// shadow or one whole window-sink frame per bill), VGA render cycles, final
 /// framebuffer/window publication cycles, and destination pixels written.
 static mut DISP_PARTS: [u64; 5] = [0; 5];
-static mut DISP_MODE: vga::VgaMode =
-    vga::VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 };
+static mut DISP_MODE: vga::VgaMode = vga::VgaMode::Text {
+    cols: 80,
+    rows: 25,
+    cell_w: 9,
+    cell_h: 16,
+};
 
 pub fn bill_display(
     mode: vga::VgaMode,
@@ -1914,7 +2354,9 @@ impl EventStats {
     /// Bill dispatch cycles to the port that caused them, so an expensive
     /// HANDLER is distinguishable from a merely popular port.
     fn bill_port(&mut self, cycles: u64) {
-        let Some(port) = self.last_port.take() else { return };
+        let Some(port) = self.last_port.take() else {
+            return;
+        };
         for e in self.ports.iter_mut() {
             if e.0 == port && e.1 != 0 {
                 e.2 = e.2.wrapping_add(cycles);
@@ -1932,9 +2374,7 @@ impl EventStats {
         use crate::KernelEvent as KE;
         let now = machine.rdtsc();
         let guest_cycles = now.wrapping_sub(self.last_kernel_entry);
-        self.user_cycles = self
-            .user_cycles
-            .wrapping_add(guest_cycles);
+        self.user_cycles = self.user_cycles.wrapping_add(guest_cycles);
         self.last_kernel_entry = now;
         let idx = match kevent {
             KE::Irq => 0,
@@ -1984,11 +2424,15 @@ impl EventStats {
             if profile_enabled() {
                 let total = self.user_cycles.wrapping_add(self.kernel_cycles);
                 let pct10 = |v: u64| {
-                    v.saturating_mul(1000).checked_div(total.max(1)).unwrap_or(0)
+                    v.saturating_mul(1000)
+                        .checked_div(total.max(1))
+                        .unwrap_or(0)
                 };
                 // Average dispatch cost for the two hottest event kinds.
                 let cost = |i: usize| -> u64 {
-                    self.dispatch_cycles[i].checked_div(self.counts[i].max(1) as u64).unwrap_or(0)
+                    self.dispatch_cycles[i]
+                        .checked_div(self.counts[i].max(1) as u64)
+                        .unwrap_or(0)
                 };
                 let c = &self.counts;
                 // The three hottest vectors, so a polling loop names itself.
@@ -2000,7 +2444,9 @@ impl EventStats {
                     }
                 }
                 let ev = self.iterations.max(1);
-                let dispatch_total = self.dispatch_cycles.iter()
+                let dispatch_total = self
+                    .dispatch_cycles
+                    .iter()
                     .fold(0u64, |sum, &v| sum.wrapping_add(v));
                 let scheduler_total = self.post_cycles.saturating_sub(dispatch_total);
                 let sp = unsafe { SLICE_PARTS };
@@ -2014,7 +2460,11 @@ impl EventStats {
                     .wrapping_add(self.pre_parts[3])
                     .wrapping_add(self.pre_parts[4]);
                 let world_other = self.pre_parts[2].saturating_sub(
-                    sp[0].saturating_add(sp[1]).saturating_add(sp[2]).saturating_add(sp[3]));
+                    sp[0]
+                        .saturating_add(sp[1])
+                        .saturating_add(sp[2])
+                        .saturating_add(sp[3]),
+                );
                 let accounted = sp[2]
                     .saturating_add(sp[3])
                     .saturating_add(dispatch_total)
@@ -2027,8 +2477,14 @@ impl EventStats {
                 let kernel = pct10(self.kernel_cycles);
                 crate::dbg_println!(
                     "[prof] CPU: guest={}.{}% kernel={}.{}% ticks={} at={:04X}:{:08X}",
-                    user / 10, user % 10, kernel / 10, kernel % 10,
-                    machine.get_ticks(), regs.code_seg(), regs.ip32());
+                    user / 10,
+                    user % 10,
+                    kernel / 10,
+                    kernel % 10,
+                    machine.get_ticks(),
+                    regs.code_seg(),
+                    regs.ip32()
+                );
                 let display = pct10(sp[2]);
                 let audio = pct10(sp[3]);
                 let dispatch = pct10(dispatch_total);
@@ -2042,71 +2498,142 @@ impl EventStats {
                 let other_pct = pct10(other);
                 crate::dbg_println!(
                     "[prof] kernel: display={}.{}% audio={}.{}% dispatch={}.{}% irq-drain={}.{}% loop={}.{}% sched={}.{}% world-other={}.{}% other={}.{}%",
-                    display / 10, display % 10, audio / 10, audio % 10,
-                    dispatch / 10, dispatch % 10, irq_drain / 10, irq_drain % 10,
-                    loop_pct / 10, loop_pct % 10, sched / 10, sched % 10,
-                    world / 10, world % 10, other_pct / 10, other_pct % 10);
+                    display / 10,
+                    display % 10,
+                    audio / 10,
+                    audio % 10,
+                    dispatch / 10,
+                    dispatch % 10,
+                    irq_drain / 10,
+                    irq_drain % 10,
+                    loop_pct / 10,
+                    loop_pct % 10,
+                    sched / 10,
+                    sched % 10,
+                    world / 10,
+                    world % 10,
+                    other_pct / 10,
+                    other_pct % 10
+                );
                 crate::dbg_println!(
                     "[prof] loop: clock={}.{}% console={}.{}% after-input={}.{}%",
-                    clock_pct / 10, clock_pct % 10,
-                    console_pct / 10, console_pct % 10,
-                    after_input_pct / 10, after_input_pct % 10);
+                    clock_pct / 10,
+                    clock_pct % 10,
+                    console_pct / 10,
+                    console_pct % 10,
+                    after_input_pct / 10,
+                    after_input_pct % 10
+                );
                 let scanout = pct10(dp[0]);
                 let render = pct10(dp[2]);
                 let present = pct10(dp[3]);
                 let per_frame = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
                 crate::dbg_println!(
                     "[prof] display: {:?} | {} frames, {} renders, {} px/frame | scanout={}.{}% render={}.{}% present={}.{}% | cycles/frame render={} present={}",
-                    dm, np, dp[1], dp[4].checked_div(np.max(1)).unwrap_or(0),
-                    scanout / 10, scanout % 10, render / 10, render % 10,
-                    present / 10, present % 10,
-                    per_frame(dp[2]), per_frame(dp[3]));
+                    dm,
+                    np,
+                    dp[1],
+                    dp[4].checked_div(np.max(1)).unwrap_or(0),
+                    scanout / 10,
+                    scanout % 10,
+                    render / 10,
+                    render % 10,
+                    present / 10,
+                    present % 10,
+                    per_frame(dp[2]),
+                    per_frame(dp[3])
+                );
                 let devices = pct10(ap[0]);
                 let setup = pct10(ap[1]);
                 let pump = pct10(ap[2]);
                 let clocks = pct10(ap[3]);
                 crate::dbg_println!(
                     "[prof] audio: pump={}.{}% devices={}.{}% setup={}.{}% clocks/irqs={}.{}% | generated={} frames",
-                    pump / 10, pump % 10, devices / 10, devices % 10,
-                    setup / 10, setup % 10, clocks / 10, clocks % 10, ap[4]);
+                    pump / 10,
+                    pump % 10,
+                    devices / 10,
+                    devices % 10,
+                    setup / 10,
+                    setup % 10,
+                    clocks / 10,
+                    clocks % 10,
+                    ap[4]
+                );
                 crate::dbg_println!(
                     "[prof] audio service: sb={}c gus={}c mpu={}c",
-                    asp[0], asp[1], asp[2]);
+                    asp[0],
+                    asp[1],
+                    asp[2]
+                );
                 crate::dbg_println!(
                     "[prof] audio sources: sb={}c gus={}c mpu={}c speaker={}c",
-                    asrc[0], asrc[1], asrc[2], asrc[3]);
+                    asrc[0],
+                    asrc[1],
+                    asrc[2],
+                    asrc[3]
+                );
                 crate::dbg_println!(
                     "[prof] exits: {} total | softint={}@{}c in={}@{}c out={}@{}c irq={}@{}c pf={} syscall={}",
-                    ev, c[1], cost(1), c[3], cost(3), c[4], cost(4),
-                    c[0], cost(0), c[8], c[10]);
+                    ev,
+                    c[1],
+                    cost(1),
+                    c[3],
+                    cost(3),
+                    c[4],
+                    cost(4),
+                    c[0],
+                    cost(0),
+                    c[8],
+                    c[10]
+                );
                 let event_names = [
-                    "irq", "softint/vif", "hlt", "in", "out", "ins",
-                    "outs", "fault", "page-fault", "exception", "syscall",
+                    "irq",
+                    "softint/vif",
+                    "hlt",
+                    "in",
+                    "out",
+                    "ins",
+                    "outs",
+                    "fault",
+                    "page-fault",
+                    "exception",
+                    "syscall",
                 ];
                 crate::dbg_println!(
                     "[prof] longest guest={}c entry={:04X}:{:08X} flags={:08X} (VIF={}) exit={:04X}:{:08X} flags={:08X} (VIF={}) via {}",
                     self.longest_guest_cycles,
-                    self.longest_guest_entry_cs, self.longest_guest_entry_ip,
+                    self.longest_guest_entry_cs,
+                    self.longest_guest_entry_ip,
                     self.longest_guest_entry_flags,
                     (self.longest_guest_entry_flags >> 19) & 1,
-                    self.longest_guest_exit_cs, self.longest_guest_exit_ip,
+                    self.longest_guest_exit_cs,
+                    self.longest_guest_exit_ip,
                     self.longest_guest_exit_flags,
                     (self.longest_guest_exit_flags >> 19) & 1,
-                    event_names[self.longest_guest_exit_kind]);
+                    event_names[self.longest_guest_exit_kind]
+                );
                 let fixed = loop_total
                     .saturating_add(self.pre_parts[1])
                     .checked_div(ev)
                     .unwrap_or(0);
                 crate::dbg_println!(
                     "[prof] per-exit fixed={}c (loop={} irq-drain={}) | world: advances={} timer={}c/advance unclassified={} cycles",
-                    fixed, loop_total / ev, self.pre_parts[1] / ev, sp[4],
-                    sp[1].checked_div(sp[4].max(1)).unwrap_or(0), world_other);
+                    fixed,
+                    loop_total / ev,
+                    self.pre_parts[1] / ev,
+                    sp[4],
+                    sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
+                    world_other
+                );
                 let (allocations, deallocations) = lib::heap::allocation_counts();
                 crate::dbg_println!(
                     "[prof] heap: allocations={} (+{}) deallocations={} (+{}) live={}",
-                    allocations, allocations.wrapping_sub(self.last_allocations),
-                    deallocations, deallocations.wrapping_sub(self.last_deallocations),
-                    allocations.wrapping_sub(deallocations));
+                    allocations,
+                    allocations.wrapping_sub(self.last_allocations),
+                    deallocations,
+                    deallocations.wrapping_sub(self.last_deallocations),
+                    allocations.wrapping_sub(deallocations)
+                );
                 unsafe { SLICE_PARTS = [0; 5] };
                 unsafe { DISP_PARTS = [0; 5] };
                 unsafe { AUDIO_PARTS = [0; 5] };
@@ -2119,27 +2646,44 @@ impl EventStats {
                     let per = |e: (u16, u32, u64)| e.2.checked_div(e.1.max(1) as u64).unwrap_or(0);
                     crate::dbg_println!(
                         "[prof] ports: {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c other={}",
-                        p[0].0, p[0].1, per(p[0]), p[1].0, p[1].1, per(p[1]),
-                        p[2].0, p[2].1, per(p[2]), p[3].0, p[3].1, per(p[3]),
-                        p[4].0, p[4].1, per(p[4]), self.port_other);
+                        p[0].0,
+                        p[0].1,
+                        per(p[0]),
+                        p[1].0,
+                        p[1].1,
+                        per(p[1]),
+                        p[2].0,
+                        p[2].1,
+                        per(p[2]),
+                        p[3].0,
+                        p[3].1,
+                        per(p[3]),
+                        p[4].0,
+                        p[4].1,
+                        per(p[4]),
+                        self.port_other
+                    );
                 }
                 if c[1] > 0 {
-                    crate::dbg_println!("[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
-                        top[0].1, top[0].0, top[1].1, top[1].0, top[2].1, top[2].0);
-                }
-                // Disk I/O per directory entry — the ratio that says whether a
-                // slow listing is MANY reads (cache) or SLOW reads (driver).
-                let io = crate::kernel::iostat::snapshot();
-                if io.vol_reads > 0 || io.dirents > 0 {
-                    let per = |v: u64| v.checked_div(io.dirents.max(1)).unwrap_or(0);
                     crate::dbg_println!(
-                        "[io] reads={} ({} sectors, {} sec/read) bread={} | readdir: opens={} entries={} => {} reads/entry | resolve={} symprobe={} ({} probes/resolve) stat={}",
-                        io.vol_reads, io.vol_sectors,
-                        io.vol_sectors.checked_div(io.vol_reads.max(1)).unwrap_or(0),
-                        io.breads, io.dir_opens, io.dirents, per(io.vol_reads),
-                        io.resolves, io.symlink_probes,
-                        io.symlink_probes.checked_div(io.resolves.max(1)).unwrap_or(0),
-                        io.stats);
+                        "[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
+                        top[0].1,
+                        top[0].0,
+                        top[1].1,
+                        top[1].0,
+                        top[2].1,
+                        top[2].0
+                    );
+                }
+                // Disk I/O volume and average request size.
+                let io = crate::kernel::iostat::snapshot();
+                if io.vol_reads > 0 {
+                    crate::dbg_println!(
+                        "[io] reads={} ({} sectors, {} sec/read)",
+                        io.vol_reads,
+                        io.vol_sectors,
+                        io.vol_sectors.checked_div(io.vol_reads).unwrap_or(0),
+                    );
                 }
                 crate::kernel::iostat::reset();
             }

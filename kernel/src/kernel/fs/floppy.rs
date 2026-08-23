@@ -368,8 +368,11 @@ impl Filesystem for FloppySlot {
                 name_len,
                 size: entry.len().min(u32::MAX as u64) as u32,
                 is_dir: entry.is_dir(),
+                is_symlink: false,
                 mode: if entry.is_dir() { 0o555 } else { 0o444 },
                 mtime: unix_from_datetime(&entry.modified()),
+                node: 0,
+                mount_idx: 0,
             };
             de.name[..name_len].copy_from_slice(&short[..name_len]);
             out.push(de);

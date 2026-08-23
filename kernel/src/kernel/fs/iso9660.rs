@@ -459,8 +459,11 @@ impl Filesystem for Iso9660Fs {
                 name_len,
                 size: entry.total_size().min(u32::MAX as u64) as u32,
                 is_dir: entry.is_directory(),
+                is_symlink: false,
                 mode: if entry.is_directory() { 0o555 } else { 0o444 },
                 mtime: 0,
+                node: 0,
+                mount_idx: 0,
             };
             result.name[..name_len].copy_from_slice(&bytes[..name_len]);
             out.push(result);
