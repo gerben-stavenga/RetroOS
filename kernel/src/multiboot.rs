@@ -313,7 +313,7 @@ pub fn mount_modules(
         let disk: &'static dyn Disk = Box::leak(Box::new(
             crate::kernel::block::overlay::RamOverlay::wrap(disk),
         ));
-        let volume = Volume::whole(disk);
+        let volume = crate::kernel::block::cache::volume(Volume::whole(disk));
         assert!(is_ext(&volume), "Multiboot module is not a raw ext4 image");
         let fs = PortableExt4Fs::new(volume)
             .unwrap_or_else(|error| panic!("portable Multiboot ext4 mount failed: {}", error));

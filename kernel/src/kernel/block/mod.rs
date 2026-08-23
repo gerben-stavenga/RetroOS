@@ -11,6 +11,7 @@
 
 use alloc::{boxed::Box, vec::Vec};
 
+pub mod cache;
 pub mod overlay;
 pub mod partition;
 use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
@@ -84,7 +85,6 @@ impl Volume {
         if inside.is_empty() {
             return 0;
         }
-        crate::kernel::iostat::vol_read(inside.len().div_ceil(512) as u64);
         self.disk.read(self.start + lba, inside)
     }
 

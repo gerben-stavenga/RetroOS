@@ -1,8 +1,7 @@
 //! I/O counters for the profile dump — temporary diagnostics.
 //!
-//! These count volume reads and request sizes without coupling the diagnostic
-//! to a particular filesystem implementation. They distinguish repeated
-//! metadata reads from expensive device operations.
+//! These count cache misses sent to the composed backing disk and their
+//! request sizes, without coupling the diagnostic to a filesystem.
 //!
 //! Single-threaded kernel/event-loop context, same argument as `SLICE_PARTS`
 //! in `startup`: plain statics, no locking. Increments are unconditional —
@@ -13,7 +12,7 @@
 /// copy and reset is one store, matching the `SLICE_PARTS` idiom.
 #[derive(Clone, Copy, Default)]
 pub struct IoStats {
-    /// `Volume::read` calls — every read the filesystems make, post-cache.
+    /// Backing-disk reads issued on cache misses.
     pub vol_reads: u64,
     /// Sectors those calls asked for, to show the average request size.
     pub vol_sectors: u64,

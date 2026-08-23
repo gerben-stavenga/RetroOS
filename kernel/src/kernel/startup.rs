@@ -354,6 +354,7 @@ fn mount_filesystems(
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
         .map(|p| p.volume)
+        .map(crate::kernel::block::cache::volume)
         .filter(crate::kernel::fs::portable_ext4::is_ext)
         .collect();
 
