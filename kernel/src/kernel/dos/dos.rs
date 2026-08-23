@@ -613,6 +613,14 @@ pub(super) fn pmdos_int33_handler<A: crate::Arch>(machine: &mut A, dos: &mut thr
     thread::KernelAction::Done
 }
 
+fn translate_rm_low_pointer(seg: u16, off: u16) -> (u16, u16) {
+    let linear = u32::from(seg) * 16 + u32::from(off);
+    // The substitute BIOS fonts live in the first 64 KiB, so 16-bit clients
+    // can address them through the existing base-zero low-memory descriptor.
+    assert!(linear <= u32::from(u16::MAX), "translated BIOS pointer exceeds 16-bit LOW_MEM_SEL reach");
+    (super::dpmi::LOW_MEM_SEL, linear as u16)
+}
+
 /// PM INT 10h direct-service path. Video BIOS calls commonly carry buffers in
 /// ES:DI or ES:DX; keeping the client in protected mode lets the BIOS handler
 /// resolve those selectors through the LDT instead of mistaking them for
@@ -623,10 +631,33 @@ pub(super) fn pmdos_int10_handler<A: crate::Arch>(
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
 ) -> thread::KernelAction {
+    let ax = regs.rax as u16;
     super::bios::int10(machine, bios_display, dos, regs);
+    // DPMI default reflection does not transfer segment registers between
+    // modes. Pointer-bearing BIOS APIs therefore belong to this API translator,
+    // not to the real-mode BIOS implementation. AX=1130h returns ES:BP as a
+    // real-mode font pointer; convert it before the exit stub reloads ES.
+    if ax == 0x1130 {
+        let (es, bp) = translate_rm_low_pointer(regs.es as u16, regs.rbp as u16);
+        regs.es = u64::from(es);
+        regs.rbp = (regs.rbp & !0xFFFF) | u64::from(bp);
+    }
     // INT 10h itself never blocks; see the nested-call ownership note above.
     finish_dos_call(machine, dos, regs);
     thread::KernelAction::Done
+}
+
+#[cfg(test)]
+mod pmdos_translation_tests {
+    use super::translate_rm_low_pointer;
+
+    #[test]
+    fn font_pointer_becomes_a_protected_mode_low_memory_pointer() {
+        assert_eq!(
+            translate_rm_low_pointer(0x0339, 0),
+            (super::super::dpmi::LOW_MEM_SEL, 0x3390),
+        );
+    }
 }
 
 /// Resume the user after a kernel-serviced DOS call. Mode-aware: the call
