@@ -221,9 +221,9 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     }
 }
 
-/// Allocate `num_pages` physically contiguous, ISA-DMA-safe pages
-/// (< 16 MB, not crossing a `1 << boundary_log2` boundary). Returns the
-/// starting physical page number, or 0 on failure.
+/// Allocate `num_pages` physically contiguous DMA pages. A nonzero
+/// `boundary_log2` requests an ISA-DMA-safe run; zero permits general RAM.
+/// Returns the starting physical page number, or 0 on failure.
 #[allow(dead_code)]
 pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
     let r: u32;

@@ -1625,20 +1625,16 @@ fn split_parent_bytes(path: &[u8]) -> Option<(&[u8], &[u8])> {
 /// If a mount prefix is a direct child of `dir`, return the child name.
 /// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
 fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    if prefix.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&prefix[..dir.len()], dir) { return None; }
-    let rest = &prefix[dir.len()..];
-    let name = rest.strip_suffix(b"/")?;
-    if name.is_empty() || name.contains(&b'/') { return None; }
-    Some(name)
+    let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
+    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+    let (parent, name) = split_parent_bytes(prefix)?;
+    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
 }
 
 fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    if entry_name.len() <= dir.len() { return None; }
-    if !dir.is_empty() && !eq_ignore_case(&entry_name[..dir.len()], dir) { return None; }
-    let rest = &entry_name[dir.len()..];
-    if rest.contains(&b'/') { return None; }
-    Some(rest)
+    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
+    let (parent, name) = split_parent_bytes(entry_name)?;
+    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
 }
 
 // ============================================================================
@@ -2090,7 +2086,10 @@ pub fn file_mode_by_handle(handle: i32) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirEntry, Filesystem, Vfs, Vnode, WriteAccess};
+    use super::{
+        DirEntry, Filesystem, Vfs, Vnode, WriteAccess, entry_in_ram_dir,
+        mount_child_in_dir,
+    };
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -2139,6 +2138,22 @@ mod tests {
         assert_eq!(vfs.create_to_handle(b"failed.txt"), -13);
         assert!(CREATE_CALLED.load(Ordering::Relaxed));
         assert!(!vfs.ram_files.contains_key(b"failed.txt".as_slice()));
+    }
+
+    #[test]
+    fn nested_mounts_and_ram_entries_accept_normalized_directory_paths() {
+        assert_eq!(
+            mount_child_in_dir(b"home/retroos/proc/", b"home/retroos"),
+            Some(&b"proc"[..]),
+        );
+        assert_eq!(
+            mount_child_in_dir(b"home/retroos/proc/", b"home/retroos/"),
+            Some(&b"proc"[..]),
+        );
+        assert_eq!(
+            entry_in_ram_dir(b"home/retroos/scratch", b"home/retroos"),
+            Some(&b"scratch"[..]),
+        );
     }
 
     struct NodeFs;

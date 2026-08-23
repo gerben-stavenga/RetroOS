@@ -13,7 +13,7 @@
 //!    programmed by sending *verbs* over the **CORB/RIRB** DMA rings, then a
 //!    stream descriptor + BDL feed PCM exactly like AC'97's bus master.
 //!
-//! Ring geometry mirrors `ac97`: a ring of small PCM buffers in a borrowed
+//! Ring geometry mirrors `ac97`: a ring of small PCM buffers in a dedicated
 //! contiguous DMA buffer, primed then run. The regular system tick polls
 //! SDLPIB and the producer refills every completed buffer; playback requests no
 //! completion interrupts.
@@ -31,12 +31,12 @@
 //!
 //! ## DMA buffer placement (TEMPORARY — same stopgap as ac97)
 //!
-//! We borrow a `dma_channel_buf` (physically contiguous) and map it into kernel
+//! We allocate a physically contiguous PCI DMA buffer and map it into kernel
 //! space over the dead upper-memory slice of the low-mem identity window
 //! (`LOW_MEM_BASE + 0xC0000..`). See `ac97`'s header and memory
 //! `project_ac97_lowmem_dma_window_todo`; the proper fix is a real kernel
 //! DMA-window pool. HDA and AC'97 are mutually exclusive (one `Audio` verdict),
-//! so reusing the same window + DMA channel is safe.
+//! so reusing the same virtual window is safe.
 
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -48,10 +48,6 @@ const BAR_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
 const BAR_PAGES: usize = 4;
 /// DMA buffer window: CORB + RIRB + BDL + the PCM ring.
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_8000;
-/// Borrow the 16-bit ISA DMA channel's permanent contiguous buffer (128 KB / 32
-/// pages). Free on an HDA host — the SB is emulated, not passed through, so the
-/// real ISA channels are idle.
-const DMA_CHANNEL: usize = 5;
 
 // ── Controller registers (offsets into BAR0) ─────────────────────────────────
 const GCAP: usize = 0x00; // w16: bits 8..11 ISS, 12..15 OSS
@@ -621,8 +617,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     let iss = ((gcap >> 8) & 0xF) as usize;
     let sd = SD_BASE + iss * SD_STRIDE;
 
-    // Map the borrowed contiguous DMA buffer.
-    let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
+    // PCI bus mastering needs contiguous memory, but has no ISA placement or
+    // boundary constraint.
+    let phys_page = machine.alloc_phys_contig(DMA_PAGES, 0);
     if phys_page == 0 {
         crate::println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
         return None;

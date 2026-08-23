@@ -222,6 +222,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     crate::multiboot::reserve_modules(&boot_modules_raw, |start, end| {
         phys_mm::mark_reserved(start, end)
     });
+    phys_mm::reserve_dma_regions();
 
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,

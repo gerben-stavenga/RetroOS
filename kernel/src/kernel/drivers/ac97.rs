@@ -5,14 +5,14 @@
 //! needs somewhere to play it. This driver is that sink on metal: `sound::play`
 //! dispatches here when [`probe`] discovered a codec at boot (PCI class 04:01).
 //! It uses only machine *primitives* — 32-bit port I/O (`inl`/`outl`, for PCI
-//! config + the AC'97 bus-master registers), `dma_channel_buf` (the existing
+//! config + the AC'97 bus-master registers), `alloc_phys_contig` (a dedicated
 //! contiguous DMA buffer), and `map_phys_range` (to map that buffer into kernel
 //! space) — never any machine-side driver logic.
 //!
 //! ## DMA buffer (TEMPORARY placement — see the load-bearing note below)
 //!
 //! The codec bus-masters PCM out of a buffer the kernel must also be able to
-//! *write*. We reuse a `dma_channel_buf` (physically contiguous, < 16 MB) and
+//! *write*. We allocate physically contiguous PCI DMA memory and
 //! map it into kernel space by **repurposing a dead slice of the low-mem
 //! identity window**: the kernel maps the whole first 1 MB at `LOW_MEM_BASE`,
 //! but only ever dereferences the DOS `LowMem` struct (~`0x500..0x3800`) and the
@@ -52,10 +52,6 @@ const PO_CR_RESET: u8 = 0x02;
 /// Kernel VA we steal from the low-mem identity window (over phys
 /// `0xC0000`, the dead upper-memory area) to map the channel buffer.
 const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
-/// DMA channel whose permanent contiguous buffer we borrow (16-bit channel →
-/// 128 KB / 32 pages). Free on a cardless host (the SB is emulated, not
-/// passed through, so it never touches the real channels).
-const DMA_CHANNEL: usize = 5;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 const BDL_BYTES: usize = 0x1000; // first page of the buffer holds the BDL
@@ -156,13 +152,13 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         }
     }
 
-    // Map the channel buffer into the stolen low-mem window VA so the kernel can
-    // write PCM into it; the codec reads it (and the BDL) by physical address.
-    let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
+    // Map a dedicated PCI DMA buffer into the stolen low-mem window VA so the
+    // kernel can write PCM into it; the codec reads it by physical address.
+    let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
+    let phys_page = machine.alloc_phys_contig(pages, 0);
     if phys_page == 0 {
         return None;
     }
-    let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
     machine.map_phys_range(DMA_WIN_VA >> 12, pages, phys_page, PTE_CACHE_DISABLE);
     let dma_phys = (phys_page * 0x1000) as u32;
 
