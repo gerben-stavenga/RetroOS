@@ -448,6 +448,21 @@ impl Display {
             fit_vga(fb.width, fb.height)
         }
     }
+    /// Output canvas used by the shared desktop. Hosted windows follow the
+    /// producer's natural size; a physical surface uses its already-selected
+    /// picture area so composition reaches [`Self::present`] without another
+    /// implicit scale.
+    pub fn composition_size(
+        &self,
+        natural_width: usize,
+        natural_height: usize,
+    ) -> (usize, usize) {
+        if matches!(self.backend, Backend::Host | Backend::Headless) {
+            (natural_width, natural_height)
+        } else {
+            self.fit()
+        }
+    }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
     /// Composite the system OSD into one completed packed shadow and publish
     /// it. This is the personality-independent frame boundary: DOS VGA,
@@ -858,13 +873,12 @@ pub fn beam_vretrace(s: &Scratch, now_tick: u64) -> Option<bool> {
     Some(s.phase < VRETRACE_STEPS)
 }
 
-pub enum ScanoutAction<'a> {
+pub enum ScanoutAction {
     None,
     Render,
     Publish {
         vga_height: usize,
         out_width: usize,
-        shadow: &'a mut [u8],
     },
 }
 
@@ -876,19 +890,23 @@ pub enum ScanoutAction<'a> {
 /// publishes that immutable shadow to GOP. This mirrors the natural cost split
 /// without first performing a 14 ms software scanout before the physical
 /// display performs another one.
-pub fn scanout_action<'a>(
-    s: &'a mut Scratch,
+pub fn scanout_action(
+    s: &mut Scratch,
     display: &Display,
     mode: vga::VgaMode,
     now_ns: u64,
     refresh_hz: u32,
-) -> ScanoutAction<'a> {
+    raster_size: Option<(usize, usize)>,
+) -> ScanoutAction {
     let (w, h) = vga::dimensions(mode);
     if w == 0 || h == 0 || refresh_hz == 0 {
         return ScanoutAction::None;
     }
     let (frame, phase) = beam_time(now_ns, refresh_hz);
-    let (out_w, out_h) = display.fit();
+    // Direct scanout chooses the fitted physical picture. A compositor asks
+    // for the guest's natural dimensions, which makes the very same stretched
+    // row rasterizer run at a horizontal ratio of exactly one.
+    let (out_w, out_h) = raster_size.unwrap_or_else(|| display.fit());
     // A sink SMALLER than the guest image is legal: the Bresenham walk in
     // `StretchRow` shrinks as readily as it stretches, and `present` drops
     // source rows the same way. Refusing it here is what made the 320x200
@@ -946,13 +964,12 @@ pub fn scanout_action<'a>(
         else {
             return ScanoutAction::None;
         };
-        let Some(shadow) = s.surface.get_mut(..len) else {
+        if s.surface.get(..len).is_none() {
             return ScanoutAction::None;
-        };
+        }
         ScanoutAction::Publish {
             vga_height: h,
             out_width: out_w,
-            shadow,
         }
     } else if frame != s.frame && phase >= VRETRACE_STEPS {
         s.frame = frame;
@@ -963,23 +980,38 @@ pub fn scanout_action<'a>(
     }
 }
 
+/// Transfer a completed packed shadow to its sink. The sink returns its prior
+/// front-buffer storage with [`recycle_shadow`], forming a copy-free swapchain.
+pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u8> {
+    core::mem::take(&mut s.surface)
+}
+
+pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u8>) {
+    s.surface = pixels;
+}
+
 /// Render one complete VGA image into the compact write-back shadow. Palette
 /// state is folded exactly once, so a completed shadow cannot contain bands
 /// from different DAC generations.
-pub fn render_shadow(
+fn raster_shadow(
     s: &mut Scratch,
-    display: &Display,
+    format: PixelFormat,
     frame: &vga::Frame,
+    out_w: usize,
 ) -> bool {
-    let format = display.rgb;
     let (w, h) = vga::dimensions(frame.mode);
-    let (out_w, _) = display.fit();
+    if w == 0 || h == 0 || out_w == 0 {
+        return false;
+    }
     let step = format.bytes_per_pixel as usize;
-    let row_bytes = out_w * step;
+    let Some(row_bytes) = out_w.checked_mul(step) else { return false };
+    let Some(pixels_bytes) = row_bytes.checked_mul(h) else { return false };
+    let Some(slack) = out_w.div_ceil(w).checked_mul(4) else { return false };
+    let Some(required) = pixels_bytes.checked_add(slack) else { return false };
     if s.mode != Some(frame.mode)
         || s.geo.0 != w
         || s.geo.1 != h
-        || s.surface.len() < row_bytes * h
+        || s.surface.len() < required
     {
         return false;
     }
@@ -990,8 +1022,53 @@ pub fn render_shadow(
     for sy in 0..h {
         vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
     }
+    true
+}
+
+pub fn render_shadow(
+    s: &mut Scratch,
+    display: &Display,
+    frame: &vga::Frame,
+) -> bool {
+    // `scanout_action` owns sink geometry. In particular, a desktop surface
+    // records the VGA width here while direct GOP scanout records its fitted
+    // width; both use the identical fused stretch/format-conversion loop.
+    let out_w = s.geo.2;
+    if !raster_shadow(s, display.rgb, frame, out_w) {
+        return false;
+    }
     s.ready = true;
     true
+}
+
+/// Render a completed frame for an immediate sink through the same fused
+/// row rasterizer used by paced direct scanout. Passing the VGA width makes
+/// composited scanout a stretch of one while retaining packed-format output.
+pub fn render_frame<'a>(
+    s: &'a mut Scratch,
+    display: &Display,
+    frame: &vga::Frame,
+    out_w: usize,
+) -> Option<&'a mut [u8]> {
+    let (w, h) = vga::dimensions(frame.mode);
+    if w == 0 || h == 0 || out_w == 0 {
+        return None;
+    }
+    let step = display.rgb.bytes_per_pixel as usize;
+    let bytes = out_w.checked_mul(h)?.checked_mul(step)?;
+    let slack = out_w.div_ceil(w).checked_mul(4)?;
+    let storage = bytes.checked_add(slack)?;
+    if s.surface.len() != storage {
+        s.surface.clear();
+        s.surface.resize(storage, 0);
+    }
+    s.geo = (w, h, out_w, h, out_w, h);
+    s.mode = Some(frame.mode);
+    s.ready = false;
+    if !raster_shadow(s, display.rgb, frame, out_w) {
+        return None;
+    }
+    s.surface.get_mut(..bytes)
 }
 
 /// Cheap diagnostic signature of the completed packed shadow. Sampling one

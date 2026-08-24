@@ -1319,7 +1319,7 @@ pub fn pump_fullscreen<A: crate::Arch>(
     now_ns: u64,
 ) {
     debug_assert!(dos.pc.vga.is_fullscreen());
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, None);
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, None, None);
 }
 
 /// Render state-only DOS VGA through the event loop's compositor display.
@@ -1330,9 +1330,19 @@ pub fn render<A: crate::Arch>(
     regs: &Regs,
     now_ns: u64,
     display: &mut crate::kernel::display::Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
 ) {
     debug_assert!(!dos.pc.vga.is_fullscreen());
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, Some(display));
+    present::display_tick(
+        machine,
+        bios,
+        &mut dos.pc,
+        regs,
+        now_ns,
+        Some(display),
+        Some((desktop, endpoint)),
+    );
 }
 
 /// Advance emulated audio playback and its guest-visible device events.

@@ -231,6 +231,8 @@ pub struct PcMachine {
     /// lifetime, which a field of `VgaState` could not satisfy.
     pub present_scratch: alloc::vec::Vec<u8>,
     pub present_fb: alloc::vec::Vec<u32>,
+    /// Output shadow after the retained DOS surface has crossed the shared scene.
+    pub present_scene: alloc::vec::Vec<u8>,
     /// Direct-display scanout scratch: palette, a completed WB shadow frame,
     /// and render/publish phase timing.
     pub present_scratch2: alloc::boxed::Box<crate::kernel::display::Scratch>,
@@ -567,6 +569,7 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).voodoo).write(voodoo);
             core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
+            core::ptr::addr_of_mut!((*p).present_scene).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).present_scratch2)
                 .write(crate::kernel::display::Scratch::new_boxed());
             core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());

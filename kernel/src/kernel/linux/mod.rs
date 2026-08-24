@@ -54,8 +54,10 @@ pub fn render<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::display::Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
 ) {
-    crate::kernel::term::present(machine, bios, display);
+    crate::kernel::term::present_on(machine, bios, display, desktop, endpoint);
 }
 
 /// Linux-specific thread state

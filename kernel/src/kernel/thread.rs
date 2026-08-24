@@ -368,14 +368,20 @@ impl<A: crate::Arch> Personality<A> {
         regs: &Regs,
         now_ns: u64,
         display: &mut crate::kernel::display::Display,
+        desktop: &mut crate::kernel::gui::Desktop,
+        endpoint: crate::kernel::gui::EndpointId,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
         match self {
             Self::Dos(dos) => {
-                crate::kernel::dos::render(machine, bios, dos, regs, now_ns, display);
+                crate::kernel::dos::render(
+                    machine, bios, dos, regs, now_ns, display, desktop, endpoint,
+                );
             }
-            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => crate::kernel::linux::render(machine, bios, display),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {
+                crate::kernel::linux::render(machine, bios, display, desktop, endpoint)
+            }
         }
         if prof {
             crate::kernel::startup::bill_slice2(
@@ -846,7 +852,7 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
-/// Target selected by the F12 task picker (a tid, or -1 when idle).
+/// Endpoint selected by the F12 window picker (a tid, or -1 when idle).
 static SWITCH_TO: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
 
 /// Ask to focus a specific thread (the F12 picker's selection).

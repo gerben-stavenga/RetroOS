@@ -22,6 +22,7 @@ pub mod thread;
 
 // ── Machine policy: what this box is, who owns the console, what it may do ─
 pub mod focus;
+pub mod gui;
 pub mod io_policy;
 pub mod irq_dispatch;
 pub mod platform;

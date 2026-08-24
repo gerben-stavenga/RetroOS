@@ -1,7 +1,7 @@
 //! Console focus: which thread owns the display, keyboard, mouse — and the
 //! machine's Sound Blaster when a guest is driving it directly.
 //!
-//! Focus is orthogonal to scheduling — the F12 task picker moves FOCUS (a
+//! Focus is orthogonal to scheduling — the F12 window picker moves FOCUS (a
 //! console-ownership transfer: snapshot the old owner's screen state, repaint the new
 //! owner's, swap the I/O bitmap so the real card follows the owner); the
 //! scheduler decides who RUNS. Today the event loop runs the focused
