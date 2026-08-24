@@ -181,6 +181,13 @@ _EXTRA_FILES = {
     "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
     "//apps/windows/kernel32:kernel32_dll": "WINDOWS/SYSTEM32/KERNEL32.DLL",
     "//apps/windows/user32:user32_dll":     "WINDOWS/SYSTEM32/USER32.DLL",
+    "//apps/windows/compat:advapi32_dll":   "WINDOWS/SYSTEM32/ADVAPI32.DLL",
+    "//apps/windows/compat:comctl32_dll":   "WINDOWS/SYSTEM32/COMCTL32.DLL",
+    "//apps/windows/compat:dwmapi_dll":     "WINDOWS/SYSTEM32/DWMAPI.DLL",
+    "//apps/windows/compat:gdi32_dll":      "WINDOWS/SYSTEM32/GDI32.DLL",
+    "//apps/windows/compat:shell32_dll":    "WINDOWS/SYSTEM32/SHELL32.DLL",
+    "//apps/windows/compat:winmm_dll":      "WINDOWS/SYSTEM32/WINMM.DLL",
+    "//apps/windows/minesweeper:MINESWPR.EXE": "WINDOWS/APPS/MINESWPR.EXE",
     "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
     "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).

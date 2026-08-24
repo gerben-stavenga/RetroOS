@@ -1,0 +1,4 @@
+exports_files(
+    ["MINESWPR.EXE", "LICENSE.md", "README.md"],
+    visibility = ["//visibility:public"],
+)

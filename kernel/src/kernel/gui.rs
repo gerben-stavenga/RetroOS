@@ -304,6 +304,7 @@ pub enum SurfaceError {
 pub struct Desktop {
     scene: Scene,
     keyboard_focus: Option<EndpointId>,
+    pointer: Option<Point>,
     bindings: Vec<Binding>,
     surfaces: Vec<Surface>,
     next_surface: u64,
@@ -325,6 +326,13 @@ impl Desktop {
 
     pub fn focused(&self) -> Option<EndpointId> {
         self.keyboard_focus
+    }
+
+    /// Set the compositor-owned pointer position in desktop coordinates.
+    pub fn set_pointer(&mut self, point: Point) -> bool {
+        let changed = self.pointer != Some(point);
+        self.pointer = Some(point);
+        changed
     }
 
     /// Return the retained node for `(endpoint, key)`, creating it invisible
@@ -444,18 +452,58 @@ impl Desktop {
                 .and_then(|surface| surface.buffer.as_ref())
                 .map(SurfaceBuffer::borrowed)
         };
-        self.scene.compose_endpoint_with(
+        let pixels = self.scene.compose_endpoint_with(
             None,
             &resolve,
             width,
             height,
             format,
             output,
-        )
+        )?;
+        if let Some(point) = self.pointer {
+            draw_pointer(
+                output,
+                width,
+                height,
+                width * format.bytes_per_pixel as usize,
+                format,
+                point,
+            );
+        }
+        Ok(pixels)
     }
 
     pub fn hit_test(&self, point: Point) -> Option<Hit> {
         self.scene.hit_test(point)
+    }
+}
+
+/// Classic arrow drawn after scene composition, leaving application surfaces
+/// untouched as the pointer moves.
+fn draw_pointer(
+    output: &mut [u8], width: usize, height: usize, stride: usize,
+    format: vga::PixelFormat, point: Point,
+) {
+    let step = format.bytes_per_pixel as usize;
+    let black = format.encode(0x0000_0000).to_le_bytes();
+    let white = format.encode(0x00ff_ffff).to_le_bytes();
+    let mut pixel = |x: i32, y: i32, color: &[u8; 4]| {
+        if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 { return; }
+        let at = y as usize * stride + x as usize * step;
+        if at + step <= output.len() { output[at..at + step].copy_from_slice(&color[..step]); }
+    };
+    for y in 0..14i32 {
+        let edge = y / 2;
+        for x in 0..=edge {
+            let outline = x == 0 || x == edge || y == 13;
+            pixel(point.x + x, point.y + y, if outline { &black } else { &white });
+        }
+    }
+    for y in 10..18i32 {
+        for x in 3..=5i32 {
+            let outline = x == 3 || x == 5 || y == 17;
+            pixel(point.x + x, point.y + y, if outline { &black } else { &white });
+        }
     }
 }
 
@@ -1578,6 +1626,22 @@ mod tests {
         manager.select_window(os2);
         manager.select_window(windows);
         assert_eq!(manager.presentation(), Presentation::Desktop);
+    }
+
+    #[test]
+    fn retained_composition_draws_pointer_with_byte_stride() {
+        let mut desktop = Desktop::new();
+        desktop.set_pointer(Point { x: 1, y: 1 });
+        let mut output = vec![];
+        desktop
+            .compose_retained(16, 20, vga::PixelFormat::NATIVE, &mut output)
+            .unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 16 + x) * 4;
+            u32::from_le_bytes(output[at..at + 4].try_into().unwrap())
+        };
+        assert_eq!(pixel(1, 1), 0x0000_0000);
+        assert_eq!(pixel(2, 5), 0x00ff_ffff);
     }
 
     #[test]

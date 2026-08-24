@@ -256,8 +256,10 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     pub fn repaint_osd(&mut self) {
-        if matches!(self, Self::Linux(_) | Self::Os2(_) | Self::Windows(_)) {
-            crate::kernel::linux::repaint_console();
+        match self {
+            Self::Linux(_) | Self::Os2(_) => crate::kernel::linux::repaint_console(),
+            Self::Windows(windows) => windows.repaint_osd(),
+            Self::Dos(_) => {}
         }
     }
 
@@ -379,8 +381,11 @@ impl<A: crate::Arch> Personality<A> {
                     machine, bios, dos, regs, now_ns, display, desktop, endpoint,
                 );
             }
-            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {
+            Self::Linux(_) | Self::Os2(_) => {
                 crate::kernel::linux::render(machine, bios, display, desktop, endpoint)
+            }
+            Self::Windows(windows) => {
+                crate::kernel::windows::render(machine, bios, windows, display, desktop, endpoint)
             }
         }
         if prof {

@@ -58,8 +58,10 @@ pub fn dispatch<A: crate::Arch>(
         }
         thread::Personality::Windows(windows) => {
             for evt in guest_events {
-                if let crate::Irq::Key(scancode) = evt {
-                    windows.process_key(&kt.fds, scancode);
+                match evt {
+                    crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode),
+                    crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons),
+                    _ => {}
                 }
             }
         }
@@ -122,6 +124,7 @@ fn monitor_key<A: crate::Arch>(
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
             restore_from_monitor(machine, &mut *bios_workspace, personality, display);
+            personality.repaint_osd();
         } else {
             personality.repaint_osd();
         }
