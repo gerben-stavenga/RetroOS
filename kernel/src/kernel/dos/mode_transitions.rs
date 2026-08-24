@@ -1075,18 +1075,26 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
         && save.eip == SYNTHETIC_HOST_IRET_EIP;
     let was_outermost = save.other_stack().is_none();
     resume_continuation(machine, dos, regs, save);
+    // A continuation nested inside an IRQ handler must resume with that
+    // handler's VIF, normally zero. In particular, DJGPP's timer wrapper may
+    // tail-chain through the default real-mode vector after the BIOS has
+    // already EOI'd IRQ0. Forcing VIF on at that inner return permits a second
+    // IRQ0 to re-enter the still-busy wrapper; its busy path IRETs without a
+    // second EOI and leaves the virtual PIC wedged. Capture the suspended
+    // context's VIF before the synthetic IRET frame merges guest flags below.
+    let continuation_vif = if_bit(machine, regs);
     if resumes_to_host_iret {
         let use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
         let (ret_eip, ret_cs, ret_flags) = pop_iret_frame(machine, &dos.ldt[..], regs, use32);
         regs.set_ip32(ret_eip);
         regs.set_cs32(ret_cs as u32);
         // ret_flags is guest-observable; `apply_guest_flags` maps its IF slot
-        // to VIF. Then force VIF on: this frame closes a HW-IRQ/soft-INT
-        // excursion, and the client resumes interruptible regardless of the
-        // image (handlers enter with the image's IF slot cleared).
+        // to VIF. The continuation is the authority for whether the suspended
+        // context was interruptible, however: the synthetic frame belongs to
+        // the inner operation being unwound and must not act as an implicit
+        // STI for its caller.
         machine::apply_guest_flags(regs, (ret_flags & !STATUS_MASK) | current_status);
-        let vif_on = regs.flags32() | machine::VIF_FLAG;
-        regs.set_flags32(vif_on);
+        regs.set_flags32(restore_return_vif(regs.flags32(), continuation_vif));
     }
     // IRQ chain complete when we just popped an outermost HC (HC.other_stack=None
     // ⇒ first-entry from client). Nested HCs (Some) keep the flag so trace
@@ -1096,6 +1104,31 @@ pub(super) fn resume_continuation_from_stub<A: crate::Arch>(machine: &mut A, dos
     }
     if_record(IF_RESUME_CONTINUATION, regs, resume_if_in, if_bit(machine, regs), resume_other);
 
+}
+
+#[inline]
+fn restore_return_vif(flags: u32, continuation_vif: bool) -> u32 {
+    if continuation_vif {
+        flags | machine::VIF_FLAG
+    } else {
+        flags & !machine::VIF_FLAG
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_return_vif;
+    use crate::kernel::dos::machine::VIF_FLAG;
+
+    #[test]
+    fn continuation_preserves_disabled_vif() {
+        assert_eq!(restore_return_vif(VIF_FLAG, false) & VIF_FLAG, 0);
+    }
+
+    #[test]
+    fn continuation_preserves_enabled_vif() {
+        assert_ne!(restore_return_vif(0, true) & VIF_FLAG, 0);
+    }
 }
 
 
