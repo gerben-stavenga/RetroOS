@@ -294,6 +294,14 @@ impl WindowsState {
     pub fn repaint_osd(&mut self) {
         self.dirty = true;
     }
+    pub fn advance_timers(&mut self, now_ns: u64) {
+        if let Some(state) = self.win16.as_mut() {
+            win16::advance_timers(state, &mut self.messages, &self.windows, now_ns);
+        }
+    }
+    pub fn has_pending_message(&self) -> bool {
+        !self.messages.is_empty()
+    }
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         let pressed = crate::kernel::keyboard::update_key_state(scancode);
         let hwnd = self

@@ -85,9 +85,13 @@ pub fn dispatch<A: crate::Arch>(
             }
         }
         thread::Personality::Windows(windows) => {
+            let mut wake = false;
             for evt in guest_events {
                 match evt {
-                    crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode),
+                    crate::Irq::Key(scancode) => {
+                        windows.process_key(&kt.fds, scancode);
+                        wake = true;
+                    }
                     crate::Irq::Mouse { dx, dy, buttons } => {
                         desktop.move_pointer(dx, dy);
                         if let Some(point) = desktop.pointer_for(
@@ -95,9 +99,13 @@ pub fn dispatch<A: crate::Arch>(
                         ) {
                             windows.process_pointer(point.x, point.y, buttons);
                         }
+                        wake = true;
                     }
                     _ => {}
                 }
+            }
+            if wake && kt.state == thread::ThreadState::Blocked {
+                kt.state = thread::ThreadState::Ready;
             }
         }
     }

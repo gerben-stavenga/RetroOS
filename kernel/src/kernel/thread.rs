@@ -365,7 +365,8 @@ impl<A: crate::Arch> Personality<A> {
                 }
             }
             Self::Os2(os2) => os2.advance_timers(now_ns),
-            Self::Linux(_) | Self::Windows(_) => {}
+            Self::Windows(windows) => windows.advance_timers(now_ns),
+            Self::Linux(_) => {}
         }
         if prof {
             crate::kernel::startup::bill_slice2(
@@ -374,7 +375,11 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     pub fn has_pending_message(&self) -> bool {
-        matches!(self, Self::Os2(os2) if os2.has_pending_message())
+        match self {
+            Self::Os2(os2) => os2.has_pending_message(),
+            Self::Windows(windows) => windows.has_pending_message(),
+            Self::Dos(_) | Self::Linux(_) => false,
+        }
     }
 
     /// Advance one emulated-audio span; its samples may be output or discarded.

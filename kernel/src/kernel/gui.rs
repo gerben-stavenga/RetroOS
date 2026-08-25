@@ -261,6 +261,7 @@ pub struct Desktop {
     scene: Scene,
     keyboard_focus: Option<EndpointId>,
     pointer: Option<Point>,
+    canvas: Size,
     bindings: Vec<Binding>,
     surfaces: Vec<Surface>,
     next_surface: u64,
@@ -299,13 +300,17 @@ impl Desktop {
     /// Move the single compositor-owned pointer, clamped to the desktop rather
     /// than to any personality's client area.
     pub fn move_pointer(&mut self, dx: i16, dy: i16) -> Point {
-        let extent = self.extent();
+        let bounds = if self.canvas.width != 0 && self.canvas.height != 0 {
+            self.canvas
+        } else {
+            self.extent()
+        };
         let old = self.pointer.unwrap_or_default();
         let point = Point {
             x: old.x.saturating_add(i32::from(dx))
-                .clamp(0, extent.width.saturating_sub(1) as i32),
+                .clamp(0, bounds.width.saturating_sub(1) as i32),
             y: old.y.saturating_add(i32::from(dy))
-                .clamp(0, extent.height.saturating_sub(1) as i32),
+                .clamp(0, bounds.height.saturating_sub(1) as i32),
         };
         self.set_pointer(point);
         point
@@ -320,6 +325,15 @@ impl Desktop {
             self.scene.node(id).filter(|node| node.visible && node.owner == endpoint)
         })?;
         Some(Point { x: point.x - node.geometry.x, y: point.y - node.geometry.y })
+    }
+
+    /// Record the compositor's actual output coordinate space. On physical
+    /// displays this is generally larger than the union of application nodes.
+    pub fn set_canvas_size(&mut self, width: usize, height: usize) {
+        self.canvas = Size {
+            width: width.min(u32::MAX as usize) as u32,
+            height: height.min(u32::MAX as usize) as u32,
+        };
     }
 
     /// Return the retained node for `(endpoint, key)`, creating it invisible
@@ -587,6 +601,7 @@ impl WindowManager {
     ) -> Result<&'a mut Vec<u8>, ComposeError> {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
+        self.desktop.set_canvas_size(width, height);
         let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
         let system = if crate::kernel::osd::is_open()
             && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
@@ -620,6 +635,7 @@ impl WindowManager {
     {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
+        self.desktop.set_canvas_size(width, height);
         let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
         let osd = if crate::kernel::osd::is_open()
             && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
@@ -1810,6 +1826,10 @@ mod tests {
         assert_eq!(desktop.move_pointer(80, 60), Point { x: 80, y: 60 });
         assert_eq!(desktop.pointer_for(WINDOWS), Some(Point { x: 60, y: 50 }));
         assert_eq!(desktop.pointer_for(OS2), Some(Point { x: 80, y: 60 }));
+
+        desktop.set_canvas_size(160, 120);
+        assert_eq!(desktop.move_pointer(70, 50), Point { x: 150, y: 110 });
+        assert_eq!(desktop.pointer_for(WINDOWS), Some(Point { x: 130, y: 100 }));
     }
 
     #[test]

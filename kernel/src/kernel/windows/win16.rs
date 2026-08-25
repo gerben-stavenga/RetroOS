@@ -74,6 +74,9 @@ pub(super) struct State {
     psp_selector: u16,
     env_selector: u16,
     timer: u16,
+    timer_hwnd: u32,
+    timer_interval_ns: u64,
+    timer_deadline_ns: u64,
     resource_selector: u16,
     resource_next: u16,
     resources: Vec<Resource>,
@@ -783,6 +786,9 @@ pub(super) fn exec<A: crate::Arch>(
         psp_selector,
         env_selector,
         timer: 0,
+        timer_hwnd: 0,
+        timer_interval_ns: 0,
+        timer_deadline_ns: 0,
         resource_selector,
         resource_next: 0,
         resources: Vec::new(),
@@ -1325,12 +1331,17 @@ fn dispatch<A: crate::Arch>(
             0
         }
         (Module::User, 10) => {
-            let requested = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let interval_ms = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let requested = stack_u16(machine, windows, regs, 10).unwrap_or(0);
             state.timer = if requested == 0 { 1 } else { requested };
+            state.timer_hwnd = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
+            state.timer_interval_ns = u64::from(interval_ms.max(1)) * 1_000_000;
+            state.timer_deadline_ns = machine.now().saturating_add(state.timer_interval_ns);
             u32::from(state.timer)
         }
         (Module::User, 12) => {
             state.timer = 0;
+            state.timer_hwnd = 0;
             1
         }
         (Module::User, 15) => (machine.now() / 1_000_000) as u32,
@@ -1629,17 +1640,7 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::User, 108 | 109) => {
             if windows.quit { return 0; }
-            if windows.messages.is_empty() {
-                if state.timer != 0
-                    && let Some(window) = windows.windows.iter().find(|window| window.visible)
-                {
-                    windows.messages.push(super::Message {
-                        hwnd: window.hwnd, message: 0x0113,
-                        wparam: u32::from(state.timer), lparam: 0,
-                    });
-                }
-                if windows.messages.is_empty() { return 0; }
-            }
+            if windows.messages.is_empty() { return 0; }
             let message = windows.messages[0];
             let Some(out) = stack_u32(machine, windows, regs,
                     if gate.ordinal == 108 { 10 } else { 12 })
@@ -2119,6 +2120,38 @@ fn dispatch<A: crate::Arch>(
     }
 }
 
+pub(super) fn advance_timers(
+    state: &mut State,
+    messages: &mut Vec<super::Message>,
+    windows: &[super::Window],
+    now_ns: u64,
+) {
+    if state.timer == 0 || now_ns < state.timer_deadline_ns {
+        return;
+    }
+    // Timers are coalesced notifications. A stalled application gets one
+    // WM_TIMER, never a replay burst or a guest-speed repaint loop.
+    state.timer_deadline_ns = now_ns.saturating_add(state.timer_interval_ns.max(1));
+    if messages.iter().any(|message| {
+        message.message == 0x0113 && message.wparam == u32::from(state.timer)
+    }) {
+        return;
+    }
+    let hwnd = if state.timer_hwnd != 0 {
+        state.timer_hwnd
+    } else {
+        windows.iter().find(|window| window.visible).map_or(0, |window| window.hwnd)
+    };
+    if hwnd != 0 {
+        messages.push(super::Message {
+            hwnd,
+            message: 0x0113,
+            wparam: u32::from(state.timer),
+            lparam: 0,
+        });
+    }
+}
+
 pub(super) fn handle_event<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
@@ -2202,13 +2235,14 @@ pub(super) fn handle_event<A: crate::Arch>(
                 }
             }
             if gate.module == Module::User && gate.ordinal == 108
-                && !windows.quit && windows.messages.is_empty() && state.timer == 0
+                && !windows.quit && windows.messages.is_empty()
             {
                 // GetMessage blocks until input or another producer queues a
                 // message.  Re-enter the INT gate when this thread is next
                 // scheduled instead of returning the WM_QUIT value zero.
                 regs.frame.rip = u64::from(gate.offset);
-                return thread::KernelAction::Yield;
+                kt.state = thread::ThreadState::Blocked;
+                return thread::KernelAction::Done;
             }
             let result = dispatch(machine, kt, windows, state, regs, gate);
             if gate.module == Module::User && gate.ordinal == 41 && result != 0 {
