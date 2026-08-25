@@ -52,6 +52,8 @@ struct Callback {
 enum CallbackResult {
     WndProc,
     CreateWindow { hwnd: u32 },
+    DialogInit { hwnd: u32, auto_ok: bool },
+    DialogCommand { hwnd: u32 },
 }
 
 struct Resource {
@@ -62,12 +64,13 @@ struct Resource {
 pub(super) struct State {
     image: Vec<u8>,
     gates: Vec<Gate>,
-    callback: Option<Callback>,
+    callbacks: Vec<Callback>,
     callback_gate: Gate,
     instance: u16,
     auto_data: u16,
     local_next: u16,
     local_end: u16,
+    local_allocations: Vec<(u16, u16)>,
     psp_selector: u16,
     env_selector: u16,
     timer: u16,
@@ -770,12 +773,13 @@ pub(super) fn exec<A: crate::Arch>(
     windows.win16 = Some(State {
         image: data,
         gates,
-        callback: None,
+        callbacks: Vec::new(),
         callback_gate,
         instance: data_selector,
         auto_data: data_selector,
         local_next,
         local_end,
+        local_allocations: Vec::new(),
         psp_selector,
         env_selector,
         timer: 0,
@@ -873,7 +877,7 @@ fn begin_wndproc<A: crate::Arch>(
     let Some(window) = windows.windows.iter().find(|window| window.hwnd == message.hwnd) else {
         return false;
     };
-    if window.wndproc == 0 || state.callback.is_some() { return false; }
+    if window.wndproc == 0 { return false; }
     let new_sp = (regs.sp32() as u16).wrapping_sub(14);
     let Some(stack) = linear(windows, regs.stack_seg(), new_sp) else { return false; };
     machine.write::<u16>(stack, state.callback_gate.offset);
@@ -882,7 +886,7 @@ fn begin_wndproc<A: crate::Arch>(
     machine.write::<u16>(stack + 8, message.wparam as u16);
     machine.write::<u16>(stack + 10, message.message as u16);
     machine.write::<u16>(stack + 12, message.hwnd as u16);
-    state.callback = Some(Callback { dispatch_gate, result: callback_result });
+    state.callbacks.push(Callback { dispatch_gate, result: callback_result });
     regs.frame.rsp = u64::from(new_sp);
     regs.frame.rip = u64::from(window.wndproc as u16);
     regs.frame.cs = u64::from((window.wndproc >> 16) as u16);
@@ -966,6 +970,146 @@ fn palette_color<A: crate::Arch>(
     b | (g << 8) | (r << 16)
 }
 
+fn menu_word(data: &[u8], at: &mut usize) -> Option<u16> {
+    let value = u16::from_le_bytes(data.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    Some(value)
+}
+
+fn menu_text(data: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    let start = *at;
+    let end = data.get(start..)?.iter().position(|&byte| byte == 0)? + start;
+    *at = end + 1;
+    Some(data[start..end].to_vec())
+}
+
+fn menu_items(data: &[u8], at: &mut usize) -> Option<Vec<super::MenuItem>> {
+    let mut items = Vec::new();
+    loop {
+        let flags = menu_word(data, at)?;
+        let popup = flags & 0x0010 != 0;
+        let command = if popup { 0 } else { menu_word(data, at)? };
+        let text = menu_text(data, at)?;
+        let children = if popup { menu_items(data, at)? } else { Vec::new() };
+        items.push(super::MenuItem { text, command, children });
+        if flags & 0x0080 != 0 { return Some(items); }
+    }
+}
+
+fn install_menu(windows: &mut WindowsState, handle: u32, data: &[u8]) {
+    if handle == 0 || windows.menus.iter().any(|menu| menu.handle == handle) { return; }
+    if data.len() < 4 { return; }
+    let header = u16::from_le_bytes([data[2], data[3]]) as usize;
+    let mut at = 4usize.saturating_add(header);
+    if let Some(items) = menu_items(data, &mut at) {
+        windows.menus.push(super::Menu { handle, items });
+    }
+}
+
+fn ensure_menu(windows: &mut WindowsState, state: &State, handle: u32) {
+    let Ok(image) = ne::Image::parse(&state.image) else { return };
+    let Ok(data) = image.resource(4, handle as u16) else { return };
+    install_menu(windows, handle, data);
+}
+
+fn dialog_byte(data: &[u8], at: &mut usize) -> Option<u8> {
+    let value = *data.get(*at)?;
+    *at += 1;
+    Some(value)
+}
+
+fn dialog_i16(data: &[u8], at: &mut usize) -> Option<i16> {
+    let value = i16::from_le_bytes(data.get(*at..*at + 2)?.try_into().ok()?);
+    *at += 2;
+    Some(value)
+}
+
+fn dialog_u32(data: &[u8], at: &mut usize) -> Option<u32> {
+    let value = u32::from_le_bytes(data.get(*at..*at + 4)?.try_into().ok()?);
+    *at += 4;
+    Some(value)
+}
+
+fn dialog_string(data: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    let first = dialog_byte(data, at)?;
+    if first == 0 { return Some(Vec::new()); }
+    if first & 0x80 != 0 { return Some(vec![first]); }
+    let mut text = vec![first];
+    loop {
+        let byte = dialog_byte(data, at)?;
+        if byte == 0 { return Some(text); }
+        text.push(byte);
+    }
+}
+
+fn create_dialog(
+    windows: &mut WindowsState, state: &State, template: u16, proc: u32,
+) -> Option<(u32, bool)> {
+    let image = ne::Image::parse(&state.image).ok()?;
+    let data = image.resource(5, template).ok()?;
+    let mut at = 0;
+    let _style = dialog_u32(data, &mut at)?;
+    let count = dialog_byte(data, &mut at)?;
+    let _x = dialog_i16(data, &mut at)?;
+    let _y = dialog_i16(data, &mut at)?;
+    let width = u32::from(dialog_i16(data, &mut at)?.max(80) as u16) * 2;
+    let height = u32::from(dialog_i16(data, &mut at)?.max(40) as u16) * 2 + 20;
+    let _menu = dialog_string(data, &mut at)?;
+    let _class = dialog_string(data, &mut at)?;
+    let title = dialog_string(data, &mut at)?;
+    let hwnd = windows.next_object;
+    windows.next_object = windows.next_object.wrapping_add(1);
+    windows.windows.push(super::Window {
+        hwnd, parent: 0, wndproc: proc, menu: 0, control_class: 0, text: title.clone(), x: 0, y: 0,
+        width, height, visible: true,
+        pixels: vec![0xc0; width as usize * height as usize * 4],
+    });
+    let root = windows.windows.len() - 1;
+    super::menu_fill(&mut windows.windows[root], 0, 0, width as i32, 20, 0x0080_80c0);
+    super::menu_text(&mut windows.windows[root], 6, 2, &title);
+    let mut interactive = false;
+    for _ in 0..count {
+        let x = i32::from(dialog_i16(data, &mut at)?) * 2;
+        let y = i32::from(dialog_i16(data, &mut at)?) * 2 + 20;
+        let control_width = u32::from(dialog_i16(data, &mut at)?.max(1) as u16) * 2;
+        let control_height = u32::from(dialog_i16(data, &mut at)?.max(1) as u16) * 2;
+        let id = u32::from(dialog_i16(data, &mut at)? as u16);
+        let _style = dialog_u32(data, &mut at)?;
+        let class = dialog_string(data, &mut at)?;
+        let text = dialog_string(data, &mut at)?;
+        let extra = dialog_byte(data, &mut at)? as usize;
+        at = at.checked_add(extra)?;
+        let class_id = class.first().copied().unwrap_or(0);
+        if matches!(class_id, 0x81 | 0x84) || (class_id == 0x80 && id != 1) {
+            interactive = true;
+        }
+        if class_id == 0x80 || class_id == 0x81 {
+            super::menu_fill(&mut windows.windows[root], x, y,
+                x + control_width as i32, y + control_height as i32, 0x00ff_ffff);
+        }
+        if class_id == 0x84 {
+            super::menu_fill(&mut windows.windows[root], x, y,
+                x + control_width as i32, y + control_height as i32, 0x00ff_ffff);
+            super::menu_text(&mut windows.windows[root], x + 1, y + 1, b"^");
+            super::menu_text(&mut windows.windows[root], x + 1,
+                y + control_height as i32 - 17, b"v");
+        }
+        let shown = if class_id == 0x81 && id == 151 { b"Player".as_slice() } else { &text };
+        if !shown.is_empty() && shown.first() != Some(&b'#') {
+            super::menu_text(&mut windows.windows[root], x + 3, y + 1, shown);
+        }
+        windows.windows.push(super::Window {
+            hwnd: windows.next_object, parent: hwnd, wndproc: 0, menu: id,
+            control_class: class_id, text: shown.to_vec(),
+            x, y, width: control_width, height: control_height, visible: true,
+            pixels: Vec::new(),
+        });
+        windows.next_object = windows.next_object.wrapping_add(1);
+    }
+    windows.dirty = true;
+    Some((hwnd, !interactive))
+}
+
 fn finish<A: crate::Arch>(
     machine: &A,
     windows: &WindowsState,
@@ -1040,10 +1184,47 @@ fn dispatch<A: crate::Arch>(
             } else {
                 let handle = state.local_next;
                 state.local_next = next as u16;
+                state.local_allocations.push((handle, aligned as u16));
                 u32::from(handle)
             }
         }
-        (Module::Kernel, 7) => 0,
+        (Module::Kernel, 6) => {
+            let handle = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let size = stack_u16(machine, windows, regs, 6).unwrap_or(0) as usize;
+            let Some((_, old_size)) = state.local_allocations.iter()
+                .find(|(allocated, _)| *allocated == handle).copied() else { return 0 };
+            if size <= old_size as usize { return u32::from(handle); }
+            let aligned = (size.max(2) + 1) & !1;
+            let next = usize::from(state.local_next).saturating_add(aligned);
+            if next > usize::from(state.local_end) { return 0; }
+            let new_handle = state.local_next;
+            let Some(source) = linear(windows, state.auto_data, handle) else { return 0 };
+            let Some(destination) = linear(windows, state.auto_data, new_handle) else { return 0 };
+            let mut bytes = vec![0; old_size as usize];
+            machine.copy_from(source, &mut bytes);
+            machine.copy_to(destination, &bytes);
+            state.local_next = next as u16;
+            state.local_allocations.push((new_handle, aligned as u16));
+            u32::from(new_handle)
+        }
+        (Module::Kernel, 7) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            state.local_allocations.retain(|(allocated, _)| *allocated != handle);
+            0
+        }
+        (Module::Kernel, 8) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            if handle == 0 { 0 } else {
+                u32::from(handle) | (u32::from(state.auto_data) << 16)
+            }
+        }
+        (Module::Kernel, 9) => 0,
+        (Module::Kernel, 10) => {
+            let handle = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            state.local_allocations.iter().find(|(allocated, _)| *allocated == handle)
+                .map_or(0, |(_, size)| u32::from(*size))
+        }
+        (Module::Kernel, 25) => 0x000f_0000,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
         (Module::Kernel, 47) => u32::from(state.instance),
         (Module::Kernel, 49) => {
@@ -1128,6 +1309,7 @@ fn dispatch<A: crate::Arch>(
         (Module::Kernel, 131) => u32::from(state.env_selector) << 16,
         (Module::Kernel, 132) => 0x0025, // protected mode, 386, enhanced mode
         (Module::User, 1) => {
+            let style = stack_u16(machine, windows, regs, 4).unwrap_or(0);
             let text = stack_u32(machine, windows, regs, 10).unwrap_or(0);
             let caption = stack_u32(machine, windows, regs, 6).unwrap_or(0);
             let text = far_string(machine, windows, text).unwrap_or_default();
@@ -1135,7 +1317,7 @@ fn dispatch<A: crate::Arch>(
             crate::dbg_println!("[win16] MessageBox '{}': '{}'",
                 core::str::from_utf8(&caption).unwrap_or("?"),
                 core::str::from_utf8(&text).unwrap_or("?"));
-            1 // IDOK
+            if matches!(style & 0x000f, 3 | 4) { 6 } else { 1 } // IDYES or IDOK
         }
         (Module::User, 5) => 1,
         (Module::User, 6) => {
@@ -1163,6 +1345,21 @@ fn dispatch<A: crate::Arch>(
             previous
         }
         (Module::User, 23) => windows.focus_hwnd,
+        (Module::User, 32) => {
+            let Some(rect) = stack_u32(machine, windows, regs, 4)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
+            let (x, y, width, height) = if hwnd == 0 {
+                (0, 0, 640, 480)
+            } else if let Some(window) = windows.windows.iter().find(|window| window.hwnd == hwnd) {
+                (window.x, window.y, window.width as i32, window.height as i32)
+            } else { return 0 };
+            machine.write::<i16>(rect, x as i16);
+            machine.write::<i16>(rect + 2, y as i16);
+            machine.write::<i16>(rect + 4, x.saturating_add(width) as i16);
+            machine.write::<i16>(rect + 6, y.saturating_add(height) as i16);
+            1
+        }
         (Module::User, 33) => {
             let Some(rect) = stack_u32(machine, windows, regs, 4)
                 .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
@@ -1175,6 +1372,29 @@ fn dispatch<A: crate::Arch>(
             machine.write::<i16>(rect + 4, window.width as i16);
             machine.write::<i16>(rect + 6, window.height as i16);
             1
+        }
+        (Module::User, 36) => {
+            let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;
+            let Some(out) = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let text = windows.windows.iter().find(|window| window.hwnd == hwnd)
+                .map_or(b"".as_slice(), |window| window.text.as_slice());
+            if capacity == 0 { return 0; }
+            let len = text.len().min(capacity - 1);
+            machine.copy_to(out, &text[..len]);
+            machine.write::<u8>(out + len, 0);
+            len as u32
+        }
+        (Module::User, 37) => {
+            let pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
+            let Some(text) = far_string(machine, windows, pointer) else { return 0 };
+            if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
+                window.text = text;
+                windows.dirty = true;
+                1
+            } else { 0 }
         }
         (Module::User, 39) => {
             let Some(out) = stack_u32(machine, windows, regs, 4)
@@ -1202,40 +1422,48 @@ fn dispatch<A: crate::Arch>(
                 .and_then(|p| far_linear(windows, p)) else { return 0 };
             let wndproc = machine.read::<u32>(wc + 2);
             let background = u32::from(machine.read::<u16>(wc + 16));
+            let menu_pointer = machine.read::<u32>(wc + 18);
+            let menu = if menu_pointer >> 16 == 0 { menu_pointer } else { 0 };
             let name_pointer = machine.read::<u32>(wc + 22);
             let Some(name) = far_string(machine, windows, name_pointer) else { return 0 };
             if let Some(class) = windows.classes.iter_mut()
                 .find(|class| class.name.eq_ignore_ascii_case(&name)) {
                 class.wndproc = wndproc;
                 class.background = background;
+                class.menu = menu;
             } else {
-                windows.classes.push(super::WindowClass { name, wndproc, background });
+                windows.classes.push(super::WindowClass { name, wndproc, background, menu });
             }
             windows.classes.len() as u32
         }
         (Module::User, 41) => {
             let class_pointer = stack_u32(machine, windows, regs, 30).unwrap_or(0);
             let class = if class_pointer >> 16 == 0 {
-                windows.classes.first().map(|class| (class.wndproc, class.background))
+                windows.classes.first().map(|class| {
+                    (class.wndproc, class.background, class.menu)
+                })
             } else {
                 let Some(name) = far_string(machine, windows, class_pointer) else {
                     crate::dbg_println!("[win16] invalid window class pointer {:08x}", class_pointer);
                     return 0;
                 };
                 windows.classes.iter().find(|class| class.name.eq_ignore_ascii_case(&name))
-                    .map(|class| (class.wndproc, class.background))
+                    .map(|class| (class.wndproc, class.background, class.menu))
                     .or_else(|| [b"BUTTON".as_slice(), b"EDIT", b"STATIC", b"LISTBOX",
                         b"SCROLLBAR", b"COMBOBOX", b"MDICLIENT"]
                         .iter().any(|class| name.eq_ignore_ascii_case(class))
-                        .then_some((0, 0x30005)))
+                        .then_some((0, 0x30005, 0)))
                     .or_else(|| {
                         crate::dbg_println!("[win16] window class '{}' not found",
                             core::str::from_utf8(&name).unwrap_or("?"));
                         None
                     })
             };
-            let Some((wndproc, _background)) = class else { return 0 };
+            let Some((wndproc, _background, class_menu)) = class else { return 0 };
             let parent = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
+            let requested_menu = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let menu = if parent == 0 && requested_menu == 0 { class_menu } else { requested_menu };
+            ensure_menu(windows, state, menu);
             let raw_width = stack_u16(machine, windows, regs, 16).unwrap_or(1);
             let raw_height = stack_u16(machine, windows, regs, 14).unwrap_or(1);
             let raw_x = stack_u16(machine, windows, regs, 20).unwrap_or(0);
@@ -1254,6 +1482,9 @@ fn dispatch<A: crate::Arch>(
                 hwnd,
                 parent,
                 wndproc,
+                menu,
+                control_class: 0,
+                text: Vec::new(),
                 x: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_x as i16) },
                 y: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_y as i16) },
                 width,
@@ -1347,6 +1578,55 @@ fn dispatch<A: crate::Arch>(
             windows.dirty = true;
             1
         }
+        (Module::User, 88) => {
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
+            windows.windows.retain(|window| window.hwnd != hwnd && window.parent != hwnd);
+            windows.dirty = true;
+            1
+        }
+        (Module::User, 91) => {
+            let id = stack_u16(machine, windows, regs, 4).unwrap_or(0);
+            let dialog = stack_u16(machine, windows, regs, 6).unwrap_or(0);
+            windows.windows.iter().find(|window| {
+                window.parent == u32::from(dialog) && window.menu == u32::from(id)
+            }).map_or(0, |window| window.hwnd)
+        }
+        (Module::User, 92) => {
+            let pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            let id = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
+            let dialog = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let Some(text) = far_string(machine, windows, pointer) else { return 0 };
+            if let Some(window) = windows.windows.iter_mut()
+                .find(|window| window.parent == dialog && window.menu == id)
+            {
+                window.text = text;
+                windows.dirty = true;
+                1
+            } else { 0 }
+        }
+        (Module::User, 93) => {
+            let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;
+            let Some(out) = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let id = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let dialog = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
+            let text = windows.windows.iter()
+                .find(|window| window.parent == dialog && window.menu == id)
+                .map_or(b"".as_slice(), |window| window.text.as_slice());
+            if capacity == 0 { return 0; }
+            let len = text.len().min(capacity - 1);
+            machine.copy_to(out, &text[..len]);
+            machine.write::<u8>(out + len, 0);
+            len as u32
+        }
+        (Module::User, 101) => {
+            let lparam = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            let wparam = stack_u16(machine, windows, regs, 8).unwrap_or(0);
+            let message = stack_u16(machine, windows, regs, 10).unwrap_or(0);
+            let id = stack_u16(machine, windows, regs, 12).unwrap_or(0);
+            let _ = (id, message, wparam, lparam);
+            0
+        }
         (Module::User, 108 | 109) => {
             if windows.quit { return 0; }
             if windows.messages.is_empty() {
@@ -1388,8 +1668,52 @@ fn dispatch<A: crate::Arch>(
                 1
             } else { 0 }
         }
-        (Module::User, 150 | 173 | 174 | 177) => 1,
-        (Module::User, 154 | 155 | 158 | 171) => 1,
+        (Module::User, 150) => {
+            let resource = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            if resource >> 16 == 0 {
+                ensure_menu(windows, state, resource);
+                resource
+            } else {
+                let handle = windows.next_object;
+                windows.next_object = windows.next_object.wrapping_add(1);
+                if let Some(name) = far_string(machine, windows, resource)
+                    && let Ok(image) = ne::Image::parse(&state.image)
+                    && let Ok(data) = image.named_resource(4, &name)
+                {
+                    install_menu(windows, handle, data);
+                }
+                handle
+            }
+        }
+        (Module::User, 151) => {
+            let handle = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            handle
+        }
+        (Module::User, 152) => 1,
+        (Module::User, 157) => {
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            windows.windows.iter().find(|window| window.hwnd == hwnd)
+                .map_or(0, |window| window.menu)
+        }
+        (Module::User, 158) => {
+            let menu = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
+            if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
+                window.menu = menu;
+                windows.dirty = true;
+                1
+            } else {
+                0
+            }
+        }
+        (Module::User, 159) => u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0)),
+        (Module::User, 160) => {
+            windows.dirty = true;
+            1
+        }
+        (Module::User, 173 | 174 | 177) => 1,
+        (Module::User, 154 | 155 | 171) => 1,
         (Module::User, 175) => {
             let name = stack_u32(machine, windows, regs, 4).unwrap_or(0);
             if name >> 16 != 0 {
@@ -1814,7 +2138,7 @@ pub(super) fn handle_event<A: crate::Arch>(
                 return thread::KernelAction::Exit(-1);
             };
             if gate.ordinal == 0xffff {
-                let Some(callback) = state.callback.take() else {
+                let Some(callback) = state.callbacks.pop() else {
                     return thread::KernelAction::Exit(-1);
                 };
                 let wndproc_result = (regs.rax as u16 as u32) | ((regs.rdx as u16 as u32) << 16);
@@ -1831,6 +2155,20 @@ pub(super) fn handle_event<A: crate::Arch>(
                         } else {
                             hwnd
                         }
+                    }
+                    CallbackResult::DialogInit { hwnd, auto_ok } => {
+                        if auto_ok && begin_wndproc(machine, windows, state, regs,
+                            callback.dispatch_gate, CallbackResult::DialogCommand { hwnd },
+                            super::Message { hwnd, message: 0x0111, wparam: 1, lparam: 0 })
+                        {
+                            return thread::KernelAction::Done;
+                        }
+                        0
+                    }
+                    CallbackResult::DialogCommand { hwnd } => {
+                        windows.windows.retain(|window| window.hwnd != hwnd && window.parent != hwnd);
+                        windows.dirty = true;
+                        1
                     }
                 };
                 if finish(machine, windows, regs, callback.dispatch_gate, result).is_err() {
@@ -1849,6 +2187,17 @@ pub(super) fn handle_event<A: crate::Arch>(
                 let message = message16(machine, message_at);
                 if begin_wndproc(machine, windows, state, regs, gate,
                     CallbackResult::WndProc, message) {
+                    return thread::KernelAction::Done;
+                }
+            }
+            if gate.module == Module::User && gate.ordinal == 87 {
+                let proc = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+                let template = stack_u32(machine, windows, regs, 10).unwrap_or(0);
+                if let Some((hwnd, auto_ok)) = create_dialog(windows, state, template as u16, proc)
+                    && begin_wndproc(machine, windows, state, regs, gate,
+                    CallbackResult::DialogInit { hwnd, auto_ok },
+                    super::Message { hwnd, message: 0x0110, wparam: 0, lparam: 0 })
+                {
                     return thread::KernelAction::Done;
                 }
             }

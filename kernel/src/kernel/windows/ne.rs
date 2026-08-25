@@ -254,6 +254,38 @@ impl<'a> Image<'a> {
         }
     }
 
+    /// Return one numeric-type resource whose identifier is a resource-table name.
+    pub fn named_resource(&self, wanted_type: u16, wanted_name: &[u8]) -> Result<&'a [u8], Error> {
+        let resource_table = self.ne + u16_at(self.data, self.ne + 0x24)? as usize;
+        let mut at = resource_table;
+        let shift = u16_at(self.data, at)? as u32;
+        at += 2;
+        loop {
+            let kind = u16_at(self.data, at)?;
+            if kind == 0 { return Err(Error::BadImage); }
+            let count = u16_at(self.data, at + 2)? as usize;
+            at += 8;
+            for _ in 0..count {
+                let offset = (u16_at(self.data, at)? as usize)
+                    .checked_shl(shift).ok_or(Error::Overflow)?;
+                let length = (u16_at(self.data, at + 2)? as usize)
+                    .checked_shl(shift).ok_or(Error::Overflow)?;
+                let id = u16_at(self.data, at + 6)?;
+                if kind == (0x8000 | wanted_type) && id & 0x8000 == 0 {
+                    let name_at = resource_table.checked_add(id as usize).ok_or(Error::Overflow)?;
+                    let name_len = *self.data.get(name_at).ok_or(Error::BadImage)? as usize;
+                    let name = self.data.get(name_at + 1..name_at + 1 + name_len)
+                        .ok_or(Error::BadImage)?;
+                    if name.eq_ignore_ascii_case(wanted_name) {
+                        return self.data.get(offset..offset.checked_add(length)
+                            .ok_or(Error::Overflow)?).ok_or(Error::BadImage);
+                    }
+                }
+                at += 12;
+            }
+        }
+    }
+
     pub fn string_resource(&self, id: u16) -> Result<&'a [u8], Error> {
         let block = id / 16 + 1;
         let index = id % 16;

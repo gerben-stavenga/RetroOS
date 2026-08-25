@@ -142,6 +142,7 @@ struct WindowClass {
     name: Vec<u8>,
     wndproc: u32,
     background: u32,
+    menu: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -156,12 +157,27 @@ struct Window {
     hwnd: u32,
     parent: u32,
     wndproc: u32,
+    menu: u32,
+    control_class: u8,
+    text: Vec<u8>,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
     visible: bool,
     pixels: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct MenuItem {
+    text: Vec<u8>,
+    command: u16,
+    children: Vec<MenuItem>,
+}
+
+struct Menu {
+    handle: u32,
+    items: Vec<MenuItem>,
 }
 
 enum GdiObject {
@@ -210,6 +226,8 @@ pub struct WindowsState {
     stack_size: u32,
     classes: Vec<WindowClass>,
     windows: Vec<Window>,
+    menus: Vec<Menu>,
+    open_menu: Option<(u32, usize)>,
     messages: Vec<Message>,
     callback: Option<Callback>,
     callback_return: u32,
@@ -261,6 +279,8 @@ impl WindowsState {
             mouse_x: 0,
             mouse_y: 0,
             mouse_buttons: 0,
+            menus: Vec::new(),
+            open_menu: None,
             win16: None,
         }
     }
@@ -293,6 +313,19 @@ impl WindowsState {
             return;
         }
         let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
+        if let Some(window) = self.windows.iter_mut()
+            .find(|window| window.hwnd == self.focus_hwnd && window.control_class == 0x81)
+        {
+            if scancode & 0x7f == 0x0e {
+                window.text.pop();
+            } else if (0x20..0x7f).contains(&c)
+                && window.text.len() < (window.width as usize / 8).saturating_sub(1)
+            {
+                window.text.push(c);
+            }
+            self.dirty = true;
+            return;
+        }
         if c != 0
             && let thread::FdKind::PipeRead(p) = fds[0]
         {
@@ -309,6 +342,13 @@ impl WindowsState {
             (self.mouse_x + i32::from(dx)).clamp(0, window.width.saturating_sub(1) as i32);
         self.mouse_y =
             (self.mouse_y + i32::from(dy)).clamp(0, window.height.saturating_sub(1) as i32);
+        if buttons & 1 != 0 && self.mouse_buttons & 1 == 0
+            && (self.process_control_click(hwnd) || self.process_menu_click(hwnd))
+        {
+            self.mouse_buttons = buttons;
+            self.cursor_dirty = true;
+            return;
+        }
         let lparam = (self.mouse_x as u32 & 0xffff) | ((self.mouse_y as u32 & 0xffff) << 16);
         self.messages.push(Message {
             hwnd,
@@ -348,6 +388,176 @@ impl WindowsState {
         }
         self.mouse_buttons = buttons;
         self.cursor_dirty = true;
+    }
+
+    fn process_menu_click(&mut self, hwnd: u32) -> bool {
+        let Some(menu_handle) = self.windows.iter().find(|window| window.hwnd == hwnd)
+            .map(|window| window.menu).filter(|handle| *handle != 0) else { return false };
+        let Some(menu) = self.menus.iter().find(|menu| menu.handle == menu_handle) else {
+            return false;
+        };
+        if self.mouse_y < 20 {
+            let mut x = 4;
+            for (index, item) in menu.items.iter().enumerate() {
+                let width = menu_text_width(&item.text) + 16;
+                if self.mouse_x >= x && self.mouse_x < x + width {
+                    self.open_menu = Some((hwnd, index));
+                    self.dirty = true;
+                    return true;
+                }
+                x += width;
+            }
+            self.open_menu = None;
+            self.dirty = true;
+            return true;
+        }
+        let Some((open_hwnd, index)) = self.open_menu else { return false };
+        if open_hwnd != hwnd { return false; }
+        let Some(item) = menu.items.get(index) else { return false };
+        let row = (self.mouse_y - 20) / 18;
+        if self.mouse_x >= 4 && row >= 0
+            && let Some(child) = item.children.get(row as usize)
+        {
+            if child.command != 0 && child.text.first() != Some(&b'-') {
+                self.messages.push(Message {
+                    hwnd,
+                    message: 0x0111,
+                    wparam: u32::from(child.command),
+                    lparam: 0,
+                });
+            }
+            self.open_menu = None;
+            self.dirty = true;
+            return true;
+        }
+        self.open_menu = None;
+        self.dirty = true;
+        true
+    }
+
+    fn process_control_click(&mut self, hwnd: u32) -> bool {
+        let Some(control) = self.windows.iter().rfind(|window| {
+            window.visible && window.parent == hwnd
+                && self.mouse_x >= window.x && self.mouse_y >= window.y
+                && self.mouse_x < window.x + window.width as i32
+                && self.mouse_y < window.y + window.height as i32
+        }) else { return false };
+        if control.control_class == 0x81 {
+            self.focus_hwnd = control.hwnd;
+            return true;
+        }
+        if control.menu == 0 || !matches!(control.control_class, 0x80 | 0x84) { return false; }
+        let (message, wparam) = if control.control_class == 0x84 {
+            let below_middle = self.mouse_y >= control.y + control.height as i32 / 2;
+            (0x0115, if below_middle { 1 } else { 0 })
+        } else {
+            (0x0111, control.menu)
+        };
+        self.messages.push(Message {
+            hwnd,
+            message,
+            wparam,
+            lparam: control.hwnd,
+        });
+        true
+    }
+}
+
+fn menu_text_width(text: &[u8]) -> i32 {
+    (text.iter().filter(|&&byte| byte != b'&').count() as i32) * 8
+}
+
+fn menu_fill(window: &mut Window, left: i32, top: i32, right: i32, bottom: i32, color: u32) {
+    let left = left.clamp(0, window.width as i32) as usize;
+    let top = top.clamp(0, window.height as i32) as usize;
+    let right = right.clamp(0, window.width as i32) as usize;
+    let bottom = bottom.clamp(0, window.height as i32) as usize;
+    let bytes = color.to_le_bytes();
+    for y in top..bottom {
+        for x in left..right {
+            let at = (y * window.width as usize + x) * 4;
+            window.pixels[at..at + 4].copy_from_slice(&bytes);
+        }
+    }
+}
+
+fn menu_text(window: &mut Window, mut x: i32, y: i32, text: &[u8]) {
+    for &byte in text {
+        if byte == b'&' { continue; }
+        let glyph = &lib::vga_fonts::FONT_8X16[byte as usize * 16..byte as usize * 16 + 16];
+        for (gy, &bits) in glyph.iter().enumerate() {
+            for gx in 0..8 {
+                if bits & (0x80 >> gx) != 0 {
+                    let px = x + gx;
+                    let py = y + gy as i32;
+                    if px >= 0 && py >= 0 && px < window.width as i32 && py < window.height as i32 {
+                        let at = (py as usize * window.width as usize + px as usize) * 4;
+                        window.pixels[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+            }
+        }
+        x += 8;
+    }
+}
+
+fn paint_menu(state: &mut WindowsState, window_index: usize) {
+    let hwnd = state.windows[window_index].hwnd;
+    let handle = state.windows[window_index].menu;
+    let Some(items) = state.menus.iter().find(|menu| menu.handle == handle)
+        .map(|menu| menu.items.clone()) else { return };
+    let open = state.open_menu.filter(|(open_hwnd, _)| *open_hwnd == hwnd)
+        .map(|(_, index)| index);
+    let window = &mut state.windows[window_index];
+    menu_fill(window, 0, 0, window.width as i32, 20, 0x00c0_c0c0);
+    menu_fill(window, 0, 19, window.width as i32, 20, 0x0080_8080);
+    let mut x = 4;
+    for (index, item) in items.iter().enumerate() {
+        let width = menu_text_width(&item.text) + 16;
+        if open == Some(index) { menu_fill(window, x, 1, x + width, 19, 0x00ff_ffff); }
+        menu_text(window, x + 8, 2, &item.text);
+        x += width;
+    }
+    let Some(index) = open else { return };
+    let Some(item) = items.get(index) else { return };
+    let width = item.children.iter().map(|child| menu_text_width(&child.text))
+        .max().unwrap_or(0) + 24;
+    let bottom = 20 + item.children.len() as i32 * 18;
+    menu_fill(window, 4, 20, 4 + width, bottom, 0x00ff_ffff);
+    menu_fill(window, 4, 20, 5, bottom, 0x0080_8080);
+    menu_fill(window, 4, bottom - 1, 4 + width, bottom, 0x0080_8080);
+    for (row, child) in item.children.iter().enumerate() {
+        let y = 21 + row as i32 * 18;
+        if child.text.first() == Some(&b'-') {
+            menu_fill(window, 8, y + 8, 4 + width - 4, y + 9, 0x0080_8080);
+        } else {
+            menu_text(window, 12, y + 1, &child.text);
+        }
+    }
+}
+
+fn paint_dialog(state: &mut WindowsState, window_index: usize) {
+    let hwnd = state.windows[window_index].hwnd;
+    let controls: Vec<(u8, i32, i32, u32, u32, Vec<u8>)> = state.windows.iter()
+        .filter(|window| window.visible && window.parent == hwnd && window.control_class != 0)
+        .map(|window| (window.control_class, window.x, window.y,
+            window.width, window.height, window.text.clone()))
+        .collect();
+    if controls.is_empty() { return; }
+    let title = state.windows[window_index].text.clone();
+    let window = &mut state.windows[window_index];
+    menu_fill(window, 0, 0, window.width as i32, 20, 0x0080_80c0);
+    menu_text(window, 6, 2, &title);
+    for (class, x, y, width, height, text) in controls {
+        if matches!(class, 0x80 | 0x81 | 0x84) {
+            menu_fill(window, x, y, x + width as i32, y + height as i32, 0x00ff_ffff);
+        }
+        if class == 0x84 {
+            menu_text(window, x + 1, y + 1, b"^");
+            menu_text(window, x + 1, y + height as i32 - 17, b"v");
+        } else if !text.is_empty() {
+            menu_text(window, x + 3, y + 1, &text);
+        }
     }
 }
 
@@ -401,6 +611,10 @@ pub fn render<A: crate::Arch>(
         x: placement.x + state.mouse_x,
         y: placement.y + state.mouse_y,
     });
+    // USER-owned non-client UI and dialog controls are retained independently
+    // from application client painting and restored at presentation time.
+    paint_menu(state, index);
+    paint_dialog(state, index);
     if !state.dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
         return;
     }
@@ -1699,11 +1913,13 @@ fn dispatch<A: crate::Arch>(
             {
                 class.wndproc = wndproc;
                 class.background = background;
+                class.menu = machine.read::<u32>(wc + 32);
             } else {
                 state.classes.push(WindowClass {
                     name,
                     wndproc,
                     background,
+                    menu: machine.read::<u32>(wc + 32),
                 });
             }
             state.classes.len() as u32
@@ -1734,6 +1950,13 @@ fn dispatch<A: crate::Arch>(
                 hwnd,
                 parent: arg(machine, regs, 8),
                 wndproc: class.wndproc,
+                menu: if arg(machine, regs, 9) != 0 {
+                    arg(machine, regs, 9)
+                } else {
+                    class.menu
+                },
+                control_class: 0,
+                text: Vec::new(),
                 x: arg(machine, regs, 4) as i32,
                 y: arg(machine, regs, 5) as i32,
                 width,
