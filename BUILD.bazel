@@ -201,6 +201,7 @@ _EXTRA_FILES = {
     "//apps/windows/win16:gdi_dll":          "WINDOWS/SYSTEM/GDI.DLL",
     "//apps/windows/win16:shell_dll":        "WINDOWS/SYSTEM/SHELL.DLL",
     "//apps/windows/win16:sound_dll":        "WINDOWS/SYSTEM/SOUND.DLL",
+    "//apps/windows/win16:keyboard_dll":     "WINDOWS/SYSTEM/KEYBOARD.DLL",
     "//apps/windows/minesweeper:MINESWPR.EXE": "WINDOWS/APPS/MINESWPR.EXE",
     "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
     "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",

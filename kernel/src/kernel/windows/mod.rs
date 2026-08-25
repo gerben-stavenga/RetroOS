@@ -154,7 +154,10 @@ struct Message {
 
 struct Window {
     hwnd: u32,
+    parent: u32,
     wndproc: u32,
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     visible: bool,
@@ -169,6 +172,7 @@ enum GdiObject {
     },
     Brush(u32),
     Pen(u32),
+    Font,
 }
 
 struct DeviceContext {
@@ -178,6 +182,7 @@ struct DeviceContext {
     y: i32,
     pen: u32,
     brush: u32,
+    font: u32,
     bk: u32,
     text: u32,
 }
@@ -213,6 +218,7 @@ pub struct WindowsState {
     dirty: bool,
     cursor_dirty: bool,
     paint_hwnd: u32,
+    focus_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
     dcs: Vec<DeviceContext>,
     mouse_x: i32,
@@ -249,6 +255,7 @@ impl WindowsState {
             dirty: true,
             cursor_dirty: true,
             paint_hwnd: 0,
+            focus_hwnd: 0,
             gdi_objects: Vec::new(),
             dcs: Vec::new(),
             mouse_x: 0,
@@ -274,7 +281,7 @@ impl WindowsState {
         let hwnd = self
             .windows
             .iter()
-            .rfind(|w| w.visible)
+            .rfind(|w| w.visible && w.parent == 0)
             .map_or(0, |w| w.hwnd);
         self.messages.push(Message {
             hwnd,
@@ -294,7 +301,7 @@ impl WindowsState {
     }
 
     pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8) {
-        let Some(window) = self.windows.iter().rfind(|w| w.visible) else {
+        let Some(window) = self.windows.iter().rfind(|w| w.visible && w.parent == 0) else {
             return;
         };
         let hwnd = window.hwnd;
@@ -369,7 +376,8 @@ pub fn render<A: crate::Arch>(
     const WINDOW_PRESENTATION: crate::kernel::gui::PresentationKey =
         crate::kernel::gui::PresentationKey(1);
     let focus_changed = desktop.focus(endpoint);
-    let Some(index) = state.windows.iter().rposition(|window| window.visible) else {
+    let Some(index) = state.windows.iter()
+        .rposition(|window| window.visible && window.parent == 0) else {
         return;
     };
     let (width, height) = (
@@ -415,7 +423,7 @@ pub fn render<A: crate::Arch>(
 pub fn surface_buffer<'a>(
     state: &'a WindowsState,
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
-    let window = state.windows.iter().rfind(|window| window.visible)?;
+    let window = state.windows.iter().rfind(|window| window.visible && window.parent == 0)?;
     crate::kernel::gui::PixelBuffer::new(
         window.width as usize,
         window.height as usize,
@@ -1074,6 +1082,9 @@ fn write_message<A: crate::Arch>(machine: &mut A, out: usize, message: Message) 
 }
 
 fn queue_paint(state: &mut WindowsState, hwnd: u32) {
+    if !state.windows.iter().any(|window| window.hwnd == hwnd && window.visible) {
+        return;
+    }
     if !state
         .messages
         .iter()
@@ -1149,15 +1160,50 @@ fn dc_bitmap(state: &WindowsState, dc: u32) -> Option<u32> {
         .and_then(|item| item.bitmap)
 }
 
-fn target_mut(state: &mut WindowsState, dc: u32) -> Option<(u32, u32, &mut Vec<u8>)> {
+struct RenderTarget<'a> {
+    width: u32,
+    height: u32,
+    origin_x: i32,
+    origin_y: i32,
+    clip_width: u32,
+    clip_height: u32,
+    pixels: &'a mut Vec<u8>,
+}
+
+fn target_mut(
+    state: &mut WindowsState,
+    dc: u32,
+) -> Option<RenderTarget<'_>> {
     if dc == state.paint_dc {
         let hwnd = state.paint_hwnd;
-        return state.windows.iter_mut().find(|w| w.hwnd == hwnd).map(|w| {
-            let need = w.width as usize * w.height as usize * 4;
-            if w.pixels.len() != need {
-                w.pixels.resize(need, 0xc0);
+        let window = state.windows.iter().find(|window| window.hwnd == hwnd)?;
+        let (clip_width, clip_height) = (window.width, window.height);
+        let (mut x, mut y, mut parent) = (window.x, window.y, window.parent);
+        let mut root = hwnd;
+        while parent != 0 {
+            let window = state.windows.iter().find(|window| window.hwnd == parent)?;
+            root = window.hwnd;
+            if window.parent != 0 {
+                x = x.saturating_add(window.x);
+                y = y.saturating_add(window.y);
             }
-            (w.width, w.height, &mut w.pixels)
+            parent = window.parent;
+        }
+        if root == hwnd { x = 0; y = 0; }
+        return state.windows.iter_mut().find(|window| window.hwnd == root).map(|window| {
+            let need = window.width as usize * window.height as usize * 4;
+            if window.pixels.len() != need {
+                window.pixels.resize(need, 0xc0);
+            }
+            RenderTarget {
+                width: window.width,
+                height: window.height,
+                origin_x: x,
+                origin_y: y,
+                clip_width,
+                clip_height,
+                pixels: &mut window.pixels,
+            }
         });
     }
     let bitmap = dc_bitmap(state, dc)?;
@@ -1170,22 +1216,33 @@ fn target_mut(state: &mut WindowsState, dc: u32) -> Option<(u32, u32, &mut Vec<u
                 width,
                 height,
                 pixels,
-            } => Some((*width, *height, pixels)),
+            } => Some(RenderTarget {
+                width: *width,
+                height: *height,
+                origin_x: 0,
+                origin_y: 0,
+                clip_width: *width,
+                clip_height: *height,
+                pixels,
+            }),
             _ => None,
         }
     })
 }
 
 fn put_pixel(state: &mut WindowsState, dc: u32, x: i32, y: i32, color: u32) {
-    let Some((width, height, pixels)) = target_mut(state, dc) else {
+    let Some(target) = target_mut(state, dc) else {
         return;
     };
-    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+    if x < 0 || y < 0 || x >= target.clip_width as i32 || y >= target.clip_height as i32 {
         return;
     }
-    let at = (y as usize * width as usize + x as usize) * 4;
-    if at + 4 <= pixels.len() {
-        pixels[at..at + 4].copy_from_slice(&color.to_le_bytes());
+    let x = x.saturating_add(target.origin_x);
+    let y = y.saturating_add(target.origin_y);
+    if x < 0 || y < 0 || x >= target.width as i32 || y >= target.height as i32 { return; }
+    let at = (y as usize * target.width as usize + x as usize) * 4;
+    if at + 4 <= target.pixels.len() {
+        target.pixels[at..at + 4].copy_from_slice(&color.to_le_bytes());
     }
 }
 
@@ -1198,18 +1255,22 @@ fn fill_pixels(
     bottom: i32,
     color: u32,
 ) {
-    let Some((width, height, pixels)) = target_mut(state, dc) else {
+    let Some(target) = target_mut(state, dc) else {
         return;
     };
-    let left = left.clamp(0, width as i32) as usize;
-    let right = right.clamp(0, width as i32) as usize;
-    let top = top.clamp(0, height as i32) as usize;
-    let bottom = bottom.clamp(0, height as i32) as usize;
+    let left = left.clamp(0, target.clip_width as i32).saturating_add(target.origin_x)
+        .clamp(0, target.width as i32) as usize;
+    let right = right.clamp(0, target.clip_width as i32).saturating_add(target.origin_x)
+        .clamp(0, target.width as i32) as usize;
+    let top = top.clamp(0, target.clip_height as i32).saturating_add(target.origin_y)
+        .clamp(0, target.height as i32) as usize;
+    let bottom = bottom.clamp(0, target.clip_height as i32).saturating_add(target.origin_y)
+        .clamp(0, target.height as i32) as usize;
     let bytes = color.to_le_bytes();
     for y in top..bottom {
         for x in left..right {
-            let at = (y * width as usize + x) * 4;
-            pixels[at..at + 4].copy_from_slice(&bytes);
+            let at = (y * target.width as usize + x) * 4;
+            target.pixels[at..at + 4].copy_from_slice(&bytes);
         }
     }
 }
@@ -1671,7 +1732,10 @@ fn dispatch<A: crate::Arch>(
             let pixels = vec![0xc0; width as usize * height as usize * 4];
             state.windows.push(Window {
                 hwnd,
+                parent: arg(machine, regs, 8),
                 wndproc: class.wndproc,
+                x: arg(machine, regs, 4) as i32,
+                y: arg(machine, regs, 5) as i32,
                 width,
                 height,
                 visible: false,
@@ -1876,6 +1940,7 @@ fn dispatch<A: crate::Arch>(
                 y: 0,
                 pen: 0x30008,
                 brush: 0x30005,
+                font: 1,
                 bk: 0x00ff_ffff,
                 text: 0,
             });
@@ -1892,6 +1957,7 @@ fn dispatch<A: crate::Arch>(
                     GdiObject::Bitmap { .. } => 0,
                     GdiObject::Brush(_) => 1,
                     GdiObject::Pen(_) => 2,
+                    GdiObject::Font => 3,
                 });
             let Some(context) = state.dcs.iter_mut().find(|d| d.handle == dc) else {
                 return 0;
@@ -1906,6 +1972,11 @@ fn dispatch<A: crate::Arch>(
                 Some(2) => {
                     let old = context.pen;
                     context.pen = object;
+                    old
+                }
+                Some(3) => {
+                    let old = context.font;
+                    context.font = object;
                     old
                 }
                 _ => 1,

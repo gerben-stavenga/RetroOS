@@ -28,6 +28,7 @@ enum Module {
     User,
     Sound,
     Shell,
+    Keyboard,
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +45,13 @@ struct Gate {
 #[derive(Clone, Copy)]
 struct Callback {
     dispatch_gate: Gate,
+    result: CallbackResult,
+}
+
+#[derive(Clone, Copy)]
+enum CallbackResult {
+    WndProc,
+    CreateWindow { hwnd: u32 },
 }
 
 struct Resource {
@@ -61,6 +69,7 @@ pub(super) struct State {
     local_next: u16,
     local_end: u16,
     psp_selector: u16,
+    env_selector: u16,
     timer: u16,
     resource_selector: u16,
     resource_next: u16,
@@ -73,6 +82,7 @@ fn module(name: &[u8]) -> Option<Module> {
     else if name.eq_ignore_ascii_case(b"USER") { Some(Module::User) }
     else if name.eq_ignore_ascii_case(b"SOUND") { Some(Module::Sound) }
     else if name.eq_ignore_ascii_case(b"SHELL") { Some(Module::Shell) }
+    else if name.eq_ignore_ascii_case(b"KEYBOARD") { Some(Module::Keyboard) }
     else { None }
 }
 
@@ -82,43 +92,115 @@ fn module(name: &[u8]) -> Option<Module> {
 fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
     let s = match (module, ordinal) {
         (Module::Kernel, 1) => (2, false, "FatalExit"),
+        (Module::Kernel, 3) => (0, true, "GetVersion"),
+        (Module::Kernel, 4) => (6, false, "LocalInit"),
         (Module::Kernel, 5) => (4, false, "LocalAlloc"),
         (Module::Kernel, 6) => (6, false, "LocalReAlloc"),
         (Module::Kernel, 7) => (2, false, "LocalFree"),
+        (Module::Kernel, 8) => (2, true, "LocalLock"),
+        (Module::Kernel, 9) => (2, false, "LocalUnlock"),
+        (Module::Kernel, 10) => (2, false, "LocalSize"),
         (Module::Kernel, 15) => (6, false, "GlobalAlloc"),
         (Module::Kernel, 16) => (8, false, "GlobalReAlloc"),
         (Module::Kernel, 17) => (2, false, "GlobalFree"),
+        (Module::Kernel, 18) => (2, true, "GlobalLock"),
         (Module::Kernel, 19) => (2, false, "GlobalUnlock"),
+        (Module::Kernel, 20) => (2, true, "GlobalSize"),
         (Module::Kernel, 23) => (2, false, "LockSegment"),
         (Module::Kernel, 24) => (2, false, "UnlockSegment"),
+        (Module::Kernel, 25) => (4, true, "GlobalCompact"),
         (Module::Kernel, 30) => (2, false, "WaitEvent"),
+        (Module::Kernel, 47) => (4, true, "GetModuleHandle"),
+        (Module::Kernel, 48) => (2, false, "GetModuleUsage"),
+        (Module::Kernel, 49) => (8, false, "GetModuleFileName"),
+        (Module::Kernel, 50) => (6, true, "GetProcAddress"),
         (Module::Kernel, 51) => (6, true, "MakeProcInstance"),
         (Module::Kernel, 52) => (4, false, "FreeProcInstance"),
+        (Module::Kernel, 58) => (18, false, "GetProfileString"),
         (Module::Kernel, 60) => (10, false, "FindResource"),
         (Module::Kernel, 61) => (4, false, "LoadResource"),
         (Module::Kernel, 62) => (2, true, "LockResource"),
+        (Module::Kernel, 63) => (2, false, "FreeResource"),
+        (Module::Kernel, 74) => (10, false, "OpenFile"),
+        (Module::Kernel, 81) => (2, false, "_lclose"),
         (Module::Kernel, 88) => (8, true, "lstrcpy"),
+        (Module::Kernel, 89) => (8, true, "lstrcat"),
+        (Module::Kernel, 90) => (4, false, "lstrlen"),
         (Module::Kernel, 91) => (0, false, "InitTask"),
+        (Module::Kernel, 95) => (4, false, "LoadLibrary"),
+        (Module::Kernel, 96) => (2, false, "FreeLibrary"),
+        (Module::Kernel, 97) => (12, false, "GetTempFileName"),
         (Module::Kernel, 102) => (0, false, "DOS3Call"),
+        (Module::Kernel, 107) => (2, false, "SetErrorMode"),
         (Module::Kernel, 115) => (4, false, "OutputDebugString"),
+        (Module::Kernel, 121) => (4, false, "LocalShrink"),
         (Module::Kernel, 127) => (14, false, "GetPrivateProfileInt"),
         (Module::Kernel, 128) => (22, false, "GetPrivateProfileString"),
         (Module::Kernel, 129) => (16, false, "WritePrivateProfileString"),
+        (Module::Kernel, 131) => (0, true, "GetDOSEnvironment"),
+        (Module::Kernel, 132) => (0, true, "GetWinFlags"),
+        (Module::Kernel, 135) => (6, false, "GetSystemDirectory"),
+        (Module::Kernel, 136) => (2, false, "GetDriveType"),
         (Module::Kernel, 137) => (6, false, "FatalAppExit"),
+        (Module::Kernel, 207) => (2, false, "IsDBCSLeadByte"),
 
+        (Module::Gdi, 1) => (6, true, "SetBkColor"),
+        (Module::Gdi, 2) => (4, false, "SetBkMode"),
+        (Module::Gdi, 3) => (4, false, "SetMapMode"),
         (Module::Gdi, 4) => (4, false, "SetROP2"),
+        (Module::Gdi, 7) => (4, false, "SetStretchBltMode"),
+        (Module::Gdi, 9) => (6, true, "SetTextColor"),
+        (Module::Gdi, 11) => (6, true, "SetWindowOrg"),
+        (Module::Gdi, 12) => (6, true, "SetWindowExt"),
+        (Module::Gdi, 13) => (6, true, "SetViewportOrg"),
+        (Module::Gdi, 14) => (6, true, "SetViewportExt"),
         (Module::Gdi, 19) => (6, false, "LineTo"),
         (Module::Gdi, 20) => (6, true, "MoveTo"),
+        (Module::Gdi, 23) => (18, false, "Arc"),
+        (Module::Gdi, 27) => (10, false, "Rectangle"),
+        (Module::Gdi, 29) => (14, false, "PatBlt"),
         (Module::Gdi, 31) => (10, true, "SetPixel"),
+        (Module::Gdi, 33) => (12, false, "TextOut"),
         (Module::Gdi, 34) => (20, false, "BitBlt"),
+        (Module::Gdi, 35) => (24, false, "StretchBlt"),
+        (Module::Gdi, 36) => (8, false, "Polygon"),
+        (Module::Gdi, 38) => (14, true, "Escape"),
+        (Module::Gdi, 44) => (4, false, "SelectClipRgn"),
         (Module::Gdi, 45) => (4, false, "SelectObject"),
+        (Module::Gdi, 51) => (6, false, "CreateCompatibleBitmap"),
         (Module::Gdi, 52) => (2, false, "CreateCompatibleDC"),
+        (Module::Gdi, 53) => (16, false, "CreateDC"),
+        (Module::Gdi, 54) => (8, false, "CreateEllipticRgn"),
+        (Module::Gdi, 57) => (4, false, "CreateFontIndirect"),
+        (Module::Gdi, 60) => (2, false, "CreatePatternBrush"),
         (Module::Gdi, 61) => (8, false, "CreatePen"),
         (Module::Gdi, 66) => (4, false, "CreateSolidBrush"),
+        (Module::Gdi, 67) => (8, false, "DPtoLP"),
         (Module::Gdi, 68) => (2, false, "DeleteDC"),
         (Module::Gdi, 69) => (2, false, "DeleteObject"),
+        (Module::Gdi, 74) => (10, true, "GetBitmapBits"),
         (Module::Gdi, 80) => (4, false, "GetDeviceCaps"),
+        (Module::Gdi, 81) => (2, false, "GetMapMode"),
+        (Module::Gdi, 82) => (8, false, "GetObject"),
+        (Module::Gdi, 83) => (6, true, "GetPixel"),
         (Module::Gdi, 87) => (2, false, "GetStockObject"),
+        (Module::Gdi, 91) => (8, true, "GetTextExtent"),
+        (Module::Gdi, 93) => (6, false, "GetTextMetrics"),
+        (Module::Gdi, 94) => (2, true, "GetViewportExt"),
+        (Module::Gdi, 96) => (2, true, "GetWindowExt"),
+        (Module::Gdi, 99) => (8, false, "LPtoDP"),
+        (Module::Gdi, 123) => (4, false, "PlayMetaFile"),
+        (Module::Gdi, 127) => (2, false, "DeleteMetaFile"),
+        (Module::Gdi, 128) => (6, false, "MulDiv"),
+        (Module::Gdi, 148) => (6, true, "SetBrushOrg"),
+        (Module::Gdi, 150) => (2, false, "UnrealizeObject"),
+        (Module::Gdi, 153) => (16, false, "CreateIC"),
+        (Module::Gdi, 154) => (6, true, "GetNearestColor"),
+        (Module::Gdi, 156) => (6, false, "CreateDiscardableBitmap"),
+        (Module::Gdi, 160) => (2, false, "SetMetaFileBits"),
+        (Module::Gdi, 351) => (22, false, "ExtTextOut"),
+        (Module::Gdi, 360) => (4, false, "CreatePalette"),
+        (Module::Gdi, 367) => (10, false, "AnimatePalette"),
         (Module::Gdi, 442) => (20, false, "CreateDIBitmap"),
         (Module::Gdi, 443) => (30, false, "SetDIBitsToDevice"),
 
@@ -175,6 +257,91 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::User, 287) => (2, false, "GetLastActivePopup"),
         (Module::User, 420) => (0, false, "wsprintf"),
 
+        (Module::User, 16) => (4, false, "ClipCursor"),
+        (Module::User, 17) => (4, false, "GetCursorPos"),
+        (Module::User, 22) => (2, false, "SetFocus"),
+        (Module::User, 23) => (0, false, "GetFocus"),
+        (Module::User, 24) => (6, false, "RemoveProp"),
+        (Module::User, 25) => (6, false, "GetProp"),
+        (Module::User, 26) => (8, false, "SetProp"),
+        (Module::User, 29) => (6, false, "ScreenToClient"),
+        (Module::User, 32) => (6, false, "GetWindowRect"),
+        (Module::User, 33) => (6, false, "GetClientRect"),
+        (Module::User, 34) => (4, false, "EnableWindow"),
+        (Module::User, 35) => (2, false, "IsWindowEnabled"),
+        (Module::User, 36) => (8, false, "GetWindowText"),
+        (Module::User, 37) => (6, false, "SetWindowText"),
+        (Module::User, 46) => (2, false, "GetParent"),
+        (Module::User, 47) => (2, false, "IsWindow"),
+        (Module::User, 60) => (0, false, "GetActiveWindow"),
+        (Module::User, 61) => (14, false, "ScrollWindow"),
+        (Module::User, 62) => (8, false, "SetScrollPos"),
+        (Module::User, 64) => (10, false, "SetScrollRange"),
+        (Module::User, 69) => (2, false, "SetCursor"),
+        (Module::User, 70) => (4, false, "SetCursorPos"),
+        (Module::User, 71) => (2, false, "ShowCursor"),
+        (Module::User, 74) => (8, false, "CopyRect"),
+        (Module::User, 77) => (8, false, "OffsetRect"),
+        (Module::User, 78) => (8, false, "InflateRect"),
+        (Module::User, 79) => (12, false, "IntersectRect"),
+        (Module::User, 81) => (8, false, "FillRect"),
+        (Module::User, 83) => (8, false, "FrameRect"),
+        (Module::User, 84) => (8, false, "DrawIcon"),
+        (Module::User, 85) => (14, false, "DrawText"),
+        (Module::User, 91) => (4, false, "GetDlgItem"),
+        (Module::User, 96) => (8, false, "CheckRadioButton"),
+        (Module::User, 97) => (6, false, "CheckDlgButton"),
+        (Module::User, 98) => (4, false, "IsDlgButtonChecked"),
+        (Module::User, 100) => (12, false, "DlgDirList"),
+        (Module::User, 101) => (12, true, "SendDlgItemMessage"),
+        (Module::User, 104) => (2, false, "MessageBeep"),
+        (Module::User, 106) => (2, false, "GetKeyState"),
+        (Module::User, 118) => (4, false, "RegisterWindowMessage"),
+        (Module::User, 122) => (14, true, "CallWindowProc"),
+        (Module::User, 127) => (6, false, "ValidateRect"),
+        (Module::User, 131) => (4, true, "GetClassLong"),
+        (Module::User, 133) => (4, false, "GetWindowWord"),
+        (Module::User, 134) => (6, false, "SetWindowWord"),
+        (Module::User, 135) => (4, true, "GetWindowLong"),
+        (Module::User, 136) => (8, true, "SetWindowLong"),
+        (Module::User, 151) => (0, false, "CreateMenu"),
+        (Module::User, 152) => (2, false, "DestroyMenu"),
+        (Module::User, 153) => (12, false, "ChangeMenu"),
+        (Module::User, 156) => (4, false, "GetSystemMenu"),
+        (Module::User, 157) => (2, false, "GetMenu"),
+        (Module::User, 159) => (4, false, "GetSubMenu"),
+        (Module::User, 160) => (2, false, "DrawMenuBar"),
+        (Module::User, 175) => (6, false, "LoadBitmap"),
+        (Module::User, 180) => (2, true, "GetSysColor"),
+        (Module::User, 185) => (22, false, "GrayString"),
+        (Module::User, 189) => (0, false, "GetSysModalWindow"),
+        (Module::User, 191) => (6, false, "ChildWindowFromPoint"),
+        (Module::User, 196) => (20, true, "TabbedTextOut"),
+        (Module::User, 229) => (2, false, "GetTopWindow"),
+        (Module::User, 232) => (14, false, "SetWindowPos"),
+        (Module::User, 236) => (0, false, "GetCapture"),
+        (Module::User, 240) => (14, false, "DialogBoxIndirectParam"),
+        (Module::User, 242) => (16, false, "CreateDialogIndirectParam"),
+        (Module::User, 244) => (8, false, "EqualRect"),
+        (Module::User, 249) => (2, false, "GetAsyncKeyState"),
+        (Module::User, 277) => (2, false, "GetDlgCtrlID"),
+        (Module::User, 282) => (6, false, "SelectPalette"),
+        (Module::User, 283) => (2, false, "RealizePalette"),
+        (Module::User, 407) => (18, false, "CreateIcon"),
+        (Module::User, 410) => (12, false, "InsertMenu"),
+        (Module::User, 411) => (10, false, "AppendMenu"),
+        (Module::User, 412) => (6, false, "RemoveMenu"),
+        (Module::User, 413) => (6, false, "DeleteMenu"),
+        (Module::User, 414) => (12, false, "ModifyMenu"),
+        (Module::User, 430) => (8, false, "lstrcmp"),
+        (Module::User, 431) => (4, true, "AnsiUpper"),
+        (Module::User, 432) => (4, true, "AnsiLower"),
+        (Module::User, 457) => (2, false, "DestroyIcon"),
+        (Module::User, 466) => (6, false, "DrawFocusRect"),
+        (Module::User, 471) => (8, false, "lstrcmpi"),
+        (Module::User, 472) => (4, true, "AnsiNext"),
+        (Module::User, 512) => (12, false, "WNetGetConnection"),
+
         (Module::Sound, 1) => (0, false, "OpenSound"),
         (Module::Sound, 2) => (0, false, "CloseSound"),
         (Module::Sound, 4) => (8, false, "SetVoiceNote"),
@@ -182,6 +349,8 @@ fn spec(module: Module, ordinal: u16) -> Option<(u16, bool, &'static str)> {
         (Module::Sound, 9) => (0, false, "StartSound"),
         (Module::Sound, 10) => (0, false, "StopSound"),
         (Module::Shell, 22) => (12, false, "ShellAbout"),
+        (Module::Keyboard, 5) => (8, false, "AnsiToOem"),
+        (Module::Keyboard, 6) => (8, false, "OemToAnsi"),
         _ => return None,
     };
     Some(s)
@@ -235,7 +404,8 @@ fn register_gate(
 }
 
 struct LoadedModule {
-    kind: Module,
+    name: Vec<u8>,
+    kind: Option<Module>,
     data: Vec<u8>,
     selectors: Vec<u16>,
 }
@@ -259,11 +429,24 @@ fn dirname(path: &[u8]) -> &[u8] {
     path.iter().rposition(|&b| b == b'/').map_or(b"", |at| &path[..at])
 }
 
-fn load_module_file(name: &[u8], importer: &[u8]) -> Result<Vec<u8>, i32> {
+fn canonical_module_name(name: &[u8]) -> Vec<u8> {
+    let mut canonical = name.to_vec();
+    canonical.make_ascii_uppercase();
+    if canonical.ends_with(b".DLL") { canonical.truncate(canonical.len() - 4); }
+    canonical
+}
+
+fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_file(name);
     let system = join(crate::kernel::dos::c_root(), b"WINDOWS/SYSTEM");
     for path in [join(dirname(importer), &file), join(&system, &file)] {
-        if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) { return Ok(data); }
+        if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
+            return Ok((path, data));
+        }
+        let rooted = [crate::kernel::dos::c_root(), path.as_slice()].concat();
+        if let Ok(data) = crate::kernel::exec::load_file_resolved(&rooted) {
+            return Ok((rooted, data));
+        }
     }
     Err(-2)
 }
@@ -310,6 +493,90 @@ fn patch_chain<A: crate::Arch>(
     Ok(())
 }
 
+fn imported_target<A: crate::Arch>(
+    machine: &A,
+    ldt: &[u64],
+    modules: &[LoadedModule],
+    gates: &mut Vec<Gate>,
+    name: &[u8],
+    ordinal: Option<u16>,
+    symbol: Option<&[u8]>,
+) -> Result<(u16, u16), i32> {
+    let canonical = canonical_module_name(name);
+    let kind = module(&canonical);
+    if kind == Some(Module::Kernel) {
+        match ordinal {
+            Some(114) => return Ok((8, 0)),
+            Some(178) => return Ok((0x0413, 0)),
+            _ => {}
+        }
+    }
+    let Some(loaded) = modules.iter().find(|loaded| loaded.name == canonical) else {
+        crate::dbg_println!("[win16] module {} not loaded",
+            core::str::from_utf8(&canonical).unwrap_or("?"));
+        return Err(-2);
+    };
+    let image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
+    let entry = match (ordinal, symbol) {
+        (Some(ordinal), None) => image.entry(ordinal),
+        (None, Some(symbol)) => image.entry_by_name(symbol),
+        _ => return Err(-8),
+    };
+    let (segment, offset) = entry.map_err(|_| {
+        let module = core::str::from_utf8(&canonical).unwrap_or("?");
+        if let Some(ordinal) = ordinal {
+            crate::dbg_println!("[win16] export {}.{} not found", module, ordinal);
+        } else {
+            crate::dbg_println!("[win16] export {}!{} not found", module,
+                core::str::from_utf8(symbol.unwrap_or(b"?")).unwrap_or("?"));
+        }
+        -127
+    })?;
+    let selector = *loaded.selectors.get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
+    if let (Some(kind), Some(ordinal)) = (kind, ordinal) {
+        let base = selector_base_from_ldt(ldt, selector).ok_or(-8)?;
+        if machine.read::<u8>((base + u32::from(offset)) as usize) != 0xcd
+            || machine.read::<u8>((base + u32::from(offset) + 1) as usize) != GATE_VECTOR
+        {
+            return Err(-8);
+        }
+        let gate = register_gate(gates, kind, ordinal, selector, offset)?;
+        return Ok((gate.offset, gate.selector));
+    }
+    Ok((offset, selector))
+}
+
+fn relocate_image<A: crate::Arch>(
+    machine: &mut A,
+    image: &ne::Image<'_>,
+    selectors: &[u16],
+    modules: &[LoadedModule],
+    ldt: &[u64],
+    gates: &mut Vec<Gate>,
+    mut segment_base: impl FnMut(u16) -> Result<u32, i32>,
+) -> Result<(), i32> {
+    for number in 1..=image.header.segment_count {
+        let segment = image.segment(number).map_err(|_| -8)?;
+        let base = segment_base(number)?;
+        for relocation in image.relocations(segment).map_err(|_| -8)? {
+            let (offset, target_selector) = match &relocation.target {
+                ne::Target::Internal { segment, offset } => {
+                    let selector = *selectors.get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
+                    (*offset, selector)
+                }
+                ne::Target::ImportOrdinal { module, ordinal } => imported_target(
+                    machine, ldt, modules, gates, module, Some(*ordinal), None,
+                )?,
+                ne::Target::ImportName { module, name } => imported_target(
+                    machine, ldt, modules, gates, module, None, Some(name),
+                )?,
+            };
+            patch_chain(machine, base, segment.alloc_size, &relocation, offset, target_selector)?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn exec<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
@@ -343,11 +610,20 @@ pub(super) fn exec<A: crate::Arch>(
         let mut b = [0u8; 164];
         crate::kernel::exec::resolve_path(path, parent_cwd, &mut b).to_vec()
     };
+    // Build the complete dependency closure before applying any fixups. Real
+    // Win16 libraries (for example an application's COMMDLG.DLL) contain code
+    // and imports of their own; replacement system DLLs are merely leaves in
+    // this same graph.
+    let mut pending: Vec<(Vec<u8>, Vec<u8>)> = image.modules().map_err(|_| -8)?
+        .into_iter().map(|name| (name, main_path.clone())).collect();
     let mut modules = Vec::new();
-    for name in image.modules().map_err(|_| -8)? {
-        let kind = module(&name).ok_or(-8)?;
-        if modules.iter().any(|loaded: &LoadedModule| loaded.kind == kind) { continue; }
-        let module_data = load_module_file(&name, &main_path)?;
+    let mut next = 0;
+    while next < pending.len() {
+        let (name, importer) = pending[next].clone();
+        next += 1;
+        let canonical = canonical_module_name(&name);
+        if modules.iter().any(|loaded: &LoadedModule| loaded.name == canonical) { continue; }
+        let (module_path, module_data) = load_module_file(&canonical, &importer)?;
         let module_image = ne::Image::parse(&module_data).map_err(|_| -8)?;
         let mut module_selectors = Vec::with_capacity(module_image.header.segment_count as usize);
         let module_index = modules.len();
@@ -360,7 +636,16 @@ pub(super) fn exec<A: crate::Arch>(
             module_selectors.push(selector(
                 &mut ldt, base, segment.alloc_size, segment.is_code())?);
         }
-        modules.push(LoadedModule { kind, data: module_data, selectors: module_selectors });
+        let dependencies = module_image.modules().map_err(|_| -8)?;
+        modules.push(LoadedModule {
+            name: canonical.clone(),
+            kind: module(&canonical),
+            data: module_data,
+            selectors: module_selectors,
+        });
+        pending.extend(dependencies.into_iter().map(|dependency| {
+            (dependency, module_path.clone())
+        }));
     }
 
     machine.zero(PSP_BASE as usize, 4096);
@@ -372,47 +657,17 @@ pub(super) fn exec<A: crate::Arch>(
     machine.zero(RESOURCE_BASE as usize, 0x10000);
     let mut gates = Vec::new();
 
-    for number in 1..=header.segment_count {
-        let segment = image.segment(number).map_err(|_| -8)?;
-        let base = segment_base(number)?;
-        for relocation in image.relocations(segment).map_err(|_| -8)? {
-            let (offset, target_selector) = match &relocation.target {
-                ne::Target::Internal { segment, offset } => {
-                    let sel = *selectors.get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
-                    (*offset, sel)
-                }
-                ne::Target::ImportOrdinal { module: name, ordinal } => {
-                    let kind = module(name).ok_or(-8)?;
-                    if kind == Module::Kernel && *ordinal == 178 {
-                        (0x0413, 0)
-                    } else {
-                        let loaded = modules.iter().find(|loaded| loaded.kind == kind).ok_or(-2)?;
-                        let module_image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
-                        let (segment, offset) = module_image.entry(*ordinal).map_err(|_| -127)?;
-                        let target_selector = *loaded.selectors
-                            .get(segment.wrapping_sub(1) as usize).ok_or(-8)?;
-                        let base = selector_base_from_ldt(&ldt, target_selector).ok_or(-8)?;
-                        if machine.read::<u8>((base + u32::from(offset)) as usize) != 0xcd
-                            || machine.read::<u8>((base + u32::from(offset) + 1) as usize)
-                                != GATE_VECTOR {
-                            return Err(-8);
-                        }
-                        let gate = register_gate(
-                            &mut gates, kind, *ordinal, target_selector, offset)?;
-                        (gate.offset, gate.selector)
-                    }
-                }
-                ne::Target::ImportName { module: name, name: symbol } => {
-                    crate::dbg_println!("[win16] named import {}!{} unsupported",
-                        core::str::from_utf8(name).unwrap_or("?"),
-                        core::str::from_utf8(symbol).unwrap_or("?"));
-                    return Err(-8);
-                }
-            };
-            patch_chain(machine, base, segment.alloc_size, &relocation, offset, target_selector)?;
-        }
+    relocate_image(
+        machine, &image, &selectors, &modules, &ldt, &mut gates, segment_base,
+    )?;
+    for (module_index, loaded) in modules.iter().enumerate() {
+        let module_image = ne::Image::parse(&loaded.data).map_err(|_| -8)?;
+        relocate_image(
+            machine, &module_image, &loaded.selectors, &modules, &ldt, &mut gates,
+            |number| module_segment_base(module_index, number),
+        )?;
     }
-    let user = modules.iter().find(|loaded| loaded.kind == Module::User).ok_or(-2)?;
+    let user = modules.iter().find(|loaded| loaded.kind == Some(Module::User)).ok_or(-2)?;
     let user_image = ne::Image::parse(&user.data).map_err(|_| -8)?;
     let (callback_segment, callback_offset) = user_image.entry(421).map_err(|_| -127)?;
     let callback_selector = *user.selectors
@@ -468,6 +723,7 @@ pub(super) fn exec<A: crate::Arch>(
         y: 0,
         pen: 0,
         brush: 0,
+        font: 1,
         bk: 0x00ff_ffff,
         text: 0,
     });
@@ -521,6 +777,7 @@ pub(super) fn exec<A: crate::Arch>(
         local_next,
         local_end,
         psp_selector,
+        env_selector,
         timer: 0,
         resource_selector,
         resource_next: 0,
@@ -575,6 +832,16 @@ fn far_string<A: crate::Arch>(
     None
 }
 
+fn dos_path(path: &[u8]) -> Vec<u8> {
+    let root = crate::kernel::dos::c_root();
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let relative = relative.strip_prefix(b"/").unwrap_or(relative);
+    let mut result = Vec::with_capacity(relative.len() + 3);
+    result.extend_from_slice(b"C:\\");
+    result.extend(relative.iter().map(|&byte| if byte == b'/' { b'\\' } else { byte }));
+    result
+}
+
 fn write_message16<A: crate::Arch>(machine: &mut A, out: usize, message: super::Message) {
     machine.write::<u16>(out, message.hwnd as u16);
     machine.write::<u16>(out + 2, message.message as u16);
@@ -600,6 +867,7 @@ fn begin_wndproc<A: crate::Arch>(
     state: &mut State,
     regs: &mut Regs,
     dispatch_gate: Gate,
+    callback_result: CallbackResult,
     message: super::Message,
 ) -> bool {
     let Some(window) = windows.windows.iter().find(|window| window.hwnd == message.hwnd) else {
@@ -614,7 +882,7 @@ fn begin_wndproc<A: crate::Arch>(
     machine.write::<u16>(stack + 8, message.wparam as u16);
     machine.write::<u16>(stack + 10, message.message as u16);
     machine.write::<u16>(stack + 12, message.hwnd as u16);
-    state.callback = Some(Callback { dispatch_gate });
+    state.callback = Some(Callback { dispatch_gate, result: callback_result });
     regs.frame.rsp = u64::from(new_sp);
     regs.frame.rip = u64::from(window.wndproc as u16);
     regs.frame.cs = u64::from((window.wndproc >> 16) as u16);
@@ -727,6 +995,8 @@ fn dispatch<A: crate::Arch>(
     gate: Gate,
 ) -> u32 {
     match (gate.module, gate.ordinal) {
+        (Module::Kernel, 3) => 0x0000_0a03, // Windows 3.10
+        (Module::Kernel, 4) => 1,
         (Module::Kernel, 91) => {
             // The Microsoft C startup consumes these register results before
             // it calls WinMain.
@@ -763,7 +1033,11 @@ fn dispatch<A: crate::Arch>(
                 .map(|p| machine.read::<u16>(p) as usize).unwrap_or(0);
             let aligned = (size.max(2) + 1) & !1;
             let next = usize::from(state.local_next).saturating_add(aligned);
-            if next > usize::from(state.local_end) { 0 } else {
+            if next > usize::from(state.local_end) {
+                crate::dbg_println!("[win16] LocalAlloc {} failed ({:04x}..{:04x})",
+                    size, state.local_next, state.local_end);
+                0
+            } else {
                 let handle = state.local_next;
                 state.local_next = next as u16;
                 u32::from(handle)
@@ -771,11 +1045,32 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::Kernel, 7) => 0,
         (Module::Kernel, 23 | 24 | 30 | 52) => 1,
+        (Module::Kernel, 47) => u32::from(state.instance),
+        (Module::Kernel, 49) => {
+            let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;
+            let Some(out) = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            if capacity == 0 { return 0; }
+            let path = dos_path(windows.exec_path_str());
+            let len = path.len().min(capacity - 1);
+            machine.copy_to(out, &path[..len]);
+            machine.write::<u8>(out + len, 0);
+            len as u32
+        }
         (Module::Kernel, 51) => {
             // MakeProcInstance is unnecessary in protected mode: preserve the
             // application's far procedure value.
             let Some(p) = stack_at(windows, regs, 6) else { return 0 };
             machine.read::<u32>(p)
+        }
+        (Module::Kernel, 88) => {
+            let source_pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            let destination_pointer = stack_u32(machine, windows, regs, 8).unwrap_or(0);
+            let Some(source) = far_string(machine, windows, source_pointer) else { return 0 };
+            let Some(destination) = far_linear(windows, destination_pointer) else { return 0 };
+            machine.copy_to(destination, &source);
+            machine.write::<u8>(destination + source.len(), 0);
+            destination_pointer
         }
         (Module::Kernel, 60) => {
             let kind_pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
@@ -830,6 +1125,18 @@ fn dispatch<A: crate::Arch>(
             len as u32
         }
         (Module::Kernel, 129) => 1,
+        (Module::Kernel, 131) => u32::from(state.env_selector) << 16,
+        (Module::Kernel, 132) => 0x0025, // protected mode, 386, enhanced mode
+        (Module::User, 1) => {
+            let text = stack_u32(machine, windows, regs, 10).unwrap_or(0);
+            let caption = stack_u32(machine, windows, regs, 6).unwrap_or(0);
+            let text = far_string(machine, windows, text).unwrap_or_default();
+            let caption = far_string(machine, windows, caption).unwrap_or_default();
+            crate::dbg_println!("[win16] MessageBox '{}': '{}'",
+                core::str::from_utf8(&caption).unwrap_or("?"),
+                core::str::from_utf8(&text).unwrap_or("?"));
+            1 // IDOK
+        }
         (Module::User, 5) => 1,
         (Module::User, 6) => {
             windows.quit = true;
@@ -847,6 +1154,28 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 15) => (machine.now() / 1_000_000) as u32,
         (Module::User, 18) => stack_u16(machine, windows, regs, 4).unwrap_or(0) as u32,
         (Module::User, 19) => 1,
+        (Module::User, 22) => {
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let previous = windows.focus_hwnd;
+            if hwnd == 0 || windows.windows.iter().any(|window| window.hwnd == hwnd) {
+                windows.focus_hwnd = hwnd;
+            }
+            previous
+        }
+        (Module::User, 23) => windows.focus_hwnd,
+        (Module::User, 33) => {
+            let Some(rect) = stack_u32(machine, windows, regs, 4)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let hwnd = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
+            let Some(window) = windows.windows.iter().find(|window| window.hwnd == hwnd) else {
+                return 0;
+            };
+            machine.write::<i16>(rect, 0);
+            machine.write::<i16>(rect + 2, 0);
+            machine.write::<i16>(rect + 4, window.width as i16);
+            machine.write::<i16>(rect + 6, window.height as i16);
+            1
+        }
         (Module::User, 39) => {
             let Some(out) = stack_u32(machine, windows, regs, 4)
                 .and_then(|p| far_linear(windows, p)) else { return 0 };
@@ -887,29 +1216,50 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 41) => {
             let class_pointer = stack_u32(machine, windows, regs, 30).unwrap_or(0);
             let class = if class_pointer >> 16 == 0 {
-                windows.classes.first()
+                windows.classes.first().map(|class| (class.wndproc, class.background))
             } else {
-                let Some(name) = far_string(machine, windows, class_pointer) else { return 0 };
+                let Some(name) = far_string(machine, windows, class_pointer) else {
+                    crate::dbg_println!("[win16] invalid window class pointer {:08x}", class_pointer);
+                    return 0;
+                };
                 windows.classes.iter().find(|class| class.name.eq_ignore_ascii_case(&name))
+                    .map(|class| (class.wndproc, class.background))
+                    .or_else(|| [b"BUTTON".as_slice(), b"EDIT", b"STATIC", b"LISTBOX",
+                        b"SCROLLBAR", b"COMBOBOX", b"MDICLIENT"]
+                        .iter().any(|class| name.eq_ignore_ascii_case(class))
+                        .then_some((0, 0x30005)))
+                    .or_else(|| {
+                        crate::dbg_println!("[win16] window class '{}' not found",
+                            core::str::from_utf8(&name).unwrap_or("?"));
+                        None
+                    })
             };
-            let Some(class) = class else { return 0 };
-            let width = u32::from(stack_u16(machine, windows, regs, 16).unwrap_or(1)).clamp(1, 2048);
-            let height = u32::from(stack_u16(machine, windows, regs, 14).unwrap_or(1)).clamp(1, 2048);
+            let Some((wndproc, _background)) = class else { return 0 };
+            let parent = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
+            let raw_width = stack_u16(machine, windows, regs, 16).unwrap_or(1);
+            let raw_height = stack_u16(machine, windows, regs, 14).unwrap_or(1);
+            let raw_x = stack_u16(machine, windows, regs, 20).unwrap_or(0);
+            let raw_y = stack_u16(machine, windows, regs, 18).unwrap_or(0);
+            let (width, height) = if parent == 0 && raw_width == 0x8000 {
+                // CW_USEDEFAULT on a top-level window delegates both dimensions
+                // to the window manager; the supplied height is ignored.
+                (640, 480)
+            } else {
+                (u32::from(raw_width).clamp(1, 2048),
+                    u32::from(raw_height).clamp(1, 2048))
+            };
             let hwnd = windows.next_object;
             windows.next_object = windows.next_object.wrapping_add(1);
             windows.windows.push(super::Window {
                 hwnd,
-                wndproc: class.wndproc,
+                parent,
+                wndproc,
+                x: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_x as i16) },
+                y: if parent == 0 && raw_x == 0x8000 { 0 } else { i32::from(raw_y as i16) },
                 width,
                 height,
                 visible: false,
                 pixels: vec![0xc0; width as usize * height as usize * 4],
-            });
-            windows.messages.push(super::Message {
-                hwnd,
-                message: 1,
-                wparam: 0,
-                lparam: stack_u32(machine, windows, regs, 4).unwrap_or(0),
             });
             hwnd
         }
@@ -919,6 +1269,16 @@ fn dispatch<A: crate::Arch>(
             if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
                 let was = window.visible;
                 window.visible = show;
+                let top_level = window.parent == 0;
+                let size = window.width | (window.height << 16);
+                if show && top_level {
+                    windows.messages.push(super::Message {
+                        hwnd,
+                        message: 0x0005,
+                        wparam: 0,
+                        lparam: size,
+                    });
+                }
                 if show { super::queue_paint(windows, hwnd); }
                 was as u32
             } else { 0 }
@@ -934,8 +1294,12 @@ fn dispatch<A: crate::Arch>(
             let repaint = stack_u16(machine, windows, regs, 4).unwrap_or(0) != 0;
             let height = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(1)).clamp(1, 2048);
             let width = u32::from(stack_u16(machine, windows, regs, 8).unwrap_or(1)).clamp(1, 2048);
+            let y = i32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16);
+            let x = i32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0) as i16);
             let hwnd = u32::from(stack_u16(machine, windows, regs, 14).unwrap_or(0));
             if let Some(window) = windows.windows.iter_mut().find(|window| window.hwnd == hwnd) {
+                window.x = x;
+                window.y = y;
                 window.width = width;
                 window.height = height;
                 window.pixels.resize(width as usize * height as usize * 4, 0xc0);
@@ -968,6 +1332,20 @@ fn dispatch<A: crate::Arch>(
             let right = machine.read::<i16>(rect + 4);
             let bottom = machine.read::<i16>(rect + 6);
             (x >= left && x < right && y >= top && y < bottom) as u32
+        }
+        (Module::User, 81) => {
+            let brush = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let Some(rect) = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let dc = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let left = i32::from(machine.read::<i16>(rect));
+            let top = i32::from(machine.read::<i16>(rect + 2));
+            let right = i32::from(machine.read::<i16>(rect + 4));
+            let bottom = i32::from(machine.read::<i16>(rect + 6));
+            let color = super::object_color(windows, brush, 0x00c0_c0c0);
+            super::fill_pixels(windows, dc, left, top, right, bottom, color);
+            windows.dirty = true;
+            1
         }
         (Module::User, 108 | 109) => {
             if windows.quit { return 0; }
@@ -1012,6 +1390,51 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::User, 150 | 173 | 174 | 177) => 1,
         (Module::User, 154 | 155 | 158 | 171) => 1,
+        (Module::User, 175) => {
+            let name = stack_u32(machine, windows, regs, 4).unwrap_or(0);
+            if name >> 16 != 0 {
+                crate::dbg_println!("[win16] named bitmap resources unsupported");
+                return 0;
+            }
+            let Ok(image) = ne::Image::parse(&state.image) else { return 0 };
+            let Ok(bytes) = image.resource(2, name as u16) else {
+                crate::dbg_println!("[win16] bitmap resource {} not found", name as u16);
+                return 0;
+            };
+            let offset = (usize::from(state.resource_next) + 3) & !3;
+            let Some(end) = offset.checked_add(bytes.len()) else { return 0 };
+            if end >= 0x10000 { return 0; }
+            let header = RESOURCE_BASE as usize + offset;
+            machine.copy_to(header, bytes);
+            let Some((width, height, bpp, palette)) = dib_header(machine, header) else {
+                return 0;
+            };
+            let header_size = machine.read::<u32>(header) as usize;
+            let palette_entries = match bpp {
+                1..=8 if header_size >= 40 => {
+                    let used = machine.read::<u32>(header + 32) as usize;
+                    if used == 0 { 1usize << bpp } else { used }
+                }
+                1..=8 => 1usize << bpp,
+                _ => 0,
+            };
+            let palette_stride = if header_size == 12 { 3 } else { 4 };
+            let bits = palette.saturating_add(palette_entries.saturating_mul(palette_stride));
+            let Some(pixel_bytes) = width.checked_mul(height).and_then(|n| n.checked_mul(4)) else {
+                return 0;
+            };
+            let mut pixels = vec![0u8; pixel_bytes];
+            decode_dib(machine, bits, palette, width, height, bpp, &mut pixels);
+            state.resource_next = end as u16;
+            let handle = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            windows.gdi_objects.push((handle, super::GdiObject::Bitmap {
+                width: width as u32,
+                height: height as u32,
+                pixels,
+            }));
+            handle
+        }
         (Module::User, 178) => 0,
         (Module::User, 176) => {
             let capacity = stack_u16(machine, windows, regs, 4).unwrap_or(0) as usize;
@@ -1029,6 +1452,17 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 179) => {
             let metric = stack_at(windows, regs, 4).map(|p| machine.read::<u16>(p)).unwrap_or(0);
             match metric { 0 => 640, 1 => 480, 2 | 3 => 16, 4 => 16, 15 => 16, _ => 0 }
+        }
+        (Module::User, 180) => {
+            match stack_u16(machine, windows, regs, 4).unwrap_or(0) {
+                0 | 4 | 15 => 0x00c0_c0c0,
+                1 | 3 => 0x0080_8080,
+                2 => 0x0080_0000,
+                5 | 9 | 14 => 0x00ff_ffff,
+                6 | 7 | 8 | 10 | 18 => 0,
+                13 => 0x0000_0080,
+                _ => 0x00c0_c0c0,
+            }
         }
         (Module::User, 286) => 1,
         (Module::User, 287) => stack_u16(machine, windows, regs, 4).unwrap_or(0) as u32,
@@ -1065,6 +1499,30 @@ fn dispatch<A: crate::Arch>(
             let dc = u32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0));
             super::put_pixel(windows, dc, x, y, color);
             color
+        }
+        (Module::Gdi, 33) => {
+            let count = usize::from(stack_u16(machine, windows, regs, 4).unwrap_or(0)).min(4096);
+            let Some(text) = stack_u32(machine, windows, regs, 6)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let y = i32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0) as i16);
+            let x = i32::from(stack_u16(machine, windows, regs, 12).unwrap_or(0) as i16);
+            let dc = u32::from(stack_u16(machine, windows, regs, 14).unwrap_or(0));
+            let color = windows.dcs.iter().find(|context| context.handle == dc)
+                .map_or(0, |context| context.text);
+            for n in 0..count {
+                let ch = usize::from(machine.read::<u8>(text + n));
+                let glyph = &lib::vga_fonts::FONT_8X16[ch * 16..ch * 16 + 16];
+                for (gy, &bits) in glyph.iter().enumerate() {
+                    for gx in 0..8 {
+                        if bits & (0x80 >> gx) != 0 {
+                            super::put_pixel(windows, dc,
+                                x + (n * 8 + gx) as i32, y + gy as i32, color);
+                        }
+                    }
+                }
+            }
+            windows.dirty = true;
+            1
         }
         (Module::Gdi, 34) => {
             let sy = stack_u16(machine, windows, regs, 8).unwrap_or(0) as i16 as i32;
@@ -1106,18 +1564,72 @@ fn dispatch<A: crate::Arch>(
                 } else if windows.gdi_objects.iter().any(|(h, o)| *h == object
                     && matches!(o, super::GdiObject::Pen(_))) {
                     core::mem::replace(&mut item.pen, object)
+                } else if windows.gdi_objects.iter().any(|(h, o)| *h == object
+                    && matches!(o, super::GdiObject::Font)) {
+                    core::mem::replace(&mut item.font, object)
                 } else {
                     core::mem::replace(&mut item.brush, object)
                 }
             } else { 0 }
         }
+        (Module::Gdi, 51) => {
+            let height = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let width = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
+            let Some(size) = usize::try_from(width).ok()
+                .and_then(|width| usize::try_from(height).ok()
+                    .and_then(|height| width.checked_mul(height)))
+                .and_then(|pixels| pixels.checked_mul(4)) else { return 0 };
+            if width == 0 || height == 0 || width > 2048 || height > 2048 { return 0; }
+            let handle = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            windows.gdi_objects.push((handle, super::GdiObject::Bitmap {
+                width,
+                height,
+                pixels: vec![0; size],
+            }));
+            handle
+        }
         (Module::Gdi, 52) => {
+            // A memory DC always owns a default 1x1 monochrome bitmap.  The
+            // first SelectObject must return that non-null previous object.
+            let bitmap = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            windows.gdi_objects.push((bitmap, super::GdiObject::Bitmap {
+                width: 1,
+                height: 1,
+                pixels: vec![0; 4],
+            }));
             let handle = windows.next_object;
             windows.next_object = windows.next_object.wrapping_add(1);
             windows.dcs.push(super::DeviceContext {
-                handle, bitmap: None, x: 0, y: 0, pen: 0, brush: 0,
+                handle, bitmap: Some(bitmap), x: 0, y: 0, pen: 0, brush: 0, font: 1,
                 bk: 0x00ff_ffff, text: 0,
             });
+            handle
+        }
+        (Module::Gdi, 57) => {
+            if stack_u32(machine, windows, regs, 4)
+                .and_then(|pointer| far_linear(windows, pointer)).is_none()
+            {
+                return 0;
+            }
+            let handle = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            windows.gdi_objects.push((handle, super::GdiObject::Font));
+            handle
+        }
+        (Module::Gdi, 60) => {
+            let bitmap = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            let Some(color) = windows.gdi_objects.iter().find_map(|(handle, object)| {
+                match object {
+                    super::GdiObject::Bitmap { pixels, .. } if *handle == bitmap => pixels
+                        .get(..4).map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap())),
+                    _ => None,
+                }
+            }) else { return 0 };
+            let handle = windows.next_object;
+            windows.next_object = windows.next_object.wrapping_add(1);
+            windows.gdi_objects.push((handle, super::GdiObject::Brush(color)));
             handle
         }
         (Module::Gdi, 61) => {
@@ -1157,6 +1669,30 @@ fn dispatch<A: crate::Arch>(
                 _ => 0,
             }
         }
+        (Module::Gdi, 82) => {
+            let Some(out) = stack_u32(machine, windows, regs, 4)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            let capacity = usize::from(stack_u16(machine, windows, regs, 8).unwrap_or(0));
+            let handle = u32::from(stack_u16(machine, windows, regs, 10).unwrap_or(0));
+            let Some(object) = windows.gdi_objects.iter()
+                .find(|(object_handle, _)| *object_handle == handle)
+                .map(|(_, object)| object) else { return 0 };
+            match object {
+                super::GdiObject::Bitmap { width, height, .. } if capacity >= 14 => {
+                    machine.zero(out, 14);
+                    machine.write::<i16>(out + 2, *width as i16);
+                    machine.write::<i16>(out + 4, *height as i16);
+                    machine.write::<i16>(out + 6, width.saturating_add(7).div_ceil(8) as i16);
+                    machine.write::<u8>(out + 8, 1);
+                    machine.write::<u8>(out + 9, 1);
+                    14
+                }
+                _ => {
+                    machine.zero(out, capacity);
+                    capacity as u32
+                }
+            }
+        }
         (Module::Gdi, 87) => {
             let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
             let color = match index { 0 | 6 => 0x00ff_ffff, 1 => 0x00c0_c0c0,
@@ -1168,6 +1704,28 @@ fn dispatch<A: crate::Arch>(
             } else { super::GdiObject::Brush(color) };
             windows.gdi_objects.push((handle, object));
             handle
+        }
+        (Module::Gdi, 91) => {
+            let count = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
+            count.saturating_mul(8) | (16 << 16)
+        }
+        (Module::Gdi, 93) => {
+            let Some(out) = stack_u32(machine, windows, regs, 4)
+                .and_then(|pointer| far_linear(windows, pointer)) else { return 0 };
+            machine.zero(out, 30);
+            machine.write::<i16>(out, 16);      // tmHeight
+            machine.write::<i16>(out + 2, 13);  // tmAscent
+            machine.write::<i16>(out + 4, 3);   // tmDescent
+            machine.write::<i16>(out + 10, 8);  // tmAveCharWidth
+            machine.write::<i16>(out + 12, 8);  // tmMaxCharWidth
+            machine.write::<i16>(out + 14, 400); // tmWeight
+            machine.write::<i16>(out + 18, 96); // tmDigitizedAspectX
+            machine.write::<i16>(out + 20, 96); // tmDigitizedAspectY
+            machine.write::<u8>(out + 22, 0x20); // tmFirstChar
+            machine.write::<u8>(out + 23, 0xff); // tmLastChar
+            machine.write::<u8>(out + 24, b'?'); // tmDefaultChar
+            machine.write::<u8>(out + 25, b' '); // tmBreakChar
+            1
         }
         (Module::Gdi, 442) => {
             let bits_pointer = stack_u32(machine, windows, regs, 10).unwrap_or(0);
@@ -1229,6 +1787,7 @@ fn dispatch<A: crate::Arch>(
             lines as u32
         }
         (Module::Sound, _) => 1,
+        (Module::Keyboard, 5 | 6) => 1,
         _ => {
             crate::dbg_println!("[win16] stub {}", gate.name);
             0
@@ -1258,7 +1817,22 @@ pub(super) fn handle_event<A: crate::Arch>(
                 let Some(callback) = state.callback.take() else {
                     return thread::KernelAction::Exit(-1);
                 };
-                let result = (regs.rax as u16 as u32) | ((regs.rdx as u16 as u32) << 16);
+                let wndproc_result = (regs.rax as u16 as u32) | ((regs.rdx as u16 as u32) << 16);
+                let result = match callback.result {
+                    CallbackResult::WndProc => wndproc_result,
+                    CallbackResult::CreateWindow { hwnd } => {
+                        if wndproc_result as u16 == 0xffff {
+                            if let Some(index) = windows.windows.iter()
+                                .position(|window| window.hwnd == hwnd)
+                            {
+                                windows.windows.remove(index);
+                            }
+                            0
+                        } else {
+                            hwnd
+                        }
+                    }
+                };
                 if finish(machine, windows, regs, callback.dispatch_gate, result).is_err() {
                     return thread::KernelAction::Exit(-1);
                 }
@@ -1273,11 +1847,33 @@ pub(super) fn handle_event<A: crate::Arch>(
                     return thread::KernelAction::Exit(-1);
                 };
                 let message = message16(machine, message_at);
-                if begin_wndproc(machine, windows, state, regs, gate, message) {
+                if begin_wndproc(machine, windows, state, regs, gate,
+                    CallbackResult::WndProc, message) {
                     return thread::KernelAction::Done;
                 }
             }
+            if gate.module == Module::User && gate.ordinal == 108
+                && !windows.quit && windows.messages.is_empty() && state.timer == 0
+            {
+                // GetMessage blocks until input or another producer queues a
+                // message.  Re-enter the INT gate when this thread is next
+                // scheduled instead of returning the WM_QUIT value zero.
+                regs.frame.rip = u64::from(gate.offset);
+                return thread::KernelAction::Yield;
+            }
             let result = dispatch(machine, kt, windows, state, regs, gate);
+            if gate.module == Module::User && gate.ordinal == 41 && result != 0 {
+                let message = super::Message {
+                    hwnd: result,
+                    message: 1,
+                    wparam: 0,
+                    lparam: stack_u32(machine, windows, regs, 4).unwrap_or(0),
+                };
+                if begin_wndproc(machine, windows, state, regs, gate,
+                    CallbackResult::CreateWindow { hwnd: result }, message) {
+                    return thread::KernelAction::Done;
+                }
+            }
             if finish(machine, windows, regs, gate, result).is_err() {
                 return thread::KernelAction::Exit(-1);
             }

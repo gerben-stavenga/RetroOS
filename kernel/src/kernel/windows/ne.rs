@@ -160,6 +160,37 @@ impl<'a> Image<'a> {
         Err(Error::BadImage)
     }
 
+    fn named_ordinal(&self, mut at: usize, end: usize, wanted: &[u8]) -> Result<Option<u16>, Error> {
+        while at < end {
+            let len = *self.data.get(at).ok_or(Error::BadImage)? as usize;
+            at += 1;
+            if len == 0 { return Ok(None); }
+            let name = self.data.get(at..at.checked_add(len).ok_or(Error::Overflow)?)
+                .ok_or(Error::BadImage)?;
+            at += len;
+            let ordinal = u16_at(self.data, at)?;
+            at += 2;
+            if name.eq_ignore_ascii_case(wanted) { return Ok(Some(ordinal)); }
+        }
+        Ok(None)
+    }
+
+    /// Resolve an exported name through the resident and non-resident name
+    /// tables, then decode its ordinary NE entry-table target.
+    pub fn entry_by_name(&self, wanted: &[u8]) -> Result<(u8, u16), Error> {
+        let resident = self.ne + u16_at(self.data, self.ne + 0x26)? as usize;
+        if let Some(ordinal) = self.named_ordinal(resident, self.data.len(), wanted)? {
+            return self.entry(ordinal);
+        }
+        let nonresident = u32_at(self.data, self.ne + 0x2c)? as usize;
+        let length = u16_at(self.data, self.ne + 0x20)? as usize;
+        let end = nonresident.checked_add(length).ok_or(Error::Overflow)?;
+        if let Some(ordinal) = self.named_ordinal(nonresident, end, wanted)? {
+            return self.entry(ordinal);
+        }
+        Err(Error::BadImage)
+    }
+
     pub fn relocations(&self, segment: Segment) -> Result<Vec<Relocation>, Error> {
         if !segment.has_relocations() { return Ok(Vec::new()); }
         let modules = self.modules()?;
