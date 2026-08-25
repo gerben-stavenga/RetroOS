@@ -364,12 +364,17 @@ impl<A: crate::Arch> Personality<A> {
                     crate::kernel::dos::pump_fullscreen(machine, bios, dos, regs, now_ns);
                 }
             }
-            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => {}
+            Self::Os2(os2) => os2.advance_timers(now_ns),
+            Self::Linux(_) | Self::Windows(_) => {}
         }
         if prof {
             crate::kernel::startup::bill_slice2(
                 0, machine.rdtsc().wrapping_sub(t0), 0, 0, u64::from(dt_ns != 0));
         }
+    }
+
+    pub fn has_pending_message(&self) -> bool {
+        matches!(self, Self::Os2(os2) if os2.has_pending_message())
     }
 
     /// Advance one emulated-audio span; its samples may be output or discarded.

@@ -1126,6 +1126,11 @@ pub fn event_loop<A: crate::Arch>(
                 elapsed_ns,
                 audio_clock.produced_frames(),
             );
+            if thread.kernel.state == thread::ThreadState::Blocked
+                && thread.personality.has_pending_message()
+            {
+                thread.kernel.state = thread::ThreadState::Ready;
+            }
             if elapsed_ns != 0 {
                 crate::kernel::sound::advance(
                     machine,

@@ -196,6 +196,31 @@ impl Os2State {
         self.cursor_dirty = true;
     }
 
+    pub fn advance_timers(&mut self, now: u64) {
+        if self.timer_hwnd == 0
+            || now < self.timer_deadline_ns
+            || self.pm_messages.iter().any(|message| {
+                message.hwnd == self.timer_hwnd
+                    && message.message == 0x0024
+                    && message.mp1 == self.timer_id
+            })
+        {
+            return;
+        }
+        self.pm_messages.push(PmMessage {
+            hwnd: self.timer_hwnd,
+            message: 0x0024,
+            mp1: self.timer_id,
+            mp2: 0,
+        });
+        // PM timers are notifications, not a count of elapsed periods.
+        self.timer_deadline_ns = now.saturating_add(self.timer_interval_ns);
+    }
+
+    pub fn has_pending_message(&self) -> bool {
+        !self.pm_messages.is_empty()
+    }
+
     pub fn repaint_osd(&mut self) {
         self.pm_dirty = true;
     }
@@ -1282,19 +1307,7 @@ fn dispatch_api<A: crate::Arch>(
         }
         Api::WinGetMsg => {
             let out = arg32(machine, regs, 1) as usize;
-            let now = machine.now();
-            if state.pm_messages.is_empty()
-                && state.timer_hwnd != 0
-                && now >= state.timer_deadline_ns
-            {
-                state.pm_messages.push(PmMessage {
-                    hwnd: state.timer_hwnd, message: 0x0024,
-                    mp1: state.timer_id, mp2: 0,
-                });
-                // Do not replay a burst of missed timer messages after a pause.
-                // PM timers are notifications, not a count of elapsed periods.
-                state.timer_deadline_ns = now.saturating_add(state.timer_interval_ns);
-            }
+            state.advance_timers(machine.now());
             let Some(message) = (!state.pm_messages.is_empty())
                 .then(|| state.pm_messages.remove(0))
             else {
@@ -1469,10 +1482,13 @@ pub fn handle_event<A: crate::Arch>(
 ) -> thread::KernelAction {
     match event {
         crate::KernelEvent::Irq => thread::KernelAction::Done,
-        // PMWIN parks an empty WinGetMsg on HLT.  Giving up the remainder of
-        // this turn lets another personality run; resumption executes the
-        // stub's jump back to WinGetMsg and re-checks input and timer state.
-        crate::KernelEvent::Hlt => thread::KernelAction::Yield,
+        // PMWIN parks an empty WinGetMsg on HLT.  This is an input wait, not a
+        // task-selection request: keep the PM window focused and wake it when
+        // input or a timer message arrives.
+        crate::KernelEvent::Hlt => {
+            kt.state = thread::ThreadState::Blocked;
+            thread::KernelAction::Done
+        }
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = gate_from_event(state, regs.frame.cs as u16, regs.ip32()) else {
                 crate::println!("OS/2: invalid API gate at {:#x}", regs.ip32());
@@ -1537,6 +1553,28 @@ pub fn handle_event<A: crate::Arch>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pm_timer_wakes_an_idle_queue_without_bursting() {
+        let mut state = Os2State::new();
+        state.timer_hwnd = 7;
+        state.timer_id = 3;
+        state.timer_interval_ns = 10;
+        state.timer_deadline_ns = 100;
+
+        state.advance_timers(99);
+        assert!(!state.has_pending_message());
+        state.advance_timers(100);
+        assert_eq!(state.pm_messages.len(), 1);
+        assert_eq!(state.timer_deadline_ns, 110);
+        state.advance_timers(200);
+        assert_eq!(state.pm_messages.len(), 1);
+
+        state.pm_messages.clear();
+        state.advance_timers(200);
+        assert_eq!(state.pm_messages.len(), 1);
+        assert_eq!(state.timer_deadline_ns, 210);
+    }
 
     #[test]
     fn gate_is_identified_by_selector_and_return_ip() {

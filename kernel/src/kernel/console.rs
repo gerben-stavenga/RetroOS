@@ -50,12 +50,22 @@ pub fn dispatch<A: crate::Arch>(
             dispatch_linux(machine, regs, kt, linux, guest_events)
         }
         thread::Personality::Os2(os2) => {
+            let mut wake = false;
             for evt in guest_events {
                 match evt {
-                    crate::Irq::Key(scancode) => os2.process_key(&kt.fds, scancode),
-                    crate::Irq::Mouse { dx, dy, buttons } => os2.process_mouse(dx, dy, buttons),
+                    crate::Irq::Key(scancode) => {
+                        os2.process_key(&kt.fds, scancode);
+                        wake = true;
+                    }
+                    crate::Irq::Mouse { dx, dy, buttons } => {
+                        os2.process_mouse(dx, dy, buttons);
+                        wake = true;
+                    }
                     _ => {}
                 }
+            }
+            if wake && kt.state == thread::ThreadState::Blocked {
+                kt.state = thread::ThreadState::Ready;
             }
         }
         thread::Personality::Windows(windows) => {
