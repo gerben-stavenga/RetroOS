@@ -1319,10 +1319,11 @@ pub fn pump_fullscreen<A: crate::Arch>(
     now_ns: u64,
 ) {
     debug_assert!(dos.pc.vga.is_fullscreen());
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, None);
+    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, None, None);
 }
 
 /// Render state-only DOS VGA through the event loop's compositor display.
+#[allow(clippy::too_many_arguments)]
 pub fn render<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1330,9 +1331,33 @@ pub fn render<A: crate::Arch>(
     regs: &Regs,
     now_ns: u64,
     display: &mut crate::kernel::display::Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
 ) {
     debug_assert!(!dos.pc.vga.is_fullscreen());
-    present::display_tick(machine, bios, &mut dos.pc, regs, now_ns, Some(display));
+    present::display_tick(
+        machine,
+        bios,
+        &mut dos.pc,
+        regs,
+        now_ns,
+        Some(display),
+        Some((desktop, endpoint)),
+    );
+}
+
+pub fn surface_buffer<'a, A: crate::Arch>(
+    dos: &'a thread::DosState<A>,
+    format: vga::PixelFormat,
+) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+    let (width, height, pixels) = dos.pc.present_scratch2.surface(format)?;
+    crate::kernel::gui::PixelBuffer::new(
+        width,
+        height,
+        width * format.bytes_per_pixel as usize,
+        format,
+        pixels,
+    ).ok()
 }
 
 /// Advance emulated audio playback and its guest-visible device events.

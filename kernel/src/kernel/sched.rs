@@ -3,7 +3,7 @@
 //! Today's policy, stated in one place instead of inline in the event loop:
 //! the FOCUSED thread runs. Execution leaves it only when an action says so
 //! (exit → the waiting parent or whatever `schedule` finds; an explicit
-//! Switch; a Yield target) or when the F12 task picker moves focus (and
+//! Switch; a Yield target) or when the F12 window picker moves focus (and
 //! execution follows, because focus implies execution for now). When background execution
 //! arrives, this module is the only thing that should need to change — the
 //! test of whether the factorization around it is right.
@@ -102,7 +102,7 @@ fn next_after<A: crate::Arch>(
     }
 }
 
-/// Honor the F12 task picker's explicit target. This is a pure focus shift:
+/// Honor the F12 window picker's explicit target. This is a pure focus shift:
 /// it does not wake a blocked thread or break waitpid.
 pub(crate) fn focus_request<A: crate::Arch>(threads: &[thread::Thread<A>], tid: usize) -> Option<usize> {
     // Ignore a stale target that is the current owner, out of range, or no

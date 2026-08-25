@@ -1,0 +1,59 @@
+   Ready for some Mine sweeper with an attitude?  This is not your mothers 
+Minesweeper! So read the documentation (SWEEPER.DOC) or look through the
+on-line help before starting to play.
+
+  I wrote this program to learn how to do OS/2 PM programing.  Somewhere along
+the way I gave it an attitude.  You will find the following features:
+
+   1) There are rocks in the minefield
+   2) There is an Unexploded bomb in the mine field that needs to be
+	defused.
+   3) There is a pesky gopher in the mine field that likes to push 
+	the mines around and steal your markers.
+   4) You can cheat!!!
+   5) Clear around works by MB1 clicking an open square. Not by chording.
+   6) The silly smiley face button is gone.
+
+Other than that it is your basic mine sweeper game.
+
+This game is distributed as shareware.  But the author retains the copyright
+and all other rights.  You are encouraged to redistribute the game.  You must
+include all the original files including this readme and the documentation.
+
+INSTALLATION
+Since you are reading this I will assume that you have already unzipped the
+files into their own directory (probably GAMES\MINESWP).  Having done that
+you only have to create a program object in your games folder or on the desktop
+that will start up Minesweeper.  Be sure that you set the working directory
+field on page 1 of the settings notebook to the directory where the files
+have been unzipped.
+You will find the following files:
+
+Readme.doc	This file.
+Sweeper.exe	The executable game file.
+Sweeper.hlp	The on-line help file.
+Sweeper.doc	More documentation and instructions to play.
+Sweeper.ini	This will be created after you run the game for the 1st time.
+
+There will be no files created or modified in any other directories.
+
+Contacting The author:
+If you have questions you can contact me at either...
+	Greeder@Delphi.Com  -or- Greed39@IDT.com
+
+I would give you my snail mail address and ask for money but I know that
+no one registers games.  So if you use the game just send me a note by
+email and I'll consider you a registered user.
+
+A few last words:
+Yes, my spelling is awful.  What's your point?
+And I'm not an artist so my bitmaps my leave a little to be desired.
+If you want to design a new set of bitmaps for me send me a note at one of the
+above email addresses and I'll send you a list and specification for the
+bitmaps.
+   If you are bilingual and want to help do a foreign language version.
+Again, send me a note at one of the above e-mail addresses and I'll send you 
+a copy of the documentation and resource files to be translated.
+
+Thanks and have fun playing!
+Gordon

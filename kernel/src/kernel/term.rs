@@ -1,26 +1,22 @@
-//! Rendering the terminal onto a framebuffer.
+//! Publishing the terminal as graphical content.
 //!
 //! The terminal itself — grid, cursor, ANSI parser — is `lib::term`, shared by
-//! every embedder. This module is the part only the kernel needs: on a machine
-//! with no VGA text mode, cells have to become pixels. `attach_framebuffer`
-//! points it at a mapped packed framebuffer and every write is scanned out
-//! through the VGA renderer as an 80×25 text frame; legacy machines attach
-//! nothing and let the real card scan B8000 itself.
+//! every embedder. This module turns that grid into a canonical 720x400 content
+//! buffer, attaches it to a personality-neutral scene node, and composes the
+//! scene into the current display's packed shadow. Legacy boot consoles may
+//! still let a real VGA scan B8000 directly before the event loop takes over.
 //!
-//! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. It used
-//! to read back the cells out of whatever aperture the terminal had written
-//! them to, which meant a framebuffer machine needed one even though it had no
-//! text mode, and a hosted machine had to fabricate one for the purpose.
+//! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. No
+//! personality or content producer sees the physical framebuffer format.
 
-pub use lib::term::{term, Term, putchar};
+pub use lib::term::{Term, putchar, term};
 
 use crate::kernel::display::Display;
 use core::sync::atomic::{AtomicBool, Ordering};
 use lib::vga_fonts::FONT_8X16;
 use vga::{Frame, VgaMode};
 
-/// The pixel sink attached to the emulated VGA on framebuffer-only machines.
-/// Legacy BIOS leaves this unset and the real VGA scans B8000 directly.
+/// VGA text palette used to turn terminal attributes into canonical RGB.
 static mut PALETTE: [u8; 768] = [0; 768];
 
 /// Packed terminal shadow. Terminal writes only dirty the grid; the event-loop
@@ -29,7 +25,12 @@ static mut PALETTE: [u8; 768] = [0; 768];
 struct Scanout {
     pal: vga::Pal,
     pal_cache: [u8; 768],
+    /// Process-independent terminal pixels borrowed by the event-loop compositor.
+    content: alloc::vec::Vec<u8>,
+    /// Output-format shadow produced by the GUI scene compositor.
     surface: alloc::vec::Vec<u8>,
+    /// Startup/panic path before an event loop owns the real desktop.
+    bootstrap_desktop: Option<crate::kernel::gui::Desktop>,
 }
 
 impl Scanout {
@@ -37,7 +38,9 @@ impl Scanout {
         Scanout {
             pal: vga::Pal::new(),
             pal_cache: [0; 768],
+            content: alloc::vec::Vec::new(),
             surface: alloc::vec::Vec::new(),
+            bootstrap_desktop: None,
         }
     }
 }
@@ -62,15 +65,40 @@ static TEXT_AC: [u8; 21] = {
     ac
 };
 
-/// Render the terminal grid into shadow RAM and pass the completed frame to
-/// the shared OSD/display boundary.
+/// Render the terminal into its back buffer, commit it to the retained surface,
+/// and pass the completed desktop shadow to the display boundary.
 pub fn present<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut Display,
 ) {
-    if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 { return; }
-    let Some((height, shadow)) = render(display) else { return };
+    if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 {
+        return;
+    }
+    let Some((height, shadow)) = render(display, None) else {
+        return;
+    };
+    display.present(machine, bios, height, shadow);
+}
+
+/// Event-loop publication through the desktop that outlives every focused
+/// personality. Focusing an endpoint forces one frame even when the shared
+/// terminal cells themselves did not change.
+pub fn present_on<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: &mut Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    let focus_changed = desktop.focus(endpoint);
+    if (!focus_changed && !DIRTY.swap(false, Ordering::AcqRel)) || display.shadow_width == 0 {
+        return;
+    }
+    DIRTY.store(false, Ordering::Release);
+    let Some((height, shadow)) = render(display, Some((desktop, endpoint))) else {
+        return;
+    };
     display.present(machine, bios, height, shadow);
 }
 
@@ -78,20 +106,35 @@ pub fn present<A: crate::Arch>(
 /// longer live, so deliberately seize the global scanout even if the failed
 /// call chain had borrowed it.
 pub fn panic_present(display: &mut Display) {
-    if let Some((height, shadow)) = render(display) {
+    if let Some((height, shadow)) = render(display, None) {
         display.panic_present(height, shadow);
     }
 }
 
-fn render(display: &Display) -> Option<(usize, &'static mut [u8])> {
-    if display.shadow_width == 0 { return None; }
+fn render(
+    display: &mut Display,
+    desktop: Option<(
+        &mut crate::kernel::gui::Desktop,
+        crate::kernel::gui::EndpointId,
+    )>,
+) -> Option<(usize, &'static mut [u8])> {
+    if display.shadow_width == 0 {
+        return None;
+    }
     unsafe {
-        if PALETTE == [0; 768] { PALETTE = vga::fallback_palette(); }
+        if PALETTE == [0; 768] {
+            PALETTE = vga::fallback_palette();
+        }
     }
     let vram = lib::term::term().cells_bytes();
     let palette_p = &raw const PALETTE;
     let frame = Frame {
-        mode: VgaMode::Text { cols: 80, rows: 25, cell_w: 9, cell_h: 16 },
+        mode: VgaMode::Text {
+            cols: 80,
+            rows: 25,
+            cell_w: 9,
+            cell_h: 16,
+        },
         vram,
         planes: &[],
         ac: &TEXT_AC,
@@ -105,35 +148,127 @@ fn render(display: &Display) -> Option<(usize, &'static mut [u8])> {
         pixel_pan: 0,
         line_compare: usize::MAX,
     };
-    render_frame(display, &frame)
+    render_frame(display, &frame, desktop)
 }
 
 fn render_frame(
-    display: &Display,
+    display: &mut Display,
     frame: &Frame<'_>,
+    desktop: Option<(
+        &mut crate::kernel::gui::Desktop,
+        crate::kernel::gui::EndpointId,
+    )>,
 ) -> Option<(usize, &'static mut [u8])> {
+    let managed = desktop.is_some();
     let (w, h) = vga::dimensions(frame.mode);
     let out_w = display.shadow_width;
     if w == 0 || h == 0 || out_w == 0 {
         return None;
     }
 
-    // Picture-only shadow, exactly like the timed raster: the bars around it
-    // were cleared once when `fbcon` mapped the framebuffer, and every mode
-    // fits the same 4:3 rectangle, so they stay black without being rewritten.
-    let format = display.rgb;
-    let step = format.bytes_per_pixel as usize;
-    let row_bytes = out_w * step;
-    let slack = out_w.div_ceil(w) * 4; // final run's overlapping dword stores
+    // The terminal is a content producer, not an output renderer. Keep its
+    // native 720x400 XRGB8888 pixels independent of the physical display;
+    // scene composition performs scaling and output-format conversion.
+    let content_format = vga::PixelFormat::NATIVE;
+    let content_step = content_format.bytes_per_pixel as usize;
+    let content_row_bytes = w * content_step;
+    let slack = 4; // final render_row_stretched overlapping dword store
     let scanout_p = &raw mut SCANOUT;
     let s = unsafe { &mut *scanout_p };
-    let need = row_bytes * h + slack;
-    if s.surface.len() != need {
-        s.surface.resize(need, 0);
+    let Scanout {
+        pal,
+        pal_cache,
+        content,
+        surface,
+        bootstrap_desktop,
+    } = s;
+    let need = content_row_bytes * h + slack;
+    if content.len() != need {
+        content.resize(need, 0);
     }
-    s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+    pal.sync(frame.palette, frame.dac_mask, content_format, pal_cache);
     for sy in 0..h {
-        vga::render_row_stretched(frame, sy, &s.pal, &mut s.surface, out_w);
+        vga::render_row_stretched(frame, sy, pal, content, w);
     }
-    Some((h, &mut s.surface[..row_bytes * h]))
+
+    const TERMINAL_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
+    const TERMINAL_PRESENTATION: crate::kernel::gui::PresentationKey =
+        crate::kernel::gui::PresentationKey(1);
+    const BOOT_ENDPOINT: crate::kernel::gui::EndpointId = crate::kernel::gui::EndpointId(0);
+    let (desktop, endpoint) = match desktop {
+        Some(pair) => pair,
+        None => (
+            bootstrap_desktop.get_or_insert_with(crate::kernel::gui::Desktop::new),
+            BOOT_ENDPOINT,
+        ),
+    };
+    desktop.focus(endpoint);
+    let surface_id = desktop
+        .ensure_surface(endpoint, TERMINAL_SURFACE)
+        .expect("create terminal surface");
+    let node_width = if managed { w } else { out_w };
+    let node = desktop
+        .ensure_node(
+            endpoint,
+            TERMINAL_PRESENTATION,
+            crate::kernel::gui::Rect::new(0, 0, node_width as u32, h as u32),
+        )
+        .expect("create terminal presentation node");
+    let placement = desktop.geometry(node).expect("live terminal presentation node");
+    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+    transaction
+        .set_geometry(
+            node,
+            crate::kernel::gui::Rect::new(
+                placement.x,
+                placement.y,
+                node_width as u32,
+                h as u32,
+            ),
+        )
+        .attach(node, Some(surface_id))
+        .set_visible(node, true);
+    desktop
+        .commit(transaction)
+        .expect("commit terminal presentation node");
+
+    // In the event loop the terminal retains this producer buffer and the
+    // compositor borrows it after the mutable render pass has ended.
+    if managed {
+        return None;
+    }
+
+    let buffer = crate::kernel::gui::PixelBuffer::new(
+        w,
+        h,
+        content_row_bytes,
+        content_format,
+        content,
+    )
+    .expect("valid terminal content buffer");
+    let contents = [crate::kernel::gui::Content { id: surface_id, buffer }];
+    let extent = desktop.extent();
+    let (canvas_width, canvas_height) = display.composition_size(
+        extent.width as usize,
+        extent.height as usize,
+    );
+    if display.is_host() {
+        display.shadow_width = canvas_width;
+    }
+    desktop
+        .compose_surfaces(&contents, canvas_width, canvas_height, display.rgb, surface)
+        .expect("compose terminal scene");
+    Some((canvas_height, surface))
+}
+
+pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {
+    let scanout = &raw const SCANOUT;
+    let pixels = unsafe { &(*scanout).content };
+    crate::kernel::gui::PixelBuffer::new(
+        720,
+        400,
+        720 * 4,
+        vga::PixelFormat::NATIVE,
+        pixels,
+    ).ok()
 }

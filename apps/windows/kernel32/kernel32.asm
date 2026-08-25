@@ -23,9 +23,12 @@ gate GetLastError
 gate GetModuleFileNameA
 gate GetModuleFileNameW
 gate GetModuleHandleA
+gate GetModuleHandleW
 gate GetOEMCP
 gate GetProcAddress
 gate GetStdHandle
+gate GetStartupInfoA
+gate GetTickCount64
 gate GetVersion
 gate LoadLibraryA
 gate MultiByteToWideChar
@@ -44,3 +47,5 @@ gate VirtualQuery
 gate WideCharToMultiByte
 gate WriteConsoleA
 gate WriteFile
+gate lstrcpyW
+gate lstrlenW

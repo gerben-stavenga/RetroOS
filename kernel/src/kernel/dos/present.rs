@@ -1,13 +1,13 @@
 //! Putting the machine's picture on the machine's display.
 //!
-//! The emulated VGA, the Voodoo and the OSD all produce pixels; `platform` says
+//! The emulated VGA and Voodoo produce process-owned pixels; `platform` says
 //! what this machine can actually show them on. This is where those meet: when
-//! a frame is due, scan the current owner's VGA out into a frame, composite
-//! the overlay, and present it through whatever sink the probe handed over.
+//! a frame is due, scan the current owner's video into its retained surface.
+//! The event-loop compositor combines that surface with other windows.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
 //! cards. Everything it names on the display side — `Display`,
-//! `Sink`, `Scratch`, the OSD — is a capability or a
+//! `Sink` and `Scratch` — is a capability or a
 //! sink the kernel owns; the machine below produces a picture and has no
 //! opinion about where it goes.
 
@@ -415,6 +415,49 @@ fn voodoo_display_tick<A: crate::Arch>(
     true
 }
 
+/// Publish one completed emulated-VGA frame. State-only DOS enters the shared
+/// desktop as an opaque content node; fullscreen DOS keeps its direct display
+/// path because it deliberately owns the whole adapter.
+fn attach_vga_surface(
+    width: usize,
+    height: usize,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    const DOS_SCANOUT: crate::kernel::gui::PresentationKey =
+        crate::kernel::gui::PresentationKey(2);
+    const DOS_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(2);
+    desktop.focus(endpoint);
+    let surface_id = desktop
+        .ensure_surface(endpoint, DOS_SURFACE)
+        .expect("create DOS VGA surface");
+    let node = desktop
+        .ensure_node(
+            endpoint,
+            DOS_SCANOUT,
+            crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
+        )
+        .expect("create DOS VGA presentation node");
+    let placement = desktop.geometry(node).expect("live DOS VGA presentation node");
+    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+    transaction
+        .set_geometry(
+            node,
+            crate::kernel::gui::Rect::new(
+                placement.x,
+                placement.y,
+                width as u32,
+                height as u32,
+            ),
+        )
+        .attach(node, Some(surface_id))
+        .set_visible(node, true);
+    desktop
+        .commit(transaction)
+        .expect("commit DOS VGA presentation node");
+
+}
+
 pub fn display_tick<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -422,6 +465,10 @@ pub fn display_tick<A: crate::Arch>(
     regs: &Regs,
     now_ns: u64,
     mut external: Option<&mut crate::kernel::display::Display>,
+    presentation: Option<(
+        &mut crate::kernel::gui::Desktop,
+        crate::kernel::gui::EndpointId,
+    )>,
 ) {
     // A physical Voodoo board takes the monitor away from the VGA card with
     // its pass-through relay.  Our Voodoo is a software producer, so on a
@@ -483,8 +530,16 @@ pub fn display_tick<A: crate::Arch>(
         // top-to-bottom sweep.
         let refresh_hz: u32 = if display.slow() { 20 } else { 70 };
         let Some(mode) = vga.current_mode() else { return };
+        let raster_size = presentation
+            .is_some()
+            .then(|| ::vga::dimensions(mode));
         match crate::kernel::display::scanout_action(
-            &mut pc.present_scratch2, display, mode, now_ns, refresh_hz,
+            &mut pc.present_scratch2,
+            display,
+            mode,
+            now_ns,
+            refresh_hz,
+            raster_size,
         ) {
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
@@ -521,11 +576,18 @@ pub fn display_tick<A: crate::Arch>(
             crate::kernel::display::ScanoutAction::Publish {
                 vga_height: vga_h,
                 out_width: out_w,
-                shadow,
             } => {
                 let p0 = if prof { machine.rdtsc() } else { 0 };
-                debug_assert_eq!(display.shadow_width, out_w);
-                let copied = display.present(machine, &mut *bios, vga_h, shadow);
+                debug_assert!(presentation.is_some() || display.shadow_width == out_w);
+                let copied = if let Some((desktop, endpoint)) = presentation {
+                    attach_vga_surface(out_w, vga_h, desktop, endpoint);
+                    0
+                } else {
+                    let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+                    let copied = display.present(machine, &mut *bios, vga_h, &mut pixels);
+                    crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
+                    copied
+                };
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {
@@ -554,23 +616,26 @@ pub fn display_tick<A: crate::Arch>(
     ) else { return };
     let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = ::vga::dimensions(frame.mode);
-    let need = w * h;
-    if pc.present_fb.len() < need {
-        pc.present_fb.resize(need, 0);
-    }
-    let fb = &mut pc.present_fb[..need];
-    ::vga::render(&frame, fb);
+    let rendered = crate::kernel::display::render_frame(
+        &mut pc.present_scratch2,
+        display,
+        &frame,
+        w,
+    ).is_some();
+    if !rendered { return }
     let p2 = if prof { machine.rdtsc() } else { 0 };
-    pc.present_fb.truncate(need);
     display.shadow_width = w;
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(pc.present_fb.as_mut_ptr() as *mut u8, need * 4)
-    };
-    display.present(machine, bios, h, bytes);
+    if let Some((desktop, endpoint)) = presentation {
+        attach_vga_surface(w, h, desktop, endpoint);
+    } else {
+        let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+        display.present(machine, bios, h, &mut pixels);
+        crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
+    }
     if prof {
         let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(
             frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
-            p3.wrapping_sub(p2), need);
+            p3.wrapping_sub(p2), w * h);
     }
 }

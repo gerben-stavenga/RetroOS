@@ -1,0 +1,16 @@
+load(":compat.bzl", "compat_dll")
+
+compat_dll("advapi32", "ADVAPI32", [
+    "RegCloseKey", "RegCreateKeyExW", "RegQueryValueExW", "RegSetValueExW",
+])
+compat_dll("comctl32", "COMCTL32", ["InitCommonControlsEx"])
+compat_dll("dwmapi", "DWMAPI", ["DwmSetWindowAttribute"])
+compat_dll("gdi32", "GDI32", [
+    "Arc", "BitBlt", "CreateCompatibleBitmap", "CreateCompatibleDC",
+    "CreateFontW", "CreatePen", "CreateSolidBrush", "DeleteDC", "DeleteObject",
+    "Ellipse", "GetLayout", "GetStockObject", "GetTextExtentPoint32W", "LineTo",
+    "MoveToEx", "Polygon", "SelectObject", "SetBkColor", "SetBkMode", "SetLayout",
+    "SetTextColor", "TextOutW",
+])
+compat_dll("shell32", "SHELL32", ["ExtractIconA", "ShellAboutW"])
+compat_dll("winmm", "WINMM", ["PlaySoundW"])

@@ -815,6 +815,7 @@ fn run_program<A: crate::Arch>(
     let tid = match exec::detect_format(&buf, path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, path),
+        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, path),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, path),
         _ => dos::run_init_program(
             machine,
@@ -943,6 +944,34 @@ fn launch_windows<A: crate::Arch>(
     tid
 }
 
+/// Launch a native 16-bit Windows NE image as a fresh process.
+fn launch_win16<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    buf: alloc::vec::Vec<u8>,
+    path: &[u8],
+) -> usize {
+    let cpipe = thread::console_pipe();
+    let tid = {
+        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+            .expect("create Win16 thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    crate::kernel::kpipe::add_reader(cpipe);
+    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, b"", None)
+        .unwrap_or_else(|e| {
+            panic!(
+                "Windows NE exec failed ({}): errno {}",
+                core::str::from_utf8(path).unwrap_or("?"),
+                e
+            )
+        });
+    tid
+}
+
 /// Ring-1 kernel event loop. Returns when no threads remain.
 ///
 /// One iteration is the whole kernel, in order: advance the running
@@ -954,6 +983,49 @@ fn launch_windows<A: crate::Arch>(
 /// moved together with execution by `switch_focus_and_run` for now). The
 /// loop's `display` is `Some` exactly while it is compositing Linux, OSD, or
 /// state-only DOS VGA; fullscreen DOS owns the output and leaves it `None`.
+fn present_desktop<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    threads: &[thread::Thread<A>],
+    display: &mut crate::kernel::display::Display,
+    windows: &mut crate::kernel::gui::WindowManager,
+) {
+    // Surface producers establish the presentation edge. OSD changes remain
+    // pending and join the next VGA/window publication; they never create an
+    // independent compositor clock.
+    if !windows.needs_present() {
+        return;
+    }
+    let extent = windows.desktop().extent();
+    let (canvas_width, canvas_height) = display.composition_size(
+        extent.width as usize,
+        extent.height as usize,
+    );
+    if display.is_host() {
+        display.shadow_width = canvas_width;
+    }
+    windows.sync_osd(
+        canvas_width,
+        canvas_height,
+        display.composition_scale_y(canvas_height),
+        display.rgb,
+    );
+    if !windows.needs_present() {
+        return;
+    }
+    let resolve = |endpoint: crate::kernel::gui::EndpointId,
+                   key: crate::kernel::gui::SurfaceKey| {
+        threads
+            .get(endpoint.0 as usize)?
+            .personality
+            .surface_buffer(key, display.rgb)
+    };
+    let shadow = windows
+        .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
+        .expect("compose process-owned surfaces");
+    display.present(machine, bios_workspace, canvas_height, shadow);
+}
+
 pub fn event_loop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -976,6 +1048,19 @@ pub fn event_loop<A: crate::Arch>(
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
+    // The event loop is the execution engine and sole owner of window policy.
+    // A missing display means the initial DOS window holds the fullscreen
+    // direct-scanout lease; otherwise the compositor starts on the desktop.
+    let initial_window = crate::kernel::gui::WindowManager::primary_window(
+        crate::kernel::gui::EndpointId(first_tid as u32),
+    );
+    let initial_presentation = if display.is_some() {
+        crate::kernel::gui::Presentation::Desktop
+    } else {
+        crate::kernel::gui::Presentation::Fullscreen(initial_window)
+    };
+    let mut windows = crate::kernel::gui::WindowManager::new(initial_presentation);
+    windows.focus(initial_window);
     // The machine's Sound Blaster lives in this frame for the loop's life,
     // beside the display token and for the same reason: it is one piece of
     // hardware with at most one guest owner, and the loop is what outlives
@@ -1001,56 +1086,82 @@ pub fn event_loop<A: crate::Arch>(
             last_world_ns
         };
         let now_tick = world_now_ns / 1_000_000;
-        // Keep the F12 switch picker's process list fresh while it is open,
+        // Keep the F12 window list fresh while it is open,
         // but not on every port/interrupt exit: millisecond resolution is
         // ample for a menu and polling games can cross this loop hundreds of
         // times per tick.
         if crate::kernel::osd::is_open() && now_tick != last_osd_refresh_tick {
             last_osd_refresh_tick = now_tick;
-            crate::kernel::osd::refresh_processes(threads, crate::kernel::focus::focused());
+            crate::kernel::osd::refresh_windows(
+                threads,
+                crate::kernel::focus::focused(),
+                !windows.uses_desktop(),
+            );
         }
         stats.part(machine, 0);
         // The queue is cheap to drain when empty and carries the IRQ0 wakeup
         // which gates clock sampling, so it cannot itself be clock-gated.
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
-        let thread = ctx.thread(threads);
-        debug_assert_eq!(
-            display.is_some(),
-            thread.personality.uses_compositor(),
-            "event-loop display ownership disagrees with personality video state",
-        );
 
-        // Advance virtual devices, then feed sound before display publication:
-        // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(
-            machine,
-            &mut *bios_workspace,
-            &ctx.regs,
-            world_now_ns,
-            elapsed_ns,
-            audio_clock.produced_frames(),
-        );
-        if elapsed_ns != 0 {
-            crate::kernel::sound::advance(
-                machine,
-                &mut audio_clock,
-                sink.as_deref_mut(),
-                elapsed_ns,
-                |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
-            );
-        }
-        if elapsed_ns != 0
-            && let Some(display) = display.as_mut()
         {
-            thread.personality.render(
+            let thread = ctx.thread(threads);
+            debug_assert_eq!(
+                display.is_some(),
+                thread.personality.uses_compositor(),
+                "event-loop display ownership disagrees with personality video state",
+            );
+            debug_assert!(
+                !windows.uses_desktop() || display.is_some(),
+                "desktop presentation lost the compositor display",
+            );
+
+            // Audio precedes display publication: a synchronous framebuffer
+            // write may be slow, but cannot delay the samples due this tick.
+            thread.personality.advance_world(
                 machine,
                 &mut *bios_workspace,
                 &ctx.regs,
                 world_now_ns,
+                elapsed_ns,
+                audio_clock.produced_frames(),
+            );
+            if elapsed_ns != 0 {
+                crate::kernel::sound::advance(
+                    machine,
+                    &mut audio_clock,
+                    sink.as_deref_mut(),
+                    elapsed_ns,
+                    |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
+                );
+            }
+            if elapsed_ns != 0
+                && let Some(display) = display.as_mut()
+            {
+                let endpoint = crate::kernel::gui::EndpointId(thread.kernel.tid as u32);
+                thread.personality.render(
+                    machine,
+                    &mut *bios_workspace,
+                    &ctx.regs,
+                    world_now_ns,
+                    display,
+                    windows.desktop_mut(),
+                    endpoint,
+                );
+            }
+        }
+        if elapsed_ns != 0
+            && let Some(display) = display.as_mut()
+        {
+            present_desktop(
+                machine,
+                &mut *bios_workspace,
+                threads,
                 display,
+                &mut windows,
             );
         }
+        let thread = ctx.thread(threads);
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
@@ -1061,6 +1172,37 @@ pub fn event_loop<A: crate::Arch>(
             &mut display,
             events,
         );
+        if let Some(tid) = crate::kernel::osd::take_window_request() {
+            let window = crate::kernel::gui::WindowManager::primary_window(
+                crate::kernel::gui::EndpointId(tid as u32),
+            );
+            windows.select_window(window);
+            crate::kernel::osd::finish_presentation_change();
+            thread::request_switch_to(tid);
+            if tid == ctx.tid {
+                apply_current_presentation(
+                    machine,
+                    &mut *bios_workspace,
+                    &mut thread.personality,
+                    &mut display,
+                    &windows,
+                );
+            }
+        }
+        if crate::kernel::osd::take_presentation_request() {
+            let window = crate::kernel::gui::WindowManager::primary_window(
+                crate::kernel::gui::EndpointId(ctx.tid as u32),
+            );
+            windows.toggle_presentation(window);
+            crate::kernel::osd::finish_presentation_change();
+            apply_current_presentation(
+                machine,
+                &mut *bios_workspace,
+                &mut thread.personality,
+                &mut display,
+                &windows,
+            );
+        }
         stats.part(machine, 3);
         thread
             .personality
@@ -1068,7 +1210,7 @@ pub fn event_loop<A: crate::Arch>(
         stats.part(machine, 4);
 
         // A blocked thread holds the console but not the CPU: wait for input
-        // to unblock it (above) or the F12 task picker to move on.
+        // to unblock it (above) or the F12 window picker to move on.
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
@@ -1080,6 +1222,7 @@ pub fn event_loop<A: crate::Arch>(
                     &mut exiting_display,
                     &mut sb_handoff,
                     &mut display,
+                    &mut windows,
                 ),
                 None => core::hint::spin_loop(),
             }
@@ -1135,12 +1278,22 @@ pub fn event_loop<A: crate::Arch>(
                     &mut exiting_display,
                     &mut sb_handoff,
                     &mut display,
+                    &mut windows,
                 );
             }
             crate::kernel::sched::Verdict::ContinueAs(next) => {
+                let old_window = crate::kernel::gui::WindowManager::primary_window(
+                    crate::kernel::gui::EndpointId(ctx.tid as u32),
+                );
+                let new_window = crate::kernel::gui::WindowManager::primary_window(
+                    crate::kernel::gui::EndpointId(next as u32),
+                );
+                windows.inherit_mode(old_window, new_window);
                 ctx.continue_as(threads, machine, next);
+                windows.select_window(new_window);
                 let thread = ctx.thread(threads);
                 if !crate::kernel::osd::is_open()
+                    && !windows.uses_desktop()
                     && matches!(thread.personality, thread::Personality::Dos(_))
                     && let Some(surface) = display.take()
                 {
@@ -1271,6 +1424,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
     display: &mut Option<crate::kernel::display::Display>,
+    windows: &mut crate::kernel::gui::WindowManager,
 ) {
     if new_tid == ctx.tid {
         let focused = crate::kernel::focus::focused();
@@ -1294,7 +1448,9 @@ fn switch_focus_and_run<A: crate::Arch>(
             *sb_handoff = card;
         }
         let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
+        select_window_for_tid(windows, new_tid);
         if crate::kernel::osd::is_open()
+            || windows.uses_desktop()
             || matches!(
                 new.personality,
                 thread::Personality::Linux(_)
@@ -1324,6 +1480,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         let transfer = exiting_display.take();
         ctx.switch_to(threads, machine, new_tid);
         let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
+        select_window_for_tid(windows, new_tid);
         match transfer {
             Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
                 let thread::Personality::Dos(dos) = &mut new.personality else {
@@ -1333,6 +1490,7 @@ fn switch_focus_and_run<A: crate::Arch>(
             }
             Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
                 if crate::kernel::osd::is_open()
+                    || windows.uses_desktop()
                     || matches!(
                         new.personality,
                         thread::Personality::Linux(_)
@@ -1374,9 +1532,11 @@ fn switch_focus_and_run<A: crate::Arch>(
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
+    select_window_for_tid(windows, new_tid);
     match transfer {
         Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
             if crate::kernel::osd::is_open()
+                || windows.uses_desktop()
                 || matches!(
                     new.personality,
                     thread::Personality::Linux(_)
@@ -1400,6 +1560,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         None => assert!(display.is_some(), "zombie lost display"),
     }
     if !crate::kernel::osd::is_open()
+        && !windows.uses_desktop()
         && matches!(new.personality, thread::Personality::Dos(_))
         && let Some(surface) = display.take()
     {
@@ -1409,6 +1570,33 @@ fn switch_focus_and_run<A: crate::Arch>(
     }
     crate::kernel::focus::adopt(new_tid);
     *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
+}
+
+fn select_window_for_tid(windows: &mut crate::kernel::gui::WindowManager, tid: usize) {
+    let window = crate::kernel::gui::WindowManager::primary_window(
+        crate::kernel::gui::EndpointId(tid as u32),
+    );
+    windows.select_window(window);
+}
+
+fn apply_current_presentation<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    personality: &mut thread::Personality<A>,
+    display: &mut Option<crate::kernel::display::Display>,
+    windows: &crate::kernel::gui::WindowManager,
+) {
+    if windows.uses_desktop() {
+        if display.is_none() {
+            let handoff = personality.release_display(machine, bios_workspace);
+            *display = Some(handoff.into_surface(machine, bios_workspace));
+        }
+    } else if matches!(personality, thread::Personality::Dos(_))
+        && let Some(surface) = display.take()
+    {
+        let handoff = crate::kernel::display::DisplayHandoff::from_surface(surface, machine);
+        personality.acquire_display_restore(machine, bios_workspace, handoff);
+    }
 }
 
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
@@ -1522,6 +1710,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             exec::BinaryFormat::Elf => "elf",
             exec::BinaryFormat::Lx => "lx",
             exec::BinaryFormat::Pe => "pe",
+            exec::BinaryFormat::Ne => "ne",
             exec::BinaryFormat::MzExe => "exe",
             exec::BinaryFormat::Com => "com",
         },
@@ -1554,7 +1743,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     let exec_vga = match format {
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => {
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
+            | exec::BinaryFormat::Pe => {
             exec::ExecVga::None
         }
         _ if parent_is_dos => {
@@ -1623,7 +1813,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(
         format,
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
+            | exec::BinaryFormat::Pe
     ) {
         crate::dbg_println!("  fork done, loading protected-mode image...");
         machine.free_user_pages();
@@ -2138,7 +2329,7 @@ pub fn bill_slice2(take: u64, timer_cyc: u64, display: u64, audio: u64, advances
 
 /// Is the periodic `[prof]` dump on? Written by the F12 monitor, read by the
 /// event loop — the same single-threaded volatile-flag shape as
-/// the task picker's atomic target.
+/// the window picker's atomic target.
 static mut PROFILE_DUMP: bool = false;
 
 /// Toggle the profile dump and report its new state.

@@ -54,8 +54,10 @@ pub fn render<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::display::Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
 ) {
-    crate::kernel::term::present(machine, bios, display);
+    crate::kernel::term::present_on(machine, bios, display, desktop, endpoint);
 }
 
 /// Linux-specific thread state
@@ -1205,12 +1207,14 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     // Native protected-mode images need a clean address space; DOS handles
     // its own setup inside exec_dos_into.
-    if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe) {
+    if matches!(format, exec::BinaryFormat::Elf | exec::BinaryFormat::Lx
+        | exec::BinaryFormat::Ne | exec::BinaryFormat::Pe) {
         machine.free_user_pages();
     }
 
     let exec_vga = match format {
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => exec::ExecVga::None,
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
+            | exec::BinaryFormat::Pe => exec::ExecVga::None,
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
             crate::kernel::bios_display::EmulatedVga::initial_mode3())),
     };

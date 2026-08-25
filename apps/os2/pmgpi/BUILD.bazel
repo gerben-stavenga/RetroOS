@@ -1,0 +1,22 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "pmgpi_obj",
+    srcs = ["pmgpi.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "pmgpi_dll",
+    obj = ":pmgpi_obj",
+    out = "PMGPI.DLL",
+    module_name = "PMGPI",
+    exports = [
+        "GpiBox.356",
+        "GpiDeleteBitmap.371",
+        "GpiLoadBitmap.399",
+        "GpiMove.404",
+    ],
+    visibility = ["//visibility:public"],
+)

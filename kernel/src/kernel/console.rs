@@ -51,15 +51,19 @@ pub fn dispatch<A: crate::Arch>(
         }
         thread::Personality::Os2(os2) => {
             for evt in guest_events {
-                if let crate::Irq::Key(scancode) = evt {
-                    os2.process_key(&kt.fds, scancode);
+                match evt {
+                    crate::Irq::Key(scancode) => os2.process_key(&kt.fds, scancode),
+                    crate::Irq::Mouse { dx, dy, buttons } => os2.process_mouse(dx, dy, buttons),
+                    _ => {}
                 }
             }
         }
         thread::Personality::Windows(windows) => {
             for evt in guest_events {
-                if let crate::Irq::Key(scancode) = evt {
-                    windows.process_key(&kt.fds, scancode);
+                match evt {
+                    crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode),
+                    crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons),
+                    _ => {}
                 }
             }
         }
@@ -122,17 +126,19 @@ fn monitor_key<A: crate::Arch>(
         crate::kernel::osd::key(machine, regs, sc, dos);
         if !crate::kernel::osd::is_open() {
             restore_from_monitor(machine, &mut *bios_workspace, personality, display);
+            personality.repaint_osd();
         } else {
             personality.repaint_osd();
         }
         return true;
     }
     if sc == F12_PRESS {
-        if display.is_none() {
+        let borrowed_fullscreen = display.is_none();
+        if borrowed_fullscreen {
             let handoff = personality.release_display(machine, bios_workspace);
             *display = Some(handoff.into_surface(machine, bios_workspace));
         }
-        crate::kernel::osd::open();
+        crate::kernel::osd::open(borrowed_fullscreen);
         personality.repaint_osd();
         return true;
     }
@@ -147,7 +153,9 @@ pub fn restore_from_monitor<A: crate::Arch>(
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
 ) {
-    if matches!(personality, thread::Personality::Dos(_)) {
+    if crate::kernel::osd::take_fullscreen_lease() {
+        assert!(matches!(personality, thread::Personality::Dos(_)),
+            "non-DOS OSD borrowed a fullscreen scanout lease");
         let display = display.take().expect("closing OSD without compositor display");
         let handoff = crate::kernel::display::DisplayHandoff::from_surface(display, machine);
         personality.acquire_display_restore(

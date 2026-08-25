@@ -6,10 +6,10 @@
 //! under the menu keeps updating. This replaces the old one-key-per-action
 //! debug/switch hotkeys: one discoverable door.
 //!
-//! Actions fold into machinery that already exists — Switch opens a task picker
-//! that targets the focus-switch request, Trace the shared DOS/DPMI/Linux
+//! The Windows tab selects windows, toggles the focused window between its
+//! retained fullscreen/windowed modes, and can terminate its task. Trace toggles the shared DOS/DPMI/Linux
 //! syscall-trace gate, Profile the profile-dump toggle, Dump the register/VGA
-//! dump, Disk lists the CD images shipped in `C:\CD`, Kill the ordinary exit path (a pending flag the event loop turns into
+//! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
 //! `Exit` for the focused thread, exactly as the SEGV path does). Volume is the
 //! one new knob: a runtime master gain multiplied into the single mix-out clip.
 //!
@@ -27,15 +27,16 @@ use crate::kernel::thread;
 
 // ── Menu model ───────────────────────────────────────────────────────────────
 
-const TAB_SYSTEM: usize = 0;
+const TAB_WINDOWS: usize = 0;
 const TAB_SOUND: usize = 1;
 const TAB_DISK: usize = 2;
 const TAB_DEBUG: usize = 3;
 const NUM_TABS: usize = 4;
 
-const SYSTEM_ITEM_KILL: usize = 0;
-const SYSTEM_ITEM_SWITCH: usize = 1;
-const SYSTEM_NUM_ITEMS: usize = 2;
+const WINDOWS_ITEM_SELECT: usize = 0;
+const WINDOWS_ITEM_PRESENTATION: usize = 1;
+const WINDOWS_ITEM_KILL: usize = 2;
+const WINDOWS_NUM_ITEMS: usize = 3;
 
 const SOUND_ITEM_VOLUME: usize = 0;
 const SOUND_ITEM_LATENCY: usize = 1;
@@ -63,9 +64,12 @@ const LATENCY_MAX_MS: u32 = 80;
 const LATENCY_STEP_MS: u32 = 5;
 
 static OPEN: AtomicBool = AtomicBool::new(false);
+/// True only when opening the OSD revoked a DOS fullscreen scanout lease.
+/// Desktop OSD sessions already have the compositor and require no restore.
+static BORROWED_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 static REPAINT: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
-static SYSTEM_SEL: AtomicUsize = AtomicUsize::new(0);
+static WINDOWS_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
 /// Which media device the Disk tab is showing: 0=A:, 1=B:, 2=CD (◄/►).
@@ -76,6 +80,8 @@ static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
+static PRESENTATION_REQ: AtomicBool = AtomicBool::new(false);
+static CURRENT_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 
 /// Is the monitor panel currently open?
 pub fn is_open() -> bool {
@@ -83,16 +89,19 @@ pub fn is_open() -> bool {
 }
 
 /// Open the panel (F12 while closed). Selection starts at the top, menu mode.
-pub fn open() {
+pub fn open(borrowed_fullscreen: bool) {
     crate::kernel::fs::cdrom::refresh_catalog();
     crate::kernel::fs::floppy::refresh_catalog();
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
-    SYSTEM_SEL.store(0, Ordering::Relaxed);
+    WINDOWS_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
     DISK_SEL.store(0, Ordering::Relaxed);
     DISK_SCROLL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
     PICKER.store(false, Ordering::Relaxed);
+    PRESENTATION_REQ.store(false, Ordering::Relaxed);
+    CURRENT_FULLSCREEN.store(borrowed_fullscreen, Ordering::Relaxed);
+    BORROWED_FULLSCREEN.store(borrowed_fullscreen, Ordering::Relaxed);
     REPAINT.store(true, Ordering::Relaxed);
     OPEN.store(true, Ordering::Relaxed);
 }
@@ -106,11 +115,26 @@ pub fn take_repaint_request() -> bool {
 fn close() {
     PICKER.store(false, Ordering::Relaxed);
     OPEN.store(false, Ordering::Relaxed);
+    REPAINT.store(true, Ordering::Relaxed);
 }
 
 /// Close the monitor without interpreting another key. Used when the focused
 /// owner is exiting: its display must first be returned from the OSD.
 pub fn dismiss() {
+    close();
+}
+
+/// Consume the fullscreen lease marker when an ordinary OSD close must return
+/// the display capability to DOS direct scanout.
+pub fn take_fullscreen_lease() -> bool {
+    BORROWED_FULLSCREEN.swap(false, Ordering::Relaxed)
+}
+
+/// Close after a window selection or explicit presentation change. The event
+/// loop now owns the display token and will apply the destination's retained
+/// mode, so the OSD must not restore the mode from which it was opened.
+pub fn finish_presentation_change() {
+    BORROWED_FULLSCREEN.store(false, Ordering::Relaxed);
     close();
 }
 
@@ -176,7 +200,7 @@ fn active_sel(tab: usize) -> usize {
         TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
         TAB_DISK => DISK_SEL.load(Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.load(Ordering::Relaxed),
-        _ => SYSTEM_SEL.load(Ordering::Relaxed),
+        _ => WINDOWS_SEL.load(Ordering::Relaxed),
     }
 }
 
@@ -185,7 +209,7 @@ fn set_active_sel(tab: usize, sel: usize) {
         TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
         TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
-        _ => SYSTEM_SEL.store(sel.min(SYSTEM_NUM_ITEMS - 1), Ordering::Relaxed),
+        _ => WINDOWS_SEL.store(sel.min(WINDOWS_NUM_ITEMS - 1), Ordering::Relaxed),
     }
 }
 
@@ -194,7 +218,7 @@ fn active_item_count(tab: usize) -> usize {
         TAB_SOUND => sound_item_count(),
         TAB_DISK => disk_item_count(),
         TAB_DEBUG => DEBUG_NUM_ITEMS,
-        _ => SYSTEM_NUM_ITEMS,
+        _ => WINDOWS_NUM_ITEMS,
     }
 }
 
@@ -344,7 +368,7 @@ fn active_tab_name(tab: usize) -> &'static [u8] {
         TAB_SOUND => b"Sound",
         TAB_DISK => b"Disk",
         TAB_DEBUG => b"Debug",
-        _ => b"System",
+        _ => b"Windows",
     }
 }
 
@@ -355,50 +379,56 @@ pub fn take_kill_request() -> bool {
     KILL_REQ.swap(false, Ordering::Relaxed)
 }
 
-// ── Process list (the Switch picker) ─────────────────────────────────────────
+pub fn take_presentation_request() -> bool {
+    PRESENTATION_REQ.swap(false, Ordering::Relaxed)
+}
 
-/// Max tasks the picker lists — RetroOS runs a handful, not hundreds.
+// ── Primary-window list ──────────────────────────────────────────────────────
+
+/// Max primary windows the picker lists in this first endpoint-backed model.
 const MAX_LIST: usize = 12;
 
 #[derive(Clone, Copy)]
-struct Proc {
+struct WindowEntry {
     tid: u16,
-    /// One-glyph state: 'R'unning / 'r'eady / 'B'locked.
-    state: u8,
     focused: bool,
     name: [u8; 16],
     name_len: u8,
 }
 
-impl Proc {
-    const EMPTY: Proc = Proc { tid: 0, state: 0, focused: false, name: [0; 16], name_len: 0 };
+impl WindowEntry {
+    const EMPTY: WindowEntry = WindowEntry { tid: 0, focused: false, name: [0; 16], name_len: 0 };
 }
 
 /// The picker's snapshot, rebuilt once per timer tick while the monitor is
 /// open — at the event-loop point where the whole thread table is borrowable.
 /// Single-threaded cooperative kernel, so a plain `static mut` behind
 /// accessors, the same discipline as the flags above.
-static mut PROCS: [Proc; MAX_LIST] = [Proc::EMPTY; MAX_LIST];
-static PROC_COUNT: AtomicUsize = AtomicUsize::new(0);
+static mut WINDOWS: [WindowEntry; MAX_LIST] = [WindowEntry::EMPTY; MAX_LIST];
+static WINDOW_COUNT: AtomicUsize = AtomicUsize::new(0);
 static PICK_SEL: AtomicUsize = AtomicUsize::new(0);
 static PICKER: AtomicBool = AtomicBool::new(false);
+static WINDOW_REQUEST: AtomicUsize = AtomicUsize::new(usize::MAX);
 
-/// Rebuild the process list from the thread table. Mirrors `cycle_next`'s
-/// active-thread filter (skip tid 0 and Unused/Zombie); `focused` marks the
-/// current console owner.
-pub fn refresh_processes<A: crate::Arch>(threads: &[thread::Thread<A>], focused: usize) {
+/// Rebuild the primary-window list from live personality endpoints. Native
+/// Windows/OS2 adapters can replace this snapshot with multiple WindowIds.
+pub fn refresh_windows<A: crate::Arch>(
+    threads: &[thread::Thread<A>],
+    focused: usize,
+    fullscreen: bool,
+) {
     let mut count = 0;
     for (i, t) in threads.iter().enumerate().skip(1) {
         if count >= MAX_LIST {
             break;
         }
         let k = &t.kernel;
-        let state = match k.state {
-            thread::ThreadState::Running => b'R',
-            thread::ThreadState::Ready => b'r',
-            thread::ThreadState::Blocked => b'B',
+        match k.state {
+            thread::ThreadState::Running
+            | thread::ThreadState::Ready
+            | thread::ThreadState::Blocked => {}
             _ => continue, // Unused / Zombie: not a switch target
-        };
+        }
         let name: &[u8] = match &threads[i].personality {
             thread::Personality::Linux(l) => thread::basename(l.exec_path_str()),
             thread::Personality::Os2(o) => thread::basename(o.exec_path_str()),
@@ -411,9 +441,8 @@ pub fn refresh_processes<A: crate::Arch>(threads: &[thread::Thread<A>], focused:
         let n = name.len().min(16);
         // SAFETY: single-threaded cooperative kernel; no concurrent access.
         unsafe {
-            let p = &mut (*core::ptr::addr_of_mut!(PROCS))[count];
+            let p = &mut (*core::ptr::addr_of_mut!(WINDOWS))[count];
             p.tid = i as u16;
-            p.state = state;
             p.focused = i == focused;
             p.name = [0; 16];
             p.name[..n].copy_from_slice(&name[..n]);
@@ -421,15 +450,16 @@ pub fn refresh_processes<A: crate::Arch>(threads: &[thread::Thread<A>], focused:
         }
         count += 1;
     }
-    PROC_COUNT.store(count, Ordering::Relaxed);
+    WINDOW_COUNT.store(count, Ordering::Relaxed);
+    CURRENT_FULLSCREEN.store(fullscreen, Ordering::Relaxed);
     if PICK_SEL.load(Ordering::Relaxed) >= count {
         PICK_SEL.store(count.saturating_sub(1), Ordering::Relaxed);
     }
 }
 
-fn proc_at(idx: usize) -> Proc {
-    // SAFETY: single-threaded; idx bounded by the caller against PROC_COUNT.
-    unsafe { (*core::ptr::addr_of!(PROCS))[idx] }
+fn window_at(idx: usize) -> WindowEntry {
+    // SAFETY: single-threaded; idx bounded by the caller against WINDOW_COUNT.
+    unsafe { (*core::ptr::addr_of!(WINDOWS))[idx] }
 }
 
 // ── Input ────────────────────────────────────────────────────────────────────
@@ -470,7 +500,7 @@ pub fn key<A: crate::Arch>(machine: &mut A, regs: &mut Regs, sc: u8, dos: Option
     }
 }
 
-/// Drive the Switch picker submode. Esc/◄ backs out to the menu; Enter/► picks.
+/// Drive the window picker submode. Esc/◄ backs out to the menu; Enter/► picks.
 fn pick_key(sc: u8) {
     match sc {
         K_F12 => close(),
@@ -483,7 +513,7 @@ fn pick_key(sc: u8) {
 }
 
 fn pick_move(up: bool) {
-    let count = PROC_COUNT.load(Ordering::Relaxed);
+    let count = WINDOW_COUNT.load(Ordering::Relaxed);
     if count == 0 {
         return;
     }
@@ -494,16 +524,20 @@ fn pick_move(up: bool) {
 
 fn pick_select() {
     let sel = PICK_SEL.load(Ordering::Relaxed);
-    if sel < PROC_COUNT.load(Ordering::Relaxed) {
-        thread::request_switch_to(proc_at(sel).tid as usize);
+    if sel < WINDOW_COUNT.load(Ordering::Relaxed) {
+        WINDOW_REQUEST.store(window_at(sel).tid as usize, Ordering::Relaxed);
     }
-    // Stay open: the switch path re-parks the display of the newly focused
-    // owner into the monitor (see switch_focus_and_run), so the picker
-    // survives the hop and further switches need no reopening.
+    // Stay open until the event loop consumes the request atomically with the
+    // destination presentation transition.
     REPAINT.store(true, Ordering::Relaxed);
 }
 
-/// After a switch the focused-task marker in the picker is stale until the
+pub fn take_window_request() -> Option<usize> {
+    let tid = WINDOW_REQUEST.swap(usize::MAX, Ordering::Relaxed);
+    (tid != usize::MAX).then_some(tid)
+}
+
+/// After a switch the focused-window marker in the picker is stale until the
 /// event loop's next snapshot; nudge a repaint so it corrects promptly.
 fn cycle_tab() {
     let next = (active_tab() + 1) % NUM_TABS;
@@ -611,15 +645,19 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
             }
             _ => {}
         },
-        _ => match active_sel(TAB_SYSTEM) {
-            SYSTEM_ITEM_KILL => {
-                KILL_REQ.store(true, Ordering::Relaxed);
-                close();
-            }
-            // Open the task picker (a submode of the still-open monitor).
-            SYSTEM_ITEM_SWITCH => {
+        _ => match active_sel(TAB_WINDOWS) {
+            // Open the primary-window list. Personalities can later contribute
+            // multiple native top-level windows without changing selection.
+            WINDOWS_ITEM_SELECT => {
                 PICK_SEL.store(0, Ordering::Relaxed);
                 PICKER.store(true, Ordering::Relaxed);
+            }
+            WINDOWS_ITEM_PRESENTATION => {
+                PRESENTATION_REQ.store(true, Ordering::Relaxed);
+            }
+            WINDOWS_ITEM_KILL => {
+                KILL_REQ.store(true, Ordering::Relaxed);
+                close();
             }
             _ => {}
         },
@@ -748,20 +786,47 @@ fn paint_scales(
     (cw, sy)
 }
 
+fn panel_rows() -> usize {
+    if PICKER.load(Ordering::Relaxed) {
+        WINDOW_COUNT.load(Ordering::Relaxed).clamp(1, MAX_ROWS - 2) + 2
+    } else {
+        let tab = active_tab();
+        let count = active_item_count(tab);
+        let visible = if tab == TAB_DISK { count.min(DISK_VISIBLE) } else { count };
+        visible + usize::from(tab == TAB_DISK) + 3
+    }
+}
+
+/// Size of the opaque system window containing the monitor panel.
+pub fn window_size(
+    canvas_width: usize,
+    canvas_height: usize,
+    scale_y: usize,
+) -> Option<(usize, usize)> {
+    let rows = panel_rows();
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
+    let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
+    let width = COLS * cw + pad_x * 2;
+    let height = rows * CELL_H * sy + pad_y * 2;
+    (canvas_width >= width && canvas_height >= height).then_some((width, height))
+}
+
 /// Composite the panel into a completed packed shadow. `scale_y` is an
 /// integer because a Mode 13h output may consume several source rows per
 /// physical row; glyph rows are repeated, never fractionally resampled.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     out: &mut [u8],
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    canvas_width: usize,
+    canvas_height: usize,
     scale_y: usize,
     fmt: PixelFormat,
 ) {
     if PICKER.load(Ordering::Relaxed) {
-        paint_picker(out, stride, w, h, logical_w, scale_y, fmt);
+        paint_picker(out, stride, w, h, canvas_width, canvas_height, scale_y, fmt);
         return;
     }
     let tab = active_tab();
@@ -776,16 +841,17 @@ pub fn paint(
     let subtab_rows = usize::from(tab == TAB_DISK);
     // Title + tab bar + (device sub-tabs) + items + footer.
     let rows = visible + subtab_rows + 3;
-    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     // Tight box: a two-glyph-pixel margin, just enough to keep strokes
     // off the panel edge (a glyph pixel is cw/8 wide, sy rows tall).
     let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
-    if logical_w < panel_w || h < panel_h {
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let logical_w = w;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
     vga::overlay_fill_xscaled(
@@ -902,7 +968,7 @@ fn paint_tabs(
 ) {
     let mut x = tx;
     for &(tab, label) in &[
-        (TAB_SYSTEM, b"System" as &[u8]),
+        (TAB_WINDOWS, b"Windows" as &[u8]),
         (TAB_SOUND, b"Sound" as &[u8]),
         (TAB_DISK, b"Disk" as &[u8]),
         (TAB_DEBUG, b"Debug" as &[u8]),
@@ -924,28 +990,31 @@ fn paint_tabs(
     }
 }
 
-/// Paint the Switch picker: one row per active task, `tid: name  S *`.
+/// Paint the window picker: currently one primary window per active endpoint.
+#[allow(clippy::too_many_arguments)]
 fn paint_picker(
     out: &mut [u8],
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    canvas_width: usize,
+    canvas_height: usize,
     scale_y: usize,
     fmt: PixelFormat,
 ) {
-    let count = PROC_COUNT.load(Ordering::Relaxed);
+    let count = WINDOW_COUNT.load(Ordering::Relaxed);
     // Character budget: the list shares MAX_ROWS with title + footer.
     let visible = count.clamp(1, MAX_ROWS - 2);
     let rows = visible + 2;
-    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
-    if logical_w < panel_w || h < panel_h {
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let logical_w = w;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
     vga::overlay_fill_xscaled(
@@ -960,7 +1029,7 @@ fn paint_picker(
     let mut ty = y0 + pad_y;
     paint_text(
         out, stride, w, h, logical_w, tx, ty, cw, sy,
-        b"Switch to task", TITLE_FG, TITLE_BG, fmt,
+        b"Select window", TITLE_FG, TITLE_BG, fmt,
     );
     ty += CELL_H * sy;
 
@@ -968,7 +1037,7 @@ fn paint_picker(
     if count == 0 {
         paint_text(
             out, stride, w, h, logical_w, tx, ty, cw, sy,
-            b"(no tasks)", ITEM_FG, PANEL_BG, fmt,
+            b"(no windows)", ITEM_FG, PANEL_BG, fmt,
         );
         ty += CELL_H * sy;
     } else {
@@ -976,7 +1045,7 @@ fn paint_picker(
         let start = sel.saturating_sub(visible - 1).min(count - visible);
         for idx in start..start + visible {
             let mut line = Line::new();
-            proc_line(idx, &mut line);
+            window_line(idx, &mut line);
             let selected = idx == sel;
             if selected {
                 vga::overlay_fill_xscaled(
@@ -999,19 +1068,15 @@ fn paint_picker(
     );
 }
 
-/// One picker row: `tid: name` padded to a column, then state glyph and a `*`
-/// for the current console owner.
-fn proc_line(idx: usize, line: &mut Line) {
-    let p = proc_at(idx);
-    line.put_num(p.tid as u32);
-    line.put(b": ");
+/// One primary-window row, with a `*` for keyboard focus.
+fn window_line(idx: usize, line: &mut Line) {
+    let p = window_at(idx);
     line.put(&p.name[..p.name_len as usize]);
-    while line.len < 22 {
+    while line.len < 24 {
         line.put(b" ");
     }
-    line.put(&[p.state]);
     if p.focused {
-        line.put(b" *");
+        line.put(b"*");
     }
 }
 
@@ -1077,8 +1142,15 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             _ => {}
         },
         _ => match item {
-            SYSTEM_ITEM_KILL => line.put(b"Kill task"),
-            SYSTEM_ITEM_SWITCH => line.put(b"Switch task"),
+            WINDOWS_ITEM_SELECT => line.put(b"Select window"),
+            WINDOWS_ITEM_PRESENTATION => {
+                line.put(if CURRENT_FULLSCREEN.load(Ordering::Relaxed) {
+                    b"Make window"
+                } else {
+                    b"Make fullscreen"
+                });
+            }
+            WINDOWS_ITEM_KILL => line.put(b"Kill task"),
             _ => {}
         },
     }

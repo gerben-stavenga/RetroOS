@@ -179,6 +179,28 @@ pub enum Personality<A: crate::Arch> {
 }
 
 impl<A: crate::Arch> Personality<A> {
+    pub fn surface_buffer<'a>(
+        &'a self,
+        key: crate::kernel::gui::SurfaceKey,
+        format: vga::PixelFormat,
+    ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+        match self {
+            Self::Os2(state) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::os2::surface_buffer(state)
+            }
+            Self::Windows(state) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::windows::surface_buffer(state)
+            }
+            Self::Dos(state) if key == crate::kernel::gui::SurfaceKey(2) => {
+                crate::kernel::dos::surface_buffer(state, format)
+            }
+            Self::Linux(_) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::term::surface_buffer()
+            }
+            _ => None,
+        }
+    }
+
     /// Give the first running personality the boot display. Unlike a later
     /// materialization, Linux adopts the existing contents instead of
     /// repainting its shared console snapshot.
@@ -256,8 +278,11 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     pub fn repaint_osd(&mut self) {
-        if matches!(self, Self::Linux(_) | Self::Os2(_) | Self::Windows(_)) {
-            crate::kernel::linux::repaint_console();
+        match self {
+            Self::Linux(_) => crate::kernel::linux::repaint_console(),
+            Self::Os2(os2) => os2.repaint_osd(),
+            Self::Windows(windows) => windows.repaint_osd(),
+            Self::Dos(_) => {}
         }
     }
 
@@ -361,6 +386,7 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     /// Render compositor-owned personality state into the event loop's output.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         machine: &mut A,
@@ -368,14 +394,26 @@ impl<A: crate::Arch> Personality<A> {
         regs: &Regs,
         now_ns: u64,
         display: &mut crate::kernel::display::Display,
+        desktop: &mut crate::kernel::gui::Desktop,
+        endpoint: crate::kernel::gui::EndpointId,
     ) {
         let prof = crate::kernel::startup::profile_enabled();
         let t0 = if prof { machine.rdtsc() } else { 0 };
         match self {
             Self::Dos(dos) => {
-                crate::kernel::dos::render(machine, bios, dos, regs, now_ns, display);
+                crate::kernel::dos::render(
+                    machine, bios, dos, regs, now_ns, display, desktop, endpoint,
+                );
             }
-            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => crate::kernel::linux::render(machine, bios, display),
+            Self::Linux(_) => {
+                crate::kernel::linux::render(machine, bios, display, desktop, endpoint)
+            }
+            Self::Os2(os2) => {
+                crate::kernel::os2::render(machine, bios, os2, display, desktop, endpoint)
+            }
+            Self::Windows(windows) => {
+                crate::kernel::windows::render(machine, bios, windows, display, desktop, endpoint)
+            }
         }
         if prof {
             crate::kernel::startup::bill_slice2(
@@ -846,7 +884,7 @@ pub fn basename(path: &[u8]) -> &[u8] {
     }
 }
 
-/// Target selected by the F12 task picker (a tid, or -1 when idle).
+/// Endpoint selected by the F12 window picker (a tid, or -1 when idle).
 static SWITCH_TO: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(-1);
 
 /// Ask to focus a specific thread (the F12 picker's selection).

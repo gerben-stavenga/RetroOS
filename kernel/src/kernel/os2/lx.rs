@@ -56,6 +56,8 @@ pub struct Header {
     pub object_count: u32,
     pub page_map: u32,
     pub resident_names: u32,
+    pub resource_table: u32,
+    pub resource_count: u32,
     pub entry_table: u32,
     pub fixup_pages: u32,
     pub fixup_records: u32,
@@ -157,6 +159,8 @@ impl<'a> Image<'a> {
             object_count: u32_at(data, at + 0x44)?,
             page_map: u32_at(data, at + 0x48)?,
             resident_names: u32_at(data, at + 0x58)?,
+            resource_table: u32_at(data, at + 0x50)?,
+            resource_count: u32_at(data, at + 0x54)?,
             entry_table: u32_at(data, at + 0x5c)?,
             fixup_pages: u32_at(data, at + 0x68)?,
             fixup_records: u32_at(data, at + 0x6c)?,
@@ -234,6 +238,45 @@ impl<'a> Image<'a> {
             at += 1;
             out.push(self.data.get(at..at + len).ok_or(Error::Truncated)?.to_vec());
             at += len;
+        }
+        Ok(out)
+    }
+
+    pub fn resources(&self) -> Result<Vec<Resource>, Error> {
+        let mut out = Vec::with_capacity(self.header.resource_count as usize);
+        let table = self.header.rel(self.header.resource_table)?;
+        for index in 0..self.header.resource_count as usize {
+            let at = table.checked_add(index * 14).ok_or(Error::BadTable)?;
+            out.push(Resource {
+                kind: u16_at(self.data, at)?,
+                id: u16_at(self.data, at + 2)?,
+                size: u32_at(self.data, at + 4)?,
+                object: u16_at(self.data, at + 8)?,
+                offset: u32_at(self.data, at + 10)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Return a resource's bytes from its object page stream. Resource data
+    /// can cross page records and need not have a mapped virtual address.
+    pub fn resource_data(&self, resource: Resource) -> Result<Vec<u8>, Error> {
+        let object = self.object(resource.object as u32)?;
+        let end = resource.offset.checked_add(resource.size).ok_or(Error::BadTable)?;
+        if end > object.size { return Err(Error::BadTable); }
+        let mut out = Vec::with_capacity(resource.size as usize);
+        let mut offset = resource.offset;
+        while offset < end {
+            let page_in_object = offset / self.header.page_size;
+            let within = offset % self.header.page_size;
+            let page = self.page(object.map_index + page_in_object)?;
+            if page.flags != PAGE_VALID { return Err(Error::BadTable); }
+            let bytes = self.page_data(page)?;
+            let available = (bytes.len() as u32).saturating_sub(within);
+            let take = available.min(end - offset);
+            if take == 0 { return Err(Error::BadTable); }
+            out.extend_from_slice(&bytes[within as usize..(within + take) as usize]);
+            offset += take;
         }
         Ok(out)
     }
@@ -394,6 +437,15 @@ impl<'a> Image<'a> {
         }
         Err(Error::BadTable)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Resource {
+    pub kind: u16,
+    pub id: u16,
+    pub size: u32,
+    pub object: u16,
+    pub offset: u32,
 }
 
 #[cfg(test)]

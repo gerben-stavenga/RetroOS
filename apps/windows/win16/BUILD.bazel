@@ -1,0 +1,45 @@
+load(":win16.bzl", "win16_dll")
+
+win16_dll("kernel", "KERNEL", [
+    "FatalExit.1", "LocalAlloc.5", "LocalReAlloc.6", "LocalFree.7",
+    "GlobalAlloc.15", "GlobalReAlloc.16", "GlobalFree.17", "GlobalUnlock.19",
+    "LockSegment.23", "UnlockSegment.24", "WaitEvent.30",
+    "MakeProcInstance.51", "FreeProcInstance.52", "FindResource.60",
+    "LoadResource.61", "LockResource.62", "lstrcpy.88", "InitTask.91",
+    "DOS3Call.102", "OutputDebugString.115", "GetPrivateProfileInt.127",
+    "GetPrivateProfileString.128", "WritePrivateProfileString.129",
+    "FatalAppExit.137",
+])
+
+win16_dll("gdi", "GDI", [
+    "SetROP2.4", "LineTo.19", "MoveTo.20", "SetPixel.31", "BitBlt.34",
+    "SelectObject.45", "CreateCompatibleDC.52", "CreatePen.61",
+    "CreateSolidBrush.66", "DeleteDC.68", "DeleteObject.69",
+    "GetDeviceCaps.80", "GetStockObject.87", "CreateDIBitmap.442",
+    "SetDIBitsToDevice.443",
+])
+
+win16_dll("user", "USER", [
+    "MessageBox.1", "InitApp.5", "PostQuitMessage.6", "SetTimer.10",
+    "KillTimer.12", "GetCurrentTime.15", "SetCapture.18", "ReleaseCapture.19",
+    "ClientToScreen.28", "IsIconic.31", "BeginPaint.39", "EndPaint.40",
+    "CreateWindow.41", "ShowWindow.42", "BringWindowToTop.45", "FindWindow.50",
+    "DestroyWindow.53", "MoveWindow.56", "RegisterClass.57", "GetDC.66",
+    "ReleaseDC.68", "SetRect.72", "PtInRect.76", "DialogBox.87", "EndDialog.88",
+    "SetDlgItemText.92", "GetDlgItemText.93", "SetDlgItemInt.94",
+    "GetDlgItemInt.95", "DefWindowProc.107", "GetMessage.108", "PeekMessage.109",
+    "PostMessage.110", "SendMessage.111", "TranslateMessage.113",
+    "DispatchMessage.114", "UpdateWindow.124", "InvalidateRect.125",
+    "LoadMenu.150", "CheckMenuItem.154", "EnableMenuItem.155", "SetMenu.158",
+    "WinHelp.171", "LoadCursor.173", "LoadIcon.174", "LoadString.176",
+    "LoadAccelerators.177", "TranslateAccelerator.178", "GetSystemMetrics.179",
+    "GetDesktopWindow.286", "GetLastActivePopup.287", "wsprintf.420",
+    "RetroWndProcReturn.421",
+])
+
+win16_dll("sound", "SOUND", [
+    "OpenSound.1", "CloseSound.2", "SetVoiceNote.4", "SetVoiceAccent.5",
+    "StartSound.9", "StopSound.10",
+])
+
+win16_dll("shell", "SHELL", ["ShellAbout.22"])
