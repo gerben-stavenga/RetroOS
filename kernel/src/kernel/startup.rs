@@ -1175,6 +1175,7 @@ pub fn event_loop<A: crate::Arch>(
             &mut thread.kernel,
             &mut thread.personality,
             &mut display,
+            windows.desktop_mut(),
             events,
         );
         if let Some(tid) = crate::kernel::osd::take_window_request() {

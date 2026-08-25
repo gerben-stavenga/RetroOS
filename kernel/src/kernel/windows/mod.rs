@@ -234,7 +234,6 @@ pub struct WindowsState {
     quit: bool,
     paint_dc: u32,
     dirty: bool,
-    cursor_dirty: bool,
     paint_hwnd: u32,
     focus_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
@@ -271,7 +270,6 @@ impl WindowsState {
             quit: false,
             paint_dc: 0x20000,
             dirty: true,
-            cursor_dirty: true,
             paint_hwnd: 0,
             focus_hwnd: 0,
             gdi_objects: Vec::new(),
@@ -294,7 +292,7 @@ impl WindowsState {
         machine.load_ldt(&self.ldt);
     }
     pub fn repaint_osd(&mut self) {
-        self.cursor_dirty = true;
+        self.dirty = true;
     }
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         let pressed = crate::kernel::keyboard::update_key_state(scancode);
@@ -333,20 +331,17 @@ impl WindowsState {
         }
     }
 
-    pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8) {
+    pub fn process_pointer(&mut self, x: i32, y: i32, buttons: u8) {
         let Some(window) = self.windows.iter().rfind(|w| w.visible && w.parent == 0) else {
             return;
         };
         let hwnd = window.hwnd;
-        self.mouse_x =
-            (self.mouse_x + i32::from(dx)).clamp(0, window.width.saturating_sub(1) as i32);
-        self.mouse_y =
-            (self.mouse_y + i32::from(dy)).clamp(0, window.height.saturating_sub(1) as i32);
+        self.mouse_x = x;
+        self.mouse_y = y;
         if buttons & 1 != 0 && self.mouse_buttons & 1 == 0
             && (self.process_control_click(hwnd) || self.process_menu_click(hwnd))
         {
             self.mouse_buttons = buttons;
-            self.cursor_dirty = true;
             return;
         }
         let lparam = (self.mouse_x as u32 & 0xffff) | ((self.mouse_y as u32 & 0xffff) << 16);
@@ -387,7 +382,6 @@ impl WindowsState {
             });
         }
         self.mouse_buttons = buttons;
-        self.cursor_dirty = true;
     }
 
     fn process_menu_click(&mut self, hwnd: u32) -> bool {
@@ -607,15 +601,11 @@ pub fn render<A: crate::Arch>(
     let placement = desktop
         .geometry(node)
         .expect("live Win32 presentation node");
-    let pointer_changed = desktop.set_pointer(crate::kernel::gui::Point {
-        x: placement.x + state.mouse_x,
-        y: placement.y + state.mouse_y,
-    });
     // USER-owned non-client UI and dialog controls are retained independently
     // from application client painting and restored at presentation time.
     paint_menu(state, index);
     paint_dialog(state, index);
-    if !state.dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
+    if !state.dirty && !focus_changed {
         return;
     }
     let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
@@ -631,7 +621,6 @@ pub fn render<A: crate::Arch>(
         .expect("commit Win32 presentation node");
 
     state.dirty = false;
-    state.cursor_dirty = false;
 }
 
 pub fn surface_buffer<'a>(

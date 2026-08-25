@@ -120,7 +120,6 @@ pub struct Os2State {
     mouse_x: i32,
     mouse_y: i32,
     mouse_buttons: u8,
-    cursor_dirty: bool,
     pm_dirty: bool,
 }
 
@@ -150,7 +149,6 @@ impl Os2State {
             mouse_x: 0,
             mouse_y: 0,
             mouse_buttons: 0,
-            cursor_dirty: true,
             pm_dirty: false,
         }
     }
@@ -177,11 +175,11 @@ impl Os2State {
         }
     }
 
-    pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8) {
+    pub fn process_pointer(&mut self, x: i32, y: i32, buttons: u8) {
         let Some(window) = self.pm_windows.iter().rfind(|window| window.visible) else { return; };
         let hwnd = window.hwnd;
-        self.mouse_x = (self.mouse_x + i32::from(dx)).clamp(0, window.width as i32 - 1);
-        self.mouse_y = (self.mouse_y + i32::from(dy)).clamp(0, window.height as i32 - 1);
+        self.mouse_x = x;
+        self.mouse_y = y;
         let pm_y = window.height as i32 - 1 - self.mouse_y;
         let mp1 = (self.mouse_x as u32 & 0xffff) | ((pm_y as u32 & 0xffff) << 16);
         self.pm_messages.push(PmMessage { hwnd, message: 0x0070, mp1, mp2: buttons as u32 });
@@ -193,7 +191,6 @@ impl Os2State {
             }
         }
         self.mouse_buttons = buttons;
-        self.cursor_dirty = true;
     }
 
     pub fn advance_timers(&mut self, now: u64) {
@@ -256,11 +253,7 @@ pub fn render<A: crate::Arch>(
         )
         .expect("create PM presentation node");
     let placement = desktop.geometry(node).expect("live PM presentation node");
-    let pointer_changed = desktop.set_pointer(crate::kernel::gui::Point {
-        x: placement.x + state.mouse_x,
-        y: placement.y + state.mouse_y,
-    });
-    if !state.pm_dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
+    if !state.pm_dirty && !focus_changed {
         return;
     }
     let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
@@ -273,7 +266,6 @@ pub fn render<A: crate::Arch>(
     desktop.commit(transaction).expect("commit PM presentation node");
 
     state.pm_dirty = false;
-    state.cursor_dirty = false;
 }
 
 pub fn surface_buffer<'a>(

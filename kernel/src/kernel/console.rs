@@ -30,6 +30,7 @@ pub fn dispatch<A: crate::Arch>(
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
+    desktop: &mut crate::kernel::gui::Desktop,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
     let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
@@ -43,10 +44,20 @@ pub fn dispatch<A: crate::Arch>(
     }
     match personality {
         thread::Personality::Dos(dos) => {
+            for event in &guest_events {
+                if let crate::Irq::Mouse { dx, dy, .. } = *event {
+                    desktop.move_pointer(dx, dy);
+                }
+            }
             let blocked = kt.state == thread::ThreadState::Blocked;
             dispatch_dos(machine, regs, blocked, dos, guest_events);
         }
         thread::Personality::Linux(linux) => {
+            for event in &guest_events {
+                if let crate::Irq::Mouse { dx, dy, .. } = *event {
+                    desktop.move_pointer(dx, dy);
+                }
+            }
             dispatch_linux(machine, regs, kt, linux, guest_events)
         }
         thread::Personality::Os2(os2) => {
@@ -58,7 +69,12 @@ pub fn dispatch<A: crate::Arch>(
                         wake = true;
                     }
                     crate::Irq::Mouse { dx, dy, buttons } => {
-                        os2.process_mouse(dx, dy, buttons);
+                        desktop.move_pointer(dx, dy);
+                        if let Some(point) = desktop.pointer_for(
+                            crate::kernel::gui::EndpointId(kt.tid as u32),
+                        ) {
+                            os2.process_pointer(point.x, point.y, buttons);
+                        }
                         wake = true;
                     }
                     _ => {}
@@ -72,7 +88,14 @@ pub fn dispatch<A: crate::Arch>(
             for evt in guest_events {
                 match evt {
                     crate::Irq::Key(scancode) => windows.process_key(&kt.fds, scancode),
-                    crate::Irq::Mouse { dx, dy, buttons } => windows.process_mouse(dx, dy, buttons),
+                    crate::Irq::Mouse { dx, dy, buttons } => {
+                        desktop.move_pointer(dx, dy);
+                        if let Some(point) = desktop.pointer_for(
+                            crate::kernel::gui::EndpointId(kt.tid as u32),
+                        ) {
+                            windows.process_pointer(point.x, point.y, buttons);
+                        }
+                    }
                     _ => {}
                 }
             }

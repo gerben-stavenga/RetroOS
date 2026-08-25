@@ -296,6 +296,32 @@ impl Desktop {
         changed
     }
 
+    /// Move the single compositor-owned pointer, clamped to the desktop rather
+    /// than to any personality's client area.
+    pub fn move_pointer(&mut self, dx: i16, dy: i16) -> Point {
+        let extent = self.extent();
+        let old = self.pointer.unwrap_or_default();
+        let point = Point {
+            x: old.x.saturating_add(i32::from(dx))
+                .clamp(0, extent.width.saturating_sub(1) as i32),
+            y: old.y.saturating_add(i32::from(dy))
+                .clamp(0, extent.height.saturating_sub(1) as i32),
+        };
+        self.set_pointer(point);
+        point
+    }
+
+    /// Translate the desktop pointer into a top-level endpoint's coordinates.
+    /// Coordinates deliberately remain outside the client rectangle when the
+    /// pointer leaves it; capture and hit-test policy belong above this layer.
+    pub fn pointer_for(&self, endpoint: EndpointId) -> Option<Point> {
+        let point = self.pointer?;
+        let node = self.scene.roots.iter().rev().find_map(|&id| {
+            self.scene.node(id).filter(|node| node.visible && node.owner == endpoint)
+        })?;
+        Some(Point { x: point.x - node.geometry.x, y: point.y - node.geometry.y })
+    }
+
     /// Return the retained node for `(endpoint, key)`, creating it invisible
     /// on first use. Node identity survives focus changes.
     pub fn ensure_node(
@@ -1763,6 +1789,27 @@ mod tests {
         };
         assert_eq!(pixel(1, 1), 0x0000_0000);
         assert_eq!(pixel(2, 5), 0x00ff_ffff);
+    }
+
+    #[test]
+    fn desktop_pointer_is_not_clamped_to_a_personality_window() {
+        let mut desktop = Desktop::new();
+        let background = desktop
+            .ensure_node(OS2, PresentationKey(1), Rect::new(0, 0, 100, 80))
+            .unwrap();
+        let window = desktop
+            .ensure_node(WINDOWS, PresentationKey(1), Rect::new(20, 10, 30, 20))
+            .unwrap();
+        let mut os2 = Transaction::new(OS2);
+        os2.set_visible(background, true);
+        desktop.commit(os2).unwrap();
+        let mut windows = Transaction::new(WINDOWS);
+        windows.set_visible(window, true);
+        desktop.commit(windows).unwrap();
+
+        assert_eq!(desktop.move_pointer(80, 60), Point { x: 80, y: 60 });
+        assert_eq!(desktop.pointer_for(WINDOWS), Some(Point { x: 60, y: 50 }));
+        assert_eq!(desktop.pointer_for(OS2), Some(Point { x: 80, y: 60 }));
     }
 
     #[test]
