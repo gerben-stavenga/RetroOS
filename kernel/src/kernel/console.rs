@@ -51,8 +51,10 @@ pub fn dispatch<A: crate::Arch>(
         }
         thread::Personality::Os2(os2) => {
             for evt in guest_events {
-                if let crate::Irq::Key(scancode) = evt {
-                    os2.process_key(&kt.fds, scancode);
+                match evt {
+                    crate::Irq::Key(scancode) => os2.process_key(&kt.fds, scancode),
+                    crate::Irq::Mouse { dx, dy, buttons } => os2.process_mouse(dx, dy, buttons),
+                    _ => {}
                 }
             }
         }

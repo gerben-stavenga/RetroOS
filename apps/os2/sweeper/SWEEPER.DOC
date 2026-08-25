@@ -1,0 +1,108 @@
+Minesweeper for OS/2 is a game of luck and strategy based on the Windows game of
+the same name.  This version contains additional features that enhance the
+challenge of the game.
+
+  The game is played on a tiled grid. The object of the game is to clear every 
+tile on the grid.  To clear a tile either "open" it by clicking with Mouse button
+1 or "mark" it by clicking with mouse button 2.  Open those tiles that you believe
+have NO mine.  Mark those that you believe DO have mines.  By reclicking mouse 
+button 2 you can place a question mark on a tile that you are unsure of.  By 
+reclicking again you can remove the mark.  As you mark tiles, the numerical 
+display in the upper left of the window will keep track of the number of mines 
+left to find.
+
+Cleared tiles are marked with a flag or question mark, which means you have marked 
+that tile as (possibly) containing a mine, or with a digit which means you have 
+opened that tile.  
+
+The digits are key.  They indicate how many of the eight adjacent tiles contain 
+mines.  For example, an opened tile that shows a '1' has only one mine adjacent 
+to it.
+
+A blank tile indicates that NO adjacent tiles contain mines.  If you open one of 
+these, the surrounding eight tiles are opened automatically.  If one of these tiles 
+is also blank, the process repeats recursivly.  This is what causes those exciting 
+sweeps that happen every so often.  
+
+The first few moves depend on luck.  After that, strategy comes into play.  
+Figure out the contents of the tiles from the surrounding tiles that have already 
+been exposed.
+
+You can use the "clear around" feature to speed up the game.  If you have an
+opened tile that has the indicated number of surrounding tiles marked,
+You can click on the open tile and cause any surrounding closed tiles to open.
+This is different from how the Small & Squishy (Microsoft) version works. 
+
+Some other features:
+
+Rocks:
+  When you open a tile you may see a rock instead of a number.  There is no 
+penalty for opening tiles that have rocks.  There is also no way of seeing the 
+number that is normally displayed in an open tile.  Rocks make the game more 
+challenging.  If you don't like rocks in your mine field uncheck the 'rocks' item 
+under the 'options' menu.
+
+Danger UXB:
+  There is an UneXploded Bomb hidden in the mine field.  But it isn't treated like 
+a regular mine. The numbers in the opened tiles don't reflect the location of the 
+UXB.  But the clear around and sweep procedures are smart enough to leave the UXB  
+alone.  AND SO SHOULD YOU!. If you see a tile that looks like it should have 
+automatically opened but it stayed closed, LEAVE IT ALONE! IT'S THE UXB!  You don't
+have to mark or open the tile that has the UXB. 
+   If however, you do Open the tile with the UXB you will have to defuse it. A 
+dialogue window will pop up with the control panel for the UXB and directions 
+for defusing.
+   There are six buttons on the UXB control panel labeled A through F.  Two of 
+these are live.  When you press a live button it's label changes to '***'.  You 
+must find and press both live buttons to defuse the UXB.  _IF_ you manage to 
+defuse the UXB the dialog will disappear and the game will continue.
+  There are three harmless buttons.  When you press a harmless button it's label 
+changes to '---'.  Harmless buttons are there to make life difficult.  There is no 
+penalty for pushing a harmless button.
+  One button will cause immediate detonation of the UXB.  When you push this 
+button the dialog will dismiss and the game will end.
+   If you would rather not deal with the UXB (whimp!) uncheck the 'UXBomb' item 
+under the 'Options' menu.
+
+Gopher:
+  There is a gopher in the mine field!  You would think that a mine would have 
+gotten him by now, but he is adept at pushing the mines around.  During the game 
+the gopher will pop up from time to time.  You can expect him to steal your 
+markers.  Also, if he pops up on a tile that contains a mine he will push it into 
+a surrounding closed tile.  When this happens the numbers surrounding the tiles will 
+change to reflect the new position of the mine.  Keep your eyes out for gophers
+and be prepared for some rearrangement of the mines.
+  If you would rather not deal with the varmint, uncheck the 'Gopher' item under 
+the 'Options' menu.
+
+Cheating!:
+  When you select the 'peek' item in the 'options' submenue the next mouse 
+button 1 click on any tile will reveal what is in that tile.  Numbers will not 
+be shown; but mines, rocks, and the UXB will.  Be careful though, if you peek at 
+a mine there is a 1 in ten chance of setting it off.
+
+Marking:
+  As you mouse button 2 click on a tile it will cycle through a flag mark, a 
+question mark and no mark.  If you prefer to not have the question mark, uncheck 
+the 'marks' menu item under the 'Options' menu.
+
+Starting a new game:
+  There are three preset games (beginner, intermediate, and expert) on the 'game' 
+menu. Or, if you prefer, you can create a custom game by selecting the 'custom' 
+item under the 'game' menu. 
+   The custom game dialog will pop up.  There are four spinners to set the 
+X (width) and Y (height) of the game board as well as spinners for the number of 
+rocks and mines.  Left mouse click on the arrows next to the numbers to increase 
+or decrease the numbers.  When you have numbers you like, click on the OK button.  
+Regardless of how many rocks and mines you specified in the dialog, you can't get 
+any more then half the tiles filled with mines and one quarter filled with rocks.  
+   The 'New' item under the 'game' menu will start a new game with all the same 
+parameters.
+
+Scoring: 
+  The fastest completion times for the beginner, intermediate, and 
+expert games are remembered. Times for custom games are not remembered.  To 
+display the high score table, select the 'show times' item in the 'game' menu.
+The 'Clear times' item will erase the high score table.  A timer runs in the 
+upper right corner as the game is played so you can keep track of how well you 
+are doing.  

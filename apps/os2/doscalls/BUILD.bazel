@@ -14,6 +14,7 @@ os2_dll(
     module_name = "DOSCALLS",
     exports = [
         "DosQueryHType.224",
+        "DosGetDateTime.230",
         "DosExit.234",
         "DosResetBuffer.254",
         "DosSetFilePtr.256",
@@ -23,7 +24,10 @@ os2_dll(
         "DosWrite.282",
         "DosQueryCp.291",
         "DosAllocMem.299",
+        "DosAllocSharedMem.300",
+        "DosGetNamedSharedMem.301",
         "DosFreeMem.304",
+        "DosGetInfoBlocks.312",
         "DosQueryModuleHandle.319",
         "DosQueryProcAddr.321",
         "DosQuerySysInfo.348",

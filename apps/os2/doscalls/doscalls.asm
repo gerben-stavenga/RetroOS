@@ -22,6 +22,10 @@ global DosSelToFlat
 global DosOpenL
 global DosSetFileLocksL
 global DosSetFilePtrL
+global DosGetDateTime
+global DosAllocSharedMem
+global DosGetNamedSharedMem
+global DosGetInfoBlocks
 
 ; RetroOS's replacement DOSCALLS module is an ordinary LX DLL.  Each export
 ; consists only of the private personality gate.  The saved EIP after INT
@@ -47,3 +51,7 @@ DosSelToFlat:         int 0x82
 DosOpenL:              int 0x82
 DosSetFileLocksL:      int 0x82
 DosSetFilePtrL:         int 0x82
+DosGetDateTime:         int 0x82
+DosAllocSharedMem:      int 0x82
+DosGetNamedSharedMem:   int 0x82
+DosGetInfoBlocks:       int 0x82

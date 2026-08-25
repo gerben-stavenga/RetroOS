@@ -1,0 +1,22 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "pmshapi_obj",
+    srcs = ["pmshapi.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "pmshapi_dll",
+    obj = ":pmshapi_obj",
+    out = "PMSHAPI.DLL",
+    module_name = "PMSHAPI",
+    exports = [
+        "PrfOpenProfile.102",
+        "PrfCloseProfile.103",
+        "PrfQueryProfileData.117",
+        "PrfWriteProfileData.118",
+    ],
+    visibility = ["//visibility:public"],
+)

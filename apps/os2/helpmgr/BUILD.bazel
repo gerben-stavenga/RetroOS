@@ -1,0 +1,21 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "helpmgr_obj",
+    srcs = ["helpmgr.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "helpmgr_dll",
+    obj = ":helpmgr_obj",
+    out = "HELPMGR.DLL",
+    module_name = "HELPMGR",
+    exports = [
+        "WinCreateHelpInstance.51",
+        "WinDestroyHelpInstance.52",
+        "WinAssociateHelpInstance.54",
+    ],
+    visibility = ["//visibility:public"],
+)

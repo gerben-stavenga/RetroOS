@@ -1,8 +1,8 @@
 //! Native 32-bit OS/2 application personality.
 //!
-//! Applications and compatibility DLLs are ordinary LX modules. DOSCALLS is
-//! a tiny replacement DLL whose exports are consecutive two-byte `INT 82h`
-//! gates; all service implementation lives here in Rust.
+//! Applications and compatibility DLLs are ordinary LX modules. DOSCALLS and
+//! the PM/GPI facade DLLs expose two-byte `INT 82h` gates; all service
+//! implementation lives here in Rust.
 
 extern crate alloc;
 
@@ -34,10 +34,20 @@ enum Api {
     DosOpen, DosRead, DosWrite, DosQueryCp, DosAllocMem, DosFreeMem,
     DosQueryModuleHandle, DosQueryProcAddr, DosQuerySysInfo, DosSetRelMaxFH,
     DosFlatToSel, DosSelToFlat, DosOpenL, DosSetFileLocksL, DosSetFilePtrL,
+    DosGetDateTime, DosAllocSharedMem, DosGetNamedSharedMem, DosGetInfoBlocks,
     DosQueryDBCSEnv, KbdCharIn, VioGetConfig,
     WinInitialize, WinCreateMsgQueue, WinCreateWindow, WinShowWindow,
     WinGetPS, WinReleasePS, WinFillRect, WinPostQueueMsg, WinGetMsg,
     WinDispatchMsg, WinDestroyWindow, WinDestroyMsgQueue, WinTerminate,
+    WinBeginPaint, WinDismissDlg, WinDrawBitmap, WinDrawBorder, WinEndPaint,
+    WinInvalidateRect, WinLoadString, WinMessageBox, WinPtInRect,
+    WinQueryDlgItemText, WinQuerySysValue, WinQueryWindow, WinQueryWindowPos,
+    WinQueryWindowRect, WinSetDlgItemText, WinSetWindowPos, WinStartTimer,
+    WinStopTimer, WinWindowFromId, WinSendDlgItemMsg, WinCreateStdWindow,
+    WinDefDlgProc, WinDefWindowProc, WinSendMsg, WinDlgBox, WinRegisterClass,
+    RetroWndProcReturn, GpiBox, GpiDeleteBitmap, GpiLoadBitmap, GpiMove,
+    PrfOpenProfile, PrfCloseProfile, PrfQueryProfileData, PrfWriteProfileData,
+    WinCreateHelpInstance, WinDestroyHelpInstance, WinAssociateHelpInstance,
 }
 
 #[derive(Clone, Copy)]
@@ -58,11 +68,30 @@ struct PmMessage {
 
 struct PmWindow {
     hwnd: u32,
+    wndproc: u32,
+    id: u32,
+    x: i32,
+    y: i32,
     width: u32,
     height: u32,
     visible: bool,
     pixels: Vec<u8>,
 }
+
+struct PmClass {
+    name: Vec<u8>,
+    wndproc: u32,
+}
+
+struct PmBitmap {
+    handle: u32,
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct Callback { dispatch_sp: u32 }
 
 /// OS/2-specific process state. The first implementation intentionally keeps
 /// process state small; TIB/PIB, threads and asynchronous operations grow here
@@ -78,8 +107,20 @@ pub struct Os2State {
     exec_path: [u8; 128],
     exec_path_len: usize,
     next_pm_handle: u32,
+    pm_classes: Vec<PmClass>,
+    pm_bitmaps: Vec<PmBitmap>,
     pm_windows: Vec<PmWindow>,
     pm_messages: Vec<PmMessage>,
+    callback: Option<Callback>,
+    callback_return: u32,
+    timer_hwnd: u32,
+    timer_id: u32,
+    timer_interval_ns: u64,
+    timer_deadline_ns: u64,
+    mouse_x: i32,
+    mouse_y: i32,
+    mouse_buttons: u8,
+    cursor_dirty: bool,
     pm_dirty: bool,
 }
 
@@ -96,8 +137,20 @@ impl Os2State {
             exec_path: [0; 128],
             exec_path_len: 0,
             next_pm_handle: 0x10000,
+            pm_classes: Vec::new(),
+            pm_bitmaps: Vec::new(),
             pm_windows: Vec::new(),
             pm_messages: Vec::new(),
+            callback: None,
+            callback_return: 0,
+            timer_hwnd: 0,
+            timer_id: 0,
+            timer_interval_ns: 0,
+            timer_deadline_ns: 0,
+            mouse_x: 0,
+            mouse_y: 0,
+            mouse_buttons: 0,
+            cursor_dirty: true,
             pm_dirty: false,
         }
     }
@@ -122,6 +175,25 @@ impl Os2State {
         if let thread::FdKind::PipeRead(idx) = fds[0] {
             crate::kernel::kpipe::write(idx, &[c]);
         }
+    }
+
+    pub fn process_mouse(&mut self, dx: i16, dy: i16, buttons: u8) {
+        let Some(window) = self.pm_windows.iter().rfind(|window| window.visible) else { return; };
+        let hwnd = window.hwnd;
+        self.mouse_x = (self.mouse_x + i32::from(dx)).clamp(0, window.width as i32 - 1);
+        self.mouse_y = (self.mouse_y + i32::from(dy)).clamp(0, window.height as i32 - 1);
+        let pm_y = window.height as i32 - 1 - self.mouse_y;
+        let mp1 = (self.mouse_x as u32 & 0xffff) | ((pm_y as u32 & 0xffff) << 16);
+        self.pm_messages.push(PmMessage { hwnd, message: 0x0070, mp1, mp2: buttons as u32 });
+        for (mask, down, up) in [(1, 0x0071, 0x0072), (2, 0x0074, 0x0075)] {
+            if buttons & mask != 0 && self.mouse_buttons & mask == 0 {
+                self.pm_messages.push(PmMessage { hwnd, message: down, mp1, mp2: 0 });
+            } else if buttons & mask == 0 && self.mouse_buttons & mask != 0 {
+                self.pm_messages.push(PmMessage { hwnd, message: up, mp1, mp2: 0 });
+            }
+        }
+        self.mouse_buttons = buttons;
+        self.cursor_dirty = true;
     }
 
     pub fn repaint_osd(&mut self) {
@@ -158,10 +230,14 @@ pub fn render<A: crate::Arch>(
             crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
         )
         .expect("create PM presentation node");
-    if !state.pm_dirty && !focus_changed {
+    let placement = desktop.geometry(node).expect("live PM presentation node");
+    let pointer_changed = desktop.set_pointer(crate::kernel::gui::Point {
+        x: placement.x + state.mouse_x,
+        y: placement.y + state.mouse_y,
+    });
+    if !state.pm_dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
         return;
     }
-    let placement = desktop.geometry(node).expect("live PM presentation node");
     let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
     transaction
         .set_geometry(node, crate::kernel::gui::Rect::new(
@@ -172,6 +248,7 @@ pub fn render<A: crate::Arch>(
     desktop.commit(transaction).expect("commit PM presentation node");
 
     state.pm_dirty = false;
+    state.cursor_dirty = false;
 }
 
 pub fn surface_buffer<'a>(
@@ -308,10 +385,11 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
             match page.flags {
                 lx::PAGE_VALID => {
                     let bytes = image.page_data(page).map_err(|_| 8)?;
-                    if within.checked_add(bytes.len() as u32).ok_or(8)? > object.size {
-                        return Err(8);
-                    }
-                    machine.copy_to(base + within as usize, bytes);
+                    // LX page records are page-sized storage units. The last
+                    // page of an object may contain linker padding beyond the
+                    // object's declared virtual size; map only its live prefix.
+                    let remaining = object.size.saturating_sub(within) as usize;
+                    machine.copy_to(base + within as usize, &bytes[..bytes.len().min(remaining)]);
                 }
                 lx::PAGE_ZEROED | lx::PAGE_INVALID => {}
                 lx::PAGE_ITERATED => return Err(8),
@@ -457,8 +535,18 @@ pub fn exec_lx_into<A: crate::Arch>(
         }
     }
 
-    for module in &modules { map_module(machine, module)?; }
-    for index in 0..modules.len() { apply_fixups(machine, &modules, index)?; }
+    for module in &modules {
+        if let Err(error) = map_module(machine, module) {
+            crate::println!("OS/2: cannot map module {}", core::str::from_utf8(&module.name).unwrap_or("?"));
+            return Err(error);
+        }
+    }
+    for index in 0..modules.len() {
+        if let Err(error) = apply_fixups(machine, &modules, index) {
+            crate::println!("OS/2: cannot fix up module {}", core::str::from_utf8(&modules[index].name).unwrap_or("?"));
+            return Err(error);
+        }
+    }
 
     let main = lx::Image::parse(&modules[0].data).map_err(|_| 8)?;
     let entry = object_address(&main, 0, main.header.start_object as u16, main.header.eip)?;
@@ -537,6 +625,10 @@ pub fn exec_lx_into<A: crate::Arch>(
         (b"DOSCALLS", b"DosOpenL", Api::DosOpenL, 0),
         (b"DOSCALLS", b"DosSetFileLocksL", Api::DosSetFileLocksL, 0),
         (b"DOSCALLS", b"DosSetFilePtrL", Api::DosSetFilePtrL, 0),
+        (b"DOSCALLS", b"DosGetDateTime", Api::DosGetDateTime, 0),
+        (b"DOSCALLS", b"DosAllocSharedMem", Api::DosAllocSharedMem, 0),
+        (b"DOSCALLS", b"DosGetNamedSharedMem", Api::DosGetNamedSharedMem, 0),
+        (b"DOSCALLS", b"DosGetInfoBlocks", Api::DosGetInfoBlocks, 0),
         (b"NLS", b"DosQueryDBCSEnv", Api::DosQueryDBCSEnv, 0),
         (b"KBDCALLS", b"KbdCharIn", Api::KbdCharIn, 6),
         (b"VIOCALLS", b"VioGetConfig", Api::VioGetConfig, 6),
@@ -553,13 +645,51 @@ pub fn exec_lx_into<A: crate::Arch>(
         (b"PMWIN", b"WinDestroyWindow", Api::WinDestroyWindow, 0),
         (b"PMWIN", b"WinDestroyMsgQueue", Api::WinDestroyMsgQueue, 0),
         (b"PMWIN", b"WinTerminate", Api::WinTerminate, 0),
+        (b"PMWIN", b"WinBeginPaint", Api::WinBeginPaint, 0),
+        (b"PMWIN", b"WinDismissDlg", Api::WinDismissDlg, 0),
+        (b"PMWIN", b"WinDrawBitmap", Api::WinDrawBitmap, 0),
+        (b"PMWIN", b"WinDrawBorder", Api::WinDrawBorder, 0),
+        (b"PMWIN", b"WinEndPaint", Api::WinEndPaint, 0),
+        (b"PMWIN", b"WinInvalidateRect", Api::WinInvalidateRect, 0),
+        (b"PMWIN", b"WinLoadString", Api::WinLoadString, 0),
+        (b"PMWIN", b"WinMessageBox", Api::WinMessageBox, 0),
+        (b"PMWIN", b"WinPtInRect", Api::WinPtInRect, 0),
+        (b"PMWIN", b"WinQueryDlgItemText", Api::WinQueryDlgItemText, 0),
+        (b"PMWIN", b"WinQuerySysValue", Api::WinQuerySysValue, 0),
+        (b"PMWIN", b"WinQueryWindow", Api::WinQueryWindow, 0),
+        (b"PMWIN", b"WinQueryWindowPos", Api::WinQueryWindowPos, 0),
+        (b"PMWIN", b"WinQueryWindowRect", Api::WinQueryWindowRect, 0),
+        (b"PMWIN", b"WinSetDlgItemText", Api::WinSetDlgItemText, 0),
+        (b"PMWIN", b"WinSetWindowPos", Api::WinSetWindowPos, 0),
+        (b"PMWIN", b"WinStartTimer", Api::WinStartTimer, 0),
+        (b"PMWIN", b"WinStopTimer", Api::WinStopTimer, 0),
+        (b"PMWIN", b"WinWindowFromID", Api::WinWindowFromId, 0),
+        (b"PMWIN", b"WinSendDlgItemMsg", Api::WinSendDlgItemMsg, 0),
+        (b"PMWIN", b"WinCreateStdWindow", Api::WinCreateStdWindow, 0),
+        (b"PMWIN", b"WinDefDlgProc", Api::WinDefDlgProc, 0),
+        (b"PMWIN", b"WinDefWindowProc", Api::WinDefWindowProc, 0),
+        (b"PMWIN", b"WinSendMsg", Api::WinSendMsg, 0),
+        (b"PMWIN", b"WinDlgBox", Api::WinDlgBox, 0),
+        (b"PMWIN", b"WinRegisterClass", Api::WinRegisterClass, 0),
+        (b"PMWIN", b"RetroWndProcReturn", Api::RetroWndProcReturn, 0),
+        (b"PMGPI", b"GpiBox", Api::GpiBox, 0),
+        (b"PMGPI", b"GpiDeleteBitmap", Api::GpiDeleteBitmap, 0),
+        (b"PMGPI", b"GpiLoadBitmap", Api::GpiLoadBitmap, 0),
+        (b"PMGPI", b"GpiMove", Api::GpiMove, 0),
+        (b"PMSHAPI", b"PrfOpenProfile", Api::PrfOpenProfile, 0),
+        (b"PMSHAPI", b"PrfCloseProfile", Api::PrfCloseProfile, 0),
+        (b"PMSHAPI", b"PrfQueryProfileData", Api::PrfQueryProfileData, 0),
+        (b"PMSHAPI", b"PrfWriteProfileData", Api::PrfWriteProfileData, 0),
+        (b"HELPMGR", b"WinCreateHelpInstance", Api::WinCreateHelpInstance, 0),
+        (b"HELPMGR", b"WinDestroyHelpInstance", Api::WinDestroyHelpInstance, 0),
+        (b"HELPMGR", b"WinAssociateHelpInstance", Api::WinAssociateHelpInstance, 0),
     ];
     for &(module_name, export_name, api, far16_args) in gate_specs {
         // A process only needs gates for DLLs in its own import closure. For
         // example, a small stdio program imports DOSCALLS but no KBD/VIO/NLS
         // module; those absent optional modules are not a load failure.
         let Some(mi) = find_module(&modules, module_name) else { continue; };
-        let target = resolve_export(&modules, mi, None, Some(export_name))?;
+        let Ok(target) = resolve_export(&modules, mi, None, Some(export_name)) else { continue; };
         state.gates.push(Gate {
             cs: if far16_args == 0 { arch_abi::USER_CS } else { target.selector },
             return_ip: if far16_args == 0 { target.linear + 2 } else { target.offset + 2 },
@@ -573,6 +703,10 @@ pub fn exec_lx_into<A: crate::Arch>(
     state.cwd[..n].copy_from_slice(&cwd[..n]);
     state.cwd_len = n;
     state.modules = modules;
+    state.callback_return = state.gates.iter()
+        .find(|gate| gate.api == Api::RetroWndProcReturn)
+        .map(|gate| gate.return_ip - 2)
+        .unwrap_or(0);
     state.on_resume(machine);
     current.personality = thread::Personality::Os2(state);
     Ok(())
@@ -776,6 +910,176 @@ fn fill_pm_rect<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) 
     1
 }
 
+fn queue_pm_message(state: &mut Os2State, message: PmMessage) {
+    if !state.pm_messages.iter().any(|queued| {
+        queued.hwnd == message.hwnd && queued.message == message.message
+    }) {
+        state.pm_messages.push(message);
+    }
+}
+
+fn create_pm_window(state: &mut Os2State, class: &[u8], id: u32, width: u32, height: u32, visible: bool) -> u32 {
+    let hwnd = state.next_pm_handle;
+    state.next_pm_handle = state.next_pm_handle.wrapping_add(1);
+    let wndproc = state.pm_classes.iter()
+        .find(|registered| eq_name(&registered.name, class))
+        .map_or(0, |registered| registered.wndproc);
+    state.pm_windows.push(PmWindow {
+        hwnd,
+        wndproc,
+        id,
+        x: 0,
+        y: 0,
+        width: width.clamp(1, 2048),
+        height: height.clamp(1, 2048),
+        visible,
+        pixels: vec![0x00; width.clamp(1, 2048) as usize * height.clamp(1, 2048) as usize * 4],
+    });
+    queue_pm_message(state, PmMessage { hwnd, message: 0x0001, mp1: 0, mp2: 0 });
+    queue_pm_message(state, PmMessage { hwnd, message: 0x0023, mp1: 0, mp2: 0 });
+    state.pm_dirty = true;
+    hwnd
+}
+
+fn begin_wndproc<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    state: &mut Os2State,
+    _gate: Gate,
+    message: PmMessage,
+) -> bool {
+    let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == message.hwnd) else {
+        return false;
+    };
+    if window.wndproc == 0 || state.callback.is_some() { return false; }
+    let sp = regs.sp().wrapping_sub(20);
+    machine.write::<u32>(sp as usize, state.callback_return);
+    machine.write::<u32>(sp as usize + 4, message.hwnd);
+    machine.write::<u32>(sp as usize + 8, message.message);
+    machine.write::<u32>(sp as usize + 12, message.mp1);
+    machine.write::<u32>(sp as usize + 16, message.mp2);
+    state.callback = Some(Callback { dispatch_sp: regs.sp() as u32 });
+    regs.frame.rsp = sp as u64;
+    regs.frame.rip = window.wndproc as u64;
+    true
+}
+
+fn alloc_os2_memory<A: crate::Arch>(machine: &mut A, state: &mut Os2State, out: usize, requested: u32) -> u32 {
+    let size = requested.max(1).next_multiple_of(4096);
+    let Some(end) = state.heap_next.checked_add(size) else { return ERROR_NOT_ENOUGH_MEMORY; };
+    if end >= USER_LIMIT { return ERROR_NOT_ENOUGH_MEMORY; }
+    let base = state.heap_next;
+    state.heap_next = end;
+    machine.zero(base as usize, size as usize);
+    machine.set_page_flags(base as usize / 4096, size as usize / 4096, true, false);
+    state.allocations.push((base, size));
+    machine.write::<u32>(out, base);
+    NO_ERROR
+}
+
+fn le_u16(data: &[u8], at: usize) -> Option<u16> {
+    let bytes = data.get(at..at + 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn le_u32(data: &[u8], at: usize) -> Option<u32> {
+    let bytes = data.get(at..at + 4)?;
+    Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn decode_os2_bitmap(data: &[u8], handle: u32) -> Option<PmBitmap> {
+    let file = if data.get(0..2) == Some(b"BA") { 14 } else { 0 };
+    if data.get(file..file + 2) != Some(b"BM") { return None; }
+    let bits = le_u32(data, file + 10)? as usize;
+    let info = file + 14;
+    let header_size = le_u32(data, info)? as usize;
+    let (width, height, planes, bit_count, palette_stride) = if header_size == 12 {
+        (
+            le_u16(data, info + 4)? as u32,
+            le_u16(data, info + 6)? as u32,
+            le_u16(data, info + 8)?,
+            le_u16(data, info + 10)?,
+            3,
+        )
+    } else if header_size >= 16 {
+        (
+            le_u32(data, info + 4)?,
+            le_u32(data, info + 8)?,
+            le_u16(data, info + 12)?,
+            le_u16(data, info + 14)?,
+            4,
+        )
+    } else { return None; };
+    if width == 0 || height == 0 || planes != 1 || !matches!(bit_count, 1 | 4 | 8) {
+        return None;
+    }
+    let palette_at = info.checked_add(header_size)?;
+    let colors = 1usize << bit_count;
+    data.get(palette_at..palette_at.checked_add(colors * palette_stride)?)?;
+    let row_bytes = ((width as usize * bit_count as usize + 31) / 32) * 4;
+    data.get(bits..bits.checked_add(row_bytes * height as usize)?)?;
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        let source_y = height as usize - 1 - y;
+        let row = bits + source_y * row_bytes;
+        for x in 0..width as usize {
+            let index = match bit_count {
+                1 => (data[row + x / 8] >> (7 - x % 8)) & 1,
+                4 => {
+                    let byte = data[row + x / 2];
+                    if x & 1 == 0 { byte >> 4 } else { byte & 0x0f }
+                }
+                8 => data[row + x],
+                _ => unreachable!(),
+            } as usize;
+            let color = palette_at + index * palette_stride;
+            let target = (y * width as usize + x) * 4;
+            pixels[target] = data[color];
+            pixels[target + 1] = data[color + 1];
+            pixels[target + 2] = data[color + 2];
+        }
+    }
+    Some(PmBitmap { handle, width, height, pixels })
+}
+
+fn load_pm_bitmap(state: &mut Os2State, id: u16) -> u32 {
+    let handle = 0x20000 + u32::from(id);
+    if state.pm_bitmaps.iter().any(|bitmap| bitmap.handle == handle) { return handle; }
+    let Some(module) = state.modules.first() else { return 0; };
+    let Ok(image) = lx::Image::parse(&module.data) else { return 0; };
+    let Ok(resources) = image.resources() else { return 0; };
+    let Some(resource) = resources.into_iter().find(|resource| resource.kind == 2 && resource.id == id) else {
+        return 0;
+    };
+    let Ok(data) = image.resource_data(resource) else { return 0; };
+    let Some(bitmap) = decode_os2_bitmap(&data, handle) else { return 0; };
+    state.pm_bitmaps.push(bitmap);
+    handle
+}
+
+fn draw_pm_bitmap<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
+    let hps = arg32(machine, regs, 0);
+    let handle = arg32(machine, regs, 1);
+    let destination = arg32(machine, regs, 3) as usize;
+    let Some(bitmap) = state.pm_bitmaps.iter().find(|bitmap| bitmap.handle == handle) else { return 0; };
+    let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hps) else { return 0; };
+    let left = machine.read::<i32>(destination);
+    let bottom = machine.read::<i32>(destination + 4);
+    for source_y in 0..bitmap.height as i32 {
+        let target_y = window.height as i32 - 1 - (bottom + bitmap.height as i32 - 1 - source_y);
+        if !(0..window.height as i32).contains(&target_y) { continue; }
+        for source_x in 0..bitmap.width as i32 {
+            let target_x = left + source_x;
+            if !(0..window.width as i32).contains(&target_x) { continue; }
+            let source = (source_y as usize * bitmap.width as usize + source_x as usize) * 4;
+            let target = (target_y as usize * window.width as usize + target_x as usize) * 4;
+            window.pixels[target..target + 4].copy_from_slice(&bitmap.pixels[source..source + 4]);
+        }
+    }
+    state.pm_dirty = true;
+    1
+}
+
 fn dispatch_api<A: crate::Arch>(
     machine: &mut A, kt: &mut thread::KernelThread<A>, state: &mut Os2State,
     regs: &mut Regs, api: Api,
@@ -845,19 +1149,9 @@ fn dispatch_api<A: crate::Arch>(
                 NO_ERROR
             }
         }
-        Api::DosAllocMem => {
-            let out = arg32(machine, regs, 0) as usize;
-            let size = arg32(machine, regs, 1).max(1).next_multiple_of(4096);
-            let Some(end) = state.heap_next.checked_add(size) else { return ERROR_NOT_ENOUGH_MEMORY; };
-            if end >= USER_LIMIT { return ERROR_NOT_ENOUGH_MEMORY; }
-            let base = state.heap_next;
-            state.heap_next = end;
-            machine.zero(base as usize, size as usize);
-            machine.set_page_flags(base as usize / 4096, size as usize / 4096, true, false);
-            state.allocations.push((base, size));
-            machine.write::<u32>(out, base);
-            NO_ERROR
-        }
+        Api::DosAllocMem | Api::DosAllocSharedMem => alloc_os2_memory(
+            machine, state, arg32(machine, regs, 0) as usize, arg32(machine, regs, 1),
+        ),
         Api::DosFreeMem => {
             let address = arg32(machine, regs, 0);
             if let Some(i) = state.allocations.iter().position(|&(a, _)| a == address) {
@@ -911,6 +1205,22 @@ fn dispatch_api<A: crate::Arch>(
             if max != 0 { machine.write::<u32>(max, thread::MAX_FDS as u32); }
             NO_ERROR
         }
+        Api::DosGetDateTime => {
+            let out = arg32(machine, regs, 0) as usize;
+            machine.zero(out, 12);
+            machine.write::<u8>(out, 12);
+            machine.write::<u8>(out + 1, 0);
+            machine.write::<u8>(out + 4, 1);
+            machine.write::<u8>(out + 5, 1);
+            machine.write::<u16>(out + 6, 1996);
+            NO_ERROR
+        }
+        Api::DosGetNamedSharedMem => ERROR_FILE_NOT_FOUND,
+        Api::DosGetInfoBlocks => {
+            machine.write::<u32>(arg32(machine, regs, 0) as usize, PROCESS_DATA);
+            machine.write::<u32>(arg32(machine, regs, 1) as usize, PROCESS_DATA + 0x80);
+            NO_ERROR
+        }
         Api::DosQueryDBCSEnv => {
             let cb = arg32(machine, regs, 0) as usize;
             let out = arg32(machine, regs, 2) as usize;
@@ -938,19 +1248,13 @@ fn dispatch_api<A: crate::Arch>(
         Api::WinInitialize => 1,
         Api::WinCreateMsgQueue => 2,
         Api::WinCreateWindow => {
+            let class = c_string(machine, arg32(machine, regs, 1)).unwrap_or_default();
             let width = arg32(machine, regs, 6).clamp(1, 2048);
             let height = arg32(machine, regs, 7).clamp(1, 2048);
-            let hwnd = state.next_pm_handle;
-            state.next_pm_handle = state.next_pm_handle.wrapping_add(1);
-            state.pm_windows.push(PmWindow {
-                hwnd,
-                width,
-                height,
-                visible: arg32(machine, regs, 3) & 0x8000_0000 != 0,
-                pixels: vec![0; width as usize * height as usize * 4],
-            });
-            state.pm_dirty = true;
-            hwnd
+            create_pm_window(
+                state, &class, arg32(machine, regs, 10), width, height,
+                arg32(machine, regs, 3) & 0x8000_0000 != 0,
+            )
         }
         Api::WinShowWindow => {
             let hwnd = arg32(machine, regs, 0);
@@ -978,15 +1282,30 @@ fn dispatch_api<A: crate::Arch>(
         }
         Api::WinGetMsg => {
             let out = arg32(machine, regs, 1) as usize;
-            let message = if state.pm_messages.is_empty() {
-                PmMessage { hwnd: 0, message: 0, mp1: 0, mp2: 0 }
-            } else {
-                state.pm_messages.remove(0)
+            let now = machine.now();
+            if state.pm_messages.is_empty()
+                && state.timer_hwnd != 0
+                && now >= state.timer_deadline_ns
+            {
+                state.pm_messages.push(PmMessage {
+                    hwnd: state.timer_hwnd, message: 0x0024,
+                    mp1: state.timer_id, mp2: 0,
+                });
+                // Do not replay a burst of missed timer messages after a pause.
+                // PM timers are notifications, not a count of elapsed periods.
+                state.timer_deadline_ns = now.saturating_add(state.timer_interval_ns);
+            }
+            let Some(message) = (!state.pm_messages.is_empty())
+                .then(|| state.pm_messages.remove(0))
+            else {
+                // Keep the call frame intact.  PMWIN's WinGetMsg tail executes
+                // HLT and retries this gate when the event loop next runs it.
+                return u32::MAX;
             };
             write_pm_message(machine, out, message);
             (message.message != 0x002a) as u32
         }
-        Api::WinDispatchMsg => 0,
+        Api::WinDispatchMsg | Api::RetroWndProcReturn => 0,
         Api::WinDestroyWindow => {
             let hwnd = arg32(machine, regs, 0);
             if let Some(index) = state.pm_windows.iter().position(|window| window.hwnd == hwnd) {
@@ -996,6 +1315,147 @@ fn dispatch_api<A: crate::Arch>(
             } else { 0 }
         }
         Api::WinDestroyMsgQueue | Api::WinTerminate => 1,
+        Api::WinRegisterClass => {
+            let name = match c_string(machine, arg32(machine, regs, 1)) {
+                Ok(name) => name,
+                Err(_) => return 0,
+            };
+            let wndproc = arg32(machine, regs, 2);
+            if let Some(class) = state.pm_classes.iter_mut().find(|class| eq_name(&class.name, &name)) {
+                class.wndproc = wndproc;
+            } else {
+                state.pm_classes.push(PmClass { name, wndproc });
+            }
+            1
+        }
+        Api::WinCreateStdWindow => {
+            let class = c_string(machine, arg32(machine, regs, 3)).unwrap_or_default();
+            let client = create_pm_window(state, &class, 0x8008, 640, 480, true);
+            let out = arg32(machine, regs, 8) as usize;
+            if out != 0 { machine.write::<u32>(out, client); }
+            client
+        }
+        Api::WinBeginPaint => {
+            let hwnd = arg32(machine, regs, 0);
+            let rect = arg32(machine, regs, 2) as usize;
+            if let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) {
+                if rect != 0 {
+                    machine.write::<i32>(rect, 0);
+                    machine.write::<i32>(rect + 4, 0);
+                    machine.write::<i32>(rect + 8, window.width as i32);
+                    machine.write::<i32>(rect + 12, window.height as i32);
+                }
+                hwnd
+            } else { 0 }
+        }
+        Api::WinEndPaint | Api::WinDismissDlg | Api::WinDrawBorder
+        | Api::WinSetDlgItemText
+        | Api::WinDestroyHelpInstance | Api::WinAssociateHelpInstance
+        | Api::PrfCloseProfile | Api::PrfWriteProfileData
+        | Api::GpiDeleteBitmap => 1,
+        Api::WinInvalidateRect => {
+            let hwnd = arg32(machine, regs, 0);
+            queue_pm_message(state, PmMessage { hwnd, message: 0x0023, mp1: 0, mp2: 0 });
+            1
+        }
+        Api::WinQuerySysValue => match arg32(machine, regs, 1) {
+            20 => 1024,
+            21 => 768,
+            _ => 16,
+        },
+        Api::WinQueryWindowRect => {
+            let hwnd = arg32(machine, regs, 0);
+            let out = arg32(machine, regs, 1) as usize;
+            let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) else { return 0; };
+            machine.write::<i32>(out, 0);
+            machine.write::<i32>(out + 4, 0);
+            machine.write::<i32>(out + 8, window.width as i32);
+            machine.write::<i32>(out + 12, window.height as i32);
+            1
+        }
+        Api::WinQueryWindowPos => {
+            let hwnd = arg32(machine, regs, 0);
+            let out = arg32(machine, regs, 1) as usize;
+            let Some(window) = state.pm_windows.iter().find(|window| window.hwnd == hwnd) else { return 0; };
+            machine.zero(out, 36);
+            machine.write::<i32>(out + 4, window.height as i32);
+            machine.write::<i32>(out + 8, window.width as i32);
+            machine.write::<i32>(out + 12, window.y);
+            machine.write::<i32>(out + 16, window.x);
+            machine.write::<u32>(out + 24, hwnd);
+            1
+        }
+        Api::WinSetWindowPos => {
+            let hwnd = arg32(machine, regs, 0);
+            let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hwnd) else { return 0; };
+            let flags = arg32(machine, regs, 6);
+            if flags & 0x0001 != 0 {
+                window.width = arg32(machine, regs, 4).clamp(1, 2048);
+                window.height = arg32(machine, regs, 5).clamp(1, 2048);
+                window.pixels.resize(window.width as usize * window.height as usize * 4, 0);
+            }
+            if flags & 0x0002 != 0 {
+                window.x = arg32(machine, regs, 2) as i32;
+                window.y = arg32(machine, regs, 3) as i32;
+            }
+            if flags & 0x0004 != 0 { window.visible = true; }
+            state.pm_dirty = true;
+            1
+        }
+        Api::WinStartTimer => {
+            state.timer_hwnd = arg32(machine, regs, 1);
+            let requested_id = arg32(machine, regs, 2);
+            state.timer_id = if requested_id == 0 { 1 } else { requested_id };
+            let interval_ms = arg32(machine, regs, 3).max(1);
+            state.timer_interval_ns = u64::from(interval_ms).saturating_mul(1_000_000);
+            state.timer_deadline_ns = machine.now().saturating_add(state.timer_interval_ns);
+            state.timer_id
+        }
+        Api::WinStopTimer => {
+            let hwnd = arg32(machine, regs, 1);
+            let timer_id = arg32(machine, regs, 2);
+            if state.timer_hwnd != hwnd || state.timer_id != timer_id {
+                return 0;
+            }
+            state.timer_hwnd = 0;
+            state.timer_id = 0;
+            state.timer_interval_ns = 0;
+            state.timer_deadline_ns = 0;
+            1
+        }
+        Api::WinWindowFromId => {
+            let parent = arg32(machine, regs, 0);
+            let id = arg32(machine, regs, 1);
+            state.pm_windows.iter().find(|window| window.id == id)
+                .map_or(parent, |window| window.hwnd)
+        }
+        Api::WinQueryWindow => arg32(machine, regs, 0),
+        Api::WinPtInRect => {
+            let rect = arg32(machine, regs, 1) as usize;
+            let point = arg32(machine, regs, 2) as usize;
+            let x = machine.read::<i32>(point);
+            let y = machine.read::<i32>(point + 4);
+            (x >= machine.read::<i32>(rect) && x < machine.read::<i32>(rect + 8)
+                && y >= machine.read::<i32>(rect + 4) && y < machine.read::<i32>(rect + 12)) as u32
+        }
+        Api::WinLoadString | Api::WinQueryDlgItemText => {
+            let (length_arg, out_arg) = if api == Api::WinLoadString { (3, 4) } else { (2, 3) };
+            let length = arg32(machine, regs, length_arg) as usize;
+            let out = arg32(machine, regs, out_arg) as usize;
+            if length != 0 { machine.write::<u8>(out, 0); }
+            0
+        }
+        Api::WinMessageBox => 1,
+        Api::WinSendDlgItemMsg | Api::WinSendMsg | Api::WinDefDlgProc | Api::WinDefWindowProc => 0,
+        Api::WinDlgBox => 1,
+        Api::WinDrawBitmap => draw_pm_bitmap(machine, state, regs),
+        Api::GpiLoadBitmap => {
+            load_pm_bitmap(state, arg32(machine, regs, 2) as u16)
+        }
+        Api::GpiMove | Api::GpiBox => 1,
+        Api::PrfOpenProfile => 1,
+        Api::PrfQueryProfileData => 0,
+        Api::WinCreateHelpInstance => 1,
         Api::DosExit => unreachable!(),
     }
 }
@@ -1009,6 +1469,10 @@ pub fn handle_event<A: crate::Arch>(
 ) -> thread::KernelAction {
     match event {
         crate::KernelEvent::Irq => thread::KernelAction::Done,
+        // PMWIN parks an empty WinGetMsg on HLT.  Giving up the remainder of
+        // this turn lets another personality run; resumption executes the
+        // stub's jump back to WinGetMsg and re-checks input and timer state.
+        crate::KernelEvent::Hlt => thread::KernelAction::Yield,
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = gate_from_event(state, regs.frame.cs as u16, regs.ip32()) else {
                 crate::println!("OS/2: invalid API gate at {:#x}", regs.ip32());
@@ -1019,9 +1483,37 @@ pub fn handle_event<A: crate::Arch>(
                     let result = machine.read::<u32>(regs.sp() as usize + 8);
                     thread::KernelAction::Exit(result as i32)
                 }
+                Api::RetroWndProcReturn => {
+                    let Some(callback) = state.callback.take() else {
+                        crate::println!("OS/2: stray window-procedure return");
+                        return thread::KernelAction::Exit(-1);
+                    };
+                    let result = regs.rax as u32;
+                    regs.rax = result as u64;
+                    regs.frame.rip = machine.read::<u32>(callback.dispatch_sp as usize) as u64;
+                    regs.frame.rsp = callback.dispatch_sp.wrapping_add(4) as u64;
+                    thread::KernelAction::Done
+                }
+                Api::WinDispatchMsg => {
+                    let msg = arg32(machine, regs, 1) as usize;
+                    let message = PmMessage {
+                        hwnd: machine.read::<u32>(msg),
+                        message: machine.read::<u32>(msg + 4),
+                        mp1: machine.read::<u32>(msg + 8),
+                        mp2: machine.read::<u32>(msg + 12),
+                    };
+                    if begin_wndproc(machine, regs, state, gate, message) {
+                        thread::KernelAction::Done
+                    } else {
+                        finish_gate(machine, regs, gate, 0);
+                        thread::KernelAction::Done
+                    }
+                }
                 api => {
                     let result = dispatch_api(machine, kt, state, regs, api);
-                    finish_gate(machine, regs, gate, result);
+                    if api != Api::WinGetMsg || result != u32::MAX {
+                        finish_gate(machine, regs, gate, result);
+                    }
                     thread::KernelAction::Done
                 }
             }
