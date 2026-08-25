@@ -7,6 +7,8 @@
 extern crate alloc;
 
 pub mod pe;
+pub mod ne;
+mod win16;
 
 use crate::Regs;
 use crate::kernel::thread;
@@ -216,6 +218,7 @@ pub struct WindowsState {
     mouse_x: i32,
     mouse_y: i32,
     mouse_buttons: u8,
+    win16: Option<win16::State>,
 }
 
 impl WindowsState {
@@ -251,6 +254,7 @@ impl WindowsState {
             mouse_x: 0,
             mouse_y: 0,
             mouse_buttons: 0,
+            win16: None,
         }
     }
     pub fn cwd_str(&self) -> &[u8] {
@@ -338,6 +342,18 @@ impl WindowsState {
         self.mouse_buttons = buttons;
         self.cursor_dirty = true;
     }
+}
+
+pub fn exec_ne_into<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    tid: usize,
+    data: Vec<u8>,
+    path: &[u8],
+    parent_cwd: &[u8],
+    launcher: Option<thread::PersonalityName>,
+) -> Result<(), i32> {
+    win16::exec(machine, threads, tid, data, path, parent_cwd, launcher)
 }
 
 /// Publish the foremost native Win32 top-level window into the shared desktop.
@@ -2127,6 +2143,11 @@ pub fn handle_event<A: crate::Arch>(
     regs: &mut Regs,
     event: crate::KernelEvent,
 ) -> thread::KernelAction {
+    if let Some(mut win16) = state.win16.take() {
+        let action = win16::handle_event(machine, kt, state, &mut win16, regs, event);
+        state.win16 = Some(win16);
+        return action;
+    }
     match event {
         crate::KernelEvent::Irq => thread::KernelAction::Done,
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {

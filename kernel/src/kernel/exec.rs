@@ -46,6 +46,7 @@ pub fn load_file_resolved(path: &[u8]) -> Result<Vec<u8>, i32> {
 pub enum BinaryFormat {
     Elf,
     Lx,
+    Ne,
     Pe,
     MzExe,
     Com,
@@ -58,6 +59,9 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
     }
     if is_lx(data) {
         return BinaryFormat::Lx;
+    }
+    if crate::kernel::windows::ne::is_ne(data) {
+        return BinaryFormat::Ne;
     }
     if is_pe(data) {
         return BinaryFormat::Pe;
@@ -131,6 +135,11 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
                 machine, threads, tid, data, path, &parent_cwd, personality_name)
         }
         BinaryFormat::Lx => Err(-8),
+        BinaryFormat::Ne if matches!(exec_vga, ExecVga::None) => {
+            crate::kernel::windows::exec_ne_into(
+                machine, threads, tid, data, path, &parent_cwd, personality_name)
+        }
+        BinaryFormat::Ne => Err(-8),
         BinaryFormat::Pe if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::windows::exec_pe_into(
                 machine, threads, tid, data, path, &parent_cwd, personality_name)

@@ -84,3 +84,46 @@ windows_dll = rule(
         "_runtime": attr.label(default = "@open_watcom//:c_runtime"),
     },
 )
+
+def _windows16_dll_impl(ctx):
+    obj = ctx.file.obj
+    output = ctx.outputs.out
+    response = ctx.actions.declare_file(ctx.label.name + ".lnk")
+    watcom_root = ctx.executable._linker.dirname + "/.."
+    ctx.actions.write(
+        output = response,
+        content = "\n".join([
+            "format windows dll",
+            "option quiet",
+            "option modname=%s" % ctx.attr.module_name,
+            "name %s" % output.path,
+            "file %s" % obj.path,
+        ] + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
+    )
+    ctx.actions.run(
+        executable = ctx.executable._linker,
+        arguments = ["@" + response.path],
+        env = {"WATCOM": watcom_root},
+        inputs = depset([obj, response], transitive = [ctx.attr._runtime[DefaultInfo].files]),
+        outputs = [output],
+        mnemonic = "Windows16WatcomDllLink",
+        progress_message = "Linking Win16 NE DLL %{label}",
+    )
+    return [DefaultInfo(files = depset([output]))]
+
+windows16_dll = rule(
+    implementation = _windows16_dll_impl,
+    attrs = {
+        "obj": attr.label(allow_single_file = True, mandatory = True),
+        "out": attr.output(mandatory = True),
+        "module_name": attr.string(mandatory = True),
+        "exports": attr.string_list(mandatory = True),
+        "_linker": attr.label(
+            default = "@open_watcom//:binl64/wlink",
+            allow_single_file = True,
+            executable = True,
+            cfg = "exec",
+        ),
+        "_runtime": attr.label(default = "@open_watcom//:c_runtime"),
+    },
+)

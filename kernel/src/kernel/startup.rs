@@ -815,6 +815,7 @@ fn run_program<A: crate::Arch>(
     let tid = match exec::detect_format(&buf, path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, path),
+        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, path),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, path),
         _ => dos::run_init_program(
             machine,
@@ -936,6 +937,34 @@ fn launch_windows<A: crate::Arch>(
         .unwrap_or_else(|e| {
             panic!(
                 "Windows PE exec failed ({}): errno {}",
+                core::str::from_utf8(path).unwrap_or("?"),
+                e
+            )
+        });
+    tid
+}
+
+/// Launch a native 16-bit Windows NE image as a fresh process.
+fn launch_win16<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    buf: alloc::vec::Vec<u8>,
+    path: &[u8],
+) -> usize {
+    let cpipe = thread::console_pipe();
+    let tid = {
+        let t = thread::create_thread(threads, machine, None, A::PageTable::default(), true)
+            .expect("create Win16 thread");
+        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
+        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
+        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
+        t.kernel.tid as usize
+    };
+    crate::kernel::kpipe::add_reader(cpipe);
+    crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, b"", None)
+        .unwrap_or_else(|e| {
+            panic!(
+                "Windows NE exec failed ({}): errno {}",
                 core::str::from_utf8(path).unwrap_or("?"),
                 e
             )
@@ -1681,6 +1710,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             exec::BinaryFormat::Elf => "elf",
             exec::BinaryFormat::Lx => "lx",
             exec::BinaryFormat::Pe => "pe",
+            exec::BinaryFormat::Ne => "ne",
             exec::BinaryFormat::MzExe => "exe",
             exec::BinaryFormat::Com => "com",
         },
@@ -1713,7 +1743,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     let exec_vga = match format {
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe => {
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
+            | exec::BinaryFormat::Pe => {
             exec::ExecVga::None
         }
         _ if parent_is_dos => {
@@ -1782,7 +1813,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // ELF needs user pages freed before loading; DOS handles its own address space
     if matches!(
         format,
-        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Pe
+        exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
+            | exec::BinaryFormat::Pe
     ) {
         crate::dbg_println!("  fork done, loading protected-mode image...");
         machine.free_user_pages();
