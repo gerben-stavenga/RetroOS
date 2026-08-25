@@ -1323,6 +1323,7 @@ pub fn pump_fullscreen<A: crate::Arch>(
 }
 
 /// Render state-only DOS VGA through the event loop's compositor display.
+#[allow(clippy::too_many_arguments)]
 pub fn render<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,

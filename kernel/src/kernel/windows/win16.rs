@@ -629,7 +629,7 @@ fn dib_header<A: crate::Arch>(machine: &A, header: usize) -> Option<(usize, usiz
             let bpp = machine.read::<u16>(header + 10);
             (width != 0 && height != 0).then_some((width, height, bpp, header + 12))
         }
-        size if size >= 40 && size <= 4096 => {
+        size if (40..=4096).contains(&size) => {
             let width = machine.read::<i32>(header + 4).unsigned_abs() as usize;
             let height = machine.read::<i32>(header + 8).unsigned_abs() as usize;
             let bpp = machine.read::<u16>(header + 14);
@@ -972,13 +972,13 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 108 | 109) => {
             if windows.quit { return 0; }
             if windows.messages.is_empty() {
-                if state.timer != 0 {
-                    if let Some(window) = windows.windows.iter().find(|window| window.visible) {
-                        windows.messages.push(super::Message {
-                            hwnd: window.hwnd, message: 0x0113,
-                            wparam: u32::from(state.timer), lparam: 0,
-                        });
-                    }
+                if state.timer != 0
+                    && let Some(window) = windows.windows.iter().find(|window| window.visible)
+                {
+                    windows.messages.push(super::Message {
+                        hwnd: window.hwnd, message: 0x0113,
+                        wparam: u32::from(state.timer), lparam: 0,
+                    });
                 }
                 if windows.messages.is_empty() { return 0; }
             }
@@ -1100,7 +1100,7 @@ fn dispatch<A: crate::Arch>(
             let object = u32::from(stack_u16(machine, windows, regs, 4).unwrap_or(0));
             let dc = u32::from(stack_u16(machine, windows, regs, 6).unwrap_or(0));
             if let Some(item) = windows.dcs.iter_mut().find(|item| item.handle == dc) {
-                let old = if windows.gdi_objects.iter().any(|(h, o)| *h == object
+                if windows.gdi_objects.iter().any(|(h, o)| *h == object
                     && matches!(o, super::GdiObject::Bitmap { .. })) {
                     item.bitmap.replace(object).unwrap_or(0)
                 } else if windows.gdi_objects.iter().any(|(h, o)| *h == object
@@ -1108,8 +1108,7 @@ fn dispatch<A: crate::Arch>(
                     core::mem::replace(&mut item.pen, object)
                 } else {
                     core::mem::replace(&mut item.brush, object)
-                };
-                old
+                }
             } else { 0 }
         }
         (Module::Gdi, 52) => {
@@ -1149,15 +1148,14 @@ fn dispatch<A: crate::Arch>(
         }
         (Module::Gdi, 80) => {
             let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
-            let value = match index {
+            match index {
                 // WinMine's 16-bit signed comparison treats the modern
                 // high-colour sentinel (-1) as monochrome.  Advertise the
                 // classic 16-colour Windows display that this personality
                 // emulates instead.
                 8 => 640, 10 => 480, 12 => 4, 14 => 1, 24 => 16,
                 _ => 0,
-            };
-            value
+            }
         }
         (Module::Gdi, 87) => {
             let index = stack_u16(machine, windows, regs, 4).unwrap_or(0);
@@ -1165,7 +1163,7 @@ fn dispatch<A: crate::Arch>(
                 2 => 0x0080_8080, 3 => 0x0040_4040, _ => 0 };
             let handle = windows.next_object;
             windows.next_object = windows.next_object.wrapping_add(1);
-            let object = if matches!(index, 6 | 7 | 8) {
+            let object = if matches!(index, 6..=8) {
                 super::GdiObject::Pen(color)
             } else { super::GdiObject::Brush(color) };
             windows.gdi_objects.push((handle, object));

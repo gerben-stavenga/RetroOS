@@ -959,7 +959,7 @@ fn begin_wndproc<A: crate::Arch>(
     machine.write::<u32>(sp as usize + 12, message.mp1);
     machine.write::<u32>(sp as usize + 16, message.mp2);
     state.callback = Some(Callback { dispatch_sp: regs.sp() as u32 });
-    regs.frame.rsp = sp as u64;
+    regs.frame.rsp = sp;
     regs.frame.rip = window.wndproc as u64;
     true
 }
@@ -1016,7 +1016,7 @@ fn decode_os2_bitmap(data: &[u8], handle: u32) -> Option<PmBitmap> {
     let palette_at = info.checked_add(header_size)?;
     let colors = 1usize << bit_count;
     data.get(palette_at..palette_at.checked_add(colors * palette_stride)?)?;
-    let row_bytes = ((width as usize * bit_count as usize + 31) / 32) * 4;
+    let row_bytes = (width as usize * bit_count as usize).div_ceil(32) * 4;
     data.get(bits..bits.checked_add(row_bytes * height as usize)?)?;
     let mut pixels = vec![0; width as usize * height as usize * 4];
     for y in 0..height as usize {
@@ -1267,7 +1267,7 @@ fn dispatch_api<A: crate::Arch>(
         }
         Api::WinGetPS => {
             let hwnd = arg32(machine, regs, 0);
-            state.pm_windows.iter().any(|window| window.hwnd == hwnd).then_some(hwnd).unwrap_or(0)
+            if state.pm_windows.iter().any(|window| window.hwnd == hwnd) { hwnd } else { 0 }
         }
         Api::WinReleasePS => 1,
         Api::WinFillRect => fill_pm_rect(machine, state, regs),

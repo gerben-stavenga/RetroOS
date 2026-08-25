@@ -814,6 +814,7 @@ pub fn window_size(
 /// Composite the panel into a completed packed shadow. `scale_y` is an
 /// integer because a Mode 13h output may consume several source rows per
 /// physical row; glyph rows are repeated, never fractionally resampled.
+#[allow(clippy::too_many_arguments)]
 pub fn paint(
     out: &mut [u8],
     stride: usize,
@@ -990,6 +991,7 @@ fn paint_tabs(
 }
 
 /// Paint the window picker: currently one primary window per active endpoint.
+#[allow(clippy::too_many_arguments)]
 fn paint_picker(
     out: &mut [u8],
     stride: usize,

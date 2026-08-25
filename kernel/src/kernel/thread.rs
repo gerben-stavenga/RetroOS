@@ -386,6 +386,7 @@ impl<A: crate::Arch> Personality<A> {
     }
 
     /// Render compositor-owned personality state into the event loop's output.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         machine: &mut A,

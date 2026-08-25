@@ -1109,7 +1109,7 @@ fn begin_wndproc<A: crate::Arch>(
     machine.write::<u32>(sp as usize + 12, message.wparam);
     machine.write::<u32>(sp as usize + 16, message.lparam);
     state.callback = Some(Callback { gate });
-    regs.frame.rsp = sp as u64;
+    regs.frame.rsp = sp;
     regs.frame.rip = window.wndproc as u64;
     true
 }
@@ -1127,7 +1127,7 @@ fn system_color(index: u32) -> u32 {
 }
 
 fn object_color(state: &WindowsState, handle: u32, default: u32) -> u32 {
-    if handle >= 0x30000 && handle < 0x30100 {
+    if (0x30000..0x30100).contains(&handle) {
         return system_color(handle - 0x30000);
     }
     match state
