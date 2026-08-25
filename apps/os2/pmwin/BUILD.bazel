@@ -1,0 +1,31 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "pmwin_obj",
+    srcs = ["pmwin.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "pmwin_dll",
+    obj = ":pmwin_obj",
+    out = "PMWIN.DLL",
+    module_name = "PMWIN",
+    exports = [
+        "WinInitialize",
+        "WinCreateMsgQueue",
+        "WinCreateWindow",
+        "WinShowWindow",
+        "WinGetPS",
+        "WinReleasePS",
+        "WinFillRect",
+        "WinPostQueueMsg",
+        "WinGetMsg",
+        "WinDispatchMsg",
+        "WinDestroyWindow",
+        "WinDestroyMsgQueue",
+        "WinTerminate",
+    ],
+    visibility = ["//visibility:public"],
+)

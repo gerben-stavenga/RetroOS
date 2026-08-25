@@ -954,6 +954,49 @@ fn launch_windows<A: crate::Arch>(
 /// moved together with execution by `switch_focus_and_run` for now). The
 /// loop's `display` is `Some` exactly while it is compositing Linux, OSD, or
 /// state-only DOS VGA; fullscreen DOS owns the output and leaves it `None`.
+fn present_desktop<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    threads: &[thread::Thread<A>],
+    display: &mut crate::kernel::display::Display,
+    windows: &mut crate::kernel::gui::WindowManager,
+) {
+    // Surface producers establish the presentation edge. OSD changes remain
+    // pending and join the next VGA/window publication; they never create an
+    // independent compositor clock.
+    if !windows.needs_present() {
+        return;
+    }
+    let extent = windows.desktop().extent();
+    let (canvas_width, canvas_height) = display.composition_size(
+        extent.width as usize,
+        extent.height as usize,
+    );
+    if display.is_host() {
+        display.shadow_width = canvas_width;
+    }
+    windows.sync_osd(
+        canvas_width,
+        canvas_height,
+        display.composition_scale_y(canvas_height),
+        display.rgb,
+    );
+    if !windows.needs_present() {
+        return;
+    }
+    let resolve = |endpoint: crate::kernel::gui::EndpointId,
+                   key: crate::kernel::gui::SurfaceKey| {
+        threads
+            .get(endpoint.0 as usize)?
+            .personality
+            .surface_buffer(key, display.rgb)
+    };
+    let shadow = windows
+        .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
+        .expect("compose process-owned surfaces");
+    display.present(machine, bios_workspace, canvas_height, shadow);
+}
+
 pub fn event_loop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1031,50 +1074,65 @@ pub fn event_loop<A: crate::Arch>(
         // which gates clock sampling, so it cannot itself be clock-gated.
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
-        let thread = ctx.thread(threads);
-        debug_assert_eq!(
-            display.is_some(),
-            thread.personality.uses_compositor(),
-            "event-loop display ownership disagrees with personality video state",
-        );
-        debug_assert!(
-            !windows.uses_desktop() || display.is_some(),
-            "desktop presentation lost the compositor display",
-        );
 
-        // Advance virtual devices, then feed sound before display publication:
-        // a synchronous framebuffer write can consume most of a millisecond.
-        thread.personality.advance_world(
-            machine,
-            &mut *bios_workspace,
-            &ctx.regs,
-            world_now_ns,
-            elapsed_ns,
-            audio_clock.produced_frames(),
-        );
-        if elapsed_ns != 0 {
-            crate::kernel::sound::advance(
-                machine,
-                &mut audio_clock,
-                sink.as_deref_mut(),
-                elapsed_ns,
-                |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
-            );
-        }
-        if elapsed_ns != 0
-            && let Some(display) = display.as_mut()
         {
-            let endpoint = crate::kernel::gui::EndpointId(thread.kernel.tid as u32);
-            thread.personality.render(
+            let thread = ctx.thread(threads);
+            debug_assert_eq!(
+                display.is_some(),
+                thread.personality.uses_compositor(),
+                "event-loop display ownership disagrees with personality video state",
+            );
+            debug_assert!(
+                !windows.uses_desktop() || display.is_some(),
+                "desktop presentation lost the compositor display",
+            );
+
+            // Audio precedes display publication: a synchronous framebuffer
+            // write may be slow, but cannot delay the samples due this tick.
+            thread.personality.advance_world(
                 machine,
                 &mut *bios_workspace,
                 &ctx.regs,
                 world_now_ns,
+                elapsed_ns,
+                audio_clock.produced_frames(),
+            );
+            if elapsed_ns != 0 {
+                crate::kernel::sound::advance(
+                    machine,
+                    &mut audio_clock,
+                    sink.as_deref_mut(),
+                    elapsed_ns,
+                    |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
+                );
+            }
+            if elapsed_ns != 0
+                && let Some(display) = display.as_mut()
+            {
+                let endpoint = crate::kernel::gui::EndpointId(thread.kernel.tid as u32);
+                thread.personality.render(
+                    machine,
+                    &mut *bios_workspace,
+                    &ctx.regs,
+                    world_now_ns,
+                    display,
+                    windows.desktop_mut(),
+                    endpoint,
+                );
+            }
+        }
+        if elapsed_ns != 0
+            && let Some(display) = display.as_mut()
+        {
+            present_desktop(
+                machine,
+                &mut *bios_workspace,
+                threads,
                 display,
-                windows.desktop_mut(),
-                endpoint,
+                &mut windows,
             );
         }
+        let thread = ctx.thread(threads);
         stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,

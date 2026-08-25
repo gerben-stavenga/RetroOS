@@ -115,6 +115,7 @@ pub fn take_repaint_request() -> bool {
 fn close() {
     PICKER.store(false, Ordering::Relaxed);
     OPEN.store(false, Ordering::Relaxed);
+    REPAINT.store(true, Ordering::Relaxed);
 }
 
 /// Close the monitor without interpreting another key. Used when the focused
@@ -785,6 +786,31 @@ fn paint_scales(
     (cw, sy)
 }
 
+fn panel_rows() -> usize {
+    if PICKER.load(Ordering::Relaxed) {
+        WINDOW_COUNT.load(Ordering::Relaxed).clamp(1, MAX_ROWS - 2) + 2
+    } else {
+        let tab = active_tab();
+        let count = active_item_count(tab);
+        let visible = if tab == TAB_DISK { count.min(DISK_VISIBLE) } else { count };
+        visible + usize::from(tab == TAB_DISK) + 3
+    }
+}
+
+/// Size of the opaque system window containing the monitor panel.
+pub fn window_size(
+    canvas_width: usize,
+    canvas_height: usize,
+    scale_y: usize,
+) -> Option<(usize, usize)> {
+    let rows = panel_rows();
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
+    let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
+    let width = COLS * cw + pad_x * 2;
+    let height = rows * CELL_H * sy + pad_y * 2;
+    (canvas_width >= width && canvas_height >= height).then_some((width, height))
+}
+
 /// Composite the panel into a completed packed shadow. `scale_y` is an
 /// integer because a Mode 13h output may consume several source rows per
 /// physical row; glyph rows are repeated, never fractionally resampled.
@@ -793,12 +819,13 @@ pub fn paint(
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    canvas_width: usize,
+    canvas_height: usize,
     scale_y: usize,
     fmt: PixelFormat,
 ) {
     if PICKER.load(Ordering::Relaxed) {
-        paint_picker(out, stride, w, h, logical_w, scale_y, fmt);
+        paint_picker(out, stride, w, h, canvas_width, canvas_height, scale_y, fmt);
         return;
     }
     let tab = active_tab();
@@ -813,16 +840,17 @@ pub fn paint(
     let subtab_rows = usize::from(tab == TAB_DISK);
     // Title + tab bar + (device sub-tabs) + items + footer.
     let rows = visible + subtab_rows + 3;
-    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     // Tight box: a two-glyph-pixel margin, just enough to keep strokes
     // off the panel edge (a glyph pixel is cw/8 wide, sy rows tall).
     let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
-    if logical_w < panel_w || h < panel_h {
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let logical_w = w;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
     vga::overlay_fill_xscaled(
@@ -967,7 +995,8 @@ fn paint_picker(
     stride: usize,
     w: usize,
     h: usize,
-    logical_w: usize,
+    canvas_width: usize,
+    canvas_height: usize,
     scale_y: usize,
     fmt: PixelFormat,
 ) {
@@ -975,14 +1004,15 @@ fn paint_picker(
     // Character budget: the list shares MAX_ROWS with title + footer.
     let visible = count.clamp(1, MAX_ROWS - 2);
     let rows = visible + 2;
-    let (cw, sy) = paint_scales(scale_y, logical_w, h, rows);
+    let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let panel_w = COLS * cw + pad_x * 2;
     let panel_h = rows * CELL_H * sy + pad_y * 2;
-    if logical_w < panel_w || h < panel_h {
+    if w < panel_w || h < panel_h {
         return;
     }
-    let x0 = (logical_w - panel_w) / 2;
+    let logical_w = w;
+    let x0 = (w - panel_w) / 2;
     let y0 = (h - panel_h) / 2;
 
     vga::overlay_fill_xscaled(

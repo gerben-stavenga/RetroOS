@@ -35,6 +35,9 @@ enum Api {
     DosQueryModuleHandle, DosQueryProcAddr, DosQuerySysInfo, DosSetRelMaxFH,
     DosFlatToSel, DosSelToFlat, DosOpenL, DosSetFileLocksL, DosSetFilePtrL,
     DosQueryDBCSEnv, KbdCharIn, VioGetConfig,
+    WinInitialize, WinCreateMsgQueue, WinCreateWindow, WinShowWindow,
+    WinGetPS, WinReleasePS, WinFillRect, WinPostQueueMsg, WinGetMsg,
+    WinDispatchMsg, WinDestroyWindow, WinDestroyMsgQueue, WinTerminate,
 }
 
 #[derive(Clone, Copy)]
@@ -43,6 +46,22 @@ struct Gate {
     return_ip: u32,
     api: Api,
     far16_args: u16,
+}
+
+#[derive(Clone, Copy)]
+struct PmMessage {
+    hwnd: u32,
+    message: u32,
+    mp1: u32,
+    mp2: u32,
+}
+
+struct PmWindow {
+    hwnd: u32,
+    width: u32,
+    height: u32,
+    visible: bool,
+    pixels: Vec<u8>,
 }
 
 /// OS/2-specific process state. The first implementation intentionally keeps
@@ -58,6 +77,10 @@ pub struct Os2State {
     pub cwd_len: usize,
     exec_path: [u8; 128],
     exec_path_len: usize,
+    next_pm_handle: u32,
+    pm_windows: Vec<PmWindow>,
+    pm_messages: Vec<PmMessage>,
+    pm_dirty: bool,
 }
 
 impl Os2State {
@@ -72,6 +95,10 @@ impl Os2State {
             cwd_len: 0,
             exec_path: [0; 128],
             exec_path_len: 0,
+            next_pm_handle: 0x10000,
+            pm_windows: Vec::new(),
+            pm_messages: Vec::new(),
+            pm_dirty: false,
         }
     }
 
@@ -96,6 +123,68 @@ impl Os2State {
             crate::kernel::kpipe::write(idx, &[c]);
         }
     }
+
+    pub fn repaint_osd(&mut self) {
+        self.pm_dirty = true;
+    }
+}
+
+/// Publish the foremost native Presentation Manager window into the shared
+/// desktop. PM owns its pixels; the compositor owns placement and visibility.
+pub fn render<A: crate::Arch>(
+    _machine: &mut A,
+    _bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    state: &mut Os2State,
+    _display: &mut crate::kernel::display::Display,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    const PM_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
+    const PM_PRESENTATION: crate::kernel::gui::PresentationKey =
+        crate::kernel::gui::PresentationKey(1);
+    let focus_changed = desktop.focus(endpoint);
+    let Some(index) = state.pm_windows.iter().rposition(|window| window.visible) else {
+        return;
+    };
+    let (width, height) = (
+        state.pm_windows[index].width as usize,
+        state.pm_windows[index].height as usize,
+    );
+    let surface = desktop.ensure_surface(endpoint, PM_SURFACE).expect("create PM surface");
+    let node = desktop
+        .ensure_node(
+            endpoint,
+            PM_PRESENTATION,
+            crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
+        )
+        .expect("create PM presentation node");
+    if !state.pm_dirty && !focus_changed {
+        return;
+    }
+    let placement = desktop.geometry(node).expect("live PM presentation node");
+    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+    transaction
+        .set_geometry(node, crate::kernel::gui::Rect::new(
+            placement.x, placement.y, width as u32, height as u32,
+        ))
+        .attach(node, Some(surface))
+        .set_visible(node, true);
+    desktop.commit(transaction).expect("commit PM presentation node");
+
+    state.pm_dirty = false;
+}
+
+pub fn surface_buffer<'a>(
+    state: &'a Os2State,
+) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+    let window = state.pm_windows.iter().rfind(|window| window.visible)?;
+    crate::kernel::gui::PixelBuffer::new(
+        window.width as usize,
+        window.height as usize,
+        window.width as usize * 4,
+        vga::PixelFormat::NATIVE,
+        &window.pixels,
+    ).ok()
 }
 
 impl Default for Os2State {
@@ -451,6 +540,19 @@ pub fn exec_lx_into<A: crate::Arch>(
         (b"NLS", b"DosQueryDBCSEnv", Api::DosQueryDBCSEnv, 0),
         (b"KBDCALLS", b"KbdCharIn", Api::KbdCharIn, 6),
         (b"VIOCALLS", b"VioGetConfig", Api::VioGetConfig, 6),
+        (b"PMWIN", b"WinInitialize", Api::WinInitialize, 0),
+        (b"PMWIN", b"WinCreateMsgQueue", Api::WinCreateMsgQueue, 0),
+        (b"PMWIN", b"WinCreateWindow", Api::WinCreateWindow, 0),
+        (b"PMWIN", b"WinShowWindow", Api::WinShowWindow, 0),
+        (b"PMWIN", b"WinGetPS", Api::WinGetPS, 0),
+        (b"PMWIN", b"WinReleasePS", Api::WinReleasePS, 0),
+        (b"PMWIN", b"WinFillRect", Api::WinFillRect, 0),
+        (b"PMWIN", b"WinPostQueueMsg", Api::WinPostQueueMsg, 0),
+        (b"PMWIN", b"WinGetMsg", Api::WinGetMsg, 0),
+        (b"PMWIN", b"WinDispatchMsg", Api::WinDispatchMsg, 0),
+        (b"PMWIN", b"WinDestroyWindow", Api::WinDestroyWindow, 0),
+        (b"PMWIN", b"WinDestroyMsgQueue", Api::WinDestroyMsgQueue, 0),
+        (b"PMWIN", b"WinTerminate", Api::WinTerminate, 0),
     ];
     for &(module_name, export_name, api, far16_args) in gate_specs {
         // A process only needs gates for DLLs in its own import closure. For
@@ -642,6 +744,38 @@ fn selector_base(state: &Os2State, selector: u16) -> Option<u32> {
     Some((((desc >> 16) & 0xffff) | (((desc >> 32) & 0xff) << 16) | (((desc >> 56) & 0xff) << 24)) as u32)
 }
 
+fn write_pm_message<A: crate::Arch>(machine: &mut A, address: usize, message: PmMessage) {
+    machine.write::<u32>(address, message.hwnd);
+    machine.write::<u32>(address + 4, message.message);
+    machine.write::<u32>(address + 8, message.mp1);
+    machine.write::<u32>(address + 12, message.mp2);
+    machine.write::<u32>(address + 16, machine.get_ticks() as u32);
+    machine.write::<u32>(address + 20, 0);
+    machine.write::<u32>(address + 24, 0);
+}
+
+fn fill_pm_rect<A: crate::Arch>(machine: &A, state: &mut Os2State, regs: &Regs) -> u32 {
+    let hps = arg32(machine, regs, 0);
+    let rect = arg32(machine, regs, 1) as usize;
+    let color = arg32(machine, regs, 2).to_le_bytes();
+    let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hps) else {
+        return 0;
+    };
+    let left = machine.read::<i32>(rect).clamp(0, window.width as i32);
+    let bottom = machine.read::<i32>(rect + 4).clamp(0, window.height as i32);
+    let right = machine.read::<i32>(rect + 8).clamp(left, window.width as i32);
+    let top = machine.read::<i32>(rect + 12).clamp(bottom, window.height as i32);
+    for pm_y in bottom..top {
+        let y = window.height as i32 - 1 - pm_y;
+        for x in left..right {
+            let at = (y as usize * window.width as usize + x as usize) * 4;
+            window.pixels[at..at + 4].copy_from_slice(&color);
+        }
+    }
+    state.pm_dirty = true;
+    1
+}
+
 fn dispatch_api<A: crate::Arch>(
     machine: &mut A, kt: &mut thread::KernelThread<A>, state: &mut Os2State,
     regs: &mut Regs, api: Api,
@@ -801,6 +935,67 @@ fn dispatch_api<A: crate::Arch>(
             }
             NO_ERROR
         }
+        Api::WinInitialize => 1,
+        Api::WinCreateMsgQueue => 2,
+        Api::WinCreateWindow => {
+            let width = arg32(machine, regs, 6).clamp(1, 2048);
+            let height = arg32(machine, regs, 7).clamp(1, 2048);
+            let hwnd = state.next_pm_handle;
+            state.next_pm_handle = state.next_pm_handle.wrapping_add(1);
+            state.pm_windows.push(PmWindow {
+                hwnd,
+                width,
+                height,
+                visible: arg32(machine, regs, 3) & 0x8000_0000 != 0,
+                pixels: vec![0; width as usize * height as usize * 4],
+            });
+            state.pm_dirty = true;
+            hwnd
+        }
+        Api::WinShowWindow => {
+            let hwnd = arg32(machine, regs, 0);
+            let Some(window) = state.pm_windows.iter_mut().find(|window| window.hwnd == hwnd) else {
+                return 0;
+            };
+            window.visible = arg32(machine, regs, 1) != 0;
+            state.pm_dirty = true;
+            1
+        }
+        Api::WinGetPS => {
+            let hwnd = arg32(machine, regs, 0);
+            state.pm_windows.iter().any(|window| window.hwnd == hwnd).then_some(hwnd).unwrap_or(0)
+        }
+        Api::WinReleasePS => 1,
+        Api::WinFillRect => fill_pm_rect(machine, state, regs),
+        Api::WinPostQueueMsg => {
+            state.pm_messages.push(PmMessage {
+                hwnd: 0,
+                message: arg32(machine, regs, 1),
+                mp1: arg32(machine, regs, 2),
+                mp2: arg32(machine, regs, 3),
+            });
+            1
+        }
+        Api::WinGetMsg => {
+            let out = arg32(machine, regs, 1) as usize;
+            let message = if state.pm_messages.is_empty() {
+                PmMessage { hwnd: 0, message: 0, mp1: 0, mp2: 0 }
+            } else {
+                state.pm_messages.remove(0)
+            };
+            write_pm_message(machine, out, message);
+            (message.message != 0x002a) as u32
+        }
+        Api::WinDispatchMsg => 0,
+        Api::WinDestroyWindow => {
+            let hwnd = arg32(machine, regs, 0);
+            if let Some(index) = state.pm_windows.iter().position(|window| window.hwnd == hwnd) {
+                state.pm_windows.swap_remove(index);
+                state.pm_dirty = true;
+                1
+            } else { 0 }
+        }
+        Api::WinDestroyMsgQueue | Api::WinTerminate => 1,
         Api::DosExit => unreachable!(),
     }
 }

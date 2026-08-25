@@ -1,0 +1,23 @@
+load("//toolchain:os2_watcom.bzl", "os2_c_binary")
+
+os2_c_binary(
+    name = "pm_smoke",
+    src = "pm_smoke.c",
+    imports = {
+        "DosExit": "DOSCALLS.DosExit",
+        "WinCreateMsgQueue": "PMWIN.WinCreateMsgQueue",
+        "WinCreateWindow": "PMWIN.WinCreateWindow",
+        "WinDestroyMsgQueue": "PMWIN.WinDestroyMsgQueue",
+        "WinDestroyWindow": "PMWIN.WinDestroyWindow",
+        "WinDispatchMsg": "PMWIN.WinDispatchMsg",
+        "WinFillRect": "PMWIN.WinFillRect",
+        "WinGetMsg": "PMWIN.WinGetMsg",
+        "WinGetPS": "PMWIN.WinGetPS",
+        "WinInitialize": "PMWIN.WinInitialize",
+        "WinPostQueueMsg": "PMWIN.WinPostQueueMsg",
+        "WinReleasePS": "PMWIN.WinReleasePS",
+        "WinShowWindow": "PMWIN.WinShowWindow",
+        "WinTerminate": "PMWIN.WinTerminate",
+    },
+    visibility = ["//visibility:public"],
+)

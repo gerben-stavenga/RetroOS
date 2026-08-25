@@ -103,49 +103,6 @@ pub struct Content<'a> {
     pub buffer: PixelBuffer<'a>,
 }
 
-/// A completed producer buffer whose ownership can be transferred to the
-/// desktop. A commit replaces width, height, stride, format, and pixels as one
-/// unit; the prior buffer is returned to the producer for reuse.
-#[derive(Debug)]
-pub struct SurfaceBuffer {
-    pub width: usize,
-    pub height: usize,
-    pub stride: usize,
-    pub format: vga::PixelFormat,
-    pixels: Vec<u8>,
-}
-
-impl SurfaceBuffer {
-    pub fn new(
-        width: usize,
-        height: usize,
-        stride: usize,
-        format: vga::PixelFormat,
-        pixels: Vec<u8>,
-    ) -> Result<Self, BufferError> {
-        PixelBuffer::new(width, height, stride, format, &pixels)?;
-        Ok(Self { width, height, stride, format, pixels })
-    }
-
-    pub fn pixels(&self) -> &[u8] {
-        &self.pixels
-    }
-
-    pub fn into_pixels(self) -> Vec<u8> {
-        self.pixels
-    }
-
-    fn borrowed(&self) -> PixelBuffer<'_> {
-        PixelBuffer {
-            width: self.width,
-            height: self.height,
-            stride: self.stride,
-            format: self.format,
-            pixels: &self.pixels,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ComposeError {
     InvalidOutputFormat,
@@ -285,7 +242,6 @@ struct Surface {
     owner: EndpointId,
     key: SurfaceKey,
     id: SurfaceId,
-    buffer: Option<SurfaceBuffer>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -308,6 +264,7 @@ pub struct Desktop {
     bindings: Vec<Binding>,
     surfaces: Vec<Surface>,
     next_surface: u64,
+    revision: u64,
 }
 
 impl Desktop {
@@ -320,6 +277,7 @@ impl Desktop {
         self.keyboard_focus = Some(endpoint);
         if changed {
             self.scene.raise_endpoint(endpoint);
+            self.revision = self.revision.wrapping_add(1);
         }
         changed
     }
@@ -332,6 +290,9 @@ impl Desktop {
     pub fn set_pointer(&mut self, point: Point) -> bool {
         let changed = self.pointer != Some(point);
         self.pointer = Some(point);
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
         changed
     }
 
@@ -351,6 +312,7 @@ impl Desktop {
             return Ok(binding.node);
         }
         let node = self.scene.create(endpoint, None, geometry)?;
+        self.revision = self.revision.wrapping_add(1);
         self.bindings.push(Binding {
             endpoint,
             key,
@@ -396,31 +358,25 @@ impl Desktop {
         let raw = self.next_surface.checked_add(1).ok_or(SurfaceError::Exhausted)?;
         self.next_surface = raw;
         let id = SurfaceId(raw);
-        self.surfaces.push(Surface { owner: endpoint, key, id, buffer: None });
+        self.surfaces.push(Surface { owner: endpoint, key, id });
+        self.revision = self.revision.wrapping_add(1);
         Ok(id)
     }
 
-    /// Atomically replace a surface's complete front buffer and return the old
-    /// one. The producer can render the next frame into that returned storage.
-    pub fn commit_surface(
-        &mut self,
-        endpoint: EndpointId,
-        id: SurfaceId,
-        buffer: SurfaceBuffer,
-    ) -> Result<Option<SurfaceBuffer>, SurfaceError> {
-        let surface = self
-            .surfaces
-            .iter_mut()
-            .find(|surface| surface.id == id)
-            .ok_or(SurfaceError::Unknown(id))?;
-        if surface.owner != endpoint {
-            return Err(SurfaceError::NotOwner(id));
-        }
-        Ok(surface.buffer.replace(buffer))
+    pub fn surface_id(&self, endpoint: EndpointId, key: SurfaceKey) -> Option<SurfaceId> {
+        self.surfaces
+            .iter()
+            .find(|surface| surface.owner == endpoint && surface.key == key)
+            .map(|surface| surface.id)
+    }
+
+    pub fn surface_endpoints(&self) -> impl Iterator<Item = EndpointId> + '_ {
+        self.surfaces.iter().map(|surface| surface.owner)
     }
 
     pub fn commit(&mut self, transaction: Transaction) -> Result<(), SceneError> {
         self.scene.commit(transaction)?;
+        self.revision = self.revision.wrapping_add(1);
         self.bindings
             .retain(|binding| self.scene.node(binding.node).is_some());
         Ok(())
@@ -437,24 +393,53 @@ impl Desktop {
         self.scene.compose(contents, width, height, format, output)
     }
 
-    /// Composite the latest complete buffer retained by every surface.
-    pub fn compose_retained(
+    /// Composite immutable views of process-owned surfaces.
+    pub fn compose_surfaces(
         &self,
+        contents: &[Content<'_>],
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+        output: &mut Vec<u8>,
+    ) -> Result<usize, ComposeError> {
+        self.compose_surfaces_with(contents, None, width, height, format, output)
+    }
+
+    fn compose_surfaces_with(
+        &self,
+        contents: &[Content<'_>],
+        system: Option<Content<'_>>,
         width: usize,
         height: usize,
         format: vga::PixelFormat,
         output: &mut Vec<u8>,
     ) -> Result<usize, ComposeError> {
         let resolve = |id| {
-            self.surfaces
-                .iter()
-                .find(|surface| surface.id == id)
-                .and_then(|surface| surface.buffer.as_ref())
-                .map(SurfaceBuffer::borrowed)
+            if let Some(content) = system.filter(|content| content.id == id) {
+                return Some(content.buffer);
+            }
+            if let Some(content) = contents.iter().find(|content| content.id == id) {
+                return Some(content.buffer);
+            }
+            None
         };
+        self.compose_resolved(&resolve, width, height, format, output)
+    }
+
+    fn compose_resolved<'a, F>(
+        &self,
+        resolve: &F,
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+        output: &mut Vec<u8>,
+    ) -> Result<usize, ComposeError>
+    where
+        F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
+    {
         let pixels = self.scene.compose_endpoint_with(
             None,
-            &resolve,
+            resolve,
             width,
             height,
             format,
@@ -509,13 +494,18 @@ fn draw_pointer(
 
 /// Event-loop-owned window policy and retained graphical state.
 ///
-/// `Desktop` remains the personality-neutral scene/buffer mechanism. This
+/// `Desktop` remains the personality-neutral scene and surface registry. This
 /// layer names the persistent windows, owns keyboard focus, and decides
 /// whether the output is presenting the desktop or granting one window the
 /// fullscreen direct-scanout fast path.
 #[derive(Debug)]
 pub struct WindowManager {
     desktop: Desktop,
+    composed: Vec<u8>,
+    osd_pixels: Vec<u8>,
+    osd_rect: Option<Rect>,
+    osd_geometry: Option<(usize, usize, vga::PixelFormat)>,
+    presented_revision: u64,
     focused: Option<WindowId>,
     presentation: Presentation,
     modes: Vec<(WindowId, WindowMode)>,
@@ -531,7 +521,17 @@ impl WindowManager {
         if let Presentation::Fullscreen(window) = initial {
             modes.push((window, WindowMode::Fullscreen));
         }
-        Self { desktop: Desktop::new(), focused, presentation: initial, modes }
+        Self {
+            desktop: Desktop::new(),
+            composed: Vec::new(),
+            osd_pixels: Vec::new(),
+            osd_rect: None,
+            osd_geometry: None,
+            presented_revision: 0,
+            focused,
+            presentation: initial,
+            modes,
+        }
     }
 
     /// The primary-window mapping used until personalities expose more than
@@ -550,6 +550,148 @@ impl WindowManager {
 
     pub fn desktop_mut(&mut self) -> &mut Desktop {
         &mut self.desktop
+    }
+
+    pub fn compose<'a>(
+        &'a mut self,
+        contents: &[Content<'_>],
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+    ) -> Result<&'a mut Vec<u8>, ComposeError> {
+        const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
+        const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
+        let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
+        let system = if crate::kernel::osd::is_open()
+            && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
+            && let Some(rect) = osd_rect
+            && let Ok(buffer) = PixelBuffer::new(
+                rect.width as usize,
+                rect.height as usize,
+                rect.width as usize * format.bytes_per_pixel as usize,
+                format,
+                osd_pixels,
+            )
+        {
+            Some(Content { id, buffer })
+        } else {
+            None
+        };
+        desktop.compose_surfaces_with(contents, system, width, height, format, composed)?;
+        *presented_revision = desktop.revision;
+        Ok(composed)
+    }
+
+    pub fn compose_processes<'a, F>(
+        &'a mut self,
+        resolve_process: F,
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+    ) -> Result<&'a mut Vec<u8>, ComposeError>
+    where
+        F: Fn(EndpointId, SurfaceKey) -> Option<PixelBuffer<'a>>,
+    {
+        const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
+        const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
+        let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
+        let osd = if crate::kernel::osd::is_open()
+            && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
+            && let Some(rect) = osd_rect
+            && let Ok(buffer) = PixelBuffer::new(
+                rect.width as usize,
+                rect.height as usize,
+                rect.width as usize * format.bytes_per_pixel as usize,
+                format,
+                osd_pixels,
+            )
+        {
+            Some(Content { id, buffer })
+        } else {
+            None
+        };
+        let resolve = |id| {
+            if let Some(content) = osd.filter(|content| content.id == id) {
+                return Some(content.buffer);
+            }
+            let surface = desktop.surfaces.iter().find(|surface| surface.id == id)?;
+            resolve_process(surface.owner, surface.key)
+        };
+        desktop.compose_resolved(&resolve, width, height, format, composed)?;
+        *presented_revision = desktop.revision;
+        Ok(composed)
+    }
+
+    pub fn needs_present(&self) -> bool {
+        self.presented_revision != self.desktop.revision
+    }
+
+    pub fn sync_osd(
+        &mut self,
+        width: usize,
+        height: usize,
+        scale_y: usize,
+        format: vga::PixelFormat,
+    ) {
+        const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
+        const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
+        const OSD_PRESENTATION: PresentationKey = PresentationKey(u64::MAX);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let geometry = (width, height, format);
+        let repaint = crate::kernel::osd::take_repaint_request();
+        let open = crate::kernel::osd::is_open();
+        let frontmost = self.desktop.bindings
+            .iter()
+            .find(|binding| {
+                binding.endpoint == OSD_ENDPOINT && binding.key == OSD_PRESENTATION
+            })
+            .is_some_and(|binding| self.desktop.scene.roots.last() == Some(&binding.node));
+        let redraw = repaint || self.osd_geometry != Some(geometry);
+        if !redraw && (!open || frontmost) {
+            return;
+        }
+        self.osd_geometry = Some(geometry);
+        let step = format.bytes_per_pixel as usize;
+        if redraw && open {
+            self.osd_pixels.clear();
+            self.osd_rect = crate::kernel::osd::window_size(width, height, scale_y)
+                .map(|(panel_width, panel_height)| {
+                    self.osd_pixels.resize(panel_width * panel_height * step, 0);
+                    crate::kernel::osd::paint(
+                        &mut self.osd_pixels,
+                        panel_width * step,
+                        panel_width,
+                        panel_height,
+                        width,
+                        height,
+                        scale_y,
+                        format,
+                    );
+                    Rect::new(
+                        ((width - panel_width) / 2) as i32,
+                        ((height - panel_height) / 2) as i32,
+                        panel_width as u32,
+                        panel_height as u32,
+                    )
+                });
+        }
+        let rect = self.osd_rect.unwrap_or(Rect::new(0, 0, 1, 1));
+        let surface = self.desktop.ensure_surface(OSD_ENDPOINT, OSD_SURFACE)
+            .expect("create OSD surface");
+        let node = self.desktop.ensure_node(
+            OSD_ENDPOINT,
+            OSD_PRESENTATION,
+            rect,
+        ).expect("create OSD presentation node");
+        let mut transaction = Transaction::new(OSD_ENDPOINT);
+        transaction
+            .set_geometry(node, rect)
+            .attach(node, Some(surface))
+            .set_visible(node, open && self.osd_rect.is_some())
+            .raise(node);
+        self.desktop.commit(transaction).expect("commit OSD window");
     }
 
     pub fn presentation(&self) -> Presentation {
@@ -1510,35 +1652,27 @@ mod tests {
             .set_visible(os2, true);
         desktop.commit(os2_tx).unwrap();
 
-        let red = SurfaceBuffer::new(
-            1,
-            1,
-            4,
-            vga::PixelFormat::NATIVE,
-            0x00ff_0000u32.to_le_bytes().to_vec(),
-        )
-        .unwrap();
-        let blue = SurfaceBuffer::new(
-            1,
-            1,
-            4,
-            vga::PixelFormat::NATIVE,
-            0x0000_00ffu32.to_le_bytes().to_vec(),
-        )
-        .unwrap();
-        desktop.commit_surface(WINDOWS, windows_surface, red).unwrap();
-        desktop.commit_surface(OS2, os2_surface, blue).unwrap();
+        let red = 0x00ff_0000u32.to_le_bytes();
+        let blue = 0x0000_00ffu32.to_le_bytes();
+        let contents = [
+            Content { id: windows_surface, buffer: PixelBuffer::new(
+                1, 1, 4, vga::PixelFormat::NATIVE, &red,
+            ).unwrap() },
+            Content { id: os2_surface, buffer: PixelBuffer::new(
+                1, 1, 4, vga::PixelFormat::NATIVE, &blue,
+            ).unwrap() },
+        ];
         let mut output = vec![];
 
         desktop
-            .compose_retained(1, 1, vga::PixelFormat::NATIVE, &mut output)
+            .compose_surfaces(&contents, 1, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
         assert_eq!(native_pixels(&output), vec![0x0000_00ff]);
         assert_eq!(desktop.hit_test(Point::default()).unwrap().endpoint, OS2);
 
         assert!(desktop.focus(WINDOWS));
         desktop
-            .compose_retained(1, 1, vga::PixelFormat::NATIVE, &mut output)
+            .compose_surfaces(&contents, 1, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
         assert_eq!(native_pixels(&output), vec![0x00ff_0000]);
         assert_eq!(desktop.focused(), Some(WINDOWS));
@@ -1546,7 +1680,7 @@ mod tests {
 
         assert!(desktop.focus(OS2));
         desktop
-            .compose_retained(1, 1, vga::PixelFormat::NATIVE, &mut output)
+            .compose_surfaces(&contents, 1, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
         assert_eq!(native_pixels(&output), vec![0x0000_00ff]);
         assert_eq!(desktop.focused(), Some(OS2));
@@ -1561,7 +1695,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_identity_survives_atomic_buffer_size_changes() {
+    fn surface_identity_is_independent_of_process_owned_buffer_size() {
         let mut desktop = Desktop::new();
         let surface = desktop.ensure_surface(WINDOWS, SurfaceKey(7)).unwrap();
         assert_eq!(
@@ -1578,33 +1712,20 @@ mod tests {
         desktop.commit(transaction).unwrap();
         desktop.focus(WINDOWS);
 
-        let red = 0x00ff_0000u32.to_le_bytes().to_vec();
-        let first = SurfaceBuffer::new(1, 1, 4, vga::PixelFormat::NATIVE, red).unwrap();
-        assert!(desktop.commit_surface(WINDOWS, surface, first).unwrap().is_none());
-
         let pixels = [0x0000_00ffu32.to_le_bytes(), 0x0000_ff00u32.to_le_bytes()].concat();
-        let second = SurfaceBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, pixels).unwrap();
-        let recycled = desktop
-            .commit_surface(WINDOWS, surface, second)
-            .unwrap()
-            .unwrap();
-        assert_eq!((recycled.width, recycled.height), (1, 1));
+        let contents = [Content { id: surface, buffer: PixelBuffer::new(
+            2, 1, 8, vga::PixelFormat::NATIVE, &pixels,
+        ).unwrap() }];
 
         let mut output = vec![];
         desktop
-            .compose_retained(2, 1, vga::PixelFormat::NATIVE, &mut output)
+            .compose_surfaces(&contents, 2, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
         let values: Vec<u32> = output
             .chunks_exact(4)
             .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![0x0000_00ff, 0x0000_ff00]);
-        assert_eq!(
-            desktop
-                .commit_surface(OS2, surface, recycled)
-                .unwrap_err(),
-            SurfaceError::NotOwner(surface)
-        );
     }
 
     #[test]
@@ -1634,7 +1755,7 @@ mod tests {
         desktop.set_pointer(Point { x: 1, y: 1 });
         let mut output = vec![];
         desktop
-            .compose_retained(16, 20, vga::PixelFormat::NATIVE, &mut output)
+            .compose_surfaces(&[], 16, 20, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
         let pixel = |x: usize, y: usize| {
             let at = (y * 16 + x) * 4;

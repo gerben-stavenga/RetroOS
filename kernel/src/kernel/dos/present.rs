@@ -1,13 +1,13 @@
 //! Putting the machine's picture on the machine's display.
 //!
-//! The emulated VGA, the Voodoo and the OSD all produce pixels; `platform` says
+//! The emulated VGA and Voodoo produce process-owned pixels; `platform` says
 //! what this machine can actually show them on. This is where those meet: when
-//! a frame is due, scan the current owner's VGA out into a frame, composite
-//! the overlay, and present it through whatever sink the probe handed over.
+//! a frame is due, scan the current owner's video into its retained surface.
+//! The event-loop compositor combines that surface with other windows.
 //!
 //! Kernel work, not machine work, which is why it is here and not beside the
 //! cards. Everything it names on the display side — `Display`,
-//! `Sink`, `Scratch`, the OSD — is a capability or a
+//! `Sink` and `Scratch` — is a capability or a
 //! sink the kernel owns; the machine below produces a picture and has no
 //! opinion about where it goes.
 
@@ -418,23 +418,12 @@ fn voodoo_display_tick<A: crate::Arch>(
 /// Publish one completed emulated-VGA frame. State-only DOS enters the shared
 /// desktop as an opaque content node; fullscreen DOS keeps its direct display
 /// path because it deliberately owns the whole adapter.
-fn publish_vga_frame<A: crate::Arch>(
-    machine: &mut A,
-    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::display::Display,
+fn attach_vga_surface(
     width: usize,
     height: usize,
-    mut pixels: alloc::vec::Vec<u8>,
-    scene_output: &mut alloc::vec::Vec<u8>,
-    presentation: Option<(
-        &mut crate::kernel::gui::Desktop,
-        crate::kernel::gui::EndpointId,
-    )>,
-) -> (usize, alloc::vec::Vec<u8>) {
-    let Some((desktop, endpoint)) = presentation else {
-        let copied = display.present(machine, bios, height, &mut pixels);
-        return (copied, pixels);
-    };
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
     const DOS_SCANOUT: crate::kernel::gui::PresentationKey =
         crate::kernel::gui::PresentationKey(2);
     const DOS_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(2);
@@ -467,35 +456,6 @@ fn publish_vga_frame<A: crate::Arch>(
         .commit(transaction)
         .expect("commit DOS VGA presentation node");
 
-    let step = display.rgb.bytes_per_pixel as usize;
-    let buffer = crate::kernel::gui::SurfaceBuffer::new(
-        width,
-        height,
-        width * step,
-        display.rgb,
-        pixels,
-    )
-    .expect("valid DOS VGA content buffer");
-    let recycled = desktop
-        .commit_surface(endpoint, surface_id, buffer)
-        .expect("commit DOS VGA surface")
-        .map(crate::kernel::gui::SurfaceBuffer::into_pixels)
-        .unwrap_or_default();
-    let extent = desktop.extent();
-    let (canvas_width, canvas_height) = display.composition_size(
-        extent.width as usize,
-        extent.height as usize,
-    );
-    if display.is_host() {
-        display.shadow_width = canvas_width;
-    }
-    desktop
-        .compose_retained(canvas_width, canvas_height, display.rgb, scene_output)
-        .expect("compose DOS VGA scene");
-    (
-        display.present(machine, bios, canvas_height, scene_output),
-        recycled,
-    )
 }
 
 pub fn display_tick<A: crate::Arch>(
@@ -619,21 +579,15 @@ pub fn display_tick<A: crate::Arch>(
             } => {
                 let p0 = if prof { machine.rdtsc() } else { 0 };
                 debug_assert!(presentation.is_some() || display.shadow_width == out_w);
-                let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-                let (copied, recycled) = publish_vga_frame(
-                    machine,
-                    &mut *bios,
-                    display,
-                    out_w,
-                    vga_h,
-                    pixels,
-                    &mut pc.present_scene,
-                    presentation,
-                );
-                crate::kernel::display::recycle_shadow(
-                    &mut pc.present_scratch2,
-                    recycled,
-                );
+                let copied = if let Some((desktop, endpoint)) = presentation {
+                    attach_vga_surface(out_w, vga_h, desktop, endpoint);
+                    0
+                } else {
+                    let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+                    let copied = display.present(machine, &mut *bios, vga_h, &mut pixels);
+                    crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
+                    copied
+                };
                 let present_cycles = if prof {
                     machine.rdtsc().wrapping_sub(p0)
                 } else {
@@ -671,18 +625,13 @@ pub fn display_tick<A: crate::Arch>(
     if !rendered { return }
     let p2 = if prof { machine.rdtsc() } else { 0 };
     display.shadow_width = w;
-    let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-    let (_, recycled) = publish_vga_frame(
-        machine,
-        bios,
-        display,
-        w,
-        h,
-        pixels,
-        &mut pc.present_scene,
-        presentation,
-    );
-    crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, recycled);
+    if let Some((desktop, endpoint)) = presentation {
+        attach_vga_surface(w, h, desktop, endpoint);
+    } else {
+        let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+        display.present(machine, bios, h, &mut pixels);
+        crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
+    }
     if prof {
         let p3 = machine.rdtsc();
         crate::kernel::startup::bill_display(

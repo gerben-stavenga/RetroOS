@@ -34,3 +34,8 @@ bazelisk build //test/os2/hello:hello_lx
 Both programs link the normal runtime and therefore use the real Watcom entry
 point and OS/2 calling convention. `watcom_io` additionally exercises memory
 services and OS/2 file handles.
+
+`pm_smoke/pm_smoke.c` is the first native Presentation Manager acceptance
+program. It creates a PM window, paints through `WinFillRect`, and remains in
+its PM message loop. Run `C:\OS2\APPS\PMSMOKE.EXE`; use the F12 monitor to
+switch away from or terminate it.

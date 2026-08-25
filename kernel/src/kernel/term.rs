@@ -25,7 +25,7 @@ static mut PALETTE: [u8; 768] = [0; 768];
 struct Scanout {
     pal: vga::Pal,
     pal_cache: [u8; 768],
-    /// Producer back buffer; a surface commit swaps it with the desktop front.
+    /// Process-independent terminal pixels borrowed by the event-loop compositor.
     content: alloc::vec::Vec<u8>,
     /// Output-format shadow produced by the GUI scene compositor.
     surface: alloc::vec::Vec<u8>,
@@ -232,21 +232,21 @@ fn render_frame(
         .commit(transaction)
         .expect("commit terminal presentation node");
 
-    let submitted = core::mem::take(content);
-    let buffer = crate::kernel::gui::SurfaceBuffer::new(
+    // In the event loop the terminal retains this producer buffer and the
+    // compositor borrows it after the mutable render pass has ended.
+    if managed {
+        return None;
+    }
+
+    let buffer = crate::kernel::gui::PixelBuffer::new(
         w,
         h,
         content_row_bytes,
         content_format,
-        submitted,
+        content,
     )
     .expect("valid terminal content buffer");
-    let recycled = desktop
-        .commit_surface(endpoint, surface_id, buffer)
-        .expect("commit terminal surface");
-    *content = recycled
-        .map(crate::kernel::gui::SurfaceBuffer::into_pixels)
-        .unwrap_or_default();
+    let contents = [crate::kernel::gui::Content { id: surface_id, buffer }];
     let extent = desktop.extent();
     let (canvas_width, canvas_height) = display.composition_size(
         extent.width as usize,
@@ -256,7 +256,19 @@ fn render_frame(
         display.shadow_width = canvas_width;
     }
     desktop
-        .compose_retained(canvas_width, canvas_height, display.rgb, surface)
+        .compose_surfaces(&contents, canvas_width, canvas_height, display.rgb, surface)
         .expect("compose terminal scene");
     Some((canvas_height, surface))
+}
+
+pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {
+    let scanout = &raw const SCANOUT;
+    let pixels = unsafe { &(*scanout).content };
+    crate::kernel::gui::PixelBuffer::new(
+        720,
+        400,
+        720 * 4,
+        vga::PixelFormat::NATIVE,
+        pixels,
+    ).ok()
 }

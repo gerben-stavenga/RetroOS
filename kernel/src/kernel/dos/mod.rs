@@ -1345,6 +1345,20 @@ pub fn render<A: crate::Arch>(
     );
 }
 
+pub fn surface_buffer<'a, A: crate::Arch>(
+    dos: &'a thread::DosState<A>,
+    format: vga::PixelFormat,
+) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+    let (width, height, pixels) = dos.pc.present_scratch2.surface(format)?;
+    crate::kernel::gui::PixelBuffer::new(
+        width,
+        height,
+        width * format.bytes_per_pixel as usize,
+        format,
+        pixels,
+    ).ok()
+}
+
 /// Advance emulated audio playback and its guest-visible device events.
 pub fn audio_tick<A: crate::Arch>(
     machine: &mut A,

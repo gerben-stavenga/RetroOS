@@ -210,7 +210,6 @@ pub struct WindowsState {
     paint_dc: u32,
     dirty: bool,
     cursor_dirty: bool,
-    composed: Vec<u8>,
     paint_hwnd: u32,
     gdi_objects: Vec<(u32, GdiObject)>,
     dcs: Vec<DeviceContext>,
@@ -246,7 +245,6 @@ impl WindowsState {
             paint_dc: 0x20000,
             dirty: true,
             cursor_dirty: true,
-            composed: Vec::new(),
             paint_hwnd: 0,
             gdi_objects: Vec::new(),
             dcs: Vec::new(),
@@ -344,10 +342,10 @@ impl WindowsState {
 
 /// Publish the foremost native Win32 top-level window into the shared desktop.
 pub fn render<A: crate::Arch>(
-    machine: &mut A,
-    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    _machine: &mut A,
+    _bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     state: &mut WindowsState,
-    display: &mut crate::kernel::display::Display,
+    _display: &mut crate::kernel::display::Display,
     desktop: &mut crate::kernel::gui::Desktop,
     endpoint: crate::kernel::gui::EndpointId,
 ) {
@@ -379,6 +377,9 @@ pub fn render<A: crate::Arch>(
         x: placement.x + state.mouse_x,
         y: placement.y + state.mouse_y,
     });
+    if !state.dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
+        return;
+    }
     let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
     transaction
         .set_geometry(
@@ -391,46 +392,21 @@ pub fn render<A: crate::Arch>(
         .commit(transaction)
         .expect("commit Win32 presentation node");
 
-    if state.dirty {
-        state.dirty = false;
-        let need = width * height * 4;
-        if state.windows[index].pixels.len() != need {
-            state.windows[index].pixels.resize(need, 0xc0);
-        }
-        let pixels = core::mem::take(&mut state.windows[index].pixels);
-        let buffer = crate::kernel::gui::SurfaceBuffer::new(
-            width,
-            height,
-            width * 4,
-            vga::PixelFormat::NATIVE,
-            pixels,
-        )
-        .expect("valid Win32 content buffer");
-        state.windows[index].pixels = desktop
-            .commit_surface(endpoint, surface, buffer)
-            .expect("commit Win32 surface")
-            .map(crate::kernel::gui::SurfaceBuffer::into_pixels)
-            .unwrap_or_default();
-    } else if !focus_changed && !pointer_changed && !state.cursor_dirty {
-        return;
-    }
+    state.dirty = false;
     state.cursor_dirty = false;
+}
 
-    let extent = desktop.extent();
-    let (canvas_width, canvas_height) =
-        display.composition_size(extent.width as usize, extent.height as usize);
-    if display.is_host() {
-        display.shadow_width = canvas_width;
-    }
-    desktop
-        .compose_retained(
-            canvas_width,
-            canvas_height,
-            display.rgb,
-            &mut state.composed,
-        )
-        .expect("compose Win32 scene");
-    display.present(machine, bios, canvas_height, &mut state.composed);
+pub fn surface_buffer<'a>(
+    state: &'a WindowsState,
+) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+    let window = state.windows.iter().rfind(|window| window.visible)?;
+    crate::kernel::gui::PixelBuffer::new(
+        window.width as usize,
+        window.height as usize,
+        window.width as usize * 4,
+        vga::PixelFormat::NATIVE,
+        &window.pixels,
+    ).ok()
 }
 
 fn descriptor(base: u32, limit: u32) -> u64 {

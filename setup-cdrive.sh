@@ -36,13 +36,17 @@ bazelisk build \
     //apps/os2/kbdcalls:kbdcalls_dll \
     //apps/os2/viocalls:viocalls_dll \
     //apps/os2/nls:nls_dll \
+    //apps/os2/pmwin:pmwin_dll \
     //test/os2/hello:hello_lx \
+    //test/os2/pm_smoke:pm_smoke \
     //test/os2/watcom_io:watcom_io
 cp -f "$REPO/bazel-bin/apps/os2/doscalls/DOSCALLS.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/apps/os2/kbdcalls/KBDCALLS.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/apps/os2/viocalls/VIOCALLS.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/apps/os2/nls/NLS.DLL" "$C/OS2/DLL/"
+cp -f "$REPO/bazel-bin/apps/os2/pmwin/PMWIN.DLL" "$C/OS2/DLL/"
 cp -f "$REPO/bazel-bin/test/os2/hello/hello_lx.exe" "$C/OS2/APPS/HELLO.EXE"
+cp -f "$REPO/bazel-bin/test/os2/pm_smoke/pm_smoke.exe" "$C/OS2/APPS/PMSMOKE.EXE"
 cp -f "$REPO/bazel-bin/test/os2/watcom_io/watcom_io.exe" "$C/OS2/APPS/WATCIO.EXE"
 
 # Native Win32 replacement DLLs and console acceptance programs.

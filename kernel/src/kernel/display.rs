@@ -392,14 +392,14 @@ impl Display {
             self.voodoo_ramp_generation = None;
         }
     }
-    /// The vertical stretch the present step applies AFTER the OSD is
-    /// painted. The shadow is wide-and-short: `render_shadow` stretches
+    /// The vertical stretch the present step applies after the compositor has
+    /// painted the OSD window. The shadow is wide-and-short: `render_shadow` stretches
     /// each mode row HORIZONTALLY to the output width, but keeps the
     /// mode's row count — a 320x200 game on a 480-line output is a
     /// 640x200 shadow whose rows the sink expands x2.4 afterward. The
     /// OSD must divide its cell height by this factor or its glyphs
     /// come out tall-and-narrow on every scaled-up low mode.
-    fn osd_stretch_y(&self, shadow_height: usize) -> usize {
+    pub fn composition_scale_y(&self, shadow_height: usize) -> usize {
         let (_, out_h) = self.fit();
         (out_h / shadow_height.max(1)).max(1)
     }
@@ -464,9 +464,7 @@ impl Display {
         }
     }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
-    /// Composite the system OSD into one completed packed shadow and publish
-    /// it. This is the personality-independent frame boundary: DOS VGA,
-    /// Voodoo, the kernel terminal, and future personalities all finish here.
+    /// Publish one completed packed compositor shadow.
     pub fn present<A: crate::Arch>(
         &mut self,
         machine: &mut A,
@@ -479,17 +477,6 @@ impl Display {
         let stride = self.shadow_width * format.bytes_per_pixel as usize;
         if height == 0 || shadow.len() < stride * height {
             return 0;
-        }
-        if crate::kernel::osd::is_open() {
-            crate::kernel::osd::paint(
-                shadow,
-                stride,
-                self.shadow_width,
-                height,
-                self.shadow_width,
-                self.osd_stretch_y(height),
-                format,
-            );
         }
         if matches!(self.backend, Backend::Linear(_)) {
             return self.present_linear(height, shadow).unwrap_or(0);
@@ -773,6 +760,17 @@ impl Scratch {
             core::ptr::addr_of_mut!((*p).last_tick).write(0);
             boxed.assume_init()
         }
+    }
+
+    /// Immutable view of the completed compact source image retained by its
+    /// producer. Slack used by the fused row rasterizer is excluded.
+    pub fn surface(&self, format: PixelFormat) -> Option<(usize, usize, &[u8])> {
+        let width = self.geo.2;
+        let height = self.geo.1;
+        let bytes = width
+            .checked_mul(height)?
+            .checked_mul(format.bytes_per_pixel as usize)?;
+        Some((width, height, self.surface.get(..bytes)?))
     }
 }
 

@@ -179,6 +179,28 @@ pub enum Personality<A: crate::Arch> {
 }
 
 impl<A: crate::Arch> Personality<A> {
+    pub fn surface_buffer<'a>(
+        &'a self,
+        key: crate::kernel::gui::SurfaceKey,
+        format: vga::PixelFormat,
+    ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
+        match self {
+            Self::Os2(state) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::os2::surface_buffer(state)
+            }
+            Self::Windows(state) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::windows::surface_buffer(state)
+            }
+            Self::Dos(state) if key == crate::kernel::gui::SurfaceKey(2) => {
+                crate::kernel::dos::surface_buffer(state, format)
+            }
+            Self::Linux(_) if key == crate::kernel::gui::SurfaceKey(1) => {
+                crate::kernel::term::surface_buffer()
+            }
+            _ => None,
+        }
+    }
+
     /// Give the first running personality the boot display. Unlike a later
     /// materialization, Linux adopts the existing contents instead of
     /// repainting its shared console snapshot.
@@ -257,7 +279,8 @@ impl<A: crate::Arch> Personality<A> {
 
     pub fn repaint_osd(&mut self) {
         match self {
-            Self::Linux(_) | Self::Os2(_) => crate::kernel::linux::repaint_console(),
+            Self::Linux(_) => crate::kernel::linux::repaint_console(),
+            Self::Os2(os2) => os2.repaint_osd(),
             Self::Windows(windows) => windows.repaint_osd(),
             Self::Dos(_) => {}
         }
@@ -381,8 +404,11 @@ impl<A: crate::Arch> Personality<A> {
                     machine, bios, dos, regs, now_ns, display, desktop, endpoint,
                 );
             }
-            Self::Linux(_) | Self::Os2(_) => {
+            Self::Linux(_) => {
                 crate::kernel::linux::render(machine, bios, display, desktop, endpoint)
+            }
+            Self::Os2(os2) => {
+                crate::kernel::os2::render(machine, bios, os2, display, desktop, endpoint)
             }
             Self::Windows(windows) => {
                 crate::kernel::windows::render(machine, bios, windows, display, desktop, endpoint)
