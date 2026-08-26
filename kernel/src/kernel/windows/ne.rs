@@ -270,3 +270,41 @@ impl<'a> Image<'a> {
 }
 
 pub fn is_ne(data: &[u8]) -> bool { Image::parse(data).is_ok() }
+
+/// Whether an NE image targets the Windows ABI. NE is a container format,
+/// not a personality marker: OS/2, DOS 4 and Borland's protected-mode tools
+/// use it too. Byte 0x36 of the NE header identifies the intended OS; Windows
+/// uses values 2 (Windows) and 4 (Windows 386).
+pub fn is_windows_ne(data: &[u8]) -> bool {
+    if Image::parse(data).is_err() { return false; }
+    let Some(ne) = data.get(0x3c..0x40)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()) as usize) else {
+        return false;
+    };
+    matches!(data.get(ne.saturating_add(0x36)), Some(2 | 4))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    fn image(target_os: u8) -> Vec<u8> {
+        let mut data = vec![0; 0x80];
+        data[0..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0x40..0x42].copy_from_slice(b"NE");
+        data[0x40 + 0x1c..0x40 + 0x1e].copy_from_slice(&1u16.to_le_bytes());
+        data[0x40 + 0x36] = target_os;
+        data
+    }
+
+    #[test]
+    fn only_windows_ne_targets_are_claimed() {
+        assert!(is_windows_ne(&image(2)));
+        assert!(is_windows_ne(&image(4)));
+        assert!(!is_windows_ne(&image(1)));
+        assert!(!is_windows_ne(&image(3)));
+        assert!(!is_windows_ne(&image(5)));
+    }
+}

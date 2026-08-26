@@ -730,16 +730,7 @@ fn finish_int09<A: crate::Arch>(
     // `/` — put the 0xE0 in the scancode slot instead. `int16` folds all of
     // this back for the conventional AH=00/01 reads.
     let word = if flags & 0x08 != 0 {
-        // The original BIOS assigns distinct scan codes to Alt+Fn. Programs
-        // such as DOS Navigator use these words for their panel drive menus;
-        // returning the unmodified F-key would make Alt+F1 look like Help.
-        alt_function_key_word(key).unwrap_or_else(|| {
-            if e0 {
-                enhanced_key_word(key)
-            } else {
-                ((key as u16) << 8) | asc as u16
-            }
-        })
+        alt_key_word(key, e0)
     } else if e0 {
         enhanced_key_word(key)
     } else {
@@ -776,9 +767,18 @@ fn alt_function_key_word(key: u8) -> Option<u16> {
     }
 }
 
+fn alt_key_word(key: u8, e0: bool) -> u16 {
+    // BIOS Alt combinations carry a zero ASCII byte. Borland's menu handling
+    // consequently recognizes Alt+F as 0x2100 and Alt+X as 0x2D00, not as the
+    // ordinary `f`/`x` character paired with its physical scan code.
+    alt_function_key_word(key).unwrap_or_else(|| {
+        if e0 { enhanced_key_word(key) } else { u16::from(key) << 8 }
+    })
+}
+
 #[cfg(test)]
 mod keyboard_tests {
-    use super::alt_function_key_word;
+    use super::{alt_function_key_word, alt_key_word};
 
     #[test]
     fn bios_alt_function_scan_codes() {
@@ -788,6 +788,12 @@ mod keyboard_tests {
         assert_eq!(alt_function_key_word(0x57), Some(0x8B00));
         assert_eq!(alt_function_key_word(0x58), Some(0x8C00));
         assert_eq!(alt_function_key_word(0x1C), None);
+    }
+
+    #[test]
+    fn bios_alt_letters_have_no_ascii_byte() {
+        assert_eq!(alt_key_word(0x21, false), 0x2100); // Alt+F
+        assert_eq!(alt_key_word(0x2d, false), 0x2d00); // Alt+X
     }
 }
 

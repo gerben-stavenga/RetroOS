@@ -60,7 +60,7 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
     if is_lx(data) {
         return BinaryFormat::Lx;
     }
-    if crate::kernel::windows::ne::is_ne(data) {
+    if crate::kernel::windows::ne::is_windows_ne(data) {
         return BinaryFormat::Ne;
     }
     if is_pe(data) {
