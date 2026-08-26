@@ -462,6 +462,18 @@ fn window_at(idx: usize) -> WindowEntry {
     unsafe { (*core::ptr::addr_of!(WINDOWS))[idx] }
 }
 
+/// Highlighted task while the window picker is open. Merely browsing never
+/// changes execution or keyboard focus; the window manager uses this endpoint
+/// to raise its retained frame for preview.
+pub fn picker_preview_tid() -> Option<usize> {
+    if !is_open() || !PICKER.load(Ordering::Relaxed) {
+        return None;
+    }
+    let selected = PICK_SEL.load(Ordering::Relaxed);
+    (selected < WINDOW_COUNT.load(Ordering::Relaxed))
+        .then(|| window_at(selected).tid as usize)
+}
+
 // ── Input ────────────────────────────────────────────────────────────────────
 
 // Bare PC set-1 make codes, matching what both the SDL harness and the stdin
@@ -649,7 +661,11 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
             // Open the primary-window list. Personalities can later contribute
             // multiple native top-level windows without changing selection.
             WINDOWS_ITEM_SELECT => {
-                PICK_SEL.store(0, Ordering::Relaxed);
+                let count = WINDOW_COUNT.load(Ordering::Relaxed);
+                let focused = (0..count)
+                    .position(|index| window_at(index).focused)
+                    .unwrap_or(0);
+                PICK_SEL.store(focused, Ordering::Relaxed);
                 PICKER.store(true, Ordering::Relaxed);
             }
             WINDOWS_ITEM_PRESENTATION => {

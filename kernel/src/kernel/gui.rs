@@ -267,6 +267,18 @@ pub struct Desktop {
     revision: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SwitcherComposition {
+    active: EndpointId,
+    highlighted: EndpointId,
+    node: NodeId,
+    target: Rect,
+}
+
+pub struct ComposedFrame<'a> {
+    pub pixels: &'a mut Vec<u8>,
+}
+
 impl Desktop {
     pub fn new() -> Self {
         Self::default()
@@ -458,6 +470,28 @@ impl Desktop {
         Ok(pixels)
     }
 
+    fn compose_resolved_switcher<'a, F>(
+        &self,
+        resolve: &F,
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+        output: &mut Vec<u8>,
+        switcher: Option<SwitcherComposition>,
+    ) -> Result<usize, ComposeError>
+    where
+        F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
+    {
+        let pixels = self.scene.compose_switcher_with(
+            resolve, width, height, format, output, switcher,
+        )?;
+        if let Some(point) = self.pointer {
+            draw_pointer(output, width, height, width * format.bytes_per_pixel as usize,
+                format, point);
+        }
+        Ok(pixels)
+    }
+
     pub fn hit_test(&self, point: Point) -> Option<Hit> {
         self.scene.hit_test(point)
     }
@@ -509,6 +543,10 @@ pub struct WindowManager {
     focused: Option<WindowId>,
     presentation: Presentation,
     modes: Vec<(WindowId, WindowMode)>,
+    switcher_active: Option<EndpointId>,
+    switcher_highlighted: Option<EndpointId>,
+    switcher_node: Option<NodeId>,
+    switcher_target: Option<Rect>,
 }
 
 impl WindowManager {
@@ -531,6 +569,10 @@ impl WindowManager {
             focused,
             presentation: initial,
             modes,
+            switcher_active: None,
+            switcher_highlighted: None,
+            switcher_node: None,
+            switcher_target: None,
         }
     }
 
@@ -588,13 +630,16 @@ impl WindowManager {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-    ) -> Result<&'a mut Vec<u8>, ComposeError>
+    ) -> Result<ComposedFrame<'a>, ComposeError>
     where
         F: Fn(EndpointId, SurfaceKey) -> Option<PixelBuffer<'a>>,
     {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
-        let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
+        let Self {
+            desktop, composed, osd_pixels, osd_rect, presented_revision,
+            switcher_active, switcher_highlighted, switcher_node, switcher_target, ..
+        } = self;
         let osd = if crate::kernel::osd::is_open()
             && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
             && let Some(rect) = osd_rect
@@ -617,9 +662,18 @@ impl WindowManager {
             let surface = desktop.surfaces.iter().find(|surface| surface.id == id)?;
             resolve_process(surface.owner, surface.key)
         };
-        desktop.compose_resolved(&resolve, width, height, format, composed)?;
+        let switcher = match (*switcher_active, *switcher_highlighted,
+            *switcher_node, *switcher_target)
+        {
+            (Some(active), Some(highlighted), Some(node), Some(target)) =>
+                Some(SwitcherComposition { active, highlighted, node, target }),
+            _ => None,
+        };
+        desktop.compose_resolved_switcher(
+            &resolve, width, height, format, composed, switcher,
+        )?;
         *presented_revision = desktop.revision;
-        Ok(composed)
+        Ok(ComposedFrame { pixels: composed })
     }
 
     pub fn needs_present(&self) -> bool {
@@ -692,6 +746,85 @@ impl WindowManager {
             .set_visible(node, open && self.osd_rect.is_some())
             .raise(node);
         self.desktop.commit(transaction).expect("commit OSD window");
+    }
+
+    /// Present the task picker without changing execution focus. The active
+    /// endpoint's existing window leaves the ordinary stack and runs live in
+    /// the lower-right corner; no surface is duplicated. The browsed endpoint
+    /// rises above it, followed by the rest of the retained stack. `sync_osd`
+    /// subsequently keeps the picker itself frontmost.
+    pub fn sync_task_switcher(
+        &mut self,
+        active: EndpointId,
+        canvas_width: usize,
+        canvas_height: usize,
+    ) {
+        let highlighted = crate::kernel::osd::picker_preview_tid()
+            .map(|tid| EndpointId(tid as u32));
+        self.sync_task_switcher_preview(active, highlighted, canvas_width, canvas_height);
+    }
+
+    fn sync_task_switcher_preview(
+        &mut self,
+        active: EndpointId,
+        highlighted: Option<EndpointId>,
+        canvas_width: usize,
+        canvas_height: usize,
+    ) {
+        let Some(highlighted) = highlighted else {
+            self.finish_task_switcher();
+            return;
+        };
+        let node = if self.switcher_active == Some(active) { self.switcher_node } else { None }
+            .or_else(|| {
+            self.desktop.scene.roots.iter().rev().find_map(|&root| {
+                self.desktop.scene.node(root)
+                    .is_some_and(|node| node.owner == active && node.visible)
+                    .then_some(root)
+            })
+        });
+        let Some(node) = node else { return };
+        let source = self.desktop.scene.node(node).expect("live switcher node").geometry;
+        if canvas_width == 0 || canvas_height == 0 || source.width == 0 || source.height == 0 {
+            return;
+        }
+        let max_width = (canvas_width / 3).max(1);
+        let max_height = (canvas_height / 3).max(1);
+        let mut live_width = max_width;
+        let mut live_height = (u64::from(source.height) * live_width as u64
+            / u64::from(source.width)).max(1) as usize;
+        if live_height > max_height {
+            live_height = max_height;
+            live_width = (u64::from(source.width) * live_height as u64
+                / u64::from(source.height)).max(1) as usize;
+        }
+        let margin = (canvas_width.min(canvas_height) / 40).max(6);
+        let target = Rect::new(
+            canvas_width.saturating_sub(live_width + margin) as i32,
+            canvas_height.saturating_sub(live_height + margin) as i32,
+            live_width as u32,
+            live_height as u32,
+        );
+        let highlight_changed = self.switcher_highlighted != Some(highlighted);
+        let layout_changed = self.switcher_active != Some(active)
+            || self.switcher_node != Some(node)
+            || self.switcher_target != Some(target);
+        self.switcher_active = Some(active);
+        self.switcher_highlighted = Some(highlighted);
+        self.switcher_node = Some(node);
+        self.switcher_target = Some(target);
+        if layout_changed || highlight_changed {
+            self.desktop.revision = self.desktop.revision.wrapping_add(1);
+        }
+    }
+
+    /// Restore the active window before an actual execution/display handoff.
+    pub fn finish_task_switcher(&mut self) {
+        let Some(_) = self.switcher_active.take() else { return };
+        self.switcher_target = None;
+        self.switcher_highlighted = None;
+        self.switcher_node = None;
+        self.desktop.revision = self.desktop.revision.wrapping_add(1);
     }
 
     pub fn presentation(&self) -> Presentation {
@@ -1037,8 +1170,68 @@ impl Scene {
             {
                 continue;
             }
-            self.compose_node(root, Point::default(), output_clip, resolve, &mut target);
+            self.compose_node(root, Point::default(), output_clip, None, resolve, &mut target);
         }
+        Ok(width.saturating_mul(height))
+    }
+
+    fn compose_switcher_with<'a, F>(
+        &self,
+        resolve: &F,
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+        output: &mut Vec<u8>,
+        switcher: Option<SwitcherComposition>,
+    ) -> Result<usize, ComposeError>
+    where
+        F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
+    {
+        if !valid_format(format) {
+            return Err(ComposeError::InvalidOutputFormat);
+        }
+        let step = format.bytes_per_pixel as usize;
+        let len = width.checked_mul(height).and_then(|n| n.checked_mul(step))
+            .ok_or(ComposeError::Overflow)?;
+        let canvas = Rect::new(0, 0, u32::try_from(width).unwrap_or(u32::MAX),
+            u32::try_from(height).unwrap_or(u32::MAX));
+        output.clear();
+        output.resize(len, 0);
+        let target = Target { width, height, stride: width * step, format, pixels: output };
+        let mut target = target;
+        let mut compose_clip = |clip: Rect| {
+            let Some(clip) = intersect(canvas, clip) else { return };
+            if let Some(layout) = switcher {
+                const SYSTEM_ENDPOINT: EndpointId = EndpointId(u32::MAX);
+                for &root in &self.roots {
+                    let Some(node) = self.node(root) else { continue };
+                    if root == layout.node || node.owner == layout.highlighted
+                        || node.owner == SYSTEM_ENDPOINT
+                    { continue; }
+                    self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                }
+                self.compose_node(layout.node, Point::default(), clip, Some(layout.target),
+                    resolve, &mut target);
+                if layout.highlighted != layout.active {
+                    for &root in &self.roots {
+                        if self.node(root).is_some_and(|node| node.owner == layout.highlighted) {
+                            self.compose_node(root, Point::default(), clip, None, resolve,
+                                &mut target);
+                        }
+                    }
+                }
+                for &root in &self.roots {
+                    if self.node(root).is_some_and(|node| node.owner == SYSTEM_ENDPOINT) {
+                        self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                    }
+                }
+            } else {
+                for &root in &self.roots {
+                    self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                }
+            }
+        };
+        compose_clip(canvas);
         Ok(width.saturating_mul(height))
     }
 
@@ -1203,6 +1396,7 @@ impl Scene {
         id: NodeId,
         parent_origin: Point,
         inherited_clip: Rect,
+        geometry: Option<Rect>,
         resolve: &F,
         target: &mut Target<'_>,
     )
@@ -1213,15 +1407,16 @@ impl Scene {
         if !node.visible {
             return;
         }
+        let geometry = geometry.unwrap_or(node.geometry);
         let origin = Point {
-            x: parent_origin.x.saturating_add(node.geometry.x),
-            y: parent_origin.y.saturating_add(node.geometry.y),
+            x: parent_origin.x.saturating_add(geometry.x),
+            y: parent_origin.y.saturating_add(geometry.y),
         };
         let node_rect = Rect::new(
             origin.x,
             origin.y,
-            node.geometry.width,
-            node.geometry.height,
+            geometry.width,
+            geometry.height,
         );
         let mut subtree_clip = inherited_clip;
         if let Some(local_clip) = node.clip {
@@ -1243,7 +1438,7 @@ impl Scene {
             blit_scaled(source, node_rect, subtree_clip, node.opacity, target);
         }
         for &child in &node.children {
-            self.compose_node(child, origin, subtree_clip, resolve, target);
+            self.compose_node(child, origin, subtree_clip, None, resolve, target);
         }
     }
 }
@@ -1692,6 +1887,75 @@ mod tests {
                 .unwrap(),
             windows
         );
+    }
+
+    #[test]
+    fn task_switcher_raises_preview_without_changing_live_focus() {
+        let active_window = WindowManager::primary_window(WINDOWS);
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        let active = manager.desktop.ensure_node(
+            WINDOWS, PresentationKey(1), Rect::new(0, 0, 640, 480),
+        ).unwrap();
+        let preview = manager.desktop.ensure_node(
+            OS2, PresentationKey(1), Rect::new(30, 20, 500, 400),
+        ).unwrap();
+        let active_surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap();
+        let preview_surface = manager.desktop.ensure_surface(OS2, SurfaceKey(1)).unwrap();
+        let mut active_tx = Transaction::new(WINDOWS);
+        active_tx.attach(active, Some(active_surface)).set_visible(active, true);
+        manager.desktop.commit(active_tx).unwrap();
+        let mut preview_tx = Transaction::new(OS2);
+        preview_tx.attach(preview, Some(preview_surface)).set_visible(preview, true);
+        manager.desktop.commit(preview_tx).unwrap();
+        manager.focus(active_window);
+
+        manager.sync_task_switcher_preview(WINDOWS, Some(OS2), 900, 600);
+
+        assert_eq!(manager.desktop.focused(), Some(WINDOWS));
+        assert_eq!(manager.desktop.bindings.len(), 2, "preview must not duplicate a surface");
+        assert_eq!(manager.desktop.scene.node(active).unwrap().geometry,
+            Rect::new(0, 0, 640, 480), "switcher layout must not mutate retained geometry");
+        assert_eq!(manager.switcher_target, Some(Rect::new(619, 385, 266, 200)));
+        assert_eq!(manager.desktop.scene.roots.last(), Some(&active),
+            "browsing must not mutate the retained stack");
+        let red = 0x00ff_0000u32.to_le_bytes();
+        let blue = 0x0000_00ffu32.to_le_bytes();
+        let frame = manager.compose_processes(
+            |endpoint, _| {
+                let pixels = if endpoint == WINDOWS { &red } else { &blue };
+                PixelBuffer::new(1, 1, 4, vga::PixelFormat::NATIVE, pixels).ok()
+            },
+            900,
+            600,
+            vga::PixelFormat::NATIVE,
+        ).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 900 + x) * 4;
+            u32::from_le_bytes(frame.pixels[at..at + 4].try_into().unwrap())
+        };
+        assert_eq!(pixel(40, 30), 0x0000_00ff, "highlighted still is above the stack");
+        assert_eq!(pixel(700, 500), 0x00ff_0000, "active task is live in its corner");
+        assert_eq!(pixel(550, 300), 0, "active retained geometry is not also composed");
+        let stable_revision = manager.desktop.revision;
+        manager.sync_task_switcher_preview(WINDOWS, Some(OS2), 900, 600);
+        assert_eq!(manager.desktop.revision, stable_revision,
+            "stable preview must wait for the producer instead of repainting per timer tick");
+
+        // A live producer may republish a different native resolution. The
+        // compositor reflows its destination without writing it back.
+        let mut publish = Transaction::new(WINDOWS);
+        publish.set_geometry(active, Rect::new(0, 0, 320, 200));
+        manager.desktop.commit(publish).unwrap();
+        manager.sync_task_switcher_preview(WINDOWS, Some(OS2), 900, 600);
+        assert_eq!(manager.desktop.scene.node(active).unwrap().geometry,
+            Rect::new(0, 0, 320, 200));
+        assert_eq!(manager.switcher_target, Some(Rect::new(585, 398, 300, 187)));
+
+        manager.sync_task_switcher_preview(WINDOWS, None, 900, 600);
+        assert_eq!(manager.desktop.scene.node(active).unwrap().geometry,
+            Rect::new(0, 0, 320, 200));
+        assert_eq!(manager.switcher_target, None);
+        assert_eq!(manager.desktop.focused(), Some(WINDOWS));
     }
 
     #[test]

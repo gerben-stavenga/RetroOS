@@ -990,12 +990,6 @@ fn present_desktop<A: crate::Arch>(
     display: &mut crate::kernel::display::Display,
     windows: &mut crate::kernel::gui::WindowManager,
 ) {
-    // Surface producers establish the presentation edge. OSD changes remain
-    // pending and join the next VGA/window publication; they never create an
-    // independent compositor clock.
-    if !windows.needs_present() {
-        return;
-    }
     let extent = windows.desktop().extent();
     let (canvas_width, canvas_height) = display.composition_size(
         extent.width as usize,
@@ -1004,6 +998,15 @@ fn present_desktop<A: crate::Arch>(
     if display.is_host() {
         display.shadow_width = canvas_width;
     }
+    // Picker geometry is compositor policy, synchronized at the producer's
+    // normal publication edge. Browsing does not schedule the highlighted
+    // task: its retained surface is composed above the stack while the active
+    // endpoint remains the only live producer, drawn in the corner.
+    windows.sync_task_switcher(
+        crate::kernel::gui::EndpointId(crate::kernel::focus::focused() as u32),
+        canvas_width,
+        canvas_height,
+    );
     windows.sync_osd(
         canvas_width,
         canvas_height,
@@ -1020,10 +1023,10 @@ fn present_desktop<A: crate::Arch>(
             .personality
             .surface_buffer(key, display.rgb)
     };
-    let shadow = windows
+    let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
         .expect("compose process-owned surfaces");
-    display.present(machine, bios_workspace, canvas_height, shadow);
+    display.present(machine, bios_workspace, canvas_height, frame.pixels);
 }
 
 pub fn event_loop<A: crate::Arch>(
@@ -1177,7 +1180,11 @@ pub fn event_loop<A: crate::Arch>(
             &mut display,
             events,
         );
+        if crate::kernel::osd::picker_preview_tid().is_none() {
+            windows.finish_task_switcher();
+        }
         if let Some(tid) = crate::kernel::osd::take_window_request() {
+            windows.finish_task_switcher();
             let window = crate::kernel::gui::WindowManager::primary_window(
                 crate::kernel::gui::EndpointId(tid as u32),
             );
@@ -2014,6 +2021,12 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     {
         let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
         parent.kernel.vcpu.regs = *vcpu;
+        // ForkExec returns `ContinueAs`: unlike an ordinary scheduler switch,
+        // ExecutionContext::switch_to will not park and re-hash the outgoing
+        // parent for us. This assignment is the authoritative parked parent
+        // frame (including the successful child-TID return registers), so its
+        // integrity hash must be advanced at the same boundary.
+        thread::refresh_cpu_hash(parent);
         let mut clean_child_fx = machine.clean_fx_template();
         machine.switch_fx(&mut clean_child_fx);
         parent.kernel.fx_state = clean_child_fx;
