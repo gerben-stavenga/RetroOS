@@ -1416,22 +1416,6 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    // PM STI runs through the sensitive-instruction monitor at CPL3/IOPL1.
-    // The real instruction therefore never executes and hardware cannot give
-    // us STI's one-instruction interrupt shadow. Do not inject while CS:EIP is
-    // still the post-STI instruction; once it advances, the shadow is consumed
-    // and ordinary vPIC/VIF delivery resumes. DOS/4GW's IRQ wrapper relies on
-    // this at `sti; cld`: re-entering between those instructions repeatedly
-    // consumes its transfer-stack nesting allowance and can strand IRQ0 ISR.
-    if dos
-        .dpmi
-        .as_mut()
-        .is_some_and(|dpmi| dpmi.vif.blocks_irq_after_sti(regs))
-    {
-        machine.set_irq_line(false);
-        return;
-    }
-
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI

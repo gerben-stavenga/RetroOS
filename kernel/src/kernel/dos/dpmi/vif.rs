@@ -84,23 +84,13 @@ pub struct VifMap {
     /// by the CLI address *within this space*.
     sites: SiteTable,
     active: Option<Active>,
-    /// Post-STI CS:EIP. Because PM STI traps at CPL3/IOPL1 and is emulated by
-    /// the monitor, the CPU cannot supply its architectural one-instruction
-    /// interrupt shadow for us. Hold virtual IRQ delivery until this following
-    /// instruction has retired (observed as CS:EIP moving away).
-    sti_shadow: Option<(u16, u32)>,
     /// Per-client parity counters (windows, tag-closes, post-tag #DBs, steps).
     pub stats: [u32; 4],
 }
 
 impl VifMap {
     pub const fn new() -> Self {
-        VifMap {
-            sites: SiteTable::new(),
-            active: None,
-            sti_shadow: None,
-            stats: [0; 4],
-        }
+        VifMap { sites: SiteTable::new(), active: None, stats: [0; 4] }
     }
 
     /// Whether the next #DB belongs to an interrupts-off window currently
@@ -179,15 +169,6 @@ impl VifMap {
             self.sites.insert(a.cli_ip, Class::Sti);
         }
         regs.clear_flag32(TF_FLAG);
-        self.sti_shadow = Some((regs.code_seg(), regs.ip32()));
-    }
-
-    /// Whether virtual IRQ injection must wait for STI's following
-    /// instruction. Repeated host wakeups at the same post-STI EIP remain
-    /// deferred; the first boundary at a different EIP proves retirement and
-    /// consumes the shadow.
-    pub fn blocks_irq_after_sti(&mut self, regs: &Regs) -> bool {
-        sti_shadow_blocks(&mut self.sti_shadow, (regs.code_seg(), regs.ip32()))
     }
 
     /// A `#DB`: either the post-tag trap (a tagged `POPF`/`IRET` just ran) or a
@@ -260,9 +241,6 @@ impl VifMap {
                         }
                         regs.clear_flag32(TF_FLAG);
                         self.active = None;
-                        if op == 0xFB {
-                            self.sti_shadow = Some((regs.code_seg(), regs.ip32()));
-                        }
                         return DbResult::Resume;
                     }
                 }
@@ -278,17 +256,6 @@ impl VifMap {
     /// reload). Called from the per-space code-write / SMC path.
     pub fn invalidate_page(&mut self, page: u32) {
         self.sites.retain_out_of_page(page);
-    }
-}
-
-fn sti_shadow_blocks(shadow: &mut Option<(u16, u32)>, current: (u16, u32)) -> bool {
-    match *shadow {
-        Some(at) if at == current => true,
-        Some(_) => {
-            *shadow = None;
-            false
-        }
-        None => false,
     }
 }
 
@@ -457,19 +424,5 @@ impl SiteTable {
 impl Default for SiteTable {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sti_shadow_blocks;
-
-    #[test]
-    fn sti_shadow_blocks_until_the_following_instruction_retires() {
-        let mut shadow = Some((0x1df, 0x63256e));
-        assert!(sti_shadow_blocks(&mut shadow, (0x1df, 0x63256e)));
-        assert!(sti_shadow_blocks(&mut shadow, (0x1df, 0x63256e)));
-        assert!(!sti_shadow_blocks(&mut shadow, (0x1df, 0x63256f)));
-        assert_eq!(shadow, None);
     }
 }
