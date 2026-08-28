@@ -385,10 +385,13 @@ pub fn take_presentation_request() -> bool {
 
 // ── Primary-window list ──────────────────────────────────────────────────────
 
-/// Max primary windows the picker lists in this first endpoint-backed model.
-const MAX_LIST: usize = 12;
+/// Every live task currently contributes at most one primary window. Keep the
+/// complete table: truncating by slot order can otherwise omit the focused
+/// program when enough lower-numbered background tasks are alive. The picker
+/// already scrolls lists longer than its visible row budget.
+const MAX_LIST: usize = thread::MAX_THREADS - 1;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct WindowEntry {
     tid: u16,
     focused: bool,
@@ -417,6 +420,9 @@ pub fn refresh_windows<A: crate::Arch>(
     focused: usize,
     fullscreen: bool,
 ) {
+    let old_count = WINDOW_COUNT.load(Ordering::Relaxed);
+    let old_fullscreen = CURRENT_FULLSCREEN.load(Ordering::Relaxed);
+    let mut changed = old_fullscreen != fullscreen;
     let mut count = 0;
     for (i, t) in threads.iter().enumerate().skip(1) {
         if count >= MAX_LIST {
@@ -442,18 +448,24 @@ pub fn refresh_windows<A: crate::Arch>(
         // SAFETY: single-threaded cooperative kernel; no concurrent access.
         unsafe {
             let p = &mut (*core::ptr::addr_of_mut!(WINDOWS))[count];
-            p.tid = i as u16;
-            p.focused = i == focused;
-            p.name = [0; 16];
-            p.name[..n].copy_from_slice(&name[..n]);
-            p.name_len = n as u8;
+            let mut entry = WindowEntry::EMPTY;
+            entry.tid = i as u16;
+            entry.focused = i == focused;
+            entry.name[..n].copy_from_slice(&name[..n]);
+            entry.name_len = n as u8;
+            changed |= *p != entry;
+            *p = entry;
         }
         count += 1;
     }
+    changed |= old_count != count;
     WINDOW_COUNT.store(count, Ordering::Relaxed);
     CURRENT_FULLSCREEN.store(fullscreen, Ordering::Relaxed);
     if PICK_SEL.load(Ordering::Relaxed) >= count {
         PICK_SEL.store(count.saturating_sub(1), Ordering::Relaxed);
+    }
+    if changed {
+        REPAINT.store(true, Ordering::Relaxed);
     }
 }
 

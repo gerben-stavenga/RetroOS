@@ -1348,9 +1348,9 @@ pub fn render<A: crate::Arch>(
 
 pub fn surface_buffer<'a, A: crate::Arch>(
     dos: &'a thread::DosState<A>,
-    format: vga::PixelFormat,
+    _format: vga::PixelFormat,
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
-    let (width, height, pixels) = dos.pc.present_scratch2.surface(format)?;
+    let (width, height, format, pixels) = dos.pc.present_scratch2.surface()?;
     crate::kernel::gui::PixelBuffer::new(
         width,
         height,
@@ -1358,6 +1358,29 @@ pub fn surface_buffer<'a, A: crate::Arch>(
         format,
         pixels,
     ).ok()
+}
+
+/// Capture a packed compositor preview of a detached DOS VGA while its
+/// address space is still active. DOS fork/exec parks the parent immediately
+/// afterward, so its video mappings cannot be rasterized later without a
+/// context switch.
+pub fn snapshot_retained_surface<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    regs: &Regs,
+) {
+    present::snapshot_retained_surface(machine, dos, regs);
+}
+
+/// Register a previously captured DOS preview with the retained desktop.
+/// This does not move keyboard focus or raise the suspended parent.
+pub fn attach_retained_surface<A: crate::Arch>(
+    dos: &thread::DosState<A>,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    let Some((width, height, _, _)) = dos.pc.present_scratch2.surface() else { return };
+    present::attach_retained_vga_surface(width, height, desktop, endpoint);
 }
 
 /// Advance emulated audio playback and its guest-visible device events.
@@ -1393,6 +1416,22 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    // PM STI runs through the sensitive-instruction monitor at CPL3/IOPL1.
+    // The real instruction therefore never executes and hardware cannot give
+    // us STI's one-instruction interrupt shadow. Do not inject while CS:EIP is
+    // still the post-STI instruction; once it advances, the shadow is consumed
+    // and ordinary vPIC/VIF delivery resumes. DOS/4GW's IRQ wrapper relies on
+    // this at `sti; cld`: re-entering between those instructions repeatedly
+    // consumes its transfer-stack nesting allowance and can strand IRQ0 ISR.
+    if dos
+        .dpmi
+        .as_mut()
+        .is_some_and(|dpmi| dpmi.vif.blocks_irq_after_sti(regs))
+    {
+        machine.set_irq_line(false);
+        return;
+    }
+
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI

@@ -1210,8 +1210,6 @@ impl Scene {
                     { continue; }
                     self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
                 }
-                self.compose_node(layout.node, Point::default(), clip, Some(layout.target),
-                    resolve, &mut target);
                 if layout.highlighted != layout.active {
                     for &root in &self.roots {
                         if self.node(root).is_some_and(|node| node.owner == layout.highlighted) {
@@ -1220,6 +1218,12 @@ impl Scene {
                         }
                     }
                 }
+                // Keep the running task's live thumbnail above the selected
+                // retained window. Drawing it first lets a large/fullscreen
+                // preview cover the lower-right corner and makes the running
+                // program appear to vanish from the switcher.
+                self.compose_node(layout.node, Point::default(), clip, Some(layout.target),
+                    resolve, &mut target);
                 for &root in &self.roots {
                     if self.node(root).is_some_and(|node| node.owner == SYSTEM_ENDPOINT) {
                         self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
@@ -1897,7 +1901,7 @@ mod tests {
             WINDOWS, PresentationKey(1), Rect::new(0, 0, 640, 480),
         ).unwrap();
         let preview = manager.desktop.ensure_node(
-            OS2, PresentationKey(1), Rect::new(30, 20, 500, 400),
+            OS2, PresentationKey(1), Rect::new(0, 0, 900, 600),
         ).unwrap();
         let active_surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap();
         let preview_surface = manager.desktop.ensure_surface(OS2, SurfaceKey(1)).unwrap();
@@ -1934,8 +1938,10 @@ mod tests {
             u32::from_le_bytes(frame.pixels[at..at + 4].try_into().unwrap())
         };
         assert_eq!(pixel(40, 30), 0x0000_00ff, "highlighted still is above the stack");
-        assert_eq!(pixel(700, 500), 0x00ff_0000, "active task is live in its corner");
-        assert_eq!(pixel(550, 300), 0, "active retained geometry is not also composed");
+        assert_eq!(pixel(700, 500), 0x00ff_0000,
+            "active task remains visible over a fullscreen preview");
+        assert_eq!(pixel(550, 300), 0x0000_00ff,
+            "active retained geometry is not also composed");
         let stable_revision = manager.desktop.revision;
         manager.sync_task_switcher_preview(WINDOWS, Some(OS2), 900, 600);
         assert_eq!(manager.desktop.revision, stable_revision,

@@ -1294,6 +1294,13 @@ pub fn event_loop<A: crate::Arch>(
                 );
             }
             crate::kernel::sched::Verdict::ContinueAs(next) => {
+                if let thread::Personality::Dos(parent) = &threads[ctx.tid].personality {
+                    crate::kernel::dos::attach_retained_surface(
+                        parent,
+                        windows.desktop_mut(),
+                        crate::kernel::gui::EndpointId(ctx.tid as u32),
+                    );
+                }
                 let old_window = crate::kernel::gui::WindowManager::primary_window(
                     crate::kernel::gui::EndpointId(ctx.tid as u32),
                 );
@@ -1773,6 +1780,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
                         crate::kernel::bios_display::EmulatedVga::initial_mode3(),
                     )
                 });
+            crate::kernel::dos::snapshot_retained_surface(machine, parent, vcpu);
             exec::ExecVga::Dos(vga)
         }
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(

@@ -78,21 +78,40 @@ impl EmulatedVga {
                 logical_pitch,
             }, pages)
         } else {
-            // 4F04 is a short-lived transaction only. It restores the hidden
-            // hardware state destroyed by the register/VRAM walk, after which
-            // standard VGA operations extract latches and AC phase explicitly.
-            let checkpoint = native.cap().bios_checkpoint(machine, bios);
-            crate::kernel::drivers::vga_hw::save(native.cap(), &mut model);
+            let cirrus_readback = crate::kernel::platform::get().vga_readback;
+            let checkpoint = if cirrus_readback {
+                None
+            } else {
+                // Generic VGA: 4F04 is an opaque rewind point. After the bulk
+                // save destroys the hidden state, restore it separately for
+                // the latch spill and for the AC-phase experiment.
+                Some(native.cap().bios_checkpoint(machine, bios)
+                    .unwrap_or_else(|| panic!(
+                        "native VGA has no exact hidden-state capture path"
+                    )))
+            };
+            crate::kernel::drivers::vga_hw::save(
+                native.cap(), &mut model, cirrus_readback,
+            );
+
             if let Some(checkpoint) = checkpoint.as_ref() {
                 native.cap().bios_restore_checkpoint(machine, bios, checkpoint);
-                let ac_value = crate::kernel::drivers::vga_hw::read_selected_ac(&model);
+                crate::kernel::drivers::vga_hw::write_latches_and_readback(
+                    &mut model,
+                );
+
                 native.cap().bios_restore_checkpoint(machine, bios, checkpoint);
-                crate::kernel::drivers::vga_hw::extract_hidden_state(
-                    native.cap(), &mut model, ac_value);
+                let plane_enable =
+                    crate::kernel::drivers::vga_hw::read_ac_register(0x12);
+
+                native.cap().bios_restore_checkpoint(machine, bios, checkpoint);
+                crate::kernel::drivers::vga_hw::correct_flip_flop_phase(
+                    &mut model,
+                    plane_enable,
+                );
+
                 native.cap().bios_restore_checkpoint(machine, bios, checkpoint);
                 crate::kernel::drivers::vga_hw::checkpoint_restored(&model);
-            } else if !crate::kernel::platform::get().vga_readback {
-                panic!("native VGA has no exact hidden-state capture path");
             }
             materialize_emulated_aperture(&mut model, machine);
             let bios_mode = native.cap().bios_current_legacy_mode(machine, bios)

@@ -458,6 +458,65 @@ fn attach_vga_surface(
 
 }
 
+/// Attach a completed background snapshot without changing compositor focus.
+pub(super) fn attach_retained_vga_surface(
+    width: usize,
+    height: usize,
+    desktop: &mut crate::kernel::gui::Desktop,
+    endpoint: crate::kernel::gui::EndpointId,
+) {
+    const DOS_SCANOUT: crate::kernel::gui::PresentationKey =
+        crate::kernel::gui::PresentationKey(2);
+    const DOS_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(2);
+    let surface_id = desktop
+        .ensure_surface(endpoint, DOS_SURFACE)
+        .expect("create retained DOS VGA surface");
+    let node = desktop
+        .ensure_node(
+            endpoint,
+            DOS_SCANOUT,
+            crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
+        )
+        .expect("create retained DOS VGA presentation node");
+    let placement = desktop.geometry(node).expect("retained DOS VGA presentation node");
+    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+    transaction
+        .set_geometry(node, crate::kernel::gui::Rect::new(
+            placement.x, placement.y, width as u32, height as u32,
+        ))
+        .attach(node, Some(surface_id))
+        .set_visible(node, true);
+    desktop.commit(transaction).expect("commit retained DOS VGA presentation node");
+}
+
+/// Rasterize the detached VGA into an output-independent retained preview.
+/// Native RGB is intentional: PixelBuffer carries its own format and the
+/// compositor converts it to the eventual output format when the OSD opens.
+pub(super) fn snapshot_retained_surface<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut crate::kernel::thread::DosState<A>,
+    regs: &Regs,
+) {
+    let pc = &mut dos.pc;
+    let (vga, scratch, output) =
+        (&mut pc.vga, &mut pc.present_scratch, &mut pc.present_scratch2);
+    let DosVideo::Vga(dev) = vga else { return };
+    let svga_start = match dev.resume {
+        crate::kernel::bios_display::VideoResume::Vbe {
+            mode, display_start: (x, y), logical_pitch, ..
+        } => usize::from(y) * usize::from(logical_pitch)
+            + usize::from(x) * usize::from(mode.bits_per_pixel.div_ceil(8)),
+        crate::kernel::bios_display::VideoResume::Legacy { .. } => 0,
+    };
+    let height = dev.state.current_mode().map_or(0, |mode| ::vga::dimensions(mode).1);
+    let Some(frame) = scanout(
+        &dev.state, machine, regs, scratch, (0, height), svga_start,
+    ) else { return };
+    let (width, _) = ::vga::dimensions(frame.mode);
+    let display = crate::kernel::display::Display::host();
+    let _ = crate::kernel::display::render_frame(output, &display, &frame, width);
+}
+
 pub fn display_tick<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,

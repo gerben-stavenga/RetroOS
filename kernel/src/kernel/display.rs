@@ -220,7 +220,11 @@ impl Display {
         // A legacy owner must be restored register-for-register. A VBE owner
         // is restored by its firmware mode set and framebuffer handoff; running
         // the legacy save algorithm over a live banked VBE mode corrupts it.
-        crate::kernel::drivers::vga_hw::save(&native, &mut saved);
+        crate::kernel::drivers::vga_hw::save(
+            &native,
+            &mut saved,
+            crate::kernel::platform::get().vga_readback,
+        );
         let mut state = vga::VgaState::new();
         let regs = vga::bios_mode13_regs();
         state.misc_output = regs.misc;
@@ -764,13 +768,14 @@ impl Scratch {
 
     /// Immutable view of the completed compact source image retained by its
     /// producer. Slack used by the fused row rasterizer is excluded.
-    pub fn surface(&self, format: PixelFormat) -> Option<(usize, usize, &[u8])> {
+    pub fn surface(&self) -> Option<(usize, usize, PixelFormat, &[u8])> {
         let width = self.geo.2;
         let height = self.geo.1;
+        let format = self.pal.fmt;
         let bytes = width
             .checked_mul(height)?
             .checked_mul(format.bytes_per_pixel as usize)?;
-        Some((width, height, self.surface.get(..bytes)?))
+        Some((width, height, format, self.surface.get(..bytes)?))
     }
 }
 

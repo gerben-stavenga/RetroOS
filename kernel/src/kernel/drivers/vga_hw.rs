@@ -19,6 +19,11 @@
 
 use vga::{AcState, VgaState};
 
+/// QEMU's VGA backend does not reconstruct chain-4/odd-even aperture contents
+/// reliably from flat plane transfers. Keep its extra CPU-aperture capture and
+/// replay behind one switch so conforming-hardware behavior is easy to test.
+const QEMU_COMPAT: bool = true;
+
 /// The real card's Attribute-Controller flip-flop and latched index.
 ///
 /// The flip-flop phase is not port-readable, so it must be tracked. The
@@ -46,36 +51,21 @@ pub fn track_ac_reset() {
     unsafe { AC.pending_data = false; }
 }
 
-/// Destructively read the AC register selected by a captured state. The caller
-/// brackets this with a firmware checkpoint restore, so resetting the
-/// flip-flop here does not become process-visible.
-pub fn read_selected_ac(state: &VgaState) -> u8 {
+/// Destructively read one AC register. The caller brackets this with a
+/// firmware checkpoint restore, so resetting the flip-flop here does not
+/// become process-visible.
+pub fn read_ac_register(index: u8) -> u8 {
     use crate::kernel::portio::{inb, outb};
     let _ = inb(0x3DA);
-    outb(0x3C0, state.ac_state.index & 0x1F);
+    outb(0x3C0, index & 0x1F);
     inb(0x3C1)
 }
 
-/// Convert the two hidden pieces of generic VGA state into explicit model
-/// bytes after a firmware checkpoint has restored the original hardware.
-///
-/// AC phase is used as an oracle: one controlled 3C0 write either changes the
-/// selected register (data phase) or merely changes the index (index phase).
-/// The four GC latches are spilled through write mode 1 into one scratch VRAM
-/// offset, then read plane by plane. The caller restores the checkpoint once
-/// more afterward, so none of these probes remain live on the card.
-pub fn extract_hidden_state(
-    _cap: &crate::kernel::platform::VgaCap,
-    state: &mut VgaState,
-    selected_ac_value: u8,
-) {
-    use crate::kernel::portio::{inb, outb};
-
-    let probe = !selected_ac_value;
-    outb(0x3C0, probe);
-    let _ = inb(0x3DA);
-    outb(0x3C0, state.ac_state.index & 0x1F);
-    state.ac_state.pending_data = inb(0x3C1) == probe;
+/// Spill generic VGA's four inaccessible data latches through write mode 1.
+/// The caller first restores a VBE 4F04 checkpoint containing the original
+/// latches, and restores it again after this destructive probe.
+pub fn write_latches_and_readback(state: &mut VgaState) {
+    use crate::kernel::portio::outb;
 
     const SCRATCH: usize = 0xFFFF;
     // Preserve the latch contents while selecting a flat A0000 view. VGA
@@ -94,8 +84,59 @@ pub fn extract_hidden_state(
     state.latches_valid = true;
 }
 
+fn flip_flop_probe(plane_enable_before: u8) -> u8 {
+    const PLANE_ENABLE_DATA: u8 = 0x02;
+    const WRITABLE_MASK: u8 = 0x0F;
+
+    let old = plane_enable_before & WRITABLE_MASK;
+    let mut probe = old ^ 1;
+    if probe == PLANE_ENABLE_DATA {
+        probe = old ^ 2;
+    }
+    probe
+}
+
+/// Recover the AC index/data flip-flop phase after a VBE 4F04 checkpoint has
+/// restored it. Register 12h is used instead of the program's selected
+/// register: its low four Color Plane Enable bits are defined and writable on
+/// every VGA. Two writes make the result depend on the original phase.
+pub fn correct_flip_flop_phase(state: &mut VgaState, plane_enable_before: u8) {
+    use crate::kernel::portio::{inb, outb};
+
+    const PLANE_ENABLE: u8 = 0x12;
+    // In data phase, the first write touches register 12h only if it was
+    // already selected, producing low bits 2. Pick a probe distinct from both
+    // possible data-phase results: the original value and 2.
+    let probe = flip_flop_probe(plane_enable_before);
+
+    // Original index phase: select 12h, then write `probe` to it.
+    // Original data phase: write 12h to the old selection, then select
+    // `probe` as the next index.
+    outb(0x3C0, PLANE_ENABLE);
+    outb(0x3C0, probe);
+
+    let _ = inb(0x3DA);
+    outb(0x3C0, PLANE_ENABLE);
+    let observed = inb(0x3C1) & 0x0F;
+    state.ac_state.pending_data = observed != probe;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::flip_flop_probe;
+
+    #[test]
+    fn phase_probe_differs_from_both_data_phase_results() {
+        for old in 0..=0x0F {
+            let probe = flip_flop_probe(old);
+            assert_ne!(probe, old);
+            assert_ne!(probe, 0x02);
+        }
+    }
+}
+
 /// Synchronize the software tracker after the BIOS has restored the exact AC
-/// index and phase discovered by [`extract_hidden_state`].
+/// index and phase discovered by [`correct_flip_flop_phase`].
 pub fn checkpoint_restored(state: &VgaState) {
     unsafe { AC = state.ac_state; }
 }
@@ -138,34 +179,25 @@ pub fn is_standard_text_mode(_cap: &crate::kernel::platform::VgaCap) -> bool {
 
 /// Read the live card's whole register file, DAC and plane memory into
 /// `state`. Called when a thread stops owning the physical display and its
-/// screen must survive as a model (`NativeVga -> EmulatedVga`).
-pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
+/// screen must survive as a model (`NativeVga -> EmulatedVga`). When
+/// `cirrus_readback` is set, capture CR24/CR22 hidden state before the first
+/// 3DA reset or VGA memory read can destroy it.
+pub fn save(
+    cap: &crate::kernel::platform::VgaCap,
+    state: &mut VgaState,
+    cirrus_readback: bool,
+) {
     use crate::kernel::portio::{inb, outb};
     if state.planes.is_empty() {
         state.planes = alloc::vec![0u8; 4 * 65536];
     }
     state.latches_valid = false;
-    // Capture the AC sequencing state, then reset the flipflop to a
-    // known index state. With 0x3C0/0x3DA granted to the guest
-    // (io_policy's `FullscreenVga::Native` arm), the VGA_AC_STATE tracker never saw
-    // its writes — the card is the only source of truth, and it must be
-    // read BEFORE the 0x3DA reset below destroys the phase.
+    // Reading the AC address register does not disturb its flip-flop. Defer
+    // the first 3DA read until all Cirrus hidden state has been captured.
     let plat = crate::kernel::platform::get();
     let index = inb(0x3C0); // address-register readback (incl. PAS)
-    let pending_data = if plat.vga_readback {
-        let crtc_index = inb(0x3D4);
-        outb(0x3D4, 0x24); // Cirrus CR24: bit 7 = flip-flop phase
-        let phase = inb(0x3D5) & 0x80 != 0;
-        outb(0x3D4, crtc_index);
-        phase
-    } else {
-        // Phase not readable on this card — assume index state (the boot
-        // warning declared full restore unsupported here).
-        false
-    };
-    state.ac_state = AcState { index, pending_data };
+    state.ac_state.index = index;
     state.ac_pas_valid = plat.host != crate::kernel::platform::Host::Qemu;
-    let _ = inb(0x3DA);
 
     // Capture index registers BEFORE the save loops overwrite them.
     state.seq_index = inb(0x3C4);
@@ -179,19 +211,31 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     for i in 0..25u8 { outb(0x3D4, i); state.crtc[i as usize] = inb(0x3D5); }
     for i in 0..9u8 { outb(0x3CE, i); state.gc[i as usize] = inb(0x3CF); }
 
-    // Data latches, via Cirrus CR22 (latch selected by GC4 read-map).
-    // Must happen before the plane copy below — every VRAM read reloads
-    // them. Without the readback the latches stay unrecoverable (see the
-    // gap comment further down).
-    if plat.vga_readback {
+    // Cirrus makes the otherwise-hidden state readable. The regular CRTC/GC
+    // indices and GC4 value are already in `state`, so this participates in
+    // the surrounding save transaction instead of maintaining a nested set
+    // of temporary index saves. The index registers themselves are restored
+    // once at the end of `save`.
+    if cirrus_readback {
+        outb(0x3D4, 0x24);
+        state.ac_state.pending_data = inb(0x3D5) & 0x80 != 0;
+        outb(0x3CE, 4);
         for plane in 0..4u8 {
-            outb(0x3CE, 4); outb(0x3CF, plane);
+            outb(0x3CF, plane);
             outb(0x3D4, 0x22);
             state.latches[plane as usize] = inb(0x3D5);
         }
-        outb(0x3CE, 4); outb(0x3CF, state.gc[4]);
+        // Only the QEMU compatibility aperture reads below need the original
+        // read-map selection before the flat plane walk takes control.
+        if QEMU_COMPAT {
+            outb(0x3CF, state.gc[4]);
+        }
         state.latches_valid = true;
+    } else {
+        // Provisional only; the checkpoint oracle corrects it after this save.
+        state.ac_state.pending_data = false;
     }
+
     save_dac(cap, state);
 
     // Attribute Controller — must reset flipflop EACH iteration.
@@ -218,11 +262,11 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
         (state.crtc[0x0C] as u16) << 8 | state.crtc[0x0D] as u16,
         state.dac_mask);
 
-    // Chain-4 has the same boundary problem in mode 13h: once chain-4 is
-    // disabled, the A0000 aperture no longer presents the guest's linear
-    // pixel stream. Preserve that stream before changing SEQ[4], then use
-    // it to normalize the four plane images after the flat capture.
-    let native_chain4 = if matches!(
+    // QEMU VGA workaround: a conforming VGA's four flat plane reads are a
+    // complete capture, but QEMU can expose a different backing interpretation
+    // after chain-4 is disabled. Preserve its original CPU-visible A0000 stream
+    // and use that to repair the corresponding plane bytes after the flat walk.
+    let native_chain4 = if QEMU_COMPAT && matches!(
         state.classify_mode(),
         Some(vga::VgaMode::Mode13h)
     ) {
@@ -235,10 +279,11 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     } else {
         None
     };
-    // Preserve the CPU-visible text aperture before flattening odd/even. The
-    // linear B8000 view is identical across implementations and therefore
-    // provides the unambiguous representation at this hardware boundary.
-    let native_text = if matches!(
+    // QEMU VGA workaround: QEMU does not emulate odd/even memory addressing
+    // correctly across the flat-planar capture below. Preserve the original
+    // CPU-visible B8000 stream and use it to repair planes 0 and 1 afterward.
+    // Correct hardware needs only the four flat plane reads.
+    let native_text = if QEMU_COMPAT && matches!(
         state.classify_mode(),
         Some(vga::VgaMode::Text { .. })
     ) {
@@ -266,12 +311,9 @@ pub fn save(cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
     outb(0x3CE, 5); outb(0x3CF, 0x00);
     outb(0x3CE, 6); outb(0x3CF, 0x05);
 
-    // GAP (plain VGA only): GC read latches (4 bytes loaded by the most
-    // recent VGA memory read) are not preserved across save/restore —
-    // the bulk reads below clobber them, and stock VGA exposes no port
-    // to read them without a destructive VRAM access. With Cirrus
-    // readbacks (`platform::vga_readback`) they were already captured
-    // via CR22 above and are reloaded by `restore`.
+    // The bulk reads below replace the hardware latches. Their original
+    // values were captured through Cirrus CR22 above, or will be recovered by
+    // restoring and destructively probing a BIOS checkpoint.
     //
     // Symptom without readbacks: a mode-X latch blit preempted between
     // its source read and destination write produces 4 wrong bytes when
@@ -480,15 +522,14 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
     // Graphics Controller
     for i in 0..9u8 { outb(0x3CE, i); outb(0x3CF, state.gc[i as usize]); }
 
-    // For chain-4, finish by replaying the linear CPU aperture
-    // through the target mode itstate. The flat pass above preserves the
-    // whole 4x64K VGA store, but strict implementations can expose a
-    // different address interpretation while that pass is active. A
-    // chained write makes the card perform the definitive n&3 / n>>2
-    // routing for the visible 64K image. Keep the screen blank and force
-    // an unmodified write-mode-0 transfer, then restore the guest's exact
-    // write registers.
-    if matches!(state.classify_mode(), Some(vga::VgaMode::Mode13h)) {
+    // QEMU VGA workaround corresponding to the save-side linear capture.
+    // A conforming VGA is fully restored by the flat four-plane write above;
+    // QEMU additionally needs the visible 64K replayed through chain-4 so its
+    // backend performs the n&3 / n>>2 routing. Keep the screen blank and force
+    // an unmodified write-mode-0 transfer, then restore the guest's registers.
+    if QEMU_COMPAT
+        && matches!(state.classify_mode(), Some(vga::VgaMode::Mode13h))
+    {
         let mut chained = alloc::vec![0u8; 0x10000];
         for (address, byte) in chained.iter_mut().enumerate() {
             *byte = state.planes[state.layout().index(address & 3, address >> 2)];
@@ -511,17 +552,19 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
         }
     }
 
-    // Text mode needs the same treatment, and for the same reason: odd/even
-    // is a different address interpretation, so the flat planar pass above
-    // writes plane bytes without exercising the target odd/even address
-    // routing. Replay the visible page through the target mode and let the
-    // card perform the definitive A0 plane selection itself.
+    // QEMU VGA workaround corresponding to the save-side B8000 capture. QEMU
+    // does not reconstruct its odd/even CPU view correctly from the flat plane
+    // write alone, so replay the visible page through the target text mode and
+    // make QEMU perform the A0 plane selection itself. Correct VGA hardware
+    // does not require this replay.
     //
-    // Without this, a text-mode program that follows a mode-13h one sees
-    // every cell smeared across four bytes (`00 00 char attr`): Dark Forces
-    // launched after Duke3D rendered its screen as two column-interleaved
-    // streams, while B8000 row 0 — written after the mode set — was clean.
-    if matches!(state.classify_mode(), Some(vga::VgaMode::Text { .. })) {
+    // Observed QEMU symptom: text cells restored by the flat plane write form
+    // two interleaved column streams. Cells the guest writes through B8000
+    // after the restore render correctly, isolating the error to QEMU's
+    // reconstruction of the pre-existing odd/even text memory.
+    if QEMU_COMPAT
+        && matches!(state.classify_mode(), Some(vga::VgaMode::Text { .. }))
+    {
         let mut text = alloc::vec![0u8; 0x8000];
         for (address, byte) in text.iter_mut().enumerate() {
             *byte = state.planes[
