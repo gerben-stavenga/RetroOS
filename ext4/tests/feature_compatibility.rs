@@ -51,12 +51,10 @@ fn reads_and_writes_current_distro_default_profile() {
     assert_eq!(&contents, b"portable ext4\n");
 
     {
-        let mut transaction = filesystem.begin_transaction();
+        let mut transaction = filesystem.begin_transaction(&mut storage);
         transaction.reserve_blocks(8).unwrap();
-        transaction
-            .overwrite(&mut storage, "/file-0.txt", 0, b"modern")
-            .unwrap();
-        transaction.commit(&mut storage).unwrap();
+        transaction.overwrite("/file-0.txt", 0, b"modern").unwrap();
+        transaction.commit().unwrap();
     }
     assert_eq!(
         filesystem
@@ -232,10 +230,10 @@ fn unlink_releases_an_exclusive_external_xattr_block() {
     let mut storage = ModelStorage::new(image(env!("EXT4_EXTENDED_ATTRIBUTES_IMAGE")));
     let mut filesystem = Ext4::mount(&mut storage).unwrap();
     {
-        let mut transaction = filesystem.begin_transaction();
+        let mut transaction = filesystem.begin_transaction(&mut storage);
         transaction.reserve_blocks(12).unwrap();
-        transaction.unlink(&mut storage, "/attributed.txt").unwrap();
-        transaction.commit(&mut storage).unwrap();
+        transaction.unlink("/attributed.txt").unwrap();
+        transaction.commit().unwrap();
     }
     assert_eq!(
         filesystem.stat(&mut storage, "/attributed.txt"),
@@ -262,10 +260,10 @@ fn unlink_decrements_a_shared_external_xattr_block() {
     let mut storage = ModelStorage::new(image(env!("EXT4_EXTENDED_ATTRIBUTES_IMAGE")));
     let mut filesystem = Ext4::mount(&mut storage).unwrap();
     {
-        let mut transaction = filesystem.begin_transaction();
+        let mut transaction = filesystem.begin_transaction(&mut storage);
         transaction.reserve_blocks(12).unwrap();
-        transaction.unlink(&mut storage, "/shared-a.txt").unwrap();
-        transaction.commit(&mut storage).unwrap();
+        transaction.unlink("/shared-a.txt").unwrap();
+        transaction.commit().unwrap();
     }
     assert_eq!(
         filesystem.stat(&mut storage, "/shared-a.txt"),

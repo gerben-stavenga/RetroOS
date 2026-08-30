@@ -303,8 +303,11 @@ impl Ext4 {
         &self.superblock
     }
     /// Begin an isolated block transaction. Dropping it performs no writes.
-    pub fn begin_transaction(&mut self) -> Transaction<'_> {
-        Transaction::new(self)
+    pub fn begin_transaction<'f, 's>(
+        &'f mut self,
+        storage: &'s mut dyn Storage,
+    ) -> Transaction<'f, 's> {
+        Transaction::new(self, storage)
     }
 
     /// Number of filesystem blocks supplied by committed journal records.
@@ -1635,7 +1638,7 @@ mod tests {
         let (mut fs, mut storage) = mounted(image());
         let effects_before = storage.effects().len();
         {
-            let mut transaction = fs.begin_transaction();
+            let mut transaction = fs.begin_transaction(&mut storage);
             transaction.reserve_blocks(1).unwrap();
             assert_eq!(transaction.reserved_blocks(), 1);
 
@@ -1649,9 +1652,7 @@ mod tests {
             replacement[..5].copy_from_slice(b"again");
             transaction.write_block(11, &replacement).unwrap();
             let mut visible = vec![0; BLOCK];
-            transaction
-                .read_block(&mut storage, 11, &mut visible)
-                .unwrap();
+            transaction.read_block(11, &mut visible).unwrap();
             assert_eq!(&visible[..5], b"again");
         }
 
@@ -1673,17 +1674,13 @@ mod tests {
         let (mut fs, mut storage) = mounted(image());
         let effects_before = storage.effects().len();
         {
-            let mut transaction = fs.begin_transaction();
+            let mut transaction = fs.begin_transaction(&mut storage);
             transaction.reserve_blocks(1).unwrap();
             transaction
-                .modify_block(&mut storage, 11, |block| {
-                    block[..5].copy_from_slice(b"new!!")
-                })
+                .modify_block(11, |block| block[..5].copy_from_slice(b"new!!"))
                 .unwrap();
             let mut contents = vec![0; BLOCK];
-            transaction
-                .read_block(&mut storage, 11, &mut contents)
-                .unwrap();
+            transaction.read_block(11, &mut contents).unwrap();
             assert_eq!(&contents[..5], b"new!!");
         }
         assert_eq!(storage.effects().len(), effects_before + 1);
@@ -1694,16 +1691,14 @@ mod tests {
     fn transaction_enforces_reservations_and_block_bounds() {
         const BLOCK: usize = 1024;
         let (mut fs, mut storage) = mounted(image());
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut storage);
         let block = vec![0; BLOCK];
         assert_eq!(
             transaction.write_block(11, &block).unwrap_err(),
             FsError::ReservationExhausted
         );
         assert_eq!(
-            transaction
-                .read_block(&mut storage, 32, &mut [0; BLOCK])
-                .unwrap_err(),
+            transaction.read_block(32, &mut [0; BLOCK]).unwrap_err(),
             Error::InvalidArgument
         );
         assert_eq!(
@@ -1720,13 +1715,10 @@ mod tests {
 
         let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(next_effect));
         let mut fs = Ext4::mount(&mut storage).unwrap();
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut storage);
         transaction.reserve_blocks(1).unwrap();
         assert!(
-            (transaction
-                .modify_block(&mut storage, 11, |_| {})
-                .unwrap_err())
-            .storage_is(&ModelError::InjectedIo)
+            (transaction.modify_block(11, |_| {}).unwrap_err()).storage_is(&ModelError::InjectedIo)
         );
         assert_eq!(transaction.dirty_blocks(), 0);
         assert_eq!(transaction.reserved_blocks(), 1);

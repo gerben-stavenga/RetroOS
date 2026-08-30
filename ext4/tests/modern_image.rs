@@ -379,12 +379,12 @@ fn commits_created_file_through_checksum_v3_journal() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/", "committed.bin", 0o640)
+            .create_empty_file("/", "committed.bin", 0o640)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let storage = fs_storage;
     assert_eq!(storage.pending_writes(), 0);
@@ -419,12 +419,12 @@ fn commits_through_normal_mke2fs_unchecksummed_journal() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/", "normal.bin", 0o644)
+            .create_empty_file("/", "normal.bin", 0o644)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
@@ -459,14 +459,14 @@ fn initializes_and_commits_multiblock_file() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/dir/empty.bin", &payload)
+            .initialize_file("/dir/empty.bin", &payload)
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 7);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -510,14 +510,12 @@ fn appends_across_partial_and_new_blocks() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction
-            .append(&mut fs_storage, "/dir/hello.txt", &appended)
-            .unwrap();
+        transaction.append("/dir/hello.txt", &appended).unwrap();
         assert_eq!(transaction.dirty_blocks(), 7);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -561,51 +559,45 @@ fn writes_across_eof_and_resizes_through_one_file_editor() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     let mut expected = vec![0x31; 9_000];
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(16).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/root-empty.bin", &expected)
+            .initialize_file("/root-empty.bin", &expected)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let crossing = vec![0x72; 6_000];
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(16).unwrap();
         transaction
-            .write_at(&mut fs_storage, "/root-empty.bin", 3_500, &crossing)
+            .write_at("/root-empty.bin", 3_500, &crossing)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     expected.resize(9_500, 0);
     expected[3_500..9_500].copy_from_slice(&crossing);
 
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(16).unwrap();
-        transaction
-            .resize(&mut fs_storage, "/root-empty.bin", 15_000)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.resize("/root-empty.bin", 15_000).unwrap();
+        transaction.commit().unwrap();
     }
     expected.resize(15_000, 0);
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(16).unwrap();
-        transaction
-            .resize(&mut fs_storage, "/root-empty.bin", 5_000)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.resize("/root-empty.bin", 5_000).unwrap();
+        transaction.commit().unwrap();
     }
     expected.truncate(5_000);
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(16).unwrap();
-        transaction
-            .resize(&mut fs_storage, "/root-empty.bin", 7_000)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.resize("/root-empty.bin", 7_000).unwrap();
+        transaction.commit().unwrap();
     }
     expected.resize(7_000, 0);
 
@@ -651,20 +643,20 @@ fn writes_sparse_and_unwritten_extents_from_e2fsprogs() {
     let sparse_write = b"mapped-inside-a-hole";
     let unwritten_write = b"initialized-subrange";
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut storage);
         transaction.reserve_blocks(16).unwrap();
         transaction
-            .write_at(&mut storage, "/sparse.bin", 1_000, sparse_write)
+            .write_at("/sparse.bin", 1_000, sparse_write)
             .unwrap();
-        transaction.commit(&mut storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut storage);
         transaction.reserve_blocks(16).unwrap();
         transaction
-            .write_at(&mut storage, "/unwritten.bin", 5_000, unwritten_write)
+            .write_at("/unwritten.bin", 5_000, unwritten_write)
             .unwrap();
-        transaction.commit(&mut storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = storage.durable_bytes().to_vec();
@@ -728,14 +720,14 @@ fn allocates_one_transaction_across_two_block_groups() {
     let mut fs_storage = ModelStorage::new(original.clone());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(8).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/target.bin", &payload)
+            .initialize_file("/target.bin", &payload)
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 8);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -781,10 +773,10 @@ fn every_cross_group_allocation_read_is_fallible_before_dirtying() {
     let payload = vec![0x74; 9000];
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(8).unwrap();
     transaction
-        .initialize_file(&mut successful_storage, "/target.bin", &payload)
+        .initialize_file("/target.bin", &payload)
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -797,11 +789,11 @@ fn every_cross_group_allocation_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(8).unwrap();
                 assert!(
                     (transaction
-                        .initialize_file(&mut storage, "/target.bin", &payload)
+                        .initialize_file("/target.bin", &payload)
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -835,15 +827,15 @@ fn creates_inode_in_a_lazily_initialized_later_group() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     let created;
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
         created = transaction
-            .create_empty_file(&mut fs_storage, "/create", "cross.bin", 0o640)
+            .create_empty_file("/create", "cross.bin", 0o640)
             .unwrap();
         assert_eq!(created, 1025);
         assert_eq!(transaction.dirty_blocks(), 6);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -879,10 +871,10 @@ fn every_cross_group_inode_read_is_fallible_before_dirtying() {
     let image = inode_group_image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(6).unwrap();
     transaction
-        .create_empty_file(&mut successful_storage, "/create", "cross.bin", 0o640)
+        .create_empty_file("/create", "cross.bin", 0o640)
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -895,11 +887,11 @@ fn every_cross_group_inode_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(6).unwrap();
                 assert!(
                     (transaction
-                        .create_empty_file(&mut storage, "/create", "cross.bin", 0o640)
+                        .create_empty_file("/create", "cross.bin", 0o640)
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -915,24 +907,22 @@ fn unlinks_an_empty_inode_from_a_later_group() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
         assert_eq!(
             transaction
-                .create_empty_file(&mut fs_storage, "/create", "cross-unlink.bin", 0o600)
+                .create_empty_file("/create", "cross-unlink.bin", 0o600)
                 .unwrap(),
             1025
         );
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/create/cross-unlink.bin")
-            .unwrap();
+        transaction.unlink("/create/cross-unlink.bin").unwrap();
         assert_eq!(transaction.dirty_blocks(), 5);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -965,21 +955,16 @@ fn creates_and_removes_directory_in_a_lazy_later_group() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(8).unwrap();
-        assert_eq!(
-            transaction
-                .mkdir(&mut fs_storage, "/create", "later", 0o755)
-                .unwrap(),
-            1025
-        );
-        transaction.commit(&mut fs_storage).unwrap();
+        assert_eq!(transaction.mkdir("/create", "later", 0o755).unwrap(), 1025);
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction.rmdir(&mut fs_storage, "/create/later").unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.rmdir("/create/later").unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -1012,12 +997,10 @@ fn commits_in_place_file_overwrite_through_journal() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(2).unwrap();
-        transaction
-            .overwrite(&mut fs_storage, "/dir/hello.txt", 0, b"PORT")
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.overwrite("/dir/hello.txt", 0, b"PORT").unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
@@ -1051,17 +1034,19 @@ fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
     let image = image_with_checksum_v3_journal();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let commit_start;
     {
-        let mut transaction = successful.begin_transaction();
+        let mut transaction = successful.begin_transaction(&mut successful_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut successful_storage, "/", "atomic.bin", 0o644)
+            .create_empty_file("/", "atomic.bin", 0o644)
             .unwrap();
-        commit_start = successful_storage.effects().len();
-        transaction.commit(&mut successful_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let effects = successful_storage.effects().to_vec();
+    let commit_start = effects
+        .iter()
+        .position(|effect| effect.kind == EffectKind::Write)
+        .unwrap();
     let commit_end = effects.len();
     assert!(
         effects[commit_start..]
@@ -1079,12 +1064,12 @@ fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
             ModelStorage::new(image.clone()).with_injection(Inject::PowerLossAt(sequence));
         let mut fs = Ext4::mount(&mut storage).unwrap();
         let error = {
-            let mut transaction = fs.begin_transaction();
+            let mut transaction = fs.begin_transaction(&mut storage);
             transaction.reserve_blocks(5).unwrap();
             transaction
-                .create_empty_file(&mut storage, "/", "atomic.bin", 0o644)
+                .create_empty_file("/", "atomic.bin", 0o644)
                 .unwrap();
-            transaction.commit(&mut storage).unwrap_err()
+            transaction.commit().unwrap_err()
         };
         assert!((error).storage_is(&ModelError::PowerLoss));
         let durable = storage.durable_bytes().to_vec();
@@ -1097,16 +1082,19 @@ fn every_failed_barrier_pending_prefix_is_old_or_new() {
     let image = image_with_checksum_v3_journal();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let commit_start;
     {
-        let mut transaction = successful.begin_transaction();
+        let mut transaction = successful.begin_transaction(&mut successful_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut successful_storage, "/", "prefix.bin", 0o644)
+            .create_empty_file("/", "prefix.bin", 0o644)
             .unwrap();
-        commit_start = successful_storage.effects().len();
-        transaction.commit(&mut successful_storage).unwrap();
+        transaction.commit().unwrap();
     }
+    let commit_start = successful_storage
+        .effects()
+        .iter()
+        .position(|effect| effect.kind == EffectKind::Write)
+        .unwrap();
     let flushes: Vec<_> = successful_storage.effects()[commit_start..]
         .iter()
         .filter(|effect| effect.kind == EffectKind::Flush)
@@ -1119,12 +1107,12 @@ fn every_failed_barrier_pending_prefix_is_old_or_new() {
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         let mut fs = Ext4::mount(&mut storage).unwrap();
         let error = {
-            let mut transaction = fs.begin_transaction();
+            let mut transaction = fs.begin_transaction(&mut storage);
             transaction.reserve_blocks(5).unwrap();
             transaction
-                .create_empty_file(&mut storage, "/", "prefix.bin", 0o644)
+                .create_empty_file("/", "prefix.bin", 0o644)
                 .unwrap();
-            transaction.commit(&mut storage).unwrap_err()
+            transaction.commit().unwrap_err()
         };
         assert!((error).storage_is(&ModelError::InjectedIo));
         let pending = storage.pending_writes();
@@ -1153,24 +1141,18 @@ fn stages_checked_bitmap_and_root_extent_mutation() {
     assert_eq!(empty_inode.size, 0);
     let effects_before = fs_storage.effects().len();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
-        let allocated = transaction
-            .append_zeroed_block(&mut fs_storage, "/dir/empty.bin")
-            .unwrap();
+        let allocated = transaction.append_zeroed_block("/dir/empty.bin").unwrap();
         assert_eq!(transaction.dirty_blocks(), 5);
         assert_eq!(transaction.reserved_blocks(), 0);
 
         let mut data = vec![1; 4096];
-        transaction
-            .read_block(&mut fs_storage, allocated, &mut data)
-            .unwrap();
+        transaction.read_block(allocated, &mut data).unwrap();
         assert_eq!(data, vec![0; 4096]);
 
         let mut superblock = vec![0; 4096];
-        transaction
-            .read_block(&mut fs_storage, 0, &mut superblock)
-            .unwrap();
+        transaction.read_block(0, &mut superblock).unwrap();
         let old_free =
             u64::from(le32(&image, 1024 + 0x0c)) | (u64::from(le32(&image, 1024 + 0x158)) << 32);
         let new_free = u64::from(le32(&superblock, 1024 + 0x0c))
@@ -1181,9 +1163,7 @@ fn stages_checked_bitmap_and_root_extent_mutation() {
         let bitmap = u64::from(le32(&image, descriptor_offset))
             | (u64::from(le32(&image, descriptor_offset + 0x20)) << 32);
         let mut bitmap_bytes = vec![0; 4096];
-        transaction
-            .read_block(&mut fs_storage, bitmap, &mut bitmap_bytes)
-            .unwrap();
+        transaction.read_block(bitmap, &mut bitmap_bytes).unwrap();
         assert_ne!(
             bitmap_bytes[allocated as usize / 8] & (1 << (allocated as usize % 8)),
             0
@@ -1196,9 +1176,7 @@ fn stages_checked_bitmap_and_root_extent_mutation() {
             (inode_table * 4096 + u64::from(empty_inode.number - 1) * inode_size) / 4096;
         for number in [0, 1, bitmap, inode_block, allocated] {
             let mut block = vec![0; 4096];
-            transaction
-                .read_block(&mut fs_storage, number, &mut block)
-                .unwrap();
+            transaction.read_block(number, &mut block).unwrap();
             let offset = number as usize * 4096;
             staged[offset..offset + 4096].copy_from_slice(&block);
         }
@@ -1231,11 +1209,9 @@ fn every_mutation_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(5).unwrap();
-    transaction
-        .append_zeroed_block(&mut successful_storage, "/dir/empty.bin")
-        .unwrap();
+    transaction.append_zeroed_block("/dir/empty.bin").unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -1247,11 +1223,11 @@ fn every_mutation_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(5).unwrap();
                 assert!(
                     (transaction
-                        .append_zeroed_block(&mut storage, "/dir/empty.bin")
+                        .append_zeroed_block("/dir/empty.bin")
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -1262,11 +1238,11 @@ fn every_mutation_read_effect_is_fallible_before_dirtying() {
 
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction();
+    let mut transaction = fs.begin_transaction(&mut fs_storage);
     transaction.reserve_blocks(4).unwrap();
     assert_eq!(
         transaction
-            .append_zeroed_block(&mut fs_storage, "/dir/empty.bin")
+            .append_zeroed_block("/dir/empty.bin")
             .unwrap_err(),
         Error::ReservationExhausted
     );
@@ -1279,10 +1255,10 @@ fn every_multiblock_initialize_read_effect_is_fallible_before_dirtying() {
     let payload = vec![0x5a; 9000];
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(7).unwrap();
     transaction
-        .initialize_file(&mut successful_storage, "/dir/empty.bin", &payload)
+        .initialize_file("/dir/empty.bin", &payload)
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -1295,11 +1271,11 @@ fn every_multiblock_initialize_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(7).unwrap();
                 assert!(
                     (transaction
-                        .initialize_file(&mut storage, "/dir/empty.bin", &payload)
+                        .initialize_file("/dir/empty.bin", &payload)
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -1315,21 +1291,19 @@ fn creates_and_appends_depth_one_extent_tree() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(11).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/dir/empty.bin", &expected)
+            .initialize_file("/dir/empty.bin", &expected)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let appended = vec![0x72; 4096];
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
-        transaction
-            .append(&mut fs_storage, "/dir/empty.bin", &appended)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.append("/dir/empty.bin", &appended).unwrap();
+        transaction.commit().unwrap();
     }
     expected.extend_from_slice(&appended);
 
@@ -1368,21 +1342,19 @@ fn append_splits_full_extent_leaf_on_fragmented_allocation() {
     let mut fs_storage = ModelStorage::new(fragmented);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(345).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/root-empty.bin", &expected)
+            .initialize_file("/root-empty.bin", &expected)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let appended = vec![0x7a; 4096];
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction
-            .append(&mut fs_storage, "/root-empty.bin", &appended)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.append("/root-empty.bin", &appended).unwrap();
+        transaction.commit().unwrap();
     }
     expected.extend_from_slice(&appended);
 
@@ -1421,26 +1393,20 @@ fn every_leaf_split_read_is_fallible_before_dirtying() {
     let mut initialized_storage = ModelStorage::new(fragmented);
     let mut initialized = Ext4::mount(&mut initialized_storage).unwrap();
     {
-        let mut transaction = initialized.begin_transaction();
+        let mut transaction = initialized.begin_transaction(&mut initialized_storage);
         transaction.reserve_blocks(345).unwrap();
         transaction
-            .initialize_file(
-                &mut initialized_storage,
-                "/root-empty.bin",
-                &vec![0x47; 340 * 4096],
-            )
+            .initialize_file("/root-empty.bin", &vec![0x47; 340 * 4096])
             .unwrap();
-        transaction.commit(&mut initialized_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let base = initialized_storage.durable_bytes().to_vec();
     let appended = vec![0x68; 4096];
     let mut successful_storage = ModelStorage::new(base.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(7).unwrap();
-    transaction
-        .append(&mut successful_storage, "/root-empty.bin", &appended)
-        .unwrap();
+    transaction.append("/root-empty.bin", &appended).unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -1452,11 +1418,11 @@ fn every_leaf_split_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(7).unwrap();
                 assert!(
                     (transaction
-                        .append(&mut storage, "/root-empty.bin", &appended)
+                        .append("/root-empty.bin", &appended)
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -1473,20 +1439,18 @@ fn unlinks_file_with_external_extent_leaf() {
     let mut fs_storage = ModelStorage::new(fragmented);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(11).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/root-empty.bin", &vec![0x63; 6 * 4096])
+            .initialize_file("/root-empty.bin", &vec![0x63; 6 * 4096])
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/root-empty.bin")
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.unlink("/root-empty.bin").unwrap();
+        transaction.commit().unwrap();
     }
 
     let mut durable = fs_storage.durable_bytes().to_vec();
@@ -1520,11 +1484,9 @@ fn every_append_read_effect_is_fallible_before_dirtying() {
     let payload = vec![0x6b; 9000];
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(7).unwrap();
-    transaction
-        .append(&mut successful_storage, "/dir/hello.txt", &payload)
-        .unwrap();
+    transaction.append("/dir/hello.txt", &payload).unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -1536,13 +1498,11 @@ fn every_append_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(7).unwrap();
                 assert!(
-                    (transaction
-                        .append(&mut storage, "/dir/hello.txt", &payload)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.append("/dir/hello.txt", &payload).unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1551,12 +1511,10 @@ fn every_append_read_effect_is_fallible_before_dirtying() {
 
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction();
+    let mut transaction = fs.begin_transaction(&mut fs_storage);
     transaction.reserve_blocks(6).unwrap();
     assert_eq!(
-        transaction
-            .append(&mut fs_storage, "/dir/hello.txt", &payload)
-            .unwrap_err(),
+        transaction.append("/dir/hello.txt", &payload).unwrap_err(),
         Error::ReservationExhausted
     );
     assert_eq!(transaction.dirty_blocks(), 0);
@@ -1582,19 +1540,17 @@ fn creates_checked_empty_inode_and_directory_entry() {
 
     let created;
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         created = transaction
-            .create_empty_file(&mut fs_storage, "/", "created.bin", 0o644)
+            .create_empty_file("/", "created.bin", 0o644)
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 5);
 
         let inode_block = (inode_table * 4096 + u64::from(created - 1) * inode_size) / 4096;
         for number in [0, 1, inode_bitmap, inode_block, root_block] {
             let mut block = vec![0; 4096];
-            transaction
-                .read_block(&mut fs_storage, number, &mut block)
-                .unwrap();
+            transaction.read_block(number, &mut block).unwrap();
             let offset = number as usize * 4096;
             staged[offset..offset + 4096].copy_from_slice(&block);
         }
@@ -1634,25 +1590,18 @@ fn edits_linux_metadata_through_layout_free_apis() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(2).unwrap();
-        transaction
-            .chmod(&mut fs_storage, "/root-data.bin", 0o6750)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.chmod("/root-data.bin", 0o6750).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(2).unwrap();
         transaction
-            .chown(
-                &mut fs_storage,
-                "/root-data.bin",
-                Some(0x1234_5678),
-                Some(0x9abc_def0),
-            )
+            .chown("/root-data.bin", Some(0x1234_5678), Some(0x9abc_def0))
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let accessed = Timestamp {
         seconds: -123,
@@ -1667,18 +1616,17 @@ fn edits_linux_metadata_through_layout_free_apis() {
         nanoseconds: 42,
     };
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(2).unwrap();
         transaction
             .set_times(
-                &mut fs_storage,
                 "/root-data.bin",
                 Some(accessed),
                 Some(modified),
                 Some(changed),
             )
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -1714,10 +1662,10 @@ fn every_create_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(5).unwrap();
     transaction
-        .create_empty_file(&mut successful_storage, "/", "created.bin", 0o644)
+        .create_empty_file("/", "created.bin", 0o644)
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -1730,11 +1678,11 @@ fn every_create_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(5).unwrap();
                 assert!(
                     (transaction
-                        .create_empty_file(&mut storage, "/", "created.bin", 0o644)
+                        .create_empty_file("/", "created.bin", 0o644)
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -1751,20 +1699,20 @@ fn creates_hard_links_and_fast_symlinks() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     let source = fs.stat(&mut fs_storage, "/root-data.bin").unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         transaction
-            .link(&mut fs_storage, "/root-data.bin", "/root-data-link.bin")
+            .link("/root-data.bin", "/root-data-link.bin")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .symlink(&mut fs_storage, "root-data.bin", "/root-data-link")
+            .symlink("root-data.bin", "/root-data-link")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -1803,36 +1751,32 @@ fn unlinks_hard_links_and_fast_symlinks() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     let original_links = fs.stat(&mut fs_storage, "/root-data.bin").unwrap().links;
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         transaction
-            .link(&mut fs_storage, "/root-data.bin", "/root-data-link.bin")
+            .link("/root-data.bin", "/root-data-link.bin")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .symlink(&mut fs_storage, "root-data.bin", "/root-data-link")
+            .symlink("root-data.bin", "/root-data-link")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/root-data-link.bin")
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.unlink("/root-data-link.bin").unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/root-data-link")
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.unlink("/root-data-link").unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -1879,19 +1823,15 @@ fn every_link_creation_read_is_fallible_before_dirtying() {
     for (reserved, operation) in [(3usize, 0u8), (5, 1)] {
         let mut successful_storage = ModelStorage::new(original.clone());
         let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-        let mut transaction = successful.begin_transaction();
+        let mut transaction = successful.begin_transaction(&mut successful_storage);
         transaction.reserve_blocks(reserved).unwrap();
         if operation == 0 {
             transaction
-                .link(
-                    &mut successful_storage,
-                    "/root-data.bin",
-                    "/root-data-link.bin",
-                )
+                .link("/root-data.bin", "/root-data-link.bin")
                 .unwrap();
         } else {
             transaction
-                .symlink(&mut successful_storage, "root-data.bin", "/root-data-link")
+                .symlink("root-data.bin", "/root-data-link")
                 .unwrap();
         }
         drop(transaction);
@@ -1905,15 +1845,15 @@ fn every_link_creation_read_is_fallible_before_dirtying() {
                     if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
                 Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
                 Ok(mut fs) => {
-                    let mut transaction = fs.begin_transaction();
+                    let mut transaction = fs.begin_transaction(&mut storage);
                     transaction.reserve_blocks(reserved).unwrap();
                     let error = if operation == 0 {
                         transaction
-                            .link(&mut storage, "/root-data.bin", "/root-data-link.bin")
+                            .link("/root-data.bin", "/root-data-link.bin")
                             .unwrap_err()
                     } else {
                         transaction
-                            .symlink(&mut storage, "root-data.bin", "/root-data-link")
+                            .symlink("root-data.bin", "/root-data-link")
                             .unwrap_err()
                     };
                     assert!((error).storage_is(&ModelError::InjectedIo));
@@ -1944,14 +1884,12 @@ fn unlinks_empty_regular_file_and_releases_its_inode() {
     let mut fs_storage = ModelStorage::new(original);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/root-empty.bin")
-            .unwrap();
+        transaction.unlink("/root-empty.bin").unwrap();
         assert_eq!(transaction.dirty_blocks(), 5);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     assert_eq!(le32(&durable, 1024 + 0x10), super_free + 1);
@@ -1994,11 +1932,9 @@ fn every_unlink_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(5).unwrap();
-    transaction
-        .unlink(&mut successful_storage, "/root-empty.bin")
-        .unwrap();
+    transaction.unlink("/root-empty.bin").unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -2010,13 +1946,11 @@ fn every_unlink_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(5).unwrap();
                 assert!(
-                    (transaction
-                        .unlink(&mut storage, "/root-empty.bin")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.unlink("/root-empty.bin").unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2032,14 +1966,12 @@ fn unlinks_nonempty_regular_file_and_releases_its_data() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/root-data.bin")
-            .unwrap();
+        transaction.unlink("/root-data.bin").unwrap();
         assert_eq!(transaction.dirty_blocks(), 6);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     assert_eq!(le32(&durable, 1024 + 0x0c), super_free_blocks + 1);
@@ -2073,11 +2005,9 @@ fn every_nonempty_unlink_read_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(6).unwrap();
-    transaction
-        .unlink(&mut successful_storage, "/root-data.bin")
-        .unwrap();
+    transaction.unlink("/root-data.bin").unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -2089,13 +2019,11 @@ fn every_nonempty_unlink_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(6).unwrap();
                 assert!(
-                    (transaction
-                        .unlink(&mut storage, "/root-data.bin")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.unlink("/root-data.bin").unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2110,19 +2038,19 @@ fn unlinks_file_whose_blocks_span_groups() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(8).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/target.bin", &payload)
+            .initialize_file("/target.bin", &payload)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction.unlink(&mut fs_storage, "/target.bin").unwrap();
+        transaction.unlink("/target.bin").unwrap();
         assert_eq!(transaction.dirty_blocks(), 7);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
@@ -2152,10 +2080,10 @@ fn unlinks_file_whose_blocks_span_groups() {
 fn unlink_rejects_directory_target_without_dirtying() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction();
+    let mut transaction = fs.begin_transaction(&mut fs_storage);
     transaction.reserve_blocks(5).unwrap();
     assert_eq!(
-        transaction.unlink(&mut fs_storage, "/dir").unwrap_err(),
+        transaction.unlink("/dir").unwrap_err(),
         Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
     );
     assert_eq!(transaction.dirty_blocks(), 0);
@@ -2166,10 +2094,10 @@ fn unlinks_regular_file_and_symlink_from_indexed_directory() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     for path in ["/dir/hello.link", "/dir/hello.txt"] {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction.unlink(&mut fs_storage, path).unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.unlink(path).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
@@ -2207,28 +2135,26 @@ fn mutates_entries_across_multiblock_linear_directory() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     assert!(fs.stat(&mut fs_storage, "/linear").unwrap().size > 4096);
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/linear", "created.bin", 0o644)
+            .create_empty_file("/linear", "created.bin", 0o644)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         transaction
-            .rename(&mut fs_storage, "/linear/file-499", "/linear/renamed-499")
+            .rename("/linear/file-499", "/linear/renamed-499")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction
-            .unlink(&mut fs_storage, "/linear/file-498")
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.unlink("/linear/file-498").unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2279,12 +2205,12 @@ fn grows_a_full_multiblock_linear_directory() {
     let mut grown = false;
     for index in 0..64 {
         let name = format!("growth-{index:02}");
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(12).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/linear", &name, 0o644)
+            .create_empty_file("/linear", &name, 0o644)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
         if fs.stat(&mut fs_storage, "/linear").unwrap().size > original_size {
             grown = true;
             break;
@@ -2332,22 +2258,20 @@ fn creates_checked_directory_and_supports_a_child_file() {
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     let created;
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(8).unwrap();
-        created = transaction
-            .mkdir(&mut fs_storage, "/", "made", 0o750)
-            .unwrap();
+        created = transaction.mkdir("/", "made", 0o750).unwrap();
         assert_eq!(transaction.dirty_blocks(), 8);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/made", "child.bin", 0o640)
+            .create_empty_file("/made", "child.bin", 0o640)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2400,11 +2324,9 @@ fn every_mkdir_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(8).unwrap();
-    transaction
-        .mkdir(&mut successful_storage, "/", "made", 0o750)
-        .unwrap();
+    transaction.mkdir("/", "made", 0o750).unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -2416,13 +2338,11 @@ fn every_mkdir_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(8).unwrap();
                 assert!(
-                    (transaction
-                        .mkdir(&mut storage, "/", "made", 0o750)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.mkdir("/", "made", 0o750).unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2445,14 +2365,12 @@ fn removes_checked_empty_directory_and_restores_parent_links() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(7).unwrap();
-        transaction
-            .rmdir(&mut fs_storage, "/root-empty-dir")
-            .unwrap();
+        transaction.rmdir("/root-empty-dir").unwrap();
         assert_eq!(transaction.dirty_blocks(), 7);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2489,11 +2407,9 @@ fn every_rmdir_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(7).unwrap();
-    transaction
-        .rmdir(&mut successful_storage, "/root-empty-dir")
-        .unwrap();
+    transaction.rmdir("/root-empty-dir").unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -2505,13 +2421,11 @@ fn every_rmdir_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(7).unwrap();
                 assert!(
-                    (transaction
-                        .rmdir(&mut storage, "/root-empty-dir")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.rmdir("/root-empty-dir").unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2524,27 +2438,22 @@ fn rmdir_reports_nonempty_without_dirtying() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(8).unwrap();
-        transaction
-            .mkdir(&mut fs_storage, "/", "occupied", 0o755)
-            .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.mkdir("/", "occupied", 0o755).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(5).unwrap();
         transaction
-            .create_empty_file(&mut fs_storage, "/occupied", "child.bin", 0o600)
+            .create_empty_file("/occupied", "child.bin", 0o600)
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
-    let mut transaction = fs.begin_transaction();
+    let mut transaction = fs.begin_transaction(&mut fs_storage);
     transaction.reserve_blocks(7).unwrap();
-    assert_eq!(
-        transaction.rmdir(&mut fs_storage, "/occupied").unwrap_err(),
-        Error::NotEmpty
-    );
+    assert_eq!(transaction.rmdir("/occupied").unwrap_err(), Error::NotEmpty);
     assert_eq!(transaction.dirty_blocks(), 0);
 }
 
@@ -2564,28 +2473,24 @@ fn renames_file_across_parents_and_directory_within_parent() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         transaction
-            .rename(
-                &mut fs_storage,
-                "/root-empty.bin",
-                "/root-empty-dir/moved.bin",
-            )
+            .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 3);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         transaction
-            .rename(&mut fs_storage, "/root-empty-dir", "/renamed-dir")
+            .rename("/root-empty-dir", "/renamed-dir")
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 2);
         assert_eq!(transaction.reserved_blocks(), 1);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2638,14 +2543,10 @@ fn every_cross_parent_rename_read_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(3).unwrap();
     transaction
-        .rename(
-            &mut successful_storage,
-            "/root-empty.bin",
-            "/root-empty-dir/moved.bin",
-        )
+        .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -2658,11 +2559,11 @@ fn every_cross_parent_rename_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(3).unwrap();
                 assert!(
                     (transaction
-                        .rename(&mut storage, "/root-empty.bin", "/root-empty-dir/moved.bin")
+                        .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -2677,22 +2578,22 @@ fn rename_rejects_replacement_and_unsupported_parent_without_dirtying() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         assert_eq!(
             transaction
-                .rename(&mut fs_storage, "/root-empty.bin", "/root-empty-dir")
+                .rename("/root-empty.bin", "/root-empty-dir")
                 .unwrap_err(),
             Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
         );
         assert_eq!(transaction.dirty_blocks(), 0);
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(3).unwrap();
         assert_eq!(
             transaction
-                .rename(&mut fs_storage, "/root-empty-dir", "/dir/moved-dir")
+                .rename("/root-empty-dir", "/dir/moved-dir")
                 .unwrap_err(),
             Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
         );
@@ -2718,14 +2619,14 @@ fn replacement_rename_reclaims_nonempty_destination() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
         transaction
-            .rename(&mut fs_storage, "/root-empty.bin", "/root-data.bin")
+            .rename("/root-empty.bin", "/root-data.bin")
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 6);
         assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2781,12 +2682,12 @@ fn directory_rename_replaces_empty_directory() {
     let mut fs_storage = ModelStorage::new(original);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(9).unwrap();
         transaction
-            .rename(&mut fs_storage, "/move-left/branch", "/root-empty-dir")
+            .rename("/move-left/branch", "/root-empty-dir")
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -2837,14 +2738,10 @@ fn every_directory_replacement_read_is_fallible_before_dirtying() {
     let original = image();
     let mut successful_storage = ModelStorage::new(original.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(9).unwrap();
     transaction
-        .rename(
-            &mut successful_storage,
-            "/move-left/branch",
-            "/root-empty-dir",
-        )
+        .rename("/move-left/branch", "/root-empty-dir")
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -2857,11 +2754,11 @@ fn every_directory_replacement_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(9).unwrap();
                 assert!(
                     (transaction
-                        .rename(&mut storage, "/move-left/branch", "/root-empty-dir")
+                        .rename("/move-left/branch", "/root-empty-dir")
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -2887,13 +2784,13 @@ fn replacement_rename_moves_file_across_parents() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
         transaction
-            .rename(&mut fs_storage, "/root-data.bin", "/replace-dir/victim.bin")
+            .rename("/root-data.bin", "/replace-dir/victim.bin")
             .unwrap();
         assert_eq!(transaction.dirty_blocks(), 6);
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
@@ -2931,10 +2828,10 @@ fn every_replacement_rename_read_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(6).unwrap();
     transaction
-        .rename(&mut successful_storage, "/root-empty.bin", "/root-data.bin")
+        .rename("/root-empty.bin", "/root-data.bin")
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -2947,11 +2844,11 @@ fn every_replacement_rename_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(6).unwrap();
                 assert!(
                     (transaction
-                        .rename(&mut storage, "/root-empty.bin", "/root-data.bin")
+                        .rename("/root-empty.bin", "/root-data.bin")
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -2975,17 +2872,17 @@ fn moves_directory_across_parents_and_updates_dotdot_and_link_counts() {
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(6).unwrap();
         transaction
-            .rename(&mut fs_storage, "/move-left/branch", "/move-right/branch")
+            .rename("/move-left/branch", "/move-right/branch")
             .unwrap();
         assert!((5..=6).contains(&transaction.dirty_blocks()));
         assert_eq!(
             transaction.dirty_blocks() + transaction.reserved_blocks(),
             6
         );
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
 
     let durable = fs_storage.durable_bytes().to_vec();
@@ -3039,14 +2936,10 @@ fn every_cross_parent_directory_rename_read_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(6).unwrap();
     transaction
-        .rename(
-            &mut successful_storage,
-            "/move-left/branch",
-            "/move-right/branch",
-        )
+        .rename("/move-left/branch", "/move-right/branch")
         .unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
@@ -3059,11 +2952,11 @@ fn every_cross_parent_directory_rename_read_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(6).unwrap();
                 assert!(
                     (transaction
-                        .rename(&mut storage, "/move-left/branch", "/move-right/branch")
+                        .rename("/move-left/branch", "/move-right/branch")
                         .unwrap_err())
                     .storage_is(&ModelError::InjectedIo)
                 );
@@ -3077,11 +2970,11 @@ fn every_cross_parent_directory_rename_read_is_fallible_before_dirtying() {
 fn cross_parent_directory_rename_rejects_descendant_cycle() {
     let mut fs_storage = ModelStorage::new(image());
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction();
+    let mut transaction = fs.begin_transaction(&mut fs_storage);
     transaction.reserve_blocks(6).unwrap();
     assert_eq!(
         transaction
-            .rename(&mut fs_storage, "/move-left", "/move-left/branch/loop")
+            .rename("/move-left", "/move-left/branch/loop")
             .unwrap_err(),
         Error::InvalidArgument
     );
@@ -3112,20 +3005,13 @@ fn truncates_checked_root_extent_and_releases_its_block() {
         | u64::from(le32(&image, extent_root + 20));
 
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(4).unwrap();
-        assert_eq!(
-            transaction
-                .truncate_to_zero(&mut fs_storage, "/dir/hello.txt")
-                .unwrap(),
-            1
-        );
+        assert_eq!(transaction.truncate_to_zero("/dir/hello.txt").unwrap(), 1);
         assert_eq!(transaction.dirty_blocks(), 4);
 
         let mut bitmap_bytes = vec![0; 4096];
-        transaction
-            .read_block(&mut fs_storage, bitmap, &mut bitmap_bytes)
-            .unwrap();
+        transaction.read_block(bitmap, &mut bitmap_bytes).unwrap();
         assert_eq!(
             bitmap_bytes[data_block as usize / 8] & (1 << (data_block as usize % 8)),
             0
@@ -3133,9 +3019,7 @@ fn truncates_checked_root_extent_and_releases_its_block() {
 
         for number in [0, 1, bitmap, inode_block] {
             let mut block = vec![0; 4096];
-            transaction
-                .read_block(&mut fs_storage, number, &mut block)
-                .unwrap();
+            transaction.read_block(number, &mut block).unwrap();
             let offset = number as usize * 4096;
             staged[offset..offset + 4096].copy_from_slice(&block);
         }
@@ -3182,23 +3066,18 @@ fn truncates_file_with_external_extent_leaf() {
     let mut fs_storage = ModelStorage::new(fragmented);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(11).unwrap();
         transaction
-            .initialize_file(&mut fs_storage, "/root-empty.bin", &vec![0x35; 6 * 4096])
+            .initialize_file("/root-empty.bin", &vec![0x35; 6 * 4096])
             .unwrap();
-        transaction.commit(&mut fs_storage).unwrap();
+        transaction.commit().unwrap();
     }
     {
-        let mut transaction = fs.begin_transaction();
+        let mut transaction = fs.begin_transaction(&mut fs_storage);
         transaction.reserve_blocks(4).unwrap();
-        assert_eq!(
-            transaction
-                .truncate_to_zero(&mut fs_storage, "/root-empty.bin")
-                .unwrap(),
-            7
-        );
-        transaction.commit(&mut fs_storage).unwrap();
+        assert_eq!(transaction.truncate_to_zero("/root-empty.bin").unwrap(), 7);
+        transaction.commit().unwrap();
     }
 
     let mut durable = fs_storage.durable_bytes().to_vec();
@@ -3232,11 +3111,9 @@ fn every_truncate_read_effect_is_fallible_before_dirtying() {
     let image = image();
     let mut successful_storage = ModelStorage::new(image.clone());
     let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction();
+    let mut transaction = successful.begin_transaction(&mut successful_storage);
     transaction.reserve_blocks(4).unwrap();
-    transaction
-        .truncate_to_zero(&mut successful_storage, "/dir/hello.txt")
-        .unwrap();
+    transaction.truncate_to_zero("/dir/hello.txt").unwrap();
     drop(transaction);
     let effects = successful_storage.effects().len();
 
@@ -3248,13 +3125,11 @@ fn every_truncate_read_effect_is_fallible_before_dirtying() {
                 if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction();
+                let mut transaction = fs.begin_transaction(&mut storage);
                 transaction.reserve_blocks(4).unwrap();
                 assert!(
-                    (transaction
-                        .truncate_to_zero(&mut storage, "/dir/hello.txt")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
+                    (transaction.truncate_to_zero("/dir/hello.txt").unwrap_err())
+                        .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
