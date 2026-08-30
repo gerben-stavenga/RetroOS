@@ -7,7 +7,7 @@
 
 use crate::checksum::Checksum;
 use crate::ondisk::{le16, le32};
-use crate::{Corrupt, Error, Unsupported, EXTENT_MAGIC};
+use crate::{Corrupt, EXTENT_MAGIC, Error, Unsupported};
 use alloc::vec::Vec;
 
 pub(crate) const MAX_DEPTH: u16 = 5;
@@ -44,12 +44,12 @@ pub(crate) struct Extent {
 }
 
 impl Extent {
-    pub(crate) fn new<E>(
+    pub(crate) fn new(
         logical: u32,
         physical: u64,
         length: u32,
         state: ExtentState,
-    ) -> Result<Self, Error<E>> {
+    ) -> Result<Self, Error> {
         let max = match state {
             ExtentState::Written => WRITTEN_MAX_LEN,
             ExtentState::Unwritten => UNWRITTEN_MAX_LEN,
@@ -152,7 +152,7 @@ impl ExtentNode {
         }
     }
 
-    fn validate<E>(&self, block_capacity: usize, root: bool) -> Result<(), Error<E>> {
+    fn validate(&self, block_capacity: usize, root: bool) -> Result<(), Error> {
         let capacity = if root { ROOT_CAPACITY } else { block_capacity };
         match &self.entries {
             NodeEntries::Leaf(extents) => {
@@ -161,7 +161,7 @@ impl ExtentNode {
                 }
                 let mut previous = None;
                 for &extent in extents {
-                    Extent::new::<E>(extent.logical, extent.physical, extent.length, extent.state)?;
+                    Extent::new(extent.logical, extent.physical, extent.length, extent.state)?;
                     if previous.is_some_and(|end| u64::from(extent.logical) < end) {
                         return Err(Corrupt::InvalidExtentTree.into());
                     }
@@ -204,12 +204,12 @@ impl ExtentNode {
         }
     }
 
-    fn insert<E>(
+    fn insert(
         &mut self,
         extent: Extent,
         capacity: usize,
         block_capacity: usize,
-    ) -> Result<Option<Self>, Error<E>> {
+    ) -> Result<Option<Self>, Error> {
         match &mut self.entries {
             NodeEntries::Leaf(extents) => {
                 let position = extents
@@ -252,14 +252,14 @@ impl ExtentNode {
         }))
     }
 
-    fn set_state_range<E>(
+    fn set_state_range(
         &mut self,
         start: u64,
         end: u64,
         state: ExtentState,
         capacity: usize,
         block_capacity: usize,
-    ) -> Result<Option<Self>, Error<E>> {
+    ) -> Result<Option<Self>, Error> {
         let changed = match &mut self.entries {
             NodeEntries::Leaf(extents) => {
                 let mut changed = false;
@@ -354,13 +354,13 @@ impl ExtentNode {
         }
     }
 
-    fn remove_range<E>(
+    fn remove_range(
         &mut self,
         start: u64,
         end: u64,
         removed_extents: &mut Vec<Extent>,
         released_nodes: &mut Vec<u64>,
-    ) -> Result<bool, Error<E>> {
+    ) -> Result<bool, Error> {
         let changed = match &mut self.entries {
             NodeEntries::Leaf(extents) => remove_from_leaf(extents, start, end, removed_extents)?,
             NodeEntries::Branch(children) => {
@@ -388,10 +388,7 @@ impl ExtentNode {
         Ok(changed)
     }
 
-    fn assign_new_blocks<E>(
-        &mut self,
-        blocks: &mut impl Iterator<Item = u64>,
-    ) -> Result<(), Error<E>> {
+    fn assign_new_blocks(&mut self, blocks: &mut impl Iterator<Item = u64>) -> Result<(), Error> {
         if self.location == NodeLocation::Unassigned {
             self.location = NodeLocation::Block(blocks.next().ok_or(Corrupt::InvalidExtentTree)?);
         }
@@ -422,13 +419,13 @@ pub(crate) struct ExtentTree {
 }
 
 impl ExtentTree {
-    pub(crate) fn load<E>(
+    pub(crate) fn load(
         root: &[u8],
         block_size: usize,
         blocks_count: u64,
         identity: ExtentIdentity,
-        mut read_block: impl FnMut(u64) -> Result<Vec<u8>, Error<E>>,
-    ) -> Result<Self, Error<E>> {
+        mut read_block: impl FnMut(u64) -> Result<Vec<u8>, Error>,
+    ) -> Result<Self, Error> {
         let block_capacity = block_size
             .checked_sub(16)
             .ok_or(Corrupt::InvalidExtentTree)?
@@ -436,7 +433,7 @@ impl ExtentTree {
         if block_capacity <= ROOT_CAPACITY {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        let depth = extent_header::<E>(root, ROOT_CAPACITY)?;
+        let depth = extent_header(root, ROOT_CAPACITY)?;
         if depth > MAX_DEPTH {
             return Err(Unsupported::ExtentTreeTooDeep.into());
         }
@@ -478,7 +475,7 @@ impl ExtentTree {
         Ok(tree)
     }
 
-    pub(crate) fn new<E>(root: ExtentNode, block_capacity: usize) -> Result<Self, Error<E>> {
+    pub(crate) fn new(root: ExtentNode, block_capacity: usize) -> Result<Self, Error> {
         if root.location != NodeLocation::Root || block_capacity <= ROOT_CAPACITY {
             return Err(Corrupt::InvalidExtentTree.into());
         }
@@ -490,8 +487,8 @@ impl ExtentTree {
         })
     }
 
-    pub(crate) fn insert<E>(&mut self, extent: Extent) -> Result<(), Error<E>> {
-        Extent::new::<E>(extent.logical, extent.physical, extent.length, extent.state)?;
+    pub(crate) fn insert(&mut self, extent: Extent) -> Result<(), Error> {
+        Extent::new(extent.logical, extent.physical, extent.length, extent.state)?;
         if self
             .root
             .overlaps(u64::from(extent.logical), extent.logical_end())
@@ -526,7 +523,7 @@ impl ExtentTree {
 
     /// Remove mappings in `[start, end)`, trimming or splitting boundary
     /// extents and preserving the physical offset of any surviving suffix.
-    pub(crate) fn remove<E>(&mut self, start: u64, end: u64) -> Result<Vec<Extent>, Error<E>> {
+    pub(crate) fn remove(&mut self, start: u64, end: u64) -> Result<Vec<Extent>, Error> {
         if start >= end {
             return Ok(Vec::new());
         }
@@ -563,12 +560,12 @@ impl ExtentTree {
     /// Change the initialized state of every mapped block in `[start, end)`.
     /// Holes remain holes. Boundary records are split as needed, then ordinary
     /// insertion performs all merging, node splitting, and root promotion.
-    pub(crate) fn set_state<E>(
+    pub(crate) fn set_state(
         &mut self,
         start: u64,
         end: u64,
         state: ExtentState,
-    ) -> Result<(), Error<E>> {
+    ) -> Result<(), Error> {
         if start >= end || !node_has_different_state(&self.root, start, end, state) {
             return Ok(());
         }
@@ -609,7 +606,7 @@ impl ExtentTree {
         }
     }
 
-    pub(crate) fn assign_blocks<E>(&mut self, blocks: &[u64]) -> Result<(), Error<E>> {
+    pub(crate) fn assign_blocks(&mut self, blocks: &[u64]) -> Result<(), Error> {
         if blocks.len() != self.unassigned_blocks()
             || blocks.iter().enumerate().any(|(index, block)| {
                 *block == 0
@@ -637,8 +634,8 @@ impl ExtentTree {
         &self.released_nodes
     }
 
-    pub(crate) fn data_extents<E>(&self) -> Result<Vec<Extent>, Error<E>> {
-        fn collect<E>(node: &ExtentNode, out: &mut Vec<Extent>) -> Result<(), Error<E>> {
+    pub(crate) fn data_extents(&self) -> Result<Vec<Extent>, Error> {
+        fn collect(node: &ExtentNode, out: &mut Vec<Extent>) -> Result<(), Error> {
             match &node.entries {
                 NodeEntries::Leaf(extents) => {
                     out.try_reserve_exact(extents.len())
@@ -680,12 +677,8 @@ impl ExtentTree {
         find(&self.root, logical)
     }
 
-    pub(crate) fn external_blocks_by_level<E>(&self) -> Result<Vec<u64>, Error<E>> {
-        fn collect<E>(
-            node: &ExtentNode,
-            wanted_depth: u16,
-            out: &mut Vec<u64>,
-        ) -> Result<(), Error<E>> {
+    pub(crate) fn external_blocks_by_level(&self) -> Result<Vec<u64>, Error> {
+        fn collect(node: &ExtentNode, wanted_depth: u16, out: &mut Vec<u64>) -> Result<(), Error> {
             if node.depth() == wanted_depth {
                 if let NodeLocation::Block(number) = node.location {
                     out.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
@@ -708,22 +701,22 @@ impl ExtentTree {
         Ok(blocks)
     }
 
-    pub(crate) fn write_root<E>(&self, target: &mut [u8]) -> Result<(), Error<E>> {
+    pub(crate) fn write_root(&self, target: &mut [u8]) -> Result<(), Error> {
         write_node(target, &self.root, ROOT_CAPACITY)
     }
 
-    pub(crate) fn serialize_dirty<E>(
+    pub(crate) fn serialize_dirty(
         &self,
         block_size: usize,
         identity: ExtentIdentity,
-    ) -> Result<Vec<SerializedNode>, Error<E>> {
-        fn collect<E>(
+    ) -> Result<Vec<SerializedNode>, Error> {
+        fn collect(
             node: &ExtentNode,
             block_size: usize,
             capacity: usize,
             identity: ExtentIdentity,
             out: &mut Vec<SerializedNode>,
-        ) -> Result<(), Error<E>> {
+        ) -> Result<(), Error> {
             if node.dirty {
                 let NodeLocation::Block(number) = node.location else {
                     return Err(Corrupt::InvalidExtentTree.into());
@@ -785,7 +778,7 @@ impl ExtentTree {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn load_node<E>(
+fn load_node(
     bytes: &[u8],
     location: NodeLocation,
     expected_depth: u16,
@@ -794,9 +787,9 @@ fn load_node<E>(
     blocks_count: u64,
     identity: ExtentIdentity,
     visited: &mut Vec<u64>,
-    read_block: &mut impl FnMut(u64) -> Result<Vec<u8>, Error<E>>,
-) -> Result<ExtentNode, Error<E>> {
-    let depth = extent_header::<E>(bytes, capacity)?;
+    read_block: &mut impl FnMut(u64) -> Result<Vec<u8>, Error>,
+) -> Result<ExtentNode, Error> {
+    let depth = extent_header(bytes, capacity)?;
     if depth != expected_depth {
         return Err(Corrupt::InvalidExtentTree.into());
     }
@@ -874,7 +867,7 @@ fn load_node<E>(
     Ok(ExtentNode::branch(location, children))
 }
 
-fn extent_header<E>(bytes: &[u8], capacity: usize) -> Result<u16, Error<E>> {
+fn extent_header(bytes: &[u8], capacity: usize) -> Result<u16, Error> {
     if bytes.len() < 12 + capacity * 12
         || le16(bytes, 0) != EXTENT_MAGIC
         || usize::from(le16(bytes, 2)) > capacity
@@ -885,11 +878,11 @@ fn extent_header<E>(bytes: &[u8], capacity: usize) -> Result<u16, Error<E>> {
     Ok(le16(bytes, 6))
 }
 
-fn verify_node_checksum<E>(
+fn verify_node_checksum(
     bytes: &[u8],
     capacity: usize,
     identity: ExtentIdentity,
-) -> Result<(), Error<E>> {
+) -> Result<(), Error> {
     if !identity.metadata_checksums {
         return Ok(());
     }
@@ -907,7 +900,7 @@ fn verify_node_checksum<E>(
     Ok(())
 }
 
-fn write_node<E>(target: &mut [u8], node: &ExtentNode, capacity: usize) -> Result<(), Error<E>> {
+fn write_node(target: &mut [u8], node: &ExtentNode, capacity: usize) -> Result<(), Error> {
     if target.len() < 12 + capacity * 12 || node.entry_count() > capacity {
         return Err(Corrupt::InvalidExtentTree.into());
     }
@@ -969,12 +962,12 @@ fn merge_leaf(extents: &mut Vec<Extent>) {
     }
 }
 
-fn remove_from_leaf<E>(
+fn remove_from_leaf(
     extents: &mut Vec<Extent>,
     start: u64,
     end: u64,
     removed_extents: &mut Vec<Extent>,
-) -> Result<bool, Error<E>> {
+) -> Result<bool, Error> {
     let mut changed = false;
     let mut output = Vec::new();
     output
@@ -1021,7 +1014,7 @@ fn remove_from_leaf<E>(
     Ok(changed)
 }
 
-fn collect_blocks<E>(node: ExtentNode, blocks: &mut Vec<u64>) -> Result<(), Error<E>> {
+fn collect_blocks(node: ExtentNode, blocks: &mut Vec<u64>) -> Result<(), Error> {
     if let NodeLocation::Block(block) = node.location {
         blocks.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         blocks.push(block);
@@ -1097,22 +1090,22 @@ mod tests {
     use alloc::vec;
 
     fn extent(logical: u32, physical: u64, length: u32) -> Extent {
-        Extent::new::<()>(logical, physical, length, ExtentState::Written).unwrap()
+        Extent::new(logical, physical, length, ExtentState::Written).unwrap()
     }
 
     #[test]
     fn insertion_splits_and_promotes_at_every_level() {
         let root = ExtentNode::leaf(NodeLocation::Root, Vec::new());
-        let mut tree = ExtentTree::new::<()>(root, 8).unwrap();
+        let mut tree = ExtentTree::new(root, 8).unwrap();
         for index in 0..80 {
-            tree.insert::<()>(extent(index * 2, 1000 + u64::from(index) * 2, 1))
+            tree.insert(extent(index * 2, 1000 + u64::from(index) * 2, 1))
                 .unwrap();
         }
         assert!(tree.root.depth() >= 2);
         assert!(tree.unassigned_blocks() > 0);
         let blocks: Vec<u64> = (1..=tree.unassigned_blocks() as u64).collect();
-        tree.assign_blocks::<()>(&blocks).unwrap();
-        tree.root.validate::<()>(8, true).unwrap();
+        tree.assign_blocks(&blocks).unwrap();
+        tree.root.validate(8, true).unwrap();
         assert_eq!(tree.extents().len(), 80);
     }
 
@@ -1122,17 +1115,17 @@ mod tests {
             NodeLocation::Root,
             vec![extent(0, 100, 8), extent(20, 200, 8)],
         );
-        let mut tree = ExtentTree::new::<()>(root, 8).unwrap();
-        tree.remove::<()>(3, 24).unwrap();
+        let mut tree = ExtentTree::new(root, 8).unwrap();
+        tree.remove(3, 24).unwrap();
         assert_eq!(tree.extents(), vec![extent(0, 100, 3), extent(24, 204, 4)]);
     }
 
     #[test]
     fn adjacent_compatible_extents_merge_but_unwritten_does_not() {
         let root = ExtentNode::leaf(NodeLocation::Root, vec![extent(0, 100, 3)]);
-        let mut tree = ExtentTree::new::<()>(root, 8).unwrap();
-        tree.insert::<()>(extent(3, 103, 2)).unwrap();
-        tree.insert::<()>(Extent::new::<()>(5, 105, 2, ExtentState::Unwritten).unwrap())
+        let mut tree = ExtentTree::new(root, 8).unwrap();
+        tree.insert(extent(3, 103, 2)).unwrap();
+        tree.insert(Extent::new(5, 105, 2, ExtentState::Unwritten).unwrap())
             .unwrap();
         assert_eq!(tree.extents().len(), 2);
         assert_eq!(tree.extents()[0], extent(0, 100, 5));
@@ -1140,17 +1133,17 @@ mod tests {
 
     #[test]
     fn state_conversion_splits_boundaries_and_preserves_holes() {
-        let unwritten = Extent::new::<()>(0, 100, 10, ExtentState::Unwritten).unwrap();
-        let mut tree = ExtentTree::new::<()>(
+        let unwritten = Extent::new(0, 100, 10, ExtentState::Unwritten).unwrap();
+        let mut tree = ExtentTree::new(
             ExtentNode::leaf(NodeLocation::Root, vec![unwritten, extent(20, 200, 4)]),
             8,
         )
         .unwrap();
-        tree.set_state::<()>(3, 22, ExtentState::Written).unwrap();
+        tree.set_state(3, 22, ExtentState::Written).unwrap();
         assert_eq!(
             tree.extents(),
             vec![
-                Extent::new::<()>(0, 100, 3, ExtentState::Unwritten).unwrap(),
+                Extent::new(0, 100, 3, ExtentState::Unwritten).unwrap(),
                 extent(3, 103, 7),
                 extent(20, 200, 4),
             ]
@@ -1171,8 +1164,8 @@ mod tests {
             entries: NodeEntries::Leaf(vec![extent(10, 200, 2)]),
         };
         let root = ExtentNode::branch(NodeLocation::Root, vec![left, right]);
-        let mut tree = ExtentTree::new::<()>(root, 8).unwrap();
-        tree.remove::<()>(0, 2).unwrap();
+        let mut tree = ExtentTree::new(root, 8).unwrap();
+        tree.remove(0, 2).unwrap();
         assert_eq!(tree.root.depth(), 0);
         assert_eq!(tree.root.location, NodeLocation::Root);
         assert_eq!(tree.extents(), vec![extent(10, 200, 2)]);
@@ -1182,13 +1175,13 @@ mod tests {
     #[test]
     fn serialized_tree_round_trips_at_arbitrary_depth() {
         let mut tree =
-            ExtentTree::new::<()>(ExtentNode::leaf(NodeLocation::Root, Vec::new()), 8).unwrap();
+            ExtentTree::new(ExtentNode::leaf(NodeLocation::Root, Vec::new()), 8).unwrap();
         for index in 0..40 {
-            tree.insert::<()>(extent(index * 3, 1000 + u64::from(index) * 3, 1))
+            tree.insert(extent(index * 3, 1000 + u64::from(index) * 3, 1))
                 .unwrap();
         }
         let assigned: Vec<u64> = (10..10 + tree.unassigned_blocks() as u64).collect();
-        tree.assign_blocks::<()>(&assigned).unwrap();
+        tree.assign_blocks(&assigned).unwrap();
         let identity = ExtentIdentity {
             checksum_seed: 0x1234_5678,
             inode: 42,
@@ -1196,17 +1189,17 @@ mod tests {
             metadata_checksums: true,
         };
         let mut root = [0u8; 60];
-        tree.write_root::<()>(&mut root).unwrap();
-        let serialized = tree.serialize_dirty::<()>(112, identity).unwrap();
+        tree.write_root(&mut root).unwrap();
+        let serialized = tree.serialize_dirty(112, identity).unwrap();
         let loaded = ExtentTree::load(&root, 112, 10_000, identity, |number| {
             serialized
                 .iter()
                 .find(|node| node.number == number)
                 .map(|node| node.bytes.clone())
-                .ok_or(Error::<()>::NotFound)
+                .ok_or(Error::NotFound)
         })
         .unwrap();
-        assert_eq!(loaded.data_extents::<()>().unwrap(), tree.extents());
+        assert_eq!(loaded.data_extents().unwrap(), tree.extents());
         assert_eq!(loaded.root.depth(), tree.root.depth());
     }
 
@@ -1215,8 +1208,8 @@ mod tests {
         let last = extent(u32::MAX, 100, 1);
         assert_eq!(last.logical_end(), 1_u64 << 32);
         let mut tree =
-            ExtentTree::new::<()>(ExtentNode::leaf(NodeLocation::Root, vec![last]), 8).unwrap();
-        let removed = tree.remove::<()>(u64::from(u32::MAX), 1_u64 << 32).unwrap();
+            ExtentTree::new(ExtentNode::leaf(NodeLocation::Root, vec![last]), 8).unwrap();
+        let removed = tree.remove(u64::from(u32::MAX), 1_u64 << 32).unwrap();
         assert_eq!(removed, vec![last]);
         assert!(tree.extents().is_empty());
     }

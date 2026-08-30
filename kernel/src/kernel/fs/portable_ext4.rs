@@ -5,10 +5,11 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use core::cell::{Cell, RefCell};
+use core::any::Any;
+use core::cell::RefCell;
 
 use crate::kernel::block::Volume;
 use crate::kernel::vfs::{DirEntry, Filesystem, Meta, Stat, Vnode};
@@ -35,24 +36,23 @@ impl VolumeStorage {
 }
 
 impl Storage for VolumeStorage {
-    type Error = VolumeError;
-
     fn len(&self) -> u64 {
         self.volume.sectors.saturating_mul(512)
     }
 
-    fn read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Self::Error> {
+    fn read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Box<dyn Any>> {
         let end = offset
             .checked_add(dst.len() as u64)
             .filter(|end| *end <= self.len())
-            .ok_or(VolumeError::OutOfBounds)?;
+            .ok_or(VolumeError::OutOfBounds)
+            .map_err(|error| Box::new(error) as Box<dyn Any>)?;
         if dst.is_empty() {
             return Ok(());
         }
         if offset.is_multiple_of(512) && dst.len().is_multiple_of(512) {
             let expected = dst.len() / 512;
             if self.volume.read(offset / 512, dst) as usize != expected {
-                return Err(VolumeError::ShortRead);
+                return Err(Box::new(VolumeError::ShortRead));
             }
             return Ok(());
         }
@@ -62,7 +62,7 @@ impl Storage for VolumeStorage {
         while position < end {
             let lba = position / 512;
             if self.volume.read(lba, &mut sector) != 1 {
-                return Err(VolumeError::ShortRead);
+                return Err(Box::new(VolumeError::ShortRead));
             }
             let within = (position % 512) as usize;
             let amount = (dst.len() - copied).min(512 - within);
@@ -73,18 +73,19 @@ impl Storage for VolumeStorage {
         Ok(())
     }
 
-    fn write(&mut self, offset: u64, src: &[u8]) -> Result<(), Self::Error> {
+    fn write(&mut self, offset: u64, src: &[u8]) -> Result<(), Box<dyn Any>> {
         let end = offset
             .checked_add(src.len() as u64)
             .filter(|end| *end <= self.len())
-            .ok_or(VolumeError::OutOfBounds)?;
+            .ok_or(VolumeError::OutOfBounds)
+            .map_err(|error| Box::new(error) as Box<dyn Any>)?;
         if src.is_empty() {
             return Ok(());
         }
         if offset.is_multiple_of(512) && src.len().is_multiple_of(512) {
             let expected = src.len() / 512;
             if self.volume.write(offset / 512, src) as usize != expected {
-                return Err(VolumeError::ShortWrite);
+                return Err(Box::new(VolumeError::ShortWrite));
             }
             return Ok(());
         }
@@ -95,13 +96,13 @@ impl Storage for VolumeStorage {
         while position < end {
             let lba = position / 512;
             if self.volume.read(lba, &mut sector) != 1 {
-                return Err(VolumeError::ShortRead);
+                return Err(Box::new(VolumeError::ShortRead));
             }
             let within = (position % 512) as usize;
             let amount = (src.len() - copied).min(512 - within);
             sector[within..within + amount].copy_from_slice(&src[copied..copied + amount]);
             if self.volume.write(lba, &sector) != 1 {
-                return Err(VolumeError::ShortWrite);
+                return Err(Box::new(VolumeError::ShortWrite));
             }
             copied += amount;
             position += amount as u64;
@@ -109,21 +110,84 @@ impl Storage for VolumeStorage {
         Ok(())
     }
 
-    fn flush(&mut self) -> Result<(), Self::Error> {
+    fn flush(&mut self) -> Result<(), Box<dyn Any>> {
         Ok(())
     }
 }
 
-struct OpenFile {
-    inode: Inode,
+struct OpenFileSlot {
+    generation: u32,
+    inode: Option<Inode>,
+}
+
+#[derive(Default)]
+struct OpenFiles {
+    slots: Vec<OpenFileSlot>,
+    free: Vec<u32>,
+}
+
+impl OpenFiles {
+    fn handle(index: usize, generation: u32) -> u64 {
+        (u64::from(generation) << 32) | (index as u64 + 1)
+    }
+
+    fn locate(&self, handle: u64) -> Option<usize> {
+        let index = usize::try_from((handle as u32).checked_sub(1)?).ok()?;
+        let generation = (handle >> 32) as u32;
+        self.slots
+            .get(index)
+            .filter(|slot| slot.generation == generation && slot.inode.is_some())
+            .map(|_| index)
+    }
+
+    fn insert(&mut self, inode: Inode) -> u64 {
+        if let Some(index) = self.free.pop() {
+            let index = index as usize;
+            let slot = &mut self.slots[index];
+            debug_assert!(slot.inode.is_none());
+            slot.inode = Some(inode);
+            return Self::handle(index, slot.generation);
+        }
+        assert!(
+            self.slots.len() < u32::MAX as usize,
+            "ext4 open-file table exhausted"
+        );
+        let index = self.slots.len();
+        self.slots.push(OpenFileSlot {
+            generation: 1,
+            inode: Some(inode),
+        });
+        Self::handle(index, 1)
+    }
+
+    fn inode(&self, handle: u64) -> Option<&Inode> {
+        self.slots.get(self.locate(handle)?)?.inode.as_ref()
+    }
+
+    fn contains_inode(&self, number: u32) -> bool {
+        self.slots.iter().any(|slot| {
+            slot.inode
+                .as_ref()
+                .is_some_and(|inode| inode.number == number)
+        })
+    }
+
+    fn remove(&mut self, handle: u64) {
+        let Some(index) = self.locate(handle) else {
+            return;
+        };
+        let slot = &mut self.slots[index];
+        slot.inode = None;
+        slot.generation = slot.generation.wrapping_add(1).max(1);
+        self.free.push(index as u32);
+    }
 }
 
 /// Writable VFS adapter for the portable ext4 engine.
 pub struct PortableExt4Fs {
     filesystem: RefCell<Ext4>,
     storage: RefCell<VolumeStorage>,
-    open_files: RefCell<BTreeMap<u64, OpenFile>>,
-    next_handle: Cell<u64>,
+    open_files: RefCell<OpenFiles>,
 }
 
 impl PortableExt4Fs {
@@ -133,8 +197,7 @@ impl PortableExt4Fs {
         Ok(Self {
             filesystem: RefCell::new(filesystem),
             storage: RefCell::new(storage),
-            open_files: RefCell::new(BTreeMap::new()),
-            next_handle: Cell::new(1),
+            open_files: RefCell::new(OpenFiles::default()),
         })
     }
 
@@ -147,12 +210,7 @@ impl PortableExt4Fs {
     }
 
     fn allocate_handle(&self, inode: Inode) -> u64 {
-        let handle = self.next_handle.get();
-        self.next_handle.set(handle.wrapping_add(1));
-        self.open_files
-            .borrow_mut()
-            .insert(handle, OpenFile { inode });
-        handle
+        self.open_files.borrow_mut().insert(inode)
     }
 
     fn split_parent(path: &str) -> Option<(&str, &str)> {
@@ -202,7 +260,9 @@ impl PortableExt4Fs {
         }
         let mut inode = filesystem.root(storage).map_err(|_| ())?;
         for component in path.split('/').filter(|component| !component.is_empty()) {
-            if component == "." || component == ".." || component.len() > 255
+            if component == "."
+                || component == ".."
+                || component.len() > 255
                 || !inode.is_directory()
             {
                 return Err(());
@@ -235,17 +295,62 @@ impl PortableExt4Fs {
     fn commit(
         &self,
         reserve: usize,
-        operation: impl FnOnce(
+        operation: &mut dyn FnMut(
             &mut portable_ext4::Transaction<'_>,
-            &mut VolumeStorage,
-        ) -> Result<(), portable_ext4::Error<VolumeError>>,
+            &mut dyn Storage,
+        ) -> Result<(), portable_ext4::Error>,
     ) -> bool {
         let mut filesystem = self.filesystem.borrow_mut();
         let mut storage = self.storage.borrow_mut();
         let mut transaction = filesystem.begin_transaction();
         transaction.reserve_blocks(reserve).is_ok()
-            && operation(&mut transaction, &mut storage).is_ok()
+            && operation(&mut transaction, &mut *storage).is_ok()
             && transaction.commit(&mut *storage).is_ok()
+    }
+
+    fn open_inode(&self, inode: Inode) -> Option<Vnode> {
+        if inode.is_directory() || inode.is_symlink() {
+            return None;
+        }
+        Some(Vnode {
+            handle: self.allocate_handle(inode.clone()),
+            size: inode.size.min(u64::from(u32::MAX)) as u32,
+            mode: inode.mode & 0x0fff,
+        })
+    }
+
+    fn readlink_inode(&self, inode: &Inode, out: &mut [u8]) -> Option<usize> {
+        let target = self
+            .filesystem
+            .borrow_mut()
+            .read_symlink(&mut *self.storage.borrow_mut(), inode)
+            .ok()?;
+        let len = target.len().min(out.len());
+        out[..len].copy_from_slice(&target[..len]);
+        Some(len)
+    }
+
+    fn readdir_inode(
+        &self,
+        directory: &Inode,
+        cookie: u64,
+        output: &mut Vec<DirEntry>,
+        max: usize,
+    ) -> Option<u64> {
+        let mut entries = Vec::new();
+        let next = self
+            .filesystem
+            .borrow_mut()
+            .list(
+                &mut *self.storage.borrow_mut(),
+                directory,
+                cookie,
+                &mut entries,
+                max,
+            )
+            .ok()?;
+        Self::append_directory_entries(output, entries);
+        next
     }
 
     fn append_directory_entries(output: &mut Vec<DirEntry>, entries: Vec<ExtDirectoryEntry>) {
@@ -304,14 +409,7 @@ impl Filesystem for PortableExt4Fs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let path = Self::path(path)?;
         let inode = self.resolve(&path).ok()?;
-        if inode.is_directory() || inode.is_symlink() {
-            return None;
-        }
-        Some(Vnode {
-            handle: self.allocate_handle(inode.clone()),
-            size: inode.size.min(u64::from(u32::MAX)) as u32,
-            mode: inode.mode & 0x0fff,
-        })
+        self.open_inode(inode)
     }
 
     fn open_node(&self, node: u64) -> Option<Vnode> {
@@ -321,14 +419,7 @@ impl Filesystem for PortableExt4Fs {
             .borrow_mut()
             .inode(&mut *self.storage.borrow_mut(), number)
             .ok()?;
-        if inode.is_directory() || inode.is_symlink() {
-            return None;
-        }
-        Some(Vnode {
-            handle: self.allocate_handle(inode.clone()),
-            size: inode.size.min(u64::from(u32::MAX)) as u32,
-            mode: inode.mode & 0x0fff,
-        })
+        self.open_inode(inode)
     }
 
     fn readlink_node(&self, node: u64, out: &mut [u8]) -> Option<usize> {
@@ -337,14 +428,7 @@ impl Filesystem for PortableExt4Fs {
             .borrow_mut()
             .inode(&mut *self.storage.borrow_mut(), u32::try_from(node).ok()?)
             .ok()?;
-        let target = self
-            .filesystem
-            .borrow_mut()
-            .read_symlink(&mut *self.storage.borrow_mut(), &inode)
-            .ok()?;
-        let len = target.len().min(out.len());
-        out[..len].copy_from_slice(&target[..len]);
-        Some(len)
+        self.readlink_inode(&inode, out)
     }
 
     fn readdir_node(
@@ -354,28 +438,18 @@ impl Filesystem for PortableExt4Fs {
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
-        let mut filesystem = self.filesystem.borrow_mut();
-        let mut storage = self.storage.borrow_mut();
-        let directory = filesystem.inode(&mut *storage, u32::try_from(node).ok()?).ok()?;
-        let mut entries = Vec::new();
-        let next = filesystem
-            .list(&mut *storage, &directory, cookie, &mut entries, max)
+        let directory = self
+            .filesystem
+            .borrow_mut()
+            .inode(&mut *self.storage.borrow_mut(), u32::try_from(node).ok()?)
             .ok()?;
-        Self::append_directory_entries(output, entries);
-        next
+        self.readdir_inode(&directory, cookie, output, max)
     }
 
     fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
         let path = Self::path(path)?;
         let inode = self.resolve(&path).ok()?;
-        let target = self
-            .filesystem
-            .borrow_mut()
-            .read_symlink(&mut *self.storage.borrow_mut(), &inode)
-            .ok()?;
-        let len = target.len().min(out.len());
-        out[..len].copy_from_slice(&target[..len]);
-        Some(len)
+        self.readlink_inode(&inode, out)
     }
 
     fn stat(&self, path: &[u8], _follow_final: bool) -> Option<Stat> {
@@ -393,10 +467,10 @@ impl Filesystem for PortableExt4Fs {
     fn read(&self, handle: u64, offset: u32, buffer: &mut [u8], _size: u32) -> i32 {
         let inode = {
             let files = self.open_files.borrow();
-            let Some(file) = files.get(&handle) else {
+            let Some(inode) = files.inode(handle) else {
                 return -9;
             };
-            file.inode.clone()
+            inode.clone()
         };
         self.filesystem
             .borrow_mut()
@@ -412,10 +486,10 @@ impl Filesystem for PortableExt4Fs {
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
         let inode = {
             let files = self.open_files.borrow();
-            let Some(file) = files.get(&handle) else {
+            let Some(inode) = files.inode(handle) else {
                 return -9;
             };
-            file.inode.clone()
+            inode.clone()
         };
         let offset = u64::from(offset);
         let current = match self
@@ -429,7 +503,7 @@ impl Filesystem for PortableExt4Fs {
         if offset > current.size
             && !self.commit(
                 Self::reserve_for_data((offset - current.size) as usize),
-                |transaction, storage| transaction.resize_inode(storage, &current, offset),
+                &mut |transaction, storage| transaction.resize_inode(storage, &current, offset),
             )
         {
             return -5;
@@ -447,7 +521,7 @@ impl Filesystem for PortableExt4Fs {
         };
         if self.commit(
             Self::reserve_for_data(data.len()),
-            |transaction, storage| transaction.write_inode(storage, &inode, offset, data),
+            &mut |transaction, storage| transaction.write_inode(storage, &inode, offset, data),
         ) {
             data.len() as i32
         } else {
@@ -460,13 +534,13 @@ impl Filesystem for PortableExt4Fs {
         let exists = self.resolve(&path).ok();
         let success = if let Some(inode) = exists {
             !inode.is_directory()
-                && self.commit(64, |transaction, storage| {
+                && self.commit(64, &mut |transaction, storage| {
                     transaction.resize_inode(storage, &inode, 0)
                 })
         } else {
             let (parent, name) = Self::split_parent(&path)?;
             let parent = self.resolve(parent).ok()?;
-            self.commit(64, |transaction, storage| {
+            self.commit(64, &mut |transaction, storage| {
                 transaction
                     .create_file(storage, &parent, name.as_bytes(), 0o664)
                     .map(|_| ())
@@ -497,7 +571,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok(parent) = self.resolve(parent) else {
             return -2;
         };
-        if self.commit(64, |transaction, storage| {
+        if self.commit(64, &mut |transaction, storage| {
             transaction
                 .create_directory(storage, &parent, name.as_bytes(), 0o775)
                 .map(|_| ())
@@ -519,7 +593,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok((parent, entry)) = self.parent_entry(&path) else {
             return -2;
         };
-        if self.commit(64, |transaction, storage| {
+        if self.commit(64, &mut |transaction, storage| {
             transaction.remove_directory(storage, &parent, &entry)
         }) {
             0
@@ -554,7 +628,7 @@ impl Filesystem for PortableExt4Fs {
                 Err(()) => return -5,
             }
         };
-        if !self.commit(96, |transaction, storage| {
+        if !self.commit(96, &mut |transaction, storage| {
             transaction.move_entry(
                 storage,
                 &old_parent,
@@ -586,27 +660,12 @@ impl Filesystem for PortableExt4Fs {
     ) -> Option<u64> {
         let path = Self::path(directory)?;
         let directory = self.resolve(&path).ok()?;
-        let mut entries = Vec::new();
-        let next = self
-            .filesystem
-            .borrow_mut()
-            .list(
-                &mut *self.storage.borrow_mut(),
-                &directory,
-                cookie,
-                &mut entries,
-                max,
-            )
-            .ok()?;
-        Self::append_directory_entries(output, entries);
-        next
+        self.readdir_inode(&directory, cookie, output, max)
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
-        Self::path(path).is_some_and(|path| {
-            self.resolve(&path)
-                .is_ok_and(|inode| inode.is_directory())
-        })
+        Self::path(path)
+            .is_some_and(|path| self.resolve(&path).is_ok_and(|inode| inode.is_directory()))
     }
 
     fn mtime(&self, path: &[u8]) -> Option<u32> {
@@ -623,7 +682,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok(inode) = self.resolve(&path) else {
             return false;
         };
-        self.commit(4, |transaction, storage| {
+        self.commit(4, &mut |transaction, storage| {
             transaction.set_inode_times(
                 storage,
                 &inode,
@@ -657,7 +716,7 @@ impl Filesystem for PortableExt4Fs {
         let Ok(inode) = self.resolve(&path) else {
             return false;
         };
-        self.commit(4, |transaction, storage| {
+        self.commit(4, &mut |transaction, storage| {
             transaction.update_metadata(
                 storage,
                 &inode,
@@ -678,15 +737,10 @@ impl Filesystem for PortableExt4Fs {
         let Ok((parent, entry)) = self.parent_entry(&path) else {
             return -2;
         };
-        if self
-            .open_files
-            .borrow()
-            .values()
-            .any(|file| file.inode.number == entry.inode.number)
-        {
+        if self.open_files.borrow().contains_inode(entry.inode.number) {
             return -16;
         }
-        if self.commit(64, |transaction, storage| {
+        if self.commit(64, &mut |transaction, storage| {
             transaction.remove_entry(storage, &parent, &entry)
         }) {
             0
@@ -696,7 +750,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn clunk(&self, handle: u64) {
-        self.open_files.borrow_mut().remove(&handle);
+        self.open_files.borrow_mut().remove(handle);
     }
 }
 
@@ -851,11 +905,14 @@ mod tests {
     fn vfs_adapter_mutates_files_and_directories() {
         let fs = filesystem();
         let vnode = fs.create(b"adapter-new").unwrap();
+        let stale_handle = vnode.handle;
         let payload = vec![0x5a; 6000];
         assert_eq!(fs.write(vnode.handle, 0, &payload), payload.len() as i32);
         fs.clunk(vnode.handle);
 
         let vnode = fs.open(b"adapter-new").unwrap();
+        assert_ne!(vnode.handle, stale_handle);
+        assert_eq!(fs.read(stale_handle, 0, &mut [0; 1], 1), -9);
         let mut contents = vec![0; payload.len()];
         assert_eq!(
             fs.read(vnode.handle, 0, &mut contents, vnode.size),

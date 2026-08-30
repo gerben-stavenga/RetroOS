@@ -46,12 +46,13 @@ fn every_legacy_lookup_effect_is_fallible() {
     for sequence in 0..effects {
         let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => assert_eq!(
+            Ok(mut fs) => assert!(
                 fs.read(&mut storage, "/large.bin", 300 * 1024, &mut contents)
-                    .unwrap_err(),
-                Error::Storage(ModelError::InjectedIo),
+                    .unwrap_err()
+                    .storage_is(&ModelError::InjectedIo)
             ),
         }
     }

@@ -685,9 +685,11 @@ fn writes_sparse_and_unwritten_extents_from_e2fsprogs() {
         unwritten_write
     );
     assert!(unwritten[..5_000].iter().all(|byte| *byte == 0));
-    assert!(unwritten[5_000 + unwritten_write.len()..]
-        .iter()
-        .all(|byte| *byte == 0));
+    assert!(
+        unwritten[5_000 + unwritten_write.len()..]
+            .iter()
+            .all(|byte| *byte == 0)
+    );
 
     let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("sparse-unwritten.img");
@@ -791,16 +793,17 @@ fn every_cross_group_allocation_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(8).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .initialize_file(&mut storage, "/target.bin", &payload)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -888,16 +891,17 @@ fn every_cross_group_inode_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(6).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .create_empty_file(&mut storage, "/create", "cross.bin", 0o640)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1059,12 +1063,16 @@ fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
     }
     let effects = successful_storage.effects().to_vec();
     let commit_end = effects.len();
-    assert!(effects[commit_start..]
-        .iter()
-        .any(|effect| effect.kind == EffectKind::Write));
-    assert!(effects[commit_start..]
-        .iter()
-        .any(|effect| effect.kind == EffectKind::Flush));
+    assert!(
+        effects[commit_start..]
+            .iter()
+            .any(|effect| effect.kind == EffectKind::Write)
+    );
+    assert!(
+        effects[commit_start..]
+            .iter()
+            .any(|effect| effect.kind == EffectKind::Flush)
+    );
 
     for sequence in commit_start..commit_end {
         let mut storage =
@@ -1078,7 +1086,7 @@ fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
                 .unwrap();
             transaction.commit(&mut storage).unwrap_err()
         };
-        assert_eq!(error, Error::Storage(ModelError::PowerLoss));
+        assert!((error).storage_is(&ModelError::PowerLoss));
         let durable = storage.durable_bytes().to_vec();
         let _ = assert_atomic_file_view(&durable, "/atomic.bin", &format!("power-loss-{sequence}"));
     }
@@ -1118,7 +1126,7 @@ fn every_failed_barrier_pending_prefix_is_old_or_new() {
                 .unwrap();
             transaction.commit(&mut storage).unwrap_err()
         };
-        assert_eq!(error, Error::Storage(ModelError::InjectedIo));
+        assert!((error).storage_is(&ModelError::InjectedIo));
         let pending = storage.pending_writes();
         assert!(pending > 0);
         for prefix in 0..=pending {
@@ -1195,9 +1203,11 @@ fn stages_checked_bitmap_and_root_extent_mutation() {
             staged[offset..offset + 4096].copy_from_slice(&block);
         }
     }
-    assert!(fs_storage.effects()[effects_before..]
-        .iter()
-        .all(|effect| effect.kind == portable_ext4::test_support::EffectKind::Read));
+    assert!(
+        fs_storage.effects()[effects_before..]
+            .iter()
+            .all(|effect| effect.kind == portable_ext4::test_support::EffectKind::Read)
+    );
     assert_eq!(fs.stat(&mut fs_storage, "/dir/empty.bin").unwrap().size, 0);
     assert_eq!(fs_storage.durable_bytes(), image);
 
@@ -1233,16 +1243,17 @@ fn every_mutation_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(5).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .append_zeroed_block(&mut storage, "/dir/empty.bin")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1280,16 +1291,17 @@ fn every_multiblock_initialize_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(7).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .initialize_file(&mut storage, "/dir/empty.bin", &payload)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1436,16 +1448,17 @@ fn every_leaf_split_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(base.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(7).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .append(&mut storage, "/root-empty.bin", &appended)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1519,16 +1532,17 @@ fn every_append_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(7).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .append(&mut storage, "/dir/hello.txt", &payload)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1712,16 +1726,17 @@ fn every_create_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(5).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .create_empty_file(&mut storage, "/", "created.bin", 0o644)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -1886,7 +1901,8 @@ fn every_link_creation_read_is_fallible_before_dirtying() {
             let mut storage =
                 ModelStorage::new(original.clone()).with_injection(Inject::IoErrorAt(sequence));
             match Ext4::mount(&mut storage) {
-                Err(Error::Storage(ModelError::InjectedIo)) => {}
+                Err(Error::Storage(error))
+                    if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
                 Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
                 Ok(mut fs) => {
                     let mut transaction = fs.begin_transaction();
@@ -1900,7 +1916,7 @@ fn every_link_creation_read_is_fallible_before_dirtying() {
                             .symlink(&mut storage, "root-data.bin", "/root-data-link")
                             .unwrap_err()
                     };
-                    assert_eq!(error, Error::Storage(ModelError::InjectedIo));
+                    assert!((error).storage_is(&ModelError::InjectedIo));
                     assert_eq!(transaction.dirty_blocks(), 0);
                 }
             }
@@ -1990,16 +2006,17 @@ fn every_unlink_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(5).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .unlink(&mut storage, "/root-empty.bin")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2068,16 +2085,17 @@ fn every_nonempty_unlink_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(6).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .unlink(&mut storage, "/root-data.bin")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2216,12 +2234,16 @@ fn mutates_entries_across_multiblock_linear_directory() {
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
     let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(remounted
-        .stat(&mut remounted_storage, "/linear/created.bin")
-        .is_ok());
-    assert!(remounted
-        .stat(&mut remounted_storage, "/linear/renamed-499")
-        .is_ok());
+    assert!(
+        remounted
+            .stat(&mut remounted_storage, "/linear/created.bin")
+            .is_ok()
+    );
+    assert!(
+        remounted
+            .stat(&mut remounted_storage, "/linear/renamed-499")
+            .is_ok()
+    );
     assert_eq!(
         remounted
             .stat(&mut remounted_storage, "/linear/file-499")
@@ -2273,9 +2295,11 @@ fn grows_a_full_multiblock_linear_directory() {
     let durable = fs_storage.durable_bytes().to_vec();
     let mut remounted_storage = ModelStorage::new(durable.clone());
     let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(remounted
-        .stat(&mut remounted_storage, "/linear/growth-00")
-        .is_ok());
+    assert!(
+        remounted
+            .stat(&mut remounted_storage, "/linear/growth-00")
+            .is_ok()
+    );
     assert!(
         remounted
             .stat(&mut remounted_storage, "/linear")
@@ -2388,16 +2412,17 @@ fn every_mkdir_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(8).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .mkdir(&mut storage, "/", "made", 0o750)
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2411,10 +2436,12 @@ fn removes_checked_empty_directory_and_restores_parent_links() {
     let mut probe_storage = ModelStorage::new(image.clone());
     let mut probe = Ext4::mount(&mut probe_storage).unwrap();
     let root_links = probe.stat(&mut probe_storage, "/").unwrap().links;
-    assert!(probe
-        .stat(&mut probe_storage, "/root-empty-dir")
-        .unwrap()
-        .is_directory());
+    assert!(
+        probe
+            .stat(&mut probe_storage, "/root-empty-dir")
+            .unwrap()
+            .is_directory()
+    );
     let mut fs_storage = ModelStorage::new(image);
     let mut fs = Ext4::mount(&mut fs_storage).unwrap();
     {
@@ -2474,16 +2501,17 @@ fn every_rmdir_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(7).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .rmdir(&mut storage, "/root-empty-dir")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2626,16 +2654,17 @@ fn every_cross_parent_rename_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(3).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .rename(&mut storage, "/root-empty.bin", "/root-empty-dir/moved.bin")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2824,16 +2853,17 @@ fn every_directory_replacement_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(original.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(9).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .rename(&mut storage, "/move-left/branch", "/root-empty-dir")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -2913,16 +2943,17 @@ fn every_replacement_rename_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(6).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .rename(&mut storage, "/root-empty.bin", "/root-data.bin")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -3024,16 +3055,17 @@ fn every_cross_parent_directory_rename_read_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(6).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .rename(&mut storage, "/move-left/branch", "/move-right/branch")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -3212,16 +3244,17 @@ fn every_truncate_read_effect_is_fallible_before_dirtying() {
         let mut storage =
             ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
             Ok(mut fs) => {
                 let mut transaction = fs.begin_transaction();
                 transaction.reserve_blocks(4).unwrap();
-                assert_eq!(
-                    transaction
+                assert!(
+                    (transaction
                         .truncate_to_zero(&mut storage, "/dir/hello.txt")
-                        .unwrap_err(),
-                    Error::Storage(ModelError::InjectedIo)
+                        .unwrap_err())
+                    .storage_is(&ModelError::InjectedIo)
                 );
                 assert_eq!(transaction.dirty_blocks(), 0);
             }
@@ -3305,12 +3338,13 @@ fn every_effect_in_modern_indexed_lookup_is_fallible() {
     for sequence in 0..effects {
         let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
         match Ext4::mount(&mut storage) {
-            Err(Error::Storage(ModelError::InjectedIo)) => {}
+            Err(Error::Storage(error))
+                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
             Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => assert_eq!(
+            Ok(mut fs) => assert!(
                 fs.read(&mut storage, "/dir/file-299", 0, &mut contents)
-                    .unwrap_err(),
-                Error::Storage(ModelError::InjectedIo),
+                    .unwrap_err()
+                    .storage_is(&ModelError::InjectedIo)
             ),
         }
     }

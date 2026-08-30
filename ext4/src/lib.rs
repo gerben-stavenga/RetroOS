@@ -17,7 +17,9 @@ mod storage;
 pub mod test_support;
 mod transaction;
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::fmt;
 pub use ondisk::Superblock;
 use ondisk::{checked_read, le16, le32};
@@ -93,9 +95,8 @@ enum DirectoryBlockKind {
     Internal,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum Error<E> {
-    Storage(E),
+pub enum Error {
+    Storage(Box<dyn Any>),
     Corrupt(Corrupt),
     Unsupported(Unsupported),
     OutOfMemory,
@@ -107,6 +108,48 @@ pub enum Error<E> {
     NotEmpty,
 }
 
+impl Error {
+    pub fn storage_is<T: core::any::Any + PartialEq>(&self, expected: &T) -> bool {
+        matches!(self, Self::Storage(error) if error.downcast_ref::<T>() == Some(expected))
+    }
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Corrupt(left), Self::Corrupt(right)) => left == right,
+            (Self::Unsupported(left), Self::Unsupported(right)) => left == right,
+            (Self::OutOfMemory, Self::OutOfMemory)
+            | (Self::NotFound, Self::NotFound)
+            | (Self::NotDirectory, Self::NotDirectory)
+            | (Self::InvalidArgument, Self::InvalidArgument)
+            | (Self::ReservationExhausted, Self::ReservationExhausted)
+            | (Self::AlreadyExists, Self::AlreadyExists)
+            | (Self::NotEmpty, Self::NotEmpty) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Error {}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Storage(_) => f.write_str("Storage(..)"),
+            Self::Corrupt(error) => f.debug_tuple("Corrupt").field(error).finish(),
+            Self::Unsupported(error) => f.debug_tuple("Unsupported").field(error).finish(),
+            Self::OutOfMemory => f.write_str("OutOfMemory"),
+            Self::NotFound => f.write_str("NotFound"),
+            Self::NotDirectory => f.write_str("NotDirectory"),
+            Self::InvalidArgument => f.write_str("InvalidArgument"),
+            Self::ReservationExhausted => f.write_str("ReservationExhausted"),
+            Self::AlreadyExists => f.write_str("AlreadyExists"),
+            Self::NotEmpty => f.write_str("NotEmpty"),
+        }
+    }
+}
+
 /// Failures from transaction preparation that perform no storage I/O.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FsError {
@@ -115,7 +158,7 @@ pub enum FsError {
     ReservationExhausted,
 }
 
-impl<E> From<FsError> for Error<E> {
+impl From<FsError> for Error {
     fn from(value: FsError) -> Self {
         match value {
             FsError::OutOfMemory => Self::OutOfMemory,
@@ -125,22 +168,22 @@ impl<E> From<FsError> for Error<E> {
     }
 }
 
-impl<E> From<Corrupt> for Error<E> {
+impl From<Corrupt> for Error {
     fn from(value: Corrupt) -> Self {
         Self::Corrupt(value)
     }
 }
 
-impl<E> From<Unsupported> for Error<E> {
+impl From<Unsupported> for Error {
     fn from(value: Unsupported) -> Self {
         Self::Unsupported(value)
     }
 }
 
-impl<E: fmt::Display> fmt::Display for Error<E> {
+impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Storage(e) => write!(f, "storage error: {e}"),
+            Self::Storage(_) => f.write_str("storage error"),
             Self::Corrupt(e) => write!(f, "corrupt ext filesystem: {e:?}"),
             Self::Unsupported(e) => write!(f, "unsupported ext feature: {e:?}"),
             Self::OutOfMemory => f.write_str("out of memory"),
@@ -230,12 +273,12 @@ impl Inode {
     }
 }
 
-fn decode_inode_timestamp<E>(
+fn decode_inode_timestamp(
     raw: &[u8],
     seconds_offset: usize,
     extra_offset: usize,
     inode_number: u32,
-) -> Result<Timestamp, Error<E>> {
+) -> Result<Timestamp, Error> {
     let seconds = i64::from(le32(raw, seconds_offset) as i32);
     let extra = if extra_offset + 4 <= raw.len() {
         le32(raw, extra_offset)
@@ -262,7 +305,7 @@ pub struct Ext4 {
 }
 
 impl Ext4 {
-    pub fn mount<S: Storage>(storage: &mut S) -> Result<Self, Error<S::Error>> {
+    pub fn mount(storage: &mut dyn Storage) -> Result<Self, Error> {
         let superblock = Superblock::load(storage)?;
         let mut filesystem = Self {
             superblock,
@@ -293,12 +336,12 @@ impl Ext4 {
         self.overlay.len()
     }
 
-    fn read_storage<S: Storage>(
+    fn read_storage(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         offset: u64,
         dst: &mut [u8],
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<(), Error> {
         checked_read(storage, offset, dst)?;
         if dst.is_empty() {
             return Ok(());
@@ -338,26 +381,18 @@ impl Ext4 {
     }
 
     /// Return the filesystem's well-known starting inode.
-    pub fn root<S: Storage>(&mut self, storage: &mut S) -> Result<Inode, Error<S::Error>> {
+    pub fn root(&mut self, storage: &mut dyn Storage) -> Result<Inode, Error> {
         self.load_inode(storage, ROOT_INODE)
     }
 
     /// Load an inode by the identity returned from a directory listing.
     /// Name resolution belongs to the caller; this does not search a directory.
-    pub fn inode<S: Storage>(
-        &mut self,
-        storage: &mut S,
-        number: u32,
-    ) -> Result<Inode, Error<S::Error>> {
+    pub fn inode(&mut self, storage: &mut dyn Storage, number: u32) -> Result<Inode, Error> {
         self.load_inode(storage, number)
     }
 
     /// Reload an inode identity from disk, rejecting a reused identity.
-    pub fn refresh<S: Storage>(
-        &mut self,
-        storage: &mut S,
-        inode: &Inode,
-    ) -> Result<Inode, Error<S::Error>> {
+    pub fn refresh(&mut self, storage: &mut dyn Storage, inode: &Inode) -> Result<Inode, Error> {
         let current = self.load_inode(storage, inode.number)?;
         if current.generation != inode.generation {
             return Err(Error::NotFound);
@@ -365,23 +400,23 @@ impl Ext4 {
         Ok(current)
     }
 
-    pub fn read_inode<S: Storage>(
+    pub fn read_inode(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
         offset: u64,
         dst: &mut [u8],
-    ) -> Result<usize, Error<S::Error>> {
+    ) -> Result<usize, Error> {
         let inode = self.refresh(storage, inode)?;
         self.read_inode_data(storage, &inode, offset, dst)
     }
 
     /// Read the target bytes stored in a symbolic-link inode.
-    pub fn read_symlink<S: Storage>(
+    pub fn read_symlink(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         let inode = self.refresh(storage, inode)?;
         if !inode.is_symlink() {
             return Err(Error::InvalidArgument);
@@ -391,11 +426,11 @@ impl Ext4 {
 
     /// Return every inode-body and external-block extended attribute.
     /// Namespace access policy and prefix mapping belong to the caller.
-    pub fn extended_attributes<S: Storage>(
+    pub fn extended_attributes(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
-    ) -> Result<Vec<ExtendedAttribute>, Error<S::Error>> {
+    ) -> Result<Vec<ExtendedAttribute>, Error> {
         let current = self.refresh(storage, inode)?;
         let raw = self.read_raw_inode(storage, current.number)?;
         let mut pending = Vec::new();
@@ -439,12 +474,12 @@ impl Ext4 {
         Ok(attributes)
     }
 
-    fn read_extended_attribute_inode<S: Storage>(
+    fn read_extended_attribute_inode(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         number: u32,
         size: usize,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         if self.superblock.feature_incompat & ondisk::INCOMPAT_EA_INODE == 0 {
             return Err(Corrupt::InvalidExtendedAttributes(number).into());
         }
@@ -473,11 +508,11 @@ impl Ext4 {
         Ok(value)
     }
 
-    fn read_external_xattr_block<S: Storage>(
+    fn read_external_xattr_block(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         let number = inode.external_xattr_block;
         if number == 0 || number >= self.superblock.blocks_count {
             return Err(Corrupt::InvalidExtendedAttributes(inode.number).into());
@@ -509,11 +544,11 @@ impl Ext4 {
         Ok(block)
     }
 
-    fn read_symlink_inode<S: Storage>(
+    fn read_symlink_inode(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         let len = usize::try_from(inode.size).map_err(|_| Corrupt::AddressOverflow)?;
         let mut target = Vec::new();
         target
@@ -532,14 +567,14 @@ impl Ext4 {
 
     /// Append at most `max` checked directory entries, resuming from an opaque
     /// byte cookie returned by the previous call. `None` means end of directory.
-    pub fn list<S: Storage>(
+    pub fn list(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         directory: &Inode,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
         max: usize,
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         if max == 0 {
             return Err(Error::InvalidArgument);
         }
@@ -637,14 +672,14 @@ impl Ext4 {
         Ok(None)
     }
 
-    fn list_inline_directory<S: Storage>(
+    fn list_inline_directory(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         directory: &Inode,
         cookie: u64,
         output: &mut Vec<DirectoryEntry>,
         max: usize,
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         let data = directory
             .inline_data
             .as_ref()
@@ -697,7 +732,7 @@ impl Ext4 {
         Ok(None)
     }
 
-    fn new_block_buffer<E>(&self) -> Result<Vec<u8>, Error<E>> {
+    fn new_block_buffer(&self) -> Result<Vec<u8>, Error> {
         let len = self.superblock.block_size as usize;
         let mut result = Vec::new();
         result
@@ -707,11 +742,11 @@ impl Ext4 {
         Ok(result)
     }
 
-    fn read_group_descriptor<S: Storage>(
+    fn read_group_descriptor(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         group: u32,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         if group >= self.superblock.group_count() {
             return Err(Corrupt::InvalidGroup(group).into());
         }
@@ -747,11 +782,7 @@ impl Ext4 {
         Ok(descriptor)
     }
 
-    fn read_raw_inode<S: Storage>(
-        &mut self,
-        storage: &mut S,
-        number: u32,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    fn read_raw_inode(&mut self, storage: &mut dyn Storage, number: u32) -> Result<Vec<u8>, Error> {
         if number == 0 || number > self.superblock.inodes_count {
             return Err(Corrupt::InvalidInode(number).into());
         }
@@ -802,11 +833,11 @@ impl Ext4 {
         Ok(raw)
     }
 
-    pub(crate) fn load_inode<S: Storage>(
+    pub(crate) fn load_inode(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         number: u32,
-    ) -> Result<Inode, Error<S::Error>> {
+    ) -> Result<Inode, Error> {
         let raw = self.read_raw_inode(storage, number)?;
         let generation = le32(&raw, 0x64);
         let mode = le16(&raw, 0);
@@ -885,13 +916,13 @@ impl Ext4 {
         }
     }
 
-    fn verify_directory_checksum<E>(
+    fn verify_directory_checksum(
         &self,
         directory: &Inode,
         kind: DirectoryBlockKind,
         count: usize,
         block: &[u8],
-    ) -> Result<(), Error<E>> {
+    ) -> Result<(), Error> {
         if count != block.len() {
             return Err(Corrupt::InvalidDirectory.into());
         }
@@ -943,13 +974,13 @@ impl Ext4 {
         Ok(())
     }
 
-    fn read_inode_data<S: Storage>(
+    fn read_inode_data(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
         offset: u64,
         dst: &mut [u8],
-    ) -> Result<usize, Error<S::Error>> {
+    ) -> Result<usize, Error> {
         if let Some(data) = &inode.inline_data {
             if offset >= inode.size || dst.is_empty() {
                 return Ok(0);
@@ -992,12 +1023,12 @@ impl Ext4 {
         Ok(done)
     }
 
-    fn map_file_block<S: Storage>(
+    fn map_file_block(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
         logical: u64,
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         if inode.flags & EXTENTS_FL == 0 {
             return self.map_legacy_block(storage, inode, logical);
         }
@@ -1005,12 +1036,12 @@ impl Ext4 {
         self.map_extent_node(storage, &root, logical, 0, inode, false)
     }
 
-    fn map_legacy_block<S: Storage>(
+    fn map_legacy_block(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
         logical: u64,
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         const DIRECT_BLOCKS: u64 = 12;
         if logical < DIRECT_BLOCKS {
             return self
@@ -1055,12 +1086,12 @@ impl Ext4 {
         Err(Corrupt::InvalidLegacyBlockMap.into())
     }
 
-    fn follow_legacy_indirect<S: Storage>(
+    fn follow_legacy_indirect(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         mut physical: u64,
         indexes: &[u64],
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         let pointers = u64::from(self.superblock.block_size / 4);
         let block_size = u64::from(self.superblock.block_size);
         let mut block = self.new_block_buffer()?;
@@ -1086,7 +1117,7 @@ impl Ext4 {
         self.validate_legacy_pointer(physical)
     }
 
-    fn validate_legacy_pointer<E>(&self, physical: u64) -> Result<Option<u64>, Error<E>> {
+    fn validate_legacy_pointer(&self, physical: u64) -> Result<Option<u64>, Error> {
         if physical == 0 {
             Ok(None)
         } else if physical < self.superblock.blocks_count {
@@ -1096,15 +1127,15 @@ impl Ext4 {
         }
     }
 
-    fn map_extent_node<S: Storage>(
+    fn map_extent_node(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         node: &[u8],
         logical: u64,
         traversed: u16,
         inode: &Inode,
         external: bool,
-    ) -> Result<Option<u64>, Error<S::Error>> {
+    ) -> Result<Option<u64>, Error> {
         if node.len() < 12 || le16(node, 0) != EXTENT_MAGIC {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
@@ -1211,13 +1242,13 @@ impl Ext4 {
     }
 }
 
-fn parse_extended_attributes<E>(
+fn parse_extended_attributes(
     inode: u32,
     bytes: &[u8],
     entries: usize,
     value_base: usize,
     output: &mut Vec<PendingExtendedAttribute>,
-) -> Result<(), Error<E>> {
+) -> Result<(), Error> {
     let table_end = extended_attribute_table_end(bytes, entries, inode)?;
     let mut cursor = entries;
     while cursor < table_end - 4 {
@@ -1271,11 +1302,7 @@ fn parse_extended_attributes<E>(
     Ok(())
 }
 
-fn extended_attribute_table_end<E>(
-    bytes: &[u8],
-    entries: usize,
-    inode: u32,
-) -> Result<usize, Error<E>> {
+fn extended_attribute_table_end(bytes: &[u8], entries: usize, inode: u32) -> Result<usize, Error> {
     let mut cursor = entries;
     loop {
         if cursor.checked_add(4).is_none_or(|end| end > bytes.len()) {
@@ -1300,13 +1327,13 @@ fn extended_attribute_table_end<E>(
     }
 }
 
-fn parse_inline_data<E>(
+fn parse_inline_data(
     inode: u32,
     mode: u16,
     size: u64,
     raw: &[u8],
     block_map: &[u8; 60],
-) -> Result<Vec<u8>, Error<E>> {
+) -> Result<Vec<u8>, Error> {
     let size = usize::try_from(size).map_err(|_| Corrupt::InvalidInode(inode))?;
     let directory = mode & MODE_TYPE_MASK == MODE_DIRECTORY;
     let total = if directory {
@@ -1766,7 +1793,8 @@ mod tests {
                 ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
             assert!(matches!(
                 Ext4::mount(&mut storage),
-                Err(Error::Storage(ModelError::InjectedIo))
+                Err(Error::Storage(error))
+                    if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo)
             ));
         }
     }
@@ -1785,11 +1813,12 @@ mod tests {
             let mut storage =
                 ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
             match Ext4::mount(&mut storage) {
-                Err(Error::Storage(ModelError::InjectedIo)) => {}
+                Err(Error::Storage(error))
+                    if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
                 Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
                 Ok(mut fs) => {
                     let error = fs.read(&mut storage, "/hello", 0, &mut output).unwrap_err();
-                    assert_eq!(error, Error::Storage(ModelError::InjectedIo));
+                    assert!((error).storage_is(&ModelError::InjectedIo));
                 }
             }
         }
@@ -1905,11 +1934,11 @@ mod tests {
         let mut fs = Ext4::mount(&mut storage).unwrap();
         let mut transaction = fs.begin_transaction();
         transaction.reserve_blocks(1).unwrap();
-        assert_eq!(
-            transaction
+        assert!(
+            (transaction
                 .modify_block(&mut storage, 11, |_| {})
-                .unwrap_err(),
-            Error::Storage(ModelError::InjectedIo)
+                .unwrap_err())
+            .storage_is(&ModelError::InjectedIo)
         );
         assert_eq!(transaction.dirty_blocks(), 0);
         assert_eq!(transaction.reserved_blocks(), 1);

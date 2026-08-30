@@ -62,13 +62,13 @@ pub struct Superblock {
 }
 
 impl Superblock {
-    pub(crate) fn load<S: Storage>(storage: &mut S) -> Result<Self, Error<S::Error>> {
+    pub(crate) fn load(storage: &mut dyn Storage) -> Result<Self, Error> {
         let mut bytes = [0u8; SUPERBLOCK_SIZE];
         checked_read(storage, SUPERBLOCK_OFFSET, &mut bytes)?;
         Self::parse(&bytes, storage.len())
     }
 
-    fn parse<E>(b: &[u8; SUPERBLOCK_SIZE], storage_len: u64) -> Result<Self, Error<E>> {
+    fn parse(b: &[u8; SUPERBLOCK_SIZE], storage_len: u64) -> Result<Self, Error> {
         if le16(b, 0x38) != EXT4_MAGIC {
             return Err(Corrupt::BadMagic.into());
         }
@@ -273,11 +273,11 @@ fn is_power_of(mut value: u32, base: u32) -> bool {
     value == 1
 }
 
-pub(crate) fn checked_read<S: Storage>(
-    storage: &mut S,
+pub(crate) fn checked_read(
+    storage: &mut dyn Storage,
     offset: u64,
     dst: &mut [u8],
-) -> Result<(), Error<S::Error>> {
+) -> Result<(), Error> {
     let end = offset
         .checked_add(u64::try_from(dst.len()).map_err(|_| Corrupt::AddressOverflow)?)
         .ok_or(Corrupt::AddressOverflow)?;

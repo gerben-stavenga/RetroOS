@@ -95,11 +95,11 @@ struct Tag {
 }
 
 impl Ext4 {
-    pub(crate) fn commit_journal<S: Storage>(
+    pub(crate) fn commit_journal(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         dirty: &[DirtyBlock],
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<(), Error> {
         if dirty.is_empty() {
             return Ok(());
         }
@@ -151,7 +151,7 @@ impl Ext4 {
             .ok_or(Corrupt::AddressOverflow)?;
         self.read_storage(storage, superblock_offset, &mut activation_superblock)?;
         set_recovery_flag(&mut activation_superblock, true)?;
-        let mut checkpoint_superblock = clone_bytes::<S::Error>(&final_superblock.bytes)?;
+        let mut checkpoint_superblock = clone_bytes(&final_superblock.bytes)?;
         set_recovery_flag(&mut checkpoint_superblock, true)?;
 
         let mut journal_data = Vec::new();
@@ -168,7 +168,7 @@ impl Ext4 {
             {
                 return Err(Error::InvalidArgument);
             }
-            let mut bytes = clone_bytes::<S::Error>(&block.bytes)?;
+            let mut bytes = clone_bytes(&block.bytes)?;
             let escape = be32(&bytes, 0) == MAGIC;
             if escape {
                 bytes[..4].fill(0);
@@ -230,7 +230,7 @@ impl Ext4 {
         if format.has_checksums() {
             update_journal_superblock_checksum(&mut active_journal_superblock);
         }
-        let mut clean_journal_superblock = clone_bytes::<S::Error>(&active_journal_superblock)?;
+        let mut clean_journal_superblock = clone_bytes(&active_journal_superblock)?;
         put_be32(
             &mut clean_journal_superblock,
             0x18,
@@ -309,10 +309,7 @@ impl Ext4 {
         Ok(())
     }
 
-    pub(super) fn replay_journal<S: Storage>(
-        &mut self,
-        storage: &mut S,
-    ) -> Result<(), Error<S::Error>> {
+    pub(super) fn replay_journal(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
         let journal = self.load_inode(storage, self.superblock.journal_inode)?;
         if journal.mode & 0xf000 != 0x8000 {
             return Err(Corrupt::InvalidJournal.into());
@@ -408,11 +405,11 @@ impl Ext4 {
         Ok(())
     }
 
-    fn load_journal_format<S: Storage>(
+    fn load_journal_format(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
-    ) -> Result<Format, Error<S::Error>> {
+    ) -> Result<Format, Error> {
         let bytes = self.read_journal_block(storage, inode, 0)?;
         if be32(&bytes, 0) != MAGIC || be32(&bytes, 4) != SUPERBLOCK_V2 {
             return Err(Corrupt::InvalidJournal.into());
@@ -497,12 +494,12 @@ impl Ext4 {
         Ok(format)
     }
 
-    fn read_journal_block<S: Storage>(
+    fn read_journal_block(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         inode: &Inode,
         logical: u32,
-    ) -> Result<Vec<u8>, Error<S::Error>> {
+    ) -> Result<Vec<u8>, Error> {
         let mut bytes = self.new_block_buffer()?;
         let offset = u64::from(logical)
             .checked_mul(u64::from(self.superblock.block_size))
@@ -513,12 +510,12 @@ impl Ext4 {
         Ok(bytes)
     }
 
-    fn write_physical_block<S: Storage>(
+    fn write_physical_block(
         &mut self,
-        storage: &mut S,
+        storage: &mut dyn Storage,
         physical: u64,
         bytes: &[u8],
-    ) -> Result<(), Error<S::Error>> {
+    ) -> Result<(), Error> {
         if physical >= self.superblock.blocks_count
             || bytes.len() != self.superblock.block_size as usize
         {
@@ -530,12 +527,12 @@ impl Ext4 {
         storage.write(offset, bytes).map_err(Error::Storage)
     }
 
-    fn flush_storage<S: Storage>(&mut self, storage: &mut S) -> Result<(), Error<S::Error>> {
+    fn flush_storage(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
         storage.flush().map_err(Error::Storage)
     }
 }
 
-fn clone_bytes<E>(bytes: &[u8]) -> Result<Vec<u8>, Error<E>> {
+fn clone_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let mut copy = Vec::new();
     copy.try_reserve_exact(bytes.len())
         .map_err(|_| Error::OutOfMemory)?;
@@ -543,7 +540,7 @@ fn clone_bytes<E>(bytes: &[u8]) -> Result<Vec<u8>, Error<E>> {
     Ok(copy)
 }
 
-fn set_recovery_flag<E>(block: &mut [u8], enabled: bool) -> Result<(), Error<E>> {
+fn set_recovery_flag(block: &mut [u8], enabled: bool) -> Result<(), Error> {
     let offset = usize::try_from(ondisk::SUPERBLOCK_OFFSET % block.len() as u64)
         .map_err(|_| Corrupt::AddressOverflow)?;
     if offset + ondisk::SUPERBLOCK_SIZE > block.len()
@@ -584,7 +581,7 @@ fn update_journal_superblock_checksum(bytes: &mut [u8]) {
     put_be32(bytes, 0xfc, checksum);
 }
 
-fn parse_tags<E>(format: Format, bytes: &[u8]) -> Result<Vec<Tag>, Error<E>> {
+fn parse_tags(format: Format, bytes: &[u8]) -> Result<Vec<Tag>, Error> {
     let end = bytes.len() - usize::from(format.has_checksums()) * 4;
     let mut cursor = 12usize;
     let mut tags = Vec::new();
@@ -639,12 +636,12 @@ fn parse_tags<E>(format: Format, bytes: &[u8]) -> Result<Vec<Tag>, Error<E>> {
     }
 }
 
-fn parse_revokes<E>(
+fn parse_revokes(
     format: Format,
     sequence: u32,
     bytes: &[u8],
     output: &mut Vec<Revoke>,
-) -> Result<(), Error<E>> {
+) -> Result<(), Error> {
     let count = usize::try_from(be32(bytes, 12)).map_err(|_| Corrupt::InvalidJournal)?;
     let checksum_len = usize::from(format.has_checksums()) * 4;
     if count < 16 || count > bytes.len() - checksum_len {
@@ -665,7 +662,7 @@ fn parse_revokes<E>(
     Ok(())
 }
 
-fn verify_metadata_checksum<E>(format: Format, bytes: &[u8]) -> Result<(), Error<E>> {
+fn verify_metadata_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     if !format.has_checksums() {
         return Ok(());
     }
@@ -679,12 +676,12 @@ fn verify_metadata_checksum<E>(format: Format, bytes: &[u8]) -> Result<(), Error
     Ok(())
 }
 
-fn verify_data_checksum<E>(
+fn verify_data_checksum(
     format: Format,
     sequence: u32,
     tag: &Tag,
     bytes: &[u8],
-) -> Result<(), Error<E>> {
+) -> Result<(), Error> {
     if !format.has_checksums() {
         return Ok(());
     }
@@ -700,7 +697,7 @@ fn verify_data_checksum<E>(
     Ok(())
 }
 
-fn verify_commit_checksum<E>(format: Format, bytes: &[u8]) -> Result<(), Error<E>> {
+fn verify_commit_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     if !format.has_checksums() {
         return Ok(());
     }
@@ -714,7 +711,7 @@ fn verify_commit_checksum<E>(format: Format, bytes: &[u8]) -> Result<(), Error<E
     Ok(())
 }
 
-fn append<T, E>(destination: &mut Vec<T>, source: &mut Vec<T>) -> Result<(), Error<E>> {
+fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) -> Result<(), Error> {
     destination
         .try_reserve(source.len())
         .map_err(|_| Error::OutOfMemory)?;
@@ -722,7 +719,7 @@ fn append<T, E>(destination: &mut Vec<T>, source: &mut Vec<T>) -> Result<(), Err
     Ok(())
 }
 
-fn try_push<T, E>(destination: &mut Vec<T>, value: T) -> Result<(), Error<E>> {
+fn try_push<T>(destination: &mut Vec<T>, value: T) -> Result<(), Error> {
     destination.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
     destination.push(value);
     Ok(())
