@@ -11,7 +11,7 @@
 //! This is the same boundary a compositor needs: incomplete state is never
 //! observable by rendering or hit testing.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
 /// The personality server or session that receives input for a node.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -242,6 +242,7 @@ struct Surface {
     owner: EndpointId,
     key: SurfaceKey,
     id: SurfaceId,
+    dirty: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,7 +257,7 @@ pub enum SurfaceError {
 /// Every personality retains its complete node tree and every visible endpoint
 /// participates in composition and pointer hit testing. Keyboard focus is an
 /// independent endpoint selection, not visibility or repaint policy.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Desktop {
     scene: Scene,
     keyboard_focus: Option<EndpointId>,
@@ -264,7 +265,25 @@ pub struct Desktop {
     bindings: Vec<Binding>,
     surfaces: Vec<Surface>,
     next_surface: u64,
+    /// Scene configuration changed (geometry, visibility, stacking, pointer,
+    /// or attachment). Surface pixel changes are tracked on `Surface` instead.
+    scene_dirty: bool,
     revision: u64,
+}
+
+impl Default for Desktop {
+    fn default() -> Self {
+        Self {
+            scene: Scene::default(),
+            keyboard_focus: None,
+            pointer: None,
+            bindings: Vec::new(),
+            surfaces: Vec::new(),
+            next_surface: 0,
+            scene_dirty: true,
+            revision: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -277,6 +296,7 @@ struct SwitcherComposition {
 
 pub struct ComposedFrame<'a> {
     pub pixels: &'a mut Vec<u8>,
+    pub damage: Vec<Rect>,
 }
 
 impl Desktop {
@@ -284,12 +304,17 @@ impl Desktop {
         Self::default()
     }
 
+    fn damage_scene(&mut self) {
+        self.scene_dirty = true;
+        self.revision = self.revision.wrapping_add(1);
+    }
+
     pub fn focus(&mut self, endpoint: EndpointId) -> bool {
         let changed = self.keyboard_focus != Some(endpoint);
         self.keyboard_focus = Some(endpoint);
         if changed {
             self.scene.raise_endpoint(endpoint);
-            self.revision = self.revision.wrapping_add(1);
+            self.damage_scene();
         }
         changed
     }
@@ -303,7 +328,7 @@ impl Desktop {
         let changed = self.pointer != Some(point);
         self.pointer = Some(point);
         if changed {
-            self.revision = self.revision.wrapping_add(1);
+            self.damage_scene();
         }
         changed
     }
@@ -324,7 +349,7 @@ impl Desktop {
             return Ok(binding.node);
         }
         let node = self.scene.create(endpoint, None, geometry)?;
-        self.revision = self.revision.wrapping_add(1);
+        self.damage_scene();
         self.bindings.push(Binding {
             endpoint,
             key,
@@ -335,6 +360,10 @@ impl Desktop {
 
     pub fn geometry(&self, node: NodeId) -> Option<Rect> {
         self.scene.node(node).map(|node| node.geometry)
+    }
+
+    pub fn node_state(&self, node: NodeId) -> Option<&Node> {
+        self.scene.node(node)
     }
 
     /// Bounding size of all visible top-level presentations in output space.
@@ -370,9 +399,20 @@ impl Desktop {
         let raw = self.next_surface.checked_add(1).ok_or(SurfaceError::Exhausted)?;
         self.next_surface = raw;
         let id = SurfaceId(raw);
-        self.surfaces.push(Surface { owner: endpoint, key, id });
-        self.revision = self.revision.wrapping_add(1);
+        self.surfaces.push(Surface { owner: endpoint, key, id, dirty: true });
+        self.damage_scene();
         Ok(id)
+    }
+
+    /// Record that a producer replaced the pixels of one retained surface.
+    /// Pixel storage remains producer-owned; this is content damage, not a
+    /// scene transaction, and therefore does not change the desktop revision.
+    pub fn damage_surface(&mut self, endpoint: EndpointId, key: SurfaceKey) {
+        if let Some(surface) = self.surfaces.iter_mut()
+            .find(|surface| surface.owner == endpoint && surface.key == key)
+        {
+            surface.dirty = true;
+        }
     }
 
     pub fn surface_id(&self, endpoint: EndpointId, key: SurfaceKey) -> Option<SurfaceId> {
@@ -388,7 +428,7 @@ impl Desktop {
 
     pub fn commit(&mut self, transaction: Transaction) -> Result<(), SceneError> {
         self.scene.commit(transaction)?;
-        self.revision = self.revision.wrapping_add(1);
+        self.damage_scene();
         self.bindings
             .retain(|binding| self.scene.node(binding.node).is_some());
         Ok(())
@@ -470,30 +510,83 @@ impl Desktop {
         Ok(pixels)
     }
 
-    fn compose_resolved_switcher<'a, F>(
-        &self,
-        resolve: &F,
-        width: usize,
-        height: usize,
-        format: vga::PixelFormat,
-        output: &mut Vec<u8>,
-        switcher: Option<SwitcherComposition>,
-    ) -> Result<usize, ComposeError>
-    where
-        F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
-    {
-        let pixels = self.scene.compose_switcher_with(
-            resolve, width, height, format, output, switcher,
-        )?;
-        if let Some(point) = self.pointer {
-            draw_pointer(output, width, height, width * format.bytes_per_pixel as usize,
-                format, point);
-        }
-        Ok(pixels)
-    }
-
     pub fn hit_test(&self, point: Point) -> Option<Hit> {
         self.scene.hit_test(point)
+    }
+
+    fn surface_dirty(&self, id: SurfaceId) -> bool {
+        self.surfaces.iter().find(|surface| surface.id == id)
+            .is_some_and(|surface| surface.dirty)
+    }
+
+    fn collect_surface_damage(
+        &self,
+        id: NodeId,
+        parent_origin: Point,
+        inherited_clip: Rect,
+        switcher: Option<SwitcherComposition>,
+        damage: &mut Vec<Rect>,
+    ) {
+        let Some(node) = self.scene.node(id) else { return };
+        if !node.visible { return; }
+        let geometry = switcher
+            .filter(|layout| layout.node == id)
+            .map_or(node.geometry, |layout| layout.target);
+        let origin = Point {
+            x: parent_origin.x.saturating_add(geometry.x),
+            y: parent_origin.y.saturating_add(geometry.y),
+        };
+        let node_rect = Rect::new(origin.x, origin.y, geometry.width, geometry.height);
+        let Some(mut subtree_clip) = intersect(inherited_clip, node_rect) else { return };
+        if let Some(local_clip) = node.clip {
+            let world_clip = Rect::new(
+                origin.x.saturating_add(local_clip.x),
+                origin.y.saturating_add(local_clip.y),
+                local_clip.width,
+                local_clip.height,
+            );
+            let Some(clip) = intersect(subtree_clip, world_clip) else { return };
+            subtree_clip = clip;
+        }
+        if node.content.is_some_and(|surface| self.surface_dirty(surface)) {
+            push_damage(damage, subtree_clip);
+        }
+        for &child in &node.children {
+            self.collect_surface_damage(
+                child, origin, subtree_clip, switcher, damage,
+            );
+        }
+    }
+
+    fn output_damage(
+        &self,
+        width: usize,
+        height: usize,
+        switcher: Option<SwitcherComposition>,
+    ) -> Vec<Rect> {
+        let canvas = Rect::new(
+            0,
+            0,
+            u32::try_from(width).unwrap_or(u32::MAX),
+            u32::try_from(height).unwrap_or(u32::MAX),
+        );
+        if self.scene_dirty {
+            return vec![canvas];
+        }
+        let mut damage = Vec::new();
+        for &root in &self.scene.roots {
+            self.collect_surface_damage(
+                root, Point::default(), canvas, switcher, &mut damage,
+            );
+        }
+        damage
+    }
+
+    fn finish_damage(&mut self) {
+        self.scene_dirty = false;
+        for surface in &mut self.surfaces {
+            surface.dirty = false;
+        }
     }
 }
 
@@ -539,7 +632,6 @@ pub struct WindowManager {
     osd_pixels: Vec<u8>,
     osd_rect: Option<Rect>,
     osd_geometry: Option<(usize, usize, vga::PixelFormat)>,
-    presented_revision: u64,
     focused: Option<WindowId>,
     presentation: Presentation,
     modes: Vec<(WindowId, WindowMode)>,
@@ -565,7 +657,6 @@ impl WindowManager {
             osd_pixels: Vec::new(),
             osd_rect: None,
             osd_geometry: None,
-            presented_revision: 0,
             focused,
             presentation: initial,
             modes,
@@ -603,7 +694,7 @@ impl WindowManager {
     ) -> Result<&'a mut Vec<u8>, ComposeError> {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
-        let Self { desktop, composed, osd_pixels, osd_rect, presented_revision, .. } = self;
+        let Self { desktop, composed, osd_pixels, osd_rect, .. } = self;
         let system = if crate::kernel::osd::is_open()
             && let Some(id) = desktop.surface_id(OSD_ENDPOINT, OSD_SURFACE)
             && let Some(rect) = osd_rect
@@ -620,7 +711,7 @@ impl WindowManager {
             None
         };
         desktop.compose_surfaces_with(contents, system, width, height, format, composed)?;
-        *presented_revision = desktop.revision;
+        desktop.finish_damage();
         Ok(composed)
     }
 
@@ -637,7 +728,7 @@ impl WindowManager {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
         let Self {
-            desktop, composed, osd_pixels, osd_rect, presented_revision,
+            desktop, composed, osd_pixels, osd_rect,
             switcher_active, switcher_highlighted, switcher_node, switcher_target, ..
         } = self;
         let osd = if crate::kernel::osd::is_open()
@@ -669,15 +760,26 @@ impl WindowManager {
                 Some(SwitcherComposition { active, highlighted, node, target }),
             _ => None,
         };
-        desktop.compose_resolved_switcher(
-            &resolve, width, height, format, composed, switcher,
+        let mut damage = desktop.output_damage(width, height, switcher);
+        let step = format.bytes_per_pixel as usize;
+        let required = width.checked_mul(height).and_then(|n| n.checked_mul(step))
+            .ok_or(ComposeError::Overflow)?;
+        if composed.len() != required {
+            damage.clear();
+            damage.push(Rect::new(0, 0, width as u32, height as u32));
+        }
+        desktop.scene.compose_switcher_regions_with(
+            &resolve, width, height, format, composed, switcher, &damage,
         )?;
-        *presented_revision = desktop.revision;
-        Ok(ComposedFrame { pixels: composed })
-    }
-
-    pub fn needs_present(&self) -> bool {
-        self.presented_revision != self.desktop.revision
+        if !damage.is_empty()
+            && let Some(point) = desktop.pointer
+        {
+            draw_pointer(
+                composed, width, height, width * step, format, point,
+            );
+        }
+        desktop.finish_damage();
+        Ok(ComposedFrame { pixels: composed, damage })
     }
 
     pub fn sync_osd(
@@ -739,13 +841,24 @@ impl WindowManager {
             OSD_PRESENTATION,
             rect,
         ).expect("create OSD presentation node");
-        let mut transaction = Transaction::new(OSD_ENDPOINT);
-        transaction
-            .set_geometry(node, rect)
-            .attach(node, Some(surface))
-            .set_visible(node, open && self.osd_rect.is_some())
-            .raise(node);
-        self.desktop.commit(transaction).expect("commit OSD window");
+        if redraw && open {
+            self.desktop.damage_surface(OSD_ENDPOINT, OSD_SURFACE);
+        }
+        let visible = open && self.osd_rect.is_some();
+        let structural = self.desktop.scene.node(node).is_none_or(|current| {
+            current.geometry != rect
+                || current.content != Some(surface)
+                || current.visible != visible
+        }) || !frontmost;
+        if structural {
+            let mut transaction = Transaction::new(OSD_ENDPOINT);
+            transaction
+                .set_geometry(node, rect)
+                .attach(node, Some(surface))
+                .set_visible(node, visible)
+                .raise(node);
+            self.desktop.commit(transaction).expect("commit OSD window");
+        }
     }
 
     /// Present the task picker without changing execution focus. The active
@@ -814,7 +927,7 @@ impl WindowManager {
         self.switcher_node = Some(node);
         self.switcher_target = Some(target);
         if layout_changed || highlight_changed {
-            self.desktop.revision = self.desktop.revision.wrapping_add(1);
+            self.desktop.damage_scene();
         }
     }
 
@@ -824,7 +937,7 @@ impl WindowManager {
         self.switcher_target = None;
         self.switcher_highlighted = None;
         self.switcher_node = None;
-        self.desktop.revision = self.desktop.revision.wrapping_add(1);
+        self.desktop.damage_scene();
     }
 
     pub fn presentation(&self) -> Presentation {
@@ -1175,7 +1288,7 @@ impl Scene {
         Ok(width.saturating_mul(height))
     }
 
-    fn compose_switcher_with<'a, F>(
+    fn compose_switcher_regions_with<'a, F>(
         &self,
         resolve: &F,
         width: usize,
@@ -1183,6 +1296,7 @@ impl Scene {
         format: vga::PixelFormat,
         output: &mut Vec<u8>,
         switcher: Option<SwitcherComposition>,
+        damage: &[Rect],
     ) -> Result<usize, ComposeError>
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
@@ -1195,12 +1309,15 @@ impl Scene {
             .ok_or(ComposeError::Overflow)?;
         let canvas = Rect::new(0, 0, u32::try_from(width).unwrap_or(u32::MAX),
             u32::try_from(height).unwrap_or(u32::MAX));
-        output.clear();
-        output.resize(len, 0);
+        if output.len() != len {
+            output.clear();
+            output.resize(len, 0);
+        }
         let target = Target { width, height, stride: width * step, format, pixels: output };
         let mut target = target;
         let mut compose_clip = |clip: Rect| {
             let Some(clip) = intersect(canvas, clip) else { return };
+            clear_rect(&mut target, clip);
             if let Some(layout) = switcher {
                 const SYSTEM_ENDPOINT: EndpointId = EndpointId(u32::MAX);
                 for &root in &self.roots {
@@ -1235,8 +1352,10 @@ impl Scene {
                 }
             }
         };
-        compose_clip(canvas);
-        Ok(width.saturating_mul(height))
+        for &clip in damage {
+            compose_clip(clip);
+        }
+        Ok(damage.iter().map(|rect| rect.width as usize * rect.height as usize).sum())
     }
 
     fn apply(&mut self, owner: EndpointId, operation: Operation) -> Result<(), SceneError> {
@@ -1455,6 +1574,22 @@ struct Target<'a> {
     pixels: &'a mut [u8],
 }
 
+fn clear_rect(target: &mut Target<'_>, rect: Rect) {
+    let step = target.format.bytes_per_pixel as usize;
+    let x = rect.x.max(0) as usize;
+    let y = rect.y.max(0) as usize;
+    let right = (i64::from(rect.x) + i64::from(rect.width))
+        .clamp(0, target.width as i64) as usize;
+    let bottom = (i64::from(rect.y) + i64::from(rect.height))
+        .clamp(0, target.height as i64) as usize;
+    if x >= right || y >= bottom { return; }
+    for row in y..bottom {
+        let start = row * target.stride + x * step;
+        let end = row * target.stride + right * step;
+        target.pixels[start..end].fill(0);
+    }
+}
+
 fn valid_format(format: vga::PixelFormat) -> bool {
     vga::PixelFormat::from_rgb(
         format.bytes_per_pixel,
@@ -1483,6 +1618,53 @@ fn intersect(a: Rect, b: Rect) -> Option<Rect> {
         (right - left) as u32,
         (bottom - top) as u32,
     ))
+}
+
+fn push_damage(regions: &mut Vec<Rect>, mut rect: Rect) {
+    if rect.width == 0 || rect.height == 0 { return; }
+    // Coalesce only when the union is itself rectangular. Bounding arbitrary
+    // overlaps would repaint clean pixels and defeat region-limited output.
+    let mut i = 0;
+    while i < regions.len() {
+        let other = regions[i];
+        let rect_right = i64::from(rect.x) + i64::from(rect.width);
+        let rect_bottom = i64::from(rect.y) + i64::from(rect.height);
+        let other_right = i64::from(other.x) + i64::from(other.width);
+        let other_bottom = i64::from(other.y) + i64::from(other.height);
+        let rect_contains = rect.x <= other.x && rect.y <= other.y
+            && rect_right >= other_right && rect_bottom >= other_bottom;
+        let other_contains = other.x <= rect.x && other.y <= rect.y
+            && other_right >= rect_right && other_bottom >= rect_bottom;
+        if rect_contains {
+            regions.remove(i);
+            i = 0;
+            continue;
+        }
+        if other_contains {
+            return;
+        }
+        let same_columns = rect.x == other.x && rect.width == other.width
+            && i64::from(rect.y) <= other_bottom && i64::from(other.y) <= rect_bottom;
+        let same_rows = rect.y == other.y && rect.height == other.height
+            && i64::from(rect.x) <= other_right && i64::from(other.x) <= rect_right;
+        if same_columns || same_rows {
+            let left = rect.x.min(other.x);
+            let top = rect.y.min(other.y);
+            let right = rect_right.max(other_right);
+            let bottom = rect_bottom.max(other_bottom);
+            rect = Rect::new(
+                left,
+                top,
+                (right - i64::from(left)) as u32,
+                (bottom - i64::from(top)) as u32,
+            );
+            regions.remove(i);
+            i = 0;
+        } else {
+            i += 1;
+        }
+    }
+    regions.push(rect);
 }
 
 fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
@@ -1996,6 +2178,46 @@ mod tests {
             .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap()))
             .collect();
         assert_eq!(values, vec![0x0000_00ff, 0x0000_ff00]);
+    }
+
+    #[test]
+    fn surface_damage_is_separate_from_scene_damage() {
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        let surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(9)).unwrap();
+        let node = manager.desktop.ensure_node(
+            WINDOWS, PresentationKey(9), Rect::new(1, 0, 2, 1),
+        ).unwrap();
+        let mut transaction = Transaction::new(WINDOWS);
+        transaction.attach(node, Some(surface)).set_visible(node, true);
+        manager.desktop.commit(transaction).unwrap();
+        let mut pixels = [0x00ff_0000u32.to_le_bytes(), 0x0000_ff00u32.to_le_bytes()].concat();
+
+        {
+            let frame = manager.compose_processes(
+                |_, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &pixels).ok(),
+                4, 1, vga::PixelFormat::NATIVE,
+            ).unwrap();
+            assert_eq!(frame.damage, vec![Rect::new(0, 0, 4, 1)]);
+        }
+        {
+            let frame = manager.compose_processes(
+                |_, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &pixels).ok(),
+                4, 1, vga::PixelFormat::NATIVE,
+            ).unwrap();
+            assert!(frame.damage.is_empty());
+        }
+
+        pixels[..4].copy_from_slice(&0x0000_00ffu32.to_le_bytes());
+        manager.desktop.damage_surface(WINDOWS, SurfaceKey(9));
+        let frame = manager.compose_processes(
+            |_, _| PixelBuffer::new(2, 1, 8, vga::PixelFormat::NATIVE, &pixels).ok(),
+            4, 1, vga::PixelFormat::NATIVE,
+        ).unwrap();
+        assert_eq!(frame.damage, vec![Rect::new(1, 0, 2, 1)]);
+        assert_eq!(
+            u32::from_le_bytes(frame.pixels[4..8].try_into().unwrap()),
+            0x0000_00ff,
+        );
     }
 
     #[test]

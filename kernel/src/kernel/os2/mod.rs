@@ -263,14 +263,23 @@ pub fn render<A: crate::Arch>(
     if !state.pm_dirty && !state.cursor_dirty && !focus_changed && !pointer_changed {
         return;
     }
-    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
-    transaction
-        .set_geometry(node, crate::kernel::gui::Rect::new(
-            placement.x, placement.y, width as u32, height as u32,
-        ))
-        .attach(node, Some(surface))
-        .set_visible(node, true);
-    desktop.commit(transaction).expect("commit PM presentation node");
+    let geometry = crate::kernel::gui::Rect::new(
+        placement.x, placement.y, width as u32, height as u32,
+    );
+    let structural = desktop.node_state(node).is_none_or(|current| {
+        current.geometry != geometry || current.content != Some(surface) || !current.visible
+    });
+    if structural {
+        let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+        transaction
+            .set_geometry(node, geometry)
+            .attach(node, Some(surface))
+            .set_visible(node, true);
+        desktop.commit(transaction).expect("commit PM presentation node");
+    }
+    if state.pm_dirty || state.cursor_dirty {
+        desktop.damage_surface(endpoint, PM_SURFACE);
+    }
 
     state.pm_dirty = false;
     state.cursor_dirty = false;

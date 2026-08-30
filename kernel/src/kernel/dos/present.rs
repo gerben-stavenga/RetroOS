@@ -418,7 +418,7 @@ fn voodoo_display_tick<A: crate::Arch>(
 /// Publish one completed emulated-VGA frame. State-only DOS enters the shared
 /// desktop as an opaque content node; fullscreen DOS keeps its direct display
 /// path because it deliberately owns the whole adapter.
-fn attach_vga_surface(
+fn publish_vga_surface(
     width: usize,
     height: usize,
     desktop: &mut crate::kernel::gui::Desktop,
@@ -439,22 +439,23 @@ fn attach_vga_surface(
         )
         .expect("create DOS VGA presentation node");
     let placement = desktop.geometry(node).expect("live DOS VGA presentation node");
-    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
-    transaction
-        .set_geometry(
-            node,
-            crate::kernel::gui::Rect::new(
-                placement.x,
-                placement.y,
-                width as u32,
-                height as u32,
-            ),
-        )
-        .attach(node, Some(surface_id))
-        .set_visible(node, true);
-    desktop
-        .commit(transaction)
-        .expect("commit DOS VGA presentation node");
+    let geometry = crate::kernel::gui::Rect::new(
+        placement.x, placement.y, width as u32, height as u32,
+    );
+    let structural = desktop.node_state(node).is_none_or(|current| {
+        current.geometry != geometry
+            || current.content != Some(surface_id)
+            || !current.visible
+    });
+    if structural {
+        let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+        transaction
+            .set_geometry(node, geometry)
+            .attach(node, Some(surface_id))
+            .set_visible(node, true);
+        desktop.commit(transaction).expect("commit DOS VGA presentation node");
+    }
+    desktop.damage_surface(endpoint, DOS_SURFACE);
 
 }
 
@@ -479,14 +480,23 @@ pub(super) fn attach_retained_vga_surface(
         )
         .expect("create retained DOS VGA presentation node");
     let placement = desktop.geometry(node).expect("retained DOS VGA presentation node");
-    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
-    transaction
-        .set_geometry(node, crate::kernel::gui::Rect::new(
-            placement.x, placement.y, width as u32, height as u32,
-        ))
-        .attach(node, Some(surface_id))
-        .set_visible(node, true);
-    desktop.commit(transaction).expect("commit retained DOS VGA presentation node");
+    let geometry = crate::kernel::gui::Rect::new(
+        placement.x, placement.y, width as u32, height as u32,
+    );
+    let structural = desktop.node_state(node).is_none_or(|current| {
+        current.geometry != geometry
+            || current.content != Some(surface_id)
+            || !current.visible
+    });
+    if structural {
+        let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+        transaction
+            .set_geometry(node, geometry)
+            .attach(node, Some(surface_id))
+            .set_visible(node, true);
+        desktop.commit(transaction).expect("commit retained DOS VGA presentation node");
+    }
+    desktop.damage_surface(endpoint, DOS_SURFACE);
 }
 
 /// Rasterize the detached VGA into an output-independent retained preview.
@@ -524,7 +534,7 @@ pub fn display_tick<A: crate::Arch>(
     regs: &Regs,
     now_ns: u64,
     mut external: Option<&mut crate::kernel::display::Display>,
-    presentation: Option<(
+    mut presentation: Option<(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
@@ -588,6 +598,10 @@ pub fn display_tick<A: crate::Arch>(
         // separate budgets, and the physical scanout is the only visible
         // top-to-bottom sweep.
         let refresh_hz: u32 = if display.slow() { 20 } else { 70 };
+        // OSD publication samples the live VGA producer at 20 Hz, but the
+        // guest-visible beam continues at its normal rate. Conflating these
+        // clocks makes retrace-polled games themselves run at OSD speed.
+        let raster_hz = if crate::kernel::osd::is_open() { 20 } else { refresh_hz };
         let Some(mode) = vga.current_mode() else { return };
         let raster_size = presentation
             .is_some()
@@ -598,6 +612,7 @@ pub fn display_tick<A: crate::Arch>(
             mode,
             now_ns,
             refresh_hz,
+            raster_hz,
             raster_size,
         ) {
             crate::kernel::display::ScanoutAction::None => {}
@@ -615,6 +630,12 @@ pub fn display_tick<A: crate::Arch>(
                 let rendered = crate::kernel::display::render_shadow(
                     &mut pc.present_scratch2, display, &frame,
                 );
+                if rendered
+                    && let Some((desktop, endpoint)) = presentation.as_mut()
+                {
+                    let (width, height) = ::vga::dimensions(frame.mode);
+                    publish_vga_surface(width, height, desktop, *endpoint);
+                }
                 if rendered && prof {
                     let (nonzero, hash) =
                         crate::kernel::display::shadow_sample(&pc.present_scratch2);
@@ -638,8 +659,10 @@ pub fn display_tick<A: crate::Arch>(
             } => {
                 let p0 = if prof { machine.rdtsc() } else { 0 };
                 debug_assert!(presentation.is_some() || display.shadow_width == out_w);
-                let copied = if let Some((desktop, endpoint)) = presentation {
-                    attach_vga_surface(out_w, vga_h, desktop, endpoint);
+                let copied = if presentation.is_some() {
+                    // A retained surface became available at Render, when its
+                    // producer actually changed the pixels. This later phase
+                    // exists only to transfer direct-scanout shadows.
                     0
                 } else {
                     let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
@@ -685,7 +708,7 @@ pub fn display_tick<A: crate::Arch>(
     let p2 = if prof { machine.rdtsc() } else { 0 };
     display.shadow_width = w;
     if let Some((desktop, endpoint)) = presentation {
-        attach_vga_surface(w, h, desktop, endpoint);
+        publish_vga_surface(w, h, desktop, endpoint);
     } else {
         let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
         display.present(machine, bios, h, &mut pixels);

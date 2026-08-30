@@ -503,6 +503,45 @@ impl Display {
         }
     }
 
+    /// Publish only compositor regions whose packed shadow pixels changed.
+    /// Hosted and banked sinks currently require whole frames; linear GOP/VBE
+    /// and the packed Mode 13h sink receive the exact damaged rectangles.
+    pub fn present_regions<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        height: usize,
+        shadow: &mut [u8],
+        regions: &[crate::kernel::gui::Rect],
+    ) -> usize {
+        if regions.is_empty() { return 0; }
+        if matches!(
+            self.backend,
+            Backend::Host
+                | Backend::Vga { scanout: VgaScanout::VbeBanked { .. }, .. }
+        ) {
+            return self.present(machine, bios, height, shadow);
+        }
+        let format = self.rgb;
+        let (out_w, out_h) = self.fit();
+        let copied = match &mut self.backend {
+            Backend::Linear(framebuffer)
+            | Backend::Vga {
+                scanout: VgaScanout::Mode13 { framebuffer, .. }
+                    | VgaScanout::VbeLinear { framebuffer, .. },
+                ..
+            } => blit_regions(
+                framebuffer, format, out_w, out_h, height, shadow, regions,
+            ),
+            Backend::Headless => 0,
+            Backend::Host | Backend::Vga { scanout: VgaScanout::VbeBanked { .. }, .. } => {
+                unreachable!()
+            }
+        };
+        finish_present();
+        copied
+    }
+
     fn present_linear(&mut self, height: usize, shadow: &[u8]) -> Option<usize> {
         let format = self.rgb;
         let (out_w, out_h) = self.fit();
@@ -637,6 +676,60 @@ fn blit(
     out_w * out_h
 }
 
+fn blit_regions(
+    fb: &Framebuffer,
+    format: PixelFormat,
+    out_w: usize,
+    out_h: usize,
+    vga_height: usize,
+    shadow: &[u8],
+    regions: &[crate::kernel::gui::Rect],
+) -> usize {
+    let step = format.bytes_per_pixel as usize;
+    let row_bytes = out_w * step;
+    if vga_height == 0 || shadow.len() < row_bytes * vga_height {
+        return 0;
+    }
+    let bx = (fb.width - out_w) / 2;
+    let by = (fb.height - out_h) / 2;
+    let (ybase, yrem) = (out_h / vga_height, out_h % vga_height);
+    let origin = fb.va + by * fb.pitch + bx * step;
+    let mut copied = 0usize;
+    let mut oy = 0usize;
+    let mut yerr = 0usize;
+    for sy in 0..vga_height {
+        yerr += yrem;
+        let carry = (yerr >= vga_height) as usize;
+        let rows = ybase + carry;
+        yerr -= carry * vga_height;
+        for region in regions {
+            let top = region.y.max(0) as usize;
+            let bottom = (i64::from(region.y) + i64::from(region.height))
+                .clamp(0, vga_height as i64) as usize;
+            if sy < top || sy >= bottom { continue; }
+            let left = region.x.max(0) as usize;
+            let right = (i64::from(region.x) + i64::from(region.width))
+                .clamp(0, out_w as i64) as usize;
+            if left >= right { continue; }
+            let bytes = (right - left) * step;
+            let src = shadow[sy * row_bytes + left * step..].as_ptr();
+            for row in 0..rows {
+                unsafe {
+                    copy_bytes(
+                        (origin + (oy + row) * fb.pitch + left * step) as *mut u8,
+                        src,
+                        bytes,
+                        fb.wide,
+                    );
+                }
+                copied += right - left;
+            }
+        }
+        oy += rows;
+    }
+    copied
+}
+
 /// Largest centered 4:3 VGA picture that fits a physical framebuffer.
 pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
     if width * 3 >= height * 4 {
@@ -714,8 +807,11 @@ pub struct Scratch {
     /// the next clock wakeup publishes it.
     phase: usize,
     refresh_hz: u32,
-    /// Refresh containing the most recent render. This prevents the 1 ms work
-    /// cadence from becoming the display clock.
+    /// Rate at which the beam is sampled into a retained compositor surface.
+    /// This may be lower than `refresh_hz` without changing guest retrace.
+    raster_hz: u32,
+    /// Raster period containing the most recent render. This prevents the
+    /// 1 ms work cadence from becoming the display clock.
     frame: u64,
     /// A complete shadow exists and has not yet been published.
     ready: bool,
@@ -740,6 +836,7 @@ impl Scratch {
             mode: None,
             phase: 0,
             refresh_hz: 0,
+            raster_hz: 0,
             frame: 0,
             ready: false,
             last_tick: 0,
@@ -759,6 +856,7 @@ impl Scratch {
             core::ptr::addr_of_mut!((*p).mode).write(None);
             core::ptr::addr_of_mut!((*p).phase).write(0);
             core::ptr::addr_of_mut!((*p).refresh_hz).write(0);
+            core::ptr::addr_of_mut!((*p).raster_hz).write(0);
             core::ptr::addr_of_mut!((*p).frame).write(0);
             core::ptr::addr_of_mut!((*p).ready).write(false);
             core::ptr::addr_of_mut!((*p).last_tick).write(0);
@@ -887,25 +985,25 @@ pub enum ScanoutAction {
 
 /// Advance the direct-display clock and select this tick's bounded operation.
 ///
-/// Phase zero (and the extra blank phases on the slow path) exposes vertical
-/// retrace to the guest. At its trailing edge [`render_shadow`] captures the
-/// complete current VGA image and palette into write-back RAM. The next tick
-/// publishes that immutable shadow to GOP. This mirrors the natural cost split
-/// without first performing a 14 ms software scanout before the physical
-/// display performs another one.
+/// `refresh_hz` drives guest-visible retrace. `raster_hz` independently limits
+/// how often [`render_shadow`] captures the VGA image into retained RAM; OSD
+/// uses 20 Hz here without changing a game's beam timing. The tick following a
+/// completed render publishes that immutable shadow to its sink.
 pub fn scanout_action(
     s: &mut Scratch,
     display: &Display,
     mode: vga::VgaMode,
     now_ns: u64,
     refresh_hz: u32,
+    raster_hz: u32,
     raster_size: Option<(usize, usize)>,
 ) -> ScanoutAction {
     let (w, h) = vga::dimensions(mode);
-    if w == 0 || h == 0 || refresh_hz == 0 {
+    if w == 0 || h == 0 || refresh_hz == 0 || raster_hz == 0 {
         return ScanoutAction::None;
     }
-    let (frame, phase) = beam_time(now_ns, refresh_hz);
+    let (_, phase) = beam_time(now_ns, refresh_hz);
+    let (frame, _) = beam_time(now_ns, raster_hz);
     // Direct scanout chooses the fitted physical picture. A compositor asks
     // for the guest's natural dimensions, which makes the very same stretched
     // row rasterizer run at a horizontal ratio of exactly one.
@@ -933,13 +1031,15 @@ pub fn scanout_action(
     let reset = s.geo != geo
         || s.mode != Some(mode)
         || s.surface.len() != row_bytes * h + slack
-        || s.refresh_hz != refresh_hz;
+        || s.refresh_hz != refresh_hz
+        || s.raster_hz != raster_hz;
     if reset {
         s.geo = geo;
         s.surface.clear();
         s.surface.resize(row_bytes * h + slack, 0);
         s.mode = Some(mode);
         s.refresh_hz = refresh_hz;
+        s.raster_hz = raster_hz;
         // A mode switch gets a complete shadow immediately and publishes it
         // on the following tick. Keep the old complete physical frame until
         // then: scanout is double-buffered, so reconfiguring the write-back
@@ -1098,5 +1198,70 @@ pub fn dac_for(fmt: PixelFormat) -> voodoo::Dac {
         g: (fmt.green_pos, fmt.green_size),
         b: (fmt.blue_pos, fmt.blue_size),
         bytes: fmt.bytes_per_pixel,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raster_rate_does_not_change_guest_beam_rate() {
+        let mut scratch = Scratch::new();
+        let display = Display::host();
+        let mode = vga::VgaMode::Mode13h;
+        assert!(matches!(
+            scanout_action(&mut scratch, &display, mode, 0, 70, 20, Some((320, 200))),
+            ScanoutAction::Render,
+        ));
+        assert!(matches!(
+            scanout_action(
+                &mut scratch, &display, mode, 15_000_000, 70, 20, Some((320, 200)),
+            ),
+            ScanoutAction::None,
+        ));
+        assert_eq!(beam_vretrace(&scratch, 15), Some(true));
+        assert!(matches!(
+            scanout_action(
+                &mut scratch, &display, mode, 20_000_000, 70, 20, Some((320, 200)),
+            ),
+            ScanoutAction::None,
+        ));
+        assert_eq!(beam_vretrace(&scratch, 20), Some(false));
+        assert!(matches!(
+            scanout_action(
+                &mut scratch, &display, mode, 50_000_000, 70, 20, Some((320, 200)),
+            ),
+            ScanoutAction::Render,
+        ));
+    }
+
+    #[test]
+    fn regional_blit_leaves_clean_pixels_untouched() {
+        let mut output = alloc::vec![0xAAu8; 4 * 2 * 2];
+        let framebuffer = Framebuffer {
+            va: output.as_mut_ptr() as usize,
+            pitch: 4 * 2,
+            width: 4,
+            height: 2,
+            slow: false,
+            wide: false,
+        };
+        let shadow: alloc::vec::Vec<u8> = (0..16u8).collect();
+        assert_eq!(
+            blit_regions(
+                &framebuffer,
+                PixelFormat::RGB565,
+                4,
+                2,
+                2,
+                &shadow,
+                &[crate::kernel::gui::Rect::new(1, 0, 2, 1)],
+            ),
+            2,
+        );
+        assert_eq!(&output[..2], &[0xAA, 0xAA]);
+        assert_eq!(&output[2..6], &shadow[2..6]);
+        assert!(output[6..].iter().all(|&byte| byte == 0xAA));
     }
 }

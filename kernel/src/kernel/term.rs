@@ -215,22 +215,23 @@ fn render_frame(
         )
         .expect("create terminal presentation node");
     let placement = desktop.geometry(node).expect("live terminal presentation node");
-    let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
-    transaction
-        .set_geometry(
-            node,
-            crate::kernel::gui::Rect::new(
-                placement.x,
-                placement.y,
-                node_width as u32,
-                h as u32,
-            ),
-        )
-        .attach(node, Some(surface_id))
-        .set_visible(node, true);
-    desktop
-        .commit(transaction)
-        .expect("commit terminal presentation node");
+    let geometry = crate::kernel::gui::Rect::new(
+        placement.x, placement.y, node_width as u32, h as u32,
+    );
+    let structural = desktop.node_state(node).is_none_or(|current| {
+        current.geometry != geometry
+            || current.content != Some(surface_id)
+            || !current.visible
+    });
+    if structural {
+        let mut transaction = crate::kernel::gui::Transaction::new(endpoint);
+        transaction
+            .set_geometry(node, geometry)
+            .attach(node, Some(surface_id))
+            .set_visible(node, true);
+        desktop.commit(transaction).expect("commit terminal presentation node");
+    }
+    desktop.damage_surface(endpoint, TERMINAL_SURFACE);
 
     // In the event loop the terminal retains this producer buffer and the
     // compositor borrows it after the mutable render pass has ended.

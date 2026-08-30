@@ -1013,9 +1013,6 @@ fn present_desktop<A: crate::Arch>(
         display.composition_scale_y(canvas_height),
         display.rgb,
     );
-    if !windows.needs_present() {
-        return;
-    }
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
                    key: crate::kernel::gui::SurfaceKey| {
         threads
@@ -1026,7 +1023,9 @@ fn present_desktop<A: crate::Arch>(
     let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
         .expect("compose process-owned surfaces");
-    display.present(machine, bios_workspace, canvas_height, frame.pixels);
+    display.present_regions(
+        machine, bios_workspace, canvas_height, frame.pixels, &frame.damage,
+    );
 }
 
 pub fn event_loop<A: crate::Arch>(
@@ -1045,6 +1044,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_osd_refresh_tick = u64::MAX;
+    let mut last_osd_composite_period = u64::MAX;
     let mut last_world_ns = machine.now();
     // Metal IRQ0 queues Irq::Hw(0); hosted KVM's timer signal returns
     // KernelEvent::Irq. Either is only permission to resample the real clock.
@@ -1158,7 +1158,28 @@ pub fn event_loop<A: crate::Arch>(
                 );
             }
         }
-        if elapsed_ns != 0
+        // OSD publication is deliberately capped at 20 Hz regardless of the
+        // physical sink. DOS scanout keeps its independent guest-visible beam
+        // clock but samples the VGA aperture into its retained surface at this
+        // same rate. Each attempt consumes accumulated scene/surface damage;
+        // an empty damage set is a no-op inside `present_desktop`.
+        let osd_composite_due = if elapsed_ns == 0 {
+            false
+        } else if crate::kernel::osd::is_open() {
+            const OSD_COMPOSITOR_HZ: u128 = 20;
+            let period = (u128::from(world_now_ns) * OSD_COMPOSITOR_HZ
+                / 1_000_000_000) as u64;
+            if period != last_osd_composite_period {
+                last_osd_composite_period = period;
+                true
+            } else {
+                false
+            }
+        } else {
+            last_osd_composite_period = u64::MAX;
+            true
+        };
+        if osd_composite_due
             && let Some(display) = display.as_mut()
         {
             present_desktop(
