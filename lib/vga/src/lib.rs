@@ -811,72 +811,32 @@ impl Pal {
     }
 }
 
-/// Render ONE source scanline into `out`, in the framebuffer's format.
-///
-/// The caller places each horizontally-stretched row directly in its compact
-/// `out_w × VGA_height` shadow. Presentation later expands those completed
-/// rows vertically with bulk copies; every VGA mode takes this path.
-///
-/// Horizontal-stretch cursor, templated on `N = ceil(out_w / w)` — the
-/// constant overwrite width, so each pixel's run is N straight-line stores
-/// with no per-pixel loop. The cursor advances by the true Bresenham run
-/// (`out_w/w` or one more), so the overwrite overshoots at most one pixel,
-/// harmlessly covered by the next run; `out` carries `N × 4` bytes past
-/// `out_w` for the last one, since each store is a dword whatever the pixel
-/// width. `N = 0` is the dynamic-width instance for ratios no constant was
-/// compiled for.
-struct StretchRow<'a, const N: usize> {
-    out: &'a mut [u8],
-    /// Byte offset of the next output run.
-    o: usize,
-    /// Runtime packed-pixel width. The write count remains const-specialised;
-    /// this is only the branchless 2/3/4-byte pointer step.
-    step: usize,
-    err: usize,
-    base: usize,
-    rem: usize,
-    w: usize,
+/// Cursor for one native-width decoded row. Every VGA memory format writes
+/// exactly one `u32` per source pixel; presentation owns all scaling and
+/// physical framebuffer packing.
+struct NativeRow<'a> {
+    out: &'a mut [u32],
+    x: usize,
 }
 
-impl<const N: usize> StretchRow<'_, N> {
-    #[inline]
-    fn put(&mut self, v: u32) {
-        let writes = if N == 0 { self.base + 1 } else { N };
-        let mut p = self.o;
-        for _ in 0..writes {
-            // Always issue one overlapping dword store. For 16/24-bit pixels
-            // the following store replaces the excess high bytes; the shadow
-            // allocation carries guard bytes for the final store.
-            unsafe {
-                core::ptr::write_unaligned(self.out.as_mut_ptr().add(p) as *mut u32, v);
-            }
-            p += self.step;
+impl NativeRow<'_> {
+    fn put(&mut self, pixel: u32) {
+        if let Some(out) = self.out.get_mut(self.x) {
+            *out = pixel;
         }
-        self.err += self.rem;
-        let carry = (self.err >= self.w) as usize;
-        self.err -= carry * self.w;
-        self.o += (self.base + carry) * self.step;
+        self.x += 1;
     }
 }
 
-fn row_stretched<const N: usize>(
-    frame: &Frame,
-    sy: usize,
-    pal: &Pal,
-    out: &mut [u8],
-    w: usize,
-    out_w: usize,
-) {
-    let step = pal.fmt.bytes_per_pixel as usize;
-    let st = &mut StretchRow::<N> {
-        out,
-        o: sy * out_w * step,
-        step,
-        err: 0,
-        base: out_w / w,
-        rem: out_w % w,
-        w,
-    };
+/// Decode one VGA source scanline into `w` native `u32` pixels. `Pal`
+/// determines the word's channel encoding; no presentation geometry enters
+/// this pass.
+pub fn render_row(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32]) {
+    let (w, h) = dimensions(frame.mode);
+    if sy >= h || w == 0 || out.len() < w {
+        return;
+    }
+    let st = &mut NativeRow { out: &mut out[..w], x: 0 };
     match frame.mode {
         VgaMode::Mode13h => row_mode13(frame, sy, pal, st, w),
         VgaMode::Text { cols, rows, cell_w, cell_h } =>
@@ -887,48 +847,6 @@ fn row_stretched<const N: usize>(
         VgaMode::Planar16 { row_bytes, .. } => row_planar16(frame, sy, pal, st, w, row_bytes as usize),
         VgaMode::ModeX { row_bytes, .. } => row_modex(frame, sy, pal, st, w, row_bytes as usize),
         VgaMode::LinearSvga { bpp, pitch, .. } => row_svga(frame, sy, pal, st, w, bpp, pitch as usize),
-    }
-}
-
-/// Colour-translate source row `sy` — ANY mode — directly into row `sy` of the
-/// `out_w × h` shadow `out`: translation and horizontal stretch in one pass, no
-/// source-width intermediate. `out` is the WHOLE shadow, pitched by
-/// `out_w × bytes_per_pixel` and carrying `ceil(out_w/w) × 4` bytes of slack for
-/// the last row's final stores. The decoders emit strictly left-to-right; a
-/// malformed frame may stop early, leaving that row's tail untouched.
-pub fn render_row_stretched(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u8], out_w: usize) {
-    let (w, h) = dimensions(frame.mode);
-    // `out_w < w` is a SHRINK, not an error: the Bresenham step below yields
-    // base = 0, so the destination pointer holds still across several source
-    // pixels and each overwrites the last — nearest-neighbour downscale, the
-    // same walk as stretching with the roles swapped. Refusing it was what
-    // made an aperture narrower than the guest image (the 320x200 mode-13 OSD
-    // sink, 266 px after aspect fit) render nothing at all.
-    if sy >= h || w == 0 || out_w == 0 {
-        return;
-    }
-    let n = out_w.div_ceil(w);
-    let step = pal.fmt.bytes_per_pixel as usize;
-    if !(1..=4).contains(&step) || out.len() < out_w * step * h + n * 4 {
-        return;
-    }
-    // Constant-width instances for the ratios real panels produce (text
-    // 720-wide → 2-3, CGA 640 → 2-4, 320-wide sources → 4-12); rarer
-    // ratios take the dynamic-width instance.
-    match n {
-        1 => row_stretched::<1>(frame, sy, pal, out, w, out_w),
-        2 => row_stretched::<2>(frame, sy, pal, out, w, out_w),
-        3 => row_stretched::<3>(frame, sy, pal, out, w, out_w),
-        4 => row_stretched::<4>(frame, sy, pal, out, w, out_w),
-        5 => row_stretched::<5>(frame, sy, pal, out, w, out_w),
-        6 => row_stretched::<6>(frame, sy, pal, out, w, out_w),
-        7 => row_stretched::<7>(frame, sy, pal, out, w, out_w),
-        8 => row_stretched::<8>(frame, sy, pal, out, w, out_w),
-        9 => row_stretched::<9>(frame, sy, pal, out, w, out_w),
-        10 => row_stretched::<10>(frame, sy, pal, out, w, out_w),
-        11 => row_stretched::<11>(frame, sy, pal, out, w, out_w),
-        12 => row_stretched::<12>(frame, sy, pal, out, w, out_w),
-        _ => row_stretched::<0>(frame, sy, pal, out, w, out_w),
     }
 }
 
@@ -943,7 +861,7 @@ fn row_origin(frame: &Frame, sy: usize) -> (usize, usize, usize) {
     }
 }
 
-fn row_mode13<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize) {
+fn row_mode13(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize) {
     let (start, pan, ry) = row_origin(frame, sy);
     let base = start + ry * w + pan;
     for x in 0..w {
@@ -951,7 +869,7 @@ fn row_mode13<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stre
     }
 }
 
-fn row_modex<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize, row_bytes: usize) {
+fn row_modex(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize, row_bytes: usize) {
     let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
     let (start, pan, ry) = row_origin(frame, sy);
     for x in 0..w {
@@ -966,7 +884,7 @@ fn row_modex<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stret
     }
 }
 
-fn row_planar16<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize, row_bytes: usize) {
+fn row_planar16(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize, row_bytes: usize) {
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
     let (start, pan, ry) = row_origin(frame, sy);
     // Per SOURCE BYTE: fetch its 4 plane bytes once (64K apart) and spread them
@@ -991,7 +909,7 @@ fn row_planar16<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut St
     }
 }
 
-fn row_cga4<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize) {
+fn row_cga4(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize) {
     // CGA's four colours are fixed, not DAC entries — encode them once per row.
     let c: [u32; 4] = core::array::from_fn(|i| pal.fmt.encode(frame.cga_palette[i]));
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 4);
@@ -1001,7 +919,7 @@ fn row_cga4<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stretc
     }
 }
 
-fn row_cga2<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize) {
+fn row_cga2(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize) {
     let (bg, fg) = (pal.fmt.encode(frame.cga_palette[0]), pal.fmt.encode(frame.cga_palette[1]));
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 8);
     for x in 0..w {
@@ -1010,8 +928,8 @@ fn row_cga2<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut Stretc
     }
 }
 
-fn row_text<const N: usize>(
-    frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize,
+fn row_text(
+    frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize,
     cols: usize, rows: usize, cell_w: usize, cell_h: usize,
 ) {
     let (trow, gy) = (sy / cell_h, sy % cell_h);
@@ -1049,7 +967,7 @@ fn row_text<const N: usize>(
     }
 }
 
-fn row_svga<const N: usize>(frame: &Frame, sy: usize, pal: &Pal, st: &mut StretchRow<N>, w: usize, bpp: u8, pitch: usize) {
+fn row_svga(frame: &Frame, sy: usize, pal: &Pal, st: &mut NativeRow<'_>, w: usize, bpp: u8, pitch: usize) {
     let bpp8 = (bpp as usize).div_ceil(8);
     let pitch = if pitch == 0 { w * bpp8 } else { pitch };
     let vram = frame.vram;

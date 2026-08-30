@@ -472,7 +472,7 @@ fn fallback_palette_has_ega_colors_first() {
 }
 
 #[test]
-fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
+fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
     let mut palette = [0u8; 768];
     for i in 0..256usize {
         palette[i * 3] = (i & 63) as u8;
@@ -503,39 +503,16 @@ fn packed_stretch_rows_match_for_16_24_and_32_bit_outputs() {
         PixelFormat::from_rgb(3, [16, 8, 8, 8, 0, 8]).unwrap(),
         PixelFormat::NATIVE,
     ];
-    let out_w = 643usize; // non-integral 643/320 exercises the DDA carry
-    let sy = 199usize; // the LAST row: its final stores land in the slack
+    let sy = 199usize;
     for fmt in formats {
-        let step = fmt.bytes_per_pixel as usize;
-        let n = out_w.div_ceil(320);
-        // The whole shadow, exactly as the raster allocates it.
-        let mut out = vec![0u8; out_w * step * 200 + n * 4];
+        let mut out = vec![0u32; 320];
         let mut pal = vga_render::Pal::new();
         let mut cache = [0u8; 768];
         pal.sync(&palette, 0xFF, fmt, &mut cache);
-        vga_render::render_row_stretched(&frame, sy, &pal, &mut out, out_w);
-        let row = &out[sy * out_w * step..];
-
-        let (base, rem) = (out_w / 320, out_w % 320);
-        let (mut xout, mut err) = (0usize, 0usize);
+        vga_render::render_row(&frame, sy, &pal, &mut out);
         for (x, &idx) in vram[sy * 320..(sy + 1) * 320].iter().enumerate() {
-            err += rem;
-            let carry = (err >= 320) as usize;
-            err -= carry * 320;
-            let run = base + carry;
-            let expected = fmt.encode(pal_rgb(&palette, idx)).to_le_bytes();
-            for p in xout..xout + run {
-                assert_eq!(
-                    &row[p * step..p * step + step],
-                    &expected[..step],
-                    "{step}-byte output, source {x}, output {p}"
-                );
-            }
-            xout += run;
+            assert_eq!(out[x], fmt.encode(pal_rgb(&palette, idx)));
         }
-        assert_eq!(xout, out_w);
-        // Only row `sy` was asked for, so every earlier row must be untouched.
-        assert!(out[..sy * out_w * step].iter().all(|&b| b == 0));
     }
 }
 

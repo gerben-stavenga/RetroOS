@@ -26,7 +26,7 @@ struct Scanout {
     pal: vga::Pal,
     pal_cache: [u8; 768],
     /// Process-independent terminal pixels borrowed by the event-loop compositor.
-    content: alloc::vec::Vec<u8>,
+    content: alloc::vec::Vec<u32>,
     /// Output-format shadow produced by the GUI scene compositor.
     surface: alloc::vec::Vec<u8>,
     /// Startup/panic path before an event loop owns the real desktop.
@@ -170,9 +170,7 @@ fn render_frame(
     // native 720x400 XRGB8888 pixels independent of the physical display;
     // scene composition performs scaling and output-format conversion.
     let content_format = vga::PixelFormat::NATIVE;
-    let content_step = content_format.bytes_per_pixel as usize;
-    let content_row_bytes = w * content_step;
-    let slack = 4; // final render_row_stretched overlapping dword store
+    let content_row_bytes = w * 4;
     let scanout_p = &raw mut SCANOUT;
     let s = unsafe { &mut *scanout_p };
     let Scanout {
@@ -182,13 +180,13 @@ fn render_frame(
         surface,
         bootstrap_desktop,
     } = s;
-    let need = content_row_bytes * h + slack;
+    let need = w * h;
     if content.len() != need {
         content.resize(need, 0);
     }
     pal.sync(frame.palette, frame.dac_mask, content_format, pal_cache);
     for sy in 0..h {
-        vga::render_row_stretched(frame, sy, pal, content, w);
+        vga::render_row(frame, sy, pal, &mut content[sy * w..(sy + 1) * w]);
     }
 
     const TERMINAL_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
@@ -239,12 +237,15 @@ fn render_frame(
         return None;
     }
 
+    let content_bytes = unsafe {
+        core::slice::from_raw_parts(content.as_ptr().cast::<u8>(), content.len() * 4)
+    };
     let buffer = crate::kernel::gui::PixelBuffer::new(
         w,
         h,
         content_row_bytes,
         content_format,
-        content,
+        content_bytes,
     )
     .expect("valid terminal content buffer");
     let contents = [crate::kernel::gui::Content { id: surface_id, buffer }];
@@ -265,11 +266,14 @@ fn render_frame(
 pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {
     let scanout = &raw const SCANOUT;
     let pixels = unsafe { &(*scanout).content };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4)
+    };
     crate::kernel::gui::PixelBuffer::new(
         720,
         400,
         720 * 4,
         vga::PixelFormat::NATIVE,
-        pixels,
+        bytes,
     ).ok()
 }

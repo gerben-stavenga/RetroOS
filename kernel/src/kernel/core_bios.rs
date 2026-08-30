@@ -125,6 +125,15 @@ impl EmulatedVga {
 /// private and can only be opened by a [`VgaCap`](crate::kernel::platform::VgaCap).
 pub struct BiosDisplayWorkspace<A: Arch>(Option<NativeBiosWorkspace<A>>);
 
+enum BankedSource<'a> {
+    Packed(&'a [u8]),
+    Native {
+        width: usize,
+        pixels: &'a [u32],
+        row: &'a mut alloc::vec::Vec<u8>,
+    },
+}
+
 struct NativeBiosWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
@@ -614,6 +623,46 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         shadow_height: usize,
         shadow: &[u8],
     ) -> Result<usize, BiosError> {
+        self.present_banked_source(
+            machine,
+            display,
+            mode,
+            bank_state,
+            shadow_height,
+            BankedSource::Packed(shadow),
+        )
+    }
+
+    fn present_banked_native(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::VgaCap,
+        mode: crate::kernel::platform::VbeMode,
+        bank_state: &mut u16,
+        source_width: usize,
+        source_height: usize,
+        pixels: &[u32],
+        row: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, BiosError> {
+        self.present_banked_source(
+            machine,
+            display,
+            mode,
+            bank_state,
+            source_height,
+            BankedSource::Native { width: source_width, pixels, row },
+        )
+    }
+
+    fn present_banked_source(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::VgaCap,
+        mode: crate::kernel::platform::VbeMode,
+        bank_state: &mut u16,
+        shadow_height: usize,
+        mut source: BankedSource<'_>,
+    ) -> Result<usize, BiosError> {
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
             return Err(BiosError::InvalidFrame);
         };
@@ -628,7 +677,12 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let pitch = usize::from(mode.pitch);
         let granularity = usize::from(mode.window_granularity_kb) * 1024;
         let window_size = usize::from(mode.window_size_kb) * 1024;
-        if shadow_height == 0 || shadow.len() < needed
+        let source_valid = match &source {
+            BankedSource::Packed(shadow) => shadow.len() >= needed,
+            BankedSource::Native { width, pixels, .. } => *width != 0
+                && pixels.len() >= width.saturating_mul(shadow_height),
+        };
+        if shadow_height == 0 || !source_valid
             || shadow_width > panel_w || row_bytes > pitch
             || granularity == 0 || window_size == 0 || window_size % granularity != 0
             || mode.window_segment == 0
@@ -659,7 +713,22 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 let carry = usize::from(yerr >= shadow_height);
                 let rows = ybase + carry;
                 yerr -= carry * shadow_height;
-                let src = &shadow[sy * row_bytes..(sy + 1) * row_bytes];
+                let src = match &mut source {
+                    BankedSource::Packed(shadow) =>
+                        &shadow[sy * row_bytes..(sy + 1) * row_bytes],
+                    BankedSource::Native { width, pixels, row } => {
+                        row.resize(row_bytes.saturating_add(4), 0);
+                        if !crate::kernel::display::stretch_native_row(
+                            &pixels[sy * *width..(sy + 1) * *width],
+                            row,
+                            out_w,
+                            step,
+                        ) {
+                            return Err(BiosError::InvalidFrame);
+                        }
+                        &row[..row_bytes]
+                    }
+                };
                 for _ in 0..rows {
                     let mut source = src;
                     let mut offset = (by + oy) * pitch + bx * step;
@@ -1047,6 +1116,29 @@ impl crate::kernel::platform::VgaCap {
     ) -> Result<usize, BiosError> {
         self.bios(bios)?.present_banked(
             machine, self, mode, current_bank, shadow_height, shadow,
+        )
+    }
+
+    pub fn bios_present_native<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        mode: crate::kernel::platform::VbeMode,
+        current_bank: &mut u16,
+        source_width: usize,
+        source_height: usize,
+        pixels: &[u32],
+        row: &mut alloc::vec::Vec<u8>,
+    ) -> Result<usize, BiosError> {
+        self.bios(bios)?.present_banked_native(
+            machine,
+            self,
+            mode,
+            current_bank,
+            source_width,
+            source_height,
+            pixels,
+            row,
         )
     }
 
