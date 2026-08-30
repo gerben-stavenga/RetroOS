@@ -1,5 +1,6 @@
 use crate::checksum::Checksum;
 use crate::{Corrupt, Error, Storage, Unsupported};
+use alloc::vec::Vec;
 
 pub(crate) const SUPERBLOCK_OFFSET: u64 = 1024;
 pub(crate) const SUPERBLOCK_SIZE: usize = 1024;
@@ -62,6 +63,7 @@ pub struct Superblock {
 }
 
 impl Superblock {
+    #[inline(never)]
     pub(crate) fn load(storage: &mut dyn Storage) -> Result<Self, Error> {
         let mut bytes = [0u8; SUPERBLOCK_SIZE];
         checked_read(storage, SUPERBLOCK_OFFSET, &mut bytes)?;
@@ -261,6 +263,278 @@ impl Superblock {
     pub(crate) fn needs_recovery(&self) -> bool {
         self.feature_incompat & INCOMPAT_RECOVER != 0
     }
+
+    pub(crate) fn update_free_counts(
+        &self,
+        raw: &mut [u8],
+        blocks: u64,
+        inode: bool,
+        allocate: bool,
+    ) -> Result<(), Error> {
+        fn change(
+            raw: &mut [u8],
+            offsets: (usize, Option<usize>),
+            amount: u64,
+            max: u64,
+            subtract: bool,
+        ) -> Result<(), Error> {
+            let old = u64::from(le32(raw, offsets.0))
+                | offsets.1.map_or(0, |high| u64::from(le32(raw, high)) << 32);
+            let new = if subtract {
+                old.checked_sub(amount)
+            } else {
+                old.checked_add(amount).filter(|value| *value <= max)
+            }
+            .ok_or(Corrupt::InvalidFreeBlockCount)?;
+            put_le32(raw, offsets.0, new as u32);
+            if let Some(high) = offsets.1 {
+                put_le32(raw, high, (new >> 32) as u32);
+            }
+            Ok(())
+        }
+        if blocks != 0 {
+            change(
+                raw,
+                (0x0c, Some(0x158)),
+                blocks,
+                self.blocks_count,
+                allocate,
+            )?;
+        }
+        if inode {
+            change(raw, (0x10, None), 1, u64::from(self.inodes_count), allocate)?;
+        }
+        let mut checksum = Checksum::new();
+        checksum.update(&raw[..0x3fc]);
+        put_le32(raw, 0x3fc, checksum.finalize());
+        Ok(())
+    }
+}
+
+/// One checked block-group descriptor.
+///
+/// Field widths, byte offsets, counter bounds and descriptor checksums belong
+/// here. Allocation code deals in group resources rather than raw ext4 bytes.
+pub(crate) struct GroupDescriptor {
+    pub(crate) group: u32,
+    bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum BitmapKind {
+    Block,
+    Inode,
+}
+
+impl GroupDescriptor {
+    pub(crate) fn new(superblock: &Superblock, group: u32, bytes: Vec<u8>) -> Result<Self, Error> {
+        if group >= superblock.group_count()
+            || bytes.len() != usize::from(superblock.descriptor_size)
+        {
+            return Err(Corrupt::InvalidGroup(group).into());
+        }
+        let expected = le16(&bytes, 0x1e);
+        if superblock.has_metadata_checksums() {
+            let mut checksum = Checksum::with_seed(superblock.checksum_seed);
+            checksum.update_u32_le(group);
+            checksum.update(&bytes[..0x1e]);
+            checksum.update_u16_le(0);
+            checksum.update(&bytes[0x20..]);
+            if checksum.finalize() as u16 != expected {
+                return Err(Corrupt::GroupDescriptorChecksum(group).into());
+            }
+        } else if superblock.feature_ro_compat & RO_COMPAT_GDT_CSUM != 0
+            && legacy_descriptor_checksum(&superblock.uuid, group, &bytes) != expected
+        {
+            return Err(Corrupt::GroupDescriptorChecksum(group).into());
+        }
+        Ok(Self { group, bytes })
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn wide32(&self, low: usize, high: usize) -> u64 {
+        u64::from(le32(&self.bytes, low))
+            | self
+                .bytes
+                .get(high..high + 4)
+                .map_or(0, |bytes| u64::from(le32(bytes, 0)) << 32)
+    }
+
+    fn wide16(&self, low: usize, high: usize) -> u64 {
+        u64::from(le16(&self.bytes, low))
+            | self
+                .bytes
+                .get(high..high + 2)
+                .map_or(0, |bytes| u64::from(le16(bytes, 0)) << 16)
+    }
+
+    fn set_wide16(&mut self, low: usize, high: usize, value: u64) -> Result<(), Error> {
+        if value > u64::from(u32::MAX) || value > u64::from(u16::MAX) && self.bytes.len() < high + 2
+        {
+            return Err(Corrupt::InvalidFreeBlockCount.into());
+        }
+        put_le16(&mut self.bytes, low, value as u16);
+        if self.bytes.len() >= high + 2 {
+            put_le16(&mut self.bytes, high, (value >> 16) as u16);
+        }
+        Ok(())
+    }
+
+    fn decrease(&mut self, field: (usize, usize), amount: u64) -> Result<(), Error> {
+        self.set_wide16(
+            field.0,
+            field.1,
+            self.wide16(field.0, field.1)
+                .checked_sub(amount)
+                .ok_or(Corrupt::InvalidFreeBlockCount)?,
+        )
+    }
+
+    fn increase(&mut self, field: (usize, usize), amount: u64, max: u64) -> Result<(), Error> {
+        let value = self
+            .wide16(field.0, field.1)
+            .checked_add(amount)
+            .filter(|value| *value <= max)
+            .ok_or(Corrupt::InvalidFreeBlockCount)?;
+        self.set_wide16(field.0, field.1, value)
+    }
+
+    pub(crate) fn bitmap(&self, kind: BitmapKind) -> u64 {
+        let (low, high) = match kind {
+            BitmapKind::Block => (0, 0x20),
+            BitmapKind::Inode => (4, 0x24),
+        };
+        self.wide32(low, high)
+    }
+
+    pub(crate) fn inode_table(&self) -> u64 {
+        self.wide32(8, 0x28)
+    }
+
+    pub(crate) fn free_blocks(&self) -> u64 {
+        self.wide16(0x0c, 0x2c)
+    }
+
+    pub(crate) fn free_inodes(&self) -> u64 {
+        self.wide16(0x0e, 0x2e)
+    }
+
+    pub(crate) fn flags(&self) -> u16 {
+        le16(&self.bytes, 0x12)
+    }
+
+    pub(crate) fn clear_flag(&mut self, flag: u16) {
+        let flags = self.flags() & !flag;
+        put_le16(&mut self.bytes, 0x12, flags);
+    }
+
+    pub(crate) fn allocate_blocks(&mut self, amount: u64) -> Result<(), Error> {
+        self.decrease((0x0c, 0x2c), amount)
+    }
+
+    pub(crate) fn release_blocks(&mut self, amount: u64, blocks: u64) -> Result<(), Error> {
+        self.increase((0x0c, 0x2c), amount, blocks)
+    }
+
+    pub(crate) fn allocate_inode(
+        &mut self,
+        index: u64,
+        inodes: u64,
+        directory: bool,
+    ) -> Result<(), Error> {
+        self.decrease((0x0e, 0x2e), 1)?;
+        let unused = self.wide16(0x1c, 0x3c);
+        if unused > inodes || index >= inodes {
+            return Err(Corrupt::InvalidFreeBlockCount.into());
+        }
+        let initialized = inodes - unused;
+        if index >= initialized {
+            self.set_wide16(0x1c, 0x3c, inodes - index - 1)?;
+        }
+        if directory {
+            self.increase((0x10, 0x30), 1, inodes)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release_inode(&mut self, inodes: u64, directory: bool) -> Result<(), Error> {
+        self.increase((0x0e, 0x2e), 1, inodes)?;
+        if directory {
+            let used = self.wide16(0x10, 0x30);
+            if used > inodes {
+                return Err(Corrupt::InvalidFreeBlockCount.into());
+            }
+            self.decrease((0x10, 0x30), 1)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bitmap_checksum(&self, kind: BitmapKind) -> u32 {
+        let (low, high) = match kind {
+            BitmapKind::Block => (0x18, 0x38),
+            BitmapKind::Inode => (0x1a, 0x3a),
+        };
+        self.wide16(low, high) as u32
+    }
+
+    pub(crate) fn set_bitmap_checksum(&mut self, kind: BitmapKind, checksum: u32) {
+        let (low, high) = match kind {
+            BitmapKind::Block => (0x18, 0x38),
+            BitmapKind::Inode => (0x1a, 0x3a),
+        };
+        put_le16(&mut self.bytes, low, checksum as u16);
+        if self.bytes.len() >= high + 2 {
+            put_le16(&mut self.bytes, high, (checksum >> 16) as u16);
+        }
+    }
+
+    pub(crate) fn finish(&mut self, superblock: &Superblock) {
+        put_le16(&mut self.bytes, 0x1e, 0);
+        let checksum = if superblock.has_metadata_checksums() {
+            let mut checksum = Checksum::with_seed(superblock.checksum_seed);
+            checksum.update_u32_le(self.group);
+            checksum.update(&self.bytes);
+            checksum.finalize() as u16
+        } else {
+            legacy_descriptor_checksum(&superblock.uuid, self.group, &self.bytes)
+        };
+        put_le16(&mut self.bytes, 0x1e, checksum);
+    }
+}
+
+fn legacy_descriptor_checksum(uuid: &[u8; 16], group: u32, descriptor: &[u8]) -> u16 {
+    let mut checksum = crc16(u16::MAX, uuid);
+    checksum = crc16(checksum, &group.to_le_bytes());
+    checksum = crc16(checksum, &descriptor[..0x1e]);
+    if descriptor.len() > 0x20 {
+        checksum = crc16(checksum, &descriptor[0x20..]);
+    }
+    checksum
+}
+
+fn crc16(mut checksum: u16, bytes: &[u8]) -> u16 {
+    for &byte in bytes {
+        checksum ^= u16::from(byte);
+        for _ in 0..8 {
+            checksum = if checksum & 1 != 0 {
+                (checksum >> 1) ^ 0xa001
+            } else {
+                checksum >> 1
+            };
+        }
+    }
+    checksum
+}
+
+pub(crate) fn put_le16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+pub(crate) fn put_le32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
 fn is_power_of(mut value: u32, base: u32) -> bool {

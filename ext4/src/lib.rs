@@ -10,7 +10,9 @@
 extern crate alloc;
 
 mod checksum;
+mod directory;
 mod extent_tree;
+mod inode;
 mod journal;
 mod ondisk;
 mod storage;
@@ -21,7 +23,9 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
+use directory::{BlockKind as DirectoryBlockKind, DirectoryBlock, record as directory_record};
 use extent_tree::{ExtentIdentity, ExtentState, ExtentTree};
+use inode::InodeRecord;
 pub use ondisk::Superblock;
 use ondisk::{checked_read, le16, le32};
 pub use storage::Storage;
@@ -38,32 +42,6 @@ const MODE_TYPE_MASK: u16 = 0xf000;
 const MODE_DIRECTORY: u16 = 0x4000;
 const MODE_REGULAR: u16 = 0x8000;
 const MODE_SYMLINK: u16 = 0xa000;
-
-fn directory_record(
-    bytes: &[u8],
-    cursor: usize,
-) -> Result<(usize, u32, u8, &[u8]), Error> {
-    if bytes.len().saturating_sub(cursor) < 8 {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let record_len = usize::from(le16(bytes, cursor + 4));
-    let name_len = usize::from(bytes[cursor + 6]);
-    let next = cursor
-        .checked_add(record_len)
-        .filter(|next| {
-            record_len >= 8
-                && record_len.is_multiple_of(4)
-                && *next <= bytes.len()
-                && name_len <= record_len - 8
-        })
-        .ok_or(Corrupt::InvalidDirectory)?;
-    Ok((
-        next,
-        le32(bytes, cursor),
-        bytes[cursor + 7],
-        &bytes[cursor + 8..cursor + 8 + name_len],
-    ))
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Corrupt {
@@ -113,13 +91,6 @@ pub enum Unsupported {
     ExtentMutation,
     InlineData,
     Encryption,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DirectoryBlockKind {
-    Leaf,
-    Root,
-    Internal,
 }
 
 pub enum Error {
@@ -300,28 +271,6 @@ impl Inode {
     }
 }
 
-fn decode_inode_timestamp(
-    raw: &[u8],
-    seconds_offset: usize,
-    extra_offset: usize,
-    inode_number: u32,
-) -> Result<Timestamp, Error> {
-    let seconds = i64::from(le32(raw, seconds_offset) as i32);
-    let extra = if extra_offset + 4 <= raw.len() {
-        le32(raw, extra_offset)
-    } else {
-        0
-    };
-    let nanoseconds = extra >> 2;
-    if nanoseconds >= 1_000_000_000 {
-        return Err(Corrupt::InvalidInode(inode_number).into());
-    }
-    Ok(Timestamp {
-        seconds: seconds + (i64::from(extra & 3) << 32),
-        nanoseconds,
-    })
-}
-
 /// Interpreted state for a mounted filesystem.
 ///
 /// Storage is caller-owned and supplied explicitly to every operation that
@@ -363,6 +312,7 @@ impl Ext4 {
         self.overlay.len()
     }
 
+    #[inline(never)]
     fn read_storage(
         &mut self,
         storage: &mut dyn Storage,
@@ -594,6 +544,7 @@ impl Ext4 {
 
     /// Append at most `max` checked directory entries, resuming from an opaque
     /// byte cookie returned by the previous call. `None` means end of directory.
+    #[inline(never)]
     pub fn list(
         &mut self,
         storage: &mut dyn Storage,
@@ -655,18 +606,20 @@ impl Ext4 {
                     &mut block[..count],
                 )?;
             }
-            let kind = self.directory_block_kind(&directory, logical, count, &block);
-            if self.superblock.has_metadata_checksums() {
-                self.verify_directory_checksum(&directory, kind, count, &block)?;
-            }
-            if kind != DirectoryBlockKind::Leaf {
+            block.truncate(count);
+            let checked = DirectoryBlock::new(
+                self.superblock.checksum_seed,
+                self.superblock.has_metadata_checksums(),
+                &directory,
+                logical,
+                block,
+            )?;
+            if checked.kind != DirectoryBlockKind::Leaf {
+                block = checked.bytes;
+                block.resize(self.superblock.block_size as usize, 0);
                 continue;
             }
-            let end = if self.superblock.has_metadata_checksums() {
-                count.checked_sub(12).ok_or(Corrupt::InvalidDirectory)?
-            } else {
-                count
-            };
+            let end = checked.records_end;
             let wanted = if logical == first_logical {
                 first_within
             } else {
@@ -675,8 +628,9 @@ impl Ext4 {
             let mut cursor = 0usize;
             let mut cookie_is_boundary = wanted == 0;
             while cursor < end {
+                let entry = directory_record(&checked.bytes[..checked.records_end], cursor)?;
                 let (next, number, file_type, name) =
-                    directory_record(&block[..end], cursor)?;
+                    (entry.next, entry.inode, entry.file_type, entry.name);
                 if cursor == wanted {
                     cookie_is_boundary = true;
                 }
@@ -704,6 +658,8 @@ impl Ext4 {
                 }
                 cursor = next;
             }
+            block = checked.bytes;
+            block.resize(self.superblock.block_size as usize, 0);
             if logical == first_logical && wanted != end && !cookie_is_boundary {
                 return Err(Error::InvalidArgument);
             }
@@ -732,25 +688,25 @@ impl Ext4 {
         let mut cursor = 0usize;
         let mut cookie_is_boundary = wanted == 0;
         while cursor < data.len() {
-            let (next, number, file_type, record_name) = directory_record(data, cursor)?;
+            let entry = directory::record(data, cursor)?;
             if cursor == wanted {
                 cookie_is_boundary = true;
             }
-            if cursor >= wanted && number != 0 {
+            if cursor >= wanted && entry.inode != 0 {
                 let mut name = Vec::new();
-                name.try_reserve_exact(record_name.len())
+                name.try_reserve_exact(entry.name.len())
                     .map_err(|_| Error::OutOfMemory)?;
-                name.extend_from_slice(record_name);
+                name.extend_from_slice(entry.name);
                 output.push(DirectoryEntry {
                     name,
-                    file_type,
-                    inode: self.load_inode(storage, number)?,
+                    file_type: entry.file_type,
+                    inode: self.load_inode(storage, entry.inode)?,
                 });
                 if output.len() - initial_len == max {
-                    return Ok(Some(next as u64));
+                    return Ok(Some(entry.next as u64));
                 }
             }
-            cursor = next;
+            cursor = entry.next;
         }
         if wanted != data.len() && !cookie_is_boundary {
             return Err(Error::InvalidArgument);
@@ -768,11 +724,12 @@ impl Ext4 {
         Ok(result)
     }
 
+    #[inline(never)]
     fn read_group_descriptor(
         &mut self,
         storage: &mut dyn Storage,
         group: u32,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<ondisk::GroupDescriptor, Error> {
         if group >= self.superblock.group_count() {
             return Err(Corrupt::InvalidGroup(group).into());
         }
@@ -787,25 +744,7 @@ impl Ext4 {
             .map_err(|_| Error::OutOfMemory)?;
         descriptor.resize(len, 0);
         self.read_storage(storage, offset, &mut descriptor)?;
-        if self.superblock.has_metadata_checksums() {
-            let expected = le16(&descriptor, 0x1e);
-            let mut checksum = checksum::Checksum::with_seed(self.superblock.checksum_seed);
-            checksum.update_u32_le(group);
-            checksum.update(&descriptor[..0x1e]);
-            checksum.update_u16_le(0);
-            checksum.update(&descriptor[0x20..]);
-            if checksum.finalize() as u16 != expected {
-                return Err(Corrupt::GroupDescriptorChecksum(group).into());
-            }
-        } else if self.superblock.feature_ro_compat & ondisk::RO_COMPAT_GDT_CSUM != 0 {
-            let expected = le16(&descriptor, 0x1e);
-            if legacy_group_descriptor_checksum(&self.superblock.uuid, group, &descriptor)
-                != expected
-            {
-                return Err(Corrupt::GroupDescriptorChecksum(group).into());
-            }
-        }
-        Ok(descriptor)
+        ondisk::GroupDescriptor::new(&self.superblock, group, descriptor)
     }
 
     fn read_raw_inode(&mut self, storage: &mut dyn Storage, number: u32) -> Result<Vec<u8>, Error> {
@@ -815,11 +754,7 @@ impl Ext4 {
         let zero_based = number - 1;
         let group = zero_based / self.superblock.inodes_per_group;
         let index = zero_based % self.superblock.inodes_per_group;
-        let descriptor = self.read_group_descriptor(storage, group)?;
-        let mut inode_table = u64::from(le32(&descriptor, 8));
-        if self.superblock.feature_incompat & ondisk::INCOMPAT_64BIT != 0 {
-            inode_table |= u64::from(le32(&descriptor, 40)) << 32;
-        }
+        let inode_table = self.read_group_descriptor(storage, group)?.inode_table();
         if inode_table == 0 || inode_table >= self.superblock.blocks_count {
             return Err(Corrupt::InvalidInodeTable.into());
         }
@@ -833,65 +768,44 @@ impl Ext4 {
         raw.resize(len, 0);
         self.read_storage(storage, offset, &mut raw)?;
 
-        let generation = le32(&raw, 0x64);
-        if self.superblock.has_metadata_checksums() {
-            let expected_lo = le16(&raw, 0x7c);
-            raw[0x7c..0x7e].fill(0);
-            let expected_hi = if raw.len() >= 0x84 {
-                let value = le16(&raw, 0x82);
-                raw[0x82..0x84].fill(0);
-                Some(value)
-            } else {
-                None
-            };
-            let mut checksum = checksum::Checksum::with_seed(self.superblock.checksum_seed);
-            checksum.update_u32_le(number);
-            checksum.update_u32_le(generation);
-            checksum.update(&raw);
-            let actual = checksum.finalize();
-            let matches = expected_hi.map_or(actual as u16 == expected_lo, |expected_hi| {
-                actual == u32::from(expected_lo) | (u32::from(expected_hi) << 16)
-            });
-            if !matches {
-                return Err(Corrupt::InodeChecksum(number).into());
-            }
-        }
         Ok(raw)
     }
 
+    #[inline(never)]
     pub(crate) fn load_inode(
         &mut self,
         storage: &mut dyn Storage,
         number: u32,
     ) -> Result<Inode, Error> {
-        let raw = self.read_raw_inode(storage, number)?;
-        let generation = le32(&raw, 0x64);
-        let mode = le16(&raw, 0);
+        let mut raw = self.read_raw_inode(storage, number)?;
+        let mut record = InodeRecord::new(&mut raw, self.superblock.checksum_seed, number)?;
+        if self.superblock.has_metadata_checksums() {
+            record.verify_checksum()?;
+        }
+        let generation = record.generation;
+        let mode = record.mode();
         if mode == 0 {
             return Err(Corrupt::InvalidInode(number).into());
         }
-        let size = u64::from(le32(&raw, 4)) | (u64::from(le32(&raw, 0x6c)) << 32);
-        let uid = u32::from(le16(&raw, 2)) | (u32::from(le16(&raw, 0x78)) << 16);
-        let gid = u32::from(le16(&raw, 0x18)) | (u32::from(le16(&raw, 0x7a)) << 16);
-        let mut block_map = [0; 60];
-        block_map.copy_from_slice(&raw[0x28..0x64]);
-        let flags = le32(&raw, 0x20);
+        let size = record.size();
+        let uid = record.uid();
+        let gid = record.gid();
+        let block_map = record.block_map();
+        let flags = record.flags();
         let inline_data = if flags & INLINE_DATA_FL != 0
             && matches!(
                 mode & MODE_TYPE_MASK,
                 MODE_REGULAR | MODE_DIRECTORY | MODE_SYMLINK
             ) {
-            Some(parse_inline_data(number, mode, size, &raw, &block_map)?)
+            Some(parse_inline_data(
+                number, mode, size, record.raw, &block_map,
+            )?)
         } else {
             None
         };
-        let blocks_512 = u64::from(le32(&raw, 0x1c)) | (u64::from(le16(&raw, 0x74)) << 32);
-        let external_xattr_block = u64::from(le32(&raw, 0x68))
-            | if self.superblock.feature_incompat & ondisk::INCOMPAT_64BIT != 0 {
-                u64::from(le16(&raw, 0x76)) << 32
-            } else {
-                0
-            };
+        let blocks_512 = record.blocks_512();
+        let external_xattr_block = record
+            .external_xattr_block(self.superblock.feature_incompat & ondisk::INCOMPAT_64BIT != 0);
         let (accessed, changed, modified) = if flags & EA_INODE_FL != 0 {
             let zero = Timestamp {
                 seconds: 0,
@@ -900,9 +814,9 @@ impl Ext4 {
             (zero, zero, zero)
         } else {
             (
-                decode_inode_timestamp(&raw, 0x08, 0x8c, number)?,
-                decode_inode_timestamp(&raw, 0x0c, 0x84, number)?,
-                decode_inode_timestamp(&raw, 0x10, 0x88, number)?,
+                record.timestamp(0x08, 0x8c)?,
+                record.timestamp(0x0c, 0x84)?,
+                record.timestamp(0x10, 0x88)?,
             )
         };
         Ok(Inode {
@@ -911,7 +825,7 @@ impl Ext4 {
             uid,
             gid,
             size,
-            links: le16(&raw, 0x1a),
+            links: record.links(),
             accessed,
             modified,
             changed,
@@ -922,82 +836,6 @@ impl Ext4 {
             block_map,
             inline_data,
         })
-    }
-
-    fn directory_block_kind(
-        &self,
-        directory: &Inode,
-        logical: u64,
-        count: usize,
-        block: &[u8],
-    ) -> DirectoryBlockKind {
-        if directory.flags & DIRECTORY_INDEX_FL == 0 {
-            DirectoryBlockKind::Leaf
-        } else if logical == 0 {
-            DirectoryBlockKind::Root
-        } else if count >= 8 && usize::from(le16(block, 4)) == block.len() {
-            DirectoryBlockKind::Internal
-        } else {
-            DirectoryBlockKind::Leaf
-        }
-    }
-
-    fn verify_directory_checksum(
-        &self,
-        directory: &Inode,
-        kind: DirectoryBlockKind,
-        count: usize,
-        block: &[u8],
-    ) -> Result<(), Error> {
-        if count != block.len() {
-            return Err(Corrupt::InvalidDirectory.into());
-        }
-        let mut checksum = self.inode_checksum_base(directory);
-        let expected = match kind {
-            DirectoryBlockKind::Leaf => {
-                if block.len() < 12 {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let tail = block.len() - 12;
-                if le32(block, tail) != 0
-                    || le16(block, tail + 4) != 12
-                    || block[tail + 6] != 0
-                    || block[tail + 7] != 0xde
-                {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                checksum.update(&block[..tail]);
-                le32(block, block.len() - 4)
-            }
-            DirectoryBlockKind::Root | DirectoryBlockKind::Internal => {
-                if block.len() < 8 {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let tail = block.len() - 8;
-                let limit_offset = if kind == DirectoryBlockKind::Root {
-                    0x20
-                } else {
-                    0x08
-                };
-                if limit_offset + 4 > tail {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let entries = usize::from(le16(block, limit_offset + 2));
-                let hashed_bytes = entries
-                    .checked_mul(8)
-                    .and_then(|bytes| limit_offset.checked_add(bytes))
-                    .filter(|end| *end <= tail)
-                    .ok_or(Corrupt::InvalidDirectory)?;
-                checksum.update(&block[..hashed_bytes]);
-                checksum.update_u32_le(le32(block, tail));
-                checksum.update_u32_le(0);
-                le32(block, tail + 4)
-            }
-        };
-        if checksum.finalize() != expected {
-            return Err(Corrupt::DirectoryChecksum(directory.number).into());
-        }
-        Ok(())
     }
 
     fn read_inode_data(
@@ -1015,6 +853,7 @@ impl Ext4 {
         self.read_inode_data_mapped(storage, inode, extent_tree.as_ref(), offset, dst)
     }
 
+    #[inline(never)]
     fn read_inode_data_mapped(
         &mut self,
         storage: &mut dyn Storage,
@@ -1092,6 +931,7 @@ impl Ext4 {
             .and_then(|(physical, state)| (state == ExtentState::Written).then_some(physical)))
     }
 
+    #[inline(never)]
     fn map_legacy_block(
         &mut self,
         storage: &mut dyn Storage,
@@ -1183,6 +1023,7 @@ impl Ext4 {
         }
     }
 
+    #[inline(never)]
     fn load_extent_tree(
         &mut self,
         storage: &mut dyn Storage,
@@ -1210,13 +1051,6 @@ impl Ext4 {
                 Ok(block)
             },
         )
-    }
-
-    fn inode_checksum_base(&self, inode: &Inode) -> checksum::Checksum {
-        let mut checksum = checksum::Checksum::with_seed(self.superblock.checksum_seed);
-        checksum.update_u32_le(inode.number);
-        checksum.update_u32_le(inode.generation);
-        checksum
     }
 }
 
@@ -1379,36 +1213,12 @@ fn parse_inline_data(
     Err(Corrupt::InvalidInode(inode).into())
 }
 
-fn legacy_group_descriptor_checksum(uuid: &[u8; 16], group: u32, descriptor: &[u8]) -> u16 {
-    let mut checksum = crc16(u16::MAX, uuid);
-    checksum = crc16(checksum, &group.to_le_bytes());
-    checksum = crc16(checksum, &descriptor[..0x1e]);
-    if descriptor.len() > 0x20 {
-        checksum = crc16(checksum, &descriptor[0x20..]);
-    }
-    checksum
-}
-
 fn update_external_xattr_checksum(seed: u32, number: u64, block: &mut [u8]) {
     block[0x10..0x14].fill(0);
     let mut checksum = checksum::Checksum::with_seed(seed);
     checksum.update(&number.to_le_bytes());
     checksum.update(block);
     block[0x10..0x14].copy_from_slice(&checksum.finalize().to_le_bytes());
-}
-
-fn crc16(mut checksum: u16, bytes: &[u8]) -> u16 {
-    for &byte in bytes {
-        checksum ^= u16::from(byte);
-        for _ in 0..8 {
-            checksum = if checksum & 1 != 0 {
-                (checksum >> 1) ^ 0xa001
-            } else {
-                checksum >> 1
-            };
-        }
-    }
-    checksum
 }
 
 #[cfg(test)]

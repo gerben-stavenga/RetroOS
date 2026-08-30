@@ -4,184 +4,84 @@
 //! through the internal JBD2 journal.
 
 use crate::checksum::Checksum;
-use crate::extent_tree::{Extent, ExtentIdentity, ExtentState, ExtentTree};
-use crate::ondisk::{self, le16, le32};
+use crate::directory::{
+    BlockKind as DirectoryBlockKind, DirectoryBlock, record as directory_record,
+};
+use crate::extent_tree::{Extent, ExtentIdentity, ExtentState, ExtentTree, SerializedNode};
+use crate::inode::InodeRecord;
+use crate::ondisk::{self, le32, put_le32};
 use crate::{
     Corrupt, DirectoryEntry, Error, Ext4, FsError, Inode, InodeMetadataUpdate, Storage, Timestamp,
     Unsupported,
 };
 use alloc::vec::Vec;
 
-pub(crate) struct DirtyBlock {
-    pub(crate) number: u64,
-    pub(crate) bytes: Vec<u8>,
+pub(crate) type DirtyBlock = SerializedNode;
+
+#[inline(never)]
+fn set_extent_tree(
+    record: &mut InodeRecord<'_>,
+    tree: &ExtentTree,
+    size: u64,
+    block_size: u64,
+    metadata_checksums: bool,
+    extra_owned_blocks: u64,
+) -> Result<Vec<DirtyBlock>, Error> {
+    tree.write_root(record.extent_root_mut())?;
+    record.set_size(size);
+    let blocks = tree
+        .data_extents()?
+        .into_iter()
+        .try_fold(0u64, |sum, extent| {
+            sum.checked_add(u64::from(extent.length))
+                .ok_or(Corrupt::AddressOverflow)
+        })?
+        .checked_add(
+            u64::try_from(tree.external_blocks()?.len()).map_err(|_| Corrupt::AddressOverflow)?,
+        )
+        .and_then(|n| n.checked_add(extra_owned_blocks))
+        .ok_or(Corrupt::AddressOverflow)?;
+    record.set_blocks_512(
+        blocks
+            .checked_mul(block_size / 512)
+            .filter(|n| *n < 1_u64 << 48)
+            .ok_or(Corrupt::AddressOverflow)?,
+    );
+    tree.serialize_dirty(
+        usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?,
+        ExtentIdentity {
+            checksum_seed: record.checksum_seed,
+            inode: record.number,
+            generation: record.generation,
+            metadata_checksums,
+        },
+    )
 }
 
-/// Typed access to one ext inode record.
+/// A sorted, unique map from physical block number to prospective contents.
 ///
-/// Filesystem operations express metadata changes here; byte offsets and ext4
-/// timestamp encoding do not escape into namespace or policy-shaped APIs.
-struct InodeEditor<'a> {
-    raw: &'a mut [u8],
-    checksum_seed: u32,
-    number: u32,
-    generation: u32,
+/// Both an operation-local metadata edit and the enclosing transaction use
+/// this representation. Moving edits between them therefore transfers block
+/// buffers instead of searching again and copying a full filesystem block.
+#[derive(Default)]
+struct BlockEdits {
+    blocks: Vec<DirtyBlock>,
 }
 
-impl<'a> InodeEditor<'a> {
-    fn new(
-        raw: &'a mut [u8],
-        checksum_seed: u32,
-        number: u32,
-        generation: u32,
-    ) -> Result<Self, Corrupt> {
-        if raw.len() < 128 || number == 0 {
-            return Err(Corrupt::InvalidInode(number));
-        }
-        Ok(Self {
-            raw,
-            checksum_seed,
-            number,
-            generation,
-        })
+impl BlockEdits {
+    fn index(&self, number: u64) -> Result<usize, usize> {
+        self.blocks
+            .binary_search_by_key(&number, |block| block.number)
     }
 
-    fn set_links(&mut self, links: u16) {
-        put_le16(self.raw, 0x1a, links);
-    }
-
-    fn set_extent_tree(
-        &mut self,
-        tree: &ExtentTree,
-        size: u64,
-        block_size: u64,
-        metadata_checksums: bool,
-        extra_owned_blocks: u64,
-    ) -> Result<Vec<DirtyBlock>, Error> {
-        let root = self
-            .raw
-            .get_mut(0x28..0x64)
-            .ok_or(Corrupt::InvalidInode(self.number))?;
-        tree.write_root(root)?;
-        put_le32(self.raw, 4, size as u32);
-        put_le32(self.raw, 0x6c, (size >> 32) as u32);
-        let data_blocks = tree
-            .data_extents()?
-            .into_iter()
-            .try_fold(0u64, |total, extent| {
-                total
-                    .checked_add(u64::from(extent.length))
-                    .ok_or(Corrupt::AddressOverflow)
-            })?;
-        let tree_blocks =
-            u64::try_from(tree.external_blocks()?.len()).map_err(|_| Corrupt::AddressOverflow)?;
-        let sectors = data_blocks
-            .checked_add(tree_blocks)
-            .and_then(|blocks| blocks.checked_add(extra_owned_blocks))
-            .and_then(|blocks| blocks.checked_mul(block_size / 512))
-            .filter(|sectors| *sectors < (1_u64 << 48))
-            .ok_or(Corrupt::AddressOverflow)?;
-        put_le32(self.raw, 0x1c, sectors as u32);
-        put_le16(self.raw, 0x74, (sectors >> 32) as u16);
-        let serialized = tree.serialize_dirty(
-            usize::try_from(block_size).map_err(|_| Corrupt::AddressOverflow)?,
-            ExtentIdentity {
-                checksum_seed: self.checksum_seed,
-                inode: self.number,
-                generation: self.generation,
-                metadata_checksums,
-            },
-        )?;
-        let mut nodes = Vec::new();
-        nodes
-            .try_reserve_exact(serialized.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for node in serialized {
-            nodes.push(DirtyBlock {
-                number: node.number,
-                bytes: node.bytes,
-            });
-        }
-        Ok(nodes)
-    }
-
-    fn initialize_regular(&mut self, permissions: u16) {
-        initialize_empty_inode(self.raw, permissions);
-    }
-
-    fn initialize_fast_symlink(&mut self, target: &[u8]) -> Result<(), Error> {
-        initialize_fast_symlink(self.raw, target)
-    }
-
-    fn initialize_directory(
-        &mut self,
-        permissions: u16,
-        physical: u64,
-        block_size: u64,
-    ) -> Result<(), Error> {
-        initialize_directory_inode(self.raw, permissions, physical, block_size)
-    }
-
-    fn apply_metadata(&mut self, update: InodeMetadataUpdate) -> Result<(), Error> {
-        if let Some(permissions) = update.permissions {
-            if permissions & !0o7777 != 0 {
-                return Err(Error::InvalidArgument);
-            }
-            let file_type = le16(self.raw, 0) & 0xf000;
-            put_le16(self.raw, 0, file_type | permissions);
-        }
-        if let Some(uid) = update.uid {
-            put_le16(self.raw, 2, uid as u16);
-            put_le16(self.raw, 0x78, (uid >> 16) as u16);
-        }
-        if let Some(gid) = update.gid {
-            put_le16(self.raw, 0x18, gid as u16);
-            put_le16(self.raw, 0x7a, (gid >> 16) as u16);
-        }
-        if let Some(timestamp) = update.accessed {
-            self.set_timestamp(0x08, 0x8c, timestamp)?;
-        }
-        if let Some(timestamp) = update.changed {
-            self.set_timestamp(0x0c, 0x84, timestamp)?;
-        }
-        if let Some(timestamp) = update.modified {
-            self.set_timestamp(0x10, 0x88, timestamp)?;
-        }
+    fn adopt(&mut self, block: DirtyBlock) -> Result<(), Error> {
+        let index = match self.index(block.number) {
+            Ok(_) => return Err(Corrupt::InvalidDirectory.into()),
+            Err(index) => index,
+        };
+        self.blocks.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+        self.blocks.insert(index, block);
         Ok(())
-    }
-
-    fn set_timestamp(
-        &mut self,
-        seconds_offset: usize,
-        extra_offset: usize,
-        timestamp: Timestamp,
-    ) -> Result<(), Error> {
-        if timestamp.nanoseconds >= 1_000_000_000 {
-            return Err(Error::InvalidArgument);
-        }
-        let low = timestamp.seconds as i32;
-        let epoch = (timestamp.seconds - i64::from(low)) >> 32;
-        if !(0..=3).contains(&epoch) {
-            return Err(Error::InvalidArgument);
-        }
-        if timestamp.nanoseconds != 0 || epoch != 0 {
-            if extra_offset + 4 > self.raw.len() {
-                return Err(Unsupported::MutationProfile.into());
-            }
-            put_le32(
-                self.raw,
-                extra_offset,
-                (timestamp.nanoseconds << 2) | epoch as u32,
-            );
-        } else if extra_offset + 4 <= self.raw.len() {
-            put_le32(self.raw, extra_offset, 0);
-        }
-        put_le32(self.raw, seconds_offset, low as u32);
-        Ok(())
-    }
-
-    fn finish(self) {
-        update_inode_checksum(self.checksum_seed, self.number, self.generation, self.raw);
     }
 }
 
@@ -191,68 +91,62 @@ impl<'a> InodeEditor<'a> {
 /// share a descriptor or inode-table block.  Keeping those edits in one cache
 /// makes that aliasing ordinary instead of forcing every operation to build a
 /// list of supposedly-distinct block numbers and special-case collisions.
+#[derive(Default)]
 struct MetadataMutation {
-    blocks: Vec<DirtyBlock>,
+    blocks: BlockEdits,
 }
 
 impl MetadataMutation {
-    fn new() -> Self {
-        Self { blocks: Vec::new() }
-    }
-
+    #[inline(never)]
     fn load(&mut self, transaction: &mut TransactionIo<'_, '_>, number: u64) -> Result<(), Error> {
-        let Err(index) = self.index(number) else {
+        let Err(index) = self.blocks.index(number) else {
             return Ok(());
         };
         let bytes = transaction.read_owned_block(number)?;
-        self.blocks.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        self.blocks.insert(index, DirtyBlock { number, bytes });
+        self.blocks
+            .blocks
+            .try_reserve(1)
+            .map_err(|_| Error::OutOfMemory)?;
+        self.blocks
+            .blocks
+            .insert(index, DirtyBlock { number, bytes });
         Ok(())
     }
 
     fn adopt(&mut self, number: u64, bytes: Vec<u8>) -> Result<(), Error> {
-        let index = match self.index(number) {
-            Ok(_) => return Err(Corrupt::InvalidDirectory.into()),
-            Err(index) => index,
-        };
-        self.blocks.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        self.blocks.insert(index, DirtyBlock { number, bytes });
-        Ok(())
-    }
-
-    fn adopt_block(&mut self, block: DirtyBlock) -> Result<(), Error> {
-        self.adopt(block.number, block.bytes)
+        self.blocks.adopt(DirtyBlock { number, bytes })
     }
 
     fn adopt_blocks(&mut self, blocks: impl IntoIterator<Item = DirtyBlock>) -> Result<(), Error> {
         for block in blocks {
-            self.adopt_block(block)?;
+            self.adopt(block.number, block.bytes)?;
         }
         Ok(())
     }
 
     fn adopt_group_edits(&mut self, groups: Vec<GroupEdit>) -> Result<(), Error> {
         for group in groups {
-            if let Some(bitmap) = group.block_bitmap {
-                self.adopt_block(bitmap)?;
-            }
-            if let Some(bitmap) = group.inode_bitmap {
-                self.adopt_block(bitmap)?;
+            for bitmap in group.bitmaps.into_iter().flatten() {
+                self.adopt(bitmap.number, bitmap.bytes)?;
             }
         }
         Ok(())
     }
 
     fn get_mut(&mut self, number: u64) -> Result<&mut [u8], Corrupt> {
-        let index = self.index(number).map_err(|_| Corrupt::InvalidDirectory)?;
-        Ok(&mut self.blocks[index].bytes)
+        let index = self
+            .blocks
+            .index(number)
+            .map_err(|_| Corrupt::InvalidDirectory)?;
+        Ok(&mut self.blocks.blocks[index].bytes)
     }
 
+    #[inline(never)]
     fn edit_inode(
         &mut self,
         transaction: &mut TransactionIo<'_, '_>,
         inode: &Inode,
-        edit: &mut dyn FnMut(&mut InodeEditor<'_>) -> Result<(), Error>,
+        edit: &mut dyn FnMut(&mut InodeRecord<'_>) -> Result<(), Error>,
     ) -> Result<(), Error> {
         let (block_number, offset) = transaction.inode_location(inode.number)?;
         let inode_size = usize::from(transaction.filesystem.superblock.inode_size);
@@ -264,9 +158,9 @@ impl MetadataMutation {
             .filter(|end| *end <= block.len())
             .ok_or(Corrupt::InvalidInodeTable)?;
         let raw = &mut block[offset..end];
-        let mut editor = InodeEditor::new(raw, checksum_seed, inode.number, inode.generation)?;
-        edit(&mut editor)?;
-        editor.finish();
+        let mut record = InodeRecord::for_update(raw, checksum_seed, inode)?;
+        edit(&mut record)?;
+        record.finish();
         Ok(())
     }
 
@@ -282,31 +176,16 @@ impl MetadataMutation {
         })
     }
 
+    #[inline(never)]
     fn stage(self, transaction: &mut TransactionIo<'_, '_>) -> Result<(), Error> {
-        if transaction.available.len() < self.blocks.len() {
+        if transaction.available.len() < self.blocks.blocks.len() {
             return Err(Error::ReservationExhausted);
         }
-        for block in self.blocks {
-            transaction.write_block(block.number, &block.bytes)?;
+        for block in self.blocks.blocks {
+            transaction.adopt_dirty(block)?;
         }
         Ok(())
     }
-
-    fn index(&self, number: u64) -> Result<usize, usize> {
-        self.blocks
-            .binary_search_by_key(&number, |block| block.number)
-    }
-}
-
-/// Typed access to one checked directory leaf.
-///
-/// The inode identity and checksum seed travel with the block, so namespace
-/// code only expresses entry operations and cannot accidentally checksum a
-/// directory block as a different inode.
-struct DirectoryEditor<'a> {
-    checksum_seed: u32,
-    inode: &'a Inode,
-    bytes: &'a mut [u8],
 }
 
 #[derive(Clone, Copy)]
@@ -316,9 +195,8 @@ enum ExistingDirectoryEdit {
 }
 
 struct DirectoryNode {
-    logical: u64,
-    kind: crate::DirectoryBlockKind,
-    block: DirtyBlock,
+    number: u64,
+    block: DirectoryBlock,
     dirty: bool,
 }
 
@@ -328,12 +206,12 @@ struct DirectoryNode {
 /// mapping from those operations to physical leaf blocks.  Loading, checksum
 /// validation, duplicate detection, and multi-block scanning happen once.
 struct DirectoryTree {
-    checksum_seed: u32,
     inode: Inode,
     nodes: Vec<DirectoryNode>,
 }
 
 impl DirectoryTree {
+    #[inline(never)]
     fn load(transaction: &mut TransactionIo<'_, '_>, inode: &Inode) -> Result<Self, Error> {
         if !inode.is_directory() {
             return Err(Error::NotDirectory);
@@ -365,35 +243,31 @@ impl DirectoryTree {
             .ok_or(Corrupt::InvalidDirectory)?;
             if nodes
                 .iter()
-                .any(|node: &DirectoryNode| node.block.number == physical)
+                .any(|node: &DirectoryNode| node.number == physical)
             {
                 return Err(Corrupt::InvalidDirectory.into());
             }
             let bytes = transaction.read_owned_block(physical)?;
-            let kind =
-                transaction
-                    .filesystem
-                    .directory_block_kind(inode, logical, bytes.len(), &bytes);
-            transaction
-                .filesystem
-                .verify_directory_checksum(inode, kind, bytes.len(), &bytes)?;
-            nodes.push(DirectoryNode {
+            let block = DirectoryBlock::new(
+                transaction.filesystem.superblock.checksum_seed,
+                transaction.filesystem.superblock.has_metadata_checksums(),
+                inode,
                 logical,
-                kind,
-                block: DirtyBlock {
-                    number: physical,
-                    bytes,
-                },
+                bytes,
+            )?;
+            nodes.push(DirectoryNode {
+                number: physical,
+                block,
                 dirty: false,
             });
         }
         Ok(Self {
-            checksum_seed: transaction.filesystem.superblock.checksum_seed,
             inode: inode.clone(),
             nodes,
         })
     }
 
+    #[inline(never)]
     fn insert(&mut self, number: u32, name: &[u8], kind: u8) -> Result<(), Error> {
         if self.find(name)?.is_some() {
             return Err(Error::AlreadyExists);
@@ -404,12 +278,10 @@ impl DirectoryTree {
             return Err(Unsupported::MutationProfile.into());
         }
         for node in &mut self.nodes {
-            if node.kind != crate::DirectoryBlockKind::Leaf {
+            if node.block.kind != DirectoryBlockKind::Leaf {
                 continue;
             }
-            match DirectoryEditor::new(self.checksum_seed, &self.inode, &mut node.block.bytes)
-                .insert(number, name, kind)
-            {
+            match node.block.insert(number, name, kind) {
                 Ok(()) => {
                     node.dirty = true;
                     return Ok(());
@@ -421,14 +293,18 @@ impl DirectoryTree {
         Err(Unsupported::ExtentMutation.into())
     }
 
+    #[inline(never)]
     fn edit_existing(&mut self, name: &[u8], edit: ExistingDirectoryEdit) -> Result<(), Error> {
         for node in &mut self.nodes {
-            if node.kind != crate::DirectoryBlockKind::Leaf {
+            if node.block.kind != DirectoryBlockKind::Leaf {
                 continue;
             }
-            let mut editor =
-                DirectoryEditor::new(self.checksum_seed, &self.inode, &mut node.block.bytes);
-            let result = editor.edit_existing(name, edit);
+            let result = match edit {
+                ExistingDirectoryEdit::Remove { number } => node.block.remove(name, number),
+                ExistingDirectoryEdit::Replace { old, new, kind } => {
+                    node.block.replace(name, old, new, kind)
+                }
+            };
             match result {
                 Ok(()) => {
                     node.dirty = true;
@@ -441,80 +317,52 @@ impl DirectoryTree {
         Err(Error::NotFound)
     }
 
+    #[inline(never)]
     fn set_parent(&mut self, old_parent: u32, new_parent: u32) -> Result<(), Error> {
         let node = self
             .nodes
             .iter_mut()
-            .find(|node| node.logical == 0)
+            .find(|node| node.block.logical == 0)
             .ok_or(Corrupt::InvalidDirectory)?;
-        match node.kind {
-            crate::DirectoryBlockKind::Leaf => {
-                DirectoryEditor::new(self.checksum_seed, &self.inode, &mut node.block.bytes)
-                    .set_parent(old_parent, new_parent)?;
-            }
-            crate::DirectoryBlockKind::Root => {
-                if node.block.bytes.len() < 24
-                    || le32(&node.block.bytes, 12) != old_parent
-                    || le16(&node.block.bytes, 16) < 12
-                    || node.block.bytes[18] != 2
-                    || &node.block.bytes[20..22] != b".."
-                {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                put_le32(&mut node.block.bytes, 12, new_parent);
-                update_directory_index_checksum(
-                    self.checksum_seed,
-                    &self.inode,
-                    node.kind,
-                    &mut node.block.bytes,
-                )?;
-            }
-            crate::DirectoryBlockKind::Internal => {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-        }
+        node.block.replace_parent(old_parent, new_parent)?;
         node.dirty = true;
         Ok(())
     }
 
-    fn validate_empty(&self, parent_number: u32) -> Result<(), Error> {
+    fn validate_empty(&mut self, parent_number: u32) -> Result<(), Error> {
         let indexed = self.inode.flags & super::DIRECTORY_INDEX_FL != 0;
         let mut dot = false;
         let mut dotdot = false;
         if indexed {
             let root = self
                 .nodes
-                .iter()
-                .find(|node| node.logical == 0 && node.kind == crate::DirectoryBlockKind::Root)
+                .iter_mut()
+                .find(|node| node.block.logical == 0 && node.block.kind == DirectoryBlockKind::Root)
                 .ok_or(Corrupt::InvalidDirectory)?;
-            if directory_parent_entry(&root.block.bytes, self.inode.number)? != parent_number {
+            if root.block.parent()? != parent_number {
                 return Err(Corrupt::InvalidDirectory.into());
             }
             dot = true;
             dotdot = true;
         }
-        for node in &self.nodes {
-            if node.kind != crate::DirectoryBlockKind::Leaf {
+        for node in &mut self.nodes {
+            if node.block.kind != DirectoryBlockKind::Leaf {
                 continue;
             }
-            let tail = node
-                .block
-                .bytes
-                .len()
-                .checked_sub(12)
-                .ok_or(Corrupt::InvalidDirectory)?;
+            let tail = node.block.records_end;
             let mut cursor = 0usize;
             while cursor < tail {
-                let (next, number, _, name) =
-                    crate::directory_record(&node.block.bytes[..tail], cursor)?;
-                if number != 0 {
-                    match name {
-                        b"." if !indexed && !dot && number == self.inode.number => dot = true,
-                        b".." if !indexed && !dotdot && number == parent_number => dotdot = true,
+                let entry = directory_record(&node.block.bytes[..node.block.records_end], cursor)?;
+                if entry.inode != 0 {
+                    match entry.name {
+                        b"." if !indexed && !dot && entry.inode == self.inode.number => dot = true,
+                        b".." if !indexed && !dotdot && entry.inode == parent_number => {
+                            dotdot = true
+                        }
                         _ => return Err(Error::NotEmpty),
                     }
                 }
-                cursor = next;
+                cursor = entry.next;
             }
         }
         if !dot || !dotdot {
@@ -523,12 +371,12 @@ impl DirectoryTree {
         Ok(())
     }
 
-    fn find(&self, name: &[u8]) -> Result<Option<(usize, u32)>, Error> {
-        for (index, node) in self.nodes.iter().enumerate() {
-            if node.kind != crate::DirectoryBlockKind::Leaf {
+    fn find(&mut self, name: &[u8]) -> Result<Option<(usize, u32)>, Error> {
+        for (index, node) in self.nodes.iter_mut().enumerate() {
+            if node.block.kind != DirectoryBlockKind::Leaf {
                 continue;
             }
-            if let Some(number) = find_directory_entry(&node.block.bytes, name)? {
+            if let Some(number) = node.block.find(name)? {
                 return Ok(Some((index, number)));
             }
         }
@@ -538,51 +386,19 @@ impl DirectoryTree {
     fn into_dirty_blocks(self) -> Vec<DirtyBlock> {
         self.nodes
             .into_iter()
-            .filter_map(|node| node.dirty.then_some(node.block))
+            .filter_map(|node| {
+                node.dirty.then(|| DirtyBlock {
+                    number: node.number,
+                    bytes: node.block.bytes,
+                })
+            })
             .collect()
     }
 }
 
-impl<'a> DirectoryEditor<'a> {
-    fn new(checksum_seed: u32, inode: &'a Inode, bytes: &'a mut [u8]) -> Self {
-        Self {
-            checksum_seed,
-            inode,
-            bytes,
-        }
-    }
-
-    fn insert(&mut self, number: u32, name: &[u8], kind: u8) -> Result<(), Error> {
-        insert_directory_entry(
-            self.checksum_seed,
-            self.inode,
-            self.bytes,
-            number,
-            name,
-            kind,
-        )
-    }
-
-    fn edit_existing(&mut self, name: &[u8], edit: ExistingDirectoryEdit) -> Result<(), Error> {
-        edit_directory_entry(self.checksum_seed, self.inode, self.bytes, name, edit)
-    }
-
-    fn set_parent(&mut self, old_parent: u32, new_parent: u32) -> Result<(), Error> {
-        replace_directory_parent(
-            self.checksum_seed,
-            self.inode,
-            self.bytes,
-            old_parent,
-            new_parent,
-        )
-    }
-}
-
 struct GroupEdit {
-    number: u32,
-    descriptor: Vec<u8>,
-    block_bitmap: Option<DirtyBlock>,
-    inode_bitmap: Option<DirtyBlock>,
+    descriptor: ondisk::GroupDescriptor,
+    bitmaps: [Option<DirtyBlock>; 2],
 }
 
 struct BlockGroup {
@@ -592,8 +408,7 @@ struct BlockGroup {
     first_inode: u64,
     inodes: u64,
     inodes_per_group: u64,
-    block_bitmap_number: u64,
-    inode_bitmap_number: u64,
+    bitmap_numbers: [u64; 2],
 }
 
 struct Bitmap<'a> {
@@ -602,6 +417,7 @@ struct Bitmap<'a> {
 }
 
 impl Bitmap<'_> {
+    #[inline(never)]
     fn release(&mut self, bit: u64) -> Result<(), Error> {
         if bit >= self.bits {
             return Err(Corrupt::InvalidBlockBitmap.into());
@@ -615,6 +431,7 @@ impl Bitmap<'_> {
         Ok(())
     }
 
+    #[inline(never)]
     fn claim_free(&mut self, start: u64) -> Option<u64> {
         for bit in start..self.bits {
             let bit_index = bit as usize;
@@ -629,11 +446,15 @@ impl Bitmap<'_> {
 }
 
 impl BlockGroup {
+    #[inline(never)]
     fn allocate_blocks(&mut self, wanted: usize, output: &mut Vec<u64>) -> Result<usize, Error> {
         let before = output.len();
         let mut cursor = 0;
         let mut bitmap = Bitmap {
-            bytes: &mut self.edit.block_bitmap.as_mut().unwrap().bytes,
+            bytes: &mut self.edit.bitmaps[ondisk::BitmapKind::Block as usize]
+                .as_mut()
+                .unwrap()
+                .bytes,
             bits: self.blocks,
         };
         while output.len() - before < wanted {
@@ -643,16 +464,19 @@ impl BlockGroup {
             cursor = bit + 1;
         }
         let allocated = output.len() - before;
-        decrement_descriptor_free_blocks_by(
-            &mut self.edit.descriptor,
-            u64::try_from(allocated).map_err(|_| Corrupt::AddressOverflow)?,
-        )?;
+        self.edit
+            .descriptor
+            .allocate_blocks(u64::try_from(allocated).map_err(|_| Corrupt::AddressOverflow)?)?;
         Ok(allocated)
     }
 
+    #[inline(never)]
     fn release_blocks(&mut self, bits: &[u64], reserved: &[u8]) -> Result<(), Error> {
         let mut bitmap = Bitmap {
-            bytes: &mut self.edit.block_bitmap.as_mut().unwrap().bytes,
+            bytes: &mut self.edit.bitmaps[ondisk::BitmapKind::Block as usize]
+                .as_mut()
+                .unwrap()
+                .bytes,
             bits: self.blocks,
         };
         for &bit in bits {
@@ -664,46 +488,43 @@ impl BlockGroup {
                 .release(bit)
                 .map_err(|_| Error::Corrupt(Corrupt::InvalidExtentTree))?;
         }
-        increment_descriptor_free_blocks(
-            &mut self.edit.descriptor,
+        self.edit.descriptor.release_blocks(
             u64::try_from(bits.len()).map_err(|_| Corrupt::AddressOverflow)?,
             self.blocks,
         )
     }
 
+    #[inline(never)]
     fn allocate_inode(&mut self, start: u64, directory: bool) -> Result<u64, Error> {
         let mut bitmap = Bitmap {
-            bytes: &mut self.edit.inode_bitmap.as_mut().unwrap().bytes,
+            bytes: &mut self.edit.bitmaps[ondisk::BitmapKind::Inode as usize]
+                .as_mut()
+                .unwrap()
+                .bytes,
             bits: self.inodes,
         };
         let index = bitmap
             .claim_free(start)
             .ok_or(Corrupt::InvalidFreeBlockCount)?;
-        decrement_descriptor_free_inodes(&mut self.edit.descriptor)?;
-        update_unused_inode_count(&mut self.edit.descriptor, index, self.inodes_per_group)?;
-        if directory {
-            increment_descriptor_used_directories(
-                &mut self.edit.descriptor,
-                self.inodes_per_group,
-            )?;
-        }
+        self.edit
+            .descriptor
+            .allocate_inode(index, self.inodes_per_group, directory)?;
         Ok(index)
     }
 
+    #[inline(never)]
     fn release_inode(&mut self, index: u64, directory: bool) -> Result<(), Error> {
         Bitmap {
-            bytes: &mut self.edit.inode_bitmap.as_mut().unwrap().bytes,
+            bytes: &mut self.edit.bitmaps[ondisk::BitmapKind::Inode as usize]
+                .as_mut()
+                .unwrap()
+                .bytes,
             bits: self.inodes,
         }
         .release(index)?;
-        increment_descriptor_free_inodes(&mut self.edit.descriptor, self.inodes_per_group)?;
-        if directory {
-            decrement_descriptor_used_directories(
-                &mut self.edit.descriptor,
-                self.inodes_per_group,
-            )?;
-        }
-        Ok(())
+        self.edit
+            .descriptor
+            .release_inode(self.inodes_per_group, directory)
     }
 }
 
@@ -732,10 +553,6 @@ struct DirectoryGrowth {
 /// the extent tree.
 struct FileEditor {
     inode: Inode,
-}
-
-struct FileEditResult {
-    first_allocated: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -812,18 +629,17 @@ impl FileEditor {
         Ok(Self { inode })
     }
 
+    #[inline(never)]
     fn write_at(
         &self,
         transaction: &mut TransactionIo<'_, '_>,
         offset: u64,
         data: &[u8],
-    ) -> Result<FileEditResult, Error> {
+    ) -> Result<Option<u64>, Error> {
         if data.is_empty() {
-            return Ok(FileEditResult {
-                first_allocated: None,
-            });
+            return Ok(None);
         }
-        if !transaction.dirty.is_empty() {
+        if !transaction.dirty.blocks.is_empty() {
             return Err(Error::ReservationExhausted);
         }
         if offset > self.inode.size {
@@ -835,9 +651,7 @@ impl FileEditor {
         if end <= self.inode.size {
             match transaction.overwrite_inode(&self.inode, offset, data) {
                 Ok(()) => {
-                    return Ok(FileEditResult {
-                        first_allocated: None,
-                    });
+                    return Ok(None);
                 }
                 Err(Error::Unsupported(Unsupported::ExtentMutation)) => {}
                 Err(error) => return Err(error),
@@ -846,8 +660,9 @@ impl FileEditor {
         transaction.extend_file(&self.inode, FileGrowth::Write { offset, data })
     }
 
+    #[inline(never)]
     fn resize(&self, transaction: &mut TransactionIo<'_, '_>, new_size: u64) -> Result<(), Error> {
-        if !transaction.dirty.is_empty() {
+        if !transaction.dirty.blocks.is_empty() {
             return Err(Error::ReservationExhausted);
         }
         match new_size.cmp(&self.inode.size) {
@@ -901,7 +716,7 @@ enum ReleaseKind {
 /// when loading an unchanged block from storage.
 pub struct Transaction<'a> {
     pub(crate) filesystem: &'a mut Ext4,
-    dirty: Vec<DirtyBlock>,
+    dirty: BlockEdits,
     available: Vec<Vec<u8>>,
 }
 
@@ -928,7 +743,7 @@ impl<'a> Transaction<'a> {
     pub(crate) fn new(filesystem: &'a mut Ext4) -> Self {
         Self {
             filesystem,
-            dirty: Vec::new(),
+            dirty: BlockEdits::default(),
             available: Vec::new(),
         }
     }
@@ -943,6 +758,7 @@ impl<'a> Transaction<'a> {
     pub fn reserve_blocks(&mut self, additional: usize) -> Result<(), FsError> {
         let total = self
             .dirty
+            .blocks
             .len()
             .checked_add(self.available.len())
             .and_then(|value| value.checked_add(additional))
@@ -966,6 +782,7 @@ impl<'a> Transaction<'a> {
             buffers.push(block);
         }
         self.dirty
+            .blocks
             .try_reserve(self.available.len() + additional)
             .map_err(|_| FsError::OutOfMemory)?;
         self.available
@@ -976,7 +793,7 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn dirty_blocks(&self) -> usize {
-        self.dirty.len()
+        self.dirty.blocks.len()
     }
 
     pub fn reserved_blocks(&self) -> usize {
@@ -984,14 +801,11 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn is_dirty(&self, number: u64) -> bool {
-        self.dirty
-            .binary_search_by_key(&number, |block| block.number)
-            .is_ok()
+        self.dirty.index(number).is_ok()
     }
 
-    #[inline(never)]
     pub fn commit(self, storage: &mut dyn Storage) -> Result<(), Error> {
-        self.filesystem.commit_journal(storage, &self.dirty)
+        self.filesystem.commit_journal(storage, &self.dirty.blocks)
     }
 
     pub fn update_metadata(
@@ -1183,15 +997,14 @@ impl<'a> Transaction<'a> {
         {
             return Err(FsError::InvalidArgument);
         }
-        match self
-            .dirty
-            .binary_search_by_key(&number, |block| block.number)
-        {
-            Ok(index) => self.dirty[index].bytes.copy_from_slice(src),
+        match self.dirty.index(number) {
+            Ok(index) => self.dirty.blocks[index].bytes.copy_from_slice(src),
             Err(index) => {
                 let bytes = self.available.pop().ok_or(FsError::ReservationExhausted)?;
-                self.dirty.insert(index, DirtyBlock { number, bytes });
-                self.dirty[index].bytes.copy_from_slice(src);
+                self.dirty
+                    .blocks
+                    .insert(index, DirtyBlock { number, bytes });
+                self.dirty.blocks[index].bytes.copy_from_slice(src);
             }
         }
         Ok(())
@@ -1234,7 +1047,7 @@ impl TransactionIo<'_, '_> {
     ) -> Result<(), Error> {
         const REQUIRED_DIRTY_BLOCKS: usize = 2;
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
+        if !self.dirty.blocks.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
         if update == InodeMetadataUpdate::default() {
@@ -1243,7 +1056,7 @@ impl TransactionIo<'_, '_> {
         let inode = self.transaction.filesystem.refresh(self.storage, inode)?;
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         metadata.load(self, superblock_number)?;
         metadata.edit_inode(self, &inode, &mut |editor| editor.apply_metadata(update))?;
         metadata.stage(self)
@@ -1301,7 +1114,7 @@ impl TransactionIo<'_, '_> {
     /// Sparse gaps are deliberately a separate `resize` concern: `offset` may
     /// equal EOF but may not skip beyond it.
     pub fn write_inode(&mut self, inode: &Inode, offset: u64, data: &[u8]) -> Result<(), Error> {
-        if !self.dirty.is_empty() {
+        if !self.dirty.blocks.is_empty() {
             return Err(Error::ReservationExhausted);
         }
         let file = FileEditor::new(self.transaction.filesystem.refresh(self.storage, inode)?)?;
@@ -1409,7 +1222,6 @@ impl TransactionIo<'_, '_> {
         }
         let zero = self.zero_block()?;
         file.write_at(self, 0, &zero)?
-            .first_allocated
             .ok_or(Corrupt::InvalidExtentTree.into())
     }
 
@@ -1428,11 +1240,8 @@ impl TransactionIo<'_, '_> {
         file.write_at(self, file.inode.size, data).map(|_| ())
     }
 
-    fn extend_file(
-        &mut self,
-        inode: &Inode,
-        growth: FileGrowth<'_>,
-    ) -> Result<FileEditResult, Error> {
+    #[inline(never)]
+    fn extend_file(&mut self, inode: &Inode, growth: FileGrowth<'_>) -> Result<Option<u64>, Error> {
         self.validate_mutation_profile()?;
         let (offset, requested_end) = growth.range(inode.size)?;
         let new_size = match growth {
@@ -1529,14 +1338,14 @@ impl TransactionIo<'_, '_> {
             });
         }
 
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         self.apply_resources(&mut metadata, ResourceUpdate::Allocate(allocation))?;
         for payload in payloads {
-            metadata.adopt_block(payload)?;
+            metadata.adopt(payload.number, payload.bytes)?;
         }
         self.stage_extent_tree(&mut metadata, inode, &tree, new_size)?;
         metadata.stage(self)?;
-        Ok(FileEditResult { first_allocated })
+        Ok(first_allocated)
     }
 
     /// Create an empty regular file in a checked mutable directory.
@@ -1568,7 +1377,7 @@ impl TransactionIo<'_, '_> {
         kind: CreateKind<'_>,
     ) -> Result<u32, Error> {
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() || self.available.len() < kind.required_blocks() {
+        if !self.dirty.blocks.is_empty() || self.available.len() < kind.required_blocks() {
             return Err(Error::ReservationExhausted);
         }
         if name.is_empty()
@@ -1611,43 +1420,43 @@ impl TransactionIo<'_, '_> {
             name,
             kind.file_type(),
         )?;
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         metadata.adopt(
             inode_block_number,
             self.read_owned_block(inode_block_number)?,
         )?;
         let raw_inode =
             &mut metadata.get_mut(inode_block_number)?[inode_offset..inode_offset + inode_size];
-        let mut editor = InodeEditor::new(
+        let mut record = InodeRecord::new(
             raw_inode,
             self.transaction.filesystem.superblock.checksum_seed,
             inode_number,
-            0,
         )?;
         match kind {
-            CreateKind::Regular => editor.initialize_regular(permissions),
-            CreateKind::Symlink(target) => editor.initialize_fast_symlink(target)?,
-            CreateKind::Directory => editor.initialize_directory(
+            CreateKind::Regular => record.initialize_regular(permissions),
+            CreateKind::Symlink(target) => record.initialize_fast_symlink(target)?,
+            CreateKind::Directory => record.initialize_directory(
                 permissions,
                 directory_block_number.unwrap(),
                 block_size,
             )?,
         }
-        editor.finish();
+        record.finish();
 
         if matches!(kind, CreateKind::Directory) {
             metadata.set_inode_links(self, &parent, parent.links + 1)?;
         }
         self.apply_directory_insertion(&mut metadata, allocation.resources, growth)?;
         if let Some(number) = directory_block_number {
-            let mut block = self.zero_block()?;
-            initialize_directory_block(
+            let block = DirectoryBlock::initialize(
                 self.transaction.filesystem.superblock.checksum_seed,
                 inode_number,
                 0,
-                parent.number,
-                &mut block,
-            )?;
+                0,
+                Some(parent.number),
+                self.zero_block()?,
+            )?
+            .bytes;
             metadata.adopt(number, block)?;
         }
         metadata.adopt_blocks(parent_tree.into_dirty_blocks())?;
@@ -1659,7 +1468,7 @@ impl TransactionIo<'_, '_> {
     pub fn create_link(&mut self, inode: &Inode, parent: &Inode, name: &[u8]) -> Result<(), Error> {
         const REQUIRED_DIRTY_BLOCKS: usize = 3;
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
+        if !self.dirty.blocks.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
 
@@ -1685,7 +1494,7 @@ impl TransactionIo<'_, '_> {
             name,
             file_type,
         )?;
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         metadata.set_inode_links(self, &inode, inode.links + 1)?;
         self.apply_directory_insertion(&mut metadata, resources, growth)?;
         metadata.adopt_blocks(directory_tree.into_dirty_blocks())?;
@@ -1705,7 +1514,7 @@ impl TransactionIo<'_, '_> {
     /// Remove a link-count-one regular file with checked initialized extents.
     pub fn remove_entry(&mut self, directory: &Inode, entry: &DirectoryEntry) -> Result<(), Error> {
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() {
+        if !self.dirty.blocks.is_empty() {
             return Err(Error::ReservationExhausted);
         }
 
@@ -1737,7 +1546,7 @@ impl TransactionIo<'_, '_> {
         if inode.links > 1 {
             let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
             let superblock = self.read_owned_block(superblock_number)?;
-            let mut metadata = MetadataMutation::new();
+            let mut metadata = MetadataMutation::default();
             metadata.adopt(superblock_number, superblock)?;
             metadata.adopt_blocks(directory_tree.into_dirty_blocks())?;
             metadata.set_inode_links(self, &inode, inode.links - 1)?;
@@ -1760,7 +1569,7 @@ impl TransactionIo<'_, '_> {
     ) -> Result<(), Error> {
         const REQUIRED_DIRTY_BLOCKS: usize = 7;
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
+        if !self.dirty.blocks.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
         if entry.name.is_empty() || entry.name == b"." || entry.name == b".." {
@@ -1796,7 +1605,7 @@ impl TransactionIo<'_, '_> {
     ) -> Result<(), Error> {
         const REQUIRED_DIRTY_BLOCKS: usize = 3;
         self.validate_mutation_profile()?;
-        if !self.dirty.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
+        if !self.dirty.blocks.is_empty() || self.available.len() < REQUIRED_DIRTY_BLOCKS {
             return Err(Error::ReservationExhausted);
         }
         if new_name.is_empty()
@@ -1868,7 +1677,7 @@ impl TransactionIo<'_, '_> {
         } else {
             None
         };
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
 
         if let Some(destination) = destination {
             let release = if is_directory {
@@ -1974,7 +1783,7 @@ impl TransactionIo<'_, '_> {
         ranges.extend(tree.released_blocks().iter().map(|number| (*number, 1)));
         let released = self.release_blocks(&ranges)?;
 
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         let released_blocks = released.blocks;
         self.apply_resources(&mut metadata, ResourceUpdate::Release(released))?;
 
@@ -2002,29 +1811,12 @@ impl TransactionIo<'_, '_> {
             return Err(Error::InvalidArgument);
         }
         match self.dirty_index(number) {
-            Ok(index) => dst.copy_from_slice(&self.dirty[index].bytes),
+            Ok(index) => dst.copy_from_slice(&self.dirty.blocks[index].bytes),
             Err(_) => {
                 let offset = self.block_offset(number)?;
                 self.transaction
                     .filesystem
                     .read_storage(self.storage, offset, dst)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Replace one complete filesystem block in the private dirty set.
-    pub fn write_block(&mut self, number: u64, src: &[u8]) -> Result<(), Error> {
-        if number >= self.transaction.filesystem.superblock.blocks_count
-            || src.len() != self.transaction.filesystem.superblock.block_size as usize
-        {
-            return Err(Error::InvalidArgument);
-        }
-        match self.dirty_index(number) {
-            Ok(index) => self.dirty[index].bytes.copy_from_slice(src),
-            Err(index) => {
-                let dirty = self.insert_reserved(number, index)?;
-                self.dirty[dirty].bytes.copy_from_slice(src);
             }
         }
         Ok(())
@@ -2051,23 +1843,34 @@ impl TransactionIo<'_, '_> {
                     self.available.push(bytes);
                     return Err(error);
                 }
-                self.dirty.insert(index, DirtyBlock { number, bytes });
+                self.dirty
+                    .blocks
+                    .insert(index, DirtyBlock { number, bytes });
                 index
             }
         };
-        modify(&mut self.dirty[index].bytes);
+        modify(&mut self.dirty.blocks[index].bytes);
         Ok(())
     }
 
     fn dirty_index(&self, number: u64) -> Result<usize, usize> {
-        self.dirty
-            .binary_search_by_key(&number, |block| block.number)
+        self.dirty.index(number)
     }
 
-    fn insert_reserved(&mut self, number: u64, index: usize) -> Result<usize, Error> {
-        let bytes = self.available.pop().ok_or(Error::ReservationExhausted)?;
-        self.dirty.insert(index, DirtyBlock { number, bytes });
-        Ok(index)
+    fn adopt_dirty(&mut self, mut block: DirtyBlock) -> Result<(), Error> {
+        if block.number >= self.transaction.filesystem.superblock.blocks_count
+            || block.bytes.len() != self.transaction.filesystem.superblock.block_size as usize
+        {
+            return Err(Error::InvalidArgument);
+        }
+        match self.dirty_index(block.number) {
+            Ok(index) => core::mem::swap(&mut self.dirty.blocks[index].bytes, &mut block.bytes),
+            Err(index) => {
+                let _reserved = self.available.pop().ok_or(Error::ReservationExhausted)?;
+                self.dirty.blocks.insert(index, block);
+            }
+        }
+        Ok(())
     }
 
     fn block_offset(&self, number: u64) -> Result<u64, Error> {
@@ -2095,6 +1898,7 @@ impl TransactionIo<'_, '_> {
         }
     }
 
+    #[inline(never)]
     fn grow_linear_directory(
         &mut self,
         tree: &mut DirectoryTree,
@@ -2110,10 +1914,10 @@ impl TransactionIo<'_, '_> {
             .last()
             .is_some_and(|extent| extent.logical_end() > tree.nodes.len() as u64)
             || tree.nodes.iter().any(|node| {
-                u32::try_from(node.logical)
+                u32::try_from(node.block.logical)
                     .ok()
                     .and_then(|logical| extent_tree.lookup(logical))
-                    != Some((node.block.number, ExtentState::Written))
+                    != Some((node.number, ExtentState::Written))
             })
         {
             return Err(Corrupt::InvalidExtentTree.into());
@@ -2128,20 +1932,17 @@ impl TransactionIo<'_, '_> {
         self.extend_allocation(resources, new_nodes)?;
         extent_tree.assign_blocks(&resources.blocks[allocation_start + 1..])?;
 
-        let mut leaf = self.zero_block()?;
-        initialize_empty_directory_leaf(
+        let block = DirectoryBlock::initialize(
             self.transaction.filesystem.superblock.checksum_seed,
             tree.inode.number,
             tree.inode.generation,
-            &mut leaf,
+            u64::from(logical),
+            None,
+            self.zero_block()?,
         )?;
         tree.nodes.push(DirectoryNode {
-            logical: u64::from(logical),
-            kind: crate::DirectoryBlockKind::Leaf,
-            block: DirtyBlock {
-                number: leaf_number,
-                bytes: leaf,
-            },
+            number: leaf_number,
+            block,
             dirty: true,
         });
         let size = u64::from(logical)
@@ -2168,6 +1969,7 @@ impl TransactionIo<'_, '_> {
         Ok(())
     }
 
+    #[inline(never)]
     fn stage_extent_tree(
         &mut self,
         metadata: &mut MetadataMutation,
@@ -2186,8 +1988,9 @@ impl TransactionIo<'_, '_> {
             .filter(|end| *end <= block.len())
             .ok_or(Corrupt::InvalidInodeTable)?;
         let raw = &mut block[offset..end];
-        let mut editor = InodeEditor::new(raw, checksum_seed, inode.number, inode.generation)?;
-        let extent_nodes = editor.set_extent_tree(
+        let mut record = InodeRecord::for_update(raw, checksum_seed, inode)?;
+        let extent_nodes = set_extent_tree(
+            &mut record,
             tree,
             size,
             block_size,
@@ -2197,10 +2000,11 @@ impl TransactionIo<'_, '_> {
                 .has_metadata_checksums(),
             u64::from(inode.external_xattr_block != 0),
         )?;
-        editor.finish();
+        record.finish();
         metadata.adopt_blocks(extent_nodes)
     }
 
+    #[inline(never)]
     fn apply_resources(
         &mut self,
         metadata: &mut MetadataMutation,
@@ -2214,7 +2018,9 @@ impl TransactionIo<'_, '_> {
             ),
             ResourceUpdate::Release(resources) => (resources.blocks, false, resources.groups),
         };
-        let inode_changed = groups.iter().any(|group| group.inode_bitmap.is_some());
+        let inode_changed = groups
+            .iter()
+            .any(|group| group.bitmaps[ondisk::BitmapKind::Inode as usize].is_some());
         let block_size = u64::from(self.transaction.filesystem.superblock.block_size);
         let superblock_number = ondisk::SUPERBLOCK_OFFSET / block_size;
         metadata.load(self, superblock_number)?;
@@ -2223,29 +2029,12 @@ impl TransactionIo<'_, '_> {
                 .map_err(|_| Corrupt::AddressOverflow)?;
             let raw = &mut metadata.get_mut(superblock_number)?
                 [superblock_offset..superblock_offset + ondisk::SUPERBLOCK_SIZE];
-            if allocating {
-                if blocks != 0 {
-                    decrement_superblock_free_blocks_by(raw, blocks)?;
-                }
-                if inode_changed {
-                    decrement_superblock_free_inodes(raw)?;
-                }
-            } else {
-                if blocks != 0 {
-                    increment_superblock_free_blocks(
-                        raw,
-                        blocks,
-                        self.transaction.filesystem.superblock.blocks_count,
-                    )?;
-                }
-                if inode_changed {
-                    increment_superblock_free_inodes(
-                        raw,
-                        u64::from(self.transaction.filesystem.superblock.inodes_count),
-                    )?;
-                }
-            }
-            update_superblock_checksum(raw);
+            self.transaction.filesystem.superblock.update_free_counts(
+                raw,
+                blocks,
+                inode_changed,
+                allocating,
+            )?;
         }
         let descriptor_blocks = self.descriptor_blocks(&groups)?;
         metadata.adopt_blocks(descriptor_blocks)?;
@@ -2268,16 +2057,14 @@ impl TransactionIo<'_, '_> {
         existing: Option<GroupEdit>,
     ) -> Result<BlockGroup, Error> {
         let edit = match existing {
-            Some(edit) if edit.number == number => edit,
+            Some(edit) if edit.descriptor.group == number => edit,
             Some(_) => return Err(Corrupt::InvalidGroup(number).into()),
             None => GroupEdit {
-                number,
                 descriptor: self
                     .transaction
                     .filesystem
                     .read_group_descriptor(self.storage, number)?,
-                block_bitmap: None,
-                inode_bitmap: None,
+                bitmaps: [None, None],
             },
         };
         let superblock = &self.transaction.filesystem.superblock;
@@ -2294,22 +2081,18 @@ impl TransactionIo<'_, '_> {
             .checked_sub(first_inode)
             .map(|remaining| remaining.min(u64::from(superblock.inodes_per_group)))
             .ok_or(Corrupt::InvalidGroup(number))?;
-        let block_bitmap_number =
-            u64::from(le32(&edit.descriptor, 0)) | (u64::from(le32(&edit.descriptor, 0x20)) << 32);
-        let inode_bitmap_number =
-            u64::from(le32(&edit.descriptor, 4)) | (u64::from(le32(&edit.descriptor, 0x24)) << 32);
-        if block_bitmap_number >= superblock.blocks_count
-            || inode_bitmap_number >= superblock.blocks_count
-            || edit
-                .block_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| bitmap.number != block_bitmap_number)
-            || edit
-                .inode_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| bitmap.number != inode_bitmap_number)
-        {
-            return Err(Corrupt::InvalidBlockBitmap.into());
+        let bitmap_numbers = [
+            edit.descriptor.bitmap(ondisk::BitmapKind::Block),
+            edit.descriptor.bitmap(ondisk::BitmapKind::Inode),
+        ];
+        for index in 0..2 {
+            if bitmap_numbers[index] >= superblock.blocks_count
+                || edit.bitmaps[index]
+                    .as_ref()
+                    .is_some_and(|bitmap| bitmap.number != bitmap_numbers[index])
+            {
+                return Err(Corrupt::InvalidBlockBitmap.into());
+            }
         }
         Ok(BlockGroup {
             edit,
@@ -2318,111 +2101,93 @@ impl TransactionIo<'_, '_> {
             first_inode,
             inodes,
             inodes_per_group: u64::from(superblock.inodes_per_group),
-            block_bitmap_number,
-            inode_bitmap_number,
+            bitmap_numbers,
         })
     }
 
-    fn load_group_block_bitmap(
+    fn load_group_bitmap(
         &mut self,
         group: &mut BlockGroup,
+        kind: ondisk::BitmapKind,
         allow_initialize: bool,
     ) -> Result<(), Error> {
-        if group.edit.block_bitmap.is_some() {
+        let index = kind as usize;
+        if group.edit.bitmaps[index].is_some() {
             return Ok(());
         }
-        let bitmap = if le16(&group.edit.descriptor, 0x12) & 0x0002 != 0 {
-            if !allow_initialize || group.edit.number == 0 {
-                return Err(Corrupt::InvalidBlockBitmap.into());
-            }
-            let (bitmap, computed_free) = self.initialize_block_bitmap(
-                group.edit.number,
+        let flag = match kind {
+            ondisk::BitmapKind::Block => 0x0002,
+            ondisk::BitmapKind::Inode => 0x0001,
+        };
+        let bitmap = if group.edit.descriptor.flags() & flag == 0 {
+            let bitmap = self.read_owned_block(group.bitmap_numbers[index])?;
+            self.verify_bitmap_checksum(
+                kind,
+                group.edit.descriptor.group,
                 &group.edit.descriptor,
-                group.start,
-                group.blocks,
+                &bitmap,
             )?;
-            let stored_free = u64::from(le16(&group.edit.descriptor, 0x0c))
-                | (u64::from(le16(&group.edit.descriptor, 0x2c)) << 16);
-            if stored_free != computed_free {
-                return Err(Corrupt::InvalidFreeBlockCount.into());
-            }
-            let flags = le16(&group.edit.descriptor, 0x12) & !0x0002;
-            put_le16(&mut group.edit.descriptor, 0x12, flags);
             bitmap
         } else {
-            let bitmap = self.read_owned_block(group.block_bitmap_number)?;
-            self.verify_block_bitmap_checksum(group.edit.number, &group.edit.descriptor, &bitmap)?;
-            bitmap
-        };
-        group.edit.block_bitmap = Some(DirtyBlock {
-            number: group.block_bitmap_number,
-            bytes: bitmap,
-        });
-        Ok(())
-    }
-
-    fn load_group_inode_bitmap(
-        &mut self,
-        group: &mut BlockGroup,
-        allow_initialize: bool,
-    ) -> Result<(), Error> {
-        if group.edit.inode_bitmap.is_some() {
-            return Ok(());
-        }
-        let uninitialized = le16(&group.edit.descriptor, 0x12) & 0x0001 != 0;
-        let bitmap = if uninitialized {
-            let free = u64::from(le16(&group.edit.descriptor, 0x0e))
-                | (u64::from(le16(&group.edit.descriptor, 0x2e)) << 16);
-            if !allow_initialize
-                || group.edit.number == 0
-                || free != group.inodes
-                || le16(&group.edit.descriptor, 0x12) & 0x0004 == 0
-            {
+            if !allow_initialize || group.edit.descriptor.group == 0 {
                 return Err(Corrupt::InvalidBlockBitmap.into());
             }
-            let mut bitmap = self.zero_block()?;
-            let bitmap_bits = u64::try_from(bitmap.len())
-                .map_err(|_| Corrupt::AddressOverflow)?
-                .checked_mul(8)
-                .ok_or(Corrupt::AddressOverflow)?;
-            set_bitmap_range(&mut bitmap, group.inodes, bitmap_bits - group.inodes)?;
-            let flags = le16(&group.edit.descriptor, 0x12) & !0x0001;
-            put_le16(&mut group.edit.descriptor, 0x12, flags);
-            bitmap
-        } else {
-            let bitmap = self.read_owned_block(group.inode_bitmap_number)?;
-            self.verify_inode_bitmap_checksum(group.edit.number, &group.edit.descriptor, &bitmap)?;
+            let bitmap = match kind {
+                ondisk::BitmapKind::Block => {
+                    let (bitmap, free) = self.initialize_block_bitmap(
+                        group.edit.descriptor.group,
+                        &group.edit.descriptor,
+                        group.start,
+                        group.blocks,
+                    )?;
+                    if free != group.edit.descriptor.free_blocks() {
+                        return Err(Corrupt::InvalidFreeBlockCount.into());
+                    }
+                    bitmap
+                }
+                ondisk::BitmapKind::Inode => {
+                    if group.edit.descriptor.free_inodes() != group.inodes
+                        || group.edit.descriptor.flags() & 0x0004 == 0
+                    {
+                        return Err(Corrupt::InvalidBlockBitmap.into());
+                    }
+                    let mut bitmap = self.zero_block()?;
+                    let bits = u64::try_from(bitmap.len())
+                        .map_err(|_| Corrupt::AddressOverflow)?
+                        .checked_mul(8)
+                        .ok_or(Corrupt::AddressOverflow)?;
+                    set_bitmap_range(&mut bitmap, group.inodes, bits - group.inodes)?;
+                    bitmap
+                }
+            };
+            group.edit.descriptor.clear_flag(flag);
             bitmap
         };
-        group.edit.inode_bitmap = Some(DirtyBlock {
-            number: group.inode_bitmap_number,
+        group.edit.bitmaps[index] = Some(DirtyBlock {
+            number: group.bitmap_numbers[index],
             bytes: bitmap,
         });
         Ok(())
     }
 
     fn finish_group(&self, mut group: BlockGroup) -> GroupEdit {
-        if let Some(bitmap) = &group.edit.block_bitmap {
-            let checksum = self.block_bitmap_checksum(&bitmap.bytes);
-            put_le16(&mut group.edit.descriptor, 0x18, checksum as u16);
-            put_le16(&mut group.edit.descriptor, 0x38, (checksum >> 16) as u16);
+        for kind in [ondisk::BitmapKind::Block, ondisk::BitmapKind::Inode] {
+            if let Some(bitmap) = &group.edit.bitmaps[kind as usize] {
+                let checksum = self.bitmap_checksum(kind, &bitmap.bytes);
+                group.edit.descriptor.set_bitmap_checksum(kind, checksum);
+            }
         }
-        if let Some(bitmap) = &group.edit.inode_bitmap {
-            let checksum = self.inode_bitmap_checksum(&bitmap.bytes);
-            put_le16(&mut group.edit.descriptor, 0x1a, checksum as u16);
-            put_le16(&mut group.edit.descriptor, 0x3a, (checksum >> 16) as u16);
-        }
-        update_group_descriptor_checksum(
-            self.transaction.filesystem.superblock.checksum_seed,
-            group.edit.number,
-            &mut group.edit.descriptor,
-        );
+        group
+            .edit
+            .descriptor
+            .finish(&self.transaction.filesystem.superblock);
         group.edit
     }
 
     /// Add blocks to an allocation while preserving its prospective bitmap
     /// edits. This lets callers allocate data first, inspect its extent shape,
     /// and then request exactly the tree metadata that shape requires.
+    #[inline(never)]
     fn extend_allocation(
         &mut self,
         allocation: &mut Allocation,
@@ -2447,12 +2212,12 @@ impl TransactionIo<'_, '_> {
             .try_reserve_exact(group_count as usize)
             .map_err(|_| Error::OutOfMemory)?;
         for edit in &allocation.groups {
-            group_order.push(edit.number);
+            group_order.push(edit.descriptor.group);
         }
         for group in 0..group_count {
             if allocation
                 .groups
-                .binary_search_by_key(&group, |edit| edit.number)
+                .binary_search_by_key(&group, |edit| edit.descriptor.group)
                 .is_err()
             {
                 group_order.push(group);
@@ -2465,20 +2230,19 @@ impl TransactionIo<'_, '_> {
             }
             let existing = allocation
                 .groups
-                .binary_search_by_key(&group, |edit| edit.number);
+                .binary_search_by_key(&group, |edit| edit.descriptor.group);
             let had_existing = existing.is_ok();
             let edit = existing
                 .ok()
                 .map(|position| allocation.groups.remove(position));
             let mut editor = self.open_group(group, edit)?;
-            self.load_group_block_bitmap(&mut editor, true)?;
-            let free = u64::from(le16(&editor.edit.descriptor, 0x0c))
-                | (u64::from(le16(&editor.edit.descriptor, 0x2c)) << 16);
+            self.load_group_bitmap(&mut editor, ondisk::BitmapKind::Block, true)?;
+            let free = editor.edit.descriptor.free_blocks();
             if free == 0 {
                 if had_existing {
                     let position = allocation
                         .groups
-                        .binary_search_by_key(&group, |edit| edit.number)
+                        .binary_search_by_key(&group, |edit| edit.descriptor.group)
                         .unwrap_or_else(|position| position);
                     let edit = self.finish_group(editor);
                     allocation.groups.insert(position, edit);
@@ -2492,7 +2256,7 @@ impl TransactionIo<'_, '_> {
             }
             let position = allocation
                 .groups
-                .binary_search_by_key(&group, |edit| edit.number)
+                .binary_search_by_key(&group, |edit| edit.descriptor.group)
                 .unwrap_or_else(|position| position);
             let edit = self.finish_group(editor);
             allocation.groups.insert(position, edit);
@@ -2503,10 +2267,11 @@ impl TransactionIo<'_, '_> {
         Ok(())
     }
 
+    #[inline(never)]
     fn initialize_block_bitmap(
         &self,
         group: u32,
-        descriptor: &[u8],
+        descriptor: &ondisk::GroupDescriptor,
         group_start: u64,
         group_blocks: u64,
     ) -> Result<(Vec<u8>, u64), Error> {
@@ -2541,12 +2306,9 @@ impl TransactionIo<'_, '_> {
         let group_end = group_start
             .checked_add(group_blocks)
             .ok_or(Corrupt::AddressOverflow)?;
-        let block_bitmap =
-            u64::from(le32(descriptor, 0)) | (u64::from(le32(descriptor, 0x20)) << 32);
-        let inode_bitmap =
-            u64::from(le32(descriptor, 4)) | (u64::from(le32(descriptor, 0x24)) << 32);
-        let inode_table =
-            u64::from(le32(descriptor, 8)) | (u64::from(le32(descriptor, 0x28)) << 32);
+        let block_bitmap = descriptor.bitmap(ondisk::BitmapKind::Block);
+        let inode_bitmap = descriptor.bitmap(ondisk::BitmapKind::Inode);
+        let inode_table = descriptor.inode_table();
         for metadata in [block_bitmap, inode_bitmap] {
             if metadata >= superblock.blocks_count {
                 return Err(Corrupt::InvalidBlockBitmap.into());
@@ -2585,6 +2347,7 @@ impl TransactionIo<'_, '_> {
         Ok((bitmap, group_blocks - used))
     }
 
+    #[inline(never)]
     fn allocate_inode(&mut self, directory: bool) -> Result<InodeAllocation, Error> {
         let group_count = self.transaction.filesystem.superblock.group_count();
         let first_inode = u64::from(self.transaction.filesystem.superblock.first_inode);
@@ -2593,8 +2356,7 @@ impl TransactionIo<'_, '_> {
             if editor.inodes == 0 {
                 break;
             }
-            let free = u64::from(le16(&editor.edit.descriptor, 0x0e))
-                | (u64::from(le16(&editor.edit.descriptor, 0x2e)) << 16);
+            let free = editor.edit.descriptor.free_inodes();
             if free == 0 {
                 continue;
             }
@@ -2602,16 +2364,15 @@ impl TransactionIo<'_, '_> {
                 return Err(Corrupt::InvalidFreeBlockCount.into());
             }
 
-            if le16(&editor.edit.descriptor, 0x12) & 0x0002 != 0 {
-                self.load_group_block_bitmap(&mut editor, true)?;
+            if editor.edit.descriptor.flags() & 0x0002 != 0 {
+                self.load_group_bitmap(&mut editor, ondisk::BitmapKind::Block, true)?;
             }
 
-            let inode_table = u64::from(le32(&editor.edit.descriptor, 8))
-                | (u64::from(le32(&editor.edit.descriptor, 0x28)) << 32);
+            let inode_table = editor.edit.descriptor.inode_table();
             if inode_table >= self.transaction.filesystem.superblock.blocks_count {
                 return Err(Corrupt::InvalidInodeTable.into());
             }
-            self.load_group_inode_bitmap(&mut editor, true)?;
+            self.load_group_bitmap(&mut editor, ondisk::BitmapKind::Inode, true)?;
             let start = if group_number == 0 {
                 first_inode - 1
             } else {
@@ -2678,6 +2439,7 @@ impl TransactionIo<'_, '_> {
         })
     }
 
+    #[inline(never)]
     fn release_blocks(&mut self, ranges: &[(u64, u64)]) -> Result<ResourceRelease, Error> {
         let mut releases: Vec<GroupBlocks> = Vec::new();
         releases
@@ -2743,7 +2505,7 @@ impl TransactionIo<'_, '_> {
                     group.blocks,
                 )?
                 .0;
-            self.load_group_block_bitmap(&mut group, false)?;
+            self.load_group_bitmap(&mut group, ondisk::BitmapKind::Block, false)?;
             group.release_blocks(&release.bits, &reserved)?;
             groups.push(self.finish_group(group));
         }
@@ -2805,6 +2567,7 @@ impl TransactionIo<'_, '_> {
         Ok((tree, extents, tree_blocks))
     }
 
+    #[inline(never)]
     fn prepare_inode_release(
         &mut self,
         inode: &Inode,
@@ -2857,7 +2620,7 @@ impl TransactionIo<'_, '_> {
             u64::from(zero_based % self.transaction.filesystem.superblock.inodes_per_group);
         let (position, existing) = match resources
             .groups
-            .binary_search_by_key(&inode_group, |group| group.number)
+            .binary_search_by_key(&inode_group, |group| group.descriptor.group)
         {
             Ok(position) => (position, Some(resources.groups.remove(position))),
             Err(position) => {
@@ -2869,8 +2632,7 @@ impl TransactionIo<'_, '_> {
             }
         };
         let mut group = self.open_group(inode_group, existing)?;
-        let inode_table = u64::from(le32(&group.edit.descriptor, 8))
-            | (u64::from(le32(&group.edit.descriptor, 0x28)) << 32);
+        let inode_table = group.edit.descriptor.inode_table();
         if inode_table >= self.transaction.filesystem.superblock.blocks_count {
             return Err(Corrupt::InvalidInodeTable.into());
         }
@@ -2880,7 +2642,7 @@ impl TransactionIo<'_, '_> {
         let inode_size = usize::from(self.transaction.filesystem.superblock.inode_size);
         let mut inode_block = self.read_owned_block(inode_block_number)?;
         inode_block[inode_offset..inode_offset + inode_size].fill(0);
-        self.load_group_inode_bitmap(&mut group, false)?;
+        self.load_group_bitmap(&mut group, ondisk::BitmapKind::Inode, false)?;
         group.release_inode(inode_index, matches!(kind, ReleaseKind::Directory))?;
         let edit = self.finish_group(group);
         resources.groups.insert(position, edit);
@@ -2911,8 +2673,8 @@ impl TransactionIo<'_, '_> {
         superblock: DirtyBlock,
         data: Vec<DirtyBlock>,
     ) -> Result<(), Error> {
-        let mut metadata = MetadataMutation::new();
-        metadata.adopt_block(superblock)?;
+        let mut metadata = MetadataMutation::default();
+        metadata.adopt(superblock.number, superblock.bytes)?;
         metadata.adopt_blocks(data)?;
         metadata.stage(self)
     }
@@ -2922,7 +2684,7 @@ impl TransactionIo<'_, '_> {
         release: PreparedInodeRelease,
         namespace: Vec<DirtyBlock>,
     ) -> Result<(), Error> {
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         self.apply_inode_release(&mut metadata, release)?;
         metadata.adopt_blocks(namespace)?;
         metadata.stage(self)
@@ -2934,7 +2696,7 @@ impl TransactionIo<'_, '_> {
         namespace: Vec<DirtyBlock>,
         old_parent: &Inode,
     ) -> Result<(), Error> {
-        let mut metadata = MetadataMutation::new();
+        let mut metadata = MetadataMutation::default();
         self.apply_inode_release(&mut metadata, release)?;
         metadata.adopt_blocks(namespace)?;
         metadata.set_inode_links(self, old_parent, old_parent.links - 1)?;
@@ -2947,9 +2709,9 @@ impl TransactionIo<'_, '_> {
         release: PreparedInodeRelease,
     ) -> Result<(), Error> {
         self.apply_resources(metadata, ResourceUpdate::Release(release.resources))?;
-        metadata.adopt_block(release.inode_block)?;
+        metadata.adopt(release.inode_block.number, release.inode_block.bytes)?;
         if let Some(block) = release.retained_xattr_block {
-            metadata.adopt_block(block)?;
+            metadata.adopt(block.number, block.bytes)?;
         }
         Ok(())
     }
@@ -2968,7 +2730,7 @@ impl TransactionIo<'_, '_> {
             .map_err(|_| Error::OutOfMemory)?;
         for group in groups {
             let byte = table
-                .checked_add(u64::from(group.number) * descriptor_size)
+                .checked_add(u64::from(group.descriptor.group) * descriptor_size)
                 .ok_or(Corrupt::AddressOverflow)?;
             let number = byte / block_size;
             let offset =
@@ -2988,10 +2750,10 @@ impl TransactionIo<'_, '_> {
                 }
             };
             let end = offset
-                .checked_add(group.descriptor.len())
+                .checked_add(group.descriptor.bytes().len())
                 .filter(|end| *end <= blocks[index].bytes.len())
-                .ok_or(Corrupt::InvalidGroup(group.number))?;
-            blocks[index].bytes[offset..end].copy_from_slice(&group.descriptor);
+                .ok_or(Corrupt::InvalidGroup(group.descriptor.group))?;
+            blocks[index].bytes[offset..end].copy_from_slice(group.descriptor.bytes());
         }
         Ok(blocks)
     }
@@ -3007,7 +2769,7 @@ impl TransactionIo<'_, '_> {
             .transaction
             .filesystem
             .read_group_descriptor(self.storage, group)?;
-        let table = u64::from(le32(&descriptor, 8)) | (u64::from(le32(&descriptor, 0x28)) << 32);
+        let table = descriptor.inode_table();
         self.inode_table_location(table, index)
     }
 
@@ -3070,13 +2832,14 @@ impl TransactionIo<'_, '_> {
             .map_file_block(directory, 0)?
             .ok_or(Corrupt::InvalidDirectory)?;
         let block = self.read_owned_block(number)?;
-        let kind = self
-            .filesystem
-            .directory_block_kind(directory, 0, block_size, &block);
-        self.transaction
-            .filesystem
-            .verify_directory_checksum(directory, kind, block_size, &block)?;
-        directory_parent_entry(&block, directory.number)
+        DirectoryBlock::new(
+            self.filesystem.superblock.checksum_seed,
+            self.filesystem.superblock.has_metadata_checksums(),
+            directory,
+            0,
+            block,
+        )?
+        .parent()
     }
 
     fn validate_mutation_profile(&self) -> Result<(), Error> {
@@ -3125,545 +2888,36 @@ impl TransactionIo<'_, '_> {
         self.transaction.filesystem.new_block_buffer()
     }
 
-    fn block_bitmap_checksum(&self, bitmap: &[u8]) -> u32 {
-        let bytes = usize::try_from(
-            self.transaction
-                .filesystem
-                .superblock
-                .blocks_per_group
-                .div_ceil(8),
-        )
-        .unwrap_or(bitmap.len())
-        .min(bitmap.len());
+    fn bitmap_checksum(&self, kind: ondisk::BitmapKind, bitmap: &[u8]) -> u32 {
+        let bits = match kind {
+            ondisk::BitmapKind::Block => self.transaction.filesystem.superblock.blocks_per_group,
+            ondisk::BitmapKind::Inode => self.transaction.filesystem.superblock.inodes_per_group,
+        };
+        let bytes = usize::try_from(bits.div_ceil(8))
+            .unwrap_or(bitmap.len())
+            .min(bitmap.len());
         let mut checksum =
             Checksum::with_seed(self.transaction.filesystem.superblock.checksum_seed);
         checksum.update(&bitmap[..bytes]);
         checksum.finalize()
     }
 
-    fn inode_bitmap_checksum(&self, bitmap: &[u8]) -> u32 {
-        let bytes = usize::try_from(
-            self.transaction
-                .filesystem
-                .superblock
-                .inodes_per_group
-                .div_ceil(8),
-        )
-        .unwrap_or(bitmap.len());
-        let mut checksum =
-            Checksum::with_seed(self.transaction.filesystem.superblock.checksum_seed);
-        checksum.update(&bitmap[..bytes]);
-        checksum.finalize()
-    }
-
-    fn verify_block_bitmap_checksum(
+    fn verify_bitmap_checksum(
         &self,
+        kind: ondisk::BitmapKind,
         group: u32,
-        descriptor: &[u8],
+        descriptor: &ondisk::GroupDescriptor,
         bitmap: &[u8],
     ) -> Result<(), Error> {
-        let expected =
-            u32::from(le16(descriptor, 0x18)) | (u32::from(le16(descriptor, 0x38)) << 16);
-        if self.block_bitmap_checksum(bitmap) != expected {
-            return Err(Corrupt::BlockBitmapChecksum(group).into());
+        if self.bitmap_checksum(kind, bitmap) != descriptor.bitmap_checksum(kind) {
+            return Err(match kind {
+                ondisk::BitmapKind::Block => Corrupt::BlockBitmapChecksum(group),
+                ondisk::BitmapKind::Inode => Corrupt::InodeBitmapChecksum(group),
+            }
+            .into());
         }
         Ok(())
     }
-
-    fn verify_inode_bitmap_checksum(
-        &self,
-        group: u32,
-        descriptor: &[u8],
-        bitmap: &[u8],
-    ) -> Result<(), Error> {
-        let expected =
-            u32::from(le16(descriptor, 0x1a)) | (u32::from(le16(descriptor, 0x3a)) << 16);
-        if self.inode_bitmap_checksum(bitmap) != expected {
-            return Err(Corrupt::InodeBitmapChecksum(group).into());
-        }
-        Ok(())
-    }
-}
-
-fn decrement_descriptor_free_blocks_by(descriptor: &mut [u8], amount: u64) -> Result<(), Error> {
-    let free = u64::from(le16(descriptor, 0x0c)) | (u64::from(le16(descriptor, 0x2c)) << 16);
-    let free = free
-        .checked_sub(amount)
-        .filter(|free| *free <= u64::from(u32::MAX))
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x0c, free as u16);
-    put_le16(descriptor, 0x2c, (free >> 16) as u16);
-    Ok(())
-}
-
-fn increment_descriptor_free_blocks(
-    descriptor: &mut [u8],
-    amount: u64,
-    group_blocks: u64,
-) -> Result<(), Error> {
-    let free = u64::from(le16(descriptor, 0x0c)) | (u64::from(le16(descriptor, 0x2c)) << 16);
-    let free = free
-        .checked_add(amount)
-        .filter(|free| *free <= group_blocks && *free <= u64::from(u32::MAX))
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x0c, free as u16);
-    put_le16(descriptor, 0x2c, (free >> 16) as u16);
-    Ok(())
-}
-
-fn decrement_descriptor_free_inodes(descriptor: &mut [u8]) -> Result<(), Error> {
-    let free = u32::from(le16(descriptor, 0x0e)) | (u32::from(le16(descriptor, 0x2e)) << 16);
-    let free = free.checked_sub(1).ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x0e, free as u16);
-    put_le16(descriptor, 0x2e, (free >> 16) as u16);
-    Ok(())
-}
-
-fn increment_descriptor_free_inodes(
-    descriptor: &mut [u8],
-    inodes_per_group: u64,
-) -> Result<(), Error> {
-    let free = u64::from(le16(descriptor, 0x0e)) | (u64::from(le16(descriptor, 0x2e)) << 16);
-    let free = free
-        .checked_add(1)
-        .filter(|free| *free <= inodes_per_group && *free <= u64::from(u32::MAX))
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x0e, free as u16);
-    put_le16(descriptor, 0x2e, (free >> 16) as u16);
-    Ok(())
-}
-
-fn increment_descriptor_used_directories(
-    descriptor: &mut [u8],
-    inodes_per_group: u64,
-) -> Result<(), Error> {
-    let used = u64::from(le16(descriptor, 0x10)) | (u64::from(le16(descriptor, 0x30)) << 16);
-    let used = used
-        .checked_add(1)
-        .filter(|used| *used <= inodes_per_group && *used <= u64::from(u32::MAX))
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x10, used as u16);
-    put_le16(descriptor, 0x30, (used >> 16) as u16);
-    Ok(())
-}
-
-fn decrement_descriptor_used_directories(
-    descriptor: &mut [u8],
-    inodes_per_group: u64,
-) -> Result<(), Error> {
-    let used = u64::from(le16(descriptor, 0x10)) | (u64::from(le16(descriptor, 0x30)) << 16);
-    if used > inodes_per_group {
-        return Err(Corrupt::InvalidFreeBlockCount.into());
-    }
-    let used = used.checked_sub(1).ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le16(descriptor, 0x10, used as u16);
-    put_le16(descriptor, 0x30, (used >> 16) as u16);
-    Ok(())
-}
-
-fn update_unused_inode_count(
-    descriptor: &mut [u8],
-    allocated_index: u64,
-    inodes_per_group: u64,
-) -> Result<(), Error> {
-    let unused = u64::from(le16(descriptor, 0x1c)) | (u64::from(le16(descriptor, 0x3c)) << 16);
-    if unused > inodes_per_group || allocated_index >= inodes_per_group {
-        return Err(Corrupt::InvalidFreeBlockCount.into());
-    }
-    let initialized = inodes_per_group - unused;
-    if allocated_index >= initialized {
-        let new_unused = inodes_per_group - allocated_index - 1;
-        put_le16(descriptor, 0x1c, new_unused as u16);
-        put_le16(descriptor, 0x3c, (new_unused >> 16) as u16);
-    }
-    Ok(())
-}
-
-fn decrement_superblock_free_blocks_by(superblock: &mut [u8], amount: u64) -> Result<(), Error> {
-    let free = u64::from(le32(superblock, 0x0c)) | (u64::from(le32(superblock, 0x158)) << 32);
-    let free = free
-        .checked_sub(amount)
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le32(superblock, 0x0c, free as u32);
-    put_le32(superblock, 0x158, (free >> 32) as u32);
-    Ok(())
-}
-
-fn increment_superblock_free_blocks(
-    superblock: &mut [u8],
-    amount: u64,
-    blocks_count: u64,
-) -> Result<(), Error> {
-    let free = u64::from(le32(superblock, 0x0c)) | (u64::from(le32(superblock, 0x158)) << 32);
-    let free = free
-        .checked_add(amount)
-        .filter(|free| *free <= blocks_count)
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le32(superblock, 0x0c, free as u32);
-    put_le32(superblock, 0x158, (free >> 32) as u32);
-    Ok(())
-}
-
-fn decrement_superblock_free_inodes(superblock: &mut [u8]) -> Result<(), Error> {
-    let free = le32(superblock, 0x10)
-        .checked_sub(1)
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le32(superblock, 0x10, free);
-    Ok(())
-}
-
-fn increment_superblock_free_inodes(superblock: &mut [u8], inodes_count: u64) -> Result<(), Error> {
-    let free = u64::from(le32(superblock, 0x10));
-    let free = free
-        .checked_add(1)
-        .filter(|free| *free <= inodes_count && *free <= u64::from(u32::MAX))
-        .ok_or(Corrupt::InvalidFreeBlockCount)?;
-    put_le32(superblock, 0x10, free as u32);
-    Ok(())
-}
-
-fn update_group_descriptor_checksum(seed: u32, group: u32, descriptor: &mut [u8]) {
-    put_le16(descriptor, 0x1e, 0);
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(group);
-    checksum.update(descriptor);
-    put_le16(descriptor, 0x1e, checksum.finalize() as u16);
-}
-
-fn update_superblock_checksum(superblock: &mut [u8]) {
-    let mut checksum = Checksum::new();
-    checksum.update(&superblock[..0x3fc]);
-    put_le32(superblock, 0x3fc, checksum.finalize());
-}
-
-fn update_inode_checksum(seed: u32, number: u32, generation: u32, inode: &mut [u8]) {
-    put_le16(inode, 0x7c, 0);
-    if inode.len() >= 0x84 {
-        put_le16(inode, 0x82, 0);
-    }
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(number);
-    checksum.update_u32_le(generation);
-    checksum.update(inode);
-    let checksum = checksum.finalize();
-    put_le16(inode, 0x7c, checksum as u16);
-    if inode.len() >= 0x84 {
-        put_le16(inode, 0x82, (checksum >> 16) as u16);
-    }
-}
-
-fn initialize_empty_inode(inode: &mut [u8], permissions: u16) {
-    inode.fill(0);
-    put_le16(inode, 0, 0x8000 | permissions);
-    put_le16(inode, 0x1a, 1);
-    put_le32(inode, 0x20, super::EXTENTS_FL);
-    let root = &mut inode[0x28..0x64];
-    put_le16(root, 0, super::EXTENT_MAGIC);
-    put_le16(root, 4, 4);
-    if inode.len() >= 0x84 {
-        put_le16(inode, 0x80, 32);
-    }
-}
-
-fn initialize_fast_symlink(inode: &mut [u8], target: &[u8]) -> Result<(), Error> {
-    if target.is_empty() || target.len() > 60 || inode.len() < 0x84 {
-        return Err(Error::InvalidArgument);
-    }
-    inode.fill(0);
-    put_le16(inode, 0, 0xa000 | 0o777);
-    put_le32(inode, 4, target.len() as u32);
-    put_le16(inode, 0x1a, 1);
-    inode[0x28..0x28 + target.len()].copy_from_slice(target);
-    put_le16(inode, 0x80, 32);
-    Ok(())
-}
-
-fn initialize_directory_inode(
-    inode: &mut [u8],
-    permissions: u16,
-    physical: u64,
-    block_size: u64,
-) -> Result<(), Error> {
-    if physical >> 48 != 0 {
-        return Err(Unsupported::ExtentMutation.into());
-    }
-    inode.fill(0);
-    put_le16(inode, 0, 0x4000 | permissions);
-    put_le32(inode, 4, block_size as u32);
-    put_le32(inode, 0x6c, (block_size >> 32) as u32);
-    put_le16(inode, 0x1a, 2);
-    let sectors = block_size / 512;
-    put_le32(inode, 0x1c, sectors as u32);
-    put_le16(inode, 0x74, (sectors >> 32) as u16);
-    put_le32(inode, 0x20, super::EXTENTS_FL);
-    let root = &mut inode[0x28..0x64];
-    put_le16(root, 0, super::EXTENT_MAGIC);
-    put_le16(root, 2, 1);
-    put_le16(root, 4, 4);
-    put_le32(root, 12, 0);
-    put_le16(root, 16, 1);
-    put_le16(root, 18, (physical >> 32) as u16);
-    put_le32(root, 20, physical as u32);
-    if inode.len() >= 0x84 {
-        put_le16(inode, 0x80, 32);
-    }
-    Ok(())
-}
-
-fn initialize_directory_block(
-    checksum_seed: u32,
-    inode_number: u32,
-    generation: u32,
-    parent_number: u32,
-    block: &mut [u8],
-) -> Result<(), Error> {
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .filter(|tail| *tail >= 24 && *tail <= usize::from(u16::MAX))
-        .ok_or(Corrupt::InvalidDirectory)?;
-    block.fill(0);
-    put_le32(block, 0, inode_number);
-    put_le16(block, 4, 12);
-    block[6] = 1;
-    block[7] = 2;
-    block[8] = b'.';
-    put_le32(block, 12, parent_number);
-    put_le16(block, 16, (tail - 12) as u16);
-    block[18] = 2;
-    block[19] = 2;
-    block[20..22].copy_from_slice(b"..");
-    put_le16(block, tail + 4, 12);
-    block[tail + 7] = 0xde;
-    update_directory_leaf_checksum(checksum_seed, inode_number, generation, block)
-}
-
-fn initialize_empty_directory_leaf(
-    checksum_seed: u32,
-    inode_number: u32,
-    generation: u32,
-    block: &mut [u8],
-) -> Result<(), Error> {
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .filter(|tail| *tail >= 8 && *tail <= usize::from(u16::MAX))
-        .ok_or(Corrupt::InvalidDirectory)?;
-    block.fill(0);
-    put_le16(block, 4, tail as u16);
-    put_le16(block, tail + 4, 12);
-    block[tail + 7] = 0xde;
-    update_directory_leaf_checksum(checksum_seed, inode_number, generation, block)
-}
-
-fn update_directory_leaf_checksum(
-    seed: u32,
-    inode: u32,
-    generation: u32,
-    block: &mut [u8],
-) -> Result<(), Error> {
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(inode);
-    checksum.update_u32_le(generation);
-    checksum.update(&block[..tail]);
-    put_le32(block, tail + 8, checksum.finalize());
-    Ok(())
-}
-
-fn directory_parent_entry(block: &[u8], inode_number: u32) -> Result<u32, Error> {
-    let (parent, number, file_type, name) = crate::directory_record(block, 0)?;
-    if number != inode_number || file_type != 2 || name != b"." || parent < 12 {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let (next, number, file_type, name) = crate::directory_record(block, parent)?;
-    if number == 0 || file_type != 2 || name != b".." || next - parent < 12 {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    Ok(number)
-}
-
-fn replace_directory_parent(
-    checksum_seed: u32,
-    directory: &Inode,
-    block: &mut [u8],
-    old_parent: u32,
-    new_parent: u32,
-) -> Result<(), Error> {
-    if directory_parent_entry(block, directory.number)? != old_parent || new_parent == 0 {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let parent = usize::from(le16(block, 4));
-    put_le32(block, parent, new_parent);
-    update_directory_leaf_checksum(checksum_seed, directory.number, directory.generation, block)
-}
-
-fn insert_directory_entry(
-    checksum_seed: u32,
-    directory: &Inode,
-    block: &mut [u8],
-    inode_number: u32,
-    name: &[u8],
-    file_type: u8,
-) -> Result<(), Error> {
-    if !matches!(file_type, 1 | 2 | 7) {
-        return Err(Error::InvalidArgument);
-    }
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let needed = (8 + name.len() + 3) & !3;
-    let mut cursor = 0usize;
-    let mut insertion = None;
-    while cursor < tail {
-        let (next, entry_inode, _, entry_name) = crate::directory_record(&block[..tail], cursor)?;
-        let record_len = next - cursor;
-        if insertion.is_none() {
-            if entry_inode == 0 && record_len >= needed {
-                insertion = Some((cursor, record_len, None));
-            } else if entry_inode != 0 {
-                let used = (8 + entry_name.len() + 3) & !3;
-                if record_len - used >= needed {
-                    insertion = Some((cursor + used, record_len - used, Some((cursor, used))));
-                }
-            }
-        }
-        cursor = next;
-    }
-    if cursor != tail {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let (at, record_len, split_previous) = insertion.ok_or(Unsupported::ExtentMutation)?;
-    if let Some((previous, previous_len)) = split_previous {
-        put_le16(block, previous + 4, previous_len as u16);
-    }
-    block[at..at + record_len].fill(0);
-    put_le32(block, at, inode_number);
-    put_le16(block, at + 4, record_len as u16);
-    block[at + 6] = name.len() as u8;
-    block[at + 7] = file_type;
-    block[at + 8..at + 8 + name.len()].copy_from_slice(name);
-
-    update_directory_leaf_checksum(checksum_seed, directory.number, directory.generation, block)
-}
-
-fn edit_directory_entry(
-    checksum_seed: u32,
-    directory: &Inode,
-    block: &mut [u8],
-    name: &[u8],
-    edit: ExistingDirectoryEdit,
-) -> Result<(), Error> {
-    if matches!(edit, ExistingDirectoryEdit::Replace { old: 0, .. })
-        || matches!(edit, ExistingDirectoryEdit::Replace { new: 0, .. })
-        || matches!(edit, ExistingDirectoryEdit::Replace { kind, .. } if !matches!(kind, 1 | 2 | 7))
-    {
-        return Err(Error::InvalidArgument);
-    }
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let mut cursor = 0usize;
-    let mut previous = None;
-    while cursor < tail {
-        let (next, entry_inode, _, entry_name) = crate::directory_record(&block[..tail], cursor)?;
-        if entry_inode != 0 && entry_name == name {
-            match edit {
-                ExistingDirectoryEdit::Remove { number } => {
-                    if entry_inode != number {
-                        return Err(Corrupt::InvalidDirectory.into());
-                    }
-                    let record_len = next - cursor;
-                    if let Some(previous) = previous {
-                        let previous_len = usize::from(le16(block, previous + 4));
-                        let merged = previous_len
-                            .checked_add(record_len)
-                            .filter(|length| previous + *length <= tail)
-                            .ok_or(Corrupt::InvalidDirectory)?;
-                        block[cursor..next].fill(0);
-                        put_le16(block, previous + 4, merged as u16);
-                    } else {
-                        put_le32(block, cursor, 0);
-                        block[cursor + 6..next].fill(0);
-                    }
-                }
-                ExistingDirectoryEdit::Replace { old, new, kind } => {
-                    if entry_inode != old {
-                        return Err(Corrupt::InvalidDirectory.into());
-                    }
-                    put_le32(block, cursor, new);
-                    block[cursor + 7] = kind;
-                }
-            }
-            return update_directory_leaf_checksum(
-                checksum_seed,
-                directory.number,
-                directory.generation,
-                block,
-            );
-        }
-        previous = Some(cursor);
-        cursor = next;
-    }
-    Err(Error::NotFound)
-}
-
-fn find_directory_entry(block: &[u8], name: &[u8]) -> Result<Option<u32>, Error> {
-    let tail = block
-        .len()
-        .checked_sub(12)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let mut cursor = 0usize;
-    while cursor < tail {
-        let (next, inode, _, entry_name) = crate::directory_record(&block[..tail], cursor)?;
-        if inode != 0 && entry_name == name {
-            return Ok(Some(inode));
-        }
-        cursor = next;
-    }
-    if cursor != tail {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    Ok(None)
-}
-
-fn update_directory_index_checksum(
-    seed: u32,
-    directory: &Inode,
-    kind: crate::DirectoryBlockKind,
-    block: &mut [u8],
-) -> Result<(), Error> {
-    let tail = block
-        .len()
-        .checked_sub(8)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let limit_offset = match kind {
-        crate::DirectoryBlockKind::Root => 0x20,
-        crate::DirectoryBlockKind::Internal => 0x08,
-        crate::DirectoryBlockKind::Leaf => return Err(Corrupt::InvalidDirectory.into()),
-    };
-    if limit_offset + 4 > tail {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let entries = usize::from(le16(block, limit_offset + 2));
-    let hashed_bytes = entries
-        .checked_mul(8)
-        .and_then(|bytes| limit_offset.checked_add(bytes))
-        .filter(|end| *end <= tail)
-        .ok_or(Corrupt::InvalidDirectory)?;
-    let mut checksum = Checksum::with_seed(seed);
-    checksum.update_u32_le(directory.number);
-    checksum.update_u32_le(directory.generation);
-    checksum.update(&block[..hashed_bytes]);
-    checksum.update_u32_le(le32(block, tail));
-    checksum.update_u32_le(0);
-    put_le32(block, tail + 4, checksum.finalize());
-    Ok(())
 }
 
 fn is_power_of(mut value: u32, base: u32) -> bool {
@@ -3687,12 +2941,4 @@ fn set_bitmap_range(bitmap: &mut [u8], start: u64, len: u64) -> Result<(), Error
         bitmap[bit / 8] |= 1 << (bit % 8);
     }
     Ok(())
-}
-
-fn put_le16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_le32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }

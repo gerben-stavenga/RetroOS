@@ -95,6 +95,7 @@ struct Tag {
 }
 
 impl Ext4 {
+    #[inline(never)]
     pub(crate) fn commit_journal(
         &mut self,
         storage: &mut dyn Storage,
@@ -261,7 +262,7 @@ impl Ext4 {
                     .map(|(physical, _)| physical),
                 None => self.map_file_block(storage, &journal, u64::from(logical))?,
             }
-                .ok_or(Corrupt::InvalidJournal)?;
+            .ok_or(Corrupt::InvalidJournal)?;
             if physical >= self.superblock.blocks_count
                 || dirty.iter().any(|block| block.number == physical)
                 || journal_offsets.contains(&physical)
@@ -319,6 +320,7 @@ impl Ext4 {
         Ok(())
     }
 
+    #[inline(never)]
     pub(super) fn replay_journal(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
         let journal = self.load_inode(storage, self.superblock.journal_inode)?;
         if journal.mode & 0xf000 != 0x8000 {
