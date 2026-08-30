@@ -424,7 +424,7 @@ impl ExtentTree {
         block_size: usize,
         blocks_count: u64,
         identity: ExtentIdentity,
-        mut read_block: impl FnMut(u64) -> Result<Vec<u8>, Error>,
+        read_block: &mut dyn FnMut(u64) -> Result<Vec<u8>, Error>,
     ) -> Result<Self, Error> {
         let block_capacity = block_size
             .checked_sub(16)
@@ -447,7 +447,7 @@ impl ExtentTree {
             blocks_count,
             identity,
             &mut visited,
-            &mut read_block,
+            read_block,
         )?;
         let tree = Self::new(root, block_capacity)?;
         let extents = tree.data_extents()?;
@@ -677,27 +677,22 @@ impl ExtentTree {
         find(&self.root, logical)
     }
 
-    pub(crate) fn external_blocks_by_level(&self) -> Result<Vec<u64>, Error> {
-        fn collect(node: &ExtentNode, wanted_depth: u16, out: &mut Vec<u64>) -> Result<(), Error> {
-            if node.depth() == wanted_depth {
-                if let NodeLocation::Block(number) = node.location {
-                    out.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                    out.push(number);
-                }
-                return Ok(());
+    pub(crate) fn external_blocks(&self) -> Result<Vec<u64>, Error> {
+        fn collect(node: &ExtentNode, out: &mut Vec<u64>) -> Result<(), Error> {
+            if let NodeLocation::Block(number) = node.location {
+                out.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                out.push(number);
             }
             if let NodeEntries::Branch(children) = &node.entries {
                 for child in children {
-                    collect(child, wanted_depth, out)?;
+                    collect(child, out)?;
                 }
             }
             Ok(())
         }
 
         let mut blocks = Vec::new();
-        for depth in 0..self.root.depth() {
-            collect(&self.root, depth, &mut blocks)?;
-        }
+        collect(&self.root, &mut blocks)?;
         Ok(blocks)
     }
 
@@ -787,7 +782,7 @@ fn load_node(
     blocks_count: u64,
     identity: ExtentIdentity,
     visited: &mut Vec<u64>,
-    read_block: &mut impl FnMut(u64) -> Result<Vec<u8>, Error>,
+    read_block: &mut dyn FnMut(u64) -> Result<Vec<u8>, Error>,
 ) -> Result<ExtentNode, Error> {
     let depth = extent_header(bytes, capacity)?;
     if depth != expected_depth {
@@ -1191,7 +1186,7 @@ mod tests {
         let mut root = [0u8; 60];
         tree.write_root(&mut root).unwrap();
         let serialized = tree.serialize_dirty(112, identity).unwrap();
-        let loaded = ExtentTree::load(&root, 112, 10_000, identity, |number| {
+        let loaded = ExtentTree::load(&root, 112, 10_000, identity, &mut |number| {
             serialized
                 .iter()
                 .find(|node| node.number == number)

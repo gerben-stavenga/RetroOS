@@ -21,6 +21,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::any::Any;
 use core::fmt;
+use extent_tree::{ExtentIdentity, ExtentState, ExtentTree};
 pub use ondisk::Superblock;
 use ondisk::{checked_read, le16, le32};
 pub use storage::Storage;
@@ -37,6 +38,32 @@ const MODE_TYPE_MASK: u16 = 0xf000;
 const MODE_DIRECTORY: u16 = 0x4000;
 const MODE_REGULAR: u16 = 0x8000;
 const MODE_SYMLINK: u16 = 0xa000;
+
+fn directory_record(
+    bytes: &[u8],
+    cursor: usize,
+) -> Result<(usize, u32, u8, &[u8]), Error> {
+    if bytes.len().saturating_sub(cursor) < 8 {
+        return Err(Corrupt::InvalidDirectory.into());
+    }
+    let record_len = usize::from(le16(bytes, cursor + 4));
+    let name_len = usize::from(bytes[cursor + 6]);
+    let next = cursor
+        .checked_add(record_len)
+        .filter(|next| {
+            record_len >= 8
+                && record_len.is_multiple_of(4)
+                && *next <= bytes.len()
+                && name_len <= record_len - 8
+        })
+        .ok_or(Corrupt::InvalidDirectory)?;
+    Ok((
+        next,
+        le32(bytes, cursor),
+        bytes[cursor + 7],
+        &bytes[cursor + 8..cursor + 8 + name_len],
+    ))
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Corrupt {
@@ -596,13 +623,38 @@ impl Ext4 {
         let first_within =
             usize::try_from(cookie % block_size).map_err(|_| Corrupt::AddressOverflow)?;
         let mut block = self.new_block_buffer()?;
+        let extent_tree = if directory.flags & EXTENTS_FL != 0 {
+            Some(self.load_extent_tree(storage, &directory)?)
+        } else {
+            None
+        };
 
         for logical in first_logical..blocks {
             block.fill(0);
             let block_offset = logical
                 .checked_mul(block_size)
                 .ok_or(Corrupt::AddressOverflow)?;
-            let count = self.read_inode_data(storage, &directory, block_offset, &mut block)?;
+            let count = usize::try_from((directory.size - block_offset).min(block_size))
+                .map_err(|_| Corrupt::AddressOverflow)?;
+            if let Some(tree) = &extent_tree {
+                if let Some((physical, ExtentState::Written)) = u32::try_from(logical)
+                    .ok()
+                    .and_then(|logical| tree.lookup(logical))
+                {
+                    let offset = physical
+                        .checked_mul(block_size)
+                        .ok_or(Corrupt::AddressOverflow)?;
+                    self.read_storage(storage, offset, &mut block[..count])?;
+                }
+            } else {
+                self.read_inode_data_mapped(
+                    storage,
+                    &directory,
+                    None,
+                    block_offset,
+                    &mut block[..count],
+                )?;
+            }
             let kind = self.directory_block_kind(&directory, logical, count, &block);
             if self.superblock.has_metadata_checksums() {
                 self.verify_directory_checksum(&directory, kind, count, &block)?;
@@ -623,35 +675,22 @@ impl Ext4 {
             let mut cursor = 0usize;
             let mut cookie_is_boundary = wanted == 0;
             while cursor < end {
-                if end - cursor < 8 {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let number = le32(&block, cursor);
-                let record_len = usize::from(le16(&block, cursor + 4));
-                let name_len = usize::from(block[cursor + 6]);
-                if record_len < 8
-                    || !record_len.is_multiple_of(4)
-                    || record_len > end - cursor
-                    || name_len > record_len - 8
-                {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
+                let (next, number, file_type, name) =
+                    directory_record(&block[..end], cursor)?;
                 if cursor == wanted {
                     cookie_is_boundary = true;
                 }
-                let next = cursor + record_len;
                 if cursor >= wanted && number != 0 {
-                    let name = &block[cursor + 8..cursor + 8 + name_len];
                     if name != b"." && name != b".." {
                         let mut owned_name = Vec::new();
                         owned_name
-                            .try_reserve_exact(name_len)
+                            .try_reserve_exact(name.len())
                             .map_err(|_| Error::OutOfMemory)?;
                         owned_name.extend_from_slice(name);
                         let inode = self.load_inode(storage, number)?;
                         output.push(DirectoryEntry {
                             name: owned_name,
-                            file_type: block[cursor + 7],
+                            file_type,
                             inode,
                         });
                         if output.len() - initial_len == max {
@@ -693,31 +732,18 @@ impl Ext4 {
         let mut cursor = 0usize;
         let mut cookie_is_boundary = wanted == 0;
         while cursor < data.len() {
-            if data.len() - cursor < 8 {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-            let number = le32(data, cursor);
-            let record_len = usize::from(le16(data, cursor + 4));
-            let name_len = usize::from(data[cursor + 6]);
-            if record_len < 8
-                || !record_len.is_multiple_of(4)
-                || record_len > data.len() - cursor
-                || name_len > record_len - 8
-            {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
+            let (next, number, file_type, record_name) = directory_record(data, cursor)?;
             if cursor == wanted {
                 cookie_is_boundary = true;
             }
-            let next = cursor + record_len;
             if cursor >= wanted && number != 0 {
                 let mut name = Vec::new();
-                name.try_reserve_exact(name_len)
+                name.try_reserve_exact(record_name.len())
                     .map_err(|_| Error::OutOfMemory)?;
-                name.extend_from_slice(&data[cursor + 8..cursor + 8 + name_len]);
+                name.extend_from_slice(record_name);
                 output.push(DirectoryEntry {
                     name,
-                    file_type: data[cursor + 7],
+                    file_type,
                     inode: self.load_inode(storage, number)?,
                 });
                 if output.len() - initial_len == max {
@@ -981,6 +1007,22 @@ impl Ext4 {
         offset: u64,
         dst: &mut [u8],
     ) -> Result<usize, Error> {
+        let extent_tree = if inode.flags & EXTENTS_FL != 0 && inode.flags & INLINE_DATA_FL == 0 {
+            Some(self.load_extent_tree(storage, inode)?)
+        } else {
+            None
+        };
+        self.read_inode_data_mapped(storage, inode, extent_tree.as_ref(), offset, dst)
+    }
+
+    fn read_inode_data_mapped(
+        &mut self,
+        storage: &mut dyn Storage,
+        inode: &Inode,
+        extent_tree: Option<&ExtentTree>,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
         if let Some(data) = &inode.inline_data {
             if offset >= inode.size || dst.is_empty() {
                 return Ok(0);
@@ -1008,7 +1050,16 @@ impl Ext4 {
             let logical = position / block_size;
             let within = position % block_size;
             let amount = (wanted - done).min((block_size - within) as usize);
-            match self.map_file_block(storage, inode, logical)? {
+            let physical = match extent_tree {
+                Some(tree) => u32::try_from(logical)
+                    .ok()
+                    .and_then(|logical| tree.lookup(logical))
+                    .and_then(|(physical, state)| {
+                        (state == ExtentState::Written).then_some(physical)
+                    }),
+                None => self.map_legacy_block(storage, inode, logical)?,
+            };
+            match physical {
                 Some(physical) => {
                     let disk_offset = physical
                         .checked_mul(block_size)
@@ -1032,8 +1083,13 @@ impl Ext4 {
         if inode.flags & EXTENTS_FL == 0 {
             return self.map_legacy_block(storage, inode, logical);
         }
-        let root = inode.block_map;
-        self.map_extent_node(storage, &root, logical, 0, inode, false)
+        let Ok(logical) = u32::try_from(logical) else {
+            return Ok(None);
+        };
+        Ok(self
+            .load_extent_tree(storage, inode)?
+            .lookup(logical)
+            .and_then(|(physical, state)| (state == ExtentState::Written).then_some(physical)))
     }
 
     fn map_legacy_block(
@@ -1127,111 +1183,33 @@ impl Ext4 {
         }
     }
 
-    fn map_extent_node(
+    fn load_extent_tree(
         &mut self,
         storage: &mut dyn Storage,
-        node: &[u8],
-        logical: u64,
-        traversed: u16,
         inode: &Inode,
-        external: bool,
-    ) -> Result<Option<u64>, Error> {
-        if node.len() < 12 || le16(node, 0) != EXTENT_MAGIC {
-            return Err(Corrupt::InvalidExtentHeader.into());
-        }
-        let entries = usize::from(le16(node, 2));
-        let max = usize::from(le16(node, 4));
-        let depth = le16(node, 6);
-        if depth > 5 || traversed > 5 {
-            return Err(Unsupported::ExtentTreeTooDeep.into());
-        }
-        let capacity = (node.len() - 12) / 12;
-        if entries > max || max > capacity {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        if external && self.superblock.has_metadata_checksums() {
-            let checksum_offset = 12usize
-                .checked_add(max.checked_mul(12).ok_or(Corrupt::AddressOverflow)?)
-                .ok_or(Corrupt::AddressOverflow)?;
-            if checksum_offset + 4 > node.len() {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            let expected = le32(node, checksum_offset);
-            let mut checksum = self.inode_checksum_base(inode);
-            checksum.update(&node[..checksum_offset]);
-            if checksum.finalize() != expected {
-                return Err(Corrupt::ExtentChecksum(inode.number).into());
-            }
-        }
-
-        if depth == 0 {
-            let mut previous = None;
-            for i in 0..entries {
-                let at = 12 + i * 12;
-                let start_logical = u64::from(le32(node, at));
-                if previous.is_some_and(|p| start_logical <= p) {
-                    return Err(Corrupt::InvalidExtentTree.into());
-                }
-                previous = Some(start_logical);
-                let encoded_len = le16(node, at + 4);
-                if encoded_len == 0 {
-                    return Err(Corrupt::InvalidExtentTree.into());
-                }
-                let initialized = encoded_len <= 32768;
-                let len = if initialized {
-                    u64::from(encoded_len)
-                } else {
-                    u64::from(encoded_len - 32768)
-                };
-                if logical >= start_logical && logical - start_logical < len {
-                    if !initialized {
-                        return Ok(None);
-                    }
-                    let physical_start =
-                        u64::from(le32(node, at + 8)) | (u64::from(le16(node, at + 6)) << 32);
-                    let physical = physical_start
-                        .checked_add(logical - start_logical)
-                        .ok_or(Corrupt::AddressOverflow)?;
-                    if physical >= self.superblock.blocks_count {
-                        return Err(Corrupt::ExtentPastEnd.into());
-                    }
-                    return Ok(Some(physical));
-                }
-            }
-            return Ok(None);
-        }
-
-        let mut child = None;
-        let mut previous = None;
-        for i in 0..entries {
-            let at = 12 + i * 12;
-            let start_logical = u64::from(le32(node, at));
-            if previous.is_some_and(|p| start_logical <= p) {
-                return Err(Corrupt::InvalidExtentTree.into());
-            }
-            previous = Some(start_logical);
-            if start_logical <= logical {
-                child = Some(u64::from(le32(node, at + 4)) | (u64::from(le16(node, at + 8)) << 32));
-            } else {
-                break;
-            }
-        }
-        let Some(child) = child else { return Ok(None) };
-        if child == 0 || child >= self.superblock.blocks_count {
-            return Err(Corrupt::ExtentPastEnd.into());
-        }
-        let mut bytes = self.new_block_buffer()?;
-        self.read_storage(
-            storage,
-            child
-                .checked_mul(u64::from(self.superblock.block_size))
-                .ok_or(Corrupt::AddressOverflow)?,
-            &mut bytes,
-        )?;
-        if le16(&bytes, 6).checked_add(1) != Some(depth) {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
-        self.map_extent_node(storage, &bytes, logical, traversed + 1, inode, true)
+    ) -> Result<ExtentTree, Error> {
+        let block_size = self.superblock.block_size as usize;
+        let blocks_count = self.superblock.blocks_count;
+        let identity = ExtentIdentity {
+            checksum_seed: self.superblock.checksum_seed,
+            inode: inode.number,
+            generation: inode.generation,
+            metadata_checksums: self.superblock.has_metadata_checksums(),
+        };
+        ExtentTree::load(
+            &inode.block_map,
+            block_size,
+            blocks_count,
+            identity,
+            &mut |number| {
+                let mut block = self.new_block_buffer()?;
+                let offset = number
+                    .checked_mul(block_size as u64)
+                    .ok_or(Corrupt::AddressOverflow)?;
+                self.read_storage(storage, offset, &mut block)?;
+                Ok(block)
+            },
+        )
     }
 
     fn inode_checksum_base(&self, inode: &Inode) -> checksum::Checksum {

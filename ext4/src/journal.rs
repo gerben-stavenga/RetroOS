@@ -245,12 +245,22 @@ impl Ext4 {
         journal_offsets
             .try_reserve_exact(dirty.len() + 3)
             .map_err(|_| Error::OutOfMemory)?;
+        let journal_extents = if journal.flags & super::EXTENTS_FL != 0 {
+            Some(self.load_extent_tree(storage, &journal)?)
+        } else {
+            None
+        };
         for logical in 0..=commit_logical {
             if logical != 0 && logical < format.first {
                 continue;
             }
-            let physical = self
-                .map_file_block(storage, &journal, u64::from(logical))?
+            let physical = match &journal_extents {
+                Some(tree) => tree
+                    .lookup(logical)
+                    .filter(|(_, state)| *state == super::extent_tree::ExtentState::Written)
+                    .map(|(physical, _)| physical),
+                None => self.map_file_block(storage, &journal, u64::from(logical))?,
+            }
                 .ok_or(Corrupt::InvalidJournal)?;
             if physical >= self.superblock.blocks_count
                 || dirty.iter().any(|block| block.number == physical)
