@@ -688,6 +688,48 @@ impl ExtentTree {
         find(&self.root, logical)
     }
 
+    /// Count unmapped logical blocks in `[start, end)`.
+    #[inline(never)]
+    pub(crate) fn count_holes(&self, start: u64, end: u64) -> Result<usize, Error> {
+        let mut holes = 0usize;
+        for logical in start..end {
+            let logical = u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?;
+            if self.lookup(logical).is_none() {
+                holes = holes.checked_add(1).ok_or(Corrupt::AddressOverflow)?;
+            }
+        }
+        Ok(holes)
+    }
+
+    /// Map every hole in `[start, end)` to the next supplied physical block.
+    /// Existing mappings are preserved and the input must contain exactly one
+    /// block for every hole.
+    #[inline(never)]
+    pub(crate) fn fill_holes(
+        &mut self,
+        start: u64,
+        end: u64,
+        blocks: &[u64],
+        state: ExtentState,
+    ) -> Result<(), Error> {
+        let mut blocks = blocks.iter().copied();
+        for logical in start..end {
+            let logical = u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?;
+            if self.lookup(logical).is_none() {
+                self.insert(Extent::new(
+                    logical,
+                    blocks.next().ok_or(Corrupt::InvalidExtentTree)?,
+                    1,
+                    state,
+                )?)?;
+            }
+        }
+        if blocks.next().is_some() {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        Ok(())
+    }
+
     #[inline(never)]
     pub(crate) fn external_blocks(&self) -> Result<Vec<u64>, Error> {
         fn collect(node: &ExtentNode, out: &mut Vec<u64>) -> Result<(), Error> {
