@@ -40,6 +40,43 @@ const READ_INCOMPAT: u32 = INCOMPAT_FILETYPE
     | INCOMPAT_ENCRYPT
     | INCOMPAT_CASEFOLD;
 
+struct SuperblockCounters {
+    free_blocks: u64,
+    free_inodes: u32,
+}
+
+impl SuperblockCounters {
+    fn decode(bytes: &[u8], wide: bool) -> Self {
+        Self {
+            free_blocks: u64::from(le32(bytes, 0x0c))
+                | if wide {
+                    u64::from(le32(bytes, 0x158)) << 32
+                } else {
+                    0
+                },
+            free_inodes: le32(bytes, 0x10),
+        }
+    }
+
+    fn change(value: &mut u64, amount: u64, max: u64, subtract: bool) -> Result<(), Error> {
+        *value = if subtract {
+            value.checked_sub(amount)
+        } else {
+            value.checked_add(amount).filter(|value| *value <= max)
+        }
+        .ok_or(Corrupt::InvalidFreeBlockCount)?;
+        Ok(())
+    }
+
+    fn encode(&self, bytes: &mut [u8], wide: bool) {
+        put_le32(bytes, 0x0c, self.free_blocks as u32);
+        put_le32(bytes, 0x10, self.free_inodes);
+        if wide {
+            put_le32(bytes, 0x158, (self.free_blocks >> 32) as u32);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Superblock {
     pub inodes_count: u32,
@@ -49,6 +86,8 @@ pub struct Superblock {
     pub blocks_per_group: u32,
     pub inodes_per_group: u32,
     pub inode_size: u16,
+    /// `s_creator_os`; selects the meaning of each inode's opaque OS data.
+    pub creator_os: u32,
     pub(crate) first_inode: u32,
     pub descriptor_size: u16,
     pub feature_compat: u32,
@@ -106,6 +145,7 @@ impl Superblock {
         let inodes_count = le32(b, 0x00);
         let inodes_per_group = le32(b, 0x28);
         let dynamic_revision = le32(b, 0x4c) != 0;
+        let creator_os = le32(b, 0x48);
         let inode_size = if !dynamic_revision {
             128
         } else {
@@ -125,7 +165,7 @@ impl Superblock {
             || inode_size < 128
             || first_inode == 0
             || first_inode > inodes_count
-            || !inode_size.is_multiple_of(4)
+            || !inode_size.is_power_of_two()
             || u32::from(inode_size) > block_size
             || descriptor_size < 32
             || !descriptor_size.is_multiple_of(8)
@@ -195,6 +235,7 @@ impl Superblock {
             blocks_per_group,
             inodes_per_group,
             inode_size,
+            creator_os,
             first_inode,
             descriptor_size,
             feature_compat,
@@ -264,6 +305,7 @@ impl Superblock {
         self.feature_incompat & INCOMPAT_RECOVER != 0
     }
 
+    #[inline(never)]
     pub(crate) fn update_free_counts(
         &self,
         raw: &mut [u8],
@@ -271,39 +313,28 @@ impl Superblock {
         inode: bool,
         allocate: bool,
     ) -> Result<(), Error> {
-        fn change(
-            raw: &mut [u8],
-            offsets: (usize, Option<usize>),
-            amount: u64,
-            max: u64,
-            subtract: bool,
-        ) -> Result<(), Error> {
-            let old = u64::from(le32(raw, offsets.0))
-                | offsets.1.map_or(0, |high| u64::from(le32(raw, high)) << 32);
-            let new = if subtract {
-                old.checked_sub(amount)
-            } else {
-                old.checked_add(amount).filter(|value| *value <= max)
-            }
-            .ok_or(Corrupt::InvalidFreeBlockCount)?;
-            put_le32(raw, offsets.0, new as u32);
-            if let Some(high) = offsets.1 {
-                put_le32(raw, high, (new >> 32) as u32);
-            }
-            Ok(())
-        }
+        let wide = self.feature_incompat & INCOMPAT_64BIT != 0;
+        let mut counters = SuperblockCounters::decode(raw, wide);
         if blocks != 0 {
-            change(
-                raw,
-                (0x0c, Some(0x158)),
+            SuperblockCounters::change(
+                &mut counters.free_blocks,
                 blocks,
                 self.blocks_count,
                 allocate,
             )?;
         }
         if inode {
-            change(raw, (0x10, None), 1, u64::from(self.inodes_count), allocate)?;
+            let mut free_inodes = u64::from(counters.free_inodes);
+            SuperblockCounters::change(
+                &mut free_inodes,
+                1,
+                u64::from(self.inodes_count),
+                allocate,
+            )?;
+            counters.free_inodes =
+                u32::try_from(free_inodes).map_err(|_| Corrupt::InvalidFreeBlockCount)?;
         }
+        counters.encode(raw, wide);
         let mut checksum = Checksum::new();
         checksum.update(&raw[..0x3fc]);
         put_le32(raw, 0x3fc, checksum.finalize());
@@ -317,7 +348,20 @@ impl Superblock {
 /// here. Allocation code deals in group resources rather than raw ext4 bytes.
 pub(crate) struct GroupDescriptor {
     pub(crate) group: u32,
-    bytes: Vec<u8>,
+    pub(crate) block_bitmap: u64,
+    pub(crate) inode_bitmap: u64,
+    pub(crate) inode_table: u64,
+    pub(crate) free_blocks: u32,
+    pub(crate) free_inodes: u32,
+    used_directories: u32,
+    pub(crate) flags: u16,
+    exclude_bitmap: u64,
+    block_bitmap_checksum: u32,
+    inode_bitmap_checksum: u32,
+    inode_table_unused: u32,
+    reserved: [u8; 4],
+    extra: Vec<u8>,
+    wide: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -348,95 +392,87 @@ impl GroupDescriptor {
         {
             return Err(Corrupt::GroupDescriptorChecksum(group).into());
         }
-        Ok(Self { group, bytes })
-    }
-
-    pub(crate) fn bytes(&self) -> &[u8] {
-        &self.bytes
-    }
-
-    fn wide32(&self, low: usize, high: usize) -> u64 {
-        u64::from(le32(&self.bytes, low))
-            | self
-                .bytes
-                .get(high..high + 4)
-                .map_or(0, |bytes| u64::from(le32(bytes, 0)) << 32)
-    }
-
-    fn wide16(&self, low: usize, high: usize) -> u64 {
-        u64::from(le16(&self.bytes, low))
-            | self
-                .bytes
-                .get(high..high + 2)
-                .map_or(0, |bytes| u64::from(le16(bytes, 0)) << 16)
-    }
-
-    fn set_wide16(&mut self, low: usize, high: usize, value: u64) -> Result<(), Error> {
-        if value > u64::from(u32::MAX) || value > u64::from(u16::MAX) && self.bytes.len() < high + 2
-        {
-            return Err(Corrupt::InvalidFreeBlockCount.into());
+        let wide = bytes.len() >= 64;
+        let wide32 = |low, high| {
+            u64::from(le32(&bytes, low))
+                | if wide {
+                    u64::from(le32(&bytes, high)) << 32
+                } else {
+                    0
+                }
+        };
+        let wide16 = |low, high| {
+            u32::from(le16(&bytes, low))
+                | if wide {
+                    u32::from(le16(&bytes, high)) << 16
+                } else {
+                    0
+                }
+        };
+        let mut extra = Vec::new();
+        if bytes.len() > 64 {
+            extra
+                .try_reserve_exact(bytes.len() - 64)
+                .map_err(|_| Error::OutOfMemory)?;
+            extra.extend_from_slice(&bytes[64..]);
         }
-        put_le16(&mut self.bytes, low, value as u16);
-        if self.bytes.len() >= high + 2 {
-            put_le16(&mut self.bytes, high, (value >> 16) as u16);
-        }
-        Ok(())
+        Ok(Self {
+            group,
+            block_bitmap: wide32(0, 0x20),
+            inode_bitmap: wide32(4, 0x24),
+            inode_table: wide32(8, 0x28),
+            free_blocks: wide16(0x0c, 0x2c),
+            free_inodes: wide16(0x0e, 0x2e),
+            used_directories: wide16(0x10, 0x30),
+            flags: le16(&bytes, 0x12),
+            exclude_bitmap: wide32(0x14, 0x34),
+            block_bitmap_checksum: wide16(0x18, 0x38),
+            inode_bitmap_checksum: wide16(0x1a, 0x3a),
+            inode_table_unused: wide16(0x1c, 0x32),
+            reserved: if wide {
+                bytes[0x3c..0x40].try_into().unwrap()
+            } else {
+                [0; 4]
+            },
+            extra,
+            wide,
+        })
     }
 
-    fn decrease(&mut self, field: (usize, usize), amount: u64) -> Result<(), Error> {
-        self.set_wide16(
-            field.0,
-            field.1,
-            self.wide16(field.0, field.1)
+    fn decrease(value: &mut u32, amount: u64) -> Result<(), Error> {
+        *value = u32::try_from(
+            u64::from(*value)
                 .checked_sub(amount)
                 .ok_or(Corrupt::InvalidFreeBlockCount)?,
         )
+        .map_err(|_| Corrupt::InvalidFreeBlockCount)?;
+        Ok(())
     }
 
-    fn increase(&mut self, field: (usize, usize), amount: u64, max: u64) -> Result<(), Error> {
-        let value = self
-            .wide16(field.0, field.1)
-            .checked_add(amount)
-            .filter(|value| *value <= max)
-            .ok_or(Corrupt::InvalidFreeBlockCount)?;
-        self.set_wide16(field.0, field.1, value)
+    fn increase(value: &mut u32, amount: u64, max: u64) -> Result<(), Error> {
+        *value = u32::try_from(
+            u64::from(*value)
+                .checked_add(amount)
+                .filter(|value| *value <= max)
+                .ok_or(Corrupt::InvalidFreeBlockCount)?,
+        )
+        .map_err(|_| Corrupt::InvalidFreeBlockCount)?;
+        Ok(())
     }
 
     pub(crate) fn bitmap(&self, kind: BitmapKind) -> u64 {
-        let (low, high) = match kind {
-            BitmapKind::Block => (0, 0x20),
-            BitmapKind::Inode => (4, 0x24),
-        };
-        self.wide32(low, high)
-    }
-
-    pub(crate) fn inode_table(&self) -> u64 {
-        self.wide32(8, 0x28)
-    }
-
-    pub(crate) fn free_blocks(&self) -> u64 {
-        self.wide16(0x0c, 0x2c)
-    }
-
-    pub(crate) fn free_inodes(&self) -> u64 {
-        self.wide16(0x0e, 0x2e)
-    }
-
-    pub(crate) fn flags(&self) -> u16 {
-        le16(&self.bytes, 0x12)
-    }
-
-    pub(crate) fn clear_flag(&mut self, flag: u16) {
-        let flags = self.flags() & !flag;
-        put_le16(&mut self.bytes, 0x12, flags);
+        match kind {
+            BitmapKind::Block => self.block_bitmap,
+            BitmapKind::Inode => self.inode_bitmap,
+        }
     }
 
     pub(crate) fn allocate_blocks(&mut self, amount: u64) -> Result<(), Error> {
-        self.decrease((0x0c, 0x2c), amount)
+        Self::decrease(&mut self.free_blocks, amount)
     }
 
     pub(crate) fn release_blocks(&mut self, amount: u64, blocks: u64) -> Result<(), Error> {
-        self.increase((0x0c, 0x2c), amount, blocks)
+        Self::increase(&mut self.free_blocks, amount, blocks)
     }
 
     pub(crate) fn allocate_inode(
@@ -445,63 +481,97 @@ impl GroupDescriptor {
         inodes: u64,
         directory: bool,
     ) -> Result<(), Error> {
-        self.decrease((0x0e, 0x2e), 1)?;
-        let unused = self.wide16(0x1c, 0x3c);
+        Self::decrease(&mut self.free_inodes, 1)?;
+        let unused = u64::from(self.inode_table_unused);
         if unused > inodes || index >= inodes {
             return Err(Corrupt::InvalidFreeBlockCount.into());
         }
         let initialized = inodes - unused;
         if index >= initialized {
-            self.set_wide16(0x1c, 0x3c, inodes - index - 1)?;
+            self.inode_table_unused =
+                u32::try_from(inodes - index - 1).map_err(|_| Corrupt::InvalidFreeBlockCount)?;
         }
         if directory {
-            self.increase((0x10, 0x30), 1, inodes)?;
+            Self::increase(&mut self.used_directories, 1, inodes)?;
         }
         Ok(())
     }
 
     pub(crate) fn release_inode(&mut self, inodes: u64, directory: bool) -> Result<(), Error> {
-        self.increase((0x0e, 0x2e), 1, inodes)?;
+        Self::increase(&mut self.free_inodes, 1, inodes)?;
         if directory {
-            let used = self.wide16(0x10, 0x30);
+            let used = u64::from(self.used_directories);
             if used > inodes {
                 return Err(Corrupt::InvalidFreeBlockCount.into());
             }
-            self.decrease((0x10, 0x30), 1)?;
+            Self::decrease(&mut self.used_directories, 1)?;
         }
         Ok(())
     }
 
     pub(crate) fn bitmap_checksum(&self, kind: BitmapKind) -> u32 {
-        let (low, high) = match kind {
-            BitmapKind::Block => (0x18, 0x38),
-            BitmapKind::Inode => (0x1a, 0x3a),
-        };
-        self.wide16(low, high) as u32
-    }
-
-    pub(crate) fn set_bitmap_checksum(&mut self, kind: BitmapKind, checksum: u32) {
-        let (low, high) = match kind {
-            BitmapKind::Block => (0x18, 0x38),
-            BitmapKind::Inode => (0x1a, 0x3a),
-        };
-        put_le16(&mut self.bytes, low, checksum as u16);
-        if self.bytes.len() >= high + 2 {
-            put_le16(&mut self.bytes, high, (checksum >> 16) as u16);
+        match kind {
+            BitmapKind::Block => self.block_bitmap_checksum,
+            BitmapKind::Inode => self.inode_bitmap_checksum,
         }
     }
 
-    pub(crate) fn finish(&mut self, superblock: &Superblock) {
-        put_le16(&mut self.bytes, 0x1e, 0);
+    pub(crate) fn set_bitmap_checksum(&mut self, kind: BitmapKind, checksum: u32) {
+        let value = if self.wide {
+            checksum
+        } else {
+            checksum & 0xffff
+        };
+        match kind {
+            BitmapKind::Block => self.block_bitmap_checksum = value,
+            BitmapKind::Inode => self.inode_bitmap_checksum = value,
+        }
+    }
+
+    pub(crate) fn encoded_len(&self) -> usize {
+        if self.wide { 64 + self.extra.len() } else { 32 }
+    }
+
+    pub(crate) fn encode(&self, superblock: &Superblock, bytes: &mut [u8]) -> Result<(), Error> {
+        if bytes.len() != self.encoded_len() {
+            return Err(Corrupt::InvalidGroup(self.group).into());
+        }
+        bytes.fill(0);
+        put_le32(bytes, 0, self.block_bitmap as u32);
+        put_le32(bytes, 4, self.inode_bitmap as u32);
+        put_le32(bytes, 8, self.inode_table as u32);
+        put_le16(bytes, 0x0c, self.free_blocks as u16);
+        put_le16(bytes, 0x0e, self.free_inodes as u16);
+        put_le16(bytes, 0x10, self.used_directories as u16);
+        put_le16(bytes, 0x12, self.flags);
+        put_le32(bytes, 0x14, self.exclude_bitmap as u32);
+        put_le16(bytes, 0x18, self.block_bitmap_checksum as u16);
+        put_le16(bytes, 0x1a, self.inode_bitmap_checksum as u16);
+        put_le16(bytes, 0x1c, self.inode_table_unused as u16);
+        if self.wide {
+            put_le32(bytes, 0x20, (self.block_bitmap >> 32) as u32);
+            put_le32(bytes, 0x24, (self.inode_bitmap >> 32) as u32);
+            put_le32(bytes, 0x28, (self.inode_table >> 32) as u32);
+            put_le16(bytes, 0x2c, (self.free_blocks >> 16) as u16);
+            put_le16(bytes, 0x2e, (self.free_inodes >> 16) as u16);
+            put_le16(bytes, 0x30, (self.used_directories >> 16) as u16);
+            put_le16(bytes, 0x32, (self.inode_table_unused >> 16) as u16);
+            put_le32(bytes, 0x34, (self.exclude_bitmap >> 32) as u32);
+            put_le16(bytes, 0x38, (self.block_bitmap_checksum >> 16) as u16);
+            put_le16(bytes, 0x3a, (self.inode_bitmap_checksum >> 16) as u16);
+            bytes[0x3c..0x40].copy_from_slice(&self.reserved);
+            bytes[0x40..].copy_from_slice(&self.extra);
+        }
         let checksum = if superblock.has_metadata_checksums() {
             let mut checksum = Checksum::with_seed(superblock.checksum_seed);
             checksum.update_u32_le(self.group);
-            checksum.update(&self.bytes);
+            checksum.update(bytes);
             checksum.finalize() as u16
         } else {
-            legacy_descriptor_checksum(&superblock.uuid, self.group, &self.bytes)
+            legacy_descriptor_checksum(&superblock.uuid, self.group, bytes)
         };
-        put_le16(&mut self.bytes, 0x1e, checksum);
+        put_le16(bytes, 0x1e, checksum);
+        Ok(())
     }
 }
 

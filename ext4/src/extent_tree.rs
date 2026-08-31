@@ -7,8 +7,9 @@
 
 use crate::checksum::Checksum;
 use crate::ondisk::{le16, le32, put_le16, put_le32};
-use crate::{Corrupt, EXTENT_MAGIC, Error, Unsupported};
+use crate::{Corrupt, EXTENT_MAGIC, Error, Unsupported, try_insert, try_push, zeroed_bytes};
 use alloc::vec::Vec;
+use core::ops::Range;
 
 pub(crate) const MAX_DEPTH: u16 = 5;
 pub(crate) const ROOT_CAPACITY: usize = 4;
@@ -28,6 +29,13 @@ pub(crate) struct SerializedNode {
     pub(crate) bytes: Vec<u8>,
 }
 
+type LogicalRange = Range<u64>;
+
+pub(crate) struct Holes {
+    ranges: Vec<LogicalRange>,
+    pub(crate) blocks: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ExtentState {
     Written,
@@ -41,6 +49,169 @@ pub(crate) struct Extent {
     pub(crate) physical: u64,
     pub(crate) length: u32,
     pub(crate) state: ExtentState,
+}
+
+/// One inode-resident extent-tree index record. Unlike an external
+/// [`ExtentNode`], this is only a reference: loading the tree resolves it to
+/// the child node stored in `block`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ExtentIndex {
+    pub(crate) logical: u32,
+    pub(crate) block: u64,
+}
+
+/// The typed contents of the inode's fixed 60-byte extent-tree root.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ExtentRootEntries {
+    Leaf(Vec<Extent>),
+    Branch {
+        depth: u16,
+        indexes: Vec<ExtentIndex>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtentRoot {
+    pub(crate) generation: u32,
+    pub(crate) entries: ExtentRootEntries,
+    padding: Vec<u8>,
+}
+
+impl ExtentRoot {
+    pub(crate) fn empty() -> Self {
+        Self {
+            generation: 0,
+            entries: ExtentRootEntries::Leaf(Vec::new()),
+            padding: alloc::vec![0; ROOT_CAPACITY * 12],
+        }
+    }
+
+    pub(crate) fn single(extent: Extent) -> Self {
+        Self {
+            generation: 0,
+            entries: ExtentRootEntries::Leaf(alloc::vec![extent]),
+            padding: alloc::vec![0; (ROOT_CAPACITY - 1) * 12],
+        }
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let depth = extent_header(bytes, ROOT_CAPACITY)?;
+        if depth > MAX_DEPTH {
+            return Err(Unsupported::ExtentTreeTooDeep.into());
+        }
+        let count = usize::from(le16(bytes, 2));
+        if depth == 0 {
+            let mut extents = Vec::new();
+            extents
+                .try_reserve_exact(count)
+                .map_err(|_| Error::OutOfMemory)?;
+            for index in 0..count {
+                let at = 12 + index * 12;
+                let encoded_length = le16(bytes, at + 4);
+                let (length, state) = if encoded_length <= WRITTEN_MAX_LEN as u16 {
+                    (u32::from(encoded_length), ExtentState::Written)
+                } else {
+                    (
+                        u32::from(encoded_length) - WRITTEN_MAX_LEN,
+                        ExtentState::Unwritten,
+                    )
+                };
+                extents.push(Extent::new(
+                    le32(bytes, at),
+                    u64::from(le32(bytes, at + 8)) | (u64::from(le16(bytes, at + 6)) << 32),
+                    length,
+                    state,
+                )?);
+            }
+            let mut padding = zeroed_bytes(60 - (12 + count * 12))?;
+            padding.copy_from_slice(&bytes[12 + count * 12..60]);
+            Ok(Self {
+                generation: le32(bytes, 8),
+                entries: ExtentRootEntries::Leaf(extents),
+                padding,
+            })
+        } else {
+            let mut indexes = Vec::new();
+            indexes
+                .try_reserve_exact(count)
+                .map_err(|_| Error::OutOfMemory)?;
+            let mut previous = None;
+            for index in 0..count {
+                let at = 12 + index * 12;
+                let logical = le32(bytes, at);
+                if previous.is_some_and(|value| logical <= value) {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                previous = Some(logical);
+                indexes.push(ExtentIndex {
+                    logical,
+                    block: u64::from(le32(bytes, at + 4)) | (u64::from(le16(bytes, at + 8)) << 32),
+                });
+            }
+            let mut padding = zeroed_bytes(60 - (12 + count * 12))?;
+            padding.copy_from_slice(&bytes[12 + count * 12..60]);
+            Ok(Self {
+                generation: le32(bytes, 8),
+                entries: ExtentRootEntries::Branch { depth, indexes },
+                padding,
+            })
+        }
+    }
+
+    pub(crate) fn encode(&self, target: &mut [u8]) -> Result<(), Error> {
+        if target.len() < 60 {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        target.fill(0);
+        put_le16(target, 0, EXTENT_MAGIC);
+        put_le16(target, 4, ROOT_CAPACITY as u16);
+        put_le32(target, 8, self.generation);
+        match &self.entries {
+            ExtentRootEntries::Leaf(extents) => {
+                if extents.len() > ROOT_CAPACITY {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                put_le16(target, 2, extents.len() as u16);
+                for (index, extent) in extents.iter().enumerate() {
+                    let at = 12 + index * 12;
+                    let length = match extent.state {
+                        ExtentState::Written => extent.length,
+                        ExtentState::Unwritten => extent.length + WRITTEN_MAX_LEN,
+                    };
+                    put_le32(target, at, extent.logical);
+                    put_le16(target, at + 4, length as u16);
+                    put_le16(target, at + 6, (extent.physical >> 32) as u16);
+                    put_le32(target, at + 8, extent.physical as u32);
+                }
+                if self.padding.len() != (ROOT_CAPACITY - extents.len()) * 12 {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                target[12 + extents.len() * 12..].copy_from_slice(&self.padding);
+            }
+            ExtentRootEntries::Branch { depth, indexes } => {
+                if *depth == 0
+                    || *depth > MAX_DEPTH
+                    || indexes.is_empty()
+                    || indexes.len() > ROOT_CAPACITY
+                {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                put_le16(target, 2, indexes.len() as u16);
+                put_le16(target, 6, *depth);
+                for (index, entry) in indexes.iter().enumerate() {
+                    let at = 12 + index * 12;
+                    put_le32(target, at, entry.logical);
+                    put_le32(target, at + 4, entry.block as u32);
+                    put_le16(target, at + 8, (entry.block >> 32) as u16);
+                }
+                if self.padding.len() != (ROOT_CAPACITY - indexes.len()) * 12 {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                target[12 + indexes.len() * 12..].copy_from_slice(&self.padding);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Extent {
@@ -196,15 +367,6 @@ impl ExtentNode {
         Ok(())
     }
 
-    fn overlaps(&self, start: u64, end: u64) -> bool {
-        match &self.entries {
-            NodeEntries::Leaf(extents) => extents.iter().any(|extent| extent.overlaps(start, end)),
-            NodeEntries::Branch(children) => {
-                children.iter().any(|child| child.overlaps(start, end))
-            }
-        }
-    }
-
     #[inline(never)]
     fn insert(
         &mut self,
@@ -217,8 +379,17 @@ impl ExtentNode {
                 let position = extents
                     .binary_search_by_key(&extent.logical, |entry| entry.logical)
                     .unwrap_or_else(|position| position);
-                extents.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                extents.insert(position, extent);
+                if position
+                    .checked_sub(1)
+                    .and_then(|left| extents.get(left))
+                    .is_some_and(|left| left.logical_end() > u64::from(extent.logical))
+                    || extents
+                        .get(position)
+                        .is_some_and(|right| u64::from(right.logical) < extent.logical_end())
+                {
+                    return Err(Corrupt::InvalidExtentTree.into());
+                }
+                try_insert(extents, position, extent)?;
                 merge_leaf(extents);
                 self.dirty = true;
             }
@@ -232,26 +403,12 @@ impl ExtentNode {
                     .saturating_sub(1);
                 let promoted = children[position].insert(extent, block_capacity, block_capacity)?;
                 if let Some(promoted) = promoted {
-                    children.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                    children.insert(position + 1, promoted);
+                    try_insert(children, position + 1, promoted)?;
                 }
                 self.dirty = true;
             }
         }
-        if self.entry_count() <= capacity {
-            return Ok(None);
-        }
-        let sibling_entries = match &mut self.entries {
-            NodeEntries::Leaf(extents) => NodeEntries::Leaf(extents.split_off(extents.len() / 2)),
-            NodeEntries::Branch(children) => {
-                NodeEntries::Branch(children.split_off(children.len() / 2))
-            }
-        };
-        Ok(Some(Self {
-            location: NodeLocation::Unassigned,
-            dirty: true,
-            entries: sibling_entries,
-        }))
+        Ok(self.split_overflow(capacity))
     }
 
     #[inline(never)]
@@ -276,34 +433,14 @@ impl ExtentNode {
                         continue;
                     }
                     changed = true;
-                    let extent_start = u64::from(extent.logical);
-                    let extent_end = extent.logical_end();
-                    let middle_start = start.max(extent_start);
-                    let middle_end = end.min(extent_end);
-                    if extent_start < middle_start {
-                        output.push(Extent {
-                            length: u32::try_from(middle_start - extent_start)
-                                .map_err(|_| Corrupt::InvalidExtentTree)?,
-                            ..extent
-                        });
+                    let (before, mut middle, after) = split_extent(extent, start, end);
+                    if let Some(before) = before {
+                        output.push(before);
                     }
-                    output.push(Extent {
-                        logical: u32::try_from(middle_start)
-                            .map_err(|_| Corrupt::InvalidExtentTree)?,
-                        physical: extent.physical + (middle_start - extent_start),
-                        length: u32::try_from(middle_end - middle_start)
-                            .map_err(|_| Corrupt::InvalidExtentTree)?,
-                        state,
-                    });
-                    if middle_end < extent_end {
-                        output.push(Extent {
-                            logical: u32::try_from(middle_end)
-                                .map_err(|_| Corrupt::InvalidExtentTree)?,
-                            physical: extent.physical + (middle_end - extent_start),
-                            length: u32::try_from(extent_end - middle_end)
-                                .map_err(|_| Corrupt::InvalidExtentTree)?,
-                            state: extent.state,
-                        });
+                    middle.state = state;
+                    output.push(middle);
+                    if let Some(after) = after {
+                        output.push(after);
                     }
                 }
                 merge_leaf(&mut output);
@@ -312,8 +449,16 @@ impl ExtentNode {
             }
             NodeEntries::Branch(children) => {
                 let mut changed = false;
-                let mut index = 0;
+                let mut index = child_at(children, start);
                 while index < children.len() {
+                    if u64::from(
+                        children[index]
+                            .first_logical()
+                            .ok_or(Corrupt::InvalidExtentTree)?,
+                    ) >= end
+                    {
+                        break;
+                    }
                     let was_dirty = children[index].dirty;
                     let sibling = children[index].set_state_range(
                         start,
@@ -324,8 +469,7 @@ impl ExtentNode {
                     )?;
                     changed |= children[index].dirty != was_dirty || sibling.is_some();
                     if let Some(sibling) = sibling {
-                        children.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                        children.insert(index + 1, sibling);
+                        try_insert(children, index + 1, sibling)?;
                         index += 1;
                     }
                     index += 1;
@@ -334,20 +478,7 @@ impl ExtentNode {
             }
         };
         self.dirty |= changed;
-        if self.entry_count() <= capacity {
-            return Ok(None);
-        }
-        let sibling_entries = match &mut self.entries {
-            NodeEntries::Leaf(extents) => NodeEntries::Leaf(extents.split_off(extents.len() / 2)),
-            NodeEntries::Branch(children) => {
-                NodeEntries::Branch(children.split_off(children.len() / 2))
-            }
-        };
-        Ok(Some(Self {
-            location: NodeLocation::Unassigned,
-            dirty: true,
-            entries: sibling_entries,
-        }))
+        Ok(self.split_overflow(capacity))
     }
 
     fn entry_count(&self) -> usize {
@@ -355,6 +486,24 @@ impl ExtentNode {
             NodeEntries::Leaf(extents) => extents.len(),
             NodeEntries::Branch(children) => children.len(),
         }
+    }
+
+    #[inline(never)]
+    fn split_overflow(&mut self, capacity: usize) -> Option<Self> {
+        if self.entry_count() <= capacity {
+            return None;
+        }
+        let entries = match &mut self.entries {
+            NodeEntries::Leaf(extents) => NodeEntries::Leaf(extents.split_off(extents.len() / 2)),
+            NodeEntries::Branch(children) => {
+                NodeEntries::Branch(children.split_off(children.len() / 2))
+            }
+        };
+        Some(Self {
+            location: NodeLocation::Unassigned,
+            dirty: true,
+            entries,
+        })
     }
 
     #[inline(never)]
@@ -369,8 +518,16 @@ impl ExtentNode {
             NodeEntries::Leaf(extents) => remove_from_leaf(extents, start, end, removed_extents)?,
             NodeEntries::Branch(children) => {
                 let mut changed = false;
-                let mut index = 0;
+                let mut index = child_at(children, start);
                 while index < children.len() {
+                    if u64::from(
+                        children[index]
+                            .first_logical()
+                            .ok_or(Corrupt::InvalidExtentTree)?,
+                    ) >= end
+                    {
+                        break;
+                    }
                     changed |= children[index].remove_range(
                         start,
                         end,
@@ -420,13 +577,15 @@ impl ExtentNode {
 pub(crate) struct ExtentTree {
     pub(crate) root: ExtentNode,
     block_capacity: usize,
-    released_nodes: Vec<u64>,
+    pub(crate) released_nodes: Vec<u64>,
+    root_generation: u32,
+    root_padding: Vec<u8>,
 }
 
 impl ExtentTree {
     #[inline(never)]
     pub(crate) fn load(
-        root: &[u8],
+        root: &ExtentRoot,
         block_size: usize,
         blocks_count: u64,
         identity: ExtentIdentity,
@@ -439,13 +598,20 @@ impl ExtentTree {
         if block_capacity <= ROOT_CAPACITY {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        let depth = extent_header(root, ROOT_CAPACITY)?;
+        let root_generation = root.generation;
+        let root_padding = root.padding.clone();
+        let depth = match &root.entries {
+            ExtentRootEntries::Leaf(_) => 0,
+            ExtentRootEntries::Branch { depth, .. } => *depth,
+        };
         if depth > MAX_DEPTH {
             return Err(Unsupported::ExtentTreeTooDeep.into());
         }
+        let mut root_bytes = [0; 60];
+        root.encode(&mut root_bytes)?;
         let mut visited = Vec::new();
         let root = load_node(
-            root,
+            &root_bytes,
             NodeLocation::Root,
             depth,
             ROOT_CAPACITY,
@@ -455,7 +621,9 @@ impl ExtentTree {
             &mut visited,
             read_block,
         )?;
-        let tree = Self::new(root, block_capacity)?;
+        let mut tree = Self::new(root, block_capacity)?;
+        tree.root_generation = root_generation;
+        tree.root_padding = root_padding;
         let extents = tree.data_extents()?;
         for (index, extent) in extents.iter().enumerate() {
             if index != 0 && u64::from(extent.logical) < extents[index - 1].logical_end() {
@@ -490,42 +658,25 @@ impl ExtentTree {
             root,
             block_capacity,
             released_nodes: Vec::new(),
+            root_generation: 0,
+            root_padding: alloc::vec![0; ROOT_CAPACITY * 12],
         })
     }
 
+    /// Insert allocator-owned physical blocks. The loaded tree was already
+    /// validated and the allocator guarantees physical uniqueness; rescanning
+    /// every physical extent here would turn keyed insertion into O(n).
+    /// Logical overlap is rejected at the destination leaf.
     #[inline(never)]
     pub(crate) fn insert(&mut self, extent: Extent) -> Result<(), Error> {
         Extent::new(extent.logical, extent.physical, extent.length, extent.state)?;
-        if self
-            .root
-            .overlaps(u64::from(extent.logical), extent.logical_end())
-            || node_overlaps_data(&self.root, extent.physical, u64::from(extent.length))
-            || node_overlaps_block_range(&self.root, extent.physical, u64::from(extent.length))
-        {
-            return Err(Corrupt::InvalidExtentTree.into());
-        }
         let sibling = self
             .root
             .insert(extent, self.block_capacity, self.block_capacity)?;
         if sibling.is_some() {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        if self.root.entry_count() > ROOT_CAPACITY {
-            let mut old_root = core::mem::replace(
-                &mut self.root,
-                ExtentNode::leaf(NodeLocation::Root, Vec::new()),
-            );
-            old_root.location = NodeLocation::Unassigned;
-            self.root = ExtentNode {
-                location: NodeLocation::Root,
-                dirty: true,
-                entries: NodeEntries::Branch(alloc::vec![old_root]),
-            };
-        }
-        if self.root.depth() > MAX_DEPTH {
-            return Err(Unsupported::ExtentTreeTooDeep.into());
-        }
-        Ok(())
+        self.finish_growth()
     }
 
     /// Remove mappings in `[start, end)`, trimming or splitting boundary
@@ -552,10 +703,7 @@ impl ExtentTree {
             }
             let mut child = children.remove(0);
             if let NodeLocation::Block(block) = child.location {
-                self.released_nodes
-                    .try_reserve(1)
-                    .map_err(|_| Error::OutOfMemory)?;
-                self.released_nodes.push(block);
+                try_push(&mut self.released_nodes, block)?;
             }
             child.location = NodeLocation::Root;
             child.dirty = true;
@@ -575,7 +723,7 @@ impl ExtentTree {
         end: u64,
         state: ExtentState,
     ) -> Result<(), Error> {
-        if start >= end || !node_has_different_state(&self.root, start, end, state) {
+        if start >= end {
             return Ok(());
         }
         let sibling = self.root.set_state_range(
@@ -588,6 +736,11 @@ impl ExtentTree {
         if sibling.is_some() {
             return Err(Corrupt::InvalidExtentTree.into());
         }
+        self.finish_growth()
+    }
+
+    #[inline(never)]
+    fn finish_growth(&mut self) -> Result<(), Error> {
         if self.root.entry_count() > ROOT_CAPACITY {
             let mut old_root = core::mem::replace(
                 &mut self.root,
@@ -640,10 +793,6 @@ impl ExtentTree {
         Ok(())
     }
 
-    pub(crate) fn released_blocks(&self) -> &[u64] {
-        &self.released_nodes
-    }
-
     #[inline(never)]
     pub(crate) fn data_extents(&self) -> Result<Vec<Extent>, Error> {
         fn collect(node: &ExtentNode, out: &mut Vec<Extent>) -> Result<(), Error> {
@@ -664,6 +813,68 @@ impl ExtentTree {
         let mut extents = Vec::new();
         collect(&self.root, &mut extents)?;
         Ok(extents)
+    }
+
+    #[inline(never)]
+    pub(crate) fn stats(&self) -> Result<(u64, u64), Error> {
+        fn collect(
+            node: &ExtentNode,
+            logical_end: &mut u64,
+            blocks: &mut u64,
+        ) -> Result<(), Error> {
+            *blocks = blocks
+                .checked_add(u64::from(node.location != NodeLocation::Root))
+                .ok_or(Corrupt::AddressOverflow)?;
+            match &node.entries {
+                NodeEntries::Leaf(extents) => {
+                    for extent in extents {
+                        *logical_end = extent.logical_end();
+                        *blocks = blocks
+                            .checked_add(u64::from(extent.length))
+                            .ok_or(Corrupt::AddressOverflow)?;
+                    }
+                }
+                NodeEntries::Branch(children) => {
+                    for child in children {
+                        collect(child, logical_end, blocks)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        let mut logical_end = 0;
+        let mut blocks = 0;
+        collect(&self.root, &mut logical_end, &mut blocks)?;
+        Ok((logical_end, blocks))
+    }
+
+    #[inline(never)]
+    pub(crate) fn visit_owned_ranges(
+        &self,
+        visit: &mut dyn FnMut(u64, u64) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        fn walk(
+            node: &ExtentNode,
+            visit: &mut dyn FnMut(u64, u64) -> Result<(), Error>,
+        ) -> Result<(), Error> {
+            if let NodeLocation::Block(number) = node.location {
+                visit(number, 1)?;
+            }
+            match &node.entries {
+                NodeEntries::Leaf(extents) => {
+                    for extent in extents {
+                        visit(extent.physical, u64::from(extent.length))?;
+                    }
+                }
+                NodeEntries::Branch(children) => {
+                    for child in children {
+                        walk(child, visit)?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        walk(&self.root, visit)
     }
 
     pub(crate) fn lookup(&self, logical: u32) -> Option<(u64, ExtentState)> {
@@ -688,70 +899,105 @@ impl ExtentTree {
         find(&self.root, logical)
     }
 
-    /// Count unmapped logical blocks in `[start, end)`.
+    /// Return the unmapped runs in `[start, end)` by walking only the keyed
+    /// branch range that can intersect it.
     #[inline(never)]
-    pub(crate) fn count_holes(&self, start: u64, end: u64) -> Result<usize, Error> {
-        let mut holes = 0usize;
-        for logical in start..end {
-            let logical = u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?;
-            if self.lookup(logical).is_none() {
-                holes = holes.checked_add(1).ok_or(Corrupt::AddressOverflow)?;
-            }
+    pub(crate) fn holes(&self, start: u64, end: u64) -> Result<Holes, Error> {
+        if start > end || end > 1_u64 << 32 {
+            return Err(Corrupt::AddressOverflow.into());
         }
+        let mut holes = Holes {
+            ranges: Vec::new(),
+            blocks: 0,
+        };
+        let mut cursor = start;
+        collect_holes(&self.root, &mut cursor, end, &mut holes)?;
+        push_hole(&mut holes, cursor, end)?;
         Ok(holes)
     }
 
-    /// Map every hole in `[start, end)` to the next supplied physical block.
-    /// Existing mappings are preserved and the input must contain exactly one
-    /// block for every hole.
+    /// Map previously discovered holes to allocator-owned blocks, coalescing
+    /// adjacent physical blocks into the largest legal extent records.
     #[inline(never)]
     pub(crate) fn fill_holes(
         &mut self,
-        start: u64,
-        end: u64,
+        holes: &Holes,
         blocks: &[u64],
         state: ExtentState,
     ) -> Result<(), Error> {
-        let mut blocks = blocks.iter().copied();
-        for logical in start..end {
-            let logical = u32::try_from(logical).map_err(|_| Corrupt::AddressOverflow)?;
-            if self.lookup(logical).is_none() {
-                self.insert(Extent::new(
-                    logical,
-                    blocks.next().ok_or(Corrupt::InvalidExtentTree)?,
-                    1,
-                    state,
-                )?)?;
-            }
-        }
-        if blocks.next().is_some() {
+        if blocks.len() != holes.blocks {
             return Err(Corrupt::InvalidExtentTree.into());
         }
+        let max_length = match state {
+            ExtentState::Written => WRITTEN_MAX_LEN,
+            ExtentState::Unwritten => UNWRITTEN_MAX_LEN,
+        } as usize;
+        let mut block = 0usize;
+        for hole in &holes.ranges {
+            let length =
+                usize::try_from(hole.end - hole.start).map_err(|_| Corrupt::AddressOverflow)?;
+            let mut offset = 0usize;
+            while offset < length {
+                let physical = *blocks.get(block).ok_or(Corrupt::InvalidExtentTree)?;
+                let mut run = 1usize;
+                while run < max_length
+                    && offset + run < length
+                    && blocks.get(block + run).copied() == physical.checked_add(run as u64)
+                {
+                    run += 1;
+                }
+                self.insert(Extent::new(
+                    u32::try_from(hole.start + offset as u64)
+                        .map_err(|_| Corrupt::AddressOverflow)?,
+                    physical,
+                    run as u32,
+                    state,
+                )?)?;
+                offset += run;
+                block += run;
+            }
+        }
+        debug_assert_eq!(block, blocks.len());
         Ok(())
     }
 
-    #[inline(never)]
-    pub(crate) fn external_blocks(&self) -> Result<Vec<u64>, Error> {
-        fn collect(node: &ExtentNode, out: &mut Vec<u64>) -> Result<(), Error> {
-            if let NodeLocation::Block(number) = node.location {
-                out.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                out.push(number);
-            }
-            if let NodeEntries::Branch(children) = &node.entries {
+    pub(crate) fn root_record(&self) -> Result<ExtentRoot, Error> {
+        let entries = match &self.root.entries {
+            NodeEntries::Leaf(extents) => ExtentRootEntries::Leaf(extents.clone()),
+            NodeEntries::Branch(children) => {
+                let mut indexes = Vec::new();
+                indexes
+                    .try_reserve_exact(children.len())
+                    .map_err(|_| Error::OutOfMemory)?;
                 for child in children {
-                    collect(child, out)?;
+                    let NodeLocation::Block(block) = child.location else {
+                        return Err(Corrupt::InvalidExtentTree.into());
+                    };
+                    indexes.push(ExtentIndex {
+                        logical: child.first_logical().ok_or(Corrupt::InvalidExtentTree)?,
+                        block,
+                    });
+                }
+                ExtentRootEntries::Branch {
+                    depth: self.root.depth(),
+                    indexes,
                 }
             }
-            Ok(())
-        }
-
-        let mut blocks = Vec::new();
-        collect(&self.root, &mut blocks)?;
-        Ok(blocks)
-    }
-
-    pub(crate) fn write_root(&self, target: &mut [u8]) -> Result<(), Error> {
-        write_node(target, &self.root, ROOT_CAPACITY)
+        };
+        let count = match &entries {
+            ExtentRootEntries::Leaf(extents) => extents.len(),
+            ExtentRootEntries::Branch { indexes, .. } => indexes.len(),
+        };
+        let padding = if self.root_padding.len() == (ROOT_CAPACITY - count) * 12 {
+            self.root_padding.clone()
+        } else {
+            alloc::vec![0; (ROOT_CAPACITY - count) * 12]
+        };
+        Ok(ExtentRoot {
+            generation: self.root_generation,
+            entries,
+            padding,
+        })
     }
 
     #[inline(never)]
@@ -771,11 +1017,7 @@ impl ExtentTree {
                 let NodeLocation::Block(number) = node.location else {
                     return Err(Corrupt::InvalidExtentTree.into());
                 };
-                let mut bytes = Vec::new();
-                bytes
-                    .try_reserve_exact(block_size)
-                    .map_err(|_| Error::OutOfMemory)?;
-                bytes.resize(block_size, 0);
+                let mut bytes = zeroed_bytes(block_size)?;
                 write_node(&mut bytes, node, capacity)?;
                 if identity.metadata_checksums {
                     let checksum_offset = 12 + capacity * 12;
@@ -785,8 +1027,7 @@ impl ExtentTree {
                     checksum.update(&bytes[..checksum_offset]);
                     put_le32(&mut bytes, checksum_offset, checksum.finalize());
                 }
-                out.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                out.push(SerializedNode { number, bytes });
+                try_push(out, SerializedNode { number, bytes })?;
             }
             if let NodeEntries::Branch(children) = &node.entries {
                 for child in children {
@@ -892,8 +1133,7 @@ fn load_node(
         if number == 0 || number >= blocks_count || visited.contains(&number) {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        visited.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        visited.push(number);
+        try_push(visited, number)?;
         let child_bytes = read_block(number)?;
         if child_bytes.len() != 12 + block_capacity * 12 + 4 {
             return Err(Corrupt::InvalidExtentTree.into());
@@ -1006,6 +1246,31 @@ fn merge_leaf(extents: &mut Vec<Extent>) {
     }
 }
 
+fn split_extent(extent: Extent, start: u64, end: u64) -> (Option<Extent>, Extent, Option<Extent>) {
+    debug_assert!(extent.overlaps(start, end));
+    let extent_start = u64::from(extent.logical);
+    let extent_end = extent.logical_end();
+    let middle_start = start.max(extent_start);
+    let middle_end = end.min(extent_end);
+    let before = (extent_start < middle_start).then(|| Extent {
+        length: (middle_start - extent_start) as u32,
+        ..extent
+    });
+    let middle = Extent {
+        logical: middle_start as u32,
+        physical: extent.physical + middle_start - extent_start,
+        length: (middle_end - middle_start) as u32,
+        state: extent.state,
+    };
+    let after = (middle_end < extent_end).then(|| Extent {
+        logical: middle_end as u32,
+        physical: extent.physical + middle_end - extent_start,
+        length: (extent_end - middle_end) as u32,
+        state: extent.state,
+    });
+    (before, middle, after)
+}
+
 #[inline(never)]
 fn remove_from_leaf(
     extents: &mut Vec<Extent>,
@@ -1024,34 +1289,13 @@ fn remove_from_leaf(
             continue;
         }
         changed = true;
-        let extent_end = extent.logical_end();
-        let removed_start = start.max(u64::from(extent.logical));
-        let removed_end = end.min(extent_end);
-        removed_extents
-            .try_reserve(1)
-            .map_err(|_| Error::OutOfMemory)?;
-        removed_extents.push(Extent {
-            logical: u32::try_from(removed_start).map_err(|_| Corrupt::InvalidExtentTree)?,
-            physical: extent.physical + (removed_start - u64::from(extent.logical)),
-            length: u32::try_from(removed_end - removed_start)
-                .map_err(|_| Corrupt::InvalidExtentTree)?,
-            state: extent.state,
-        });
-        if u64::from(extent.logical) < start {
-            output.push(Extent {
-                length: u32::try_from(start - u64::from(extent.logical))
-                    .map_err(|_| Corrupt::InvalidExtentTree)?,
-                ..extent
-            });
+        let (before, removed, after) = split_extent(extent, start, end);
+        try_push(removed_extents, removed)?;
+        if let Some(before) = before {
+            output.push(before);
         }
-        if end < extent_end {
-            let skipped = end - u64::from(extent.logical);
-            output.push(Extent {
-                logical: u32::try_from(end).map_err(|_| Corrupt::InvalidExtentTree)?,
-                physical: extent.physical + skipped,
-                length: u32::try_from(extent_end - end).map_err(|_| Corrupt::InvalidExtentTree)?,
-                state: extent.state,
-            });
+        if let Some(after) = after {
+            output.push(after);
         }
     }
     merge_leaf(&mut output);
@@ -1061,13 +1305,70 @@ fn remove_from_leaf(
 
 fn collect_blocks(node: ExtentNode, blocks: &mut Vec<u64>) -> Result<(), Error> {
     if let NodeLocation::Block(block) = node.location {
-        blocks.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-        blocks.push(block);
+        try_push(blocks, block)?;
     }
     if let NodeEntries::Branch(children) = node.entries {
         for child in children {
             collect_blocks(child, blocks)?;
         }
+    }
+    Ok(())
+}
+
+fn child_at(children: &[ExtentNode], logical: u64) -> usize {
+    children
+        .partition_point(|child| {
+            child
+                .first_logical()
+                .is_some_and(|first| u64::from(first) <= logical)
+        })
+        .saturating_sub(1)
+}
+
+fn collect_holes(
+    node: &ExtentNode,
+    cursor: &mut u64,
+    end: u64,
+    holes: &mut Holes,
+) -> Result<(), Error> {
+    match &node.entries {
+        NodeEntries::Leaf(extents) => {
+            for extent in extents {
+                if extent.logical_end() <= *cursor {
+                    continue;
+                }
+                let logical = u64::from(extent.logical);
+                if logical >= end {
+                    break;
+                }
+                push_hole(holes, *cursor, logical.min(end))?;
+                *cursor = extent.logical_end().min(end);
+            }
+        }
+        NodeEntries::Branch(children) => {
+            let mut index = child_at(children, *cursor);
+            while index < children.len() && *cursor < end {
+                let first = children[index]
+                    .first_logical()
+                    .ok_or(Corrupt::InvalidExtentTree)?;
+                if u64::from(first) >= end {
+                    break;
+                }
+                collect_holes(&children[index], cursor, end, holes)?;
+                index += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn push_hole(holes: &mut Holes, start: u64, end: u64) -> Result<(), Error> {
+    if start < end {
+        holes.blocks = holes
+            .blocks
+            .checked_add(usize::try_from(end - start).map_err(|_| Corrupt::AddressOverflow)?)
+            .ok_or(Corrupt::AddressOverflow)?;
+        try_push(&mut holes.ranges, start..end)?;
     }
     Ok(())
 }
@@ -1091,41 +1392,6 @@ fn node_contains_data_block(node: &ExtentNode, number: u64) -> bool {
         NodeEntries::Branch(children) => children
             .iter()
             .any(|child| node_contains_data_block(child, number)),
-    }
-}
-
-fn node_overlaps_data(node: &ExtentNode, physical: u64, length: u64) -> bool {
-    let end = physical.saturating_add(length);
-    match &node.entries {
-        NodeEntries::Leaf(extents) => extents.iter().any(|extent| {
-            physical < extent.physical.saturating_add(u64::from(extent.length))
-                && extent.physical < end
-        }),
-        NodeEntries::Branch(children) => children
-            .iter()
-            .any(|child| node_overlaps_data(child, physical, length)),
-    }
-}
-
-fn node_overlaps_block_range(node: &ExtentNode, physical: u64, length: u64) -> bool {
-    let end = physical.saturating_add(length);
-    matches!(node.location, NodeLocation::Block(block) if physical <= block && block < end)
-        || match &node.entries {
-            NodeEntries::Leaf(_) => false,
-            NodeEntries::Branch(children) => children
-                .iter()
-                .any(|child| node_overlaps_block_range(child, physical, length)),
-        }
-}
-
-fn node_has_different_state(node: &ExtentNode, start: u64, end: u64, state: ExtentState) -> bool {
-    match &node.entries {
-        NodeEntries::Leaf(extents) => extents
-            .iter()
-            .any(|extent| extent.state != state && extent.overlaps(start, end)),
-        NodeEntries::Branch(children) => children
-            .iter()
-            .any(|child| node_has_different_state(child, start, end, state)),
     }
 }
 
@@ -1214,7 +1480,7 @@ mod tests {
         assert_eq!(tree.root.depth(), 0);
         assert_eq!(tree.root.location, NodeLocation::Root);
         assert_eq!(tree.extents(), vec![extent(10, 200, 2)]);
-        assert_eq!(tree.released_blocks(), &[10, 11]);
+        assert_eq!(tree.released_nodes, [10, 11]);
     }
 
     #[test]
@@ -1233,8 +1499,7 @@ mod tests {
             generation: 7,
             metadata_checksums: true,
         };
-        let mut root = [0u8; 60];
-        tree.write_root(&mut root).unwrap();
+        let root = tree.root_record().unwrap();
         let serialized = tree.serialize_dirty(112, identity).unwrap();
         let loaded = ExtentTree::load(&root, 112, 10_000, identity, &mut |number| {
             serialized

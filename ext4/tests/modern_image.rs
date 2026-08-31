@@ -3156,11 +3156,12 @@ fn detects_superblock_group_inode_and_directory_corruption() {
         .find(|effect| effect.len == 64)
         .unwrap()
         .offset as usize;
-    let root_inode = effects
+    let root_inode_block = effects
         .iter()
-        .find(|effect| effect.len == 256)
+        .find(|effect| effect.len == 4096)
         .unwrap()
         .offset as usize;
+    let root_inode = root_inode_block + 256;
 
     let mut bad_group = image();
     bad_group[group_descriptor + 12] ^= 1;
@@ -3187,7 +3188,7 @@ fn detects_superblock_group_inode_and_directory_corruption() {
     let directory_block = probe_storage
         .effects()
         .iter()
-        .find(|effect| effect.len == block_size)
+        .find(|effect| effect.len == block_size && effect.offset as usize != root_inode_block)
         .unwrap()
         .offset as usize;
     let mut bad_directory = image();

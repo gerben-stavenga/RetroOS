@@ -7,7 +7,10 @@
 use crate::checksum::Checksum;
 use crate::ondisk;
 use crate::transaction::DirtyBlock;
-use crate::{Corrupt, Error, Ext4, Inode, Storage, Unsupported};
+use crate::{
+    Corrupt, Error, Ext4, Inode, InodeBlocks, Storage, Unsupported, copy_bytes, try_insert,
+    try_push,
+};
 use alloc::vec::Vec;
 
 const MAGIC: u32 = 0xc03b_3998;
@@ -94,6 +97,123 @@ struct Tag {
     checksum: u32,
 }
 
+struct Tags<'a> {
+    format: Format,
+    bytes: &'a [u8],
+    cursor: usize,
+    end: usize,
+    have_uuid: bool,
+    finished: bool,
+}
+
+impl<'a> Tags<'a> {
+    fn new(format: Format, bytes: &'a [u8]) -> Self {
+        Self {
+            format,
+            bytes,
+            cursor: 12,
+            end: bytes.len() - usize::from(format.has_checksums()) * 4,
+            have_uuid: false,
+            finished: false,
+        }
+    }
+
+    #[inline(never)]
+    fn next(&mut self) -> Result<Option<Tag>, Error> {
+        if self.finished {
+            return Ok(None);
+        }
+        let tag_len = self.format.tag_len();
+        if self.cursor + tag_len > self.end {
+            return Err(Corrupt::InvalidJournal.into());
+        }
+        let low = u64::from(be32(self.bytes, self.cursor));
+        let (flags, checksum, high) = if self.format.csum_v3() {
+            (
+                be32(self.bytes, self.cursor + 4),
+                be32(self.bytes, self.cursor + 12),
+                be32(self.bytes, self.cursor + 8),
+            )
+        } else {
+            (
+                u32::from(be16(self.bytes, self.cursor + 6)),
+                u32::from(be16(self.bytes, self.cursor + 4)),
+                if self.format.is_64bit() {
+                    be32(self.bytes, self.cursor + 8)
+                } else {
+                    0
+                },
+            )
+        };
+        if flags & !KNOWN_FLAGS != 0 {
+            return Err(Corrupt::InvalidJournal.into());
+        }
+        self.cursor += tag_len;
+        if flags & FLAG_SAME_UUID == 0 {
+            if self.cursor + 16 > self.end
+                || self.bytes[self.cursor..self.cursor + 16] != self.format.uuid
+            {
+                return Err(Corrupt::InvalidJournal.into());
+            }
+            self.cursor += 16;
+            self.have_uuid = true;
+        } else if !self.have_uuid {
+            return Err(Corrupt::InvalidJournal.into());
+        }
+        self.finished = flags & FLAG_LAST != 0;
+        Ok(Some(Tag {
+            target: low | (u64::from(high) << 32),
+            flags,
+            checksum,
+        }))
+    }
+}
+
+struct Journal {
+    inode: Inode,
+    blocks: InodeBlocks,
+}
+
+impl Journal {
+    #[inline(never)]
+    fn open(filesystem: &mut Ext4, storage: &mut dyn Storage) -> Result<Self, Error> {
+        let inode = filesystem.load_inode(storage, filesystem.superblock.journal_inode)?;
+        if inode.mode & 0xf000 != 0x8000 {
+            return Err(Corrupt::InvalidJournal.into());
+        }
+        let blocks = InodeBlocks::open(filesystem, storage, &inode)?;
+        Ok(Self { inode, blocks })
+    }
+
+    fn physical(
+        &self,
+        filesystem: &mut Ext4,
+        storage: &mut dyn Storage,
+        logical: u32,
+    ) -> Result<u64, Error> {
+        self.blocks
+            .physical(filesystem, storage, &self.inode, u64::from(logical))?
+            .filter(|physical| *physical < filesystem.superblock.blocks_count)
+            .ok_or(Corrupt::InvalidJournal.into())
+    }
+
+    #[inline(never)]
+    fn read(
+        &self,
+        filesystem: &mut Ext4,
+        storage: &mut dyn Storage,
+        logical: u32,
+    ) -> Result<Vec<u8>, Error> {
+        let physical = self.physical(filesystem, storage, logical)?;
+        let mut bytes = filesystem.new_block_buffer()?;
+        let offset = physical
+            .checked_mul(u64::from(filesystem.superblock.block_size))
+            .ok_or(Corrupt::AddressOverflow)?;
+        filesystem.read_storage(storage, offset, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
 impl Ext4 {
     #[inline(never)]
     pub(crate) fn commit_journal(
@@ -111,10 +231,7 @@ impl Ext4 {
             return Err(Unsupported::JournalWriteProfile.into());
         }
 
-        let journal = self.load_inode(storage, self.superblock.journal_inode)?;
-        if journal.mode & 0xf000 != 0x8000 {
-            return Err(Corrupt::InvalidJournal.into());
-        }
+        let journal = Journal::open(self, storage)?;
         let format = self.load_journal_format(storage, &journal)?;
         if format.start != 0
             || (!format.csum_v3() && format.has_checksums())
@@ -151,67 +268,55 @@ impl Ext4 {
             .checked_mul(u64::from(self.superblock.block_size))
             .ok_or(Corrupt::AddressOverflow)?;
         self.read_storage(storage, superblock_offset, &mut activation_superblock)?;
-        set_recovery_flag(&mut activation_superblock, true)?;
-        let mut checkpoint_superblock = clone_bytes(&final_superblock.bytes)?;
-        set_recovery_flag(&mut checkpoint_superblock, true)?;
-
-        let mut journal_data = Vec::new();
-        journal_data
-            .try_reserve_exact(dirty.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        let mut escaped = Vec::new();
-        escaped
-            .try_reserve_exact(dirty.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        for block in dirty {
-            if block.bytes.len() != self.superblock.block_size as usize
-                || block.number >= self.superblock.blocks_count
-            {
-                return Err(Error::InvalidArgument);
-            }
-            let mut bytes = clone_bytes(&block.bytes)?;
-            let escape = be32(&bytes, 0) == MAGIC;
-            if escape {
-                bytes[..4].fill(0);
-            }
-            journal_data.push(bytes);
-            escaped.push(escape);
-        }
+        enable_recovery(&mut activation_superblock)?;
+        let mut checkpoint_superblock = copy_bytes(&final_superblock.bytes)?;
+        enable_recovery(&mut checkpoint_superblock)?;
 
         let mut descriptor = self.new_block_buffer()?;
         put_be32(&mut descriptor, 0, MAGIC);
         put_be32(&mut descriptor, 4, DESCRIPTOR);
         put_be32(&mut descriptor, 8, format.sequence);
         let mut cursor = 12usize;
+        let mut escaped = self.new_block_buffer()?;
         for (index, block) in dirty.iter().enumerate() {
+            if block.bytes.len() != self.superblock.block_size as usize
+                || block.number >= self.superblock.blocks_count
+            {
+                return Err(Error::InvalidArgument);
+            }
+            let escape = be32(&block.bytes, 0) == MAGIC;
+            let data = if escape {
+                escaped.copy_from_slice(&block.bytes);
+                escaped[..4].fill(0);
+                &escaped
+            } else {
+                &block.bytes
+            };
             let mut flags = if index == 0 { 0 } else { FLAG_SAME_UUID };
-            if escaped[index] {
+            if escape {
                 flags |= FLAG_ESCAPE;
             }
             if index + 1 == dirty.len() {
                 flags |= FLAG_LAST;
             }
-            put_be32(&mut descriptor, cursor, block.number as u32);
-            if format.csum_v3() {
-                put_be32(&mut descriptor, cursor + 4, flags);
-                put_be32(&mut descriptor, cursor + 8, (block.number >> 32) as u32);
-                let data_checksum = crc32c(
+            let checksum = if format.csum_v3() {
+                crc32c(
                     crc32c(format.checksum_seed, &format.sequence.to_be_bytes()),
-                    &journal_data[index],
-                );
-                put_be32(&mut descriptor, cursor + 12, data_checksum);
+                    data,
+                )
             } else {
-                put_be16(&mut descriptor, cursor + 4, 0);
-                put_be16(&mut descriptor, cursor + 6, flags as u16);
-                if format.is_64bit() {
-                    put_be32(&mut descriptor, cursor + 8, (block.number >> 32) as u32);
-                }
-            }
-            cursor += format.tag_len();
-            if index == 0 {
-                descriptor[cursor..cursor + 16].copy_from_slice(&format.uuid);
-                cursor += 16;
-            }
+                0
+            };
+            cursor = write_tag(
+                format,
+                &mut descriptor,
+                cursor,
+                Tag {
+                    target: block.number,
+                    flags,
+                    checksum,
+                },
+            );
         }
         if format.has_checksums() {
             update_metadata_checksum(format, &mut descriptor);
@@ -225,13 +330,13 @@ impl Ext4 {
             update_commit_checksum(format, &mut commit);
         }
 
-        let mut active_journal_superblock = self.read_journal_block(storage, &journal, 0)?;
+        let mut active_journal_superblock = journal.read(self, storage, 0)?;
         put_be32(&mut active_journal_superblock, 0x18, format.sequence);
         put_be32(&mut active_journal_superblock, 0x1c, format.first);
         if format.has_checksums() {
             update_journal_superblock_checksum(&mut active_journal_superblock);
         }
-        let mut clean_journal_superblock = clone_bytes(&active_journal_superblock)?;
+        let mut clean_journal_superblock = copy_bytes(&active_journal_superblock)?;
         put_be32(
             &mut clean_journal_superblock,
             0x18,
@@ -246,33 +351,14 @@ impl Ext4 {
         journal_offsets
             .try_reserve_exact(dirty.len() + 3)
             .map_err(|_| Error::OutOfMemory)?;
-        let journal_extents = if journal.flags & super::EXTENTS_FL != 0 {
-            Some(self.load_extent_tree(storage, &journal)?)
-        } else {
-            None
-        };
-        for logical in 0..=commit_logical {
-            if logical != 0 && logical < format.first {
-                continue;
-            }
-            let physical = match &journal_extents {
-                Some(tree) => tree
-                    .lookup(logical)
-                    .filter(|(_, state)| *state == super::extent_tree::ExtentState::Written)
-                    .map(|(physical, _)| physical),
-                None => self.map_file_block(storage, &journal, u64::from(logical))?,
-            }
-            .ok_or(Corrupt::InvalidJournal)?;
-            if physical >= self.superblock.blocks_count
-                || dirty.iter().any(|block| block.number == physical)
-                || journal_offsets.contains(&physical)
-            {
-                return Err(Corrupt::InvalidJournal.into());
-            }
-            journal_offsets.push(physical);
-        }
-        if journal_offsets.len() != dirty.len() + 3 {
-            return Err(Corrupt::InvalidJournal.into());
+        record_journal_offset(
+            &mut journal_offsets,
+            dirty,
+            journal.physical(self, storage, 0)?,
+        )?;
+        for logical in format.first..=commit_logical {
+            let physical = journal.physical(self, storage, logical)?;
+            record_journal_offset(&mut journal_offsets, dirty, physical)?;
         }
         let journal_superblock_physical = journal_offsets[0];
         let descriptor_physical = journal_offsets[1];
@@ -280,7 +366,14 @@ impl Ext4 {
 
         // Prepare an ignored transaction while the journal is still clean.
         self.write_physical_block(storage, descriptor_physical, &descriptor)?;
-        for (index, bytes) in journal_data.iter().enumerate() {
+        for (index, block) in dirty.iter().enumerate() {
+            let bytes = if be32(&block.bytes, 0) == MAGIC {
+                escaped.copy_from_slice(&block.bytes);
+                escaped[..4].fill(0);
+                &escaped
+            } else {
+                &block.bytes
+            };
             self.write_physical_block(storage, journal_offsets[index + 2], bytes)?;
         }
         self.flush_storage(storage)?;
@@ -322,10 +415,7 @@ impl Ext4 {
 
     #[inline(never)]
     pub(super) fn replay_journal(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
-        let journal = self.load_inode(storage, self.superblock.journal_inode)?;
-        if journal.mode & 0xf000 != 0x8000 {
-            return Err(Corrupt::InvalidJournal.into());
-        }
+        let journal = Journal::open(self, storage)?;
         let format = self.load_journal_format(storage, &journal)?;
         if format.start == 0 {
             return Ok(());
@@ -340,7 +430,7 @@ impl Ext4 {
         let mut visited = 0u32;
 
         while visited < format.max_len - format.first {
-            let bytes = self.read_journal_block(storage, &journal, block)?;
+            let bytes = journal.read(self, storage, block)?;
             visited += 1;
             if be32(&bytes, 0) != MAGIC || be32(&bytes, 8) != sequence {
                 break;
@@ -348,13 +438,13 @@ impl Ext4 {
             match be32(&bytes, 4) {
                 DESCRIPTOR => {
                     verify_metadata_checksum(format, &bytes)?;
-                    let tags = parse_tags(format, &bytes)?;
+                    let mut tags = Tags::new(format, &bytes);
                     block = format.advance(block);
-                    for tag in tags {
+                    while let Some(tag) = tags.next()? {
                         if visited >= format.max_len - format.first {
                             return Err(Corrupt::InvalidJournal.into());
                         }
-                        let mut data = self.read_journal_block(storage, &journal, block)?;
+                        let mut data = journal.read(self, storage, block)?;
                         visited += 1;
                         verify_data_checksum(format, sequence, &tag, &data)?;
                         if tag.flags & FLAG_ESCAPE != 0 {
@@ -407,10 +497,7 @@ impl Ext4 {
             {
                 Ok(index) => self.overlay[index].1 = update.bytes,
                 Err(index) => {
-                    self.overlay
-                        .try_reserve(1)
-                        .map_err(|_| Error::OutOfMemory)?;
-                    self.overlay.insert(index, (update.target, update.bytes));
+                    try_insert(&mut self.overlay, index, (update.target, update.bytes))?;
                 }
             }
         }
@@ -420,9 +507,9 @@ impl Ext4 {
     fn load_journal_format(
         &mut self,
         storage: &mut dyn Storage,
-        inode: &Inode,
+        journal: &Journal,
     ) -> Result<Format, Error> {
-        let bytes = self.read_journal_block(storage, inode, 0)?;
+        let bytes = journal.read(self, storage, 0)?;
         if be32(&bytes, 0) != MAGIC || be32(&bytes, 4) != SUPERBLOCK_V2 {
             return Err(Corrupt::InvalidJournal.into());
         }
@@ -467,7 +554,7 @@ impl Ext4 {
         }
         if block_size != self.superblock.block_size
             || max_len < 4
-            || u64::from(max_len) > inode.size / u64::from(block_size)
+            || u64::from(max_len) > journal.inode.size / u64::from(block_size)
             || first == 0
             || first >= max_len
             || start != 0 && (start < first || start >= max_len)
@@ -506,22 +593,7 @@ impl Ext4 {
         Ok(format)
     }
 
-    fn read_journal_block(
-        &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        logical: u32,
-    ) -> Result<Vec<u8>, Error> {
-        let mut bytes = self.new_block_buffer()?;
-        let offset = u64::from(logical)
-            .checked_mul(u64::from(self.superblock.block_size))
-            .ok_or(Corrupt::AddressOverflow)?;
-        if self.read_inode_data(storage, inode, offset, &mut bytes)? != bytes.len() {
-            return Err(Corrupt::InvalidJournal.into());
-        }
-        Ok(bytes)
-    }
-
+    #[inline(never)]
     fn write_physical_block(
         &mut self,
         storage: &mut dyn Storage,
@@ -539,20 +611,13 @@ impl Ext4 {
         storage.write(offset, bytes).map_err(Error::Storage)
     }
 
+    #[inline(never)]
     fn flush_storage(&mut self, storage: &mut dyn Storage) -> Result<(), Error> {
         storage.flush().map_err(Error::Storage)
     }
 }
 
-fn clone_bytes(bytes: &[u8]) -> Result<Vec<u8>, Error> {
-    let mut copy = Vec::new();
-    copy.try_reserve_exact(bytes.len())
-        .map_err(|_| Error::OutOfMemory)?;
-    copy.extend_from_slice(bytes);
-    Ok(copy)
-}
-
-fn set_recovery_flag(block: &mut [u8], enabled: bool) -> Result<(), Error> {
+fn enable_recovery(block: &mut [u8]) -> Result<(), Error> {
     let offset = usize::try_from(ondisk::SUPERBLOCK_OFFSET % block.len() as u64)
         .map_err(|_| Corrupt::AddressOverflow)?;
     if offset + ondisk::SUPERBLOCK_SIZE > block.len()
@@ -560,12 +625,7 @@ fn set_recovery_flag(block: &mut [u8], enabled: bool) -> Result<(), Error> {
     {
         return Err(Corrupt::BadMagic.into());
     }
-    let incompat = crate::ondisk::le32(block, offset + 0x60);
-    let incompat = if enabled {
-        incompat | ondisk::INCOMPAT_RECOVER
-    } else {
-        incompat & !ondisk::INCOMPAT_RECOVER
-    };
+    let incompat = crate::ondisk::le32(block, offset + 0x60) | ondisk::INCOMPAT_RECOVER;
     block[offset + 0x60..offset + 0x64].copy_from_slice(&incompat.to_le_bytes());
     let superblock = &mut block[offset..offset + ondisk::SUPERBLOCK_SIZE];
     let mut checksum = Checksum::new();
@@ -574,6 +634,40 @@ fn set_recovery_flag(block: &mut [u8], enabled: bool) -> Result<(), Error> {
     Ok(())
 }
 
+fn record_journal_offset(
+    offsets: &mut Vec<u64>,
+    dirty: &[DirtyBlock],
+    physical: u64,
+) -> Result<(), Error> {
+    if dirty.iter().any(|block| block.number == physical) || offsets.contains(&physical) {
+        return Err(Corrupt::InvalidJournal.into());
+    }
+    offsets.push(physical);
+    Ok(())
+}
+
+fn write_tag(format: Format, bytes: &mut [u8], mut cursor: usize, tag: Tag) -> usize {
+    put_be32(bytes, cursor, tag.target as u32);
+    if format.csum_v3() {
+        put_be32(bytes, cursor + 4, tag.flags);
+        put_be32(bytes, cursor + 8, (tag.target >> 32) as u32);
+        put_be32(bytes, cursor + 12, tag.checksum);
+    } else {
+        put_be16(bytes, cursor + 4, 0);
+        put_be16(bytes, cursor + 6, tag.flags as u16);
+        if format.is_64bit() {
+            put_be32(bytes, cursor + 8, (tag.target >> 32) as u32);
+        }
+    }
+    cursor += format.tag_len();
+    if tag.flags & FLAG_SAME_UUID == 0 {
+        bytes[cursor..cursor + 16].copy_from_slice(&format.uuid);
+        cursor += 16;
+    }
+    cursor
+}
+
+#[inline(never)]
 fn update_metadata_checksum(format: Format, bytes: &mut [u8]) {
     let tail = bytes.len() - 4;
     bytes[tail..].fill(0);
@@ -581,6 +675,7 @@ fn update_metadata_checksum(format: Format, bytes: &mut [u8]) {
     put_be32(bytes, tail, checksum);
 }
 
+#[inline(never)]
 fn update_commit_checksum(format: Format, bytes: &mut [u8]) {
     bytes[16..20].fill(0);
     let checksum = crc32c(format.checksum_seed, bytes);
@@ -593,61 +688,7 @@ fn update_journal_superblock_checksum(bytes: &mut [u8]) {
     put_be32(bytes, 0xfc, checksum);
 }
 
-fn parse_tags(format: Format, bytes: &[u8]) -> Result<Vec<Tag>, Error> {
-    let end = bytes.len() - usize::from(format.has_checksums()) * 4;
-    let mut cursor = 12usize;
-    let mut tags = Vec::new();
-    let mut have_uuid = false;
-    loop {
-        let tag_len = format.tag_len();
-        if cursor + tag_len > end {
-            return Err(Corrupt::InvalidJournal.into());
-        }
-        let low = u64::from(be32(bytes, cursor));
-        let (flags, checksum, high) = if format.csum_v3() {
-            (
-                be32(bytes, cursor + 4),
-                be32(bytes, cursor + 12),
-                be32(bytes, cursor + 8),
-            )
-        } else {
-            (
-                u32::from(be16(bytes, cursor + 6)),
-                u32::from(be16(bytes, cursor + 4)),
-                if format.is_64bit() {
-                    be32(bytes, cursor + 8)
-                } else {
-                    0
-                },
-            )
-        };
-        if flags & !KNOWN_FLAGS != 0 {
-            return Err(Corrupt::InvalidJournal.into());
-        }
-        cursor += tag_len;
-        if flags & FLAG_SAME_UUID == 0 {
-            if cursor + 16 > end || bytes[cursor..cursor + 16] != format.uuid {
-                return Err(Corrupt::InvalidJournal.into());
-            }
-            cursor += 16;
-            have_uuid = true;
-        } else if !have_uuid {
-            return Err(Corrupt::InvalidJournal.into());
-        }
-        try_push(
-            &mut tags,
-            Tag {
-                target: low | (u64::from(high) << 32),
-                flags,
-                checksum,
-            },
-        )?;
-        if flags & FLAG_LAST != 0 {
-            return Ok(tags);
-        }
-    }
-}
-
+#[inline(never)]
 fn parse_revokes(
     format: Format,
     sequence: u32,
@@ -674,6 +715,7 @@ fn parse_revokes(
     Ok(())
 }
 
+#[inline(never)]
 fn verify_metadata_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     if !format.has_checksums() {
         return Ok(());
@@ -688,6 +730,7 @@ fn verify_metadata_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+#[inline(never)]
 fn verify_data_checksum(
     format: Format,
     sequence: u32,
@@ -709,6 +752,7 @@ fn verify_data_checksum(
     Ok(())
 }
 
+#[inline(never)]
 fn verify_commit_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     if !format.has_checksums() {
         return Ok(());
@@ -723,17 +767,12 @@ fn verify_commit_checksum(format: Format, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+#[inline(never)]
 fn append<T>(destination: &mut Vec<T>, source: &mut Vec<T>) -> Result<(), Error> {
     destination
         .try_reserve(source.len())
         .map_err(|_| Error::OutOfMemory)?;
     destination.append(source);
-    Ok(())
-}
-
-fn try_push<T>(destination: &mut Vec<T>, value: T) -> Result<(), Error> {
-    destination.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-    destination.push(value);
     Ok(())
 }
 
