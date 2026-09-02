@@ -1,21 +1,21 @@
-//! RetroOS VFS adapter for the portable ext4 engine.
-//!
-//! This is RetroOS's ext2/3/4 filesystem backend for both writable roots and
-//! additional read-only volumes.
+//! POSIX/VFS policy over the graph-only ext4 storage engine.
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec::Vec;
-use core::any::Any;
 use core::cell::RefCell;
 
 use crate::kernel::block::Volume;
 use crate::kernel::vfs::{DirEntry, Filesystem, Meta, Stat, Vnode};
-use portable_ext4::{
-    DirectoryEntry as ExtDirectoryEntry, Ext4, Inode, InodeMetadataUpdate, Storage, Timestamp,
+use portable_ext4::ext4::{
+    AttributeUpdate, Blob, EdgeCursor, EdgeHandle, Node, Object, ObjectInfo,
 };
+use portable_ext4::{Error, Filesystem as HandleFilesystem, Storage, StorageError};
+
+const TYPE_MASK: u16 = 0xf000;
+const TYPE_NODE: u16 = 0x4000;
+const TYPE_BLOB: u16 = 0x8000;
+const TYPE_SYMLINK: u16 = 0xa000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeError {
@@ -24,14 +24,81 @@ pub enum VolumeError {
     ShortWrite,
 }
 
-/// Byte-addressed exact I/O over RetroOS's sector-addressed partition view.
 pub struct VolumeStorage {
     volume: Volume,
+}
+
+enum Transfer<'a> {
+    Read(&'a mut [u8]),
+    Write(&'a [u8]),
+}
+
+impl Transfer<'_> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Read(bytes) => bytes.len(),
+            Self::Write(bytes) => bytes.len(),
+        }
+    }
 }
 
 impl VolumeStorage {
     pub fn new(volume: Volume) -> Self {
         Self { volume }
+    }
+
+    #[inline(never)]
+    fn transfer(&mut self, offset: u64, mut transfer: Transfer<'_>) -> Result<(), StorageError> {
+        let len = transfer.len();
+        let end = offset
+            .checked_add(len as u64)
+            .filter(|end| *end <= self.volume.sectors.saturating_mul(512))
+            .ok_or(VolumeError::OutOfBounds)
+            .map_err(StorageError::new)?;
+        if len == 0 {
+            return Ok(());
+        }
+        if offset.is_multiple_of(512) && len.is_multiple_of(512) {
+            let writing = matches!(transfer, Transfer::Write(_));
+            let transferred = match &mut transfer {
+                Transfer::Read(bytes) => self.volume.read(offset / 512, bytes),
+                Transfer::Write(bytes) => self.volume.write(offset / 512, bytes),
+            } as usize;
+            if transferred != len / 512 {
+                return Err(StorageError::new(if writing {
+                    VolumeError::ShortWrite
+                } else {
+                    VolumeError::ShortRead
+                }));
+            }
+            return Ok(());
+        }
+        let mut position = offset;
+        let mut copied = 0;
+        let mut sector = [0; 512];
+        while position < end {
+            let lba = position / 512;
+            if self.volume.read(lba, &mut sector) != 1 {
+                return Err(StorageError::new(VolumeError::ShortRead));
+            }
+            let within = (position % 512) as usize;
+            let amount = (len - copied).min(512 - within);
+            match &mut transfer {
+                Transfer::Read(bytes) => {
+                    bytes[copied..copied + amount].copy_from_slice(&sector[within..within + amount])
+                }
+                Transfer::Write(bytes) => {
+                    sector[within..within + amount]
+                        .copy_from_slice(&bytes[copied..copied + amount]);
+                    if self.volume.write(lba, &sector) != 1 {
+                        return Err(StorageError::new(VolumeError::ShortWrite));
+                    }
+                }
+            }
+            copied += amount;
+            position += amount as u64;
+        }
+        Ok(())
     }
 }
 
@@ -40,357 +107,199 @@ impl Storage for VolumeStorage {
         self.volume.sectors.saturating_mul(512)
     }
 
-    fn read(&mut self, offset: u64, dst: &mut [u8]) -> Result<(), Box<dyn Any>> {
-        let end = offset
-            .checked_add(dst.len() as u64)
-            .filter(|end| *end <= self.len())
-            .ok_or(VolumeError::OutOfBounds)
-            .map_err(|error| Box::new(error) as Box<dyn Any>)?;
-        if dst.is_empty() {
-            return Ok(());
-        }
-        if offset.is_multiple_of(512) && dst.len().is_multiple_of(512) {
-            let expected = dst.len() / 512;
-            if self.volume.read(offset / 512, dst) as usize != expected {
-                return Err(Box::new(VolumeError::ShortRead));
-            }
-            return Ok(());
-        }
-        let mut position = offset;
-        let mut copied = 0usize;
-        let mut sector = [0u8; 512];
-        while position < end {
-            let lba = position / 512;
-            if self.volume.read(lba, &mut sector) != 1 {
-                return Err(Box::new(VolumeError::ShortRead));
-            }
-            let within = (position % 512) as usize;
-            let amount = (dst.len() - copied).min(512 - within);
-            dst[copied..copied + amount].copy_from_slice(&sector[within..within + amount]);
-            copied += amount;
-            position += amount as u64;
-        }
-        Ok(())
+    fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
+        self.transfer(offset, Transfer::Read(output))
     }
 
-    fn write(&mut self, offset: u64, src: &[u8]) -> Result<(), Box<dyn Any>> {
-        let end = offset
-            .checked_add(src.len() as u64)
-            .filter(|end| *end <= self.len())
-            .ok_or(VolumeError::OutOfBounds)
-            .map_err(|error| Box::new(error) as Box<dyn Any>)?;
-        if src.is_empty() {
-            return Ok(());
-        }
-        if offset.is_multiple_of(512) && src.len().is_multiple_of(512) {
-            let expected = src.len() / 512;
-            if self.volume.write(offset / 512, src) as usize != expected {
-                return Err(Box::new(VolumeError::ShortWrite));
-            }
-            return Ok(());
-        }
-
-        let mut position = offset;
-        let mut copied = 0usize;
-        let mut sector = [0u8; 512];
-        while position < end {
-            let lba = position / 512;
-            if self.volume.read(lba, &mut sector) != 1 {
-                return Err(Box::new(VolumeError::ShortRead));
-            }
-            let within = (position % 512) as usize;
-            let amount = (src.len() - copied).min(512 - within);
-            sector[within..within + amount].copy_from_slice(&src[copied..copied + amount]);
-            if self.volume.write(lba, &sector) != 1 {
-                return Err(Box::new(VolumeError::ShortWrite));
-            }
-            copied += amount;
-            position += amount as u64;
-        }
-        Ok(())
+    fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {
+        self.transfer(offset, Transfer::Write(input))
     }
 
-    fn flush(&mut self) -> Result<(), Box<dyn Any>> {
+    fn flush(&mut self) -> Result<(), StorageError> {
         Ok(())
     }
-}
-
-struct OpenFileSlot {
-    generation: u32,
-    inode: Option<Inode>,
 }
 
 #[derive(Default)]
 struct OpenFiles {
-    slots: Vec<OpenFileSlot>,
-    free: Vec<u32>,
+    slots: Vec<Option<ObjectInfo>>,
 }
 
 impl OpenFiles {
-    fn handle(index: usize, generation: u32) -> u64 {
-        (u64::from(generation) << 32) | (index as u64 + 1)
-    }
-
-    fn locate(&self, handle: u64) -> Option<usize> {
-        let index = usize::try_from((handle as u32).checked_sub(1)?).ok()?;
-        let generation = (handle >> 32) as u32;
-        self.slots
-            .get(index)
-            .filter(|slot| slot.generation == generation && slot.inode.is_some())
-            .map(|_| index)
-    }
-
-    fn insert(&mut self, inode: Inode) -> u64 {
-        if let Some(index) = self.free.pop() {
-            let index = index as usize;
-            let slot = &mut self.slots[index];
-            debug_assert!(slot.inode.is_none());
-            slot.inode = Some(inode);
-            return Self::handle(index, slot.generation);
+    fn insert(&mut self, info: ObjectInfo) -> u64 {
+        if let Some(index) = self.slots.iter().position(Option::is_none) {
+            self.slots[index] = Some(info);
+            return index as u64 + 1;
         }
-        assert!(
-            self.slots.len() < u32::MAX as usize,
-            "ext4 open-file table exhausted"
-        );
-        let index = self.slots.len();
-        self.slots.push(OpenFileSlot {
-            generation: 1,
-            inode: Some(inode),
-        });
-        Self::handle(index, 1)
+        self.slots.push(Some(info));
+        self.slots.len() as u64
     }
 
-    fn inode(&self, handle: u64) -> Option<&Inode> {
-        self.slots.get(self.locate(handle)?)?.inode.as_ref()
+    fn get(&self, handle: u64) -> Option<ObjectInfo> {
+        self.slots.get(handle.checked_sub(1)? as usize).copied()?
     }
 
-    fn contains_inode(&self, number: u32) -> bool {
-        self.slots.iter().any(|slot| {
-            slot.inode
-                .as_ref()
-                .is_some_and(|inode| inode.number == number)
-        })
+    fn contains(&self, object: Object) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|info| info.object == object)
     }
 
     fn remove(&mut self, handle: u64) {
-        let Some(index) = self.locate(handle) else {
-            return;
-        };
-        let slot = &mut self.slots[index];
-        slot.inode = None;
-        slot.generation = slot.generation.wrapping_add(1).max(1);
-        self.free.push(index as u32);
+        if let Some(slot) = handle
+            .checked_sub(1)
+            .and_then(|index| self.slots.get_mut(index as usize))
+        {
+            *slot = None;
+        }
     }
 }
 
-/// Writable VFS adapter for the portable ext4 engine.
+#[derive(Clone, Copy)]
+struct LocatedEdge {
+    handle: EdgeHandle,
+    object: Object,
+}
+
 pub struct PortableExt4Fs {
-    filesystem: RefCell<Ext4>,
-    storage: RefCell<VolumeStorage>,
-    open_files: RefCell<OpenFiles>,
+    filesystem: RefCell<HandleFilesystem<VolumeStorage>>,
+    open: RefCell<OpenFiles>,
 }
 
 impl PortableExt4Fs {
     pub fn new(volume: Volume) -> Result<Self, &'static str> {
-        let mut storage = VolumeStorage::new(volume);
-        let filesystem = Ext4::mount(&mut storage).map_err(|_| "portable ext4 mount failed")?;
+        let filesystem = HandleFilesystem::mount(VolumeStorage::new(volume))
+            .map_err(|_| "portable ext4 mount failed")?;
         Ok(Self {
             filesystem: RefCell::new(filesystem),
-            storage: RefCell::new(storage),
-            open_files: RefCell::new(OpenFiles::default()),
+            open: RefCell::new(OpenFiles::default()),
         })
     }
 
-    fn path(path: &[u8]) -> Option<String> {
-        let path = core::str::from_utf8(path).ok()?;
-        let mut absolute = String::with_capacity(path.len() + 1);
-        absolute.push('/');
-        absolute.push_str(path.trim_start_matches('/'));
-        Some(absolute)
+    fn path(path: &[u8]) -> Option<&[u8]> {
+        let first = path
+            .iter()
+            .position(|byte| *byte != b'/')
+            .unwrap_or(path.len());
+        (!path.contains(&0)).then_some(&path[first..])
     }
 
-    fn allocate_handle(&self, inode: Inode) -> u64 {
-        self.open_files.borrow_mut().insert(inode)
+    fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
+        let (parent, name) = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(slash) => (&path[..slash], &path[slash + 1..]),
+            None => (&b""[..], path),
+        };
+        (!name.is_empty()).then_some((parent, name))
     }
 
-    fn split_parent(path: &str) -> Option<(&str, &str)> {
-        let (parent, name) = path.rsplit_once('/')?;
-        if name.is_empty() {
-            return None;
-        }
-        Some((if parent.is_empty() { "/" } else { parent }, name))
-    }
-
-    fn reserve_for_data(data_len: usize) -> usize {
-        data_len.div_ceil(4096).saturating_add(64)
-    }
-
-    fn find_entry(
-        filesystem: &mut Ext4,
-        storage: &mut VolumeStorage,
-        directory: &Inode,
-        name: &[u8],
-    ) -> Result<Option<ExtDirectoryEntry>, ()> {
-        let mut cookie = 0;
-        loop {
-            let mut entries = Vec::new();
-            let next = filesystem
-                .list(storage, directory, cookie, &mut entries, 64)
-                .map_err(|_| ())?;
-            if let Some(entry) = entries.into_iter().find(|entry| entry.name == name) {
-                return Ok(Some(entry));
-            }
-            match next {
-                Some(next) => cookie = next,
-                None => return Ok(None),
-            }
-        }
-    }
-
-    /// Walk an already-canonical path without assigning semantics to symlink
-    /// payloads. A symlink in a non-final component naturally fails the next
-    /// directory step; VFS must expand it before calling the backend.
     fn resolve_in(
-        filesystem: &mut Ext4,
-        storage: &mut VolumeStorage,
-        path: &str,
-    ) -> Result<Inode, ()> {
-        if !path.starts_with('/') || path.as_bytes().contains(&0) {
-            return Err(());
-        }
-        let mut inode = filesystem.root(storage).map_err(|_| ())?;
-        for component in path.split('/').filter(|component| !component.is_empty()) {
-            if component == "."
-                || component == ".."
-                || component.len() > 255
-                || !inode.is_directory()
-            {
-                return Err(());
+        filesystem: &mut HandleFilesystem<VolumeStorage>,
+        path: &[u8],
+    ) -> Result<ObjectInfo, Error> {
+        let root = filesystem.root()?;
+        let mut info = filesystem.inspect(Object::Node(root))?;
+        for name in path
+            .split(|byte| *byte == b'/')
+            .filter(|name| !name.is_empty())
+        {
+            if matches!(name, b"." | b"..") || name.len() > 255 {
+                return Err(Error::InvalidArgument);
             }
-            inode = Self::find_entry(filesystem, storage, &inode, component.as_bytes())?
-                .ok_or(())?
-                .inode;
+            let node = info.node().ok_or(Error::NotDirectory)?;
+            let (_, object) = filesystem.find(node, name)?.ok_or(Error::NotFound)?;
+            info = filesystem.inspect(object)?;
         }
-        Ok(inode)
+        Ok(info)
     }
 
-    fn resolve(&self, path: &str) -> Result<Inode, ()> {
-        Self::resolve_in(
-            &mut self.filesystem.borrow_mut(),
-            &mut self.storage.borrow_mut(),
-            path,
-        )
+    fn resolve(&self, path: &[u8]) -> Result<ObjectInfo, Error> {
+        Self::resolve_in(&mut self.filesystem.borrow_mut(), path)
     }
 
-    fn parent_entry(&self, path: &str) -> Result<(Inode, ExtDirectoryEntry), ()> {
-        let (parent_path, name) = Self::split_parent(path).ok_or(())?;
+    fn parent_edge(&self, path: &[u8]) -> Result<(Node, LocatedEdge), Error> {
+        let (parent_path, name) = Self::split_parent(path).ok_or(Error::InvalidArgument)?;
         let mut filesystem = self.filesystem.borrow_mut();
-        let mut storage = self.storage.borrow_mut();
-        let parent = Self::resolve_in(&mut filesystem, &mut storage, parent_path)?;
-        let entry =
-            Self::find_entry(&mut filesystem, &mut storage, &parent, name.as_bytes())?.ok_or(())?;
-        Ok((parent, entry))
+        let parent = Self::resolve_in(&mut filesystem, parent_path)?
+            .node()
+            .ok_or(Error::NotDirectory)?;
+        let (handle, object) = filesystem.find(parent, name)?.ok_or(Error::NotFound)?;
+        Ok((parent, LocatedEdge { handle, object }))
     }
 
-    fn commit(
-        &self,
-        reserve: usize,
-        operation: &mut dyn FnMut(
-            &mut portable_ext4::Transaction<'_, '_>,
-        ) -> Result<(), portable_ext4::Error>,
-    ) -> bool {
-        let mut filesystem = self.filesystem.borrow_mut();
-        let mut storage = self.storage.borrow_mut();
-        let mut transaction = filesystem.begin_transaction(&mut *storage);
-        transaction.reserve_blocks(reserve).is_ok()
-            && operation(&mut transaction).is_ok()
-            && transaction.commit().is_ok()
+    fn is_symlink(info: ObjectInfo) -> bool {
+        info.format & TYPE_MASK == TYPE_SYMLINK
     }
 
-    fn open_inode(&self, inode: Inode) -> Option<Vnode> {
-        if inode.is_directory() || inode.is_symlink() {
+    fn open_info(&self, info: ObjectInfo) -> Option<Vnode> {
+        if info.node().is_some() || Self::is_symlink(info) {
             return None;
         }
         Some(Vnode {
-            handle: self.allocate_handle(inode.clone()),
-            size: inode.size.min(u64::from(u32::MAX)) as u32,
-            mode: inode.mode & 0x0fff,
+            handle: self.open.borrow_mut().insert(info),
+            size: info.size.min(u64::from(u32::MAX)) as u32,
+            mode: info.format & 0x0fff,
         })
     }
 
-    fn readlink_inode(&self, inode: &Inode, out: &mut [u8]) -> Option<usize> {
-        let target = self
-            .filesystem
+    fn readlink_info(&self, info: ObjectInfo, output: &mut [u8]) -> Option<usize> {
+        if !Self::is_symlink(info) {
+            return None;
+        }
+        let count = output.len().min(info.size as usize);
+        self.filesystem
             .borrow_mut()
-            .read_symlink(&mut *self.storage.borrow_mut(), inode)
-            .ok()?;
-        let len = target.len().min(out.len());
-        out[..len].copy_from_slice(&target[..len]);
-        Some(len)
+            .read(info.blob()?, 0, &mut output[..count])
+            .ok()
     }
 
-    fn readdir_inode(
+    fn append_entries(
         &self,
-        directory: &Inode,
+        node: Node,
         cookie: u64,
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
+        let mut filesystem = self.filesystem.borrow_mut();
         let mut entries = Vec::new();
-        let next = self
-            .filesystem
-            .borrow_mut()
-            .list(
-                &mut *self.storage.borrow_mut(),
-                directory,
-                cookie,
-                &mut entries,
-                max,
-            )
+        let next = filesystem
+            .edges(node, EdgeCursor::from_position(cookie), &mut |edge| {
+                entries.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                let mut name = Vec::new();
+                name.try_reserve_exact(edge.name.len())
+                    .map_err(|_| Error::OutOfMemory)?;
+                name.extend_from_slice(edge.name);
+                entries.push((name, edge.object));
+                Ok(entries.len() < max)
+            })
             .ok()?;
-        Self::append_directory_entries(output, entries);
-        next
-    }
-
-    fn append_directory_entries(output: &mut Vec<DirEntry>, entries: Vec<ExtDirectoryEntry>) {
-        for entry in entries {
-            let name_len = entry.name.len().min(100);
-            let mut result = DirEntry {
+        for (name, object) in entries {
+            let info = filesystem.inspect(object).ok()?;
+            let name_len = name.len().min(100);
+            let mut entry = DirEntry {
                 name: [0; 100],
                 name_len,
-                size: if entry.inode.is_directory() {
-                    0
-                } else {
-                    entry.inode.size.min(u64::from(u32::MAX)) as u32
-                },
-                is_dir: entry.inode.is_directory(),
-                is_symlink: entry.inode.is_symlink(),
-                mode: entry.inode.mode & 0x0fff,
-                mtime: u32::try_from(entry.inode.modified.seconds).unwrap_or(0),
-                node: u64::from(entry.inode.number),
+                size: info.size.min(u64::from(u32::MAX)) as u32,
+                is_dir: info.node().is_some(),
+                is_symlink: Self::is_symlink(info),
+                mode: info.format & 0x0fff,
+                mtime: info.modified,
+                node: info.object.opaque(),
                 mount_idx: 0,
             };
-            result.name[..name_len].copy_from_slice(&entry.name[..name_len]);
-            output.push(result);
+            entry.name[..name_len].copy_from_slice(&name[..name_len]);
+            output.push(entry);
         }
+        next.map(EdgeCursor::position)
     }
 }
 
-/// Does `volume` contain an ext superblock?
-///
-/// Partition type bytes and GUIDs are only declarations. Probe the on-disk
-/// magic so an ext filesystem is found regardless of how its partition was
-/// labelled, while unsupported ext features still produce a useful mount
-/// error instead of making the filesystem disappear from discovery.
 pub fn is_ext(volume: &Volume) -> bool {
     let mut storage = VolumeStorage::new(*volume);
-    let mut magic = [0u8; 2];
+    let mut magic = [0; 2];
     storage.read(1024 + 56, &mut magic).is_ok() && magic == [0x53, 0xef]
 }
 
-/// Does this ext volume look like a Linux root (`/etc` and `/usr`)?
-///
-/// Used only to disambiguate disks containing more than one ext partition.
 pub fn is_linux_root(volume: &Volume) -> bool {
     PortableExt4Fs::new(*volume)
         .is_ok_and(|filesystem| filesystem.dir_exists(b"etc") && filesystem.dir_exists(b"usr"))
@@ -400,34 +309,25 @@ impl Filesystem for PortableExt4Fs {
     fn root_node(&self) -> Option<u64> {
         self.filesystem
             .borrow_mut()
-            .root(&mut *self.storage.borrow_mut())
+            .root()
             .ok()
-            .map(|inode| u64::from(inode.number))
+            .map(|node| Object::Node(node).opaque())
     }
 
     fn open(&self, path: &[u8]) -> Option<Vnode> {
-        let path = Self::path(path)?;
-        let inode = self.resolve(&path).ok()?;
-        self.open_inode(inode)
+        self.open_info(self.resolve(Self::path(path)?).ok()?)
     }
 
     fn open_node(&self, node: u64) -> Option<Vnode> {
-        let number = u32::try_from(node).ok()?;
-        let inode = self
-            .filesystem
-            .borrow_mut()
-            .inode(&mut *self.storage.borrow_mut(), number)
-            .ok()?;
-        self.open_inode(inode)
+        let object = Object::from_opaque(node)?;
+        let info = self.filesystem.borrow_mut().inspect(object).ok()?;
+        self.open_info(info)
     }
 
-    fn readlink_node(&self, node: u64, out: &mut [u8]) -> Option<usize> {
-        let inode = self
-            .filesystem
-            .borrow_mut()
-            .inode(&mut *self.storage.borrow_mut(), u32::try_from(node).ok()?)
-            .ok()?;
-        self.readlink_inode(&inode, out)
+    fn readlink_node(&self, node: u64, output: &mut [u8]) -> Option<usize> {
+        let object = Object::from_opaque(node)?;
+        let info = self.filesystem.borrow_mut().inspect(object).ok()?;
+        self.readlink_info(info, output)
     }
 
     fn readdir_node(
@@ -437,120 +337,71 @@ impl Filesystem for PortableExt4Fs {
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
-        let directory = self
-            .filesystem
-            .borrow_mut()
-            .inode(&mut *self.storage.borrow_mut(), u32::try_from(node).ok()?)
-            .ok()?;
-        self.readdir_inode(&directory, cookie, output, max)
+        let Object::Node(node) = Object::from_opaque(node)? else {
+            return None;
+        };
+        self.append_entries(node, cookie, output, max)
     }
 
-    fn readlink(&self, path: &[u8], out: &mut [u8]) -> Option<usize> {
-        let path = Self::path(path)?;
-        let inode = self.resolve(&path).ok()?;
-        self.readlink_inode(&inode, out)
+    fn readlink(&self, path: &[u8], output: &mut [u8]) -> Option<usize> {
+        self.readlink_info(self.resolve(Self::path(path)?).ok()?, output)
     }
 
     fn stat(&self, path: &[u8], _follow_final: bool) -> Option<Stat> {
-        let path = Self::path(path)?;
-        let inode = self.resolve(&path).ok()?;
+        let info = self.resolve(Self::path(path)?).ok()?;
         Some(Stat {
-            size: inode.size.min(u64::from(u32::MAX)) as u32,
-            mode: inode.mode & 0x0fff,
-            is_dir: inode.is_directory(),
-            is_symlink: inode.is_symlink(),
-            ino: 0,
+            size: info.size.min(u64::from(u32::MAX)) as u32,
+            mode: info.format & 0x0fff,
+            is_dir: info.node().is_some(),
+            is_symlink: Self::is_symlink(info),
+            ino: info.object.opaque(),
         })
     }
 
-    fn read(&self, handle: u64, offset: u32, buffer: &mut [u8], _size: u32) -> i32 {
-        let inode = {
-            let files = self.open_files.borrow();
-            let Some(inode) = files.inode(handle) else {
-                return -9;
-            };
-            inode.clone()
+    fn read(&self, handle: u64, offset: u32, output: &mut [u8], _size: u32) -> i32 {
+        let Some(info) = self.open.borrow().get(handle) else {
+            return -9;
         };
         self.filesystem
             .borrow_mut()
-            .read_inode(
-                &mut *self.storage.borrow_mut(),
-                &inode,
-                u64::from(offset),
-                buffer,
-            )
+            .read(info.blob().unwrap(), u64::from(offset), output)
             .map_or(-5, |count| count as i32)
     }
 
-    fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
-        let inode = {
-            let files = self.open_files.borrow();
-            let Some(inode) = files.inode(handle) else {
-                return -9;
-            };
-            inode.clone()
+    fn write(&self, handle: u64, offset: u32, input: &[u8]) -> i32 {
+        let Some(info) = self.open.borrow().get(handle) else {
+            return -9;
         };
-        let offset = u64::from(offset);
-        let current = match self
-            .filesystem
+        self.filesystem
             .borrow_mut()
-            .refresh(&mut *self.storage.borrow_mut(), &inode)
-        {
-            Ok(inode) => inode,
-            Err(_) => return -5,
-        };
-        if offset > current.size
-            && !self.commit(
-                Self::reserve_for_data((offset - current.size) as usize),
-                &mut |transaction| transaction.resize_inode(&current, offset),
-            )
-        {
-            return -5;
-        }
-        if data.is_empty() {
-            return 0;
-        }
-        let inode = match self
-            .filesystem
-            .borrow_mut()
-            .refresh(&mut *self.storage.borrow_mut(), &inode)
-        {
-            Ok(inode) => inode,
-            Err(_) => return -5,
-        };
-        if self.commit(Self::reserve_for_data(data.len()), &mut |transaction| {
-            transaction.write_inode(&inode, offset, data)
-        }) {
-            data.len() as i32
-        } else {
-            -5
-        }
+            .write(info.blob().unwrap(), u64::from(offset), input)
+            .map_or(-5, |_| input.len() as i32)
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let path = Self::path(path)?;
-        let exists = self.resolve(&path).ok();
-        let success = if let Some(inode) = exists {
-            !inode.is_directory()
-                && self.commit(64, &mut |transaction| transaction.resize_inode(&inode, 0))
-        } else {
-            let (parent, name) = Self::split_parent(&path)?;
-            let parent = self.resolve(parent).ok()?;
-            self.commit(64, &mut |transaction| {
-                transaction
-                    .create_file(&parent, name.as_bytes(), 0o664)
-                    .map(|_| ())
-            })
-        };
-        if !success {
-            return None;
+        if let Ok(info) = self.resolve(path) {
+            graph_blob(info)?;
+            self.filesystem
+                .borrow_mut()
+                .resize(info.blob().unwrap(), 0)
+                .ok()?;
+            return self.open_info(self.resolve(path).ok()?);
         }
-        let inode = self.resolve(&path).ok()?;
-        Some(Vnode {
-            handle: self.allocate_handle(inode),
-            size: 0,
-            mode: 0o664,
-        })
+        let (parent_path, name) = Self::split_parent(path)?;
+        let parent = self.resolve(parent_path).ok()?.node()?;
+        self.filesystem
+            .borrow_mut()
+            .create_blob(
+                parent,
+                name,
+                AttributeUpdate {
+                    format: Some(TYPE_BLOB | 0o664),
+                    ..AttributeUpdate::default()
+                },
+            )
+            .ok()?;
+        self.open_info(self.resolve(path).ok()?)
     }
 
     fn supports_create(&self) -> bool {
@@ -561,21 +412,26 @@ impl Filesystem for PortableExt4Fs {
         let Some(path) = Self::path(path) else {
             return -22;
         };
-        let Some((parent, name)) = Self::split_parent(&path) else {
+        let Some((parent_path, name)) = Self::split_parent(path) else {
             return -22;
         };
-        let Ok(parent) = self.resolve(parent) else {
-            return -2;
+        let Ok(parent) = self
+            .resolve(parent_path)
+            .and_then(|info| info.node().ok_or(Error::NotDirectory))
+        else {
+            return -5;
         };
-        if self.commit(64, &mut |transaction| {
-            transaction
-                .create_directory(&parent, name.as_bytes(), 0o775)
-                .map(|_| ())
-        }) {
-            0
-        } else {
-            -5
-        }
+        self.filesystem
+            .borrow_mut()
+            .create_node(
+                parent,
+                name,
+                AttributeUpdate {
+                    format: Some(TYPE_NODE | 0o775),
+                    ..AttributeUpdate::default()
+                },
+            )
+            .map_or(-5, |_| 0)
     }
 
     fn supports_mkdir(&self) -> bool {
@@ -586,117 +442,98 @@ impl Filesystem for PortableExt4Fs {
         let Some(path) = Self::path(path) else {
             return -22;
         };
-        let Ok((parent, entry)) = self.parent_entry(&path) else {
+        let Ok((_, edge)) = self.parent_edge(path) else {
             return -2;
         };
-        if self.commit(64, &mut |transaction| {
-            transaction.remove_directory(&parent, &entry)
-        }) {
-            0
-        } else {
-            -5
+        if !matches!(edge.object, Object::Node(_)) {
+            return -20;
         }
+        self.filesystem
+            .borrow_mut()
+            .remove(edge.handle)
+            .map_or(-5, |_| 0)
     }
 
     fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
         let (Some(path), Some(new_path)) = (Self::path(path), Self::path(new_path)) else {
             return -22;
         };
-        let Ok((old_parent, source)) = self.parent_entry(&path) else {
-            return -2;
-        };
-        let Some((new_parent_path, new_name)) = Self::split_parent(&new_path) else {
+        let Some((target_parent_path, target_name)) = Self::split_parent(new_path) else {
             return -22;
         };
-        let Ok(new_parent) = self.resolve(new_parent_path) else {
+        let Ok((_, source)) = self.parent_edge(path) else {
             return -2;
         };
-        let destination = {
-            let mut filesystem = self.filesystem.borrow_mut();
-            let mut storage = self.storage.borrow_mut();
-            match Self::find_entry(
-                &mut filesystem,
-                &mut storage,
-                &new_parent,
-                new_name.as_bytes(),
-            ) {
-                Ok(entry) => entry,
-                Err(()) => return -5,
-            }
-        };
-        if !self.commit(96, &mut |transaction| {
-            transaction.move_entry(
-                &old_parent,
-                &source,
-                &new_parent,
-                new_name.as_bytes(),
-                destination.as_ref(),
-            )
-        }) {
+        let Ok(target_parent) = self
+            .resolve(target_parent_path)
+            .and_then(|info| info.node().ok_or(Error::NotDirectory))
+        else {
             return -5;
+        };
+        let mut filesystem = self.filesystem.borrow_mut();
+        match filesystem.find(target_parent, target_name) {
+            Ok(Some((_, target))) => {
+                if matches!(source.object, Object::Node(_)) != matches!(target, Object::Node(_)) {
+                    return -22;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return -5,
         }
-        0
+        filesystem
+            .move_edge(source.handle, target_parent, target_name)
+            .map_or(-5, |_| 0)
     }
 
     fn supports_directory_mutation(&self) -> bool {
         true
     }
 
-    fn flush(&self, _path: &[u8]) -> i32 {
-        0
-    }
-
     fn readdir(
         &self,
-        directory: &[u8],
+        path: &[u8],
         cookie: u64,
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
-        let path = Self::path(directory)?;
-        let directory = self.resolve(&path).ok()?;
-        self.readdir_inode(&directory, cookie, output, max)
+        let node = self.resolve(Self::path(path)?).ok()?.node()?;
+        self.append_entries(node, cookie, output, max)
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         Self::path(path)
-            .is_some_and(|path| self.resolve(&path).is_ok_and(|inode| inode.is_directory()))
+            .is_some_and(|path| self.resolve(path).is_ok_and(|info| info.node().is_some()))
     }
 
     fn mtime(&self, path: &[u8]) -> Option<u32> {
-        let path = Self::path(path)?;
-        self.resolve(&path)
-            .ok()
-            .and_then(|inode| u32::try_from(inode.modified.seconds).ok())
+        Some(self.resolve(Self::path(path)?).ok()?.modified)
     }
 
     fn set_mtime(&self, path: &[u8], mtime: u32) -> bool {
         let Some(path) = Self::path(path) else {
             return false;
         };
-        let Ok(inode) = self.resolve(&path) else {
+        let Ok(info) = self.resolve(path) else {
             return false;
         };
-        self.commit(4, &mut |transaction| {
-            transaction.set_inode_times(
-                &inode,
-                None,
-                Some(Timestamp {
-                    seconds: i64::from(mtime),
-                    nanoseconds: 0,
-                }),
-                None,
+        self.filesystem
+            .borrow_mut()
+            .update_attributes(
+                info.object,
+                AttributeUpdate {
+                    modified: Some(mtime),
+                    ..AttributeUpdate::default()
+                },
             )
-        })
+            .is_ok()
     }
 
     fn meta(&self, path: &[u8]) -> Option<Meta> {
-        let path = Self::path(path)?;
-        let inode = self.resolve(&path).ok()?;
+        let info = self.resolve(Self::path(path)?).ok()?;
         Some(Meta {
-            uid: inode.uid,
-            gid: inode.gid,
-            mode: u32::from(inode.mode),
+            uid: info.owner,
+            gid: info.group,
+            mode: u32::from(info.format),
         })
     }
 
@@ -704,222 +541,48 @@ impl Filesystem for PortableExt4Fs {
         let Some(path) = Self::path(path) else {
             return false;
         };
-        let Ok(permissions) = u16::try_from(mode & 0x0fff) else {
+        let Ok(info) = self.resolve(path) else {
             return false;
         };
-        let Ok(inode) = self.resolve(&path) else {
-            return false;
-        };
-        self.commit(4, &mut |transaction| {
-            transaction.update_metadata(
-                &inode,
-                InodeMetadataUpdate {
-                    permissions: Some(permissions),
-                    uid: Some(uid),
-                    gid: Some(gid),
-                    ..InodeMetadataUpdate::default()
+        self.filesystem
+            .borrow_mut()
+            .update_attributes(
+                info.object,
+                AttributeUpdate {
+                    format: Some((info.format & TYPE_MASK) | mode as u16 & 0x0fff),
+                    owner: Some(uid),
+                    group: Some(gid),
+                    ..AttributeUpdate::default()
                 },
             )
-        })
+            .is_ok()
     }
 
     fn remove(&self, path: &[u8]) -> i32 {
         let Some(path) = Self::path(path) else {
             return -22;
         };
-        let Ok((parent, entry)) = self.parent_entry(&path) else {
+        let Ok((_, edge)) = self.parent_edge(path) else {
             return -2;
         };
-        if self.open_files.borrow().contains_inode(entry.inode.number) {
+        if matches!(edge.object, Object::Node(_)) {
+            return -21;
+        }
+        if self.open.borrow().contains(edge.object) {
             return -16;
         }
-        if self.commit(64, &mut |transaction| {
-            transaction.remove_entry(&parent, &entry)
-        }) {
-            0
-        } else {
-            -5
-        }
+        self.filesystem
+            .borrow_mut()
+            .remove(edge.handle)
+            .map_or(-5, |_| 0)
     }
 
     fn clunk(&self, handle: u64) {
-        self.open_files.borrow_mut().remove(handle);
+        self.open.borrow_mut().remove(handle);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    extern crate std;
-
-    use super::{Filesystem, PortableExt4Fs, is_ext};
-    use crate::kernel::block::{Disk, Volume};
-    use alloc::boxed::Box;
-    use alloc::vec;
-    use alloc::vec::Vec;
-    use core::cell::RefCell;
-
-    struct ImageDisk {
-        bytes: RefCell<Vec<u8>>,
-    }
-
-    impl Disk for ImageDisk {
-        fn read(&self, lba: u64, buffer: &mut [u8]) -> u32 {
-            let start = lba as usize * 512;
-            let bytes = self.bytes.borrow();
-            let Some(bytes) = bytes.get(start..start + buffer.len()) else {
-                return 0;
-            };
-            buffer.copy_from_slice(bytes);
-            buffer.len().div_ceil(512) as u32
-        }
-
-        fn write(&self, lba: u64, buffer: &[u8]) -> u32 {
-            let start = lba as usize * 512;
-            let mut bytes = self.bytes.borrow_mut();
-            let Some(destination) = bytes.get_mut(start..start + buffer.len()) else {
-                return 0;
-            };
-            destination.copy_from_slice(buffer);
-            buffer.len().div_ceil(512) as u32
-        }
-
-        fn sectors(&self) -> u64 {
-            (self.bytes.borrow().len() / 512) as u64
-        }
-
-        fn name(&self) -> &str {
-            "portable-ext4-test"
-        }
-    }
-
-    fn filesystem_from(relative: &str) -> PortableExt4Fs {
-        let image =
-            std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap()).join(relative);
-        let bytes = std::fs::read(image).unwrap();
-        let disk: &'static dyn Disk = Box::leak(Box::new(ImageDisk {
-            bytes: RefCell::new(bytes),
-        }));
-        PortableExt4Fs::new(Volume::whole(disk)).unwrap()
-    }
-
-    fn filesystem() -> PortableExt4Fs {
-        filesystem_from(env!("EXT4_MODERN_IMAGE"))
-    }
-
-    fn volume(bytes: Vec<u8>) -> Volume {
-        let disk: &'static dyn Disk = Box::leak(Box::new(ImageDisk {
-            bytes: RefCell::new(bytes),
-        }));
-        Volume::whole(disk)
-    }
-
-    #[test]
-    fn ext_probe_reads_the_superblock_magic() {
-        let mut image = vec![0; 2048];
-        image[1024 + 56..1024 + 58].copy_from_slice(&[0x53, 0xef]);
-        assert!(is_ext(&volume(image)));
-        assert!(!is_ext(&volume(vec![0; 2048])));
-    }
-
-    #[test]
-    fn vfs_adapter_mounts_current_distro_default_profile() {
-        let filesystem = filesystem_from(env!("EXT4_MODERN_DEFAULTS_IMAGE"));
-        let file = filesystem.open(b"file-0.txt").unwrap();
-        let mut contents = [0; 14];
-        assert_eq!(
-            filesystem.read(file.handle, 0, &mut contents, file.size),
-            14
-        );
-        assert_eq!(&contents, b"portable ext4\n");
-    }
-
-    #[test]
-    fn vfs_adapter_reads_symlinks_and_resumes_directories() {
-        let fs = filesystem();
-        for path in [
-            &b"dir/hello.link"[..],
-            &b"dir/parent.link"[..],
-            &b"dir/absolute.link"[..],
-            &b"dir/chained.link"[..],
-        ] {
-            assert!(fs.open(path).is_none());
-        }
-        let mut target = [0; 32];
-        let len = fs.readlink(b"dir/parent.link", &mut target).unwrap();
-        assert_eq!(&target[..len], b"../root-data.bin");
-        let len = fs.readlink(b"dir/absolute.link", &mut target).unwrap();
-        assert_eq!(&target[..len], b"/root-data.bin");
-
-        let link_stat = fs.stat(b"dir/parent.link", false).unwrap();
-        assert!(link_stat.is_symlink);
-        assert!(!link_stat.is_dir);
-        assert_eq!(link_stat.size, b"../root-data.bin".len() as u32);
-        let target_stat = fs.stat(b"dir/parent.link", true).unwrap();
-        assert!(target_stat.is_symlink);
-        assert_eq!(target_stat.size, b"../root-data.bin".len() as u32);
-
-        let long_path = b"long-dir.link/hello.txt";
-        assert!(fs.open(long_path).is_none());
-        assert!(!fs.dir_exists(b"long-dir.link"));
-
-        let mut root_entries = Vec::new();
-        fs.readdir(b"", 0, &mut root_entries, 32);
-        let directory_link = root_entries
-            .iter()
-            .find(|entry| &entry.name[..entry.name_len] == b"dir.link")
-            .unwrap();
-        assert!(directory_link.is_symlink);
-        assert!(!directory_link.is_dir);
-        assert!(!fs.dir_exists(b"dir.link"));
-        let long_directory_link = root_entries
-            .iter()
-            .find(|entry| &entry.name[..entry.name_len] == b"long-dir.link")
-            .unwrap();
-        assert!(long_directory_link.is_symlink);
-        assert!(!long_directory_link.is_dir);
-
-        let mut entries = Vec::new();
-        let mut cookie = 0;
-        loop {
-            match fs.readdir(b"dir", cookie, &mut entries, 19) {
-                Some(next) => cookie = next,
-                None => break,
-            }
-        }
-        assert_eq!(entries.len(), 306);
-        assert!(
-            entries
-                .iter()
-                .any(|entry| { &entry.name[..entry.name_len] == b"file-299" && entry.size == 14 })
-        );
-    }
-
-    #[test]
-    fn vfs_adapter_mutates_files_and_directories() {
-        let fs = filesystem();
-        let vnode = fs.create(b"adapter-new").unwrap();
-        let stale_handle = vnode.handle;
-        let payload = vec![0x5a; 6000];
-        assert_eq!(fs.write(vnode.handle, 0, &payload), payload.len() as i32);
-        fs.clunk(vnode.handle);
-
-        let vnode = fs.open(b"adapter-new").unwrap();
-        assert_ne!(vnode.handle, stale_handle);
-        assert_eq!(fs.read(stale_handle, 0, &mut [0; 1], 1), -9);
-        let mut contents = vec![0; payload.len()];
-        assert_eq!(
-            fs.read(vnode.handle, 0, &mut contents, vnode.size),
-            payload.len() as i32
-        );
-        assert_eq!(contents, payload);
-        fs.clunk(vnode.handle);
-
-        assert_eq!(fs.mkdir(b"adapter-dir"), 0);
-        assert_eq!(fs.rename(b"adapter-new", b"adapter-dir/moved"), 0);
-        assert!(fs.set_mtime(b"adapter-dir/moved", 1_700_000_000));
-        assert!(fs.set_meta(b"adapter-dir/moved", 12, 34, 0o640));
-        assert_eq!(fs.mtime(b"adapter-dir/moved"), Some(1_700_000_000));
-        assert_eq!(fs.remove(b"adapter-dir/moved"), 0);
-        assert_eq!(fs.rmdir(b"adapter-dir"), 0);
-    }
+fn graph_blob(info: ObjectInfo) -> Option<Blob> {
+    info.blob()
+        .filter(|_| info.format & TYPE_MASK != TYPE_SYMLINK)
 }

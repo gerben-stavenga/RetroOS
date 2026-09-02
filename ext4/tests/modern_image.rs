@@ -1,7 +1,5 @@
-use portable_ext4::test_support::{
-    EffectKind, Inject, ModelError, ModelStorage, PathExt4, PathTransaction,
-};
-use portable_ext4::{Corrupt, Error, Ext4, Timestamp};
+use portable_ext4::test_support::{Inject, ModelError, ModelStorage};
+use portable_ext4::Error;
 
 fn image() -> Vec<u8> {
     let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
@@ -18,12 +16,6 @@ fn multi_group_image() -> Vec<u8> {
 fn inode_group_image() -> Vec<u8> {
     let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
         .join(env!("EXT4_INODE_GROUP_IMAGE"));
-    std::fs::read(image_path).unwrap()
-}
-
-fn linear_directory_image() -> Vec<u8> {
-    let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
-        .join(env!("EXT4_LINEAR_DIRECTORY_IMAGE"));
     std::fs::read(image_path).unwrap()
 }
 
@@ -47,14 +39,6 @@ fn put_le16(bytes: &mut [u8], offset: usize, value: u16) {
 
 fn put_le32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_be16(bytes: &mut [u8], offset: usize, value: u16) {
-    bytes[offset..offset + 2].copy_from_slice(&value.to_be_bytes());
-}
-
-fn put_be32(bytes: &mut [u8], offset: usize, value: u32) {
-    bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
 }
 
 fn crc32c(mut crc: u32, bytes: &[u8]) -> u32 {
@@ -96,7 +80,7 @@ fn update_fragmentation_checksums(bytes: &mut [u8]) {
 }
 
 /// Occupy every second free group-0 block without attaching it to an inode.
-/// The returned list can be released after the transaction, restoring a
+/// The returned list can be released after the operation, restoring a
 /// completely ordinary filesystem for e2fsck while forcing deterministic
 /// one-block allocation runs during the operation under test.
 fn add_artificial_fragmentation(bytes: &mut [u8], gaps: usize) -> Vec<u64> {
@@ -165,3063 +149,675 @@ fn adjust_artificial_free_counts(bytes: &mut [u8], delta: i64) {
     put_le32(bytes, SUPERBLOCK + 0x158, (super_free >> 32) as u32);
 }
 
-fn image_with_committed_journal_update() -> Vec<u8> {
-    const SUPERBLOCK: usize = 1024;
-    const JBD2_MAGIC: u32 = 0xc03b_3998;
-    let mut bytes = image();
-    let block_size = 1024usize << le32(&bytes, SUPERBLOCK + 0x18);
+#[test]
+fn graph_api_reads_typed_objects_directly() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
-    let mut probe_storage = ModelStorage::new(bytes.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let mut old_contents = [0; 14];
-    probe
-        .read(&mut probe_storage, "/dir/hello.txt", 0, &mut old_contents)
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut data = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            if edge.name == b"root-data.bin" {
+                data = Some(edge.object);
+            }
+            Ok(true)
+        })
         .unwrap();
-    let target = probe_storage.effects().last().unwrap().offset / block_size as u64;
-
-    let descriptor_table = block_size;
-    let inode_table = le32(&bytes, descriptor_table + 8) as usize;
-    let inode_size = usize::from(le16(&bytes, SUPERBLOCK + 0x58));
-    let journal_inode = inode_table * block_size + 7 * inode_size;
-    let extent_root = journal_inode + 0x28;
-    assert_eq!(le16(&bytes, extent_root), 0xf30a);
-    assert_eq!(le16(&bytes, extent_root + 6), 0);
-    assert_eq!(le32(&bytes, extent_root + 12), 0);
-    let journal_start = (u64::from(le16(&bytes, extent_root + 18)) << 32)
-        | u64::from(le32(&bytes, extent_root + 20));
-    let journal_start = journal_start as usize * block_size;
-
-    let sequence = u32::from_be_bytes(
-        bytes[journal_start + 0x18..journal_start + 0x1c]
-            .try_into()
-            .unwrap(),
+    let Object::Blob(blob) = data.unwrap() else {
+        panic!("root-data.bin is not a blob")
+    };
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
+            .unwrap()
+            .size,
+        14
     );
-    put_be32(&mut bytes, journal_start + 0x1c, 1);
-
-    let descriptor = journal_start + block_size;
-    bytes[descriptor..descriptor + block_size].fill(0);
-    put_be32(&mut bytes, descriptor, JBD2_MAGIC);
-    put_be32(&mut bytes, descriptor + 4, 1);
-    put_be32(&mut bytes, descriptor + 8, sequence);
-    put_be32(&mut bytes, descriptor + 12, target as u32);
-    put_be16(&mut bytes, descriptor + 18, 8); // last tag
-    let uuid = bytes[journal_start + 0x30..journal_start + 0x40].to_vec();
-    bytes[descriptor + 20..descriptor + 36].copy_from_slice(&uuid);
-
-    let data = journal_start + 2 * block_size;
-    let home = target as usize * block_size;
-    let home_block = bytes[home..home + block_size].to_vec();
-    bytes[data..data + block_size].copy_from_slice(&home_block);
-    bytes[data..data + 14].copy_from_slice(b"journal ext4!\n");
-
-    let commit = journal_start + 3 * block_size;
-    bytes[commit..commit + block_size].fill(0);
-    put_be32(&mut bytes, commit, JBD2_MAGIC);
-    put_be32(&mut bytes, commit + 4, 2);
-    put_be32(&mut bytes, commit + 8, sequence);
-
-    let incompat = le32(&bytes, SUPERBLOCK + 0x60) | 4;
-    bytes[SUPERBLOCK + 0x60..SUPERBLOCK + 0x64].copy_from_slice(&incompat.to_le_bytes());
-    let checksum = crc32c(u32::MAX, &bytes[SUPERBLOCK..SUPERBLOCK + 0x3fc]);
-    bytes[SUPERBLOCK + 0x3fc..SUPERBLOCK + 0x400].copy_from_slice(&checksum.to_le_bytes());
-    bytes
+    let mut contents = [0; 14];
+    assert_eq!(
+        graph.read(&mut storage, blob, 0, &mut contents).unwrap(),
+        14
+    );
+    assert_eq!(&contents, b"portable ext4\n");
 }
 
-fn image_with_checksum_v3_journal() -> Vec<u8> {
-    const SUPERBLOCK: usize = 1024;
-    let mut bytes = image();
-    let block_size = 1024usize << le32(&bytes, SUPERBLOCK + 0x18);
-    let descriptor_table = block_size;
-    let inode_table = le32(&bytes, descriptor_table + 8) as usize;
-    let inode_size = usize::from(le16(&bytes, SUPERBLOCK + 0x58));
-    let journal_inode = inode_table * block_size + 7 * inode_size;
-    let extent_root = journal_inode + 0x28;
-    assert_eq!(le16(&bytes, extent_root), 0xf30a);
-    assert_eq!(le32(&bytes, extent_root + 12), 0);
-    let journal_start = ((u64::from(le16(&bytes, extent_root + 18)) << 32)
-        | u64::from(le32(&bytes, extent_root + 20))) as usize
-        * block_size;
+#[test]
+fn graph_api_owns_detached_blob_references() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
-    put_be32(&mut bytes, journal_start + 0x28, 16);
-    bytes[journal_start + 0x50] = 4;
-    put_be32(&mut bytes, journal_start + 0xfc, 0);
-    let checksum = crc32c(u32::MAX, &bytes[journal_start..journal_start + 1024]);
-    put_be32(&mut bytes, journal_start + 0xfc, checksum);
-    bytes
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let created = graph.create_blob(&mut storage).unwrap();
+    let Object::Blob(blob) = created.object() else {
+        panic!("create_blob returned a node")
+    };
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
+            .unwrap()
+            .references,
+        1
+    );
+    let retained = graph.retain(&mut storage, blob).unwrap();
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
+            .unwrap()
+            .references,
+        2
+    );
+    graph.release(&mut storage, retained).unwrap();
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
+            .unwrap()
+            .references,
+        1
+    );
 }
 
-fn assert_atomic_file_view(bytes: &[u8], file_name: &str, context: &str) -> bool {
-    let mut remounted_storage = ModelStorage::new(bytes.to_vec());
-    let mut remounted = Ext4::mount(&mut remounted_storage)
-        .unwrap_or_else(|error| panic!("{context} failed remount: {error:?}"));
-    let is_new = match remounted.stat(&mut remounted_storage, file_name) {
-        Ok(inode) => {
-            assert_eq!(inode.mode, 0o100644, "{context}");
-            assert_eq!(inode.size, 0, "{context}");
-            true
-        }
-        Err(Error::NotFound) => false,
-        Err(error) => panic!("{context} exposed {error:?}"),
+#[test]
+fn graph_api_resizes_extent_blob() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
+
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut data = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            if edge.name == b"root-data.bin" {
+                data = Some(edge.object);
+            }
+            Ok(true)
+        })
+        .unwrap();
+    let Object::Blob(blob) = data.unwrap() else {
+        panic!("root-data.bin is not a blob")
     };
 
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join(format!("journal-{context}.img"));
-    std::fs::write(&output_path, bytes).unwrap();
-    let recovery = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fy", output_path.to_str().unwrap()])
-        .output()
+    graph.resize(&mut storage, blob, 15_000).unwrap();
+    graph
+        .write(&mut storage, blob, 3_500, b"cross-block-write")
         .unwrap();
-    assert!(
-        matches!(recovery.status.code(), Some(0 | 1)),
-        "e2fsck could not recover {context}:\n{}\n{}",
-        String::from_utf8_lossy(&recovery.stdout),
-        String::from_utf8_lossy(&recovery.stderr)
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
+            .unwrap()
+            .size,
+        15_000
     );
+    let mut grown = vec![0x55; 15_000];
+    assert_eq!(
+        graph.read(&mut storage, blob, 0, &mut grown).unwrap(),
+        15_000
+    );
+    assert_eq!(&grown[..14], b"portable ext4\n");
+    assert!(grown[14..3_500].iter().all(|byte| *byte == 0));
+    assert_eq!(&grown[3_500..3_517], b"cross-block-write");
+    assert!(grown[3_517..].iter().all(|byte| *byte == 0));
+
+    graph.resize(&mut storage, blob, 5_000).unwrap();
+    let mut shrunk = vec![0; 5_000];
+    assert_eq!(
+        graph.read(&mut storage, blob, 0, &mut shrunk).unwrap(),
+        5_000
+    );
+    assert_eq!(&shrunk[..14], b"portable ext4\n");
+    assert!(shrunk[14..3_500].iter().all(|byte| *byte == 0));
+    assert_eq!(&shrunk[3_500..3_517], b"cross-block-write");
+    assert!(shrunk[3_517..].iter().all(|byte| *byte == 0));
+
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-resized.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
     let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
+        .args(["-fn", output.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "e2fsck recovery left errors in {context}:\n{}\n{}",
+        "e2fsck rejected graph resize:\n{}\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
-    is_new
 }
 
 #[test]
-fn reads_file_from_mke2fs_image() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let inode = fs.stat(&mut fs_storage, "/dir/hello.txt").unwrap();
-    assert_eq!(inode.size, 14);
+fn graph_api_collapses_external_extent_leaf() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
 
-    let mut contents = [0; 32];
-    let count = fs
-        .read(&mut fs_storage, "/dir/hello.txt", 0, &mut contents)
-        .unwrap();
-    assert_eq!(&contents[..count], b"portable ext4\n");
-
-    let count = fs
-        .read(&mut fs_storage, "/dir/file-299", 0, &mut contents)
-        .unwrap();
-    assert_eq!(&contents[..count], b"portable ext4\n");
-}
-
-#[test]
-fn iterates_indexed_directory_with_opaque_cookies_and_reads_symlink() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut entries = Vec::new();
-    let mut cookie = 0;
-    loop {
-        let before = entries.len();
-        match fs
-            .read_dir(&mut fs_storage, "/dir", cookie, &mut entries, 17)
-            .unwrap()
-        {
-            Some(next) => {
-                assert!(next > cookie);
-                assert_eq!(entries.len() - before, 17);
-                cookie = next;
+    let mut fragmented = image();
+    let artificial = add_artificial_fragmentation(&mut fragmented, 6);
+    let mut storage = ModelStorage::new(fragmented);
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut data = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            if edge.name == b"root-empty.bin" {
+                data = Some(edge.object);
             }
-            None => break,
-        }
-    }
-    assert_eq!(entries.len(), 306);
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    assert!(entries.iter().any(|entry| entry.name == b"empty.bin"));
-    assert!(entries.iter().any(|entry| entry.name == b"file-299"));
-    let link = entries
-        .iter()
-        .find(|entry| entry.name == b"hello.link")
+            Ok(true)
+        })
         .unwrap();
-    assert!(link.inode.is_symlink());
-    assert_eq!(
-        fs.read_link(&mut fs_storage, "/dir/hello.link").unwrap(),
-        b"hello.txt"
-    );
-    let mut contents = [0; 14];
-    assert_eq!(
-        fs.read(&mut fs_storage, "/dir/hello.link", 0, &mut contents)
-            .unwrap(),
-        14
-    );
-    assert_eq!(&contents, b"portable ext4\n");
-    assert_eq!(
-        fs.read(&mut fs_storage, "/dir.link/hello.txt", 0, &mut contents)
-            .unwrap(),
-        14
-    );
-    assert_eq!(&contents, b"portable ext4\n");
-}
+    let Object::Blob(blob) = data.unwrap() else {
+        panic!("root-empty.bin is not a blob")
+    };
 
-#[test]
-fn replays_committed_journal_from_mke2fs_image_without_writing() {
-    let image = image_with_committed_journal_update();
-    let mut fs_storage = ModelStorage::new(image.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut contents = [0; 14];
-    assert_eq!(
-        fs.read(&mut fs_storage, "/dir/hello.txt", 0, &mut contents)
-            .unwrap(),
-        14
-    );
-    assert_eq!(&contents, b"journal ext4!\n");
-    assert_eq!(fs.recovered_blocks(), 1);
-    assert_eq!(fs_storage.durable_bytes(), image);
-}
-
-#[test]
-fn commits_created_file_through_checksum_v3_journal() {
-    let image = image_with_checksum_v3_journal();
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/", "committed.bin", 0o640)
+    for logical in 0..6 {
+        graph
+            .write(&mut storage, blob, logical * 4096, &[logical as u8 + 1])
             .unwrap();
-        transaction.commit().unwrap();
     }
-    let storage = fs_storage;
-    assert_eq!(storage.pending_writes(), 0);
-    let durable = storage.durable_bytes().to_vec();
-
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let inode = remounted
-        .stat(&mut remounted_storage, "/committed.bin")
-        .unwrap();
-    assert_eq!(inode.mode, 0o100640);
-    assert_eq!(inode.size, 0);
-    assert_eq!(remounted.recovered_blocks(), 0);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("journal-committed.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected journal commit:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn commits_through_normal_mke2fs_unchecksummed_journal() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/", "normal.bin", 0o644)
-            .unwrap();
-        transaction.commit().unwrap();
+    for logical in 0..6 {
+        let mut byte = [0];
+        assert_eq!(
+            graph
+                .read(&mut storage, blob, logical * 4096, &mut byte)
+                .unwrap(),
+            1
+        );
+        assert_eq!(byte[0], logical as u8 + 1);
     }
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
+    graph.resize(&mut storage, blob, 0).unwrap();
     assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/normal.bin")
-            .unwrap()
-            .mode,
-        0o100644
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("normal-journal-commit.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected normal journal commit:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn initializes_and_commits_multiblock_file() {
-    let mut payload: Vec<u8> = (0..9000).map(|index| (index % 251) as u8).collect();
-    payload[..4].copy_from_slice(&0xc03b_3998u32.to_be_bytes());
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction
-            .initialize_file("/dir/empty.bin", &payload)
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 7);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/dir/empty.bin")
+        graph
+            .inspect(&mut storage, Object::Blob(blob))
             .unwrap()
             .size,
-        9000
+        0
     );
-    let mut contents = vec![0; payload.len()];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/empty.bin", 0, &mut contents)
-            .unwrap(),
-        payload.len()
-    );
-    assert_eq!(contents, payload);
 
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("initialized-multiblock.img");
-    std::fs::write(&output_path, durable).unwrap();
+    storage.flush().unwrap();
+    let mut durable = storage.durable_bytes().to_vec();
+    remove_artificial_fragmentation(&mut durable, &artificial);
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-external-resized.img");
+    std::fs::write(&output, durable).unwrap();
     let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
+        .args(["-fn", output.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "e2fsck rejected initialized multi-block file:\n{}\n{}",
+        "e2fsck rejected graph external resize:\n{}\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
 }
 
 #[test]
-fn appends_across_partial_and_new_blocks() {
-    let mut appended: Vec<u8> = (0..9000).map(|index| (index % 239) as u8).collect();
-    appended[4082..4086].copy_from_slice(&0xc03b_3998u32.to_be_bytes());
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.append("/dir/hello.txt", &appended).unwrap();
-        assert_eq!(transaction.dirty_blocks(), 7);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
+fn graph_api_resizes_unwritten_extent() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
 
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
+    let mut storage = ModelStorage::new(extent_mutation_image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut data = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            if edge.name == b"unwritten.bin" {
+                data = Some(edge.object);
+            }
+            Ok(true)
+        })
+        .unwrap();
+    let Object::Blob(blob) = data.unwrap() else {
+        panic!("unwritten.bin is not a blob")
+    };
+
+    graph.resize(&mut storage, blob, 5_000).unwrap();
+    graph.resize(&mut storage, blob, 12_000).unwrap();
+    graph
+        .write(&mut storage, blob, 5_000, b"initialized-subrange")
+        .unwrap();
+    let mut contents = vec![1; 12_000];
     assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/dir/hello.txt")
-            .unwrap()
-            .size,
-        9014
-    );
-    let mut contents = vec![0; 9014];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/hello.txt", 0, &mut contents)
-            .unwrap(),
+        graph.read(&mut storage, blob, 0, &mut contents).unwrap(),
         contents.len()
     );
-    assert_eq!(&contents[..14], b"portable ext4\n");
-    assert_eq!(&contents[14..], appended);
+    assert!(contents[..5_000].iter().all(|byte| *byte == 0));
+    assert_eq!(&contents[5_000..5_020], b"initialized-subrange");
+    assert!(contents[5_020..].iter().all(|byte| *byte == 0));
 
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("appended-multiblock.img");
-    std::fs::write(&output_path, durable).unwrap();
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-unwritten-resized.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
     let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
+        .args(["-fn", output.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "e2fsck rejected appended multi-block file:\n{}\n{}",
+        "e2fsck rejected graph unwritten resize:\n{}\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
 }
 
 #[test]
-fn writes_across_eof_and_resizes_through_one_file_editor() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut expected = vec![0x31; 9_000];
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction
-            .initialize_file("/root-empty.bin", &expected)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
+fn graph_api_owns_edges_and_reclaims_objects() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
 
-    let crossing = vec![0x72; 6_000];
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction
-            .write_at("/root-empty.bin", 3_500, &crossing)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.resize(9_500, 0);
-    expected[3_500..9_500].copy_from_slice(&crossing);
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
 
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction.resize("/root-empty.bin", 15_000).unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.resize(15_000, 0);
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction.resize("/root-empty.bin", 5_000).unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.truncate(5_000);
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction.resize("/root-empty.bin", 7_000).unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.resize(7_000, 0);
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let mut actual = vec![0; expected.len()];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/root-empty.bin", 0, &mut actual)
-            .unwrap(),
-        actual.len()
-    );
-    assert_eq!(actual, expected);
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("file-editor-resize.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected file editor resize:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn writes_sparse_and_unwritten_extents_from_e2fsprogs() {
-    let mut storage = ModelStorage::new(extent_mutation_image());
-    let mut fs = Ext4::mount(&mut storage).unwrap();
-
-    let mut unwritten_before = vec![0x55; 32_768];
-    assert_eq!(
-        fs.read(&mut storage, "/unwritten.bin", 0, &mut unwritten_before)
-            .unwrap(),
-        unwritten_before.len()
-    );
-    assert!(unwritten_before.iter().all(|byte| *byte == 0));
-
-    let sparse_write = b"mapped-inside-a-hole";
-    let unwritten_write = b"initialized-subrange";
-    {
-        let mut transaction = fs.begin_transaction(&mut storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction
-            .write_at("/sparse.bin", 1_000, sparse_write)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut storage);
-        transaction.reserve_blocks(16).unwrap();
-        transaction
-            .write_at("/unwritten.bin", 5_000, unwritten_write)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let mut sparse = vec![0; 65_536];
-    remounted
-        .read(&mut remounted_storage, "/sparse.bin", 0, &mut sparse)
-        .unwrap();
-    assert_eq!(&sparse[1_000..1_000 + sparse_write.len()], sparse_write);
-    assert_eq!(&sparse[60_000..60_011], b"sparse-tail");
-    let mut unwritten = vec![0; 32_768];
-    remounted
-        .read(&mut remounted_storage, "/unwritten.bin", 0, &mut unwritten)
-        .unwrap();
-    assert_eq!(
-        &unwritten[5_000..5_000 + unwritten_write.len()],
-        unwritten_write
-    );
-    assert!(unwritten[..5_000].iter().all(|byte| *byte == 0));
-    assert!(
-        unwritten[5_000 + unwritten_write.len()..]
-            .iter()
-            .all(|byte| *byte == 0)
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("sparse-unwritten.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected sparse/unwritten mutations:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn allocates_one_transaction_across_two_block_groups() {
-    let original = multi_group_image();
-    let descriptor_table = 4096usize;
-    let descriptor_size = usize::from(le16(&original, 1024 + 0xfe));
-    assert_eq!(le32(&original, 1024 + 0x20), 1024);
-    assert_eq!(descriptor_size, 64);
-    let free = |bytes: &[u8], group: usize| {
-        let descriptor = descriptor_table + group * descriptor_size;
-        u64::from(le16(bytes, descriptor + 0x0c))
-            | (u64::from(le16(bytes, descriptor + 0x2c)) << 16)
+    let blob = graph.create_blob(&mut storage).unwrap();
+    let Object::Blob(blob_id) = blob.object() else {
+        panic!("create_blob returned a node")
     };
-    let flags =
-        |bytes: &[u8], group: usize| le16(bytes, descriptor_table + group * descriptor_size + 0x12);
-    assert_eq!(free(&original, 0), 2);
-    assert!(free(&original, 1) >= 2);
-    assert_ne!(flags(&original, 1) & 0x0002, 0);
-
-    let payload: Vec<u8> = (0..9000).map(|index| (index % 197) as u8).collect();
-    let mut fs_storage = ModelStorage::new(original.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(8).unwrap();
-        transaction
-            .initialize_file("/target.bin", &payload)
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 8);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    assert_eq!(free(&durable, 0), 0);
-    assert_eq!(free(&durable, 1), free(&original, 1) - 1);
-    assert_eq!(flags(&durable, 1) & 0x0002, 0);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
+    graph
+        .write(&mut storage, blob_id, 0, b"graph payload")
+        .unwrap();
+    let (blob_edge, displaced) = graph
+        .attach(&mut storage, root, b"graph-object", blob)
+        .unwrap();
+    assert!(displaced.is_none());
+    let detached_blob = graph.detach(&mut storage, blob_edge).unwrap();
+    let mut payload = [0; 13];
     assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/target.bin")
-            .unwrap()
-            .size,
-        9000
-    );
-    let mut contents = vec![0; payload.len()];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/target.bin", 0, &mut contents)
-            .unwrap(),
+        graph.read(&mut storage, blob_id, 0, &mut payload).unwrap(),
         payload.len()
     );
-    assert_eq!(contents, payload);
+    assert_eq!(&payload, b"graph payload");
+    graph.release(&mut storage, detached_blob).unwrap();
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Blob(blob_id))
+            .unwrap_err(),
+        Error::NotFound
+    );
 
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("allocated-across-groups.img");
-    std::fs::write(&output_path, durable).unwrap();
+    let node = graph.create_node(&mut storage).unwrap();
+    let Object::Node(node_id) = node.object() else {
+        panic!("create_node returned a blob")
+    };
+    let (node_edge, displaced) = graph
+        .attach(&mut storage, root, b"graph-node", node)
+        .unwrap();
+    assert!(displaced.is_none());
+    let detached_node = graph.detach(&mut storage, node_edge).unwrap();
+    graph.release(&mut storage, detached_node).unwrap();
+    assert_eq!(
+        graph
+            .inspect(&mut storage, Object::Node(node_id))
+            .unwrap_err(),
+        Error::NotFound
+    );
+
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-owned-edges.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
     let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
+        .args(["-fn", output.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "e2fsck rejected cross-group allocation:\n{}\n{}",
+        "e2fsck rejected graph ownership:\n{}\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
 }
 
 #[test]
-fn every_cross_group_allocation_read_is_fallible_before_dirtying() {
-    let image = multi_group_image();
-    let payload = vec![0x74; 9000];
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(8).unwrap();
-    transaction
-        .initialize_file("/target.bin", &payload)
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
+fn graph_api_mutates_indexed_node_through_linear_graph_representation() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
 
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(8).unwrap();
-                assert!(
-                    (transaction
-                        .initialize_file("/target.bin", &payload)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut directory = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            if edge.name == b"dir" {
+                directory = Some(edge.object);
             }
-        }
-    }
+            Ok(true)
+        })
+        .unwrap();
+    let Object::Node(directory) = directory.unwrap() else {
+        panic!("dir is not a node")
+    };
+
+    let mut original_edges = 0;
+    let mut found_last = false;
+    graph
+        .edges(&mut storage, directory, Default::default(), &mut |edge| {
+            original_edges += 1;
+            found_last |= edge.name == b"file-299";
+            Ok(true)
+        })
+        .unwrap();
+    assert!(original_edges >= 306);
+    assert!(found_last);
+
+    let object = graph.create_blob(&mut storage).unwrap();
+    let Object::Blob(blob) = object.object() else {
+        panic!("create_blob returned a node")
+    };
+    graph
+        .write(&mut storage, blob, 0, b"indexed graph")
+        .unwrap();
+    let (_, displaced) = graph
+        .attach(&mut storage, directory, b"new-graph-edge", object)
+        .unwrap();
+    assert!(displaced.is_none());
+
+    let mut found = false;
+    graph
+        .edges(&mut storage, directory, Default::default(), &mut |edge| {
+            if edge.name == b"new-graph-edge" {
+                assert_eq!(edge.object, Object::Blob(blob));
+                found = true;
+            }
+            Ok(true)
+        })
+        .unwrap();
+    assert!(found);
+
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-indexed-node.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "e2fsck rejected graph indexed-node conversion:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
 }
 
 #[test]
-fn creates_inode_in_a_lazily_initialized_later_group() {
-    let original = inode_group_image();
-    let descriptor_table = 4096usize;
-    let descriptor_size = usize::from(le16(&original, 1024 + 0xfe));
-    let descriptor = |group: usize| descriptor_table + group * descriptor_size;
-    let free_inodes = |bytes: &[u8], group: usize| {
-        let at = descriptor(group);
-        u32::from(le16(bytes, at + 0x0e)) | (u32::from(le16(bytes, at + 0x2e)) << 16)
-    };
-    let flags = |bytes: &[u8], group: usize| le16(bytes, descriptor(group) + 0x12);
-    let unused = |bytes: &[u8], group: usize| {
-        let at = descriptor(group);
-        u32::from(le16(bytes, at + 0x1c)) | (u32::from(le16(bytes, at + 0x3c)) << 16)
-    };
-    assert_eq!(le32(&original, 1024 + 0x28), 1024);
-    assert_eq!(free_inodes(&original, 0), 0);
-    assert_eq!(free_inodes(&original, 1), 1024);
-    assert_eq!(flags(&original, 1) & 0x0007, 0x0007);
+fn graph_api_materializes_lazy_inode_and_block_groups() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::Storage;
 
-    let mut fs_storage = ModelStorage::new(original.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let created;
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        created = transaction
-            .create_empty_file("/create", "cross.bin", 0o640)
+    for (name, source, payload) in [
+        ("lazy-inode", inode_group_image(), Vec::new()),
+        ("lazy-block", multi_group_image(), vec![0x5a; 3 * 4096]),
+    ] {
+        let mut storage = ModelStorage::new(source);
+        let mut graph = Graph::mount(&mut storage).unwrap();
+        let root = graph.root(&mut storage).unwrap();
+        let detached = graph.create_blob(&mut storage).unwrap();
+        let Object::Blob(blob) = detached.object() else {
+            panic!("create_blob returned a node")
+        };
+        graph.write(&mut storage, blob, 0, &payload).unwrap();
+        graph
+            .attach(&mut storage, root, name.as_bytes(), detached)
             .unwrap();
-        assert_eq!(created, 1025);
-        assert_eq!(transaction.dirty_blocks(), 6);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
 
-    let durable = fs_storage.durable_bytes().to_vec();
-    assert_eq!(free_inodes(&durable, 1), 1023);
-    assert_eq!(unused(&durable, 1), 1023);
-    assert_eq!(flags(&durable, 1) & 0x0003, 0);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let inode = remounted
-        .stat(&mut remounted_storage, "/create/cross.bin")
-        .unwrap();
-    assert_eq!(inode.number, created);
-    assert_eq!(inode.mode, 0o100640);
-    assert_eq!(inode.size, 0);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("inode-allocated-across-groups.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected cross-group inode allocation:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_cross_group_inode_read_is_fallible_before_dirtying() {
-    let image = inode_group_image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(6).unwrap();
-    transaction
-        .create_empty_file("/create", "cross.bin", 0o640)
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(6).unwrap();
-                assert!(
-                    (transaction
-                        .create_empty_file("/create", "cross.bin", 0o640)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn unlinks_an_empty_inode_from_a_later_group() {
-    let image = inode_group_image();
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        assert_eq!(
-            transaction
-                .create_empty_file("/create", "cross-unlink.bin", 0o600)
-                .unwrap(),
-            1025
+        storage.flush().unwrap();
+        let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+            .join(format!("graph-{name}.img"));
+        std::fs::write(&output, storage.durable_bytes()).unwrap();
+        let check = std::process::Command::new("/usr/sbin/e2fsck")
+            .args(["-fn", output.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "e2fsck rejected {name}:\n{}\n{}",
+            String::from_utf8_lossy(&check.stdout),
+            String::from_utf8_lossy(&check.stderr)
         );
-        transaction.commit().unwrap();
     }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction.unlink("/create/cross-unlink.bin").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 5);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/create/cross-unlink.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-later-group-inode.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected later-group inode unlink:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
 }
 
 #[test]
-fn creates_and_removes_directory_in_a_lazy_later_group() {
-    let image = inode_group_image();
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(8).unwrap();
-        assert_eq!(transaction.mkdir("/create", "later", 0o755).unwrap(), 1025);
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.rmdir("/create/later").unwrap();
-        transaction.commit().unwrap();
+fn graph_composition_commits_complete_blocks_through_journal() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::{BlockOverlay, GraphJournal, Storage, StorageError};
+
+    struct Recovered<'a> {
+        journal: &'a GraphJournal,
+        base: &'a mut ModelStorage,
     }
 
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/create/later")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("later-group-directory-round-trip.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected later-group directory round trip:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
+    impl Storage for Recovered<'_> {
+        fn len(&self) -> u64 {
+            self.base.len()
+        }
 
-#[test]
-fn commits_in_place_file_overwrite_through_journal() {
-    let image = image_with_checksum_v3_journal();
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(2).unwrap();
-        transaction.overwrite("/dir/hello.txt", 0, b"PORT").unwrap();
-        transaction.commit().unwrap();
+        fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
+            self.journal
+                .read_recovered(self.base, offset, output)
+                .map_err(|error| match error {
+                    Error::Storage(error) => error,
+                    _ => StorageError::new(ModelError::OutOfBounds),
+                })
+        }
+
+        fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {
+            self.base.write(offset, input)
+        }
+
+        fn flush(&mut self) -> Result<(), StorageError> {
+            Ok(())
+        }
     }
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let mut contents = [0; 14];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/hello.txt", 0, &mut contents)
-            .unwrap(),
-        14
-    );
-    assert_eq!(&contents, b"PORTable ext4\n");
 
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("journal-overwrite.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected overwrite:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_journal_commit_effect_loses_power_to_an_old_or_new_view() {
-    let image = image_with_checksum_v3_journal();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    {
-        let mut transaction = successful.begin_transaction(&mut successful_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/", "atomic.bin", 0o644)
+    let mut storage = ModelStorage::new(image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let mut journal = GraphJournal::mount(&mut graph, &mut storage).unwrap();
+    let blocks = {
+        let mut recovered = Recovered {
+            journal: &journal,
+            base: &mut storage,
+        };
+        graph = Graph::mount(&mut recovered).unwrap();
+        let root = graph.root(&mut recovered).unwrap();
+        let block_size = graph.block_size;
+        let mut overlay = BlockOverlay::new(&mut recovered, block_size);
+        let detached = graph.create_blob(&mut overlay).unwrap();
+        let Object::Blob(blob) = detached.object() else {
+            panic!("create_blob returned a node")
+        };
+        graph
+            .write(&mut overlay, blob, 0, b"journal graph")
             .unwrap();
-        transaction.commit().unwrap();
-    }
-    let effects = successful_storage.effects().to_vec();
-    let commit_start = effects
-        .iter()
-        .position(|effect| effect.kind == EffectKind::Write)
-        .unwrap();
-    let commit_end = effects.len();
-    assert!(
-        effects[commit_start..]
-            .iter()
-            .any(|effect| effect.kind == EffectKind::Write)
-    );
-    assert!(
-        effects[commit_start..]
-            .iter()
-            .any(|effect| effect.kind == EffectKind::Flush)
-    );
+        graph
+            .attach(&mut overlay, root, b"journal-graph", detached)
+            .unwrap();
+        overlay.finish()
+    };
+    journal.commit_blocks(&graph, &mut storage, blocks).unwrap();
 
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut found = false;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            found |= edge.name == b"journal-graph";
+            Ok(true)
+        })
+        .unwrap();
+    assert!(found);
+
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("graph-journal.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "e2fsck rejected journaled graph composition:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+}
+
+#[test]
+fn every_graph_journal_commit_effect_recovers_to_old_or_new_graph() {
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+    use portable_ext4::{BlockOverlay, GraphJournal, Storage, StorageError};
+
+    struct Recovered<'a> {
+        journal: &'a GraphJournal,
+        base: &'a mut ModelStorage,
+    }
+
+    impl Storage for Recovered<'_> {
+        fn len(&self) -> u64 {
+            self.base.len()
+        }
+
+        fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
+            self.journal
+                .read_recovered(self.base, offset, output)
+                .map_err(|error| match error {
+                    Error::Storage(error) => error,
+                    _ => StorageError::new(ModelError::OutOfBounds),
+                })
+        }
+
+        fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {
+            self.base.write(offset, input)
+        }
+
+        fn flush(&mut self) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    fn prepare(storage: &mut ModelStorage) -> (Graph, GraphJournal, Vec<(u64, Vec<u8>)>) {
+        let mut graph = Graph::mount(storage).unwrap();
+        let journal = GraphJournal::mount(&mut graph, storage).unwrap();
+        let mut recovered = Recovered {
+            journal: &journal,
+            base: storage,
+        };
+        graph = Graph::mount(&mut recovered).unwrap();
+        let root = graph.root(&mut recovered).unwrap();
+        let block_size = graph.block_size;
+        let mut overlay = BlockOverlay::new(&mut recovered, block_size);
+        let detached = graph.create_blob(&mut overlay).unwrap();
+        let Object::Blob(blob) = detached.object() else {
+            panic!("create_blob returned a node")
+        };
+        graph.write(&mut overlay, blob, 0, b"atomic graph").unwrap();
+        graph
+            .attach(&mut overlay, root, b"atomic-graph", detached)
+            .unwrap();
+        let blocks = overlay.finish();
+        drop(recovered);
+        (graph, journal, blocks)
+    }
+
+    fn recovered_is_new(bytes: Vec<u8>) -> bool {
+        let mut storage = ModelStorage::new(bytes);
+        let mut graph = Graph::mount(&mut storage).unwrap();
+        let journal = GraphJournal::mount(&mut graph, &mut storage).unwrap();
+        let mut recovered = Recovered {
+            journal: &journal,
+            base: &mut storage,
+        };
+        let mut graph = Graph::mount(&mut recovered).unwrap();
+        let root = graph.root(&mut recovered).unwrap();
+        let mut found = false;
+        graph
+            .edges(&mut recovered, root, Default::default(), &mut |edge| {
+                found |= edge.name == b"atomic-graph";
+                Ok(true)
+            })
+            .unwrap();
+        found
+    }
+
+    let source = image();
+    let mut successful_storage = ModelStorage::new(source.clone());
+    let (graph, mut journal, blocks) = prepare(&mut successful_storage);
+    let commit_start = successful_storage.effects().len();
+    journal
+        .commit_blocks(&graph, &mut successful_storage, blocks)
+        .unwrap();
+    let commit_end = successful_storage.effects().len();
+
+    let mut saw_old = false;
+    let mut saw_new = false;
     for sequence in commit_start..commit_end {
         let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::PowerLossAt(sequence));
-        let mut fs = Ext4::mount(&mut storage).unwrap();
-        let error = {
-            let mut transaction = fs.begin_transaction(&mut storage);
-            transaction.reserve_blocks(5).unwrap();
-            transaction
-                .create_empty_file("/", "atomic.bin", 0o644)
-                .unwrap();
-            transaction.commit().unwrap_err()
-        };
-        assert!((error).storage_is(&ModelError::PowerLoss));
-        let durable = storage.durable_bytes().to_vec();
-        let _ = assert_atomic_file_view(&durable, "/atomic.bin", &format!("power-loss-{sequence}"));
-    }
-}
-
-#[test]
-fn every_failed_barrier_pending_prefix_is_old_or_new() {
-    let image = image_with_checksum_v3_journal();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    {
-        let mut transaction = successful.begin_transaction(&mut successful_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/", "prefix.bin", 0o644)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let commit_start = successful_storage
-        .effects()
-        .iter()
-        .position(|effect| effect.kind == EffectKind::Write)
-        .unwrap();
-    let flushes: Vec<_> = successful_storage.effects()[commit_start..]
-        .iter()
-        .filter(|effect| effect.kind == EffectKind::Flush)
-        .map(|effect| effect.sequence)
-        .collect();
-    assert_eq!(flushes.len(), 5);
-
-    for (barrier, sequence) in flushes.into_iter().enumerate() {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        let mut fs = Ext4::mount(&mut storage).unwrap();
-        let error = {
-            let mut transaction = fs.begin_transaction(&mut storage);
-            transaction.reserve_blocks(5).unwrap();
-            transaction
-                .create_empty_file("/", "prefix.bin", 0o644)
-                .unwrap();
-            transaction.commit().unwrap_err()
-        };
-        assert!((error).storage_is(&ModelError::InjectedIo));
-        let pending = storage.pending_writes();
-        assert!(pending > 0);
-        for prefix in 0..=pending {
-            let mut crashed = storage.clone();
-            crashed.persist_pending_prefix(prefix);
-            let is_new = assert_atomic_file_view(
-                crashed.durable_bytes(),
-                "/prefix.bin",
-                &format!("barrier-{sequence}-prefix-{prefix}"),
-            );
-            let expected_new = barrier > 2 || (barrier == 2 && prefix == pending);
-            assert_eq!(is_new, expected_new, "barrier {barrier}, prefix {prefix}");
-        }
-    }
-}
-
-#[test]
-fn stages_checked_bitmap_and_root_extent_mutation() {
-    let image = image();
-    let mut staged = image.clone();
-    let mut fs_storage = ModelStorage::new(image.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let empty_inode = fs.stat(&mut fs_storage, "/dir/empty.bin").unwrap();
-    assert_eq!(empty_inode.size, 0);
-    let effects_before = fs_storage.effects().len();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        let allocated = transaction.append_zeroed_block("/dir/empty.bin").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 5);
-        assert_eq!(transaction.reserved_blocks(), 0);
-
-        let mut data = vec![1; 4096];
-        transaction.read_block(allocated, &mut data).unwrap();
-        assert_eq!(data, vec![0; 4096]);
-
-        let mut superblock = vec![0; 4096];
-        transaction.read_block(0, &mut superblock).unwrap();
-        let old_free =
-            u64::from(le32(&image, 1024 + 0x0c)) | (u64::from(le32(&image, 1024 + 0x158)) << 32);
-        let new_free = u64::from(le32(&superblock, 1024 + 0x0c))
-            | (u64::from(le32(&superblock, 1024 + 0x158)) << 32);
-        assert_eq!(new_free, old_free - 1);
-
-        let descriptor_offset = 4096;
-        let bitmap = u64::from(le32(&image, descriptor_offset))
-            | (u64::from(le32(&image, descriptor_offset + 0x20)) << 32);
-        let mut bitmap_bytes = vec![0; 4096];
-        transaction.read_block(bitmap, &mut bitmap_bytes).unwrap();
-        assert_ne!(
-            bitmap_bytes[allocated as usize / 8] & (1 << (allocated as usize % 8)),
-            0
+            ModelStorage::new(source.clone()).with_injection(Inject::PowerLossAt(sequence));
+        let (graph, mut journal, blocks) = prepare(&mut storage);
+        let error = journal
+            .commit_blocks(&graph, &mut storage, blocks)
+            .unwrap_err();
+        assert!(
+            error.storage_is(&ModelError::PowerLoss),
+            "effect {sequence}"
         );
-
-        let inode_table = u64::from(le32(&image, descriptor_offset + 8))
-            | (u64::from(le32(&image, descriptor_offset + 0x28)) << 32);
-        let inode_size = u64::from(le16(&image, 1024 + 0x58));
-        let inode_block =
-            (inode_table * 4096 + u64::from(empty_inode.number - 1) * inode_size) / 4096;
-        for number in [0, 1, bitmap, inode_block, allocated] {
-            let mut block = vec![0; 4096];
-            transaction.read_block(number, &mut block).unwrap();
-            let offset = number as usize * 4096;
-            staged[offset..offset + 4096].copy_from_slice(&block);
-        }
-    }
-    assert!(
-        fs_storage.effects()[effects_before..]
-            .iter()
-            .all(|effect| effect.kind == portable_ext4::test_support::EffectKind::Read)
-    );
-    assert_eq!(fs.stat(&mut fs_storage, "/dir/empty.bin").unwrap().size, 0);
-    assert_eq!(fs_storage.durable_bytes(), image);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("staged-mutation.img");
-    std::fs::write(&output_path, staged).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected staged transaction:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_mutation_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(5).unwrap();
-    transaction.append_zeroed_block("/dir/empty.bin").unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(5).unwrap();
-                assert!(
-                    (transaction
-                        .append_zeroed_block("/dir/empty.bin")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction(&mut fs_storage);
-    transaction.reserve_blocks(4).unwrap();
-    assert_eq!(
-        transaction
-            .append_zeroed_block("/dir/empty.bin")
-            .unwrap_err(),
-        Error::ReservationExhausted
-    );
-    assert_eq!(transaction.dirty_blocks(), 0);
-}
-
-#[test]
-fn every_multiblock_initialize_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let payload = vec![0x5a; 9000];
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(7).unwrap();
-    transaction
-        .initialize_file("/dir/empty.bin", &payload)
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(7).unwrap();
-                assert!(
-                    (transaction
-                        .initialize_file("/dir/empty.bin", &payload)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn creates_and_appends_depth_one_extent_tree() {
-    let mut expected = vec![0x51; 6 * 4096];
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(11).unwrap();
-        transaction
-            .initialize_file("/dir/empty.bin", &expected)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let appended = vec![0x72; 4096];
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        transaction.append("/dir/empty.bin", &appended).unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.extend_from_slice(&appended);
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let mut actual = vec![0; expected.len()];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/empty.bin", 0, &mut actual)
-            .unwrap(),
-        actual.len()
-    );
-    assert_eq!(actual, expected);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("depth-one-extents.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected depth-one extent tree:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn append_splits_full_extent_leaf_on_fragmented_allocation() {
-    let mut fragmented = image();
-    let artificial = add_artificial_fragmentation(&mut fragmented, 341);
-    let mut expected = vec![0x29; 340 * 4096];
-    let mut fs_storage = ModelStorage::new(fragmented);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(345).unwrap();
-        transaction
-            .initialize_file("/root-empty.bin", &expected)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let appended = vec![0x7a; 4096];
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.append("/root-empty.bin", &appended).unwrap();
-        transaction.commit().unwrap();
-    }
-    expected.extend_from_slice(&appended);
-
-    let mut durable = fs_storage.durable_bytes().to_vec();
-    remove_artificial_fragmentation(&mut durable, &artificial);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let mut actual = vec![0; expected.len()];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/root-empty.bin", 0, &mut actual)
-            .unwrap(),
-        actual.len()
-    );
-    assert_eq!(actual, expected);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("split-extent-leaf.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected split extent leaf:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_leaf_split_read_is_fallible_before_dirtying() {
-    let mut fragmented = image();
-    add_artificial_fragmentation(&mut fragmented, 341);
-    let mut initialized_storage = ModelStorage::new(fragmented);
-    let mut initialized = Ext4::mount(&mut initialized_storage).unwrap();
-    {
-        let mut transaction = initialized.begin_transaction(&mut initialized_storage);
-        transaction.reserve_blocks(345).unwrap();
-        transaction
-            .initialize_file("/root-empty.bin", &vec![0x47; 340 * 4096])
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let base = initialized_storage.durable_bytes().to_vec();
-    let appended = vec![0x68; 4096];
-    let mut successful_storage = ModelStorage::new(base.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(7).unwrap();
-    transaction.append("/root-empty.bin", &appended).unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(base.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(7).unwrap();
-                assert!(
-                    (transaction
-                        .append("/root-empty.bin", &appended)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn unlinks_file_with_external_extent_leaf() {
-    let mut fragmented = image();
-    let artificial = add_artificial_fragmentation(&mut fragmented, 6);
-    let mut fs_storage = ModelStorage::new(fragmented);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(11).unwrap();
-        transaction
-            .initialize_file("/root-empty.bin", &vec![0x63; 6 * 4096])
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.unlink("/root-empty.bin").unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let mut durable = fs_storage.durable_bytes().to_vec();
-    remove_artificial_fragmentation(&mut durable, &artificial);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-external-extent-leaf.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected external-leaf unlink:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_append_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let payload = vec![0x6b; 9000];
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(7).unwrap();
-    transaction.append("/dir/hello.txt", &payload).unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(7).unwrap();
-                assert!(
-                    (transaction.append("/dir/hello.txt", &payload).unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction(&mut fs_storage);
-    transaction.reserve_blocks(6).unwrap();
-    assert_eq!(
-        transaction.append("/dir/hello.txt", &payload).unwrap_err(),
-        Error::ReservationExhausted
-    );
-    assert_eq!(transaction.dirty_blocks(), 0);
-}
-
-#[test]
-fn creates_checked_empty_inode_and_directory_entry() {
-    let image = image();
-    let mut staged = image.clone();
-    let mut fs_storage = ModelStorage::new(image.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let descriptor_offset = 4096;
-    let inode_bitmap = u64::from(le32(&image, descriptor_offset + 4))
-        | (u64::from(le32(&image, descriptor_offset + 0x24)) << 32);
-    let inode_table = u64::from(le32(&image, descriptor_offset + 8))
-        | (u64::from(le32(&image, descriptor_offset + 0x28)) << 32);
-    let inode_size = u64::from(le16(&image, 1024 + 0x58));
-    let root_inode_offset = inode_table * 4096 + inode_size;
-    let root_extent = root_inode_offset as usize + 0x28;
-    assert_eq!(le16(&image, root_extent), 0xf30a);
-    let root_block = (u64::from(le16(&image, root_extent + 18)) << 32)
-        | u64::from(le32(&image, root_extent + 20));
-
-    let created;
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        created = transaction
-            .create_empty_file("/", "created.bin", 0o644)
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 5);
-
-        let inode_block = (inode_table * 4096 + u64::from(created - 1) * inode_size) / 4096;
-        for number in [0, 1, inode_bitmap, inode_block, root_block] {
-            let mut block = vec![0; 4096];
-            transaction.read_block(number, &mut block).unwrap();
-            let offset = number as usize * 4096;
-            staged[offset..offset + 4096].copy_from_slice(&block);
-        }
-    }
-    assert!(matches!(
-        fs.stat(&mut fs_storage, "/created.bin"),
-        Err(Error::NotFound)
-    ));
-    assert_eq!(fs_storage.durable_bytes(), image);
-
-    let mut remounted_storage = ModelStorage::new(staged.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let inode = remounted
-        .stat(&mut remounted_storage, "/created.bin")
-        .unwrap();
-    assert_eq!(inode.number, created);
-    assert_eq!(inode.mode, 0o100644);
-    assert_eq!(inode.size, 0);
-
-    let output_path =
-        std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join("created-file.img");
-    std::fs::write(&output_path, staged).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected created inode:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn edits_linux_metadata_through_layout_free_apis() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(2).unwrap();
-        transaction.chmod("/root-data.bin", 0o6750).unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(2).unwrap();
-        transaction
-            .chown("/root-data.bin", Some(0x1234_5678), Some(0x9abc_def0))
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let accessed = Timestamp {
-        seconds: -123,
-        nanoseconds: 456,
-    };
-    let modified = Timestamp {
-        seconds: 5_000_000_000,
-        nanoseconds: 999_999_999,
-    };
-    let changed = Timestamp {
-        seconds: 1_700_000_000,
-        nanoseconds: 42,
-    };
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(2).unwrap();
-        transaction
-            .set_times(
-                "/root-data.bin",
-                Some(accessed),
-                Some(modified),
-                Some(changed),
-            )
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let inode = remounted
-        .stat(&mut remounted_storage, "/root-data.bin")
-        .unwrap();
-    assert_eq!(inode.mode, 0o106750);
-    assert_eq!(inode.uid, 0x1234_5678);
-    assert_eq!(inode.gid, 0x9abc_def0);
-    assert_eq!(inode.accessed, accessed);
-    assert_eq!(inode.modified, modified);
-    assert_eq!(inode.changed, changed);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("inode-metadata.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected inode metadata edits:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_create_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(5).unwrap();
-    transaction
-        .create_empty_file("/", "created.bin", 0o644)
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(5).unwrap();
-                assert!(
-                    (transaction
-                        .create_empty_file("/", "created.bin", 0o644)
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn creates_hard_links_and_fast_symlinks() {
-    let original = image();
-    let mut fs_storage = ModelStorage::new(original);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let source = fs.stat(&mut fs_storage, "/root-data.bin").unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction
-            .link("/root-data.bin", "/root-data-link.bin")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .symlink("root-data.bin", "/root-data-link")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let linked = remounted
-        .stat(&mut remounted_storage, "/root-data-link.bin")
-        .unwrap();
-    assert_eq!(linked.number, source.number);
-    assert_eq!(linked.links, source.links + 1);
-    assert_eq!(
-        remounted
-            .read_link(&mut remounted_storage, "/root-data-link")
-            .unwrap(),
-        b"root-data.bin"
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("links-and-symlink.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected links:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn unlinks_hard_links_and_fast_symlinks() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let original_links = fs.stat(&mut fs_storage, "/root-data.bin").unwrap().links;
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction
-            .link("/root-data.bin", "/root-data-link.bin")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .symlink("root-data.bin", "/root-data-link")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction.unlink("/root-data-link.bin").unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction.unlink("/root-data-link").unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data-link.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data-link")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data.bin")
-            .unwrap()
-            .links,
-        original_links
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-links.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected unlinked links:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_link_creation_read_is_fallible_before_dirtying() {
-    let original = image();
-    for (reserved, operation) in [(3usize, 0u8), (5, 1)] {
-        let mut successful_storage = ModelStorage::new(original.clone());
-        let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-        let mut transaction = successful.begin_transaction(&mut successful_storage);
-        transaction.reserve_blocks(reserved).unwrap();
-        if operation == 0 {
-            transaction
-                .link("/root-data.bin", "/root-data-link.bin")
-                .unwrap();
+        if recovered_is_new(storage.durable_bytes().to_vec()) {
+            saw_new = true;
         } else {
-            transaction
-                .symlink("root-data.bin", "/root-data-link")
-                .unwrap();
-        }
-        drop(transaction);
-        let effects = successful_storage.effects().len();
-
-        for sequence in 0..effects {
-            let mut storage =
-                ModelStorage::new(original.clone()).with_injection(Inject::IoErrorAt(sequence));
-            match Ext4::mount(&mut storage) {
-                Err(Error::Storage(error))
-                    if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-                Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-                Ok(mut fs) => {
-                    let mut transaction = fs.begin_transaction(&mut storage);
-                    transaction.reserve_blocks(reserved).unwrap();
-                    let error = if operation == 0 {
-                        transaction
-                            .link("/root-data.bin", "/root-data-link.bin")
-                            .unwrap_err()
-                    } else {
-                        transaction
-                            .symlink("root-data.bin", "/root-data-link")
-                            .unwrap_err()
-                    };
-                    assert!((error).storage_is(&ModelError::InjectedIo));
-                    assert_eq!(transaction.dirty_blocks(), 0);
-                }
-            }
+            saw_old = true;
         }
     }
+    assert!(saw_old && saw_new);
 }
 
 #[test]
-fn unlinks_empty_regular_file_and_releases_its_inode() {
-    let original = image();
-    let mut probe_storage = ModelStorage::new(original.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let inode = probe.stat(&mut probe_storage, "/root-empty.bin").unwrap();
-    let inodes_per_group = le32(&original, 1024 + 0x28);
-    let group = (inode.number - 1) / inodes_per_group;
-    let descriptor_size = usize::from(le16(&original, 1024 + 0xfe));
-    let descriptor = 4096 + group as usize * descriptor_size;
-    let free_inodes = |bytes: &[u8]| {
-        u32::from(le16(bytes, descriptor + 0x0e))
-            | (u32::from(le16(bytes, descriptor + 0x2e)) << 16)
+fn handle_filesystem_owns_atomic_graph_composition() {
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+    use portable_ext4::Filesystem;
+
+    let storage = ModelStorage::new(image());
+    let mut filesystem = Filesystem::mount(storage).unwrap();
+    let root = filesystem.root().unwrap();
+    let object = filesystem
+        .create_blob(
+            root,
+            b"handle-file",
+            AttributeUpdate {
+                format: Some(0x8000 | 0o644),
+                ..AttributeUpdate::default()
+            },
+        )
+        .unwrap();
+    let Object::Blob(blob) = object else {
+        panic!("create_blob returned a node")
     };
-    let super_free = le32(&original, 1024 + 0x10);
-    let group_free = free_inodes(&original);
+    filesystem.write(blob, 0, b"handle filesystem").unwrap();
+    let mut contents = [0; 17];
+    assert_eq!(filesystem.read(blob, 0, &mut contents).unwrap(), 17);
+    assert_eq!(&contents, b"handle filesystem");
+    let (edge, found) = filesystem.find(root, b"handle-file").unwrap().unwrap();
+    assert_eq!(found, object);
+    filesystem.remove(edge).unwrap();
+    assert!(filesystem.find(root, b"handle-file").unwrap().is_none());
 
-    let mut fs_storage = ModelStorage::new(original);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction.unlink("/root-empty.bin").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 5);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-    let durable = fs_storage.durable_bytes().to_vec();
-    assert_eq!(le32(&durable, 1024 + 0x10), super_free + 1);
-    assert_eq!(free_inodes(&durable), group_free + 1);
-
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let mut contents = [0; 14];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/hello.txt", 0, &mut contents)
-            .unwrap(),
-        contents.len()
-    );
-    assert_eq!(&contents, b"portable ext4\n");
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-empty-file.img");
-    std::fs::write(&output_path, durable).unwrap();
+    let storage = filesystem.into_storage();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("handle-filesystem.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
     let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
+        .args(["-fn", output.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
         check.status.success(),
-        "e2fsck rejected unlinked inode:\n{}\n{}",
+        "e2fsck rejected handle filesystem:\n{}\n{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
-}
-
-#[test]
-fn every_unlink_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(5).unwrap();
-    transaction.unlink("/root-empty.bin").unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(5).unwrap();
-                assert!(
-                    (transaction.unlink("/root-empty.bin").unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn unlinks_nonempty_regular_file_and_releases_its_data() {
-    let image = image();
-    let super_free_blocks = le32(&image, 1024 + 0x0c);
-    let super_free_inodes = le32(&image, 1024 + 0x10);
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        transaction.unlink("/root-data.bin").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 6);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-    let durable = fs_storage.durable_bytes().to_vec();
-    assert_eq!(le32(&durable, 1024 + 0x0c), super_free_blocks + 1);
-    assert_eq!(le32(&durable, 1024 + 0x10), super_free_inodes + 1);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-nonempty-file.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected non-empty unlink:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_nonempty_unlink_read_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(6).unwrap();
-    transaction.unlink("/root-data.bin").unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(6).unwrap();
-                assert!(
-                    (transaction.unlink("/root-data.bin").unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn unlinks_file_whose_blocks_span_groups() {
-    let image = multi_group_image();
-    let payload = vec![0x39; 9000];
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(8).unwrap();
-        transaction
-            .initialize_file("/target.bin", &payload)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.unlink("/target.bin").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 7);
-        transaction.commit().unwrap();
-    }
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/target.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("unlinked-cross-group-file.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected cross-group unlink:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn unlink_rejects_directory_target_without_dirtying() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction(&mut fs_storage);
-    transaction.reserve_blocks(5).unwrap();
-    assert_eq!(
-        transaction.unlink("/dir").unwrap_err(),
-        Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
-    );
-    assert_eq!(transaction.dirty_blocks(), 0);
-}
-
-#[test]
-fn unlinks_regular_file_and_symlink_from_indexed_directory() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    for path in ["/dir/hello.link", "/dir/hello.txt"] {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.unlink(path).unwrap();
-        transaction.commit().unwrap();
-    }
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/dir/hello.link")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/dir/hello.txt")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("indexed-directory-unlink.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected indexed-directory unlink:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn mutates_entries_across_multiblock_linear_directory() {
-    let mut fs_storage = ModelStorage::new(linear_directory_image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    assert!(fs.stat(&mut fs_storage, "/linear").unwrap().size > 4096);
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/linear", "created.bin", 0o644)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction
-            .rename("/linear/file-499", "/linear/renamed-499")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.unlink("/linear/file-498").unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/created.bin")
-            .is_ok()
-    );
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/renamed-499")
-            .is_ok()
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/file-499")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/file-498")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("multiblock-linear-directory.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected multi-block directory mutations:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn grows_a_full_multiblock_linear_directory() {
-    let mut fs_storage = ModelStorage::new(linear_directory_image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let original_size = fs.stat(&mut fs_storage, "/linear").unwrap().size;
-    let mut grown = false;
-    for index in 0..64 {
-        let name = format!("growth-{index:02}");
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(12).unwrap();
-        transaction
-            .create_empty_file("/linear", &name, 0o644)
-            .unwrap();
-        transaction.commit().unwrap();
-        if fs.stat(&mut fs_storage, "/linear").unwrap().size > original_size {
-            grown = true;
-            break;
-        }
-    }
-    assert!(grown, "fixture still had room after 64 insertions");
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear/growth-00")
-            .is_ok()
-    );
-    assert!(
-        remounted
-            .stat(&mut remounted_storage, "/linear")
-            .unwrap()
-            .size
-            > original_size
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("grown-linear-directory.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected grown linear directory:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn creates_checked_directory_and_supports_a_child_file() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let root_links = probe.stat(&mut probe_storage, "/").unwrap().links;
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let created;
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(8).unwrap();
-        created = transaction.mkdir("/", "made", 0o750).unwrap();
-        assert_eq!(transaction.dirty_blocks(), 8);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/made", "child.bin", 0o640)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    let directory = remounted.stat(&mut remounted_storage, "/made").unwrap();
-    assert_eq!(directory.number, created);
-    assert!(directory.is_directory());
-    assert_eq!(directory.mode, 0o40750);
-    assert_eq!(directory.links, 2);
-    assert_eq!(directory.size, 4096);
-    assert_eq!(
-        remounted.stat(&mut remounted_storage, "/").unwrap().links,
-        root_links + 1
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/made/child.bin")
-            .unwrap()
-            .mode,
-        0o100640
-    );
-    let mut entries = Vec::new();
-    assert_eq!(
-        remounted
-            .read_dir(&mut remounted_storage, "/made", 0, &mut entries, 8)
-            .unwrap(),
-        None
-    );
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, b"child.bin");
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("created-directory.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected created directory:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_mkdir_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(8).unwrap();
-    transaction.mkdir("/", "made", 0o750).unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(8).unwrap();
-                assert!(
-                    (transaction.mkdir("/", "made", 0o750).unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn removes_checked_empty_directory_and_restores_parent_links() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let root_links = probe.stat(&mut probe_storage, "/").unwrap().links;
-    assert!(
-        probe
-            .stat(&mut probe_storage, "/root-empty-dir")
-            .unwrap()
-            .is_directory()
-    );
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(7).unwrap();
-        transaction.rmdir("/root-empty-dir").unwrap();
-        assert_eq!(transaction.dirty_blocks(), 7);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty-dir")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted.stat(&mut remounted_storage, "/").unwrap().links,
-        root_links - 1
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("removed-directory.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected removed directory:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_rmdir_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(7).unwrap();
-    transaction.rmdir("/root-empty-dir").unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(7).unwrap();
-                assert!(
-                    (transaction.rmdir("/root-empty-dir").unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn rmdir_reports_nonempty_without_dirtying() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(8).unwrap();
-        transaction.mkdir("/", "occupied", 0o755).unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(5).unwrap();
-        transaction
-            .create_empty_file("/occupied", "child.bin", 0o600)
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    let mut transaction = fs.begin_transaction(&mut fs_storage);
-    transaction.reserve_blocks(7).unwrap();
-    assert_eq!(transaction.rmdir("/occupied").unwrap_err(), Error::NotEmpty);
-    assert_eq!(transaction.dirty_blocks(), 0);
-}
-
-#[test]
-fn renames_file_across_parents_and_directory_within_parent() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let file_number = probe
-        .stat(&mut probe_storage, "/root-empty.bin")
-        .unwrap()
-        .number;
-    let directory_number = probe
-        .stat(&mut probe_storage, "/root-empty-dir")
-        .unwrap()
-        .number;
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction
-            .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 3);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        transaction
-            .rename("/root-empty-dir", "/renamed-dir")
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 2);
-        assert_eq!(transaction.reserved_blocks(), 1);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty-dir")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/renamed-dir")
-            .unwrap()
-            .number,
-        directory_number
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/renamed-dir/moved.bin")
-            .unwrap()
-            .number,
-        file_number
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("renamed-entries.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected renamed entries:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_cross_parent_rename_read_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(3).unwrap();
-    transaction
-        .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(3).unwrap();
-                assert!(
-                    (transaction
-                        .rename("/root-empty.bin", "/root-empty-dir/moved.bin")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn rename_rejects_replacement_and_unsupported_parent_without_dirtying() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        assert_eq!(
-            transaction
-                .rename("/root-empty.bin", "/root-empty-dir")
-                .unwrap_err(),
-            Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
-        );
-        assert_eq!(transaction.dirty_blocks(), 0);
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(3).unwrap();
-        assert_eq!(
-            transaction
-                .rename("/root-empty-dir", "/dir/moved-dir")
-                .unwrap_err(),
-            Error::Unsupported(portable_ext4::Unsupported::MutationProfile)
-        );
-        assert_eq!(transaction.dirty_blocks(), 0);
-    }
-}
-
-#[test]
-fn replacement_rename_reclaims_nonempty_destination() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let source_number = probe
-        .stat(&mut probe_storage, "/root-empty.bin")
-        .unwrap()
-        .number;
-    let destination_number = probe
-        .stat(&mut probe_storage, "/root-data.bin")
-        .unwrap()
-        .number;
-    let free_blocks = le32(&image, 1024 + 0x0c);
-    let free_inodes = le32(&image, 1024 + 0x10);
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        transaction
-            .rename("/root-empty.bin", "/root-data.bin")
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 6);
-        assert_eq!(transaction.reserved_blocks(), 0);
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    assert_eq!(le32(&durable, 1024 + 0x0c), free_blocks + 1);
-    assert_eq!(le32(&durable, 1024 + 0x10), free_inodes + 1);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data.bin")
-            .unwrap()
-            .number,
-        source_number
-    );
-    assert_ne!(source_number, destination_number);
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data.bin")
-            .unwrap()
-            .size,
-        0
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("replacement-rename.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected replacement rename:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn directory_rename_replaces_empty_directory() {
-    let original = image();
-    let mut probe_storage = ModelStorage::new(original.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let source = probe.stat(&mut probe_storage, "/move-left/branch").unwrap();
-    let old_parent_links = probe.stat(&mut probe_storage, "/move-left").unwrap().links;
-    let new_parent_links = probe.stat(&mut probe_storage, "/").unwrap().links;
-    let mut fs_storage = ModelStorage::new(original);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(9).unwrap();
-        transaction
-            .rename("/move-left/branch", "/root-empty-dir")
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-left/branch")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty-dir")
-            .unwrap()
-            .number,
-        source.number
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-left")
-            .unwrap()
-            .links,
-        old_parent_links - 1
-    );
-    assert_eq!(
-        remounted.stat(&mut remounted_storage, "/").unwrap().links,
-        new_parent_links
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("directory-replacement.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected directory replacement:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_directory_replacement_read_is_fallible_before_dirtying() {
-    let original = image();
-    let mut successful_storage = ModelStorage::new(original.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(9).unwrap();
-    transaction
-        .rename("/move-left/branch", "/root-empty-dir")
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(original.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(9).unwrap();
-                assert!(
-                    (transaction
-                        .rename("/move-left/branch", "/root-empty-dir")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn replacement_rename_moves_file_across_parents() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let source_number = probe
-        .stat(&mut probe_storage, "/root-data.bin")
-        .unwrap()
-        .number;
-    let victim_number = probe
-        .stat(&mut probe_storage, "/replace-dir/victim.bin")
-        .unwrap()
-        .number;
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        transaction
-            .rename("/root-data.bin", "/replace-dir/victim.bin")
-            .unwrap();
-        assert_eq!(transaction.dirty_blocks(), 6);
-        transaction.commit().unwrap();
-    }
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-data.bin")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    let moved = remounted
-        .stat(&mut remounted_storage, "/replace-dir/victim.bin")
-        .unwrap();
-    assert_eq!(moved.number, source_number);
-    assert_ne!(moved.number, victim_number);
-    assert_eq!(moved.size, 14);
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("cross-parent-replacement-rename.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected cross-parent replacement rename:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_replacement_rename_read_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(6).unwrap();
-    transaction
-        .rename("/root-empty.bin", "/root-data.bin")
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(6).unwrap();
-                assert!(
-                    (transaction
-                        .rename("/root-empty.bin", "/root-data.bin")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn moves_directory_across_parents_and_updates_dotdot_and_link_counts() {
-    let image = image();
-    let mut probe_storage = ModelStorage::new(image.clone());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    let source_number = probe
-        .stat(&mut probe_storage, "/move-left/branch")
-        .unwrap()
-        .number;
-    let left_links = probe.stat(&mut probe_storage, "/move-left").unwrap().links;
-    let right_links = probe.stat(&mut probe_storage, "/move-right").unwrap().links;
-    let mut fs_storage = ModelStorage::new(image);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(6).unwrap();
-        transaction
-            .rename("/move-left/branch", "/move-right/branch")
-            .unwrap();
-        assert!((5..=6).contains(&transaction.dirty_blocks()));
-        assert_eq!(
-            transaction.dirty_blocks() + transaction.reserved_blocks(),
-            6
-        );
-        transaction.commit().unwrap();
-    }
-
-    let durable = fs_storage.durable_bytes().to_vec();
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-left/branch")
-            .unwrap_err(),
-        Error::NotFound
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-right/branch")
-            .unwrap()
-            .number,
-        source_number
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-left")
-            .unwrap()
-            .links,
-        left_links - 1
-    );
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/move-right")
-            .unwrap()
-            .links,
-        right_links + 1
-    );
-
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("cross-parent-directory-rename.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected cross-parent directory rename:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_cross_parent_directory_rename_read_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(6).unwrap();
-    transaction
-        .rename("/move-left/branch", "/move-right/branch")
-        .unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(6).unwrap();
-                assert!(
-                    (transaction
-                        .rename("/move-left/branch", "/move-right/branch")
-                        .unwrap_err())
-                    .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn cross_parent_directory_rename_rejects_descendant_cycle() {
-    let mut fs_storage = ModelStorage::new(image());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let mut transaction = fs.begin_transaction(&mut fs_storage);
-    transaction.reserve_blocks(6).unwrap();
-    assert_eq!(
-        transaction
-            .rename("/move-left", "/move-left/branch/loop")
-            .unwrap_err(),
-        Error::InvalidArgument
-    );
-    assert_eq!(transaction.dirty_blocks(), 0);
-}
-
-#[test]
-fn truncates_checked_root_extent_and_releases_its_block() {
-    let image = image();
-    let mut staged = image.clone();
-    let mut fs_storage = ModelStorage::new(image.clone());
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    let inode = fs.stat(&mut fs_storage, "/dir/hello.txt").unwrap();
-    assert_eq!(inode.size, 14);
-
-    let descriptor_offset = 4096;
-    let bitmap = u64::from(le32(&image, descriptor_offset))
-        | (u64::from(le32(&image, descriptor_offset + 0x20)) << 32);
-    let inode_table = u64::from(le32(&image, descriptor_offset + 8))
-        | (u64::from(le32(&image, descriptor_offset + 0x28)) << 32);
-    let inode_size = u64::from(le16(&image, 1024 + 0x58));
-    let inode_byte = inode_table * 4096 + u64::from(inode.number - 1) * inode_size;
-    let inode_block = inode_byte / 4096;
-    let extent_root = inode_byte as usize + 0x28;
-    assert_eq!(le16(&image, extent_root), 0xf30a);
-    assert_eq!(le16(&image, extent_root + 2), 1);
-    let data_block = (u64::from(le16(&image, extent_root + 18)) << 32)
-        | u64::from(le32(&image, extent_root + 20));
-
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(4).unwrap();
-        assert_eq!(transaction.truncate_to_zero("/dir/hello.txt").unwrap(), 1);
-        assert_eq!(transaction.dirty_blocks(), 4);
-
-        let mut bitmap_bytes = vec![0; 4096];
-        transaction.read_block(bitmap, &mut bitmap_bytes).unwrap();
-        assert_eq!(
-            bitmap_bytes[data_block as usize / 8] & (1 << (data_block as usize % 8)),
-            0
-        );
-
-        for number in [0, 1, bitmap, inode_block] {
-            let mut block = vec![0; 4096];
-            transaction.read_block(number, &mut block).unwrap();
-            let offset = number as usize * 4096;
-            staged[offset..offset + 4096].copy_from_slice(&block);
-        }
-    }
-    assert_eq!(fs.stat(&mut fs_storage, "/dir/hello.txt").unwrap().size, 14);
-    assert_eq!(fs_storage.durable_bytes(), image);
-
-    let mut remounted_storage = ModelStorage::new(staged.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/dir/hello.txt")
-            .unwrap()
-            .size,
-        0
-    );
-    let mut contents = [0; 14];
-    assert_eq!(
-        remounted
-            .read(&mut remounted_storage, "/dir/hello.txt", 0, &mut contents)
-            .unwrap(),
-        0
-    );
-
-    let output_path =
-        std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap()).join("truncated.img");
-    std::fs::write(&output_path, staged).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected truncated inode:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn truncates_file_with_external_extent_leaf() {
-    let mut fragmented = image();
-    let artificial = add_artificial_fragmentation(&mut fragmented, 6);
-    let mut fs_storage = ModelStorage::new(fragmented);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(11).unwrap();
-        transaction
-            .initialize_file("/root-empty.bin", &vec![0x35; 6 * 4096])
-            .unwrap();
-        transaction.commit().unwrap();
-    }
-    {
-        let mut transaction = fs.begin_transaction(&mut fs_storage);
-        transaction.reserve_blocks(4).unwrap();
-        assert_eq!(transaction.truncate_to_zero("/root-empty.bin").unwrap(), 7);
-        transaction.commit().unwrap();
-    }
-
-    let mut durable = fs_storage.durable_bytes().to_vec();
-    remove_artificial_fragmentation(&mut durable, &artificial);
-    let mut remounted_storage = ModelStorage::new(durable.clone());
-    let mut remounted = Ext4::mount(&mut remounted_storage).unwrap();
-    assert_eq!(
-        remounted
-            .stat(&mut remounted_storage, "/root-empty.bin")
-            .unwrap()
-            .size,
-        0
-    );
-    let output_path = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
-        .join("truncated-external-extent-leaf.img");
-    std::fs::write(&output_path, durable).unwrap();
-    let check = std::process::Command::new("/usr/sbin/e2fsck")
-        .args(["-fn", output_path.to_str().unwrap()])
-        .output()
-        .unwrap();
-    assert!(
-        check.status.success(),
-        "e2fsck rejected external-leaf truncate:\n{}\n{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
-}
-
-#[test]
-fn every_truncate_read_effect_is_fallible_before_dirtying() {
-    let image = image();
-    let mut successful_storage = ModelStorage::new(image.clone());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut transaction = successful.begin_transaction(&mut successful_storage);
-    transaction.reserve_blocks(4).unwrap();
-    transaction.truncate_to_zero("/dir/hello.txt").unwrap();
-    drop(transaction);
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage =
-            ModelStorage::new(image.clone()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => {
-                let mut transaction = fs.begin_transaction(&mut storage);
-                transaction.reserve_blocks(4).unwrap();
-                assert!(
-                    (transaction.truncate_to_zero("/dir/hello.txt").unwrap_err())
-                        .storage_is(&ModelError::InjectedIo)
-                );
-                assert_eq!(transaction.dirty_blocks(), 0);
-            }
-        }
-    }
-}
-
-#[test]
-fn detects_superblock_group_inode_and_directory_corruption() {
-    let mut bad_superblock = image();
-    bad_superblock[1024 + 0x10] ^= 1;
-    let mut bad_superblock_storage = ModelStorage::new(bad_superblock);
-    assert!(matches!(
-        Ext4::mount(&mut bad_superblock_storage).err(),
-        Some(Error::Corrupt(Corrupt::SuperblockChecksum))
-    ));
-
-    let mut probe_storage = ModelStorage::new(image());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    probe.stat(&mut probe_storage, "/").unwrap();
-    let effects = probe_storage.effects();
-    let group_descriptor = effects
-        .iter()
-        .find(|effect| effect.len == 64)
-        .unwrap()
-        .offset as usize;
-    let root_inode_block = effects
-        .iter()
-        .find(|effect| effect.len == 4096)
-        .unwrap()
-        .offset as usize;
-    let root_inode = root_inode_block + 256;
-
-    let mut bad_group = image();
-    bad_group[group_descriptor + 12] ^= 1;
-    let mut fs_storage = ModelStorage::new(bad_group);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    assert!(matches!(
-        fs.stat(&mut fs_storage, "/").unwrap_err(),
-        Error::Corrupt(Corrupt::GroupDescriptorChecksum(0))
-    ));
-
-    let mut bad_inode = image();
-    bad_inode[root_inode] ^= 1;
-    let mut fs_storage = ModelStorage::new(bad_inode);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    assert!(matches!(
-        fs.stat(&mut fs_storage, "/").unwrap_err(),
-        Error::Corrupt(Corrupt::InodeChecksum(2))
-    ));
-
-    let mut probe_storage = ModelStorage::new(image());
-    let mut probe = Ext4::mount(&mut probe_storage).unwrap();
-    probe.stat(&mut probe_storage, "/dir").unwrap();
-    let block_size = probe.block_size() as usize;
-    let directory_block = probe_storage
-        .effects()
-        .iter()
-        .find(|effect| effect.len == block_size && effect.offset as usize != root_inode_block)
-        .unwrap()
-        .offset as usize;
-    let mut bad_directory = image();
-    bad_directory[directory_block + block_size - 1] ^= 1;
-    let mut fs_storage = ModelStorage::new(bad_directory);
-    let mut fs = Ext4::mount(&mut fs_storage).unwrap();
-    assert!(matches!(
-        fs.stat(&mut fs_storage, "/dir").unwrap_err(),
-        Error::Corrupt(Corrupt::DirectoryChecksum(2))
-    ));
-}
-
-#[test]
-fn every_effect_in_modern_indexed_lookup_is_fallible() {
-    let mut successful_storage = ModelStorage::new(image());
-    let mut successful = Ext4::mount(&mut successful_storage).unwrap();
-    let mut contents = [0; 14];
-    successful
-        .read(&mut successful_storage, "/dir/file-299", 0, &mut contents)
-        .unwrap();
-    let effects = successful_storage.effects().len();
-
-    for sequence in 0..effects {
-        let mut storage = ModelStorage::new(image()).with_injection(Inject::IoErrorAt(sequence));
-        match Ext4::mount(&mut storage) {
-            Err(Error::Storage(error))
-                if error.downcast_ref::<ModelError>() == Some(&ModelError::InjectedIo) => {}
-            Err(other) => panic!("unexpected mount error at {sequence}: {other:?}"),
-            Ok(mut fs) => assert!(
-                fs.read(&mut storage, "/dir/file-299", 0, &mut contents)
-                    .unwrap_err()
-                    .storage_is(&ModelError::InjectedIo)
-            ),
-        }
-    }
 }

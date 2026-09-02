@@ -243,4 +243,4 @@ crate.annotation(
     # which rejects custom target JSON before the actual nightly compile.
     gen_build_script = "off",
 )
-use_repo(crate, "crates")
+use_repo(crate, "crates", "crates__bytemuck-1.25.2")
