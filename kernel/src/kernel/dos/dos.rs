@@ -1649,8 +1649,6 @@ fn int_21h<A: crate::Arch>(
                     if immutable_media_path(&path[..len]) {
                         -30
                     } else {
-                        let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        dfs::ci::invalidate(&path[..parent_end]);
                         crate::kernel::vfs::mkdir(&path[..len])
                     }
                 }
@@ -1680,8 +1678,6 @@ fn int_21h<A: crate::Arch>(
                 Ok((path, len)) => {
                     if immutable_media_path(&path[..len]) { -30 }
                     else {
-                        let parent = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        dfs::ci::invalidate(&path[..parent]);
                         crate::kernel::vfs::rmdir(&path[..len])
                     }
                 }
@@ -2226,10 +2222,6 @@ fn int_21h<A: crate::Arch>(
                 // deletes a random D:\ name; success = "not a CD").
                 Ok((path, len)) if immutable_media_path(&path[..len]) => -13,
                 Ok((path, len)) => {
-                    // Invalidate the parent dir's CI cache so the new file
-                    // becomes visible to find_first/find_next on next walk.
-                    let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                    dfs::ci::invalidate(&path[..parent_end]);
                     crate::kernel::vfs::create(&path[..len], &mut kt.fds)
                 }
                 Err(e) => -e,
@@ -2670,10 +2662,6 @@ fn int_21h<A: crate::Arch>(
                     let new_cd = immutable_media_path(&new_path[..nlen]);
                     if old_cd || new_cd { -30 }
                     else {
-                        let op = old_path[..olen].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        let np = new_path[..nlen].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        dfs::ci::invalidate(&old_path[..op]);
-                        dfs::ci::invalidate(&new_path[..np]);
                         crate::kernel::vfs::rename(&old_path[..olen], &new_path[..nlen])
                     }
                 }
@@ -2923,10 +2911,6 @@ fn int_21h<A: crate::Arch>(
                     regs.set_flag32(1);
                 }
                 Ok((path, len)) => {
-                    // Invalidate parent dir CI cache before delete so a stale
-                    // alias→missing-file mapping doesn't confuse later lookups.
-                    let parent_end = path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                    dfs::ci::invalidate(&path[..parent_end]);
                     let rv = crate::kernel::vfs::delete(&path[..len]);
                     if rv >= 0 {
                         regs.clear_flag32(1);
@@ -3186,9 +3170,6 @@ fn int_21h<A: crate::Arch>(
                     crate::kernel::vfs::close(fd, &mut kt.fds);
                     let mut new_fd = match dfs_create_path(dos, &name[..i]) {
                         Ok((path, len)) => {
-                            let parent_end =
-                                path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                            dfs::ci::invalidate(&path[..parent_end]);
                             crate::kernel::vfs::create(&path[..len], &mut kt.fds)
                         }
                         Err(e) => -e,
@@ -3216,9 +3197,6 @@ fn int_21h<A: crate::Arch>(
             } else if create_not {
                 let mut new_fd = match dfs_create_path(dos, &name[..i]) {
                     Ok((path, len)) => {
-                        let parent_end =
-                            path[..len].iter().rposition(|&b| b == b'/').unwrap_or(0);
-                        dfs::ci::invalidate(&path[..parent_end]);
                         crate::kernel::vfs::create(&path[..len], &mut kt.fds)
                     }
                     Err(e) => -e,

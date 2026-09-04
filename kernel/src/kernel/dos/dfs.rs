@@ -50,8 +50,8 @@ pub const DFS_CWD_MAX: usize = 64;
 // the VFS itself is POSIX-strict.
 //
 // Cache key: VFS dir path with no trailing `/` ("" = root).
-// Entries are kept sorted by alias for O(log N) lookup and cheap iteration
-// (find_first/find_next walks in alias order).
+// Entries retain the underlying directory order for find_first/find_next;
+// a separate tree indexes their aliases for O(log N) lookup.
 //
 // Long names that don't fit 8.3 (legal-char, ≤8 base, ≤3 ext) get an alias
 // of the form `BASE~N.EXT` (FAT-style) so DOS programs can both see them in
@@ -68,8 +68,10 @@ pub mod ci {
         pub mtime: u32,
     }
 
-    /// Per-dir mapping `alias → entry`, sorted by alias.
-    type DirCi = Vec<(Vec<u8>, Entry)>;
+    struct DirCi {
+        entries: Vec<(Vec<u8>, Entry)>,
+        aliases: BTreeMap<Vec<u8>, usize>,
+    }
 
     static mut CI_CACHE: BTreeMap<Vec<u8>, DirCi> = BTreeMap::new();
     static mut CI_GENERATION: u64 = u64::MAX;
@@ -90,11 +92,14 @@ pub mod ci {
         if !readdir_key.is_empty() && readdir_key.last() != Some(&b'/') {
             readdir_key.push(b'/');
         }
-        let mut entries: DirCi = Vec::new();
+        let mut dir = DirCi {
+            entries: Vec::new(),
+            aliases: BTreeMap::new(),
+        };
         let mut idx = 0usize;
         while let Some(e) = vfs::readdir(&readdir_key, idx) {
             let original = e.name[..e.name_len].to_vec();
-            let alias = compute_alias_8_3(&original, &entries);
+            let alias = compute_alias_8_3(&original, &dir.aliases);
             // DOS has no symbolic-link file type. Present a link to a
             // directory as the directory it resolves to, otherwise file
             // managers such as DN/NC render it as a file and refuse to enter
@@ -108,7 +113,9 @@ pub mod ci {
             } else {
                 false
             };
-            entries.push((alias, Entry {
+            let entry_index = dir.entries.len();
+            dir.aliases.insert(alias.clone(), entry_index);
+            dir.entries.push((alias, Entry {
                 original,
                 size: e.size,
                 is_dir,
@@ -116,8 +123,7 @@ pub mod ci {
             }));
             idx += 1;
         }
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
-        entries
+        dir
     }
 
     fn ensure_cached(vfs_dir: &[u8]) -> &'static DirCi {
@@ -140,26 +146,17 @@ pub mod ci {
     /// name on hit. Populates the cache on miss.
     pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<&'static [u8]> {
         let dir = ensure_cached(vfs_dir);
-        if let Ok(i) = dir.binary_search_by(|(k, _)| k.as_slice().cmp(alias)) {
-            return Some(dir[i].1.original.as_slice());
-        }
-        // Not a backing-fs entry — but it may be a VFS mount point under this
-        // dir (a VFS mount point, invisible to the backing fs readdir).
-        crate::kernel::vfs::mount_child(vfs_dir, alias)
+        let index = *dir.aliases.get(alias)?;
+        Some(dir.entries[index].1.original.as_slice())
     }
 
-    /// Get the entry at `idx` in the cache's alias order. Used by
+    /// Get the entry at `idx` in the backing directory's order. Used by
     /// find_first/find_next, which copies these straight into the DTA.
     pub fn entry_at(vfs_dir: &[u8], idx: usize) -> Option<(&'static [u8], &'static Entry)> {
         let dir = ensure_cached(vfs_dir);
-        dir.get(idx).map(|(a, e)| (a.as_slice(), e))
+        dir.entries.get(idx).map(|(a, e)| (a.as_slice(), e))
     }
 
-    /// Drop cached entries for `vfs_dir`. Call after writes that can change
-    /// the dir's contents (create / unlink / rename).
-    pub fn invalidate(vfs_dir: &[u8]) {
-        cache().remove(norm(vfs_dir));
-    }
 }
 
 /// FAT-style 8.3 chars: A-Z 0-9 plus a small set of punctuation. Lowercase
@@ -192,9 +189,12 @@ fn fits_8_3(name: &[u8]) -> bool {
 /// Generate the 8.3 alias for `name`, avoiding collisions in `existing`.
 /// Short legal names → uppercased verbatim. Long/illegal → `BASE~N.EXT` with
 /// N grown until unique; base shrinks as digits grow so alias stays ≤8 base.
-fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> {
+fn compute_alias_8_3(name: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> Vec<u8> {
     if fits_8_3(name) {
-        return name.iter().map(|b| b.to_ascii_uppercase()).collect();
+        let alias: Vec<u8> = name.iter().map(|b| b.to_ascii_uppercase()).collect();
+        if !alias_taken(&alias, existing) {
+            return alias;
+        }
     }
 
     let last_dot = name.iter().rposition(|&b| b == b'.').unwrap_or(name.len());
@@ -210,10 +210,6 @@ fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> 
         .map(|b| b.to_ascii_uppercase())
         .take(3)
         .collect();
-
-    let alias_taken = |a: &[u8], existing: &[(Vec<u8>, ci::Entry)]| -> bool {
-        existing.iter().any(|(k, _)| k.as_slice() == a)
-    };
 
     for n in 1u32..=999_999 {
         let mut digits = [0u8; 8];
@@ -244,6 +240,10 @@ fn compute_alias_8_3(name: &[u8], existing: &[(Vec<u8>, ci::Entry)]) -> Vec<u8> 
     // Ran out of digits — fall back to a guaranteed-unique key. Shouldn't
     // happen in practice (>1M same-prefix files in one dir).
     name.iter().map(|b| b.to_ascii_uppercase()).collect()
+}
+
+fn alias_taken(alias: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> bool {
+    existing.contains_key(alias)
 }
 
 /// Per-thread DOS filesystem state.
@@ -658,7 +658,19 @@ fn canonicalize_components(buf: &mut [u8], len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DfsState, DFS_PATH_MAX, strip_drive_prefix};
+    use super::{DfsState, DFS_PATH_MAX, compute_alias_8_3, strip_drive_prefix};
+    use alloc::collections::BTreeMap;
+
+    #[test]
+    fn colliding_short_names_receive_distinct_dos_aliases() {
+        let mut aliases = BTreeMap::new();
+        let first = compute_alias_8_3(b"foo", &aliases);
+        aliases.insert(first.clone(), 0);
+        let second = compute_alias_8_3(b"FOO", &aliases);
+
+        assert_eq!(first, b"FOO");
+        assert_eq!(second, b"FOO~1");
+    }
 
     #[test]
     fn resolve_discards_spaces_from_each_component() {
