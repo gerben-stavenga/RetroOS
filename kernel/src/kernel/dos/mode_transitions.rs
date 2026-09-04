@@ -934,14 +934,10 @@ pub(super) fn pop_iret_frame<A: crate::Arch>(machine: &mut A, ldt: &[u64], regs:
 /// synthetic host IRET after `resume_continuation_from_stub` restores the continuation:
 ///   - `SLOT_RESUME_CONTINUATION` for cross-mode HW-IRQ first-entry.
 ///   - The outer caller's CS:EIP for soft-INT and nested-HW-IRQ.
+#[inline(never)]
 pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let eip = regs.ip32();
     let vector = ((eip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8;
-    if vector >= 0x10 {
-        dos_trace!("[DPMI] VECSTUB vec={:#04x} SS:ESP={:04x}:{:#x} CS:EIP={:04x}:{:#x} DS={:04X} ES={:04X} DX={:04X} DI={:04X}",
-            vector, regs.stack_seg(), regs.sp32(), regs.code_seg(), eip,
-            regs.ds as u16, regs.es as u16, regs.rdx as u16, regs.rdi as u16);
-    }
     // INT 31h's host default handler is the DPMI services API — NOT a real-
     // mode IVT reflection. A client that hooks INT 31h and tail-chains to the
     // previously-installed (host) vector — which we report as this default

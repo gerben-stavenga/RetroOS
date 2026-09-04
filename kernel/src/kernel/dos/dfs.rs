@@ -86,6 +86,7 @@ pub mod ci {
         if vfs_dir.last() == Some(&b'/') { &vfs_dir[..vfs_dir.len() - 1] } else { vfs_dir }
     }
 
+    #[inline(never)]
     fn build(vfs_dir: &[u8]) -> DirCi {
         // VFS readdir wants the prefix with a trailing `/` (or empty for root).
         let mut readdir_key = vfs_dir.to_vec();
@@ -130,15 +131,26 @@ pub mod ci {
         let generation = vfs::directory_generation();
         let generation_ptr = &raw mut CI_GENERATION;
         if unsafe { *generation_ptr } != generation {
-            cache().clear();
-            unsafe { *generation_ptr = generation };
+            reset_cache(generation);
         }
         let key = norm(vfs_dir);
+        if let Some(dir) = cache().get(key) { return dir; }
+        cache_miss(key)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reset_cache(generation: u64) {
+        cache().clear();
+        unsafe { CI_GENERATION = generation };
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn cache_miss(key: &[u8]) -> &'static DirCi {
+        let built = build(key);
         let c = cache();
-        if !c.contains_key(key) {
-            let built = build(key);
-            c.insert(key.to_vec(), built);
-        }
+        c.insert(key.to_vec(), built);
         c.get(key).unwrap()
     }
 
@@ -189,6 +201,7 @@ fn fits_8_3(name: &[u8]) -> bool {
 /// Generate the 8.3 alias for `name`, avoiding collisions in `existing`.
 /// Short legal names → uppercased verbatim. Long/illegal → `BASE~N.EXT` with
 /// N grown until unique; base shrinks as digits grow so alias stays ≤8 base.
+#[inline(never)]
 fn compute_alias_8_3(name: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> Vec<u8> {
     if fits_8_3(name) {
         let alias: Vec<u8> = name.iter().map(|b| b.to_ascii_uppercase()).collect();

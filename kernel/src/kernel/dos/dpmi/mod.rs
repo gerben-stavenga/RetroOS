@@ -209,6 +209,7 @@ fn scrub_freed_selector(regs: &mut Regs, sel: u16) {
     if regs.gs as u16 == sel { regs.gs = 0; }
 }
 
+#[inline(never)]
 pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let action = dpmi_api_inner(machine, dos, regs);
     machine.on_ldt_changed();
@@ -226,11 +227,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     };
 
     let ax = regs.rax as u16;
-    dos_trace!("[INT31] AX={:04x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} cs:ip={:04X}:{:04X}",
-        ax, regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16,
-        regs.code_seg(), regs.ip32() as u16);
-
     match ax {
         // AX=0000h — Allocate LDT Descriptors
         // CX = number of descriptors
@@ -1016,10 +1012,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         }
     }
 
-    dos_trace!("[INT31 RET] AX={:04x} CF={:x} | BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x}",
-        regs.rax as u16, regs.frame.rflags & 1,
-        regs.rbx as u16, regs.rcx as u16, regs.rdx as u16,
-        regs.rsi as u16, regs.rdi as u16, regs.ds as u16, regs.es as u16);
     trace_client_selector_leak("dpmi_int31.exit", regs);
     thread::KernelAction::Done
 }

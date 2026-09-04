@@ -47,6 +47,7 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::Dos
 /// initiated return trampolines, entry points, and the PMDOS INT 21
 /// short-circuit live here.
 /// Slot = (EIP - STUB_BASE - 2) / 2.
+#[inline(never)]
 pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -57,13 +58,6 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
     let eip = regs.ip32();
     let stub_base = dos::STUB_BASE;
     let slot = ((eip.wrapping_sub(stub_base + 2)) / 2) as u8;
-    // Skip the slot trace for PMDOS INT 21 character-output AHs to keep
-    // the exception-handler dump and CRT printf output readable in the log.
-    let pmdos_chatty = slot == dos::SLOT_PMDOS_INT21
-        && matches!((regs.rax >> 8) as u8, 0x02 | 0x06 | 0x09);
-    if !pmdos_chatty {
-        dos_trace!("[DPMI] STUB slot={:#04x} EIP={:#x}", slot, eip);
-    }
 
     match slot {
         dos::SLOT_PMDOS_INT10 => {

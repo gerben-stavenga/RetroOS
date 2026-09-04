@@ -30,14 +30,23 @@ fn should_trace() -> bool {
         && !IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+#[inline(never)]
+fn write_trace_line(args: core::fmt::Arguments<'_>) {
+    use core::fmt::Write;
+    let mut output = lib::log::DebugCon;
+    let _ = output.write_fmt(args);
+    let _ = output.write_str("\n");
+}
+
+// Keep the detailed DPMI transition probes available as source-level
+// breadcrumbs, but compile them out. Interrupt entry is traced once, centrally,
+// by `trace_interrupt`; per-service and internal trampoline traces duplicate it.
 macro_rules! dos_trace {
     (force $($arg:tt)*) => {
-        $crate::dbg_println!($($arg)*);
+        if false { $crate::kernel::dos::write_trace_line(format_args!($($arg)*)); }
     };
     ($($arg:tt)*) => {
-        if crate::kernel::dos::should_trace() {
-            $crate::dbg_println!($($arg)*);
-        }
+        if false { $crate::kernel::dos::write_trace_line(format_args!($($arg)*)); }
     };
 }
 
@@ -522,6 +531,43 @@ fn linear<A: crate::Arch>(_machine: &mut A, dos: &thread::DosState<A>, regs: &Re
 ///
 /// Lives at the personality root because INT 31h spans both submodules
 /// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
+#[inline(never)]
+fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
+    if !should_trace() { return; }
+    let ip = if mode == crate::UserMode::VM86 {
+        machine::vm86_ip(regs) as u32
+    } else {
+        regs.ip32()
+    };
+    let vector = if mode == crate::UserMode::VM86 {
+        if cs == dos::STUB_SEG {
+            Some(ip.wrapping_sub(2) / 2)
+        } else if cs == dos::CTRL_STUB_SEG {
+            None // internal return/entry trampoline
+        } else {
+            Some(0x31) // native/synthetic INT 31h
+        }
+    } else if cs == mode_transitions::VECTOR_STUB_SEL {
+        Some(ip.wrapping_sub(dos::STUB_BASE + 2) / 2)
+    } else if cs == mode_transitions::SPECIAL_STUB_SEL {
+        match ((ip.wrapping_sub(dos::STUB_BASE + 2)) / 2) as u8 {
+            dos::SLOT_PMDOS_INT10 => Some(0x10),
+            dos::SLOT_PMDOS_INT21 => Some(0x21),
+            dos::SLOT_PMDOS_INT33 => Some(0x33),
+            _ => None, // internal host trampoline
+        }
+    } else {
+        Some(0x31) // DPMI API
+    };
+    let Some(vector) = vector else { return; };
+    write_trace_line(format_args!(
+        "[INT {:02X}] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} CS:IP={:04x}:{:08x}",
+        vector, regs.rax as u16, regs.rbx as u16, regs.rcx as u16,
+        regs.rdx as u16, regs.rsi as u16, regs.rdi as u16,
+        regs.ds as u16, regs.es as u16, cs, ip,
+    ));
+}
+
 pub fn syscall<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -532,6 +578,7 @@ pub fn syscall<A: crate::Arch>(
     use crate::UserMode;
     let mode = regs.mode();
     let cs = if mode == UserMode::VM86 { machine::vm86_cs(regs) } else { regs.code_seg() };
+    trace_interrupt(mode, cs, regs);
     match (mode, cs) {
         (UserMode::VM86, dos::STUB_SEG)         => dos::rm_vector_dispatch(machine, bios_display, kt, dos, regs),
         (UserMode::VM86, dos::CTRL_STUB_SEG)    => dos::rm_ctrl_dispatch(machine, bios_display, kt, dos, regs),
@@ -1491,7 +1538,7 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 //     reading [mcb_seg]: sig + owner + paras, then advancing to
 //     `mcb_seg + 1 + paras` for the next MCB.
 //
-// `dos_blocks` is the source of truth. Guest writes to MCB memory are
+// `dos_blocks`, kept in ascending `seg` order, is the source of truth. Guest writes to MCB memory are
 // ignored; every alloc/free/resize/reset re-emits the chain via
 // `sync_mcb_chain`. This keeps the kernel safe from buggy or hostile
 // guests that scribble on MCB memory while still presenting a
@@ -1502,9 +1549,6 @@ pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
 /// in VM86 memory. Free MCBs are synthesized in the gaps so the chain
 /// walks contiguously from `heap_base_seg` up to 0xA000.
 fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mut Regs) {
-    let mut blocks = dos.dos_blocks.clone();
-    blocks.sort_by_key(|b| b.seg);
-
     // Update the LOL-1 first-MCB pointer. AH=52h returns ES:BX = LOL, and
     // programs (DOS/4G stubs, MEM utilities) read [LOL - 2] = first MCB
     // segment to walk the chain head.
@@ -1513,7 +1557,7 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mu
     let mut entries: alloc::vec::Vec<(u16, u16, u16)> = alloc::vec::Vec::new();
 
     let mut walk = dos.heap_base_seg;
-    for block in &blocks {
+    for block in &dos.dos_blocks {
         let block_mcb = block.seg.saturating_sub(1);
         if block_mcb > walk {
             // Free MCB at walk; data [walk+1, block_mcb), paras=block_mcb-walk-1.
@@ -1545,16 +1589,13 @@ fn sync_mcb_chain<A: crate::Arch>(machine: &mut A, dos: &DosState<A>, _regs: &mu
 }
 
 fn next_dos_block_limit<A: crate::Arch>(dos: &DosState<A>, seg: u16, skip_seg: Option<u16>) -> u16 {
-    let mut limit = 0xA000u16;
     for block in &dos.dos_blocks {
         if Some(block.seg) == skip_seg || block.seg < seg {
             continue;
         }
-        if block.seg < limit {
-            limit = block.seg;
-        }
+        return block.seg;
     }
-    limit
+    0xA000
 }
 
 /// `heap_seg` = first paragraph past the contiguous run of allocated blocks
@@ -1562,21 +1603,34 @@ fn next_dos_block_limit<A: crate::Arch>(dos: &DosState<A>, seg: u16, skip_seg: O
 /// "where does the child's arena start" hint.
 fn sync_heap_seg<A: crate::Arch>(dos: &mut DosState<A>) {
     let mut first_free = dos.heap_base_seg;
-    loop {
-        let mut advanced = false;
-        for block in &dos.dos_blocks {
-            // Block's MCB sits at first_free; data at first_free+1.
-            if block.seg == first_free.saturating_add(1) {
-                first_free = block.seg.saturating_add(block.paras);
-                advanced = true;
-                break;
-            }
-        }
-        if !advanced {
+    for block in &dos.dos_blocks {
+        // Block's MCB sits at first_free; data at first_free+1.
+        let next = first_free.saturating_add(1);
+        if block.seg == next {
+            first_free = block.seg.saturating_add(block.paras);
+        } else if block.seg > next {
             break;
         }
     }
     dos.heap_seg = first_free.min(0xA000);
+}
+
+/// Preserve the address-order invariant shared by allocation, gap discovery,
+/// and guest MCB-chain emission.
+#[inline(never)]
+fn insert_dos_block<A: crate::Arch>(dos: &mut DosState<A>, block: DosMemBlock) {
+    let mut lo = 0;
+    let mut hi = dos.dos_blocks.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if dos.dos_blocks[mid].seg < block.seg {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    debug_assert!(dos.dos_blocks.get(lo).is_none_or(|next| next.seg != block.seg));
+    dos.dos_blocks.insert(lo, block);
 }
 
 /// Largest free *data* paragraphs across all gaps + trailing region.
@@ -1585,9 +1639,7 @@ fn sync_heap_seg<A: crate::Arch>(dos: &mut DosState<A>) {
 fn largest_dos_block<A: crate::Arch>(dos: &DosState<A>) -> u16 {
     let mut largest_data = 0u16;
     let mut cur = dos.heap_base_seg;
-    let mut blocks = dos.dos_blocks.clone();
-    blocks.sort_by_key(|b| b.seg);
-    for block in blocks {
+    for block in &dos.dos_blocks {
         let block_mcb = block.seg.saturating_sub(1);
         if block_mcb > cur {
             let region = block_mcb - cur;
@@ -1626,44 +1678,39 @@ fn dos_alloc_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs:
     }
 
     let mut cur = dos.heap_base_seg;
-    let mut blocks = dos.dos_blocks.clone();
-    blocks.sort_by_key(|b| b.seg);
     let mut max_data = 0u16;
     let owner = current_mcb_owner(dos);
+    let mut allocation = None;
 
-    for block in &blocks {
+    for block in &dos.dos_blocks {
         let block_mcb = block.seg.saturating_sub(1);
         if block_mcb > cur {
             let region = block_mcb - cur;
             if region >= total {
-                let data_seg = cur.saturating_add(1);
-                if need != 0 {
-                    dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
-                }
-                sync_heap_seg(dos);
-                sync_mcb_chain(machine, dos, regs);
-                return Ok(data_seg);
+                allocation = Some(cur.saturating_add(1));
+                break;
             }
             max_data = max_data.max(region.saturating_sub(1));
         }
         cur = block.seg.saturating_add(block.paras);
     }
 
-    if cur < 0xA000 {
+    if allocation.is_none() && cur < 0xA000 {
         let region = 0xA000 - cur;
         if region >= total {
-            let data_seg = cur.saturating_add(1);
-            if need != 0 {
-                dos.dos_blocks.push(DosMemBlock { seg: data_seg, paras: need, owner });
-            }
-            sync_heap_seg(dos);
-            sync_mcb_chain(machine, dos, regs);
-            return Ok(data_seg);
+            allocation = Some(cur.saturating_add(1));
+        } else {
+            max_data = max_data.max(region.saturating_sub(1));
         }
-        max_data = max_data.max(region.saturating_sub(1));
     }
 
-    Err(max_data)
+    let Some(data_seg) = allocation else { return Err(max_data) };
+    if need != 0 {
+        insert_dos_block(dos, DosMemBlock { seg: data_seg, paras: need, owner });
+    }
+    sync_heap_seg(dos);
+    sync_mcb_chain(machine, dos, regs);
+    Ok(data_seg)
 }
 
 fn dos_free_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16) -> Result<(), u16> {
@@ -1693,7 +1740,7 @@ fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A
         return;
     }
 
-    dos.dos_blocks.push(DosMemBlock { seg, paras, owner });
+    insert_dos_block(dos, DosMemBlock { seg, paras, owner });
     sync_heap_seg(dos);
     sync_mcb_chain(machine, dos, regs);
 }

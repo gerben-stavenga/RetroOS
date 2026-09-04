@@ -1538,6 +1538,7 @@ pub fn bind_union(prefix: &'static [u8], src_prefix: &'static [u8]) {
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
 /// POSIX-strict case-sensitive lookup. (Orchestrator: no lock held across the
 /// `open_to_handle` / `close_vfs_handle` wrapper calls.)
+#[inline(never)]
 pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
     let handle = open_to_handle(path);
     if handle < 0 { return handle; }
@@ -1550,6 +1551,7 @@ pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Read from an open file descriptor. Returns bytes read or negative error.
+#[inline(never)]
 pub fn read(fd: i32, buf: &mut [u8], fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => read_by_handle(handle, buf),
@@ -1566,6 +1568,7 @@ pub fn read_raw(fd: i32, buf: &mut [u8], fds: &[FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Close a file descriptor.
+#[inline(never)]
 pub fn close(fd: i32, fds: &mut [FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => {
@@ -1578,6 +1581,7 @@ pub fn close(fd: i32, fds: &mut [FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Create or truncate a file by absolute VFS path.
+#[inline(never)]
 pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
     let handle = create_to_handle(path);
     if handle < 0 { return handle; }
@@ -1590,21 +1594,29 @@ pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Create or truncate a file on the filesystem mounted at its path.
+#[inline(never)]
 pub fn create_to_handle(path: &[u8]) -> i32 {
     VFS.lock().create_to_handle(path)
 }
 
 /// Create a directory on the filesystem mounted at its path.
+#[inline(never)]
 pub fn mkdir(path: &[u8]) -> i32 {
     VFS.lock().mkdir(path)
 }
 
+#[inline(never)]
 pub fn rmdir(path: &[u8]) -> i32 { VFS.lock().rmdir(path) }
+#[inline(never)]
 pub fn rename(old: &[u8], new: &[u8]) -> i32 { VFS.lock().rename(old, new) }
+#[inline(never)]
 pub fn path_exists(path: &[u8]) -> bool { VFS.lock().path_exists(path) }
+#[inline(never)]
 pub fn path_mode(path: &[u8]) -> Option<(u32, bool)> { VFS.lock().path_mode(path) }
+#[inline(never)]
 pub fn set_path_mode(path: &[u8], mode: u32) -> i32 { VFS.lock().set_path_mode(path, mode) }
 
+#[inline(never)]
 pub fn flush(fd: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => VFS.lock().flush_handle(handle),
@@ -1612,10 +1624,12 @@ pub fn flush(fd: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     }
 }
 
+#[inline(never)]
 pub fn handle_mtime(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<u32> {
     vfs_handle(fds, fd).ok().and_then(|h| VFS.lock().handle_mtime(h))
 }
 
+#[inline(never)]
 pub fn set_handle_mtime(fd: i32, mtime: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => VFS.lock().set_handle_mtime(handle, mtime),
@@ -1624,6 +1638,7 @@ pub fn set_handle_mtime(fd: i32, mtime: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
 }
 
 /// Write to an open file descriptor.
+#[inline(never)]
 pub fn write<A: crate::Arch>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => write_by_handle(machine, handle, data),
@@ -1632,11 +1647,13 @@ pub fn write<A: crate::Arch>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKin
 }
 
 /// Delete a file by absolute VFS path.
+#[inline(never)]
 pub fn delete(path: &[u8]) -> i32 {
     VFS.lock().delete(path)
 }
 
 /// Get the size of an open file descriptor.
+#[inline(never)]
 pub fn file_size(fd: i32, fds: &[FdKind; MAX_FDS]) -> u32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => file_size_by_handle(handle),
@@ -1649,6 +1666,7 @@ pub fn file_size(fd: i32, fds: &[FdKind; MAX_FDS]) -> u32 {
 /// honor the requested access mode: a write-mode open of something not ours
 /// must fail up front with "access denied", where programs actually check,
 /// instead of surfacing per-write errors most of them ignore.
+#[inline(never)]
 pub fn fd_writable(fd: i32, fds: &[FdKind; MAX_FDS]) -> bool {
     match vfs_handle(fds, fd) {
         Ok(handle) => VFS.lock().handle_writable(handle),
@@ -1656,6 +1674,7 @@ pub fn fd_writable(fd: i32, fds: &[FdKind; MAX_FDS]) -> bool {
     }
 }
 
+#[inline(never)]
 pub fn configure_open(
     fd: i32,
     access: OpenAccess,
@@ -1668,6 +1687,7 @@ pub fn configure_open(
     }
 }
 
+#[inline(never)]
 pub fn lock_range(fd: i32, unlock: bool, start: u32, len: u32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => VFS.lock().lock_range(handle, unlock, start, len),
@@ -1676,6 +1696,7 @@ pub fn lock_range(fd: i32, unlock: bool, start: u32, len: u32, fds: &[FdKind; MA
 }
 
 /// Seek on an open file descriptor. whence: 0=SET, 1=CUR, 2=END
+#[inline(never)]
 pub fn seek(fd: i32, offset: i32, whence: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => seek_by_handle(handle, offset, whence),
