@@ -297,6 +297,7 @@ fn packed_frame(storage: &mut alloc::vec::Vec<u32>, bytes: usize) -> &mut [u8] {
 /// Nearest-neighbour horizontal fit from a card-native packed frame into the
 /// display shadow. Vertical fitting remains `Display::present`'s job, exactly
 /// as it is for a VGA shadow.
+#[optimize(speed)]
 fn stretch_packed_rows(
     src: &[u8],
     src_w: usize,

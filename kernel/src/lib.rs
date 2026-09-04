@@ -13,6 +13,7 @@
 //! entries through plain function hooks — no `cfg` anywhere in this crate.
 
 #![no_std]
+#![feature(optimize_attribute)]
 
 extern crate alloc;
 extern crate rustc_demangle;

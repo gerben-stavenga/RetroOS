@@ -1667,6 +1667,7 @@ fn push_damage(regions: &mut Vec<Rect>, mut rect: Rect) {
     regions.push(rect);
 }
 
+#[optimize(speed)]
 fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
     let step = buffer.format.bytes_per_pixel as usize;
     let offset = y * buffer.stride + x * step;
@@ -1687,6 +1688,7 @@ fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
         | channel(buffer.format.blue_pos, buffer.format.blue_size)
 }
 
+#[optimize(speed)]
 fn read_target(target: &Target<'_>, x: usize, y: usize) -> u32 {
     let buffer = PixelBuffer {
         width: target.width,
@@ -1698,6 +1700,7 @@ fn read_target(target: &Target<'_>, x: usize, y: usize) -> u32 {
     read_pixel(buffer, x, y)
 }
 
+#[optimize(speed)]
 fn write_target(target: &mut Target<'_>, x: usize, y: usize, rgb: u32) {
     let step = target.format.bytes_per_pixel as usize;
     let offset = y * target.stride + x * step;
@@ -1705,6 +1708,7 @@ fn write_target(target: &mut Target<'_>, x: usize, y: usize, rgb: u32) {
     target.pixels[offset..offset + step].copy_from_slice(&encoded[..step]);
 }
 
+#[optimize(speed)]
 fn blend(source: u32, destination: u32, opacity: u8) -> u32 {
     let alpha = u32::from(opacity);
     let inverse = 255 - alpha;
@@ -1716,6 +1720,7 @@ fn blend(source: u32, destination: u32, opacity: u8) -> u32 {
     channel(16) | channel(8) | channel(0)
 }
 
+#[optimize(speed)]
 fn blit_scaled(
     source: PixelBuffer<'_>,
     destination: Rect,

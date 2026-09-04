@@ -92,11 +92,9 @@ rust_test(
     name = "kernel_unit_test_host",
     crate = ":kernel",
     data = [
-        "//ext4:modern_defaults_image",
         "//ext4:modern_image",
     ],
     rustc_env = {
-        "EXT4_MODERN_DEFAULTS_IMAGE": "$(rlocationpath //ext4:modern_defaults_image)",
         "EXT4_MODERN_IMAGE": "$(rlocationpath //ext4:modern_image)",
     },
     rustc_flags = [

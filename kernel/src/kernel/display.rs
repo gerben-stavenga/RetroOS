@@ -641,6 +641,7 @@ pub fn finish_present() {
 /// caller keeps `wide` off there. This deliberately does not fence each row:
 /// the caller's single end-of-frame [`present`] drains the whole blit.
 #[inline]
+#[optimize(speed)]
 unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
     let mut d = dst;
     let mut s = src;
@@ -691,6 +692,7 @@ unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
 /// Stretch one row of already-encoded `u32` pixels into a packed destination
 /// row. The destination drives the walk: every output pixel performs exactly
 /// one cached source-word load and one overlapping dword store.
+#[optimize(speed)]
 pub(crate) fn stretch_native_row(
     source: &[u32],
     destination: &mut [u8],
@@ -744,6 +746,7 @@ pub(crate) fn stretch_native_row(
 /// picture origin. Format conversion already happened in the raster pass, and
 /// the pillarbox/letterbox bars were painted once at the mode switch, so
 /// nothing here touches a pixel outside the picture.
+#[optimize(speed)]
 fn blit(
     fb: &Framebuffer,
     format: PixelFormat,
@@ -783,6 +786,7 @@ fn blit(
 /// Fill a centered physical rectangle from a dense source-sized word image.
 /// Only one packed destination row is staged; it is stretched once and reused
 /// for every vertical repetition of that source row.
+#[optimize(speed)]
 fn blit_native(
     fb: &Framebuffer,
     format: PixelFormat,
@@ -834,6 +838,7 @@ fn blit_native(
     out_w * out_h
 }
 
+#[optimize(speed)]
 fn blit_regions(
     fb: &Framebuffer,
     format: PixelFormat,

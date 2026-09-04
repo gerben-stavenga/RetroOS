@@ -1817,7 +1817,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         }
     };
 
-    let format = exec::detect_format(&buf, path);
+    let format = if parent_is_dos {
+        exec::detect_format_for_dos(&buf, path)
+    } else {
+        exec::detect_format(&buf, path)
+    };
     crate::dbg_println!(
         "handle_fork_exec: {:?} size={} format={} free_pages={}",
         core::str::from_utf8(path),

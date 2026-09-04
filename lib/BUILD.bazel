@@ -49,7 +49,7 @@ rust_library(
 # Emulated sound cards as passive, host-agnostic state machines, plus the
 # integer voice engine they share (GUS now; GM/SF2, AWE32, MT-32 later).
 # Its own target, not part of :lib. The per-frame mix loop runs at up to
-# 44.1 kHz × 32 voices but follows the system-wide opt-level z policy.
+# 44.1 kHz × 32 voices; metal underrun measurements require speed optimization.
 rust_library(
     name = "sound",
     srcs = glob(["sound/src/**/*.rs"]),
@@ -58,6 +58,7 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
+        "-Copt-level=2",
         "-Crelocation-model=static",
     ],
     deps = ["@nuked_opl3//:nuked_opl3"],

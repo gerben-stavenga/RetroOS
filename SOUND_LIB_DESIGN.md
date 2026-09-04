@@ -294,9 +294,8 @@ lib/sound/src/
   mpu401.rs     // UART/intelligent mode        (new)
 ```
 
-One crate, not two. It follows the system-wide `-Copt-level=z` policy, including
-the 44.1 kHz × 32-voice mix loop. A performance exception should only be
-introduced with a benchmark demonstrating that it is necessary.
+One crate, not two. Its 44.1 kHz × 32-voice mix loop uses `-Copt-level=2`:
+metal testing of the uniform size build produced repeated audio underruns.
 
 `sound::Format` moves down; `sound::Pace` does not (it is sink policy).
 

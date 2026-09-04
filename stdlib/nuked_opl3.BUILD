@@ -6,8 +6,8 @@ package(default_visibility = ["//visibility:public"])
 # no_std (see nuked_opl3_no_std.patch): only the integer-math `Opl3Chip` is
 # compiled; the `Opl3Device` wrapper (f64 timers) and stereo-ext panning
 # (f64::sin) stay behind features we never enable — the metal kernel builds
-# with -sse and must not emit float code. It follows the system-wide opt-level z
-# policy; any performance exception needs a benchmark.
+# with -sse and must not emit float code. Its 49.716 kHz synthesis loop is
+# speed-optimized because the size build caused measured audio underruns.
 rust_library(
     name = "nuked_opl3",
     srcs = glob(["src/**/*.rs"]),
@@ -17,5 +17,6 @@ rust_library(
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
+        "-Copt-level=2",
     ],
 )

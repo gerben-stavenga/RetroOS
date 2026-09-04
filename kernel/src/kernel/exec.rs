@@ -43,6 +43,7 @@ pub fn load_file_resolved(path: &[u8]) -> Result<Vec<u8>, i32> {
 // ── Format detection ────────────────────────────────────────────────────
 
 /// Binary format detected from magic bytes and file extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BinaryFormat {
     Elf,
     Lx,
@@ -75,6 +76,40 @@ pub fn detect_format(data: &[u8], path: &[u8]) -> BinaryFormat {
     BinaryFormat::Com
 }
 
+/// Select the half of a dual DOS/Windows executable that DOS would run.
+///
+/// Some executables contain a complete MZ program followed by an aligned PE
+/// image.  COMANCHE.EXE is one: its DOS half launches C1.EXE, while its PE half
+/// is a Windows launcher.  A conventional PE stub overlaps the PE headers in
+/// the file extent declared by its MZ header; a genuine dual-mode executable's
+/// declared MZ image ends before the secondary header begins.
+pub fn detect_format_for_dos(data: &[u8], path: &[u8]) -> BinaryFormat {
+    let format = detect_format(data, path);
+    if format == BinaryFormat::Pe && has_complete_mz_image(data) {
+        BinaryFormat::MzExe
+    } else {
+        format
+    }
+}
+
+fn has_complete_mz_image(data: &[u8]) -> bool {
+    if data.get(..2) != Some(b"MZ") || data.len() < 0x40 {
+        return false;
+    }
+    let word = |at| u16::from_le_bytes([data[at], data[at + 1]]) as usize;
+    let last_page = word(2);
+    let pages = word(4);
+    let header_bytes = word(8) * 16;
+    let secondary = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
+    let Some(image_bytes) = pages.checked_sub(1)
+        .and_then(|whole| whole.checked_mul(512))
+        .and_then(|whole| whole.checked_add(if last_page == 0 { 512 } else { last_page }))
+    else {
+        return false;
+    };
+    header_bytes < image_bytes && image_bytes <= secondary && image_bytes <= data.len()
+}
+
 fn is_lx(data: &[u8]) -> bool {
     if data.get(0..2) == Some(b"LX") { return true; }
     if data.get(0..2) != Some(b"MZ") || data.len() < 0x40 { return false; }
@@ -83,10 +118,64 @@ fn is_lx(data: &[u8]) -> bool {
 }
 
 fn is_pe(data: &[u8]) -> bool {
-    if data.get(0..4) == Some(b"PE\0\0") { return true; }
-    if data.get(0..2) != Some(b"MZ") || data.len() < 0x40 { return false; }
-    let at = u32::from_le_bytes([data[0x3c], data[0x3d], data[0x3e], data[0x3f]]) as usize;
-    data.get(at..at.saturating_add(4)) == Some(b"PE\0\0")
+    crate::kernel::windows::pe::Image::parse(data)
+        .is_ok_and(|image| image.is_windows_application())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BinaryFormat, detect_format, detect_format_for_dos};
+    use alloc::vec;
+
+    fn mz_pe(subsystem: u16) -> alloc::vec::Vec<u8> {
+        let mut data = vec![0; 256];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3c..0x40].copy_from_slice(&64u32.to_le_bytes());
+        data[64..68].copy_from_slice(b"PE\0\0");
+        data[68..70].copy_from_slice(&0x14cu16.to_le_bytes());
+        data[84..86].copy_from_slice(&96u16.to_le_bytes());
+        let optional = 88;
+        data[optional..optional + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        data[optional + 28..optional + 32].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+        data[optional + 32..optional + 36].copy_from_slice(&4096u32.to_le_bytes());
+        data[optional + 56..optional + 60].copy_from_slice(&4096u32.to_le_bytes());
+        data[optional + 60..optional + 64].copy_from_slice(&256u32.to_le_bytes());
+        data[optional + 68..optional + 70].copy_from_slice(&subsystem.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn only_windows_subsystems_select_the_native_pe_loader() {
+        assert_eq!(detect_format(&mz_pe(2), b"WINDOWS.EXE"), BinaryFormat::Pe);
+        assert_eq!(detect_format(&mz_pe(3), b"CONSOLE.EXE"), BinaryFormat::Pe);
+        assert_eq!(
+            detect_format(&mz_pe(0), b"DOSGAME.EXE"),
+            BinaryFormat::MzExe
+        );
+    }
+
+    #[test]
+    fn dos_launch_uses_complete_mz_half_of_dual_mode_pe() {
+        let mut data = vec![0; 512];
+        data[..2].copy_from_slice(b"MZ");
+        data[2..4].copy_from_slice(&96u16.to_le_bytes());
+        data[4..6].copy_from_slice(&1u16.to_le_bytes());
+        data[8..10].copy_from_slice(&4u16.to_le_bytes());
+        data[0x3c..0x40].copy_from_slice(&128u32.to_le_bytes());
+        data[128..132].copy_from_slice(b"PE\0\0");
+        data[132..134].copy_from_slice(&0x14cu16.to_le_bytes());
+        data[148..150].copy_from_slice(&96u16.to_le_bytes());
+        let optional = 152;
+        data[optional..optional + 2].copy_from_slice(&0x10bu16.to_le_bytes());
+        data[optional + 28..optional + 32].copy_from_slice(&0x0040_0000u32.to_le_bytes());
+        data[optional + 32..optional + 36].copy_from_slice(&4096u32.to_le_bytes());
+        data[optional + 56..optional + 60].copy_from_slice(&4096u32.to_le_bytes());
+        data[optional + 60..optional + 64].copy_from_slice(&256u32.to_le_bytes());
+        data[optional + 68..optional + 70].copy_from_slice(&2u16.to_le_bytes());
+
+        assert_eq!(detect_format(&data, b"DUAL.EXE"), BinaryFormat::Pe);
+        assert_eq!(detect_format_for_dos(&data, b"DUAL.EXE"), BinaryFormat::MzExe);
+    }
 }
 
 fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
@@ -125,7 +214,12 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
     // Name the thread for the F12 switch picker — the one path every launch
     // (boot init and fork-exec) flows through, so every task is named.
     threads[tid].kernel.set_comm(path);
-    match detect_format(&data, path) {
+    let format = if personality_name == Some(crate::kernel::thread::PersonalityName::Dos) {
+        detect_format_for_dos(&data, path)
+    } else {
+        detect_format(&data, path)
+    };
+    match format {
         BinaryFormat::Elf if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)
         }

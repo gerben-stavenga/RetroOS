@@ -76,6 +76,7 @@ pub struct Header {
     pub section_alignment: u32,
     pub size_image: u32,
     pub size_headers: u32,
+    pub subsystem: u16,
     pub stack_reserve: u32,
     pub export: Directory,
     pub import: Directory,
@@ -134,6 +135,7 @@ impl<'a> Image<'a> {
             section_alignment: u32_at(data, opt + 32)?,
             size_image: u32_at(data, opt + 56)?,
             size_headers: u32_at(data, opt + 60)?,
+            subsystem: u16_at(data, opt + 68)?,
             stack_reserve: u32_at(data, opt + 72)?,
             export: directory(0)?, import: directory(1)?, reloc: directory(5)?,
             section_table,
@@ -145,6 +147,10 @@ impl<'a> Image<'a> {
     }
 
     pub fn is_dll(&self) -> bool { self.header.characteristics & 0x2000 != 0 }
+
+    pub fn is_windows_application(&self) -> bool {
+        !self.is_dll() && matches!(self.header.subsystem, 2 | 3)
+    }
 
     pub fn section(&self, n: usize) -> Result<Section, Error> {
         if n >= self.header.sections as usize { return Err(Error::BadTable); }
