@@ -33,7 +33,7 @@ const S_IRGRP: u32 = 0o040;
 /// Centralizing enforcement in the VFS means EVERY mount needs an answer here,
 /// not just the ones with ownership bits. Getting this wrong is silent: the
 /// first version defaulted everything to "no grant, so read-only" and made the
-/// host filesystem, the boot TAR and the RAM overlay unwritable, which the
+/// host filesystem and the boot TAR unwritable, which the
 /// COMMAND.COM bootstrap caught by failing to compile.
 #[derive(Clone, Copy)]
 pub enum WriteAccess {

@@ -284,9 +284,8 @@ impl Filesystem for HostFs {
         true
     }
 
-    /// HostFS is a writable backend even when its peer is temporarily down.
-    /// Keep failed creates as I/O errors rather than letting VFS substitute
-    /// its RAM overlay and report a false success to DOS.
+    /// HostFS is a writable backend even when its peer is temporarily down;
+    /// distinguish a failed request from an unsupported operation.
     fn supports_create(&self) -> bool {
         true
     }

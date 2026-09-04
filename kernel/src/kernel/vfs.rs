@@ -4,12 +4,11 @@
 //! Thread FD arrays index into this table. FDs 0/1/2 are reserved
 //! for stdin/stdout/stderr and handled directly in syscall handlers.
 //!
-//! Writable overlay: a BTreeMap<Vec<u8>, Vec<u8>> holds RAM-backed files
-//! created by DOS programs. create() inserts, open() checks overlay
-//! before the backing filesystem, read()/write()/seek() dispatch on the backing type.
+//! Disk volatility is composed below filesystems by the block-device RAM
+//! overlay. VFS itself has no RAM-specific data path.
 //!
-//! All VFS state — the mount table, the open-file table, the RAM overlay, and
-//! the path/dir caches — is a single kernel-wide singleton (`Vfs`) behind a
+//! All VFS state — the mount table, open-file table, and path/dir caches — is
+//! a single kernel-wide singleton (`Vfs`) behind a
 //! `spin::Mutex`, so access is borrow-checked and correct under multiple cores.
 //! The lock is taken only from kernel/event-loop context (ISRs merely queue), so
 //! a plain spinlock suffices. To stay deadlock-free, the *state* lives in `&mut
@@ -20,7 +19,7 @@
 //! filesystems never call back into `vfs`, so holding the lock across `fs.read`/
 //! `fs.open` is safe.
 
-use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
@@ -32,9 +31,6 @@ const MAX_OPEN_FILES: usize = 128;
 
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
-
-/// Sentinel: handle value meaning "RAM-backed file"
-const RAM_SENTINEL: u64 = u64::MAX;
 
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
@@ -155,13 +151,8 @@ pub trait Filesystem {
 
     /// Does this backend implement `create` at all?
     ///
-    /// This distinguishes the two very different meanings of `create → None`:
-    /// a read-only backend (tarfs, klog — the default) has no create, so the
-    /// VFS substitutes a RAM-backed file and the guest can scribble on C:\BOOT
-    /// harmlessly. A backend that DOES create (portable ext4, hostfs) returning `None`
-    /// means DENIED, and must surface to the guest as an error — silently
-    /// handing it a RAM file would report success for a write that will never
-    /// exist.
+    /// Distinguishes an unsupported operation from a supported create that
+    /// failed. VFS never substitutes another filesystem.
     fn supports_create(&self) -> bool { false }
 
     /// Create a directory. Returns 0 on success, negative errno on failure.
@@ -212,7 +203,7 @@ pub trait Filesystem {
 /// `Tstat` message is deferred until the wire codec needs it.
 #[derive(Clone, Copy)]
 pub struct Vnode {
-    pub handle: u64,  // 9P fid: filesystem-specific opaque handle (RAM_SENTINEL for overlay)
+    pub handle: u64,  // filesystem-specific opaque handle
     pub size: u32,
     /// POSIX permission bits (lower 12 — perms + setuid/setgid/sticky).
     /// Carried through from the backing filesystem (TAR's USTAR mode field,
@@ -282,9 +273,9 @@ pub struct FileEntry {
     pub writable: bool,
     pub access: OpenAccess,
     pub share: SharePolicy,
-    /// For RAM-backed files: normalized path key into the RAM overlay
-    pub ram_key: [u8; PATH_KEY_MAX],
-    pub ram_key_len: u8,
+    /// Resolved path retained for path-oriented metadata operations.
+    pub path: [u8; PATH_KEY_MAX],
+    pub path_len: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -321,8 +312,9 @@ enum BindTarget {
     Alias { src_prefix: &'static [u8] },
 }
 
-/// One entry in the namespace: a prefix, what it points at, how it composes,
-/// and a monotonic sequence number that gives union members a stable order.
+/// One entry in the namespace: a prefix, what it points at, and its write
+/// policy. Bindings are stored oldest-to-newest; reverse iteration is union
+/// priority order.
 ///
 /// Prefixes and alias targets are `&'static` — boot-time mounts leak their
 /// (one-time, boot-lifetime) prefix, the same discipline the old fixed table
@@ -339,11 +331,37 @@ struct Binding {
     // NB: the mount MODE (Replace vs Union) is applied when the binding is
     // added (Replace drops peers at the prefix; see `add_binding`) — it does
     // not need to persist per-binding, so it is not stored here.
-    seq: u32,
 }
 
-/// Max members in one union group (fixed scratch, no alloc on resolve). A
-/// union stack is tiny in practice; overflow drops the oldest layers (logged).
+struct ResolvedObject {
+    mount_idx: u8,
+    fs: &'static dyn Filesystem,
+    subpath: [u8; PATH_KEY_MAX],
+    subpath_len: u8,
+    stat: Stat,
+}
+
+impl ResolvedObject {
+    fn new(
+        mount_idx: u8,
+        fs: &'static dyn Filesystem,
+        subpath: &[u8],
+        stat: Stat,
+    ) -> Option<Self> {
+        if subpath.len() > PATH_KEY_MAX { return None; }
+        let subpath_len = u8::try_from(subpath.len()).ok()?;
+        let mut path = [0; PATH_KEY_MAX];
+        path[..subpath.len()].copy_from_slice(subpath);
+        Some(Self { mount_idx, fs, subpath: path, subpath_len, stat })
+    }
+
+    fn subpath(&self) -> &[u8] {
+        &self.subpath[..usize::from(self.subpath_len)]
+    }
+}
+
+/// Max members visited in one union group. A union stack is tiny in practice;
+/// overflow drops the oldest layers (logged).
 const MAX_UNION: usize = 8;
 
 /// Alias (bind) expansion depth cap — breaks any accidental bind cycle.
@@ -366,11 +384,11 @@ struct DirCache {
 }
 
 impl DirCache {
-    fn new(dir: &[u8], entries: Vec<DirEntry>) -> Self {
-        let mut names = BTreeMap::new();
-        for (index, entry) in entries.iter().enumerate() {
-            names.insert(entry.name[..entry.name_len].to_vec(), index);
-        }
+    fn new(
+        dir: &[u8],
+        entries: Vec<DirEntry>,
+        names: BTreeMap<Vec<u8>, usize>,
+    ) -> Self {
         Self { dir: dir.to_vec(), entries, names }
     }
 }
@@ -394,12 +412,7 @@ struct Vfs {
     /// The namespace: an ordered, stackable, bind-capable mount table (the
     /// composer). Built at startup; a Replace group is a single member.
     mounts: Vec<Binding>,
-    next_seq: u32,
-    /// Writable file overlay — persists across open/close cycles.
-    ram_files: BTreeMap<Vec<u8>, Vec<u8>>,
-    /// RAM-overlay directories created over read-only filesystems.
-    ram_dirs: BTreeSet<Vec<u8>>,
-    /// Metadata for RAM-overlay objects and backends which cannot persist it.
+    /// Metadata overrides for backends which cannot persist it.
     modes: BTreeMap<Vec<u8>, u32>,
     mtimes: BTreeMap<Vec<u8>, u32>,
     locks: Vec<FileLock>,
@@ -423,14 +436,11 @@ impl Vfs {
             writable: false,
             access: OpenAccess::Read,
             share: SharePolicy::DenyNone,
-            ram_key: [0; PATH_KEY_MAX],
-            ram_key_len: 0,
+            path: [0; PATH_KEY_MAX],
+            path_len: 0,
         };
         Vfs {
             mounts: Vec::new(),
-            next_seq: 0,
-            ram_files: BTreeMap::new(),
-            ram_dirs: BTreeSet::new(),
             modes: BTreeMap::new(),
             mtimes: BTreeMap::new(),
             locks: Vec::new(),
@@ -442,54 +452,124 @@ impl Vfs {
 
     // ── mount table (namespace composer) ─────────────────────────────────
 
-    /// Visit the members serving `path`, highest-priority first, each resolved
-    /// to `(mount_idx, fs, subpath)`, calling `f` per member; return the first
-    /// `Some` it yields (short-circuit). So `open` stops at the first hit and
-    /// `dir_exists` at the first existing dir, while a `readdir` closure that
-    /// always returns `None` visits every member in order (union merge). Alias
-    /// (bind) targets are expanded by retrying under `src_prefix`, depth-capped.
-    ///
-    /// For a `Replace` group (every startup mount) there is exactly one member,
-    /// so this reduces to the old single-winner longest-prefix lookup.
-    fn resolve_members<R>(
+    fn longest_prefix(&self, path: &[u8]) -> Option<usize> {
+        self.mounts
+            .iter()
+            .filter(|binding| match_prefix(binding.prefix, path).is_some())
+            .map(|binding| binding.prefix.len())
+            .max()
+    }
+
+    /// Find the first object supplied by the highest-priority matching layer.
+    fn resolve_object(&self, path: &[u8], depth: u8) -> Option<ResolvedObject> {
+        let best = self.longest_prefix(path)?;
+        let mut visited = 0;
+        for (index, binding) in self.mounts.iter().enumerate().rev() {
+            if binding.prefix.len() != best { continue; }
+            let Some(start) = match_prefix(binding.prefix, path) else { continue };
+            if visited == MAX_UNION {
+                crate::dbg_println!(
+                    "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
+                break;
+            }
+            visited += 1;
+            let subpath = &path[start..];
+            match binding.target {
+                BindTarget::Server(fs) => {
+                    let stat = if subpath.is_empty() {
+                        Some(Stat {
+                            size: 0,
+                            mode: 0o755,
+                            is_dir: true,
+                            is_symlink: false,
+                            ino: fs.root_node().unwrap_or(0),
+                        })
+                    } else {
+                        fs.stat(subpath, false)
+                    };
+                    if let Some(stat) = stat {
+                        return ResolvedObject::new(index as u8, fs, subpath, stat);
+                    }
+                }
+                BindTarget::Alias { src_prefix } if depth != 0 => {
+                    let mut rewritten = [0; PATH_KEY_MAX];
+                    let len = src_prefix.len().checked_add(subpath.len())?;
+                    if len > rewritten.len() { continue; }
+                    rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
+                    rewritten[src_prefix.len()..len].copy_from_slice(subpath);
+                    if let Some(object) = self.resolve_object(&rewritten[..len], depth - 1) {
+                        return Some(object);
+                    }
+                }
+                BindTarget::Alias { .. } => {}
+            }
+        }
+        None
+    }
+
+    /// Locate an object whose owning layer is already known from a directory
+    /// entry. The listing is the existence proof, so this only translates the
+    /// namespace path (including aliases); it does not repeat backend lookup.
+    fn resolve_listed(
         &self,
         path: &[u8],
         depth: u8,
-        f: &mut impl FnMut(u8, &'static dyn Filesystem, &[u8]) -> Option<R>,
-    ) -> Option<R> {
-        // Longest matching prefix length across all bindings.
-        let mut best: Option<usize> = None;
-        for b in &self.mounts {
-            if match_prefix(b.prefix, path).is_some() {
-                best = Some(best.map_or(b.prefix.len(), |x| x.max(b.prefix.len())));
-            }
-        }
-        let best = best?;
-
-        // Members at that prefix, ordered most-recently-mounted (highest seq)
-        // first. A Replace group is a single member; a union stacks here.
-        let mut members = [(0usize, 0u32); MAX_UNION];
-        let mut n = 0;
-        for (i, b) in self.mounts.iter().enumerate() {
-            if b.prefix.len() == best && match_prefix(b.prefix, path).is_some() {
-                if n < MAX_UNION {
-                    members[n] = (i, b.seq);
-                    n += 1;
-                } else {
-                    crate::dbg_println!(
-                        "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
+        mount_idx: u8,
+        stat: Stat,
+    ) -> Option<ResolvedObject> {
+        let best = self.longest_prefix(path)?;
+        for (index, binding) in self.mounts.iter().enumerate().rev() {
+            if binding.prefix.len() != best { continue; }
+            let Some(start) = match_prefix(binding.prefix, path) else { continue };
+            let subpath = &path[start..];
+            match binding.target {
+                BindTarget::Server(fs) if index as u8 == mount_idx => {
+                    return ResolvedObject::new(mount_idx, fs, subpath, stat);
                 }
+                BindTarget::Alias { src_prefix } if depth != 0 => {
+                    let mut rewritten = [0; PATH_KEY_MAX];
+                    let len = src_prefix.len().checked_add(subpath.len())?;
+                    if len > rewritten.len() { continue; }
+                    rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
+                    rewritten[src_prefix.len()..len].copy_from_slice(subpath);
+                    if let Some(object) = self.resolve_listed(
+                        &rewritten[..len], depth - 1, mount_idx, stat,
+                    ) {
+                        return Some(object);
+                    }
+                }
+                _ => {}
             }
         }
-        members[..n].sort_by_key(|&(_, seq)| core::cmp::Reverse(seq)); // most-recent (highest seq) first
+        None
+    }
 
-        for &(i, _) in &members[..n] {
-            let b = self.mounts[i];
-            let start = match_prefix(b.prefix, path).unwrap();
+    /// Visit every matching layer for union directory enumeration. Returning
+    /// `true` stops the walk. Object lookup uses [`Self::resolve_object`].
+    fn visit_layers(
+        &self,
+        path: &[u8],
+        depth: u8,
+        visit: &mut dyn FnMut(u8, &'static dyn Filesystem, &[u8]) -> bool,
+    ) -> bool {
+        let Some(best) = self.longest_prefix(path) else { return false };
+
+        // Bindings are appended oldest-to-newest, so reverse iteration is
+        // already union priority order. A Replace group is a single member.
+        let mut n = 0;
+        for (i, b) in self.mounts.iter().enumerate().rev() {
+            if b.prefix.len() != best { continue; }
+            let Some(start) = match_prefix(b.prefix, path) else { continue };
+            if n == MAX_UNION {
+                crate::dbg_println!(
+                    "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
+                break;
+            }
+            n += 1;
             let subpath = &path[start..];
             match b.target {
                 BindTarget::Server(fs) => {
-                    if let Some(r) = f(i as u8, fs, subpath) { return Some(r); }
+                    if visit(i as u8, fs, subpath) { return true; }
                 }
                 BindTarget::Alias { src_prefix } => {
                     if depth == 0 { continue; }
@@ -499,34 +579,30 @@ impl Vfs {
                     if pl + sl > buf.len() { continue; }
                     buf[..pl].copy_from_slice(src_prefix);
                     buf[pl..pl + sl].copy_from_slice(subpath);
-                    if let Some(r) = self.resolve_members(&buf[..pl + sl], depth - 1, f) {
-                        return Some(r);
-                    }
+                    if self.visit_layers(&buf[..pl + sl], depth - 1, visit) { return true; }
                 }
             }
         }
-        None
+        false
     }
 
     /// The single highest-priority `Server` member at the longest matching
     /// prefix (non-allocating). Used by `create`/`delete`, which write to the
-    /// top layer. Alias heads and an empty table fall back to `EmptyFs` (so a
-    /// create on a bound or unmounted path lands on the RAM overlay).
+    /// top layer. Alias heads and an empty table fall back to `EmptyFs`.
     fn resolve_head<'a>(&self, path: &'a [u8]) -> (u8, &'static dyn Filesystem, &'a [u8]) {
-        let mut best: Option<(usize, u32, usize, usize)> = None; // (plen, seq, idx, start)
-        for (i, b) in self.mounts.iter().enumerate() {
+        let mut best: Option<(usize, usize, usize)> = None; // (prefix length, index, path start)
+        for (i, b) in self.mounts.iter().enumerate().rev() {
             if let BindTarget::Server(_) = b.target
                 && let Some(start) = match_prefix(b.prefix, path) {
                 let better = match best {
                     None => true,
-                    Some((bl, bseq, _, _)) =>
-                        b.prefix.len() > bl || (b.prefix.len() == bl && b.seq > bseq),
+                    Some((best_len, _, _)) => b.prefix.len() > best_len,
                 };
-                if better { best = Some((b.prefix.len(), b.seq, i, start)); }
+                if better { best = Some((b.prefix.len(), i, start)); }
             }
         }
         match best {
-            Some((_, _, i, start)) => match self.mounts[i].target {
+            Some((_, i, start)) => match self.mounts[i].target {
                 BindTarget::Server(fs) => (i as u8, fs, &path[start..]),
                 BindTarget::Alias { .. } => unreachable!(),
             },
@@ -612,9 +688,11 @@ impl Vfs {
         if mode == MountMode::Replace {
             self.mounts.retain(|b| !eq_ignore_case(b.prefix, prefix));
         }
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
-        self.mounts.push(Binding { prefix, target, access: WriteAccess::Delegated, seq });
+        self.mounts.push(Binding {
+            prefix,
+            target,
+            access: WriteAccess::Delegated,
+        });
     }
 
     fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
@@ -635,6 +713,33 @@ impl Vfs {
         (0..MAX_OPEN_FILES).find(|&i| self.file_table[i].refcount == 0)
     }
 
+    fn install_handle(
+        &mut self,
+        path: &[u8],
+        ino: u64,
+        mount_idx: u8,
+        vnode: Vnode,
+        writable: bool,
+    ) -> i32 {
+        let Some(index) = self.alloc_file_entry() else { return -24 };
+        let path_len = path.len().min(PATH_KEY_MAX);
+        let mut path_key = [0; PATH_KEY_MAX];
+        path_key[..path_len].copy_from_slice(&path[..path_len]);
+        self.file_table[index] = FileEntry {
+            vnode,
+            offset: 0,
+            refcount: 1,
+            ino,
+            mount_idx,
+            writable,
+            access: OpenAccess::Read,
+            share: SharePolicy::DenyNone,
+            path: path_key,
+            path_len: path_len as u8,
+        };
+        index as i32
+    }
+
     /// Drop one reference to a file-table entry; at refcount 0 release the slot
     /// and `clunk` the backing fid (Tclunk).
     ///
@@ -643,7 +748,7 @@ impl Vfs {
     /// is gone. `dup`/`fork` share one file-table entry (refcount > 1), so the
     /// fid is clunked exactly once, when the last of them closes; two
     /// independent opens of the same path hold distinct fids and clunk
-    /// independently. RAM-overlay entries own no backing fid (skip).
+    /// independently.
     fn close_handle(&mut self, idx: i32) {
         if idx < 0 || (idx as usize) >= MAX_OPEN_FILES { return; }
         let i = idx as usize;
@@ -652,10 +757,8 @@ impl Vfs {
         if self.file_table[i].refcount == 0 {
             self.locks.retain(|l| l.owner != idx);
             let handle = self.file_table[i].vnode.handle;
-            if handle != RAM_SENTINEL {
-                let midx = self.file_table[i].mount_idx;
-                self.mount_fs(midx).clunk(handle);
-            }
+            let midx = self.file_table[i].mount_idx;
+            self.mount_fs(midx).clunk(handle);
         }
     }
 
@@ -681,48 +784,17 @@ impl Vfs {
     }
 
     /// Populate the directory cache for `dir` (single pass). Layers, top to
-    /// bottom (a name from a higher layer shadows the same name lower down):
-    /// the RAM overlay (writable, shadows the backing fs — matching `open`'s
-    /// RAM-first check), then the union stack of mounted filesystems (most-
-    /// recent first), then synthesized mount/bind-point directories.
+    /// bottom (a name from a higher layer shadows the same name lower down),
+    /// followed by synthesized mount/bind-point directories. Writable RAM
+    /// overlays are ordinary members of that union stack.
     fn populate_dir_cache(&mut self, dir: &[u8]) {
         let mut entries: Vec<DirEntry> = Vec::new();
-        let mut visible_names: BTreeMap<Vec<u8>, ()> = BTreeMap::new();
-
-        // RAM overlay files (writable layer, highest priority).
-        for (key, data) in self.ram_files.iter() {
-            if let Some(basename) = entry_in_ram_dir(key, dir)
-                && claim_visible_name(&mut visible_names, basename) {
-                let len = basename.len().min(100);
-                let mut de = DirEntry {
-                    name: [0; 100], name_len: len, size: data.len() as u32,
-                    is_dir: false, is_symlink: false, mode: 0o644, mtime: 0,
-                    node: 0, mount_idx: 0,
-                };
-                de.name[..len].copy_from_slice(&basename[..len]);
-                entries.push(de);
-            }
-        }
-
-        // RAM overlay directories.
-        for key in self.ram_dirs.iter() {
-            if let Some(basename) = entry_in_ram_dir(key, dir)
-                && claim_visible_name(&mut visible_names, basename) {
-                let len = basename.len().min(100);
-                let mut de = DirEntry {
-                    name: [0; 100], name_len: len, size: 0,
-                    is_dir: true, is_symlink: false, mode: 0o755, mtime: 0,
-                    node: 0, mount_idx: 0,
-                };
-                de.name[..len].copy_from_slice(&basename[..len]);
-                entries.push(de);
-            }
-        }
+        let mut visible_names: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
 
         // Union merge: visit every member of the group in priority order (most
         // recent first); an upper layer shadows a lower one on a name clash.
         // For a Replace group this is just the one backing fs (== old behavior).
-        self.resolve_members(dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
+        self.visit_layers(dir, ALIAS_DEPTH, &mut |idx, fs, subpath| {
             let mut batch: Vec<DirEntry> = Vec::new();
             let mut cookie = READDIR_START;
             let directory_node = if subpath.is_empty() {
@@ -739,7 +811,11 @@ impl Vfs {
                 };
                 for mut e in batch.drain(..) {
                     e.mount_idx = idx;
-                    if claim_visible_name(&mut visible_names, &e.name[..e.name_len]) {
+                    if claim_visible_name(
+                        &mut visible_names,
+                        &e.name[..e.name_len],
+                        entries.len(),
+                    ) {
                         entries.push(e);
                     }
                 }
@@ -752,13 +828,13 @@ impl Vfs {
                     _ => break,
                 }
             }
-            None::<()>
+            false
         });
 
         // Synthesize mount/bind-point directories that live directly under `dir`.
         for b in &self.mounts {
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
-                && claim_visible_name(&mut visible_names, name) {
+                && claim_visible_name(&mut visible_names, name, entries.len()) {
                 let name_len = name.len().min(100);
                 let mut de = DirEntry {
                     name: [0; 100], name_len, size: 0, is_dir: true,
@@ -772,7 +848,7 @@ impl Vfs {
             }
         }
 
-        self.dir_cache.push(DirCache::new(dir, entries));
+        self.dir_cache.push(DirCache::new(dir, entries, visible_names));
     }
 
     fn readdir(&mut self, dir: &[u8], index: usize) -> Option<DirEntry> {
@@ -791,7 +867,8 @@ impl Vfs {
             self.populate_dir_cache(parent);
         }
         let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
-        Some(clone_dir_entry(cached.entries.get(*cached.names.get(name)?)?))
+        let folded: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+        Some(clone_dir_entry(cached.entries.get(*cached.names.get(folded.as_slice())?)?))
     }
 
     fn readlink_entry(&self, path: &[u8], entry: &DirEntry, out: &mut [u8]) -> Option<usize> {
@@ -800,9 +877,15 @@ impl Vfs {
         {
             return Some(len);
         }
-        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            fs.readlink(subpath, out)
-        })
+        let object = self.resolve_listed(path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            size: entry.size,
+            mode: entry.mode,
+            is_dir: entry.is_dir,
+            is_symlink: entry.is_symlink,
+            ino: entry.node,
+        })?;
+        object.fs.readlink_node(object.stat.ino, out)
+            .or_else(|| object.fs.readlink(object.subpath(), out))
     }
 
     /// Expand symlinks as namespace objects. Backends only expose link bytes;
@@ -892,32 +975,27 @@ impl Vfs {
         if entry.node == 0 || entry.is_dir || entry.is_symlink {
             return None;
         }
-        let subpath = self.resolve_members(path, ALIAS_DEPTH, &mut |idx, _fs, subpath| {
-            (idx == entry.mount_idx).then(|| subpath.to_vec())
+        let object = self.resolve_listed(path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            size: entry.size,
+            mode: entry.mode,
+            is_dir: entry.is_dir,
+            is_symlink: entry.is_symlink,
+            ino: entry.node,
         })?;
-        let vnode = self.mount_fs(entry.mount_idx).open_node(entry.node)?;
-        Some((entry.mount_idx, vnode, subpath))
+        let vnode = object.fs.open_node(entry.node)?;
+        Some((entry.mount_idx, vnode, object.subpath().to_vec()))
     }
 
     fn dir_exists(&mut self, path: &[u8]) -> bool {
         let Some(path) = self.resolve_symlinks(path, true) else { return false };
         let path = path.as_slice();
-        if self.ram_dirs.contains(path) {
-            return true;
-        }
         if let Some((parent, name)) = split_parent_bytes(path)
             && let Some(entry) = self.cached_child(parent, name)
         {
             return entry.is_dir;
         }
-        // True if any member of the group has this dir. A mount root (and the
-        // VFS root) is structurally a directory — a member with an empty
-        // subpath answers true without querying the backing fs, which avoids
-        // blocking on a mount whose transport is unresponsive (e.g. `ls /`
-        // stats the /host mount; a hostfs read with no server attached hangs).
-        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            if subpath.is_empty() || fs.dir_exists(subpath) { Some(()) } else { None }
-        }).is_some()
+        self.resolve_object(path, ALIAS_DEPTH)
+            .is_some_and(|object| object.stat.is_dir)
     }
 
     fn readlink(&mut self, path: &[u8], out: &mut [u8]) -> Option<usize> {
@@ -933,24 +1011,6 @@ impl Vfs {
     fn stat(&mut self, path: &[u8], follow_final: bool) -> Option<Stat> {
         let resolved = self.resolve_symlinks(path, follow_final)?;
         let path = resolved.as_slice();
-        if let Some(data) = self.ram_files.get(path) {
-            return Some(Stat {
-                size: data.len().min(u32::MAX as usize) as u32,
-                mode: self.modes.get(path).copied().unwrap_or(0o644) as u16,
-                is_dir: false,
-                is_symlink: false,
-                ino: path_ino(path),
-            });
-        }
-        if self.ram_dirs.contains(path) {
-            return Some(Stat {
-                size: 0,
-                mode: self.modes.get(path).copied().unwrap_or(0o755) as u16,
-                is_dir: true,
-                is_symlink: false,
-                ino: path_ino(path),
-            });
-        }
         let override_mode = self.modes.get(path).copied();
         if let Some((parent, name)) = split_parent_bytes(path)
             && let Some(entry) = self.cached_child(parent, name)
@@ -963,20 +1023,10 @@ impl Vfs {
                 ino: path_ino(path),
             });
         }
-        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            let mut stat = if subpath.is_empty() {
-                Stat { size: 0, mode: 0o755, is_dir: true, is_symlink: false, ino: 0 }
-            } else {
-                fs.stat(subpath, false)?
-            };
-            if let Some(mode) = override_mode {
-                stat.mode = mode as u16;
-            }
-            if stat.ino == 0 {
-                stat.ino = path_ino(path);
-            }
-            Some(stat)
-        })
+        let mut stat = self.resolve_object(path, ALIAS_DEPTH)?.stat;
+        if let Some(mode) = override_mode { stat.mode = mode as u16; }
+        if stat.ino == 0 { stat.ino = path_ino(path); }
+        Some(stat)
     }
 
     fn mkdir(&mut self, path: &[u8]) -> i32 {
@@ -989,18 +1039,11 @@ impl Vfs {
         };
         let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
-        if fs.supports_mkdir() {
-            if !self.may_write_parent(midx, subpath) {
-                return -13;
-            }
-            let rc = fs.mkdir(subpath);
-            if rc < 0 {
-                return rc;
-            }
-            self.claim(midx, subpath);
-        } else {
-            self.ram_dirs.insert(path.to_vec());
-        }
+        if !fs.supports_mkdir() { return -38; }
+        if !self.may_write_parent(midx, subpath) { return -13; }
+        let rc = fs.mkdir(subpath);
+        if rc < 0 { return rc; }
+        self.claim(midx, subpath);
         self.invalidate_dir_cache();
         0
     }
@@ -1014,31 +1057,6 @@ impl Vfs {
             None => return -2,
         };
         let path = resolved_path.as_slice();
-        // Check RAM overlay first.
-        if let Some(data) = self.ram_files.get(path) {
-            let size = data.len() as u32;
-            let table_idx = match self.alloc_file_entry() {
-                Some(i) => i,
-                None => return -24,
-            };
-            let key_len = path.len().min(PATH_KEY_MAX) as u8;
-            let mut ram_key = [0u8; PATH_KEY_MAX];
-            ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-            self.file_table[table_idx] = FileEntry {
-                vnode: Vnode { handle: RAM_SENTINEL, size, mode: 0o644 },
-                ino: original_ino,
-                offset: 0,
-                refcount: 1,
-                mount_idx: 0,
-                ram_key,
-                ram_key_len: key_len,
-                writable: true, // RAM overlay files are always ours
-                access: OpenAccess::Read,
-                share: SharePolicy::DenyNone,
-            };
-            return table_idx as i32;
-        }
-
         // Try each member of the group in priority order; first hit wins and
         // its mount_idx is recorded (a Replace group = the single backing fs).
         // Every open gets its OWN fid from `fs.open` — fids are never cached or
@@ -1048,37 +1066,19 @@ impl Vfs {
         // the member that actually opened the file, not against whatever
         // `resolve_head` would pick.
         let resolved = self.open_cached_node(path).or_else(|| {
-            self.resolve_members(path, ALIAS_DEPTH, &mut |idx, fs, subpath| {
-                fs.open(subpath).map(|v| (idx, v, subpath.to_vec()))
-            })
+            let object = self.resolve_object(path, ALIAS_DEPTH)?;
+            if object.stat.is_dir || object.stat.is_symlink { return None; }
+            let vnode = object.fs.open_node(object.stat.ino)
+                .or_else(|| object.fs.open(object.subpath()))?;
+            Some((object.mount_idx, vnode, object.subpath().to_vec()))
         });
         let (midx, vnode, sub) = match resolved {
             Some(x) => x,
             None => return -2,
         };
 
-        let table_idx = match self.alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        let key_len = path.len().min(PATH_KEY_MAX) as u8;
-        let mut path_key = [0u8; PATH_KEY_MAX];
-        path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-        self.file_table[table_idx] = FileEntry {
-            vnode,
-            ino: original_ino,
-            offset: 0,
-            refcount: 1,
-            mount_idx: midx,
-            ram_key: path_key,
-            ram_key_len: key_len,
-            // Decide now, while the path is still in hand — `write` receives
-            // only a handle.
-            writable: self.may_write(midx, &sub),
-            access: OpenAccess::Read,
-            share: SharePolicy::DenyNone,
-        };
-        table_idx as i32
+        let writable = self.may_write(midx, &sub);
+        self.install_handle(path, original_ino, midx, vnode, writable)
     }
 
     fn create_to_handle(&mut self, path: &[u8]) -> i32 {
@@ -1089,100 +1089,34 @@ impl Vfs {
         let Some(resolved) = resolved else { return -2 };
         let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
-        // The check applies only to filesystems that can really create. One
-        // that cannot (a TAR) falls through to the RAM overlay below, exactly
-        // as before — denying there would make read-only mounts lose their
-        // scratch files rather than protect anything.
+        if !fs.supports_create() { return -38; }
         // Did it already exist? Decides both which permission applies and
         // whether a successful create needs stamping as ours.
         let existed = fs.meta(subpath).is_some();
-        if fs.supports_create() {
-            // Creating or truncating is a write: an existing object must
-            // itself be ours, a new one needs write permission on its parent.
-            let permitted = if existed {
-                self.may_write(midx, subpath)
-            } else {
-                self.may_write_parent(midx, subpath)
-            };
-            if !permitted {
-                return -13; // EACCES
-            }
+        // Creating or truncating is a write: an existing object must itself
+        // be ours, a new one needs write permission on its parent.
+        let permitted = if existed {
+            self.may_write(midx, subpath)
+        } else {
+            self.may_write_parent(midx, subpath)
+        };
+        if !permitted {
+            return -13; // EACCES
         }
         if let Some(vnode) = fs.create(subpath) {
             if !existed {
                 self.claim(midx, subpath);
             }
-            let table_idx = match self.alloc_file_entry() {
-                Some(i) => i,
-                None => return -24,
-            };
-            let key_len = path.len().min(PATH_KEY_MAX) as u8;
-            let mut path_key = [0u8; PATH_KEY_MAX];
-            path_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-            self.file_table[table_idx] = FileEntry {
-                vnode,
-                ino: original_ino,
-                offset: 0,
-                refcount: 1,
-                mount_idx: midx,
-                ram_key: path_key,
-                ram_key_len: key_len,
-                writable: true, // the permission check above already passed
-                access: OpenAccess::Read,
-                share: SharePolicy::DenyNone,
-            };
             self.invalidate_dir_cache();
-            return table_idx as i32;
+            return self.install_handle(path, original_ino, midx, vnode, true);
         }
 
-        // The backend HAS a create and refused: that is a permission denial, not
-        // a missing feature. Report it (EACCES) — never paper over it with a RAM
-        // file, which would tell the guest its write succeeded.
-        if fs.supports_create() {
-            return -13; // EACCES
-        }
-
-        let key_len = path.len().min(PATH_KEY_MAX) as u8;
-        self.ram_files.insert(path.to_vec(), Vec::new());
-        self.invalidate_dir_cache();
-
-        let table_idx = match self.alloc_file_entry() {
-            Some(i) => i,
-            None => return -24,
-        };
-        let mut ram_key = [0u8; PATH_KEY_MAX];
-        ram_key[..key_len as usize].copy_from_slice(&path[..key_len as usize]);
-        self.file_table[table_idx] = FileEntry {
-            vnode: Vnode { handle: RAM_SENTINEL, size: 0, mode: 0o644 },
-            ino: original_ino,
-            offset: 0,
-            refcount: 1,
-            mount_idx: 0,
-            writable: true, // RAM overlay files are always ours
-            access: OpenAccess::Read,
-            share: SharePolicy::DenyNone,
-            ram_key,
-            ram_key_len: key_len,
-        };
-        table_idx as i32
+        -13
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
         let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
         let path = resolved.as_slice();
-        if self.ram_dirs.contains(path) {
-            let mut prefix = path.to_vec();
-            prefix.push(b'/');
-            if self.ram_dirs.iter().any(|p| p.starts_with(&prefix))
-                || self.ram_files.keys().any(|p| p.starts_with(&prefix)) {
-                return -39; // ENOTEMPTY
-            }
-            self.ram_dirs.remove(path);
-            self.modes.remove(path);
-            self.mtimes.remove(path);
-            self.invalidate_dir_cache();
-            return 0;
-        }
         let (midx, fs, subpath) = self.resolve_head(path);
         if !fs.supports_directory_mutation() { return -38; }
         if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath) {
@@ -1203,42 +1137,16 @@ impl Vfs {
         let old = old_resolved.as_slice();
         let new = new_resolved.as_slice();
         if self.path_exists(new) { return -17; }
-        if self.ram_files.contains_key(old) {
-            let data = self.ram_files.remove(old).unwrap();
-            self.ram_files.insert(new.to_vec(), data);
-            self.rekey_open_paths(old, new);
-        } else if self.ram_dirs.contains(old) {
-            let mut old_prefix = old.to_vec(); old_prefix.push(b'/');
-            let mut new_prefix = new.to_vec(); new_prefix.push(b'/');
-            let dirs: Vec<Vec<u8>> = self.ram_dirs.iter()
-                .filter(|p| *p == old || p.starts_with(&old_prefix)).cloned().collect();
-            let files: Vec<Vec<u8>> = self.ram_files.keys()
-                .filter(|p| p.starts_with(&old_prefix)).cloned().collect();
-            for src in dirs {
-                self.ram_dirs.remove(&src);
-                let dst = if src == old { new.to_vec() } else {
-                    let mut p = new_prefix.clone(); p.extend_from_slice(&src[old_prefix.len()..]); p
-                };
-                self.ram_dirs.insert(dst);
-            }
-            for src in files {
-                let data = self.ram_files.remove(&src).unwrap();
-                let mut dst = new_prefix.clone(); dst.extend_from_slice(&src[old_prefix.len()..]);
-                self.ram_files.insert(dst.clone(), data);
-                self.rekey_open_paths(&src, &dst);
-            }
-        } else {
-            let (old_idx, old_fs, old_sub) = self.resolve_head(old);
-            let (new_idx, _new_fs, new_sub) = self.resolve_head(new);
-            if old_idx != new_idx { return -18; } // EXDEV
-            if !old_fs.supports_directory_mutation() { return -38; }
-            if !self.may_write(old_idx, old_sub)
-                || !self.may_write_parent(old_idx, old_sub)
-                || !self.may_write_parent(new_idx, new_sub) { return -13; }
-            let rc = old_fs.rename(old_sub, new_sub);
-            if rc < 0 { return rc; }
-            self.rekey_open_paths(old, new);
-        }
+        let (old_idx, old_fs, old_sub) = self.resolve_head(old);
+        let (new_idx, _new_fs, new_sub) = self.resolve_head(new);
+        if old_idx != new_idx { return -18; } // EXDEV
+        if !old_fs.supports_directory_mutation() { return -38; }
+        if !self.may_write(old_idx, old_sub)
+            || !self.may_write_parent(old_idx, old_sub)
+            || !self.may_write_parent(new_idx, new_sub) { return -13; }
+        let rc = old_fs.rename(old_sub, new_sub);
+        if rc < 0 { return rc; }
+        self.rekey_open_paths(old, new);
         if let Some(v) = self.modes.remove(old) { self.modes.insert(new.to_vec(), v); }
         if let Some(v) = self.mtimes.remove(old) { self.mtimes.insert(new.to_vec(), v); }
         self.invalidate_dir_cache();
@@ -1247,10 +1155,10 @@ impl Vfs {
 
     fn rekey_open_paths(&mut self, old: &[u8], new: &[u8]) {
         for e in &mut self.file_table {
-            let len = e.ram_key_len as usize;
-            if e.refcount != 0 && &e.ram_key[..len] == old && new.len() <= PATH_KEY_MAX {
-                e.ram_key[..new.len()].copy_from_slice(new);
-                e.ram_key_len = new.len() as u8;
+            let len = e.path_len as usize;
+            if e.refcount != 0 && &e.path[..len] == old && new.len() <= PATH_KEY_MAX {
+                e.path[..new.len()].copy_from_slice(new);
+                e.path_len = new.len() as u8;
             }
         }
     }
@@ -1258,16 +1166,13 @@ impl Vfs {
     fn path_exists(&mut self, path: &[u8]) -> bool {
         let Some(resolved) = self.resolve_symlinks(path, true) else { return false };
         let path = resolved.as_slice();
-        if self.ram_files.contains_key(path) || self.ram_dirs.contains(path) { return true; }
         if let Some((parent, name)) = split_parent_bytes(path)
             && self.cached_child(parent, name).is_some()
         {
             return true;
         }
         if path.is_empty() { return true; }
-        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            fs.open(subpath).map(|v| { fs.clunk(v.handle); })
-        }).is_some()
+        self.resolve_object(path, ALIAS_DEPTH).is_some()
     }
 
     fn path_mode(&mut self, path: &[u8]) -> Option<(u32, bool)> {
@@ -1276,14 +1181,10 @@ impl Vfs {
         let path = resolved.as_slice();
         let is_dir = self.dir_exists(path);
         if let Some(&mode) = self.modes.get(path) { return Some((mode, is_dir)); }
-        if self.ram_files.contains_key(path) { return Some((0o644, false)); }
-        if self.ram_dirs.contains(path) { return Some((0o755, true)); }
-        let (_idx, fs, subpath) = self.resolve_head(path);
-        if let Some(m) = fs.meta(subpath) { return Some((m.mode, is_dir)); }
+        let object = self.resolve_object(path, ALIAS_DEPTH)?;
+        if let Some(m) = object.fs.meta(object.subpath()) { return Some((m.mode, is_dir)); }
         if is_dir { return Some((0o555, true)); }
-        self.resolve_members(path, ALIAS_DEPTH, &mut |_idx, fs, subpath| {
-            fs.open(subpath).map(|v| { let mode = v.mode as u32; fs.clunk(v.handle); (mode, false) })
-        })
+        Some((u32::from(object.stat.mode), false))
     }
 
     fn set_path_mode(&mut self, path: &[u8], mode: u32) -> i32 {
@@ -1302,7 +1203,7 @@ impl Vfs {
     fn handle_path(&self, handle: i32) -> Option<&[u8]> {
         let e = self.file_table.get(handle as usize)?;
         if e.refcount == 0 { return None; }
-        Some(&e.ram_key[..e.ram_key_len as usize])
+        Some(&e.path[..e.path_len as usize])
     }
 
     fn flush_handle(&mut self, handle: i32) -> i32 {
@@ -1331,12 +1232,7 @@ impl Vfs {
     fn delete(&mut self, path: &[u8]) -> i32 {
         let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
         let path = resolved.as_slice();
-        if self.ram_files.remove(path).is_some() {
-            self.invalidate_dir_cache();
-            return 0;
-        }
-        // Not a RAM-overlay file: ask the backing filesystem (Tremove). Backends
-        // that can't (or are read-only) return the default -1.
+        // Ask the backing filesystem (Tremove). Read-only backends reject it.
         let (midx, fs, subpath) = self.resolve_head(path);
         // Unlinking mutates the parent, so the parent must be ours — and the
         // victim too, so a link we may traverse can't delete something we may
@@ -1358,21 +1254,6 @@ impl Vfs {
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
-        if self.file_table[h].vnode.handle == RAM_SENTINEL {
-            let off = self.file_table[h].offset as usize;
-            let klen = self.file_table[h].ram_key_len as usize;
-            let key = self.file_table[h].ram_key[..klen].to_vec();
-            if let Some(data) = self.ram_files.get(&key) {
-                if off >= data.len() { return 0; }
-                let avail = data.len() - off;
-                let n = buf.len().min(avail);
-                buf[..n].copy_from_slice(&data[off..off + n]);
-                self.file_table[h].offset += n as u32;
-                return n as i32;
-            }
-            return 0;
-        }
-
         let (mount_idx, fs_handle, offset, size) = {
             let e = &self.file_table[h];
             (e.mount_idx, e.vnode.handle, e.offset, e.vnode.size)
@@ -1386,23 +1267,6 @@ impl Vfs {
         if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
-
-        if self.file_table[h].vnode.handle == RAM_SENTINEL {
-            let off = self.file_table[h].offset as usize;
-            let klen = self.file_table[h].ram_key_len as usize;
-            let key = self.file_table[h].ram_key[..klen].to_vec();
-            if let Some(file_data) = self.ram_files.get_mut(&key) {
-                let end = off + data.len();
-                if end > file_data.len() { file_data.resize(end, 0); }
-                file_data[off..end].copy_from_slice(data);
-                let new_size = file_data.len() as u32;
-                self.file_table[h].offset = end as u32;
-                self.file_table[h].vnode.size = new_size;
-                self.invalidate_dir_cache();
-                return data.len() as i32;
-            }
-            return -9;
-        }
 
         if !self.file_table[h].writable {
             return -30; // EROFS — this handle was opened on something not ours
@@ -1426,13 +1290,7 @@ impl Vfs {
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
-        let size = if self.file_table[h].vnode.handle == RAM_SENTINEL {
-            let klen = self.file_table[h].ram_key_len as usize;
-            let key = self.file_table[h].ram_key[..klen].to_vec();
-            self.ram_files.get(&key).map(|d| d.len() as u32).unwrap_or(0)
-        } else {
-            self.file_table[h].vnode.size
-        };
+        let size = self.file_table[h].vnode.size;
 
         let cur = self.file_table[h].offset;
         let new_offset = match whence {
@@ -1450,10 +1308,6 @@ impl Vfs {
         if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return 0; }
-        if e.vnode.handle == RAM_SENTINEL {
-            let key = &e.ram_key[..e.ram_key_len as usize];
-            return self.ram_files.get(key).map(|d| d.len() as u32).unwrap_or(0);
-        }
         e.vnode.size
     }
 
@@ -1461,8 +1315,7 @@ impl Vfs {
         if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return false; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return false; }
-        // RAM-overlay files are always ours (see `write_by_handle`).
-        e.vnode.handle == RAM_SENTINEL || e.writable
+        e.writable
     }
 
     fn configure_open(&mut self, handle: i32, access: OpenAccess, share: SharePolicy) -> i32 {
@@ -1580,9 +1433,15 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
 }
 
 /// Claim a case-folded name for union merging. The first (highest) layer wins.
-fn claim_visible_name(names: &mut BTreeMap<Vec<u8>, ()>, name: &[u8]) -> bool {
+fn claim_visible_name(
+    names: &mut BTreeMap<Vec<u8>, usize>,
+    name: &[u8],
+    index: usize,
+) -> bool {
     let folded = name.iter().map(u8::to_ascii_lowercase).collect();
-    names.insert(folded, ()).is_none()
+    if names.contains_key(&folded) { return false; }
+    names.insert(folded, index);
+    true
 }
 
 fn clone_dir_entry(e: &DirEntry) -> DirEntry {
@@ -1628,12 +1487,6 @@ fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
     let dir = dir.strip_suffix(b"/").unwrap_or(dir);
     let (parent, name) = split_parent_bytes(prefix)?;
-    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
-}
-
-fn entry_in_ram_dir<'a>(entry_name: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
-    let dir = dir.strip_suffix(b"/").unwrap_or(dir);
-    let (parent, name) = split_parent_bytes(entry_name)?;
     (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
 }
 
@@ -1726,7 +1579,7 @@ pub fn close(fd: i32, fds: &mut [FdKind; MAX_FDS]) -> i32 {
     }
 }
 
-/// Create (or truncate) a writable RAM-backed file by absolute VFS path.
+/// Create or truncate a file by absolute VFS path.
 pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
     let handle = create_to_handle(path);
     if handle < 0 { return handle; }
@@ -1738,14 +1591,12 @@ pub fn create(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
     fd as i32
 }
 
-/// Create (or truncate) a file. If the path's mount FS supports `create`,
-/// it owns the file; otherwise we fall back to the RAM overlay.
+/// Create or truncate a file on the filesystem mounted at its path.
 pub fn create_to_handle(path: &[u8]) -> i32 {
     VFS.lock().create_to_handle(path)
 }
 
-/// Create a directory, using a real writable backend when available and the
-/// RAM overlay otherwise.
+/// Create a directory on the filesystem mounted at its path.
 pub fn mkdir(path: &[u8]) -> i32 {
     VFS.lock().mkdir(path)
 }
@@ -1782,7 +1633,7 @@ pub fn write<A: crate::Arch>(machine: &mut A, fd: i32, data: &[u8], fds: &[FdKin
     }
 }
 
-/// Delete a RAM-backed file by absolute VFS path.
+/// Delete a file by absolute VFS path.
 pub fn delete(path: &[u8]) -> i32 {
     VFS.lock().delete(path)
 }
@@ -2039,8 +1890,6 @@ impl BackingFile {
 /// Open `path` directly on its backing mount for media use. The resolution
 /// holds the VFS lock; the returned handle never touches it again.
 ///
-/// Only real files on a Server mount resolve (a RAM-overlay scratch file
-/// does not) — media images are real catalogue files by construction.
 pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
     let mut vfs = VFS.lock();
     let resolved = vfs.resolve_symlinks(path, true)?;
@@ -2087,8 +1936,7 @@ pub fn file_mode_by_handle(handle: i32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirEntry, Filesystem, Vfs, Vnode, WriteAccess, entry_in_ram_dir,
-        mount_child_in_dir,
+        DirEntry, Filesystem, Vfs, Vnode, WriteAccess, mount_child_in_dir,
     };
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -2129,7 +1977,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_supported_create_does_not_create_ram_overlay_file() {
+    fn failed_supported_create_is_not_reported_as_unsupported() {
         CREATE_CALLED.store(false, Ordering::Relaxed);
         let mut vfs = Vfs::new();
         vfs.mount(b"", &FAILING_CREATE_FS);
@@ -2137,11 +1985,11 @@ mod tests {
 
         assert_eq!(vfs.create_to_handle(b"failed.txt"), -13);
         assert!(CREATE_CALLED.load(Ordering::Relaxed));
-        assert!(!vfs.ram_files.contains_key(b"failed.txt".as_slice()));
+        assert!(vfs.resolve_object(b"failed.txt", 8).is_none());
     }
 
     #[test]
-    fn nested_mounts_and_ram_entries_accept_normalized_directory_paths() {
+    fn nested_mounts_accept_normalized_directory_paths() {
         assert_eq!(
             mount_child_in_dir(b"home/retroos/proc/", b"home/retroos"),
             Some(&b"proc"[..]),
@@ -2149,10 +1997,6 @@ mod tests {
         assert_eq!(
             mount_child_in_dir(b"home/retroos/proc/", b"home/retroos/"),
             Some(&b"proc"[..]),
-        );
-        assert_eq!(
-            entry_in_ram_dir(b"home/retroos/scratch", b"home/retroos"),
-            Some(&b"scratch"[..]),
         );
     }
 
@@ -2237,6 +2081,33 @@ mod tests {
     }
 
     #[test]
+    fn union_members_follow_reverse_insertion_order_without_sorting() {
+        let mut vfs = Vfs::new();
+        vfs.add_binding(
+            b"stack/",
+            super::BindTarget::Server(&FAILING_CREATE_FS),
+            super::MountMode::Replace,
+        );
+        vfs.add_binding(
+            b"stack/",
+            super::BindTarget::Server(&NODE_FS),
+            super::MountMode::Union,
+        );
+
+        let mut visited = Vec::new();
+        assert_eq!(
+            vfs.visit_layers(b"stack/file", 8, &mut |idx, _, _| {
+                visited.push(idx);
+                false
+            }),
+            false,
+        );
+        assert_eq!(visited, [1, 0]);
+        assert_eq!(vfs.resolve_head(b"stack/file").0, 1);
+        assert_eq!(vfs.resolve_object(b"stack", 8).unwrap().mount_idx, 1);
+    }
+
+    #[test]
     fn opens_nodes_from_one_vfs_owned_directory_listing() {
         READDIR_CALLS.store(0, Ordering::Relaxed);
         PATH_OPEN_CALLS.store(0, Ordering::Relaxed);
@@ -2249,6 +2120,7 @@ mod tests {
         assert_eq!(READDIR_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(NODE_OPEN_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(vfs.cached_child(b"", b"ONE").unwrap().node, 11);
     }
 
     #[test]
