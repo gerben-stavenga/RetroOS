@@ -867,8 +867,7 @@ impl Vfs {
             self.populate_dir_cache(parent);
         }
         let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
-        let folded: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
-        Some(clone_dir_entry(cached.entries.get(*cached.names.get(folded.as_slice())?)?))
+        Some(clone_dir_entry(cached.entries.get(*cached.names.get(name)?)?))
     }
 
     fn readlink_entry(&self, path: &[u8], entry: &DirEntry, out: &mut [u8]) -> Option<usize> {
@@ -1432,15 +1431,14 @@ fn vfs_handle(fds: &[FdKind; MAX_FDS], fd: i32) -> Result<i32, i32> {
     }
 }
 
-/// Claim a case-folded name for union merging. The first (highest) layer wins.
+/// Claim an exact name for union merging. The first (highest) layer wins.
 fn claim_visible_name(
     names: &mut BTreeMap<Vec<u8>, usize>,
     name: &[u8],
     index: usize,
 ) -> bool {
-    let folded = name.iter().map(u8::to_ascii_lowercase).collect();
-    if names.contains_key(&folded) { return false; }
-    names.insert(folded, index);
+    if names.contains_key(name) { return false; }
+    names.insert(name.to_vec(), index);
     true
 }
 
@@ -2120,7 +2118,8 @@ mod tests {
         assert_eq!(READDIR_CALLS.load(Ordering::Relaxed), 1);
         assert_eq!(PATH_OPEN_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(NODE_OPEN_CALLS.load(Ordering::Relaxed), 2);
-        assert_eq!(vfs.cached_child(b"", b"ONE").unwrap().node, 11);
+        assert_eq!(vfs.cached_child(b"", b"one").unwrap().node, 11);
+        assert!(vfs.cached_child(b"", b"ONE").is_none());
     }
 
     #[test]
