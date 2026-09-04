@@ -25,7 +25,6 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     deps = ["//lib"],
@@ -41,7 +40,6 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     # dosrt = the runtime (crt0/_start, console, DPMI, libc); //lib for
@@ -83,7 +81,6 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         # PIE — RLOADER applies R_386_RELATIVE fixups at load.
         "-Crelocation-model=pie",
     ],

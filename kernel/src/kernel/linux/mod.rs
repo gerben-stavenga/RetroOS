@@ -764,6 +764,7 @@ fn fork_set_retval(regs: &mut Regs, ret: i32) {
 /// hold both the parent and the new child slot at once. `vcpu` is the live
 /// (parent) frame. Returns the child tid to switch to (child runs first), or
 /// None on failure (stay on the parent).
+#[inline(never)]
 pub(crate) fn handle_fork<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
@@ -1181,6 +1182,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
 /// `init_thread`/`exit_thread` on `tid` are clean. Returns `None` (stay on the
 /// re-imaged thread) or the next tid if the load fails and the thread exits.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub(crate) fn handle_exec<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1518,6 +1520,7 @@ fn sys_wait4<A: crate::Arch>(_machine: &mut A, _kt: &mut thread::KernelThread<A>
 ///   - children but none exited (EAGAIN): record the deferred status pointer,
 ///     block the parent, reschedule (woken when a child exits; `on_resume`
 ///     finalizes the status write + return value, as before).
+#[inline(never)]
 pub(crate) fn handle_wait<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],

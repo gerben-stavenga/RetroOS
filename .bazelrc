@@ -1,6 +1,10 @@
 build --platforms=//toolchain:i686_retro_none
 build --@rules_rust//rust/toolchain/channel=nightly
 build -c opt
+build --@rules_rust//rust/settings:extra_rustc_flag=-Copt-level=z
+build --@rules_rust//rust/settings:extra_rustc_flag=-Cembed-bitcode=yes
+build --@rules_rust//rust/settings:extra_rustc_flag=-Clto=fat
+build --@rules_rust//rust/settings:extra_rustc_flag=-Ccodegen-units=1
 build --workspace_status_command=tools/workspace_status.sh
 build --action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 build --host_action_env=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

@@ -124,8 +124,10 @@ pub struct VVoodoo {
 
 impl VVoodoo {
     pub fn new() -> Self {
+        let mut card = Box::<Voodoo>::new_uninit();
+        Voodoo::init(&mut card, Kind::Voodoo1, FB_BYTES, TEX_BYTES);
         Self {
-            card: Box::new(Voodoo::new(Kind::Voodoo1, FB_BYTES, TEX_BYTES)),
+            card: unsafe { card.assume_init() },
             fb: vec![0u8; FB_BYTES],
             tex: vec![0u8; TEX_BYTES],
             cfg: Config { command: 0, bar0: BAR_PHYS, init_enable: 0 },

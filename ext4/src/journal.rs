@@ -9,7 +9,7 @@ use crate::ext4::{
     Blob as GraphBlob, Ext4 as Graph, SUPERBLOCK_MAGIC, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use crate::overlay::RamOverlay;
-use crate::{copy_bytes, try_insert, try_push, BlockEdit, Corrupt, Error, Storage, Unsupported};
+use crate::{BlockEdit, Corrupt, Error, Storage, Unsupported, copy_bytes, try_insert, try_push};
 use alloc::vec::Vec;
 
 const MAGIC: u32 = 0xc03b_3998;
@@ -429,7 +429,7 @@ impl GraphJournal {
         if blocks.is_empty() {
             return Ok(());
         }
-        if !self.overlay.blocks.is_empty() || self.block_size != 4096 {
+        if !self.overlay.blocks.is_empty() {
             return Err(Unsupported::JournalWriteProfile.into());
         }
         let mut dirty = RamOverlay::default();
@@ -471,17 +471,20 @@ impl GraphJournal {
         }
 
         let superblock_target = SUPERBLOCK_OFFSET / u64::from(self.block_size);
-        let final_superblock_index = dirty
-            .index(superblock_target)
-            .map_err(|_| Unsupported::JournalWriteProfile)?;
+        let final_superblock_index = dirty.index(superblock_target).ok();
         let mut activation = self.buffer()?;
         self.read_recovered(
             storage,
             superblock_target * u64::from(self.block_size),
             &mut activation,
         )?;
+        let final_superblock = if let Some(index) = final_superblock_index {
+            copy_bytes(&dirty.blocks[index].bytes)?
+        } else {
+            copy_bytes(&activation)?
+        };
         enable_recovery(&mut activation)?;
-        let mut checkpoint = copy_bytes(&dirty.blocks[final_superblock_index].bytes)?;
+        let mut checkpoint = copy_bytes(&final_superblock)?;
         enable_recovery(&mut checkpoint)?;
 
         let mut descriptor = self.buffer()?;
@@ -589,11 +592,7 @@ impl GraphJournal {
                 )?;
             }
             storage.flush().map_err(Error::Storage)?;
-            self.write_block(
-                storage,
-                superblock_target,
-                &committed.blocks[final_superblock_index].bytes,
-            )?;
+            self.write_block(storage, superblock_target, &final_superblock)?;
             self.write_block(storage, journal_super, &clean_jsb)?;
             storage.flush().map_err(Error::Storage)
         })();

@@ -194,6 +194,10 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
     true
 }
 
+// Architecture calls include operations with page-sized scratch storage.
+// They are a distinct phase of trap handling: do not let fat LTO reserve that
+// scratch in the common ISR frame used by every hardware interrupt.
+#[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
         arch_call::EXECUTE => {
@@ -208,12 +212,18 @@ fn arch_dispatch(regs: &mut Regs) {
             unsafe { (*fx).restore(); }
             unsafe { *fx = tmp; }
         }
-        // FORK: EDX=child_root out. COW fork, fill child, free temp page.
+        // FORK: EDX=child_root out. COW fork and fill the caller's root.
         arch_call::FORK => {
             let child_root = regs.rdx as usize as *mut paging2::RootPageTable;
-            let mut cr = paging2::RootPageTable::empty();
-            paging2::fork_current(&mut cr);
-            unsafe { *child_root = cr; }
+            // Some callers provide uninitialized output storage.  fork_current
+            // replaces entries (and releases any displaced mapping), so make
+            // the output an empty root before exposing it as a reference.  Do
+            // this in place: constructing a RootPageTable value here costs a
+            // 3 KiB interrupt-stack temporary after fat LTO.
+            unsafe {
+                child_root.write_bytes(0, 1);
+                paging2::fork_current(&mut *child_root);
+            }
         }
         arch_call::CLEAN => paging2::free_user_pages(),
         arch_call::SET_PAGE_FLAGS => {

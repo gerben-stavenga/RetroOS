@@ -24,7 +24,10 @@ pub(crate) struct RequestWriter {
 
 impl RequestWriter {
     pub(crate) fn new() -> Self {
-        Self { data: [0; MAX_FRAME_PAYLOAD], len: 0 }
+        Self {
+            data: [0; MAX_FRAME_PAYLOAD],
+            len: 0,
+        }
     }
 
     pub(crate) fn push_u16(&mut self, value: u16) -> bool {
@@ -36,17 +39,19 @@ impl RequestWriter {
     }
 
     pub(crate) fn push_bytes(&mut self, bytes: &[u8]) -> bool {
-        let Some(end) = self.len.checked_add(bytes.len()) else { return false; };
-        if end > self.data.len() { return false; }
+        let Some(end) = self.len.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > self.data.len() {
+            return false;
+        }
         self.data[self.len..end].copy_from_slice(bytes);
         self.len = end;
         true
     }
 
     pub(crate) fn push_path(&mut self, path: &[u8]) -> bool {
-        path.len() <= u16::MAX as usize
-            && self.push_u16(path.len() as u16)
-            && self.push_bytes(path)
+        path.len() <= u16::MAX as usize && self.push_u16(path.len() as u16) && self.push_bytes(path)
     }
 
     pub(crate) fn as_slice(&self) -> &[u8] {
@@ -214,7 +219,9 @@ where
 }
 
 fn next_session() -> u32 {
-    HOSTFS_SESSION.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    HOSTFS_SESSION
+        .fetch_add(1, Ordering::Relaxed)
+        .wrapping_add(1)
 }
 
 pub(crate) fn peer_hello_token(response: &[u8; MAX_BODY]) -> [u8; 4] {
@@ -261,7 +268,9 @@ where
 }
 
 pub(crate) fn request(cmd: u8, payload: &[u8], response: &mut [u8; MAX_BODY]) -> Option<usize> {
-    if !send_frame(cmd, payload) { return None; }
+    if !send_frame(cmd, payload) {
+        return None;
+    }
     receive_expected(0x80 | cmd, response)
 }
 
@@ -281,7 +290,7 @@ pub(crate) const CMD_MKDIR: u8 = 0x08;
 #[cfg(test)]
 mod tests {
     use super::{
-        establish_session, peer_hello_token, receive_expected_with_io, ResponseReader, MAX_BODY,
+        MAX_BODY, ResponseReader, establish_session, peer_hello_token, receive_expected_with_io,
     };
     use crate::kernel::fs::hostfs::frame::{recv_frame, send_frame};
     use alloc::vec::Vec;

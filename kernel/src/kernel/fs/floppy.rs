@@ -268,8 +268,12 @@ fn split_handle(handle: u64) -> (u32, u32) {
 /// DOS datetime (as rust-fatfs reports it) → seconds since the Unix epoch.
 fn unix_from_datetime(dt: &fatfs::DateTime) -> u32 {
     unix_from_ymd_hms(
-        dt.date.year, dt.date.month, dt.date.day,
-        dt.time.hour, dt.time.min, dt.time.sec,
+        dt.date.year,
+        dt.date.month,
+        dt.date.day,
+        dt.time.hour,
+        dt.time.min,
+        dt.time.sec,
     )
 }
 
@@ -325,10 +329,18 @@ impl Filesystem for FloppySlot {
         if generation != state.generation {
             return -5;
         }
-        let Some(path) = state.opens.get(&inner) else { return -9 };
-        let Some(media) = state.media.as_ref() else { return -5 };
-        let Some(path) = path_str(path) else { return -5 };
-        let Ok(mut file) = media.root_dir().open_file(path) else { return -5 };
+        let Some(path) = state.opens.get(&inner) else {
+            return -9;
+        };
+        let Some(media) = state.media.as_ref() else {
+            return -5;
+        };
+        let Some(path) = path_str(path) else {
+            return -5;
+        };
+        let Ok(mut file) = media.root_dir().open_file(path) else {
+            return -5;
+        };
         if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
             return -5;
         }
@@ -347,7 +359,11 @@ impl Filesystem for FloppySlot {
         let state = self.state.lock();
         let media = state.media.as_ref()?;
         let root = media.root_dir();
-        let listing = if dir.is_empty() { root } else { root.open_dir(path_str(dir)?).ok()? };
+        let listing = if dir.is_empty() {
+            root
+        } else {
+            root.open_dir(path_str(dir)?).ok()?
+        };
         let mut visible = 0_u64;
         for entry in listing.iter() {
             let Ok(entry) = entry else { break };
@@ -383,7 +399,9 @@ impl Filesystem for FloppySlot {
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else { return false };
+        let Some(media) = state.media.as_ref() else {
+            return false;
+        };
         if path.is_empty() {
             return true;
         }
@@ -404,10 +422,18 @@ impl Filesystem for FloppySlot {
         if generation != state.generation {
             return -5;
         }
-        let Some(path) = state.opens.get(&inner) else { return -9 };
-        let Some(media) = state.media.as_ref() else { return -5 };
-        let Some(path) = path_str(path) else { return -5 };
-        let Ok(mut file) = media.root_dir().open_file(path) else { return -5 };
+        let Some(path) = state.opens.get(&inner) else {
+            return -9;
+        };
+        let Some(media) = state.media.as_ref() else {
+            return -5;
+        };
+        let Some(path) = path_str(path) else {
+            return -5;
+        };
+        let Ok(mut file) = media.root_dir().open_file(path) else {
+            return -5;
+        };
         if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
             return -5;
         }
@@ -448,16 +474,32 @@ impl Filesystem for FloppySlot {
 
     fn remove(&self, path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else { return -5 };
-        let Some(path) = path_str(path) else { return -5 };
-        if media.root_dir().remove(path).is_ok() { 0 } else { -2 }
+        let Some(media) = state.media.as_ref() else {
+            return -5;
+        };
+        let Some(path) = path_str(path) else {
+            return -5;
+        };
+        if media.root_dir().remove(path).is_ok() {
+            0
+        } else {
+            -2
+        }
     }
 
     fn mkdir(&self, path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else { return -5 };
-        let Some(path) = path_str(path) else { return -5 };
-        if media.root_dir().create_dir(path).is_ok() { 0 } else { -13 }
+        let Some(media) = state.media.as_ref() else {
+            return -5;
+        };
+        let Some(path) = path_str(path) else {
+            return -5;
+        };
+        if media.root_dir().create_dir(path).is_ok() {
+            0
+        } else {
+            -13
+        }
     }
 
     fn supports_mkdir(&self) -> bool {
@@ -471,10 +513,18 @@ impl Filesystem for FloppySlot {
 
     fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else { return -5 };
-        let (Some(src), Some(dst)) = (path_str(path), path_str(new_path)) else { return -5 };
+        let Some(media) = state.media.as_ref() else {
+            return -5;
+        };
+        let (Some(src), Some(dst)) = (path_str(path), path_str(new_path)) else {
+            return -5;
+        };
         let root = media.root_dir();
-        if root.rename(src, &root, dst).is_ok() { 0 } else { -2 }
+        if root.rename(src, &root, dst).is_ok() {
+            0
+        } else {
+            -2
+        }
     }
 
     fn supports_directory_mutation(&self) -> bool {
@@ -527,7 +577,10 @@ pub fn refresh_catalog() {
         let mut path = dir.clone();
         path.push(b'/');
         path.extend_from_slice(name);
-        found.push(CatalogEntry { name: name.to_vec(), path });
+        found.push(CatalogEntry {
+            name: name.to_vec(),
+            path,
+        });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     *CATALOG.lock() = found;
@@ -539,7 +592,9 @@ pub fn catalog_count() -> usize {
 
 pub fn catalog_name(index: usize, out: &mut [u8]) -> usize {
     let catalog = CATALOG.lock();
-    let Some(entry) = catalog.get(index) else { return 0 };
+    let Some(entry) = catalog.get(index) else {
+        return 0;
+    };
     let n = entry.name.len().min(out.len());
     out[..n].copy_from_slice(&entry.name[..n]);
     n
@@ -560,7 +615,9 @@ pub fn label(drive: usize, out: &mut [u8]) -> usize {
 
 pub fn selected(drive: usize, index: usize) -> bool {
     let catalog = CATALOG.lock();
-    let Some(entry) = catalog.get(index) else { return false };
+    let Some(entry) = catalog.get(index) else {
+        return false;
+    };
     slot(drive).state.lock().label == entry.name
 }
 
@@ -585,7 +642,11 @@ pub fn eject(drive: usize) {
 /// Insert one catalogue entry into a drive's slot: open the image FILE as
 /// the medium (reads and writes go through to it; nothing is copied).
 pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
-    let entry = CATALOG.lock().get(index).cloned().ok_or(InsertError::OutOfBounds)?;
+    let entry = CATALOG
+        .lock()
+        .get(index)
+        .cloned()
+        .ok_or(InsertError::OutOfBounds)?;
     let backing = vfs::open_backing(&entry.path).ok_or(InsertError::Io)?;
     {
         // Backing I/O (BPB read, fatfs mount, old media's flush-on-drop)
@@ -593,8 +654,15 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
         // mounted_media_changed re-enters the VFS.
         let _fs = vfs::serialize_fs();
         let mut boot = [0u8; 512];
-        let geom = if backing.read_at(0, &mut boot) == 512 { parse_chs(&boot) } else { None };
-        let cursor = ImageCursor { file: backing, pos: 0 };
+        let geom = if backing.read_at(0, &mut boot) == 512 {
+            parse_chs(&boot)
+        } else {
+            None
+        };
+        let cursor = ImageCursor {
+            file: backing,
+            pos: 0,
+        };
         let media = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
             Ok(media) => media,
             Err(_) => {

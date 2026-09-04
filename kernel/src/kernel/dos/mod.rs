@@ -1070,6 +1070,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 /// INT-31 synth ops (reap / waitpid probe), run after the
 /// caller's `dos`/`kt` borrow releases. Writes the AX/BX/CF result into the
 /// live frame and stays on the caller (`None`).
+#[inline(never)]
 pub(crate) fn handle_synth_child<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],

@@ -35,3 +35,17 @@ fn important_disk_offsets_match_ext4() {
     assert_eq!(offset_of!(Inode128, block), 0x28);
     assert_eq!(offset_of!(Inode128, os_dependent_2), 0x74);
 }
+
+#[test]
+fn directory_record_lengths_cover_the_64k_encoding() {
+    use crate::ext4::{directory_record_length, directory_record_length_to_disk};
+
+    for length in [12, 4096, 65532, 65536] {
+        let disk = directory_record_length_to_disk(length, 65536).unwrap();
+        assert_eq!(directory_record_length(disk, 65536), length);
+    }
+    assert_eq!(
+        directory_record_length_to_disk(65536, 65536).unwrap().get(),
+        u16::MAX
+    );
+}

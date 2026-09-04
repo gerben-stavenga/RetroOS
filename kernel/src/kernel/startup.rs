@@ -13,6 +13,50 @@ use crate::kernel::{
 /// Each phase is a named function below; this stays short enough to read as
 /// the boot story. Called from enter_ring1 — we are already at ring 1.
 pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
+    let mut state = core::mem::MaybeUninit::<StartupState<A>>::uninit();
+    prepare_startup(machine, boot, &mut state);
+    let StartupState {
+        ref master_env,
+        ref mut bios_workspace,
+        ref mut dos_template,
+        ref mut threads,
+        screen,
+        sb_card,
+        sink,
+    } = unsafe { state.assume_init() };
+
+    run(
+        machine,
+        boot,
+        master_env,
+        bios_workspace,
+        dos_template,
+        threads,
+        screen,
+        sb_card,
+        sink,
+    )
+}
+
+struct StartupState<A: crate::Arch> {
+    master_env: alloc::vec::Vec<u8>,
+    bios_workspace: crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: crate::kernel::dos::DosTemplate<A>,
+    threads: alloc::vec::Vec<thread::Thread<A>>,
+    screen: crate::kernel::console::Console,
+    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+    sink: Option<crate::kernel::sound::Sink>,
+}
+
+/// Perform one-shot discovery and construct the runtime objects directly in
+/// the caller's one persistent state slot.  This call boundary lets probe and
+/// formatting temporaries leave the stack before the non-returning flow.
+#[inline(never)]
+fn prepare_startup<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+    out: &mut core::mem::MaybeUninit<StartupState<A>>,
+) {
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
@@ -108,7 +152,7 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
-    let mut threads = crate::kernel::thread::init_threading();
+    let threads = crate::kernel::thread::init_threading();
     crate::screenln!(screen => machine, &mut bios_workspace; "Threading initialized");
 
     // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
@@ -304,19 +348,17 @@ pub fn startup<A: crate::Arch>(machine: &mut A, boot: &crate::BootConfig) -> ! {
     init_console_pipe();
 
     // DOS worlds are cloned from their substitute-BIOS template.
-    let mut dos_template = crate::kernel::dos::DosTemplate::new(machine);
+    let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
-    run(
-        machine,
-        boot,
-        &master_env,
-        &mut bios_workspace,
-        &mut dos_template,
-        &mut threads,
+    out.write(StartupState {
+        master_env,
+        bios_workspace,
+        dos_template,
+        threads,
         screen,
         sb_card,
         sink,
-    )
+    });
 }
 
 /// The host filesystem on the selected serial transport. Mounted at /host
@@ -761,6 +803,38 @@ fn run_program<A: crate::Arch>(
     crate::kernel::display::Display,
     Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
+    let (tid, display) = prepare_program(
+        machine,
+        bios_workspace,
+        dos_template,
+        threads,
+        path,
+        cmdline_tail,
+        cwd,
+        env,
+        debug_watch,
+        display,
+    );
+    event_loop(machine, bios_workspace, threads, tid, sb, sink, display)
+}
+
+/// Load and install a program, returning only the live execution identity and
+/// display capability.  File buffers, argv construction, and loader scratch
+/// are gone before the event loop is entered.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn prepare_program<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos_template: &mut crate::kernel::dos::DosTemplate<A>,
+    threads: &mut [thread::Thread<A>],
+    path: &[u8],
+    cmdline_tail: &[u8],
+    cwd: &[u8],
+    env: &[u8],
+    debug_watch: Option<(u32, u32)>,
+    display: crate::kernel::display::Display,
+) -> (usize, Option<crate::kernel::display::Display>) {
     use crate::kernel::{dos, exec};
 
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
@@ -851,7 +925,7 @@ fn run_program<A: crate::Arch>(
             crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
-    event_loop(machine, bios_workspace, threads, tid, sb, sink, display)
+    (tid, display)
 }
 
 /// Launch an ELF as a fresh Linux process thread and return its tid: stdin is
@@ -1371,6 +1445,7 @@ pub fn event_loop<A: crate::Arch>(
 /// Page faults are decided here — an unhandled user fault is a SEGV exit,
 /// and `signal_thread` wants the whole `Thread` for its diagnostics;
 /// everything else is the personality's call.
+#[inline(never)]
 fn dispatch<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1642,6 +1717,7 @@ fn apply_current_presentation<A: crate::Arch>(
 /// Fork the current process and exec a binary (DOS .COM/.EXE or ELF) in the child.
 /// Blocks parent, returns child tid on success, None on error (caller stays on parent).
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub(crate) fn handle_fork_exec<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -2603,6 +2679,7 @@ impl EventStats {
         }
     }
 
+    #[inline(never)]
     fn post_run<A: crate::Arch>(
         &mut self,
         machine: &mut A,

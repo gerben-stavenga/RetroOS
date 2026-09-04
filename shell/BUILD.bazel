@@ -12,7 +12,6 @@ rust_binary(
     # SSE2/cmov so it runs on --arch 386 (like busybox). -Cpanic=abort: no
     # unwinder/eh_personality in no_std.
     rustc_flags = [
-        "-Copt-level=s",
         "-Cstrip=symbols",
         "-Clinker-flavor=ld.lld",
         "-Clinker=rust-lld",

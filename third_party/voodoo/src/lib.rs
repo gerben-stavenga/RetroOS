@@ -187,6 +187,42 @@ pub struct Voodoo {
 }
 
 impl Voodoo {
+    /// Initialize a card directly in its final storage.
+    ///
+    /// `Voodoo` contains several large register and lookup tables. Building a
+    /// complete value and then moving it into a `Box` needlessly materializes
+    /// roughly 20 KiB on a kernel stack, so heap-owning hosts use this entry
+    /// point to construct the same value in place.
+    pub fn init(dst: &mut core::mem::MaybeUninit<Self>, kind: Kind, fb_bytes: usize, tex_bytes: usize) {
+        debug_assert!(fb_bytes.is_power_of_two());
+        let p = dst.as_mut_ptr();
+        unsafe {
+            core::ptr::addr_of_mut!((*p).kind).write(kind);
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).reg), 0, 1);
+            core::ptr::addr_of_mut!((*p).fbi).write(Fbi::new(fb_bytes));
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).dac), 0, 1);
+            core::ptr::addr_of_mut!((*p).dac_read_result).write(0);
+            core::ptr::addr_of_mut!((*p).init_enable).write(0);
+            core::ptr::addr_of_mut!((*p).chipmask).write(0x03);
+            core::ptr::addr_of_mut!((*p).alt_regmap).write(false);
+            core::ptr::addr_of_mut!((*p).output_on).write(false);
+            core::ptr::addr_of_mut!((*p).send_config).write(false);
+            core::ptr::addr_of_mut!((*p).tmu_config).write(0x11);
+            core::ptr::addr_of_mut!((*p).vblank_swap_pending).write(false);
+            core::ptr::addr_of_mut!((*p).vblank_swap).write(0);
+            core::ptr::addr_of_mut!((*p).vblank_count).write(0);
+            core::ptr::addr_of_mut!((*p).swaps_pending).write(0);
+            core::ptr::addr_of_mut!((*p).setup).write(Setup::default());
+            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).tmureg), 0, 1);
+            core::ptr::addr_of_mut!((*p).tmuiter[0]).write(TexIter::default());
+            core::ptr::addr_of_mut!((*p).tmuiter[1]).write(TexIter::default());
+            core::ptr::addr_of_mut!((*p).tex[0]).write(Texture::new(tex_bytes));
+            core::ptr::addr_of_mut!((*p).tex[1]).write(Texture::new(tex_bytes));
+            core::ptr::addr_of_mut!((*p).fog).write(FogTable::default());
+            core::ptr::addr_of_mut!((*p).clut).write(Clut::new());
+        }
+    }
+
     /// `fb_bytes` and `tex_bytes` are the sizes of the video and per-TMU
     /// texture memory the host will hand to every call — 2 MB and 2 MB on a
     /// real SST-1, powers of two either way. Only the sizes live here; the

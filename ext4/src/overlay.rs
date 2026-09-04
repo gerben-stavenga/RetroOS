@@ -1,6 +1,6 @@
 //! Ordered RAM-resident filesystem-block layers.
 
-use crate::{apply_block_edits, BlockEdit, FsError, Storage, StorageError};
+use crate::{BlockEdit, FsError, Storage, StorageError, apply_block_edits};
 use alloc::vec::Vec;
 
 /// A volatile byte-addressed view which stores each changed filesystem block

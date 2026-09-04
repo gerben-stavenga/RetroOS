@@ -10,7 +10,6 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     deps = ["//klog"],
@@ -42,7 +41,6 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     deps = [":lib"],
@@ -50,8 +48,8 @@ rust_library(
 
 # Emulated sound cards as passive, host-agnostic state machines, plus the
 # integer voice engine they share (GUS now; GM/SF2, AWE32, MT-32 later).
-# Its own target, not part of :lib: the per-frame mix loop runs at up to
-# 44.1 kHz × 32 voices, so opt-level 2, not z (the nuked_opl3 reasoning).
+# Its own target, not part of :lib. The per-frame mix loop runs at up to
+# 44.1 kHz × 32 voices but follows the system-wide opt-level z policy.
 rust_library(
     name = "sound",
     srcs = glob(["sound/src/**/*.rs"]),
@@ -60,7 +58,6 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=2",
         "-Crelocation-model=static",
     ],
     deps = ["@nuked_opl3//:nuked_opl3"],

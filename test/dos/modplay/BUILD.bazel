@@ -13,7 +13,6 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         # PIE: emit position-independent code; RLOADER applies the
         # R_386_RELATIVE fixups at load time (DOS4GW-style).
         "-Crelocation-model=pie",

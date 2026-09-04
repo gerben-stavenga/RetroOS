@@ -15,7 +15,6 @@ rust_static_library(
     edition = "2024",
     rustc_flags = [
         "-Cpanic=abort",
-        "-Copt-level=z",
         "-Crelocation-model=static",
     ],
     deps = ["//lib"],

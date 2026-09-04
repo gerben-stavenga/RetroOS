@@ -67,10 +67,11 @@ compose physical storage, recovered journal state, and prospective writes.
 No graph operation reaches the device before the upper composition succeeds.
 
 Dropping the overlay discards it. `finish` yields sorted complete blocks which
-the JBD2 transport publishes. The initial writer is intentionally narrow: it requires a clean
-internal journal using either checksum v3 or the ordinary unchecksummed
-`mke2fs` format, a 4 KiB filesystem, enough consecutive journal space for one
-descriptor/data/commit sequence, and no circular wrap. It writes and flushes
+the JBD2 transport publishes. The initial writer requires a clean internal
+journal using either checksum v3 or the ordinary unchecksummed `mke2fs` format,
+enough consecutive journal space for one descriptor/data/commit sequence, and
+no circular wrap. Filesystem and journal block sizes are selected at mount time
+across ext4's 1--64 KiB format range. It writes and flushes
 five ordered phases: journal preparation, recovery activation, commit,
 home-block checkpoint, and cleanup.
 
@@ -80,13 +81,16 @@ new superblock while retaining `needs_recovery`; the flag is cleared only after
 every home block is durable. A failed commit consumes the transaction and the
 filesystem must be remounted before further use.
 
-The graph writer supports extent-backed blobs, sparse growth, arbitrary
-subrange writes, shrinking and extent-tree collapse; node creation, streaming,
-linear growth, indexed-node normalization, attach/replace/detach, cycle-safe
-node moves, reference ownership, and final object reclamation. Allocation and
-release update typed inode/block bitmaps, group and superblock counts,
-`itable_unused`, used-node counts, and all affected checksums. Lazy inode and
-block groups are materialized from their structural reservations before use.
+The graph writer supports extent-backed and inode-inline blobs, sparse growth,
+arbitrary subrange writes, shrinking and extent-tree collapse; node creation,
+streaming, linear growth, indexed-node normalization, attach/replace/detach,
+cycle-safe node moves, reference ownership, and final object reclamation. Fast
+symlinks and `inline_data` files are the same byte-storage primitive; exceeding
+their capacity converts either to extents without changing its `Blob` handle.
+Allocation and release update typed inode/block bitmaps, group and superblock
+counts, `itable_unused`, used-node counts, and all affected checksums. Lazy
+inode and block groups are materialized from their structural reservations
+before use.
 
 The ext4 HTree is treated as an accelerator over the same graph. Reads
 validate and skip hash-root/internal blocks while streaming edge leaves.

@@ -294,10 +294,9 @@ lib/sound/src/
   mpu401.rs     // UART/intelligent mode        (new)
 ```
 
-One crate, not two. The `-Copt-level=2` justification in the current
-`lib/BUILD.bazel` (the 44.1 kHz × 32-voice mix loop, versus `//lib`'s `-z`)
-covers the whole thing, and the engine remains the bulk of the code.
-Register decode is not hot but does not object to being optimised.
+One crate, not two. It follows the system-wide `-Copt-level=z` policy, including
+the 44.1 kHz × 32-voice mix loop. A performance exception should only be
+introduced with a benchmark demonstrating that it is necessary.
 
 `sound::Format` moves down; `sound::Pace` does not (it is sink policy).
 

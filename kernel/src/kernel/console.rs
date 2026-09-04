@@ -23,6 +23,7 @@ pub const F12_PRESS: u8 = 0x58;
 
 /// Route already-drained input/guest events into the console owner. Kernel
 /// device IRQs were consumed earlier by `irq_dispatch`.
+#[inline(never)]
 pub fn dispatch<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,

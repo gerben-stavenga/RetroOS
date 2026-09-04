@@ -52,6 +52,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
     /// Lend the CPU to this personality. This is the only guest-entry point,
     /// and therefore the single place where the live IOPB is reconciled with
     /// the thread's current capabilities.
+    #[inline(never)]
     pub fn run(
         &mut self,
         machine: &mut A,

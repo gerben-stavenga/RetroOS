@@ -32,7 +32,9 @@ static mut HOST_BACKEND: Option<HostBackendHooks> = None;
 /// calls this before `startup`), safe by the same argument as the rest of the
 /// boot statics.
 pub fn install_host_backend(hooks: HostBackendHooks) {
-    unsafe { HOST_BACKEND = Some(hooks); }
+    unsafe {
+        HOST_BACKEND = Some(hooks);
+    }
 }
 
 /// Whether a native host backend is installed — the hosted signal that `/host`
@@ -54,8 +56,14 @@ pub static INJECTED_HOSTFS: InjectedHostFs = InjectedHostFs;
 impl Filesystem for InjectedHostFs {
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let (status, handle, size) = (backend().open)(path);
-        if status < 0 { return None; }
-        Some(Vnode { handle, size, mode: 0o644 })
+        if status < 0 {
+            return None;
+        }
+        Some(Vnode {
+            handle,
+            size,
+            mode: 0o644,
+        })
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], size: u32) -> i32 {
@@ -93,8 +101,14 @@ impl Filesystem for InjectedHostFs {
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let (status, handle) = (backend().create)(path);
-        if status < 0 { return None; }
-        Some(Vnode { handle, size: 0, mode: 0o644 })
+        if status < 0 {
+            return None;
+        }
+        Some(Vnode {
+            handle,
+            size: 0,
+            mode: 0o644,
+        })
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {

@@ -125,6 +125,77 @@ truncate -s 32M "$@"
 """,
 )
 
+genrule(
+    name = "runtime_block_1024",
+    outs = ["runtime_block_1024.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/runtime-block-1024-root"
+mkdir -p "$$ROOT/dir"
+printf runtime-block-size > "$$ROOT/dir/seed.bin"
+truncate -s 32M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 1024 -d "$$ROOT" "$@"
+""",
+)
+
+genrule(
+    name = "runtime_block_2048",
+    outs = ["runtime_block_2048.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/runtime-block-2048-root"
+mkdir -p "$$ROOT/dir"
+printf runtime-block-size > "$$ROOT/dir/seed.bin"
+truncate -s 32M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 2048 -d "$$ROOT" "$@"
+""",
+)
+
+genrule(
+    name = "runtime_block_8192",
+    outs = ["runtime_block_8192.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/runtime-block-8192-root"
+mkdir -p "$$ROOT/dir"
+printf runtime-block-size > "$$ROOT/dir/seed.bin"
+truncate -s 32M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 8192 -d "$$ROOT" "$@"
+""",
+)
+
+genrule(
+    name = "runtime_block_65536",
+    outs = ["runtime_block_65536.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/runtime-block-65536-root"
+mkdir -p "$$ROOT/dir"
+printf runtime-block-size > "$$ROOT/dir/seed.bin"
+truncate -s 128M "$@"
+/usr/sbin/mkfs.ext4 -q -F -b 65536 -d "$$ROOT" "$@"
+""",
+)
+
+# Both ext4 encodings present bytes inside the inode: a fast symbolic link
+# uses i_block alone, while inline_data continues regular-file bytes in the
+# inode-local system.data xattr.
+genrule(
+    name = "inline_data_image",
+    outs = ["inline-data.img"],
+    cmd = """
+set -eu
+ROOT="$(@D)/inline-data-root"
+mkdir -p "$$ROOT"
+printf '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--inline-data-payload--0123456789' > "$$ROOT/inline.bin"
+ln -s short-inline-target "$$ROOT/fast.link"
+truncate -s 32M "$@"
+/usr/sbin/mkfs.ext4 -q -F -O inline_data -d "$$ROOT" "$@"
+/usr/sbin/debugfs -w -R "ea_set /inline.bin user.keep preserved" "$@" >/dev/null 2>&1
+/usr/sbin/e2fsck -fy "$@" >/dev/null
+""",
+)
+
 rust_test(
     name = "modern_image_test",
     srcs = ["tests/modern_image.rs"],
@@ -132,15 +203,25 @@ rust_test(
     data = [
         ":extent_mutation_image",
         ":inode_group_image",
+        ":inline_data_image",
         ":modern_image",
         ":multi_group_image",
+        ":runtime_block_1024",
+        ":runtime_block_2048",
+        ":runtime_block_8192",
+        ":runtime_block_65536",
     ],
     edition = "2024",
     rustc_env = {
         "EXT4_MODERN_IMAGE": "$(rlocationpath :modern_image)",
         "EXT4_INODE_GROUP_IMAGE": "$(rlocationpath :inode_group_image)",
+        "EXT4_INLINE_DATA_IMAGE": "$(rlocationpath :inline_data_image)",
         "EXT4_EXTENT_MUTATION_IMAGE": "$(rlocationpath :extent_mutation_image)",
         "EXT4_MULTI_GROUP_IMAGE": "$(rlocationpath :multi_group_image)",
+        "EXT4_RUNTIME_BLOCK_1024": "$(rlocationpath :runtime_block_1024)",
+        "EXT4_RUNTIME_BLOCK_2048": "$(rlocationpath :runtime_block_2048)",
+        "EXT4_RUNTIME_BLOCK_8192": "$(rlocationpath :runtime_block_8192)",
+        "EXT4_RUNTIME_BLOCK_65536": "$(rlocationpath :runtime_block_65536)",
     },
     rustc_flags = [
         "-Cpanic=abort",

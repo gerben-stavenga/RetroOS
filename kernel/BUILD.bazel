@@ -56,7 +56,6 @@ rust_library(
         "-Crelocation-model=static",
     ] + select({
         ":metal": [
-            "-Copt-level=s",
             "-Cforce-frame-pointers=yes",
         ],
         "//conditions:default": [],

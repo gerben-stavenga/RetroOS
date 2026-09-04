@@ -100,7 +100,9 @@ impl CueSheet {
                 continue;
             }
             let mut words = line.split_ascii_whitespace();
-            let Some(command) = words.next() else { continue };
+            let Some(command) = words.next() else {
+                continue;
+            };
             if command.eq_ignore_ascii_case("FILE") {
                 if bin_file.is_some() {
                     return Err(MediaError::UnsupportedCue);
@@ -121,7 +123,12 @@ impl CueSheet {
                     Some(word) if word.eq_ignore_ascii_case("MODE1/2352") => TrackMode::Mode1_2352,
                     _ => return Err(MediaError::UnsupportedCue),
                 };
-                tracks.push(PartialTrack { number, mode, index00: None, index01: None });
+                tracks.push(PartialTrack {
+                    number,
+                    mode,
+                    index00: None,
+                    index01: None,
+                });
             } else if command.eq_ignore_ascii_case("INDEX") {
                 let track = tracks.last_mut().ok_or(MediaError::InvalidCue)?;
                 let index = words
@@ -156,7 +163,10 @@ impl CueSheet {
                 index01,
             });
         }
-        Ok(Self { bin_file, tracks: complete })
+        Ok(Self {
+            bin_file,
+            tracks: complete,
+        })
     }
 }
 
@@ -187,9 +197,18 @@ fn parse_file_line(rest: &str) -> Result<(&str, &str), MediaError> {
 
 fn parse_msf(value: &str) -> Result<u32, MediaError> {
     let mut fields = value.split(':');
-    let minutes = fields.next().and_then(|v| v.parse::<u32>().ok()).ok_or(MediaError::InvalidCue)?;
-    let seconds = fields.next().and_then(|v| v.parse::<u32>().ok()).ok_or(MediaError::InvalidCue)?;
-    let frames = fields.next().and_then(|v| v.parse::<u32>().ok()).ok_or(MediaError::InvalidCue)?;
+    let minutes = fields
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or(MediaError::InvalidCue)?;
+    let seconds = fields
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or(MediaError::InvalidCue)?;
+    let frames = fields
+        .next()
+        .and_then(|v| v.parse::<u32>().ok())
+        .ok_or(MediaError::InvalidCue)?;
     if fields.next().is_some() || seconds >= 60 || frames >= 75 {
         return Err(MediaError::InvalidCue);
     }
@@ -243,7 +262,10 @@ impl DataTrackReader {
     }
 
     fn open_cue_bin(source: Box<dyn RandomAccess>, cue: &CueSheet) -> Result<Self, MediaError> {
-        let data_index = cue.tracks.iter().position(|track| track.mode.is_data())
+        let data_index = cue
+            .tracks
+            .iter()
+            .position(|track| track.mode.is_data())
             .ok_or(MediaError::NoDataTrack)?;
         let track = &cue.tracks[data_index];
         let stored_sector = track.mode.stored_sector_size();
@@ -251,7 +273,11 @@ impl DataTrackReader {
         // A single BIN whose tracks use different stored sector sizes needs a
         // per-span byte map.  Reject that uncommon layout explicitly; mixed
         // mode AUDIO + MODE1/2352 (the usual raw BIN) is fully supported.
-        if cue.tracks.iter().any(|candidate| candidate.mode.stored_sector_size() != stored_sector) {
+        if cue
+            .tracks
+            .iter()
+            .any(|candidate| candidate.mode.stored_sector_size() != stored_sector)
+        {
             return Err(MediaError::UnsupportedCue);
         }
 
@@ -264,10 +290,16 @@ impl DataTrackReader {
         if end_frame <= start_frame || !source.len().is_multiple_of(stored_sector) {
             return Err(MediaError::InvalidImage);
         }
-        let file_offset = start_frame.checked_mul(stored_sector).ok_or(MediaError::InvalidImage)?;
+        let file_offset = start_frame
+            .checked_mul(stored_sector)
+            .ok_or(MediaError::InvalidImage)?;
         let sectors = end_frame - start_frame;
         let end = file_offset
-            .checked_add(sectors.checked_mul(stored_sector).ok_or(MediaError::InvalidImage)?)
+            .checked_add(
+                sectors
+                    .checked_mul(stored_sector)
+                    .ok_or(MediaError::InvalidImage)?,
+            )
             .ok_or(MediaError::InvalidImage)?;
         if end > source.len() {
             return Err(MediaError::InvalidImage);
@@ -277,7 +309,11 @@ impl DataTrackReader {
             file_offset,
             sectors,
             stored_sector,
-            payload_offset: if track.mode == TrackMode::Mode1_2352 { MODE1_PAYLOAD_OFFSET } else { 0 },
+            payload_offset: if track.mode == TrackMode::Mode1_2352 {
+                MODE1_PAYLOAD_OFFSET
+            } else {
+                0
+            },
             position: 0,
         })
     }
@@ -292,7 +328,10 @@ impl DataTrackReader {
 
     fn read_source_exact(&self, mut offset: u64, mut buf: &mut [u8]) -> Result<(), ErrorKind> {
         while !buf.is_empty() {
-            let n = self.source.read_at(offset, buf).map_err(|_| ErrorKind::Other)?;
+            let n = self
+                .source
+                .read_at(offset, buf)
+                .map_err(|_| ErrorKind::Other)?;
             if n == 0 || n > buf.len() {
                 return Err(ErrorKind::UnexpectedEof);
             }
@@ -315,10 +354,8 @@ impl Read for DataTrackReader {
             let sector = logical / COOKED_SECTOR;
             let within = logical % COOKED_SECTOR;
             let chunk = (wanted - done).min((COOKED_SECTOR - within) as usize);
-            let physical = self.file_offset
-                + sector * self.stored_sector
-                + self.payload_offset
-                + within;
+            let physical =
+                self.file_offset + sector * self.stored_sector + self.payload_offset + within;
             self.read_source_exact(physical, &mut buf[done..done + chunk])
                 .map_err(hadris_iso::sync::Error::from_source)?;
             self.position += chunk as u64;
@@ -338,7 +375,9 @@ impl Seek for DataTrackReader {
             SeekFrom::Current(delta) => i128::from(self.position) + i128::from(delta),
         };
         if next < 0 || next > i128::from(self.len()) {
-            return Err(hadris_iso::sync::Error::from_source(ErrorKind::InvalidInput));
+            return Err(hadris_iso::sync::Error::from_source(
+                ErrorKind::InvalidInput,
+            ));
         }
         self.position = next as u64;
         Ok(self.position)
@@ -368,7 +407,10 @@ impl Iso9660Fs {
         let image = IsoImage::open(reader).map_err(|_| MediaError::InvalidImage)?;
         Ok(Self {
             image,
-            opens: Mutex::new(OpenState { next_handle: 1, files: BTreeMap::new() }),
+            opens: Mutex::new(OpenState {
+                next_handle: 1,
+                files: BTreeMap::new(),
+            }),
         })
     }
 
@@ -387,7 +429,11 @@ impl Iso9660Fs {
             }
             entry.as_dir_ref(&self.image).ok()?
         };
-        self.image.open_dir(dir_ref).entries().collect::<Result<Vec<_>, _>>().ok()
+        self.image
+            .open_dir(dir_ref)
+            .entries()
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
     }
 }
 
@@ -401,8 +447,18 @@ impl Filesystem for Iso9660Fs {
         let handle = state.next_handle;
         state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
         let size = entry.total_size() as u32;
-        state.files.insert(handle, OpenFile { size, extents: entry.extents().collect() });
-        Some(Vnode { handle, size, mode: 0o444 })
+        state.files.insert(
+            handle,
+            OpenFile {
+                size,
+                extents: entry.extents().collect(),
+            },
+        );
+        Some(Vnode {
+            handle,
+            size,
+            mode: 0o444,
+        })
     }
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
@@ -424,7 +480,11 @@ impl Filesystem for Iso9660Fs {
             }
             let n = (wanted - done).min((extent_len - logical) as usize);
             let image_offset = extent.sector.0 as u64 * COOKED_SECTOR + logical;
-            if self.image.read_bytes_at(image_offset, &mut buf[done..done + n]).is_err() {
+            if self
+                .image
+                .read_bytes_at(image_offset, &mut buf[done..done + n])
+                .is_err()
+            {
                 return if done == 0 { -5 } else { done as i32 };
             }
             done += n;
@@ -487,7 +547,11 @@ impl Filesystem for Iso9660Fs {
 
 fn strip_iso_version(name: &str) -> &str {
     match name.rsplit_once(';') {
-        Some((base, version)) if !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()) => base,
+        Some((base, version))
+            if !version.is_empty() && version.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            base
+        }
         _ => name,
     }
 }
@@ -512,7 +576,9 @@ mod tests {
     struct Bytes(Vec<u8>);
 
     impl RandomAccess for Bytes {
-        fn len(&self) -> u64 { self.0.len() as u64 }
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
 
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, MediaError> {
             let offset = offset as usize;
@@ -527,14 +593,17 @@ mod tests {
 
     #[test]
     fn parses_mixed_mode_cue() {
-        let cue = CueSheet::parse(br#"
+        let cue = CueSheet::parse(
+            br#"
             FILE "game.bin" BINARY
               TRACK 01 MODE1/2352
                 INDEX 01 00:00:00
               TRACK 02 AUDIO
                 INDEX 00 00:10:00
                 INDEX 01 00:12:00
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert_eq!(cue.bin_file, b"game.bin");
         assert_eq!(cue.tracks.len(), 2);
         assert_eq!(cue.tracks[0].mode, TrackMode::Mode1_2352);
@@ -561,7 +630,8 @@ mod tests {
         let error = DataTrackReader::open(
             Box::new(Bytes(vec![0; RAW_SECTOR as usize])),
             DiscFormat::Cue(cue),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(error, MediaError::NoDataTrack);
     }
 
@@ -569,9 +639,13 @@ mod tests {
     fn rejects_mixed_stored_sector_sizes() {
         let cue = b"FILE \"odd.bin\" BINARY\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 MODE1/2048\nINDEX 01 00:01:00\n";
         let error = DataTrackReader::open(
-            Box::new(Bytes(vec![0; RAW_SECTOR as usize * 75 + COOKED_SECTOR as usize])),
+            Box::new(Bytes(vec![
+                0;
+                RAW_SECTOR as usize * 75 + COOKED_SECTOR as usize
+            ])),
             DiscFormat::Cue(cue),
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert_eq!(error, MediaError::UnsupportedCue);
     }
 
@@ -642,19 +716,22 @@ mod tests {
 
     #[test]
     fn hadris_iso_stream_serves_the_vfs() {
-        let filesystem = Iso9660Fs::open(
-            Box::new(Bytes(minimal_iso())),
-            DiscFormat::Iso,
-        ).unwrap();
+        let filesystem = Iso9660Fs::open(Box::new(Bytes(minimal_iso())), DiscFormat::Iso).unwrap();
 
         let vnode = Filesystem::open(&filesystem, b"hello.txt").unwrap();
         assert_eq!(vnode.size, 5);
         let mut contents = [0_u8; 8];
-        assert_eq!(Filesystem::read(&filesystem, vnode.handle, 0, &mut contents, vnode.size), 5);
+        assert_eq!(
+            Filesystem::read(&filesystem, vnode.handle, 0, &mut contents, vnode.size),
+            5
+        );
         assert_eq!(&contents[..5], b"hello");
 
         let mut entries = Vec::new();
-        assert_eq!(Filesystem::readdir(&filesystem, b"", 0, &mut entries, 8), None);
+        assert_eq!(
+            Filesystem::readdir(&filesystem, b"", 0, &mut entries, 8),
+            None
+        );
         assert_eq!(entries.len(), 1);
         assert_eq!(&entries[0].name[..entries[0].name_len], b"HELLO.TXT");
         Filesystem::clunk(&filesystem, vnode.handle);

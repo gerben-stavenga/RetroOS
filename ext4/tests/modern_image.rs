@@ -1,5 +1,5 @@
-use portable_ext4::test_support::{Inject, ModelError, ModelStorage};
 use portable_ext4::Error;
+use portable_ext4::test_support::{Inject, ModelError, ModelStorage};
 
 fn image() -> Vec<u8> {
     let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
@@ -22,6 +22,17 @@ fn inode_group_image() -> Vec<u8> {
 fn extent_mutation_image() -> Vec<u8> {
     let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
         .join(env!("EXT4_EXTENT_MUTATION_IMAGE"));
+    std::fs::read(image_path).unwrap()
+}
+
+fn inline_data_image() -> Vec<u8> {
+    let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap())
+        .join(env!("EXT4_INLINE_DATA_IMAGE"));
+    std::fs::read(image_path).unwrap()
+}
+
+fn runtime_block_image(path: &str) -> Vec<u8> {
+    let image_path = std::path::PathBuf::from(std::env::var_os("TEST_SRCDIR").unwrap()).join(path);
     std::fs::read(image_path).unwrap()
 }
 
@@ -184,6 +195,111 @@ fn graph_api_reads_typed_objects_directly() {
 }
 
 #[test]
+fn graph_blobs_share_fast_symlink_and_inline_data_storage() {
+    use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
+
+    let mut storage = ModelStorage::new(inline_data_image());
+    let mut graph = Graph::mount(&mut storage).unwrap();
+    let root = graph.root(&mut storage).unwrap();
+    let mut inline = None;
+    let mut fast = None;
+    graph
+        .edges(&mut storage, root, Default::default(), &mut |edge| {
+            match edge.name {
+                b"inline.bin" => inline = Some(edge.object),
+                b"fast.link" => fast = Some(edge.object),
+                _ => {}
+            }
+            Ok(true)
+        })
+        .unwrap();
+    let Object::Blob(inline) = inline.unwrap() else {
+        panic!("inline.bin is not a blob")
+    };
+    let Object::Blob(fast) = fast.unwrap() else {
+        panic!("fast.link is not a blob")
+    };
+
+    let original = b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ--inline-data-payload--0123456789";
+    let mut readback = vec![0; original.len()];
+    assert_eq!(
+        graph.read(&mut storage, inline, 0, &mut readback).unwrap(),
+        original.len()
+    );
+    assert_eq!(readback, original);
+    let mut target = [0; 19];
+    assert_eq!(graph.read(&mut storage, fast, 0, &mut target).unwrap(), 19);
+    assert_eq!(&target, b"short-inline-target");
+
+    // This write crosses from i_block into system.data without exposing that
+    // representation through the Blob API.
+    graph
+        .write(&mut storage, inline, 55, b"CROSS-INLINE")
+        .unwrap();
+    graph.resize(&mut storage, inline, 75).unwrap();
+    graph.resize(&mut storage, inline, 90).unwrap();
+    let mut within = vec![0xff; 90];
+    assert_eq!(
+        graph.read(&mut storage, inline, 0, &mut within).unwrap(),
+        90
+    );
+    assert_eq!(&within[55..67], b"CROSS-INLINE");
+    assert_eq!(&within[75..], &[0; 15]);
+
+    // Exceeding the inode's inline capacity converts either encoding to the
+    // same extent-backed Blob without changing its public identity.
+    graph.write(&mut storage, inline, 150, b"extent").unwrap();
+    let long_target =
+        b"this-symbolic-link-target-is-deliberately-longer-than-sixty-bytes-for-extents";
+    graph.write(&mut storage, fast, 0, long_target).unwrap();
+    let mut converted = vec![0xff; 156];
+    assert_eq!(
+        graph.read(&mut storage, inline, 0, &mut converted).unwrap(),
+        156
+    );
+    assert_eq!(&converted[90..150], &[0; 60]);
+    assert_eq!(&converted[150..], b"extent");
+    let mut converted_target = vec![0; long_target.len()];
+    assert_eq!(
+        graph
+            .read(&mut storage, fast, 0, &mut converted_target)
+            .unwrap(),
+        long_target.len()
+    );
+    assert_eq!(converted_target, long_target);
+
+    storage.flush().unwrap();
+    let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
+        .join("inline-data-mutated.img");
+    std::fs::write(&output, storage.durable_bytes()).unwrap();
+    let check = std::process::Command::new("/usr/sbin/e2fsck")
+        .args(["-fn", output.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "e2fsck rejected inline conversion:\n{}\n{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let attribute = std::process::Command::new("/usr/sbin/debugfs")
+        .args([
+            "-R",
+            "ea_get /inline.bin user.keep",
+            output.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        attribute.status.success() && attribute.stdout.windows(9).any(|part| part == b"preserved"),
+        "inline conversion lost an unrelated inode xattr:\n{}\n{}",
+        String::from_utf8_lossy(&attribute.stdout),
+        String::from_utf8_lossy(&attribute.stderr)
+    );
+}
+
+#[test]
 fn graph_api_owns_detached_blob_references() {
     use portable_ext4::ext4::{Ext4 as Graph, Object};
 
@@ -220,8 +336,8 @@ fn graph_api_owns_detached_blob_references() {
 
 #[test]
 fn graph_api_resizes_extent_blob() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     let mut storage = ModelStorage::new(image());
     let mut graph = Graph::mount(&mut storage).unwrap();
@@ -289,8 +405,8 @@ fn graph_api_resizes_extent_blob() {
 
 #[test]
 fn graph_api_collapses_external_extent_leaf() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     let mut fragmented = image();
     let artificial = add_artificial_fragmentation(&mut fragmented, 6);
@@ -354,8 +470,8 @@ fn graph_api_collapses_external_extent_leaf() {
 
 #[test]
 fn graph_api_resizes_unwritten_extent() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     let mut storage = ModelStorage::new(extent_mutation_image());
     let mut graph = Graph::mount(&mut storage).unwrap();
@@ -405,8 +521,8 @@ fn graph_api_resizes_unwritten_extent() {
 
 #[test]
 fn graph_api_owns_edges_and_reclaims_objects() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     let mut storage = ModelStorage::new(image());
     let mut graph = Graph::mount(&mut storage).unwrap();
@@ -473,8 +589,8 @@ fn graph_api_owns_edges_and_reclaims_objects() {
 
 #[test]
 fn graph_api_mutates_indexed_node_through_linear_graph_representation() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     let mut storage = ModelStorage::new(image());
     let mut graph = Graph::mount(&mut storage).unwrap();
@@ -546,8 +662,8 @@ fn graph_api_mutates_indexed_node_through_linear_graph_representation() {
 
 #[test]
 fn graph_api_materializes_lazy_inode_and_block_groups() {
-    use portable_ext4::ext4::{Ext4 as Graph, Object};
     use portable_ext4::Storage;
+    use portable_ext4::ext4::{Ext4 as Graph, Object};
 
     for (name, source, payload) in [
         ("lazy-inode", inode_group_image(), Vec::new()),
@@ -778,8 +894,8 @@ fn every_graph_journal_commit_effect_recovers_to_old_or_new_graph() {
 
 #[test]
 fn handle_filesystem_owns_atomic_graph_composition() {
-    use portable_ext4::ext4::{AttributeUpdate, Object};
     use portable_ext4::Filesystem;
+    use portable_ext4::ext4::{AttributeUpdate, Object};
 
     let storage = ModelStorage::new(image());
     let mut filesystem = Filesystem::mount(storage).unwrap();
@@ -820,4 +936,74 @@ fn handle_filesystem_owns_atomic_graph_composition() {
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
+}
+
+#[test]
+fn handle_filesystem_journals_runtime_block_sizes() {
+    use portable_ext4::Filesystem;
+    use portable_ext4::ext4::{AttributeUpdate, Object};
+
+    for (path, block_size) in [
+        (env!("EXT4_RUNTIME_BLOCK_1024"), 1024usize),
+        (env!("EXT4_RUNTIME_BLOCK_2048"), 2048),
+        (env!("EXT4_RUNTIME_BLOCK_8192"), 8192),
+        (env!("EXT4_RUNTIME_BLOCK_65536"), 65536),
+    ] {
+        let storage = ModelStorage::new(runtime_block_image(path));
+        let mut filesystem = Filesystem::mount(storage).unwrap();
+        let root = filesystem.root().unwrap();
+        let (_, dir_object) = filesystem.find(root, b"dir").unwrap().unwrap();
+        let Object::Node(dir) = dir_object else {
+            panic!("fixture directory is not a node");
+        };
+        let (seed_edge, seed_object) = filesystem.find(dir, b"seed.bin").unwrap().unwrap();
+        let Object::Blob(seed) = seed_object else {
+            panic!("fixture seed is not a blob");
+        };
+
+        // These do not alter allocation counters and therefore prove that a
+        // journal transaction need not contain the ext4 superblock.
+        filesystem.write(seed, 0, b"RUNTIME").unwrap();
+        filesystem
+            .update_attributes(
+                seed_object,
+                AttributeUpdate {
+                    modified: Some(0x1234_5678),
+                    ..AttributeUpdate::default()
+                },
+            )
+            .unwrap();
+        filesystem
+            .move_edge(seed_edge, dir, b"renamed.bin")
+            .unwrap();
+
+        let created = filesystem
+            .create_blob(dir, b"spanning.bin", AttributeUpdate::default())
+            .unwrap();
+        let Object::Blob(created) = created else {
+            panic!("created object is not a blob");
+        };
+        let payload = vec![0x5a; block_size + 17];
+        filesystem.write(created, 0, &payload).unwrap();
+        let mut readback = vec![0; payload.len()];
+        assert_eq!(
+            filesystem.read(created, 0, &mut readback).unwrap(),
+            payload.len()
+        );
+        assert_eq!(readback, payload);
+
+        let storage = filesystem.into_storage();
+        let output = std::env::temp_dir().join(format!("portable-ext4-{block_size}.img"));
+        std::fs::write(&output, storage.durable_bytes()).unwrap();
+        let checked = std::process::Command::new("/usr/sbin/e2fsck")
+            .args(["-fy", output.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(
+            checked.status.success(),
+            "e2fsck rejected {block_size}-byte filesystem:\n{}\n{}",
+            String::from_utf8_lossy(&checked.stdout),
+            String::from_utf8_lossy(&checked.stderr)
+        );
+    }
 }

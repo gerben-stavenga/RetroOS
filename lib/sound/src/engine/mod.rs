@@ -22,8 +22,8 @@
 //!  - pan: Q12 gains, resolved by the personality (the GF1's 16-position
 //!    table is device policy, not engine math).
 //!
-//! The per-frame mix loop is hot (up to 44.1 kHz × 32 voices), which is why
-//! the crate builds `-Copt-level=2` instead of //lib's `-z`.
+//! The per-frame mix loop is hot (up to 44.1 kHz × 32 voices), but it follows
+//! the system-wide `-Copt-level=z` policy; exceptions require benchmarks.
 
 pub mod voice;
 pub mod volume;

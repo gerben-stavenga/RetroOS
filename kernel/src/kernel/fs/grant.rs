@@ -64,7 +64,9 @@ impl Grant {
     /// than guessing a gid.
     pub fn from_home(fs: &dyn Filesystem, home: &[u8]) -> Option<Grant> {
         let home = home.strip_suffix(b"/").unwrap_or(home);
-        Some(Grant { gid: fs.meta(home)?.gid })
+        Some(Grant {
+            gid: fs.meta(home)?.gid,
+        })
     }
 
     /// The rule: ours, and group-writable.

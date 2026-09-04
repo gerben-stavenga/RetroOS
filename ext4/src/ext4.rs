@@ -32,6 +32,8 @@ const MODE_SYMLINK: u16 = 0xa000;
 const EXTENTS: u32 = 0x0008_0000;
 const INDEXED_NODE: u32 = 0x0000_1000;
 const INLINE_DATA: u32 = 0x1000_0000;
+const XATTR_INDEX_SYSTEM: u8 = 7;
+const INLINE_XATTR_NAME: &[u8] = b"data";
 const INCOMPAT_64BIT: u32 = 0x0080;
 const INCOMPAT_META_BG: u32 = 0x0010;
 const INCOMPAT_CSUM_SEED: u32 = 0x2000;
@@ -324,7 +326,14 @@ impl Inode {
     }
 
     fn is_fast_blob(self) -> bool {
-        self.mode & MODE_TYPE == MODE_SYMLINK && self.size <= 60 && self.blocks_512 == 0
+        self.mode & MODE_TYPE == MODE_SYMLINK
+            && self.size <= 60
+            && self.blocks_512 == 0
+            && self.flags & (EXTENTS | INLINE_DATA) == 0
+    }
+
+    fn has_inline_bytes(self) -> bool {
+        self.is_fast_blob() || self.flags & INLINE_DATA != 0
     }
 }
 
@@ -420,6 +429,16 @@ struct Materialized {
     zero: bool,
     first: u32,
     sibling: Option<ExtentIndex>,
+}
+
+#[derive(Clone, Copy)]
+struct InlineValue {
+    header: usize,
+    entry: usize,
+    entry_length: usize,
+    entries_end: usize,
+    value: usize,
+    value_length: usize,
 }
 
 struct EdgeInsertion {
@@ -835,7 +854,7 @@ impl Ext4 {
             while within < end {
                 let entry = record_at::<DirectoryEntryHeader>(&bytes, within)?;
                 let object = entry.inode.get();
-                let length = usize::from(entry.record_length.get());
+                let length = directory_record_length(entry.record_length, self.block_size as usize);
                 let name_length = usize::from(entry.name_length);
                 if length < size_of::<DirectoryEntryHeader>() + name_length
                     || !length.is_multiple_of(4)
@@ -1423,10 +1442,18 @@ impl Ext4 {
                     0
                 },
             )
-            .filter(|end| *end >= 24 && *end <= usize::from(u16::MAX))
+            .filter(|end| *end >= 24 && *end <= self.block_size as usize)
             .ok_or(Corrupt::InvalidDirectory)?;
-        write_edge_record(&mut bytes, 0, inode, 12, b".", 2)?;
-        write_edge_record(&mut bytes, 12, inode, data_end - 12, b"..", 2)?;
+        write_edge_record(&mut bytes, self.block_size as usize, 0, inode, 12, b".", 2)?;
+        write_edge_record(
+            &mut bytes,
+            self.block_size as usize,
+            12,
+            inode,
+            data_end - 12,
+            b"..",
+            2,
+        )?;
         if data_end != bytes.len() {
             let mut tail = DirectoryEntryTail::zeroed();
             tail.record_length
@@ -1465,7 +1492,8 @@ impl Ext4 {
         } else if logical == 0 {
             NodeBlockKind::IndexRoot
         } else if bytes.len() >= 8
-            && usize::from(u16::from_le_bytes([bytes[4], bytes[5]])) == bytes.len()
+            && directory_record_length(Le16([bytes[4], bytes[5]]), self.block_size as usize)
+                == bytes.len()
         {
             NodeBlockKind::Index
         } else {
@@ -1636,11 +1664,292 @@ impl Ext4 {
         }
     }
 
+    fn inode_raw(&self, storage: &mut dyn Storage, number: u32) -> Result<Vec<u8>, Error> {
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(usize::from(self.inode_size))
+            .map_err(|_| Error::OutOfMemory)?;
+        raw.resize(usize::from(self.inode_size), 0);
+        let offset = self.inode_offset(storage, number)?;
+        read_storage(storage, offset, &mut raw)?;
+        Ok(raw)
+    }
+
+    fn inline_value(raw: &[u8]) -> Result<InlineValue, Error> {
+        if raw.len() < INODE_BASE_SIZE + size_of::<Le16>() {
+            return Err(Corrupt::InvalidXattr.into());
+        }
+        let extra = usize::from(record_at::<Le16>(raw, INODE_BASE_SIZE)?.get());
+        let header = INODE_BASE_SIZE
+            .checked_add(extra)
+            .filter(|offset| offset.is_multiple_of(4))
+            .ok_or(Corrupt::InvalidXattr)?;
+        let first = header
+            .checked_add(size_of::<Le32>())
+            .ok_or(Corrupt::InvalidXattr)?;
+        if first
+            .checked_add(4)
+            .filter(|end| *end <= raw.len())
+            .is_none()
+            || record_at::<Le32>(raw, header)?.get() != XATTR_MAGIC
+        {
+            return Err(Corrupt::InvalidXattr.into());
+        }
+
+        let mut entry = first;
+        let mut target = None;
+        let mut values_begin = raw.len();
+        let entries_end = loop {
+            if entry
+                .checked_add(4)
+                .filter(|end| *end <= raw.len())
+                .is_none()
+            {
+                return Err(Corrupt::InvalidXattr.into());
+            }
+            if raw[entry..entry + 4] == [0; 4] {
+                break entry;
+            }
+            let disk = record_at::<XattrEntryHeader>(raw, entry)?;
+            let entry_length = (size_of::<XattrEntryHeader>()
+                .checked_add(usize::from(disk.name_length))
+                .and_then(|size| size.checked_add(3))
+                .ok_or(Corrupt::InvalidXattr)?)
+                & !3;
+            let next = entry
+                .checked_add(entry_length)
+                .filter(|next| *next <= raw.len())
+                .ok_or(Corrupt::InvalidXattr)?;
+            let name_end = entry + size_of::<XattrEntryHeader>() + usize::from(disk.name_length);
+            let name = &raw[entry + size_of::<XattrEntryHeader>()..name_end];
+            let value_length =
+                usize::try_from(disk.value_size.get()).map_err(|_| Corrupt::InvalidXattr)?;
+            if disk.value_inode.get() == 0 && value_length != 0 {
+                let value = first
+                    .checked_add(usize::from(disk.value_offset.get()))
+                    .filter(|value| value.is_multiple_of(4))
+                    .ok_or(Corrupt::InvalidXattr)?;
+                let value_end = value
+                    .checked_add(value_length)
+                    .filter(|end| *end <= raw.len())
+                    .ok_or(Corrupt::InvalidXattr)?;
+                if value < next || value_end > raw.len() {
+                    return Err(Corrupt::InvalidXattr.into());
+                }
+                values_begin = values_begin.min(value);
+            }
+            if disk.name_index == XATTR_INDEX_SYSTEM && name == INLINE_XATTR_NAME {
+                if target.is_some() || disk.value_inode.get() != 0 {
+                    return Err(Corrupt::InvalidXattr.into());
+                }
+                let value = if value_length == 0 {
+                    raw.len()
+                } else {
+                    first
+                        .checked_add(usize::from(disk.value_offset.get()))
+                        .ok_or(Corrupt::InvalidXattr)?
+                };
+                target = Some(InlineValue {
+                    header,
+                    entry,
+                    entry_length,
+                    entries_end: 0,
+                    value,
+                    value_length,
+                });
+            }
+            entry = next;
+        };
+        if entries_end + 4 > values_begin {
+            return Err(Corrupt::InvalidXattr.into());
+        }
+        let mut target = target.ok_or(Corrupt::InvalidXattr)?;
+        if target.value < entries_end + 4
+            || target
+                .value
+                .checked_add(target.value_length)
+                .filter(|end| *end <= raw.len())
+                .is_none()
+        {
+            return Err(Corrupt::InvalidXattr.into());
+        }
+        target.entries_end = entries_end;
+        Ok(target)
+    }
+
+    fn read_inline(
+        &self,
+        storage: &mut dyn Storage,
+        inode: &Inode,
+        offset: usize,
+        output: &mut [u8],
+    ) -> Result<(), Error> {
+        let end = offset
+            .checked_add(output.len())
+            .ok_or(Corrupt::AddressOverflow)?;
+        if end > usize::try_from(inode.size).map_err(|_| Corrupt::AddressOverflow)? {
+            return Err(Corrupt::ReadPastEnd.into());
+        }
+        let first_end = end.min(inode.block.len());
+        if offset < first_end {
+            output[..first_end - offset].copy_from_slice(&inode.block[offset..first_end]);
+        }
+        if end > inode.block.len() {
+            let raw = self.inode_raw(storage, inode.number)?;
+            let inline = Self::inline_value(&raw)?;
+            let logical = offset.max(inode.block.len());
+            let value_offset = logical - inode.block.len();
+            let count = end - logical;
+            if value_offset
+                .checked_add(count)
+                .filter(|end| *end <= inline.value_length)
+                .is_none()
+            {
+                return Err(Corrupt::InvalidXattr.into());
+            }
+            output[logical - offset..].copy_from_slice(
+                &raw[inline.value + value_offset..inline.value + value_offset + count],
+            );
+        }
+        Ok(())
+    }
+
+    fn inline_capacity(raw: &[u8], inode: Inode) -> Result<usize, Error> {
+        if inode.flags & INLINE_DATA != 0 {
+            inode
+                .block
+                .len()
+                .checked_add(Self::inline_value(raw)?.value_length)
+                .ok_or(Corrupt::AddressOverflow.into())
+        } else {
+            Ok(inode.block.len())
+        }
+    }
+
+    fn fill_inline(
+        raw: &mut [u8],
+        base: &mut Inode128,
+        inode: Inode,
+        start: usize,
+        end: usize,
+        value: u8,
+    ) -> Result<(), Error> {
+        let first_end = end.min(base.block.len());
+        if start < first_end {
+            base.block[start..first_end].fill(value);
+        }
+        if end > base.block.len() {
+            let inline = Self::inline_value(raw)?;
+            let logical = start.max(base.block.len());
+            let value_start = logical - base.block.len();
+            let value_end = end - base.block.len();
+            if inode.flags & INLINE_DATA == 0 || value_end > inline.value_length {
+                return Err(Corrupt::InvalidXattr.into());
+            }
+            raw[inline.value + value_start..inline.value + value_end].fill(value);
+        }
+        Ok(())
+    }
+
+    fn copy_inline(
+        raw: &mut [u8],
+        base: &mut Inode128,
+        inode: Inode,
+        offset: usize,
+        input: &[u8],
+    ) -> Result<(), Error> {
+        let end = offset
+            .checked_add(input.len())
+            .ok_or(Corrupt::AddressOverflow)?;
+        let first_end = end.min(base.block.len());
+        if offset < first_end {
+            base.block[offset..first_end].copy_from_slice(&input[..first_end - offset]);
+        }
+        if end > base.block.len() {
+            let inline = Self::inline_value(raw)?;
+            let logical = offset.max(base.block.len());
+            let value_start = logical - base.block.len();
+            let count = end - logical;
+            if inode.flags & INLINE_DATA == 0 || value_start + count > inline.value_length {
+                return Err(Corrupt::InvalidXattr.into());
+            }
+            raw[inline.value + value_start..inline.value + value_start + count]
+                .copy_from_slice(&input[logical - offset..]);
+        }
+        Ok(())
+    }
+
+    fn convert_inline_to_extents(
+        &mut self,
+        storage: &mut dyn Storage,
+        object: Object,
+        inode: Inode,
+    ) -> Result<(), Error> {
+        let length = usize::try_from(inode.size).map_err(|_| Corrupt::AddressOverflow)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| Error::OutOfMemory)?;
+        bytes.resize(length, 0);
+        self.read_inline(storage, &inode, 0, &mut bytes)?;
+        self.edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
+            if current.generation != inode.generation
+                || current.object() != object
+                || !current.has_inline_bytes()
+            {
+                return Err(Error::NotFound);
+            }
+            if current.flags & INLINE_DATA != 0 {
+                let inline = Self::inline_value(raw)?;
+                let through = inline
+                    .entries_end
+                    .checked_add(4)
+                    .ok_or(Corrupt::InvalidXattr)?;
+                raw.copy_within(inline.entry + inline.entry_length..through, inline.entry);
+                raw[through - inline.entry_length..through].fill(0);
+                let padded_value = inline
+                    .value_length
+                    .checked_add(3)
+                    .ok_or(Corrupt::InvalidXattr)?
+                    & !3;
+                let value_end = inline
+                    .value
+                    .checked_add(padded_value)
+                    .filter(|end| *end <= raw.len())
+                    .ok_or(Corrupt::InvalidXattr)?;
+                raw[inline.value..value_end].fill(0);
+                if raw[inline.header + 4..inline.header + 8] == [0; 4] {
+                    raw[inline.header..inline.header + 4].fill(0);
+                }
+            }
+            let mut root = ExtentLeafRoot::zeroed();
+            root.header.magic.set(EXTENT_MAGIC);
+            root.header.max_entries.set(root.entries.len() as u16);
+            base.block.copy_from_slice(bytemuck::bytes_of(&root));
+            base.flags.set((current.flags & !INLINE_DATA) | EXTENTS);
+            base.size_lo.set(0);
+            base.size_hi.set(0);
+            Ok(())
+        })?;
+        if !bytes.is_empty() {
+            self.write_object(storage, object, 0, &bytes)?;
+        }
+        Ok(())
+    }
+
     fn edit_inode(
         &self,
         storage: &mut dyn Storage,
         number: u32,
         edit: &mut dyn FnMut(&mut Inode128, Inode) -> Result<(), Error>,
+    ) -> Result<Inode, Error> {
+        self.edit_inode_raw(storage, number, &mut |_, base, inode| edit(base, inode))
+    }
+
+    fn edit_inode_raw(
+        &self,
+        storage: &mut dyn Storage,
+        number: u32,
+        edit: &mut dyn FnMut(&mut [u8], &mut Inode128, Inode) -> Result<(), Error>,
     ) -> Result<Inode, Error> {
         let offset = self.inode_offset(storage, number)?;
         let mut raw = Vec::new();
@@ -1652,7 +1961,7 @@ impl Ext4 {
         let mut extra = (raw.len() >= size_of::<Inode160>())
             .then(|| bytemuck::pod_read_unaligned::<InodeExtra32>(&raw[INODE_BASE_SIZE..160]));
         let inode = decode_inode(number, base)?;
-        edit(&mut base, inode)?;
+        edit(&mut raw, &mut base, inode)?;
         if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
             let mut os_data =
                 bytemuck::pod_read_unaligned::<LinuxInodeOsData2>(&base.os_dependent_2);
@@ -1755,8 +2064,13 @@ impl Ext4 {
             .checked_add(output.len() as u64)
             .filter(|end| *end <= inode.size)
             .ok_or(Corrupt::ReadPastEnd)?;
-        if inode.is_fast_blob() {
-            output.copy_from_slice(&inode.block[offset as usize..end as usize]);
+        if matches!(inode.object(), Object::Blob(_)) && inode.has_inline_bytes() {
+            self.read_inline(
+                storage,
+                inode,
+                usize::try_from(offset).map_err(|_| Corrupt::AddressOverflow)?,
+                output,
+            )?;
             return Ok(());
         }
         if inode.flags & INLINE_DATA != 0 {
@@ -2525,22 +2839,36 @@ impl Ext4 {
         let end = offset
             .checked_add(input.len() as u64)
             .ok_or(Corrupt::AddressOverflow)?;
-        if inode.is_fast_blob() {
-            if end > inode.block.len() as u64 {
-                return Err(Unsupported::ExtentMutation.into());
+        if matches!(object, Object::Blob(_)) && inode.has_inline_bytes() {
+            let raw = self.inode_raw(storage, inode.number)?;
+            if end <= Self::inline_capacity(&raw, inode)? as u64 {
+                let start = usize::try_from(offset).map_err(|_| Corrupt::AddressOverflow)?;
+                let finish = usize::try_from(end).map_err(|_| Corrupt::AddressOverflow)?;
+                self.edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
+                    if current.generation != inode.generation || current.object() != object {
+                        return Err(Error::NotFound);
+                    }
+                    if offset > current.size {
+                        Self::fill_inline(
+                            raw,
+                            base,
+                            current,
+                            usize::try_from(current.size).map_err(|_| Corrupt::AddressOverflow)?,
+                            start,
+                            0,
+                        )?;
+                    }
+                    Self::copy_inline(raw, base, current, start, input)?;
+                    if end > current.size {
+                        base.size_lo.set(finish as u32);
+                        base.size_hi.set((end >> 32) as u32);
+                    }
+                    Ok(())
+                })?;
+                return Ok(());
             }
-            self.edit_inode(storage, inode.number, &mut |base, current| {
-                if current.generation != inode.generation || current.object() != object {
-                    return Err(Error::NotFound);
-                }
-                base.block[offset as usize..end as usize].copy_from_slice(input);
-                if end > current.size {
-                    base.size_lo.set(end as u32);
-                    base.size_hi.set(0);
-                }
-                Ok(())
-            })?;
-            return Ok(());
+            self.convert_inline_to_extents(storage, object, inode)?;
+            return self.write_object(storage, object, offset, input);
         }
         let block_size = u64::from(self.block_size);
         if inode.flags & INLINE_DATA != 0
@@ -2614,23 +2942,32 @@ impl Ext4 {
         if size == inode.size {
             return Ok(());
         }
-        if inode.is_fast_blob() {
-            if size > inode.block.len() as u64 {
-                return Err(Unsupported::ExtentMutation.into());
+        if matches!(object, Object::Blob(_)) && inode.has_inline_bytes() {
+            let raw = self.inode_raw(storage, inode.number)?;
+            if size <= Self::inline_capacity(&raw, inode)? as u64 {
+                return self
+                    .edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
+                        if current.generation != inode.generation || current.object() != object {
+                            return Err(Error::NotFound);
+                        }
+                        Self::fill_inline(
+                            raw,
+                            base,
+                            current,
+                            usize::try_from(size.min(current.size))
+                                .map_err(|_| Corrupt::AddressOverflow)?,
+                            usize::try_from(size.max(current.size))
+                                .map_err(|_| Corrupt::AddressOverflow)?,
+                            0,
+                        )?;
+                        base.size_lo.set(size as u32);
+                        base.size_hi.set((size >> 32) as u32);
+                        Ok(())
+                    })
+                    .map(|_| ());
             }
-            return self
-                .edit_inode(storage, inode.number, &mut |base, current| {
-                    if current.generation != inode.generation {
-                        return Err(Error::NotFound);
-                    }
-                    let start = usize::try_from(size.min(inode.size)).unwrap_or(base.block.len());
-                    let end = usize::try_from(size.max(inode.size)).unwrap_or(base.block.len());
-                    base.block[start..end].fill(0);
-                    base.size_lo.set(size as u32);
-                    base.size_hi.set((size >> 32) as u32);
-                    Ok(())
-                })
-                .map(|_| ());
+            self.convert_inline_to_extents(storage, object, inode)?;
+            return self.resize_object(storage, object, size);
         }
         if inode.flags & INLINE_DATA != 0 {
             return Err(Unsupported::InlineData.into());
@@ -2732,7 +3069,7 @@ impl Ext4 {
         let mut offset = 0;
         while offset < end {
             let entry = record_at::<DirectoryEntryHeader>(&bytes, offset)?;
-            let length = usize::from(entry.record_length.get());
+            let length = directory_record_length(entry.record_length, self.block_size as usize);
             let name_length = usize::from(entry.name_length);
             if length < size_of::<DirectoryEntryHeader>() + name_length || offset + length > end {
                 return Err(Corrupt::InvalidDirectory.into());
@@ -2758,7 +3095,7 @@ impl Ext4 {
         let mut offset = 0;
         while offset < end {
             let mut entry = record_at::<DirectoryEntryHeader>(&bytes, offset)?;
-            let length = usize::from(entry.record_length.get());
+            let length = directory_record_length(entry.record_length, self.block_size as usize);
             let name_length = usize::from(entry.name_length);
             if length < size_of::<DirectoryEntryHeader>() + name_length || offset + length > end {
                 return Err(Corrupt::InvalidDirectory.into());
@@ -2794,7 +3131,7 @@ impl Ext4 {
 
         let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
         let dot = record_at::<DirectoryEntryHeader>(&bytes, 0)?;
-        let dot_length = usize::from(dot.record_length.get());
+        let dot_length = directory_record_length(dot.record_length, self.block_size as usize);
         let dot_name_start = size_of::<DirectoryEntryHeader>();
         if dot.inode.get() != node.number()
             || dot.name_length != 1
@@ -2812,9 +3149,18 @@ impl Ext4 {
         {
             return Err(Corrupt::InvalidDirectory.into());
         }
-        write_edge_record(&mut bytes, 0, node.number(), dot_length, b".", 2)?;
         write_edge_record(
             &mut bytes,
+            self.block_size as usize,
+            0,
+            node.number(),
+            dot_length,
+            b".",
+            2,
+        )?;
+        write_edge_record(
+            &mut bytes,
+            self.block_size as usize,
             dot_length,
             parent.inode.get(),
             end - dot_length,
@@ -2844,6 +3190,7 @@ impl Ext4 {
             let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
             if let Some(mut inserted) = insert_edge_record(
                 &mut bytes,
+                self.block_size as usize,
                 end,
                 name,
                 target.number,
@@ -2874,6 +3221,7 @@ impl Ext4 {
             };
         write_edge_record(
             &mut bytes,
+            self.block_size as usize,
             0,
             target.number,
             end,
@@ -2897,7 +3245,13 @@ impl Ext4 {
         let logical = edge.offset / u64::from(self.block_size);
         let within = (edge.offset % u64::from(self.block_size)) as usize;
         let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
-        remove_edge_record(&mut bytes, end, within, edge.object)?;
+        remove_edge_record(
+            &mut bytes,
+            self.block_size as usize,
+            end,
+            within,
+            edge.object,
+        )?;
         self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
         let target = self.inode(storage, edge.object)?;
         if let Object::Node(node) = target.object() {
@@ -3148,6 +3502,7 @@ fn write_storage(storage: &mut dyn Storage, offset: u64, input: &[u8]) -> Result
 
 fn write_edge_record(
     bytes: &mut [u8],
+    block_size: usize,
     offset: usize,
     inode: u32,
     length: usize,
@@ -3167,7 +3522,7 @@ fn write_edge_record(
     bytes[offset..offset + length].fill(0);
     let mut header = DirectoryEntryHeader::zeroed();
     header.inode.set(inode);
-    header.record_length.set(length as u16);
+    header.record_length = directory_record_length_to_disk(length, block_size)?;
     header.name_length = name.len() as u8;
     header.file_type = file_type;
     let header_end = offset + size_of::<DirectoryEntryHeader>();
@@ -3186,6 +3541,7 @@ fn edge_record_size(name: &[u8]) -> Result<usize, Error> {
 
 fn insert_edge_record(
     bytes: &mut [u8],
+    block_size: usize,
     end: usize,
     name: &[u8],
     object: u32,
@@ -3196,7 +3552,7 @@ fn insert_edge_record(
     let mut slot = None;
     while offset < end {
         let mut entry = record_at::<DirectoryEntryHeader>(bytes, offset)?;
-        let length = usize::from(entry.record_length.get());
+        let length = directory_record_length(entry.record_length, block_size);
         let name_length = usize::from(entry.name_length);
         let used = (size_of::<DirectoryEntryHeader>() + name_length + 3) & !3;
         if length < used || !length.is_multiple_of(4) || offset + length > end {
@@ -3231,10 +3587,12 @@ fn insert_edge_record(
     };
     if let Some((previous, used)) = split {
         let mut shortened = record_at::<DirectoryEntryHeader>(bytes, previous)?;
-        shortened.record_length.set(used as u16);
+        shortened.record_length = directory_record_length_to_disk(used, block_size)?;
         write_record_at(bytes, previous, &shortened)?;
     }
-    write_edge_record(bytes, offset, object, available, name, file_type)?;
+    write_edge_record(
+        bytes, block_size, offset, object, available, name, file_type,
+    )?;
     Ok(Some(EdgeInsertion {
         offset,
         replaced: None,
@@ -3243,6 +3601,7 @@ fn insert_edge_record(
 
 fn remove_edge_record(
     bytes: &mut [u8],
+    block_size: usize,
     end: usize,
     wanted: usize,
     object: u32,
@@ -3251,7 +3610,7 @@ fn remove_edge_record(
     let mut previous = None;
     while offset < end {
         let mut entry = record_at::<DirectoryEntryHeader>(bytes, offset)?;
-        let length = usize::from(entry.record_length.get());
+        let length = directory_record_length(entry.record_length, block_size);
         let name_length = usize::from(entry.name_length);
         if length < size_of::<DirectoryEntryHeader>() + name_length
             || !length.is_multiple_of(4)
@@ -3267,8 +3626,10 @@ fn remove_edge_record(
             }
             if let Some(previous) = previous {
                 let mut left = record_at::<DirectoryEntryHeader>(bytes, previous)?;
-                left.record_length
-                    .set((usize::from(left.record_length.get()) + length) as u16);
+                let combined = directory_record_length(left.record_length, block_size)
+                    .checked_add(length)
+                    .ok_or(Corrupt::InvalidDirectory)?;
+                left.record_length = directory_record_length_to_disk(combined, block_size)?;
                 write_record_at(bytes, previous, &left)?;
             } else {
                 entry.inode.set(0);
@@ -3282,6 +3643,38 @@ fn remove_edge_record(
         offset += length;
     }
     Err(Error::NotFound)
+}
+
+pub(crate) fn directory_record_length(record: Le16, block_size: usize) -> usize {
+    let length = usize::from(record.get());
+    if block_size == 65536 {
+        if length == usize::from(u16::MAX) || length == 0 {
+            block_size
+        } else {
+            (length & 65532) | ((length & 3) << 16)
+        }
+    } else {
+        length
+    }
+}
+
+pub(crate) fn directory_record_length_to_disk(
+    length: usize,
+    block_size: usize,
+) -> Result<Le16, Error> {
+    if length > block_size || !length.is_multiple_of(4) {
+        return Err(Corrupt::InvalidDirectory.into());
+    }
+    let encoded = if length < 65536 {
+        length
+    } else if length == block_size && block_size == 65536 {
+        usize::from(u16::MAX)
+    } else {
+        (length & 65532) | ((length >> 16) & 3)
+    };
+    u16::try_from(encoded)
+        .map(Le16::new)
+        .map_err(|_| Corrupt::InvalidDirectory.into())
 }
 
 /// The 1024-byte superblock stored at byte 1024 (and in backup locations).

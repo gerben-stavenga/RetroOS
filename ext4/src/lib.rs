@@ -45,6 +45,7 @@ pub enum Corrupt {
     InvalidExtentHeader,
     InvalidExtentTree,
     InvalidLegacyBlockMap,
+    InvalidXattr,
     InvalidBlockBitmap,
     InvalidFreeBlockCount,
     ExtentPastEnd,

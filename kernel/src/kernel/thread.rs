@@ -333,6 +333,7 @@ impl<A: crate::Arch> Personality<A> {
     /// before audio, display, input routing, and guest resume. DOS steps its
     /// PIT and services sound-device events; Linux currently has no virtual
     /// devices to advance. Runs once per event-loop iteration.
+    #[inline(never)]
     pub fn advance_world(
         &mut self,
         machine: &mut A,
@@ -392,6 +393,7 @@ impl<A: crate::Arch> Personality<A> {
 
     /// Render compositor-owned personality state into the event loop's output.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub fn render(
         &mut self,
         machine: &mut A,
@@ -906,6 +908,7 @@ pub fn take_switch_target() -> Option<usize> {
 /// Exit thread and schedule next.
 /// Returns the TID of the next thread to run (falls back to thread 0/idle).
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub fn exit_thread<A: crate::Arch>(
     threads: &mut [Thread<A>],
     machine: &mut A,

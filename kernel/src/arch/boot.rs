@@ -21,6 +21,12 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 #[global_allocator]
 static ALLOCATOR: lib::heap::DemandHeap = lib::heap::DemandHeap::new();
 
+// Boot configuration is immutable after the one-shot handoff and needed for
+// the kernel's lifetime.  Keeping it here avoids retaining its 4 KiB command
+// line array in the bottom frame of the permanent kernel stack.
+static mut BOOT_CONFIG: core::mem::MaybeUninit<crate::BootConfig> =
+    core::mem::MaybeUninit::uninit();
+
 /// Metal log sink: preserve the emulator debug port and mirror to the optional
 /// physical serial logger. The kernel only hands bytes to this platform sink.
 fn log_byte(b: u8) {
@@ -112,6 +118,25 @@ unsafe fn capture_boot_info(
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInfo) -> ! {
+    let config = unsafe { prepare_boot(magic, info) };
+
+    // The arch backend handle, threaded as `&mut` through the kernel from here
+    // on so its mutable state is borrow-checked rather than global. Lives for
+    // the rest of the kernel's life (startup never returns).
+    let mut machine = arch::Metal;
+    lib::screenln!(lib::term::term(), "Heap base: {:#x}", arch::heap_base());
+    crate::kernel::startup::startup(&mut machine, config);
+}
+
+/// Finish all one-shot metal boot work and return only the configuration that
+/// the runtime needs.  Keep this out of `boot_kernel`: with fat LTO, inlining
+/// this phase otherwise reserves its large capture/probe temporaries for the
+/// entire non-returning kernel call chain.
+#[inline(never)]
+unsafe fn prepare_boot(
+    magic: u32,
+    info: *const arch::MultibootInfo,
+) -> &'static crate::BootConfig {
     // FIRST life sign, before paging: paint a strip into the framebuffer the
     // loader handed us. On real hardware there is no debug port and no
     // display until fbcon::init — a kernel that dies in early init reboots
@@ -298,14 +323,11 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 
     lib::screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
 
-    // The arch backend handle, threaded as `&mut` through the kernel from here
-    // on so its mutable state is borrow-checked rather than global. Lives for
-    // the rest of the kernel's life (startup never returns).
-    let mut machine = arch::Metal;
-
-    lib::screenln!(screen, "Heap base: {:#x}", arch::heap_base());
-
-    crate::kernel::startup::startup(&mut machine, &config);
+    let dst = (&raw mut BOOT_CONFIG).cast::<crate::BootConfig>();
+    unsafe {
+        dst.write(config);
+        &*dst
+    }
 }
 
 /// Read platform boot settings into a `BootConfig`. The Multiboot command line

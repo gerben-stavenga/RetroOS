@@ -235,6 +235,7 @@ impl Clock {
 /// a sink the same device clocks run at the canonical rate and their samples
 /// are discarded; SB DMA, GF1 voices, MIDI envelopes, and completion events
 /// therefore do not depend on output hardware existing.
+#[inline(never)]
 pub fn advance<A: crate::Arch>(
     machine: &mut A,
     clock: &mut Clock,

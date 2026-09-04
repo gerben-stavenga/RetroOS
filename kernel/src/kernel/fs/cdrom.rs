@@ -44,7 +44,8 @@ pub fn transfer_ns(bytes: usize) -> Option<u64> {
     }
     let numerator = (bytes as u128) * 1_000_000_000u128;
     Some(
-        numerator.div_ceil(bytes_per_second as u128)
+        numerator
+            .div_ceil(bytes_per_second as u128)
             .min(u128::from(u64::MAX)) as u64,
     )
 }
@@ -69,7 +70,9 @@ pub fn cycle_speed(forward: bool) {
 struct FileImage(BackingFile);
 
 impl RandomAccess for FileImage {
-    fn len(&self) -> u64 { self.0.size() as u64 }
+    fn len(&self) -> u64 {
+        self.0.size() as u64
+    }
 
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, MediaError> {
         let offset = u32::try_from(offset).map_err(|_| MediaError::OutOfBounds)?;
@@ -128,15 +131,26 @@ impl Filesystem for CdSlot {
         if generation != state.generation {
             return -5;
         }
-        state.media.as_ref().map_or(-5, |media| media.read(inner, offset, buf, size))
+        state
+            .media
+            .as_ref()
+            .map_or(-5, |media| media.read(inner, offset, buf, size))
     }
 
     fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
-        self.state.lock().media.as_ref()?.readdir(dir, cookie, out, max)
+        self.state
+            .lock()
+            .media
+            .as_ref()?
+            .readdir(dir, cookie, out, max)
     }
 
     fn dir_exists(&self, path: &[u8]) -> bool {
-        self.state.lock().media.as_ref().is_some_and(|media| media.dir_exists(path))
+        self.state
+            .lock()
+            .media
+            .as_ref()
+            .is_some_and(|media| media.dir_exists(path))
     }
 
     fn clunk(&self, handle: u64) {
@@ -149,7 +163,9 @@ impl Filesystem for CdSlot {
         }
     }
 
-    fn write(&self, _handle: u64, _offset: u32, _data: &[u8]) -> i32 { -1 }
+    fn write(&self, _handle: u64, _offset: u32, _data: &[u8]) -> i32 {
+        -1
+    }
 }
 
 #[derive(Clone)]
@@ -173,8 +189,9 @@ fn catalog_dir() -> Vec<u8> {
 }
 
 fn supported_name(name: &[u8]) -> bool {
-    name.rsplit(|byte| *byte == b'.').next().is_some_and(|ext|
-        ext.eq_ignore_ascii_case(b"ISO") || ext.eq_ignore_ascii_case(b"CUE"))
+    name.rsplit(|byte| *byte == b'.')
+        .next()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case(b"ISO") || ext.eq_ignore_ascii_case(b"CUE"))
 }
 
 /// Rebuild the OSD catalogue from `C:\CD`.
@@ -191,7 +208,10 @@ pub fn refresh_catalog() {
         let mut path = dir.clone();
         path.push(b'/');
         path.extend_from_slice(name);
-        found.push(CatalogEntry { name: name.to_vec(), path });
+        found.push(CatalogEntry {
+            name: name.to_vec(),
+            path,
+        });
     }
     found.sort_by(|a, b| a.name.cmp(&b.name));
     *CATALOG.lock() = found;
@@ -203,7 +223,9 @@ pub fn catalog_count() -> usize {
 
 pub fn catalog_name(index: usize, out: &mut [u8]) -> usize {
     let catalog = CATALOG.lock();
-    let Some(entry) = catalog.get(index) else { return 0 };
+    let Some(entry) = catalog.get(index) else {
+        return 0;
+    };
     let n = entry.name.len().min(out.len());
     out[..n].copy_from_slice(&entry.name[..n]);
     n
@@ -224,7 +246,9 @@ pub fn label(out: &mut [u8]) -> usize {
 
 pub fn selected(index: usize) -> bool {
     let catalog = CATALOG.lock();
-    let Some(entry) = catalog.get(index) else { return false };
+    let Some(entry) = catalog.get(index) else {
+        return false;
+    };
     CD_SLOT.state.lock().label == entry.name
 }
 
@@ -251,7 +275,10 @@ fn read_cue_file(path: &[u8]) -> Result<Vec<u8>, MediaError> {
 }
 
 fn sibling_path(path: &[u8], filename: &[u8]) -> Vec<u8> {
-    let parent = path.iter().rposition(|byte| *byte == b'/').map_or(0, |i| i + 1);
+    let parent = path
+        .iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(0, |i| i + 1);
     let mut result = path[..parent].to_vec();
     result.extend_from_slice(filename);
     result
@@ -260,13 +287,24 @@ fn sibling_path(path: &[u8], filename: &[u8]) -> Vec<u8> {
 /// Insert one catalogue entry into the fixed slot: the image FILE becomes
 /// the disc (a .CUE's small sheet is parsed from RAM; its .BIN is the disc).
 pub fn insert(index: usize) -> Result<(), MediaError> {
-    let entry = CATALOG.lock().get(index).cloned().ok_or(MediaError::OutOfBounds)?;
-    let is_cue = entry.name.rsplit(|byte| *byte == b'.').next()
+    let entry = CATALOG
+        .lock()
+        .get(index)
+        .cloned()
+        .ok_or(MediaError::OutOfBounds)?;
+    let is_cue = entry
+        .name
+        .rsplit(|byte| *byte == b'.')
+        .next()
         .is_some_and(|ext| ext.eq_ignore_ascii_case(b"CUE"));
 
     // Resolve everything through the VFS first (cue slurp, backing open) —
     // these are ordinary VFS operations and must NOT run under the guard.
-    let cue = if is_cue { Some(read_cue_file(&entry.path)?) } else { None };
+    let cue = if is_cue {
+        Some(read_cue_file(&entry.path)?)
+    } else {
+        None
+    };
     let disc_path = match &cue {
         Some(cue) => {
             let sheet = CueSheet::parse(cue)?;
@@ -301,7 +339,10 @@ pub fn insert(index: usize) -> Result<(), MediaError> {
         slot.label = entry.name.clone();
     }
     vfs::mounted_media_changed();
-    crate::println!("CD-ROM: inserted {} as D:", String::from_utf8_lossy(&entry.name));
+    crate::println!(
+        "CD-ROM: inserted {} as D:",
+        String::from_utf8_lossy(&entry.name)
+    );
     Ok(())
 }
 

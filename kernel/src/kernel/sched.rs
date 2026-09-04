@@ -28,6 +28,7 @@ pub enum Verdict {
 /// pending task-picker request. It is honored only when the action itself
 /// didn't already pick a successor.
 #[allow(clippy::too_many_arguments)]
+#[inline(never)]
 pub fn verdict<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,

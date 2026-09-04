@@ -21,6 +21,5 @@ rust_library(
     rustc_flags = [
         "--cap-lints=allow",
         "-Cpanic=abort",
-        "-Copt-level=z",
     ],
 )

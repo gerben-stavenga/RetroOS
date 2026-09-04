@@ -118,7 +118,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{crc16, recv_frame, send_frame, MAX_BODY};
+    use super::{MAX_BODY, crc16, recv_frame, send_frame};
     use alloc::{vec, vec::Vec};
 
     #[test]
