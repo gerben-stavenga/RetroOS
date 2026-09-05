@@ -187,6 +187,60 @@ fn trapped_addressing_is_independent_of_backing_layout() {
 }
 
 #[test]
+fn byte_mode_odd_even_blits_preserve_full_plane_offsets() {
+    let mut state = vga::VgaState::new();
+    let regs = vga::bios_mode_regs(0x13).unwrap();
+    state.seq = regs.seq;
+    state.gc = regs.gc;
+    state.crtc = regs.crtc;
+    // Jazz combines odd/even plane selection with byte-mode scanout and a
+    // 336-pixel virtual stride. A0 chooses planes without halving the offset.
+    state.seq[4] = 0x02;
+    state.gc[5] = 0x50;
+    state.crtc[0x14] = 0;
+    state.crtc[0x17] = 0xE3;
+    state.crtc[0x13] = 42;
+    let mut vram = vec![0u8; 4 * 0x10000];
+    for (offset, pixels) in [(0x1200, [11, 12, 13, 14]), (0x1201, [21, 22, 23, 24])] {
+        for (plane, pixel) in pixels.into_iter().enumerate() {
+            vram[state.layout().index(plane, offset)] = pixel;
+        }
+    }
+    for parity in 0..2 {
+        let (source, plane) = state.cpu_read_address(0x1200 + parity);
+        assert_eq!((source, plane), (0x1200 + parity, parity));
+        let cur = core::array::from_fn(|p| vram[state.layout().index(p, source)]);
+        let mut gc = state.gc;
+        gc[4] = plane as u8;
+        let (_, latches) = vga::planar_read(cur, &gc);
+        gc[5] |= 1; // VRAM-to-VRAM latch copy
+        let (destination, mask) = state.cpu_write_address(0x2000 + parity);
+        assert_eq!(destination, 0x2000 + parity);
+        let out = vga::planar_write([0; 4], latches, &gc, mask, 0);
+        for (p, value) in out.into_iter().enumerate() {
+            vram[state.layout().index(p, destination)] = value;
+        }
+    }
+    VramTransition::between(state.layout(), VramLayout::PlaneMinor).apply(&mut vram);
+    assert_eq!(&vram[4 * 0x2000..4 * 0x2002], &[11, 0, 13, 0, 0, 22, 0, 24]);
+}
+
+#[test]
+fn byte_mode_odd_even_cannot_use_compact_text_alias() {
+    let mut state = *vga::VgaState::new_mode3_boxed();
+    assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Direct { .. }));
+    state.port_write(0x3D4, 0x17);
+    let write = state.port_write(0x3D5, state.crtc[0x17] | 0x40);
+    assert!(matches!(write.new_aperture, vga::CpuAperture::Trapped { .. }));
+    // GC6 chain-odd/even pairs addresses independently of plane selection.
+    assert_eq!(state.cpu_read_address(7), (6, 1));
+    assert_eq!(state.cpu_write_address(7), (6, 0x02));
+    state.gc[6] &= !0x02;
+    assert_eq!(state.cpu_read_address(7), (7, 1));
+    assert_eq!(state.cpu_write_address(7), (7, 0x02));
+}
+
+#[test]
 fn odd_even_map_zero_exposes_the_full_128k_aperture() {
     let mut state = vga::VgaState::new();
     let regs = vga::bios_mode_regs(3).unwrap();

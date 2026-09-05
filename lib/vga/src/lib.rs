@@ -2119,6 +2119,15 @@ impl VgaState {
         }
     }
 
+    /// Odd/even selects planes with A0 independently of the CRTC's byte/word
+    /// addressing. Word-mode scanout uses compact offsets in our backing;
+    /// byte-mode scanout (Jazz's scrolling playfield) uses the full offset.
+    fn odd_even_offset(&self, address: usize) -> usize {
+        let address = if self.gc[6] & 0x02 != 0 { address & !1 } else { address };
+        let address = if self.crtc[0x17] & 0x40 == 0 { address >> 1 } else { address };
+        address & 0xFFFF
+    }
+
     /// Resolve one CPU read in the decoded VGA aperture to the logical plane
     /// byte selected by the sequencer/graphics-controller addressing mode.
     /// The returned offset is always an offset *within a plane*; callers then
@@ -2128,7 +2137,7 @@ impl VgaState {
             return ((address >> 2) & 0xFFFF, address & 3);
         }
         if self.gc[5] & 0x10 != 0 {
-            return ((address >> 1) & 0xFFFF, usize::from(self.gc[4] & 2) | (address & 1));
+            return (self.odd_even_offset(address), usize::from(self.gc[4] & 2) | (address & 1));
         }
         (address & 0xFFFF, usize::from(self.gc[4] & 3))
     }
@@ -2145,7 +2154,7 @@ impl VgaState {
         }
         if self.seq[4] & 0x04 == 0 {
             let parity_mask = if address & 1 == 0 { 0x05 } else { 0x0A };
-            return ((address >> 1) & 0xFFFF, map_mask & parity_mask);
+            return (self.odd_even_offset(address), map_mask & parity_mask);
         }
         (address & 0xFFFF, map_mask)
     }
@@ -2167,11 +2176,12 @@ impl VgaState {
             return (self.seq[2] & 0x0F == 0x0F).then_some(self.layout());
         }
         // A direct odd/even alias is valid only for the conventional matched
-        // read/write setup and plane set 0. Other legal combinations remain
-        // trapped and use layout-aware logical indexing.
+        // read/write setup, compact word-mode offsets and plane set 0. Other
+        // legal combinations remain trapped and use layout-aware indexing.
         let write_oe = self.seq[4] & 0x04 == 0;
         let read_oe = self.gc[5] & 0x10 != 0;
         if write_oe && read_oe
+            && self.crtc[0x17] & 0x40 == 0
             && self.seq[2] & 0x0F == 0x03
             && self.gc[4] & 0x02 == 0
         {
