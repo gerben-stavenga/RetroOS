@@ -519,6 +519,28 @@ struct Group {
     flags: u16,
 }
 
+#[derive(Clone, Copy)]
+enum AllocationKind {
+    Block,
+    Blob,
+    Node,
+}
+
+impl AllocationKind {
+    fn inode(self) -> bool {
+        !matches!(self, Self::Block)
+    }
+
+    fn node(self) -> bool {
+        matches!(self, Self::Node)
+    }
+}
+
+struct Allocation {
+    number: u64,
+    inode_offset: u64,
+}
+
 struct Materialized {
     physical: u64,
     zero: bool,
@@ -539,6 +561,211 @@ struct InlineValue {
 struct EdgeInsertion {
     offset: usize,
     replaced: Option<u32>,
+}
+
+#[derive(Clone, Copy)]
+struct DirectoryRecord {
+    length: usize,
+    header: DirectoryEntryHeader,
+}
+
+/// An in-place view of the variable-length records in one directory leaf.
+struct DirectoryBlock<'a> {
+    bytes: &'a mut [u8],
+    end: usize,
+    block_size: usize,
+}
+
+impl<'a> DirectoryBlock<'a> {
+    fn new(bytes: &'a mut [u8], end: usize, block_size: usize) -> Self {
+        Self {
+            bytes,
+            end,
+            block_size,
+        }
+    }
+
+    fn record_prefix(&self, offset: usize) -> Result<DirectoryRecord, Error> {
+        let header = record_at::<DirectoryEntryHeader>(self.bytes, offset)?;
+        let length = directory_record_length(header.record_length, self.block_size);
+        let name_start = offset
+            .checked_add(size_of::<DirectoryEntryHeader>())
+            .ok_or(Corrupt::InvalidDirectory)?;
+        let name_end = name_start
+            .checked_add(usize::from(header.name_length))
+            .ok_or(Corrupt::InvalidDirectory)?;
+        if length < size_of::<DirectoryEntryHeader>() + usize::from(header.name_length)
+            || !length.is_multiple_of(4)
+            || name_end > self.end
+        {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        Ok(DirectoryRecord { length, header })
+    }
+
+    fn record(&self, offset: usize) -> Result<DirectoryRecord, Error> {
+        let record = self.record_prefix(offset)?;
+        if offset
+            .checked_add(record.length)
+            .is_none_or(|next| next > self.end)
+        {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        Ok(record)
+    }
+
+    fn name(&self, offset: usize, record: DirectoryRecord) -> &[u8] {
+        let start = offset + size_of::<DirectoryEntryHeader>();
+        &self.bytes[start..start + usize::from(record.header.name_length)]
+    }
+
+    fn write(
+        &mut self,
+        offset: usize,
+        inode: u32,
+        length: usize,
+        name: &[u8],
+        file_type: u8,
+    ) -> Result<(), Error> {
+        if inode == 0
+            || name.len() > 255
+            || length < size_of::<DirectoryEntryHeader>() + name.len()
+            || !length.is_multiple_of(4)
+            || offset.checked_add(length).is_none_or(|end| end > self.end)
+        {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        self.bytes[offset..offset + length].fill(0);
+        let mut header = DirectoryEntryHeader::zeroed();
+        header.inode.set(inode);
+        header.record_length = directory_record_length_to_disk(length, self.block_size)?;
+        header.name_length = name.len() as u8;
+        header.file_type = file_type;
+        let header_end = offset + size_of::<DirectoryEntryHeader>();
+        self.bytes[offset..header_end].copy_from_slice(bytemuck::bytes_of(&header));
+        self.bytes[header_end..header_end + name.len()].copy_from_slice(name);
+        Ok(())
+    }
+
+    fn set_object(
+        &mut self,
+        offset: usize,
+        mut header: DirectoryEntryHeader,
+        object: u32,
+        file_type: u8,
+    ) -> Result<(), Error> {
+        header.inode.set(object);
+        header.file_type = file_type;
+        write_record_at(self.bytes, offset, &header)
+    }
+
+    fn find(&self, name: &[u8]) -> Result<Option<(usize, DirectoryEntryHeader)>, Error> {
+        let mut offset = 0;
+        while offset < self.end {
+            let record = self.record(offset)?;
+            if record.header.inode.get() != 0 && self.name(offset, record) == name {
+                return Ok(Some((offset, record.header)));
+            }
+            offset += record.length;
+        }
+        Ok(None)
+    }
+
+    fn insert(
+        &mut self,
+        name: &[u8],
+        object: u32,
+        file_type: u8,
+    ) -> Result<Option<EdgeInsertion>, Error> {
+        let needed = edge_record_size(name)?;
+        let mut offset = 0;
+        let mut slot = None;
+        while offset < self.end {
+            let record = self.record(offset)?;
+            let used = edge_record_size_unchecked(usize::from(record.header.name_length));
+            if record.header.inode.get() != 0 && self.name(offset, record) == name {
+                let replaced = record.header.inode.get();
+                self.set_object(offset, record.header, object, file_type)?;
+                return Ok(Some(EdgeInsertion {
+                    offset,
+                    replaced: Some(replaced),
+                }));
+            }
+            if slot.is_none() {
+                if record.header.inode.get() == 0 && record.length >= needed {
+                    slot = Some((offset, record.length, None));
+                } else if record.header.inode.get() != 0 && record.length - used >= needed {
+                    slot = Some((
+                        offset + used,
+                        record.length - used,
+                        Some((offset, used, record.header)),
+                    ));
+                }
+            }
+            offset += record.length;
+        }
+        let Some((offset, available, split)) = slot else {
+            return Ok(None);
+        };
+        if let Some((previous, used, mut header)) = split {
+            header.record_length = directory_record_length_to_disk(used, self.block_size)?;
+            write_record_at(self.bytes, previous, &header)?;
+        }
+        self.write(offset, object, available, name, file_type)?;
+        Ok(Some(EdgeInsertion {
+            offset,
+            replaced: None,
+        }))
+    }
+
+    fn remove(&mut self, wanted: usize, object: u32) -> Result<(), Error> {
+        let mut offset = 0;
+        let mut previous: Option<(usize, DirectoryEntryHeader, usize)> = None;
+        while offset < self.end {
+            let record = self.record(offset)?;
+            if offset == wanted {
+                if record.header.inode.get() != object
+                    || matches!(self.name(offset, record), b"." | b"..")
+                {
+                    return Err(Error::NotFound);
+                }
+                if let Some((previous, mut left, left_length)) = previous {
+                    let combined = left_length
+                        .checked_add(record.length)
+                        .ok_or(Corrupt::InvalidDirectory)?;
+                    left.record_length =
+                        directory_record_length_to_disk(combined, self.block_size)?;
+                    write_record_at(self.bytes, previous, &left)?;
+                } else {
+                    let mut header = record.header;
+                    header.inode.set(0);
+                    header.name_length = 0;
+                    header.file_type = 0;
+                    write_record_at(self.bytes, offset, &header)?;
+                }
+                return Ok(());
+            }
+            previous = Some((offset, record.header, record.length));
+            offset += record.length;
+        }
+        Err(Error::NotFound)
+    }
+
+    fn seal(&mut self, checksum_seed: u32, inode: u32, generation: u32) {
+        if self.end == self.bytes.len() {
+            return;
+        }
+        let mut tail = DirectoryEntryTail::zeroed();
+        tail.record_length
+            .set(size_of::<DirectoryEntryTail>() as u16);
+        tail.reserved_file_type = 0xde;
+        let mut checksum = crate::checksum::Checksum::with_seed(checksum_seed);
+        checksum.update_u32_le(inode);
+        checksum.update_u32_le(generation);
+        checksum.update(&self.bytes[..self.end]);
+        tail.checksum.set(checksum.finalize());
+        self.bytes[self.end..].copy_from_slice(bytemuck::bytes_of(&tail));
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -963,30 +1190,22 @@ impl Ext4 {
         let block_size = u64::from(self.block_size);
         let blocks = inode.size.div_ceil(block_size);
         for logical in cursor.0 / block_size..blocks {
-            let (bytes, end, kind) = self.read_node_block(storage, &inode, logical)?;
+            let (mut bytes, end, kind) = self.read_node_block(storage, &inode, logical)?;
             if kind != NodeBlockKind::Leaf {
                 continue;
             }
+            let block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
             let base = logical * block_size;
             let mut within = 0;
-            while within < end {
-                let entry = record_at::<DirectoryEntryHeader>(&bytes, within)?;
-                let object = entry.inode.get();
-                let length = directory_record_length(entry.record_length, self.block_size as usize);
-                let name_length = usize::from(entry.name_length);
-                if length < size_of::<DirectoryEntryHeader>() + name_length
-                    || !length.is_multiple_of(4)
-                    || within + length > end
-                {
-                    return Err(Corrupt::InvalidDirectory.into());
-                }
-                let next = within + length;
+            while within < block.end {
+                let record = block.record(within)?;
+                let object = record.header.inode.get();
+                let next = within + record.length;
                 let position = base + within as u64;
                 if position >= cursor.0 && object != 0 {
-                    let name = &bytes[within + size_of::<DirectoryEntryHeader>()
-                        ..within + size_of::<DirectoryEntryHeader>() + name_length];
+                    let name = block.name(within, record);
                     if !matches!(name, b"." | b"..") {
-                        let target = match entry.file_type {
+                        let target = match record.header.file_type {
                             2 => Object::Node(Node(object)),
                             _ => Object::Blob(Blob(object)),
                         };
@@ -1119,6 +1338,43 @@ impl Ext4 {
         checksum.finalize()
     }
 
+    fn bitmap_buffer(&self) -> Result<Vec<u8>, Error> {
+        let mut bitmap = Vec::new();
+        bitmap
+            .try_reserve_exact(self.block_size as usize)
+            .map_err(|_| Error::OutOfMemory)?;
+        bitmap.resize(self.block_size as usize, 0);
+        Ok(bitmap)
+    }
+
+    fn read_bitmap(&self, storage: &mut dyn Storage, block: u64) -> Result<Vec<u8>, Error> {
+        if block == 0 || block >= self.blocks_count {
+            return Err(Corrupt::InvalidBlockBitmap.into());
+        }
+        let mut bitmap = self.bitmap_buffer()?;
+        read_storage(storage, block * u64::from(self.block_size), &mut bitmap)?;
+        Ok(bitmap)
+    }
+
+    fn write_bitmap(
+        &self,
+        storage: &mut dyn Storage,
+        group: &mut Group,
+        kind: AllocationKind,
+        bitmap: &[u8],
+    ) -> Result<(), Error> {
+        let (block, bits) = if kind.inode() {
+            (group.inode_bitmap, u64::from(self.inodes_per_group))
+        } else {
+            (group.block_bitmap, u64::from(self.blocks_per_group))
+        };
+        group
+            .descriptor
+            .set_bitmap_checksum(kind.inode(), self.bitmap_checksum(bitmap, bits));
+        write_storage(storage, block * u64::from(self.block_size), bitmap)?;
+        self.write_group(storage, group)
+    }
+
     fn group_has_superblock(&self, group: u32) -> bool {
         if group == 0 {
             return true;
@@ -1156,11 +1412,7 @@ impl Ext4 {
         {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
-        let mut bitmap = Vec::new();
-        bitmap
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bitmap.resize(self.block_size as usize, 0);
+        let mut bitmap = self.bitmap_buffer()?;
         let capacity = bitmap.len() as u64 * 8;
         Self::mark_bitmap(&mut bitmap, count, capacity - count)?;
         Ok(bitmap)
@@ -1175,11 +1427,7 @@ impl Ext4 {
         if group.number == 0 {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
-        let mut bitmap = Vec::new();
-        bitmap
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bitmap.resize(self.block_size as usize, 0);
+        let mut bitmap = self.bitmap_buffer()?;
         if self.group_has_superblock(group.number) {
             let descriptor_blocks = (u64::from(self.groups_count)
                 * u64::from(self.descriptor_size))
@@ -1223,16 +1471,6 @@ impl Ext4 {
         Ok(bitmap)
     }
 
-    fn set_bitmap_checksum(
-        &self,
-        group: &mut Group,
-        inode: bool,
-        checksum: u32,
-    ) -> Result<(), Error> {
-        group.descriptor.set_bitmap_checksum(inode, checksum);
-        Ok(())
-    }
-
     fn update_superblock_counts(
         &mut self,
         storage: &mut dyn Storage,
@@ -1267,284 +1505,271 @@ impl Ext4 {
         write_record(storage, SUPERBLOCK_OFFSET, &superblock)
     }
 
-    fn allocate_inode(
+    #[inline(never)]
+    fn allocate(
         &mut self,
         storage: &mut dyn Storage,
-        node: bool,
-    ) -> Result<(u32, u32), Error> {
+        kind: AllocationKind,
+    ) -> Result<Allocation, Error> {
         for number in 0..self.groups_count {
             let mut group = self.group(storage, number)?;
-            if group.free_inodes == 0 {
+            let (free, block, base, count, first, uninitialized) = if kind.inode() {
+                let base = u64::from(number) * u64::from(self.inodes_per_group);
+                (
+                    group.free_inodes,
+                    group.inode_bitmap,
+                    base,
+                    u64::from(self.inodes_count)
+                        .saturating_sub(base)
+                        .min(u64::from(self.inodes_per_group)),
+                    if number == 0 {
+                        u64::from(self.first_inode - 1)
+                    } else {
+                        0
+                    },
+                    GROUP_INODE_UNINIT,
+                )
+            } else {
+                let base = u64::from(self.first_data_block)
+                    + u64::from(number) * u64::from(self.blocks_per_group);
+                (
+                    group.free_blocks,
+                    group.block_bitmap,
+                    base,
+                    self.blocks_count
+                        .saturating_sub(base)
+                        .min(u64::from(self.blocks_per_group)),
+                    0,
+                    GROUP_BLOCK_UNINIT,
+                )
+            };
+            if free == 0 {
                 continue;
             }
-            if group.inode_bitmap == 0 || group.inode_bitmap >= self.blocks_count {
+            if block == 0 || block >= self.blocks_count {
                 return Err(Corrupt::InvalidBlockBitmap.into());
             }
-            let group_first = u64::from(number) * u64::from(self.inodes_per_group);
-            let count = u64::from(self.inodes_count)
-                .saturating_sub(group_first)
-                .min(u64::from(self.inodes_per_group));
-            let mut bitmap = if group.flags & GROUP_INODE_UNINIT != 0 {
-                let bitmap = self.initialize_inode_bitmap(&group, count)?;
-                group.flags &= !GROUP_INODE_UNINIT;
+            let mut bitmap = if group.flags & uninitialized != 0 {
+                let bitmap = if kind.inode() {
+                    self.initialize_inode_bitmap(&group, count)?
+                } else {
+                    self.initialize_block_bitmap(&group, base, count)?
+                };
+                group.flags &= !uninitialized;
                 bitmap
             } else {
-                let mut bitmap = Vec::new();
-                bitmap
-                    .try_reserve_exact(self.block_size as usize)
-                    .map_err(|_| Error::OutOfMemory)?;
-                bitmap.resize(self.block_size as usize, 0);
-                read_storage(
-                    storage,
-                    group.inode_bitmap * u64::from(self.block_size),
-                    &mut bitmap,
-                )?;
-                bitmap
+                self.read_bitmap(storage, block)?
             };
-            let first = if number == 0 {
-                u64::from(self.first_inode - 1)
+            let index = (first..count)
+                .find(|index| bitmap[*index as usize / 8] & (1 << (*index % 8)) == 0)
+                .ok_or(Corrupt::InvalidFreeBlockCount)?;
+            bitmap[index as usize / 8] |= 1 << (index % 8);
+
+            if kind.inode() {
+                group.free_inodes = group
+                    .free_inodes
+                    .checked_sub(1)
+                    .ok_or(Corrupt::InvalidFreeBlockCount)?;
+                let initialized = count
+                    .checked_sub(u64::from(group.unused_inodes))
+                    .ok_or(Corrupt::InvalidInodeTable)?;
+                if index >= initialized {
+                    group.unused_inodes =
+                        u32::try_from(count - index - 1).map_err(|_| Corrupt::InvalidInodeTable)?;
+                }
+                if kind.node() {
+                    group.used_directories = group
+                        .used_directories
+                        .checked_add(1)
+                        .ok_or(Corrupt::InvalidFreeBlockCount)?;
+                }
+            } else {
+                group.free_blocks = group
+                    .free_blocks
+                    .checked_sub(1)
+                    .ok_or(Corrupt::InvalidFreeBlockCount)?;
+            }
+            self.write_bitmap(storage, &mut group, kind, &bitmap)?;
+            self.update_superblock_counts(
+                storage,
+                if kind.inode() { 0 } else { -1 },
+                if kind.inode() { -1 } else { 0 },
+            )?;
+
+            let inode_offset = if kind.inode() {
+                group
+                    .inode_table
+                    .checked_mul(u64::from(self.block_size))
+                    .and_then(|value| value.checked_add(index * u64::from(self.inode_size)))
+                    .ok_or(Corrupt::AddressOverflow)?
             } else {
                 0
             };
-            let Some(index) =
-                (first..count).find(|index| bitmap[*index as usize / 8] & (1 << (*index % 8)) == 0)
-            else {
-                return Err(Corrupt::InvalidFreeBlockCount.into());
-            };
-            bitmap[index as usize / 8] |= 1 << (index % 8);
-            group.free_inodes = group
-                .free_inodes
-                .checked_sub(1)
-                .ok_or(Corrupt::InvalidFreeBlockCount)?;
-            let initialized = count
-                .checked_sub(u64::from(group.unused_inodes))
-                .ok_or(Corrupt::InvalidInodeTable)?;
-            if index >= initialized {
-                group.unused_inodes =
-                    u32::try_from(count - index - 1).map_err(|_| Corrupt::InvalidInodeTable)?;
-            }
-            if node {
-                group.used_directories = group
-                    .used_directories
-                    .checked_add(1)
-                    .ok_or(Corrupt::InvalidFreeBlockCount)?;
-            }
-            let checksum = self.bitmap_checksum(&bitmap, u64::from(self.inodes_per_group));
-            self.set_bitmap_checksum(&mut group, true, checksum)?;
-            write_storage(
-                storage,
-                group.inode_bitmap * u64::from(self.block_size),
-                &bitmap,
-            )?;
-            self.write_group(storage, &mut group)?;
-            self.update_superblock_counts(storage, 0, -1)?;
-
-            let inode =
-                u32::try_from(group_first + index + 1).map_err(|_| Corrupt::AddressOverflow)?;
-            let offset = group
-                .inode_table
-                .checked_mul(u64::from(self.block_size))
-                .and_then(|value| value.checked_add(index * u64::from(self.inode_size)))
-                .ok_or(Corrupt::AddressOverflow)?;
-            let old: Inode128 = read_record(storage, offset)?;
-            let generation = old.generation.get().wrapping_add(1).max(1);
-            let mut raw = Vec::new();
-            raw.try_reserve_exact(usize::from(self.inode_size))
-                .map_err(|_| Error::OutOfMemory)?;
-            raw.resize(usize::from(self.inode_size), 0);
-            let mut base = Inode128::zeroed();
-            base.mode.set(if node { 0x4000 } else { 0x8000 });
-            base.links_count.set(if node { 2 } else { 1 });
-            base.flags.set(EXTENTS);
-            base.generation.set(generation);
-            let mut root = ExtentLeafRoot::zeroed();
-            root.header.magic.set(EXTENT_MAGIC);
-            root.header.max_entries.set(root.entries.len() as u16);
-            base.block.copy_from_slice(bytemuck::bytes_of(&root));
-            raw[..INODE_BASE_SIZE].copy_from_slice(bytemuck::bytes_of(&base));
-            let mut extra = (raw.len() >= size_of::<Inode160>()).then(InodeExtra32::zeroed);
-            if let Some(extra) = &mut extra {
-                extra.extra_inode_size.set(size_of::<InodeExtra32>() as u16);
-                raw[INODE_BASE_SIZE..size_of::<Inode160>()]
-                    .copy_from_slice(bytemuck::bytes_of(extra));
-            }
-            if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
-                let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-                checksum.update_u32_le(inode);
-                checksum.update_u32_le(generation);
-                checksum.update(&raw);
-                let checksum = checksum.finalize();
-                let mut os_data = LinuxInodeOsData2::zeroed();
-                os_data.checksum_lo.set(checksum as u16);
-                base.os_dependent_2
-                    .copy_from_slice(bytemuck::bytes_of(&os_data));
-                raw[..INODE_BASE_SIZE].copy_from_slice(bytemuck::bytes_of(&base));
-                if let Some(extra) = &mut extra {
-                    extra.checksum_hi.set((checksum >> 16) as u16);
-                    raw[INODE_BASE_SIZE..size_of::<Inode160>()]
-                        .copy_from_slice(bytemuck::bytes_of(extra));
-                }
-            }
-            write_storage(storage, offset, &raw)?;
-            return Ok((inode, generation));
+            return Ok(Allocation {
+                number: base + index + u64::from(kind.inode()),
+                inode_offset,
+            });
         }
         Err(Corrupt::InvalidFreeBlockCount.into())
     }
 
-    fn allocate_block(&mut self, storage: &mut dyn Storage) -> Result<u64, Error> {
-        for number in 0..self.groups_count {
-            let mut group = self.group(storage, number)?;
-            if group.free_blocks == 0 {
-                continue;
-            }
-            if group.block_bitmap == 0 || group.block_bitmap >= self.blocks_count {
-                return Err(Corrupt::InvalidBlockBitmap.into());
-            }
-            let start = u64::from(self.first_data_block)
+    #[inline(never)]
+    fn release_allocation(
+        &mut self,
+        storage: &mut dyn Storage,
+        kind: AllocationKind,
+        allocation: u64,
+    ) -> Result<(), Error> {
+        let (number, index, count, uninitialized) = if kind.inode() {
+            let index = allocation
+                .checked_sub(1)
+                .ok_or(Corrupt::InvalidInode(allocation as u32))?;
+            let number = u32::try_from(index / u64::from(self.inodes_per_group))
+                .map_err(|_| Corrupt::InvalidBlockBitmap)?;
+            let base = u64::from(number) * u64::from(self.inodes_per_group);
+            (
+                number,
+                index % u64::from(self.inodes_per_group),
+                u64::from(self.inodes_count)
+                    .saturating_sub(base)
+                    .min(u64::from(self.inodes_per_group)),
+                GROUP_INODE_UNINIT,
+            )
+        } else {
+            let relative = allocation
+                .checked_sub(u64::from(self.first_data_block))
+                .ok_or(Corrupt::InvalidBlockBitmap)?;
+            let number = u32::try_from(relative / u64::from(self.blocks_per_group))
+                .map_err(|_| Corrupt::InvalidBlockBitmap)?;
+            let base = u64::from(self.first_data_block)
                 + u64::from(number) * u64::from(self.blocks_per_group);
-            let count = self
-                .blocks_count
-                .saturating_sub(start)
-                .min(u64::from(self.blocks_per_group));
-            let mut bitmap = if group.flags & GROUP_BLOCK_UNINIT != 0 {
-                let bitmap = self.initialize_block_bitmap(&group, start, count)?;
-                group.flags &= !GROUP_BLOCK_UNINIT;
-                bitmap
-            } else {
-                let mut bitmap = Vec::new();
-                bitmap
-                    .try_reserve_exact(self.block_size as usize)
-                    .map_err(|_| Error::OutOfMemory)?;
-                bitmap.resize(self.block_size as usize, 0);
-                read_storage(
-                    storage,
-                    group.block_bitmap * u64::from(self.block_size),
-                    &mut bitmap,
-                )?;
-                bitmap
-            };
-            let Some(index) =
-                (0..count).find(|index| bitmap[*index as usize / 8] & (1 << (*index % 8)) == 0)
-            else {
-                return Err(Corrupt::InvalidFreeBlockCount.into());
-            };
-            bitmap[index as usize / 8] |= 1 << (index % 8);
-            group.free_blocks = group
-                .free_blocks
-                .checked_sub(1)
-                .ok_or(Corrupt::InvalidFreeBlockCount)?;
-            let checksum = self.bitmap_checksum(&bitmap, u64::from(self.blocks_per_group));
-            self.set_bitmap_checksum(&mut group, false, checksum)?;
-            write_storage(
-                storage,
-                group.block_bitmap * u64::from(self.block_size),
-                &bitmap,
-            )?;
-            self.write_group(storage, &mut group)?;
-            self.update_superblock_counts(storage, -1, 0)?;
-            return Ok(start + index);
-        }
-        Err(Corrupt::InvalidFreeBlockCount.into())
-    }
-
-    fn release_block(&mut self, storage: &mut dyn Storage, block: u64) -> Result<(), Error> {
-        let relative = block
-            .checked_sub(u64::from(self.first_data_block))
-            .ok_or(Corrupt::InvalidBlockBitmap)?;
-        let number = u32::try_from(relative / u64::from(self.blocks_per_group))
-            .map_err(|_| Corrupt::InvalidBlockBitmap)?;
-        let index = relative % u64::from(self.blocks_per_group);
-        let mut group = self.group(storage, number)?;
-        if group.flags & GROUP_BLOCK_UNINIT != 0
-            || group.block_bitmap == 0
-            || group.block_bitmap >= self.blocks_count
-        {
+            (
+                number,
+                relative % u64::from(self.blocks_per_group),
+                self.blocks_count
+                    .saturating_sub(base)
+                    .min(u64::from(self.blocks_per_group)),
+                GROUP_BLOCK_UNINIT,
+            )
+        };
+        if index >= count {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
-        let mut bitmap = Vec::new();
-        bitmap
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bitmap.resize(self.block_size as usize, 0);
-        read_storage(
-            storage,
-            group.block_bitmap * u64::from(self.block_size),
-            &mut bitmap,
-        )?;
-        let byte = bitmap
-            .get_mut(index as usize / 8)
-            .ok_or(Corrupt::InvalidBlockBitmap)?;
+        let mut group = self.group(storage, number)?;
+        let block = if kind.inode() {
+            group.inode_bitmap
+        } else {
+            group.block_bitmap
+        };
+        if group.flags & uninitialized != 0 || block == 0 || block >= self.blocks_count {
+            return Err(Corrupt::InvalidBlockBitmap.into());
+        }
+        let mut bitmap = self.read_bitmap(storage, block)?;
+        let byte = &mut bitmap[index as usize / 8];
         let mask = 1 << (index % 8);
         if *byte & mask == 0 {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
         *byte &= !mask;
-        group.free_blocks = group
-            .free_blocks
-            .checked_add(1)
-            .ok_or(Corrupt::InvalidFreeBlockCount)?;
-        let checksum = self.bitmap_checksum(&bitmap, u64::from(self.blocks_per_group));
-        self.set_bitmap_checksum(&mut group, false, checksum)?;
-        write_storage(
+
+        if kind.inode() {
+            group.free_inodes = group
+                .free_inodes
+                .checked_add(1)
+                .ok_or(Corrupt::InvalidFreeBlockCount)?;
+            if kind.node() {
+                group.used_directories = group
+                    .used_directories
+                    .checked_sub(1)
+                    .ok_or(Corrupt::InvalidFreeBlockCount)?;
+            }
+        } else {
+            group.free_blocks = group
+                .free_blocks
+                .checked_add(1)
+                .ok_or(Corrupt::InvalidFreeBlockCount)?;
+        }
+        self.write_bitmap(storage, &mut group, kind, &bitmap)?;
+        self.update_superblock_counts(
             storage,
-            group.block_bitmap * u64::from(self.block_size),
-            &bitmap,
-        )?;
-        self.write_group(storage, &mut group)?;
-        self.update_superblock_counts(storage, 1, 0)
+            if kind.inode() { 0 } else { 1 },
+            if kind.inode() { 1 } else { 0 },
+        )
+    }
+
+    fn allocate_inode(
+        &mut self,
+        storage: &mut dyn Storage,
+        node: bool,
+    ) -> Result<(u32, u32), Error> {
+        let kind = if node {
+            AllocationKind::Node
+        } else {
+            AllocationKind::Blob
+        };
+        let allocation = self.allocate(storage, kind)?;
+        let inode = u32::try_from(allocation.number).map_err(|_| Corrupt::AddressOverflow)?;
+        let old: Inode128 = read_record(storage, allocation.inode_offset)?;
+        let generation = old.generation.get().wrapping_add(1).max(1);
+        let mut raw = Vec::new();
+        raw.try_reserve_exact(usize::from(self.inode_size))
+            .map_err(|_| Error::OutOfMemory)?;
+        raw.resize(usize::from(self.inode_size), 0);
+        let mut base = Inode128::zeroed();
+        base.mode.set(if node { 0x4000 } else { 0x8000 });
+        base.links_count.set(if node { 2 } else { 1 });
+        base.flags.set(EXTENTS);
+        base.generation.set(generation);
+        let mut root = ExtentLeafRoot::zeroed();
+        root.header.magic.set(EXTENT_MAGIC);
+        root.header.max_entries.set(root.entries.len() as u16);
+        base.block.copy_from_slice(bytemuck::bytes_of(&root));
+        raw[..INODE_BASE_SIZE].copy_from_slice(bytemuck::bytes_of(&base));
+        let mut extra = (raw.len() >= size_of::<Inode160>()).then(InodeExtra32::zeroed);
+        if let Some(extra) = &mut extra {
+            extra.extra_inode_size.set(size_of::<InodeExtra32>() as u16);
+            raw[INODE_BASE_SIZE..size_of::<Inode160>()].copy_from_slice(bytemuck::bytes_of(extra));
+        }
+        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+            let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
+            checksum.update_u32_le(inode);
+            checksum.update_u32_le(generation);
+            checksum.update(&raw);
+            let checksum = checksum.finalize();
+            let mut os_data = LinuxInodeOsData2::zeroed();
+            os_data.checksum_lo.set(checksum as u16);
+            base.os_dependent_2
+                .copy_from_slice(bytemuck::bytes_of(&os_data));
+            raw[..INODE_BASE_SIZE].copy_from_slice(bytemuck::bytes_of(&base));
+            if let Some(extra) = &mut extra {
+                extra.checksum_hi.set((checksum >> 16) as u16);
+                raw[INODE_BASE_SIZE..size_of::<Inode160>()]
+                    .copy_from_slice(bytemuck::bytes_of(extra));
+            }
+        }
+        write_storage(storage, allocation.inode_offset, &raw)?;
+        Ok((inode, generation))
+    }
+
+    fn allocate_block(&mut self, storage: &mut dyn Storage) -> Result<u64, Error> {
+        self.allocate(storage, AllocationKind::Block)
+            .map(|allocation| allocation.number)
+    }
+
+    fn release_block(&mut self, storage: &mut dyn Storage, block: u64) -> Result<(), Error> {
+        self.release_allocation(storage, AllocationKind::Block, block)
     }
 
     fn release_inode(&mut self, storage: &mut dyn Storage, inode: Inode) -> Result<(), Error> {
-        let index = inode
-            .number
-            .checked_sub(1)
-            .ok_or(Corrupt::InvalidInode(inode.number))?;
-        let number = index / self.inodes_per_group;
-        let within = u64::from(index % self.inodes_per_group);
-        let mut group = self.group(storage, number)?;
-        if group.flags & GROUP_INODE_UNINIT != 0
-            || group.inode_bitmap == 0
-            || group.inode_bitmap >= self.blocks_count
-        {
-            return Err(Corrupt::InvalidBlockBitmap.into());
-        }
-        let mut bitmap = Vec::new();
-        bitmap
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bitmap.resize(self.block_size as usize, 0);
-        read_storage(
+        self.release_allocation(
             storage,
-            group.inode_bitmap * u64::from(self.block_size),
-            &mut bitmap,
-        )?;
-        let byte = bitmap
-            .get_mut(within as usize / 8)
-            .ok_or(Corrupt::InvalidBlockBitmap)?;
-        let mask = 1 << (within % 8);
-        if *byte & mask == 0 {
-            return Err(Corrupt::InvalidBlockBitmap.into());
-        }
-        *byte &= !mask;
-        group.free_inodes = group
-            .free_inodes
-            .checked_add(1)
-            .ok_or(Corrupt::InvalidFreeBlockCount)?;
-        if matches!(inode.object(), Object::Node(_)) {
-            group.used_directories = group
-                .used_directories
-                .checked_sub(1)
-                .ok_or(Corrupt::InvalidFreeBlockCount)?;
-        }
-        let checksum = self.bitmap_checksum(&bitmap, u64::from(self.inodes_per_group));
-        self.set_bitmap_checksum(&mut group, true, checksum)?;
-        write_storage(
-            storage,
-            group.inode_bitmap * u64::from(self.block_size),
-            &bitmap,
-        )?;
-        self.write_group(storage, &mut group)?;
-        self.update_superblock_counts(storage, 0, 1)
+            if matches!(inode.object(), Object::Node(_)) {
+                AllocationKind::Node
+            } else {
+                AllocationKind::Blob
+            },
+            u64::from(inode.number),
+        )
     }
 
     fn initialize_node(
@@ -1570,27 +1795,11 @@ impl Ext4 {
             )
             .filter(|end| *end >= 24 && *end <= self.block_size as usize)
             .ok_or(Corrupt::InvalidDirectory)?;
-        write_edge_record(&mut bytes, self.block_size as usize, 0, inode, 12, b".", 2)?;
-        write_edge_record(
-            &mut bytes,
-            self.block_size as usize,
-            12,
-            inode,
-            data_end - 12,
-            b"..",
-            2,
-        )?;
-        if data_end != bytes.len() {
-            let mut tail = DirectoryEntryTail::zeroed();
-            tail.record_length
-                .set(size_of::<DirectoryEntryTail>() as u16);
-            tail.reserved_file_type = 0xde;
-            let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-            checksum.update_u32_le(inode);
-            checksum.update_u32_le(generation);
-            checksum.update(&bytes[..data_end]);
-            tail.checksum.set(checksum.finalize());
-            bytes[data_end..].copy_from_slice(bytemuck::bytes_of(&tail));
+        {
+            let mut block = DirectoryBlock::new(&mut bytes, data_end, self.block_size as usize);
+            block.write(0, inode, 12, b".", 2)?;
+            block.write(12, inode, data_end - 12, b"..", 2)?;
+            block.seal(self.checksum_seed, inode, generation);
         }
         write_storage(storage, block * u64::from(self.block_size), &bytes)
     }
@@ -1729,18 +1938,11 @@ impl Ext4 {
         bytes: &mut [u8],
         data_end: usize,
     ) -> Result<(), Error> {
-        if data_end != bytes.len() {
-            let mut tail = DirectoryEntryTail::zeroed();
-            tail.record_length
-                .set(size_of::<DirectoryEntryTail>() as u16);
-            tail.reserved_file_type = 0xde;
-            let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-            checksum.update_u32_le(inode.number);
-            checksum.update_u32_le(inode.generation);
-            checksum.update(&bytes[..data_end]);
-            tail.checksum.set(checksum.finalize());
-            bytes[data_end..].copy_from_slice(bytemuck::bytes_of(&tail));
-        }
+        DirectoryBlock::new(bytes, data_end, self.block_size as usize).seal(
+            self.checksum_seed,
+            inode.number,
+            inode.generation,
+        );
         self.write_object(
             storage,
             inode.object(),
@@ -3155,23 +3357,12 @@ impl Ext4 {
 
     fn back_edge(&self, storage: &mut dyn Storage, node: Node) -> Result<Node, Error> {
         let inode = self.inode(storage, node.number())?;
-        let (bytes, end) = self.node_block(storage, &inode, 0)?;
-        let mut offset = 0;
-        while offset < end {
-            let entry = record_at::<DirectoryEntryHeader>(&bytes, offset)?;
-            let length = directory_record_length(entry.record_length, self.block_size as usize);
-            let name_length = usize::from(entry.name_length);
-            if length < size_of::<DirectoryEntryHeader>() + name_length || offset + length > end {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-            let name = &bytes[offset + size_of::<DirectoryEntryHeader>()
-                ..offset + size_of::<DirectoryEntryHeader>() + name_length];
-            if entry.inode.get() != 0 && name == b".." {
-                return Ok(Node(entry.inode.get()));
-            }
-            offset += length;
-        }
-        Err(Corrupt::InvalidDirectory.into())
+        let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
+        let block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
+        block
+            .find(b"..")?
+            .map(|(_, header)| Node(header.inode.get()))
+            .ok_or(Corrupt::InvalidDirectory.into())
     }
 
     fn set_back_edge(
@@ -3182,24 +3373,12 @@ impl Ext4 {
     ) -> Result<(), Error> {
         let inode = self.inode(storage, node.number())?;
         let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
-        let mut offset = 0;
-        while offset < end {
-            let mut entry = record_at::<DirectoryEntryHeader>(&bytes, offset)?;
-            let length = directory_record_length(entry.record_length, self.block_size as usize);
-            let name_length = usize::from(entry.name_length);
-            if length < size_of::<DirectoryEntryHeader>() + name_length || offset + length > end {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-            let name = &bytes[offset + size_of::<DirectoryEntryHeader>()
-                ..offset + size_of::<DirectoryEntryHeader>() + name_length];
-            if entry.inode.get() != 0 && name == b".." {
-                entry.inode.set(target.number());
-                write_record_at(&mut bytes, offset, &entry)?;
-                return self.store_node_block(storage, &inode, 0, &mut bytes, end);
-            }
-            offset += length;
+        {
+            let mut block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
+            let (offset, header) = block.find(b"..")?.ok_or(Corrupt::InvalidDirectory)?;
+            block.set_object(offset, header, target.number(), header.file_type)?;
         }
-        Err(Corrupt::InvalidDirectory.into())
+        self.store_node_block(storage, &inode, 0, &mut bytes, end)
     }
 
     /// Replace an ext4 hash index with its equivalent linear edge array.
@@ -3220,43 +3399,28 @@ impl Ext4 {
         }
 
         let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
-        let dot = record_at::<DirectoryEntryHeader>(&bytes, 0)?;
-        let dot_length = directory_record_length(dot.record_length, self.block_size as usize);
-        let dot_name_start = size_of::<DirectoryEntryHeader>();
-        if dot.inode.get() != node.number()
-            || dot.name_length != 1
-            || bytes.get(dot_name_start) != Some(&b'.')
-            || dot_length < 12
-            || dot_length >= end
         {
-            return Err(Corrupt::InvalidDirectory.into());
+            let mut block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
+            let dot = block.record(0)?;
+            let dot_length = dot.length;
+            if dot.header.inode.get() != node.number()
+                || block.name(0, dot) != b"."
+                || dot_length < 12
+                || dot_length >= end
+            {
+                return Err(Corrupt::InvalidDirectory.into());
+            }
+            // The htree root occupies the slack of this `..` record, so its
+            // original length still spans the indexed block rather than the
+            // linear leaf boundary we are about to establish.
+            let parent = block.record_prefix(dot_length)?;
+            let parent_inode = parent.header.inode.get();
+            if parent_inode == 0 || block.name(dot_length, parent) != b".." {
+                return Err(Corrupt::InvalidDirectory.into());
+            }
+            block.write(0, node.number(), dot_length, b".", 2)?;
+            block.write(dot_length, parent_inode, end - dot_length, b"..", 2)?;
         }
-        let parent = record_at::<DirectoryEntryHeader>(&bytes, dot_length)?;
-        let parent_name_start = dot_length + size_of::<DirectoryEntryHeader>();
-        if parent.inode.get() == 0
-            || parent.name_length != 2
-            || bytes.get(parent_name_start..parent_name_start + 2) != Some(&b".."[..])
-        {
-            return Err(Corrupt::InvalidDirectory.into());
-        }
-        write_edge_record(
-            &mut bytes,
-            self.block_size as usize,
-            0,
-            node.number(),
-            dot_length,
-            b".",
-            2,
-        )?;
-        write_edge_record(
-            &mut bytes,
-            self.block_size as usize,
-            dot_length,
-            parent.inode.get(),
-            end - dot_length,
-            b"..",
-            2,
-        )?;
         self.store_node_block(storage, &inode, 0, &mut bytes, end)?;
         self.edit_inode(storage, inode.number, &mut |base, current| {
             if current.generation != inode.generation || current.object() != Object::Node(node) {
@@ -3278,14 +3442,12 @@ impl Ext4 {
         let blocks = inode.size.div_ceil(u64::from(self.block_size));
         for logical in 0..blocks {
             let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
-            if let Some(mut inserted) = insert_edge_record(
-                &mut bytes,
-                self.block_size as usize,
-                end,
+            let inserted = DirectoryBlock::new(&mut bytes, end, self.block_size as usize).insert(
                 name,
                 target.number,
                 Self::edge_type(target),
-            )? {
+            )?;
+            if let Some(mut inserted) = inserted {
                 self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
                 inserted.offset += logical as usize * self.block_size as usize;
                 return Ok(inserted);
@@ -3309,9 +3471,7 @@ impl Ext4 {
             } else {
                 0
             };
-        write_edge_record(
-            &mut bytes,
-            self.block_size as usize,
+        DirectoryBlock::new(&mut bytes, end, self.block_size as usize).write(
             0,
             target.number,
             end,
@@ -3335,13 +3495,8 @@ impl Ext4 {
         let logical = edge.offset / u64::from(self.block_size);
         let within = (edge.offset % u64::from(self.block_size)) as usize;
         let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
-        remove_edge_record(
-            &mut bytes,
-            self.block_size as usize,
-            end,
-            within,
-            edge.object,
-        )?;
+        DirectoryBlock::new(&mut bytes, end, self.block_size as usize)
+            .remove(within, edge.object)?;
         self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
         let target = self.inode(storage, edge.object)?;
         if let Object::Node(node) = target.object() {
@@ -3579,149 +3734,16 @@ fn write_storage(storage: &mut dyn Storage, offset: u64, input: &[u8]) -> Result
     storage.write(offset, input).map_err(Error::Storage)
 }
 
-fn write_edge_record(
-    bytes: &mut [u8],
-    block_size: usize,
-    offset: usize,
-    inode: u32,
-    length: usize,
-    name: &[u8],
-    file_type: u8,
-) -> Result<(), Error> {
-    if inode == 0
-        || name.len() > 255
-        || length < size_of::<DirectoryEntryHeader>() + name.len()
-        || !length.is_multiple_of(4)
-        || offset
-            .checked_add(length)
-            .is_none_or(|end| end > bytes.len())
-    {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    bytes[offset..offset + length].fill(0);
-    let mut header = DirectoryEntryHeader::zeroed();
-    header.inode.set(inode);
-    header.record_length = directory_record_length_to_disk(length, block_size)?;
-    header.name_length = name.len() as u8;
-    header.file_type = file_type;
-    let header_end = offset + size_of::<DirectoryEntryHeader>();
-    bytes[offset..header_end].copy_from_slice(bytemuck::bytes_of(&header));
-    bytes[header_end..header_end + name.len()].copy_from_slice(name);
-    Ok(())
-}
-
 fn edge_record_size(name: &[u8]) -> Result<usize, Error> {
     if name.is_empty() || name.len() > 255 || name == b"." || name == b".." || name.contains(&b'/')
     {
         return Err(Error::InvalidArgument);
     }
-    Ok((size_of::<DirectoryEntryHeader>() + name.len() + 3) & !3)
+    Ok(edge_record_size_unchecked(name.len()))
 }
 
-fn insert_edge_record(
-    bytes: &mut [u8],
-    block_size: usize,
-    end: usize,
-    name: &[u8],
-    object: u32,
-    file_type: u8,
-) -> Result<Option<EdgeInsertion>, Error> {
-    let needed = edge_record_size(name)?;
-    let mut offset = 0;
-    let mut slot = None;
-    while offset < end {
-        let mut entry = record_at::<DirectoryEntryHeader>(bytes, offset)?;
-        let length = directory_record_length(entry.record_length, block_size);
-        let name_length = usize::from(entry.name_length);
-        let used = (size_of::<DirectoryEntryHeader>() + name_length + 3) & !3;
-        if length < used || !length.is_multiple_of(4) || offset + length > end {
-            return Err(Corrupt::InvalidDirectory.into());
-        }
-        let existing = &bytes[offset + size_of::<DirectoryEntryHeader>()
-            ..offset + size_of::<DirectoryEntryHeader>() + name_length];
-        if entry.inode.get() != 0 && existing == name {
-            let replaced = entry.inode.get();
-            entry.inode.set(object);
-            entry.file_type = file_type;
-            write_record_at(bytes, offset, &entry)?;
-            return Ok(Some(EdgeInsertion {
-                offset,
-                replaced: Some(replaced),
-            }));
-        }
-        if slot.is_none() {
-            if entry.inode.get() == 0 && length >= needed {
-                slot = Some((offset, length, None));
-            } else if entry.inode.get() != 0 && length - used >= needed {
-                slot = Some((offset + used, length - used, Some((offset, used))));
-            }
-        }
-        offset += length;
-    }
-    if offset != end {
-        return Err(Corrupt::InvalidDirectory.into());
-    }
-    let Some((offset, available, split)) = slot else {
-        return Ok(None);
-    };
-    if let Some((previous, used)) = split {
-        let mut shortened = record_at::<DirectoryEntryHeader>(bytes, previous)?;
-        shortened.record_length = directory_record_length_to_disk(used, block_size)?;
-        write_record_at(bytes, previous, &shortened)?;
-    }
-    write_edge_record(
-        bytes, block_size, offset, object, available, name, file_type,
-    )?;
-    Ok(Some(EdgeInsertion {
-        offset,
-        replaced: None,
-    }))
-}
-
-fn remove_edge_record(
-    bytes: &mut [u8],
-    block_size: usize,
-    end: usize,
-    wanted: usize,
-    object: u32,
-) -> Result<(), Error> {
-    let mut offset = 0;
-    let mut previous = None;
-    while offset < end {
-        let mut entry = record_at::<DirectoryEntryHeader>(bytes, offset)?;
-        let length = directory_record_length(entry.record_length, block_size);
-        let name_length = usize::from(entry.name_length);
-        if length < size_of::<DirectoryEntryHeader>() + name_length
-            || !length.is_multiple_of(4)
-            || offset + length > end
-        {
-            return Err(Corrupt::InvalidDirectory.into());
-        }
-        if offset == wanted {
-            let name = &bytes[offset + size_of::<DirectoryEntryHeader>()
-                ..offset + size_of::<DirectoryEntryHeader>() + name_length];
-            if entry.inode.get() != object || matches!(name, b"." | b"..") {
-                return Err(Error::NotFound);
-            }
-            if let Some(previous) = previous {
-                let mut left = record_at::<DirectoryEntryHeader>(bytes, previous)?;
-                let combined = directory_record_length(left.record_length, block_size)
-                    .checked_add(length)
-                    .ok_or(Corrupt::InvalidDirectory)?;
-                left.record_length = directory_record_length_to_disk(combined, block_size)?;
-                write_record_at(bytes, previous, &left)?;
-            } else {
-                entry.inode.set(0);
-                entry.name_length = 0;
-                entry.file_type = 0;
-                write_record_at(bytes, offset, &entry)?;
-            }
-            return Ok(());
-        }
-        previous = Some(offset);
-        offset += length;
-    }
-    Err(Error::NotFound)
+fn edge_record_size_unchecked(name_length: usize) -> usize {
+    (size_of::<DirectoryEntryHeader>() + name_length + 3) & !3
 }
 
 pub(crate) fn directory_record_length(record: Le16, block_size: usize) -> usize {
