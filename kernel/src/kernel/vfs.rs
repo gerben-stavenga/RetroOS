@@ -25,10 +25,6 @@ use spin::Mutex;
 use crate::kernel::thread::{FdKind, MAX_FDS};
 use crate::kernel::fs::grant::WriteAccess;
 
-/// Maximum simultaneous open files system-wide. Sized so one thread's full
-/// fd table (MAX_FDS) plus its parents' open files fit without contention.
-const MAX_OPEN_FILES: usize = 128;
-
 /// First usable file descriptor (0=stdin, 1=stdout, 2=stderr)
 const FIRST_FD: usize = 3;
 
@@ -416,8 +412,9 @@ struct Vfs {
     modes: BTreeMap<Vec<u8>, u32>,
     mtimes: BTreeMap<Vec<u8>, u32>,
     locks: Vec<FileLock>,
-    /// Global file table — slot is free when refcount == 0.
-    file_table: [FileEntry; MAX_OPEN_FILES],
+    /// Stable open-file indices. Closed slots are reused and the table grows
+    /// with demand; process handle limits belong to each process's fd/JFT.
+    file_table: Vec<FileEntry>,
     dir_cache: Vec<DirCache>,
     /// Changes whenever directory-visible metadata may have changed. DOS's
     /// 8.3 cache keys off this so a file grown after create is not forever
@@ -427,24 +424,12 @@ struct Vfs {
 
 impl Vfs {
     const fn new() -> Self {
-        const EMPTY: FileEntry = FileEntry {
-            vnode: Vnode { handle: 0, size: 0, mode: 0 },
-            ino: 0,
-            offset: 0,
-            refcount: 0,
-            mount_idx: 0,
-            writable: false,
-            access: OpenAccess::Read,
-            share: SharePolicy::DenyNone,
-            path: [0; PATH_KEY_MAX],
-            path_len: 0,
-        };
         Vfs {
             mounts: Vec::new(),
             modes: BTreeMap::new(),
             mtimes: BTreeMap::new(),
             locks: Vec::new(),
-            file_table: [EMPTY; MAX_OPEN_FILES],
+            file_table: Vec::new(),
             dir_cache: Vec::new(),
             dir_generation: 0,
         }
@@ -709,8 +694,9 @@ impl Vfs {
 
     // ── file table ───────────────────────────────────────────────────────
 
-    fn alloc_file_entry(&self) -> Option<usize> {
-        (0..MAX_OPEN_FILES).find(|&i| self.file_table[i].refcount == 0)
+    fn alloc_file_entry(&self) -> usize {
+        self.file_table.iter().position(|entry| entry.refcount == 0)
+            .unwrap_or(self.file_table.len())
     }
 
     fn install_handle(
@@ -721,11 +707,11 @@ impl Vfs {
         vnode: Vnode,
         writable: bool,
     ) -> i32 {
-        let Some(index) = self.alloc_file_entry() else { return -24 };
+        let index = self.alloc_file_entry();
         let path_len = path.len().min(PATH_KEY_MAX);
         let mut path_key = [0; PATH_KEY_MAX];
         path_key[..path_len].copy_from_slice(&path[..path_len]);
-        self.file_table[index] = FileEntry {
+        let entry = FileEntry {
             vnode,
             offset: 0,
             refcount: 1,
@@ -737,6 +723,11 @@ impl Vfs {
             path: path_key,
             path_len: path_len as u8,
         };
+        if index == self.file_table.len() {
+            self.file_table.push(entry);
+        } else {
+            self.file_table[index] = entry;
+        }
         index as i32
     }
 
@@ -750,7 +741,7 @@ impl Vfs {
     /// independent opens of the same path hold distinct fids and clunk
     /// independently.
     fn close_handle(&mut self, idx: i32) {
-        if idx < 0 || (idx as usize) >= MAX_OPEN_FILES { return; }
+        if idx < 0 || (idx as usize) >= self.file_table.len() { return; }
         let i = idx as usize;
         if self.file_table[i].refcount == 0 { return; }
         self.file_table[i].refcount -= 1;
@@ -763,7 +754,7 @@ impl Vfs {
     }
 
     fn add_ref(&mut self, idx: i32) {
-        if idx >= 0 && (idx as usize) < MAX_OPEN_FILES {
+        if idx >= 0 && (idx as usize) < self.file_table.len() {
             self.file_table[idx as usize].refcount += 1;
         }
     }
@@ -1249,7 +1240,7 @@ impl Vfs {
     }
 
     fn read_by_handle(&mut self, handle: i32, buf: &mut [u8]) -> i32 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
@@ -1263,7 +1254,7 @@ impl Vfs {
     }
 
     fn write_by_handle<A: crate::Arch>(&mut self, _machine: &mut A, handle: i32, data: &[u8]) -> i32 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
@@ -1285,7 +1276,7 @@ impl Vfs {
     }
 
     fn seek_by_handle(&mut self, handle: i32, offset: i32, whence: i32) -> i32 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return -9; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
 
@@ -1304,14 +1295,14 @@ impl Vfs {
     }
 
     fn file_size_by_handle(&self, handle: i32) -> u32 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return 0; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return 0; }
         e.vnode.size
     }
 
     fn handle_writable(&self, handle: i32) -> bool {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return false; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return false; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return false; }
         e.writable
@@ -1361,14 +1352,14 @@ impl Vfs {
     }
 
     fn file_ino_by_handle(&self, handle: i32) -> u64 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return 0; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return 0; }
         e.ino
     }
 
     fn file_mode_by_handle(&self, handle: i32) -> u16 {
-        if handle < 0 || (handle as usize) >= MAX_OPEN_FILES { return 0; }
+        if handle < 0 || (handle as usize) >= self.file_table.len() { return 0; }
         let e = &self.file_table[handle as usize];
         if e.refcount == 0 { return 0; }
         e.vnode.mode
@@ -1931,11 +1922,8 @@ pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
 /// probing (Tomb Raider's CD check).
 pub fn mount_prefix(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<&'static [u8]> {
     let handle = vfs_handle(fds, fd).ok()?;
-    if handle < 0 || (handle as usize) >= MAX_OPEN_FILES {
-        return None;
-    }
     let vfs = VFS.lock();
-    let entry = &vfs.file_table[handle as usize];
+    let entry = vfs.file_table.get(handle as usize)?;
     if entry.refcount == 0 {
         return None;
     }
