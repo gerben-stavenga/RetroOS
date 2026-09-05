@@ -638,6 +638,12 @@ fn int09<A: crate::Arch>(machine: &mut A, dos: &mut super::DosState<A>, regs: &m
         // IBM-compatible BIOSes offer every keyboard byte to INT 15h/AH=4Fh
         // before translating it. CF enters set; the hook may replace AL and
         // returns CF set to continue normal BIOS handling, clear to consume.
+        // This is an asynchronous host-Rust equivalent of a BIOS subroutine
+        // call, so retain INT 9's registers until the control-slot return.
+        dos.int09_registers = [
+            regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp,
+            regs.ds, regs.es, regs.fs, regs.gs,
+        ];
         regs.rax = (regs.rax & !0xFFFF) | u64::from(0x4F00 | u16::from(sc));
         let flags = (machine::vm86_flags(regs) as u16) | 1;
         vm86_push(machine, regs, flags);
@@ -662,6 +668,10 @@ pub(super) fn int09_intercept_return<A: crate::Arch>(
     let accepted = machine::vm86_flags(regs) & 1 != 0;
     let sc = regs.rax as u8;
     finish_int09(machine, dos, regs, sc, accepted);
+    let [rax, rbx, rcx, rdx, rsi, rdi, rbp, ds, es, fs, gs] = dos.int09_registers;
+    [regs.rax, regs.rbx, regs.rcx, regs.rdx, regs.rsi, regs.rdi, regs.rbp,
+     regs.ds, regs.es, regs.fs, regs.gs] =
+        [rax, rbx, rcx, rdx, rsi, rdi, rbp, ds, es, fs, gs];
     // The nested INT 15 frame was consumed on entry to this slot; unwind the
     // original hardware INT 9 frame after completing BIOS processing.
     pop_iret_frame(machine, regs);

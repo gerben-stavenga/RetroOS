@@ -36,6 +36,14 @@ pub struct Framebuffer {
     pub wide: bool,
 }
 
+/// Dense unscaled pixels plus the reusable row used to pack one output scanline.
+pub(crate) struct NativeSource<'a> {
+    pub width: usize,
+    pub height: usize,
+    pub pixels: &'a [u32],
+    pub row: &'a mut alloc::vec::Vec<u8>,
+}
+
 /// The only display interface visible to renderers. Physical geometry, pitch,
 /// mappings, publication policy and VGA ownership stay in the backend.
 pub struct Display {
@@ -505,13 +513,15 @@ impl Display {
                     | VgaScanout::VbeLinear { framebuffer, .. },
                 ..
             } => blit_native(
-                framebuffer, format, out_w, out_h, width, height, pixels, scratch,
+                framebuffer, format, out_w, out_h,
+                NativeSource { width, height, pixels, row: scratch },
             ),
             Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
             } => native.bios_present_native(
-                machine, bios, *mode, current_bank, width, height, pixels, scratch,
+                machine, bios, *mode, current_bank,
+                NativeSource { width, height, pixels, row: scratch },
             ).unwrap_or_else(|error| panic!("banked VBE present failed: {:?}", error)),
             Backend::Host => {
                 let bytes = unsafe {
@@ -792,11 +802,9 @@ fn blit_native(
     format: PixelFormat,
     out_w: usize,
     out_h: usize,
-    source_w: usize,
-    source_h: usize,
-    source: &[u32],
-    row: &mut alloc::vec::Vec<u8>,
+    source: NativeSource<'_>,
 ) -> usize {
+    let NativeSource { width: source_w, height: source_h, pixels: source, row } = source;
     let step = usize::from(format.bytes_per_pixel);
     let Some(source_words) = source_w.checked_mul(source_h) else { return 0 };
     let Some(row_bytes) = out_w.checked_mul(step) else { return 0 };

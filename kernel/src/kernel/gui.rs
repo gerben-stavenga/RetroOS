@@ -294,6 +294,11 @@ struct SwitcherComposition {
     target: Rect,
 }
 
+struct SwitcherRegions<'a> {
+    layout: Option<SwitcherComposition>,
+    damage: &'a [Rect],
+}
+
 pub struct ComposedFrame<'a> {
     pub pixels: &'a mut Vec<u8>,
     pub damage: Vec<Rect>,
@@ -769,7 +774,8 @@ impl WindowManager {
             damage.push(Rect::new(0, 0, width as u32, height as u32));
         }
         desktop.scene.compose_switcher_regions_with(
-            &resolve, width, height, format, composed, switcher, &damage,
+            &resolve, width, height, format, composed,
+            SwitcherRegions { layout: switcher, damage: &damage },
         )?;
         if !damage.is_empty()
             && let Some(point) = desktop.pointer
@@ -1295,12 +1301,12 @@ impl Scene {
         height: usize,
         format: vga::PixelFormat,
         output: &mut Vec<u8>,
-        switcher: Option<SwitcherComposition>,
-        damage: &[Rect],
+        regions: SwitcherRegions<'_>,
     ) -> Result<usize, ComposeError>
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
     {
+        let SwitcherRegions { layout: switcher, damage } = regions;
         if !valid_format(format) {
             return Err(ComposeError::InvalidOutputFormat);
         }

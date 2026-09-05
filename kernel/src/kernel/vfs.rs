@@ -31,6 +31,9 @@ const FIRST_FD: usize = 3;
 /// Maximum length of a normalized path key
 const PATH_KEY_MAX: usize = 164;
 
+type LayerVisitor<'a> =
+    dyn FnMut(u8, &'static dyn Filesystem, &[u8]) -> bool + 'a;
+
 /// Filesystem trait — implemented by PortableExt4Fs, HostFs, etc. POSIX-strict; the
 /// DOS personality wraps this layer with its own case-folding cache (DFS).
 ///
@@ -535,7 +538,7 @@ impl Vfs {
         &self,
         path: &[u8],
         depth: u8,
-        visit: &mut dyn FnMut(u8, &'static dyn Filesystem, &[u8]) -> bool,
+        visit: &mut LayerVisitor<'_>,
     ) -> bool {
         let Some(best) = self.longest_prefix(path) else { return false };
 

@@ -404,8 +404,8 @@ fn synthetic_host_iret_target() -> (u16, u32) {
 // `regs.SS:SP` is the live stack cursor, and `other_stack` holds the
 // cursor for the side not currently executing. First-entry/toggle cases
 // push a `HostContinuation` plus an IRET frame targeting
-// `SLOT_RESUME_CONTINUATION`; nested PM-side IRQs only need a normal IRET
-// frame on the current PM stack.
+// `SLOT_RESUME_CONTINUATION`. Nested PM-side IRQs keep using the current PM
+// stack, but each nesting level still has its own host continuation.
 
 /// Deliver a PM soft INT to the installed handler.
 ///
@@ -462,10 +462,8 @@ pub(super) fn deliver_pm_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::
 ///     the unified continuation resume restores the interrupted
 ///     state, including SS:ESP.
 ///
-///   - **Nested while already on the PM side of a chain**: push only an
-///     IRET frame at `regs.ESP - frame_size` targeting the outer CS:EIP.
-///     No `HostContinuation` is needed because the current PM stack already is
-///     the live cursor and same-privilege IRET can unwind it directly.
+///   - **Nested while already on the PM side of a chain**: keep the current
+///     stack, push another continuation, and return through the same host thunk.
 ///
 /// Works for non-DPMI threads too: `install_kernel_ldt_slots` makes the
 /// LDT + kernel-owned selectors (VECTOR_STUB, SPECIAL_STUB, HOST_STACK_PM*)
@@ -498,7 +496,7 @@ pub(super) const IF_SWITCH_PM: u8 = 1;
 pub(super) const IF_REFLECT_RM: u8 = 2; // reflect_int_to_real_mode (clears IF)
 pub(super) const IF_RESUME_CONTINUATION: u8 = 3;    // resume_continuation_from_stub (pops HostContinuation)
 pub(super) const IF_PM_IRQ_NESTED_DEF: u8 = 4; // deliver_pm_irq nested, default vector (inline reflect)
-pub(super) const IF_PM_IRQ_NESTED: u8 = 5;     // deliver_pm_irq nested, hooked vector (stub return)
+pub(super) const IF_PM_IRQ_NESTED: u8 = 5;     // deliver_pm_irq nested, hooked vector
 pub(super) const IF_PM_IRQ_FIRST: u8 = 6;      // deliver_pm_irq first-entry/toggle
 
 const IF_RING_LEN: usize = 128;
@@ -592,17 +590,9 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
     } else if nested_on_pm {
-        // Nested IRQ into the client's OWN PM handler. We're already on the PM
-        // side so we don't switch, but we MUST still push a HostContinuation
-        // (on the handler's current stack — pm_stack returns regs.SS:SP for
-        // the nested case) and return the handler through SLOT_RESUME_CONTINUATION.
-        // This is load-bearing for the virtual-IF: deliver clears VIF below
-        // (handlers run with interrupts off), and the CPU CANNOT re-enable it on
-        // the handler's IRET — POPF/IRET preserve EFLAGS bits 19/20. Only
-        // resume_continuation, replaying the captured pre-IRQ eflags, puts VIF
-        // back. Without this the nested path left VIF=0 forever: the client's
-        // timer firing inside a DPMI excursion → mainline spins on a tick now
-        // permanently held (VIP=1) — the Doom/Duke3D startup hang in the wild.
+        // The locked PM stack is already active, so don't switch stacks. Keep
+        // one host continuation per nesting level; the handler's architectural
+        // IRET frame returns through the host thunk that releases that level.
         push_continuation(dos, regs, None);
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
         push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
@@ -656,20 +646,8 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
     // body, so `virtual_if_stepping` is off inside it and the handler runs at
     // hardware speed instead of one #DB per instruction.
     //
-    // Stepping exists for exactly one reason: at the pinned real IOPL=1, CLI
-    // and STI still #GP (the monitor keeps tracking VIF exactly), but POPF and
-    // IRET do NOT fault — they silently preserve EFLAGS bits 19/20 — so a
-    // client that re-enables IF that way can only be caught by stepping.
-    // Inside a handler none of that applies:
-    //   * the handler's IRET is routed through SLOT_RESUME_CONTINUATION, which
-    //     replays the captured pre-IRQ eflags and forces VIF back on. The CPU
-    //     never restores VIF on its own here, stepped or not.
-    //   * a PUSHF/POPF pair *inside* the handler pushes an image whose IF slot
-    //     is the handler's own (cleared on entry), so honoring the POPF would
-    //     be a no-op anyway.
-    // The client's own vIOPL rides the HostContinuation pushed above — captured
-    // before this line, put back by `HostContinuation::restore` on unwind — so
-    // the mainline resumes at whatever level it was launched with.
+    // Every hooked handler returns through SLOT_RESUME_CONTINUATION; its host
+    // continuation restores the flags from that nesting level.
     regs.frame.rflags = (regs.frame.rflags & !(machine::IOPL_MASK as u64))
         | machine::IOPL_DEFAULT as u64;
     regs.frame.cs  = sel as u64;
@@ -835,7 +813,10 @@ pub(super) fn vector_stub_reflect<A: crate::Arch>(machine: &mut A, dos: &mut thr
 /// SLOT_RESUME_CONTINUATION. If the saved continuation target is the synthetic
 /// host IRET marker, `resume_continuation_from_stub` restores the PM state and
 /// immediately pops the frame the caller planted on the user stack.
-pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, vector: u8) -> thread::KernelAction {
+pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
+                                                       dos: &mut thread::DosState<A>,
+                                                       regs: &mut Regs, vector: u8)
+                                                       -> thread::KernelAction {
     // Run the RM handler on the dedicated RM stack — never the
     // client's own VM86 stack — so a HW IRQ landing during a sensitive
     // moment in the client (e.g. just after exec_return) can't trample

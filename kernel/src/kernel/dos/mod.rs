@@ -131,6 +131,10 @@ pub struct DosState<A: crate::Arch> {
     /// Current PSP segment as seen by INT 21h/AH=50h (set), 51h (get), 62h (get).
     pub current_psp: u16,
     pub dos_pending_char: Option<u8>,
+    /// INT 9's register image while its optional INT 15/AH=4F interception
+    /// call is executing. A ROM INT 9 saves these around the subcall; our
+    /// host-Rust BIOS resumes it later through SLOT_KBD_INTERCEPT_RETURN.
+    int09_registers: [u64; 11],
     /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
     pub last_child_exit_status: u16,
     pub exec_parent: Option<ExecParent>,
@@ -273,6 +277,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).umb_link_state).write(0);
             core::ptr::addr_of_mut!((*p).current_psp).write(dos::heap_start() + 0x10);
             core::ptr::addr_of_mut!((*p).dos_pending_char).write(None);
+            core::ptr::addr_of_mut!((*p).int09_registers).write([0; 11]);
             core::ptr::addr_of_mut!((*p).last_child_exit_status).write(0);
             core::ptr::addr_of_mut!((*p).exec_parent).write(None);
             core::ptr::addr_of_mut!((*p).xms).write(None);

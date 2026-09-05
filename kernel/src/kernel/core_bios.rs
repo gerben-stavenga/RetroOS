@@ -574,7 +574,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
-        mut buffer: Option<&mut [u8]>,
+        buffer: Option<&mut [u8]>,
         copy_to_bios: bool,
         offset_in_di: bool,
     ) -> Result<(), BiosError> {
@@ -602,7 +602,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 regs.rdx = (Self::STATE_BUFFER & 0xF) as u64;
             }
         }
-        let transfer = match buffer.as_deref_mut() {
+        let transfer = match buffer {
             Some(buffer) if copy_to_bios => BiosTransfer::Input(Self::STATE_BUFFER, buffer),
             Some(buffer) => BiosTransfer::Output(Self::STATE_BUFFER, buffer),
             None => BiosTransfer::None,
@@ -688,18 +688,16 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         display: &mut crate::kernel::platform::VgaCap,
         mode: crate::kernel::platform::VbeMode,
         bank_state: &mut u16,
-        source_width: usize,
-        source_height: usize,
-        pixels: &[u32],
-        row: &mut alloc::vec::Vec<u8>,
+        source: crate::kernel::display::NativeSource<'_>,
     ) -> Result<usize, BiosError> {
+        let crate::kernel::display::NativeSource { width, height, pixels, row } = source;
         self.present_banked_source(
             machine,
             display,
             mode,
             bank_state,
-            source_height,
-            BankedSource::Native { width: source_width, pixels, row },
+            height,
+            BankedSource::Native { width, pixels, row },
         )
     }
 
@@ -1174,26 +1172,16 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
-    pub fn bios_present_native<A: Arch>(
+    pub(crate) fn bios_present_native<A: Arch>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         mode: crate::kernel::platform::VbeMode,
         current_bank: &mut u16,
-        source_width: usize,
-        source_height: usize,
-        pixels: &[u32],
-        row: &mut alloc::vec::Vec<u8>,
+        source: crate::kernel::display::NativeSource<'_>,
     ) -> Result<usize, BiosError> {
         self.bios(bios)?.present_banked_native(
-            machine,
-            self,
-            mode,
-            current_bank,
-            source_width,
-            source_height,
-            pixels,
-            row,
+            machine, self, mode, current_bank, source,
         )
     }
 
