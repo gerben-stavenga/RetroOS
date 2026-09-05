@@ -48,13 +48,15 @@ They are not necessarily additive: a symbol can match more than one category.
 The F12 Profile operation now answers two permanent questions: guest versus
 kernel CPU time, and the distribution of kernel time across loop/OSD work, IRQ
 drain, virtual devices, audio, display, input, event dispatch, and scheduler
-control. It retains the runtime toggle and periodic reports while removing the
+control. It retains the runtime toggle, shows live ratios in the Debug OSD,
+and provides an explicit Print profile action for copyable log output while removing the
 special-purpose port/vector rankings, deepest subsystem probes, heap deltas,
 and block-I/O counters. Those details belong to on-demand tracing.
 
 When profiling is off, one enable check runs per event-loop iteration and no
 timestamp is read. When it is on, phase boundaries update one eight-element
-cycle array. Two generic decimal report lines replace the formatting-heavy
+cycle array and periodically publish an OSD snapshot. Two generic decimal log
+lines are emitted only when requested, replacing the formatting-heavy periodic
 reporter. VGA scanout diagnostics remain available under Trace.
 
 The metal final link also enables LLVM's size-profitable machine outliner.
@@ -64,9 +66,9 @@ inside one prints the raw address and continues with the symbolized caller.
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
 | `kernel.elf` | 882,148 | 869,852 | -12,296 |
-| `.text` | 722,814 | 712,062 | -10,752 |
-| `.rodata` | 141,624 | 141,248 | -376 |
-| `KERNEL.SYM` | 185,505 | 182,291 | -3,214 |
+| `.text` | 722,814 | 711,422 | -11,392 |
+| `.rodata` | 141,624 | 141,380 | -244 |
+| `KERNEL.SYM` | 185,505 | 182,436 | -3,069 |
 
 Repeated symbol names share one string-table entry.
 

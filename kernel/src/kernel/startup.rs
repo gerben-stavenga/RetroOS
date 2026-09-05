@@ -2423,7 +2423,7 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     crate::kernel::dos::dump_gus_ring();
 }
 
-/// Is the periodic `[prof]` dump on? Written by the F12 monitor, read by the
+/// Is cycle profiling on? Written by the F12 monitor, read by the
 /// event loop — the same single-threaded volatile-flag shape as
 /// the window picker's atomic target.
 static mut PROFILE_DUMP: bool = false;
@@ -2435,6 +2435,9 @@ pub fn toggle_profile() {
         core::ptr::write_volatile(&raw mut PROFILE_DUMP, v);
         v
     };
+    if on {
+        unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
+    }
     crate::println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
 
@@ -2479,6 +2482,26 @@ const PROFILE_DISPATCH: usize = 6;
 const PROFILE_SCHEDULER: usize = 7;
 const PROFILE_BUCKETS: usize = 8;
 
+#[derive(Clone, Copy)]
+pub struct ProfileSnapshot {
+    pub guest: u32,
+    pub kernel: u32,
+    pub parts: [u32; PROFILE_BUCKETS],
+    pub cycles: u64,
+}
+
+impl ProfileSnapshot {
+    const EMPTY: Self = Self { guest: 0, kernel: 0, parts: [0; PROFILE_BUCKETS], cycles: 0 };
+}
+
+static mut PROFILE_SNAPSHOT: ProfileSnapshot = ProfileSnapshot::EMPTY;
+static PROFILE_REBASE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+pub fn profile_snapshot() -> ProfileSnapshot {
+    unsafe { core::ptr::read_volatile(&raw const PROFILE_SNAPSHOT) }
+}
+
 fn profile_bytes(bytes: &[u8]) {
     for &byte in bytes {
         lib::log::stream(byte);
@@ -2512,25 +2535,49 @@ fn profile_line(label: &[u8], fields: &[(&[u8], u64)]) {
     profile_bytes(b"\n");
 }
 
+/// Emit the current OSD snapshot as two pasteable log lines. The next phase
+/// marker rebases its clock so formatting and debug-port I/O are not profiled.
+pub fn print_profile() {
+    let s = profile_snapshot();
+    profile_line(b"cpu-permille", &[
+        (b"guest", s.guest as u64),
+        (b"kernel", s.kernel as u64),
+        (b"cycles", s.cycles),
+    ]);
+    profile_line(b"kernel-permille", &[
+        (b"loop", s.parts[PROFILE_LOOP] as u64),
+        (b"irq", s.parts[PROFILE_IRQ] as u64),
+        (b"devices", s.parts[PROFILE_DEVICES] as u64),
+        (b"audio", s.parts[PROFILE_AUDIO] as u64),
+        (b"display", s.parts[PROFILE_DISPLAY] as u64),
+        (b"input", s.parts[PROFILE_INPUT] as u64),
+        (b"dispatch", s.parts[PROFILE_DISPATCH] as u64),
+        (b"scheduler", s.parts[PROFILE_SCHEDULER] as u64),
+    ]);
+    if profile_enabled() {
+        PROFILE_REBASE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Coarse accounting for the two questions the permanent profiler answers:
 /// guest versus kernel time, and which broad kernel phase consumed that time.
 struct EventStats {
     active: bool,
     last_tsc: u64,
-    last_report: u64,
+    last_publish: u64,
     guest_cycles: u64,
     kernel_cycles: [u64; PROFILE_BUCKETS],
 }
 
 impl EventStats {
-    const REPORT_CYCLES: u64 = 2_000_000_000;
+    const PUBLISH_CYCLES: u64 = 100_000_000;
 
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
         let now = machine.rdtsc();
         Self {
             active: false,
             last_tsc: now,
-            last_report: now,
+            last_publish: now,
             guest_cycles: 0,
             kernel_cycles: [0; PROFILE_BUCKETS],
         }
@@ -2549,7 +2596,9 @@ impl EventStats {
                 .wrapping_add(now.wrapping_sub(self.last_tsc));
         } else {
             self.active = true;
-            self.last_report = now;
+            self.last_publish = now;
+            self.guest_cycles = 0;
+            self.kernel_cycles = [0; PROFILE_BUCKETS];
         }
         self.last_tsc = now;
     }
@@ -2559,6 +2608,10 @@ impl EventStats {
             return;
         }
         let now = machine.rdtsc();
+        if PROFILE_REBASE.swap(false, core::sync::atomic::Ordering::Relaxed) {
+            self.last_tsc = now;
+            return;
+        }
         self.kernel_cycles[bucket] = self.kernel_cycles[bucket]
             .wrapping_add(now.wrapping_sub(self.last_tsc));
         self.last_tsc = now;
@@ -2584,13 +2637,9 @@ impl EventStats {
         let now = machine.rdtsc();
         self.guest_cycles = self.guest_cycles.wrapping_add(now.wrapping_sub(self.last_tsc));
         self.last_tsc = now;
-        if now.wrapping_sub(self.last_report) >= Self::REPORT_CYCLES {
-            self.report();
-            self.guest_cycles = 0;
-            self.kernel_cycles = [0; PROFILE_BUCKETS];
-            let now = machine.rdtsc();
-            self.last_tsc = now;
-            self.last_report = now;
+        if now.wrapping_sub(self.last_publish) >= Self::PUBLISH_CYCLES {
+            unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, self.snapshot()) };
+            self.last_publish = now;
         }
     }
 
@@ -2598,27 +2647,22 @@ impl EventStats {
         self.mark(machine, PROFILE_DISPATCH);
     }
 
-    fn report(&self) {
+    fn snapshot(&self) -> ProfileSnapshot {
         let kernel = self.kernel_cycles.iter().copied().fold(0u64, u64::wrapping_add);
         let total = self.guest_cycles.wrapping_add(kernel).max(1);
         let share = |cycles: u64, denominator: u64| {
-            cycles.saturating_mul(1000) / denominator.max(1)
+            (cycles.saturating_mul(1000) / denominator.max(1)) as u32
         };
-        profile_line(b"cpu-permille", &[
-            (b"guest", share(self.guest_cycles, total)),
-            (b"kernel", share(kernel, total)),
-            (b"cycles", total),
-        ]);
-        profile_line(b"kernel-permille", &[
-            (b"loop", share(self.kernel_cycles[PROFILE_LOOP], kernel)),
-            (b"irq", share(self.kernel_cycles[PROFILE_IRQ], kernel)),
-            (b"devices", share(self.kernel_cycles[PROFILE_DEVICES], kernel)),
-            (b"audio", share(self.kernel_cycles[PROFILE_AUDIO], kernel)),
-            (b"display", share(self.kernel_cycles[PROFILE_DISPLAY], kernel)),
-            (b"input", share(self.kernel_cycles[PROFILE_INPUT], kernel)),
-            (b"dispatch", share(self.kernel_cycles[PROFILE_DISPATCH], kernel)),
-            (b"scheduler", share(self.kernel_cycles[PROFILE_SCHEDULER], kernel)),
-        ]);
+        let mut parts = [0; PROFILE_BUCKETS];
+        for (part, &cycles) in parts.iter_mut().zip(&self.kernel_cycles) {
+            *part = share(cycles, kernel);
+        }
+        ProfileSnapshot {
+            guest: share(self.guest_cycles, total),
+            kernel: share(kernel, total),
+            parts,
+            cycles: total,
+        }
     }
 }
 

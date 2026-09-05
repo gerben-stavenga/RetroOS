@@ -8,7 +8,7 @@
 //!
 //! The Windows tab selects windows, toggles the focused window between its
 //! retained fullscreen/windowed modes, and can terminate its task. Trace toggles the shared DOS/DPMI/Linux
-//! syscall-trace gate, Profile the profile-dump toggle, Dump the register/VGA
+//! syscall-trace gate, Profile live cycle accounting, Dump the register/VGA
 //! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
 //! `Exit` for the focused thread, exactly as the SEGV path does). Volume is the
 //! one new knob: a runtime master gain multiplied into the single mix-out clip.
@@ -47,10 +47,15 @@ const SOUND_NUM_ITEMS_WITH_HDA_OUTPUT: usize = 4;
 
 const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
-const DEBUG_ITEM_DUMP: usize = 2;
-const DEBUG_ITEM_VIF_WINDOWS: usize = 3;
-const DEBUG_ITEM_VIF_TRAPS: usize = 4;
-const DEBUG_NUM_ITEMS_BASE: usize = 3;
+const DEBUG_ITEM_PRINT_PROFILE: usize = 2;
+const DEBUG_ITEM_DUMP: usize = 3;
+const DEBUG_ITEM_PROFILE_CPU: usize = 4;
+const DEBUG_ITEM_PROFILE_LOOP_IRQ: usize = 5;
+const DEBUG_ITEM_PROFILE_DEV_AUDIO: usize = 6;
+const DEBUG_ITEM_PROFILE_DISPLAY_INPUT: usize = 7;
+const DEBUG_ITEM_PROFILE_DISPATCH_SCHED: usize = 8;
+const DEBUG_NUM_ITEMS_BASE: usize = 4;
+const DEBUG_PROFILE_ROWS: usize = 5;
 
 /// Master volume step, adjusted by ◄/► on the Volume row. The displayed
 /// percentage selects a perceptual gain step; 100 is unity.
@@ -241,7 +246,12 @@ fn sound_item_count() -> usize {
 }
 
 fn debug_item_count() -> usize {
-    DEBUG_NUM_ITEMS_BASE + 2 * usize::from(VIF_STATS_VISIBLE.load(Ordering::Relaxed))
+    debug_vif_base() + 2 * usize::from(VIF_STATS_VISIBLE.load(Ordering::Relaxed))
+}
+
+fn debug_vif_base() -> usize {
+    DEBUG_NUM_ITEMS_BASE
+        + DEBUG_PROFILE_ROWS * usize::from(crate::kernel::startup::profile_enabled())
 }
 
 /// The Disk tab shows ONE device at a time — A:, B:, or CD, cycled with
@@ -695,6 +705,7 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
             // Toggle each diagnostic and stay open so the new state shows on the row.
             DEBUG_ITEM_TRACE => crate::kernel::startup::toggle_trace(),
             DEBUG_ITEM_PROFILE => crate::kernel::startup::toggle_profile(),
+            DEBUG_ITEM_PRINT_PROFILE => crate::kernel::startup::print_profile(),
             DEBUG_ITEM_DUMP => {
                 crate::kernel::startup::dump_interrupted_thread(machine, regs, dos);
                 close();
@@ -1198,14 +1209,50 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                 line.put(b"Profile  ");
                 line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
             }
+            DEBUG_ITEM_PRINT_PROFILE => line.put(b"Print profile"),
             DEBUG_ITEM_DUMP => line.put(b"Dump state"),
-            DEBUG_ITEM_VIF_WINDOWS => {
+            DEBUG_ITEM_PROFILE_CPU if crate::kernel::startup::profile_enabled() => {
+                let s = crate::kernel::startup::profile_snapshot();
+                line.put(b"CPU guest/kernel ");
+                line.put_permille(s.guest);
+                line.put(b"/");
+                line.put_permille(s.kernel);
+            }
+            DEBUG_ITEM_PROFILE_LOOP_IRQ if crate::kernel::startup::profile_enabled() => {
+                let s = crate::kernel::startup::profile_snapshot();
+                line.put(b"Kernel loop/irq ");
+                line.put_permille(s.parts[0]);
+                line.put(b"/");
+                line.put_permille(s.parts[1]);
+            }
+            DEBUG_ITEM_PROFILE_DEV_AUDIO if crate::kernel::startup::profile_enabled() => {
+                let s = crate::kernel::startup::profile_snapshot();
+                line.put(b"Kernel dev/audio ");
+                line.put_permille(s.parts[2]);
+                line.put(b"/");
+                line.put_permille(s.parts[3]);
+            }
+            DEBUG_ITEM_PROFILE_DISPLAY_INPUT if crate::kernel::startup::profile_enabled() => {
+                let s = crate::kernel::startup::profile_snapshot();
+                line.put(b"Kernel disp/input ");
+                line.put_permille(s.parts[4]);
+                line.put(b"/");
+                line.put_permille(s.parts[5]);
+            }
+            DEBUG_ITEM_PROFILE_DISPATCH_SCHED if crate::kernel::startup::profile_enabled() => {
+                let s = crate::kernel::startup::profile_snapshot();
+                line.put(b"Kernel dsp/sched ");
+                line.put_permille(s.parts[6]);
+                line.put(b"/");
+                line.put_permille(s.parts[7]);
+            }
+            item if item == debug_vif_base() => {
                 line.put(b"VIF windows/pred ");
                 line.put_num(VIF_WINDOWS.load(Ordering::Relaxed));
                 line.put(b"/");
                 line.put_num(VIF_PREDICTED.load(Ordering::Relaxed));
             }
-            DEBUG_ITEM_VIF_TRAPS => {
+            item if item == debug_vif_base() + 1 => {
                 line.put(b"VIF traps/steps  ");
                 line.put_num(VIF_DEBUG_TRAPS.load(Ordering::Relaxed));
                 line.put(b"/");
@@ -1265,6 +1312,13 @@ impl Line {
                 self.len += 1;
             }
         }
+    }
+
+    fn put_permille(&mut self, n: u32) {
+        self.put_num(n / 10);
+        self.put(b".");
+        self.put_num(n % 10);
+        self.put(b"%");
     }
 
     fn put_3digits(&mut self, n: u32) {
