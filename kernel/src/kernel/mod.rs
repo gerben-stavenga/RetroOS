@@ -28,7 +28,6 @@ pub mod irq_dispatch;
 pub mod platform;
 
 // ── Diagnostics ─────────────────────────────────────────────────────────
-pub mod iostat;
 pub mod klog;
 pub mod osd;
 pub mod stacktrace;

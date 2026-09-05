@@ -1248,8 +1248,6 @@ pub fn audio_service<A: crate::Arch>(
     pushed: u64,
 ) {
     let PcMachine { sb, gus, mpu, vpic, .. } = pc;
-    let prof = crate::kernel::startup::profile_enabled();
-    let t0 = if prof { machine.rdtsc() } else { 0 };
     // Latched probe/trigger IRQs are the emulated card's business: a real one
     // raises its own line and the relay carries it.
     let SoundBlaster { blaster, device } = sb;
@@ -1257,17 +1255,10 @@ pub fn audio_service<A: crate::Arch>(
         emu.deliver_trigger_irq(vpic, blaster.irq);
         emu.deliver_probe_irq(now_ns, vpic, blaster.irq);
     }
-    let t1 = if prof { machine.rdtsc() } else { 0 };
     if dt_ns != 0 {
         gus.advance(dt_ns, vpic);
     }
-    let t2 = if prof { machine.rdtsc() } else { 0 };
     mpu.tick(machine, pushed);
-    if prof {
-        let t3 = machine.rdtsc();
-        crate::kernel::startup::bill_audio_service(
-            t1.wrapping_sub(t0), t2.wrapping_sub(t1), t3.wrapping_sub(t2));
-    }
 }
 
 /// Mix one CPU-clocked producer span and advance producer-side device clocks.
@@ -1298,17 +1289,8 @@ pub fn audio_tick<A: crate::Arch>(
         PcmSource::Midi(mpu),
         PcmSource::Speaker(spk),
     ];
-    let prof = crate::kernel::startup::profile_enabled();
-    let mut source_cycles = [0u64; 4];
-    for (i, source) in sources.iter_mut().enumerate() {
-        let t0 = if prof { machine.rdtsc() } else { 0 };
+    for source in &mut sources {
         source.mix_into(machine, span.rate, span.base_frame, span.frames);
-        if prof {
-            source_cycles[i] = machine.rdtsc().wrapping_sub(t0);
-        }
-    }
-    if prof {
-        crate::kernel::startup::bill_audio_sources(source_cycles);
     }
 
     if let Some(emu) = sb {

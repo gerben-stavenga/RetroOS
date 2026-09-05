@@ -1777,13 +1777,6 @@ fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs
     }
 }
 
-/// The real-mode segment holding the IVT stub array — every unhooked INT
-/// lands here. Exposed so the profiler can decode which service a trap was
-/// for: the stub slot index IS the original vector.
-pub fn stub_seg() -> u16 {
-    dos::STUB_SEG
-}
-
 /// Descriptor state at a client #GP: which selectors were loaded, what they
 /// actually covered, and where the Voodoo aperture sits — enough to say
 /// whether the faulting address was simply past a limit. First few only: a

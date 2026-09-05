@@ -26,7 +26,7 @@ static DIAG_RENDERS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
 fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash: u32) {
-    if !crate::kernel::startup::profile_enabled() {
+    if !crate::kernel::startup::trace_enabled() {
         return;
     }
     let black = nonzero == 0;
@@ -593,7 +593,6 @@ pub fn display_tick<A: crate::Arch>(
     };
     let vga = &mut dev.state;
     if display.is_headless() { return; }
-    let prof = crate::kernel::startup::profile_enabled();
     if !display.is_host() {
         // Direct framebuffer: phase zero is guest-visible retrace. Its
         // trailing edge renders one complete immutable shadow; the following
@@ -620,7 +619,6 @@ pub fn display_tick<A: crate::Arch>(
         ) {
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
-                let p0 = if prof { machine.rdtsc() } else { 0 };
                 let full = (0, ::vga::dimensions(mode).1);
                 // The source aperture, registers and DAC are captured once for
                 // the whole shadow; no palette generation can split the image.
@@ -629,7 +627,6 @@ pub fn display_tick<A: crate::Arch>(
                 else {
                     return;
                 };
-                let p1 = if prof { machine.rdtsc() } else { 0 };
                 let shadow_format = if presentation.is_some() {
                     ::vga::PixelFormat::NATIVE
                 } else {
@@ -644,37 +641,23 @@ pub fn display_tick<A: crate::Arch>(
                     let (width, height) = ::vga::dimensions(frame.mode);
                     publish_vga_surface(width, height, desktop, *endpoint);
                 }
-                if rendered && prof {
+                if rendered && crate::kernel::startup::trace_enabled() {
                     let (nonzero, hash) =
                         crate::kernel::display::shadow_sample(&pc.present_scratch2);
                     diagnose_shadow(vga, frame.mode, nonzero, hash);
-                }
-                if prof {
-                    let p2 = machine.rdtsc();
-                    crate::kernel::startup::bill_display(
-                        frame.mode,
-                        p1.wrapping_sub(p0),
-                        rendered as u64,
-                        p2.wrapping_sub(p1),
-                        0,
-                        0,
-                    );
                 }
             }
             crate::kernel::display::ScanoutAction::Publish {
                 vga_height: vga_h,
                 out_width: out_w,
             } => {
-                let p0 = if prof { machine.rdtsc() } else { 0 };
                 debug_assert!(presentation.is_some() || display.shadow_width == out_w);
-                let copied = if presentation.is_some() {
-                    // A retained surface became available at Render, when its
-                    // producer actually changed the pixels. This later phase
-                    // exists only to transfer direct-scanout shadows.
-                    0
-                } else {
+                // A retained surface became available at Render, when its
+                // producer actually changed the pixels. This later phase
+                // exists only to transfer direct-scanout shadows.
+                if presentation.is_none() {
                     let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-                    let copied = display.present_native(
+                    display.present_native(
                         machine,
                         &mut *bios,
                         ::vga::dimensions(mode).0,
@@ -682,18 +665,6 @@ pub fn display_tick<A: crate::Arch>(
                         &pixels,
                     );
                     crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
-                    copied
-                };
-                let present_cycles = if prof {
-                    machine.rdtsc().wrapping_sub(p0)
-                } else {
-                    0
-                };
-                crate::kernel::startup::bill_present();
-                if prof {
-                    crate::kernel::startup::bill_display(
-                        mode, 0, 0, 0, present_cycles, copied,
-                    );
                 }
             }
         }
@@ -703,14 +674,11 @@ pub fn display_tick<A: crate::Arch>(
     if !frame_due(now_ns, 70) {
         return;
     }
-    crate::kernel::startup::bill_present();
-    let p0 = if prof { machine.rdtsc() } else { 0 };
     // Whole-frame sink: `render` walks every row, so capture the full frame.
     let full = vga.current_mode().map_or((0, 0), |m| (0, ::vga::dimensions(m).1));
     let Some(frame) = scanout(
         vga, machine, regs, &mut pc.present_scratch, full, svga_start,
     ) else { return };
-    let p1 = if prof { machine.rdtsc() } else { 0 };
     let (w, h) = ::vga::dimensions(frame.mode);
     let rendered = crate::kernel::display::render_frame(
         &mut pc.present_scratch2,
@@ -718,7 +686,6 @@ pub fn display_tick<A: crate::Arch>(
         &frame,
     );
     if !rendered { return }
-    let p2 = if prof { machine.rdtsc() } else { 0 };
     display.shadow_width = w;
     if let Some((desktop, endpoint)) = presentation {
         publish_vga_surface(w, h, desktop, endpoint);
@@ -726,11 +693,5 @@ pub fn display_tick<A: crate::Arch>(
         let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
         display.present_native(machine, bios, w, h, &pixels);
         crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
-    }
-    if prof {
-        let p3 = machine.rdtsc();
-        crate::kernel::startup::bill_display(
-            frame.mode, p1.wrapping_sub(p0), 1, p2.wrapping_sub(p1),
-            p3.wrapping_sub(p2), w * h);
     }
 }

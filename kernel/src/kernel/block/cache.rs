@@ -117,7 +117,6 @@ impl CachedDisk {
         // Build directly in the heap. `Box::new([0; 4096])` may materialize
         // the array on the small metal kernel stack before moving it.
         let mut data = alloc::vec![0u8; PAGE_SIZE].into_boxed_slice();
-        crate::kernel::iostat::vol_read(available.div_ceil(512) as u64);
         if self.inner.read(page.saturating_mul(PAGE_SECTORS), &mut data[..available])
             as usize
             != available.div_ceil(512)

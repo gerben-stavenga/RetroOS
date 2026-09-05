@@ -243,10 +243,6 @@ pub fn advance<A: crate::Arch>(
     dt_ns: u64,
     mut mix: impl FnMut(&mut A, AudioSpan<'_>),
 ) {
-    let prof = crate::kernel::startup::profile_enabled();
-    let profile_start = if prof { machine.rdtsc() } else { 0 };
-    let mut device_cycles = 0u64;
-    let mut output_cycles = 0u64;
     let mut elapsed_ns = dt_ns;
     let mut written = 0;
     let mut consumed = 0;
@@ -312,7 +308,6 @@ pub fn advance<A: crate::Arch>(
     }
 
     let gain_q16 = sink.as_ref().map(|_| crate::kernel::osd::master_gain_q16());
-    let setup_end = if prof { machine.rdtsc() } else { 0 };
     // Two different rates come out of the controller, and conflating them is
     // what detunes the mix. `rate_q16` is the effective rate `s - 2w q`: it
     // carries the dashpot's queue-noise on purpose, and its job is to set how
@@ -339,20 +334,13 @@ pub fn advance<A: crate::Arch>(
     while remaining > 0 {
         let run = usize::try_from(remaining.min(MIX_CHUNK as u64)).unwrap();
         frames[..run].fill((0, 0));
-        let t0 = if prof { machine.rdtsc() } else { 0 };
         mix(machine, AudioSpan {
             rate: mix_rate,
             base_frame: base,
             frames: &mut frames[..run],
         });
-        let t1 = if prof { machine.rdtsc() } else { 0 };
-        device_cycles = device_cycles.wrapping_add(t1.wrapping_sub(t0));
         if let (Some(output), Some(gain_q16)) = (sink.as_deref_mut(), gain_q16) {
             output.play(&frames[..run], gain_q16);
-        }
-        if prof {
-            let t2 = machine.rdtsc();
-            output_cycles = output_cycles.wrapping_add(t2.wrapping_sub(t1));
         }
         base += run as u64;
         remaining -= run as u64;
@@ -363,19 +351,6 @@ pub fn advance<A: crate::Arch>(
     // longer describes anything audible. The instantaneous rate and its
     // deviation from `s` stay visible through the trace/census diagnostics.
     publish_mixing_rate_q16(pitch_rate_q16);
-
-    if prof {
-        let profile_end = machine.rdtsc();
-        let setup_cycles = setup_end.wrapping_sub(profile_start);
-        let accounted = setup_cycles
-            .wrapping_add(device_cycles)
-            .wrapping_add(output_cycles);
-        let clocks = profile_end.wrapping_sub(profile_start).saturating_sub(accounted);
-        crate::kernel::startup::bill_audio(
-            device_cycles, setup_cycles, output_cycles, clocks, produced);
-        crate::kernel::startup::bill_slice2(
-            0, 0, 0, profile_end.wrapping_sub(profile_start), 0);
-    }
 
     let Some(output) = sink else { return };
 

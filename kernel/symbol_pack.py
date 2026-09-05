@@ -22,6 +22,8 @@ def main() -> None:
         if len(fields) != 4 or fields[1] not in "tTwW":
             continue
         name, _, address, size = fields
+        if re.fullmatch(r"OUTLINED_FUNCTION_\d+", name):
+            continue
         address = int(address, 16)
         size = int(size, 16)
         if address:
@@ -50,12 +52,16 @@ def main() -> None:
     # Crate disambiguators make linker symbols unique but add no useful context
     # to a backtrace. Removing them also saves about 40 KB in KERNEL.SYM.
     names = bytearray()
+    name_offsets = {}
     entries = bytearray()
     for (address, size, _), name in zip(symbols, demangled):
         name = re.sub(r"\[[0-9a-f]{16}\]", "", name)
-        name_offset = len(names)
-        names.extend(name.encode("utf-8"))
-        names.append(0)
+        name_offset = name_offsets.get(name)
+        if name_offset is None:
+            name_offset = len(names)
+            name_offsets[name] = name_offset
+            names.extend(name.encode("utf-8"))
+            names.append(0)
         entries.extend(struct.pack("<III", address, size, name_offset))
 
     names_offset = 16 + len(entries)

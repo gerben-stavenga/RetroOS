@@ -1215,9 +1215,8 @@ pub fn event_loop<A: crate::Arch>(
 
     loop {
         stats.slice_begin(machine);
-        stats.iteration(machine);
         let mut events = crate::kernel::irq_dispatch::drain(machine);
-        stats.part(machine, 1);
+        stats.part(machine, PROFILE_IRQ);
         let tick_wakeup = events
             .iter()
             .any(|event| matches!(event, crate::Irq::Hw(0)));
@@ -1241,7 +1240,7 @@ pub fn event_loop<A: crate::Arch>(
                 !windows.uses_desktop(),
             );
         }
-        stats.part(machine, 0);
+        stats.part(machine, PROFILE_LOOP);
         // The queue is cheap to drain when empty and carries the IRQ0 wakeup
         // which gates clock sampling, so it cannot itself be clock-gated.
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
@@ -1269,6 +1268,7 @@ pub fn event_loop<A: crate::Arch>(
                 elapsed_ns,
                 audio_clock.produced_frames(),
             );
+            stats.mark(machine, PROFILE_DEVICES);
             if thread.kernel.state == thread::ThreadState::Blocked
                 && thread.personality.has_pending_message()
             {
@@ -1283,6 +1283,7 @@ pub fn event_loop<A: crate::Arch>(
                     |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
                 );
             }
+            stats.mark(machine, PROFILE_AUDIO);
             if elapsed_ns != 0
                 && let Some(display) = display.as_mut()
             {
@@ -1297,6 +1298,7 @@ pub fn event_loop<A: crate::Arch>(
                     endpoint,
                 );
             }
+            stats.mark(machine, PROFILE_DISPLAY);
         }
         // OSD publication is deliberately capped at 20 Hz regardless of the
         // physical sink. DOS scanout keeps its independent guest-visible beam
@@ -1330,8 +1332,8 @@ pub fn event_loop<A: crate::Arch>(
                 &mut windows,
             );
         }
+        stats.mark(machine, PROFILE_DISPLAY);
         let thread = ctx.thread(threads);
-        stats.part(machine, 2);
         crate::kernel::console::dispatch(
             machine,
             &mut *bios_workspace,
@@ -1376,11 +1378,11 @@ pub fn event_loop<A: crate::Arch>(
                 &windows,
             );
         }
-        stats.part(machine, 3);
+        stats.part(machine, PROFILE_INPUT);
         thread
             .personality
             .after_input(machine, &mut thread.kernel, &mut ctx.regs);
-        stats.part(machine, 4);
+        stats.part(machine, PROFILE_INPUT);
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
@@ -2421,105 +2423,6 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     crate::kernel::dos::dump_gus_ring();
 }
 
-/// Event-loop diagnostics: per-event-type counts, user/kernel cycle split,
-/// the periodic [prof] dump, and the free-page low-water sampling. Keeps
-/// the loop body logic, not bookkeeping.
-/// Event-loop world-advance costs, billed from `thread.rs`: timer/device work,
-/// display, audio, and tick count. Diagnostic only — read by the profile dump.
-static mut SLICE_PARTS: [u64; 5] = [0; 5];
-
-/// Count of actual frame presentations (past the frame_due gate), so the
-/// tick+display total can be divided by the right denominator.
-static mut PRESENTS: u64 = 0;
-
-/// display_tick's internals: scanout cycles, render-pass count (one complete
-/// shadow or one whole window-sink frame per bill), VGA render cycles, final
-/// framebuffer/window publication cycles, and destination pixels written.
-static mut DISP_PARTS: [u64; 5] = [0; 5];
-static mut DISP_MODE: vga::VgaMode = vga::VgaMode::Text {
-    cols: 80,
-    rows: 25,
-    cell_w: 9,
-    cell_h: 16,
-};
-
-pub fn bill_display(
-    mode: vga::VgaMode,
-    scanout: u64,
-    renders: u64,
-    render: u64,
-    present: u64,
-    px: usize,
-) {
-    unsafe {
-        core::ptr::write_volatile(&raw mut DISP_MODE, mode);
-        let p = &raw mut DISP_PARTS;
-        (*p)[0] = (*p)[0].wrapping_add(scanout);
-        (*p)[1] = (*p)[1].wrapping_add(renders);
-        (*p)[2] = (*p)[2].wrapping_add(render);
-        (*p)[3] = (*p)[3].wrapping_add(present);
-        (*p)[4] = (*p)[4].wrapping_add(px as u64);
-    }
-}
-
-/// Audio-pump diagnostics: device maintenance, pacing setup, source mixing and
-/// sink output, guest clocks/IRQ delivery, and canonical frames generated.
-static mut AUDIO_PARTS: [u64; 5] = [0; 5];
-/// `audio_service` split: Sound Blaster, GUS, MPU-401. This runs outside the
-/// sample pump and used to disappear into `world-other` on zero-tick exits.
-static mut AUDIO_SERVICE_PARTS: [u64; 3] = [0; 3];
-/// Mixer source split: Sound Blaster, GUS, MPU/GM synth, PC speaker.
-static mut AUDIO_SOURCE_PARTS: [u64; 4] = [0; 4];
-
-pub fn bill_audio(devices: u64, setup: u64, pump: u64, clocks: u64, frames: u64) {
-    unsafe {
-        let p = &raw mut AUDIO_PARTS;
-        (*p)[0] = (*p)[0].wrapping_add(devices);
-        (*p)[1] = (*p)[1].wrapping_add(setup);
-        (*p)[2] = (*p)[2].wrapping_add(pump);
-        (*p)[3] = (*p)[3].wrapping_add(clocks);
-        (*p)[4] = (*p)[4].wrapping_add(frames);
-    }
-}
-
-pub fn bill_audio_service(sb: u64, gus: u64, mpu: u64) {
-    unsafe {
-        let p = &raw mut AUDIO_SERVICE_PARTS;
-        (*p)[0] = (*p)[0].wrapping_add(sb);
-        (*p)[1] = (*p)[1].wrapping_add(gus);
-        (*p)[2] = (*p)[2].wrapping_add(mpu);
-    }
-}
-
-pub fn bill_audio_sources(parts: [u64; 4]) {
-    unsafe {
-        let p = &raw mut AUDIO_SOURCE_PARTS;
-        for (i, part) in parts.into_iter().enumerate() {
-            (*p)[i] = (*p)[i].wrapping_add(part);
-        }
-    }
-}
-
-pub fn bill_present() {
-    unsafe {
-        let p = &raw mut PRESENTS;
-        *p = (*p).wrapping_add(1);
-    }
-}
-
-/// Timer acquisition, device tick loop, display, audio, and the tick count —
-/// each can be billed independently and divided by its own denominator.
-pub fn bill_slice2(take: u64, timer_cyc: u64, display: u64, audio: u64, advances: u64) {
-    unsafe {
-        let p = &raw mut SLICE_PARTS;
-        (*p)[0] = (*p)[0].wrapping_add(take);
-        (*p)[1] = (*p)[1].wrapping_add(timer_cyc);
-        (*p)[2] = (*p)[2].wrapping_add(display);
-        (*p)[3] = (*p)[3].wrapping_add(audio);
-        (*p)[4] = (*p)[4].wrapping_add(advances);
-    }
-}
-
 /// Is the periodic `[prof]` dump on? Written by the F12 monitor, read by the
 /// event loop — the same single-threaded volatile-flag shape as
 /// the window picker's atomic target.
@@ -2566,537 +2469,156 @@ pub fn trace_enabled() -> bool {
     unsafe { core::ptr::read_volatile(&raw const SYSCALL_TRACE) }
 }
 
+const PROFILE_LOOP: usize = 0;
+const PROFILE_IRQ: usize = 1;
+const PROFILE_DEVICES: usize = 2;
+const PROFILE_AUDIO: usize = 3;
+const PROFILE_DISPLAY: usize = 4;
+const PROFILE_INPUT: usize = 5;
+const PROFILE_DISPATCH: usize = 6;
+const PROFILE_SCHEDULER: usize = 7;
+const PROFILE_BUCKETS: usize = 8;
+
+fn profile_bytes(bytes: &[u8]) {
+    for &byte in bytes {
+        lib::log::stream(byte);
+    }
+}
+
+fn profile_u64(mut value: u64) {
+    let mut digits = [0u8; 20];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    profile_bytes(&digits[at..]);
+}
+
+/// One shared report encoder keeps profiling independent of `core::fmt`.
+fn profile_line(label: &[u8], fields: &[(&[u8], u64)]) {
+    profile_bytes(b"[prof] ");
+    profile_bytes(label);
+    for &(name, value) in fields {
+        profile_bytes(b" ");
+        profile_bytes(name);
+        profile_bytes(b"=");
+        profile_u64(value);
+    }
+    profile_bytes(b"\n");
+}
+
+/// Coarse accounting for the two questions the permanent profiler answers:
+/// guest versus kernel time, and which broad kernel phase consumed that time.
 struct EventStats {
-    iterations: u64,
-    min_free: usize,
-    last_free: usize,
-    user_cycles: u64,
-    kernel_cycles: u64,
-    /// Kernel time split by phase, to localize it: `pre` is the per-event
-    /// world-advance before the guest runs (advance_world, console drain,
-    /// after_input); `post` is dispatch + scheduler afterwards.
-    pre_cycles: u64,
-    post_cycles: u64,
-    /// Cycles spent in `dispatch` per event kind — the same 11 slots as
-    /// `counts`, so dividing one by the other gives cost-per-event.
-    dispatch_cycles: [u64; 11],
-    /// Exact pre-run routine split: event bookkeeping/OSD, hardware IRQ drain,
-    /// advance_world, console dispatch, personality after_input.
-    pre_parts: [u64; 5],
-    part_mark: u64,
-    slice_start: u64,
-    last_idx: usize,
-    last_kernel_entry: u64,
-    guest_entry_cs: u16,
-    guest_entry_ip: u32,
-    guest_entry_flags: u32,
-    longest_guest_cycles: u64,
-    longest_guest_entry_cs: u16,
-    longest_guest_entry_ip: u32,
-    longest_guest_entry_flags: u32,
-    longest_guest_exit_cs: u16,
-    longest_guest_exit_ip: u32,
-    longest_guest_exit_flags: u32,
-    longest_guest_exit_kind: usize,
-    last_profile_dump: u64,
-    last_allocations: u32,
-    last_deallocations: u32,
-    counts: [u32; 11], // irq, softint, hlt, in, out, ins, outs, fault, pf, exc, syscall
-    /// Port I/O by PORT — a small associative table rather than a 64K array,
-    /// which would not fit the kernel stack. Ports that matter are few; once
-    /// the table is full the rest aggregate into `port_other`.
-    ports: [(u16, u32, u64); 12], // (port, accesses, dispatch cycles)
-    port_other: u32,
-    last_port: Option<u16>,
-    /// Software interrupts BY VECTOR. The aggregate above says the guest is
-    /// trapping a lot; only this says which service it is asking for, which is
-    /// the difference between a number and a lead.
-    softint_by_vec: [u32; 256],
+    active: bool,
+    last_tsc: u64,
+    last_report: u64,
+    guest_cycles: u64,
+    kernel_cycles: [u64; PROFILE_BUCKETS],
 }
 
 impl EventStats {
-    /// Sampling cadence for the free-page low-water mark.
-    const MEM_DUMP_PERIOD: u64 = 1000;
-    /// Profile dump cadence. Roughly assume 2 GHz host; only used to format
-    /// the dump as seconds. Off by a constant factor but the ratio is exact.
-    const PROFILE_DUMP_CYCLES: u64 = 2_000_000_000;
+    const REPORT_CYCLES: u64 = 2_000_000_000;
+
     fn new<A: crate::Arch>(machine: &mut A) -> Self {
-        let free = machine.free_page_count();
         let now = machine.rdtsc();
-        let (allocations, deallocations) = lib::heap::allocation_counts();
-        EventStats {
-            iterations: 0,
-            min_free: free,
-            last_free: free,
-            user_cycles: 0,
-            kernel_cycles: 0,
-            pre_cycles: 0,
-            post_cycles: 0,
-            dispatch_cycles: [0; 11],
-            pre_parts: [0; 5],
-            part_mark: 0,
-            slice_start: 0,
-            last_idx: 0,
-            last_kernel_entry: now,
-            guest_entry_cs: 0,
-            guest_entry_ip: 0,
-            guest_entry_flags: 0,
-            longest_guest_cycles: 0,
-            longest_guest_entry_cs: 0,
-            longest_guest_entry_ip: 0,
-            longest_guest_entry_flags: 0,
-            longest_guest_exit_cs: 0,
-            longest_guest_exit_ip: 0,
-            longest_guest_exit_flags: 0,
-            longest_guest_exit_kind: 0,
-            last_profile_dump: now,
-            last_allocations: allocations,
-            last_deallocations: deallocations,
-            counts: [0; 11],
-            ports: [(0, 0, 0); 12],
-            port_other: 0,
-            last_port: None,
-            softint_by_vec: [0; 256],
+        Self {
+            active: false,
+            last_tsc: now,
+            last_report: now,
+            guest_cycles: 0,
+            kernel_cycles: [0; PROFILE_BUCKETS],
         }
     }
 
-    /// Called right after `dispatch` returns: bills its cost to the event kind
-    /// that caused it, so cost-per-event falls out of cycles/count.
-    fn after_dispatch<A: crate::Arch>(&mut self, machine: &mut A) {
-        let now = machine.rdtsc();
-        let spent = now.wrapping_sub(self.last_kernel_entry);
-        self.dispatch_cycles[self.last_idx] =
-            self.dispatch_cycles[self.last_idx].wrapping_add(spent);
-        self.bill_port(spent);
-    }
-
-    /// Top of the loop: everything from here to `pre_run` is the per-event
-    /// world-advance.
+    /// Start an iteration and charge everything after the prior dispatch to
+    /// scheduler/control. The disabled path performs no timestamp read.
     fn slice_begin<A: crate::Arch>(&mut self, machine: &mut A) {
-        let now = machine.rdtsc();
-        // Whatever ran since the last post_run was dispatch + scheduler.
-        self.post_cycles = self
-            .post_cycles
-            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
-        self.slice_start = now;
-        self.part_mark = now;
-    }
-
-    /// Close out one part of the pre-phase and open the next.
-    fn part<A: crate::Arch>(&mut self, machine: &mut A, i: usize) {
-        // The extra routine boundaries exist only for an active profile.
-        // Normal gameplay keeps the old event-loop instruction count.
         if !profile_enabled() {
+            self.active = false;
             return;
         }
         let now = machine.rdtsc();
-        self.pre_parts[i] = self.pre_parts[i].wrapping_add(now.wrapping_sub(self.part_mark));
-        self.part_mark = now;
-    }
-
-    fn iteration<A: crate::Arch>(&mut self, machine: &mut A) {
-        self.iterations = self.iterations.wrapping_add(1);
-        if self.iterations.is_multiple_of(Self::MEM_DUMP_PERIOD) {
-            let free = machine.free_page_count();
-            if free < self.min_free {
-                self.min_free = free;
-            }
-            self.last_free = free;
+        if self.active {
+            self.kernel_cycles[PROFILE_SCHEDULER] = self.kernel_cycles[PROFILE_SCHEDULER]
+                .wrapping_add(now.wrapping_sub(self.last_tsc));
+        } else {
+            self.active = true;
+            self.last_report = now;
         }
+        self.last_tsc = now;
     }
 
-    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A, regs: &Regs) {
-        let now = machine.rdtsc();
-        self.pre_cycles = self
-            .pre_cycles
-            .wrapping_add(now.wrapping_sub(self.slice_start));
-        self.kernel_cycles = self
-            .kernel_cycles
-            .wrapping_add(now.wrapping_sub(self.last_kernel_entry));
-        self.last_kernel_entry = now;
-        if profile_enabled() {
-            self.guest_entry_cs = regs.code_seg();
-            self.guest_entry_ip = regs.ip32();
-            self.guest_entry_flags = regs.flags32();
-        }
-    }
-
-    /// Tally one port access. Linear scan of a 12-entry table: shorter than a
-    /// cache line's worth of work, and the hot set is a handful of ports.
-    fn count_port(&mut self, port: u16) {
-        self.last_port = Some(port);
-        for e in self.ports.iter_mut() {
-            if e.1 == 0 || e.0 == port {
-                e.0 = port;
-                e.1 += 1;
-                return;
-            }
-        }
-        self.port_other += 1;
-    }
-
-    /// Bill dispatch cycles to the port that caused them, so an expensive
-    /// HANDLER is distinguishable from a merely popular port.
-    fn bill_port(&mut self, cycles: u64) {
-        let Some(port) = self.last_port.take() else {
+    fn mark<A: crate::Arch>(&mut self, machine: &mut A, bucket: usize) {
+        if !self.active {
             return;
-        };
-        for e in self.ports.iter_mut() {
-            if e.0 == port && e.1 != 0 {
-                e.2 = e.2.wrapping_add(cycles);
-                return;
-            }
         }
+        let now = machine.rdtsc();
+        self.kernel_cycles[bucket] = self.kernel_cycles[bucket]
+            .wrapping_add(now.wrapping_sub(self.last_tsc));
+        self.last_tsc = now;
     }
 
-    #[inline(never)]
+    fn part<A: crate::Arch>(&mut self, machine: &mut A, bucket: usize) {
+        self.mark(machine, bucket);
+    }
+
+    fn pre_run<A: crate::Arch>(&mut self, machine: &mut A, _regs: &Regs) {
+        self.mark(machine, PROFILE_LOOP);
+    }
+
     fn post_run<A: crate::Arch>(
         &mut self,
         machine: &mut A,
-        kevent: &crate::KernelEvent,
-        regs: &Regs,
+        _event: &crate::KernelEvent,
+        _regs: &Regs,
     ) {
-        use crate::KernelEvent as KE;
+        if !self.active {
+            return;
+        }
         let now = machine.rdtsc();
-        let guest_cycles = now.wrapping_sub(self.last_kernel_entry);
-        self.user_cycles = self.user_cycles.wrapping_add(guest_cycles);
-        self.last_kernel_entry = now;
-        let idx = match kevent {
-            KE::Irq => 0,
-            KE::SoftInt(n) => {
-                // Every IVT slot is a 2-byte `INT 31h` stub, so the event's own
-                // vector is always 31h — the trampoline, not the service. The
-                // service is the slot the guest landed in, which `rm_vector_
-                // dispatch` recovers the same way: (ip - 2) / 2.
-                let vec = if regs.code_seg() == crate::kernel::dos::stub_seg() {
-                    (regs.ip32().wrapping_sub(2) / 2) as u8
-                } else {
-                    *n
-                };
-                self.softint_by_vec[vec as usize] += 1;
-                1
-            }
-            KE::Hlt => 2,
-            KE::In { port, .. } => {
-                self.count_port(*port);
-                3
-            }
-            KE::Out { port, .. } => {
-                self.count_port(*port);
-                4
-            }
-            KE::Ins { .. } => 5,
-            KE::Outs { .. } => 6,
-            KE::Fault => 7,
-            KE::PageFault { .. } => 8,
-            KE::Exception(_) => 9,
-            KE::Syscall => 10,
-            KE::VifWindow { .. } | KE::VifStep => 1,
+        self.guest_cycles = self.guest_cycles.wrapping_add(now.wrapping_sub(self.last_tsc));
+        self.last_tsc = now;
+        if now.wrapping_sub(self.last_report) >= Self::REPORT_CYCLES {
+            self.report();
+            self.guest_cycles = 0;
+            self.kernel_cycles = [0; PROFILE_BUCKETS];
+            let now = machine.rdtsc();
+            self.last_tsc = now;
+            self.last_report = now;
+        }
+    }
+
+    fn after_dispatch<A: crate::Arch>(&mut self, machine: &mut A) {
+        self.mark(machine, PROFILE_DISPATCH);
+    }
+
+    fn report(&self) {
+        let kernel = self.kernel_cycles.iter().copied().fold(0u64, u64::wrapping_add);
+        let total = self.guest_cycles.wrapping_add(kernel).max(1);
+        let share = |cycles: u64, denominator: u64| {
+            cycles.saturating_mul(1000) / denominator.max(1)
         };
-        if profile_enabled() && guest_cycles > self.longest_guest_cycles {
-            self.longest_guest_cycles = guest_cycles;
-            self.longest_guest_entry_cs = self.guest_entry_cs;
-            self.longest_guest_entry_ip = self.guest_entry_ip;
-            self.longest_guest_entry_flags = self.guest_entry_flags;
-            self.longest_guest_exit_cs = regs.code_seg();
-            self.longest_guest_exit_ip = regs.ip32();
-            self.longest_guest_exit_flags = regs.flags32();
-            self.longest_guest_exit_kind = idx;
-        }
-        self.counts[idx] += 1;
-        self.last_idx = idx;
-        if now.wrapping_sub(self.last_profile_dump) >= Self::PROFILE_DUMP_CYCLES {
-            if profile_enabled() {
-                let total = self.user_cycles.wrapping_add(self.kernel_cycles);
-                let pct10 = |v: u64| {
-                    v.saturating_mul(1000)
-                        .checked_div(total.max(1))
-                        .unwrap_or(0)
-                };
-                // Average dispatch cost for the two hottest event kinds.
-                let cost = |i: usize| -> u64 {
-                    self.dispatch_cycles[i]
-                        .checked_div(self.counts[i].max(1) as u64)
-                        .unwrap_or(0)
-                };
-                let c = &self.counts;
-                // The three hottest vectors, so a polling loop names itself.
-                let mut top = [(0u32, 0usize); 3];
-                for (v, &n) in self.softint_by_vec.iter().enumerate() {
-                    if n > top[2].0 {
-                        top[2] = (n, v);
-                        top.sort_by_key(|e| core::cmp::Reverse(e.0));
-                    }
-                }
-                let ev = self.iterations.max(1);
-                let dispatch_total = self
-                    .dispatch_cycles
-                    .iter()
-                    .fold(0u64, |sum, &v| sum.wrapping_add(v));
-                let scheduler_total = self.post_cycles.saturating_sub(dispatch_total);
-                let sp = unsafe { SLICE_PARTS };
-                let dp = unsafe { DISP_PARTS };
-                let dm = unsafe { core::ptr::read_volatile(&raw const DISP_MODE) };
-                let ap = unsafe { AUDIO_PARTS };
-                let asp = unsafe { AUDIO_SERVICE_PARTS };
-                let asrc = unsafe { AUDIO_SOURCE_PARTS };
-                let np = unsafe { PRESENTS };
-                let loop_total = self.pre_parts[0]
-                    .wrapping_add(self.pre_parts[3])
-                    .wrapping_add(self.pre_parts[4]);
-                let world_other = self.pre_parts[2].saturating_sub(
-                    sp[0]
-                        .saturating_add(sp[1])
-                        .saturating_add(sp[2])
-                        .saturating_add(sp[3]),
-                );
-                let accounted = sp[2]
-                    .saturating_add(sp[3])
-                    .saturating_add(dispatch_total)
-                    .saturating_add(self.pre_parts[1])
-                    .saturating_add(loop_total)
-                    .saturating_add(scheduler_total)
-                    .saturating_add(world_other);
-                let other = self.kernel_cycles.saturating_sub(accounted);
-                let user = pct10(self.user_cycles);
-                let kernel = pct10(self.kernel_cycles);
-                crate::dbg_println!(
-                    "[prof] CPU: guest={}.{}% kernel={}.{}% ticks={} at={:04X}:{:08X}",
-                    user / 10,
-                    user % 10,
-                    kernel / 10,
-                    kernel % 10,
-                    machine.get_ticks(),
-                    regs.code_seg(),
-                    regs.ip32()
-                );
-                let display = pct10(sp[2]);
-                let audio = pct10(sp[3]);
-                let dispatch = pct10(dispatch_total);
-                let irq_drain = pct10(self.pre_parts[1]);
-                let loop_pct = pct10(loop_total);
-                let clock_pct = pct10(self.pre_parts[0]);
-                let console_pct = pct10(self.pre_parts[3]);
-                let after_input_pct = pct10(self.pre_parts[4]);
-                let sched = pct10(scheduler_total);
-                let world = pct10(world_other);
-                let other_pct = pct10(other);
-                crate::dbg_println!(
-                    "[prof] kernel: display={}.{}% audio={}.{}% dispatch={}.{}% irq-drain={}.{}% loop={}.{}% sched={}.{}% world-other={}.{}% other={}.{}%",
-                    display / 10,
-                    display % 10,
-                    audio / 10,
-                    audio % 10,
-                    dispatch / 10,
-                    dispatch % 10,
-                    irq_drain / 10,
-                    irq_drain % 10,
-                    loop_pct / 10,
-                    loop_pct % 10,
-                    sched / 10,
-                    sched % 10,
-                    world / 10,
-                    world % 10,
-                    other_pct / 10,
-                    other_pct % 10
-                );
-                crate::dbg_println!(
-                    "[prof] loop: clock={}.{}% console={}.{}% after-input={}.{}%",
-                    clock_pct / 10,
-                    clock_pct % 10,
-                    console_pct / 10,
-                    console_pct % 10,
-                    after_input_pct / 10,
-                    after_input_pct % 10
-                );
-                let scanout = pct10(dp[0]);
-                let render = pct10(dp[2]);
-                let present = pct10(dp[3]);
-                let per_frame = |v: u64| v.checked_div(np.max(1)).unwrap_or(0);
-                crate::dbg_println!(
-                    "[prof] display: {:?} | {} frames, {} renders, {} px/frame | scanout={}.{}% render={}.{}% present={}.{}% | cycles/frame render={} present={}",
-                    dm,
-                    np,
-                    dp[1],
-                    dp[4].checked_div(np.max(1)).unwrap_or(0),
-                    scanout / 10,
-                    scanout % 10,
-                    render / 10,
-                    render % 10,
-                    present / 10,
-                    present % 10,
-                    per_frame(dp[2]),
-                    per_frame(dp[3])
-                );
-                let devices = pct10(ap[0]);
-                let setup = pct10(ap[1]);
-                let pump = pct10(ap[2]);
-                let clocks = pct10(ap[3]);
-                crate::dbg_println!(
-                    "[prof] audio: pump={}.{}% devices={}.{}% setup={}.{}% clocks/irqs={}.{}% | generated={} frames",
-                    pump / 10,
-                    pump % 10,
-                    devices / 10,
-                    devices % 10,
-                    setup / 10,
-                    setup % 10,
-                    clocks / 10,
-                    clocks % 10,
-                    ap[4]
-                );
-                crate::dbg_println!(
-                    "[prof] audio service: sb={}c gus={}c mpu={}c",
-                    asp[0],
-                    asp[1],
-                    asp[2]
-                );
-                crate::dbg_println!(
-                    "[prof] audio sources: sb={}c gus={}c mpu={}c speaker={}c",
-                    asrc[0],
-                    asrc[1],
-                    asrc[2],
-                    asrc[3]
-                );
-                crate::dbg_println!(
-                    "[prof] exits: {} total | softint={}@{}c in={}@{}c out={}@{}c irq={}@{}c pf={} syscall={}",
-                    ev,
-                    c[1],
-                    cost(1),
-                    c[3],
-                    cost(3),
-                    c[4],
-                    cost(4),
-                    c[0],
-                    cost(0),
-                    c[8],
-                    c[10]
-                );
-                let event_names = [
-                    "irq",
-                    "softint/vif",
-                    "hlt",
-                    "in",
-                    "out",
-                    "ins",
-                    "outs",
-                    "fault",
-                    "page-fault",
-                    "exception",
-                    "syscall",
-                ];
-                crate::dbg_println!(
-                    "[prof] longest guest={}c entry={:04X}:{:08X} flags={:08X} (VIF={}) exit={:04X}:{:08X} flags={:08X} (VIF={}) via {}",
-                    self.longest_guest_cycles,
-                    self.longest_guest_entry_cs,
-                    self.longest_guest_entry_ip,
-                    self.longest_guest_entry_flags,
-                    (self.longest_guest_entry_flags >> 19) & 1,
-                    self.longest_guest_exit_cs,
-                    self.longest_guest_exit_ip,
-                    self.longest_guest_exit_flags,
-                    (self.longest_guest_exit_flags >> 19) & 1,
-                    event_names[self.longest_guest_exit_kind]
-                );
-                let fixed = loop_total
-                    .saturating_add(self.pre_parts[1])
-                    .checked_div(ev)
-                    .unwrap_or(0);
-                crate::dbg_println!(
-                    "[prof] per-exit fixed={}c (loop={} irq-drain={}) | world: advances={} timer={}c/advance unclassified={} cycles",
-                    fixed,
-                    loop_total / ev,
-                    self.pre_parts[1] / ev,
-                    sp[4],
-                    sp[1].checked_div(sp[4].max(1)).unwrap_or(0),
-                    world_other
-                );
-                let (allocations, deallocations) = lib::heap::allocation_counts();
-                crate::dbg_println!(
-                    "[prof] heap: allocations={} (+{}) deallocations={} (+{}) live={}",
-                    allocations,
-                    allocations.wrapping_sub(self.last_allocations),
-                    deallocations,
-                    deallocations.wrapping_sub(self.last_deallocations),
-                    allocations.wrapping_sub(deallocations)
-                );
-                unsafe { SLICE_PARTS = [0; 5] };
-                unsafe { DISP_PARTS = [0; 5] };
-                unsafe { AUDIO_PARTS = [0; 5] };
-                unsafe { AUDIO_SERVICE_PARTS = [0; 3] };
-                unsafe { AUDIO_SOURCE_PARTS = [0; 4] };
-                unsafe { PRESENTS = 0 };
-                if c[3] + c[4] > 0 {
-                    let mut p = self.ports;
-                    p.sort_by_key(|e| core::cmp::Reverse(e.1));
-                    let per = |e: (u16, u32, u64)| e.2.checked_div(e.1.max(1) as u64).unwrap_or(0);
-                    crate::dbg_println!(
-                        "[prof] ports: {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c {:03X}h={}@{}c other={}",
-                        p[0].0,
-                        p[0].1,
-                        per(p[0]),
-                        p[1].0,
-                        p[1].1,
-                        per(p[1]),
-                        p[2].0,
-                        p[2].1,
-                        per(p[2]),
-                        p[3].0,
-                        p[3].1,
-                        per(p[3]),
-                        p[4].0,
-                        p[4].1,
-                        per(p[4]),
-                        self.port_other
-                    );
-                }
-                if c[1] > 0 {
-                    crate::dbg_println!(
-                        "[prof] hottest INT (service, not the 31h trampoline): {:02X}h={} {:02X}h={} {:02X}h={}",
-                        top[0].1,
-                        top[0].0,
-                        top[1].1,
-                        top[1].0,
-                        top[2].1,
-                        top[2].0
-                    );
-                }
-                // Disk I/O volume and average request size.
-                let io = crate::kernel::iostat::snapshot();
-                if io.vol_reads > 0 {
-                    crate::dbg_println!(
-                        "[io] reads={} ({} sectors, {} sec/read)",
-                        io.vol_reads,
-                        io.vol_sectors,
-                        io.vol_sectors.checked_div(io.vol_reads).unwrap_or(0),
-                    );
-                }
-                crate::kernel::iostat::reset();
-            }
-            let (allocations, deallocations) = lib::heap::allocation_counts();
-            self.last_allocations = allocations;
-            self.last_deallocations = deallocations;
-            self.user_cycles = 0;
-            self.kernel_cycles = 0;
-            self.pre_cycles = 0;
-            self.post_cycles = 0;
-            self.dispatch_cycles = [0; 11];
-            self.pre_parts = [0; 5];
-            self.counts = [0; 11];
-            self.softint_by_vec = [0; 256];
-            self.ports = [(0, 0, 0); 12];
-            self.port_other = 0;
-            self.longest_guest_cycles = 0;
-            self.last_profile_dump = now;
-            self.iterations = 0;
-            // Emitting the report can be expensive (notably klog line
-            // capture). It is profiler overhead, not dispatch or scheduler
-            // work for the event that happened to cross the dump deadline.
-            // Re-open kernel timing after it so neither this event nor the
-            // next window is charged for printing the previous window.
-            if profile_enabled() {
-                self.last_kernel_entry = machine.rdtsc();
-            }
-        }
+        profile_line(b"cpu-permille", &[
+            (b"guest", share(self.guest_cycles, total)),
+            (b"kernel", share(kernel, total)),
+            (b"cycles", total),
+        ]);
+        profile_line(b"kernel-permille", &[
+            (b"loop", share(self.kernel_cycles[PROFILE_LOOP], kernel)),
+            (b"irq", share(self.kernel_cycles[PROFILE_IRQ], kernel)),
+            (b"devices", share(self.kernel_cycles[PROFILE_DEVICES], kernel)),
+            (b"audio", share(self.kernel_cycles[PROFILE_AUDIO], kernel)),
+            (b"display", share(self.kernel_cycles[PROFILE_DISPLAY], kernel)),
+            (b"input", share(self.kernel_cycles[PROFILE_INPUT], kernel)),
+            (b"dispatch", share(self.kernel_cycles[PROFILE_DISPATCH], kernel)),
+            (b"scheduler", share(self.kernel_cycles[PROFILE_SCHEDULER], kernel)),
+        ]);
     }
 }
 

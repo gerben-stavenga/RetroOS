@@ -342,8 +342,6 @@ impl<A: crate::Arch> Personality<A> {
         dt_ns: u64,
         audio_pushed: u64,
     ) {
-        let prof = crate::kernel::startup::profile_enabled();
-        let t0 = if prof { machine.rdtsc() } else { 0 };
         match self {
             Self::Dos(dos) => {
                 // Port-polling games can exit to the kernel hundreds of
@@ -366,10 +364,6 @@ impl<A: crate::Arch> Personality<A> {
             }
             Self::Os2(os2) => os2.advance_timers(now_ns),
             Self::Linux(_) | Self::Windows(_) => {}
-        }
-        if prof {
-            crate::kernel::startup::bill_slice2(
-                0, machine.rdtsc().wrapping_sub(t0), 0, 0, u64::from(dt_ns != 0));
         }
     }
 
@@ -403,8 +397,6 @@ impl<A: crate::Arch> Personality<A> {
         desktop: &mut crate::kernel::gui::Desktop,
         endpoint: crate::kernel::gui::EndpointId,
     ) {
-        let prof = crate::kernel::startup::profile_enabled();
-        let t0 = if prof { machine.rdtsc() } else { 0 };
         match self {
             Self::Dos(dos) => {
                 crate::kernel::dos::render(
@@ -420,10 +412,6 @@ impl<A: crate::Arch> Personality<A> {
             Self::Windows(windows) => {
                 crate::kernel::windows::render(machine, bios, windows, display, desktop, endpoint)
             }
-        }
-        if prof {
-            crate::kernel::startup::bill_slice2(
-                0, 0, machine.rdtsc().wrapping_sub(t0), 0, 0);
         }
     }
 
