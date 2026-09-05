@@ -12,7 +12,7 @@
 
 use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 
 use crate::{Corrupt, Error, Storage, Unsupported};
 
@@ -343,6 +343,15 @@ impl Inode {
 }
 
 impl Extent {
+    fn initialized(logical: u32, physical: u64) -> Self {
+        let mut extent = Self::zeroed();
+        extent.logical_block.set(logical);
+        extent.length.set(1);
+        extent.physical_start_hi.set((physical >> 32) as u16);
+        extent.physical_start_lo.set(physical as u32);
+        extent
+    }
+
     fn logical(&self) -> u64 {
         u64::from(self.logical_block.get())
     }
@@ -541,11 +550,37 @@ struct Allocation {
     inode_offset: u64,
 }
 
+/// The slice of an allocation bitmap described by one block group.
+struct AllocationDomain {
+    group: u32,
+    base: u64,
+    count: u64,
+    first: u64,
+    uninitialized: u16,
+}
+
 struct Materialized {
     physical: u64,
     zero: bool,
     first: u32,
     sibling: Option<ExtentIndex>,
+}
+
+/// A mutable extent tree rooted in an inode's 60-byte `i_block` field.
+///
+/// External nodes, allocation accounting, and the root image belong to one
+/// edit.  Callers materialize or truncate logical blocks and finally persist
+/// the root and ownership delta together.
+struct ExtentTree<'a> {
+    io: ExtentIo<'a>,
+    root: [u8; 60 + 2 * size_of::<Extent>()],
+}
+
+struct ExtentIo<'a> {
+    graph: &'a mut Ext4,
+    storage: &'a mut dyn Storage,
+    inode: Inode,
+    owned: i64,
 }
 
 #[derive(Clone, Copy)]
@@ -556,6 +591,16 @@ struct InlineValue {
     entries_end: usize,
     value: usize,
     value_length: usize,
+}
+
+#[derive(Clone, Copy)]
+enum InlineMutation<'a> {
+    Resize(u64),
+    Write {
+        offset: usize,
+        end: u64,
+        input: &'a [u8],
+    },
 }
 
 struct EdgeInsertion {
@@ -671,6 +716,7 @@ impl<'a> DirectoryBlock<'a> {
         Ok(None)
     }
 
+    #[inline(never)]
     fn insert(
         &mut self,
         name: &[u8],
@@ -751,7 +797,7 @@ impl<'a> DirectoryBlock<'a> {
         Err(Error::NotFound)
     }
 
-    fn seal(&mut self, checksum_seed: u32, inode: u32, generation: u32) {
+    fn seal(&mut self) {
         if self.end == self.bytes.len() {
             return;
         }
@@ -759,11 +805,6 @@ impl<'a> DirectoryBlock<'a> {
         tail.record_length
             .set(size_of::<DirectoryEntryTail>() as u16);
         tail.reserved_file_type = 0xde;
-        let mut checksum = crate::checksum::Checksum::with_seed(checksum_seed);
-        checksum.update_u32_le(inode);
-        checksum.update_u32_le(generation);
-        checksum.update(&self.bytes[..self.end]);
-        tail.checksum.set(checksum.finalize());
         self.bytes[self.end..].copy_from_slice(bytemuck::bytes_of(&tail));
     }
 }
@@ -773,6 +814,59 @@ enum NodeBlockKind {
     Leaf,
     IndexRoot,
     Index,
+}
+
+/// One classified and checksum-verified directory data block.
+struct NodeBlock {
+    bytes: Vec<u8>,
+    data_end: usize,
+    kind: NodeBlockKind,
+}
+
+impl NodeBlock {
+    fn directory(&mut self, block_size: usize) -> Result<DirectoryBlock<'_>, Error> {
+        if self.kind == NodeBlockKind::Index {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        Ok(DirectoryBlock::new(
+            &mut self.bytes,
+            self.data_end,
+            block_size,
+        ))
+    }
+
+    #[inline(never)]
+    fn linearize(&mut self, node: Node, block_size: usize, checksummed: bool) -> Result<(), Error> {
+        if self.kind != NodeBlockKind::IndexRoot {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        let end = self.bytes.len() - usize::from(checksummed) * size_of::<DirectoryEntryTail>();
+        let mut block = self.directory(block_size)?;
+        let dot = block.record(0)?;
+        let dot_length = dot.length;
+        let minimum = edge_record_size_unchecked(1);
+        if dot.header.inode.get() != node.number()
+            || block.name(0, dot) != b"."
+            || dot_length < minimum
+            || dot_length >= end
+        {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+
+        // The htree root occupies the slack of this `..` record. Rewriting
+        // its length turns that indexed payload back into ordinary free
+        // directory-record space without changing either intrinsic link.
+        let parent = block.record_prefix(dot_length)?;
+        let parent_inode = parent.header.inode.get();
+        if parent_inode == 0 || block.name(dot_length, parent) != b".." {
+            return Err(Corrupt::InvalidDirectory.into());
+        }
+        block.write(0, node.number(), dot_length, b".", 2)?;
+        block.write(dot_length, parent_inode, end - dot_length, b"..", 2)?;
+        self.kind = NodeBlockKind::Leaf;
+        self.data_end = end;
+        Ok(())
+    }
 }
 
 enum GroupDisk {
@@ -910,6 +1004,55 @@ impl GroupDisk {
 }
 
 impl Ext4 {
+    #[inline(never)]
+    fn validate_mount(&mut self, superblock: &Superblock, storage_len: u64) -> Result<(), Error> {
+        if self.blocks_count <= u64::from(self.first_data_block)
+            || self.reserved_blocks > self.blocks_count
+            || self.free_blocks > self.blocks_count
+            || self.free_inodes > self.inodes_count
+            || self.blocks_per_group == 0
+            || self.clusters_per_group == 0
+            || self.inodes_per_group == 0
+            || self.inodes_count < ROOT_INODE
+            || self.first_inode == 0
+            || self.first_inode > self.inodes_count
+            || self.inode_size < INODE_BASE_SIZE as u16
+            || !self.inode_size.is_power_of_two()
+            || u32::from(self.inode_size) > self.block_size
+            || self.descriptor_size < GROUP_DESCRIPTOR32_SIZE as u16
+            || !self.descriptor_size.is_multiple_of(8)
+            || u32::from(self.descriptor_size) > self.block_size
+        {
+            return Err(Corrupt::InvalidGeometry.into());
+        }
+        let groups = (self.blocks_count - u64::from(self.first_data_block))
+            .div_ceil(u64::from(self.blocks_per_group));
+        let inode_groups = u64::from(self.inodes_count).div_ceil(u64::from(self.inodes_per_group));
+        if groups > u64::from(u32::MAX) || inode_groups > groups {
+            return Err(Corrupt::InvalidGeometry.into());
+        }
+        self.groups_count = groups as u32;
+        self.descriptors_per_block = self.block_size / u32::from(self.descriptor_size);
+
+        let filesystem_bytes = self
+            .blocks_count
+            .checked_mul(u64::from(self.block_size))
+            .ok_or(Corrupt::AddressOverflow)?;
+        if filesystem_bytes > storage_len {
+            return Err(Corrupt::FilesystemPastEnd.into());
+        }
+        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+            let expected = superblock.checksum.get();
+            let mut checksum = crate::checksum::Checksum::new();
+            let bytes = bytemuck::bytes_of(superblock);
+            checksum.update(&bytes[..size_of::<Superblock>() - size_of::<Le32>()]);
+            if checksum.finalize() != expected {
+                return Err(Corrupt::SuperblockChecksum.into());
+            }
+        }
+        Ok(())
+    }
+
     /// Read and validate the superblock once, retaining only the state needed
     /// by subsequent graph operations.
     pub fn mount(storage: &mut dyn Storage) -> Result<Self, Error> {
@@ -968,46 +1111,6 @@ impl Ext4 {
         } else {
             GROUP_DESCRIPTOR32_SIZE as u16
         };
-        if blocks_count <= u64::from(first_data_block)
-            || reserved_blocks > blocks_count
-            || free_blocks > blocks_count
-            || free_inodes > inodes_count
-            || blocks_per_group == 0
-            || clusters_per_group == 0
-            || inodes_per_group == 0
-            || inodes_count < ROOT_INODE
-            || first_inode == 0
-            || first_inode > inodes_count
-            || inode_size < INODE_BASE_SIZE as u16
-            || !inode_size.is_power_of_two()
-            || u32::from(inode_size) > block_size
-            || descriptor_size < GROUP_DESCRIPTOR32_SIZE as u16
-            || !descriptor_size.is_multiple_of(8)
-            || u32::from(descriptor_size) > block_size
-        {
-            return Err(Corrupt::InvalidGeometry.into());
-        }
-        let groups =
-            (blocks_count - u64::from(first_data_block)).div_ceil(u64::from(blocks_per_group));
-        let inode_groups = u64::from(inodes_count).div_ceil(u64::from(inodes_per_group));
-        if groups > u64::from(u32::MAX) || inode_groups > groups {
-            return Err(Corrupt::InvalidGeometry.into());
-        }
-        let filesystem_bytes = blocks_count
-            .checked_mul(u64::from(block_size))
-            .ok_or(Corrupt::AddressOverflow)?;
-        if filesystem_bytes > storage.len() {
-            return Err(Corrupt::FilesystemPastEnd.into());
-        }
-        if features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
-            let expected = superblock.checksum.get();
-            let mut checksum = crate::checksum::Checksum::new();
-            let bytes = bytemuck::bytes_of(&superblock);
-            checksum.update(&bytes[..size_of::<Superblock>() - size_of::<Le32>()]);
-            if checksum.finalize() != expected {
-                return Err(Corrupt::SuperblockChecksum.into());
-            }
-        }
         let uuid = superblock.uuid;
         let checksum_seed = if features.incompatible & INCOMPAT_CSUM_SEED != 0 {
             superblock.checksum_seed.get()
@@ -1016,7 +1119,7 @@ impl Ext4 {
             checksum.update(&uuid);
             checksum.finalize()
         };
-        Ok(Self {
+        let mut graph = Self {
             inodes_count,
             blocks_count,
             reserved_blocks,
@@ -1028,11 +1131,11 @@ impl Ext4 {
             blocks_per_group,
             clusters_per_group,
             inodes_per_group,
-            groups_count: groups as u32,
+            groups_count: 0,
             first_inode,
             inode_size,
             descriptor_size,
-            descriptors_per_block: block_size / u32::from(descriptor_size),
+            descriptors_per_block: 0,
             creator_os: superblock.creator_os.get(),
             features,
             uuid,
@@ -1045,7 +1148,9 @@ impl Ext4 {
             log_groups_per_flex: superblock.log_groups_per_flex,
             journal_inode: superblock.journal_inode.get(),
             needs_recovery: features.incompatible & 0x0004 != 0,
-        })
+        };
+        graph.validate_mount(&superblock, storage.len())?;
+        Ok(graph)
     }
 
     pub(crate) fn journal_blob(&self) -> Result<Blob, Error> {
@@ -1190,11 +1295,11 @@ impl Ext4 {
         let block_size = u64::from(self.block_size);
         let blocks = inode.size.div_ceil(block_size);
         for logical in cursor.0 / block_size..blocks {
-            let (mut bytes, end, kind) = self.read_node_block(storage, &inode, logical)?;
-            if kind != NodeBlockKind::Leaf {
+            let mut node_block = self.read_node_block(storage, &inode, logical)?;
+            if node_block.kind != NodeBlockKind::Leaf {
                 continue;
             }
-            let block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
+            let block = node_block.directory(self.block_size as usize)?;
             let base = logical * block_size;
             let mut within = 0;
             while within < block.end {
@@ -1405,6 +1510,7 @@ impl Ext4 {
         Ok(())
     }
 
+    #[inline(never)]
     fn initialize_inode_bitmap(&self, group: &Group, count: u64) -> Result<Vec<u8>, Error> {
         if group.number == 0
             || group.flags & GROUP_INODE_ZEROED == 0
@@ -1418,6 +1524,7 @@ impl Ext4 {
         Ok(bitmap)
     }
 
+    #[inline(never)]
     fn initialize_block_bitmap(
         &self,
         group: &Group,
@@ -1506,6 +1613,69 @@ impl Ext4 {
     }
 
     #[inline(never)]
+    fn allocation_domain(&self, kind: AllocationKind, group: u32) -> AllocationDomain {
+        if kind.inode() {
+            let base = u64::from(group) * u64::from(self.inodes_per_group);
+            AllocationDomain {
+                group,
+                base: base + 1,
+                count: u64::from(self.inodes_count)
+                    .saturating_sub(base)
+                    .min(u64::from(self.inodes_per_group)),
+                first: if group == 0 {
+                    u64::from(self.first_inode - 1)
+                } else {
+                    0
+                },
+                uninitialized: GROUP_INODE_UNINIT,
+            }
+        } else {
+            let base = u64::from(self.first_data_block)
+                + u64::from(group) * u64::from(self.blocks_per_group);
+            AllocationDomain {
+                group,
+                base,
+                count: self
+                    .blocks_count
+                    .saturating_sub(base)
+                    .min(u64::from(self.blocks_per_group)),
+                first: 0,
+                uninitialized: GROUP_BLOCK_UNINIT,
+            }
+        }
+    }
+
+    #[inline(never)]
+    fn locate_allocation(
+        &self,
+        kind: AllocationKind,
+        allocation: u64,
+    ) -> Result<(AllocationDomain, u64), Error> {
+        let (origin, per_group) = if kind.inode() {
+            (1, u64::from(self.inodes_per_group))
+        } else {
+            (
+                u64::from(self.first_data_block),
+                u64::from(self.blocks_per_group),
+            )
+        };
+        let relative = allocation.checked_sub(origin).ok_or_else(|| {
+            if kind.inode() {
+                Corrupt::InvalidInode(allocation as u32)
+            } else {
+                Corrupt::InvalidBlockBitmap
+            }
+        })?;
+        let group = u32::try_from(relative / per_group).map_err(|_| Corrupt::InvalidBlockBitmap)?;
+        let domain = self.allocation_domain(kind, group);
+        let index = relative % per_group;
+        if group >= self.groups_count || index >= domain.count {
+            return Err(Corrupt::InvalidBlockBitmap.into());
+        }
+        Ok((domain, index))
+    }
+
+    #[inline(never)]
     fn allocate(
         &mut self,
         storage: &mut dyn Storage,
@@ -1513,35 +1683,11 @@ impl Ext4 {
     ) -> Result<Allocation, Error> {
         for number in 0..self.groups_count {
             let mut group = self.group(storage, number)?;
-            let (free, block, base, count, first, uninitialized) = if kind.inode() {
-                let base = u64::from(number) * u64::from(self.inodes_per_group);
-                (
-                    group.free_inodes,
-                    group.inode_bitmap,
-                    base,
-                    u64::from(self.inodes_count)
-                        .saturating_sub(base)
-                        .min(u64::from(self.inodes_per_group)),
-                    if number == 0 {
-                        u64::from(self.first_inode - 1)
-                    } else {
-                        0
-                    },
-                    GROUP_INODE_UNINIT,
-                )
+            let domain = self.allocation_domain(kind, number);
+            let (free, block) = if kind.inode() {
+                (group.free_inodes, group.inode_bitmap)
             } else {
-                let base = u64::from(self.first_data_block)
-                    + u64::from(number) * u64::from(self.blocks_per_group);
-                (
-                    group.free_blocks,
-                    group.block_bitmap,
-                    base,
-                    self.blocks_count
-                        .saturating_sub(base)
-                        .min(u64::from(self.blocks_per_group)),
-                    0,
-                    GROUP_BLOCK_UNINIT,
-                )
+                (group.free_blocks, group.block_bitmap)
             };
             if free == 0 {
                 continue;
@@ -1549,18 +1695,18 @@ impl Ext4 {
             if block == 0 || block >= self.blocks_count {
                 return Err(Corrupt::InvalidBlockBitmap.into());
             }
-            let mut bitmap = if group.flags & uninitialized != 0 {
+            let mut bitmap = if group.flags & domain.uninitialized != 0 {
                 let bitmap = if kind.inode() {
-                    self.initialize_inode_bitmap(&group, count)?
+                    self.initialize_inode_bitmap(&group, domain.count)?
                 } else {
-                    self.initialize_block_bitmap(&group, base, count)?
+                    self.initialize_block_bitmap(&group, domain.base, domain.count)?
                 };
-                group.flags &= !uninitialized;
+                group.flags &= !domain.uninitialized;
                 bitmap
             } else {
                 self.read_bitmap(storage, block)?
             };
-            let index = (first..count)
+            let index = (domain.first..domain.count)
                 .find(|index| bitmap[*index as usize / 8] & (1 << (*index % 8)) == 0)
                 .ok_or(Corrupt::InvalidFreeBlockCount)?;
             bitmap[index as usize / 8] |= 1 << (index % 8);
@@ -1570,12 +1716,13 @@ impl Ext4 {
                     .free_inodes
                     .checked_sub(1)
                     .ok_or(Corrupt::InvalidFreeBlockCount)?;
-                let initialized = count
+                let initialized = domain
+                    .count
                     .checked_sub(u64::from(group.unused_inodes))
                     .ok_or(Corrupt::InvalidInodeTable)?;
                 if index >= initialized {
-                    group.unused_inodes =
-                        u32::try_from(count - index - 1).map_err(|_| Corrupt::InvalidInodeTable)?;
+                    group.unused_inodes = u32::try_from(domain.count - index - 1)
+                        .map_err(|_| Corrupt::InvalidInodeTable)?;
                 }
                 if kind.node() {
                     group.used_directories = group
@@ -1606,7 +1753,7 @@ impl Ext4 {
                 0
             };
             return Ok(Allocation {
-                number: base + index + u64::from(kind.inode()),
+                number: domain.base + index,
                 inode_offset,
             });
         }
@@ -1620,48 +1767,14 @@ impl Ext4 {
         kind: AllocationKind,
         allocation: u64,
     ) -> Result<(), Error> {
-        let (number, index, count, uninitialized) = if kind.inode() {
-            let index = allocation
-                .checked_sub(1)
-                .ok_or(Corrupt::InvalidInode(allocation as u32))?;
-            let number = u32::try_from(index / u64::from(self.inodes_per_group))
-                .map_err(|_| Corrupt::InvalidBlockBitmap)?;
-            let base = u64::from(number) * u64::from(self.inodes_per_group);
-            (
-                number,
-                index % u64::from(self.inodes_per_group),
-                u64::from(self.inodes_count)
-                    .saturating_sub(base)
-                    .min(u64::from(self.inodes_per_group)),
-                GROUP_INODE_UNINIT,
-            )
-        } else {
-            let relative = allocation
-                .checked_sub(u64::from(self.first_data_block))
-                .ok_or(Corrupt::InvalidBlockBitmap)?;
-            let number = u32::try_from(relative / u64::from(self.blocks_per_group))
-                .map_err(|_| Corrupt::InvalidBlockBitmap)?;
-            let base = u64::from(self.first_data_block)
-                + u64::from(number) * u64::from(self.blocks_per_group);
-            (
-                number,
-                relative % u64::from(self.blocks_per_group),
-                self.blocks_count
-                    .saturating_sub(base)
-                    .min(u64::from(self.blocks_per_group)),
-                GROUP_BLOCK_UNINIT,
-            )
-        };
-        if index >= count {
-            return Err(Corrupt::InvalidBlockBitmap.into());
-        }
-        let mut group = self.group(storage, number)?;
+        let (domain, index) = self.locate_allocation(kind, allocation)?;
+        let mut group = self.group(storage, domain.group)?;
         let block = if kind.inode() {
             group.inode_bitmap
         } else {
             group.block_bitmap
         };
-        if group.flags & uninitialized != 0 || block == 0 || block >= self.blocks_count {
+        if group.flags & domain.uninitialized != 0 || block == 0 || block >= self.blocks_count {
             return Err(Corrupt::InvalidBlockBitmap.into());
         }
         let mut bitmap = self.read_bitmap(storage, block)?;
@@ -1799,7 +1912,12 @@ impl Ext4 {
             let mut block = DirectoryBlock::new(&mut bytes, data_end, self.block_size as usize);
             block.write(0, inode, 12, b".", 2)?;
             block.write(12, inode, data_end - 12, b"..", 2)?;
-            block.seal(self.checksum_seed, inode, generation);
+            block.seal();
+        }
+        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+            let (field, checksum) =
+                self.node_checksum(inode, generation, NodeBlockKind::Leaf, &bytes)?;
+            write_record_at(&mut bytes, field, &Le32::new(checksum))?;
         }
         write_storage(storage, block * u64::from(self.block_size), &bytes)
     }
@@ -1809,7 +1927,7 @@ impl Ext4 {
         storage: &mut dyn Storage,
         inode: &Inode,
         logical: u64,
-    ) -> Result<(Vec<u8>, usize, NodeBlockKind), Error> {
+    ) -> Result<NodeBlock, Error> {
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(self.block_size as usize)
@@ -1826,10 +1944,10 @@ impl Ext4 {
             NodeBlockKind::Leaf
         } else if logical == 0 {
             NodeBlockKind::IndexRoot
-        } else if bytes.len() >= 8
-            && directory_record_length(Le16([bytes[4], bytes[5]]), self.block_size as usize)
+        } else if record_at::<HtreeIndexPrefix>(&bytes, 0).is_ok_and(|prefix| {
+            directory_record_length(prefix.fake.record_length, self.block_size as usize)
                 == bytes.len()
-        {
+        }) {
             NodeBlockKind::Index
         } else {
             NodeBlockKind::Leaf
@@ -1842,23 +1960,21 @@ impl Ext4 {
             NodeBlockKind::Leaf => {
                 bytes.len() - usize::from(checksummed) * size_of::<DirectoryEntryTail>()
             }
-            NodeBlockKind::IndexRoot | NodeBlockKind::Index => 0,
+            NodeBlockKind::IndexRoot => bytes.len(),
+            NodeBlockKind::Index => 0,
         };
-        if data_end == 0 {
-            if kind == NodeBlockKind::Leaf {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
+        if data_end == 0 && kind == NodeBlockKind::Leaf {
+            return Err(Corrupt::InvalidDirectory.into());
         }
-        Ok((bytes, data_end, kind))
+        Ok(NodeBlock {
+            bytes,
+            data_end,
+            kind,
+        })
     }
 
-    fn verify_node_checksum(
-        &self,
-        inode: &Inode,
-        kind: NodeBlockKind,
-        bytes: &[u8],
-    ) -> Result<(), Error> {
-        let (field, hashed) = match kind {
+    fn node_checksum_layout(kind: NodeBlockKind, bytes: &[u8]) -> Result<(usize, usize), Error> {
+        match kind {
             NodeBlockKind::Leaf => {
                 let tail = bytes
                     .len()
@@ -1872,82 +1988,81 @@ impl Ext4 {
                 {
                     return Err(Corrupt::InvalidDirectory.into());
                 }
-                (tail + 8, tail)
+                Ok((tail + offset_of!(DirectoryEntryTail, checksum), tail))
             }
             NodeBlockKind::IndexRoot | NodeBlockKind::Index => {
                 let at = if kind == NodeBlockKind::IndexRoot {
-                    32
+                    size_of::<HtreeRootPrefix>()
                 } else {
-                    8
+                    size_of::<HtreeIndexPrefix>()
                 };
-                let count = bytes
-                    .get(at + 2..at + 4)
-                    .map(|raw| u16::from_le_bytes([raw[0], raw[1]]) as usize)
-                    .ok_or(Corrupt::InvalidDirectory)?;
+                let count = usize::from(record_at::<HtreeCountLimit>(bytes, at)?.count.get());
                 let hashed = at
-                    .checked_add(count * 8)
-                    .filter(|hashed| *hashed <= bytes.len().saturating_sub(8))
+                    .checked_add(
+                        count
+                            .checked_mul(size_of::<HtreeEntry>())
+                            .ok_or(Corrupt::InvalidDirectory)?,
+                    )
+                    .filter(|hashed| *hashed <= bytes.len().saturating_sub(size_of::<HtreeTail>()))
                     .ok_or(Corrupt::InvalidDirectory)?;
-                (bytes.len() - 4, hashed)
+                Ok((bytes.len() - size_of::<Le32>(), hashed))
             }
-        };
-        let expected = u32::from_le_bytes(
-            bytes[field..field + 4]
-                .try_into()
-                .map_err(|_| Corrupt::InvalidDirectory)?,
-        );
+        }
+    }
+
+    fn node_checksum(
+        &self,
+        inode: u32,
+        generation: u32,
+        kind: NodeBlockKind,
+        bytes: &[u8],
+    ) -> Result<(usize, u32), Error> {
+        let (field, hashed) = Self::node_checksum_layout(kind, bytes)?;
         let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-        checksum.update_u32_le(inode.number);
-        checksum.update_u32_le(inode.generation);
+        checksum.update_u32_le(inode);
+        checksum.update_u32_le(generation);
         checksum.update(&bytes[..hashed]);
         if kind != NodeBlockKind::Leaf {
             checksum.update(&bytes[field - 4..field]);
             checksum.update_u32_le(0);
         }
-        if checksum.finalize() != expected {
+        Ok((field, checksum.finalize()))
+    }
+
+    fn verify_node_checksum(
+        &self,
+        inode: &Inode,
+        kind: NodeBlockKind,
+        bytes: &[u8],
+    ) -> Result<(), Error> {
+        let (field, actual) = self.node_checksum(inode.number, inode.generation, kind, bytes)?;
+        if record_at::<Le32>(bytes, field)?.get() != actual {
             return Err(Corrupt::DirectoryChecksum(inode.number).into());
         }
         Ok(())
     }
 
-    fn node_block(
-        &self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        logical: u64,
-    ) -> Result<(Vec<u8>, usize), Error> {
-        let (bytes, mut end, kind) = self.read_node_block(storage, inode, logical)?;
-        if kind == NodeBlockKind::IndexRoot {
-            end = bytes.len()
-                - if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
-                    size_of::<DirectoryEntryTail>()
-                } else {
-                    0
-                };
-        } else if kind == NodeBlockKind::Index {
-            return Err(Corrupt::InvalidDirectory.into());
-        }
-        Ok((bytes, end))
-    }
-
+    #[inline(never)]
     fn store_node_block(
         &mut self,
         storage: &mut dyn Storage,
         inode: &Inode,
         logical: u64,
-        bytes: &mut [u8],
-        data_end: usize,
+        block: &mut NodeBlock,
     ) -> Result<(), Error> {
-        DirectoryBlock::new(bytes, data_end, self.block_size as usize).seal(
-            self.checksum_seed,
-            inode.number,
-            inode.generation,
-        );
+        if block.kind == NodeBlockKind::Leaf {
+            block.directory(self.block_size as usize)?.seal();
+        }
+        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+            let (field, checksum) =
+                self.node_checksum(inode.number, inode.generation, block.kind, &block.bytes)?;
+            write_record_at(&mut block.bytes, field, &Le32::new(checksum))?;
+        }
         self.write_object(
             storage,
             inode.object(),
             logical * u64::from(self.block_size),
-            bytes,
+            &block.bytes,
         )
     }
 
@@ -2206,6 +2321,40 @@ impl Ext4 {
         Ok(())
     }
 
+    #[inline(never)]
+    fn mutate_inline(
+        &self,
+        storage: &mut dyn Storage,
+        object: Object,
+        inode: Inode,
+        mutation: InlineMutation<'_>,
+    ) -> Result<(), Error> {
+        self.edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
+            if current.generation != inode.generation || current.object() != object {
+                return Err(Error::NotFound);
+            }
+            let size = match mutation {
+                InlineMutation::Resize(size) => size,
+                InlineMutation::Write { end, .. } => current.size.max(end),
+            };
+            Self::fill_inline(
+                raw,
+                base,
+                current,
+                usize::try_from(size.min(current.size)).map_err(|_| Corrupt::AddressOverflow)?,
+                usize::try_from(size.max(current.size)).map_err(|_| Corrupt::AddressOverflow)?,
+                0,
+            )?;
+            if let InlineMutation::Write { offset, input, .. } = mutation {
+                Self::copy_inline(raw, base, current, offset, input)?;
+            }
+            base.size_lo.set(size as u32);
+            base.size_hi.set((size >> 32) as u32);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
     fn convert_inline_to_extents(
         &mut self,
         storage: &mut dyn Storage,
@@ -2341,41 +2490,6 @@ impl Ext4 {
             base.links_count.set(references);
             Ok(())
         })
-    }
-
-    #[inline(never)]
-    fn store_extent_inode(
-        &self,
-        storage: &mut dyn Storage,
-        inode: Inode,
-        root: [u8; 60],
-        owned: i64,
-        size: u64,
-    ) -> Result<(), Error> {
-        let blocks_512 = inode
-            .blocks_512
-            .checked_add_signed(
-                owned
-                    .checked_mul(i64::from(self.block_size / 512))
-                    .ok_or(Corrupt::AddressOverflow)?,
-            )
-            .ok_or(Corrupt::AddressOverflow)?;
-        self.edit_inode(storage, inode.number, &mut |base, current| {
-            if current.generation != inode.generation {
-                return Err(Error::NotFound);
-            }
-            base.size_lo.set(size as u32);
-            base.size_hi.set((size >> 32) as u32);
-            base.blocks_lo.set(blocks_512 as u32);
-            let mut os_data =
-                bytemuck::pod_read_unaligned::<LinuxInodeOsData2>(&base.os_dependent_2);
-            os_data.blocks_hi.set((blocks_512 >> 32) as u16);
-            base.os_dependent_2
-                .copy_from_slice(bytemuck::bytes_of(&os_data));
-            base.block = root;
-            Ok(())
-        })?;
-        Ok(())
     }
 
     fn read_inode(
@@ -2618,9 +2732,27 @@ impl Ext4 {
         }
         Ok((block != 0).then_some(block))
     }
+}
 
+impl<'a> ExtentTree<'a> {
+    fn new(graph: &'a mut Ext4, storage: &'a mut dyn Storage, inode: Inode) -> Self {
+        let mut root = [0; 60 + 2 * size_of::<Extent>()];
+        root[..60].copy_from_slice(&inode.block);
+        Self {
+            root,
+            io: ExtentIo {
+                graph,
+                storage,
+                inode,
+                owned: 0,
+            },
+        }
+    }
+}
+
+impl ExtentIo<'_> {
     fn extent_capacity(&self) -> Result<usize, Error> {
-        (self.block_size as usize)
+        (self.graph.block_size as usize)
             .checked_sub(size_of::<ExtentHeader>() + size_of::<Le32>())
             .map(|bytes| bytes / size_of::<Extent>())
             .filter(|capacity| *capacity > 4 && *capacity <= usize::from(u16::MAX))
@@ -2628,7 +2760,7 @@ impl Ext4 {
     }
 
     fn extent_buffer(&self) -> Result<Vec<u8>, Error> {
-        let length = (self.block_size as usize)
+        let length = (self.graph.block_size as usize)
             .checked_add(2 * size_of::<Extent>())
             .ok_or(Corrupt::AddressOverflow)?;
         let mut bytes = Vec::new();
@@ -2639,21 +2771,15 @@ impl Ext4 {
         Ok(bytes)
     }
 
-    fn read_extent_node(
-        &self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        block: u64,
-        depth: u16,
-    ) -> Result<Vec<u8>, Error> {
-        if block == 0 || block >= self.blocks_count {
+    fn read_extent_node(&mut self, block: u64, depth: u16) -> Result<Vec<u8>, Error> {
+        if block == 0 || block >= self.graph.blocks_count {
             return Err(Corrupt::InvalidExtentTree.into());
         }
         let mut bytes = self.extent_buffer()?;
         read_storage(
-            storage,
-            block * u64::from(self.block_size),
-            &mut bytes[..self.block_size as usize],
+            self.storage,
+            block * u64::from(self.graph.block_size),
+            &mut bytes[..self.graph.block_size as usize],
         )?;
         let header = record_at::<ExtentHeader>(&bytes, 0)?;
         let capacity = self.extent_capacity()?;
@@ -2664,29 +2790,26 @@ impl Ext4 {
         {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
-        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+        if self.graph.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
             let checksum_at = size_of::<ExtentHeader>() + capacity * size_of::<Extent>();
             let expected = record_at::<Le32>(&bytes, checksum_at)?.get();
-            let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-            checksum.update_u32_le(inode.number);
-            checksum.update_u32_le(inode.generation);
+            let mut checksum = crate::checksum::Checksum::with_seed(self.graph.checksum_seed);
+            checksum.update_u32_le(self.inode.number);
+            checksum.update_u32_le(self.inode.generation);
             checksum.update(&bytes[..checksum_at]);
             if checksum.finalize() != expected {
-                return Err(Corrupt::ExtentChecksum(inode.number).into());
+                return Err(Corrupt::ExtentChecksum(self.inode.number).into());
             }
         }
         Ok(bytes)
     }
 
     #[inline(never)]
-    fn write_extent_node(
-        &self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        block: u64,
-        bytes: &mut [u8],
-    ) -> Result<(), Error> {
-        if block == 0 || block >= self.blocks_count || bytes.len() < self.block_size as usize {
+    fn write_extent_node(&mut self, block: u64, bytes: &mut [u8]) -> Result<(), Error> {
+        if block == 0
+            || block >= self.graph.blocks_count
+            || bytes.len() < self.graph.block_size as usize
+        {
             return Err(Corrupt::InvalidExtentTree.into());
         }
         let capacity = self.extent_capacity()?;
@@ -2699,27 +2822,26 @@ impl Ext4 {
         {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
+        if self.graph.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
             let checksum_at = size_of::<ExtentHeader>() + capacity * size_of::<Extent>();
-            let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
-            checksum.update_u32_le(inode.number);
-            checksum.update_u32_le(inode.generation);
+            let mut checksum = crate::checksum::Checksum::with_seed(self.graph.checksum_seed);
+            checksum.update_u32_le(self.inode.number);
+            checksum.update_u32_le(self.inode.generation);
             checksum.update(&bytes[..checksum_at]);
             write_record_at(bytes, checksum_at, &Le32::new(checksum.finalize()))?;
         }
         write_storage(
-            storage,
-            block * u64::from(self.block_size),
-            &bytes[..self.block_size as usize],
+            self.storage,
+            block * u64::from(self.graph.block_size),
+            &bytes[..self.graph.block_size as usize],
         )
     }
 
+    #[inline(never)]
     fn materialize_leaf(
         &mut self,
-        storage: &mut dyn Storage,
         node: &mut ExtentNode<'_, Extent>,
         logical: u32,
-        owned: &mut i64,
     ) -> Result<(u64, bool), Error> {
         validate_extents(node.entries())?;
         let position = node
@@ -2727,7 +2849,7 @@ impl Ext4 {
             .partition_point(|extent| extent.logical_block.get() <= logical);
         if let Some(at) = position.checked_sub(1) {
             if node.entries()[at].end() <= u64::from(logical) {
-                return self.materialize_hole(storage, node, logical, position, owned);
+                return self.materialize_hole(node, logical, position);
             }
             let extent = node.entries()[at];
             let physical = extent.physical() + u64::from(logical) - extent.logical();
@@ -2744,11 +2866,7 @@ impl Ext4 {
                 node.insert(insert, left)?;
                 insert += 1;
             }
-            let mut middle = extent;
-            middle.logical_block.set(logical);
-            middle.length.set(1);
-            middle.physical_start_hi.set((physical >> 32) as u16);
-            middle.physical_start_lo.set(physical as u32);
+            let middle = Extent::initialized(logical, physical);
             node.insert(insert, middle)?;
             insert += 1;
             if after != 0 {
@@ -2762,24 +2880,18 @@ impl Ext4 {
             merge_extents(node)?;
             return Ok((physical, true));
         }
-        self.materialize_hole(storage, node, logical, position, owned)
+        self.materialize_hole(node, logical, position)
     }
 
     fn materialize_hole(
         &mut self,
-        storage: &mut dyn Storage,
         node: &mut ExtentNode<'_, Extent>,
         logical: u32,
         position: usize,
-        owned: &mut i64,
     ) -> Result<(u64, bool), Error> {
-        let physical = self.allocate_block(storage)?;
-        *owned += 1;
-        let mut extent = Extent::zeroed();
-        extent.logical_block.set(logical);
-        extent.length.set(1);
-        extent.physical_start_hi.set((physical >> 32) as u16);
-        extent.physical_start_lo.set(physical as u32);
+        let physical = self.graph.allocate_block(self.storage)?;
+        self.owned += 1;
+        let extent = Extent::initialized(logical, physical);
         node.insert(position, extent)?;
         merge_extents(node)?;
         Ok((physical, true))
@@ -2787,17 +2899,14 @@ impl Ext4 {
 
     fn materialize_extent_node(
         &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
         bytes: &mut [u8],
         capacity: usize,
         depth: u16,
         logical: u32,
-        owned: &mut i64,
     ) -> Result<Materialized, Error> {
         if depth == 0 {
             let mut node = ExtentNode::<Extent>::open(bytes, capacity, depth)?;
-            let (physical, zero) = self.materialize_leaf(storage, &mut node, logical, owned)?;
+            let (physical, zero) = self.materialize_leaf(&mut node, logical)?;
             return Ok(Materialized {
                 physical,
                 zero,
@@ -2822,8 +2931,7 @@ impl Ext4 {
             .get(at)
             .ok_or(Corrupt::InvalidExtentTree)?
             .block();
-        let mut child =
-            self.materialize_external(storage, inode, block, depth - 1, logical, owned)?;
+        let mut child = self.materialize_external(block, depth - 1, logical)?;
         if child.zero {
             node.entries_mut()[at].logical_block.set(child.first);
             if let Some(sibling) = child.sibling.take() {
@@ -2834,13 +2942,8 @@ impl Ext4 {
         Ok(child)
     }
 
-    fn split_extent_node(
-        &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        bytes: &mut [u8],
-        owned: &mut i64,
-    ) -> Result<ExtentIndex, Error> {
+    #[inline(never)]
+    fn split_extent_node(&mut self, bytes: &mut [u8]) -> Result<ExtentIndex, Error> {
         let capacity = self.extent_capacity()?;
         let mut header = record_at::<ExtentHeader>(bytes, 0)?;
         let count = usize::from(header.entries.get());
@@ -2861,106 +2964,94 @@ impl Ext4 {
         header.entries.set(middle as u16);
         write_record_at(bytes, 0, &header)?;
 
-        let sibling = self.allocate_block(storage)?;
-        *owned += 1;
-        self.write_extent_node(storage, inode, sibling, &mut right)?;
+        let sibling = self.graph.allocate_block(self.storage)?;
+        self.owned += 1;
+        self.write_extent_node(sibling, &mut right)?;
         let first = extent_first(&right, header.depth.get())?;
         ExtentIndex::from_child(first, sibling)
     }
 
+    #[inline(never)]
     fn materialize_external(
         &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
         block: u64,
         depth: u16,
         logical: u32,
-        owned: &mut i64,
     ) -> Result<Materialized, Error> {
-        let mut bytes = self.read_extent_node(storage, inode, block, depth)?;
+        let mut bytes = self.read_extent_node(block, depth)?;
         let capacity = self.extent_capacity()?;
-        let mut child = self
-            .materialize_extent_node(storage, inode, &mut bytes, capacity, depth, logical, owned)?;
+        let mut child = self.materialize_extent_node(&mut bytes, capacity, depth, logical)?;
         if !child.zero {
             return Ok(child);
         }
         if usize::from(record_at::<ExtentHeader>(&bytes, 0)?.entries.get()) > capacity {
-            child.sibling = Some(self.split_extent_node(storage, inode, &mut bytes, owned)?);
+            child.sibling = Some(self.split_extent_node(&mut bytes)?);
         }
         child.first = extent_first(&bytes, depth)?;
-        self.write_extent_node(storage, inode, block, &mut bytes)?;
+        self.write_extent_node(block, &mut bytes)?;
         Ok(child)
     }
+}
 
+impl ExtentTree<'_> {
     #[inline(never)]
-    fn materialize_root(
-        &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        root: &mut [u8; 60],
-        logical: u32,
-        owned: &mut i64,
-    ) -> Result<(u64, bool), Error> {
-        let mut bytes = [0; 60 + 2 * size_of::<Extent>()];
-        bytes[..60].copy_from_slice(root);
-        let header = record_at::<ExtentHeader>(&bytes, 0)?;
+    fn materialize(&mut self, logical: u32) -> Result<(u64, bool), Error> {
+        let header = record_at::<ExtentHeader>(&self.root, 0)?;
         let depth = header.depth.get();
         if depth > 5 {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
-        let changed =
-            self.materialize_extent_node(storage, inode, &mut bytes, 4, depth, logical, owned)?;
+        let changed = self
+            .io
+            .materialize_extent_node(&mut self.root, 4, depth, logical)?;
         if !changed.zero {
             return Ok((changed.physical, false));
         }
-        if usize::from(record_at::<ExtentHeader>(&bytes, 0)?.entries.get()) > 4 {
+        if usize::from(record_at::<ExtentHeader>(&self.root, 0)?.entries.get()) > 4 {
             if depth == 5 {
                 return Err(Unsupported::ExtentMutation.into());
             }
-            let child = self.allocate_block(storage)?;
-            *owned += 1;
-            let capacity = self.extent_capacity()?;
-            let mut promoted = record_at::<ExtentHeader>(&bytes, 0)?;
+            let child = self.io.graph.allocate_block(self.io.storage)?;
+            self.io.owned += 1;
+            let capacity = self.io.extent_capacity()?;
+            let mut promoted = record_at::<ExtentHeader>(&self.root, 0)?;
             promoted.max_entries.set(capacity as u16);
             let record_bytes = usize::from(promoted.entries.get()) * size_of::<Extent>();
-            let mut child_bytes = self.extent_buffer()?;
+            let mut child_bytes = self.io.extent_buffer()?;
             write_record_at(&mut child_bytes, 0, &promoted)?;
             child_bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + record_bytes]
                 .copy_from_slice(
-                    &bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + record_bytes],
+                    &self.root[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + record_bytes],
                 );
-            self.write_extent_node(storage, inode, child, &mut child_bytes)?;
+            self.io.write_extent_node(child, &mut child_bytes)?;
 
-            bytes.fill(0);
+            self.root.fill(0);
             let mut root_header = promoted;
             root_header.entries.set(1);
             root_header.max_entries.set(4);
             root_header.depth.set(depth + 1);
-            write_record_at(&mut bytes, 0, &root_header)?;
+            write_record_at(&mut self.root, 0, &root_header)?;
             write_record_at(
-                &mut bytes,
+                &mut self.root,
                 size_of::<ExtentHeader>(),
                 &ExtentIndex::from_child(changed.first, child)?,
             )?;
         }
-        root.copy_from_slice(&bytes[..60]);
         Ok((changed.physical, changed.zero))
     }
+}
 
-    fn release_extent(
-        &mut self,
-        storage: &mut dyn Storage,
-        extent: Extent,
-        first: u64,
-        owned: &mut i64,
-    ) -> Result<Option<Extent>, Error> {
+impl ExtentIo<'_> {
+    #[inline(never)]
+    fn release_extent(&mut self, extent: Extent, first: u64) -> Result<Option<Extent>, Error> {
         let keep = first
             .saturating_sub(extent.logical())
             .min(u64::from(extent.blocks()));
         let release = u64::from(extent.blocks()) - keep;
         for offset in 0..release {
-            self.release_block(storage, extent.physical() + keep + offset)?;
-            *owned -= 1;
+            self.graph
+                .release_block(self.storage, extent.physical() + keep + offset)?;
+            self.owned -= 1;
         }
         if keep == 0 {
             Ok(None)
@@ -2971,34 +3062,29 @@ impl Ext4 {
         }
     }
 
+    #[inline(never)]
     fn truncate_external_extent(
         &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
         block: u64,
         depth: u16,
         first: u64,
-        owned: &mut i64,
     ) -> Result<bool, Error> {
-        let mut bytes = self.read_extent_node(storage, inode, block, depth)?;
+        let mut bytes = self.read_extent_node(block, depth)?;
         let capacity = self.extent_capacity()?;
-        self.truncate_extent_node(storage, inode, &mut bytes, capacity, depth, first, owned)?;
+        self.truncate_extent_node(&mut bytes, capacity, depth, first)?;
         if record_at::<ExtentHeader>(&bytes, 0)?.entries.get() == 0 {
             return Ok(true);
         }
-        self.write_extent_node(storage, inode, block, &mut bytes)?;
+        self.write_extent_node(block, &mut bytes)?;
         Ok(false)
     }
 
     fn truncate_extent_node(
         &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
         bytes: &mut [u8],
         capacity: usize,
         depth: u16,
         first: u64,
-        owned: &mut i64,
     ) -> Result<(), Error> {
         if depth == 0 {
             let mut node = ExtentNode::<Extent>::open(bytes, capacity, depth)?;
@@ -3010,7 +3096,7 @@ impl Ext4 {
                 let retained = if extent.end() <= first {
                     Some(extent)
                 } else {
-                    self.release_extent(storage, extent, first, owned)?
+                    self.release_extent(extent, first)?
                 };
                 if let Some(extent) = retained {
                     node.slots[write] = extent;
@@ -3030,16 +3116,9 @@ impl Ext4 {
         let mut write = start;
         for read in start..count {
             let index = node.slots[read];
-            if self.truncate_external_extent(
-                storage,
-                inode,
-                index.block(),
-                depth - 1,
-                first,
-                owned,
-            )? {
-                self.release_block(storage, index.block())?;
-                *owned -= 1;
+            if self.truncate_external_extent(index.block(), depth - 1, first)? {
+                self.graph.release_block(self.storage, index.block())?;
+                self.owned -= 1;
             } else {
                 node.slots[write] = index;
                 write += 1;
@@ -3047,61 +3126,140 @@ impl Ext4 {
         }
         node.truncate(write)
     }
+}
 
+impl ExtentTree<'_> {
     #[inline(never)]
-    fn truncate_root_extent(
-        &mut self,
-        storage: &mut dyn Storage,
-        inode: &Inode,
-        root: &mut [u8; 60],
-        first: u64,
-        owned: &mut i64,
-    ) -> Result<(), Error> {
-        let mut bytes = [0; 60 + 2 * size_of::<Extent>()];
-        bytes[..60].copy_from_slice(root);
-        let header = record_at::<ExtentHeader>(&bytes, 0)?;
+    fn truncate(&mut self, first: u64) -> Result<(), Error> {
+        let header = record_at::<ExtentHeader>(&self.root, 0)?;
         let depth = header.depth.get();
         if depth > 5 {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
-        self.truncate_extent_node(storage, inode, &mut bytes, 4, depth, first, owned)?;
-        if record_at::<ExtentHeader>(&bytes, 0)?.entries.get() == 0 {
-            bytes.fill(0);
+        self.io
+            .truncate_extent_node(&mut self.root, 4, depth, first)?;
+        if record_at::<ExtentHeader>(&self.root, 0)?.entries.get() == 0 {
+            self.root.fill(0);
             let mut empty = ExtentHeader::zeroed();
             empty.magic.set(EXTENT_MAGIC);
             empty.max_entries.set(4);
-            write_record_at(&mut bytes, 0, &empty)?;
+            write_record_at(&mut self.root, 0, &empty)?;
         }
 
         loop {
-            let header = record_at::<ExtentHeader>(&bytes, 0)?;
+            let header = record_at::<ExtentHeader>(&self.root, 0)?;
             if header.depth.get() == 0 || header.entries.get() != 1 {
                 break;
             }
-            let index = record_at::<ExtentIndex>(&bytes, size_of::<ExtentHeader>())?;
-            let child_bytes =
-                self.read_extent_node(storage, inode, index.block(), header.depth.get() - 1)?;
+            let index = record_at::<ExtentIndex>(&self.root, size_of::<ExtentHeader>())?;
+            let child_bytes = self
+                .io
+                .read_extent_node(index.block(), header.depth.get() - 1)?;
             let child = record_at::<ExtentHeader>(&child_bytes, 0)?;
             if child.entries.get() > 4 {
                 break;
             }
-            bytes.fill(0);
+            self.root.fill(0);
             let mut collapsed = child;
             collapsed.max_entries.set(4);
-            write_record_at(&mut bytes, 0, &collapsed)?;
+            write_record_at(&mut self.root, 0, &collapsed)?;
             let entry_bytes = usize::from(child.entries.get()) * size_of::<Extent>();
-            bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes]
+            self.root[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes]
                 .copy_from_slice(
                     &child_bytes
                         [size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes],
                 );
-            self.release_block(storage, index.block())?;
-            *owned -= 1;
+            self.io
+                .graph
+                .release_block(self.io.storage, index.block())?;
+            self.io.owned -= 1;
         }
-        root.copy_from_slice(&bytes[..60]);
         Ok(())
     }
 
+    fn lookup(&mut self, logical: u64) -> Result<Option<u64>, Error> {
+        let mut inode = self.io.inode;
+        inode.block.copy_from_slice(&self.root[..60]);
+        self.io.graph.map_extent(self.io.storage, &inode, logical)
+    }
+
+    #[inline(never)]
+    fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), Error> {
+        let block_size = u64::from(self.io.graph.block_size);
+        let end = offset
+            .checked_add(input.len() as u64)
+            .ok_or(Corrupt::AddressOverflow)?;
+        let mut zero = Vec::new();
+        let mut position = offset;
+        let mut consumed = 0;
+        while position < end {
+            let within = position % block_size;
+            let count = usize::try_from((end - position).min(block_size - within))
+                .map_err(|_| Corrupt::AddressOverflow)?;
+            let (physical, initialize) = self.materialize(
+                u32::try_from(position / block_size).map_err(|_| Corrupt::AddressOverflow)?,
+            )?;
+            let address = physical
+                .checked_mul(block_size)
+                .and_then(|value| value.checked_add(within))
+                .ok_or(Corrupt::AddressOverflow)?;
+            if initialize {
+                if zero.is_empty() {
+                    zero.try_reserve_exact(block_size as usize)
+                        .map_err(|_| Error::OutOfMemory)?;
+                    zero.resize(block_size as usize, 0);
+                }
+                write_storage(self.io.storage, physical * block_size, &zero)?;
+            }
+            write_storage(self.io.storage, address, &input[consumed..consumed + count])?;
+            position += count as u64;
+            consumed += count;
+        }
+        Ok(())
+    }
+
+    fn finish(self, size: u64) -> Result<(), Error> {
+        if size == self.io.inode.size
+            && self.io.owned == 0
+            && self.root[..60] == self.io.inode.block
+        {
+            return Ok(());
+        }
+        let root = self.root;
+        let ExtentIo {
+            graph,
+            storage,
+            inode,
+            owned,
+        } = self.io;
+        let blocks_512 = inode
+            .blocks_512
+            .checked_add_signed(
+                owned
+                    .checked_mul(i64::from(graph.block_size / 512))
+                    .ok_or(Corrupt::AddressOverflow)?,
+            )
+            .ok_or(Corrupt::AddressOverflow)?;
+        graph.edit_inode(storage, inode.number, &mut |base, current| {
+            if current.generation != inode.generation {
+                return Err(Error::NotFound);
+            }
+            base.size_lo.set(size as u32);
+            base.size_hi.set((size >> 32) as u32);
+            base.blocks_lo.set(blocks_512 as u32);
+            let mut os_data =
+                bytemuck::pod_read_unaligned::<LinuxInodeOsData2>(&base.os_dependent_2);
+            os_data.blocks_hi.set((blocks_512 >> 32) as u16);
+            base.os_dependent_2
+                .copy_from_slice(bytemuck::bytes_of(&os_data));
+            base.block.copy_from_slice(&root[..60]);
+            Ok(())
+        })?;
+        Ok(())
+    }
+}
+
+impl Ext4 {
     pub fn write(
         &mut self,
         storage: &mut dyn Storage,
@@ -3133,29 +3291,16 @@ impl Ext4 {
             let raw = self.inode_raw(storage, inode.number)?;
             if end <= Self::inline_capacity(&raw, inode)? as u64 {
                 let start = usize::try_from(offset).map_err(|_| Corrupt::AddressOverflow)?;
-                let finish = usize::try_from(end).map_err(|_| Corrupt::AddressOverflow)?;
-                self.edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
-                    if current.generation != inode.generation || current.object() != object {
-                        return Err(Error::NotFound);
-                    }
-                    if offset > current.size {
-                        Self::fill_inline(
-                            raw,
-                            base,
-                            current,
-                            usize::try_from(current.size).map_err(|_| Corrupt::AddressOverflow)?,
-                            start,
-                            0,
-                        )?;
-                    }
-                    Self::copy_inline(raw, base, current, start, input)?;
-                    if end > current.size {
-                        base.size_lo.set(finish as u32);
-                        base.size_hi.set((end >> 32) as u32);
-                    }
-                    Ok(())
-                })?;
-                return Ok(());
+                return self.mutate_inline(
+                    storage,
+                    object,
+                    inode,
+                    InlineMutation::Write {
+                        offset: start,
+                        end,
+                        input,
+                    },
+                );
             }
             self.convert_inline_to_extents(storage, object, inode)?;
             return self.write_object(storage, object, offset, input);
@@ -3172,42 +3317,10 @@ impl Ext4 {
             self.resize_object(storage, object, end)?;
             inode = self.inode(storage, object.number())?;
         }
-        let mut root = inode.block;
-        let mut owned = 0i64;
-        let mut zero = Vec::new();
-        let mut position = offset;
-        let mut consumed = 0;
-        while position < end {
-            let within = position % block_size;
-            let count = usize::try_from((end - position).min(block_size - within))
-                .map_err(|_| Corrupt::AddressOverflow)?;
-            let (physical, initialize) = self.materialize_root(
-                storage,
-                &inode,
-                &mut root,
-                u32::try_from(position / block_size).map_err(|_| Corrupt::AddressOverflow)?,
-                &mut owned,
-            )?;
-            let address = physical
-                .checked_mul(block_size)
-                .and_then(|value| value.checked_add(within))
-                .ok_or(Corrupt::AddressOverflow)?;
-            if initialize {
-                if zero.is_empty() {
-                    zero.try_reserve_exact(self.block_size as usize)
-                        .map_err(|_| Error::OutOfMemory)?;
-                    zero.resize(self.block_size as usize, 0);
-                }
-                write_storage(storage, physical * block_size, &zero)?;
-            }
-            write_storage(storage, address, &input[consumed..consumed + count])?;
-            position += count as u64;
-            consumed += count;
-        }
-        if owned != 0 || root != inode.block {
-            self.store_extent_inode(storage, inode, root, owned, inode.size)?;
-        }
-        Ok(())
+        let final_size = inode.size;
+        let mut tree = ExtentTree::new(self, storage, inode);
+        tree.write(offset, input)?;
+        tree.finish(final_size)
     }
 
     pub fn resize(
@@ -3235,26 +3348,7 @@ impl Ext4 {
         if matches!(object, Object::Blob(_)) && inode.has_inline_bytes() {
             let raw = self.inode_raw(storage, inode.number)?;
             if size <= Self::inline_capacity(&raw, inode)? as u64 {
-                return self
-                    .edit_inode_raw(storage, inode.number, &mut |raw, base, current| {
-                        if current.generation != inode.generation || current.object() != object {
-                            return Err(Error::NotFound);
-                        }
-                        Self::fill_inline(
-                            raw,
-                            base,
-                            current,
-                            usize::try_from(size.min(current.size))
-                                .map_err(|_| Corrupt::AddressOverflow)?,
-                            usize::try_from(size.max(current.size))
-                                .map_err(|_| Corrupt::AddressOverflow)?,
-                            0,
-                        )?;
-                        base.size_lo.set(size as u32);
-                        base.size_hi.set((size >> 32) as u32);
-                        Ok(())
-                    })
-                    .map(|_| ());
+                return self.mutate_inline(storage, object, inode, InlineMutation::Resize(size));
             }
             self.convert_inline_to_extents(storage, object, inode)?;
             return self.resize_object(storage, object, size);
@@ -3271,18 +3365,15 @@ impl Ext4 {
         if self.cluster_size != self.block_size || new_blocks > 1_u64 << 32 {
             return Err(Unsupported::ExtentMutation.into());
         }
-        let mut root = inode.block;
-        let mut owned = 0i64;
+        let mut tree = ExtentTree::new(self, storage, inode);
         if size < inode.size {
-            self.truncate_root_extent(storage, &inode, &mut root, new_blocks, &mut owned)?;
+            tree.truncate(new_blocks)?;
         }
 
         let zero_from = if size < inode.size { size } else { inode.size };
         if zero_from % block_size != 0 {
             let logical = zero_from / block_size;
-            let mut current = inode;
-            current.block = root;
-            if let Some(physical) = self.map_extent(storage, &current, logical)? {
+            if let Some(physical) = tree.lookup(logical)? {
                 let within = zero_from % block_size;
                 let count =
                     usize::try_from(block_size - within).map_err(|_| Corrupt::AddressOverflow)?;
@@ -3290,11 +3381,11 @@ impl Ext4 {
                 zero.try_reserve_exact(count)
                     .map_err(|_| Error::OutOfMemory)?;
                 zero.resize(count, 0);
-                write_storage(storage, physical * block_size + within, &zero)?;
+                write_storage(tree.io.storage, physical * block_size + within, &zero)?;
             }
         }
 
-        self.store_extent_inode(storage, inode, root, owned, size)
+        tree.finish(size)
     }
 
     #[inline(never)]
@@ -3355,30 +3446,59 @@ impl Ext4 {
         })
     }
 
+    #[inline(never)]
     fn back_edge(&self, storage: &mut dyn Storage, node: Node) -> Result<Node, Error> {
         let inode = self.inode(storage, node.number())?;
-        let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
-        let block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
-        block
+        let mut node_block = self.read_node_block(storage, &inode, 0)?;
+        node_block
+            .directory(self.block_size as usize)?
             .find(b"..")?
             .map(|(_, header)| Node(header.inode.get()))
             .ok_or(Corrupt::InvalidDirectory.into())
     }
 
+    #[inline(never)]
     fn set_back_edge(
         &mut self,
         storage: &mut dyn Storage,
         node: Node,
+        expected: Node,
         target: Node,
     ) -> Result<(), Error> {
         let inode = self.inode(storage, node.number())?;
-        let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
+        let mut node_block = self.read_node_block(storage, &inode, 0)?;
         {
-            let mut block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
+            let mut block = node_block.directory(self.block_size as usize)?;
             let (offset, header) = block.find(b"..")?.ok_or(Corrupt::InvalidDirectory)?;
+            if header.inode.get() != expected.number() {
+                return Err(Corrupt::InvalidDirectory.into());
+            }
             block.set_object(offset, header, target.number(), header.file_type)?;
         }
-        self.store_node_block(storage, &inode, 0, &mut bytes, end)
+        self.store_node_block(storage, &inode, 0, &mut node_block)
+    }
+
+    #[inline(never)]
+    fn reparent_node(
+        &mut self,
+        storage: &mut dyn Storage,
+        node: Node,
+        from: Node,
+        to: Node,
+        parent_generation: Option<u32>,
+    ) -> Result<(), Error> {
+        let (parent, change) = match (from == node, to == node) {
+            (true, false) => (to, 1),
+            (false, true) => (from, -1),
+            _ => return Err(Error::InvalidArgument),
+        };
+        let generation = match parent_generation {
+            Some(generation) => generation,
+            None => self.inode(storage, parent.number())?.generation,
+        };
+        self.set_back_edge(storage, node, from, to)?;
+        self.change_references(storage, Object::Node(parent), generation, change)?;
+        Ok(())
     }
 
     /// Replace an ext4 hash index with its equivalent linear edge array.
@@ -3398,30 +3518,13 @@ impl Ext4 {
             return Ok(inode);
         }
 
-        let (mut bytes, end) = self.node_block(storage, &inode, 0)?;
-        {
-            let mut block = DirectoryBlock::new(&mut bytes, end, self.block_size as usize);
-            let dot = block.record(0)?;
-            let dot_length = dot.length;
-            if dot.header.inode.get() != node.number()
-                || block.name(0, dot) != b"."
-                || dot_length < 12
-                || dot_length >= end
-            {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-            // The htree root occupies the slack of this `..` record, so its
-            // original length still spans the indexed block rather than the
-            // linear leaf boundary we are about to establish.
-            let parent = block.record_prefix(dot_length)?;
-            let parent_inode = parent.header.inode.get();
-            if parent_inode == 0 || block.name(dot_length, parent) != b".." {
-                return Err(Corrupt::InvalidDirectory.into());
-            }
-            block.write(0, node.number(), dot_length, b".", 2)?;
-            block.write(dot_length, parent_inode, end - dot_length, b"..", 2)?;
-        }
-        self.store_node_block(storage, &inode, 0, &mut bytes, end)?;
+        let mut node_block = self.read_node_block(storage, &inode, 0)?;
+        node_block.linearize(
+            node,
+            self.block_size as usize,
+            self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0,
+        )?;
+        self.store_node_block(storage, &inode, 0, &mut node_block)?;
         self.edit_inode(storage, inode.number, &mut |base, current| {
             if current.generation != inode.generation || current.object() != Object::Node(node) {
                 return Err(Error::NotFound);
@@ -3431,6 +3534,7 @@ impl Ext4 {
         })
     }
 
+    #[inline(never)]
     fn insert_edge(
         &mut self,
         storage: &mut dyn Storage,
@@ -3441,14 +3545,14 @@ impl Ext4 {
         let mut inode = self.linearize_node(storage, parent)?;
         let blocks = inode.size.div_ceil(u64::from(self.block_size));
         for logical in 0..blocks {
-            let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
-            let inserted = DirectoryBlock::new(&mut bytes, end, self.block_size as usize).insert(
+            let mut node_block = self.read_node_block(storage, &inode, logical)?;
+            let inserted = node_block.directory(self.block_size as usize)?.insert(
                 name,
                 target.number,
                 Self::edge_type(target),
             )?;
             if let Some(mut inserted) = inserted {
-                self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
+                self.store_node_block(storage, &inode, logical, &mut node_block)?;
                 inserted.offset += logical as usize * self.block_size as usize;
                 return Ok(inserted);
             }
@@ -3471,14 +3575,19 @@ impl Ext4 {
             } else {
                 0
             };
-        DirectoryBlock::new(&mut bytes, end, self.block_size as usize).write(
+        let mut node_block = NodeBlock {
+            bytes,
+            data_end: end,
+            kind: NodeBlockKind::Leaf,
+        };
+        node_block.directory(self.block_size as usize)?.write(
             0,
             target.number,
             end,
             name,
             Self::edge_type(target),
         )?;
-        self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
+        self.store_node_block(storage, &inode, logical, &mut node_block)?;
         Ok(EdgeInsertion {
             offset: logical as usize * self.block_size as usize,
             replaced: None,
@@ -3494,14 +3603,14 @@ impl Ext4 {
         let inode = self.linearize_node(storage, parent)?;
         let logical = edge.offset / u64::from(self.block_size);
         let within = (edge.offset % u64::from(self.block_size)) as usize;
-        let (mut bytes, end) = self.node_block(storage, &inode, logical)?;
-        DirectoryBlock::new(&mut bytes, end, self.block_size as usize)
+        let mut node_block = self.read_node_block(storage, &inode, logical)?;
+        node_block
+            .directory(self.block_size as usize)?
             .remove(within, edge.object)?;
-        self.store_node_block(storage, &inode, logical, &mut bytes, end)?;
+        self.store_node_block(storage, &inode, logical, &mut node_block)?;
         let target = self.inode(storage, edge.object)?;
         if let Object::Node(node) = target.object() {
-            self.set_back_edge(storage, node, node)?;
-            self.change_references(storage, Object::Node(parent), inode.generation, -1)?;
+            self.reparent_node(storage, node, parent, node, Some(inode.generation))?;
         }
         Ok(Detached {
             object: target.object(),
@@ -3538,9 +3647,7 @@ impl Ext4 {
         let displaced = if let Some(number) = inserted.replaced {
             let inode = self.inode(storage, number)?;
             if let Object::Node(node) = inode.object() {
-                self.set_back_edge(storage, node, node)?;
-                let parent_inode = self.inode(storage, parent.number())?;
-                self.change_references(storage, Object::Node(parent), parent_inode.generation, -1)?;
+                self.reparent_node(storage, node, parent, node, None)?;
             }
             Some(Detached {
                 object: inode.object(),
@@ -3550,9 +3657,7 @@ impl Ext4 {
             None
         };
         if let Object::Node(node) = object.object {
-            self.set_back_edge(storage, node, parent)?;
-            let parent_inode = self.inode(storage, parent.number())?;
-            self.change_references(storage, Object::Node(parent), parent_inode.generation, 1)?;
+            self.reparent_node(storage, node, node, parent, None)?;
         }
         Ok((
             EdgeHandle {
@@ -4062,6 +4167,55 @@ pub(crate) struct DirectoryEntryTail {
     pub checksum: Le32,
 }
 
+/// Fixed 32-byte prefix preceding the count/limit pair in an htree root.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeRootPrefix {
+    dot: DirectoryEntryHeader,
+    dot_name: [u8; 4],
+    dotdot: DirectoryEntryHeader,
+    dotdot_name: [u8; 4],
+    info: HtreeRootInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeRootInfo {
+    reserved_zero: Le32,
+    hash_version: u8,
+    info_length: u8,
+    indirect_levels: u8,
+    unused_flags: u8,
+}
+
+/// Fake directory record preceding entries in a non-root htree node.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeIndexPrefix {
+    fake: DirectoryEntryHeader,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeCountLimit {
+    limit: Le16,
+    count: Le16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeEntry {
+    hash: Le32,
+    block: Le32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct HtreeTail {
+    reserved: Le32,
+    checksum: Le32,
+}
+
 /// Header of an external extended-attribute block.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -4104,5 +4258,11 @@ const _: [(); 60] = [(); size_of::<ExtentLeafRoot>()];
 const _: [(); 60] = [(); size_of::<ExtentIndexRoot>()];
 const _: [(); 8] = [(); size_of::<DirectoryEntryHeader>()];
 const _: [(); 12] = [(); size_of::<DirectoryEntryTail>()];
+const _: [(); 32] = [(); size_of::<HtreeRootPrefix>()];
+const _: [(); 8] = [(); size_of::<HtreeRootInfo>()];
+const _: [(); 8] = [(); size_of::<HtreeIndexPrefix>()];
+const _: [(); 4] = [(); size_of::<HtreeCountLimit>()];
+const _: [(); 8] = [(); size_of::<HtreeEntry>()];
+const _: [(); 8] = [(); size_of::<HtreeTail>()];
 const _: [(); 32] = [(); size_of::<XattrHeader>()];
 const _: [(); 16] = [(); size_of::<XattrEntryHeader>()];

@@ -25,7 +25,7 @@ use core::fmt;
 
 pub use filesystem::Filesystem;
 pub use journal::GraphJournal;
-pub use overlay::BlockOverlay;
+pub use overlay::{BlockChanges, BlockOverlay};
 pub use storage::{Storage, StorageError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

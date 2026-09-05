@@ -595,14 +595,21 @@ fn graph_api_mutates_indexed_node_through_linear_graph_representation() {
     graph
         .edges(&mut storage, root, Default::default(), &mut |edge| {
             if edge.name == b"dir" {
-                directory = Some(edge.object);
+                directory = Some((edge.handle, edge.object));
             }
             Ok(true)
         })
         .unwrap();
-    let Object::Node(directory) = directory.unwrap() else {
+    let (directory_edge, Object::Node(directory)) = directory.unwrap() else {
         panic!("dir is not a node")
     };
+
+    // Reparent the indexed node without first linearizing its own contents.
+    // Its intrinsic `..` record changes, but the htree and its checksum must
+    // remain an indexed directory until an edge mutation requires conversion.
+    let detached = graph.detach(&mut storage, directory_edge).unwrap();
+    let (_, displaced) = graph.attach(&mut storage, root, b"dir", detached).unwrap();
+    assert!(displaced.is_none());
 
     let mut original_edges = 0;
     let mut found_last = false;
@@ -783,7 +790,7 @@ fn graph_composition_commits_complete_blocks_through_journal() {
 #[test]
 fn every_graph_journal_commit_effect_recovers_to_old_or_new_graph() {
     use portable_ext4::ext4::{Ext4 as Graph, Object};
-    use portable_ext4::{BlockOverlay, GraphJournal, Storage, StorageError};
+    use portable_ext4::{BlockChanges, BlockOverlay, GraphJournal, Storage, StorageError};
 
     struct Recovered<'a> {
         journal: &'a GraphJournal,
@@ -813,7 +820,7 @@ fn every_graph_journal_commit_effect_recovers_to_old_or_new_graph() {
         }
     }
 
-    fn prepare(storage: &mut ModelStorage) -> (Graph, GraphJournal, Vec<(u64, Vec<u8>)>) {
+    fn prepare(storage: &mut ModelStorage) -> (Graph, GraphJournal, BlockChanges) {
         let mut graph = Graph::mount(storage).unwrap();
         let journal = GraphJournal::mount(&mut graph, storage).unwrap();
         let mut recovered = Recovered {
@@ -927,10 +934,12 @@ fn handle_filesystem_journals_atomic_graph_composition() {
         .unwrap();
     assert_eq!(found, object);
     filesystem.remove(&mut storage, edge).unwrap();
-    assert!(filesystem
-        .find(&mut storage, root, b"handle-file")
-        .unwrap()
-        .is_none());
+    assert!(
+        filesystem
+            .find(&mut storage, root, b"handle-file")
+            .unwrap()
+            .is_none()
+    );
 
     let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("handle-filesystem.img");
@@ -978,9 +987,7 @@ fn handle_filesystem_journals_runtime_block_sizes() {
 
         // These do not alter allocation counters and therefore prove that a
         // journal transaction need not contain the ext4 superblock.
-        filesystem
-            .write(&mut storage, seed, 0, b"RUNTIME")
-            .unwrap();
+        filesystem.write(&mut storage, seed, 0, b"RUNTIME").unwrap();
         filesystem
             .update_attributes(
                 &mut storage,
