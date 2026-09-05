@@ -128,6 +128,11 @@ pub struct Edge<'a> {
     pub name: &'a [u8],
 }
 
+enum EdgeVisitor<'a> {
+    Edge(&'a mut dyn FnMut(Edge<'_>) -> Result<bool, Error>),
+    Entry(&'a mut dyn FnMut(Edge<'_>, ObjectInfo) -> Result<bool, Error>),
+}
+
 /// Information intrinsic to the ext4 graph, without POSIX interpretation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ObjectInfo {
@@ -405,9 +410,99 @@ impl ExtentIndex {
 }
 
 #[derive(Clone, Copy)]
-enum ExtentNode<'a> {
+enum ExtentLocation<'a> {
     Root(&'a [u8; 60]),
     Block(u64),
+}
+
+/// An editable view of the extent records stored directly after a header.
+///
+/// `capacity` is the on-disk capacity. The backing buffer may contain two
+/// scratch records so splitting an unwritten extent can be expressed in place
+/// before an overflowing node is divided.
+struct ExtentNode<'a, T> {
+    header: &'a mut ExtentHeader,
+    slots: &'a mut [T],
+}
+
+impl<'a, T: Pod + Copy> ExtentNode<'a, T> {
+    fn open(bytes: &'a mut [u8], capacity: usize, depth: u16) -> Result<Self, Error> {
+        let record_bytes = capacity
+            .checked_add(2)
+            .and_then(|count| count.checked_mul(size_of::<T>()))
+            .ok_or(Corrupt::AddressOverflow)?;
+        if bytes.len() < size_of::<ExtentHeader>() {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        let (header, records) = bytes.split_at_mut(size_of::<ExtentHeader>());
+        let records = records
+            .get_mut(..record_bytes)
+            .ok_or(Corrupt::InvalidExtentTree)?;
+        let header = bytemuck::from_bytes_mut::<ExtentHeader>(header);
+        if header.magic.get() != EXTENT_MAGIC
+            || header.depth.get() != depth
+            || usize::from(header.max_entries.get()) != capacity
+            || usize::from(header.entries.get()) > capacity
+        {
+            return Err(Corrupt::InvalidExtentHeader.into());
+        }
+        Ok(Self {
+            header,
+            slots: bytemuck::cast_slice_mut(records),
+        })
+    }
+
+    fn entries(&self) -> &[T] {
+        &self.slots[..usize::from(self.header.entries.get())]
+    }
+
+    fn entries_mut(&mut self) -> &mut [T] {
+        let count = usize::from(self.header.entries.get());
+        &mut self.slots[..count]
+    }
+
+    fn len(&self) -> usize {
+        usize::from(self.header.entries.get())
+    }
+
+    fn set_len(&mut self, len: usize) -> Result<(), Error> {
+        if len > self.slots.len() {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        self.header
+            .entries
+            .set(u16::try_from(len).map_err(|_| Corrupt::InvalidExtentTree)?);
+        Ok(())
+    }
+
+    fn insert(&mut self, at: usize, value: T) -> Result<(), Error> {
+        let len = self.len();
+        if at > len || len == self.slots.len() {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        self.slots.copy_within(at..len, at + 1);
+        self.slots[at] = value;
+        self.set_len(len + 1)
+    }
+
+    fn remove(&mut self, at: usize) -> Result<T, Error> {
+        let len = self.len();
+        let value = *self
+            .slots
+            .get(at)
+            .filter(|_| at < len)
+            .ok_or(Corrupt::InvalidExtentTree)?;
+        self.slots.copy_within(at + 1..len, at);
+        self.set_len(len - 1)?;
+        Ok(value)
+    }
+
+    fn truncate(&mut self, len: usize) -> Result<(), Error> {
+        if len > self.len() {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        self.set_len(len)
+    }
 }
 
 struct Group {
@@ -838,6 +933,29 @@ impl Ext4 {
         cursor: EdgeCursor,
         visit: &mut dyn FnMut(Edge<'_>) -> Result<bool, Error>,
     ) -> Result<Option<EdgeCursor>, Error> {
+        self.visit_edges(storage, node, cursor, EdgeVisitor::Edge(visit))
+    }
+
+    /// Visit edges together with the intrinsic information of their target.
+    /// The graph owns this join: callers should not have to copy names out of
+    /// the directory block merely to inspect each referenced object later.
+    pub fn entries(
+        &mut self,
+        storage: &mut dyn Storage,
+        node: Node,
+        cursor: EdgeCursor,
+        visit: &mut dyn FnMut(Edge<'_>, ObjectInfo) -> Result<bool, Error>,
+    ) -> Result<Option<EdgeCursor>, Error> {
+        self.visit_edges(storage, node, cursor, EdgeVisitor::Entry(visit))
+    }
+
+    fn visit_edges(
+        &mut self,
+        storage: &mut dyn Storage,
+        node: Node,
+        cursor: EdgeCursor,
+        mut visit: EdgeVisitor<'_>,
+    ) -> Result<Option<EdgeCursor>, Error> {
         let inode = self.inode(storage, node.number())?;
         if inode.object() != Object::Node(node) || cursor.0 > inode.size {
             return Err(Error::NotDirectory);
@@ -872,7 +990,7 @@ impl Ext4 {
                             2 => Object::Node(Node(object)),
                             _ => Object::Blob(Blob(object)),
                         };
-                        if !visit(Edge {
+                        let edge = Edge {
                             handle: EdgeHandle {
                                 node: node.number(),
                                 object,
@@ -880,7 +998,15 @@ impl Ext4 {
                             },
                             object: target,
                             name,
-                        })? {
+                        };
+                        let keep_going = match &mut visit {
+                            EdgeVisitor::Edge(visit) => visit(edge)?,
+                            EdgeVisitor::Entry(visit) => {
+                                let info = self.inspect(storage, target)?;
+                                visit(edge, info)?
+                            }
+                        };
+                        if !keep_going {
                             let resume = base + next as u64;
                             return Ok((resume < inode.size).then_some(EdgeCursor(resume)));
                         }
@@ -2120,16 +2246,16 @@ impl Ext4 {
     fn extent_record<T: Pod + Zeroable>(
         &self,
         storage: &mut dyn Storage,
-        node: ExtentNode<'_>,
+        node: ExtentLocation<'_>,
         offset: usize,
     ) -> Result<T, Error> {
         match node {
-            ExtentNode::Root(bytes) => bytes
+            ExtentLocation::Root(bytes) => bytes
                 .get(offset..offset + size_of::<T>())
                 .ok_or(Corrupt::InvalidExtentTree)
                 .map(bytemuck::pod_read_unaligned)
                 .map_err(Error::from),
-            ExtentNode::Block(block) => {
+            ExtentLocation::Block(block) => {
                 if block == 0
                     || block >= self.blocks_count
                     || offset + size_of::<T>() > self.block_size as usize
@@ -2152,7 +2278,7 @@ impl Ext4 {
         logical: u64,
     ) -> Result<Option<u64>, Error> {
         let logical = u32::try_from(logical).map_err(|_| Corrupt::InvalidExtentTree)?;
-        let mut node = ExtentNode::Root(&inode.block);
+        let mut node = ExtentLocation::Root(&inode.block);
         loop {
             let header: ExtentHeader = self.extent_record(storage, node, 0)?;
             if header.magic.get() != EXTENT_MAGIC {
@@ -2162,8 +2288,8 @@ impl Ext4 {
             let maximum = usize::from(header.max_entries.get());
             let depth = header.depth.get();
             let capacity = match node {
-                ExtentNode::Root(_) => 4,
-                ExtentNode::Block(_) => {
+                ExtentLocation::Root(_) => 4,
+                ExtentLocation::Block(_) => {
                     (self.block_size as usize - size_of::<ExtentHeader>()) / size_of::<Extent>()
                 }
             };
@@ -2199,7 +2325,7 @@ impl Ext4 {
                 )?;
                 let child =
                     u64::from(entry.child_lo.get()) | (u64::from(entry.child_hi.get()) << 32);
-                node = ExtentNode::Block(child);
+                node = ExtentLocation::Block(child);
                 continue;
             }
             let entry: Extent = self.extent_record(
@@ -2299,22 +2425,34 @@ impl Ext4 {
             .ok_or(Corrupt::InvalidExtentTree.into())
     }
 
+    fn extent_buffer(&self) -> Result<Vec<u8>, Error> {
+        let length = (self.block_size as usize)
+            .checked_add(2 * size_of::<Extent>())
+            .ok_or(Corrupt::AddressOverflow)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(length)
+            .map_err(|_| Error::OutOfMemory)?;
+        bytes.resize(length, 0);
+        Ok(bytes)
+    }
+
     fn read_extent_node(
         &self,
         storage: &mut dyn Storage,
         inode: &Inode,
         block: u64,
         depth: u16,
-    ) -> Result<(Vec<u8>, ExtentHeader), Error> {
+    ) -> Result<Vec<u8>, Error> {
         if block == 0 || block >= self.blocks_count {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bytes.resize(self.block_size as usize, 0);
-        read_storage(storage, block * u64::from(self.block_size), &mut bytes)?;
+        let mut bytes = self.extent_buffer()?;
+        read_storage(
+            storage,
+            block * u64::from(self.block_size),
+            &mut bytes[..self.block_size as usize],
+        )?;
         let header = record_at::<ExtentHeader>(&bytes, 0)?;
         let capacity = self.extent_capacity()?;
         if header.magic.get() != EXTENT_MAGIC
@@ -2335,75 +2473,73 @@ impl Ext4 {
                 return Err(Corrupt::ExtentChecksum(inode.number).into());
             }
         }
-        Ok((bytes, header))
+        Ok(bytes)
     }
 
     #[inline(never)]
-    fn write_extent_node<T: Pod>(
+    fn write_extent_node(
         &self,
         storage: &mut dyn Storage,
         inode: &Inode,
         block: u64,
-        depth: u16,
-        entries: &[T],
+        bytes: &mut [u8],
     ) -> Result<(), Error> {
-        if size_of::<T>() != size_of::<Extent>() || block == 0 || block >= self.blocks_count {
+        if block == 0 || block >= self.blocks_count || bytes.len() < self.block_size as usize {
             return Err(Corrupt::InvalidExtentTree.into());
         }
         let capacity = self.extent_capacity()?;
-        if entries.is_empty() || entries.len() > capacity {
+        let header = record_at::<ExtentHeader>(bytes, 0)?;
+        if header.magic.get() != EXTENT_MAGIC
+            || header.depth.get() > 5
+            || usize::from(header.max_entries.get()) != capacity
+            || usize::from(header.entries.get()) == 0
+            || usize::from(header.entries.get()) > capacity
+        {
             return Err(Corrupt::InvalidExtentTree.into());
         }
-        let mut bytes = Vec::new();
-        bytes
-            .try_reserve_exact(self.block_size as usize)
-            .map_err(|_| Error::OutOfMemory)?;
-        bytes.resize(self.block_size as usize, 0);
-        let mut header = ExtentHeader::zeroed();
-        header.magic.set(EXTENT_MAGIC);
-        header.entries.set(entries.len() as u16);
-        header.max_entries.set(capacity as u16);
-        header.depth.set(depth);
-        write_record_at(&mut bytes, 0, &header)?;
-        write_records(&mut bytes, size_of::<ExtentHeader>(), entries)?;
         if self.features.read_only_compatible & RO_COMPAT_METADATA_CSUM != 0 {
             let checksum_at = size_of::<ExtentHeader>() + capacity * size_of::<Extent>();
             let mut checksum = crate::checksum::Checksum::with_seed(self.checksum_seed);
             checksum.update_u32_le(inode.number);
             checksum.update_u32_le(inode.generation);
             checksum.update(&bytes[..checksum_at]);
-            write_record_at(&mut bytes, checksum_at, &Le32::new(checksum.finalize()))?;
+            write_record_at(bytes, checksum_at, &Le32::new(checksum.finalize()))?;
         }
-        write_storage(storage, block * u64::from(self.block_size), &bytes)
+        write_storage(
+            storage,
+            block * u64::from(self.block_size),
+            &bytes[..self.block_size as usize],
+        )
     }
 
     fn materialize_leaf(
         &mut self,
         storage: &mut dyn Storage,
-        entries: &mut Vec<Extent>,
+        node: &mut ExtentNode<'_, Extent>,
         logical: u32,
         owned: &mut i64,
     ) -> Result<(u64, bool), Error> {
-        validate_extents(entries)?;
-        let position = entries.partition_point(|extent| extent.logical_block.get() <= logical);
+        validate_extents(node.entries())?;
+        let position = node
+            .entries()
+            .partition_point(|extent| extent.logical_block.get() <= logical);
         if let Some(at) = position.checked_sub(1) {
-            if entries[at].end() <= u64::from(logical) {
-                return self.materialize_hole(storage, entries, logical, position, owned);
+            if node.entries()[at].end() <= u64::from(logical) {
+                return self.materialize_hole(storage, node, logical, position, owned);
             }
-            let extent = entries[at];
+            let extent = node.entries()[at];
             let physical = extent.physical() + u64::from(logical) - extent.logical();
             if !extent.is_unwritten() {
                 return Ok((physical, false));
             }
-            entries.try_reserve(2).map_err(|_| Error::OutOfMemory)?;
-            entries.remove(at);
+            node.remove(at)?;
             let before = logical - extent.logical_block.get();
             let after = extent.blocks() - before - 1;
             let mut insert = at;
             if before != 0 {
                 let mut left = extent;
                 left.set_blocks(before)?;
-                entries.insert(insert, left);
+                node.insert(insert, left)?;
                 insert += 1;
             }
             let mut middle = extent;
@@ -2411,7 +2547,7 @@ impl Ext4 {
             middle.length.set(1);
             middle.physical_start_hi.set((physical >> 32) as u16);
             middle.physical_start_lo.set(physical as u32);
-            entries.insert(insert, middle);
+            node.insert(insert, middle)?;
             insert += 1;
             if after != 0 {
                 let mut right = extent;
@@ -2419,33 +2555,115 @@ impl Ext4 {
                 right.physical_start_hi.set(((physical + 1) >> 32) as u16);
                 right.physical_start_lo.set((physical + 1) as u32);
                 right.set_blocks(after)?;
-                entries.insert(insert, right);
+                node.insert(insert, right)?;
             }
-            merge_extents(entries);
+            merge_extents(node)?;
             return Ok((physical, true));
         }
-        self.materialize_hole(storage, entries, logical, position, owned)
+        self.materialize_hole(storage, node, logical, position, owned)
     }
 
     fn materialize_hole(
         &mut self,
         storage: &mut dyn Storage,
-        entries: &mut Vec<Extent>,
+        node: &mut ExtentNode<'_, Extent>,
         logical: u32,
         position: usize,
         owned: &mut i64,
     ) -> Result<(u64, bool), Error> {
         let physical = self.allocate_block(storage)?;
         *owned += 1;
-        entries.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
         let mut extent = Extent::zeroed();
         extent.logical_block.set(logical);
         extent.length.set(1);
         extent.physical_start_hi.set((physical >> 32) as u16);
         extent.physical_start_lo.set(physical as u32);
-        entries.insert(position, extent);
-        merge_extents(entries);
+        node.insert(position, extent)?;
+        merge_extents(node)?;
         Ok((physical, true))
+    }
+
+    fn materialize_extent_node(
+        &mut self,
+        storage: &mut dyn Storage,
+        inode: &Inode,
+        bytes: &mut [u8],
+        capacity: usize,
+        depth: u16,
+        logical: u32,
+        owned: &mut i64,
+    ) -> Result<Materialized, Error> {
+        if depth == 0 {
+            let mut node = ExtentNode::<Extent>::open(bytes, capacity, depth)?;
+            let (physical, zero) = self.materialize_leaf(storage, &mut node, logical, owned)?;
+            return Ok(Materialized {
+                physical,
+                zero,
+                first: node
+                    .entries()
+                    .first()
+                    .ok_or(Corrupt::InvalidExtentTree)?
+                    .logical_block
+                    .get(),
+                sibling: None,
+            });
+        }
+
+        let mut node = ExtentNode::<ExtentIndex>::open(bytes, capacity, depth)?;
+        validate_indexes(node.entries())?;
+        let at = node
+            .entries()
+            .partition_point(|index| index.logical() <= logical)
+            .saturating_sub(1);
+        let block = node
+            .entries()
+            .get(at)
+            .ok_or(Corrupt::InvalidExtentTree)?
+            .block();
+        let mut child =
+            self.materialize_external(storage, inode, block, depth - 1, logical, owned)?;
+        if child.zero {
+            node.entries_mut()[at].logical_block.set(child.first);
+            if let Some(sibling) = child.sibling.take() {
+                node.insert(at + 1, sibling)?;
+            }
+        }
+        child.first = node.entries()[0].logical();
+        Ok(child)
+    }
+
+    fn split_extent_node(
+        &mut self,
+        storage: &mut dyn Storage,
+        inode: &Inode,
+        bytes: &mut [u8],
+        owned: &mut i64,
+    ) -> Result<ExtentIndex, Error> {
+        let capacity = self.extent_capacity()?;
+        let mut header = record_at::<ExtentHeader>(bytes, 0)?;
+        let count = usize::from(header.entries.get());
+        if count <= capacity || count > capacity + 2 {
+            return Err(Corrupt::InvalidExtentTree.into());
+        }
+        let middle = count / 2;
+        let right_count = count - middle;
+        let records = size_of::<ExtentHeader>();
+        let source = records + middle * size_of::<Extent>();
+        let length = right_count * size_of::<Extent>();
+        let mut right = self.extent_buffer()?;
+        right[records..records + length].copy_from_slice(&bytes[source..source + length]);
+        let mut right_header = header;
+        right_header.entries.set(right_count as u16);
+        right_header.max_entries.set(capacity as u16);
+        write_record_at(&mut right, 0, &right_header)?;
+        header.entries.set(middle as u16);
+        write_record_at(bytes, 0, &header)?;
+
+        let sibling = self.allocate_block(storage)?;
+        *owned += 1;
+        self.write_extent_node(storage, inode, sibling, &mut right)?;
+        let first = extent_first(&right, header.depth.get())?;
+        ExtentIndex::from_child(first, sibling)
     }
 
     fn materialize_external(
@@ -2457,74 +2675,18 @@ impl Ext4 {
         logical: u32,
         owned: &mut i64,
     ) -> Result<Materialized, Error> {
-        let (bytes, header) = self.read_extent_node(storage, inode, block, depth)?;
-        let count = usize::from(header.entries.get());
+        let mut bytes = self.read_extent_node(storage, inode, block, depth)?;
         let capacity = self.extent_capacity()?;
-        if depth == 0 {
-            let mut entries = read_records::<Extent>(&bytes, size_of::<ExtentHeader>(), count)?;
-            let (physical, zero) = self.materialize_leaf(storage, &mut entries, logical, owned)?;
-            if !zero {
-                return Ok(Materialized {
-                    physical,
-                    zero,
-                    first: entries[0].logical_block.get(),
-                    sibling: None,
-                });
-            }
-            let sibling = if entries.len() > capacity {
-                let right = entries.split_off(entries.len() / 2);
-                let sibling = self.allocate_block(storage)?;
-                *owned += 1;
-                self.write_extent_node(storage, inode, sibling, 0, &right)?;
-                Some(ExtentIndex::from_child(
-                    right[0].logical_block.get(),
-                    sibling,
-                )?)
-            } else {
-                None
-            };
-            self.write_extent_node(storage, inode, block, 0, &entries)?;
-            return Ok(Materialized {
-                physical,
-                zero,
-                first: entries[0].logical_block.get(),
-                sibling,
-            });
-        }
-
-        let mut indexes = read_records::<ExtentIndex>(&bytes, size_of::<ExtentHeader>(), count)?;
-        validate_indexes(&indexes)?;
-        let at = indexes
-            .partition_point(|index| index.logical() <= logical)
-            .saturating_sub(1);
-        let mut child = self.materialize_external(
-            storage,
-            inode,
-            indexes[at].block(),
-            depth - 1,
-            logical,
-            owned,
-        )?;
+        let mut child = self
+            .materialize_extent_node(storage, inode, &mut bytes, capacity, depth, logical, owned)?;
         if !child.zero {
-            child.first = indexes[0].logical();
             return Ok(child);
         }
-        indexes[at].logical_block.set(child.first);
-        if let Some(sibling) = child.sibling.take() {
-            indexes.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-            indexes.insert(at + 1, sibling);
+        if usize::from(record_at::<ExtentHeader>(&bytes, 0)?.entries.get()) > capacity {
+            child.sibling = Some(self.split_extent_node(storage, inode, &mut bytes, owned)?);
         }
-        child.first = indexes[0].logical();
-        child.sibling = if indexes.len() > capacity {
-            let right = indexes.split_off(indexes.len() / 2);
-            let sibling = self.allocate_block(storage)?;
-            *owned += 1;
-            self.write_extent_node(storage, inode, sibling, depth, &right)?;
-            Some(ExtentIndex::from_child(right[0].logical(), sibling)?)
-        } else {
-            None
-        };
-        self.write_extent_node(storage, inode, block, depth, &indexes)?;
+        child.first = extent_first(&bytes, depth)?;
+        self.write_extent_node(storage, inode, block, &mut bytes)?;
         Ok(child)
     }
 
@@ -2537,86 +2699,49 @@ impl Ext4 {
         logical: u32,
         owned: &mut i64,
     ) -> Result<(u64, bool), Error> {
-        let mut header = record_at::<ExtentHeader>(root, 0)?;
-        if header.magic.get() != EXTENT_MAGIC
-            || header.max_entries.get() != 4
-            || header.entries.get() > 4
-            || header.depth.get() > 5
-        {
+        let mut bytes = [0; 60 + 2 * size_of::<Extent>()];
+        bytes[..60].copy_from_slice(root);
+        let header = record_at::<ExtentHeader>(&bytes, 0)?;
+        let depth = header.depth.get();
+        if depth > 5 {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
-        let count = usize::from(header.entries.get());
-        let depth = header.depth.get();
-        if depth == 0 {
-            let mut entries = read_records::<Extent>(root, size_of::<ExtentHeader>(), count)?;
-            let result = self.materialize_leaf(storage, &mut entries, logical, owned)?;
-            if !result.1 {
-                return Ok(result);
-            }
-            if entries.len() <= 4 {
-                root.fill(0);
-                header.entries.set(entries.len() as u16);
-                write_record_at(root, 0, &header)?;
-                write_records(root, size_of::<ExtentHeader>(), &entries)?;
-                return Ok(result);
-            }
-            let child = self.allocate_block(storage)?;
-            *owned += 1;
-            self.write_extent_node(storage, inode, child, 0, &entries)?;
-            root.fill(0);
-            header.entries.set(1);
-            header.depth.set(1);
-            write_record_at(root, 0, &header)?;
-            write_record_at(
-                root,
-                size_of::<ExtentHeader>(),
-                &ExtentIndex::from_child(entries[0].logical_block.get(), child)?,
-            )?;
-            return Ok(result);
-        }
-
-        let mut indexes = read_records::<ExtentIndex>(root, size_of::<ExtentHeader>(), count)?;
-        validate_indexes(&indexes)?;
-        let at = indexes
-            .partition_point(|index| index.logical() <= logical)
-            .saturating_sub(1);
-        let mut changed = self.materialize_external(
-            storage,
-            inode,
-            indexes[at].block(),
-            depth - 1,
-            logical,
-            owned,
-        )?;
+        let changed =
+            self.materialize_extent_node(storage, inode, &mut bytes, 4, depth, logical, owned)?;
         if !changed.zero {
             return Ok((changed.physical, false));
         }
-        indexes[at].logical_block.set(changed.first);
-        if let Some(sibling) = changed.sibling.take() {
-            indexes.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-            indexes.insert(at + 1, sibling);
-        }
-        root.fill(0);
-        if indexes.len() <= 4 {
-            header.entries.set(indexes.len() as u16);
-            write_record_at(root, 0, &header)?;
-            write_records(root, size_of::<ExtentHeader>(), &indexes)?;
-        } else {
+        if usize::from(record_at::<ExtentHeader>(&bytes, 0)?.entries.get()) > 4 {
             if depth == 5 {
                 return Err(Unsupported::ExtentMutation.into());
             }
             let child = self.allocate_block(storage)?;
             *owned += 1;
-            self.write_extent_node(storage, inode, child, depth, &indexes)?;
-            header.entries.set(1);
-            header.depth.set(depth + 1);
-            write_record_at(root, 0, &header)?;
+            let capacity = self.extent_capacity()?;
+            let mut promoted = record_at::<ExtentHeader>(&bytes, 0)?;
+            promoted.max_entries.set(capacity as u16);
+            let record_bytes = usize::from(promoted.entries.get()) * size_of::<Extent>();
+            let mut child_bytes = self.extent_buffer()?;
+            write_record_at(&mut child_bytes, 0, &promoted)?;
+            child_bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + record_bytes]
+                .copy_from_slice(
+                    &bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + record_bytes],
+                );
+            self.write_extent_node(storage, inode, child, &mut child_bytes)?;
+
+            bytes.fill(0);
+            let mut root_header = promoted;
+            root_header.entries.set(1);
+            root_header.max_entries.set(4);
+            root_header.depth.set(depth + 1);
+            write_record_at(&mut bytes, 0, &root_header)?;
             write_record_at(
-                root,
+                &mut bytes,
                 size_of::<ExtentHeader>(),
-                &ExtentIndex::from_child(indexes[0].logical(), child)?,
+                &ExtentIndex::from_child(changed.first, child)?,
             )?;
         }
+        root.copy_from_slice(&bytes[..60]);
         Ok((changed.physical, changed.zero))
     }
 
@@ -2653,40 +2778,56 @@ impl Ext4 {
         first: u64,
         owned: &mut i64,
     ) -> Result<bool, Error> {
-        let (bytes, header) = self.read_extent_node(storage, inode, block, depth)?;
-        let count = usize::from(header.entries.get());
+        let mut bytes = self.read_extent_node(storage, inode, block, depth)?;
+        let capacity = self.extent_capacity()?;
+        self.truncate_extent_node(storage, inode, &mut bytes, capacity, depth, first, owned)?;
+        if record_at::<ExtentHeader>(&bytes, 0)?.entries.get() == 0 {
+            return Ok(true);
+        }
+        self.write_extent_node(storage, inode, block, &mut bytes)?;
+        Ok(false)
+    }
+
+    fn truncate_extent_node(
+        &mut self,
+        storage: &mut dyn Storage,
+        inode: &Inode,
+        bytes: &mut [u8],
+        capacity: usize,
+        depth: u16,
+        first: u64,
+        owned: &mut i64,
+    ) -> Result<(), Error> {
         if depth == 0 {
-            let entries = read_records::<Extent>(&bytes, size_of::<ExtentHeader>(), count)?;
-            validate_extents(&entries)?;
-            let mut retained = Vec::new();
-            retained
-                .try_reserve_exact(entries.len())
-                .map_err(|_| Error::OutOfMemory)?;
-            for extent in entries {
-                if extent.end() <= first {
-                    retained.push(extent);
-                } else if let Some(extent) = self.release_extent(storage, extent, first, owned)? {
-                    retained.push(extent);
+            let mut node = ExtentNode::<Extent>::open(bytes, capacity, depth)?;
+            validate_extents(node.entries())?;
+            let count = node.len();
+            let mut write = 0;
+            for read in 0..count {
+                let extent = node.slots[read];
+                let retained = if extent.end() <= first {
+                    Some(extent)
+                } else {
+                    self.release_extent(storage, extent, first, owned)?
+                };
+                if let Some(extent) = retained {
+                    node.slots[write] = extent;
+                    write += 1;
                 }
             }
-            if retained.is_empty() {
-                return Ok(true);
-            }
-            self.write_extent_node(storage, inode, block, 0, &retained)?;
-            return Ok(false);
+            return node.truncate(write);
         }
 
-        let indexes = read_records::<ExtentIndex>(&bytes, size_of::<ExtentHeader>(), count)?;
-        validate_indexes(&indexes)?;
-        let start = indexes
+        let mut node = ExtentNode::<ExtentIndex>::open(bytes, capacity, depth)?;
+        validate_indexes(node.entries())?;
+        let count = node.len();
+        let start = node
+            .entries()
             .partition_point(|index| u64::from(index.logical()) < first)
             .saturating_sub(1);
-        let mut retained = Vec::new();
-        retained
-            .try_reserve_exact(indexes.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        retained.extend_from_slice(&indexes[..start]);
-        for index in &indexes[start..] {
+        let mut write = start;
+        for read in start..count {
+            let index = node.slots[read];
             if self.truncate_external_extent(
                 storage,
                 inode,
@@ -2698,14 +2839,11 @@ impl Ext4 {
                 self.release_block(storage, index.block())?;
                 *owned -= 1;
             } else {
-                retained.push(*index);
+                node.slots[write] = index;
+                write += 1;
             }
         }
-        if retained.is_empty() {
-            return Ok(true);
-        }
-        self.write_extent_node(storage, inode, block, depth, &retained)?;
-        Ok(false)
+        node.truncate(write)
     }
 
     #[inline(never)]
@@ -2717,98 +2855,48 @@ impl Ext4 {
         first: u64,
         owned: &mut i64,
     ) -> Result<(), Error> {
-        let header = record_at::<ExtentHeader>(root, 0)?;
-        if header.magic.get() != EXTENT_MAGIC
-            || header.max_entries.get() != 4
-            || header.entries.get() > 4
-            || header.depth.get() > 5
-        {
+        let mut bytes = [0; 60 + 2 * size_of::<Extent>()];
+        bytes[..60].copy_from_slice(root);
+        let header = record_at::<ExtentHeader>(&bytes, 0)?;
+        let depth = header.depth.get();
+        if depth > 5 {
             return Err(Corrupt::InvalidExtentHeader.into());
         }
-        let count = usize::from(header.entries.get());
-        let depth = header.depth.get();
-        if depth == 0 {
-            let entries = read_records::<Extent>(root, size_of::<ExtentHeader>(), count)?;
-            validate_extents(&entries)?;
-            let mut retained = Vec::new();
-            retained
-                .try_reserve_exact(entries.len())
-                .map_err(|_| Error::OutOfMemory)?;
-            for extent in entries {
-                if extent.end() <= first {
-                    retained.push(extent);
-                } else if let Some(extent) = self.release_extent(storage, extent, first, owned)? {
-                    retained.push(extent);
-                }
-            }
-            root.fill(0);
-            let mut changed = header;
-            changed.entries.set(retained.len() as u16);
-            write_record_at(root, 0, &changed)?;
-            return write_records(root, size_of::<ExtentHeader>(), &retained);
-        }
-
-        let indexes = read_records::<ExtentIndex>(root, size_of::<ExtentHeader>(), count)?;
-        validate_indexes(&indexes)?;
-        let start = indexes
-            .partition_point(|index| u64::from(index.logical()) < first)
-            .saturating_sub(1);
-        let mut retained = Vec::new();
-        retained
-            .try_reserve_exact(indexes.len())
-            .map_err(|_| Error::OutOfMemory)?;
-        retained.extend_from_slice(&indexes[..start]);
-        for index in &indexes[start..] {
-            if self.truncate_external_extent(
-                storage,
-                inode,
-                index.block(),
-                depth - 1,
-                first,
-                owned,
-            )? {
-                self.release_block(storage, index.block())?;
-                *owned -= 1;
-            } else {
-                retained.push(*index);
-            }
-        }
-        if retained.is_empty() {
-            root.fill(0);
+        self.truncate_extent_node(storage, inode, &mut bytes, 4, depth, first, owned)?;
+        if record_at::<ExtentHeader>(&bytes, 0)?.entries.get() == 0 {
+            bytes.fill(0);
             let mut empty = ExtentHeader::zeroed();
             empty.magic.set(EXTENT_MAGIC);
             empty.max_entries.set(4);
-            return write_record_at(root, 0, &empty);
+            write_record_at(&mut bytes, 0, &empty)?;
         }
-        root.fill(0);
-        let mut changed = header;
-        changed.entries.set(retained.len() as u16);
-        write_record_at(root, 0, &changed)?;
-        write_records(root, size_of::<ExtentHeader>(), &retained)?;
 
         loop {
-            let header = record_at::<ExtentHeader>(root, 0)?;
+            let header = record_at::<ExtentHeader>(&bytes, 0)?;
             if header.depth.get() == 0 || header.entries.get() != 1 {
                 break;
             }
-            let index = record_at::<ExtentIndex>(root, size_of::<ExtentHeader>())?;
-            let (bytes, child) =
+            let index = record_at::<ExtentIndex>(&bytes, size_of::<ExtentHeader>())?;
+            let child_bytes =
                 self.read_extent_node(storage, inode, index.block(), header.depth.get() - 1)?;
+            let child = record_at::<ExtentHeader>(&child_bytes, 0)?;
             if child.entries.get() > 4 {
                 break;
             }
-            root.fill(0);
+            bytes.fill(0);
             let mut collapsed = child;
             collapsed.max_entries.set(4);
-            write_record_at(root, 0, &collapsed)?;
+            write_record_at(&mut bytes, 0, &collapsed)?;
             let entry_bytes = usize::from(child.entries.get()) * size_of::<Extent>();
-            root[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes]
+            bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes]
                 .copy_from_slice(
-                    &bytes[size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes],
+                    &child_bytes
+                        [size_of::<ExtentHeader>()..size_of::<ExtentHeader>() + entry_bytes],
                 );
             self.release_block(storage, index.block())?;
             *owned -= 1;
         }
+        root.copy_from_slice(&bytes[..60]);
         Ok(())
     }
 
@@ -3007,6 +3095,7 @@ impl Ext4 {
         self.store_extent_inode(storage, inode, root, owned, size)
     }
 
+    #[inline(never)]
     pub fn create_blob(&mut self, storage: &mut dyn Storage) -> Result<Detached, Error> {
         let (number, generation) = self.allocate_inode(storage, false)?;
         Ok(Detached {
@@ -3015,6 +3104,7 @@ impl Ext4 {
         })
     }
 
+    #[inline(never)]
     pub fn create_node(&mut self, storage: &mut dyn Storage) -> Result<Detached, Error> {
         let (number, generation) = self.allocate_inode(storage, true)?;
         let block = self.allocate_block(storage)?;
@@ -3378,29 +3468,6 @@ fn write_record_at<T: Pod>(bytes: &mut [u8], offset: usize, record: &T) -> Resul
     Ok(())
 }
 
-fn read_records<T: Pod>(bytes: &[u8], offset: usize, count: usize) -> Result<Vec<T>, Error> {
-    let mut records = Vec::new();
-    records
-        .try_reserve_exact(count)
-        .map_err(|_| Error::OutOfMemory)?;
-    for index in 0..count {
-        records.push(record_at(bytes, offset + index * size_of::<T>())?);
-    }
-    Ok(records)
-}
-
-fn write_records<T: Pod>(bytes: &mut [u8], offset: usize, records: &[T]) -> Result<(), Error> {
-    let length = records
-        .len()
-        .checked_mul(size_of::<T>())
-        .ok_or(Corrupt::AddressOverflow)?;
-    bytes
-        .get_mut(offset..offset + length)
-        .ok_or(Corrupt::ReadPastEnd)?
-        .copy_from_slice(bytemuck::cast_slice(records));
-    Ok(())
-}
-
 fn validate_extents(extents: &[Extent]) -> Result<(), Error> {
     let mut previous = 0;
     for (index, extent) in extents.iter().enumerate() {
@@ -3416,17 +3483,29 @@ fn validate_extents(extents: &[Extent]) -> Result<(), Error> {
     Ok(())
 }
 
-fn merge_extents(extents: &mut Vec<Extent>) {
+fn extent_first(bytes: &[u8], depth: u16) -> Result<u32, Error> {
+    if depth == 0 {
+        Ok(record_at::<Extent>(bytes, size_of::<ExtentHeader>())?
+            .logical_block
+            .get())
+    } else {
+        Ok(record_at::<ExtentIndex>(bytes, size_of::<ExtentHeader>())?
+            .logical_block
+            .get())
+    }
+}
+
+fn merge_extents(extents: &mut ExtentNode<'_, Extent>) -> Result<(), Error> {
     let mut write = 0;
     for read in 0..extents.len() {
-        let extent = extents[read];
-        if write != 0 && extents[write - 1].append(extent) {
+        let extent = extents.slots[read];
+        if write != 0 && extents.slots[write - 1].append(extent) {
             continue;
         }
-        extents[write] = extent;
+        extents.slots[write] = extent;
         write += 1;
     }
-    extents.truncate(write);
+    extents.truncate(write)
 }
 
 fn validate_indexes(indexes: &[ExtentIndex]) -> Result<(), Error> {

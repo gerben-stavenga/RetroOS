@@ -213,7 +213,6 @@ pub fn refresh_catalog() {
             path,
         });
     }
-    found.sort_by(|a, b| a.name.cmp(&b.name));
     *CATALOG.lock() = found;
 }
 

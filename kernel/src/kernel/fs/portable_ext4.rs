@@ -122,28 +122,25 @@ impl Storage for VolumeStorage {
 
 #[derive(Default)]
 struct OpenFiles {
-    slots: Vec<Option<ObjectInfo>>,
+    slots: Vec<Option<Object>>,
 }
 
 impl OpenFiles {
-    fn insert(&mut self, info: ObjectInfo) -> u64 {
+    fn insert(&mut self, object: Object) -> u64 {
         if let Some(index) = self.slots.iter().position(Option::is_none) {
-            self.slots[index] = Some(info);
+            self.slots[index] = Some(object);
             return index as u64 + 1;
         }
-        self.slots.push(Some(info));
+        self.slots.push(Some(object));
         self.slots.len() as u64
     }
 
-    fn get(&self, handle: u64) -> Option<ObjectInfo> {
+    fn get(&self, handle: u64) -> Option<Object> {
         self.slots.get(handle.checked_sub(1)? as usize).copied()?
     }
 
     fn contains(&self, object: Object) -> bool {
-        self.slots
-            .iter()
-            .flatten()
-            .any(|info| info.object == object)
+        self.slots.iter().flatten().any(|open| *open == object)
     }
 
     fn remove(&mut self, handle: u64) {
@@ -162,17 +159,32 @@ struct LocatedEdge {
     object: Object,
 }
 
+struct MountedExt4 {
+    filesystem: HandleFilesystem,
+    storage: VolumeStorage,
+}
+
+impl MountedExt4 {
+    fn parts(&mut self) -> (&mut HandleFilesystem, &mut VolumeStorage) {
+        (&mut self.filesystem, &mut self.storage)
+    }
+}
+
 pub struct PortableExt4Fs {
-    filesystem: RefCell<HandleFilesystem<VolumeStorage>>,
+    mounted: RefCell<MountedExt4>,
     open: RefCell<OpenFiles>,
 }
 
 impl PortableExt4Fs {
     pub fn new(volume: Volume) -> Result<Self, &'static str> {
-        let filesystem = HandleFilesystem::mount(VolumeStorage::new(volume))
+        let mut storage = VolumeStorage::new(volume);
+        let filesystem = HandleFilesystem::mount(&mut storage)
             .map_err(|_| "portable ext4 mount failed")?;
         Ok(Self {
-            filesystem: RefCell::new(filesystem),
+            mounted: RefCell::new(MountedExt4 {
+                filesystem,
+                storage,
+            }),
             open: RefCell::new(OpenFiles::default()),
         })
     }
@@ -194,11 +206,12 @@ impl PortableExt4Fs {
     }
 
     fn resolve_in(
-        filesystem: &mut HandleFilesystem<VolumeStorage>,
+        mounted: &mut MountedExt4,
         path: &[u8],
     ) -> Result<ObjectInfo, Error> {
-        let root = filesystem.root()?;
-        let mut info = filesystem.inspect(Object::Node(root))?;
+        let (filesystem, storage) = mounted.parts();
+        let root = filesystem.root(storage)?;
+        let mut info = filesystem.inspect(storage, Object::Node(root))?;
         for name in path
             .split(|byte| *byte == b'/')
             .filter(|name| !name.is_empty())
@@ -207,23 +220,28 @@ impl PortableExt4Fs {
                 return Err(Error::InvalidArgument);
             }
             let node = info.node().ok_or(Error::NotDirectory)?;
-            let (_, object) = filesystem.find(node, name)?.ok_or(Error::NotFound)?;
-            info = filesystem.inspect(object)?;
+            let (_, object) = filesystem
+                .find(storage, node, name)?
+                .ok_or(Error::NotFound)?;
+            info = filesystem.inspect(storage, object)?;
         }
         Ok(info)
     }
 
     fn resolve(&self, path: &[u8]) -> Result<ObjectInfo, Error> {
-        Self::resolve_in(&mut self.filesystem.borrow_mut(), path)
+        Self::resolve_in(&mut self.mounted.borrow_mut(), path)
     }
 
     fn parent_edge(&self, path: &[u8]) -> Result<(Node, LocatedEdge), Error> {
         let (parent_path, name) = Self::split_parent(path).ok_or(Error::InvalidArgument)?;
-        let mut filesystem = self.filesystem.borrow_mut();
-        let parent = Self::resolve_in(&mut filesystem, parent_path)?
+        let mut mounted = self.mounted.borrow_mut();
+        let parent = Self::resolve_in(&mut mounted, parent_path)?
             .node()
             .ok_or(Error::NotDirectory)?;
-        let (handle, object) = filesystem.find(parent, name)?.ok_or(Error::NotFound)?;
+        let (filesystem, storage) = mounted.parts();
+        let (handle, object) = filesystem
+            .find(storage, parent, name)?
+            .ok_or(Error::NotFound)?;
         Ok((parent, LocatedEdge { handle, object }))
     }
 
@@ -236,7 +254,7 @@ impl PortableExt4Fs {
             return None;
         }
         Some(Vnode {
-            handle: self.open.borrow_mut().insert(info),
+            handle: self.open.borrow_mut().insert(info.object),
             size: info.size.min(u64::from(u32::MAX)) as u32,
             mode: info.format & 0x0fff,
         })
@@ -247,9 +265,10 @@ impl PortableExt4Fs {
             return None;
         }
         let count = output.len().min(info.size as usize);
-        self.filesystem
-            .borrow_mut()
-            .read(info.blob()?, 0, &mut output[..count])
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .read(storage, info.blob()?, 0, &mut output[..count])
             .ok()
     }
 
@@ -260,36 +279,35 @@ impl PortableExt4Fs {
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
-        let mut filesystem = self.filesystem.borrow_mut();
-        let mut entries = Vec::new();
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let mut appended = 0;
         let next = filesystem
-            .edges(node, EdgeCursor::from_position(cookie), &mut |edge| {
-                entries.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                let mut name = Vec::new();
-                name.try_reserve_exact(edge.name.len())
-                    .map_err(|_| Error::OutOfMemory)?;
-                name.extend_from_slice(edge.name);
-                entries.push((name, edge.object));
-                Ok(entries.len() < max)
-            })
+            .entries(
+                storage,
+                node,
+                EdgeCursor::from_position(cookie),
+                &mut |edge, info| {
+                    output.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
+                    let name_len = edge.name.len().min(100);
+                    let mut entry = DirEntry {
+                        name: [0; 100],
+                        name_len,
+                        size: info.size.min(u64::from(u32::MAX)) as u32,
+                        is_dir: info.node().is_some(),
+                        is_symlink: Self::is_symlink(info),
+                        mode: info.format & 0x0fff,
+                        mtime: info.modified,
+                        node: info.object.opaque(),
+                        mount_idx: 0,
+                    };
+                    entry.name[..name_len].copy_from_slice(&edge.name[..name_len]);
+                    output.push(entry);
+                    appended += 1;
+                    Ok(appended < max)
+                },
+            )
             .ok()?;
-        for (name, object) in entries {
-            let info = filesystem.inspect(object).ok()?;
-            let name_len = name.len().min(100);
-            let mut entry = DirEntry {
-                name: [0; 100],
-                name_len,
-                size: info.size.min(u64::from(u32::MAX)) as u32,
-                is_dir: info.node().is_some(),
-                is_symlink: Self::is_symlink(info),
-                mode: info.format & 0x0fff,
-                mtime: info.modified,
-                node: info.object.opaque(),
-                mount_idx: 0,
-            };
-            entry.name[..name_len].copy_from_slice(&name[..name_len]);
-            output.push(entry);
-        }
         next.map(EdgeCursor::position)
     }
 }
@@ -307,9 +325,10 @@ pub fn is_linux_root(volume: &Volume) -> bool {
 
 impl Filesystem for PortableExt4Fs {
     fn root_node(&self) -> Option<u64> {
-        self.filesystem
-            .borrow_mut()
-            .root()
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .root(storage)
             .ok()
             .map(|node| Object::Node(node).opaque())
     }
@@ -320,13 +339,19 @@ impl Filesystem for PortableExt4Fs {
 
     fn open_node(&self, node: u64) -> Option<Vnode> {
         let object = Object::from_opaque(node)?;
-        let info = self.filesystem.borrow_mut().inspect(object).ok()?;
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let info = filesystem.inspect(storage, object).ok()?;
+        drop(mounted);
         self.open_info(info)
     }
 
     fn readlink_node(&self, node: u64, output: &mut [u8]) -> Option<usize> {
         let object = Object::from_opaque(node)?;
-        let info = self.filesystem.borrow_mut().inspect(object).ok()?;
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let info = filesystem.inspect(storage, object).ok()?;
+        drop(mounted);
         self.readlink_info(info, output)
     }
 
@@ -359,40 +384,45 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn read(&self, handle: u64, offset: u32, output: &mut [u8], _size: u32) -> i32 {
-        let Some(info) = self.open.borrow().get(handle) else {
+        let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;
         };
-        self.filesystem
-            .borrow_mut()
-            .read(info.blob().unwrap(), u64::from(offset), output)
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .read(storage, blob, u64::from(offset), output)
             .map_or(-5, |count| count as i32)
     }
 
     fn write(&self, handle: u64, offset: u32, input: &[u8]) -> i32 {
-        let Some(info) = self.open.borrow().get(handle) else {
+        let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;
         };
-        self.filesystem
-            .borrow_mut()
-            .write(info.blob().unwrap(), u64::from(offset), input)
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .write(storage, blob, u64::from(offset), input)
             .map_or(-5, |_| input.len() as i32)
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let path = Self::path(path)?;
-        if let Ok(info) = self.resolve(path) {
-            graph_blob(info)?;
-            self.filesystem
-                .borrow_mut()
-                .resize(info.blob().unwrap(), 0)
-                .ok()?;
-            return self.open_info(self.resolve(path).ok()?);
+        if let Ok(mut info) = self.resolve(path) {
+            let blob = graph_blob(info)?;
+            let mut mounted = self.mounted.borrow_mut();
+            let (filesystem, storage) = mounted.parts();
+            filesystem.resize(storage, blob, 0).ok()?;
+            info.size = 0;
+            drop(mounted);
+            return self.open_info(info);
         }
         let (parent_path, name) = Self::split_parent(path)?;
         let parent = self.resolve(parent_path).ok()?.node()?;
-        self.filesystem
-            .borrow_mut()
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        let object = filesystem
             .create_blob(
+                storage,
                 parent,
                 name,
                 AttributeUpdate {
@@ -401,7 +431,9 @@ impl Filesystem for PortableExt4Fs {
                 },
             )
             .ok()?;
-        self.open_info(self.resolve(path).ok()?)
+        let info = filesystem.inspect(storage, object).ok()?;
+        drop(mounted);
+        self.open_info(info)
     }
 
     fn supports_create(&self) -> bool {
@@ -421,9 +453,11 @@ impl Filesystem for PortableExt4Fs {
         else {
             return -5;
         };
-        self.filesystem
-            .borrow_mut()
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
             .create_node(
+                storage,
                 parent,
                 name,
                 AttributeUpdate {
@@ -448,9 +482,10 @@ impl Filesystem for PortableExt4Fs {
         if !matches!(edge.object, Object::Node(_)) {
             return -20;
         }
-        self.filesystem
-            .borrow_mut()
-            .remove(edge.handle)
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .remove(storage, edge.handle)
             .map_or(-5, |_| 0)
     }
 
@@ -470,8 +505,9 @@ impl Filesystem for PortableExt4Fs {
         else {
             return -5;
         };
-        let mut filesystem = self.filesystem.borrow_mut();
-        match filesystem.find(target_parent, target_name) {
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        match filesystem.find(storage, target_parent, target_name) {
             Ok(Some((_, target))) => {
                 if matches!(source.object, Object::Node(_)) != matches!(target, Object::Node(_)) {
                     return -22;
@@ -481,7 +517,7 @@ impl Filesystem for PortableExt4Fs {
             Err(_) => return -5,
         }
         filesystem
-            .move_edge(source.handle, target_parent, target_name)
+            .move_edge(storage, source.handle, target_parent, target_name)
             .map_or(-5, |_| 0)
     }
 
@@ -516,9 +552,11 @@ impl Filesystem for PortableExt4Fs {
         let Ok(info) = self.resolve(path) else {
             return false;
         };
-        self.filesystem
-            .borrow_mut()
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
             .update_attributes(
+                storage,
                 info.object,
                 AttributeUpdate {
                     modified: Some(mtime),
@@ -544,9 +582,11 @@ impl Filesystem for PortableExt4Fs {
         let Ok(info) = self.resolve(path) else {
             return false;
         };
-        self.filesystem
-            .borrow_mut()
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
             .update_attributes(
+                storage,
                 info.object,
                 AttributeUpdate {
                     format: Some((info.format & TYPE_MASK) | mode as u16 & 0x0fff),
@@ -571,9 +611,10 @@ impl Filesystem for PortableExt4Fs {
         if self.open.borrow().contains(edge.object) {
             return -16;
         }
-        self.filesystem
-            .borrow_mut()
-            .remove(edge.handle)
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem
+            .remove(storage, edge.handle)
             .map_or(-5, |_| 0)
     }
 

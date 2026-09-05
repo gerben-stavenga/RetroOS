@@ -169,23 +169,18 @@ fn graph_api_reads_typed_objects_directly() {
     let root = graph.root(&mut storage).unwrap();
     let mut data = None;
     graph
-        .edges(&mut storage, root, Default::default(), &mut |edge| {
+        .entries(&mut storage, root, Default::default(), &mut |edge, info| {
             if edge.name == b"root-data.bin" {
-                data = Some(edge.object);
+                data = Some((edge.object, info));
             }
             Ok(true)
         })
         .unwrap();
-    let Object::Blob(blob) = data.unwrap() else {
+    let (Object::Blob(blob), info) = data.unwrap() else {
         panic!("root-data.bin is not a blob")
     };
-    assert_eq!(
-        graph
-            .inspect(&mut storage, Object::Blob(blob))
-            .unwrap()
-            .size,
-        14
-    );
+    assert_eq!(info.object, Object::Blob(blob));
+    assert_eq!(info.size, 14);
     let mut contents = [0; 14];
     assert_eq!(
         graph.read(&mut storage, blob, 0, &mut contents).unwrap(),
@@ -408,8 +403,9 @@ fn graph_api_collapses_external_extent_leaf() {
     use portable_ext4::Storage;
     use portable_ext4::ext4::{Ext4 as Graph, Object};
 
+    const EXTENTS: u64 = 350;
     let mut fragmented = image();
-    let artificial = add_artificial_fragmentation(&mut fragmented, 6);
+    let artificial = add_artificial_fragmentation(&mut fragmented, EXTENTS as usize);
     let mut storage = ModelStorage::new(fragmented);
     let mut graph = Graph::mount(&mut storage).unwrap();
     let root = graph.root(&mut storage).unwrap();
@@ -426,12 +422,12 @@ fn graph_api_collapses_external_extent_leaf() {
         panic!("root-empty.bin is not a blob")
     };
 
-    for logical in 0..6 {
+    for logical in 0..EXTENTS {
         graph
             .write(&mut storage, blob, logical * 4096, &[logical as u8 + 1])
             .unwrap();
     }
-    for logical in 0..6 {
+    for logical in 0..EXTENTS {
         let mut byte = [0];
         assert_eq!(
             graph
@@ -893,15 +889,16 @@ fn every_graph_journal_commit_effect_recovers_to_old_or_new_graph() {
 }
 
 #[test]
-fn handle_filesystem_owns_atomic_graph_composition() {
+fn handle_filesystem_journals_atomic_graph_composition() {
     use portable_ext4::Filesystem;
     use portable_ext4::ext4::{AttributeUpdate, Object};
 
-    let storage = ModelStorage::new(image());
-    let mut filesystem = Filesystem::mount(storage).unwrap();
-    let root = filesystem.root().unwrap();
+    let mut storage = ModelStorage::new(image());
+    let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+    let root = filesystem.root(&mut storage).unwrap();
     let object = filesystem
         .create_blob(
+            &mut storage,
             root,
             b"handle-file",
             AttributeUpdate {
@@ -913,16 +910,28 @@ fn handle_filesystem_owns_atomic_graph_composition() {
     let Object::Blob(blob) = object else {
         panic!("create_blob returned a node")
     };
-    filesystem.write(blob, 0, b"handle filesystem").unwrap();
+    filesystem
+        .write(&mut storage, blob, 0, b"handle filesystem")
+        .unwrap();
     let mut contents = [0; 17];
-    assert_eq!(filesystem.read(blob, 0, &mut contents).unwrap(), 17);
+    assert_eq!(
+        filesystem
+            .read(&mut storage, blob, 0, &mut contents)
+            .unwrap(),
+        17
+    );
     assert_eq!(&contents, b"handle filesystem");
-    let (edge, found) = filesystem.find(root, b"handle-file").unwrap().unwrap();
+    let (edge, found) = filesystem
+        .find(&mut storage, root, b"handle-file")
+        .unwrap()
+        .unwrap();
     assert_eq!(found, object);
-    filesystem.remove(edge).unwrap();
-    assert!(filesystem.find(root, b"handle-file").unwrap().is_none());
+    filesystem.remove(&mut storage, edge).unwrap();
+    assert!(filesystem
+        .find(&mut storage, root, b"handle-file")
+        .unwrap()
+        .is_none());
 
-    let storage = filesystem.into_storage();
     let output = std::path::PathBuf::from(std::env::var_os("TEST_TMPDIR").unwrap())
         .join("handle-filesystem.img");
     std::fs::write(&output, storage.durable_bytes()).unwrap();
@@ -949,23 +958,32 @@ fn handle_filesystem_journals_runtime_block_sizes() {
         (env!("EXT4_RUNTIME_BLOCK_8192"), 8192),
         (env!("EXT4_RUNTIME_BLOCK_65536"), 65536),
     ] {
-        let storage = ModelStorage::new(runtime_block_image(path));
-        let mut filesystem = Filesystem::mount(storage).unwrap();
-        let root = filesystem.root().unwrap();
-        let (_, dir_object) = filesystem.find(root, b"dir").unwrap().unwrap();
+        let mut storage = ModelStorage::new(runtime_block_image(path));
+        let mut filesystem = Filesystem::mount(&mut storage).unwrap();
+        let root = filesystem.root(&mut storage).unwrap();
+        let (_, dir_object) = filesystem
+            .find(&mut storage, root, b"dir")
+            .unwrap()
+            .unwrap();
         let Object::Node(dir) = dir_object else {
             panic!("fixture directory is not a node");
         };
-        let (seed_edge, seed_object) = filesystem.find(dir, b"seed.bin").unwrap().unwrap();
+        let (seed_edge, seed_object) = filesystem
+            .find(&mut storage, dir, b"seed.bin")
+            .unwrap()
+            .unwrap();
         let Object::Blob(seed) = seed_object else {
             panic!("fixture seed is not a blob");
         };
 
         // These do not alter allocation counters and therefore prove that a
         // journal transaction need not contain the ext4 superblock.
-        filesystem.write(seed, 0, b"RUNTIME").unwrap();
+        filesystem
+            .write(&mut storage, seed, 0, b"RUNTIME")
+            .unwrap();
         filesystem
             .update_attributes(
+                &mut storage,
                 seed_object,
                 AttributeUpdate {
                     modified: Some(0x1234_5678),
@@ -974,25 +992,33 @@ fn handle_filesystem_journals_runtime_block_sizes() {
             )
             .unwrap();
         filesystem
-            .move_edge(seed_edge, dir, b"renamed.bin")
+            .move_edge(&mut storage, seed_edge, dir, b"renamed.bin")
             .unwrap();
 
         let created = filesystem
-            .create_blob(dir, b"spanning.bin", AttributeUpdate::default())
+            .create_blob(
+                &mut storage,
+                dir,
+                b"spanning.bin",
+                AttributeUpdate::default(),
+            )
             .unwrap();
         let Object::Blob(created) = created else {
             panic!("created object is not a blob");
         };
         let payload = vec![0x5a; block_size + 17];
-        filesystem.write(created, 0, &payload).unwrap();
+        filesystem
+            .write(&mut storage, created, 0, &payload)
+            .unwrap();
         let mut readback = vec![0; payload.len()];
         assert_eq!(
-            filesystem.read(created, 0, &mut readback).unwrap(),
+            filesystem
+                .read(&mut storage, created, 0, &mut readback)
+                .unwrap(),
             payload.len()
         );
         assert_eq!(readback, payload);
 
-        let storage = filesystem.into_storage();
         let output = std::env::temp_dir().join(format!("portable-ext4-{block_size}.img"));
         std::fs::write(&output, storage.durable_bytes()).unwrap();
         let checked = std::process::Command::new("/usr/sbin/e2fsck")

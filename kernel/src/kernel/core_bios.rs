@@ -134,6 +134,106 @@ enum BankedSource<'a> {
     },
 }
 
+enum BiosTransfer<'a> {
+    None,
+    Input(usize, &'a [u8]),
+    Output(usize, &'a mut [u8]),
+    InOut(usize, &'a mut [u8]),
+}
+
+#[repr(C, packed)]
+struct VbeControllerInfo {
+    signature: [u8; 4],
+    version: u16,
+    oem_string: u32,
+    capabilities: u32,
+    video_modes: u32,
+    total_memory: u16,
+    reserved: [u8; 492],
+}
+
+#[repr(C, packed)]
+struct VbeModeInfo {
+    attributes: u16,
+    window_a_attributes: u8,
+    window_b_attributes: u8,
+    window_granularity_kb: u16,
+    window_size_kb: u16,
+    window_a_segment: u16,
+    window_b_segment: u16,
+    window_function: u32,
+    banked_pitch: u16,
+    width: u16,
+    height: u16,
+    character_width: u8,
+    character_height: u8,
+    planes: u8,
+    bits_per_pixel: u8,
+    banks: u8,
+    memory_model: u8,
+    bank_size_kb: u8,
+    banked_image_pages: u8,
+    reserved0: u8,
+    red_mask_size: u8,
+    red_position: u8,
+    green_mask_size: u8,
+    green_position: u8,
+    blue_mask_size: u8,
+    blue_position: u8,
+    reserved_mask_size: u8,
+    reserved_position: u8,
+    direct_color_attributes: u8,
+    physical_base: u32,
+    offscreen_offset: u32,
+    offscreen_kb: u16,
+    linear_pitch: u16,
+    banked_image_pages_v3: u8,
+    linear_image_pages: u8,
+    linear_red_mask_size: u8,
+    linear_red_position: u8,
+    linear_green_mask_size: u8,
+    linear_green_position: u8,
+    linear_blue_mask_size: u8,
+    linear_blue_position: u8,
+    linear_reserved_mask_size: u8,
+    linear_reserved_position: u8,
+    maximum_pixel_clock: u32,
+    reserved1: [u8; 190],
+}
+
+const _: [(); 512] = [(); core::mem::size_of::<VbeControllerInfo>()];
+const _: [(); 256] = [(); core::mem::size_of::<VbeModeInfo>()];
+
+impl VbeControllerInfo {
+    fn request() -> Self {
+        let mut info: Self = unsafe { core::mem::zeroed() };
+        info.signature = *b"VBE2";
+        info
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut(self).cast(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
+impl VbeModeInfo {
+    fn empty() -> Self { unsafe { core::mem::zeroed() } }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut(self).cast(),
+                core::mem::size_of::<Self>(),
+            )
+        }
+    }
+}
+
 struct NativeBiosWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
@@ -206,21 +306,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return None;
         }
         let mut regs = Regs::empty();
-        self.with_bios_workspace(
-            machine,
-            display,
-            &mut regs,
-            |_, regs| {
-                regs.rax = 0x4F04;
-                regs.rcx = Self::STATE_COMPONENTS;
-                regs.rdx = 0;
-            },
-            |_, regs| {
-                if regs.rax as u16 != 0x004F { return None; }
-                let bytes = usize::from(regs.rbx as u16).checked_mul(64)?;
-                (bytes != 0 && bytes <= Self::MAX_STATE_BYTES).then_some(bytes)
-            },
-        ).ok().flatten()
+        regs.rax = 0x4F04;
+        regs.rcx = Self::STATE_COMPONENTS;
+        regs.rdx = 0;
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None).ok()?;
+        if regs.rax as u16 != 0x004F { return None; }
+        let bytes = usize::from(regs.rbx as u16).checked_mul(64)?;
+        (bytes != 0 && bytes <= Self::MAX_STATE_BYTES).then_some(bytes)
     }
 
     /// Save all firmware-visible controller state. Failure means the caller
@@ -237,25 +329,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }
         let bytes = self.state_bytes?;
         let mut regs = Regs::empty();
-        self.with_bios_workspace(
+        let mut state = alloc::vec![0; bytes];
+        regs.rax = 0x4F04;
+        regs.rcx = Self::STATE_COMPONENTS;
+        regs.rdx = 1;
+        regs.es = (Self::STATE_BUFFER >> 4) as u64;
+        regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+        self.call_buffer(
             machine,
             display,
             &mut regs,
-            |machine, regs| {
-                machine.copy_to(Self::STATE_BUFFER, &alloc::vec![0; bytes]);
-                regs.rax = 0x4F04;
-                regs.rcx = Self::STATE_COMPONENTS;
-                regs.rdx = 1;
-                regs.es = (Self::STATE_BUFFER >> 4) as u64;
-                regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
-            },
-            |machine, regs| {
-                if regs.rax as u16 != 0x004F { return None; }
-                let mut state = alloc::vec![0; bytes];
-                machine.copy_from(Self::STATE_BUFFER, &mut state);
-                Some(FirmwareCheckpoint(state))
-            },
-        ).ok().flatten()
+            BiosTransfer::InOut(Self::STATE_BUFFER, &mut state),
+        ).ok()?;
+        (regs.rax as u16 == 0x004F).then_some(FirmwareCheckpoint(state))
     }
 
     /// Restore a blob returned by [`checkpoint`](Self::checkpoint). The blob
@@ -270,20 +356,17 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if state.0.is_empty() || state.0.len() > Self::MAX_STATE_BYTES {
             return Err(BiosError::InvalidStateSize);
         }
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(
+        let mut regs = Regs::empty();
+        regs.rax = 0x4F04;
+        regs.rcx = Self::STATE_COMPONENTS;
+        regs.rdx = 2;
+        regs.es = (Self::STATE_BUFFER >> 4) as u64;
+        regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
+        self.call_buffer(
             machine,
             display,
             &mut regs,
-            |machine, regs| {
-                machine.copy_to(Self::STATE_BUFFER, &state.0);
-                regs.rax = 0x4F04;
-                regs.rcx = Self::STATE_COMPONENTS;
-                regs.rdx = 2;
-                regs.es = (Self::STATE_BUFFER >> 4) as u64;
-                regs.rbx = (Self::STATE_BUFFER & 0xF) as u64;
-            },
-            |_, _| (),
+            BiosTransfer::Input(Self::STATE_BUFFER, &state.0),
         )?;
         let status = regs.rax as u16;
         if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
@@ -321,21 +404,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
         let number = request & 0x3FFF;
         if number <= 0xFF {
-            let mut regs = self.bios_vcpu.regs;
-            self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
-                regs.rax = u64::from(number);
-            }, |_, _| ())?;
+            let mut regs = Regs::empty();
+            regs.rax = u64::from(number);
+            self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
             bios_display.mark_legacy();
             return Ok(());
         }
         let Some(mode) = self.mode(number) else {
             return Err(BiosError::Rejected(0x014F));
         };
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, bios_display, &mut regs, |_, regs| {
-            regs.rax = 0x4F02;
-            regs.rbx = u64::from(request);
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = 0x4F02;
+        regs.rbx = u64::from(request);
+        self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status == 0x004F {
             let indexed = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8);
@@ -354,10 +435,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
     ) -> Result<Option<(crate::kernel::platform::VbeMode, bool)>, BiosError> {
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
-            regs.rax = 0x4F03;
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = 0x4F03;
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status != 0x004F {
             return Err(BiosError::Rejected(status));
@@ -376,10 +456,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         display: &crate::kernel::platform::VgaCap,
     ) -> Result<u8, BiosError> {
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
-            regs.rax = 0x0F00;
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = 0x0F00;
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         Ok(regs.rax as u8)
     }
 
@@ -393,13 +472,12 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
-            regs.rax = input[0];
-            regs.rbx = input[1];
-            regs.rcx = input[2];
-            regs.rdx = input[3];
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = input[0];
+        regs.rbx = input[1];
+        regs.rcx = input[2];
+        regs.rdx = input[3];
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         caller.rax = regs.rax;
         if input[0] as u16 == 0x4F09 && regs.rax as u16 != 0x004F {
@@ -420,13 +498,12 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
-            regs.rax = input[0];
-            regs.rbx = input[1];
-            regs.rcx = input[2];
-            regs.rdx = input[3];
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = input[0];
+        regs.rbx = input[1];
+        regs.rcx = input[2];
+        regs.rdx = input[3];
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         caller.rax = regs.rax;
         caller.rbx = regs.rbx;
@@ -444,12 +521,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         display: &crate::kernel::platform::VgaCap,
         set: Option<u16>,
     ) -> Result<u16, BiosError> {
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(machine, display, &mut regs, |_, regs| {
-            regs.rax = 0x4F05;
-            regs.rbx = if set.is_some() { 0 } else { 0x0100 };
-            regs.rdx = u64::from(set.unwrap_or(0));
-        }, |_, _| ())?;
+        let mut regs = Regs::empty();
+        regs.rax = 0x4F05;
+        regs.rbx = if set.is_some() { 0 } else { 0x0100 };
+        regs.rdx = u64::from(set.unwrap_or(0));
+        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status == 0x004F { Ok(regs.rdx as u16) } else { Err(BiosError::Rejected(status)) }
     }
@@ -498,7 +574,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
-        buffer: Option<&mut [u8]>,
+        mut buffer: Option<&mut [u8]>,
         copy_to_bios: bool,
         offset_in_di: bool,
     ) -> Result<(), BiosError> {
@@ -513,41 +589,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }
 
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let input_data = if copy_to_bios {
-            buffer.as_ref().map(|b| b.to_vec())
-        } else {
-            None
+        let mut regs = Regs::empty();
+        regs.rax = input[0];
+        regs.rbx = input[1];
+        regs.rcx = input[2];
+        regs.rdx = input[3];
+        if len != 0 {
+            regs.es = (Self::STATE_BUFFER >> 4) as u64;
+            if offset_in_di {
+                regs.rdi = (Self::STATE_BUFFER & 0xF) as u64;
+            } else {
+                regs.rdx = (Self::STATE_BUFFER & 0xF) as u64;
+            }
+        }
+        let transfer = match buffer.as_deref_mut() {
+            Some(buffer) if copy_to_bios => BiosTransfer::Input(Self::STATE_BUFFER, buffer),
+            Some(buffer) => BiosTransfer::Output(Self::STATE_BUFFER, buffer),
+            None => BiosTransfer::None,
         };
-        let mut regs = self.bios_vcpu.regs;
-        let output = self.with_bios_workspace(
-            machine,
-            display,
-            &mut regs,
-            |machine, regs| {
-                regs.rax = input[0];
-                regs.rbx = input[1];
-                regs.rcx = input[2];
-                regs.rdx = input[3];
-                if len != 0 {
-                    if let Some(data) = input_data.as_deref() {
-                        machine.copy_to(Self::STATE_BUFFER, data);
-                    }
-                    regs.es = (Self::STATE_BUFFER >> 4) as u64;
-                    if offset_in_di {
-                        regs.rdi = (Self::STATE_BUFFER & 0xF) as u64;
-                    } else {
-                        regs.rdx = (Self::STATE_BUFFER & 0xF) as u64;
-                    }
-                }
-            },
-            |machine, _| {
-                let mut data = alloc::vec![0; len];
-                if len != 0 && !copy_to_bios {
-                    machine.copy_from(Self::STATE_BUFFER, &mut data);
-                }
-                data
-            },
-        )?;
+        self.call_buffer(machine, display, &mut regs, transfer)?;
 
         // VBE reports status in AX. Legacy AH=10h/AL=15h additionally returns
         // one DAC entry in DH/CH/CL. Do not leak the bounce-buffer offset back
@@ -559,11 +619,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if input[0] as u16 == 0x1015 {
             caller.rcx = regs.rcx;
             caller.rdx = regs.rdx;
-        }
-        if let Some(dst) = buffer
-            && !copy_to_bios
-        {
-            dst.copy_from_slice(&output);
         }
         Ok(())
     }
@@ -588,25 +643,19 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             return Err(BiosError::InvalidStateSize);
         }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
-        let data = font.map(<[u8]>::to_vec);
-        let mut regs = self.bios_vcpu.regs;
-        self.with_bios_workspace(
-            machine,
-            display,
-            &mut regs,
-            |machine, regs| {
-                regs.rax = input[0];
-                regs.rbx = input[1];
-                regs.rcx = input[2];
-                regs.rdx = input[3];
-                if let Some(data) = data.as_deref() {
-                    machine.copy_to(Self::STATE_BUFFER, data);
-                    regs.es = (Self::STATE_BUFFER >> 4) as u64;
-                    regs.rbp = (Self::STATE_BUFFER & 0xF) as u64;
-                }
-            },
-            |_, _| (),
-        )?;
+        let mut regs = Regs::empty();
+        regs.rax = input[0];
+        regs.rbx = input[1];
+        regs.rcx = input[2];
+        regs.rdx = input[3];
+        let transfer = if let Some(font) = font {
+            regs.es = (Self::STATE_BUFFER >> 4) as u64;
+            regs.rbp = (Self::STATE_BUFFER & 0xF) as u64;
+            BiosTransfer::Input(Self::STATE_BUFFER, font)
+        } else {
+            BiosTransfer::None
+        };
+        self.call_buffer(machine, display, &mut regs, transfer)?;
         caller.rax = regs.rax;
         Ok(())
     }
@@ -789,54 +838,46 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         const INFO: usize = 0x9000;
         const MODE_INFO: usize = 0x9200;
 
+        let mut info = VbeControllerInfo::request();
         let mut regs = Regs::empty();
-        let modes = self.with_bios_workspace(
+        regs.rax = 0x4F00;
+        regs.es = (INFO >> 4) as u64;
+        regs.rdi = (INFO & 0xF) as u64;
+        self.call_buffer(
             machine,
             bios_display,
             &mut regs,
-            |machine, regs| {
-                machine.copy_to(INFO, &[0; 512]);
-                machine.copy_to(INFO, b"VBE2");
-                regs.rax = 0x4F00;
-                regs.es = (INFO >> 4) as u64;
-                regs.rdi = (INFO & 0xF) as u64;
-            },
-            |machine, regs| {
-                if regs.rax as u16 != 0x004F {
-                    return Vec::new();
-                }
-                let far = machine.read::<u32>(INFO + 14);
-                let list = usize::from((far >> 16) as u16) * 16 + usize::from(far as u16);
-                let mut modes = Vec::new();
-                for i in 0..512 {
-                    let mode = machine.read::<u16>(list + i * 2);
-                    if mode == 0xFFFF { break; }
-                    modes.push(mode);
-                }
-                modes
-            },
+            BiosTransfer::InOut(INFO, info.bytes_mut()),
         ).ok()?;
+        if regs.rax as u16 != 0x004F {
+            return None;
+        }
+        let far = info.video_modes;
+        let list = usize::from((far >> 16) as u16) * 16 + usize::from(far as u16);
+        let mut raw_modes = [0u8; 1024];
+        self.read_workspace(machine, list, &mut raw_modes);
 
         let mut candidates = Vec::new();
-        for number in modes {
+        for raw in raw_modes.chunks_exact(2) {
+            let number = u16::from_le_bytes([raw[0], raw[1]]);
+            if number == 0xFFFF {
+                break;
+            }
             let mut regs = Regs::empty();
-            let mode = self.with_bios_workspace(
+            let mut info = VbeModeInfo::empty();
+            regs.rax = 0x4F01;
+            regs.rcx = u64::from(number);
+            regs.es = (MODE_INFO >> 4) as u64;
+            regs.rdi = (MODE_INFO & 0xF) as u64;
+            self.call_buffer(
                 machine,
                 bios_display,
                 &mut regs,
-                |machine, regs| {
-                    machine.copy_to(MODE_INFO, &[0; 256]);
-                    regs.rax = 0x4F01;
-                    regs.rcx = u64::from(number);
-                    regs.es = (MODE_INFO >> 4) as u64;
-                    regs.rdi = (MODE_INFO & 0xF) as u64;
-                },
-                |machine, regs| {
-                    if regs.rax as u16 != 0x004F { return None; }
-                    parse_vbe_mode(machine, MODE_INFO, number)
-                },
-            ).ok().flatten();
-            if let Some(mode) = mode {
+                BiosTransfer::InOut(MODE_INFO, info.bytes_mut()),
+            ).ok()?;
+            if regs.rax as u16 == 0x004F
+                && let Some(mode) = parse_vbe_mode(&info, number)
+            {
                 candidates.push(mode);
             }
         }
@@ -892,46 +933,60 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         selected
     }
 
-    fn with_bios_workspace<T, F, G>(
+    fn call_buffer(
         &mut self,
         machine: &mut A,
         bios_display: &crate::kernel::platform::VgaCap,
         regs: &mut Regs,
-        configure: F,
-        collect: G,
-    ) -> Result<T, BiosError>
-    where
-        F: FnOnce(&mut A, &mut Regs),
-        G: FnOnce(&mut A, &Regs) -> T,
-    {
-        // The ROM owns one persistent private real-mode workspace, just as it
-        // does on a physical PC. It is isolated from every guest address space,
-        // but BIOS scratch/BDA state intentionally survives between calls.
-        // Keeping that workspace parked here also makes high-frequency VBE
-        // operations (notably 4F05h bank switching) ordinary BIOS executions
-        // instead of a COW fork + full page-table teardown per bank.
+        mut transfer: BiosTransfer<'_>,
+    ) -> Result<(), BiosError> {
         let caller_space = machine.activate(
             core::mem::take(&mut self.bios_vcpu.space),
             &mut self.fx,
             core::ptr::null_mut(),
         );
-
+        let request = *regs;
         crate::kernel::dos::prepare_bios_int10(machine, regs);
-        configure(machine, regs);
+        let frame = regs.frame;
+        *regs = request;
+        regs.frame = frame;
+        match &transfer {
+            BiosTransfer::Input(address, buffer) => machine.copy_to(*address, buffer),
+            BiosTransfer::InOut(address, buffer) => machine.copy_to(*address, buffer),
+            BiosTransfer::None | BiosTransfer::Output(..) => {}
+        }
         let io = crate::kernel::io_policy::bios_display(bios_display);
         let completed = run_bios_int10(machine, regs, &io);
-
-        let result = completed.map(|()| collect(machine, regs));
-
-        // `self.fx` contains the caller's displaced FPU image. Restore both
-        // caller resources and park the BIOS workspace/FPU state for next time.
+        if completed.is_ok() {
+            match &mut transfer {
+                BiosTransfer::Output(address, buffer) | BiosTransfer::InOut(address, buffer) => {
+                    machine.copy_from(*address, buffer);
+                }
+                BiosTransfer::None | BiosTransfer::Input(..) => {}
+            }
+        }
         self.bios_vcpu.space = machine.activate(
             caller_space,
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        result
+        completed
     }
+
+    fn read_workspace(&mut self, machine: &mut A, address: usize, output: &mut [u8]) {
+        let caller_space = machine.activate(
+            core::mem::take(&mut self.bios_vcpu.space),
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+        machine.copy_from(address, output);
+        self.bios_vcpu.space = machine.activate(
+            caller_space,
+            &mut self.fx,
+            core::ptr::null_mut(),
+        );
+    }
+
 }
 
 /// Native video-ROM operations are methods on the physical VGA capability:
@@ -1222,36 +1277,35 @@ fn prepare_bank_call<A: Arch>(
     return_ip
 }
 
-fn parse_vbe_mode<A: Arch>(
-    machine: &A,
-    address: usize,
+fn parse_vbe_mode(
+    info: &VbeModeInfo,
     number: u16,
 ) -> Option<crate::kernel::platform::VbeMode> {
-    let attributes = machine.read::<u16>(address);
-    let memory_model = machine.read::<u8>(address + 0x1B);
+    let attributes = info.attributes;
+    let memory_model = info.memory_model;
     if attributes & 0x0019 != 0x0019 || !matches!(memory_model, 4 | 6) {
         return None;
     }
-    let width = machine.read::<u16>(address + 0x12);
-    let height = machine.read::<u16>(address + 0x14);
-    let bpp = machine.read::<u8>(address + 0x19);
-    let programmable_ramp = machine.read::<u8>(address + 0x27) & 0x01 != 0;
-    let physical_base_raw = machine.read::<u32>(address + 0x28);
+    let width = info.width;
+    let height = info.height;
+    let bpp = info.bits_per_pixel;
+    let programmable_ramp = info.direct_color_attributes & 0x01 != 0;
+    let physical_base_raw = info.physical_base;
     let linear = attributes & 0x0080 != 0 && physical_base_raw != 0;
     let physical_base = if linear { physical_base_raw } else { 0 };
-    let banked_pitch = machine.read::<u16>(address + 0x10);
-    let linear_pitch_raw = machine.read::<u16>(address + 0x32);
+    let banked_pitch = info.banked_pitch;
+    let linear_pitch_raw = info.linear_pitch;
     let linear_pitch = if linear_pitch_raw != 0 { linear_pitch_raw } else { banked_pitch };
     let pitch = if linear { linear_pitch } else { banked_pitch };
     let linear_fields = [
-        machine.read::<u8>(address + 0x37), machine.read::<u8>(address + 0x36),
-        machine.read::<u8>(address + 0x39), machine.read::<u8>(address + 0x38),
-        machine.read::<u8>(address + 0x3B), machine.read::<u8>(address + 0x3A),
+        info.linear_red_position, info.linear_red_mask_size,
+        info.linear_green_position, info.linear_green_mask_size,
+        info.linear_blue_position, info.linear_blue_mask_size,
     ];
     let legacy_fields = [
-        machine.read::<u8>(address + 0x20), machine.read::<u8>(address + 0x1F),
-        machine.read::<u8>(address + 0x22), machine.read::<u8>(address + 0x21),
-        machine.read::<u8>(address + 0x24), machine.read::<u8>(address + 0x23),
+        info.red_position, info.red_mask_size,
+        info.green_position, info.green_mask_size,
+        info.blue_position, info.blue_mask_size,
     ];
     let fields = if linear && linear_fields[1] != 0 { linear_fields } else { legacy_fields };
     let format = if memory_model == 4 && bpp == 8 {
@@ -1277,13 +1331,13 @@ fn parse_vbe_mode<A: Arch>(
         crate::kernel::display::FormatSpec::Packed(format) => format.bytes_per_pixel,
         crate::kernel::display::FormatSpec::Indexed8 => 1,
     };
-    let window_segment = machine.read::<u16>(address + 0x08);
-    let window_attributes = machine.read::<u8>(address + 0x02);
-    let window_granularity_kb = machine.read::<u16>(address + 0x04);
-    let window_size_kb = machine.read::<u16>(address + 0x06);
-    let window_function = machine.read::<u32>(address + 0x0C);
-    let banked_image_pages = machine.read::<u8>(address + 0x1D);
-    let linear_image_pages = machine.read::<u8>(address + 0x35);
+    let window_segment = info.window_a_segment;
+    let window_attributes = info.window_a_attributes;
+    let window_granularity_kb = info.window_granularity_kb;
+    let window_size_kb = info.window_size_kb;
+    let window_function = info.window_function;
+    let banked_image_pages = info.banked_image_pages;
+    let linear_image_pages = info.linear_image_pages;
     let banked_bytes = u32::from(banked_pitch)
         .checked_mul(u32::from(height))?
         .checked_mul(u32::from(banked_image_pages) + 1)?;

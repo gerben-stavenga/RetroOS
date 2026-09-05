@@ -62,16 +62,7 @@ fn prepare_startup<A: crate::Arch>(
 
     crate::println!("{}", crate::build_info::VersionBanner);
 
-    // Discover every disk. The block layer reports what exists; nothing below
-    // this line picks a boot disk or decides where anything mounts.
-    let disks = crate::kernel::block::probe(machine);
-    for d in &disks {
-        crate::println!("Storage: {} ({} MB)", d.name(), d.sectors() / 2048);
-    }
-    if disks.is_empty() {
-        crate::println!("Storage: none detected");
-    }
-    crate::println!("Block devices initialized");
+    let disks = discover_disks(machine);
 
     // Probe the machine ONCE and freeze the result; all hardware policy
     // (VGA passthrough, BIOS choice, audio, console, IOPB) derives from this.
@@ -81,116 +72,66 @@ fn prepare_startup<A: crate::Arch>(
         facts: platform,
         display,
         audio,
-    } = crate::kernel::platform::probe(machine, boot);
+    } = discover_platform(machine, boot);
 
     // Select the kernel display once, before anything draws through it.
     // Preserve a pristine real-mode environment for this and all later
     // firmware calls; DOS personalities receive their separate substitute BIOS.
     let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
-    let vbe_mode = display
-        .vga_capability()
-        .and_then(|native| native.bios_discover_vbe(machine, &mut bios_workspace));
-    crate::kernel::platform::set_vbe_mode(vbe_mode);
-    crate::kernel::platform::set_voodoo_vbe_mode(
-        bios_workspace.curated_modes(),
-        !display.is_headless(),
-    );
-    let display = match display.into_native_capability(machine) {
-        Ok(native) => {
-            crate::kernel::display::Display::new_selected(machine, &mut bios_workspace, native)
-        }
-        Err(display) => display,
-    };
-    let mut screen = crate::kernel::console::Console::new(display);
+    let mut screen = select_display(machine, &mut bios_workspace, display);
 
-    // Disk-write policy, applied by COMPOSITION and DECLARED, never inferred.
-    //
-    // RetroOS writes to its disk, like an operating system. A machine that
-    // wants its medium left alone asks for it, with `ram-overlay` on the
-    // kernel command line — and the machine that wants it is the one with a
-    // real install on it, which boots through GRUB, whose config its owner
-    // controls. So the protection is configured where the risk actually lives.
-    //
-    // It used to be the other way round: protect by default, on the theory
-    // that metal means "someone's real disk". That silently broke every
-    // emulator too — a DOS program could not save a game, and a test could not
-    // leave a verdict behind, which is why the 86Box SB suite could assert
-    // nothing for as long as it existed. The first repair was worse: sniff the
-    // southbridge and call a PIIX-class chipset an emulator. That gets this
-    // project's own audience exactly backwards, since a real Pentium with a
-    // PIIX4 is a first-class target and the likeliest machine to be holding
-    // someone's actual data. No heuristic can answer "is this disk precious";
-    // only its owner can, so only its owner does.
-    //
-    // Done before partition scanning, so every Volume built below already
-    // carries the policy.
-    let disks = if boot.ram_overlay {
-        crate::screenln!(
-            screen,
-            "Disk writes: volatile RAM overlay (ram-overlay) — changes will NOT persist"
-        );
-        disks
-            .into_iter()
-            .map(|d| -> &'static dyn crate::kernel::block::Disk {
-                alloc::boxed::Box::leak(alloc::boxed::Box::new(
-                    crate::kernel::block::overlay::RamOverlay::wrap(d),
-                ))
-            })
-            .collect()
-    } else {
-        // One line, because there is one behaviour. This used to print a
-        // different message per host — a leftover from when the host DERIVED
-        // the policy. It no longer does: the policy is `ram-overlay` or its
-        // absence, and whether the device underneath is a laptop's NVMe or a
-        // disposable image is not something the kernel knows or should claim.
-        crate::screenln!(
-            screen,
-            "\x1b[91mDisk writes: PERSISTENT\x1b[0m — pass `ram-overlay` to protect the disk"
-        );
-        disks
-    };
+    let disks = apply_disk_policy(disks, boot.ram_overlay, &mut screen);
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let threads = crate::kernel::thread::init_threading();
     crate::screenln!(screen => machine, &mut bios_workspace; "Threading initialized");
 
-    // FS-layout policy (DOS C: → VFS subtree) before any mount/resolve.
-    crate::kernel::dos::set_c_root(boot.c_root());
-    crate::kernel::dos::set_hostfs_enabled(platform.hostfs);
-
-    // Read every disk's partition table, then decide the mount tree from what
-    // they declare. `plan_mounts` is a pure function of those facts.
-    crate::screenln!(screen => machine, &mut bios_workspace;
-        "Filesystems: scanning partition tables...");
-    let parts: alloc::vec::Vec<_> = disks
-        .iter()
-        .flat_map(|&d| {
-            crate::kernel::block::partition::scan(crate::kernel::block::Volume::whole(d))
-        })
-        .collect();
-    crate::screenln!(screen => machine, &mut bios_workspace;
-        "Filesystems: {} partition(s) found", parts.len());
-    let modules = crate::multiboot::mount_modules(boot, &mut screen, 0);
-    let hostfs_is_root = mount_filesystems(
+    prepare_storage(
         machine,
-        &mut bios_workspace,
-        &parts,
+        boot,
+        disks,
         platform.hostfs,
         &mut screen,
-        modules,
+        &mut bios_workspace,
     );
-    screen.present(machine, &mut bios_workspace);
-    // A root mount must have an established backend/session. Later filesystem
-    // operations retain their normal operation-driven reconnect behavior.
-    if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
-        panic!("hostfs: mounted as root but its server is unavailable");
-    }
-    // Permanent empty proxies keep the mount table stable while the OSD
-    // inserts/ejects images discovered under DOS's C:\CD and C:\FLOPPY.
-    crate::kernel::fs::cdrom::init();
-    crate::kernel::fs::floppy::init();
 
+    let PreparedAudio {
+        master_env,
+        sb_card,
+        sink,
+    } = prepare_audio(machine, boot, audio, &mut screen, &mut bios_workspace);
+
+    // DOS worlds are cloned from their substitute-BIOS template.
+    let dos_template = crate::kernel::dos::DosTemplate::new(machine);
+
+    out.write(StartupState {
+        master_env,
+        bios_workspace,
+        dos_template,
+        threads,
+        screen,
+        sb_card,
+        sink,
+    });
+}
+
+struct PreparedAudio {
+    master_env: alloc::vec::Vec<u8>,
+    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+    sink: Option<crate::kernel::sound::Sink>,
+}
+
+/// Resolve audio policy and transfer each hardware capability to its runtime
+/// owner before the first guest starts.
+#[inline(never)]
+fn prepare_audio<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+    audio: crate::kernel::platform::AudioToken,
+    screen: &mut crate::kernel::console::Console,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) -> PreparedAudio {
     // CONFIG.SYS is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
@@ -331,34 +272,158 @@ fn prepare_startup<A: crate::Arch>(
     // the shipped bank lives under the C: root beside the GUS patches. A
     // native-SB machine has no emulated GM to feed and cannot afford the
     // ~5 MB; a silent machine has nothing to render it to.
-    match platform.audio {
-        crate::kernel::platform::Audio::NativeSb
-        | crate::kernel::platform::Audio::EmulatedSilent => {}
-        _ => {
-            crate::screenln!(screen => machine, &mut bios_workspace;
-                "Loading General MIDI bank...");
-            crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
-            crate::screenln!(screen => machine, &mut bios_workspace;
-                "General MIDI bank load complete");
-        }
-    }
+    load_midi_bank(machine, bios_workspace, screen, platform.audio);
     // Take the selected output capability into runtime ownership. `None` is a
     // silent runtime, not a dummy sink.
     let sink = crate::kernel::sound::Sink::new(machine, audio, for_sink);
     init_console_pipe();
-
-    // DOS worlds are cloned from their substitute-BIOS template.
-    let dos_template = crate::kernel::dos::DosTemplate::new(machine);
-
-    out.write(StartupState {
+    PreparedAudio {
         master_env,
-        bios_workspace,
-        dos_template,
-        threads,
-        screen,
         sb_card,
         sink,
-    });
+    }
+}
+
+/// Discover physical disks without letting controller-specific probe and
+/// cleanup paths become part of the startup conductor.
+#[inline(never)]
+fn discover_disks<A: crate::Arch>(
+    machine: &mut A,
+) -> alloc::vec::Vec<&'static dyn crate::kernel::block::Disk> {
+    let disks = crate::kernel::block::probe(machine);
+    for disk in &disks {
+        crate::println!("Storage: {} ({} MB)", disk.name(), disk.sectors() / 2048);
+    }
+    if disks.is_empty() {
+        crate::println!("Storage: none detected");
+    }
+    crate::println!("Block devices initialized");
+    disks
+}
+
+/// Freeze the machine facts before any subsystem derives policy from them.
+#[inline(never)]
+fn discover_platform<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+) -> crate::kernel::platform::ProbedPlatform {
+    crate::kernel::platform::probe(machine, boot)
+}
+
+/// Consume the probed display capability and leave the persistent BIOS
+/// workspace in the caller's final slot.
+#[inline(never)]
+fn select_display<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    display: crate::kernel::display::Display,
+) -> crate::kernel::console::Console {
+    let vbe_mode = display
+        .vga_capability()
+        .and_then(|native| native.bios_discover_vbe(machine, bios_workspace));
+    crate::kernel::platform::set_vbe_mode(vbe_mode);
+    crate::kernel::platform::set_voodoo_vbe_mode(
+        bios_workspace.curated_modes(),
+        !display.is_headless(),
+    );
+    let display = match display.into_native_capability(machine) {
+        Ok(native) => crate::kernel::display::Display::new_selected(
+            machine,
+            bios_workspace,
+            native,
+        ),
+        Err(display) => display,
+    };
+    crate::kernel::console::Console::new(display)
+}
+
+#[inline(never)]
+fn load_midi_bank<A: crate::Arch>(
+    machine: &mut A,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    screen: &mut crate::kernel::console::Console,
+    audio: crate::kernel::platform::Audio,
+) {
+    if !matches!(
+        audio,
+        crate::kernel::platform::Audio::NativeSb
+            | crate::kernel::platform::Audio::EmulatedSilent
+    ) {
+        crate::screenln!(screen => machine, bios_workspace; "Loading General MIDI bank...");
+        crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+        crate::screenln!(screen => machine, bios_workspace; "General MIDI bank load complete");
+    }
+}
+
+/// Apply the owner's disk-write policy before any `Volume` borrows a disk.
+/// Whether a disk is precious cannot be inferred from its controller or host.
+#[inline(never)]
+fn apply_disk_policy(
+    mut disks: alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>,
+    ram_overlay: bool,
+    screen: &mut crate::kernel::console::Console,
+) -> alloc::vec::Vec<&'static dyn crate::kernel::block::Disk> {
+    if ram_overlay {
+        crate::screenln!(
+            screen,
+            "Disk writes: volatile RAM overlay (ram-overlay) — changes will NOT persist"
+        );
+        for disk in &mut disks {
+            *disk = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                crate::kernel::block::overlay::RamOverlay::wrap(*disk),
+            ));
+        }
+    } else {
+        crate::screenln!(
+            screen,
+            "\x1b[91mDisk writes: PERSISTENT\x1b[0m — pass `ram-overlay` to protect the disk"
+        );
+    }
+    disks
+}
+
+/// Establish the complete mount namespace. Disk and partition discovery are
+/// boot temporaries and are dropped before audio and guest construction.
+#[inline(never)]
+fn prepare_storage<A: crate::Arch>(
+    machine: &mut A,
+    boot: &crate::BootConfig,
+    disks: alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>,
+    hostfs: bool,
+    screen: &mut crate::kernel::console::Console,
+    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) {
+    crate::kernel::dos::set_c_root(boot.c_root());
+    crate::kernel::dos::set_hostfs_enabled(hostfs);
+
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: scanning partition tables...");
+    let mut parts = alloc::vec::Vec::new();
+    for disk in disks {
+        parts.extend(crate::kernel::block::partition::scan(
+            crate::kernel::block::Volume::whole(disk),
+        ));
+    }
+    crate::screenln!(screen => machine, bios_workspace;
+        "Filesystems: {} partition(s) found", parts.len());
+
+    let modules = crate::multiboot::mount_modules(boot, screen, 0);
+    let hostfs_is_root = mount_filesystems(
+        machine,
+        bios_workspace,
+        &parts,
+        hostfs,
+        screen,
+        modules,
+    );
+    screen.present(machine, bios_workspace);
+    if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
+        panic!("hostfs: mounted as root but its server is unavailable");
+    }
+
+    // Stable empty proxies let the OSD insert and eject media later.
+    crate::kernel::fs::cdrom::init();
+    crate::kernel::fs::floppy::init();
 }
 
 /// The host filesystem on the selected serial transport. Mounted at /host
@@ -399,6 +464,7 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
 /// Build the mount tree. The disk's 0xDA boot-bundle partition is
 /// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
 /// ordinary directory on whatever backs C:, not a mount of its own.
+#[inline(never)]
 fn mount_filesystems<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -687,7 +753,7 @@ fn run<A: crate::Arch>(
                 }
             };
             crate::screenln!(
-                screen,
+                &mut screen,
                 "Starting {} {} (cwd={})...",
                 core::str::from_utf8(path).unwrap_or("?"),
                 core::str::from_utf8(tail).unwrap_or(""),
@@ -708,7 +774,7 @@ fn run<A: crate::Arch>(
                 sink.as_mut(),
             );
         }
-        crate::screenln!(screen, "All commands done — shutting down.");
+        crate::screenln!(&mut screen, "All commands done — shutting down.");
         crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
@@ -719,9 +785,9 @@ fn run<A: crate::Arch>(
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
-    crate::screenln!(screen, "Welcome to RetroOS! F12 opens the host monitor.");
+    crate::screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
-    crate::screenln!(screen, "Starting DN...");
+    crate::screenln!(&mut screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
     loop {
         (screen, sb) = run_program_with_screen(
@@ -738,7 +804,7 @@ fn run<A: crate::Arch>(
             sb,
             sink.as_mut(),
         );
-        crate::screenln!(screen, "DN exited, restarting...");
+        crate::screenln!(&mut screen, "DN exited, restarting...");
     }
 }
 

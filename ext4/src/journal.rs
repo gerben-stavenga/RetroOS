@@ -178,6 +178,7 @@ pub struct GraphJournal {
 }
 
 impl GraphJournal {
+    #[inline(never)]
     pub fn mount(graph: &mut Graph, storage: &mut dyn Storage) -> Result<Self, Error> {
         let blob = graph.journal_blob()?;
         let info = graph.inspect(storage, crate::ext4::Object::Blob(blob))?;
@@ -318,6 +319,7 @@ impl GraphJournal {
         Ok(format)
     }
 
+    #[inline(never)]
     fn replay(&mut self, graph: &Graph, storage: &mut dyn Storage) -> Result<(), Error> {
         let format = self.format(graph, storage)?;
         if format.start == 0 {
@@ -420,6 +422,7 @@ impl GraphJournal {
             .map_err(Error::Storage)
     }
 
+    #[inline(never)]
     pub fn commit_blocks(
         &mut self,
         graph: &Graph,
