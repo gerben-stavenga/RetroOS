@@ -1,0 +1,9 @@
+[package]
+name = "compact-fmt"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Compact allocation-free formatting bytecode for no_std targets"
+
+[dependencies]
+compact-fmt-macros = { path = "macros" }

@@ -1,7 +1,44 @@
 # Build lib crate using rules_rust
-load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_proc_macro", "rust_test")
 
 package(default_visibility = ["//visibility:public"])
+
+# Compact, allocation-free formatting. The host-built proc macro compiles
+# format literals to bytecode; the target runtime is an independent no_std
+# crate and delegates primitive conversion to core::fmt without fmt::Arguments.
+rust_proc_macro(
+    name = "compact_fmt_macros",
+    srcs = ["compact_fmt/macros/src/lib.rs"],
+    crate_name = "compact_fmt_macros",
+    crate_root = "compact_fmt/macros/src/lib.rs",
+    edition = "2024",
+)
+
+rust_library(
+    name = "compact_fmt",
+    srcs = ["compact_fmt/src/lib.rs"],
+    crate_name = "compact_fmt",
+    crate_root = "compact_fmt/src/lib.rs",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Crelocation-model=static",
+    ],
+    proc_macro_deps = [":compact_fmt_macros"],
+)
+
+rust_test(
+    name = "compact_fmt_test",
+    srcs = ["compact_fmt/tests/format.rs"],
+    crate_name = "compact_fmt_test",
+    edition = "2024",
+    rustc_flags = [
+        "-Cpanic=abort",
+        "-Zpanic_abort_tests",
+        "-Crelocation-model=static",
+    ],
+    deps = [":compact_fmt"],
+)
 
 rust_library(
     name = "lib",
