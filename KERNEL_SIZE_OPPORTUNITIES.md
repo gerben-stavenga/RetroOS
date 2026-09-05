@@ -59,14 +59,10 @@ cycle array and periodically publish an OSD snapshot. Two generic decimal log
 lines are emitted only when requested, replacing the formatting-heavy periodic
 reporter. VGA scanout diagnostics remain available under Trace.
 
-The metal final link also enables LLVM's size-profitable machine outliner.
-Its synthetic numbered fragments are omitted from `KERNEL.SYM`; a backtrace
-inside one prints the raw address and continues with the symbolized caller.
-
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| `kernel.elf` | 882,148 | 869,852 | -12,296 |
-| `.text` | 722,814 | 711,422 | -11,392 |
+| `kernel.elf` | 882,148 | 873,948 | -8,200 |
+| `.text` | 722,814 | 713,598 | -9,216 |
 | `.rodata` | 141,624 | 141,380 | -244 |
 | `KERNEL.SYM` | 185,505 | 182,436 | -3,069 |
 

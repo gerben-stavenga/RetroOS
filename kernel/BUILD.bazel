@@ -137,10 +137,6 @@ rust_binary(
         "-Clink-arg=$(location :entry)",
         "-Clink-arg=-nostdlib",
         "-Clink-arg=-no-pie",
-        # Share repeated post-LTO instruction sequences when LLVM's size cost
-        # model says an outlined local routine is smaller. Keep this on the
-        # metal final link: applying it workspace-wide breaks 16-bit payloads.
-        "-Cllvm-args=-enable-machine-outliner=always",
     ],
     deps = [
         ":kernel",

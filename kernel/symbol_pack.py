@@ -22,8 +22,6 @@ def main() -> None:
         if len(fields) != 4 or fields[1] not in "tTwW":
             continue
         name, _, address, size = fields
-        if re.fullmatch(r"OUTLINED_FUNCTION_\d+", name):
-            continue
         address = int(address, 16)
         size = int(size, 16)
         if address:
