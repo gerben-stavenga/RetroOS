@@ -533,7 +533,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
 /// `dos.pm_vectors[0x21] = (SPECIAL_STUB_SEL, STUB_BASE + SLOT_PMDOS_INT21*2)`,
 /// which `dpmi_enter` installs when `client_use32 == false`.
 ///
-/// We service the call directly with PM regs — no `push_continuation_and_switch_to_rm_side`,
+/// We service the call directly with PM regs — no `enter_rm`,
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
@@ -3220,11 +3220,11 @@ pub(super) fn deliver_mouse_callback<A: crate::Arch>(machine: &mut A, dos: &mut 
         // protected mode. Mirror the IRQ PM-entry path (switch to the PM side
         // via a HostContinuation), but return via FAR RET — MS-Mouse handlers
         // end with RETF, not IRET — to the SLOT_MOUSE_CB_RET trampoline.
-        mode_transitions::push_continuation_and_switch_to_pm_side(machine, dos, regs, None);
+        mode_transitions::enter_pm(dos, regs, None);
     } else {
         // Real-mode client: ES:DX is a paragraph; far-call it on the RM stack.
-        let rm_dest = mode_transitions::rm_get_stack(dos);
-        mode_transitions::push_continuation_and_switch_to_rm_side(machine, dos, regs, rm_dest, None);
+        let rm_dest = mode_transitions::rm_stack(dos, regs);
+        mode_transitions::enter_rm(dos, regs, rm_dest, None);
     }
 
     let m = &mut dos.pc.mouse;
@@ -3528,9 +3528,10 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
         &mut dos.pm_rm_vector_shadow,
         [(0, 0, 0); 256],
     );
-    // The child begins a fresh continuation chain: its locked-stack cursor
-    // must not point into the parent's PM stack (see ExecParent docs).
-    let suspended_locked_stack = dos.pc.locked_stack.other_stack.take();
+    let suspended_locked_stack = core::mem::replace(
+        &mut dos.pc.locked_stack,
+        mode_transitions::LockedStackState::new(),
+    );
     let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
     for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
@@ -3563,7 +3564,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
         ldt_alloc: suspended_ldt_alloc,
         pm_rm_vector_shadow: suspended_pm_rm_vector_shadow,
         pm_dos: suspended_pm_dos,
-        locked_stack_other: suspended_locked_stack,
+        locked_stack: suspended_locked_stack,
         pm_mode: parent_pm_mode,
         prev: prev.map(alloc::boxed::Box::new),
     });
@@ -3742,9 +3743,7 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
         dos.ldt_alloc = parent.ldt_alloc;
         dos.pm_rm_vector_shadow = parent.pm_rm_vector_shadow;
         dos.pm_dos = parent.pm_dos;
-        // Restore the parent's continuation-chain cursor alongside its LDT:
-        // the two are a matched pair (cursor indexes stack via LDT selectors).
-        dos.pc.locked_stack.other_stack = parent.locked_stack_other;
+        dos.pc.locked_stack = parent.locked_stack;
     }
     // LDTR currently points at the child's LDT — reload (same box if we
     // preserved it, parent's box if we restored).
@@ -4487,7 +4486,7 @@ pub(super) fn host_stack_size() -> u32 {
 /// SP value within `HOST_STACK_PM*_SEL` for an empty locked stack. The
 /// selectors have base = host_stack_base() and limit = size−1, so the
 /// post-init SP that pushes decrement from is exactly `size`. Used by
-/// [`super::mode_transitions::pm_get_stack`] as the chain-empty default.
+/// the transition layer as the chain-empty PM default.
 pub(super) fn host_stack_empty_sp() -> u32 {
     host_stack_size()
 }

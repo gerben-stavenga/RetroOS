@@ -262,7 +262,7 @@ pub struct PcMachine {
     /// PM/RM transition state. The pm-side cursor isn't a separate
     /// field — it's `regs.SS:SP` when user is on pm side, or
     /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
-    /// rm side. See [`super::mode_transitions::pm_get_stack`].
+    /// rm side. See `mode_transitions::stack_for`.
     pub locked_stack: super::mode_transitions::LockedStackState,
 }
 

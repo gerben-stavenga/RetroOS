@@ -454,15 +454,9 @@ pub struct ExecParent {
     /// Parent's PMDOS routing flag, suspended alongside dpmi/pm_vectors so
     /// the child runs with the default reflect-to-RM INT 21 path.
     pub pm_dos: bool,
-    /// Parent's locked-stack chain cursor (`pc.locked_stack.other_stack`),
-    /// suspended so the child starts a fresh continuation chain. The cursor
-    /// is a LIFO position into the parent's host/PM stack tied to the
-    /// parent's LDT selectors; leaving it visible to the child makes the
-    /// child's first PM IRQ plant its resume continuation on the *parent's*
-    /// stack selector — which is null in the child's fresh LDT, so the exit
-    /// IRET to the resume park #GPs in ring 0 (the OMF-launcher relaunch
-    /// crash). Restored on `exec_return` alongside dpmi/ldt.
-    pub locked_stack_other: Option<(u16, u32)>,
+    /// Parent's complete locked-stack chain, including host continuations.
+    /// The child starts with an independent empty chain.
+    pub locked_stack: mode_transitions::LockedStackState,
     /// Parent was running in PM at EXEC time. The child is always VM86;
     /// `exec_return` uses this to flip `VM_FLAG` back so the dispatch tail
     /// runs the PM iret-frame pop instead of the VM86 one.
@@ -797,7 +791,7 @@ pub fn handle_event<A: crate::Arch>(
             }
 
             // DPMI session active: route to client's exception handler
-            // regardless of current mode. push_continuation_and_switch_to_pm_side handles the
+            // regardless of current mode. enter_pm handles the
             // VM86→PM toggle if needed; save.restore puts us back in
             // VM86 on the unwind.
             if dos.dpmi.is_some() {
@@ -808,7 +802,9 @@ pub fn handle_event<A: crate::Arch>(
                 // reads the descriptors AFTER it has restored them, so dump
                 // the live LDT view here, where it is still the fault's.
                 if n == 13 {
-                    log_pm_gp(dos, regs);
+                    log_pm_gp(machine, dos, regs);
+                } else if n == 6 {
+                    log_pm_ud(machine, dos, regs);
                 }
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, n as u32)
             } else if is_vm86 && matches!(n, 0..=7 | 16 | 17 | 19)
@@ -878,7 +874,7 @@ pub fn handle_event<A: crate::Arch>(
                     bytes[0], bytes[1], bytes[2], bytes[3],
                     bytes[4], bytes[5], bytes[6], bytes[7]);
             } else if dos.dpmi.is_some() {
-                log_pm_gp(dos, regs);
+                log_pm_gp(machine, dos, regs);
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, 13)
             } else {
                 thread::KernelAction::Exit(0x0200 | 13) // #GP
@@ -1779,7 +1775,7 @@ pub fn stub_seg() -> u16 {
 /// actually covered, and where the Voodoo aperture sits — enough to say
 /// whether the faulting address was simply past a limit. First few only: a
 /// client that GPs repeatedly must not flood the log.
-fn log_pm_gp<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) {
+fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
     use core::sync::atomic::{AtomicU32, Ordering};
     static SEEN: AtomicU32 = AtomicU32::new(0);
     if SEEN.fetch_add(1, Ordering::Relaxed) >= 8 {
@@ -1798,10 +1794,25 @@ fn log_pm_gp<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) {
     let (ds_b, ds_l) = seg(regs.ds as u16);
     let (es_b, es_l) = seg(regs.es as u16);
     let (ss_b, ss_l) = seg(regs.stack_seg());
+    let ip = if mode_transitions::seg_is_32(&dos.ldt[..], regs.code_seg()) {
+        regs.ip32()
+    } else {
+        regs.ip32() & 0xffff
+    };
+    let mut bytes = [0u8; 12];
+    machine.copy_from(cs_b.wrapping_add(ip) as usize, &mut bytes);
+    let sp = if mode_transitions::seg_is_32(&dos.ldt[..], regs.stack_seg()) {
+        regs.sp32()
+    } else {
+        regs.sp32() & 0xffff
+    };
+    let mut stack = [0u8; 24];
+    machine.copy_from(ss_b.wrapping_add(sp) as usize, &mut stack);
+    let last_irq = unsafe { mode_transitions::LAST_IRQ };
     crate::println!(
-        "[#GP] cs={:04x}:{:#x} err={:#x} eax={:#x} ebx={:#x} esi={:#x}",
-        regs.code_seg(), regs.ip32(), regs.err_code, regs.rax as u32,
-        regs.rbx as u32, regs.rsi as u32
+        "[#GP] cs={:04x}:{:#x} err={:#x} bytes={:02x?} eax={:#x} ebx={:#x} esi={:#x}",
+        regs.code_seg(), regs.ip32(), regs.err_code, bytes, regs.rax as u32,
+        regs.rbx as u32, regs.rsi as u32,
     );
     crate::println!(
         "[#GP] cs={:04x} base={:#x} limit={:#x} | ds={:04x} base={:#x} limit={:#x}",
@@ -1811,5 +1822,39 @@ fn log_pm_gp<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) {
         "[#GP] es={:04x} base={:#x} limit={:#x} | ss={:04x} base={:#x} limit={:#x} | voodoo aperture={:x?}",
         regs.es as u16, es_b, es_l, regs.stack_seg(), ss_b, ss_l,
         dos.pc.voodoo.as_ref().and_then(|voodoo| voodoo.linear_base)
+    );
+    crate::println!(
+        "[#GP] stack={:02x?} last_irq=vec{:02x} target={:04x}:{:08x} from={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+        stack, last_irq.0, last_irq.1, last_irq.2, last_irq.3,
+        last_irq.4, last_irq.5, last_irq.6,
+    );
+}
+
+/// Runtime bytes for a protected-mode #UD.  DOS extenders print the selector
+/// and offset, but that alone cannot distinguish an actually invalid encoding
+/// from damaged code or a bad resume point.
+fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static SEEN: AtomicU32 = AtomicU32::new(0);
+    if SEEN.fetch_add(1, Ordering::Relaxed) >= 8 {
+        return;
+    }
+    let selector = regs.code_seg();
+    let (base, limit) = match dpmi::valid_ldt_selector_idx(&dos.ldt_alloc, selector) {
+        Some(idx) => {
+            let descriptor = dos.ldt[idx];
+            (dpmi::desc_base(descriptor), dpmi::desc_limit(descriptor))
+        }
+        None => (A::seg_base(selector), 0),
+    };
+    let ip = regs.ip32();
+    let linear = base.wrapping_add(ip);
+    let mut bytes = [0u8; 16];
+    machine.copy_from(linear as usize, &mut bytes);
+    let mut preceding = [0u8; 8];
+    machine.copy_from(linear.wrapping_sub(preceding.len() as u32) as usize, &mut preceding);
+    crate::println!(
+        "[#UD] cs={:04x}:{:#x} linear={:#x} limit={:#x} bytes={:02x?} before={:02x?}",
+        selector, ip, linear, limit, bytes, preceding
     );
 }
