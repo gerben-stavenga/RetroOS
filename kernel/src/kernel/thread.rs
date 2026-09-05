@@ -3,7 +3,6 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::kernel::stacktrace::SymbolData;
 use crate::println;
 use crate::Regs;
 
@@ -514,7 +513,6 @@ pub struct KernelThread<A: crate::Arch> {
     pub exit_code: i32,
     pub addr_hash: u64,
     pub cpu_hash: u64,
-    pub symbols: Option<SymbolData>,
     pub fds: [FdKind; MAX_FDS],
     // u64: one bit per fd slot, so it must cover MAX_FDS (was u16 — fds >= 16
     // silently wrapped the shift in release builds).
@@ -565,7 +563,6 @@ impl<A: crate::Arch> KernelThread<A> {
             exit_code: 0,
             addr_hash: 0,
             cpu_hash: 0,
-            symbols: None,
             fds: [FdKind::None; MAX_FDS],
             cloexec: 0,
             comm: [0; 16],
@@ -971,7 +968,6 @@ pub fn exit_thread<A: crate::Arch>(
             Personality::Linux(_) | Personality::Os2(_) | Personality::Windows(_) => {}
         }
         thread.kernel.close_all_fds();
-        thread.kernel.symbols = None;
         thread.kernel.exit_code = exit_code;
     }
 

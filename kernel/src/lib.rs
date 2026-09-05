@@ -16,7 +16,6 @@
 #![feature(optimize_attribute)]
 
 extern crate alloc;
-extern crate rustc_demangle;
 
 // The bare-metal entry glue lives with the kernel but is inherently 32-bit
 // x86 (the `boot_kernel` crt0 called by `entry.asm`, the GOP fbcon console,

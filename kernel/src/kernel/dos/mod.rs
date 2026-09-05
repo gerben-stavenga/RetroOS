@@ -1103,7 +1103,6 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     *f = (*f & !(3u64 << 12)) | ((viopl as u64) << 12);
     let dos_state = current.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
-    current.kernel.symbols = None;
     // Bind this thread's DOS CPU state (LDT/TLS/IOPB) into the hardware now.
     // An in-place execve has no context switch, so `on_resume` — which the boot
     // path's `run_init_program` calls — wouldn't otherwise fire, leaving the

@@ -19,7 +19,6 @@ macro_rules! linux_trace {
 }
 
 use crate::kernel::elf;
-use crate::kernel::stacktrace::SymbolData;
 use crate::kernel::thread;
 use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
@@ -710,15 +709,12 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         (loaded.entry, alloc::vec::Vec::new())
     };
 
-    let symbols = SymbolData::new(alloc::vec::Vec::from(data).into_boxed_slice());
-
     let sp = setup_user_stack(machine, &mut current.kernel.vcpu, args, want_64, &extra_auxv);
     if want_64 {
         thread::init_process_thread_64(current, cpu_entry, sp as u64);
     } else {
         thread::init_process_thread(current, cpu_entry as u32, sp as u32);
     }
-    current.kernel.symbols = symbols;
 
     if let thread::Personality::Linux(l) = &mut current.personality {
         l.heap_base = loaded.max_vaddr;
@@ -1203,7 +1199,6 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     // Point of no return — drop symbols + close CLOEXEC fds.
     {
         let cur = thread::get_thread(threads, tid).unwrap();
-        cur.kernel.symbols = None;
         cur.kernel.close_cloexec();
     }
 

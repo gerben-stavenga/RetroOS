@@ -43,6 +43,24 @@ They are not necessarily additive: a symbol can match more than one category.
 
 ## Completed work
 
+### Build-time stack symbols
+
+`KERNEL.SYM` is now a compact address table with names demangled by the build.
+The kernel no longer links `rustc-demangle`, parses an ELF symbol table for
+backtraces, or retains an unused copy of each Linux process's ELF image.
+
+| Metric | Before | After | Reduction |
+|---|---:|---:|---:|
+| `kernel.elf` | 898,532 | 882,148 | 16,384 |
+| `.text` | 741,310 | 722,814 | 18,496 |
+| `.rodata` | 143,180 | 141,624 | 1,556 |
+| `KERNEL.SYM` | 283,380 | 185,505 | 97,875 |
+
+The ELF file reduction is page-rounded; `.data` stayed at 9,320 bytes. The
+reported `.bss` section grew from 425,984 to 442,368 bytes because moving the
+preceding sections changed the padding before the fixed 64-KiB-aligned arch
+stack. No writable object was added.
+
 ### Shared generic monomorphizations
 
 Commit `f216548` enabled reuse of generic instantiations rather than compiling
@@ -92,29 +110,7 @@ are copied to the framebuffer.
 
 ## Recommended order
 
-### 1. Move Rust demangling into `KERNEL.SYM` generation
-
-The full `rustc-demangle` implementation contributes about 12,762 bytes of
-`.text` and is called at only one location, when a stack-frame name is printed.
-This is build-time work being repeated inside the kernel.
-
-Generate a compact, sorted address/name table after linking:
-
-1. Read defined `STT_FUNC` symbols from `kernel_elf_bin`.
-2. Demangle Rust v0 names on the build host (`c++filt -s rust` is available).
-3. Store `(address, name_offset)` records followed by NUL-terminated names.
-4. Binary-search that table in the stack tracer and print the stored name.
-5. Remove the kernel's runtime `rustc-demangle` dependency.
-
-This retains readable backtraces. It should also make `KERNEL.SYM` smaller than
-the current debug ELF, although only the removed demangler affects
-`kernel.elf`.
-
-Do not attempt to compile all Rust functions with `#[no_mangle]`: mangling is
-needed for unique linker symbols. Demangling belongs in the post-link symbol
-generator.
-
-### 2. Consolidate DOS service primitives
+### 1. Consolidate DOS service primitives
 
 The two principal DOS service dispatchers alone occupy 54,475 bytes:
 
@@ -149,7 +145,7 @@ Related large DOS paths to audit after the basic primitives exist:
 | DOS machine MMIO fault handling | 6,667 |
 | DOS display tick | 6,760 |
 
-### 3. Collapse repeated lifecycle work in startup and the event loop
+### 2. Collapse repeated lifecycle work in startup and the event loop
 
 The largest individual functions are state-machine coordinators:
 
@@ -170,7 +166,7 @@ Keep the central state transition visible. Extract only operations whose
 preconditions and ownership are genuinely identical, then compare generated
 symbols before continuing.
 
-### 4. Reuse ext4 mutation machinery
+### 3. Reuse ext4 mutation machinery
 
 Symbols containing `portable_ext4` account for approximately 111,167 bytes,
 the largest coherent code cluster in the image. Full read/write modern ext4
@@ -205,7 +201,7 @@ power-of-two tests, and checksum update helpers. Consolidate those first; then
 use the shared primitives to simplify the large mutation operations. Changes
 should ideally live in `portable_ext4` rather than kernel-specific wrappers.
 
-### 5. Share executable-loader and personality ABI primitives
+### 4. Share executable-loader and personality ABI primitives
 
 Approximate code inventories:
 
@@ -232,7 +228,7 @@ mechanics around them:
 Avoid a universal loader abstraction that makes simple paths indirect. Share
 small ownership and mapping operations while leaving format parsing explicit.
 
-### 6. Reduce formatting and diagnostic machinery deliberately
+### 5. Reduce formatting and diagnostic machinery deliberately
 
 Symbols whose names contain `core::fmt`/`alloc::fmt` account for roughly
 13,462 bytes; this overlaps the demangler inventory. Formatting is spread
@@ -244,7 +240,7 @@ monomorphizations are duplicated. Prefer a small set of existing log primitives
 for repeated hexadecimal addresses, register dumps, and byte strings. Do not
 create many near-identical bespoke printers; that merely moves the duplication.
 
-### 7. Simplify table-like dispatchers
+### 6. Simplify table-like dispatchers
 
 Several large functions are register/API decoders rather than algorithms:
 
@@ -261,7 +257,7 @@ represented once. A data table is useful only when it replaces repeated code
 and remains readable. Do not turn hot VGA, audio, or MMIO paths into indirect
 function calls merely to reduce a symbol.
 
-### 8. External parser and emulation clusters
+### 7. External parser and emulation clusters
 
 These are meaningful but lower-priority until the surrounding shared
 primitives are improved:

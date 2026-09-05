@@ -80,9 +80,7 @@ rust_library(
         ":metal": [
             "//arch-metal",
         ],
-        "//conditions:default": [
-            "@crates//:rustc-demangle",
-        ],
+        "//conditions:default": [],
     }),
 )
 
@@ -162,15 +160,14 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-# The symbol table on its own, for the in-kernel stack tracer. `--only-keep-debug`
-# keeps .symtab/.strtab and turns the allocatable sections into NOBITS
-# placeholders, so this is ~276 KB against the linked binary's 1 MB — and the
-# tracer no longer slurps a second copy of .text it already has mapped.
+# Compact address table for the in-kernel stack tracer. Names are demangled at
+# build time, so the kernel carries neither rustc-demangle nor ELF symbol-table
+# parsing just to print a backtrace.
 genrule(
     name = "kernel_sym",
-    srcs = [":kernel_elf_bin"],
+    srcs = [":kernel_elf_bin", "symbol_pack.py"],
     outs = ["kernel.sym"],
-    cmd = "objcopy --only-keep-debug $< $@",
+    cmd = "python3 $(location symbol_pack.py) $(location :kernel_elf_bin) $@",
     visibility = ["//visibility:public"],
 )
 

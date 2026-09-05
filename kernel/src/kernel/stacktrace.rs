@@ -12,47 +12,85 @@ use core::fmt::Write;
 use crate::kernel::vfs;
 #[cfg(target_arch = "x86")]
 use core::arch::asm;
-use lib::elf::SymbolTable;
 
-/// Owned symbol data - keeps ELF data alive for SymbolTable references
-#[derive(Clone)]
-pub struct SymbolData {
-    elf_data: Box<[u8]>,
+const SYMBOL_MAGIC: &[u8; 4] = b"RSYM";
+const SYMBOL_VERSION: u32 = 1;
+const HEADER_SIZE: usize = 16;
+const ENTRY_SIZE: usize = 12;
+
+/// Packed, address-sorted function symbols. Names are demangled by the build;
+/// the kernel only validates the table and binary-searches it.
+struct SymbolData {
+    data: Box<[u8]>,
+    count: usize,
+    names_offset: usize,
 }
 
 impl SymbolData {
-    /// Create symbol data from ELF bytes
-    pub fn new(elf_data: Box<[u8]>) -> Option<Self> {
-        // Verify we can parse symbols before storing
-        let elf_ref: &[u8] = &elf_data;
-        if SymbolTable::parse(elf_ref).is_some() {
-            Some(SymbolData { elf_data })
-        } else {
-            None
-        }
+    fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(data.get(offset..offset + 4)?.try_into().ok()?))
     }
 
-    /// Look up a symbol by address
-    pub fn lookup(&self, addr: u64) -> (&str, u64) {
-        // SAFETY: elf_data is owned by self and won't move
-        let elf_ref: &[u8] = unsafe {
-            core::slice::from_raw_parts(self.elf_data.as_ptr(), self.elf_data.len())
-        };
-        if let Some(table) = SymbolTable::parse(elf_ref) {
-            table.lookup(addr)
-        } else {
-            ("", 0)
+    fn new(data: Box<[u8]>) -> Option<Self> {
+        if data.get(..4)? != SYMBOL_MAGIC
+            || Self::read_u32(&data, 4)? != SYMBOL_VERSION
+        {
+            return None;
         }
+        let count = Self::read_u32(&data, 8)? as usize;
+        let names_offset = Self::read_u32(&data, 12)? as usize;
+        let entries_end = HEADER_SIZE.checked_add(count.checked_mul(ENTRY_SIZE)?)?;
+        if names_offset != entries_end || names_offset > data.len() {
+            return None;
+        }
+
+        let mut previous = 0;
+        for index in 0..count {
+            let entry = HEADER_SIZE + index * ENTRY_SIZE;
+            let address = Self::read_u32(&data, entry)?;
+            let name_offset = Self::read_u32(&data, entry + 8)? as usize;
+            if address == 0 || (index != 0 && address <= previous) {
+                return None;
+            }
+            previous = address;
+            let name = data.get(names_offset.checked_add(name_offset)?..)?;
+            let end = name.iter().position(|&byte| byte == 0)?;
+            core::str::from_utf8(&name[..end]).ok()?;
+        }
+        Some(Self { data, count, names_offset })
     }
 
-    /// Get symbol count (for diagnostics)
-    pub fn symbol_count(&self) -> (usize, usize) {
-        let elf_ref: &[u8] = &self.elf_data;
-        if let Some(table) = SymbolTable::parse(elf_ref) {
-            (table.symbol_count(), table.func_count())
-        } else {
-            (0, 0)
+    fn entry(&self, index: usize) -> (u32, u32, usize) {
+        let offset = HEADER_SIZE + index * ENTRY_SIZE;
+        (
+            Self::read_u32(&self.data, offset).unwrap(),
+            Self::read_u32(&self.data, offset + 4).unwrap(),
+            Self::read_u32(&self.data, offset + 8).unwrap() as usize,
+        )
+    }
+
+    fn lookup(&self, addr: u64) -> (&str, u64) {
+        let Ok(addr) = u32::try_from(addr) else { return ("", 0) };
+        let mut low = 0;
+        let mut high = self.count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            if self.entry(middle).0 <= addr {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
         }
+        if low == 0 {
+            return ("", 0);
+        }
+        let (start, size, name_offset) = self.entry(low - 1);
+        if addr > start.saturating_add(size) {
+            return ("", 0);
+        }
+        let name = &self.data[self.names_offset + name_offset..];
+        let end = name.iter().position(|&byte| byte == 0).unwrap();
+        (core::str::from_utf8(&name[..end]).unwrap(), u64::from(addr - start))
     }
 }
 
@@ -64,28 +102,13 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 
 /// Load the kernel's symbol table, for naming addresses in a backtrace.
 ///
-/// `C:\BOOT\KERNEL.SYM` is the real source: `kernel.elf` is stripped, so the
-/// booted image carries no names at all. The symbol file is an ELF whose
-/// allocatable sections are NOBITS placeholders — .symtab and .strtab are the
-/// only content — which is a quarter the size of the linked binary and, more
-/// to the point, is not a second copy of the .text we already have mapped.
-///
-/// The two `kernel.elf` fallbacks are for an unstripped development build
-/// (hosted runs from the VFS root, a disk boot from the DOS system directory).
-/// They cost a megabyte of heap when they hit, which is precisely why the
-/// symbol file exists.
+/// `C:\BOOT\KERNEL.SYM` is generated from the unstripped linked kernel. It
+/// contains only fixed-size address records and pre-demangled names.
 pub fn init_from_vfs() {
     let sym = [crate::kernel::dos::c_root(), b"BOOT/KERNEL.SYM"].concat();
-    let mut handle = vfs::open_to_handle(&sym);
+    let handle = vfs::open_to_handle(&sym);
     if handle < 0 {
-        handle = vfs::open_to_handle(b"kernel.elf");
-    }
-    if handle < 0 {
-        let p = [crate::kernel::dos::c_root(), b"BOOT/kernel.elf"].concat();
-        handle = vfs::open_to_handle(&p);
-    }
-    if handle < 0 {
-        println!("stacktrace: no KERNEL.SYM and no kernel.elf — backtraces will be addresses only");
+        println!("stacktrace: no KERNEL.SYM — backtraces will be addresses only");
         return;
     }
     let size = vfs::file_size_by_handle(handle) as usize;
@@ -100,14 +123,13 @@ pub fn init_from_vfs() {
 
     match SymbolData::new(elf_box) {
         Some(data) => {
-            let (total, funcs) = data.symbol_count();
-            println!("Loaded {} symbols ({} functions)", total, funcs);
+            println!("Loaded {} function symbols", data.count);
             unsafe {
                 *kernel_symbols_ptr() = Some(data);
             }
         }
         None => {
-            println!("stacktrace: failed to parse ELF symbols");
+            println!("stacktrace: invalid KERNEL.SYM");
         }
     }
 }
@@ -151,7 +173,7 @@ fn print_frame(out: &mut dyn Write, depth: usize, ip: u64) {
     let (name, offset) = lookup_symbol(ip);
     let _ = write!(out, "  {:2}: {:#010x}", depth, ip);
     if !name.is_empty() {
-        let _ = write!(out, " {}+{:#x}", rustc_demangle::demangle(name), offset);
+        let _ = write!(out, " {}+{:#x}", name, offset);
     }
     let _ = writeln!(out);
 }
@@ -219,4 +241,44 @@ fn lookup_symbol(addr: u64) -> (&'static str, u64) {
         }
     }
     ("", 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENTRY_SIZE, HEADER_SIZE, SYMBOL_MAGIC, SYMBOL_VERSION, SymbolData};
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+
+    fn packed(entries: &[(u32, u32, u32)], names: &[u8]) -> Box<[u8]> {
+        let mut data = Vec::new();
+        data.extend_from_slice(SYMBOL_MAGIC);
+        data.extend_from_slice(&SYMBOL_VERSION.to_le_bytes());
+        data.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        data.extend_from_slice(&((HEADER_SIZE + entries.len() * ENTRY_SIZE) as u32).to_le_bytes());
+        for &(address, size, name) in entries {
+            data.extend_from_slice(&address.to_le_bytes());
+            data.extend_from_slice(&size.to_le_bytes());
+            data.extend_from_slice(&name.to_le_bytes());
+        }
+        data.extend_from_slice(names);
+        data.into_boxed_slice()
+    }
+
+    #[test]
+    fn packed_symbols_binary_search_and_reject_gaps() {
+        let symbols = SymbolData::new(packed(
+            &[(0x1000, 0x20, 0), (0x1100, 0x10, 6)],
+            b"first\0second\0",
+        )).unwrap();
+        assert_eq!(symbols.lookup(0x1014), ("first", 0x14));
+        assert_eq!(symbols.lookup(0x1080), ("", 0));
+        assert_eq!(symbols.lookup(0x1104), ("second", 4));
+    }
+
+    #[test]
+    fn packed_symbols_validate_order_and_names() {
+        assert!(SymbolData::new(packed(&[(0x1100, 1, 0), (0x1000, 1, 2)], b"a\0b\0")).is_none());
+        assert!(SymbolData::new(packed(&[(0x1000, 1, 4)], b"a\0")).is_none());
+        assert!(SymbolData::new(packed(&[(0x1000, 1, 0)], b"unterminated")).is_none());
+    }
 }
