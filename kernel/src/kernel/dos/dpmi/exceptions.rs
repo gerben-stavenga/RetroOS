@@ -19,18 +19,9 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     }
 }
 
-fn dump_words<A: crate::Arch>(machine: &mut A, label: &str, addr: u32) {
-    let _ = machine;
-    crate::println!("  {} @{:08X}", label, addr);
-}
-
-fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
+fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, exc_num: u32) {
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
-    let ss_base = seg_base(&dos.ldt[..], regs.stack_seg());
     let ip_addr = cs_base.wrapping_add(regs.ip32());
-    let sp_addr = ss_base.wrapping_add(regs.sp32());
-    let bp_addr = ss_base.wrapping_add(regs.rbp as u32);
-    let _ = machine;
 
     crate::println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
@@ -60,8 +51,6 @@ fn dump_dpmi_fault_context<A: crate::Arch>(machine: &mut A, dos: &thread::DosSta
     dump_selector("DS", dos, regs.ds as u16);
     dump_selector("ES", dos, regs.es as u16);
     dump_selector("SS", dos, regs.stack_seg());
-    dump_words(machine, "stack SP", sp_addr);
-    dump_words(machine, "stack BP", bp_addr);
 }
 
 /// FAR-CALL return frame the host pushes below the spec exception
@@ -244,7 +233,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
         }
         crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
-        dump_dpmi_fault_context(machine, dos, regs, exc_num);
+        dump_dpmi_fault_context(dos, regs, exc_num);
         startup::arch_dump_exception(machine, dos, regs);
         return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }
@@ -506,6 +495,5 @@ pub(super) fn exception_return<A: crate::Arch>(machine: &mut A,
     let image = regs.flags32();
     machine::apply_guest_flags(regs, image);
 
-    trace_client_selector_leak("exception_return.out", regs);
     thread::KernelAction::Done
 }

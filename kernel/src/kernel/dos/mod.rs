@@ -1314,6 +1314,15 @@ pub fn dump_if_ring() {
     mode_transitions::dump_if_ring();
 }
 
+/// Virtual-IF activity for the focused DPMI client: windows opened, predicted
+/// exits, post-tag debug traps, and instructions stepped while learning.
+pub(in crate::kernel) fn vif_stats<A: crate::Arch>(dos: &DosState<A>) -> Option<(u32, u32, u32, u32)> {
+    dos.dpmi.as_ref().map(|dpmi| {
+        let [windows, predicted, debug_traps, steps] = dpmi.vif.stats;
+        (windows, predicted, debug_traps, steps)
+    })
+}
+
 /// Dump the zero-perturbation GUS port-access ring (F12 state key). Pairs with
 /// `dump_if_ring` to diagnose a wedged/storming GUS ISR: shows the exact
 /// register cycle the handler loops on, tagged with `irq=1` for ISR-context.

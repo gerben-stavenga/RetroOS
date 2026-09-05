@@ -2,10 +2,10 @@
 //!
 //! Minimal DPMI server for DOS4GW/DOOM: mode switch, LDT descriptors,
 //! linear memory allocation, real-mode interrupt simulation, and I/O
-//! virtualization from 32-bit protected mode.
+//! virtualization from protected mode.
 //!
 //! A DOS thread starts in VM86 (real mode), detects DPMI via INT 2F/1687h,
-//! then calls the entry point to switch to 32-bit protected mode. INT 31h
+//! then calls the entry point to switch to protected mode. INT 31h
 //! services are dispatched directly from the event loop (IDT DPL=3 for
 //! vectors 0x30-0xFF). GP faults from protected mode (#13 with Mode32)
 //! handle sensitive instructions: I/O, CLI/STI, PUSHF/POPF, HLT, IRET.
@@ -28,7 +28,7 @@ pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL
 use self::state::{exception_index, physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors, valid_ldt_selector_idx};
-use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit, trace_dpmi_desc};
+use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit};
 mod rm_calls;
 pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
@@ -39,13 +39,13 @@ mod psp;
 pub(in crate::kernel::dos) use self::psp::{install_dpmi_psp_view, get_or_alloc_psp_sel, psp_sel_to_segment};
 mod raw_switch;
 pub(in crate::kernel::dos) use self::raw_switch::{pm_stub_dispatch, raw_switch_real_to_pm};
-use self::raw_switch::{clear_carry, flat_addr, set_carry, trace_client_selector_leak};
+use self::raw_switch::{clear_carry, flat_addr, set_carry};
 
 // ============================================================================
 // DPMI entry — mode switch from Dos/VM86 to Dos/DPMI (protected mode)
 // ============================================================================
 
-/// Switch from VM86 to 32-bit protected mode.
+/// Switch from VM86 to protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
 pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
@@ -108,11 +108,6 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
     dpmi.mem_next = (dpmi.mem_next + 0xFFFFF) & !0xFFFFF;
     dos.dpmi_mem_next = dpmi.mem_next;
 
-    // pm_vectors stays zero-initialized: sel=0 means "no client handler",
-    // which signals reflect-to-real-mode in deliver_pm_int. INT 31h/0204h
-    // synthesizes the stub address on demand for clients that chain to the
-    // default handler.
-
     // Attach DPMI state to thread, then install the one-shot DPMI PSP
     // view: LDT[18] (PSP_SEL) descriptor for the entering client's PSP,
     // seed the PSP cache with (initial_psp, PSP_SEL), capture
@@ -120,7 +115,7 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
     // selector per §4.1. `dos.current_psp` stays as the segment value
     // (pure DOS state).
     dos.dpmi = Some(Box::new(dpmi));
-    install_dpmi_psp_view(machine, dos, regs);
+    install_dpmi_psp_view(machine, dos);
 
     // PMDOS: route PM INT 21 to the kernel's direct-service handler.
     if dos.pm_dos {
@@ -246,7 +241,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 Some(idx) => {
                     for extra in idx..(idx + count) {
                         dos.ldt[extra] = make_data_desc_ex(0, 0, use32);
-                        trace_dpmi_desc("0000 alloc", idx_to_sel(extra), dos.ldt[extra]);
                     }
                     let sel = idx_to_sel(idx);
                     regs.rax = (regs.rax & !0xFFFF) | sel as u64;
@@ -339,7 +333,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                         }
                     }
                 set_desc_base(&mut dos.ldt[idx], base);
-                trace_dpmi_desc("0007 base", sel, dos.ldt[idx]);
                 dos_trace!("[DPMI] 0007 sel={:04X} base={:08X}", sel, base);
                 clear_carry(regs);
             } else {
@@ -353,7 +346,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             if let Some(idx) = valid_ldt_selector_idx(&dos.ldt_alloc, sel) {
                 let limit = ((regs.rcx as u32 & 0xFFFF) << 16) | (regs.rdx as u32 & 0xFFFF);
                 set_desc_limit(&mut dos.ldt[idx], limit);
-                trace_dpmi_desc("0008 limit", sel, dos.ldt[idx]);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -372,7 +364,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 dos.ldt[idx] &= !0x00F0_FF00_0000_0000;
                 dos.ldt[idx] |= ((0x10 | client_dpl(cl)) as u64) << 40;
                 dos.ldt[idx] |= ((ch & 0xD0) as u64) << 48;
-                trace_dpmi_desc("0009 rights", sel, dos.ldt[idx]);
                 clear_carry(regs);
             } else {
                 set_carry(regs);
@@ -391,7 +382,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     desc |= 1u64 << 41;    // set writable
                     dos.ldt[new_idx] = desc;
                     let new_sel = idx_to_sel(new_idx);
-                    trace_dpmi_desc("000A alias", new_sel, desc);
                     regs.rax = (regs.rax & !0xFFFF) | new_sel as u64;
                     dos_trace!("[DPMI] 000A alias src_sel={:04X} -> new_sel={:04X} base={:08X}",
                         sel, new_sel, desc_base(desc));
@@ -431,7 +421,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                 let acc = client_dpl((new_desc >> 40) as u8);
                 new_desc = (new_desc & !(0xFFu64 << 40)) | ((acc as u64) << 40);
                 dos.ldt[idx] = new_desc;
-                trace_dpmi_desc("000C set", sel, new_desc);
                 dos_trace!("[DPMI] 000C sel={:04X} base={:08X} raw={:016X}", sel,
                     desc_base(new_desc), new_desc);
                 clear_carry(regs);
@@ -1012,7 +1001,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         }
     }
 
-    trace_client_selector_leak("dpmi_int31.exit", regs);
     thread::KernelAction::Done
 }
 

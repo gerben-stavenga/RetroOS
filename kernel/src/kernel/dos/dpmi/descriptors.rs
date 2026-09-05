@@ -1,8 +1,6 @@
 use super::*;
 use super::super::mode_transitions;
 
-const TRACE_DPMI_SELECTORS: &[u16] = &[];
-
 /// Convert LDT index to selector (TI=1, RPL=3).
 pub(super) fn idx_to_sel(idx: usize) -> u16 {
     ((idx as u16) << 3) | 4 | 3
@@ -119,19 +117,6 @@ pub(super) fn set_desc_limit(desc: &mut u64, limit: u32) {
     *desc |= (((lim >> 16) & 0x0F) as u64) << 48;
     if g {
         *desc |= 1u64 << 55;
-    }
-}
-
-pub(super) fn trace_dpmi_desc(label: &str, sel: u16, desc: u64) {
-    if TRACE_DPMI_SELECTORS.contains(&sel) {
-        crate::println!(
-            "[DPMI-DESC] {} sel={:04X} base={:08X} limit={:08X} raw={:016X}",
-            label,
-            sel,
-            desc_base(desc),
-            desc_limit(desc),
-            desc,
-        );
     }
 }
 

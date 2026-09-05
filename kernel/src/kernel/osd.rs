@@ -48,7 +48,9 @@ const SOUND_NUM_ITEMS_WITH_HDA_OUTPUT: usize = 4;
 const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
 const DEBUG_ITEM_DUMP: usize = 2;
-const DEBUG_NUM_ITEMS: usize = 3;
+const DEBUG_ITEM_VIF_WINDOWS: usize = 3;
+const DEBUG_ITEM_VIF_TRAPS: usize = 4;
+const DEBUG_NUM_ITEMS_BASE: usize = 3;
 
 /// Master volume step, adjusted by ◄/► on the Volume row. The displayed
 /// percentage selects a perceptual gain step; 100 is unity.
@@ -77,6 +79,11 @@ static DISK_DEV: AtomicUsize = AtomicUsize::new(0);
 /// First visible row of the Disk tab's scroller.
 static DISK_SCROLL: AtomicUsize = AtomicUsize::new(0);
 static DEBUG_SEL: AtomicUsize = AtomicUsize::new(0);
+static VIF_STATS_VISIBLE: AtomicBool = AtomicBool::new(false);
+static VIF_WINDOWS: AtomicU32 = AtomicU32::new(0);
+static VIF_PREDICTED: AtomicU32 = AtomicU32::new(0);
+static VIF_DEBUG_TRAPS: AtomicU32 = AtomicU32::new(0);
+static VIF_STEPS: AtomicU32 = AtomicU32::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
@@ -208,7 +215,7 @@ fn set_active_sel(tab: usize, sel: usize) {
     match tab {
         TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
         TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
-        TAB_DEBUG => DEBUG_SEL.store(sel.min(DEBUG_NUM_ITEMS - 1), Ordering::Relaxed),
+        TAB_DEBUG => DEBUG_SEL.store(sel.min(debug_item_count() - 1), Ordering::Relaxed),
         _ => WINDOWS_SEL.store(sel.min(WINDOWS_NUM_ITEMS - 1), Ordering::Relaxed),
     }
 }
@@ -217,7 +224,7 @@ fn active_item_count(tab: usize) -> usize {
     match tab {
         TAB_SOUND => sound_item_count(),
         TAB_DISK => disk_item_count(),
-        TAB_DEBUG => DEBUG_NUM_ITEMS,
+        TAB_DEBUG => debug_item_count(),
         _ => WINDOWS_NUM_ITEMS,
     }
 }
@@ -231,6 +238,10 @@ fn sound_item_count_for(audio: crate::kernel::platform::Audio) -> usize {
 
 fn sound_item_count() -> usize {
     sound_item_count_for(crate::kernel::platform::get().audio)
+}
+
+fn debug_item_count() -> usize {
+    DEBUG_NUM_ITEMS_BASE + 2 * usize::from(VIF_STATS_VISIBLE.load(Ordering::Relaxed))
 }
 
 /// The Disk tab shows ONE device at a time — A:, B:, or CD, cycled with
@@ -423,6 +434,27 @@ pub fn refresh_windows<A: crate::Arch>(
     let old_count = WINDOW_COUNT.load(Ordering::Relaxed);
     let old_fullscreen = CURRENT_FULLSCREEN.load(Ordering::Relaxed);
     let mut changed = old_fullscreen != fullscreen;
+    let vif_stats = threads.get(focused).and_then(|thread| match &thread.personality {
+        thread::Personality::Dos(dos) => crate::kernel::dos::vif_stats(dos),
+        _ => None,
+    });
+    let vif_visible = vif_stats.is_some();
+    changed |= VIF_STATS_VISIBLE.swap(vif_visible, Ordering::Relaxed) != vif_visible;
+    if let Some((windows, predicted, debug_traps, steps)) = vif_stats {
+        for (counter, value) in [
+            (&VIF_WINDOWS, windows),
+            (&VIF_PREDICTED, predicted),
+            (&VIF_DEBUG_TRAPS, debug_traps),
+            (&VIF_STEPS, steps),
+        ] {
+            changed |= counter.swap(value, Ordering::Relaxed) != value;
+        }
+    }
+    let debug_count = debug_item_count();
+    if DEBUG_SEL.load(Ordering::Relaxed) >= debug_count {
+        DEBUG_SEL.store(debug_count - 1, Ordering::Relaxed);
+        changed = true;
+    }
     let mut count = 0;
     for (i, t) in threads.iter().enumerate().skip(1) {
         if count >= MAX_LIST {
@@ -1167,6 +1199,18 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                 line.put(if crate::kernel::startup::profile_enabled() { b"ON" } else { b"off" });
             }
             DEBUG_ITEM_DUMP => line.put(b"Dump state"),
+            DEBUG_ITEM_VIF_WINDOWS => {
+                line.put(b"VIF windows/pred ");
+                line.put_num(VIF_WINDOWS.load(Ordering::Relaxed));
+                line.put(b"/");
+                line.put_num(VIF_PREDICTED.load(Ordering::Relaxed));
+            }
+            DEBUG_ITEM_VIF_TRAPS => {
+                line.put(b"VIF traps/steps  ");
+                line.put_num(VIF_DEBUG_TRAPS.load(Ordering::Relaxed));
+                line.put(b"/");
+                line.put_num(VIF_STEPS.load(Ordering::Relaxed));
+            }
             _ => {}
         },
         _ => match item {

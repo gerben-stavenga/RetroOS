@@ -184,8 +184,6 @@ pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 
     seg_base(ldt, seg).wrapping_add(offset)
 }
 
-pub(super) fn trace_client_selector_leak(_label: &str, _regs: &Regs) {}
-
 pub(super) fn set_carry(regs: &mut Regs) {
     regs.set_flag32(1); // CF
 }

@@ -357,7 +357,7 @@ pub(super) fn rm_stack_top() -> u16 {
 /// reflection: route to `vector_stub_reflect` which dispatches the vector to
 /// the real-mode IVT.
 ///
-/// Placed at LDT[200] — well above the CWSDPMI [1..127] range.
+/// Placed at LDT[4], a kernel-owned slot reserved before client allocation.
 pub const VECTOR_STUB_LDT_IDX: usize = 4;
 
 /// LDT index of the host "special stub" segment. Base=0, limit=0x0FFF, 16-bit.

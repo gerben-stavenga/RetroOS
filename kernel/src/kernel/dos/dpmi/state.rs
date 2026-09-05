@@ -4,17 +4,12 @@ pub(in crate::kernel::dos) const LDT_ENTRIES: usize = 8192;
 /// LDT index of the "low memory" selector. Base=0, limit=1MB, 16-bit.
 /// DOS handlers that need to return a pointer to a fixed low-memory byte
 /// (INDOS flag, LOL, IVT vectors) use this as ES; BX is the linear address.
-///
-/// Internal-host slots are placed at LDT[200+] (well outside the LDT[1..127]
-/// range that CWSDPMI uses) so DOS/4GW's `lar`-probe of low slots sees the
-/// CWSDPMI-shaped empty range and we don't collide with client allocations.
 pub(super) const LOW_MEM_LDT_IDX: usize = 5;
 
 /// Selector value for LOW_MEM_LDT_IDX (TI=1, RPL=3).
 pub(in crate::kernel::dos) const LOW_MEM_SEL: u16 = ((LOW_MEM_LDT_IDX as u16) << 3) | 4 | 3;
 
 /// LDT index of the PSP selector (ES on return from dpmi_enter).
-/// Matches CWSDPMI's l_apsp = 18.
 /// Matches CWSDPMI's `l_apsp = 18` so DOS/4GW's first dynamic alloc lands at
 /// LDT[20] (sel 0xA7) — same as CWSDPMI.
 pub(super) const PSP_LDT_IDX: usize = 18;
@@ -22,19 +17,14 @@ pub(super) const PSP_LDT_IDX: usize = 18;
 /// Selector value for PSP_LDT_IDX (TI=1, RPL=3).
 pub(in crate::kernel::dos) const PSP_SEL: u16 = ((PSP_LDT_IDX as u16) << 3) | 4 | 3;
 
-
 /// LDT indices for the client's initial CS/DS/SS. Matches CWSDPMI's
 /// l_acode=16, l_adata=17, l_apsp=18 layout. SS lives at l_aenv=19 (CWSDPMI
-/// uses that slot for the env pointer; RetroOS doesn't separately allocate
-/// env so we reuse 19 for SS). LDT[1..15] stays null so DOS/4GW's "lar
-/// probe" sees the CWSDPMI-shaped empty range.
+/// uses that slot for the env pointer; RetroOS allocates the env selector
+/// dynamically). LDT[1..15] stays null so DOS/4GW's "lar probe" sees the
+/// CWSDPMI-shaped empty range.
 pub(super) const CLIENT_CS_LDT_IDX: usize = 16;
 pub(super) const CLIENT_DS_LDT_IDX: usize = 17;
 pub(super) const CLIENT_SS_LDT_IDX: usize = 19;
-
-
-
-
 /// Maximum DPMI memory blocks
 const MAX_MEM_BLOCKS: usize = 256;
 /// Base address for DPMI linear memory allocations
@@ -98,21 +88,15 @@ pub struct DpmiState {
     /// INT). The stub LDT segment itself is 16-bit, so we can't infer this
     /// from the trapped CS — we must remember what the client declared.
     pub(in crate::kernel::dos) client_use32: bool,
-    /// RM PSP segment captured on the most recent RM→PM transition (initial
-    /// `dpmi_enter` or `raw_switch_real_to_pm`). The matching PM→RM transition
-    /// uses this to restore `dos.current_psp`. While in PM, `dos.current_psp`
-    /// is fixed at `PSP_SEL` and this field names the RM PSP that PSP_SEL's
-    /// LDT[4] descriptor points at.
+    /// RM PSP segment captured at `dpmi_enter`. `dos.current_psp` remains a
+    /// segment; this field identifies the PSP whose LDT[18] view and env word
+    /// were installed for the DPMI client.
     pub(in crate::kernel::dos) saved_rm_psp: u16,
-    /// Original PSP[0x2C] value (RM env paragraph) captured on the most
-    /// recent RM→PM transition. For 32-bit clients we patch PSP[0x2C] with
-    /// an env selector during PM execution; PM→RM restores from this field.
-    /// For 16-bit clients PSP[0x2C] is left untouched but we still capture
-    /// it so callers that want the RM env segment have a single source.
+    /// Original PSP[0x2C] value (RM env paragraph) captured at DPMI entry.
+    /// The in-memory word contains an env selector while the client runs.
     pub(in crate::kernel::dos) saved_rm_env: u16,
-    /// LDT slot of the env selector allocated for 32-bit clients on RM→PM,
-    /// or 0 if none is currently allocated (16-bit client, null env, or
-    /// PM→RM has run since the last RM→PM). Non-zero implies PSP[0x2C] of
+    /// LDT slot of the env selector allocated at DPMI entry, or 0 for a null
+    /// environment or allocation failure. Non-zero implies PSP[0x2C] of
     /// `saved_rm_psp` is currently patched with `idx_to_sel(env_ldt_idx)`.
     pub(in crate::kernel::dos) env_ldt_idx: usize,
     /// Number of nested exception handlers using the fixed exception-stack
