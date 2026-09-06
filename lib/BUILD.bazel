@@ -1,5 +1,6 @@
 # Build lib crate using rules_rust
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_proc_macro", "rust_test")
+load("//toolchain:panic.bzl", "panic_strategy")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -21,9 +22,8 @@ rust_library(
     crate_root = "compact_fmt/src/lib.rs",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
     proc_macro_deps = [":compact_fmt_macros"],
 )
 
@@ -46,9 +46,8 @@ rust_library(
     crate_name = "lib",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
     deps = ["//klog", ":compact_fmt"],
 )
 
@@ -77,9 +76,8 @@ rust_library(
     crate_root = "vga/src/lib.rs",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
     deps = [":lib"],
 )
 
@@ -94,10 +92,9 @@ rust_library(
     crate_root = "sound/src/lib.rs",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Copt-level=2",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
     deps = ["@nuked_opl3//:nuked_opl3"],
 )
 

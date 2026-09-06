@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//toolchain:panic.bzl", "panic_strategy")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -13,10 +14,9 @@ rust_library(
     crate_name = "voodoo",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Copt-level=2",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
 )
 
 # bazelisk test //third_party/voodoo:voodoo_test --platforms=@platforms//host

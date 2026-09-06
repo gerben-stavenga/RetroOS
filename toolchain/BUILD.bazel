@@ -4,6 +4,12 @@ load(":bootstrap.bzl", "bootstrap_mode_flag")
 
 package(default_visibility = ["//visibility:public"])
 
+config_setting(
+    name = "freestanding",
+    constraint_values = ["@platforms//os:none"],
+    visibility = ["//visibility:public"],
+)
+
 # Bootstrap mode flag - when true, use empty stdlib
 bootstrap_mode_flag(
     name = "bootstrap_mode",
@@ -177,7 +183,7 @@ TARGET_JSON_32 = """{
   "executables": true,
   "linker-flavor": "ld.lld",
   "linker": "rust-lld",
-  "panic-strategy": "abort",
+  "panic-strategy": "immediate-abort",
   "disable-redzone": true,
   "relocation-model": "static",
   "features": "-mmx,-sse,-sse2",
@@ -195,7 +201,7 @@ TARGET_JSON_64 = """{
   "executables": true,
   "linker-flavor": "ld.lld",
   "linker": "rust-lld",
-  "panic-strategy": "abort",
+  "panic-strategy": "immediate-abort",
   "disable-redzone": true,
   "relocation-model": "static",
   "features": "+soft-float,-mmx,-sse,-sse2",

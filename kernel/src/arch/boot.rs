@@ -174,6 +174,7 @@ unsafe fn prepare_boot(
 
     // Install the kernel's metal log sink before any normal startup output.
     lib::log::set_debug_sink(log_byte);
+    lib::log::set_fatal_handler(fatal_finish);
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
     // platform probe reads (real 0xE9 debugcon, GOP fbcon detection, metal).
@@ -398,10 +399,6 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
 /// `#[cfg]`'d item in the backend-agnostic kernel crate.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Stop HDA DMA and hold its link in reset first: a hard reboot from a
-    // panic mid-stream can wedge the codec until a cold power-off.
-    crate::kernel::drivers::hda::emergency_quiesce();
-
     // The console lives somewhere up the dead call chain; a panic does not
     // follow the ownership rules — they protect a *running* program's screen,
     // and nothing runs after this. Write straight to the terminal. Its writes
@@ -416,18 +413,19 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     } else {
         lib::compact_screenln!(screen, "at <unknown location>");
     }
-    let message = lib::log::panic_message()
-        .or_else(|| info.message().as_str())
-        .unwrap_or("<panic message unavailable>");
-    lib::compact_screenln!(screen, "  {}", message);
-    lib::screenln!(screen);
+    lib::compact_screenln!(screen, "<panic message unavailable>");
+    fatal_finish()
+}
 
+fn fatal_finish() -> ! {
+    crate::kernel::drivers::hda::emergency_quiesce();
+    let screen = lib::term::term();
+    lib::screenln!(screen);
+    lib::compact_screenln!(screen, "{}", crate::build_info::VersionBanner);
     crate::kernel::stacktrace::stack_trace(screen);
 
-    // The normal display owner is somewhere in the dead call chain.  Seize
-    // the already-mapped framebuffer and make one best-effort publication of
-    // the panic terminal before stopping the machine.
+    // The normal display owner is somewhere up the dead call chain. Seize the
+    // mapped framebuffer for one best-effort publication before stopping.
     crate::fbcon::panic_present();
-
     arch::halt_forever();
 }

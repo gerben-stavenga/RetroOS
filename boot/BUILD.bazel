@@ -14,7 +14,7 @@ rust_static_library(
     crate_name = "boot",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Crelocation-model=static",
     ],
     deps = ["//lib", "//lib:compact_fmt"],

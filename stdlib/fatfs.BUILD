@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@retro_os//toolchain:panic.bzl", "panic_strategy")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -20,6 +21,5 @@ rust_library(
     ],
     rustc_flags = [
         "--cap-lints=allow",
-        "-Cpanic=abort",
-    ],
+    ] + panic_strategy(),
 )

@@ -9,7 +9,7 @@ rust_library(
     crate_name = "arch_metal",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
     ],

@@ -13,7 +13,7 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Cforce-frame-pointers=yes",
         # Mark stable items as unstable inside core so compiler_builtins
         # cannot re-monomorphize core generics ("upstream monomorphizations").
@@ -31,7 +31,7 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Cforce-frame-pointers=yes",
         # Match rustc bootstrap's std build:
         "-Zforce-unstable-if-unmarked",
@@ -53,7 +53,7 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Cforce-frame-pointers=yes",
         # Same flag rustc's bootstrap passes — marks unmarked items unstable
         # so the upstream-monomorphizations check is satisfied.
@@ -77,7 +77,7 @@ rust_library(
     edition = "2024",
     rustc_flags = [
         "--cap-lints=allow",
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Cforce-frame-pointers=yes",
     ],
     deps = [":core_internal", ":compiler_builtins_internal"],

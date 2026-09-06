@@ -1,4 +1,5 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("//toolchain:panic.bzl", "panic_strategy")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -8,7 +9,6 @@ rust_library(
     crate_name = "klog",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
         "-Crelocation-model=static",
-    ],
+    ] + panic_strategy(),
 )

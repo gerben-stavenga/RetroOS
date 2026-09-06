@@ -67,77 +67,44 @@ impl compact_fmt::Write for DebugCon {
     }
 }
 
-const PANIC_MESSAGE_CAPACITY: usize = 384;
-static mut PANIC_MESSAGE: [u8; PANIC_MESSAGE_CAPACITY] = [0; PANIC_MESSAGE_CAPACITY];
-static PANIC_MESSAGE_LEN: core::sync::atomic::AtomicUsize =
+/// Platform fatal tail. Controlled fatal diagnostics write their message
+/// directly to the terminal and log, then call this hook for machine-specific
+/// quiescing, stack tracing, final display publication, and halt.
+static FATAL_HANDLER: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
-static PANIC_MESSAGE_CLAIMED: core::sync::atomic::AtomicBool =
-    core::sync::atomic::AtomicBool::new(false);
+
+pub fn set_fatal_handler(f: fn() -> !) {
+    FATAL_HANDLER.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
 
 #[doc(hidden)]
-pub struct PanicMessageWriter {
-    claimed: bool,
-}
-
-impl PanicMessageWriter {
-    pub fn new() -> Self {
-        let claimed = PANIC_MESSAGE_CLAIMED
-            .compare_exchange(
-                false,
-                true,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Relaxed,
-            )
-            .is_ok();
-        if claimed {
-            PANIC_MESSAGE_LEN.store(0, core::sync::atomic::Ordering::Relaxed);
-        }
-        Self { claimed }
+#[inline(never)]
+pub fn finish_fatal() -> ! {
+    let p = FATAL_HANDLER.load(core::sync::atomic::Ordering::Relaxed);
+    if p != 0 {
+        let f: fn() -> ! = unsafe { core::mem::transmute(p) };
+        f();
     }
-}
-
-impl Default for PanicMessageWriter {
-    fn default() -> Self {
-        Self::new()
+    loop {
+        core::hint::spin_loop();
     }
-}
-
-impl compact_fmt::Write for PanicMessageWriter {
-    fn write_str(&mut self, text: &str) -> compact_fmt::Result {
-        if !self.claimed {
-            return Ok(());
-        }
-        let start = PANIC_MESSAGE_LEN.load(core::sync::atomic::Ordering::Relaxed);
-        let count = text.len().min(PANIC_MESSAGE_CAPACITY.saturating_sub(start));
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                text.as_ptr(),
-                core::ptr::addr_of_mut!(PANIC_MESSAGE).cast::<u8>().add(start),
-                count,
-            );
-        }
-        PANIC_MESSAGE_LEN.store(start + count, core::sync::atomic::Ordering::Release);
-        Ok(())
-    }
-}
-
-pub fn panic_message() -> Option<&'static str> {
-    let len = PANIC_MESSAGE_LEN.load(core::sync::atomic::Ordering::Acquire);
-    if len == 0 {
-        return None;
-    }
-    let bytes = unsafe {
-        core::slice::from_raw_parts(core::ptr::addr_of!(PANIC_MESSAGE).cast::<u8>(), len)
-    };
-    core::str::from_utf8(bytes).ok()
 }
 
 #[macro_export]
 macro_rules! compact_panic {
     ($($arg:tt)*) => {{
-        let mut writer = $crate::log::PanicMessageWriter::new();
-        let _ = compact_fmt::write!(&mut writer, $($arg)*);
-        panic!("compact panic")
+        let __screen = $crate::term::term();
+        __screen.clear();
+        let _ = compact_fmt::writeln!(__screen, "\x1b[91m!!! FATAL !!!\x1b[0m");
+        let __location = ::core::panic::Location::caller();
+        let _ = compact_fmt::writeln!(
+            __screen,
+            "at {}:{}",
+            __location.file(),
+            __location.line(),
+        );
+        let _ = compact_fmt::writeln!(__screen, $($arg)*);
+        $crate::log::finish_fatal()
     }};
 }
 

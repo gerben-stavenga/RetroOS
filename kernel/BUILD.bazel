@@ -3,6 +3,7 @@ load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
 load("@rules_nasm//nasm:defs.bzl", "nasm_library")
 load("//toolchain:host_transition.bzl", "host_platform_test")
 load("//toolchain:retro_platform.bzl", "retro_platform_files")
+load("//toolchain:panic.bzl", "panic_strategy")
 load(":build_info.bzl", "retroos_build_info")
 
 # Bare-metal (os:none) vs host build selector. The one kernel library and the
@@ -50,11 +51,10 @@ rust_library(
     },
     visibility = ["//visibility:public"],
     rustc_flags = [
-        "-Cpanic=abort",
         # //lib + //arch-abi are -Crelocation-model=static (non-PIC); a PIE link
         # rejects them — build non-PIE to match, on both platforms.
         "-Crelocation-model=static",
-    ] + select({
+    ] + panic_strategy() + select({
         ":metal": [
             "-Cforce-frame-pointers=yes",
         ],
@@ -127,7 +127,7 @@ rust_binary(
     edition = "2024",
     compile_data = [":kernel_ld", ":entry"],
     rustc_flags = [
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         "-Crelocation-model=static",
         # Link with rustc's bundled lld (the bare CC toolchain is dummy-only),
         # directly as ld.lld — the i686-unknown-none target's linker.

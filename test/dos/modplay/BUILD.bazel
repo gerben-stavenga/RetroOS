@@ -12,7 +12,7 @@ rust_static_library(
     crate_name = "modplay",
     edition = "2024",
     rustc_flags = [
-        "-Cpanic=abort",
+        "-Cpanic=immediate-abort",
         # PIE: emit position-independent code; RLOADER applies the
         # R_386_RELATIVE fixups at load time (DOS4GW-style).
         "-Crelocation-model=pie",
