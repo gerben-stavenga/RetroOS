@@ -2272,7 +2272,7 @@ pub fn handle_event<A: crate::Arch>(
             unreachable!("page faults are handled by the event loop")
         }
         _ => {
-            crate::println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
+            crate::compact_println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
             thread::KernelAction::Exit(-1)
         }
     }

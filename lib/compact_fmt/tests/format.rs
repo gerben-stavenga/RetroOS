@@ -1,5 +1,3 @@
-use core::fmt;
-
 macro_rules! nested_write {
     ($out:expr, $($arg:tt)*) => {
         compact_fmt::write!($out, $($arg)*)
@@ -11,8 +9,8 @@ struct Buffer {
     bytes: Vec<u8>,
 }
 
-impl fmt::Write for Buffer {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
+impl compact_fmt::Write for Buffer {
+    fn write_str(&mut self, text: &str) -> compact_fmt::Result {
         self.bytes.extend_from_slice(text.as_bytes());
         Ok(())
     }
@@ -118,4 +116,39 @@ fn supported_presentations_match_core_fmt() {
     )
     .unwrap();
     assert_eq!(output.text(), "2a 2A 0b101 0o11 +7 0x1234 \"a\\nb\"");
+}
+
+#[test]
+fn signed_hex_keeps_the_source_width() {
+    let mut output = Buffer::default();
+    compact_fmt::write!(&mut output, "{:x} {:x} {:x}", -2i8, -2i16, -2i32).unwrap();
+    assert_eq!(output.text(), "fe fffe fffffffe");
+}
+
+#[test]
+fn hexadecimal_slices_share_the_slice_formatter() {
+    let mut output = Buffer::default();
+    let bytes = [0x0au8, 0xff];
+    let words = [0x1234u32, 0xabcdef];
+    compact_fmt::write!(&mut output, "{:02x?} {:08X?}", &bytes[..], &words[..]).unwrap();
+    assert_eq!(output.text(), "[0a, ff] [00001234, 00ABCDEF]");
+}
+
+struct Pair(u32, &'static str);
+
+impl compact_fmt::Format for Pair {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        compact_fmt::write!(out, "Pair({}, {})", self.0, self.1)
+    }
+}
+
+#[test]
+fn project_types_supply_one_formatter_pointer() {
+    let mut output = Buffer::default();
+    compact_fmt::write!(&mut output, "{:?}", Pair(7, "seven")).unwrap();
+    assert_eq!(output.text(), "Pair(7, seven)");
 }

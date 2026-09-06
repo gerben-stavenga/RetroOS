@@ -1545,14 +1545,14 @@ pub fn handle_event<A: crate::Arch>(
         }
         crate::KernelEvent::PageFault { .. } => unreachable!("page faults are handled by the event loop"),
         _ => {
-            crate::println!("OS/2: unhandled event {:?} at {:#x}", event, regs.ip32());
+            crate::compact_println!("OS/2: unhandled event {:?} at {:#x}", event, regs.ip32());
             let mut code = [0u8; 16];
             machine.copy_from(regs.ip32() as usize, &mut code);
             let mut stack = [0u32; 8];
             for (i, word) in stack.iter_mut().enumerate() {
                 *word = machine.read::<u32>(regs.sp() as usize + i * 4);
             }
-            crate::println!("OS/2: code={:02x?} sp={:#x} stack={:08x?}", code, regs.sp(), stack);
+            crate::compact_println!("OS/2: code={:02x?} sp={:#x} stack={:08x?}", &code[..], regs.sp(), &stack[..]);
             let _ = ERROR_INVALID_FUNCTION;
             thread::KernelAction::Exit(-1)
         }

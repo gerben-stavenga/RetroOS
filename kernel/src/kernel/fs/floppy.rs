@@ -32,6 +32,16 @@ pub enum InsertError {
     BadFilesystem,
 }
 
+impl compact_fmt::Format for InsertError {
+    fn format(&self, out: &mut dyn compact_fmt::Write, _: compact_fmt::FormatSpec) -> compact_fmt::Result {
+        out.write_str(match self {
+            Self::OutOfBounds => "OutOfBounds",
+            Self::Io => "Io",
+            Self::BadFilesystem => "BadFilesystem",
+        })
+    }
+}
+
 // ── The image file behind fatfs's byte-stream io traits ─────────────────────
 
 /// `std::io::Cursor` semantics over the backing image file: seeks anywhere
@@ -681,11 +691,8 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
         state.change_pending = true;
     }
     vfs::mounted_media_changed();
-    crate::println!(
-        "Floppy {}: inserted {}",
-        DRIVE_LETTERS[drive] as char,
-        String::from_utf8_lossy(&entry.name)
-    );
+    let name = String::from_utf8_lossy(&entry.name);
+    crate::compact_println!("Floppy {}: inserted {}", DRIVE_LETTERS[drive] as char, name.as_ref());
     Ok(())
 }
 

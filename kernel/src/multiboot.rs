@@ -316,7 +316,7 @@ pub fn mount_modules(
         let volume = crate::kernel::block::cache::volume(Volume::whole(disk));
         assert!(is_ext(&volume), "Multiboot module is not a raw ext4 image");
         let fs = PortableExt4Fs::new(volume)
-            .unwrap_or_else(|error| panic!("portable Multiboot ext4 mount failed: {}", error));
+            .unwrap_or_else(|error| lib::compact_panic!("portable Multiboot ext4 mount failed: {}", error));
         let fs: &'static dyn vfs::Filesystem = Box::leak(Box::new(fs));
         let mount = module.mount();
         let mount: &'static [u8] = Box::leak(mount.to_vec().into_boxed_slice());

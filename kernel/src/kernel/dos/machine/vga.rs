@@ -38,10 +38,10 @@ impl EmulatedVga {
     ) -> Self {
         let mut model = VgaState::new_boxed();
         let current = native.cap().bios_current_vbe_mode(machine, bios)
-            .unwrap_or_else(|error| panic!("native BIOS current-mode query failed: {:?}", error));
+            .unwrap_or_else(|error| lib::compact_panic!("native BIOS current-mode query failed: {:?}", error));
         let current_bank = current.and_then(|(_, linear)| (!linear).then(|| {
             native.cap().guest_bios_window(machine, bios, None)
-                .unwrap_or_else(|error| panic!("native BIOS current-bank query failed: {:?}", error))
+                .unwrap_or_else(|error| lib::compact_panic!("native BIOS current-bank query failed: {:?}", error))
         }));
         let physical_lfb = current.and_then(|(mode, linear)| linear.then_some(mode.physical_base));
         let (resume, svga_pages) = if let Some((mode, linear)) = current {
@@ -86,7 +86,7 @@ impl EmulatedVga {
                 // save destroys the hidden state, restore it separately for
                 // the latch spill and for the AC-phase experiment.
                 Some(native.cap().bios_checkpoint(machine, bios)
-                    .unwrap_or_else(|| panic!(
+                    .unwrap_or_else(|| lib::compact_panic!(
                         "native VGA has no exact hidden-state capture path"
                     )))
             };
@@ -115,7 +115,7 @@ impl EmulatedVga {
             }
             materialize_emulated_aperture(&mut model, machine);
             let bios_mode = native.cap().bios_current_legacy_mode(machine, bios)
-                .unwrap_or_else(|error| panic!("native BIOS legacy-mode query failed: {:?}", error));
+                .unwrap_or_else(|error| lib::compact_panic!("native BIOS legacy-mode query failed: {:?}", error));
             (VideoResume::Legacy { bios_mode }, 0)
         };
         if let Some(physical_base) = physical_lfb {
@@ -332,7 +332,7 @@ pub fn release_fullscreen<A: crate::Arch>(
 ) -> crate::kernel::display::DisplayHandoff {
     video.map(|video| {
         let DosVideo::Fullscreen(mut fullscreen) = video else {
-            panic!("display release from non-fullscreen DOS VGA")
+            lib::compact_panic!("display release from non-fullscreen DOS VGA")
         };
         let handoff = release_display(&mut fullscreen, machine, bios);
         let FullscreenVga::Emulated(vga, headless) = fullscreen else {
@@ -352,7 +352,7 @@ pub fn acquire_fullscreen<A: crate::Arch>(
 ) {
     video.map(|video| {
         let DosVideo::Vga(vga) = video else {
-            panic!("display acquire by already-fullscreen DOS VGA")
+            lib::compact_panic!("display acquire by already-fullscreen DOS VGA")
         };
         let mut fullscreen = FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless());
         acquire_display(&mut fullscreen, machine, bios, display);
@@ -367,7 +367,7 @@ pub fn acquire_fullscreen_replace<A: crate::Arch>(
 ) {
     video.map(|video| {
         let DosVideo::Vga(vga) = video else {
-            panic!("replacement display acquire by already-fullscreen DOS VGA")
+            lib::compact_panic!("replacement display acquire by already-fullscreen DOS VGA")
         };
         let mut fullscreen = FullscreenVga::Emulated(vga, crate::kernel::display::Display::headless());
         acquire_display_replace(&mut fullscreen, machine, display);
@@ -772,7 +772,7 @@ fn capture_native_vbe_palette<A: crate::Arch>(
     regs.rcx = 256;
     display.bios_palette_call(
         machine, bios, &mut regs, Some(&mut entries), false, true,
-    ).unwrap_or_else(|error| panic!(
+    ).unwrap_or_else(|error| lib::compact_panic!(
         "native VBE mode has no palette/ramp read service: {:?}",
         error,
     ));
@@ -801,7 +801,7 @@ fn restore_native_vbe_palette<A: crate::Arch>(
     regs.rcx = 256;
     display.bios_palette_call(
         machine, bios, &mut regs, Some(&mut entries), true, true,
-    ).unwrap_or_else(|error| panic!(
+    ).unwrap_or_else(|error| lib::compact_panic!(
         "native VBE mode has no palette/ramp write service: {:?}",
         error,
     ));

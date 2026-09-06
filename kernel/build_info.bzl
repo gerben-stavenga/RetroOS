@@ -27,18 +27,17 @@ describe_escaped="$(printf '%s' "$describe" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/
 
 cat > "$out" <<EOF
 // Generated from Bazel workspace status; do not edit.
-use core::fmt;
 
 pub const GIT_DESCRIBE: &str = "$describe_escaped";
 pub const GIT_DIRTY: bool = $dirty_rust;
 
 pub struct VersionBanner;
 
-impl fmt::Display for VersionBanner {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RetroOS kernel {}", GIT_DESCRIBE)?;
+impl compact_fmt::Format for VersionBanner {
+    fn format(&self, out: &mut dyn compact_fmt::Write, _: compact_fmt::FormatSpec) -> compact_fmt::Result {
+        compact_fmt::write!(out, "RetroOS kernel {}", GIT_DESCRIBE)?;
         if GIT_DIRTY {
-            f.write_str("*")?;
+            out.write_str("*")?;
         }
         Ok(())
     }

@@ -2,13 +2,14 @@
 
 extern crate proc_macro;
 
-use proc_macro::{Group, Literal, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Group, Literal, TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
 
 const ALTERNATE: u8 = 0x08;
 const ZERO_PAD: u8 = 0x10;
 const SIGN_PLUS: u8 = 0x20;
 const HAS_WIDTH: u8 = 0x40;
+const DEBUG_UPPER: u8 = 0x80;
 
 struct Hole {
     selector: String,
@@ -167,6 +168,8 @@ fn parse_spec(source: &str) -> Result<(u8, Option<u8>), String> {
         "o" => 4,
         "p" => 5,
         "?" => 6,
+        "x?" => 7,
+        "X?" => 7 | DEBUG_UPPER,
         _ => return Err(format!("unsupported compact format specifier :{source}")),
     };
     Ok((spec, width))
@@ -268,7 +271,17 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
         return error("expected writer and format string");
     }
     let writer = fields[0].clone();
-    let mut format_tokens = fields[1].clone().into_iter();
+    let mut format_field = fields[1].clone();
+    loop {
+        let tokens: Vec<_> = format_field.clone().into_iter().collect();
+        match tokens.as_slice() {
+            [TokenTree::Group(group)] if group.delimiter() == Delimiter::None => {
+                format_field = group.stream();
+            }
+            _ => break,
+        }
+    }
+    let mut format_tokens = format_field.into_iter();
     let Some(TokenTree::Literal(format_literal)) = format_tokens.next() else {
         return error("format must be a string literal");
     };
@@ -348,9 +361,7 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
         .enumerate()
         .map(|(index, _)| {
             format!(
-                "let __compact_fmt_arg_{index} = &(__compact_fmt_input_{});\n\
-                 let __compact_fmt_cap_{index} = \
-                     ::compact_fmt::__private::capture(__compact_fmt_arg_{index});",
+                "let __compact_fmt_arg_{index} = &(__compact_fmt_input_{});",
                 index + 1,
             )
         })
@@ -358,21 +369,41 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
         .join("\n");
     let values = order
         .iter()
-        .map(|index| format!("__compact_fmt_cap_{index}.value"))
+        .map(|index| format!("::compact_fmt::__private::capture(__compact_fmt_arg_{index})"))
         .collect::<Vec<_>>()
         .join(",");
-    let tags = order
-        .iter()
-        .map(|index| format!("__compact_fmt_cap_{index}.tag"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let formats = if order.is_empty() {
+        "::core::ptr::null()".into()
+    } else {
+        let parameters = (0..order.len())
+            .map(|index| format!("__A{index}: ::compact_fmt::__private::Capture + ?Sized"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let tuple_types = (0..order.len())
+            .map(|index| format!("&__A{index},"))
+            .collect::<String>();
+        let tuple_values = order
+            .iter()
+            .map(|index| format!("__compact_fmt_arg_{index},"))
+            .collect::<String>();
+        let pointers = (0..order.len())
+            .map(|index| format!("<__A{index} as ::compact_fmt::__private::Capture>::FORMAT"))
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(
+            "{{ #[inline(always)] fn __compact_fmt_list<{parameters}>(_: ({tuple_types})) \
+                 -> &'static [::compact_fmt::__private::FormatFn; {count}] {{ &[{pointers}] }} \
+               __compact_fmt_list(({tuple_values})).as_ptr() }}",
+            count = order.len(),
+        )
+    };
     let expanded: TokenStream = format!(
         "{{ {bindings}\n\
            let __compact_fmt_values: [::compact_fmt::__private::RawValue; {count}] = [{values}];\n\
-           let __compact_fmt_tags: [::compact_fmt::__private::ValueTag; {count}] = [{tags}];\n\
+           let __compact_fmt_formats = {formats};\n\
            unsafe {{ ::compact_fmt::__private::emit(\
                __compact_fmt_input_0, {program}.as_ptr(), __compact_fmt_values.as_ptr(), \
-               __compact_fmt_tags.as_ptr()) }}\
+               __compact_fmt_formats) }}\
          }}",
         count = order.len(),
     )

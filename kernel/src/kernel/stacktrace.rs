@@ -8,7 +8,7 @@ extern crate alloc;
 use alloc::boxed::Box;
 use alloc::vec;
 use crate::compact_println;
-use core::fmt::Write;
+use compact_fmt::Write;
 use crate::kernel::vfs;
 #[cfg(target_arch = "x86")]
 use core::arch::asm;
@@ -147,7 +147,7 @@ pub fn stack_trace(out: &mut dyn Write) {
     let caller_bp = if bp != 0 {
         unsafe { *(bp as *const u32) as u64 }
     } else { 0 };
-    let _ = writeln!(out, "Stack trace:");
+    let _ = compact_fmt::writeln!(out, "Stack trace:");
     walk(out, caller_bp, 0, false);
 }
 
@@ -160,7 +160,7 @@ pub fn stack_trace(out: &mut dyn Write) {
 ///   - Ring 3 / VM86 (user): rbp points into untrusted user memory — stop.
 pub fn stack_trace_regs(regs: &crate::Regs) {
     let mut out = lib::log::DebugCon;
-    let _ = writeln!(out, "Stack trace:");
+    let _ = compact_fmt::writeln!(&mut out, "Stack trace:");
     print_frame(&mut out, 0, regs.ip());
     if (regs.frame.cs & 3) == 1 {
         let user_64 = regs.mode() == crate::UserMode::Mode64;
@@ -171,11 +171,11 @@ pub fn stack_trace_regs(regs: &crate::Regs) {
 /// Write one line of the backtrace.
 fn print_frame(out: &mut dyn Write, depth: usize, ip: u64) {
     let (name, offset) = lookup_symbol(ip);
-    let _ = write!(out, "  {:2}: {:#010x}", depth, ip);
+    let _ = compact_fmt::write!(out, "  {:2}: {:#010x}", depth, ip);
     if !name.is_empty() {
-        let _ = write!(out, " {}+{:#x}", name, offset);
+        let _ = compact_fmt::write!(out, " {}+{:#x}", name, offset);
     }
-    let _ = writeln!(out);
+    let _ = compact_fmt::writeln!(out, "");
 }
 
 /// Walk the ebp/rbp chain starting at `bp`. Each iteration reads the frame's
@@ -216,7 +216,7 @@ fn walk(out: &mut dyn Write, mut bp: u64, mut depth: usize, user_64: bool) {
     }
 
     if depth == MAX_DEPTH {
-        let _ = writeln!(out, "  ... (truncated)");
+        let _ = compact_fmt::writeln!(out, "  ... (truncated)");
     }
 }
 

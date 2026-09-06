@@ -199,12 +199,17 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
         }
         (_, d) => d,
     };
-    crate::println!(
-        "sb: DSP {}.x at {:#05x} — IRQ{} DMA{}{}{}",
-        dsp_major, base, w.irq, w.dma8,
-        dma16.map(|d| alloc::format!(" HDMA{}", d)).unwrap_or_default(),
-        if is_sb16 { " (SB16: straps read from the mixer)" } else { " (declared)" }
-    );
+    let source = if is_sb16 { " (SB16: straps read from the mixer)" } else { " (declared)" };
+    match dma16 {
+        Some(dma16) => crate::compact_println!(
+            "sb: DSP {}.x at {:#05x} — IRQ{} DMA{} HDMA{}{}",
+            dsp_major, base, w.irq, w.dma8, dma16, source,
+        ),
+        None => crate::compact_println!(
+            "sb: DSP {}.x at {:#05x} — IRQ{} DMA{}{}",
+            dsp_major, base, w.irq, w.dma8, source,
+        ),
+    }
     Some(SbCard { base, irq: w.irq, dma8: w.dma8, dma16 })
 }
 
@@ -333,7 +338,7 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
 /// Returns the unique runtime device, or `None` if this card cannot be a sink.
 pub fn adopt<A: crate::Arch>(machine: &mut A, card: SbCard) -> Option<&'static mut Sb16> {
     if card.dma16 != Some(DMA_CHANNEL as u8) {
-        crate::println!(
+        crate::compact_println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
             DMA_CHANNEL, card.dma16
         );

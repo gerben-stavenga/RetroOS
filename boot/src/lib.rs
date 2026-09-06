@@ -478,6 +478,10 @@ fn panic(info: &PanicInfo) -> ! {
     if let Some(location) = info.location() {
         screenln!(screen, "at {}:{}", location.file(), location.line());
     }
+    let message = lib::log::panic_message()
+        .or_else(|| info.message().as_str())
+        .unwrap_or("<panic message unavailable>");
+    screenln!(screen, "  {}", message);
 
     loop {
         unsafe {

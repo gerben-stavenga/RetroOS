@@ -19,6 +19,24 @@ pub enum FormatSpec {
     Indexed8,
 }
 
+impl compact_fmt::Format for FormatSpec {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        match self {
+            Self::Packed(rgb) => compact_fmt::write!(
+                out,
+                "Packed({}:{}@{},{}@{},{}@{})",
+                rgb.bytes_per_pixel, rgb.red_size, rgb.red_pos, rgb.green_size,
+                rgb.green_pos, rgb.blue_size, rgb.blue_pos,
+            ),
+            Self::Indexed8 => out.write_str("Indexed8"),
+        }
+    }
+}
+
 /// Kernel mapping of physical framebuffer storage. The VGA library never sees
 /// this address or the mapping/publication policy attached to it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -522,7 +540,7 @@ impl Display {
             } => native.bios_present_native(
                 machine, bios, *mode, current_bank,
                 NativeSource { width, height, pixels, row: scratch },
-            ).unwrap_or_else(|error| panic!("banked VBE present failed: {:?}", error)),
+            ).unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
             Backend::Host => {
                 let bytes = unsafe {
                     core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), words * 4)
@@ -560,7 +578,7 @@ impl Display {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
             } => native.bios_present(machine, bios, *mode, current_bank, height, shadow)
-                    .unwrap_or_else(|error| panic!("banked VBE present failed: {:?}", error)),
+                    .unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
             Backend::Host => present_host_shadow(
                 self.shadow_width, height, format, shadow),
             Backend::Headless => 0,

@@ -240,20 +240,6 @@ impl Console {
         crate::kernel::term::present(machine, bios, &mut self.display);
     }
 
-    /// Write and publish one startup line. `screenln!` only constructs the
-    /// formatting arguments; this shared boundary owns the actual output and
-    /// presentation work.
-    #[inline(never)]
-    pub fn line_and_present<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        args: core::fmt::Arguments<'_>,
-    ) {
-        lib::term::screen_line(self, args);
-        self.present(machine, bios);
-    }
-
     pub fn bios_display(&self) -> Option<&crate::kernel::platform::VgaCap> {
         self.display.vga_capability()
     }
@@ -282,9 +268,9 @@ impl Console {
     }
 }
 
-impl core::fmt::Write for Console {
-    fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        core::fmt::Write::write_str(lib::term::term(), s)?;
+impl compact_fmt::Write for Console {
+    fn write_str(&mut self, text: &str) -> compact_fmt::Result {
+        compact_fmt::Write::write_str(lib::term::term(), text)?;
         crate::kernel::term::mark_dirty();
         Ok(())
     }

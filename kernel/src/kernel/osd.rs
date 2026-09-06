@@ -689,10 +689,10 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
                 DiskRow::Insert(index) => {
                     if dev == 2 {
                         if let Err(error) = crate::kernel::fs::cdrom::insert(index) {
-                            crate::println!("CD-ROM: insert failed: {:?}", error);
+                            crate::compact_println!("CD-ROM: insert failed: {:?}", error);
                         }
                     } else if let Err(error) = crate::kernel::fs::floppy::insert(dev, index) {
-                        crate::println!("Floppy: insert failed: {:?}", error);
+                        crate::compact_println!("Floppy: insert failed: {:?}", error);
                     }
                 }
                 DiskRow::NoImages => {}

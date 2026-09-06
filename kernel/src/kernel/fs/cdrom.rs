@@ -338,10 +338,8 @@ pub fn insert(index: usize) -> Result<(), MediaError> {
         slot.label = entry.name.clone();
     }
     vfs::mounted_media_changed();
-    crate::println!(
-        "CD-ROM: inserted {} as D:",
-        String::from_utf8_lossy(&entry.name)
-    );
+    let name = String::from_utf8_lossy(&entry.name);
+    crate::compact_println!("CD-ROM: inserted {} as D:", name.as_ref());
     Ok(())
 }
 

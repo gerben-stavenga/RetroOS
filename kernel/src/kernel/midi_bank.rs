@@ -107,7 +107,7 @@ pub fn load(dir_vfs: &[u8]) {
         }
     }
     if !missing.is_empty() {
-        crate::println!("midi: melodic ids absent from the bank: {}", missing);
+        crate::compact_println!("midi: melodic ids absent from the bank: {}", missing.as_str());
     }
     *BANK.lock() = Some(alloc::boxed::Box::leak(alloc::boxed::Box::new(bank)));
 }

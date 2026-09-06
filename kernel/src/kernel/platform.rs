@@ -99,8 +99,6 @@ impl VbeDisplayMode {
     }
 }
 
-use crate::println;
-
 pub struct Platform {
     pub host: Host,
     /// Guest VGA port programming reaches a real adapter rather than an
@@ -314,6 +312,16 @@ pub enum Audio {
 }
 
 impl Audio {
+    fn name(self) -> &'static str {
+        match self {
+            Self::NativeSb => "NativeSb",
+            Self::SbSink => "SbSink",
+            Self::EmulatedHda => "EmulatedHda",
+            Self::EmulatedAc97 => "EmulatedAc97",
+            Self::EmulatedPortWindow => "EmulatedPortWindow",
+            Self::EmulatedSilent => "EmulatedSilent",
+        }
+    }
     /// Guest SB programming reaches the real card directly (native playback),
     /// vs the software DSP. Phase A always emulates — even with a real SB16
     /// present it is a kernel sink, not guest-owned — so this is always false.
@@ -496,9 +504,12 @@ pub fn probe<A: crate::Arch>(
     let display = display.unwrap_or_else(|| {
         crate::kernel::display::Display::new_vga(NativeVga::new().into_cap())
     });
-    println!(
-        "Platform: host={:?} vga_passthrough={} firmware={:?} audio={:?} hostfs={} debug={:?}",
-        p.host, p.vga_passthrough, p.firmware, p.audio, p.hostfs, p.debug
+    let host = match p.host { Host::Qemu => "Qemu", Host::Metal => "Metal", Host::Interp => "Interp" };
+    let firmware = match p.firmware { Firmware::NativeBios => "NativeBios", Firmware::Substitute => "Substitute" };
+    let debug = match p.debug { DebugSink::Debugcon => "Debugcon", DebugSink::HostStdout => "HostStdout" };
+    crate::compact_println!(
+        "Platform: host={} vga_passthrough={} firmware={} audio={} hostfs={} debug={}",
+        host, p.vga_passthrough, firmware, p.audio.name(), p.hostfs, debug,
     );
     ProbedPlatform { facts: p, display, audio: audio_token }
 }
@@ -553,7 +564,7 @@ pub fn apply_audio_mode<A: crate::Arch>(
             hw => hw.default_verdict(),
         },
     };
-    crate::println!("Audio: {:?} ({})", p.audio,
+    crate::compact_println!("Audio: {} ({})", p.audio.name(),
         if mixed { "SB_AUDIO=mixed" } else { "SB_AUDIO=native" });
     card
 }
@@ -619,9 +630,13 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
     match selected {
         Some(selected) => {
             let m = selected.mode();
-            crate::println!(
-                "VBE: Voodoo mode {:#x} {}x{}x{} format={:?} ramp={}",
-                m.number, m.width, m.height, m.bits_per_pixel, selected.rgb,
+            crate::compact_println!(
+                "VBE: Voodoo mode {:#x} {}x{}x{} format={}:{}@{},{}@{},{}@{} ramp={}",
+                m.number, m.width, m.height, m.bits_per_pixel,
+                selected.rgb.bytes_per_pixel,
+                selected.rgb.red_size, selected.rgb.red_pos,
+                selected.rgb.green_size, selected.rgb.green_pos,
+                selected.rgb.blue_size, selected.rgb.blue_pos,
                 if m.programmable_ramp { "programmable" } else { "fixed" },
             );
         }

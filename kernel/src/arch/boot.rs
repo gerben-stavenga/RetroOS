@@ -188,9 +188,9 @@ unsafe fn prepare_boot(
     let mut config = read_boot_config(&boot_cmdline[..boot_cmdline_len]);
     if let Some(port) = config.serial_console_port {
         if crate::kernel::serial_log::init(port) {
-            crate::println!("serial: {:?} logging enabled at 115200 8N1", port);
+            crate::compact_println!("serial: {:?} logging enabled at 115200 8N1", port);
         } else {
-            crate::println!("serial: {:?} unavailable", port);
+            crate::compact_println!("serial: {:?} unavailable", port);
         }
     }
 
@@ -410,13 +410,16 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     screen.clear();
 
     lib::compact_screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
-    lib::screenln!(screen, "{}", crate::build_info::VersionBanner);
+    lib::compact_screenln!(screen, "{}", crate::build_info::VersionBanner);
     if let Some(location) = info.location() {
         lib::compact_screenln!(screen, "at {}:{}", location.file(), location.line());
     } else {
         lib::compact_screenln!(screen, "at <unknown location>");
     }
-    lib::screenln!(screen, "  {}", info.message());
+    let message = lib::log::panic_message()
+        .or_else(|| info.message().as_str())
+        .unwrap_or("<panic message unavailable>");
+    lib::compact_screenln!(screen, "  {}", message);
     lib::screenln!(screen);
 
     crate::kernel::stacktrace::stack_trace(screen);

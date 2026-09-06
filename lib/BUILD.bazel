@@ -5,7 +5,7 @@ package(default_visibility = ["//visibility:public"])
 
 # Compact, allocation-free formatting. The host-built proc macro compiles
 # format literals to bytecode; the target runtime is an independent no_std
-# crate and delegates primitive conversion to core::fmt without fmt::Arguments.
+# crate with its own small writer and primitive conversion routines.
 rust_proc_macro(
     name = "compact_fmt_macros",
     srcs = ["compact_fmt/macros/src/lib.rs"],
@@ -49,7 +49,7 @@ rust_library(
         "-Cpanic=abort",
         "-Crelocation-model=static",
     ],
-    deps = ["//klog"],
+    deps = ["//klog", ":compact_fmt"],
 )
 
 rust_test(

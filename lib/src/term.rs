@@ -14,8 +14,6 @@
 //! Nor is this where output goes to be *kept* — see [`crate::log`], which is
 //! unowned and survives. A terminal's contents scroll away by definition.
 
-use core::fmt::{self, Write};
-
 use crate::log::stream;
 
 const WIDTH: usize = 80;
@@ -233,11 +231,11 @@ impl Term {
     }
 }
 
-impl Write for Term {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        for b in s.bytes() {
-            self.putchar(b);
-            stream(b);
+impl compact_fmt::Write for Term {
+    fn write_str(&mut self, text: &str) -> compact_fmt::Result {
+        for byte in text.bytes() {
+            self.putchar(byte);
+            stream(byte);
         }
         text_flush();
         Ok(())
@@ -288,35 +286,25 @@ pub fn putchar(c: u8) {
 }
 
 
-/// Write one complete line through the one shared screen-formatting path.
-/// Keeping this out of line prevents every caller from acquiring its own copy
-/// of `writeln!`'s formatting and error plumbing.
-#[inline(never)]
-pub fn screen_line(screen: &mut dyn core::fmt::Write, args: core::fmt::Arguments<'_>) {
-    let _ = screen.write_fmt(args);
-}
-
 /// Write an unformatted line without constructing a formatting argument list.
 #[inline(never)]
-pub fn screen_text(screen: &mut dyn core::fmt::Write, text: &str) {
+pub fn screen_text(screen: &mut dyn compact_fmt::Write, text: &str) {
     let _ = screen.write_str(text);
 }
 
 /// Print one line to something that writes to the display — the kernel's
 /// `Console`, or a bare [`Term`] for an embedder that is alone on the machine.
-/// The macro is only a syntax adapter for `format_args!`; output itself lives
-/// in the functions above.
+/// Formatting is compiled to compact bytecode and writes through the small
+/// `compact_fmt::Write` interface.
 #[macro_export]
 macro_rules! screenln {
     ($screen:expr => $machine:expr, $bios:expr) => {{
-        $screen.line_and_present($machine, $bios, ::core::format_args!("\n"));
+        let _ = compact_fmt::writeln!($screen, "");
+        $screen.present($machine, $bios);
     }};
     ($screen:expr => $machine:expr, $bios:expr; $fmt:literal $($arg:tt)*) => {{
-        $screen.line_and_present(
-            $machine,
-            $bios,
-            ::core::format_args!(::core::concat!($fmt, "\n") $($arg)*),
-        );
+        let _ = compact_fmt::writeln!($screen, $fmt $($arg)*);
+        $screen.present($machine, $bios);
     }};
     ($screen:expr) => {{
         $crate::term::screen_text($screen, "\n");
@@ -325,10 +313,7 @@ macro_rules! screenln {
         $crate::term::screen_text($screen, ::core::concat!($text, "\n"));
     }};
     ($screen:expr, $fmt:literal $($arg:tt)*) => {{
-        $crate::term::screen_line(
-            $screen,
-            ::core::format_args!(::core::concat!($fmt, "\n") $($arg)*),
-        );
+        let _ = compact_fmt::writeln!($screen, $fmt $($arg)*);
     }};
 }
 

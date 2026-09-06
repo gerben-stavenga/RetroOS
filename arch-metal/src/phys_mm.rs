@@ -223,7 +223,7 @@ pub fn inc_shared_count(page: u64) -> bool {
             return false;
         }
         if count + 1 == RESERVED {
-            panic!("refcount overflow: page {:#x} count {}", page, count);
+            lib::compact_panic!("refcount overflow: page {:#x} count {}", page, count);
         }
 
         PAGE_REFS[page as usize] = count + 1;

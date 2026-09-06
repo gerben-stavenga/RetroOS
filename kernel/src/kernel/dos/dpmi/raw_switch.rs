@@ -117,7 +117,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
             regs.set_cs32(ret_cs);
             thread::KernelAction::Done
         }
-        _ => panic!("pm_stub_dispatch: unhandled slot {:#04x}", slot),
+        _ => lib::compact_panic!("pm_stub_dispatch: unhandled slot {:#04x}", slot),
     }
 }
 

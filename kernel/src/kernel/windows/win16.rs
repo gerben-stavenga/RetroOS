@@ -31,6 +31,19 @@ enum Module {
     Keyboard,
 }
 
+impl compact_fmt::Format for Module {
+    fn format(&self, out: &mut dyn compact_fmt::Write, _: compact_fmt::FormatSpec) -> compact_fmt::Result {
+        out.write_str(match self {
+            Self::Kernel => "Kernel",
+            Self::Gdi => "Gdi",
+            Self::User => "User",
+            Self::Sound => "Sound",
+            Self::Shell => "Shell",
+            Self::Keyboard => "Keyboard",
+        })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Gate {
     module: Module,
@@ -395,7 +408,7 @@ fn register_gate(
         return Ok(*gate);
     }
     let (arg_bytes, long_result, name) = spec(module, ordinal).ok_or_else(|| {
-        crate::dbg_println!("[win16] unsupported import {:?}.{}", module, ordinal);
+        crate::compact_dbg_println!("[win16] unsupported import {:?}.{}", module, ordinal);
         -8
     })?;
     let gate = Gate { module, ordinal, selector, offset, arg_bytes, long_result, name };
@@ -1839,7 +1852,7 @@ pub(super) fn handle_event<A: crate::Arch>(
                 return thread::KernelAction::Done;
             }
             if crate::kernel::startup::trace_enabled() {
-                crate::dbg_println!("[win16] {:?}.{} {}", gate.module, gate.ordinal, gate.name);
+                crate::compact_dbg_println!("[win16] {:?}.{} {}", gate.module, gate.ordinal, gate.name);
             }
             if gate.module == Module::User && gate.ordinal == 114 {
                 let Some(message_at) = stack_u32(machine, windows, regs, 4)
@@ -1881,7 +1894,7 @@ pub(super) fn handle_event<A: crate::Arch>(
         }
         crate::KernelEvent::PageFault { .. } => unreachable!("page faults handled by event loop"),
         _ => {
-            crate::dbg_println!("[win16] unhandled {:?} at {:04x}:{:04x}",
+            crate::compact_dbg_println!("[win16] unhandled {:?} at {:04x}:{:04x}",
                 event, regs.code_seg(), regs.ip32() as u16);
             thread::KernelAction::Exit(-1)
         }

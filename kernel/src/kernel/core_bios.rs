@@ -17,6 +17,22 @@ pub enum BiosError {
     UnexpectedEvent,
 }
 
+impl compact_fmt::Format for BiosError {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        match *self {
+            Self::NoNativeBios => out.write_str("NoNativeBios"),
+            Self::Rejected(code) => compact_fmt::write!(out, "Rejected({:#x})", code),
+            Self::InvalidStateSize => out.write_str("InvalidStateSize"),
+            Self::InvalidFrame => out.write_str("InvalidFrame"),
+            Self::UnexpectedEvent => out.write_str("UnexpectedEvent"),
+        }
+    }
+}
+
 /// Short-lived controller checkpoint produced by VBE 4F04h. Its layout belongs
 /// to the machine's video BIOS. It may bracket destructive hardware inspection
 /// but must never become runnable process state.
@@ -907,13 +923,13 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
         let selected = selected.map(|mode| {
             crate::kernel::platform::VbeDisplayMode::try_from_bios_mode(mode)
-                .unwrap_or_else(|| panic!(
+                .unwrap_or_else(|| lib::compact_panic!(
                     "BIOS selected unusable VBE display mode {:#x}", mode.number
                 ))
         });
         crate::compact_println!("VBE: {} available modes (* selected)", self.modes.len());
         for mode in &self.modes {
-            crate::println!(
+            crate::compact_println!(
                 "VBE: {} {:#05x} {}x{}x{} pitch={} format={:?} phys={:#010x} bank={:04x}:{}K/{}K",
                 if selected.is_some_and(|selected| selected.mode() == *mode) { '*' } else { ' ' },
                 mode.number,
@@ -1036,7 +1052,7 @@ impl crate::kernel::platform::VgaCap {
     ) {
         self.bios(bios)
             .and_then(|bios| bios.restore_checkpoint(machine, self, state))
-            .unwrap_or_else(|error| panic!(
+            .unwrap_or_else(|error| lib::compact_panic!(
                 "native video BIOS failed to restore capture checkpoint: {:?}", error,
             ));
     }
@@ -1048,7 +1064,7 @@ impl crate::kernel::platform::VgaCap {
         mode: u16,
     ) {
         self.guest_bios_set_mode(machine, bios, mode)
-            .unwrap_or_else(|error| panic!("native BIOS mode {:#x} failed: {:?}", mode, error))
+            .unwrap_or_else(|error| lib::compact_panic!("native BIOS mode {:#x} failed: {:?}", mode, error))
     }
 
     pub fn bios_set_mode_request<A: Arch>(
@@ -1058,7 +1074,7 @@ impl crate::kernel::platform::VgaCap {
         request: u16,
     ) {
         self.guest_bios_set_mode_request(machine, bios, request)
-            .unwrap_or_else(|error| panic!("native BIOS mode request {:#x} failed: {:?}", request, error))
+            .unwrap_or_else(|error| lib::compact_panic!("native BIOS mode request {:#x} failed: {:?}", request, error))
     }
 
     /// Guest INT 10h mode selection may legitimately be rejected by firmware.

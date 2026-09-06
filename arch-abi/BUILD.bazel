@@ -13,6 +13,7 @@ rust_library(
         "-Cpanic=abort",
         "-Crelocation-model=static",
     ],
+    deps = ["//lib:compact_fmt"],
 )
 
 rust_test(

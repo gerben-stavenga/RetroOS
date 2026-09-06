@@ -17,7 +17,7 @@ rust_static_library(
         "-Cpanic=abort",
         "-Crelocation-model=static",
     ],
-    deps = ["//lib"],
+    deps = ["//lib", "//lib:compact_fmt"],
 )
 
 genrule(

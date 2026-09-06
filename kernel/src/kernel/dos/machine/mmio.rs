@@ -825,7 +825,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         }
         _ => {
             let _ = (rep, addr32);
-            crate::println!(
+            crate::compact_println!(
                 "  [planar #PF] unhandled opcode {:#04x} off={:#x} ip0={:#x} bytes={:02x?}",
                 opcode,
                 off,

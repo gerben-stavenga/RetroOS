@@ -30,24 +30,9 @@ fn should_trace() -> bool {
         && !IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-#[inline(never)]
-fn write_trace_line(args: core::fmt::Arguments<'_>) {
-    use core::fmt::Write;
-    let mut output = lib::log::DebugCon;
-    let _ = output.write_fmt(args);
-    let _ = output.write_str("\n");
-}
-
-// Keep the detailed DPMI transition probes available as source-level
-// breadcrumbs, but compile them out. Interrupt entry is traced once, centrally,
-// by `trace_interrupt`; per-service and internal trampoline traces duplicate it.
 macro_rules! dos_trace {
-    (force $($arg:tt)*) => {
-        if false { $crate::kernel::dos::write_trace_line(format_args!($($arg)*)); }
-    };
-    ($($arg:tt)*) => {
-        if false { $crate::kernel::dos::write_trace_line(format_args!($($arg)*)); }
-    };
+    (force $($arg:tt)*) => {{}};
+    ($($arg:tt)*) => {{}};
 }
 
 mod bios;
@@ -559,12 +544,12 @@ fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
         Some(0x31) // DPMI API
     };
     let Some(vector) = vector else { return; };
-    write_trace_line(format_args!(
+    crate::compact_dbg_println!(
         "[INT {:02X}] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} CS:IP={:04x}:{:08x}",
         vector, regs.rax as u16, regs.rbx as u16, regs.rcx as u16,
         regs.rdx as u16, regs.rsi as u16, regs.rdi as u16,
         regs.ds as u16, regs.es as u16, cs, ip,
-    ));
+    );
 }
 
 pub fn syscall<A: crate::Arch>(
@@ -847,11 +832,11 @@ pub fn handle_event<A: crate::Arch>(
                 let s4 = machine.read::<u16>((ss_lin.wrapping_add(8)) as usize);
                 let s5 = machine.read::<u16>((ss_lin.wrapping_add(10)) as usize);
                 let liq = unsafe { mode_transitions::LAST_IRQ };
-                crate::println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+                crate::compact_println!("DOS: CPU exception {} at CS:EIP={:04x}:{:#x} ss:sp={:04x}:{:08x} psp={:04x} (vm86={}) bytes={:02x?} stack={:04x} {:04x} {:04x} {:04x} {:04x} {:04x} last_irq=vec{:02x} target={:04x}:{:08x} from cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     n, regs.code_seg(), regs.ip32(),
                     regs.stack_seg(), regs.sp32(),
                     dos.current_psp,
-                    is_vm86, bytes,
+                is_vm86, &bytes[..],
                     s0, s1, s2, s3, s4, s5,
                     liq.0, liq.1, liq.2, liq.3, liq.4, liq.5, liq.6);
                 // DOS termination type 02h (critical error) | low byte = vector.
@@ -874,7 +859,7 @@ pub fn handle_event<A: crate::Arch>(
                     regs.stack_seg(), regs.sp32(), regs.flags32(),
                     regs.mode() == crate::UserMode::VM86,
                     liq.0, liq.1, liq.2 as u16, liq.3, liq.4, liq.5, liq.6);
-                panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                lib::compact_panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                     regs.code_seg(), regs.ip32() as u16, lin,
                     bytes[0], bytes[1], bytes[2], bytes[3],
                     bytes[4], bytes[5], bytes[6], bytes[7]);
@@ -1815,23 +1800,23 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     let mut stack = [0u8; 24];
     machine.copy_from(ss_b.wrapping_add(sp) as usize, &mut stack);
     let last_irq = unsafe { mode_transitions::LAST_IRQ };
-    crate::println!(
+    crate::compact_println!(
         "[#GP] cs={:04x}:{:#x} err={:#x} bytes={:02x?} eax={:#x} ebx={:#x} esi={:#x}",
-        regs.code_seg(), regs.ip32(), regs.err_code, bytes, regs.rax as u32,
+        regs.code_seg(), regs.ip32(), regs.err_code, &bytes[..], regs.rax as u32,
         regs.rbx as u32, regs.rsi as u32,
     );
     crate::compact_println!(
         "[#GP] cs={:04x} base={:#x} limit={:#x} | ds={:04x} base={:#x} limit={:#x}",
         regs.code_seg(), cs_b, cs_l, regs.ds as u16, ds_b, ds_l
     );
-    crate::println!(
+    crate::compact_println!(
         "[#GP] es={:04x} base={:#x} limit={:#x} | ss={:04x} base={:#x} limit={:#x} | voodoo aperture={:x?}",
         regs.es as u16, es_b, es_l, regs.stack_seg(), ss_b, ss_l,
         dos.pc.voodoo.as_ref().and_then(|voodoo| voodoo.linear_base)
     );
-    crate::println!(
+    crate::compact_println!(
         "[#GP] stack={:02x?} last_irq=vec{:02x} target={:04x}:{:08x} from={:04x}:{:08x} ss:sp={:04x}:{:08x}",
-        stack, last_irq.0, last_irq.1, last_irq.2, last_irq.3,
+        &stack[..], last_irq.0, last_irq.1, last_irq.2, last_irq.3,
         last_irq.4, last_irq.5, last_irq.6,
     );
 }
@@ -1859,8 +1844,8 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     machine.copy_from(linear as usize, &mut bytes);
     let mut preceding = [0u8; 8];
     machine.copy_from(linear.wrapping_sub(preceding.len() as u32) as usize, &mut preceding);
-    crate::println!(
+    crate::compact_println!(
         "[#UD] cs={:04x}:{:#x} linear={:#x} limit={:#x} bytes={:02x?} before={:02x?}",
-        selector, ip, linear, limit, bytes, preceding
+        selector, ip, linear, limit, &bytes[..], &preceding[..]
     );
 }

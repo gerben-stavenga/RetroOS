@@ -60,7 +60,7 @@ fn prepare_startup<A: crate::Arch>(
     // The global allocator is installed by the binary glue before startup runs
     // (metal: `arch/boot.rs`; hosted: std), so heap-using code is safe here on.
 
-    crate::println!("{}", crate::build_info::VersionBanner);
+    crate::compact_println!("{}", crate::build_info::VersionBanner);
 
     let disks = discover_disks(machine);
 
@@ -85,7 +85,7 @@ fn prepare_startup<A: crate::Arch>(
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let threads = crate::kernel::thread::init_threading();
-    crate::screenln!(screen => machine, &mut bios_workspace; "Threading initialized");
+    crate::screenln!(&mut screen => machine, &mut bios_workspace; "Threading initialized");
 
     prepare_storage(
         machine,
@@ -221,24 +221,28 @@ fn prepare_audio<A: crate::Arch>(
             && card.wiring() != want
         {
             let got = card.restrap(machine, want);
-            let h = |d: Option<u8>| d.map(|v| alloc::format!(" HDMA{}", v)).unwrap_or_default();
             if got == want {
-                crate::println!(
-                    "Audio: SB16 restrapped to BLASTER (IRQ{} DMA{}{})",
-                    got.irq,
-                    got.dma8,
-                    h(got.dma16)
-                );
+                match got.dma16 {
+                    Some(dma16) => crate::compact_println!(
+                        "Audio: SB16 restrapped to BLASTER (IRQ{} DMA{} HDMA{})",
+                        got.irq, got.dma8, dma16,
+                    ),
+                    None => crate::compact_println!(
+                        "Audio: SB16 restrapped to BLASTER (IRQ{} DMA{})",
+                        got.irq, got.dma8,
+                    ),
+                }
             } else {
-                crate::println!(
-                    "Audio: SB16 kept IRQ{} DMA{}{} (strap write refused) — relaying to \
-                     BLASTER's IRQ{} DMA{}",
-                    got.irq,
-                    got.dma8,
-                    h(got.dma16),
-                    want.irq,
-                    want.dma8
-                );
+                match got.dma16 {
+                    Some(dma16) => crate::compact_println!(
+                        "Audio: SB16 kept IRQ{} DMA{} HDMA{} (strap write refused) — relaying to BLASTER's IRQ{} DMA{}",
+                        got.irq, got.dma8, dma16, want.irq, want.dma8,
+                    ),
+                    None => crate::compact_println!(
+                        "Audio: SB16 kept IRQ{} DMA{} (strap write refused) — relaying to BLASTER's IRQ{} DMA{}",
+                        got.irq, got.dma8, want.irq, want.dma8,
+                    ),
+                }
             }
         }
         // Only a DOS-owned native SB needs its hardware IRQ. Mixer ownership
@@ -418,7 +422,7 @@ fn prepare_storage<A: crate::Arch>(
     );
     screen.present(machine, bios_workspace);
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
-        panic!("hostfs: mounted as root but its server is unavailable");
+        lib::compact_panic!("hostfs: mounted as root but its server is unavailable");
     }
 
     // Stable empty proxies let the OSD insert and eject media later.
@@ -512,14 +516,14 @@ fn mount_filesystems<A: crate::Arch>(
             crate::compact_screenln!(screen, "hostfs: mounted as root");
             hostfs_is_root = true;
         } else {
-            panic!("No root filesystem available");
+            lib::compact_panic!("No root filesystem available");
         }
     } else {
         let root = root_index(&ext);
         crate::screenln!(screen => machine, bios_workspace;
             "Mounting ext4 root ({} MB)...", ext[root].sectors / 2048);
         let fs = PortableExt4Fs::new(ext[root])
-            .unwrap_or_else(|error| panic!("portable ext4 root mount failed: {}", error));
+            .unwrap_or_else(|error| lib::compact_panic!("portable ext4 root mount failed: {}", error));
         crate::screenln!(screen => machine, bios_workspace; "ext4 root mounted");
         let fs: &'static dyn vfs::Filesystem =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
@@ -908,7 +912,7 @@ fn prepare_program<A: crate::Arch>(
     // resolution the DOS personality applies to the program's own file I/O).
     let buf = exec::load_file_resolved(path)
         .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), path].concat()))
-        .unwrap_or_else(|_| panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
+        .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
     // argv = path + the cmdline tail split into words. The ELF/Linux path
     // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
     // dash as ["-c", "echo hi"]); DOS ignores the extra entries and gets the
@@ -1017,7 +1021,7 @@ fn launch_elf<A: crate::Arch>(
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args).unwrap_or_else(
         |e| {
-            panic!(
+            lib::compact_panic!(
                 "ELF exec failed ({}): errno {}",
                 core::str::from_utf8(path).unwrap_or("?"),
                 e
@@ -1046,7 +1050,7 @@ fn launch_os2<A: crate::Arch>(
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None).unwrap_or_else(
         |e| {
-            panic!(
+            lib::compact_panic!(
                 "OS/2 LX exec failed ({}): errno {}",
                 core::str::from_utf8(path).unwrap_or("?"),
                 e
@@ -1075,7 +1079,7 @@ fn launch_windows<A: crate::Arch>(
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::windows::exec_pe_into(machine, threads, tid, buf, path, b"", None)
         .unwrap_or_else(|e| {
-            panic!(
+            lib::compact_panic!(
                 "Windows PE exec failed ({}): errno {}",
                 core::str::from_utf8(path).unwrap_or("?"),
                 e
@@ -1103,7 +1107,7 @@ fn launch_win16<A: crate::Arch>(
     crate::kernel::kpipe::add_reader(cpipe);
     crate::kernel::windows::exec_ne_into(machine, threads, tid, buf, path, b"", None)
         .unwrap_or_else(|e| {
-            panic!(
+            lib::compact_panic!(
                 "Windows NE exec failed ({}): errno {}",
                 core::str::from_utf8(path).unwrap_or("?"),
                 e
@@ -1890,9 +1894,9 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     } else {
         exec::detect_format(&buf, path)
     };
-    crate::dbg_println!(
+    crate::compact_dbg_println!(
         "handle_fork_exec: {:?} size={} format={} free_pages={}",
-        core::str::from_utf8(path),
+        core::str::from_utf8(path).unwrap_or("<non-UTF-8>"),
         buf.len(),
         match format {
             exec::BinaryFormat::Elf => "elf",

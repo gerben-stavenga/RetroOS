@@ -44,12 +44,24 @@ fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash:
     if DIAG_LINES.fetch_add(1, Ordering::Relaxed) >= 64 {
         return;
     }
-    crate::dbg_println!(
+    crate::compact_dbg_println!(
         "[vgascan] mode={:?} black={} nz={} hash={:08X} seq={:02X?} gc5={:02X} gc6={:02X} acidx={:02X} ac10={:02X} dacmask={:02X}",
-        mode, black as u8, nonzero, hash, state.seq,
+        mode_name(mode), black as u8, nonzero, hash, &state.seq[..],
         state.gc[5], state.gc[6], state.ac_state.index,
         state.ac[0x10], state.dac_mask,
     );
+}
+
+fn mode_name(mode: vga::VgaMode) -> &'static str {
+    match mode {
+        vga::VgaMode::Text { .. } => "Text",
+        vga::VgaMode::Mode13h => "Mode13h",
+        vga::VgaMode::Cga4 => "Cga4",
+        vga::VgaMode::Cga2 => "Cga2",
+        vga::VgaMode::Planar16 { .. } => "Planar16",
+        vga::VgaMode::ModeX { .. } => "ModeX",
+        vga::VgaMode::LinearSvga { .. } => "LinearSvga",
+    }
 }
 
 /// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as

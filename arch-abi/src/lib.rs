@@ -602,6 +602,22 @@ impl core::fmt::Debug for Regs {
     }
 }
 
+impl compact_fmt::Format for Regs {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _spec: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        compact_fmt::write!(out,
+            "INT: {:#04x}  ERR: {:#010x}\nIP:  {:#010x}  CS: {:#06x}  FL: {:#010x}\nSP:  {:#010x}  SS: {:#06x}\nRAX: {:#018x}  RBX: {:#018x}\nRCX: {:#018x}  RDX: {:#018x}\nRSI: {:#018x}  RDI: {:#018x}\nRBP: {:#018x}  R8:  {:#018x}\nR9:  {:#018x}  R10: {:#018x}\nR11: {:#018x}  R12: {:#018x}\nR13: {:#018x}  R14: {:#018x}\nR15: {:#018x}\nDS: {:#06x}  ES: {:#06x}  FS: {:#06x}  GS: {:#06x}",
+            self.int_num, self.err_code, self.ip(), self.code_seg(), self.flags(),
+            self.sp(), self.stack_seg(), self.rax, self.rbx, self.rcx, self.rdx,
+            self.rsi, self.rdi, self.rbp, self.r8, self.r9, self.r10, self.r11,
+            self.r12, self.r13, self.r14, self.r15, self.ds as u16, self.es as u16,
+            self.fs as u16, self.gs as u16)
+    }
+}
+
 // =============================================================================
 // Port-I/O operand width
 // =============================================================================
@@ -688,6 +704,43 @@ pub enum KernelEvent {
     /// post-tag trap (a tagged POPF/IRET ran) or a learning single-step. Handled
     /// by `dpmi::vif::on_db`.
     VifStep,
+}
+
+impl compact_fmt::Format for KernelEvent {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        let size = |size: IoSize| match size {
+            IoSize::Byte => "Byte",
+            IoSize::Word => "Word",
+            IoSize::Dword => "Dword",
+        };
+        match *self {
+            Self::Irq => out.write_str("Irq"),
+            Self::PageFault { addr } => compact_fmt::write!(out, "PageFault {{ addr: {} }}", addr),
+            Self::Exception(n) => compact_fmt::write!(out, "Exception({})", n),
+            Self::SoftInt(n) => compact_fmt::write!(out, "SoftInt({})", n),
+            Self::Syscall => out.write_str("Syscall"),
+            Self::Hlt => out.write_str("Hlt"),
+            Self::In { port, size: operand } =>
+                compact_fmt::write!(out, "In {{ port: {}, size: {} }}", port, size(operand)),
+            Self::Out { port, size: operand } =>
+                compact_fmt::write!(out, "Out {{ port: {}, size: {} }}", port, size(operand)),
+            Self::Ins { size: operand, rep, addr32 } => compact_fmt::write!(
+                out, "Ins {{ size: {}, rep: {}, addr32: {} }}", size(operand), rep, addr32,
+            ),
+            Self::Outs { size: operand, rep, addr32 } => compact_fmt::write!(
+                out, "Outs {{ size: {}, rep: {}, addr32: {} }}", size(operand), rep, addr32,
+            ),
+            Self::Fault => out.write_str("Fault"),
+            Self::VifWindow { entry_ip, vif_was_on } => compact_fmt::write!(
+                out, "VifWindow {{ entry_ip: {}, vif_was_on: {} }}", entry_ip, vif_was_on,
+            ),
+            Self::VifStep => out.write_str("VifStep"),
+        }
+    }
 }
 
 impl KernelEvent {

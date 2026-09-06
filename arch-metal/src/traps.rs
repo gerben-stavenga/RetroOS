@@ -179,7 +179,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
             let st3 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(6) as *const u16) };
             let st4 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(8) as *const u16) };
             let st5 = unsafe { core::ptr::read_unaligned(bp_addr.wrapping_add(10) as *const u16) };
-            lib::dbg_println!(
+            lib::compact_dbg_println!(
                 "[WATCH] hit={} dr6={:08X} after {:04X}:{:08X} next={:02X?} watch0={:08X}:{:04X} watch1={:08X}:{:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X} DS={:04X} ES={:04X} SS:SP={:04X}:{:08X} stack={:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
                 hits, dr6, regs.code_seg(), ip, bytes, addr0, value0, addr1, value1,
                 regs.rax as u32, regs.rbx as u32, regs.rcx as u32, regs.rdx as u32,
@@ -333,7 +333,7 @@ fn arch_dispatch(regs: &mut Regs) {
                 }
             }
         }
-        _ => panic!("Unknown arch call: {:#x}", regs.rax),
+        _ => lib::compact_panic!("Unknown arch call: {:#x}", regs.rax),
     }
 }
 
@@ -743,7 +743,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             };
             let sp = regs.sp32();
             let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
-            lib::dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+            lib::compact_dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
                 regs.code_seg(), regs.ip32(), regs.err_code, bytes,
                 regs.stack_seg(), sp, stack);
             KE::Exception(int_num as u8)
@@ -821,7 +821,7 @@ fn try_handle_page_fault(error: u64, legacy_mode: bool) -> Option<()> {
     {
         let kguard = (&raw const crate::KERNEL_STACK_GUARD) as usize;
         if fault_addr >= kguard && fault_addr < kguard + 4096 {
-            panic!("KERNEL STACK OVERFLOW at {:#x} (guard {:#x})", fault_addr, kguard);
+            lib::compact_panic!("KERNEL STACK OVERFLOW at {:#x} (guard {:#x})", fault_addr, kguard);
         }
     }
 
@@ -965,7 +965,7 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
     match int_num {
         14 => {
             if try_handle_page_fault(error, false).is_none() {
-                panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
+                lib::compact_panic!("Unhandled page fault in arch: addr={:#x} err={:#x}", x86::read_cr2(), error);
             }
         }
         32..=47 | 0xF8..=0xFF => {
@@ -973,7 +973,7 @@ fn handle_ring0(int_num: u64, error: u64, cs: u64, eip: u64) {
             regs.int_num = int_num;
             handle_irq(&mut regs);
         }
-        _ => panic!("Unhandled exception in arch: int={:#x} err={:#x} at {:#06x}:{:#010x}", int_num, error, cs, eip),
+        _ => lib::compact_panic!("Unhandled exception in arch: int={:#x} err={:#x} at {:#06x}:{:#010x}", int_num, error, cs, eip),
     }
 }
 
@@ -990,6 +990,6 @@ fn is_vm86(regs: &Regs) -> bool {
 #[track_caller]
 fn panic_with_regs(msg: &str, regs: &Regs) -> ! {
     x86::cli();
-    lib::println!("{:?}", regs);
-    panic!("{}", msg);
+    lib::compact_println!("{:?}", regs);
+    lib::compact_panic!("{}", msg);
 }

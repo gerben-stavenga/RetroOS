@@ -214,10 +214,6 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
         // faulting instruction would just re-execute and refault, producing
         // an infinite loop. Terminate the client instead.
         if matches!(exc_num, 0 | 3 | 4) {
-            let ivt_off = machine::read_u16(machine, 0, exc_num * 4);
-            let ivt_seg = machine::read_u16(machine, 0, exc_num * 4 + 2);
-            dos_trace!("[DPMI] reflect exception {} to IVT {:04X}:{:04X} from {:04X}:{:08X} flags={:04X}",
-                exc_num, ivt_seg, ivt_off, regs.code_seg(), regs.ip32(), regs.flags32() as u16);
             // Plant an iret-frame on the user's stack pointing at the
             // faulting CS:EIP. After BIOS returns, `resume_continuation_from_stub`
             // consumes the synthetic host IRET marker and lands back at the

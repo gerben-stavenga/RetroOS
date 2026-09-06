@@ -509,7 +509,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
             poll_suspended_call(machine, kt, dos, regs)
         }
         _ => {
-            panic!("VM86: INT 31h unknown control slot {:#04x} CS:IP={:04x}:{:#06x}",
+            lib::compact_panic!("VM86: INT 31h unknown control slot {:#04x} CS:IP={:04x}:{:#06x}",
                 slot, CTRL_STUB_SEG, ip);
         }
     };
@@ -737,7 +737,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             }
             let mut tail = [0u8; 128];
             let tlen = read_asciiz(regs.es as u16, regs.rbx as u32, &mut tail);
-            crate::dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
+            crate::compact_dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
                 core::str::from_utf8(&filename[..flen]).unwrap_or("<non-utf8>"),
                 tlen, &tail[..tlen.min(8)]);
             // CL carries the child's virtual IOPL — the `IfMode` COMMAND.COM

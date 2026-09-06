@@ -226,7 +226,7 @@ pub fn handle_event<A: crate::Arch>(
         KE::SoftInt(0x80) | KE::Syscall => dispatch_action(machine, kt, linux, regs),
         KE::PageFault { .. } => unreachable!("PageFault handled in event loop"),
         _ => {
-            crate::dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), kt.tid);
+            crate::compact_dbg_println!("[LINUX] fatal {:?} at EIP={:#x} tid={}", kevent, regs.ip32(), kt.tid);
             thread::KernelAction::Exit(-11)
         }
     }

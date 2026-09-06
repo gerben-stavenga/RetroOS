@@ -282,7 +282,7 @@ impl Disk for NvmeDisk {
         c[12] = batch - 1; // 0-based count
         let status = n.io.exec(&c);
         if status != 0 {
-            panic!("NVMe read failed: lba={:#x} status={:#x}", current, status);
+            lib::compact_panic!("NVMe read failed: lba={:#x} status={:#x}", current, status);
         }
         let bytes = (batch as usize * 512).min(buffer.len());
         unsafe {
@@ -329,7 +329,7 @@ impl Disk for NvmeDisk {
         c[12] = batch - 1; // 0-based count
         let status = n.io.exec(&c);
         if status != 0 {
-            panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
+            lib::compact_panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
         }
         buffer = &buffer[bytes..];
         current += batch as u64;

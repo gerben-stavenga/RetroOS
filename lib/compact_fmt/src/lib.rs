@@ -1,5 +1,4 @@
 #![no_std]
-#![feature(formatting_options)]
 #![feature(optimize_attribute)]
 
 //! Allocation-free formatting with compact compile-time bytecode.
@@ -8,11 +7,26 @@
 //! introduces a packed argument format byte and an optional width byte;
 //! 255 terminates the stream.
 
-use core::fmt::{
-    self, Binary, Debug, Display, FormattingOptions, LowerHex, Octal, Sign, UpperHex, Write,
-};
-
 pub use compact_fmt_macros::{write, writeln};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Error;
+
+pub type Result = core::result::Result<(), Error>;
+
+pub trait Write {
+    fn write_str(&mut self, text: &str) -> Result;
+}
+
+impl<T: Write + ?Sized> Write for &mut T {
+    fn write_str(&mut self, text: &str) -> Result {
+        (**self).write_str(text)
+    }
+}
+
+fn write_char(out: &mut dyn Write, character: char) -> Result {
+    out.write_str(character.encode_utf8(&mut [0; 4]))
+}
 
 const PRESENT_MASK: u8 = 0x07;
 const ALTERNATE: u8 = 0x08;
@@ -27,6 +41,8 @@ const BINARY: u8 = 3;
 const OCTAL: u8 = 4;
 const POINTER: u8 = 5;
 const DEBUG: u8 = 6;
+const DEBUG_HEX: u8 = 7;
+const DEBUG_UPPER: u8 = 0x80;
 
 /// One machine word of argument storage.
 #[repr(C)]
@@ -36,260 +52,367 @@ pub union RawValue {
     reference: *const (),
 }
 
-/// Interpretation of the RawValue at the same array index.
-#[repr(u8)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ValueTag {
-    U32,
-    I32,
-    Usize,
-    Isize,
-    U64,
-    I64,
-    Str,
-    Bool,
-    Char,
+/// Formatting flags passed to project-defined compact formatters.
+#[derive(Copy, Clone)]
+pub struct FormatSpec {
+    raw: u8,
+    width: Option<u8>,
 }
 
+impl FormatSpec {
+    pub fn width(self) -> Option<u8> { self.width }
+    pub fn is_debug(self) -> bool { self.raw & PRESENT_MASK == DEBUG }
+}
+
+/// Formatting for the uncommon structured values that cannot fit inline.
+pub trait Format {
+    fn format(&self, out: &mut dyn Write, spec: FormatSpec) -> Result;
+}
+
+impl<T: Format + ?Sized> Format for &T {
+    fn format(&self, out: &mut dyn Write, spec: FormatSpec) -> Result {
+        (*self).format(out, spec)
+    }
+}
+
+macro_rules! optional_integer {
+    ($ty:ty) => {
+        impl Format for Option<$ty> {
+            fn format(&self, out: &mut dyn Write, spec: FormatSpec) -> Result {
+                match self {
+                    Some(value) => {
+                        out.write_str("Some(")?;
+                        number(out, *value as u64, false, spec.raw, spec.width)?;
+                        write_char(out, ')')
+                    }
+                    None => out.write_str("None"),
+                }
+            }
+        }
+    };
+}
+
+optional_integer!(u8);
+optional_integer!(u32);
+
 #[doc(hidden)]
-#[derive(Copy, Clone)]
-pub struct Captured<'a> {
-    pub value: RawValue,
-    pub tag: ValueTag,
-    lifetime: core::marker::PhantomData<&'a ()>,
+pub type FormatFn = unsafe fn(&mut dyn Write, RawValue, u8, Option<u8>) -> Result;
+
+unsafe fn format_value<T: Format>(
+    out: &mut dyn Write,
+    value: RawValue,
+    raw: u8,
+    width: Option<u8>,
+) -> Result {
+    unsafe { (&*value.reference.cast::<T>()).format(out, FormatSpec { raw, width }) }
 }
 
 #[doc(hidden)]
 pub trait Capture {
-    fn capture(&self) -> Captured<'_>;
+    const FORMAT: FormatFn;
+    fn value(&self) -> RawValue;
 }
 
 macro_rules! inline_unsigned {
     ($($ty:ty),+ $(,)?) => {$(
         impl Capture for $ty {
+            const FORMAT: FormatFn = format_u32;
             #[inline]
-            fn capture(&self) -> Captured<'_> {
-                Captured {
-                    value: RawValue { word: *self as usize },
-                    tag: ValueTag::U32,
-                    lifetime: core::marker::PhantomData,
-                }
+            fn value(&self) -> RawValue {
+                RawValue { word: *self as usize }
             }
         }
     )+};
 }
 
 macro_rules! inline_signed {
-    ($($ty:ty),+ $(,)?) => {$(
+    ($($ty:ty => $format:ident),+ $(,)?) => {$(
         impl Capture for $ty {
+            const FORMAT: FormatFn = $format;
             #[inline]
-            fn capture(&self) -> Captured<'_> {
-                Captured {
-                    value: RawValue { word: (*self as i32) as usize },
-                    tag: ValueTag::I32,
-                    lifetime: core::marker::PhantomData,
-                }
+            fn value(&self) -> RawValue {
+                RawValue { word: (*self as i32) as usize }
             }
         }
     )+};
 }
 
 inline_unsigned!(u8, u16, u32);
-inline_signed!(i8, i16, i32);
+inline_signed!(i8 => format_i8, i16 => format_i16, i32 => format_i32);
 
 impl Capture for usize {
+    const FORMAT: FormatFn = format_usize;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
-            value: RawValue { word: *self },
-            tag: ValueTag::Usize,
-            lifetime: core::marker::PhantomData,
-        }
+    fn value(&self) -> RawValue {
+        RawValue { word: *self }
     }
 }
 
 impl Capture for isize {
+    const FORMAT: FormatFn = format_isize;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
-            value: RawValue {
-                word: *self as usize,
-            },
-            tag: ValueTag::Isize,
-            lifetime: core::marker::PhantomData,
-        }
+    fn value(&self) -> RawValue {
+        RawValue { word: *self as usize }
     }
 }
 
 impl Capture for u64 {
+    const FORMAT: FormatFn = format_u64;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
+    fn value(&self) -> RawValue {
             #[cfg(target_pointer_width = "64")]
-            value: RawValue {
+            let value = RawValue {
                 word: *self as usize,
-            },
+            };
             #[cfg(not(target_pointer_width = "64"))]
-            value: RawValue {
+            let value = RawValue {
                 reference: self as *const u64 as *const (),
-            },
-            tag: ValueTag::U64,
-            lifetime: core::marker::PhantomData,
-        }
+            };
+            value
     }
 }
 
 impl Capture for i64 {
+    const FORMAT: FormatFn = format_i64;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
+    fn value(&self) -> RawValue {
             #[cfg(target_pointer_width = "64")]
-            value: RawValue {
+            let value = RawValue {
                 word: *self as usize,
-            },
+            };
             #[cfg(not(target_pointer_width = "64"))]
-            value: RawValue {
+            let value = RawValue {
                 reference: self as *const i64 as *const (),
-            },
-            tag: ValueTag::I64,
-            lifetime: core::marker::PhantomData,
-        }
+            };
+            value
     }
 }
 
 impl Capture for &str {
+    const FORMAT: FormatFn = format_str;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
-            value: RawValue {
-                reference: self as *const &str as *const (),
-            },
-            tag: ValueTag::Str,
-            lifetime: core::marker::PhantomData,
-        }
+    fn value(&self) -> RawValue {
+        RawValue { reference: self as *const &str as *const () }
     }
 }
 
 impl Capture for bool {
+    const FORMAT: FormatFn = format_bool;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
-            value: RawValue {
-                word: usize::from(*self),
-            },
-            tag: ValueTag::Bool,
-            lifetime: core::marker::PhantomData,
-        }
+    fn value(&self) -> RawValue {
+        RawValue { word: usize::from(*self) }
     }
 }
 
 impl Capture for char {
+    const FORMAT: FormatFn = format_char;
     #[inline]
-    fn capture(&self) -> Captured<'_> {
-        Captured {
-            value: RawValue {
-                word: *self as usize,
-            },
-            tag: ValueTag::Char,
-            lifetime: core::marker::PhantomData,
-        }
+    fn value(&self) -> RawValue {
+        RawValue { word: *self as usize }
+    }
+}
+
+impl Capture for &[u8] {
+    const FORMAT: FormatFn = format_bytes;
+    #[inline]
+    fn value(&self) -> RawValue {
+        RawValue { reference: self as *const &[u8] as *const () }
+    }
+}
+
+impl Capture for &[u32] {
+    const FORMAT: FormatFn = format_words;
+    #[inline]
+    fn value(&self) -> RawValue {
+        RawValue { reference: self as *const &[u32] as *const () }
+    }
+}
+
+impl<T: Format> Capture for T {
+    const FORMAT: FormatFn = format_value::<T>;
+    #[inline]
+    fn value(&self) -> RawValue {
+        RawValue { reference: self as *const T as *const () }
     }
 }
 
 #[doc(hidden)]
 #[inline]
-pub fn capture<T: Capture + ?Sized>(value: &T) -> Captured<'_> {
-    value.capture()
+pub fn capture<T: Capture + ?Sized>(value: &T) -> RawValue {
+    value.value()
 }
 
-fn malformed() -> fmt::Result {
-    Err(fmt::Error)
+fn malformed() -> Result {
+    Err(Error)
 }
 
-fn formatting_options(spec: u8, width: Option<u8>) -> FormattingOptions {
-    let mut options = FormattingOptions::new();
-    options
-        .alternate(spec & ALTERNATE != 0 || spec & PRESENT_MASK == POINTER)
-        .sign_aware_zero_pad(spec & ZERO_PAD != 0)
-        .sign(if spec & SIGN_PLUS != 0 {
-            Some(Sign::Plus)
-        } else {
-            None
-        })
-        .width(width.map(u16::from));
-    options
+fn repeat(out: &mut dyn Write, byte: u8, mut count: usize) -> Result {
+    let block = [byte; 8];
+    while count >= block.len() {
+        out.write_str(unsafe { core::str::from_utf8_unchecked(&block) })?;
+        count -= block.len();
+    }
+    out.write_str(unsafe { core::str::from_utf8_unchecked(&block[..count]) })
 }
 
-macro_rules! primitive {
-    ($out:expr, $options:expr, $presentation:expr, $value:expr) => {{
-        let mut formatter = $options.create_formatter($out);
-        match $presentation {
-            DISPLAY => Display::fmt(&$value, &mut formatter),
-            LOWER_HEX | POINTER => LowerHex::fmt(&$value, &mut formatter),
-            UPPER_HEX => UpperHex::fmt(&$value, &mut formatter),
-            BINARY => Binary::fmt(&$value, &mut formatter),
-            OCTAL => Octal::fmt(&$value, &mut formatter),
-            DEBUG => Debug::fmt(&$value, &mut formatter),
-            _ => malformed(),
-        }
-    }};
-}
-
-macro_rules! display_or_debug {
-    ($out:expr, $options:expr, $presentation:expr, $value:expr) => {{
-        let mut formatter = $options.create_formatter($out);
-        match $presentation {
-            DISPLAY => Display::fmt(&$value, &mut formatter),
-            DEBUG => Debug::fmt(&$value, &mut formatter),
-            _ => malformed(),
-        }
-    }};
+fn text(out: &mut dyn Write, value: &str, width: Option<u8>) -> Result {
+    repeat(out, b' ', usize::from(width.unwrap_or(0)).saturating_sub(value.len()))?;
+    out.write_str(value)
 }
 
 #[inline(never)]
 #[optimize(size)]
-unsafe fn emit_value(
+fn number(
     out: &mut dyn Write,
-    value: RawValue,
-    tag: ValueTag,
+    mut value: u64,
+    negative: bool,
     spec: u8,
     width: Option<u8>,
-) -> fmt::Result {
+) -> Result {
     let presentation = spec & PRESENT_MASK;
-    let options = formatting_options(spec, width);
-    match tag {
-        ValueTag::U32 => primitive!(out, options, presentation, unsafe { value.word } as u32),
-        ValueTag::I32 => primitive!(out, options, presentation, unsafe { value.word } as i32),
-        ValueTag::Usize => primitive!(out, options, presentation, unsafe { value.word }),
-        ValueTag::Isize => primitive!(out, options, presentation, unsafe { value.word } as isize),
-        ValueTag::U64 => {
-            #[cfg(target_pointer_width = "64")]
-            let number = unsafe { value.word } as u64;
-            #[cfg(not(target_pointer_width = "64"))]
-            let number = unsafe { *(value.reference as *const u64) };
-            primitive!(out, options, presentation, number)
+    let (base, upper) = match presentation {
+        DISPLAY | DEBUG => (10, false),
+        LOWER_HEX | POINTER => (16, false),
+        UPPER_HEX => (16, true),
+        BINARY => (2, false),
+        OCTAL => (8, false),
+        _ => return malformed(),
+    };
+    let prefix = if spec & ALTERNATE != 0 || presentation == POINTER {
+        match presentation {
+            LOWER_HEX | POINTER | UPPER_HEX => "0x",
+            BINARY => "0b",
+            OCTAL => "0o",
+            _ => "",
         }
-        ValueTag::I64 => {
-            #[cfg(target_pointer_width = "64")]
-            let number = unsafe { value.word } as i64;
-            #[cfg(not(target_pointer_width = "64"))]
-            let number = unsafe { *(value.reference as *const i64) };
-            primitive!(out, options, presentation, number)
-        }
-        ValueTag::Str => {
-            let text = unsafe { *(value.reference as *const &str) };
-            display_or_debug!(out, options, presentation, text)
-        }
-        ValueTag::Bool => {
-            display_or_debug!(out, options, presentation, unsafe { value.word } != 0)
-        }
-        ValueTag::Char => {
-            let Some(character) = char::from_u32(unsafe { value.word } as u32) else {
-                return malformed();
-            };
-            display_or_debug!(out, options, presentation, character)
+    } else {
+        ""
+    };
+    let sign = if negative { "-" } else if spec & SIGN_PLUS != 0 { "+" } else { "" };
+    let mut storage = [0u8; 64];
+    let mut start = storage.len();
+    loop {
+        let digit = (value % base) as u8;
+        value /= base;
+        start -= 1;
+        storage[start] = if digit < 10 { b'0' + digit } else if upper {
+            b'A' + digit - 10
+        } else {
+            b'a' + digit - 10
+        };
+        if value == 0 { break; }
+    }
+    let digits = unsafe { core::str::from_utf8_unchecked(&storage[start..]) };
+    let padding = usize::from(width.unwrap_or(0))
+        .saturating_sub(sign.len() + prefix.len() + digits.len());
+    if spec & ZERO_PAD == 0 { repeat(out, b' ', padding)?; }
+    out.write_str(sign)?;
+    out.write_str(prefix)?;
+    if spec & ZERO_PAD != 0 { repeat(out, b'0', padding)?; }
+    out.write_str(digits)
+}
+
+fn signed(out: &mut dyn Write, value: i64, bits: u64, spec: u8, width: Option<u8>) -> Result {
+    let decimal = matches!(spec & PRESENT_MASK, DISPLAY | DEBUG);
+    let negative = decimal && value < 0;
+    number(out, if negative { value.unsigned_abs() } else { bits }, negative, spec, width)
+}
+
+unsafe fn format_u32(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    number(out, unsafe { value.word } as u32 as u64, false, spec, width)
+}
+unsafe fn format_usize(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    number(out, unsafe { value.word } as u64, false, spec, width)
+}
+unsafe fn format_i8(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    let value = unsafe { value.word } as i8;
+    signed(out, value as i64, value as u8 as u64, spec, width)
+}
+unsafe fn format_i16(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    let value = unsafe { value.word } as i16;
+    signed(out, value as i64, value as u16 as u64, spec, width)
+}
+unsafe fn format_i32(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    let value = unsafe { value.word } as i32;
+    signed(out, value as i64, value as u32 as u64, spec, width)
+}
+unsafe fn format_isize(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    let value = unsafe { value.word } as isize;
+    signed(out, value as i64, value as usize as u64, spec, width)
+}
+unsafe fn format_u64(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    #[cfg(target_pointer_width = "64")]
+    let value = unsafe { value.word } as u64;
+    #[cfg(not(target_pointer_width = "64"))]
+    let value = unsafe { *value.reference.cast::<u64>() };
+    number(out, value, false, spec, width)
+}
+unsafe fn format_i64(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    #[cfg(target_pointer_width = "64")]
+    let value = unsafe { value.word } as i64;
+    #[cfg(not(target_pointer_width = "64"))]
+    let value = unsafe { *value.reference.cast::<i64>() };
+    signed(out, value, value as u64, spec, width)
+}
+
+fn quoted(out: &mut dyn Write, value: &str, quote: char) -> Result {
+    write_char(out, quote)?;
+    for character in value.chars() {
+        match character {
+            c if c == quote => { write_char(out, '\\')?; write_char(out, c)?; }
+            '\\' => out.write_str("\\\\")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            '\t' => out.write_str("\\t")?,
+            '\0' => out.write_str("\\0")?,
+            c => write_char(out, c)?,
         }
     }
+    write_char(out, quote)
+}
+
+unsafe fn format_str(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    let value = unsafe { *value.reference.cast::<&str>() };
+    match spec & PRESENT_MASK {
+        DISPLAY => text(out, value, width),
+        DEBUG => quoted(out, value, '"'),
+        _ => malformed(),
+    }
+}
+unsafe fn format_bool(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    if !matches!(spec & PRESENT_MASK, DISPLAY | DEBUG) { return malformed(); }
+    text(out, if unsafe { value.word } != 0 { "true" } else { "false" }, width)
+}
+unsafe fn format_char(out: &mut dyn Write, value: RawValue, spec: u8, _width: Option<u8>) -> Result {
+    let Some(value) = char::from_u32(unsafe { value.word } as u32) else { return malformed(); };
+    match spec & PRESENT_MASK {
+        DISPLAY => write_char(out, value),
+        DEBUG => quoted(out, value.encode_utf8(&mut [0; 4]), '\''),
+        _ => malformed(),
+    }
+}
+unsafe fn format_bytes(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    if spec & PRESENT_MASK != DEBUG_HEX { return malformed(); }
+    let values = unsafe { *value.reference.cast::<&[u8]>() };
+    write_char(out, '[')?;
+    for (index, &value) in values.iter().enumerate() {
+        if index != 0 { out.write_str(", ")?; }
+        let presentation = if spec & DEBUG_UPPER != 0 { UPPER_HEX } else { LOWER_HEX };
+        number(out, value as u64, false, presentation | (spec & (ALTERNATE | ZERO_PAD)), width)?;
+    }
+    write_char(out, ']')
+}
+
+unsafe fn format_words(out: &mut dyn Write, value: RawValue, spec: u8, width: Option<u8>) -> Result {
+    if spec & PRESENT_MASK != DEBUG_HEX { return malformed(); }
+    let values = unsafe { *value.reference.cast::<&[u32]>() };
+    write_char(out, '[')?;
+    for (index, &value) in values.iter().enumerate() {
+        if index != 0 { out.write_str(", ")?; }
+        let presentation = if spec & DEBUG_UPPER != 0 { UPPER_HEX } else { LOWER_HEX };
+        number(out, value as u64, false, presentation | (spec & (ALTERNATE | ZERO_PAD)), width)?;
+    }
+    write_char(out, ']')
 }
 
 /// Execute trusted bytecode produced by write! or writeln!.
@@ -297,8 +420,8 @@ unsafe fn emit_value(
 /// # Safety
 ///
 /// `program` must point to a valid, 255-terminated bytecode stream. `values`
-/// and `tags` must each contain one entry for every argument operation, every
-/// tag must describe its corresponding value, and referenced temporaries must
+/// and `formats` must each contain one entry for every argument operation, each
+/// formatter must accept its corresponding value, and referenced temporaries must
 /// remain alive for this call. The macros establish these invariants.
 #[doc(hidden)]
 #[inline(never)]
@@ -307,8 +430,8 @@ pub unsafe fn emit(
     out: &mut dyn Write,
     mut program: *const u8,
     mut values: *const RawValue,
-    mut tags: *const ValueTag,
-) -> fmt::Result {
+    mut formats: *const FormatFn,
+) -> Result {
     loop {
         let operation = unsafe { *program };
         program = unsafe { program.add(1) };
@@ -333,14 +456,14 @@ pub unsafe fn emit(
             None
         };
         let value = unsafe { *values };
-        let tag = unsafe { *tags };
-        unsafe { emit_value(out, value, tag, spec, width)? };
+        let format = unsafe { *formats };
+        unsafe { format(out, value, spec, width)? };
         values = unsafe { values.add(1) };
-        tags = unsafe { tags.add(1) };
+        formats = unsafe { formats.add(1) };
     }
 }
 
 #[doc(hidden)]
 pub mod __private {
-    pub use super::{Capture, Captured, RawValue, ValueTag, capture, emit};
+    pub use super::{Capture, FormatFn, RawValue, capture, emit};
 }

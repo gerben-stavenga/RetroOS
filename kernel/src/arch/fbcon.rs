@@ -170,22 +170,22 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     };
     if info.framebuffer_type != FB_TYPE_RGB {
         blind_signal();
-        panic!("fbcon: framebuffer type {} unsupported (need {} = RGB)",
+        lib::compact_panic!("fbcon: framebuffer type {} unsupported (need {} = RGB)",
             info.framebuffer_type, FB_TYPE_RGB);
     }
     let bytes_per_pixel = info.framebuffer_bpp.div_ceil(8) as usize;
     let Some(format) = PixelFormat::from_rgb(bytes_per_pixel as u8, info.color_info) else {
         blind_signal();
-        panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need packed 16/24/32-bit RGB",
+        lib::compact_panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need packed 16/24/32-bit RGB",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs);
     };
     if pitch < width * bytes_per_pixel {
         blind_signal();
-        panic!("fbcon: pitch {} smaller than {} packed pixels", pitch, width);
+        lib::compact_panic!("fbcon: pitch {} smaller than {} packed pixels", pitch, width);
     }
     if width < TEXT_W || height < TEXT_H {
         blind_signal();
-        panic!("fbcon: framebuffer {}x{} smaller than the {}x{} text console",
+        lib::compact_panic!("fbcon: framebuffer {}x{} smaller than the {}x{} text console",
             width, height, TEXT_W, TEXT_H);
     }
 

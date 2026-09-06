@@ -20,6 +20,16 @@ impl ComPort {
     }
 }
 
+impl compact_fmt::Format for ComPort {
+    fn format(
+        &self,
+        out: &mut dyn compact_fmt::Write,
+        _spec: compact_fmt::FormatSpec,
+    ) -> compact_fmt::Result {
+        out.write_str(match self { Self::Com1 => "Com1", Self::Com2 => "Com2" })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ComPort;

@@ -50,6 +50,19 @@ pub enum MediaError {
     Io,
 }
 
+impl compact_fmt::Format for MediaError {
+    fn format(&self, out: &mut dyn compact_fmt::Write, _: compact_fmt::FormatSpec) -> compact_fmt::Result {
+        out.write_str(match self {
+            Self::InvalidCue => "InvalidCue",
+            Self::UnsupportedCue => "UnsupportedCue",
+            Self::NoDataTrack => "NoDataTrack",
+            Self::InvalidImage => "InvalidImage",
+            Self::OutOfBounds => "OutOfBounds",
+            Self::Io => "Io",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrackMode {
     Audio,

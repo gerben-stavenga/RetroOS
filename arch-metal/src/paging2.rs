@@ -798,6 +798,11 @@ fn node_bits(n: &Node) -> u64 {
     match n { Node::Leaf { bits, .. } | Node::Internal { bits, .. } => *bits }
 }
 
+fn diff_indent(depth: usize) -> &'static str {
+    const SPACES: &str = "                                ";
+    &SPACES[..(depth * 2).min(SPACES.len())]
+}
+
 fn diff_children(a: &[(u16, Node)], b: &[(u16, Node)], depth: usize) {
     let mut ai = 0usize;
     let mut bi = 0usize;
@@ -808,15 +813,15 @@ fn diff_children(a: &[(u16, Node)], b: &[(u16, Node)], depth: usize) {
                 ai += 1; bi += 1;
             }
             (Some((aidx, an)), Some((bidx, _))) if aidx < bidx => {
-                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::compact_println!("{}- [{}] bits={:#x}", diff_indent(depth), *aidx, node_bits(an));
                 ai += 1;
             }
             (_, Some((bidx, bn))) => {
-                lib::println!("{:w$}+ [{}] bits={:#x}", "", bidx, node_bits(bn), w = depth * 2);
+                lib::compact_println!("{}+ [{}] bits={:#x}", diff_indent(depth), *bidx, node_bits(bn));
                 bi += 1;
             }
             (Some((aidx, an)), None) => {
-                lib::println!("{:w$}- [{}] bits={:#x}", "", aidx, node_bits(an), w = depth * 2);
+                lib::compact_println!("{}- [{}] bits={:#x}", diff_indent(depth), *aidx, node_bits(an));
                 ai += 1;
             }
             (None, None) => break,
@@ -828,18 +833,18 @@ fn diff_node(idx: u16, a: &Node, b: &Node, depth: usize) {
     match (a, b) {
         (Node::Internal { bits: ab, children: ac }, Node::Internal { bits: bb, children: bc }) => {
             if ab != bb {
-                lib::println!("{:w$}~ [{}] bits={:#x} -> {:#x}", "", idx, ab, bb, w = depth * 2);
+                lib::compact_println!("{}~ [{}] bits={:#x} -> {:#x}", diff_indent(depth), idx, *ab, *bb);
             } else {
-                lib::println!("{:w$}~ [{}] bits={:#x} (children changed)", "", idx, ab, w = depth * 2);
+                lib::compact_println!("{}~ [{}] bits={:#x} (children changed)", diff_indent(depth), idx, *ab);
             }
             diff_children(ac, bc, depth + 1);
         }
         (Node::Leaf { bits: ab, data_hash: ah }, Node::Leaf { bits: bb, data_hash: bh }) => {
-            lib::println!("{:w$}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
-                "", idx, ab, ah, bb, bh, w = depth * 2);
+            lib::compact_println!("{}~ [{}] bits={:#x}dh={:#x} -> bits={:#x}dh={:#x}",
+                diff_indent(depth), idx, *ab, *ah, *bb, *bh);
         }
         _ => {
-            lib::println!("{:w$}~ [{}] node type changed!", "", idx, w = depth * 2);
+            lib::compact_println!("{}~ [{}] node type changed!", diff_indent(depth), idx);
         }
     }
 }
@@ -901,7 +906,7 @@ pub fn print_recorded_diff(expected: u64, actual: u64) {
     let act = map.get(&actual);
     match (exp, act) {
         (Some(e), Some(a)) => e.diff(a),
-        _ => lib::println!("  (trees not available for diff)"),
+        _ => lib::compact_println!("  (trees not available for diff)"),
     }
 }
 
@@ -983,32 +988,32 @@ fn remove_identity_mapping<E: Entry>(entries: &mut [E]) {
 pub fn finish_setup_paging() {
     match entries() {
         Entries::E32(e) => {
-            lib::println!("Paging: Legacy (32-bit)");
+            lib::compact_println!("Paging: Legacy (32-bit)");
             remove_identity_mapping(e);
             harden_kernel(e);
         }
         Entries::E64(e) => {
-            lib::println!("Paging: PAE (64-bit entries)");
+            lib::compact_println!("Paging: PAE (64-bit entries)");
             let lm = cpu_supports_long_mode();
             if lm {
-                lib::println!("CPU supports Long Mode (64-bit)");
+                lib::compact_println!("CPU supports Long Mode (64-bit)");
 
                 // Set up long mode page tables
                 setup_long_mode_tables();
-                lib::println!("Long mode tables set up");
+                lib::compact_println!("Long mode tables set up");
             }
 
             remove_identity_mapping(e);
-            lib::println!("Identity mapping removed");
+            lib::compact_println!("Identity mapping removed");
 
             enable_nx();
             if nx_enabled() {
-                lib::println!("NX (No-Execute) protection enabled");
+                lib::compact_println!("NX (No-Execute) protection enabled");
             }
 
             enable_wc_pat();
             if wc_pat_enabled() {
-                lib::println!("PAT: Write-Combining slot enabled (framebuffer)");
+                lib::compact_println!("PAT: Write-Combining slot enabled (framebuffer)");
             }
 
             harden_kernel(e);
@@ -2125,12 +2130,12 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     let data_start_page = page_idx(data_start);
     let data_end_page = page_idx(data_end + PAGE_SIZE - 1);
 
-    lib::println!("Hardening kernel:");
-    lib::println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
+    lib::compact_println!("Hardening kernel:");
+    lib::compact_println!("  .text:   {:#x}-{:#x} (pages {}-{}): R-X",
         text_start, text_end, text_start_page, text_end_page);
-    lib::println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
+    lib::compact_println!("  .rodata: {:#x}-{:#x} (pages {}-{}): R-- NX",
         text_end, rodata_end, text_end_page, rodata_end_page);
-    lib::println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
+    lib::compact_println!("  .data:   {:#x}-{:#x} (pages {}-{}): RW- NX",
         data_start, data_end, data_start_page, data_end_page);
 
     // .text: read-only, executable (no NX)
@@ -2152,5 +2157,5 @@ fn harden_kernel<E: Entry>(entries: &mut [E]) {
     }
 
     invalidate_tlb();
-    lib::println!("Kernel hardening complete");
+    lib::compact_println!("Kernel hardening complete");
 }
