@@ -74,7 +74,7 @@ impl Mpu {
             }
         }
         if self.present {
-            crate::dbg_println!("[mpu] MPU-401 at {:03X}", self.base);
+            crate::compact_dbg_println!("[mpu] MPU-401 at {:03X}", self.base);
         }
     }
 
@@ -124,7 +124,7 @@ impl Mpu {
             }
         }
         if let Some(note) = self.mt32.take_latch_note() {
-            crate::dbg_println!("[mpu] {}", note);
+            crate::compact_dbg_println!("[mpu] {}", note);
         }
     }
 

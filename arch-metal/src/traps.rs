@@ -141,7 +141,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 
     if hits <= 32 {
         if kernel {
-            lib::dbg_println!(
+            lib::compact_dbg_println!(
                 "[WATCH-K] hit={} dr6={:08X} at {:04X}:{:08X} watch0={:08X}:{:04X} watch1={:08X}:{:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X}",
                 hits,
                 dr6,
@@ -400,7 +400,7 @@ fn arch_switch_to(regs: &mut Regs) {
     if !hash_ptr.is_null() {
         let new_hash = paging2::hash_and_record();
         if expected != 0 && expected != new_hash {
-            lib::println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
+            lib::compact_println!("\x1b[91mHASH MISMATCH expected {:#018x} got {:#018x}\x1b[0m", expected, new_hash);
             paging2::print_recorded_diff(expected, new_hash);
         }
     }
@@ -461,9 +461,9 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         // with it. Dump the words so the panic names the bad frame.
         if !from_64 && !(raw_int_num == 14 || (32..=47).contains(&raw_int_num)) {
             let p = unsafe { core::ptr::addr_of!((*stack).raw32.0.esp) };
-            lib::println!("ring0 fault: words above the trap frame (iret-target frame):");
+            lib::compact_println!("ring0 fault: words above the trap frame (iret-target frame):");
             for i in 0..10 {
-                lib::println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
+                lib::compact_println!("  [esp+{:2}] = {:#010x}", i * 4, unsafe { p.add(i).read_volatile() });
             }
         }
         handle_ring0(raw_int_num, raw_err_code, raw_cs, raw_eip);  // No canonicalization because in 32-bit mode doesn't match Regs layout due to missing esp:ss

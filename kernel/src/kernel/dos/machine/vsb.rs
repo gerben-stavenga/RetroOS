@@ -525,7 +525,7 @@ impl EmulatedSb {
         let (gpa, len) = chan_gpa_len(&prog, is16);
         self.core.begin(start, gpa, len);
         if super::PORT_TRACE {
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[dsp] start bits={} single={} gpa={:08X} len={} chan={}",
                 start.bits, start.single, gpa, len, chan
             );

@@ -708,7 +708,7 @@ fn capture_native_vbe<A: crate::Arch>(
         A0000 >> 12,
         WINDOW_PAGES,
     );
-    crate::println!("VBE: detached guest mode {:#x} {}x{}x{} into shadow",
+    crate::compact_println!("VBE: detached guest mode {:#x} {}x{}x{} into shadow",
         mode.number, mode.width, mode.height, state.svga_bpp);
     pages
 }
@@ -755,7 +755,7 @@ fn restore_native_vbe<A: crate::Arch>(
     regs.rcx = u64::from(display_start.0);
     regs.rdx = u64::from(display_start.1);
     let _ = display.guest_bios_display_start(machine, bios, &mut regs);
-    crate::println!("VBE: restored guest mode {:#x} from shadow", mode.number);
+    crate::compact_println!("VBE: restored guest mode {:#x} from shadow", mode.number);
 }
 
 fn capture_native_vbe_palette<A: crate::Arch>(

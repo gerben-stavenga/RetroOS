@@ -50,11 +50,11 @@ fn resolve_child(base: &[u8], want: &[u8], want_dir: bool) -> Option<alloc::vec:
 /// installers write lowercase; guessing either way empties the bank).
 pub fn load_from_c_root(c_root: &[u8]) {
     let Some(ultrasnd) = resolve_child(c_root, b"ULTRASND", true) else {
-        crate::println!("midi: no ULTRASND under the C: root — General MIDI silent");
+        crate::compact_println!("midi: no ULTRASND under the C: root — General MIDI silent");
         return;
     };
     let Some(midi) = resolve_child(&ultrasnd, b"MIDI", true) else {
-        crate::println!("midi: no MIDI dir under {} — General MIDI silent",
+        crate::compact_println!("midi: no MIDI dir under {} — General MIDI silent",
             core::str::from_utf8(&ultrasnd).unwrap_or("?"));
         return;
     };
@@ -90,10 +90,10 @@ pub fn load(dir_vfs: &[u8]) {
     }
     let (count, pool) = bank.stats();
     if count == 0 {
-        crate::println!("midi: no GM bank under the C: root — General MIDI silent");
+        crate::compact_println!("midi: no GM bank under the C: root — General MIDI silent");
         return;
     }
-    crate::println!("midi: GM bank ROM: {} instruments, {} KB", count, pool / 1024);
+    crate::compact_println!("midi: GM bank ROM: {} instruments, {} KB", count, pool / 1024);
     // Any hole in the melodic range is an instrument some song will reach
     // for and get silence — worth one boot line to make "missing violin"
     // diagnosable from klog instead of by ear.

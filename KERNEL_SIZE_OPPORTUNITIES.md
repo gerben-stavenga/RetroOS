@@ -43,6 +43,26 @@ They are not necessarily additive: a symbol can match more than one category.
 
 ## Completed work
 
+### Compact diagnostic formatting
+
+Logging and simple screen diagnostics now use the shared `compact-fmt`
+decoder when all arguments are supported primitives. The decoder retains one
+`dyn Write` body for every output sink. Its compile-time bytecode is terminated,
+so each call passes pointers to the bytecode and parallel value/tag arrays
+without slice lengths or runtime bounds checks. Calls that need custom
+`Display`/`Debug`, dynamic widths, or debug collections continue to use
+`core::fmt`.
+
+Across 213 converted call sites, the kernel's `.text` shrank by 3,648 bytes and
+`.rodata` by 2,068 bytes. The stripped ELF crossed one page boundary.
+
+| Metric | Before | After | Change |
+|---|---:|---:|---:|
+| `kernel.elf` | 873,948 | 869,852 | -4,096 |
+| `.text` | 713,598 | 709,950 | -3,648 |
+| `.rodata` | 141,380 | 139,312 | -2,068 |
+| `KERNEL.SYM` | 182,436 | 182,742 | +306 |
+
 ### Compact runtime cycle profiler
 
 The F12 Profile operation now answers two permanent questions: guest versus

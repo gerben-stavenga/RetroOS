@@ -4,8 +4,9 @@
 
 //! Allocation-free formatting with compact compile-time bytecode.
 //!
-//! Bytes 1 through 255 introduce a literal run of that length. Zero
-//! introduces a packed argument format byte and an optional width byte.
+//! Bytes 1 through 254 introduce a literal run of that length. Zero
+//! introduces a packed argument format byte and an optional width byte;
+//! 255 terminates the stream.
 
 use core::fmt::{
     self, Binary, Debug, Display, FormattingOptions, LowerHex, Octal, Sign, UpperHex, Write,
@@ -295,56 +296,48 @@ unsafe fn emit_value(
 ///
 /// # Safety
 ///
-/// Every tag must describe the value at the same index, and referenced
-/// temporaries must remain alive for this call. The macros establish both.
+/// `program` must point to a valid, 255-terminated bytecode stream. `values`
+/// and `tags` must each contain one entry for every argument operation, every
+/// tag must describe its corresponding value, and referenced temporaries must
+/// remain alive for this call. The macros establish these invariants.
 #[doc(hidden)]
 #[inline(never)]
 #[optimize(size)]
 pub unsafe fn emit(
     out: &mut dyn Write,
-    program: &[u8],
-    values: &[RawValue],
-    tags: &[ValueTag],
+    mut program: *const u8,
+    mut values: *const RawValue,
+    mut tags: *const ValueTag,
 ) -> fmt::Result {
-    let mut pc = 0;
-    let mut argument = 0;
-    while pc < program.len() {
-        let operation = program[pc];
-        pc += 1;
+    loop {
+        let operation = unsafe { *program };
+        program = unsafe { program.add(1) };
+        if operation == u8::MAX {
+            return Ok(());
+        }
         if operation != 0 {
-            let end = pc + usize::from(operation);
-            let Some(bytes) = program.get(pc..end) else {
-                return malformed();
-            };
+            let bytes = unsafe { core::slice::from_raw_parts(program, usize::from(operation)) };
             let text = unsafe { core::str::from_utf8_unchecked(bytes) };
             out.write_str(text)?;
-            pc = end;
+            program = unsafe { program.add(usize::from(operation)) };
             continue;
         }
 
-        let Some(&spec) = program.get(pc) else {
-            return malformed();
-        };
-        pc += 1;
+        let spec = unsafe { *program };
+        program = unsafe { program.add(1) };
         let width = if spec & HAS_WIDTH != 0 {
-            let Some(&width) = program.get(pc) else {
-                return malformed();
-            };
-            pc += 1;
+            let width = unsafe { *program };
+            program = unsafe { program.add(1) };
             Some(width)
         } else {
             None
         };
-        let (Some(&value), Some(&tag)) = (values.get(argument), tags.get(argument)) else {
-            return malformed();
-        };
+        let value = unsafe { *values };
+        let tag = unsafe { *tags };
         unsafe { emit_value(out, value, tag, spec, width)? };
-        argument += 1;
+        values = unsafe { values.add(1) };
+        tags = unsafe { tags.add(1) };
     }
-    if argument != values.len() || values.len() != tags.len() {
-        return malformed();
-    }
-    Ok(())
 }
 
 #[doc(hidden)]

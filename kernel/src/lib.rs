@@ -51,8 +51,11 @@ pub use kernel::thread;
 pub use kernel::term;
 // The console macros live in `lib`; re-exporting them at the crate root makes
 // both bare `println!` (crate-wide, via this 2018 path import) and the explicit
-// `crate::println!` / `crate::dbg_println!` paths the kernel uses resolve.
-pub use lib::{print, println, dbg_print, dbg_println, screenln};
+// `crate::compact_println!` / `crate::compact_dbg_println!` paths the kernel uses resolve.
+pub use lib::{
+    compact_dbg_println, compact_println, compact_screenln, dbg_print, dbg_println, print,
+    println, screenln,
+};
 
 // The backend-agnostic arch contract, re-exported at the crate root: the
 // kernel is written against exactly this surface.
@@ -107,12 +110,12 @@ pub fn host_run_elf<A: Arch>(
 
     let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
     if let Err(e) = kernel::linux::exec_elf_into(machine, &mut threads, tid, &data, path, &argv) {
-        dbg_println!("[host] exec failed: errno {}", e);
+        compact_dbg_println!("[host] exec failed: errno {}", e);
         kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
 
-    dbg_println!("[host] running 32-bit Linux ELF");
+    compact_dbg_println!("[host] running 32-bit Linux ELF");
     // The bare-ELF path bypasses platform probing/startup, so establish the
     // same display-ownership invariant that `run_program` does explicitly.
     kernel::focus::adopt(tid);
@@ -123,7 +126,7 @@ pub fn host_run_elf<A: Arch>(
             machine, &mut bios_workspace, kernel::display::Display::headless())
     };
     kernel::startup::event_loop(machine, &mut bios_workspace, &mut threads, tid, None, None, display);
-    dbg_println!("[host] guest exited");
+    compact_dbg_println!("[host] guest exited");
     kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
     machine.shutdown();
 }

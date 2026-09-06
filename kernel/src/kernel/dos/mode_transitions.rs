@@ -536,13 +536,13 @@ pub(super) fn dump_if_ring() {
     unsafe {
         let pos = IF_RING_POS;
         let n = pos.min(IF_RING_LEN);
-        crate::dbg_println!("[IFRING] {} events total, showing last {} in_hw_irq={}",
+        crate::compact_dbg_println!("[IFRING] {} events total, showing last {} in_hw_irq={}",
             pos, n,
             super::IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed));
         for k in 0..n {
             let i = (pos - n + k) % IF_RING_LEN;
             let e = IF_RING[i];
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[IFRING] #{:03} tag={} vm86={} {:04X}:{:08X} if {}→{} other={:04X}:{:08X}",
                 pos - n + k, e.tag, e.vm86 as u8, e.cs, e.ip,
                 e.if_in as u8, e.if_out as u8, e.other.0, e.other.1);

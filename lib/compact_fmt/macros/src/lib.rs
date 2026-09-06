@@ -2,7 +2,7 @@
 
 extern crate proc_macro;
 
-use proc_macro::{Literal, TokenStream, TokenTree};
+use proc_macro::{Group, Literal, TokenStream, TokenTree};
 use std::collections::{BTreeMap, BTreeSet};
 
 const ALTERNATE: u8 = 0x08;
@@ -24,6 +24,26 @@ enum Part {
 fn error(message: impl AsRef<str>) -> TokenStream {
     let message = format!("{:?}", message.as_ref());
     format!("compile_error!({message})").parse().unwrap()
+}
+
+fn splice(stream: TokenStream, replacements: &[TokenStream]) -> TokenStream {
+    stream
+        .into_iter()
+        .flat_map(|token| match token {
+            TokenTree::Ident(ident) => ident
+                .to_string()
+                .strip_prefix("__compact_fmt_input_")
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| replacements.get(index).cloned())
+                .unwrap_or_else(|| TokenTree::Ident(ident).into()),
+            TokenTree::Group(group) => {
+                let mut replacement = Group::new(group.delimiter(), splice(group.stream(), replacements));
+                replacement.set_span(group.span());
+                TokenTree::Group(replacement).into()
+            }
+            token => token.into(),
+        })
+        .collect()
 }
 
 fn split_arguments(input: TokenStream) -> Vec<TokenStream> {
@@ -220,7 +240,7 @@ fn encode(parts: &[Part]) -> Vec<u8> {
             Part::Literal(bytes) => {
                 let mut start = 0;
                 while start < bytes.len() {
-                    let mut end = (start + 255).min(bytes.len());
+                    let mut end = (start + 254).min(bytes.len());
                     while core::str::from_utf8(&bytes[start..end]).is_err() {
                         end -= 1;
                     }
@@ -238,6 +258,7 @@ fn encode(parts: &[Part]) -> Vec<u8> {
             }
         }
     }
+    program.push(u8::MAX);
     program
 }
 
@@ -246,7 +267,7 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
     if fields.len() < 2 {
         return error("expected writer and format string");
     }
-    let writer = fields[0].to_string();
+    let writer = fields[0].clone();
     let mut format_tokens = fields[1].clone().into_iter();
     let Some(TokenTree::Literal(format_literal)) = format_tokens.next() else {
         return error("format must be a string literal");
@@ -271,9 +292,9 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
                 unreachable!()
             };
             let expression: TokenStream = tokens[2..].iter().cloned().collect();
-            named.push((name.to_string(), expression.to_string()));
+            named.push((name.to_string(), expression));
         } else {
-            positional.push(field.to_string());
+            positional.push(field.clone());
         }
     }
 
@@ -310,7 +331,7 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
                 return error("invalid captured argument name");
             }
             let index = captures.len();
-            captures.push(hole.selector.clone());
+            captures.push(hole.selector.parse().unwrap());
             capture_names.insert(hole.selector.clone(), index);
             index
         };
@@ -325,11 +346,12 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
     let bindings = captures
         .iter()
         .enumerate()
-        .map(|(index, expression)| {
+        .map(|(index, _)| {
             format!(
-                "let __compact_fmt_arg_{index} = &({expression});\n\
+                "let __compact_fmt_arg_{index} = &(__compact_fmt_input_{});\n\
                  let __compact_fmt_cap_{index} = \
-                     ::compact_fmt::__private::capture(__compact_fmt_arg_{index});"
+                     ::compact_fmt::__private::capture(__compact_fmt_arg_{index});",
+                index + 1,
             )
         })
         .collect::<Vec<_>>()
@@ -344,17 +366,22 @@ fn expand(input: TokenStream, newline: bool) -> TokenStream {
         .map(|index| format!("__compact_fmt_cap_{index}.tag"))
         .collect::<Vec<_>>()
         .join(",");
-    format!(
+    let expanded: TokenStream = format!(
         "{{ {bindings}\n\
            let __compact_fmt_values: [::compact_fmt::__private::RawValue; {count}] = [{values}];\n\
            let __compact_fmt_tags: [::compact_fmt::__private::ValueTag; {count}] = [{tags}];\n\
            unsafe {{ ::compact_fmt::__private::emit(\
-               {writer}, {program}, &__compact_fmt_values, &__compact_fmt_tags) }}\
+               __compact_fmt_input_0, {program}.as_ptr(), __compact_fmt_values.as_ptr(), \
+               __compact_fmt_tags.as_ptr()) }}\
          }}",
         count = order.len(),
     )
     .parse()
-    .unwrap_or_else(|_| error("compact format expansion failed"))
+    .unwrap_or_else(|_| error("compact format expansion failed"));
+    let mut replacements = Vec::with_capacity(captures.len() + 1);
+    replacements.push(writer);
+    replacements.extend(captures);
+    splice(expanded, &replacements)
 }
 
 #[proc_macro]

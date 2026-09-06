@@ -207,7 +207,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
     // every write is a dirty-tracked device access the display picks up.
     let policy = paging2::framebuffer_map_policy();
     if policy.slow {
-        lib::screenln!(screen, "fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
+        lib::compact_screenln!(screen, "fbcon: QEMU-TCG detected — strong-UC framebuffer (WC not scanned)");
     }
     let fb_bytes = pitch * height;
     let page_off = (addr & (PAGE_SIZE as u64 - 1)) as usize;
@@ -225,7 +225,7 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         );
     }
 
-    lib::screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
+    lib::compact_screenln!(screen, "fbcon: format accepted, native_blit={}", format.is_native());
     *geom() = Some(Geom {
         va: paging2::FB_WINDOW_BASE + page_off,
         pitch,

@@ -483,7 +483,7 @@ fn patch_chain<A: crate::Arch>(
             }
             5 => machine.write::<u16>(at, offset),
             kind => {
-                crate::dbg_println!("[win16] unsupported NE source relocation {}", kind);
+                crate::compact_dbg_println!("[win16] unsupported NE source relocation {}", kind);
                 return Err(-8);
             }
         }
@@ -512,7 +512,7 @@ fn imported_target<A: crate::Arch>(
         }
     }
     let Some(loaded) = modules.iter().find(|loaded| loaded.name == canonical) else {
-        crate::dbg_println!("[win16] module {} not loaded",
+        crate::compact_dbg_println!("[win16] module {} not loaded",
             core::str::from_utf8(&canonical).unwrap_or("?"));
         return Err(-2);
     };
@@ -525,9 +525,9 @@ fn imported_target<A: crate::Arch>(
     let (segment, offset) = entry.map_err(|_| {
         let module = core::str::from_utf8(&canonical).unwrap_or("?");
         if let Some(ordinal) = ordinal {
-            crate::dbg_println!("[win16] export {}.{} not found", module, ordinal);
+            crate::compact_dbg_println!("[win16] export {}.{} not found", module, ordinal);
         } else {
-            crate::dbg_println!("[win16] export {}!{} not found", module,
+            crate::compact_dbg_println!("[win16] export {}!{} not found", module,
                 core::str::from_utf8(symbol.unwrap_or(b"?")).unwrap_or("?"));
         }
         -127
@@ -1023,7 +1023,7 @@ fn dispatch<A: crate::Arch>(
                     regs.rax as u32
                 }
                 ah => {
-                    crate::dbg_println!("[win16] DOS3Call AH={:02x} stub", ah);
+                    crate::compact_dbg_println!("[win16] DOS3Call AH={:02x} stub", ah);
                     regs.rax as u32
                 }
             }
@@ -1034,7 +1034,7 @@ fn dispatch<A: crate::Arch>(
             let aligned = (size.max(2) + 1) & !1;
             let next = usize::from(state.local_next).saturating_add(aligned);
             if next > usize::from(state.local_end) {
-                crate::dbg_println!("[win16] LocalAlloc {} failed ({:04x}..{:04x})",
+                crate::compact_dbg_println!("[win16] LocalAlloc {} failed ({:04x}..{:04x})",
                     size, state.local_next, state.local_end);
                 0
             } else {
@@ -1076,16 +1076,16 @@ fn dispatch<A: crate::Arch>(
             let kind_pointer = stack_u32(machine, windows, regs, 4).unwrap_or(0);
             let name_pointer = stack_u32(machine, windows, regs, 8).unwrap_or(0);
             let kind = if kind_pointer >> 16 == 0 { kind_pointer as u16 } else {
-                crate::dbg_println!("[win16] named resource type unsupported");
+                crate::compact_dbg_println!("[win16] named resource type unsupported");
                 return 0;
             };
             let id = if name_pointer >> 16 == 0 { name_pointer as u16 } else {
-                crate::dbg_println!("[win16] named resource unsupported");
+                crate::compact_dbg_println!("[win16] named resource unsupported");
                 return 0;
             };
             let Ok(image) = ne::Image::parse(&state.image) else { return 0 };
             let Ok(bytes) = image.resource(kind, id) else {
-                crate::dbg_println!("[win16] resource type={} id={} not found", kind, id);
+                crate::compact_dbg_println!("[win16] resource type={} id={} not found", kind, id);
                 return 0;
             };
             let offset = (usize::from(state.resource_next) + 1) & !1;
@@ -1132,7 +1132,7 @@ fn dispatch<A: crate::Arch>(
             let caption = stack_u32(machine, windows, regs, 6).unwrap_or(0);
             let text = far_string(machine, windows, text).unwrap_or_default();
             let caption = far_string(machine, windows, caption).unwrap_or_default();
-            crate::dbg_println!("[win16] MessageBox '{}': '{}'",
+            crate::compact_dbg_println!("[win16] MessageBox '{}': '{}'",
                 core::str::from_utf8(&caption).unwrap_or("?"),
                 core::str::from_utf8(&text).unwrap_or("?"));
             1 // IDOK
@@ -1219,7 +1219,7 @@ fn dispatch<A: crate::Arch>(
                 windows.classes.first().map(|class| (class.wndproc, class.background))
             } else {
                 let Some(name) = far_string(machine, windows, class_pointer) else {
-                    crate::dbg_println!("[win16] invalid window class pointer {:08x}", class_pointer);
+                    crate::compact_dbg_println!("[win16] invalid window class pointer {:08x}", class_pointer);
                     return 0;
                 };
                 windows.classes.iter().find(|class| class.name.eq_ignore_ascii_case(&name))
@@ -1229,7 +1229,7 @@ fn dispatch<A: crate::Arch>(
                         .iter().any(|class| name.eq_ignore_ascii_case(class))
                         .then_some((0, 0x30005)))
                     .or_else(|| {
-                        crate::dbg_println!("[win16] window class '{}' not found",
+                        crate::compact_dbg_println!("[win16] window class '{}' not found",
                             core::str::from_utf8(&name).unwrap_or("?"));
                         None
                     })
@@ -1393,12 +1393,12 @@ fn dispatch<A: crate::Arch>(
         (Module::User, 175) => {
             let name = stack_u32(machine, windows, regs, 4).unwrap_or(0);
             if name >> 16 != 0 {
-                crate::dbg_println!("[win16] named bitmap resources unsupported");
+                crate::compact_dbg_println!("[win16] named bitmap resources unsupported");
                 return 0;
             }
             let Ok(image) = ne::Image::parse(&state.image) else { return 0 };
             let Ok(bytes) = image.resource(2, name as u16) else {
-                crate::dbg_println!("[win16] bitmap resource {} not found", name as u16);
+                crate::compact_dbg_println!("[win16] bitmap resource {} not found", name as u16);
                 return 0;
             };
             let offset = (usize::from(state.resource_next) + 3) & !3;
@@ -1755,7 +1755,7 @@ fn dispatch<A: crate::Arch>(
             let Some((source_width, source_height, bpp, palette_at)) = dib_header(machine, header)
                 else { return 0 };
             if crate::kernel::startup::trace_enabled() {
-                crate::dbg_println!("[win16] SetDIBitsToDevice source={}x{}x{}", source_width, source_height, bpp);
+                crate::compact_dbg_println!("[win16] SetDIBitsToDevice source={}x{}x{}", source_width, source_height, bpp);
             }
             let lines = usize::from(stack_u16(machine, windows, regs, 14).unwrap_or(0));
             // Win16 callers may point `bits` at just the requested scan-line
@@ -1789,7 +1789,7 @@ fn dispatch<A: crate::Arch>(
         (Module::Sound, _) => 1,
         (Module::Keyboard, 5 | 6) => 1,
         _ => {
-            crate::dbg_println!("[win16] stub {}", gate.name);
+            crate::compact_dbg_println!("[win16] stub {}", gate.name);
             0
         }
     }
@@ -1810,7 +1810,7 @@ pub(super) fn handle_event<A: crate::Arch>(
             let Some(gate) = state.gates.iter().copied()
                 .find(|gate| gate.selector == regs.code_seg()
                     && gate.offset.wrapping_add(2) == ip) else {
-                crate::dbg_println!("[win16] invalid DLL gate {:04x}:{:04x}", regs.code_seg(), ip);
+                crate::compact_dbg_println!("[win16] invalid DLL gate {:04x}:{:04x}", regs.code_seg(), ip);
                 return thread::KernelAction::Exit(-1);
             };
             if gate.ordinal == 0xffff {

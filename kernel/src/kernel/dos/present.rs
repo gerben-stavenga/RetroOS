@@ -564,7 +564,7 @@ pub fn display_tick<A: crate::Arch>(
             ),
             DosVideo::Fullscreen(_) => unreachable!("Voodoo display detach left fullscreen VGA active"),
         });
-        crate::println!("Display: Voodoo acquired packed scanout from native VGA");
+        crate::compact_println!("Display: Voodoo acquired packed scanout from native VGA");
     }
 
     // A Glide program that has mapped the Voodoo owns the display: the card

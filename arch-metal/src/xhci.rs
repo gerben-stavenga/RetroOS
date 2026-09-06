@@ -367,7 +367,7 @@ fn bringup(op: usize, rt: usize, max_slots: u32) -> bool {
     // QEMU asks for zero, which is why this was invisible until real silicon.
     let hcsp2 = r32(0x08);
     let scratch = ((((hcsp2 >> 21) & 0x1F) << 5) | ((hcsp2 >> 27) & 0x1F)) as usize;
-    lib::println!("xHCI: scratchpad buffers required: {}", scratch);
+    lib::compact_println!("xHCI: scratchpad buffers required: {}", scratch);
     if scratch > 0 {
         assert!(
             scratch <= SCRATCH_BUFS_MAX,
@@ -1004,7 +1004,7 @@ unsafe fn start_pipe(pipe: *mut HidPipe) {
 /// (driven by the timer IRQ) then streams input into the shared IRQ queue.
 pub fn init() {
     let Some((bus, dev, func)) = find_xhci() else {
-        lib::println!("xHCI: none found");
+        lib::compact_println!("xHCI: none found");
         return;
     };
     let cmd = cfg_read(bus, dev, func, 0x04);
@@ -1012,7 +1012,7 @@ pub fn init() {
 
     let bar0 = cfg_read(bus, dev, func, 0x10);
     if bar0 & 1 != 0 {
-        lib::println!("xHCI: BAR0 is I/O space (unexpected) - skipping");
+        lib::compact_println!("xHCI: BAR0 is I/O space (unexpected) - skipping");
         return;
     }
     let bar_hi = if (bar0 >> 1) & 3 == 2 {
@@ -1038,13 +1038,13 @@ pub fn init() {
     }
 
     if !bringup(op, rt, max_slots) {
-        lib::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: controller bringup failed (usbsts={:#x})",
             r32(op + OP_USBSTS)
         );
         return;
     }
-    lib::println!("xHCI: running (slots={} ports={})", max_slots, max_ports);
+    lib::compact_println!("xHCI: running (slots={} ports={})", max_slots, max_ports);
 
     // Enumerate root ports once. A device that supplies either still-missing HID
     // role retains its slot and one of our two independent device lanes. Other
@@ -1066,7 +1066,7 @@ pub fn init() {
             continue;
         };
         let dev = classify_addressed(slot, lane, p, speed);
-        lib::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: port {} speed {} class {} keyboard={} mouse={}",
             p,
             speed,
@@ -1122,7 +1122,7 @@ pub fn init() {
     if keyboard_ready {
         let (slot, dev, ep) = keyboard.unwrap();
         unsafe { start_pipe(&raw mut KBD_PIPE) };
-        lib::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: keyboard ready (slot {} port {} ep {} mps {})",
             slot,
             dev.port,
@@ -1130,12 +1130,12 @@ pub fn init() {
             ep.mps
         );
     } else {
-        lib::println!("xHCI: no keyboard found");
+        lib::compact_println!("xHCI: no keyboard found");
     }
     if mouse_ready {
         let (slot, dev, ep) = mouse.unwrap();
         unsafe { start_pipe(&raw mut MOUSE_PIPE) };
-        lib::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: mouse ready (slot {} port {} ep {} mps {})",
             slot,
             dev.port,
@@ -1143,6 +1143,6 @@ pub fn init() {
             ep.mps
         );
     } else {
-        lib::println!("xHCI: no mouse found");
+        lib::compact_println!("xHCI: no mouse found");
     }
 }

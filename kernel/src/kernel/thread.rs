@@ -3,7 +3,7 @@
 //! Thread states: Unused, Running, Ready, Blocked, Zombie
 //! TID 0 is the idle/init thread (never scheduled away from if no other threads)
 
-use crate::println;
+use crate::compact_println;
 use crate::Regs;
 
 // Re-export personality state types so `thread::DosState` / `thread::LinuxState` still works
@@ -998,7 +998,7 @@ pub fn exit_thread<A: crate::Arch>(
 
     machine.free_user_pages();
     threads[tid].kernel.state = ThreadState::Zombie;
-    crate::dbg_println!("[mem] exit tid={} code={} free_pages={}",
+    crate::compact_dbg_println!("[mem] exit tid={} code={} free_pages={}",
         tid, exit_code, machine.free_page_count());
 
     // Hand focus back to the parent that spawned us — it's the natural caller
@@ -1086,10 +1086,10 @@ pub fn waitpid<A: crate::Arch>(threads: &mut [Thread<A>], machine: &mut A, curre
 /// `last_child_exit_status`, `arch_user_clean`, personality `on_exit`).
 pub fn signal_thread<A: crate::Arch>(thread: &Thread<A>, fault_address: usize) {
     if thread.kernel.pid == 0 {
-        println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
+        compact_println!("\x1b[91mSEGV in init at {:#x}\x1b[0m", fault_address);
         loop { core::hint::spin_loop(); }
     }
-    println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
+    compact_println!("SEGV in thread {} at {:#x} rip={:#x} cs={:#x} rsp={:#x} ss={:#x} fl={:#x} rax={:#x} rbx={:#x} rcx={:#x}",
         thread.kernel.tid, fault_address,
         thread.kernel.vcpu.regs.frame.rip, thread.kernel.vcpu.regs.frame.cs,
         thread.kernel.vcpu.regs.frame.rsp, thread.kernel.vcpu.regs.frame.ss,

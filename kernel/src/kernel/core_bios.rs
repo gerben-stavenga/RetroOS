@@ -827,11 +827,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.state_bytes = self.probe_state_size(machine, bios_display);
         self.state_probed = true;
         if let Some(bytes) = self.state_bytes {
-            crate::println!("VGA: VBE 4F04 capture checkpoint available ({} bytes)", bytes);
+            crate::compact_println!("VGA: VBE 4F04 capture checkpoint available ({} bytes)", bytes);
         } else if crate::kernel::platform::get().vga_readback {
-            crate::println!("VGA: VBE 4F04 unavailable — using Cirrus CR22/24/26 readbacks");
+            crate::compact_println!("VGA: VBE 4F04 unavailable — using Cirrus CR22/24/26 readbacks");
         } else {
-            crate::println!("VGA: WARNING no VBE state service or Cirrus readbacks — full process VGA restore NOT supported");
+            crate::compact_println!("VGA: WARNING no VBE state service or Cirrus readbacks — full process VGA restore NOT supported");
         }
         const INFO: usize = 0x9000;
         const MODE_INFO: usize = 0x9200;
@@ -911,7 +911,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                     "BIOS selected unusable VBE display mode {:#x}", mode.number
                 ))
         });
-        crate::println!("VBE: {} available modes (* selected)", self.modes.len());
+        crate::compact_println!("VBE: {} available modes (* selected)", self.modes.len());
         for mode in &self.modes {
             crate::println!(
                 "VBE: {} {:#05x} {}x{}x{} pitch={} format={:?} phys={:#010x} bank={:04x}:{}K/{}K",

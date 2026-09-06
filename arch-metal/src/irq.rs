@@ -399,7 +399,7 @@ fn init_monotonic_clock() {
         };
     }
     let _ = now(true);
-    lib::println!("Clock: {} {} Hz", match source {
+    lib::compact_println!("Clock: {} {} Hz", match source {
         ClockSource::Tsc => "stable TSC",
         ClockSource::Hpet => "HPET",
         ClockSource::Pit2 => "PIT channel 2",
@@ -487,7 +487,7 @@ fn setup_lapic_timer() -> bool {
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
     lapic_write(LAPIC_INIT_COUNT, init_count);
     unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
-    lib::println!("IRQ: LAPIC timer tick (init_count={})", init_count);
+    lib::compact_println!("IRQ: LAPIC timer tick (init_count={})", init_count);
     true
 }
 
@@ -516,7 +516,7 @@ fn legacy_intr_and_pit() {
             unsafe { crate::x86::wrmsr(IA32_APIC_BASE, base & !APIC_BASE_ENABLE) };
         }
     }
-    lib::println!("IRQ: PIT");
+    lib::compact_println!("IRQ: PIT");
     init_pit(1000); // 1000 Hz timer
     unmask_irq(0);  // timer
 }
@@ -616,7 +616,7 @@ fn i8042_present() -> bool {
 
 /// Initialize interrupts (PIC + tick source + keyboard/mouse)
 pub fn init_interrupts() {
-    lib::println!("IRQ: PIC");
+    lib::compact_println!("IRQ: PIC");
     remap_pic();
     init_monotonic_clock();
 
@@ -644,7 +644,7 @@ pub fn init_interrupts() {
         // Legacy-free laptop: no PS/2 controller. The keyboard comes from the
         // xHCI USB-HID driver (initialised above), polled from the timer IRQ —
         // nothing more to route here.
-        lib::println!("IRQ: no i8042 - keyboard via USB-HID (xHCI)");
+        lib::compact_println!("IRQ: no i8042 - keyboard via USB-HID (xHCI)");
         return;
     }
 
@@ -656,7 +656,7 @@ pub fn init_interrupts() {
     // clock disable), silently killing the keyboard for the rest of the
     // boot. Also, the 8042 only edges IRQ1 when OBF transitions 0→1, so a
     // stuck OBF locks out subsequent keypresses regardless.
-    lib::println!("IRQ: keyboard");
+    lib::compact_println!("IRQ: keyboard");
     for _ in 0..1_000 {
         if inb(0x64) & 1 == 0 {
             break;
@@ -669,9 +669,9 @@ pub fn init_interrupts() {
         unmask_irq(1);
     }
 
-    lib::println!("IRQ: mouse probe");
+    lib::compact_println!("IRQ: mouse probe");
     if init_mouse() {
-        lib::println!("IRQ: mouse ready");
+        lib::compact_println!("IRQ: mouse ready");
         // Only the mouse's own line. A device's interrupt is enabled by
         // whoever probed that device (`route_isa_irq`), never as a side
         // effect of an unrelated probe — the SB lines used to be unmasked
@@ -682,7 +682,7 @@ pub fn init_interrupts() {
             unmask_irq(12);
         }
     } else {
-        lib::println!("IRQ: mouse unavailable");
+        lib::compact_println!("IRQ: mouse unavailable");
     }
 }
 
@@ -793,7 +793,7 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
         for _ in 0..2000 { let _ = inb(0x80); }
     }
     let counting = samples.iter().any(|&v| v != samples[0]);
-    lib::screenln!(screen,
+    lib::compact_screenln!(screen,
         "SELFTEST PIT counting={} samples={:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X} {:04X}",
         counting as u8,
         samples[0], samples[1], samples[2], samples[3],
@@ -812,7 +812,7 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
     }
     outb(MASTER_CMD, 0x0B);
     let mask = inb(MASTER_DATA);
-    lib::screenln!(screen,
+    lib::compact_screenln!(screen,
         "SELFTEST PIC master IRR(seen)={:08b} IMR={:08b} IRQ0_pending={} IRQ0_masked={}",
         irr_seen, mask, irr_seen & 1, mask & 1,
     );
@@ -826,12 +826,12 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
         let mode = if base & (1 << 11) == 0 { "disabled" }
             else if base & (1 << 10) != 0 { "x2apic" }
             else { "xapic" };
-        lib::screenln!(screen,
+        lib::compact_screenln!(screen,
             "SELFTEST APIC base={:#x} mode={} (LINT0 ExtINT route is what carries IRQ0)",
             base, mode,
         );
     } else {
-        lib::screenln!(screen, "SELFTEST APIC none (pure-PIC machine, INTR direct)");
+        lib::compact_screenln!(screen, "SELFTEST APIC none (pure-PIC machine, INTR direct)");
     }
 
     // --- 4. CPU timer capabilities — picks the LAPIC-timer calibration path
@@ -842,7 +842,7 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
         vd as u8, (vd >> 8) as u8, (vd >> 16) as u8, (vd >> 24) as u8,
         vc as u8, (vc >> 8) as u8, (vc >> 16) as u8, (vc >> 24) as u8,
     ];
-    lib::screenln!(screen,
+    lib::compact_screenln!(screen,
         "SELFTEST CPU vendor={} family={} tsc_deadline={} x2apic_cap={} invtsc={}",
         core::str::from_utf8(&vendor).unwrap_or("????????????"),
         family,
@@ -851,15 +851,15 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
     );
     if maxleaf >= 0x15 {
         let (den, num, crystal, _) = crate::x86::cpuid(0x15);
-        lib::screenln!(screen, "SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
+        lib::compact_screenln!(screen, "SELFTEST CPUID.15H den={} num={} crystal_hz={}", den, num, crystal);
     } else {
-        lib::screenln!(screen, "SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
+        lib::compact_screenln!(screen, "SELFTEST CPUID.15H unavailable (maxleaf={:#x})", maxleaf);
     }
     if maxleaf >= 0x16 {
         let (base_mhz, max_mhz, bus_mhz, _) = crate::x86::cpuid(0x16);
-        lib::screenln!(screen, "SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
+        lib::compact_screenln!(screen, "SELFTEST CPUID.16H base={}MHz max={}MHz bus={}MHz", base_mhz, max_mhz, bus_mhz);
     } else {
-        lib::screenln!(screen, "SELFTEST CPUID.16H unavailable");
+        lib::compact_screenln!(screen, "SELFTEST CPUID.16H unavailable");
     }
 }
 

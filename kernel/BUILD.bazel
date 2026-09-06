@@ -65,6 +65,7 @@ rust_library(
         "//ext4",
         "//klog",
         "//lib",
+        "//lib:compact_fmt",
         "//lib:vga",
         "//lib:sound",
         "//third_party/voodoo",

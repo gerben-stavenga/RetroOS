@@ -216,7 +216,7 @@ pub(crate) fn mount_physical_fallbacks(
                 );
                 slot += 1;
             }
-            Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
+            Err(error) => crate::compact_screenln!(screen, "ext4 partition skipped: {}", error),
         }
     }
     slot

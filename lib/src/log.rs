@@ -92,6 +92,20 @@ macro_rules! println {
     }};
 }
 
+/// Compact formatting for diagnostics made only of primitive values.
+#[macro_export]
+macro_rules! compact_println {
+    ($($arg:tt)*) => {{
+        let _ = compact_fmt::writeln!(&mut $crate::log::DebugCon, $($arg)*);
+    }};
+}
+
+/// Debug-console spelling of [`compact_println!`].
+#[macro_export]
+macro_rules! compact_dbg_println {
+    ($($arg:tt)*) => { $crate::compact_println!($($arg)*) };
+}
+
 /// Print to the debug console (sink) only, never the framebuffer.
 #[macro_export]
 macro_rules! dbg_print {

@@ -331,3 +331,11 @@ macro_rules! screenln {
         );
     }};
 }
+
+/// Compact primitive formatting to a screen writer.
+#[macro_export]
+macro_rules! compact_screenln {
+    ($screen:expr, $($arg:tt)*) => {{
+        let _ = compact_fmt::writeln!($screen, $($arg)*);
+    }};
+}

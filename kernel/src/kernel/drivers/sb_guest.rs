@@ -141,7 +141,7 @@ impl NativeSb {
                 dsp_write(machine, base, (st.block >> 8) as u8);
             }
         }
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[sb] card taken: {}Hz {}bit {} {} block={} speaker={} playing={}",
             st.rate, st.bits, if st.stereo { "stereo" } else { "mono" },
             if st.single { "single" } else { "auto" }, st.block, st.speaker, st.playing

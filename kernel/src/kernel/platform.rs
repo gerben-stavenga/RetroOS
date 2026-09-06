@@ -540,7 +540,7 @@ pub fn apply_audio_mode<A: crate::Arch>(
     p.audio = match (&card, mixed) {
         (Some(c), true) if c.dma16.is_some() => Audio::SbSink,
         (Some(_), true) => {
-            crate::println!(
+            crate::compact_println!(
                 "Audio: SB_AUDIO=mixed needs a 16-bit DMA channel and this card has none — \
                  running the card natively instead"
             );
@@ -568,14 +568,14 @@ pub fn set_vbe_mode(mode: Option<VbeDisplayMode>) {
     match mode {
         Some(selected) => {
             let m = selected.mode();
-            crate::println!(
+            crate::compact_println!(
             "VBE: selected mode {:#x} {}x{} pitch={} phys={:#x} bank={:04x}:{}K/{}K",
             m.number, m.width, m.height, m.pitch, m.physical_base,
             m.window_segment, m.window_granularity_kb, m.window_size_kb,
             )
         },
         None if p.vga_passthrough => {
-            crate::println!("VBE: no usable packed mode; selected display is Mode 13h")
+            crate::compact_println!("VBE: no usable packed mode; selected display is Mode 13h")
         }
         None => {}
     }
@@ -626,7 +626,7 @@ pub fn set_voodoo_vbe_mode(modes: Option<&[VbeMode]>, surface_available: bool) {
             );
         }
         None if p.vga_passthrough =>
-            crate::println!("VBE: no supported display mode; Voodoo disabled"),
+            crate::compact_println!("VBE: no supported display mode; Voodoo disabled"),
         None => {}
     }
 }

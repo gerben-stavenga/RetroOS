@@ -239,7 +239,7 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
             None => {
                 REQUESTED_OUTPUT_ROUTE.store(DEFAULT_OUTPUT_ROUTE as u8, Ordering::Relaxed);
                 OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
-                crate::println!(
+                let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                     "hda: invalid HDA_OUTPUT={}",
                     core::str::from_utf8(value).unwrap_or("<non-UTF8>")
                 );
@@ -266,7 +266,7 @@ pub fn cycle_output_route(forward: bool) {
     }
     REQUESTED_OUTPUT_ROUTE.store(next as u8, Ordering::Relaxed);
     OUTPUT_ROUTE_PENDING.store(true, Ordering::Relaxed);
-    crate::println!(
+    let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
         "hda: requested output route {}",
         core::str::from_utf8(next.label()).unwrap_or("?")
     );
@@ -560,7 +560,7 @@ fn pci_pm_power_cycle<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u
     let bar1 = crate::kernel::pci::read32(machine, bus, dev, func, 0x14);
     let pmcsr = crate::kernel::pci::read32(machine, bus, dev, func, pm + 4);
     if pmcsr & (1 << 3) != 0 {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: {:02x}:{:02x}.{} PMCSR.NSR=1: D3hot cycle will not reset this function",
             bus, dev, func
         );
@@ -600,7 +600,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     };
     let bar_phys = (hi << 32) | (bar0 & 0xFFFF_FFF0) as u64;
     if bar_phys == 0 {
-        crate::println!("hda: {:02x}:{:02x}.{} skipped: no BAR", bus, dev, func);
+        crate::compact_println!("hda: {:02x}:{:02x}.{} skipped: no BAR", bus, dev, func);
         return None;
     }
     machine.map_phys_range(
@@ -621,7 +621,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     // boundary constraint.
     let phys_page = machine.alloc_phys_contig(DMA_PAGES, 0);
     if phys_page == 0 {
-        crate::println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
+        crate::compact_println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
         return None;
     }
     machine.map_phys_range(DMA_WIN_VA >> 12, DMA_PAGES, phys_page, PTE_CACHE_DISABLE);
@@ -688,7 +688,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
             }
         }
         if !up {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: {:02x}:{:02x}.{} attempt {}: CRST stuck low",
                 bus,
                 dev,
@@ -701,7 +701,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         spin(1_000_000 << attempt);
         let codecs = r16(STATESTS);
         if codecs == 0 {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: {:02x}:{:02x}.{} attempt {}: statests=0, no codec responded",
                 bus,
                 dev,
@@ -716,7 +716,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         d.setup_corb_rirb();
         d.codec_vendor = d.verb(0, (VERB_GET_PARAMETER << 8) | PARAM_VENDOR_ID);
         if d.verb_failed || d.codec_vendor == 0 || d.codec_vendor == 0xFFFF_FFFF {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: {:02x}:{:02x}.{} attempt {}: codec verb-dead (cad={} statests={:#x} vendor={:#x})",
                 bus,
                 dev,
@@ -730,7 +730,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
             continue;
         }
         if attempt > 0 {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: {:02x}:{:02x}.{} codec recovered on attempt {}",
                 bus,
                 dev,
@@ -745,7 +745,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         return None;
     }
     if DEBUG {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: rings up corbctl={:#x} rirbctl={:#x} corbsz={:#x} rirbsz={:#x} corbwp={} corbrp={} rirbwp={}",
             r8(CORBCTL), r8(RIRBCTL), r8(CORBSIZE), r8(RIRBSIZE),
             r16(CORBWP), r16(CORBRP), r16(RIRBWP)
@@ -757,7 +757,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
                 d.shutdown_controller();
                 return None;
             }
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: probe param={:#04x} -> {:#x} corbwp={} corbrp={} rirbwp={} rirbsts={:#x}",
                 p,
                 r,
@@ -770,7 +770,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     }
     let requested = OutputRoute::from_raw(REQUESTED_OUTPUT_ROUTE.load(Ordering::Relaxed));
     if !d.select_output_path(requested) || d.verb_failed {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: {:02x}:{:02x}.{} failed: no output path (codec={:#x}, verb_failed={})",
             bus,
             dev,
@@ -787,7 +787,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
 
     d.configure_path();
     if d.verb_failed {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: {:02x}:{:02x}.{} failed: configure-path verb timeout (codec={:#x})",
             bus,
             dev,
@@ -811,7 +811,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     d.stop_corb_rirb();
 
     if DEBUG {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: bar={:#x} gcap={:#06x} iss={} oss={} statests={:#x} cad={} sd={:#x}",
             bar_phys,
             gcap,
@@ -821,10 +821,10 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
             d.cad,
             sd
         );
-        crate::println!("hda: dac=nid{} pin=nid{}", d.dac, d.pin);
+        crate::compact_println!("hda: dac=nid{} pin=nid{}", d.dac, d.pin);
     }
 
-    crate::println!(
+    let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
         "hda: selected {:02x}:{:02x}.{} codec={:#x} pin=nid{} dac=nid{}",
         bus,
         dev,
@@ -833,7 +833,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
         d.pin,
         d.dac,
     );
-    crate::println!(
+    let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
         "hda: path len={} score={} nodes={:02x}>{:02x}>{:02x}>{:02x}>{:02x}>{:02x} conn={},{},{},{},{}",
         d.path.len,
         d.path.score,
@@ -1111,7 +1111,7 @@ impl Hda {
             }
         }
         if DEBUG {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: enum root={:#x} fg_start={} fg_count={} afg={}",
                 root,
                 fg_start,
@@ -1158,7 +1158,7 @@ impl Hda {
             };
             count += 1;
             if DEBUG {
-                crate::println!(
+                let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                     "hda: nid{} caps={:#x} type={}",
                     nid,
                     caps,
@@ -1247,7 +1247,7 @@ impl Hda {
         );
         let dac_gain = self.out_amp_zero_db(self.dac);
         self.verb(self.dac, (0x3 << 16) | 0xB000 | dac_gain); // DAC amp unmute @ 0 dB
-        crate::println!("hda: amp pin gain={:#x} dac gain={:#x}", pin_gain, dac_gain);
+        crate::compact_println!("hda: amp pin gain={:#x} dac gain={:#x}", pin_gain, dac_gain);
     }
 
     /// 0 dB gain value for a widget's output amp: the offset field of its amp
@@ -1292,7 +1292,7 @@ impl Hda {
         let pinpwr = self.verb(self.pin, 0xF05 << 8);
         let dacpwr = self.verb(self.dac, 0xF05 << 8);
         let pinsel = self.verb(self.pin, VERB_GET_CONN_SELECT << 8);
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: state pinctl={:#x} eapd={:#x} pinamp={:#x} dacamp={:#x} pinpwr={:#x} dacpwr={:#x} pinsel={:#x}",
             pinctl, eapd, pinamp, dacamp, pinpwr, dacpwr, pinsel
         );
@@ -1304,7 +1304,7 @@ impl Hda {
             for (i, v) in c.iter_mut().enumerate() {
                 *v = self.read_realtek_coef(base + i as u32);
             }
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: coef {:02x}: {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} {:04x} {:04x}",
                 base, c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]
             );
@@ -1324,7 +1324,7 @@ impl Hda {
         if new != old {
             self.write_realtek_coef(REALTEK_EAPD_COEF_INDEX, new);
         }
-        crate::println!("hda: alc298 coef10 {:#06x}->{:#06x}", old, new);
+        crate::compact_println!("hda: alc298 coef10 {:#06x}->{:#06x}", old, new);
     }
 
     /// Program the ALC298's vendor DSP so the speaker amp actually produces
@@ -1340,7 +1340,7 @@ impl Hda {
         for &v in crate::kernel::drivers::alc298_amp::AMP_INIT {
             self.verb(REALTEK_VENDOR_NID, v);
             if self.verb_failed {
-                crate::println!("hda: alc298 amp init aborted (codec stopped responding)");
+                crate::compact_println!("hda: alc298 amp init aborted (codec stopped responding)");
                 return;
             }
             // Pace the replay like the reference does. The oracle (Ubuntu's
@@ -1356,7 +1356,7 @@ impl Hda {
             spin(100_000);
         }
         self.amp_init_done = true;
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: alc298 amp init replayed ({} verbs)",
             crate::kernel::drivers::alc298_amp::AMP_INIT.len()
         );
@@ -1370,7 +1370,7 @@ impl Hda {
         self.verb(dac, (0x2 << 16) | STREAM_FMT as u32); // Set Converter Format
         self.stop_corb_rirb();
         if DEBUG {
-            crate::println!("hda: format fmt={:#06x}", STREAM_FMT);
+            crate::compact_println!("hda: format fmt={:#06x}", STREAM_FMT);
         }
     }
 
@@ -1407,7 +1407,7 @@ impl Hda {
             AVAILABLE_OUTPUT_ROUTES.store(old_available, Ordering::Relaxed);
             REQUESTED_OUTPUT_ROUTE.store(old_route as u8, Ordering::Relaxed);
             self.stop_corb_rirb();
-            crate::println!("hda: output route change found no usable path");
+            crate::compact_println!("hda: output route change found no usable path");
             return;
         }
 
@@ -1445,14 +1445,14 @@ impl Hda {
             self.verb(self.dac, (0x2 << 16) | STREAM_FMT as u32);
             self.stop_corb_rirb();
             if self.verb_failed {
-                crate::println!("hda: output route change and rollback timed out");
+                crate::compact_println!("hda: output route change and rollback timed out");
             } else {
-                crate::println!("hda: output route change timed out; previous route restored");
+                crate::compact_println!("hda: output route change timed out; previous route restored");
             }
         } else {
             OUTPUT_ROUTE.store(self.output_route as u8, Ordering::Relaxed);
             REQUESTED_OUTPUT_ROUTE.store(self.output_route as u8, Ordering::Relaxed);
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "hda: output route {} selected pin=nid{} dac=nid{}",
                 core::str::from_utf8(self.output_route.label()).unwrap_or("?"),
                 self.pin,
@@ -1722,7 +1722,7 @@ impl sound::sink::Device for Hda {
         self.reported = 0;
         w32(self.sd + SDCTL, 0x02 | (STREAM_TAG << 20));
         self.running = true;
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "hda: stream RUN sdctl={:#010x} cbl={} lvi={} fmt={:#06x} lpib={}",
             r32(self.sd + SDCTL), r32(self.sd + SDCBL), r16(self.sd + SDLVI),
             r16(self.sd + SDFMT), r32(self.sd + SDLPIB),

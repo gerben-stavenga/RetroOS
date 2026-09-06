@@ -1,5 +1,11 @@
 use core::fmt;
 
+macro_rules! nested_write {
+    ($out:expr, $($arg:tt)*) => {
+        compact_fmt::write!($out, $($arg)*)
+    };
+}
+
 #[derive(Default)]
 struct Buffer {
     bytes: Vec<u8>,
@@ -62,6 +68,14 @@ fn positional_arguments_are_evaluated_once() {
     compact_fmt::write!(&mut output, "{0} {0:x}", next()).unwrap();
     assert_eq!(calls, 1);
     assert_eq!(output.text(), "7 7");
+}
+
+#[test]
+fn preserves_nested_macro_hygiene() {
+    let mut output = Buffer::default();
+    let local = 23u32;
+    nested_write!(&mut output, "value={}", local).unwrap();
+    assert_eq!(output.text(), "value=23");
 }
 
 #[test]

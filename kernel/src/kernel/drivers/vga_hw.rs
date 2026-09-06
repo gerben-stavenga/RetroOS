@@ -257,7 +257,7 @@ pub fn save(
         let _ = inb(0x3DA);
     }
 
-    crate::dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X} dacmask={:02X}",
+    crate::compact_dbg_println!("VGA save: seq4={:02X} gc5={:02X} gc6={:02X} crtc14={:02X} crtc17={:02X} ac10={:02X} misc={:02X} start={:04X} dacmask={:02X}",
         state.seq[4], state.gc[5], state.gc[6], state.crtc[0x14], state.crtc[0x17], state.ac[0x10], state.misc_output,
         (state.crtc[0x0C] as u16) << 8 | state.crtc[0x0D] as u16,
         state.dac_mask);

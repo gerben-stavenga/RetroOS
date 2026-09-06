@@ -227,7 +227,7 @@ impl sound::sink::Device for Ac97 {
         outb(self.nabm + PO_LVI, (NUM_BUF - 1) as u8);
         let cr = inb(self.nabm + PO_CR);
         outb(self.nabm + PO_CR, (cr & !0x10) | PO_CR_RUN);
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "ac97: stream RUN lvi={} cr={:#x}",
             NUM_BUF - 1,
             inb(self.nabm + PO_CR)

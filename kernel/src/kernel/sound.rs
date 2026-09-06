@@ -167,11 +167,11 @@ fn say(report: sound::sink::Report) {
         // The difference between "armed" and "the DAC is actually consuming" —
         // where metal bring-up goes wrong, and invisible in a counter that
         // only reports problems.
-        crate::println!("sink: first frame played");
+        crate::compact_println!("sink: first frame played");
     }
     if let Some(u) = report.underrun {
         let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
             n, u.written_frames, u.consumed_frames
         );
@@ -370,7 +370,7 @@ pub fn advance<A: crate::Arch>(
         c.produced += produced;
         // ~3e9 TSC ticks: a few seconds on any plausible clock.
         if now.wrapping_sub(c.tsc0) > 3_000_000_000 {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "census: tsc={} calls={} dt_ns={} drained={} produced={} rate={} s={}",
                 now - c.tsc0, c.calls, c.dt_sum, c.drained, c.produced,
                 rate_q16 >> RATE_FP_SHIFT, output.producer.s_q16() >> RATE_FP_SHIFT,
@@ -388,7 +388,7 @@ pub fn advance<A: crate::Arch>(
     if rate_hz.abs_diff(s_hz) > 500 && crate::kernel::startup::trace_enabled() {
         let n = RATE_SPIKES.fetch_add(1, Ordering::Relaxed);
         if n.is_multiple_of(256) {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "audio: rate={} s={} depth={} target={} drained={} dt_ns={} cursor_ns={} (spike #{})",
                 rate_hz,
                 s_hz,

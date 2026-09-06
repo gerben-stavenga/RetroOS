@@ -571,13 +571,13 @@ pub fn exec_lx_into<A: crate::Arch>(
 
     for module in &modules {
         if let Err(error) = map_module(machine, module) {
-            crate::println!("OS/2: cannot map module {}", core::str::from_utf8(&module.name).unwrap_or("?"));
+            crate::compact_println!("OS/2: cannot map module {}", core::str::from_utf8(&module.name).unwrap_or("?"));
             return Err(error);
         }
     }
     for index in 0..modules.len() {
         if let Err(error) = apply_fixups(machine, &modules, index) {
-            crate::println!("OS/2: cannot fix up module {}", core::str::from_utf8(&modules[index].name).unwrap_or("?"));
+            crate::compact_println!("OS/2: cannot fix up module {}", core::str::from_utf8(&modules[index].name).unwrap_or("?"));
             return Err(error);
         }
     }
@@ -1500,7 +1500,7 @@ pub fn handle_event<A: crate::Arch>(
         }
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = gate_from_event(state, regs.frame.cs as u16, regs.ip32()) else {
-                crate::println!("OS/2: invalid API gate at {:#x}", regs.ip32());
+                crate::compact_println!("OS/2: invalid API gate at {:#x}", regs.ip32());
                 return thread::KernelAction::Exit(-1);
             };
             match gate.api {
@@ -1510,7 +1510,7 @@ pub fn handle_event<A: crate::Arch>(
                 }
                 Api::RetroWndProcReturn => {
                     let Some(callback) = state.callback.take() else {
-                        crate::println!("OS/2: stray window-procedure return");
+                        crate::compact_println!("OS/2: stray window-procedure return");
                         return thread::KernelAction::Exit(-1);
                     };
                     let result = regs.rax as u32;

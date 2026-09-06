@@ -299,7 +299,7 @@ impl Display {
             wide: policy.wide,
         };
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
-        crate::println!("Display: VBE {}x{}x{} mode={:#x}",
+        crate::compact_println!("Display: VBE {}x{}x{} mode={:#x}",
             mode.width, mode.height, mode.bits_per_pixel, mode.number);
         Self {
             shadow_width,
@@ -326,7 +326,7 @@ impl Display {
     ) -> Self {
         native.bios_set_mode_request(machine, bios, mode.number);
         let (shadow_width, _) = fit_vga(usize::from(mode.width), usize::from(mode.height));
-        crate::println!("Display: banked VBE {}x{}x{} mode={:#x}",
+        crate::compact_println!("Display: banked VBE {}x{}x{} mode={:#x}",
             mode.width, mode.height, mode.bits_per_pixel, mode.number);
         Self {
             shadow_width,
@@ -385,7 +385,7 @@ impl Display {
             self.voodoo_ramp_generation = Some(generation);
         } else {
             self.programmable_ramp = false;
-            crate::println!("VBE: programmable direct-colour ramp rejected; using CPU gamma");
+            crate::compact_println!("VBE: programmable direct-colour ramp rejected; using CPU gamma");
         }
         ok
     }

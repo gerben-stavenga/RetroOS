@@ -195,13 +195,13 @@ fn prepare_audio<A: crate::Arch>(
             .unwrap_or_default();
         match blaster_base(&blaster) {
             Some(b) if b == card.base => {}
-            Some(b) => crate::println!(
+            Some(b) => crate::compact_println!(
                 "Audio: BLASTER declares A{:03X}, the card answers at {:#05X} — translating (the \
                  DSP window traps anyway, so the guest sees its declared card)",
                 b,
                 card.base
             ),
-            None => crate::println!(
+            None => crate::compact_println!(
                 "Audio: no BLASTER port declared, card is at {:#05X}",
                 card.base
             ),
@@ -246,7 +246,7 @@ fn prepare_audio<A: crate::Arch>(
         // wakeup and acknowledgement path with no accounting purpose.
         if matches!(platform.audio, crate::kernel::platform::Audio::NativeSb) {
             machine.route_isa_irq(card.irq);
-            crate::println!("Audio: SB IRQ{} routed", card.irq);
+            crate::compact_println!("Audio: SB IRQ{} routed", card.irq);
         }
 
         // Judge the H-declaration against the acting straps — the restrap just
@@ -256,7 +256,7 @@ fn prepare_audio<A: crate::Arch>(
                 .split(|&b| b == b' ')
                 .any(|t| t.first().is_some_and(|c| c.eq_ignore_ascii_case(&b'H')))
         {
-            crate::println!("Audio: BLASTER declares a 16-bit channel but this card has none");
+            crate::compact_println!("Audio: BLASTER declares a 16-bit channel but this card has none");
         }
     }
     // Reconciliation done: settle who the card belongs to. In mixer mode the
@@ -292,12 +292,12 @@ fn discover_disks<A: crate::Arch>(
 ) -> alloc::vec::Vec<&'static dyn crate::kernel::block::Disk> {
     let disks = crate::kernel::block::probe(machine);
     for disk in &disks {
-        crate::println!("Storage: {} ({} MB)", disk.name(), disk.sectors() / 2048);
+        crate::compact_println!("Storage: {} ({} MB)", disk.name(), disk.sectors() / 2048);
     }
     if disks.is_empty() {
-        crate::println!("Storage: none detected");
+        crate::compact_println!("Storage: none detected");
     }
-    crate::println!("Block devices initialized");
+    crate::compact_println!("Block devices initialized");
     disks
 }
 
@@ -501,7 +501,7 @@ fn mount_filesystems<A: crate::Arch>(
         );
         if hostfs {
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs: mounted at /host");
+            crate::compact_screenln!(screen, "hostfs: mounted at /host");
         }
     } else if ext.is_empty() {
         // No module or disk filesystem: the host fs is the root if available.
@@ -509,7 +509,7 @@ fn mount_filesystems<A: crate::Arch>(
             vfs::mount(b"", host_fs());
             // Keep the DOS H: mapping stable even when hostfs is also `/`.
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs: mounted as root");
+            crate::compact_screenln!(screen, "hostfs: mounted as root");
             hostfs_is_root = true;
         } else {
             panic!("No root filesystem available");
@@ -540,7 +540,7 @@ fn mount_filesystems<A: crate::Arch>(
             slot += 1;
             if slot >= MAX_EXT_MOUNTS {
                 // Never drop a filesystem silently — say how many and why.
-                crate::println!(
+                crate::compact_println!(
                     "ext4: {} further partition(s) not mounted (limit {})",
                     ext.len() - slot,
                     MAX_EXT_MOUNTS
@@ -562,13 +562,13 @@ fn mount_filesystems<A: crate::Arch>(
                         slot
                     );
                 }
-                Err(error) => crate::screenln!(screen, "ext4 partition skipped: {}", error),
+                Err(error) => crate::compact_screenln!(screen, "ext4 partition skipped: {}", error),
             }
         }
 
         if hostfs {
             vfs::mount(b"host/", host_fs());
-            crate::screenln!(screen, "hostfs: mounted at /host");
+            crate::compact_screenln!(screen, "hostfs: mounted at /host");
         }
     }
 
@@ -774,7 +774,7 @@ fn run<A: crate::Arch>(
                 sink.as_mut(),
             );
         }
-        crate::screenln!(&mut screen, "All commands done — shutting down.");
+        crate::compact_screenln!(&mut screen, "All commands done — shutting down.");
         crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }
@@ -785,9 +785,9 @@ fn run<A: crate::Arch>(
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
 
-    crate::screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
+    crate::compact_screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
-    crate::screenln!(&mut screen, "Starting DN...");
+    crate::compact_screenln!(&mut screen, "Starting DN...");
     let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
     loop {
         (screen, sb) = run_program_with_screen(
@@ -804,7 +804,7 @@ fn run<A: crate::Arch>(
             sb,
             sink.as_mut(),
         );
-        crate::screenln!(&mut screen, "DN exited, restarting...");
+        crate::compact_screenln!(&mut screen, "DN exited, restarting...");
     }
 }
 
@@ -982,13 +982,13 @@ fn prepare_program<A: crate::Arch>(
     if let Some((addr0, addr1)) = debug_watch {
         machine.set_debug_watch(Some((addr0, addr1)));
         if addr1 != 0 {
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[WATCH] armed write watchpoints at {:08X} and {:08X}",
                 addr0,
                 addr1
             );
         } else {
-            crate::dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
+            crate::compact_dbg_println!("[WATCH] armed write watchpoint at {:08X}", addr0);
         }
     }
     (tid, display)
@@ -1180,7 +1180,7 @@ pub fn event_loop<A: crate::Arch>(
     crate::kernel::display::Display,
     Option<crate::kernel::drivers::sb16::SbCard>,
 ) {
-    crate::dbg_println!("event_loop entered, tid={}", first_tid);
+    crate::compact_dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_osd_refresh_tick = u64::MAX;
@@ -1545,13 +1545,13 @@ fn dispatch<A: crate::Arch>(
         if thread.personality.try_vga_fault(machine, regs, addr) {
             return thread::KernelAction::Done;
         }
-        crate::println!(
+        crate::compact_println!(
             "  fault rip={:#x} addr={:#x} err={:#x}",
             regs.frame.rip,
             addr,
             regs.err_code
         );
-        crate::println!(
+        crate::compact_println!(
             "  rax={:#x} rbx={:#x} rcx={:#x} rdx={:#x} rsi={:#x} rdi={:#x} rbp={:#x} rsp={:#x}",
             regs.rax,
             regs.rbx,
@@ -1562,7 +1562,7 @@ fn dispatch<A: crate::Arch>(
             regs.rbp,
             regs.frame.rsp
         );
-        crate::println!(
+        crate::compact_println!(
             "  r8={:#x} r9={:#x} r10={:#x} r11={:#x} r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
             regs.r8,
             regs.r9,
@@ -2005,7 +2005,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         exec::BinaryFormat::Elf | exec::BinaryFormat::Lx | exec::BinaryFormat::Ne
             | exec::BinaryFormat::Pe
     ) {
-        crate::dbg_println!("  fork done, loading protected-mode image...");
+        crate::compact_dbg_println!("  fork done, loading protected-mode image...");
         machine.free_user_pages();
     }
 
@@ -2189,7 +2189,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     // Switch focus to child. Parent stays Ready; it'll poll SYNTH_WAITPID
     // when focus returns to it. No kernel-side blocking — the focused thread
     // runs continuously, so polling is just a status query.
-    crate::dbg_println!(
+    crate::compact_dbg_println!(
         "  child tid={}, parent tid={} continues without blocking",
         child_tid,
         parent_tid
@@ -2245,7 +2245,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
         let mut b = [0u8; 8];
         machine.copy_from(lin as usize, &mut b);
         let ticks = crate::kernel::dos::Bda::tick_count(machine);
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[DBG] VM86 {:04X}:{:04X} AX={:04X} BX={:04X} CX={:04X} DX={:04X} DS={:04X} SS:SP={:04X}:{:04X} flags={:04X} VIF={} ticks={} code={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
             regs.code_seg(),
             regs.ip32(),
@@ -2303,7 +2303,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
             }
             let _ = inb(0x3DA);
             outb(0x3C0, 0x20); // re-enable display by setting PAS
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[VGA HW] misc={:02X} seq=[{:02X} {:02X} {:02X} {:02X} {:02X}]",
                 misc,
                 seq[0],
@@ -2312,7 +2312,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
                 seq[3],
                 seq[4]
             );
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[VGA HW] gc=[{:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X} {:02X}]",
                 gc[0],
                 gc[1],
@@ -2324,7 +2324,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
                 gc[7],
                 gc[8]
             );
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[VGA HW] ac[10..14]={:02X} {:02X} {:02X} {:02X}  crtc[0C..0F]={:02X} {:02X} {:02X} {:02X}",
                 ac[0x10],
                 ac[0x11],
@@ -2348,7 +2348,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
                 let ch = vga[(row * 80 + col) * 2];
                 line[col] = if (0x20..0x7F).contains(&ch) { ch } else { b'.' };
             }
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[VGA {:02}] {}",
                 row,
                 core::str::from_utf8(&line).unwrap_or("???")
@@ -2356,7 +2356,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
         }
     } else {
         let fl = regs.flags32();
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[DBG] PM CS:EIP={:04x}:{:#010x} SS:ESP={:04x}:{:#010x} EFLAGS={:#010x} VIF={} vIOPL={}",
             regs.code_seg(),
             regs.ip32(),
@@ -2366,7 +2366,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
             (fl >> 19) & 1,
             (fl >> 12) & 3
         );
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[DBG] AX={:08x} BX={:08x} CX={:08x} DX={:08x} SI={:08x} DI={:08x} BP={:08x}",
             regs.rax as u32,
             regs.rbx as u32,
@@ -2376,7 +2376,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
             regs.rdi as u32,
             regs.rbp as u32
         );
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[DBG] DS={:04x} ES={:04x} FS={:04x} GS={:04x}",
             regs.ds as u16,
             regs.es as u16,
@@ -2397,7 +2397,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
 /// requested-but-masked line.
 fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
-    crate::dbg_println!(
+    crate::compact_dbg_println!(
         "[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
         mirr,
         misr,
@@ -2409,7 +2409,7 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 
     let (en, mode, reload, now, next) = dos.pc.vpit.debug_state();
     let delta = (next as i64).wrapping_sub(now as i64);
-    crate::dbg_println!(
+    crate::compact_dbg_println!(
         "[DBG] vpit ch0 en={} mode={} reload={} now={} next={} (next-now={})",
         en,
         mode,
@@ -2438,7 +2438,7 @@ pub fn toggle_profile() {
     if on {
         unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
     }
-    crate::println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
+    crate::compact_println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
 
 pub fn profile_enabled() -> bool {
@@ -2465,7 +2465,7 @@ pub fn toggle_trace() {
         core::ptr::write_volatile(&raw mut SYSCALL_TRACE, v);
         v
     };
-    crate::println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });
+    crate::compact_println!("[trace] syscall tracing {}", if on { "ON" } else { "off" });
 }
 
 pub fn trace_enabled() -> bool {

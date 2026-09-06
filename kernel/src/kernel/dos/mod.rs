@@ -870,7 +870,7 @@ pub fn handle_event<A: crate::Arch>(
                 // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
                 // was delivered against) tell us how the guest got here.
                 let liq = unsafe { mode_transitions::LAST_IRQ };
-                crate::println!("VM86 #GP state: ss:sp={:04x}:{:08x} flags={:#x} vm={} last_irq=vec{:02x} handler={:04x}:{:04x} delivered_at cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
+                crate::compact_println!("VM86 #GP state: ss:sp={:04x}:{:08x} flags={:#x} vm={} last_irq=vec{:02x} handler={:04x}:{:04x} delivered_at cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     regs.stack_seg(), regs.sp32(), regs.flags32(),
                     regs.mode() == crate::UserMode::VM86,
                     liq.0, liq.1, liq.2 as u16, liq.3, liq.4, liq.5, liq.6);
@@ -1085,7 +1085,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     } else {
         dos::load_com(machine, regs, dos_state, &parent, &data, dos_name)
     };
-    crate::dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
+    crate::compact_dbg_println!("exec_dos_into tid={} psp_seg={:04X} cmdtail.len={} cmdtail={:?}",
         tid, loaded.psp_seg, cmdtail.len(),
         core::str::from_utf8(&cmdtail).unwrap_or("<non-utf8>"));
     dos::Psp::set_cmdline(machine, loaded.psp_seg, &cmdtail);
@@ -1343,7 +1343,7 @@ pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A
         let raw = dos.ldt[idx];
         let base = dpmi::desc_base(raw);
         let limit = dpmi::desc_limit(raw);
-        crate::dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
+        crate::compact_dbg_println!("[DBG] LDT {}={:04X} idx={} base={:08X} limit={:08X} raw={:016X}",
             name, sel, idx, base, limit, raw);
     }
     let cs_base = mode_transitions::seg_base(&dos.ldt[..], regs.code_seg());
@@ -1352,7 +1352,7 @@ pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A
     let ip_lin = cs_base.wrapping_add(if cs_32 { regs.ip32() } else { regs.ip32() & 0xFFFF });
     let sp_lin = ss_base.wrapping_add(regs.sp32());
     let _ = machine;
-    crate::dbg_println!("[DBG] code @{:08x} stack @{:08x}", ip_lin, sp_lin);
+    crate::compact_dbg_println!("[DBG] code @{:08x} stack @{:08x}", ip_lin, sp_lin);
 }
 
 /// Queue an arch IRQ into this thread's virtual PIC.
@@ -1820,7 +1820,7 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
         regs.code_seg(), regs.ip32(), regs.err_code, bytes, regs.rax as u32,
         regs.rbx as u32, regs.rsi as u32,
     );
-    crate::println!(
+    crate::compact_println!(
         "[#GP] cs={:04x} base={:#x} limit={:#x} | ds={:04x} base={:#x} limit={:#x}",
         regs.code_seg(), cs_b, cs_l, regs.ds as u16, ds_b, ds_l
     );

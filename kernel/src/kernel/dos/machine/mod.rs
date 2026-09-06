@@ -742,7 +742,7 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
         // Unknown ports read as an unpopulated ISA bus and are logged for missing-device coverage.
         _ => {
             if PORT_TRACE {
-                crate::dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
+                crate::compact_dbg_println!("[port] in  {:04X} -> 0xFF (unhandled)", port);
             }
             0xFF
         }
@@ -869,7 +869,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // Unknown port writes are dropped and logged for missing-device coverage.
         _ => {
             if PORT_TRACE {
-                crate::dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
+                crate::compact_dbg_println!("[port] out {:04X} <- {:02X} (unhandled)", port, val);
             }
         }
     }
@@ -1304,7 +1304,7 @@ pub fn queue_irq<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut
     match event {
         Irq::Key(sc) => {
             if vkbd::KBD_TRACE {
-                crate::dbg_println!("[kbd] raw {:02X}{} e0p={}", sc,
+                crate::compact_dbg_println!("[kbd] raw {:02X}{} e0p={}", sc,
                     if sc & 0x80 != 0 { " REL" } else { "" }, pc.e0_pending as u8);
             }
             let Some((e0, sc)) = normalize_scancode(pc, sc) else { return };
@@ -1389,14 +1389,14 @@ pub fn pick_pending_vec(pc: &mut PcMachine, regs: &mut Regs) -> Option<u8> {
         // instead so we don't keep re-selecting it).
         if !pc.vkbd.has_data() {
             if vkbd::KBD_TRACE {
-                crate::dbg_println!("[kbd] spurious IRQ1 cleared");
+                crate::compact_dbg_println!("[kbd] spurious IRQ1 cleared");
             }
             pc.vpic.clear_request(1);
             regs.frame.rflags &= !VIP;
             return None;
         }
         if vkbd::KBD_TRACE {
-            crate::dbg_println!("[kbd] deliver INT9 sc={:02X}{}",
+            crate::compact_dbg_println!("[kbd] deliver INT9 sc={:02X}{}",
                 pc.vkbd.port60,
                 if pc.vkbd.port60 & 0x80 != 0 { " REL" } else { "" });
         }

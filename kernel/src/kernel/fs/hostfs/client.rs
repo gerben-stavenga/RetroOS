@@ -109,8 +109,8 @@ fn set_link_state(state: u8) {
         return;
     }
     match state {
-        HOSTFS_STATE_CONNECTED => crate::println!("hostfs: connected"),
-        HOSTFS_STATE_DISCONNECTED => crate::println!("hostfs: disconnected"),
+        HOSTFS_STATE_CONNECTED => crate::compact_println!("hostfs: connected"),
+        HOSTFS_STATE_DISCONNECTED => crate::compact_println!("hostfs: disconnected"),
         _ => {}
     }
 }

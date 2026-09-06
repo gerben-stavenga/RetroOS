@@ -12,10 +12,13 @@ Example:
 
 The bytecode contains only two operation shapes:
 
-- 1 through 255, followed by that many UTF-8 literal bytes.
+- 1 through 254, followed by that many UTF-8 literal bytes.
 - 0, followed by a packed presentation byte and an optional width byte.
+- 255, terminating the stream.
 
-Arguments use parallel arrays. One machine word holds each value: integers no
+The trusted bytecode is passed as a terminated pointer, so calls carry no
+slice lengths and the decoder needs no bounds checks. Arguments use parallel
+arrays. One machine word holds each value: integers no
 wider than usize are inline, while strings and wider integers borrow a
 macro-owned temporary. A parallel one-byte ValueTag array describes those
 words. Formatter function pointers and arrays of fat literal slices are absent

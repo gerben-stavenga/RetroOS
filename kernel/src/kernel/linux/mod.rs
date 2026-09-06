@@ -13,7 +13,7 @@
 macro_rules! linux_trace {
     ($($arg:tt)*) => {
         if crate::kernel::startup::trace_enabled() {
-            $crate::dbg_println!($($arg)*);
+            $crate::compact_dbg_println!($($arg)*);
         }
     };
 }
@@ -24,7 +24,7 @@ use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
 use crate::term;
 use crate::Regs;
-use crate::println;
+use crate::compact_println;
 
 // =============================================================================
 // errno constants (positive values; returned as negative)
@@ -373,7 +373,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         355 => sys_getrandom(machine, &mut kt.vcpu, a),
         102 => sys_socketcall(machine, kt, a),
         _ => {
-            println!("unimplemented syscall {}", nr);
+            compact_println!("unimplemented syscall {}", nr);
             SyscallResult::val(-ENOSYS)
         }
     }
@@ -470,7 +470,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         55  => SyscallResult::val(0), // getsockopt — report success (SO_ERROR = 0)
         288 => sys_accept(machine, kt, a.a0, a.a1 as usize, a.a2 as usize), // accept4
         _ => {
-            println!("unimplemented x86_64 syscall {}", nr);
+            compact_println!("unimplemented x86_64 syscall {}", nr);
             SyscallResult::val(-ENOSYS)
         }
     }

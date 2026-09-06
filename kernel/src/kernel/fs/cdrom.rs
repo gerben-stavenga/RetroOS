@@ -263,7 +263,7 @@ pub fn eject() {
         slot.label.clear();
     }
     vfs::mounted_media_changed();
-    crate::println!("CD-ROM: ejected");
+    crate::compact_println!("CD-ROM: ejected");
 }
 
 fn read_cue_file(path: &[u8]) -> Result<Vec<u8>, MediaError> {

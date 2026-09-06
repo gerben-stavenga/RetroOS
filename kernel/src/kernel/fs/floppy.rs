@@ -635,7 +635,7 @@ pub fn eject(drive: usize) {
         state.change_pending = true;
     }
     vfs::mounted_media_changed();
-    crate::println!("Floppy {}: ejected", DRIVE_LETTERS[drive] as char);
+    crate::compact_println!("Floppy {}: ejected", DRIVE_LETTERS[drive] as char);
 }
 
 /// Insert one catalogue entry into a drive's slot: open the image FILE as

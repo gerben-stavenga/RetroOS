@@ -77,7 +77,7 @@ impl VirtualKeyboard {
     /// `try_surface`, on the serial-pacing clock.
     pub fn push(&mut self, scancode: u8) {
         if KBD_TRACE {
-            crate::dbg_println!("[kbd] push {:02X}{} obf={} buf={}",
+            crate::compact_dbg_println!("[kbd] push {:02X}{} obf={} buf={}",
                 scancode, if scancode & 0x80 != 0 { " REL" } else { "" },
                 self.obf as u8, self.depth());
         }
@@ -106,7 +106,7 @@ impl VirtualKeyboard {
         self.obf = true;
         self.last_surface_ns = now_ns;
         if KBD_TRACE {
-            crate::dbg_println!("[kbd] surface {:02X}{} t={} buf={}",
+            crate::compact_dbg_println!("[kbd] surface {:02X}{} t={} buf={}",
                 sc, if sc & 0x80 != 0 { " REL" } else { "" }, now_ns, self.depth());
         }
         true
@@ -121,7 +121,7 @@ impl VirtualKeyboard {
     pub fn read_port60(&mut self) -> u8 {
         let sc = self.port60;
         if KBD_TRACE {
-            crate::dbg_println!("[kbd] read60 -> {:02X}{} (was_obf={} buf={})",
+            crate::compact_dbg_println!("[kbd] read60 -> {:02X}{} (was_obf={} buf={})",
                 sc, if sc & 0x80 != 0 { " REL" } else { "" }, self.obf as u8, self.depth());
         }
         self.obf = false;

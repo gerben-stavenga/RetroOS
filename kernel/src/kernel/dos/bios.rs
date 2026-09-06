@@ -221,7 +221,7 @@ macro_rules! bda_field {
 /// identical values — the layering matches a real machine (BIOS first, DOS
 /// on top). This is deliberately identical with or without a platform ROM.
 pub(super) fn install<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
-    crate::dbg_println!("DOS: installing substitute BIOS (vga_passthrough={})",
+    crate::compact_dbg_println!("DOS: installing substitute BIOS (vga_passthrough={})",
         crate::kernel::platform::get().vga_passthrough);
     // Vectors with a real service keep their own stub (slot index == vector);
     // everything unserviced shares ONE dummy cell, exactly like a real BIOS

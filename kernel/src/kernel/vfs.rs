@@ -456,7 +456,7 @@ impl Vfs {
             if binding.prefix.len() != best { continue; }
             let Some(start) = match_prefix(binding.prefix, path) else { continue };
             if visited == MAX_UNION {
-                crate::dbg_println!(
+                crate::compact_dbg_println!(
                     "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
                 break;
             }
@@ -549,7 +549,7 @@ impl Vfs {
             if b.prefix.len() != best { continue; }
             let Some(start) = match_prefix(b.prefix, path) else { continue };
             if n == MAX_UNION {
-                crate::dbg_println!(
+                crate::compact_dbg_println!(
                     "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
                 break;
             }

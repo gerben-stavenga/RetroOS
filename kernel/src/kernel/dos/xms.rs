@@ -6,7 +6,7 @@
 use crate::Regs;
 use crate::kernel::dos::linear;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
-use crate::dbg_println;
+use crate::compact_dbg_println;
 use crate::kernel::thread;
 
 const MAX_XMS_HANDLES: usize = 16;
@@ -464,7 +464,7 @@ pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A) {
     let mut umb_count = 0u32;
     let mut t = umb_free;
     while t != 0 { umb_count += 1; t &= t - 1; }
-    dbg_println!("UMA: EMS frame at {:05X}, UMB {}KB free", ems_base * 0x1000, umb_count * 4);
+    compact_dbg_println!("UMA: EMS frame at {:05X}, UMB {}KB free", ems_base * 0x1000, umb_count * 4);
 }
 
 /// Find `count` contiguous set bits in `bitmap`, preferring `hint` offset.

@@ -13,5 +13,5 @@ rust_library(
         "-Crelocation-model=static",
         "-Cforce-frame-pointers=yes",
     ],
-    deps = ["//arch-abi", "//lib"],
+    deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
 )

@@ -15,7 +15,7 @@
 use spin::Mutex;
 use crate::kernel::block::Disk;
 use crate::kernel::pci;
-use lib::println;
+use lib::compact_println;
 
 /// Kernel VA for the controller registers (BAR0): 4 pages is ample — the
 /// doorbells for qid 0/1 sit just past offset 0x1000 even at max stride.
@@ -182,7 +182,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     // IOCQES=4 (16B), IOSQES=6 (64B), MPS=0 (4K), CSS=0 (NVM), EN=1.
     w32(R_CC, (4 << 20) | (6 << 16) | 1);
     if !wait_csts(1) {
-        println!("NVMe: controller did not become ready (csts={:#x})", r32(R_CSTS));
+        compact_println!("NVMe: controller did not become ready (csts={:#x})", r32(R_CSTS));
         return None;
     }
 
@@ -205,7 +205,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     set_prp1(&mut c, dma_phys + IDENT_OFF as u64);
     // cdw10 = CNS 0 (namespace data structure)
     if n.admin.exec(&c) != 0 {
-        println!("NVMe: IDENTIFY failed");
+        compact_println!("NVMe: IDENTIFY failed");
         return None;
     }
     let ident = DMA_VA + IDENT_OFF;
@@ -216,7 +216,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
         core::ptr::read_volatile((ident + 128 + flbas as usize * 4 + 2) as *const u8)
     };
     if lbads != 9 {
-        println!("NVMe: unsupported LBA size 2^{} (want 512)", lbads);
+        compact_println!("NVMe: unsupported LBA size 2^{} (want 512)", lbads);
         return None;
     }
 
@@ -226,7 +226,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     c[10] = ((DEPTH as u32 - 1) << 16) | 1; // qsize | qid
     c[11] = 1; // physically contiguous, no interrupts
     if n.admin.exec(&c) != 0 {
-        println!("NVMe: create IO CQ failed");
+        compact_println!("NVMe: create IO CQ failed");
         return None;
     }
     let mut c = cmd(0x01, 0);
@@ -234,7 +234,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     c[10] = ((DEPTH as u32 - 1) << 16) | 1;
     c[11] = (1 << 16) | 1; // CQID 1 | physically contiguous
     if n.admin.exec(&c) != 0 {
-        println!("NVMe: create IO SQ failed");
+        compact_println!("NVMe: create IO SQ failed");
         return None;
     }
 
@@ -245,7 +245,7 @@ fn wait_csts(ready: u32) -> bool {
     for _ in 0..10_000_000u32 {
         let csts = r32(R_CSTS);
         if csts & 2 != 0 {
-            println!("NVMe: controller fatal status");
+            compact_println!("NVMe: controller fatal status");
             return false;
         }
         if csts & 1 == ready {

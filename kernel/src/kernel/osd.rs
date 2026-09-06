@@ -181,7 +181,7 @@ pub fn configure_master_volume(raw: Option<&[u8]>) {
         Some(raw) => match parse_volume_percent(raw) {
             Some(value) => value,
             None => {
-                crate::println!(
+                crate::compact_println!(
                     "audio: invalid AUDIO_VOLUME={}",
                     core::str::from_utf8(raw).unwrap_or("<non-UTF8>")
                 );

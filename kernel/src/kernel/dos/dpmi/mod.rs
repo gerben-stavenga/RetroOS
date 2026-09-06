@@ -215,7 +215,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
     let dpmi = match dos.dpmi.as_mut() {
         Some(d) => d,
         None => {
-            crate::println!("DPMI: INT 31h from client but no DPMI state!");
+            crate::compact_println!("DPMI: INT 31h from client but no DPMI state!");
             set_carry(regs);
             return thread::KernelAction::Done;
         }

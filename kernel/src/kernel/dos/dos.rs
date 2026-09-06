@@ -726,7 +726,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                 }
                 n
             };
-            crate::dbg_println!("synth_fork_exec entry: ds={:04X} dx={:04X} es={:04X} bx={:04X}",
+            crate::compact_dbg_println!("synth_fork_exec entry: ds={:04X} dx={:04X} es={:04X} bx={:04X}",
                 regs.ds as u16, regs.rdx as u16, regs.es as u16, regs.rbx as u16);
             let mut filename = [0u8; 128];
             let flen = read_asciiz(regs.ds as u16, regs.rdx as u32, &mut filename);
@@ -874,7 +874,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             // farewell over whatever the program left on screen.
             let screen = lib::term::term();
             screen.clear();
-            crate::screenln!(screen, "It is now safe to turn off your computer.");
+            crate::compact_screenln!(screen, "It is now safe to turn off your computer.");
             if crate::kernel::platform::get().host == crate::kernel::platform::Host::Metal {
                 machine.halt_forever();
             }

@@ -66,14 +66,14 @@ pub(in crate::kernel::dos) fn callback_entry<A: crate::Arch>(machine: &mut A, do
     let cb = match dos.dpmi.as_ref() {
         Some(d) => d.callbacks[cb_idx],
         None => {
-            crate::println!("DPMI: callback entry but no DPMI state!");
+            crate::compact_println!("DPMI: callback entry but no DPMI state!");
             return;
         }
     };
     let (pm_cs, pm_eip, rm_struct_sel, rm_struct_off) = match cb {
         Some(cb) => cb,
         None => {
-            crate::println!("DPMI: callback {} not allocated!", cb_idx);
+            crate::compact_println!("DPMI: callback {} not allocated!", cb_idx);
             return;
         }
     };

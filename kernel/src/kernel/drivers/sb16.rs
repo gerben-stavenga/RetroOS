@@ -178,7 +178,7 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
     let dsp_major = dsp_version_major(machine, base);
     let is_sb16 = dsp_major >= 4;
     let Some(w) = (if is_sb16 { Some(read_wiring(machine, base)) } else { declared }) else {
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "sb: DSP {}.x at {:#05x} — pre-SB16 straps are invisible to software; declare them as \
              `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS. Running without the card.",
             dsp_major, base
@@ -191,7 +191,7 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
     // say so, and mint the truth. After this, `dma16.is_some()` cannot lie.
     let dma16 = match (is_sb16, w.dma16) {
         (false, Some(h)) => {
-            crate::println!(
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                 "sb: DSP {}.x has no 16-bit DMA channel — ignoring the declared HDMA{}",
                 dsp_major, h
             );
@@ -356,7 +356,7 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<u32> {
     // window so the kernel can write PCM; the DSP reads it by physical address.
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
     if phys_page == 0 {
-        crate::println!("sb16: no channel-{} DMA buffer — output is silent", DMA_CHANNEL);
+        crate::compact_println!("sb16: no channel-{} DMA buffer — output is silent", DMA_CHANNEL);
         return None;
     }
     let pages = RING_BYTES.div_ceil(0x1000);
@@ -370,7 +370,7 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<u32> {
     machine.outb(card.base + MIX_DATA, 0xFF); // full
     dsp_write_at(machine, card.base, CMD_SPEAKER_ON);
 
-    crate::println!("sb16: sink on {:#05x}, DMA {}", card.base, DMA_CHANNEL);
+    crate::compact_println!("sb16: sink on {:#05x}, DMA {}", card.base, DMA_CHANNEL);
     Some(dma_phys)
 }
 
@@ -428,7 +428,7 @@ impl sound::sink::Device for Sb16 {
         dsp_write(self.base, MODE_SIGNED_STEREO);
         dsp_write(self.base, (block_samples - 1) as u8);
         dsp_write(self.base, ((block_samples - 1) >> 8) as u8);
-        crate::println!(
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "sb16: stream RUN base={:#05x} ring={} block={}",
             self.base,
             RING_BYTES,

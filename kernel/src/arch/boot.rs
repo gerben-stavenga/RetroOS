@@ -124,7 +124,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
     // on so its mutable state is borrow-checked rather than global. Lives for
     // the rest of the kernel's life (startup never returns).
     let mut machine = arch::Metal;
-    lib::screenln!(lib::term::term(), "Heap base: {:#x}", arch::heap_base());
+    lib::compact_screenln!(lib::term::term(), "Heap base: {:#x}", arch::heap_base());
     crate::kernel::startup::startup(&mut machine, config);
 }
 
@@ -225,11 +225,11 @@ unsafe fn prepare_boot(
     // kernel text needs that value; ambient println! stays log-only throughout.
     let screen = lib::term::term();
 
-    lib::screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
+    lib::compact_screenln!(screen, "\x1b[96mRetroOS Rust Kernel\x1b[0m");
 
     paging2::finish_setup_paging();
 
-    lib::screenln!(screen, "kernel_phys: {:#x}", KERNEL_PHYS);
+    lib::compact_screenln!(screen, "kernel_phys: {:#x}", KERNEL_PHYS);
 
     let kernel_low_page = (KERNEL_PHYS / PAGE_SIZE) as u64;
     let kernel_high_page = (KERNEL_PHYS + kernel_size).div_ceil(PAGE_SIZE) as u64;
@@ -257,14 +257,14 @@ unsafe fn prepare_boot(
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
 
-    lib::screenln!(screen, "Physical memory: {:#x} pages free", phys_mm::free_page_count());
+    lib::compact_screenln!(screen, "Physical memory: {:#x} pages free", phys_mm::free_page_count());
 
-    lib::screenln!(screen, "Memory regions: {}", mmap_count);
+    lib::compact_screenln!(screen, "Memory regions: {}", mmap_count);
     for entry in mmap_entries {
         if entry.typ == 1 {
             let base = entry.base;
             let length = entry.length;
-            lib::screenln!(screen, "  Available: {:#x} - {:#x}", base, base + length);
+            lib::compact_screenln!(screen, "  Available: {:#x} - {:#x}", base, base + length);
         }
     }
 
@@ -276,7 +276,7 @@ unsafe fn prepare_boot(
     crate::fbcon::init(info, screen);
 
     irq::init_interrupts();
-    lib::screenln!(screen, "Interrupts initialized");
+    lib::compact_screenln!(screen, "Interrupts initialized");
 
     // The compat-mode switch was a test harness to force the experimental
     // x64/long-mode path — the kernel normally runs PAE 32-bit. On a real CPU
@@ -289,7 +289,7 @@ unsafe fn prepare_boot(
         let saved = paging2::ensure_trampoline_mapped();
         descriptors::toggle_mode(paging2::toggle_cr3(true));
         paging2::clear_trampoline(saved);
-        lib::screenln!(screen, "Switched to Compat mode");
+        lib::compact_screenln!(screen, "Switched to Compat mode");
     }
 
     // Interrupts are enabled by `enter_ring1` (it sets IF in the IRET frame it
@@ -303,10 +303,10 @@ unsafe fn prepare_boot(
     let astack_guard = (&raw const crate::ARCH_STACK_GUARD) as usize;
     paging2::unmap_kernel_page(kstack_guard);
     paging2::unmap_kernel_page(astack_guard);
-    lib::screenln!(screen, "Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
+    lib::compact_screenln!(screen, "Stack guards at {:#x} (kernel) {:#x} (arch)", kstack_guard, astack_guard);
 
     lib::screenln!(screen);
-    lib::screenln!(screen, "\x1b[92mHello from Rust kernel!\x1b[0m");
+    lib::compact_screenln!(screen, "\x1b[92mHello from Rust kernel!\x1b[0m");
 
     // Complete the boot configuration with loader-owned module data now that
     // the later handoff has produced it.
@@ -321,7 +321,7 @@ unsafe fn prepare_boot(
 
     descriptors::enter_ring1();
 
-    lib::screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
+    lib::compact_screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
 
     let dst = (&raw mut BOOT_CONFIG).cast::<crate::BootConfig>();
     unsafe {
@@ -409,12 +409,12 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     let screen = lib::term::term();
     screen.clear();
 
-    lib::screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
+    lib::compact_screenln!(screen, "\x1b[91m!!! KERNEL PANIC !!!\x1b[0m");
     lib::screenln!(screen, "{}", crate::build_info::VersionBanner);
     if let Some(location) = info.location() {
-        lib::screenln!(screen, "at {}:{}", location.file(), location.line());
+        lib::compact_screenln!(screen, "at {}:{}", location.file(), location.line());
     } else {
-        lib::screenln!(screen, "at <unknown location>");
+        lib::compact_screenln!(screen, "at <unknown location>");
     }
     lib::screenln!(screen, "  {}", info.message());
     lib::screenln!(screen);

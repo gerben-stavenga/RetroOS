@@ -7,7 +7,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::vec;
-use crate::println;
+use crate::compact_println;
 use core::fmt::Write;
 use crate::kernel::vfs;
 #[cfg(target_arch = "x86")]
@@ -108,12 +108,12 @@ pub fn init_from_vfs() {
     let sym = [crate::kernel::dos::c_root(), b"BOOT/KERNEL.SYM"].concat();
     let handle = vfs::open_to_handle(&sym);
     if handle < 0 {
-        println!("stacktrace: no KERNEL.SYM — backtraces will be addresses only");
+        compact_println!("stacktrace: no KERNEL.SYM — backtraces will be addresses only");
         return;
     }
     let size = vfs::file_size_by_handle(handle) as usize;
 
-    println!("Loading kernel symbols ({} bytes)", size);
+    compact_println!("Loading kernel symbols ({} bytes)", size);
 
     let mut elf_data = vec![0u8; size];
     vfs::read_by_handle(handle, &mut elf_data);
@@ -123,13 +123,13 @@ pub fn init_from_vfs() {
 
     match SymbolData::new(elf_box) {
         Some(data) => {
-            println!("Loaded {} function symbols", data.count);
+            compact_println!("Loaded {} function symbols", data.count);
             unsafe {
                 *kernel_symbols_ptr() = Some(data);
             }
         }
         None => {
-            println!("stacktrace: invalid KERNEL.SYM");
+            compact_println!("stacktrace: invalid KERNEL.SYM");
         }
     }
 }

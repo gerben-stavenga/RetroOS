@@ -70,7 +70,7 @@ impl Gus {
         // One line per program launch: which wiring this program's GUS got.
         // The counterpart of DMX's own "GUS1/GUS2 vs ain't responding" —
         // together they answer every "why is there no GUS music" report.
-        crate::dbg_println!(
+        crate::compact_dbg_println!(
             "[gus] ULTRASND base={:03X} irq={} dma={}",
             self.base, self.irq, self.dma_ch
         );
@@ -140,7 +140,7 @@ impl Gus {
         let v = self.card.port_in(p);
         let (reg, voice) = self.card.sel();
         if super::PORT_TRACE {
-            crate::dbg_println!("[gus] in  {:03X} -> {:02X} (reg {:02X}v{})", p, v, reg, voice);
+            crate::compact_dbg_println!("[gus] in  {:03X} -> {:02X} (reg {:02X}v{})", p, v, reg, voice);
         }
         gus_ring_record(false, p, v, reg, voice);
         v
@@ -150,7 +150,7 @@ impl Gus {
     pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
         let (reg, voice) = self.card.sel();
         if super::PORT_TRACE {
-            crate::dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, reg, voice);
+            crate::compact_dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, reg, voice);
         }
         gus_ring_record(true, p, val, reg, voice);
         self.card.port_out(p, val);
@@ -256,11 +256,11 @@ pub fn dump_gus_ring() {
     unsafe {
         let pos = GUS_RING_POS;
         let n = pos.min(GUS_RING_LEN);
-        crate::dbg_println!("[GUSRING] {} accesses total, showing last {}", pos, n);
+        crate::compact_dbg_println!("[GUSRING] {} accesses total, showing last {}", pos, n);
         for k in 0..n {
             let i = (pos - n + k) % GUS_RING_LEN;
             let e = GUS_RING[i];
-            crate::dbg_println!(
+            crate::compact_dbg_println!(
                 "[GUSRING] #{:03} {} {:03X} {}={:02X} reg={:02X} v={:02X} irq={}",
                 pos - n + k, if e.write { "OUT" } else { "IN " }, e.port,
                 if e.write { "val" } else { "->" }, e.val, e.reg_sel, e.voice_sel,

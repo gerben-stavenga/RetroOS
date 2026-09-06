@@ -112,24 +112,24 @@ fn verify_kernel_cpu_hash<A: crate::Arch>(k: &thread::KernelThread<A>, tag: &str
     if k.cpu_hash == 0 { return; }
     let actual = thread::hash_regs(&k.vcpu.regs);
     if actual == k.cpu_hash { return; }
-    crate::println!(
+    crate::compact_println!(
         "\x1b[91mCPU STATE CORRUPTION [{}] tid={} expected={:#018x} actual={:#018x}\x1b[0m",
         tag, k.tid, k.cpu_hash, actual,
     );
     let r = &k.vcpu.regs;
-    crate::println!(
+    crate::compact_println!(
         "  cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x} flags={:08x}",
         r.code_seg(), r.ip32(), r.stack_seg(), r.sp32(), r.flags32(),
     );
-    crate::println!(
+    crate::compact_println!(
         "  ds={:04x} es={:04x} fs={:04x} gs={:04x}",
         r.ds as u16, r.es as u16, r.fs as u16, r.gs as u16,
     );
-    crate::println!(
+    crate::compact_println!(
         "  eax={:08x} ebx={:08x} ecx={:08x} edx={:08x}",
         r.rax as u32, r.rbx as u32, r.rcx as u32, r.rdx as u32,
     );
-    crate::println!(
+    crate::compact_println!(
         "  esi={:08x} edi={:08x} ebp={:08x} int={:02x} err={:08x}",
         r.rsi as u32, r.rdi as u32, r.rbp as u32, r.int_num as u32, r.err_code as u32,
     );

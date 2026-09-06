@@ -6,7 +6,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
     let idx = sel_to_idx(sel);
     if idx < LDT_ENTRIES {
         let desc = dos.ldt[idx];
-        crate::println!(
+        crate::compact_println!(
             "  {} {:04X}: base={:08X} limit={:08X} raw={:016X}",
             label,
             sel,
@@ -15,7 +15,7 @@ fn dump_selector<A: crate::Arch>(label: &str, dos: &thread::DosState<A>, sel: u1
             desc,
         );
     } else {
-        crate::println!("  {} {:04X}: outside LDT", label, sel);
+        crate::compact_println!("  {} {:04X}: outside LDT", label, sel);
     }
 }
 
@@ -23,7 +23,7 @@ fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Reg
     let cs_base = seg_base(&dos.ldt[..], regs.code_seg());
     let ip_addr = cs_base.wrapping_add(regs.ip32());
 
-    crate::println!(
+    crate::compact_println!(
         "[DPMI-FAULT] exc={} at {:04X}:{:08X} err={:04X} AX={:08X} BX={:08X} CX={:08X} DX={:08X} SI={:08X} DI={:08X} BP={:08X}",
         exc_num,
         regs.code_seg(),
@@ -37,7 +37,7 @@ fn dump_dpmi_fault_context<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Reg
         regs.rdi as u32,
         regs.rbp as u32,
     );
-    crate::println!(
+    crate::compact_println!(
         "  DS={:04X} ES={:04X} FS={:04X} GS={:04X} SS:SP={:04X}:{:08X} code@{:08X}",
         regs.ds as u16,
         regs.es as u16,
@@ -231,7 +231,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
                 regs.ip32(), regs.code_seg(), handler_flags);
             return mode_transitions::reflect_int_to_real_mode(machine, dos, regs, exc_num as u8);
         }
-        crate::println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
+        crate::compact_println!("DPMI: exception {} at CS:EIP={:#06x}:{:#x} err={:#x}, no handler",
             exc_num, regs.frame.cs as u16, regs.ip32(), regs.err_code);
         dump_dpmi_fault_context(dos, regs, exc_num);
         startup::arch_dump_exception(machine, dos, regs);
@@ -265,7 +265,7 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
     // `exception_return` pops.
     let depth = dos.dpmi.as_ref().map_or(0, |d| d.exc_depth) as u32;
     if depth >= dos::EXC_STACK_TOP / dos::EXC_STACK_SLOT {
-        crate::println!("DPMI: exception {} at {:04x}:{:#x} — nesting depth {} exceeds the exception-stack region",
+        crate::compact_println!("DPMI: exception {} at {:04x}:{:#x} — nesting depth {} exceeds the exception-stack region",
             exc_num, f_cs, f_eip, depth);
         return thread::KernelAction::Exit(0x0200 | (exc_num as i32 & 0xFF));
     }

@@ -2234,18 +2234,18 @@ pub fn handle_event<A: crate::Arch>(
                 .copied()
                 .find(|g| g.return_ip == regs.ip32())
             else {
-                crate::println!("Windows: invalid API gate at {:#x}", regs.ip32());
+                crate::compact_println!("Windows: invalid API gate at {:#x}", regs.ip32());
                 return thread::KernelAction::Exit(-1);
             };
             if gate.api == Api::ExitProcess {
                 return thread::KernelAction::Exit(arg(machine, regs, 0) as i32);
             }
             if crate::kernel::startup::trace_enabled() {
-                crate::dbg_println!("[win32] {}", core::str::from_utf8(gate.name).unwrap_or("?"));
+                crate::compact_dbg_println!("[win32] {}", core::str::from_utf8(gate.name).unwrap_or("?"));
             }
             if gate.api == Api::RetroWndProcReturn {
                 let Some(callback) = state.callback.take() else {
-                    crate::dbg_println!("Windows: stray WNDPROC return");
+                    crate::compact_dbg_println!("Windows: stray WNDPROC return");
                     return thread::KernelAction::Exit(-1);
                 };
                 let result = regs.rax as u32;
