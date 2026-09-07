@@ -193,6 +193,10 @@ impl Disk for CachedDisk {
         self.inner.write(lba, buffer)
     }
 
+    fn flush(&self) {
+        self.inner.flush();
+    }
+
     fn sectors(&self) -> u64 {
         self.inner.sectors()
     }
@@ -215,6 +219,7 @@ mod tests {
     struct MemoryDisk {
         bytes: RefCell<Vec<u8>>,
         reads: Cell<u32>,
+        flushes: Cell<u32>,
     }
 
     impl Disk for MemoryDisk {
@@ -235,6 +240,8 @@ mod tests {
             buffer.len().div_ceil(512) as u32
         }
 
+        fn flush(&self) { self.flushes.set(self.flushes.get() + 1); }
+
         fn sectors(&self) -> u64 { self.bytes.borrow().len().div_ceil(512) as u64 }
         fn name(&self) -> &str { "cache-test" }
     }
@@ -244,6 +251,7 @@ mod tests {
         let inner = Box::leak(Box::new(MemoryDisk {
             bytes: RefCell::new((0..8192).map(|offset| offset as u8).collect()),
             reads: Cell::new(0),
+            flushes: Cell::new(0),
         }));
         let cache = CachedDisk::wrap(inner);
 
@@ -262,6 +270,8 @@ mod tests {
         assert_eq!(cache.read(0, &mut changed), 1);
         assert_eq!(changed, [0xaa; 512]);
         assert_eq!(inner.reads.get(), 3);
+        cache.flush();
+        assert_eq!(inner.flushes.get(), 1);
     }
 
     #[test]
@@ -270,6 +280,7 @@ mod tests {
         let inner = Box::leak(Box::new(MemoryDisk {
             bytes: RefCell::new(vec![0; page_count * PAGE_SIZE]),
             reads: Cell::new(0),
+            flushes: Cell::new(0),
         }));
         let cache = CachedDisk::wrap(inner);
         let mut sector = [0; 512];
@@ -294,6 +305,7 @@ mod tests {
         let inner = Box::leak(Box::new(MemoryDisk {
             bytes: RefCell::new(vec![0; (PROTECTED_LIMIT + 1) * PAGE_SIZE]),
             reads: Cell::new(0),
+            flushes: Cell::new(0),
         }));
         let cache = CachedDisk::wrap(inner);
         let mut sector = [0; 512];

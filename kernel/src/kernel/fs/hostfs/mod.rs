@@ -69,7 +69,7 @@ impl Filesystem for HostFs {
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
         if !ensure_ready() {
-            return HOSTFS_IO_ERROR;
+            return 0;
         }
         let mut total = 0usize;
         while total < buf.len() {
@@ -256,11 +256,12 @@ impl Filesystem for HostFs {
     /// Tclunk: tell the host to free the server-side fid. Fire-and-forget (the
     /// server sends no reply). The VFS currently shares fids through its path
     /// cache, so there is no safe per-close clunk point yet.
-    fn clunk(&self, handle: u64) {
+    fn clunk(&self, handle: u64) -> i32 {
         if !ensure_ready() {
-            return;
+            return HOSTFS_IO_ERROR;
         }
         let _ = close(handle);
+        0
     }
 
     fn mkdir(&self, path: &[u8]) -> i32 {

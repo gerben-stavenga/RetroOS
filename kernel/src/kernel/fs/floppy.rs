@@ -418,12 +418,13 @@ impl Filesystem for FloppySlot {
         path_str(path).is_some_and(|p| media.root_dir().open_dir(p).is_ok())
     }
 
-    fn clunk(&self, handle: u64) {
+    fn clunk(&self, handle: u64) -> i32 {
         let (generation, inner) = split_handle(handle);
         let mut state = self.state.lock();
         if generation == state.generation {
             state.opens.remove(&inner);
         }
+        0
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {

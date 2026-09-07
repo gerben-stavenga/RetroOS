@@ -250,13 +250,13 @@ impl Disk for AtaDisk {
             }
         }
 
-        // Flush the drive's write cache so the data is durable before we
-        // report success.
+        count
+    }
+
+    fn flush(&self) {
         self.wait_ready();
         outb(self.base + reg::COMMAND, cmd::CACHE_FLUSH);
         self.wait_ready();
-
-        count
     }
 
     fn sectors(&self) -> u64 {

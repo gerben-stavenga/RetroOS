@@ -178,7 +178,7 @@ pub trait Filesystem {
     /// handle owns no per-open resource (TarFs's archive offset). Backends that
     /// allocate per-open server state — an ext inode, hostfs's COM1 /
     /// native fid, a future 9P client — override this to free it.
-    fn clunk(&self, _handle: u64) {}
+    fn clunk(&self, _handle: u64) -> i32 { 0 }
 
     /// Remove a file by path (Tremove). Default = -1 (read-only / unsupported).
     fn remove(&self, _path: &[u8]) -> i32 { -1 }
@@ -743,17 +743,18 @@ impl Vfs {
     /// fid is clunked exactly once, when the last of them closes; two
     /// independent opens of the same path hold distinct fids and clunk
     /// independently.
-    fn close_handle(&mut self, idx: i32) {
-        if idx < 0 || (idx as usize) >= self.file_table.len() { return; }
+    fn close_handle(&mut self, idx: i32) -> i32 {
+        if idx < 0 || (idx as usize) >= self.file_table.len() { return -9; }
         let i = idx as usize;
-        if self.file_table[i].refcount == 0 { return; }
+        if self.file_table[i].refcount == 0 { return -9; }
         self.file_table[i].refcount -= 1;
         if self.file_table[i].refcount == 0 {
             self.locks.retain(|l| l.owner != idx);
             let handle = self.file_table[i].vnode.handle;
             let midx = self.file_table[i].mount_idx;
-            self.mount_fs(midx).clunk(handle);
+            return self.mount_fs(midx).clunk(handle);
         }
+        0
     }
 
     fn add_ref(&mut self, idx: i32) {
@@ -1567,8 +1568,7 @@ pub fn close(fd: i32, fds: &mut [FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
         Ok(handle) => {
             fds[fd as usize] = FdKind::None;
-            close_vfs_handle(handle);
-            0
+            close_vfs_handle(handle)
         }
         Err(e) => e,
     }
@@ -1806,8 +1806,8 @@ pub fn close_dir_handle(idx: i32) {
 }
 
 /// Decrement refcount for a VFS file table entry (Linux FdKind::Vfs close).
-pub fn close_vfs_handle(idx: i32) {
-    VFS.lock().close_handle(idx);
+pub fn close_vfs_handle(idx: i32) -> i32 {
+    VFS.lock().close_handle(idx)
 }
 
 /// Increment refcount for a VFS file table entry (Linux fork/dup).

@@ -23,6 +23,8 @@ pub trait Disk {
     fn read(&self, lba: u64, buf: &mut [u8]) -> u32;
     /// Write `buf.len().div_ceil(512)` sectors at `lba`. Returns sectors written.
     fn write(&self, lba: u64, buf: &[u8]) -> u32;
+    /// Complete earlier writes before later writes are issued.
+    fn flush(&self) {}
     /// Capacity in 512-byte sectors.
     fn sectors(&self) -> u64;
     /// Stable short name for logs and mount points: "ata0", "nvme0n1".
@@ -97,6 +99,10 @@ impl Volume {
             return 0;
         }
         self.disk.write(self.start + lba, &buf[..n])
+    }
+
+    pub fn flush(&self) {
+        self.disk.flush();
     }
 }
 

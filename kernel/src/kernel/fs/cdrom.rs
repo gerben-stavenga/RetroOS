@@ -24,11 +24,11 @@ const MAX_CUE_BYTES: u32 = 1024 * 1024;
 
 /// Runtime drive-speed model selected in the OSD. Index zero means no
 /// throttling; the remaining entries model the original 150 KiB/s CD-ROM
-/// multiples. Keep 2x as the default for compatibility with the installer
-/// timing that motivated the model.
+/// multiples. The virtual drive is unthrottled by default; original-drive
+/// speeds remain selectable in the debug OSD for timing-sensitive software.
 const SPEED_BYTES_PER_SECOND: [u64; 4] = [0, 150 * 1024, 300 * 1024, 600 * 1024];
 const SPEED_LABELS: [&[u8]; 4] = [b"None", b"1x", b"2x", b"4x"];
-const DEFAULT_SPEED: u32 = 2;
+const DEFAULT_SPEED: u32 = 0;
 static SPEED: AtomicU32 = AtomicU32::new(DEFAULT_SPEED);
 
 fn speed_index() -> usize {
@@ -153,14 +153,15 @@ impl Filesystem for CdSlot {
             .is_some_and(|media| media.dir_exists(path))
     }
 
-    fn clunk(&self, handle: u64) {
+    fn clunk(&self, handle: u64) -> i32 {
         let (generation, inner) = split_handle(handle);
         let state = self.state.lock();
         if generation == state.generation
             && let Some(media) = state.media.as_ref()
         {
-            media.clunk(inner);
+            return media.clunk(inner);
         }
+        0
     }
 
     fn write(&self, _handle: u64, _offset: u32, _data: &[u8]) -> i32 {

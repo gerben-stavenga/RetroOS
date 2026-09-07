@@ -115,8 +115,9 @@ impl Filesystem for InjectedHostFs {
         (backend().write)(handle, offset, data)
     }
 
-    fn clunk(&self, handle: u64) {
-        (backend().clunk)(handle)
+    fn clunk(&self, handle: u64) -> i32 {
+        (backend().clunk)(handle);
+        0
     }
 
     fn remove(&self, path: &[u8]) -> i32 {

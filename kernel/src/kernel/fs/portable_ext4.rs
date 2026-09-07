@@ -16,6 +16,11 @@ const TYPE_MASK: u16 = 0xf000;
 const TYPE_NODE: u16 = 0x4000;
 const TYPE_BLOB: u16 = 0x8000;
 const TYPE_SYMLINK: u16 = 0xa000;
+// DOS copy loops commonly issue 8 KiB writes. Committing each as a separate
+// JBD2 transaction costs five durability barriers; group a bounded sequential
+// run and commit it on close, explicit flush, a conflicting write, or any
+// operation that must observe the new inode contents.
+const WRITE_BATCH_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeError {
@@ -116,6 +121,7 @@ impl Storage for VolumeStorage {
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
+        self.volume.flush();
         Ok(())
     }
 }
@@ -164,6 +170,12 @@ struct MountedExt4 {
     storage: VolumeStorage,
 }
 
+struct PendingWrite {
+    blob: Blob,
+    offset: u64,
+    bytes: Vec<u8>,
+}
+
 impl MountedExt4 {
     fn parts(&mut self) -> (&mut HandleFilesystem, &mut VolumeStorage) {
         (&mut self.filesystem, &mut self.storage)
@@ -173,6 +185,7 @@ impl MountedExt4 {
 pub struct PortableExt4Fs {
     mounted: RefCell<MountedExt4>,
     open: RefCell<OpenFiles>,
+    pending: RefCell<Option<PendingWrite>>,
 }
 
 impl PortableExt4Fs {
@@ -186,7 +199,17 @@ impl PortableExt4Fs {
                 storage,
             }),
             open: RefCell::new(OpenFiles::default()),
+            pending: RefCell::new(None),
         })
+    }
+
+    fn flush_pending(&self) -> Result<(), Error> {
+        let Some(pending) = self.pending.borrow_mut().take() else {
+            return Ok(());
+        };
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem.write(storage, pending.blob, pending.offset, &pending.bytes)
     }
 
     fn path(path: &[u8]) -> Option<&[u8]> {
@@ -229,10 +252,12 @@ impl PortableExt4Fs {
     }
 
     fn resolve(&self, path: &[u8]) -> Result<ObjectInfo, Error> {
+        self.flush_pending()?;
         Self::resolve_in(&mut self.mounted.borrow_mut(), path)
     }
 
     fn parent_edge(&self, path: &[u8]) -> Result<(Node, LocatedEdge), Error> {
+        self.flush_pending()?;
         let (parent_path, name) = Self::split_parent(path).ok_or(Error::InvalidArgument)?;
         let mut mounted = self.mounted.borrow_mut();
         let parent = Self::resolve_in(&mut mounted, parent_path)?
@@ -264,6 +289,7 @@ impl PortableExt4Fs {
         if !Self::is_symlink(info) {
             return None;
         }
+        self.flush_pending().ok()?;
         let count = output.len().min(info.size as usize);
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
@@ -279,6 +305,7 @@ impl PortableExt4Fs {
         output: &mut Vec<DirEntry>,
         max: usize,
     ) -> Option<u64> {
+        self.flush_pending().ok()?;
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         let mut appended = 0;
@@ -325,6 +352,7 @@ pub fn is_linux_root(volume: &Volume) -> bool {
 
 impl Filesystem for PortableExt4Fs {
     fn root_node(&self) -> Option<u64> {
+        self.flush_pending().ok()?;
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         filesystem
@@ -338,6 +366,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn open_node(&self, node: u64) -> Option<Vnode> {
+        self.flush_pending().ok()?;
         let object = Object::from_opaque(node)?;
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
@@ -347,6 +376,7 @@ impl Filesystem for PortableExt4Fs {
     }
 
     fn readlink_node(&self, node: u64, output: &mut [u8]) -> Option<usize> {
+        self.flush_pending().ok()?;
         let object = Object::from_opaque(node)?;
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
@@ -387,6 +417,9 @@ impl Filesystem for PortableExt4Fs {
         let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;
         };
+        if self.flush_pending().is_err() {
+            return -5;
+        }
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         filesystem
@@ -398,11 +431,49 @@ impl Filesystem for PortableExt4Fs {
         let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;
         };
-        let mut mounted = self.mounted.borrow_mut();
-        let (filesystem, storage) = mounted.parts();
-        filesystem
-            .write(storage, blob, u64::from(offset), input)
-            .map_or(-5, |_| input.len() as i32)
+        if input.is_empty() {
+            return 0;
+        }
+        let offset = u64::from(offset);
+        if input.len() > WRITE_BATCH_BYTES {
+            if self.flush_pending().is_err() {
+                return -5;
+            }
+            let mut mounted = self.mounted.borrow_mut();
+            let (filesystem, storage) = mounted.parts();
+            return filesystem
+                .write(storage, blob, offset, input)
+                .map_or(-5, |_| input.len() as i32);
+        }
+        let append = self.pending.borrow().as_ref().is_some_and(|pending| {
+            pending.blob == blob
+                && pending.offset + pending.bytes.len() as u64 == offset
+                && pending.bytes.len() + input.len() <= WRITE_BATCH_BYTES
+        });
+        if !append && self.flush_pending().is_err() {
+            return -5;
+        }
+        let mut pending = self.pending.borrow_mut();
+        if pending.is_none() {
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(input.len()).is_err() {
+                return -12;
+            }
+            *pending = Some(PendingWrite { blob, offset, bytes });
+        }
+        let Some(batch) = pending.as_mut() else {
+            return -5;
+        };
+        if batch.bytes.try_reserve(input.len()).is_err() {
+            return -12;
+        }
+        batch.bytes.extend_from_slice(input);
+        let full = batch.bytes.len() == WRITE_BATCH_BYTES;
+        drop(pending);
+        if full && self.flush_pending().is_err() {
+            return -5;
+        }
+        input.len() as i32
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
@@ -525,6 +596,10 @@ impl Filesystem for PortableExt4Fs {
         true
     }
 
+    fn flush(&self, _path: &[u8]) -> i32 {
+        self.flush_pending().map_or(-5, |_| 0)
+    }
+
     fn readdir(
         &self,
         path: &[u8],
@@ -618,8 +693,10 @@ impl Filesystem for PortableExt4Fs {
             .map_or(-5, |_| 0)
     }
 
-    fn clunk(&self, handle: u64) {
+    fn clunk(&self, handle: u64) -> i32 {
+        let result = self.flush_pending().map_or(-5, |_| 0);
         self.open.borrow_mut().remove(handle);
+        result
     }
 }
 

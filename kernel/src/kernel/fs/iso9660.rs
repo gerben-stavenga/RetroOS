@@ -549,8 +549,9 @@ impl Filesystem for Iso9660Fs {
         path.is_empty() || self.find(path).is_some_and(|entry| entry.is_directory())
     }
 
-    fn clunk(&self, handle: u64) {
+    fn clunk(&self, handle: u64) -> i32 {
         self.opens.lock().files.remove(&handle);
+        0
     }
 
     fn write(&self, _handle: u64, _offset: u32, _data: &[u8]) -> i32 {
