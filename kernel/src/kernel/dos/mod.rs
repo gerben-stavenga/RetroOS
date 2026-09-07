@@ -389,6 +389,10 @@ pub const DOS_SEARCH_SLOTS: usize = 8;
 pub struct DosSearch {
     pub path: [u8; 96],
     pub path_len: u8,
+    /// FindFirst's CX attribute mask. Directories are returned only when the
+    /// caller includes ATTR_DIRECTORY (10h); FindNext has no CX parameter, so
+    /// the mask belongs to the saved enumeration.
+    pub attributes: u8,
     /// Bumped every time the slot is reused, so a DTA left over from a
     /// finished search cannot resume whatever now occupies its slot.
     pub generation: u8,
@@ -397,7 +401,7 @@ pub struct DosSearch {
 
 impl DosSearch {
     pub const fn new() -> Self {
-        DosSearch { path: [0; 96], path_len: 0, generation: 0, in_use: false }
+        DosSearch { path: [0; 96], path_len: 0, attributes: 0, generation: 0, in_use: false }
     }
 }
 

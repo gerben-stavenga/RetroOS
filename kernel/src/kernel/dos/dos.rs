@@ -1879,6 +1879,7 @@ fn int_21h<A: crate::Arch>(
             let slot = alloc_search_slot(dos);
             dos.searches[slot].path[..pos].copy_from_slice(&composed[..pos]);
             dos.searches[slot].path_len = pos as u8;
+            dos.searches[slot].attributes = regs.rcx as u8;
             let generation = dos.searches[slot].generation;
             let dta = dos.dta as usize;
             machine.zero(dta, 43);
@@ -3962,9 +3963,16 @@ fn epoch_days_fast(year: u32, month: u32, day: u32) -> u32 {
 #[cfg(test)]
 mod file_api_tests {
     use super::{
-        dos_to_unix_datetime, epoch_days_fast, merge_dos_status,
+        dos_to_unix_datetime, epoch_days_fast, find_attributes_match, merge_dos_status,
         unix_to_dos_datetime,
     };
+
+    #[test]
+    fn findfirst_requires_directory_attribute_for_directories() {
+        assert!(find_attributes_match(0, false));
+        assert!(!find_attributes_match(0, true));
+        assert!(find_attributes_match(0x10, true));
+    }
 
     #[test]
     fn resumed_dos_call_uses_completed_carry_status() {
@@ -4029,6 +4037,7 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
 
     let mut idx = cursor as usize;
     let generation = dos.searches[slot].generation;
+    let attributes = dos.searches[slot].attributes;
 
     // Iterate DFS's per-dir CI cache. Keys are 8.3 aliases (uppercase),
     // already in the form DOS expects in the DTA filename slot — long VFS
@@ -4039,7 +4048,11 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
         match dfs::ci::entry_at(dir_for_ci, idx) {
             Some((alias, entry)) => {
                 idx += 1;
-                if dos_wildcard_match(pat, alias) {
+                // Ordinary files always participate; directories require the
+                // directory bit in the FindFirst attribute mask.
+                if find_attributes_match(attributes, entry.is_dir)
+                    && dos_wildcard_match(pat, alias)
+                {
                     // Clear only the result fields: the reserved area below
                     // holds this search's cursor, and wiping it would strand
                     // the enumeration after its first entry.
@@ -4061,6 +4074,11 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
             }
         }
     }
+}
+
+#[inline]
+fn find_attributes_match(attributes: u8, is_dir: bool) -> bool {
+    !is_dir || attributes & 0x10 != 0
 }
 
 // /// Prepare the VM86 IVT for a new process.
