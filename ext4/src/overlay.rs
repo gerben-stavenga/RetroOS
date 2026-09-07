@@ -21,7 +21,7 @@ impl<'a> BlockOverlay<'a> {
         }
     }
 
-    fn block(&mut self, number: u64) -> Result<usize, StorageError> {
+    fn block(&mut self, number: u64, preserve: bool) -> Result<usize, StorageError> {
         match self
             .dirty
             .blocks
@@ -36,7 +36,9 @@ impl<'a> BlockOverlay<'a> {
                     .try_reserve_exact(size)
                     .map_err(|_| StorageError::new(FsError::OutOfMemory))?;
                 bytes.resize(size, 0);
-                self.base.read(number * self.block_size, &mut bytes)?;
+                if preserve {
+                    self.base.read(number * self.block_size, &mut bytes)?;
+                }
                 self.dirty
                     .blocks
                     .try_reserve(1)
@@ -89,7 +91,7 @@ impl Storage for BlockOverlay<'_> {
             let number = position / self.block_size;
             let within = (position % self.block_size) as usize;
             let count = (end - position).min(self.block_size - within as u64) as usize;
-            let index = self.block(number)?;
+            let index = self.block(number, within != 0 || count != self.block_size as usize)?;
             let source = (position - offset) as usize;
             self.dirty.blocks[index].bytes[within..within + count]
                 .copy_from_slice(&input[source..source + count]);

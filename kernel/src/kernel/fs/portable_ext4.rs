@@ -19,8 +19,9 @@ const TYPE_SYMLINK: u16 = 0xa000;
 // DOS copy loops commonly issue 8 KiB writes. Committing each as a separate
 // JBD2 transaction costs five durability barriers; group a bounded sequential
 // run and commit it on close, explicit flush, a conflicting write, or any
-// operation that must observe the new inode contents.
-const WRITE_BATCH_BYTES: usize = 256 * 1024;
+// operation that must observe the new inode contents. Leave enough room in
+// the journal's one descriptor block for allocation and inode metadata.
+const WRITE_BATCH_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VolumeError {
@@ -198,6 +199,34 @@ struct PendingWrite {
     blob: Blob,
     offset: u64,
     bytes: Vec<u8>,
+}
+
+fn overlay_pending_read(
+    blob: Blob,
+    offset: u64,
+    output: &mut [u8],
+    count: usize,
+    pending: Option<&PendingWrite>,
+) -> usize {
+    let Some(pending) = pending.filter(|pending| pending.blob == blob) else {
+        return count;
+    };
+    let read_end = offset.saturating_add(output.len() as u64);
+    let pending_end = pending.offset.saturating_add(pending.bytes.len() as u64);
+    let start = offset.max(pending.offset);
+    let end = read_end.min(pending_end);
+    if start >= end {
+        return count;
+    }
+    let destination = (start - offset) as usize;
+    let source = (start - pending.offset) as usize;
+    let bytes = (end - start) as usize;
+    if count < destination {
+        output[count..destination].fill(0);
+    }
+    output[destination..destination + bytes]
+        .copy_from_slice(&pending.bytes[source..source + bytes]);
+    count.max(destination + bytes)
 }
 
 impl MountedExt4 {
@@ -441,14 +470,19 @@ impl Filesystem for PortableExt4Fs {
         let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;
         };
-        if self.flush_pending().is_err() {
-            return -5;
-        }
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
-        filesystem
-            .read(storage, blob, u64::from(offset), output)
-            .map_or(-5, |count| count as i32)
+        let Ok(count) = filesystem.read(storage, blob, u64::from(offset), output) else {
+            return -5;
+        };
+        drop(mounted);
+        overlay_pending_read(
+            blob,
+            u64::from(offset),
+            output,
+            count,
+            self.pending.borrow().as_ref(),
+        ) as i32
     }
 
     fn write(&self, handle: u64, offset: u32, input: &[u8]) -> i32 {
@@ -733,11 +767,12 @@ fn graph_blob(info: ObjectInfo) -> Option<Blob> {
 mod tests {
     extern crate std;
 
-    use super::VolumeStorage;
+    use super::{PendingWrite, VolumeStorage, overlay_pending_read};
     use crate::kernel::block::{Disk, Volume};
     use core::cell::{Cell, RefCell};
-    use portable_ext4::Storage;
+    use portable_ext4::{Storage, ext4::Object};
     use std::boxed::Box;
+    use std::vec;
     use std::vec::Vec;
 
     struct RecordingDisk {
@@ -775,5 +810,23 @@ mod tests {
         storage.flush().unwrap();
         assert_eq!(&*disk.writes.borrow(), &[(0, 8192)]);
         assert_eq!(disk.flushes.get(), 1);
+    }
+
+    #[test]
+    fn pending_file_bytes_overlay_reads_without_committing() {
+        let Object::Blob(blob) = Object::from_opaque((1u64 << 32) | 7).unwrap() else {
+            unreachable!();
+        };
+        let pending = PendingWrite { blob, offset: 6, bytes: vec![7, 8] };
+        let mut output = [1u8; 8];
+        assert_eq!(overlay_pending_read(blob, 0, &mut output, 4, Some(&pending)), 8);
+        assert_eq!(output, [1, 1, 1, 1, 0, 0, 7, 8]);
+
+        let Object::Blob(other) = Object::from_opaque((1u64 << 32) | 8).unwrap() else {
+            unreachable!();
+        };
+        let mut unrelated = [2u8; 8];
+        assert_eq!(overlay_pending_read(other, 0, &mut unrelated, 4, Some(&pending)), 4);
+        assert_eq!(unrelated, [2; 8]);
     }
 }

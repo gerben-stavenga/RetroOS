@@ -166,6 +166,12 @@ impl Disk for CachedDisk {
             .saturating_sub(start)
             .min(buffer.len() as u64) as usize;
         buffer[valid..].fill(0);
+        // Large aligned reads are already streaming runs assembled by the
+        // filesystem. Passing them through lets the device use multi-page
+        // commands and keeps one-pass file data out of the metadata cache.
+        if start.is_multiple_of(PAGE_SIZE as u64) && valid >= 2 * PAGE_SIZE {
+            return self.inner.read(lba, &mut buffer[..valid]);
+        }
         let mut position = start;
         let mut copied = 0;
         while copied < valid {
@@ -272,6 +278,22 @@ mod tests {
         assert_eq!(inner.reads.get(), 3);
         cache.flush();
         assert_eq!(inner.flushes.get(), 1);
+    }
+
+    #[test]
+    fn streaming_read_reaches_device_as_one_request() {
+        let inner = Box::leak(Box::new(MemoryDisk {
+            bytes: RefCell::new(vec![0x5a; 2 * PAGE_SIZE]),
+            reads: Cell::new(0),
+            flushes: Cell::new(0),
+        }));
+        let cache = CachedDisk::wrap(inner);
+        let mut output = vec![0; 2 * PAGE_SIZE];
+
+        assert_eq!(cache.read(0, &mut output), (2 * PAGE_SECTORS) as u32);
+        assert_eq!(inner.reads.get(), 1);
+        assert_eq!(output, vec![0x5a; 2 * PAGE_SIZE]);
+        assert!(cache.pages.borrow().is_empty());
     }
 
     #[test]

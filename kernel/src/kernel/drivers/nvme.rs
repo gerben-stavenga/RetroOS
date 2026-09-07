@@ -2,14 +2,14 @@
 //! have no ATA: the SSD hangs directly off PCIe).
 //!
 //! Minimal by design: one admin queue pair + one I/O queue pair, polled
-//! completions (no MSI/interrupts), and 512-byte LBAs. I/O uses a six-page
+//! completions (no MSI/interrupts), and 512-byte LBAs. I/O uses a 22-page
 //! bounce buffer described by one short PRP list.
 //! Writes exist for the backing-file overlay's raw-sector persistence.
 //!
 //! Memory: controller registers (BAR0) and the DMA region (queues + bounce)
 //! are mapped into slices of the dead low-mem identity window, following the
 //! AC'97 driver's stopgap pattern — AC'97 owns `LOW_MEM_BASE+0xC0000..+0xD1000`,
-//! NVMe takes `+0xE0000..+0xF0000`. See memory `project_ac97_lowmem_dma_window_todo`
+//! NVMe takes `+0xE0000..+0x100000`. See memory `project_ac97_lowmem_dma_window_todo`
 //! for the proper DMA-window-pool fix that should eventually replace both.
 
 use core::mem::size_of;
@@ -24,8 +24,9 @@ const REGS_VA: usize = crate::LOW_MEM_BASE + 0xE0000;
 const REGS_PAGES: usize = 4;
 /// Kernel VA + size of the DMA region (queues, identify, bounce).
 const DMA_VA: usize = crate::LOW_MEM_BASE + 0xE4000;
-const DMA_PAGES: usize = 12;
-/// PTE cache-disable — required for MMIO; harmless overkill for the DMA RAM.
+const DMA_PAGES: usize = 28;
+/// PTE cache-disable for the controller's MMIO registers. The coherent DMA
+/// RAM stays write-back cacheable.
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 // Offsets inside the DMA region. Queues must be page-aligned (CC.MPS=0).
@@ -35,8 +36,8 @@ const IOSQ_OFF: usize = 0x2000; // I/O submission queue (qid 1)
 const IOCQ_OFF: usize = 0x3000; // I/O completion queue (qid 1)
 const IDENT_OFF: usize = 0x4000; // identify / scratch page
 const BOUNCE_OFF: usize = 0x5000;
-const BOUNCE_PAGES: usize = 6;
-const PRP_LIST_OFF: usize = 0xB000;
+const BOUNCE_PAGES: usize = 22;
+const PRP_LIST_OFF: usize = 0x1B000;
 
 /// Queue depth (entries). 16 fits both rings comfortably in one page each
 /// (SQ entry = 64 B, CQ entry = 16 B) and we only ever have one in flight.
@@ -191,7 +192,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     // another driver stealing the pool is obvious, not a silent "Diskless".
     let dma_page = machine.alloc_phys_contig(DMA_PAGES, 0);
     assert!(dma_page != 0, "nvme: controller found but no DMA pool available");
-    machine.map_phys_range(DMA_VA >> 12, DMA_PAGES, dma_page, PTE_CACHE_DISABLE);
+    machine.map_phys_range(DMA_VA >> 12, DMA_PAGES, dma_page, 0);
     let dma_phys = dma_page * 0x1000;
     unsafe { core::ptr::write_bytes(DMA_VA as *mut u8, 0, DMA_PAGES * 0x1000) };
 

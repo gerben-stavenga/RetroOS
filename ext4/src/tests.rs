@@ -4,6 +4,21 @@ use crate::journal::crc32c;
 use core::mem::offset_of;
 
 #[test]
+fn full_block_overlay_write_does_not_read_discarded_bytes() {
+    use crate::test_support::{EffectKind, ModelStorage};
+    use crate::{BlockOverlay, Storage};
+    use alloc::vec;
+
+    let mut storage = ModelStorage::new(vec![0xaa; 8192]);
+    let mut overlay = BlockOverlay::new(&mut storage, 4096);
+    overlay.write(0, &[0x55; 4096]).unwrap();
+    let changes = overlay.finish();
+
+    assert!(storage.effects().iter().all(|effect| effect.kind != EffectKind::Read));
+    assert_eq!(changes.blocks[0].bytes, [0x55; 4096]);
+}
+
+#[test]
 fn ext4_crc_convention() {
     let mut checksum = Checksum::new();
     checksum.update_u32_le(1);

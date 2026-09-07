@@ -361,6 +361,15 @@ impl Read for DataTrackReader {
     fn read(&mut self, buf: &mut [u8]) -> hadris_iso::sync::IoResult<usize, Self::Error> {
         let available = self.len().saturating_sub(self.position);
         let wanted = (buf.len() as u64).min(available) as usize;
+        if self.stored_sector == COOKED_SECTOR && self.payload_offset == 0 {
+            self.read_source_exact(
+                self.file_offset + self.position,
+                &mut buf[..wanted],
+            )
+            .map_err(hadris_iso::sync::Error::from_source)?;
+            self.position += wanted as u64;
+            return Ok(wanted);
+        }
         let mut done = 0;
         while done < wanted {
             let logical = self.position;
@@ -585,7 +594,9 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::sync::Arc;
     use alloc::vec;
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
     struct Bytes(Vec<u8>);
 
@@ -603,6 +614,37 @@ mod tests {
             buf[..n].copy_from_slice(&self.0[offset..offset + n]);
             Ok(n)
         }
+    }
+
+    struct CountingBytes(Vec<u8>, Arc<AtomicUsize>);
+
+    impl RandomAccess for CountingBytes {
+        fn len(&self) -> u64 {
+            self.0.len() as u64
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, MediaError> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            let offset = offset as usize;
+            if offset > self.0.len() {
+                return Err(MediaError::OutOfBounds);
+            }
+            let n = buf.len().min(self.0.len() - offset);
+            buf[..n].copy_from_slice(&self.0[offset..offset + n]);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn cooked_iso_preserves_large_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = CountingBytes(vec![0x5a; 4 * COOKED_SECTOR as usize], reads.clone());
+        let mut reader = DataTrackReader::open(Box::new(source), DiscFormat::Iso).unwrap();
+        let mut output = vec![0; 2 * COOKED_SECTOR as usize];
+
+        assert_eq!(reader.read(&mut output).unwrap(), output.len());
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        assert_eq!(output, vec![0x5a; 2 * COOKED_SECTOR as usize]);
     }
 
     #[test]

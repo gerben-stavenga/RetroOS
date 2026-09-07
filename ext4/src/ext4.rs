@@ -2532,11 +2532,37 @@ impl Ext4 {
                         .checked_mul(block_size)
                         .and_then(|value| value.checked_add(within))
                         .ok_or(Corrupt::AddressOverflow)?;
+                    let mut run = count;
+                    let mut next = position + count as u64;
+                    while next < end {
+                        let next_logical = next / block_size;
+                        let next_within = next % block_size;
+                        let next_count = usize::try_from(
+                            (end - next).min(block_size - next_within),
+                        )
+                        .map_err(|_| Corrupt::AddressOverflow)?;
+                        let Some(next_physical) = self.map_block(storage, inode, next_logical)?
+                        else {
+                            break;
+                        };
+                        let next_offset = next_physical
+                            .checked_mul(block_size)
+                            .and_then(|value| value.checked_add(next_within))
+                            .ok_or(Corrupt::AddressOverflow)?;
+                        if next_offset != physical_offset + run as u64 {
+                            break;
+                        }
+                        run += next_count;
+                        next += next_count as u64;
+                    }
                     read_storage(
                         storage,
                         physical_offset,
-                        &mut output[written..written + count],
+                        &mut output[written..written + run],
                     )?;
+                    position += run as u64;
+                    written += run;
+                    continue;
                 }
                 None => output[written..written + count].fill(0),
             }
