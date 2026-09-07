@@ -59,6 +59,7 @@ pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{c_root, set_c_root, set_hostfs_enabled};
+pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos};
 
 /// Look up `KEY` in a DOS environment block (the parsed CONFIG.SYS master
 /// env). Startup reads boot policy out of it — `SB_AUDIO=` — before any

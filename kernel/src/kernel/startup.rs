@@ -907,22 +907,44 @@ fn prepare_program<A: crate::Arch>(
 ) -> (usize, Option<crate::kernel::display::Display>) {
     use crate::kernel::{dos, exec};
 
+    // A batch file is input to COMMAND.COM, not a flat .COM image.  The DOS
+    // EXEC path already makes this distinction, but top-level launches (DN's
+    // app launcher and hosted --cmd) arrive here directly.  Loading the BAT
+    // bytes as a COM program executes its text and then runs through zeroed
+    // memory.  Translate the requested VFS path to an absolute DOS path so it
+    // remains valid when the caller also supplied that file's directory as cwd.
+    let is_batch = path.len() >= 4
+        && path[path.len() - 4..].eq_ignore_ascii_case(b".BAT");
+    let mut launch_path = path.to_vec();
+    let mut launch_tail = cmdline_tail.to_vec();
+    if is_batch {
+        let mut dos_path = [0u8; dos::DFS_PATH_MAX];
+        let dos_len = dos::vfs_to_dos(path, &mut dos_path);
+        launch_path = [dos::c_root(), b"BOOT/COMMAND.COM"].concat();
+        launch_tail = b"/C ".to_vec();
+        launch_tail.extend_from_slice(&dos_path[..dos_len]);
+        if !cmdline_tail.is_empty() {
+            launch_tail.push(b' ');
+            launch_tail.extend_from_slice(cmdline_tail);
+        }
+    }
+
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
     // C:-relative one (the common `--cmd GAMES/...` form — C: = c_root, same
     // resolution the DOS personality applies to the program's own file I/O).
-    let buf = exec::load_file_resolved(path)
-        .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), path].concat()))
-        .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(path).unwrap_or("?")));
+    let buf = exec::load_file_resolved(&launch_path)
+        .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), &launch_path].concat()))
+        .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(&launch_path).unwrap_or("?")));
     // argv = path + the cmdline tail split into words. The ELF/Linux path
     // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
     // dash as ["-c", "echo hi"]); DOS ignores the extra entries and gets the
     // raw tail as PSP:0080h instead. Quotes group words, nothing more — the
     // launcher is not a shell.
-    let mut args = alloc::vec![path.to_vec()];
+    let mut args = alloc::vec![launch_path.clone()];
     {
         let mut word: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
         let mut quote: u8 = 0;
-        for &b in cmdline_tail {
+        for &b in &launch_tail {
             match b {
                 b'\'' | b'"' if quote == 0 => quote = b,
                 b if quote != 0 && b == quote => quote = 0,
@@ -938,7 +960,7 @@ fn prepare_program<A: crate::Arch>(
             args.push(word);
         }
     }
-    let cmdline_tail = cmdline_tail.to_vec();
+    let cmdline_tail = launch_tail;
     let cwd = cwd.to_vec();
     let env = env.to_vec();
 
@@ -956,11 +978,11 @@ fn prepare_program<A: crate::Arch>(
     // everything else is DOS. (The
     // cmdline launcher used to force every program through the DOS loader,
     // which silently load_com'd an ELF and ran its header as VM86 garbage.)
-    let tid = match exec::detect_format(&buf, path) {
-        exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, path, args),
-        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, path),
-        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, path),
-        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, path),
+    let tid = match exec::detect_format(&buf, &launch_path) {
+        exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args),
+        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
+        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
+        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &launch_path),
         _ => dos::run_init_program(
             machine,
             dos_template,
