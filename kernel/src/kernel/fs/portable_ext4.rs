@@ -27,34 +27,27 @@ pub enum VolumeError {
     OutOfBounds,
     ShortRead,
     ShortWrite,
+    OutOfMemory,
+}
+
+struct BufferedWrite {
+    offset: u64,
+    bytes: Vec<u8>,
 }
 
 pub struct VolumeStorage {
     volume: Volume,
-}
-
-enum Transfer<'a> {
-    Read(&'a mut [u8]),
-    Write(&'a [u8]),
-}
-
-impl Transfer<'_> {
-    fn len(&self) -> usize {
-        match self {
-            Self::Read(bytes) => bytes.len(),
-            Self::Write(bytes) => bytes.len(),
-        }
-    }
+    writes: Vec<BufferedWrite>,
 }
 
 impl VolumeStorage {
     pub fn new(volume: Volume) -> Self {
-        Self { volume }
+        Self { volume, writes: Vec::new() }
     }
 
     #[inline(never)]
-    fn transfer(&mut self, offset: u64, mut transfer: Transfer<'_>) -> Result<(), StorageError> {
-        let len = transfer.len();
+    fn read_direct(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
+        let len = output.len();
         let end = offset
             .checked_add(len as u64)
             .filter(|end| *end <= self.volume.sectors.saturating_mul(512))
@@ -64,17 +57,9 @@ impl VolumeStorage {
             return Ok(());
         }
         if offset.is_multiple_of(512) && len.is_multiple_of(512) {
-            let writing = matches!(transfer, Transfer::Write(_));
-            let transferred = match &mut transfer {
-                Transfer::Read(bytes) => self.volume.read(offset / 512, bytes),
-                Transfer::Write(bytes) => self.volume.write(offset / 512, bytes),
-            } as usize;
+            let transferred = self.volume.read(offset / 512, output) as usize;
             if transferred != len / 512 {
-                return Err(StorageError::new(if writing {
-                    VolumeError::ShortWrite
-                } else {
-                    VolumeError::ShortRead
-                }));
+                return Err(StorageError::new(VolumeError::ShortRead));
             }
             return Ok(());
         }
@@ -88,18 +73,8 @@ impl VolumeStorage {
             }
             let within = (position % 512) as usize;
             let amount = (len - copied).min(512 - within);
-            match &mut transfer {
-                Transfer::Read(bytes) => {
-                    bytes[copied..copied + amount].copy_from_slice(&sector[within..within + amount])
-                }
-                Transfer::Write(bytes) => {
-                    sector[within..within + amount]
-                        .copy_from_slice(&bytes[copied..copied + amount]);
-                    if self.volume.write(lba, &sector) != 1 {
-                        return Err(StorageError::new(VolumeError::ShortWrite));
-                    }
-                }
-            }
+            output[copied..copied + amount]
+                .copy_from_slice(&sector[within..within + amount]);
             copied += amount;
             position += amount as u64;
         }
@@ -113,14 +88,63 @@ impl Storage for VolumeStorage {
     }
 
     fn read(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
-        self.transfer(offset, Transfer::Read(output))
+        self.read_direct(offset, output)?;
+        let end = offset.saturating_add(output.len() as u64);
+        for write in &self.writes {
+            let write_end = write.offset.saturating_add(write.bytes.len() as u64);
+            let start = offset.max(write.offset);
+            let stop = end.min(write_end);
+            if start < stop {
+                let destination = (start - offset) as usize;
+                let source = (start - write.offset) as usize;
+                let count = (stop - start) as usize;
+                output[destination..destination + count]
+                    .copy_from_slice(&write.bytes[source..source + count]);
+            }
+        }
+        Ok(())
     }
 
     fn write(&mut self, offset: u64, input: &[u8]) -> Result<(), StorageError> {
-        self.transfer(offset, Transfer::Write(input))
+        offset
+            .checked_add(input.len() as u64)
+            .filter(|end| *end <= self.len())
+            .ok_or_else(|| StorageError::new(VolumeError::OutOfBounds))?;
+        if input.is_empty() {
+            return Ok(());
+        }
+        if let Some(last) = self.writes.last_mut()
+            && last.offset + last.bytes.len() as u64 == offset
+        {
+            last.bytes
+                .try_reserve(input.len())
+                .map_err(|_| StorageError::new(VolumeError::OutOfMemory))?;
+            last.bytes.extend_from_slice(input);
+            return Ok(());
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(input.len())
+            .map_err(|_| StorageError::new(VolumeError::OutOfMemory))?;
+        bytes.extend_from_slice(input);
+        self.writes
+            .try_reserve(1)
+            .map_err(|_| StorageError::new(VolumeError::OutOfMemory))?;
+        self.writes.push(BufferedWrite { offset, bytes });
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), StorageError> {
+        for write in &self.writes {
+            let sectors = write.bytes.len().div_ceil(512);
+            if !write.offset.is_multiple_of(512)
+                || !write.bytes.len().is_multiple_of(512)
+                || self.volume.write(write.offset / 512, &write.bytes) as usize != sectors
+            {
+                return Err(StorageError::new(VolumeError::ShortWrite));
+            }
+        }
+        self.writes.clear();
         self.volume.flush();
         Ok(())
     }
@@ -703,4 +727,53 @@ impl Filesystem for PortableExt4Fs {
 fn graph_blob(info: ObjectInfo) -> Option<Blob> {
     info.blob()
         .filter(|_| info.format & TYPE_MASK != TYPE_SYMLINK)
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::VolumeStorage;
+    use crate::kernel::block::{Disk, Volume};
+    use core::cell::{Cell, RefCell};
+    use portable_ext4::Storage;
+    use std::boxed::Box;
+    use std::vec::Vec;
+
+    struct RecordingDisk {
+        writes: RefCell<Vec<(u64, usize)>>,
+        flushes: Cell<u32>,
+    }
+
+    impl Disk for RecordingDisk {
+        fn read(&self, _lba: u64, output: &mut [u8]) -> u32 {
+            output.fill(0);
+            output.len().div_ceil(512) as u32
+        }
+
+        fn write(&self, lba: u64, input: &[u8]) -> u32 {
+            self.writes.borrow_mut().push((lba, input.len()));
+            input.len().div_ceil(512) as u32
+        }
+
+        fn flush(&self) { self.flushes.set(self.flushes.get() + 1); }
+        fn sectors(&self) -> u64 { 1024 }
+        fn name(&self) -> &str { "recording" }
+    }
+
+    #[test]
+    fn volume_storage_combines_adjacent_writes_until_barrier() {
+        let disk = Box::leak(Box::new(RecordingDisk {
+            writes: RefCell::new(Vec::new()),
+            flushes: Cell::new(0),
+        }));
+        let mut storage = VolumeStorage::new(Volume::whole(disk));
+        storage.write(0, &[1; 4096]).unwrap();
+        storage.write(4096, &[2; 4096]).unwrap();
+        assert!(disk.writes.borrow().is_empty());
+
+        storage.flush().unwrap();
+        assert_eq!(&*disk.writes.borrow(), &[(0, 8192)]);
+        assert_eq!(disk.flushes.get(), 1);
+    }
 }

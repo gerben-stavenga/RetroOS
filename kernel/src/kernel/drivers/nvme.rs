@@ -2,16 +2,17 @@
 //! have no ATA: the SSD hangs directly off PCIe).
 //!
 //! Minimal by design: one admin queue pair + one I/O queue pair, polled
-//! completions (no MSI/interrupts), 512-byte LBAs, reads and writes in 4 KB
-//! chunks through a shared bounce buffer (single-PRP commands — no PRP lists).
+//! completions (no MSI/interrupts), and 512-byte LBAs. I/O uses a six-page
+//! bounce buffer described by one short PRP list.
 //! Writes exist for the backing-file overlay's raw-sector persistence.
 //!
 //! Memory: controller registers (BAR0) and the DMA region (queues + bounce)
 //! are mapped into slices of the dead low-mem identity window, following the
 //! AC'97 driver's stopgap pattern — AC'97 owns `LOW_MEM_BASE+0xC0000..+0xD1000`,
-//! NVMe takes `+0xE0000..+0xEC000`. See memory `project_ac97_lowmem_dma_window_todo`
+//! NVMe takes `+0xE0000..+0xF0000`. See memory `project_ac97_lowmem_dma_window_todo`
 //! for the proper DMA-window-pool fix that should eventually replace both.
 
+use core::mem::size_of;
 use spin::Mutex;
 use crate::kernel::block::Disk;
 use crate::kernel::pci;
@@ -23,7 +24,7 @@ const REGS_VA: usize = crate::LOW_MEM_BASE + 0xE0000;
 const REGS_PAGES: usize = 4;
 /// Kernel VA + size of the DMA region (queues, identify, bounce).
 const DMA_VA: usize = crate::LOW_MEM_BASE + 0xE4000;
-const DMA_PAGES: usize = 8;
+const DMA_PAGES: usize = 12;
 /// PTE cache-disable — required for MMIO; harmless overkill for the DMA RAM.
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
@@ -33,14 +34,16 @@ const ACQ_OFF: usize = 0x1000; // admin completion queue
 const IOSQ_OFF: usize = 0x2000; // I/O submission queue (qid 1)
 const IOCQ_OFF: usize = 0x3000; // I/O completion queue (qid 1)
 const IDENT_OFF: usize = 0x4000; // identify / scratch page
-const BOUNCE_OFF: usize = 0x5000; // 4 KB read bounce buffer
+const BOUNCE_OFF: usize = 0x5000;
+const BOUNCE_PAGES: usize = 6;
+const PRP_LIST_OFF: usize = 0xB000;
 
 /// Queue depth (entries). 16 fits both rings comfortably in one page each
 /// (SQ entry = 64 B, CQ entry = 16 B) and we only ever have one in flight.
 const DEPTH: usize = 16;
 
-/// Sectors per READ command: 4 KB = one PRP page, no PRP2/list needed.
-const SECTORS_PER_CMD: u32 = 8;
+const SECTORS_PER_PAGE: u32 = (crate::PAGE_SIZE / 512) as u32;
+const SECTORS_PER_CMD: u32 = BOUNCE_PAGES as u32 * SECTORS_PER_PAGE;
 
 // Controller register offsets (from BAR0).
 const R_CAP_HI: usize = 0x04;
@@ -130,6 +133,31 @@ fn cmd(opc: u8, nsid: u32) -> [u32; 16] {
 fn set_prp1(c: &mut [u32; 16], phys: u64) {
     c[6] = phys as u32;
     c[7] = (phys >> 32) as u32;
+}
+
+fn set_data_prps(c: &mut [u32; 16], dma_phys: u64, sectors: u32) {
+    set_prp1(c, dma_phys + BOUNCE_OFF as u64);
+    if sectors <= SECTORS_PER_PAGE {
+        return;
+    }
+    let pages = sectors.div_ceil(SECTORS_PER_PAGE) as usize;
+    let second_page = dma_phys + BOUNCE_OFF as u64 + crate::PAGE_SIZE as u64;
+    if pages == 2 {
+        c[8] = second_page as u32;
+        c[9] = (second_page >> 32) as u32;
+        return;
+    }
+    let list_phys = dma_phys + PRP_LIST_OFF as u64;
+    c[8] = list_phys as u32;
+    c[9] = (list_phys >> 32) as u32;
+    for page in 1..pages {
+        unsafe {
+            core::ptr::write_volatile(
+                (DMA_VA + PRP_LIST_OFF + (page - 1) * size_of::<u64>()) as *mut u64,
+                dma_phys + BOUNCE_OFF as u64 + page as u64 * crate::PAGE_SIZE as u64,
+            );
+        }
+    }
 }
 
 /// Probe PCI for an NVMe controller (class 01h / subclass 08h) and bring it
@@ -265,77 +293,81 @@ impl NvmeDisk {
 }
 
 impl Disk for NvmeDisk {
-    /// 4 KB chunks through the bounce buffer; short tails copy partially.
+    /// Bounded chunks through the bounce buffer; short tails copy partially.
     fn read(&self, lba: u64, mut buffer: &mut [u8]) -> u32 {
         let total = buffer.len().div_ceil(512) as u32;
         let mut guard = self.inner.lock();
         let n = &mut *guard;
 
-    let mut current = lba;
-    let mut remaining = total;
-    while remaining > 0 {
-        let batch = remaining.min(SECTORS_PER_CMD);
-        let mut c = cmd(0x02, 1); // READ, nsid 1
-        set_prp1(&mut c, n.dma_phys + BOUNCE_OFF as u64);
-        c[10] = current as u32;         // starting LBA, low
-        c[11] = (current >> 32) as u32; // starting LBA, high
-        c[12] = batch - 1; // 0-based count
-        let status = n.io.exec(&c);
-        if status != 0 {
-            lib::compact_panic!("NVMe read failed: lba={:#x} status={:#x}", current, status);
+        let mut current = lba;
+        let mut remaining = total;
+        while remaining > 0 {
+            let batch = remaining.min(SECTORS_PER_CMD);
+            let mut c = cmd(0x02, 1); // READ, nsid 1
+            set_data_prps(&mut c, n.dma_phys, batch);
+            c[10] = current as u32; // starting LBA, low
+            c[11] = (current >> 32) as u32; // starting LBA, high
+            c[12] = batch - 1; // 0-based count
+            let status = n.io.exec(&c);
+            if status != 0 {
+                lib::compact_panic!("NVMe read failed: lba={:#x} status={:#x}", current, status);
+            }
+            let bytes = (batch as usize * 512).min(buffer.len());
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (DMA_VA + BOUNCE_OFF) as *const u8,
+                    buffer.as_mut_ptr(),
+                    bytes,
+                );
+            }
+            buffer = &mut buffer[bytes..];
+            current += batch as u64;
+            remaining -= batch;
         }
-        let bytes = (batch as usize * 512).min(buffer.len());
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                (DMA_VA + BOUNCE_OFF) as *const u8,
-                buffer.as_mut_ptr(),
-                bytes,
-            );
-        }
-        buffer = &mut buffer[bytes..];
-        current += batch as u64;
-        remaining -= batch;
+        total
     }
-    total
-}
 
     /// The write-direction twin of [`Self::read`]. Source bytes are staged
     /// into the bounce buffer, then a WRITE (opcode 01h) points PRP1 at it. A
-    /// short final chunk is zero-padded to a full 4 KB command page.
+    /// short final sector is zero-padded before submission.
     fn write(&self, lba: u64, mut buffer: &[u8]) -> u32 {
         let total = buffer.len().div_ceil(512) as u32;
         let mut guard = self.inner.lock();
         let n = &mut *guard;
 
-    let mut current = lba;
-    let mut remaining = total;
-    while remaining > 0 {
-        let batch = remaining.min(SECTORS_PER_CMD);
-        let bytes = (batch as usize * 512).min(buffer.len());
-        // Stage into the bounce buffer, zero-filling any partial tail so the
-        // whole command page is defined.
-        unsafe {
-            core::ptr::write_bytes((DMA_VA + BOUNCE_OFF) as *mut u8, 0, batch as usize * 512);
-            core::ptr::copy_nonoverlapping(
-                buffer.as_ptr(),
-                (DMA_VA + BOUNCE_OFF) as *mut u8,
-                bytes,
-            );
+        let mut current = lba;
+        let mut remaining = total;
+        while remaining > 0 {
+            let batch = remaining.min(SECTORS_PER_CMD);
+            let bytes = (batch as usize * 512).min(buffer.len());
+            // Stage into the bounce buffer, zero-filling any partial tail so
+            // the whole command buffer is defined.
+            unsafe {
+                core::ptr::write_bytes(
+                    (DMA_VA + BOUNCE_OFF) as *mut u8,
+                    0,
+                    batch as usize * 512,
+                );
+                core::ptr::copy_nonoverlapping(
+                    buffer.as_ptr(),
+                    (DMA_VA + BOUNCE_OFF) as *mut u8,
+                    bytes,
+                );
+            }
+            let mut c = cmd(0x01, 1); // WRITE, nsid 1
+            set_data_prps(&mut c, n.dma_phys, batch);
+            c[10] = current as u32; // starting LBA, low
+            c[11] = (current >> 32) as u32; // starting LBA, high
+            c[12] = batch - 1; // 0-based count
+            let status = n.io.exec(&c);
+            if status != 0 {
+                lib::compact_panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
+            }
+            buffer = &buffer[bytes..];
+            current += batch as u64;
+            remaining -= batch;
         }
-        let mut c = cmd(0x01, 1); // WRITE, nsid 1
-        set_prp1(&mut c, n.dma_phys + BOUNCE_OFF as u64);
-        c[10] = current as u32;         // starting LBA, low
-        c[11] = (current >> 32) as u32; // starting LBA, high
-        c[12] = batch - 1; // 0-based count
-        let status = n.io.exec(&c);
-        if status != 0 {
-            lib::compact_panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
-        }
-        buffer = &buffer[bytes..];
-        current += batch as u64;
-        remaining -= batch;
-    }
-    total
+        total
     }
 
     fn sectors(&self) -> u64 {
