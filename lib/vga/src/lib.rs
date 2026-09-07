@@ -115,6 +115,10 @@ pub struct Frame<'a> {
     /// `start_offset`/`pixel_pan` apply; at and below it, the address latch
     /// resets to 0.
     pub line_compare: usize,
+    /// First output row suppressed by CRTC Vertical Blank Start. Programs may
+    /// begin blanking before Vertical Display End while keeping the nominal
+    /// mode geometry unchanged. `usize::MAX` = no blanking inside the frame.
+    pub blank_start: usize,
 }
 
 /// Output framebuffer dimensions for a mode.
@@ -836,6 +840,10 @@ pub fn render_row(frame: &Frame, sy: usize, pal: &Pal, out: &mut [u32]) {
     if sy >= h || w == 0 || out.len() < w {
         return;
     }
+    if sy >= frame.blank_start {
+        out[..w].fill(0);
+        return;
+    }
     let st = &mut NativeRow { out: &mut out[..w], x: 0 };
     match frame.mode {
         VgaMode::Mode13h => row_mode13(frame, sy, pal, st, w),
@@ -1021,6 +1029,11 @@ pub fn render(frame: &Frame, out: &mut [u32]) -> (usize, usize) {
         VgaMode::Planar16 { row_bytes, .. } => render_planar16(frame, out, w, h, row_bytes as usize),
         VgaMode::ModeX { row_bytes, .. } => render_modex(frame, out, w, h, row_bytes as usize),
         VgaMode::LinearSvga { bpp, pitch, .. } => render_svga(frame, out, w, h, bpp, pitch as usize),
+    }
+    let blank = frame.blank_start.min(h);
+    if blank < h {
+        let blank_at = (blank * w).min(out.len());
+        out[blank_at..].fill(0);
     }
     (w, h)
 }
@@ -1553,7 +1566,7 @@ mod tests {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -1611,7 +1624,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1635,7 +1648,7 @@ mod tests {
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
-            start_offset: 0x100, pixel_pan: 0, line_compare: 2,
+            start_offset: 0x100, pixel_pan: 0, line_compare: 2, blank_start: usize::MAX,
         };
         let mut out = [0u32; 16];
         render(&frame, &mut out);
@@ -1643,6 +1656,41 @@ mod tests {
         assert_eq!(out[0], pal_rgb(&pal, 9));
         // Row 2 (split region, ry=0) reads address 0 → pixel (0,0) = 5.
         assert_eq!(out[2 * 4], pal_rgb(&pal, 5));
+    }
+
+    #[test]
+    fn vertical_blank_suppresses_tail_rows() {
+        let mut planes = vec![0u8; 4 * 0x10000];
+        planes[..4].fill(1);
+        let ac = [0u8; 21];
+        let pal = fallback_palette();
+        let frame = Frame {
+            mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
+            vram: &[], planes: &planes,
+            ac: &ac, palette: &pal, dac_mask: 0xFF,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16,
+            blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0,
+            line_compare: usize::MAX, blank_start: 3,
+        };
+        let mut out = [0xFFFF_FFFF; 16];
+        render(&frame, &mut out);
+        assert_ne!(out[2 * 4], 0);
+        assert_eq!(&out[3 * 4..], &[0; 4]);
+
+        let mut row = [0xFFFF_FFFF; 4];
+        let mut native_pal = Pal::new();
+        let mut cache = [0u8; 768];
+        native_pal.sync(&pal, 0xFF, PixelFormat::NATIVE, &mut cache);
+        render_row(&frame, 3, &native_pal, &mut row);
+        assert_eq!(row, [0; 4]);
+    }
+
+    #[test]
+    fn tim_vertical_blank_starts_at_row_470() {
+        let mut state = VgaState::new();
+        state.crtc = bios_mode_regs(0x12).unwrap().crtc;
+        state.crtc[0x15] = 0xD6;
+        assert_eq!(state.vertical_blank_start(480), 470);
     }
 
     /// GC file with write mode `wm`, full bit mask, no set/reset, copy ALU,
@@ -1732,7 +1780,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1755,7 +1803,7 @@ mod tests {
             vram: &vram, planes: &[],
             ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
-            start_offset: 320, pixel_pan: 3, line_compare: usize::MAX,
+            start_offset: 320, pixel_pan: 3, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
         render(&frame, &mut out);
@@ -1775,7 +1823,7 @@ mod tests {
                 mode, vram, planes: &[],
                 ac: &ac, palette: &pal, dac_mask: 0xFF,
                 font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
-                start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+                start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
             };
             let (w, h) = dimensions(mode);
             let mut out = vec![0u32; w * h];
@@ -2397,5 +2445,18 @@ impl VgaState {
             * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
         let lc = lc / scan_div.max(1);
         if lc < h { lc } else { usize::MAX }
+    }
+
+    /// CRTC Vertical Blank Start (0x15 + overflow bits 8/9), converted from
+    /// scanlines to output rows. Blanking does not change the mode geometry;
+    /// it only suppresses scanout from this row through the end of the frame.
+    pub fn vertical_blank_start(&self, h: usize) -> usize {
+        let start = self.crtc[0x15] as usize
+            | (((self.crtc[7] >> 3) & 1) as usize) << 8
+            | (((self.crtc[9] >> 5) & 1) as usize) << 9;
+        let scan_div = ((self.crtc[9] as usize & 0x1F) + 1)
+            * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
+        let start = start / scan_div.max(1);
+        if start < h { start } else { usize::MAX }
     }
 }

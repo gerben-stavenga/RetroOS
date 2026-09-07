@@ -147,6 +147,7 @@ fn render(
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
+        blank_start: usize::MAX,
     };
     render_frame(display, &frame, desktop)
 }

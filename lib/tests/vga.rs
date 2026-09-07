@@ -355,6 +355,7 @@ fn mode13h_maps_each_index_through_the_palette() {
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
+        blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 320 * 200];
     let (w, h) = vga_render::render(&frame, &mut out);
@@ -391,6 +392,7 @@ fn mode13h_tolerates_short_vram() {
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
+        blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 320 * 200];
     let (w, h) = vga_render::render(&frame, &mut out);
@@ -433,6 +435,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
+        blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
     let (w, h) = vga_render::render(&frame, &mut out);
@@ -484,6 +487,7 @@ fn text_attribute_bit_three_selects_character_map() {
         start_offset: 0,
         pixel_pan: 0,
         line_compare: usize::MAX,
+        blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
     vga_render::render(&frame, &mut out);
@@ -507,7 +511,7 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
         mode: TEXT40, vram: &vram, planes: &[],
         ac: &ac, palette: &pal,
         dac_mask: 0xFF, font: &font, font_b: &font, blink: false, cga_palette: [0; 4],
-        start_offset: 0, pixel_pan: 0, line_compare: usize::MAX,
+        start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
     vga_render::render(&frame, &mut out);
@@ -550,7 +554,7 @@ fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
         cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,
-        line_compare: usize::MAX,
+        line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let formats = [
         PixelFormat::from_rgb(2, [11, 5, 5, 6, 0, 5]).unwrap(),

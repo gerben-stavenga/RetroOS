@@ -126,6 +126,7 @@ fn scanout<'a, A: crate::Arch>(
             start_offset: 0,
             pixel_pan: 0,
             line_compare: usize::MAX,
+            blank_start: usize::MAX,
         });
     }
     let mode = state.classify_mode()?;
@@ -282,6 +283,7 @@ fn scanout<'a, A: crate::Arch>(
         start_offset: if planar { start_latch } else if mode13 { start_latch * 4 } else { 0 },
         pixel_pan: if planar || mode13 { (state.ac[0x13] & 0x07) as usize } else { 0 },
         line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
+        blank_start: if planar || mode13 { state.vertical_blank_start(h) } else { usize::MAX },
     })
 }
 
