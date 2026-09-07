@@ -101,12 +101,32 @@ impl VifMap {
         self.active.is_some()
     }
 
+    /// Whether an open window is currently being traced instruction by
+    /// instruction. Fault-emulated instructions do not retire and therefore
+    /// produce no hardware #DB; their kernel handlers use this to resume the
+    /// learner explicitly at the already-advanced IP.
+    pub fn is_learning(&self) -> bool {
+        self.active.is_some_and(|active| active.learning)
+    }
+
+    pub fn active_site(&self) -> Option<u32> {
+        self.active.map(|active| active.cli_ip)
+    }
+
     /// A `CLI` `#GP`'d: virtual IF just went 1→0, a window opens at `cli_ip`.
     /// `arch` gives guest memory + segment bases; `regs` is the fault frame.
-    pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32) {
+    pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
+                           always_step: bool) {
         let cli_sp = regs.sp32();
         self.active = Some(Active { cli_ip, cli_sp, learning: false, probe: None, snap: [0; 8] });
         self.stats[0] = self.stats[0].wrapping_add(1);
+        // vIOPL=3 is the slow reference mode: learn the exit afresh for every
+        // window and never trust a cached tag. It exists to distinguish a bad
+        // repair prediction from a broken client or device model.
+        if always_step {
+            self.begin_learn(regs, None);
+            return;
+        }
         match self.sites.get(cli_ip) {
             Some(Class::Sti) => {
                 // Run free — the STI will #GP and close it.

@@ -431,8 +431,8 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
     // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
     // stash holds the level the client is *treated* as having, so the dispatch
-    // can read it back via `virtual_if_stepping`. 3 = compat (honor POPF/IRET by
-    // stepping); <3 = spec-strict. The kernel is its single writer.
+    // can read the launch policy back. 1 = spec-strict, 2 = learn/tag repair,
+    // and 3 = always-step reference mode. The kernel is its single writer.
     static mut VIOPL: u8 = 1;
     // Read just enough raw fields to classify the trap before canonicalizing.
     // Same-priv (ring 0 → ring 0) traps don't push SS/ESP and never reach VM86

@@ -639,6 +639,47 @@ fn fault_segment_bases<A: crate::Arch>(
     }
 }
 
+/// Continue a VIF trace at the current IP. Besides real #DBs, this is needed
+/// after an instruction was completed by the fault monitor: fault-emulated I/O
+/// advances IP but does not retire, so the CPU cannot generate the #DB that TF
+/// would normally produce. Looking at the successor here prevents a following
+/// POPF/IRET from silently clearing TF and stranding VIF off.
+fn continue_vif<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    loop {
+        match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
+            Some(dpmi::DbResult::Event(ev)) => {
+                let action = handle_event(machine, &mut *bios_display, kt, dos, regs, ev);
+                if !matches!(action, thread::KernelAction::Done)
+                    || !dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning())
+                {
+                    return action;
+                }
+            }
+            _ => return thread::KernelAction::Done,
+        }
+    }
+}
+
+fn continue_vif_after_io<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    if dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning()) {
+        continue_vif(machine, bios_display, kt, dos, regs)
+    } else {
+        thread::KernelAction::Done
+    }
+}
+
 /// Single entry point the event loop calls for the DOS personality.
 /// All DOS/DPMI-specific knowledge (VM86 INT routing, DPMI INT 31, soft INT
 /// reflection, In/Out/Ins/Outs port virtualization, exception → DPMI exception
@@ -662,22 +703,24 @@ pub fn handle_event<A: crate::Arch>(
         // Virtual IF: arch reflected a PM CLI/STI (window toggle) or a #DB
         // inside a window; the policy + per-space map live here (dpmi::vif).
         KE::VifWindow { entry_ip, vif_was_on } => {
-            if let Some(dpmi) = dos.dpmi.as_mut() {
+            // vIOPL=1 is the spec-strict mode, and is also forced while a PM
+            // hardware interrupt handler runs. Do not let the handler's own
+            // CLI/STI pairs replace the interrupted client's active repair
+            // window: the tagged POPF/IRET after IRET still owns the next #DB.
+            // vIOPL=2 learns/caches exits; vIOPL=3 always single-steps them.
+            let viopl = (regs.flags32() >> 12) & 3;
+            let in_hw_irq = IN_HW_IRQ_CONTEXT.load(core::sync::atomic::Ordering::Relaxed);
+            if viopl >= 2 && !in_hw_irq && let Some(dpmi) = dos.dpmi.as_mut() {
                 let vif_now = regs.flags32() & (1 << 19) != 0;
                 if vif_was_on && !vif_now {
-                    dpmi.vif.on_cli(machine, regs, entry_ip);
+                    dpmi.vif.on_cli(machine, regs, entry_ip, viopl == 3);
                 } else if !vif_was_on && vif_now {
                     dpmi.vif.on_sti(regs);
                 }
             }
             thread::KernelAction::Done
         }
-        KE::VifStep => {
-            match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
-                Some(dpmi::DbResult::Event(ev)) => handle_event(machine, &mut *bios_display, kt, dos, regs, ev),
-                _ => thread::KernelAction::Done,
-            }
-        }
+        KE::VifStep => continue_vif(machine, bios_display, kt, dos, regs),
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
         // must NOT yield/schedule — that would hand focus to the next Ready
         // thread on the very first idle cycle, defeating task switching. The Phase 1
@@ -740,19 +783,19 @@ pub fn handle_event<A: crate::Arch>(
         }
         KE::In { port, size } => {
             machine::handle_in_event(machine, &mut dos.pc, regs, port, size.bytes());
-            thread::KernelAction::Done
+            continue_vif_after_io(machine, bios_display, kt, dos, regs)
         }
         KE::Out { port, size } => {
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
-            thread::KernelAction::Done
+            continue_vif_after_io(machine, bios_display, kt, dos, regs)
         }
         KE::Ins { size, rep, addr32 } => {
             machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            thread::KernelAction::Done
+            continue_vif_after_io(machine, bios_display, kt, dos, regs)
         }
         KE::Outs { size, rep, addr32 } => {
             machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            thread::KernelAction::Done
+            continue_vif_after_io(machine, bios_display, kt, dos, regs)
         }
         KE::Exception(n) => {
             // CLI/STI never arrive here: a CPL-3 CLI/STI #GP is a sensitive
@@ -1320,7 +1363,10 @@ pub fn dump_gus_ring() {
 }
 
 pub fn dump_dpmi_state<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs) {
-    if dos.dpmi.is_none() { return; }
+    let Some(dpmi) = dos.dpmi.as_ref() else { return };
+    crate::compact_dbg_println!("[DBG] VIF windows={} predicted={} traps={} steps={} active={:08x}",
+        dpmi.vif.stats[0], dpmi.vif.stats[1], dpmi.vif.stats[2], dpmi.vif.stats[3],
+        dpmi.vif.active_site().unwrap_or(0));
     for (name, sel) in [
         ("CS", regs.code_seg()), ("SS", regs.stack_seg()),
         ("DS", regs.ds as u16), ("ES", regs.es as u16),
