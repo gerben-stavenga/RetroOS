@@ -109,6 +109,12 @@ pub(super) const SPEAKER_SCALE_Q16: i32 = 1_454;
 /// source frame per output frame.
 const DSP_SCRATCH_BYTES: usize = 256 * 4;
 
+// The event loop cannot schedule a 156-us one-byte transfer while KVM runs
+// guest-only code. Three TF retirements cross the usual DSP-write helper's
+// epilogue and let its caller publish the probe result before completion;
+// this also remains inside MONKEY2's narrow listen window.
+const PROBE_DELAY_STEPS: u8 = 3;
+
 /// What a DOS program was told its Sound Blaster is — the model's name for
 /// [`sound::sb::Wiring`], which lives beside the card because both halves of
 /// the XOR need it (the emulated card decodes these ports; the driver behind
@@ -232,6 +238,12 @@ pub struct EmulatedSb {
     est_cap: u64,
     est_slope: u64,
     est_served: u64,
+    /// A sub-millisecond DMA completion must not interrupt at the boundary
+    /// immediately after its final DSP OUT. Real hardware needs time to move
+    /// the byte; a few retired guest instructions preserve that ordering
+    /// while still meeting old drivers' very short probe windows.
+    probe_steps: u8,
+    probe_forced_tf: bool,
     /// Linearized guest DMA window for the software mixer. The emulated SB16
     /// is capped at the canonical mix rate, so one 128-frame 16-bit stereo
     /// block is the strict maximum. Audio mixing therefore never allocates.
@@ -256,6 +268,7 @@ impl EmulatedSb {
             core: sound::sb::Sb::new(),
             mix_pos_q32: 0,
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
+            probe_steps: 0, probe_forced_tf: false,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         })
     }
@@ -326,6 +339,33 @@ impl SoundBlaster {
     pub fn owns(&self, p: u16) -> bool {
         let b = &self.blaster;
         (p >= b.io_base && p < b.io_base + 0x10) || matches!(p, 0x388..=0x38B)
+    }
+
+    /// Retire a few guest instructions before a tiny DMA transfer may complete.
+    pub fn arm_probe_step(&mut self, regs: &mut Regs) {
+        let SbDevice::Emulated(emu) = &mut self.device else { return };
+        if emu.probe_steps == 0 {
+            return;
+        }
+        let forced = regs.flags32() & (1 << 8) == 0;
+        emu.probe_forced_tf = forced;
+        regs.set_flag32(1 << 8);
+    }
+
+    /// Whether pending IRQ injection must wait for the probe delay to retire.
+    pub fn probe_is_stepping(&self) -> bool {
+        matches!(&self.device, SbDevice::Emulated(emu) if emu.probe_steps != 0)
+    }
+
+    /// Consume one #DB belonging to the probe delay. Returns whether TF was
+    /// ours and whether the final delayed instruction has now retired.
+    pub fn complete_probe_step(&mut self) -> Option<(bool, bool)> {
+        let SbDevice::Emulated(emu) = &mut self.device else { return None };
+        if emu.probe_steps == 0 {
+            return None;
+        }
+        emu.probe_steps -= 1;
+        Some((emu.probe_forced_tf, emu.probe_steps == 0))
     }
 
     /// Read an SB DSP/mixer/OPL port.
@@ -524,6 +564,11 @@ impl EmulatedSb {
         let prog = dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&prog, is16);
         self.core.begin(start, gpa, len);
+        self.probe_steps = if self.core.short_probe_active() {
+            PROBE_DELAY_STEPS
+        } else {
+            0
+        };
         if super::PORT_TRACE {
             crate::compact_dbg_println!(
                 "[dsp] start bits={} single={} gpa={:08X} len={} chan={}",
@@ -550,7 +595,7 @@ impl EmulatedSb {
         vpic: &mut super::vpic::VirtualPic,
         irq: u8,
     ) {
-        if self.core.take_probe(now_ns) && !vpic.is_requested(irq) {
+        if self.probe_steps == 0 && self.core.take_probe(now_ns) && !vpic.is_requested(irq) {
             vpic.raise(irq);
         }
     }
@@ -628,7 +673,10 @@ impl EmulatedSb {
         irq: u8,
     ) {
         let produced = self.mix_pos_q32 >> 32;
-        if self.core.advance_clock(now_ns, produced) && !vpic.is_requested(irq) {
+        if self.probe_steps == 0
+            && self.core.advance_clock(now_ns, produced)
+            && !vpic.is_requested(irq)
+        {
             vpic.raise(irq);
         }
         // Re-anchor the count-read estimator on the reconciled cursor and

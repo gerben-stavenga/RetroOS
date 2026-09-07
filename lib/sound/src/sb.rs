@@ -795,18 +795,20 @@ impl Sb {
     /// instructions later, so on a fast backend it had already stopped
     /// listening and gave up with "Unable to initialize SoundDriver".
     pub fn take_probe(&mut self, now: u64) -> bool {
-        if !self.probe || !self.playing {
-            return false;
-        }
-        // Frames the pump clock cannot resolve: shorter than its 1 ms turn.
-        if self.block_frames as u64 * 1_000_000_000
-            >= self.rate.max(1) as u64 * 1_000_000
-        {
+        if !self.short_probe_active() {
             return false;
         }
         let raise = self.block_irq();
         self.finish_single(now);
         raise
+    }
+
+    /// Whether this transfer needs the machine's sub-millisecond completion
+    /// path rather than the regular audio clock.
+    pub fn short_probe_active(&self) -> bool {
+        self.probe && self.playing
+            && self.block_frames as u64 * 1_000_000_000
+                < self.rate.max(1) as u64 * 1_000_000
     }
 
     // ── state the host's mixer pump asks about ───────────────────────────

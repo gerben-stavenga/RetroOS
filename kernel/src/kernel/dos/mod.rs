@@ -720,7 +720,14 @@ pub fn handle_event<A: crate::Arch>(
             }
             thread::KernelAction::Done
         }
-        KE::VifStep => continue_vif(machine, bios_display, kt, dos, regs),
+        KE::VifStep => {
+            if let Some((true, done)) = dos.pc.sb.complete_probe_step() {
+                if done { regs.clear_flag32(1 << 8); }
+                thread::KernelAction::Done
+            } else {
+                continue_vif(machine, bios_display, kt, dos, regs)
+            }
+        }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
         // must NOT yield/schedule — that would hand focus to the next Ready
         // thread on the very first idle cycle, defeating task switching. The Phase 1
@@ -787,6 +794,7 @@ pub fn handle_event<A: crate::Arch>(
         }
         KE::Out { port, size } => {
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
+            dos.pc.sb.arm_probe_step(regs);
             continue_vif_after_io(machine, bios_display, kt, dos, regs)
         }
         KE::Ins { size, rep, addr32 } => {
@@ -810,6 +818,10 @@ pub fn handle_event<A: crate::Arch>(
             // itself (ST3's packer). Ownership state, rather than CPU mode,
             // separates those cases.
             if n == 1 && is_vm86 {
+                if let Some((true, done)) = dos.pc.sb.complete_probe_step() {
+                    if done { regs.clear_flag32(1 << 8); }
+                    return thread::KernelAction::Done;
+                }
                 let vif_owns_db = dos.dpmi.as_ref().is_some_and(|d| d.vif.owns_db());
                 if vif_owns_db {
                     return match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
@@ -1509,6 +1521,12 @@ pub fn audio_service<A: crate::Arch>(
 /// resume path. BIOS executes on a kernel-owned RM frame allocated from
 /// host_stack, never on the client's own stack.
 pub fn raise_pending<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    // Keep timer/keyboard delivery from spending the DSP delay inside an IRQ
+    // handler. The short step sequence models time passing in the interrupted
+    // program, where probe drivers perform their result-byte bookkeeping.
+    if dos.pc.sb.probe_is_stepping() {
+        return;
+    }
     // Never inject while the guest sits on the resume-continuation park —
     // the one-instruction window where a handler's IRET has landed on the
     // stub but its CD 31 hasn't yet trapped back for the unwind. A real DPMI
