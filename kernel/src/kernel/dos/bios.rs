@@ -69,7 +69,14 @@ pub(crate) struct Bda {
     kb_tail: u16,
     /// 0x1E: the 16-entry (scancode:ascii) ring itself.
     kb_ring: [u16; 16],
-    _pad_3e: [u8; 11],
+    /// 0x3E/0x3F: diskette calibration state and motor-status latch.
+    _diskette_recalibration_status: u8,
+    diskette_motor_status: u8,
+    /// 0x40: ticks until the BIOS turns off the diskette motor. Programs also
+    /// use this byte as a one-tick delay because the ROM BIOS decrements it in
+    /// INT 08h even when no motor is active.
+    diskette_motor_timeout: u8,
+    _pad_41: [u8; 8],
     /// 0x49: current video mode.
     video_mode: u8,
     /// 0x4A: text columns.
@@ -114,6 +121,7 @@ const _: () = {
     assert!(offset_of!(Bda, kb_flags) == 0x17);
     assert!(offset_of!(Bda, kb_head) == 0x1A);
     assert!(offset_of!(Bda, kb_ring) == 0x1E);
+    assert!(offset_of!(Bda, diskette_motor_timeout) == 0x40);
     assert!(offset_of!(Bda, video_mode) == 0x49);
     assert!(offset_of!(Bda, columns) == 0x4A);
     assert!(offset_of!(Bda, cursor_pos) == 0x50);
@@ -393,6 +401,15 @@ pub(super) fn dispatch<A: crate::Arch>(
             // never regain control, so the EOI moves ahead of the handler).
             let t: u32 = bda_field!(machine, tick_count);
             bda_field!(machine, tick_count = t.wrapping_add(1));
+            let motor_ticks: u8 = bda_field!(machine, diskette_motor_timeout);
+            if motor_ticks != 0 {
+                let motor_ticks = motor_ticks - 1;
+                bda_field!(machine, diskette_motor_timeout = motor_ticks);
+                if motor_ticks == 0 {
+                    let status: u8 = bda_field!(machine, diskette_motor_status);
+                    bda_field!(machine, diskette_motor_status = status & 0xF0);
+                }
+            }
             emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
             // Chain the user timer tick like a real INT 08 does. The
             // selector tells us whether anyone hooked INT 1C — unhooked
