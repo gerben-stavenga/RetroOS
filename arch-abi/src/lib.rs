@@ -769,6 +769,10 @@ pub enum KernelEvent {
     /// active TF source: guest tracing, VIF learning/tag repair, and device
     /// delays may coexist.
     DebugTrap,
+    /// A trapped instruction was completed by the instruction monitor while
+    /// physical TF was set. `user_was` records guest-TF ownership before the
+    /// instruction, since POPF/IRET may change the current guest TF image.
+    EmulatedStep { user_was: bool },
 }
 
 impl compact_fmt::Format for KernelEvent {
@@ -804,6 +808,9 @@ impl compact_fmt::Format for KernelEvent {
                 out, "VifWindow {{ entry_ip: {}, vif_was_on: {} }}", entry_ip, vif_was_on,
             ),
             Self::DebugTrap => out.write_str("DebugTrap"),
+            Self::EmulatedStep { user_was } => compact_fmt::write!(
+                out, "EmulatedStep {{ user_was: {} }}", user_was,
+            ),
         }
     }
 }
@@ -826,6 +833,7 @@ impl KernelEvent {
     const SYSCALL:    u32 = 11;
     const VIF_WINDOW: u32 = 12; // `vif_was_on` packed into tag bit 8; entry_ip in extra
     const DEBUG_TRAP:   u32 = 13;
+    const EMULATED_STEP: u32 = 14;
 
     /// Encode into the `(event, extra)` u32 pair that flows across the
     /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
@@ -846,6 +854,7 @@ impl KernelEvent {
             KernelEvent::Fault                => (Self::FAULT, 0),
             KernelEvent::VifWindow { entry_ip, vif_was_on } => (Self::VIF_WINDOW | ((vif_was_on as u32) << 8), entry_ip),
             KernelEvent::DebugTrap              => (Self::DEBUG_TRAP, 0),
+            KernelEvent::EmulatedStep { user_was } => (Self::EMULATED_STEP, user_was as u32),
         }
     }
 
@@ -865,6 +874,7 @@ impl KernelEvent {
             Self::FAULT      => KernelEvent::Fault,
             Self::VIF_WINDOW => KernelEvent::VifWindow { entry_ip: extra, vif_was_on: event & (1 << 8) != 0 },
             Self::DEBUG_TRAP   => KernelEvent::DebugTrap,
+            Self::EMULATED_STEP => KernelEvent::EmulatedStep { user_was: extra != 0 },
             _ => panic!("KernelEvent::decode: unknown tag {:#x}", event),
         }
     }

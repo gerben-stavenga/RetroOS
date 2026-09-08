@@ -764,12 +764,17 @@ fn dispatch_shim(
         // boundary, reflected to `dpmi::vif` (which owns the per-space policy).
         let entry_ip = vcpu.ip32();
         let vif_was_on = vcpu.flags32() & VIF_FLAG != 0;
+        let stepped = arch_abi::monitor::stepping(&vcpu.regs);
+        let user_was = vcpu.user_tf();
         match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
             MonitorResult::Resume => {
                 if mode != UserMode::VM86
                     && (vcpu.flags32() & VIF_FLAG != 0) != vif_was_on
                 {
                     return Some(KernelEvent::VifWindow { entry_ip, vif_was_on });
+                }
+                if stepped {
+                    return Some(KernelEvent::EmulatedStep { user_was });
                 }
                 return None;
             }

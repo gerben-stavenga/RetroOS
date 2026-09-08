@@ -476,6 +476,8 @@ pub fn execute() -> KernelEvent {
                 // its learned exit breakpoints on.
                 let entry_ip = vcpu.ip32();
                 let vif_was_on = vcpu.flags32() & VIF_FLAG != 0;
+                let stepped = arch_abi::monitor::stepping(&vcpu.regs);
+                let user_was = vcpu.user_tf();
                 match arch_abi::monitor::monitor(&mut crate::backend::Interp, &mut vcpu.regs) {
                     MonitorResult::Resume => {
                         // A PM CLI/STI toggled virtual IF: reflect the window
@@ -486,6 +488,9 @@ pub fn execute() -> KernelEvent {
                             && (vcpu.flags32() & VIF_FLAG != 0) != vif_was_on
                         {
                             return KernelEvent::VifWindow { entry_ip, vif_was_on };
+                        }
+                        if stepped {
+                            return KernelEvent::EmulatedStep { user_was };
                         }
                         continue;
                     }

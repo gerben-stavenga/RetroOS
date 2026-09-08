@@ -767,23 +767,6 @@ fn handle_debug_trap<A: crate::Arch>(
     action
 }
 
-/// A #GP-emulated I/O instruction has retired without hardware being able to
-/// raise its pending #DB. Deliver it now at the already-advanced EIP.
-fn raise_db_after_emulated_io<A: crate::Arch>(
-    machine: &mut A,
-    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    kt: &mut thread::KernelThread<A>,
-    dos: &mut thread::DosState<A>,
-    regs: &mut Regs,
-    sources: u8,
-) -> thread::KernelAction {
-    if sources != 0 {
-        handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
-    } else {
-        thread::KernelAction::Done
-    }
-}
-
 /// Single entry point the event loop calls for the DOS personality.
 /// All DOS/DPMI-specific knowledge (VM86 INT routing, DPMI INT 31, soft INT
 /// reflection, In/Out/Ins/Outs port virtualization, exception → DPMI exception
@@ -799,9 +782,37 @@ pub fn handle_event<A: crate::Arch>(
     regs: &mut Regs,
     kevent: crate::KernelEvent,
 ) -> thread::KernelAction {
+    enter_kernel_tf(dos, regs, &kevent);
+    let sources = active_tf_sources(dos, regs);
+    let emulated = matches!(
+        kevent,
+        crate::KernelEvent::VifWindow { .. }
+            | crate::KernelEvent::Hlt
+            | crate::KernelEvent::SoftInt(_)
+            | crate::KernelEvent::In { .. }
+            | crate::KernelEvent::Out { .. }
+            | crate::KernelEvent::Ins { .. }
+            | crate::KernelEvent::Outs { .. }
+    );
+    let action = handle_event_inner(machine, bios_display, kt, dos, regs, kevent);
+    if emulated && sources != 0 {
+        let debug = handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
+        if matches!(debug, thread::KernelAction::Done) { action } else { debug }
+    } else {
+        action
+    }
+}
+
+fn handle_event_inner<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+    kevent: crate::KernelEvent,
+) -> thread::KernelAction {
     use crate::KernelEvent as KE;
 
-    enter_kernel_tf(dos, regs, &kevent);
     let is_vm86 = regs.mode() == crate::UserMode::VM86;
     match kevent {
         KE::Irq => thread::KernelAction::Done,
@@ -829,6 +840,10 @@ pub fn handle_event<A: crate::Arch>(
         }
         KE::DebugTrap => {
             let sources = active_tf_sources(dos, regs);
+            handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
+        }
+        KE::EmulatedStep { user_was } => {
+            let sources = dos.tf_sources | if user_was { TF_USER } else { 0 };
             handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
         }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
@@ -892,30 +907,23 @@ pub fn handle_event<A: crate::Arch>(
             }
         }
         KE::In { port, size } => {
-            let sources = active_tf_sources(dos, regs);
             machine::handle_in_event(machine, &mut dos.pc, regs, port, size.bytes());
-            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
+            thread::KernelAction::Done
         }
         KE::Out { port, size } => {
-            let sources = active_tf_sources(dos, regs);
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
-            let action = raise_db_after_emulated_io(
-                machine, bios_display, kt, dos, regs, sources,
-            );
             let delay = dos.pc.sb.probe_is_stepping();
             set_tf_source(dos, TF_DELAY, delay);
             regs.project_tf();
-            action
+            thread::KernelAction::Done
         }
         KE::Ins { size, rep, addr32 } => {
-            let sources = active_tf_sources(dos, regs);
             machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
+            thread::KernelAction::Done
         }
         KE::Outs { size, rep, addr32 } => {
-            let sources = active_tf_sources(dos, regs);
             machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
+            thread::KernelAction::Done
         }
         KE::Exception(n) => {
             // CLI/STI never arrive here: a CPL-3 CLI/STI #GP is a sensitive

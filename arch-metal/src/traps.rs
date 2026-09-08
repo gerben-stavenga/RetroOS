@@ -710,6 +710,8 @@ fn isr_handler_ring3(regs: &mut Regs) {
             // reflected to `dpmi::vif`.
             let entry_ip = regs.ip32();
             let vif_was_on = regs.flags32() & (1 << 19) != 0;
+            let stepped = arch_abi::monitor::stepping(regs);
+            let user_was = regs.user_tf();
             match monitor(regs) {
                 MonitorResult::Resume => {
                     // A PM CLI/STI toggled virtual IF: reflect the window to
@@ -719,10 +721,12 @@ fn isr_handler_ring3(regs: &mut Regs) {
                         && (regs.flags32() & (1 << 19) != 0) != vif_was_on
                     {
                         KE::VifWindow { entry_ip, vif_was_on }
-                    } else if regs.flags32() & VIF_VIP != VIF_VIP {
-                        return;
-                    } else {
+                    } else if regs.flags32() & VIF_VIP == VIF_VIP {
                         KE::Irq
+                    } else if stepped {
+                        KE::EmulatedStep { user_was }
+                    } else {
+                        return;
                     }
                 }
                 // A real fault is reclassified as IRQ delivery only when the
