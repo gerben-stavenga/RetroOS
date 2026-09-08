@@ -1431,48 +1431,16 @@ pub fn event_loop<A: crate::Arch>(
         }
 
         // Lend the CPU; canonicalize the outcome into an action.
-        // Planar VGA and Voodoo apertures deliberately page-fault so their
-        // device logic can retire the memory instruction. Keep a bounded run
-        // of those faults at the CPU-loan boundary: returning through input,
-        // audio, display and scheduler policy for every pixel made scalar VGA
-        // loops thousands of times slower than the instructions they model.
-        // The bound returns to the normal loop often enough to drain timer and
-        // input IRQs. TF disables the shortcut because each emulated
-        // instruction must then surface its architectural post-instruction
-        // debug trap through the ordinary dispatch path.
-        const MMIO_FAULT_BUDGET: usize = 256;
-        let mut handled_mmio = false;
-        let mut mmio_faults = 0usize;
-        let kevent = loop {
-            stats.pre_run(machine, &ctx.regs);
-            let event = ctx.run(machine, &thread.personality);
-            stats.post_run(machine, &event, &ctx.regs);
-            if let crate::KernelEvent::PageFault { addr } = event
-                && !ctx.regs.user_tf()
-                && !ctx.regs.forced_tf()
-                && thread.personality.try_vga_fault(machine, &mut ctx.regs, addr)
-            {
-                stats.after_dispatch(machine);
-                mmio_faults += 1;
-                if mmio_faults < MMIO_FAULT_BUDGET {
-                    continue;
-                }
-                handled_mmio = true;
-            }
-            break event;
-        };
+        stats.pre_run(machine, &ctx.regs);
+        let kevent = ctx.run(machine, &thread.personality);
         if matches!(&kevent, crate::KernelEvent::Irq) {
             // Hosted backends express their periodic preemption kick directly
             // as KernelEvent::Irq rather than through the metal IRQ queue.
             irq_clock_wakeup = true;
         }
-        let action = if handled_mmio {
-            thread::KernelAction::Done
-        } else {
-            let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
-            stats.after_dispatch(machine);
-            action
-        };
+        stats.post_run(machine, &kevent, &ctx.regs);
+        let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
+        stats.after_dispatch(machine);
 
         // The OSD holds foreground scanout while the personality targets its
         // headless display.
