@@ -888,7 +888,12 @@ launch_qemu_uefi() {
     # Image selection is uniform with the BIOS path: -i picks the keyword, the
     # central default rule supplies it when unset. resolve_image maps it to the
     # on-disk file, then we build it if needed (same as the BIOS path).
-    QEMU="${RETROOS_QEMU_BIN:-$QEMU}"
+    # OVMF_CODE_4M.fd contains x86-64 firmware.  qemu-system-i386 happened to
+    # run it with TCG's synthetic `max` CPU, but KVM constrains that binary to
+    # a 32-bit target and OVMF shuts down at the reset vector before the kernel
+    # prints anything.  The kernel may still be a 386 build; the machine binary
+    # only determines which CPU modes the firmware is allowed to enter.
+    QEMU="${RETROOS_QEMU_BIN:-qemu-system-x86_64}"
     resolve_image
     IMAGE="bazel-bin/$IMAGE_FILE"
     if [ -n "$BAZEL_TARGET" ]; then
