@@ -18,7 +18,7 @@ use crate::sysdesc::{
 };
 use arch_abi::monitor::MonitorResult;
 use arch_abi::GuestBytes;
-use arch_abi::{KernelEvent, Regs, UserMode};
+use arch_abi::{FORCED_TF_SHADOW, KernelEvent, Regs, USER_TF_SHADOW, UserMode};
 use kvm_bindings::{
     kvm_guest_debug, kvm_guest_debug_arch, kvm_regs, kvm_segment, KVM_GUESTDBG_ENABLE,
     KVM_GUESTDBG_SINGLESTEP, KVM_GUESTDBG_USE_HW_BP,
@@ -302,6 +302,7 @@ fn copy_gprs(r: &mut Regs, regs: &kvm_regs) {
 /// stay untouched — `frame.cs == USER_CS64` is the kernel's Mode64
 /// fingerprint and 64-bit gates don't reload data segments.
 fn sync_out_shim64(k: &KvmCpu, r: &mut Regs, f: &ShimFrame64) {
+    let tf_shadows = r.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
     let regs = k.vcpu.get_regs().expect("KVM_GET_REGS");
     let sregs = k.vcpu.get_sregs().expect("KVM_GET_SREGS");
     copy_gprs(r, &regs);
@@ -310,7 +311,7 @@ fn sync_out_shim64(k: &KvmCpu, r: &mut Regs, f: &ShimFrame64) {
     r.fs = sregs.fs.base;
     r.gs = sregs.gs.base;
     r.frame.rflags =
-        (if_to_vif(f.rflags as u32) as u64) & !IOPL_MASK & !(TF_FLAG as u64);
+        ((if_to_vif(f.rflags as u32) as u64) & !IOPL_MASK & !(TF_FLAG as u64)) | tf_shadows;
 }
 
 /// Read guest state back into `Regs` after a shim exit: GPRs are live in the
@@ -345,6 +346,7 @@ fn sync_out_shim(k: &KvmCpu, r: &mut Regs, mode: UserMode, f: &ShimFrame) {
 /// TF stripped, VM re-asserted for VM86; SP/IP masked to 16 bits when SS/CS is
 /// a 16-bit segment.
 fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
+    let tf_shadows = r.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
     let [cs, ss, ds, es, fs, gs] = segs;
     match mode {
         UserMode::VM86 => {
@@ -363,7 +365,7 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             // I_StartupTimer with VIF=0). The guest-visible IOPL in `eflags`
             // is a VME artifact, never trusted (see set_vm86_flags).
             let viopl = r.frame.rflags & IOPL_MASK as u64;
-            r.frame.rflags = (fl & !IOPL_MASK) | VM_FLAG | viopl;
+            r.frame.rflags = (fl & !IOPL_MASK) | VM_FLAG | viopl | tf_shadows;
         }
         UserMode::Mode32 => {
             r.set_cs32(cs);
@@ -384,8 +386,12 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             // (`kvm_get_rflags`), so the CPU cannot tell us whether a step is
             // still pending. The monitor owns that bit; carry it across the run.
             let viopl = r.frame.rflags & IOPL_MASK as u64;
-            let tf = r.frame.rflags & TF_FLAG as u64;
-            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | viopl | tf;
+            let tf = if r.forced_tf() {
+                r.frame.rflags & TF_FLAG as u64
+            } else {
+                fl & TF_FLAG as u64
+            };
+            r.frame.rflags = (fl & !IOPL_MASK & !(TF_FLAG as u64)) | viopl | tf | tf_shadows;
             if !crate::desc::seg_is_32(ss as u16) {
                 r.frame.rsp &= 0xFFFF;
             }
@@ -398,7 +404,7 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             // CS/SS selectors stay as the kernel set them (USER_CS64 is the
             // Mode64 fingerprint `Regs::mode()` keys on).
             r.frame.rflags =
-                (if_to_vif(eflags) as u64) & !IOPL_MASK & !(TF_FLAG as u64);
+                ((if_to_vif(eflags) as u64) & !IOPL_MASK & !(TF_FLAG as u64)) | tf_shadows;
         }
     }
 }
@@ -459,7 +465,7 @@ fn apply_guest_debug(k: &mut KvmCpu, step: bool) {
     // #DB interception (USE_HW_BP) stays on for the whole session, with nothing
     // in DR0-3 (dr7=0): KVM only *intercepts* #DB while guest_debug has
     // SINGLESTEP or USE_HW_BP. We need it even while the client runs FREE so a
-    // tagged POPF/IRET that loads TF traps to us (`VifStep`) rather than into
+    // tagged POPF/IRET that loads TF traps to us (`DebugTrap`) rather than into
     // the DPMI client's own vector 1. SINGLESTEP is layered on to learn a
     // window's exit.
     let control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_HW_BP
@@ -490,12 +496,10 @@ pub fn execute() -> KernelEvent {
         let vcpu = unsafe { &mut *(&raw mut crate::vcpu::REGS) };
         let mode = vcpu.mode();
 
-        // Virtual-IF single-step: `dpmi::vif` sets TF in `regs` (to learn a
-        // window's exit) or a tagged POPF/IRET loads it (the exit fires one
-        // instruction later). TF in `regs` says "single-step this entry"; the
-        // resulting `#DB` is reflected below as `KernelEvent::VifStep`. KVM
-        // strips TF from guest RFLAGS under GUESTDBG_SINGLESTEP, so the flag
-        // drives the ioctl, not the guest.
+        // The projected TF in `regs` says "single-step this entry". The
+        // resulting `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS
+        // attributes it to guest, VIF and delay sources. KVM strips TF from
+        // guest RFLAGS under GUESTDBG_SINGLESTEP, so the flag drives the ioctl.
         let stepping = arch_abi::monitor::stepping(&vcpu.regs);
 
         // The INTR-line check (the TCG block hook's analogue): hand the slice
@@ -538,9 +542,8 @@ pub fn execute() -> KernelEvent {
             Intr,
             Shim,
             Io { port: u16, is_in: bool, bytes: usize },
-            /// A #DB: either a single-step (BS) from `regs` TF, or a tagged
-            /// POPF/IRET loading TF and trapping one instruction later. Both are
-            /// reflected to `dpmi::vif` as `VifStep` — the policy lives in dos.
+            /// A #DB: either a single-step (BS) from projected TF, or a tagged
+            /// POPF/IRET loading TF and trapping one instruction later.
             Debug,
             BadPhys,
             Shutdown,
@@ -579,13 +582,12 @@ pub fn execute() -> KernelEvent {
                     sync_out(k, vcpu, mode);
                     break Some(KernelEvent::Irq);
                 }
-                // A #DB retired: reflect it to `dpmi::vif`. Only PM (Mode32)
-                // clients run the virtual-IF machinery; a stray VM86 #DB (there
-                // is none in practice) just re-enters.
+                // A #DB retired. Protected-mode source attribution lives in DOS;
+                // a VM86 #DB follows the interpreter's separate exception path.
                 Kind::Debug => {
                     sync_out(k, vcpu, mode);
                     if mode == UserMode::Mode32 {
-                        break Some(KernelEvent::VifStep);
+                        break Some(KernelEvent::DebugTrap);
                     }
                     break None;
                 }

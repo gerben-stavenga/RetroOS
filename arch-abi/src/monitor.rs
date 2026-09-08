@@ -54,7 +54,9 @@ const PRESERVED_FLAGS: u32 = IOPL_MASK | VM_FLAG | IF_FLAG;
 fn guest_flags(regs: &Regs) -> u32 {
     let f = regs.flags32();
     let vif = f & VIF_FLAG != 0;
-    (f & !(IF_FLAG | VIF_FLAG)) | if vif { IF_FLAG } else { 0 }
+    (f & !(IF_FLAG | VIF_FLAG | TF_FLAG))
+        | if vif { IF_FLAG } else { 0 }
+        | if regs.user_tf() { TF_FLAG } else { 0 }
 }
 
 /// Apply a flags word the guest supplied (POPF / IRET): status flags take
@@ -63,10 +65,13 @@ fn guest_flags(regs: &Regs) -> u32 {
 #[inline]
 fn apply_guest_flags(regs: &mut Regs, popped: u32) {
     let want_vif = popped & IF_FLAG != 0;
+    let want_tf = popped & TF_FLAG != 0;
     let preserved = regs.flags32() & PRESERVED_FLAGS;
     let mut nf = (popped & !(PRESERVED_FLAGS | VIF_FLAG)) | preserved;
     if want_vif { nf |= VIF_FLAG; } else { nf &= !VIF_FLAG; }
     regs.set_flags32(nf);
+    regs.set_user_tf(want_tf);
+    regs.project_tf();
 }
 
 // The hole all of this closes: at CPL>IOPL, `POPF`/`IRET` do **not** #GP — they
@@ -173,7 +178,8 @@ pub fn sw_reflect_vm86_int<P: GuestBytes>(regs: &mut Regs, space: &mut P, vector
     push16(regs, space, ss_base, false, old_cs);
     push16(regs, space, ss_base, false, old_ip);
     regs.clear_flag32(VIF_FLAG);
-    regs.clear_flag32(TF_FLAG);
+    regs.set_user_tf(false);
+    regs.project_tf();
     regs.set_cs32(new_cs as u32);
     regs.set_ip32(new_ip as u32);
 }
@@ -441,11 +447,38 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     }
 }
 
-/// Is a hardware single step pending for this guest? `dpmi::vif` owns TF: it
-/// sets it in `regs` to learn a window's exit (or a tagged POPF/IRET loads it),
-/// and clears it when the window closes. The KVM engine asks this to decide
-/// whether to arm KVM_GUESTDBG_SINGLESTEP for the next entry.
+/// Whether the projected architectural TF requests a hardware single step.
+/// DOS composes guest tracing, VIF learning and device-delay sources before
+/// entry; the KVM engine uses the result to arm KVM_GUESTDBG_SINGLESTEP.
 #[inline]
 pub fn stepping(regs: &Regs) -> bool {
     regs.flags32() & TF_FLAG != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_flags_hide_forced_tf() {
+        let mut r = Regs::empty();
+        r.set_forced_tf(true);
+        r.project_tf();
+        assert_ne!(r.flags32() & TF_FLAG, 0);
+        assert_eq!(guest_flags(&r) & TF_FLAG, 0);
+    }
+
+    #[test]
+    fn popped_tf_updates_only_guest_owner() {
+        let mut r = Regs::empty();
+        r.set_forced_tf(true);
+        apply_guest_flags(&mut r, 2 | TF_FLAG);
+        assert!(r.user_tf());
+        assert!(r.forced_tf());
+
+        apply_guest_flags(&mut r, 2);
+        assert!(!r.user_tf());
+        assert!(r.forced_tf());
+        assert_ne!(r.flags32() & TF_FLAG, 0);
+    }
 }

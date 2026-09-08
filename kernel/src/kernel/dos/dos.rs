@@ -3533,6 +3533,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
         &mut dos.pc.locked_stack,
         mode_transitions::LockedStackState::new(),
     );
+    dos.tf_sources = 0;
     let parent_pm_mode = regs.mode() != crate::UserMode::VM86;
     let mut parent_ivt = [(0u8, 0u16, 0u16); 12];
     for (slot, &int_num) in parent_ivt.iter_mut().zip(EXEC_SAVED_IVT_VECTORS.iter()) {
@@ -3579,6 +3580,8 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     // dependency hangs forever (e.g. OMF after re-launch from a launcher).
     regs.set_ss32(ss as u32);
     regs.set_sp32(sp as u32);
+    regs.set_user_tf(false);
+    regs.project_tf();
     let flags = machine::guest_flags_if_on(regs) as u16;
     vm86_push(machine, regs, flags);
     vm86_push(machine, regs, cs);
@@ -3692,7 +3695,9 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
     // the child's #DB in the restored parent (Zone 66 exits this way).
     // Clear child CF and TF here.  A parent that was genuinely tracing keeps
     // TF in its saved FLAGS word and the dispatch IRET restores it normally.
-    regs.clear_flag32(1 | (1 << 8));
+    regs.clear_flag32(1);
+    regs.set_user_tf(false);
+    regs.project_tf();
     regs.ds = parent.ds as u64;
     regs.es = parent.es as u64;
     // Restore parent's mode. The child was always VM86; if the parent

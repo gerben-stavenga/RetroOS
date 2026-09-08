@@ -23,7 +23,7 @@ use crate::sysdesc::{
 };
 use crate::vcpu;
 use arch_abi::monitor::MonitorResult;
-use arch_abi::{IoSize, KernelEvent, Regs, UserMode};
+use arch_abi::{FORCED_TF_SHADOW, IoSize, KernelEvent, Regs, USER_TF_SHADOW, UserMode};
 use core::cell::{Cell, RefCell};
 use core::ffi::c_void;
 use unicorn_engine::unicorn_const::{uc_error, Arch, HookType, MemType, Mode, Prot};
@@ -136,8 +136,8 @@ fn build() -> Unicorn<'static, Ctx> {
     uc.add_intr_hook(|uc, intno| {
         let vector = (intno & 0xFF) as u8;
         let is_int = intno & 0x100 != 0;
-        // Virtual-IF single-steps are reflected as `KernelEvent::VifStep` and
-        // handled by `dpmi::vif` — there is no in-arch stepping fast path.
+        // Debug single-steps are reflected as `KernelEvent::DebugTrap`; DOS
+        // attributes the trap to its active TF sources.
         // A page fault is the paging backend's own business: demand-commit or
         // genuine SEGV is decided in `execute` (it needs CR2 + the active page
         // tables). It surfaces as #PF (vector 14) when unicorn can report it, or
@@ -355,11 +355,9 @@ pub fn execute() -> KernelEvent {
         // monitor calls) is a safe reborrow of it.
         let vcpu = unsafe { &mut *(&raw mut vcpu::REGS) };
         let mode = vcpu.mode();
-        // A virtual-IF single-step is driven by TF in `regs`: `dpmi::vif` sets it
-        // (to learn a window's exit) or a tagged POPF/IRET loads it (the exit
-        // fires one instruction later). `configure` arms TF in hardware; the
-        // resulting `#DB` is reflected below as `KernelEvent::VifStep`. Nothing
-        // to do at the top of the slice — just let it run.
+        // The projected TF in `regs` requests one hardware step. The resulting
+        // `#DB` is reflected below as `KernelEvent::DebugTrap`; DOS owns source
+        // attribution, so the interpreter only needs to let it run.
         // Roll to the next IRQ0 grid period once the last was fully spent; a trap
         // carries the remainder over so the grid stays fixed in cumulative
         // instructions (the kernel pumps the PIT on every return regardless).
@@ -458,7 +456,7 @@ pub fn execute() -> KernelEvent {
                 if let Some(ev) = uc.get_data_mut().pending.take() {
                     return ev;
                 }
-                return KernelEvent::VifStep;
+                return KernelEvent::DebugTrap;
             }
             // Sensitive-instruction #GP (error code 0): decode through the shared
             // monitor — the same decoder arch-metal runs on its real #GP, so the
@@ -784,6 +782,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
 }
 
 fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
+    let tf_shadows = r.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
     let rd = |uc: &mut Unicorn<'static, Ctx>, reg| uc.reg_read(reg).unwrap_or(0);
     r.rax = rd(uc, RegisterX86::EAX);
     r.rbx = rd(uc, RegisterX86::EBX);
@@ -813,7 +812,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // its first exit).
             let viopl = r.frame.rflags & IOPL_MASK;
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | VM_FLAG;
+            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | VM_FLAG | tf_shadows;
         }
         UserMode::Mode32 => {
             // PM client: a far jump / mov may have reloaded any selector — read
@@ -842,7 +841,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             // through the monitor while a window is open.)
             let viopl = r.frame.rflags & IOPL_MASK;
             let uc_fl = if_to_vif(rd(uc, RegisterX86::EFLAGS) as u32) as u64;
-            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl;
+            r.frame.rflags = (uc_fl & !IOPL_MASK) | viopl | tf_shadows;
             // On a 16-bit stack/code segment only SP / IP are meaningful. The
             // ring-0 → ring-3 `iretd` trampoline leaves the high half of ESP
             // (and possibly EIP) holding stale bits from the trampoline's own
@@ -856,7 +855,7 @@ fn store_regs(uc: &mut Unicorn<'static, Ctx>, r: &mut Regs, mode: UserMode) {
             }
         }
         UserMode::Mode64 => {
-            r.frame.rflags = rd(uc, RegisterX86::EFLAGS);
+            r.frame.rflags = rd(uc, RegisterX86::EFLAGS) | tf_shadows;
         }
     }
 }

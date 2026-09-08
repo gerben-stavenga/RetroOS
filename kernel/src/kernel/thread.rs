@@ -462,6 +462,7 @@ impl<A: crate::Arch> Personality<A> {
             Self::Dos(dos) => {
                 if !blocked {
                     crate::kernel::dos::raise_pending(machine, dos, regs);
+                    crate::kernel::dos::prepare_user_tf(dos, regs);
                 }
             }
             Self::Linux(linux) => {

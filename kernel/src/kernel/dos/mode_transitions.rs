@@ -191,7 +191,9 @@ fn fresh_rm_stack() -> (u16, u32) {
 }
 
 fn push_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &Regs, rm_call_struct_addr: Option<u32>) {
-    let save = HostContinuation::capture(regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr);
+    let save = HostContinuation::capture(
+        regs, dos.pc.locked_stack.other_stack, rm_call_struct_addr,
+    );
     dos.pc.locked_stack.continuations.push(save);
 }
 
@@ -296,6 +298,8 @@ pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &
     let next_rm_cursor = rm_stack(dos, regs);
     let pm_cursor = cursor.unwrap_or_else(|| pm_stack(dos, regs));
     push_continuation(dos, regs, rm_call_struct_addr);
+    regs.set_user_tf(false);
+    regs.project_tf();
     regs.frame.ss  = pm_cursor.0 as u64;
     regs.frame.rsp = pm_cursor.1 as u64;
     regs.frame.rflags &= !(machine::VM_FLAG as u64);
@@ -315,6 +319,8 @@ pub(super) fn enter_rm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut
                                       rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) {
     let pm_cursor = pm_stack(dos, regs);
     push_continuation(dos, regs, rm_call_struct_addr);
+    regs.set_user_tf(false);
+    regs.project_tf();
     regs.frame.ss  = rm_dest.0 as u64;
     regs.frame.rsp = rm_dest.1 as u64;
     regs.frame.rflags |= machine::VM_FLAG as u64;
@@ -431,6 +437,9 @@ pub(super) fn deliver_pm_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::
     };
     push_iret_frame(machine, &dos.ldt[..], regs, frame_use32,
         regs.ip32(), regs.code_seg(), machine::guest_flags(regs));
+    // INT saves guest TF in its IRET frame and clears guest TF for the handler.
+    regs.set_user_tf(false);
+    regs.project_tf();
     if sel == VECTOR_STUB_SEL && off == dos::STUB_BASE + (vector as u32) * 2 {
         let (stub_sel, stub_off) = synthetic_host_iret_target();
         regs.set_cs32(stub_sel as u32);
@@ -439,7 +448,6 @@ pub(super) fn deliver_pm_int<A: crate::Arch>(machine: &mut A, dos: &mut thread::
     }
     regs.set_cs32(sel as u32);
     regs.set_ip32(off);
-    regs.clear_flag32(1 << 8);
     // Skip per-call trace for noisy INT 21 character-output AHs so the
     // exception-handler dump and CRT printf output stay readable.
     let ah = (regs.rax >> 8) as u8;
@@ -594,6 +602,8 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         // one host continuation per nesting level; the handler's architectural
         // IRET frame returns through the host thunk that releases that level.
         push_continuation(dos, regs, None);
+        regs.set_user_tf(false);
+        regs.project_tf();
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
         push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
@@ -638,8 +648,9 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         return;
     }
 
-    // PM HW-IRQ handler entry: clear VM, the guest's virtual IF (VIF — handlers
-    // enter with interrupts disabled, textbook INT semantics), and TF. The real
+    // PM HW-IRQ handler entry: clear VM and the guest's virtual IF (VIF — handlers
+    // enter with interrupts disabled, textbook INT semantics). Guest TF was
+    // cleared through its shadow above. The real
     // IF (bit 9) is the host's, forced =1 at the arch exit.
     regs.frame.rflags &= !((machine::VM_FLAG | machine::VIF_FLAG | (1u32 << 8)) as u64);
     // ...and drop the *virtual* IOPL to the spec-strict level for the handler

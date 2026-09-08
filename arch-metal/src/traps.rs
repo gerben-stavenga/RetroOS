@@ -428,6 +428,8 @@ fn arch_switch_to(regs: &mut Regs) {
 pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     static mut VIF: bool = false;
     static mut VIP: bool = false;
+    static mut USER_TF: bool = false;
+    static mut FORCED_TF: bool = false;
     // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
     // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
     // stash holds the level the client is *treated* as having, so the dispatch
@@ -553,6 +555,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         // exit, so the just-pushed frame reads 1; put the virtual level back in
         // bits 12-13 before the dispatch so `virtual_if_stepping` sees it.
         unsafe { regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | ((VIOPL as u64) << 12); }
+        unsafe {
+            regs.set_user_tf(USER_TF);
+            regs.set_forced_tf(FORCED_TF);
+        }
         isr_handler_ring3(regs);
     } else {
         isr_handler_ring1(regs);
@@ -602,6 +608,11 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         // the kernel now owns the virtual IOPL and we carry it across the iret
         // like VIF/VIP, while the client always actually runs at IOPL=1.
         unsafe { VIOPL = ((regs.frame.rflags >> 12) & 3) as u8; }
+        unsafe {
+            USER_TF = regs.user_tf();
+            FORCED_TF = regs.forced_tf();
+        }
+        regs.frame.rflags &= !(arch_abi::USER_TF_SHADOW | arch_abi::FORCED_TF_SHADOW);
         regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
     }
 
@@ -675,7 +686,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
             }
             match regs.mode() {
                 UserMode::VM86 => KE::Exception(1),
-                UserMode::Mode32 => KE::VifStep,
+                UserMode::Mode32 => KE::DebugTrap,
                 _ => {
                     regs.clear_flag32(1 << 8); // stale internal TF
                     return;

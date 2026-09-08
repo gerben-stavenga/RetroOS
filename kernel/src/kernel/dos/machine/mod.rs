@@ -74,7 +74,9 @@ pub fn vm86_sp(regs: &Regs) -> u16 {
 pub fn guest_flags(regs: &Regs) -> u32 {
     let f = regs.flags32();
     let vif = f & VIF_FLAG != 0;
-    (f & !(IF_FLAG | VIF_FLAG)) | if vif { IF_FLAG } else { 0 }
+    (f & !(IF_FLAG | VIF_FLAG | (1 << 8)))
+        | if vif { IF_FLAG } else { 0 }
+        | if regs.user_tf() { 1 << 8 } else { 0 }
 }
 
 pub fn vm86_flags(regs: &Regs) -> u32 {
@@ -106,6 +108,7 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
     // canonical flags word is well-formed wherever it lands in a frame,
     // and bit 9 never carries guest state.
     let want_vif = flags & IF_FLAG != 0;
+    let want_tf = flags & (1 << 8) != 0;
     // The guest's IOPL bits (12-13) are NOT real state: under VME the VM86 flags
     // image reads back IOPL=3 regardless of the pinned real IOPL=1 (KVM), while
     // TCG hands back the literal 1. Never trust them — preserve the kernel-owned
@@ -118,6 +121,8 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
         | viopl;
     if want_vif { regs.frame.rflags |= VIF_FLAG as u64; }
     else        { regs.frame.rflags &= !(VIF_FLAG as u64); }
+    regs.set_user_tf(want_tf);
+    regs.project_tf();
 }
 
 /// Inverse of `guest_flags` for full-width (PM) images: apply a guest-view
@@ -128,6 +133,7 @@ pub fn set_vm86_flags(regs: &mut Regs, flags: u32) {
 #[inline]
 pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
     let want_vif = image & IF_FLAG != 0;
+    let want_tf = image & (1 << 8) != 0;
     let vm = regs.flags32() & VM_FLAG;
     // Preserve the kernel-owned virtual IOPL (see `set_vm86_flags`): the guest's
     // IOPL bits are a VME artifact under KVM, never trusted — like IF.
@@ -135,6 +141,8 @@ pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
     let mut nf = (image & !(IF_FLAG | VIF_FLAG | VM_FLAG | IOPL_MASK)) | vm | IF_FLAG | viopl;
     if want_vif { nf |= VIF_FLAG; }
     regs.set_flags32(nf);
+    regs.set_user_tf(want_tf);
+    regs.project_tf();
 }
 
 /// Canonical EFLAGS for entering a kernel-orchestrated VM86 excursion:

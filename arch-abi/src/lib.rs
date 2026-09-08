@@ -321,6 +321,12 @@ pub const USER_CS: u16 = 0x20 | 3; // Ring 3
 pub const USER_DS: u16 = 0x28 | 3; // Ring 3
 pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 
+/// Host-only shadows carried in the high half of canonical RFLAGS. They are
+/// never copied to a hardware interrupt frame. USER_TF is the guest's TF;
+/// FORCED_TF says the personality also needs physical single stepping.
+pub const USER_TF_SHADOW: u64 = 1 << 32;
+pub const FORCED_TF_SHADOW: u64 = 1 << 33;
+
 /// `Arch::map_phys_range` flag: map the range as an **emulated MMIO aperture** —
 /// present=0 with the regular Cache-Disable (PCD) attribute the kernel already
 /// uses for device memory (NVMe BARs, AC'97/SB DMA map present+PCD). The
@@ -471,7 +477,8 @@ impl Regs {
     }
 
     pub fn set_flags32(&mut self, flags: u32) {
-        self.frame.rflags = flags as u64;
+        let shadows = self.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
+        self.frame.rflags = flags as u64 | shadows;
     }
 
     pub fn set_flag32(&mut self, mask: u32) {
@@ -480,6 +487,31 @@ impl Regs {
 
     pub fn clear_flag32(&mut self, mask: u32) {
         self.set_flags32(self.flags32() & !mask);
+    }
+
+    pub fn user_tf(&self) -> bool {
+        self.frame.rflags & USER_TF_SHADOW != 0
+    }
+
+    pub fn set_user_tf(&mut self, on: bool) {
+        if on { self.frame.rflags |= USER_TF_SHADOW; }
+        else { self.frame.rflags &= !USER_TF_SHADOW; }
+    }
+
+    pub fn forced_tf(&self) -> bool {
+        self.frame.rflags & FORCED_TF_SHADOW != 0
+    }
+
+    pub fn set_forced_tf(&mut self, on: bool) {
+        if on { self.frame.rflags |= FORCED_TF_SHADOW; }
+        else { self.frame.rflags &= !FORCED_TF_SHADOW; }
+    }
+
+    /// Materialize the hardware TF from its two independent owners.
+    pub fn project_tf(&mut self) {
+        let on = self.user_tf() || self.forced_tf();
+        if on { self.set_flag32(1 << 8); }
+        else { self.clear_flag32(1 << 8); }
     }
 
     pub fn sp32(&self) -> u32 {
@@ -581,6 +613,39 @@ impl Regs {
             rsp: stack,
             ss: USER_DS as u64,
         };
+    }
+}
+
+#[cfg(test)]
+mod tf_shadow_tests {
+    use super::*;
+
+    #[test]
+    fn physical_tf_is_projection_of_guest_and_forced_sources() {
+        let mut r = Regs::empty();
+        r.set_forced_tf(true);
+        r.project_tf();
+        assert_ne!(r.flags32() & (1 << 8), 0);
+        assert!(!r.user_tf());
+
+        r.set_forced_tf(false);
+        r.set_user_tf(true);
+        r.project_tf();
+        assert_ne!(r.flags32() & (1 << 8), 0);
+
+        r.set_user_tf(false);
+        r.project_tf();
+        assert_eq!(r.flags32() & (1 << 8), 0);
+    }
+
+    #[test]
+    fn low_flags_updates_preserve_tf_shadows() {
+        let mut r = Regs::empty();
+        r.set_user_tf(true);
+        r.set_forced_tf(true);
+        r.set_flags32(2);
+        assert!(r.user_tf());
+        assert!(r.forced_tf());
     }
 }
 
@@ -700,10 +765,10 @@ pub enum KernelEvent {
     /// against its per-address-space map. `vif_was_on` distinguishes CLI (1→0)
     /// from STI (0→1). arch only reflects it — the policy lives in dos.
     VifWindow { entry_ip: u32, vif_was_on: bool },
-    /// A #DB while a PM DPMI client is inside a virtual-IF window — either the
-    /// post-tag trap (a tagged POPF/IRET ran) or a learning single-step. Handled
-    /// by `dpmi::vif::on_db`.
-    VifStep,
+    /// A protected-mode #DB. DOS attributes the retired instruction to every
+    /// active TF source: guest tracing, VIF learning/tag repair, and device
+    /// delays may coexist.
+    DebugTrap,
 }
 
 impl compact_fmt::Format for KernelEvent {
@@ -738,7 +803,7 @@ impl compact_fmt::Format for KernelEvent {
             Self::VifWindow { entry_ip, vif_was_on } => compact_fmt::write!(
                 out, "VifWindow {{ entry_ip: {}, vif_was_on: {} }}", entry_ip, vif_was_on,
             ),
-            Self::VifStep => out.write_str("VifStep"),
+            Self::DebugTrap => out.write_str("DebugTrap"),
         }
     }
 }
@@ -760,7 +825,7 @@ impl KernelEvent {
     const FAULT:      u32 = 10;
     const SYSCALL:    u32 = 11;
     const VIF_WINDOW: u32 = 12; // `vif_was_on` packed into tag bit 8; entry_ip in extra
-    const VIF_STEP:   u32 = 13;
+    const DEBUG_TRAP:   u32 = 13;
 
     /// Encode into the `(event, extra)` u32 pair that flows across the
     /// arch→kernel boundary as `(eax, edx)`. Total over all variants.
@@ -780,7 +845,7 @@ impl KernelEvent {
             KernelEvent::Outs { size, rep, addr32 } => (Self::OUTS, (size as u32) | ((rep as u32) << 8) | ((addr32 as u32) << 9)),
             KernelEvent::Fault                => (Self::FAULT, 0),
             KernelEvent::VifWindow { entry_ip, vif_was_on } => (Self::VIF_WINDOW | ((vif_was_on as u32) << 8), entry_ip),
-            KernelEvent::VifStep              => (Self::VIF_STEP, 0),
+            KernelEvent::DebugTrap              => (Self::DEBUG_TRAP, 0),
         }
     }
 
@@ -799,7 +864,7 @@ impl KernelEvent {
             Self::OUTS       => KernelEvent::Outs { size: IoSize::from_u32(extra), rep: extra & (1 << 8) != 0, addr32: extra & (1 << 9) != 0 },
             Self::FAULT      => KernelEvent::Fault,
             Self::VIF_WINDOW => KernelEvent::VifWindow { entry_ip: extra, vif_was_on: event & (1 << 8) != 0 },
-            Self::VIF_STEP   => KernelEvent::VifStep,
+            Self::DEBUG_TRAP   => KernelEvent::DebugTrap,
             _ => panic!("KernelEvent::decode: unknown tag {:#x}", event),
         }
     }

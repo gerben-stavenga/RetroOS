@@ -243,7 +243,6 @@ pub struct EmulatedSb {
     /// the byte; a few retired guest instructions preserve that ordering
     /// while still meeting old drivers' very short probe windows.
     probe_steps: u8,
-    probe_forced_tf: bool,
     /// Linearized guest DMA window for the software mixer. The emulated SB16
     /// is capped at the canonical mix rate, so one 128-frame 16-bit stereo
     /// block is the strict maximum. Audio mixing therefore never allocates.
@@ -268,7 +267,7 @@ impl EmulatedSb {
             core: sound::sb::Sb::new(),
             mix_pos_q32: 0,
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
-            probe_steps: 0, probe_forced_tf: false,
+            probe_steps: 0,
             dsp_scratch: [0; DSP_SCRATCH_BYTES],
         })
     }
@@ -342,30 +341,20 @@ impl SoundBlaster {
     }
 
     /// Retire a few guest instructions before a tiny DMA transfer may complete.
-    pub fn arm_probe_step(&mut self, regs: &mut Regs) {
-        let SbDevice::Emulated(emu) = &mut self.device else { return };
-        if emu.probe_steps == 0 {
-            return;
-        }
-        let forced = regs.flags32() & (1 << 8) == 0;
-        emu.probe_forced_tf = forced;
-        regs.set_flag32(1 << 8);
-    }
-
     /// Whether pending IRQ injection must wait for the probe delay to retire.
     pub fn probe_is_stepping(&self) -> bool {
         matches!(&self.device, SbDevice::Emulated(emu) if emu.probe_steps != 0)
     }
 
-    /// Consume one #DB belonging to the probe delay. Returns whether TF was
-    /// ours and whether the final delayed instruction has now retired.
-    pub fn complete_probe_step(&mut self) -> Option<(bool, bool)> {
+    /// Consume one retired instruction from the probe delay. Returns whether
+    /// the final delayed instruction has now retired.
+    pub fn complete_probe_step(&mut self) -> Option<bool> {
         let SbDevice::Emulated(emu) = &mut self.device else { return None };
         if emu.probe_steps == 0 {
             return None;
         }
         emu.probe_steps -= 1;
-        Some((emu.probe_forced_tf, emu.probe_steps == 0))
+        Some(emu.probe_steps == 0)
     }
 
     /// Read an SB DSP/mixer/OPL port.

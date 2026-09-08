@@ -91,6 +91,11 @@ use dos::{
 use crate::kernel::thread;
 use crate::Regs;
 
+const TF_FLAG: u32 = 1 << 8;
+const TF_USER: u8 = 1;
+const TF_LEARNING: u8 = 2;
+const TF_DELAY: u8 = 4;
+
 /// DOS-specific thread state: virtual hardware machine + DOS personality + optional DPMI.
 ///
 /// Split into three logical groups:
@@ -173,6 +178,10 @@ pub struct DosState<A: crate::Arch> {
     pub pm_rm_vector_shadow: [(u16, u16, u16); 256],
 
     pub dpmi: Option<alloc::boxed::Box<dpmi::DpmiState>>,
+
+    /// Kernel-owned reasons the physical CPU must run with TF set. Guest TF
+    /// lives in `Regs::user_tf`; the live EFLAGS bit is only their projection.
+    pub(super) tf_sources: u8,
 
     /// PMDOS short-circuit for INT 21 from PM. When set, `pm_vectors[0x21]`
     /// targets `SLOT_PMDOS_INT21` instead of the generic vector stub —
@@ -284,6 +293,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).dpmi_phys_next).write(dpmi::PHYS_MAP_TOP);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_rm_vector_shadow), 0, 1);
             core::ptr::addr_of_mut!((*p).dpmi).write(None);
+            core::ptr::addr_of_mut!((*p).tf_sources).write(0);
             core::ptr::addr_of_mut!((*p).pm_dos).write(false);
             core::ptr::addr_of_mut!((*p).suspended_calls).write(alloc::vec::Vec::new());
             state.assume_init()
@@ -639,6 +649,46 @@ fn fault_segment_bases<A: crate::Arch>(
     }
 }
 
+fn set_tf_source<A: crate::Arch>(dos: &mut thread::DosState<A>, source: u8, on: bool) {
+    if on { dos.tf_sources |= source; } else { dos.tf_sources &= !source; }
+}
+
+pub(crate) fn prepare_user_tf<A: crate::Arch>(dos: &thread::DosState<A>, regs: &mut Regs) {
+    regs.set_forced_tf(dos.tf_sources != 0);
+    regs.project_tf();
+}
+
+fn active_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
+    dos.tf_sources | if regs.user_tf() { TF_USER } else { 0 }
+}
+
+/// Split the physical TF observed on entry back into guest and kernel state.
+/// The forced-TF shadow records whether the last user entry projected an
+/// internal source, so that projection can never be mistaken for guest TF.
+fn enter_kernel_tf<A: crate::Arch>(
+    dos: &mut thread::DosState<A>, regs: &mut Regs, event: &crate::KernelEvent,
+) {
+    // KVM implements single-step through KVM_GUESTDBG and consequently strips
+    // TF from the returned RFLAGS. A debug event itself is authoritative that
+    // the projected TF was active for the retired instruction.
+    let actual = regs.flags32() & TF_FLAG != 0
+        || matches!(event, crate::KernelEvent::DebugTrap | crate::KernelEvent::Exception(1));
+    let vif = dos.dpmi.as_ref().is_some_and(|d| d.vif.owns_db());
+    if actual && vif {
+        dos.tf_sources |= TF_LEARNING;
+    }
+    if !regs.forced_tf() && !(actual && vif) {
+        regs.set_user_tf(actual);
+    }
+    regs.set_forced_tf(false);
+    regs.project_tf();
+}
+
+fn refresh_learning_tf<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+    let learning = dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning());
+    set_tf_source(dos, TF_LEARNING, learning);
+}
+
 /// Continue a VIF trace at the current IP. Besides real #DBs, this is needed
 /// after an instruction was completed by the fault monitor: fault-emulated I/O
 /// advances IP but does not retire, so the CPU cannot generate the #DB that TF
@@ -652,7 +702,10 @@ fn continue_vif<A: crate::Arch>(
     regs: &mut Regs,
 ) -> thread::KernelAction {
     loop {
-        match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
+        let result = dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs));
+        refresh_learning_tf(dos);
+        regs.project_tf();
+        match result {
             Some(dpmi::DbResult::Event(ev)) => {
                 let action = handle_event(machine, &mut *bios_display, kt, dos, regs, ev);
                 if !matches!(action, thread::KernelAction::Done)
@@ -666,15 +719,66 @@ fn continue_vif<A: crate::Arch>(
     }
 }
 
-fn continue_vif_after_io<A: crate::Arch>(
+/// Dispatch the #DB produced by one retired instruction to every TF source
+/// that was active for that instruction.
+fn handle_debug_trap<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
+    sources: u8,
 ) -> thread::KernelAction {
-    if dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning()) {
-        continue_vif(machine, bios_display, kt, dos, regs)
+    if sources & TF_DELAY != 0
+        && dos.pc.sb.complete_probe_step().is_some_and(|done| done)
+    {
+        set_tf_source(dos, TF_DELAY, false);
+    }
+
+    let mut action = thread::KernelAction::Done;
+    if sources & TF_LEARNING != 0 {
+        action = continue_vif(machine, bios_display, kt, dos, regs);
+        if !matches!(action, thread::KernelAction::Done) {
+            regs.project_tf();
+            return action;
+        }
+    }
+
+    if sources & TF_USER != 0 {
+        // Exception dispatch sees only the guest's TF. Kernel-owned stepping
+        // remains in dos.tf_sources and cannot leak into the exception frame.
+        action = if regs.mode() == crate::UserMode::VM86 {
+            if machine.read::<u16>(4 + 2) != dos::STUB_SEG {
+                arch_abi::monitor::sw_reflect_vm86_int(regs, machine, 1);
+            } else {
+                regs.set_user_tf(false);
+                regs.project_tf();
+            }
+            thread::KernelAction::Done
+        } else if dos.dpmi.is_some() {
+            dpmi::dispatch_dpmi_exception(machine, dos, regs, 1)
+        } else {
+            regs.set_user_tf(false);
+            regs.project_tf();
+            thread::KernelAction::Done
+        };
+    }
+    regs.project_tf();
+    action
+}
+
+/// A #GP-emulated I/O instruction has retired without hardware being able to
+/// raise its pending #DB. Deliver it now at the already-advanced EIP.
+fn raise_db_after_emulated_io<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+    sources: u8,
+) -> thread::KernelAction {
+    if sources != 0 {
+        handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
     } else {
         thread::KernelAction::Done
     }
@@ -697,6 +801,7 @@ pub fn handle_event<A: crate::Arch>(
 ) -> thread::KernelAction {
     use crate::KernelEvent as KE;
 
+    enter_kernel_tf(dos, regs, &kevent);
     let is_vm86 = regs.mode() == crate::UserMode::VM86;
     match kevent {
         KE::Irq => thread::KernelAction::Done,
@@ -718,15 +823,13 @@ pub fn handle_event<A: crate::Arch>(
                     dpmi.vif.on_sti(regs);
                 }
             }
+            refresh_learning_tf(dos);
+            regs.project_tf();
             thread::KernelAction::Done
         }
-        KE::VifStep => {
-            if let Some((true, done)) = dos.pc.sb.complete_probe_step() {
-                if done { regs.clear_flag32(1 << 8); }
-                thread::KernelAction::Done
-            } else {
-                continue_vif(machine, bios_display, kt, dos, regs)
-            }
+        KE::DebugTrap => {
+            let sources = active_tf_sources(dos, regs);
+            handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
         }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
         // must NOT yield/schedule — that would hand focus to the next Ready
@@ -789,21 +892,30 @@ pub fn handle_event<A: crate::Arch>(
             }
         }
         KE::In { port, size } => {
+            let sources = active_tf_sources(dos, regs);
             machine::handle_in_event(machine, &mut dos.pc, regs, port, size.bytes());
-            continue_vif_after_io(machine, bios_display, kt, dos, regs)
+            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
         }
         KE::Out { port, size } => {
+            let sources = active_tf_sources(dos, regs);
             machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
-            dos.pc.sb.arm_probe_step(regs);
-            continue_vif_after_io(machine, bios_display, kt, dos, regs)
+            let action = raise_db_after_emulated_io(
+                machine, bios_display, kt, dos, regs, sources,
+            );
+            let delay = dos.pc.sb.probe_is_stepping();
+            set_tf_source(dos, TF_DELAY, delay);
+            regs.project_tf();
+            action
         }
         KE::Ins { size, rep, addr32 } => {
+            let sources = active_tf_sources(dos, regs);
             machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            continue_vif_after_io(machine, bios_display, kt, dos, regs)
+            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
         }
         KE::Outs { size, rep, addr32 } => {
+            let sources = active_tf_sources(dos, regs);
             machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
-            continue_vif_after_io(machine, bios_display, kt, dos, regs)
+            raise_db_after_emulated_io(machine, bios_display, kt, dos, regs, sources)
         }
         KE::Exception(n) => {
             // CLI/STI never arrive here: a CPL-3 CLI/STI #GP is a sensitive
@@ -817,27 +929,9 @@ pub fn handle_event<A: crate::Arch>(
             // bare VM86 program may deliberately hook INT 1 and single-step
             // itself (ST3's packer). Ownership state, rather than CPU mode,
             // separates those cases.
-            if n == 1 && is_vm86 {
-                if let Some((true, done)) = dos.pc.sb.complete_probe_step() {
-                    if done { regs.clear_flag32(1 << 8); }
-                    return thread::KernelAction::Done;
-                }
-                let vif_owns_db = dos.dpmi.as_ref().is_some_and(|d| d.vif.owns_db());
-                if vif_owns_db {
-                    return match dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs)) {
-                        Some(dpmi::DbResult::Event(ev)) =>
-                            handle_event(machine, bios_display, kt, dos, regs, ev),
-                        _ => thread::KernelAction::Done,
-                    };
-                }
-                if machine.read::<u16>(4 + 2) != dos::STUB_SEG {
-                    arch_abi::monitor::sw_reflect_vm86_int(regs, machine, 1);
-                } else {
-                    // No guest handler owns this trace. Avoid restoring TF and
-                    // trapping forever on the next VM86 instruction.
-                    regs.clear_flag32(1 << 8);
-                }
-                return thread::KernelAction::Done;
+            if n == 1 {
+                let sources = active_tf_sources(dos, regs);
+                return handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
             }
 
             // DPMI session active: route to client's exception handler

@@ -131,7 +131,6 @@ impl VifMap {
             Some(Class::Sti) => {
                 // Run free — the STI will #GP and close it.
                 self.stats[1] = self.stats[1].wrapping_add(1);
-                regs.clear_flag32(TF_FLAG);
             }
             // Flags saved on the stack BEFORE the CLI (d >= 0): the word exists
             // now and nothing rewrites it before the exit reads it — tag it.
@@ -141,7 +140,6 @@ impl VifMap {
                 if looks_like_flags(w) {
                     arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
                     self.stats[1] = self.stats[1].wrapping_add(1);
-                    regs.clear_flag32(TF_FLAG);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
                 }
@@ -155,7 +153,6 @@ impl VifMap {
                 if looks_like_flags(v) {
                     set_reg32(regs, r, v | TF_FLAG);
                     self.stats[1] = self.stats[1].wrapping_add(1);
-                    regs.clear_flag32(TF_FLAG);
                 } else {
                     self.begin_learn(regs, None); // register isn't flags right now → relearn
                 }
@@ -188,7 +185,6 @@ impl VifMap {
         {
             self.sites.insert(a.cli_ip, Class::Sti);
         }
-        regs.clear_flag32(TF_FLAG);
     }
 
     /// A `#DB`: either the post-tag trap (a tagged `POPF`/`IRET` just ran) or a
@@ -200,7 +196,6 @@ impl VifMap {
                 // Post-tag (or self-heal of a leaked tag): restore VIF, one
                 // instruction late; clear TF.
                 regs.set_flags32(regs.flags32() | VIF_FLAG);
-                regs.clear_flag32(TF_FLAG);
                 self.active = None;
                 self.stats[2] = self.stats[2].wrapping_add(1);
                 DbResult::Resume
@@ -216,7 +211,6 @@ impl VifMap {
                 *s = reg32(regs, i as u8);
             }
         }
-        regs.set_flag32(TF_FLAG);
     }
 
     /// Single-step the window, emulating each sensitive op; when one re-enables
@@ -225,7 +219,6 @@ impl VifMap {
         const BUDGET: usize = 64;
         for _ in 0..BUDGET {
             if regs.flags32() & VIF_FLAG != 0 {
-                regs.clear_flag32(TF_FLAG);
                 self.active = None;
                 return DbResult::Resume;
             }
@@ -246,20 +239,26 @@ impl VifMap {
             let op = arch.read::<u8>(cs_base.wrapping_add(p) as usize);
             if !matches!(op, 0x9C | 0x9D | 0xCF | 0xFA | 0xFB) {
                 self.stats[3] = self.stats[3].wrapping_add(1);
-                regs.set_flag32(TF_FLAG);
                 return DbResult::Resume;
             }
             let op32 = cs_32 ^ has66; // operand width of this instruction
             let sp_before = regs.sp32();
             let ip_before = regs.ip32(); // this instruction's start (the exit's IP)
-            match arch_abi::monitor::monitor(arch, regs) {
+            // The flags image may carry our TF tag. The shared monitor quite
+            // correctly treats popped TF as guest TF in ordinary trap
+            // emulation, but inside the VIF learner that bit belongs to this
+            // state machine. Preserve the independently tracked guest value.
+            let user_tf = regs.user_tf();
+            let monitored = arch_abi::monitor::monitor(arch, regs);
+            regs.set_user_tf(user_tf);
+            regs.project_tf();
+            match monitored {
                 arch_abi::monitor::MonitorResult::Resume => {
                     if regs.flags32() & VIF_FLAG != 0 {
                         if let Some(a) = self.active {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
                             self.sites.insert(a.cli_ip, class);
                         }
-                        regs.clear_flag32(TF_FLAG);
                         self.active = None;
                         return DbResult::Resume;
                     }
@@ -268,7 +267,6 @@ impl VifMap {
             }
         }
         self.stats[3] = self.stats[3].wrapping_add(1);
-        regs.set_flag32(TF_FLAG);
         DbResult::Resume
     }
 
