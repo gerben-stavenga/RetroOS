@@ -3,7 +3,7 @@
 //! The terminal itself — grid, cursor, ANSI parser — is `lib::term`, shared by
 //! every embedder. This module turns that grid into a canonical 720x400 content
 //! buffer, attaches it to a personality-neutral scene node, and composes the
-//! scene into the current display's packed shadow. Legacy boot consoles may
+//! scene into the current display's encoded word shadow. Legacy boot consoles may
 //! still let a real VGA scan B8000 directly before the event loop takes over.
 //!
 //! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. No
@@ -27,8 +27,8 @@ struct Scanout {
     pal_cache: [u8; 768],
     /// Process-independent terminal pixels borrowed by the event-loop compositor.
     content: alloc::vec::Vec<u32>,
-    /// Output-format shadow produced by the GUI scene compositor.
-    surface: alloc::vec::Vec<u8>,
+    /// Display-encoded word shadow produced by the GUI scene compositor.
+    surface: alloc::vec::Vec<u32>,
     /// Startup/panic path before an event loop owns the real desktop.
     bootstrap_desktop: Option<crate::kernel::gui::Desktop>,
 }
@@ -75,10 +75,10 @@ pub fn present<A: crate::Arch>(
     if !DIRTY.swap(false, Ordering::AcqRel) || display.shadow_width == 0 {
         return;
     }
-    let Some((height, shadow)) = render(display, None) else {
+    let Some((width, height, shadow)) = render(display, None) else {
         return;
     };
-    display.present(machine, bios, height, shadow);
+    display.present_native(machine, bios, width, height, shadow);
 }
 
 /// Event-loop publication through the desktop that outlives every focused
@@ -96,18 +96,18 @@ pub fn present_on<A: crate::Arch>(
         return;
     }
     DIRTY.store(false, Ordering::Release);
-    let Some((height, shadow)) = render(display, Some((desktop, endpoint))) else {
+    let Some((width, height, shadow)) = render(display, Some((desktop, endpoint))) else {
         return;
     };
-    display.present(machine, bios, height, shadow);
+    display.present_native(machine, bios, width, height, shadow);
 }
 
 /// Best-effort terminal publication for the panic handler.  The system is no
 /// longer live, so deliberately seize the global scanout even if the failed
 /// call chain had borrowed it.
 pub fn panic_present(display: &mut Display) {
-    if let Some((height, shadow)) = render(display, None) {
-        display.panic_present(height, shadow);
+    if let Some((width, height, shadow)) = render(display, None) {
+        display.panic_present_native(width, height, shadow);
     }
 }
 
@@ -117,7 +117,7 @@ fn render(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
-) -> Option<(usize, &'static mut [u8])> {
+) -> Option<(usize, usize, &'static mut [u32])> {
     if display.shadow_width == 0 {
         return None;
     }
@@ -159,11 +159,10 @@ fn render_frame(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
-) -> Option<(usize, &'static mut [u8])> {
+) -> Option<(usize, usize, &'static mut [u32])> {
     let managed = desktop.is_some();
     let (w, h) = vga::dimensions(frame.mode);
-    let out_w = display.shadow_width;
-    if w == 0 || h == 0 || out_w == 0 {
+    if w == 0 || h == 0 || display.shadow_width == 0 {
         return None;
     }
 
@@ -205,7 +204,7 @@ fn render_frame(
     let surface_id = desktop
         .ensure_surface(endpoint, TERMINAL_SURFACE)
         .expect("create terminal surface");
-    let node_width = if managed { w } else { out_w };
+    let node_width = w;
     let node = desktop
         .ensure_node(
             endpoint,
@@ -255,13 +254,10 @@ fn render_frame(
         extent.width as usize,
         extent.height as usize,
     );
-    if display.is_host() {
-        display.shadow_width = canvas_width;
-    }
     desktop
         .compose_surfaces(&contents, canvas_width, canvas_height, display.rgb, surface)
         .expect("compose terminal scene");
-    Some((canvas_height, surface))
+    Some((canvas_width, canvas_height, surface))
 }
 
 pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {

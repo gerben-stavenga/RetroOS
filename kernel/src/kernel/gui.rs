@@ -54,8 +54,10 @@ pub struct PixelBuffer<'a> {
     pub width: usize,
     pub height: usize,
     pub stride: usize,
+    pixel_stride: usize,
     pub format: vga::PixelFormat,
     pixels: &'a [u8],
+    words: Option<&'a [u32]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,8 +93,30 @@ impl<'a> PixelBuffer<'a> {
             width,
             height,
             stride,
+            pixel_stride: format.bytes_per_pixel as usize,
             format,
             pixels,
+            words: None,
+        })
+    }
+
+    pub fn new_words(
+        width: usize,
+        height: usize,
+        format: vga::PixelFormat,
+        pixels: &'a [u32],
+    ) -> Result<Self, BufferError> {
+        if !valid_format(format) { return Err(BufferError::InvalidFormat); }
+        let words = width.checked_mul(height).ok_or(BufferError::Overflow)?;
+        let stride = width.checked_mul(4).ok_or(BufferError::Overflow)?;
+        let bytes_len = words.checked_mul(4).ok_or(BufferError::Overflow)?;
+        if pixels.len() < words { return Err(BufferError::TooShort); }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), bytes_len)
+        };
+        Ok(Self {
+            width, height, stride, pixel_stride: 4, format,
+            pixels: bytes, words: Some(&pixels[..words]),
         })
     }
 }
@@ -300,7 +324,7 @@ struct SwitcherRegions<'a> {
 }
 
 pub struct ComposedFrame<'a> {
-    pub pixels: &'a mut Vec<u8>,
+    pub pixels: &'a mut Vec<u32>,
     pub damage: Vec<Rect>,
 }
 
@@ -445,7 +469,7 @@ impl Desktop {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError> {
         self.scene.compose(contents, width, height, format, output)
     }
@@ -457,7 +481,7 @@ impl Desktop {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError> {
         self.compose_surfaces_with(contents, None, width, height, format, output)
     }
@@ -469,7 +493,7 @@ impl Desktop {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError> {
         let resolve = |id| {
             if let Some(content) = system.filter(|content| content.id == id) {
@@ -489,7 +513,7 @@ impl Desktop {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError>
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
@@ -507,7 +531,6 @@ impl Desktop {
                 output,
                 width,
                 height,
-                width * format.bytes_per_pixel as usize,
                 format,
                 point,
             );
@@ -598,28 +621,27 @@ impl Desktop {
 /// Classic arrow drawn after scene composition, leaving application surfaces
 /// untouched as the pointer moves.
 fn draw_pointer(
-    output: &mut [u8], width: usize, height: usize, stride: usize,
+    output: &mut [u32], width: usize, height: usize,
     format: vga::PixelFormat, point: Point,
 ) {
-    let step = format.bytes_per_pixel as usize;
-    let black = format.encode(0x0000_0000).to_le_bytes();
-    let white = format.encode(0x00ff_ffff).to_le_bytes();
-    let mut pixel = |x: i32, y: i32, color: &[u8; 4]| {
+    let black = format.encode(0x0000_0000);
+    let white = format.encode(0x00ff_ffff);
+    let mut pixel = |x: i32, y: i32, color: u32| {
         if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 { return; }
-        let at = y as usize * stride + x as usize * step;
-        if at + step <= output.len() { output[at..at + step].copy_from_slice(&color[..step]); }
+        let at = y as usize * width + x as usize;
+        if let Some(pixel) = output.get_mut(at) { *pixel = color; }
     };
     for y in 0..14i32 {
         let edge = y / 2;
         for x in 0..=edge {
             let outline = x == 0 || x == edge || y == 13;
-            pixel(point.x + x, point.y + y, if outline { &black } else { &white });
+            pixel(point.x + x, point.y + y, if outline { black } else { white });
         }
     }
     for y in 10..18i32 {
         for x in 3..=5i32 {
             let outline = x == 3 || x == 5 || y == 17;
-            pixel(point.x + x, point.y + y, if outline { &black } else { &white });
+            pixel(point.x + x, point.y + y, if outline { black } else { white });
         }
     }
 }
@@ -633,7 +655,7 @@ fn draw_pointer(
 #[derive(Debug)]
 pub struct WindowManager {
     desktop: Desktop,
-    composed: Vec<u8>,
+    composed: Vec<u32>,
     osd_pixels: Vec<u8>,
     osd_rect: Option<Rect>,
     osd_geometry: Option<(usize, usize, vga::PixelFormat)>,
@@ -696,7 +718,7 @@ impl WindowManager {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-    ) -> Result<&'a mut Vec<u8>, ComposeError> {
+    ) -> Result<&'a mut Vec<u32>, ComposeError> {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
         let Self { desktop, composed, osd_pixels, osd_rect, .. } = self;
@@ -766,9 +788,7 @@ impl WindowManager {
             _ => None,
         };
         let mut damage = desktop.output_damage(width, height, switcher);
-        let step = format.bytes_per_pixel as usize;
-        let required = width.checked_mul(height).and_then(|n| n.checked_mul(step))
-            .ok_or(ComposeError::Overflow)?;
+        let required = width.checked_mul(height).ok_or(ComposeError::Overflow)?;
         if composed.len() != required {
             damage.clear();
             damage.push(Rect::new(0, 0, width as u32, height as u32));
@@ -780,9 +800,7 @@ impl WindowManager {
         if !damage.is_empty()
             && let Some(point) = desktop.pointer
         {
-            draw_pointer(
-                composed, width, height, width * step, format, point,
-            );
+            draw_pointer(composed, width, height, format, point);
         }
         desktop.finish_damage();
         Ok(ComposedFrame { pixels: composed, damage })
@@ -1212,10 +1230,10 @@ impl Scene {
         None
     }
 
-    /// Composite visible content back-to-front into one packed output shadow.
+    /// Composite visible content back-to-front into one encoded-word shadow.
     ///
-    /// Content buffers remain producer-owned and may use any validated packed
-    /// RGB layout.  Geometry, clipping, stacking, scaling, and global opacity
+    /// Content buffers remain producer-owned and may use packed bytes or one
+    /// encoded `u32` per pixel. Geometry, clipping, stacking, scaling, and global opacity
     /// are scene mechanisms; decorations and native paint semantics remain in
     /// the personality that produced the buffers.
     pub fn compose(
@@ -1224,7 +1242,7 @@ impl Scene {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError> {
         self.compose_endpoint(None, contents, width, height, format, output)
     }
@@ -1236,7 +1254,7 @@ impl Scene {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError> {
         let resolve = |id| {
             contents
@@ -1254,7 +1272,7 @@ impl Scene {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
     ) -> Result<usize, ComposeError>
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
@@ -1262,11 +1280,7 @@ impl Scene {
         if !valid_format(format) {
             return Err(ComposeError::InvalidOutputFormat);
         }
-        let step = format.bytes_per_pixel as usize;
-        let len = width
-            .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(step))
-            .ok_or(ComposeError::Overflow)?;
+        let len = width.checked_mul(height).ok_or(ComposeError::Overflow)?;
         output.clear();
         output.resize(len, 0);
         let output_clip = Rect::new(
@@ -1278,7 +1292,6 @@ impl Scene {
         let target = Target {
             width,
             height,
-            stride: width * step,
             format,
             pixels: output,
         };
@@ -1300,7 +1313,7 @@ impl Scene {
         width: usize,
         height: usize,
         format: vga::PixelFormat,
-        output: &mut Vec<u8>,
+        output: &mut Vec<u32>,
         regions: SwitcherRegions<'_>,
     ) -> Result<usize, ComposeError>
     where
@@ -1310,16 +1323,14 @@ impl Scene {
         if !valid_format(format) {
             return Err(ComposeError::InvalidOutputFormat);
         }
-        let step = format.bytes_per_pixel as usize;
-        let len = width.checked_mul(height).and_then(|n| n.checked_mul(step))
-            .ok_or(ComposeError::Overflow)?;
+        let len = width.checked_mul(height).ok_or(ComposeError::Overflow)?;
         let canvas = Rect::new(0, 0, u32::try_from(width).unwrap_or(u32::MAX),
             u32::try_from(height).unwrap_or(u32::MAX));
         if output.len() != len {
             output.clear();
             output.resize(len, 0);
         }
-        let target = Target { width, height, stride: width * step, format, pixels: output };
+        let target = Target { width, height, format, pixels: output };
         let mut target = target;
         let mut compose_clip = |clip: Rect| {
             let Some(clip) = intersect(canvas, clip) else { return };
@@ -1575,13 +1586,11 @@ impl Scene {
 struct Target<'a> {
     width: usize,
     height: usize,
-    stride: usize,
     format: vga::PixelFormat,
-    pixels: &'a mut [u8],
+    pixels: &'a mut [u32],
 }
 
 fn clear_rect(target: &mut Target<'_>, rect: Rect) {
-    let step = target.format.bytes_per_pixel as usize;
     let x = rect.x.max(0) as usize;
     let y = rect.y.max(0) as usize;
     let right = (i64::from(rect.x) + i64::from(rect.width))
@@ -1590,8 +1599,8 @@ fn clear_rect(target: &mut Target<'_>, rect: Rect) {
         .clamp(0, target.height as i64) as usize;
     if x >= right || y >= bottom { return; }
     for row in y..bottom {
-        let start = row * target.stride + x * step;
-        let end = row * target.stride + right * step;
+        let start = row * target.width + x;
+        let end = row * target.width + right;
         target.pixels[start..end].fill(0);
     }
 }
@@ -1674,17 +1683,25 @@ fn push_damage(regions: &mut Vec<Rect>, mut rect: Rect) {
 }
 
 #[optimize(speed)]
-fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
+fn read_encoded(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
+    if let Some(words) = buffer.words {
+        return words[y * buffer.width + x];
+    }
     let step = buffer.format.bytes_per_pixel as usize;
-    let offset = y * buffer.stride + x * step;
+    let offset = y * buffer.stride + x * buffer.pixel_stride;
     let bytes = &buffer.pixels[offset..offset + step];
-    let raw = match step {
+    match step {
         1 => u32::from(bytes[0]),
         2 => u32::from(u16::from_le_bytes([bytes[0], bytes[1]])),
         3 => u32::from(bytes[0]) | u32::from(bytes[1]) << 8 | u32::from(bytes[2]) << 16,
         4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         _ => unreachable!("validated pixel format"),
-    };
+    }
+}
+
+#[optimize(speed)]
+fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
+    let raw = read_encoded(buffer, x, y);
     if buffer.format.is_native() {
         return raw & 0x00FF_FFFF;
     }
@@ -1699,22 +1716,20 @@ fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
 
 #[optimize(speed)]
 fn read_target(target: &Target<'_>, x: usize, y: usize) -> u32 {
-    let buffer = PixelBuffer {
-        width: target.width,
-        height: target.height,
-        stride: target.stride,
-        format: target.format,
-        pixels: target.pixels,
+    let raw = target.pixels[y * target.width + x];
+    if target.format.is_native() { return raw & 0x00ff_ffff; }
+    let channel = |position: u8, size: u8| -> u32 {
+        let mask = (1u32 << size) - 1;
+        (raw >> position & mask) * 255 / mask
     };
-    read_pixel(buffer, x, y)
+    channel(target.format.red_pos, target.format.red_size) << 16
+        | channel(target.format.green_pos, target.format.green_size) << 8
+        | channel(target.format.blue_pos, target.format.blue_size)
 }
 
 #[optimize(speed)]
 fn write_target(target: &mut Target<'_>, x: usize, y: usize, rgb: u32) {
-    let step = target.format.bytes_per_pixel as usize;
-    let offset = y * target.stride + x * step;
-    let encoded = target.format.encode(rgb).to_le_bytes();
-    target.pixels[offset..offset + step].copy_from_slice(&encoded[..step]);
+    target.pixels[y * target.width + x] = target.format.encode(rgb);
 }
 
 #[optimize(speed)]
@@ -1752,9 +1767,7 @@ fn blit_scaled(
     let bottom = usize::try_from(i64::from(draw.y) + i64::from(draw.height))
         .unwrap_or(target.height)
         .min(target.height);
-    // Existing full-frame producers can enter the scene cheaply: if their
-    // packed pixels already match an opaque, unscaled destination, composition
-    // is one row copy rather than a decode/encode pass over every pixel.
+    // A display-encoded word surface enters the compositor as row copies.
     if opacity == u8::MAX
         && source.format == target.format
         && destination == draw
@@ -1763,66 +1776,32 @@ fn blit_scaled(
         && source.width == destination.width as usize
         && source.height == destination.height as usize
     {
-        let step = target.format.bytes_per_pixel as usize;
-        let row_bytes = source.width * step;
-        let left = destination.x as usize * step;
+        let left = destination.x as usize;
         let top = destination.y as usize;
-        if left + row_bytes <= target.stride && top + source.height <= target.height {
+        if left + source.width <= target.width && top + source.height <= target.height {
             for row in 0..source.height {
-                let source_start = row * source.stride;
-                let target_start = (top + row) * target.stride + left;
-                target.pixels[target_start..target_start + row_bytes]
-                    .copy_from_slice(&source.pixels[source_start..source_start + row_bytes]);
+                let target_start = (top + row) * target.width + left;
+                if let Some(words) = source.words {
+                    let source_width = source.width;
+                    let source = &words[row * source_width..(row + 1) * source_width];
+                    target.pixels[target_start..target_start + source_width]
+                        .copy_from_slice(source);
+                } else {
+                    for x in 0..source.width {
+                        target.pixels[target_start + x] = read_encoded(source, x, row);
+                    }
+                }
             }
             return;
         }
     }
-    // The common fullscreen surface already has its final geometry. Convert
-    // its packed format directly instead of running the general scaler's two
-    // integer divisions for every pixel.
+    // An opaque unscaled source only needs format conversion.
     if opacity == u8::MAX
         && source.width == destination.width as usize
         && source.height == destination.height as usize
     {
         let ox = destination.x;
         let oy = destination.y;
-        if source.format.is_native() && target.format == vga::PixelFormat::RGB565 {
-            let count = right.saturating_sub(left);
-            for y in top..bottom {
-                let sx = (left as i64 - i64::from(ox)) as usize;
-                let sy = (y as i64 - i64::from(oy)) as usize;
-                let src = unsafe {
-                    source.pixels.as_ptr().add(sy * source.stride + sx * 4).cast::<u32>()
-                };
-                let dst = unsafe {
-                    target.pixels.as_mut_ptr().add(y * target.stride + left * 2).cast::<u16>()
-                };
-                let mut i = 0usize;
-                while i + 1 < count {
-                    let rgb = unsafe { src.add(i).read_unaligned() };
-                    let packed0 = ((rgb >> 8) & 0xF800)
-                        | ((rgb >> 5) & 0x07E0)
-                        | ((rgb >> 3) & 0x001F);
-                    let rgb = unsafe { src.add(i + 1).read_unaligned() };
-                    let packed1 = ((rgb >> 8) & 0xF800)
-                        | ((rgb >> 5) & 0x07E0)
-                        | ((rgb >> 3) & 0x001F);
-                    unsafe {
-                        dst.add(i).cast::<u32>()
-                            .write_unaligned(packed0 | packed1 << 16);
-                    }
-                    i += 2;
-                }
-                if i < count {
-                    let rgb = unsafe { src.add(i).read_unaligned() };
-                    let packed = ((rgb >> 8) & 0xF800)
-                        | ((rgb >> 5) & 0x07E0)
-                        | ((rgb >> 3) & 0x001F);
-                    unsafe { dst.add(i).write_unaligned(packed as u16) };
-                }
-            }
-            return;
-        }
         for y in top..bottom {
             for x in left..right {
                 let sx = (x as i64 - i64::from(ox)) as usize;
@@ -1865,11 +1844,8 @@ mod tests {
         scene.commit(transaction).unwrap();
     }
 
-    fn native_pixels(output: &[u8]) -> Vec<u32> {
-        output
-            .chunks_exact(4)
-            .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap()))
-            .collect()
+    fn native_pixels(output: &[u32]) -> Vec<u32> {
+        output.to_vec()
     }
 
     #[test]
@@ -2027,15 +2003,29 @@ mod tests {
             .compose(&sources, 2, 1, vga::PixelFormat::RGB565, &mut output)
             .unwrap();
 
-        assert_eq!(output.len(), 4);
-        assert_eq!(
-            u16::from_le_bytes([output[0], output[1]]),
-            vga::PixelFormat::RGB565.encode(0x00ff_0000) as u16
-        );
-        assert_eq!(
-            u16::from_le_bytes([output[2], output[3]]),
-            vga::PixelFormat::RGB565.encode(0x0000_00ff) as u16
-        );
+        assert_eq!(output, vec![
+            vga::PixelFormat::RGB565.encode(0x00ff_0000),
+            vga::PixelFormat::RGB565.encode(0x0000_00ff),
+        ]);
+    }
+
+    #[test]
+    fn compositor_copies_display_encoded_word_surface() {
+        let mut scene = Scene::new();
+        let node = scene.create(WINDOWS, None, Rect::new(0, 0, 2, 1)).unwrap();
+        let mut transaction = Transaction::new(WINDOWS);
+        transaction.attach(node, Some(SurfaceId(12))).set_visible(node, true);
+        scene.commit(transaction).unwrap();
+        let words = [0x1234, 0xabcd];
+        let contents = [Content {
+            id: SurfaceId(12),
+            buffer: PixelBuffer::new_words(
+                2, 1, vga::PixelFormat::RGB565, &words,
+            ).unwrap(),
+        }];
+        let mut output = vec![];
+        scene.compose(&contents, 2, 1, vga::PixelFormat::RGB565, &mut output).unwrap();
+        assert_eq!(output, words);
     }
 
     #[test]
@@ -2062,11 +2052,7 @@ mod tests {
         scene
             .compose(&source, 4, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
-        let values: Vec<u32> = output
-            .chunks_exact(4)
-            .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap()))
-            .collect();
-        assert_eq!(values, vec![0x00ff_0000, 0x00ff_0000, 0x0000_ff00, 0]);
+        assert_eq!(output, vec![0x00ff_0000, 0x00ff_0000, 0x0000_ff00, 0]);
     }
 
     #[test]
@@ -2184,10 +2170,7 @@ mod tests {
             600,
             vga::PixelFormat::NATIVE,
         ).unwrap();
-        let pixel = |x: usize, y: usize| {
-            let at = (y * 900 + x) * 4;
-            u32::from_le_bytes(frame.pixels[at..at + 4].try_into().unwrap())
-        };
+        let pixel = |x: usize, y: usize| frame.pixels[y * 900 + x];
         assert_eq!(pixel(40, 30), 0x0000_00ff, "highlighted still is above the stack");
         assert_eq!(pixel(700, 500), 0x00ff_0000,
             "active task remains visible over a fullscreen preview");
@@ -2242,11 +2225,7 @@ mod tests {
         desktop
             .compose_surfaces(&contents, 2, 1, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
-        let values: Vec<u32> = output
-            .chunks_exact(4)
-            .map(|pixel| u32::from_le_bytes(pixel.try_into().unwrap()))
-            .collect();
-        assert_eq!(values, vec![0x0000_00ff, 0x0000_ff00]);
+        assert_eq!(output, vec![0x0000_00ff, 0x0000_ff00]);
     }
 
     #[test]
@@ -2283,10 +2262,7 @@ mod tests {
             4, 1, vga::PixelFormat::NATIVE,
         ).unwrap();
         assert_eq!(frame.damage, vec![Rect::new(1, 0, 2, 1)]);
-        assert_eq!(
-            u32::from_le_bytes(frame.pixels[4..8].try_into().unwrap()),
-            0x0000_00ff,
-        );
+        assert_eq!(frame.pixels[1], 0x0000_00ff);
     }
 
     #[test]
@@ -2311,17 +2287,14 @@ mod tests {
     }
 
     #[test]
-    fn retained_composition_draws_pointer_with_byte_stride() {
+    fn retained_composition_draws_pointer() {
         let mut desktop = Desktop::new();
         desktop.set_pointer(Point { x: 1, y: 1 });
         let mut output = vec![];
         desktop
             .compose_surfaces(&[], 16, 20, vga::PixelFormat::NATIVE, &mut output)
             .unwrap();
-        let pixel = |x: usize, y: usize| {
-            let at = (y * 16 + x) * 4;
-            u32::from_le_bytes(output[at..at + 4].try_into().unwrap())
-        };
+        let pixel = |x: usize, y: usize| output[y * 16 + x];
         assert_eq!(pixel(1, 1), 0x0000_0000);
         assert_eq!(pixel(2, 5), 0x00ff_ffff);
     }

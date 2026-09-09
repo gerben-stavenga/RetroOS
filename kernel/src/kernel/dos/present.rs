@@ -514,8 +514,9 @@ pub(super) fn attach_retained_vga_surface(
     desktop.damage_surface(endpoint, DOS_SURFACE);
 }
 
-/// Rasterize the detached VGA into the packed format already selected for
-/// this display. The retained preview can then be copied by the compositor.
+/// Rasterize the detached VGA into an output-independent retained preview.
+/// Native RGB is intentional: PixelBuffer carries its own format and the
+/// compositor converts it to the eventual output format when the OSD opens.
 pub(super) fn snapshot_retained_surface<A: crate::Arch>(
     machine: &mut A,
     dos: &mut crate::kernel::thread::DosState<A>,
@@ -661,8 +662,14 @@ pub fn display_tick<A: crate::Arch>(
                 // producer actually changed the pixels. This later phase
                 // exists only to transfer direct-scanout shadows.
                 if presentation.is_none() {
-                    let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-                    display.present(machine, &mut *bios, vga_h, &mut pixels);
+                    let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+                    display.present_native(
+                        machine,
+                        &mut *bios,
+                        ::vga::dimensions(mode).0,
+                        vga_h,
+                        &pixels,
+                    );
                     crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
                 }
             }
@@ -689,8 +696,8 @@ pub fn display_tick<A: crate::Arch>(
     if let Some((desktop, endpoint)) = presentation {
         publish_vga_surface(w, h, desktop, endpoint);
     } else {
-        let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-        display.present(machine, bios, h, &mut pixels);
+        let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+        display.present_native(machine, bios, w, h, &pixels);
         crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
     }
 }

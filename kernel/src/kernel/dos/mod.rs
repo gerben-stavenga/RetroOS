@@ -1559,13 +1559,7 @@ pub fn surface_buffer<'a, A: crate::Arch>(
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
     let (width, height, format, pixels) = dos.pc.present_scratch2.surface()?;
     if format != output_format { return None; }
-    crate::kernel::gui::PixelBuffer::new(
-        width,
-        height,
-        width * format.bytes_per_pixel as usize,
-        format,
-        pixels,
-    ).ok()
+    crate::kernel::gui::PixelBuffer::new_words(width, height, format, pixels).ok()
 }
 
 /// Capture a packed compositor preview of a detached DOS VGA while its

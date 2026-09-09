@@ -1148,9 +1148,6 @@ fn present_desktop<A: crate::Arch>(
         extent.width as usize,
         extent.height as usize,
     );
-    if display.is_host() {
-        display.shadow_width = canvas_width;
-    }
     // Picker geometry is compositor policy, synchronized at the producer's
     // normal publication edge. Browsing does not schedule the highlighted
     // task: its retained surface is composed above the stack while the active
@@ -1176,8 +1173,8 @@ fn present_desktop<A: crate::Arch>(
     let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
         .expect("compose process-owned surfaces");
-    display.present_regions(
-        machine, bios_workspace, canvas_height, frame.pixels, &frame.damage,
+    display.present_native(
+        machine, bios_workspace, canvas_width, canvas_height, frame.pixels,
     );
 }
 
