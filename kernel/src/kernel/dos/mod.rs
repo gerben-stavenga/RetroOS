@@ -831,7 +831,7 @@ fn handle_event_inner<A: crate::Arch>(
                 if vif_was_on && !vif_now {
                     dpmi.vif.on_cli(machine, regs, entry_ip, viopl == 3);
                 } else if !vif_was_on && vif_now {
-                    dpmi.vif.on_sti(regs);
+                    dpmi.vif.on_sti(machine, regs);
                 }
             }
             refresh_learning_tf(dos);

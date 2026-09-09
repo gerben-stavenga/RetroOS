@@ -57,6 +57,15 @@ enum Class {
     /// CLI-register → … → push → popf. Tag `r` at the CLI and run free
     /// (x86 index 0..7, never esp).
     Reg(u8),
+    /// This CLI site has more than one exit shape. Prediction is unsafe, so
+    /// trace every invocation until the actual exit is known.
+    Mixed,
+}
+
+#[derive(Clone, Copy)]
+enum Tag {
+    Flags(u32),
+    Reg(u8),
 }
 
 /// The window currently open (transient — swapped in/out WITH the address space,
@@ -84,13 +93,23 @@ pub struct VifMap {
     /// by the CLI address *within this space*.
     sites: SiteTable,
     active: Option<Active>,
+    /// Exact guest value carrying our TF tag. A cached CLI site can take a
+    /// different branch and close through STI; in that case the predicted
+    /// POPF/IRET never consumes the tag, so remove it at the alternate exit.
+    tag: Option<Tag>,
+    /// A register tag can be copied before an alternate STI exit. The next
+    /// otherwise-unowned #DB consumes that escaped tag inside VIF.
+    escaped_tag: bool,
     /// Per-client parity counters (windows, tag-closes, post-tag #DBs, steps).
     pub stats: [u32; 4],
 }
 
 impl VifMap {
     pub const fn new() -> Self {
-        VifMap { sites: SiteTable::new(), active: None, stats: [0; 4] }
+        VifMap {
+            sites: SiteTable::new(), active: None, tag: None,
+            escaped_tag: false, stats: [0; 4],
+        }
     }
 
     /// Whether the next #DB belongs to an interrupts-off window currently
@@ -98,7 +117,7 @@ impl VifMap {
     /// client is temporarily executing its VM86 side: CPU mode alone cannot
     /// distinguish this host-owned trace from a real-mode program's INT 1.
     pub fn owns_db(&self) -> bool {
-        self.active.is_some()
+        self.active.is_some() || self.escaped_tag
     }
 
     /// Whether an open window is currently being traced instruction by
@@ -117,6 +136,7 @@ impl VifMap {
     /// `arch` gives guest memory + segment bases; `regs` is the fault frame.
     pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
                            always_step: bool) {
+        self.escaped_tag |= self.clear_tag(arch, regs);
         let cli_sp = regs.sp32();
         self.active = Some(Active { cli_ip, cli_sp, learning: false, probe: None, snap: [0; 8] });
         self.stats[0] = self.stats[0].wrapping_add(1);
@@ -139,6 +159,7 @@ impl VifMap {
                 let w: u32 = arch.read(addr as usize);
                 if looks_like_flags(w) {
                     arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
+                    self.tag = Some(Tag::Flags(addr));
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
@@ -152,6 +173,7 @@ impl VifMap {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
                     set_reg32(regs, r, v | TF_FLAG);
+                    self.tag = Some(Tag::Reg(r));
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // register isn't flags right now → relearn
@@ -164,11 +186,13 @@ impl VifMap {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
                     set_reg32(regs, r, v | TF_FLAG);
+                    self.tag = Some(Tag::Reg(r));
                     self.begin_learn(regs, Some(r));
                 } else {
                     self.begin_learn(regs, None);
                 }
             }
+            Some(Class::Mixed) => self.begin_learn(regs, None),
             // A word BELOW cli_sp with no register idiom: the exit builds its own
             // flags image after the CLI and we can't predict it — step every time.
             Some(Class::Flags(_)) => self.begin_learn(regs, None),
@@ -178,10 +202,17 @@ impl VifMap {
 
     /// An `STI` `#GP`'d: it re-enabled IF on its own. If we were learning, this
     /// site's exit is an STI. (arch has already reflected the fault; we set VIF.)
-    pub fn on_sti(&mut self, regs: &mut Regs) {
+    pub fn on_sti<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) {
+        let mismatch = self.tag.is_some()
+            && self.active.is_some_and(|active| !active.learning);
+        if mismatch && let Some(active) = self.active {
+            self.sites.insert(active.cli_ip, Class::Mixed);
+        }
+        self.escaped_tag |= self.clear_tag(arch, regs);
         regs.set_flags32(regs.flags32() | VIF_FLAG);
         if let Some(a) = self.active.take()
             && a.learning
+            && !matches!(self.sites.get(a.cli_ip), Some(Class::Mixed))
         {
             self.sites.insert(a.cli_ip, Class::Sti);
         }
@@ -197,9 +228,28 @@ impl VifMap {
                 // instruction late; clear TF.
                 regs.set_flags32(regs.flags32() | VIF_FLAG);
                 self.active = None;
+                self.tag = None;
+                self.escaped_tag = false;
                 self.stats[2] = self.stats[2].wrapping_add(1);
                 DbResult::Resume
             }
+        }
+    }
+
+    /// Remove the known copy and report whether a register tag may also have
+    /// propagated through ordinary guest moves.
+    fn clear_tag<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> bool {
+        match self.tag.take() {
+            Some(Tag::Flags(addr)) => {
+                let value: u32 = arch.read(addr as usize);
+                arch.write(addr as usize, value & !TF_FLAG);
+                false
+            }
+            Some(Tag::Reg(r)) => {
+                set_reg32(regs, r, reg32(regs, r) & !TF_FLAG);
+                true
+            }
+            None => false,
         }
     }
 
@@ -257,7 +307,9 @@ impl VifMap {
                     if regs.flags32() & VIF_FLAG != 0 {
                         if let Some(a) = self.active {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
-                            self.sites.insert(a.cli_ip, class);
+                            if !matches!(self.sites.get(a.cli_ip), Some(Class::Mixed)) {
+                                self.sites.insert(a.cli_ip, class);
+                            }
                         }
                         self.active = None;
                         return DbResult::Resume;
