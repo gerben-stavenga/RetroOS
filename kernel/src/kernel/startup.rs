@@ -85,7 +85,7 @@ fn prepare_startup<A: crate::Arch>(
     // reused) — startup owns it and threads `&mut threads` down through run →
     // run_program → event_loop. No global; no `&'static mut`.
     let threads = crate::kernel::thread::init_threading();
-    crate::screenln!(&mut screen => machine, &mut bios_workspace; "Threading initialized");
+    crate::compact_screenln!(&mut screen, "Threading initialized");
 
     prepare_storage(
         machine,
@@ -400,26 +400,17 @@ fn prepare_storage<A: crate::Arch>(
     crate::kernel::dos::set_c_root(boot.c_root());
     crate::kernel::dos::set_hostfs_enabled(hostfs);
 
-    crate::screenln!(screen => machine, bios_workspace;
-        "Filesystems: scanning partition tables...");
+    crate::compact_screenln!(screen, "Filesystems: scanning partition tables...");
     let mut parts = alloc::vec::Vec::new();
     for disk in disks {
         parts.extend(crate::kernel::block::partition::scan(
             crate::kernel::block::Volume::whole(disk),
         ));
     }
-    crate::screenln!(screen => machine, bios_workspace;
-        "Filesystems: {} partition(s) found", parts.len());
+    crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
     let modules = crate::multiboot::mount_modules(boot, screen, 0);
-    let hostfs_is_root = mount_filesystems(
-        machine,
-        bios_workspace,
-        &parts,
-        hostfs,
-        screen,
-        modules,
-    );
+    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, modules);
     screen.present(machine, bios_workspace);
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
         lib::compact_panic!("hostfs: mounted as root but its server is unavailable");
@@ -469,9 +460,7 @@ fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
 /// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
 /// ordinary directory on whatever backs C:, not a mount of its own.
 #[inline(never)]
-fn mount_filesystems<A: crate::Arch>(
-    machine: &mut A,
-    bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
@@ -481,8 +470,7 @@ fn mount_filesystems<A: crate::Arch>(
 
     // Ask the filesystem, don't trust the table: a partition holds ext when it
     // has an ext superblock, whatever type byte or GUID it carries.
-    crate::screenln!(screen => machine, bios_workspace;
-        "Filesystems: probing ext superblocks...");
+    crate::compact_screenln!(screen, "Filesystems: probing ext superblocks...");
     let ext: alloc::vec::Vec<_> = parts
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
@@ -490,8 +478,7 @@ fn mount_filesystems<A: crate::Arch>(
         .map(crate::kernel::block::cache::volume)
         .filter(crate::kernel::fs::portable_ext4::is_ext)
         .collect();
-    crate::screenln!(screen => machine, bios_workspace;
-        "Filesystems: {} ext partition(s)", ext.len());
+    crate::compact_screenln!(screen, "Filesystems: {} ext partition(s)", ext.len());
 
     let mut hostfs_is_root = false;
     if modules.has_root {
@@ -520,11 +507,11 @@ fn mount_filesystems<A: crate::Arch>(
         }
     } else {
         let root = root_index(&ext);
-        crate::screenln!(screen => machine, bios_workspace;
+        crate::compact_screenln!(screen,
             "Mounting ext4 root ({} MB)...", ext[root].sectors / 2048);
         let fs = PortableExt4Fs::new(ext[root])
             .unwrap_or_else(|error| lib::compact_panic!("portable ext4 root mount failed: {}", error));
-        crate::screenln!(screen => machine, bios_workspace; "ext4 root mounted");
+        crate::compact_screenln!(screen, "ext4 root mounted");
         let fs: &'static dyn vfs::Filesystem =
             alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
         // The write grant is RetroOS's identity — the group owning its

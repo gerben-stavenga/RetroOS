@@ -744,12 +744,12 @@ impl PixelFormat {
     }
 
     /// Pack `0x00RRGGBB` into the framebuffer's little-endian pixel word.
-    /// This runs only 256 times when an indexed palette changes; keep the
-    /// uncommon channel widths obvious rather than micro-optimising them.
+    /// The arithmetic stays 32-bit: even a 16-bit channel's product fits, and
+    /// `/ 255` then lowers to a multiply/shift on 32-bit CPUs.
     pub fn encode(self, rgb: u32) -> u32 {
         fn channel(value: u32, pos: u8, size: u8) -> u32 {
-            let max = (1u64 << size) - 1;
-            ((((value as u64 * max) + 127) / 255) << pos) as u32
+            let max = (1u32 << size) - 1;
+            ((value * max + 127) / 255) << pos
         }
         channel((rgb >> 16) & 0xFF, self.red_pos, self.red_size)
             | channel((rgb >> 8) & 0xFF, self.green_pos, self.green_size)
@@ -963,6 +963,22 @@ fn row_text(
         // line-draw block 0xC0..=0xDF, so box drawing joins seamlessly; every
         // other glyph gets a blank 9th column for inter-character spacing.
         let line_gfx = (0xC0..=0xDF).contains(&ch);
+        if (cell_w == 8 || cell_w == 9) && st.x + cell_w <= w {
+            let dst = &mut st.out[st.x..st.x + cell_w];
+            dst[0] = if bits & 0x80 != 0 { fg } else { bg };
+            dst[1] = if bits & 0x40 != 0 { fg } else { bg };
+            dst[2] = if bits & 0x20 != 0 { fg } else { bg };
+            dst[3] = if bits & 0x10 != 0 { fg } else { bg };
+            dst[4] = if bits & 0x08 != 0 { fg } else { bg };
+            dst[5] = if bits & 0x04 != 0 { fg } else { bg };
+            dst[6] = if bits & 0x02 != 0 { fg } else { bg };
+            dst[7] = if bits & 0x01 != 0 { fg } else { bg };
+            if cell_w == 9 {
+                dst[8] = if line_gfx && bits & 0x01 != 0 { fg } else { bg };
+            }
+            st.x += cell_w;
+            continue;
+        }
         for gx in 0..cell_w {
             let dot = gx / repeat;
             let x = col * cell_w + gx;

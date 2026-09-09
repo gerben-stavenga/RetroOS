@@ -1685,6 +1685,9 @@ fn read_pixel(buffer: PixelBuffer<'_>, x: usize, y: usize) -> u32 {
         4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
         _ => unreachable!("validated pixel format"),
     };
+    if buffer.format.is_native() {
+        return raw & 0x00FF_FFFF;
+    }
     let channel = |position: u8, size: u8| -> u32 {
         let mask = (1u32 << size) - 1;
         (raw >> position & mask) * 255 / mask
@@ -1741,6 +1744,14 @@ fn blit_scaled(
     let Some(draw) = intersect(destination, clip) else {
         return;
     };
+    let left = usize::try_from(draw.x).unwrap_or(0).min(target.width);
+    let top = usize::try_from(draw.y).unwrap_or(0).min(target.height);
+    let right = usize::try_from(i64::from(draw.x) + i64::from(draw.width))
+        .unwrap_or(target.width)
+        .min(target.width);
+    let bottom = usize::try_from(i64::from(draw.y) + i64::from(draw.height))
+        .unwrap_or(target.height)
+        .min(target.height);
     // Existing full-frame producers can enter the scene cheaply: if their
     // packed pixels already match an opaque, unscaled destination, composition
     // is one row copy rather than a decode/encode pass over every pixel.
@@ -1766,14 +1777,61 @@ fn blit_scaled(
             return;
         }
     }
-    let left = usize::try_from(draw.x).unwrap_or(0).min(target.width);
-    let top = usize::try_from(draw.y).unwrap_or(0).min(target.height);
-    let right = usize::try_from(i64::from(draw.x) + i64::from(draw.width))
-        .unwrap_or(target.width)
-        .min(target.width);
-    let bottom = usize::try_from(i64::from(draw.y) + i64::from(draw.height))
-        .unwrap_or(target.height)
-        .min(target.height);
+    // The common fullscreen surface already has its final geometry. Convert
+    // its packed format directly instead of running the general scaler's two
+    // integer divisions for every pixel.
+    if opacity == u8::MAX
+        && source.width == destination.width as usize
+        && source.height == destination.height as usize
+    {
+        let ox = destination.x;
+        let oy = destination.y;
+        if source.format.is_native() && target.format == vga::PixelFormat::RGB565 {
+            let count = right.saturating_sub(left);
+            for y in top..bottom {
+                let sx = (left as i64 - i64::from(ox)) as usize;
+                let sy = (y as i64 - i64::from(oy)) as usize;
+                let src = unsafe {
+                    source.pixels.as_ptr().add(sy * source.stride + sx * 4).cast::<u32>()
+                };
+                let dst = unsafe {
+                    target.pixels.as_mut_ptr().add(y * target.stride + left * 2).cast::<u16>()
+                };
+                let mut i = 0usize;
+                while i + 1 < count {
+                    let rgb = unsafe { src.add(i).read_unaligned() };
+                    let packed0 = ((rgb >> 8) & 0xF800)
+                        | ((rgb >> 5) & 0x07E0)
+                        | ((rgb >> 3) & 0x001F);
+                    let rgb = unsafe { src.add(i + 1).read_unaligned() };
+                    let packed1 = ((rgb >> 8) & 0xF800)
+                        | ((rgb >> 5) & 0x07E0)
+                        | ((rgb >> 3) & 0x001F);
+                    unsafe {
+                        dst.add(i).cast::<u32>()
+                            .write_unaligned(packed0 | packed1 << 16);
+                    }
+                    i += 2;
+                }
+                if i < count {
+                    let rgb = unsafe { src.add(i).read_unaligned() };
+                    let packed = ((rgb >> 8) & 0xF800)
+                        | ((rgb >> 5) & 0x07E0)
+                        | ((rgb >> 3) & 0x001F);
+                    unsafe { dst.add(i).write_unaligned(packed as u16) };
+                }
+            }
+            return;
+        }
+        for y in top..bottom {
+            for x in left..right {
+                let sx = (x as i64 - i64::from(ox)) as usize;
+                let sy = (y as i64 - i64::from(oy)) as usize;
+                write_target(target, x, y, read_pixel(source, sx, sy));
+            }
+        }
+        return;
+    }
     for y in top..bottom {
         let local_y = i64::try_from(y).unwrap_or(i64::MAX) - i64::from(destination.y);
         let source_y = (local_y as u64 * source.height as u64 / u64::from(destination.height))
