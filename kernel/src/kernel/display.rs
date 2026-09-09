@@ -54,14 +54,6 @@ pub struct Framebuffer {
     pub wide: bool,
 }
 
-/// Dense unscaled pixels plus the reusable row used to pack one output scanline.
-pub(crate) struct NativeSource<'a> {
-    pub width: usize,
-    pub height: usize,
-    pub pixels: &'a [u32],
-    pub row: &'a mut alloc::vec::Vec<u8>,
-}
-
 /// The only display interface visible to renderers. Physical geometry, pitch,
 /// mappings, publication policy and VGA ownership stay in the backend.
 pub struct Display {
@@ -69,9 +61,6 @@ pub struct Display {
     pub rgb: PixelFormat,
     programmable_ramp: bool,
     voodoo_ramp_generation: Option<u64>,
-    /// Physical-format staging used only within native-surface presentation.
-    /// Retained producers always keep their unscaled `u32` content.
-    present_pixels: alloc::vec::Vec<u8>,
     backend: Backend,
 }
 
@@ -240,7 +229,7 @@ impl Display {
     ) -> Self {
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
         Self { shadow_width, rgb, programmable_ramp: false,
-            voodoo_ramp_generation: None, present_pixels: alloc::vec::Vec::new(),
+            voodoo_ramp_generation: None,
             backend: Backend::Linear(framebuffer) }
     }
 
@@ -272,7 +261,6 @@ impl Display {
             rgb: PixelFormat::RGB332,
             programmable_ramp: false,
             voodoo_ramp_generation: None,
-            present_pixels: alloc::vec::Vec::new(),
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::Mode13 {
@@ -324,7 +312,6 @@ impl Display {
             rgb,
             programmable_ramp: mode.programmable_ramp,
             voodoo_ramp_generation: None,
-            present_pixels: alloc::vec::Vec::new(),
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeLinear { framebuffer, pages },
@@ -351,7 +338,6 @@ impl Display {
             rgb,
             programmable_ramp: mode.programmable_ramp,
             voodoo_ramp_generation: None,
-            present_pixels: alloc::vec::Vec::new(),
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank: 0 },
@@ -362,14 +348,12 @@ impl Display {
     pub fn host() -> Self {
         Self { shadow_width: 720, rgb: PixelFormat::NATIVE,
             programmable_ramp: false, voodoo_ramp_generation: None,
-            present_pixels: alloc::vec::Vec::new(),
             backend: Backend::Host }
     }
 
     pub fn headless() -> Self {
         Self { shadow_width: 0, rgb: PixelFormat::NATIVE,
             programmable_ramp: false, voodoo_ramp_generation: None,
-            present_pixels: alloc::vec::Vec::new(),
             backend: Backend::Headless }
     }
 
@@ -503,53 +487,6 @@ impl Display {
         }
     }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
-
-    /// Fill the display's fitted rectangle from one dense native word image.
-    /// Each `u32` already contains this display's encoded pixel bits.
-    /// Horizontal packing/enlargement happens here, after the producer has
-    /// completed its unscaled `width * height` words. At most one packed row
-    /// is staged; there is no scaled retained frame.
-    pub fn present_native<A: crate::Arch>(
-        &mut self,
-        machine: &mut A,
-        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        width: usize,
-        height: usize,
-        pixels: &[u32],
-    ) -> usize {
-        let Some(words) = width.checked_mul(height) else { return 0 };
-        if width == 0 || height == 0 || pixels.len() < words {
-            return 0;
-        }
-        let format = self.rgb;
-        let (out_w, out_h) = self.fit();
-        let scratch = &mut self.present_pixels;
-        match &mut self.backend {
-            Backend::Linear(framebuffer)
-            | Backend::Vga {
-                scanout: VgaScanout::Mode13 { framebuffer, .. }
-                    | VgaScanout::VbeLinear { framebuffer, .. },
-                ..
-            } => blit_native(
-                framebuffer, format, out_w, out_h,
-                NativeSource { width, height, pixels, row: scratch },
-            ),
-            Backend::Vga {
-                native,
-                scanout: VgaScanout::VbeBanked { mode, current_bank },
-            } => native.bios_present_native(
-                machine, bios, *mode, current_bank,
-                NativeSource { width, height, pixels, row: scratch },
-            ).unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
-            Backend::Host => {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), words * 4)
-                };
-                present_host_shadow(width, height, PixelFormat::NATIVE, bytes)
-            }
-            Backend::Headless => 0,
-        }
-    }
 
     /// Publish one completed packed compositor shadow.
     pub fn present<A: crate::Arch>(
@@ -811,59 +748,6 @@ fn blit(
     out_w * out_h
 }
 
-/// Fill a centered physical rectangle from a dense source-sized word image.
-/// Only one packed destination row is staged; it is stretched once and reused
-/// for every vertical repetition of that source row.
-#[optimize(speed)]
-fn blit_native(
-    fb: &Framebuffer,
-    format: PixelFormat,
-    out_w: usize,
-    out_h: usize,
-    source: NativeSource<'_>,
-) -> usize {
-    let NativeSource { width: source_w, height: source_h, pixels: source, row } = source;
-    let step = usize::from(format.bytes_per_pixel);
-    let Some(source_words) = source_w.checked_mul(source_h) else { return 0 };
-    let Some(row_bytes) = out_w.checked_mul(step) else { return 0 };
-    if source_w == 0 || source_h == 0 || source.len() < source_words {
-        return 0;
-    }
-    row.resize(row_bytes.saturating_add(4), 0);
-    let bx = (fb.width - out_w) / 2;
-    let by = (fb.height - out_h) / 2;
-    let (ybase, yrem) = (out_h / source_h, out_h % source_h);
-    let origin = fb.va + by * fb.pitch + bx * step;
-    let mut oy = 0usize;
-    let mut yerr = 0usize;
-    for sy in 0..source_h {
-        if !stretch_native_row(
-            &source[sy * source_w..(sy + 1) * source_w],
-            row,
-            out_w,
-            step,
-        ) {
-            return 0;
-        }
-        yerr += yrem;
-        let carry = usize::from(yerr >= source_h);
-        let rows = ybase + carry;
-        yerr -= carry * source_h;
-        for _ in 0..rows {
-            unsafe {
-                copy_bytes(
-                    (origin + oy * fb.pitch) as *mut u8,
-                    row.as_ptr(),
-                    row_bytes,
-                    fb.wide,
-                );
-            }
-            oy += 1;
-        }
-    }
-    out_w * out_h
-}
-
 #[optimize(speed)]
 fn blit_regions(
     fb: &Framebuffer,
@@ -977,14 +861,16 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
     w * h
 }
 
-/// Direct-framebuffer scanout state: a palette, one native-size `u32` frame,
-/// and the render/publish clock.
+/// Direct-framebuffer scanout state: a palette, one display-packed frame, and
+/// the render/publish clock.
 pub struct Scratch {
     pal: vga::Pal,
     pal_cache: [u8; 768],
-    /// Dense native VGA image: exactly `w * h` words, with no presentation
-    /// pitch or scaling.
-    surface: alloc::vec::Vec<u32>,
+    /// Dense display-format image at `out_w * h`, with no presentation pitch.
+    surface: alloc::vec::Vec<u8>,
+    /// One decoded source row. Pixels are encoded for the display already;
+    /// packing and horizontal fitting consume this immediately.
+    row: alloc::vec::Vec<u32>,
     /// Geometry the scanout is armed for
     /// `(w, h, out_w, out_h, panel_w, panel_h)`; any change
     /// discards a pending shadow and starts a fresh render.
@@ -1020,6 +906,7 @@ impl Scratch {
             pal: vga::Pal::new(),
             pal_cache: [0; 768],
             surface: alloc::vec::Vec::new(),
+            row: alloc::vec::Vec::new(),
             geo: (0, 0, 0, 0, 0, 0),
             mode: None,
             phase: 0,
@@ -1040,6 +927,7 @@ impl Scratch {
             core::ptr::addr_of_mut!((*p).pal).write(vga::Pal::new());
             core::ptr::addr_of_mut!((*p).pal_cache).write([0; 768]);
             core::ptr::addr_of_mut!((*p).surface).write(alloc::vec::Vec::new());
+            core::ptr::addr_of_mut!((*p).row).write(alloc::vec::Vec::new());
             core::ptr::addr_of_mut!((*p).geo).write((0, 0, 0, 0, 0, 0));
             core::ptr::addr_of_mut!((*p).mode).write(None);
             core::ptr::addr_of_mut!((*p).phase).write(0);
@@ -1052,19 +940,16 @@ impl Scratch {
         }
     }
 
-    /// Immutable view of a compositor-owned native-RGB VGA image.
+    /// Immutable view of the display-packed VGA image.
     pub fn surface(&self) -> Option<(usize, usize, PixelFormat, &[u8])> {
-        if self.pal.fmt != PixelFormat::NATIVE {
-            return None;
-        }
-        let width = self.geo.0;
+        let width = self.geo.2;
         let height = self.geo.1;
-        let words = self.surface.get(..width.checked_mul(height)?)?;
-        let pixels = unsafe {
-            core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), words.len() * 4)
-        };
-        Some((width, height, PixelFormat::NATIVE, pixels))
+        let bytes = width.checked_mul(height)?
+            .checked_mul(self.pal.fmt.bytes_per_pixel as usize)?;
+        Some((width, height, self.pal.fmt, self.surface.get(..bytes)?))
     }
+
+    pub const fn format(&self) -> PixelFormat { self.pal.fmt }
 }
 
 #[cfg(target_arch = "x86")]
@@ -1209,15 +1094,18 @@ pub fn scanout_action(
     }
 
     let geo = (w, h, out_w, out_h, out_w, out_h);
+    let packed_bytes = out_w.saturating_mul(h)
+        .saturating_mul(display.rgb.bytes_per_pixel as usize);
     let reset = s.geo != geo
         || s.mode != Some(mode)
-        || s.surface.len() != w * h
+        || s.surface.len() != packed_bytes.saturating_add(4)
+        || s.pal.fmt != display.rgb
         || s.refresh_hz != refresh_hz
         || s.raster_hz != raster_hz;
     if reset {
         s.geo = geo;
         s.surface.clear();
-        s.surface.resize(w * h, 0);
+        s.surface.resize(packed_bytes.saturating_add(4), 0);
         s.mode = Some(mode);
         s.refresh_hz = refresh_hz;
         s.raster_hz = raster_hz;
@@ -1242,7 +1130,9 @@ pub fn scanout_action(
         s.ready = false;
         let h = s.geo.1;
         let out_w = s.geo.2;
-        if s.surface.get(..s.geo.0.saturating_mul(h)).is_none() {
+        let bytes = out_w.saturating_mul(h)
+            .saturating_mul(s.pal.fmt.bytes_per_pixel as usize);
+        if s.surface.get(..bytes).is_none() {
             return ScanoutAction::None;
         }
         ScanoutAction::Publish {
@@ -1260,11 +1150,11 @@ pub fn scanout_action(
 
 /// Transfer a completed packed shadow to its sink. The sink returns its prior
 /// front-buffer storage with [`recycle_shadow`], forming a copy-free swapchain.
-pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u32> {
+pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u8> {
     core::mem::take(&mut s.surface)
 }
 
-pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u32>) {
+pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u8>) {
     s.surface = pixels;
 }
 
@@ -1280,10 +1170,14 @@ fn raster_shadow(
     if w == 0 || h == 0 {
         return false;
     }
+    let out_w = s.geo.2;
+    let step = format.bytes_per_pixel as usize;
+    let Some(row_bytes) = out_w.checked_mul(step) else { return false };
+    let Some(surface_bytes) = row_bytes.checked_mul(h) else { return false };
     if s.mode != Some(frame.mode)
         || s.geo.0 != w
         || s.geo.1 != h
-        || s.surface.len() < w * h
+        || s.surface.len() < surface_bytes.saturating_add(4)
     {
         return false;
     }
@@ -1291,13 +1185,18 @@ fn raster_shadow(
     if matches!(frame.mode, vga::VgaMode::Planar16 { .. }) {
         s.pal.sync_planar(frame.ac);
     }
+    s.row.resize(w, 0);
     for sy in 0..h {
-        vga::render_row(
-            frame,
-            sy,
-            &s.pal,
-            &mut s.surface[sy * w..(sy + 1) * w],
-        );
+        vga::render_row(frame, sy, &s.pal, &mut s.row);
+        let start = sy * row_bytes;
+        if !stretch_native_row(
+            &s.row,
+            &mut s.surface[start..start + row_bytes + 4],
+            out_w,
+            step,
+        ) {
+            return false;
+        }
     }
     true
 }
@@ -1320,7 +1219,10 @@ pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) ->
     if w == 0 || h == 0 {
         return false;
     }
-    let Some(storage) = w.checked_mul(h) else { return false };
+    let Some(storage) = w.checked_mul(h)
+        .and_then(|pixels| pixels.checked_mul(format.bytes_per_pixel as usize))
+        .and_then(|bytes| bytes.checked_add(4))
+    else { return false };
     if s.surface.len() != storage {
         s.surface.clear();
         s.surface.resize(storage, 0);
@@ -1335,14 +1237,15 @@ pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) ->
 /// byte per cache-line-sized span is enough to distinguish IT's all-black
 /// frames from its populated text UI without adding another full-frame walk.
 pub fn shadow_sample(s: &Scratch) -> (usize, u32) {
-    let len = s.geo.0
+    let len = s.geo.2
         .saturating_mul(s.geo.1)
+        .saturating_mul(s.pal.fmt.bytes_per_pixel as usize)
         .min(s.surface.len());
     let mut nonzero = 0usize;
     let mut hash = 0x811C9DC5u32;
     for &pixel in s.surface[..len].iter().step_by(16) {
         nonzero += usize::from(pixel != 0);
-        hash = (hash ^ pixel).wrapping_mul(0x01000193);
+        hash = (hash ^ u32::from(pixel)).wrapping_mul(0x01000193);
     }
     (nonzero, hash)
 }

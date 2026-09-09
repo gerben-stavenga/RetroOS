@@ -514,9 +514,8 @@ pub(super) fn attach_retained_vga_surface(
     desktop.damage_surface(endpoint, DOS_SURFACE);
 }
 
-/// Rasterize the detached VGA into an output-independent retained preview.
-/// Native RGB is intentional: PixelBuffer carries its own format and the
-/// compositor converts it to the eventual output format when the OSD opens.
+/// Rasterize the detached VGA into the packed format already selected for
+/// this display. The retained preview can then be copied by the compositor.
 pub(super) fn snapshot_retained_surface<A: crate::Arch>(
     machine: &mut A,
     dos: &mut crate::kernel::thread::DosState<A>,
@@ -537,11 +536,8 @@ pub(super) fn snapshot_retained_surface<A: crate::Arch>(
     let Some(frame) = scanout(
         &dev.state, machine, regs, scratch, (0, height), svga_start,
     ) else { return };
-    let _ = crate::kernel::display::render_frame(
-        output,
-        ::vga::PixelFormat::NATIVE,
-        &frame,
-    );
+    let format = output.format();
+    let _ = crate::kernel::display::render_frame(output, format, &frame);
 }
 
 pub fn display_tick<A: crate::Arch>(
@@ -641,13 +637,8 @@ pub fn display_tick<A: crate::Arch>(
                 else {
                     return;
                 };
-                let shadow_format = if presentation.is_some() {
-                    ::vga::PixelFormat::NATIVE
-                } else {
-                    display.rgb
-                };
                 let rendered = crate::kernel::display::render_shadow(
-                    &mut pc.present_scratch2, shadow_format, &frame,
+                    &mut pc.present_scratch2, display.rgb, &frame,
                 );
                 if rendered
                     && let Some((desktop, endpoint)) = presentation.as_mut()
@@ -670,14 +661,8 @@ pub fn display_tick<A: crate::Arch>(
                 // producer actually changed the pixels. This later phase
                 // exists only to transfer direct-scanout shadows.
                 if presentation.is_none() {
-                    let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-                    display.present_native(
-                        machine,
-                        &mut *bios,
-                        ::vga::dimensions(mode).0,
-                        vga_h,
-                        &pixels,
-                    );
+                    let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+                    display.present(machine, &mut *bios, vga_h, &mut pixels);
                     crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
                 }
             }
@@ -696,7 +681,7 @@ pub fn display_tick<A: crate::Arch>(
     let (w, h) = ::vga::dimensions(frame.mode);
     let rendered = crate::kernel::display::render_frame(
         &mut pc.present_scratch2,
-        ::vga::PixelFormat::NATIVE,
+        display.rgb,
         &frame,
     );
     if !rendered { return }
@@ -704,8 +689,8 @@ pub fn display_tick<A: crate::Arch>(
     if let Some((desktop, endpoint)) = presentation {
         publish_vga_surface(w, h, desktop, endpoint);
     } else {
-        let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-        display.present_native(machine, bios, w, h, &pixels);
+        let mut pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
+        display.present(machine, bios, h, &mut pixels);
         crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
     }
 }

@@ -1555,9 +1555,10 @@ pub fn render<A: crate::Arch>(
 
 pub fn surface_buffer<'a, A: crate::Arch>(
     dos: &'a thread::DosState<A>,
-    _format: vga::PixelFormat,
+    output_format: vga::PixelFormat,
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
     let (width, height, format, pixels) = dos.pc.present_scratch2.surface()?;
+    if format != output_format { return None; }
     crate::kernel::gui::PixelBuffer::new(
         width,
         height,
