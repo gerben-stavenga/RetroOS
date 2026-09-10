@@ -928,6 +928,29 @@ pub fn unmap_kernel_page(vaddr: usize) {
     crate::x86::invlpg(vaddr);
 }
 
+/// Return unused heap backing without faulting in absent page tables. The
+/// heap retains its virtual range and faults these pages back in on reuse.
+pub fn release_heap_pages(addr: usize, bytes: usize) {
+    assert!(addr >= heap_base() && addr.checked_add(bytes).is_some_and(|end| end <= HEAP_END));
+    assert!(addr % PAGE_SIZE == 0 && bytes % PAGE_SIZE == 0);
+    fn present<E: Entry>(entries: &[E], idx: usize) -> bool {
+        let parent = parent_index::<E>(idx);
+        (parent == idx || present(entries, parent)) && entries[idx].present()
+    }
+    fn release<E: Entry>(entries: &mut [E], addr: usize, bytes: usize) {
+        for idx in addr / PAGE_SIZE..(addr + bytes) / PAGE_SIZE {
+            if present(entries, idx) {
+                replace_mapping(&mut entries[idx], E::default());
+                crate::x86::invlpg(idx * PAGE_SIZE);
+            }
+        }
+    }
+    match entries() {
+        Entries::E32(e) => release(e, addr, bytes),
+        Entries::E64(e) => release(e, addr, bytes),
+    }
+}
+
 /// Get physical page number for a virtual address
 pub fn physical_page(vaddr: usize) -> u64 {
     let idx = page_idx(vaddr);

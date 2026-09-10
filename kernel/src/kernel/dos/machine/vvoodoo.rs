@@ -8,7 +8,6 @@
 //! is allowed to see, when a frame is presented — lives here, not in the card.
 
 use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 use voodoo::{Beam, Events, Kind, Voodoo};
 
@@ -128,8 +127,10 @@ impl VVoodoo {
         Voodoo::init(&mut card, Kind::Voodoo1, FB_BYTES, TEX_BYTES);
         Self {
             card: unsafe { card.assume_init() },
-            fb: vec![0u8; FB_BYTES],
-            tex: vec![0u8; TEX_BYTES],
+            // PCI presence alone must not consume 4 MiB per DOS process.
+            // Back the card only when a client actually accesses its MMIO.
+            fb: Vec::new(),
+            tex: Vec::new(),
             cfg: Config { command: 0, bar0: BAR_PHYS, init_enable: 0 },
             wc: WriteCombine::default(),
             linear_base: None,
@@ -141,6 +142,13 @@ impl VVoodoo {
     /// driving the card and its output should own the display.
     pub fn active(&self) -> bool {
         self.linear_base.is_some() && self.card.output_on
+    }
+
+    fn ensure_memory(&mut self) {
+        if self.fb.is_empty() {
+            self.fb.resize(FB_BYTES, 0);
+            self.tex.resize(TEX_BYTES, 0);
+        }
     }
 
     pub fn config_read(&self, off: u8) -> u32 {
@@ -181,6 +189,7 @@ impl VVoodoo {
         if self.wc.valid == 0 {
             return;
         }
+        self.ensure_memory();
         let data = u32::from_le_bytes(self.wc.bytes);
         // A byte lane the guest did not write must not disturb the register.
         let mut mask = 0u32;
@@ -200,6 +209,7 @@ impl VVoodoo {
     }
 
     pub fn read8(&mut self, off: u32) -> u8 {
+        self.ensure_memory();
         self.flush();
         let dword = self.card.read(&self.fb, off & !3, Beam::default());
         (dword >> ((off & 3) * 8)) as u8
@@ -222,12 +232,14 @@ impl VVoodoo {
     /// Clock the visible buffer out into `out`, in whatever encoding `dac`
     /// describes, `pitch` BYTES per row.
     pub fn scanout(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
+        self.ensure_memory();
         self.flush();
         self.card.render(&self.fb, dac, out, pitch);
         self.frame_ready = false;
     }
 
     pub fn scanout_raw(&mut self, out: &mut [u8], pitch: usize, dac: &voodoo::Dac) {
+        self.ensure_memory();
         self.flush();
         self.card.render_raw(&self.fb, dac, out, pitch);
         self.frame_ready = false;
@@ -248,5 +260,25 @@ impl VVoodoo {
 impl Default for VVoodoo {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pci_presence_does_not_allocate_vram_but_first_mmio_does() {
+        let mut board = VVoodoo::new();
+        let _ = board.config_read(0);
+        board.flush();
+        assert!(board.fb.is_empty() && board.tex.is_empty());
+        let _ = board.read8(0);
+        assert_eq!(board.fb.len(), FB_BYTES);
+        assert_eq!(board.tex.len(), TEX_BYTES);
+        assert!(board.fb.iter().chain(board.tex.iter()).all(|&b| b == 0));
+        board.fb[0] = 0x5a;
+        let _ = board.read8(0);
+        assert_eq!(board.fb[0], 0x5a);
     }
 }

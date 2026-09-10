@@ -253,7 +253,7 @@ unsafe fn prepare_boot(
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
     // so the demand-paged heap can safely be enabled here.
-    ALLOCATOR.init(arch::heap_base(), arch::HEAP_END);
+    ALLOCATOR.init_with_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages));
     arch::aperture::init();
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);

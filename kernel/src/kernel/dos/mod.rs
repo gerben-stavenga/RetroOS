@@ -702,7 +702,8 @@ fn continue_vif<A: crate::Arch>(
     regs: &mut Regs,
 ) -> thread::KernelAction {
     loop {
-        let result = dos.dpmi.as_mut().map(|d| d.vif.on_db(machine, regs));
+        let result = dos.dpmi.as_mut().filter(|d| d.vif.owns_db())
+            .map(|d| d.vif.on_db(machine, regs));
         refresh_learning_tf(dos);
         regs.project_tf();
         match result {
@@ -795,6 +796,11 @@ pub fn handle_event<A: crate::Arch>(
             | crate::KernelEvent::Outs { .. }
     );
     let action = handle_event_inner(machine, bios_display, kt, dos, regs, kevent);
+    // A completed RM call may restore a learning caller. Inspect its next
+    // instruction now, before a native POPF/IRET can retire without repair.
+    let sources = sources | if dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning()) {
+        TF_LEARNING
+    } else { 0 };
     if emulated && sources != 0 {
         let debug = handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
         if matches!(debug, thread::KernelAction::Done) { action } else { debug }

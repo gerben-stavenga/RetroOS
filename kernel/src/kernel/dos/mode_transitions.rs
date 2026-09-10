@@ -77,6 +77,7 @@ pub(super) struct HostContinuation {
     segments: [u64; 4],
     pub other_stack: Option<(u16, u32)>,
     pub rm_call_struct_addr: Option<u32>,
+    vif: Option<super::dpmi::vif::SuspendedVif>,
 }
 
 impl HostContinuation {
@@ -86,6 +87,7 @@ impl HostContinuation {
             segments: [regs.ds, regs.es, regs.fs, regs.gs],
             other_stack,
             rm_call_struct_addr,
+            vif: None,
         }
     }
 
@@ -202,6 +204,15 @@ pub(super) fn pop_continuation<A: crate::Arch>(dos: &mut thread::DosState<A>) ->
         .expect("DPMI return without a host continuation")
 }
 
+/// The simulated RM call executes a separate register context. Its known
+/// interrupt entry/return does not need the suspended caller's IF learner.
+pub(super) fn suspend_call_vif<A: crate::Arch>(dos: &mut thread::DosState<A>) {
+    let saved = dos.dpmi.as_mut().map(|dpmi| dpmi.vif.suspend());
+    dos.pc.locked_stack.continuations.last_mut()
+        .expect("RM call without a continuation").vif = saved;
+    super::refresh_learning_tf(dos);
+}
+
 pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, save: HostContinuation) {
     // An attached RMCS on a continuation captured from VM86 identifies an
     // allocated real-mode callback. Unlike 0300/01/02 calls, its handler owns
@@ -224,6 +235,12 @@ pub(super) fn resume_continuation<A: crate::Arch>(machine: &mut A, dos: &mut thr
 
     save.restore(regs);
     dos.pc.locked_stack.other_stack = save.other_stack;
+    if let Some(saved) = save.vif
+        && let Some(dpmi) = dos.dpmi.as_mut()
+    {
+        dpmi.vif.restore(saved);
+        super::refresh_learning_tf(dos);
+    }
 
     if let Some(saved) = saved_regs {
         saved.restore_gp(regs);

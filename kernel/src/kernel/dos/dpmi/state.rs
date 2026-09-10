@@ -59,8 +59,11 @@ pub(super) fn exception_index(vector: u8) -> Option<usize> {
 pub struct DpmiState {
     /// Linear memory blocks allocated via INT 31h/0501h
     pub(super) mem_blocks: [Option<MemBlock>; MAX_MEM_BLOCKS],
-    /// Bump allocator for linear memory (next free address)
+    /// High-water mark of this session's linear allocations.
     pub(super) mem_next: u32,
+    /// Start of this session's allocation arena (earlier sessions may still
+    /// own addresses below it). Freed holes within this arena can be reused.
+    pub(super) mem_start: u32,
     /// Physical mappings made by INT 31h/0800h and owned by this client.
     pub(super) phys_mappings: [Option<PhysicalMapping>; MAX_PHYS_MAPPINGS],
     /// DPMI 0.9 exception handler vectors (set via INT 31h/0203H).
@@ -156,6 +159,7 @@ impl DpmiState {
         Self {
             mem_blocks: [None; MAX_MEM_BLOCKS],
             mem_next: MEM_BASE,
+            mem_start: MEM_BASE,
             phys_mappings: [None; MAX_PHYS_MAPPINGS],
             exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
             pm_exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],

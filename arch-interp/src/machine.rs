@@ -217,4 +217,4 @@ pub fn drain(mut f: impl FnMut(Irq)) {
 
 /// Physical free-page count, for diagnostic logging only. The interpreter has
 /// no physical frame allocator yet (M3); report 0.
-pub fn free_page_count() -> usize { 0 }
+pub fn free_page_count() -> usize { crate::phys::free_page_count() }

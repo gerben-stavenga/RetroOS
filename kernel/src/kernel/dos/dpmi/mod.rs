@@ -24,8 +24,9 @@ use super::mode_transitions::{seg_base, seg_is_32};
 pub(in crate::kernel::dos) mod vif;
 pub(in crate::kernel::dos) use self::vif::DbResult;
 mod state;
+mod memory;
 pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PHYS_MAP_TOP, PSP_SEL};
-use self::state::{exception_index, physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, MemBlock, PhysicalMapping, PSP_LDT_IDX};
+use self::state::{exception_index, physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors, valid_ldt_selector_idx};
 use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit};
@@ -106,6 +107,7 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
     // treat the first 0501 base as a slab origin and takes a private code path
     // when it is not MB-aligned (matches CWSDPMI's VADDR_START=0x400000).
     dpmi.mem_next = (dpmi.mem_next + 0xFFFFF) & !0xFFFFF;
+    dpmi.mem_start = dpmi.mem_next;
     dos.dpmi_mem_next = dpmi.mem_next;
 
     // Attach DPMI state to thread, then install the one-shot DPMI PSP
@@ -714,9 +716,9 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // AX=0400h — Get DPMI Version
         // Returns: AH=major, AL=minor, BX=flags, CL=processor, DH=master PIC, DL=slave PIC
         // BX bits: 0=32-bit, 1=returns to RM (else VM86), 2=virtual memory
-        // supported. We're 32-bit with demand-paged VM (0501H allocations are
-        // lazy-committed via #PF — see `mem_next` bump-only logic at the
-        // allocator), so bits 0 and 2 are set.
+        // supported. We provide a 32-bit paged virtual address space (bits
+        // 0 and 2). 0501H commits physical backing immediately; 0500H reports
+        // the physical limit and no swap file.
         0x0400 => {
             regs.rax = (regs.rax & !0xFFFF) | 0x0100; // version 1.00
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0005; // 32-bit + VM
@@ -749,23 +751,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             clear_carry(regs);
         }
         // AX=0500h — Get Free Memory Information
-        // ES:EDI = 48-byte buffer. Mirror CWSDPMI: fields that aren't applicable
-        // stay as 0xFFFFFFFF ("unknown / no limit"). DOS/4GW branches on [3]/[7]
-        // (linear space) — concrete small values trigger a conservative path.
+        // ES:EDI = 48-byte buffer. Report actual backing, not fictitious swap.
         0x0500 => {
             let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-            let physical_pages: u32 = 4096;
-            let free_pages: u32 = 4096;
-            let swap_pages: u32 = 0x4000; // pretend 64 MB of paging file (CWSDPMI default w/ swap)
-            let mut info = [0xFFFF_FFFFu32; 12];
-            info[4] = physical_pages;            // total unlocked
-            info[6] = physical_pages;            // total physical
-            info[2] = free_pages;                // max locked alloc
-            info[5] = free_pages;                // total free
-            info[8] = swap_pages;                // paging file pages
-            info[1] = swap_pages + physical_pages; // max unlocked alloc (pages)
-            info[0] = info[1] << 12;             // largest block (bytes)
-            for (i, value) in info.into_iter().enumerate() {
+            for (i, value) in memory::info(machine, dpmi).into_iter().enumerate() {
                 machine.write::<u32>(dest as usize + i * 4, value);
             }
             clear_carry(regs);
@@ -774,25 +763,18 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // BX:CX = size in bytes. Returns: BX:CX = linear address, SI:DI = handle
         0x0501 => {
             let size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
-            if size == 0 { set_carry(regs); return thread::KernelAction::Done; }
-            // Align to page boundary.
-            let aligned = (size + 0xFFF) & !0xFFF;
-            let base = dpmi.mem_next;
-            dpmi.mem_next = dpmi.mem_next.wrapping_add(aligned);
+            let base = match memory::allocate(machine, dpmi, size) {
+                Ok(base) => base,
+                Err(error) => {
+                    regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
+                    set_carry(regs);
+                    return thread::KernelAction::Done;
+                }
+            };
             dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             // Keep the DPMI 0.9 handle equal to the base address. Several
             // extenders assume this CWSDPMI-compatible handle shape.
             let handle = base;
-            // Record the block
-            let mut stored = false;
-            for slot in dpmi.mem_blocks.iter_mut() {
-                if slot.is_none() {
-                    *slot = Some(MemBlock { base, size: aligned });
-                    stored = true;
-                    break;
-                }
-            }
-            if !stored { set_carry(regs); return thread::KernelAction::Done; }
             // Return linear address in BX:CX
             dos_trace!("[DPMI] 0501 alloc size={:#x} -> base={:#x} handle={:#x}", size, base, handle);
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
@@ -805,12 +787,10 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // SI:DI = handle
         0x0502 => {
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            for slot in dpmi.mem_blocks.iter_mut() {
-                if let Some(blk) = slot
-                    && blk.base == handle {
-                        *slot = None;
-                        break;
-                    }
+            if let Err(error) = memory::free(machine, dpmi, handle) {
+                regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
+                set_carry(regs);
+                return thread::KernelAction::Done;
             }
             clear_carry(regs);
         }
@@ -820,26 +800,15 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         0x0503 => {
             let new_size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            let aligned = (new_size + 0xFFF) & !0xFFF;
-            // Grow in place; pages are committed lazily.
-            // This preserves existing data (pages already faulted in stay mapped).
-            let mut base = handle;
-            let mut found = false;
-            for blk in dpmi.mem_blocks.iter_mut().flatten() {
-                if blk.base == handle {
-                    // Ensure mem_next covers the grown region
-                    let end = blk.base.wrapping_add(aligned);
-                    if end > dpmi.mem_next {
-                        dpmi.mem_next = end;
-                    }
-                    dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
-                    blk.size = aligned;
-                    base = blk.base;
-                    found = true;
-                    break;
+            let base = match memory::resize(machine, dpmi, handle, new_size) {
+                Ok(base) => base,
+                Err(error) => {
+                    regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
+                    set_carry(regs);
+                    return thread::KernelAction::Done;
                 }
-            }
-            if !found { set_carry(regs); return thread::KernelAction::Done; }
+            };
+            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
             regs.rsi = (regs.rsi & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;

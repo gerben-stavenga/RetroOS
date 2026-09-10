@@ -145,10 +145,10 @@ pub fn apply_guest_flags(regs: &mut Regs, image: u32) {
     regs.project_tf();
 }
 
-/// Canonical EFLAGS for entering a kernel-orchestrated VM86 excursion:
+/// Initial EFLAGS for a new VM86 process or isolated BIOS context:
 /// VM set, the guest's virtual IF on, canonical IF pinned to 1, and the
-/// current virtual IOPL riding along. The single construction point for
-/// from-scratch VM86 entry flags (DPMI RM calls / callbacks).
+/// current virtual IOPL riding along. DPMI RM calls must instead load their
+/// supplied flags with `set_vm86_flags`; raw switches preserve virtual IF.
 #[inline]
 pub fn vm86_entry_flags(current: u32) -> u32 {
     VM_FLAG | VIF_FLAG | IF_FLAG | (current & IOPL_MASK)

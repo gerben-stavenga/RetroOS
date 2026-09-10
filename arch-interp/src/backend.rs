@@ -141,6 +141,7 @@ impl Arch for Interp {
 
     // ── Diagnostics & power ──
     fn free_page_count(&self) -> usize { crate::machine::free_page_count() }
+    fn total_page_count(&self) -> Option<usize> { Some(crate::phys::PHYS_SIZE / 4096 - 1) }
     fn shutdown(&mut self) -> ! { crate::machine::shutdown() }
     fn halt_forever(&mut self) -> ! { crate::machine::halt_forever() }
 

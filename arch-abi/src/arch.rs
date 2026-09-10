@@ -357,8 +357,10 @@ pub trait Arch: Sized + GuestBytes {
 
     // ── Diagnostics & power ────────────────────────────────────────────────
 
-    /// Physical free-page count (diagnostic logging).
+    /// Number of currently unallocated 4 KiB frames in the backing allocator.
     fn free_page_count(&self) -> usize;
+    /// Total 4 KiB frames managed by that allocator, if known.
+    fn total_page_count(&self) -> Option<usize> { None }
     /// Power off / leave the host.
     fn shutdown(&mut self) -> !;
     /// Disable interrupts and halt forever (panic / shutdown failure).

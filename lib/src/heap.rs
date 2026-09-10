@@ -4,9 +4,10 @@
 //! address window `[base, end)`. It is *demand-paged*: `extend_heap` only claims
 //! virtual address space (bumps a cursor toward `end`) and never maps a page
 //! itself — it assumes that touching an address in the window gets backed by the
-//! platform (a `#PF` handler on bare metal). So the allocator holds no platform
-//! knowledge beyond the two window bounds, which the embedder supplies via
-//! [`DemandHeap::init`]. The raw free-list pointer-juggling lives here, off the
+//! platform (a `#PF` handler on bare metal). An optional embedder callback
+//! returns whole free pages to that platform on deallocation. The allocator
+//! otherwise knows only the two window bounds supplied via [`DemandHeap::init`].
+//! The raw free-list pointer-juggling lives here, off the
 //! kernel, with `lib`'s other freestanding primitives.
 
 use core::alloc::{GlobalAlloc, Layout};
@@ -54,6 +55,8 @@ struct Inner {
     mapped_end: usize,
     /// Ceiling of the heap window (set in `init`).
     heap_end: usize,
+    /// Return whole, unused pages to the platform's demand-paging pool.
+    release: Option<fn(usize, usize)>,
 }
 
 /// Demand-paged heap over a `[base, end)` virtual window. Install as the
@@ -70,17 +73,25 @@ unsafe impl Sync for DemandHeap {}
 impl DemandHeap {
     pub const fn new() -> Self {
         DemandHeap {
-            inner: UnsafeCell::new(Inner { head: None, mapped_end: 0, heap_end: 0 }),
+            inner: UnsafeCell::new(Inner { head: None, mapped_end: 0, heap_end: 0, release: None }),
         }
     }
 
     /// Initialize the allocator over `[base, end)`. Call once, after the
     /// platform can back accesses in that window.
     pub fn init(&self, base: usize, end: usize) {
+        self.init_with_release(base, end, None);
+    }
+
+    /// As `init`, with an optional callback receiving a page-aligned address
+    /// and byte length on deallocation. It must not allocate or reenter this
+    /// heap, and accesses to released pages must be demand-backed again.
+    pub fn init_with_release(&self, base: usize, end: usize, release: Option<fn(usize, usize)>) {
         let inner = unsafe { &mut *self.inner.get() };
         inner.head = None;
         inner.mapped_end = base;
         inner.heap_end = end;
+        inner.release = release;
     }
 }
 
@@ -112,9 +123,9 @@ impl Inner {
     }
 
     /// Add a region to the free list (sorted by address, coalesces).
-    fn add_free_region(&mut self, addr: usize, size: usize) {
+    fn add_free_region(&mut self, addr: usize, size: usize) -> (usize, usize) {
         if size < MIN_BLOCK_SIZE {
-            return; // Too small to track
+            return (addr, 0); // Too small to track
         }
 
         let block_ptr = addr as *mut FreeBlock;
@@ -152,6 +163,7 @@ impl Inner {
         }
 
         // Coalesce with previous block if adjacent (re-traverse to find prev).
+        let mut merged = new_block;
         let mut prev: Option<NonNull<FreeBlock>> = None;
         let mut current = self.head;
         while let Some(block) = current {
@@ -162,6 +174,7 @@ impl Inner {
                     if prev_end == addr {
                         prev_ptr.size += unsafe { (*block.as_ptr()).size };
                         prev_ptr.next = unsafe { (*block.as_ptr()).next };
+                        merged = prev_block;
                     }
                 }
                 break;
@@ -169,6 +182,7 @@ impl Inner {
             prev = current;
             current = unsafe { (*block.as_ptr()).next };
         }
+        (merged.as_ptr() as usize, unsafe { (*merged.as_ptr()).size })
     }
 
     /// Allocate from the free list.
@@ -280,6 +294,18 @@ unsafe impl GlobalAlloc for DemandHeap {
         let size = align_up(layout.size().max(MIN_BLOCK_SIZE), core::mem::align_of::<FreeBlock>());
         if size >= 100_000 { LARGE_FREES.fetch_add(1, Relaxed); }
         DEALLOCATIONS.fetch_add(1, Relaxed);
-        inner.add_free_region(ptr as usize, size);
+        let addr = ptr as usize;
+        let (merged, length) = inner.add_free_region(addr, size);
+        if let Some(release) = inner.release {
+            // Keep the surviving free-list header and all boundary pages that
+            // contain live data. Only revisit pages intersecting this free:
+            // interiors of neighboring free blocks were already released.
+            let start = align_up(merged + MIN_BLOCK_SIZE, PAGE_SIZE).max(addr & !(PAGE_SIZE - 1));
+            // Include a coalesced successor's obsolete header, including
+            // when that header sits exactly on the following page boundary.
+            let end = ((merged + length) & !(PAGE_SIZE - 1))
+                .min(align_up(addr + size + MIN_BLOCK_SIZE, PAGE_SIZE));
+            if start < end { release(start, end - start); }
+        }
     }
 }

@@ -109,6 +109,7 @@ pub mod arch_call {
     pub const HALT: u64 = 0x11F;              // cli + hlt forever at ring 0 (never returns)
     pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120; // ESI:EDX=phys page ECX=shadow vpage EBX=count EDI=redirect
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
+    pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -261,6 +262,7 @@ fn arch_dispatch(regs: &mut Regs) {
             paging2::swap_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }
         arch_call::UNMAP_RANGE => paging2::unmap_range(regs.rdx as usize, regs.rcx as usize),
+        arch_call::RELEASE_HEAP => paging2::release_heap_pages(regs.rdx as usize, regs.rcx as usize),
         arch_call::LOAD_LDT => {
             crate::descriptors::load_ldt(regs.rdx as u32, regs.rcx as u32);
         }

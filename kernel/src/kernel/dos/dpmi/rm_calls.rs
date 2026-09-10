@@ -13,6 +13,18 @@ use super::super::mode_transitions::RmCallStruct;
 #[derive(Clone, Copy)]
 enum Transfer { Interrupt(u8), FarCall, Iret }
 
+impl Transfer {
+    fn entry_flags(self, supplied: u16) -> u32 {
+        let flags = u32::from(supplied);
+        match self {
+            Self::FarCall => flags,
+            // DPMI 0300/0302 push the supplied FLAGS unchanged, but enter
+            // the RM handler with IF and TF clear.
+            Self::Interrupt(_) | Self::Iret => flags & !(machine::IF_FLAG | (1 << 8)),
+        }
+    }
+}
+
 fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, transfer: Transfer) -> thread::KernelAction {
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
@@ -26,6 +38,7 @@ fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
                    else { (rm.ss, rm.sp as u32) };
     machine.write::<RmCallStruct>(struct_addr as usize, RmCallStruct::capture(regs));
     mode_transitions::enter_rm(dos, regs, rm_stack, Some(struct_addr));
+    mode_transitions::suspend_call_vif(dos);
     rm.restore(regs);
 
     let resume = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
@@ -44,7 +57,7 @@ fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
     };
     regs.frame.cs = cs as u64;
     regs.frame.rip = ip as u64;
-    regs.frame.rflags = machine::vm86_entry_flags(regs.flags32()) as u64;
+    machine::set_vm86_flags(regs, transfer.entry_flags(rm.flags));
     thread::KernelAction::Done
 }
 
@@ -58,6 +71,39 @@ pub(super) fn call_real_mode_proc<A: crate::Arch>(machine: &mut A, dos: &mut thr
 
 pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     transfer(machine, dos, regs, Transfer::Iret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simulated_interrupt_entry_clears_if_tf_and_preserves_status() {
+        for transfer in [Transfer::Interrupt(0x21), Transfer::Iret] {
+            for control in [0, 0x100, 0x200, 0x300] {
+                let supplied = 0x0CD7 | control; // arithmetic flags and DF
+                let mut regs = Regs::empty();
+                regs.set_flags32(machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_DEFAULT);
+                machine::set_vm86_flags(&mut regs, transfer.entry_flags(supplied));
+                assert_eq!(machine::guest_flags(&regs) & 0x0FD7, 0x0CD7);
+                assert_eq!(regs.flags32() & machine::VIF_FLAG, 0);
+                assert!(!regs.user_tf());
+                assert_ne!(regs.flags32() & machine::VM_FLAG, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn far_call_uses_supplied_if_tf_instead_of_current_state() {
+        for control in [0, 0x100, 0x200, 0x300] {
+            let supplied = 0x0CD7 | control;
+            let mut regs = Regs::empty();
+            regs.set_flags32(machine::VM_FLAG | machine::VIF_FLAG | machine::IOPL_DEFAULT);
+            machine::set_vm86_flags(&mut regs, Transfer::FarCall.entry_flags(supplied));
+            assert_eq!(machine::guest_flags(&regs) & 0x0FD7, u32::from(supplied));
+            assert_eq!(regs.user_tf(), control & 0x100 != 0);
+        }
+    }
 }
 
 /// Real-mode callback entry — real-mode code called one of our callback stubs.

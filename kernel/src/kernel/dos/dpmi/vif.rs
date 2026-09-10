@@ -57,9 +57,6 @@ enum Class {
     /// CLI-register → … → push → popf. Tag `r` at the CLI and run free
     /// (x86 index 0..7, never esp).
     Reg(u8),
-    /// This CLI site has more than one exit shape. Prediction is unsafe, so
-    /// trace every invocation until the actual exit is known.
-    Mixed,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +82,16 @@ struct Active {
     snap: [u32; 8],
 }
 
+/// Repair state belonging to a caller suspended by a DPMI real-mode call.
+/// Learned sites remain shared; the active window and its tags follow the
+/// caller's continuation, including across nested calls and callbacks.
+#[derive(Clone, Copy)]
+pub(in crate::kernel::dos) struct SuspendedVif {
+    active: Option<Active>,
+    tag: Option<Tag>,
+    escaped_tag: bool,
+}
+
 /// Per-address-space virtual-IF state. A field on the DPMI client; dropped with
 /// the address space, so nothing leaks across clients or reboots.
 #[derive(Default)]
@@ -105,6 +112,20 @@ pub struct VifMap {
 }
 
 impl VifMap {
+    pub(in crate::kernel::dos) fn suspend(&mut self) -> SuspendedVif {
+        SuspendedVif {
+            active: self.active.take(),
+            tag: self.tag.take(),
+            escaped_tag: core::mem::take(&mut self.escaped_tag),
+        }
+    }
+
+    pub(in crate::kernel::dos) fn restore(&mut self, saved: SuspendedVif) {
+        self.active = saved.active;
+        self.tag = saved.tag;
+        self.escaped_tag = saved.escaped_tag;
+    }
+
     pub const fn new() -> Self {
         VifMap {
             sites: SiteTable::new(), active: None, tag: None,
@@ -192,7 +213,6 @@ impl VifMap {
                     self.begin_learn(regs, None);
                 }
             }
-            Some(Class::Mixed) => self.begin_learn(regs, None),
             // A word BELOW cli_sp with no register idiom: the exit builds its own
             // flags image after the CLI and we can't predict it — step every time.
             Some(Class::Flags(_)) => self.begin_learn(regs, None),
@@ -203,16 +223,10 @@ impl VifMap {
     /// An `STI` `#GP`'d: it re-enabled IF on its own. If we were learning, this
     /// site's exit is an STI. (arch has already reflected the fault; we set VIF.)
     pub fn on_sti<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) {
-        let mismatch = self.tag.is_some()
-            && self.active.is_some_and(|active| !active.learning);
-        if mismatch && let Some(active) = self.active {
-            self.sites.insert(active.cli_ip, Class::Mixed);
-        }
         self.escaped_tag |= self.clear_tag(arch, regs);
         regs.set_flags32(regs.flags32() | VIF_FLAG);
         if let Some(a) = self.active.take()
             && a.learning
-            && !matches!(self.sites.get(a.cli_ip), Some(Class::Mixed))
         {
             self.sites.insert(a.cli_ip, Class::Sti);
         }
@@ -307,9 +321,7 @@ impl VifMap {
                     if regs.flags32() & VIF_FLAG != 0 {
                         if let Some(a) = self.active {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
-                            if !matches!(self.sites.get(a.cli_ip), Some(Class::Mixed)) {
-                                self.sites.insert(a.cli_ip, class);
-                            }
+                            self.sites.insert(a.cli_ip, class);
                         }
                         self.active = None;
                         return DbResult::Resume;
@@ -494,5 +506,41 @@ impl SiteTable {
 impl Default for SiteTable {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn learning_window(ip: u32) -> Active {
+        Active { cli_ip: ip, cli_sp: 0x1000, learning: true, probe: None, snap: [0; 8] }
+    }
+
+    #[test]
+    fn nested_call_suspends_ownership_and_restores_each_callers_window() {
+        let mut vif = VifMap::new();
+        vif.active = Some(learning_window(0x100));
+        vif.tag = Some(Tag::Flags(0x1004));
+        let outer = vif.suspend();
+        assert!(!vif.owns_db());
+        assert!(!vif.is_learning());
+        assert!(vif.tag.is_none());
+
+        // A PM callback can own its own window, then make another RM call.
+        vif.active = Some(learning_window(0x200));
+        let inner = vif.suspend();
+        assert!(!vif.owns_db());
+        vif.restore(inner);
+        assert_eq!(vif.active_site(), Some(0x200));
+        assert!(vif.is_learning());
+        vif.sites.insert(0x200, Class::Sti);
+        vif.active = None;
+
+        vif.restore(outer);
+        assert_eq!(vif.active_site(), Some(0x100));
+        assert!(vif.is_learning());
+        assert!(matches!(vif.tag, Some(Tag::Flags(0x1004))));
+        assert!(matches!(vif.sites.get(0x200), Some(Class::Sti)));
     }
 }

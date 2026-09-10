@@ -133,6 +133,7 @@ impl Arch for Metal {
 
     // ── Diagnostics & power ──
     fn free_page_count(&self) -> usize { super::phys_mm::free_page_count() }
+    fn total_page_count(&self) -> Option<usize> { Some(super::phys_mm::total_page_count()) }
     fn shutdown(&mut self) -> ! { super::x86::shutdown() }
     fn halt_forever(&mut self) -> ! { super::halt_forever() }
 

@@ -40,10 +40,8 @@ unsafe impl Send for Phys {}
 
 static PHYS: std::sync::OnceLock<Phys> = std::sync::OnceLock::new();
 
-/// Bump allocator over the phys backing. Frame 0 is reserved (a null-ish
-/// sentinel so a 0 ppage reads as "unallocated"). The kernel frees rarely
-/// enough (VGA teardown, reaped DMA buffers) that a simple high-water bump
-/// with no reuse is acceptable for now; `free` is a no-op stub.
+/// High-water mark over the phys backing; reclaimed frames are reused first.
+/// Frame 0 is reserved (a null-ish sentinel so 0 reads as "unallocated").
 static NEXT_FRAME: AtomicUsize = AtomicUsize::new(1);
 
 /// Reclaimed single frames available for reuse before the bump pointer advances.
@@ -51,6 +49,11 @@ static NEXT_FRAME: AtomicUsize = AtomicUsize::new(1);
 /// and returns it here; with real reuse, sequential program runs (DN → game →
 /// exit → next game) no longer march `NEXT_FRAME` to exhaustion.
 static FREE_LIST: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+pub fn free_page_count() -> usize {
+    (PHYS_SIZE / PAGE).saturating_sub(NEXT_FRAME.load(Ordering::Relaxed))
+        + FREE_LIST.lock().unwrap().len()
+}
 
 /// Base of the persistent kernel-side mapping of the whole guest-physical memfd.
 /// This is the single region handed to unicorn (`mem_map_ptr(0, PHYS_SIZE, …)`):

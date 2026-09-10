@@ -179,6 +179,25 @@ pub fn arch_unmap_range(base_page: usize, count: usize) {
     }
 }
 
+/// Heap release hook, usable during ring-0 boot and ring-1 kernel execution.
+/// Does not allocate or call back into the heap.
+pub fn release_heap_pages(addr: usize, bytes: usize) {
+    let cs: u16;
+    unsafe { core::arch::asm!("mov {0:x}, cs", out(reg) cs, options(nomem, nostack, preserves_flags)); }
+    if cs & 3 == 0 {
+        crate::paging2::release_heap_pages(addr, bytes);
+    } else {
+        unsafe {
+            core::arch::asm!(
+                "int 0x80",
+                in("eax") crate::arch_call::RELEASE_HEAP as u32,
+                in("edx") addr as u32,
+                in("ecx") bytes as u32,
+            );
+        }
+    }
+}
+
 
 
 
