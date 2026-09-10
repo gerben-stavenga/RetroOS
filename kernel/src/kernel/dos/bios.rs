@@ -829,7 +829,6 @@ mod keyboard_tests {
 // ============================================================================
 
 const VRAM_TEXT: usize = 0xB8000;
-const VRAM_MODE13: usize = 0xA0000;
 
 /// Is this a text mode? Only 0-3 and 7 have character cells; everything else
 /// the BIOS knows is a pixel buffer, where the text services rasterize glyphs
@@ -1183,22 +1182,7 @@ pub(super) fn int10<A: crate::Arch>(
             emulate_outb(machine, &mut dos.pc, regs, 0x3D8, mode_ctl);
             emulate_outb(machine, &mut dos.pc, regs, 0x3D9, palette);
             if clear {
-                // AL bit 7 clear: clear the framebuffer. Planar modes are
-                // cleared inside on_set_mode (their VRAM is the plane window).
-                if mode == 0x13 {
-                    for i in 0..(320 * 200 / 4) {
-                        machine.write::<u32>(VRAM_MODE13 + i * 4, 0);
-                    }
-                } else if !matches!(mode, 0x0D..=0x12) {
-                    // Text modes blank to space-on-gray cells; the CGA graphics
-                    // modes (4-6) share the window but blank to pixel value 0 —
-                    // 0x0720 there is a red/green/brown pixel-stripe pattern.
-                    let blank: u16 = if matches!(mode, 4..=6) { 0x0000 } else { 0x0720 };
-                    for i in 0..16384 {
-                        // full 32K text window
-                        machine.write::<u16>(VRAM_TEXT + i * 2, blank);
-                    }
-                }
+                super::machine::vga::bios_clear_framebuffer(machine, &mut dos.pc.vga, mode);
             }
         }
         0x01 => {

@@ -1115,7 +1115,7 @@ pub fn on_set_mode<A: crate::Arch>(
 /// in the page-backed planes. Used when a linear alias can't model the access —
 /// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
 /// write. Latches must have been loaded by a prior `vram_read`.
-pub fn vram_write<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32, byte: u8) {
+pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, off: u32, byte: u8) {
     let (off, map_mask) = vga.cpu_write_address(off as usize);
     let layout = vga.layout();
     let cur = core::array::from_fn(|p| {
@@ -1129,12 +1129,12 @@ pub fn vram_write<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32,
     }
 }
 
-/// Copy bytes into guest memory, routing any overlap with a trap-backed planar
-/// A0000 window through the VGA write path. DOS services can legally transfer
+/// Copy bytes into guest memory, routing any overlap with the trap-backed VGA
+/// aperture through the VGA write path. DOS services can legally transfer
 /// file/device data straight into video memory; on a real VGA those CPU stores
-/// still honour map mask/write-mode/latches, while the emulated path has A0000
+/// still honour map mask/write-mode/latches, while the emulated path has the aperture
 /// unmapped so raw `machine.copy_to` would fault in the kernel.
-pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
+pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVideo, addr: usize, src: &[u8]) {
     let Some(vga) = vga.emulated_mut() else {
         machine.copy_to(addr, src);
         return;
@@ -1177,7 +1177,7 @@ pub fn copy_to_guest<A: crate::Arch>(machine: &mut A, vga: &mut DosVideo, addr: 
 
 /// Trapped planar VRAM read: load the 4 latches from the planes at A0000 offset
 /// `off` and return the byte the CPU sees (read map select, or color compare).
-pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) -> u8 {
+pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, off: u32) -> u8 {
     let (off, read_plane) = vga.cpu_read_address(off as usize);
     let layout = vga.layout();
     let cur = core::array::from_fn(|p| {
@@ -1189,6 +1189,35 @@ pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) 
     vga.latches = latches;
     vga.latches_valid = true;
     data
+}
+
+/// Read a CPU-visible video byte, including latch effects on a trapped aperture.
+fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u8 {
+    if let Some(dev) = device.emulated_mut() {
+        if let Some(pages) = trapped_aperture(&dev.state) {
+            let base = usize::from(pages.start) << 12;
+            let end = usize::from(pages.end) << 12;
+            if (base..end).contains(&addr) {
+                return vram_read(machine, &mut dev.state, (addr - base) as u32);
+            }
+        }
+    }
+    machine.read(addr)
+}
+
+/// BIOS mode-set clearing after the new aperture has been installed. EGA/VGA
+/// planar modes were already cleared in on_set_mode; the other modes use their
+/// CPU-visible windows, which may be direct or trapped (notably CGA mode 6).
+pub fn bios_clear_framebuffer<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, mode: u8) {
+    if matches!(mode, 0x0D..=0x12) { return; }
+    let (base, len) = if mode == 0x13 { (0xA0000, 320 * 200) } else { (0xB8000, 32768) };
+    let mut blank = [0u8; 512];
+    if !matches!(mode, 4..=6 | 0x13) {
+        for cell in blank.chunks_exact_mut(2) { cell.copy_from_slice(&0x0720u16.to_le_bytes()); }
+    }
+    for offset in (0..len).step_by(blank.len()) {
+        copy_to_guest(machine, device, base + offset, &blank[..(len - offset).min(blank.len())]);
+    }
 }
 
 /// Rasterize the 8-wide glyph for `ch` into the current *graphics*-mode
@@ -1208,7 +1237,7 @@ pub fn vram_read<A: crate::Arch>(machine: &mut A, vga: &mut VgaState, off: u32) 
 /// adapter directly and can therefore leave the BDA stale. A native card has
 /// no shadow register file; its BIOS mode byte selects the CPU-visible legacy
 /// aperture, whose packed mode-4/6 and mode-13 layouts are standardized.
-pub fn bios_draw_glyph<A: crate::Arch>(
+pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
     machine: &mut A,
     device: &mut DosVideo,
     bios_mode: u8,
@@ -1257,7 +1286,7 @@ pub fn bios_draw_glyph<A: crate::Arch>(
                 let py = py0 + gy;
                 for gx in 0..8u32 {
                     let color = if bits & (0x80 >> gx) != 0 { fg } else { 0 };
-                    machine.write::<u8>(0xA0000 + (py * 320 + px0 + gx) as usize, color);
+                    copy_to_guest(machine, device, 0xA0000 + (py * 320 + px0 + gx) as usize, &[color]);
                 }
             }
         }
@@ -1273,9 +1302,9 @@ pub fn bios_draw_glyph<A: crate::Arch>(
                     let color = if bits & (0x80 >> gx) != 0 { fg & 0x03 } else { 0 };
                     let off = bank + (px / 4) as usize;
                     let shift = 6 - (px & 3) * 2;
-                    let mut b: u8 = machine.read(off);
+                    let mut b = read_guest_byte(machine, device, off);
                     b = (b & !(0x03 << shift)) | (color << shift);
-                    machine.write::<u8>(off, b);
+                    copy_to_guest(machine, device, off, &[b]);
                 }
             }
         }
@@ -1289,9 +1318,9 @@ pub fn bios_draw_glyph<A: crate::Arch>(
                     let px = px0 + gx;
                     let off = bank + (px / 8) as usize;
                     let mask = 0x80u8 >> (px & 7);
-                    let mut b: u8 = machine.read(off);
+                    let mut b = read_guest_byte(machine, device, off);
                     if bits & (0x80 >> gx) != 0 { b |= mask; } else { b &= !mask; }
-                    machine.write::<u8>(off, b);
+                    copy_to_guest(machine, device, off, &[b]);
                 }
             }
         }
@@ -1330,3 +1359,119 @@ pub fn bios_draw_glyph<A: crate::Arch>(
 // ============================================================================
 // Emulated display: render to the platform's present sink
 // ============================================================================
+
+#[cfg(test)]
+mod bios_memory_tests {
+    use super::*;
+    use alloc::vec::Vec;
+    use arch_abi::GuestBytes;
+
+    struct Memory {
+        ram: Vec<u8>,
+        planes: Vec<u8>,
+        aperture: ::vga::CpuAperture,
+    }
+
+    impl Memory {
+        fn offset(&self, addr: usize) -> (bool, usize) {
+            if (VGA_VRAM_BASE..VGA_VRAM_BASE + PLANES_LEN).contains(&addr) {
+                return (true, addr - VGA_VRAM_BASE);
+            }
+            match self.aperture {
+                ::vga::CpuAperture::Trapped { range } => {
+                    assert!(!(usize::from(range.start_page) * 4096..usize::from(range.end_page) * 4096)
+                        .contains(&addr), "raw BIOS access to trapped VGA at {addr:#x}");
+                }
+                ::vga::CpuAperture::Direct { range, pages } => {
+                    let base = usize::from(range.start_page) * 4096;
+                    if (base..base + usize::from(pages) * 4096).contains(&addr) {
+                        return (true, addr - base);
+                    }
+                }
+                _ => {}
+            }
+            (false, addr)
+        }
+    }
+
+    impl GuestBytes for Memory {
+        fn read<T: Copy>(&self, addr: usize) -> T {
+            let mut value = core::mem::MaybeUninit::<T>::uninit();
+            unsafe {
+                let bytes = core::slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>());
+                self.copy_from(addr, bytes);
+                value.assume_init()
+            }
+        }
+        fn write<T: Copy>(&mut self, addr: usize, value: T) {
+            let bytes = unsafe { core::slice::from_raw_parts(core::ptr::addr_of!(value).cast::<u8>(), core::mem::size_of::<T>()) };
+            self.copy_to(addr, bytes);
+        }
+        fn copy_from(&self, addr: usize, dst: &mut [u8]) {
+            for (i, byte) in dst.iter_mut().enumerate() {
+                let (plane, off) = self.offset(addr + i);
+                *byte = if plane { self.planes[off] } else { self.ram[off] };
+            }
+        }
+        fn copy_to(&mut self, addr: usize, src: &[u8]) {
+            for (i, byte) in src.iter().enumerate() {
+                let (plane, off) = self.offset(addr + i);
+                if plane { self.planes[off] = *byte; } else { self.ram[off] = *byte; }
+            }
+        }
+        fn copy_cstr(&self, _: usize, _: &mut [u8]) -> usize { unimplemented!() }
+        fn zero(&mut self, _: usize, _: usize) { unimplemented!() }
+        fn copy_within(&mut self, _: usize, _: usize, _: usize) { unimplemented!() }
+    }
+
+    fn setup(mode: u8) -> (Memory, DosVideo) {
+        let mut dev = EmulatedVga::initial_mode3();
+        let regs = ::vga::bios_mode_regs(mode).unwrap();
+        dev.state.seq = regs.seq;
+        dev.state.gc = regs.gc;
+        dev.state.crtc = regs.crtc;
+        dev.state.misc_output = regs.misc;
+        let memory = Memory {
+            ram: alloc::vec![0xA5; 0xC0000],
+            planes: alloc::vec![0xA5; PLANES_LEN],
+            aperture: dev.state.cpu_aperture(),
+        };
+        (memory, DosVideo::Vga(dev))
+    }
+
+    #[test]
+    fn mode_clear_handles_direct_and_trapped_apertures() {
+        for mode in [0, 1, 2, 3, 4, 5, 6, 7, 0x13] {
+            let (mut memory, mut device) = setup(mode);
+            if mode == 6 { assert!(matches!(memory.aperture, ::vga::CpuAperture::Trapped { .. })); }
+            bios_clear_framebuffer(&mut memory, &mut device, mode);
+            let (base, len) = if mode == 0x13 { (0xA0000, 64000) } else { (0xB8000, 32768) };
+            for off in 0..len {
+                let expected = if matches!(mode, 4..=6 | 0x13) { 0 } else if off & 1 == 0 { 0x20 } else { 7 };
+                assert_eq!(read_guest_byte(&mut memory, &mut device, base + off), expected, "mode {mode:#x} offset {off:#x}");
+            }
+            if mode == 6 {
+                // Sequential mode 6 clears only plane 0, not the other maps.
+                for off in 0..32768 {
+                    for plane in 1..4 {
+                        assert_eq!(memory.planes[::vga::VramLayout::PlaneMinor.index(plane, off)], 0xA5);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mode6_glyph_reads_and_writes_both_cga_banks_through_vga() {
+        let (mut memory, mut device) = setup(6);
+        assert!(bios_draw_glyph(&mut memory, &mut device, 6, b'A', 2, 1, 1));
+        for row in 0..8 {
+            let py = 8 + row;
+            let address = 0xB8000 + (py & 1) * 0x2000 + (py >> 1) * 80 + 2;
+            assert_eq!(read_guest_byte(&mut memory, &mut device, address), lib::vga_fonts::FONT_8X8[b'A' as usize * 8 + row]);
+            assert_eq!(read_guest_byte(&mut memory, &mut device, address - 1), 0xA5);
+            assert_eq!(read_guest_byte(&mut memory, &mut device, address + 1), 0xA5);
+        }
+        assert_eq!(device.emulated().unwrap().state.latches, [0xA5; 4]);
+    }
+}
