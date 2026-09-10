@@ -347,5 +347,6 @@ pub fn free_page_count() -> usize {
 
 /// Frames managed by the allocator, including allocated kernel/user frames.
 pub fn total_page_count() -> usize {
-    unsafe { (*(&raw const PAGE_REFS)).iter().filter(|&&n| n != RESERVED).count() }
+    let pr = &raw const PAGE_REFS;
+    unsafe { (*pr).iter().filter(|&&n| n != RESERVED).count() }
 }

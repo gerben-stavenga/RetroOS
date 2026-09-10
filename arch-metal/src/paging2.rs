@@ -932,7 +932,7 @@ pub fn unmap_kernel_page(vaddr: usize) {
 /// heap retains its virtual range and faults these pages back in on reuse.
 pub fn release_heap_pages(addr: usize, bytes: usize) {
     assert!(addr >= heap_base() && addr.checked_add(bytes).is_some_and(|end| end <= HEAP_END));
-    assert!(addr % PAGE_SIZE == 0 && bytes % PAGE_SIZE == 0);
+    assert!(addr.is_multiple_of(PAGE_SIZE) && bytes.is_multiple_of(PAGE_SIZE));
     fn present<E: Entry>(entries: &[E], idx: usize) -> bool {
         let parent = parent_index::<E>(idx);
         (parent == idx || present(entries, parent)) && entries[idx].present()

@@ -1193,13 +1193,13 @@ pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, o
 
 /// Read a CPU-visible video byte, including latch effects on a trapped aperture.
 fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, addr: usize) -> u8 {
-    if let Some(dev) = device.emulated_mut() {
-        if let Some(pages) = trapped_aperture(&dev.state) {
-            let base = usize::from(pages.start) << 12;
-            let end = usize::from(pages.end) << 12;
-            if (base..end).contains(&addr) {
-                return vram_read(machine, &mut dev.state, (addr - base) as u32);
-            }
+    if let Some(dev) = device.emulated_mut()
+        && let Some(pages) = trapped_aperture(&dev.state)
+    {
+        let base = usize::from(pages.start) << 12;
+        let end = usize::from(pages.end) << 12;
+        if (base..end).contains(&addr) {
+            return vram_read(machine, &mut dev.state, (addr - base) as u32);
         }
     }
     machine.read(addr)
