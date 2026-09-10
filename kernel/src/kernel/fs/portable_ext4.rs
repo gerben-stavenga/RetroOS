@@ -369,9 +369,9 @@ impl PortableExt4Fs {
                 EdgeCursor::from_position(cookie),
                 &mut |edge, info| {
                     output.try_reserve(1).map_err(|_| Error::OutOfMemory)?;
-                    let name_len = edge.name.len().min(100);
+                    let name_len = edge.name.len();
                     let mut entry = DirEntry {
-                        name: [0; 100],
+                        name: alloc::vec![0; name_len],
                         name_len,
                         size: info.size.min(u64::from(u32::MAX)) as u32,
                         is_dir: info.node().is_some(),
@@ -379,6 +379,7 @@ impl PortableExt4Fs {
                         mode: info.format & 0x0fff,
                         mtime: info.modified,
                         node: info.object.opaque(),
+                        short_name: None,
                         mount_idx: 0,
                     };
                     entry.name[..name_len].copy_from_slice(&edge.name[..name_len]);

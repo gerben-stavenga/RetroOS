@@ -63,7 +63,7 @@ impl Filesystem for KLogFs {
             }
             let len = name.len().min(100);
             let mut de = DirEntry {
-                name: [0; 100],
+                name: alloc::vec![0; len],
                 name_len: len,
                 size: klog::byte_len(),
                 is_dir: false,
@@ -71,6 +71,7 @@ impl Filesystem for KLogFs {
                 mode: 0o444,
                 mtime: 0,
                 node: 0,
+                short_name: None,
                 mount_idx: 0,
             };
             de.name[..len].copy_from_slice(&name[..len]);

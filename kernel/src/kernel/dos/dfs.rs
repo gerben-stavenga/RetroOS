@@ -26,6 +26,9 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[path = "dfs_lfn.rs"]
+pub mod lfn;
+
 // Startup sets this before DOS personalities are constructed. Each DfsState
 // snapshots it into owned state, so path operations do not consult mutable
 // process-global state after construction.
@@ -97,10 +100,15 @@ pub mod ci {
             entries: Vec::new(),
             aliases: BTreeMap::new(),
         };
+        let mut listed = Vec::new();
         let mut idx = 0usize;
         while let Some(e) = vfs::readdir(&readdir_key, idx) {
+            listed.push(e);
+            idx += 1;
+        }
+        let aliases = assign_directory_aliases(&listed);
+        for (e, alias) in listed.into_iter().zip(aliases) {
             let original = e.name[..e.name_len].to_vec();
-            let alias = compute_alias_8_3(&original, &dir.aliases);
             // DOS has no symbolic-link file type. Present a link to a
             // directory as the directory it resolves to, otherwise file
             // managers such as DN/NC render it as a file and refuse to enter
@@ -122,7 +130,6 @@ pub mod ci {
                 is_dir,
                 mtime: e.mtime,
             }));
-            idx += 1;
         }
         dir
     }
@@ -160,6 +167,15 @@ pub mod ci {
         let dir = ensure_cached(vfs_dir);
         let index = *dir.aliases.get(alias)?;
         Some(dir.entries[index].1.original.as_slice())
+    }
+
+    /// LFN lookup accepts either namespace spelling; matching policy is DOS
+    /// policy even when the backing filesystem is case-sensitive.
+    pub fn lookup_lfn(vfs_dir: &[u8], name: &[u8]) -> Option<(&'static [u8], &'static Entry)> {
+        let dir = ensure_cached(vfs_dir);
+        dir.entries.iter().find(|(alias, _)| lfn::equal(&lfn::decode_oem(alias), name))
+            .or_else(|| dir.entries.iter().find(|(_, entry)| lfn::equal(&entry.original, name)))
+            .map(|(alias, entry)| (alias.as_slice(), entry))
     }
 
     /// Get the entry at `idx` in the backing directory's order. Used by
@@ -255,16 +271,48 @@ fn compute_alias_8_3(name: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> Vec<u8
     name.iter().map(|b| b.to_ascii_uppercase()).collect()
 }
 
+/// Native aliases are authoritative. Reserve them and real 8.3 filenames
+/// before synthesizing any aliases, regardless of directory enumeration order.
+fn assign_directory_aliases(entries: &[vfs::DirEntry]) -> Vec<Vec<u8>> {
+    let mut assigned = alloc::vec![None; entries.len()];
+    let mut used = BTreeMap::new();
+    for native in [true, false] {
+        for (index, entry) in entries.iter().enumerate() {
+            if assigned[index].is_some() { continue; }
+            let name = if native {
+                let Some(short) = &entry.short_name else { continue };
+                short.as_bytes()
+            } else {
+                let name = &entry.name[..entry.name_len];
+                if !fits_8_3(name) { continue; }
+                name
+            };
+            let alias: Vec<u8> = name.iter().map(u8::to_ascii_uppercase).collect();
+            if !used.contains_key(&alias) {
+                used.insert(alias.clone(), index);
+                assigned[index] = Some(alias);
+            }
+        }
+    }
+    entries.iter().enumerate().map(|(index, entry)| {
+        assigned[index].take().unwrap_or_else(|| {
+            let alias = compute_alias_8_3(&entry.name[..entry.name_len], &used);
+            used.insert(alias.clone(), index);
+            alias
+        })
+    }).collect()
+}
+
 fn alias_taken(alias: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> bool {
     existing.contains_key(alias)
 }
 
 /// Per-thread DOS filesystem state.
 pub struct DfsState {
-    cwd: [[u8; DFS_CWD_MAX]; 5],
-    cwd_len: [u8; 5],
+    cwd: [Vec<u8>; 5],
     current_drive: u8,
     hostfs_enabled: bool,
+    pub lfn_searches: lfn::Searches,
 }
 
 impl DfsState {
@@ -273,7 +321,8 @@ impl DfsState {
     }
 
     pub const fn new_with_hostfs(hostfs_enabled: bool) -> Self {
-        Self { cwd: [[0; DFS_CWD_MAX]; 5], cwd_len: [0; 5], current_drive: b'C', hostfs_enabled }
+        Self { cwd: [const { Vec::new() }; 5], current_drive: b'C', hostfs_enabled,
+            lfn_searches: lfn::Searches::new() }
     }
 
     fn drive_slot(drive: u8) -> Option<usize> {
@@ -295,7 +344,7 @@ impl DfsState {
     pub fn get_cwd_for(&self, drive: u8) -> Option<&[u8]> {
         if !self.drive_available(drive) { return None; }
         let slot = Self::drive_slot(drive)?;
-        Some(&self.cwd[slot][..self.cwd_len[slot] as usize])
+        Some(&self.cwd[slot])
     }
 
     /// Overwrite cwd with `new_cwd` (expected already in AH=47 form).
@@ -306,9 +355,7 @@ impl DfsState {
     fn set_cwd_for(&mut self, drive: u8, new_cwd: &[u8]) {
         if !self.drive_available(drive) { return; }
         let Some(slot) = Self::drive_slot(drive) else { return };
-        let n = new_cwd.len().min(DFS_CWD_MAX);
-        self.cwd[slot][..n].copy_from_slice(&new_cwd[..n]);
-        self.cwd_len[slot] = n as u8;
+        self.cwd[slot] = new_cwd.to_vec();
     }
 
     fn drive_available(&self, drive: u8) -> bool {
@@ -369,11 +416,7 @@ impl DfsState {
     fn store_cwd_slot(&mut self, slot: usize, mut s: &[u8]) {
         while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
-        let n = s.len().min(DFS_CWD_MAX);
-        for (i, &b) in s.iter().enumerate().take(n) {
-            self.cwd[slot][i] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
-        }
-        self.cwd_len[slot] = n as u8;
+        self.cwd[slot] = s.iter().map(|&b| if b == b'/' { b'\\' } else { b.to_ascii_uppercase() }).collect();
     }
 
     /// Resolve a DOS input path to absolute DOS form `"X:\UPPER\PATH"`.
@@ -443,7 +486,7 @@ impl DfsState {
     /// `vfs::open` expects. Walks each DOS component through DFS's per-dir
     /// CI cache to recover the canonical (mixed-case) VFS name; the VFS
     /// itself is POSIX-strict.
-    pub fn to_vfs_open(abs_dos: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
+    pub fn to_vfs_open(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
         walk_components(rest, out, &mut pos, /*allow_missing_last=*/false)?;
         Ok(pos)
@@ -453,7 +496,7 @@ impl DfsState {
     /// that basename is appended verbatim (uppercase, as produced by
     /// `resolve`). Intermediate directories must exist.
     /// Use for CREATE / UNLINK / RENAME (destination) / MKDIR.
-    pub fn to_vfs_create(abs_dos: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
+    pub fn to_vfs_create(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
         walk_components(rest, out, &mut pos, /*allow_missing_last=*/true)?;
         Ok(pos)
@@ -467,7 +510,7 @@ impl DfsState {
             Err(e) => return e,
         };
         // Walk the path as an existing directory.
-        let mut vfs_buf = [0u8; DFS_PATH_MAX];
+        let mut vfs_buf = alloc::vec![0u8; vfs::PATH_KEY_MAX];
         let vlen = match Self::to_vfs_open(&abs[..alen], &mut vfs_buf) {
             Ok(n) => n,
             Err(e) => return e,
@@ -533,7 +576,7 @@ pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
 
 /// Map `"X:\..."` → VFS prefix. Writes the prefix into `out`, returns the new
 /// `pos` and the remaining DOS path (after `"X:\"`).
-fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
+fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8])
     -> Result<(usize, &'a [u8]), i32>
 {
     if abs_dos.len() < 3 || abs_dos[1] != b':' || abs_dos[2] != b'\\' {
@@ -551,6 +594,7 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
     // re-adds slashes, so write it WITHOUT the trailing one (and "" → root).
     let prefix = if prefix.last() == Some(&b'/') { &prefix[..prefix.len() - 1] } else { prefix };
     let mut pos = 0;
+    if prefix.len() > out.len() { return Err(3); }
     for &b in prefix {
         out[pos] = b; pos += 1;
     }
@@ -568,7 +612,7 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8; DFS_PATH_MAX])
 /// missing intermediate is `3` (path not found).
 fn walk_components(
     rest: &[u8],
-    out: &mut [u8; DFS_PATH_MAX],
+    out: &mut [u8],
     pos: &mut usize,
     allow_missing_last: bool,
 ) -> Result<(), i32> {
@@ -673,6 +717,28 @@ fn canonicalize_components(buf: &mut [u8], len: usize) -> usize {
 mod tests {
     use super::{DfsState, DFS_PATH_MAX, compute_alias_8_3, strip_drive_prefix};
     use alloc::collections::BTreeMap;
+
+    #[test]
+    fn native_fat_aliases_and_real_short_names_are_reserved_before_generated_aliases() {
+        use crate::kernel::vfs::{DirEntry, ShortName};
+        let names: &[(&[u8], Option<&[u8]>)] = &[
+            (b"My long ext4 filename.txt", None),
+            (b"MYLONG~1.TXT", None),
+            (b"My long FAT filename.txt", Some(b"MYLONG~2.TXT")),
+        ];
+        let entries: alloc::vec::Vec<_> = names.iter().map(|(name, short)| {
+            let mut entry = DirEntry {
+                name: alloc::vec![0; name.len()], name_len: name.len(), short_name: short.and_then(ShortName::new),
+                size: 0, is_dir: false, is_symlink: false, mode: 0o644, mtime: 0, node: 0, mount_idx: 0,
+            };
+            entry.name[..name.len()].copy_from_slice(name);
+            entry
+        }).collect();
+        let aliases = super::assign_directory_aliases(&entries);
+        assert_eq!(aliases[0], b"MYLONG~3.TXT");
+        assert_eq!(aliases[1], b"MYLONG~1.TXT");
+        assert_eq!(aliases[2], b"MYLONG~2.TXT");
+    }
 
     #[test]
     fn colliding_short_names_receive_distinct_dos_aliases() {

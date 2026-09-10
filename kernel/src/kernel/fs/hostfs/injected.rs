@@ -80,7 +80,7 @@ impl Filesystem for InjectedHostFs {
                 return None;
             }
             out.push(DirEntry {
-                name,
+                name: name[..name_len].to_vec(),
                 name_len,
                 size,
                 is_dir,
@@ -88,6 +88,7 @@ impl Filesystem for InjectedHostFs {
                 mode: if is_dir { 0o755 } else { 0o644 },
                 mtime,
                 node: 0,
+                short_name: None,
                 mount_idx: 0,
             });
             index += 1;

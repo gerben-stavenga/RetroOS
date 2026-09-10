@@ -5,7 +5,7 @@ extern crate alloc;
 use crate::Regs;
 use crate::kernel::thread;
 use crate::kernel::{
-    fs::portable_ext4::PortableExt4Fs,
+    fs::disk::FilesystemVolume,
     vfs,
 };
 
@@ -403,9 +403,18 @@ fn prepare_storage<A: crate::Arch>(
     crate::compact_screenln!(screen, "Filesystems: scanning partition tables...");
     let mut parts = alloc::vec::Vec::new();
     for disk in disks {
-        parts.extend(crate::kernel::block::partition::scan(
-            crate::kernel::block::Volume::whole(disk),
-        ));
+        let whole = crate::kernel::block::Volume::whole(disk);
+        let partitions = crate::kernel::block::partition::scan(whole);
+        if partitions.is_empty() {
+            // Unpartitioned filesystem media ("superfloppies") have no table;
+            // the same filesystem probes below decide whether to accept them.
+            parts.push(crate::kernel::block::partition::Partition {
+                volume: whole,
+                kind: crate::kernel::block::partition::PartKind::Other(0),
+            });
+        } else {
+            parts.extend(partitions);
+        }
     }
     crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
@@ -437,23 +446,18 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
 }
 
 /// Keep the boot-time mount namespace in the single-digit `/diskN` range.
-const MAX_EXT_MOUNTS: usize = 8;
+const MAX_DISK_MOUNTS: usize = 8;
 
-/// Which ext filesystem is the root: the one that looks like a Linux root
-/// (`/etc` + `/usr`), else the first.
-///
-/// This is the ONLY real decision in the mount tree — everything else follows
-/// mechanically — so it is the only part worth naming. A disk can carry
-/// several ext partitions (a data partition AND the real root) and the table
-/// order says nothing about which is which. Only sniff when ambiguous: a lone
-/// ext partition IS the root, and probing it would mean a needless mount.
-fn root_index(ext: &[crate::kernel::block::Volume]) -> usize {
-    if ext.len() < 2 {
-        return 0;
+/// Select a filesystem root, not merely the first FAT volume (often an ESP).
+/// Equal scores retain device/partition order, as the ext4-only path did.
+fn root_index(volumes: &[FilesystemVolume]) -> usize {
+    if volumes.len() < 2 { return 0; }
+    let mut best = (0, 0);
+    for (index, volume) in volumes.iter().enumerate() {
+        let score = volume.root_score(crate::kernel::dos::c_root());
+        if score > best.1 { best = (index, score); }
     }
-    ext.iter()
-        .position(crate::kernel::fs::portable_ext4::is_linux_root)
-        .unwrap_or(0)
+    best.0
 }
 
 /// Build the mount tree. The disk's 0xDA boot-bundle partition is
@@ -468,33 +472,32 @@ fn mount_filesystems(
 ) -> bool {
     use crate::kernel::block::partition::PartKind;
 
-    // Ask the filesystem, don't trust the table: a partition holds ext when it
-    // has an ext superblock, whatever type byte or GUID it carries.
-    crate::compact_screenln!(screen, "Filesystems: probing ext superblocks...");
-    let ext: alloc::vec::Vec<_> = parts
+    // Ask the filesystem, not the partition's type byte or GUID.
+    crate::compact_screenln!(screen, "Filesystems: probing ext4/FAT volumes...");
+    let volumes: alloc::vec::Vec<_> = parts
         .iter()
         .filter(|p| p.kind != PartKind::BootBundle)
         .map(|p| p.volume)
         .map(crate::kernel::block::cache::volume)
-        .filter(crate::kernel::fs::portable_ext4::is_ext)
+        .filter_map(FilesystemVolume::probe)
         .collect();
-    crate::compact_screenln!(screen, "Filesystems: {} ext partition(s)", ext.len());
+    crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
 
     let mut hostfs_is_root = false;
     if modules.has_root {
         // A Multiboot root owns `/`; physical filesystems remain available as
         // read-only fallback mounts below `/diskN`.
         crate::multiboot::mount_physical_fallbacks(
-            &ext,
-            modules.next_ext_slot,
-            MAX_EXT_MOUNTS,
+            &volumes,
+            modules.next_fs_slot,
+            MAX_DISK_MOUNTS,
             screen,
         );
         if hostfs {
             vfs::mount(b"host/", host_fs());
             crate::compact_screenln!(screen, "hostfs: mounted at /host");
         }
-    } else if ext.is_empty() {
+    } else if volumes.is_empty() {
         // No module or disk filesystem: the host fs is the root if available.
         if hostfs {
             vfs::mount(b"", host_fs());
@@ -506,35 +509,33 @@ fn mount_filesystems(
             lib::compact_panic!("No root filesystem available");
         }
     } else {
-        let root = root_index(&ext);
+        let root = root_index(&volumes);
+        let root_volume = volumes[root];
         crate::compact_screenln!(screen,
-            "Mounting ext4 root ({} MB)...", ext[root].sectors / 2048);
-        let fs = PortableExt4Fs::new(ext[root])
-            .unwrap_or_else(|error| lib::compact_panic!("portable ext4 root mount failed: {}", error));
-        crate::compact_screenln!(screen, "ext4 root mounted");
-        let fs: &'static dyn vfs::Filesystem =
-            alloc::boxed::Box::leak(alloc::boxed::Box::new(fs));
-        // The write grant is RetroOS's identity — the group owning its
-        // home. C: is a DOS-side notion only this layer knows, and the
-        // VFS enforces the rule from here on. Extra mounts get no
-        // grant, so nothing on them is writable.
-        vfs::mount_writable(b"", fs, crate::kernel::dos::c_root());
+            "Mounting {} root ({} MB)...", root_volume.name(), root_volume.volume.sectors / 2048);
+        let fs = root_volume.open(true)
+            .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error));
+        crate::compact_screenln!(screen, "{} root mounted", root_volume.name());
+        let fs: &'static dyn vfs::Filesystem = alloc::boxed::Box::leak(fs);
+        // Ext4 writes use the group owning RetroOS's home; FAT has no Unix
+        // ownership and delegates writes. Extra mounts are explicitly read-only.
+        root_volume.mount_writable(b"", fs, crate::kernel::dos::c_root());
 
-        // Every other ext filesystem mounts read-only at /disk1, /disk2, …
+        // Every other supported filesystem mounts read-only at /disk1, /disk2, …
         // (Linux-visible, not under C:). An unreadable one is logged and
         // skipped, never fatal — the root is already up.
-        let mut slot = modules.next_ext_slot;
-        for (i, &vol) in ext.iter().enumerate() {
+        let mut slot = modules.next_fs_slot;
+        for (i, vol) in volumes.iter().enumerate() {
             if i == root {
                 continue;
             }
             slot += 1;
-            if slot >= MAX_EXT_MOUNTS {
+            if slot >= MAX_DISK_MOUNTS {
                 // Never drop a filesystem silently — say how many and why.
                 crate::compact_println!(
-                    "ext4: {} further partition(s) not mounted (limit {})",
-                    ext.len() - slot,
-                    MAX_EXT_MOUNTS
+                    "Filesystems: {} further partition(s) not mounted (limit {})",
+                    volumes.len() - i,
+                    MAX_DISK_MOUNTS
                 );
                 break;
             }
@@ -543,17 +544,18 @@ fn mount_filesystems(
             prefix.push(b'0' + slot as u8);
             prefix.push(b'/');
             let prefix: &'static [u8] = alloc::boxed::Box::leak(prefix.into_boxed_slice());
-            match PortableExt4Fs::new(vol) {
+            match vol.open(false) {
                 Ok(fs) => {
-                    vfs::mount(prefix, alloc::boxed::Box::leak(alloc::boxed::Box::new(fs)));
+                    vfs::mount_readonly(prefix, alloc::boxed::Box::leak(fs));
                     crate::screenln!(
                         screen,
-                        "portable ext4 partition ({} MB) → /disk{}",
-                        vol.sectors / 2048,
+                        "portable {} partition ({} MB) → /disk{}",
+                        vol.name(),
+                        vol.volume.sectors / 2048,
                         slot
                     );
                 }
-                Err(error) => crate::compact_screenln!(screen, "ext4 partition skipped: {}", error),
+                Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", vol.name(), error),
             }
         }
 

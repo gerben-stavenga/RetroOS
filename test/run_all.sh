@@ -28,6 +28,7 @@ python3_test() { have python3; }
 qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
+grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
@@ -63,11 +64,13 @@ run() {
 
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
+run grub_fat     grub_fat  python3 test/grub_fat.py
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
 run module_program module_qemu   bash test/grub_module_program.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
 run hosted_games -         bash test/hosted_games.sh
+run lfn          -         python3 test/lfn.py
 run dpmi_hx      -         bash test/dpmi_hx.sh
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh

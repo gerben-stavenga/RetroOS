@@ -482,7 +482,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
 
 /// Resolve a path (NUL-terminated user pointer) against cwd.
 /// Leading `/` = absolute (strip it). Otherwise prepend cwd.
-pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
     crate::kernel::exec::resolve_path(path, cwd, buf)
 }
 

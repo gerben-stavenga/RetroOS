@@ -257,7 +257,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
 /// Resolve a path against a working directory. Absolute paths ignore cwd.
 /// Normalizes `.`/`./` and `..`/`../` segments. Returns a slice of `buf`
 /// holding the resolved path with no leading slash.
-pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8; 164]) -> &'a [u8] {
+pub fn resolve_path<'a>(path: &[u8], cwd: &[u8], buf: &'a mut [u8]) -> &'a [u8] {
     // Build the raw concatenation first (cwd + path for relatives).
     let mut tmp = [0u8; 164];
     let mut tlen = 0;

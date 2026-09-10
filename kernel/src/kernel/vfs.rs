@@ -29,13 +29,14 @@ use crate::kernel::fs::grant::WriteAccess;
 const FIRST_FD: usize = 3;
 
 /// Maximum length of a normalized path key
-const PATH_KEY_MAX: usize = 164;
+pub const PATH_KEY_MAX: usize = 1024;
 
 type LayerVisitor<'a> =
     dyn FnMut(u8, &'static dyn Filesystem, &[u8]) -> bool + 'a;
 
-/// Filesystem trait — implemented by PortableExt4Fs, HostFs, etc. POSIX-strict; the
-/// DOS personality wraps this layer with its own case-folding cache (DFS).
+/// Filesystem trait — implemented by PortableExt4Fs, FatFs, HostFs, etc.
+/// VFS resolves names by exact bytes regardless of the storage format. The
+/// DOS personality owns case-folding and its short-name namespace (DFS).
 ///
 /// This is 9P-shaped: `open(path)` is a fused Twalk+Topen returning a fid
 /// (`Vnode::handle`), `read`/`write` carry the offset per call (like `Tread`/
@@ -57,7 +58,7 @@ pub struct Meta {
 }
 
 pub trait Filesystem {
-    /// Look up a file by normalized path, case-sensitively (POSIX).
+    /// Open a file by its normalized, exact name as resolved by VFS.
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
 
@@ -93,7 +94,7 @@ pub trait Filesystem {
     /// probes, which is especially expensive for block-backed filesystems.
     fn stat(&self, path: &[u8], follow_final: bool) -> Option<Stat> {
         if !follow_final {
-            let mut target = [0u8; DIR_PATH_MAX];
+            let mut target = alloc::vec![0u8; DIR_PATH_MAX];
             if let Some(size) = self.readlink(path, &mut target) {
                 return Some(Stat {
                     size: size as u32,
@@ -166,6 +167,8 @@ pub trait Filesystem {
     fn flush(&self, _path: &[u8]) -> i32 { 0 }
     fn mtime(&self, _path: &[u8]) -> Option<u32> { None }
     fn set_mtime(&self, _path: &[u8], _mtime: u32) -> bool { false }
+    /// Optional on-disk DOS attributes, independent of Unix ownership/mode.
+    fn dos_attributes(&self, _path: &[u8]) -> Option<u8> { None }
 
     /// Write to a file identified by handle at given byte offset (Twrite).
     /// Returns bytes written, or negative errno. Default = R/O (silently accept).
@@ -223,10 +226,28 @@ pub struct Stat {
     pub ino: u64,
 }
 
+/// Optional native 8.3 alias, already assigned by the backing filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShortName([u8; 12]);
+
+impl ShortName {
+    pub fn new(name: &[u8]) -> Option<Self> {
+        if name.is_empty() || name.len() > 12 || name.contains(&0) { return None; }
+        let mut bytes = [0; 12];
+        bytes[..name.len()].copy_from_slice(name);
+        Some(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0[..self.0.iter().position(|&byte| byte == 0).unwrap_or(12)]
+    }
+}
+
 /// Directory entry returned by readdir
 pub struct DirEntry {
-    pub name: [u8; 100],
+    pub name: Vec<u8>,
     pub name_len: usize,
+    pub short_name: Option<ShortName>,
     pub size: u32,
     pub is_dir: bool,
     /// The entry itself is a symbolic link. `is_dir` describes the entry,
@@ -273,8 +294,7 @@ pub struct FileEntry {
     pub access: OpenAccess,
     pub share: SharePolicy,
     /// Resolved path retained for path-oriented metadata operations.
-    pub path: [u8; PATH_KEY_MAX],
-    pub path_len: u8,
+    pub path: Vec<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -335,8 +355,7 @@ struct Binding {
 struct ResolvedObject {
     mount_idx: u8,
     fs: &'static dyn Filesystem,
-    subpath: [u8; PATH_KEY_MAX],
-    subpath_len: u8,
+    subpath: Vec<u8>,
     stat: Stat,
 }
 
@@ -348,14 +367,11 @@ impl ResolvedObject {
         stat: Stat,
     ) -> Option<Self> {
         if subpath.len() > PATH_KEY_MAX { return None; }
-        let subpath_len = u8::try_from(subpath.len()).ok()?;
-        let mut path = [0; PATH_KEY_MAX];
-        path[..subpath.len()].copy_from_slice(subpath);
-        Some(Self { mount_idx, fs, subpath: path, subpath_len, stat })
+        Some(Self { mount_idx, fs, subpath: subpath.to_vec(), stat })
     }
 
     fn subpath(&self) -> &[u8] {
-        &self.subpath[..usize::from(self.subpath_len)]
+        &self.subpath
     }
 }
 
@@ -414,6 +430,7 @@ struct Vfs {
     /// Metadata overrides for backends which cannot persist it.
     modes: BTreeMap<Vec<u8>, u32>,
     mtimes: BTreeMap<Vec<u8>, u32>,
+    dos_attributes: BTreeMap<Vec<u8>, u8>,
     locks: Vec<FileLock>,
     /// Stable open-file indices. Closed slots are reused and the table grows
     /// with demand; process handle limits belong to each process's fd/JFT.
@@ -431,6 +448,7 @@ impl Vfs {
             mounts: Vec::new(),
             modes: BTreeMap::new(),
             mtimes: BTreeMap::new(),
+            dos_attributes: BTreeMap::new(),
             locks: Vec::new(),
             file_table: Vec::new(),
             dir_cache: Vec::new(),
@@ -480,7 +498,7 @@ impl Vfs {
                     }
                 }
                 BindTarget::Alias { src_prefix } if depth != 0 => {
-                    let mut rewritten = [0; PATH_KEY_MAX];
+            let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
                     let len = src_prefix.len().checked_add(subpath.len())?;
                     if len > rewritten.len() { continue; }
                     rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
@@ -515,7 +533,7 @@ impl Vfs {
                     return ResolvedObject::new(mount_idx, fs, subpath, stat);
                 }
                 BindTarget::Alias { src_prefix } if depth != 0 => {
-                    let mut rewritten = [0; PATH_KEY_MAX];
+            let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
                     let len = src_prefix.len().checked_add(subpath.len())?;
                     if len > rewritten.len() { continue; }
                     rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
@@ -562,7 +580,7 @@ impl Vfs {
                 BindTarget::Alias { src_prefix } => {
                     if depth == 0 { continue; }
                     // Retry the lookup as `src_prefix + subpath`.
-                    let mut buf = [0u8; PATH_KEY_MAX];
+            let mut buf = alloc::vec![0u8; PATH_KEY_MAX];
                     let (pl, sl) = (src_prefix.len(), subpath.len());
                     if pl + sl > buf.len() { continue; }
                     buf[..pl].copy_from_slice(src_prefix);
@@ -711,9 +729,6 @@ impl Vfs {
         writable: bool,
     ) -> i32 {
         let index = self.alloc_file_entry();
-        let path_len = path.len().min(PATH_KEY_MAX);
-        let mut path_key = [0; PATH_KEY_MAX];
-        path_key[..path_len].copy_from_slice(&path[..path_len]);
         let entry = FileEntry {
             vnode,
             offset: 0,
@@ -723,8 +738,7 @@ impl Vfs {
             writable,
             access: OpenAccess::Read,
             share: SharePolicy::DenyNone,
-            path: path_key,
-            path_len: path_len as u8,
+            path: path.to_vec(),
         };
         if index == self.file_table.len() {
             self.file_table.push(entry);
@@ -806,6 +820,11 @@ impl Vfs {
                 };
                 for mut e in batch.drain(..) {
                     e.mount_idx = idx;
+                    let mut child = dir.to_vec();
+                    if !child.is_empty() && child.last() != Some(&b'/') { child.push(b'/'); }
+                    child.extend_from_slice(&e.name[..e.name_len]);
+                    if let Some(&mode) = self.modes.get(&child) { e.mode = mode as u16; }
+                    if let Some(&mtime) = self.mtimes.get(&child) { e.mtime = mtime; }
                     if claim_visible_name(
                         &mut visible_names,
                         &e.name[..e.name_len],
@@ -830,9 +849,10 @@ impl Vfs {
         for b in &self.mounts {
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
                 && claim_visible_name(&mut visible_names, name, entries.len()) {
-                let name_len = name.len().min(100);
+                let name_len = name.len();
                 let mut de = DirEntry {
-                    name: [0; 100], name_len, size: 0, is_dir: true,
+                    name: alloc::vec![0; name_len], name_len, size: 0, is_dir: true,
+                    short_name: None,
                     is_symlink: false, mode: 0o755,
                     mtime: 0,
                     node: 0,
@@ -915,7 +935,7 @@ impl Vfs {
                     candidate.push(b'/');
                 }
                 candidate.extend_from_slice(&entry.name[..entry.name_len]);
-                let mut target = [0u8; DIR_PATH_MAX];
+            let mut target = alloc::vec![0u8; DIR_PATH_MAX];
                 let len = self.readlink_entry(&candidate, &entry, &mut target)?;
                 if len == 0 || target[..len].contains(&0) {
                     return None;
@@ -1109,7 +1129,7 @@ impl Vfs {
     }
 
     fn rmdir(&mut self, path: &[u8]) -> i32 {
-        let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
+        let Some(resolved) = self.resolve_symlinks(path, false) else { return -2 };
         let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
         if !fs.supports_directory_mutation() { return -38; }
@@ -1120,13 +1140,14 @@ impl Vfs {
         if rc >= 0 {
             self.modes.remove(path);
             self.mtimes.remove(path);
+            self.dos_attributes.remove(path);
             self.invalidate_dir_cache();
         }
         rc
     }
 
     fn rename(&mut self, old: &[u8], new: &[u8]) -> i32 {
-        let Some(old_resolved) = self.resolve_parent_symlinks(old) else { return -2 };
+        let Some(old_resolved) = self.resolve_symlinks(old, false) else { return -2 };
         let Some(new_resolved) = self.resolve_parent_symlinks(new) else { return -2 };
         let old = old_resolved.as_slice();
         let new = new_resolved.as_slice();
@@ -1143,16 +1164,15 @@ impl Vfs {
         self.rekey_open_paths(old, new);
         if let Some(v) = self.modes.remove(old) { self.modes.insert(new.to_vec(), v); }
         if let Some(v) = self.mtimes.remove(old) { self.mtimes.insert(new.to_vec(), v); }
+        if let Some(v) = self.dos_attributes.remove(old) { self.dos_attributes.insert(new.to_vec(), v); }
         self.invalidate_dir_cache();
         0
     }
 
     fn rekey_open_paths(&mut self, old: &[u8], new: &[u8]) {
         for e in &mut self.file_table {
-            let len = e.path_len as usize;
-            if e.refcount != 0 && &e.path[..len] == old && new.len() <= PATH_KEY_MAX {
-                e.path[..new.len()].copy_from_slice(new);
-                e.path_len = new.len() as u8;
+            if e.refcount != 0 && e.path == old && new.len() <= PATH_KEY_MAX {
+                e.path = new.to_vec();
             }
         }
     }
@@ -1186,7 +1206,7 @@ impl Vfs {
         let Some(resolved) = self.resolve_symlinks(path, true) else { return -2 };
         let path = resolved.as_slice();
         let (midx, fs, subpath) = self.resolve_head(path);
-        if fs.meta(subpath).is_some() && !self.may_write(midx, subpath) { return -13; }
+        if !self.may_write(midx, subpath) { return -13; }
         if let Some(m) = fs.meta(subpath)
             && !fs.set_meta(subpath, m.uid, m.gid, mode) { return -13; }
         self.modes.insert(path.to_vec(), mode);
@@ -1197,7 +1217,7 @@ impl Vfs {
     fn handle_path(&self, handle: i32) -> Option<&[u8]> {
         let e = self.file_table.get(handle as usize)?;
         if e.refcount == 0 { return None; }
-        Some(&e.path[..e.path_len as usize])
+        Some(&e.path)
     }
 
     fn flush_handle(&mut self, handle: i32) -> i32 {
@@ -1216,28 +1236,30 @@ impl Vfs {
     fn set_handle_mtime(&mut self, handle: i32, mtime: u32) -> i32 {
         let Some(path) = self.handle_path(handle).map(|p| p.to_vec()) else { return -9; };
         let (midx, fs, subpath) = self.resolve_head(&path);
-        if fs.meta(subpath).is_some() && !self.may_write(midx, subpath) { return -13; }
-        if fs.meta(subpath).is_some() && !fs.set_mtime(subpath, mtime) { return -13; }
+        if !self.may_write(midx, subpath) { return -13; }
+        if !fs.set_mtime(subpath, mtime) && fs.meta(subpath).is_some() { return -13; }
         self.mtimes.insert(path, mtime);
         self.invalidate_dir_cache();
         0
     }
 
     fn delete(&mut self, path: &[u8]) -> i32 {
-        let Some(resolved) = self.resolve_parent_symlinks(path) else { return -2 };
+        let Some(resolved) = self.resolve_symlinks(path, false) else { return -2 };
         let path = resolved.as_slice();
         // Ask the backing filesystem (Tremove). Read-only backends reject it.
         let (midx, fs, subpath) = self.resolve_head(path);
         // Unlinking mutates the parent, so the parent must be ours — and the
         // victim too, so a link we may traverse can't delete something we may
         // not write. Only meaningful where the mount has a rule at all.
-        if fs.meta(subpath).is_some()
-            && (!self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath))
+        if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath)
         {
             return -13; // EACCES
         }
         let r = fs.remove(subpath);
         if r >= 0 {
+            self.modes.remove(path);
+            self.mtimes.remove(path);
+            self.dos_attributes.remove(path);
             self.invalidate_dir_cache();
         }
         r
@@ -1439,8 +1461,9 @@ fn claim_visible_name(
 
 fn clone_dir_entry(e: &DirEntry) -> DirEntry {
     DirEntry {
-        name: e.name,
+        name: e.name.clone(),
         name_len: e.name_len,
+        short_name: e.short_name,
         size: e.size,
         is_dir: e.is_dir,
         is_symlink: e.is_symlink,
@@ -1494,10 +1517,19 @@ pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount(prefix, fs);
 }
 
+/// Explicitly deny mutations on a secondary filesystem. Ordinary mounts
+/// delegate access to the backend; they do not themselves imply read-only.
+pub(crate) fn mount_readonly(prefix: &'static [u8], fs: &'static dyn Filesystem) {
+    let mut v = VFS.lock();
+    v.mount(prefix, fs);
+    if let Some(binding) = v.mounts.iter_mut().find(|binding| binding.prefix == prefix) {
+        binding.access = WriteAccess::None;
+    }
+}
+
 /// Mount `fs` and give it a write grant derived from the group owning `home`
-/// (a path within the new mount). Without this a mount is read-only, which is
-/// the safe default: a mount site cannot accidentally grant write access, only
-/// deliberately.
+/// (a path within the new mount). Failure to derive the grant makes this
+/// mount read-only. Filesystems without ownership use a delegated mount.
 pub fn mount_writable(prefix: &'static [u8], fs: &'static dyn Filesystem, home: &[u8]) {
     let mut v = VFS.lock();
     v.mount(prefix, fs);
@@ -1531,7 +1563,7 @@ pub fn bind_union(prefix: &'static [u8], src_prefix: &'static [u8]) {
 }
 
 /// Open a file by absolute VFS path. Returns fd (>= 3) or negative error.
-/// POSIX-strict case-sensitive lookup. (Orchestrator: no lock held across the
+/// Exact, case-sensitive name lookup. (Orchestrator: no lock held across the
 /// `open_to_handle` / `close_vfs_handle` wrapper calls.)
 #[inline(never)]
 pub fn open(path: &[u8], fds: &mut [FdKind; MAX_FDS]) -> i32 {
@@ -1610,6 +1642,36 @@ pub fn path_mode(path: &[u8]) -> Option<(u32, bool)> { VFS.lock().path_mode(path
 #[inline(never)]
 pub fn set_path_mode(path: &[u8], mode: u32) -> i32 { VFS.lock().set_path_mode(path, mode) }
 
+/// DOS attributes are session metadata until backends offer a setter. They
+/// never rewrite Unix group/mode permissions (the independent write grant).
+pub fn dos_attributes(path: &[u8]) -> Option<u8> {
+    let mut v = VFS.lock();
+    let path = v.resolve_symlinks(path, true)?;
+    if let Some(&attributes) = v.dos_attributes.get(&path) { return Some(attributes); }
+    let (mode, is_dir) = v.path_mode(&path)?;
+    let (_, fs, subpath) = v.resolve_head(&path);
+    fs.dos_attributes(subpath).or(Some(if is_dir { 0x10 } else { 0x20 }
+        | if mode & 0o222 == 0 { 1 } else { 0 }))
+}
+
+pub fn set_dos_attributes(path: &[u8], attributes: u8) -> i32 {
+    if attributes & !0x37 != 0 { return -22; }
+    let mut v = VFS.lock();
+    let Some(path) = v.resolve_symlinks(path, true) else { return -2 };
+    let (midx, _, subpath) = v.resolve_head(&path);
+    if !v.may_write(midx, subpath) { return -13; }
+    let Some((_, is_dir)) = v.path_mode(&path) else { return -2 };
+    v.dos_attributes.insert(path, (attributes & 0x27) | if is_dir { 0x10 } else { 0 });
+    v.invalidate_dir_cache();
+    0
+}
+
+pub fn fd_dos_attributes(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<u8> {
+    let handle = vfs_handle(fds, fd).ok()?;
+    let path = VFS.lock().handle_path(handle)?.to_vec();
+    dos_attributes(&path)
+}
+
 #[inline(never)]
 pub fn flush(fd: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
     match vfs_handle(fds, fd) {
@@ -1621,6 +1683,16 @@ pub fn flush(fd: i32, fds: &[FdKind; MAX_FDS]) -> i32 {
 #[inline(never)]
 pub fn handle_mtime(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<u32> {
     vfs_handle(fds, fd).ok().and_then(|h| VFS.lock().handle_mtime(h))
+}
+
+/// Metadata for a live process file descriptor, without a second path lookup.
+pub fn fd_info(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<(Stat, u32)> {
+    let handle = vfs_handle(fds, fd).ok()?;
+    let v = VFS.lock();
+    let entry = v.file_table.get(handle as usize)?;
+    if entry.refcount == 0 { return None; }
+    Some((Stat { size: entry.vnode.size, mode: v.file_mode_by_handle(handle),
+        is_dir: false, is_symlink: false, ino: entry.ino }, v.handle_mtime(handle).unwrap_or(0)))
 }
 
 #[inline(never)]
@@ -1747,12 +1819,12 @@ pub fn mount_child(parent: &[u8], name: &[u8]) -> Option<&'static [u8]> {
 // fork/dup add a reference, close releases the slot at zero.
 
 const DIR_HANDLES: usize = 32;
-pub const DIR_PATH_MAX: usize = 164;
+pub const DIR_PATH_MAX: usize = PATH_KEY_MAX;
 
 #[derive(Clone, Copy)]
 struct DirHandle {
     path: [u8; DIR_PATH_MAX],
-    len: u8,
+    len: u16,
     refcount: u8,
 }
 
@@ -1761,12 +1833,13 @@ static DIR_TABLE: Mutex<[DirHandle; DIR_HANDLES]> =
 
 /// Allocate a directory handle recording `path` (refcount 1), or -24 (EMFILE).
 pub fn open_dir_handle(path: &[u8]) -> i32 {
+    if path.len() > DIR_PATH_MAX { return -36; }
     let mut t = DIR_TABLE.lock();
     for (i, e) in t.iter_mut().enumerate() {
         if e.refcount == 0 {
             let n = path.len().min(DIR_PATH_MAX);
             e.path[..n].copy_from_slice(&path[..n]);
-            e.len = n as u8;
+            e.len = n as u16;
             e.refcount = 1;
             return i as i32;
         }
@@ -1956,6 +2029,52 @@ mod tests {
     static PATH_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static NODE_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
 
+    #[test]
+    fn fat_root_keeps_exact_vfs_names_and_aliases_as_metadata() {
+        use crate::kernel::fs::fat::{FatFs, VolumeIo, tests::formatted};
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(FatFs::new(VolumeIo::new(volume, true)).unwrap()));
+        assert_eq!(fs.mkdir(b"HOME"), 0);
+        assert_eq!(fs.mkdir(b"HOME/RETROOS"), 0);
+        let node = fs.create(b"HOME/RETROOS/My long document.txt").unwrap();
+        assert_eq!(fs.write(node.handle, 0, b"hello"), 5);
+        fs.clunk(node.handle);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        vfs.mounts[0].access = WriteAccess::None;
+        let long = b"HOME/RETROOS/My long document.txt";
+        assert_eq!(vfs.resolve_symlinks(long, true).unwrap(), long);
+        assert!(vfs.resolve_symlinks(b"home/retroos/My long document.txt", true).is_none());
+        assert_eq!(vfs.open_to_handle(b"HOME/RETROOS/my LONG document.TXT"), -2);
+        let mut entries = Vec::new();
+        fs.readdir(b"HOME/RETROOS", 0, &mut entries, 8);
+        let short = entries[0].short_name.unwrap();
+        let mut short_path = b"HOME/RETROOS/".to_vec();
+        short_path.extend_from_slice(short.as_bytes());
+        assert!(vfs.resolve_symlinks(&short_path, true).is_none());
+        let handle = vfs.open_to_handle(long);
+        assert!(handle >= 0);
+        vfs.close_handle(handle);
+        assert_eq!(vfs.create_to_handle(b"HOME/RETROOS/DENIED.TXT"), -13);
+        vfs.mounts[0].access = WriteAccess::Delegated;
+        assert_eq!(vfs.delete(b"HOME/RETROOS/my long document.txt"), -2);
+        assert_eq!(vfs.rename(b"HOME/RETROOS/my long document.txt", b"HOME/RETROOS/renamed.txt"), -2);
+        assert_eq!(vfs.rmdir(b"HOME/retroos"), -2);
+        assert_eq!(vfs.mkdir(b"HOME/retroos"), -17);
+        // An unavailable spelling must not truncate a different existing
+        // name just because the FAT library's internal lookup folds case.
+        assert!(vfs.create_to_handle(b"HOME/RETROOS/my long document.txt") < 0);
+        assert!(vfs.create_to_handle(&short_path) < 0);
+        let handle = vfs.open_to_handle(long);
+        let mut data = [0; 5];
+        assert_eq!(vfs.read_by_handle(handle, &mut data), 5);
+        assert_eq!(&data, b"hello");
+        vfs.close_handle(handle);
+        let handle = vfs.create_to_handle(b"HOME/RETROOS/ALLOWED.TXT");
+        assert!(handle >= 0);
+        vfs.close_handle(handle);
+    }
+
     struct FailingCreateFs;
     static FAILING_CREATE_FS: FailingCreateFs = FailingCreateFs;
 
@@ -2063,7 +2182,8 @@ mod tests {
             };
             for &(name, node, is_symlink, is_dir) in entries {
                 let mut entry = DirEntry {
-                    name: [0; 100], name_len: name.len(), size: 1,
+                    name: alloc::vec![0; name.len()], name_len: name.len(), size: 1,
+                    short_name: None,
                     is_dir, is_symlink, mode: 0o444, mtime: 0,
                     node, mount_idx: 0,
                 };

@@ -280,7 +280,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).find_path), 0, 1);
             core::ptr::addr_of_mut!((*p).find_path_len).write(0);
             core::ptr::addr_of_mut!((*p).find_idx).write(0);
-            core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).searches), 0, 1);
+            core::ptr::addr_of_mut!((*p).searches).write(core::array::from_fn(|_| DosSearch::new()));
             core::ptr::addr_of_mut!((*p).search_next).write(0);
             core::ptr::addr_of_mut!((*p).fcb_search_drive).write(0);
             core::ptr::addr_of_mut!((*p).fcb_search_ext).write(false);
@@ -395,10 +395,9 @@ pub const DOS_SEARCH_SLOTS: usize = 8;
 /// reserved area, so it stays here and the DTA carries a slot id, a
 /// generation and the cursor — enough to identify *which* search a given DTA
 /// belongs to and where it had got to.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DosSearch {
-    pub path: [u8; 96],
-    pub path_len: u8,
+    pub path: Vec<u8>,
     /// FindFirst's CX attribute mask. Directories are returned only when the
     /// caller includes ATTR_DIRECTORY (10h); FindNext has no CX parameter, so
     /// the mask belongs to the saved enumeration.
@@ -411,7 +410,7 @@ pub struct DosSearch {
 
 impl DosSearch {
     pub const fn new() -> Self {
-        DosSearch { path: [0; 96], path_len: 0, attributes: 0, generation: 0, in_use: false }
+        DosSearch { path: Vec::new(), attributes: 0, generation: 0, in_use: false }
     }
 }
 
@@ -1409,7 +1408,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
 /// DOS-layer's single VFS translator; the generic exec layer calls this rather
 /// than reaching into `dfs`. `None` if the path doesn't resolve.
 pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let mut out = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
     dfs::DfsState::to_vfs_open(dos_abs, &mut out)
         .ok()
         .map(|n| out[..n].to_vec())
@@ -1419,7 +1418,7 @@ pub fn dos_abs_to_vfs(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 /// component not to exist yet. File-creation APIs use this variant; parent
 /// directories must still resolve normally.
 pub fn dos_abs_to_vfs_create(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let mut out = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
     dfs::DfsState::to_vfs_create(dos_abs, &mut out)
         .ok()
         .map(|n| out[..n].to_vec())

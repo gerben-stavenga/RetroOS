@@ -9,6 +9,9 @@
 
 extern crate alloc;
 
+#[path = "lfn.rs"]
+mod lfn;
+
 use crate::kernel::thread;
 use crate::Regs;
 use core::sync::atomic::{AtomicU16, Ordering};
@@ -1368,7 +1371,8 @@ fn accept_open_file<A: crate::Arch>(
 ) -> Result<u16, i32> {
     if fd < 0 { return Err(fd); }
     let policy = open_policies(mode);
-    let writable = mode & 3 == 0 || crate::kernel::vfs::fd_writable(fd, &kt.fds);
+    let writable = mode & 3 == 0 || (crate::kernel::vfs::fd_writable(fd, &kt.fds)
+        && crate::kernel::vfs::fd_dos_attributes(fd, &kt.fds).is_some_and(|a| a & 1 == 0));
     let rc = policy.map_or(-22, |(access, share)| {
         if writable { crate::kernel::vfs::configure_open(fd, access, share, &kt.fds) }
         else { -13 }
@@ -1389,12 +1393,13 @@ fn create_file_handle<A: crate::Arch>(
     dos: &thread::DosState<A>,
     path: &[u8],
 ) -> Result<u16, i32> {
+    if crate::kernel::vfs::dos_attributes(path).is_some_and(|attributes| attributes & 1 != 0) { return Err(-13); }
     let fd = crate::kernel::vfs::create(path, &mut kt.fds);
     publish_file_handle(machine, kt, dos, fd, 0)
 }
 
 struct VfsPath {
-    bytes: [u8; dfs::DFS_PATH_MAX],
+    bytes: alloc::vec::Vec<u8>,
     len: usize,
 }
 
@@ -1442,9 +1447,10 @@ fn resolve_search_path(
     } else {
         directory
     };
-    let mut vfs = [0; dfs::DFS_PATH_MAX];
+    let mut vfs = alloc::vec![0; crate::kernel::vfs::PATH_KEY_MAX];
     let vfs_len = dfs::DfsState::to_vfs_open(directory, &mut vfs)?;
-    let mut len = vfs_len.min(output.len());
+    if vfs_len + usize::from(vfs_len > 0) + pattern.len() > output.len() { return Err(3); }
+    let mut len = vfs_len;
     output[..len].copy_from_slice(&vfs[..len]);
     if vfs_len > 0 && len < output.len() {
         output[len] = b'/';
@@ -1636,6 +1642,11 @@ fn int_21h<A: crate::Arch>(
                 b'A' + (dl - 1)
             };
             if let Some(cwd) = dos.dfs.get_cwd_for(drive) {
+                if cwd.len() >= dfs::DFS_CWD_MAX {
+                    regs.rax = (regs.rax & !0xffff) | 206;
+                    regs.set_flag32(1);
+                    return thread::KernelAction::Done;
+                }
                 let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 machine.copy_to(addr, cwd);
                 machine.write::<u8>(addr + cwd.len(), 0);
@@ -1868,7 +1879,7 @@ fn int_21h<A: crate::Arch>(
             let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut raw = [0u8; 80];
             let raw_len = read_asciiz(machine, addr, &mut raw);
-            let mut composed = [0u8; 96];
+            let mut composed = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
             let pos = match resolve_search_path(&dos.dfs, &raw[..raw_len], &mut composed) {
                 Ok(len) => len,
                 Err(e) => break 'find DosExit::Error(e as u16),
@@ -1877,8 +1888,8 @@ fn int_21h<A: crate::Arch>(
             // so a FindNext knows which enumeration it is continuing even if
             // another search ran in between.
             let slot = alloc_search_slot(dos);
-            dos.searches[slot].path[..pos].copy_from_slice(&composed[..pos]);
-            dos.searches[slot].path_len = pos as u8;
+            composed.truncate(pos);
+            dos.searches[slot].path = composed;
             dos.searches[slot].attributes = regs.rcx as u8;
             let generation = dos.searches[slot].generation;
             let dta = dos.dta as usize;
@@ -2194,23 +2205,15 @@ fn int_21h<A: crate::Arch>(
                 machine, dos, regs, regs.ds as u16, regs.rdx as u32, PathTarget::Existing,
             );
             match (al, resolved) {
-                (0, Ok(path)) => match crate::kernel::vfs::path_mode(path.as_bytes()) {
-                    Some((mode, is_dir)) => {
-                        let attrs = if is_dir { 0x10 } else { 0x20 }
-                            | if mode & 0o222 == 0 { 0x01 } else { 0 };
+                (0, Ok(path)) => match crate::kernel::vfs::dos_attributes(path.as_bytes()) {
+                    Some(attrs) => {
                         regs.rcx = (regs.rcx & !0xFFFF) | attrs as u64;
                         DosExit::Ok
                     }
                     None => DosExit::Error(2),
                 },
                 (1, Ok(path)) => {
-                    let rc = match crate::kernel::vfs::path_mode(path.as_bytes()) {
-                        Some((mode, _)) => {
-                            let new_mode = if regs.rcx as u8 & 1 != 0 { mode & !0o222 } else { mode | 0o200 };
-                            crate::kernel::vfs::set_path_mode(path.as_bytes(), new_mode)
-                        }
-                        None => -2,
-                    };
+                    let rc = crate::kernel::vfs::set_dos_attributes(path.as_bytes(), regs.rcx as u8);
                     if rc == 0 { DosExit::Ok } else { DosExit::Errno(rc) }
                 }
                 (_, Err(e)) => DosExit::Error(e as u16),
@@ -2702,7 +2705,8 @@ fn int_21h<A: crate::Arch>(
             ) {
                 Ok(path) if immutable_media_path(path.as_bytes()) => DosExit::Error(5),
                 Ok(path) => {
-                    let rv = crate::kernel::vfs::delete(path.as_bytes());
+                    let rv = if crate::kernel::vfs::dos_attributes(path.as_bytes()).is_some_and(|a| a & 1 != 0) { -13 }
+                        else { crate::kernel::vfs::delete(path.as_bytes()) };
                     if rv >= 0 { DosExit::Ok } else { DosExit::Error(5) }
                 }
                 Err(e) => DosExit::Error(e as u16),
@@ -2947,9 +2951,7 @@ fn int_21h<A: crate::Arch>(
             }
         }
         0x71 => {
-            // LFN (Long File Name) API — not supported.
-            // Return AX=7100h so DJGPP/libc knows to fall back to short-name DOS calls.
-            DosExit::Error(0x7100)
+            lfn::dispatch(machine, kt, dos, regs)
         }
         0xFF => {
             regs.set_flag32(1);
@@ -3807,10 +3809,10 @@ fn dos_wildcard_match(pattern: &[u8], name: &[u8]) -> bool {
 }
 
 /// Resolve a raw DOS path to a VFS path for OPEN (all components must exist).
-/// Returns `([u8; DFS_PATH_MAX], len)` on success, DOS error code on failure
+/// Returns a heap-backed VFS path and its length, or a DOS error code.
 /// (2 = file not found, 3 = path not found, 15 = invalid drive).
 pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_in: &[u8])
-    -> Result<([u8; dfs::DFS_PATH_MAX], usize), i32>
+    -> Result<(alloc::vec::Vec<u8>, usize), i32>
 {
     // An empty name is not a file. `resolve` would fold it into the current
     // directory and `to_vfs_open` would hand back a perfectly good handle to
@@ -3829,7 +3831,7 @@ pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_i
     }
     let mut abs = [0u8; dfs::DFS_PATH_MAX];
     let alen = dos.dfs.resolve(dos_in, &mut abs)?;
-    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let mut out = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
     let vlen = dfs::DfsState::to_vfs_open(&abs[..alen], &mut out)?;
     Ok((out, vlen))
 }
@@ -3837,11 +3839,11 @@ pub(crate) fn dfs_open_existing<A: crate::Arch>(dos: &thread::DosState<A>, dos_i
 /// Resolve a raw DOS path to a VFS path for CREATE (final component may not
 /// exist yet). Intermediate dirs must exist.
 pub(crate) fn dfs_create_path<A: crate::Arch>(dos: &thread::DosState<A>, dos_in: &[u8])
-    -> Result<([u8; dfs::DFS_PATH_MAX], usize), i32>
+    -> Result<(alloc::vec::Vec<u8>, usize), i32>
 {
     let mut abs = [0u8; dfs::DFS_PATH_MAX];
     let alen = dos.dfs.resolve(dos_in, &mut abs)?;
-    let mut out = [0u8; dfs::DFS_PATH_MAX];
+    let mut out = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
     let vlen = dfs::DfsState::to_vfs_create(&abs[..alen], &mut out)?;
     Ok((out, vlen))
 }
@@ -4023,12 +4025,11 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
     // The search path is an absolute VFS path like "DN/DN*.SWP" or "*.*".
     // The directory part includes any trailing slash; the pattern is the
     // basename (filespec with wildcards).
-    let path_len = dos.searches[slot].path_len as usize;
-    let full = &dos.searches[slot].path[..path_len];
+    let path_len = dos.searches[slot].path.len();
+    let full = &dos.searches[slot].path;
     let split = full.iter().rposition(|&b| b == b'/').map(|i| i + 1).unwrap_or(0);
     let dir_buf = {
-        let mut b = [0u8; 96];
-        b[..split].copy_from_slice(&full[..split]);
+        let b = full[..split].to_vec();
         (b, split)
     };
     let pat_buf = {
@@ -4058,13 +4059,17 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
                 if find_attributes_match(attributes, entry.is_dir)
                     && dos_wildcard_match(pat, alias)
                 {
+                    let mut path = dir.to_vec();
+                    path.extend_from_slice(&entry.original);
+                    let found_attributes = crate::kernel::vfs::dos_attributes(&path).unwrap_or(if entry.is_dir { 0x10 } else { 0x20 });
+                    if !dfs::lfn::attributes_match(u16::from(attributes), found_attributes) { continue; }
                     // Clear only the result fields: the reserved area below
                     // holds this search's cursor, and wiping it would strand
                     // the enumeration after its first entry.
                     machine.zero(dta + dta::RESULT, 43 - dta::RESULT);
                     write_search_state(machine, dta, slot as u8, generation, idx as u16);
                     let (time, date) = unix_to_dos_datetime(entry.mtime);
-                    machine.write::<u8>(dta + 0x15, if entry.is_dir { 0x10 } else { 0x20 });
+                    machine.write::<u8>(dta + 0x15, found_attributes);
                     machine.write::<u16>(dta + 0x16, time);
                     machine.write::<u16>(dta + 0x18, date);
                     machine.write::<u32>(dta + 0x1A, entry.size);

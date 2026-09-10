@@ -13,7 +13,6 @@
 //! VFS's job at that seam. Writes are LIVE: rust-fatfs allocates clusters
 //! and updates directories in place on the image.
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -115,7 +114,7 @@ impl fatfs::Seek for ImageCursor {
     }
 }
 
-type Media = fatfs::FileSystem<ImageCursor>;
+type Media = super::fat::FatFs<ImageCursor>;
 
 // ── CHS shape of the inserted medium (the INT 13h view) ─────────────────────
 
@@ -238,11 +237,6 @@ struct SlotState {
     /// BIOS change line: set by insert/eject, cleared when INT 13h AH=16h
     /// reports it.
     change_pending: bool,
-    /// Open handles → paths. Reads/writes re-resolve by path; it keeps the
-    /// borrow of `media` inside each call (fatfs `File`s borrow the
-    /// `FileSystem`).
-    opens: BTreeMap<u32, Vec<u8>>,
-    next_handle: u32,
 }
 
 pub struct FloppySlot {
@@ -258,8 +252,6 @@ const fn empty_slot() -> FloppySlot {
             geom: None,
             label: Vec::new(),
             change_pending: false,
-            opens: BTreeMap::new(),
-            next_handle: 1,
         }),
     }
 }
@@ -275,272 +267,54 @@ fn split_handle(handle: u64) -> (u32, u32) {
     ((handle >> 32) as u32, handle as u32)
 }
 
-/// DOS datetime (as rust-fatfs reports it) → seconds since the Unix epoch.
-fn unix_from_datetime(dt: &fatfs::DateTime) -> u32 {
-    unix_from_ymd_hms(
-        dt.date.year,
-        dt.date.month,
-        dt.date.day,
-        dt.time.hour,
-        dt.time.min,
-        dt.time.sec,
-    )
-}
-
-/// Days-from-civil-date, branchless. fatfs decodes stored timestamp fields
-/// without validation, so FAT's zeroed "no timestamp" encoding arrives here
-/// as month 0 / day 0 and must fall out as 0 via the validity guard.
-fn unix_from_ymd_hms(year: u16, month: u16, day: u16, hour: u16, min: u16, sec: u16) -> u32 {
-    let (y, m, d) = (year as i64, month as i64, day as i64);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y < 1980 {
-        return 0;
+impl FloppySlot {
+    fn with_media<R>(&self, missing: R, f: impl FnOnce(&Media) -> R) -> R {
+        let state = self.state.lock();
+        state.media.as_ref().map_or(missing, f)
     }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + hour as i64 * 3600 + min as i64 * 60 + sec as i64;
-    u32::try_from(secs).unwrap_or(0)
-}
 
-fn path_str(path: &[u8]) -> Option<&str> {
-    core::str::from_utf8(path).ok()
-}
+    fn with_handle<R>(&self, handle: u64, missing: R, f: impl FnOnce(&Media, u64) -> R) -> R {
+        let state = self.state.lock();
+        let (generation, inner) = split_handle(handle);
+        if generation != state.generation { return missing; }
+        state.media.as_ref().map_or(missing, |media| f(media, inner as u64))
+    }
 
-/// `"."`/`".."` chain entries of FAT subdirectories; VFS paths never use them.
-fn is_dot_entry(name: &[u8]) -> bool {
-    name == b"." || name == b".."
+    fn open_file(&self, path: &[u8], create: bool) -> Option<Vnode> {
+        let state = self.state.lock();
+        let media = state.media.as_ref()?;
+        let mut node = if create { media.create(path)? } else { media.open(path)? };
+        node.handle |= (state.generation as u64) << 32;
+        Some(node)
+    }
 }
 
 impl Filesystem for FloppySlot {
-    fn open(&self, path: &[u8]) -> Option<Vnode> {
-        let mut state = self.state.lock();
-        let generation = state.generation;
-        let media = state.media.as_ref()?;
-        let mut file = media.root_dir().open_file(path_str(path)?).ok()?;
-        let size = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)).ok()?;
-        let size = u32::try_from(size).ok()?;
-        drop(file);
-        let handle = state.next_handle;
-        state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
-        state.opens.insert(handle, path.to_vec());
-        Some(Vnode {
-            handle: (generation as u64) << 32 | handle as u64,
-            size,
-            mode: 0o644,
-        })
+    fn dos_attributes(&self, path: &[u8]) -> Option<u8> { self.with_media(None, |fs| fs.dos_attributes(path)) }
+    fn mtime(&self, path: &[u8]) -> Option<u32> { self.with_media(None, |fs| fs.mtime(path)) }
+    fn set_mtime(&self, path: &[u8], mtime: u32) -> bool { self.with_media(false, |fs| fs.set_mtime(path, mtime)) }
+    fn open(&self, path: &[u8]) -> Option<Vnode> { self.open_file(path, false) }
+    fn create(&self, path: &[u8]) -> Option<Vnode> { self.open_file(path, true) }
+    fn read(&self, handle: u64, offset: u32, out: &mut [u8], size: u32) -> i32 {
+        self.with_handle(handle, -5, |fs, handle| fs.read(handle, offset, out, size))
     }
-
-    fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
-        let (generation, inner) = split_handle(handle);
-        let state = self.state.lock();
-        if generation != state.generation {
-            return -5;
-        }
-        let Some(path) = state.opens.get(&inner) else {
-            return -9;
-        };
-        let Some(media) = state.media.as_ref() else {
-            return -5;
-        };
-        let Some(path) = path_str(path) else {
-            return -5;
-        };
-        let Ok(mut file) = media.root_dir().open_file(path) else {
-            return -5;
-        };
-        if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
-            return -5;
-        }
-        let mut done = 0;
-        while done < buf.len() {
-            match fatfs::Read::read(&mut file, &mut buf[done..]) {
-                Ok(0) => break,
-                Ok(n) => done += n,
-                Err(_) => return if done == 0 { -5 } else { done as i32 },
-            }
-        }
-        done as i32
-    }
-
-    fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
-        let state = self.state.lock();
-        let media = state.media.as_ref()?;
-        let root = media.root_dir();
-        let listing = if dir.is_empty() {
-            root
-        } else {
-            root.open_dir(path_str(dir)?).ok()?
-        };
-        let mut visible = 0_u64;
-        for entry in listing.iter() {
-            let Ok(entry) = entry else { break };
-            let short = entry.short_file_name_as_bytes();
-            if is_dot_entry(short) {
-                continue;
-            }
-            if visible < cookie {
-                visible += 1;
-                continue;
-            }
-            if out.len() >= max {
-                return Some(visible);
-            }
-            let name_len = short.len().min(100);
-            let mut de = DirEntry {
-                name: [0; 100],
-                name_len,
-                size: entry.len().min(u32::MAX as u64) as u32,
-                is_dir: entry.is_dir(),
-                is_symlink: false,
-                mode: if entry.is_dir() { 0o555 } else { 0o444 },
-                mtime: unix_from_datetime(&entry.modified()),
-                node: 0,
-                mount_idx: 0,
-            };
-            de.name[..name_len].copy_from_slice(&short[..name_len]);
-            out.push(de);
-            visible += 1;
-        }
-        None
-    }
-
-    fn dir_exists(&self, path: &[u8]) -> bool {
-        let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else {
-            return false;
-        };
-        if path.is_empty() {
-            return true;
-        }
-        path_str(path).is_some_and(|p| media.root_dir().open_dir(p).is_ok())
-    }
-
-    fn clunk(&self, handle: u64) -> i32 {
-        let (generation, inner) = split_handle(handle);
-        let mut state = self.state.lock();
-        if generation == state.generation {
-            state.opens.remove(&inner);
-        }
-        0
-    }
-
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
-        let (generation, inner) = split_handle(handle);
-        let state = self.state.lock();
-        if generation != state.generation {
-            return -5;
-        }
-        let Some(path) = state.opens.get(&inner) else {
-            return -9;
-        };
-        let Some(media) = state.media.as_ref() else {
-            return -5;
-        };
-        let Some(path) = path_str(path) else {
-            return -5;
-        };
-        let Ok(mut file) = media.root_dir().open_file(path) else {
-            return -5;
-        };
-        if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(offset as u64)).is_err() {
-            return -5;
-        }
-        let mut done = 0;
-        while done < data.len() {
-            match fatfs::Write::write(&mut file, &data[done..]) {
-                Ok(0) => break, // media full / fixed size reached
-                Ok(n) => done += n,
-                Err(_) => return if done == 0 { -28 } else { done as i32 },
-            }
-        }
-        if fatfs::Write::flush(&mut file).is_err() {
-            return -5;
-        }
-        done as i32
+        self.with_handle(handle, -5, |fs, handle| fs.write(handle, offset, data))
     }
-
-    fn create(&self, path: &[u8]) -> Option<Vnode> {
-        let mut state = self.state.lock();
-        let generation = state.generation;
-        let media = state.media.as_ref()?;
-        let mut file = media.root_dir().create_file(path_str(path)?).ok()?;
-        file.truncate().ok()?; // DOS AH=3Ch create-or-truncate semantics
-        drop(file);
-        let handle = state.next_handle;
-        state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
-        state.opens.insert(handle, path.to_vec());
-        Some(Vnode {
-            handle: (generation as u64) << 32 | handle as u64,
-            size: 0,
-            mode: 0o644,
-        })
+    fn clunk(&self, handle: u64) -> i32 {
+        self.with_handle(handle, 0, |fs, handle| fs.clunk(handle))
     }
-
-    fn supports_create(&self) -> bool {
-        true
+    fn readdir(&self, path: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
+        self.with_media(None, |fs| fs.readdir(path, cookie, out, max))
     }
-
-    fn remove(&self, path: &[u8]) -> i32 {
-        let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else {
-            return -5;
-        };
-        let Some(path) = path_str(path) else {
-            return -5;
-        };
-        if media.root_dir().remove(path).is_ok() {
-            0
-        } else {
-            -2
-        }
-    }
-
-    fn mkdir(&self, path: &[u8]) -> i32 {
-        let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else {
-            return -5;
-        };
-        let Some(path) = path_str(path) else {
-            return -5;
-        };
-        if media.root_dir().create_dir(path).is_ok() {
-            0
-        } else {
-            -13
-        }
-    }
-
-    fn supports_mkdir(&self) -> bool {
-        true
-    }
-
-    fn rmdir(&self, path: &[u8]) -> i32 {
-        // fatfs `remove` handles empty directories; a non-empty one errors.
-        self.remove(path)
-    }
-
-    fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
-        let state = self.state.lock();
-        let Some(media) = state.media.as_ref() else {
-            return -5;
-        };
-        let (Some(src), Some(dst)) = (path_str(path), path_str(new_path)) else {
-            return -5;
-        };
-        let root = media.root_dir();
-        if root.rename(src, &root, dst).is_ok() {
-            0
-        } else {
-            -2
-        }
-    }
-
-    fn supports_directory_mutation(&self) -> bool {
-        true
-    }
+    fn dir_exists(&self, path: &[u8]) -> bool { self.with_media(false, |fs| fs.dir_exists(path)) }
+    fn remove(&self, path: &[u8]) -> i32 { self.with_media(-5, |fs| fs.remove(path)) }
+    fn mkdir(&self, path: &[u8]) -> i32 { self.with_media(-5, |fs| fs.mkdir(path)) }
+    fn rmdir(&self, path: &[u8]) -> i32 { self.with_media(-5, |fs| fs.rmdir(path)) }
+    fn rename(&self, old: &[u8], new: &[u8]) -> i32 { self.with_media(-5, |fs| fs.rename(old, new)) }
+    fn supports_create(&self) -> bool { true }
+    fn supports_mkdir(&self) -> bool { true }
+    fn supports_directory_mutation(&self) -> bool { true }
 }
 
 // ── Catalogue and media control (OSD surface) ───────────────────────────────
@@ -642,7 +416,6 @@ pub fn eject(drive: usize) {
         }
         state.geom = None;
         state.label.clear();
-        state.opens.clear();
         state.change_pending = true;
     }
     vfs::mounted_media_changed();
@@ -673,7 +446,7 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
             file: backing,
             pos: 0,
         };
-        let media = match fatfs::FileSystem::new(cursor, fatfs::FsOptions::new()) {
+        let media = match Media::new(cursor) {
             Ok(media) => media,
             Err(_) => {
                 backing.close();
@@ -688,7 +461,6 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
         }
         state.geom = geom;
         state.label = entry.name.clone();
-        state.opens.clear();
         state.change_pending = true;
     }
     vfs::mounted_media_changed();
@@ -704,20 +476,13 @@ pub fn insert(drive: usize, index: usize) -> Result<(), InsertError> {
 pub fn geometry(drive: usize) -> Option<(u16, u16, u16, u16)> {
     let _fs = vfs::serialize_fs(); // stats() may read FAT sectors from backing
     let state = slot(drive).state.lock();
-    let media = state.media.as_ref()?;
-    let sectors_per_cluster = (media.cluster_size() / 512).max(1);
-    let stats = media.stats().ok()?;
-    Some((
-        u16::try_from(sectors_per_cluster).unwrap_or(1),
-        512,
-        u16::try_from(stats.total_clusters()).unwrap_or(u16::MAX),
-        u16::try_from(stats.free_clusters()).unwrap_or(u16::MAX),
-    ))
+    state.media.as_ref()?.geometry()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{supported_name, unix_from_ymd_hms};
+    use super::supported_name;
+    use crate::kernel::fs::fat::unix_from_ymd_hms;
 
     #[test]
     fn catalogue_accepts_floppy_image_extensions_only() {

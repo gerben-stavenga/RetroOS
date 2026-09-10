@@ -10,7 +10,7 @@ use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::kernel::block::{Disk, Volume};
-use crate::kernel::fs::portable_ext4::{PortableExt4Fs, is_ext};
+use crate::kernel::fs::disk::FilesystemVolume;
 use crate::kernel::{console::Console, vfs};
 
 #[repr(C)]
@@ -190,13 +190,13 @@ pub(crate) fn handoff_modules(
 /// allowing them to replace `/`. The mount-table slot and visible disk number
 /// are intentionally independent.
 pub(crate) fn mount_physical_fallbacks(
-    ext: &[Volume],
+    volumes: &[FilesystemVolume],
     first_slot: usize,
     max_slots: usize,
     screen: &mut Console,
 ) -> usize {
     let mut slot = first_slot;
-    for (disk_number, &volume) in (1usize..).zip(ext.iter()) {
+    for (disk_number, volume) in (1usize..).zip(volumes.iter()) {
         if slot >= max_slots {
             break;
         }
@@ -205,18 +205,19 @@ pub(crate) fn mount_physical_fallbacks(
         prefix.extend_from_slice(disk_number.to_string().as_bytes());
         prefix.push(b'/');
         let prefix: &'static [u8] = Box::leak(prefix.into_boxed_slice());
-        match PortableExt4Fs::new(volume) {
+        match volume.open(false) {
             Ok(fs) => {
-                vfs::mount(prefix, Box::leak(Box::new(fs)));
+                vfs::mount_readonly(prefix, Box::leak(fs));
                 crate::screenln!(
                     screen,
-                    "portable ext4 partition ({} MB) → /{}",
-                    volume.sectors / 2048,
+                    "portable {} partition ({} MB) → /{}",
+                    volume.name(),
+                    volume.volume.sectors / 2048,
                     core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?")
                 );
                 slot += 1;
             }
-            Err(error) => crate::compact_screenln!(screen, "ext4 partition skipped: {}", error),
+            Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", volume.name(), error),
         }
     }
     slot
@@ -278,10 +279,10 @@ impl Disk for ModuleDisk {
 
 pub struct ModuleMountSummary {
     pub has_root: bool,
-    pub next_ext_slot: usize,
+    pub next_fs_slot: usize,
 }
 
-/// Mount each module as an independent volatile writable session. Raw ext4
+/// Mount each module as an independent volatile writable session. Raw ext4/FAT
 /// images are treated as whole disks; partition scanning is intentionally not
 /// used for this boot-only format.
 pub fn mount_modules(
@@ -306,7 +307,7 @@ pub fn mount_modules(
         )
     };
     for module in modules {
-        assert!(slot < 8, "too many ext4 mounts (maximum 8)");
+        assert!(slot < 8, "too many filesystem mounts (maximum 8)");
         let disk = ModuleDisk::from_boot_module(module, reader.expect("missing module reader"))
             .expect("invalid Multiboot module");
         let disk: &'static dyn Disk = Box::leak(Box::new(disk));
@@ -314,13 +315,14 @@ pub fn mount_modules(
             crate::kernel::block::overlay::RamOverlay::wrap(disk),
         ));
         let volume = crate::kernel::block::cache::volume(Volume::whole(disk));
-        assert!(is_ext(&volume), "Multiboot module is not a raw ext4 image");
-        let fs = PortableExt4Fs::new(volume)
-            .unwrap_or_else(|error| lib::compact_panic!("portable Multiboot ext4 mount failed: {}", error));
-        let fs: &'static dyn vfs::Filesystem = Box::leak(Box::new(fs));
+        let filesystem = FilesystemVolume::probe(volume)
+            .expect("Multiboot module is not a raw ext4/FAT image");
+        let fs = filesystem.open(true)
+            .unwrap_or_else(|error| lib::compact_panic!("Multiboot filesystem mount failed: {}", error));
+        let fs: &'static dyn vfs::Filesystem = Box::leak(fs);
         let mount = module.mount();
         let mount: &'static [u8] = Box::leak(mount.to_vec().into_boxed_slice());
-        vfs::mount_writable(
+        filesystem.mount_writable(
             mount,
             fs,
             if mount.is_empty() {
@@ -332,13 +334,15 @@ pub fn mount_modules(
         if mount.is_empty() {
             crate::screenln!(
                 screen,
-                "Multiboot ext4 ({} MB, volatile overlay) → /",
+                "Multiboot {} ({} MB, volatile overlay) → /",
+                filesystem.name(),
                 volume.sectors / 2048
             );
         } else {
             crate::screenln!(
                 screen,
-                "Multiboot ext4 ({} MB, volatile overlay) → /{}",
+                "Multiboot {} ({} MB, volatile overlay) → /{}",
+                filesystem.name(),
                 volume.sectors / 2048,
                 core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?")
             );
@@ -348,7 +352,7 @@ pub fn mount_modules(
     }
     ModuleMountSummary {
         has_root,
-        next_ext_slot: slot,
+        next_fs_slot: slot,
     }
 }
 

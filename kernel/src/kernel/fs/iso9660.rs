@@ -535,9 +535,9 @@ impl Filesystem for Iso9660Fs {
             let display = entry.display_name();
             let display = strip_iso_version(display.as_ref());
             let bytes = display.as_bytes();
-            let name_len = bytes.len().min(100);
+            let name_len = bytes.len();
             let mut result = DirEntry {
-                name: [0; 100],
+                name: alloc::vec![0; name_len],
                 name_len,
                 size: entry.total_size().min(u32::MAX as u64) as u32,
                 is_dir: entry.is_directory(),
@@ -545,6 +545,7 @@ impl Filesystem for Iso9660Fs {
                 mode: if entry.is_directory() { 0o555 } else { 0o444 },
                 mtime: 0,
                 node: 0,
+                short_name: None,
                 mount_idx: 0,
             };
             result.name[..name_len].copy_from_slice(&bytes[..name_len]);

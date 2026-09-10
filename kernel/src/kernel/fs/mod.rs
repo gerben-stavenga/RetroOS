@@ -8,6 +8,8 @@
 //! Backends read blocks through `kernel::block`, never a driver directly.
 
 pub mod cdrom;
+pub mod disk;
+pub mod fat;
 pub mod floppy;
 pub mod grant;
 pub mod hostfs;

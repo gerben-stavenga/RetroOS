@@ -1,0 +1,7 @@
+genrule(
+    name = "lfnprobe_com",
+    srcs = ["lfnprobe.asm"],
+    outs = ["LFNPROBE.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

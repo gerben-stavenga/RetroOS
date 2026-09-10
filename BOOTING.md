@@ -5,8 +5,8 @@ installed on the machine: `kernel.elf` is multiboot-loadable, so installing it
 is copying one file and adding one menuentry. No partitioning, no images, no
 bootloader install.
 
-The kernel carries no filesystem of its own. It mounts the machine's ext4
-root and takes `C:` from `/home/retroos`, so the DOS system directory
+The kernel carries no filesystem image of its own. It accepts ext4 and
+FAT12/16/32 roots and takes `C:` from `/home/retroos`, so the DOS system directory
 `C:\BOOT` (DN, COMMAND.COM, LOADFIX.CFG, SHELL.ELF) has to exist there —
 `setup-cdrive.sh` puts it there, or run `tools/install_boot_dir.sh` on its
 own. Without it the kernel boots but has no shell to start.
@@ -111,25 +111,27 @@ Disk writes: PERSISTENT — physical devices are writable        (in red)
 
 ### Which disk is at stake
 
-RetroOS picks its root by probing each ext partition for `/etc` and `/usr` —
-it deliberately looks for **a Linux root**, and on a laptop that is the one you
-boot Linux from. `C:` is `/home/retroos` on that same filesystem. So without
+RetroOS probes supported filesystems, preferring one containing `/etc` and
+`/usr`, then one containing the configured DOS home. On a laptop the first
+choice is usually **the Linux root** you boot Linux from. `C:` is
+`/home/retroos` on that same filesystem. So without
 `ram-overlay`, a DOS program is writing into your live system's root.
 
 What it can and cannot reach:
 
-- **Cannot**, structurally: the partition table, the EFI System Partition
-  (where GRUB's own binary lives), any other partition, firmware. Every write
+- **Cannot**, structurally: the partition table, any unselected partition,
+  firmware. A separate EFI System Partition stays read-only unless selected
+  as the root itself. Every write
   goes through `Volume::write`, which is volume-relative and bounds-checked, so
-  a filesystem cannot address past its own extent. GRUB will always still come
-  up.
+  a filesystem cannot address past its own extent.
 - **Can**: the contents of that one filesystem — which includes `/boot`. A bug
   in the ext4 write path could therefore leave Linux unbootable until you fsck
   it from a live USB. Recoverable, not catastrophic, but plan for it.
 
-A second gate limits ordinary file writes: a file is writable only if its group
+A second gate limits ordinary ext4 file writes: a file is writable only if its group
 matches the `C:`-root's group **and** it is group-writable (`chgrp retroos` +
-`chmod g+w`). That bounds deliberate writes; it does not bound a metadata bug.
+`chmod g+w`). FAT has no such ownership gate. That bounds deliberate ext4
+writes; it does not bound a metadata bug.
 
 ### Status
 
@@ -168,7 +170,9 @@ boot
 
 The only module declaration is `retroos.mount=<absolute-vfs-path>`. Modules
 use replacement mounts, and the boot log derives the displayed volume identity
-from that path. Each module has its own volatile RAM overlay; physical ext4
+from that path. Raw FAT12/16/32 images are accepted through exactly the same
+`retroos.mount=` declaration; there is no filesystem-type boot option.
+Each module has its own volatile RAM overlay; physical ext4/FAT
 fallback filesystems remain read-only at `/disk1`, `/disk2`, and so on.
 
 Module images remain resident in the physical RAM where GRUB loaded them, but
@@ -182,6 +186,30 @@ Boot directly with QEMU, for example:
 bazelisk build //:grub_module_iso
 qemu-system-i386 -cdrom bazel-bin/retroos_grub_module.iso
 ```
+
+## FAT roots
+
+GRUB loads `kernel.elf` as usual. The kernel probes filesystem contents and
+accepts FAT12/16/32 partitions, unpartitioned FAT media, and raw FAT Multiboot
+modules. Populate the usual `/home/retroos` tree (including `BOOT`) on the
+chosen root, preserving the exact spelling of these VFS paths. When multiple
+filesystems are present, `/etc` plus `/usr` take precedence, followed by a filesystem
+containing the configured DOS home. This keeps a separate EFI system
+partition from displacing a recognizable OS root.
+
+A selected physical FAT root is writable; FAT has no Unix ownership/group
+grant. Use `ram-overlay` to keep physical writes volatile. FAT modules always
+use volatile overlays, and secondary disk mounts remain read-only.
+
+FAT directory entries expose both the long name and the stored 8.3 alias.
+VFS uses exact names on every storage format; DOS case folding belongs to
+DosFS. DosFS preserves FAT's alias; ext4 entries receive generated aliases.
+DOS applications can use the INT 21h/AH=71h LFN services on either format;
+see [DOS LFN support](test/dos/lfnprobe/README.md) for the implemented calls
+and remaining limits.
+
+Regression test: `python3 test/grub_fat.py` (GRUB, QEMU, gcc, dosfstools,
+and mtools required).
 
 ## Booting from a GRUB hard disk (`//:image_grub`)
 
@@ -208,7 +236,7 @@ packaged. It needs `grub-mkimage` plus the i386-pc modules (`grub-pc-bin`).
 
 GOP text console (the kernel renders into the framebuffer GRUB hands over —
 `kernel/src/arch/fbcon.rs`), then storage discovery. RetroOS walks MBR or GPT
-partitions and mounts the selected ext4 root. DN and COMMAND.COM come from
+partitions and mounts the selected ext4 or FAT root. DN and COMMAND.COM come from
 `C:\BOOT`, an ordinary directory on that root — a boot with no RetroOS
 filesystem has no DOS system directory. Block writes reach the physical device
 unless `ram-overlay` was passed.
@@ -223,7 +251,7 @@ Caveats on real hardware (vs the `run_uefi.sh` mock):
   channel positions and widths reported by GRUB.
 - ACPI shutdown is wired for QEMU/Bochs/VirtualBox and PIIX4 boards; on a
   modern laptop it falls through to a halt, so power off by holding the button.
-- An MBR- or GPT-partitioned disk containing ext4 can become the RetroOS root,
+- An MBR- or GPT-partitioned disk containing ext4 or FAT can become the RetroOS root,
   and its files appear in DN. Whether changes reach the medium is the
   `ram-overlay` question above.
 - Returning to Linux after a RetroOS session has been seen to add ~34 s to the

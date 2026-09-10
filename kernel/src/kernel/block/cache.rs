@@ -53,6 +53,10 @@ impl Disk for VolumeDisk {
         self.volume.sectors
     }
 
+    fn flush(&self) {
+        self.volume.flush();
+    }
+
     fn name(&self) -> &str {
         self.volume.disk().name()
     }

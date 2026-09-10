@@ -145,7 +145,7 @@ impl Filesystem for HostFs {
             let mtime = u32::from_le_bytes(response[tail + 5..tail + 9].try_into().unwrap());
 
             out.push(DirEntry {
-                name,
+                name: name[..n].to_vec(),
                 name_len: n,
                 size,
                 is_dir,
@@ -153,6 +153,7 @@ impl Filesystem for HostFs {
                 mode: if is_dir { 0o755 } else { 0o644 },
                 mtime,
                 node: 0,
+                short_name: None,
                 mount_idx: 0,
             });
             index += 1;
