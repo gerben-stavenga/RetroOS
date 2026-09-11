@@ -3,7 +3,7 @@
 //! The terminal itself — grid, cursor, ANSI parser — is `lib::term`, shared by
 //! every embedder. This module turns that grid into a canonical 720x400 content
 //! buffer, attaches it to a personality-neutral scene node, and composes the
-//! scene into the current display's encoded word shadow. Legacy boot consoles may
+//! scene into the current display's packed shadow. Legacy boot consoles may
 //! still let a real VGA scan B8000 directly before the event loop takes over.
 //!
 //! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. No
@@ -27,8 +27,8 @@ struct Scanout {
     pal_cache: [u8; 768],
     /// Process-independent terminal pixels borrowed by the event-loop compositor.
     content: alloc::vec::Vec<u32>,
-    /// Display-encoded word shadow produced by the GUI scene compositor.
-    surface: alloc::vec::Vec<u32>,
+    /// Display-encoded packed shadow produced by the GUI scene compositor.
+    surface: alloc::vec::Vec<u8>,
     /// Startup/panic path before an event loop owns the real desktop.
     bootstrap_desktop: Option<crate::kernel::gui::Desktop>,
 }
@@ -78,7 +78,7 @@ pub fn present<A: crate::Arch>(
     let Some((width, height, shadow)) = render(display, None) else {
         return;
     };
-    display.present_native(machine, bios, width, height, shadow);
+    display.present_packed(machine, bios, width, height, shadow);
 }
 
 /// Event-loop publication through the desktop that outlives every focused
@@ -99,7 +99,7 @@ pub fn present_on<A: crate::Arch>(
     let Some((width, height, shadow)) = render(display, Some((desktop, endpoint))) else {
         return;
     };
-    display.present_native(machine, bios, width, height, shadow);
+    display.present_packed(machine, bios, width, height, shadow);
 }
 
 /// Best-effort terminal publication for the panic handler.  The system is no
@@ -107,7 +107,7 @@ pub fn present_on<A: crate::Arch>(
 /// call chain had borrowed it.
 pub fn panic_present(display: &mut Display) {
     if let Some((width, height, shadow)) = render(display, None) {
-        display.panic_present_native(width, height, shadow);
+        display.panic_present_packed(width, height, shadow);
     }
 }
 
@@ -117,7 +117,7 @@ fn render(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
-) -> Option<(usize, usize, &'static mut [u32])> {
+) -> Option<(usize, usize, &'static mut [u8])> {
     if display.shadow_width == 0 {
         return None;
     }
@@ -129,6 +129,7 @@ fn render(
     let vram = lib::term::term().cells_bytes();
     let palette_p = &raw const PALETTE;
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Text {
             cols: 80,
             rows: 25,
@@ -159,7 +160,7 @@ fn render_frame(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
-) -> Option<(usize, usize, &'static mut [u32])> {
+) -> Option<(usize, usize, &'static mut [u8])> {
     let managed = desktop.is_some();
     let (w, h) = vga::dimensions(frame.mode);
     if w == 0 || h == 0 || display.shadow_width == 0 {

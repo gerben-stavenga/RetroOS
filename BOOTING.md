@@ -6,8 +6,9 @@ is copying one file and adding one menuentry. No partitioning, no images, no
 bootloader install.
 
 The kernel carries no filesystem image of its own. It accepts ext4 and
-FAT12/16/32 roots and takes `C:` from `/home/retroos`, so the DOS system directory
-`C:\BOOT` (DN, COMMAND.COM, LOADFIX.CFG, SHELL.ELF) has to exist there —
+FAT12/16/32 roots. `C:` is `/home/retroos` on a Unix/ext4 root, or the entire
+selected FAT volume. The DOS system directory `C:\BOOT` (DN, COMMAND.COM,
+LOADFIX.CFG, SHELL.ELF) has to exist at that location —
 `setup-cdrive.sh` puts it there, or run `tools/install_boot_dir.sh` on its
 own. Without it the kernel boots but has no shell to start.
 
@@ -112,7 +113,8 @@ Disk writes: PERSISTENT — physical devices are writable        (in red)
 ### Which disk is at stake
 
 RetroOS probes supported filesystems, preferring one containing `/etc` and
-`/usr`, then one containing the configured DOS home. On a laptop the first
+`/usr`, then one containing the configured DOS home (or top-level `BOOT` on
+a FAT root). On a laptop the first
 choice is usually **the Linux root** you boot Linux from. `C:` is
 `/home/retroos` on that same filesystem. So without
 `ram-overlay`, a DOS program is writing into your live system's root.
@@ -191,11 +193,18 @@ qemu-system-i386 -cdrom bazel-bin/retroos_grub_module.iso
 
 GRUB loads `kernel.elf` as usual. The kernel probes filesystem contents and
 accepts FAT12/16/32 partitions, unpartitioned FAT media, and raw FAT Multiboot
-modules. Populate the usual `/home/retroos` tree (including `BOOT`) on the
-chosen root, preserving the exact spelling of these VFS paths. When multiple
-filesystems are present, `/etc` plus `/usr` take precedence, followed by a filesystem
-containing the configured DOS home. This keeps a separate EFI system
-partition from displacing a recognizable OS root.
+modules. On a selected FAT root, `C:` maps to the volume root: put the DOS
+system files in `/BOOT` (`C:\BOOT`), alongside the partition's existing
+Windows/DOS files and games. No `/home/retroos` directory is needed on FAT.
+On a Unix/ext4 root, `C:` remains `/home/retroos` even if that directory is
+missing; it never silently falls back to `/`. Explicit C-drive overrides
+still take precedence. FAT root modules use the same mapping as physical FAT.
+
+Preserve the exact spelling of the VFS startup paths, including `BOOT`.
+When multiple filesystems are present, `/etc` plus `/usr` take precedence,
+followed by a filesystem containing its DOS home (top-level `BOOT` for FAT).
+This keeps a separate EFI system partition from displacing an installed DOS
+root. GRUB's kernel location does not override this root-selection policy.
 
 A selected physical FAT root is writable; FAT has no Unix ownership/group
 grant. Use `ram-overlay` to keep physical writes volatile. FAT modules always

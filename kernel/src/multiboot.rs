@@ -322,6 +322,9 @@ pub fn mount_modules(
         let fs: &'static dyn vfs::Filesystem = Box::leak(fs);
         let mount = module.mount();
         let mount: &'static [u8] = Box::leak(mount.to_vec().into_boxed_slice());
+        if mount.is_empty() {
+            crate::kernel::dos::set_c_root(filesystem.c_root(boot));
+        }
         filesystem.mount_writable(
             mount,
             fs,

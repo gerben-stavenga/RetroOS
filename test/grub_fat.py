@@ -20,11 +20,14 @@ def make_fat(work, name, bits, size, root):
         stream.truncate(size)
     run("mkfs.fat", "-F", bits, image)
     if root:
-        run("mmd", "-i", image, "::home", "::home/retroos")
-        run("mcopy", "-i", image, work / "probe.elf", "::home/retroos/PROBE.ELF")
-        run("mcopy", "-i", image, work / "payload", "::home/retroos/Mixed case filename.txt")
-        run("mcopy", "-i", image, work / "empty", "::home/retroos/WRITE.TXT")
-        run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::home/retroos/LFNPROBE.COM")
+        run("mmd", "-i", image, "::BOOT")
+        run("mcopy", "-i", image, work / "probe.elf", "::PROBE.ELF")
+        run("mcopy", "-i", image, work / "payload", "::Mixed case filename.txt")
+        run("mcopy", "-i", image, work / "empty", "::WRITE.TXT")
+        run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::BOOT/LFNPROBE.COM")
+        run("mcopy", "-i", image, ROOT / "bazel-bin/tools/command/COMMAND.COM", "::BOOT/COMMAND.COM")
+        run("mcopy", "-i", image, work / "ROOTTEST.BAT", "::ROOTTEST.BAT")
+        run("mcopy", "-i", image, work / "CONFIG.SYS", "::CONFIG.SYS")
     else:
         run("mmd", "-i", image, "::EFI")
     return image
@@ -66,7 +69,7 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
             process.kill()
             process.wait()
     text = log.read_text(errors="replace")
-    if expected not in text or marker not in text or any(
+    if expected not in text or marker not in text or "DOS C: maps to /\n" not in text or any(
         error in text for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL", "panicked"]
     ):
         raise AssertionError(f"{name} failed:\n{text}")
@@ -74,13 +77,17 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
 
 
 def main():
-    run("bazelisk", "build", "//kernel:kernel_elf", "//test/dos/lfnprobe:lfnprobe_com")
+    run("bazelisk", "build", "//kernel:kernel_elf", "//test/dos/lfnprobe:lfnprobe_com", "//tools/command:command_com")
     with tempfile.TemporaryDirectory(prefix="retroos-fat-") as scratch:
         work = pathlib.Path(scratch)
         run("gcc", "-m32", "-static", "-nostdlib", "-no-pie", "-fno-pic", "-fno-stack-protector",
             "-O2", "-e", "_start", "-o", work / "probe.elf", "test/fat_probe.c")
         (work / "payload").write_bytes(b"FAT-DATA")
         (work / "empty").write_bytes(b"")
+        # Top-level batch launch must find the real C:\BOOT\COMMAND.COM,
+        # which then opens the probe through its drive-qualified DOS path.
+        (work / "ROOTTEST.BAT").write_bytes(b"@echo off\r\nC:\\BOOT\\LFNPROBE.COM\r\n")
+        (work / "CONFIG.SYS").write_bytes(b"COMSPEC=C:\\BOOT\\COMMAND.COM\r\nPATH=C:\\BOOT\r\n")
         fat12 = make_fat(work, "fat12.img", 12, 1440 * 1024, True)
         fat16 = make_fat(work, "fat16.img", 16, 16 * 1024 * 1024, True)
         fat32 = make_fat(work, "fat32.img", 32, 64 * 1024 * 1024, True)
@@ -101,11 +108,13 @@ def main():
             stream.seek(0)
             stream.write(mbr)
         boot(work, "fat16-partition-root", disk, False, "Mounting FAT root (16 MB)")
+        boot(work, "fat16-partition-lfn", disk, False, "Mounting FAT root (16 MB)",
+             "ROOTTEST.BAT", "LFN-ALL-OK")
         boot(work, "fat16-whole-disk-root", fat16, False, "Mounting FAT root (16 MB)")
         boot(work, "fat12-module-root", fat12, True, "Multiboot FAT (1 MB, volatile overlay)")
         boot(work, "fat32-module-root", fat32, True, "Multiboot FAT (64 MB, volatile overlay)")
         for label, image in [("fat12", fat12), ("fat16", fat16), ("fat32", fat32)]:
-            boot(work, label + "-lfn", image, True, "Multiboot FAT", "LFNPROBE.COM", "LFN-ALL-OK",
+            boot(work, label + "-lfn", image, True, "Multiboot FAT", "ROOTTEST.BAT", "LFN-ALL-OK",
                  memory=32 if label == "fat12" else 256)
 
 

@@ -1896,6 +1896,19 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     flush_tlb();
 }
 
+/// Alias an allocated kernel RAM range into the active guest. The kernel
+/// allocation owns the frames; guest cleanup and COW must leave them alone.
+pub(crate) fn map_shared_pages_user(vpage: usize, kernel_base: usize, count: usize) {
+    assert!(vpage.checked_add(count).is_some_and(|end| end <= 0xC000_0000 / PAGE_SIZE));
+    assert!(kernel_base.is_multiple_of(PAGE_SIZE) && kernel_base >= heap_base());
+    assert!(count.checked_mul(PAGE_SIZE).and_then(|len| kernel_base.checked_add(len))
+        .is_some_and(|end| end <= HEAP_END));
+    for i in 0..count {
+        let physical = physical_page(kernel_base + i * PAGE_SIZE);
+        map_user_page_phys(vpage + i, physical, flags::FOREIGN);
+    }
+}
+
 /// Physical page base of the shared VGA text aperture (0xB8000-0xBFFFF: 8 pages
 /// of real RAM), allocated once on first call. On a UEFI/GOP machine the legacy
 /// physical 0xB8000 region is unbacked (reads 0xFF), so it cannot serve as the

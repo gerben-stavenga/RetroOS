@@ -27,10 +27,133 @@ fn identity_ac() -> [u8; 21] {
 }
 
 #[test]
+fn packed_rows_match_encoded_words_for_every_vga_mode() {
+    let modes = [
+        VgaMode::Mode13h, TEXT80, TEXT40, VgaMode::Cga4, VgaMode::Cga2,
+        VgaMode::Planar16 { w: 24, h: 4, row_bytes: 3 },
+        VgaMode::ModeX { w: 12, h: 4, row_bytes: 3 },
+        VgaMode::LinearSvga { w: 7, h: 4, bpp: 8, pitch: 11 },
+        VgaMode::LinearSvga { w: 7, h: 4, bpp: 15, pitch: 18 },
+        VgaMode::LinearSvga { w: 7, h: 4, bpp: 16, pitch: 18 },
+        VgaMode::LinearSvga { w: 7, h: 4, bpp: 24, pitch: 25 },
+        VgaMode::LinearSvga { w: 7, h: 4, bpp: 32, pitch: 32 },
+    ];
+    let memory: Vec<u8> = (0..4 * 65536).map(|i| (i * 29 + i / 256) as u8).collect();
+    let palette = vga::fallback_palette();
+    let ac = identity_ac();
+    for mode in modes {
+        let (w, h) = vga::dimensions(mode);
+        let frame = Frame {
+            plane_layout: vga::VramLayout::PlaneMinor,
+            mode, vram: &memory, planes: &memory, ac: &ac, palette: &palette,
+            dac_mask: 0x7F, font: &lib::vga_fonts::FONT_8X16,
+            font_b: &lib::vga_fonts::FONT_8X16, blink: true,
+            cga_palette: [0, 0x123456, 0xABCDEF, 0xFFFFFF],
+            start_offset: 8, pixel_pan: 1, line_compare: 1, blank_start: h - 1,
+        };
+        for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
+            PixelFormat::RGB888, PixelFormat::NATIVE]
+        {
+            let mut pal = vga::Pal::new();
+            pal.sync(&palette, frame.dac_mask, format, &mut [0; 768]);
+            pal.sync_planar(&ac);
+            let step = usize::from(format.bytes_per_pixel);
+            for sy in [0, 1, h - 1] {
+                let mut words = vec![0; w];
+                vga::render_row(&frame, sy, &pal, &mut words);
+                let storage = w * step + vga::PACKED_ROW_PADDING;
+                let mut packed = vec![0xEE; storage + 2];
+                vga::render_row_packed(&frame, sy, &pal, &mut packed[1..1 + storage]);
+                let expected: Vec<u8> = words.iter()
+                    .flat_map(|p| p.to_le_bytes().into_iter().take(step)).collect();
+                assert_eq!(&packed[1..1 + w * step], expected, "{mode:?} {format:?} row={sy}");
+                assert_eq!(packed[0], 0xEE);
+                assert_eq!(packed[1 + storage], 0xEE);
+                // A caller without the required writable tail must not be
+                // allowed into the unchecked per-pixel writer.
+                let mut short = vec![0xEE; storage - 1];
+                vga::render_row_packed(&frame, sy, &pal, &mut short);
+                assert!(short.iter().all(|&b| b == 0xEE));
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_rows_share_tail_storage_without_corrupting_following_rows() {
+    let palette = vga::fallback_palette();
+    let ac = identity_ac();
+    let planes: Vec<u8> = (1..=16).collect();
+    for width in [1, 2, 4] {
+        let frame = Frame {
+            plane_layout: vga::VramLayout::PlaneMinor,
+            mode: VgaMode::ModeX { w: width, h: 4, row_bytes: 1 },
+            vram: &[], planes: &planes, ac: &ac, palette: &palette, dac_mask: 0xFF,
+            font: &[], font_b: &[], blink: false, cga_palette: [0; 4],
+            start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: 3,
+        };
+        for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
+            PixelFormat::RGB888, PixelFormat::NATIVE]
+        {
+            let mut pal = vga::Pal::new();
+            pal.sync(&palette, 0xFF, format, &mut [0; 768]);
+            let step = usize::from(format.bytes_per_pixel);
+            let row_bytes = usize::from(width) * step;
+            let storage = row_bytes * 4 + vga::PACKED_ROW_PADDING;
+            let mut output = vec![0xEE; storage + 2];
+            let mut expected = Vec::new();
+            for y in 0..4 {
+                let mut words = vec![0; usize::from(width)];
+                vga::render_row(&frame, y, &pal, &mut words);
+                expected.extend(words.iter().flat_map(|p| p.to_le_bytes().into_iter().take(step)));
+                vga::render_row_packed(&frame, y, &pal,
+                    &mut output[1 + y * row_bytes..1 + (y + 1) * row_bytes + vga::PACKED_ROW_PADDING]);
+            }
+            assert_eq!(&output[1..1 + 4 * row_bytes], expected);
+            assert_eq!(output[0], 0xEE);
+            assert_eq!(output[1 + storage], 0xEE);
+        }
+    }
+}
+
+#[test]
 fn dimensions_match_modes() {
     assert_eq!(vga_render::dimensions(VgaMode::Mode13h), (320, 200));
     assert_eq!(vga_render::dimensions(TEXT80), (720, 400));
     assert_eq!(vga_render::dimensions(TEXT40), (720, 400));
+}
+
+#[test]
+fn scanout_reads_either_live_plane_layout_without_reordering() {
+    let minor: Vec<u8> = (0..4 * 65536).map(|i| (i * 29 + i / 256) as u8).collect();
+    let mut odd_even = minor.clone();
+    VramTransition::between(VramLayout::PlaneMinor, VramLayout::OddEven).apply(&mut odd_even);
+    let palette = vga::fallback_palette();
+    let ac = identity_ac();
+    for mode in [VgaMode::ModeX { w: 24, h: 4, row_bytes: 8 },
+        VgaMode::Planar16 { w: 24, h: 4, row_bytes: 4 }]
+    {
+        let mut frame = Frame {
+            mode, plane_layout: VramLayout::PlaneMinor, planes: &minor, vram: &[],
+            ac: &ac, palette: &palette, dac_mask: 0xFF, font: &[], font_b: &[],
+            blink: false, cga_palette: [0; 4], start_offset: 0x4000,
+            pixel_pan: 3, line_compare: 2, blank_start: 3,
+        };
+        let mut pal = vga::Pal::new();
+        pal.sync(&palette, 0xFF, PixelFormat::RGB565, &mut [0; 768]);
+        pal.sync_planar(&ac);
+        for y in 0..4 {
+            frame.plane_layout = VramLayout::PlaneMinor;
+            frame.planes = &minor;
+            let mut expected = vec![0; 48 + vga::PACKED_ROW_PADDING];
+            vga::render_row_packed(&frame, y, &pal, &mut expected);
+            frame.plane_layout = VramLayout::OddEven;
+            frame.planes = &odd_even;
+            let mut actual = vec![0; expected.len()];
+            vga::render_row_packed(&frame, y, &pal, &mut actual);
+            assert_eq!(actual, expected, "{mode:?} row {y}");
+        }
+    }
 }
 
 #[test]
@@ -342,6 +465,7 @@ fn mode13h_maps_each_index_through_the_palette() {
     }
     let ac = identity_ac();
     let mut frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
@@ -379,6 +503,7 @@ fn mode13h_tolerates_short_vram() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],
@@ -402,6 +527,51 @@ fn mode13h_tolerates_short_vram() {
 }
 
 #[test]
+fn packed_indexed_spans_preserve_short_source_and_palette_zero() {
+    let memory: Vec<u8> = (0..350).map(|i| (i * 37) as u8).collect();
+    let mut palette = vga::fallback_palette();
+    palette[..3].copy_from_slice(&[63, 31, 15]); // Missing VRAM is index 0, not black.
+    let ac = identity_ac();
+    for mode in [VgaMode::Mode13h, VgaMode::ModeX { w: 13, h: 4, row_bytes: 5 },
+        VgaMode::LinearSvga { w: 13, h: 4, bpp: 8, pitch: 17 }]
+    {
+        let (w, h) = vga::dimensions(mode);
+        for len in [0, 1, 23, 350] {
+            let frame = Frame {
+                mode, plane_layout: VramLayout::PlaneMinor,
+                vram: &memory[..len], planes: &memory[..len],
+                ac: &ac, palette: &palette, dac_mask: 0x7F, font: &[], font_b: &[],
+                blink: false, cga_palette: [0; 4], start_offset: 3,
+                pixel_pan: 7, line_compare: 2, blank_start: h,
+            };
+            for format in [PixelFormat::RGB332, PixelFormat::RGB565,
+                PixelFormat::RGB888, PixelFormat::NATIVE]
+            {
+                let mut pal = vga::Pal::new();
+                pal.sync(&palette, frame.dac_mask, format, &mut [0; 768]);
+                let step = usize::from(format.bytes_per_pixel);
+                for y in 0..4 {
+                    let (start, pan, ry) = if y >= 2 { (0, 0, y - 2) } else { (3, 7, y) };
+                    let base = match mode {
+                        VgaMode::Mode13h => start + ry * w + pan,
+                        VgaMode::ModeX { .. } => (start + ry * 5) * 4 + pan,
+                        _ => y * 17,
+                    };
+                    let mut output = vec![0xEE; w * step + vga::PACKED_ROW_PADDING];
+                    vga::render_row_packed(&frame, y, &pal, &mut output);
+                    for x in 0..w {
+                        let index = memory[..len].get(base + x).copied().unwrap_or(0) & 0x7F;
+                        let expected = format.encode(pal_rgb(&palette, index)).to_le_bytes();
+                        assert_eq!(&output[x * step..(x + 1) * step], &expected[..step],
+                            "{mode:?} {format:?} len={len} row={y} x={x}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn text_renders_glyph_pixels_with_fg_bg() {
     // Two solid (all-bits-set) glyphs: char 1 (a normal glyph) and char 0xC4 (a
     // line-draw glyph in the 0xC0..=0xDF block). Cell attribute fg=15 (white) on
@@ -422,6 +592,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT80,
         vram: &vram,
         planes: &[],
@@ -474,6 +645,7 @@ fn text_attribute_bit_three_selects_character_map() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT80,
         vram: &vram,
         planes: &[],
@@ -508,6 +680,7 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
     let pal = vga_render::fallback_palette();
     let ac = identity_ac();
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT40, vram: &vram, planes: &[],
         ac: &ac, palette: &pal,
         dac_mask: 0xFF, font: &font, font_b: &font, blink: false, cga_palette: [0; 4],
@@ -530,6 +703,52 @@ fn fallback_palette_has_ega_colors_first() {
 }
 
 #[test]
+fn initial_vga_palette_has_standard_greys_and_hue_rings() {
+    let p = vga::fallback_palette();
+    let grey = [0, 5, 8, 11, 14, 17, 20, 24, 28, 32, 36, 40, 45, 50, 56, 63];
+    for (i, value) in grey.into_iter().enumerate() {
+        assert_eq!(&p[(16 + i) * 3..(17 + i) * 3], &[value; 3]);
+    }
+    for (index, rgb) in [
+        (32, [0, 0, 63]), (33, [16, 0, 63]), (40, [63, 0, 0]),
+        (48, [0, 63, 0]), (56, [31, 31, 63]), (80, [45, 45, 63]),
+        (104, [0, 0, 28]), (128, [14, 14, 28]), (152, [20, 20, 28]),
+        (176, [0, 0, 16]), (200, [8, 8, 16]), (224, [11, 11, 16]),
+        (247, [11, 12, 16]),
+    ] {
+        assert_eq!(&p[index * 3..index * 3 + 3], &rgb);
+    }
+    assert!(p[248 * 3..].iter().all(|&v| v == 0));
+    assert!(p.iter().all(|&v| v <= 63));
+    assert_eq!(vga::VgaState::new().dac, p);
+    assert_eq!(vga::VgaState::new_boxed().dac, p);
+}
+
+#[test]
+fn ega_defaults_map_both_bios_attribute_tables_to_rgbi() {
+    let normal = vga::ega_dac();
+    let rgb200 = vga::ega_200line_dac();
+    assert!(normal[64 * 3..].iter().all(|&v| v == 0));
+    assert!(rgb200[64 * 3..].iter().all(|&v| v == 0));
+    let normal_ac = [0, 1, 2, 3, 4, 5, 0x14, 7, 0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F];
+    let ac200 = [0, 1, 2, 3, 4, 5, 6, 7, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17];
+    for (i, &(r, g, b)) in vga::EGA16.iter().enumerate() {
+        for (palette, index) in [(&normal, normal_ac[i]), (&rgb200, ac200[i])] {
+            assert_eq!(&palette[index * 3..index * 3 + 3], &[r, g, b]);
+        }
+    }
+    // EGA's primary and secondary bits contribute 42 and 21 respectively.
+    for index in 0..64 {
+        let expected = [
+            (42 * ((index >> 2) & 1) + 21 * ((index >> 5) & 1)) as u8,
+            (42 * ((index >> 1) & 1) + 21 * ((index >> 4) & 1)) as u8,
+            (42 * (index & 1) + 21 * ((index >> 3) & 1)) as u8,
+        ];
+        assert_eq!(&normal[index * 3..index * 3 + 3], &expected);
+    }
+}
+
+#[test]
 fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
     let mut palette = [0u8; 768];
     for i in 0..256usize {
@@ -542,6 +761,7 @@ fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
     let vram: Vec<u8> = (0..320 * 200).map(|i| (i % 320 & 255) as u8).collect();
     let ac = identity_ac();
     let frame = Frame {
+        plane_layout: vga::VramLayout::PlaneMinor,
         mode: VgaMode::Mode13h,
         vram: &vram,
         planes: &[],

@@ -63,6 +63,15 @@ pub fn region_base() -> *mut u8 {
     phys().view
 }
 
+/// Resolve a page-aligned kernel view back to its guest-physical RAM range.
+pub(crate) fn kernel_frame(base: core::ptr::NonNull<u8>, count: usize) -> u64 {
+    let offset = (base.as_ptr() as usize).checked_sub(region_base() as usize).unwrap();
+    assert!(offset.is_multiple_of(PAGE));
+    assert!(count.checked_mul(PAGE).and_then(|len| offset.checked_add(len))
+        .is_some_and(|end| end <= PHYS_SIZE));
+    (offset / PAGE) as u64
+}
+
 fn phys() -> &'static Phys {
     PHYS.get_or_init(|| {
         let name = b"retroos-guest-phys\0";

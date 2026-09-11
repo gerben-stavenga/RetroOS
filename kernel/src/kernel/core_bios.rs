@@ -54,6 +54,8 @@ pub enum VideoResume {
 
 /// Software VGA state owned by the core INT 10h/video-BIOS driver.
 pub struct EmulatedVga {
+    /// Registers plus a suspended VRAM snapshot. Empty `planes` means this
+    /// device occupies the shared live store; capacity is retained for saving.
     pub state: alloc::boxed::Box<vga::VgaState>,
     /// Guest pages backing the substitute-VBE aperture.
     pub svga_pages: usize,
@@ -143,11 +145,94 @@ pub struct BiosDisplayWorkspace<A: Arch>(Option<NativeBiosWorkspace<A>>);
 
 enum BankedSource<'a> {
     Packed(&'a [u8]),
-    Native {
+    Sized {
         width: usize,
-        pixels: &'a [u32],
+        pixels: &'a [u8],
         row: &'a mut alloc::vec::Vec<u8>,
     },
+}
+
+/// Split a contiguous framebuffer span only at aperture boundaries, not rows.
+fn banked_span(
+    mut offset: usize,
+    mut source: &[u8],
+    window_size: usize,
+    granularity: usize,
+    mut copy: impl FnMut(u16, usize, &[u8]) -> Result<(), BiosError>,
+) -> Result<(), BiosError> {
+    while !source.is_empty() {
+        let window_base = offset / window_size * window_size;
+        let bank = u16::try_from(window_base / granularity)
+            .map_err(|_| BiosError::InvalidFrame)?;
+        let inside = offset - window_base;
+        let count = source.len().min(window_size - inside);
+        copy(bank, inside, &source[..count])?;
+        source = &source[count..];
+        offset += count;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod banked_tests {
+    use super::*;
+
+    #[test]
+    fn packed_canvas_copies_once_per_bank() {
+        let source: Vec<u8> = (0..800 * 600 * 2).map(|i| (i * 37) as u8).collect();
+        let mut output = alloc::vec![0; source.len()];
+        let mut copies = 0;
+        banked_span(0, &source, 65536, 4096, |bank, inside, bytes| {
+            assert_eq!(usize::from(bank), copies * 16);
+            assert_eq!(inside, 0);
+            assert_eq!(bytes.len(), (source.len() - copies * 65536).min(65536));
+            let offset = usize::from(bank) * 4096 + inside;
+            unsafe {
+                crate::kernel::display::copy_bytes(
+                    output.as_mut_ptr().add(offset), bytes.as_ptr(), bytes.len(), false,
+                );
+            }
+            copies += 1;
+            Ok(())
+        }).unwrap();
+        assert_eq!(copies, 15);
+        assert_eq!(output, source);
+    }
+
+    #[test]
+    fn bank_splits_preserve_unaligned_rgb888_rows_and_pitch_gaps() {
+        let source: Vec<u8> = (0..321 * 3).map(|i| (i * 53) as u8).collect();
+        let mut output = alloc::vec![0xEE; 70000];
+        let mut expected = output.clone();
+        for offset in [65533, 66533] {
+            expected[offset..offset + source.len()].copy_from_slice(&source);
+            banked_span(offset, &source, 65536, 4096, |bank, inside, bytes| {
+                assert!(inside + bytes.len() <= 65536);
+                let address = usize::from(bank) * 4096 + inside;
+                unsafe {
+                    crate::kernel::display::copy_bytes(
+                        output.as_mut_ptr().add(address), bytes.as_ptr(), bytes.len(), false,
+                    );
+                }
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn bank_copy_stops_on_failure() {
+        let mut copies = 0;
+        let result = banked_span(65535, &[1, 2, 3], 65536, 4096, |_, _, _| {
+            copies += 1;
+            Err(BiosError::Rejected(0x014F))
+        });
+        assert_eq!(result, Err(BiosError::Rejected(0x014F)));
+        assert_eq!(copies, 1);
+        assert_eq!(banked_span(65536, &[1], 65536, 1, |_, _, _| {
+            panic!("unrepresentable bank must not be selected");
+        }), Err(BiosError::InvalidFrame));
+    }
 }
 
 enum BiosTransfer<'a> {
@@ -250,6 +335,95 @@ impl VbeModeInfo {
     }
 }
 
+/// The active physical adapter's indexed-SVGA palette. Guest NonVGA modes
+/// route all palette access through our BIOS. Legacy VGA still reads the DAC.
+struct IndexedPalette {
+    rgb: [u8; 768],
+}
+
+impl IndexedPalette {
+    fn new() -> Self {
+        let mut palette = Self { rgb: [0; 768] };
+        vga::fill_vga_palette(&mut palette.rgb);
+        palette
+    }
+
+    fn range(start: u16, bytes: usize) -> Result<core::ops::Range<usize>, BiosError> {
+        let start = usize::from(start);
+        if !bytes.is_multiple_of(4) || start >= 256 || bytes / 4 > 256 - start {
+            return Err(BiosError::InvalidFrame);
+        }
+        Ok(start * 3..(start + bytes / 4) * 3)
+    }
+
+    fn read(&self, start: u16, entries: &mut [u8]) -> Result<(), BiosError> {
+        let range = Self::range(start, entries.len())?;
+        for (entry, rgb) in entries.chunks_exact_mut(4).zip(self.rgb[range].chunks_exact(3)) {
+            entry.copy_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
+        }
+        Ok(())
+    }
+
+    fn write(&mut self, start: u16, entries: &[u8]) -> Result<(), BiosError> {
+        let range = Self::range(start, entries.len())?;
+        for (rgb, entry) in self.rgb[range].chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
+            rgb.copy_from_slice(&[entry[2] & 63, entry[1] & 63, entry[0] & 63]);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod indexed_palette_tests {
+    use super::*;
+
+    #[test]
+    fn partial_updates_round_trip_bgr_and_preserve_other_entries() {
+        let mut palette = IndexedPalette::new();
+        let before = palette.rgb;
+        palette.write(254, &[3, 7, 11, 0xEE, 255, 128, 65, 0xDD]).unwrap();
+        assert_eq!(&palette.rgb[..254 * 3], &before[..254 * 3]);
+        let mut entries = [0xAA; 8];
+        palette.read(254, &mut entries).unwrap();
+        assert_eq!(entries, [3, 7, 11, 0, 63, 0, 1, 0]);
+    }
+
+    #[test]
+    fn invalid_ranges_do_not_change_palette_or_read_buffer() {
+        let mut palette = IndexedPalette::new();
+        let before = palette.rgb;
+        for (start, bytes) in [(256, 4), (255, 8), (0, 3), (0, 1028)] {
+            let mut entries = alloc::vec![0xAA; bytes];
+            assert_eq!(palette.write(start, &entries), Err(BiosError::InvalidFrame));
+            assert_eq!(palette.read(start, &mut entries), Err(BiosError::InvalidFrame));
+            assert!(entries.iter().all(|&byte| byte == 0xAA));
+            assert_eq!(palette.rgb, before);
+        }
+        palette.write(255, &[]).unwrap();
+        palette.read(255, &mut []).unwrap();
+        assert_eq!(palette.rgb, before);
+    }
+
+    #[test]
+    fn mode_reset_and_task_restore_replace_the_entire_palette() {
+        let mut active = IndexedPalette::new();
+        active.write(17, &[1, 2, 3, 0]).unwrap();
+        let task_a = active.rgb;
+        active = IndexedPalette::new();
+        assert_ne!(active.rgb, task_a);
+        active.write(42, &[4, 5, 6, 0]).unwrap();
+        let task_b = active.rgb;
+        // The same RGB -> BGR transfer used when restoring a detached task.
+        let mut entries = [0; 1024];
+        IndexedPalette { rgb: task_a }.read(0, &mut entries).unwrap();
+        active.write(0, &entries).unwrap();
+        assert_eq!(active.rgb, task_a);
+        IndexedPalette { rgb: task_b }.read(0, &mut entries).unwrap();
+        active.write(0, &entries).unwrap();
+        assert_eq!(active.rgb, task_b);
+    }
+}
+
 struct NativeBiosWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
     bios_vcpu: Vcpu<A>,
@@ -257,6 +431,9 @@ struct NativeBiosWorkspace<A: Arch> {
     modes: Vec<crate::kernel::platform::VbeMode>,
     state_bytes: Option<usize>,
     state_probed: bool,
+    /// Kernel memory, not STATE_BUFFER (which fonts/checkpoints overwrite).
+    /// Detached tasks save their own copy in VgaState.dac.
+    indexed_palette: alloc::boxed::Box<IndexedPalette>,
 }
 
 impl<A: Arch> BiosDisplayWorkspace<A> {
@@ -298,6 +475,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             modes: Vec::new(),
             state_bytes: None,
             state_probed: false,
+            indexed_palette: alloc::boxed::Box::new(IndexedPalette::new()),
         }
     }
 
@@ -437,8 +615,17 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if status == 0x004F {
             let indexed = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8);
             bios_display.mark_vbe(number, indexed, mode.vga_compatible);
+            if indexed {
+                let palette = IndexedPalette::new();
+                let mut entries = alloc::vec![0; 256 * 4];
+                palette.read(0, &mut entries)?;
+                // Mode sets reset the DAC to six bits. Program all entries,
+                // including those the application never subsequently writes.
+                self.indexed_palette_call(machine, bios_display, 0, 0, &mut entries)?;
+            }
             Ok(())
         } else {
+            crate::compact_println!("VBE: physical mode set returned {:#x}", status);
             Err(BiosError::Rejected(status))
         }
     }
@@ -581,6 +768,43 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         Ok(())
     }
 
+    /// RetroOS indexed-SVGA service. Reads never enter the physical ROM or
+    /// access the DAC. Successful writes commit the same values to the shadow.
+    fn indexed_palette_call(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::VgaCap,
+        subfn: u8,
+        start: u16,
+        entries: &mut [u8],
+    ) -> Result<(), BiosError> {
+        IndexedPalette::range(start, entries.len())?;
+        match subfn {
+            1 => return self.indexed_palette.read(start, entries),
+            0 | 0x80 => {}
+            _ => return Err(BiosError::Rejected(0x014F)),
+        }
+        if entries.is_empty() { return Ok(()); }
+        for entry in entries.chunks_exact_mut(4) {
+            for channel in &mut entry[..3] { *channel &= 63; }
+            entry[3] = 0;
+        }
+        if display.physical_vbe_dac_access() {
+            crate::kernel::drivers::vga_hw::set_vbe_palette(display, start as u8, entries);
+        } else {
+            let mut regs = Regs::empty();
+            regs.rax = 0x4F09;
+            regs.rbx = u64::from(subfn);
+            regs.rcx = (entries.len() / 4) as u64;
+            regs.rdx = u64::from(start);
+            if let Err(error) = self.palette_call(machine, display, &mut regs, Some(entries), true, true) {
+                crate::compact_println!("VBE: physical palette write failed: {:?}", error);
+                return Err(error);
+            }
+        }
+        self.indexed_palette.write(start, entries)
+    }
+
     /// Execute a native video-BIOS palette call with an optional caller buffer.
     /// The ROM can only address its private real-mode workspace, so protected-
     /// mode DOS buffers are bounced through [`STATE_BUFFER`]. `offset_in_di`
@@ -698,22 +922,22 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         )
     }
 
-    fn present_banked_native(
+    fn present_banked_packed(
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
         mode: crate::kernel::platform::VbeMode,
         bank_state: &mut u16,
-        source: crate::kernel::display::NativeSource<'_>,
+        source: crate::kernel::display::PackedSource<'_>,
     ) -> Result<usize, BiosError> {
-        let crate::kernel::display::NativeSource { width, height, pixels, row } = source;
+        let crate::kernel::display::PackedSource { width, height, pixels, row } = source;
         self.present_banked_source(
             machine,
             display,
             mode,
             bank_state,
             height,
-            BankedSource::Native { width, pixels, row },
+            BankedSource::Sized { width, pixels, row },
         )
     }
 
@@ -729,21 +953,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
             return Err(BiosError::InvalidFrame);
         };
-        let (shadow_width, _) = crate::kernel::display::fit_vga(
-            usize::from(mode.width), usize::from(mode.height),
-        );
+        let panel_w = usize::from(mode.width);
+        let panel_h = usize::from(mode.height);
+        let (out_w, out_h) = match &source {
+            BankedSource::Packed(_) => crate::kernel::display::fit_vga(panel_w, panel_h),
+            BankedSource::Sized { width, .. } => crate::kernel::display::native_output_size(
+                panel_w, panel_h, *width, shadow_height,
+            ),
+        };
+        let shadow_width = out_w;
         let step = usize::from(rgb.bytes_per_pixel);
         let row_bytes = shadow_width.checked_mul(step).ok_or(BiosError::InvalidFrame)?;
         let needed = row_bytes.checked_mul(shadow_height).ok_or(BiosError::InvalidFrame)?;
-        let panel_w = usize::from(mode.width);
-        let panel_h = usize::from(mode.height);
         let pitch = usize::from(mode.pitch);
         let granularity = usize::from(mode.window_granularity_kb) * 1024;
         let window_size = usize::from(mode.window_size_kb) * 1024;
         let source_valid = match &source {
             BankedSource::Packed(shadow) => shadow.len() >= needed,
-            BankedSource::Native { width, pixels, .. } => *width != 0
-                && pixels.len() >= width.saturating_mul(shadow_height),
+            BankedSource::Sized { width, pixels, .. } => *width != 0
+                && pixels.len() >= width.saturating_mul(shadow_height).saturating_mul(step),
         };
         if shadow_height == 0 || !source_valid
             || shadow_width > panel_w || row_bytes > pitch
@@ -761,13 +989,53 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let io = crate::kernel::io_policy::bios_display(display);
 
         let result = (|| {
-            let (out_w, out_h) = crate::kernel::display::fit_vga(panel_w, panel_h);
-            if shadow_width != out_w { return Err(BiosError::InvalidFrame); }
             let bx = (panel_w - out_w) / 2;
             let by = (panel_h - out_h) / 2;
             let (ybase, yrem) = (out_h / shadow_height, out_h % shadow_height);
             let aperture = usize::from(mode.window_segment) * 16;
             let mut current_bank = None;
+            let mut write_span = |machine: &mut A, offset, bytes: &[u8]| {
+                banked_span(offset, bytes, window_size, granularity, |bank, inside, chunk| {
+                    if current_bank != Some(bank) {
+                        let bank_sample = crate::kernel::osd_profile::Sample::start(machine);
+                        let mut regs = self.bios_vcpu.regs;
+                        let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
+                        run_bios_until(machine, &mut regs, return_ip, &io)?;
+                        let status = regs.rax as u16;
+                        if status != 0x004F { return Err(BiosError::Rejected(status)); }
+                        bank_sample.finish(machine, crate::kernel::osd_profile::Stage::Bank, 0);
+                        *bank_state = bank;
+                        current_bank = Some(bank);
+                    }
+                    let copy_sample = crate::kernel::osd_profile::Sample::start(machine);
+                    // Only native firmware creates this workspace. Its active
+                    // address space maps the hardware aperture directly; this
+                    // is framebuffer memory, not a generic guest/MMIO copy.
+                    unsafe {
+                        crate::kernel::display::copy_bytes(
+                            (aperture + inside) as *mut u8, chunk.as_ptr(), chunk.len(), false,
+                        );
+                    }
+                    copy_sample.finish(machine, crate::kernel::osd_profile::Stage::Copy, chunk.len() / step);
+                    Ok(())
+                })
+            };
+
+            // A matching packed canvas is one span, just like linear present.
+            // For 800x600 RGB565 this is 15 aperture copies, not 600 row copies
+            // plus another 14 splits at bank boundaries.
+            let contiguous = match &source {
+                BankedSource::Packed(pixels) => Some(*pixels),
+                BankedSource::Sized { width, pixels, .. } if *width == out_w => Some(*pixels),
+                _ => None,
+            };
+            if pitch == row_bytes && shadow_height == out_h
+                && let Some(pixels) = contiguous
+            {
+                write_span(machine, by * pitch + bx * step, &pixels[..needed])?;
+                return Ok(out_w * out_h);
+            }
+
             let mut oy = 0usize;
             let mut yerr = 0usize;
 
@@ -779,41 +1047,23 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                 let src = match &mut source {
                     BankedSource::Packed(shadow) =>
                         &shadow[sy * row_bytes..(sy + 1) * row_bytes],
-                    BankedSource::Native { width, pixels, row } => {
-                        row.resize(row_bytes.saturating_add(4), 0);
-                        if !crate::kernel::display::stretch_native_row(
-                            &pixels[sy * *width..(sy + 1) * *width],
-                            row,
-                            out_w,
-                            step,
-                        ) {
-                            return Err(BiosError::InvalidFrame);
+                    BankedSource::Sized { width, pixels, row } => {
+                        let src = &pixels[sy * *width * step..(sy + 1) * *width * step];
+                        if *width == out_w {
+                            src
+                        } else {
+                            let pack_sample = crate::kernel::osd_profile::Sample::start(machine);
+                            row.resize(row_bytes, 0);
+                            if !crate::kernel::display::stretch_packed_row(src, row, out_w, step) {
+                                return Err(BiosError::InvalidFrame);
+                            }
+                            pack_sample.finish(machine, crate::kernel::osd_profile::Stage::Pack, out_w);
+                            &row[..row_bytes]
                         }
-                        &row[..row_bytes]
                     }
                 };
                 for _ in 0..rows {
-                    let mut source = src;
-                    let mut offset = (by + oy) * pitch + bx * step;
-                    while !source.is_empty() {
-                        let window_base = offset / window_size * window_size;
-                        let bank_usize = window_base / granularity;
-                        let bank = u16::try_from(bank_usize).map_err(|_| BiosError::InvalidFrame)?;
-                        if current_bank != Some(bank) {
-                            let mut regs = self.bios_vcpu.regs;
-                            let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
-                            run_bios_until(machine, &mut regs, return_ip, &io)?;
-                            let status = regs.rax as u16;
-                            if status != 0x004F { return Err(BiosError::Rejected(status)); }
-                            *bank_state = bank;
-                            current_bank = Some(bank);
-                        }
-                        let inside = offset - window_base;
-                        let count = source.len().min(window_size - inside);
-                        machine.copy_to(aperture + inside, &source[..count]);
-                        source = &source[count..];
-                        offset += count;
-                    }
+                    write_span(machine, (by + oy) * pitch + bx * step, src)?;
                     oy += 1;
                 }
             }
@@ -1150,6 +1400,26 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?.scan_line_length(machine, self, caller)
     }
 
+    /// Kernel-owned shadow for the active indexed mode, without a ROM call or
+    /// an address-space switch. Legacy VGA must use hardware DAC capture.
+    pub(crate) fn bios_indexed_palette<'a, A: Arch>(
+        &self,
+        bios: &'a BiosDisplayWorkspace<A>,
+    ) -> Result<&'a [u8; 768], BiosError> {
+        Ok(&self.bios_ref(bios)?.indexed_palette.rgb)
+    }
+
+    pub(crate) fn bios_indexed_palette_call<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        subfn: u8,
+        start: u16,
+        entries: &mut [u8],
+    ) -> Result<(), BiosError> {
+        self.bios(bios)?.indexed_palette_call(machine, self, subfn, start, entries)
+    }
+
     pub fn bios_palette_call<A: Arch>(
         &mut self,
         machine: &mut A,
@@ -1188,15 +1458,15 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
-    pub(crate) fn bios_present_native<A: Arch>(
+    pub(crate) fn bios_present_packed<A: Arch>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         mode: crate::kernel::platform::VbeMode,
         current_bank: &mut u16,
-        source: crate::kernel::display::NativeSource<'_>,
+        source: crate::kernel::display::PackedSource<'_>,
     ) -> Result<usize, BiosError> {
-        self.bios(bios)?.present_banked_native(
+        self.bios(bios)?.present_banked_packed(
             machine, self, mode, current_bank, source,
         )
     }

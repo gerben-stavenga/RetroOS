@@ -71,6 +71,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
             return;
         }
         let (old, new) = thread::get_two_threads(threads, self.tid, new_tid);
+        old.personality.on_suspend(machine);
         verify_kernel_cpu_hash(&new.kernel, "switch-in");
         // Registers are plain data: park the outgoing set, load the incoming.
         old.kernel.vcpu.regs = self.regs;

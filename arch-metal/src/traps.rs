@@ -110,6 +110,7 @@ pub mod arch_call {
     pub const REDIRECT_PHYSICAL_ALIASES: u64 = 0x120; // ESI:EDX=phys page ECX=shadow vpage EBX=count EDI=redirect
     pub const REMAP_PHYSICAL_APERTURE: u64 = 0x121; // EDX/ECX=physical base low/high
     pub const RELEASE_HEAP: u64 = 0x122; // EDX=heap address, ECX=byte length
+    pub const MAP_SHARED_PAGES: u64 = 0x123; // EDX=guest vpage, ECX=kernel address, EBX=count
 }
 
 static DEBUG_WATCH_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -249,6 +250,8 @@ fn arch_dispatch(regs: &mut Regs) {
         }
         arch_call::MAP_LOW_MEM => paging2::map_low_mem_user(),
         arch_call::MAP_VGA_TEXT_APERTURE => paging2::map_vga_text_aperture_user(),
+        arch_call::MAP_SHARED_PAGES => paging2::map_shared_pages_user(
+            regs.rdx as usize, regs.rcx as usize, regs.rbx as usize),
         arch_call::COPY_PAGE_ENTRIES => {
             paging2::copy_page_entries(regs.rdx as usize, regs.rcx as usize, regs.rbx as usize);
         }

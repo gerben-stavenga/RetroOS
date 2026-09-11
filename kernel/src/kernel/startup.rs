@@ -419,7 +419,7 @@ fn prepare_storage<A: crate::Arch>(
     crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
     let modules = crate::multiboot::mount_modules(boot, screen, 0);
-    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, modules);
+    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, modules, boot);
     screen.present(machine, bios_workspace);
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
         lib::compact_panic!("hostfs: mounted as root but its server is unavailable");
@@ -450,11 +450,11 @@ const MAX_DISK_MOUNTS: usize = 8;
 
 /// Select a filesystem root, not merely the first FAT volume (often an ESP).
 /// Equal scores retain device/partition order, as the ext4-only path did.
-fn root_index(volumes: &[FilesystemVolume]) -> usize {
+fn root_index(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> usize {
     if volumes.len() < 2 { return 0; }
     let mut best = (0, 0);
     for (index, volume) in volumes.iter().enumerate() {
-        let score = volume.root_score(crate::kernel::dos::c_root());
+        let score = volume.root_score(boot);
         if score > best.1 { best = (index, score); }
     }
     best.0
@@ -469,6 +469,7 @@ fn mount_filesystems(
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     modules: crate::multiboot::ModuleMountSummary,
+    boot: &crate::BootConfig,
 ) -> bool {
     use crate::kernel::block::partition::PartKind;
 
@@ -509,7 +510,7 @@ fn mount_filesystems(
             lib::compact_panic!("No root filesystem available");
         }
     } else {
-        let root = root_index(&volumes);
+        let root = root_index(&volumes, boot);
         let root_volume = volumes[root];
         crate::compact_screenln!(screen,
             "Mounting {} root ({} MB)...", root_volume.name(), root_volume.volume.sectors / 2048);
@@ -517,6 +518,7 @@ fn mount_filesystems(
             .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error));
         crate::compact_screenln!(screen, "{} root mounted", root_volume.name());
         let fs: &'static dyn vfs::Filesystem = alloc::boxed::Box::leak(fs);
+        crate::kernel::dos::set_c_root(root_volume.c_root(boot));
         // Ext4 writes use the group owning RetroOS's home; FAT has no Unix
         // ownership and delegates writes. Extra mounts are explicitly read-only.
         root_volume.mount_writable(b"", fs, crate::kernel::dos::c_root());
@@ -567,6 +569,8 @@ fn mount_filesystems(
 
     // C:\BOOT is an ordinary directory on whatever backs C: — no mount, no
     // embedded archive. A root without one simply has no DOS system directory.
+    crate::compact_screenln!(screen, "DOS C: maps to /{}",
+        core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
     mount_kernel_log_fs();
 
     crate::kernel::stacktrace::init_from_vfs();
@@ -1146,6 +1150,7 @@ fn present_desktop<A: crate::Arch>(
     windows: &mut crate::kernel::gui::WindowManager,
 ) {
     let extent = windows.desktop().extent();
+    let compose_sample = crate::kernel::osd_profile::Sample::start(machine);
     let (canvas_width, canvas_height) = display.composition_size(
         extent.width as usize,
         extent.height as usize,
@@ -1159,12 +1164,14 @@ fn present_desktop<A: crate::Arch>(
         canvas_width,
         canvas_height,
     );
+    let osd_sample = crate::kernel::osd_profile::Sample::start(machine);
     windows.sync_osd(
         canvas_width,
         canvas_height,
         display.composition_scale_y(canvas_height),
         display.rgb,
     );
+    osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
                    key: crate::kernel::gui::SurfaceKey| {
         threads
@@ -1172,12 +1179,20 @@ fn present_desktop<A: crate::Arch>(
             .personality
             .surface_buffer(key, display.rgb)
     };
+    let scene_sample = crate::kernel::osd_profile::Sample::start(machine);
     let frame = windows
         .compose_processes(resolve, canvas_width, canvas_height, display.rgb)
         .expect("compose process-owned surfaces");
-    display.present_native(
+    scene_sample.finish(machine, crate::kernel::osd_profile::Stage::Scene,
+        frame.damage.iter().map(|r| r.width as usize * r.height as usize).sum());
+    compose_sample.finish(machine, crate::kernel::osd_profile::Stage::Compose,
+        frame.damage.iter().map(|r| r.width as usize * r.height as usize).sum());
+    let present_sample = crate::kernel::osd_profile::Sample::start(machine);
+    let presented = display.present_packed(
         machine, bios_workspace, canvas_width, canvas_height, frame.pixels,
     );
+    present_sample.finish(machine, crate::kernel::osd_profile::Stage::Present,
+        presented);
 }
 
 pub fn event_loop<A: crate::Arch>(
@@ -1418,6 +1433,7 @@ pub fn event_loop<A: crate::Arch>(
 
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine, &ctx.regs);
+        let event_sample = super::event_profile::Sample::start(machine);
         let kevent = ctx.run(machine, &thread.personality);
         if matches!(&kevent, crate::KernelEvent::Irq) {
             // Hosted backends express their periodic preemption kick directly
@@ -1425,7 +1441,9 @@ pub fn event_loop<A: crate::Arch>(
             irq_clock_wakeup = true;
         }
         stats.post_run(machine, &kevent, &ctx.regs);
+        let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
         let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
+        event_dispatch.finish(machine);
         stats.after_dispatch(machine);
 
         // The OSD holds foreground scanout while the personality targets its
@@ -2008,6 +2026,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     };
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
+        parent.personality.on_suspend(machine);
         machine.user_fork(&mut parent.kernel.vcpu.space);
     }
 
@@ -2449,6 +2468,8 @@ pub fn toggle_profile() {
     };
     if on {
         unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
+        crate::kernel::osd_profile::reset();
+        super::event_profile::reset();
     }
     crate::compact_println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
@@ -2567,6 +2588,8 @@ pub fn print_profile() {
         (b"scheduler", s.parts[PROFILE_SCHEDULER] as u64),
     ]);
     if profile_enabled() {
+        crate::kernel::osd_profile::print();
+        super::event_profile::print();
         PROFILE_REBASE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
 }

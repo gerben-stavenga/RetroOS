@@ -32,6 +32,8 @@ const COW: u32 = 1 << 9;
 /// Physical-device alias temporarily redirected onto an owned shadow page.
 /// The other PTE flags remain unchanged so the mapping can be restored.
 const REDIRECTED_ALIAS: u32 = 1 << 10;
+/// Shared writable RAM: fork retains this mapping instead of making it COW.
+const SHARED: u32 = 1 << 11;
 
 #[inline]
 fn pde_index(vaddr: u32) -> usize {
@@ -468,6 +470,9 @@ pub fn space_map_fresh(vpage: usize, count: usize) {
         for i in 0..count {
             let v = ((vpage + i) * 4096) as u32;
             let frame = phys::alloc_frames(1);
+            if let Some(old) = translate(pd, v) {
+                phys::free_frames(u64::from(old >> 12), 1);
+            }
             map_page(pd, v, frame, true);
         }
     });
@@ -478,6 +483,23 @@ pub fn space_map_phys(vpage: usize, count: usize, ppage: u64, writable: bool) {
     with_active_pd(|pd| {
         for i in 0..count {
             map_page(pd, ((vpage + i) * 4096) as u32, ppage + i as u64, writable);
+        }
+    });
+}
+
+/// Map an externally retained allocation. Each guest alias holds a reference;
+/// the allocation's original reference keeps the kernel view alive after exit.
+pub fn space_map_shared(vpage: usize, count: usize, ppage: u64) {
+    with_active_pd(|pd| {
+        for i in 0..count {
+            let v = ((vpage + i) * 4096) as u32;
+            phys::inc_ref(ppage + i as u64);
+            if let Some(old) = translate(pd, v) {
+                phys::free_frames(u64::from(old >> 12), 1);
+            }
+            map_page(pd, v, ppage + i as u64, true);
+            let pt = u64::from(read_entry(pd, pde_index(v)) >> 12);
+            write_entry(pt, pte_index(v), pte_raw(pd, v) | SHARED);
         }
     });
 }
@@ -506,7 +528,11 @@ pub fn space_set_writable(vpage: usize, count: usize, writable: bool) {
 pub fn space_unmap(vpage: usize, count: usize) {
     with_active_pd(|pd| {
         for i in 0..count {
-            unmap_page(pd, ((vpage + i) * 4096) as u32);
+            let v = ((vpage + i) * 4096) as u32;
+            if let Some(old) = translate(pd, v) {
+                phys::free_frames(u64::from(old >> 12), 1);
+            }
+            unmap_page(pd, v);
         }
     });
 }
@@ -536,7 +562,7 @@ pub fn space_fork(src: u32) -> u32 {
         let src_pt = (pde >> 12) as u64;
         for pte_i in 0..1024usize {
             let pte = read_entry(src_pt, pte_i);
-            if pte & PRESENT == 0 {
+            if pte == 0 {
                 continue;
             }
             let v = ((pde_i << 22) | (pte_i << 12)) as u32;
@@ -546,7 +572,13 @@ pub fn space_fork(src: u32) -> u32 {
                 continue;
             }
             let frame = (pte >> 12) as u64;
-            if pte & WRITABLE != 0 || pte & COW != 0 {
+            if pte & PRESENT == 0 || pte & SHARED != 0 {
+                // Preserve trap markers as well as shared RAM: an inactive
+                // planar VGA must not turn into anonymous RAM after fork.
+                map_page(dst_pd, v, frame, pte & WRITABLE != 0);
+                let pt = u64::from(read_entry(dst_pd, pde_index(v)) >> 12);
+                write_entry(pt, pte_i, pte);
+            } else if pte & WRITABLE != 0 || pte & COW != 0 {
                 // Writable, OR already a COW page from an earlier fork (RO but
                 // privately writable): both sides go RO+COW over the one shared
                 // frame. Marking src is idempotent when it's already COW — the
@@ -558,7 +590,7 @@ pub fn space_fork(src: u32) -> u32 {
                 // Genuinely read-only (code/rodata): share as-is, no COW needed.
                 map_page(dst_pd, v, frame, false);
             }
-            phys::inc_ref(frame);
+            if pte & PRESENT != 0 { phys::inc_ref(frame); }
         }
     }
     dst
@@ -730,6 +762,8 @@ pub fn space_copy_entries(src: usize, dst: usize, count: usize) {
                     let pde = read_entry(pd, pde_index(sv));
                     let pte = read_entry((pde >> 12) as u64, pte_index(sv));
                     map_page(pd, dv, frame, pte & WRITABLE != 0);
+                    let dst_pt = u64::from(read_entry(pd, pde_index(dv)) >> 12);
+                    write_entry(dst_pt, pte_index(dv), pte);
                     phys::inc_ref(frame);
                 }
                 None => unmap_page(pd, dv),
@@ -1016,6 +1050,44 @@ fn translate64(pml4: u64, vaddr: u64) -> Option<u64> {
 #[cfg(test)]
 mod space_ops {
     use super::*;
+
+    #[test]
+    fn shared_kernel_ram_aliases_survive_fork_and_guest_teardown() {
+        space_init();
+        let parent = space_new();
+        space_switch(parent);
+        let backing = phys::alloc_frames(64);
+        space_map_shared(0x41000, 64, backing);
+        space_copy_entries(0x41000, 0xA0, 16);
+        space_map_mmio(0xB0, 8);
+        unsafe { *phys::frame_ptr(backing).add(23) = 0x31; }
+        assert_eq!(space_translate(0xA0017), Some((backing as u32 * 4096) + 23));
+        let child = space_fork(parent);
+        space_switch(child);
+        assert_eq!(pte_raw(active_pd(), 0xB0000), CACHE_DISABLE);
+        assert!(!space_demand(0xB0000), "fork must preserve the planar trap");
+        for addr in [0xA0017, 0x4100_0017, 0x4103_F000] {
+            assert_ne!(pte_raw(active_pd(), addr) & WRITABLE, 0);
+            assert_ne!(pte_raw(active_pd(), addr) & SHARED, 0);
+            assert!(!space_cow_fault(addr));
+        }
+        let guest = space_translate(0xA0017).unwrap();
+        unsafe { *phys::frame_ptr(u64::from(guest >> 12)).add((guest & 4095) as usize) = 0x72; }
+        assert_eq!(unsafe { *phys::frame_ptr(backing).add(23) }, 0x72);
+        // Mode changes replace/unmap direct windows. They must drop their
+        // alias references while retaining the permanent kernel allocation.
+        space_map_fresh(0xA0, 8);
+        space_unmap(0xA8, 8);
+        space_clean();
+        space_switch(parent);
+        assert_eq!(space_translate(0xA0017), Some(guest));
+        space_clean();
+        for page in backing..backing + 64 {
+            assert!(!phys::is_shared(page), "only the kernel reference remains");
+        }
+        assert_eq!(unsafe { *phys::frame_ptr(backing).add(23) }, 0x72);
+        phys::free_frames(backing, 64);
+    }
 
     #[test]
     fn long_twin_mirrors_and_tracks_changes() {

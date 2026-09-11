@@ -192,9 +192,6 @@ impl NativeVga {
     pub fn is_indexed_vbe(&self) -> bool {
         self.0.vbe_mode.is_some() && self.0.vbe_indexed
     }
-    pub(crate) fn physical_vbe_dac_access(&self) -> bool {
-        self.is_indexed_vbe() && self.0.vbe_vga_compatible
-    }
 
     /// Mark the hardware state authoritative again after a complete software
     /// VGA has been restored into the adapter.
@@ -202,6 +199,10 @@ impl NativeVga {
 }
 
 impl VgaCap {
+    pub(crate) fn physical_vbe_dac_access(&self) -> bool {
+        self.vbe_indexed && self.vbe_vga_compatible
+    }
+
     pub(crate) fn mark_legacy(&mut self) {
         self.vbe_mode = None;
         self.vbe_indexed = false;

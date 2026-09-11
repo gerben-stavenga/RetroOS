@@ -335,17 +335,17 @@ impl<A: crate::Arch> DosState<A> {
     }
 
     /// Called by the context-switch code when this thread becomes the running
-    /// DOS thread. Encapsulates any per-resume side effects (right now: point
-    /// LDTR at this thread's LDT). Keeps the LDT layout private to the dos
+    /// DOS thread. Restores its shared VGA store and points LDTR at its LDT.
+    /// Keeps the LDT layout private to the dos
     /// module — external code never touches `self.ldt`.
     pub fn on_resume(&mut self, machine: &mut A) {
+        self.pc.vga.resume_vram(machine);
         machine.load_ldt(&self.ldt[..]);
     }
 
     /// Called when the thread loses focus. Snapshots the VGA framebuffer +
-    /// register set so the screen can be repainted on materialize. With no
-    /// card there is nothing to do: the per-thread register file already IS
-    /// the live state (the emulated port model), and VRAM lives in guest RAM.
+    /// register set so the screen can be repainted on materialize. Emulated
+    /// VRAM is saved by the execution switch, independently of display focus.
     pub(super) fn release_display(
         &mut self,
         machine: &mut A,
@@ -529,15 +529,13 @@ fn linear<A: crate::Arch>(_machine: &mut A, dos: &thread::DosState<A>, regs: &Re
 ///
 /// Lives at the personality root because INT 31h spans both submodules
 /// (RM-side stubs in `dos.rs`, PM-side stubs + DPMI API in `dpmi`).
-#[inline(never)]
-fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
-    if !should_trace() { return; }
+fn interrupt_vector(mode: crate::UserMode, cs: u16, regs: &Regs) -> Option<u32> {
     let ip = if mode == crate::UserMode::VM86 {
         machine::vm86_ip(regs) as u32
     } else {
         regs.ip32()
     };
-    let vector = if mode == crate::UserMode::VM86 {
+    if mode == crate::UserMode::VM86 {
         if cs == dos::STUB_SEG {
             Some(ip.wrapping_sub(2) / 2)
         } else if cs == dos::CTRL_STUB_SEG {
@@ -556,8 +554,25 @@ fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
         }
     } else {
         Some(0x31) // DPMI API
-    };
-    let Some(vector) = vector else { return; };
+    }
+}
+
+pub(in crate::kernel) fn profile_interrupt_key(regs: &Regs, vector: u8) -> u32 {
+    let vector = if vector == 0x31 {
+        let Some(vector) = interrupt_vector(regs.mode(), regs.code_seg(), regs) else {
+            return 0x8000_0000 | regs.ip32();
+        };
+        vector
+    } else { u32::from(vector) };
+    (vector << 16) | if vector == 0x31 { regs.rax as u32 & 0xFFFF }
+        else { (regs.rax as u32 >> 8) & 0xFF }
+}
+
+#[inline(never)]
+fn trace_interrupt(mode: crate::UserMode, cs: u16, regs: &Regs) {
+    if !should_trace() { return; }
+    let Some(vector) = interrupt_vector(mode, cs, regs) else { return; };
+    let ip = if mode == crate::UserMode::VM86 { machine::vm86_ip(regs) as u32 } else { regs.ip32() };
     crate::compact_dbg_println!(
         "[INT {:02X}] AX={:04x} BX={:04x} CX={:04x} DX={:04x} SI={:04x} DI={:04x} DS={:04x} ES={:04x} CS:IP={:04x}:{:08x}",
         vector, regs.rax as u16, regs.rbx as u16, regs.rcx as u16,
@@ -1474,6 +1489,10 @@ pub(in crate::kernel) fn vif_stats<A: crate::Arch>(dos: &DosState<A>) -> Option<
     })
 }
 
+pub(in crate::kernel) fn vif_profile_site<A: crate::Arch>(dos: &DosState<A>) -> Option<u32> {
+    dos.dpmi.as_ref().and_then(|dpmi| dpmi.vif.active_site())
+}
+
 /// Dump the zero-perturbation GUS port-access ring (F12 state key). Pairs with
 /// `dump_if_ring` to diagnose a wedged/storming GUS ISR: shows the exact
 /// register cycle the handler loops on, tagged with `irq=1` for ISR-context.
@@ -1564,7 +1583,7 @@ pub fn surface_buffer<'a, A: crate::Arch>(
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
     let (width, height, format, pixels) = dos.pc.present_scratch2.surface()?;
     if format != output_format { return None; }
-    crate::kernel::gui::PixelBuffer::new_words(width, height, format, pixels).ok()
+    crate::kernel::gui::PixelBuffer::new(width, height, width * usize::from(format.bytes_per_pixel), format, pixels).ok()
 }
 
 /// Capture a packed compositor preview of a detached DOS VGA while its

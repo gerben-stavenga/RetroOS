@@ -1664,11 +1664,11 @@ fn vbe_dac_format(regs: &mut Regs) {
 }
 
 /// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
-/// bytes (Blue, Green, Red, align), 6-bit components. Routed through the DAC
-/// ports so the SVGA renderer (which reads `vga.dac`) sees one palette path.
+/// bytes (Blue, Green, Red, align), 6-bit components. Native modes retain their
+/// shadow in the BIOS workspace; detached modes retain it in VgaState.dac.
 fn vbe_palette<A: crate::Arch>(
     machine: &mut A,
-    _bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
@@ -1682,51 +1682,23 @@ fn vbe_palette<A: crate::Arch>(
     };
     if !indexed { return false; }
     let count = regs.rcx as u16 as usize;
-    let start = regs.rdx as u8;
-    if count > 256 - usize::from(start) { return false; }
+    let start = regs.rdx as u16;
+    if start >= 256 || count > 256 - usize::from(start) { return false; }
     let tbl = es_offset(dos, regs, regs.rdi as u32);
     if let Some(display) = dos.pc.vga.native_mut() {
-        // The guest sees a RetroOS VBE adapter, not the physical ROM's API.
-        // Implement its indexed-palette service directly on the VGA DAC so a
-        // card BIOS that has modes but no 4F09h (notably the Cirrus GD5446
-        // ROM in 86Box) cannot make our advertised service a false success.
         let mut data = alloc::vec![0; count * 4];
-        if !display.physical_vbe_dac_access() {
-            let copy_to_bios = matches!(regs.rbx as u8, 0x00 | 0x80);
-            if !copy_to_bios && regs.rbx as u8 != 0x01 { return false; }
-            if copy_to_bios { machine.copy_from(tbl, &mut data); }
-            let ok = display.cap_mut().bios_palette_call(
-                machine,
-                _bios_display,
-                regs,
-                (!data.is_empty()).then_some(data.as_mut_slice()),
-                copy_to_bios,
-                true,
-            ).is_ok();
-            if ok && !copy_to_bios { machine.copy_to(tbl, &data); }
-            return ok;
-        }
-        match regs.rbx as u8 {
-            0x00 | 0x80 => {
-                machine.copy_from(tbl, &mut data);
-                crate::kernel::drivers::vga_hw::set_vbe_palette(
-                    display.cap(), start, &data,
-                );
-            }
-            0x01 => {
-                crate::kernel::drivers::vga_hw::get_vbe_palette(
-                    display.cap(), start, &mut data,
-                );
-                machine.copy_to(tbl, &data);
-            }
-            _ => return false,
-        }
-        return true;
+        let subfn = regs.rbx as u8;
+        if matches!(subfn, 0 | 0x80) { machine.copy_from(tbl, &mut data); }
+        let ok = display.cap_mut().bios_indexed_palette_call(
+            machine, bios_display, subfn, start, &mut data,
+        ).is_ok();
+        if ok && subfn == 1 { machine.copy_to(tbl, &data); }
+        return ok;
     }
     match regs.rbx as u8 {
         0x00 | 0x80 => {
             // Set (00h) / set-during-retrace (80h): we apply immediately.
-            emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start);
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start as u8);
             for i in 0..count {
                 let e = tbl + i * 4;
                 let (b, g, r): (u8, u8, u8) = (machine.read(e), machine.read(e + 1), machine.read(e + 2));
@@ -1738,7 +1710,7 @@ fn vbe_palette<A: crate::Arch>(
         }
         0x01 => {
             // Get: read the DAC back into the caller's table.
-            emulate_outb(machine, &mut dos.pc, regs, 0x3C7, start);
+            emulate_outb(machine, &mut dos.pc, regs, 0x3C7, start as u8);
             for i in 0..count {
                 let r = emulate_inb(machine, &mut dos.pc, 0x3C9);
                 let g = emulate_inb(machine, &mut dos.pc, 0x3C9);
@@ -1964,9 +1936,15 @@ fn vbe_set_mode<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     if let Some(display) = dos.pc.as_mut().vga.native_mut() {
-        return display.cap_mut()
+        return match display.cap_mut()
             .guest_bios_set_mode_request(machine, bios_display, regs.rbx as u16)
-            .is_ok();
+        {
+            Ok(()) => true,
+            Err(error) => {
+                crate::compact_println!("VBE: mode request {:#x} failed: {:?}", regs.rbx as u16, error);
+                false
+            }
+        };
     }
     if let Some(mode) = bios_display.curated_mode(regs.rbx as u16 & 0x3FFF) {
         let request = regs.rbx as u16;

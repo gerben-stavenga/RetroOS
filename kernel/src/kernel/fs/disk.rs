@@ -31,6 +31,13 @@ impl FilesystemVolume {
         match self.format { Format::Ext4 => "ext4", Format::Fat => "FAT" }
     }
 
+    /// A Unix root exposes its DOS home; a FAT root is the actual C: volume.
+    /// Explicit mappings (including the build toolchain's C: = /) still win.
+    pub fn c_root<'a>(&self, boot: &'a crate::BootConfig) -> &'a [u8] {
+        if boot.c_root_explicit() || self.format == Format::Ext4 { boot.c_root() }
+        else { b"" }
+    }
+
     pub fn open(&self, writable: bool) -> Result<Box<dyn Filesystem>, &'static str> {
         match self.format {
             Format::Ext4 => portable_ext4::PortableExt4Fs::new(self.volume)
@@ -44,12 +51,13 @@ impl FilesystemVolume {
 
     /// Prefer an OS root over an EFI system partition or unrelated data disk.
     /// Preserve the legacy ext4 preference when no candidate has root markers.
-    pub fn root_score(&self, home: &[u8]) -> u8 {
+    pub fn root_score(&self, boot: &crate::BootConfig) -> u8 {
         let Ok(fs) = self.open(false) else { return 0 };
+        let home = self.c_root(boot);
         let home = home.strip_suffix(b"/").unwrap_or(home);
         if has_directory(fs.as_ref(), b"etc") && has_directory(fs.as_ref(), b"usr") {
             3
-        } else if !home.is_empty() && has_directory(fs.as_ref(), home) {
+        } else if has_directory(fs.as_ref(), if home.is_empty() { b"BOOT" } else { home }) {
             2
         } else {
             u8::from(self.format == Format::Ext4)
@@ -80,4 +88,44 @@ fn has_directory(fs: &dyn Filesystem, path: &[u8]) -> bool {
         parent.extend_from_slice(name);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::fat::tests::formatted;
+
+    #[test]
+    fn c_drive_mapping_depends_on_mount_type_not_directory_presence() {
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fat = FilesystemVolume { volume, format: Format::Fat };
+        // The mapping decision does not read the filesystem.
+        let unix = FilesystemVolume { volume, format: Format::Ext4 };
+        let mut boot = crate::BootConfig::empty();
+        assert_eq!(fat.c_root(&boot), b"");
+        assert_eq!(unix.c_root(&boot), b"home/retroos/");
+        boot.set_c_root(b"/home/retroos");
+        assert_eq!(fat.c_root(&boot), b"home/retroos/");
+        boot.set_c_root(b"/");
+        assert_eq!(unix.c_root(&boot), b"");
+    }
+
+    #[test]
+    fn fat_boot_directory_marks_a_dos_root_not_an_efi_partition() {
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fat = FilesystemVolume { volume, format: Format::Fat };
+        let boot = crate::BootConfig::empty();
+        assert_eq!(fat.root_score(&boot), 0);
+        {
+            let fs = fat.open(true).unwrap();
+            assert_eq!(fs.mkdir(b"EFI"), 0);
+        }
+        assert_eq!(fat.root_score(&boot), 0);
+        {
+            let fs = fat.open(true).unwrap();
+            assert_eq!(fs.mkdir(b"BOOT"), 0);
+        }
+        assert_eq!(fat.root_score(&boot), 2);
+        assert_eq!(fat.c_root(&boot), b"");
+    }
 }

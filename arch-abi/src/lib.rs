@@ -101,11 +101,12 @@ pub struct BootConfig {
     cwd: [u8; 256],
     cwd_len: Option<usize>,
     /// VFS subtree that DOS drive `C:` maps to (normalized: no leading `/`, one
-    /// trailing `/`; empty = root). Default `home/retroos/` so DOS gets a tidy
-    /// C: while Linux keeps the real `/`. The in-OS build toolchain sets it to
+    /// trailing `/`; empty = root). Default `home/retroos/` on a Unix root;
+    /// a selected FAT root maps C: to the whole volume. The build toolchain sets it to
     /// `""` (root) so TC's hardcoded `C:\TC` paths still resolve.
     c_root: [u8; 128],
     c_root_len: usize,
+    c_root_explicit: bool,
     /// Debug write-watch addresses (metal QEMU `opt/debug-watch`), if any.
     pub debug_watch: Option<(u32, u32)>,
     /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
@@ -147,7 +148,7 @@ impl BootConfig {
         let mut cfg = BootConfig {
             cmdline: [0; 4096], cmdline_len: None,
             cwd: [0; 256], cwd_len: None,
-            c_root: [0; 128], c_root_len: 0,
+            c_root: [0; 128], c_root_len: 0, c_root_explicit: false,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
             hostfs_port: None,
@@ -200,6 +201,7 @@ impl BootConfig {
     /// Set the DOS C: root (VFS prefix). Normalized: leading `/` stripped, one
     /// trailing `/` added when non-empty; `"/"` or `""` → root.
     pub fn set_c_root(&mut self, s: &[u8]) {
+        self.c_root_explicit = true;
         let mut t = s;
         while t.first() == Some(&b'/') { t = &t[1..]; }
         while t.last() == Some(&b'/') { t = &t[..t.len() - 1]; }
@@ -212,11 +214,25 @@ impl BootConfig {
     }
     /// The DOS C: root as a VFS prefix (e.g. `home/retroos/`, or `` for root).
     pub fn c_root(&self) -> &[u8] { &self.c_root[..self.c_root_len] }
+    /// Whether the owner selected a C: mapping instead of the mount default.
+    pub fn c_root_explicit(&self) -> bool { self.c_root_explicit }
 }
 
 #[cfg(test)]
 mod boot_config_tests {
     use super::{BootConfig, ComPort};
+
+    #[test]
+    fn explicit_c_root_is_distinct_from_the_default_hint() {
+        let mut config = BootConfig::empty();
+        assert!(!config.c_root_explicit());
+        assert_eq!(config.c_root(), b"home/retroos/");
+        config.set_c_root(b"/home/retroos/");
+        assert!(config.c_root_explicit());
+        assert_eq!(config.c_root(), b"home/retroos/");
+        config.set_c_root(b"/");
+        assert!(config.c_root().is_empty());
+    }
 
     #[test]
     fn hostfs_directives_are_case_insensitive_and_last_valid_wins() {

@@ -15,7 +15,7 @@ use crate::Regs;
 use crate::kernel::bios_display::{DosVideo, FullscreenVga};
 use core::sync::atomic::Ordering;
 
-use super::machine::{PcMachine, vga::{SVGA_LFB_BASE, VGA_VRAM_BASE}};
+use super::machine::{PcMachine, vga::SVGA_LFB_BASE};
 use ::vga::VgaState;
 
 static mut LAST_DIAG_MODE: Option<::vga::VgaMode> = None;
@@ -64,9 +64,8 @@ fn mode_name(mode: vga::VgaMode) -> &'static str {
     }
 }
 
-/// Read a guest aperture (untrapped, scattered RAM) into `buf` and return it as
-/// a slice — the one copy linear modes (mode 13h / text) can't avoid, since that
-/// VRAM is guest memory the kernel can't address as a flat region.
+/// Read a scattered guest aperture (SVGA) into `buf` and return it as a slice.
+/// Legacy VGA instead reads the permanent kernel store directly.
 /// Snapshot guest bytes `[lo, hi)` of the `len`-byte aperture at `addr` into
 /// `buf`, which keeps the aperture's FULL length so the renderer's offsets are
 /// the guest's own. Only the requested span is copied — the beam paints a band
@@ -76,7 +75,7 @@ fn mode_name(mode: vga::VgaMode) -> &'static str {
 /// The buffer is resized only when the length changes: `clear()` + `resize()`
 /// would memset every byte immediately before overwriting it.
 fn read_aperture<'a, A: crate::Arch>(
-    machine: &mut A, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize,
+    machine: &A, buf: &'a mut alloc::vec::Vec<u8>, addr: usize, len: usize,
     lo: usize, hi: usize,
 ) -> &'a [u8] {
     if buf.len() != len {
@@ -92,23 +91,23 @@ fn read_aperture<'a, A: crate::Arch>(
 
 /// Build the displayed frame from the live registers + VRAM: resolve the
 /// mode, point at the video memory, and read the display-start / pixel pan /
-/// line-compare that select the visible window. Planar modes render our own
-/// `planes` in place (no copy); linear modes copy the `band` of their guest
-/// aperture the beam is about to paint into `scratch`. `None` for a mode the
-/// renderer doesn't draw.
+/// line-compare that select the visible window. Legacy VGA reads the shared
+/// kernel store directly; text glyphs are compacted into `scratch`. SVGA still
+/// captures the requested band from its scattered guest pages. `None` for a
+/// mode the renderer doesn't draw.
 fn scanout<'a, A: crate::Arch>(
-    state: &'a VgaState, machine: &mut A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
+    state: &'a VgaState, machine: &'a A, _regs: &Regs, scratch: &'a mut alloc::vec::Vec<u8>,
     band: (usize, usize), svga_start: usize,
 ) -> Option<::vga::Frame<'a>>
 {
     use ::vga::{Frame, VgaMode};
-    // VESA SVGA: present the kernel-side linear framebuffer directly. The
-    // guest filled it through the banked 0xA0000 window; `display_tick`
-    // flushes the live window into `svga_fb` just before this call.
+    // SVGA has its own larger, per-address-space backing. Banked apertures and
+    // LFB mappings alias those pages; capture the requested scanline band.
     if state.svga_w != 0 {
         let pitch = state.svga_pitch as usize;
         let size = pitch * state.svga_h as usize;
         return Some(Frame {
+            plane_layout: state.layout(),
             mode: VgaMode::LinearSvga {
                 w: state.svga_w, h: state.svga_h, bpp: state.svga_bpp, pitch: pitch as u16,
             },
@@ -130,24 +129,10 @@ fn scanout<'a, A: crate::Arch>(
         });
     }
     let mode = state.classify_mode()?;
-    let (w, h) = ::vga::dimensions(mode);
-    // Mode 13h's rows are linear but not contiguous: a panned display-start
-    // (screen-shake) slides the origin forward, and below Line Compare the
-    // latch resets to 0 — so walk the band's rows the way `row_origin`
-    // does and take the span they cover. The buffer stays a full 64 KB
-    // window, only the copy shrinks.
-    let m13_span = || {
-        let start = (((state.crtc[0x0C] as usize) << 8) | state.crtc[0x0D] as usize) * 4;
-        let pan = (state.ac[0x13] & 0x07) as usize;
-        let lc = state.line_compare(h);
-        let (mut lo, mut hi) = (usize::MAX, 0usize);
-        for r in band.0..band.0 + band.1 {
-            let base = if r >= lc { (r - lc) * w } else { start + r * w + pan };
-            lo = lo.min(base);
-            hi = hi.max(base + w);
-        }
-        if lo > hi { (0, 0) } else { (lo, hi) }
-    };
+    let (_, h) = ::vga::dimensions(mode);
+    // The shared borrow prevents guest execution/owner switches until the
+    // returned frame is consumed. No IRQ handler accesses this store.
+    let live = super::machine::vga::live_planes(machine);
     let fallback_font: &[u8] = match mode {
         VgaMode::Text { cell_h: 8, .. } => &lib::vga_fonts::FONT_8X8,
         VgaMode::Text { cell_h: 14, .. } => &lib::vga_fonts::FONT_8X14,
@@ -155,18 +140,10 @@ fn scanout<'a, A: crate::Arch>(
     };
     let (vram, planes, font, font_b): (&[u8], &[u8], &[u8], &[u8]) = match mode {
         VgaMode::Planar16 { .. } | VgaMode::ModeX { .. } => {
-            read_aperture(machine, scratch, VGA_VRAM_BASE, 4 * 0x10000, 0, 4 * 0x10000);
-            if state.layout() != ::vga::VramLayout::PlaneMinor {
-                ::vga::VramTransition::between(
-                    state.layout(),
-                    ::vga::VramLayout::PlaneMinor,
-                ).apply(scratch);
-            }
-            (&[], scratch.as_slice(), fallback_font, fallback_font)
+            (&[], live, fallback_font, fallback_font)
         }
         VgaMode::Mode13h => {
-            let (lo, hi) = m13_span();
-            (read_aperture(machine, scratch, 0xA0000, 0x10000, lo, hi), &[], fallback_font, fallback_font)
+            (&live[..0x10000], &[], fallback_font, fallback_font)
         }
         VgaMode::Text { cols, rows, cell_h, .. } => {
             // Text cells live at B8000, but their glyphs are programmable VGA
@@ -191,14 +168,11 @@ fn scanout<'a, A: crate::Arch>(
                 // characters in plane 0, attributes in plane 1, both at even
                 // CRTC word offsets.
                 for cell in 0..text_len / 2 {
-                    scratch[cell * 2] = machine.read(
-                        VGA_VRAM_BASE + state.layout().index(0, cell),
-                    );
-                    scratch[cell * 2 + 1] =
-                        machine.read(VGA_VRAM_BASE + state.layout().index(1, cell));
+                    scratch[cell * 2] = live[state.layout().index(0, cell)];
+                    scratch[cell * 2 + 1] = live[state.layout().index(1, cell)];
                 }
             } else {
-                machine.copy_from(0xB8000, &mut scratch[..text_len]);
+                scratch[..text_len].copy_from_slice(&live[..text_len]);
             }
             // Sequencer Character Map Select: B uses bits 1:0 plus bit 4;
             // A uses bits 3:2 plus bit 5. The encoded selector is reordered
@@ -208,9 +182,7 @@ fn scanout<'a, A: crate::Arch>(
                 | (state.seq[3] >> 5) & 1);
             for (map, dst_base) in [(map_a, text_len), (map_b, text_len + VGA_MAP_LEN)] {
                 for n in 0..VGA_MAP_LEN {
-                    scratch[dst_base + n] = machine.read(
-                        VGA_VRAM_BASE + state.layout().index(2, map * 0x2000 + n),
-                    );
+                    scratch[dst_base + n] = live[state.layout().index(2, map * 0x2000 + n)];
                 }
                 // VGA reserves 32 bytes per glyph. Compact the selected map
                 // in place for the renderer; walking forward is safe because
@@ -241,13 +213,11 @@ fn scanout<'a, A: crate::Arch>(
                         // Mode 6 is sequential plane 0 (SEQ map mask = 1).
                         (0, address)
                     };
-                    *byte = machine.read(
-                        VGA_VRAM_BASE + layout.index(plane, offset),
-                    );
+                    *byte = live[layout.index(plane, offset)];
                 }
                 (scratch.as_slice(), &[], fallback_font, fallback_font)
             } else {
-                (read_aperture(machine, scratch, 0xB8000, 0x4000, 0, 0x4000), &[], fallback_font, fallback_font)
+                (&live[..0x4000], &[], fallback_font, fallback_font)
             }
         }
         VgaMode::LinearSvga { .. } => (&[], &[], fallback_font, fallback_font), // handled by the short-circuit above
@@ -270,6 +240,7 @@ fn scanout<'a, A: crate::Arch>(
         _ => [0; 4],
     };
     Some(Frame {
+        plane_layout: state.layout(),
         mode,
         vram,
         planes,
@@ -631,6 +602,7 @@ pub fn display_tick<A: crate::Arch>(
             crate::kernel::display::ScanoutAction::None => {}
             crate::kernel::display::ScanoutAction::Render => {
                 let full = (0, ::vga::dimensions(mode).1);
+                let capture_sample = crate::kernel::osd_profile::Sample::start(machine);
                 // The source aperture, registers and DAC are captured once for
                 // the whole shadow; no palette generation can split the image.
                 let Some(frame) =
@@ -638,9 +610,13 @@ pub fn display_tick<A: crate::Arch>(
                 else {
                     return;
                 };
+                let (width, height) = ::vga::dimensions(frame.mode);
+                capture_sample.finish(machine, crate::kernel::osd_profile::Stage::Capture, width * height);
+                let raster_sample = crate::kernel::osd_profile::Sample::start(machine);
                 let rendered = crate::kernel::display::render_shadow(
                     &mut pc.present_scratch2, display.rgb, &frame,
                 );
+                raster_sample.finish(machine, crate::kernel::osd_profile::Stage::Raster, width * height);
                 if rendered
                     && let Some((desktop, endpoint)) = presentation.as_mut()
                 {
@@ -663,7 +639,7 @@ pub fn display_tick<A: crate::Arch>(
                 // exists only to transfer direct-scanout shadows.
                 if presentation.is_none() {
                     let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-                    display.present_native(
+                    display.present_packed(
                         machine,
                         &mut *bios,
                         ::vga::dimensions(mode).0,
@@ -697,7 +673,7 @@ pub fn display_tick<A: crate::Arch>(
         publish_vga_surface(w, h, desktop, endpoint);
     } else {
         let pixels = crate::kernel::display::take_shadow(&mut pc.present_scratch2);
-        display.present_native(machine, bios, w, h, &pixels);
+        display.present_packed(machine, bios, w, h, &pixels);
         crate::kernel::display::recycle_shadow(&mut pc.present_scratch2, pixels);
     }
 }

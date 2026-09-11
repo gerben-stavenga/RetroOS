@@ -111,6 +111,13 @@ pub fn arch_map_low_mem() {
 }
 
 /// Map this process's VGA color-text aperture onto the shared text screen.
+pub fn arch_map_shared_pages(vpage: usize, kernel_base: usize, count: usize) {
+    unsafe {
+        core::arch::asm!("int 0x80", in("eax") crate::arch_call::MAP_SHARED_PAGES as u32,
+            in("edx") vpage, in("ecx") kernel_base, in("ebx") count);
+    }
+}
+
 pub fn arch_map_vga_text_aperture() {
     unsafe {
         core::arch::asm!(

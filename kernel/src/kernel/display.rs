@@ -54,11 +54,11 @@ pub struct Framebuffer {
     pub wide: bool,
 }
 
-/// Dense unscaled pixels plus the reusable row used to pack one output scanline.
-pub(crate) struct NativeSource<'a> {
+/// Dense packed pixels plus the reusable row for optional horizontal scaling.
+pub(crate) struct PackedSource<'a> {
     pub width: usize,
     pub height: usize,
-    pub pixels: &'a [u32],
+    pub pixels: &'a [u8],
     pub row: &'a mut alloc::vec::Vec<u8>,
 }
 
@@ -70,7 +70,7 @@ pub struct Display {
     programmable_ramp: bool,
     voodoo_ramp_generation: Option<u64>,
     /// Physical-format staging used only within native-surface presentation.
-    /// Retained producers always keep their unscaled `u32` content.
+    /// Retained producers keep their unscaled packed content.
     present_pixels: alloc::vec::Vec<u8>,
     backend: Backend,
 }
@@ -487,36 +487,41 @@ impl Display {
             fit_vga(fb.width, fb.height)
         }
     }
-    /// The compositor works in the producer's natural coordinates. Physical
-    /// scaling and packing happen only at presentation.
+    /// The desktop canvas covers the selected physical mode, independently
+    /// of window geometry. Hosted/headless sinks have no selected mode and
+    /// retain their content-sized canvas.
     pub fn composition_size(
         &self,
         natural_width: usize,
         natural_height: usize,
     ) -> (usize, usize) {
-        (natural_width, natural_height)
+        if let Backend::Vga { scanout: VgaScanout::VbeBanked { mode, .. }, .. } = &self.backend {
+            return (usize::from(mode.width), usize::from(mode.height));
+        }
+        self.framebuffer().map_or((natural_width, natural_height), |fb| (fb.width, fb.height))
     }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
 
-    /// Fill the display's fitted rectangle from one dense native word image.
-    /// Each `u32` already contains this display's encoded pixel bits.
-    /// Horizontal packing/enlargement happens here, after the producer has
-    /// completed its unscaled `width * height` words. At most one packed row
+    /// Present a mode-sized desktop 1:1, or fit a standalone VGA image to 4:3.
+    /// Pixels already have this display's encoding and byte layout.
+    /// Only scaling, when required, happens here. At most one packed row
     /// is staged; there is no scaled retained frame.
-    pub fn present_native<A: crate::Arch>(
+    pub fn present_packed<A: crate::Arch>(
         &mut self,
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         width: usize,
         height: usize,
-        pixels: &[u32],
+        pixels: &[u8],
     ) -> usize {
-        let Some(words) = width.checked_mul(height) else { return 0 };
-        if width == 0 || height == 0 || pixels.len() < words {
+        let Some(bytes) = width.checked_mul(height)
+            .and_then(|n| n.checked_mul(usize::from(self.rgb.bytes_per_pixel))) else { return 0 };
+        if width == 0 || height == 0 || pixels.len() < bytes {
             return 0;
         }
         let format = self.rgb;
-        let (out_w, out_h) = self.fit();
+        let canvas = self.composition_size(width, height);
+        let output = if (width, height) == canvas { canvas } else { self.fit() };
         let scratch = &mut self.present_pixels;
         match &mut self.backend {
             Backend::Linear(framebuffer)
@@ -524,22 +529,19 @@ impl Display {
                 scanout: VgaScanout::Mode13 { framebuffer, .. }
                     | VgaScanout::VbeLinear { framebuffer, .. },
                 ..
-            } => blit_native(
-                framebuffer, format, out_w, out_h,
-                NativeSource { width, height, pixels, row: scratch },
+            } => blit_packed(
+                framebuffer, format, output,
+                PackedSource { width, height, pixels, row: scratch },
             ),
             Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
-            } => native.bios_present_native(
+            } => native.bios_present_packed(
                 machine, bios, *mode, current_bank,
-                NativeSource { width, height, pixels, row: scratch },
+                PackedSource { width, height, pixels, row: scratch },
             ).unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
             Backend::Host => {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), words * 4)
-                };
-                present_host_shadow(width, height, PixelFormat::NATIVE, bytes)
+                present_host_shadow(width, height, format, pixels)
             }
             Backend::Headless => 0,
         }
@@ -636,16 +638,16 @@ impl Display {
         self.present_linear(height, shadow).unwrap_or(0)
     }
 
-    pub fn panic_present_native(&mut self, width: usize, height: usize, pixels: &[u32]) -> usize {
+    pub fn panic_present_packed(&mut self, width: usize, height: usize, pixels: &[u8]) -> usize {
         let format = self.rgb;
-        let (out_w, out_h) = self.fit();
+        let canvas = self.composition_size(width, height);
+        let output = if (width, height) == canvas { canvas } else { self.fit() };
         let Backend::Linear(framebuffer) = &mut self.backend else { return 0 };
-        let copied = blit_native(
+        let copied = blit_packed(
             framebuffer,
             format,
-            out_w,
-            out_h,
-            NativeSource { width, height, pixels, row: &mut self.present_pixels },
+            output,
+            PackedSource { width, height, pixels, row: &mut self.present_pixels },
         );
         finish_present();
         copied
@@ -668,8 +670,8 @@ pub fn finish_present() {
     (unsafe { PRESENT_HOOK })();
 }
 
-/// Copy one packed framebuffer row. Bulk traffic still moves in dwords; a
-/// 16/24-bit row merely has a short 0..3-byte tail.
+/// Copy a packed framebuffer span. Bulk traffic moves in dwords; a
+/// 16/24-bit row or bank boundary merely has a short 0..3-byte tail.
 ///
 /// `wide` selects 16-byte non-temporal stores (real hardware: ERMS fast
 /// strings never engage on the WC framebuffer, so rep movsd issues one
@@ -677,9 +679,13 @@ pub fn finish_present() {
 /// TCG (`fb.slow`) rep movsd IS the fast path — one helper call — so the
 /// caller keeps `wide` off there. This deliberately does not fence each row:
 /// the caller's single end-of-frame [`present`] drains the whole blit.
+///
+/// # Safety
+/// Both pointers must be valid for `len` bytes and must not overlap. The
+/// destination must support dword stores (and SSE stores when `wide` is set).
 #[inline]
 #[optimize(speed)]
-unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
+pub(crate) unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
     let mut d = dst;
     let mut s = src;
     let mut left = len;
@@ -726,56 +732,57 @@ unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize, wide: bool) {
     }
 }
 
-/// Stretch one row of already-encoded `u32` pixels into a packed destination
-/// row. The destination drives the walk: every output pixel performs exactly
-/// one cached source-word load and one overlapping dword store.
+/// Scale already-encoded packed pixels, without colour conversion. Equal
+/// widths are a row copy. RGB888 uses overlapping dwords only where both
+/// slices have room; the last pixel is always bounded to three bytes.
 #[optimize(speed)]
-pub(crate) fn stretch_native_row(
-    source: &[u32],
-    destination: &mut [u8],
-    out_w: usize,
-    pixel_bytes: usize,
+pub(crate) fn stretch_packed_row(
+    source: &[u8], destination: &mut [u8], out_w: usize, step: usize,
 ) -> bool {
-    if source.is_empty() || out_w == 0 || !(1..=4).contains(&pixel_bytes) {
+    if !(1..=4).contains(&step) || source.is_empty() || !source.len().is_multiple_of(step) || out_w == 0 {
         return false;
     }
-    let row_bytes = match out_w.checked_mul(pixel_bytes) {
-        Some(bytes) => bytes,
-        None => return false,
-    };
-    if destination.len() < row_bytes + 4 {
-        return false;
+    let Some(row_bytes) = out_w.checked_mul(step) else { return false };
+    if destination.len() < row_bytes { return false; }
+    let destination = &mut destination[..row_bytes];
+    if source.len() == row_bytes {
+        destination.copy_from_slice(source);
+        return true;
     }
-
-    let source_w = source.len();
-    let (whole, remainder) = (source_w / out_w, source_w % out_w);
-    let mut sx = 0usize;
-    let mut error = 0usize;
-    let mut destination_offset = 0usize;
-    for _ in 0..out_w {
-        unsafe {
-            core::ptr::write_unaligned(
-                destination.as_mut_ptr().add(destination_offset).cast::<u32>(),
-                *source.get_unchecked(sx),
-            );
-        }
-        destination_offset += pixel_bytes;
-        sx += whole;
-        error += remainder;
-        let mut carry_mask = usize::from(error >= out_w).wrapping_neg();
-        // Keep the 0/-1 mask materialized: with opt-level=z LLVM otherwise
-        // turns the correction below into a conditional jump in the hot loop.
-        unsafe {
-            core::arch::asm!(
-                "/* {carry_mask} */",
-                carry_mask = inout(reg) carry_mask,
-                options(nomem, nostack, preserves_flags),
-            );
-        }
-        error -= carry_mask & out_w;
-        sx = sx.wrapping_sub(carry_mask);
+    match step {
+        1 => scale_packed_row::<1>(source, destination),
+        2 => scale_packed_row::<2>(source, destination),
+        3 => scale_packed_row::<3>(source, destination),
+        4 => scale_packed_row::<4>(source, destination),
+        _ => unreachable!(),
     }
     true
+}
+
+#[optimize(speed)]
+fn scale_packed_row<const STEP: usize>(source: &[u8], destination: &mut [u8]) {
+    let source_w = source.len() / STEP;
+    let out_w = destination.len() / STEP;
+    let (whole, remainder) = (source_w / out_w, source_w % out_w);
+    let mut sx = 0;
+    let mut error = 0;
+    for dx in 0..out_w {
+        let from = sx * STEP;
+        let to = dx * STEP;
+        if STEP == 3 && from + 4 <= source.len() && to + 4 <= destination.len() {
+            unsafe {
+                let pixel = source.as_ptr().add(from).cast::<u32>().read_unaligned();
+                destination.as_mut_ptr().add(to).cast::<u32>().write_unaligned(pixel);
+            }
+        } else {
+            destination[to..to + STEP].copy_from_slice(&source[from..from + STEP]);
+        }
+        sx += whole;
+        error += remainder;
+        let carry = usize::from(error >= out_w);
+        error -= carry * out_w;
+        sx += carry;
+    }
 }
 /// Publish a completed horizontally-stretched VGA shadow. The shadow holds the
 /// PICTURE only — `out_w × vga_height` — so this is pure vertical expansion:
@@ -820,40 +827,44 @@ fn blit(
     out_w * out_h
 }
 
-/// Fill a centered physical rectangle from a dense source-sized word image.
+/// Fill a centered physical rectangle from a dense source-sized packed image.
 /// Only one packed destination row is staged; it is stretched once and reused
 /// for every vertical repetition of that source row.
 #[optimize(speed)]
-fn blit_native(
+fn blit_packed(
     fb: &Framebuffer,
     format: PixelFormat,
-    out_w: usize,
-    out_h: usize,
-    source: NativeSource<'_>,
+    output: (usize, usize),
+    source: PackedSource<'_>,
 ) -> usize {
-    let NativeSource { width: source_w, height: source_h, pixels: source, row } = source;
+    let PackedSource { width: source_w, height: source_h, pixels: source, row } = source;
+    let (out_w, out_h) = output;
     let step = usize::from(format.bytes_per_pixel);
     let Some(source_words) = source_w.checked_mul(source_h) else { return 0 };
     let Some(row_bytes) = out_w.checked_mul(step) else { return 0 };
-    if source_w == 0 || source_h == 0 || source.len() < source_words {
+    if source_w == 0 || source_h == 0 || source.len() < source_words.saturating_mul(step) {
         return 0;
     }
-    row.resize(row_bytes.saturating_add(4), 0);
+    if source_w != out_w { row.resize(row_bytes, 0); }
     let bx = (fb.width - out_w) / 2;
     let by = (fb.height - out_h) / 2;
     let (ybase, yrem) = (out_h / source_h, out_h % source_h);
     let origin = fb.va + by * fb.pitch + bx * step;
+    if source_w == out_w && source_h == out_h && row_bytes == fb.pitch {
+        // A dense mode-sized canvas is already the framebuffer's byte layout.
+        unsafe { copy_bytes(origin as *mut u8, source.as_ptr(), row_bytes * out_h, fb.wide); }
+        return out_w * out_h;
+    }
     let mut oy = 0usize;
     let mut yerr = 0usize;
     for sy in 0..source_h {
-        if !stretch_native_row(
-            &source[sy * source_w..(sy + 1) * source_w],
-            row,
-            out_w,
-            step,
-        ) {
-            return 0;
-        }
+        let src = &source[sy * source_w * step..(sy + 1) * source_w * step];
+        let src = if source_w == out_w {
+            src
+        } else {
+            if !stretch_packed_row(src, row, out_w, step) { return 0; }
+            &row[..row_bytes]
+        };
         yerr += yrem;
         let carry = usize::from(yerr >= source_h);
         let rows = ybase + carry;
@@ -862,7 +873,7 @@ fn blit_native(
             unsafe {
                 copy_bytes(
                     (origin + oy * fb.pitch) as *mut u8,
-                    row.as_ptr(),
+                    src.as_ptr(),
                     row_bytes,
                     fb.wide,
                 );
@@ -928,6 +939,18 @@ fn blit_regions(
     copied
 }
 
+/// A desktop matching the physical mode must not be aspect-fitted. Smaller
+/// standalone VGA images retain the fullscreen 4:3 presentation policy.
+pub(crate) fn native_output_size(
+    panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
+) -> (usize, usize) {
+    if (source_w, source_h) == (panel_w, panel_h) {
+        (panel_w, panel_h)
+    } else {
+        fit_vga(panel_w, panel_h)
+    }
+}
+
 /// Largest centered 4:3 VGA picture that fits a physical framebuffer.
 pub fn fit_vga(width: usize, height: usize) -> (usize, usize) {
     if width * 3 >= height * 4 {
@@ -964,7 +987,17 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
     let step = rgb.bytes_per_pixel as usize;
     let Some(bytes) = w.checked_mul(h).and_then(|n| n.checked_mul(step)) else { return 0 };
     if shadow.len() < bytes { return 0; }
-    let mut pixels = alloc::vec::Vec::with_capacity(w * h);
+    let mut pixels = alloc::vec::Vec::<u32>::with_capacity(w * h);
+    if rgb == PixelFormat::NATIVE {
+        // The host sink accepts XRGB8888 words, exactly these packed bytes.
+        // Copy into aligned storage without decoding/re-encoding channels.
+        unsafe {
+            core::ptr::copy_nonoverlapping(shadow.as_ptr(), pixels.as_mut_ptr().cast::<u8>(), bytes);
+            pixels.set_len(w * h);
+        }
+        present_host(w, h, &mut pixels);
+        return w * h;
+    }
     for p in shadow[..bytes].chunks_exact(step) {
         let raw = match step {
             1 => u32::from(p[0]),
@@ -986,14 +1019,14 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
     w * h
 }
 
-/// Direct-framebuffer scanout state: a palette, one native-size `u32` frame,
+/// Direct-framebuffer scanout state: a palette, one native-size packed frame,
 /// and the render/publish clock.
 pub struct Scratch {
     pal: vga::Pal,
     pal_cache: [u8; 768],
-    /// Dense native VGA image: exactly `w * h` words, with no presentation
-    /// pitch or scaling.
-    surface: alloc::vec::Vec<u32>,
+    /// Dense native VGA image plus three backing bytes for overlapping dword
+    /// stores. Surface views exclude the tail; no presentation pitch or scaling.
+    surface: alloc::vec::Vec<u8>,
     /// Geometry the scanout is armed for
     /// `(w, h, out_w, out_h, panel_w, panel_h)`; any change
     /// discards a pending shadow and starts a fresh render.
@@ -1061,11 +1094,12 @@ impl Scratch {
         }
     }
 
-    /// Immutable view of one display-encoded word per VGA pixel.
-    pub fn surface(&self) -> Option<(usize, usize, PixelFormat, &[u32])> {
+    /// Immutable view of tightly packed display-format VGA pixels.
+    pub fn surface(&self) -> Option<(usize, usize, PixelFormat, &[u8])> {
         let width = self.geo.0;
         let height = self.geo.1;
-        let words = self.surface.get(..width.checked_mul(height)?)?;
+        let words = self.surface.get(..width.checked_mul(height)?
+            .checked_mul(usize::from(self.pal.fmt.bytes_per_pixel))?)?;
         Some((width, height, self.pal.fmt, words))
     }
 
@@ -1200,8 +1234,8 @@ pub fn scanout_action(
     let (_, phase) = beam_time(now_ns, refresh_hz);
     let (frame, _) = beam_time(now_ns, raster_hz);
     // Direct scanout chooses the fitted physical picture. A compositor asks
-    // for the guest's natural dimensions, which makes the very same stretched
-    // row rasterizer run at a horizontal ratio of exactly one.
+    // for the guest's natural dimensions. Neither changes the raster storage:
+    // decoding always produces packed source-sized pixels; the sink scales.
     let (out_w, out_h) = raster_size.unwrap_or_else(|| display.fit());
     // A sink SMALLER than the guest image is legal: the Bresenham walk in
     // `StretchRow` shrinks as readily as it stretches, and `present` drops
@@ -1216,13 +1250,13 @@ pub fn scanout_action(
     let geo = (w, h, out_w, out_h, out_w, out_h);
     let reset = s.geo != geo
         || s.mode != Some(mode)
-        || s.surface.len() != w * h
+        || s.surface.len() != w * h * usize::from(display.rgb.bytes_per_pixel) + vga::PACKED_ROW_PADDING
         || s.refresh_hz != refresh_hz
         || s.raster_hz != raster_hz;
     if reset {
         s.geo = geo;
         s.surface.clear();
-        s.surface.resize(w * h, 0);
+        s.surface.resize(w * h * usize::from(display.rgb.bytes_per_pixel) + vga::PACKED_ROW_PADDING, 0);
         s.mode = Some(mode);
         s.refresh_hz = refresh_hz;
         s.raster_hz = raster_hz;
@@ -1247,7 +1281,8 @@ pub fn scanout_action(
         s.ready = false;
         let h = s.geo.1;
         let out_w = s.geo.2;
-        if s.surface.get(..s.geo.0.saturating_mul(h)).is_none() {
+        if s.surface.get(..s.geo.0.saturating_mul(h)
+            .saturating_mul(usize::from(s.pal.fmt.bytes_per_pixel))).is_none() {
             return ScanoutAction::None;
         }
         ScanoutAction::Publish {
@@ -1265,11 +1300,11 @@ pub fn scanout_action(
 
 /// Transfer a completed packed shadow to its sink. The sink returns its prior
 /// front-buffer storage with [`recycle_shadow`], forming a copy-free swapchain.
-pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u32> {
+pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u8> {
     core::mem::take(&mut s.surface)
 }
 
-pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u32>) {
+pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u8>) {
     s.surface = pixels;
 }
 
@@ -1288,7 +1323,7 @@ fn raster_shadow(
     if s.mode != Some(frame.mode)
         || s.geo.0 != w
         || s.geo.1 != h
-        || s.surface.len() < w * h
+        || s.surface.len() < w * h * usize::from(format.bytes_per_pixel) + vga::PACKED_ROW_PADDING
     {
         return false;
     }
@@ -1297,11 +1332,12 @@ fn raster_shadow(
         s.pal.sync_planar(frame.ac);
     }
     for sy in 0..h {
-        vga::render_row(
+        vga::render_row_packed(
             frame,
             sy,
             &s.pal,
-            &mut s.surface[sy * w..(sy + 1) * w],
+            &mut s.surface[sy * w * usize::from(format.bytes_per_pixel)
+                ..(sy + 1) * w * usize::from(format.bytes_per_pixel) + vga::PACKED_ROW_PADDING],
         );
     }
     true
@@ -1325,7 +1361,9 @@ pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) ->
     if w == 0 || h == 0 {
         return false;
     }
-    let Some(storage) = w.checked_mul(h) else { return false };
+    let Some(storage) = w.checked_mul(h)
+        .and_then(|n| n.checked_mul(usize::from(format.bytes_per_pixel)))
+        .and_then(|n| n.checked_add(vga::PACKED_ROW_PADDING)) else { return false };
     if s.surface.len() != storage {
         s.surface.clear();
         s.surface.resize(storage, 0);
@@ -1342,12 +1380,13 @@ pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) ->
 pub fn shadow_sample(s: &Scratch) -> (usize, u32) {
     let len = s.geo.0
         .saturating_mul(s.geo.1)
+        .saturating_mul(usize::from(s.pal.fmt.bytes_per_pixel))
         .min(s.surface.len());
     let mut nonzero = 0usize;
     let mut hash = 0x811C9DC5u32;
     for &pixel in s.surface[..len].iter().step_by(16) {
         nonzero += usize::from(pixel != 0);
-        hash = (hash ^ pixel).wrapping_mul(0x01000193);
+        hash = (hash ^ u32::from(pixel)).wrapping_mul(0x01000193);
     }
     (nonzero, hash)
 }
@@ -1365,6 +1404,79 @@ pub fn dac_for(fmt: PixelFormat) -> voodoo::Dac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_canvas_uses_mode_dimensions_not_window_extents() {
+        for (width, height) in [(800, 600), (1280, 720), (320, 200)] {
+            let display = Display::from_framebuffer(Framebuffer {
+                va: 0, pitch: width * 2, width, height, slow: false, wide: false,
+            }, PixelFormat::RGB565);
+            for extent in [(0, 0), (320, 200), (720, 400), (1920, 1080)] {
+                assert_eq!(display.composition_size(extent.0, extent.1), (width, height));
+            }
+            assert_eq!(native_output_size(width, height, width, height), (width, height));
+        }
+        // A standalone fullscreen VGA image still uses aspect-fitted output.
+        assert_eq!(native_output_size(1280, 720, 320, 200), (960, 720));
+        // A hosted sink has no hardware mode to impose on its window.
+        assert_eq!(Display::host().composition_size(720, 400), (720, 400));
+    }
+
+    #[test]
+    fn mode_sized_packed_canvas_is_presented_one_to_one() {
+        for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
+            PixelFormat::RGB888, PixelFormat::NATIVE]
+        {
+            let step = usize::from(format.bytes_per_pixel);
+            for width in [1, 7, 8] {
+                let height = 3;
+                for padding in [0, 4] {
+                    let pitch = width * step + padding;
+                    let mut output = alloc::vec![0xAAu8; pitch * height + 2];
+                    let framebuffer = Framebuffer {
+                        va: output.as_mut_ptr() as usize + 1, pitch, width, height,
+                        slow: false, wide: false,
+                    };
+                    let pixels: alloc::vec::Vec<u8> = (0..width * height * step)
+                        .map(|i| (i * 19 + 7) as u8).collect();
+                    let mut row = alloc::vec::Vec::new();
+                    assert_eq!(blit_packed(&framebuffer, format,
+                        native_output_size(width, height, width, height),
+                        PackedSource { width, height, pixels: &pixels, row: &mut row }), width * height);
+                    assert!(row.is_empty(), "unscaled presentation must not allocate a staging row");
+                    for y in 0..height {
+                        assert_eq!(&output[1 + y * pitch..1 + y * pitch + width * step],
+                            &pixels[y * width * step..(y + 1) * width * step]);
+                        assert!(output[1 + y * pitch + width * step..1 + (y + 1) * pitch]
+                            .iter().all(|&byte| byte == 0xAA));
+                    }
+                    assert_eq!(output[0], 0xAA);
+                    assert_eq!(output[1 + pitch * height], 0xAA);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_scaling_and_copy_preserve_pixels_and_row_boundaries() {
+        for step in 1..=4 {
+            for width in 1..=9 {
+                let source: alloc::vec::Vec<u8> = (0..width * step)
+                    .map(|i| (i * 17 + 3) as u8).collect();
+                for out_w in 1..=12 {
+                    let mut output = alloc::vec![0xEE; out_w * step + 2];
+                    assert!(stretch_packed_row(&source, &mut output[1..1 + out_w * step], out_w, step));
+                    for x in 0..out_w {
+                        let sx = x * width / out_w;
+                        assert_eq!(&output[1 + x * step..1 + (x + 1) * step],
+                            &source[sx * step..(sx + 1) * step]);
+                    }
+                    assert_eq!(output[0], 0xEE);
+                    assert_eq!(output[out_w * step + 1], 0xEE);
+                }
+            }
+        }
+    }
 
     #[test]
     fn raster_rate_does_not_change_guest_beam_rate() {
@@ -1399,9 +1511,9 @@ mod tests {
 
     #[test]
     fn native_row_scaler_writes_one_fractionally_selected_pixel_per_output() {
-        let source = [0x1111u32, 0x2222, 0x3333];
+        let source = [0x11u8, 0x11, 0x22, 0x22, 0x33, 0x33];
         let mut destination = [0u8; 14];
-        assert!(stretch_native_row(&source, &mut destination, 5, 2));
+        assert!(stretch_packed_row(&source, &mut destination, 5, 2));
         let words: alloc::vec::Vec<u16> = destination[..10]
             .chunks_exact(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))

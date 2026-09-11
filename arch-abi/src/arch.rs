@@ -308,6 +308,21 @@ pub trait Arch: Sized + GuestBytes {
     /// On VGA-text hardware this is implicit (the aperture already is shared
     /// RAM); this is the GOP/emulated stand-in.
     fn map_vga_text_aperture(&mut self);
+    /// Allocate zeroed, page-aligned RAM with a stable kernel view. Ownership
+    /// passes to the caller; guest aliases do not own the allocation.
+    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8>;
+    /// Release a shared allocation after removing all guest aliases.
+    ///
+    /// # Safety
+    /// `base` and `count` must describe an allocation from `alloc_shared_pages`;
+    /// no guest mappings or kernel references may remain.
+    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize);
+    /// Alias kernel-owned RAM into the active guest, shared across fork.
+    ///
+    /// # Safety
+    /// The range must belong to a live `alloc_shared_pages` allocation, which
+    /// must outlive every alias. Kernel access must be serialized with guests.
+    unsafe fn map_shared_pages(&mut self, vpage: usize, base: core::ptr::NonNull<u8>, count: usize);
     /// Load the LDT (write base+limit into the GDT slot and `LLDT`).
     fn load_ldt(&mut self, ldt: &[u64]);
     /// Notify the backend that the active thread's LDT descriptors changed

@@ -37,3 +37,29 @@ fn demand_isolation_and_unmap() {
     arch::arch_unmap_range(HI / 4096, 1);
     assert_eq!(arch::mem().read::<u32>(HI), 0, "unmapped page reads back zero");
 }
+
+#[test]
+fn kernel_owned_shared_pages_are_coherent_across_guest_fork() {
+    arch::init_guest_ram(0);
+    let mut machine = arch::Interp;
+    let memory = machine.alloc_shared_pages(3);
+    assert_eq!(memory.as_ptr() as usize % 4096, 0);
+    unsafe {
+        assert!(core::slice::from_raw_parts(memory.as_ptr(), 3 * 4096).iter().all(|&b| b == 0));
+        machine.map_shared_pages(HI >> 12, memory, 3);
+        *memory.as_ptr().add(8197) = 0xC3;
+    }
+    assert_eq!(arch::mem().read::<u8>(HI + 8197), 0xC3);
+    let mut child = arch::RootPageTable::default();
+    machine.user_fork(&mut child);
+    let parent = machine.activate(child, null_mut(), null_mut());
+    arch::mem().write::<u8>(HI + 8197, 0x79);
+    assert_eq!(unsafe { *memory.as_ptr().add(8197) }, 0x79);
+    machine.free_user_pages();
+    let mut child = machine.activate(parent, null_mut(), null_mut());
+    assert_eq!(arch::mem().read::<u8>(HI + 8197), 0x79);
+    machine.free_user_pages();
+    machine.destroy_space(&mut child);
+    assert_eq!(unsafe { *memory.as_ptr().add(8197) }, 0x79);
+    unsafe { machine.free_shared_pages(memory, 3); }
+}

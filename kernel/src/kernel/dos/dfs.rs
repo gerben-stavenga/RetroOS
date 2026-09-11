@@ -525,15 +525,14 @@ impl DfsState {
     }
 }
 
-/// The VFS subtree that DOS drive `C:` maps to — set once at boot from
-/// `BootConfig.c_root` (default `home/retroos/`; the in-OS build toolchain sets
-/// it to `""` = root). DOS programs see a tidy `C:\...`; the Linux personality
-/// keeps the real root (`/usr`, `/lib`, ...). The embedded DOS system mounts at
-/// `c_root() + "boot/"` (= `C:\BOOT`).
+/// The VFS subtree that DOS drive `C:` maps to — `home/retroos/` on a Unix
+/// root, or the entire selected FAT volume, unless BootConfig supplies an
+/// explicit override. Linux keeps the real `/`.
+/// DOS startup files live in the ordinary `c_root() + "BOOT/"` directory.
 static mut C_ROOT_BUF: [u8; 128] = [0; 128];
 static mut C_ROOT_LEN: usize = 0;
 
-/// Set the C: → VFS prefix (call once at boot, before any mount/resolve).
+/// Set the C: → VFS prefix during storage setup, before any DOS resolution.
 pub fn set_c_root(prefix: &[u8]) {
     let n = prefix.len().min(128);
     unsafe {

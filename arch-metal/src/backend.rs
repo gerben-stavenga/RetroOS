@@ -94,6 +94,19 @@ impl Arch for Metal {
     }
     fn map_low_mem(&mut self) { super::calls::arch_map_low_mem() }
     fn map_vga_text_aperture(&mut self) { super::calls::arch_map_vga_text_aperture() }
+    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
+        assert!(count != 0);
+        let layout = alloc::alloc::Layout::from_size_align(count.checked_mul(4096).unwrap(), 4096).unwrap();
+        let base = unsafe { alloc::alloc::alloc_zeroed(layout) };
+        core::ptr::NonNull::new(base).unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
+    }
+    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize) {
+        let layout = alloc::alloc::Layout::from_size_align(count.checked_mul(4096).unwrap(), 4096).unwrap();
+        unsafe { alloc::alloc::dealloc(base.as_ptr(), layout); }
+    }
+    unsafe fn map_shared_pages(&mut self, vpage: usize, base: core::ptr::NonNull<u8>, count: usize) {
+        super::calls::arch_map_shared_pages(vpage, base.as_ptr() as usize, count);
+    }
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize) {
         super::calls::arch_copy_page_entries(src_vpage, dst_vpage, count)
     }

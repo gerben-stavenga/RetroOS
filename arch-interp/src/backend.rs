@@ -105,6 +105,18 @@ impl Arch for Interp {
     }
     fn map_low_mem(&mut self) { crate::calls::arch_map_low_mem() }
     fn map_vga_text_aperture(&mut self) { crate::calls::arch_map_vga_text_aperture() }
+    fn alloc_shared_pages(&mut self, count: usize) -> core::ptr::NonNull<u8> {
+        assert!(count != 0);
+        let base = crate::phys::frame_ptr(crate::phys::alloc_frames(count));
+        core::ptr::NonNull::new(base).unwrap()
+    }
+    unsafe fn free_shared_pages(&mut self, base: core::ptr::NonNull<u8>, count: usize) {
+        crate::phys::free_frames(crate::phys::kernel_frame(base, count), count);
+    }
+    unsafe fn map_shared_pages(&mut self, vpage: usize, base: core::ptr::NonNull<u8>, count: usize) {
+        crate::paging::space_map_shared(vpage, count, crate::phys::kernel_frame(base, count));
+        crate::engine::invalidate_pages(vpage, count);
+    }
     fn copy_page_entries(&mut self, src_vpage: usize, dst_vpage: usize, count: usize) {
         crate::calls::arch_copy_page_entries(src_vpage, dst_vpage, count)
     }

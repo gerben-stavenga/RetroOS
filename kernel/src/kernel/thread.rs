@@ -316,6 +316,13 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    /// Park device memory before another thread can overwrite the live store.
+    pub fn on_suspend(&mut self, machine: &mut A) {
+        if let Self::Dos(d) = self {
+            d.pc.vga.capture_address_space_vram(machine);
+        }
+    }
+
     /// Swap-in hook: rebind per-thread CPU state. Called every time a thread
     /// becomes the running thread, regardless of whether it's also taking
     /// focus visually.

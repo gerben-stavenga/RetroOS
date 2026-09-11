@@ -50,8 +50,12 @@ Overlong or unterminated guest names fail rather than being truncated.
 
 `python3 test/lfn.py` runs `LFNPROBE.COM` on a fresh writable ext4 image with
 the hosted interpreter. It never writes the read-only Bazel artifact.
-`python3 test/grub_fat.py` runs the same probe on FAT12, FAT16, and FAT32 GRUB
-module roots, including a 32 MiB FAT12 boot. Both are in `test/run_all.sh`.
+`python3 test/grub_fat.py` runs the same probe on a FAT16 partition and on
+FAT12, FAT16, and FAT32 GRUB module roots, including a 32 MiB FAT12 boot.
+FAT fixtures map `C:` to the
+whole volume and launch a batch file through `C:\BOOT\COMMAND.COM`, which
+opens `C:\BOOT\LFNPROBE.COM`; no `/home/retroos` is present. Both tests are
+in `test/run_all.sh`.
 
 The probe checks preserved spelling, case-folded lookup, long/short conversion,
 legacy opens through aliases, 200-character names, CP437 accents, independent

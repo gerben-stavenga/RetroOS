@@ -291,14 +291,17 @@ pub(crate) mod tests {
         use crate::kernel::fs::disk::FilesystemVolume;
         let (disk, volume) = formatted(fatfs::FatType::Fat12, 2880);
         let detected = FilesystemVolume::probe(volume).unwrap();
-        assert_eq!(detected.root_score(b"home/retroos/"), 0);
+        let mut boot = crate::BootConfig::empty();
+        boot.set_c_root(b"home/retroos/");
+        assert_eq!(detected.root_score(&boot), 0);
         let fs = detected.open(true).unwrap();
         assert_eq!(fs.mkdir(b"home"), 0);
         assert_eq!(fs.mkdir(b"home/retroos"), 0);
         drop(fs);
         let before = disk.writes.get();
-        assert_eq!(detected.root_score(b"home/retroos/"), 2);
-        assert_eq!(detected.root_score(b"HOME/RETROOS/"), 0);
+        assert_eq!(detected.root_score(&boot), 2);
+        boot.set_c_root(b"HOME/RETROOS/");
+        assert_eq!(detected.root_score(&boot), 0);
         assert_eq!(disk.writes.get(), before);
     }
 }
