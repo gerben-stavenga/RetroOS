@@ -25,11 +25,6 @@ pub(in crate::kernel::dos) const PSP_SEL: u16 = ((PSP_LDT_IDX as u16) << 3) | 4 
 pub(super) const CLIENT_CS_LDT_IDX: usize = 16;
 pub(super) const CLIENT_DS_LDT_IDX: usize = 17;
 pub(super) const CLIENT_SS_LDT_IDX: usize = 19;
-/// Maximum DPMI memory blocks
-const MAX_MEM_BLOCKS: usize = 256;
-/// Base address for DPMI linear memory allocations
-pub(in crate::kernel::dos) const MEM_BASE: u32 = 0x0050_0000;
-
 /// Exclusive upper bound of the dedicated DPMI physical-mapping window.
 /// Keep it below the user stack at 0xC0000000. Allocations grow downward.
 pub(in crate::kernel::dos) const PHYS_MAP_TOP: u32 = 0xB000_0000;
@@ -57,12 +52,10 @@ pub(super) fn exception_index(vector: u8) -> Option<usize> {
 /// init — so DPMI entry/exit doesn't have to (re)allocate them. See
 /// `feedback_ldt_in_dpmi.md`.
 pub struct DpmiState {
-    /// Linear memory blocks allocated via INT 31h/0501h
-    pub(super) mem_blocks: [Option<MemBlock>; MAX_MEM_BLOCKS],
-    /// High-water mark of this session's linear allocations.
-    pub(super) mem_next: u32,
-    /// Start of this session's allocation arena (earlier sessions may still
-    /// own addresses below it). Freed holes within this arena can be reused.
+    /// Ownership domain in the DOS personality's common extended-memory pool.
+    pub(super) memory_owner: super::super::memory::Owner,
+    /// First address offered to this client. Suspended parent allocations and
+    /// EMS backing remain owned by the common manager and cannot overlap it.
     pub(super) mem_start: u32,
     /// Physical mappings made by INT 31h/0800h and owned by this client.
     pub(super) phys_mappings: [Option<PhysicalMapping>; MAX_PHYS_MAPPINGS],
@@ -134,13 +127,6 @@ pub(super) struct PspCacheEntry {
     pub(super) selector: u16,
 }
 
-/// A DPMI linear memory block
-#[derive(Clone, Copy)]
-pub(super) struct MemBlock {
-    pub(super) base: u32,
-    pub(super) size: u32,
-}
-
 /// One externally-owned physical-device mapping.
 #[derive(Clone, Copy)]
 pub(super) struct PhysicalMapping {
@@ -155,11 +141,10 @@ pub(super) struct PhysicalMapping {
 }
 
 impl DpmiState {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(memory_owner: super::super::memory::Owner, mem_start: u32) -> Self {
         Self {
-            mem_blocks: [None; MAX_MEM_BLOCKS],
-            mem_next: MEM_BASE,
-            mem_start: MEM_BASE,
+            memory_owner,
+            mem_start,
             phys_mappings: [None; MAX_PHYS_MAPPINGS],
             exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
             pm_exc_vectors: [(0, 0); NUM_EXCEPTION_VECTORS],
@@ -173,6 +158,10 @@ impl DpmiState {
             psp_cache: [PspCacheEntry::default(); MAX_PSP_CACHE],
             vif: super::vif::VifMap::new(),
         }
+    }
+
+    pub(in crate::kernel::dos) fn memory_owner(&self) -> super::super::memory::Owner {
+        self.memory_owner
     }
 
     /// Release all device mappings owned by this client. Required both for

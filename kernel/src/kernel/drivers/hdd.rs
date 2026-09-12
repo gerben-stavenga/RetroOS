@@ -205,14 +205,23 @@ impl Disk for AtaDisk {
             // enough to stall the audio pump and coalesce away timer ticks.
             for _ in 0..batch {
                 self.wait_data();
-                let mut words = [0u16; 256];
-                insw(self.base + reg::DATA, &mut words);
-                let mut bytes = [0u8; 512];
-                for (pair, w) in bytes.chunks_exact_mut(2).zip(words) {
-                    pair.copy_from_slice(&w.to_le_bytes());
-                }
                 let n = buffer.len().min(512);
-                buffer[..n].copy_from_slice(&bytes[..n]);
+                if n == 512 && buffer.as_mut_ptr().align_offset(2) == 0 {
+                    // x86 permits the device transfer directly into the
+                    // caller's byte buffer. Avoid converting and copying 256
+                    // words after every sector of a large executable/WAD.
+                    let words = unsafe {
+                        core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u16>(), 256)
+                    };
+                    insw(self.base + reg::DATA, words);
+                } else {
+                    let mut words = [0u16; 256];
+                    insw(self.base + reg::DATA, &mut words);
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(words.as_ptr().cast::<u8>(), 512)
+                    };
+                    buffer[..n].copy_from_slice(&bytes[..n]);
+                }
                 buffer = &mut buffer[n..];
             }
         }

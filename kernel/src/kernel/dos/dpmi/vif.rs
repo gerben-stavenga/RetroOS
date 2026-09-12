@@ -69,6 +69,9 @@ enum Tag {
 /// so it is per-thread automatically). Was the global `WIN`/`CUR_SITE`/`CUR_SP`.
 #[derive(Clone, Copy)]
 struct Active {
+    /// Linear address used as the cache/invalidation identity. DPMI code
+    /// selectors may have a nonzero base, so `cli_ip` alone is not a page.
+    cli_linear: u32,
     cli_ip: u32,
     cli_sp: u32,
     learning: bool,
@@ -96,8 +99,8 @@ pub(in crate::kernel::dos) struct SuspendedVif {
 /// the address space, so nothing leaks across clients or reboots.
 #[derive(Default)]
 pub struct VifMap {
-    /// `cli_ip → Class`, learned once per site. Small open-addressed table keyed
-    /// by the CLI address *within this space*.
+    /// `linear CLI address → Class`, learned once per site. Using the real
+    /// linear address makes code-page invalidation correct for based selectors.
     sites: SiteTable,
     active: Option<Active>,
     /// Exact guest value carrying our TF tag. A cached CLI site can take a
@@ -158,8 +161,11 @@ impl VifMap {
     pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
                            always_step: bool) {
         self.escaped_tag |= self.clear_tag(arch, regs);
+        let cli_linear = A::seg_base(regs.code_seg()).wrapping_add(cli_ip);
         let cli_sp = regs.sp32();
-        self.active = Some(Active { cli_ip, cli_sp, learning: false, probe: None, snap: [0; 8] });
+        self.active = Some(Active {
+            cli_linear, cli_ip, cli_sp, learning: false, probe: None, snap: [0; 8],
+        });
         self.stats[0] = self.stats[0].wrapping_add(1);
         // vIOPL=3 is the slow reference mode: learn the exit afresh for every
         // window and never trust a cached tag. It exists to distinguish a bad
@@ -168,7 +174,7 @@ impl VifMap {
             self.begin_learn(regs, None);
             return;
         }
-        match self.sites.get(cli_ip) {
+        match self.sites.get(cli_linear) {
             Some(Class::Sti) => {
                 // Run free — the STI will #GP and close it.
                 self.stats[1] = self.stats[1].wrapping_add(1);
@@ -228,7 +234,7 @@ impl VifMap {
         if let Some(a) = self.active.take()
             && a.learning
         {
-            self.sites.insert(a.cli_ip, Class::Sti);
+            self.sites.insert(a.cli_linear, Class::Sti);
         }
     }
 
@@ -321,7 +327,7 @@ impl VifMap {
                     if regs.flags32() & VIF_FLAG != 0 {
                         if let Some(a) = self.active {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
-                            self.sites.insert(a.cli_ip, class);
+                            self.sites.insert(a.cli_linear, class);
                         }
                         self.active = None;
                         return DbResult::Resume;
@@ -473,7 +479,7 @@ fn set_reg32(regs: &mut Regs, idx: u8, v: u32) {
 const N: usize = 64;
 
 struct SiteTable {
-    slots: [Option<(u32, Class)>; N], // (cli_ip, class)
+    slots: [Option<(u32, Class)>; N], // (linear CLI address, class)
 }
 
 impl SiteTable {
@@ -484,13 +490,36 @@ impl SiteTable {
         (ip.wrapping_mul(0x9E37_79B1) >> 26) as usize & (N - 1)
     }
     fn get(&self, ip: u32) -> Option<Class> {
-        match self.slots[Self::slot(ip)] {
-            Some((a, c)) if a == ip => Some(c),
-            _ => None,
+        let first = Self::slot(ip);
+        for probe in 0..N {
+            if let Some((at, class)) = self.slots[(first + probe) & (N - 1)]
+                && at == ip
+            {
+                return Some(class);
+            }
         }
+        None
     }
     fn insert(&mut self, ip: u32, c: Class) {
-        self.slots[Self::slot(ip)] = Some((ip, c));
+        let first = Self::slot(ip);
+        let mut empty = None;
+        for probe in 0..N {
+            let slot = &mut self.slots[(first + probe) & (N - 1)];
+            if slot.is_some_and(|(at, _)| at == ip) {
+                *slot = Some((ip, c));
+                return;
+            }
+            if slot.is_none() && empty.is_none() {
+                empty = Some((first + probe) & (N - 1));
+            }
+        }
+        if let Some(slot) = empty {
+            self.slots[slot] = Some((ip, c));
+            return;
+        }
+        // Keep storage bounded if a client really has more than N sites.
+        // Eviction only costs another learning pass; it cannot change VIF.
+        self.slots[first] = Some((ip, c));
     }
     fn retain_out_of_page(&mut self, page: u32) {
         for s in &mut self.slots {
@@ -514,7 +543,10 @@ mod tests {
     use super::*;
 
     fn learning_window(ip: u32) -> Active {
-        Active { cli_ip: ip, cli_sp: 0x1000, learning: true, probe: None, snap: [0; 8] }
+        Active {
+            cli_linear: ip, cli_ip: ip, cli_sp: 0x1000,
+            learning: true, probe: None, snap: [0; 8],
+        }
     }
 
     #[test]
@@ -542,5 +574,35 @@ mod tests {
         assert!(vif.is_learning());
         assert!(matches!(vif.tag, Some(Tag::Flags(0x1004))));
         assert!(matches!(vif.sites.get(0x200), Some(Class::Sti)));
+    }
+
+    #[test]
+    fn site_table_keeps_colliding_cli_sites() {
+        let mut table = SiteTable::new();
+        let first = 0x7370u32;
+        let collision = (1..u32::MAX)
+            .map(|n| first.wrapping_add(n))
+            .find(|&ip| SiteTable::slot(ip) == SiteTable::slot(first))
+            .unwrap();
+
+        table.insert(first, Class::Sti);
+        table.insert(collision, Class::Flags(4));
+
+        assert!(matches!(table.get(first), Some(Class::Sti)));
+        assert!(matches!(table.get(collision), Some(Class::Flags(4))));
+    }
+
+    #[test]
+    fn site_invalidation_uses_linear_code_page() {
+        let mut table = SiteTable::new();
+        let linear = 0x11_7d0;
+        table.insert(linear, Class::Sti);
+
+        // A DOS read into linear page 7 must not invalidate CS:7370 when the
+        // code selector's base places that instruction on linear page 0x11.
+        table.retain_out_of_page(0x7);
+        assert!(matches!(table.get(linear), Some(Class::Sti)));
+        table.retain_out_of_page(linear >> 12);
+        assert!(table.get(linear).is_none());
     }
 }

@@ -168,6 +168,7 @@ _EXTRA_FILES = {
     "//test/dos/svgaprobe:svgaprobe_com": "TESTS/SVGAPROBE.COM",
     "//test/dos/lfnprobe:lfnprobe_com": "TESTS/LFNPROBE.COM",
     "//test/dos/int13_com:int13_com":     "TESTS/INT13T.COM",
+    "//test/dos/xmsprobe:xmsprobe_com": "TESTS/XMSPROBE.COM",
     "//test/dos/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
     "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",

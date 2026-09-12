@@ -49,7 +49,7 @@ impl VolumeStorage {
     #[inline(never)]
     fn read_direct(&mut self, offset: u64, output: &mut [u8]) -> Result<(), StorageError> {
         let len = output.len();
-        let end = offset
+        let _end = offset
             .checked_add(len as u64)
             .filter(|end| *end <= self.volume.sectors.saturating_mul(512))
             .ok_or(VolumeError::OutOfBounds)
@@ -57,19 +57,11 @@ impl VolumeStorage {
         if len == 0 {
             return Ok(());
         }
-        if offset.is_multiple_of(512) && len.is_multiple_of(512) {
-            let transferred = self.volume.read(offset / 512, output) as usize;
-            if transferred != len / 512 {
-                return Err(StorageError::new(VolumeError::ShortRead));
-            }
-            return Ok(());
-        }
         let mut position = offset;
         let mut copied = 0;
-        let mut sector = [0; 512];
-        while position < end {
-            let lba = position / 512;
-            if self.volume.read(lba, &mut sector) != 1 {
+        if !position.is_multiple_of(512) {
+            let mut sector = [0; 512];
+            if self.volume.read(position / 512, &mut sector) != 1 {
                 return Err(StorageError::new(VolumeError::ShortRead));
             }
             let within = (position % 512) as usize;
@@ -78,6 +70,24 @@ impl VolumeStorage {
                 .copy_from_slice(&sector[within..within + amount]);
             copied += amount;
             position += amount as u64;
+        }
+        let middle = (len - copied) / 512 * 512;
+        if middle != 0 {
+            let transferred = self.volume.read(
+                position / 512, &mut output[copied..copied + middle],
+            ) as usize;
+            if transferred != middle / 512 {
+                return Err(StorageError::new(VolumeError::ShortRead));
+            }
+            copied += middle;
+            position += middle as u64;
+        }
+        if copied < len {
+            let mut sector = [0; 512];
+            if self.volume.read(position / 512, &mut sector) != 1 {
+                return Err(StorageError::new(VolumeError::ShortRead));
+            }
+            output[copied..].copy_from_slice(&sector[..len - copied]);
         }
         Ok(())
     }
@@ -777,13 +787,17 @@ mod tests {
     use std::vec::Vec;
 
     struct RecordingDisk {
+        reads: RefCell<Vec<(u64, usize)>>,
         writes: RefCell<Vec<(u64, usize)>>,
         flushes: Cell<u32>,
     }
 
     impl Disk for RecordingDisk {
-        fn read(&self, _lba: u64, output: &mut [u8]) -> u32 {
-            output.fill(0);
+        fn read(&self, lba: u64, output: &mut [u8]) -> u32 {
+            self.reads.borrow_mut().push((lba, output.len()));
+            for (offset, byte) in output.iter_mut().enumerate() {
+                *byte = (lba * 512 + offset as u64) as u8;
+            }
             output.len().div_ceil(512) as u32
         }
 
@@ -800,6 +814,7 @@ mod tests {
     #[test]
     fn volume_storage_combines_adjacent_writes_until_barrier() {
         let disk = Box::leak(Box::new(RecordingDisk {
+            reads: RefCell::new(Vec::new()),
             writes: RefCell::new(Vec::new()),
             flushes: Cell::new(0),
         }));
@@ -811,6 +826,23 @@ mod tests {
         storage.flush().unwrap();
         assert_eq!(&*disk.writes.borrow(), &[(0, 8192)]);
         assert_eq!(disk.flushes.get(), 1);
+    }
+
+    #[test]
+    fn unaligned_read_batches_its_sector_aligned_middle() {
+        let disk = Box::leak(Box::new(RecordingDisk {
+            reads: RefCell::new(Vec::new()),
+            writes: RefCell::new(Vec::new()),
+            flushes: Cell::new(0),
+        }));
+        let mut storage = VolumeStorage::new(Volume::whole(disk));
+        let mut output = vec![0; 10 * 512 + 200];
+
+        storage.read(100, &mut output).unwrap();
+
+        assert_eq!(&*disk.reads.borrow(), &[(0, 512), (1, 9 * 512), (10, 512)]);
+        assert_eq!(output[0], 100);
+        assert_eq!(output[output.len() - 1], (100 + output.len() - 1) as u8);
     }
 
     #[test]

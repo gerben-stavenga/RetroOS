@@ -547,6 +547,52 @@ impl Display {
         }
     }
 
+    /// Publish only changed rectangles from a mode-sized packed compositor
+    /// canvas. Unlike [`Self::present_regions`], the input width is explicit:
+    /// compositor storage is dense and independent of the legacy VGA shadow
+    /// width. A scaled or hosted sink falls back to a whole-frame present.
+    pub fn present_packed_regions<A: crate::Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+        regions: &[crate::kernel::gui::Rect],
+    ) -> usize {
+        if regions.is_empty() {
+            return 0;
+        }
+        let Some(bytes) = width.checked_mul(height)
+            .and_then(|n| n.checked_mul(usize::from(self.rgb.bytes_per_pixel))) else { return 0 };
+        if width == 0 || height == 0 || pixels.len() < bytes
+            || (width, height) != self.composition_size(width, height)
+        {
+            return self.present_packed(machine, bios, width, height, pixels);
+        }
+        let format = self.rgb;
+        let copied = match &mut self.backend {
+            Backend::Linear(framebuffer)
+            | Backend::Vga {
+                scanout: VgaScanout::Mode13 { framebuffer, .. }
+                    | VgaScanout::VbeLinear { framebuffer, .. },
+                ..
+            } => blit_regions(framebuffer, format, width, height, height, pixels, regions),
+            Backend::Vga {
+                native,
+                scanout: VgaScanout::VbeBanked { mode, current_bank },
+            } => return native.bios_present_packed_regions(
+                    machine, bios, *mode, current_bank, width, height, pixels, regions,
+                ).unwrap_or_else(|error| lib::compact_panic!(
+                    "banked VBE regional present failed: {:?}", error,
+                )),
+            Backend::Host => return self.present_packed(machine, bios, width, height, pixels),
+            Backend::Headless => return 0,
+        };
+        finish_present();
+        copied
+    }
+
     /// Publish one completed packed compositor shadow.
     pub fn present<A: crate::Arch>(
         &mut self,

@@ -25,7 +25,7 @@ pub(in crate::kernel::dos) mod vif;
 pub(in crate::kernel::dos) use self::vif::DbResult;
 mod state;
 mod memory;
-pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, MEM_BASE, PHYS_MAP_TOP, PSP_SEL};
+pub(in crate::kernel::dos) use self::state::{DpmiState, LDT_ENTRIES, LOW_MEM_SEL, PHYS_MAP_TOP, PSP_SEL};
 use self::state::{exception_index, physical_mapping_layout, CLIENT_CS_LDT_IDX, CLIENT_DS_LDT_IDX, CLIENT_SS_LDT_IDX, LOW_MEM_LDT_IDX, PhysicalMapping, PSP_LDT_IDX};
 mod descriptors;
 pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, install_kernel_ldt_slots, reset_pm_vectors, valid_ldt_selector_idx};
@@ -59,8 +59,8 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
         client_type, if client_type != 0 { 32 } else { 16 },
         ret_cs, ret_ip, dos.current_psp, real_ss, real_sp, regs.ds as u16, regs.es as u16);
 
-    let mut dpmi = DpmiState::new();
-    dpmi.mem_next = dos.dpmi_mem_next;
+    let (memory_owner, mem_start) = dos.memory.new_dpmi_owner();
+    let mut dpmi = DpmiState::new(memory_owner, mem_start);
     dpmi.client_use32 = client_type != 0;
     // 16-bit DPMI clients (Borland) issue INT 21 directly from PM with
     // high-base PM selector buffers and rely on the host to handle them.
@@ -102,13 +102,6 @@ pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &
     let cs_sel = idx_to_sel(CLIENT_CS_LDT_IDX);
     let ds_sel = idx_to_sel(CLIENT_DS_LDT_IDX);
     let ss_sel = idx_to_sel(CLIENT_SS_LDT_IDX);
-
-    // Round client allocation pool up to a 1 MB boundary. DOS/4GW appears to
-    // treat the first 0501 base as a slab origin and takes a private code path
-    // when it is not MB-aligned (matches CWSDPMI's VADDR_START=0x400000).
-    dpmi.mem_next = (dpmi.mem_next + 0xFFFFF) & !0xFFFFF;
-    dpmi.mem_start = dpmi.mem_next;
-    dos.dpmi_mem_next = dpmi.mem_next;
 
     // Attach DPMI state to thread, then install the one-shot DPMI PSP
     // view: LDT[18] (PSP_SEL) descriptor for the entering client's PSP,
@@ -754,7 +747,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // ES:EDI = 48-byte buffer. Report actual backing, not fictitious swap.
         0x0500 => {
             let dest = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, dpmi.client_use32);
-            for (i, value) in memory::info(machine, dpmi).into_iter().enumerate() {
+            for (i, value) in memory::info(machine, &dos.memory, dpmi).into_iter().enumerate() {
                 machine.write::<u32>(dest as usize + i * 4, value);
             }
             clear_carry(regs);
@@ -763,7 +756,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // BX:CX = size in bytes. Returns: BX:CX = linear address, SI:DI = handle
         0x0501 => {
             let size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
-            let base = match memory::allocate(machine, dpmi, size) {
+            let base = match memory::allocate(machine, &mut dos.memory, dpmi, size) {
                 Ok(base) => base,
                 Err(error) => {
                     regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
@@ -771,7 +764,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     return thread::KernelAction::Done;
                 }
             };
-            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             // Keep the DPMI 0.9 handle equal to the base address. Several
             // extenders assume this CWSDPMI-compatible handle shape.
             let handle = base;
@@ -787,7 +779,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         // SI:DI = handle
         0x0502 => {
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            if let Err(error) = memory::free(machine, dpmi, handle) {
+            if let Err(error) = memory::free(machine, &mut dos.memory, dpmi, handle) {
                 regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
                 set_carry(regs);
                 return thread::KernelAction::Done;
@@ -800,7 +792,7 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
         0x0503 => {
             let new_size = ((regs.rbx as u32 & 0xFFFF) << 16) | (regs.rcx as u32 & 0xFFFF);
             let handle = ((regs.rsi as u32 & 0xFFFF) << 16) | (regs.rdi as u32 & 0xFFFF);
-            let base = match memory::resize(machine, dpmi, handle, new_size) {
+            let base = match memory::resize(machine, &mut dos.memory, dpmi, handle, new_size) {
                 Ok(base) => base,
                 Err(error) => {
                     regs.rax = (regs.rax & !0xFFFF) | u64::from(error);
@@ -808,7 +800,6 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
                     return thread::KernelAction::Done;
                 }
             };
-            dos.dpmi_mem_next = dos.dpmi_mem_next.max(dpmi.mem_next);
             regs.rbx = (regs.rbx & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;
             regs.rcx = (regs.rcx & !0xFFFF) | (base & 0xFFFF) as u64;
             regs.rsi = (regs.rsi & !0xFFFF) | ((base >> 16) & 0xFFFF) as u64;

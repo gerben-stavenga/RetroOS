@@ -1,0 +1,7 @@
+genrule(
+    name = "xmsprobe_com",
+    srcs = ["xmsprobe.asm"],
+    outs = ["XMSPROBE.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

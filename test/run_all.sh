@@ -72,6 +72,7 @@ run module_program module_qemu   bash test/grub_module_program.sh
 run hosted_games -         bash test/hosted_games.sh
 run lfn          -         python3 test/lfn.py
 run dpmi_hx      -         bash test/dpmi_hx.sh
+run xms          -         bash test/xms.sh
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm

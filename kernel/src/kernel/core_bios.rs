@@ -919,6 +919,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             bank_state,
             shadow_height,
             BankedSource::Packed(shadow),
+            None,
         )
     }
 
@@ -938,6 +939,30 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             bank_state,
             height,
             BankedSource::Sized { width, pixels, row },
+            None,
+        )
+    }
+
+    fn present_banked_packed_regions(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::VgaCap,
+        mode: crate::kernel::platform::VbeMode,
+        bank_state: &mut u16,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+        regions: &[crate::kernel::gui::Rect],
+    ) -> Result<usize, BiosError> {
+        let mut row = alloc::vec::Vec::new();
+        self.present_banked_source(
+            machine,
+            display,
+            mode,
+            bank_state,
+            height,
+            BankedSource::Sized { width, pixels, row: &mut row },
+            Some(regions),
         )
     }
 
@@ -949,6 +974,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         bank_state: &mut u16,
         shadow_height: usize,
         mut source: BankedSource<'_>,
+        regions: Option<&[crate::kernel::gui::Rect]>,
     ) -> Result<usize, BiosError> {
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
             return Err(BiosError::InvalidFrame);
@@ -1020,6 +1046,42 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                     Ok(())
                 })
             };
+
+            // A compositor canvas already matches the selected mode. Copy
+            // only its changed row spans; `banked_span` splits a row if it
+            // crosses an aperture boundary and preserves the current bank
+            // across adjacent rows and rectangles.
+            if let Some(regions) = regions {
+                let BankedSource::Sized { width, pixels, .. } = &source else {
+                    return Err(BiosError::InvalidFrame);
+                };
+                if *width != panel_w || shadow_height != panel_h {
+                    return Err(BiosError::InvalidFrame);
+                }
+                let mut copied = 0usize;
+                for rect in regions {
+                    let x0 = rect.x.max(0) as usize;
+                    let y0 = rect.y.max(0) as usize;
+                    let x1 = (i64::from(rect.x) + i64::from(rect.width))
+                        .clamp(0, panel_w as i64) as usize;
+                    let y1 = (i64::from(rect.y) + i64::from(rect.height))
+                        .clamp(0, panel_h as i64) as usize;
+                    if x0 >= x1 || y0 >= y1 {
+                        continue;
+                    }
+                    let bytes = (x1 - x0) * step;
+                    for y in y0..y1 {
+                        let source_at = (y * panel_w + x0) * step;
+                        write_span(
+                            machine,
+                            y * pitch + x0 * step,
+                            &pixels[source_at..source_at + bytes],
+                        )?;
+                    }
+                    copied += (x1 - x0) * (y1 - y0);
+                }
+                return Ok(copied);
+            }
 
             // A matching packed canvas is one span, just like linear present.
             // For 800x600 RGB565 this is 15 aperture copies, not 600 row copies
@@ -1468,6 +1530,22 @@ impl crate::kernel::platform::VgaCap {
     ) -> Result<usize, BiosError> {
         self.bios(bios)?.present_banked_packed(
             machine, self, mode, current_bank, source,
+        )
+    }
+
+    pub(crate) fn bios_present_packed_regions<A: Arch>(
+        &mut self,
+        machine: &mut A,
+        bios: &mut BiosDisplayWorkspace<A>,
+        mode: crate::kernel::platform::VbeMode,
+        current_bank: &mut u16,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+        regions: &[crate::kernel::gui::Rect],
+    ) -> Result<usize, BiosError> {
+        self.bios(bios)?.present_banked_packed_regions(
+            machine, self, mode, current_bank, width, height, pixels, regions,
         )
     }
 

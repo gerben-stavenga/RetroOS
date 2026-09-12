@@ -58,46 +58,37 @@ in Git history.
   Ctrl-C/Break checking, critical-error handling (`INT 24h`), and the process
   and file-state behavior applications expect around failed or interrupted
   calls.
-- [ ] **Add raw disk compatibility where software requires it.** Implement the
-  useful `INT 13h` disk services and DOS absolute-sector interfaces against
-  mounted media. Keep access mediated by the DOS machine rather than exposing
-  host block devices directly.
-- [x] **Mount FAT filesystems from floppy images.** (read side) Two OSD
-  floppy slots (A:/B:) mount rust-fatfs over RAM images from `C:\FLOPPY`,
-  with FAT12/16, subdirectories, timestamps, and media-change handling via
-  slot generations. Remaining: the write side — allocation,
-  create/write/delete/rename through the slot, and safe writeback of the
-  RAM image to the catalogue file on eject.
-- [ ] **Add CD-ROM and MSCDEX compatibility over OSD media slots.** Keep
-  persistent floppy and CD drive slots whose inserted media can change while
-  the drive remains registered. Provide a synthetic MSCDEX interface, drive
-  letter, ISO 9660 data access, media-change status, TOC queries, and audio
-  play/pause/stop controls. A pure-audio disc has no filesystem but remains an
-  MSCDEX CD device; a mixed-mode disc mounts its data track and sends audio
-  tracks to the mixer.
-- [ ] **Implement the initial CD image formats deliberately.** Start with
-  ISO 9660 primary volume descriptors, directory extents, and `;1` version
-  stripping. Support Mode 1/2048 directly and Mode 1/2352 by extracting user
-  data. CUE/BIN track offsets and mixed-mode layout come next; XA, Joliet,
-  Rock Ridge, multisession, and unusual sector modes can remain later
-  extensions.
-- [ ] **Add an LFN read/query subset, then mutation support.** DFS already
-  retains long names and synthesizes short aliases, so implement the Windows
-  `INT 21h AX=71xx` query/open/find surface first. Full LFN behavior also needs
-  correct mkdir/rmdir/rename operations and independent concurrent search
-  handles. Add code-page/NLS behavior separately where applications depend on
-  it.
-- [ ] **Finish LIM EMS 4.0 application services.** Correct allocation so
-  application handles begin at 1 (handle 0 is reserved) and freed physical
-  pages are reusable. Then implement save/restore page map (`47h`/`48h`),
-  whole and partial page-map operations (`4Eh`/`4Fh`), handle attributes and
-  names/directories (`52h`-`54h`), alter-map-and-transfer (`55h`/`56h`), and
-  move/exchange memory (`57h`). The OS/environment functions `59h`-`5Dh` are
-  lower priority.
-- [ ] **Audit XMS conformance and edge cases.** Verify handle lifecycle,
-  realloc/free behavior, move overlap and validation, A20 ownership, reported
-  memory limits, UMB calls, and exact error returns against common HIMEM/XMS
-  clients.
+- [ ] **Complete raw disk compatibility where software requires it.** Floppy
+  `INT 13h` services are implemented. Add the useful hard-disk services and
+  DOS absolute-sector interfaces against mounted media. Keep access mediated
+  by the DOS machine rather than exposing host block devices directly.
+- [ ] **Finish the MSCDEX device and CD-audio interfaces.** The persistent OSD
+  slot, D: drive, ISO 9660 filesystem, media-change handling, and ISO/CUE/BIN
+  Mode 1 data tracks are implemented. Add the MSCDEX device-request surface,
+  TOC queries, and audio play/pause/stop controls. A pure-audio disc has no
+  filesystem but must remain an MSCDEX CD device; mixed-mode audio tracks must
+  feed the mixer. Add XA, Joliet, Rock Ridge, multisession, and unusual sector
+  modes only as compatibility demands them.
+- [ ] **Add DOS code-page and NLS filename semantics.** The Windows
+  `INT 21h AX=71xx` LFN query, open, find, mutation, canonical-name, and
+  independent search-handle surface is implemented. Replace ASCII-only case
+  folding and raw-byte names with active OEM-code-page rules, and add the
+  required OEM/ANSI/Unicode conversions, including the non-OEM forms of
+  `AX=71A8h`.
+- [ ] **Finish and correct the advertised LIM EMS 4.0 interface.** EMS now
+  reserves handle 0 from application allocation and reuses released pages, but
+  the protocol surface still needs conformance work. `43h` must reject a
+  zero-page request with `89h` and distinguish total (`87h`) from currently
+  free (`88h`) exhaustion. Model OS handle 0 as active in `4Bh`/`4Dh`; increase
+  the 16-application-handle limit if compatibility requires it. Only advertise
+  EMS when `scan_uma` actually reserves a 64 KiB page frame, and make unmapped
+  windows inaccessible. Tighten `50h` so zero-count, AL, count, exact segment,
+  and per-entry failure semantics do not desynchronize the shadow map; return
+  exact `51h` exhaustion and `58h` subfunction errors. Implement the EMS 3.0
+  save/restore calls (`47h`/`48h`), EMS 3.2 whole-map call (`4Eh`), and EMS 4.0
+  partial maps (`4Fh`), attributes/names/directory (`52h`-`54h`), alter-map
+  jump/call (`55h`/`56h`), and move/exchange (`57h`). The OS/environment calls
+  `59h`-`5Dh` remain lower priority.
 - [ ] **Add remaining common BIOS peripherals as demand appears.** Cover the
   useful serial, printer, and joystick BIOS services and tighten keyboard,
   mouse, timer, and video semantics exposed by real games.
@@ -108,13 +99,6 @@ in Git history.
   gives its client ring-0-style ownership of paging, descriptors, interrupts,
   and I/O, so native backends cannot safely expose it as an ordinary DOS
   thread; the interpreter can virtualize it more naturally.
-- [ ] **Debug The Incredible Machine's timer interrupt chain.** TIM has never
-  worked and currently reaches `0000:00c4`, inside the IVT, after entering its
-  `INT 08h` handler at `0027:0510`. Byte `62h` is then decoded as `BOUND` and
-  raises exception 5 (`#BR`). Trace the first far call, `RETF`, or `IRET` that
-  produces a zero CS to distinguish a bad saved/chained timer vector (including
-  `INT 21h AH=25h/35h` semantics) from a malformed VM86 interrupt frame. This
-  failure is unrelated to pMAX, VCPI, or DPMI.
 - [ ] **Pace native DOS CPU execution independently of display work.** F22's
   startup calibrates a `DEC ECX` busy loop against a timer counter. On KVM with
   native VGA, even a nearly full 32-bit count completes below its 120-tick
@@ -129,7 +113,6 @@ in Git history.
 - [ ] **Aladdin:** sound degrades and graphics eventually become corrupt.
 - [ ] **Golden Axe:** missing keyboard keys prevent selection.
 - [ ] **Comanche/F22:** no arrow key response.
-- [ ] **Civilization:** introscreen crawls
 
 ## Emulator-specific reference issues
 

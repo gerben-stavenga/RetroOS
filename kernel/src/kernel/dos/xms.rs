@@ -1,27 +1,95 @@
 //! XMS 3.0 (Extended Memory Specification) emulation.
 //!
 //! Pure bookkeeping over the VM86 linear address space above the HMA.
-//! Physical backing comes from the kernel's demand paging.
+//! Physical backing comes from the DOS personality's common committed
+//! extended-memory pool.
 
 use crate::Regs;
 use crate::kernel::dos::linear;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use crate::compact_dbg_println;
 use crate::kernel::thread;
 
 const MAX_XMS_HANDLES: usize = 16;
-/// XMS address space: linear 0x120000 to about 0x500000. Pages 0x100-0x10F are
+/// XMS address space begins at 0x120000. Pages 0x100-0x10F are
 /// the HMA (permanently wrapped over page 0); 0x110-0x11F is a reserved gap left
-/// from the former A20 shadow region.
+/// from the former A20 shadow region. The common manager supplies the upper
+/// bound and shared 32 MiB capacity.
 const XMS_BASE: u32 = 0x120000;
-const XMS_END: u32 = 0x500000;  // 5MB — plenty for DOS games
-const XMS_TOTAL_KB: u16 = ((XMS_END - XMS_BASE) / 1024) as u16;
+/// Highest exclusive address representable by an ordinary real-mode far
+/// pointer (FFFF:FFFF plus one).
+const DIRECT_LIMIT: u32 = 0x10FFF0;
 
 /// A single XMS handle — contiguous range in VM86 linear address space.
+#[derive(Clone, Copy)]
 struct XmsHandle {
-    base: u32,    // linear address
-    size_kb: u16,
-    locked: bool,
+    /// Zero-length handles deliberately own no common-manager range.
+    base: Option<u32>,
+    size_kb: u32,
+    lock_count: u8,
+}
+
+fn handle_index(handle: u16) -> Option<usize> {
+    handle.checked_sub(1).map(usize::from).filter(|&i| i < MAX_XMS_HANDLES)
+}
+
+fn free_handle_count(xms: &XmsState) -> usize {
+    xms.handles.iter().filter(|h| h.is_none()).count()
+}
+
+fn allocate_emb<A: crate::Arch>(
+    machine: &mut A,
+    xms: &mut XmsState,
+    memory: &mut super::memory::DosMemory,
+    size_kb: u32,
+) -> Result<u16, u8> {
+    let slot = xms.handles.iter().position(Option::is_none).ok_or(0xA1)?;
+    let base = if size_kb == 0 {
+        None
+    } else {
+        let bytes = size_kb.checked_mul(1024).ok_or(0xA0)?;
+        Some(memory.allocate(
+            machine, super::memory::XMS_OWNER, bytes, 4096, XMS_BASE,
+            super::memory::general_limit(),
+        ).map_err(|_| 0xA0)?.base)
+    };
+    xms.handles[slot] = Some(XmsHandle { base, size_kb, lock_count: 0 });
+    Ok((slot + 1) as u16)
+}
+
+fn resize_emb<A: crate::Arch>(
+    machine: &mut A,
+    xms: &mut XmsState,
+    memory: &mut super::memory::DosMemory,
+    handle: u16,
+    size_kb: u32,
+) -> Result<(), u8> {
+    let slot = handle_index(handle).ok_or(0xA2)?;
+    let old = xms.handles[slot].ok_or(0xA2)?;
+    if old.lock_count != 0 { return Err(0xAB); }
+    let base = match (old.base, size_kb) {
+        (None, 0) => None,
+        (None, _) => {
+            let bytes = size_kb.checked_mul(1024).ok_or(0xA0)?;
+            Some(memory.allocate(
+                machine, super::memory::XMS_OWNER, bytes, 4096, XMS_BASE,
+                super::memory::general_limit(),
+            ).map_err(|_| 0xA0)?.base)
+        }
+        (Some(base), 0) => {
+            memory.free(machine, super::memory::XMS_OWNER, base).map_err(|_| 0xA2)?;
+            None
+        }
+        (Some(base), _) => {
+            let bytes = size_kb.checked_mul(1024).ok_or(0xA0)?;
+            Some(memory.resize(
+                machine, super::memory::XMS_OWNER, base, bytes, 4096, XMS_BASE,
+                super::memory::general_limit(),
+            ).map_err(|_| 0xA0)?.base)
+        }
+    };
+    xms.handles[slot] = Some(XmsHandle { base, size_kb, lock_count: 0 });
+    Ok(())
 }
 
 /// Per-thread XMS driver state.
@@ -35,68 +103,6 @@ impl XmsState {
         Self { handles: [NONE; MAX_XMS_HANDLES] }
     }
 
-    /// Find a contiguous free region of `size` bytes. Returns linear address or None.
-    fn find_free(&self, size: u32) -> Option<u32> {
-        if size == 0 { return Some(XMS_BASE); }
-
-        // Collect allocated ranges, sorted by base
-        let mut ranges: [(u32, u32); MAX_XMS_HANDLES] = [(0, 0); MAX_XMS_HANDLES];
-        let mut count = 0;
-        for h in self.handles.iter().flatten() {
-            ranges[count] = (h.base, h.size_kb as u32 * 1024);
-            count += 1;
-        }
-        for i in 1..count {
-            let mut j = i;
-            while j > 0 && ranges[j].0 < ranges[j - 1].0 {
-                ranges.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-
-        let mut start = XMS_BASE;
-        for r in ranges.iter().take(count) {
-            let gap = r.0.saturating_sub(start);
-            if gap >= size { return Some(start); }
-            start = r.0 + r.1;
-        }
-        if XMS_END.saturating_sub(start) >= size { return Some(start); }
-        None
-    }
-
-    fn free_kb(&self) -> u16 {
-        let mut used: u32 = 0;
-        for h in self.handles.iter().flatten() {
-            used += h.size_kb as u32;
-        }
-        XMS_TOTAL_KB.saturating_sub(used as u16)
-    }
-
-    fn largest_free_kb(&self) -> u16 {
-        let mut ranges: [(u32, u32); MAX_XMS_HANDLES] = [(0, 0); MAX_XMS_HANDLES];
-        let mut count = 0;
-        for h in self.handles.iter().flatten() {
-            ranges[count] = (h.base, h.size_kb as u32 * 1024);
-            count += 1;
-        }
-        for i in 1..count {
-            let mut j = i;
-            while j > 0 && ranges[j].0 < ranges[j - 1].0 {
-                ranges.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-        let mut largest = 0u32;
-        let mut start = XMS_BASE;
-        for r in ranges.iter().take(count) {
-            let gap = r.0.saturating_sub(start);
-            if gap > largest { largest = gap; }
-            start = r.0 + r.1;
-        }
-        let gap = XMS_END.saturating_sub(start);
-        if gap > largest { largest = gap; }
-        (largest / 1024) as u16
-    }
 }
 
 fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
@@ -104,6 +110,15 @@ fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
         dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
     dos.xms.as_deref_mut().unwrap()
+}
+
+fn xms_parts<A: crate::Arch>(dos: &mut thread::DosState<A>)
+    -> (&mut XmsState, &mut super::memory::DosMemory)
+{
+    if dos.xms.is_none() {
+        dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
+    }
+    (dos.xms.as_deref_mut().unwrap(), &mut dos.memory)
 }
 
 pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
@@ -115,78 +130,79 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
             regs.rbx = (regs.rbx & !0xFFFF) | 0x0001; // driver internal revision
             regs.rdx &= !0xFFFF;            // no HMA (A20 always wrapped)
         }
-        // AH=03h–06h — A20 enable/disable (global + local). The gate is
-        // permanently wrapped (see machine::new): a VM86 guest has no usable HMA
-        // and can't reach >1 MB directly, so these are no-op successes — callers
-        // that bracket XMS access with enable/disable just proceed.
-        0x03..=0x06 => {
-            regs.rax = (regs.rax & !0xFFFF) | 1; // success
-            regs.rbx &= !0xFFFF;       // BL=0 no error
+        // AH=01h/02h — Request/release HMA. RetroOS deliberately has no HMA:
+        // its VM86 1MB boundary remains wrapped onto low memory.
+        0x01 | 0x02 => {
+            regs.rax &= !0xFFFF;
+            regs.rbx = (regs.rbx & !0xFF) | 0x90; // HMA does not exist
         }
-        // AH=07h — Query A20 state. Report "enabled" so an enable-then-verify
-        // caller is satisfied; the physical wrap is invisible to XMS-API users.
-        0x07 => {
+        // AH=03h/05h — Global/local Enable A20. The virtual gate cannot be
+        // enabled, so report the specified A20 error instead of claiming a
+        // state change while leaving the HMA alias in place.
+        0x03 | 0x05 => {
+            regs.rax &= !0xFFFF;
+            regs.rbx = (regs.rbx & !0xFF) | 0x82;
+        }
+        // AH=04h/06h — Global/local Disable A20. It is already disabled.
+        0x04 | 0x06 => {
             regs.rax = (regs.rax & !0xFFFF) | 1;
-            regs.rbx &= !0xFFFF;
+        }
+        // AH=07h — Query A20 state: disabled, with no query error.
+        0x07 => {
+            regs.rax &= !0xFFFF;
         }
         // AH=08h — Query free extended memory
         0x08 => {
-            let xms = xms_state(dos);
-            let largest = xms.largest_free_kb();
-            let total = xms.free_kb();
+            let (_xms, memory) = xms_parts(dos);
+            let physical = memory.available_pages(machine).saturating_mul(4).min(u16::MAX as usize) as u16;
+            let largest = (memory.largest_bytes(machine, XMS_BASE, super::memory::general_limit(), 4096) / 1024)
+                .min(u32::from(physical)) as u16;
+            let total = physical;
             regs.rax = (regs.rax & !0xFFFF) | largest as u64; // largest free block (KB)
             regs.rdx = (regs.rdx & !0xFFFF) | total as u64;   // total free (KB)
+            if total == 0 { regs.rbx = (regs.rbx & !0xFF) | 0xA0; }
         }
         // AH=09h — Allocate extended memory block (DX=size in KB)
         0x09 => {
             let size_kb = regs.rdx as u16;
-            let xms = xms_state(dos);
-            let mut handle = None;
-            for i in 0..MAX_XMS_HANDLES {
-                if xms.handles[i].is_none() {
-                    handle = Some(i);
-                    break;
+            let (xms, memory) = xms_parts(dos);
+            match allocate_emb(machine, xms, memory, u32::from(size_kb)) {
+                Ok(handle) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.rdx = (regs.rdx & !0xFFFF) | u64::from(handle);
                 }
-            }
-            match handle {
-                Some(i) => {
-                    let size_bytes = size_kb as u32 * 1024;
-                    match xms.find_free(size_bytes) {
-                        Some(base) => {
-                            xms.handles[i] = Some(XmsHandle {
-                                base,
-                                size_kb,
-                                locked: false,
-                            });
-                            regs.rax = (regs.rax & !0xFFFF) | 1;
-                            regs.rdx = (regs.rdx & !0xFFFF) | (i + 1) as u64;
-                        }
-                        None => {
-                            regs.rax &= !0xFFFF;
-                            regs.rbx = (regs.rbx & !0xFF) | 0xA0;
-                        }
-                    }
-                }
-                None => {
+                Err(error) => {
                     regs.rax &= !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA1;
+                    regs.rdx &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
                 }
             }
         }
         // AH=0Ah — Free extended memory block (DX=handle)
         0x0A => {
             let handle = regs.rdx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if xms.handles[handle as usize - 1].take().is_some() {
+            let (xms, memory) = xms_parts(dos);
+            let Some(slot) = handle_index(handle) else {
+                regs.rax &= !0xFFFF;
+                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
+                return thread::KernelAction::Done;
+            };
+            match xms.handles[slot] {
+                Some(block) if block.lock_count != 0 => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | 0xAB;
+                }
+                Some(block) => {
+                    if let Some(base) = block.base {
+                        let _ = memory.free(machine, super::memory::XMS_OWNER, base);
+                    }
+                    xms.handles[slot] = None;
                     regs.rax = (regs.rax & !0xFFFF) | 1;
-                } else {
+                }
+                None => {
                     regs.rax &= !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
                 }
-            } else {
-                regs.rax &= !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
         // AH=0Bh — Move extended memory block (DS:SI = move struct)
@@ -197,10 +213,15 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
         0x0C => {
             let handle = regs.rdx as u16;
             let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref mut h) = xms.handles[handle as usize - 1] {
-                    h.locked = true;
-                    let addr = h.base;
+            if let Some(slot) = handle_index(handle) {
+                if let Some(ref mut h) = xms.handles[slot] {
+                    if h.lock_count == u8::MAX {
+                        regs.rax &= !0xFFFF;
+                        regs.rbx = (regs.rbx & !0xFF) | 0xAC;
+                        return thread::KernelAction::Done;
+                    }
+                    h.lock_count += 1;
+                    let addr = h.base.unwrap_or(0);
                     regs.rdx = (regs.rdx & !0xFFFF) | (addr >> 16) as u64;
                     regs.rbx = (regs.rbx & !0xFFFF) | (addr & 0xFFFF) as u64;
                     regs.rax = (regs.rax & !0xFFFF) | 1;
@@ -217,10 +238,15 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
         0x0D => {
             let handle = regs.rdx as u16;
             let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref mut h) = xms.handles[handle as usize - 1] {
-                    h.locked = false;
-                    regs.rax = (regs.rax & !0xFFFF) | 1;
+            if let Some(slot) = handle_index(handle) {
+                if let Some(ref mut h) = xms.handles[slot] {
+                    if h.lock_count == 0 {
+                        regs.rax &= !0xFFFF;
+                        regs.rbx = (regs.rbx & !0xFF) | 0xAA;
+                    } else {
+                        h.lock_count -= 1;
+                        regs.rax = (regs.rax & !0xFFFF) | 1;
+                    }
                 } else {
                     regs.rax &= !0xFFFF;
                     regs.rbx = (regs.rbx & !0xFF) | 0xA2;
@@ -234,13 +260,12 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
         0x0E => {
             let handle = regs.rdx as u16;
             let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if let Some(ref h) = xms.handles[handle as usize - 1] {
-                    let lock_count = if h.locked { 1u8 } else { 0 };
-                    let free_handles = xms.handles.iter().filter(|h| h.is_none()).count() as u8;
+            if let Some(slot) = handle_index(handle) {
+                if let Some(ref h) = xms.handles[slot] {
+                    let free_handles = free_handle_count(xms) as u8;
                     // BH=lock count, BL=free handles
-                    regs.rbx = (regs.rbx & !0xFFFF) | (lock_count as u64) << 8 | free_handles as u64;
-                    regs.rdx = (regs.rdx & !0xFFFF) | h.size_kb as u64;
+                    regs.rbx = (regs.rbx & !0xFFFF) | (h.lock_count as u64) << 8 | free_handles as u64;
+                    regs.rdx = (regs.rdx & !0xFFFF) | u64::from(h.size_kb as u16);
                     regs.rax = (regs.rax & !0xFFFF) | 1;
                 } else {
                     regs.rax &= !0xFFFF;
@@ -251,49 +276,80 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
-        // AH=0Fh — Reallocate extended memory block (DX=handle, BX=new size KB)
-        // This implementation allocates a fresh block and does not preserve contents.
+        // AH=0Fh — Reallocate extended memory block (DX=handle, BX=new size KB).
+        // The common manager preserves the old pages if relocation is needed.
         0x0F => {
             let handle = regs.rdx as u16;
             let new_kb = regs.rbx as u16;
-            let xms = xms_state(dos);
-            if handle >= 1 && (handle as usize - 1) < MAX_XMS_HANDLES {
-                if xms.handles[handle as usize - 1].is_some() {
-                    let old = xms.handles[handle as usize - 1].take().unwrap();
-                    let new_bytes = new_kb as u32 * 1024;
-                    match xms.find_free(new_bytes) {
-                        Some(base) => {
-                            xms.handles[handle as usize - 1] = Some(XmsHandle {
-                                base,
-                                size_kb: new_kb,
-                                locked: old.locked,
-                            });
-                            regs.rax = (regs.rax & !0xFFFF) | 1;
-                        }
-                        None => {
-                            // Preserve the original handle when the new allocation fails.
-                            xms.handles[handle as usize - 1] = Some(old);
-                            regs.rax &= !0xFFFF;
-                            regs.rbx = (regs.rbx & !0xFF) | 0xA0;
-                        }
-                    }
-                } else {
-                    regs.rax &= !0xFFFF;
-                    regs.rbx = (regs.rbx & !0xFF) | 0xA2;
+            let (xms, memory) = xms_parts(dos);
+            match resize_emb(machine, xms, memory, handle, u32::from(new_kb)) {
+                Ok(()) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
                 }
+                Err(error) => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+                }
+            }
+        }
+        // AH=88h — Query free extended memory (32-bit, XMS 3.0)
+        0x88 => {
+            let (_xms, memory) = xms_parts(dos);
+            let free = memory.available_pages(machine).saturating_mul(4)
+                .min(u32::MAX as usize) as u32;
+            let largest = (memory.largest_bytes(
+                machine, XMS_BASE, super::memory::general_limit(), 4096,
+            ) / 1024).min(free);
+            regs.rax = (regs.rax & !0xFFFF_FFFF) | u64::from(largest);
+            regs.rdx = (regs.rdx & !0xFFFF_FFFF) | u64::from(free);
+            regs.rcx = (regs.rcx & !0xFFFF_FFFF)
+                | u64::from(XMS_BASE + super::memory::client_bytes() - 1);
+            regs.rbx = (regs.rbx & !0xFF) | if free == 0 { 0xA0 } else { 0 };
+        }
+        // AH=89h — Allocate Any Extended Memory (32-bit size in EDX).
+        0x89 => {
+            let size_kb = regs.rdx as u32;
+            let (xms, memory) = xms_parts(dos);
+            match allocate_emb(machine, xms, memory, size_kb) {
+                Ok(handle) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                    regs.rdx = (regs.rdx & !0xFFFF) | u64::from(handle);
+                }
+                Err(error) => {
+                    regs.rax &= !0xFFFF;
+                    regs.rdx &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+                }
+            }
+        }
+        // AH=8Eh — Get Extended EMB Handle Information.
+        0x8E => {
+            let handle = regs.rdx as u16;
+            let xms = xms_state(dos);
+            if let Some(h) = handle_index(handle).and_then(|slot| xms.handles[slot]) {
+                regs.rax = (regs.rax & !0xFFFF) | 1;
+                regs.rbx = (regs.rbx & !0xFFFF) | (u64::from(h.lock_count) << 8);
+                regs.rcx = (regs.rcx & !0xFFFF) | free_handle_count(xms) as u64;
+                regs.rdx = (regs.rdx & !0xFFFF_FFFF) | u64::from(h.size_kb);
             } else {
                 regs.rax &= !0xFFFF;
                 regs.rbx = (regs.rbx & !0xFF) | 0xA2;
             }
         }
-        // AH=88h — Query free extended memory (32-bit, XMS 3.0)
-        0x88 => {
-            let xms = xms_state(dos);
-            let free = xms.free_kb() as u32;
-            regs.rax = (regs.rax & !0xFFFF) | (free & 0xFFFF) as u64;
-            regs.rdx = (regs.rdx & !0xFFFF) | (free & 0xFFFF) as u64;
-            regs.rcx = (regs.rcx & !0xFFFFFFFF) | (XMS_END - 1) as u64;
-            regs.rbx &= !0xFFFF;
+        // AH=8Fh — Reallocate Any Extended Memory (32-bit size in EBX).
+        0x8F => {
+            let handle = regs.rdx as u16;
+            let size_kb = regs.rbx as u32;
+            let (xms, memory) = xms_parts(dos);
+            match resize_emb(machine, xms, memory, handle, size_kb) {
+                Ok(()) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                }
+                Err(error) => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+                }
+            }
         }
         // AH=10h — Request Upper Memory Block (DX=size in paragraphs)
         0x10 => {
@@ -322,6 +378,25 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
                 regs.rbx = (regs.rbx & !0xFF) | 0xB2; // invalid UMB segment
             }
         }
+        // AH=12h — Reallocate Upper Memory Block.
+        0x12 => {
+            let segment = regs.rdx as u16;
+            let paragraphs = regs.rbx as u16;
+            match umb_resize(machine, segment, paragraphs) {
+                Ok(_) => {
+                    regs.rax = (regs.rax & !0xFFFF) | 1;
+                }
+                Err(0xB0) => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | 0xB0;
+                    regs.rdx = (regs.rdx & !0xFFFF) | u64::from(umb_largest());
+                }
+                Err(error) => {
+                    regs.rax &= !0xFFFF;
+                    regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+                }
+            }
+        }
         _ => {
             dos_trace!("XMS: UNHANDLED AH={:02X}", ah);
             regs.rax &= !0xFFFF; // failure
@@ -347,55 +422,70 @@ fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
     let dst_handle = machine.read::<u16>((addr + 10) as usize);
     let dst_offset = machine.read::<u32>((addr + 12) as usize);
 
-    if length == 0 {
-        regs.rax = (regs.rax & !0xFFFF) | 1;
-        regs.rbx &= !0xFFFF;
+    if length & 1 != 0 {
+        regs.rax &= !0xFFFF;
+        regs.rbx = (regs.rbx & !0xFF) | 0xA7;
+        return;
+    }
+    let length32 = match u32::try_from(length) {
+        Ok(length) => length,
+        Err(_) => {
+            regs.rax &= !0xFFFF;
+            regs.rbx = (regs.rbx & !0xFF) | 0xA7;
+            return;
+        }
+    };
+
+    let xms = xms_state(dos);
+    let resolve = |handle: u16, offset: u32, bad_handle: u8, bad_offset: u8|
+        -> Result<u32, u8>
+    {
+        if handle == 0 {
+            // Intel DWORD notation: low word is offset, high word is segment.
+            let segment = offset >> 16;
+            let displacement = offset & 0xFFFF;
+            let address = (segment << 4).checked_add(displacement).ok_or(bad_offset)?;
+            let end = address.checked_add(length32).ok_or(bad_offset)?;
+            if end > DIRECT_LIMIT { return Err(bad_offset); }
+            return Ok(address);
+        }
+        let slot = handle_index(handle).ok_or(bad_handle)?;
+        let block = xms.handles[slot].ok_or(bad_handle)?;
+        let end = offset.checked_add(length32).ok_or(bad_offset)?;
+        let bytes = block.size_kb.checked_mul(1024).ok_or(bad_offset)?;
+        if end > bytes { return Err(bad_offset); }
+        match block.base {
+            Some(base) => base.checked_add(offset).ok_or(bad_offset),
+            None if end == 0 => Ok(0),
+            None => Err(bad_offset),
+        }
+    };
+    let src = match resolve(src_handle, src_offset, 0xA3, 0xA4) {
+        Ok(address) => address,
+        Err(error) => {
+            regs.rax &= !0xFFFF;
+            regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+            return;
+        }
+    };
+    let dst = match resolve(dst_handle, dst_offset, 0xA5, 0xA6) {
+        Ok(address) => address,
+        Err(error) => {
+            regs.rax &= !0xFFFF;
+            regs.rbx = (regs.rbx & !0xFF) | u64::from(error);
+            return;
+        }
+    };
+
+    let overlaps = src < dst.saturating_add(length32) && dst < src.saturating_add(length32);
+    if overlaps && src >= dst {
+        regs.rax &= !0xFFFF;
+        regs.rbx = (regs.rbx & !0xFF) | 0xA8;
         return;
     }
 
-    // Resolve source to linear address
-    let xms = xms_state(dos);
-    let src = if src_handle == 0 {
-        // Conventional memory: offset is seg:off packed as off(16):seg(16)
-        let seg = src_offset >> 16;
-        let off = src_offset & 0xFFFF;
-        (seg << 4) + off
-    } else {
-        let idx = src_handle as usize - 1;
-        match xms.handles.get(idx).and_then(|h| h.as_ref()) {
-            Some(h) if (src_offset as usize) + length <= h.size_kb as usize * 1024 => {
-                h.base + src_offset
-            }
-            _ => {
-                regs.rax &= !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA3;
-                return;
-            }
-        }
-    };
-
-    // Resolve dest to linear address
-    let dst = if dst_handle == 0 {
-        let seg = dst_offset >> 16;
-        let off = dst_offset & 0xFFFF;
-        (seg << 4) + off
-    } else {
-        let idx = dst_handle as usize - 1;
-        match xms.handles.get(idx).and_then(|h| h.as_ref()) {
-            Some(h) if (dst_offset as usize) + length <= h.size_kb as usize * 1024 => {
-                h.base + dst_offset
-            }
-            _ => {
-                regs.rax &= !0xFFFF;
-                regs.rbx = (regs.rbx & !0xFF) | 0xA5;
-                return;
-            }
-        }
-    };
-
     machine.copy_within(src as usize, dst as usize, length);
     regs.rax = (regs.rax & !0xFFFF) | 1;
-    regs.rbx &= !0xFFFF;
 }
 
 // ── Upper Memory Area: page scan + UMB allocator ───────────────────────
@@ -418,6 +508,10 @@ static UMA_FREE_LO: AtomicU32 = AtomicU32::new(0);
 static UMA_FREE_HI: AtomicU32 = AtomicU32::new(0);
 static UMB_ALLOC_LO: AtomicU32 = AtomicU32::new(0);
 static UMB_ALLOC_HI: AtomicU32 = AtomicU32::new(0);
+/// Allocation length in 4 KiB pages, present only at each block's first page.
+/// This prevents releasing one UMB from consuming a separately allocated
+/// adjacent run in the bitmap.
+static UMB_LEN: [AtomicU8; UMA_PAGES] = [const { AtomicU8::new(0) }; UMA_PAGES];
 
 fn load64(lo: &AtomicU32, hi: &AtomicU32) -> u64 {
     (hi.load(Relaxed) as u64) << 32 | lo.load(Relaxed) as u64
@@ -450,6 +544,8 @@ pub(super) fn scan_uma<A: crate::Arch>(machine: &mut A) {
         }
     }
     store64(&UMA_FREE_LO, &UMA_FREE_HI, free);
+    store64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, 0);
+    for length in &UMB_LEN { length.store(0, Relaxed); }
 
     // Find 16 contiguous free pages for the EMS page frame (64KB).
     // Prefer 0xD000 (standard EMS frame address).
@@ -510,6 +606,7 @@ fn umb_alloc<A: crate::Arch>(machine: &mut A, paragraphs: u16) -> Option<(u16, u
                     alloc_mask |= 1 << j;
                 }
                 or64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, alloc_mask);
+                UMB_LEN[run_start].store(pages_needed as u8, Relaxed);
                 let base_page = UMA_BASE + run_start;
                 machine.unmap_range(base_page, pages_needed);
                 let seg = (base_page as u16) * 0x100;
@@ -526,22 +623,53 @@ fn umb_alloc<A: crate::Arch>(machine: &mut A, paragraphs: u16) -> Option<(u16, u
 /// Free a UMB by segment address.
 fn umb_free<A: crate::Arch>(machine: &mut A, segment: u16) -> bool {
     let page = (segment / 0x100) as usize;
-    if !(UMA_BASE..UMA_END).contains(&page) { return false; }
-    let offset = page - UMA_BASE;
-
-    let alloc = load64(&UMB_ALLOC_LO, &UMB_ALLOC_HI);
-    if alloc & (1 << offset) == 0 { return false; }
-
-    let mut mask = 0u64;
-    let mut i = offset;
-    while i < UMA_PAGES && alloc & (1 << i) != 0 {
-        mask |= 1 << i;
-        i += 1;
+    if !(UMA_BASE..UMA_END).contains(&page) || segment as usize != page * 0x100 {
+        return false;
     }
-    let count = i - offset;
+    let offset = page - UMA_BASE;
+    let count = UMB_LEN[offset].swap(0, Relaxed) as usize;
+    if count == 0 { return false; }
+    let mask = ((1u64 << count) - 1) << offset;
     and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
     machine.unmap_range(page, count);
     true
+}
+
+/// Resize a UMB without moving its segment. The implementation may return a
+/// page-rounded block; XMS explicitly returns the actual paragraph count.
+fn umb_resize<A: crate::Arch>(machine: &mut A, segment: u16, paragraphs: u16)
+    -> Result<u16, u8>
+{
+    let page = (segment / 0x100) as usize;
+    if !(UMA_BASE..UMA_END).contains(&page) || segment as usize != page * 0x100 {
+        return Err(0xB2);
+    }
+    let offset = page - UMA_BASE;
+    let old_pages = UMB_LEN[offset].load(Relaxed) as usize;
+    if old_pages == 0 { return Err(0xB2); }
+    let new_pages = (usize::from(paragraphs) * 16).div_ceil(0x1000);
+    if new_pages == 0 { return Err(0xB0); }
+    if new_pages == old_pages { return Ok((new_pages as u16) * 0x100); }
+
+    if new_pages < old_pages {
+        let released = old_pages - new_pages;
+        let released_offset = offset + new_pages;
+        let mask = ((1u64 << released) - 1) << released_offset;
+        and64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, !mask);
+        UMB_LEN[offset].store(new_pages as u8, Relaxed);
+        machine.unmap_range(UMA_BASE + released_offset, released);
+        return Ok((new_pages as u16) * 0x100);
+    }
+
+    let growth = new_pages - old_pages;
+    let growth_offset = offset + old_pages;
+    if growth_offset + growth > UMA_PAGES { return Err(0xB0); }
+    let mask = ((1u64 << growth) - 1) << growth_offset;
+    if umb_avail() & mask != mask { return Err(0xB0); }
+    or64(&UMB_ALLOC_LO, &UMB_ALLOC_HI, mask);
+    UMB_LEN[offset].store(new_pages as u8, Relaxed);
+    machine.unmap_range(UMA_BASE + growth_offset, growth);
+    Ok((new_pages as u16) * 0x100)
 }
 
 /// Largest free UMB in paragraphs.

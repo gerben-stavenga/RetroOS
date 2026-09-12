@@ -208,8 +208,10 @@ fn fits_8_3(name: &[u8]) -> bool {
         Some(p) => (&name[..p], &name[p + 1..]),
         None => (name, &b""[..]),
     };
-    if base.len() > 8 || ext.len() > 3 { return false; }
-    if base.is_empty() && ext.is_empty() { return false; }
+    // A DOS directory entry always has a basename. Unix dotfiles such as
+    // `.INI` are long names from the DOS namespace's point of view; exposing
+    // `.INI` verbatim makes file managers confuse it with a dot entry.
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 { return false; }
     base.iter().all(|&b| is_dos_legal(b))
         && ext.iter().all(|&b| is_dos_legal(b))
 }
@@ -748,6 +750,14 @@ mod tests {
 
         assert_eq!(first, b"FOO");
         assert_eq!(second, b"FOO~1");
+    }
+
+    #[test]
+    fn unix_dotfile_receives_a_valid_nonempty_dos_basename() {
+        let aliases = BTreeMap::new();
+
+        assert!(!super::fits_8_3(b".INI"));
+        assert_eq!(compute_alias_8_3(b".INI", &aliases), b"~1.INI");
     }
 
     #[test]

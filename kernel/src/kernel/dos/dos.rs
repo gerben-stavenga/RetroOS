@@ -3738,12 +3738,14 @@ fn exec_return<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, r
         // owned before its bookkeeping disappears.
         if let Some(ref mut parent_dpmi) = parent.dpmi {
             parent_dpmi.unmap_all_physical(machine);
+            dos.memory.release_owner(machine, parent_dpmi.memory_owner());
         }
     } else {
         // A normal child exit drops its DPMI state. Device mappings are
         // externally owned and therefore require explicit virtual unmapping.
         if let Some(ref mut child_dpmi) = dos.dpmi {
             child_dpmi.unmap_all_physical(machine);
+            dos.memory.release_owner(machine, child_dpmi.memory_owner());
         }
         dos.dpmi = parent.dpmi;
         dos.pm_vectors = parent.pm_vectors;

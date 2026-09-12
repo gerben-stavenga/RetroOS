@@ -43,6 +43,7 @@ mod machine;
 mod present;
 mod xms;
 mod ems;
+mod memory;
 // The DOS ABI core (INT 21h/33h services). Named `dosabi` rather than `dos` so
 // it does not shadow its parent module; `dos` stays a local alias for the many
 // in-file references.
@@ -131,6 +132,9 @@ pub struct DosState<A: crate::Arch> {
     pub exec_parent: Option<ExecParent>,
     pub xms: Option<alloc::boxed::Box<xms::XmsState>>,
     pub ems: Option<alloc::boxed::Box<ems::EmsState>>,
+    /// One committed extended-memory pool shared by XMS, EMS and every DPMI
+    /// client (including suspended parents across nested EXEC).
+    pub memory: memory::DosMemory,
     /// FCB-FindFirst (AH=11h/12h) search state. Still a single enumeration:
     /// the FCB surface has nowhere better to keep a cursor, and no DOS program
     /// we run interleaves FCB searches. The handle-based AH=4Eh/4Fh path uses
@@ -162,11 +166,6 @@ pub struct DosState<A: crate::Arch> {
     pub ldt: alloc::boxed::Box<[u64; dpmi::LDT_ENTRIES]>,
     pub ldt_alloc: [u32; dpmi::LDT_ENTRIES / 32],
     pub pm_vectors: [(u16, u32); 256],
-    /// Monotonic DPMI linear-memory high-water mark shared across nested
-    /// clients. EXEC suspends the parent's DPMI state, but the child's
-    /// allocations still live in the same linear address space and must not
-    /// overlap the parent's protected-mode stack or heap blocks.
-    pub dpmi_mem_next: u32,
     /// Downward-growing allocator for DPMI 0800h physical mappings. Shared
     /// across nested EXEC clients because their mappings coexist in this
     /// address space while the parent's DPMI state is suspended.
@@ -277,6 +276,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).exec_parent).write(None);
             core::ptr::addr_of_mut!((*p).xms).write(None);
             core::ptr::addr_of_mut!((*p).ems).write(None);
+            core::ptr::addr_of_mut!((*p).memory).write(memory::DosMemory::new());
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).find_path), 0, 1);
             core::ptr::addr_of_mut!((*p).find_path_len).write(0);
             core::ptr::addr_of_mut!((*p).find_idx).write(0);
@@ -289,7 +289,6 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).ldt).write(ldt);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).ldt_alloc), 0, 1);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_vectors), 0, 1);
-            core::ptr::addr_of_mut!((*p).dpmi_mem_next).write(dpmi::MEM_BASE);
             core::ptr::addr_of_mut!((*p).dpmi_phys_next).write(dpmi::PHYS_MAP_TOP);
             core::ptr::write_bytes(core::ptr::addr_of_mut!((*p).pm_rm_vector_shadow), 0, 1);
             core::ptr::addr_of_mut!((*p).dpmi).write(None);
@@ -319,10 +318,13 @@ impl<A: crate::Arch> DosState<A> {
         }
         if let Some(ref mut dpmi) = self.dpmi {
             dpmi.unmap_all_physical(machine);
+            self.memory.release_owner(machine, dpmi.memory_owner());
         }
         if let Some(ref mut ems) = self.ems {
-            ems.free_all_pages();
+            ems.free_all_pages(machine);
         }
+        self.memory.release_owner(machine, memory::EMS_OWNER);
+        self.memory.release_owner(machine, memory::XMS_OWNER);
         self.ems = None;
         self.xms = None;
         // Hand the single global ISA-DMA pool back; a dying thread that

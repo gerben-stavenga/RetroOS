@@ -1188,8 +1188,9 @@ fn present_desktop<A: crate::Arch>(
     compose_sample.finish(machine, crate::kernel::osd_profile::Stage::Compose,
         frame.damage.iter().map(|r| r.width as usize * r.height as usize).sum());
     let present_sample = crate::kernel::osd_profile::Sample::start(machine);
-    let presented = display.present_packed(
-        machine, bios_workspace, canvas_width, canvas_height, frame.pixels,
+    let presented = display.present_packed_regions(
+        machine, bios_workspace, canvas_width, canvas_height,
+        frame.pixels, &frame.damage,
     );
     present_sample.finish(machine, crate::kernel::osd_profile::Stage::Present,
         presented);
