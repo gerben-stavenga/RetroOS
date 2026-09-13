@@ -262,11 +262,6 @@ pub struct PcMachine {
     /// Reads of port 0x71 pass through to the host CMOS using this index.
     pub cmos_index: u8,
 
-    /// Non-zero while an explicit DPMI INT 10h VBE call is executing the
-    /// native option ROM. The value identifies the outer RM call so native,
-    /// wide-decoded BIOS I/O is enabled only for that exact excursion.
-    pub native_vbe_io_rmcs: u32,
-
     /// PM/RM transition state. The pm-side cursor isn't a separate
     /// field — it's `regs.SS:SP` when user is on pm side, or
     /// `locked_stack.other_stack` (an `(SS, SP)` pair) when user is on
@@ -583,7 +578,6 @@ impl PcMachine {
             core::ptr::addr_of_mut!((*p).mpu).write(Mpu::new());
             core::ptr::addr_of_mut!((*p).spk).write(sound::speaker::Speaker::new());
             core::ptr::addr_of_mut!((*p).cmos_index).write(0);
-            core::ptr::addr_of_mut!((*p).native_vbe_io_rmcs).write(0);
             core::ptr::addr_of_mut!((*p).locked_stack)
                 .write(super::mode_transitions::LockedStackState::new());
             boxed.assume_init()
@@ -624,16 +618,6 @@ fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
 }
 
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
-    if native_vbe_byte_port(pc, port) {
-        return machine.inb(port);
-    }
-    if pc.vga.native().is_some_and(|native| native.is_vbe()) {
-        return match port {
-            0x3DA => input_status1(machine, &pc.present_scratch2),
-            0x3C0..=0x3DF | 0x01CE..=0x01D0 => 0xFF,
-            _ => emulate_inb_non_vga(machine, pc, port),
-        };
-    }
     emulate_inb_non_vga(machine, pc, port)
 }
 
@@ -655,27 +639,34 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
         // case is gone: QEMU is not a VGA reference, and `--firmware uefi` is
         // the supported way to run it (run.sh warns on the BIOS combination).
         0x3DA => {
-            // Reading 0x3DA returns Input Status #1 AND resets the attribute-
-            // controller write flip-flop — mirror that side effect either way.
-            if let Some(dev) = pc.vga.emulated_mut() {
-                dev.state.ac_state.pending_data = false;
-                return input_status1(machine, &pc.present_scratch2);
+            use crate::kernel::bios_display::LegacyVgaIo;
+            match pc.vga.legacy_vga_io() {
+                LegacyVgaIo::Emulated(state) => {
+                    // Reading 0x3DA returns Input Status #1 AND resets the
+                    // attribute-controller write flip-flop.
+                    state.ac_state.pending_data = false;
+                    input_status1(machine, &pc.present_scratch2)
+                }
+                LegacyVgaIo::Native => {
+                    crate::kernel::drivers::vga_hw::track_ac_reset();
+                    machine.inb(0x3DA)
+                }
+                LegacyVgaIo::Absent => 0xFF,
             }
-            crate::kernel::drivers::vga_hw::track_ac_reset();
-            machine.inb(0x3DA)
         }
         // VGA ports — pass through to hardware, or the emulated register file
         // when this thread does not own the physical VGA lease.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
-            match pc.vga.emulated_mut() {
-                Some(dev) => dev.state.port_read(port),
-                None => machine.inb(port),
+            use crate::kernel::bios_display::LegacyVgaIo;
+            match pc.vga.legacy_vga_io() {
+                LegacyVgaIo::Emulated(state) => state.port_read(port),
+                LegacyVgaIo::Native => machine.inb(port),
+                LegacyVgaIo::Absent => 0xFF,
             }
         }
-        // Bochs/QEMU VBE Display Interface (BVDI). SeaBIOS uses these
-        // to configure QEMU's emulated VGA, even for legacy modes.
-        // Pass through so SeaBIOS sees real VBE state.
-        0x01CE..=0x01D0 => machine.inb(port),
+        // VBE has no guest-visible register interface. Firmware backends use
+        // chipset ports only inside the isolated BIOS workspace.
+        0x01CE..=0x01D0 => 0xFF,
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
         // reads return 0xFF (floating data lines, weakly pulled high by
@@ -759,41 +750,33 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
 
 /// Emulate OUT to a port.
 pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, val: u8) {
-    if native_vbe_byte_port(pc, port) {
-        machine.outb(port, val);
-        return;
-    }
-    if pc.vga.native().is_some_and(|native| native.is_vbe())
-        && matches!(port, 0x3C0..=0x3DF | 0x01CE..=0x01D0)
-    {
-        return;
-    }
     match port {
         // VGA ports — pass through to hardware (tracking the AC flip-flop +
         // index, which hardware can't read back), or the emulated register
         // file when no card is present (it has its own per-thread flip-flop).
         0x3C0 => {
-            if let Some(dev) = pc.vga.emulated_mut() {
-                vga::port_write(machine, &mut dev.state, port, val);
-                return;
+            use crate::kernel::bios_display::LegacyVgaIo;
+            match pc.vga.legacy_vga_io() {
+                LegacyVgaIo::Emulated(state) => vga::port_write(machine, state, port, val),
+                LegacyVgaIo::Native => {
+                    // The flip-flop and index are write-only in the silicon,
+                    // so the card's own driver tracks them.
+                    crate::kernel::drivers::vga_hw::track_ac_write(val);
+                    machine.outb(port, val);
+                }
+                LegacyVgaIo::Absent => {}
             }
-            // Native card: the flip-flop and index are write-only in the
-            // silicon, so the card's own driver tracks them.
-            crate::kernel::drivers::vga_hw::track_ac_write(val);
-            machine.outb(port, val);
         }
         0x3C1..=0x3DF => {
-            let dev = match pc.vga.emulated_mut() {
-                Some(dev) => dev,
-                None => {
-                    machine.outb(port, val);
-                    return;
-                }
-            };
-            vga::port_write(machine, &mut dev.state, port, val);
+            use crate::kernel::bios_display::LegacyVgaIo;
+            match pc.vga.legacy_vga_io() {
+                LegacyVgaIo::Emulated(state) => vga::port_write(machine, state, port, val),
+                LegacyVgaIo::Native => machine.outb(port, val),
+                LegacyVgaIo::Absent => {}
+            }
         }
-        // Bochs/QEMU VBE Display Interface (BVDI) — see emulate_inb.
-        0x01CE..=0x01D0 => machine.outb(port, val),
+        // VBE has no guest-visible register interface; see emulate_inb.
+        0x01CE..=0x01D0 => {}
         // Master PIC command
         0x20 => {
             if let Some(retired_irq) = pc.vpic.master_ocw2(val) {
@@ -987,63 +970,14 @@ fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
     }
 }
 
-/// Native option-ROM ports are width-preserving: one trapped INW/INL becomes
-/// one host INW/INL at the same port. Emulated byte devices retain their own
-/// lane behavior below; the generic dispatcher must not turn native wide I/O
-/// into accesses to adjacent ports.
-fn native_vbe_byte_port(pc: &PcMachine, port: u16) -> bool {
-    pc.native_vbe_io_rmcs != 0
-        && matches!(port, 0xCF8..=0xCFF | 0xF140..=0xF147)
-}
-
-fn port_range_contains(first: u16, last: u16, port: u16, size: u32) -> bool {
-    port >= first && (port as u32).saturating_add(size).saturating_sub(1) <= last as u32
-}
-
-fn native_atomic_port(pc: &PcMachine, port: u16, size: u32) -> bool {
-    (size == 2 && matches!(port, 0x01CE..=0x01D0))
-        || (pc.native_vbe_io_rmcs != 0
-            && matches!(size, 2 | 4)
-            && (port_range_contains(0xCF8, 0xCFF, port, size)
-                || port_range_contains(0xF140, 0xF147, port, size)))
-}
-
-fn native_in<A: crate::Arch>(machine: &mut A, port: u16, size: u32) -> u32 {
-    match size {
-        1 => machine.inb(port) as u32,
-        2 => machine.inw(port) as u32,
-        4 => machine.inl(port),
-        _ => unreachable!("invalid port-I/O width"),
-    }
-}
-
-fn native_out<A: crate::Arch>(machine: &mut A, port: u16, size: u32, val: u32) {
-    match size {
-        1 => machine.outb(port, val as u8),
-        2 => machine.outw(port, val as u16),
-        4 => machine.outl(port, val),
-        _ => unreachable!("invalid port-I/O width"),
-    }
-}
-
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up.
 pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
-    if native_atomic_port(pc, port, size) {
-        let val = native_in(machine, port, size) as u64;
-        let mask = if size == 2 { 0xFFFF } else { 0xFFFF_FFFF };
-        regs.rax = (regs.rax & !mask) | val;
-        return;
-    }
     // PCI configuration space (mechanism #1), served whole rather than through
     // the per-byte path below: 0xCF8 is a latched dword and a config read must
     // answer as a unit, where four ISA byte reads would each fall to the
     // unpopulated-bus arm and report 0xFF — no card. Glide's DOS backend
     // reaches the board with raw `inpd`/`outpd` here, not through the PCI BIOS.
-    // A native option ROM owns these ports whenever it is driving real
-    // hardware, so the emulated card answers only when it is not.
-    if !native_vbe_byte_port(pc, port)
-        && let Some(val) = pci_config_in(pc, port, size)
-    {
+    if let Some(val) = pci_config_in(pc, port, size) {
         let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
         regs.rax = (regs.rax & !mask) | (val as u64 & mask);
         return;
@@ -1060,11 +994,7 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
 pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
-    if native_atomic_port(pc, port, size) {
-        native_out(machine, port, size, val as u32);
-        return;
-    }
-    if !native_vbe_byte_port(pc, port) && pci_config_out(pc, port, size, val as u32) {
+    if pci_config_out(pc, port, size, val as u32) {
         return;
     }
 
@@ -1080,16 +1010,9 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = string_index(regs.rdi, addr32);
-    if native_atomic_port(pc, port, size) {
-        let bytes = native_in(machine, port, size).to_le_bytes();
-        for (i, &byte) in bytes.iter().enumerate().take(size as usize) {
-            machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i as u32))) as usize, byte);
-        }
-    } else {
-        for i in 0..size {
-            let b = emulate_inb(machine, pc, port + i as u16);
-            machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
-        }
+    for i in 0..size {
+        let b = emulate_inb(machine, pc, port + i as u16);
+        machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     advance_string_index(&mut regs.rdi, size, addr32, df);
@@ -1102,19 +1025,9 @@ pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, re
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = string_index(regs.rsi, addr32);
-    if native_atomic_port(pc, port, size) {
-        let mut bytes = [0u8; 4];
-        for (i, byte) in bytes.iter_mut().enumerate().take(size as usize) {
-            *byte = machine.read::<u8>(
-                (ds_base.wrapping_add(si.wrapping_add(i as u32))) as usize,
-            );
-        }
-        native_out(machine, port, size, u32::from_le_bytes(bytes));
-    } else {
-        for i in 0..size {
-            let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
-            emulate_outb(machine, pc, regs, port + i as u16, b);
-        }
+    for i in 0..size {
+        let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
+        emulate_outb(machine, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     advance_string_index(&mut regs.rsi, size, addr32, df);

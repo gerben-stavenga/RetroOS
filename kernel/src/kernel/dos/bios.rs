@@ -1288,7 +1288,7 @@ pub(super) fn int10<A: crate::Arch>(
             // Bounce pointer-bearing PM calls through the ROM's private RM
             // workspace. The substitute/emulated path below owns its ports.
             let subfn = (ax & 0xFF) as u8;
-            if dos.pc.vga.is_native() {
+            if dos.pc.vga.native_legacy_vga() {
                 let (mut buffer, copy_to_bios, guest_dst) = match subfn {
                     0x02 => {
                         let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
@@ -1609,13 +1609,7 @@ fn vbe<A: crate::Arch>(
         }
         0x03 => {
             let cur = if let Some(display) = dos.pc.vga.native() {
-                match display.cap()
-                    .bios_current_vbe_mode(machine, bios_display)
-                {
-                    Ok(Some((mode, linear))) => mode.number | if linear { 0x4000 } else { 0 },
-                    Ok(None) => 0,
-                    Err(_) => { done(regs, false); return; }
-                }
+                display.vbe_state().map_or(0, |state| state.request)
             } else {
                 match dos.pc.vga.emulated().expect("DOS video has no VGA state").resume {
                     crate::kernel::bios_display::VideoResume::Vbe { request, .. } => request,
@@ -1634,8 +1628,8 @@ fn vbe<A: crate::Arch>(
             done(regs, ok);
         }
         0x07 => {
-            let ok = if let Some(display) = dos.pc.vga.native() {
-                display.cap().guest_bios_display_start(
+            let ok = if let Some(display) = dos.pc.vga.native_mut() {
+                display.cap_mut().guest_bios_display_start(
                     machine, bios_display, regs,
                 ).is_ok()
             } else {
@@ -1672,15 +1666,15 @@ fn vbe_palette<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    let indexed = if let Some(display) = dos.pc.vga.native() {
-        display.is_indexed_vbe()
+    let has_palette = if let Some(display) = dos.pc.vga.native() {
+        display.has_vbe_palette()
     } else {
         matches!(dos.pc.vga.emulated().expect("DOS video has no VGA state").resume,
             crate::kernel::bios_display::VideoResume::Vbe { mode, .. }
-                if matches!(mode.format,
-                    crate::kernel::display::FormatSpec::Indexed8))
+                if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                    || mode.programmable_ramp)
     };
-    if !indexed { return false; }
+    if !has_palette { return false; }
     let count = regs.rcx as u16 as usize;
     let start = regs.rdx as u16;
     if start >= 256 || count > 256 - usize::from(start) { return false; }
@@ -1695,26 +1689,26 @@ fn vbe_palette<A: crate::Arch>(
         if ok && subfn == 1 { machine.copy_to(tbl, &data); }
         return ok;
     }
+    let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
     match regs.rbx as u8 {
         0x00 | 0x80 => {
-            // Set (00h) / set-during-retrace (80h): we apply immediately.
-            emulate_outb(machine, &mut dos.pc, regs, 0x3C8, start as u8);
+            // Set (00h) / set-during-retrace (80h): update the VBE
+            // indexed-colour state directly. Raw VGA DAC ports are a
+            // different interface and are absent in the non-VGA-compatible
+            // modes exposed by RetroOS.
             for i in 0..count {
                 let e = tbl + i * 4;
                 let (b, g, r): (u8, u8, u8) = (machine.read(e), machine.read(e + 1), machine.read(e + 2));
-                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, r);
-                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, g);
-                emulate_outb(machine, &mut dos.pc, regs, 0x3C9, b);
+                let at = (usize::from(start) + i) * 3;
+                dev.state.dac[at..at + 3].copy_from_slice(&[r & 63, g & 63, b & 63]);
             }
             true
         }
         0x01 => {
-            // Get: read the DAC back into the caller's table.
-            emulate_outb(machine, &mut dos.pc, regs, 0x3C7, start as u8);
+            // Get: read the VBE palette shadow back into the caller's table.
             for i in 0..count {
-                let r = emulate_inb(machine, &mut dos.pc, 0x3C9);
-                let g = emulate_inb(machine, &mut dos.pc, 0x3C9);
-                let b = emulate_inb(machine, &mut dos.pc, 0x3C9);
+                let at = (usize::from(start) + i) * 3;
+                let (r, g, b) = (dev.state.dac[at], dev.state.dac[at + 1], dev.state.dac[at + 2]);
                 let e = tbl + i * 4;
                 machine.write::<u8>(e, b);
                 machine.write::<u8>(e + 1, g);
@@ -1900,8 +1894,8 @@ fn vbe_scan_line<A: crate::Arch>(
     dos: &mut super::DosState<A>,
     regs: &mut Regs,
 ) -> bool {
-    if let Some(display) = dos.pc.vga.native() {
-        return display.cap().guest_bios_scan_line_length(machine, bios, regs).is_ok();
+    if let Some(display) = dos.pc.vga.native_mut() {
+        return display.cap_mut().guest_bios_scan_line_length(machine, bios, regs).is_ok();
     }
     let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
     let crate::kernel::bios_display::VideoResume::Vbe {
@@ -1976,7 +1970,7 @@ fn vbe_window<A: crate::Arch>(
 ) -> bool {
     if let Some(display) = dos.pc.as_mut().vga.native_mut() {
         let set = ((regs.rbx >> 8) as u8 == 0).then_some(regs.rdx as u16);
-        return match display.cap().guest_bios_window(machine, bios_display, set) {
+        return match display.cap_mut().guest_bios_window(machine, bios_display, set) {
             Ok(bank) => {
                 regs.rdx = (regs.rdx & !0xFFFF) | u64::from(bank);
                 true

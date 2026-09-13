@@ -49,12 +49,13 @@ const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
 const DEBUG_ITEM_PRINT_PROFILE: usize = 2;
 const DEBUG_ITEM_DUMP: usize = 3;
-const DEBUG_ITEM_PROFILE_CPU: usize = 4;
-const DEBUG_ITEM_PROFILE_LOOP_IRQ: usize = 5;
-const DEBUG_ITEM_PROFILE_DEV_AUDIO: usize = 6;
-const DEBUG_ITEM_PROFILE_DISPLAY_INPUT: usize = 7;
-const DEBUG_ITEM_PROFILE_DISPATCH_SCHED: usize = 8;
-const DEBUG_NUM_ITEMS_BASE: usize = 4;
+const DEBUG_ITEM_VIDEO_MODE: usize = 4;
+const DEBUG_ITEM_PROFILE_CPU: usize = 5;
+const DEBUG_ITEM_PROFILE_LOOP_IRQ: usize = 6;
+const DEBUG_ITEM_PROFILE_DEV_AUDIO: usize = 7;
+const DEBUG_ITEM_PROFILE_DISPLAY_INPUT: usize = 8;
+const DEBUG_ITEM_PROFILE_DISPATCH_SCHED: usize = 9;
+const DEBUG_NUM_ITEMS_BASE: usize = 5;
 const DEBUG_PROFILE_ROWS: usize = 5;
 
 /// Master volume step, adjusted by ◄/► on the Volume row. The displayed
@@ -89,6 +90,13 @@ static VIF_WINDOWS: AtomicU32 = AtomicU32::new(0);
 static VIF_PREDICTED: AtomicU32 = AtomicU32::new(0);
 static VIF_DEBUG_TRAPS: AtomicU32 = AtomicU32::new(0);
 static VIF_STEPS: AtomicU32 = AtomicU32::new(0);
+// Focused DOS VGA mode, snapshotted with the rest of the OSD diagnostics.
+// KIND 0 means that the focused personality has no emulated VGA register
+// image; DETAIL is row bytes, except for text (cell_w:cell_h) and SVGA (bpp).
+static VIDEO_KIND: AtomicU32 = AtomicU32::new(0);
+static VIDEO_WIDTH: AtomicU32 = AtomicU32::new(0);
+static VIDEO_HEIGHT: AtomicU32 = AtomicU32::new(0);
+static VIDEO_DETAIL: AtomicU32 = AtomicU32::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
@@ -459,6 +467,33 @@ pub fn refresh_windows<A: crate::Arch>(
         ] {
             changed |= counter.swap(value, Ordering::Relaxed) != value;
         }
+    }
+    let video_mode = threads.get(focused).and_then(|thread| match &thread.personality {
+        thread::Personality::Dos(dos) => dos.pc.vga.emulated()
+            .and_then(|vga| vga.state.current_mode()),
+        _ => None,
+    });
+    let video = match video_mode {
+        None => (0, 0, 0, 0),
+        Some(vga::VgaMode::Text { cols, rows, cell_w, cell_h }) =>
+            (1, u32::from(cols), u32::from(rows), u32::from(cell_w) << 8 | u32::from(cell_h)),
+        Some(vga::VgaMode::Mode13h) => (2, 320, 200, 0),
+        Some(vga::VgaMode::Cga4) => (3, 320, 200, 4),
+        Some(vga::VgaMode::Cga2) => (4, 640, 200, 2),
+        Some(vga::VgaMode::Planar16 { w, h, row_bytes }) =>
+            (5, u32::from(w), u32::from(h), u32::from(row_bytes)),
+        Some(vga::VgaMode::ModeX { w, h, row_bytes }) =>
+            (6, u32::from(w), u32::from(h), u32::from(row_bytes)),
+        Some(vga::VgaMode::LinearSvga { w, h, bpp, .. }) =>
+            (7, u32::from(w), u32::from(h), u32::from(bpp)),
+    };
+    for (counter, value) in [
+        (&VIDEO_KIND, video.0),
+        (&VIDEO_WIDTH, video.1),
+        (&VIDEO_HEIGHT, video.2),
+        (&VIDEO_DETAIL, video.3),
+    ] {
+        changed |= counter.swap(value, Ordering::Relaxed) != value;
     }
     let debug_count = debug_item_count();
     if DEBUG_SEL.load(Ordering::Relaxed) >= debug_count {
@@ -1211,6 +1246,7 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             }
             DEBUG_ITEM_PRINT_PROFILE => line.put(b"Print profile"),
             DEBUG_ITEM_DUMP => line.put(b"Dump state"),
+            DEBUG_ITEM_VIDEO_MODE => video_mode_line(line),
             DEBUG_ITEM_PROFILE_CPU if crate::kernel::startup::profile_enabled() => {
                 let s = crate::kernel::startup::profile_snapshot();
                 line.put(b"CPU guest/kernel ");
@@ -1272,6 +1308,38 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
             WINDOWS_ITEM_KILL => line.put(b"Kill task"),
             _ => {}
         },
+    }
+}
+
+fn video_mode_line(line: &mut Line) {
+    let kind = VIDEO_KIND.load(Ordering::Relaxed);
+    let width = VIDEO_WIDTH.load(Ordering::Relaxed);
+    let height = VIDEO_HEIGHT.load(Ordering::Relaxed);
+    let detail = VIDEO_DETAIL.load(Ordering::Relaxed);
+    line.put(b"VGA ");
+    match kind {
+        1 => {
+            line.put(b"text ");
+            line.put_num(width);
+            line.put(b"x");
+            line.put_num(height);
+            line.put(b" ");
+            line.put_num(detail >> 8);
+            line.put(b"x");
+            line.put_num(detail & 0xff);
+        }
+        2 => line.put(b"13h 320x200"),
+        3 => line.put(b"CGA4 320x200"),
+        4 => line.put(b"CGA2 640x200"),
+        5 | 6 | 7 => {
+            line.put(if kind == 5 { b"planar16 " } else if kind == 6 { b"Mode X " } else { b"SVGA " });
+            line.put_num(width);
+            line.put(b"x");
+            line.put_num(height);
+            line.put(if kind == 7 { b"x" } else { b" r" });
+            line.put_num(detail);
+        }
+        _ => line.put(b"unavailable"),
     }
 }
 

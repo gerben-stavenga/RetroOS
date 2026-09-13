@@ -29,11 +29,6 @@ fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
     let client_use32 = dos.dpmi.as_ref().unwrap().client_use32;
     let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, client_use32);
     let rm = machine.read::<RmCallStruct>((struct_addr) as usize);
-    if matches!(transfer, Transfer::Interrupt(0x10))
-        && rm.eax as u16 & 0xFF00 == 0x4F00
-        && crate::kernel::platform::get().firmware == crate::kernel::platform::Firmware::NativeBios
-    { dos.pc.native_vbe_io_rmcs = struct_addr; }
-
     let rm_stack = if rm.ss == 0 { mode_transitions::rm_stack(dos, regs) }
                    else { (rm.ss, rm.sp as u32) };
     machine.write::<RmCallStruct>(struct_addr as usize, RmCallStruct::capture(regs));

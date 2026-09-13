@@ -82,6 +82,18 @@ pub enum DosVideo {
     Fullscreen(FullscreenVga),
 }
 
+/// The legacy VGA card visible through the 3C0h..3DFh register window.
+///
+/// VBE is deliberately absent from this type: it is a BIOS API, not another
+/// port-programmed card.  A VBE mode therefore leaves no legacy VGA register
+/// target, regardless of whether its framebuffer is RAM-backed or owned by a
+/// native firmware backend.
+pub(crate) enum LegacyVgaIo<'a> {
+    Emulated(&'a mut vga::VgaState),
+    Native,
+    Absent,
+}
+
 impl DosVideo {
     pub fn emulated(&self) -> Option<&EmulatedVga> {
         match self {
@@ -113,6 +125,31 @@ impl DosVideo {
 
     pub fn is_native(&self) -> bool { self.native().is_some() }
     pub fn is_fullscreen(&self) -> bool { matches!(self, Self::Fullscreen(_)) }
+
+    pub(crate) fn native_legacy_vga(&self) -> bool {
+        matches!(self,
+            Self::Fullscreen(FullscreenVga::Native(native))
+                if native.legacy_vga_active())
+    }
+
+    pub(crate) fn legacy_vga_io(&mut self) -> LegacyVgaIo<'_> {
+        match self {
+            Self::Vga(dev) | Self::Fullscreen(FullscreenVga::Emulated(dev, _)) => {
+                if matches!(dev.resume, VideoResume::Legacy { .. }) {
+                    LegacyVgaIo::Emulated(&mut dev.state)
+                } else {
+                    LegacyVgaIo::Absent
+                }
+            }
+            Self::Fullscreen(FullscreenVga::Native(native)) => {
+                if native.legacy_vga_active() {
+                    LegacyVgaIo::Native
+                } else {
+                    LegacyVgaIo::Absent
+                }
+            }
+        }
+    }
 }
 
 impl EmulatedVga {
@@ -582,8 +619,8 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     }
 
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
-    /// bit. The persistent firmware workspace remains the authority for the
-    /// resulting current mode.
+    /// bit. Firmware applies the operation, then the RetroOS shadow becomes
+    /// authoritative for the resulting VBE state.
     fn set_mode_request(
         &mut self,
         machine: &mut A,
@@ -613,9 +650,10 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status == 0x004F {
-            let indexed = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8);
-            bios_display.mark_vbe(number, indexed, mode.vga_compatible);
-            if indexed {
+            let has_palette = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                || mode.programmable_ramp;
+            bios_display.mark_vbe(mode, request);
+            if has_palette {
                 let palette = IndexedPalette::new();
                 let mut entries = alloc::vec![0; 256 * 4];
                 palette.read(0, &mut entries)?;
@@ -630,30 +668,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         }
     }
 
-    /// Ask the persistent firmware instance which VBE mode currently owns the
-    /// adapter. Legacy modes return `None`; VBE returns its descriptor and the
-    /// LFB bit reported by 4F03h.
-    fn current_vbe_mode(
-        &mut self,
-        machine: &mut A,
-        display: &crate::kernel::platform::VgaCap,
-    ) -> Result<Option<(crate::kernel::platform::VbeMode, bool)>, BiosError> {
-        let mut regs = Regs::empty();
-        regs.rax = 0x4F03;
-        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
-        let status = regs.rax as u16;
-        if status != 0x004F {
-            return Err(BiosError::Rejected(status));
-        }
-        let request = regs.rbx as u16;
-        let number = request & 0x3FFF;
-        if number <= 0xFF {
-            return Ok(None);
-        }
-        let mode = self.mode(number).ok_or(BiosError::Rejected(0x014F))?;
-        Ok(Some((mode, request & 0x4000 != 0)))
-    }
-
     fn current_legacy_mode(
         &mut self,
         machine: &mut A,
@@ -665,15 +679,24 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         Ok(regs.rax as u8)
     }
 
-    /// Forward VBE 4F07h (set/get display start).  This call has no pointer
-    /// parameters, so the native firmware remains authoritative without
-    /// exposing any address from its private workspace to the DOS client.
+    /// Apply VBE 4F07h display-start changes to the physical backend. Reads
+    /// are answered exclusively from RetroOS's authoritative shadow.
     fn display_start(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::VgaCap,
+        display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
+        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
+        if caller.rbx as u8 == 1 {
+            caller.rax = (caller.rax & !0xFFFF) | 0x004F;
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(state.display_start.0);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(state.display_start.1);
+            return Ok(());
+        }
+        if !matches!(caller.rbx as u8, 0 | 0x80) {
+            return Err(BiosError::Rejected(0x014F));
+        }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
         let mut regs = Regs::empty();
         regs.rax = input[0];
@@ -683,23 +706,38 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         caller.rax = regs.rax;
-        if input[0] as u16 == 0x4F09 && regs.rax as u16 != 0x004F {
-            return Err(BiosError::Rejected(regs.rax as u16));
-        }
         caller.rbx = regs.rbx;
         caller.rcx = regs.rcx;
         caller.rdx = regs.rdx;
-        if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
+        if status != 0x004F { return Err(BiosError::Rejected(status)); }
+        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.display_start =
+            (input[2] as u16, input[3] as u16);
+        Ok(())
     }
 
-    /// Forward VBE 4F06h logical scan-line control. It has no guest pointers;
-    /// the modeled result is copied back into the caller registers.
+    /// Apply VBE 4F06h logical scan-line changes to the physical backend.
+    /// Query operations are answered from RetroOS's authoritative shadow.
     fn scan_line_length(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::VgaCap,
+        display: &mut crate::kernel::platform::VgaCap,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
+        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
+        if matches!(caller.rbx as u8, 1 | 3) {
+            let step = u16::from(state.mode.bits_per_pixel.div_ceil(8)).max(1);
+            caller.rax = (caller.rax & !0xFFFF) | 0x004F;
+            caller.rbx = (caller.rbx & !0xFFFF) | u64::from(state.logical_pitch);
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(state.logical_pitch / step);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(
+                (state.mode.framebuffer_bytes / u32::from(state.logical_pitch.max(1)))
+                    .min(u32::from(u16::MAX)) as u16,
+            );
+            return Ok(());
+        }
+        if !matches!(caller.rbx as u8, 0 | 2) {
+            return Err(BiosError::Rejected(0x014F));
+        }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
         let mut regs = Regs::empty();
         regs.rax = input[0];
@@ -712,25 +750,33 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         caller.rbx = regs.rbx;
         caller.rcx = regs.rcx;
         caller.rdx = regs.rdx;
-        if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
+        if status != 0x004F { return Err(BiosError::Rejected(status)); }
+        let pitch = regs.rbx as u16;
+        if pitch == 0 { return Err(BiosError::InvalidFrame); }
+        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.logical_pitch = pitch;
+        Ok(())
     }
 
-    /// Forward VBE 4F05h to the same persistent firmware instance. This is
-    /// authoritative even when a program used a firmware window-function
-    /// entry rather than the substitute BIOS path.
+    /// Apply VBE 4F05h bank changes to the physical backend. Bank queries are
+    /// answered from the RetroOS shadow, including calls through WinFuncPtr.
     fn window(
         &mut self,
         machine: &mut A,
-        display: &crate::kernel::platform::VgaCap,
+        display: &mut crate::kernel::platform::VgaCap,
         set: Option<u16>,
     ) -> Result<u16, BiosError> {
+        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
+        let current = state.bank.ok_or(BiosError::Rejected(0x014F))?;
+        let Some(bank) = set else { return Ok(current); };
         let mut regs = Regs::empty();
         regs.rax = 0x4F05;
-        regs.rbx = if set.is_some() { 0 } else { 0x0100 };
-        regs.rdx = u64::from(set.unwrap_or(0));
+        regs.rbx = 0;
+        regs.rdx = u64::from(bank);
         self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
-        if status == 0x004F { Ok(regs.rdx as u16) } else { Err(BiosError::Rejected(status)) }
+        if status != 0x004F { return Err(BiosError::Rejected(status)); }
+        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.bank = Some(bank);
+        Ok(bank)
     }
 
     pub fn mode(&self, number: u16) -> Option<crate::kernel::platform::VbeMode> {
@@ -768,7 +814,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         Ok(())
     }
 
-    /// RetroOS indexed-SVGA service. Reads never enter the physical ROM or
+    /// RetroOS VBE palette/ramp service. Reads never enter the physical ROM or
     /// access the DAC. Successful writes commit the same values to the shadow.
     fn indexed_palette_call(
         &mut self,
@@ -1419,14 +1465,6 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?.set_bank(machine, self, mode, bank)
     }
 
-    pub fn bios_current_vbe_mode<A: Arch>(
-        &self,
-        machine: &mut A,
-        bios: &mut BiosDisplayWorkspace<A>,
-    ) -> Result<Option<(crate::kernel::platform::VbeMode, bool)>, BiosError> {
-        self.bios(bios)?.current_vbe_mode(machine, self)
-    }
-
     pub fn bios_current_legacy_mode<A: Arch>(
         &self,
         machine: &mut A,
@@ -1436,7 +1474,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     pub fn guest_bios_window<A: Arch>(
-        &self,
+        &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         set: Option<u16>,
@@ -1445,7 +1483,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     pub fn guest_bios_display_start<A: Arch>(
-        &self,
+        &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         caller: &mut Regs,
@@ -1454,7 +1492,7 @@ impl crate::kernel::platform::VgaCap {
     }
 
     pub fn guest_bios_scan_line_length<A: Arch>(
-        &self,
+        &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         caller: &mut Regs,

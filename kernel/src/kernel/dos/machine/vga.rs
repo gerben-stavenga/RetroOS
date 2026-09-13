@@ -57,55 +57,39 @@ impl EmulatedVga {
         }
     }
 
-    /// The single native-to-emulated transition. Capture every piece of state
-    /// that lived only in the adapter, publish its framebuffer into the guest
-    /// address space, and return the still-unmodified card capability.
+    /// The single native-to-emulated transition. Legacy VGA state is captured
+    /// from the authoritative adapter. VBE metadata/palette come from the
+    /// authoritative RetroOS shadows; only its directly mapped framebuffer is
+    /// copied back from hardware.
     fn snapshot_native<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         native: &mut crate::kernel::platform::NativeVga,
     ) -> Self {
         let mut model = VgaState::new_boxed();
-        let current = native.cap().bios_current_vbe_mode(machine, bios)
-            .unwrap_or_else(|error| lib::compact_panic!("native BIOS current-mode query failed: {:?}", error));
-        let current_bank = current.and_then(|(_, linear)| (!linear).then(|| {
-            native.cap().guest_bios_window(machine, bios, None)
-                .unwrap_or_else(|error| lib::compact_panic!("native BIOS current-bank query failed: {:?}", error))
-        }));
-        let physical_lfb = current.and_then(|(mode, linear)| linear.then_some(mode.physical_base));
-        let (resume, svga_pages) = if let Some((mode, linear)) = current {
+        let current = native.vbe_state();
+        let physical_lfb = current.and_then(|state| {
+            (state.request & 0x4000 != 0).then_some(state.mode.physical_base)
+        });
+        let (resume, svga_pages) = if let Some(active) = current {
+            let mode = active.mode;
             if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
                 || mode.programmable_ramp
             {
                 capture_native_vbe_palette(
-                    machine, bios, native.cap_mut(), mode, &mut model,
+                    bios, native.cap(), &mut model,
                 );
             }
-            let mut pitch_regs = Regs::empty();
-            pitch_regs.rax = 0x4F06;
-            pitch_regs.rbx = 1;
-            let logical_pitch = native.cap().guest_bios_scan_line_length(
-                machine, bios, &mut pitch_regs,
-            ).ok().map(|()| pitch_regs.rbx as u16)
-                .filter(|&pitch| pitch != 0)
-                .unwrap_or(mode.pitch);
-            let mut display_regs = Regs::empty();
-            display_regs.rax = 0x4F07;
-            display_regs.rbx = 0x0100;
-            let display_start = native.cap().guest_bios_display_start(
-                machine, bios, &mut display_regs,
-            ).map(|()| (display_regs.rcx as u16, display_regs.rdx as u16))
-                .unwrap_or((0, 0));
             let pages = capture_native_vbe(
-                machine, bios, native.cap_mut(), mode, current_bank,
-                logical_pitch, &mut model);
+                machine, bios, native.cap_mut(), mode, active.bank,
+                active.logical_pitch, &mut model);
             materialize_emulated_aperture(&mut model, machine);
             (VideoResume::Vbe {
                 mode,
-                request: mode.number | if linear { 0x4000 } else { 0 },
-                bank: current_bank,
-                display_start,
-                logical_pitch,
+                request: active.request,
+                bank: active.bank,
+                display_start: active.display_start,
+                logical_pitch: active.logical_pitch,
             }, pages)
         } else {
             let cirrus_readback = crate::kernel::platform::get().vga_readback;
@@ -569,8 +553,14 @@ fn live_vram_ptr() -> *mut u8 {
     base
 }
 
+fn live_vram_ptr_if_initialized() -> Option<core::ptr::NonNull<u8>> {
+    core::ptr::NonNull::new(
+        LIVE_VRAM.load(core::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// Borrow the device while guest execution and owner switches are excluded.
-pub(crate) fn live_planes<A: crate::Arch>(_machine: &A) -> &[u8] {
+pub(crate) fn live_planes<A>(_machine: &A) -> &[u8] {
     unsafe { core::slice::from_raw_parts(live_vram_ptr(), PLANES_LEN) }
 }
 
@@ -587,7 +577,7 @@ pub fn trapped_aperture(vga: &VgaState) -> Option<core::ops::Range<u16>> {
 /// pages; address-space teardown/fork must never free or privatize them.
 pub(crate) const VGA_VRAM_BASE: usize = 0x4100_0000;
 
-fn live_planes_mut<A: crate::Arch>(_machine: &mut A) -> &mut [u8] {
+fn live_planes_mut<A>(_machine: &mut A) -> &mut [u8] {
     // The exclusive machine borrow prevents guest entry/owner switches while
     // this kernel view is held. IRQ handlers never access emulated VRAM.
     unsafe { core::slice::from_raw_parts_mut(live_vram_ptr(), PLANES_LEN) }
@@ -823,11 +813,15 @@ fn restore_native_vbe<A: crate::Arch>(
         copy_banked_to_card(
             machine, bios, display, mode, bank.unwrap_or(0), &mut scratch,
         );
+        // The bulk copier restores this physical bank through its private
+        // low-level helper. Commit the same value to the authoritative VBE
+        // shadow through the public operation as well.
+        let _ = display.guest_bios_window(machine, bios, Some(bank.unwrap_or(0)));
     }
     if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
         || mode.programmable_ramp
     {
-        restore_native_vbe_palette(machine, bios, display, mode, state);
+        restore_native_vbe_palette(machine, bios, display, state);
     }
     let mut regs = Regs::empty();
     regs.rax = 0x4F07;
@@ -839,35 +833,12 @@ fn restore_native_vbe<A: crate::Arch>(
 }
 
 fn capture_native_vbe_palette<A: crate::Arch>(
-    machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-    display: &mut crate::kernel::platform::VgaCap,
-    mode: crate::kernel::platform::VbeMode,
+    display: &crate::kernel::platform::VgaCap,
     state: &mut VgaState,
 ) {
-    if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8) {
-        state.dac.copy_from_slice(display.bios_indexed_palette(bios)
-            .expect("native indexed VGA has no BIOS workspace"));
-        state.dac_mask = 0xFF;
-        state.dac_index = 0;
-        state.dac_state = 0;
-        return;
-    }
-    // Direct-colour programmable ramps are not indexed palettes.
-    let mut entries = alloc::vec![0; 256 * 4];
-    let mut regs = Regs::empty();
-    regs.rax = 0x4F09;
-    regs.rbx = 1;
-    regs.rcx = 256;
-    display.bios_palette_call(
-        machine, bios, &mut regs, Some(&mut entries), false, true,
-    ).unwrap_or_else(|error| lib::compact_panic!(
-        "native VBE mode has no palette/ramp read service: {:?}",
-        error,
-    ));
-    for (rgb, entry) in state.dac.chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
-        rgb.copy_from_slice(&[entry[2], entry[1], entry[0]]);
-    }
+    state.dac.copy_from_slice(display.bios_indexed_palette(bios)
+        .expect("native VBE palette has no BIOS workspace"));
     state.dac_mask = 0xFF;
     state.dac_index = 0;
     state.dac_state = 0;
@@ -877,30 +848,16 @@ fn restore_native_vbe_palette<A: crate::Arch>(
     machine: &mut A,
     bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     display: &mut crate::kernel::platform::VgaCap,
-    mode: crate::kernel::platform::VbeMode,
     state: &VgaState,
 ) {
     let mut entries = alloc::vec![0; 256 * 4];
     for (entry, rgb) in entries.chunks_exact_mut(4).zip(state.dac.chunks_exact(3)) {
         entry.copy_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
     }
-    if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8) {
-        display.bios_indexed_palette_call(machine, bios, 0, 0, &mut entries)
-            .unwrap_or_else(|error| lib::compact_panic!(
-                "native indexed VBE palette restore failed: {:?}", error,
-            ));
-        return;
-    }
-    let mut regs = Regs::empty();
-    regs.rax = 0x4F09;
-    regs.rbx = 0;
-    regs.rcx = 256;
-    display.bios_palette_call(
-        machine, bios, &mut regs, Some(&mut entries), true, true,
-    ).unwrap_or_else(|error| lib::compact_panic!(
-        "native VBE mode has no palette/ramp write service: {:?}",
-        error,
-    ));
+    display.bios_indexed_palette_call(machine, bios, 0, 0, &mut entries)
+        .unwrap_or_else(|error| lib::compact_panic!(
+            "native VBE palette/ramp restore failed: {:?}", error,
+        ));
 }
 
 fn copy_banked_from_card<A: crate::Arch>(
@@ -1222,6 +1179,14 @@ pub fn on_set_mode<A: crate::Arch>(
 /// write mode 1 (Mode X latched copy), write modes 2/3, or a multi-plane EGA
 /// write. Latches must have been loaded by a prior `vram_read`.
 pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, off: u32, byte: u8) {
+    if let Some(base) = live_vram_ptr_if_initialized() {
+        let planes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), PLANES_LEN) };
+        vram_write_live(planes, vga, off, byte);
+        return;
+    }
+
+    // Unit-test/early-construction fallback before the DOS VGA singleton has
+    // installed its permanent kernel mapping.
     let (off, map_mask) = vga.cpu_write_address(off as usize);
     let layout = vga.layout();
     let cur = core::array::from_fn(|p| {
@@ -1231,6 +1196,42 @@ pub fn vram_write<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, 
     for p in 0..4 {
         if out[p] != cur[p] {
             machine.write::<u8>(VGA_VRAM_BASE + layout.index(p, off), out[p]);
+        }
+    }
+}
+
+/// Apply one planar write through the permanent kernel mapping. The guest
+/// alias is intentionally absent while the VGA ALU is active; walking that
+/// alias through `GuestBytes` here used to perform four translated reads and
+/// up to four translated writes for every already-expensive #PF-emulated CPU
+/// byte.
+#[inline(always)]
+fn vram_write_live(planes: &mut [u8], vga: &mut VgaState, off: u32, byte: u8) {
+    let (off, map_mask) = vga.cpu_write_address(off as usize);
+    let layout = vga.layout();
+
+    // Ordinary Mode-X drawing is write mode 0 with an unrotated, unmasked CPU
+    // byte and no set/reset. In that configuration the VGA ALU reduces exactly
+    // to assigning the byte to every enabled plane; avoid fetching four old
+    // values and running the general ALU for the overwhelmingly common case.
+    if vga.gc[5] & 0x0B == 0
+        && vga.gc[3] & 0x1F == 0
+        && vga.gc[1] & 0x0F == 0
+        && vga.gc[8] == 0xFF
+    {
+        for p in 0..4 {
+            if map_mask & (1 << p) != 0 {
+                planes[layout.index(p, off)] = byte;
+            }
+        }
+        return;
+    }
+
+    let cur = core::array::from_fn(|p| planes[layout.index(p, off)]);
+    let out = ::vga::planar_write(cur, vga.latches, &vga.gc, map_mask, byte);
+    for p in 0..4 {
+        if out[p] != cur[p] {
+            planes[layout.index(p, off)] = out[p];
         }
     }
 }
@@ -1274,8 +1275,15 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
             break;
         }
         let n = (window_end - cur).min(src.len() - pos);
-        for (i, &byte) in src[pos..pos + n].iter().enumerate() {
-            vram_write(machine, vga, (cur + i - window_base) as u32, byte);
+        if let Some(base) = live_vram_ptr_if_initialized() {
+            let planes = unsafe { core::slice::from_raw_parts_mut(base.as_ptr(), PLANES_LEN) };
+            for (i, &byte) in src[pos..pos + n].iter().enumerate() {
+                vram_write_live(planes, vga, (cur + i - window_base) as u32, byte);
+            }
+        } else {
+            for (i, &byte) in src[pos..pos + n].iter().enumerate() {
+                vram_write(machine, vga, (cur + i - window_base) as u32, byte);
+            }
         }
         pos += n;
     }
@@ -1286,9 +1294,14 @@ pub fn copy_to_guest<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut DosVide
 pub fn vram_read<A: arch_abi::GuestBytes>(machine: &mut A, vga: &mut VgaState, off: u32) -> u8 {
     let (off, read_plane) = vga.cpu_read_address(off as usize);
     let layout = vga.layout();
-    let cur = core::array::from_fn(|p| {
-        machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
-    });
+    let cur = if let Some(base) = live_vram_ptr_if_initialized() {
+        let planes = unsafe { core::slice::from_raw_parts(base.as_ptr(), PLANES_LEN) };
+        core::array::from_fn(|p| planes[layout.index(p, off)])
+    } else {
+        core::array::from_fn(|p| {
+            machine.read::<u8>(VGA_VRAM_BASE + layout.index(p, off))
+        })
+    };
     let mut gc = vga.gc;
     gc[4] = read_plane as u8;
     let (data, latches) = ::vga::planar_read(cur, &gc);

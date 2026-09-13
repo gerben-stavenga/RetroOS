@@ -29,8 +29,7 @@ pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> a
     match personality {
         Personality::Dos(_) => {
             if let Personality::Dos(dos) = personality
-                && let Some(native) = dos.pc.vga.native()
-                && !native.is_vbe()
+                && dos.pc.vga.native_legacy_vga()
             {
                 policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
                 policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
