@@ -24,12 +24,15 @@ use crate::kernel::thread::Personality;
 /// deny everything, then open exactly the windows represented by its state.
 ///
 /// Called only by the CPU-loan boundary immediately before guest execution.
-pub(super) fn for_personality<A: crate::Arch>(personality: &Personality<A>) -> arch_abi::IoPolicy {
+pub(super) fn for_personality<A: crate::Arch>(
+    personality: &Personality<A>,
+    bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) -> arch_abi::IoPolicy {
     let mut policy = arch_abi::IoPolicy::deny_all();
     match personality {
         Personality::Dos(_) => {
             if let Personality::Dos(dos) = personality
-                && dos.pc.vga.native_legacy_vga()
+                && dos.pc.vga.native_legacy_vga(bios)
             {
                 policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
                 policy.allow(0x3DB, 5); // 0x3DB..=0x3DF

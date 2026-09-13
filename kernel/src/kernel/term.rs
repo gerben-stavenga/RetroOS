@@ -143,6 +143,7 @@ fn render(
         dac_mask: 0xFF,
         font: &FONT_8X16,
         font_b: &FONT_8X16,
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,

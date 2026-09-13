@@ -47,7 +47,7 @@ fn packed_rows_match_encoded_words_for_every_vga_mode() {
             plane_layout: vga::VramLayout::PlaneMinor,
             mode, vram: &memory, planes: &memory, ac: &ac, palette: &palette,
             dac_mask: 0x7F, font: &lib::vga_fonts::FONT_8X16,
-            font_b: &lib::vga_fonts::FONT_8X16, blink: true,
+            font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: true,
             cga_palette: [0, 0x123456, 0xABCDEF, 0xFFFFFF],
             start_offset: 8, pixel_pan: 1, line_compare: 1, blank_start: h - 1,
         };
@@ -89,7 +89,7 @@ fn packed_rows_share_tail_storage_without_corrupting_following_rows() {
             plane_layout: vga::VramLayout::PlaneMinor,
             mode: VgaMode::ModeX { w: width, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &palette, dac_mask: 0xFF,
-            font: &[], font_b: &[], blink: false, cga_palette: [0; 4],
+            font: &[], font_b: &[], font_maps: None, blink: false, cga_palette: [0; 4],
             start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: 3,
         };
         for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
@@ -117,6 +117,55 @@ fn packed_rows_share_tail_storage_without_corrupting_following_rows() {
 }
 
 #[test]
+fn packed_text_reads_cells_and_font_directly_from_vga_planes() {
+    let mut state = vga::LegacyVgaState::new_mode3_boxed();
+    let layout = state.layout();
+    state.planes[layout.index(0, 0)] = b'A';
+    state.planes[layout.index(1, 0)] = 0x0F;
+    let mut text = vec![0u8; 80 * 25 * 2];
+    for cell in 0..80 * 25 {
+        text[cell * 2] = state.planes[layout.index(0, cell)];
+        text[cell * 2 + 1] = state.planes[layout.index(1, cell)];
+    }
+    let ac = identity_ac();
+    let direct = Frame {
+        plane_layout: layout,
+        mode: TEXT80,
+        vram: &[],
+        planes: &state.planes,
+        ac: &ac,
+        palette: &state.dac,
+        dac_mask: state.dac_mask,
+        font: &[],
+        font_b: &[],
+        font_maps: Some((0, 0)),
+        blink: false,
+        cga_palette: [0; 4],
+        start_offset: 0,
+        pixel_pan: 0,
+        line_compare: usize::MAX,
+        blank_start: usize::MAX,
+    };
+    let compact = Frame {
+        vram: &text,
+        planes: &[],
+        font: &lib::vga_fonts::FONT_8X16,
+        font_b: &lib::vga_fonts::FONT_8X16,
+        font_maps: None,
+        ..direct
+    };
+    let mut pal = vga::Pal::new();
+    pal.sync(&state.dac, state.dac_mask, PixelFormat::NATIVE, &mut [0; 768]);
+    for y in 0..16 {
+        let mut expected = vec![0u8; 720 * 4 + vga::PACKED_ROW_PADDING];
+        let mut actual = vec![0u8; expected.len()];
+        vga::render_row_packed(&compact, y, &pal, &mut expected);
+        vga::render_row_packed(&direct, y, &pal, &mut actual);
+        assert_eq!(actual, expected, "text row {y}");
+    }
+}
+
+#[test]
 fn dimensions_match_modes() {
     assert_eq!(vga_render::dimensions(VgaMode::Mode13h), (320, 200));
     assert_eq!(vga_render::dimensions(TEXT80), (720, 400));
@@ -135,7 +184,7 @@ fn scanout_reads_either_live_plane_layout_without_reordering() {
     {
         let mut frame = Frame {
             mode, plane_layout: VramLayout::PlaneMinor, planes: &minor, vram: &[],
-            ac: &ac, palette: &palette, dac_mask: 0xFF, font: &[], font_b: &[],
+            ac: &ac, palette: &palette, dac_mask: 0xFF, font: &[], font_b: &[], font_maps: None,
             blink: false, cga_palette: [0; 4], start_offset: 0x4000,
             pixel_pan: 3, line_compare: 2, blank_start: 3,
         };
@@ -177,7 +226,7 @@ fn standard_text_requires_live_mode3_environment() {
 
 #[test]
 fn initial_mode3_state_is_complete() {
-    let state = vga_render::VgaState::new_mode3_boxed();
+    let state = vga_render::LegacyVgaState::new_mode3_boxed();
     assert_eq!(state.classify_mode(), Some(TEXT80));
     assert_eq!(state.planes.len(), 4 * 0x10000);
 
@@ -239,7 +288,7 @@ fn both_layouts_are_complete_bijections() {
 
 #[test]
 fn register_writes_move_vram_with_the_cpu_aperture() {
-    let mut state = *vga::VgaState::new_mode3_boxed();
+    let mut state = *vga::LegacyVgaState::new_mode3_boxed();
     let mut vram = state.planes.clone();
     // Materializing mode 3 produces the complete odd/even ordering. Its first
     // 32K is exactly the B800 CPU view, while plane set 2/3 remains preserved
@@ -276,7 +325,7 @@ fn register_writes_move_vram_with_the_cpu_aperture() {
 
 #[test]
 fn trapped_addressing_is_independent_of_backing_layout() {
-    let mut state = *vga::VgaState::new_mode3_boxed();
+    let mut state = *vga::LegacyVgaState::new_mode3_boxed();
     let mut vram = state.planes.clone();
     assert_eq!(state.layout(), VramLayout::OddEven);
 
@@ -311,7 +360,7 @@ fn trapped_addressing_is_independent_of_backing_layout() {
 
 #[test]
 fn byte_mode_odd_even_blits_preserve_full_plane_offsets() {
-    let mut state = vga::VgaState::new();
+    let mut state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(0x13).unwrap();
     state.seq = regs.seq;
     state.gc = regs.gc;
@@ -350,7 +399,7 @@ fn byte_mode_odd_even_blits_preserve_full_plane_offsets() {
 
 #[test]
 fn byte_mode_odd_even_cannot_use_compact_text_alias() {
-    let mut state = *vga::VgaState::new_mode3_boxed();
+    let mut state = *vga::LegacyVgaState::new_mode3_boxed();
     assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Direct { .. }));
     state.port_write(0x3D4, 0x17);
     let write = state.port_write(0x3D5, state.crtc[0x17] | 0x40);
@@ -365,7 +414,7 @@ fn byte_mode_odd_even_cannot_use_compact_text_alias() {
 
 #[test]
 fn odd_even_map_zero_exposes_the_full_128k_aperture() {
-    let mut state = vga::VgaState::new();
+    let mut state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(3).unwrap();
     state.seq = regs.seq;
     state.gc = regs.gc;
@@ -384,7 +433,7 @@ fn odd_even_map_zero_exposes_the_full_128k_aperture() {
 
 #[test]
 fn mode6_is_sequential_plane_zero_and_trapped() {
-    let mut state = vga::VgaState::new();
+    let mut state = vga::LegacyVgaState::new();
     let regs = vga::bios_mode_regs(6).unwrap();
     state.seq = regs.seq;
     state.gc = regs.gc;
@@ -474,6 +523,7 @@ fn mode13h_maps_each_index_through_the_palette() {
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -512,6 +562,7 @@ fn mode13h_tolerates_short_vram() {
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -540,7 +591,7 @@ fn packed_indexed_spans_preserve_short_source_and_palette_zero() {
             let frame = Frame {
                 mode, plane_layout: VramLayout::PlaneMinor,
                 vram: &memory[..len], planes: &memory[..len],
-                ac: &ac, palette: &palette, dac_mask: 0x7F, font: &[], font_b: &[],
+                ac: &ac, palette: &palette, dac_mask: 0x7F, font: &[], font_b: &[], font_maps: None,
                 blink: false, cga_palette: [0; 4], start_offset: 3,
                 pixel_pan: 7, line_compare: 2, blank_start: h,
             };
@@ -601,6 +652,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         dac_mask: 0xFF,
         font: &font,
         font_b: &font,
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -654,6 +706,7 @@ fn text_attribute_bit_three_selects_character_map() {
         dac_mask: 0xFF,
         font: &font_a,
         font_b: &font_b,
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,
@@ -683,7 +736,7 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
         plane_layout: vga::VramLayout::PlaneMinor,
         mode: TEXT40, vram: &vram, planes: &[],
         ac: &ac, palette: &pal,
-        dac_mask: 0xFF, font: &font, font_b: &font, blink: false, cga_palette: [0; 4],
+        dac_mask: 0xFF, font: &font, font_b: &font, font_maps: None, blink: false, cga_palette: [0; 4],
         start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
@@ -720,8 +773,8 @@ fn initial_vga_palette_has_standard_greys_and_hue_rings() {
     }
     assert!(p[248 * 3..].iter().all(|&v| v == 0));
     assert!(p.iter().all(|&v| v <= 63));
-    assert_eq!(vga::VgaState::new().dac, p);
-    assert_eq!(vga::VgaState::new_boxed().dac, p);
+    assert_eq!(vga::LegacyVgaState::new().dac, p);
+    assert_eq!(vga::LegacyVgaState::new_boxed().dac, p);
 }
 
 #[test]
@@ -770,6 +823,7 @@ fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
         dac_mask: 0xFF,
         font: &[],
         font_b: &[],
+        font_maps: None,
         blink: false,
         cga_palette: [0; 4],
         start_offset: 0,

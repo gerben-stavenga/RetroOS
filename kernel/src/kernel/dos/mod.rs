@@ -353,7 +353,10 @@ impl<A: crate::Arch> DosState<A> {
         machine: &mut A,
         bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     ) -> crate::kernel::display::DisplayHandoff {
-        machine::vga::release_fullscreen(&mut self.pc.vga, machine, bios_workspace)
+        let display = machine::vga::release_fullscreen(
+            &mut self.pc.vga, machine, bios_workspace);
+        dpmi::refresh_physical_mappings(machine, self);
+        display
     }
 
     /// Called when the thread regains focus. Repaints the VGA framebuffer
@@ -367,6 +370,7 @@ impl<A: crate::Arch> DosState<A> {
     ) {
         machine::vga::acquire_fullscreen(
             &mut self.pc.vga, machine, bios_workspace, display);
+        dpmi::refresh_physical_mappings(machine, self);
     }
 
     /// Acquire a handoff while preserving the adapter's current state. Unlike
@@ -378,6 +382,7 @@ impl<A: crate::Arch> DosState<A> {
         display: crate::kernel::display::DisplayHandoff,
     ) {
         machine::vga::acquire_fullscreen_replace(&mut self.pc.vga, machine, display);
+        dpmi::refresh_physical_mappings(machine, self);
     }
 
 }
@@ -630,7 +635,8 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
     let Some(dev) = dos.pc.vga.emulated_mut() else {
         return false;
     };
-    let Some(pages) = machine::vga::trapped_aperture(&dev.state) else {
+    let Some(state) = dev.state.legacy_mut() else { return false };
+    let Some(pages) = machine::vga::trapped_aperture(state) else {
         return false;
     };
     let base = u32::from(pages.start) << 12;
@@ -639,7 +645,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         return false;
     }
     let off = addr - base;
-    let mut target = machine::mmio::MmioTarget::Planar { vga: &mut dev.state, base, len };
+    let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len };
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 
@@ -929,22 +935,22 @@ fn handle_event_inner<A: crate::Arch>(
             }
         }
         KE::In { port, size } => {
-            machine::handle_in_event(machine, &mut dos.pc, regs, port, size.bytes());
+            machine::handle_in_event(machine, bios_display, &mut dos.pc, regs, port, size.bytes());
             thread::KernelAction::Done
         }
         KE::Out { port, size } => {
-            machine::handle_out_event(machine, &mut dos.pc, regs, port, size.bytes());
+            machine::handle_out_event(machine, bios_display, &mut dos.pc, regs, port, size.bytes());
             let delay = dos.pc.sb.probe_is_stepping();
             set_tf_source(dos, TF_DELAY, delay);
             regs.project_tf();
             thread::KernelAction::Done
         }
         KE::Ins { size, rep, addr32 } => {
-            machine::handle_ins_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
+            machine::handle_ins_event(machine, bios_display, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
         KE::Outs { size, rep, addr32 } => {
-            machine::handle_outs_event(machine, &mut dos.pc, regs, size.bytes(), rep, addr32);
+            machine::handle_outs_event(machine, bios_display, &mut dos.pc, regs, size.bytes(), rep, addr32);
             thread::KernelAction::Done
         }
         KE::Exception(n) => {
@@ -1583,7 +1589,7 @@ pub fn surface_buffer<'a, A: crate::Arch>(
     dos: &'a thread::DosState<A>,
     output_format: vga::PixelFormat,
 ) -> Option<crate::kernel::gui::PixelBuffer<'a>> {
-    let (width, height, format, pixels) = dos.pc.present_scratch2.surface()?;
+    let (width, height, format, pixels) = dos.pc.scanout.surface()?;
     if format != output_format { return None; }
     crate::kernel::gui::PixelBuffer::new(width, height, width * usize::from(format.bytes_per_pixel), format, pixels).ok()
 }
@@ -1607,7 +1613,7 @@ pub fn attach_retained_surface<A: crate::Arch>(
     desktop: &mut crate::kernel::gui::Desktop,
     endpoint: crate::kernel::gui::EndpointId,
 ) {
-    let Some((width, height, _, _)) = dos.pc.present_scratch2.surface() else { return };
+    let Some((width, height, _, _)) = dos.pc.scanout.surface() else { return };
     present::attach_retained_vga_surface(width, height, desktop, endpoint);
 }
 

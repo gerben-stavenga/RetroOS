@@ -1288,7 +1288,7 @@ pub(super) fn int10<A: crate::Arch>(
             // Bounce pointer-bearing PM calls through the ROM's private RM
             // workspace. The substitute/emulated path below owns its ports.
             let subfn = (ax & 0xFF) as u8;
-            if dos.pc.vga.native_legacy_vga() {
+            if dos.pc.vga.native_legacy_vga(bios_display) {
                 let (mut buffer, copy_to_bios, guest_dst) = match subfn {
                     0x02 => {
                         let tbl = es_offset(dos, regs, regs.rdx as u16 as u32);
@@ -1608,13 +1608,11 @@ fn vbe<A: crate::Arch>(
             done(regs, ok);
         }
         0x03 => {
-            let cur = if let Some(display) = dos.pc.vga.native() {
-                display.vbe_state().map_or(0, |state| state.request)
+            let cur = if let Some(_display) = dos.pc.vga.native() {
+                bios_display.vbe_state().map_or(0, |state| state.svga.mode_value())
             } else {
-                match dos.pc.vga.emulated().expect("DOS video has no VGA state").resume {
-                    crate::kernel::bios_display::VideoResume::Vbe { request, .. } => request,
-                    crate::kernel::bios_display::VideoResume::Legacy { .. } => 0,
-                }
+                dos.pc.vga.emulated().and_then(|dev| dev.state.svga())
+                    .map_or(0, |svga| svga.mode_value())
             };
             regs.rbx = (regs.rbx & !0xFFFF) | cur as u64;
             done(regs, true);
@@ -1637,7 +1635,10 @@ fn vbe<A: crate::Arch>(
             };
             done(regs, ok);
         }
-        0x08 => { vbe_dac_format(regs); done(regs, true); }
+        0x08 => {
+            let ok = vbe_dac_format(bios_display, dos, regs);
+            done(regs, ok);
+        }
         0x09 => {
             let ok = vbe_palette(machine, bios_display, dos, regs);
             done(regs, ok);
@@ -1651,15 +1652,41 @@ fn vbe<A: crate::Arch>(
     }
 }
 
-/// VBE 4F08h — Set/Get DAC palette format. We model only the 6-bit VGA DAC, so
-/// report BH=6 for both set and get (a client asking for 8-bit falls back).
-fn vbe_dac_format(regs: &mut Regs) {
-    regs.rbx = (regs.rbx & !0xFF00) | (6 << 8);
+/// VBE 4F08h — Set/Get DAC palette format. Changing the exposed width never
+/// rewrites the canonical eight-bit palette/ramp.
+fn vbe_dac_format<A: crate::Arch>(
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos: &mut super::DosState<A>,
+    regs: &mut Regs,
+) -> bool {
+    let palette = if dos.pc.vga.native().is_some() {
+        bios.vbe_state_mut().and_then(|state| {
+            (matches!(state.mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                || state.mode.programmable_ramp)
+                .then_some(&mut state.svga.palette)
+        })
+    } else {
+        dos.pc.vga.emulated_mut().and_then(|dev| {
+            let svga = dev.vbe_state_mut()?;
+            svga.config.palette_capable.then_some(&mut svga.palette)
+        })
+    };
+    let Some(palette) = palette else { return false };
+    match regs.rbx as u8 {
+        0 => {
+            if !palette.set_width((regs.rbx >> 8) as u8) { return false; }
+        }
+        1 => {}
+        _ => return false,
+    }
+    regs.rbx = (regs.rbx & !0xFF00) | (u64::from(palette.width) << 8);
+    true
 }
 
 /// VBE 4F09h — Set/Get Palette Data. CX entries from index DX at ES:DI, each 4
-/// bytes (Blue, Green, Red, align), 6-bit components. Native modes retain their
-/// shadow in the BIOS workspace; detached modes retain it in VgaState.dac.
+/// bytes (Blue, Green, Red, align), in the width selected through 4F08h.
+/// Native modes retain their shadow in the BIOS display service; detached
+/// modes retain a complete private copy in `EmulatedVga`.
 fn vbe_palette<A: crate::Arch>(
     machine: &mut A,
     bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -1667,12 +1694,14 @@ fn vbe_palette<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     let has_palette = if let Some(display) = dos.pc.vga.native() {
-        display.has_vbe_palette()
+        let _ = display;
+        bios_display.vbe_state().is_some_and(|state| {
+            matches!(state.mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                || state.mode.programmable_ramp
+        })
     } else {
-        matches!(dos.pc.vga.emulated().expect("DOS video has no VGA state").resume,
-            crate::kernel::bios_display::VideoResume::Vbe { mode, .. }
-                if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
-                    || mode.programmable_ramp)
+        dos.pc.vga.emulated().and_then(|dev| dev.state.svga())
+            .is_some_and(|svga| svga.config.palette_capable)
     };
     if !has_palette { return false; }
     let count = regs.rcx as u16 as usize;
@@ -1699,20 +1728,26 @@ fn vbe_palette<A: crate::Arch>(
             for i in 0..count {
                 let e = tbl + i * 4;
                 let (b, g, r): (u8, u8, u8) = (machine.read(e), machine.read(e + 1), machine.read(e + 2));
-                let at = (usize::from(start) + i) * 3;
-                dev.state.dac[at..at + 3].copy_from_slice(&[r & 63, g & 63, b & 63]);
+                let entry = [b, g, r, 0];
+                let Some(svga) = dev.state.svga_mut() else { return false };
+                if !svga.palette.write((usize::from(start) + i) as u16, &entry) {
+                    return false;
+                }
             }
             true
         }
         0x01 => {
             // Get: read the VBE palette shadow back into the caller's table.
             for i in 0..count {
-                let at = (usize::from(start) + i) * 3;
-                let (r, g, b) = (dev.state.dac[at], dev.state.dac[at + 1], dev.state.dac[at + 2]);
+                let mut entry = [0; 4];
+                let Some(svga) = dev.state.svga() else { return false };
+                if !svga.palette.read((usize::from(start) + i) as u16, &mut entry) {
+                    return false;
+                }
                 let e = tbl + i * 4;
-                machine.write::<u8>(e, b);
-                machine.write::<u8>(e + 1, g);
-                machine.write::<u8>(e + 2, r);
+                machine.write::<u8>(e, entry[0]);
+                machine.write::<u8>(e + 1, entry[1]);
+                machine.write::<u8>(e + 2, entry[2]);
                 machine.write::<u8>(e + 3, 0);
             }
             true
@@ -1751,6 +1786,9 @@ fn vbe_controller_info<A: crate::Arch>(
     machine.write::<u8>(lin + 2, b'S');
     machine.write::<u8>(lin + 3, b'A');
     machine.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
+    // Bit 0: the RetroOS VBE boundary supports switching between six- and
+    // eight-bit DAC components; storage remains canonical eight-bit.
+    machine.write::<u32>(lin + 0x0A, 1);
     let list = super::dos::vbe_mode_list_addr() as usize;
     // Far pointer 0000:list. The fixed LowMem target is below 64 KiB.
     machine.write::<u32>(lin + 0x0E, list as u32);
@@ -1783,12 +1821,11 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
 ) -> bool {
     let want = regs.rcx as u16 & 0x1FF;
     let mode = native_mode.or_else(|| substitute_vbe_mode(want));
-    let (w, h, bpp, banked_pitch, linear_pitch, physical_base, format,
-        window_segment, granularity, window_size, banked_pages, linear_pages) = if let Some(mode) = mode {
+    let (w, h, bpp, banked_pitch, linear_pitch, format,
+        banked_pages, linear_pages) = if let Some(mode) = mode {
         (mode.width, mode.height, mode.bits_per_pixel, mode.banked_pitch,
             mode.linear_pitch,
-            mode.physical_base, mode.format, mode.window_segment,
-            mode.window_granularity_kb, mode.window_size_kb,
+            mode.format,
             mode.banked_image_pages, mode.linear_image_pages)
     } else {
         return false;
@@ -1800,18 +1837,13 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     let direct = matches!(format, crate::kernel::display::FormatSpec::Packed(_));
     // ModeAttributes: supported|reserved|colour|graphics, plus LFB only when
     // the curated hardware mode actually has one.
-    machine.write::<u16>(lin, 0x003B | if physical_base != 0 { 0x0080 } else { 0 });
-    machine.write::<u8>(lin + 0x02, if window_segment != 0 { 0x07 } else { 0 });
+    machine.write::<u16>(lin, 0x003B | 0x0080);
+    machine.write::<u8>(lin + 0x02, 0x07);
     machine.write::<u8>(lin + 0x03, 0x00); // win B: not present
-    machine.write::<u16>(lin + 0x04, granularity); // granularity (KB)
-    machine.write::<u16>(lin + 0x06, window_size); // window size (KB)
-    machine.write::<u16>(lin + 0x08, window_segment); // win A segment
-    if window_segment != 0 {
-        // A process-owned real-mode thunk with the standard 4F05 register ABI.
-        // Guests may call this hot bank switch directly without learning the
-        // physical BIOS's private address-space pointer.
-        machine.write::<u32>(lin + 0x0C, super::dos::vbe_window_ptr());
-    }
+    machine.write::<u16>(lin + 0x04, 64); // normalized 64 KiB granularity
+    machine.write::<u16>(lin + 0x06, 64); // normalized 64 KiB window
+    machine.write::<u16>(lin + 0x08, 0xA000); // window A
+    machine.write::<u32>(lin + 0x0C, super::dos::vbe_window_ptr());
     machine.write::<u16>(lin + 0x10, banked_pitch); // banked bytes per scanline
     machine.write::<u16>(lin + 0x12, w);
     machine.write::<u16>(lin + 0x14, h);
@@ -1821,7 +1853,7 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     machine.write::<u8>(lin + 0x19, bpp);
     machine.write::<u8>(lin + 0x1A, 1); // banks
     machine.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
-    machine.write::<u8>(lin + 0x1C, window_size.min(u16::from(u8::MAX)) as u8); // bank size (KB)
+    machine.write::<u8>(lin + 0x1C, 64); // bank size (KB)
     machine.write::<u8>(lin + 0x1D, banked_pages);
     machine.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
     if direct {
@@ -1849,7 +1881,7 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
     // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
     // mirrors the banked pitch since the framebuffer is contiguous.
-    machine.write::<u32>(lin + 0x28, physical_base);
+    machine.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
     machine.write::<u16>(lin + 0x32, linear_pitch);
     machine.write::<u8>(lin + 0x35, linear_pages);
     true
@@ -1860,31 +1892,22 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
 /// state, and therefore survives OSD/background execution exactly.
 fn emulated_vbe_display_start(pc: &mut super::machine::PcMachine, regs: &mut Regs) -> bool {
     let Some(dev) = pc.vga.emulated_mut() else { return false };
-    let crate::kernel::bios_display::VideoResume::Vbe {
-        mode, display_start, logical_pitch, ..
-    } = &mut dev.resume else {
+    if dev.state.svga().is_none() {
         return regs.rbx as u8 == 0x01 && {
             regs.rcx &= !0xFFFF;
             regs.rdx &= !0xFFFF;
             true
         };
-    };
+    }
+    let Some(svga) = dev.state.svga_mut() else { return false };
     match regs.rbx as u8 {
         0x00 | 0x80 => {
-            let x = regs.rcx as u16;
-            let y = regs.rdx as u16;
-            let step = u32::from(mode.bits_per_pixel.div_ceil(8));
-            let start = u32::from(y) * u32::from(*logical_pitch) + u32::from(x) * step;
-            let visible = u32::from(mode.height.saturating_sub(1))
-                * u32::from(*logical_pitch)
-                + u32::from(mode.width) * step;
-            if start.saturating_add(visible) > mode.framebuffer_bytes { return false; }
-            *display_start = (x, y);
-            true
+            svga.display_start(Some((regs.rcx as u16, regs.rdx as u16))).is_some()
         }
         0x01 => {
-            regs.rcx = (regs.rcx & !0xFFFF) | u64::from(display_start.0);
-            regs.rdx = (regs.rdx & !0xFFFF) | u64::from(display_start.1);
+            let Some((x, y)) = svga.display_start(None) else { return false };
+            regs.rcx = (regs.rcx & !0xFFFF) | u64::from(x);
+            regs.rdx = (regs.rdx & !0xFFFF) | u64::from(y);
             true
         }
         _ => false,
@@ -1901,26 +1924,17 @@ fn vbe_scan_line<A: crate::Arch>(
         return display.cap_mut().guest_bios_scan_line_length(machine, bios, regs).is_ok();
     }
     let Some(dev) = dos.pc.vga.emulated_mut() else { return false };
-    let crate::kernel::bios_display::VideoResume::Vbe {
-        mode, logical_pitch, ..
-    } = &mut dev.resume else { return false };
-    let step = u16::from(mode.bits_per_pixel.div_ceil(8));
-    let requested = match regs.rbx as u8 {
-        0 => (regs.rcx as u16).checked_mul(step),
-        2 => Some(regs.rcx as u16),
-        1 | 3 => Some(*logical_pitch),
+    let Some(svga) = dev.state.svga_mut() else { return false };
+    let set = match regs.rbx as u8 {
+        0 => Some((regs.rcx as u16, false)),
+        2 => Some((regs.rcx as u16, true)),
+        1 | 3 => None,
         _ => return false,
     };
-    let Some(pitch) = requested else { return false };
-    if pitch < mode.width.saturating_mul(step) { return false; }
-    if matches!(regs.rbx as u8, 0 | 2) {
-        *logical_pitch = pitch;
-        dev.state.svga_pitch = pitch;
-    }
-    regs.rbx = (regs.rbx & !0xFFFF) | u64::from(*logical_pitch);
-    regs.rcx = (regs.rcx & !0xFFFF) | u64::from(*logical_pitch / step.max(1));
-    regs.rdx = (regs.rdx & !0xFFFF)
-        | u64::from((mode.framebuffer_bytes / u32::from(*logical_pitch)).min(u32::from(u16::MAX)) as u16);
+    let Some(result) = svga.scan_line(set) else { return false };
+    regs.rbx = (regs.rbx & !0xFFFF) | u64::from(result.bytes);
+    regs.rcx = (regs.rcx & !0xFFFF) | u64::from(result.pixels);
+    regs.rdx = (regs.rdx & !0xFFFF) | u64::from(result.lines);
     true
 }
 
@@ -1933,7 +1947,7 @@ fn vbe_set_mode<A: crate::Arch>(
     regs: &mut Regs,
 ) -> bool {
     if let Some(display) = dos.pc.as_mut().vga.native_mut() {
-        return match display.cap_mut()
+        let success = match display.cap_mut()
             .guest_bios_set_mode_request(machine, bios_display, regs.rbx as u16)
         {
             Ok(()) => true,
@@ -1942,12 +1956,17 @@ fn vbe_set_mode<A: crate::Arch>(
                 false
             }
         };
+        if success
+            && let Some(state) = bios_display.vbe_state().copied()
+        {
+            super::machine::vga::select_native_svga_aperture(
+                machine, state.mode, state.svga.access);
+            super::dpmi::refresh_physical_mappings(machine, dos);
+        }
+        return success;
     }
     if let Some(mode) = bios_display.curated_mode(regs.rbx as u16 & 0x3FFF) {
         let request = regs.rbx as u16;
-        let linear_ok = request & 0x4000 == 0 || mode.physical_base != 0;
-        let banked_ok = request & 0x4000 != 0 || mode.window_segment != 0;
-        if !linear_ok || !banked_ok { return false; }
         super::machine::vga::svga_set_curated_mode(
             machine, &mut dos.pc, mode, request);
         super::dpmi::refresh_physical_mappings(machine, dos);
@@ -1982,9 +2001,7 @@ fn vbe_window<A: crate::Arch>(
         };
     }
     let Some(dev) = dos.pc.vga.emulated() else { return false };
-    if matches!(dev.resume,
-        crate::kernel::bios_display::VideoResume::Vbe { request, .. }
-            if request & 0x4000 != 0)
+    if dev.state.svga().is_some_and(|svga| matches!(svga.access, vga::SvgaAccess::Linear))
     {
         return false;
     }
@@ -1992,7 +2009,8 @@ fn vbe_window<A: crate::Arch>(
         super::machine::vga::svga_set_bank(machine, &mut dos.pc, regs.rdx as u16);
     } else {
         let Some(dev) = dos.pc.vga.emulated() else { return false };
-        let bank = dev.state.svga_bank;
+        let Some(svga) = dev.state.svga() else { return false };
+        let Some(bank) = svga.bank() else { return false };
         regs.rdx = (regs.rdx & !0xFFFF) | bank as u64;
     }
     true

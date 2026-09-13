@@ -46,6 +46,21 @@ pub struct VbeMode {
     pub window_function: u32,
 }
 
+impl VbeMode {
+    pub(crate) fn svga_config(self) -> vga::SvgaConfig {
+        vga::SvgaConfig {
+            width: self.width,
+            height: self.height,
+            bits_per_pixel: self.bits_per_pixel,
+            banked_pitch: self.banked_pitch,
+            linear_pitch: self.linear_pitch,
+            framebuffer_bytes: self.framebuffer_bytes,
+            palette_capable: matches!(self.format, crate::kernel::display::FormatSpec::Indexed8)
+                || self.programmable_ramp,
+        }
+    }
+}
+
 /// A BIOS mode already validated for use as the kernel display.
 ///
 /// The raw mode list remains [`VbeMode`] because DOS must see everything the
@@ -161,24 +176,11 @@ pub enum Host {
 #[derive(Debug)]
 pub struct VgaCap {
     _private: (),
-    vbe: Option<NativeVbeState>,
 }
 
-/// RetroOS-owned state for a VBE API session whose framebuffer is currently
-/// attached directly to the physical display. The firmware is only the sink
-/// used to apply this state; it is never queried to reconstruct it.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct NativeVbeState {
-    pub mode: VbeMode,
-    pub request: u16,
-    pub bank: Option<u16>,
-    pub display_start: (u16, u16),
-    pub logical_pitch: u16,
-}
-
-/// Exclusive physical-display ownership. In legacy mode the VGA adapter is
-/// authoritative. In VBE mode RetroOS's `NativeVbeState` is authoritative and
-/// the physical BIOS/framebuffer are merely its direct-output backend.
+/// Exclusive physical-display ownership. This is deliberately state-free:
+/// the BIOS display service owns the active Legacy/VBE state, while this
+/// value only proves that the DOS thread owns the physical display.
 #[derive(Debug)]
 pub struct NativeVga(VgaCap);
 
@@ -188,55 +190,15 @@ impl Default for NativeVga {
 
 impl NativeVga {
     pub fn new() -> Self {
-        Self(VgaCap {
-            _private: (), vbe: None,
-        })
+        Self(VgaCap { _private: () })
     }
 
     pub(crate) fn into_cap(self) -> VgaCap { self.0 }
     pub(crate) fn cap(&self) -> &VgaCap { &self.0 }
     pub(crate) fn cap_mut(&mut self) -> &mut VgaCap { &mut self.0 }
-    pub(crate) fn legacy_vga_active(&self) -> bool { self.0.vbe.is_none() }
-    pub fn has_vbe_palette(&self) -> bool {
-        self.0.vbe.is_some_and(|state| {
-            matches!(state.mode.format, crate::kernel::display::FormatSpec::Indexed8)
-                || state.mode.programmable_ramp
-        })
-    }
-    pub(crate) fn vbe_state(&self) -> Option<NativeVbeState> { self.0.vbe }
-
     /// Mark the hardware state authoritative again after a complete software
     /// VGA has been restored into the adapter.
     pub(crate) fn restored(cap: VgaCap) -> NativeVga { NativeVga(cap) }
-}
-
-impl VgaCap {
-    pub(crate) fn physical_vbe_dac_access(&self) -> bool {
-        self.vbe.is_some_and(|state| {
-            state.mode.vga_compatible
-                && matches!(state.mode.format,
-                    crate::kernel::display::FormatSpec::Indexed8)
-        })
-    }
-
-    pub(crate) fn mark_legacy(&mut self) {
-        self.vbe = None;
-    }
-    pub(crate) fn mark_vbe(&mut self, mode: VbeMode, request: u16) {
-        let linear = request & 0x4000 != 0;
-        self.vbe = Some(NativeVbeState {
-            mode,
-            request,
-            bank: (!linear).then_some(0),
-            display_start: (0, 0),
-            logical_pitch: if linear { mode.linear_pitch } else { mode.banked_pitch },
-        });
-    }
-
-    pub(crate) fn vbe_state(&self) -> Option<NativeVbeState> { self.vbe }
-    pub(crate) fn vbe_state_mut(&mut self) -> Option<&mut NativeVbeState> {
-        self.vbe.as_mut()
-    }
 }
 
 pub struct ProbedPlatform {

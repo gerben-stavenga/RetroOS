@@ -56,9 +56,10 @@ impl<A: crate::Arch> ExecutionContext<A> {
     pub fn run(
         &mut self,
         machine: &mut A,
+        bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         personality: &thread::Personality<A>,
     ) -> crate::KernelEvent {
-        let io = crate::kernel::io_policy::for_personality(personality);
+        let io = crate::kernel::io_policy::for_personality(personality, bios);
         machine.execute(&mut self.regs, &io)
     }
 

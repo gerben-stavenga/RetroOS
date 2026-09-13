@@ -2,7 +2,7 @@
 //!
 //! A machine has one VGA, and more than one thing wants the screen — a DOS
 //! program, a Linux program, the kernel console. Whoever is not holding the
-//! card keeps its screen as a *model* ([`VgaState`], a passive register file
+//! card keeps its screen as a *model* (`LegacyVgaState`, a passive register file
 //! and four plane images that belongs to the machine model, not here), and the
 //! two functions below are the only code that moves state between that model
 //! and the silicon. `save` reads the card into a model; `restore` programs a
@@ -17,7 +17,7 @@
 //! and the emulated port model. Those are the machine's model of a VGA and
 //! run with no card present at all.
 
-use vga::{AcState, VgaState};
+use vga::{AcState, LegacyVgaState};
 
 /// QEMU's VGA backend does not reconstruct chain-4/odd-even aperture contents
 /// reliably from flat plane transfers. Keep its extra CPU-aperture capture and
@@ -29,7 +29,7 @@ const QEMU_COMPAT: bool = true;
 /// The flip-flop phase is not port-readable, so it must be tracked. The
 /// latched address (including PAS) is readable only on some VGA-compatible
 /// hardware. Because both belong to the *card*, the tracker is global rather
-/// than per-thread (a thread's own AC state lives in its `VgaState`).
+/// than per-thread (a thread's own AC state lives in its `LegacyVgaState`).
 /// The guest's own 0x3C0 writes reach it through [`track_ac_write`] when the
 /// port is passed through to a native card.
 static mut AC: AcState = AcState::new();
@@ -64,7 +64,7 @@ pub fn read_ac_register(index: u8) -> u8 {
 /// Spill generic VGA's four inaccessible data latches through write mode 1.
 /// The caller first restores a VBE 4F04 checkpoint containing the original
 /// latches, and restores it again after this destructive probe.
-pub fn write_latches_and_readback(state: &mut VgaState) {
+pub fn write_latches_and_readback(state: &mut LegacyVgaState) {
     use crate::kernel::portio::outb;
 
     const SCRATCH: usize = 0xFFFF;
@@ -100,7 +100,7 @@ fn flip_flop_probe(plane_enable_before: u8) -> u8 {
 /// restored it. Register 12h is used instead of the program's selected
 /// register: its low four Color Plane Enable bits are defined and writable on
 /// every VGA. Two writes make the result depend on the original phase.
-pub fn correct_flip_flop_phase(state: &mut VgaState, plane_enable_before: u8) {
+pub fn correct_flip_flop_phase(state: &mut LegacyVgaState, plane_enable_before: u8) {
     use crate::kernel::portio::{inb, outb};
 
     const PLANE_ENABLE: u8 = 0x12;
@@ -137,7 +137,7 @@ mod tests {
 
 /// Synchronize the software tracker after the BIOS has restored the exact AC
 /// index and phase discovered by [`correct_flip_flop_phase`].
-pub fn checkpoint_restored(state: &VgaState) {
+pub fn checkpoint_restored(state: &LegacyVgaState) {
     unsafe { AC = state.ac_state; }
 }
 
@@ -184,7 +184,7 @@ pub fn is_standard_text_mode(_cap: &crate::kernel::platform::VgaCap) -> bool {
 /// 3DA reset or VGA memory read can destroy it.
 pub fn save(
     cap: &crate::kernel::platform::VgaCap,
-    state: &mut VgaState,
+    state: &mut LegacyVgaState,
     cirrus_readback: bool,
 ) {
     use crate::kernel::portio::{inb, outb};
@@ -377,7 +377,7 @@ pub fn save(
 /// Capture only the palette state shared by legacy VGA and indexed VBE.
 /// Unlike [`save`], this never touches sequencer, CRTC, graphics-controller or
 /// aperture state, so it is safe while a firmware VBE mode is scanning out.
-pub fn save_dac(_cap: &crate::kernel::platform::VgaCap, state: &mut VgaState) {
+pub fn save_dac(_cap: &crate::kernel::platform::VgaCap, state: &mut LegacyVgaState) {
     use crate::kernel::portio::{inb, outb};
     let dac_mask = inb(0x3C6);
     // QEMU's legacy VGA returns zero for the standard PEL-mask read even when
@@ -418,7 +418,7 @@ pub fn set_vbe_palette(
 /// Program `state` back into the live card: registers, DAC, and plane
 /// memory. Called while acquiring the physical lease, or when repainting an
 /// owner that already holds it.
-pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
+pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     if state.planes.is_empty() { return; }
     use crate::kernel::portio::{inb, outb};
 
@@ -580,7 +580,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
         state.ac_state.index
     } else {
         // The adapter could not report PAS. A captured display owner is
-        // restored visible; the invalidity remains explicit in VgaState
+        // restored visible; the invalidity remains explicit in LegacyVgaState
         // instead of leaking a platform quirk into ownership code.
         state.ac_state.index | 0x20
     };
@@ -619,7 +619,7 @@ pub fn restore(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
 /// normalized at this ownership boundary.
 pub fn enable_palette_output(
     _cap: &crate::kernel::platform::VgaCap,
-    state: &VgaState,
+    state: &LegacyVgaState,
 ) {
     use crate::kernel::portio::{inb, outb};
     let ac_state = AcState {
@@ -638,7 +638,7 @@ pub fn enable_palette_output(
 /// legacy sequencer/CRTC register file after a firmware VBE mode set would
 /// destroy that mode, but indexed VBE scanout still depends on this
 /// palette and PEL mask.
-pub fn restore_dac(_cap: &crate::kernel::platform::VgaCap, state: &VgaState) {
+pub fn restore_dac(_cap: &crate::kernel::platform::VgaCap, state: &LegacyVgaState) {
     use crate::kernel::portio::outb;
     outb(0x3C6, state.dac_mask);
     outb(0x3C8, 0);

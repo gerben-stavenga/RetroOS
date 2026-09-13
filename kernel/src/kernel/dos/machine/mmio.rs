@@ -21,7 +21,7 @@
 //! devices themselves, and travels with them.
 
 use crate::Regs;
-use super::vga::{self, VgaState};
+use super::vga::{self, LegacyVgaState};
 use super::{set_string_index, step_string_index, string_index};
 
 // Planar #PF decode is a kernel-side trap with no arch involvement: A0000 is
@@ -293,7 +293,7 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 pub enum MmioTarget<'a> {
     /// The VGA planar aperture selected by GC[6], through the graphics
     /// controller. Text-font access commonly selects B8000 rather than A0000.
-    Planar { vga: &'a mut VgaState, base: u32, len: u32 },
+    Planar { vga: &'a mut LegacyVgaState, base: u32, len: u32 },
     /// The Voodoo's PCI aperture: registers, LFB and texture download.
     Voodoo(&'a mut super::vvoodoo::VVoodoo),
 }

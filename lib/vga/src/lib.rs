@@ -95,6 +95,9 @@ pub struct Frame<'a> {
     /// modes normally point A and B at the same font, while trackers commonly
     /// use the two maps as an extra bank of UI tiles.
     pub font_b: &'a [u8],
+    /// Selected VGA character maps when text glyphs come directly from
+    /// `planes`. `None` selects the compact `font` and `font_b` slices.
+    pub font_maps: Option<(u8, u8)>,
     /// Attribute bit 7 semantics (AC mode-control bit 3): `true` = blink
     /// (bit 7 ignored here — not animated), `false` = 16 background colors.
     /// TUIs (DN, NC) disable blink via INT 10h AX=1003 to get bright
@@ -567,6 +570,266 @@ pub fn fill_vga_palette(p: &mut [u8; 768]) {
     }
 }
 
+/// Complete palette/ramp and compatibility-DAC state for one SVGA device.
+/// Components are canonical eight-bit values; six-bit VBE/DAC interfaces
+/// convert only while entering or leaving this object.
+#[derive(Clone, Copy, Debug)]
+pub struct VbePalette {
+    pub rgb: [u8; 768],
+    pub width: u8,
+    mask: u8,
+    write_index: u8,
+    read_index: u8,
+    write_sub: u8,
+    read_sub: u8,
+    read_mode: bool,
+    dirty_lo: u16,
+    dirty_hi: u16,
+}
+
+impl Default for VbePalette {
+    fn default() -> Self { Self::new() }
+}
+
+impl VbePalette {
+    pub fn new() -> Self {
+        let mut six = [0; 768];
+        fill_vga_palette(&mut six);
+        let mut palette = Self {
+            rgb: [0; 768], width: 6, mask: 0xFF,
+            write_index: 0, read_index: 0, write_sub: 0, read_sub: 0,
+            read_mode: false, dirty_lo: 256, dirty_hi: 0,
+        };
+        for (dst, src) in palette.rgb.iter_mut().zip(six) {
+            *dst = Self::six_to_eight(src);
+        }
+        palette
+    }
+
+    #[inline]
+    fn six_to_eight(v: u8) -> u8 {
+        let v = v & 63;
+        (v << 2) | (v >> 4)
+    }
+
+    #[inline]
+    fn input(&self, v: u8) -> u8 {
+        if self.width == 6 { Self::six_to_eight(v) } else { v }
+    }
+
+    #[inline]
+    fn output(&self, v: u8) -> u8 {
+        if self.width == 6 { v >> 2 } else { v }
+    }
+
+    fn range(start: u16, bytes: usize) -> Option<core::ops::Range<usize>> {
+        let start = usize::from(start);
+        if !bytes.is_multiple_of(4) || start >= 256 || bytes / 4 > 256 - start {
+            return None;
+        }
+        Some(start * 3..(start + bytes / 4) * 3)
+    }
+
+    pub fn valid_range(start: u16, bytes: usize) -> bool {
+        Self::range(start, bytes).is_some()
+    }
+
+    /// Read VBE B,G,R,align entries in the currently exposed component width.
+    pub fn read(&self, start: u16, entries: &mut [u8]) -> bool {
+        let Some(range) = Self::range(start, entries.len()) else { return false };
+        for (entry, rgb) in entries.chunks_exact_mut(4).zip(self.rgb[range].chunks_exact(3)) {
+            entry.copy_from_slice(&[
+                self.output(rgb[2]), self.output(rgb[1]), self.output(rgb[0]), 0,
+            ]);
+        }
+        true
+    }
+
+    /// Write VBE B,G,R,align entries in the currently exposed component width.
+    pub fn write(&mut self, start: u16, entries: &[u8]) -> bool {
+        let Some(range) = Self::range(start, entries.len()) else { return false };
+        let width = self.width;
+        for (rgb, entry) in self.rgb[range].chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
+            let cvt = |v| if width == 6 { Self::six_to_eight(v) } else { v };
+            rgb.copy_from_slice(&[cvt(entry[2]), cvt(entry[1]), cvt(entry[0])]);
+        }
+        true
+    }
+
+    pub fn set_width(&mut self, width: u8) -> bool {
+        if matches!(width, 6 | 8) { self.width = width; true } else { false }
+    }
+
+    pub fn mask(&self) -> u8 { self.mask }
+
+    pub fn clear_dirty(&mut self) {
+        self.dirty_lo = 256;
+        self.dirty_hi = 0;
+    }
+
+    pub fn dirty_range(&self) -> Option<core::ops::Range<u16>> {
+        (self.dirty_lo < self.dirty_hi).then_some(self.dirty_lo..self.dirty_hi)
+    }
+
+    pub fn port_read(&mut self, port: u16) -> u8 {
+        match port {
+            0x3C6 => self.mask,
+            0x3C7 => if self.read_mode { 3 } else { 0 },
+            0x3C8 => self.write_index,
+            0x3C9 => {
+                let at = usize::from(self.read_index) * 3 + usize::from(self.read_sub);
+                let value = self.output(self.rgb[at]);
+                self.read_sub += 1;
+                if self.read_sub == 3 {
+                    self.read_sub = 0;
+                    self.read_index = self.read_index.wrapping_add(1);
+                }
+                value
+            }
+            _ => 0xFF,
+        }
+    }
+
+    pub fn port_write(&mut self, port: u16, value: u8) {
+        match port {
+            0x3C6 => self.mask = value,
+            0x3C7 => { self.read_index = value; self.read_sub = 0; self.read_mode = true; }
+            0x3C8 => { self.write_index = value; self.write_sub = 0; self.read_mode = false; }
+            0x3C9 => {
+                let at = usize::from(self.write_index) * 3 + usize::from(self.write_sub);
+                self.rgb[at] = self.input(value);
+                self.write_sub += 1;
+                if self.write_sub == 3 {
+                    self.write_sub = 0;
+                    let completed = self.write_index;
+                    self.write_index = self.write_index.wrapping_add(1);
+                    self.dirty_lo = self.dirty_lo.min(u16::from(completed));
+                    self.dirty_hi = self.dirty_hi.max(u16::from(completed) + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Backend-independent geometry needed by the VBE control state machine.
+#[derive(Clone, Copy, Debug)]
+pub struct SvgaConfig {
+    pub width: u16,
+    pub height: u16,
+    pub bits_per_pixel: u8,
+    pub banked_pitch: u16,
+    pub linear_pitch: u16,
+    pub framebuffer_bytes: u32,
+    pub palette_capable: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvgaScanLine {
+    pub bytes: u16,
+    pub pixels: u16,
+    pub lines: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SvgaAccess {
+    Linear,
+    Banked { bank: u16 },
+}
+
+/// Complete DOS-visible control state for one SVGA device. Framebuffer pages
+/// are supplied by the owner (physical display or private DOS address space);
+/// all VBE-visible state transitions are shared here.
+#[derive(Clone, Copy, Debug)]
+pub struct SvgaState {
+    pub config: SvgaConfig,
+    pub mode_number: u16,
+    pub access: SvgaAccess,
+    pub display_start: (u16, u16),
+    pub logical_pitch: u16,
+    pub palette: VbePalette,
+}
+
+impl SvgaState {
+    pub fn new(mode_number: u16, access: SvgaAccess, mode: SvgaConfig) -> Self {
+        let linear = matches!(access, SvgaAccess::Linear);
+        Self {
+            config: mode,
+            mode_number,
+            access,
+            display_start: (0, 0),
+            logical_pitch: if linear { mode.linear_pitch } else { mode.banked_pitch },
+            palette: VbePalette::new(),
+        }
+    }
+
+    pub fn window(&mut self, set: Option<u16>) -> Option<u16> {
+        let SvgaAccess::Banked { bank } = &mut self.access else { return None };
+        if let Some(next) = set { *bank = next; }
+        Some(*bank)
+    }
+
+    pub fn mode_value(&self) -> u16 {
+        self.mode_number | if matches!(self.access, SvgaAccess::Linear) { 0x4000 } else { 0 }
+    }
+
+    pub fn bank(&self) -> Option<u16> {
+        match self.access {
+            SvgaAccess::Linear => None,
+            SvgaAccess::Banked { bank } => Some(bank),
+        }
+    }
+
+    #[inline]
+    pub fn display_byte_offset(&self) -> usize {
+        usize::from(self.display_start.1) * usize::from(self.logical_pitch)
+            + usize::from(self.display_start.0)
+                * usize::from(self.config.bits_per_pixel.div_ceil(8))
+    }
+
+    #[inline]
+    pub fn visible_frame_bytes(&self) -> usize {
+        usize::from(self.logical_pitch) * usize::from(self.config.height)
+    }
+
+    pub fn display_start(
+        &mut self,
+        set: Option<(u16, u16)>,
+    ) -> Option<(u16, u16)> {
+        let Some((x, y)) = set else { return Some(self.display_start) };
+        let mode = self.config;
+        let step = u32::from(mode.bits_per_pixel.div_ceil(8));
+        let start = u32::from(y) * u32::from(self.logical_pitch) + u32::from(x) * step;
+        let visible = u32::from(mode.height.saturating_sub(1))
+            * u32::from(self.logical_pitch)
+            + u32::from(mode.width) * step;
+        if start.saturating_add(visible) > mode.framebuffer_bytes { return None; }
+        self.display_start = (x, y);
+        Some((x, y))
+    }
+
+    /// Set/query logical scanline length. `set` is `(value, in_bytes)`;
+    /// `None` performs either VBE query form because their result is identical.
+    pub fn scan_line(
+        &mut self,
+        set: Option<(u16, bool)>,
+    ) -> Option<SvgaScanLine> {
+        let mode = self.config;
+        let step = u16::from(mode.bits_per_pixel.div_ceil(8)).max(1);
+        if let Some((value, in_bytes)) = set {
+            let pitch = if in_bytes { value } else { value.checked_mul(step)? };
+            if pitch < mode.width.saturating_mul(step) { return None; }
+            self.logical_pitch = pitch;
+        }
+        Some(SvgaScanLine {
+            bytes: self.logical_pitch,
+            pixels: self.logical_pitch / step,
+            lines: (mode.framebuffer_bytes / u32::from(self.logical_pitch.max(1)))
+                .min(u32::from(u16::MAX)) as u16,
+        })
+    }
+}
+
 pub fn fallback_palette() -> [u8; 768] {
     let mut p = [0u8; 768];
     fill_fallback_palette(&mut p);
@@ -632,6 +895,13 @@ pub fn pal_rgb_at(palette: &[u8; 768], idx: u8) -> u32 {
 fn pal_rgb(palette: &[u8; 768], idx: u8) -> u32 {
     let o = idx as usize * 3;
     (c6to8(palette[o]) << 16) | (c6to8(palette[o + 1]) << 8) | c6to8(palette[o + 2])
+}
+
+#[inline]
+fn pal_rgb_width(palette: &[u8; 768], idx: u8, eight_bit: bool) -> u32 {
+    if !eight_bit { return pal_rgb(palette, idx); }
+    let o = idx as usize * 3;
+    ((palette[o] as u32) << 16) | ((palette[o + 1] as u32) << 8) | palette[o + 2] as u32
 }
 
 /// Packed framebuffer storage and channel layout. Lives here, with the
@@ -775,6 +1045,7 @@ pub struct Pal {
     planar: [u32; 16],
     pub fmt: PixelFormat,
     mask: u8,
+    eight_bit: bool,
 }
 
 impl Default for Pal {
@@ -785,7 +1056,7 @@ impl Default for Pal {
 
 impl Pal {
     pub const fn new() -> Pal {
-        Pal { lut: [0; 256], planar: [0; 16], fmt: PixelFormat::NATIVE, mask: 0xFF }
+        Pal { lut: [0; 256], planar: [0; 16], fmt: PixelFormat::NATIVE, mask: 0xFF, eight_bit: false }
     }
 
     /// Rebuild for `palette`/`fmt`. Cheap to call every frame — it compares
@@ -797,14 +1068,38 @@ impl Pal {
         fmt: PixelFormat,
         cache: &mut [u8; 768],
     ) -> bool {
-        if cache == palette && self.fmt == fmt && self.mask == mask {
+        self.sync_width(palette, mask, false, fmt, cache)
+    }
+
+    /// VBE counterpart of [`sync`](Self::sync): the LUT already contains
+    /// canonical eight-bit components.
+    pub fn sync_vbe(
+        &mut self,
+        palette: &[u8; 768],
+        mask: u8,
+        fmt: PixelFormat,
+        cache: &mut [u8; 768],
+    ) -> bool {
+        self.sync_width(palette, mask, true, fmt, cache)
+    }
+
+    fn sync_width(
+        &mut self,
+        palette: &[u8; 768],
+        mask: u8,
+        eight_bit: bool,
+        fmt: PixelFormat,
+        cache: &mut [u8; 768],
+    ) -> bool {
+        if cache == palette && self.fmt == fmt && self.mask == mask && self.eight_bit == eight_bit {
             return false;
         }
         *cache = *palette;
         self.fmt = fmt;
         self.mask = mask;
+        self.eight_bit = eight_bit;
         for (i, e) in self.lut.iter_mut().enumerate() {
-            *e = fmt.encode(pal_rgb(palette, i as u8 & mask));
+            *e = fmt.encode(pal_rgb_width(palette, i as u8 & mask, eight_bit));
         }
         true
     }
@@ -1030,7 +1325,13 @@ fn row_cga4(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     let c: [u32; 4] = core::array::from_fn(|i| pal.fmt.encode(frame.cga_palette[i]));
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 4);
     for x in 0..w {
-        let byte = frame.vram.get(bank + x / 4).copied().unwrap_or(0);
+        let address = bank + x / 4;
+        let byte = if frame.vram.is_empty() {
+            frame.planes.get(frame.plane_layout.index(address & 1, address >> 1))
+                .copied().unwrap_or(0)
+        } else {
+            frame.vram.get(address).copied().unwrap_or(0)
+        };
         st.put(c[((byte >> (6 - (x & 3) * 2)) & 0x03) as usize]);
     }
 }
@@ -1039,7 +1340,13 @@ fn row_cga2(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usiz
     let (bg, fg) = (pal.fmt.encode(frame.cga_palette[0]), pal.fmt.encode(frame.cga_palette[1]));
     let bank = (sy & 1) * 0x2000 + (sy >> 1) * (w / 8);
     for x in 0..w {
-        let byte = frame.vram.get(bank + x / 8).copied().unwrap_or(0);
+        let address = bank + x / 8;
+        let byte = if frame.vram.is_empty() {
+            frame.planes.get(frame.plane_layout.index(0, address))
+                .copied().unwrap_or(0)
+        } else {
+            frame.vram.get(address).copied().unwrap_or(0)
+        };
         st.put(if byte & (0x80 >> (x & 7)) != 0 { fg } else { bg });
     }
 }
@@ -1049,7 +1356,9 @@ fn row_text(
     cols: usize, rows: usize, cell_w: usize, cell_h: usize,
 ) {
     let (trow, gy) = (sy / cell_h, sy % cell_h);
-    if frame.font.len() < 256 * cell_h || frame.font_b.len() < 256 * cell_h || trow >= rows {
+    if trow >= rows || frame.font_maps.is_none()
+        && (frame.font.len() < 256 * cell_h || frame.font_b.len() < 256 * cell_h)
+    {
         return;
     }
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
@@ -1057,16 +1366,27 @@ fn row_text(
     let repeat = cell_w / dot_w;
     for col in 0..cols {
         let cell = (trow * cols + col) * 2;
-        let (ch, attr) = match (frame.vram.get(cell), frame.vram.get(cell + 1)) {
-            (Some(&c), Some(&a)) => (c as usize, a),
-            _ => return,
+        let (ch, attr) = if frame.vram.is_empty() {
+            let Some(&ch) = frame.planes.get(frame.plane_layout.index(0, cell / 2)) else { return };
+            let Some(&attr) = frame.planes.get(frame.plane_layout.index(1, cell / 2)) else { return };
+            (ch as usize, attr)
+        } else {
+            let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
+            (ch as usize, attr)
         };
         let fg = pal.lut[(attr & 0x0F) as usize];
         let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
         // VGA Character Map A is selected by attribute bit 3 set; Character
         // Map B is selected when it is clear (Sequencer register 3).
-        let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
-        let bits = font[ch * cell_h + gy];
+        let bits = if let Some((map_a, map_b)) = frame.font_maps {
+            let map = if attr & 0x08 != 0 { map_a } else { map_b };
+            frame.planes.get(frame.plane_layout.index(
+                2, usize::from(map) * 0x2000 + ch * 32 + gy,
+            )).copied().unwrap_or(0)
+        } else {
+            let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
+            font[ch * cell_h + gy]
+        };
         // VGA 9th-dot rule: the 9th column repeats the 8th ONLY for the
         // line-draw block 0xC0..=0xDF, so box drawing joins seamlessly; every
         // other glyph gets a blank 9th column for inter-character spacing.
@@ -1181,9 +1501,10 @@ fn render_svga(frame: &Frame, out: &mut [u32], w: usize, h: usize, bpp: u8, pitc
         for (x, px) in row.iter_mut().enumerate() {
             let p = base + x * bpp8;
             *px = match bpp {
-                8 => pal_rgb(
+                8 => pal_rgb_width(
                     frame.palette,
                     vram.get(p).copied().unwrap_or(0) & frame.dac_mask,
+                    true,
                 ),
                 15 => {
                     let v = rd16(p);
@@ -1271,15 +1592,17 @@ pub fn cga4_palette(mode_ctl: u8, sel: u8) -> [u32; 4] {
 /// Scanlines interleave by bank — even lines at offset 0, odd lines at +0x2000.
 /// Colours come from the register-resolved `frame.cga_palette`.
 fn render_cga4(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
-    let vram = frame.vram;
     let pal = frame.cga_palette;
     for y in 0..h {
         let bank = (y & 1) * 0x2000 + (y >> 1) * (w / 4);
         for x in 0..w {
-            let byte = match vram.get(bank + x / 4) {
-                Some(&b) => b,
-                None => continue,
+            let address = bank + x / 4;
+            let byte = if frame.vram.is_empty() {
+                frame.planes.get(frame.plane_layout.index(address & 1, address >> 1))
+            } else {
+                frame.vram.get(address)
             };
+            let Some(&byte) = byte else { continue };
             let shift = 6 - (x & 3) * 2;
             let idx = (byte >> shift) & 0x03;
             out[y * w + x] = pal[idx as usize];
@@ -1291,15 +1614,17 @@ fn render_cga4(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
 /// bank interleave. Foreground is the Colour-Select colour (`cga_palette[1]`)
 /// on the background (`cga_palette[0]`, normally black).
 fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
-    let vram = frame.vram;
     let (bg, fg) = (frame.cga_palette[0], frame.cga_palette[1]);
     for y in 0..h {
         let bank = (y & 1) * 0x2000 + (y >> 1) * (w / 8);
         for x in 0..w {
-            let byte = match vram.get(bank + x / 8) {
-                Some(&b) => b,
-                None => continue,
+            let address = bank + x / 8;
+            let byte = if frame.vram.is_empty() {
+                frame.planes.get(frame.plane_layout.index(0, address))
+            } else {
+                frame.vram.get(address)
             };
+            let Some(&byte) = byte else { continue };
             let on = byte & (0x80 >> (x & 7)) != 0;
             out[y * w + x] = if on { fg } else { bg };
         }
@@ -1443,36 +1768,43 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let VgaMode::Text { cols, rows, cell_w, cell_h } = frame.mode else { return };
     let (cols, rows, cell_w, cell_h) =
         (cols as usize, rows as usize, cell_w as usize, cell_h as usize);
-    if frame.font.len() < 256 * cell_h || frame.font_b.len() < 256 * cell_h
-        || col >= cols || row >= rows
-    {
-        return;
-    }
+    if col >= cols || row >= rows { return; }
     let cell = (row * cols + col) * 2;
-    if cell + 1 >= frame.vram.len() {
-        return;
-    }
     // Whole-cell bounds up front so the pixel loop can't overrun.
     if (row * cell_h + cell_h - 1) * stride + col * cell_w + cell_w > out.len() {
         return;
     }
-    let ch = frame.vram[cell] as usize;
-    let attr = frame.vram[cell + 1];
+    let (ch, attr) = if frame.vram.is_empty() {
+        let Some(&ch) = frame.planes.get(frame.plane_layout.index(0, cell / 2)) else { return };
+        let Some(&attr) = frame.planes.get(frame.plane_layout.index(1, cell / 2)) else { return };
+        (ch as usize, attr)
+    } else {
+        let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
+        (ch as usize, attr)
+    };
     let fg = pal_rgb(frame.palette, (attr & 0x0F) & frame.dac_mask);
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(
         frame.palette,
         ((attr >> 4) & bg_mask) & frame.dac_mask,
     );
-    let font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
-    let glyph = &font[ch * cell_h..ch * cell_h + cell_h];
+    let compact_font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
+    let font_map = frame.font_maps
+        .map(|maps| if attr & 0x08 != 0 { maps.0 } else { maps.1 });
     // VGA 9th-dot rule: the 9th column repeats the glyph's 8th column ONLY for
     // the line-draw block 0xC0..=0xDF, so box-drawing joins seamlessly. Every
     // other glyph gets a blank 9th column for inter-character spacing —
     // replicating unconditionally welds the right edge of any glyph that lights
     // its last column (M W X Z m w x * 0 _ …) onto the next cell.
     let line_gfx = (0xC0..=0xDF).contains(&ch);
-    for (gy, &bits) in glyph.iter().enumerate() {
+    for gy in 0..cell_h {
+        let bits = if let Some(map) = font_map {
+            frame.planes.get(frame.plane_layout.index(
+                2, usize::from(map) * 0x2000 + ch * 32 + gy,
+            )).copied().unwrap_or(0)
+        } else {
+            compact_font.get(ch * cell_h + gy).copied().unwrap_or(0)
+        };
         let py = row * cell_h + gy;
         let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
         let repeat = cell_w / dot_w;
@@ -1494,7 +1826,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
 // A small text panel the kernel composites over the *finished* frame, after
 // render and before present, so it looks identical over text mode, mode 13h and
 // Doom's Mode-Y — it never touches the VGA model. Two primitives, both writing
-// format-encoded pixels so one call serves the native hosted `present_fb` and
+// format-encoded pixels so one call serves the common packed scanout surface and
 // the GOP framebuffer (`fb.format`) alike. 8-px cells through `FONT_8X16`: a
 // menu needs no 9th-dot line-draw welding, so the cell is the glyph's width.
 
@@ -1632,6 +1964,53 @@ mod tests {
         Regs { crtc: [0; 25], seq: [0; 5], gc: [0; 9], misc: 0 }
     }
 
+    fn svga_config() -> SvgaConfig {
+        SvgaConfig {
+            width: 640,
+            height: 480,
+            bits_per_pixel: 8,
+            banked_pitch: 640,
+            linear_pitch: 640,
+            framebuffer_bytes: 640 * 480 * 2,
+            palette_capable: true,
+        }
+    }
+
+    #[test]
+    fn svga_owns_mode_and_control_state() {
+        let mut svga = SvgaState::new(0x101, SvgaAccess::Linear, svga_config());
+        assert_eq!(svga.access, SvgaAccess::Linear);
+        assert_eq!(svga.scan_line(Some((800, true))).map(|line| line.bytes), Some(800));
+        assert_eq!(svga.display_start(Some((4, 200))), Some((4, 200)));
+        assert_eq!(svga.display_byte_offset(), 200 * 800 + 4);
+        assert_eq!(svga.visible_frame_bytes(), 480 * 800);
+    }
+
+    #[test]
+    fn vbe_palette_width_is_an_interface_conversion() {
+        let mut palette = VbePalette::new();
+        assert!(palette.write(7, &[1, 17, 63, 0]));
+        assert_eq!(&palette.rgb[7 * 3..8 * 3], &[255, 69, 4]);
+        assert!(palette.set_width(8));
+        let mut entry = [0; 4];
+        assert!(palette.read(7, &mut entry));
+        assert_eq!(entry, [4, 69, 255, 0]);
+    }
+
+    #[test]
+    fn vbe_compatibility_dac_uses_device_palette() {
+        let mut palette = VbePalette::new();
+        palette.port_write(0x3C8, 12);
+        for value in [2, 3, 4] { palette.port_write(0x3C9, value); }
+        let mut entry = [0; 4];
+        assert!(palette.read(12, &mut entry));
+        assert_eq!(entry, [4, 3, 2, 0]);
+        palette.port_write(0x3C7, 12);
+        assert_eq!(palette.port_read(0x3C9), 2);
+        assert_eq!(palette.port_read(0x3C9), 3);
+        assert_eq!(palette.port_read(0x3C9), 4);
+    }
+
     #[test]
     fn classify_text() {
         let mut r = regs();
@@ -1693,7 +2072,7 @@ mod tests {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -1752,7 +2131,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1776,7 +2155,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2, blank_start: usize::MAX,
         };
         let mut out = [0u32; 16];
@@ -1799,7 +2178,7 @@ mod tests {
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16,
-            blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0,
+            font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0,
             line_compare: usize::MAX, blank_start: 3,
         };
         let mut out = [0xFFFF_FFFF; 16];
@@ -1817,7 +2196,7 @@ mod tests {
 
     #[test]
     fn tim_vertical_blank_starts_at_row_470() {
-        let mut state = VgaState::new();
+        let mut state = LegacyVgaState::new();
         state.crtc = bios_mode_regs(0x12).unwrap().crtc;
         state.crtc[0x15] = 0xD6;
         assert_eq!(state.vertical_blank_start(480), 470);
@@ -1911,7 +2290,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -1934,7 +2313,7 @@ mod tests {
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[],
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
@@ -1955,7 +2334,7 @@ mod tests {
                 plane_layout: VramLayout::PlaneMinor,
                 mode, vram, planes: &[],
                 ac: &ac, palette: &pal, dac_mask: 0xFF,
-                font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, blink: false, cga_palette: [0; 4],
+                font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
             };
             let (w, h) = dimensions(mode);
@@ -2077,7 +2456,7 @@ pub struct PortWrite {
 /// Per-process VGA state: 256KB framebuffer (4 planes) + all registers.
 /// Saved/restored on context switch so each process has its own screen.
 #[derive(Clone)]
-pub struct VgaState {
+pub struct LegacyVgaState {
     /// 4 planes × 64KB = 256KB framebuffer (flat: plane 0 at [0..65536], etc.)
     pub planes: alloc::vec::Vec<u8>,
     // ── Registers ──
@@ -2130,28 +2509,17 @@ pub struct VgaState {
     /// hardware capture does so only when the card or firmware checkpoint
     /// provides an exact extraction path.
     pub latches_valid: bool,
-    // ── VESA SVGA (banked) ──
-    /// Active VBE mode geometry; `svga_w == 0` ⇒ not in an SVGA mode. The
-    /// framebuffer is a guest-mapped region at `SVGA_LFB_BASE`; the 0xA0000
-    /// window is *aliased* onto its current bank (shared frames), so guest
-    /// writes land directly in it — no copy, always coherent.
-    pub svga_w: u16,
-    pub svga_h: u16,
-    pub svga_bpp: u8,
-    pub svga_pitch: u16,
-    /// Current window-A bank (64 KB granule) the 0xA0000 window aliases.
-    pub svga_bank: u16,
 }
 
-impl Default for VgaState {
+impl Default for LegacyVgaState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VgaState {
+impl LegacyVgaState {
     /// Allocate and initialize the register file in its final heap location.
-    /// `VgaState::new()` is almost 1 KiB (chiefly the DAC); embedding that call
+    /// `LegacyVgaState::new()` is almost 1 KiB (chiefly the DAC); embedding that call
     /// in `PcMachine::new_boxed` made rustc materialize a temporary on the
     /// already-deep fork/exec kernel stack before copying it into the box.
     pub fn new_boxed() -> alloc::boxed::Box<Self> {
@@ -2186,11 +2554,6 @@ impl VgaState {
             core::ptr::addr_of_mut!((*p).dac_wsub).write(0);
             core::ptr::addr_of_mut!((*p).latches).write([0; 4]);
             core::ptr::addr_of_mut!((*p).latches_valid).write(true);
-            core::ptr::addr_of_mut!((*p).svga_w).write(0);
-            core::ptr::addr_of_mut!((*p).svga_h).write(0);
-            core::ptr::addr_of_mut!((*p).svga_bpp).write(0);
-            core::ptr::addr_of_mut!((*p).svga_pitch).write(0);
-            core::ptr::addr_of_mut!((*p).svga_bank).write(0);
             let mut boxed = boxed.assume_init();
             fill_fallback_palette(&mut boxed.dac);
             boxed
@@ -2271,11 +2634,6 @@ impl VgaState {
             dac_wsub: 0,
             latches: [0; 4],
             latches_valid: true,
-            svga_w: 0,
-            svga_h: 0,
-            svga_bpp: 0,
-            svga_pitch: 0,
-            svga_bank: 0,
         }
     }
 
@@ -2348,7 +2706,7 @@ impl VgaState {
     }
 
     fn direct_layout(&self) -> Option<VramLayout> {
-        if self.svga_w != 0 || !self.simple_alu() {
+        if !self.simple_alu() {
             return None;
         }
         // Chain-4 overrides both odd/even controls. A standard VGA exposes
@@ -2372,9 +2730,6 @@ impl VgaState {
     }
 
     pub fn cpu_aperture(&self) -> CpuAperture {
-        if self.svga_w != 0 {
-            return CpuAperture::None;
-        }
         let range = self.decoded_aperture();
         match self.direct_layout() {
             Some(VramLayout::PlaneMinor) => CpuAperture::Direct {
@@ -2544,14 +2899,6 @@ impl VgaState {
     /// is read. Lets the caller size the band before the snapshot that band
     /// determines.
     pub fn current_mode(&self) -> Option<VgaMode> {
-        if self.svga_w != 0 {
-            return Some(VgaMode::LinearSvga {
-                w: self.svga_w,
-                h: self.svga_h,
-                bpp: self.svga_bpp,
-                pitch: self.svga_pitch,
-            });
-        }
         self.classify_mode()
     }
 
@@ -2591,5 +2938,51 @@ impl VgaState {
             * if self.crtc[9] & 0x80 != 0 { 2 } else { 1 };
         let start = start / scan_div.max(1);
         if start < h { start } else { usize::MAX }
+    }
+}
+
+/// The complete emulated video device. Exactly one programming model is
+/// authoritative: port-programmed legacy VGA or BIOS-programmed VBE/SVGA.
+#[derive(Clone)]
+pub enum VgaState {
+    Legacy(alloc::boxed::Box<LegacyVgaState>),
+    Vbe(alloc::boxed::Box<SvgaState>),
+}
+
+impl Default for VgaState {
+    fn default() -> Self { Self::new() }
+}
+
+impl VgaState {
+    pub fn new() -> Self { Self::Legacy(LegacyVgaState::new_boxed()) }
+
+    pub fn new_mode3() -> Self { Self::Legacy(LegacyVgaState::new_mode3_boxed()) }
+
+    pub fn legacy(&self) -> Option<&LegacyVgaState> {
+        match self { Self::Legacy(state) => Some(state), Self::Vbe(_) => None }
+    }
+
+    pub fn legacy_mut(&mut self) -> Option<&mut LegacyVgaState> {
+        match self { Self::Legacy(state) => Some(state), Self::Vbe(_) => None }
+    }
+
+    pub fn svga(&self) -> Option<&SvgaState> {
+        match self { Self::Vbe(state) => Some(state), Self::Legacy(_) => None }
+    }
+
+    pub fn svga_mut(&mut self) -> Option<&mut SvgaState> {
+        match self { Self::Vbe(state) => Some(state), Self::Legacy(_) => None }
+    }
+
+    pub fn current_mode(&self) -> Option<VgaMode> {
+        match self {
+            Self::Legacy(state) => state.current_mode(),
+            Self::Vbe(svga) => Some(VgaMode::LinearSvga {
+                w: svga.config.width,
+                h: svga.config.height,
+                bpp: svga.config.bits_per_pixel,
+                pitch: svga.logical_pitch,
+            }),
+        }
     }
 }

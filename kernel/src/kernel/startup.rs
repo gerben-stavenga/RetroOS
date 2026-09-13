@@ -1435,7 +1435,7 @@ pub fn event_loop<A: crate::Arch>(
         // Lend the CPU; canonicalize the outcome into an action.
         stats.pre_run(machine, &ctx.regs);
         let event_sample = super::event_profile::Sample::start(machine);
-        let kevent = ctx.run(machine, &thread.personality);
+        let kevent = ctx.run(machine, bios_workspace, &thread.personality);
         if matches!(&kevent, crate::KernelEvent::Irq) {
             // Hosted backends express their periodic preemption kick directly
             // as KernelEvent::Irq rather than through the metal IRQ queue.

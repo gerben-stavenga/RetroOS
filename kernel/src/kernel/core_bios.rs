@@ -38,32 +38,15 @@ impl compact_fmt::Format for BiosError {
 /// but must never become runnable process state.
 pub(crate) struct FirmwareCheckpoint(Vec<u8>);
 
-#[derive(Clone, Copy)]
-pub enum VideoResume {
-    Legacy {
-        bios_mode: u8,
-    },
-    Vbe {
-        mode: crate::kernel::platform::VbeMode,
-        request: u16,
-        bank: Option<u16>,
-        display_start: (u16, u16),
-        logical_pitch: u16,
-    },
-}
-
 /// Software VGA state owned by the core INT 10h/video-BIOS driver.
 pub struct EmulatedVga {
     /// Registers plus a suspended VRAM snapshot. Empty `planes` means this
     /// device occupies the shared live store; capacity is retained for saving.
-    pub state: alloc::boxed::Box<vga::VgaState>,
-    /// Guest pages backing the substitute-VBE aperture.
+    pub state: vga::VgaState,
+    /// Size of the active shared framebuffer mapping.
     pub svga_pages: usize,
-    /// Complete, interpretable transition used to materialize this process.
-    pub(crate) resume: VideoResume,
-    /// Physical framebuffer whose aliases target `SVGA_LFB_BASE` while this
-    /// VGA is detached from the adapter.
-    pub(crate) physical_lfb: Option<u32>,
+    /// Suspended SVGA framebuffer. Empty while this device owns LiveVram.
+    pub(crate) svga_vram: Vec<u8>,
 }
 
 /// A VGA paired with an output target. Native VGA intrinsically owns physical
@@ -82,16 +65,13 @@ pub enum DosVideo {
     Fullscreen(FullscreenVga),
 }
 
-/// The legacy VGA card visible through the 3C0h..3DFh register window.
-///
-/// VBE is deliberately absent from this type: it is a BIOS API, not another
-/// port-programmed card.  A VBE mode therefore leaves no legacy VGA register
-/// target, regardless of whether its framebuffer is RAM-backed or owned by a
-/// native firmware backend.
+/// Target visible through the VGA register window. VBE remains a BIOS API,
+/// but exposes a deliberately small compatibility surface for programs which
+/// incorrectly poll 3DAh or program the DAC in an SVGA mode.
 pub(crate) enum LegacyVgaIo<'a> {
-    Emulated(&'a mut vga::VgaState),
+    Emulated(&'a mut vga::LegacyVgaState),
+    Vbe(&'a mut vga::VbePalette),
     Native,
-    Absent,
 }
 
 impl DosVideo {
@@ -126,50 +106,48 @@ impl DosVideo {
     pub fn is_native(&self) -> bool { self.native().is_some() }
     pub fn is_fullscreen(&self) -> bool { matches!(self, Self::Fullscreen(_)) }
 
-    pub(crate) fn native_legacy_vga(&self) -> bool {
+    pub(crate) fn native_legacy_vga<A: Arch>(&self, bios: &BiosDisplayWorkspace<A>) -> bool {
         matches!(self,
-            Self::Fullscreen(FullscreenVga::Native(native))
-                if native.legacy_vga_active())
+            Self::Fullscreen(FullscreenVga::Native(_))
+                if bios.native_legacy_active())
     }
 
     pub(crate) fn legacy_vga_io(&mut self) -> LegacyVgaIo<'_> {
         match self {
             Self::Vga(dev) | Self::Fullscreen(FullscreenVga::Emulated(dev, _)) => {
-                if matches!(dev.resume, VideoResume::Legacy { .. }) {
-                    LegacyVgaIo::Emulated(&mut dev.state)
-                } else {
-                    LegacyVgaIo::Absent
+                match &mut dev.state {
+                    vga::VgaState::Legacy(state) => LegacyVgaIo::Emulated(state),
+                    vga::VgaState::Vbe(state) => LegacyVgaIo::Vbe(&mut state.palette),
                 }
             }
-            Self::Fullscreen(FullscreenVga::Native(native)) => {
-                if native.legacy_vga_active() {
-                    LegacyVgaIo::Native
-                } else {
-                    LegacyVgaIo::Absent
-                }
-            }
+            Self::Fullscreen(FullscreenVga::Native(_)) => LegacyVgaIo::Native,
         }
     }
 }
 
 impl EmulatedVga {
+    pub(crate) fn vbe_state_mut(&mut self) -> Option<&mut vga::SvgaState> {
+        match &mut self.state {
+            vga::VgaState::Vbe(state) => Some(state),
+            vga::VgaState::Legacy(_) => None,
+        }
+    }
+
     /// Construct the conventional initial PC text display image without
     /// publishing it into any particular guest address space.
     pub fn initial_mode3() -> Self {
         Self {
-            state: vga::VgaState::new_mode3_boxed(),
+            state: vga::VgaState::new_mode3(),
             svga_pages: 0,
-            resume: VideoResume::Legacy { bios_mode: 3 },
-            physical_lfb: None,
+            svga_vram: Vec::new(),
         }
     }
 
     pub(crate) fn clone_for_fork(&self) -> Self {
         Self {
-            state: alloc::boxed::Box::new((*self.state).clone()),
+            state: self.state.clone(),
             svga_pages: self.svga_pages,
-            resume: self.resume,
-            physical_lfb: self.physical_lfb,
+            svga_vram: self.svga_vram.clone(),
         }
     }
 }
@@ -178,7 +156,14 @@ impl EmulatedVga {
 /// can flow through backend-independent scheduling code; only a native-BIOS
 /// platform has an execution workspace inside it. The interior is deliberately
 /// private and can only be opened by a [`VgaCap`](crate::kernel::platform::VgaCap).
-pub struct BiosDisplayWorkspace<A: Arch>(Option<NativeBiosWorkspace<A>>);
+pub struct BiosDisplayWorkspace<A: Arch> {
+    /// State of the one physical display. VBE state belongs here regardless
+    /// of whether its implementation is GOP or a real-mode video BIOS.
+    active: PhysicalVideoState,
+    /// Optional real-mode firmware driver. It is an implementation detail of
+    /// BIOS machines, never the owner of DOS-visible VBE state.
+    native: Option<NativeBiosWorkspace<A>>,
+}
 
 enum BankedSource<'a> {
     Packed(&'a [u8]),
@@ -372,94 +357,14 @@ impl VbeModeInfo {
     }
 }
 
-/// The active physical adapter's indexed-SVGA palette. Guest NonVGA modes
-/// route all palette access through our BIOS. Legacy VGA still reads the DAC.
-struct IndexedPalette {
-    rgb: [u8; 768],
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PhysicalVbeState {
+    pub mode: crate::kernel::platform::VbeMode,
+    pub svga: vga::SvgaState,
 }
 
-impl IndexedPalette {
-    fn new() -> Self {
-        let mut palette = Self { rgb: [0; 768] };
-        vga::fill_vga_palette(&mut palette.rgb);
-        palette
-    }
-
-    fn range(start: u16, bytes: usize) -> Result<core::ops::Range<usize>, BiosError> {
-        let start = usize::from(start);
-        if !bytes.is_multiple_of(4) || start >= 256 || bytes / 4 > 256 - start {
-            return Err(BiosError::InvalidFrame);
-        }
-        Ok(start * 3..(start + bytes / 4) * 3)
-    }
-
-    fn read(&self, start: u16, entries: &mut [u8]) -> Result<(), BiosError> {
-        let range = Self::range(start, entries.len())?;
-        for (entry, rgb) in entries.chunks_exact_mut(4).zip(self.rgb[range].chunks_exact(3)) {
-            entry.copy_from_slice(&[rgb[2], rgb[1], rgb[0], 0]);
-        }
-        Ok(())
-    }
-
-    fn write(&mut self, start: u16, entries: &[u8]) -> Result<(), BiosError> {
-        let range = Self::range(start, entries.len())?;
-        for (rgb, entry) in self.rgb[range].chunks_exact_mut(3).zip(entries.chunks_exact(4)) {
-            rgb.copy_from_slice(&[entry[2] & 63, entry[1] & 63, entry[0] & 63]);
-        }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod indexed_palette_tests {
-    use super::*;
-
-    #[test]
-    fn partial_updates_round_trip_bgr_and_preserve_other_entries() {
-        let mut palette = IndexedPalette::new();
-        let before = palette.rgb;
-        palette.write(254, &[3, 7, 11, 0xEE, 255, 128, 65, 0xDD]).unwrap();
-        assert_eq!(&palette.rgb[..254 * 3], &before[..254 * 3]);
-        let mut entries = [0xAA; 8];
-        palette.read(254, &mut entries).unwrap();
-        assert_eq!(entries, [3, 7, 11, 0, 63, 0, 1, 0]);
-    }
-
-    #[test]
-    fn invalid_ranges_do_not_change_palette_or_read_buffer() {
-        let mut palette = IndexedPalette::new();
-        let before = palette.rgb;
-        for (start, bytes) in [(256, 4), (255, 8), (0, 3), (0, 1028)] {
-            let mut entries = alloc::vec![0xAA; bytes];
-            assert_eq!(palette.write(start, &entries), Err(BiosError::InvalidFrame));
-            assert_eq!(palette.read(start, &mut entries), Err(BiosError::InvalidFrame));
-            assert!(entries.iter().all(|&byte| byte == 0xAA));
-            assert_eq!(palette.rgb, before);
-        }
-        palette.write(255, &[]).unwrap();
-        palette.read(255, &mut []).unwrap();
-        assert_eq!(palette.rgb, before);
-    }
-
-    #[test]
-    fn mode_reset_and_task_restore_replace_the_entire_palette() {
-        let mut active = IndexedPalette::new();
-        active.write(17, &[1, 2, 3, 0]).unwrap();
-        let task_a = active.rgb;
-        active = IndexedPalette::new();
-        assert_ne!(active.rgb, task_a);
-        active.write(42, &[4, 5, 6, 0]).unwrap();
-        let task_b = active.rgb;
-        // The same RGB -> BGR transfer used when restoring a detached task.
-        let mut entries = [0; 1024];
-        IndexedPalette { rgb: task_a }.read(0, &mut entries).unwrap();
-        active.write(0, &entries).unwrap();
-        assert_eq!(active.rgb, task_a);
-        IndexedPalette { rgb: task_b }.read(0, &mut entries).unwrap();
-        active.write(0, &entries).unwrap();
-        assert_eq!(active.rgb, task_b);
-    }
-}
+#[derive(Clone, Copy, Debug)]
+enum PhysicalVideoState { Legacy, Vbe(PhysicalVbeState) }
 
 struct NativeBiosWorkspace<A: Arch> {
     /// Original firmware IVT/BDA view, used only for native video-ROM calls.
@@ -468,9 +373,6 @@ struct NativeBiosWorkspace<A: Arch> {
     modes: Vec<crate::kernel::platform::VbeMode>,
     state_bytes: Option<usize>,
     state_probed: bool,
-    /// Kernel memory, not STATE_BUFFER (which fonts/checkpoints overwrite).
-    /// Detached tasks save their own copy in VgaState.dac.
-    indexed_palette: alloc::boxed::Box<IndexedPalette>,
 }
 
 impl<A: Arch> BiosDisplayWorkspace<A> {
@@ -478,21 +380,90 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         let native = (crate::kernel::platform::get().firmware
             == crate::kernel::platform::Firmware::NativeBios)
             .then(|| NativeBiosWorkspace::new(machine));
-        Self(native)
+        Self { active: PhysicalVideoState::Legacy, native }
     }
 
     /// Backend paths which deliberately bypass platform probing (the hosted
     /// bare-ELF runner) have no native video firmware.
-    pub(crate) fn absent() -> Self { Self(None) }
+    pub(crate) fn absent() -> Self {
+        Self { active: PhysicalVideoState::Legacy, native: None }
+    }
 
     /// Immutable, sanitized mode catalogue discovered at boot. Consulting it
     /// does not operate the adapter and therefore requires no live `VgaCap`.
     pub fn curated_mode(&self, number: u16) -> Option<crate::kernel::platform::VbeMode> {
-        self.0.as_ref()?.mode(number)
+        self.native.as_ref()?.mode(number)
     }
 
     pub fn curated_modes(&self) -> Option<&[crate::kernel::platform::VbeMode]> {
-        Some(self.0.as_ref()?.modes())
+        Some(self.native.as_ref()?.modes())
+    }
+
+    pub(crate) fn native_legacy_active(&self) -> bool {
+        matches!(self.active, PhysicalVideoState::Legacy)
+    }
+
+    pub(crate) fn vbe_state(&self) -> Option<&PhysicalVbeState> {
+        match &self.active { PhysicalVideoState::Vbe(state) => Some(state), _ => None }
+    }
+
+    pub(crate) fn vbe_state_mut(&mut self) -> Option<&mut PhysicalVbeState> {
+        match &mut self.active { PhysicalVideoState::Vbe(state) => Some(state), _ => None }
+    }
+
+    pub(crate) fn vbe_port_read(&mut self, port: u16) -> Option<u8> {
+        Some(self.vbe_state_mut()?.svga.palette.port_read(port))
+    }
+
+    pub(crate) fn vbe_port_write(
+        &mut self,
+        port: u16,
+        value: u8,
+    ) -> bool {
+        let Some(state) = self.vbe_state_mut() else { return false };
+        state.svga.palette.port_write(port, value);
+        true
+    }
+
+    /// Publish raw DAC compatibility writes as one VBE operation. The guest
+    /// never touches physical VGA ports, and a 256-entry palette load does not
+    /// turn into 256 real-mode BIOS excursions.
+    pub(crate) fn flush_vbe_ports(
+        &mut self,
+        machine: &mut A,
+        display: &mut crate::kernel::platform::VgaCap,
+    ) {
+        let BiosDisplayWorkspace { active, native } = self;
+        let PhysicalVideoState::Vbe(state) = active else { return };
+        let Some(range) = state.svga.palette.dirty_range() else { return };
+        let (start, end) = (range.start, range.end);
+        let mut entries = alloc::vec![0; usize::from(end - start) * 4];
+        assert!(state.svga.palette.read(start, &mut entries), "dirty palette range");
+        let physical_dac = state.mode.vga_compatible
+            && matches!(state.mode.format, crate::kernel::display::FormatSpec::Indexed8);
+        let published = native.as_mut().is_some_and(|firmware| {
+            firmware.indexed_palette_call(
+                machine, display, &mut state.svga.palette, physical_dac,
+                0, start, &mut entries,
+            ).is_ok()
+        });
+        if published {
+            state.svga.palette.clear_dirty();
+        }
+    }
+
+    fn mark_legacy(&mut self) { self.active = PhysicalVideoState::Legacy; }
+
+    fn mark_vbe(&mut self, mode: crate::kernel::platform::VbeMode, request: u16) {
+        let access = if request & 0x4000 != 0 {
+            vga::SvgaAccess::Linear
+        } else {
+            vga::SvgaAccess::Banked { bank: 0 }
+        };
+        self.active = PhysicalVideoState::Vbe(PhysicalVbeState {
+            mode,
+            svga: vga::SvgaState::new(mode.number, access, mode.svga_config()),
+        });
     }
 }
 
@@ -512,7 +483,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             modes: Vec::new(),
             state_bytes: None,
             state_probed: false,
-            indexed_palette: alloc::boxed::Box::new(IndexedPalette::new()),
         }
     }
 
@@ -609,15 +579,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
     /// are restored before it returns. The ROM runs in its isolated persistent
     /// driver address space, so guest memory remains unreachable while the
     /// firmware's own BDA and scratch state remain coherent with native VGA.
-    fn set_mode(
-        &mut self,
-        machine: &mut A,
-        bios_display: &mut crate::kernel::platform::VgaCap,
-        mode: u16,
-    ) -> Result<(), BiosError> {
-        self.set_mode_request(machine, bios_display, mode | if mode > 0xFF { 0x4000 } else { 0 })
-    }
-
     /// Execute a guest-requested native mode set. `request` retains VBE's LFB
     /// bit. Firmware applies the operation, then the RetroOS shadow becomes
     /// authoritative for the resulting VBE state.
@@ -638,10 +599,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             let mut regs = Regs::empty();
             regs.rax = u64::from(number);
             self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
-            bios_display.mark_legacy();
             return Ok(());
         }
-        let Some(mode) = self.mode(number) else {
+        let Some(_mode) = self.mode(number) else {
             return Err(BiosError::Rejected(0x014F));
         };
         let mut regs = Regs::empty();
@@ -650,33 +610,11 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status == 0x004F {
-            let has_palette = matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
-                || mode.programmable_ramp;
-            bios_display.mark_vbe(mode, request);
-            if has_palette {
-                let palette = IndexedPalette::new();
-                let mut entries = alloc::vec![0; 256 * 4];
-                palette.read(0, &mut entries)?;
-                // Mode sets reset the DAC to six bits. Program all entries,
-                // including those the application never subsequently writes.
-                self.indexed_palette_call(machine, bios_display, 0, 0, &mut entries)?;
-            }
             Ok(())
         } else {
             crate::compact_println!("VBE: physical mode set returned {:#x}", status);
             Err(BiosError::Rejected(status))
         }
-    }
-
-    fn current_legacy_mode(
-        &mut self,
-        machine: &mut A,
-        display: &crate::kernel::platform::VgaCap,
-    ) -> Result<u8, BiosError> {
-        let mut regs = Regs::empty();
-        regs.rax = 0x0F00;
-        self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
-        Ok(regs.rax as u8)
     }
 
     /// Apply VBE 4F07h display-start changes to the physical backend. Reads
@@ -685,19 +623,24 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        state: &mut PhysicalVbeState,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
-        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
         if caller.rbx as u8 == 1 {
+            let (x, y) = state.svga.display_start(None)
+                .ok_or(BiosError::InvalidFrame)?;
             caller.rax = (caller.rax & !0xFFFF) | 0x004F;
-            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(state.display_start.0);
-            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(state.display_start.1);
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(x);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(y);
             return Ok(());
         }
         if !matches!(caller.rbx as u8, 0 | 0x80) {
             return Err(BiosError::Rejected(0x014F));
         }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let mut next = state.svga;
+        next.display_start(Some((input[2] as u16, input[3] as u16)))
+            .ok_or(BiosError::InvalidFrame)?;
         let mut regs = Regs::empty();
         regs.rax = input[0];
         regs.rbx = input[1];
@@ -710,8 +653,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         caller.rcx = regs.rcx;
         caller.rdx = regs.rdx;
         if status != 0x004F { return Err(BiosError::Rejected(status)); }
-        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.display_start =
-            (input[2] as u16, input[3] as u16);
+        state.svga = next;
         Ok(())
     }
 
@@ -721,24 +663,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        state: &mut PhysicalVbeState,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
-        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
         if matches!(caller.rbx as u8, 1 | 3) {
-            let step = u16::from(state.mode.bits_per_pixel.div_ceil(8)).max(1);
+            let result = state.svga.scan_line(None)
+                .ok_or(BiosError::InvalidFrame)?;
             caller.rax = (caller.rax & !0xFFFF) | 0x004F;
-            caller.rbx = (caller.rbx & !0xFFFF) | u64::from(state.logical_pitch);
-            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(state.logical_pitch / step);
-            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(
-                (state.mode.framebuffer_bytes / u32::from(state.logical_pitch.max(1)))
-                    .min(u32::from(u16::MAX)) as u16,
-            );
+            caller.rbx = (caller.rbx & !0xFFFF) | u64::from(result.bytes);
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(result.pixels);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(result.lines);
             return Ok(());
         }
         if !matches!(caller.rbx as u8, 0 | 2) {
             return Err(BiosError::Rejected(0x014F));
         }
         let input = [caller.rax, caller.rbx, caller.rcx, caller.rdx];
+        let mut next = state.svga;
+        next.scan_line(Some((input[2] as u16, caller.rbx as u8 == 2)))
+            .ok_or(BiosError::InvalidFrame)?;
         let mut regs = Regs::empty();
         regs.rax = input[0];
         regs.rbx = input[1];
@@ -753,7 +696,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if status != 0x004F { return Err(BiosError::Rejected(status)); }
         let pitch = regs.rbx as u16;
         if pitch == 0 { return Err(BiosError::InvalidFrame); }
-        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.logical_pitch = pitch;
+        next.scan_line(Some((pitch, true)))
+            .ok_or(BiosError::InvalidFrame)?;
+        state.svga = next;
         Ok(())
     }
 
@@ -763,19 +708,36 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        state: &mut PhysicalVbeState,
         set: Option<u16>,
     ) -> Result<u16, BiosError> {
-        let state = display.vbe_state().ok_or(BiosError::Rejected(0x014F))?;
-        let current = state.bank.ok_or(BiosError::Rejected(0x014F))?;
+        let current = state.svga.window(None).ok_or(BiosError::Rejected(0x014F))?;
         let Some(bank) = set else { return Ok(current); };
+        if state.mode.window_segment == 0 && state.mode.physical_base != 0 {
+            let physical = u64::from(state.mode.physical_base)
+                + u64::from(bank) * 64 * 1024;
+            machine.map_phys_range(
+                0xA0000 >> 12,
+                0x10,
+                physical >> 12,
+                arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
+            );
+            state.svga.window(Some(bank)).ok_or(BiosError::InvalidFrame)?;
+            return Ok(bank);
+        }
+        let granularity = state.mode.window_granularity_kb;
+        if granularity == 0 { return Err(BiosError::InvalidFrame); }
+        let physical_bank = bank.checked_mul(64)
+            .map(|offset_kb| offset_kb / granularity)
+            .ok_or(BiosError::InvalidFrame)?;
         let mut regs = Regs::empty();
         regs.rax = 0x4F05;
         regs.rbx = 0;
-        regs.rdx = u64::from(bank);
+        regs.rdx = u64::from(physical_bank);
         self.call_buffer(machine, display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status != 0x004F { return Err(BiosError::Rejected(status)); }
-        display.vbe_state_mut().ok_or(BiosError::InvalidFrame)?.bank = Some(bank);
+        state.svga.window(Some(bank)).ok_or(BiosError::InvalidFrame)?;
         Ok(bank)
     }
 
@@ -820,35 +782,43 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
+        palette: &mut vga::VbePalette,
+        physical_dac: bool,
         subfn: u8,
         start: u16,
         entries: &mut [u8],
     ) -> Result<(), BiosError> {
-        IndexedPalette::range(start, entries.len())?;
+        if !vga::VbePalette::valid_range(start, entries.len()) {
+            return Err(BiosError::InvalidFrame);
+        }
         match subfn {
-            1 => return self.indexed_palette.read(start, entries),
+            1 => return palette.read(start, entries)
+                .then_some(()).ok_or(BiosError::InvalidFrame),
             0 | 0x80 => {}
             _ => return Err(BiosError::Rejected(0x014F)),
         }
         if entries.is_empty() { return Ok(()); }
-        for entry in entries.chunks_exact_mut(4) {
-            for channel in &mut entry[..3] { *channel &= 63; }
-            entry[3] = 0;
-        }
-        if display.physical_vbe_dac_access() {
-            crate::kernel::drivers::vga_hw::set_vbe_palette(display, start as u8, entries);
+        let mut next = *palette;
+        if !next.write(start, entries) { return Err(BiosError::InvalidFrame); }
+        let mut physical = alloc::vec![0; entries.len()];
+        let mut six = next;
+        six.width = 6;
+        if !six.read(start, &mut physical) { return Err(BiosError::InvalidFrame); }
+        if physical_dac {
+            crate::kernel::drivers::vga_hw::set_vbe_palette(display, start as u8, &physical);
         } else {
             let mut regs = Regs::empty();
             regs.rax = 0x4F09;
             regs.rbx = u64::from(subfn);
             regs.rcx = (entries.len() / 4) as u64;
             regs.rdx = u64::from(start);
-            if let Err(error) = self.palette_call(machine, display, &mut regs, Some(entries), true, true) {
+            if let Err(error) = self.palette_call(machine, display, &mut regs, Some(&mut physical), true, true) {
                 crate::compact_println!("VBE: physical palette write failed: {:?}", error);
                 return Err(error);
             }
         }
-        self.indexed_palette.write(start, entries)
+        *palette = next;
+        Ok(())
     }
 
     /// Execute a native video-BIOS palette call with an optional caller buffer.
@@ -1361,22 +1331,22 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
 }
 
-/// Native video-ROM operations are methods on the physical VGA capability:
-/// the receiver proves that the caller owns the adapter, while the workspace
-/// is only the isolated real-mode execution engine.
+/// Physical-display operations require the state-free VGA capability. The
+/// BIOS display object owns the active Legacy/VBE state; its optional native
+/// workspace is only the isolated real-mode execution engine.
 impl crate::kernel::platform::VgaCap {
     fn bios<'a, A: Arch>(
         &self,
         bios: &'a mut BiosDisplayWorkspace<A>,
     ) -> Result<&'a mut NativeBiosWorkspace<A>, BiosError> {
-        bios.0.as_mut().ok_or(BiosError::NoNativeBios)
+        bios.native.as_mut().ok_or(BiosError::NoNativeBios)
     }
 
     fn bios_ref<'a, A: Arch>(
         &self,
         bios: &'a BiosDisplayWorkspace<A>,
     ) -> Result<&'a NativeBiosWorkspace<A>, BiosError> {
-        bios.0.as_ref().ok_or(BiosError::NoNativeBios)
+        bios.native.as_ref().ok_or(BiosError::NoNativeBios)
     }
 
     pub fn bios_mode<A: Arch>(
@@ -1442,7 +1412,9 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         mode: u16,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.set_mode(machine, self, mode)
+        self.guest_bios_set_mode_request(
+            machine, bios, mode | if mode > 0xFF { 0x4000 } else { 0 },
+        )
     }
 
     /// Guest VBE 4F02h preserves the complete request and reports failure in AX.
@@ -1452,7 +1424,28 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         request: u16,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.set_mode_request(machine, self, request)
+        let number = request & 0x3FFF;
+        let mode = if number > 0xFF {
+            Some(self.bios_ref(bios)?.mode(number).ok_or(BiosError::Rejected(0x014F))?)
+        } else { None };
+        self.bios(bios)?.set_mode_request(machine, self, request)?;
+        if let Some(mode) = mode {
+            if matches!(mode.format, crate::kernel::display::FormatSpec::Indexed8)
+                || mode.programmable_ramp
+            {
+                let mut entries = alloc::vec![0; 1024];
+                if !vga::VbePalette::new().read(0, &mut entries) {
+                    return Err(BiosError::InvalidFrame);
+                }
+                bios.mark_vbe(mode, request);
+                self.bios_indexed_palette_call(machine, bios, 0, 0, &mut entries)?;
+            } else {
+                bios.mark_vbe(mode, request);
+            }
+        } else {
+            bios.mark_legacy();
+        }
+        Ok(())
     }
 
     pub fn bios_set_bank<A: Arch>(
@@ -1465,21 +1458,15 @@ impl crate::kernel::platform::VgaCap {
         self.bios(bios)?.set_bank(machine, self, mode, bank)
     }
 
-    pub fn bios_current_legacy_mode<A: Arch>(
-        &self,
-        machine: &mut A,
-        bios: &mut BiosDisplayWorkspace<A>,
-    ) -> Result<u8, BiosError> {
-        self.bios(bios)?.current_legacy_mode(machine, self)
-    }
-
     pub fn guest_bios_window<A: Arch>(
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
         set: Option<u16>,
     ) -> Result<u16, BiosError> {
-        self.bios(bios)?.window(machine, self, set)
+        let BiosDisplayWorkspace { active, native } = bios;
+        let PhysicalVideoState::Vbe(state) = active else { return Err(BiosError::Rejected(0x014F)); };
+        native.as_mut().ok_or(BiosError::NoNativeBios)?.window(machine, self, state, set)
     }
 
     pub fn guest_bios_display_start<A: Arch>(
@@ -1488,7 +1475,9 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.display_start(machine, self, caller)
+        let BiosDisplayWorkspace { active, native } = bios;
+        let PhysicalVideoState::Vbe(state) = active else { return Err(BiosError::Rejected(0x014F)); };
+        native.as_mut().ok_or(BiosError::NoNativeBios)?.display_start(machine, self, state, caller)
     }
 
     pub fn guest_bios_scan_line_length<A: Arch>(
@@ -1497,16 +1486,9 @@ impl crate::kernel::platform::VgaCap {
         bios: &mut BiosDisplayWorkspace<A>,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.scan_line_length(machine, self, caller)
-    }
-
-    /// Kernel-owned shadow for the active indexed mode, without a ROM call or
-    /// an address-space switch. Legacy VGA must use hardware DAC capture.
-    pub(crate) fn bios_indexed_palette<'a, A: Arch>(
-        &self,
-        bios: &'a BiosDisplayWorkspace<A>,
-    ) -> Result<&'a [u8; 768], BiosError> {
-        Ok(&self.bios_ref(bios)?.indexed_palette.rgb)
+        let BiosDisplayWorkspace { active, native } = bios;
+        let PhysicalVideoState::Vbe(state) = active else { return Err(BiosError::Rejected(0x014F)); };
+        native.as_mut().ok_or(BiosError::NoNativeBios)?.scan_line_length(machine, self, state, caller)
     }
 
     pub(crate) fn bios_indexed_palette_call<A: Arch>(
@@ -1517,7 +1499,13 @@ impl crate::kernel::platform::VgaCap {
         start: u16,
         entries: &mut [u8],
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.indexed_palette_call(machine, self, subfn, start, entries)
+        let BiosDisplayWorkspace { active, native } = bios;
+        let PhysicalVideoState::Vbe(state) = active else { return Err(BiosError::Rejected(0x014F)); };
+        let physical_dac = state.mode.vga_compatible
+            && matches!(state.mode.format, crate::kernel::display::FormatSpec::Indexed8);
+        native.as_mut().ok_or(BiosError::NoNativeBios)?.indexed_palette_call(
+            machine, self, &mut state.svga.palette, physical_dac, subfn, start, entries,
+        )
     }
 
     pub fn bios_palette_call<A: Arch>(

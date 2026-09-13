@@ -159,7 +159,7 @@ enum Backend {
 enum VgaScanout {
     Mode13 {
         framebuffer: Framebuffer,
-        saved: alloc::boxed::Box<vga::VgaState>,
+        saved: alloc::boxed::Box<vga::LegacyVgaState>,
     },
     VbeLinear {
         framebuffer: Framebuffer,
@@ -246,7 +246,7 @@ impl Display {
 
     /// Establish the VGA adapter as a known packed linear Mode 13h display.
     pub fn new_vga(native: crate::kernel::platform::VgaCap) -> Self {
-        let mut saved = vga::VgaState::new_boxed();
+        let mut saved = vga::LegacyVgaState::new_boxed();
         // A legacy owner must be restored register-for-register. A VBE owner
         // is restored by its firmware mode set and framebuffer handoff; running
         // the legacy save algorithm over a live banked VBE mode corrupts it.
@@ -255,7 +255,7 @@ impl Display {
             &mut saved,
             crate::kernel::platform::get().vga_readback,
         );
-        let mut state = vga::VgaState::new();
+        let mut state = vga::LegacyVgaState::new();
         let regs = vga::bios_mode13_regs();
         state.misc_output = regs.misc;
         state.seq = regs.seq;
@@ -1065,9 +1065,9 @@ fn present_host_shadow(w: usize, h: usize, rgb: PixelFormat, shadow: &[u8]) -> u
     w * h
 }
 
-/// Direct-framebuffer scanout state: a palette, one native-size packed frame,
-/// and the render/publish clock.
-pub struct Scratch {
+/// Shared emulated-display scanout: one native-size packed frame, VGA palette
+/// cache, and the render/publish clock used by VGA's beam model.
+pub struct Scanout {
     pal: vga::Pal,
     pal_cache: [u8; 768],
     /// Dense native VGA image plus three backing bytes for overlapping dword
@@ -1096,15 +1096,15 @@ pub struct Scratch {
     last_tick: u64,
 }
 
-impl Default for Scratch {
-    fn default() -> Scratch {
-        Scratch::new()
+impl Default for Scanout {
+    fn default() -> Scanout {
+        Scanout::new()
     }
 }
 
-impl Scratch {
-    pub const fn new() -> Scratch {
-        Scratch {
+impl Scanout {
+    pub const fn new() -> Scanout {
+        Scanout {
             pal: vga::Pal::new(),
             pal_cache: [0; 768],
             surface: alloc::vec::Vec::new(),
@@ -1121,8 +1121,8 @@ impl Scratch {
 
     /// Allocate the scanout scratch without ever materializing its large
     /// palette arrays as a return-value temporary on the kernel stack.
-    pub fn new_boxed() -> alloc::boxed::Box<Scratch> {
-        let mut boxed = alloc::boxed::Box::<Scratch>::new_uninit();
+    pub fn new_boxed() -> alloc::boxed::Box<Scanout> {
+        let mut boxed = alloc::boxed::Box::<Scanout>::new_uninit();
         let p = boxed.as_mut_ptr();
         unsafe {
             core::ptr::addr_of_mut!((*p).pal).write(vga::Pal::new());
@@ -1150,6 +1150,30 @@ impl Scratch {
     }
 
     pub const fn format(&self) -> PixelFormat { self.pal.fmt }
+
+    /// Mutable native-size packed scanout storage for a producer that already
+    /// emits pixels in the sink's format. VGA uses [`render_frame`] to decode
+    /// its register-defined layout into this same surface; devices such as
+    /// Voodoo can render here directly.
+    pub fn packed_surface(
+        &mut self,
+        width: usize,
+        height: usize,
+        format: PixelFormat,
+    ) -> Option<&mut [u8]> {
+        let bytes = width.checked_mul(height)?
+            .checked_mul(usize::from(format.bytes_per_pixel))?;
+        let storage = bytes.checked_add(vga::PACKED_ROW_PADDING)?;
+        if self.surface.len() != storage {
+            self.surface.clear();
+            self.surface.resize(storage, 0);
+        }
+        self.geo = (width, height, width, height, width, height);
+        self.mode = None;
+        self.ready = false;
+        self.pal.fmt = format;
+        self.surface.get_mut(..storage)
+    }
 }
 
 #[cfg(target_arch = "x86")]
@@ -1240,7 +1264,7 @@ fn beam_time(now_ns: u64, refresh_hz: u32) -> (u64, usize) {
 /// Guest-visible vertical retrace for an active direct scanout. `None` when
 /// no scanout is live (window sink, unfocused thread, real VGA), so the caller
 /// can use its free-running fallback.
-pub fn beam_vretrace(s: &Scratch, now_tick: u64) -> Option<bool> {
+pub fn beam_vretrace(s: &Scanout, now_tick: u64) -> Option<bool> {
     if s.geo.1 == 0 || s.refresh_hz == 0
         || now_tick.saturating_sub(s.last_tick) > 100
     {
@@ -1265,7 +1289,7 @@ pub enum ScanoutAction {
 /// uses 20 Hz here without changing a game's beam timing. The tick following a
 /// completed render publishes that immutable shadow to its sink.
 pub fn scanout_action(
-    s: &mut Scratch,
+    s: &mut Scanout,
     display: &Display,
     mode: vga::VgaMode,
     now_ns: u64,
@@ -1346,11 +1370,11 @@ pub fn scanout_action(
 
 /// Transfer a completed packed shadow to its sink. The sink returns its prior
 /// front-buffer storage with [`recycle_shadow`], forming a copy-free swapchain.
-pub fn take_shadow(s: &mut Scratch) -> alloc::vec::Vec<u8> {
+pub fn take_shadow(s: &mut Scanout) -> alloc::vec::Vec<u8> {
     core::mem::take(&mut s.surface)
 }
 
-pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u8>) {
+pub fn recycle_shadow(s: &mut Scanout, pixels: alloc::vec::Vec<u8>) {
     s.surface = pixels;
 }
 
@@ -1358,7 +1382,7 @@ pub fn recycle_shadow(s: &mut Scratch, pixels: alloc::vec::Vec<u8>) {
 /// state is folded exactly once, so a completed shadow cannot contain bands
 /// from different DAC generations.
 fn raster_shadow(
-    s: &mut Scratch,
+    s: &mut Scanout,
     format: PixelFormat,
     frame: &vga::Frame,
 ) -> bool {
@@ -1373,7 +1397,11 @@ fn raster_shadow(
     {
         return false;
     }
-    s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+    if matches!(frame.mode, vga::VgaMode::LinearSvga { .. }) {
+        s.pal.sync_vbe(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+    } else {
+        s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
+    }
     if matches!(frame.mode, vga::VgaMode::Planar16 { .. }) {
         s.pal.sync_planar(frame.ac);
     }
@@ -1390,7 +1418,7 @@ fn raster_shadow(
 }
 
 pub fn render_shadow(
-    s: &mut Scratch,
+    s: &mut Scanout,
     format: PixelFormat,
     frame: &vga::Frame,
 ) -> bool {
@@ -1402,7 +1430,7 @@ pub fn render_shadow(
 }
 
 /// Render a completed native-size frame for an immediate sink.
-pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) -> bool {
+pub fn render_frame(s: &mut Scanout, format: PixelFormat, frame: &vga::Frame) -> bool {
     let (w, h) = vga::dimensions(frame.mode);
     if w == 0 || h == 0 {
         return false;
@@ -1423,7 +1451,7 @@ pub fn render_frame(s: &mut Scratch, format: PixelFormat, frame: &vga::Frame) ->
 /// Cheap diagnostic signature of the completed packed shadow. Sampling one
 /// byte per cache-line-sized span is enough to distinguish IT's all-black
 /// frames from its populated text UI without adding another full-frame walk.
-pub fn shadow_sample(s: &Scratch) -> (usize, u32) {
+pub fn shadow_sample(s: &Scanout) -> (usize, u32) {
     let len = s.geo.0
         .saturating_mul(s.geo.1)
         .saturating_mul(usize::from(s.pal.fmt.bytes_per_pixel))
@@ -1526,7 +1554,7 @@ mod tests {
 
     #[test]
     fn raster_rate_does_not_change_guest_beam_rate() {
-        let mut scratch = Scratch::new();
+        let mut scratch = Scanout::new();
         let display = Display::host();
         let mode = vga::VgaMode::Mode13h;
         assert!(matches!(

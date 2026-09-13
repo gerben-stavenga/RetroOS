@@ -230,18 +230,9 @@ pub struct PcMachine {
     /// The 3dfx Voodoo board. Native-BIOS machines expose it only when boot
     /// discovery found a display mode capable of showing its output.
     pub voodoo: Option<vvoodoo::VVoodoo>,
-    /// Present-path scratch, owned so the frame path allocates NOTHING per
-    /// frame. `scanout` copies the live aperture into `present_scratch` and
-    /// hands back a `Frame` borrowing it; the hosted whole-frame path renders
-    /// into `present_fb`. Both are sized once on the first frame of a mode and
-    /// reused thereafter. They sit beside `vga` rather than inside it because
-    /// `scanout` takes `&self` and lends the scratch out with the same
-    /// lifetime, which a field of `VgaState` could not satisfy.
-    pub present_scratch: alloc::vec::Vec<u8>,
-    pub present_fb: alloc::vec::Vec<u32>,
-    /// Direct-display scanout scratch: palette, a completed WB shadow frame,
-    /// and render/publish phase timing.
-    pub present_scratch2: alloc::boxed::Box<crate::kernel::display::Scratch>,
+    /// Common packed scanout surface for every emulated display producer,
+    /// plus VGA palette and render/publish timing state.
+    pub scanout: alloc::boxed::Box<crate::kernel::display::Scanout>,
     /// Generic virtual 8237 DMA controller shadow — bus infrastructure
     /// shared by every DMA-using card model (SB today, GUS next), so it
     /// lives here rather than inside any one card.
@@ -481,43 +472,16 @@ impl PcMachine {
             return;
         }
 
-        let detached_lfb = self.vga.emulated().and_then(|vga| vga.physical_lfb
-            .map(|base| (base & !0xFFF, vga.svga_pages)));
-        if let Some((lfb_base, lfb_pages)) = detached_lfb {
-            let mapping_start = u64::from(physical & !0xFFF);
-            let mapping_end = mapping_start + u64::from(page_count) * crate::PAGE_SIZE as u64;
-            let lfb_start = u64::from(lfb_base);
-            let lfb_end = lfb_start + lfb_pages as u64 * crate::PAGE_SIZE as u64;
-            if mapping_start < lfb_end && lfb_start < mapping_end {
-                machine.map_phys_range(
-                    (virtual_base >> 12) as usize,
-                    page_count as usize,
-                    mapping_start >> 12,
-                    arch_abi::MAP_PHYS_CACHE_DISABLE | arch_abi::MAP_PHYS_FOREIGN,
-                );
-                machine.redirect_physical_aliases(
-                    lfb_start >> 12,
-                    vga::svga_lfb_base() as usize >> 12,
-                    lfb_pages,
-                    true,
-                );
-                return;
-            }
-        }
-
-        if self.vga.emulated().is_some()
-            && vga::svga_lfb_reserved_contains(physical, size)
-        {
-            // The substitute adapter reports a bus-looking address for RAM it
-            // owns in this guest. Before mode selection the aperture has no
-            // pages yet; replaying this mapping after the mode set connects it.
-            if vga::svga_ensure_lfb(machine, self, physical, size) {
-                machine.copy_page_entries(
-                    (physical as usize & !0xFFF) >> 12,
-                    (virtual_base >> 12) as usize,
-                    page_count as usize,
-                );
-            }
+        if vga::svga_lfb_reserved_contains(physical, size) {
+            // PhysBasePtr is RetroOS's stable guest aperture. Its PTEs name
+            // either LiveVram or the native card depending on display
+            // ownership, so a DPMI mapping aliases the canonical range rather
+            // than exposing a machine-specific bus address.
+            machine.copy_page_entries(
+                (physical as usize & !0xFFF) >> 12,
+                (virtual_base >> 12) as usize,
+                page_count as usize,
+            );
             return;
         }
 
@@ -568,10 +532,8 @@ impl PcMachine {
             let voodoo = crate::kernel::platform::get().voodoo_emulation
                 .then(vvoodoo::VVoodoo::new);
             core::ptr::addr_of_mut!((*p).voodoo).write(voodoo);
-            core::ptr::addr_of_mut!((*p).present_scratch).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).present_fb).write(alloc::vec::Vec::new());
-            core::ptr::addr_of_mut!((*p).present_scratch2)
-                .write(crate::kernel::display::Scratch::new_boxed());
+            core::ptr::addr_of_mut!((*p).scanout)
+                .write(crate::kernel::display::Scanout::new_boxed());
             core::ptr::addr_of_mut!((*p).dma).write(Dma8237::new());
             core::ptr::addr_of_mut!((*p).sb).write(SoundBlaster::new());
             core::ptr::addr_of_mut!((*p).gus).write(Gus::new());
@@ -645,27 +607,28 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
                     // Reading 0x3DA returns Input Status #1 AND resets the
                     // attribute-controller write flip-flop.
                     state.ac_state.pending_data = false;
-                    input_status1(machine, &pc.present_scratch2)
+                    input_status1(machine, &pc.scanout)
                 }
                 LegacyVgaIo::Native => {
                     crate::kernel::drivers::vga_hw::track_ac_reset();
                     machine.inb(0x3DA)
                 }
-                LegacyVgaIo::Absent => 0xFF,
+                LegacyVgaIo::Vbe(_) => input_status1(machine, &pc.scanout),
             }
         }
-        // VGA ports — pass through to hardware, or the emulated register file
-        // when this thread does not own the physical VGA lease.
+        // VGA ports — pass through to legacy hardware, use the emulated VGA
+        // register file, or expose only the VBE DAC compatibility window.
         0x3C0..=0x3D9 | 0x3DB..=0x3DF => {
             use crate::kernel::bios_display::LegacyVgaIo;
             match pc.vga.legacy_vga_io() {
                 LegacyVgaIo::Emulated(state) => state.port_read(port),
                 LegacyVgaIo::Native => machine.inb(port),
-                LegacyVgaIo::Absent => 0xFF,
+                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) =>
+                    palette.port_read(port),
+                LegacyVgaIo::Vbe(_) => 0xFF,
             }
         }
-        // VBE has no guest-visible register interface. Firmware backends use
-        // chipset ports only inside the isolated BIOS workspace.
+        // Chipset VBE ports remain private to firmware backends.
         0x01CE..=0x01D0 => 0xFF,
         // Gameport (joystick): we don't model a Sound Blaster or dedicated
         // gameport card, so on the ISA bus the gameport is unpopulated —
@@ -764,7 +727,10 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     crate::kernel::drivers::vga_hw::track_ac_write(val);
                     machine.outb(port, val);
                 }
-                LegacyVgaIo::Absent => {}
+                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
+                    let _ = palette.port_write(port, val);
+                }
+                LegacyVgaIo::Vbe(_) => {}
             }
         }
         0x3C1..=0x3DF => {
@@ -772,10 +738,13 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             match pc.vga.legacy_vga_io() {
                 LegacyVgaIo::Emulated(state) => vga::port_write(machine, state, port, val),
                 LegacyVgaIo::Native => machine.outb(port, val),
-                LegacyVgaIo::Absent => {}
+                LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
+                    let _ = palette.port_write(port, val);
+                }
+                LegacyVgaIo::Vbe(_) => {}
             }
         }
-        // VBE has no guest-visible register interface; see emulate_inb.
+        // Chipset VBE ports remain private to firmware backends.
         0x01CE..=0x01D0 => {}
         // Master PIC command
         0x20 => {
@@ -895,7 +864,7 @@ fn seg_base_for<A: crate::Arch>(regs: &Regs, sel: u16) -> u32 {
 /// per-DAC-entry snow-avoidance wait too slow. Runs of 8 ones/zeros also
 /// satisfy "6+ consecutive bit0=X" idioms (Wolf3D's VL_SetScreen
 /// pre-CRTC-write wait, etc.)
-fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display::Scratch) -> u8 {
+fn input_status1<A: crate::Arch>(machine: &mut A, beam: &crate::kernel::display::Scanout) -> u8 {
     let ticks = machine.get_ticks();
     let vr = crate::kernel::display::beam_vretrace(beam, ticks).unwrap_or_else(|| {
         let phase = ((ticks.wrapping_mul(70 * 32)) / 1000) as u32 & 31;
@@ -971,7 +940,7 @@ fn pci_config_out(pc: &mut PcMachine, port: u16, size: u32, val: u32) -> bool {
 }
 
 /// Complete an `IN AL/AX/EAX, port` the arch monitor bubbled up.
-pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_in_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     // PCI configuration space (mechanism #1), served whole rather than through
     // the per-byte path below: 0xCF8 is a latched dword and a config read must
     // answer as a unit, where four ISA byte reads would each fall to the
@@ -985,33 +954,33 @@ pub fn handle_in_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs
 
     let mut val: u64 = 0;
     for i in 0..size {
-        val |= (emulate_inb(machine, pc, port + i as u16) as u64) << (i * 8);
+        val |= (guest_inb(machine, bios, pc, port + i as u16) as u64) << (i * 8);
     }
     let mask: u64 = if size >= 4 { 0xFFFF_FFFF } else { (1u64 << (size * 8)) - 1 };
     regs.rax = (regs.rax & !mask) | (val & mask);
 }
 
 /// Complete an `OUT port, AL/AX/EAX` the arch monitor bubbled up.
-pub fn handle_out_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
+pub fn handle_out_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, port: u16, size: u32) {
     let val = regs.rax;
     if pci_config_out(pc, port, size, val as u32) {
         return;
     }
 
     for i in 0..size {
-        emulate_outb(machine, pc, regs, port + i as u16, (val >> (i * 8)) as u8);
+        guest_outb(machine, bios, pc, regs, port + i as u16, (val >> (i * 8)) as u8);
     }
 }
 
 /// Complete one `INSB/INSW/INSD` element (ES:DI ← port, advance DI). On `rep`
 /// the monitor re-faults per iteration (leaving IP on the instruction), so this
 /// does a single element and decrements the count — `dec_rep_count` — each time.
-pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
+pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let es_base = seg_base_for::<A>(regs, regs.es as u16);
     let di = string_index(regs.rdi, addr32);
     for i in 0..size {
-        let b = emulate_inb(machine, pc, port + i as u16);
+        let b = guest_inb(machine, bios, pc, port + i as u16);
         machine.write::<u8>((es_base.wrapping_add(di.wrapping_add(i))) as usize, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
@@ -1021,17 +990,55 @@ pub fn handle_ins_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, reg
 
 /// Complete one `OUTSB/OUTSW/OUTSD` element (port ← DS:SI, advance SI). Same
 /// per-iteration `rep` contract as `handle_ins_event`.
-pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
+pub fn handle_outs_event<A: crate::Arch>(machine: &mut A, bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, pc: &mut PcMachine, regs: &mut Regs, size: u32, rep: bool, addr32: bool) {
     let port = regs.rdx as u16;
     let ds_base = seg_base_for::<A>(regs, regs.ds as u16);
     let si = string_index(regs.rsi, addr32);
     for i in 0..size {
         let b = machine.read::<u8>((ds_base.wrapping_add(si.wrapping_add(i))) as usize);
-        emulate_outb(machine, pc, regs, port + i as u16, b);
+        guest_outb(machine, bios, pc, regs, port + i as u16, b);
     }
     let df = regs.flags32() & (1 << 10) != 0;
     advance_string_index(&mut regs.rsi, size, addr32, df);
     if rep { dec_rep_count(regs, addr32); }
+}
+
+fn guest_inb<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    pc: &mut PcMachine,
+    port: u16,
+) -> u8 {
+    if pc.vga.native().is_some() && !bios.native_legacy_active() {
+        return match port {
+            0x3DA => input_status1(machine, &pc.scanout),
+            0x3C6..=0x3C9 => bios.vbe_port_read(port).map_or(0xFF, |value| value),
+            0x3C0..=0x3DF => 0xFF,
+            _ => emulate_inb(machine, pc, port),
+        };
+    }
+    emulate_inb(machine, pc, port)
+}
+
+fn guest_outb<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    pc: &mut PcMachine,
+    regs: &mut Regs,
+    port: u16,
+    value: u8,
+) {
+    if pc.vga.native().is_some() && !bios.native_legacy_active() {
+        match port {
+            0x3C6..=0x3C9 => {
+                let _ = bios.vbe_port_write(port, value);
+            }
+            0x3C0..=0x3DF => {}
+            _ => emulate_outb(machine, pc, regs, port, value),
+        }
+        return;
+    }
+    emulate_outb(machine, pc, regs, port, value)
 }
 
 /// Select and advance an offset register at the instruction's effective
