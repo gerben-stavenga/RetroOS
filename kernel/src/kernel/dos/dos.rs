@@ -4388,6 +4388,11 @@ struct LowMem {
     /// the guest dereferences long after the call.
     video_static_info: [u8; 16],
 
+    /// Stable VBE `VideoModePtr` target. A caller commonly reuses its 4F00h
+    /// controller-info buffer for each 4F01h mode-info query while it walks
+    /// this list, so the list cannot live inside the caller's output buffer.
+    vbe_mode_list: [u16; VBE_MODE_LIST_CAPACITY],
+
     /// Guest-readable copies of the standard VGA ROM fonts. The substitute
     /// BIOS publishes these through INT 10h AX=1130h and points INT 43h at the
     /// font selected by the current mode. The low half of 8x8 is additionally
@@ -4397,6 +4402,7 @@ struct LowMem {
     font_8x14: [u8; 256 * 14],
     font_8x16: [u8; 256 * 16],
 }
+const _: () = assert!(LOW_MEM_BASE as usize + core::mem::size_of::<LowMem>() <= 0x1_0000);
 
 /// Locked PM stack size (see `LowMem::host_stack`).
 const HOST_STACK_SIZE: usize = 4096;
@@ -4420,6 +4426,7 @@ pub(super) const EXC_STACK_TOP: u32 = 2048;
 pub(super) const EXC_STACK_SLOT: u32 = 1024;
 /// Dedicated RM stack size (see `LowMem::rm_stack`).
 const RM_STACK_SIZE: usize = 0x1000;
+pub(super) const VBE_MODE_LIST_CAPACITY: usize = 512;
 
 /// Linear address of a `LowMem` field, e.g. `lm_field(offset_of!(LowMem, lol))`.
 /// The kernel-owned low-mem area is a *projection* written into guest memory
@@ -4453,6 +4460,15 @@ pub(super) fn font_8x16_addr() -> u32 {
 /// AH=1Bh publishes it as a far pointer.
 pub(super) fn video_static_info_addr() -> u32 {
     LOW_MEM_BASE + core::mem::offset_of!(LowMem, video_static_info) as u32
+}
+
+/// Linear address published as VBE ControllerInfo.VideoModePtr. LowMem stays
+/// below 64 KiB, so segment zero plus this offset is a valid real-mode far
+/// pointer.
+pub(super) fn vbe_mode_list_addr() -> u32 {
+    let address = LOW_MEM_BASE + core::mem::offset_of!(LowMem, vbe_mode_list) as u32;
+    debug_assert!(address + (VBE_MODE_LIST_CAPACITY * 2) as u32 <= 0x1_0000);
+    address
 }
 
 pub(crate) const STUB_BASE: u32 = LOW_MEM_BASE;

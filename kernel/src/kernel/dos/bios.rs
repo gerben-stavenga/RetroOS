@@ -1733,8 +1733,9 @@ fn es_offset<A: crate::Arch>(dos: &super::DosState<A>, regs: &Regs, off: u32) ->
     }
 }
 
-/// VBE 4F00h — controller info into ES:DI, with the mode list placed in the
-/// block's reserved area and pointed at by VideoModePtr.
+/// VBE 4F00h — controller info into ES:DI, with VideoModePtr naming stable
+/// personality-owned low memory. The list must outlive and not alias this
+/// output block: clients routinely reuse the block for subsequent 4F01h calls.
 fn vbe_controller_info<A: crate::Arch>(
     machine: &mut A,
     dos: &super::DosState<A>,
@@ -1750,18 +1751,19 @@ fn vbe_controller_info<A: crate::Arch>(
     machine.write::<u8>(lin + 2, b'S');
     machine.write::<u8>(lin + 3, b'A');
     machine.write::<u16>(lin + 0x04, 0x0200); // VBE 2.0
-    // VideoModePtr (0x0E) → mode list at ES:(DI+0x20), in the reserved area.
-    let list_off = (regs.rdi as u16).wrapping_add(0x20);
-    machine.write::<u32>(lin + 0x0E, ((regs.es as u32 & 0xFFFF) << 16) | list_off as u32);
+    let list = super::dos::vbe_mode_list_addr() as usize;
+    // Far pointer 0000:list. The fixed LowMem target is below 64 KiB.
+    machine.write::<u32>(lin + 0x0E, list as u32);
     machine.write::<u16>(lin + 0x12, 0x100); // generic adapter memory: 16 MB
-    let mut p = lin + 0x20;
+    let mut p = list;
+    let remaining = super::dos::VBE_MODE_LIST_CAPACITY - 1;
     if let Some(modes) = native_modes {
-        for mode in modes {
+        for mode in modes.iter().take(remaining) {
             machine.write::<u16>(p, mode.number);
             p += 2;
         }
     } else {
-        for &(num, ..) in VBE_MODES {
+        for &(num, ..) in VBE_MODES.iter().take(remaining) {
             machine.write::<u16>(p, num);
             p += 2;
         }
@@ -1819,6 +1821,7 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     machine.write::<u8>(lin + 0x19, bpp);
     machine.write::<u8>(lin + 0x1A, 1); // banks
     machine.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
+    machine.write::<u8>(lin + 0x1C, window_size.min(u16::from(u8::MAX)) as u8); // bank size (KB)
     machine.write::<u8>(lin + 0x1D, banked_pages);
     machine.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
     if direct {
