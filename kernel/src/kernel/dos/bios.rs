@@ -1822,11 +1822,12 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     let want = regs.rcx as u16 & 0x1FF;
     let mode = native_mode.or_else(|| substitute_vbe_mode(want));
     let (w, h, bpp, banked_pitch, linear_pitch, format,
-        banked_pages, linear_pages) = if let Some(mode) = mode {
+        banked_pages, linear_pages, linear, banked) = if let Some(mode) = mode {
         (mode.width, mode.height, mode.bits_per_pixel, mode.banked_pitch,
             mode.linear_pitch,
             mode.format,
-            mode.banked_image_pages, mode.linear_image_pages)
+            mode.banked_image_pages, mode.linear_image_pages,
+            mode.physical_base != 0, mode.window_segment != 0)
     } else {
         return false;
     };
@@ -1836,14 +1837,19 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     }
     let direct = matches!(format, crate::kernel::display::FormatSpec::Packed(_));
     // ModeAttributes: supported|reserved|colour|graphics, plus LFB only when
-    // the curated hardware mode actually has one.
-    machine.write::<u16>(lin, 0x003B | 0x0080);
-    machine.write::<u8>(lin + 0x02, 0x07);
+    // the curated hardware mode actually has one. The substitute modes have
+    // both apertures; a native banked-only mode must not entice a client into
+    // sending an unsupported 4F02h request with bit 14 set.
+    machine.write::<u16>(lin, 0x003B | if linear { 0x0080 } else { 0 });
+    machine.write::<u8>(lin + 0x02, if banked { 0x07 } else { 0 });
     machine.write::<u8>(lin + 0x03, 0x00); // win B: not present
-    machine.write::<u16>(lin + 0x04, 64); // normalized 64 KiB granularity
-    machine.write::<u16>(lin + 0x06, 64); // normalized 64 KiB window
-    machine.write::<u16>(lin + 0x08, 0xA000); // window A
-    machine.write::<u32>(lin + 0x0C, super::dos::vbe_window_ptr());
+    machine.write::<u16>(lin + 0x04, if banked { 64 } else { 0 });
+    machine.write::<u16>(lin + 0x06, if banked { 64 } else { 0 });
+    machine.write::<u16>(lin + 0x08, if banked { 0xA000 } else { 0 });
+    machine.write::<u32>(
+        lin + 0x0C,
+        if banked { super::dos::vbe_window_ptr() } else { 0 },
+    );
     machine.write::<u16>(lin + 0x10, banked_pitch); // banked bytes per scanline
     machine.write::<u16>(lin + 0x12, w);
     machine.write::<u16>(lin + 0x14, h);
@@ -1853,7 +1859,7 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     machine.write::<u8>(lin + 0x19, bpp);
     machine.write::<u8>(lin + 0x1A, 1); // banks
     machine.write::<u8>(lin + 0x1B, if direct { 6 } else { 4 }); // direct vs packed
-    machine.write::<u8>(lin + 0x1C, 64); // bank size (KB)
+    machine.write::<u8>(lin + 0x1C, if banked { 64 } else { 0 });
     machine.write::<u8>(lin + 0x1D, banked_pages);
     machine.write::<u8>(lin + 0x1E, 1); // reserved (must be 1)
     if direct {
@@ -1878,10 +1884,14 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
         }
         machine.write::<u8>(lin + 0x27, 1); // direct-colour mode information
     }
-    // PhysBasePtr (0x28): the framebuffer's linear base — directly usable by a
-    // PM/DPMI client (physical == linear here). LinBytesPerScanLine (0x32)
-    // mirrors the banked pitch since the framebuffer is contiguous.
-    machine.write::<u32>(lin + 0x28, super::machine::vga::svga_lfb_base());
+    // PhysBasePtr is RetroOS's stable guest-linear aperture, but only a mode
+    // backed by a genuine physical or emulated LFB has one. A native banked
+    // card remains banked all the way through; paging cannot make its moving
+    // 64 KiB window into a simultaneous linear framebuffer.
+    machine.write::<u32>(
+        lin + 0x28,
+        if linear { super::machine::vga::svga_lfb_base() as u32 } else { 0 },
+    );
     machine.write::<u16>(lin + 0x32, linear_pitch);
     machine.write::<u8>(lin + 0x35, linear_pages);
     true
