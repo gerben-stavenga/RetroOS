@@ -61,8 +61,8 @@ enum Class {
 
 #[derive(Clone, Copy)]
 enum Tag {
-    Flags(u32),
-    Reg(u8),
+    Flags { addr: u32, value: u32 },
+    Reg { index: u8, value: u32 },
 }
 
 /// The window currently open (transient — swapped in/out WITH the address space,
@@ -185,8 +185,9 @@ impl VifMap {
                 let addr = stack_base::<A>(regs).wrapping_add(cli_sp.wrapping_add(d as u32));
                 let w: u32 = arch.read(addr as usize);
                 if looks_like_flags(w) {
-                    arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
-                    self.tag = Some(Tag::Flags(addr));
+                    let tagged = w | TF_FLAG;
+                    arch.write(addr as usize, tagged); // tag: TF rides the flags
+                    self.tag = Some(Tag::Flags { addr, value: tagged });
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
@@ -199,8 +200,9 @@ impl VifMap {
             Some(Class::Reg(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    set_reg32(regs, r, v | TF_FLAG);
-                    self.tag = Some(Tag::Reg(r));
+                    let tagged = v | TF_FLAG;
+                    set_reg32(regs, r, tagged);
+                    self.tag = Some(Tag::Reg { index: r, value: tagged });
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // register isn't flags right now → relearn
@@ -212,8 +214,9 @@ impl VifMap {
             Some(Class::RegProbe(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    set_reg32(regs, r, v | TF_FLAG);
-                    self.tag = Some(Tag::Reg(r));
+                    let tagged = v | TF_FLAG;
+                    set_reg32(regs, r, tagged);
+                    self.tag = Some(Tag::Reg { index: r, value: tagged });
                     self.begin_learn(regs, Some(r));
                 } else {
                     self.begin_learn(regs, None);
@@ -260,14 +263,15 @@ impl VifMap {
     /// propagated through ordinary guest moves.
     fn clear_tag<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> bool {
         match self.tag.take() {
-            Some(Tag::Flags(addr)) => {
-                let value: u32 = arch.read(addr as usize);
-                arch.write(addr as usize, value & !TF_FLAG);
+            Some(Tag::Flags { addr, value: tagged }) => {
+                let current: u32 = arch.read(addr as usize);
+                if current == tagged {
+                    arch.write(addr as usize, current & !TF_FLAG);
+                }
                 false
             }
-            Some(Tag::Reg(r)) => {
-                set_reg32(regs, r, reg32(regs, r) & !TF_FLAG);
-                true
+            Some(Tag::Reg { index, value: tagged }) => {
+                clear_register_tag(regs, index, tagged)
             }
             None => false,
         }
@@ -472,6 +476,18 @@ fn set_reg32(regs: &mut Regs, idx: u8, v: u32) {
     *slot = (*slot & !0xFFFF_FFFF) | v as u64;
 }
 
+/// Remove a tag only while the register still contains the flags image we
+/// wrote. The critical-section body is free to reuse that register before an
+/// alternate STI exit; in that case bit 8 belongs to the new guest value.
+fn clear_register_tag(regs: &mut Regs, index: u8, tagged: u32) -> bool {
+    let current = reg32(regs, index);
+    if current != tagged {
+        return false;
+    }
+    set_reg32(regs, index, current & !TF_FLAG);
+    true
+}
+
 // ── Small per-space CLI-site table ───────────────────────────────────────────
 // Open-addressed, fixed capacity — a client has a handful of critical sections.
 // Stores the `Class` enum directly; `None` = empty slot.
@@ -553,7 +569,7 @@ mod tests {
     fn nested_call_suspends_ownership_and_restores_each_callers_window() {
         let mut vif = VifMap::new();
         vif.active = Some(learning_window(0x100));
-        vif.tag = Some(Tag::Flags(0x1004));
+        vif.tag = Some(Tag::Flags { addr: 0x1004, value: IF_FLAG | TF_FLAG | 2 });
         let outer = vif.suspend();
         assert!(!vif.owns_db());
         assert!(!vif.is_learning());
@@ -572,7 +588,7 @@ mod tests {
         vif.restore(outer);
         assert_eq!(vif.active_site(), Some(0x100));
         assert!(vif.is_learning());
-        assert!(matches!(vif.tag, Some(Tag::Flags(0x1004))));
+        assert!(matches!(vif.tag, Some(Tag::Flags { addr: 0x1004, .. })));
         assert!(matches!(vif.sites.get(0x200), Some(Class::Sti)));
     }
 
@@ -604,5 +620,19 @@ mod tests {
         assert!(matches!(table.get(linear), Some(Class::Sti)));
         table.retain_out_of_page(linear >> 12);
         assert!(table.get(linear).is_none());
+    }
+
+    #[test]
+    fn alternate_sti_does_not_untag_a_reused_register() {
+        let mut regs = Regs::empty();
+        let tagged_flags = IF_FLAG | TF_FLAG | 2;
+
+        regs.rbx = 0xDEAD_BEEF;
+        assert!(!clear_register_tag(&mut regs, 3, tagged_flags));
+        assert_eq!(regs.rbx, 0xDEAD_BEEF);
+
+        regs.rbx = u64::from(tagged_flags);
+        assert!(clear_register_tag(&mut regs, 3, tagged_flags));
+        assert_eq!(regs.rbx, u64::from(tagged_flags & !TF_FLAG));
     }
 }
