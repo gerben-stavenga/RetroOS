@@ -202,10 +202,7 @@ fn debug_watch_trap(regs: &Regs, dr6: u32, kernel: bool) -> bool {
 #[inline(never)]
 fn arch_dispatch(regs: &mut Regs) {
     match regs.rax {
-        arch_call::EXECUTE => {
-            swap_regs(regs);
-            regs.frame.rflags &= !(1 << 14); // HACK: strip NT
-        }
+        arch_call::EXECUTE => swap_regs(regs),
         arch_call::SWITCH_TO => arch_switch_to(regs),
         arch_call::SWITCH_FX => {
             let fx = regs.rdx as u32 as *mut crate::x86::FxState;

@@ -7,8 +7,9 @@
 //!
 //! The Windows-95 technique (see Raymond Chen, "Getting MS-DOS games to run on
 //! Windows 95: the interrupt flag"): don't chase the exit's *address*, tag the
-//! saved-flags *data* with TF. The reload drops IF but loads TF (not
-//! IOPL-gated), so a `#DB` fires one instruction later and we restore VIF there.
+//! saved-flags *data* with TF|NT. The reload drops IF but loads TF (not
+//! IOPL-gated), so a `#DB` fires one instruction later and we restore VIF there;
+//! NT is the in-band proof that the TF came from this mechanism, not the guest.
 //! `STI` exits `#GP` on their own and need no tag.
 //!
 //! Each CLI site is learned once (by single-stepping the window) into one of
@@ -37,6 +38,8 @@ use arch_abi::{Arch, Regs};
 // EFLAGS bits.
 const IF_FLAG: u32 = 1 << 9;
 const TF_FLAG: u32 = 1 << 8;
+const NT_FLAG: u32 = 1 << 14;
+const CARRIER_FLAGS: u32 = TF_FLAG | NT_FLAG;
 const VIF_FLAG: u32 = 1 << 19; // our virtual IF (host-only bit)
 
 /// How a window exits, learned per CLI site.
@@ -160,7 +163,7 @@ impl VifMap {
                 let addr = stack_base::<A>(regs).wrapping_add(cli_sp.wrapping_add(d as u32));
                 let w: u32 = arch.read(addr as usize);
                 if looks_like_flags(w) {
-                    arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
+                    arch.write(addr as usize, w | CARRIER_FLAGS);
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
@@ -173,7 +176,7 @@ impl VifMap {
             Some(Class::Reg(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    set_reg32(regs, r, v | TF_FLAG);
+                    set_reg32(regs, r, v | CARRIER_FLAGS);
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // register isn't flags right now → relearn
@@ -185,7 +188,7 @@ impl VifMap {
             Some(Class::RegProbe(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    set_reg32(regs, r, v | TF_FLAG);
+                    set_reg32(regs, r, v | CARRIER_FLAGS);
                     self.begin_learn(regs, Some(r));
                 } else {
                     self.begin_learn(regs, None);
@@ -212,6 +215,10 @@ impl VifMap {
     /// A `#DB`: either the post-tag trap (a tagged `POPF`/`IRET` just ran) or a
     /// learning single-step. Returns whether the client should resume.
     pub fn on_db<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> DbResult {
+        if self.is_carrier_trap(regs) {
+            self.finish_carrier(regs);
+            return DbResult::Resume;
+        }
         match self.active {
             Some(a) if a.learning => self.step_learn(arch, regs),
             _ => {
@@ -223,6 +230,25 @@ impl VifMap {
                 DbResult::Resume
             }
         }
+    }
+
+    /// NT is the durable provenance marker. Trap entry may project physical TF
+    /// away after attributing the event, but leaves NT in the saved frame.
+    /// RetroOS has no hardware nested tasks and reserves NT for this purpose.
+    pub fn is_carrier_trap(&self, regs: &Regs) -> bool {
+        regs.flags32() & NT_FLAG != 0
+    }
+
+    /// Complete a tagged CLI window without touching the saved flags carrier.
+    /// This is shared by its ordinary #DB and the #TS fallback for an IRET
+    /// attempted during TF's one-instruction delay.
+    pub fn finish_carrier(&mut self, regs: &mut Regs) {
+        regs.clear_flag32(NT_FLAG);
+        regs.set_user_tf(false);
+        regs.set_flags32(regs.flags32() | VIF_FLAG);
+        regs.project_tf();
+        self.active = None;
+        self.stats[2] = self.stats[2].wrapping_add(1);
     }
 
     fn begin_learn(&mut self, regs: &mut Regs, probe: Option<u8>) {
@@ -281,6 +307,9 @@ impl VifMap {
                             let class = classify_exit(arch, regs, &a, op, op32, sp_before, ip_before);
                             self.sites.insert(a.cli_linear, class);
                         }
+                        // A probe carrier was consumed through the monitor, so
+                        // no hardware #DB will clear its NT provenance marker.
+                        regs.clear_flag32(NT_FLAG);
                         self.active = None;
                         return DbResult::Resume;
                     }
@@ -335,12 +364,14 @@ fn classify_exit<A: Arch>(
         let popped: u32 = arch.read(stack_base::<A>(regs).wrapping_add(sp_before) as usize);
         let m = if op32 { u32::MAX } else { 0xFFFF };
         if let Some(r) = a.probe {
-            if popped & TF_FLAG != 0 && (popped ^ a.snap[r as usize]) & m & !TF_FLAG == 0 {
+            if popped & CARRIER_FLAGS == CARRIER_FLAGS
+                && (popped ^ a.snap[r as usize]) & m & !CARRIER_FLAGS == 0
+            {
                 return Class::Reg(r);
             }
         } else if let Some((r1, r2)) = reg_idiom(arch, cs_base, a.cli_ip, ip_before)
             && looks_like_flags(a.snap[r1 as usize])
-            && (a.snap[r1 as usize] ^ reg32(regs, r2)) & m & !TF_FLAG == 0
+            && (a.snap[r1 as usize] ^ reg32(regs, r2)) & m & !CARRIER_FLAGS == 0
             && (popped ^ reg32(regs, r2)) & m == 0
         {
             return Class::RegProbe(r1);
@@ -385,7 +416,7 @@ pub enum DbResult {
 /// Saved flags we intend to re-enable IF from: IF set, reserved bit 1 set, TF
 /// clear. Checks only the low 16 bits, valid for a 16- or 32-bit pushed image.
 fn looks_like_flags(w: u32) -> bool {
-    w & IF_FLAG != 0 && w & 2 != 0 && w & TF_FLAG == 0
+    w & IF_FLAG != 0 && w & 2 != 0 && w & CARRIER_FLAGS == 0
 }
 
 fn stack_base<A: Arch>(regs: &Regs) -> u32 {
@@ -553,5 +584,22 @@ mod tests {
         assert!(matches!(table.get(linear), Some(Class::Sti)));
         table.retain_out_of_page(linear >> 12);
         assert!(table.get(linear).is_none());
+    }
+
+    #[test]
+    fn nt_distinguishes_vif_carrier_from_guest_tf() {
+        let mut vif = VifMap::new();
+        let mut regs = Regs::empty();
+        regs.set_flags32(2 | TF_FLAG);
+        assert!(!vif.is_carrier_trap(&regs));
+
+        // Trap attribution projects physical TF away before VIF consumes it;
+        // NT alone must keep identifying the already-attributed carrier.
+        regs.set_flags32(2 | NT_FLAG);
+        assert!(vif.is_carrier_trap(&regs));
+        vif.finish_carrier(&mut regs);
+        assert_eq!(regs.flags32() & CARRIER_FLAGS, 0);
+        assert_ne!(regs.flags32() & VIF_FLAG, 0);
+        assert_eq!(vif.stats[2], 1);
     }
 }

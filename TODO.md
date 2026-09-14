@@ -112,7 +112,6 @@ in Git history.
   to a halt when emulated retrace advances independently of guest polling.
 - [ ] **Aladdin:** sound degrades and graphics eventually become corrupt.
 - [ ] **Golden Axe:** missing keyboard keys prevent selection.
-- [ ] **Comanche/F22:** no arrow key response.
 
 ## Emulator-specific reference issues
 

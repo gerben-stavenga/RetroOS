@@ -137,6 +137,7 @@ fn prepare_audio<A: crate::Arch>(
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
     let master_env = load_master_env();
+    configure_config_serial(boot, &master_env);
     crate::kernel::drivers::hda::configure_output_route(crate::kernel::dos::config_var(
         &master_env,
         b"HDA_OUTPUT",
@@ -288,6 +289,36 @@ fn prepare_audio<A: crate::Arch>(
     }
 }
 
+/// Enable a late kernel serial mirror requested by CONFIG.SYS. Firmware-free
+/// launchers such as 86Box cannot supply a Multiboot or fw_cfg command line,
+/// but CONFIG.SYS is available before the first DOS personality starts. Early
+/// boot messages remain in klog; all subsequent diagnostics are mirrored to
+/// the selected UART.
+fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
+    if boot.serial_console_port.is_some() {
+        return;
+    }
+    let Some(value) = crate::kernel::dos::config_var(master_env, b"SERIAL") else {
+        return;
+    };
+    let Some(value) = value.split(|byte| *byte == b' ').next() else {
+        return;
+    };
+    let Some(port) = arch_abi::ComPort::parse_ascii(value) else {
+        crate::compact_println!("serial: invalid CONFIG.SYS SERIAL value");
+        return;
+    };
+    if boot.hostfs_port == Some(port) {
+        crate::compact_println!("serial: {:?} already belongs to hostfs", port);
+        return;
+    }
+    if crate::kernel::serial_log::init(port) {
+        crate::compact_println!("serial: {:?} logging enabled from CONFIG.SYS", port);
+    } else {
+        crate::compact_println!("serial: {:?} unavailable", port);
+    }
+}
+
 /// Discover physical disks without letting controller-specific probe and
 /// cleanup paths become part of the startup conductor.
 #[inline(never)]
@@ -326,6 +357,7 @@ fn select_display<A: crate::Arch>(
         .vga_capability()
         .and_then(|native| native.bios_discover_vbe(machine, bios_workspace));
     crate::kernel::platform::set_vbe_mode(vbe_mode);
+    crate::kernel::dos::reserve_live_vram(machine, bios_workspace.curated_modes());
     crate::kernel::platform::set_voodoo_vbe_mode(
         bios_workspace.curated_modes(),
         !display.is_headless(),

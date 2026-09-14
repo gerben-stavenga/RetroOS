@@ -55,6 +55,7 @@ mod mode_transitions;
 pub use machine::vsb::SbDevice;
 pub use machine::vga::physical_vga_present;
 pub(crate) use machine::vga::release_fullscreen;
+pub(crate) use machine::vga::reserve_live_vram;
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub use dos::parse_config_env;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
@@ -93,6 +94,7 @@ use crate::kernel::thread;
 use crate::Regs;
 
 const TF_FLAG: u32 = 1 << 8;
+const NT_FLAG: u32 = 1 << 14;
 const TF_USER: u8 = 1;
 const TF_LEARNING: u8 = 2;
 const TF_DELAY: u8 = 4;
@@ -695,7 +697,9 @@ fn enter_kernel_tf<A: crate::Arch>(
     // the projected TF was active for the retired instruction.
     let actual = regs.flags32() & TF_FLAG != 0
         || matches!(event, crate::KernelEvent::DebugTrap | crate::KernelEvent::Exception(1));
-    let vif = dos.dpmi.as_ref().is_some_and(|d| d.vif.owns_db());
+    let vif = dos.dpmi.as_ref().is_some_and(|d| {
+        d.vif.owns_db() || d.vif.is_carrier_trap(regs)
+    });
     if actual && vif {
         dos.tf_sources |= TF_LEARNING;
     }
@@ -724,7 +728,9 @@ fn continue_vif<A: crate::Arch>(
     regs: &mut Regs,
 ) -> thread::KernelAction {
     loop {
-        let result = dos.dpmi.as_mut().filter(|d| d.vif.owns_db())
+        let result = dos.dpmi.as_mut().filter(|d| {
+            d.vif.owns_db() || d.vif.is_carrier_trap(regs)
+        })
             .map(|d| d.vif.on_db(machine, regs));
         refresh_learning_tf(dos);
         regs.project_tf();
@@ -968,6 +974,26 @@ fn handle_event_inner<A: crate::Arch>(
             if n == 1 {
                 let sources = active_tf_sources(dos, regs);
                 return handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
+            }
+
+            // NT is RetroOS's in-band provenance marker for a VIF TF carrier.
+            // If TF's one-instruction delay encounters IRET, x86 consults the
+            // zero TSS backlink first and raises #TS(0). Complete the carrier,
+            // then emulate that same IRET with NT clear so its own IF image is
+            // applied through the ordinary monitor path.
+            if n == 10 && regs.err_code == 0
+                && regs.flags32() & NT_FLAG != 0
+                && let Some(dpmi) = dos.dpmi.as_mut()
+            {
+                dpmi.vif.finish_carrier(regs);
+                refresh_learning_tf(dos);
+                regs.project_tf();
+                return match arch_abi::monitor::monitor(machine, regs) {
+                    arch_abi::monitor::MonitorResult::Resume => thread::KernelAction::Done,
+                    arch_abi::monitor::MonitorResult::Event(event) => {
+                        handle_event(machine, bios_display, kt, dos, regs, event)
+                    }
+                };
             }
 
             // DPMI session active: route to client's exception handler

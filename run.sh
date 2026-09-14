@@ -1268,11 +1268,11 @@ EOF
 # ===========================================================================
 # launch_86box  (verbatim from run_86box.sh)
 # ===========================================================================
-# Append a TEST= line to C:\CONFIG.SYS inside a raw disk image. debugfs cannot
+# Append one KEY=VALUE line to C:\CONFIG.SYS inside a raw disk image. debugfs cannot
 # take a partition offset, so the partition is lifted out, edited, and spliced
 # back at the same LBA. Writes only to the caller's copy of the image.
-inject_test_cmd() {
-    local img="$1" cmd="$2" off part cfg
+inject_config_line() {
+    local img="$1" line="$2" off part cfg
     command -v debugfs >/dev/null 2>&1 || return 1
     # Partition 2, not 1: p1 is the boot TAR the MBR bootloader reads, p2 is
     # the ext4 root that carries C:.
@@ -1285,11 +1285,15 @@ inject_test_cmd() {
     # An empty CONFIG.SYS here would mean the dump silently failed and we are
     # about to REPLACE the guest's BLASTER/SB_AUDIO declarations with one line.
     [ -s "$cfg" ] || return 1
-    printf 'TEST=%s\r\n' "$cmd" >> "$cfg"
+    printf '%s\r\n' "$line" >> "$cfg"
     printf 'rm home/retroos/CONFIG.SYS\nwrite %s home/retroos/CONFIG.SYS\n' "$cfg" \
         | debugfs -w -f - "$part" 2>&1 | grep -qi "Bad magic\|error" && return 1
     dd if="$part" of="$img" bs=512 seek="$off" conv=notrunc status=none || return 1
     rm -f "$part" "$cfg"
+}
+
+inject_test_cmd() {
+    inject_config_line "$1" "TEST=$2"
 }
 
 launch_86box() {
@@ -1379,7 +1383,7 @@ cpu_speed = 166666666
 cpu_multi = 2.5
 cpu_use_dynarec = 1
 fpu_type = internal
-mem_size = 32768
+mem_size = 65536
 time_sync = local
 pit_mode = -1
 fpu_softfloat = 0
@@ -1423,6 +1427,24 @@ EOF
     rm -f "${VM_DIR}/disk.img"
     cp --reflink=auto "${SCRIPT_DIR}/bazel-bin/${IMAGE_FILE}" "${VM_DIR}/disk.img"
     chmod u+rw "${VM_DIR}/disk.img"
+
+    # Older generated profiles used 32 MiB. Keep user-customized profiles,
+    # but raise that exact old default to 64 MiB for memory-hungry DOS games.
+    if [ -f "${VM_DIR}/86box.cfg" ] && grep -q '^mem_size = 32768$' "${VM_DIR}/86box.cfg"; then
+        sed -i 's/^mem_size = 32768$/mem_size = 65536/' "${VM_DIR}/86box.cfg"
+        echo "Raised 86Box memory from 32 MiB to 64 MiB in $VM_DIR/86box.cfg"
+    fi
+
+    # Permanent diagnostic-driver contract: expose the kernel log on 86Box's
+    # stdout. SERIAL=COM1 only touches this run's private disk copy; ordinary
+    # boots retain their configured serial/hostfs ownership.
+    if [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 1 ]; then
+        inject_config_line "${VM_DIR}/disk.img" "SERIAL=COM1" || {
+            echo "run.sh: could not enable CONFIG.SYS kernel serial logging." >&2
+            exit 1
+        }
+        echo "86box: RetroOS kernel log routed through COM1 to stdout"
+    fi
 
     # --cmd on a backend with no fw_cfg. 86Box cannot be handed a cmdline, so
     # the command travels IN the image: the kernel runs CONFIG.SYS's TEST= line
@@ -1477,7 +1499,7 @@ cpu_speed = 166666666
 cpu_multi = 2.5
 cpu_use_dynarec = 1
 fpu_type = internal
-mem_size = 32768
+mem_size = 65536
 time_sync = local
 pit_mode = -1
 fpu_softfloat = 0
@@ -1518,6 +1540,32 @@ fdd_01_type = 35_2hd
 fdd_02_type = none
 EOF
         echo "Created default 86box config at $VM_DIR/86box.cfg"
+    fi
+
+    if [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 1 ]; then
+        sed -i '/^serial1_enabled = /d; /^serial1_device = /d' "${VM_DIR}/86box.cfg"
+        if grep -q '^\[Ports (COM & LPT)\]$' "${VM_DIR}/86box.cfg"; then
+            sed -i '/^\[Ports (COM & LPT)\]$/a serial1_enabled = 1\nserial1_device = pipe' \
+                "${VM_DIR}/86box.cfg"
+        else
+            printf '\n[Ports (COM & LPT)]\nserial1_enabled = 1\nserial1_device = pipe\n' \
+                >> "${VM_DIR}/86box.cfg"
+        fi
+        # Do not use 86Box's stdio virtual console here: it redirects the
+        # emulator's own stdout/stderr and can stall startup when a supervising
+        # process captures those streams. Version 6's FIFO COM device is
+        # non-interactive, unbuffered, and leaves the emulator log alone.
+        SERIAL_PIPE="${VM_DIR}/kernel-serial"
+        rm -f "${SERIAL_PIPE}.in" "${SERIAL_PIPE}.out"
+        awk '
+            /^\[(Virtual Console|File|Named Pipe) \(COM\) #1\]$/ { drop = 1; next }
+            /^\[/ { drop = 0 }
+            !drop { print }
+        ' "${VM_DIR}/86box.cfg" > "${VM_DIR}/86box.cfg.serial"
+        mv "${VM_DIR}/86box.cfg.serial" "${VM_DIR}/86box.cfg"
+        printf '\n[Named Pipe (COM) #1]\npath = %s\nmode = 1\nreconnect = 1\n' "$SERIAL_PIPE" \
+            >> "${VM_DIR}/86box.cfg"
+        echo "86box: RetroOS kernel log file: ${SERIAL_PIPE}.out"
     fi
 
     # The image grows as bundled software is added. 86Box persists an explicit

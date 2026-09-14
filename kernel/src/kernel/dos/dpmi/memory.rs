@@ -24,17 +24,24 @@ fn code(error: Error) -> u16 {
 }
 
 pub(super) fn info<A: Backing>(machine: &A, memory: &DosMemory, dpmi: &DpmiState) -> [u32; 12] {
+    let free = memory.available_pages(machine).min(u32::MAX as usize) as u32;
     let max = if memory.owner_blocks(dpmi.memory_owner) < MAX_MEM_BLOCKS {
         memory.largest_bytes(machine, dpmi.mem_start, memory::general_limit(), PAGE) / PAGE
     } else { 0 };
+    // DPMI 0.9 defines this as pages managed by the DPMI host, not installed
+    // machine RAM. Kernel pages, another DOS task's suspended address space,
+    // and reserved video backing can never be returned by 0501h and therefore
+    // must not be counted. Existing blocks of this client remain managed but
+    // are no longer free.
+    let managed = memory.owner_pages(dpmi.memory_owner)
+        .saturating_add(free as usize).min(u32::MAX as usize) as u32;
     let mut info = [u32::MAX; 12];
     info[0] = max * PAGE;
     info[1] = max;
     info[2] = max;
-    info[4] = max;
-    info[5] = max;
-    info[6] = memory.total_page_count(machine)
-        .map_or(u32::MAX, |n| n.min(u32::MAX as usize) as u32);
+    info[4] = managed;
+    info[5] = free;
+    info[6] = managed;
     info[8] = 0;
     info
 }
@@ -71,4 +78,36 @@ pub(super) fn resize<A: Backing>(
         machine, dpmi.memory_owner, handle, size, PAGE, dpmi.mem_start,
         memory::general_limit(),
     ).map(|block| block.base).map_err(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Pool { free: usize }
+
+    impl Backing for Pool {
+        fn free_page_count(&self) -> usize { self.free }
+        fn map_fresh_range(&mut self, _base: usize, count: usize) { self.free -= count; }
+        fn unmap_range(&mut self, _base: usize, count: usize) { self.free += count; }
+        fn swap_page_entries(&mut self, _from: usize, _to: usize, _count: usize) {}
+    }
+
+    #[test]
+    fn memory_info_counts_only_pages_managed_for_this_client() {
+        let mut pool = Pool { free: 4096 };
+        let mut memory = DosMemory::new();
+        let (owner, start) = memory.new_dpmi_owner();
+        let dpmi = DpmiState::new(owner, start);
+
+        let before = info(&pool, &memory, &dpmi);
+        assert_eq!(before[4], before[5]);
+        assert_eq!(before[5], before[6]);
+
+        allocate(&mut pool, &mut memory, &dpmi, 3 * PAGE).unwrap();
+        let after = info(&pool, &memory, &dpmi);
+        assert_eq!(after[4], after[5] + 3);
+        assert_eq!(after[6], after[5] + 3);
+        assert_eq!(after[6], before[6]);
+    }
 }

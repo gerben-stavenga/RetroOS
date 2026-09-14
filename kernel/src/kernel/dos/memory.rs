@@ -8,7 +8,12 @@
 const PAGE: u32 = 4096;
 const GENERAL_BASE: u32 = 0x0050_0000;
 const LIMIT: u32 = super::machine::vga::SVGA_LFB_BASE as u32;
-const HOST_RESERVE: usize = 4 * 1024 * 1024 / PAGE as usize;
+// The display's largest advertised framebuffer is committed before DOS starts,
+// so extended-memory admission no longer needs to withhold another whole video
+// image. Keep one MiB for later kernel bookkeeping in addition to the explicit
+// page-table allowance below. Four MiB here made an 8 MiB DOS/4GW heap miss on
+// a 32 MiB machine with DN suspended, triggering tens of thousands of retries.
+const HOST_RESERVE: usize = 1024 * 1024 / PAGE as usize;
 const CLIENT_PAGES: usize = 32 * 1024 * 1024 / PAGE as usize;
 const MAX_BLOCKS: usize = 512;
 
@@ -33,7 +38,6 @@ pub enum Error { BadSize, NoLinear, NoPhysical, NoSlots, BadHandle }
 /// the metal/interpreter page-table implementations.
 pub trait Backing {
     fn free_page_count(&self) -> usize;
-    fn total_page_count(&self) -> Option<usize>;
     fn map_fresh_range(&mut self, base: usize, count: usize);
     fn unmap_range(&mut self, base: usize, count: usize);
     fn swap_page_entries(&mut self, from: usize, to: usize, count: usize);
@@ -41,7 +45,6 @@ pub trait Backing {
 
 impl<A: crate::Arch> Backing for A {
     fn free_page_count(&self) -> usize { crate::Arch::free_page_count(self) }
-    fn total_page_count(&self) -> Option<usize> { crate::Arch::total_page_count(self) }
     fn map_fresh_range(&mut self, base: usize, count: usize) { crate::Arch::map_fresh_range(self, base, count); }
     fn unmap_range(&mut self, base: usize, count: usize) { crate::Arch::unmap_range(self, base, count); }
     fn swap_page_entries(&mut self, from: usize, to: usize, count: usize) { crate::Arch::swap_page_entries(self, from, to, count); }
@@ -72,6 +75,11 @@ impl DosMemory {
 
     pub fn owner_blocks(&self, owner: Owner) -> usize {
         self.blocks.iter().filter(|b| b.owner == owner).count()
+    }
+
+    pub fn owner_pages(&self, owner: Owner) -> usize {
+        self.blocks.iter().filter(|b| b.owner == owner)
+            .map(|b| (b.size / PAGE) as usize).sum()
     }
 
     pub fn allocate<A: Backing>(
@@ -176,10 +184,6 @@ impl DosMemory {
         linear.min((self.available_pages(machine).min(u32::MAX as usize / PAGE as usize) as u32) * PAGE)
     }
 
-    pub fn total_page_count<A: Backing>(&self, machine: &A) -> Option<usize> {
-        machine.total_page_count()
-    }
-
     fn hole(&self, lower: u32, upper: u32, alignment: u32, wanted: Option<u32>) -> Option<(u32, u32)> {
         if lower >= upper || !alignment.is_power_of_two() { return None; }
         let mut ranges: alloc::vec::Vec<Block> = self.blocks.iter().copied()
@@ -245,7 +249,6 @@ mod tests {
 
     impl Backing for Pool {
         fn free_page_count(&self) -> usize { self.free }
-        fn total_page_count(&self) -> Option<usize> { Some(65536) }
         fn map_fresh_range(&mut self, base: usize, count: usize) {
             for page in base..base + count {
                 assert!(self.pages.insert(page, 0).is_none());
@@ -282,6 +285,7 @@ mod tests {
         assert_eq!(ems.base, GENERAL_BASE);
         assert_eq!(start & 0xFFFFF, 0);
         assert!(block.base >= ems.base + ems.size);
+        assert_eq!(memory.owner_pages(dpmi), 1);
         assert_eq!(memory.available_pages(&pool), CLIENT_PAGES - 6);
     }
 

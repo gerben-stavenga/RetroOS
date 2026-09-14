@@ -523,6 +523,20 @@ static LIVE_VRAM: core::sync::atomic::AtomicPtr<u8> =
 static LIVE_VRAM_PAGES: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// Commit the largest framebuffer this machine's DOS VBE boundary can expose
+/// before XMS/EMS/DPMI report free memory. A native BIOS supplies its exact
+/// curated capacity; the firmware-independent VBE uses RetroOS's own aperture.
+pub(crate) fn reserve_live_vram<A: crate::Arch>(
+    machine: &mut A,
+    native_modes: Option<&[crate::kernel::platform::VbeMode]>,
+) {
+    let bytes = native_modes.map_or(SVGA_LFB_MAX_BYTES, |modes| {
+        modes.iter().map(|mode| mode.framebuffer_bytes as usize)
+            .max().unwrap_or(PLANES_LEN)
+    });
+    initialize_live_vram(machine, bytes.max(PLANES_LEN).div_ceil(crate::PAGE_SIZE));
+}
+
 fn initialize_live_vram<A: crate::Arch>(
     machine: &mut A,
     required_pages: usize,
