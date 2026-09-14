@@ -59,12 +59,6 @@ enum Class {
     Reg(u8),
 }
 
-#[derive(Clone, Copy)]
-enum Tag {
-    Flags { addr: u32, value: u32 },
-    Reg { index: u8, value: u32 },
-}
-
 /// The window currently open (transient — swapped in/out WITH the address space,
 /// so it is per-thread automatically). Was the global `WIN`/`CUR_SITE`/`CUR_SP`.
 #[derive(Clone, Copy)]
@@ -86,13 +80,11 @@ struct Active {
 }
 
 /// Repair state belonging to a caller suspended by a DPMI real-mode call.
-/// Learned sites remain shared; the active window and its tags follow the
-/// caller's continuation, including across nested calls and callbacks.
+/// Learned sites remain shared; the active window follows the caller's
+/// continuation, including across nested calls and callbacks.
 #[derive(Clone, Copy)]
 pub(in crate::kernel::dos) struct SuspendedVif {
     active: Option<Active>,
-    tag: Option<Tag>,
-    escaped_tag: bool,
 }
 
 /// Per-address-space virtual-IF state. A field on the DPMI client; dropped with
@@ -103,37 +95,21 @@ pub struct VifMap {
     /// linear address makes code-page invalidation correct for based selectors.
     sites: SiteTable,
     active: Option<Active>,
-    /// Exact guest value carrying our TF tag. A cached CLI site can take a
-    /// different branch and close through STI; in that case the predicted
-    /// POPF/IRET never consumes the tag, so remove it at the alternate exit.
-    tag: Option<Tag>,
-    /// A register tag can be copied before an alternate STI exit. The next
-    /// otherwise-unowned #DB consumes that escaped tag inside VIF.
-    escaped_tag: bool,
     /// Per-client parity counters (windows, tag-closes, post-tag #DBs, steps).
     pub stats: [u32; 4],
 }
 
 impl VifMap {
     pub(in crate::kernel::dos) fn suspend(&mut self) -> SuspendedVif {
-        SuspendedVif {
-            active: self.active.take(),
-            tag: self.tag.take(),
-            escaped_tag: core::mem::take(&mut self.escaped_tag),
-        }
+        SuspendedVif { active: self.active.take() }
     }
 
     pub(in crate::kernel::dos) fn restore(&mut self, saved: SuspendedVif) {
         self.active = saved.active;
-        self.tag = saved.tag;
-        self.escaped_tag = saved.escaped_tag;
     }
 
     pub const fn new() -> Self {
-        VifMap {
-            sites: SiteTable::new(), active: None, tag: None,
-            escaped_tag: false, stats: [0; 4],
-        }
+        VifMap { sites: SiteTable::new(), active: None, stats: [0; 4] }
     }
 
     /// Whether the next #DB belongs to an interrupts-off window currently
@@ -141,7 +117,7 @@ impl VifMap {
     /// client is temporarily executing its VM86 side: CPU mode alone cannot
     /// distinguish this host-owned trace from a real-mode program's INT 1.
     pub fn owns_db(&self) -> bool {
-        self.active.is_some() || self.escaped_tag
+        self.active.is_some()
     }
 
     /// Whether an open window is currently being traced instruction by
@@ -160,7 +136,6 @@ impl VifMap {
     /// `arch` gives guest memory + segment bases; `regs` is the fault frame.
     pub fn on_cli<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs, cli_ip: u32,
                            always_step: bool) {
-        self.escaped_tag |= self.clear_tag(arch, regs);
         let cli_linear = A::seg_base(regs.code_seg()).wrapping_add(cli_ip);
         let cli_sp = regs.sp32();
         self.active = Some(Active {
@@ -185,9 +160,7 @@ impl VifMap {
                 let addr = stack_base::<A>(regs).wrapping_add(cli_sp.wrapping_add(d as u32));
                 let w: u32 = arch.read(addr as usize);
                 if looks_like_flags(w) {
-                    let tagged = w | TF_FLAG;
-                    arch.write(addr as usize, tagged); // tag: TF rides the flags
-                    self.tag = Some(Tag::Flags { addr, value: tagged });
+                    arch.write(addr as usize, w | TF_FLAG); // tag: TF rides the flags
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // stale delta (wrong page / SMC) → relearn
@@ -200,9 +173,7 @@ impl VifMap {
             Some(Class::Reg(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    let tagged = v | TF_FLAG;
-                    set_reg32(regs, r, tagged);
-                    self.tag = Some(Tag::Reg { index: r, value: tagged });
+                    set_reg32(regs, r, v | TF_FLAG);
                     self.stats[1] = self.stats[1].wrapping_add(1);
                 } else {
                     self.begin_learn(regs, None); // register isn't flags right now → relearn
@@ -214,9 +185,7 @@ impl VifMap {
             Some(Class::RegProbe(r)) => {
                 let v = reg32(regs, r);
                 if looks_like_flags(v) {
-                    let tagged = v | TF_FLAG;
-                    set_reg32(regs, r, tagged);
-                    self.tag = Some(Tag::Reg { index: r, value: tagged });
+                    set_reg32(regs, r, v | TF_FLAG);
                     self.begin_learn(regs, Some(r));
                 } else {
                     self.begin_learn(regs, None);
@@ -231,8 +200,7 @@ impl VifMap {
 
     /// An `STI` `#GP`'d: it re-enabled IF on its own. If we were learning, this
     /// site's exit is an STI. (arch has already reflected the fault; we set VIF.)
-    pub fn on_sti<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) {
-        self.escaped_tag |= self.clear_tag(arch, regs);
+    pub fn on_sti(&mut self, regs: &mut Regs) {
         regs.set_flags32(regs.flags32() | VIF_FLAG);
         if let Some(a) = self.active.take()
             && a.learning
@@ -251,29 +219,9 @@ impl VifMap {
                 // instruction late; clear TF.
                 regs.set_flags32(regs.flags32() | VIF_FLAG);
                 self.active = None;
-                self.tag = None;
-                self.escaped_tag = false;
                 self.stats[2] = self.stats[2].wrapping_add(1);
                 DbResult::Resume
             }
-        }
-    }
-
-    /// Remove the known copy and report whether a register tag may also have
-    /// propagated through ordinary guest moves.
-    fn clear_tag<A: Arch>(&mut self, arch: &mut A, regs: &mut Regs) -> bool {
-        match self.tag.take() {
-            Some(Tag::Flags { addr, value: tagged }) => {
-                let current: u32 = arch.read(addr as usize);
-                if current == tagged {
-                    arch.write(addr as usize, current & !TF_FLAG);
-                }
-                false
-            }
-            Some(Tag::Reg { index, value: tagged }) => {
-                clear_register_tag(regs, index, tagged)
-            }
-            None => false,
         }
     }
 
@@ -476,18 +424,6 @@ fn set_reg32(regs: &mut Regs, idx: u8, v: u32) {
     *slot = (*slot & !0xFFFF_FFFF) | v as u64;
 }
 
-/// Remove a tag only while the register still contains the flags image we
-/// wrote. The critical-section body is free to reuse that register before an
-/// alternate STI exit; in that case bit 8 belongs to the new guest value.
-fn clear_register_tag(regs: &mut Regs, index: u8, tagged: u32) -> bool {
-    let current = reg32(regs, index);
-    if current != tagged {
-        return false;
-    }
-    set_reg32(regs, index, current & !TF_FLAG);
-    true
-}
-
 // ── Small per-space CLI-site table ───────────────────────────────────────────
 // Open-addressed, fixed capacity — a client has a handful of critical sections.
 // Stores the `Class` enum directly; `None` = empty slot.
@@ -569,11 +505,9 @@ mod tests {
     fn nested_call_suspends_ownership_and_restores_each_callers_window() {
         let mut vif = VifMap::new();
         vif.active = Some(learning_window(0x100));
-        vif.tag = Some(Tag::Flags { addr: 0x1004, value: IF_FLAG | TF_FLAG | 2 });
         let outer = vif.suspend();
         assert!(!vif.owns_db());
         assert!(!vif.is_learning());
-        assert!(vif.tag.is_none());
 
         // A PM callback can own its own window, then make another RM call.
         vif.active = Some(learning_window(0x200));
@@ -588,7 +522,6 @@ mod tests {
         vif.restore(outer);
         assert_eq!(vif.active_site(), Some(0x100));
         assert!(vif.is_learning());
-        assert!(matches!(vif.tag, Some(Tag::Flags { addr: 0x1004, .. })));
         assert!(matches!(vif.sites.get(0x200), Some(Class::Sti)));
     }
 
@@ -620,19 +553,5 @@ mod tests {
         assert!(matches!(table.get(linear), Some(Class::Sti)));
         table.retain_out_of_page(linear >> 12);
         assert!(table.get(linear).is_none());
-    }
-
-    #[test]
-    fn alternate_sti_does_not_untag_a_reused_register() {
-        let mut regs = Regs::empty();
-        let tagged_flags = IF_FLAG | TF_FLAG | 2;
-
-        regs.rbx = 0xDEAD_BEEF;
-        assert!(!clear_register_tag(&mut regs, 3, tagged_flags));
-        assert_eq!(regs.rbx, 0xDEAD_BEEF);
-
-        regs.rbx = u64::from(tagged_flags);
-        assert!(clear_register_tag(&mut regs, 3, tagged_flags));
-        assert_eq!(regs.rbx, u64::from(tagged_flags & !TF_FLAG));
     }
 }
