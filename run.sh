@@ -1435,12 +1435,16 @@ EOF
         echo "Raised 86Box memory from 32 MiB to 64 MiB in $VM_DIR/86box.cfg"
     fi
 
-    # Permanent diagnostic-driver contract: expose the kernel log on 86Box's
-    # stdout. SERIAL=COM1 only touches this run's private disk copy; ordinary
-    # boots retain their configured serial/hostfs ownership.
+    # Permanent diagnostic-driver contract: COM1 carries the kernel log and
+    # COM2 carries the command/reply control service used by the MCP adapter.
+    # These CONFIG.SYS edits touch only this run's private disk copy.
     if [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 1 ]; then
         inject_config_line "${VM_DIR}/disk.img" "SERIAL=COM1" || {
             echo "run.sh: could not enable CONFIG.SYS kernel serial logging." >&2
+            exit 1
+        }
+        inject_config_line "${VM_DIR}/disk.img" "MCP=COM2" || {
+            echo "run.sh: could not enable CONFIG.SYS serial control." >&2
             exit 1
         }
         echo "86box: RetroOS kernel log routed through COM1 to stdout"
@@ -1543,12 +1547,12 @@ EOF
     fi
 
     if [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 1 ]; then
-        sed -i '/^serial1_enabled = /d; /^serial1_device = /d' "${VM_DIR}/86box.cfg"
+        sed -i '/^serial1_enabled = /d; /^serial1_device = /d; /^serial2_enabled = /d; /^serial2_device = /d' "${VM_DIR}/86box.cfg"
         if grep -q '^\[Ports (COM & LPT)\]$' "${VM_DIR}/86box.cfg"; then
-            sed -i '/^\[Ports (COM & LPT)\]$/a serial1_enabled = 1\nserial1_device = pipe' \
+            sed -i '/^\[Ports (COM & LPT)\]$/a serial1_enabled = 1\nserial1_device = pipe\nserial2_enabled = 1\nserial2_device = pipe' \
                 "${VM_DIR}/86box.cfg"
         else
-            printf '\n[Ports (COM & LPT)]\nserial1_enabled = 1\nserial1_device = pipe\n' \
+            printf '\n[Ports (COM & LPT)]\nserial1_enabled = 1\nserial1_device = pipe\nserial2_enabled = 1\nserial2_device = pipe\n' \
                 >> "${VM_DIR}/86box.cfg"
         fi
         # Do not use 86Box's stdio virtual console here: it redirects the
@@ -1558,14 +1562,17 @@ EOF
         SERIAL_PIPE="${VM_DIR}/kernel-serial"
         rm -f "${SERIAL_PIPE}.in" "${SERIAL_PIPE}.out"
         awk '
-            /^\[(Virtual Console|File|Named Pipe) \(COM\) #1\]$/ { drop = 1; next }
+            /^\[(Virtual Console|File|Named Pipe) \(COM\) #[12]\]$/ { drop = 1; next }
             /^\[/ { drop = 0 }
             !drop { print }
         ' "${VM_DIR}/86box.cfg" > "${VM_DIR}/86box.cfg.serial"
         mv "${VM_DIR}/86box.cfg.serial" "${VM_DIR}/86box.cfg"
         printf '\n[Named Pipe (COM) #1]\npath = %s\nmode = 1\nreconnect = 1\n' "$SERIAL_PIPE" \
             >> "${VM_DIR}/86box.cfg"
+        printf '\n[Named Pipe (COM) #2]\npath = %s\nmode = 1\nreconnect = 1\n' "${VM_DIR}/mcp-serial" \
+            >> "${VM_DIR}/86box.cfg"
         echo "86box: RetroOS kernel log file: ${SERIAL_PIPE}.out"
+        echo "86box: RetroOS control pipe: ${VM_DIR}/mcp-serial"
     fi
 
     # The image grows as bundled software is added. 86Box persists an explicit

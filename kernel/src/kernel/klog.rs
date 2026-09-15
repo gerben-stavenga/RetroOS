@@ -69,6 +69,7 @@ impl Filesystem for KLogFs {
                 is_dir: false,
                 is_symlink: false,
                 mode: 0o444,
+                dos_attributes: None,
                 mtime: 0,
                 node: 0,
                 short_name: None,

@@ -32,6 +32,7 @@ pub(in crate::kernel::dos) use self::descriptors::{desc_base, desc_limit, instal
 use self::descriptors::{alloc_ldt, alloc_ldt_range, client_dpl, desc_is_seg_alias, free_ldt, idx_to_sel, ldt_is_allocated, make_code_desc_ex, make_data_desc, make_data_desc_ex, sel_to_idx, set_desc_base, set_desc_limit};
 mod rm_calls;
 pub(in crate::kernel::dos) use self::rm_calls::callback_entry;
+pub(in crate::kernel::dos) use self::rm_calls::direct_int21_iret;
 use self::rm_calls::{call_real_mode_proc, call_real_mode_proc_iret, simulate_real_mode_int};
 mod exceptions;
 pub(in crate::kernel::dos) use self::exceptions::dispatch_dpmi_exception;

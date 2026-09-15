@@ -20,6 +20,62 @@
 mod arch;
 pub use arch::{Arch, GuestBytes, Vcpu};
 
+/// Flat, exclusive cycle totals for one guest-entry path. Each elapsed
+/// interval belongs to exactly one field, so the phase values may be summed.
+/// Hosted backends may leave them zero.
+#[derive(Clone, Copy, Default)]
+pub struct ExecutionProfile {
+    pub calls: u64,
+    pub ring1: u64,
+    pub policy_lookup: u64,
+    pub policy_install: u64,
+    pub bridge_in: u64,
+    pub ring0_enter_frame_in: u64,
+    pub ring0_enter_dispatch: u64,
+    pub ring0_enter_frame_out: u64,
+    pub guest: u64,
+    pub ring0_exit_frame_in: u64,
+    pub ring0_exit_dispatch: u64,
+    pub ring0_exit_frame_out: u64,
+    pub bridge_out: u64,
+    pub decode: u64,
+}
+
+impl ExecutionProfile {
+    pub fn total_cycles(&self) -> u64 {
+        self.policy_lookup
+            .wrapping_add(self.ring1)
+            .wrapping_add(self.policy_install)
+            .wrapping_add(self.bridge_in)
+            .wrapping_add(self.ring0_enter_frame_in)
+            .wrapping_add(self.ring0_enter_dispatch)
+            .wrapping_add(self.ring0_enter_frame_out)
+            .wrapping_add(self.guest)
+            .wrapping_add(self.ring0_exit_frame_in)
+            .wrapping_add(self.ring0_exit_dispatch)
+            .wrapping_add(self.ring0_exit_frame_out)
+            .wrapping_add(self.bridge_out)
+            .wrapping_add(self.decode)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum ExecutionProfileStage {
+    Ring1,
+    PolicyLookup,
+    PolicyInstall,
+    BridgeIn,
+    Ring0EnterFrameIn,
+    Ring0EnterDispatch,
+    Ring0EnterFrameOut,
+    Guest,
+    Ring0ExitFrameIn,
+    Ring0ExitDispatch,
+    Ring0ExitFrameOut,
+    BridgeOut,
+    Decode,
+}
+
 pub mod cmdline;
 pub mod monitor;
 pub mod serial;

@@ -20,65 +20,70 @@
 
 use crate::kernel::thread::Personality;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct PolicyKey {
+    native_vga: bool,
+    native_sb: bool,
+    sb_base: u16,
+    sb_trap_mask: u16,
+    mpu_base: u16,
+}
+
+/// Compact identity of everything that can alter a guest's direct-I/O grant.
+/// Reading this on every entry is cheap; rebuilding 124 bitmap bytes and all
+/// of the individual port grants is not.
+pub(super) fn key<A: crate::Arch>(
+    personality: &Personality<A>,
+    bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+) -> PolicyKey {
+    let mut key = PolicyKey {
+        native_vga: false,
+        native_sb: false,
+        sb_base: 0,
+        sb_trap_mask: 0,
+        mpu_base: 0,
+    };
+    if let Personality::Dos(dos) = personality {
+        key.native_vga = dos.pc.vga.native_legacy_vga(bios);
+        if let crate::kernel::dos::SbDevice::Native { pt, .. } = &dos.pc.sb.device {
+            key.native_sb = true;
+            key.sb_base = dos.pc.sb.blaster.io_base;
+            key.sb_trap_mask = pt.trap_mask(&dos.pc.sb.blaster);
+            if dos.pc.mpu.present {
+                key.mpu_base = dos.pc.mpu.base;
+            }
+        }
+    }
+    key
+}
+
 /// Rebuild the live I/O bitmap from the running personality's capabilities:
 /// deny everything, then open exactly the windows represented by its state.
 ///
 /// Called only by the CPU-loan boundary immediately before guest execution.
-pub(super) fn for_personality<A: crate::Arch>(
-    personality: &Personality<A>,
-    bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-) -> arch_abi::IoPolicy {
+pub(super) fn for_key(key: PolicyKey) -> arch_abi::IoPolicy {
     let mut policy = arch_abi::IoPolicy::deny_all();
-    match personality {
-        Personality::Dos(_) => {
-            if let Personality::Dos(dos) = personality
-                && dos.pc.vga.native_legacy_vga(bios)
-            {
-                policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
-                policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
-                policy.allow(0x3C0, 1);
-                policy.allow(0x3DA, 1);
-            }
-            // Ports are granted to a guest that holds the REAL card, and to
-            // no other: an emulated card's window must keep trapping, or the
-            // model never sees the traffic it exists to answer. Holding the
-            // card is exactly `SbDevice::Native`, so the match that decides
-            // this also hands over the wiring the grant needs.
-            if let Personality::Dos(dos) = personality
-                && let crate::kernel::dos::SbDevice::Native { pt, .. } = &dos.pc.sb.device
-            {
-                // A real SB implies a real OPL: FM music writes (frequent) go
-                // straight to the card.
-                policy.allow(0x388, 2);
-                // The DSP window, port by port: the IOPB is a bitmap, so
-                // only what genuinely needs interception traps (see
-                // `trap_mask`) and the rest reaches the card directly.
-                let mask = pt.trap_mask(&dos.pc.sb.blaster);
-                for off in 0..16u16 {
-                    if mask & (1 << off) == 0 {
-                        policy.allow(dos.pc.sb.blaster.io_base + off, 1);
-                    }
-                }
-                // The MPU-401 window the guest declared (BLASTER `P`). In
-                // native mode the emulated MPU stands down, so these reach
-                // whatever the owner actually has there — a real MPU, a
-                // wavetable daughterboard, an external module.
-                if dos.pc.mpu.present {
-                    policy.allow(dos.pc.mpu.base, 2);
-                }
-                // The 8237 windows are NEVER granted, in any configuration:
-                // vdma is not a channel relabeler but an ADDRESS translator —
-                // the guest programs DOS-physical buffer addresses while its
-                // pages are COW-relocated, so a direct write would make the
-                // card DMA the wrong memory. Strap alignment can make the
-                // channel numbers an identity; it cannot make the addresses
-                // one. (Tried 2026-07-26 for Pinball Fantasies' count-poll
-                // storm; it silenced the card. The poll cost is real but
-                // must be attacked inside the trap, not by ungating it.)
+    if key.native_vga {
+        policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
+        policy.allow(0x3DB, 5); // 0x3DB..=0x3DF
+        policy.allow(0x3C0, 1);
+        policy.allow(0x3DA, 1);
+    }
+    // Ports are granted to a guest that holds the REAL card, and to no other:
+    // an emulated card's window must keep trapping, or the model never sees
+    // the traffic it exists to answer.
+    if key.native_sb {
+        policy.allow(0x388, 2);
+        for off in 0..16u16 {
+            if key.sb_trap_mask & (1 << off) == 0 {
+                policy.allow(key.sb_base + off, 1);
             }
         }
-        // Linux: no ports. The deny-all baseline stands.
-        Personality::Linux(_) | Personality::Os2(_) | Personality::Windows(_) => {}
+        if key.mpu_base != 0 {
+            policy.allow(key.mpu_base, 2);
+        }
+        // The 8237 windows remain trapped: vdma translates guest-physical
+        // addresses, so direct DMA-controller access would target wrong pages.
     }
     policy
 }

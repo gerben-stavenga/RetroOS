@@ -69,9 +69,11 @@ impl EmulatedVga {
     }
 
     /// The single native-to-emulated transition. Legacy VGA state is captured
-    /// from the authoritative adapter. VBE metadata/palette come from the
-    /// authoritative RetroOS shadows; only its directly mapped framebuffer is
-    /// copied back from hardware.
+    /// from the authoritative adapter. Chipsets without readable latches or a
+    /// VBE 4F04 checkpoint retain the complete public register/VRAM state and
+    /// explicitly leave the unobservable latch field invalid. VBE metadata and
+    /// palette come from the authoritative RetroOS shadows; only its directly
+    /// mapped framebuffer is copied back from hardware.
     fn snapshot_native<A: crate::Arch>(
         machine: &mut A,
         bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -95,10 +97,7 @@ impl EmulatedVga {
         let checkpoint = if cirrus_readback {
             None
         } else {
-            Some(native.cap().bios_checkpoint(machine, bios)
-                .unwrap_or_else(|| lib::compact_panic!(
-                    "native VGA has no exact hidden-state capture path"
-                )))
+            native.cap().bios_checkpoint(machine, bios)
         };
         crate::kernel::drivers::vga_hw::save(native.cap(), &mut legacy, cirrus_readback);
         if let Some(checkpoint) = checkpoint.as_ref() {

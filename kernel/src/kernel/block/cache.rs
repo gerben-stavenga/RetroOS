@@ -18,12 +18,36 @@ const PAGE_LIMIT: usize = 512;
 /// Reused pages live here; the remainder is a probation window for one-pass
 /// traffic. A sequential file read therefore cannot evict hot metadata.
 const PROTECTED_LIMIT: usize = 384;
-/// Once two misses prove a forward scan, fetch this many pages per device
-/// command. The pages still occupy the existing bounded probation cache.
-const READ_AHEAD_PAGES: usize = 8;
+/// Once two misses prove a forward scan, fetch one 128 KiB ATA-sized run. The
+/// pages still occupy the existing bounded probation cache, and a random
+/// first miss still fetches only its requested page.
+const READ_AHEAD_PAGES: usize = 32;
 /// Periodically decay frequency so a page that was hot during boot does not
 /// remain immortal after its workload has disappeared.
 const FREQUENCY_AGE_INTERVAL: u64 = PAGE_LIMIT as u64;
+
+// hits, misses, read-ahead misses, pages loaded, inner bytes, streaming calls,
+// streaming bytes. The block layer is serialized by the VFS on current
+// kernels, so the profiler follows the cache's existing single-owner model.
+static mut PROFILE: [u64; 7] = [0; 7];
+
+fn profile_add(index: usize, value: u64) {
+    if !crate::kernel::startup::profile_enabled() {
+        return;
+    }
+    unsafe {
+        let profile = &mut *core::ptr::addr_of_mut!(PROFILE);
+        profile[index] = profile[index].wrapping_add(value);
+    }
+}
+
+pub(crate) fn profile_reset() {
+    unsafe { PROFILE = [0; 7]; }
+}
+
+pub(crate) fn profile() -> [u64; 7] {
+    unsafe { *core::ptr::addr_of!(PROFILE) }
+}
 
 struct Page {
     data: Box<[u8]>,
@@ -96,6 +120,7 @@ impl CachedDisk {
             }
         }
         if pages.contains_key(&page) {
+            profile_add(0, 1);
             // A read-ahead page starts at zero. Its first real access makes it
             // probationary, just like a demand-loaded page; only a subsequent
             // access proves reuse and earns protected-cache space.
@@ -120,8 +145,11 @@ impl CachedDisk {
         }
         drop(pages);
 
+        profile_add(1, 1);
+
         let offset = page.saturating_mul(PAGE_SIZE as u64);
         let wanted_pages = if self.next_miss.get() == Some(page) {
+            profile_add(2, 1);
             READ_AHEAD_PAGES
         } else {
             1
@@ -143,6 +171,8 @@ impl CachedDisk {
         {
             return false;
         }
+        profile_add(3, loaded_pages as u64);
+        profile_add(4, available as u64);
         self.next_miss.set(Some(page + loaded_pages as u64));
 
         let mut pages = self.pages.borrow_mut();
@@ -201,6 +231,8 @@ impl Disk for CachedDisk {
         // filesystem. Passing them through lets the device use multi-page
         // commands and keeps one-pass file data out of the metadata cache.
         if valid >= 2 * PAGE_SIZE {
+            profile_add(5, 1);
+            profile_add(6, valid as u64);
             return self.inner.read(lba, &mut buffer[..valid]);
         }
         let mut position = start;
@@ -247,7 +279,10 @@ impl Disk for CachedDisk {
 mod tests {
     extern crate std;
 
-    use super::{CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE, PROTECTED_LIMIT};
+    use super::{
+        CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE, PROTECTED_LIMIT,
+        READ_AHEAD_PAGES,
+    };
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -346,7 +381,11 @@ mod tests {
     #[test]
     fn sequential_misses_trigger_bounded_read_ahead() {
         let inner = Box::leak(Box::new(MemoryDisk {
-            bytes: RefCell::new((0..16 * PAGE_SIZE).map(|offset| offset as u8).collect()),
+            bytes: RefCell::new(
+                (0..(READ_AHEAD_PAGES + 2) * PAGE_SIZE)
+                    .map(|offset| offset as u8)
+                    .collect(),
+            ),
             reads: Cell::new(0),
             flushes: Cell::new(0),
         }));
@@ -357,11 +396,11 @@ mod tests {
         assert_eq!(inner.reads.get(), 1);
         assert_eq!(cache.read(PAGE_SECTORS, &mut sector), 1);
         assert_eq!(inner.reads.get(), 2);
-        for page in 2..=8 {
-            assert_eq!(cache.read(page * PAGE_SECTORS, &mut sector), 1);
+        for page in 2..=READ_AHEAD_PAGES {
+            assert_eq!(cache.read(page as u64 * PAGE_SECTORS, &mut sector), 1);
         }
         assert_eq!(inner.reads.get(), 2);
-        assert_eq!(cache.pages.borrow().len(), 9);
+        assert_eq!(cache.pages.borrow().len(), READ_AHEAD_PAGES + 1);
     }
 
     #[test]

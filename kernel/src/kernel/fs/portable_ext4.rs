@@ -387,6 +387,7 @@ impl PortableExt4Fs {
                         is_dir: info.node().is_some(),
                         is_symlink: Self::is_symlink(info),
                         mode: info.format & 0x0fff,
+                        dos_attributes: None,
                         mtime: info.modified,
                         node: info.object.opaque(),
                         short_name: None,

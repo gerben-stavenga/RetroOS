@@ -15,6 +15,12 @@ const EMPTY: Counter = Counter {
 const SLOTS: usize = 256;
 static mut COUNTERS: [Counter; SLOTS] = [EMPTY; SLOTS];
 static mut OVERFLOW: u64 = 0;
+const RM_TARGET_SLOTS: usize = 32;
+static mut RM_TARGETS: [(u8, u16, u16, u64); RM_TARGET_SLOTS] = [(0, 0, 0, 0); RM_TARGET_SLOTS];
+const READ_DETAIL_SLOTS: usize = 64;
+static mut READ_DETAILS: [(u16, u64, u64); READ_DETAIL_SLOTS] = [(0, 0, 0); READ_DETAIL_SLOTS];
+// calls, RM-call setup, DOS vector dispatch, continuation unwind.
+static mut DIRECT_RM_PHASES: [u64; 4] = [0; 4];
 
 pub(super) struct Sample(Option<u64>);
 pub(super) struct Dispatch(Option<(usize, u64, u64)>);
@@ -91,6 +97,69 @@ pub(super) fn reset() {
     unsafe {
         core::ptr::write(core::ptr::addr_of_mut!(COUNTERS), [EMPTY; SLOTS]);
         OVERFLOW = 0;
+        RM_TARGETS = [(0, 0, 0, 0); RM_TARGET_SLOTS];
+        READ_DETAILS = [(0, 0, 0); READ_DETAIL_SLOTS];
+        DIRECT_RM_PHASES = [0; 4];
+    }
+    super::block::cache::profile_reset();
+}
+
+pub(super) fn record_direct_rm_phases(setup: u64, dispatch: u64, unwind: u64) {
+    unsafe {
+        let phases = &mut *core::ptr::addr_of_mut!(DIRECT_RM_PHASES);
+        phases[0] = phases[0].wrapping_add(1);
+        phases[1] = phases[1].wrapping_add(setup);
+        phases[2] = phases[2].wrapping_add(dispatch);
+        phases[3] = phases[3].wrapping_add(unwind);
+    }
+}
+
+pub(super) fn direct_rm_phases() -> [u64; 4] {
+    unsafe { *core::ptr::addr_of!(DIRECT_RM_PHASES) }
+}
+
+fn record_dos_read_detail(size: u16, fetch: u64, copy: u64) {
+    if !super::startup::profile_enabled() { return; }
+    unsafe {
+        let details = &mut *core::ptr::addr_of_mut!(READ_DETAILS);
+        if let Some(entry) = details.iter_mut().find(|entry| entry.0 == size || entry.0 == 0) {
+            entry.0 = size;
+            entry.1 = entry.1.wrapping_add(fetch);
+            entry.2 = entry.2.wrapping_add(copy);
+        }
+    }
+}
+
+pub(super) fn record_dos_read_fetch(size: u16, cycles: u64) {
+    record_dos_read_detail(size, cycles, 0);
+}
+
+pub(super) fn record_dos_read_copy(size: u16, cycles: u64) {
+    record_dos_read_detail(size, 0, cycles);
+}
+
+/// Record a DPMI 0300/0301/0302 destination.
+pub(super) fn record_rm_target(kind: u8, cs: u16, ip: u16) {
+    if !super::startup::profile_enabled() { return; }
+    unsafe {
+        let targets = &mut *core::ptr::addr_of_mut!(RM_TARGETS);
+        if let Some(entry) = targets
+            .iter_mut()
+            .find(|entry| (entry.0 == kind && entry.1 == cs && entry.2 == ip) || entry.3 == 0)
+        {
+            entry.0 = kind;
+            entry.1 = cs;
+            entry.2 = ip;
+            entry.3 = entry.3.wrapping_add(1);
+        }
+    }
+}
+
+pub(super) fn visit_rm_targets(mut visit: impl FnMut(u8, u16, u16, u64)) {
+    for &(kind, cs, ip, calls) in unsafe { &*core::ptr::addr_of!(RM_TARGETS) } {
+        if calls != 0 {
+            visit(kind, cs, ip, calls);
+        }
     }
 }
 
@@ -104,4 +173,50 @@ pub(super) fn print() {
         }
     }
     crate::compact_println!("[event-prof] overflow={}", unsafe { OVERFLOW });
+}
+
+/// Visit profiled DOS file reads without routing the data through the ambient
+/// log UART. Large COM1 dumps can outrun an emulator's serial sink; the
+/// diagnostic control channel emits these counters as one structured reply.
+pub(super) fn visit_dos_file_reads(mut visit: impl FnMut(u16, u64, u64, u64, u64, u64)) {
+    for counter in unsafe { &*core::ptr::addr_of!(COUNTERS) } {
+        if counter.kind == 4 && counter.key >> 16 == 0x213F && counter.calls != 0 {
+            let detail = unsafe { &*core::ptr::addr_of!(READ_DETAILS) }
+                .iter()
+                .find(|detail| detail.0 == counter.key as u16)
+                .copied()
+                .unwrap_or((0, 0, 0));
+            visit(
+                counter.key as u16,
+                counter.calls,
+                counter.dispatch,
+                counter.max_dispatch,
+                detail.1,
+                detail.2,
+            );
+        }
+    }
+}
+
+/// Return the busiest event classes in descending dispatch-cycle order for
+/// the serial-control profiler. A bounded list keeps the reply well below the
+/// UART timeout while retaining every material kernel-side cost.
+pub(super) fn top(limit: usize) -> alloc::vec::Vec<(u32, u32, u32, u32, u64, u64, u64, u64)> {
+    let mut counters: alloc::vec::Vec<_> = unsafe { &*core::ptr::addr_of!(COUNTERS) }
+        .iter()
+        .filter(|counter| counter.calls != 0)
+        .map(|counter| (
+            counter.kind,
+            counter.key,
+            counter.cs,
+            counter.ip,
+            counter.calls,
+            counter.run,
+            counter.dispatch,
+            counter.max_dispatch,
+        ))
+        .collect();
+    counters.sort_unstable_by(|left, right| right.6.cmp(&left.6));
+    counters.truncate(limit);
+    counters
 }

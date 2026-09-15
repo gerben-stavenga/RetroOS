@@ -573,8 +573,20 @@ pub(in crate::kernel) fn profile_interrupt_key(regs: &Regs, vector: u8) -> u32 {
         };
         vector
     } else { u32::from(vector) };
-    (vector << 16) | if vector == 0x31 { regs.rax as u32 & 0xFFFF }
-        else { (regs.rax as u32 >> 8) & 0xFF }
+    // File-read cost varies enormously with the DOS request size. Preserve CX
+    // in the profile key so one aggregate AH=3F counter does not hide whether
+    // a loader is issuing tiny records or useful streaming reads.
+    if vector == 0x21 {
+        let function = (regs.rax as u32 >> 8) & 0xFF;
+        if function == 0x3F {
+            return (vector << 24) | (function << 16) | (regs.rcx as u32 & 0xFFFF);
+        }
+    }
+    (vector << 16) | if vector == 0x31 || vector == 0x33 {
+        regs.rax as u32 & 0xFFFF
+    } else {
+        (regs.rax as u32 >> 8) & 0xFF
+    }
 }
 
 #[inline(never)]
@@ -607,7 +619,10 @@ pub fn syscall<A: crate::Arch>(
         (UserMode::VM86, _)                     => dos::rm_native_syscall(machine, kt, dos, regs),
         (_, mode_transitions::VECTOR_STUB_SEL)  => mode_transitions::vector_stub_reflect(machine, dos, regs),
         (_, mode_transitions::SPECIAL_STUB_SEL) => dpmi::pm_stub_dispatch(machine, bios_display, kt, dos, regs),
-        _                                       => dpmi::dpmi_api(machine, dos, regs),
+        _ => match dpmi::direct_int21_iret(machine, bios_display, kt, dos, regs) {
+            Some(action) => action,
+            None => dpmi::dpmi_api(machine, dos, regs),
+        },
     }
 }
 

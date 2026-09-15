@@ -4,12 +4,11 @@
 //! same set of functions as direct calls. Either way this is the kernel-facing
 //! arch API surface — the kernel layer never issues `int 0x80` itself.
 
-/// Resume user code via arch `EXECUTE` (INT 0x80) and return the next
-/// kernel-visible event. The arch→kernel boundary is `(eax, edx)` =
-/// `(event, extra)`; this function decodes it into `KernelEvent` right away
-/// so the event loop never sees raw tag numbers.
+/// Resume user code via arch `EXECUTE` (INT 0x80) and return the raw event
+/// words. Decoding stays outside this wrapper so its cost can be measured
+/// independently from the privilege transition and guest run.
 #[inline(never)]
-pub fn do_arch_execute() -> crate::monitor::KernelEvent {
+pub fn do_arch_execute_raw() -> (u32, u32) {
     let event: u32;
     let extra: u32;
     unsafe {
@@ -22,7 +21,7 @@ pub fn do_arch_execute() -> crate::monitor::KernelEvent {
             out("edi") _,
         );
     }
-    crate::monitor::KernelEvent::decode(event, extra)
+    (event, extra)
 }
 
 /// Switch threads: swap live state with pointed-to state.

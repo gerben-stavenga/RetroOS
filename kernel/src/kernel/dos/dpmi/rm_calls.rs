@@ -50,6 +50,12 @@ fn transfer<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs
         ),
         _ => (rm.cs, rm.ip),
     };
+    let kind = match transfer {
+        Transfer::Interrupt(_) => 0,
+        Transfer::FarCall => 1,
+        Transfer::Iret => 2,
+    };
+    crate::kernel::event_profile::record_rm_target(kind, cs, ip);
     regs.frame.cs = cs as u64;
     regs.frame.rip = ip as u64;
     machine::set_vm86_flags(regs, transfer.entry_flags(rm.flags));
@@ -66,6 +72,72 @@ pub(super) fn call_real_mode_proc<A: crate::Arch>(machine: &mut A, dos: &mut thr
 
 pub(super) fn call_real_mode_proc_iret<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     transfer(machine, dos, regs, Transfer::Iret)
+}
+
+/// Execute DPMI 0302h in-place when its target is RetroOS's own unhooked
+/// real-mode INT 21h vector stub. A client-supplied or hooked target must run
+/// as real-mode code, so every other address takes the ordinary mode-switch
+/// path.
+///
+/// The fast path still constructs the specified RM call frame and uses the
+/// normal RM DOS dispatcher and continuation unwind. It merely executes the
+/// two known `CD 31h` control stubs without lending the CPU between them.
+pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> Option<thread::KernelAction> {
+    if regs.rax as u16 != 0x0302 {
+        return None;
+    }
+    let use32 = dos.dpmi.as_ref()?.client_use32;
+    let struct_addr = flat_addr(&dos.ldt[..], regs.es as u16, regs.rdi as u32, use32);
+    let rm = machine.read::<RmCallStruct>(struct_addr as usize);
+    if rm.cs != dos::STUB_SEG || rm.ip != dos::slot_offset(0x21) {
+        return None;
+    }
+
+    let profile_start = crate::kernel::startup::profile_enabled().then(|| machine.rdtsc());
+    let action = call_real_mode_proc_iret(machine, dos, regs);
+    let dispatch_start = profile_start.map(|_| machine.rdtsc());
+    debug_assert!(matches!(&action, thread::KernelAction::Done));
+    machine::set_vm86_ip(regs, machine::vm86_ip(regs).wrapping_add(2));
+    let action = super::super::dos::rm_vector_dispatch(
+        machine, bios_display, kt, dos, regs,
+    );
+    let unwind_start = dispatch_start.map(|_| machine.rdtsc());
+    if !matches!(&action, thread::KernelAction::Done) {
+        if let (Some(start), Some(dispatch), Some(after_dispatch)) =
+            (profile_start, dispatch_start, unwind_start)
+        {
+            crate::kernel::event_profile::record_direct_rm_phases(
+                dispatch.wrapping_sub(start),
+                after_dispatch.wrapping_sub(dispatch),
+                0,
+            );
+        }
+        return Some(action);
+    }
+
+    let resume_ip = dos::ctrl_slot_off(dos::SLOT_RESUME_CONTINUATION);
+    if regs.mode() == crate::UserMode::VM86
+        && machine::vm86_cs(regs) == dos::CTRL_STUB_SEG
+        && machine::vm86_ip(regs) == resume_ip
+    {
+        mode_transitions::resume_continuation_from_stub(machine, dos, regs);
+    }
+    if let (Some(start), Some(dispatch), Some(unwind)) =
+        (profile_start, dispatch_start, unwind_start)
+    {
+        crate::kernel::event_profile::record_direct_rm_phases(
+            dispatch.wrapping_sub(start),
+            unwind.wrapping_sub(dispatch),
+            machine.rdtsc().wrapping_sub(unwind),
+        );
+    }
+    Some(action)
 }
 
 #[cfg(test)]

@@ -7,6 +7,22 @@ const LSHIFT: u8 = 0x2A;
 const RSHIFT: u8 = 0x36;
 const LCTRL: u8 = 0x1D;
 
+/// US-layout printable-key map used in both directions.
+#[rustfmt::skip]
+const ASCII_KEYS: &[(u8, u8, u8)] = &[
+    (0x02,b'1',b'!'),(0x03,b'2',b'@'),(0x04,b'3',b'#'),(0x05,b'4',b'$'),(0x06,b'5',b'%'),
+    (0x07,b'6',b'^'),(0x08,b'7',b'&'),(0x09,b'8',b'*'),(0x0A,b'9',b'('),(0x0B,b'0',b')'),
+    (0x0C,b'-',b'_'),(0x0D,b'=',b'+'),
+    (0x10,b'q',b'Q'),(0x11,b'w',b'W'),(0x12,b'e',b'E'),(0x13,b'r',b'R'),(0x14,b't',b'T'),
+    (0x15,b'y',b'Y'),(0x16,b'u',b'U'),(0x17,b'i',b'I'),(0x18,b'o',b'O'),(0x19,b'p',b'P'),
+    (0x1A,b'[',b'{'),(0x1B,b']',b'}'),
+    (0x1E,b'a',b'A'),(0x1F,b's',b'S'),(0x20,b'd',b'D'),(0x21,b'f',b'F'),(0x22,b'g',b'G'),
+    (0x23,b'h',b'H'),(0x24,b'j',b'J'),(0x25,b'k',b'K'),(0x26,b'l',b'L'),(0x27,b';',b':'),
+    (0x28,b'\'',b'"'),(0x29,b'`',b'~'),(0x2B,b'\\',b'|'),
+    (0x2C,b'z',b'Z'),(0x2D,b'x',b'X'),(0x2E,b'c',b'C'),(0x2F,b'v',b'V'),(0x30,b'b',b'B'),
+    (0x31,b'n',b'N'),(0x32,b'm',b'M'),(0x33,b',',b'<'),(0x34,b'.',b'>'),(0x35,b'/',b'?'),
+];
+
 /// Scancode-to-ASCII table (US layout, unshifted)
 /// Negative values = special keys (ignored), 0 = undefined, positive = ASCII
 #[rustfmt::skip]
@@ -89,4 +105,44 @@ pub fn scancode_to_ascii(scancode: u8) -> u8 {
         if lower.is_ascii_lowercase() { return lower - b'a' + 1; }
     }
     c
+}
+
+/// Convert one ASCII byte to a complete Set-1 make/break sequence. The fixed
+/// result avoids allocating in serial-control input. Unsupported bytes return
+/// a zero length.
+pub fn ascii_to_scancodes(byte: u8) -> ([u8; 4], usize) {
+    let tap = |scancode: u8| ([scancode, scancode | 0x80, 0, 0], 2);
+    match byte {
+        b'\r' | b'\n' => return tap(0x1C),
+        0x08 | 0x7F => return tap(0x0E),
+        b'\t' => return tap(0x0F),
+        0x1B => return tap(0x01),
+        b' ' => return tap(0x39),
+        _ => {}
+    }
+    if (0x01..=0x1A).contains(&byte) {
+        let letter = byte + b'a' - 1;
+        if let Some(&(scancode, _, _)) = ASCII_KEYS.iter().find(|(_, plain, _)| *plain == letter) {
+            return ([LCTRL, scancode, scancode | 0x80, LCTRL | 0x80], 4);
+        }
+    }
+    for &(scancode, plain, shifted) in ASCII_KEYS {
+        if byte == plain { return tap(scancode); }
+        if byte == shifted {
+            return ([LSHIFT, scancode, scancode | 0x80, LSHIFT | 0x80], 4);
+        }
+    }
+    ([0; 4], 0)
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::ascii_to_scancodes;
+
+    #[test]
+    fn ascii_produces_complete_key_taps() {
+        assert_eq!(ascii_to_scancodes(b'a'), ([0x1E, 0x9E, 0, 0], 2));
+        assert_eq!(ascii_to_scancodes(b'A'), ([0x2A, 0x1E, 0x9E, 0xAA], 4));
+        assert_eq!(ascii_to_scancodes(b'\n'), ([0x1C, 0x9C, 0, 0], 2));
+    }
 }

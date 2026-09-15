@@ -80,6 +80,10 @@ class XTest:
         self.x11.XSetInputFocus.argtypes = [
             ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong
         ]
+        self.x11.XGetInputFocus.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_int)
+        ]
+        self.x11.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
         self.x11.XWarpPointer.argtypes = [
             ctypes.c_void_p,
             ctypes.c_ulong,
@@ -103,10 +107,20 @@ class XTest:
         if not self.display:
             raise SystemExit(f"cannot open DISPLAY={os.environ.get('DISPLAY', '')!r}")
         self.window = window
+        previous = ctypes.c_ulong()
+        revert = ctypes.c_int()
+        self.x11.XGetInputFocus(self.display, ctypes.byref(previous), ctypes.byref(revert))
+        self.previous_focus = previous.value
+        self.previous_revert = revert.value
         self.x11.XSetInputFocus(self.display, window, 2, 0)  # RevertToParent, CurrentTime
         self.x11.XFlush(self.display)
 
     def close(self) -> None:
+        if self.previous_focus:
+            self.x11.XSetInputFocus(
+                self.display, self.previous_focus, self.previous_revert, 0
+            )
+            self.x11.XFlush(self.display)
         self.x11.XCloseDisplay(self.display)
 
     def keysym(self, name: str) -> int:
@@ -172,6 +186,10 @@ class XTest:
         self.x11.XFlush(self.display)
         time.sleep(0.02)
 
+    def raise_window(self) -> None:
+        self.x11.XRaiseWindow(self.display, self.window)
+        self.x11.XFlush(self.display)
+
 
 def command_wait(args: argparse.Namespace) -> None:
     deadline = time.monotonic() + args.timeout
@@ -211,6 +229,15 @@ def command_click(args: argparse.Namespace) -> None:
     driver = XTest(wid)
     try:
         driver.click(args.x, args.y, args.button)
+    finally:
+        driver.close()
+
+
+def command_raise(args: argparse.Namespace) -> None:
+    wid, _ = select_window(args.title)
+    driver = XTest(wid)
+    try:
+        driver.raise_window()
     finally:
         driver.close()
 
@@ -375,6 +402,10 @@ def parser() -> argparse.ArgumentParser:
     click.add_argument("x", type=int)
     click.add_argument("y", type=int)
     click.set_defaults(function=command_click)
+
+    raised = sub.add_parser("raise", help="raise the matching VM window")
+    raised.add_argument("--title", default="RetroOS")
+    raised.set_defaults(function=command_raise)
 
     shot = sub.add_parser("screenshot", help="capture the matching VM window as PNG")
     shot.add_argument("--title", default="RetroOS")

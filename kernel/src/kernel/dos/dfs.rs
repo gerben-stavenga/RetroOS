@@ -67,6 +67,7 @@ pub mod ci {
         pub original: Vec<u8>,
         pub size: u32,
         pub is_dir: bool,
+        pub attributes: u8,
         /// Unix epoch seconds; 0 = unknown (the DTA then shows a blank date).
         pub mtime: u32,
     }
@@ -122,12 +123,17 @@ pub mod ci {
             } else {
                 false
             };
+            let mut attributes = e.dos_attributes.unwrap_or(if is_dir { 0x10 } else { 0x20 });
+            if is_dir {
+                attributes = (attributes & !0x20) | 0x10;
+            }
             let entry_index = dir.entries.len();
             dir.aliases.insert(alias.clone(), entry_index);
             dir.entries.push((alias, Entry {
                 original,
                 size: e.size,
                 is_dir,
+                attributes,
                 mtime: e.mtime,
             }));
         }
@@ -730,7 +736,8 @@ mod tests {
         let entries: alloc::vec::Vec<_> = names.iter().map(|(name, short)| {
             let mut entry = DirEntry {
                 name: alloc::vec![0; name.len()], name_len: name.len(), short_name: short.and_then(ShortName::new),
-                size: 0, is_dir: false, is_symlink: false, mode: 0o644, mtime: 0, node: 0, mount_idx: 0,
+                size: 0, is_dir: false, is_symlink: false, mode: 0o644,
+                dos_attributes: None, mtime: 0, node: 0, mount_idx: 0,
             };
             entry.name[..name.len()].copy_from_slice(name);
             entry

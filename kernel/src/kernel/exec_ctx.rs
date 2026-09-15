@@ -24,6 +24,8 @@ pub struct ExecutionContext<A: crate::Arch> {
     /// single active space ([`crate::Arch::activate`]); guest memory is reached
     /// through `machine`. `PhantomData` keeps `A` in the type.
     pub regs: crate::Regs,
+    io_key: Option<crate::kernel::io_policy::PolicyKey>,
+    io_policy: arch_abi::IoPolicy,
     _a: core::marker::PhantomData<A>,
 }
 
@@ -40,7 +42,13 @@ impl<A: crate::Arch> ExecutionContext<A> {
     pub fn seed(threads: &mut [thread::Thread<A>], tid: usize) -> Self {
         let t = thread::get_thread(threads, tid).expect("ExecutionContext::seed: invalid thread");
         let regs = t.kernel.vcpu.regs;
-        ExecutionContext { tid, regs, _a: core::marker::PhantomData }
+        ExecutionContext {
+            tid,
+            regs,
+            io_key: None,
+            io_policy: arch_abi::IoPolicy::deny_all(),
+            _a: core::marker::PhantomData,
+        }
     }
 
     /// The thread currently holding the CPU. The borrow is tied to the passed
@@ -59,8 +67,14 @@ impl<A: crate::Arch> ExecutionContext<A> {
         bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
         personality: &thread::Personality<A>,
     ) -> crate::KernelEvent {
-        let io = crate::kernel::io_policy::for_personality(personality, bios);
-        machine.execute(&mut self.regs, &io)
+        machine.execution_profile_begin();
+        let key = crate::kernel::io_policy::key(personality, bios);
+        if self.io_key != Some(key) {
+            self.io_policy = crate::kernel::io_policy::for_key(key);
+            self.io_key = Some(key);
+        }
+        machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
+        machine.execute(&mut self.regs, &self.io_policy)
     }
 
     /// Execution swap: make `new_tid` the running thread. No-op when it already

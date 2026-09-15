@@ -19,7 +19,6 @@ use crate::Vcpu;
 // Arch state (Ring 0 maintains state for Ring 1 and Ring 3)
 // =============================================================================
 
-
 /// Raw 32-bit register save layout, what `entry_wrapper_32` pushes natively.
 /// Total size matches `Regs` (216 bytes) so the two share a common stack slot
 /// via `StackFrame`. Layout from low to high address (matches push order):
@@ -80,6 +79,16 @@ const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32
 /// thread switch); it is not consulted by the memory API, which always hits
 /// the active page tables.
 pub(crate) static mut REGS: Vcpu = Vcpu::new(Regs::empty(), paging2::RootPageTable::empty());
+
+// While Arch::execute is in flight, point directly at the event loop's
+// register object.  The ring-1 entry and ring-3 exit can then exchange their
+// physical trap frames with that object instead of bouncing the same 216-byte
+// register file through REGS.regs before and after every run.
+static mut EXECUTE_REGS: *mut Regs = core::ptr::null_mut();
+
+pub(crate) fn set_execute_regs(regs: *mut Regs) {
+    unsafe { EXECUTE_REGS = regs; }
+}
 
 
 /// Arch call numbers (ring-1 kernel → ring-0, via INT 0x80 with EAX=call#)
@@ -356,8 +365,13 @@ fn toggle_mode_if_needed(regs: &Regs, is_long: bool) -> bool {
 }
 
 fn swap_regs(regs: &mut Regs) {
-    let p = &raw mut REGS;
-    unsafe { core::mem::swap(regs, &mut (*p).regs); }
+    let execute = unsafe { EXECUTE_REGS };
+    if execute.is_null() {
+        let p = &raw mut REGS;
+        unsafe { core::mem::swap(regs, &mut (*p).regs); }
+    } else {
+        unsafe { core::mem::swap(regs, &mut *execute); }
+    }
 }
 
 /// Switch threads: swap live state with pointed-to state.
@@ -454,6 +468,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // vectors >= 0x80. `syscall_entry_64` pushes 256 (out of IDT range) as a
     // sentinel — preserve it so ring3 can route it to `KE::Syscall`.
     let raw_int_num = if raw_int_num == 256 { 256 } else { raw_int_num & 0xFF };
+    let from_ring3 = vm86 || (raw_cs & 3) == 3;
+    if from_ring3 {
+        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Guest);
+    }
 
     if !vm86 && (raw_cs & 3) == 0 {  // from ring 0?
         // An unhandled ring-0 exception is headed for the panic in
@@ -514,6 +532,9 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         };
         *regs = canonical;
     }
+    let execute_entry = !from_ring3
+        && raw_int_num == 0x80
+        && regs.rax == arch_call::EXECUTE;
 
     // 16-bit SS sanity-fix: CPU only loads low 16 bits of SP for B=0 stacks;
     // upper bits are kernel residue.
@@ -544,7 +565,6 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     // hardware; no-VME / PM can't carry them across the iret (the CPU would
     // misapply VME semantics), so on exit they were stashed in the statics —
     // restore them into the frame here.
-    let from_ring3 = vm86 || (raw_cs & 3) == 3;
     if from_ring3 {
         let vme_vm86 = vm86 && x86::read_cr4() & x86::cr4::VME != 0;
         if !vme_vm86 {
@@ -561,9 +581,17 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
             regs.set_user_tf(USER_TF);
             regs.set_forced_tf(FORCED_TF);
         }
+        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameIn);
         isr_handler_ring3(regs);
+        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitDispatch);
     } else {
+        if execute_entry {
+            crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterFrameIn);
+        }
         isr_handler_ring1(regs);
+        if execute_entry {
+            crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterDispatch);
+        }
     }
 
     // Mode-toggle the CPU if the kernel's output mode differs from entry.
@@ -636,33 +664,40 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         } else {
             (r.gs as u32, r.fs as u32, r.es as u32, r.ds as u32)
         };
-        let raw32 = Raw32 {
-            gs, fs, es, ds,
-            edi: r.rdi as u32,
-            esi: r.rsi as u32,
-            ebp: r.rbp as u32,
-            esp_dummy: r.rsp_dummy as u32,
-            ebx: r.rbx as u32,
-            edx: r.rdx as u32,
-            ecx: r.rcx as u32,
-            eax: r.rax as u32,
-            _pad: [0; 140],
-            int_num: r.int_num as u32,
-            err_code: r.err_code as u32,
-            eip: r.frame.rip as u32,
-            cs: r.frame.cs as u32,
-            eflags: r.frame.rflags as u32,
-            esp: r.frame.rsp as u32,
-            ss: r.frame.ss as u32,
-        };
-        // Unconditionally copy user segs into the Vm86Segs tail: iret only
-        // pops it on VM86 exit, and the 16 bytes are the TSS.sp0 reserve
-        // (see StackFrame doc) so a stray write is harmless either way.
-        let v = Vm86Segs {
-            es: r.es as u32, ds: r.ds as u32,
-            fs: r.fs as u32, gs: r.gs as u32,
-        };
-        unsafe { (*stack).raw32 = (raw32, v); }
+        // Only overwrite fields consumed by the 32-bit assembly exit. A
+        // whole-struct assignment used to clear Raw32's 140-byte layout pad
+        // and write the VM86-only tail on every protected-mode crossing.
+        // Neither is part of the native trap frame, so that was pure work.
+        let raw = unsafe { &mut (*stack).raw32.0 };
+        raw.gs = gs;
+        raw.fs = fs;
+        raw.es = es;
+        raw.ds = ds;
+        raw.edi = r.rdi as u32;
+        raw.esi = r.rsi as u32;
+        raw.ebp = r.rbp as u32;
+        raw.ebx = r.rbx as u32;
+        raw.edx = r.rdx as u32;
+        raw.ecx = r.rcx as u32;
+        raw.eax = r.rax as u32;
+        raw.eip = r.frame.rip as u32;
+        raw.cs = r.frame.cs as u32;
+        raw.eflags = r.frame.rflags as u32;
+        raw.esp = r.frame.rsp as u32;
+        raw.ss = r.frame.ss as u32;
+
+        if to_vm86 {
+            let v = unsafe { &mut (*stack).raw32.1 };
+            v.es = r.es as u32;
+            v.ds = r.ds as u32;
+            v.fs = r.fs as u32;
+            v.gs = r.gs as u32;
+        }
+    }
+    if from_ring3 {
+        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameOut);
+    } else if execute_entry {
+        crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0EnterFrameOut);
     }
     to_64
 }

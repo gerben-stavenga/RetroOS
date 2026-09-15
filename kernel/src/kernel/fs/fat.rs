@@ -429,6 +429,7 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
                 is_dir: entry.is_dir(),
                 is_symlink: false,
                 mode: if entry.is_dir() { 0o777 } else if entry.attributes().contains(fatfs::FileAttributes::READ_ONLY) { 0o444 } else { 0o666 },
+                dos_attributes: Some(entry.attributes().bits()),
                 mtime: unix_from_datetime(&entry.modified()),
                 node: 0,
                 mount_idx: 0,

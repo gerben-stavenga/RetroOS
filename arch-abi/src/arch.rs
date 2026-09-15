@@ -29,7 +29,7 @@
 //! — generic over the page-table type but otherwise shared, since both backends
 //! are x86 and share the `Regs` ABI.
 
-use crate::{FramebufferMapPolicy, Irq, KernelEvent, Regs};
+use crate::{ExecutionProfile, ExecutionProfileStage, FramebufferMapPolicy, Irq, KernelEvent, Regs};
 
 // =============================================================================
 // GuestBytes — access to guest memory
@@ -218,6 +218,12 @@ pub trait Arch: Sized + GuestBytes {
     fn drain(&mut self, f: &mut dyn FnMut(Irq));
     /// Read the CPU timestamp counter.
     fn rdtsc(&self) -> u64;
+
+    /// Deterministic profiling for the kernel/arch/guest execution boundary.
+    fn execution_profile_set(&mut self, _enabled: bool) {}
+    fn execution_profile_begin(&mut self) {}
+    fn execution_profile_time(&mut self, _stage: ExecutionProfileStage) {}
+    fn execution_profile(&self) -> ExecutionProfile { ExecutionProfile::default() }
 
     // ── IRQ lines ──────────────────────────────────────────────────────────
 

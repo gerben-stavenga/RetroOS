@@ -9,7 +9,7 @@
 
 use super::paging2::RootPageTable;
 use super::x86::FxState;
-use arch_abi::{Arch, Irq, KernelEvent, Regs, Vcpu};
+use arch_abi::{Arch, ExecutionProfile, ExecutionProfileStage, Irq, KernelEvent, Regs, Vcpu};
 
 /// The bare-metal backend handle. Zero-sized today (state lives in module
 /// statics — `traps::REGS`, the timer/IRQ queue); it gains fields as those
@@ -45,12 +45,17 @@ impl Arch for Metal {
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
         super::descriptors::install_io_policy(io);
-        // Bridge the loop-owned registers to the live trap frame for the run
-        // (the active SPACE already lives in `REGS.space`), then read them back.
-        let live = unsafe { &mut *(&raw mut super::traps::REGS) };
-        core::mem::swap(&mut live.regs, regs);
-        let ev = super::calls::do_arch_execute();
-        core::mem::swap(&mut live.regs, regs);
+        super::exec_profile::time(ExecutionProfileStage::PolicyInstall);
+        // The ring transitions exchange their physical frames directly with
+        // this loop-owned register object.  Its borrow remains live until the
+        // matching INT 80 returns, so no intermediate register copy is needed.
+        super::traps::set_execute_regs(regs);
+        super::exec_profile::time(ExecutionProfileStage::BridgeIn);
+        let (event, extra) = super::calls::do_arch_execute_raw();
+        super::traps::set_execute_regs(core::ptr::null_mut());
+        super::exec_profile::time(ExecutionProfileStage::BridgeOut);
+        let ev = KernelEvent::decode(event, extra);
+        super::exec_profile::time(ExecutionProfileStage::Decode);
         ev
     }
     #[allow(clippy::deref_addrof)] // `&raw const REGS`-first form; see `execute`
@@ -73,6 +78,10 @@ impl Arch for Metal {
     fn now(&self) -> u64 { super::irq::now(false) }
     fn drain(&mut self, f: &mut dyn FnMut(Irq)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }
+    fn execution_profile_set(&mut self, enabled: bool) { super::exec_profile::set(enabled) }
+    fn execution_profile_begin(&mut self) { super::exec_profile::begin() }
+    fn execution_profile_time(&mut self, stage: ExecutionProfileStage) { super::exec_profile::time(stage) }
+    fn execution_profile(&self) -> ExecutionProfile { super::exec_profile::snapshot() }
 
     // ── IRQ lines ──
     fn set_irq_line(&mut self, _asserted: bool) {} // real 8259 drives INTR

@@ -138,6 +138,7 @@ fn prepare_audio<A: crate::Arch>(
     // for testing without editing the disk.
     let master_env = load_master_env();
     configure_config_serial(boot, &master_env);
+    configure_serial_control(boot, &master_env);
     crate::kernel::drivers::hda::configure_output_route(crate::kernel::dos::config_var(
         &master_env,
         b"HDA_OUTPUT",
@@ -316,6 +317,36 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
         crate::compact_println!("serial: {:?} logging enabled from CONFIG.SYS", port);
     } else {
         crate::compact_println!("serial: {:?} unavailable", port);
+    }
+}
+
+/// Enable the command/reply diagnostic UART. It must not share the ambient
+/// log or HostFS port: either stream may contain arbitrary bytes.
+fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
+    let Some(value) = crate::kernel::dos::config_var(master_env, b"MCP") else {
+        return;
+    };
+    let Some(value) = value.split(|byte| *byte == b' ').next() else {
+        return;
+    };
+    let Some(port) = arch_abi::ComPort::parse_ascii(value) else {
+        crate::compact_println!("serial-control: invalid CONFIG.SYS MCP value");
+        return;
+    };
+    let config_log_port = crate::kernel::dos::config_var(master_env, b"SERIAL")
+        .and_then(|value| value.split(|byte| *byte == b' ').next())
+        .and_then(arch_abi::ComPort::parse_ascii);
+    if boot.hostfs_port == Some(port)
+        || boot.serial_console_port == Some(port)
+        || config_log_port == Some(port)
+    {
+        crate::compact_println!("serial-control: {:?} already has another owner", port);
+        return;
+    }
+    if crate::kernel::serial_control::init(port) {
+        crate::compact_println!("serial-control: {:?} enabled at 115200 8N1", port);
+    } else {
+        crate::compact_println!("serial-control: {:?} unavailable", port);
     }
 }
 
@@ -714,6 +745,7 @@ fn init_console_pipe() {
 fn is_kernel_launch_directive(key: &[u8]) -> bool {
     arch_abi::cmdline::key_eq(key, b"hostfs")
         || arch_abi::cmdline::key_eq(key, b"serial")
+        || arch_abi::cmdline::key_eq(key, b"mcp")
 }
 
 #[cfg(test)]
@@ -722,8 +754,8 @@ mod launch_directive_tests {
 
     #[test]
     fn serial_directive_is_not_treated_as_a_program() {
-        let segment = arch_abi::cmdline::segments(b"serial=com2;TESTS/X.COM arg")
-            .nth(1)
+        let segment = arch_abi::cmdline::segments(b"serial=com2;mcp=com1;TESTS/X.COM arg")
+            .nth(2)
             .unwrap();
         let launch = arch_abi::cmdline::launch(segment, is_kernel_launch_directive).unwrap();
         assert_eq!(launch.program(), b"TESTS/X.COM");
@@ -1251,6 +1283,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
+    let mut execution_profile_on = false;
     // The event loop is the execution engine and sole owner of window policy.
     // A missing display means the initial DOS window holds the fullscreen
     // direct-scanout lease; otherwise the compositor starts on the desktop.
@@ -1274,13 +1307,31 @@ pub fn event_loop<A: crate::Arch>(
         .and_then(|t| t.personality.adopt_sb(machine, sb_card));
 
     loop {
+        let requested_profile = profile_enabled();
+        if requested_profile != execution_profile_on {
+            machine.execution_profile_set(requested_profile);
+            execution_profile_on = requested_profile;
+        }
         stats.slice_begin(machine);
         let mut events = crate::kernel::irq_dispatch::drain(machine);
-        stats.part(machine, PROFILE_IRQ);
         let tick_wakeup = events
             .iter()
             .any(|event| matches!(event, crate::Irq::Hw(0)));
         events.retain(|event| !matches!(event, crate::Irq::Hw(0)));
+        // A 115200-baud UART can deliver fewer than 12 bytes per millisecond,
+        // safely below its 16-byte FIFO. Poll only on the timer wakeup: doing
+        // an IN from COM2 on every guest exit would itself distort profiles.
+        if (tick_wakeup || irq_clock_wakeup) && crate::kernel::serial_control::poll(machine, &mut events) {
+            let thread = ctx.thread(threads);
+            let dos = match &thread.personality {
+                thread::Personality::Dos(dos) => Some(&**dos),
+                thread::Personality::Linux(_)
+                | thread::Personality::Os2(_)
+                | thread::Personality::Windows(_) => None,
+            };
+            dump_interrupted_thread(machine, &ctx.regs, dos);
+        }
+        stats.part(machine, PROFILE_IRQ);
         let world_now_ns = if tick_wakeup || irq_clock_wakeup {
             irq_clock_wakeup = false;
             machine.now()
@@ -2492,20 +2543,23 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
 /// the window picker's atomic target.
 static mut PROFILE_DUMP: bool = false;
 
-/// Toggle the profile dump and report its new state.
-pub fn toggle_profile() {
-    let on = unsafe {
-        let v = !core::ptr::read_volatile(&raw const PROFILE_DUMP);
-        core::ptr::write_volatile(&raw mut PROFILE_DUMP, v);
-        v
-    };
-    if on {
-        unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
-        crate::kernel::osd_profile::reset();
-        super::event_profile::reset();
-    }
+pub fn reset_profile() {
+    unsafe { core::ptr::write_volatile(&raw mut PROFILE_SNAPSHOT, ProfileSnapshot::EMPTY) };
+    crate::kernel::osd_profile::reset();
+    super::event_profile::reset();
+}
+
+/// Set profiling explicitly; unlike the OSD toggle this is idempotent, which
+/// makes it safe for a remote control client to retry after a lost reply.
+pub fn set_profile(on: bool) {
+    let was_on = profile_enabled();
+    unsafe { core::ptr::write_volatile(&raw mut PROFILE_DUMP, on) };
+    if on && !was_on { reset_profile(); }
     crate::compact_println!("[prof] cycle profiling {}", if on { "ON" } else { "off" });
 }
+
+/// Toggle the profile dump and report its new state.
+pub fn toggle_profile() { set_profile(!profile_enabled()); }
 
 pub fn profile_enabled() -> bool {
     unsafe { core::ptr::read_volatile(&raw const PROFILE_DUMP) }

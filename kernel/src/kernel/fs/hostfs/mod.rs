@@ -151,6 +151,7 @@ impl Filesystem for HostFs {
                 is_dir,
                 is_symlink: false,
                 mode: if is_dir { 0o755 } else { 0o644 },
+                dos_attributes: None,
                 mtime,
                 node: 0,
                 short_name: None,

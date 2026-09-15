@@ -156,7 +156,7 @@ impl Search {
             let mut path = self.directory.clone();
             if !path.is_empty() { path.push(b'/'); }
             path.extend_from_slice(&entry.original);
-            let attributes = vfs::dos_attributes(&path)?;
+            let attributes = entry.attributes;
             if !attributes_match(self.attributes, attributes) { continue; }
             let (name, replaced) = encode_oem(&entry.original);
             return Some(Found { name, alias: alias.to_vec(), path, size: entry.size,

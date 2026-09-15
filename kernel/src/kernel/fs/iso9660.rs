@@ -543,6 +543,7 @@ impl Filesystem for Iso9660Fs {
                 is_dir: entry.is_directory(),
                 is_symlink: false,
                 mode: if entry.is_directory() { 0o555 } else { 0o444 },
+                dos_attributes: None,
                 mtime: 0,
                 node: 0,
                 short_name: None,

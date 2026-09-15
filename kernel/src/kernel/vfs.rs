@@ -255,6 +255,9 @@ pub struct DirEntry {
     pub is_symlink: bool,
     /// POSIX permission bits (same convention as `Vnode::mode`).
     pub mode: u16,
+    /// Backend DOS attribute byte, when the filesystem stores one natively.
+    /// The VFS fills a derived value while caching directory entries.
+    pub dos_attributes: Option<u8>,
     /// Last-modified time, seconds since the Unix epoch. `0` = unknown, which
     /// backends without a clock (tarfs entries predating the field, the COM1
     /// hostfs wire) report; DOS renders that as an empty date rather than as
@@ -825,6 +828,10 @@ impl Vfs {
                     child.extend_from_slice(&e.name[..e.name_len]);
                     if let Some(&mode) = self.modes.get(&child) { e.mode = mode as u16; }
                     if let Some(&mtime) = self.mtimes.get(&child) { e.mtime = mtime; }
+                    e.dos_attributes = Some(self.dos_attributes.get(&child).copied()
+                        .or(e.dos_attributes)
+                        .unwrap_or(if e.is_dir { 0x10 } else { 0x20 }
+                            | if e.mode & 0o222 == 0 { 1 } else { 0 }));
                     if claim_visible_name(
                         &mut visible_names,
                         &e.name[..e.name_len],
@@ -854,6 +861,7 @@ impl Vfs {
                     name: alloc::vec![0; name_len], name_len, size: 0, is_dir: true,
                     short_name: None,
                     is_symlink: false, mode: 0o755,
+                    dos_attributes: Some(0x10),
                     mtime: 0,
                     node: 0,
                     mount_idx: 0,
@@ -1468,6 +1476,7 @@ fn clone_dir_entry(e: &DirEntry) -> DirEntry {
         is_dir: e.is_dir,
         is_symlink: e.is_symlink,
         mode: e.mode,
+        dos_attributes: e.dos_attributes,
         mtime: e.mtime,
         node: e.node,
         mount_idx: e.mount_idx,
@@ -2184,7 +2193,7 @@ mod tests {
                 let mut entry = DirEntry {
                     name: alloc::vec![0; name.len()], name_len: name.len(), size: 1,
                     short_name: None,
-                    is_dir, is_symlink, mode: 0o444, mtime: 0,
+                    is_dir, is_symlink, mode: 0o444, dos_attributes: None, mtime: 0,
                     node, mount_idx: 0,
                 };
                 entry.name[..name.len()].copy_from_slice(name);

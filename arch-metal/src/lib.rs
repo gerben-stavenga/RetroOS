@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod backend;
 mod calls;
+mod exec_profile;
 pub mod mem;
 pub mod descriptors;
 pub mod irq;

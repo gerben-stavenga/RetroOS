@@ -1845,7 +1845,15 @@ fn int_21h<A: crate::Arch>(
                     == Some(b"cdrom/" as &[u8]);
                 let mut buf = alloc::vec![0u8; count];
                 let read_started = machine.now();
+                let fetch_started = crate::kernel::startup::profile_enabled()
+                    .then(|| machine.rdtsc());
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
+                if let Some(start) = fetch_started {
+                    crate::kernel::event_profile::record_dos_read_fetch(
+                        count as u16,
+                        machine.rdtsc().wrapping_sub(start),
+                    );
+                }
                 if n >= 0 {
                     let got = (n as usize).min(count);
                     buf.truncate(got);
@@ -1866,7 +1874,15 @@ fn int_21h<A: crate::Arch>(
                             )),
                         });
                     } else {
+                        let copy_started = crate::kernel::startup::profile_enabled()
+                            .then(|| machine.rdtsc());
                         finish_file_read(machine, dos, regs, buf_addr, &buf);
+                        if let Some(start) = copy_started {
+                            crate::kernel::event_profile::record_dos_read_copy(
+                                count as u16,
+                                machine.rdtsc().wrapping_sub(start),
+                            );
+                        }
                     }
                     return thread::KernelAction::Done;
                 } else {
@@ -4061,9 +4077,7 @@ fn find_matching_file<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosStat
                 if find_attributes_match(attributes, entry.is_dir)
                     && dos_wildcard_match(pat, alias)
                 {
-                    let mut path = dir.to_vec();
-                    path.extend_from_slice(&entry.original);
-                    let found_attributes = crate::kernel::vfs::dos_attributes(&path).unwrap_or(if entry.is_dir { 0x10 } else { 0x20 });
+                    let found_attributes = entry.attributes;
                     if !dfs::lfn::attributes_match(u16::from(attributes), found_attributes) { continue; }
                     // Clear only the result fields: the reserved area below
                     // holds this search's cursor, and wiping it would strand
