@@ -1603,6 +1603,34 @@ EOF
     if [ -n "${BOX86:-}" ]; then
         exec "$BOX86" --vmpath "$VM_DIR" "${PASS[@]}"
     fi
+
+    # Prefer the sibling developer build when present. Our local 86Box carries
+    # the protected-mode IRETD fix which preserves privileged VIF/VIP; released
+    # 86Box currently restores those bits from the guest frame and leaves PVI
+    # clients such as Dark Forces hung with VIF=0. RETROOS_86BOX_SOURCE allows
+    # the source tree to live somewhere other than ../86Box, while BOX86 above
+    # remains the explicit executable override.
+    LOCAL_86BOX_ROOT="${RETROOS_86BOX_SOURCE:-$SCRIPT_DIR/../86Box}"
+    if [ -d "$LOCAL_86BOX_ROOT" ]; then
+        LOCAL_86BOX_ROOT="$(cd "$LOCAL_86BOX_ROOT" && pwd)"
+    fi
+    LOCAL_86BOX_BIN="$LOCAL_86BOX_ROOT/build/regular/src/86Box"
+    if [ -x "$LOCAL_86BOX_BIN" ]; then
+        echo "86box: using local build $LOCAL_86BOX_BIN"
+        # The developer build is produced inside the 86Box Flatpak SDK and
+        # uses its libraries. Run that binary in the installed Flatpak when
+        # available, granting only its source/build tree and the VM directory.
+        if command -v flatpak >/dev/null 2>&1; then
+            FLATPAK_ID=$(flatpak list --app --columns=application 2>/dev/null | grep -i 86box | head -1)
+            if [ -n "$FLATPAK_ID" ]; then
+                exec flatpak run --devel --env=QT_QPA_PLATFORM="$QT_QPA_PLATFORM" \
+                    $FS_GRANT --filesystem="$LOCAL_86BOX_ROOT" \
+                    --command="$LOCAL_86BOX_BIN" "$FLATPAK_ID" \
+                    --vmpath "$VM_DIR" "${PASS[@]}"
+            fi
+        fi
+        exec "$LOCAL_86BOX_BIN" --vmpath "$VM_DIR" "${PASS[@]}"
+    fi
     if [ -x "$HOME/bin/86Box.AppImage" ]; then
         exec "$HOME/bin/86Box.AppImage" --vmpath "$VM_DIR" "${PASS[@]}"
     fi
@@ -1618,7 +1646,8 @@ EOF
     fi
 
     echo "86box binary not found." >&2
-    echo "Tried: \$BOX86, \$HOME/bin/86Box.AppImage, any installed flatpak (containing \"86box\"), 86box in PATH." >&2
+    echo "Tried: \$BOX86, \$RETROOS_86BOX_SOURCE, ../86Box, \$HOME/bin/86Box.AppImage," >&2
+    echo "       any installed flatpak (containing \"86box\"), and 86box in PATH." >&2
     echo "Either install the AppImage from https://github.com/86Box/86Box/releases" >&2
     echo "or install via flatpak (search: flatpak search 86box)." >&2
     exit 1
