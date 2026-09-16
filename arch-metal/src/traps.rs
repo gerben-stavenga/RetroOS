@@ -8,7 +8,7 @@
 use crate::irq::handle_irq;
 use crate::paging2::{self, Entry};
 use crate::x86;
-use arch_abi::{Frame64, Regs};
+use arch_abi::Regs;
 use crate::Vcpu;
 
 // =============================================================================
@@ -19,15 +19,11 @@ use crate::Vcpu;
 // Arch state (Ring 0 maintains state for Ring 1 and Ring 3)
 // =============================================================================
 
-/// Raw 32-bit register save layout, what `entry_wrapper_32` pushes natively.
-/// Total size matches `Regs` (216 bytes) so the two share a common stack slot
-/// via `StackFrame`. Layout from low to high address (matches push order):
-///   - 4 segment selectors (low offset; pushed last by asm)
-///   - 8 GP regs in `pushad` order: edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax
-///   - 140 bytes of internal padding (covers the slots `Regs` uses for r8..r15
-///     and the high halves of segs/GP)
-///   - int_num, err_code (sw-pushed by `int_vector` / `common_dispatch`)
-///   - Frame32 IRET payload (eip, cs, eflags [, esp, ss for cross-priv])
+/// Hybrid 32-bit entry layout. Assembly saves the segments and general
+/// registers directly in their canonical `Regs` qword slots, then leaves a
+/// 28-byte expansion gap before the native dword interrupt/IRET tail. Rust
+/// widens only that tail for cross-privilege entries. Same-ring ring-0 entries
+/// return before widening and therefore never inspect the absent ESP/SS.
 ///
 /// VM86 segs (es, ds, fs, gs) the CPU pushes above the IRET frame for VM86
 /// entries are *not* part of `Raw32` — they form the second component of the
@@ -36,10 +32,12 @@ use crate::Vcpu;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Raw32 {
-    pub gs: u32, pub fs: u32, pub es: u32, pub ds: u32,
-    pub edi: u32, pub esi: u32, pub ebp: u32, pub esp_dummy: u32,
-    pub ebx: u32, pub edx: u32, pub ecx: u32, pub eax: u32,
-    pub _pad: [u8; 140],
+    pub gs: u64, pub fs: u64, pub es: u64, pub ds: u64,
+    pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
+    pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,
+    pub edi: u64, pub esi: u64, pub ebp: u64, pub esp_dummy: u64,
+    pub ebx: u64, pub edx: u64, pub ecx: u64, pub eax: u64,
+    pub _expand: [u8; 28],
     pub int_num: u32, pub err_code: u32,
     pub eip: u32, pub cs: u32, pub eflags: u32, pub esp: u32, pub ss: u32,
 }
@@ -54,9 +52,9 @@ pub struct Vm86Segs {
 }
 
 /// Stack-side view of a saved interrupt frame. Two arms: `regs` is the
-/// canonical 64-bit form (216B); the 32-bit arm is `(Raw32, Vm86Segs)` — the
-/// native push slot plus the optional VM86 seg tail. `isr_handler` picks the
-/// live arm via `from_64`.
+/// canonical 64-bit form (216B); the 32-bit arm is `(Raw32, Vm86Segs)` — its
+/// 216-byte hybrid slot plus the optional VM86 seg tail. `isr_handler` picks
+/// the live arm via `from_64`.
 ///
 /// The 16-byte `Vm86Segs` tail is always safe to read/write: TSS.sp0 is
 /// pinned 16 bytes below the kernel stack top (see `arch/boot.rs`), and ring
@@ -69,7 +67,14 @@ pub union StackFrame {
     pub raw32: (Raw32, Vm86Segs),
 }
 
-const _: () = assert!(core::mem::size_of::<Regs>() == core::mem::size_of::<Raw32>());
+const _: () = {
+    assert!(core::mem::size_of::<Raw32>() == core::mem::size_of::<Regs>());
+    assert!(core::mem::offset_of!(Raw32, int_num) == 188);
+    assert!(core::mem::offset_of!(Raw32, cs) == 200);
+    assert!(core::mem::offset_of!(Raw32, gs) == core::mem::offset_of!(Regs, gs));
+    assert!(core::mem::offset_of!(Raw32, edi) == core::mem::offset_of!(Regs, rdi));
+    assert!(core::mem::offset_of!(Raw32, eax) == core::mem::offset_of!(Regs, rax));
+};
 
 /// The live execution context while the kernel runs: `REGS.regs` is the user
 /// register swap buffer (holds user regs when the kernel runs); the Vcpu
@@ -432,8 +437,8 @@ fn arch_switch_to(regs: &mut Regs) {
 /// Ring 3 (user): save state, return event to ring-1 kernel.
 /// Ring 0 (boot): page fault → demand paging. IRQ → ACK+queue. Rest → panic.
 ///
-/// `stack` is the raw saved state on the kernel stack — a `StackFrame` union
-/// over the same 216-byte slot. `from_64` tells us which arm holds live data:
+/// `stack` is the raw saved state on the kernel stack. `from_64` tells us which
+/// union arm holds live data:
 /// the 64-bit form pushed by `entry_wrapper_64`, or the 32-bit form pushed by
 /// `entry_wrapper_32`. We canonicalize to `Regs` (always the 64-bit form), let
 /// the kernel run on it, then denormalize back if exiting to 32-bit user.
@@ -492,9 +497,9 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         return from_64;
     }
 
-    // Canonicalize: write a `Regs` into the stack slot via the union, picking
-    // fields conditionally so we never read residue (SS/ESP only valid on
-    // ring transition; VM86 segs only valid in VM86).
+    // Canonicalize the native dword tail in place. The wrapper-owned prefix is
+    // already in canonical qword slots. Capture every native value first,
+    // because the widened Regs tail overlaps the compact tail.
     let regs = unsafe { &mut (*stack).regs };
     if from_64 {
         // 64-bit user: entry_wrapper_64 already pushed the right FS/GS
@@ -504,33 +509,20 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         regs.int_num = raw_int_num;
     } else {
         let (r, v) = unsafe { &(*stack).raw32 };
-        // VM86 supplies segs in the CPU-pushed `Vm86Segs` tail; non-VM86
-        // ring-3 already has the user selectors in `Raw32`'s seg slots.
-        let canonical = Regs {
-            gs: if vm86 { v.gs as u64 } else { r.gs as u64 },
-            fs: if vm86 { v.fs as u64 } else { r.fs as u64 },
-            es: if vm86 { v.es as u64 } else { r.es as u64 },
-            ds: if vm86 { v.ds as u64 } else { r.ds as u64 },
-            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-            rdi: r.edi as u64,
-            rsi: r.esi as u64,
-            rbp: r.ebp as u64,
-            rsp_dummy: r.esp_dummy as u64,
-            rbx: r.ebx as u64,
-            rdx: r.edx as u64,
-            rcx: r.ecx as u64,
-            rax: r.eax as u64,
-            int_num: raw_int_num,
-            err_code: raw_err_code,
-            frame: Frame64 {
-                rip: r.eip as u64,
-                cs: raw_cs,
-                rflags: r.eflags as u64,
-                rsp: r.esp as u64,
-                ss: r.ss as u64,
-            },
-        };
-        *regs = canonical;
+        let eflags = r.eflags as u64;
+        let esp = r.esp as u64;
+        let ss = r.ss as u64;
+        let vm_segs = (v.gs as u64, v.fs as u64, v.es as u64, v.ds as u64);
+        regs.int_num = raw_int_num;
+        regs.err_code = raw_err_code;
+        regs.frame.rip = raw_eip;
+        regs.frame.cs = raw_cs;
+        regs.frame.rflags = eflags;
+        regs.frame.rsp = esp;
+        regs.frame.ss = ss;
+        if vm86 {
+            (regs.gs, regs.fs, regs.es, regs.ds) = vm_segs;
+        }
     }
     let execute_entry = !from_ring3
         && raw_int_num == 0x80
@@ -662,24 +654,17 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         let (gs, fs, es, ds) = if to_vm86 {
             (0, 0, 0, 0)
         } else {
-            (r.gs as u32, r.fs as u32, r.es as u32, r.ds as u32)
+            (r.gs, r.fs, r.es, r.ds)
         };
-        // Only overwrite fields consumed by the 32-bit assembly exit. A
-        // whole-struct assignment used to clear Raw32's 140-byte layout pad
-        // and write the VM86-only tail on every protected-mode crossing.
-        // Neither is part of the native trap frame, so that was pure work.
+        // The register prefix is already in the form consumed by assembly;
+        // compact only the interrupt/IRET tail back into its native dwords.
         let raw = unsafe { &mut (*stack).raw32.0 };
         raw.gs = gs;
         raw.fs = fs;
         raw.es = es;
         raw.ds = ds;
-        raw.edi = r.rdi as u32;
-        raw.esi = r.rsi as u32;
-        raw.ebp = r.rbp as u32;
-        raw.ebx = r.rbx as u32;
-        raw.edx = r.rdx as u32;
-        raw.ecx = r.rcx as u32;
-        raw.eax = r.rax as u32;
+        raw.int_num = r.int_num as u32;
+        raw.err_code = r.err_code as u32;
         raw.eip = r.frame.rip as u32;
         raw.cs = r.frame.cs as u32;
         raw.eflags = r.frame.rflags as u32;
@@ -757,7 +742,22 @@ fn isr_handler_ring3(regs: &mut Regs) {
                     if regs.mode() != UserMode::VM86
                         && (regs.flags32() & (1 << 19) != 0) != vif_was_on
                     {
-                        KE::VifWindow { entry_ip, vif_was_on }
+                        let flags = regs.flags32();
+                        let vif_now = flags & (1 << 19) != 0;
+                        let viopl = (flags >> 12) & 3;
+                        if viopl >= 2 {
+                            // Repair/reference modes need the CLI boundary in
+                            // ring 1 to learn or step a later POPF/IRET exit.
+                            KE::VifWindow { entry_ip, vif_was_on }
+                        } else if vif_now && flags & (1 << 20) != 0 {
+                            // Strict mode has no learning work. Bubble out only
+                            // when STI made a pending virtual IRQ deliverable.
+                            KE::Irq
+                        } else {
+                            // CLI/STI was fully emulated in ring 0; returning a
+                            // VifWindow to ring 1 would be a pure round trip.
+                            return;
+                        }
                     } else if regs.flags32() & VIF_VIP == VIF_VIP {
                         KE::Irq
                     } else if stepped {

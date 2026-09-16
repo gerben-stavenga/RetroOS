@@ -193,16 +193,10 @@ common_dispatch:
 ; =============================================================================
 ; 32-bit-only code: entry_wrapper_32, common_call, exit_interrupt_32
 ;
-; Stack layout matches `Raw32` in arch/traps.rs (216 bytes total):
-;   [low ↑]  gs, fs, es, ds                            (4 segs as u32)
-;            edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax  (pushad order)
-;            <140 bytes of pad — fills the slots Regs uses for r8..r15
-;             and the high halves of segs/GP; left uninitialized>
-;            int_num, err_code                         (sw-pushed)
-;            eip, cs, eflags, esp, ss                  (CPU-pushed IRET)
-;
-; VM86 segs (CPU-pushed only when EFLAGS.VM=1) sit just past the Raw32 slot
-; and are accessed by Rust via `vm86_segs_after()` — not part of the struct.
+; Construct canonical Regs directly. The wrapper-owned registers are pushed
+; into their final qword slots; only the CPU/vector dword tail is widened into
+; a gap reserved immediately below it. The canonical frame ends at the same
+; address as the native frame, so no duplicate return frame exists.
 ; =============================================================================
 
 entry_wrapper_32:
@@ -211,24 +205,51 @@ entry_wrapper_32:
     ; int_vector pushed int_num; common_dispatch[_no_err] ensured an
     ; err_code slot above it (either real or duplicated int_num).
 
-    ; Allocate the 140-byte pad. Asm-32 pushes natively below; the upper
-    ; portion of Raw32 (where Regs would put r8..r15) sits here unused.
-    sub esp, 140
-    ; Save 8 GP regs in pushad order: edi (low addr) ... eax (high).
-    pushad
-    ; Save segment regs as u32 selectors. Order on stack: gs at lowest.
-    push ds
-    push es
-    push fs
-    push gs
-    ; ESP now points at offset 0 of Raw32 (= gs).
+    ; A complete cross-privilege dword tail is 28 bytes; its canonical qword
+    ; form is 56 bytes. Reserve exactly that 28-byte widening gap. Same-ring
+    ; ring-0 frames are returned without widening.
+    sub esp, 28
+    ; General registers, reverse canonical order: each low dword followed by
+    ; an explicitly zero high dword in memory.
+    push dword 0
+    push eax
+    push dword 0
+    push ecx
+    push dword 0
+    push edx
+    push dword 0
+    push ebx
+    times 2 push dword 0         ; rsp_dummy
+    push dword 0
+    push ebp
+    push dword 0
+    push esi
+    push dword 0
+    push edi
+    times 16 push dword 0        ; r8-r15
+
+    ; EAX is saved now, so use it to make segment qwords without relying on
+    ; the architecture-specific upper-word behaviour of PUSH segment.
+    xor eax, eax
+    mov ax, ds
+    push dword 0
+    push eax
+    mov ax, es
+    push dword 0
+    push eax
+    mov ax, fs
+    push dword 0
+    push eax
+    mov ax, gs
+    push dword 0
+    push eax
 
     xor ebx, ebx                  ; ebx = from_64 = false
     jmp common_call
 
 ; -----------------------------------------------------------------------------
 ; common_call: shared dispatch tail. Caller has:
-;   - pushed StackFrame (216B) — its own native form (Raw32 or Regs)
+;   - pushed StackFrame — canonical Regs for 64-bit, hybrid Raw32 for 32-bit
 ;   - set ebx = from_64 flag
 ;
 ; ebp is left untouched between trap entry and `call isr_handler`. For ring-1
@@ -298,14 +319,20 @@ exit_interrupt_32:
     mov ss, ax
     movzx esp, sp
 .no_espfix:
-    ; ESP at Raw32 offset 0. Pop in reverse of entry_wrapper_32.
-    pop gs
-    pop fs
-    pop es
-    pop ds
-    popad
-    add esp, 140                ; skip pad
-    add esp, 8                  ; skip int_num + err_code
+    ; Restore low halves directly from the canonical qword slots, then skip
+    ; the entire prefix, expansion gap, and int/error pair in one adjustment.
+    mov gs, [esp + 0]
+    mov fs, [esp + 8]
+    mov es, [esp + 16]
+    mov ds, [esp + 24]
+    mov edi, [esp + 96]
+    mov esi, [esp + 104]
+    mov ebp, [esp + 112]
+    mov ebx, [esp + 128]
+    mov edx, [esp + 136]
+    mov ecx, [esp + 144]
+    mov eax, [esp + 152]
+    add esp, 196                ; native eip begins at Raw32 offset 196
     iret                        ; CPU pops eip, cs, eflags [, esp, ss [, vm86 segs]]
 
 ; =============================================================================

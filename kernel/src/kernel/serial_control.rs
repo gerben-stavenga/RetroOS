@@ -106,22 +106,16 @@ fn read_profile() {
         send_u64(copy);
         send(b"}");
     });
-    let [hits, misses, readahead, pages, inner_bytes, streams, stream_bytes] =
+    let [hits, misses, pages, inner_bytes] =
         super::block::cache::profile();
     send(b"],\"cache\":{\"hits\":");
     send_u64(hits);
     send(b",\"misses\":");
     send_u64(misses);
-    send(b",\"readahead\":");
-    send_u64(readahead);
     send(b",\"pages\":");
     send_u64(pages);
     send(b",\"inner_bytes\":");
     send_u64(inner_bytes);
-    send(b",\"streams\":");
-    send_u64(streams);
-    send(b",\"stream_bytes\":");
-    send_u64(stream_bytes);
     send(b"}}\n");
 }
 

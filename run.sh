@@ -1301,7 +1301,10 @@ launch_86box() {
         image)        BAZEL_TARGET="//:image";              IMAGE_FILE="image.bin" ;;
         proprietary)  BAZEL_TARGET="//:image_proprietary";  IMAGE_FILE="image_proprietary.bin" ;;
         ext4)         BAZEL_TARGET="//:image_ext4";         IMAGE_FILE="image_ext4.bin" ;;
-        freedos)      BAZEL_TARGET="//:freedos_apps" ;;
+        # The persistent FreeDOS HDD is already bootable. Do not rebuild the
+        # optional apps disk (and its DOSBox-hosted CWSDPMI toolchain) merely
+        # to start 86Box; attach an existing apps image below when present.
+        freedos)      BAZEL_TARGET="" ;;
         *)            echo "Unknown image type: $IMG (image | proprietary | ext4 | freedos)" >&2; exit 1 ;;
     esac
 
@@ -1311,7 +1314,9 @@ launch_86box() {
         echo "63, 16, $(( sectors / (63 * 16) ))"
     }
 
-    "$(find_bazel)" build "$BAZEL_TARGET" 2>&1 | tail -3
+    if [ -n "$BAZEL_TARGET" ]; then
+        "$(find_bazel)" build "$BAZEL_TARGET" 2>&1 | tail -3
+    fi
 
     VM_NAME="RetroOS"
     [ "$IMG" = "freedos" ] && VM_NAME="RetroOS-FreeDOS"
@@ -1379,8 +1384,8 @@ sound_gain = 0
 [Machine]
 machine = tx97
 cpu_family = pentium_p54c
-cpu_speed = 166666666
-cpu_multi = 2.5
+cpu_speed = 75000000
+cpu_multi = 1.5
 cpu_use_dynarec = 1
 fpu_type = internal
 mem_size = 65536

@@ -99,6 +99,42 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         return None;
     }
 
+    // The unhooked vector is a Rust DOS service, not guest real-mode code.
+    // Synchronous functions need only the RM register/addressing view; a full
+    // PM->VM86 continuation, synthetic IRET frame, and VM86->PM unwind carry
+    // no observable state. Calls that can block or replace the process retain
+    // the framed path below.
+    let ah = (rm.eax >> 8) as u8;
+    if super::super::dos::int21_is_synchronous(ah) {
+        let saved = *regs;
+        rm.restore(regs);
+        regs.frame.ss = if rm.ss == 0 { dos::rm_stack_seg() as u64 } else { rm.ss as u64 };
+        regs.frame.rsp = if rm.ss == 0 {
+            mode_transitions::rm_stack_top() as u64
+        } else {
+            rm.sp as u64
+        };
+        regs.frame.cs = rm.cs as u64;
+        regs.frame.rip = rm.ip as u64;
+        regs.frame.rflags |= machine::VM_FLAG as u64;
+        machine::set_vm86_flags(regs, Transfer::Iret.entry_flags(rm.flags));
+
+        let action = super::super::dos::dispatch_synchronous_rm_int21(
+            machine, kt, dos, regs,
+        );
+        let mut result = RmCallStruct::capture(regs);
+        // 0302's procedure has returned: its control fields describe the call
+        // target/stack supplied by the client, while GP, segment, and FLAGS
+        // fields carry the procedure's results.
+        result.ip = rm.ip;
+        result.cs = rm.cs;
+        result.sp = rm.sp;
+        result.ss = rm.ss;
+        machine.write::<RmCallStruct>(struct_addr as usize, result);
+        *regs = saved;
+        return Some(action);
+    }
+
     let profile_start = crate::kernel::startup::profile_enabled().then(|| machine.rdtsc());
     let action = call_real_mode_proc_iret(machine, dos, regs);
     let dispatch_start = profile_start.map(|_| machine.rdtsc());

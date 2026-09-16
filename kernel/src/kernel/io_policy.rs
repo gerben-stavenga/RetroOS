@@ -22,6 +22,7 @@ use crate::kernel::thread::Personality;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct PolicyKey {
+    dos: bool,
     native_vga: bool,
     native_sb: bool,
     sb_base: u16,
@@ -37,6 +38,7 @@ pub(super) fn key<A: crate::Arch>(
     bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> PolicyKey {
     let mut key = PolicyKey {
+        dos: false,
         native_vga: false,
         native_sb: false,
         sb_base: 0,
@@ -44,6 +46,7 @@ pub(super) fn key<A: crate::Arch>(
         mpu_base: 0,
     };
     if let Personality::Dos(dos) = personality {
+        key.dos = true;
         key.native_vga = dos.pc.vga.native_legacy_vga(bios);
         if let crate::kernel::dos::SbDevice::Native { pt, .. } = &dos.pc.sb.device {
             key.native_sb = true;
@@ -63,6 +66,14 @@ pub(super) fn key<A: crate::Arch>(
 /// Called only by the CPU-loan boundary immediately before guest execution.
 pub(super) fn for_key(key: PolicyKey) -> arch_abi::IoPolicy {
     let mut policy = arch_abi::IoPolicy::deny_all();
+    if key.dos {
+        // RetroOS has no virtual gameport state: the emulated fallback merely
+        // returned the ISA floating-bus value 0xFF. Let DOS probe the canonical
+        // window directly instead of turning tight joystick-detection loops
+        // (Dark Forces reads 0x201 50,000 times) into 50,000 kernel exits. An
+        // absent port reads high; a physical gameport remains useful.
+        policy.allow(0x200, 0x10);
+    }
     if key.native_vga {
         policy.allow(0x3C1, 25); // 0x3C1..=0x3D9
         policy.allow(0x3DB, 5); // 0x3DB..=0x3DF

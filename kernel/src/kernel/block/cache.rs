@@ -15,21 +15,11 @@ const PAGE_SECTORS: u64 = (PAGE_SIZE / 512) as u64;
 /// Match the old lwext4 configuration: 512 filesystem-sized buffers. Pages
 /// are allocated lazily, so an unused volume costs only its map header.
 const PAGE_LIMIT: usize = 512;
-/// Reused pages live here; the remainder is a probation window for one-pass
-/// traffic. A sequential file read therefore cannot evict hot metadata.
-const PROTECTED_LIMIT: usize = 384;
-/// Once two misses prove a forward scan, fetch one 128 KiB ATA-sized run. The
-/// pages still occupy the existing bounded probation cache, and a random
-/// first miss still fetches only its requested page.
-const READ_AHEAD_PAGES: usize = 32;
-/// Periodically decay frequency so a page that was hot during boot does not
-/// remain immortal after its workload has disappeared.
-const FREQUENCY_AGE_INTERVAL: u64 = PAGE_LIMIT as u64;
 
-// hits, misses, read-ahead misses, pages loaded, inner bytes, streaming calls,
-// streaming bytes. The block layer is serialized by the VFS on current
-// kernels, so the profiler follows the cache's existing single-owner model.
-static mut PROFILE: [u64; 7] = [0; 7];
+// hits, misses, pages loaded, inner bytes. The block layer is serialized by
+// the VFS on current kernels, so the profiler follows the cache's existing
+// single-owner model.
+static mut PROFILE: [u64; 4] = [0; 4];
 
 fn profile_add(index: usize, value: u64) {
     if !crate::kernel::startup::profile_enabled() {
@@ -42,26 +32,23 @@ fn profile_add(index: usize, value: u64) {
 }
 
 pub(crate) fn profile_reset() {
-    unsafe { PROFILE = [0; 7]; }
+    unsafe { PROFILE = [0; 4]; }
 }
 
-pub(crate) fn profile() -> [u64; 7] {
+pub(crate) fn profile() -> [u64; 4] {
     unsafe { *core::ptr::addr_of!(PROFILE) }
 }
 
 struct Page {
     data: Box<[u8]>,
     used: u64,
-    hits: u16,
-    protected: bool,
 }
 
-/// A 2 MiB, scan-resistant, write-through-invalidated cache over one disk.
+/// A 2 MiB LRU, write-through-invalidated cache over one disk.
 pub struct CachedDisk {
     inner: &'static dyn Disk,
     pages: RefCell<BTreeMap<u64, Page>>,
     clock: Cell<u64>,
-    next_miss: Cell<Option<u64>>,
 }
 
 struct VolumeDisk {
@@ -104,7 +91,6 @@ impl CachedDisk {
             inner,
             pages: RefCell::new(BTreeMap::new()),
             clock: Cell::new(0),
-            next_miss: Cell::new(None),
         }
     }
 
@@ -112,35 +98,9 @@ impl CachedDisk {
         let now = self.clock.get().wrapping_add(1);
         self.clock.set(now);
         let mut pages = self.pages.borrow_mut();
-        if now.is_multiple_of(FREQUENCY_AGE_INTERVAL) {
-            for cached in pages.values_mut() {
-                if cached.hits > 1 {
-                    cached.hits = (cached.hits / 2).max(1);
-                }
-            }
-        }
-        if pages.contains_key(&page) {
+        if let Some(cached) = pages.get_mut(&page) {
             profile_add(0, 1);
-            // A read-ahead page starts at zero. Its first real access makes it
-            // probationary, just like a demand-loaded page; only a subsequent
-            // access proves reuse and earns protected-cache space.
-            let promote = pages
-                .get(&page)
-                .is_some_and(|cached| !cached.protected && cached.hits != 0);
-            if promote
-                && pages.values().filter(|cached| cached.protected).count() >= PROTECTED_LIMIT
-                && let Some(oldest) = pages
-                    .iter()
-                    .filter(|(candidate, cached)| **candidate != page && cached.protected)
-                    .min_by_key(|(_, cached)| (cached.hits, cached.used))
-                    .map(|(&candidate, _)| candidate)
-            {
-                pages.get_mut(&oldest).unwrap().protected = false;
-            }
-            let cached = pages.get_mut(&page).unwrap();
             cached.used = now;
-            cached.hits = cached.hits.saturating_add(1);
-            cached.protected = true;
             return true;
         }
         drop(pages);
@@ -148,59 +108,36 @@ impl CachedDisk {
         profile_add(1, 1);
 
         let offset = page.saturating_mul(PAGE_SIZE as u64);
-        let wanted_pages = if self.next_miss.get() == Some(page) {
-            profile_add(2, 1);
-            READ_AHEAD_PAGES
-        } else {
-            1
-        };
         let available = self
             .inner
             .sectors()
             .saturating_mul(512)
             .saturating_sub(offset)
-            .min((wanted_pages * PAGE_SIZE) as u64) as usize;
+            .min(PAGE_SIZE as u64) as usize;
         if available == 0 {
             return false;
         }
-        let loaded_pages = available.div_ceil(PAGE_SIZE);
-        let mut run = alloc::vec![0u8; loaded_pages * PAGE_SIZE];
-        if self.inner.read(page.saturating_mul(PAGE_SECTORS), &mut run[..available])
+        let mut data = alloc::vec![0u8; PAGE_SIZE].into_boxed_slice();
+        if self.inner.read(page.saturating_mul(PAGE_SECTORS), &mut data[..available])
             as usize
             != available.div_ceil(512)
         {
             return false;
         }
-        profile_add(3, loaded_pages as u64);
-        profile_add(4, available as u64);
-        self.next_miss.set(Some(page + loaded_pages as u64));
+        profile_add(2, 1);
+        profile_add(3, available as u64);
 
         let mut pages = self.pages.borrow_mut();
-        for (index, chunk) in run.chunks_exact(PAGE_SIZE).enumerate() {
-            let loaded_page = page + index as u64;
-            if pages.contains_key(&loaded_page) {
-                continue;
-            }
-            if pages.len() == PAGE_LIMIT
-                && let Some(oldest) = pages
-                    .iter()
-                    // Prefer low-frequency probation pages. Only fall back to
-                    // protected pages when no probation page exists.
-                    .filter(|(_, cached)| !cached.protected)
-                    .min_by_key(|(_, cached)| (cached.hits, cached.used))
-                    .or_else(|| pages.iter().min_by_key(|(_, cached)| (cached.hits, cached.used)))
-                    .map(|(&page, _)| page)
-            {
-                pages.remove(&oldest);
-            }
-            pages.insert(loaded_page, Page {
-                data: chunk.to_vec().into_boxed_slice(),
-                used: now,
-                hits: u16::from(index == 0),
-                protected: false,
-            });
+        if pages.len() == PAGE_LIMIT
+            && let Some(oldest) = pages
+                .iter()
+                .min_by_key(|(_, cached)| cached.used)
+                .map(|(&page, _)| page)
+        {
+            pages.remove(&oldest);
         }
-        pages.contains_key(&page)
+        pages.insert(page, Page { data, used: now });
+        true
     }
 
     fn invalidate(&self, lba: u64, len: usize) {
@@ -227,14 +164,6 @@ impl Disk for CachedDisk {
             .saturating_sub(start)
             .min(buffer.len() as u64) as usize;
         buffer[valid..].fill(0);
-        // Large aligned reads are already streaming runs assembled by the
-        // filesystem. Passing them through lets the device use multi-page
-        // commands and keeps one-pass file data out of the metadata cache.
-        if valid >= 2 * PAGE_SIZE {
-            profile_add(5, 1);
-            profile_add(6, valid as u64);
-            return self.inner.read(lba, &mut buffer[..valid]);
-        }
         let mut position = start;
         let mut copied = 0;
         while copied < valid {
@@ -279,10 +208,7 @@ impl Disk for CachedDisk {
 mod tests {
     extern crate std;
 
-    use super::{
-        CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE, PROTECTED_LIMIT,
-        READ_AHEAD_PAGES,
-    };
+    use super::{CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -347,7 +273,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_read_reaches_device_as_one_request() {
+    fn large_read_is_cached_page_by_page() {
         let inner = Box::leak(Box::new(MemoryDisk {
             bytes: RefCell::new(vec![0x5a; 2 * PAGE_SIZE]),
             reads: Cell::new(0),
@@ -357,13 +283,13 @@ mod tests {
         let mut output = vec![0; 2 * PAGE_SIZE];
 
         assert_eq!(cache.read(0, &mut output), (2 * PAGE_SECTORS) as u32);
-        assert_eq!(inner.reads.get(), 1);
+        assert_eq!(inner.reads.get(), 2);
         assert_eq!(output, vec![0x5a; 2 * PAGE_SIZE]);
-        assert!(cache.pages.borrow().is_empty());
+        assert_eq!(cache.pages.borrow().len(), 2);
     }
 
     #[test]
-    fn sector_aligned_streaming_read_does_not_require_page_alignment() {
+    fn unaligned_large_read_caches_each_touched_page() {
         let inner = Box::leak(Box::new(MemoryDisk {
             bytes: RefCell::new(vec![0x5a; 3 * PAGE_SIZE]),
             reads: Cell::new(0),
@@ -373,88 +299,33 @@ mod tests {
         let mut output = vec![0; 2 * PAGE_SIZE];
 
         assert_eq!(cache.read(1, &mut output), (2 * PAGE_SECTORS) as u32);
-        assert_eq!(inner.reads.get(), 1);
+        assert_eq!(inner.reads.get(), 3);
         assert_eq!(output, vec![0x5a; 2 * PAGE_SIZE]);
-        assert!(cache.pages.borrow().is_empty());
+        assert_eq!(cache.pages.borrow().len(), 3);
     }
 
     #[test]
-    fn sequential_misses_trigger_bounded_read_ahead() {
+    fn evicts_the_least_recently_used_page() {
         let inner = Box::leak(Box::new(MemoryDisk {
-            bytes: RefCell::new(
-                (0..(READ_AHEAD_PAGES + 2) * PAGE_SIZE)
-                    .map(|offset| offset as u8)
-                    .collect(),
-            ),
+            bytes: RefCell::new(vec![0; (PAGE_LIMIT + 1) * PAGE_SIZE]),
             reads: Cell::new(0),
             flushes: Cell::new(0),
         }));
         let cache = CachedDisk::wrap(inner);
         let mut sector = [0; 512];
 
-        assert_eq!(cache.read(0, &mut sector), 1);
-        assert_eq!(inner.reads.get(), 1);
-        assert_eq!(cache.read(PAGE_SECTORS, &mut sector), 1);
-        assert_eq!(inner.reads.get(), 2);
-        for page in 2..=READ_AHEAD_PAGES {
+        for page in 0..PAGE_LIMIT {
             assert_eq!(cache.read(page as u64 * PAGE_SECTORS, &mut sector), 1);
         }
-        assert_eq!(inner.reads.get(), 2);
-        assert_eq!(cache.pages.borrow().len(), READ_AHEAD_PAGES + 1);
-    }
-
-    #[test]
-    fn streaming_reads_do_not_evict_reused_metadata() {
-        let page_count = PAGE_LIMIT + 32;
-        let inner = Box::leak(Box::new(MemoryDisk {
-            bytes: RefCell::new(vec![0; page_count * PAGE_SIZE]),
-            reads: Cell::new(0),
-            flushes: Cell::new(0),
-        }));
-        let cache = CachedDisk::wrap(inner);
-        let mut sector = [0; 512];
-
-        // A second touch promotes this page into the protected segment.
         assert_eq!(cache.read(0, &mut sector), 1);
-        assert_eq!(cache.read(0, &mut sector), 1);
-        assert_eq!(inner.reads.get(), 1);
+        assert_eq!(cache.read(PAGE_LIMIT as u64 * PAGE_SECTORS, &mut sector), 1);
+        assert!(cache.pages.borrow().contains_key(&0));
+        assert!(!cache.pages.borrow().contains_key(&1));
 
-        // More than a cacheful of one-pass file data must churn probationary
-        // pages without displacing the reused metadata page.
-        for page in 1..page_count {
-            assert_eq!(cache.read(page as u64 * PAGE_SECTORS, &mut sector), 1);
-        }
         let reads = inner.reads.get();
         assert_eq!(cache.read(0, &mut sector), 1);
         assert_eq!(inner.reads.get(), reads);
-    }
-
-    #[test]
-    fn frequency_outweighs_recency_when_protected_segment_is_full() {
-        let inner = Box::leak(Box::new(MemoryDisk {
-            bytes: RefCell::new(vec![0; (PROTECTED_LIMIT + 1) * PAGE_SIZE]),
-            reads: Cell::new(0),
-            flushes: Cell::new(0),
-        }));
-        let cache = CachedDisk::wrap(inner);
-        let mut sector = [0; 512];
-
-        // Make page zero genuinely hot, then leave it older than every other
-        // protected page. Pure LRU would select it for demotion.
-        for _ in 0..20 {
-            assert_eq!(cache.read(0, &mut sector), 1);
-        }
-        for page in 1..PROTECTED_LIMIT {
-            let lba = page as u64 * PAGE_SECTORS;
-            assert_eq!(cache.read(lba, &mut sector), 1);
-            assert_eq!(cache.read(lba, &mut sector), 1);
-        }
-
-        // Promoting one more page forces a protected-page demotion. The old
-        // but frequently used page must win over newer two-touch pages.
-        let newcomer = PROTECTED_LIMIT as u64 * PAGE_SECTORS;
-        assert_eq!(cache.read(newcomer, &mut sector), 1);
-        assert_eq!(cache.read(newcomer, &mut sector), 1);
-        assert!(cache.pages.borrow().get(&0).is_some_and(|page| page.protected));
+        assert_eq!(cache.read(PAGE_SECTORS, &mut sector), 1);
+        assert_eq!(inner.reads.get(), reads + 1);
     }
 }

@@ -2998,6 +2998,33 @@ fn int_21h<A: crate::Arch>(
     thread::KernelAction::Done
 }
 
+/// Whether an INT 21h service can complete entirely inside one dispatcher
+/// invocation. DPMI 0302h uses this to avoid constructing a real-mode stack
+/// excursion when the real-mode vector still names RetroOS's own DOS stub.
+///
+/// Keep the state-changing/blocking calls on the ordinary path: that path
+/// owns the continuation and guest stack frames needed while execution is
+/// parked, replaced by EXEC, or returned to a parent. AH=3F remains there as
+/// well because reads from deliberately paced CD media may suspend.
+pub(super) fn int21_is_synchronous(ah: u8) -> bool {
+    !matches!(ah, 0x00 | 0x01 | 0x07 | 0x08 | 0x0A | 0x31 | 0x3F | 0x4B | 0x4C)
+}
+
+/// Dispatch a synchronous real-mode INT 21h register image without attaching
+/// interrupt/continuation frames. The caller supplies a VM86-flavoured Regs
+/// value, so pointer translation retains real-mode segment semantics.
+pub(super) fn dispatch_synchronous_rm_int21<A: crate::Arch>(
+    machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    dos: &mut thread::DosState<A>,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    let mut suspension = None;
+    let action = int_21h(machine, kt, dos, regs, &mut suspension);
+    debug_assert!(suspension.is_none());
+    action
+}
+
 // /// DOS INT 21h/4B — Load and Execute Program
 // ///
 // /// Try to open a program file via VFS. If the name has no extension (no dot),
