@@ -896,7 +896,7 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
     // vIOPL rides the flags unchanged (no IOPL force): the real IOPL is pinned
     // to 1 at the arch exit, so the RM-handler entry only needs VIF cleared.
     let new_flags = regs.flags32() & !machine::VIF_FLAG;
-    regs.frame.rflags = new_flags as u64;
+    regs.set_flags32(new_flags);
     if_record(IF_REFLECT_RM, regs, if_was, vif(regs),
         dos.pc.locked_stack.other_stack);
 

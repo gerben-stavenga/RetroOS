@@ -451,6 +451,10 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     static mut VIP: bool = false;
     static mut USER_TF: bool = false;
     static mut FORCED_TF: bool = false;
+    static mut PVI_POLICY: bool = false;
+    // This handler is the sole owner of CR4.PVI. Keep its state here so the
+    // overwhelmingly common trap path does not execute serializing CR4 reads.
+    static mut PVI_ACTIVE: bool = false;
     // Per-thread virtual IOPL (EFLAGS bits 12-13), carried across the iret like
     // VIF/VIP. The run pins the *real* IOPL=1 (so CLI/STI/IN/OUT trap); this
     // stash holds the level the client is *treated* as having, so the dispatch
@@ -553,13 +557,12 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
 
     // The guest's virtual-IF lives in EFLAGS bit 19 (VIF) of the saved frame —
     // the kernel's single virtual-IF home. Bit 9 (IF) is the *real* interrupt
-    // flag only, never guest state. VME+VM86 keeps VIF/VIP in bits 19/20 in
-    // hardware; no-VME / PM can't carry them across the iret (the CPU would
-    // misapply VME semantics), so on exit they were stashed in the statics —
-    // restore them into the frame here.
+    // flag only, never guest state. VME+VM86 and PVI+PM keep VIF/VIP in the
+    // hardware frame. Other guests use the software stash below.
     if from_ring3 {
-        let vme_vm86 = vm86 && x86::read_cr4() & x86::cr4::VME != 0;
-        if !vme_vm86 {
+        let hardware_vif = (vm86 && x86::read_cr4() & x86::cr4::VME != 0)
+            || (!vm86 && unsafe { PVI_ACTIVE });
+        if !hardware_vif {
             unsafe {
                 if VIF { regs.frame.rflags |= 1 << 19; } else { regs.frame.rflags &= !(1 << 19); }
                 if VIP { regs.frame.rflags |= 1 << 20; } else { regs.frame.rflags &= !(1 << 20); }
@@ -572,6 +575,7 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         unsafe {
             regs.set_user_tf(USER_TF);
             regs.set_forced_tf(FORCED_TF);
+            regs.set_pvi_policy(PVI_POLICY);
         }
         crate::exec_profile::time(arch_abi::ExecutionProfileStage::Ring0ExitFrameIn);
         isr_handler_ring3(regs);
@@ -594,8 +598,24 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
     let to_vm86 = is_vm86(regs);
     let to_ring3 = to_vm86 || (regs.frame.cs & 3) == 3;
     if to_ring3 {
-        let vme_vm86 = to_vm86 && x86::read_cr4() & x86::cr4::VME != 0;
-        if !vme_vm86 {
+        // Application policy, not the live vIOPL, owns PVI. A PM IRQ handler
+        // temporarily runs with vIOPL=1 and must not toggle PVI inside a repair
+        // client. PVI is harmless in VM86 and can remain set across RM calls.
+        let pvi_enabled = unsafe { PVI_ACTIVE };
+        // VME and PVI arrived together. Probe CR4 only when first enabling
+        // PVI; after that PVI_ACTIVE is authoritative because this is the
+        // sole code which changes CR4.PVI.
+        let use_pvi = regs.pvi_policy()
+            && (pvi_enabled || x86::read_cr4() & x86::cr4::VME != 0);
+        if use_pvi != pvi_enabled {
+            let mut cr4 = x86::read_cr4();
+            if use_pvi { cr4 |= x86::cr4::PVI; } else { cr4 &= !x86::cr4::PVI; }
+            unsafe { x86::write_cr4(cr4); }
+            unsafe { PVI_ACTIVE = use_pvi; }
+        }
+        let hardware_vif = (to_vm86 && x86::read_cr4() & x86::cr4::VME != 0)
+            || (!to_vm86 && use_pvi);
+        if !hardware_vif {
             // no-VME / PM: the hardware can't carry VIF/VIP across the iret —
             // bits 19/20 must be 0 or the CPU applies VME virtual-interrupt
             // semantics to the client (the Bochs Doom/Jazz/Duke3D timer-ISR
@@ -633,8 +653,11 @@ pub extern "C" fn isr_handler(stack: *mut StackFrame, from_64: bool) -> bool {
         unsafe {
             USER_TF = regs.user_tf();
             FORCED_TF = regs.forced_tf();
+            PVI_POLICY = regs.pvi_policy();
         }
-        regs.frame.rflags &= !(arch_abi::USER_TF_SHADOW | arch_abi::FORCED_TF_SHADOW);
+        regs.frame.rflags &= !(arch_abi::USER_TF_SHADOW
+            | arch_abi::FORCED_TF_SHADOW
+            | arch_abi::PVI_POLICY_SHADOW);
         regs.frame.rflags = (regs.frame.rflags & !(3 << 12)) | (1 << 12);
     }
 
@@ -781,23 +804,26 @@ fn isr_handler_ring3(regs: &mut Regs) {
         // they're soft ints. Other n<32 are genuine CPU exceptions.
         3 | 4 => KE::SoftInt(int_num as u8),
         10 => {
-            let cs_base = if regs.mode() == UserMode::VM86 {
-                (regs.code_seg() as u32) << 4
-            } else {
-                crate::monitor::seg_base(regs.code_seg())
-            };
-            let lin = cs_base.wrapping_add(regs.ip32());
-            let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
-            let ss_base = if regs.mode() == UserMode::VM86 {
-                (regs.stack_seg() as u32) << 4
-            } else {
-                crate::monitor::seg_base(regs.stack_seg())
-            };
-            let sp = regs.sp32();
-            let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
-            lib::compact_dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
-                regs.code_seg(), regs.ip32(), regs.err_code, bytes,
-                regs.stack_seg(), sp, stack);
+            let carrier_iret = regs.err_code == 0 && regs.flags32() & (1 << 14) != 0;
+            if !carrier_iret {
+                let cs_base = if regs.mode() == UserMode::VM86 {
+                    (regs.code_seg() as u32) << 4
+                } else {
+                    crate::monitor::seg_base(regs.code_seg())
+                };
+                let lin = cs_base.wrapping_add(regs.ip32());
+                let bytes = unsafe { core::slice::from_raw_parts(lin as *const u8, 8) };
+                let ss_base = if regs.mode() == UserMode::VM86 {
+                    (regs.stack_seg() as u32) << 4
+                } else {
+                    crate::monitor::seg_base(regs.stack_seg())
+                };
+                let sp = regs.sp32();
+                let stack = unsafe { core::slice::from_raw_parts(ss_base.wrapping_add(sp) as *const u32, 6) };
+                lib::compact_dbg_println!("#TS at {:04x}:{:#x} err={:#x} bytes={:02x?} SS:ESP={:04x}:{:#x} stack={:08x?}",
+                    regs.code_seg(), regs.ip32(), regs.err_code, bytes,
+                    regs.stack_seg(), sp, stack);
+            }
             KE::Exception(int_num as u8)
         }
         0..=31 => KE::Exception(int_num as u8),

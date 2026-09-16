@@ -807,6 +807,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             };
             let f = &mut regs.frame.rflags;
             *f = (*f & !(3u64 << 12)) | (mode << 12);
+            regs.set_pvi_policy(mode == 1);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }

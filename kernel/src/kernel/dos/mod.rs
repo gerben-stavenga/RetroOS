@@ -1317,6 +1317,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // level the PM gate reads. (Literal mask: `machine` is the arch param here.)
     let f = &mut current.kernel.vcpu.regs.frame.rflags;
     *f = (*f & !(3u64 << 12)) | ((viopl as u64) << 12);
+    current.kernel.vcpu.regs.set_pvi_policy(viopl == 1);
     let dos_state = current.dos_mut();
     dos_state.dta = (psp_seg as u32) * 16 + 0x80;
     // Bind this thread's DOS CPU state (LDT/TLS/IOPB) into the hardware now.
@@ -1450,6 +1451,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
         let f = &mut t.kernel.vcpu.regs.frame.rflags;
         *f = (*f & !(machine::IOPL_MASK as u64)) | (2u64 << 12);
     }
+    t.kernel.vcpu.regs.set_pvi_policy(false);
     t.dos_mut().dta = (psp_seg as u32) * 16 + 0x80;
 
     let (col, row) = lib::term::term().cursor_pos();

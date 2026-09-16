@@ -398,6 +398,10 @@ pub const USER_CS64: u16 = 0x30 | 3; // Ring 3
 /// FORCED_TF says the personality also needs physical single stepping.
 pub const USER_TF_SHADOW: u64 = 1 << 32;
 pub const FORCED_TF_SHADOW: u64 = 1 << 33;
+/// The application's virtual-interrupt policy permits hardware PVI. Unlike
+/// the live virtual IOPL in low EFLAGS, this does not change while a protected-
+/// mode IRQ handler temporarily runs with strict interrupt semantics.
+pub const PVI_POLICY_SHADOW: u64 = 1 << 34;
 
 /// `Arch::map_phys_range` flag: map the range as an **emulated MMIO aperture** —
 /// present=0 with the regular Cache-Disable (PCD) attribute the kernel already
@@ -549,7 +553,8 @@ impl Regs {
     }
 
     pub fn set_flags32(&mut self, flags: u32) {
-        let shadows = self.frame.rflags & (USER_TF_SHADOW | FORCED_TF_SHADOW);
+        let shadows = self.frame.rflags
+            & (USER_TF_SHADOW | FORCED_TF_SHADOW | PVI_POLICY_SHADOW);
         self.frame.rflags = flags as u64 | shadows;
     }
 
@@ -577,6 +582,15 @@ impl Regs {
     pub fn set_forced_tf(&mut self, on: bool) {
         if on { self.frame.rflags |= FORCED_TF_SHADOW; }
         else { self.frame.rflags &= !FORCED_TF_SHADOW; }
+    }
+
+    pub fn pvi_policy(&self) -> bool {
+        self.frame.rflags & PVI_POLICY_SHADOW != 0
+    }
+
+    pub fn set_pvi_policy(&mut self, on: bool) {
+        if on { self.frame.rflags |= PVI_POLICY_SHADOW; }
+        else { self.frame.rflags &= !PVI_POLICY_SHADOW; }
     }
 
     /// Materialize the hardware TF from its two independent owners.
@@ -711,13 +725,15 @@ mod tf_shadow_tests {
     }
 
     #[test]
-    fn low_flags_updates_preserve_tf_shadows() {
+    fn low_flags_updates_preserve_host_shadows() {
         let mut r = Regs::empty();
         r.set_user_tf(true);
         r.set_forced_tf(true);
+        r.set_pvi_policy(true);
         r.set_flags32(2);
         assert!(r.user_tf());
         assert!(r.forced_tf());
+        assert!(r.pvi_policy());
     }
 }
 

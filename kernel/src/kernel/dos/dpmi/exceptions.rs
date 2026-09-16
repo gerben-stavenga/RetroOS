@@ -471,7 +471,7 @@ pub(super) fn exception_return<A: crate::Arch>(machine: &mut A,
     if use32 || via == ExcReturnVia::V10 {
         save.frame.rip = new_eip as u64;
         save.frame.cs = new_cs as u64;
-        save.frame.rflags = new_eflags as u64;
+        save.frame.rflags = (save.frame.rflags & !0xFFFF_FFFF) | new_eflags as u64;
         save.frame.rsp = new_esp as u64;
         save.frame.ss = new_ss as u64;
     } else {
