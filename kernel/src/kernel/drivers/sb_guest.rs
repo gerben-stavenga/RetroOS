@@ -22,9 +22,9 @@
 //!
 //! This is [`sb16`](super::sb16)'s sibling, not its rival: that file owns the
 //! card as the kernel's PCM *sink*, this one lends it to a guest. Both are
-//! reached only while holding an [`SbCard`], which is the possession proof.
+//! reached only while holding an [`Sb16`], which is the possession proof.
 
-use super::sb16::SbCard;
+use super::sb16::Sb16;
 use sound::sb::Wiring as Blaster;
 
 /// PTE cache-disable bit (x86 PCD). On RetroOS it doubles as the
@@ -55,14 +55,14 @@ fn dsp_write<A: crate::Arch>(machine: &mut A, base: u16, byte: u8) {
 /// the synthesized busy bit, and the guest-buffer↔channel-buffer alias.
 ///
 /// None of this is state a card *has*; it is state about *this guest's* use of
-/// one, which is why it sits here and not in [`SbCard`]: handing the card on
+/// one, which is why it sits here and not in [`Sb16`]: handing the card on
 /// to the mixer's sink moves `card` out and leaves the binding behind to be
 /// torn down.
 pub struct NativeSb {
     /// The machine's card, held. Passthrough is total in this variant — there
     /// is no "maybe a card" state to guard, because possession is the
     /// guarantee: this value cannot be copied or conjured, only moved in.
-    pub card: SbCard,
+    pub card: Sb16,
     /// Last mixer index the guest selected (`base+0x04`), so `base+0x05`
     /// can answer the wiring registers from the guest's own numbers.
     mixer_idx: u8,
@@ -87,7 +87,7 @@ pub struct NativeSb {
 }
 
 impl NativeSb {
-    fn new(card: SbCard) -> Self {
+    fn new(card: Sb16) -> Self {
         Self {
             card,
             mixer_idx: 0,
@@ -107,7 +107,7 @@ impl NativeSb {
     /// begins the transfer. The DMA side needs nothing here — the virtual
     /// 8237 still holds the guest's programming, and the next `arm` re-arms
     /// the real controller from it.
-    pub fn adopt<A: crate::Arch>(machine: &mut A, card: SbCard, st: sound::sb::DspState) -> Self {
+    pub fn adopt<A: crate::Arch>(machine: &mut A, card: Sb16, st: sound::sb::DspState) -> Self {
         let base = card.base;
         dsp_reset(machine, base);
         dsp_write(machine, base, if st.speaker { 0xD1 } else { 0xD3 });
@@ -150,12 +150,12 @@ impl NativeSb {
     }
 
     /// Give the card back. The caller must have `release`d it first.
-    pub fn into_card(self) -> SbCard {
+    pub fn into_card(self) -> Sb16 {
         self.card
     }
 
     /// The physical card, for the questions only its own straps answer.
-    pub fn card(&self) -> &SbCard {
+    pub fn card(&self) -> &Sb16 {
         &self.card
     }
 

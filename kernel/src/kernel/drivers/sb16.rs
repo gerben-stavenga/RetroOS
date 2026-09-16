@@ -16,7 +16,7 @@
 //! ac97/hda sinks (only one sink is ever active), see `ac97.rs`.
 
 // ── SB16 DSP / mixer port OFFSETS from the card's base ──────────────────────
-//    The base is the card's own (`SbCard::base`), never a guess: a card
+//    The base is the card's own (`Sb16::base`), never a guess: a card
 //    jumpered to 0x240 used to be driven through 0x220's ports, which is
 //    nobody's card. Not a per-thread BLASTER relocation either — that is the
 //    guest's declaration, and the sink is not a guest.
@@ -56,12 +56,23 @@ const RING_FRAMES: usize = NUM_BUF * BUF_FRAMES;
 /// is stated for everyone as this card's arm of `sound::sink::Device::rate`.
 const RATE: u32 = 44_100;
 
-/// What only THIS card knows. The ring, the counters and the prime/underrun
-/// bookkeeping belong to the sound sink — shared with every other device,
-/// because none of it is Sound-Blaster-specific. What is left here is the 8237
-/// channel-5 programming, the DSP session and its live DMA cursor.
+/// **The** physical Sound Blaster capability. It is minted once by [`scan`],
+/// is neither `Copy` nor `Clone`, and moves between native DOS ownership, the
+/// event-loop handoff, and the kernel audio output.
 pub struct Sb16 {
-    base: u16,
+    /// The port window the card decodes.
+    pub base: u16,
+    /// The physical completion IRQ.
+    pub irq: u8,
+    /// The physical 8-bit DMA channel.
+    pub dma8: u8,
+    /// The physical 16-bit DMA channel, absent on pre-SB16 hardware.
+    pub dma16: Option<u8>,
+}
+
+/// Physical-SB state that exists only while the kernel mixer owns the card.
+/// This value is contained by `sound::Sink`; it is never handed to DOS.
+pub struct Sb16Output {
     /// Physical base of the transfer ring, for (re)programming the 8237.
     phys: u32,
     /// Frames already reported to the sink. Re-baselined at `start`, so a
@@ -73,24 +84,13 @@ pub struct Sb16 {
     consumed: u64,
 }
 
-// Written once during single-threaded boot, then reachable only through the
-// unique capability returned by `adopt`.
-static mut SB16: Option<Sb16> = None;
-
-/// **The** physical Sound Blaster, as a capability: where it lives, what it
-/// can play, and how it reaches us.
+/// Holding this value IS the authority to drive the card, so the machine's one
+/// card is unforgeable.
 ///
-/// Minted exactly once, by [`scan`], and neither `Copy` nor `Clone` — holding
-/// this value IS the authority to drive the card, so the machine's one card is
-/// unforgeable. It sits in exactly one place at a time: the kernel's unclaimed
-/// slot ([`sound::park_sb`](crate::kernel::sound::park_sb)), the mixer sink
-/// ([`Sb16`]), or the DOS thread driving it natively (`vsb::NativeSb`).
-///
-/// There is deliberately no `Option` inside. A card whose wiring is unknown
-/// cannot be driven by anyone, so "we don't know how to reach it" is not a
-/// half-built capability — it is the absence of one, which is why [`scan`]
-/// returns `Option<SbCard>` and every field here is unconditional. The three
-/// values that used to stand in for this one (a `Copy` `SbCard` snapshot plus
+/// A card whose wiring is unknown cannot be driven by anyone, so "we don't
+/// know how to reach it" is not a half-built capability — it is the absence of
+/// this value, which is why [`scan`] returns `Option<Sb16>`. The values that
+/// used to stand in for this one (a `Copy` card snapshot plus
 /// `Platform::{sb_card, sb_wiring}`) let every DOS thread mint its own
 /// "unique" card out of frozen facts; `Platform` now records only that a DSP
 /// *answered* (`AudioHw::Sb`).
@@ -100,21 +100,7 @@ static mut SB16: Option<Sb16> = None;
 /// real, and drops it. So `dma16.is_some()` is trustworthy *by construction* —
 /// the one path that could have lied about a 16-bit channel is closed where
 /// the truth was known — and it is exactly the mixer sink's precondition.
-#[derive(Debug)]
-pub struct SbCard {
-    /// The port window the card decodes. The guest's own base (`BLASTER A`)
-    /// may differ; native passthrough translates.
-    pub base: u16,
-    /// The line the card really asserts on completion.
-    pub irq: u8,
-    /// The real 8237 channel it is strapped to for 8-bit transfers.
-    pub dma8: u8,
-    /// Its 16-bit channel — `None` on a pre-SB16 card, which has none at all.
-    /// Being `Some` is what makes this card usable as the kernel mixer's sink.
-    pub dma16: Option<u8>,
-}
-
-impl SbCard {
+impl Sb16 {
     /// This card's own strap view, for comparing against what the guest was
     /// told (`BLASTER`) before deciding whether to restrap.
     pub fn wiring(&self) -> SbWiring {
@@ -173,7 +159,7 @@ pub fn answers<A: crate::Arch>(machine: &mut A) -> bool {
 /// can say how it is wired. That is not a defeat to paper over with a default:
 /// a guessed IRQ silently loses every completion interrupt, and a card no
 /// owner can reach is exactly a card nobody holds.
-pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Option<SbCard> {
+pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Option<Sb16> {
     let base = BASES.into_iter().find(|&b| dsp_reset_at(machine, b))?;
     let dsp_major = dsp_version_major(machine, base);
     let is_sb16 = dsp_major >= 4;
@@ -210,7 +196,12 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
             dsp_major, base, w.irq, w.dma8, source,
         ),
     }
-    Some(SbCard { base, irq: w.irq, dma8: w.dma8, dma16 })
+    Some(Sb16 {
+        base,
+        irq: w.irq,
+        dma8: w.dma8,
+        dma16,
+    })
 }
 
 /// DSP `0xE1` — get version; the major byte is the generation.
@@ -326,37 +317,34 @@ pub fn zero_channel_buf<A: crate::Arch>(machine: &mut A, chan: u8) {
     unsafe { core::ptr::write_bytes(DMA_WIN_VA as *mut u8, fill, pages * 0x1000) };
 }
 
-/// Take the machine's Sound Blaster as the kernel mixer's sink, for good.
-/// Called by `sound::Sink` once it owns the card — it keeps the capability,
-/// this driver keeps the stream, which is why the card comes in by reference.
+/// Construct the kernel mixer's physical Sound Blaster output.
 ///
 /// A card with no 16-bit DMA channel plays **silence**: the ring geometry here
 /// is 16-bit channel-5 specific (`DMA5_*` ports, word addressing), so an SB
 /// Pro has nothing to run it on. Silence is the honest output — not a
 /// downgrade to some 8-bit path nobody wrote, and not a mode switch behind the
 /// owner's back.
-/// Returns the unique runtime device, or `None` if this card cannot be a sink.
-pub fn adopt<A: crate::Arch>(machine: &mut A, card: SbCard) -> Option<&'static mut Sb16> {
-    if card.dma16 != Some(DMA_CHANNEL as u8) {
+/// Returns the unique runtime device if this card can drive the mixer sink.
+pub fn open_output<A: crate::Arch>(machine: &mut A, device: &Sb16) -> Option<Sb16Output> {
+    if device.dma16 != Some(DMA_CHANNEL as u8) {
         crate::compact_println!(
             "sb16: sink needs 16-bit DMA channel {}, this card has {:?} — output is silent",
-            DMA_CHANNEL, card.dma16
+            DMA_CHANNEL, device.dma16
         );
         return None;
     }
-    let phys = open_ring(machine, &card)?;
-    let device = Sb16 { base: card.base, phys, reported: 0, last_pos: 0, consumed: 0 };
-    unsafe {
-        let slot = &raw mut SB16;
-        assert!((*slot).is_none(), "SB16 adopted twice");
-        *slot = Some(device);
-        (*slot).as_mut()
-    }
+    let phys = open_ring(machine, device)?;
+    Some(Sb16Output {
+        phys,
+        reported: 0,
+        last_pos: 0,
+        consumed: 0,
+    })
 }
 
 /// Map the permanent channel-5 buffer and wake the card up. The ring's
 /// CONTENT is the engine's business; this hands over where it lives.
-fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<u32> {
+fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // Map the permanent contiguous channel-5 buffer into the stolen low-mem
     // window so the kernel can write PCM; the DSP reads it by physical address.
     let phys_page = machine.dma_channel_buf(DMA_CHANNEL);
@@ -389,7 +377,7 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &SbCard) -> Option<u32> {
 
 use crate::kernel::portio::{inb, outb};
 
-impl Sb16 {
+impl Sb16Output {
     pub fn ring(&mut self) -> &'static mut [crate::kernel::sound::Frame] {
         unsafe {
             core::slice::from_raw_parts_mut(
@@ -398,18 +386,16 @@ impl Sb16 {
             )
         }
     }
-}
 
-impl sound::sink::Device for Sb16 {
-    fn rate(&self) -> u32 {
+    pub fn rate(&self) -> u32 {
         RATE
     }
 
-    fn block_frames(&self) -> usize {
+    pub fn block_frames(&self) -> usize {
         BUF_FRAMES
     }
 
-    fn start(&mut self) {
+    pub fn start(&mut self, base: u16) {
         let word_addr = (self.phys >> 1) & 0xFFFF;
         let words = (RING_BYTES / 2) as u32;
         outb(DMA5_MASK, 0x05);
@@ -426,29 +412,29 @@ impl sound::sink::Device for Sb16 {
         self.reported = 0;
 
         let block_samples = (RING_BYTES / 4) as u16;
-        dsp_write(self.base, CMD_SET_RATE_OUT);
-        dsp_write(self.base, (RATE >> 8) as u8);
-        dsp_write(self.base, RATE as u8);
-        dsp_write(self.base, CMD_16BIT_AUTO_OUT);
-        dsp_write(self.base, MODE_SIGNED_STEREO);
-        dsp_write(self.base, (block_samples - 1) as u8);
-        dsp_write(self.base, ((block_samples - 1) >> 8) as u8);
+        dsp_write(base, CMD_SET_RATE_OUT);
+        dsp_write(base, (RATE >> 8) as u8);
+        dsp_write(base, RATE as u8);
+        dsp_write(base, CMD_16BIT_AUTO_OUT);
+        dsp_write(base, MODE_SIGNED_STEREO);
+        dsp_write(base, (block_samples - 1) as u8);
+        dsp_write(base, ((block_samples - 1) >> 8) as u8);
         let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "sb16: stream RUN base={:#05x} ring={} block={}",
-            self.base,
+            base,
             RING_BYTES,
             BUF_BYTES
         );
     }
 
-    fn halt(&mut self) {
-        dsp_write(self.base, CMD_HALT_AUTO_16);
+    pub fn halt(&mut self, base: u16) {
+        dsp_write(base, CMD_HALT_AUTO_16);
         outb(DMA5_MASK, 0x05);
-        let _ = dsp_reset(self.base);
-        dsp_write(self.base, CMD_SPEAKER_ON);
+        let _ = dsp_reset(base);
+        dsp_write(base, CMD_SPEAKER_ON);
     }
 
-    fn frames_played(&mut self) -> u64 {
+    pub fn frames_played(&mut self) -> u64 {
         let ring = RING_BYTES as u32;
         let pos = dma_pos_bytes();
         let delta = (pos + ring - self.last_pos) % ring;

@@ -151,6 +151,10 @@ impl<D: Device> Sink<D> {
         &mut self.dev
     }
 
+    pub fn device_ref(&self) -> &D {
+        &self.dev
+    }
+
     /// Take the device back, for a host that must hand its hardware on.
     pub fn into_device(mut self) -> D {
         self.dev.halt();

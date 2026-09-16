@@ -82,13 +82,62 @@ pub fn window_present<A: crate::Arch>(machine: &mut A) -> bool {
     machine.inw(AUDIO_SIG) == SIGNATURE
 }
 
-type Device = &'static mut (dyn sound::sink::Device + Send);
+enum Output {
+    Sb {
+        device: crate::kernel::drivers::sb16::Sb16,
+        session: crate::kernel::drivers::sb16::Sb16Output,
+    },
+    Hda(&'static mut crate::kernel::drivers::hda::Hda),
+    Ac97(&'static mut crate::kernel::drivers::ac97::Ac97),
+}
+
+impl sound::sink::Device for Output {
+    fn rate(&self) -> u32 {
+        match self {
+            Self::Sb { session, .. } => session.rate(),
+            Self::Hda(driver) => sound::sink::Device::rate(&**driver),
+            Self::Ac97(driver) => sound::sink::Device::rate(&**driver),
+        }
+    }
+
+    fn block_frames(&self) -> usize {
+        match self {
+            Self::Sb { session, .. } => session.block_frames(),
+            Self::Hda(driver) => sound::sink::Device::block_frames(&**driver),
+            Self::Ac97(driver) => sound::sink::Device::block_frames(&**driver),
+        }
+    }
+
+    fn start(&mut self) {
+        match self {
+            Self::Sb { device, session } => session.start(device.base),
+            Self::Hda(driver) => sound::sink::Device::start(&mut **driver),
+            Self::Ac97(driver) => sound::sink::Device::start(&mut **driver),
+        }
+    }
+
+    fn halt(&mut self) {
+        match self {
+            Self::Sb { device, session } => session.halt(device.base),
+            Self::Hda(driver) => sound::sink::Device::halt(&mut **driver),
+            Self::Ac97(driver) => sound::sink::Device::halt(&mut **driver),
+        }
+    }
+
+    fn frames_played(&mut self) -> u64 {
+        match self {
+            Self::Sb { session, .. } => session.frames_played(),
+            Self::Hda(driver) => sound::sink::Device::frames_played(&mut **driver),
+            Self::Ac97(driver) => sound::sink::Device::frames_played(&mut **driver),
+        }
+    }
+}
 
 /// The machine's audio output: a `//lib:sound` sink over one of our cards.
 /// Absence is represented by `Option<Sink>` at the ownership site; every
 /// value of this type owns a real device and meaningful hardware cursors.
 pub struct Sink {
-    inner: sound::sink::Sink<Device>,
+    inner: sound::sink::Sink<Output>,
     producer: sound::Pacer,
     last_consumed: u64,
     ns_since_cursor: u64,
@@ -103,23 +152,26 @@ impl Sink {
     pub fn new<A: crate::Arch>(
         machine: &mut A,
         probed: crate::kernel::platform::AudioToken,
-        card: Option<crate::kernel::drivers::sb16::SbCard>,
+        card: Option<crate::kernel::drivers::sb16::Sb16>,
     ) -> Option<Self> {
         use crate::kernel::platform::{Audio, AudioToken};
         // Probe mints one concrete device capability. The match exists only at
         // composition time; every runtime operation dispatches through it.
-        let selected: Option<(&'static mut [Frame], Device)> = match (
+        let selected: Option<(&'static mut [Frame], Output)> = match (
             crate::kernel::platform::get().audio,
             probed,
             card,
         ) {
-            (Audio::SbSink, _, Some(card)) => crate::kernel::drivers::sb16::adopt(machine, card)
-                .map(|dev| (dev.ring(), dev as Device)),
+            (Audio::SbSink, _, Some(device)) => {
+                let mut session = crate::kernel::drivers::sb16::open_output(machine, &device)?;
+                let ring = session.ring();
+                Some((ring, Output::Sb { device, session }))
+            }
             (Audio::EmulatedHda, AudioToken::Hda(dev), _) => {
-                Some((dev.ring(), dev as Device))
+                Some((dev.ring(), Output::Hda(dev)))
             }
             (Audio::EmulatedAc97, AudioToken::Ac97(dev), _) => {
-                Some((dev.ring(), dev as Device))
+                Some((dev.ring(), Output::Ac97(dev)))
             }
             // The hosted WAV sink is not wired up: it has no ring, no cursor
             // and no completion event, so it cannot answer the `Device`
@@ -132,17 +184,50 @@ impl Sink {
             // play through. Same for a mixer mode with no card to take.
             _ => None,
         };
-        let (buf, device) = selected?;
-        let inner = sound::sink::Sink::new(buf, device);
+        let (buf, output) = selected?;
+        Some(Self::from_output(buf, output))
+    }
+
+    pub fn new_sb<A: crate::Arch>(
+        machine: &mut A,
+        device: crate::kernel::drivers::sb16::Sb16,
+    ) -> Result<Self, crate::kernel::drivers::sb16::Sb16> {
+        let Some(mut session) = crate::kernel::drivers::sb16::open_output(machine, &device) else {
+            return Err(device);
+        };
+        let ring = session.ring();
+        Ok(Self::from_output(ring, Output::Sb { device, session }))
+    }
+
+    fn from_output(buf: &'static mut [Frame], output: Output) -> Self {
+        let inner = sound::sink::Sink::new(buf, output);
         let rate = inner.rate();
-        Some(Sink {
+        Sink {
             inner,
             producer: sound::Pacer::new(rate),
             last_consumed: 0,
             ns_since_cursor: 0,
             rate_q16: None,
             census: Census::default(),
-        })
+        }
+    }
+
+    pub fn into_sb(self) -> Option<crate::kernel::drivers::sb16::Sb16> {
+        match self.inner.into_device() {
+            Output::Sb { device, .. } => Some(device),
+            Output::Hda(_) | Output::Ac97(_) => None,
+        }
+    }
+
+    pub fn is_sb(&self) -> bool {
+        matches!(self.inner.device_ref(), Output::Sb { .. })
+    }
+
+    pub fn sb_port(&self) -> Option<u16> {
+        match self.inner.device_ref() {
+            Output::Sb { device, .. } => Some(device.base),
+            Output::Hda(_) | Output::Ac97(_) => None,
+        }
     }
 
     /// Stream a block of wide mixed PCM, applying the final Q16 output gain.

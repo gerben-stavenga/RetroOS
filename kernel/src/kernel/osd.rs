@@ -38,12 +38,32 @@ const WINDOWS_ITEM_PRESENTATION: usize = 1;
 const WINDOWS_ITEM_KILL: usize = 2;
 const WINDOWS_NUM_ITEMS: usize = 3;
 
-const SOUND_ITEM_VOLUME: usize = 0;
-const SOUND_ITEM_LATENCY: usize = 1;
-const SOUND_ITEM_RATE: usize = 2;
-const SOUND_ITEM_HDA_OUTPUT: usize = 3;
-const SOUND_NUM_ITEMS_BASE: usize = 3;
-const SOUND_NUM_ITEMS_WITH_HDA_OUTPUT: usize = 4;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SoundRow {
+    Status,
+    SwitchToKernel,
+    Volume,
+    Latency,
+    Rate,
+    HdaOutput,
+    SwitchToNative,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SoundModeRequest {
+    Kernel,
+    Native,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SoundView {
+    NativeSb { port: u16, can_mix: bool },
+    KernelSb { port: u16 },
+    KernelHda,
+    KernelAc97,
+    KernelHost,
+    KernelSilent,
+}
 
 const DEBUG_ITEM_TRACE: usize = 0;
 const DEBUG_ITEM_PROFILE: usize = 1;
@@ -79,6 +99,7 @@ static REPAINT: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static WINDOWS_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
+static SOUND_MODE_REQ: AtomicUsize = AtomicUsize::new(0);
 static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
 /// Which media device the Disk tab is showing: 0=A:, 1=B:, 2=CD (◄/►).
 static DISK_DEV: AtomicUsize = AtomicUsize::new(0);
@@ -114,7 +135,7 @@ pub fn open(borrowed_fullscreen: bool) {
     crate::kernel::fs::floppy::refresh_catalog();
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     WINDOWS_SEL.store(0, Ordering::Relaxed);
-    SOUND_SEL.store(SOUND_ITEM_VOLUME, Ordering::Relaxed);
+    SOUND_SEL.store(0, Ordering::Relaxed);
     DISK_SEL.store(0, Ordering::Relaxed);
     DISK_SCROLL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
@@ -224,33 +245,59 @@ fn active_sel(tab: usize) -> usize {
     }
 }
 
-fn set_active_sel(tab: usize, sel: usize) {
+fn set_active_sel(tab: usize, sel: usize, sound: SoundView) {
     match tab {
-        TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count() - 1), Ordering::Relaxed),
+        TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count(sound) - 1), Ordering::Relaxed),
         TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(debug_item_count() - 1), Ordering::Relaxed),
         _ => WINDOWS_SEL.store(sel.min(WINDOWS_NUM_ITEMS - 1), Ordering::Relaxed),
     }
 }
 
-fn active_item_count(tab: usize) -> usize {
+fn active_item_count(tab: usize, sound: SoundView) -> usize {
     match tab {
-        TAB_SOUND => sound_item_count(),
+        TAB_SOUND => sound_item_count(sound),
         TAB_DISK => disk_item_count(),
         TAB_DEBUG => debug_item_count(),
         _ => WINDOWS_NUM_ITEMS,
     }
 }
 
-fn sound_item_count_for(audio: crate::kernel::platform::Audio) -> usize {
-    match audio {
-        crate::kernel::platform::Audio::EmulatedHda => SOUND_NUM_ITEMS_WITH_HDA_OUTPUT,
-        _ => SOUND_NUM_ITEMS_BASE,
-    }
+fn sound_item_count(sound: SoundView) -> usize {
+    (0..7).take_while(|&item| sound_row_for(sound, item).is_some()).count()
 }
 
-fn sound_item_count() -> usize {
-    sound_item_count_for(crate::kernel::platform::get().audio)
+fn sound_row_for(sound: SoundView, item: usize) -> Option<SoundRow> {
+    let rows: &[SoundRow] = match sound {
+        SoundView::NativeSb { can_mix: true, .. } => {
+            &[SoundRow::Status, SoundRow::SwitchToKernel]
+        }
+        SoundView::NativeSb { can_mix: false, .. } => &[SoundRow::Status],
+        SoundView::KernelSb { .. } => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::SwitchToNative,
+        ],
+        SoundView::KernelHda => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::HdaOutput,
+        ],
+        SoundView::KernelAc97 | SoundView::KernelHost | SoundView::KernelSilent => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+        ],
+    };
+    rows.get(item).copied()
+}
+
+pub fn take_sound_mode_request() -> Option<SoundModeRequest> {
+    let request = match SOUND_MODE_REQ.swap(0, Ordering::Relaxed) {
+        1 => Some(SoundModeRequest::Kernel),
+        2 => Some(SoundModeRequest::Native),
+        _ => None,
+    };
+    if request.is_some() {
+        SOUND_SEL.store(0, Ordering::Relaxed);
+    }
+    request
 }
 
 fn debug_item_count() -> usize {
@@ -580,7 +627,13 @@ const K_F12: u8 = 0x58;
 /// Drive the panel from one key event. Only called while [`is_open`]; releases
 /// (bit 7) are swallowed so no break code leaks to the guest. `machine`/`regs`/
 /// `dos` are threaded through only for the Dump action.
-pub fn key<A: crate::Arch>(machine: &mut A, regs: &mut Regs, sc: u8, dos: Option<&thread::DosState<A>>) {
+pub fn key<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    sc: u8,
+    dos: Option<&thread::DosState<A>>,
+    sound: SoundView,
+) {
     if sc & 0x80 != 0 {
         return; // release: swallowed, no action
     }
@@ -592,11 +645,11 @@ pub fn key<A: crate::Arch>(machine: &mut A, regs: &mut Regs, sc: u8, dos: Option
     match sc {
         K_F12 | K_ESC => close(),
         K_TAB => cycle_tab(),
-        K_UP => move_sel(true),
-        K_DOWN => move_sel(false),
-        K_LEFT => adjust(false),
-        K_RIGHT => adjust(true),
-        K_ENTER => activate(machine, regs, dos),
+        K_UP => move_sel(true, sound),
+        K_DOWN => move_sel(false, sound),
+        K_LEFT => adjust(false, sound),
+        K_RIGHT => adjust(true, sound),
+        K_ENTER => activate(machine, regs, dos, sound),
         _ => {} // any other key: swallowed while open
     }
 }
@@ -646,9 +699,9 @@ fn cycle_tab() {
     REPAINT.store(true, Ordering::Relaxed);
 }
 
-fn move_sel(up: bool) {
+fn move_sel(up: bool, sound: SoundView) {
     let tab = active_tab();
-    let count = active_item_count(tab);
+    let count = active_item_count(tab, sound);
     if count == 0 {
         return;
     }
@@ -658,7 +711,7 @@ fn move_sel(up: bool) {
     } else {
         (cur + 1) % count
     };
-    set_active_sel(tab, sel);
+    set_active_sel(tab, sel, sound);
     if tab == TAB_DISK {
         disk_follow_scroll();
     }
@@ -666,7 +719,7 @@ fn move_sel(up: bool) {
 
 /// ◄/► adjust the selected continuous setting — and on the Disk tab,
 /// cycle the device sub-tab (A: / B: / CD).
-fn adjust(up: bool) {
+fn adjust(up: bool, sound: SoundView) {
     if active_tab() == TAB_DISK {
         if disk_device() == 2 && matches!(disk_row(active_sel(TAB_DISK)), DiskRow::Speed) {
             crate::kernel::fs::cdrom::cycle_speed(up);
@@ -682,8 +735,8 @@ fn adjust(up: bool) {
     if active_tab() != TAB_SOUND {
         return;
     }
-    match active_sel(TAB_SOUND) {
-        SOUND_ITEM_VOLUME => {
+    match sound_row_for(sound, active_sel(TAB_SOUND)) {
+        Some(SoundRow::Volume) => {
             let cur = VOL_PCT.load(Ordering::Relaxed);
             let next = if up {
                 (cur + VOL_STEP).min(VOL_MAX)
@@ -692,7 +745,7 @@ fn adjust(up: bool) {
             };
             VOL_PCT.store(next, Ordering::Relaxed);
         }
-        SOUND_ITEM_LATENCY => {
+        Some(SoundRow::Latency) => {
             let cur = LATENCY_MS.load(Ordering::Relaxed);
             let next = if up {
                 (cur + LATENCY_STEP_MS).min(LATENCY_MAX_MS)
@@ -701,15 +754,27 @@ fn adjust(up: bool) {
             };
             LATENCY_MS.store(next, Ordering::Relaxed);
         }
-        SOUND_ITEM_HDA_OUTPUT => crate::kernel::drivers::hda::cycle_output_route(up),
+        Some(SoundRow::HdaOutput) => crate::kernel::drivers::hda::cycle_output_route(up),
         _ => {}
     }
 }
 
-fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&thread::DosState<A>>) {
+fn activate<A: crate::Arch>(
+    machine: &mut A,
+    regs: &mut Regs,
+    dos: Option<&thread::DosState<A>>,
+    sound: SoundView,
+) {
     match active_tab() {
-        // Continuous settings are adjusted with ◄/►; Enter does nothing.
-        TAB_SOUND => {}
+        TAB_SOUND => match sound_row_for(sound, active_sel(TAB_SOUND)) {
+            Some(SoundRow::SwitchToKernel) => {
+                SOUND_MODE_REQ.store(1, Ordering::Relaxed);
+            }
+            Some(SoundRow::SwitchToNative) => {
+                SOUND_MODE_REQ.store(2, Ordering::Relaxed);
+            }
+            _ => {}
+        },
         TAB_DISK => {
             let dev = disk_device();
             match disk_row(active_sel(TAB_DISK)) {
@@ -733,7 +798,7 @@ fn activate<A: crate::Arch>(machine: &mut A, regs: &mut Regs, dos: Option<&threa
                 DiskRow::NoImages => {}
             }
             // Eject/insert changes the row model: re-clamp selection + scroll.
-            set_active_sel(TAB_DISK, active_sel(TAB_DISK));
+            set_active_sel(TAB_DISK, active_sel(TAB_DISK), sound);
             disk_follow_scroll();
         }
         TAB_DEBUG => match active_sel(TAB_DEBUG) {
@@ -892,12 +957,12 @@ fn paint_scales(
     (cw, sy)
 }
 
-fn panel_rows() -> usize {
+fn panel_rows(sound: SoundView) -> usize {
     if PICKER.load(Ordering::Relaxed) {
         WINDOW_COUNT.load(Ordering::Relaxed).clamp(1, MAX_ROWS - 2) + 2
     } else {
         let tab = active_tab();
-        let count = active_item_count(tab);
+        let count = active_item_count(tab, sound);
         let visible = if tab == TAB_DISK { count.min(DISK_VISIBLE) } else { count };
         visible + usize::from(tab == TAB_DISK) + 3
     }
@@ -908,8 +973,9 @@ pub fn window_size(
     canvas_width: usize,
     canvas_height: usize,
     scale_y: usize,
+    sound: SoundView,
 ) -> Option<(usize, usize)> {
-    let rows = panel_rows();
+    let rows = panel_rows(sound);
     let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     let (pad_x, pad_y) = ((cw / 4).max(1), 2 * sy);
     let width = COLS * cw + pad_x * 2;
@@ -930,13 +996,14 @@ pub fn paint(
     canvas_height: usize,
     scale_y: usize,
     fmt: PixelFormat,
+    sound: SoundView,
 ) {
     if PICKER.load(Ordering::Relaxed) {
         paint_picker(out, stride, w, h, canvas_width, canvas_height, scale_y, fmt);
         return;
     }
     let tab = active_tab();
-    let count = active_item_count(tab);
+    let count = active_item_count(tab, sound);
     // The Disk tab is a fixed-height scroller (device sub-tab row + window);
     // other tabs list all their items.
     let (visible, scroll) = if tab == TAB_DISK {
@@ -991,7 +1058,7 @@ pub fn paint(
     for row in 0..visible {
         let item = scroll + row;
         let mut line = Line::new();
-        item_line(tab, item, &mut line);
+        item_line(tab, item, &mut line, sound);
         let selected = item == sel;
         if selected {
             vga::overlay_fill_xscaled(
@@ -1187,10 +1254,12 @@ fn window_line(idx: usize, line: &mut Line) {
 }
 
 /// Compose one tab row's text into `line`.
-fn item_line(tab: usize, item: usize, line: &mut Line) {
+fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
     match tab {
-        TAB_SOUND => match item {
-            SOUND_ITEM_VOLUME => {
+        TAB_SOUND => match sound_row_for(sound, item) {
+            Some(SoundRow::Status) => sound_status_line(line, sound),
+            Some(SoundRow::SwitchToKernel) => line.put(b"Switch to kernel mixing"),
+            Some(SoundRow::Volume) => {
                 let pct = VOL_PCT.load(Ordering::Relaxed);
                 line.put(b"Volume   [");
                 let filled = (pct / VOL_STEP) as usize; // 0..=10 bars
@@ -1201,19 +1270,20 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
                 line.put_num(pct);
                 line.put(b"%");
             }
-            SOUND_ITEM_LATENCY => {
+            Some(SoundRow::Latency) => {
                 line.put(b"Latency  ");
                 line.put_num(LATENCY_MS.load(Ordering::Relaxed));
                 line.put(b" ms");
             }
-            SOUND_ITEM_RATE => {
+            Some(SoundRow::Rate) => {
                 line.put(b"Mix rate ");
                 line.put_rate_q16(crate::kernel::sound::mixing_rate_q16());
             }
-            SOUND_ITEM_HDA_OUTPUT => {
+            Some(SoundRow::HdaOutput) => {
                 line.put(b"HDA out  ");
                 line.put(crate::kernel::drivers::hda::output_route_label());
             }
+            Some(SoundRow::SwitchToNative) => line.put(b"Switch to native SB"),
             _ => {}
         },
         TAB_DISK => match disk_row(item) {
@@ -1311,6 +1381,23 @@ fn item_line(tab: usize, item: usize, line: &mut Line) {
     }
 }
 
+fn sound_status_line(line: &mut Line, sound: SoundView) {
+    match sound {
+        SoundView::NativeSb { port, .. } => {
+            line.put(b"native: SB port ");
+            line.put_hex3(u32::from(port));
+        }
+        SoundView::KernelSb { port } => {
+            line.put(b"kernel: SB port ");
+            line.put_hex3(u32::from(port));
+        }
+        SoundView::KernelHda => line.put(b"kernel: HDA"),
+        SoundView::KernelAc97 => line.put(b"kernel: AC97"),
+        SoundView::KernelHost => line.put(b"kernel: host audio"),
+        SoundView::KernelSilent => line.put(b"kernel: silent"),
+    }
+}
+
 fn video_mode_line(line: &mut Line) {
     let kind = VIDEO_KIND.load(Ordering::Relaxed);
     let width = VIDEO_WIDTH.load(Ordering::Relaxed);
@@ -1382,6 +1469,13 @@ impl Line {
         }
     }
 
+    fn put_hex3(&mut self, n: u32) {
+        for shift in [8, 4, 0] {
+            let digit = ((n >> shift) & 0xF) as u8;
+            self.put(&[if digit < 10 { b'0' + digit } else { b'A' + digit - 10 }]);
+        }
+    }
+
     fn put_permille(&mut self, n: u32) {
         self.put_num(n / 10);
         self.put(b".");
@@ -1419,15 +1513,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sound_item_count_is_conditional_on_hda() {
-        use crate::kernel::platform::Audio;
-
-        assert_eq!(sound_item_count_for(Audio::EmulatedHda), 4);
-        assert_eq!(sound_item_count_for(Audio::NativeSb), 3);
-        assert_eq!(sound_item_count_for(Audio::SbSink), 3);
-        assert_eq!(sound_item_count_for(Audio::EmulatedAc97), 3);
-        assert_eq!(sound_item_count_for(Audio::EmulatedPortWindow), 3);
-        assert_eq!(sound_item_count_for(Audio::EmulatedSilent), 3);
+    fn sound_items_reflect_audio_ownership() {
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true }), 2);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false }), 1);
+        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220 }), 5);
+        assert_eq!(sound_item_count(SoundView::KernelHda), 5);
+        assert_eq!(sound_item_count(SoundView::KernelAc97), 4);
+        assert_eq!(sound_item_count(SoundView::KernelHost), 4);
+        assert_eq!(sound_item_count(SoundView::KernelSilent), 4);
     }
 
     #[test]

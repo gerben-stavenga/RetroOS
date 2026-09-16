@@ -228,6 +228,13 @@ impl<A: crate::Arch> Personality<A> {
             || matches!(self, Self::Dos(d) if !d.pc.vga.is_fullscreen())
     }
 
+    pub fn physical_sb(&self) -> Option<&crate::kernel::drivers::sb16::Sb16> {
+        match self {
+            Self::Dos(dos) => dos.pc.sb.physical(),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
+        }
+    }
+
     /// Hand this thread the machine's Sound Blaster, returning whatever it
     /// did not take. Moves with the console, and for the same reason: it is
     /// one piece of machine hardware and the owner is whoever the machine is
@@ -238,8 +245,8 @@ impl<A: crate::Arch> Personality<A> {
     pub fn adopt_sb<A2>(
         &mut self,
         machine: &mut A2,
-        card: Option<crate::kernel::drivers::sb16::SbCard>,
-    ) -> Option<crate::kernel::drivers::sb16::SbCard>
+        card: Option<crate::kernel::drivers::sb16::Sb16>,
+    ) -> Option<crate::kernel::drivers::sb16::Sb16>
     where
         A2: crate::Arch,
     {
@@ -256,7 +263,7 @@ impl<A: crate::Arch> Personality<A> {
     pub fn release_sb<A2: crate::Arch>(
         &mut self,
         machine: &mut A2,
-    ) -> Option<crate::kernel::drivers::sb16::SbCard> {
+    ) -> Option<crate::kernel::drivers::sb16::Sb16> {
         match self {
             Self::Dos(d) => d.pc.sb.release_card(machine),
             Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => None,
@@ -909,7 +916,7 @@ pub fn exit_thread<A: crate::Arch>(
     tid: usize,
     exit_code: i32,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     event_display: &mut Option<crate::kernel::display::Display>,
 ) -> usize {
     let parent_tid = threads[tid].kernel.parent_tid;

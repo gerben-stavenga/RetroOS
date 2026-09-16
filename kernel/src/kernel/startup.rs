@@ -44,7 +44,7 @@ struct StartupState<A: crate::Arch> {
     dos_template: crate::kernel::dos::DosTemplate<A>,
     threads: alloc::vec::Vec<thread::Thread<A>>,
     screen: crate::kernel::console::Console,
-    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
     sink: Option<crate::kernel::sound::Sink>,
 }
 
@@ -118,7 +118,7 @@ fn prepare_startup<A: crate::Arch>(
 
 struct PreparedAudio {
     master_env: alloc::vec::Vec<u8>,
-    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
     sink: Option<crate::kernel::sound::Sink>,
 }
 
@@ -774,7 +774,7 @@ fn run<A: crate::Arch>(
     dos_template: &mut crate::kernel::dos::DosTemplate<A>,
     threads: &mut [thread::Thread<A>],
     mut screen: crate::kernel::console::Console,
-    mut sb: Option<crate::kernel::drivers::sb16::SbCard>,
+    mut sb: Option<crate::kernel::drivers::sb16::Sb16>,
     mut sink: Option<crate::kernel::sound::Sink>,
 ) -> ! {
     // What to run headlessly, from whichever channel the backend has. QEMU and
@@ -832,7 +832,7 @@ fn run<A: crate::Arch>(
                 boot.debug_watch,
                 screen,
                 sb,
-                sink.as_mut(),
+                &mut sink,
             );
         }
         crate::compact_screenln!(&mut screen, "All commands done — shutting down.");
@@ -863,7 +863,7 @@ fn run<A: crate::Arch>(
             boot.debug_watch,
             screen,
             sb,
-            sink.as_mut(),
+            &mut sink,
         );
         crate::compact_screenln!(&mut screen, "DN exited, restarting...");
     }
@@ -881,11 +881,11 @@ fn run_program_with_screen<A: crate::Arch>(
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
     screen: crate::kernel::console::Console,
-    sb: Option<crate::kernel::drivers::sb16::SbCard>,
-    sink: Option<&mut crate::kernel::sound::Sink>,
+    sb: Option<crate::kernel::drivers::sb16::Sb16>,
+    sink: &mut Option<crate::kernel::sound::Sink>,
 ) -> (
     crate::kernel::console::Console,
-    Option<crate::kernel::drivers::sb16::SbCard>,
+    Option<crate::kernel::drivers::sb16::Sb16>,
 ) {
     let (card, display) = screen.release(machine, bios_workspace);
     let (display, sb) = run_program(
@@ -924,11 +924,11 @@ fn run_program<A: crate::Arch>(
     env: &[u8],
     debug_watch: Option<(u32, u32)>,
     display: crate::kernel::display::Display,
-    sb: Option<crate::kernel::drivers::sb16::SbCard>,
-    sink: Option<&mut crate::kernel::sound::Sink>,
+    sb: Option<crate::kernel::drivers::sb16::Sb16>,
+    sink: &mut Option<crate::kernel::sound::Sink>,
 ) -> (
     crate::kernel::display::Display,
-    Option<crate::kernel::drivers::sb16::SbCard>,
+    Option<crate::kernel::drivers::sb16::Sb16>,
 ) {
     let (tid, display) = prepare_program(
         machine,
@@ -1212,6 +1212,7 @@ fn present_desktop<A: crate::Arch>(
     threads: &[thread::Thread<A>],
     display: &mut crate::kernel::display::Display,
     windows: &mut crate::kernel::gui::WindowManager,
+    sound: crate::kernel::osd::SoundView,
 ) {
     let extent = windows.desktop().extent();
     let compose_sample = crate::kernel::osd_profile::Sample::start(machine);
@@ -1234,6 +1235,7 @@ fn present_desktop<A: crate::Arch>(
         canvas_height,
         display.composition_scale_y(canvas_height),
         display.rgb,
+        sound,
     );
     osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
@@ -1265,12 +1267,12 @@ pub fn event_loop<A: crate::Arch>(
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
     first_tid: usize,
-    sb_card: Option<crate::kernel::drivers::sb16::SbCard>,
-    mut sink: Option<&mut crate::kernel::sound::Sink>,
+    sb_card: Option<crate::kernel::drivers::sb16::Sb16>,
+    sink: &mut Option<crate::kernel::sound::Sink>,
     mut display: Option<crate::kernel::display::Display>,
 ) -> (
     crate::kernel::display::Display,
-    Option<crate::kernel::drivers::sb16::SbCard>,
+    Option<crate::kernel::drivers::sb16::Sb16>,
 ) {
     crate::compact_dbg_println!("event_loop entered, tid={}", first_tid);
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
@@ -1389,7 +1391,7 @@ pub fn event_loop<A: crate::Arch>(
                 crate::kernel::sound::advance(
                     machine,
                     &mut audio_clock,
-                    sink.as_deref_mut(),
+                    sink.as_mut(),
                     elapsed_ns,
                     |machine, span| thread.personality.audio_tick(machine, world_now_ns, span),
                 );
@@ -1441,31 +1443,58 @@ pub fn event_loop<A: crate::Arch>(
                 threads,
                 display,
                 &mut windows,
+                sound_view(
+                    sink.as_ref(),
+                    sb_handoff.as_ref(),
+                    threads.get(ctx.tid).map(|thread| &thread.personality),
+                ),
             );
         }
         stats.mark(machine, PROFILE_DISPLAY);
-        let thread = ctx.thread(threads);
-        crate::kernel::console::dispatch(
-            machine,
-            &mut *bios_workspace,
-            &mut ctx.regs,
-            &mut thread.kernel,
-            &mut thread.personality,
-            &mut display,
-            events,
-        );
-        if crate::kernel::osd::picker_preview_tid().is_none() {
-            windows.finish_task_switcher();
-        }
-        if let Some(tid) = crate::kernel::osd::take_window_request() {
-            windows.finish_task_switcher();
-            let window = crate::kernel::gui::WindowManager::primary_window(
-                crate::kernel::gui::EndpointId(tid as u32),
+        {
+            let sound = sound_view(
+                sink.as_ref(),
+                sb_handoff.as_ref(),
+                threads.get(ctx.tid).map(|thread| &thread.personality),
             );
-            windows.select_window(window);
-            crate::kernel::osd::finish_presentation_change();
-            thread::request_switch_to(tid);
-            if tid == ctx.tid {
+            let thread = ctx.thread(threads);
+            crate::kernel::console::dispatch(
+                machine,
+                &mut *bios_workspace,
+                &mut ctx.regs,
+                &mut thread.kernel,
+                &mut thread.personality,
+                &mut display,
+                sound,
+                events,
+            );
+            if crate::kernel::osd::picker_preview_tid().is_none() {
+                windows.finish_task_switcher();
+            }
+            if let Some(tid) = crate::kernel::osd::take_window_request() {
+                windows.finish_task_switcher();
+                let window = crate::kernel::gui::WindowManager::primary_window(
+                    crate::kernel::gui::EndpointId(tid as u32),
+                );
+                windows.select_window(window);
+                crate::kernel::osd::finish_presentation_change();
+                thread::request_switch_to(tid);
+                if tid == ctx.tid {
+                    apply_current_presentation(
+                        machine,
+                        &mut *bios_workspace,
+                        &mut thread.personality,
+                        &mut display,
+                        &windows,
+                    );
+                }
+            }
+            if crate::kernel::osd::take_presentation_request() {
+                let window = crate::kernel::gui::WindowManager::primary_window(
+                    crate::kernel::gui::EndpointId(ctx.tid as u32),
+                );
+                windows.toggle_presentation(window);
+                crate::kernel::osd::finish_presentation_change();
                 apply_current_presentation(
                     machine,
                     &mut *bios_workspace,
@@ -1474,29 +1503,26 @@ pub fn event_loop<A: crate::Arch>(
                     &windows,
                 );
             }
+            stats.part(machine, PROFILE_INPUT);
+            thread
+                .personality
+                .after_input(machine, &mut thread.kernel, &mut ctx.regs);
         }
-        if crate::kernel::osd::take_presentation_request() {
-            let window = crate::kernel::gui::WindowManager::primary_window(
-                crate::kernel::gui::EndpointId(ctx.tid as u32),
-            );
-            windows.toggle_presentation(window);
-            crate::kernel::osd::finish_presentation_change();
-            apply_current_presentation(
+        if let Some(request) = crate::kernel::osd::take_sound_mode_request() {
+            apply_sound_mode_request(
                 machine,
-                &mut *bios_workspace,
-                &mut thread.personality,
-                &mut display,
-                &windows,
+                threads,
+                ctx.tid,
+                &mut sb_handoff,
+                sink,
+                request,
             );
         }
-        stats.part(machine, PROFILE_INPUT);
-        thread
-            .personality
-            .after_input(machine, &mut thread.kernel, &mut ctx.regs);
         stats.part(machine, PROFILE_INPUT);
 
         // A blocked thread holds the console but not the CPU: wait for input
         // to unblock it (above) or the F12 window picker to move on.
+        let thread = ctx.thread(threads);
         if thread.kernel.state == thread::ThreadState::Blocked {
             match crate::kernel::sched::focus_request(threads, ctx.tid) {
                 Some(next) => switch_focus_and_run(
@@ -1623,6 +1649,87 @@ pub fn event_loop<A: crate::Arch>(
     }
 }
 
+fn apply_sound_mode_request<A: crate::Arch>(
+    machine: &mut A,
+    threads: &mut [thread::Thread<A>],
+    tid: usize,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
+    sink: &mut Option<crate::kernel::sound::Sink>,
+    request: crate::kernel::osd::SoundModeRequest,
+) {
+    use crate::kernel::osd::SoundModeRequest;
+
+    match request {
+        SoundModeRequest::Kernel => {
+            if sink.is_some() {
+                return;
+            }
+            let owned = thread::get_thread(threads, tid)
+                .and_then(|thread| thread.personality.release_sb(machine));
+            let card = match owned {
+                Some(card) => {
+                    debug_assert!(sb_handoff.is_none());
+                    card
+                }
+                None => match sb_handoff.take() {
+                    Some(card) => card,
+                    None => return,
+                },
+            };
+            match crate::kernel::sound::Sink::new_sb(machine, card) {
+                Ok(new_sink) => {
+                    *sink = Some(new_sink);
+                    crate::compact_println!("sound: switched SB to kernel mixing");
+                }
+                Err(card) => {
+                    *sb_handoff = match thread::get_thread(threads, tid) {
+                        Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
+                        None => Some(card),
+                    };
+                }
+            }
+        }
+        SoundModeRequest::Native => {
+            if !sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_sb) {
+                return;
+            }
+            let Some(card) = sink.take().and_then(crate::kernel::sound::Sink::into_sb) else {
+                return;
+            };
+            *sb_handoff = match thread::get_thread(threads, tid) {
+                Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
+                None => Some(card),
+            };
+            crate::compact_println!("sound: switched SB to native ownership");
+        }
+    }
+}
+
+fn sound_view<A: crate::Arch>(
+    sink: Option<&crate::kernel::sound::Sink>,
+    handoff: Option<&crate::kernel::drivers::sb16::Sb16>,
+    personality: Option<&thread::Personality<A>>,
+) -> crate::kernel::osd::SoundView {
+    use crate::kernel::osd::SoundView;
+    use crate::kernel::platform::Audio;
+    match sink.and_then(crate::kernel::sound::Sink::sb_port) {
+        Some(port) => SoundView::KernelSb { port },
+        None => match handoff.or_else(|| personality.and_then(thread::Personality::physical_sb)) {
+            Some(device) => SoundView::NativeSb {
+                port: device.base,
+                can_mix: device.dma16.is_some(),
+            },
+            None => match crate::kernel::platform::get().audio {
+                Audio::EmulatedHda => SoundView::KernelHda,
+                Audio::EmulatedAc97 => SoundView::KernelAc97,
+                Audio::EmulatedPortWindow => SoundView::KernelHost,
+                Audio::EmulatedSilent => SoundView::KernelSilent,
+                Audio::NativeSb | Audio::SbSink => SoundView::KernelSilent,
+            },
+        },
+    }
+}
+
 /// Canonicalize a kernel event into the action the scheduler decides on.
 /// Page faults are decided here — an unhandled user fault is a SEGV exit,
 /// and `signal_thread` wants the whole `Thread` for its diagnostics;
@@ -1719,7 +1826,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     ctx: &mut crate::kernel::exec_ctx::ExecutionContext<A>,
     new_tid: usize,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     display: &mut Option<crate::kernel::display::Display>,
     windows: &mut crate::kernel::gui::WindowManager,
 ) {
@@ -1912,7 +2019,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     viopl: u8,
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     event_display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<usize> {
     use crate::kernel::exec;

@@ -31,12 +31,13 @@ pub fn dispatch<A: crate::Arch>(
     kt: &mut thread::KernelThread<A>,
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
+    sound: crate::kernel::osd::SoundView,
     events: alloc::vec::Vec<crate::Irq>,
 ) {
     let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
     for evt in events {
         if let crate::Irq::Key(sc) = evt
-            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality, display)
+            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality, display, sound)
         {
             continue;
         }
@@ -128,13 +129,14 @@ fn monitor_key<A: crate::Arch>(
     sc: u8,
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
+    sound: crate::kernel::osd::SoundView,
 ) -> bool {
     if crate::kernel::osd::is_open() {
         let dos = match &*personality {
             thread::Personality::Dos(dos) => Some(&**dos),
             thread::Personality::Linux(_) | thread::Personality::Os2(_) | thread::Personality::Windows(_) => None,
         };
-        crate::kernel::osd::key(machine, regs, sc, dos);
+        crate::kernel::osd::key(machine, regs, sc, dos, sound);
         if !crate::kernel::osd::is_open() {
             restore_from_monitor(machine, &mut *bios_workspace, personality, display);
             personality.repaint_osd();

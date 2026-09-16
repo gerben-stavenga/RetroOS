@@ -43,7 +43,7 @@
 //! the guest's address space is ours to reach, never the card's.
 
 use crate::Regs;
-use crate::kernel::drivers::sb16::SbCard;
+use crate::kernel::drivers::sb16::Sb16;
 use crate::kernel::drivers::sb_guest::NativeSb;
 use alloc::boxed::Box;
 use super::*;
@@ -178,7 +178,7 @@ impl SbDevice {
         self,
         machine: &mut A,
         b: &Blaster,
-    ) -> (Self, Option<SbCard>) {
+    ) -> (Self, Option<Sb16>) {
         match self {
             Self::Emulated(emu) => (Self::Emulated(emu), None),
             Self::Native { mut pt, shadow } => {
@@ -197,7 +197,7 @@ impl SbDevice {
     /// begins the transfer. The DMA side needs nothing here — the virtual 8237
     /// still holds this guest's programming, and the next `maybe_remap`
     /// re-arms the real controller from it.
-    fn present<A: crate::Arch>(self, machine: &mut A, card: SbCard) -> Self {
+    fn present<A: crate::Arch>(self, machine: &mut A, card: Sb16) -> Self {
         let Self::Emulated(shadow) = self else {
             panic!("SB already owns the card");
         };
@@ -287,6 +287,13 @@ impl SoundBlaster {
         }
     }
 
+    pub fn physical(&self) -> Option<&Sb16> {
+        match &self.device {
+            SbDevice::Native { pt, .. } => Some(pt.card()),
+            SbDevice::Emulated(_) => None,
+        }
+    }
+
     /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
     /// The per-channel buffers are permanent; this just detaches the guest
     /// alias and clears the re-arm cursor so a reused `SoundBlaster` can't
@@ -315,7 +322,7 @@ impl SoundBlaster {
     ///
     /// The mirror of `VgaAdapter::present`, and for the same reason — the guest
     /// must not be able to tell that its card changed identity underneath it.
-    pub fn adopt_card<A: crate::Arch>(&mut self, machine: &mut A, card: SbCard) {
+    pub fn adopt_card<A: crate::Arch>(&mut self, machine: &mut A, card: Sb16) {
         let dev = core::mem::replace(&mut self.device, SbDevice::Emulated(EmulatedSb::new()));
         self.device = dev.present(machine, card);
     }
@@ -323,7 +330,7 @@ impl SoundBlaster {
     /// Give the card up: snapshot it into the model and hand the silicon on.
     /// The mirror of `VgaAdapter::drop_to_facade`. `None` if this thread never had
     /// it, which is every thread on a machine without a card.
-    pub fn release_card<A: crate::Arch>(&mut self, machine: &mut A) -> Option<SbCard> {
+    pub fn release_card<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Sb16> {
         let Self { blaster, device } = self;
         let dev = core::mem::replace(device, SbDevice::Emulated(EmulatedSb::new()));
         let (dev, card) = dev.drop_to_facade(machine, blaster);

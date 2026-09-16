@@ -123,7 +123,7 @@ pub struct Platform {
     ///
     /// A *fact*, not a capability: that a Sound Blaster answered is frozen
     /// here, but the card itself is a move-only value with one owner
-    /// (`sb16::SbCard`), and `Platform` hands out `&'static`. It used to be
+    /// (`sb16::Sb16`), and `Platform` hands out `&'static`. It used to be
     /// mirrored here as `sb_card` + `sb_wiring`, which is how every DOS
     /// thread came to mint its own copy of the machine's one card.
     pub audio_hw: AudioHw,
@@ -524,7 +524,7 @@ pub fn apply_audio_mode<A: crate::Arch>(
     machine: &mut A,
     mixed: bool,
     declared: Option<crate::kernel::drivers::sb16::SbWiring>,
-) -> Option<crate::kernel::drivers::sb16::SbCard> {
+) -> Option<crate::kernel::drivers::sb16::Sb16> {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::apply_audio_mode before probe");
     let card = (p.audio_hw == AudioHw::Sb)

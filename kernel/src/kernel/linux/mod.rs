@@ -1190,7 +1190,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: alloc::vec::Vec<u8>,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<usize> {
     use crate::kernel::exec;

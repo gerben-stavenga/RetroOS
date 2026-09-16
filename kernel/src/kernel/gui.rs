@@ -792,6 +792,7 @@ impl WindowManager {
         height: usize,
         scale_y: usize,
         format: vga::PixelFormat,
+        sound: crate::kernel::osd::SoundView,
     ) {
         const OSD_ENDPOINT: EndpointId = EndpointId(u32::MAX);
         const OSD_SURFACE: SurfaceKey = SurfaceKey(u64::MAX);
@@ -816,7 +817,7 @@ impl WindowManager {
         let step = format.bytes_per_pixel as usize;
         if redraw && open {
             self.osd_pixels.clear();
-            self.osd_rect = crate::kernel::osd::window_size(width, height, scale_y)
+            self.osd_rect = crate::kernel::osd::window_size(width, height, scale_y, sound)
                 .map(|(panel_width, panel_height)| {
                     self.osd_pixels.resize(panel_width * panel_height * step, 0);
                     crate::kernel::osd::paint(
@@ -828,6 +829,7 @@ impl WindowManager {
                         height,
                         scale_y,
                         format,
+                        sound,
                     );
                     Rect::new(
                         ((width - panel_width) / 2) as i32,

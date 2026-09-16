@@ -37,7 +37,7 @@ pub fn verdict<A: crate::Arch>(
     tid: usize,
     action: thread::KernelAction,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     display: &mut Option<crate::kernel::display::Display>,
 ) -> Verdict {
     // Explicit match (not `.or_else(closure)`) so the `next_after` mutable
@@ -65,7 +65,7 @@ fn next_after<A: crate::Arch>(
     tid: usize,
     action: thread::KernelAction,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
-    sb_handoff: &mut Option<crate::kernel::drivers::sb16::SbCard>,
+    sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<Verdict> {
     match action {
