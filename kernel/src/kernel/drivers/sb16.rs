@@ -359,7 +359,12 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // Start from silence so the first auto-init lap before prime isn't garbage.
     unsafe { core::ptr::write_bytes(DMA_WIN_VA as *mut u8, 0, RING_BYTES) };
 
+    // A native DOS program may have left the CT1745 voice/master levels
+    // attenuated.  The kernel sink owns the DAC now, so re-establish a full
+    // PCM path; otherwise handoff produces only a faint residual signal.
     machine.outb(card.base + MIX_IDX, 0x22); // master volume index
+    machine.outb(card.base + MIX_DATA, 0xFF); // full
+    machine.outb(card.base + MIX_IDX, 0x04); // voice/DAC volume index
     machine.outb(card.base + MIX_DATA, 0xFF); // full
     dsp_write_at(machine, card.base, CMD_SPEAKER_ON);
 

@@ -169,6 +169,14 @@ impl Mixer {
         )
     }
 
+    /// PCM gain when the software SB stream is sent through a real SB DAC.
+    /// The hardware supplies the DAC /3 stage itself.
+    pub fn voice_gain_q16_physical(&self) -> (i32, i32) {
+        let m = (self.level_q16(0x30), self.level_q16(0x31));
+        (combine_q16(self.level_q16(0x32), m.0),
+         combine_q16(self.level_q16(0x33), m.1))
+    }
+
     /// (left, right) Q16 gain the FM synth is summed at: fm × master × 0.7172.
     pub fn fm_gain_q16(&self) -> (i32, i32) {
         let m = (self.level_q16(0x30), self.level_q16(0x31));
@@ -176,6 +184,15 @@ impl Mixer {
             combine_q16(combine_q16(self.level_q16(0x34), m.0), FM_SCALE_Q16),
             combine_q16(combine_q16(self.level_q16(0x35), m.1), FM_SCALE_Q16),
         )
+    }
+
+    /// OPL gain for software OPL samples sent through a real SB DAC. Boost by
+    /// the inverse DAC normalization so its ratio to PCM matches the card.
+    pub fn fm_gain_q16_physical(&self) -> (i32, i32) {
+        let m = (self.level_q16(0x30), self.level_q16(0x31));
+        let scale = FM_SCALE_Q16.saturating_mul(3);
+        (combine_q16(combine_q16(self.level_q16(0x34), m.0), scale),
+         combine_q16(combine_q16(self.level_q16(0x35), m.1), scale))
     }
 }
 
@@ -941,15 +958,16 @@ impl Sb {
     /// `position_q32` and `step_q32` are the host's incremental source phase;
     /// changing the output mix rate changes only future steps, never the
     /// interpretation of frames already produced.
-    pub fn mix_dsp(
+    fn mix_dsp_gain(
         &self,
         mut position_q32: u64,
         step_q32: u64,
         src: &[u8],
         f: &Fetch,
         block: &mut [(i32, i32)],
+        gain: (i32, i32),
     ) {
-        let (gl, gr) = self.mixer.voice_gain_q16();
+        let (gl, gr) = gain;
         for slot in block.iter_mut() {
             let s = position_q32 >> 32;
             if s >= f.end {
@@ -962,14 +980,29 @@ impl Sb {
         }
     }
 
+    pub fn mix_dsp(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Fetch, block: &mut [(i32, i32)]) {
+        self.mix_dsp_gain(position_q32, step_q32, src, f, block, self.mixer.voice_gain_q16());
+    }
+
+    pub fn mix_dsp_physical(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Fetch, block: &mut [(i32, i32)]) {
+        self.mix_dsp_gain(position_q32, step_q32, src, f, block, self.mixer.voice_gain_q16_physical());
+    }
+
     /// Sum the FM synth into `block` (no-op when silent).
-    pub fn mix_fm(&mut self, rate: u32, block: &mut [(i32, i32)]) {
-        let gain = self.mixer.fm_gain_q16();
+    fn mix_fm_gain(&mut self, rate: u32, block: &mut [(i32, i32)], gain: (i32, i32)) {
         if let Some(o) = self.opl.as_mut()
             && o.mixing()
         {
             o.mix_into(rate, block, gain);
         }
+    }
+
+    pub fn mix_fm(&mut self, rate: u32, block: &mut [(i32, i32)]) {
+        self.mix_fm_gain(rate, block, self.mixer.fm_gain_q16());
+    }
+
+    pub fn mix_fm_physical(&mut self, rate: u32, block: &mut [(i32, i32)]) {
+        self.mix_fm_gain(rate, block, self.mixer.fm_gain_q16_physical());
     }
 
     // ── DMA-controller readback ──────────────────────────────────────────

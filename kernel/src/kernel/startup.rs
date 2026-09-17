@@ -411,9 +411,14 @@ fn load_midi_bank<A: crate::Arch>(
     screen: &mut crate::kernel::console::Console,
     audio: crate::kernel::platform::Audio,
 ) {
+    // SB kernel mixing is deliberately PCM-only.  On a slow 86Box machine,
+    // software GM synthesis costs enough to starve the guest, while native SB
+    // mode lets its OPL/MPU hardware handle music.  HDA/AC'97 still render GM
+    // in software because they have no guest-visible FM/MIDI hardware.
     if !matches!(
         audio,
         crate::kernel::platform::Audio::NativeSb
+            | crate::kernel::platform::Audio::SbSink
             | crate::kernel::platform::Audio::EmulatedSilent
     ) {
         crate::screenln!(screen => machine, bios_workspace; "Loading General MIDI bank...");

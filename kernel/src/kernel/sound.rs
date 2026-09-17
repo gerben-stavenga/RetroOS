@@ -276,6 +276,9 @@ pub struct AudioSpan<'a> {
     /// [`advance`]); only the pitch timebase is pinned here so tuning holds.
     pub rate: u32,
     pub base_frame: u64,
+    /// The active output is a physical SB sink, so SB source rendering must
+    /// omit software-only DAC normalization and preserve native OPL balance.
+    pub physical_sb: bool,
     pub frames: &'a mut [(i32, i32)],
 }
 
@@ -422,6 +425,7 @@ pub fn advance<A: crate::Arch>(
         mix(machine, AudioSpan {
             rate: mix_rate,
             base_frame: base,
+            physical_sb: sink.as_ref().is_some_and(|output| output.is_sb()),
             frames: &mut frames[..run],
         });
         if let (Some(output), Some(gain_q16)) = (sink.as_deref_mut(), gain_q16) {

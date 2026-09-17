@@ -111,7 +111,13 @@ impl Mpu {
             if !self.card.in_uart() {
                 return;
             }
-            let Some(bank) = self.bank else { return };
+            // Native-SB programs may have been created before OSD transferred
+            // the card to the kernel mixer.  Their original configuration
+            // deliberately had no bank reference; resolve it now so the
+            // already-running MPU becomes audible immediately after the
+            // handoff.
+            let Some(bank) = self.bank.or_else(crate::kernel::midi_bank::get) else { return };
+            self.bank = Some(bank);
             let mut s = sound::midi::Synth::new_boxed(bank);
             s.init();
             self.synth = Some(s);

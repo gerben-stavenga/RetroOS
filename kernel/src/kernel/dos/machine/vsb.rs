@@ -621,6 +621,7 @@ impl EmulatedSb {
         machine: &mut A,
         rate: u32,
         block: &mut [(i32, i32)],
+        physical_sb: bool,
     ) {
         let step_q32 = ((u64::from(self.core.rate().max(1))) << 32)
             / u64::from(rate.max(1));
@@ -650,13 +651,21 @@ impl EmulatedSb {
                 machine.copy_from(addr, &mut scratch[lo..lo + run * fb]);
                 copied += run;
             }
-            self.core.mix_dsp(start_q32, step_q32, scratch, &f, block);
+            if physical_sb {
+                self.core.mix_dsp_physical(start_q32, step_q32, scratch, &f, block);
+            } else {
+                self.core.mix_dsp(start_q32, step_q32, scratch, &f, block);
+            }
         }
         if self.core.playing() {
             self.mix_pos_q32 = self.mix_pos_q32
                 .wrapping_add(step_q32.wrapping_mul(block.len() as u64));
         }
-        self.core.mix_fm(rate, block);
+        if physical_sb {
+            self.core.mix_fm_physical(rate, block);
+        } else {
+            self.core.mix_fm(rate, block);
+        }
     }
 
     /// Drive the emulated DSP's guest-visible clock from frames consumed by

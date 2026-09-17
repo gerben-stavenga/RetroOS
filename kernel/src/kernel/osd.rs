@@ -82,7 +82,9 @@ const DEBUG_PROFILE_ROWS: usize = 5;
 /// percentage selects a perceptual gain step; 100 is unity.
 const VOL_MAX: u32 = 100;
 const VOL_STEP: u32 = 10;
-const DEFAULT_VOLUME_PCT: u32 = 50;
+// Native device playback has no kernel master-gain stage.  Start the kernel
+// mixer at unity so switching ownership does not produce a volume jump.
+const DEFAULT_VOLUME_PCT: u32 = 100;
 const VOLUME_GAIN_Q16: [i32; 11] = [
     0, 1039, 1646, 2609, 4135, 6554,
     10387, 16462, 26090, 41350, 65536,
@@ -1525,7 +1527,7 @@ mod tests {
 
     #[test]
     fn volume_gain_uses_the_perceptual_table() {
-        assert_eq!(DEFAULT_VOLUME_PCT, 50);
+        assert_eq!(DEFAULT_VOLUME_PCT, 100);
         for (index, &gain) in VOLUME_GAIN_Q16.iter().enumerate() {
             assert_eq!(volume_gain_q16((index as u32) * VOL_STEP), gain);
         }

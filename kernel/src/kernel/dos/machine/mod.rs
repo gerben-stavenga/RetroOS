@@ -1123,7 +1123,7 @@ pub fn advance_timers(pc: &mut PcMachine, now_ns: u64) {
 enum PcmSource<'a> {
     /// `None` when this thread holds the real card: silicon mixes itself, and
     /// there is no emulated card to ask for frames.
-    SoundBlaster(Option<&'a mut EmulatedSb>),
+    SoundBlaster(Option<&'a mut EmulatedSb>, bool),
     Gus(&'a mut Gus),
     Midi(&'a mut Mpu),
     Speaker(&'a mut sound::speaker::Speaker),
@@ -1138,8 +1138,8 @@ impl PcmSource<'_> {
         block: &mut [(i32, i32)],
     ) {
         match self {
-            Self::SoundBlaster(Some(sb)) => sb.mix_into(machine, rate, block),
-            Self::SoundBlaster(None) => {}
+            Self::SoundBlaster(Some(sb), physical_sb) => sb.mix_into(machine, rate, block, *physical_sb),
+            Self::SoundBlaster(None, _) => {}
             Self::Gus(gus) => gus.mix_into(machine, rate, base, block),
             Self::Midi(mpu) => mpu.mix_into(machine, rate, base, block),
             Self::Speaker(spk) => {
@@ -1212,7 +1212,7 @@ pub fn audio_tick<A: crate::Arch>(
         let _ = emu.take_restart();
     }
     let mut sources = [
-        PcmSource::SoundBlaster(sb.as_deref_mut()),
+        PcmSource::SoundBlaster(sb.as_deref_mut(), span.physical_sb),
         PcmSource::Gus(gus),
         PcmSource::Midi(mpu),
         PcmSource::Speaker(spk),
