@@ -112,6 +112,10 @@ jobs:
       # End-to-end: a real 32-bit Linux ELF through the kernel's Linux
       # personality on every hosted engine this runner can run. A timeout or nonzero exit fails.
       - name: Hosted ELF smoke
+        env:
+          # -Cpanic=abort turns any kernel panic into SIGABRT, so the message is
+          # all we get; a backtrace names the call site that tripped it.
+          RUST_BACKTRACE: "1"
         run: |
           gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
             -o /tmp/hello.elf test/hosted/hello.c
