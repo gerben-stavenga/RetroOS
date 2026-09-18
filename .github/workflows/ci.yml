@@ -119,8 +119,20 @@ jobs:
           runners=retroos-host
           [ "$RETRO_REQUIRE_KVM" = 1 ] && runners="$runners retroos-host-kvm"
           for runner in $runners; do
+            echo "== $runner"
+            # Print what the runner said BEFORE asserting on it. Under `bash -e`
+            # a failing command substitution ends the step with the output still
+            # inside $out, which is how a SIGABRT here first showed up as a bare
+            # "exit code 134" with no message to diagnose.
+            set +e
             out=$(timeout 20 "bazel-bin/kernel/$runner" /tmp/hello.elf 2>&1)
+            rc=$?
+            set -e
             echo "$out"
+            if [ "$rc" != 0 ]; then
+              echo "$runner exited $rc"
+              exit 1
+            fi
             echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
             if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
           done
