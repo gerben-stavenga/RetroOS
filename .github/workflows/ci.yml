@@ -50,7 +50,8 @@ jobs:
       - name: Detect hardware virtualization
         run: |
           if [ -c /dev/kvm ] && sudo chown "$(id -u)" /dev/kvm; then
-            echo "KVM available; KVM backend tests are required"
+            echo "KVM available; hosted-engine KVM tests are required"
+            echo "(qemu -accel kvm is probed separately: nested virt here cannot boot a firmware guest)"
             echo "RETRO_REQUIRE_KVM=1" >> "$GITHUB_ENV"
           else
             echo "::warning::no /dev/kvm on this runner; KVM backend tests will be skipped"
@@ -144,39 +145,6 @@ jobs:
             if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
            done
           done
-
-      # TEMPORARY probe (remove once the CPU model is settled): QEMU under the
-      # runner's NESTED kvm exits 0 in about a second with no firmware output,
-      # which -no-reboot makes look like a clean shutdown. Our own hosted KVM
-      # engine works here, so the question is which -cpu model nested kvm will
-      # actually boot a full firmware guest.
-      - name: Probe QEMU under nested KVM
-        continue-on-error: true
-        run: |
-          # A writable COPY: bazel's outputs are read-only, and a raw -drive is
-          # opened read-write (the first attempt at this probe measured only
-          # its own "Permission denied").
-          cp "$(bazel info bazel-bin)/image.bin" /tmp/probe.img
-          chmod u+w /tmp/probe.img
-          for cpu in host max qemu64 Nehalem; do
-            echo "=== -cpu $cpu"
-            set +e
-            timeout 40 qemu-system-x86_64 -accel kvm -cpu "$cpu" -m 256 \
-              -display none -no-reboot -debugcon stdio -serial none \
-              -drive file=/tmp/probe.img,format=raw,if=ide >/tmp/probe.out 2>&1
-            echo "--- rc=$?"
-            set -e
-            head -20 /tmp/probe.out
-            wc -l /tmp/probe.out
-          done
-          echo "=== same guest under TCG, for comparison"
-          set +e
-          timeout 40 qemu-system-x86_64 -accel tcg -m 256 \
-            -display none -no-reboot -debugcon stdio -serial none \
-            -drive file=/tmp/probe.img,format=raw,if=ide >/tmp/probe-tcg.out 2>&1
-          echo "--- rc=$?"
-          set -e
-          head -20 /tmp/probe-tcg.out
 
       # Run both hosted engines and the public QEMU/Bochs integration tests.
       # Proprietary assets and the interactive 86Box reference remain local.

@@ -34,7 +34,22 @@ qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have time
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
-qemu_audio_kvm() { qemu_audio && kvm; }
+# /dev/kvm opening is NOT the same as "qemu can boot a guest with -accel kvm".
+# Under the nested virtualization of a GitHub runner, qemu accepts -accel kvm
+# and then resets the guest before the BIOS emits a byte; -no-reboot turns that
+# into a silent exit 0, which looks exactly like a clean shutdown. A host where
+# KVM really works keeps qemu alive until we kill it (124). Probed once.
+QEMU_KVM_OK=
+qemu_kvm() {
+    have qemu-system-x86_64 && kvm || return 1
+    if [ -z "$QEMU_KVM_OK" ]; then
+        timeout 5 qemu-system-x86_64 -accel kvm -display none -no-reboot \
+            -serial none >/dev/null 2>&1
+        [ $? = 124 ] && QEMU_KVM_OK=yes || QEMU_KVM_OK=no
+    fi
+    [ "$QEMU_KVM_OK" = yes ]
+}
+qemu_audio_kvm() { qemu_audio && qemu_kvm; }
 bochs_tools() { bazel_tool && have bochs && have python3 && have mcopy && have mtype && have setsid; }
 grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
@@ -109,7 +124,10 @@ run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
 run qemu_serial_logging qemu_serial bash test/qemu_serial_logging.sh
 run audio_matrix qemu_audio bash test/audio_matrix.sh
 run audio_matrix_kvm qemu_audio_kvm bash test/audio_matrix.sh --kvm
-run audio_steady qemu_audio bash test/audio_steady.sh
+# Only under KVM: this one measures sustained real-time PCM, and a host that
+# cannot run the guest at real time loses PIT ticks, which crawls the music and
+# reads as a dropout that is not there. TCG audio coverage is audio_matrix,
+# which checks the driver paths rather than wall-clock continuity.
 run audio_steady_kvm qemu_audio_kvm bash test/audio_steady.sh --kvm
 
 run dpmi_smoke   qemu_prop bash test/dpmi_smoke.sh   # qemu + BORLANDC/BCC
