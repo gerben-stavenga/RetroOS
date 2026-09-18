@@ -29,6 +29,16 @@ def check_pcm(samples, rate, channels, seconds):
             raise AssertionError("three consecutive seconds of silent PCM")
 
 
+def dump(log, why):
+    """Fail with the guest log attached: CI keeps no temp dirs."""
+    tail = ""
+    try:
+        tail = "\n".join(log.read_text(errors="replace").splitlines()[-40:])
+    except OSError as e:
+        tail = f"(could not read {log}: {e})"
+    raise AssertionError(f"{why}\n=== {log} last 40 lines ===\n{tail}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kvm", action="store_true")
@@ -51,7 +61,7 @@ def main():
             deadline = time.monotonic() + 90
             while "sink: first frame played" not in log.read_text(errors="replace"):
                 if proc.poll() is not None or time.monotonic() > deadline:
-                    raise AssertionError(f"HDA did not start; see {log}")
+                    dump(log, f"HDA did not start (qemu rc={proc.poll()})")
                 time.sleep(0.1)
             # Leave ten seconds for the game to load and the pacer to settle.
             measurement_start = time.monotonic() + 10
@@ -77,18 +87,21 @@ def main():
                 proc.wait()
     text = log.read_text(errors="replace")
     if re.search(r"KERNEL PANIC|panicked|SEGV|Segmentation", text):
-        raise AssertionError(f"kernel/guest crash; see {log}")
+        dump(log, "kernel/guest crash")
     if initial_underruns is None:
         raise AssertionError("steady-state measurement never started")
     if text.count("WARNING: sound underrun") - initial_underruns > 2:
-        raise AssertionError(f"repeated audio underruns; see {log}")
+        dump(log, "repeated audio underruns")
     with wave.open(str(recording), "rb") as wav:
         if wav.getsampwidth() != 2 or wav.getnchannels() != 2:
             raise AssertionError("expected signed 16-bit stereo PCM")
         samples = array.array("h", wav.readframes(wav.getnframes()))
         if sys.byteorder != "little":
             samples.byteswap()
-        check_pcm(samples, wav.getframerate(), wav.getnchannels(), args.seconds)
+        try:
+            check_pcm(samples, wav.getframerate(), wav.getnchannels(), args.seconds)
+        except AssertionError as e:
+            dump(log, str(e))
     print(f"PASS: HDA delivered sustained PCM for {args.seconds}s ({work})")
 
 

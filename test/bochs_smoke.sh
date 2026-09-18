@@ -36,7 +36,11 @@ run_probe() {
     local completion='All commands done'
     # SVGAPROBE deliberately waits for a key after its final success marker.
     [ "$name" != vbe ] || completion='VBE-ALL-OK'
+    # SDL_AUDIODRIVER too, not just video: on a machine with no sound card
+    # (CI) SDL's ALSA backend fails to open the default PCM and then dies
+    # with "*** buffer overflow detected ***", taking the probe with it.
     VM_DIR="$work/$name" BOCHS_DISPLAY_LIBRARY=sdl2 SDL_VIDEODRIVER=dummy \
+        SDL_AUDIODRIVER=dummy \
         setsid ./run.sh bochs -i image --cmd "$command" \
         'panic: action=fatal' 'speaker: enabled=0' >"$log" 2>&1 &
     pid=$!

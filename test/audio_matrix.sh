@@ -64,6 +64,9 @@ for sink in "${SINKS[@]}"; do
         pass=$((pass+1)); printf '%-10s %-22s ok\n' "$sink" "$(basename "$prog")"
     else
         fail=$((fail+1))
+        # Show why here: the log lives in a temp dir that CI throws away.
+        printf '=== %s %s last 40 lines ===\n' "$sink" "$(basename "$prog")" >&2
+        tail -40 "$log" >&2
         printf '%-10s %-22s FAIL missing:%s (%s)\n' "$sink" "$(basename "$prog")" \
             "$(IFS=,; echo "${missing[*]}")" "$log"
     fi
