@@ -384,12 +384,6 @@ impl<A: Arch> BiosDisplayWorkspace<A> {
         Self { active: PhysicalVideoState::Legacy, native }
     }
 
-    /// Backend paths which deliberately bypass platform probing (the hosted
-    /// bare-ELF runner) have no native video firmware.
-    pub(crate) fn absent() -> Self {
-        Self { active: PhysicalVideoState::Legacy, native: None }
-    }
-
     /// Immutable, sanitized mode catalogue discovered at boot. Consulting it
     /// does not operate the adapter and therefore requires no live `VgaCap`.
     pub fn curated_mode(&self, number: u16) -> Option<crate::kernel::platform::VbeMode> {

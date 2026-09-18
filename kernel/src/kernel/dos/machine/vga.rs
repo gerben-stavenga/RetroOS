@@ -20,10 +20,7 @@ use crate::kernel::bios_display::{DosVideo, FullscreenVga, EmulatedVga};
 /// display ownership (foreground DOS owns the card, background threads run
 /// emulated) hangs off the same Platform type later.
 pub fn physical_vga_present() -> bool {
-    // No probe (bare-ELF dev path) ⇒ no card. Guards the console-VGA snapshot
-    // that thread-exit takes, which would otherwise trip `get`'s panic there.
-    crate::kernel::platform::probed()
-        && crate::kernel::platform::get().vga_passthrough
+    crate::kernel::platform::get().vga_passthrough
 }
 
 impl EmulatedVga {

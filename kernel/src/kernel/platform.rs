@@ -643,14 +643,6 @@ pub fn get() -> &'static Platform {
     }
 }
 
-/// Whether `probe` has run. The full disk-boot / windowed paths always probe;
-/// the minimal bare-ELF dev path (`host_run_elf`) does not. Lets the few
-/// pieces reachable from that path (console-VGA snapshot on thread exit) pick a
-/// sane default instead of tripping `get`'s panic-if-unprobed invariant.
-pub fn probed() -> bool {
-    unsafe { (&raw const PLATFORM).as_ref().unwrap().is_some() }
-}
-
 /// Probe audio once. PCI drivers return their initialized capability together
 /// with the fact recorded in `Platform`; SB presence is separate because its
 /// wiring and ownership policy cannot be settled until CONFIG.SYS is mounted.

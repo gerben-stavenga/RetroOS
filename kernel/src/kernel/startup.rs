@@ -1267,7 +1267,7 @@ fn present_desktop<A: crate::Arch>(
         presented);
 }
 
-pub fn event_loop<A: crate::Arch>(
+fn event_loop<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     threads: &mut [thread::Thread<A>],
@@ -1726,9 +1726,6 @@ fn sound_view<A: crate::Arch>(
                 port: device.base,
                 can_mix: device.dma16.is_some(),
             },
-            // The bare-ELF dev path never probes, so there is no audio to
-            // describe; say so rather than trip `get`'s unprobed invariant.
-            None if !crate::kernel::platform::probed() => SoundView::KernelSilent,
             None => match crate::kernel::platform::get().audio {
                 Audio::EmulatedHda => SoundView::KernelHda,
                 Audio::EmulatedAc97 => SoundView::KernelAc97,

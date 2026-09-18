@@ -85,62 +85,6 @@ pub fn host_console_init() {
 /// kernel path — thread creation, the ELF loader, the Linux personality, and
 /// the real `event_loop` — over whatever backend the entry injected, with no
 /// disk boot. `path` is used for argv[0] / diagnostics.
-pub fn host_run_elf<A: Arch>(
-    machine: &mut A,
-    path: &[u8],
-    data: alloc::vec::Vec<u8>,
-    argv: alloc::vec::Vec<alloc::vec::Vec<u8>>,
-) -> ! {
-    use kernel::thread;
-
-    let mut threads = thread::init_threading::<A>();
-    let cpipe = kernel::kpipe::alloc().expect("console pipe");
-    kernel::kpipe::add_writer(cpipe);
-    thread::set_console_pipe(cpipe);
-
-    let tid = {
-        let t = thread::create_thread(&mut threads, machine, None, A::PageTable::default(), true)
-            .expect("create thread");
-        t.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
-        t.kernel.fds[1] = thread::FdKind::ConsoleOut;
-        t.kernel.fds[2] = thread::FdKind::ConsoleOut;
-        t.kernel.tid as usize
-    };
-    kernel::kpipe::add_reader(cpipe);
-
-    let argv = if argv.is_empty() { alloc::vec![path.to_vec()] } else { argv };
-    if let Err(e) = kernel::linux::exec_elf_into(machine, &mut threads, tid, &data, path, &argv) {
-        compact_dbg_println!("[host] exec failed: errno {}", e);
-        kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
-        machine.shutdown();
-    }
-
-    compact_dbg_println!("[host] running 32-bit Linux ELF");
-    // The bare-ELF path bypasses platform probing/startup, so establish the
-    // same display-ownership invariant that `run_program` does explicitly.
-    kernel::focus::adopt(tid);
-    let mut bios_workspace = kernel::bios_display::BiosDisplayWorkspace::absent();
-    let display = {
-        let t = thread::get_thread(&mut threads, tid).expect("initial Linux thread");
-        t.personality.adopt_display(
-            machine, &mut bios_workspace, kernel::display::Display::headless())
-    };
-    let mut sink = None;
-    kernel::startup::event_loop(
-        machine,
-        &mut bios_workspace,
-        &mut threads,
-        tid,
-        None,
-        &mut sink,
-        display,
-    );
-    compact_dbg_println!("[host] guest exited");
-    kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
-    machine.shutdown();
-}
-
-
 // Metal linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're opaque
 // externs. Metal entry (`boot.rs`) unmaps the guard pages so a kernel-stack

@@ -123,6 +123,41 @@ fn main() {
     if shot_armed {
         kernel::kernel::display::set_host_present_sink(arch::publish_frame);
     }
+    // Sniff the ELF magic from the header alone — a disk image is attached by
+    // path and streamed (`attach_disk`), so slurping it whole here just to read
+    // four bytes put its entire size in RAM (a 200 GiB test disk OOM'd).
+    let mut magic = [0u8; 4];
+    if let Some(path) = &input {
+        std::fs::File::open(path)
+            .map(|mut f| {
+                let _ = f.read(&mut magic); // short file → stays zeroed, not ELF
+            })
+            .unwrap_or_else(|e| {
+                eprintln!("retroos-host: cannot read {path}: {e}");
+                std::process::exit(1);
+            });
+    }
+    // A bare executable is not a second way to boot: serve its directory over
+    // the native host-fs punch-through and let the ordinary path name it, so
+    // the kernel is entered once, through `startup()`, with the machine
+    // probed. argv = the positional tail (so `… apps/busybox/busybox sh` runs
+    // BusyBox's `sh` applet).
+    let elf = magic == *b"\x7fELF";
+    if elf {
+        let path = std::path::Path::new(input.as_deref().unwrap());
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+        let name = path.file_name().expect("ELF path names a file");
+        if host_dir.is_none() {
+            host_dir = Some(dir.unwrap_or(std::path::Path::new(".")).to_string_lossy().into_owned());
+        }
+        let mut line = name.to_string_lossy().into_owned();
+        for arg in positional.iter().skip(1) {
+            line.push(' ');
+            line.push_str(arg);
+        }
+        cmd = Some(line);
+    }
+
     if let Some(dir) = &host_dir {
         // Native host-fs backend (the hosted "punch-through"): /host (or the
         // root, per Media) is served by direct std::fs calls, not byte-serial
@@ -144,50 +179,13 @@ fn main() {
         arch::attach_audio(&path); // canonical audio device → WAV file
     }
 
-    // Sniff the ELF magic from the header alone — a disk image is attached by
-    // path and streamed (`attach_disk`), so slurping it whole here just to read
-    // four bytes put its entire size in RAM (a 200 GiB test disk OOM'd).
-    let mut magic = [0u8; 4];
-    if let Some(path) = &input {
-        std::fs::File::open(path)
-            .map(|mut f| {
-                let _ = f.read(&mut magic); // short file → stays zeroed, not ELF
-            })
-            .unwrap_or_else(|e| {
-                eprintln!("retroos-host: cannot read {path}: {e}");
-                std::process::exit(1);
-            });
-    }
-
-    if magic == *b"\x7fELF" {
-        let path = input.as_deref().unwrap();
-        // A bare executable: run it directly (no disk). argv = the positional
-        // tail (so `… apps/busybox/busybox sh` runs BusyBox's `sh` applet).
-        let argv: Vec<Vec<u8>> = positional.iter().map(|s| s.clone().into_bytes()).collect();
-        // Wire the interactive console: put the host terminal in raw mode and
-        // spawn the stdin→keyboard pump, so the guest (a Linux shell) is
-        // drivable. Output already flows to stdout via the kernel's 0xE9 mirror.
-        arch::enter_raw_mode();
-        spawn_keyboard();
-        // Initialize guest RAM + the active address space before loading the
-        // ELF into it — the disk-boot path below does this via `init_guest_ram`
-        // too, but this branch diverges before reaching it. Without it the ELF
-        // loader's first `copy_to` resolves against no active space and panics
-        // ("active space missing").
-        arch::init_guest_ram(0);
-        let mut machine = arch::Interp;
-        let data = std::fs::read(path).unwrap_or_else(|e| {
-            eprintln!("retroos-host: cannot read {path}: {e}");
-            std::process::exit(1);
-        });
-        kernel::host_run_elf(&mut machine, path.as_bytes(), data, argv);
-    }
-
     // Otherwise boot the same kernel::startup() the metal crt0 calls — with
     // the image's ATA disk attached when one was given, diskless otherwise
     // (the platform Media probe roots on hostfs or the embedded bootfs).
     arch::init_guest_ram(0);
-    if let Some(path) = &input {
+    if let Some(path) = &input
+        && !elf
+    {
         arch::attach_disk(path).unwrap_or_else(|e| {
             eprintln!("retroos-host: cannot attach disk {path}: {e}");
             std::process::exit(1);
