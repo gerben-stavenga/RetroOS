@@ -42,3 +42,9 @@ __pycache__/
 
 # Fetched VGA BIOS ROM (see build_vga_rom_args in run.sh)
 third_party/vgabios/
+
+# Codex CLI session state (config + nested worktrees), mirrors .claude/
+.codex/
+
+# Local game CD images (proprietary, see freedos/*.iso above)
+/CD/

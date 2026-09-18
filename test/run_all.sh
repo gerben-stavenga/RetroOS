@@ -3,7 +3,8 @@
 #
 # Runs every test, skipping any whose prerequisites are absent on this host, so
 # the same script is correct in both places:
-#   - CI installs QEMU/Bochs and requires /dev/kvm, but has no proprietary assets;
+#   - CI installs QEMU/Bochs and requires the KVM suites when the runner has
+#     /dev/kvm, but has no proprietary assets;
 #   - a local run (QEMU + KVM + apps-proprietary present) runs everything.
 #
 # Adding a test: add one `run` line below — it is then covered in CI and
@@ -13,7 +14,9 @@
 # Set RETRO_TEST_ONLY to a
 # space-separated name list to run a subset (e.g. RETRO_TEST_ONLY="dpmi_hx").
 # RETRO_REQUIRE_KVM=1 makes missing KVM a failure instead of an optional skip.
-# RETRO_REQUIRE_PUBLIC=1 requires every non-proprietary, non-desktop suite.
+# RETRO_REQUIRE_PUBLIC=1 requires every non-proprietary, non-desktop suite; the
+# KVM-gated ones stay optional under it unless RETRO_REQUIRE_KVM=1 too, so a
+# host without the device is not a failure.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -58,8 +61,11 @@ run() {
         return
     fi
     if [ "$gate" != "-" ] && ! "$gate"; then
-        if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [[ "$gate" != qemu_prop && "$gate" != box86 ]]; } \
-            || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [[ "$gate" = kvm || "$gate" = qemu_audio_kvm ]]; }; then
+        local needs_kvm=0
+        [[ "$gate" = kvm || "$gate" = qemu_audio_kvm ]] && needs_kvm=1
+        if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [ "$needs_kvm" = 0 ] \
+                && [[ "$gate" != qemu_prop && "$gate" != box86 ]]; } \
+            || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [ "$needs_kvm" = 1 ]; }; then
             printf 'FAIL  %-14s (required prerequisite: %s)\n' "$name" "$gate"
             fail=$((fail + 1)); failed+=("$name"); return
         fi

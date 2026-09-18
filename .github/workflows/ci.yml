@@ -1,9 +1,11 @@
 name: CI
 
 # Gate every branch and PR: build, clippy (deny-warnings), and the hosted
-# TCG, KVM, QEMU, and Bochs end-to-end tests. KVM access is required, so a missing
-# device cannot silently turn this into TCG-only coverage. Require this check
-# to keep main green.
+# TCG, QEMU, and Bochs end-to-end tests, plus the KVM engine when the runner
+# exposes /dev/kvm. KVM coverage is required whenever the device is there, so a
+# permissions slip cannot silently turn it into TCG-only; a runner without the
+# device at all (ARM, container jobs) skips it. Require this check to keep main
+# green.
 on:
   push:
     branches: ['**']
@@ -41,10 +43,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs gcc-multilib
 
-      - name: Require hardware virtualization for backend tests
+      # KVM is opportunistic: present on GitHub's standard x86 Linux runners,
+      # absent on ARM/container ones. When the device exists the KVM suites are
+      # required (RETRO_REQUIRE_KVM=1), so a chown failure fails CI rather than
+      # quietly downgrading coverage to TCG-only.
+      - name: Detect hardware virtualization
         run: |
-          test -c /dev/kvm
-          sudo chown "$(id -u)" /dev/kvm
+          if [ -c /dev/kvm ] && sudo chown "$(id -u)" /dev/kvm; then
+            echo "KVM available; KVM backend tests are required"
+            echo "RETRO_REQUIRE_KVM=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::no /dev/kvm on this runner; KVM backend tests will be skipped"
+            echo "RETRO_REQUIRE_KVM=0" >> "$GITHUB_ENV"
+          fi
 
       - name: Install bazelisk
         run: |
@@ -99,13 +110,15 @@ jobs:
         run: bazel build //kernel:retroos-host //kernel:retroos-host-kvm --platforms=@platforms//host
 
       # End-to-end: a real 32-bit Linux ELF through the kernel's Linux
-      # personality on both hosted engines. A timeout or nonzero exit fails.
+      # personality on every hosted engine this runner can run. A timeout or nonzero exit fails.
       - name: Hosted ELF smoke
         run: |
           gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
             -o /tmp/hello.elf test/hosted/hello.c
           # The program prints its greeting then exit(0)s; cap with timeout.
-          for runner in retroos-host retroos-host-kvm; do
+          runners=retroos-host
+          [ "$RETRO_REQUIRE_KVM" = 1 ] && runners="$runners retroos-host-kvm"
+          for runner in $runners; do
             out=$(timeout 20 "bazel-bin/kernel/$runner" /tmp/hello.elf 2>&1)
             echo "$out"
             echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
@@ -117,7 +130,6 @@ jobs:
       # New tests are wired up by adding a line to test/run_all.sh.
       - name: End-to-end tests
         env:
-          RETRO_REQUIRE_KVM: "1"
           RETRO_REQUIRE_PUBLIC: "1"
         run: test/run_all.sh
 
