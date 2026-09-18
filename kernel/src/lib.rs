@@ -81,10 +81,6 @@ pub fn host_console_init() {
     lib::term::term().set_aperture(None);
 }
 
-/// Hosted: run a 32-bit Linux ELF (already read into `data`) through the real
-/// kernel path — thread creation, the ELF loader, the Linux personality, and
-/// the real `event_loop` — over whatever backend the entry injected, with no
-/// disk boot. `path` is used for argv[0] / diagnostics.
 // Metal linker symbols. Stacks and their guard pages live at the tail of .bss
 // (see kernel.ld); only their addresses matter to Rust, so they're opaque
 // externs. Metal entry (`boot.rs`) unmaps the guard pages so a kernel-stack
