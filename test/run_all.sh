@@ -34,18 +34,56 @@ qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have time
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
-# /dev/kvm opening is NOT the same as "qemu can boot a guest with -accel kvm".
-# Under the nested virtualization of a GitHub runner, qemu accepts -accel kvm
-# and then resets the guest before the BIOS emits a byte; -no-reboot turns that
-# into a silent exit 0, which looks exactly like a clean shutdown. A host where
-# KVM really works keeps qemu alive until we kill it (124). Probed once.
+# /dev/kvm opening is NOT the same as "qemu can boot THIS guest with -accel
+# kvm". Under a GitHub runner's nested virtualization qemu accepts -accel kvm
+# and then resets the guest before the BIOS emits a byte; -no-reboot renders
+# that as a silent exit 0. An empty qemu (no disk) does NOT show it — SeaBIOS
+# idles at "no bootable device" quite happily — so the probe has to boot the
+# real image, and it boots it under TCG too:
+#
+#   boots under kvm            -> yes, run the kvm tests
+#   boots under tcg, not kvm   -> this host's kvm cannot run it: skip
+#   boots under neither        -> that is our bug, not the host's: run them so
+#                                 they fail loudly
+#
+# Probed once; the image is the one the tests use anyway.
 QEMU_KVM_OK=
+qemu_kvm_boots() { # <accel> — echoes the guest's first debugcon bytes
+    timeout 25 qemu-system-x86_64 -accel "$1" -m 256 -display none -no-reboot \
+        -debugcon stdio -serial none \
+        -drive file="$QEMU_KVM_IMG",format=raw,if=ide 2>/dev/null | head -c 200
+}
 qemu_kvm() {
     have qemu-system-x86_64 && kvm || return 1
     if [ -z "$QEMU_KVM_OK" ]; then
-        timeout 5 qemu-system-x86_64 -accel kvm -display none -no-reboot \
-            -serial none >/dev/null 2>&1
-        [ $? = 124 ] && QEMU_KVM_OK=yes || QEMU_KVM_OK=no
+        # A probe that cannot run must not quietly disable the tests: every
+        # failure here answers "yes, run them" so the tests report it.
+        QEMU_KVM_OK=yes
+        if ! bz build //:image >/dev/null 2>&1; then
+            echo "qemu_kvm: cannot build //:image to probe with; running the" \
+                 "kvm tests anyway" >&2
+            return 0
+        fi
+        QEMU_KVM_IMG="$(mktemp -t retroos-kvm-probe.XXXXXX.img)"
+        if ! cp "$(bz info bazel-bin 2>/dev/null)/image.bin" "$QEMU_KVM_IMG"; then
+            echo "qemu_kvm: cannot copy the image to probe with; running the" \
+                 "kvm tests anyway" >&2
+            rm -f "$QEMU_KVM_IMG"
+            return 0
+        fi
+        chmod u+w "$QEMU_KVM_IMG"
+        if [ -n "$(qemu_kvm_boots kvm)" ]; then
+            QEMU_KVM_OK=yes
+        elif [ -z "$(qemu_kvm_boots tcg)" ]; then
+            echo "qemu_kvm: the image boots under NEITHER kvm nor tcg — running" \
+                 "the kvm tests so they report it" >&2
+            QEMU_KVM_OK=yes
+        else
+            echo "qemu_kvm: qemu boots this image under tcg but not kvm;" \
+                 "skipping the qemu kvm tests on this host" >&2
+            QEMU_KVM_OK=no
+        fi
+        rm -f "$QEMU_KVM_IMG"
     fi
     [ "$QEMU_KVM_OK" = yes ]
 }
