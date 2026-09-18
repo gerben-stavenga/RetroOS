@@ -495,7 +495,6 @@ fn materialize_emulated_aperture<A: crate::Arch>(dev: &mut EmulatedVga, machine:
     }
 }
 
-/// The reverse: read the guest's aperture back into the planes.
 // ============================================================================
 // Emulated VGA planar VRAM (trap-backed A0000)
 // ============================================================================
@@ -705,8 +704,10 @@ pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
 }
 
 pub fn bios_set_font_map_select(device: &mut DosVideo, select: u8) {
-    if let Some(dev) = device.emulated_mut() {
-        if let Some(state) = dev.state.legacy_mut() { state.seq[3] = select; }
+    if let Some(dev) = device.emulated_mut()
+        && let Some(state) = dev.state.legacy_mut()
+    {
+        state.seq[3] = select;
     }
 }
 

@@ -728,7 +728,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                     machine.outb(port, val);
                 }
                 LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
-                    let _ = palette.port_write(port, val);
+                    palette.port_write(port, val);
                 }
                 LegacyVgaIo::Vbe(_) => {}
             }
@@ -739,7 +739,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
                 LegacyVgaIo::Emulated(state) => vga::port_write(machine, state, port, val),
                 LegacyVgaIo::Native => machine.outb(port, val),
                 LegacyVgaIo::Vbe(palette) if (0x3C6..=0x3C9).contains(&port) => {
-                    let _ = palette.port_write(port, val);
+                    palette.port_write(port, val);
                 }
                 LegacyVgaIo::Vbe(_) => {}
             }

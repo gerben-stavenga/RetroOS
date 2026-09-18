@@ -364,6 +364,7 @@ pub(crate) struct PhysicalVbeState {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[allow(clippy::large_enum_variant)] // Inline, Copy snapshot of the physical video state.
 enum PhysicalVideoState { Legacy, Vbe(PhysicalVbeState) }
 
 struct NativeBiosWorkspace<A: Arch> {
@@ -778,6 +779,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
 
     /// RetroOS VBE palette/ramp service. Reads never enter the physical ROM or
     /// access the DAC. Successful writes commit the same values to the shadow.
+    #[allow(clippy::too_many_arguments)] // Explicit BIOS register/buffer contract.
     fn indexed_palette_call(
         &mut self,
         machine: &mut A,
@@ -959,6 +961,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)] // Hardware capabilities, bank state, and source stay distinct.
     fn present_banked_packed_regions(
         &mut self,
         machine: &mut A,
@@ -982,6 +985,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn present_banked_source(
         &mut self,
         machine: &mut A,
@@ -1559,6 +1563,7 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bios_present_packed_regions<A: Arch>(
         &mut self,
         machine: &mut A,

@@ -1291,6 +1291,7 @@ pub fn event_loop<A: crate::Arch>(
     let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
     let mut execution_profile_on = false;
+    let mut pending_events = crate::kernel::irq_dispatch::PendingEvents::default();
     // The event loop is the execution engine and sole owner of window policy.
     // A missing display means the initial DOS window holds the fullscreen
     // direct-scanout lease; otherwise the compositor starts on the desktop.
@@ -1320,15 +1321,13 @@ pub fn event_loop<A: crate::Arch>(
             execution_profile_on = requested_profile;
         }
         stats.slice_begin(machine);
-        let mut events = crate::kernel::irq_dispatch::drain(machine);
-        let tick_wakeup = events
-            .iter()
-            .any(|event| matches!(event, crate::Irq::Hw(0)));
-        events.retain(|event| !matches!(event, crate::Irq::Hw(0)));
+        pending_events.drain(machine);
+        let tick_wakeup = pending_events.tick_wakeup;
+        let events = &mut pending_events.events;
         // A 115200-baud UART can deliver fewer than 12 bytes per millisecond,
         // safely below its 16-byte FIFO. Poll only on the timer wakeup: doing
         // an IN from COM2 on every guest exit would itself distort profiles.
-        if (tick_wakeup || irq_clock_wakeup) && crate::kernel::serial_control::poll(machine, &mut events) {
+        if (tick_wakeup || irq_clock_wakeup) && crate::kernel::serial_control::poll(machine, events) {
             let thread = ctx.thread(threads);
             let dos = match &thread.personality {
                 thread::Personality::Dos(dos) => Some(&**dos),
@@ -1457,22 +1456,25 @@ pub fn event_loop<A: crate::Arch>(
         }
         stats.mark(machine, PROFILE_DISPLAY);
         {
-            let sound = sound_view(
-                sink.as_ref(),
-                sb_handoff.as_ref(),
-                threads.get(ctx.tid).map(|thread| &thread.personality),
-            );
+            if !events.is_empty() {
+                let sound = sound_view(
+                    sink.as_ref(),
+                    sb_handoff.as_ref(),
+                    threads.get(ctx.tid).map(|thread| &thread.personality),
+                );
+                let thread = ctx.thread(threads);
+                crate::kernel::console::dispatch(
+                    machine,
+                    &mut *bios_workspace,
+                    &mut ctx.regs,
+                    &mut thread.kernel,
+                    &mut thread.personality,
+                    &mut display,
+                    sound,
+                    events,
+                );
+            }
             let thread = ctx.thread(threads);
-            crate::kernel::console::dispatch(
-                machine,
-                &mut *bios_workspace,
-                &mut ctx.regs,
-                &mut thread.kernel,
-                &mut thread.personality,
-                &mut display,
-                sound,
-                events,
-            );
             if crate::kernel::osd::picker_preview_tid().is_none() {
                 windows.finish_task_switcher();
             }

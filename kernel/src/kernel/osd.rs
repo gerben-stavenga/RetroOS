@@ -1420,7 +1420,7 @@ fn video_mode_line(line: &mut Line) {
         2 => line.put(b"13h 320x200"),
         3 => line.put(b"CGA4 320x200"),
         4 => line.put(b"CGA2 640x200"),
-        5 | 6 | 7 => {
+        5..=7 => {
             line.put(if kind == 5 { b"planar16 " } else if kind == 6 { b"Mode X " } else { b"SVGA " });
             line.put_num(width);
             line.put(b"x");

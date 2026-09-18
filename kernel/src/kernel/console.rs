@@ -24,6 +24,7 @@ pub const F12_PRESS: u8 = 0x58;
 /// Route already-drained input/guest events into the console owner. Kernel
 /// device IRQs were consumed earlier by `irq_dispatch`.
 #[inline(never)]
+#[allow(clippy::too_many_arguments)] // The event loop lends disjoint ownership to the input router.
 pub fn dispatch<A: crate::Arch>(
     machine: &mut A,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -32,17 +33,16 @@ pub fn dispatch<A: crate::Arch>(
     personality: &mut thread::Personality<A>,
     display: &mut Option<crate::kernel::display::Display>,
     sound: crate::kernel::osd::SoundView,
-    events: alloc::vec::Vec<crate::Irq>,
+    events: &mut alloc::vec::Vec<crate::Irq>,
 ) {
-    let mut guest_events = alloc::vec::Vec::with_capacity(events.len());
-    for evt in events {
-        if let crate::Irq::Key(sc) = evt
-            && monitor_key(machine, &mut *bios_workspace, regs, sc, personality, display, sound)
-        {
-            continue;
-        }
-        guest_events.push(evt);
+    if events.is_empty() {
+        return;
     }
+    // Keep the monitor pass ahead of personality delivery: a later F12 in
+    // the same burst may change display ownership before any guest key runs.
+    events.retain(|evt| !matches!(evt, crate::Irq::Key(sc)
+        if monitor_key(machine, &mut *bios_workspace, regs, *sc, personality, display, sound)));
+    let guest_events = events.drain(..);
     match personality {
         thread::Personality::Dos(dos) => {
             let blocked = kt.state == thread::ThreadState::Blocked;
@@ -89,7 +89,7 @@ fn dispatch_dos<A: crate::Arch>(
     regs: &mut Regs,
     blocked: bool,
     dos: &mut thread::DosState<A>,
-    events: alloc::vec::Vec<crate::Irq>,
+    events: impl Iterator<Item = crate::Irq>,
 ) {
     let dp = dos as *mut thread::DosState<A>;
     {
@@ -183,7 +183,7 @@ fn dispatch_linux<A: crate::Arch>(
     _regs: &mut Regs,
     kt: &mut thread::KernelThread<A>,
     linux: &mut thread::LinuxState,
-    events: alloc::vec::Vec<crate::Irq>,
+    events: impl Iterator<Item = crate::Irq>,
 ) {
     let ktp = kt as *mut thread::KernelThread<A>;
     let lp = linux as *mut thread::LinuxState;

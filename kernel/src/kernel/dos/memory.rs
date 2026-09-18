@@ -127,6 +127,7 @@ impl DosMemory {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // Ownership, alignment and address bounds are independent constraints.
     pub fn resize<A: Backing>(
         &mut self,
         machine: &mut A,

@@ -3,15 +3,17 @@
 #
 # Runs every test, skipping any whose prerequisites are absent on this host, so
 # the same script is correct in both places:
-#   - CI (GitHub-hosted: no QEMU, no /dev/kvm, no proprietary assets) runs the
-#     hosted-TCG subset;
+#   - CI installs QEMU/Bochs and requires /dev/kvm, but has no proprietary assets;
 #   - a local run (QEMU + KVM + apps-proprietary present) runs everything.
 #
 # Adding a test: add one `run` line below — it is then covered in CI and
 # locally automatically, gated on its prerequisites.
 #
-# Exits non-zero iff a test that actually RAN failed. Set RETRO_TEST_ONLY to a
+# Exits non-zero if a test fails or a required prerequisite is missing.
+# Set RETRO_TEST_ONLY to a
 # space-separated name list to run a subset (e.g. RETRO_TEST_ONLY="dpmi_hx").
+# RETRO_REQUIRE_KVM=1 makes missing KVM a failure instead of an optional skip.
+# RETRO_REQUIRE_PUBLIC=1 requires every non-proprietary, non-desktop suite.
 set -u
 cd "$(dirname "$0")/.."
 
@@ -19,7 +21,7 @@ pass=0 fail=0 skip=0
 declare -a failed=()
 
 have()      { command -v "$1" >/dev/null 2>&1; }
-kvm()       { [ -r /dev/kvm ] && [ -w /dev/kvm ]; }
+kvm()       { { : <> /dev/kvm; } 2>/dev/null; }
 qemu_prop() { have qemu-system-i386 && [ -e apps-proprietary ]; }
 bazel_tool() { have bazelisk || have bazel; }
 module_tools() { have bazelisk && have debugfs && have mkfs.ext4; }
@@ -28,6 +30,9 @@ python3_test() { have python3; }
 qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
+qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
+qemu_audio_kvm() { qemu_audio && kvm; }
+bochs_tools() { bazel_tool && have bochs && have python3 && have mcopy && have mtype && have setsid; }
 grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
@@ -40,10 +45,11 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 unit() {
     bz test --platforms=@platforms//host \
         //arch-abi:arch_abi_test //kernel:kernel_unit_test \
-        //lib:sound_test //lib:vga_test \
+        //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test \
+        //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
-unit_kvm() { bz test --platforms=@platforms//host //arch-interp:arch-interp-kvm-test; }
+unit_kvm() { bz test --platforms=@platforms//host --test_env=RETRO_REQUIRE_KVM=1 //arch-interp:arch-interp-kvm-test; }
 
 # run <name> <gate-fn|-> <cmd...>
 run() {
@@ -52,6 +58,11 @@ run() {
         return
     fi
     if [ "$gate" != "-" ] && ! "$gate"; then
+        if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [[ "$gate" != qemu_prop && "$gate" != box86 ]]; } \
+            || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [[ "$gate" = kvm || "$gate" = qemu_audio_kvm ]]; }; then
+            printf 'FAIL  %-14s (required prerequisite: %s)\n' "$name" "$gate"
+            fail=$((fail + 1)); failed+=("$name"); return
+        fi
         printf 'SKIP  %-14s (prereq: %s)\n' "$name" "$gate"; skip=$((skip + 1)); return
     fi
     printf '\n========== RUN %s ==========\n' "$name"
@@ -69,10 +80,14 @@ run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
 run module_program module_qemu   bash test/grub_module_program.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
-run hosted_games -         bash test/hosted_games.sh
-run lfn          -         python3 test/lfn.py
-run dpmi_hx      -         bash test/dpmi_hx.sh
-run xms          -         bash test/xms.sh
+run hosted_games -         env ENGINE=tcg bash test/hosted_games.sh
+run lfn          -         env ENGINE=tcg python3 test/lfn.py
+run dpmi_hx      -         env ENGINE=tcg bash test/dpmi_hx.sh
+run xms          -         env ENGINE=tcg bash test/xms.sh
+run hosted_games_kvm kvm   env ENGINE=kvm bash test/hosted_games.sh
+run lfn_kvm      kvm       env ENGINE=kvm python3 test/lfn.py
+run dpmi_hx_kvm  kvm       env ENGINE=kvm bash test/dpmi_hx.sh
+run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm
@@ -80,14 +95,21 @@ run unit_kvm     kvm       unit_kvm
 
 run hostfs_protocol python3_test python3 test/hostfs_protocol.py
 run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
+run audio_pcm_unit python3_test python3 test/audio_steady_unit.py
 
 # --- QEMU HostFS integration (requires QEMU and Python) ---------------------
 run qemu_hostfs_lifecycle_com1 qemu_hostfs bash test/qemu_hostfs_lifecycle.sh com1
 run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
 run qemu_serial_logging qemu_serial bash test/qemu_serial_logging.sh
+run audio_matrix qemu_audio bash test/audio_matrix.sh
+run audio_matrix_kvm qemu_audio_kvm bash test/audio_matrix.sh --kvm
+run audio_steady qemu_audio bash test/audio_steady.sh
+run audio_steady_kvm qemu_audio_kvm bash test/audio_steady.sh --kvm
 
 run dpmi_smoke   qemu_prop bash test/dpmi_smoke.sh   # qemu + BORLANDC/BCC
 run dark_smoke   qemu_prop bash test/dark_smoke.sh   # qemu + DFORCES
+# --- Bochs metal backend, public probes with a headless SDL driver --------
+run bochs_smoke  bochs_tools bash test/bochs_smoke.sh
 # --- Real Sound Blaster 16: 86Box is the only faithful one -----------------
 # Never runs in CI (GUI app, no display on a hosted runner), and that is the
 # point of listing it: the SB passthrough path has no other oracle, so a local

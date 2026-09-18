@@ -2,7 +2,7 @@
 # HX DPMI conformance test.
 #
 # Runs Japeth's DPMI probe (TESTS/DPMI.EXE, from the HX DOS Extender — freeware,
-# see test/dpmi/HX-CREDITS.txt) under the hosted TCG backend and asserts that
+# see test/dpmi/HX-CREDITS.txt) under the selected hosted engine and asserts that
 # RetroOS's DPMI 0.90 host answers the probe with a full, sane state dump and
 # the client survives the real<->protected mode round-trips.
 #
@@ -16,14 +16,15 @@
 # Exits 0 on PASS, 1 on FAIL.
 set -e -o pipefail
 cd "$(dirname "$0")/.."
+source test/lib/hosted_common.sh
 
 bazelisk build //:image 2>&1 | tail -1
-bazelisk build //kernel:retroos-host --platforms=@platforms//host 2>&1 | tail -1
+bazelisk build "//kernel:$HOST_TARGET" --platforms=@platforms//host 2>&1 | tail -1
 
 LOG=/tmp/dpmi-hx.log
 # Hosted backend routes the DOS program's INT 21h console output to stdout,
 # so the probe's dump lands in the log for content assertions.
-timeout 40 bazel-bin/kernel/retroos-host --cmd "TESTS/DPMI.EXE -r" bazel-bin/image.bin \
+timeout 40 "$HOST_BIN" --cmd "TESTS/DPMI.EXE -r" bazel-bin/image.bin \
     </dev/null > "$LOG" 2>&1 || true
 
 fail() { echo "FAIL: $1"; echo "----- last 30 log lines -----"; tail -30 "$LOG"; exit 1; }

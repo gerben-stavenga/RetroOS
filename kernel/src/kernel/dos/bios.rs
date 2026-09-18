@@ -1890,7 +1890,7 @@ fn synthetic_vbe_mode_info<A: crate::Arch>(
     // 64 KiB window into a simultaneous linear framebuffer.
     machine.write::<u32>(
         lin + 0x28,
-        if linear { super::machine::vga::svga_lfb_base() as u32 } else { 0 },
+        if linear { super::machine::vga::svga_lfb_base() } else { 0 },
     );
     machine.write::<u16>(lin + 0x32, linear_pitch);
     machine.write::<u8>(lin + 0x35, linear_pages);

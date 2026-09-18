@@ -110,10 +110,8 @@ fn decode_sel(sel: u16) -> kvm_segment {
 }
 
 /// Build sregs + regs from the kernel's `Regs` and enter-able mode, then load
-/// them into the vcpu. Unconditional per entry (like the TCG trampoline, which
-/// also rewrites everything) — and `KVM_SET_SREGS` resets the vcpu's MMU
-/// context, which is exactly the TLB flush the kernel's host-side page-table
-/// edits require before re-entry.
+/// them into the vcpu. Host-side page-table edits require an explicit CR3
+/// change: setting identical SREGS does not flush cached guest translations.
 fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
     let ldt_limit = ensure_tables();
 
@@ -244,6 +242,15 @@ fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
         }
     }
 
+    if super::take_tlb_dirty() {
+        // Toggle PWT, retaining the same valid root address in both legacy
+        // and long mode. No guest instructions run with this temporary state.
+        // Restoring CR3 below forces a change even if the previous guest CR3
+        // happened to match the temporary value. PCID and PGE are disabled.
+        let mut flush_sregs = sregs;
+        flush_sregs.cr3 ^= 1 << 3;
+        k.vcpu.set_sregs(&flush_sregs).expect("KVM_SET_SREGS flush");
+    }
     k.vcpu.set_sregs(&sregs).expect("KVM_SET_SREGS");
     k.vcpu.set_regs(&regs).expect("KVM_SET_REGS");
 }
@@ -364,7 +371,7 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             // KVM silently dropped their POPF/IRET IF-restores (DOOM hung at
             // I_StartupTimer with VIF=0). The guest-visible IOPL in `eflags`
             // is a VME artifact, never trusted (see set_vm86_flags).
-            let viopl = r.frame.rflags & IOPL_MASK as u64;
+            let viopl = r.frame.rflags & IOPL_MASK;
             r.frame.rflags = (fl & !IOPL_MASK) | VM_FLAG | viopl | tf_shadows;
         }
         UserMode::Mode32 => {
@@ -385,7 +392,7 @@ fn store_segs_flags(r: &mut Regs, mode: UserMode, eflags: u32, segs: [u32; 6]) {
             // strips TF out of RFLAGS while GUESTDBG_SINGLESTEP is on
             // (`kvm_get_rflags`), so the CPU cannot tell us whether a step is
             // still pending. The monitor owns that bit; carry it across the run.
-            let viopl = r.frame.rflags & IOPL_MASK as u64;
+            let viopl = r.frame.rflags & IOPL_MASK;
             let tf = if r.forced_tf() {
                 r.frame.rflags & TF_FLAG as u64
             } else {
@@ -428,8 +435,8 @@ fn io_insn_len(vcpu: &crate::vcpu::Vcpu, port: u16) -> u32 {
         match b {
             // Legacy prefixes (operand/address size, rep, lock, seg overrides).
             0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3 | 0x2E | 0x36 | 0x3E | 0x26 | 0x64 | 0x65 => len += 1,
-            0xE4 | 0xE5 | 0xE6 | 0xE7 => return len + 2, // in/out acc, imm8
-            0xEC | 0xED | 0xEE | 0xEF => return len + 1, // in/out acc, dx
+            0xE4..=0xE7 => return len + 2, // in/out acc, imm8
+            0xEC..=0xEF => return len + 1, // in/out acc, dx
             0x6C..=0x6F => panic!(
                 "string I/O on IOPB-allowed port {port:#x} — unsupported; keep the port trapped"
             ),
@@ -484,6 +491,7 @@ fn apply_guest_debug(k: &mut KvmCpu, step: bool) {
 }
 
 /// Run the current Vcpu (`REGS`) until the next kernel-visible event.
+#[allow(clippy::deref_addrof)] // Form a raw pointer before borrowing the live static.
 pub fn execute() -> KernelEvent {
     with(|k| loop {
         // Off-thread VGA snapshot / live terminal paint (CPU thread only).
@@ -744,7 +752,7 @@ fn dispatch_shim(
             crate::paging::space_cow_fault(cr2)
         };
         if resolved {
-            return None; // re-enter at the faulting IP (SET_SREGS reflushes the TLB)
+            return None; // page-table mutation marked the next entry for a TLB flush
         }
         vcpu.err_code = f.err_code as u64;
         return Some(KernelEvent::PageFault { addr: cr2 });

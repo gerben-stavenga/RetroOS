@@ -5,9 +5,8 @@
 # one engine mis-executed something — a far tighter net than "didn't panic",
 # which is all the per-engine game cases can assert.
 #
-# Skips cleanly (exit 0) when /dev/kvm is unavailable, so CI stays green on
-# runners without virtualization.
-set -uo pipefail
+# Requires /dev/kvm; run_all.sh owns optional prerequisite skips.
+set -euo pipefail
 cd "$(dirname "$0")/.."
 
 IMG=bazel-bin/image.bin
@@ -15,8 +14,8 @@ TCG=bazel-bin/kernel/retroos-host
 KVM=bazel-bin/kernel/retroos-host-kvm
 
 if ! { : <> /dev/kvm; } 2>/dev/null; then
-    echo "SKIP: /dev/kvm unavailable — differential engine test not run"
-    exit 0
+    echo "FAIL: /dev/kvm unavailable — differential engine test not run" >&2
+    exit 1
 fi
 bazelisk build //:image >/dev/null
 bazelisk build //kernel:retroos-host //kernel:retroos-host-kvm \

@@ -69,9 +69,11 @@ pub(crate) struct ShimFrame64 {
     pub vector: u8,
     pub err_code: u32,
     pub rip: u64,
+    #[allow(dead_code)] // Retain the complete frame for diagnostic Debug output.
     pub cs: u32,
     pub rflags: u64,
     pub rsp: u64,
+    #[allow(dead_code)] // Retain the complete frame for diagnostic Debug output.
     pub ss: u32,
 }
 
@@ -232,6 +234,7 @@ pub(crate) fn write_shim() {
 /// The IOPB policy window: ports 0..0x3E0, matching metal
 /// (`arch-metal/src/descriptors.rs` — every port the kernel's io_policy ever
 /// grants lives below 0x3E0). Everything above stays permanently denied.
+#[cfg(test)]
 const IOPB_PORTS: u16 = 0x3E0;
 
 /// One-time shim init shared by setup and IOPB policy installation.
@@ -249,6 +252,7 @@ pub(super) fn ensure_shim() {
 /// Clear a port range's deny bits (kernel policy grant). SHIM_PORT stays
 /// denied unconditionally — a CPL3 `out 0xF4` must #GP into the real shim,
 /// never fabricate a shim exit.
+#[cfg(test)]
 pub(super) fn iopb_allow(port: u16, count: usize) {
     ensure_shim();
     let end = port.saturating_add(count as u16).min(IOPB_PORTS);
@@ -268,6 +272,7 @@ pub(super) fn iopb_allow(port: u16, count: usize) {
 }
 
 /// Back to all-deny (per swap-in, like metal's io_policy baseline).
+#[cfg(test)]
 pub(super) fn iopb_reset() {
     ensure_shim();
     for tss in [TSS_ADDR, TSS64_ADDR] {

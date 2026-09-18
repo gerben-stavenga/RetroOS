@@ -11,7 +11,7 @@ use arch_abi::Arch;
 use super::*;
 use crate::space::RootPageTable;
 use crate::sysdesc::{VIF_FLAG, VM_FLAG};
-use arch_abi::{GuestBytes, KernelEvent, Regs, Vcpu, USER_CS, USER_DS};
+use arch_abi::{GuestBytes, KernelEvent, Regs, USER_CS, USER_DS};
 
 fn kvm_available() -> bool {
     kvm_ioctls::Kvm::new().is_ok()
@@ -76,6 +76,17 @@ fn kvm_engine_proofs() {
     assert_eq!(r.rax as u16, 0x1234, "mov ax retired before the INT");
     assert_eq!(r.ip32(), 0x7C05, "monitor advanced IP past the INT");
     assert!(r.flags32() & (VM_FLAG as u32) != 0, "still VM86 after the trap");
+
+    // A host page-table edit at an unchanged CR3 must invalidate instruction
+    // fetches too. Keep both frames alive and exchange their mappings so the
+    // allocator cannot accidentally reuse the original physical page.
+    mem.copy_to(0x8C00, &[0xB8, 0x78, 0x56, 0xCD, 0x31]);
+    crate::mmu::swap_entries(7, 8, 1);
+    let mut remapped = r;
+    remapped.set_ip32(0x7C00);
+    set_regs(remapped);
+    assert!(matches!(run_to_event(), KernelEvent::SoftInt(0x31)));
+    assert_eq!(regs().rax as u16, 0x5678, "execute the remapped frame, not a stale TLB entry");
 
     // ── Flat PM: a store to an unmapped page (demand-#PF resolved inside the
     // engine), then `int 0x80` → SoftInt(0x80). Exercises: CPL3 PM entry with

@@ -375,7 +375,7 @@ fn swap_regs(regs: &mut Regs) {
         let p = &raw mut REGS;
         unsafe { core::mem::swap(regs, &mut (*p).regs); }
     } else {
-        unsafe { core::mem::swap(regs, &mut *execute); }
+        unsafe { core::ptr::swap(regs, execute); }
     }
 }
 

@@ -12,7 +12,7 @@
 #           and the write-status busy flicker that real chips have, so
 #           testing SB against it would validate our workarounds instead of
 #           our design.
-#   86Box — the SB reference (not yet wired up, see below). It models a real
+#   86Box — the SB reference (test/sb_86box.sh). It models a real
 #           SB16/Pro faithfully, so the passthrough/native path and the
 #           physical-configuration sweep belong there.
 #
@@ -23,11 +23,16 @@
 # and that is the property under test.
 #
 # Usage: test/audio_matrix.sh [--kvm]
-set -u
+set -uo pipefail
 cd "$(dirname "$0")/.."
-LOG_DIR="${TMPDIR:-/tmp}/audio_matrix.$$"
-mkdir -p "$LOG_DIR"
+source test/lib/qemu_common.sh
+qemu_bazel build //:image //kernel:kernel_elf || exit 1
+LOG_DIR=$(mktemp -d -t retroos-audio-matrix.XXXXXX)
 ACCEL=(); [ "${1:-}" = "--kvm" ] && ACCEL=(--kvm)
+pid=""
+trap 'qemu_stop_and_reap "$pid"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # probe:expected-markers
 PROBES=(
@@ -42,10 +47,19 @@ for sink in "${SINKS[@]}"; do
   for entry in "${PROBES[@]}"; do
     prog="${entry%%:*}"; expect="${entry#*:}"
     log="$LOG_DIR/$sink-$(basename "$prog").log"
-    QEMU_DISPLAY=none timeout 60 ./run.sh qemu "${ACCEL[@]}" --arch x64 \
-        --sound "$sink" --cmd "$prog" > "$log" 2>&1
+    AUDIO_BACKEND=none QEMU_DISPLAY=none timeout --kill-after=5 90 \
+        ./run.sh qemu "${ACCEL[@]}" --arch x64 --firmware uefi -i image \
+        --sound "$sink" --cmd "$prog" > "$log" 2>&1 &
+    pid=$!
+    # Both probes wait for a key after their last verdict.
+    qemu_wait_for_log "$log" "${expect##* }\|KERNEL PANIC\|panicked\|-FAIL" 90 "$pid" || true
+    qemu_stop_and_reap "$pid"
+    pid=""
     missing=()
     for e in $expect; do grep -aq "$e" "$log" || missing+=("$e"); done
+    if grep -aqE 'KERNEL PANIC|panicked|SEGV|-FAIL' "$log"; then
+        missing+=("no-crash-or-failure")
+    fi
     if [ ${#missing[@]} -eq 0 ]; then
         pass=$((pass+1)); printf '%-10s %-22s ok\n' "$sink" "$(basename "$prog")"
     else
@@ -59,12 +73,5 @@ done
 echo
 echo "audio_matrix: $pass passed, $fail failed (logs in $LOG_DIR)"
 echo
-echo "NOT COVERED HERE — the native/passthrough SB sweep (physical base, IRQ,"
-echo "8-bit and 16-bit channel, x SB_AUDIO=native|mixed) belongs on 86Box,"
-echo "whose SB16 model is faithful. Wiring it up needs 86Box's per-device"
-echo "config keys, which its AppImage does not expose to grep: run it once"
-echo "with sndcard=sb16, let it write its defaults, and read the section it"
-echo "generates. The invariant to assert there is the same one: BLASTER is"
-echo "what the guest sees, so SBTEST's three markers must hold no matter"
-echo "where the real card is strapped."
+echo "Native SB16 coverage: test/sb_86box.sh (not a physical-configuration sweep)."
 [ "$fail" -eq 0 ]

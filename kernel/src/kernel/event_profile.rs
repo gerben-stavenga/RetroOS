@@ -198,10 +198,13 @@ pub(super) fn visit_dos_file_reads(mut visit: impl FnMut(u16, u64, u64, u64, u64
     }
 }
 
+/// kind, key, CS, IP, calls, guest cycles, dispatch cycles, maximum dispatch.
+pub(super) type EventSummary = (u32, u32, u32, u32, u64, u64, u64, u64);
+
 /// Return the busiest event classes in descending dispatch-cycle order for
 /// the serial-control profiler. A bounded list keeps the reply well below the
 /// UART timeout while retaining every material kernel-side cost.
-pub(super) fn top(limit: usize) -> alloc::vec::Vec<(u32, u32, u32, u32, u64, u64, u64, u64)> {
+pub(super) fn top(limit: usize) -> alloc::vec::Vec<EventSummary> {
     let mut counters: alloc::vec::Vec<_> = unsafe { &*core::ptr::addr_of!(COUNTERS) }
         .iter()
         .filter(|counter| counter.calls != 0)
@@ -216,7 +219,7 @@ pub(super) fn top(limit: usize) -> alloc::vec::Vec<(u32, u32, u32, u32, u64, u64
             counter.max_dispatch,
         ))
         .collect();
-    counters.sort_unstable_by(|left, right| right.6.cmp(&left.6));
+    counters.sort_unstable_by_key(|counter| core::cmp::Reverse(counter.6));
     counters.truncate(limit);
     counters
 }

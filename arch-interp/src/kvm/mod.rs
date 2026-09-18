@@ -16,22 +16,31 @@ mod tests;
 
 pub use run::execute;
 
-/// Host-side page-table edits invalidated guest translations. The execute loop
-/// re-loads SREGS (CR3 included) on every guest entry — KVM resets the vcpu's
-/// MMU context on that path — so the flush is inherent and nothing needs
-/// recording; the hook exists as the engine-seam contract point (and becomes
-/// real state if entry ever moves to dirty-tracked SREGS reloads).
-pub fn mark_tlb_dirty() {}
+std::thread_local! {
+    static TLB_DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Host writes to guest page tables do not invalidate the CPU's translations.
+/// Reinstalling identical SREGS is insufficient: entry must force a CR3 change.
+pub fn mark_tlb_dirty() {
+    TLB_DIRTY.with(|dirty| dirty.set(true));
+}
+
+pub(super) fn take_tlb_dirty() -> bool {
+    TLB_DIRTY.with(|dirty| dirty.replace(false))
+}
 
 /// IOPB fast path: allow direct `KVM_EXIT_IO` for a port range by clearing
 /// its bits in the guest TSS I/O bitmap (kernel io_policy grants — real
 /// passthrough hardware only; the hosted platform's emulated VGA keeps its
 /// ports trapped through the shim + monitor).
+#[cfg(test)]
 pub fn allow_io_ports(port: u16, count: usize) {
     shim::iopb_allow(port, count)
 }
 
 /// Reset the guest TSS I/O bitmap to all-deny (per swap-in, like metal).
+#[cfg(test)]
 pub fn reset_io_bitmap() {
     shim::iopb_reset()
 }

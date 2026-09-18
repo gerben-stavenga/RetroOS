@@ -1124,6 +1124,9 @@ EOF
         rm -f "${VM_DIR}/disk.img"
         cp --reflink=auto "${SCRIPT_DIR}/bazel-bin/${IMAGE_FILE}" "${VM_DIR}/disk.img"
         chmod u+rw "${VM_DIR}/disk.img"
+        if [ -n "$HOSTED_CMD" ]; then
+            inject_test_cmd "$VM_DIR/disk.img" "$HOSTED_CMD"
+        fi
         # Exact geometry for the RetroOS raw image, rewritten for Bochs' CHS limits:
         # 8448 cylinders * 16 heads * 16 sectors * 512 bytes = 1,107,296,256 bytes.
         { bochsrc_preamble
@@ -1141,6 +1144,11 @@ EOF
     fi
 
     if [ -n "${BOCHS_DISPLAY_LIBRARY:-}" ]; then
+        # Permit SDL's headless driver for automated full-depth VBE probes.
+        local sdl_env=()
+        if [ -n "${SDL_VIDEODRIVER:-}" ]; then
+            sdl_env+=("SDL_VIDEODRIVER=$SDL_VIDEODRIVER")
+        fi
         exec env -i \
             PATH="/usr/bin:/bin:/usr/local/bin" \
             HOME="$HOME" \
@@ -1149,6 +1157,7 @@ EOF
             XAUTHORITY="${XAUTHORITY:-$HOME/.Xauthority}" \
             XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
             DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+            "${sdl_env[@]}" \
             "$BOCHS_BIN" "${BOCHS_ARGS[@]}" "${PASS[@]}" "display_library: ${BOCHS_DISPLAY_LIBRARY}"
     fi
 

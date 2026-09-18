@@ -56,6 +56,10 @@ fn read_entry(ppage: u64, i: usize) -> u32 {
 /// twin's invalidation generation (see `active_pml4`).
 fn write_entry(ppage: u64, i: usize, v: u32) {
     LONG_GEN.with(|g| g.set(g.get() + 1));
+    // Includes demand paging and host-side COW resolution, which can happen
+    // through GuestBytes without passing through an arch mapping call.
+    #[cfg(feature = "kvm")]
+    crate::kvm::mark_tlb_dirty();
     unsafe {
         let p = phys::frame_ptr(ppage).add(i * 4) as *mut u32;
         p.write_unaligned(v);
