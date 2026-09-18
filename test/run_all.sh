@@ -114,10 +114,17 @@ run() {
         return
     fi
     if [ "$gate" != "-" ] && ! "$gate"; then
+        # RETRO_REQUIRE_KVM guards the HOSTED engine's tests, whose only
+        # prerequisite is that /dev/kvm opens: if the device is there and they
+        # do not run, coverage was lost silently. qemu_audio_kvm is not in that
+        # bucket — it probes whether qemu can actually boot a guest under kvm,
+        # which /dev/kvm opening does not imply, and skips honestly when it
+        # cannot (a GitHub runner's nested virt).
         local needs_kvm=0
-        [[ "$gate" = kvm || "$gate" = qemu_audio_kvm ]] && needs_kvm=1
+        [ "$gate" = kvm ] && needs_kvm=1
         if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [ "$needs_kvm" = 0 ] \
-                && [[ "$gate" != qemu_prop && "$gate" != box86 ]]; } \
+                && [[ "$gate" != qemu_prop && "$gate" != box86 \
+                      && "$gate" != qemu_audio_kvm ]]; } \
             || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [ "$needs_kvm" = 1 ]; }; then
             printf 'FAIL  %-14s (required prerequisite: %s)\n' "$name" "$gate"
             fail=$((fail + 1)); failed+=("$name"); return
