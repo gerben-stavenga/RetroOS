@@ -63,7 +63,16 @@ def main():
                 if proc.poll() is not None or time.monotonic() > deadline:
                     dump(log, f"HDA did not start (qemu rc={proc.poll()})")
                 time.sleep(0.1)
-            # Leave ten seconds for the game to load and the pacer to settle.
+            # Wait for the game to be RUNNING, not for a fixed delay: DOOM's
+            # own startup banner is the only host-speed-independent signal.
+            # A slow TCG runner spent the whole fixed settle+window still in
+            # startup and recorded real silence, which read as a dropout bug.
+            deadline = time.monotonic() + 300
+            while "ST_Init" not in log.read_text(errors="replace"):
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    dump(log, f"game never started (qemu rc={proc.poll()})")
+                time.sleep(0.1)
+            # Then let the mixer and pacer settle before measuring.
             measurement_start = time.monotonic() + 10
             deadline = measurement_start + args.seconds
             initial_underruns = None

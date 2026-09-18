@@ -145,6 +145,26 @@ jobs:
            done
           done
 
+      # TEMPORARY probe (remove once the CPU model is settled): QEMU under the
+      # runner's NESTED kvm exits 0 in about a second with no firmware output,
+      # which -no-reboot makes look like a clean shutdown. Our own hosted KVM
+      # engine works here, so the question is which -cpu model nested kvm will
+      # actually boot a full firmware guest.
+      - name: Probe QEMU under nested KVM
+        continue-on-error: true
+        run: |
+          img=$(bazel info bazel-bin)/image.bin
+          for cpu in host max qemu64 "Nehalem"; do
+            echo "=== -cpu $cpu"
+            timeout 40 qemu-system-x86_64 -accel kvm -cpu "$cpu" -m 256 \
+              -display none -no-reboot -debugcon stdio -serial none \
+              -drive file="$img",format=raw,if=ide 2>&1 | head -25
+            echo "--- rc=$?"
+          done
+          echo "=== accel/cpu availability"
+          qemu-system-x86_64 -accel help || true
+          egrep -o 'vmx|svm|hypervisor' /proc/cpuinfo | sort -u || true
+
       # Run both hosted engines and the public QEMU/Bochs integration tests.
       # Proprietary assets and the interactive 86Box reference remain local.
       # New tests are wired up by adding a line to test/run_all.sh.
