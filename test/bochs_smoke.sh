@@ -36,13 +36,16 @@ run_probe() {
     local completion='All commands done'
     # SVGAPROBE deliberately waits for a key after its final success marker.
     [ "$name" != vbe ] || completion='VBE-ALL-OK'
-    # SDL_AUDIODRIVER too, not just video: on a machine with no sound card
-    # (CI) SDL's ALSA backend fails to open the default PCM and then dies
-    # with "*** buffer overflow detected ***", taking the probe with it.
+    # No sound card on a CI runner: Bochs' own lowlevel sound driver defaults
+    # to ALSA, fails to open the default PCM and then dies with "*** buffer
+    # overflow detected ***", taking the probe with it. These probes are XMS,
+    # DPMI and VBE — sound plays no part — so point every lowlevel driver at
+    # 'dummy'. SDL_* keeps SDL itself off the host's devices as well.
     VM_DIR="$work/$name" BOCHS_DISPLAY_LIBRARY=sdl2 SDL_VIDEODRIVER=dummy \
         SDL_AUDIODRIVER=dummy \
         setsid ./run.sh bochs -i image --cmd "$command" \
-        'panic: action=fatal' 'speaker: enabled=0' >"$log" 2>&1 &
+        'panic: action=fatal' 'speaker: enabled=0' \
+        'sound: waveoutdrv=dummy, waveindrv=dummy, midioutdrv=dummy' >"$log" 2>&1 &
     pid=$!
     # Also stop on an early guest exit or panic; marker checks below still
     # require success. DPMI includes benchmarks, so allow slower CI CPUs.

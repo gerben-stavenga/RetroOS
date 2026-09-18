@@ -153,17 +153,30 @@ jobs:
       - name: Probe QEMU under nested KVM
         continue-on-error: true
         run: |
-          img=$(bazel info bazel-bin)/image.bin
-          for cpu in host max qemu64 "Nehalem"; do
+          # A writable COPY: bazel's outputs are read-only, and a raw -drive is
+          # opened read-write (the first attempt at this probe measured only
+          # its own "Permission denied").
+          cp "$(bazel info bazel-bin)/image.bin" /tmp/probe.img
+          chmod u+w /tmp/probe.img
+          for cpu in host max qemu64 Nehalem; do
             echo "=== -cpu $cpu"
+            set +e
             timeout 40 qemu-system-x86_64 -accel kvm -cpu "$cpu" -m 256 \
               -display none -no-reboot -debugcon stdio -serial none \
-              -drive file="$img",format=raw,if=ide 2>&1 | head -25
+              -drive file=/tmp/probe.img,format=raw,if=ide >/tmp/probe.out 2>&1
             echo "--- rc=$?"
+            set -e
+            head -20 /tmp/probe.out
+            wc -l /tmp/probe.out
           done
-          echo "=== accel/cpu availability"
-          qemu-system-x86_64 -accel help || true
-          egrep -o 'vmx|svm|hypervisor' /proc/cpuinfo | sort -u || true
+          echo "=== same guest under TCG, for comparison"
+          set +e
+          timeout 40 qemu-system-x86_64 -accel tcg -m 256 \
+            -display none -no-reboot -debugcon stdio -serial none \
+            -drive file=/tmp/probe.img,format=raw,if=ide >/tmp/probe-tcg.out 2>&1
+          echo "--- rc=$?"
+          set -e
+          head -20 /tmp/probe-tcg.out
 
       # Run both hosted engines and the public QEMU/Bochs integration tests.
       # Proprietary assets and the interactive 86Box reference remain local.
