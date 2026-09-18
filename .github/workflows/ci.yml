@@ -117,28 +117,32 @@ jobs:
           # all we get; a backtrace names the call site that tripped it.
           RUST_BACKTRACE: "1"
         run: |
-          gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
-            -o /tmp/hello.elf test/hosted/hello.c
+          for src in hello outlive_composite; do
+            gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
+              -o "/tmp/$src.elf" "test/hosted/$src.c"
+          done
           # The program prints its greeting then exit(0)s; cap with timeout.
           runners=retroos-host
           [ "$RETRO_REQUIRE_KVM" = 1 ] && runners="$runners retroos-host-kvm"
           for runner in $runners; do
-            echo "== $runner"
+           for guest in hello outlive_composite; do
+            echo "== $runner $guest"
             # Print what the runner said BEFORE asserting on it. Under `bash -e`
             # a failing command substitution ends the step with the output still
             # inside $out, which is how a SIGABRT here first showed up as a bare
             # "exit code 134" with no message to diagnose.
             set +e
-            out=$(timeout 20 "bazel-bin/kernel/$runner" /tmp/hello.elf 2>&1)
+            out=$(timeout 30 "bazel-bin/kernel/$runner" "/tmp/$guest.elf" 2>&1)
             rc=$?
             set -e
             echo "$out"
             if [ "$rc" != 0 ]; then
-              echo "$runner exited $rc"
+              echo "$runner exited $rc on $guest"
               exit 1
             fi
             echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
             if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
+           done
           done
 
       # Run both hosted engines and the public QEMU/Bochs integration tests.
