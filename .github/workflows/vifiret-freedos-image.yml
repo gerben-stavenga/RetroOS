@@ -1,0 +1,27 @@
+name: vifiret-freedos-image
+
+# Uploads the HDPMI32I+SETPVI+VIFIRET FreeDOS HDD zip as a GitHub Actions
+# artifact (download from the run page). Rebuild the zip locally with
+# bash test/hdpmi_vif_img/make.sh before pushing if VIFIRET.COM changed.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'test/hdpmi_vif_img/**'
+      - '.github/workflows/vifiret-freedos-image.yml'
+  pull_request:
+    paths:
+      - 'test/hdpmi_vif_img/**'
+      - '.github/workflows/vifiret-freedos-image.yml'
+
+jobs:
+  artifact:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vifiret-hdpmi-freedos
+          path: test/hdpmi_vif_img/vifiret-hdpmi-freedos.zip
+          if-no-files-found: error
+          retention-days: 90

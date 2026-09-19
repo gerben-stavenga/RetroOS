@@ -19,6 +19,9 @@ rust-project.json
 # Proprietary binaries (not for public distribution)
 apps-proprietary/
 
+# Generated 16 MiB VIFIRET FreeDOS HDD (rebuild: test/hdpmi_vif_img/make.sh)
+test/hdpmi_vif_img/vifiret-hdpmi.img
+
 # FreeDOS install media + persistent HDD (huge binaries; user-local)
 freedos/*.iso
 freedos/*.ISO
