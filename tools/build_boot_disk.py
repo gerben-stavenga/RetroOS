@@ -182,16 +182,20 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
 
     mcopy(kernel, "/kernel.elf")
 
-    # C:\BOOT in the dev loop, mounted over the data disk's own BOOT directory.
+    # The DOS userland published as C:\BOOT in the dev loop.  The tree is
+    # copied at the volume root and already carries its own BOOT/ prefix, so
+    # the layout on the partition mirrors the layout in the tar exactly.
     if boot_tree:
-        mmd("/BOOT")
         for root, dirs, files in os.walk(boot_tree):
             rel = os.path.relpath(root, boot_tree)
-            prefix = "/BOOT" if rel == "." else "/BOOT/" + rel.replace(os.sep, "/")
+            prefix = "" if rel == "." else "/" + rel.replace(os.sep, "/")
             for d in sorted(dirs):
                 mmd(prefix + "/" + d)
             for name in sorted(files):
-                mcopy(os.path.join(root, name), prefix + "/" + name)
+                src = os.path.join(root, name)
+                if os.path.islink(src) or not os.path.isfile(src):
+                    continue
+                mcopy(src, prefix + "/" + name)
 
 
 def build_efi_binary(work, cfg):
@@ -211,7 +215,7 @@ def build_efi_binary(work, cfg):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--kernel", required=True, help="kernel.elf (multiboot)")
-    ap.add_argument("--boot-tree", help="directory published as C:\\BOOT")
+    ap.add_argument("--boot-tree", help="tree copied to the FAT root; carries BOOT/")
     ap.add_argument("--grub-lib", default="/usr/lib/grub/i386-pc")
     ap.add_argument("--size-mb", type=int, default=128)
     ap.add_argument("--timeout", type=int, default=0,

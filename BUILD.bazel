@@ -169,6 +169,7 @@ _EXTRA_FILES = {
     "//test/dos/lfnprobe:lfnprobe_com": "TESTS/LFNPROBE.COM",
     "//test/dos/int13_com:int13_com":     "TESTS/INT13T.COM",
     "//test/dos/xmsprobe:xmsprobe_com": "TESTS/XMSPROBE.COM",
+    "//test/dos/vifiret:vifiret_com": "TESTS/VIFIRET.COM",
     "//test/dos/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
     "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",
@@ -485,6 +486,7 @@ genrule(
         "freedos/hx/HDPMI16.EXE",
         "freedos/hx/HDPMI16D.EXE",
         "freedos/hx/HDPMI32.EXE",
+        "freedos/hx/HDPMI32I.EXE",
         "freedos/hx/SETUPBC.BAT",
     ],
     outs = ["freedos_apps.img"],
@@ -544,6 +546,7 @@ genrule(
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16.EXE" "::HDPMI16.EXE"
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16D.EXE" "::HDPMI16D.EXE"
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32.EXE" "::HDPMI32.EXE"
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32I.EXE" "::HDPMI32I.EXE"
         # SETUPBC.BAT — sets PATH/INCLUDE/LIB for BCC on D: (FreeDOS).
         # Run `D:\\SETUPBC` once after booting to make BCC find its headers.
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/SETUPBC.BAT" "::SETUPBC.BAT"
@@ -658,4 +661,143 @@ sh_binary(
     name = "run",
     srcs = ["run_qemu.sh"],
     data = [":image"],
+)
+
+# ===========================================================================
+# Two-disk layout: a disposable boot disk + a persistent data disk.
+# ===========================================================================
+# The single image conflated two things with opposite lifetimes: the product
+# being built (kernel, bootloader, DOS userland) and the user's world (games,
+# savegames, installed CDs). Splitting them along the file boundary means a
+# rebuild never has to rewrite guest state, and `--fresh` for the build half is
+# just `rm`.
+#
+#   :boot_disk   GRUB + kernel.elf + C:\BOOT. Rebuilt every launch.
+#   :data_disk   FAT32 C: (FreeDOS-bootable) + ext4 Linux root. Seeded once.
+#
+# See tools/build_boot_disk.py and tools/build_data_disk.py for the layouts and
+# why C: must be FAT and must be C: on both sides.
+
+# C:\BOOT, on the BOOT disk rather than on C: itself: it is versioned with the
+# kernel, so it belongs with the kernel. Paths already carry the BOOT/ prefix.
+pkg_tar(
+    name = "boot_dir_tar",
+    files = _BOOT_DIR_FILES,
+)
+
+# The DOS world that lives on C:. _EXTRA_FILES minus the two things that are
+# NOT DOS content on C:: busybox (the Linux root) and BOOT/ (the boot disk).
+_C_DRIVE_FILES = {
+    k: v
+    for k, v in _EXTRA_FILES.items()
+    if v != "bin/busybox" and not v.startswith("BOOT/")
+}
+
+# Flat at the volume root -- a FAT volume IS C:, so there is no home/retroos
+# prefix to apply here (contrast dos_extras_tar, which prefixes for ext4).
+pkg_tar(
+    name = "c_drive_tar",
+    files = _C_DRIVE_FILES,
+    deps = [
+        ":games_tar",
+        ":ultrasnd_tar",
+        ":tc_tar",
+        ":tp70_tar",
+    ],
+)
+
+# Same, plus the proprietary drop. Its own CONFIG.SYS wins, so ours is dropped
+# rather than shadowed (see dos_extras_tar_proprietary).
+_C_DRIVE_FILES_PROPRIETARY = {
+    k: v
+    for k, v in _C_DRIVE_FILES.items()
+    if k != "etc/CONFIG.SYS"
+}
+
+pkg_tar(
+    name = "c_drive_tar_proprietary",
+    files = _C_DRIVE_FILES_PROPRIETARY,
+    deps = [
+        ":games_tar",
+        ":ultrasnd_tar",
+        ":tc_tar",
+        ":tp70_tar",
+        "//apps-proprietary:tar",
+    ],
+)
+
+_BOOT_DISK_CMD = """
+    set -euo pipefail
+    BOOT_DIR=$$(mktemp -d)
+    tar xf $(location :boot_dir_tar) -C "$$BOOT_DIR"
+    python3 $(location tools/build_boot_disk.py) \
+        --kernel $(location //kernel:kernel_elf) \
+        --boot-tree "$$BOOT_DIR" \
+        --out $@
+    rm -rf "$$BOOT_DIR"
+"""
+
+genrule(
+    name = "boot_disk",
+    srcs = [
+        "//kernel:kernel_elf",
+        ":boot_dir_tar",
+        "tools/build_boot_disk.py",
+    ],
+    outs = ["boot_disk.bin"],
+    cmd = _BOOT_DISK_CMD,
+    # grub-mkimage/grub-mkstandalone and /usr/lib/grub come from the host, as
+    # they already do for :grub_iso.
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+# $(C_TAR) is the C: content; everything else is identical between the
+# shareware and proprietary data disks.
+_DATA_DISK_CMD = """
+    set -euo pipefail
+    C_DIR=$$(mktemp -d)
+    LINUX_DIR=$$(mktemp -d)
+    tar xf $(C_TAR) -C "$$C_DIR"
+    tar xf $(location :bin_tar) -C "$$LINUX_DIR"
+    python3 $(location tools/build_data_disk.py) \
+        --dos-tree "$$C_DIR" \
+        --linux-tree "$$LINUX_DIR" \
+        --freedos-src freedos/sys \
+        --out $@
+    rm -rf "$$C_DIR" "$$LINUX_DIR"
+"""
+
+_FREEDOS_SRCS = [
+    "freedos/sys/bootnorm.asm",
+    "freedos/sys/boot32lb.asm",
+    "freedos/sys/KERNEL.SYS",
+    "freedos/sys/COMMAND.COM",
+]
+
+genrule(
+    name = "data_disk",
+    srcs = [
+        ":c_drive_tar",
+        ":bin_tar",
+        "tools/build_data_disk.py",
+    ] + _FREEDOS_SRCS,
+    outs = ["data_disk.bin"],
+    cmd = _DATA_DISK_CMD.replace("$(C_TAR)", "$(location :c_drive_tar)"),
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "data_disk_proprietary",
+    srcs = [
+        ":c_drive_tar_proprietary",
+        ":bin_tar",
+        "tools/build_data_disk.py",
+    ] + _FREEDOS_SRCS,
+    outs = ["data_disk_proprietary.bin"],
+    cmd = _DATA_DISK_CMD.replace("$(C_TAR)",
+                                 "$(location :c_drive_tar_proprietary)"),
+    local = True,
+    visibility = ["//visibility:public"],
 )
