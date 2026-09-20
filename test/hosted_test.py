@@ -167,8 +167,13 @@ def main():
 
     if fails:
         print("FAIL:", "; ".join(fails))
-        print("--- last 20 log lines ---")
-        print("\n".join(log.splitlines()[-20:]))
+        lines = log.splitlines()
+        # Register dumps can push the actual panic out of a short tail.
+        # Keep the panic and its complete diagnostic in CI failure output.
+        panic = next((i for i, line in enumerate(lines) if "panicked at" in line), None)
+        start = max(0, panic - 1) if panic is not None else max(0, len(lines) - 20)
+        print("--- panic diagnostic ---" if panic is not None else "--- last 20 log lines ---")
+        print("\n".join(lines[start:]))
         if screen:
             print("--- screen ---")
             print(screen)
