@@ -51,12 +51,14 @@ set default=0
 insmod part_msdos
 insmod fat
 
-# The kernel's multiboot header asks for a linear framebuffer; GRUB can only
-# satisfy that with a video driver loaded.  Harmless on BIOS.
-insmod all_video
-insmod efi_gop
-set gfxmode=auto
-set gfxpayload=keep
+# Native BIOS boots keep hardware VGA, including planar and Mode X modes.
+if [ "$grub_platform" = "pc" ]; then
+    set gfxpayload=text
+else
+    insmod all_video
+    set gfxmode=auto
+    set gfxpayload=keep
+fi
 
 menuentry "RetroOS" {{
     search --no-floppy --file /kernel.elf --set=root

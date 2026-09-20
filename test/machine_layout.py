@@ -3,11 +3,15 @@
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "tools"))
+from machine_install import grub_entries
+
 UUID = "ea8c19a0-a2e3-4d14-9fd2-6955c176122c"
 
 
@@ -20,15 +24,11 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False):
     grub = tree / "boot/grub"
     grub.mkdir(parents=True)
     shutil.copyfile(ROOT / "bazel-bin/kernel/kernel.elf", tree / "boot/kernel.elf")
-    (grub / "grub.cfg").write_text(f'''set timeout=0
-menuentry "installed layout" {{
-    insmod all_video
-    set gfxmode=auto
-    set gfxpayload=keep
-    multiboot /boot/kernel.elf retroos.root={uuid} retroos.c-root=/home/retroos retroos.runtime=/boot/retroos/RETROOS
-    boot
-}}
-''')
+    # Boot the actual installer entries, including their firmware/video policy.
+    (grub / "grub.cfg").write_text("set timeout=0\n" + grub_entries({
+        "release": "/boot/retroos", "uuid": uuid, "c_root": "/home/retroos",
+    }).replace(f"search --no-floppy --fs-uuid --set=root {uuid}",
+               f"search --no-floppy --fs-uuid --set=root {UUID}"))
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)
     log = work / (name + ".log")
@@ -64,7 +64,10 @@ menuentry "installed layout" {{
         process.wait(timeout=5)
     text = log.read_text(errors="replace")
     assert expected in text and "LAYOUT-FAIL" not in text, text
-    print("PASS:", name)
+    firmware = "Substitute" if uefi else "NativeBios"
+    assert f"firmware={firmware}" in text, text
+    assert f"vga_passthrough={str(not uefi).lower()}" in text, text
+    print("PASS:", name, firmware)
 
 
 def main():

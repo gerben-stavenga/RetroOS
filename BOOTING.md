@@ -21,6 +21,31 @@ releases and unrelated GRUB entries remain. The obsolete RetroOS entries are
 backed up and replaced by managed entries named
 **RetroOS (current, persistent)** and **RetroOS (current, protected disk)**.
 
+Both disk-protection entries use the same video policy. When GRUB boots through
+legacy BIOS (`grub_platform=pc`), it hands over text mode (`gfxpayload=text`),
+so RetroOS uses native BIOS video and hardware VGA, including planar/Mode X.
+When GRUB boots through UEFI, it keeps the GOP framebuffer and RetroOS uses
+its substitute BIOS and software VGA rendering. RetroOS selects this path from
+the display handoff, not by searching memory for a BIOS ROM. Custom GRUB entries
+should use the same policy: forcing a linear framebuffer on BIOS selects the
+software rendering path too.
+
+Select the firmware boot mode before entering GRUB, using the machine's
+firmware setup or boot-device menu (the key and entry names vary by manufacturer).
+A UEFI entry loads GRUB's EFI executable and reports `grub_platform=efi`.
+A legacy entry starts the disk's BIOS bootloader and reports `grub_platform=pc`.
+
+To use native BIOS video, enable Legacy/CSM if supported and select the legacy
+boot entry. The disk must also have BIOS GRUB installed: enabling CSM alone
+does not install a BIOS bootloader, and selecting a UEFI entry still uses GOP.
+On UEFI-only machines, RetroOS uses its substitute BIOS and software rendering
+to support DOS applications. The RetroOS installer adds menu entries to the
+existing GRUB; it does not install another firmware variant or enable CSM.
+Choosing persistent versus protected inside GRUB only changes disk writes.
+
+After updating RetroOS's installer, rerun preparation and installation to apply
+the generated video policy to an existing machine's GRUB entries.
+
 The generated Multiboot arguments explicitly specify:
 
 ```text

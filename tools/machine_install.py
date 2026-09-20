@@ -50,9 +50,14 @@ def grub_entries(plan):
     insmod part_gpt
     insmod ext2
     insmod multiboot
-    insmod all_video
-    set gfxmode=auto
-    set gfxpayload=keep
+    # Native BIOS boots keep hardware VGA, including planar and Mode X modes.
+    if [ "$grub_platform" = "pc" ]; then
+        set gfxpayload=text
+    else
+        insmod all_video
+        set gfxmode=auto
+        set gfxpayload=keep
+    fi
     search --no-floppy --fs-uuid --set=root {uuid}
     multiboot {release}/kernel.elf {args}{extra}
     boot

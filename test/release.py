@@ -68,6 +68,7 @@ def main():
                 proc.wait(timeout=10)
         text = log.read_text(errors='replace')
         assert 'Hello from HELLO.COM!' in text and 'All commands done' in text, text
+        assert 'vga_passthrough=true firmware=NativeBios' in text, text
         assert 'FATAL' not in text and 'panicked' not in text, text
     print('PASS: release checksums, public data, matched runtime, packaged installer, and prebuilt QEMU launcher')
 
