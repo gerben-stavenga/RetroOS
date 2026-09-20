@@ -20,7 +20,7 @@
 #
 # 86Box is a GUI application with no log to grep, so each probe writes its
 # verdict to a file on C: and this script reads it back out of the disk image
-# afterwards with debugfs — no screen scraping, no root. Three things had to
+# afterwards with mtools — no screen scraping, no root. Three things had to
 # be true for that to work at all, and none of them were until now: the probe
 # needs a command channel (CONFIG.SYS TEST=, since 86Box has no fw_cfg), the
 # guest's writes need to reach the image rather than the volatile RAM overlay,
@@ -64,12 +64,9 @@ if [ -z "${VM_DIR:-}" ]; then
     fi
 fi
 export VM_DIR
-# run.sh -i takes an image KEYWORD, not a path; IMG is the file the same
-# keyword resolves to, which is what debugfs reads the verdicts back out of.
-IMG_KIND="${IMG_KIND:-image}"
-# 86Box runs a COPY inside the VM dir ($VM_DIR/disk.img), not bazel-bin's
-# image, so that copy is where a probe's verdict lands and where we read it.
-IMG="${IMG:-$VM_DIR/disk.img}"
+# A dedicated test image preserves the user's normal shared disk.
+IMG="${IMG:-$VM_DIR/test-data.bin}"
+bazelisk build //:data_disk || exit 1
 
 # Only one probe may use this VM directory at a time.  This also prevents a
 # second test runner from copying a new disk image underneath an active 86Box.
@@ -93,21 +90,13 @@ if [ -n "$existing_vm" ]; then
     exit 2
 fi
 
-# Read a probe's verdict file out of the image the run just used. The DOS C:
-# root is an ext4 subtree, so debugfs reads it without mounting (no root).
+# Verdicts live on the data disk's FAT C: partition.
 read_verdict() {
-    local img="$1" name="$2" part_off part out
+    local img="$1" name="$2" start
     [ -f "$img" ] || return 1
-    # Partition 2 carries the ext4 root with C:; partition 1 is the boot TAR.
-    part_off=$(partx -g -o START -n 2 "$img" 2>/dev/null | tr -d ' ')
-    [ -n "$part_off" ] || return 1
-    # A real file, not <(dd ...): debugfs seeks, and a process substitution is
-    # a pipe — it fails with "Illegal seek" and reads nothing, silently.
-    part=$(mktemp) || return 1
-    dd if="$img" bs=512 skip="$part_off" of="$part" status=none 2>/dev/null
-    out=$(debugfs -R "cat home/retroos/$name" "$part" 2>/dev/null)
-    rm -f "$part"
-    printf '%s' "$out"
+    start=$(partx -g -o START -n 1 "$img" 2>/dev/null | tr -d ' ')
+    [ -n "$start" ] || return 1
+    mtype -i "$img@@$((start * 512))" "::/$name" 2>/dev/null
 }
 
 if [ "${1:-}" = "--learn" ]; then
@@ -116,7 +105,8 @@ if [ "${1:-}" = "--learn" ]; then
     echo "set base/IRQ/DMA, then quit. The section 86Box writes is what a strap"
     echo "sweep needs:"
     echo
-    ./run.sh 86box -i "$IMG_KIND" || true
+    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$IMG" || exit 1
+    ./run.sh 86box --data-image "$IMG" || true
     echo
     echo "--- per-device sections found in $VM_DIR/86box.cfg ---"
     awk '/^\[/{p=0} /Sound Blaster|SB16|sb16/{p=1} p' "$VM_DIR/86box.cfg" 2>/dev/null
@@ -172,8 +162,7 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"
 
 # $1 = probe .COM path on C:, $2 = verdict filename, $3.. = required markers.
 #
-# The probe is launched through CONFIG.SYS's TEST= line (run.sh injects it into
-# this run's disk copy), which is the only command channel 86Box has — it takes
+# The test injects CONFIG.SYS TEST= into its own disposable data disk. 86Box takes
 # no fw_cfg and no command line.
 #
 # We poll for the verdict file rather than wait for the process to exit,
@@ -185,7 +174,8 @@ run_probe() {
     local prog="$1" log="$2"; shift 2
     echo "=== $prog ==="
 
-    setsid ./run.sh 86box -i "$IMG_KIND" --cmd "$prog" >/dev/null 2>&1 &
+    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$IMG" --command "$prog" || return 1
+    setsid ./run.sh 86box --data-image "$IMG" >/dev/null 2>&1 &
     local pid=$! waited=0 verdict=""
     VM_PGID="$pid"
     while [ "$waited" -lt "$PROBE_TIMEOUT" ]; do

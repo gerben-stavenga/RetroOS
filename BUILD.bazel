@@ -1,3 +1,4 @@
+load(":filesystem_layout.bzl", "BOOT_FILES", "DATA_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
@@ -36,7 +37,11 @@ pkg_tar(
 # wiring.
 _GAMES_PREFIX = "apps/games/"
 
-_GAME_SRCS = glob([_GAMES_PREFIX + "**/*"])
+_GAME_SRCS = glob(
+    [_GAMES_PREFIX + "**/*"],
+    # A direct/hosted game run can write state into this source directory.
+    exclude = ["apps/games/skyroads/SKYROADS.CFG"],
+)
 
 pkg_tar(
     name = "games_tar",
@@ -102,36 +107,12 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
-# DN file manager, shipped into C:\BOOT\DN. The WHOLE directory ships — drop
-# DN.ARH / config files in apps-boot/dn and they appear on the next build; no
-# hand-maintained list.
-_DN_FILES = {
-    f: "BOOT/DN/" + f.rsplit("/", 1)[-1]
-    for f in glob(["apps-boot/dn/*"])
-}
-
-# C:\BOOT — the DOS system directory: DN + COMMAND.COM + the launch overrides
-# COMMAND.COM reads. An ORDINARY DIRECTORY on the ext4 root, like C:\TESTS or
-# C:\GAMES. It used to be a TAR linked into kernel.elf and mounted over C:\BOOT
-# by a dedicated read-only VFS backend; the archive, the backend and the second
-# lookup path are gone. A boot with no RetroOS filesystem therefore has no DOS
-# system directory — there is no embedded fallback any more.
-_BOOT_DIR_FILES = {
-    "//tools/command:command_com": "BOOT/COMMAND.COM",
-    # Kernel symbols for the stack tracer. kernel.elf itself is stripped, so
-    # this is where panic backtraces get their names; without it they are
-    # addresses. Ordinary content on C:, like everything else here.
-    "//kernel:kernel_sym": "BOOT/KERNEL.SYM",
-    "//tools/command:LOADFIX.CFG": "BOOT/LOADFIX.CFG",
-    # Bridge into the Linux personality: a DN-launchable ELF that execs
-    # /bin/busybox as `sh`.
-    "//shell:shell_elf": "BOOT/SHELL.ELF",
-}
-_BOOT_DIR_FILES.update(_DN_FILES)
+# Runtime files are separate from the persistent DN defaults in DATA_FILES.
+_BOOT_DIR_FILES = dict(BOOT_FILES)
 
 # Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
 # source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
-# itself never mounts it. Everything else, C:\BOOT included, lives on ext4.
+# itself never mounts it. Everything else, C:\RETROOS included, lives on ext4.
 _BOOT_FILES = {
     "//boot:bootloader_bin": "A",
     ":kernel_md5": "kernel.elf.md5",
@@ -141,108 +122,21 @@ _BOOT_FILES = {
 # image_min's boot bundle is the same kernel. There used to be a second
 # "bare" kernel here: the full one embedded COMMAND.COM, which is built by
 # booting image_min, so image_min needed a kernel without it. Now that
-# C:\BOOT is ordinary ext4 content the kernel embeds nothing and the cycle
+# C:\RETROOS is ordinary ext4 content the kernel embeds nothing and the cycle
 # is gone with it.
 _BOOT_FILES_MIN = dict(_BOOT_FILES)
 
 # Extras (live on ext4 in the boot+ext4 image, or alongside boot files in the
 # monolithic open-source image). Linux-personality binaries, test programs,
 # and busybox.
-_EXTRA_FILES = {
-    "etc/CONFIG.SYS": "CONFIG.SYS",
-    # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
-    "//tools/command:command.c": "SRC/COMMAND.C",
-    # COMMAND.COM is not here: it lives at C:\BOOT\COMMAND.COM (see
-    # _BOOT_DIR_FILES), which is where COMSPEC points.
-    "freedos/dos32a/dos32a.exe":         "DOS32A.EXE",
-    "//test/dos/printmsg:printmsg_elf":   "TESTS/printmsg.elf",
-    "//test/dos/stress:stress_elf":       "TESTS/stress.elf",
-    "//test/dos/stress64:stress64_elf":   "TESTS/stress64.elf",
-    "//test/dos/hello_com:hello_com":     "TESTS/HELLO.COM",
-
-    "//test/dos/hostfs_commands:hostfs_commands_com": "TESTS/HFSOPS.COM",
-
-    "//test/dos/hostfs_lifecycle:hostfs_probe_com": "TESTS/HFS_PROBE.COM",
-    "//test/dos/hostfs_lifecycle:hostfs_recover_com": "TESTS/HFSRECV.COM",
-    "//test/dos/gfx_com:gfx_com":         "TESTS/GFX.COM",
-    "//test/dos/svgaprobe:svgaprobe_com": "TESTS/SVGAPROBE.COM",
-    "//test/dos/lfnprobe:lfnprobe_com": "TESTS/LFNPROBE.COM",
-    "//test/dos/int13_com:int13_com":     "TESTS/INT13T.COM",
-    "//test/dos/xmsprobe:xmsprobe_com": "TESTS/XMSPROBE.COM",
-    "//test/dos/hello_com:TEST.BAT":      "TESTS/TEST.BAT",
-    "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
-    "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",
-    "//test/dos/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
-    # DOS and OS/2 share C:. The OS/2 personality changes the executable/API
-    # environment, not the filesystem namespace.
-    "//apps/os2/doscalls:doscalls_dll": "OS2/DLL/DOSCALLS.DLL",
-    "//apps/os2/kbdcalls:kbdcalls_dll": "OS2/DLL/KBDCALLS.DLL",
-    "//apps/os2/viocalls:viocalls_dll":   "OS2/DLL/VIOCALLS.DLL",
-    "//apps/os2/nls:nls_dll":           "OS2/DLL/NLS.DLL",
-    "//apps/os2/pmwin:pmwin_dll":       "OS2/DLL/PMWIN.DLL",
-    "//apps/os2/pmgpi:pmgpi_dll":       "OS2/DLL/PMGPI.DLL",
-    "//apps/os2/pmshapi:pmshapi_dll":   "OS2/DLL/PMSHAPI.DLL",
-    "//apps/os2/helpmgr:helpmgr_dll":   "OS2/DLL/HELPMGR.DLL",
-    "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
-    "//test/os2/pm_smoke:pm_smoke":      "OS2/APPS/PMSMOKE.EXE",
-    "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
-    "//apps/os2/sweeper:SWEEPER.EXE":    "OS2/APPS/SWEEPER/SWEEPER.EXE",
-    "//apps/os2/sweeper:SWEEPER.HLP":    "OS2/APPS/SWEEPER/SWEEPER.HLP",
-    "//apps/os2/sweeper:README.DOC":     "OS2/APPS/SWEEPER/README.DOC",
-    "//apps/os2/sweeper:SWEEPER.DOC":    "OS2/APPS/SWEEPER/SWEEPER.DOC",
-    "//apps/windows/kernel32:kernel32_dll": "WINDOWS/SYSTEM32/KERNEL32.DLL",
-    "//apps/windows/user32:user32_dll":     "WINDOWS/SYSTEM32/USER32.DLL",
-    "//apps/windows/compat:advapi32_dll":   "WINDOWS/SYSTEM32/ADVAPI32.DLL",
-    "//apps/windows/compat:comctl32_dll":   "WINDOWS/SYSTEM32/COMCTL32.DLL",
-    "//apps/windows/compat:dwmapi_dll":     "WINDOWS/SYSTEM32/DWMAPI.DLL",
-    "//apps/windows/compat:gdi32_dll":      "WINDOWS/SYSTEM32/GDI32.DLL",
-    "//apps/windows/compat:shell32_dll":    "WINDOWS/SYSTEM32/SHELL32.DLL",
-    "//apps/windows/compat:winmm_dll":      "WINDOWS/SYSTEM32/WINMM.DLL",
-    "//apps/windows/win16:kernel_dll":       "WINDOWS/SYSTEM/KERNEL.DLL",
-    "//apps/windows/win16:user_dll":         "WINDOWS/SYSTEM/USER.DLL",
-    "//apps/windows/win16:gdi_dll":          "WINDOWS/SYSTEM/GDI.DLL",
-    "//apps/windows/win16:shell_dll":        "WINDOWS/SYSTEM/SHELL.DLL",
-    "//apps/windows/win16:sound_dll":        "WINDOWS/SYSTEM/SOUND.DLL",
-    "//apps/windows/win16:keyboard_dll":     "WINDOWS/SYSTEM/KEYBOARD.DLL",
-    "//apps/windows/minesweeper:MINESWPR.EXE": "WINDOWS/APPS/MINESWPR.EXE",
-    "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
-    "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
-    # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
-    "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
-    # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).
-    # `DPMI.EXE -r` dumps the DPMI host state; test/dpmi_hx.sh asserts the dump.
-    "test/dpmi/DPMI.EXE":                   "TESTS/DPMI.EXE",
-    # SB DMA test: MODPLAY.EXE (stub + Rust payload) supersedes the C
-    # `sbtest` -- modplay drives the same SB+8237 in both poll and IRQ
-    # modes. RLOADER.BIN is the in-OS PM loader the stub fopens from cwd.
-    # No build cycle: `image_min` (used to build the stub) uses
-    # _MIN_EXTRA_FILES below, not these.
-    "//test/dos/modplay:modplay_exe":     "TESTS/MODPLAY.EXE",
-    # SB single-cycle completion-protocol probes (busy flicker, status TC,
-    # count underflow) — hosted_games.sh asserts SBTEST prints TC-OK.
-    "//test/dos/sbproto:sbtest_com":      "TESTS/SBTEST.COM",
-    "//test/dos/sbproto:sbdisc_com":      "TESTS/SBDISC.COM",
-    "//test/dos/sbproto:sbirq_com":       "TESTS/SBIRQ.COM",
-    "//test/dos/sbproto:sbdoor_com":      "TESTS/SBDOOR.COM",
-    # PC speaker probe — hosted_games.sh asserts SPKTEST prints OUT-OK (the
-    # PIT ch2 OUT line at port 61h bit 5); its tone sequence is the fixture
-    # the WAV-capture check measures.
-    "//test/dos/spkproto:spktest_com":    "TESTS/SPKTEST.COM",
-    # GUS (GF1) emulation probe — hosted_games.sh asserts its G*-OK markers.
-    "//test/dos/gusproto:gustest_exe":    "TESTS/GUSTEST.EXE",
-    "//tools/dosrt:dosrt_exe":               "TESTS/DOSRT.EXE",
-    "//tools/dosrt:rloader_bin":             "TESTS/RLOADER.BIN",
-    # Static i686 busybox — single-binary Unix userland (sh + coreutils).
-    # Standalone-shell mode dispatches applets via basename(argv[0]); the
-    # binary's compiled-in re-exec path is /bin/busybox, hence the location.
-    "//:apps/busybox/busybox":               "bin/busybox",
-}
+_EXTRA_FILES = dict(DATA_FILES)
+_EXTRA_FILES.update(LINUX_FILES)
 _EXTRA_FILES.update(_BOOT_DIR_FILES)
 
 # Minimum extras needed for the stub-build image (//tools/dosrt:stub_exe
 # boots //:image_min and runs in-OS TCC from ext4 /TC;
 # CONFIG.SYS supplies the PATH
-# (= C:\;C:\BOOT\TC;C:\BORLANDC\BIN) so TCC can find TLINK.EXE. Keeping
+# (= C:\;C:\RETROOS\TC;C:\BORLANDC\BIN) so TCC can find TLINK.EXE. Keeping
 # this tiny avoids the image→modplay→stub_exe→image cycle that would
 # otherwise force a separate `dosrt_tar` indirection.
 _MIN_EXTRA_FILES = {
@@ -286,7 +180,7 @@ pkg_tar(
 # busybox + applet shims at /bin (the Linux side, NOT under home/retroos).
 pkg_tar(
     name = "bin_tar",
-    files = {"//:apps/busybox/busybox": "bin/busybox"},
+    files = LINUX_FILES,
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
 )
 
@@ -295,6 +189,7 @@ pkg_tar(
 _DOS_EXTRA = {k: v for k, v in _EXTRA_FILES.items() if v != "bin/busybox"}
 pkg_tar(
     name = "dos_extras_tar",
+    empty_dirs = ["TEMP"],
     files = _DOS_EXTRA,
     deps = [
         ":games_tar",
@@ -310,6 +205,7 @@ pkg_tar(
 # part of this transport.
 pkg_tar(
     name = "root_module_dos_tar",
+    empty_dirs = ["TEMP"],
     files = _DOS_EXTRA,
     deps = [":ultrasnd_tar", ":tc_tar", ":tp70_tar"],
     package_dir = "home/retroos",
@@ -337,6 +233,7 @@ pkg_tar(
 _DOS_EXTRA_PROPRIETARY = {k: v for k, v in _DOS_EXTRA.items() if k != "etc/CONFIG.SYS"}
 pkg_tar(
     name = "dos_extras_tar_proprietary",
+    empty_dirs = ["TEMP"],
     files = _DOS_EXTRA_PROPRIETARY,
     deps = [
         ":games_tar",
@@ -371,7 +268,7 @@ pkg_tar(
 #   sector 0           bootloader/MBR (with patched partition table)
 #   sector 1..         boot bundle TAR (kernel.elf for the MBR loader only)
 #   sector EXT4_START  ext4 partition: extras + BOOT + TC + games (+ proprietary)
-# The kernel scans the MBR for the ext4 root; C:\BOOT is a directory on it.
+# The kernel scans the MBR for the ext4 root; C:\RETROOS is a directory on it.
 #
 # EXT4_START leaves 32 MiB of headroom for the boot bundle. Anything bigger
 # should live on ext4.
@@ -485,6 +382,7 @@ genrule(
         "freedos/hx/HDPMI16.EXE",
         "freedos/hx/HDPMI16D.EXE",
         "freedos/hx/HDPMI32.EXE",
+        "freedos/hx/HDPMI32I.EXE",
         "freedos/hx/SETUPBC.BAT",
     ],
     outs = ["freedos_apps.img"],
@@ -544,6 +442,7 @@ genrule(
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16.EXE" "::HDPMI16.EXE"
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI16D.EXE" "::HDPMI16D.EXE"
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32.EXE" "::HDPMI32.EXE"
+        mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/HDPMI32I.EXE" "::HDPMI32I.EXE"
         # SETUPBC.BAT — sets PATH/INCLUDE/LIB for BCC on D: (FreeDOS).
         # Run `D:\\SETUPBC` once after booting to make BCC find its headers.
         mcopy -D o -i "$$IMG" "$$(pwd)/freedos/hx/SETUPBC.BAT" "::SETUPBC.BAT"
@@ -658,4 +557,197 @@ sh_binary(
     name = "run",
     srcs = ["run_qemu.sh"],
     data = [":image"],
+)
+
+# ===========================================================================
+# Two-disk layout: a disposable boot disk + a persistent data disk.
+# ===========================================================================
+# The single image conflated two things with opposite lifetimes: the product
+# being built (kernel, bootloader, DOS userland) and the user's world (games,
+# savegames, installed CDs). Splitting them along the file boundary means a
+# rebuild never has to rewrite guest state.
+#
+#   :boot_disk   GRUB + kernel.elf + C:\RETROOS. Rebuilt every launch.
+#   :data_disk   FAT32 C: (FreeDOS-bootable) + ext4 Linux root. Seeded once.
+#
+# See tools/build_boot_disk.py and tools/build_data_disk.py for the layouts and
+# why C: must be FAT and must be C: on both sides.
+
+# C:\RETROOS, on the BOOT disk rather than on C: itself: it is versioned with the
+# kernel, so it belongs with the kernel. Paths already carry the RETROOS/ prefix.
+pkg_tar(
+    name = "boot_dir_tar",
+    files = _BOOT_DIR_FILES,
+)
+
+# One build target keeps the installed kernel and all runtime files matched.
+pkg_tar(
+    name = "machine_boot_tar",
+    files = BOOT_FILES | {"//kernel:kernel_elf": "kernel.elf"},
+)
+
+# The data manifest declares lifetime explicitly, including any writable
+# configuration under RETROOS/. Do not infer ownership from path prefixes.
+_C_DRIVE_FILES = dict(DATA_FILES)
+
+# Flat at the volume root -- a FAT volume IS C:, so there is no home/retroos
+# prefix to apply here (contrast dos_extras_tar, which prefixes for ext4).
+pkg_tar(
+    name = "c_drive_tar",
+    empty_dirs = ["TEMP"],
+    files = _C_DRIVE_FILES,
+    deps = [
+        ":games_tar",
+        ":ultrasnd_tar",
+        ":tc_tar",
+        ":tp70_tar",
+    ],
+)
+
+# Same, plus the proprietary drop. Its own CONFIG.SYS wins, so ours is dropped
+# rather than shadowed (see dos_extras_tar_proprietary).
+_C_DRIVE_FILES_PROPRIETARY = {
+    k: v
+    for k, v in _C_DRIVE_FILES.items()
+    if k != "etc/CONFIG.SYS"
+}
+
+pkg_tar(
+    name = "c_drive_tar_proprietary",
+    empty_dirs = ["TEMP"],
+    files = _C_DRIVE_FILES_PROPRIETARY,
+    deps = [
+        ":games_tar",
+        ":ultrasnd_tar",
+        ":tc_tar",
+        ":tp70_tar",
+        "//apps-proprietary:tar",
+    ],
+)
+
+_BOOT_DISK_CMD = """
+    set -euo pipefail
+    BOOT_DIR=$$(mktemp -d)
+    tar xf $(location :boot_dir_tar) -C "$$BOOT_DIR"
+    python3 $(location tools/build_boot_disk.py) \
+        --kernel $(location //kernel:kernel_elf) \
+        --boot-tree "$$BOOT_DIR" \
+        --size-mb {BOOT_SIZE_MB} \
+        --out $@
+    rm -rf "$$BOOT_DIR"
+"""
+
+genrule(
+    name = "boot_disk",
+    srcs = [
+        "//kernel:kernel_elf",
+        ":boot_dir_tar",
+        "tools/build_boot_disk.py",
+    ],
+    outs = ["boot_disk.bin"],
+    cmd = _BOOT_DISK_CMD.replace("{BOOT_SIZE_MB}", str(BOOT_SIZE_MB)),
+    # grub-mkimage/grub-mkstandalone and /usr/lib/grub come from the host, as
+    # they already do for :grub_iso.
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+# $(C_TAR) is the C: content; everything else is identical between the
+# shareware and proprietary data disks.
+_DATA_DISK_CMD = """
+    set -euo pipefail
+    C_DIR=$$(mktemp -d)
+    LINUX_DIR=$$(mktemp -d)
+    tar xf $(C_TAR) -C "$$C_DIR"
+    tar xf $(location :bin_tar) -C "$$LINUX_DIR"
+    python3 $(location tools/build_data_disk.py) \
+        --dos-tree "$$C_DIR" \
+        --linux-tree "$$LINUX_DIR" \
+        --freedos-src freedos/sys \
+        --fat-mb {DOS_SIZE_MB} --ext4-mb {LINUX_SIZE_MB} \
+        --out $@
+    rm -rf "$$C_DIR" "$$LINUX_DIR"
+"""
+
+_DATA_DISK_CMD = _DATA_DISK_CMD.replace("{DOS_SIZE_MB}", str(DOS_SIZE_MB)).replace("{LINUX_SIZE_MB}", str(LINUX_SIZE_MB))
+
+_FREEDOS_SRCS = [
+    "freedos/sys/bootnorm.asm",
+    "freedos/sys/boot32lb.asm",
+    "freedos/sys/KERNEL.SYS",
+    "freedos/sys/COMMAND.COM",
+]
+
+genrule(
+    name = "data_disk",
+    srcs = [
+        ":c_drive_tar",
+        ":bin_tar",
+        "tools/build_data_disk.py",
+    ] + _FREEDOS_SRCS,
+    outs = ["data_disk.bin"],
+    cmd = _DATA_DISK_CMD.replace("$(C_TAR)", "$(location :c_drive_tar)"),
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "data_disk_proprietary",
+    srcs = [
+        ":c_drive_tar_proprietary",
+        ":bin_tar",
+        "tools/build_data_disk.py",
+    ] + _FREEDOS_SRCS,
+    outs = ["data_disk_proprietary.bin"],
+    cmd = _DATA_DISK_CMD.replace("$(C_TAR)",
+                                 "$(location :c_drive_tar_proprietary)"),
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+# Public release artifacts. Both bundles build from explicit public targets;
+# apps-proprietary and existing writable images are never release inputs.
+pkg_tar(
+    name = "release_vm",
+    mode = "0644",
+    files = {
+        ":boot_disk": "boot.img",
+        ":data_disk": "data.img",
+        "tools/release/run.sh": "run.sh",
+        "tools/run/qemu.sh": "tools/run/qemu.sh",
+        "tools/release/README.md": "README.md",
+    },
+    modes = {"run.sh": "0755"},
+    extension = "tar.gz",
+    out = "retroos-vm.tar.gz",
+)
+
+pkg_tar(
+    name = "release_machine",
+    mode = "0644",
+    files = {
+        ":machine_boot_tar": "machine_boot.tar",
+        "tools/release/install.sh": "install.sh",
+        "tools/machine_install.py": "tools/machine_install.py",
+        "tools/migrate_dn_state.py": "tools/migrate_dn_state.py",
+        "//tools/command:LOADFIX.CFG": "tools/command/LOADFIX.CFG",
+        "etc/CONFIG.SYS": "etc/CONFIG.SYS",
+        "tools/release/README.md": "README.md",
+    } | {src: src for src, dest in DATA_FILES.items() if dest.startswith("CONFIG/DN/")},
+    modes = {"install.sh": "0755"},
+    extension = "tar.gz",
+    out = "retroos-machine.tar.gz",
+)
+
+genrule(
+    name = "release_checksums",
+    srcs = [":release_vm", ":release_machine"],
+    outs = ["SHA256SUMS"],
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) | sed 's|  .*/|  |' > $@",
+)
+
+filegroup(
+    name = "release",
+    srcs = [":release_vm", ":release_machine", ":release_checksums"],
+    visibility = ["//visibility:public"],
 )

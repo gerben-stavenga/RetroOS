@@ -3,8 +3,11 @@
 # kernel's built-in master env (PATH only). Edit freely -- this file
 # lives on the ext4 root (read/write).
 
-COMSPEC=C:\BOOT\COMMAND.COM
-PATH=C:\;C:\BOOT;C:\TC;C:\BORLANDC\BIN
+DNSWP=C:\TEMP
+TEMP=C:\TEMP
+DN=C:\CONFIG\DN
+COMSPEC=C:\RETROOS\COMMAND.COM
+PATH=C:\;C:\RETROOS;C:\TC;C:\BORLANDC\BIN
 # Sound Blaster ownership. native = the guest drives the real card itself
 # (no kernel mixing, no GM bank) — the only thing a 386/486, 86Box or Bochs
 # can afford. mixed = emulate SB+OPL+GUS+GM and mix them out the card, which

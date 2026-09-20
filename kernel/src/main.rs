@@ -36,6 +36,7 @@ fn host_log_byte(b: u8) {
 fn main() {
 
     let mut host_dir: Option<String> = None;
+    let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
@@ -47,6 +48,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--boot-disk" => boot_disk = args.next(),
             "--host" | "-h" => host_dir = args.next(),
             // Live-render the guest's VGA text screen to this terminal (for
             // driving a full-screen DOS TUI like DN). 0xE9 debug → retroos.log.
@@ -188,6 +190,12 @@ fn main() {
     {
         arch::attach_disk(path).unwrap_or_else(|e| {
             eprintln!("retroos-host: cannot attach disk {path}: {e}");
+            std::process::exit(1);
+        });
+    }
+    if let Some(path) = &boot_disk {
+        arch::attach_boot_disk(path).unwrap_or_else(|e| {
+            eprintln!("cannot attach boot disk {path}: {e}");
             std::process::exit(1);
         });
     }

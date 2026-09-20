@@ -90,10 +90,16 @@ qemu_kvm() {
 qemu_audio_kvm() { qemu_audio && qemu_kvm; }
 bochs_tools() { bazel_tool && have bochs && have python3 && have mcopy && have mtype && have setsid; }
 grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
+machine_layout() { grub_fat && have qemu-system-x86_64 && have mkfs.ext4 && have e2fsck && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; }
+dn_state() { have bazelisk && have qemu-system-i386 && have mkfs.fat && have mmd && have mcopy && have mtype && have mdir && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
                 2>/dev/null | grep -qi 86box; }; }; }
+freedos_hdd() { have nasm && have mcopy && have mtype && have timeout \
+                && { have qemu-system-i386 || have qemu-system-x86_64; } \
+                && [ -f freedos/freedos_hdd.img ] && [ -f freedos/.installed ] \
+                && [ -f freedos/hx/HDPMI32I.EXE ]; }
 bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 
 # Rust unit tests, on the host platform. Kept separate from the KVM one below
@@ -124,7 +130,7 @@ run() {
         [ "$gate" = kvm ] && needs_kvm=1
         if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [ "$needs_kvm" = 0 ] \
                 && [[ "$gate" != qemu_prop && "$gate" != box86 \
-                      && "$gate" != qemu_audio_kvm ]]; } \
+                      && "$gate" != qemu_audio_kvm && "$gate" != freedos_hdd ]]; } \
             || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [ "$needs_kvm" = 1 ]; }; then
             printf 'FAIL  %-14s (required prerequisite: %s)\n' "$name" "$gate"
             fail=$((fail + 1)); failed+=("$name"); return
@@ -142,6 +148,8 @@ run() {
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
 run grub_fat     grub_fat  python3 test/grub_fat.py
+run machine_layout machine_layout python3 test/machine_layout.py
+run dn_state     dn_state  python3 test/dn_state.py
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
 run module_program module_qemu   bash test/grub_module_program.sh
@@ -150,15 +158,19 @@ run hosted_games -         env ENGINE=tcg bash test/hosted_games.sh
 run lfn          -         env ENGINE=tcg python3 test/lfn.py
 run dpmi_hx      -         env ENGINE=tcg bash test/dpmi_hx.sh
 run xms          -         env ENGINE=tcg bash test/xms.sh
+run dpmi_vif     -         env ENGINE=tcg bash test/dpmi_vif.sh
+run dpmi_hdpmi_pvi freedos_hdd bash test/dpmi_hdpmi_pvi.sh
 run hosted_games_kvm kvm   env ENGINE=kvm bash test/hosted_games.sh
 run lfn_kvm      kvm       env ENGINE=kvm python3 test/lfn.py
 run dpmi_hx_kvm  kvm       env ENGINE=kvm bash test/dpmi_hx.sh
 run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh
+run dpmi_vif_kvm kvm       env ENGINE=kvm bash test/dpmi_vif.sh
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm
 # --- HostFS launcher and protocol tests -------------------------------------
 
+run shared_disks python3_test python3 test/shared_disks.py
 run hostfs_protocol python3_test python3 test/hostfs_protocol.py
 run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
 run audio_pcm_unit python3_test python3 test/audio_steady_unit.py

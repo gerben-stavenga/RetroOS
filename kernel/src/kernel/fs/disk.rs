@@ -27,6 +27,14 @@ impl FilesystemVolume {
         Some(Self { volume, format })
     }
 
+    /// ext4's on-disk filesystem UUID (superblock + 0x68).
+    pub fn uuid(&self) -> Option<[u8; 16]> {
+        if self.format != Format::Ext4 { return None; }
+        let mut sector = [0; 512];
+        if self.volume.read(2, &mut sector) != 1 { return None; }
+        Some(sector[104..120].try_into().unwrap())
+    }
+
     pub fn name(&self) -> &'static str {
         match self.format { Format::Ext4 => "ext4", Format::Fat => "FAT" }
     }
@@ -57,7 +65,7 @@ impl FilesystemVolume {
         let home = home.strip_suffix(b"/").unwrap_or(home);
         if has_directory(fs.as_ref(), b"etc") && has_directory(fs.as_ref(), b"usr") {
             3
-        } else if has_directory(fs.as_ref(), if home.is_empty() { b"BOOT" } else { home }) {
+        } else if has_directory(fs.as_ref(), if home.is_empty() { b"RETROOS" } else { home }) {
             2
         } else {
             u8::from(self.format == Format::Ext4)
@@ -70,6 +78,57 @@ impl FilesystemVolume {
         match self.format {
             Format::Ext4 => vfs::mount_writable(prefix, fs, home),
             Format::Fat => vfs::mount(prefix, fs),
+        }
+    }
+}
+
+/// What a volume is carrying, judged by what is actually on it.
+///
+/// These are not exclusive and they are not a partition type: one installed
+/// ext4 carries both the Unix tree and C:, which is the shape RetroOS has on
+/// a real machine.  `startup` decides which volume fills which job; this only
+/// reports evidence, the same division drivers and `startup` already keep.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Evidence {
+    /// A Unix tree: the Linux personality's `/`.
+    pub unix: bool,
+    /// A DOS world: C:.
+    pub dos: bool,
+    /// A boot volume — GRUB's prefix volume / the ESP. Supplies C:\RETROOS and
+    /// is never a root: its `BOOT/` would otherwise outscore the real C:.
+    pub boot: bool,
+}
+
+impl FilesystemVolume {
+    /// Inspect the volume once and record what it holds.
+    ///
+    /// Marker names are matched by exact bytes, as the VFS resolves them.
+    /// Lowercase `bin`/`etc`/`usr` are Unix by construction: a DOS volume
+    /// built by mtools stores 8.3 names uppercase, so the case difference is
+    /// itself evidence rather than something to fold away.
+    pub fn evidence(&self, boot: &crate::BootConfig) -> Evidence {
+        let Ok(fs) = self.open(false) else { return Evidence::default() };
+        let fs = fs.as_ref();
+
+        // Only a runtime-bearing boot disk fills this role. A Linux root
+        // containing /boot/grub is still a root, not exclusively a boot disk.
+        if has_directory(fs, b"RETROOS") &&
+            (has_directory(fs, b"EFI") || has_directory(fs, b"boot/grub")) {
+            return Evidence { boot: true, ..Default::default() };
+        }
+
+        let home = boot.c_root();
+        let home = home.strip_suffix(b"/").unwrap_or(home);
+        Evidence {
+            unix: has_directory(fs, b"bin")
+                || has_directory(fs, b"etc")
+                || has_directory(fs, b"usr"),
+            // Either a volume that IS C: (a DOS tree at its root) or one that
+            // CONTAINS C: (the installed-machine ext4, C: in a subdirectory).
+            dos: has_directory(fs, b"RETROOS")
+                || has_directory(fs, b"GAMES")
+                || (!home.is_empty() && has_directory(fs, home)),
+            boot: false,
         }
     }
 }
@@ -123,7 +182,7 @@ mod tests {
         assert_eq!(fat.root_score(&boot), 0);
         {
             let fs = fat.open(true).unwrap();
-            assert_eq!(fs.mkdir(b"BOOT"), 0);
+            assert_eq!(fs.mkdir(b"RETROOS"), 0);
         }
         assert_eq!(fat.root_score(&boot), 2);
         assert_eq!(fat.c_root(&boot), b"");

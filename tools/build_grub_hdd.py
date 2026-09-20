@@ -30,9 +30,8 @@ PART_START = 2048          # leaves 1 MiB for boot.img + core.img
 BOOT_IMG_KERNEL_SECTOR = 0x5c
 DISKBOOT_BLOCKLIST = 0x1F4
 CORE_LOAD_SEGMENT = 0x820
-# Enough to find the root, read ext4 and hand off via multiboot. `all_video`
-# is what makes GRUB set the framebuffer mode the kernel's multiboot header
-# asks for — without it the kernel comes up with no linear framebuffer.
+# Enough to find the root, read ext4 and hand off via multiboot. Video modules
+# remain available for configurations that explicitly request a framebuffer.
 GRUB_MODULES = [
     "biosdisk", "part_msdos", "ext2", "normal", "multiboot",
     "configfile", "echo", "ls", "all_video",

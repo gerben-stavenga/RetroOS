@@ -1,92 +1,91 @@
-# Booting RetroOS on a real (UEFI) machine via its existing GRUB
+# Booting RetroOS on an installed Linux machine
 
-RetroOS's production boot path on modern hardware is the GRUB already
-installed on the machine: `kernel.elf` is multiboot-loadable, so installing it
-is copying one file and adding one menuentry. No partitioning, no images, no
-bootloader install.
-
-The kernel carries no filesystem image of its own. It accepts ext4 and
-FAT12/16/32 roots. `C:` is `/home/retroos` on a Unix/ext4 root, or the entire
-selected FAT volume. The DOS system directory `C:\BOOT` (DN, COMMAND.COM,
-LOADFIX.CFG, SHELL.ELF) has to exist at that location —
-`setup-cdrive.sh` puts it there, or run `tools/install_boot_dir.sh` on its
-own. Without it the kernel boots but has no shell to start.
+The installer uses the existing GRUB and ext4 root. It does not repartition the
+machine or use emulator image files. `/home/retroos` is the persistent DOS C:.
 
 ## Install
 
-```bash
-sudo ./setup-cdrive.sh            # C: content, including C:\BOOT  (first time)
+Run the build/preparation as your normal user, then install the prepared release:
 
-bazelisk build //kernel:kernel_elf //kernel:kernel_sym //tools/command:command_com
-sudo tools/install_kernel.sh      # kernel + symbols + COMMAND.COM  (every rebuild)
+```sh
+tools/install_kernel.sh --prepare
+# Review build/machine-install/<release>/grub.cfg
+sudo tools/install_kernel.sh
 ```
 
-`install_kernel.sh` is the one to re-run after a build. It installs **three**
-files, and they must come from the same build:
+Preparation builds one `//:machine_boot_tar` containing the matching kernel,
+symbols, COMMAND.COM, SHELL.ELF, and DN program/resources. Installation puts that
+release under `/boot/retroos/releases/<release>/`, installs managed entries in
+`/etc/grub.d/41_retroos`, and runs `update-grub`. No reboot is performed. Previous
+releases and unrelated GRUB entries remain. The obsolete RetroOS entries are
+backed up and replaced by managed entries named
+**RetroOS (current, persistent)** and **RetroOS (current, protected disk)**.
 
-| file | destination | what it is |
-|---|---|---|
-| `kernel.elf` | `/boot/retroos/kernel.elf` | what GRUB multiboots — stripped, ~763 KB |
-| `kernel.sym` | `<C:>/BOOT/KERNEL.SYM` | symbol table for panic backtraces, ~276 KB |
-| `COMMAND.COM` | `<C:>/BOOT/COMMAND.COM` | DOS launcher and OSD task-return policy |
+Both disk-protection entries use the same video policy. When GRUB boots through
+legacy BIOS (`grub_platform=pc`), it hands over text mode (`gfxpayload=text`),
+so RetroOS uses native BIOS video and hardware VGA, including planar/Mode X.
+When GRUB boots through UEFI, it keeps the GOP framebuffer and RetroOS uses
+its substitute BIOS and software VGA rendering. RetroOS selects this path from
+the display handoff, not by searching memory for a BIOS ROM. Custom GRUB entries
+should use the same policy: forcing a linear framebuffer on BIOS selects the
+software rendering path too.
 
-`kernel.elf` carries no symbol table, so a backtrace is named only if
-`KERNEL.SYM` is present *and* matches. A stale symbol file is worse than a
-missing one — the addresses still resolve, to the wrong functions. A stale
-COMMAND.COM can likewise make task handoff semantics disagree with the kernel,
-which is why one script installs all three. The boot line
-`Loading kernel symbols (N bytes)` confirms the symbol file was loaded.
+Select the firmware boot mode before entering GRUB, using the machine's
+firmware setup or boot-device menu (the key and entry names vary by manufacturer).
+A UEFI entry loads GRUB's EFI executable and reports `grub_platform=efi`.
+A legacy entry starts the disk's BIOS bootloader and reports `grub_platform=pc`.
 
-Append to `/etc/grub.d/40_custom`:
+To use native BIOS video, enable Legacy/CSM if supported and select the legacy
+boot entry. The disk must also have BIOS GRUB installed: enabling CSM alone
+does not install a BIOS bootloader, and selecting a UEFI entry still uses GOP.
+On UEFI-only machines, RetroOS uses its substitute BIOS and software rendering
+to support DOS applications. The RetroOS installer adds menu entries to the
+existing GRUB; it does not install another firmware variant or enable CSM.
+Choosing persistent versus protected inside GRUB only changes disk writes.
 
-```
-menuentry "RetroOS (protected disk)" {
-    insmod part_gpt
-    insmod ext2
-    insmod multiboot
-    insmod efi_gop
-    set gfxmode=auto
-    set gfxpayload=keep
-    search --no-floppy --file /retroos/kernel.elf --set=root
-    multiboot /retroos/kernel.elf ram-overlay
-    boot
-}
+After updating RetroOS's installer, rerun preparation and installation to apply
+the generated video policy to an existing machine's GRUB entries.
 
-menuentry "RetroOS (writable disk)" {
-    insmod part_gpt
-    insmod ext2
-    insmod multiboot
-    insmod efi_gop
-    set gfxmode=auto
-    set gfxpayload=keep
-    search --no-floppy --file /retroos/kernel.elf --set=root
-    multiboot /retroos/kernel.elf
-    boot
-}
+The generated Multiboot arguments explicitly specify:
+
+```text
+retroos.root=<ext4-filesystem-UUID>
+retroos.c-root=/home/retroos
+retroos.runtime=/boot/retroos/releases/<release>/RETROOS
 ```
 
-then `sudo update-grub` and reboot.
+The UUID selects the filesystem independently of device order or directory
+markers. Missing/duplicate UUIDs fail instead of choosing another writable disk.
+The runtime directory is exposed read-only at `C:\RETROOS`; this is a replacement
+binding, not a union. The current installer requires `/boot` and C: to reside
+on the same ext4 filesystem as Linux `/`, as they do on this laptop.
 
-Two entries, because **`ram-overlay` is the only thing standing between RetroOS
-and your real filesystem** — see below. Having both means the choice is at the
-boot menu rather than in a file you have to remember to edit, and backing out
-is a reboot.
+| Guest path | Location/lifetime |
+| --- | --- |
+| `C:\RETROOS` | Matching boot runtime, read-only |
+| `C:\CONFIG\DN` | Persistent DN settings, history, desktop, menus |
+| `C:\CONFIG\LOADFIX.CFG` | Persistent COMMAND.COM launch policy |
+| `C:\TEMP` | Writable DN swap/flag/temporary files |
+| `C:\CONFIG.SYS` | Persistent startup environment |
 
-- Path subtlety: GRUB paths are relative to the partition holding them. A
-  separate `/boot` partition → `/retroos/kernel.elf` (as above); `/boot` on
-  the root filesystem → `/boot/retroos/kernel.elf` in both lines.
-- `insmod efi_gop` is load-bearing: the kernel's multiboot header requests a
-  linear framebuffer, and without the GOP driver GRUB fails with
-  "no suitable video mode found".
-- `gfxpayload=keep` makes the framebuffer handoff explicit instead of relying
-  on GRUB's platform-specific payload default.
-- **Secure Boot must be disabled** in firmware setup: GRUB under Secure Boot
-  lockdown refuses `multiboot` of unsigned binaries.
-- Edit `/etc/grub.d/40_custom`, **not** `/boot/grub/grub.cfg`. The generated
-  file carries `### BEGIN /etc/grub.d/40_custom ###` markers, so hand-edits
-  inside them look permanent and are not: any kernel or grub package update
-  regenerates `grub.cfg` from the sources and silently drops them — taking
-  `ram-overlay` with them.
+DN already supports separate paths; no binary patch is needed. CONFIG.SYS sets
+`DNSWP=C:\TEMP`, `TEMP=C:\TEMP`, then `DN=C:\CONFIG\DN`, in that order. DN.COM
+uses the first DNSWP/DN variable for its flag file. DN.PRG uses DN for settings
+and history, while overlays, language/dialog resources and help remain next to
+the executable. See [the DN 1.51 sources](https://github.com/maximmasiutin/Dos-Navigator)
+(`STARTUP.PAS`, `DN.ASM`, `DNUTIL.PAS`, `DNAPP.PAS`).
+
+Installation backs up CONFIG.SYS and copies old `RETROOS/DN` or `BOOT/DN` state
+without deleting it or replacing existing `CONFIG/DN` files. Defaults are seeded
+only when absent. To migrate an existing emulator disk, stop its emulator first:
+
+```sh
+python3 tools/migrate_dn_state.py --image build/data.bin
+```
+
+For a direct/hosted C: directory, `tools/install_boot_dir.sh /path/to/c-root`
+refreshes the runtime and migrates state. This is distinct from physical-machine
+installation, which keeps runtime files under `/boot/retroos`.
 
 ## Disk writes and `ram-overlay`
 
@@ -112,12 +111,10 @@ Disk writes: PERSISTENT — physical devices are writable        (in red)
 
 ### Which disk is at stake
 
-RetroOS probes supported filesystems, preferring one containing `/etc` and
-`/usr`, then one containing the configured DOS home (or top-level `BOOT` on
-a FAT root). On a laptop the first
-choice is usually **the Linux root** you boot Linux from. `C:` is
-`/home/retroos` on that same filesystem. So without
-`ram-overlay`, a DOS program is writing into your live system's root.
+The installed-machine entries select the ext4 filesystem by UUID. `C:` is
+`/home/retroos` on that filesystem. Emulator/legacy entries without an explicit
+UUID still use directory evidence to select volumes. Without `ram-overlay`,
+permitted writes persist on the selected filesystem.
 
 What it can and cannot reach:
 
@@ -194,15 +191,15 @@ qemu-system-i386 -cdrom bazel-bin/retroos_grub_module.iso
 GRUB loads `kernel.elf` as usual. The kernel probes filesystem contents and
 accepts FAT12/16/32 partitions, unpartitioned FAT media, and raw FAT Multiboot
 modules. On a selected FAT root, `C:` maps to the volume root: put the DOS
-system files in `/BOOT` (`C:\BOOT`), alongside the partition's existing
+system files in `/RETROOS` (`C:\RETROOS`), alongside the partition's existing
 Windows/DOS files and games. No `/home/retroos` directory is needed on FAT.
 On a Unix/ext4 root, `C:` remains `/home/retroos` even if that directory is
 missing; it never silently falls back to `/`. Explicit C-drive overrides
 still take precedence. FAT root modules use the same mapping as physical FAT.
 
-Preserve the exact spelling of the VFS startup paths, including `BOOT`.
+Preserve the exact spelling of the VFS startup paths, including `RETROOS`.
 When multiple filesystems are present, `/etc` plus `/usr` take precedence,
-followed by a filesystem containing its DOS home (top-level `BOOT` for FAT).
+followed by a filesystem containing its DOS home (top-level `RETROOS` for FAT).
 This keeps a separate EFI system partition from displacing an installed DOS
 root. GRUB's kernel location does not override this root-selection policy.
 
@@ -229,7 +226,9 @@ one-file install above. `bazelisk build //:image_grub` produces a disk with
 **no RetroOS bootloader**:
 GRUB's `boot.img` in sector 0, `core.img` in the MBR gap, and a single ext4
 partition holding `/boot/kernel.elf`, `/boot/grub/grub.cfg` and the usual
-content. Run it with `./run.sh qemu -i grubhdd`.
+content. To test that standalone legacy image directly, use
+`qemu-system-i386 -drive file=bazel-bin/image_grub.bin,format=raw,snapshot=on`.
+Normal `./run.sh qemu` launches use the shared boot/data layout.
 
 The legacy `//:image` (our own MBR + a 0xDA boot-bundle partition holding
 `kernel.elf` as a TAR member) still builds. `//:image_grub` is the candidate
@@ -245,9 +244,8 @@ packaged. It needs `grub-mkimage` plus the i386-pc modules (`grub-pc-bin`).
 
 GOP text console (the kernel renders into the framebuffer GRUB hands over —
 `kernel/src/arch/fbcon.rs`), then storage discovery. RetroOS walks MBR or GPT
-partitions and mounts the selected ext4 or FAT root. DN and COMMAND.COM come from
-`C:\BOOT`, an ordinary directory on that root — a boot with no RetroOS
-filesystem has no DOS system directory. Block writes reach the physical device
+partitions and mounts the selected ext4 or FAT root. DN and COMMAND.COM come from the read-only runtime binding at
+`C:\RETROOS`. Block writes reach the physical device
 unless `ram-overlay` was passed.
 
 Keyboard: the i8042 path (most laptops expose one via EC emulation) feeds

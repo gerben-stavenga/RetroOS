@@ -536,7 +536,7 @@ impl DfsState {
 /// The VFS subtree that DOS drive `C:` maps to — `home/retroos/` on a Unix
 /// root, or the entire selected FAT volume, unless BootConfig supplies an
 /// explicit override. Linux keeps the real `/`.
-/// DOS startup files live in the ordinary `c_root() + "BOOT/"` directory.
+/// DOS startup files live in the ordinary `c_root() + "RETROOS/"` directory.
 static mut C_ROOT_BUF: [u8; 128] = [0; 128];
 static mut C_ROOT_LEN: usize = 0;
 
@@ -830,16 +830,16 @@ mod tests {
         assert_eq!(&dos[..len], b"D:\\DOS4GW.EXE");
 
         let mut dfs = DfsState::new();
-        dfs.init_from_vfs(b"C:BOOT");
+        dfs.init_from_vfs(b"C:RETROOS");
         assert_eq!(dfs.current_drive_number(), 2);
         let len = dfs.resolve(b"X.TXT", &mut dos).unwrap();
-        assert_eq!(&dos[..len], b"C:\\BOOT\\X.TXT");
+        assert_eq!(&dos[..len], b"C:\\RETROOS\\X.TXT");
 
         // Linux-parent form (no colon) still lands on C: via c_root strip.
         let mut dfs = DfsState::new();
-        dfs.init_from_vfs(b"boot");
+        dfs.init_from_vfs(b"retroos");
         assert_eq!(dfs.current_drive_number(), 2);
-        assert_eq!(dfs.get_cwd(), b"BOOT");
+        assert_eq!(dfs.get_cwd(), b"RETROOS");
     }
 
     #[test]

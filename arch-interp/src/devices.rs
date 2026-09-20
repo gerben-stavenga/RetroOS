@@ -261,6 +261,23 @@ pub fn attach_disk(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// A second ATA channel supplies freshly built boot files alongside the data disk.
+struct SecondaryAta(Ata);
+impl PortIo for SecondaryAta {
+    fn read(&mut self, port: u16, width: u8) -> u32 {
+        self.0.read(port + 0x80, width)
+    }
+    fn write(&mut self, port: u16, width: u8, val: u32) {
+        self.0.write(port + 0x80, width, val);
+    }
+}
+
+pub fn attach_boot_disk(path: &str) -> std::io::Result<()> {
+    let file = File::open(path)?;
+    register(0x170, 0x177, Box::new(SecondaryAta(Ata::new(file))));
+    Ok(())
+}
+
 // ── COM1 16550 UART → native host filesystem ────────────────────────────────
 
 const COM1: u16 = 0x3F8;

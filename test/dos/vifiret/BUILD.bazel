@@ -1,0 +1,7 @@
+genrule(
+    name = "vifiret_com",
+    srcs = ["vifiret.asm"],
+    outs = ["VIFIRET.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

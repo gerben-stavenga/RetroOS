@@ -88,8 +88,15 @@ jobs:
           build --keep_going
           EOF
 
-      - name: Build kernel + disk image
-        run: bazel build //:image //kernel:kernel_elf
+      - name: Build public release bundles
+        run: bazel build //:release
+
+      - name: Validate release packaging and launcher
+        run: |
+          python3 test/release.py
+          # Later host-platform builds change the bazel-bin symlink.
+          mkdir -p build/release
+          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/SHA256SUMS build/release/
 
       # clippy runs under -D warnings via the rules_rust aspect (--config=clippy),
       # so any diagnostic fails the build. Metal crates lint on the default
@@ -153,6 +160,18 @@ jobs:
         env:
           RETRO_REQUIRE_PUBLIC: "1"
         run: test/run_all.sh
+
+      - name: Upload tested public releases
+        uses: actions/upload-artifact@v4
+        with:
+          name: retroos-${{ github.sha }}
+          path: |
+            build/release/retroos-vm.tar.gz
+            build/release/retroos-machine.tar.gz
+            build/release/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
 
       # Cap the disk cache BEFORE the post-job cache save: it only ever grows
       # (every lockfile bump saves a bigger cache under a new key), and once

@@ -32,6 +32,23 @@ See [DESIGN.md](DESIGN.md) for the architecture and [OUTLOOK.md](OUTLOOK.md) for
 where it is heading — one safe-Rust core running code for any OS, any ISA, on
 any host (native on the diagonal, interpreted off it).
 
+For an existing Linux machine, see [BOOTING.md](BOOTING.md). Prepare with
+`tools/install_kernel.sh --prepare`, then install with `sudo tools/install_kernel.sh`.
+GRUB selects the root by UUID; runtime files at `C:\RETROOS` are read-only,
+while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP`.
+
+## Releases
+
+`bazelisk build //:release` produces public bundles in `bazel-bin/`:
+
+- `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and a prebuilt QEMU launcher.
+- `retroos-machine.tar.gz` (`//:release_machine`): matched kernel/runtime and installer.
+- `SHA256SUMS` (`//:release_checksums`): checksums for both bundles.
+
+CI tests these artifacts and uploads them on successful runs. The bundles require
+no compiler or Bazel to use. Extract upgrades separately and preserve your existing
+data image; replace only the boot image. See the bundled README for installation.
+
 ## Build
 
 ```bash
@@ -51,26 +68,40 @@ Everything goes through one launcher, `run.sh`, which picks the backend,
 firmware, sound card, and image:
 
 ```bash
-./run.sh qemu                         # 386 BIOS image in QEMU (default)
+./run.sh qemu                         # fresh UEFI boot + persistent data
 ./run.sh qemu --arch x64              # boot as an x86-64 machine
-./run.sh qemu --firmware uefi         # OVMF/UEFI: GRUB-less GOP boot path
-./run.sh qemu --sound ac97            # AC'97 instead of the default Sound Blaster
+./run.sh qemu --firmware uefi         # OVMF/UEFI: GRUB + GOP framebuffer
+./run.sh qemu --sound ac97            # AC'97 instead of the default HDA
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
 ```
 
-`run.sh` defaults to the proprietary image when `apps-proprietary/` is present,
-otherwise the public `//:image`. See `./run.sh` header comments for the full
-option list (`-i`, `-h HOSTDIR`, `--headless`, screenshots, etc). The old
-`run_qemu.sh` / `run_uefi.sh` / `run_bochs.sh` / `run_interp.sh` scripts are thin
-shims that forward here.
+`run.sh` defaults to the shared layout on QEMU, Bochs, 86Box and hosted:
 
-To drive the raw image yourself:
+- `bazel-bin/boot_disk.bin`: GRUB, kernel and `C:\RETROOS` system files, rebuilt from current sources.
+- `build/data.bin`: one writable disk, shared across backends. FAT32 holds `C:` and ext4 holds the Linux root. Guest writes persist.
 
-```bash
-qemu-system-i386 -drive file=bazel-bin/image.bin,format=raw -debugcon stdio -no-reboot
-```
+The data disk is seeded only when missing, using proprietary content when
+`apps-proprietary/` exists. Rebuilding a seed never replaces the live disk.
+Use `--data-image /path/to/data.bin` (or `RETROOS_DATA_IMAGE`) to choose another
+persistent disk. A launcher lock prevents simultaneous use of the same disk.
+
+Edit [filesystem_layout.bzl](filesystem_layout.bzl) for packaged file destinations
+and partition sizes. Size/seed changes apply to newly created data images;
+existing disks retain their contents and layout. `C:\RETROOS\LOADFIX.CFG` is
+seeded as writable data. The boot volume is read-only:
+new state files beside shipped files go to the data disk, while shipped files
+cannot be overwritten through that binding.
+
+`--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
+`--host DIR` uses the live host tree with the hosted backend, or exports it as
+HostFS under QEMU. `--cmd` is supported on QEMU and hosted; the launcher does
+not inject temporary commands or serial settings into the persistent disk.
+The old `-i` image modes, installer flow, and `--gpt` assembly are removed.
+
+`run.sh` owns the build/data lifecycle; `tools/run/` contains only backend
+launch arguments and configuration. See `./run.sh --help` for options.
 
 For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOTING.md).
 

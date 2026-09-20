@@ -34,9 +34,17 @@ import time
 from pathlib import Path
 
 
-WINDOW_RE = re.compile(
-    r'^\s*(0x[0-9a-fA-F]+)\s+"([^"]*)":\s+\("[^"]*"\s+"86Box"\)'
-)
+# The emulator's WM class. 86Box by default, but the same XTest driving works
+# on any emulator window — Bochs' SDL window, for one, which is where an OSD
+# bug specific to its VBE linear scanout has to be reproduced.
+WINDOW_CLASS = "86Box"
+
+
+def window_re() -> re.Pattern[str]:
+    return re.compile(
+        r'^\s*(0x[0-9a-fA-F]+)\s+"([^"]*)":\s+\("[^"]*"\s+"'
+        + re.escape(WINDOW_CLASS) + r'"\)'
+    )
 KERNEL_LOG_RE = re.compile(r"^86box: RetroOS kernel log file: (.+)\s*$")
 
 
@@ -48,8 +56,9 @@ def windows() -> list[tuple[int, str]]:
     except (OSError, subprocess.CalledProcessError) as error:
         raise SystemExit(f"cannot query X11 windows: {error}") from error
     found: list[tuple[int, str]] = []
+    pattern = window_re()
     for line in text.splitlines():
-        match = WINDOW_RE.match(line)
+        match = pattern.match(line)
         if match:
             found.append((int(match.group(1), 16), match.group(2)))
     return found
@@ -379,6 +388,11 @@ def command_capture(args: argparse.Namespace) -> None:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    result.add_argument(
+        "--window-class", default=WINDOW_CLASS,
+        help="WM class of the emulator window (default 86Box; use Bochs to "
+             "drive a Bochs SDL window with the same keys and screenshots)",
+    )
     sub = result.add_subparsers(dest="command", required=True)
 
     wait = sub.add_parser("wait", help="wait for exactly one matching VM window")
@@ -431,7 +445,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    global WINDOW_CLASS
     args = parser().parse_args()
+    WINDOW_CLASS = args.window_class
     args.function(args)
 
 

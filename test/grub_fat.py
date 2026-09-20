@@ -20,12 +20,12 @@ def make_fat(work, name, bits, size, root):
         stream.truncate(size)
     run("mkfs.fat", "-F", bits, image)
     if root:
-        run("mmd", "-i", image, "::BOOT")
+        run("mmd", "-i", image, "::RETROOS")
         run("mcopy", "-i", image, work / "probe.elf", "::PROBE.ELF")
         run("mcopy", "-i", image, work / "payload", "::Mixed case filename.txt")
         run("mcopy", "-i", image, work / "empty", "::WRITE.TXT")
-        run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::BOOT/LFNPROBE.COM")
-        run("mcopy", "-i", image, ROOT / "bazel-bin/tools/command/COMMAND.COM", "::BOOT/COMMAND.COM")
+        run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::RETROOS/LFNPROBE.COM")
+        run("mcopy", "-i", image, ROOT / "bazel-bin/tools/command/COMMAND.COM", "::RETROOS/COMMAND.COM")
         run("mcopy", "-i", image, work / "ROOTTEST.BAT", "::ROOTTEST.BAT")
         run("mcopy", "-i", image, work / "CONFIG.SYS", "::CONFIG.SYS")
     else:
@@ -84,10 +84,10 @@ def main():
             "-O2", "-e", "_start", "-o", work / "probe.elf", "test/fat_probe.c")
         (work / "payload").write_bytes(b"FAT-DATA")
         (work / "empty").write_bytes(b"")
-        # Top-level batch launch must find the real C:\BOOT\COMMAND.COM,
+        # Top-level batch launch must find the real C:\RETROOS\COMMAND.COM,
         # which then opens the probe through its drive-qualified DOS path.
-        (work / "ROOTTEST.BAT").write_bytes(b"@echo off\r\nC:\\BOOT\\LFNPROBE.COM\r\n")
-        (work / "CONFIG.SYS").write_bytes(b"COMSPEC=C:\\BOOT\\COMMAND.COM\r\nPATH=C:\\BOOT\r\n")
+        (work / "ROOTTEST.BAT").write_bytes(b"@echo off\r\nC:\\RETROOS\\LFNPROBE.COM\r\n")
+        (work / "CONFIG.SYS").write_bytes(b"COMSPEC=C:\\RETROOS\\COMMAND.COM\r\nPATH=C:\\RETROOS\r\n")
         fat12 = make_fat(work, "fat12.img", 12, 1440 * 1024, True)
         fat16 = make_fat(work, "fat16.img", 16, 16 * 1024 * 1024, True)
         fat32 = make_fat(work, "fat32.img", 32, 64 * 1024 * 1024, True)

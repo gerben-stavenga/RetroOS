@@ -92,7 +92,7 @@ pub use mmu::new_space;
 // Platform device composition (the hosted `main` hooks ports): the PortIo trait
 // + `register` for custom devices, and convenience hooks for the built-ins.
 pub use devices::{
-    attach_audio, attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon,
+    attach_audio, attach_boot_disk, attach_disk, attach_fw_cfg, attach_hostfs, register, register_debugcon,
     register_debugcon_file, PortIo,
 };
 // Native host-fs backend (hosted "punch-through"): `install_native_hostfs` sets

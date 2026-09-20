@@ -26,8 +26,9 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 source test/lib/qemu_common.sh
-qemu_bazel build //:image //kernel:kernel_elf || exit 1
+qemu_bazel build //:data_disk || exit 1
 LOG_DIR=$(mktemp -d -t retroos-audio-matrix.XXXXXX)
+python3 test/private_data_disk.py bazel-bin/data_disk.bin "$LOG_DIR/data.bin" || exit 1
 ACCEL=(); [ "${1:-}" = "--kvm" ] && ACCEL=(--kvm)
 pid=""
 trap 'qemu_stop_and_reap "$pid"' EXIT
@@ -48,7 +49,7 @@ for sink in "${SINKS[@]}"; do
     prog="${entry%%:*}"; expect="${entry#*:}"
     log="$LOG_DIR/$sink-$(basename "$prog").log"
     AUDIO_BACKEND=none QEMU_DISPLAY=none timeout --kill-after=5 90 \
-        ./run.sh qemu "${ACCEL[@]}" --arch x64 --firmware uefi -i image \
+        ./run.sh qemu "${ACCEL[@]}" --arch x64 --firmware uefi --data-image "$LOG_DIR/data.bin" \
         --sound "$sink" --cmd "$prog" > "$log" 2>&1 &
     pid=$!
     # Both probes wait for a key after their last verdict.

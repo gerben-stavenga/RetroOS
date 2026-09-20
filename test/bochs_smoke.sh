@@ -4,7 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source test/lib/qemu_common.sh
-qemu_bazel build //:image
+qemu_bazel build //:data_disk
 
 work=$(mktemp -d -t retroos-bochs-test.XXXXXX)
 pid=""
@@ -41,9 +41,10 @@ run_probe() {
     # overflow detected ***", taking the probe with it. These probes are XMS,
     # DPMI and VBE — sound plays no part — so point every lowlevel driver at
     # 'dummy'. SDL_* keeps SDL itself off the host's devices as well.
-    VM_DIR="$work/$name" BOCHS_DISPLAY_LIBRARY=sdl2 SDL_VIDEODRIVER=dummy \
+    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$work/$name/data.bin" --command "$command"
+    VM_DIR="$work/$name" BOCHS_DISPLAY=sdl2 SDL_VIDEODRIVER=dummy \
         SDL_AUDIODRIVER=dummy \
-        setsid ./run.sh bochs -i image --cmd "$command" \
+        setsid ./run.sh bochs --data-image "$work/$name/data.bin" -- \
         'panic: action=fatal' 'speaker: enabled=0' \
         'sound: waveoutdrv=dummy, waveindrv=dummy, midioutdrv=dummy' >"$log" 2>&1 &
     pid=$!
@@ -70,5 +71,6 @@ run_probe() {
 }
 
 run_probe xms TESTS/XMSPROBE.COM 'XMSPROBE PASS'
+run_probe vifiret TESTS/VIFIRET.COM 'VIFIRET PASS'
 run_probe dpmi 'TESTS/DPMI.EXE -r' 'DPMI v0.90 host found' 'raw jump to real-mode' 'GDTR:'
 run_probe vbe TESTS/SVGAPROBE.COM 'VBE-ALL-OK'
