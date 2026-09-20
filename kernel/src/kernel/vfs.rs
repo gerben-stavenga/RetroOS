@@ -350,9 +350,7 @@ struct Binding {
     /// Who decides writes here. Enforced by the VFS itself (see `may_write`) —
     /// never by a driver, and never by a wrapper a mount site could forget.
     access: crate::kernel::fs::grant::WriteAccess,
-    // NB: the mount MODE (Replace vs Union) is applied when the binding is
-    // added (Replace drops peers at the prefix; see `add_binding`) — it does
-    // not need to persist per-binding, so it is not stored here.
+    mode: MountMode,
 }
 
 struct ResolvedObject {
@@ -378,12 +376,26 @@ impl ResolvedObject {
     }
 }
 
-/// Max members visited in one union group. A union stack is tiny in practice;
-/// overflow drops the oldest layers (logged).
+/// Maximum members visited in one union group, in priority order.
 const MAX_UNION: usize = 8;
 
 /// Alias (bind) expansion depth cap — breaks any accidental bind cycle.
 const ALIAS_DEPTH: u8 = 8;
+
+/// Join a bind source and relative suffix. Backend roots are empty paths;
+/// other backend paths have no trailing slash, including the bind point itself.
+fn compose_alias(src_prefix: &[u8], subpath: &[u8], buf: &mut [u8]) -> Option<usize> {
+    let src = if subpath.is_empty() {
+        src_prefix.strip_suffix(b"/").unwrap_or(src_prefix)
+    } else {
+        src_prefix
+    };
+    let len = src.len().checked_add(subpath.len())?;
+    if len > buf.len() { return None; }
+    buf[..src.len()].copy_from_slice(src);
+    buf[src.len()..len].copy_from_slice(subpath);
+    Some(len)
+}
 
 /// The cookie that starts a fresh directory enumeration.
 pub const READDIR_START: u64 = 0;
@@ -461,64 +473,26 @@ impl Vfs {
 
     // ── mount table (namespace composer) ─────────────────────────────────
 
-    fn longest_prefix(&self, path: &[u8]) -> Option<usize> {
-        self.mounts
-            .iter()
-            .filter(|binding| match_prefix(binding.prefix, path).is_some())
-            .map(|binding| binding.prefix.len())
-            .max()
-    }
-
-    /// Find the first object supplied by the highest-priority matching layer.
+    /// Lookup policy over the resolved namespace layers. Alias traversal is
+    /// owned by visit_layers; backend lookup only sees a relative path.
     fn resolve_object(&self, path: &[u8], depth: u8) -> Option<ResolvedObject> {
-        let best = self.longest_prefix(path)?;
-        let mut visited = 0;
-        for (index, binding) in self.mounts.iter().enumerate().rev() {
-            if binding.prefix.len() != best { continue; }
-            let Some(start) = match_prefix(binding.prefix, path) else { continue };
-            if visited == MAX_UNION {
-                crate::compact_dbg_println!(
-                    "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
-                break;
-            }
-            visited += 1;
-            let subpath = &path[start..];
-            match binding.target {
-                BindTarget::Server(fs) => {
-                    let stat = if subpath.is_empty() {
-                        Some(Stat {
-                            size: 0,
-                            mode: 0o755,
-                            is_dir: true,
-                            is_symlink: false,
-                            ino: fs.root_node().unwrap_or(0),
-                        })
-                    } else {
-                        fs.stat(subpath, false)
-                    };
-                    if let Some(stat) = stat {
-                        return ResolvedObject::new(index as u8, fs, subpath, stat);
-                    }
-                }
-                BindTarget::Alias { src_prefix } if depth != 0 => {
-            let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
-                    let len = src_prefix.len().checked_add(subpath.len())?;
-                    if len > rewritten.len() { continue; }
-                    rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
-                    rewritten[src_prefix.len()..len].copy_from_slice(subpath);
-                    if let Some(object) = self.resolve_object(&rewritten[..len], depth - 1) {
-                        return Some(object);
-                    }
-                }
-                BindTarget::Alias { .. } => {}
-            }
-        }
-        None
+        let mut result = None;
+        self.visit_layers(path, depth, &mut |index, fs, subpath| {
+            let stat = if subpath.is_empty() {
+                Some(Stat {
+                    size: 0, mode: 0o755, is_dir: true, is_symlink: false,
+                    ino: fs.root_node().unwrap_or(0),
+                })
+            } else {
+                fs.stat(subpath, false)
+            };
+            result = stat.and_then(|stat| ResolvedObject::new(index, fs, subpath, stat));
+            result.is_some()
+        });
+        result
     }
 
-    /// Locate an object whose owning layer is already known from a directory
-    /// entry. The listing is the existence proof, so this only translates the
-    /// namespace path (including aliases); it does not repeat backend lookup.
+    /// A directory entry already proved existence and identified its layer.
     fn resolve_listed(
         &self,
         path: &[u8],
@@ -526,97 +500,70 @@ impl Vfs {
         mount_idx: u8,
         stat: Stat,
     ) -> Option<ResolvedObject> {
-        let best = self.longest_prefix(path)?;
-        for (index, binding) in self.mounts.iter().enumerate().rev() {
-            if binding.prefix.len() != best { continue; }
-            let Some(start) = match_prefix(binding.prefix, path) else { continue };
-            let subpath = &path[start..];
-            match binding.target {
-                BindTarget::Server(fs) if index as u8 == mount_idx => {
-                    return ResolvedObject::new(mount_idx, fs, subpath, stat);
-                }
-                BindTarget::Alias { src_prefix } if depth != 0 => {
-            let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
-                    let len = src_prefix.len().checked_add(subpath.len())?;
-                    if len > rewritten.len() { continue; }
-                    rewritten[..src_prefix.len()].copy_from_slice(src_prefix);
-                    rewritten[src_prefix.len()..len].copy_from_slice(subpath);
-                    if let Some(object) = self.resolve_listed(
-                        &rewritten[..len], depth - 1, mount_idx, stat,
-                    ) {
-                        return Some(object);
-                    }
-                }
-                _ => {}
-            }
-        }
-        None
+        let mut result = None;
+        self.visit_layers(path, depth, &mut |index, fs, subpath| {
+            if index != mount_idx { return false; }
+            result = ResolvedObject::new(index, fs, subpath, stat);
+            result.is_some()
+        });
+        result
     }
 
-    /// Visit every matching layer for union directory enumeration. Returning
-    /// `true` stops the walk. Object lookup uses [`Self::resolve_object`].
+    /// Resolve namespace bindings in priority order. This is the only place
+    /// that selects prefixes or expands aliases. Consumers receive canonical
+    /// backend-relative paths; returning true stops the walk.
     fn visit_layers(
         &self,
         path: &[u8],
         depth: u8,
         visit: &mut LayerVisitor<'_>,
     ) -> bool {
-        let Some(best) = self.longest_prefix(path) else { return false };
-
-        // Bindings are appended oldest-to-newest, so reverse iteration is
-        // already union priority order. A Replace group is a single member.
-        let mut n = 0;
-        for (i, b) in self.mounts.iter().enumerate().rev() {
-            if b.prefix.len() != best { continue; }
-            let Some(start) = match_prefix(b.prefix, path) else { continue };
-            if n == MAX_UNION {
-                crate::compact_dbg_println!(
-                    "vfs: union group exceeds {} layers; dropping oldest", MAX_UNION);
-                break;
+        let mut ceiling = usize::MAX;
+        loop {
+            let Some(best) = self.mounts.iter()
+                .filter(|b| b.prefix.len() < ceiling && match_prefix(b.prefix, path).is_some())
+                .map(|b| b.prefix.len()).max()
+            else { return false };
+            let mut count = 0;
+            for (index, binding) in self.mounts.iter().enumerate().rev() {
+                if binding.prefix.len() != best { continue; }
+                let Some(start) = match_prefix(binding.prefix, path) else { continue };
+                if count == MAX_UNION { return false; }
+                count += 1;
+                let subpath = &path[start..];
+                let done = match binding.target {
+                    BindTarget::Server(fs) => visit(index as u8, fs, subpath),
+                    BindTarget::Alias { src_prefix } if depth != 0 => {
+                        let mut rewritten = alloc::vec![0; PATH_KEY_MAX];
+                        compose_alias(src_prefix, subpath, &mut rewritten)
+                            .is_some_and(|len| self.visit_layers(&rewritten[..len], depth - 1, visit))
+                    }
+                    BindTarget::Alias { .. } => false,
+                };
+                if done { return true; }
+                if binding.mode == MountMode::Replace { return false; }
             }
-            n += 1;
-            let subpath = &path[start..];
-            match b.target {
-                BindTarget::Server(fs) => {
-                    if visit(i as u8, fs, subpath) { return true; }
-                }
-                BindTarget::Alias { src_prefix } => {
-                    if depth == 0 { continue; }
-                    // Retry the lookup as `src_prefix + subpath`.
-            let mut buf = alloc::vec![0u8; PATH_KEY_MAX];
-                    let (pl, sl) = (src_prefix.len(), subpath.len());
-                    if pl + sl > buf.len() { continue; }
-                    buf[..pl].copy_from_slice(src_prefix);
-                    buf[pl..pl + sl].copy_from_slice(subpath);
-                    if self.visit_layers(&buf[..pl + sl], depth - 1, visit) { return true; }
-                }
-            }
+            // A union at a deeper prefix includes the enclosing filesystem.
+            // A replacement terminates above, even when its lookup missed.
+            ceiling = best;
         }
-        false
     }
 
-    /// The single highest-priority `Server` member at the longest matching
-    /// prefix (non-allocating). Used by `create`/`delete`, which write to the
-    /// top layer. Alias heads and an empty table fall back to `EmptyFs`.
-    fn resolve_head<'a>(&self, path: &'a [u8]) -> (u8, &'static dyn Filesystem, &'a [u8]) {
-        let mut best: Option<(usize, usize, usize)> = None; // (prefix length, index, path start)
-        for (i, b) in self.mounts.iter().enumerate().rev() {
-            if let BindTarget::Server(_) = b.target
-                && let Some(start) = match_prefix(b.prefix, path) {
-                let better = match best {
-                    None => true,
-                    Some((best_len, _, _)) => b.prefix.len() > best_len,
-                };
-                if better { best = Some((b.prefix.len(), i, start)); }
+    /// Select the first writable layer for namespace mutations. Permission
+    /// checks still apply to the selected object/parent. If every layer is
+    /// read-only, return the first so callers report the normal access error.
+    fn resolve_create_layer(&self, path: &[u8]) -> (u8, &'static dyn Filesystem, Vec<u8>) {
+        let mut first = None;
+        let mut writable = None;
+        self.visit_layers(path, ALIAS_DEPTH, &mut |index, fs, subpath| {
+            if first.is_none() { first = Some((index, fs, subpath.to_vec())); }
+            if matches!(self.mounts[index as usize].access, WriteAccess::None) {
+                return false;
             }
-        }
-        match best {
-            Some((_, i, start)) => match self.mounts[i].target {
-                BindTarget::Server(fs) => (i as u8, fs, &path[start..]),
-                BindTarget::Alias { .. } => unreachable!(),
-            },
-            None => (0, &EMPTY_FS, path),
-        }
+            writable = Some((index, fs, subpath.to_vec()));
+            true
+        });
+        writable.or(first).unwrap_or((0, &EMPTY_FS, path.to_vec()))
     }
 
     /// If `parent/<name>` (case-insensitive) is itself a mount/bind point,
@@ -700,6 +647,7 @@ impl Vfs {
         self.mounts.push(Binding {
             prefix,
             target,
+            mode,
             access: WriteAccess::Delegated,
         });
     }
@@ -1060,7 +1008,8 @@ impl Vfs {
             None => return -2,
         };
         let path = resolved.as_slice();
-        let (midx, fs, subpath) = self.resolve_head(path);
+        let (midx, fs, subpath) = self.resolve_create_layer(path);
+        let subpath = subpath.as_slice();
         if !fs.supports_mkdir() { return -38; }
         if !self.may_write_parent(midx, subpath) { return -13; }
         let rc = fs.mkdir(subpath);
@@ -1086,7 +1035,7 @@ impl Vfs {
         // affecting any other open (see `close_handle`).
         // Carry the subpath out too: the write verdict must be taken against
         // the member that actually opened the file, not against whatever
-        // `resolve_head` would pick.
+        // `resolve_create_layer` would pick.
         let resolved = self.open_cached_node(path).or_else(|| {
             let object = self.resolve_object(path, ALIAS_DEPTH)?;
             if object.stat.is_dir || object.stat.is_symlink { return None; }
@@ -1110,7 +1059,12 @@ impl Vfs {
             .or_else(|| self.resolve_parent_symlinks(path));
         let Some(resolved) = resolved else { return -2 };
         let path = resolved.as_slice();
-        let (midx, fs, subpath) = self.resolve_head(path);
+        // Truncation belongs to the visible object. Creating an invisible
+        // lower-layer copy of a read-only boot file would lose the user's edit.
+        let (midx, fs, subpath) = self.resolve_object(path, ALIAS_DEPTH)
+            .map(|object| (object.mount_idx, object.fs, object.subpath))
+            .unwrap_or_else(|| self.resolve_create_layer(path));
+        let subpath = subpath.as_slice();
         if !fs.supports_create() { return -38; }
         // Did it already exist? Decides both which permission applies and
         // whether a successful create needs stamping as ours.
@@ -1139,7 +1093,8 @@ impl Vfs {
     fn rmdir(&mut self, path: &[u8]) -> i32 {
         let Some(resolved) = self.resolve_symlinks(path, false) else { return -2 };
         let path = resolved.as_slice();
-        let (midx, fs, subpath) = self.resolve_head(path);
+        let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
+        let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         if !fs.supports_directory_mutation() { return -38; }
         if !self.may_write_parent(midx, subpath) || !self.may_write(midx, subpath) {
             return -13;
@@ -1160,8 +1115,10 @@ impl Vfs {
         let old = old_resolved.as_slice();
         let new = new_resolved.as_slice();
         if self.path_exists(new) { return -17; }
-        let (old_idx, old_fs, old_sub) = self.resolve_head(old);
-        let (new_idx, _new_fs, new_sub) = self.resolve_head(new);
+        let Some(object) = self.resolve_object(old, ALIAS_DEPTH) else { return -2 };
+        let (old_idx, old_fs, old_sub) = (object.mount_idx, object.fs, object.subpath());
+        let (new_idx, _new_fs, new_sub) = self.resolve_create_layer(new);
+        let new_sub = new_sub.as_slice();
         if old_idx != new_idx { return -18; } // EXDEV
         if !old_fs.supports_directory_mutation() { return -38; }
         if !self.may_write(old_idx, old_sub)
@@ -1213,7 +1170,8 @@ impl Vfs {
         if !self.path_exists(path) { return -2; }
         let Some(resolved) = self.resolve_symlinks(path, true) else { return -2 };
         let path = resolved.as_slice();
-        let (midx, fs, subpath) = self.resolve_head(path);
+        let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
+        let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         if !self.may_write(midx, subpath) { return -13; }
         if let Some(m) = fs.meta(subpath)
             && !fs.set_meta(subpath, m.uid, m.gid, mode) { return -13; }
@@ -1228,22 +1186,33 @@ impl Vfs {
         Some(&e.path)
     }
 
+    fn handle_object(&self, handle: i32) -> Option<ResolvedObject> {
+        let entry = self.file_table.get(usize::try_from(handle).ok()?)?;
+        if entry.refcount == 0 { return None; }
+        self.resolve_listed(&entry.path, ALIAS_DEPTH, entry.mount_idx, Stat {
+            size: entry.vnode.size, mode: entry.vnode.mode,
+            is_dir: false, is_symlink: false, ino: 0,
+        })
+    }
+
     fn flush_handle(&mut self, handle: i32) -> i32 {
-        let Some(path) = self.handle_path(handle).map(|p| p.to_vec()) else { return -9; };
-        let (_idx, fs, subpath) = self.resolve_head(&path);
+        let Some(object) = self.handle_object(handle) else { return -9 };
+        let (fs, subpath) = (object.fs, object.subpath());
         fs.flush(subpath)
     }
 
     fn handle_mtime(&self, handle: i32) -> Option<u32> {
         let path = self.handle_path(handle)?;
         if let Some(&t) = self.mtimes.get(path) { return Some(t); }
-        let (_idx, fs, subpath) = self.resolve_head(path);
+        let object = self.handle_object(handle)?;
+        let (fs, subpath) = (object.fs, object.subpath());
         fs.mtime(subpath)
     }
 
     fn set_handle_mtime(&mut self, handle: i32, mtime: u32) -> i32 {
         let Some(path) = self.handle_path(handle).map(|p| p.to_vec()) else { return -9; };
-        let (midx, fs, subpath) = self.resolve_head(&path);
+        let Some(object) = self.handle_object(handle) else { return -9 };
+        let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         if !self.may_write(midx, subpath) { return -13; }
         if !fs.set_mtime(subpath, mtime) && fs.meta(subpath).is_some() { return -13; }
         self.mtimes.insert(path, mtime);
@@ -1255,7 +1224,8 @@ impl Vfs {
         let Some(resolved) = self.resolve_symlinks(path, false) else { return -2 };
         let path = resolved.as_slice();
         // Ask the backing filesystem (Tremove). Read-only backends reject it.
-        let (midx, fs, subpath) = self.resolve_head(path);
+        let Some(object) = self.resolve_object(path, ALIAS_DEPTH) else { return -2 };
+        let (midx, fs, subpath) = (object.mount_idx, object.fs, object.subpath());
         // Unlinking mutates the parent, so the parent must be ours — and the
         // victim too, so a link we may traverse can't delete something we may
         // not write. Only meaningful where the mount has a rule at all.
@@ -1658,7 +1628,8 @@ pub fn dos_attributes(path: &[u8]) -> Option<u8> {
     let path = v.resolve_symlinks(path, true)?;
     if let Some(&attributes) = v.dos_attributes.get(&path) { return Some(attributes); }
     let (mode, is_dir) = v.path_mode(&path)?;
-    let (_, fs, subpath) = v.resolve_head(&path);
+    let object = v.resolve_object(&path, ALIAS_DEPTH)?;
+    let (fs, subpath) = (object.fs, object.subpath());
     fs.dos_attributes(subpath).or(Some(if is_dir { 0x10 } else { 0x20 }
         | if mode & 0o222 == 0 { 1 } else { 0 }))
 }
@@ -1667,7 +1638,8 @@ pub fn set_dos_attributes(path: &[u8], attributes: u8) -> i32 {
     if attributes & !0x37 != 0 { return -22; }
     let mut v = VFS.lock();
     let Some(path) = v.resolve_symlinks(path, true) else { return -2 };
-    let (midx, _, subpath) = v.resolve_head(&path);
+    let Some(object) = v.resolve_object(&path, ALIAS_DEPTH) else { return -2 };
+    let (midx, subpath) = (object.mount_idx, object.subpath());
     if !v.may_write(midx, subpath) { return -13; }
     let Some((_, is_dir)) = v.path_mode(&path) else { return -2 };
     v.dos_attributes.insert(path, (attributes & 0x27) | if is_dir { 0x10 } else { 0 });
@@ -1995,8 +1967,9 @@ pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
             size: vnode.size,
         });
     }
-    let (_mount_idx, fs, subpath) = vfs.resolve_head(&resolved);
-    let vnode = fs.open(subpath)?;
+    let object = vfs.resolve_object(&resolved, ALIAS_DEPTH)?;
+    let fs = object.fs;
+    let vnode = fs.open(object.subpath())?;
     Some(BackingFile { fs, handle: vnode.handle, size: vnode.size })
 }
 
@@ -2138,6 +2111,51 @@ mod tests {
         );
     }
 
+    /// A filesystem in which every path exists, for tests about NAMESPACE
+    /// resolution rather than about any backend's contents.
+    struct AnyFs;
+    static ANY_FS: AnyFs = AnyFs;
+
+    impl Filesystem for AnyFs {
+        fn open(&self, _path: &[u8]) -> Option<Vnode> {
+            Some(Vnode { handle: 1, size: 1, mode: 0o444 })
+        }
+        fn read(&self, _h: u64, _o: u32, _b: &mut [u8], _s: u32) -> i32 { 0 }
+
+        /// Every directory holds one subdirectory `DN` holding one file.
+        /// A trailing slash is REJECTED, as a real backend does -- that is
+        /// exactly the shape that made a bind point list as empty.
+        fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, _m: usize)
+            -> Option<u64>
+        {
+            if dir.last() == Some(&b'/') { return None; }
+            if cookie != super::READDIR_START { return None; }
+            let last = dir.rsplit(|b| *b == b'/').next().unwrap_or(b"");
+            let listing: &[(&[u8], bool)] = match last {
+                // A mounted volume's own root arrives as an empty subpath,
+                // so this listing serves both `/` and each volume root.
+                b"" => &[(b"home", true), (b"RETROOS", true)],
+                b"home" => &[(b"retroos", true)],
+                b"retroos" | b"bootfs" => &[(b"RETROOS", true)],
+                b"RETROOS" => &[(b"DN", true)],
+                b"DN" => &[(b"DN.COM", false)],
+                _ => return None,
+            };
+            for &(name, is_dir) in listing {
+                let mut entry = DirEntry {
+                    name: alloc::vec![0; name.len()], name_len: name.len(), size: 1,
+                    short_name: None, is_dir, is_symlink: false, mode: 0o444,
+                    dos_attributes: None, mtime: 0, node: 0, mount_idx: 0,
+                };
+                entry.name[..name.len()].copy_from_slice(name);
+                out.push(entry);
+            }
+            None
+        }
+        fn clunk(&self, _handle: u64) -> i32 { 0 }
+        fn dir_exists(&self, path: &[u8]) -> bool { path.last() != Some(&b'/') }
+    }
+
     struct NodeFs;
     static NODE_FS: NodeFs = NodeFs;
 
@@ -2242,8 +2260,92 @@ mod tests {
             false,
         );
         assert_eq!(visited, [1, 0]);
-        assert_eq!(vfs.resolve_head(b"stack/file").0, 1);
+        assert_eq!(vfs.resolve_create_layer(b"stack/file").0, 1);
         assert_eq!(vfs.resolve_object(b"stack", 8).unwrap().mount_idx, 1);
+    }
+
+    /// A bind whose prefix is DEEPER than the mount it overlays must still
+    /// resolve. C:\RETROOS is exactly this shape: the boot volume's userland
+    /// is bound over a path that already lives inside the mounted C: volume,
+    /// so the bind's prefix is the longest match and the alias is the only
+    /// binding at that length.
+    #[test]
+    fn a_bind_deeper_than_the_mount_it_overlays_resolves() {
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &ANY_FS);                   // the Unix root
+        vfs.mount(b"home/retroos/", &ANY_FS);      // the C: volume
+        vfs.mount(b"bootfs/", &ANY_FS);            // the boot volume
+        vfs.bind(b"home/retroos/RETROOS/", b"bootfs/RETROOS/", super::MountMode::Union);
+
+        // The source path resolves directly ...
+        assert!(vfs.path_exists(b"bootfs/RETROOS/DN/DN.COM"));
+        // ... so the bound path must resolve too. This goes through the
+        // parent-by-parent walk, which is what actually broke: naming the
+        // bind point composed `bootfs/RETROOS/` with a trailing slash, the
+        // backend listed nothing, and the walk failed at `DN`.
+        assert!(vfs.path_exists(b"home/retroos/RETROOS/DN/DN.COM"));
+    }
+
+    #[test]
+    fn union_bind_lists_and_reopens_persistent_files_beside_boot_files() {
+        use crate::kernel::fs::fat::{FatFs, VolumeIo, tests::formatted};
+        let disk = || {
+            let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+            alloc::boxed::Box::leak(alloc::boxed::Box::new(
+                FatFs::new(VolumeIo::new(volume, true)).unwrap()))
+        };
+        let data = disk();
+        let boot = disk();
+        for fs in [&*data, &*boot] {
+            assert_eq!(fs.mkdir(b"RETROOS"), 0);
+        }
+        let shipped = boot.create(b"RETROOS/COMMAND.COM").unwrap();
+        assert_eq!(boot.write(shipped.handle, 0, b"boot"), 4);
+        boot.clunk(shipped.handle);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", data);
+        vfs.mount(b"bootfs/", boot);
+        vfs.mounts[1].access = WriteAccess::None;
+        vfs.bind(b"RETROOS/", b"bootfs/RETROOS/", super::MountMode::Union);
+
+        let file = vfs.create_to_handle(b"RETROOS/DN.HIS");
+        assert!(file >= 0);
+        assert_eq!(vfs.file_table[file as usize].mount_idx, 0);
+        let fid = vfs.file_table[file as usize].vnode.handle;
+        assert_eq!(data.write(fid, 0, b"saved"), 5);
+        vfs.close_handle(file);
+        vfs.invalidate_dir_cache();
+        let file = vfs.open_to_handle(b"RETROOS/DN.HIS");
+        assert!(file >= 0);
+        let mut bytes = [0; 5];
+        assert_eq!(vfs.read_by_handle(file, &mut bytes), 5);
+        assert_eq!(&bytes, b"saved");
+        vfs.close_handle(file);
+        let file = vfs.open_to_handle(b"RETROOS/COMMAND.COM");
+        assert!(file >= 0);
+        assert_eq!(vfs.file_table[file as usize].mount_idx, 1);
+        assert!(!vfs.file_table[file as usize].writable);
+        vfs.close_handle(file);
+        assert!(vfs.path_exists(b"RETROOS/DN.HIS"));
+        assert!(vfs.path_exists(b"RETROOS/COMMAND.COM"));
+        assert_eq!(vfs.create_to_handle(b"RETROOS/COMMAND.COM"), -13);
+        assert_eq!(vfs.delete(b"RETROOS/COMMAND.COM"), -13);
+        assert_eq!(vfs.delete(b"RETROOS/DN.HIS"), 0);
+        assert!(!vfs.path_exists(b"RETROOS/DN.HIS"));
+    }
+
+    #[test]
+    fn replacement_bind_routes_mutations_and_does_not_expose_parent() {
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &ANY_FS);
+        vfs.mount(b"target/", &FAILING_CREATE_FS);
+        vfs.bind(b"alias/", b"target/", super::MountMode::Replace);
+        let (index, _, path) = vfs.resolve_create_layer(b"alias/new");
+        assert_eq!(index, 1);
+        assert_eq!(path, b"new");
+        assert!(vfs.resolve_object(b"alias/missing", super::ALIAS_DEPTH).is_none());
+        vfs.bind(b"cycle/", b"cycle/", super::MountMode::Replace);
+        assert!(vfs.resolve_object(b"cycle/file", super::ALIAS_DEPTH).is_none());
     }
 
     #[test]

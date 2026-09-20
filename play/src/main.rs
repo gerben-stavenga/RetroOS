@@ -31,6 +31,7 @@ fn log_byte(b: u8) {
 
 fn main() {
     let mut host_dir: Option<String> = None;
+    let mut boot_disk: Option<String> = None;
     let mut cmd: Option<String> = None;
     let mut cwd: Option<String> = None;
     let mut c_root: Option<String> = None;
@@ -39,6 +40,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--boot-disk" => boot_disk = args.next(),
             "--host" => host_dir = args.next(),
             "--cmd" => cmd = args.next(),
             "--cwd" => cwd = args.next(),
@@ -68,7 +70,7 @@ fn main() {
         // the host-environment facts the platform probe reads. `retroos-host`
         // does the identical injection in `install_hosted_backend`; without it
         // the port hooks stay `NONE`, `hdd::probe` reads garbage, and the disk
-        // is never detected (Diskless — and with no root there is no C:\BOOT,
+        // is never detected (Diskless — and with no root there is no C:\RETROOS,
         // so no shell either).
         kernel::install_portio(kernel::PortIo {
             inb: arch::inb,
@@ -129,6 +131,12 @@ fn main() {
             arch::attach_audio(path); // canonical audio → WAV (offline check)
         }
         arch::init_guest_ram(0);
+        if let Some(path) = &boot_disk {
+            arch::attach_boot_disk(path).unwrap_or_else(|e| {
+                eprintln!("cannot attach boot disk {path}: {e}");
+                std::process::exit(1);
+            });
+        }
         if let Some(image) = &image {
             arch::attach_disk(image).unwrap_or_else(|e| {
                 eprintln!("retroos-play: cannot attach disk {image}: {e}");

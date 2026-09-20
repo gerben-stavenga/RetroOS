@@ -50,7 +50,10 @@ def main():
     log = work / "guest.log"
     recording = work / "hda.wav"
     env = dict(os.environ, QEMU_DISPLAY="none", AUDIO_BACKEND=f"wav,path={recording}")
-    cmd = ["./run.sh", "qemu", "--arch", "x64", "--firmware", "uefi", "-i", "image",
+    subprocess.run(["bazelisk", "build", "//:data_disk"], check=True)
+    data = work / "data.bin"
+    subprocess.run([sys.executable, "test/private_data_disk.py", "bazel-bin/data_disk.bin", str(data)], check=True)
+    cmd = ["./run.sh", "qemu", "--arch", "x64", "--firmware", "uefi", "--data-image", str(data),
            "--sound", "hda", "--cmd", "GAMES/DOOMS/DOOM.EXE"]
     if args.kvm:
         cmd.append("--kvm")

@@ -516,21 +516,83 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
 /// Keep the boot-time mount namespace in the single-digit `/diskN` range.
 const MAX_DISK_MOUNTS: usize = 8;
 
-/// Select a filesystem root, not merely the first FAT volume (often an ESP).
-/// Equal scores retain device/partition order, as the ext4-only path did.
-fn root_index(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> usize {
-    if volumes.len() < 2 { return 0; }
-    let mut best = (0, 0);
-    for (index, volume) in volumes.iter().enumerate() {
-        let score = volume.root_score(boot);
-        if score > best.1 { best = (index, score); }
-    }
-    best.0
+/// Which volume does which job.
+///
+/// A job may be unfilled, and one volume may hold several jobs: an installed
+/// machine has ONE ext4 that is both the Unix root and C:, while the dev loop
+/// has a boot disk, a FAT C: and an ext4 `/` on separate volumes. Both are
+/// this same plan with different slots filled — which is precisely what keeps
+/// the two arrangements from turning into two code paths.
+#[derive(Default)]
+struct MountPlan {
+    /// `/` — the Unix tree the Linux personality needs.
+    unix_root: usize,
+    /// The volume holding C:. Equal to `unix_root` on an installed machine.
+    dos_drive: Option<usize>,
+    /// The boot volume, which supplies C:\RETROOS. Never a root.
+    boot_support: Option<usize>,
+    /// Everything else, read-only at /diskN.
+    spares: alloc::vec::Vec<usize>,
 }
 
-/// Build the mount tree. The disk's 0xDA boot-bundle partition is
-/// bootloader-only and never mounted; C:\BOOT (DN + COMMAND.COM) is an
-/// ordinary directory on whatever backs C:, not a mount of its own.
+/// Decide the plan from what each volume actually contains.
+///
+/// Evidence, not partition type and not device order: the same disk set must
+/// come out the same way whichever order the BIOS happens to enumerate it.
+fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> MountPlan {
+    if let Some(uuid) = boot.root_uuid {
+        let mut matches = volumes.iter().enumerate().filter(|(_, v)| v.uuid() == Some(uuid));
+        let root = matches.next().map(|(i, _)| i)
+            .unwrap_or_else(|| lib::compact_panic!("Configured root UUID not found"));
+        if matches.next().is_some() {
+            lib::compact_panic!("Configured root UUID is ambiguous");
+        }
+        return MountPlan {
+            unix_root: root, dos_drive: Some(root), boot_support: None,
+            spares: (0..volumes.len()).filter(|i| *i != root).collect(),
+        };
+    }
+    let evidence: alloc::vec::Vec<_> =
+        volumes.iter().map(|volume| volume.evidence(boot)).collect();
+    let find = |pick: fn(&crate::kernel::fs::disk::Evidence) -> bool| {
+        evidence.iter().position(pick)
+    };
+
+    let boot_support = find(|e| e.boot);
+    let unix = find(|e| e.unix);
+    let dos = find(|e| e.dos);
+
+    // A root is required. Preferring the Unix tree keeps `/` meaningful for
+    // the Linux personality; a DOS-only machine roots on C: instead. If
+    // nothing identified itself, fall back to the first readable volume
+    // rather than refusing to boot -- but say so, because a root chosen
+    // without evidence is a root that may be wrong.
+    let unix_root = match unix.or(dos) {
+        Some(index) => index,
+        None => {
+            crate::compact_println!(
+                "Filesystems: no volume carries Unix or DOS markers; \
+                 rooting on the first readable one"
+            );
+            0
+        }
+    };
+
+    let spares = (0..volumes.len())
+        .filter(|i| Some(*i) != Some(unix_root)
+            && Some(*i) != dos
+            && Some(*i) != boot_support)
+        .collect();
+
+    MountPlan { unix_root, dos_drive: dos, boot_support, spares }
+}
+
+/// A leaked `&'static [u8]` for a mount prefix built at runtime.
+fn prefix(parts: &[&[u8]]) -> &'static [u8] {
+    alloc::boxed::Box::leak(parts.concat().into_boxed_slice())
+}
+
+/// Build the namespace from the selected volumes and explicit install paths.
 #[inline(never)]
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
@@ -553,6 +615,12 @@ fn mount_filesystems(
     crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
 
     let mut hostfs_is_root = false;
+    if boot.root_uuid.is_some() && (modules.has_root || volumes.is_empty()) {
+        lib::compact_panic!("Explicit disk root unavailable or conflicts with module root");
+    }
+    if boot.runtime().is_some() && boot.root_uuid.is_none() {
+        lib::compact_panic!("retroos.runtime requires retroos.root");
+    }
     if modules.has_root {
         // A Multiboot root owns `/`; physical filesystems remain available as
         // read-only fallback mounts below `/diskN`.
@@ -578,7 +646,8 @@ fn mount_filesystems(
             lib::compact_panic!("No root filesystem available");
         }
     } else {
-        let root = root_index(&volumes, boot);
+        let plan = plan_mounts(&volumes, boot);
+        let root = plan.unix_root;
         let root_volume = volumes[root];
         crate::compact_screenln!(screen,
             "Mounting {} root ({} MB)...", root_volume.name(), root_volume.volume.sectors / 2048);
@@ -586,17 +655,81 @@ fn mount_filesystems(
             .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error));
         crate::compact_screenln!(screen, "{} root mounted", root_volume.name());
         let fs: &'static dyn vfs::Filesystem = alloc::boxed::Box::leak(fs);
-        crate::kernel::dos::set_c_root(root_volume.c_root(boot));
+
+        // Where C: lands. One volume holding both jobs keeps the mapping it
+        // declares (ext4 → its home subdirectory, FAT → its own root). A
+        // separate C: volume mounts AT that same path, so every absolute DOS
+        // path is unchanged by the split — which matters because installers
+        // bake C:\... into their configs at install time.
+        let c_root: &'static [u8] = match plan.dos_drive {
+            Some(dos) if dos != root => {
+                let home = boot.c_root();
+                let home: &'static [u8] = if home.is_empty() {
+                    b"home/retroos/"
+                } else {
+                    prefix(&[home])
+                };
+                let dos_volume = volumes[dos];
+                match dos_volume.open(true) {
+                    Ok(dos_fs) => {
+                        let dos_fs: &'static dyn vfs::Filesystem =
+                            alloc::boxed::Box::leak(dos_fs);
+                        dos_volume.mount_writable(home, dos_fs, b"");
+                        crate::screenln!(screen, "{} C: ({} MB) → /{}",
+                            dos_volume.name(), dos_volume.volume.sectors / 2048,
+                            core::str::from_utf8(home).unwrap_or("?"));
+                        home
+                    }
+                    // The root is already up; losing C: is not fatal, but it
+                    // is never silent -- every DOS path would fail otherwise.
+                    Err(error) => {
+                        crate::compact_screenln!(screen, "C: mount failed: {}", error);
+                        prefix(&[root_volume.c_root(boot)])
+                    }
+                }
+            }
+            // One volume holds both jobs (an installed machine), or there is
+            // no separate C: at all. Leaked so the prefix outlives `boot`.
+            _ => prefix(&[root_volume.c_root(boot)]),
+        };
+        crate::kernel::dos::set_c_root(c_root);
         // Ext4 writes use the group owning RetroOS's home; FAT has no Unix
         // ownership and delegates writes. Extra mounts are explicitly read-only.
         root_volume.mount_writable(b"", fs, crate::kernel::dos::c_root());
+
+        // Runtime files are read-only. DN state and launch policy live under
+        // C:\CONFIG, so this is a replacement binding with no writable union.
+        if let Some(runtime) = boot.runtime() {
+            let directory = &runtime[..runtime.len() - 1];
+            if !fs.dir_exists(directory) || !fs.dir_exists(&c_root[..c_root.len().saturating_sub(1)]) {
+                lib::compact_panic!("Configured runtime or C: directory is missing");
+            }
+            // Reuse the same filesystem instance/cache, with a read-only mount
+            // policy. Binding a subtree needs no second path resolver.
+            vfs::mount_readonly(b"bootfs/", fs);
+            vfs::bind(prefix(&[c_root, b"RETROOS/"]), prefix(&[b"bootfs/", runtime]));
+            crate::screenln!(screen, "runtime /{} → C:\\RETROOS (read-only)",
+                core::str::from_utf8(directory).unwrap_or("?"));
+        } else if let Some(index) = plan.boot_support {
+            let boot_volume = volumes[index];
+            match boot_volume.open(false) {
+                Ok(boot_fs) => {
+                    vfs::mount_readonly(b"bootfs/", alloc::boxed::Box::leak(boot_fs));
+                    vfs::bind(prefix(&[c_root, b"RETROOS/"]), b"bootfs/RETROOS/");
+                    crate::screenln!(screen, "boot volume ({} MB) → C:\\RETROOS",
+                        boot_volume.volume.sectors / 2048);
+                }
+                Err(error) =>
+                    crate::compact_screenln!(screen, "boot volume skipped: {}", error),
+            }
+        }
 
         // Every other supported filesystem mounts read-only at /disk1, /disk2, …
         // (Linux-visible, not under C:). An unreadable one is logged and
         // skipped, never fatal — the root is already up.
         let mut slot = modules.next_fs_slot;
         for (i, vol) in volumes.iter().enumerate() {
-            if i == root {
+            if !plan.spares.contains(&i) {
                 continue;
             }
             slot += 1;
@@ -635,8 +768,7 @@ fn mount_filesystems(
         }
     }
 
-    // C:\BOOT is an ordinary directory on whatever backs C: — no mount, no
-    // embedded archive. A root without one simply has no DOS system directory.
+    // DOS paths use the same C: prefix with either a runtime binding or a direct tree.
     crate::compact_screenln!(screen, "DOS C: maps to /{}",
         core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
     mount_kernel_log_fs();
@@ -846,7 +978,7 @@ fn run<A: crate::Arch>(
     }
 
     // COMMAND.COM is prebuilt (in-OS TCC at image-build time —
-    // //tools/command:command_com) and ships at C:\BOOT\COMMAND.COM, which is
+    // //tools/command:command_com) and ships at C:\RETROOS\COMMAND.COM, which is
     // where COMSPEC points. The per-boot self-build from
     // BOOT\SRC\COMMAND.C is gone with it; the BCC EXEC-path exercise it
     // doubled as lives on in test/dpmi_smoke.sh.
@@ -854,7 +986,7 @@ fn run<A: crate::Arch>(
     crate::compact_screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
     crate::compact_screenln!(&mut screen, "Starting DN...");
-    let dn_path = [crate::kernel::dos::c_root(), b"BOOT/DN/DN.COM"].concat();
+    let dn_path = [crate::kernel::dos::c_root(), b"RETROOS/DN/DN.COM"].concat();
     loop {
         (screen, sb) = run_program_with_screen(
             machine,
@@ -982,7 +1114,7 @@ fn prepare_program<A: crate::Arch>(
     if is_batch {
         let mut dos_path = [0u8; dos::DFS_PATH_MAX];
         let dos_len = dos::vfs_to_dos(path, &mut dos_path);
-        launch_path = [dos::c_root(), b"BOOT/COMMAND.COM"].concat();
+        launch_path = [dos::c_root(), b"RETROOS/COMMAND.COM"].concat();
         launch_tail = b"/C ".to_vec();
         launch_tail.extend_from_slice(&dos_path[..dos_len]);
         if !cmdline_tail.is_empty() {

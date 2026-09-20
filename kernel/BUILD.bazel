@@ -156,7 +156,7 @@ genrule(
     # in any PT_LOAD, so no loader ever wanted it — it was pure weight on
     # everything that carries the kernel: the boot-bundle TAR the MBR stage
     # reads, the GRUB image, and the one file you copy onto a real machine.
-    # Symbols ship separately as :kernel_sym -> C:\BOOT\KERNEL.SYM.
+    # Symbols ship separately as :kernel_sym -> C:\RETROOS\KERNEL.SYM.
     cmd = "objcopy --strip-all $< $@",
     visibility = ["//visibility:public"],
 )

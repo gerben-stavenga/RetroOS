@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Build the RetroOS BOOT DISK — pure build output, rebuilt every launch.
 
-This disk carries no state.  Everything on it comes from the current build, so
-`--fresh` for it is just `rm`: there is nothing to preserve, diff or migrate.
+This disk carries no state. Everything on it comes from the current build.
 Guest state lives on the separate data disk (tools/build_data_disk.py).
 
 Layout:
@@ -13,17 +12,16 @@ Layout:
                         /boot/grub/{grub.cfg,i386-pc/*.mod}   BIOS GRUB
                         /EFI/BOOT/BOOTX64.EFI                 UEFI GRUB
                         /kernel.elf                           multiboot target
-                        /BOOT/...                             mounted at C:\\BOOT
+                        /RETROOS/...                          mounted at C:\\RETROOS
 
 One FAT partition does three jobs: it is GRUB's prefix volume on BIOS, the EFI
-System Partition on UEFI, and the source of C:\\BOOT in the dev loop.  Type
+System Partition on UEFI, and the source of C:\\RETROOS in the dev loop.  Type
 0xEF keeps DOS from assigning it a drive letter -- FreeDOS only lettertypes
 01/04/06/0B/0C/0E -- which is what keeps the data disk's FAT as C: in both
 worlds.  That type byte is load-bearing, not cosmetic.
 
 GRUB is installed without loop mounts or root: boot.img and core.img are
-written to the raw sectors and the modules are copied in with mtools, which is
-the same privilege-free constraint run.sh's build_gpt_disk already works under.
+written to the raw sectors and the modules are copied in with mtools.
 """
 
 import argparse
@@ -45,11 +43,13 @@ BOOT_IMG_KERNEL_SECTOR = 0x5C
 # Modules core.img needs before it can read its own prefix: enough to find the
 # FAT partition on a BIOS disk and run a config from it.  Everything else is
 # loaded as a .mod from /boot/grub at runtime.
-CORE_MODULES = ["biosdisk", "part_msdos", "fat"]
+CORE_MODULES = ["biosdisk", "part_msdos", "fat", "normal"]
 
 GRUB_CFG = """\
 set timeout={timeout}
 set default=0
+insmod part_msdos
+insmod fat
 
 # The kernel's multiboot header asks for a linear framebuffer; GRUB can only
 # satisfy that with a video driver loaded.  Harmless on BIOS.
@@ -119,7 +119,7 @@ def write_partition_table(image, entries):
         f.write(b"\x55\xaa")
 
 
-def install_grub_bios(image, work, grub_lib, cfg):
+def install_grub_bios(image, work, grub_lib):
     """boot.img in sector 0, core.img in the gap, prefix on p1."""
     core = os.path.join(work, "core.img")
     run([
@@ -127,13 +127,19 @@ def install_grub_bios(image, work, grub_lib, cfg):
         "-O", "i386-pc",
         "-o", core,
         "-p", "(hd0,msdos1)/boot/grub",
-        "-c", cfg,
     ] + CORE_MODULES)
 
     core_sectors = (os.path.getsize(core) + SECTOR - 1) // SECTOR
     if core_sectors >= GAP_SECTORS - 1:
         sys.exit("core.img is %d sectors, does not fit in the %d-sector MBR gap"
                  % (core_sectors, GAP_SECTORS - 1))
+
+    # diskboot.img reads the remainder of core.img through this block list.
+    # grub-mkimage leaves it for the installer to fill in.
+    with open(core, "rb") as f:
+        core_img = bytearray(f.read())
+    core_img += b"\0" * (-len(core_img) % SECTOR)
+    struct.pack_into("<QHH", core_img, 0x1F4, 2, core_sectors - 1, 0x820)
 
     with open(os.path.join(grub_lib, "boot.img"), "rb") as f:
         boot_img = bytearray(f.read(SECTOR))
@@ -146,8 +152,7 @@ def install_grub_bios(image, work, grub_lib, cfg):
         f.seek(0)
         f.write(boot_img[:0x1BE])
         f.seek(SECTOR)
-        with open(core, "rb") as c:
-            f.write(c.read())
+        f.write(core_img)
     return core_sectors
 
 
@@ -182,8 +187,8 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
 
     mcopy(kernel, "/kernel.elf")
 
-    # The DOS userland published as C:\BOOT in the dev loop.  The tree is
-    # copied at the volume root and already carries its own BOOT/ prefix, so
+    # The DOS userland published as C:\RETROOS in the dev loop.  The tree is
+    # copied at the volume root and already carries its own RETROOS/ prefix, so
     # the layout on the partition mirrors the layout in the tar exactly.
     if boot_tree:
         for root, dirs, files in os.walk(boot_tree):
@@ -215,7 +220,7 @@ def build_efi_binary(work, cfg):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--kernel", required=True, help="kernel.elf (multiboot)")
-    ap.add_argument("--boot-tree", help="tree copied to the FAT root; carries BOOT/")
+    ap.add_argument("--boot-tree", help="tree copied to the FAT root; carries RETROOS/")
     ap.add_argument("--grub-lib", default="/usr/lib/grub/i386-pc")
     ap.add_argument("--size-mb", type=int, default=128)
     ap.add_argument("--timeout", type=int, default=0,
@@ -229,6 +234,7 @@ def main():
                  % args.grub_lib)
 
     total_sectors = args.size_mb * 1024 * 1024 // SECTOR
+    total_sectors += (-total_sectors) % (16 * 63)
     part_start = GAP_SECTORS
     part_sectors = total_sectors - part_start
 
@@ -245,7 +251,7 @@ def main():
         # but the table must exist before grub-mkimage's prefix can resolve.
         write_partition_table(args.out, [(True, PART_TYPE_ESP,
                                           part_start, part_sectors)])
-        core_sectors = install_grub_bios(args.out, work, args.grub_lib, cfg)
+        core_sectors = install_grub_bios(args.out, work, args.grub_lib)
         build_fat_partition(args.out, part_start, part_sectors, work,
                             args.grub_lib, cfg, args.kernel, args.boot_tree, efi)
 

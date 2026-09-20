@@ -51,3 +51,6 @@ third_party/vgabios/
 
 # Local game CD images (proprietary, see freedos/*.iso above)
 /CD/
+
+# State written by a local SkyRoads session.
+/apps/games/skyroads/SKYROADS.CFG

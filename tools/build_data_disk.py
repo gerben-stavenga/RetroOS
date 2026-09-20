@@ -8,7 +8,7 @@ everything the build owns (tools/build_boot_disk.py).
 Layout:
 
     LBA 0           FreeDOS MBR (bootnorm.asm) + partition table
-    p1 @ 1 MiB      FAT32, type 0x0C, ACTIVE -- C: in BOTH worlds:
+    p1 @ LBA 63     FAT32, type 0x0C, ACTIVE -- C: in BOTH worlds:
                         KERNEL.SYS, COMMAND.COM, FDCONFIG.SYS   FreeDOS boots it
                         GAMES/, TC/, BORLANDC/, CD/, ...        the DOS world
     p2              ext4 -- the Linux personality's '/' (busybox userland)
@@ -180,6 +180,12 @@ def populate_fat(image, start, sectors, tree, freedos_dir, work, heads):
         f.write("SHELLHIGH=C:\\COMMAND.COM C:\\ /P /E:512\n")
     mcopy(fdconfig, "/FDCONFIG.SYS")
 
+    # Runtime mount point; writable DN state lives separately in CONFIG/DN.
+    mmd("/RETROOS")
+    mmd("/CONFIG")
+    mmd("/CONFIG/DN")
+    mmd("/TEMP")
+
     if not tree:
         return
     for root, dirs, files in os.walk(tree):
@@ -199,9 +205,18 @@ def build_ext4(image, start, sectors, tree, work):
     part = os.path.join(work, "linux.ext4")
     with open(part, "wb") as f:
         f.truncate(sectors * SECTOR)
-    cmd = ["mkfs.ext4", "-q", "-b", "4096", "-L", "RetroOS-root"]
+    # VFS path walking needs real parent directories for the C: mount and
+    # the boot-volume binding, even though their contents live elsewhere.
+    root = os.path.join(work, "linux-root")
     if tree:
-        cmd += ["-d", tree]
+        shutil.copytree(tree, root, symlinks=True)
+    os.makedirs(os.path.join(root, "home", "retroos"), exist_ok=True)
+    os.makedirs(os.path.join(root, "bootfs"), exist_ok=True)
+    os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
+    os.chmod(os.path.join(root, "tmp"), 0o1777)
+    os.chmod(os.path.join(root, "home", "retroos"), 0o2775)
+    cmd = ["mkfs.ext4", "-q", "-b", "4096", "-L", "RetroOS-root",
+           "-d", root]
     run(cmd + [part])
     with open(image, "r+b") as out, open(part, "rb") as src:
         out.seek(start * SECTOR)
@@ -231,6 +246,7 @@ def main():
     ext4_start += (-ext4_start) % ALIGN
     ext4_sectors = args.ext4_mb * MIB // SECTOR
     total = ext4_start + ext4_sectors
+    total += (-total) % (16 * 63)  # exact CHS capacity for 86Box/Bochs
 
     work = tempfile.mkdtemp(prefix="retroos-datadisk.")
     try:

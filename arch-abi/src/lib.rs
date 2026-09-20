@@ -163,6 +163,10 @@ pub struct BootConfig {
     c_root: [u8; 128],
     c_root_len: usize,
     c_root_explicit: bool,
+    /// Explicit installed-machine ext4 root. No autodetection when supplied.
+    pub root_uuid: Option<[u8; 16]>,
+    runtime: [u8; 128],
+    runtime_len: usize,
     /// Debug write-watch addresses (metal QEMU `opt/debug-watch`), if any.
     pub debug_watch: Option<(u32, u32)>,
     /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
@@ -199,12 +203,22 @@ pub struct BootConfig {
     pub boot_physical_reader: Option<BootPhysicalReader>,
 }
 
+fn validate_mount_path(path: &[u8]) {
+    assert!(path.first() == Some(&b'/') && path.len() < 128, "invalid filesystem path");
+    if path == b"/" { return; }
+    assert!(path[1..].split(|&c| c == b'/').all(|part|
+        !part.is_empty() && part != b"." && part != b".." &&
+        part.iter().all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c))),
+        "filesystem path must be canonical");
+}
+
 impl BootConfig {
     pub const fn empty() -> Self {
         let mut cfg = BootConfig {
             cmdline: [0; 4096], cmdline_len: None,
             cwd: [0; 256], cwd_len: None,
             c_root: [0; 128], c_root_len: 0, c_root_explicit: false,
+            root_uuid: None, runtime: [0; 128], runtime_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false,
             hostfs_port: None,
@@ -237,6 +251,48 @@ impl BootConfig {
                 self.serial_console_port = Some(port);
             }
         });
+    }
+
+    /// Installed-machine mounts supplied by GRUB. Invalid explicit settings
+    /// fail closed instead of selecting an unrelated writable partition.
+    pub fn set_filesystems_from_cmdline(&mut self, s: &[u8]) {
+        cmdline::for_each_key_value(s, |key, value| {
+            if cmdline::key_eq(key, b"retroos.root") {
+                assert_eq!(value.len(), 36, "retroos.root requires an ext4 UUID");
+                let mut uuid = [0; 16];
+                let mut digit = 0;
+                for (i, &byte) in value.iter().enumerate() {
+                    if matches!(i, 8 | 13 | 18 | 23) {
+                        assert_eq!(byte, b'-', "invalid root UUID");
+                        continue;
+                    }
+                    let hex = match byte {
+                        b'0'..=b'9' => byte - b'0',
+                        b'a'..=b'f' => byte - b'a' + 10,
+                        b'A'..=b'F' => byte - b'A' + 10,
+                        _ => panic!("invalid root UUID"),
+                    };
+                    uuid[digit / 2] = (uuid[digit / 2] << 4) | hex;
+                    digit += 1;
+                }
+                self.root_uuid = Some(uuid);
+            } else if cmdline::key_eq(key, b"retroos.c-root") {
+                validate_mount_path(value);
+                self.set_c_root(value);
+            } else if cmdline::key_eq(key, b"retroos.runtime") {
+                validate_mount_path(value);
+                assert!(value.len() > 1, "runtime must be a subdirectory");
+                let path = &value[1..];
+                self.runtime[..path.len()].copy_from_slice(path);
+                self.runtime[path.len()] = b'/';
+                self.runtime_len = path.len() + 1;
+            }
+        });
+    }
+
+    /// Path within the selected root, with the VFS trailing slash convention.
+    pub fn runtime(&self) -> Option<&[u8]> {
+        (self.runtime_len != 0).then_some(&self.runtime[..self.runtime_len])
     }
 
     /// Record the headless command line (semicolon-separated program list).
@@ -277,6 +333,27 @@ impl BootConfig {
 #[cfg(test)]
 mod boot_config_tests {
     use super::{BootConfig, ComPort};
+
+    #[test]
+    fn installed_filesystem_arguments_are_explicit_and_canonical() {
+        let mut config = BootConfig::empty();
+        config.set_filesystems_from_cmdline(b"retroos.root=ea8c19a0-a2e3-4d14-9fd2-6955c176122c retroos.c-root=/home/retroos retroos.runtime=/boot/retroos/RETROOS");
+        assert_eq!(config.root_uuid, Some([0xea,0x8c,0x19,0xa0,0xa2,0xe3,0x4d,0x14,0x9f,0xd2,0x69,0x55,0xc1,0x76,0x12,0x2c]));
+        assert_eq!(config.c_root(), b"home/retroos/");
+        assert_eq!(config.runtime(), Some(&b"boot/retroos/RETROOS/"[..]));
+    }
+
+    #[test]
+    #[should_panic(expected = "filesystem path must be canonical")]
+    fn installed_runtime_rejects_parent_components() {
+        BootConfig::empty().set_filesystems_from_cmdline(b"retroos.runtime=/boot/../home");
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid root UUID")]
+    fn malformed_root_uuid_never_falls_back_to_autodetection() {
+        BootConfig::empty().set_filesystems_from_cmdline(b"retroos.root=za8c19a0-a2e3-4d14-9fd2-6955c176122c");
+    }
 
     #[test]
     fn explicit_c_root_is_distinct_from_the_default_hint() {

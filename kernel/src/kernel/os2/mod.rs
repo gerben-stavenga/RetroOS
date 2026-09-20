@@ -613,7 +613,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     machine.write::<u32>((pib + 8) as usize, 1);
     machine.write::<u32>((pib + 12) as usize, cmd);
     machine.write::<u32>((pib + 16) as usize, env);
-    machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\OS2\\DLL\0COMSPEC=C:\\BOOT\\COMMAND.COM\0\0");
+    machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0");
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();

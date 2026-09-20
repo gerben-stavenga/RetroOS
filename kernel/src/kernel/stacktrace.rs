@@ -102,10 +102,10 @@ fn kernel_symbols_ptr() -> *mut Option<SymbolData> {
 
 /// Load the kernel's symbol table, for naming addresses in a backtrace.
 ///
-/// `C:\BOOT\KERNEL.SYM` is generated from the unstripped linked kernel. It
+/// `C:\RETROOS\KERNEL.SYM` is generated from the unstripped linked kernel. It
 /// contains only fixed-size address records and pre-demangled names.
 pub fn init_from_vfs() {
-    let sym = [crate::kernel::dos::c_root(), b"BOOT/KERNEL.SYM"].concat();
+    let sym = [crate::kernel::dos::c_root(), b"RETROOS/KERNEL.SYM"].concat();
     let handle = vfs::open_to_handle(&sym);
     if handle < 0 {
         compact_println!("stacktrace: no KERNEL.SYM — backtraces will be addresses only");

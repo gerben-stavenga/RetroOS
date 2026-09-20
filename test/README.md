@@ -43,3 +43,22 @@ and crashes, after a ten-second loading/settling period. The old per-driver
 HDA counters no longer exist; cursor and ring
 accounting are tested in `lib:sound_test`. The PCM checker itself has negative
 tests for silence, stalled playback and truncated recordings.
+
+`python3 test/shared_disks.py` checks that the shared data disk is seeded once,
+preserves guest changes across launches, rejects concurrent launchers, and checks
+backend disk attachments. `test/private_data_disk.py` prepares disposable copies
+for probes that need a `CONFIG.SYS` command; normal launches never inject it.
+
+`python3 test/machine_layout.py` boots an ext4 laptop-style layout containing
+`/boot/grub`, checks UUID selection with reordered disks, read-only runtime files,
+persistent C: writes, rejection of a missing UUID, and a clean ext4 filesystem.
+
+`python3 test/dn_state.py` drives the shipped DN through QEMU: save configuration,
+execute a command, exit and restart, then verify persistent history/config and
+separate temporary files. The data disk's runtime directory stays empty.
+
+After `bazelisk build //:release`, `python3 test/release.py` checks checksums,
+extracts the public bundles, exercises the packaged installer, and boots the
+prebuilt VM launcher without invoking Bazel. CI uploads the bundles only after
+all required checks pass. `dpmi_hdpmi_pvi` is a local reference test requiring
+an installed FreeDOS disk; it is optional in CI.

@@ -26,6 +26,45 @@ in Git history.
   GRUB path, GOP, and storage on the target laptop; add xHCI keyboard support
   if it has no usable i8042 controller.
 
+## Disk DMA engine
+
+Refactor disk transfers behind a shared DMA engine used by legacy bus-master
+IDE, AHCI, and NVMe. Keep `block::Disk` as the filesystem-facing interface;
+partition discovery, mount selection, caching, and RAM overlays stay above it.
+
+- [ ] **Extract DMA memory management from NVMe.** Provide owned buffers,
+  physical mappings, scatter/gather segments, and bounce-buffer handling.
+  Express address limits, alignment, transfer sizes, and boundary constraints
+  per controller. Replace NVMe's fixed DMA virtual-address window with managed
+  allocations; do not couple this to the Sound Blaster's ISA DMA emulation.
+- [ ] **Define a common transfer lifecycle.** Prepare/map buffers, submit,
+  complete, and release them through one contract. Keep memory pinned until
+  DMA has stopped, including timeout/reset paths. Define memory ordering,
+  partial-transfer/error reporting, and write/flush completion semantics.
+  Propagate failures through `Disk` rather than silently treating them as
+  successful transfers or flushes.
+- [ ] **Keep controller protocols in their backends.** Legacy IDE builds its
+  PRD table and programs ATA task-file/bus-master registers; AHCI builds command
+  FISes and PRDTs and manages ports/slots; NVMe builds PRPs and manages submission
+  and completion queues. Share buffer planning and request ownership, not a
+  fabricated common hardware descriptor format. Share ATA identify/command
+  definitions between IDE and AHCI where appropriate.
+- [ ] **Move NVMe onto the shared engine first.** Preserve existing behavior
+  and establish read/write/flush regression coverage before adding backends.
+- [ ] **Add legacy IDE bus-master DMA.** Discover PCI controller resources,
+  enforce its DMA constraints, and retain PIO for controllers without DMA.
+  Do not retry an uncertain write through PIO until the DMA engine is stopped
+  and completion status is understood.
+- [ ] **Add AHCI SATA disks.** Implement firmware handoff, controller/port
+  initialization, identify, DMA reads/writes, flush, and bounded error recovery.
+  Start with polling and one outstanding request per port; defer NCQ, hot-plug,
+  and ATAPI/CD support until ordinary disks work reliably.
+- [ ] **Validate all three transports.** Use disposable disks to check data
+  integrity across reboot, flush ordering, unaligned/noncontiguous buffers,
+  boundary splitting, large transfers, timeouts, and cleanup after failure.
+  Boot Q35 using its built-in AHCI controller with no added IDE or NVMe device.
+  Validate real SATA hardware before enabling writes to a live filesystem.
+
 ## Interp backend
 
 - [ ] **Idle efficiently.** An idle DOS Navigator session still divides time

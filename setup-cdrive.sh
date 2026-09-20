@@ -83,18 +83,21 @@ cp -f "$REPO/bazel-bin/test/windows/watcom_io/watcom_io.exe" "$C/WINDOWS/APPS/WA
 # names differently bought nothing.
 ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
 
-# C:\BOOT — the DOS system directory (DN, COMMAND.COM, LOADFIX.CFG,
+# C:\RETROOS — the DOS system directory (DN, COMMAND.COM, LOADFIX.CFG,
 # SHELL.ELF). Ordinary content on C:, exactly like the packaged ext4 images
 # carry it; the kernel embeds nothing, so without this there is no shell.
 # A copy, not a symlink: these are build outputs under bazel-bin.
 "$REPO/tools/install_boot_dir.sh" "$C"
 
 # C:\CONFIG.SYS is the only config the kernel reads. COMSPEC points at
-# C:\BOOT\COMMAND.COM; PATH covers DN/COMMAND (C:\BOOT), Turbo C, Borland C,
+# C:\RETROOS\COMMAND.COM; PATH covers DN/COMMAND (C:\RETROOS), Turbo C, Borland C,
 # Borland Pascal.
 cat > "$C/CONFIG.SYS" <<'CFG'
-COMSPEC=C:\BOOT\COMMAND.COM
-PATH=C:\;C:\BOOT;C:\TC;C:\BORLANDC\BIN;C:\BP\BIN
+DNSWP=C:\TEMP
+TEMP=C:\TEMP
+DN=C:\CONFIG\DN
+COMSPEC=C:\RETROOS\COMMAND.COM
+PATH=C:\;C:\RETROOS;C:\TC;C:\BORLANDC\BIN;C:\BP\BIN
 ADLIB=A388
 BLASTER=A220 I7 D1 H5 P330 T6
 ULTRASND=240,3,3,5,5
