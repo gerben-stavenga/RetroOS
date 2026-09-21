@@ -52,6 +52,10 @@ for probes that need a `CONFIG.SYS` command; normal launches never inject it.
 `python3 test/machine_layout.py` boots an ext4 laptop-style layout containing
 `/boot/grub`, checks UUID selection with reordered disks, read-only runtime files,
 persistent C: writes, rejection of a missing UUID, and a clean ext4 filesystem.
+It exercises ATA bus-master DMA (asserting that startup selected DMA without
+firmware setup), NVMe, and AHCI, and verifies the final bytes from the host.
+Kernel unit tests cover shared transfer batching, partial sectors, bounds,
+failure quarantine, IDE DMA descriptors/timings, and AHCI command encoding.
 
 `python3 test/dn_state.py` drives the shipped DN through QEMU: save configuration,
 execute a command, exit and restart, then verify persistent history/config and

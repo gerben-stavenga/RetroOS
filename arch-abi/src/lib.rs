@@ -521,6 +521,11 @@ pub const PAGE_SIZE: usize = 4096;
 pub const FB_WINDOW_BASE: usize = 0xFC00_0000;
 pub const FB_WINDOW_END: usize = 0xFFF0_0000;
 
+/// Boot-lifetime device mappings, below the 64 KiB physical-copy aperture.
+/// Drivers reserve disjoint spans here for MMIO and coherent DMA memory.
+pub const DEVICE_WINDOW_END: usize = FB_WINDOW_BASE - 64 * 1024;
+pub const DEVICE_WINDOW_BASE: usize = DEVICE_WINDOW_END - 8 * 1024 * 1024;
+
 /// Low memory (first 1MB) is mapped here for VGA/BIOS/VM86 on the metal
 /// backend; the interpreter reuses the same constant value.
 pub const LOW_MEM_BASE: usize = 0xC0A0_0000;

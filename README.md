@@ -11,7 +11,7 @@ The same kernel runs two ways, selected by the `arch` backend it links:
 
 - **metal** — on the real CPU, from a 386 to a modern UEFI x86-64 laptop. Boots
   via its own MBR bootloader or via the machine's existing GRUB (multiboot), with
-  GOP-framebuffer console, NVMe, APIC/LAPIC timer, USB (xHCI) and i8042 keyboard,
+  GOP-framebuffer console, ATA/NVMe/AHCI storage, APIC/LAPIC timer, USB (xHCI) and i8042 keyboard,
   and AC'97 / Intel HDA sound.
 - **interp** — as an ordinary host process, with guest instructions executed by a
   software x86 core (Unicorn). The kernel logic is identical; this is the
@@ -71,6 +71,7 @@ firmware, sound card, and image:
 ./run.sh qemu                         # fresh UEFI boot + persistent data
 ./run.sh qemu --arch x64              # boot as an x86-64 machine
 ./run.sh qemu --firmware uefi         # OVMF/UEFI: GRUB + GOP framebuffer
+./run.sh qemu -hd ahci               # data disk on AHCI (also: ata, nvme)
 ./run.sh qemu --sound ac97            # AC'97 instead of the default HDA
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run

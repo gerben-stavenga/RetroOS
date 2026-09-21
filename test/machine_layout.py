@@ -19,16 +19,22 @@ def run(*args):
     subprocess.run(list(map(str, args)), cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
 
-def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False):
+def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, storage="nvme", ata_dma=False):
     tree = work / name
     grub = tree / "boot/grub"
     grub.mkdir(parents=True)
     shutil.copyfile(ROOT / "bazel-bin/kernel/kernel.elf", tree / "boot/kernel.elf")
     # Boot the actual installer entries, including their firmware/video policy.
-    (grub / "grub.cfg").write_text("set timeout=0\n" + grub_entries({
+    entries = grub_entries({
         "release": "/boot/retroos", "uuid": uuid, "c_root": "/home/retroos",
     }).replace(f"search --no-floppy --fs-uuid --set=root {uuid}",
-               f"search --no-floppy --fs-uuid --set=root {UUID}"))
+               f"search --no-floppy --fs-uuid --set=root {UUID}")
+    if storage == "ahci":
+        # Boot entirely from ATA media, leaving the SATA data port unused by
+        # GRUB. The kernel must receive its initial FIS before checking SIG.
+        entries = entries.replace(f"search --no-floppy --fs-uuid --set=root {UUID}", "")
+        entries = entries.replace("multiboot /boot/retroos/kernel.elf", "multiboot /boot/kernel.elf")
+    (grub / "grub.cfg").write_text("set timeout=0\n" + entries)
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)
     log = work / (name + ".log")
@@ -43,10 +49,17 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False):
                  "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd",
                  "-drive", f"if=pflash,format=raw,file={work / 'vars.fd'}",
                  "-drive", f"file={image},format=raw,if=none,id=root",
-                 "-device", "nvme,drive=root,serial=layout-test",
+                 "-device", ("ide-hd,drive=root,bus=ide.0" if storage == "ahci"
+                             else "nvme,drive=root,serial=layout-test"),
                  "-drive", f"file={decoy},format=raw,if=none,id=decoy",
                  "-device", "piix3-ide,id=extra-ide",
                  "-device", "ide-hd,drive=decoy,bus=extra-ide.0"]
+        if storage == "ahci":
+            cdrom = args.index("-cdrom")
+            del args[cdrom:cdrom + 2]
+            args += ["-nodefaults", "-device", "bochs-display",
+                     "-drive", f"file={iso},format=raw,if=none,id=bootcd,media=cdrom",
+                     "-device", "ide-cd,drive=bootcd,bus=extra-ide.1,bootindex=1"]
     else:
         for disk in disks:
             args += ["-drive", f"file={disk},format=raw"]
@@ -64,6 +77,8 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False):
         process.wait(timeout=5)
     text = log.read_text(errors="replace")
     assert expected in text and "LAYOUT-FAIL" not in text, text
+    if ata_dma:
+        assert "ATA: ata0 DMA" in text and "ATA: ata1 DMA" in text, text
     firmware = "Substitute" if uefi else "NativeBios"
     assert f"firmware={firmware}" in text, text
     assert f"vga_passthrough={str(not uefi).lower()}" in text, text
@@ -102,7 +117,8 @@ void _start(void) {
  f=call(5,(int)"/home/retroos/STATE.DAT",2,0);
  if(f<0 || call(3,f,(int)b,4)!=4) goto fail;
  call(19,f,0,0);
- if(call(4,f,(int)"PASS",4)!=4) goto fail;
+ char next[4]={'P',b[1]+1,'S','S'};
+ if(call(4,f,(int)next,4)!=4) goto fail;
  call(6,f,0,0);
  if(b[0]=='P') say("LAYOUT-PERSISTED\n",17);
  else say("LAYOUT-WROTE\n",13);
@@ -121,11 +137,18 @@ fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
             stream.truncate(32 * 1024 * 1024)
         run("mkfs.fat", decoy)
         run("mmd", "-i", decoy, "::RETROOS")
-        boot(work, "explicit-root", image, decoy, UUID, "LAYOUT-WROTE")
+        boot(work, "explicit-root", image, decoy, UUID, "LAYOUT-WROTE", ata_dma=True)
         boot(work, "reordered-disks", image, decoy, UUID, "LAYOUT-PERSISTED", reverse=True)
         boot(work, "missing-root", image, decoy, "00000000-0000-0000-0000-000000000001",
              "Configured root UUID not found")
         boot(work, "uefi-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED", uefi=True)
+        boot(work, "ahci-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED",
+             uefi=True, storage="ahci")
+        # Every successful boot must change persistent bytes, including the
+        # final AHCI boot. Rewriting the same value could hide a dropped write.
+        state = work / "state.dat"
+        run("debugfs", "-R", f"dump /home/retroos/STATE.DAT {state}", image)
+        assert state.read_bytes() == b"PRSS", state.read_bytes()  # INIT + four writes
         run("e2fsck", "-fn", image)
 
 
