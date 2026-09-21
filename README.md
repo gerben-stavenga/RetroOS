@@ -71,7 +71,7 @@ firmware, sound card, and image:
 ./run.sh qemu                         # fresh UEFI boot + persistent data
 ./run.sh qemu --arch x64              # boot as an x86-64 machine
 ./run.sh qemu --firmware uefi         # OVMF/UEFI: GRUB + GOP framebuffer
-./run.sh qemu -hd ahci               # data disk on AHCI (also: ata, nvme)
+./run.sh qemu --hd ahci               # data disk on AHCI (also: ata, nvme)
 ./run.sh qemu --sound ac97            # AC'97 instead of the default HDA
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run

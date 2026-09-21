@@ -9,10 +9,11 @@ Extract into a new directory and run `./run.sh`. Requires Linux, QEMU x86,
 - `data.img`: public initial data, shared by every launch; changes persist here.
 - `./run.sh --firmware uefi`: Q35 with NVMe data and an added IDE boot controller;
   requires OVMF (default paths `/usr/share/OVMF/*_4M.fd`).
+- `./run.sh --firmware uefi --hd ahci`: use the built-in SATA/AHCI controller
+  for the data disk; `--hd ata|ahci|nvme` selects its controller.
 - `./run.sh --headless --sound none --cmd 'TESTS/HELLO.COM'`: smoke test.
 
-Default BIOS mode uses i440FX with IDE disks. Q35's built-in SATA/AHCI controller
-is not supported yet. SPICE/VNC is independent of disk-controller selection.
+Default BIOS mode uses i440FX with IDE disks. UEFI defaults to NVMe data storage. SPICE/VNC is independent of disk-controller selection.
 For virt-manager, use i440FX with both disks attached as IDE, boot disk first.
 Give the guest at least 128 MiB RAM. The included launcher uses 512 MiB for UEFI.
 
@@ -79,5 +80,5 @@ its temporary files live in C:\TEMP. Existing BOOT/DN or RETROOS/DN state is
 copied into the new location without overwriting existing settings. CONFIG.SYS
 selects DNSWP=C:\TEMP, TEMP=C:\TEMP, and DN=C:\CONFIG\DN in that order.
 
-The kernel supports legacy IDE and NVMe storage, not AHCI/SATA or USB storage.
+The kernel supports legacy IDE, AHCI/SATA, and NVMe storage; USB storage is not supported.
 Bootloader support for a disk does not imply the kernel can access that disk.
