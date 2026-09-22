@@ -53,12 +53,12 @@ for sink in "${SINKS[@]}"; do
         --sound "$sink" --cmd "$prog" > "$log" 2>&1 &
     pid=$!
     # Both probes wait for a key after their last verdict.
-    qemu_wait_for_log "$log" "${expect##* }\|KERNEL PANIC\|panicked\|-FAIL" 90 "$pid" || true
+    qemu_wait_for_log "$log" "${expect##* }\|FATAL\|KERNEL PANIC\|panicked\|-FAIL" 90 "$pid" || true
     qemu_stop_and_reap "$pid"
     pid=""
     missing=()
     for e in $expect; do grep -aq "$e" "$log" || missing+=("$e"); done
-    if grep -aqE 'KERNEL PANIC|panicked|SEGV|-FAIL' "$log"; then
+    if grep -aqE 'FATAL|KERNEL PANIC|panicked|SEGV|-FAIL' "$log"; then
         missing+=("no-crash-or-failure")
     fi
     if [ ${#missing[@]} -eq 0 ]; then

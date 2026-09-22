@@ -9,7 +9,9 @@
 //! move sectors to and from it" — which disk is the boot disk, and what lives
 //! on it, is decided by `startup`.
 
-use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage};
+use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage, poll, poll_with_clock};
+#[cfg(test)]
+use super::storage::COMMAND_TIMEOUT_NS;
 use crate::kernel::portio::{inb, insw, outb, outl, outsw, now_ns};
 use super::dma::Region;
 use crate::kernel::pci;
@@ -50,23 +52,17 @@ pub const CHANNELS: [(u16, u16); 2] = [(0x1F0, 0x3F6), (0x170, 0x376)];
 /// The LBA28 addressing ceiling — this driver cannot reach past it.
 const LBA28_MAX: u64 = 1 << 28;
 
-// Cache flushes can take seconds. Poll counts are not time limits: QEMU can
-// exhaust a million reads while the host is still completing its fsync.
-const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
-
-fn wait_status(mut read: impl FnMut() -> u8, mut now: impl FnMut() -> u64,
+fn wait_status(mut read: impl FnMut() -> u8, now: impl FnMut() -> u64,
                required: u8) -> Result<(), Error> {
-    let started = now();
-    loop {
+    poll_with_clock(now, || {
         let s = read();
-        if s == 0 || s == 0xff { return Err(Error::Device(s as u16)); }
+        if s == 0 || s == 0xff { return Some(Err(Error::Device(s as u16))); }
         if s & status::BSY == 0 {
-            if s & (status::ERR | 0x20) != 0 { return Err(Error::Device(s as u16)); }
-            if s & required == required { return Ok(()); }
+            if s & (status::ERR | 0x20) != 0 { return Some(Err(Error::Device(s as u16))); }
+            if s & required == required { return Some(Ok(())); }
         }
-        if now().wrapping_sub(started) >= COMMAND_TIMEOUT_NS { return Err(Error::Timeout); }
-        core::hint::spin_loop();
-    }
+        None
+    }).unwrap_or(Err(Error::Timeout))
 }
 
 /// One ATA drive: a channel plus a master/slave select.
@@ -329,15 +325,12 @@ impl BusMaster {
 
     fn complete(&self, ata_base: u16, direction: u8) -> Result<(), Error> {
         outb(self.base, direction | 1);
-        let mut result = Err(Error::Timeout);
-        let started = now_ns();
-        loop {
+        let result = poll(|| {
             let status = inb(self.base + 2);
-            if status & 2 != 0 { result = Err(Error::Device(status as u16)); break; }
-            if status & 5 == 4 { result = Ok(()); break; } // IRQ set, DMA inactive
-            if now_ns().wrapping_sub(started) >= COMMAND_TIMEOUT_NS { break; }
-            core::hint::spin_loop();
-        }
+            if status & 2 != 0 { return Some(Err(Error::Device(status as u16))); }
+            if status & 5 == 4 { return Some(Ok(())); } // IRQ set, DMA inactive
+            None
+        }).unwrap_or(Err(Error::Timeout));
         outb(self.base, direction);
         let status = inb(ata_base + reg::STATUS);
         outb(self.base + 2, inb(self.base + 2) | 6);

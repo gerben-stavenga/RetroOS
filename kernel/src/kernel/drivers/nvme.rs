@@ -10,7 +10,7 @@
 
 use core::mem::size_of;
 use super::dma::{Mmio, Region};
-use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage};
+use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage, poll};
 use crate::kernel::pci;
 use lib::compact_println;
 
@@ -65,7 +65,7 @@ impl Queue {
         self.regs.write(self.sq_db, self.tail as u32);
 
         let cqe = (self.cq_va + self.head * 16) as *const u32;
-        for _ in 0..100_000_000u32 {
+        poll(|| {
             let dw3 = unsafe { core::ptr::read_volatile(cqe.add(3)) };
             if ((dw3 >> 16) & 1) == self.phase as u32 {
                 let status = (dw3 >> 17) as u16;
@@ -75,10 +75,10 @@ impl Queue {
                     self.phase = !self.phase;
                 }
                 self.regs.write(self.cq_db, self.head as u32);
-                return status;
+                return Some(status);
             }
-        }
-        0xFFFF
+            None
+        }).unwrap_or(0xFFFF)
     }
 }
 
@@ -236,17 +236,15 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
 }
 
 fn wait_csts(regs: Mmio, ready: u32) -> bool {
-    for _ in 0..10_000_000u32 {
+    poll(|| {
         let csts = regs.read(R_CSTS);
         if csts & 2 != 0 {
             compact_println!("NVMe: controller fatal status");
-            return false;
+            return Some(false);
         }
-        if csts & 1 == ready {
-            return true;
-        }
-    }
-    false
+        if csts & 1 == ready { return Some(true); }
+        None
+    }).unwrap_or(false)
 }
 
 impl Storage<Nvme> {

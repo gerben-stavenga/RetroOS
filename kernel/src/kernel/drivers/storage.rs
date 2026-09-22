@@ -10,6 +10,24 @@ use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
 use crate::kernel::block::Disk;
 
+/// Shared elapsed-time budget for storage commands, including cache flushes.
+/// Poll counts vary with CPU speed and cannot bound asynchronous device I/O.
+pub(super) const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+pub(super) fn poll<T>(sample: impl FnMut() -> Option<T>) -> Option<T> {
+    poll_with_clock(crate::kernel::portio::now_ns, sample)
+}
+
+pub(super) fn poll_with_clock<T>(mut now: impl FnMut() -> u64,
+                                mut sample: impl FnMut() -> Option<T>) -> Option<T> {
+    let started = now();
+    loop {
+        if let Some(result) = sample() { return Some(result); }
+        if now().wrapping_sub(started) >= COMMAND_TIMEOUT_NS { return None; }
+        core::hint::spin_loop();
+    }
+}
+
 pub const SECTOR: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +201,29 @@ impl<H: Hardware> Disk for Storage<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_wait_outlives_the_old_nvme_poll_budget() {
+        let mut polls = 0u64;
+        let mut now = 0u64;
+        let result = poll_with_clock(|| { now += 1; now }, || {
+            polls += 1;
+            (polls > 100_000_000).then_some(0u16)
+        });
+        assert_eq!(result, Some(0));
+        assert!(now < COMMAND_TIMEOUT_NS);
+    }
+
+    #[test]
+    fn completion_deadline_handles_clock_wrap_and_immediate_errors() {
+        let mut now = u64::MAX - COMMAND_TIMEOUT_NS / 2;
+        assert_eq!(poll_with_clock(|| {
+            now = now.wrapping_add(COMMAND_TIMEOUT_NS / 2);
+            now
+        }, || None::<()>), None);
+        assert_eq!(poll_with_clock(|| 0, || Some(Err::<(), _>(Error::Device(7)))),
+                   Some(Err(Error::Device(7))));
+    }
 
     struct MemoryDisk { data: Vec<u8>, calls: Vec<Command>, fail_at: Option<usize> }
     impl Hardware for MemoryDisk {

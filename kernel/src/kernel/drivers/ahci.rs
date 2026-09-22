@@ -7,7 +7,7 @@
 use alloc::vec::Vec;
 use core::sync::atomic::{fence, Ordering};
 use super::dma::{Mmio, Region};
-use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage};
+use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage, poll};
 use crate::kernel::pci;
 
 const PORT_BASE: usize = 0x100;
@@ -30,7 +30,6 @@ const ERROR_BITS: u32 = (1 << 30) | (1 << 29) | (1 << 28) | (1 << 27) | (1 << 24
 const TABLE: usize = 0x500;
 const BOUNCE: usize = 0x1000;
 const BOUNCE_PAGES: usize = 16;
-const POLLS: usize = 10_000_000;
 
 pub struct Ahci { regs: Mmio, port: usize, dma: Region }
 pub type AhciDisk = Storage<Ahci>;
@@ -39,11 +38,7 @@ impl Ahci {
     fn read(&self, off: usize) -> u32 { self.regs.read(self.port + off) }
     fn write(&self, off: usize, value: u32) { self.regs.write(self.port + off, value); }
     fn wait_clear(&self, off: usize, bits: u32) -> Result<(), Error> {
-        for _ in 0..POLLS {
-            if self.read(off) & bits == 0 { return Ok(()); }
-            core::hint::spin_loop();
-        }
-        Err(Error::Timeout)
+        poll(|| (self.read(off) & bits == 0).then_some(())).ok_or(Error::Timeout)
     }
 
     fn issue(&mut self, opcode: u8, write: bool, lba: u64, sectors: u32, data: Option<u64>) -> Result<(), Error> {
@@ -75,18 +70,18 @@ impl Ahci {
         self.write(IS, u32::MAX);
         fence(Ordering::SeqCst);
         self.write(CI, 1);
-        for _ in 0..POLLS {
+        // The shared engine retains DMA memory and refuses later submissions
+        // on timeout; never substitute a CPU-dependent poll-count budget.
+        poll(|| {
             let status = self.read(IS);
-            if status & ERROR_BITS != 0 { return Err(Error::Device((status >> 16) as u16)); }
+            if status & ERROR_BITS != 0 { return Some(Err(Error::Device((status >> 16) as u16))); }
             if self.read(CI) & 1 == 0 {
                 fence(Ordering::SeqCst);
-                return if self.read(TFD) & 0x21 == 0 { Ok(()) }
-                    else { Err(Error::Device(self.read(TFD) as u16)) };
+                return Some(if self.read(TFD) & 0x21 == 0 { Ok(()) }
+                    else { Err(Error::Device(self.read(TFD) as u16)) });
             }
-            core::hint::spin_loop();
-        }
-        // The engine retains all DMA memory and refuses later submissions.
-        Err(Error::Timeout)
+            None
+        }).unwrap_or(Err(Error::Timeout))
     }
 }
 
@@ -133,12 +128,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
     // BIOS/OS handoff before changing any port's DMA addresses.
     if regs.read(0x24) & 1 != 0 {
         regs.write(0x28, regs.read(0x28) | 2);
-        let mut released = false;
-        for _ in 0..POLLS {
-            if regs.read(0x28) & 0x11 == 0 { released = true; break; }
-            core::hint::spin_loop();
-        }
-        if !released { return disks; }
+        if poll(|| (regs.read(0x28) & 0x11 == 0).then_some(())).is_none() { return disks; }
     }
     regs.write(4, (regs.read(4) | (1 << 31)) & !2); // AHCI enable, polled interrupts
     let ports = regs.read(0x0c);
@@ -149,7 +139,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
         if regs.read(port + SSTS) & 0xf0f != 0x103 { continue; }
         // Stop both command and FIS reception engines before rebinding DMA.
         regs.write(port + CMD, regs.read(port + CMD) & !ST);
-        let stopped = |bits| (0..POLLS).any(|_| regs.read(port + CMD) & bits == 0);
+        let stopped = |bits| poll(|| (regs.read(port + CMD) & bits == 0).then_some(())).is_some();
         if !stopped(CR) { continue; }
         regs.write(port + CMD, regs.read(port + CMD) & !FRE);
         if !stopped(FR) { continue; }
@@ -163,10 +153,10 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
         // Firmware need not have used this port. Its device signature is
         // unavailable until the initial device-to-host FIS has been received.
         // Supply our receive buffer and enable reception before classifying it.
-        let identified = (0..POLLS).any(|_| {
+        let identified = poll(|| {
             let signature = regs.read(port + SIG);
-            signature != u32::MAX && signature != 0
-        });
+            (signature != u32::MAX && signature != 0).then_some(())
+        }).is_some();
         if !identified || regs.read(port + SIG) != 0x101 { continue; }
         regs.write(port + CMD, regs.read(port + CMD) | ST);
         let mut controller = Ahci { regs, port, dma };
