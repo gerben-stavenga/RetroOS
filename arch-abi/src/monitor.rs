@@ -37,6 +37,8 @@ const IF_FLAG:   u32 = 1 << 9;   // real IF (host-only); never guest state
 const TF_FLAG:   u32 = 1 << 8;
 const IOPL_MASK: u32 = 3 << 12;
 const VM_FLAG:   u32 = 1 << 17;
+const RF_FLAG:   u32 = 1 << 16;
+const VIP_FLAG:  u32 = 1 << 20;
 const OF_FLAG:   u32 = 1 << 11;
 /// VIF — the guest's virtual interrupt flag. EFLAGS bit 19. This is the single
 /// canonical store the kernel reads/writes; bit 9 (IF) is the real interrupt
@@ -59,16 +61,27 @@ fn guest_flags(regs: &Regs) -> u32 {
         | if regs.user_tf() { TF_FLAG } else { 0 }
 }
 
-/// Apply a flags word the guest supplied (POPF / IRET): status flags take
-/// effect, IOPL/VM/real-IF are preserved, and the guest's bit-9 (its desired
-/// IF) lands in VIF (bit 19).
+#[derive(Clone, Copy)]
+enum FlagLoad { Popf, Iret }
+
+/// Apply flags for an emulated guest POPF or same-ring IRET. The monitor
+/// virtualizes IF; IOPL, VM and interrupt bookkeeping remain kernel-owned.
+/// Normalize here rather than relying on the backend's return instruction:
+/// KVM resumes directly, without the IRET that fixes reserved bits on metal.
 #[inline]
-fn apply_guest_flags(regs: &mut Regs, popped: u32) {
+fn apply_guest_flags(regs: &mut Regs, popped: u32, op32: bool, instruction: FlagLoad) {
+    let old = regs.flags32();
+    let popped = if op32 { popped } else { (old & 0xffff_0000) | (popped & 0xffff) };
     let want_vif = popped & IF_FLAG != 0;
     let want_tf = popped & TF_FLAG != 0;
-    let preserved = regs.flags32() & PRESERVED_FLAGS;
-    let mut nf = (popped & !(PRESERVED_FLAGS | VIF_FLAG)) | preserved;
+    let preserved_mask = PRESERVED_FLAGS | VIF_FLAG | VIP_FLAG;
+    let mut nf = (popped & !preserved_mask) | (old & preserved_mask);
+    // Only IRETD restores RF from the stack. POPF/POPFD and 16-bit IRET
+    // clear it as part of completing the emulated instruction.
+    if !op32 || matches!(instruction, FlagLoad::Popf) { nf &= !RF_FLAG; }
     if want_vif { nf |= VIF_FLAG; } else { nf &= !VIF_FLAG; }
+    // Architectural fixed bits: 1 reads as one; 3, 5, 15 and 22..31 as zero.
+    nf = (nf & 0x003f_7fd7) | 2;
     regs.set_flags32(nf);
     regs.set_user_tf(want_tf);
     regs.project_tf();
@@ -295,7 +308,7 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
             advance_ip(regs, cs_32, advance);
             let flags = if op32 { pop32(regs, arch, ss_base, ss_32) }
                         else    { pop16(regs, arch, ss_base, ss_32) as u32 };
-            apply_guest_flags(regs, flags);
+            apply_guest_flags(regs, flags, op32, FlagLoad::Popf);
             MonitorResult::Resume
         }
         // IRET / IRETD — pop IP, CS, FLAGS (same-ring only)
@@ -310,7 +323,7 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
                 }
                 regs.set_ip32(new_eip);
                 regs.set_cs32(new_cs as u32);
-                apply_guest_flags(regs, new_fl);
+                apply_guest_flags(regs, new_fl, op32, FlagLoad::Iret);
             } else {
                 let new_ip = pop16(regs, arch, ss_base, ss_32);
                 let new_cs = pop16(regs, arch, ss_base, ss_32);
@@ -320,7 +333,7 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
                 }
                 regs.set_ip32(new_ip as u32);
                 regs.set_cs32(new_cs as u32);
-                apply_guest_flags(regs, new_fl);
+                apply_guest_flags(regs, new_fl, op32, FlagLoad::Iret);
             }
             MonitorResult::Resume
         }
@@ -460,6 +473,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn popped_reserved_flags_do_not_stick() {
+        let mut r = Regs::empty();
+        r.set_flags32(VM_FLAG | IF_FLAG | (1 << 12) | 2);
+        apply_guest_flags(&mut r, 0xffff_ffff, true, FlagLoad::Popf);
+        assert_eq!(guest_flags(&r) & !0x003f_7fd7, 0);
+        assert_ne!(guest_flags(&r) & 2, 0);
+        assert_eq!(r.flags32() & IOPL_MASK, 1 << 12);
+        assert_ne!(r.flags32() & VM_FLAG, 0);
+        assert!(r.user_tf());
+        apply_guest_flags(&mut r, 0, false, FlagLoad::Popf);
+        assert_eq!(guest_flags(&r) & 2, 2);
+    }
+
+    #[test]
+    fn flag_load_width_and_instruction_semantics() {
+        const AC_ID: u32 = (1 << 18) | (1 << 21);
+        for instruction in [FlagLoad::Popf, FlagLoad::Iret] {
+            for op32 in [false, true] {
+                let mut r = Regs::empty();
+                let owned = VM_FLAG | IF_FLAG | IOPL_MASK | VIP_FLAG;
+                r.set_flags32(owned | AC_ID | RF_FLAG | VIF_FLAG | 2);
+                apply_guest_flags(&mut r, 0, op32, instruction);
+                assert_eq!(r.flags32() & owned, owned);
+                assert_eq!(r.flags32() & AC_ID, if op32 { 0 } else { AC_ID });
+                assert_eq!(r.flags32() & (RF_FLAG | VIF_FLAG), 0);
+                assert_eq!(guest_flags(&r) & IF_FLAG, 0);
+                assert_eq!(r.flags32() & 2, 2);
+
+                apply_guest_flags(&mut r, 0xffff_ffff, op32, instruction);
+                assert_eq!(r.flags32() & !0x003f_7fd7, 0);
+                assert_eq!(r.flags32() & RF_FLAG,
+                    if op32 && matches!(instruction, FlagLoad::Iret) { RF_FLAG } else { 0 });
+                assert_ne!(guest_flags(&r) & IF_FLAG, 0);
+                assert!(r.user_tf());
+            }
+        }
+    }
+
+    #[test]
     fn guest_flags_hide_forced_tf() {
         let mut r = Regs::empty();
         r.set_forced_tf(true);
@@ -472,11 +524,11 @@ mod tests {
     fn popped_tf_updates_only_guest_owner() {
         let mut r = Regs::empty();
         r.set_forced_tf(true);
-        apply_guest_flags(&mut r, 2 | TF_FLAG);
+        apply_guest_flags(&mut r, 2 | TF_FLAG, false, FlagLoad::Popf);
         assert!(r.user_tf());
         assert!(r.forced_tf());
 
-        apply_guest_flags(&mut r, 2);
+        apply_guest_flags(&mut r, 2, false, FlagLoad::Popf);
         assert!(!r.user_tf());
         assert!(r.forced_tf());
         assert_ne!(r.flags32() & TF_FLAG, 0);

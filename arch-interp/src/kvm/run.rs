@@ -575,9 +575,10 @@ pub fn execute() -> KernelEvent {
                 Ok(VcpuExit::Shutdown) => Kind::Shutdown,
                 Ok(VcpuExit::FailEntry(reason, cpu)) => {
                     let sregs = k.vcpu.get_sregs();
+                    let regs = k.vcpu.get_regs();
                     panic!(
                         "KVM_EXIT_FAIL_ENTRY (reason={reason:#x}, cpu={cpu}) mode={mode:?} \
-                         cs={:#x}:{:#x} sregs={sregs:#x?}",
+                         cs={:#x}:{:#x} regs={regs:#x?} sregs={sregs:#x?}",
                         vcpu.code_seg(),
                         vcpu.frame.rip
                     );

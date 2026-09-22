@@ -49,6 +49,9 @@ jobs:
       # quietly downgrading coverage to TCG-only.
       - name: Detect hardware virtualization
         run: |
+          # Record the host so vendor-specific KVM failures can be compared.
+          uname -a
+          lscpu
           if [ -c /dev/kvm ] && sudo chown "$(id -u)" /dev/kvm; then
             echo "KVM available; hosted-engine KVM tests are required"
             echo "(qemu -accel kvm is probed separately: nested virt here cannot boot a firmware guest)"

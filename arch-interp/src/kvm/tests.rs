@@ -77,6 +77,42 @@ fn kvm_engine_proofs() {
     assert_eq!(r.ip32(), 0x7C05, "monitor advanced IP past the INT");
     assert!(r.flags32() & (VM_FLAG as u32) != 0, "still VM86 after the trap");
 
+    // A VM86 POPF with reserved bit 15 set must behave like a hardware
+    // flags load, not feed an invalid VMCS to Intel KVM (DN's CPU probe).
+    // mov ax,0x8202; push ax; popf; pushf; pop ax; int 0x31
+    mem.copy_to(0x7D00, &[0xB8, 0x02, 0x82, 0x50, 0x9D,
+                        0x9C, 0x58, 0xCD, 0x31]);
+    mem.copy_to(0x6FFE, &[0, 0]); // back the stack used by PUSH/POPF
+    let mut probe = r;
+    probe.set_ip32(0x7D00);
+    set_regs(probe);
+    let event = run_to_event();
+    assert!(matches!(event, KernelEvent::SoftInt(0x31)), "reserved flags probe: {event:?}");
+    assert_eq!(regs().rax as u16 & 0x8202, 0x0202);
+    assert_eq!(regs().ip32(), 0x7D09);
+
+    // Both IRET widths must normalize the stacked FLAGS before re-entry.
+    // Return to 0100:6e10, then PUSHF/POP AX reads what the guest observes.
+    for op32 in [false, true] {
+        mem.copy_to(0x7E00, if op32 { &[0x66, 0xCF][..] } else { &[0xCF][..] });
+        mem.copy_to(0x7E10, &[0x9C, 0x58, 0xCD, 0x31]);
+        if op32 {
+            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 0, 0, 1, 0, 0, 2, 0x82, 0, 0]);
+        } else {
+            mem.copy_to(0x6FF0, &[0x10, 0x6E, 0, 1, 2, 0x82]);
+        }
+        let mut probe = r;
+        probe.set_ip32(0x7E00);
+        probe.set_sp32(0x6FF0);
+        set_regs(probe);
+        let event = run_to_event();
+        assert!(matches!(event, KernelEvent::SoftInt(0x31)), "IRET op32={op32}: {event:?}");
+        assert_eq!(regs().rax as u16 & 0x8202, 0x0202);
+        assert_eq!(regs().code_seg(), 0x100);
+        assert_eq!(regs().ip32(), 0x6E14);
+        assert_eq!(regs().sp32(), if op32 { 0x6FFC } else { 0x6FF6 });
+    }
+
     // A host page-table edit at an unchanged CR3 must invalidate instruction
     // fetches too. Keep both frames alive and exchange their mappings so the
     // allocator cannot accidentally reuse the original physical page.
