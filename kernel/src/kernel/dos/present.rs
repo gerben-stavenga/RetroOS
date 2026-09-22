@@ -151,7 +151,7 @@ fn scanout<'a, A: crate::Arch>(
         font_b: &[],
         font_maps: Some((map_a, map_b)),
         blink: state.ac[0x10] & 0x08 != 0,
-        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, (machine.now() / 250_000_000) % 2 == 0),
+        text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, (machine.now() / 250_000_000).is_multiple_of(2)),
         cga_palette,
         start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start_latch } else if mode13 { start_latch * 4 } else { 0 },
         pixel_pan: if planar || mode13 { (state.ac[0x13] & 0x07) as usize } else { 0 },
