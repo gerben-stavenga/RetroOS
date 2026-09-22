@@ -11,6 +11,7 @@ Usage: ./run.sh [qemu|bochs|86box|hosted] [options] [-- emulator arguments]
   --firmware bios|uefi    Default: UEFI for QEMU, BIOS elsewhere
   --freedos               Boot FreeDOS from the same data disk (BIOS only)
   --arch 386|686|x64      QEMU CPU selection (default: 386)
+  --hd ata|ahci|nvme       QEMU data controller (default: NVMe on UEFI, ATA on BIOS)
   --sound sb|ac97|hda|none QEMU sound (default: hda; other emulators: sb)
   --sb-audio native|mixed QEMU guest audio policy
   --cmd, -c, -r COMMAND   Run a command (QEMU or hosted)
@@ -29,7 +30,7 @@ HELP
 }
 fail() { echo "run.sh: $*" >&2; exit 1; }
 BACKEND=qemu FIRMWARE= SOUND= ARCH=386 FREEDOS=0 HEADLESS=0 KVM=0
-COMMAND= HOST_DIR= WAV= SHOT= TRACE=0 SB_AUDIO=
+COMMAND= HOST_DIR= WAV= SHOT= TRACE=0 SB_AUDIO= HD=
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/build/data.bin}"
 PASS=()
 case "${1:-}" in
@@ -39,11 +40,12 @@ esac
 while [ $# -gt 0 ]; do
     case "$1" in
         --help) usage; exit 0 ;;
-        --backend|--data-image|--firmware|--arch|--sound|--sb-audio|--cmd|-c|-r|--host|-H|-h|--wav|-w|--screenshot|-s)
+        --backend|--data-image|--firmware|--arch|--hd|--sound|--sb-audio|--cmd|-c|-r|--host|-H|-h|--wav|-w|--screenshot|-s)
             [ $# -ge 2 ] || fail "$1 needs a value"
             case "$1" in
                 --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2" ;;
                 --firmware) FIRMWARE="$2" ;; --arch) ARCH="$2" ;;
+                --hd) HD="$2" ;;
                 --sound) SOUND="$2" ;; --sb-audio) SB_AUDIO="$2" ;;
                 --cmd|-c|-r) COMMAND="$2" ;; --host|-H|-h) HOST_DIR="$2" ;;
                 --wav|-w) WAV="$2" ;; --screenshot|-s) SHOT="$2" ;;
@@ -62,10 +64,14 @@ case "$BACKEND" in qemu|bochs|86box|hosted) ;; *) fail "unknown backend: $BACKEN
 [ -n "$FIRMWARE" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then FIRMWARE=uefi; else FIRMWARE=bios; fi; }
 [ -n "$SOUND" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then SOUND=hda; else SOUND=sb; fi; }
 case "$FIRMWARE" in bios|uefi) ;; *) fail "unknown firmware: $FIRMWARE" ;; esac
+case "$HD" in ''|ata|ahci|nvme) ;; *) fail "unknown disk controller: $HD" ;; esac
+[ -z "$HD" ] || [ "$BACKEND" = qemu ] || fail "--hd requires QEMU"
+[ -n "$HD" ] || { if [ "$FIRMWARE" = uefi ]; then HD=nvme; else HD=ata; fi; }
 case "$SOUND" in sb|ac97|hda|none) ;; *) fail "unknown sound: $SOUND" ;; esac
 case "$ARCH" in 386|686|x64) ;; *) fail "unknown architecture: $ARCH" ;; esac
 case "$SB_AUDIO" in ''|native|mixed) ;; *) fail "unknown audio policy: $SB_AUDIO" ;; esac
 if [ "$FREEDOS" = 1 ]; then
+    [ "$HD" = ata ] || fail "FreeDOS requires --hd ata"
     [ "$FIRMWARE" = bios ] && [ "$BACKEND" != hosted ] || fail "FreeDOS needs a BIOS emulator"
     [ -z "$COMMAND$HOST_DIR" ] || fail "--cmd/--host require RetroOS"
 fi

@@ -14,7 +14,7 @@ use alloc::{boxed::Box, vec::Vec};
 pub mod cache;
 pub mod overlay;
 pub mod partition;
-use crate::kernel::drivers::{hdd::{self, AtaDisk}, nvme::NvmeDisk};
+use crate::kernel::drivers::{hdd, nvme::NvmeDisk};
 
 /// One block device: a physical disk, an NVMe namespace, or a wrapper around
 /// either (see the RAM overlay). Addressing is 512-byte LBAs throughout.
@@ -107,7 +107,7 @@ impl Volume {
 }
 
 /// Discover every disk on this machine, in a stable order: the legacy ATA
-/// channels (master then slave) first, then NVMe.
+/// channels (master then slave) first, then NVMe and AHCI.
 ///
 /// The order is fixed so results are reproducible across runs; it is *not* a
 /// priority ranking, and this function makes no claim about which disk
@@ -115,14 +115,13 @@ impl Volume {
 /// `vfs` does with its filesystems.
 pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
     let mut disks: Vec<&'static dyn Disk> = Vec::new();
-    for (base, ctrl) in hdd::CHANNELS {
-        for drive in 0..2 {
-            if let Some(d) = AtaDisk::probe(base, ctrl, drive) {
-                disks.push(Box::leak(Box::new(d)));
-            }
-        }
+    for disk in hdd::probe(machine) {
+        disks.push(Box::leak(Box::new(disk)));
     }
     if let Some(d) = NvmeDisk::probe(machine) {
+        disks.push(Box::leak(Box::new(d)));
+    }
+    for d in crate::kernel::drivers::ahci::probe(machine) {
         disks.push(Box::leak(Box::new(d)));
     }
     disks

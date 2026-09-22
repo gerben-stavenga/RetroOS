@@ -12,16 +12,31 @@ launch() {
         args=(-M q35 -m 512 -nodefaults -device bochs-display -device qemu-xhci
               -drive "if=pflash,format=raw,readonly=on,file=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
               -drive "if=pflash,format=raw,file=$WORK/vars.fd"
-              -drive "file=$DATA_IMAGE,if=none,id=data,format=raw"
-              -device nvme,drive=data,serial=retro1
               -drive "file=$BOOT_IMAGE,if=none,id=boot,format=raw"
-              # The kernel supports one NVMe controller; boot files use ATA.
+              # Keep the disposable boot disk on a separate ATA controller.
               -device piix3-ide,id=boot-ide
               -device ide-hd,drive=boot,bus=boot-ide.0,unit=0,bootindex=1)
     elif [ "$FREEDOS" = 1 ]; then
         args=(-m 64 -drive "file=$DATA_IMAGE,format=raw")
     else
-        args=(-m 128 -drive "file=$BOOT_IMAGE,format=raw" -drive "file=$DATA_IMAGE,format=raw")
+        args=(-m 128 -drive "file=$BOOT_IMAGE,format=raw")
+    fi
+    if [ "$FREEDOS" = 0 ]; then
+        args+=(-drive "file=$DATA_IMAGE,if=none,id=data,format=raw")
+        case "$HD" in
+            ata)
+                local bus=ide.0
+                [ "$FIRMWARE" != uefi ] || bus=boot-ide.0
+                args+=(-device "ide-hd,drive=data,bus=$bus,unit=1") ;;
+            ahci)
+                if [ "$FIRMWARE" = uefi ]; then
+                    args+=(-device ide-hd,drive=data,bus=ide.0)
+                else
+                    args+=(-device ich9-ahci,id=data-ahci
+                           -device ide-hd,drive=data,bus=data-ahci.0)
+                fi ;;
+            nvme) args+=(-device nvme,drive=data,serial=retro1) ;;
+        esac
     fi
     qemu="${RETROOS_QEMU_BIN:-$qemu}"
     [ "$KVM" = 0 ] || cpu=(-accel kvm -cpu host)

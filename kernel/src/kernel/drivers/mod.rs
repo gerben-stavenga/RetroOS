@@ -17,4 +17,7 @@ pub mod sb_guest;
 pub mod vga_hw;
 pub mod hdd;
 pub mod nvme;
+pub mod storage;
+pub mod dma;
+pub mod ahci;
 pub mod uart16550;

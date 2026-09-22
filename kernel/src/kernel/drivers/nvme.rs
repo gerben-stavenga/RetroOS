@@ -6,28 +6,15 @@
 //! bounce buffer described by one short PRP list.
 //! Writes exist for the backing-file overlay's raw-sector persistence.
 //!
-//! Memory: controller registers (BAR0) and the DMA region (queues + bounce)
-//! are mapped into slices of the dead low-mem identity window, following the
-//! AC'97 driver's stopgap pattern — AC'97 owns `LOW_MEM_BASE+0xC0000..+0xD1000`,
-//! NVMe takes `+0xE0000..+0x100000`. See memory `project_ac97_lowmem_dma_window_todo`
-//! for the proper DMA-window-pool fix that should eventually replace both.
+//! Queues and bounce memory use the shared boot-lifetime DMA allocator.
 
 use core::mem::size_of;
-use spin::Mutex;
-use crate::kernel::block::Disk;
+use super::dma::{Mmio, Region};
+use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage};
 use crate::kernel::pci;
 use lib::compact_println;
 
-/// Kernel VA for the controller registers (BAR0): 4 pages is ample — the
-/// doorbells for qid 0/1 sit just past offset 0x1000 even at max stride.
-const REGS_VA: usize = crate::LOW_MEM_BASE + 0xE0000;
-const REGS_PAGES: usize = 4;
-/// Kernel VA + size of the DMA region (queues, identify, bounce).
-const DMA_VA: usize = crate::LOW_MEM_BASE + 0xE4000;
 const DMA_PAGES: usize = 28;
-/// PTE cache-disable for the controller's MMIO registers. The coherent DMA
-/// RAM stays write-back cacheable.
-const PTE_CACHE_DISABLE: u64 = 1 << 4;
 
 // Offsets inside the DMA region. Queues must be page-aligned (CC.MPS=0).
 const ASQ_OFF: usize = 0x0000; // admin submission queue
@@ -44,7 +31,6 @@ const PRP_LIST_OFF: usize = 0x1B000;
 const DEPTH: usize = 16;
 
 const SECTORS_PER_PAGE: u32 = (crate::PAGE_SIZE / 512) as u32;
-const SECTORS_PER_CMD: u32 = BOUNCE_PAGES as u32 * SECTORS_PER_PAGE;
 
 // Controller register offsets (from BAR0).
 const R_CAP_HI: usize = 0x04;
@@ -55,19 +41,9 @@ const R_ASQ: usize = 0x28;
 const R_ACQ: usize = 0x30;
 const DOORBELL_BASE: usize = 0x1000;
 
-fn r32(off: usize) -> u32 {
-    unsafe { core::ptr::read_volatile((REGS_VA + off) as *const u32) }
-}
-fn w32(off: usize, v: u32) {
-    unsafe { core::ptr::write_volatile((REGS_VA + off) as *mut u32, v) }
-}
-fn w64(off: usize, v: u64) {
-    w32(off, v as u32);
-    w32(off + 4, (v >> 32) as u32);
-}
-
 /// One submission/completion queue pair (admin or I/O).
 struct Queue {
+    regs: Mmio,
     sq_va: usize,
     cq_va: usize,
     sq_db: usize, // doorbell register offsets from BAR0
@@ -86,7 +62,7 @@ impl Queue {
             unsafe { core::ptr::write_volatile(sqe.add(i), dw) };
         }
         self.tail = (self.tail + 1) % DEPTH;
-        w32(self.sq_db, self.tail as u32);
+        self.regs.write(self.sq_db, self.tail as u32);
 
         let cqe = (self.cq_va + self.head * 16) as *const u32;
         for _ in 0..100_000_000u32 {
@@ -98,7 +74,7 @@ impl Queue {
                     self.head = 0;
                     self.phase = !self.phase;
                 }
-                w32(self.cq_db, self.head as u32);
+                self.regs.write(self.cq_db, self.head as u32);
                 return status;
             }
         }
@@ -106,21 +82,14 @@ impl Queue {
     }
 }
 
-struct Nvme {
+pub struct Nvme {
     admin: Queue,
     io: Queue,
-    dma_phys: u64,
+    dma: Region,
 }
 
-/// One NVMe namespace, presented as a [`Disk`].
-///
-/// Owns the controller state it drives — there is no global handle. The queues
-/// need `&mut` to submit (tail/head/phase advance) while `Disk` hands out
-/// `&self`, so the state sits behind the same `Mutex` the old global used.
-pub struct NvmeDisk {
-    inner: Mutex<Nvme>,
-    sectors: u64,
-}
+/// One NVMe namespace behind the shared storage transfer engine.
+pub type NvmeDisk = Storage<Nvme>;
 
 /// A zeroed command with opcode + nsid filled in.
 fn cmd(opc: u8, nsid: u32) -> [u32; 16] {
@@ -136,26 +105,26 @@ fn set_prp1(c: &mut [u32; 16], phys: u64) {
     c[7] = (phys >> 32) as u32;
 }
 
-fn set_data_prps(c: &mut [u32; 16], dma_phys: u64, sectors: u32) {
-    set_prp1(c, dma_phys + BOUNCE_OFF as u64);
+fn set_data_prps(c: &mut [u32; 16], dma: &Region, buffer_phys: u64, sectors: u32) {
+    set_prp1(c, buffer_phys);
     if sectors <= SECTORS_PER_PAGE {
         return;
     }
     let pages = sectors.div_ceil(SECTORS_PER_PAGE) as usize;
-    let second_page = dma_phys + BOUNCE_OFF as u64 + crate::PAGE_SIZE as u64;
+    let second_page = buffer_phys + crate::PAGE_SIZE as u64;
     if pages == 2 {
         c[8] = second_page as u32;
         c[9] = (second_page >> 32) as u32;
         return;
     }
-    let list_phys = dma_phys + PRP_LIST_OFF as u64;
+    let list_phys = dma.phys + PRP_LIST_OFF as u64;
     c[8] = list_phys as u32;
     c[9] = (list_phys >> 32) as u32;
     for page in 1..pages {
         unsafe {
             core::ptr::write_volatile(
-                (DMA_VA + PRP_LIST_OFF + (page - 1) * size_of::<u64>()) as *mut u64,
-                dma_phys + BOUNCE_OFF as u64 + page as u64 * crate::PAGE_SIZE as u64,
+                (dma.va + PRP_LIST_OFF + (page - 1) * size_of::<u64>()) as *mut u64,
+                buffer_phys + page as u64 * crate::PAGE_SIZE as u64,
             );
         }
     }
@@ -185,48 +154,44 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     let bar_hi = if is_64 { pci::read32(machine, bus, dev, func, 0x14) } else { 0 };
     let bar_phys = ((bar_hi as u64) << 32) | (bar0 & 0xFFFF_FFF0) as u64;
 
-    machine.map_phys_range(REGS_VA >> 12, REGS_PAGES, bar_phys >> 12, PTE_CACHE_DISABLE);
-
-    // The controller is present (find_class matched) — being unable to back it
-    // with DMA is a hard error, not a "no disk". Fail loud so a regression like
-    // another driver stealing the pool is obvious, not a silent "Diskless".
-    let dma_page = machine.alloc_phys_contig(DMA_PAGES, 0);
-    assert!(dma_page != 0, "nvme: controller found but no DMA pool available");
-    machine.map_phys_range(DMA_VA >> 12, DMA_PAGES, dma_page, 0);
-    let dma_phys = dma_page * 0x1000;
-    unsafe { core::ptr::write_bytes(DMA_VA as *mut u8, 0, DMA_PAGES * 0x1000) };
+    let registers = Mmio::map(machine, bar_phys, DOORBELL_BASE)?;
+    let stride = 4usize << (registers.read(R_CAP_HI) & 0xF);
+    let regs = Mmio::map(machine, bar_phys, DOORBELL_BASE + 3 * stride + 4)?;
+    let dma = Region::allocate(machine, DMA_PAGES, 64)?;
+    let dma_phys = dma.phys;
 
     // Doorbell stride: CAP.DSTRD (bits 35:32), in units of 4 bytes.
-    let stride = 4usize << (r32(R_CAP_HI) & 0xF);
     let db = |qid: usize, is_cq: bool| DOORBELL_BASE + (2 * qid + is_cq as usize) * stride;
 
     // Reset: EN=0, wait !RDY; program admin queues; EN=1, wait RDY.
-    w32(R_CC, 0);
-    if !wait_csts(0) {
+    regs.write(R_CC, 0);
+    if !wait_csts(regs, 0) {
         return None;
     }
-    w32(R_AQA, ((DEPTH as u32 - 1) << 16) | (DEPTH as u32 - 1));
-    w64(R_ASQ, dma_phys + ASQ_OFF as u64);
-    w64(R_ACQ, dma_phys + ACQ_OFF as u64);
+    regs.write(R_AQA, ((DEPTH as u32 - 1) << 16) | (DEPTH as u32 - 1));
+    regs.write64(R_ASQ, dma_phys + ASQ_OFF as u64);
+    regs.write64(R_ACQ, dma_phys + ACQ_OFF as u64);
     // IOCQES=4 (16B), IOSQES=6 (64B), MPS=0 (4K), CSS=0 (NVM), EN=1.
-    w32(R_CC, (4 << 20) | (6 << 16) | 1);
-    if !wait_csts(1) {
-        compact_println!("NVMe: controller did not become ready (csts={:#x})", r32(R_CSTS));
+    regs.write(R_CC, (4 << 20) | (6 << 16) | 1);
+    if !wait_csts(regs, 1) {
+        compact_println!("NVMe: controller did not become ready (csts={:#x})", regs.read(R_CSTS));
         return None;
     }
 
     let mut n = Nvme {
         admin: Queue {
-            sq_va: DMA_VA + ASQ_OFF, cq_va: DMA_VA + ACQ_OFF,
+            regs,
+            sq_va: dma.va + ASQ_OFF, cq_va: dma.va + ACQ_OFF,
             sq_db: db(0, false), cq_db: db(0, true),
             tail: 0, head: 0, phase: true,
         },
         io: Queue {
-            sq_va: DMA_VA + IOSQ_OFF, cq_va: DMA_VA + IOCQ_OFF,
+            regs,
+            sq_va: dma.va + IOSQ_OFF, cq_va: dma.va + IOCQ_OFF,
             sq_db: db(1, false), cq_db: db(1, true),
             tail: 0, head: 0, phase: true,
         },
-        dma_phys,
+        dma,
     };
 
     // Identify namespace 1 (CNS=0) — verify the LBA format is 512 bytes.
@@ -237,7 +202,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
         compact_println!("NVMe: IDENTIFY failed");
         return None;
     }
-    let ident = DMA_VA + IDENT_OFF;
+    let ident = n.dma.va + IDENT_OFF;
     // NSZE (bytes 0..8): namespace size in logical blocks — the capacity.
     let sectors = unsafe { core::ptr::read_volatile(ident as *const u64) };
     let flbas = unsafe { core::ptr::read_volatile((ident + 26) as *const u8) } & 0xF;
@@ -270,9 +235,9 @@ fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
     Some((n, sectors))
 }
 
-fn wait_csts(ready: u32) -> bool {
+fn wait_csts(regs: Mmio, ready: u32) -> bool {
     for _ in 0..10_000_000u32 {
-        let csts = r32(R_CSTS);
+        let csts = regs.read(R_CSTS);
         if csts & 2 != 0 {
             compact_println!("NVMe: controller fatal status");
             return false;
@@ -284,98 +249,36 @@ fn wait_csts(ready: u32) -> bool {
     false
 }
 
-impl NvmeDisk {
-    /// Probe PCI and bring up the controller's namespace 1. `None` when there
-    /// is no NVMe controller — a legacy machine, not an error.
+impl Storage<Nvme> {
+    /// Probe PCI and bring up the controller's namespace 1.
     pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Self> {
         let (n, sectors) = bring_up(machine)?;
-        Some(NvmeDisk { inner: Mutex::new(n), sectors })
+        // SAFETY: bring_up exclusively maps this permanently resident DMA
+        // region. The bounce span is disjoint from queues and the PRP list.
+        let buffer = unsafe { n.dma.buffer(BOUNCE_OFF, BOUNCE_PAGES * crate::PAGE_SIZE) };
+        Some(Self::new(n, buffer, sectors, "nvme0n1"))
     }
 }
 
-impl Disk for NvmeDisk {
-    /// Bounded chunks through the bounce buffer; short tails copy partially.
-    fn read(&self, lba: u64, mut buffer: &mut [u8]) -> u32 {
-        let total = buffer.len().div_ceil(512) as u32;
-        let mut guard = self.inner.lock();
-        let n = &mut *guard;
-
-        let mut current = lba;
-        let mut remaining = total;
-        while remaining > 0 {
-            let batch = remaining.min(SECTORS_PER_CMD);
-            let mut c = cmd(0x02, 1); // READ, nsid 1
-            set_data_prps(&mut c, n.dma_phys, batch);
-            c[10] = current as u32; // starting LBA, low
-            c[11] = (current >> 32) as u32; // starting LBA, high
-            c[12] = batch - 1; // 0-based count
-            let status = n.io.exec(&c);
-            if status != 0 {
-                lib::compact_panic!("NVMe read failed: lba={:#x} status={:#x}", current, status);
-            }
-            let bytes = (batch as usize * 512).min(buffer.len());
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    (DMA_VA + BOUNCE_OFF) as *const u8,
-                    buffer.as_mut_ptr(),
-                    bytes,
-                );
-            }
-            buffer = &mut buffer[bytes..];
-            current += batch as u64;
-            remaining -= batch;
+impl Hardware for Nvme {
+    fn execute(&mut self, request: Command, buffer: &mut Buffer) -> Result<(), Error> {
+        let opcode = match request.operation {
+            Operation::Read => 0x02,
+            Operation::Write => 0x01,
+            Operation::Flush => 0x00,
+        };
+        let mut c = cmd(opcode, 1);
+        if request.operation != Operation::Flush {
+            set_data_prps(&mut c, &self.dma,
+                buffer.physical_address().expect("NVMe requires DMA memory"), request.sectors);
+            c[10] = request.lba as u32;
+            c[11] = (request.lba >> 32) as u32;
+            c[12] = request.sectors - 1;
         }
-        total
-    }
-
-    /// The write-direction twin of [`Self::read`]. Source bytes are staged
-    /// into the bounce buffer, then a WRITE (opcode 01h) points PRP1 at it. A
-    /// short final sector is zero-padded before submission.
-    fn write(&self, lba: u64, mut buffer: &[u8]) -> u32 {
-        let total = buffer.len().div_ceil(512) as u32;
-        let mut guard = self.inner.lock();
-        let n = &mut *guard;
-
-        let mut current = lba;
-        let mut remaining = total;
-        while remaining > 0 {
-            let batch = remaining.min(SECTORS_PER_CMD);
-            let bytes = (batch as usize * 512).min(buffer.len());
-            // Stage into the bounce buffer, zero-filling any partial tail so
-            // the whole command buffer is defined.
-            unsafe {
-                core::ptr::write_bytes(
-                    (DMA_VA + BOUNCE_OFF) as *mut u8,
-                    0,
-                    batch as usize * 512,
-                );
-                core::ptr::copy_nonoverlapping(
-                    buffer.as_ptr(),
-                    (DMA_VA + BOUNCE_OFF) as *mut u8,
-                    bytes,
-                );
-            }
-            let mut c = cmd(0x01, 1); // WRITE, nsid 1
-            set_data_prps(&mut c, n.dma_phys, batch);
-            c[10] = current as u32; // starting LBA, low
-            c[11] = (current >> 32) as u32; // starting LBA, high
-            c[12] = batch - 1; // 0-based count
-            let status = n.io.exec(&c);
-            if status != 0 {
-                lib::compact_panic!("NVMe write failed: lba={:#x} status={:#x}", current, status);
-            }
-            buffer = &buffer[bytes..];
-            current += batch as u64;
-            remaining -= batch;
+        match self.io.exec(&c) {
+            0 => Ok(()),
+            0xffff => Err(Error::Timeout),
+            status => Err(Error::Device(status)),
         }
-        total
-    }
-
-    fn sectors(&self) -> u64 {
-        self.sectors
-    }
-
-    fn name(&self) -> &str {
-        "nvme0n1"
     }
 }

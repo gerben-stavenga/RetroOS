@@ -4,6 +4,12 @@
 
 ## Pending
 
+### Persistent task hibernation
+- [ ] OSD save-to-disk and resume across reboots, releasing the saved task's
+      memory only after durable checkpoint publication. See
+      [TASK_HIBERNATION.md](TASK_HIBERNATION.md) for the proposed lifecycle,
+      state format requirements, and acceptance checks.
+
 ### Userspace & Mode Switching
 - [ ] Harden and expand 64-bit userspace support
 - [ ] Continue reducing mode-specific special cases at the kernel boundary

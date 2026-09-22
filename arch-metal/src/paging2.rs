@@ -112,7 +112,7 @@ pub const KERNEL_PHYS: usize = 0x0010_0000;
 /// within it — but the window itself is a memory-layout fact (the ceiling, and
 /// the base = first page past the kernel image's linker `_end`), owned here, not
 /// allocator policy.
-pub const HEAP_END: usize = crate::aperture::APERTURE_BASE;
+pub const HEAP_END: usize = arch_abi::DEVICE_WINDOW_BASE;
 
 /// VA window for physical framebuffers. Carved off the top of the heap window.
 pub use arch_abi::{FB_WINDOW_BASE, FB_WINDOW_END};

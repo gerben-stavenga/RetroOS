@@ -414,7 +414,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     } else {
         lib::compact_screenln!(screen, "at <unknown location>");
     }
-    lib::compact_screenln!(screen, "<panic message unavailable>");
+    let _ = core::fmt::Write::write_fmt(screen, format_args!("{}\n", info.message()));
     fatal_finish()
 }
 
