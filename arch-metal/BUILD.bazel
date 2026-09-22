@@ -1,5 +1,6 @@
 # Build arch-metal crate (the bare-metal x86 `arch_abi::Arch` backend).
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_test")
+load("//toolchain:host_transition.bzl", "host_platform_test")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -14,4 +15,18 @@ rust_library(
         "-Cforce-frame-pointers=yes",
     ],
     deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
+)
+
+# Exercise DMA allocation policy without executing privileged metal code.
+rust_test(
+    name = "xhci_dma_test_host",
+    srcs = ["xhci_test.rs", "src/xhci/dma.rs"],
+    crate_root = "xhci_test.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+)
+
+host_platform_test(
+    name = "xhci_dma_test",
+    test = ":xhci_dma_test_host",
 )

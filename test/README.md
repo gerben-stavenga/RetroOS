@@ -44,6 +44,11 @@ HDA counters no longer exist; cursor and ring
 accounting are tested in `lib:sound_test`. The PCM checker itself has negative
 tests for silence, stalled playback and truncated recordings.
 
+`python3 test/xhci_smoke.py` boots with a USB keyboard and mouse on xHCI,
+checks both HID endpoints initialize, and runs HELLO.COM. Host unit tests
+(`//arch-metal:xhci_dma_test`) cover X99's 16 scratchpads, the full 1023-buffer
+count, non-overlapping DMA regions, and allocation failure.
+
 `python3 test/shared_disks.py` checks that the shared data disk is seeded once,
 preserves guest changes across launches, rejects concurrent launchers, and checks
 backend disk attachments. `test/private_data_disk.py` prepares disposable copies

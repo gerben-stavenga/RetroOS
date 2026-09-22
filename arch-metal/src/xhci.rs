@@ -86,24 +86,8 @@ fn w64(off: usize, v: u64) {
 // ── DMA region: DCBAA + command ring + event ring + ERST in one contiguous
 // block, mapped at a fixed VA, cache-disabled (simple + coherent, as NVMe does).
 const DMA_VA: usize = 0xFFF2_0000;
-const DCBAA_OFF: usize = 0x0000; // device-context base address array
-const CMD_OFF: usize = 0x1000; // command ring (256 TRBs)
-const EVT_OFF: usize = 0x2000; // event ring (256 TRBs)
-const ERST_OFF: usize = 0x3000; // event ring segment table (1 entry)
-const INCTX_OFF: usize = 0x4000; // input context (Address Device / Configure EP)
-const DEVCTX0_OFF: usize = 0x5000; // retained device lane 0: output context
-const EP0_0_OFF: usize = 0x6000; // retained device lane 0: control transfer ring
-const XFER_OFF: usize = 0x7000; // control-transfer data buffer (descriptors)
-const INT0_OFF: usize = 0x8000; // HID interrupt pipe 0 transfer ring
-const REPORT0_OFF: usize = 0x9000; // HID interrupt pipe 0 report buffer
-const SCRATCH_OFF: usize = 0xA000; // scratchpad buffer array (DCBAA[0])
-const SCRATCH_BUF_OFF: usize = 0xB000; // scratchpad buffers (zeroed, in-region)
-const SCRATCH_BUFS_MAX: usize = 8; // reserve this many; assert the HC needs <=
-const DEVCTX1_OFF: usize = 0x13000; // retained device lane 1: output context
-const EP0_1_OFF: usize = 0x14000; // retained device lane 1: control transfer ring
-const INT1_OFF: usize = 0x15000; // HID interrupt pipe 1 transfer ring
-const REPORT1_OFF: usize = 0x16000; // HID interrupt pipe 1 report buffer
-const DMA_PAGES: usize = 15 + SCRATCH_BUFS_MAX;
+mod dma;
+use dma::*;
 const RING_TRBS: usize = 256;
 const DEVICE_LANES: usize = 2;
 
@@ -343,10 +327,16 @@ fn bringup(op: usize, rt: usize, max_slots: u32) -> bool {
         return false;
     }
 
-    // One contiguous DMA block for all the structures — from the GENERAL pool,
-    // NOT the single ISA-DMA pool (which NVMe / the Sound Blaster need). Assert:
-    // if we found and reset the controller, we must be able to back it.
-    let page = crate::phys_mm::alloc_contig(DMA_PAGES).expect("xhci: out of contiguous DMA pages");
+    // This driver uses 4 KiB pages. Refuse unsupported controllers while
+    // halted, before publishing any DMA pointers.
+    if r32(op + 8) & 1 == 0 {
+        lib::compact_println!("xHCI: 4 KiB pages unsupported - skipping");
+        return false;
+    }
+    let Some(page) = crate::phys_mm::alloc_contig(DMA_PAGES) else {
+        lib::compact_println!("xHCI: DMA allocation failed - skipping");
+        return false;
+    };
     let phys = page * 0x1000;
     map_dma(phys, DMA_PAGES);
     unsafe {
@@ -355,38 +345,36 @@ fn bringup(op: usize, rt: usize, max_slots: u32) -> bool {
         DMA_PHYS = phys;
     }
 
-    // Enable all device slots; point the controller at the (zeroed) DCBAA.
-    w32(op + OP_CONFIG, max_slots);
-    w64(op + OP_DCBAAP, phys + DCBAA_OFF as u64);
-
-    // Scratchpad buffers. HCSPARAMS2 (cap reg 0x08) Max Scratchpad Buffers =
-    // Hi(25:21)<<5 | Lo(31:27). A real controller REQUIRES the driver to hand it
-    // that many page-sized buffers, with their pointer array in DCBAA[0]; given
-    // none, it enumerates and runs control transfers but never services the
-    // periodic schedule — interrupt endpoints stay Running yet transfer nothing.
-    // QEMU asks for zero, which is why this was invisible until real silicon.
-    let hcsp2 = r32(0x08);
-    let scratch = ((((hcsp2 >> 21) & 0x1F) << 5) | ((hcsp2 >> 27) & 0x1F)) as usize;
-    lib::compact_println!("xHCI: scratchpad buffers required: {}", scratch);
-    if scratch > 0 {
-        assert!(
-            scratch <= SCRATCH_BUFS_MAX,
-            "xhci: HC wants {} scratchpad bufs",
-            scratch
-        );
+    // Allocate the full hardware-requested count, not a fixed pool. Only the
+    // pointer array is contiguous; one temporary VA zeros each separate page.
+    // All pages remain reserved for the boot lifetime, including on failure.
+    let array = unsafe {
+        core::slice::from_raw_parts_mut((DMA_VA + SCRATCH_OFF) as *mut u64,
+                                       (DMA_PAGES * 0x1000 - SCRATCH_OFF) / 8)
+    };
+    let scratch = dma::scratchpads(r32(0x08), array, || {
+        let page = crate::phys_mm::alloc_contig(1)?;
+        let temporary = DMA_VA + DMA_PAGES * 0x1000;
+        crate::paging2::map_user_page_phys(temporary / 0x1000, page,
+                                         crate::paging2::flags::CACHE_DISABLE);
+        unsafe { core::ptr::write_bytes(temporary as *mut u8, 0, 0x1000); }
+        Some(page * 0x1000)
+    });
+    let Some(scratch) = scratch else {
+        lib::compact_println!("xHCI: scratchpad allocation failed - skipping");
+        return false;
+    };
+    lib::compact_println!("xHCI: scratchpad buffers allocated: {}", scratch);
+    if scratch != 0 {
         unsafe {
-            // Buffers live inside the DMA block — already zeroed (write_bytes
-            // above) and cache-disabled, matching Linux's dma_alloc_coherent.
-            // A controller can read garbage from an uninitialised scratchpad and
-            // misbehave (e.g. never service the periodic schedule).
-            let arr = (DMA_VA + SCRATCH_OFF) as *mut u64;
-            for i in 0..scratch {
-                core::ptr::write_volatile(arr.add(i), phys + (SCRATCH_BUF_OFF + i * 0x1000) as u64);
-            }
-            // DCBAA[0] is reserved for the Scratchpad Buffer Array pointer.
-            core::ptr::write_volatile((DMA_VA + DCBAA_OFF) as *mut u64, phys + SCRATCH_OFF as u64);
+            core::ptr::write_volatile((DMA_VA + DCBAA_OFF) as *mut u64,
+                                     phys + SCRATCH_OFF as u64);
         }
     }
+    // Publish only after every scratchpad and its pointer have been initialized.
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    w32(op + OP_CONFIG, max_slots);
+    w64(op + OP_DCBAAP, phys + DCBAA_OFF as u64);
 
     // Command ring: a Link TRB at the end loops back to the start (TRB type 6,
     // Toggle-Cycle set). CRCR points at it with Ring-Cycle-State = 1.
@@ -893,10 +881,11 @@ fn classify_addressed(slot: u32, lane: usize, port: u32, speed: u32) -> PortDevi
         let mut i = rd(0) as usize;
         while i + 2 <= total {
             let (blen, btype) = (rd(i) as usize, rd(i + 1));
-            if blen == 0 {
+            if blen < 2 || i + blen > total {
                 break;
             }
             if btype == 4 {
+                if blen < 9 { break; }
                 // interface: HID(3)/keyboard(proto 1) vs HID(3)/mouse(proto 2).
                 // A composite keyboard has both a boot interface (subclass 1,
                 // small report) and the real keyboard (subclass 0, larger
@@ -908,7 +897,7 @@ fn classify_addressed(slot: u32, lane: usize, port: u32, speed: u32) -> PortDevi
                 let (cls, subclass, proto) = (rd(i + 5), rd(i + 6), rd(i + 7));
                 is_kbd = cls == 3 && proto == 1;
                 is_mouse = cls == 3 && subclass == 1 && proto == 2;
-            } else if btype == 5 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
+            } else if btype == 5 && blen >= 7 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
                 // interrupt-IN endpoint — attribute it to the current role
                 let ep = EpInfo {
                     iface: cur_iface,
@@ -1020,7 +1009,11 @@ pub fn init() {
     } else {
         0
     };
-    let bar = (((bar_hi as u64) << 32) | (bar0 & 0xFFFF_FFF0) as u64) & !0xFFF;
+    let bar = ((bar_hi as u64) << 32) | (bar0 & 0xFFFF_FFF0) as u64;
+    if bar == 0 || bar & 0xFFF != 0 || bar0 == u32::MAX {
+        lib::compact_println!("xHCI: invalid or unaligned BAR - skipping");
+        return;
+    }
     map_mmio(bar, 16);
 
     let cap0 = r32(0x00);
@@ -1032,6 +1025,16 @@ pub fn init() {
     let rt = (r32(0x18) & !0x1F) as usize; // RTSOFF
     let db = (r32(0x14) & !0x3) as usize; // DBOFF
     let stride = if (r32(0x10) >> 2) & 1 == 1 { 64 } else { 32 }; // HCCPARAMS1.CSZ
+    // The fixed MMIO window is 64 KiB. Never let capability offsets address
+    // the adjacent DMA region or wrap around the top of the address space.
+    if caplen < 0x20 || !caplen.is_multiple_of(4) || max_slots == 0 || max_ports == 0
+        || op + OP_PORTSC + max_ports as usize * 16 > 0x10000
+        || !(0x20..=0x10000 - (IR0_ERDP + 8)).contains(&rt)
+        || db < 0x20 || db > 0x10000 - (max_slots as usize + 1) * 4
+    {
+        lib::compact_println!("xHCI: unsupported register layout - skipping");
+        return;
+    }
     unsafe {
         RT = rt;
         DB = db;
@@ -1119,8 +1122,7 @@ pub fn init() {
             configure_hid(slot, &dev, ep, HidRole::Mouse, 1, stride, false)
         });
 
-    if keyboard_ready {
-        let (slot, dev, ep) = keyboard.unwrap();
+    if keyboard_ready && let Some((slot, dev, ep)) = keyboard {
         unsafe { start_pipe(&raw mut KBD_PIPE) };
         let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: keyboard ready (slot {} port {} ep {} mps {})",
@@ -1132,8 +1134,7 @@ pub fn init() {
     } else {
         lib::compact_println!("xHCI: no keyboard found");
     }
-    if mouse_ready {
-        let (slot, dev, ep) = mouse.unwrap();
+    if mouse_ready && let Some((slot, dev, ep)) = mouse {
         unsafe { start_pipe(&raw mut MOUSE_PIPE) };
         let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "xHCI: mouse ready (slot {} port {} ep {} mps {})",

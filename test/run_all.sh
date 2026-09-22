@@ -106,7 +106,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //arch-abi:arch_abi_test //kernel:kernel_unit_test \
+        //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //kernel:kernel_unit_test \
         //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test \
         //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
@@ -147,6 +147,7 @@ run() {
 
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
+run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run machine_layout machine_layout python3 test/machine_layout.py
 run dn_state     dn_state  python3 test/dn_state.py
