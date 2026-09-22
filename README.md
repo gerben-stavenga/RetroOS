@@ -90,10 +90,19 @@ persistent disk. A launcher lock prevents simultaneous use of the same disk.
 
 Edit [filesystem_layout.bzl](filesystem_layout.bzl) for packaged file destinations
 and partition sizes. Size/seed changes apply to newly created data images;
-existing disks retain their contents and layout. `C:\RETROOS\LOADFIX.CFG` is
-seeded as writable data. The boot volume is read-only:
+existing disks retain their contents and layout. `C:\CONFIG\LOADFIX.CFG` is
+seeded as writable data. Add `ALADDIN.EXE xms32k` there to cap Aladdin's classic
+XMS free-memory report at 32767 KiB; the actual pool and XMS 3.0 query stay
+unchanged. Launch through COMMAND.COM (including from DN) to apply the policy.
+The boot volume is read-only:
 new state files beside shipped files go to the data disk, while shipped files
 cannot be overwritten through that binding.
+
+Startup settings live in `C:\CONFIG\CONFIG.SYS`. Change
+`START=C:\RETROOS\DN\DN.COM` to another program (with optional arguments)
+to choose what starts at boot. The program restarts when it exits. `--cmd` and
+`TEST=` override it for tests. Migrate an existing disk with
+`python3 tools/migrate_dn_state.py --image build/data.bin` while it is offline.
 
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 `--host DIR` uses the live host tree with the hosted backend, or exports it as
@@ -103,6 +112,13 @@ The old `-i` image modes, installer flow, and `--gpt` assembly are removed.
 
 `run.sh` owns the build/data lifecycle; `tools/run/` contains only backend
 launch arguments and configuration. See `./run.sh --help` for options.
+
+For 86Box, the disposable boot image is padded to 504 MiB (1024 cylinders)
+so the emulated IDE disk advertises LBA support. Its filesystem and the
+persistent data image keep their original sizes.
+This works around the TX97 BIOS's automatic CHS translation; the kernel also
+supports CHS-only IDE disks, using their reported geometry. CHS/LBA addressing
+is independent of PIO/DMA transfers.
 
 For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOTING.md).
 

@@ -21,8 +21,8 @@ letter a permanent commitment, so C: must be C: on both sides -- which it is,
 because FreeDOS letters the first DOS-typed primary partition and the boot
 disk's ESP is type 0xEF, which DOS skips.
 
-CONFIG.SYS does not collide: FreeDOS prefers FDCONFIG.SYS, leaving plain
-CONFIG.SYS to RetroOS's key=value environment.
+FreeDOS uses FDCONFIG.SYS; RetroOS keeps its key=value startup settings
+in CONFIG/CONFIG.SYS.
 """
 
 import argparse
@@ -171,7 +171,7 @@ def populate_fat(image, start, sectors, tree, freedos_dir, work, heads):
         mcopy(os.path.join(freedos_dir, name), "/" + name)
 
     # FreeDOS reads FDCONFIG.SYS in preference to CONFIG.SYS, which is what
-    # lets RetroOS keep plain CONFIG.SYS for its own key=value environment.
+    # keeps FreeDOS startup separate from RetroOS CONFIG/CONFIG.SYS.
     fdconfig = os.path.join(work, "FDCONFIG.SYS")
     with open(fdconfig, "w", newline="\r\n") as f:
         f.write("DOS=HIGH\n")

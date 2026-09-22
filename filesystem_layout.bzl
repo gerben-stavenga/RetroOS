@@ -39,7 +39,7 @@ DATA_FILES = {
 
     # User-editable launch settings survive boot rebuilds.
     "//tools/command:LOADFIX.CFG": "CONFIG/LOADFIX.CFG",
-    "etc/CONFIG.SYS": "CONFIG.SYS",
+    "etc/CONFIG.SYS": "CONFIG/CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
     # COMMAND.COM is not here: it lives at C:\RETROOS\COMMAND.COM (see

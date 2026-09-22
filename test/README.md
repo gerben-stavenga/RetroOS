@@ -52,7 +52,7 @@ count, non-overlapping DMA regions, and allocation failure.
 `python3 test/shared_disks.py` checks that the shared data disk is seeded once,
 preserves guest changes across launches, rejects concurrent launchers, and checks
 backend disk attachments. `test/private_data_disk.py` prepares disposable copies
-for probes that need a `CONFIG.SYS` command; normal launches never inject it.
+for probes that need a `CONFIG/CONFIG.SYS` command; normal launches never inject it.
 
 `python3 test/machine_layout.py` boots an ext4 laptop-style layout containing
 `/boot/grub`, checks UUID selection with reordered disks, read-only runtime files,

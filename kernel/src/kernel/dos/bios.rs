@@ -81,7 +81,9 @@ pub(crate) struct Bda {
     video_mode: u8,
     /// 0x4A: text columns.
     columns: u16,
-    _pad_4c: [u8; 4],
+    /// 0x4C: bytes per display page; 0x4E: active page byte offset.
+    video_page_size: u16,
+    video_page_start: u16,
     /// 0x50: cursor position per page (low byte = column, high byte = row).
     cursor_pos: [u16; 8],
     /// 0x60: cursor shape (CX of INT 10h AH=01).
@@ -336,6 +338,7 @@ fn seed_bda<A: crate::Arch>(machine: &mut A) {
     bda_field!(machine, mem_size_kb = 640u16);
     bda_field!(machine, video_mode = 3u8); // 80x25 colour text
     bda_field!(machine, columns = 80u16);
+    bda_field!(machine, video_page_size = 0x1000u16);
     bda_field!(machine, crtc_base = 0x03D4u16);
     bda_field!(machine, rows_minus1 = 24u8);
     bda_field!(machine, cell_height = 16u16);
@@ -930,11 +933,15 @@ fn font_service<A: crate::Arch>(
     }
 
     if set_geometry {
-        let rows = if glyph_h == 8 { 50 } else { 25 };
+        let rows: u8 = if glyph_h == 8 { 50 } else { 25 };
         bda_field!(machine, rows_minus1 = rows - 1);
         bda_field!(machine, cell_height = glyph_h as u16);
         bda_field!(machine, cursor_shape = ((glyph_h as u16 - 2) << 8) | (glyph_h as u16 - 1));
         publish_active_font(machine, glyph_h as u8);
+        let cols: u16 = bda_field!(machine, columns);
+        bda_field!(machine, video_page_size = (cols * u16::from(rows) * 2).next_multiple_of(2048));
+        sync_cursor_shape(machine, dos);
+        sync_cursor_position(machine, dos);
     }
 }
 
@@ -990,10 +997,7 @@ pub(super) fn teletype<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosSta
         row = max_row as u32;
     }
     machine.write::<u16>(bda(pos_off), ((row << 8) | col) as u16);
-    // Keep the CRTC hardware cursor in step, so `vga_hw::save` captures it.
-    let offset = (row * cols as u32 + col) as u16;
-    machine.outb(0x3D4, 0x0E); machine.outb(0x3D5, (offset >> 8) as u8);
-    machine.outb(0x3D4, 0x0F); machine.outb(0x3D5, offset as u8);
+    sync_cursor_position(machine, dos);
 }
 
 /// Scroll a text page up one line, blanking the last. A no-op in a graphics
@@ -1023,10 +1027,50 @@ fn scroll_text_page<A: crate::Arch>(machine: &mut A, page: u8, cols: u16, max_ro
 
 fn text_cell<A: crate::Arch>(machine: &mut A, page: u8, row: u32, col: u32) -> usize {
     let cols: u16 = bda_field!(machine, columns);
-    let page_size = if cols > 40 { 0x1000 } else { 0x800 };
+    let page_size: u16 = bda_field!(machine, video_page_size);
     VRAM_TEXT
-        + (page as usize & 7) * page_size
+        + (page as usize & 7) * usize::from(page_size)
         + (row as usize * cols as usize + col as usize) * 2
+}
+
+fn write_crtc<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, index: u8, value: u8) {
+    let port: u16 = bda_field!(machine, crtc_base);
+    super::machine::vga::bios_write_crtc(machine, &mut dos.pc.vga, port, index, value);
+}
+
+fn sync_cursor_position<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
+    if !is_text_mode(Bda::video_mode(machine)) { return; }
+    let page: u8 = bda_field!(machine, active_page);
+    let (row, col) = cursor_of(machine, page);
+    let cols: u16 = bda_field!(machine, columns);
+    let page_size: u16 = bda_field!(machine, video_page_size);
+    let address = (u32::from(page & 7) * u32::from(page_size) / 2 + row * u32::from(cols) + col) as u16;
+    write_crtc(machine, dos, 0x0E, (address >> 8) as u8);
+    write_crtc(machine, dos, 0x0F, address as u8);
+}
+
+/// VGA BIOS compatibility: scale a CGA-style cursor to the active font height.
+fn cursor_scanlines(shape: u16, height: u16) -> (u8, u8) {
+    let mut start = (shape >> 8) as u8;
+    let mut end = shape as u8;
+    if height > 8 && end < 8 && start < 0x20 {
+        start = if end == start + 1 {
+            ((u16::from(end) + 1) * height / 8 - 2) as u8
+        } else {
+            ((u16::from(start) + 1) * height / 8 - 1) as u8
+        };
+        end = ((u16::from(end) + 1) * height / 8 - 1) as u8;
+    }
+    (start, end)
+}
+
+fn sync_cursor_shape<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>) {
+    if !is_text_mode(Bda::video_mode(machine)) { return; }
+    let shape: u16 = bda_field!(machine, cursor_shape);
+    let height: u16 = bda_field!(machine, cell_height);
+    let (start, end) = cursor_scanlines(shape, height);
+    write_crtc(machine, dos, 0x0A, start);
+    write_crtc(machine, dos, 0x0B, end);
 }
 
 /// A page's cursor position from the BDA, as (row, column).
@@ -1156,6 +1200,10 @@ pub(super) fn int10<A: crate::Arch>(
             bda_field!(machine, cell_height = cell_height);
             publish_active_font(machine, cell_height as u8);
             bda_field!(machine, active_page = 0u8);
+            bda_field!(machine, video_page_start = 0u16);
+            let cols: u16 = bda_field!(machine, columns);
+            bda_field!(machine, video_page_size = (cols * 25 * 2).next_multiple_of(2048));
+            bda_field!(machine, crtc_base = if mode == 7 { 0x3B4u16 } else { 0x3D4u16 });
             bda_field!(machine, cursor_pos = [0u16; 8]);
             // A mode set resets the cursor to the BIOS default underline (and
             // hides it in graphics modes) — guests read it back via AH=03 and
@@ -1167,6 +1215,8 @@ pub(super) fn int10<A: crate::Arch>(
             // Sequencer chain-4 bit, so this is the only place the trap gets
             // armed. (`clear` also blanks the planes.)
             super::machine::vga::on_set_mode(machine, &mut dos.pc, regs, mode, clear);
+            sync_cursor_shape(machine, dos);
+            sync_cursor_position(machine, dos);
             // The IBM BIOS programs the CGA compatibility registers (0x3D8
             // Mode-Control, 0x3D9 Colour-Select) on every mode set and mirrors
             // them in the BDA. The Colour-Select default is what gives mode 4/5
@@ -1187,12 +1237,15 @@ pub(super) fn int10<A: crate::Arch>(
         }
         0x01 => {
             bda_field!(machine, cursor_shape = regs.rcx as u16);
+            sync_cursor_shape(machine, dos);
         }
         0x02 => {
             // Set cursor position: BH=page, DH=row, DL=col.
             let page = ((regs.rbx >> 8) & 0x7) as usize;
             let pos_off = core::mem::offset_of!(Bda, cursor_pos) + page * 2;
             machine.write::<u16>(bda(pos_off), regs.rdx as u16);
+            let active: u8 = bda_field!(machine, active_page);
+            if page == usize::from(active) { sync_cursor_position(machine, dos); }
         }
         0x03 => {
             let page = ((regs.rbx >> 8) & 0x7) as usize;
@@ -1203,7 +1256,16 @@ pub(super) fn int10<A: crate::Arch>(
             regs.rcx = (regs.rcx & !0xFFFF) | shape as u64;
         }
         0x05 => {
-            bda_field!(machine, active_page = (ax & 0xFF) as u8);
+            let page = (ax & 7) as u8;
+            bda_field!(machine, active_page = page);
+            if is_text_mode(Bda::video_mode(machine)) {
+                let size: u16 = bda_field!(machine, video_page_size);
+                let offset = u16::from(page).wrapping_mul(size);
+                bda_field!(machine, video_page_start = offset);
+                write_crtc(machine, dos, 0x0C, ((offset / 2) >> 8) as u8);
+                write_crtc(machine, dos, 0x0D, (offset / 2) as u8);
+                sync_cursor_position(machine, dos);
+            }
         }
         0x06 | 0x07 => scroll_window(machine, regs, ah == 0x06),
         0x08 => {

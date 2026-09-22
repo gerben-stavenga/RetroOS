@@ -89,10 +89,12 @@ ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
 # A copy, not a symlink: these are build outputs under bazel-bin.
 "$REPO/tools/install_boot_dir.sh" "$C"
 
-# C:\CONFIG.SYS is the only config the kernel reads. COMSPEC points at
+# C:\CONFIG\CONFIG.SYS contains startup policy and the DOS environment. COMSPEC points at
 # C:\RETROOS\COMMAND.COM; PATH covers DN/COMMAND (C:\RETROOS), Turbo C, Borland C,
 # Borland Pascal.
-cat > "$C/CONFIG.SYS" <<'CFG'
+mkdir -p "$C/CONFIG"
+cat > "$C/CONFIG/CONFIG.SYS" <<'CFG'
+START=C:\RETROOS\DN\DN.COM
 DNSWP=C:\TEMP
 TEMP=C:\TEMP
 DN=C:\CONFIG\DN

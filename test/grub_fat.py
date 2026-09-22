@@ -20,6 +20,7 @@ def make_fat(work, name, bits, size, root):
         stream.truncate(size)
     run("mkfs.fat", "-F", bits, image)
     if root:
+        run("mmd", "-i", image, "::CONFIG")
         run("mmd", "-i", image, "::RETROOS")
         run("mcopy", "-i", image, work / "probe.elf", "::PROBE.ELF")
         run("mcopy", "-i", image, work / "payload", "::Mixed case filename.txt")
@@ -27,7 +28,7 @@ def make_fat(work, name, bits, size, root):
         run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::RETROOS/LFNPROBE.COM")
         run("mcopy", "-i", image, ROOT / "bazel-bin/tools/command/COMMAND.COM", "::RETROOS/COMMAND.COM")
         run("mcopy", "-i", image, work / "ROOTTEST.BAT", "::ROOTTEST.BAT")
-        run("mcopy", "-i", image, work / "CONFIG.SYS", "::CONFIG.SYS")
+        run("mcopy", "-i", image, work / "CONFIG.SYS", "::CONFIG/CONFIG.SYS")
     else:
         run("mmd", "-i", image, "::EFI")
     return image

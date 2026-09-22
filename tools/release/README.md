@@ -80,8 +80,8 @@ the generated video policy to an existing machine's GRUB entries.
 
 C:\RETROOS is read-only runtime. DN settings/history live in C:\CONFIG\DN;
 its temporary files live in C:\TEMP. Existing BOOT/DN or RETROOS/DN state is
-copied into the new location without overwriting existing settings. CONFIG.SYS
-selects DNSWP=C:\TEMP, TEMP=C:\TEMP, and DN=C:\CONFIG\DN in that order.
+copied into the new location without overwriting existing settings. C:\CONFIG\CONFIG.SYS selects the startup program with
+START=C:\RETROOS\DN\DN.COM and optional arguments. It also selects DNSWP=C:\TEMP, TEMP=C:\TEMP, and DN=C:\CONFIG\DN in that order.
 
 The kernel supports legacy IDE, AHCI/SATA, and NVMe storage; USB storage is not supported.
 Bootloader support for a disk does not imply the kernel can access that disk.

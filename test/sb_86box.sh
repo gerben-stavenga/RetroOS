@@ -22,7 +22,7 @@
 # verdict to a file on C: and this script reads it back out of the disk image
 # afterwards with mtools — no screen scraping, no root. Three things had to
 # be true for that to work at all, and none of them were until now: the probe
-# needs a command channel (CONFIG.SYS TEST=, since 86Box has no fw_cfg), the
+# needs a command channel (CONFIG/CONFIG.SYS TEST=, since 86Box has no fw_cfg), the
 # guest's writes need to reach the image rather than the volatile RAM overlay,
 # and the VM has to power off so those writes are flushed.
 #
@@ -162,7 +162,7 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"
 
 # $1 = probe .COM path on C:, $2 = verdict filename, $3.. = required markers.
 #
-# The test injects CONFIG.SYS TEST= into its own disposable data disk. 86Box takes
+# The test injects CONFIG/CONFIG.SYS TEST= into its own disposable data disk. 86Box takes
 # no fw_cfg and no command line.
 #
 # We poll for the verdict file rather than wait for the process to exit,

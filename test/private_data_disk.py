@@ -23,13 +23,13 @@ def main():
         mbr = stream.read(512)
     start = struct.unpack_from("<I", mbr, 446 + 8)[0]
     volume = f"{output}@@{start * 512}"
-    config = subprocess.check_output(["mtype", "-i", volume, "::CONFIG.SYS"])
+    config = subprocess.check_output(["mtype", "-i", volume, "::CONFIG/CONFIG.SYS"])
     lines = [line for line in config.splitlines() if not line.upper().startswith(b"TEST=")]
     lines.append(b"TEST=" + args.command.encode("ascii"))
     with tempfile.NamedTemporaryFile() as staged:
         staged.write(b"\r\n".join(lines) + b"\r\n")
         staged.flush()
-        subprocess.run(["mcopy", "-o", "-i", volume, staged.name, "::CONFIG.SYS"], check=True)
+        subprocess.run(["mcopy", "-o", "-i", volume, staged.name, "::CONFIG/CONFIG.SYS"], check=True)
 
 
 if __name__ == "__main__":

@@ -74,7 +74,7 @@ def session(work, disk, save_config):
             process.terminate()
             process.wait(timeout=5)
     text = log.read_text(errors="replace")
-    assert "DN exited, restarting" in text, text
+    assert "Startup program exited, restarting" in text, text
     assert "FATAL" not in text and "panicked" not in text, text
 
 
@@ -88,7 +88,7 @@ def main():
         run("mkfs.fat", "-F", "32", disk)
         for directory in ("RETROOS", "CONFIG", "CONFIG/DN", "TEMP"):
             run("mmd", "-i", disk, "::/" + directory)
-        run("mcopy", "-i", disk, ROOT / "etc/CONFIG.SYS", "::CONFIG.SYS")
+        run("mcopy", "-i", disk, ROOT / "etc/CONFIG.SYS", "::CONFIG/CONFIG.SYS")
         for ext in ("EDT", "EXT", "HGL", "MNU", "VWR", "XRN"):
             run("mcopy", "-i", disk, ROOT / f"apps-boot/dn/DN.{ext}", f"::CONFIG/DN/DN.{ext}")
         for first in (True, False):

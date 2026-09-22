@@ -788,14 +788,38 @@ fn mount_kernel_log_fs() {
     }
 }
 
-/// /CONFIG.SYS provides the master env handed to DN and any user-driven
-/// launches. KEY=VALUE lines, `#` comments. One location, C:\CONFIG.SYS —
-/// the second lookup existed only for the embedded bootfs's fallback copy.
-/// Absent, the env is empty.
+/// C:\CONFIG\CONFIG.SYS supplies startup policy and the master DOS environment.
+/// Read the old root location only when the new file is absent, so existing
+/// installations retain their settings until migrated.
 fn load_master_env() -> alloc::vec::Vec<u8> {
-    let user_cfg = [crate::kernel::dos::c_root(), b"CONFIG.SYS"].concat();
-    let config = crate::kernel::exec::load_file_resolved(&user_cfg).unwrap_or_default();
+    let root = crate::kernel::dos::c_root();
+    let user_cfg = [root, b"CONFIG/CONFIG.SYS"].concat();
+    let config = crate::kernel::exec::load_file_resolved(&user_cfg)
+        .or_else(|_| crate::kernel::exec::load_file_resolved(&[root, b"CONFIG.SYS"].concat()))
+        .unwrap_or_default();
     crate::kernel::dos::parse_config_env(&config)
+}
+
+/// START is one executable plus its command tail, with paths relative to C:.
+/// DOS C:\ paths and absolute VFS paths are also accepted.
+fn startup_command(env: &[u8], root: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+    let raw = crate::kernel::dos::config_var(env, b"START")
+        .map(trim_ascii).filter(|v| !v.is_empty())
+        .unwrap_or(b"C:\\RETROOS\\DN\\DN.COM");
+    let end = raw.iter().position(u8::is_ascii_whitespace).unwrap_or(raw.len());
+    let program = &raw[..end];
+    let tail = trim_ascii(&raw[end..]).to_vec();
+    let normalized: alloc::vec::Vec<u8> = program.iter()
+        .map(|&b| if b == b'\\' { b'/' } else { b }).collect();
+    let path = if normalized.len() >= 2 && normalized[..2].eq_ignore_ascii_case(b"C:") {
+        let relative = normalized[2..].strip_prefix(b"/").unwrap_or(&normalized[2..]);
+        [root, relative].concat()
+    } else if program.starts_with(b"/") {
+        normalized
+    } else {
+        [root, normalized.strip_prefix(b"/").unwrap_or(&normalized)].concat()
+    };
+    (path, tail)
 }
 
 /// `SB_AUDIO=native <irq> <dma8>` — the wiring an owner declares for a card
@@ -878,7 +902,7 @@ fn init_console_pipe() {
 }
 
 /// Run what the boot asked for: the headless `-fw_cfg opt/cmdline` program
-/// sequence (shut down after), or the interactive DN loop.
+/// sequence (shut down after), or the configurable interactive startup loop.
 fn is_kernel_launch_directive(key: &[u8]) -> bool {
     arch_abi::cmdline::key_eq(key, b"hostfs")
         || arch_abi::cmdline::key_eq(key, b"serial")
@@ -888,6 +912,27 @@ fn is_kernel_launch_directive(key: &[u8]) -> bool {
 #[cfg(test)]
 mod launch_directive_tests {
     use super::is_kernel_launch_directive;
+
+    #[test]
+    fn startup_command_uses_configured_path_and_arguments() {
+        let root = b"/home/retroos/";
+        let env = b"START=C:\\RETROOS\\COMMAND.COM /C echo hello\0\0";
+        let (path, tail) = super::startup_command(env, root);
+        assert_eq!(path, b"/home/retroos/RETROOS/COMMAND.COM");
+        assert_eq!(tail, b"/C echo hello");
+        assert_eq!(super::startup_command(b"START=TOOLS\\APP.COM arg\0", root),
+            (b"/home/retroos/TOOLS/APP.COM".to_vec(), b"arg".to_vec()));
+        assert_eq!(super::startup_command(b"START=/usr/bin/dash -i\0", root),
+            (b"/usr/bin/dash".to_vec(), b"-i".to_vec()));
+    }
+
+    #[test]
+    fn startup_command_defaults_to_dn_when_absent_or_empty() {
+        for env in [b"".as_slice(), b"START=   \0".as_slice()] {
+            assert_eq!(super::startup_command(env, b"/home/retroos/"),
+                (b"/home/retroos/RETROOS/DN/DN.COM".to_vec(), alloc::vec::Vec::new()));
+        }
+    }
 
     #[test]
     fn serial_directive_is_not_treated_as_a_program() {
@@ -985,16 +1030,17 @@ fn run<A: crate::Arch>(
 
     crate::compact_screenln!(&mut screen, "Welcome to RetroOS! F12 opens the host monitor.");
 
-    crate::compact_screenln!(&mut screen, "Starting DN...");
-    let dn_path = [crate::kernel::dos::c_root(), b"RETROOS/DN/DN.COM"].concat();
+    let (start_path, start_tail) = startup_command(master_env, crate::kernel::dos::c_root());
+    crate::compact_screenln!(&mut screen, "Starting {}...",
+        core::str::from_utf8(&start_path).unwrap_or("?"));
     loop {
         (screen, sb) = run_program_with_screen(
             machine,
             bios_workspace,
             dos_template,
             threads,
-            &dn_path,
-            b"",
+            &start_path,
+            &start_tail,
             b"",
             master_env,
             boot.debug_watch,
@@ -1002,7 +1048,7 @@ fn run<A: crate::Arch>(
             sb,
             &mut sink,
         );
-        crate::compact_screenln!(&mut screen, "DN exited, restarting...");
+        crate::compact_screenln!(&mut screen, "Startup program exited, restarting...");
     }
 }
 
@@ -2155,7 +2201,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     path: &[u8],
     cmdtail: &[u8],
     personality_name: Option<thread::PersonalityName>,
-    viopl: u8,
+    policy: crate::kernel::dos::LaunchPolicy,
     on_error: fn(&mut crate::Regs, i32),
     on_success: fn(&mut crate::Regs, i32),
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
@@ -2385,7 +2431,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         env,
         cwd,
         personality_name,
-        viopl,
+        policy,
         exec_vga,
     )
     .is_err()

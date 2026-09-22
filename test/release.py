@@ -51,7 +51,7 @@ def main():
         home = work / 'croot'
         home.mkdir()
         installer.migrate(home)
-        assert b'COMSPEC=C:\\RETROOS\\COMMAND.COM' in (home / 'CONFIG.SYS').read_bytes()
+        assert b'COMSPEC=C:\\RETROOS\\COMMAND.COM' in (home / 'CONFIG/CONFIG.SYS').read_bytes()
         assert (home / 'CONFIG/DN/DN.MNU').is_file()
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')

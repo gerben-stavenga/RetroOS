@@ -57,6 +57,30 @@ pub enum VgaMode {
     LinearSvga { w: u16, h: u16, bpp: u8, pitch: u16 },
 }
 
+/// The hardware text cursor, resolved from the CRTC for this blink phase.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextCursor {
+    pub address: u16,
+    pub start: u8,
+    pub end: u8,
+}
+
+impl TextCursor {
+    pub fn from_crtc(crtc: &[u8; 25], visible: bool) -> Option<Self> {
+        let start = crtc[0x0A] & 0x1F;
+        let end = crtc[0x0B] & 0x1F;
+        if !visible || crtc[0x0A] & 0x20 != 0 || start > end { return None; }
+        let address = u16::from_be_bytes([crtc[0x0E], crtc[0x0F]])
+            .wrapping_add(u16::from((crtc[0x0B] >> 5) & 3));
+        Some(Self { address, start, end })
+    }
+
+    fn covers(self, address: usize, scanline: usize) -> bool {
+        self.address == address as u16
+            && (usize::from(self.start)..=usize::from(self.end)).contains(&scanline)
+    }
+}
+
 /// One frame's worth of renderable VGA state. Borrowed — the renderer copies
 /// nothing it doesn't have to.
 pub struct Frame<'a> {
@@ -103,11 +127,12 @@ pub struct Frame<'a> {
     /// TUIs (DN, NC) disable blink via INT 10h AX=1003 to get bright
     /// backgrounds; masking bit 7 away rendered DN's dark-grey panels black.
     pub blink: bool,
+    pub text_cursor: Option<TextCursor>,
     /// CRTC display Start Address as a per-plane byte offset — the planar/Mode-X
     /// front buffer the program flipped to (registers 0x0C/0x0D). Page-flipping
     /// games (Doom's Mode Y) draw an off-screen page then set this to display
     /// it; rendering from 0 instead would show the back buffer mid-draw. 0 for
-    /// non-flipping modes.
+    /// non-flipping modes. In text modes this is the first displayed cell.
     pub start_offset: usize,
     /// Horizontal pixel pan (Attribute Controller register 0x13), 0..7: the
     /// fine sub-byte left shift that, combined with `start_offset`'s coarse
@@ -1365,7 +1390,7 @@ fn row_text(
     let dot_w = if cell_w % 9 == 0 { 9 } else { 8 };
     let repeat = cell_w / dot_w;
     for col in 0..cols {
-        let cell = (trow * cols + col) * 2;
+        let cell = ((frame.start_offset + trow * cols + col) & 0xFFFF) * 2;
         let (ch, attr) = if frame.vram.is_empty() {
             let Some(&ch) = frame.planes.get(frame.plane_layout.index(0, cell / 2)) else { return };
             let Some(&attr) = frame.planes.get(frame.plane_layout.index(1, cell / 2)) else { return };
@@ -1376,6 +1401,10 @@ fn row_text(
         };
         let fg = pal.lut[(attr & 0x0F) as usize];
         let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
+        if frame.text_cursor.is_some_and(|cursor| cursor.covers(cell / 2, gy)) {
+            for _ in 0..cell_w.min(w.saturating_sub(col * cell_w)) { st.put(fg); }
+            continue;
+        }
         // VGA Character Map A is selected by attribute bit 3 set; Character
         // Map B is selected when it is clear (Sequencer register 3).
         let bits = if let Some((map_a, map_b)) = frame.font_maps {
@@ -1769,7 +1798,7 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
     let (cols, rows, cell_w, cell_h) =
         (cols as usize, rows as usize, cell_w as usize, cell_h as usize);
     if col >= cols || row >= rows { return; }
-    let cell = (row * cols + col) * 2;
+    let cell = ((frame.start_offset + row * cols + col) & 0xFFFF) * 2;
     // Whole-cell bounds up front so the pixel loop can't overrun.
     if (row * cell_h + cell_h - 1) * stride + col * cell_w + cell_w > out.len() {
         return;
@@ -1810,7 +1839,9 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         let repeat = cell_w / dot_w;
         for gx in 0..cell_w {
             let dot = gx / repeat;
-            let on = if dot < 8 {
+            let on = if frame.text_cursor.is_some_and(|cursor| cursor.covers(cell / 2, gy)) {
+                true
+            } else if dot < 8 {
                 bits & (0x80 >> dot) != 0
             } else {
                 line_gfx && bits & 0x01 != 0
@@ -2072,7 +2103,7 @@ mod tests {
             mode: VgaMode::Planar16 { w: 8, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 8];
         render(&frame, &mut out);
@@ -2131,7 +2162,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -2155,7 +2186,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
             start_offset: 0x100, pixel_pan: 0, line_compare: 2, blank_start: usize::MAX,
         };
         let mut out = [0u32; 16];
@@ -2178,7 +2209,7 @@ mod tests {
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
             font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16,
-            font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0,
+            font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 0,
             line_compare: usize::MAX, blank_start: 3,
         };
         let mut out = [0xFFFF_FFFF; 16];
@@ -2290,7 +2321,7 @@ mod tests {
             mode: VgaMode::ModeX { w: 4, h: 1, row_bytes: 1 },
             vram: &[], planes: &planes,
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX, blank_start: usize::MAX,
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0, pixel_pan: 2, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = [0u32; 4];
         render(&frame, &mut out);
@@ -2313,7 +2344,7 @@ mod tests {
             mode: VgaMode::Mode13h,
             vram: &vram, planes: &[],
             ac: &ac, palette: &pal, dac_mask: 0xFF,
-            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
+            font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
             start_offset: 320, pixel_pan: 3, line_compare: usize::MAX, blank_start: usize::MAX,
         };
         let mut out = vec![0u32; 320 * 200];
@@ -2334,7 +2365,7 @@ mod tests {
                 plane_layout: VramLayout::PlaneMinor,
                 mode, vram, planes: &[],
                 ac: &ac, palette: &pal, dac_mask: 0xFF,
-                font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, cga_palette: [0; 4],
+                font: &lib::vga_fonts::FONT_8X16, font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
                 start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
             };
             let (w, h) = dimensions(mode);

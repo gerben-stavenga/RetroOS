@@ -141,8 +141,8 @@ def install():
     if "custom_sha256" in plan and hashlib.sha256(custom.read_bytes()).hexdigest() != plan["custom_sha256"]:
         raise ValueError("40_custom changed since preparation; prepare again")
     # Back up the user's startup settings before the one-time path migration.
-    config = c_root / "CONFIG.SYS"
-    backup = c_root / "CONFIG.SYS.before-dn-state"
+    config = c_root / "CONFIG" / "CONFIG.SYS"
+    backup = c_root / "CONFIG" / "CONFIG.SYS.before-dn-state"
     if config.exists() and not backup.exists():
         shutil.copy2(config, backup)
     old_config = config.read_bytes() if config.exists() else None
@@ -165,6 +165,8 @@ def install():
     except Exception:
         if old_config is not None:
             config.write_bytes(old_config)
+        else:
+            config.unlink(missing_ok=True)
         if old_custom is not None:
             custom.write_bytes(old_custom)
         if old_managed is None:

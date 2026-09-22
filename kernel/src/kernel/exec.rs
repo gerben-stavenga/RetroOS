@@ -210,7 +210,7 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
 #[allow(clippy::too_many_arguments)]
-pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, viopl: u8, exec_vga: ExecVga) -> Result<(), i32> {
+pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, policy: crate::kernel::dos::LaunchPolicy, exec_vga: ExecVga) -> Result<(), i32> {
     // Name the thread for the F12 switch picker — the one path every launch
     // (boot init and fork-exec) flows through, so every task is named.
     threads[tid].kernel.set_comm(path);
@@ -246,7 +246,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
             // (personality_name == Some(Dos)); otherwise it's VFS and exec_dos_into
             // dosifies it (the cross-personality / boot fallback).
             let args0_is_dos = personality_name == Some(crate::kernel::thread::PersonalityName::Dos);
-            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, viopl, vga);
+            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, policy, vga);
             Ok(())
         }
     }

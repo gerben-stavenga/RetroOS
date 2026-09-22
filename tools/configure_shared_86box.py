@@ -8,6 +8,14 @@ import sys
 def main():
     config_path, boot, data = map(Path, sys.argv[1:4])
     freedos, sound = sys.argv[4:6]
+    # 86Box advertises LBA only at >=1024 cylinders (or >16 heads / >63
+    # sectors). Below that, the TX97 BIOS's Auto translation cannot read our
+    # boot volume reliably. The kernel itself supports both CHS and LBA.
+    # Pad only the disposable boot copy; its partition and the data disk stay
+    # the same size. truncate leaves the extra space sparse.
+    if freedos != "1" and boot.stat().st_size < 1024 * 16 * 63 * 512:
+        with boot.open("r+b") as stream:
+            stream.truncate(1024 * 16 * 63 * 512)
     config = configparser.ConfigParser(interpolation=None, strict=False)
     config.read(config_path)
     for section in ("Hard disks", "Sound"):

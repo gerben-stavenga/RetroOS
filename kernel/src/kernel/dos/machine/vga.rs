@@ -700,6 +700,21 @@ pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
         | (((end >> 9) as u8 & 1) << 6);
 }
 
+/// BIOS text services program the same registers as direct guest port I/O.
+pub fn bios_write_crtc<A: crate::Arch>(
+    machine: &mut A, device: &mut DosVideo, port: u16, index: u8, value: u8,
+) {
+    if let Some(dev) = device.emulated_mut() {
+        if let Some(state) = dev.state.legacy_mut() {
+            state.crtc_index = index;
+            state.crtc[usize::from(index)] = value;
+        }
+    } else if device.is_native() {
+        machine.outb(port, index);
+        machine.outb(port + 1, value);
+    }
+}
+
 pub fn bios_set_font_map_select(device: &mut DosVideo, select: u8) {
     if let Some(dev) = device.emulated_mut()
         && let Some(state) = dev.state.legacy_mut()

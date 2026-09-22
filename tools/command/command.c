@@ -67,7 +67,7 @@ static void trace(int on) {
 
 /* ----- per-program launch overrides (LOADFIX.CFG) -----
  *
- * Two kinds of override are wired through here:
+ * Launch overrides are wired through here:
  *
  *   loadfix: EXEPACK-compressed binaries (Borland CHESS, plenty of
  *     early-90s tools) have a relocator bug that crashes when loaded
@@ -85,10 +85,10 @@ static void trace(int on) {
  *     follows DPMI 0.9 more strictly.
  *
  * LOADFIX.CFG format: BASENAME [keyword [keyword...]]. Keywords:
- *   loadfix (default if none), dos32a. Combinable.
+ *   loadfix (default if none), dos32a, iopl3, repair, xms32k. Combinable.
  *
- * The kernel knows nothing about either override -- both are implemented
- * entirely in this file. */
+ * COMMAND.COM reads the config; kernel policies travel in synth syscall CX.
+ * CL selects virtual IOPL, CH bit 0 caps classic XMS reports at 32767 KiB. */
 
 #define LF_MAX_NAMES 32
 #define LF_NAME_LEN  16
@@ -96,6 +96,7 @@ static void trace(int on) {
 #define LF_F_DOS32A  0x02
 #define LF_F_IOPL3   0x04
 #define LF_F_REPAIR  0x08
+#define LF_F_XMS32K  0x10
 
 static char          loadfix_names[LF_MAX_NAMES][LF_NAME_LEN];
 static unsigned char loadfix_flags[LF_MAX_NAMES];
@@ -120,6 +121,7 @@ static unsigned char parse_flag(const char *tok) {
     if (stricmp(tok, "dos32a")  == 0) return LF_F_DOS32A;
     if (stricmp(tok, "iopl3")   == 0) return LF_F_IOPL3;
     if (stricmp(tok, "repair")  == 0) return LF_F_REPAIR;
+    if (stricmp(tok, "xms32k")  == 0) return LF_F_XMS32K;
     return 0;
 }
 
@@ -347,7 +349,7 @@ static void join_args(char *dst, int max, char **argv, int start, int argc) {
 
 static unsigned int get_child_exit_status(void);
 
-static int synth_fork_exec(const char *name, const char *args, unsigned char viopl) {
+static int synth_fork_exec(const char *name, const char *args, unsigned int policy) {
     /* Take far pointers so the segments come from the pointers
      * themselves rather than whatever ES happens to be at the
      * call site (HW-IRQ delivery clears ES). The tiny-model
@@ -358,11 +360,11 @@ static int synth_fork_exec(const char *name, const char *args, unsigned char vio
     r.h.ah = 0x01;
     r.x.dx = FP_OFF(fname);
     r.x.bx = FP_OFF(fargs);
-    /* CL = child's virtual IOPL: 3 = `iopl3` (DOOM/DOOM2/Hexen), else the
-     * spec-conforming default of 1. Set explicitly -- the global `r` union
-     * is reused, so a stale CL could otherwise leak IOPL=3 into a plain
+    /* CL = virtual-IF mode: 1 = strict, 2 = repair, 3 = iopl3.
+     * CH bit 0 enables xms32k. The full CX is set because the global union
+     * is reused, so stale bits could otherwise leak policy into a plain
      * launch. The kernel reads CL in INT 31h AH=01 (dos.rs SYNTH_FORK_EXEC). */
-    r.x.cx = viopl;
+    r.x.cx = policy;
     s.ds   = FP_SEG(fname);
     s.es   = FP_SEG(fargs);
     int86x(0x31, &r, &r, &s);
@@ -425,12 +427,12 @@ static void set_block_size(unsigned paras) {
     int86x(0x21, &r, &r, &s);
 }
 
-/* Set THIS thread's virtual IOPL (the kernel's IfMode) via INT 31h AH=09h.
+/* Set THIS thread's launch policy via INT 31h AH=09h (same CX as fork).
  * Fork-exec passes the child's mode in CL because the child is a new thread;
  * an in-process EXEC runs on ours, so batch lines set it here instead. */
-static void synth_set_viopl(unsigned char viopl) {
+static void synth_set_policy(unsigned int policy) {
     r.h.ah = 0x09;
-    r.x.cx = viopl;
+    r.x.cx = policy;
     int86(0x31, &r, &r);
 }
 
@@ -508,11 +510,11 @@ static void refresh_bda_clock(void) {
  * `interactive` means that being scheduled again while the child is still
  * alive is an OSD task switch back to our caller, so release it immediately.
  * Batch lines pass 0 and continue waiting for their child. */
-static int run_external_raw(char **argv, int argc, int interactive, unsigned char viopl) {
+static int run_external_raw(char **argv, int argc, int interactive, unsigned int policy) {
     char tail[128];
     int pid, rc;
     join_args(tail, sizeof(tail), argv, 1, argc);
-    pid = synth_fork_exec(argv[0], tail, viopl);
+    pid = synth_fork_exec(argv[0], tail, policy);
     if (pid < 0) {
         printf("Bad command or file name: '%s'\r\n", argv[0]);
         return 255;
@@ -568,7 +570,7 @@ static int run_external_raw(char **argv, int argc, int interactive, unsigned cha
 static int dispatch_external(char **argv, int prog_idx, int argc, int interactive) {
     char resolved[80];
     unsigned char flags;
-    unsigned char viopl;
+    unsigned int policy;
     if (prog_idx >= argc) return 0;
     assert(prog_idx >= 2);
     if (!resolve_program(argv[prog_idx], resolved)) {
@@ -606,7 +608,8 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
      *              client `repair` mispredicts.
      * A client that re-enables IF the sloppy way HANGS at iopl1 (DOOM et al),
      * so `repair` is what games want; `iopl3` stays available to fall back to. */
-    viopl = (flags & LF_F_IOPL3) ? 3 : (flags & LF_F_REPAIR) ? 2 : 1;
+    policy = (flags & LF_F_IOPL3) ? 3 : (flags & LF_F_REPAIR) ? 2 : 1;
+    if (flags & LF_F_XMS32K) policy |= 0x0100; /* CH bit 0: signed XMS report */
     if (flags & LF_F_DOS32A) {
         /* Spawn DOS/32A.EXE with prog + args as its tail. DOS/32A loads
          * the target itself and provides a stricter DPMI 0.9 environment
@@ -660,13 +663,13 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
         int rc;
         int start = (flags & LF_F_LOADFIX) ? prog_idx + 2 : prog_idx;
         join_args(tail, sizeof(tail), argv, start + 1, argc);
-        synth_set_viopl(viopl);
+        synth_set_policy(policy);
         rc = dos_exec_inplace(argv[start], tail);
-        synth_set_viopl(1);      /* back to the shell's own spec-strict mode */
+        synth_set_policy(1);      /* back to the shell's own spec-strict mode */
         refresh_bda_clock();
         return rc;
     }
-    return run_external_raw(&argv[prog_idx], argc - prog_idx, interactive, viopl);
+    return run_external_raw(&argv[prog_idx], argc - prog_idx, interactive, policy);
 }
 
 /* ----- built-ins -----

@@ -75,10 +75,10 @@ fn next_after<A: crate::Arch>(
             threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff, display,
         ))),
         thread::KernelAction::Switch(next) => Some(Verdict::Switch(next)),
-        thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, viopl, on_error, on_success } => {
+        thread::KernelAction::ForkExec { path, path_len, cmdtail, cmdtail_len, personality_name, policy, on_error, on_success } => {
             crate::kernel::startup::handle_fork_exec(
                 machine, bios_workspace, threads, regs, tid,
-                &path[..path_len], &cmdtail[..cmdtail_len], personality_name, viopl,
+                &path[..path_len], &cmdtail[..cmdtail_len], personality_name, policy,
                 on_error, on_success, sb_handoff, display,
             ).map(Verdict::ContinueAs)
         }

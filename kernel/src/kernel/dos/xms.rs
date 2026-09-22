@@ -94,13 +94,14 @@ fn resize_emb<A: crate::Arch>(
 
 /// Per-thread XMS driver state.
 pub struct XmsState {
+    report_limit_kb: u16,
     handles: [Option<XmsHandle>; MAX_XMS_HANDLES],
 }
 
 impl XmsState {
     fn new() -> Self {
         const NONE: Option<XmsHandle> = None;
-        Self { handles: [NONE; MAX_XMS_HANDLES] }
+        Self { report_limit_kb: u16::MAX, handles: [NONE; MAX_XMS_HANDLES] }
     }
 
 }
@@ -110,6 +111,11 @@ fn xms_state<A: crate::Arch>(dos: &mut thread::DosState<A>) -> &mut XmsState {
         dos.xms = Some(alloc::boxed::Box::new(XmsState::new()));
     }
     dos.xms.as_deref_mut().unwrap()
+}
+
+/// Aladdin compares AH=08 sizes as signed words; keep this opt-in per launch.
+pub(super) fn set_report_limit<A: crate::Arch>(dos: &mut thread::DosState<A>, enabled: bool) {
+    xms_state(dos).report_limit_kb = if enabled { i16::MAX as u16 } else { u16::MAX };
 }
 
 fn xms_parts<A: crate::Arch>(dos: &mut thread::DosState<A>)
@@ -153,8 +159,9 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
         }
         // AH=08h — Query free extended memory
         0x08 => {
-            let (_xms, memory) = xms_parts(dos);
-            let physical = memory.available_pages(machine).saturating_mul(4).min(u16::MAX as usize) as u16;
+            let (xms, memory) = xms_parts(dos);
+            let physical = memory.available_pages(machine).saturating_mul(4)
+                .min(usize::from(xms.report_limit_kb)) as u16;
             let largest = (memory.largest_bytes(machine, XMS_BASE, super::memory::general_limit(), 4096) / 1024)
                 .min(u32::from(physical)) as u16;
             let total = physical;

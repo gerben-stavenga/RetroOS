@@ -144,7 +144,7 @@ fn render(
         font: &FONT_8X16,
         font_b: &FONT_8X16,
         font_maps: None,
-        blink: false,
+        blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
         pixel_pan: 0,

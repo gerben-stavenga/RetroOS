@@ -20,6 +20,50 @@ start:
     mov [xms_entry], bx
     mov [xms_entry+2], es
 
+    ; Optional L/U argument checks the policy through COMMAND.COM launches.
+    ; These tests run with a fresh 32 MiB quota; L is signed-safe, U uncapped.
+    cmp byte [80h], 0
+    je .policy_done
+    mov si, 81h
+.skip_spaces:
+    cmp byte [si], ' '
+    jne .have_argument
+    inc si
+    jmp .skip_spaces
+.have_argument:
+    mov al, [si]
+    mov [policy_arg], al
+    mov byte [stage], 'Q'
+    xcall 08h
+    mov bx, 8000h
+    cmp byte [policy_arg], 'L'
+    jne .check_report
+    dec bx
+.check_report:
+    cmp ax, bx
+    jne fail
+    cmp dx, bx
+    jne fail
+    ; The extended query must still expose the whole pool in either mode.
+    xcall 88h
+    cmp eax, 8000h
+    jne fail
+    cmp edx, 8000h
+    jne fail
+    ; Reproduce Aladdin's signed precheck and its 980 KiB allocation.
+    cmp byte [policy_arg], 'L'
+    jne .policy_done
+    xcall 08h
+    mov dx, 980
+    cmp dx, ax
+    jg fail
+    xcall 09h
+    cmp ax, 1
+    jne fail
+    xcall 0ah
+    cmp ax, 1
+    jne fail
+.policy_done:
     mov byte [stage], '1'
     xcall 00h
     cmp ax, 0300h
@@ -234,6 +278,7 @@ data_handle dw 0
 umb_one     dw 0
 umb_two     dw 0
 stage       db '?'
+policy_arg  db 0
 source      db 'XMS!'
 destination times 4 db 0
 move_desc:

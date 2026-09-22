@@ -66,9 +66,17 @@ on the same ext4 filesystem as Linux `/`, as they do on this laptop.
 | `C:\CONFIG\DN` | Persistent DN settings, history, desktop, menus |
 | `C:\CONFIG\LOADFIX.CFG` | Persistent COMMAND.COM launch policy |
 | `C:\TEMP` | Writable DN swap/flag/temporary files |
-| `C:\CONFIG.SYS` | Persistent startup environment |
+| `C:\CONFIG\CONFIG.SYS` | Persistent startup command and environment |
 
-DN already supports separate paths; no binary patch is needed. CONFIG.SYS sets
+`C:\CONFIG\CONFIG.SYS` selects the startup program with
+`START=C:\RETROOS\DN\DN.COM`. Set another executable and optional arguments
+(for example `START=C:\RETROOS\COMMAND.COM /P`) to choose a different shell.
+The startup program restarts when it exits; `--cmd` and `TEST=` take precedence
+and still shut down after completion. Relative startup paths are relative to C:.
+The old root `CONFIG.SYS` is read only when the new file is absent. Migration
+copies existing settings to the new location and preserves a custom `START=`.
+
+DN already supports separate paths; no binary patch is needed. The config sets
 `DNSWP=C:\TEMP`, `TEMP=C:\TEMP`, then `DN=C:\CONFIG\DN`, in that order. DN.COM
 uses the first DNSWP/DN variable for its flag file. DN.PRG uses DN for settings
 and history, while overlays, language/dialog resources and help remain next to

@@ -1,7 +1,7 @@
 //! ATA/IDE transport: bus-master DMA, with PIO fallback.
 //!
-//! Polled LBA28 commands. PIIX3/PIIX4 controllers and MWDMA2-capable drives
-//! are configured for DMA at startup; older controllers retain PIO access.
+//! Polled LBA28 or legacy CHS commands. PIIX3/PIIX4 controllers and
+//! MWDMA2-capable drives use DMA; older controllers retain PIO access.
 //!
 //! One [`AtaDisk`] value per drive: it owns its controller ports and drive
 //! select, so a machine with a primary master AND a secondary slave is just
@@ -43,6 +43,7 @@ mod cmd {
     pub const WRITE_SECTORS: u8 = 0x30;
     pub const CACHE_FLUSH: u8 = 0xE7;
     pub const IDENTIFY: u8 = 0xEC;
+    pub const INITIALIZE_PARAMETERS: u8 = 0x91;
 }
 
 /// The two legacy ISA channels: (base, control). Every PC has these at fixed
@@ -51,6 +52,55 @@ pub const CHANNELS: [(u16, u16); 2] = [(0x1F0, 0x3F6), (0x170, 0x376)];
 
 /// The LBA28 addressing ceiling — this driver cannot reach past it.
 const LBA28_MAX: u64 = 1 << 28;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Addressing {
+    Lba28(u64),
+    Chs { cylinders: u16, heads: u8, sectors: u8 },
+}
+
+impl Addressing {
+    fn identify(words: &[u16; 256]) -> Option<Self> {
+        if words[49] & (1 << 9) != 0 {
+            let sectors = u64::from(words[60]) | (u64::from(words[61]) << 16);
+            return (sectors > 0).then_some(Self::Lba28(sectors.min(LBA28_MAX)));
+        }
+        // Use the device's default translation, not a BIOS-selected one.
+        // INITIALIZE DEVICE PARAMETERS below installs these heads/sectors
+        // after reset, including on ATA-1 disks without valid words 54-58.
+        let (cylinders, heads, sectors) = (words[1], words[3], words[6]);
+        if cylinders == 0 || !(1..=16).contains(&heads) || !(1..=255).contains(&sectors) {
+            return None;
+        }
+        Some(Self::Chs { cylinders, heads: heads as u8, sectors: sectors as u8 })
+    }
+
+    fn capacity(self) -> u64 {
+        match self {
+            Self::Lba28(sectors) => sectors,
+            Self::Chs { cylinders, heads, sectors } =>
+                u64::from(cylinders) * u64::from(heads) * u64::from(sectors),
+        }
+    }
+
+    /// Drive/head, sector number, cylinder low, cylinder high (LBA uses the
+    /// same registers). CHS sectors are one-based; heads/cylinders are not.
+    fn taskfile(self, drive: u8, lba: u32) -> [u8; 4] {
+        assert!(u64::from(lba) < self.capacity());
+        let device = 0xa0 | (drive << 4);
+        match self {
+            Self::Lba28(_) => [device | 0x40 | ((lba >> 24) as u8 & 0xf),
+                              lba as u8, (lba >> 8) as u8, (lba >> 16) as u8],
+            Self::Chs { heads, sectors, .. } => {
+                let track = lba / u32::from(sectors);
+                let cylinder = track / u32::from(heads);
+                [device | (track % u32::from(heads)) as u8,
+                 (lba % u32::from(sectors) + 1) as u8,
+                 cylinder as u8, (cylinder >> 8) as u8]
+            }
+        }
+    }
+}
 
 fn wait_status(mut read: impl FnMut() -> u8, now: impl FnMut() -> u64,
                required: u8) -> Result<(), Error> {
@@ -65,15 +115,27 @@ fn wait_status(mut read: impl FnMut() -> u8, now: impl FnMut() -> u64,
     }).unwrap_or(Err(Error::Timeout))
 }
 
+fn needs_cache_flush(words: &[u16; 256]) -> bool {
+    // Older ATA disks (including 86Box's IDE disk) advertise neither a write
+    // cache nor FLUSH CACHE and abort E7h. Their completed writes need no
+    // extra command. If a write cache exists, keep requiring a flush even
+    // when the flush capability is missing: silently succeeding would lose
+    // the filesystem's durability guarantee.
+    let write_cache = words[82] & (1 << 5) != 0;
+    let flush = words[83] & 0xc000 == 0x4000 && words[83] & (1 << 12) != 0;
+    write_cache || flush
+}
+
 /// One ATA drive: a channel plus a master/slave select.
 pub struct Ata {
     base: u16,
     /// 0 = master, 1 = slave. Shifted into bit 4 of the drive/head register.
     drive: u8,
-    sectors: u64,
+    addressing: Addressing,
     /// Always 4 bytes ("ata0".."ata3"); copied into the common disk wrapper.
     name: [u8; 4],
     mwdma2: bool,
+    cache_flush: bool,
     bus_master: Option<BusMaster>,
 }
 
@@ -87,7 +149,7 @@ impl Ata {
     /// a status check alone invents a phantom disk. A drive that won't
     /// IDENTIFY (no device, or ATAPI, which we don't support) is not a disk.
     fn probe(base: u16, drive: u8) -> Option<Self> {
-        let select = 0xE0 | (drive << 4);
+        let select = 0xA0 | (drive << 4);
 
         outb(base + reg::LBA_24_27_FLAGS, select);
 
@@ -110,15 +172,25 @@ impl Ata {
         let index = if base == CHANNELS[1].0 { 2 } else { 0 } + drive;
         let name = [b'a', b't', b'a', b'0' + index];
 
-        let mut disk = Ata { base, drive, sectors: 0, name, mwdma2: false, bus_master: None };
-        disk.sectors = disk.identify_sectors()?;
+        let mut disk = Ata { base, drive, addressing: Addressing::Lba28(0), name, mwdma2: false,
+                             cache_flush: true, bus_master: None };
+        disk.addressing = disk.identify_addressing()?;
+        if let Addressing::Chs { heads, sectors, .. } = disk.addressing {
+            disk.select();
+            disk.wait(status::DRDY).ok()?;
+            outb(base + reg::LBA_24_27_FLAGS, 0xa0 | (drive << 4) | (heads - 1));
+            outb(base + reg::SECTOR_COUNT, sectors);
+            outb(base + reg::COMMAND, cmd::INITIALIZE_PARAMETERS);
+            for _ in 0..4 { inb(base + reg::STATUS); }
+            disk.wait(status::DRDY).ok()?;
+        }
         Some(disk)
     }
 
-    /// LBA28 capacity from IDENTIFY words 60-61. `None` if the drive errors or
+    /// Addressing and capacity from IDENTIFY. `None` if the drive errors or
     /// never raises DRQ (bounded wait — a non-existent slave typically hangs
     /// BSY forever, which is exactly what we must not do here).
-    fn identify_sectors(&mut self) -> Option<u64> {
+    fn identify_addressing(&mut self) -> Option<Addressing> {
         self.select();
         outb(self.base + reg::SECTOR_COUNT, 0);
         outb(self.base + reg::LBA_0_7, 0);
@@ -128,15 +200,16 @@ impl Ata {
 
         for _ in 0..1_000_000 {
             let s = inb(self.base + reg::STATUS);
+            if s & status::BSY != 0 { continue; }
             if s == 0 || (s & status::ERR) != 0 {
                 return None; // no device, or IDENTIFY unsupported (ATAPI)
             }
-            if (s & status::BSY) == 0 && (s & status::DRQ) != 0 {
+            if s & status::DRQ != 0 {
                 let mut words = [0u16; 256];
                 insw(self.base + reg::DATA, &mut words);
                 self.mwdma2 = words[49] & (1 << 8) != 0 && words[63] & 4 != 0;
-                let lba28 = ((words[61] as u64) << 16) | words[60] as u64;
-                return (lba28 > 0).then_some(lba28);
+                self.cache_flush = needs_cache_flush(&words);
+                return Addressing::identify(&words);
             }
         }
         None
@@ -150,7 +223,7 @@ impl Ata {
     /// The spec wants ~400 ns before the status register is meaningful after a
     /// select; four status reads cover it (each is an ISA cycle).
     fn select(&self) {
-        outb(self.base + reg::LBA_24_27_FLAGS, 0xE0 | (self.drive << 4));
+        outb(self.base + reg::LBA_24_27_FLAGS, 0xA0 | (self.drive << 4));
         for _ in 0..4 {
             inb(self.base + reg::STATUS);
         }
@@ -170,14 +243,14 @@ impl Ata {
     fn issue(&self, lba: u32, batch: u32, command: u8) -> Result<(), Error> {
         self.select();
         self.wait(status::DRDY)?;
-        outb(self.base + reg::LBA_24_27_FLAGS,
-             ((lba >> 24) as u8 & 0x0F) | 0xE0 | (self.drive << 4));
+        let [device, sector, low, high] = self.addressing.taskfile(self.drive, lba);
+        outb(self.base + reg::LBA_24_27_FLAGS, device);
         outb(self.base + reg::FEATURES, 0);
         // A sector count of 0 means 256 — the maximum one command can carry.
         outb(self.base + reg::SECTOR_COUNT, if batch == 256 { 0 } else { batch as u8 });
-        outb(self.base + reg::LBA_0_7, lba as u8);
-        outb(self.base + reg::LBA_8_15, (lba >> 8) as u8);
-        outb(self.base + reg::LBA_16_23, (lba >> 16) as u8);
+        outb(self.base + reg::LBA_0_7, sector);
+        outb(self.base + reg::LBA_8_15, low);
+        outb(self.base + reg::LBA_16_23, high);
         outb(self.base + reg::COMMAND, command);
         Ok(())
     }
@@ -190,7 +263,7 @@ pub type AtaDisk = Storage<Ata>;
 impl Storage<Ata> {
     fn probe<A: crate::Arch>(machine: &mut A, base: u16, drive: u8) -> Option<Self> {
         let mut ata = Ata::probe(base, drive)?;
-        let sectors = ata.sectors.min(LBA28_MAX);
+        let sectors = ata.addressing.capacity();
         let name = ata.name;
         let buffer = if ata.mwdma2 {
             if let Some((controller, buffer)) = BusMaster::probe(machine, &ata) {
@@ -198,7 +271,8 @@ impl Storage<Ata> {
                 buffer
             } else { Buffer::pio(256) }
         } else { Buffer::pio(256) };
-        lib::compact_println!("ATA: {} {}", core::str::from_utf8(&name).unwrap_or("ata?"),
+        lib::compact_println!("ATA: {} {} {}", core::str::from_utf8(&name).unwrap_or("ata?"),
+            if matches!(ata.addressing, Addressing::Chs { .. }) { "CHS" } else { "LBA28" },
             if ata.bus_master.is_some() { "DMA" } else { "PIO" });
         Some(Self::new(ata, buffer, sectors,
             core::str::from_utf8(&name).unwrap_or("ata?")))
@@ -233,6 +307,7 @@ impl Hardware for Ata {
         if c.operation == Operation::Flush {
             self.select();
             self.wait(status::DRDY)?;
+            if !self.cache_flush { return Ok(()); }
             outb(self.base + reg::COMMAND, cmd::CACHE_FLUSH);
             return self.wait(status::DRDY);
         }
@@ -370,6 +445,69 @@ fn ide_prds(mut phys: u32, mut bytes: u32) -> [u32; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn legacy_identify() -> [u16; 256] {
+        let mut words = [0; 256];
+        words[1] = 615;
+        words[3] = 4;
+        words[6] = 17;
+        words
+    }
+
+    #[test]
+    fn identify_uses_chs_without_lba_and_rejects_invalid_geometry() {
+        let mut words = legacy_identify();
+        // Unadvertised LBA words and an old BIOS translation must not win.
+        words[60] = 0xffff;
+        words[61] = 0xffff;
+        words[53] = 1;
+        words[54] = 1024;
+        words[55] = 16;
+        words[56] = 63;
+        let chs = Addressing::identify(&words).unwrap();
+        assert_eq!(chs, Addressing::Chs { cylinders: 615, heads: 4, sectors: 17 });
+        assert_eq!(chs.capacity(), 41820);
+        for (word, value) in [(1, 0), (3, 0), (3, 17), (6, 0), (6, 256)] {
+            let mut invalid = words;
+            invalid[word] = value;
+            assert_eq!(Addressing::identify(&invalid), None);
+        }
+        words[49] = 1 << 9;
+        assert_eq!(Addressing::identify(&words), Some(Addressing::Lba28(LBA28_MAX)));
+        words[60] = 0;
+        words[61] = 0;
+        assert_eq!(Addressing::identify(&words), None);
+    }
+
+    #[test]
+    fn chs_taskfiles_roll_over_sector_head_and_cylinder() {
+        let chs = Addressing::identify(&legacy_identify()).unwrap();
+        assert_eq!(chs.taskfile(0, 0), [0xa0, 1, 0, 0]);
+        assert_eq!(chs.taskfile(0, 16), [0xa0, 17, 0, 0]);
+        assert_eq!(chs.taskfile(0, 17), [0xa1, 1, 0, 0]);
+        assert_eq!(chs.taskfile(0, 68), [0xa0, 1, 1, 0]);
+        assert_eq!(chs.taskfile(1, 256 * 68), [0xb0, 1, 0, 1]);
+        assert_eq!(chs.taskfile(1, 41819), [0xb3, 17, 0x66, 2]);
+        let largest = Addressing::Chs { cylinders: 65535, heads: 16, sectors: 255 };
+        assert_eq!(largest.taskfile(1, largest.capacity() as u32 - 1),
+                   [0xbf, 255, 0xfe, 0xff]);
+        assert_eq!(Addressing::Lba28(LBA28_MAX).taskfile(1, 0x0abcdef0),
+                   [0xfa, 0xf0, 0xde, 0xbc]);
+    }
+
+    #[test]
+    fn legacy_disks_without_write_cache_need_no_flush_command() {
+        let mut words = [0; 256];
+        assert!(!needs_cache_flush(&words));
+        words[83] = 0x4000; // 86Box: valid capabilities, no FLUSH CACHE
+        assert!(!needs_cache_flush(&words));
+        words[82] = 1 << 5;
+        assert!(needs_cache_flush(&words)); // never hide a caching disk's error
+        words[82] = 0;
+        words[83] = 0x5000;
+        assert!(needs_cache_flush(&words));
+        assert!(needs_cache_flush(&[0xffff; 256]));
+    }
+
     #[test]
     fn slow_flush_uses_elapsed_time_not_poll_count() {
         let mut polls = 0;

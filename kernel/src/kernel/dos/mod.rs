@@ -99,6 +99,27 @@ const TF_USER: u8 = 1;
 const TF_LEARNING: u8 = 2;
 const TF_DELAY: u8 = 4;
 
+/// Per-launch compatibility policy supplied by COMMAND.COM, not inferred by name.
+#[derive(Clone, Copy)]
+pub struct LaunchPolicy {
+    pub viopl: u8,
+    pub xms32k: bool,
+}
+
+impl Default for LaunchPolicy {
+    fn default() -> Self { Self { viopl: 1, xms32k: false } }
+}
+
+impl LaunchPolicy {
+    /// Synth INT 31h: CL selects virtual IOPL; CH bit 0 limits XMS reports.
+    pub fn from_synth(cx: u16) -> Self {
+        Self {
+            viopl: match cx as u8 { 2 => 2, 3 => 3, _ => 1 },
+            xms32k: cx & 0x0100 != 0,
+        }
+    }
+}
+
 /// DOS-specific thread state: virtual hardware machine + DOS personality + optional DPMI.
 ///
 /// Split into three logical groups:
@@ -1235,7 +1256,7 @@ pub(crate) const fn bios_int10_return_ip() -> u32 {
 /// snapshot (taken before the address space was torn down), or None for an
 /// initial load with no parent (synthesizes default COMSPEC/PATH).
 #[allow(clippy::too_many_arguments)]
-pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, viopl: u8, vga: DosVideo) {
+pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: Vec<u8>, is_exe: bool, args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, args0_is_dos: bool, policy: LaunchPolicy, vga: DosVideo) {
     let current = thread::get_thread(threads, tid).unwrap();
     machine.free_user_pages();
     machine.map_low_mem();
@@ -1315,6 +1336,8 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // passes 1 (spec-conforming). The kernel never reads LOADFIX.CFG itself.
     // The real run IOPL is pinned to 1 at the arch exit; this is the virtual
     // level the PM gate reads. (Literal mask: `machine` is the arch param here.)
+    let viopl = policy.viopl;
+    xms::set_report_limit(current.dos_mut(), policy.xms32k);
     let f = &mut current.kernel.vcpu.regs.frame.rflags;
     *f = (*f & !(3u64 << 12)) | ((viopl as u64) << 12);
     current.kernel.vcpu.regs.set_pvi_policy(viopl == 1);

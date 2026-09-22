@@ -743,6 +743,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             crate::compact_dbg_println!("synth_fork_exec: filename={:?} tail.len={} tail_first8={:02x?}",
                 core::str::from_utf8(&filename[..flen]).unwrap_or("<non-utf8>"),
                 tlen, &tail[..tlen.min(8)]);
+            // CH bit 0 enables the per-launch classic XMS reporting limit.
             // CL carries the child's virtual IOPL — the `IfMode` COMMAND.COM
             // looked up in LOADFIX.CFG. It must accept EVERY mode: this used to
             // read `== 3 { 3 } else { 1 }`, from when there were only two, so a
@@ -750,12 +751,8 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             // is not a slow path, it is a HANG — POPF/IRET stop being honored,
             // virtual IF sticks at 0, and DOOM deadlocks at DMX_Init spinning on
             // a tick that can never arrive. Anything unknown stays conforming.
-            let viopl: u8 = match regs.rcx & 0xFF {
-                2 => 2, // IfMode::Repair
-                3 => 3, // IfMode::Iopl3
-                _ => 1, // IfMode::Iopl1
-            };
-            fork_exec(dos, &filename[..flen], &tail[..tlen], viopl, regs, kt)
+            let policy = super::LaunchPolicy::from_synth(regs.rcx as u16);
+            fork_exec(dos, &filename[..flen], &tail[..tlen], policy, regs, kt)
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
         // BX = child pid (from a prior AH=01).
@@ -791,7 +788,8 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             thread::KernelAction::DosSynthChild { pid, op: thread::DosChildOp::Reap }
         }
         // AH=09h — SYNTH_SET_VIOPL: set THIS thread's virtual IOPL (`IfMode`).
-        // CL = 1 iopl1 (spec-strict) | 2 repair | 3 iopl3. CF=0 always.
+        // CL = 1 iopl1 (spec-strict) | 2 repair | 3 iopl3; CH bit 0 = xms32k.
+        // CF=0 always.
         //
         // Fork-exec (AH=01h) carries the child's vIOPL in CL because the child
         // is a new thread. An in-process EXEC (INT 21h AH=4Bh) has no new
@@ -800,11 +798,9 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // line. `ExecParent` does not save rflags, so the value persists past
         // the child's return; COMMAND.COM restores its own afterwards.
         0x09 => {
-            let mode = match regs.rcx & 0xFF {
-                2 => 2u64, // IfMode::Repair
-                3 => 3u64, // IfMode::Iopl3
-                _ => 1u64, // IfMode::Iopl1
-            };
+            let policy = super::LaunchPolicy::from_synth(regs.rcx as u16);
+            super::xms::set_report_limit(dos, policy.xms32k);
+            let mode = u64::from(policy.viopl);
             let f = &mut regs.frame.rflags;
             *f = (*f & !(3u64 << 12)) | (mode << 12);
             regs.set_pvi_policy(mode == 1);
@@ -3051,7 +3047,7 @@ fn int_2eh<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, do
     // Shift the program name to the start of the buffer.
     let plen = end - start;
     cmd.copy_within(start..end, 0);
-    fork_exec(dos, &cmd[..plen], b"", 1, regs, kt)
+    fork_exec(dos, &cmd[..plen], b"", Default::default(), regs, kt)
 }
 
 // ============================================================================
@@ -3378,7 +3374,7 @@ fn dos_open_program<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut 
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], viopl: u8, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
+fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], policy: super::LaunchPolicy, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
     // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
     if dfs_open_existing(dos, prog_name).is_err() {
         regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
@@ -3423,7 +3419,7 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
         cmdtail: cmdtail_buf,
         cmdtail_len,
         personality_name: Some(thread::PersonalityName::Dos),
-        viopl,
+        policy,
         on_error,
         on_success,
     }
@@ -3491,7 +3487,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     // ELF binaries need a separate address space — route through fork_exec.
     let is_elf = buf.len() >= 4 && buf[0..4] == [0x7F, b'E', b'L', b'F'];
     if is_elf {
-        return fork_exec(dos, prog_name, b"", 1, regs, kt);
+        return fork_exec(dos, prog_name, b"", Default::default(), regs, kt);
     }
 
     let is_exe = is_mz_exe(&buf);

@@ -140,7 +140,7 @@ _EXTRA_FILES.update(_BOOT_DIR_FILES)
 # this tiny avoids the image→modplay→stub_exe→image cycle that would
 # otherwise force a separate `dosrt_tar` indirection.
 _MIN_EXTRA_FILES = {
-    "etc/CONFIG.SYS": "CONFIG.SYS",
+    "etc/CONFIG.SYS": "CONFIG/CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
 }
@@ -229,7 +229,7 @@ pkg_tar(
 )
 
 # Same, plus the proprietary game/tooling drop. CONFIG.SYS is dropped from the
-# DOS file map so apps-proprietary's own CONFIG.SYS is the only one.
+# DOS file map so apps-proprietary's CONFIG/CONFIG.SYS is the only one.
 _DOS_EXTRA_PROPRIETARY = {k: v for k, v in _DOS_EXTRA.items() if k != "etc/CONFIG.SYS"}
 pkg_tar(
     name = "dos_extras_tar_proprietary",

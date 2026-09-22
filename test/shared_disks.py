@@ -87,11 +87,14 @@ if os.environ.get("HOLD_VM"):
                 config = configparser.ConfigParser()
                 config.read(vm / "86box.cfg")
                 assert config["Hard disks"]["hdd_02_fn"] == str(data)
+                assert config["Hard disks"]["hdd_01_parameters"] == "63, 16, 1024, 0, ide"
+                assert data.stat().st_size == 512 * 16 * 63
                 good(run([str(root / "run.sh"), backend, "--freedos"], {"VM_DIR": str(vm)}))
                 # Read into a fresh parser so removed options do not linger.
                 config = configparser.ConfigParser()
                 config.read(vm / "86box.cfg")
                 assert config["Hard disks"]["hdd_01_fn"] == str(data)
+                assert config["Hard disks"]["hdd_01_parameters"] == "63, 16, 1, 0, ide"
                 assert "hdd_02_fn" not in config["Hard disks"]
         assert run(command + ["-i", "image"]).returncode != 0
         assert data.read_bytes().startswith(b"guest changes")

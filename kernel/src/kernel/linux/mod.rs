@@ -1215,7 +1215,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
             crate::kernel::bios_display::EmulatedVga::initial_mode3())),
     };
-    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, 1, exec_vga).is_err() {
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, Default::default(), exec_vga).is_err() {
         return Some(thread::exit_thread(
             threads, machine, bios_workspace, tid, -ENOEXEC, exiting_display, sb_handoff, display,
         ));

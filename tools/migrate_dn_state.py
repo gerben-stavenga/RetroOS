@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Separate DN's writable state on an offline C: directory or shared data image.
+"""Migrate startup settings and DN state on an offline C: tree or data image.
 
 Copies old state without deleting it or replacing existing CONFIG/DN files.
 Usage: tools/migrate_dn_state.py /home/retroos
@@ -46,14 +46,18 @@ def migrate(root):
         source = next((p for p in sources if p.is_file()), None)
         if source:
             shutil.copyfile(source, loadfix)
-    config = root / "CONFIG.SYS"
+    config = root / "CONFIG" / "CONFIG.SYS"
+    legacy_config = root / "CONFIG.SYS"
     seed_config = ROOT / "etc" / "CONFIG.SYS"
-    lines = (config if config.exists() else seed_config).read_bytes().splitlines()
+    source_config = next(p for p in (config, legacy_config, seed_config) if p.exists())
+    lines = source_config.read_bytes().splitlines()
     lines = [line.replace(b"C:\\BOOT", b"C:\\RETROOS") for line in lines]
     lines = [line for line in lines if line.split(b"=", 1)[0].strip().upper()
              not in (b"DN", b"DNSWP", b"TEMP")]
     # DN.COM takes the first DN/DNSWP variable as its flag-file directory.
     lines = [b"DNSWP=C:\\TEMP", b"TEMP=C:\\TEMP", b"DN=C:\\CONFIG\\DN"] + lines
+    if not any(line.split(b"=", 1)[0].strip().upper() == b"START" for line in lines):
+        lines.append(b"START=C:\\RETROOS\\DN\\DN.COM")
     config.write_bytes(b"\r\n".join(lines) + b"\r\n")
     # The ext4 backend authorizes writes using the C: root's group.
     for path in [root / "CONFIG", state, root / "TEMP", config, *state.iterdir(), *([loadfix] if loadfix.exists() else [])]:
@@ -93,7 +97,7 @@ def migrate_image(image):
             for source in (root / "CONFIG" / "DN").iterdir():
                 copy("-o", source, "::/CONFIG/DN/" + source.name)
             copy("-o", root / "CONFIG" / "LOADFIX.CFG", "::/CONFIG/LOADFIX.CFG")
-            copy("-o", root / "CONFIG.SYS", "::/CONFIG.SYS")
+            copy("-o", root / "CONFIG" / "CONFIG.SYS", "::/CONFIG/CONFIG.SYS")
 
 
 def main():
@@ -104,7 +108,8 @@ def main():
     try:
         (migrate_image if args.image else migrate)(args.path)
     except BlockingIOError:
-        parser.exit(1, "data image is in use; stop its emulator before migrating DN state\n")
+        parser.exit(1, "data image is in use; stop its emulator before migrating startup settings\n")
+    print(f"Startup config: C:\\CONFIG\\CONFIG.SYS ({args.path})")
     print(f"DN state configured at C:\\CONFIG\\DN; temporary files at C:\\TEMP ({args.path})")
 
 
