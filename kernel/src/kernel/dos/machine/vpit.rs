@@ -32,7 +32,8 @@ impl VirtualPitChannel {
             latched: None,
             latch_lsb_next: true,
             start_cycle: 0,
-            next_irq_cycle: 0,
+            // The default divisor must elapse before the first IRQ edge.
+            next_irq_cycle: 65_536,
             enabled: true,
         }
     }
@@ -218,10 +219,6 @@ impl VirtualPit {
         }
     }
 
-    fn sync<A: crate::Arch>(&mut self, machine: &mut A) {
-        self.sync_at(machine.now());
-    }
-
     fn sync_at(&mut self, now: u64) {
         let delta_ns = now.saturating_sub(self.last_host_ns);
         if delta_ns == 0 {
@@ -233,22 +230,20 @@ impl VirtualPit {
         self.frac_accum = total % NANOS_PER_SECOND;
     }
 
-    pub(crate) fn read_counter<A: crate::Arch>(&mut self, machine: &mut A, channel: u8) -> u8 {
-        self.sync(machine);
+    // The machine layer advances time and raises IRQ0 before each port access.
+    pub(crate) fn read_counter(&mut self, channel: u8) -> u8 {
         let now = self.input_cycles;
         self.chan(channel).map_or(0, |c| c.read_byte(now))
     }
 
-    pub(crate) fn write_counter<A: crate::Arch>(&mut self, machine: &mut A, channel: u8, val: u8) {
-        self.sync(machine);
+    pub(crate) fn write_counter(&mut self, channel: u8, val: u8) {
         let now = self.input_cycles;
         if let Some(c) = self.chan(channel) {
             c.write_byte(val, now);
         }
     }
 
-    pub(crate) fn write_command<A: crate::Arch>(&mut self, machine: &mut A, val: u8) {
-        self.sync(machine);
+    pub(crate) fn write_command(&mut self, val: u8) {
         let now = self.input_cycles;
         let channel = (val >> 6) & 0x03;
         let rw_mode = (val >> 4) & 0x03;
@@ -267,8 +262,7 @@ impl VirtualPit {
     }
 
     /// Channel 2's OUT line, as read at port 61h bit 5.
-    pub(crate) fn ch2_output<A: crate::Arch>(&mut self, machine: &mut A) -> bool {
-        self.sync(machine);
+    pub(crate) fn ch2_output(&self) -> bool {
         self.ch2.output(self.input_cycles)
     }
 
@@ -286,5 +280,100 @@ impl VirtualPit {
             self.input_cycles,
             self.ch0.next_irq_cycle,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::{pit_io, VirtualPic};
+
+    fn pit() -> VirtualPit {
+        VirtualPit {
+            last_host_ns: 0,
+            frac_accum: 0,
+            input_cycles: 0,
+            ch0: VirtualPitChannel::new(),
+            ch2: VirtualPitChannel::new(),
+        }
+    }
+
+    #[test]
+    fn quake_clock_stays_in_step_between_host_wakeups() {
+        let mut pit = pit();
+        let mut pic = VirtualPic::new();
+        pit_io(&mut pit, &mut pic, 0, |pit| {
+            pit.write_command(0x34); // Quake: mode 2, divisor 65536
+            pit.write_counter(0, 0);
+            pit.write_counter(0, 0);
+        });
+        let mut bios_ticks = 0u32;
+        let mut previous = 1i64;
+        let mut game_cycles = 0i64;
+        // Poll at 10 kHz, with the ordinary host timer service at 1 kHz.
+        // A wrap between wakeups must be delivered at the latch port exit.
+        for sample in 1..=10_000 {
+            let now = sample * 100_000;
+            if sample % 10 == 0 && pit.take_pending_irqs(now) > 0 {
+                pic.raise(0);
+            }
+            if pic.peek() == Some(0) {
+                pic.ack(0);
+                bios_ticks += 1;
+                pic.master_ocw2(0x20);
+            }
+            let mut t = bios_ticks * 65_536;
+            pit_io(&mut pit, &mut pic, now, |pit| pit.write_command(0));
+            if pic.peek() == Some(0) {
+                pic.ack(0);
+                bios_ticks += 1;
+                pic.master_ocw2(0x20);
+            }
+            let lo = pit_io(&mut pit, &mut pic, now, |pit| pit.read_counter(0));
+            let hi = pit_io(&mut pit, &mut pic, now, |pit| pit.read_counter(0));
+            let r = u16::from_le_bytes([lo, hi]).wrapping_sub(1) as u32;
+            let tick = bios_ticks * 65_536;
+            // Sys_FloatTime's rollover correction and negative-delta clamp.
+            if tick != t && r & 0x8000 != 0 {
+                t = tick;
+            }
+            let clock = i64::from(t + 65_536 - r);
+            game_cycles += (clock - previous).max(0);
+            previous = clock;
+        }
+        assert_eq!(bios_ticks, 18);
+        assert_eq!(game_cycles, PIT_INPUT_HZ as i64);
+    }
+
+    #[test]
+    fn pit_io_latches_masked_irq_and_does_not_repeat_it() {
+        let mut pit = pit();
+        let mut pic = VirtualPic::new();
+        pic.set_master_imr(1);
+        pit_io(&mut pit, &mut pic, 0, |pit| pit.write_command(0));
+        assert!(!pic.is_requested(0), "no startup IRQ before the first period");
+        pit_io(&mut pit, &mut pic, 55_000_000, |pit| pit.write_command(0));
+        assert!(pic.is_requested(0));
+        assert_eq!(pic.peek(), None);
+        pic.set_master_imr(0);
+        assert_eq!(pic.peek(), Some(0));
+        pic.ack(0);
+        pic.master_ocw2(0x20);
+        pit_io(&mut pit, &mut pic, 55_000_000, |pit| pit.read_counter(0));
+        assert!(!pic.is_requested(0));
+        assert_eq!(pit.take_pending_irqs(56_000_000), 0);
+    }
+
+    #[test]
+    fn reprogramming_preserves_an_elapsed_irq() {
+        let mut pit = pit();
+        let mut pic = VirtualPic::new();
+        pit_io(&mut pit, &mut pic, 55_000_000, |pit| {
+            pit.write_command(0x34);
+            pit.write_counter(0, 0);
+            pit.write_counter(0, 0);
+        });
+        assert!(pic.is_requested(0));
+        assert_eq!(pit.take_pending_irqs(56_000_000), 0);
     }
 }

@@ -579,6 +579,23 @@ fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
     matches!(pc.sb.device, SbDevice::Emulated(_)) && pc.mpu.owns(p)
 }
 
+/// A PIT read must expose the counter and its IRQ edge at the same instant.
+/// Otherwise a poll can observe a wrap before the next host clock wakeup
+/// raises IRQ0. Quake combines this counter with the BIOS tick count and
+/// discards backward jumps, turning that delay into extra elapsed game time.
+/// Advance before writes too, so reprogramming cannot erase an elapsed edge.
+fn pit_io<R>(
+    pit: &mut VirtualPit,
+    pic: &mut VirtualPic,
+    now_ns: u64,
+    access: impl FnOnce(&mut VirtualPit) -> R,
+) -> R {
+    if pit.take_pending_irqs(now_ns) > 0 {
+        pic.raise(0);
+    }
+    access(pit)
+}
+
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     emulate_inb_non_vga(machine, pc, port)
 }
@@ -652,7 +669,7 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
         // and not in the 8042 — composed here rather than inside either, since
         // neither device may name the other.
         0x61 => {
-            let out = pc.vpit.ch2_output(machine);
+            let out = pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.ch2_output());
             (pc.vkbd.read_port61() & !0x20) | if out { 0x20 } else { 0 }
         }
         // Keyboard status port (bit 0 = output buffer full).
@@ -671,8 +688,8 @@ fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port
             }
             if pc.vkbd.has_data() { 1 } else { 0 }
         }
-        0x40 => pc.vpit.read_counter(machine, 0),
-        0x42 => pc.vpit.read_counter(machine, 2),
+        0x40 => pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.read_counter(0)),
+        0x42 => pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.read_counter(2)),
         // Channel 1 (DRAM refresh) is not modelled; nothing reads it.
         0x41 => 0,
         // PIT command register not readable
@@ -794,12 +811,12 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         }
         // Keyboard controller command
         0x64 => {}
-        0x43 => pc.vpit.write_command(machine, val),
-        0x40 => pc.vpit.write_counter(machine, 0, val),
+        0x43 => pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.write_command(val)),
+        0x40 => pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.write_counter(0, val)),
         // Channel 2 is the speaker's pitch: the card holds no clock of its
         // own, so hand it the new reload as the guest completes it.
         0x42 => {
-            pc.vpit.write_counter(machine, 2, val);
+            pit_io(&mut pc.vpit, &mut pc.vpic, machine.now(), |pit| pit.write_counter(2, val));
             pc.spk.set_divisor(pc.vpit.ch2_reload());
         }
         0x41 => {}
