@@ -61,7 +61,8 @@ if os.environ.get("HOLD_VM"):
         assert sum("//:data_disk" in call for call in builds) == 1
         assert sum("//:boot_disk" in call for call in builds) == 2
         args = json.loads((root / "arguments").read_text())
-        assert f"file={data},format=raw" in args
+        assert f"file={data},if=none,id=data,format=raw" in args
+        assert "ide-hd,drive=data,bus=ide.0,unit=1" in args
         assert not any("snapshot=" in arg for arg in args)
         holder = subprocess.Popen(command, env=env | {"HOLD_VM": "1"}, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
