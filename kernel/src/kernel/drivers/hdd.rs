@@ -10,7 +10,7 @@
 //! on it, is decided by `startup`.
 
 use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage};
-use crate::kernel::portio::{inb, insw, outb, outl, outsw};
+use crate::kernel::portio::{inb, insw, outb, outl, outsw, now_ns};
 use super::dma::Region;
 use crate::kernel::pci;
 
@@ -49,6 +49,25 @@ pub const CHANNELS: [(u16, u16); 2] = [(0x1F0, 0x3F6), (0x170, 0x376)];
 
 /// The LBA28 addressing ceiling — this driver cannot reach past it.
 const LBA28_MAX: u64 = 1 << 28;
+
+// Cache flushes can take seconds. Poll counts are not time limits: QEMU can
+// exhaust a million reads while the host is still completing its fsync.
+const COMMAND_TIMEOUT_NS: u64 = 30_000_000_000;
+
+fn wait_status(mut read: impl FnMut() -> u8, mut now: impl FnMut() -> u64,
+               required: u8) -> Result<(), Error> {
+    let started = now();
+    loop {
+        let s = read();
+        if s == 0 || s == 0xff { return Err(Error::Device(s as u16)); }
+        if s & status::BSY == 0 {
+            if s & (status::ERR | 0x20) != 0 { return Err(Error::Device(s as u16)); }
+            if s & required == required { return Ok(()); }
+        }
+        if now().wrapping_sub(started) >= COMMAND_TIMEOUT_NS { return Err(Error::Timeout); }
+        core::hint::spin_loop();
+    }
+}
 
 /// One ATA drive: a channel plus a master/slave select.
 pub struct Ata {
@@ -144,14 +163,7 @@ impl Ata {
     /// Bounded status polling; an absent or faulted drive must not wedge the
     /// kernel while a filesystem waits for I/O.
     fn wait(&self, required: u8) -> Result<(), Error> {
-        for _ in 0..1_000_000 {
-            let s = inb(self.base + reg::STATUS);
-            if s == 0 || s == 0xff { return Err(Error::Device(s as u16)); }
-            if s & status::BSY != 0 { continue; }
-            if s & (status::ERR | 0x20) != 0 { return Err(Error::Device(s as u16)); }
-            if s & required == required { return Ok(()); }
-        }
-        Err(Error::Timeout)
+        wait_status(|| inb(self.base + reg::STATUS), now_ns, required)
     }
 
     /// Program the taskfile for a `batch`-sector transfer at `lba`.
@@ -318,10 +330,12 @@ impl BusMaster {
     fn complete(&self, ata_base: u16, direction: u8) -> Result<(), Error> {
         outb(self.base, direction | 1);
         let mut result = Err(Error::Timeout);
-        for _ in 0..1_000_000 {
+        let started = now_ns();
+        loop {
             let status = inb(self.base + 2);
             if status & 2 != 0 { result = Err(Error::Device(status as u16)); break; }
             if status & 5 == 4 { result = Ok(()); break; } // IRQ set, DMA inactive
+            if now_ns().wrapping_sub(started) >= COMMAND_TIMEOUT_NS { break; }
             core::hint::spin_loop();
         }
         outb(self.base, direction);
@@ -363,6 +377,31 @@ fn ide_prds(mut phys: u32, mut bytes: u32) -> [u32; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn slow_flush_uses_elapsed_time_not_poll_count() {
+        let mut polls = 0;
+        let mut ns = 0;
+        let result = wait_status(|| {
+            polls += 1;
+            if polls <= 1_000_001 { status::BSY } else { status::DRDY }
+        }, || { ns += 1_000; ns }, status::DRDY);
+        assert_eq!(result, Ok(()));
+        assert!(ns < COMMAND_TIMEOUT_NS);
+    }
+
+    #[test]
+    fn ata_wait_times_out_and_reports_device_errors() {
+        let mut ns = 0;
+        assert_eq!(wait_status(|| status::BSY, || {
+            ns += COMMAND_TIMEOUT_NS / 2;
+            ns
+        }, status::DRDY), Err(Error::Timeout));
+        for status in [0, 0xff, status::DRDY | status::ERR, status::DRDY | 0x20] {
+            assert_eq!(wait_status(|| status, || 0, self::status::DRDY),
+                       Err(Error::Device(status as u16)));
+        }
+    }
+
     #[test]
     fn piix_timings_preserve_other_drive_and_channel() {
         let (primary, slaves) = piix_mwdma2(0xa55a8000, 0xabcdef12, false, 0);

@@ -1,4 +1,4 @@
-//! Injected raw port I/O for kernel-side drivers (ATA, hostfs COM1, CMOS,
+//! Injected raw port I/O and deadline clock for kernel-side drivers (ATA, hostfs COM1, CMOS,
 //! PCI config) that run DEEP below any `machine: &mut A` parameter — the VFS
 //! read path reaches the disk from call sites that never see the arch handle.
 //!
@@ -10,6 +10,8 @@
 /// The installed hook table.
 #[derive(Clone, Copy)]
 pub struct PortIo {
+    /// Monotonic nanoseconds, advancing even while a driver polls in the kernel.
+    pub now_ns: fn() -> u64,
     pub inb: fn(u16) -> u8,
     pub inw: fn(u16) -> u16,
     pub inl: fn(u16) -> u32,
@@ -27,6 +29,7 @@ pub struct PortIo {
 }
 
 const NONE: PortIo = PortIo {
+    now_ns: || 0,
     inb: |_| 0xFF,
     inw: |_| 0xFFFF,
     inl: |_| 0xFFFF_FFFF,
@@ -83,3 +86,7 @@ pub fn outl(port: u16, val: u32) {
 pub fn outsw(port: u16, buf: &[u16]) {
     (hooks().outsw)(port, buf)
 }
+
+/// Elapsed-time clock for hardware command deadlines (not guest CPU time).
+#[inline]
+pub fn now_ns() -> u64 { (hooks().now_ns)() }

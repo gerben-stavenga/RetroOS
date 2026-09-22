@@ -73,6 +73,10 @@ fn main() {
         // is never detected (Diskless — and with no root there is no C:\RETROOS,
         // so no shell either).
         kernel::install_portio(kernel::PortIo {
+            now_ns: || {
+                static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+            },
             inb: arch::inb,
             inw: arch::inw,
             inl: arch::inl,

@@ -109,6 +109,17 @@ impl<H: Hardware> State<H> {
         let result = self.hardware.execute(command, &mut self.buffer);
         fence(Ordering::SeqCst);
         self.failed = result.is_err();
+        if let Err(error) = result {
+            let operation = match command.operation {
+                Operation::Read => "read", Operation::Write => "write", Operation::Flush => "flush",
+            };
+            match error {
+                Error::Timeout => lib::compact_println!("Storage: {} timeout (lba={} sectors={})",
+                    operation, command.lba, command.sectors),
+                Error::Device(status) => lib::compact_println!("Storage: {} device error {:#x} (lba={} sectors={})",
+                    operation, status, command.lba, command.sectors),
+            }
+        }
         result.is_ok()
     }
 }

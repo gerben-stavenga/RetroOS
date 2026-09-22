@@ -226,6 +226,10 @@ fn main() {
 /// host-environment facts the platform probe reads.
 fn install_hosted_backend() {
     kernel::install_portio(kernel::PortIo {
+        now_ns: || {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            EPOCH.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+        },
         inb: arch::inb,
         inw: arch::inw,
         inl: arch::inl,
