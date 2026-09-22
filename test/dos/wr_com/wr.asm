@@ -55,7 +55,7 @@ org 0x100
     mov ax, 0x4C01        ; exit 1
     int 0x21
 
-fname   db "WRTEST.TXT", 0
+fname   db "C:\WRTEST.TXT", 0
 data    db "RetroOS ext4 write test", 13, 10
 datalen equ $ - data
 msg_ok     db "WR: ok", 13, 10, '$'

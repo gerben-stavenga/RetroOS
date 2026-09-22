@@ -48,6 +48,7 @@ DATA_FILES = {
     "//test/dos/stress:stress_elf":       "TESTS/stress.elf",
     "//test/dos/stress64:stress64_elf":   "TESTS/stress64.elf",
     "//test/dos/hello_com:hello_com":     "TESTS/HELLO.COM",
+    "//test/dos/wr_com:wr_com":           "TESTS/WR.COM",
 
     "//test/dos/hostfs_commands:hostfs_commands_com": "TESTS/HFSOPS.COM",
 

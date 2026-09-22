@@ -56,12 +56,14 @@ def main():
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
         # No Bazel invocation: this launcher must consume only the release.
-        for firmware, controller in [(fw, hd) for fw in ('bios', 'uefi') for hd in ('ata', 'ahci', 'nvme')]:
-            log = work / f'vm-{firmware}-{controller}.log'
+        cases = [('bios', cpu, hd) for cpu in ('386', '686') for hd in ('ata', 'ahci', 'nvme')]
+        cases += [('uefi', 'x64', hd) for hd in ('ata', 'ahci', 'nvme')]
+        for firmware, cpu, controller in cases:
+            log = work / f'vm-{firmware}-{cpu}-{controller}.log'
             with log.open('w') as output:
                 proc = subprocess.Popen([str(vm / 'run.sh'), '--headless', '--sound', 'none',
-                                         '--firmware', firmware, '--hd', controller,
-                                         '--cmd', 'TESTS/HELLO.COM'], cwd=vm,
+                                         '--firmware', firmware, '--arch', cpu, '--hd', controller,
+                                         '--cmd', 'TESTS/WR.COM'], cwd=vm,
                                         stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT)
                 try:
                     deadline = time.monotonic() + 45
@@ -74,12 +76,19 @@ def main():
                         proc.terminate()
                     proc.wait(timeout=10)
             text = log.read_text(errors='replace')
-            assert 'Hello from HELLO.COM!' in text and 'All commands done' in text, text
+            assert 'WR: ok' in text and 'All commands done' in text, text
+            # Read after QEMU exits: success must reach the backing disk, not
+            # merely the guest cache. Remove it so every case creates anew.
+            contents = subprocess.check_output(['mtype', '-i', volume, '::/WRTEST.TXT'])
+            assert contents == b'RetroOS ext4 write test\r\n', contents
+            subprocess.run(['mdel', '-i', volume, '::/WRTEST.TXT'], check=True)
             expected = 'vga_passthrough=true firmware=NativeBios' if firmware == 'bios' else 'vga_passthrough=false firmware=Substitute'
             assert expected in text, text
+            if cpu == '386':
+                assert 'VME not supported, using software VM86 monitor' in text, text
             device = {'ata': 'ata1', 'ahci': 'ahci0p0', 'nvme': 'nvme0n1'}[controller]
             assert f'Storage: {device} ' in text, text
-            print(f'PASS: packaged launcher {firmware}/{controller}')
+            print(f'PASS: packaged launcher + persistent write {firmware}/{cpu}/{controller}')
             assert not any(marker in text for marker in ('FATAL', 'PANIC', 'panicked')), text
     print('PASS: release checksums, public data, matched runtime, packaged installer, and prebuilt QEMU launcher')
 

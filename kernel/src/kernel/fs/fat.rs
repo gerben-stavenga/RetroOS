@@ -258,6 +258,12 @@ pub(crate) mod tests {
             assert_eq!(disk.writes.get(), before, "probing must never write");
             assert!(!is_fat(&Volume::new(disk, 0, 1)), "reject truncated media");
             let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
+            let root_file = fs.create(b"ROOT.TXT").expect("create in FAT root");
+            assert_eq!(fs.write(root_file.handle, 0, b"root contents"), 13);
+            assert_eq!(fs.clunk(root_file.handle), 0);
+            assert!(fs.dos_attributes(b"ROOT.TXT").is_some());
+            assert!(fs.set_mtime(b"ROOT.TXT", 1_700_000_000));
+            assert_eq!(fs.mtime(b"ROOT.TXT"), Some(1_700_000_000));
             assert_eq!(fs.mkdir(b"Directory"), 0);
             let node = fs.create(b"Directory/My long document.txt").unwrap();
             let data: Vec<u8> = (0..9000).map(|n| n as u8).collect();
@@ -272,6 +278,11 @@ pub(crate) mod tests {
             assert!(fs.rename(b"Directory/My long document.txt", b"Directory/renamed.txt") == 0);
             drop(fs);
             let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
+            let root_file = fs.open(b"ROOT.TXT").unwrap();
+            let mut root_data = [0; 13];
+            assert_eq!(fs.read(root_file.handle, 0, &mut root_data, root_file.size), 13);
+            assert_eq!(&root_data, b"root contents");
+            fs.clunk(root_file.handle);
             let node = fs.open(b"Directory/renamed.txt").unwrap();
             let mut out = alloc::vec![0; data.len()];
             assert_eq!(fs.read(node.handle, 0, &mut out, node.size), 9000);
@@ -311,7 +322,8 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
         let state = self.state.lock();
         let text = path_str(path)?;
         let (parent, name) = text.rsplit_once('/').unwrap_or(("", text));
-        let dir = state.media.root_dir().open_dir(parent).ok()?;
+        let dir = if parent.is_empty() { state.media.root_dir() }
+                  else { state.media.root_dir().open_dir(parent).ok()? };
         for entry in dir.iter() {
             let entry = entry.ok()?;
             if entry.file_name() == name { return Some(entry.attributes().bits()); }
@@ -322,7 +334,8 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
         let state = self.state.lock();
         let text = path_str(path)?;
         let (parent, name) = text.rsplit_once('/').unwrap_or(("", text));
-        let dir = state.media.root_dir().open_dir(parent).ok()?;
+        let dir = if parent.is_empty() { state.media.root_dir() }
+                  else { state.media.root_dir().open_dir(parent).ok()? };
         for entry in dir.iter() {
             let entry = entry.ok()?;
             if entry.file_name() == name { return Some(unix_from_datetime(&entry.modified())); }
@@ -492,7 +505,8 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
         let media = &state.media;
         let path_text = path_str(path)?;
         let (parent, name) = path_text.rsplit_once('/').unwrap_or(("", path_text));
-        let dir = media.root_dir().open_dir(parent).ok()?;
+        let dir = if parent.is_empty() { media.root_dir() }
+                  else { media.root_dir().open_dir(parent).ok()? };
         // VFS has already resolved exact names. FAT cannot store colliding
         // case variants or short aliases, but a collision must not silently
         // turn a request for a new name into truncating another file.

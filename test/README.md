@@ -68,6 +68,8 @@ separate temporary files. The data disk's runtime directory stays empty.
 
 After `bazelisk build //:release`, `python3 test/release.py` checks checksums,
 extracts the public bundles, exercises the packaged installer, and boots the
-prebuilt VM launcher without invoking Bazel. CI uploads the bundles only after
+prebuilt VM launcher without invoking Bazel. Each ATA/AHCI/NVMe case writes
+and closes a file, then checks its bytes in the disk image after shutdown.
+BIOS covers both 386 and 686 CPU configurations; UEFI covers x64. CI uploads the bundles only after
 all required checks pass. `dpmi_hdpmi_pvi` is a local reference test requiring
 an installed FreeDOS disk; it is optional in CI.
