@@ -127,7 +127,7 @@ rust_binary(
     edition = "2024",
     compile_data = [":kernel_ld", ":entry"],
     rustc_flags = [
-        "-Cpanic=immediate-abort",
+        "-Cpanic=abort",
         "-Crelocation-model=static",
         # Link with rustc's bundled lld (the bare CC toolchain is dummy-only),
         # directly as ld.lld — the i686-unknown-none target's linker.

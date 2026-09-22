@@ -37,6 +37,11 @@ def main():
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
             assert {'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM', 'RETROOS/DN/DN.COM'} <= names
             assert 'RETROOS/DN/DN.HIS' not in names and 'RETROOS/DN/DN.FLG' not in names
+            kernel = next(member for member in archive.getmembers()
+                          if member.name.removeprefix('./') == 'kernel.elf')
+            # immediate-abort removes the Rust panic handler from the linked
+            # kernel. Check the shipped binary retains its diagnostic path.
+            assert b'!!! KERNEL PANIC !!!' in archive.extractfile(kernel).read()
         # Exercise the shipped installer/defaults without assuming CI's host
         # root is ext4 or writing to its /boot and /home directories.
         sys.path.insert(0, str(machine / 'tools'))
@@ -75,7 +80,7 @@ def main():
             device = {'ata': 'ata1', 'ahci': 'ahci0p0', 'nvme': 'nvme0n1'}[controller]
             assert f'Storage: {device} ' in text, text
             print(f'PASS: packaged launcher {firmware}/{controller}')
-            assert 'FATAL' not in text and 'panicked' not in text, text
+            assert not any(marker in text for marker in ('FATAL', 'PANIC', 'panicked')), text
     print('PASS: release checksums, public data, matched runtime, packaged installer, and prebuilt QEMU launcher')
 
 

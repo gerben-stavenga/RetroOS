@@ -242,6 +242,14 @@ impl compact_fmt::Write for Term {
     }
 }
 
+// Rust panic messages use core::fmt even though normal console output uses
+// compact_fmt. Preserve the same display, log, and flush behavior for both.
+impl core::fmt::Write for Term {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        compact_fmt::Write::write_str(self, text).map_err(|_| core::fmt::Error)
+    }
+}
+
 static mut TERM: Term = Term::new(Some(0xB8000));
 
 /// Access the global console.

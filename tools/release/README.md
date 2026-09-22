@@ -1,5 +1,8 @@
 # RetroOS release
 
+Release builds retain panic diagnostics. Kernel panics display the message,
+source location, and stack trace on the console and mirror them to the log.
+
 ## Virtual machine: retroos-vm.tar.gz
 
 Extract into a new directory and run `./run.sh`. Requires Linux, QEMU x86,

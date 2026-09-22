@@ -478,7 +478,7 @@ fn panic(info: &PanicInfo) -> ! {
     if let Some(location) = info.location() {
         screenln!(screen, "at {}:{}", location.file(), location.line());
     }
-    screenln!(screen, "<panic message unavailable>");
+    let _ = core::fmt::Write::write_fmt(screen, format_args!("{}\n", info.message()));
 
     loop {
         unsafe {
