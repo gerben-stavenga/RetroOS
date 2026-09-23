@@ -78,7 +78,7 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
     text = log.read_text(errors="replace")
     assert expected in text and "LAYOUT-FAIL" not in text, text
     if ata_dma:
-        assert "ATA: ata0 DMA" in text and "ATA: ata1 DMA" in text, text
+        assert "ATA: ata0 LBA28 DMA" in text and "ATA: ata1 LBA28 DMA" in text, text
     firmware = "Substitute" if uefi else "NativeBios"
     assert f"firmware={firmware}" in text, text
     assert f"vga_passthrough={str(not uefi).lower()}" in text, text
