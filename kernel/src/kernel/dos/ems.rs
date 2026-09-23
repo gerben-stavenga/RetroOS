@@ -30,17 +30,24 @@ fn ems_base_page() -> usize {
     EMS_BASE_PAGE.load(core::sync::atomic::Ordering::Relaxed)
 }
 
-/// Swap an EMS window with a backing region.
-fn swap_ems_window<A: crate::Arch>(machine: &mut A, window: usize, backing_vpage: usize) {
+/// Alias a window onto its backing pages. The backing mapping stays live:
+/// multiple physical windows may name the same logical EMS page.
+fn map_ems_window<A: crate::Arch>(machine: &mut A, window: usize, backing: Option<usize>) {
     let frame = ems_base_page() + window * 4;
-    machine.swap_page_entries(backing_vpage, frame, 4);
+    if let Some(backing) = backing {
+        machine.copy_page_entries(backing, frame, 4);
+    } else {
+        machine.unmap_range(frame, 4);
+    }
 }
+
+type PageMap = [Option<(u8, u16)>; 4];
 
 /// Per-thread EMS driver state
 pub struct EmsState {
     handles: [Option<EmsHandle>; MAX_EMS_HANDLES],
     /// Current mapping: frame[window] = (handle, logical_page) or None
-    frame: [Option<(u8, u16)>; 4],
+    frame: PageMap,
 }
 
 #[derive(Clone, Copy)]
@@ -49,6 +56,7 @@ struct EmsHandle {
     /// no backing range until it is enlarged.
     base: Option<u32>,
     pages: u16,
+    saved_map: Option<PageMap>,
 }
 
 impl EmsState {
@@ -65,21 +73,43 @@ impl EmsState {
         EMS_TOTAL_PAGES.saturating_sub(used)
     }
 
-    /// Put mapped pages back in their backing ranges before the common memory
-    /// manager releases those ranges. This keeps EMS teardown correct even
-    /// when it happens before the entire address space is destroyed.
+    /// Remove window aliases before releasing the owning allocations.
     pub fn free_all_pages<A: crate::Arch>(&mut self, machine: &mut A) {
         for window in 0..self.frame.len() {
-            if let Some((handle, logical)) = self.frame[window]
-                && let Some(allocation) = self.handles[handle as usize]
-                && let Some(vpage) = backing_vpage(&allocation, logical)
-            {
-                swap_ems_window(machine, window, vpage);
+            if self.frame[window].is_some() {
+                map_ems_window(machine, window, None);
             }
         }
         self.handles = core::array::from_fn(|_| None);
         self.frame = [None; 4];
     }
+
+    fn map<A: crate::Arch>(&mut self, machine: &mut A, window: usize,
+                          handle: u16, logical: u16) -> Result<(), u8> {
+        if window >= 4 { return Err(0x8B); }
+        let mapping = if logical == 0xFFFF { None } else {
+            let h = self.handles.get(handle as usize).and_then(Option::as_ref).ok_or(0x83)?;
+            let page = backing_vpage(h, logical).ok_or(0x8A)?;
+            Some((page, (handle as u8, logical)))
+        };
+        map_ems_window(machine, window, mapping.map(|m| m.0));
+        self.frame[window] = mapping.map(|m| m.1);
+        Ok(())
+    }
+
+    fn restore<A: crate::Arch>(&mut self, machine: &mut A, map: PageMap) -> Result<(), u8> {
+        // Validate the entire saved context before changing any window.
+        for (handle, logical) in map.iter().flatten() {
+            let h = self.handles.get(*handle as usize).and_then(Option::as_ref).ok_or(0x83)?;
+            backing_vpage(h, *logical).ok_or(0x8A)?;
+        }
+        for (window, entry) in map.into_iter().enumerate() {
+            let (handle, logical) = entry.unwrap_or((0, 0xFFFF));
+            self.map(machine, window, u16::from(handle), logical)?;
+        }
+        Ok(())
+    }
+
 }
 
 /// Ensure EMS state exists for current thread
@@ -172,7 +202,7 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
                         match allocated {
                             Ok(block) => {
                                 ems.handles[i] = Some(EmsHandle {
-                                    base: block.map(|b| b.base), pages: pages_needed,
+                                    base: block.map(|b| b.base), pages: pages_needed, saved_map: None,
                                 });
                                 regs.rdx = (regs.rdx & !0xFFFF) | i as u64;
                                 regs.rax &= !0xFF00;
@@ -188,54 +218,9 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
         }
         // AH=44h — Map page (AL=physical page 0-3, BX=logical page, DX=handle)
         0x44 => {
-            let phys_page = regs.rax as u8; // AL
-            let log_page = regs.rbx as u16;
-            let handle = regs.rdx as u16;
-
-            if phys_page > 3 {
-                regs.rax = (regs.rax & !0xFF00) | (0x8B << 8); // invalid physical page
-                return thread::KernelAction::Done;
-            }
-
-            let ems = ems_state(dos);
-
-            // BX=FFFFh means unmap
-            if log_page == 0xFFFF {
-                // Save current frame content back to its backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
-                    && let Some(ref h) = ems.handles[old_h as usize] {
-                        swap_ems_window(machine, phys_page as usize, backing_vpage(h, old_lp).unwrap());
-                    }
-                ems.frame[phys_page as usize] = None;
-                regs.rax &= !0xFF00; // AH=0
-                return thread::KernelAction::Done;
-            }
-
-            if handle == 0 || (handle as usize) >= MAX_EMS_HANDLES {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8); // invalid handle
-                return thread::KernelAction::Done;
-            }
-
-            match &ems.handles[handle as usize] {
-                Some(h) if log_page < h.pages => {
-                    let new_vpage = backing_vpage(h, log_page).unwrap();
-                    // Save current frame content back to old backing
-                    if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
-                        && let Some(ref oh) = ems.handles[old_h as usize] {
-                            swap_ems_window(machine, phys_page as usize, backing_vpage(oh, old_lp).unwrap());
-                        }
-                    // Load new backing into frame
-                    swap_ems_window(machine, phys_page as usize, new_vpage);
-                    ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                    regs.rax &= !0xFF00; // AH=0
-                }
-                Some(_) => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x8A << 8); // logical page out of range
-                }
-                None => {
-                    regs.rax = (regs.rax & !0xFF00) | (0x83 << 8); // invalid handle
-                }
-            }
+            let result = ems_state(dos).map(machine, regs.rax as u8 as usize,
+                                          regs.rdx as u16, regs.rbx as u16);
+            regs.rax = (regs.rax & !0xFF00) | (u64::from(result.err().unwrap_or(0)) << 8);
         }
         // AH=45h — Release handle (DX=handle)
         0x45 => {
@@ -244,11 +229,9 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             if handle != 0 && (handle as usize) < MAX_EMS_HANDLES && ems.handles[handle as usize].is_some() {
                 // Unmap any windows using this handle
                 for w in 0..4 {
-                    if let Some((h, lp)) = ems.frame[w]
+                    if let Some((h, _)) = ems.frame[w]
                         && h == handle as u8 {
-                            if let Some(ref hnd) = ems.handles[h as usize] {
-                                swap_ems_window(machine, w, backing_vpage(hnd, lp).unwrap());
-                            }
+                            map_ems_window(machine, w, None);
                             ems.frame[w] = None;
                         }
                 }
@@ -265,6 +248,31 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
         0x46 => {
             regs.rax &= !0xFF00; // AH=0
             regs.rax = (regs.rax & !0xFF) | 0x40; // AL=40h = version 4.0
+        }
+        // AH=47h/48h — Save/restore the complete page map in a handle.
+        0x47 | 0x48 => {
+            let ems = ems_state(dos);
+            let handle = regs.rdx as u16 as usize;
+            let result = match ems.handles.get(handle).copied().flatten() {
+                None => Err(0x83u8),
+                Some(h) if ah == 0x47 => {
+                    if h.saved_map.is_some() { Err(0x8D) } else {
+                        ems.handles[handle].as_mut().unwrap().saved_map = Some(ems.frame);
+                        Ok(())
+                    }
+                }
+                Some(h) => match h.saved_map {
+                    None => Err(0x8E),
+                    Some(map) => {
+                        let result = ems.restore(machine, map);
+                        if result.is_ok() {
+                            ems.handles[handle].as_mut().unwrap().saved_map = None;
+                        }
+                        result
+                    }
+                },
+            };
+            regs.rax = (regs.rax & !0xFF00) | (u64::from(result.err().unwrap_or(0)) << 8);
         }
         // AH=4Bh — Get number of open handles
         0x4B => {
@@ -309,59 +317,26 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
         // AH=50h — Map multiple pages (AL=0: phys page mode, AL=1: segment mode)
         // CX=count, DX=handle, DS:SI=mapping array
         0x50 => {
-            let al = regs.rax as u8;
+            let sub = regs.rax as u8;
             let count = regs.rcx as u16;
             let handle = regs.rdx as u16;
-            let ds = regs.ds as u16 as u32;
-            let si = regs.rsi as u16 as u32;
-            let base_addr = (ds << 4) + si;
-
+            let address = ((regs.ds as u16 as usize) << 4) + regs.rsi as u16 as usize;
             let ems = ems_state(dos);
-            if handle == 0 || (handle as usize) >= MAX_EMS_HANDLES || ems.handles[handle as usize].is_none() {
-                regs.rax = (regs.rax & !0xFF00) | (0x83 << 8);
-                return thread::KernelAction::Done;
-            }
-
-            for i in 0..count as u32 {
-                let log_page = machine.read::<u16>((base_addr + i * 4) as usize);
-                let phys_raw = machine.read::<u16>((base_addr + i * 4 + 2) as usize);
-
-                let phys_page = if al == 0 {
-                    phys_raw as u8
-                } else {
-                    // Segment mode: convert segment to physical page index
-                    let seg_offset = phys_raw.wrapping_sub(ems_frame_seg());
-                    (seg_offset / 0x0400) as u8 // each window is 0x400 paragraphs (16KB)
-                };
-
-                if phys_page > 3 {
-                    regs.rax = (regs.rax & !0xFF00) | (0x8B << 8);
-                    return thread::KernelAction::Done;
+            let result = (|| -> Result<(), u8> {
+                if sub > 1 { return Err(0x8F); }
+                for i in 0..usize::from(count) {
+                    let logical = machine.read::<u16>(address + i * 4);
+                    let physical = machine.read::<u16>(address + i * 4 + 2);
+                    let window = if sub == 0 { usize::from(physical) } else {
+                        let offset = physical.checked_sub(ems_frame_seg()).ok_or(0x8B)?;
+                        if !offset.is_multiple_of(0x400) { return Err(0x8B); }
+                        usize::from(offset / 0x400)
+                    };
+                    ems.map(machine, window, handle, logical)?;
                 }
-
-                // Save current frame content back to old backing
-                if let Some((old_h, old_lp)) = ems.frame[phys_page as usize]
-                    && let Some(ref oh) = ems.handles[old_h as usize] {
-                        swap_ems_window(machine, phys_page as usize, backing_vpage(oh, old_lp).unwrap());
-                    }
-
-                if log_page == 0xFFFF {
-                    ems.frame[phys_page as usize] = None;
-                } else {
-                    match &ems.handles[handle as usize] {
-                        Some(h) if log_page < h.pages => {
-                            let new_vpage = backing_vpage(h, log_page).unwrap();
-                            swap_ems_window(machine, phys_page as usize, new_vpage);
-                            ems.frame[phys_page as usize] = Some((handle as u8, log_page));
-                        }
-                        _ => {
-                            regs.rax = (regs.rax & !0xFF00) | (0x8A << 8);
-                            return thread::KernelAction::Done;
-                        }
-                    }
-                }
-            }
-            regs.rax &= !0xFF00; // AH=0
+                Ok(())
+            })();
+            regs.rax = (regs.rax & !0xFF00) | (u64::from(result.err().unwrap_or(0)) << 8);
         }
         // AH=51h — Reallocate pages for handle (DX=handle, BX=new count)
         0x51 => {
@@ -383,14 +358,14 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
                 return thread::KernelAction::Done;
             }
 
-            // Restore every window before the common allocation moves or
-            // releases backing PTEs. Reapply surviving mappings afterward.
+            // Detach aliases before resizing the owning allocation, then map
+            // surviving windows onto its possibly relocated backing.
             let mut mapped = [None; 4];
             for (window, slot) in mapped.iter_mut().enumerate() {
                 if let Some((mapped_handle, logical)) = ems.frame[window]
                     && mapped_handle == handle as u8
                 {
-                    swap_ems_window(machine, window, backing_vpage(&old, logical).unwrap());
+                    map_ems_window(machine, window, None);
                     ems.frame[window] = None;
                     *slot = Some(logical);
                 }
@@ -411,13 +386,13 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
             };
             match changed {
                 Ok(base) => {
-                    ems.handles[handle as usize] = Some(EmsHandle { base, pages: new_count });
+                    ems.handles[handle as usize] = Some(EmsHandle { base, pages: new_count, saved_map: old.saved_map });
                     let resized = ems.handles[handle as usize].as_ref().unwrap();
                     for (window, logical) in mapped.into_iter().enumerate() {
                         if let Some(logical) = logical
                             && let Some(vpage) = backing_vpage(resized, logical)
                         {
-                            swap_ems_window(machine, window, vpage);
+                            map_ems_window(machine, window, Some(vpage));
                             ems.frame[window] = Some((handle as u8, logical));
                         }
                     }
@@ -428,13 +403,18 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
                     // The old allocation is intact on failure; restore its windows.
                     for (window, logical) in mapped.into_iter().enumerate() {
                         if let Some(logical) = logical {
-                            swap_ems_window(machine, window, backing_vpage(&old, logical).unwrap());
+                            map_ems_window(machine, window, backing_vpage(&old, logical));
                             ems.frame[window] = Some((handle as u8, logical));
                         }
                     }
                     regs.rax = (regs.rax & !0xFF00) | (0x88 << 8);
                 }
             }
+        }
+        // AH=57h — Move/exchange conventional or expanded memory regions.
+        0x57 => {
+            let result = move_region(machine, ems_state(dos), regs);
+            regs.rax = (regs.rax & !0xFF00) | (u64::from(result.err().unwrap_or(0)) << 8);
         }
         // AH=58h — Get mappable physical page array
         0x58 => {
@@ -462,4 +442,89 @@ fn int_67h_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>,
         }
     }
     thread::KernelAction::Done
+}
+
+/// Resolve one packed AH=57h endpoint. Expanded offsets can cross logical
+/// pages, but the initial offset must lie within its first 16 KiB page.
+fn region_address<A: crate::Arch>(machine: &A, ems: &EmsState, descriptor: usize,
+                                  length: usize) -> Result<usize, u8> {
+    let kind = machine.read::<u8>(descriptor);
+    let handle = machine.read::<u16>(descriptor + 1);
+    let offset = usize::from(machine.read::<u16>(descriptor + 3));
+    let page = usize::from(machine.read::<u16>(descriptor + 5));
+    match kind {
+        0 => {
+            let address = (page << 4) + offset;
+            if address + length > 0x10_0000 { return Err(0xA2); }
+            Ok(address)
+        }
+        1 => {
+            let h = ems.handles.get(usize::from(handle)).and_then(Option::as_ref).ok_or(0x83)?;
+            if offset >= EMS_PAGE_BYTES as usize { return Err(0x95); }
+            if page >= usize::from(h.pages) { return Err(0x8A); }
+            let start = page * EMS_PAGE_BYTES as usize + offset;
+            if start + length > usize::from(h.pages) * EMS_PAGE_BYTES as usize { return Err(0x93); }
+            Ok(h.base.ok_or(0x8A)? as usize + start)
+        }
+        _ => Err(0x98),
+    }
+}
+
+/// Split an address range at window boundaries and translate aliases back to
+/// the owning allocation. This also detects overlap when one endpoint uses a
+/// conventional segment inside the EMS page frame.
+fn region_spans(ems: &EmsState, mut address: usize, mut length: usize)
+    -> alloc::vec::Vec<(usize, usize)>
+{
+    let mut spans = alloc::vec::Vec::new();
+    let frame = ems_base_page() * 4096;
+    while length != 0 {
+        let (canonical, run) = if address < frame {
+            (address, length.min(frame - address))
+        } else if address < frame + 4 * EMS_PAGE_BYTES as usize {
+            let window = (address - frame) / EMS_PAGE_BYTES as usize;
+            let offset = (address - frame) % EMS_PAGE_BYTES as usize;
+            let canonical = ems.frame[window].and_then(|(handle, logical)| {
+                backing_vpage(ems.handles[usize::from(handle)].as_ref()?, logical)
+            }).map_or(address, |page| page * 4096 + offset);
+            (canonical, length.min(EMS_PAGE_BYTES as usize - offset))
+        } else {
+            (address, length)
+        };
+        spans.push((canonical, run));
+        address += run;
+        length -= run;
+    }
+    spans
+}
+
+fn move_region<A: crate::Arch>(machine: &mut A, ems: &EmsState, regs: &Regs) -> Result<(), u8> {
+    let sub = regs.rax as u8;
+    if sub > 1 { return Err(0x8F); }
+    let descriptor = ((regs.ds as u16 as usize) << 4) + regs.rsi as u16 as usize;
+    let length = machine.read::<u32>(descriptor) as usize;
+    if length > 0x10_0000 { return Err(0x96); }
+    let src = region_address(machine, ems, descriptor + 4, length)?;
+    let dst = region_address(machine, ems, descriptor + 11, length)?;
+    let sources = region_spans(ems, src, length);
+    let destinations = region_spans(ems, dst, length);
+    let overlap = sources.iter().any(|&(s, sn)| destinations.iter()
+        .any(|&(d, dn)| s < d + dn && d < s + sn));
+    let overlap_status = if machine.read::<u8>(descriptor + 4)
+        != machine.read::<u8>(descriptor + 11) { 0x94 } else if sub == 1 { 0x97 } else { 0x92 };
+    if overlap && sub == 1 { return Err(overlap_status); }
+    if sub == 0 && !overlap {
+        machine.copy_within(src, dst, length);
+        return Ok(());
+    }
+    // Snapshot before writing: linear addresses alone cannot reveal physical
+    // overlap through two different page-frame windows. The spec limits this
+    // temporary buffer to 1 MiB, and no guest page mappings need to change.
+    let mut source = alloc::vec![0u8; length];
+    machine.copy_from(src, &mut source);
+    if sub == 1 {
+        machine.copy_within(dst, src, length);
+    }
+    machine.copy_to(dst, &source);
+    if overlap { Err(overlap_status) } else { Ok(()) }
 }

@@ -110,13 +110,13 @@ in Git history.
   free (`88h`) exhaustion. Model OS handle 0 as active in `4Bh`/`4Dh`; increase
   the 16-application-handle limit if compatibility requires it. Only advertise
   EMS when `scan_uma` actually reserves a 64 KiB page frame, and make unmapped
-  windows inaccessible. Tighten `50h` so zero-count, AL, count, exact segment,
-  and per-entry failure semantics do not desynchronize the shadow map; return
-  exact `51h` exhaustion and `58h` subfunction errors. Implement the EMS 3.0
-  save/restore calls (`47h`/`48h`), EMS 3.2 whole-map call (`4Eh`), and EMS 4.0
-  partial maps (`4Fh`), attributes/names/directory (`52h`-`54h`), alter-map
-  jump/call (`55h`/`56h`), and move/exchange (`57h`). The OS/environment calls
-  `59h`-`5Dh` remain lower priority.
+  windows inaccessible. Audit remaining `50h` count/handle error semantics;
+  return exact `51h` exhaustion and `58h` subfunction errors. Shared window
+  aliases, save/restore (`47h`/`48h`), and move/exchange (`57h`) now have an
+  executable regression probe. Implement the EMS 3.2 whole-map call (`4Eh`)
+  and EMS 4.0 partial maps (`4Fh`), attributes/names/directory (`52h`-`54h`),
+  and alter-map jump/call (`55h`/`56h`). The OS/environment calls `59h`-`5Dh`
+  remain lower priority.
 - [ ] **Add remaining common BIOS peripherals as demand appears.** Cover the
   useful serial, printer, and joystick BIOS services and tighten keyboard,
   mouse, timer, and video semantics exposed by real games.
@@ -138,7 +138,9 @@ in Git history.
 - [ ] **Ironman Off-Road Racing:** fix the timer ISR's polling of port `0x3DA`.
   It requires a runtime-derived number of consecutive samples and can grind
   to a halt when emulated retrace advances independently of guest polling.
-- [ ] **Aladdin:** sound degrades and graphics eventually become corrupt.
+- [x] **Aladdin:** implement its EMS save/restore and move calls, and fix
+  simultaneous page-window aliases that corrupted audio and graphics.
+  Regression: `test/ems.py`; gameplay checked on QEMU/KVM with HDA audio.
 - [ ] **Golden Axe:** missing keyboard keys prevent selection.
 
 ## Emulator-specific reference issues

@@ -23,6 +23,8 @@ RETRO_REQUIRE_KVM=1 RETRO_TEST_ONLY='hosted_games_kvm hosted_diff unit_kvm' bash
 ENGINE=kvm bash test/hosted_games.sh
 ENGINE=kvm bash test/dpmi_hx.sh
 ENGINE=kvm bash test/xms.sh
+ENGINE=kvm python3 test/ems.py
+python3 test/ems.py --qemu --kvm
 ENGINE=kvm python3 test/lfn.py
 ```
 
@@ -34,6 +36,10 @@ The KVM execution proofs include remapping a previously executed code page
 without changing CR3. They assert that the next entry executes the new frame,
 catching stale translations after host-side page-table edits (the cause of
 Navigator hanging in its loader).
+
+The EMS probe covers simultaneous aliases, saved page maps, cross-page
+move/exchange, overlapping regions, rejected mappings, and handle resizing.
+It exercises the services used by Aladdin without requiring the game assets.
 
 The host unit group includes formatting, heap, ext4 (including independently
 generated filesystem images), and Voodoo tests in addition to kernel, CPU,
