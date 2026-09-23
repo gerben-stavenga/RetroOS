@@ -13,6 +13,7 @@ Layout:
                         /EFI/BOOT/BOOTX64.EFI                 UEFI GRUB
                         /kernel.elf                           multiboot target
                         /RETROOS/...                          mounted at C:\\RETROOS
+                        /CONFIG/...                           fallback defaults
 
 One FAT partition does three jobs: it is GRUB's prefix volume on BIOS, the EFI
 System Partition on UEFI, and the source of C:\\RETROOS in the dev loop.  Type

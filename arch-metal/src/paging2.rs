@@ -1342,7 +1342,8 @@ fn prepare_kernel_mapping_entries<E: Entry>(entries: &mut [E], vpage_start: usiz
     }
 }
 
-/// Map externally owned physical pages into the fixed kernel aperture.
+/// Map externally owned physical pages writable into the fixed kernel aperture.
+/// Writes must reach the original RAM directly, without copy-on-write.
 ///
 /// The caller must have prepared the parent page table. All entries are
 /// installed before one TLB flush, so a multi-page aperture remap does not
@@ -1367,8 +1368,7 @@ pub(crate) fn map_kernel_foreign_range(
     match entries() {
         Entries::E32(entries) => {
             for i in 0..count {
-                let mut entry = Entry32::new(ppage_start + i as u64, false, false);
-                entry.set_writable(false);
+                let mut entry = Entry32::new(ppage_start + i as u64, true, false);
                 entry.set_no_execute(true);
                 entry.set_raw(entry.raw() | flags::FOREIGN);
                 replace_mapping(&mut entries[vpage_start + i], entry);
@@ -1376,8 +1376,7 @@ pub(crate) fn map_kernel_foreign_range(
         }
         Entries::E64(entries) => {
             for i in 0..count {
-                let mut entry = Entry64::new(ppage_start + i as u64, false, false);
-                entry.set_writable(false);
+                let mut entry = Entry64::new(ppage_start + i as u64, true, false);
                 entry.set_no_execute(true);
                 entry.set_raw(entry.raw() | flags::FOREIGN);
                 replace_mapping(&mut entries[vpage_start + i], entry);

@@ -34,7 +34,7 @@ def make_fat(work, name, bits, size, root):
     return image
 
 
-def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-ROOT-RW-OK", memory=256):
+def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-ROOT-RW-OK", memory=256, cpu="pentium3"):
     tree = work / name
     grub = tree / "boot/grub"
     grub.mkdir(parents=True)
@@ -49,7 +49,7 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)
     log = work / (name + ".log")
-    args = ["qemu-system-i386", "-m", str(memory), "-cpu", "pentium3", "-cdrom", str(iso),
+    args = ["qemu-system-i386", "-m", str(memory), "-cpu", cpu, "-cdrom", str(iso),
             "-boot", "order=d", "-display", "none", "-serial", "none", "-no-reboot",
             "-debugcon", "file:" + str(log), "-fw_cfg", "name=opt/cmdline,string=" + command]
     if not module:
@@ -112,8 +112,10 @@ def main():
         boot(work, "fat16-partition-lfn", disk, False, "Mounting FAT root (16 MB)",
              "ROOTTEST.BAT", "LFN-ALL-OK")
         boot(work, "fat16-whole-disk-root", fat16, False, "Mounting FAT root (16 MB)")
-        boot(work, "fat12-module-root", fat12, True, "Multiboot FAT (1 MB, volatile overlay)")
-        boot(work, "fat32-module-root", fat32, True, "Multiboot FAT (64 MB, volatile overlay)")
+        boot(work, "fat12-module-root", fat12, True, "Multiboot FAT (1 MB, volatile RAM)")
+        boot(work, "fat32-module-root", fat32, True, "Multiboot FAT (64 MB, volatile RAM)")
+        boot(work, "fat12-module-legacy", fat12, True, "Multiboot FAT (1 MB, volatile RAM)",
+             cpu="pentium")
         for label, image in [("fat12", fat12), ("fat16", fat16), ("fat32", fat32)]:
             boot(work, label + "-lfn", image, True, "Multiboot FAT", "ROOTTEST.BAT", "LFN-ALL-OK",
                  memory=32 if label == "fat12" else 256)

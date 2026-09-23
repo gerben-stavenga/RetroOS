@@ -3,6 +3,44 @@
 Release builds retain panic diagnostics. Kernel panics display the message,
 source location, and stack trace on the console and mirror them to the log.
 
+## USB / CD boot: retroos_grub_module.iso
+
+This hybrid ISO boots through either legacy BIOS or UEFI. Write the ISO as a
+whole-device image using your USB imaging tool (writing it erases that USB
+stick), or attach it as a virtual CD. Merely copying the ISO onto a FAT drive
+does not make the drive bootable. Start with 256 MiB RAM; 512 MiB is recommended
+for the base-plus-games menu. The base-only submenu uses less RAM.
+
+GRUB loads the kernel and filesystem images into RAM before handing control to
+RetroOS. This works for USB boot even though RetroOS itself has no USB
+mass-storage driver. The USB stick is not a persistence destination. Firmware
+chooses BIOS or UEFI before GRUB starts; GRUB cannot change that firmware mode.
+
+The default entry protects physical disks: reads use their existing contents,
+while writes are diverted to RAM and disappear on reboot. Choose **persistent
+disk** to write to the selected data disk. On BIOS, each choice is available
+with native BIOS VGA or a VBE framebuffer; on UEFI it uses GOP. Both framebuffer
+choices use software VGA rendering. VBE is the BIOS equivalent of this display
+path, not GOP running under BIOS.
+
+## The same C: layout across boot sources
+
+A selected ext4 `/home/retroos` or FAT data volume supplies C:. With no data
+volume, the RAM image supplies C: instead. Booting from a USB RAM image no
+longer relegates the data disk to a read-only `/disk1` mount. Unselected extra
+disks still mount read-only there.
+
+- `C:\RETROOS` comes from the matching RAM image, EFI/FAT boot volume, or installed
+  release, and is read-only.
+- `C:\CONFIG` prefers files on the data disk. Missing files fall back to editable
+  RAM copies of the boot source's CONFIG defaults. Edits to fallback files last
+  for the session; existing data-disk files follow the chosen disk-write policy.
+- `C:\TEMP` is always in RAM and starts empty. TEMP and fallback CONFIG share a
+  sparse 32 MiB filesystem; memory is allocated as written.
+
+The boot source itself is not changed by config edits. RAM-backed game modules
+are used with RAM-backed C:; they do not cover games on a selected data disk.
+
 ## Virtual machine: retroos-vm.tar.gz
 
 Extract into a new directory and run `./run.sh`. Requires Linux, QEMU x86,
@@ -22,8 +60,8 @@ Give the guest at least 128 MiB RAM. The included launcher uses 512 MiB for UEFI
 
 When upgrading, extract the new release separately and copy only its `boot.img`
 over the old boot image while the VM is stopped. Keep your existing `data.img`.
-Never overwrite a persistent data disk with a fresh release seed. Data images
-are intentionally public-only: no proprietary games or toolchains are bundled.
+Never overwrite a persistent data disk with a fresh release seed. Data images use the repository's public content targets; the optional
+apps-proprietary collection is not bundled.
 
 ## Physical machine: retroos-machine.tar.gz
 
@@ -79,7 +117,7 @@ After updating RetroOS's installer, rerun preparation and installation to apply
 the generated video policy to an existing machine's GRUB entries.
 
 C:\RETROOS is read-only runtime. DN settings/history live in C:\CONFIG\DN;
-its temporary files live in C:\TEMP. Existing BOOT/DN or RETROOS/DN state is
+its temporary files live in RAM at C:\TEMP. Existing BOOT/DN or RETROOS/DN state is
 copied into the new location without overwriting existing settings. C:\CONFIG\CONFIG.SYS selects the startup program with
 START=C:\RETROOS\DN\DN.COM and optional arguments. It also selects DNSWP=C:\TEMP, TEMP=C:\TEMP, and DN=C:\CONFIG\DN in that order.
 

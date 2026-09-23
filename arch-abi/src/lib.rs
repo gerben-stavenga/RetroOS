@@ -138,8 +138,12 @@ impl BootModule {
     pub fn mount(&self) -> &[u8] { &self.mount[..self.mount_len] }
 }
 
-/// Backend-provided copy operation for a loader-owned physical range.
-pub type BootPhysicalReader = fn(u64, &mut [u8]) -> bool;
+/// Backend-provided read/write operations for loader-owned physical RAM.
+#[derive(Clone, Copy)]
+pub struct BootPhysicalIo {
+    pub read: fn(u64, &mut [u8]) -> bool,
+    pub write: fn(u64, &[u8]) -> bool,
+}
 
 
 /// Boot-time platform configuration, read once by the platform entry point and
@@ -199,8 +203,8 @@ pub struct BootConfig {
     pub serial_console_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
-    /// Metal's temporary physical-memory reader. Hosted entries leave this empty.
-    pub boot_physical_reader: Option<BootPhysicalReader>,
+    /// Metal's temporary physical-memory access. Hosted entries leave this empty.
+    pub boot_physical_io: Option<BootPhysicalIo>,
 }
 
 fn validate_mount_path(path: &[u8]) {
@@ -224,7 +228,7 @@ impl BootConfig {
             hostfs_port: None,
             serial_console_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
-            boot_physical_reader: None,
+            boot_physical_io: None,
         };
         // Default C: root = "home/retroos/".
         let d = *b"home/retroos/";

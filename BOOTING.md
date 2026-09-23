@@ -65,8 +65,18 @@ on the same ext4 filesystem as Linux `/`, as they do on this laptop.
 | `C:\RETROOS` | Matching boot runtime, read-only |
 | `C:\CONFIG\DN` | Persistent DN settings, history, desktop, menus |
 | `C:\CONFIG\LOADFIX.CFG` | Persistent COMMAND.COM launch policy |
-| `C:\TEMP` | Writable DN swap/flag/temporary files |
+| `C:\TEMP` | RAM-only DN swap/flag/temporary files |
 | `C:\CONFIG\CONFIG.SYS` | Persistent startup command and environment |
+
+All boot sources use the same composition. The selected ext4 `/home/retroos`
+or FAT root supplies `C:`. A RAM boot image, EFI/FAT boot volume, or installed
+release supplies read-only `C:\RETROOS` and optional `CONFIG` defaults.
+Disk config files take precedence by filename; missing files come from a
+writable RAM copy of the boot defaults. Changes to those fallback files last
+for the session; files already on the data disk follow its persistent or
+`ram-overlay` policy. Boot defaults are never overwritten.
+`C:\TEMP` is always empty at boot and RAM-backed. TEMP and fallback CONFIG
+share a sparse 32 MiB session filesystem, allocating memory as written.
 
 `C:\CONFIG\CONFIG.SYS` selects the startup program with
 `START=C:\RETROOS\DN\DN.COM`. Set another executable and optional arguments
@@ -163,8 +173,13 @@ the owner says.
 
 ## Booting GRUB Multiboot module images
 
-For a diskless boot, build `//:grub_module_iso`. Its GRUB menu contains a
-base-only entry and a base-plus-games entry. The module artifacts are raw ext4
+For a USB/CD boot, build `//:grub_module_iso`. Its GRUB menu contains protected
+and persistent disk choices for the base-plus-games image, plus a base-only
+submenu with the same choices for framebuffer video (GOP on UEFI,
+VBE on BIOS). BIOS boots also offer native BIOS VGA entries, selected by
+default; the framebuffer entries explicitly select software VGA rendering.
+UEFI boots default to GOP. Disk protection (`ram-overlay`) is the default in
+both firmware modes; select persistent disk to keep changes on the data disk. The module artifacts are raw ext4
 images, not partitioned disks; GRUB expands the reproducible gzip files before
 the Multiboot handoff:
 
@@ -179,13 +194,17 @@ The only module declaration is `retroos.mount=<absolute-vfs-path>`. Modules
 use replacement mounts, and the boot log derives the displayed volume identity
 from that path. Raw FAT12/16/32 images are accepted through exactly the same
 `retroos.mount=` declaration; there is no filesystem-type boot option.
-Each module has its own volatile RAM overlay; physical ext4/FAT
-fallback filesystems remain read-only at `/disk1`, `/disk2`, and so on.
+Each module is writable directly in its resident RAM. The base module supplies
+boot runtime and config defaults; physical ext4/FAT data volumes participate
+in the normal C: selection and follow the disk-write policy. Without a data
+disk, the base module supplies C: too. Extra modules such as GAMES mount only
+for this RAM-backed C:, so they cannot hide games on the selected data disk.
+Unselected physical filesystems remain read-only at `/disk1`, `/disk2`, and so on.
 
 Module images remain resident in the physical RAM where GRUB loaded them, but
 they are not permanently mapped into a size-matched kernel virtual window.
-Reads use a reusable 64 KiB physical aperture immediately below the
-framebuffer. Legacy 32-bit paging and PAE both support module reads; available
+Reads and writes use a reusable 64 KiB physical aperture immediately below the
+framebuffer. Legacy 32-bit paging and PAE both support module access; available
 physical RAM and the Multiboot address format remain the practical limits.
 Boot directly with QEMU, for example:
 
@@ -212,8 +231,8 @@ This keeps a separate EFI system partition from displacing an installed DOS
 root. GRUB's kernel location does not override this root-selection policy.
 
 A selected physical FAT root is writable; FAT has no Unix ownership/group
-grant. Use `ram-overlay` to keep physical writes volatile. FAT modules always
-use volatile overlays, and secondary disk mounts remain read-only.
+grant. Use `ram-overlay` to keep physical writes volatile. FAT modules write
+directly to their volatile RAM, and secondary disk mounts remain read-only.
 
 FAT directory entries expose both the long name and the stored 8.3 alias.
 VFS uses exact names on every storage format; DOS case folding belongs to

@@ -1,4 +1,4 @@
-//! Reusable temporary mapping for copying from physical memory.
+//! Reusable temporary mapping for copying to and from physical memory.
 //!
 //! The aperture is a fixed virtual window below the framebuffer.  It is
 //! remapped to one 64 KiB physical chunk at a time and is intentionally
@@ -81,51 +81,55 @@ fn request_remap(base: u64) -> bool {
 }
 
 /// Copy bytes from physical memory into a kernel buffer.
-///
-/// This is task-context-only.  Interrupt handlers must not call it because
-/// the aperture is a single shared mapping and the copy is serialized only
-/// against other callers of this function.
+/// Task context only: callers share a serialized aperture with physical writes.
 pub fn copy_from_physical(physical: u64, destination: &mut [u8]) -> bool {
-    if destination.is_empty() {
+    copy_physical(physical, destination.as_mut_ptr(), destination.len(), false)
+}
+
+/// Copy bytes from a kernel buffer into loader-owned physical RAM.
+/// Task context only; interrupt handlers must not use the shared aperture.
+pub fn copy_to_physical(physical: u64, source: &[u8]) -> bool {
+    copy_physical(physical, source.as_ptr() as *mut u8, source.len(), true)
+}
+
+fn copy_physical(physical: u64, buffer: *mut u8, len: usize, write: bool) -> bool {
+    if len == 0 {
         return true;
     }
-
-    let destination_start = destination.as_mut_ptr() as usize;
-    let destination_end = match destination_start.checked_add(destination.len()) {
+    let buffer_start = buffer as usize;
+    let buffer_end = match buffer_start.checked_add(len) {
         Some(end) => end,
         None => return false,
     };
-    assert!(destination_end <= APERTURE_BASE || destination_start >= APERTURE_END,
-        "physical aperture copy destination overlaps the aperture");
+    if physical.checked_add(len as u64).is_none() {
+        return false;
+    }
+    assert!(buffer_end <= APERTURE_BASE || buffer_start >= APERTURE_END,
+        "physical aperture copy buffer overlaps the aperture");
 
     let mut physical = physical;
     let mut copied = 0usize;
-    while copied < destination.len() {
+    while copied < len {
         let base = physical & !(APERTURE_SIZE as u64 - 1);
         let offset = (physical - base) as usize;
-        let amount = (destination.len() - copied).min(APERTURE_SIZE - offset);
+        let amount = (len - copied).min(APERTURE_SIZE - offset);
         let _guard = acquire();
-
         if cached_base() != Some(base) {
             if !request_remap(base) {
                 return false;
             }
             set_cached_base(base);
         }
-
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                (APERTURE_BASE + offset) as *const u8,
-                destination.as_mut_ptr().add(copied),
-                amount,
-            );
+            let aperture = (APERTURE_BASE + offset) as *mut u8;
+            if write {
+                core::ptr::copy_nonoverlapping(buffer.add(copied), aperture, amount);
+            } else {
+                core::ptr::copy_nonoverlapping(aperture, buffer.add(copied), amount);
+            }
         }
-
         copied += amount;
-        physical = match physical.checked_add(amount as u64) {
-            Some(next) => next,
-            None => return false,
-        };
+        physical += amount as u64;
     }
     true
 }

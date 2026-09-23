@@ -15,12 +15,50 @@ ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin'))
 
 
+def check_usb(work):
+    iso = OUTPUT / 'retroos_grub_module.iso'
+    assert iso.is_file()
+    for firmware in ('bios', 'uefi'):
+        log = work / f'usb-{firmware}.log'
+        args = ['qemu-system-x86_64', '-m', '512', '-cdrom', str(iso),
+                '-boot', 'order=d', '-display', 'none', '-no-reboot',
+                '-debugcon', 'file:' + str(log),
+                '-fw_cfg', 'name=opt/cmdline,string=TESTS/HELLO.COM']
+        if firmware == 'bios':
+            args += ['-cpu', 'pentium3']
+        else:
+            import shutil
+            variables = work / 'usb-vars.fd'
+            shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', variables)
+            args += ['-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd',
+                     '-drive', f'if=pflash,format=raw,file={variables}']
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and proc.poll() is None:
+                text = log.read_text(errors='replace') if log.exists() else ''
+                if any(marker in text for marker in ('Hello from HELLO.COM!', 'PANIC')):
+                    break
+                time.sleep(.1)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=10)
+        text = log.read_text(errors='replace')
+        assert 'Hello from HELLO.COM!' in text and 'PANIC' not in text, text
+        assert 'Disk writes: volatile RAM overlay' in text, text
+        expected = 'vga_passthrough=true firmware=NativeBios' if firmware == 'bios' else 'vga_passthrough=false firmware=Substitute'
+        assert expected in text, text
+        print(f'PASS: published USB/CD ISO {firmware}, protected default, RAM C:')
+
+
 def main():
     for line in (OUTPUT / 'SHA256SUMS').read_text().splitlines():
         expected, name = line.split()
         assert hashlib.file_digest((OUTPUT / name).open('rb'), 'sha256').hexdigest() == expected, name
     with tempfile.TemporaryDirectory(prefix='retroos-release-test-') as temp:
         work = Path(temp)
+        check_usb(work)
         vm, machine = work / 'vm', work / 'machine'
         for name, dest in [('vm', vm), ('machine', machine)]:
             with tarfile.open(OUTPUT / f'retroos-{name}.tar.gz') as archive:
@@ -35,7 +73,7 @@ def main():
             assert forbidden not in listing, forbidden
         with tarfile.open(machine / 'machine_boot.tar') as archive:
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
-            assert {'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM', 'RETROOS/DN/DN.COM'} <= names
+            assert {'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM', 'RETROOS/DN/DN.COM', 'CONFIG/CONFIG.SYS'} <= names
             assert 'RETROOS/DN/DN.HIS' not in names and 'RETROOS/DN/DN.FLG' not in names
             kernel = next(member for member in archive.getmembers()
                           if member.name.removeprefix('./') == 'kernel.elf')

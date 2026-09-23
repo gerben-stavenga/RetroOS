@@ -650,6 +650,10 @@ impl Vfs {
             mode,
             access: WriteAccess::Delegated,
         });
+        // Startup may inspect CONFIG before adding runtime/host mounts.
+        // Cached directory entries also carry mount indices, which Replace
+        // can shift even when a cached path is outside the replaced subtree.
+        self.invalidate_dir_cache();
     }
 
     fn mount(&mut self, prefix: &'static [u8], fs: &'static dyn Filesystem) {
@@ -2332,6 +2336,22 @@ mod tests {
         assert_eq!(vfs.delete(b"RETROOS/COMMAND.COM"), -13);
         assert_eq!(vfs.delete(b"RETROOS/DN.HIS"), 0);
         assert!(!vfs.path_exists(b"RETROOS/DN.HIS"));
+    }
+
+    #[test]
+    fn adding_a_mount_after_lookup_refreshes_directory_entries() {
+        let root = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let host = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let file = host.create(b"COMMAND.C").unwrap();
+        host.clunk(file.handle);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", root);
+        assert!(!vfs.path_exists(b"host/COMMAND.C"));
+        vfs.mount(b"host/", host);
+        assert!(vfs.path_exists(b"host/COMMAND.C"));
+        assert!(!vfs.path_exists(b"CONFIG/COMMAND.C"));
+        vfs.bind(b"CONFIG/", b"host/", super::MountMode::Replace);
+        assert!(vfs.path_exists(b"CONFIG/COMMAND.C"));
     }
 
     #[test]

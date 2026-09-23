@@ -314,7 +314,10 @@ unsafe fn prepare_boot(
     // the later handoff has produced it.
     config.boot_modules = boot_modules;
     if config.boot_modules.iter().any(Option::is_some) {
-        config.boot_physical_reader = Some(arch::aperture::copy_from_physical);
+        config.boot_physical_io = Some(arch_abi::BootPhysicalIo {
+            read: arch::aperture::copy_from_physical,
+            write: arch::aperture::copy_to_physical,
+        });
     }
 
     // Diagnostic: with IF still 0, dump the timer chain to the VGA console so a

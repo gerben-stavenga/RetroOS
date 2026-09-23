@@ -99,7 +99,7 @@ jobs:
           python3 test/release.py
           # Later host-platform builds change the bazel-bin symlink.
           mkdir -p build/release
-          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/SHA256SUMS build/release/
+          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module.iso bazel-bin/SHA256SUMS build/release/
 
       # clippy runs under -D warnings via the rules_rust aspect (--config=clippy),
       # so any diagnostic fails the build. Metal crates lint on the default
@@ -171,6 +171,7 @@ jobs:
           path: |
             build/release/retroos-vm.tar.gz
             build/release/retroos-machine.tar.gz
+            build/release/retroos_grub_module.iso
             build/release/SHA256SUMS
           if-no-files-found: error
           compression-level: 0

@@ -6,12 +6,10 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-use alloc::string::ToString;
 use alloc::vec::Vec;
 
 use crate::kernel::block::{Disk, Volume};
 use crate::kernel::fs::disk::FilesystemVolume;
-use crate::kernel::{console::Console, vfs};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -186,53 +184,16 @@ pub(crate) fn handoff_modules(
     result
 }
 
-/// Keep physical filesystems available below a module-owned root without
-/// allowing them to replace `/`. The mount-table slot and visible disk number
-/// are intentionally independent.
-pub(crate) fn mount_physical_fallbacks(
-    volumes: &[FilesystemVolume],
-    first_slot: usize,
-    max_slots: usize,
-    screen: &mut Console,
-) -> usize {
-    let mut slot = first_slot;
-    for (disk_number, volume) in (1usize..).zip(volumes.iter()) {
-        if slot >= max_slots {
-            break;
-        }
-        let mut prefix = Vec::new();
-        prefix.extend_from_slice(b"disk");
-        prefix.extend_from_slice(disk_number.to_string().as_bytes());
-        prefix.push(b'/');
-        let prefix: &'static [u8] = Box::leak(prefix.into_boxed_slice());
-        match volume.open(false) {
-            Ok(fs) => {
-                vfs::mount_readonly(prefix, Box::leak(fs));
-                crate::screenln!(
-                    screen,
-                    "portable {} partition ({} MB) → /{}",
-                    volume.name(),
-                    volume.volume.sectors / 2048,
-                    core::str::from_utf8(&prefix[..prefix.len() - 1]).unwrap_or("?")
-                );
-                slot += 1;
-            }
-            Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", volume.name(), error),
-        }
-    }
-    slot
-}
-
 pub struct ModuleDisk {
     physical_start: u64,
     len: usize,
-    read_physical: arch_abi::BootPhysicalReader,
+    physical_io: arch_abi::BootPhysicalIo,
 }
 
 impl ModuleDisk {
     pub fn from_boot_module(
         module: arch_abi::BootModule,
-        read_physical: arch_abi::BootPhysicalReader,
+        physical_io: arch_abi::BootPhysicalIo,
     ) -> Option<Self> {
         if module.len == 0 || !module.len.is_multiple_of(512) {
             return None;
@@ -240,7 +201,7 @@ impl ModuleDisk {
         Some(Self {
             physical_start: module.physical_start,
             len: module.len,
-            read_physical,
+            physical_io,
         })
     }
 }
@@ -249,7 +210,7 @@ impl Disk for ModuleDisk {
     fn read(&self, lba: u64, buf: &mut [u8]) -> u32 {
         let want = buf.len().div_ceil(512) as u64;
         let n = self.sectors().saturating_sub(lba).min(want);
-        let count = n as usize * 512;
+        let count = (n as usize * 512).min(buf.len());
         if count != 0 {
             let offset = lba
                 .checked_mul(512)
@@ -259,15 +220,26 @@ impl Disk for ModuleDisk {
                 .checked_add(offset)
                 .expect("Multiboot module physical offset overflow");
             assert!(
-                (self.read_physical)(physical, &mut buf[..count]),
+                (self.physical_io.read)(physical, &mut buf[..count]),
                 "Multiboot module physical read failed"
             );
         }
         buf[count..].fill(0);
         n as u32
     }
-    fn write(&self, _: u64, _: &[u8]) -> u32 {
-        0
+    fn write(&self, lba: u64, buf: &[u8]) -> u32 {
+        let want = buf.len().div_ceil(512) as u64;
+        let n = self.sectors().saturating_sub(lba).min(want);
+        let count = (n as usize * 512).min(buf.len());
+        if count != 0 {
+            let offset = lba.checked_mul(512)
+                .expect("Multiboot module LBA offset overflow");
+            let physical = self.physical_start.checked_add(offset)
+                .expect("Multiboot module physical offset overflow");
+            assert!((self.physical_io.write)(physical, &buf[..count]),
+                "Multiboot module physical write failed");
+        }
+        n as u32
     }
     fn sectors(&self) -> u64 {
         (self.len / 512) as u64
@@ -277,86 +249,35 @@ impl Disk for ModuleDisk {
     }
 }
 
-pub struct ModuleMountSummary {
-    pub has_root: bool,
-    pub next_fs_slot: usize,
+pub struct ModuleVolumes {
+    pub root: Option<FilesystemVolume>,
+    pub extra: Vec<(arch_abi::BootModule, FilesystemVolume)>,
 }
 
-/// Mount each module as an independent volatile writable session. Raw ext4/FAT
-/// images are treated as whole disks; partition scanning is intentionally not
-/// used for this boot-only format.
-pub fn mount_modules(
-    boot: &crate::BootConfig,
-    screen: &mut Console,
-    first_slot: usize,
-) -> ModuleMountSummary {
+/// Decode the transport without imposing a separate root-selection policy.
+pub fn module_volumes(boot: &crate::BootConfig) -> ModuleVolumes {
     let modules: Vec<_> = boot.boot_modules.iter().flatten().copied().collect();
     for (i, a) in modules.iter().enumerate() {
         for b in modules.iter().skip(i + 1) {
             assert!(a.mount() != b.mount(), "duplicate retroos.mount path");
         }
     }
-    let mut slot = first_slot;
-    let mut has_root = false;
-    let reader = if modules.is_empty() {
-        None
-    } else {
-        Some(
-            boot.boot_physical_reader
-                .expect("Multiboot modules require a physical-memory reader"),
-        )
-    };
+    let mut result = ModuleVolumes { root: None, extra: Vec::new() };
     for module in modules {
-        assert!(slot < 8, "too many filesystem mounts (maximum 8)");
-        let disk = ModuleDisk::from_boot_module(module, reader.expect("missing module reader"))
+        let disk = ModuleDisk::from_boot_module(module, boot.boot_physical_io
+            .expect("Multiboot modules require physical-memory access"))
             .expect("invalid Multiboot module");
         let disk: &'static dyn Disk = Box::leak(Box::new(disk));
-        let disk: &'static dyn Disk = Box::leak(Box::new(
-            crate::kernel::block::overlay::RamOverlay::wrap(disk),
-        ));
         let volume = crate::kernel::block::cache::volume(Volume::whole(disk));
         let filesystem = FilesystemVolume::probe(volume)
             .expect("Multiboot module is not a raw ext4/FAT image");
-        let fs = filesystem.open(true)
-            .unwrap_or_else(|error| lib::compact_panic!("Multiboot filesystem mount failed: {}", error));
-        let fs: &'static dyn vfs::Filesystem = Box::leak(fs);
-        let mount = module.mount();
-        let mount: &'static [u8] = Box::leak(mount.to_vec().into_boxed_slice());
-        if mount.is_empty() {
-            crate::kernel::dos::set_c_root(filesystem.c_root(boot));
-        }
-        filesystem.mount_writable(
-            mount,
-            fs,
-            if mount.is_empty() {
-                crate::kernel::dos::c_root()
-            } else {
-                b""
-            },
-        );
-        if mount.is_empty() {
-            crate::screenln!(
-                screen,
-                "Multiboot {} ({} MB, volatile overlay) → /",
-                filesystem.name(),
-                volume.sectors / 2048
-            );
+        if module.mount().is_empty() {
+            result.root = Some(filesystem);
         } else {
-            crate::screenln!(
-                screen,
-                "Multiboot {} ({} MB, volatile overlay) → /{}",
-                filesystem.name(),
-                volume.sectors / 2048,
-                core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?")
-            );
+            result.extra.push((module, filesystem));
         }
-        has_root |= mount.is_empty();
-        slot += 1;
     }
-    ModuleMountSummary {
-        has_root,
-        next_fs_slot: slot,
-    }
+    result
 }
 
 #[cfg(test)]
@@ -507,6 +428,49 @@ mod tests {
         true
     }
 
+    fn host_physical_io() -> arch_abi::BootPhysicalIo {
+        arch_abi::BootPhysicalIo {
+            read: read_host_physical,
+            write: |physical, source| {
+                unsafe {
+                    core::ptr::copy_nonoverlapping(source.as_ptr(), physical as *mut u8, source.len());
+                }
+                true
+            },
+        }
+    }
+
+    #[test]
+    fn module_disk_writes_original_ram_and_clamps_bounds() {
+        let mut image = [0x11u8; 1024];
+        let module = arch_abi::BootModule::new(image.as_mut_ptr() as u64, image.len(),
+            [0; arch_abi::BOOT_MODULE_MOUNT_MAX], 0);
+        let disk = ModuleDisk::from_boot_module(module, host_physical_io()).unwrap();
+        assert_eq!(disk.write(1, &[0x22; 1024]), 1);
+        assert_eq!(&image[..512], &[0x11; 512]);
+        assert_eq!(&image[512..], &[0x22; 512]);
+        assert_eq!(disk.write(0, &[0x33; 3]), 1);
+        assert_eq!(&image[..4], &[0x33, 0x33, 0x33, 0x11]);
+        let mut output = [0; 3];
+        assert_eq!(disk.read(0, &mut output), 1);
+        assert_eq!(output, [0x33; 3]);
+        assert_eq!(disk.write(u64::MAX, &[0x44; 512]), 0);
+        assert_eq!(disk.write(0, &[]), 0);
+        assert_eq!(disk.read(u64::MAX, &mut output), 0);
+        assert_eq!(output, [0; 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "Multiboot module physical write failed")]
+    fn module_disk_reports_writer_failure() {
+        let module = arch_abi::BootModule::new(0x1000, 512,
+            [0; arch_abi::BOOT_MODULE_MOUNT_MAX], 0);
+        let disk = ModuleDisk::from_boot_module(module, arch_abi::BootPhysicalIo {
+            write: |_, _| false, ..host_physical_io()
+        }).unwrap();
+        disk.write(0, &[0; 512]);
+    }
+
     fn fail_physical_read(_: u64, _: &mut [u8]) -> bool {
         false
     }
@@ -516,12 +480,11 @@ mod tests {
         static IMAGE: [u8; 1024] = [0x11; 1024];
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
         let module = arch_abi::BootModule::new(IMAGE.as_ptr() as u64, IMAGE.len(), mount, 0);
-        let disk = ModuleDisk::from_boot_module(module, read_host_physical).unwrap();
+        let disk = ModuleDisk::from_boot_module(module, host_physical_io()).unwrap();
         let mut output = [0xff; 1024];
         assert_eq!(disk.read(1, &mut output), 1);
         assert_eq!(output[0], 0x11);
         assert!(output[512..].iter().all(|&byte| byte == 0));
-        assert_eq!(disk.write(0, &output), 0);
     }
 
     #[test]
@@ -529,7 +492,7 @@ mod tests {
         static IMAGE: [u8; 2048] = [0x22; 2048];
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
         let module = arch_abi::BootModule::new(IMAGE.as_ptr() as u64 - 512, IMAGE.len(), mount, 0);
-        let disk = ModuleDisk::from_boot_module(module, read_host_physical).unwrap();
+        let disk = ModuleDisk::from_boot_module(module, host_physical_io()).unwrap();
         let mut output = [0xff; 512];
         assert_eq!(disk.read(1, &mut output), 1);
         assert!(output.iter().all(|&byte| byte == 0x22));
@@ -540,7 +503,7 @@ mod tests {
     fn module_disk_reports_reader_failure() {
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
         let module = arch_abi::BootModule::new(0x1000, 512, mount, 0);
-        let disk = ModuleDisk::from_boot_module(module, fail_physical_read).unwrap();
+        let disk = ModuleDisk::from_boot_module(module, arch_abi::BootPhysicalIo { read: fail_physical_read, ..host_physical_io() }).unwrap();
         let mut output = [0u8; 512];
         let _ = disk.read(0, &mut output);
     }
@@ -550,7 +513,7 @@ mod tests {
     fn module_disk_rejects_physical_offset_overflow() {
         let mount = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
         let module = arch_abi::BootModule::new(u64::MAX, 1024, mount, 0);
-        let disk = ModuleDisk::from_boot_module(module, read_host_physical).unwrap();
+        let disk = ModuleDisk::from_boot_module(module, host_physical_io()).unwrap();
         let mut output = [0u8; 512];
         let _ = disk.read(1, &mut output);
     }

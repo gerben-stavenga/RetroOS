@@ -109,6 +109,7 @@ genrule(
 
 # Runtime files are separate from the persistent DN defaults in DATA_FILES.
 _BOOT_DIR_FILES = dict(BOOT_FILES)
+_BOOT_CONFIG_FILES = {k: v for k, v in DATA_FILES.items() if v.startswith("CONFIG/")}
 
 # Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
 # source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
@@ -577,13 +578,13 @@ sh_binary(
 # kernel, so it belongs with the kernel. Paths already carry the RETROOS/ prefix.
 pkg_tar(
     name = "boot_dir_tar",
-    files = _BOOT_DIR_FILES,
+    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
 )
 
 # One build target keeps the installed kernel and all runtime files matched.
 pkg_tar(
     name = "machine_boot_tar",
-    files = BOOT_FILES | {"//kernel:kernel_elf": "kernel.elf"},
+    files = BOOT_FILES | _BOOT_CONFIG_FILES | {"//kernel:kernel_elf": "kernel.elf"},
 )
 
 # The data manifest declares lifetime explicitly, including any writable
@@ -741,13 +742,13 @@ pkg_tar(
 
 genrule(
     name = "release_checksums",
-    srcs = [":release_vm", ":release_machine"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_iso"],
     outs = ["SHA256SUMS"],
-    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) | sed 's|  .*/|  |' > $@",
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_iso) | sed 's|  .*/|  |' > $@",
 )
 
 filegroup(
     name = "release",
-    srcs = [":release_vm", ":release_machine", ":release_checksums"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":release_checksums"],
     visibility = ["//visibility:public"],
 )

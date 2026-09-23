@@ -486,7 +486,7 @@ fn prepare_storage<A: crate::Arch>(
     }
     crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
-    let modules = crate::multiboot::mount_modules(boot, screen, 0);
+    let modules = crate::multiboot::module_volumes(boot);
     let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, modules, boot);
     screen.present(machine, bios_workspace);
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
@@ -592,187 +592,190 @@ fn prefix(parts: &[&[u8]]) -> &'static [u8] {
     alloc::boxed::Box::leak(parts.concat().into_boxed_slice())
 }
 
-/// Build the namespace from the selected volumes and explicit install paths.
+/// Compose the same C: layout for a RAM boot image, an EFI/FAT boot volume,
+/// and an installed runtime. Data CONFIG wins per file; boot defaults are
+/// copied into session RAM so editing a fallback never changes the boot media.
+fn mount_boot_directories(
+    c_root: &'static [u8],
+    data_home: Option<&'static [u8]>,
+    boot_source: Option<(&'static dyn vfs::Filesystem, &'static [u8], &'static [u8])>,
+    screen: &mut crate::kernel::console::Console,
+) {
+    let session: &'static dyn vfs::Filesystem =
+        alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+    assert_eq!(session.mkdir(b"TEMP"), 0);
+    assert_eq!(session.mkdir(b"CONFIG"), 0);
+    if let Some((fs, runtime, config)) = boot_source {
+        vfs::mount_readonly(b"bootfs/", fs);
+        vfs::bind(prefix(&[c_root, b"RETROOS/"]), prefix(&[b"bootfs/", runtime]));
+        if !crate::kernel::fs::session::copy_defaults(
+            fs, config.strip_suffix(b"/").unwrap_or(config), session, b"CONFIG") {
+            crate::compact_screenln!(screen, "Boot CONFIG defaults could not be copied completely");
+        }
+        crate::compact_screenln!(screen, "boot runtime → C:\\RETROOS (read-only)");
+    }
+    vfs::mount(b"sessionfs/", session);
+    vfs::bind(prefix(&[c_root, b"TEMP/"]), b"sessionfs/TEMP/");
+    let config = prefix(&[c_root, b"CONFIG/"]);
+    vfs::bind(config, b"sessionfs/CONFIG/");
+    // The alias goes through the data mount's normal write grants and avoids
+    // recursively resolving back through C:\CONFIG itself.
+    if let Some(home) = data_home {
+        let source = prefix(&[home, b"CONFIG/"]);
+        if vfs::stat(source, true).is_some_and(|stat| stat.is_dir) {
+            vfs::bind_union(config, source);
+        }
+    }
+    crate::compact_screenln!(screen, "C:\\CONFIG: disk files before boot defaults; C:\\TEMP: RAM");
+}
+
+/// Build one namespace from physical volumes and optional RAM boot content.
 #[inline(never)]
 fn mount_filesystems(
     parts: &[crate::kernel::block::partition::Partition],
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
-    modules: crate::multiboot::ModuleMountSummary,
+    modules: crate::multiboot::ModuleVolumes,
     boot: &crate::BootConfig,
 ) -> bool {
     use crate::kernel::block::partition::PartKind;
+    use alloc::boxed::Box;
 
-    // Ask the filesystem, not the partition's type byte or GUID.
     crate::compact_screenln!(screen, "Filesystems: probing ext4/FAT volumes...");
-    let volumes: alloc::vec::Vec<_> = parts
-        .iter()
+    let mut volumes: alloc::vec::Vec<_> = parts.iter()
         .filter(|p| p.kind != PartKind::BootBundle)
-        .map(|p| p.volume)
-        .map(crate::kernel::block::cache::volume)
-        .filter_map(FilesystemVolume::probe)
-        .collect();
+        .map(|p| crate::kernel::block::cache::volume(p.volume))
+        .filter_map(FilesystemVolume::probe).collect();
     crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
-
-    let mut hostfs_is_root = false;
-    if boot.root_uuid.is_some() && (modules.has_root || volumes.is_empty()) {
-        lib::compact_panic!("Explicit disk root unavailable or conflicts with module root");
+    // Physical data wins the same evidence-based selection used on disk boots.
+    // The module root remains available as a fallback and as the boot source.
+    let module_index = modules.root.map(|volume| {
+        let index = volumes.len();
+        volumes.push(volume);
+        index
+    });
+    if boot.root_uuid.is_some() && volumes.is_empty() {
+        lib::compact_panic!("Configured root UUID not found");
     }
     if boot.runtime().is_some() && boot.root_uuid.is_none() {
         lib::compact_panic!("retroos.runtime requires retroos.root");
     }
-    if modules.has_root {
-        // A Multiboot root owns `/`; physical filesystems remain available as
-        // read-only fallback mounts below `/diskN`.
-        crate::multiboot::mount_physical_fallbacks(
-            &volumes,
-            modules.next_fs_slot,
-            MAX_DISK_MOUNTS,
-            screen,
-        );
-        if hostfs {
-            vfs::mount(b"host/", host_fs());
-            crate::compact_screenln!(screen, "hostfs: mounted at /host");
-        }
-    } else if volumes.is_empty() {
-        // No module or disk filesystem: the host fs is the root if available.
-        if hostfs {
-            vfs::mount(b"", host_fs());
-            // Keep the DOS H: mapping stable even when hostfs is also `/`.
-            vfs::mount(b"host/", host_fs());
-            crate::compact_screenln!(screen, "hostfs: mounted as root");
-            hostfs_is_root = true;
-        } else {
-            lib::compact_panic!("No root filesystem available");
-        }
+    let mut hostfs_is_root = false;
+    if volumes.is_empty() {
+        if !hostfs { lib::compact_panic!("No root filesystem available"); }
+        vfs::mount(b"", host_fs());
+        vfs::mount(b"host/", host_fs());
+        vfs::mount(b"dosfs/", host_fs());
+        let c_root = prefix(&[boot.c_root()]);
+        mount_boot_directories(c_root, Some(prefix(&[b"dosfs/", c_root])), None, screen);
+        crate::compact_screenln!(screen, "hostfs: mounted as root");
+        hostfs_is_root = true;
     } else {
         let plan = plan_mounts(&volumes, boot);
         let root = plan.unix_root;
         let root_volume = volumes[root];
-        crate::compact_screenln!(screen,
-            "Mounting {} root ({} MB)...", root_volume.name(), root_volume.volume.sectors / 2048);
-        let fs = root_volume.open(true)
-            .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error));
-        crate::compact_screenln!(screen, "{} root mounted", root_volume.name());
-        let fs: &'static dyn vfs::Filesystem = alloc::boxed::Box::leak(fs);
-
-        // Where C: lands. One volume holding both jobs keeps the mapping it
-        // declares (ext4 → its home subdirectory, FAT → its own root). A
-        // separate C: volume mounts AT that same path, so every absolute DOS
-        // path is unchanged by the split — which matters because installers
-        // bake C:\... into their configs at install time.
-        let c_root: &'static [u8] = match plan.dos_drive {
-            Some(dos) if dos != root => {
-                let home = boot.c_root();
-                let home: &'static [u8] = if home.is_empty() {
-                    b"home/retroos/"
-                } else {
-                    prefix(&[home])
-                };
-                let dos_volume = volumes[dos];
-                match dos_volume.open(true) {
-                    Ok(dos_fs) => {
-                        let dos_fs: &'static dyn vfs::Filesystem =
-                            alloc::boxed::Box::leak(dos_fs);
-                        dos_volume.mount_writable(home, dos_fs, b"");
-                        crate::screenln!(screen, "{} C: ({} MB) → /{}",
-                            dos_volume.name(), dos_volume.volume.sectors / 2048,
-                            core::str::from_utf8(home).unwrap_or("?"));
-                        home
-                    }
-                    // The root is already up; losing C: is not fatal, but it
-                    // is never silent -- every DOS path would fail otherwise.
-                    Err(error) => {
-                        crate::compact_screenln!(screen, "C: mount failed: {}", error);
-                        prefix(&[root_volume.c_root(boot)])
-                    }
-                }
-            }
-            // One volume holds both jobs (an installed machine), or there is
-            // no separate C: at all. Leaked so the prefix outlives `boot`.
-            _ => prefix(&[root_volume.c_root(boot)]),
+        let fs: &'static dyn vfs::Filesystem = Box::leak(root_volume.open(plan.boot_support != Some(root))
+            .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error)));
+        if module_index == Some(root) {
+            crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /",
+                root_volume.name(), root_volume.volume.sectors / 2048);
+        } else {
+            crate::screenln!(screen, "Mounting {} root ({} MB)...",
+                root_volume.name(), root_volume.volume.sectors / 2048);
+        }
+        let dos = plan.dos_drive.unwrap_or(root);
+        let dos_volume = volumes[dos];
+        let dos_fs = if dos == root { fs } else {
+            Box::leak(dos_volume.open(true)
+                .unwrap_or_else(|error| lib::compact_panic!("C: mount failed: {}", error)))
+                as &'static dyn vfs::Filesystem
+        };
+        let data_subdir = dos_volume.c_root(boot);
+        let c_root = if dos == root { prefix(&[data_subdir]) } else {
+            prefix(&[if boot.c_root().is_empty() { b"home/retroos/" } else { boot.c_root() }])
         };
         crate::kernel::dos::set_c_root(c_root);
-        // Ext4 writes use the group owning RetroOS's home; FAT has no Unix
-        // ownership and delegates writes. Extra mounts are explicitly read-only.
-        root_volume.mount_writable(b"", fs, crate::kernel::dos::c_root());
+        if plan.boot_support == Some(root) {
+            vfs::mount_readonly(b"", fs);
+        } else {
+            root_volume.mount_writable(b"", fs, root_volume.c_root(boot));
+        }
+        if plan.boot_support == Some(dos) {
+            vfs::mount_readonly(b"dosfs/", dos_fs);
+        } else {
+            dos_volume.mount_writable(b"dosfs/", dos_fs, data_subdir);
+        }
+        let data_home = prefix(&[b"dosfs/", data_subdir]);
+        if dos != root { vfs::bind(c_root, data_home); }
+        crate::screenln!(screen, "{} C: ({} MB) from {} → /{}",
+            dos_volume.name(), dos_volume.volume.sectors / 2048,
+            if module_index == Some(dos) { "RAM" } else { "disk" },
+            core::str::from_utf8(c_root).unwrap_or("?"));
 
-        // Runtime files are read-only. DN state and launch policy live under
-        // C:\CONFIG, so this is a replacement binding with no writable union.
-        if let Some(runtime) = boot.runtime() {
+        // Explicit installed runtime wins; otherwise RAM and EFI boot sources
+        // provide identical RETROOS + CONFIG roles.
+        let boot_source = if let Some(runtime) = boot.runtime() {
             let directory = &runtime[..runtime.len() - 1];
-            if !fs.dir_exists(directory) || !fs.dir_exists(&c_root[..c_root.len().saturating_sub(1)]) {
+            let data_directory = data_subdir.strip_suffix(b"/").unwrap_or(data_subdir);
+            if !fs.dir_exists(directory) || !dos_fs.dir_exists(data_directory) {
                 lib::compact_panic!("Configured runtime or C: directory is missing");
             }
-            // Reuse the same filesystem instance/cache, with a read-only mount
-            // policy. Binding a subtree needs no second path resolver.
-            vfs::mount_readonly(b"bootfs/", fs);
-            vfs::bind(prefix(&[c_root, b"RETROOS/"]), prefix(&[b"bootfs/", runtime]));
-            crate::screenln!(screen, "runtime /{} → C:\\RETROOS (read-only)",
-                core::str::from_utf8(directory).unwrap_or("?"));
-        } else if let Some(index) = plan.boot_support {
-            let boot_volume = volumes[index];
-            match boot_volume.open(false) {
-                Ok(boot_fs) => {
-                    vfs::mount_readonly(b"bootfs/", alloc::boxed::Box::leak(boot_fs));
-                    vfs::bind(prefix(&[c_root, b"RETROOS/"]), b"bootfs/RETROOS/");
-                    crate::screenln!(screen, "boot volume ({} MB) → C:\\RETROOS",
-                        boot_volume.volume.sectors / 2048);
-                }
-                Err(error) =>
-                    crate::compact_screenln!(screen, "boot volume skipped: {}", error),
-            }
-        }
+            let parent = directory.iter().rposition(|b| *b == b'/').map_or(b"".as_slice(), |i| &directory[..i + 1]);
+            Some((fs, prefix(&[runtime]), prefix(&[parent, b"CONFIG/"])))
+        } else if let Some(index) = module_index.or(plan.boot_support) {
+            let volume = volumes[index];
+            let source = if index == root { fs } else if index == dos { dos_fs } else {
+                Box::leak(volume.open(false)
+                    .unwrap_or_else(|error| lib::compact_panic!("boot source mount failed: {}", error)))
+                    as &'static dyn vfs::Filesystem
+            };
+            let home = if Some(index) == module_index { volume.c_root(boot) } else { b"" };
+            Some((source, prefix(&[home, b"RETROOS/"]), prefix(&[home, b"CONFIG/"])))
+        } else { None };
 
-        // Every other supported filesystem mounts read-only at /disk1, /disk2, …
-        // (Linux-visible, not under C:). An unreadable one is logged and
-        // skipped, never fatal — the root is already up.
-        let mut slot = modules.next_fs_slot;
-        for (i, vol) in volumes.iter().enumerate() {
-            if !plan.spares.contains(&i) {
+        // RAM content below C: is the diskless fallback; it must not hide
+        // disk games. Explicit modules outside C: keep their declared mounts.
+        for (module, volume) in modules.extra {
+            if module_index != Some(dos) && modules.root.is_some_and(|root|
+                module.mount().starts_with(root.c_root(boot))) {
                 continue;
             }
-            slot += 1;
-            if slot >= MAX_DISK_MOUNTS {
-                // Never drop a filesystem silently — say how many and why.
-                crate::compact_println!(
-                    "Filesystems: {} further partition(s) not mounted (limit {})",
-                    volumes.len() - i,
-                    MAX_DISK_MOUNTS
-                );
+            let mount = prefix(&[module.mount()]);
+            let extra = Box::leak(volume.open(true)
+                .unwrap_or_else(|error| lib::compact_panic!("module mount failed: {}", error)));
+            volume.mount_writable(mount, extra, b"");
+            crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /{}",
+                volume.name(), volume.volume.sectors / 2048,
+                core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?"));
+        }
+        mount_boot_directories(c_root, (plan.boot_support != Some(dos)).then_some(data_home), boot_source, screen);
+
+        let mut disk_number = 0;
+        for (i, volume) in volumes.iter().enumerate() {
+            if !plan.spares.contains(&i) || Some(i) == module_index { continue; }
+            disk_number += 1;
+            if disk_number >= MAX_DISK_MOUNTS {
+                crate::compact_println!("Filesystems: further partitions not mounted (limit {})", MAX_DISK_MOUNTS);
                 break;
             }
-            let mut prefix = alloc::vec::Vec::new();
-            prefix.extend_from_slice(b"disk");
-            prefix.push(b'0' + slot as u8);
-            prefix.push(b'/');
-            let prefix: &'static [u8] = alloc::boxed::Box::leak(prefix.into_boxed_slice());
-            match vol.open(false) {
+            let mount = prefix(&[b"disk", &[b'0' + disk_number as u8], b"/"]);
+            match volume.open(false) {
                 Ok(fs) => {
-                    vfs::mount_readonly(prefix, alloc::boxed::Box::leak(fs));
-                    crate::screenln!(
-                        screen,
-                        "portable {} partition ({} MB) → /disk{}",
-                        vol.name(),
-                        vol.volume.sectors / 2048,
-                        slot
-                    );
+                    vfs::mount_readonly(mount, Box::leak(fs));
+                    crate::screenln!(screen, "portable {} partition ({} MB) → /disk{}",
+                        volume.name(), volume.volume.sectors / 2048, disk_number);
                 }
-                Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", vol.name(), error),
+                Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", volume.name(), error),
             }
         }
-
         if hostfs {
             vfs::mount(b"host/", host_fs());
             crate::compact_screenln!(screen, "hostfs: mounted at /host");
         }
     }
-
-    // DOS paths use the same C: prefix with either a runtime binding or a direct tree.
     crate::compact_screenln!(screen, "DOS C: maps to /{}",
         core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
     mount_kernel_log_fs();
-
     crate::kernel::stacktrace::init_from_vfs();
     hostfs_is_root
 }
