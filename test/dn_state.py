@@ -97,10 +97,11 @@ def main():
             config = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.CFG"])
             assert b"STATECHECK" in history, history
             assert len(config) > 1000
-            run("mdir", "-i", disk, "::TEMP/DN.FLG")
+            temporary = subprocess.check_output(["mdir", "-i", str(disk), "::TEMP/"])
+            assert b"0 bytes" in temporary, temporary
             listing = subprocess.check_output(["mdir", "-i", str(disk), "::RETROOS/"])
             assert b"0 bytes" in listing, listing
-        print("PASS: real DN saves and reloads config/history separately; runtime directory stays empty on data disk")
+        print("PASS: real DN saves and reloads config/history separately; runtime and TEMP directories stay empty on data disk")
 
 
 if __name__ == "__main__":
