@@ -26,3 +26,10 @@ ADLIB=A388
 BLASTER=A220 I7 D1 H5 P330 T6
 ULTRASND=240,3,3,5,5
 ULTRADIR=C:\ULTRASND
+
+# ISA LPC forwarding (dISAppointment, opt in with the isa_lpc_disappointment
+# boot flag): overrides the sapphisa defaults (SB, MPU, OPL, PnP write-data)
+# below. Exactly 4 "base:mask:reg" hex triples, space separated -- the
+# Fintek bridge only decodes GEN1_DEC..GEN4_DEC, so there's no 5th slot.
+# Swap in a PicoGUS config port (1D0h) in place of the PnP write-data window:
+#LPC_RANGES=200:FC:20 300:70:23 388:1C:30 1D0:FC:60

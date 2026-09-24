@@ -21,14 +21,27 @@ impl<A: crate::Arch> Io for Hardware<'_, A> {
     fn out(&mut self, port: u16, value: u8) { self.0.outb(port, value); }
 }
 
-// Explicit desktop Intel 6/7-series IDs, not a vendor-only or numeric-range
-// match. Register layout: D31:F0 IO_EN at 82h, GENx_DEC at 84h..90h.
+// Explicit desktop Intel LPC controller IDs, not a vendor-only or numeric-range
+// match. Register layout: D31:F0 IO_EN at 82h, GENx_DEC at 84h..90h. This
+// layout is part of Intel's documented PCH spec and unchanged across the
+// generations below (confirmed against upstream sapphisa.c, which hits the
+// same D31:F0 offsets unconditionally); only the PCI device ID differs.
 // Cross-reference coreboot src/southbridge/intel/bd82x6x and
-// src/include/device/pci_ids.h. Other generations need separate validation.
+// src/include/device/pci_ids.h, and pci.ids for 8/9-series and X99.
+// X99 (Wellsburg, 8D40h-8D4Fh) shares one generic name across all 16 IDs in
+// pci.ids, so it's matched by range rather than discrete SKU IDs.
 fn supported(id: u32, class: u32) -> bool {
-    id as u16 == 0x8086 && class >> 16 == 0x0601 && matches!(id >> 16,
+    id as u16 == 0x8086 && class >> 16 == 0x0601 && (matches!(id >> 16,
+        // 6-series (Cougar Point)
         0x1C44 | 0x1C46 | 0x1C4A | 0x1C4C |
-        0x1E44 | 0x1E45 | 0x1E46 | 0x1E47 | 0x1E48 | 0x1E49 | 0x1E4A)
+        // 7-series (Panther Point)
+        0x1E44 | 0x1E45 | 0x1E46 | 0x1E47 | 0x1E48 | 0x1E49 | 0x1E4A |
+        // 8-series (Lynx Point): Z87, H87, Q87, B85
+        0x8C44 | 0x8C4A | 0x8C4E | 0x8C50 |
+        // 9-series (Wildcat Point): generic, Z97, H97
+        0x8CC1 | 0x8CC2 | 0x8CC4 | 0x8CC6)
+        // X99 (Wellsburg)
+        || matches!(id >> 16, 0x8D40..=0x8D4F))
 }
 
 // sapphisa defaults: SB/PnP address, MPU, OPL, PnP write-data.
@@ -43,7 +56,29 @@ const BRIDGE_REGS: [u8; 16] = [
 fn read(io: &mut impl Io, reg: u8) -> u8 { io.out(0x4E, reg); io.input(0x4F) }
 fn write(io: &mut impl Io, reg: u8, value: u8) { io.out(0x4E, reg); io.out(0x4F, value); }
 
-fn configure(io: &mut impl Io) -> &'static str {
+/// `LPC_RANGES=base:mask:reg base:mask:reg base:mask:reg base:mask:reg`
+/// (all hex, no `0x` prefix) — an owner's override for the four forwarded
+/// windows, e.g. to add a PicoGUS config port (1D0h) in place of a default
+/// nobody's card uses. Exactly 4 entries: the Fintek bridge only decodes
+/// GEN1_DEC..GEN4_DEC, so there is no slot for a 5th.
+fn parse_ranges(value: &[u8]) -> Option<[(u16, u8, u8); 4]> {
+    let mut out = [(0u16, 0u8, 0u8); 4];
+    let mut n = 0;
+    for token in value.split(|&b| b == b' ').filter(|t| !t.is_empty()) {
+        if n >= 4 { return None; }
+        let mut fields = token.split(|&b| b == b':');
+        let (Some(base), Some(mask), Some(reg), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else { return None };
+        let parse_u16 = |b: &[u8]| u16::from_str_radix(core::str::from_utf8(b).ok()?, 16).ok();
+        let parse_u8 = |b: &[u8]| u8::from_str_radix(core::str::from_utf8(b).ok()?, 16).ok();
+        out[n] = (parse_u16(base)?, parse_u8(mask)?, parse_u8(reg)?);
+        n += 1;
+    }
+    (n == 4).then_some(out)
+}
+
+fn configure(io: &mut impl Io, ranges: &[(u16, u8, u8); 4]) -> &'static str {
     if !supported(io.pci_read(0), io.pci_read(8)) {
         return "skipped: unsupported LPC chipset (requires listed Intel 6/7-series)";
     }
@@ -62,7 +97,7 @@ fn configure(io: &mut impl Io) -> &'static str {
     let old_pci = core::array::from_fn::<_, 4, _>(|i| io.pci_read(0x84 + i as u8 * 4));
     let old_bridge = BRIDGE_REGS.map(|r| read(io, r));
     let mut good = true;
-    for (i, &(base, mask, reg)) in RANGES.iter().enumerate() {
+    for (i, &(base, mask, reg)) in ranges.iter().enumerate() {
         let encoded = u32::from(base) | (u32::from(mask) << 16) | 1;
         io.pci_write(0x84 + i as u8 * 4, encoded);
         good &= io.pci_read(0x84 + i as u8 * 4) == encoded;
@@ -91,8 +126,19 @@ fn configure(io: &mut impl Io) -> &'static str {
     "configured Intel LPC + Fintek F85226; ISA DMA initialized"
 }
 
-pub fn setup<A: crate::Arch>(machine: &mut A) {
-    let result = configure(&mut Hardware(machine));
+/// `config_ranges` is CONFIG.SYS's `LPC_RANGES` value, if present; an
+/// unparseable override falls back to the sapphisa defaults rather than
+/// aborting setup.
+pub fn setup<A: crate::Arch>(machine: &mut A, config_ranges: Option<&[u8]>) {
+    let ranges = match config_ranges.map(parse_ranges) {
+        Some(Some(ranges)) => ranges,
+        Some(None) => {
+            crate::compact_println!("ISA LPC: LPC_RANGES malformed, using sapphisa defaults");
+            RANGES
+        }
+        None => RANGES,
+    };
+    let result = configure(&mut Hardware(machine), &ranges);
     crate::compact_println!("ISA LPC: dISAppointment: {}", result);
 }
 
@@ -126,29 +172,46 @@ mod tests {
     fn rejects_unknown_chipsets_without_writes() {
         for id in [0xFFFF_FFFF, 0x1E44_1022, 0x1234_8086] {
             let mut f = Fake::new(); f.pci[0] = id;
-            assert!(configure(&mut f).starts_with("skipped")); assert!(f.writes.is_empty());
+            assert!(configure(&mut f, &RANGES).starts_with("skipped")); assert!(f.writes.is_empty());
         }
     }
     #[test]
     fn missing_bridge_restores_config_decode() {
         let mut f = Fake::new(); f.bridge[0x5A] = 0xFF; f.pci[32] = 0x123;
-        assert!(configure(&mut f).starts_with("skipped")); assert_eq!(f.pci[32], 0x123);
+        assert!(configure(&mut f, &RANGES).starts_with("skipped")); assert_eq!(f.pci[32], 0x123);
         assert!(!f.writes.iter().any(|&(p, _)| p == 0x4F || p == 0x0D));
     }
     #[test]
     fn locked_range_rolls_back_without_dma_reset() {
         let mut f = Fake::new(); f.locked = true;
         let before = (f.pci, f.bridge);
-        assert!(configure(&mut f).starts_with("failed"));
+        assert!(configure(&mut f, &RANGES).starts_with("failed"));
         assert_eq!((f.pci, f.bridge), before);
         assert!(!f.writes.iter().any(|&(p, _)| p == 0x0D));
     }
     #[test]
     fn success_preserves_pic_and_enables_dma_cascade() {
         let mut f = Fake::new();
-        assert!(configure(&mut f).starts_with("configured"));
+        assert!(configure(&mut f, &RANGES).starts_with("configured"));
         assert_eq!(f.pci[0x84 / 4], 0x00FC_0201);
         assert!(f.writes.contains(&(0xD6, 0xC0)));
         assert!(!f.writes.iter().any(|&(p, _)| p == 0x21 || p == 0xA1));
+    }
+    #[test]
+    fn parses_four_hex_triples() {
+        assert_eq!(
+            parse_ranges(b"1D0:FC:60 300:70:23 388:1C:30 A00:FC:33"),
+            Some([(0x1D0, 0xFC, 0x60), (0x300, 0x70, 0x23), (0x388, 0x1C, 0x30), (0xA00, 0xFC, 0x33)]),
+        );
+    }
+    #[test]
+    fn rejects_malformed_or_wrong_count() {
+        assert_eq!(parse_ranges(b"200:FC:20"), None);
+        assert_eq!(parse_ranges(b"200:FC 300:70:23 388:1C:30 A00:FC:33"), None);
+        assert_eq!(parse_ranges(b"zz:FC:20 300:70:23 388:1C:30 A00:FC:33"), None);
+        assert_eq!(
+            parse_ranges(b"200:FC:20 300:70:23 388:1C:30 A00:FC:33 B00:FC:40"),
+            None,
+        );
     }
 }

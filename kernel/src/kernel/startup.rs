@@ -164,7 +164,8 @@ fn prepare_audio<A: crate::Arch>(
     let pnp = crate::kernel::dos::config_var(&master_env, b"BLASTER")
         .and_then(blaster_resources);
     if boot.isa_lpc_disappointment {
-        crate::kernel::drivers::isa_lpc::setup(machine);
+        let lpc_ranges = crate::kernel::dos::config_var(&master_env, b"LPC_RANGES");
+        crate::kernel::drivers::isa_lpc::setup(machine, lpc_ranges);
     }
     let sb_card = crate::kernel::platform::apply_audio_mode(
         machine, mixed, parse_sb_wiring(&sb_audio), pnp);
