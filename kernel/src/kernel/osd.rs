@@ -317,7 +317,7 @@ fn debug_vif_base() -> usize {
 /// vanished). An empty device lists its catalogue (insert on Enter); a
 /// loaded device lists "Eject <name>" first, then the OTHER images as swap
 /// targets — the in-use image is not offered.
-const DISK_DEVICES: usize = 3;
+const DISK_DEVICES: usize = 4;
 /// Rows of the Disk scroller visible at once — derived from the panel's
 /// character budget (see `MAX_ROWS`): everything but title, tab bar,
 /// device sub-tabs, and footer.
@@ -331,7 +331,8 @@ fn disk_device_label(dev: usize) -> &'static [u8] {
     match dev {
         0 => b"A:",
         1 => b"B:",
-        _ => b"CD",
+        2 => b"CD",
+        _ => b"HD",
     }
 }
 
@@ -386,10 +387,17 @@ enum DiskRow {
     Insert(usize),
     /// "(no images)" placeholder for an empty device + empty catalogue.
     NoImages,
+    Partition(u8, &'static [u8]),
+    NoPartitions,
 }
 
 fn disk_row(item: usize) -> DiskRow {
     let dev = disk_device();
+    if dev == 3 {
+        return crate::kernel::dos::EXTRA_DRIVES.iter()
+            .filter(|&&(drive, _)| crate::kernel::dos::extra_drive_prefix(drive).is_some())
+            .nth(item).map_or(DiskRow::NoPartitions, |&(drive, prefix)| DiskRow::Partition(drive, prefix));
+    }
     if dev == 2 && item == 0 {
         return DiskRow::Speed;
     }
@@ -414,6 +422,10 @@ fn disk_row(item: usize) -> DiskRow {
 
 fn disk_item_count() -> usize {
     let dev = disk_device();
+    if dev == 3 {
+        return crate::kernel::dos::EXTRA_DRIVES.iter()
+            .filter(|&&(drive, _)| crate::kernel::dos::extra_drive_prefix(drive).is_some()).count().max(1);
+    }
     let catalog = disk_catalog_count(dev);
     let media_rows = if disk_inserted(dev) {
         1 + catalog.saturating_sub(1) // Eject + swap targets
@@ -797,7 +809,7 @@ fn activate<A: crate::Arch>(
                         crate::compact_println!("Floppy: insert failed: {:?}", error);
                     }
                 }
-                DiskRow::NoImages => {}
+                DiskRow::NoImages | DiskRow::Partition(..) | DiskRow::NoPartitions => {}
             }
             // Eject/insert changes the row model: re-clamp selection + scroll.
             set_active_sel(TAB_DISK, active_sel(TAB_DISK), sound);
@@ -1306,6 +1318,14 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put(&name[..len]);
             }
             DiskRow::NoImages => line.put(b"(no images)"),
+            DiskRow::NoPartitions => line.put(b"(no additional partitions)"),
+            DiskRow::Partition(drive, prefix) => {
+                line.put(&[drive, b':', b' ', b'/']);
+                line.put(&prefix[..prefix.len() - 1]);
+                line.put(b" ");
+                line.put(crate::kernel::vfs::mount_format_name(prefix).unwrap_or("unknown").as_bytes());
+                line.put(b" (read-only)");
+            }
         },
         TAB_DEBUG => match item {
             DEBUG_ITEM_TRACE => {

@@ -153,6 +153,7 @@ run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run boot_composition storage_selection python3 test/boot_composition.py
 run disk_selection storage_selection python3 test/disk_selection.py
+run extra_drives storage_selection python3 test/extra_drives.py
 run isapnp_smoke isapnp_tools python3 test/isapnp_smoke.py
 run machine_layout machine_layout python3 test/machine_layout.py
 run dn_state     dn_state  python3 test/dn_state.py

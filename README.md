@@ -245,3 +245,12 @@ RetroOS/
 ├── stdlib/         # core + compiler_builtins from rust-src
 └── toolchain/      # Bazel toolchain definitions
 ```
+
+Additional detected filesystems mounted at `/disk1` through `/disk7` are also
+available to DOS as **E:, F:, G:, I:, J:, K:, L:** respectively. **H:** stays
+reserved for HostFS. These partitions are read-only even in persistent mode;
+the aliases let DOS Navigator and programs browse/read the existing mounts.
+Use the F12 **Disk → HD** view to see the mappings and filesystem names
+(FAT or ext4), or switch drives in DOS
+Navigator. Only successfully mounted partitions receive a usable drive letter.
+These aliases do not add USB mass-storage support.

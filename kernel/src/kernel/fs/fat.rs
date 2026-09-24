@@ -318,6 +318,8 @@ pub(crate) mod tests {
 }
 
 impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
+    fn format_name(&self) -> &'static str { "FAT" }
+
     fn dos_attributes(&self, path: &[u8]) -> Option<u8> {
         let state = self.state.lock();
         let text = path_str(path)?;

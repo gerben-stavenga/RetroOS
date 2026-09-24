@@ -58,6 +58,9 @@ pub struct Meta {
 }
 
 pub trait Filesystem {
+    /// Filesystem format shown in mount diagnostics and the disk OSD.
+    fn format_name(&self) -> &'static str { "unknown" }
+
     /// Open a file by its normalized, exact name as resolved by VFS.
     /// Fused Twalk+Topen: returns a fid (`Vnode::handle`).
     fn open(&self, path: &[u8]) -> Option<Vnode>;
@@ -1505,6 +1508,20 @@ fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
 /// Replaces any binding already at that exact prefix.
 pub fn mount(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount(prefix, fs);
+}
+
+/// Whether this exact mount exists (a directory with the same name is not enough).
+pub(crate) fn is_mounted(prefix: &[u8]) -> bool {
+    VFS.lock().mounts.iter().any(|binding| binding.prefix == prefix)
+}
+
+/// Filesystem format of an exact mount; do not probe disk contents while painting.
+pub(crate) fn mount_format_name(prefix: &[u8]) -> Option<&'static str> {
+    VFS.lock().mounts.iter().find(|binding| binding.prefix == prefix)
+        .and_then(|binding| match binding.target {
+            BindTarget::Server(fs) => Some(fs.format_name()),
+            BindTarget::Alias { .. } => None,
+        })
 }
 
 /// Explicitly deny mutations on a secondary filesystem. Ordinary mounts

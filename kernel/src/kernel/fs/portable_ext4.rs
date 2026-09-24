@@ -416,6 +416,8 @@ pub fn is_linux_root(volume: &Volume) -> bool {
 }
 
 impl Filesystem for PortableExt4Fs {
+    fn format_name(&self) -> &'static str { "ext4" }
+
     fn root_node(&self) -> Option<u64> {
         self.flush_pending().ok()?;
         let mut mounted = self.mounted.borrow_mut();

@@ -315,9 +315,45 @@ fn alias_taken(alias: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> bool {
     existing.contains_key(alias)
 }
 
+/// Additional boot-mounted partitions. H: remains reserved for HostFS.
+pub const EXTRA_DRIVES: [(u8, &[u8]); 7] = [
+    (b'E', b"disk1/"), (b'F', b"disk2/"), (b'G', b"disk3/"),
+    (b'I', b"disk4/"), (b'J', b"disk5/"), (b'K', b"disk6/"), (b'L', b"disk7/"),
+];
+
+pub fn extra_drive_prefix(drive: u8) -> Option<&'static [u8]> {
+    EXTRA_DRIVES.iter().find(|&&(letter, prefix)|
+        letter == drive.to_ascii_uppercase() && vfs::is_mounted(prefix))
+        .map(|&(_, prefix)| prefix)
+}
+
+pub fn drive_available(drive: u8, hostfs: bool) -> bool {
+    match drive.to_ascii_uppercase() {
+        b'A'..=b'D' => true,
+        b'H' => hostfs,
+        drive => extra_drive_prefix(drive).is_some(),
+    }
+}
+
+pub fn last_drive(hostfs: bool) -> u8 {
+    (b'A'..=b'L').rev().find(|&drive| drive_available(drive, hostfs)).unwrap_or(b'D') - b'A' + 1
+}
+
+/// Return the drive and relative path for an additional mounted partition.
+fn extra_vfs_path(path: &[u8]) -> Option<(u8, &[u8])> {
+    EXTRA_DRIVES.iter().find_map(|&(drive, prefix)| {
+        let root = &prefix[..prefix.len() - 1];
+        if vfs::is_mounted(prefix) {
+            if path == root { return Some((drive, &path[path.len()..])); }
+            if let Some(rest) = path.strip_prefix(prefix) { return Some((drive, rest)); }
+        }
+        None
+    })
+}
+
 /// Per-thread DOS filesystem state.
 pub struct DfsState {
-    cwd: [Vec<u8>; 5],
+    cwd: [Vec<u8>; 12],
     current_drive: u8,
     hostfs_enabled: bool,
     pub lfn_searches: lfn::Searches,
@@ -329,19 +365,13 @@ impl DfsState {
     }
 
     pub const fn new_with_hostfs(hostfs_enabled: bool) -> Self {
-        Self { cwd: [const { Vec::new() }; 5], current_drive: b'C', hostfs_enabled,
+        Self { cwd: [const { Vec::new() }; 12], current_drive: b'C', hostfs_enabled,
             lfn_searches: lfn::Searches::new() }
     }
 
     fn drive_slot(drive: u8) -> Option<usize> {
-        match drive.to_ascii_uppercase() {
-            b'C' => Some(0),
-            b'D' => Some(1),
-            b'H' => Some(2),
-            b'A' => Some(3),
-            b'B' => Some(4),
-            _ => None,
-        }
+        let drive = drive.to_ascii_uppercase();
+        (b'A'..=b'L').contains(&drive).then(|| usize::from(drive - b'A'))
     }
 
     /// Cwd per AH=47 convention: no drive, no leading `\`, no trailing `\`.
@@ -366,12 +396,11 @@ impl DfsState {
         self.cwd[slot] = new_cwd.to_vec();
     }
 
-    fn drive_available(&self, drive: u8) -> bool {
-        let drive = drive.to_ascii_uppercase();
-        Self::drive_slot(drive).is_some() && (drive != b'H' || self.hostfs_enabled)
+    pub(super) fn drive_available(&self, drive: u8) -> bool {
+        drive_available(drive, self.hostfs_enabled)
     }
 
-    /// Select C:, the CD-ROM D: slot, or host filesystem H:.
+    /// Select an available DOS drive, including additional mounted partitions.
     pub fn select_drive(&mut self, drive: u8) -> bool {
         let drive = drive.to_ascii_uppercase();
         if !self.drive_available(drive) {
@@ -408,6 +437,11 @@ impl DfsState {
             }
         }
         while s.first() == Some(&b'/') { s = &s[1..]; }
+        if let Some((drive, rest)) = extra_vfs_path(s) {
+            self.current_drive = drive;
+            self.store_cwd_slot(usize::from(drive - b'A'), rest);
+            return;
+        }
         // Strip the C: root prefix (c_root) so the cwd is stored relative to C:\
         // (e.g. "home/retroos/boot" → "boot" → "BOOT"), not the raw VFS path —
         // otherwise the DOS cwd is a driveless "HOME\RETROOS\BOOT" and every
@@ -416,7 +450,7 @@ impl DfsState {
         if s.len() >= cr.len() && &s[..cr.len()] == cr {
             s = &s[cr.len()..];
         }
-        self.store_cwd_slot(0, s);
+        self.store_cwd_slot(2, s);
     }
 
     /// Store a forward-slash path as `cwd[slot]` in AH=47 form (uppercase,
@@ -434,7 +468,7 @@ impl DfsState {
     ///   - other           → current drive's cwd + path
     ///
     /// All `/` become `\`, all letters uppercased.
-    /// C:, CD-ROM D:, and hostfs H: retain independent current directories.
+    /// Every available drive retains an independent current directory.
     pub fn resolve(&self, dos_in: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> Result<usize, i32> {
         let mut pos: usize = 0;
 
@@ -562,14 +596,16 @@ pub fn c_root() -> &'static [u8] {
 pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
     let mut s = vfs;
     while s.first() == Some(&b'/') { s = &s[1..]; }
-    // Strip the C: root prefix if present (e.g. "home/retroos/games/x" → "games/x").
-    let cr = c_root();
-    if s.len() >= cr.len() && &s[..cr.len()] == cr {
-        s = &s[cr.len()..];
-    }
+    let drive = if let Some((drive, rest)) = extra_vfs_path(s) {
+        s = rest;
+        drive
+    } else {
+        if let Some(rest) = s.strip_prefix(c_root()) { s = rest; }
+        b'C'
+    };
     let mut pos = 0;
     if pos + 3 > out.len() { return pos; }
-    out[pos] = b'C'; out[pos+1] = b':'; out[pos+2] = b'\\';
+    out[pos] = drive; out[pos+1] = b':'; out[pos+2] = b'\\';
     pos += 3;
     for &b in s {
         if pos >= out.len() { break; }
@@ -595,7 +631,7 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8])
         b'C' => c_root(),
         b'D' => b"cdrom/",
         b'H' => b"host/",
-        _ => return Err(15),
+        drive => extra_drive_prefix(drive).ok_or(15)?,
     };
     // c_root carries a trailing slash (for path concat); the component walk
     // re-adds slashes, so write it WITHOUT the trailing one (and "" → root).

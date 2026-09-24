@@ -2031,7 +2031,8 @@ fn int_21h<A: crate::Arch>(
                                 b"floppyb/" => 1,
                                 b"cdrom/" => 0x8000 | 3,
                                 b"host/" => 0x8000 | 7,
-                                _ => 2, // every C: backing (ext4/hostfs root)
+                                _ => dfs::EXTRA_DRIVES.iter().find(|&&(_, root)| root == prefix)
+                                    .map_or(2, |&(letter, _)| u64::from(letter - b'A')),
                             });
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x0040 | info;
                         DosExit::Ok
@@ -2124,15 +2125,9 @@ fn int_21h<A: crate::Arch>(
         // AH=0x0E: Select disk (DL=drive, 0=A, 2=C, 3=D)
         0x0E => {
             let drive = b'A'.wrapping_add(regs.rdx as u8);
-            // H: exists only when the platform actually mounted hostfs. A
-            // reserved CDS slot is not a drive: accepting it here makes DOS
-            // installers offer a phantom destination on machines without a
-            // hostfs peer.
-            if drive != b'H' || crate::kernel::platform::get().hostfs {
-                let _ = dos.dfs.select_drive(drive);
-            }
-            let last_drive = if crate::kernel::platform::get().hostfs { 8 } else { 4 };
-            regs.rax = (regs.rax & !0xFF) | last_drive;
+            let _ = dos.dfs.select_drive(drive);
+            let last_drive = dfs::last_drive(crate::kernel::platform::get().hostfs);
+            regs.rax = (regs.rax & !0xFF) | u64::from(last_drive);
             return thread::KernelAction::Done;
         }
         // AH=0x3C: Create file (CX=attr, DS:DX=filename) — RAM-backed via VFS overlay
@@ -2638,6 +2633,14 @@ fn int_21h<A: crate::Arch>(
                 regs.rbx &= !0xFFFF;
                 regs.rcx = (regs.rcx & !0xFFFF) | 2048;
                 regs.rdx = (regs.rdx & !0xFFFF) | 0xFFFF;
+            } else if dfs::extra_drive_prefix(b'A'.wrapping_add(drive.wrapping_sub(1))).is_some() {
+                // Secondary partitions are read-only. VFS has no capacity
+                // query yet; use the same synthetic 128 MiB geometry as C:,
+                // with zero available clusters rather than promising writes.
+                regs.rax = (regs.rax & !0xFFFF) | 8;
+                regs.rbx &= !0xFFFF;
+                regs.rcx = (regs.rcx & !0xFFFF) | 512;
+                regs.rdx = (regs.rdx & !0xFFFF) | 32768;
             } else if drive == 8 && crate::kernel::vfs::dir_exists(b"host") {
                 // Hostfs has no portable capacity query; report the same
                 // synthetic geometry as C: while marking it remote via 4409h.
@@ -4146,7 +4149,7 @@ fn find_attributes_match(attributes: u8, is_dir: bool) -> bool {
 // initial DOS program's env arena lives there, with its PSP at +0x10.
 
 const LOW_MEM_BASE: u32 = 0x500;
-const NUM_DRIVES: u8 = 8;
+const NUM_DRIVES: u8 = 12;
 const SFT_ENTRIES: usize = 20;
 
 /// Entries in the PSP's inline Job File Table. AH=67h can replace it with an
@@ -4801,7 +4804,7 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
         ..Default::default()
     });
 
-    let last_drive = if crate::kernel::platform::get().hostfs { 8 } else { 4 };
+    let last_drive = dfs::last_drive(crate::kernel::platform::get().hostfs);
     let lol = Lol {
         sft_off: (sft_addr & 0xF) as u16,
         sft_seg: (sft_addr >> 4) as u16,
@@ -4844,8 +4847,10 @@ fn setup_lol_sft<A: crate::Arch>(machine: &mut A, _regs: &mut Regs) {
     cds[1] = mk(b'B');
     cds[2] = mk(b'C');
     cds[3] = mk(b'D');
-    if crate::kernel::platform::get().hostfs {
-        cds[7] = mk(b'H');
+    for letter in b'E'..=b'L' {
+        if dfs::drive_available(letter, crate::kernel::platform::get().hostfs) {
+            cds[usize::from(letter - b'A')] = mk(letter);
+        }
     }
     machine.write::<[CdsEntry; NUM_DRIVES as usize]>(lm_field(core::mem::offset_of!(LowMem, cds)), cds);
 

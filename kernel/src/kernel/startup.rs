@@ -525,7 +525,7 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
 }
 
 /// Keep the boot-time mount namespace in the single-digit `/diskN` range.
-const MAX_DISK_MOUNTS: usize = 8;
+const MAX_DISK_MOUNTS: usize = crate::kernel::dos::EXTRA_DRIVES.len() + 1;
 
 /// Which volume does which job.
 ///
@@ -797,8 +797,9 @@ fn mount_filesystems(
             match volume.open(false) {
                 Ok(fs) => {
                     vfs::mount_readonly(mount, Box::leak(fs));
-                    crate::screenln!(screen, "portable {} partition ({} MB) → /disk{}",
-                        volume.name(), volume.volume.sectors / 2048, disk_number);
+                    crate::screenln!(screen, "DOS {}: → /disk{} ({} partition, {} MB, read-only)",
+                        crate::kernel::dos::EXTRA_DRIVES[disk_number - 1].0 as char,
+                        disk_number, volume.name(), volume.volume.sectors / 2048);
                 }
                 Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", volume.name(), error),
             }
