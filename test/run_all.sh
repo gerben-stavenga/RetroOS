@@ -91,6 +91,8 @@ qemu_audio_kvm() { qemu_audio && qemu_kvm; }
 bochs_tools() { bazel_tool && have bochs && have python3 && have mcopy && have mtype && have setsid; }
 grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && have xorriso && have gcc && have mkfs.fat && have mmd && have mcopy && have python3; }
 machine_layout() { grub_fat && have qemu-system-x86_64 && have mkfs.ext4 && have e2fsck && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; }
+storage_selection() { machine_layout && have nasm && have sfdisk; }
+isapnp_tools() { qemu_hostfs_grub && have nasm; }
 dn_state() { have bazelisk && have qemu-system-i386 && have mkfs.fat && have mmd && have mcopy && have mtype && have mdir && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
@@ -149,6 +151,9 @@ run() {
 run unit         -         unit
 run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
+run boot_composition storage_selection python3 test/boot_composition.py
+run disk_selection storage_selection python3 test/disk_selection.py
+run isapnp_smoke isapnp_tools python3 test/isapnp_smoke.py
 run machine_layout machine_layout python3 test/machine_layout.py
 run dn_state     dn_state  python3 test/dn_state.py
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh

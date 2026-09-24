@@ -10,6 +10,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
 OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin'))
@@ -58,6 +59,19 @@ def main():
         assert hashlib.file_digest((OUTPUT / name).open('rb'), 'sha256').hexdigest() == expected, name
     with tempfile.TemporaryDirectory(prefix='retroos-release-test-') as temp:
         work = Path(temp)
+        with zipfile.ZipFile(OUTPUT / 'retroos-usb-diagnostic.zip') as archive:
+            assert archive.testzip() is None
+            archive.extract('retroos-usb-diagnostic.iso', work)
+        assert (OUTPUT / 'retroos-usb-diagnostic.zip').stat().st_size < 5_000_000
+        subprocess.run(['xorriso', '-osirrox', 'on', '-indev',
+                        str(work / 'retroos-usb-diagnostic.iso'), '-extract',
+                        '/boot/grub/grub.cfg', str(work / 'lightweight-grub.cfg')],
+                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        menu = (work / 'lightweight-grub.cfg').read_text()
+        assert 'boot_choices base' in menu and 'isa-lpc=disappointment' in menu
+        assert 'boot-log-only isa-lpc=disappointment' in menu
+        subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
+        print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
         check_usb(work)
         vm, machine = work / 'vm', work / 'machine'
         for name, dest in [('vm', vm), ('machine', machine)]:

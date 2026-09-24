@@ -487,11 +487,12 @@ genrule(
 
 genrule(
     name = "grub_module_iso",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg"],
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos_grub_module.iso"],
     cmd = """
         DIR=$$(mktemp -d)
         mkdir -p "$$DIR/boot/grub"
+        cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
         cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
         cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
         cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
@@ -499,6 +500,59 @@ genrule(
         grub-mkrescue -o $@ "$$DIR"
         rm -rf "$$DIR"
     """,
+    visibility = ["//visibility:public"],
+)
+
+# Small forum attachment for boot/input diagnostics. Keep the same kernel and
+# runtime, without games, compilers, or instrument samples.
+pkg_tar(
+    name = "diagnostic_dos_tar",
+    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
+    empty_dirs = ["TEMP"],
+    package_dir = "home/retroos",
+)
+
+pkg_tar(
+    name = "diagnostic_root_tar",
+    deps = [":bin_tar", ":diagnostic_dos_tar"],
+)
+
+genrule(
+    name = "diagnostic_module",
+    srcs = [":diagnostic_root_tar", "tools/build_module_image.py"],
+    outs = ["retroos-diagnostic.img.gz"],
+    cmd = """
+        IMG=$$(mktemp)
+        python3 $(location tools/build_module_image.py) \\
+            --contents $(location :diagnostic_root_tar) --size-mb 16 --out "$$IMG"
+        gzip -9 -n -c "$$IMG" > $@
+        rm "$$IMG"
+    """,
+)
+
+genrule(
+    name = "usb_diagnostic_iso",
+    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
+    outs = ["retroos-usb-diagnostic.iso"],
+    cmd = """
+        DIR=$$(mktemp -d)
+        mkdir -p "$$DIR/boot/grub"
+        cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
+        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
+        cp $(location :diagnostic_module) "$$DIR/boot/retroos-base.img.gz"
+        sed 's/^boot_choices games$$/boot_choices base/' \\
+            $(location tools/grub-module.cfg) > "$$DIR/boot/grub/grub.cfg"
+        grub-mkrescue --locales= --themes= -o $@ "$$DIR"
+        rm -rf "$$DIR"
+    """,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "usb_diagnostic_zip",
+    srcs = [":usb_diagnostic_iso"],
+    outs = ["retroos-usb-diagnostic.zip"],
+    cmd = "python3 -c 'import zipfile; z = zipfile.ZipFile(\"$@\", \"w\", compression=zipfile.ZIP_DEFLATED, compresslevel=9); z.write(\"$(location :usb_diagnostic_iso)\", \"retroos-usb-diagnostic.iso\"); z.close()'",
     visibility = ["//visibility:public"],
 )
 
@@ -717,6 +771,7 @@ pkg_tar(
         "tools/release/run.sh": "run.sh",
         "tools/run/qemu.sh": "tools/run/qemu.sh",
         "tools/release/README.md": "README.md",
+        "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
     },
     modes = {"run.sh": "0755"},
     extension = "tar.gz",
@@ -734,6 +789,7 @@ pkg_tar(
         "//tools/command:LOADFIX.CFG": "tools/command/LOADFIX.CFG",
         "etc/CONFIG.SYS": "etc/CONFIG.SYS",
         "tools/release/README.md": "README.md",
+        "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
     } | {src: src for src, dest in DATA_FILES.items() if dest.startswith("CONFIG/DN/")},
     modes = {"install.sh": "0755"},
     extension = "tar.gz",
@@ -742,13 +798,13 @@ pkg_tar(
 
 genrule(
     name = "release_checksums",
-    srcs = [":release_vm", ":release_machine", ":grub_module_iso"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":usb_diagnostic_zip"],
     outs = ["SHA256SUMS"],
-    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_iso) | sed 's|  .*/|  |' > $@",
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_iso) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
 )
 
 filegroup(
     name = "release",
-    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":release_checksums"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
     visibility = ["//visibility:public"],
 )

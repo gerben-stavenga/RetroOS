@@ -24,6 +24,41 @@ pub fn init() {
 
 pub use klog::line;
 
+/// Save one stable pre-launch snapshot through the normal C: write policy.
+/// A failed export must not prevent the interactive startup program running.
+pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
+    use crate::kernel::{dos, thread::{FdKind, MAX_FDS}, vfs};
+
+    // Copy before filesystem I/O, which can itself append diagnostics.
+    let mut bytes = alloc::vec![0; klog::byte_len() as usize];
+    let len = klog::read(0, &mut bytes);
+    bytes.truncate(len);
+    let mut path = dos::c_root().to_vec();
+    if !path.ends_with(b"/") {
+        path.push(b'/');
+    }
+    path.extend_from_slice(b"KLOG.TXT");
+    let mut fds = [FdKind::None; MAX_FDS];
+    let fd = vfs::create(&path, &mut fds);
+    if fd < 0 {
+        return Err(fd);
+    }
+    let result = (|| {
+        let mut offset = 0;
+        while offset < bytes.len() {
+            let n = vfs::write(machine, fd, &bytes[offset..], &fds);
+            if n <= 0 {
+                return Err(if n == 0 { -5 } else { n });
+            }
+            offset += n as usize;
+        }
+        let status = vfs::flush(fd, &fds);
+        if status < 0 { Err(status) } else { Ok(()) }
+    })();
+    let status = vfs::close(fd, &mut fds);
+    result.and(if status < 0 { Err(status) } else { Ok(()) })
+}
+
 fn is_klog_path(path: &[u8]) -> bool {
     KLOG_NAMES.contains(&path)
 }

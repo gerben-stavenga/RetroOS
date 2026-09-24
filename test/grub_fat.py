@@ -70,7 +70,7 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
             process.kill()
             process.wait()
     text = log.read_text(errors="replace")
-    if expected not in text or marker not in text or "DOS C: maps to /\n" not in text or any(
+    if expected not in text or marker not in text or "DOS C: maps to /home/retroos/\n" not in text or any(
         error in text for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL", "panicked"]
     ):
         raise AssertionError(f"{name} failed:\n{text}")

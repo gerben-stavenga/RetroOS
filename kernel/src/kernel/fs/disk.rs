@@ -13,6 +13,8 @@ pub enum Format { Ext4, Fat }
 pub struct FilesystemVolume {
     pub volume: Volume,
     pub format: Format,
+    /// Partition-table role, independent of boot directories and filesystem.
+    pub is_esp: bool,
 }
 
 impl FilesystemVolume {
@@ -24,7 +26,7 @@ impl FilesystemVolume {
         } else {
             return None;
         };
-        Some(Self { volume, format })
+        Some(Self { volume, format, is_esp: false })
     }
 
     /// ext4's on-disk filesystem UUID (superblock + 0x68).
@@ -88,14 +90,16 @@ impl FilesystemVolume {
 /// ext4 carries both the Unix tree and C:, which is the shape RetroOS has on
 /// a real machine.  `startup` decides which volume fills which job; this only
 /// reports evidence, the same division drivers and `startup` already keep.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Evidence {
     /// A Unix tree: the Linux personality's `/`.
     pub unix: bool,
-    /// A DOS world: C:.
-    pub dos: bool,
-    /// A boot volume — GRUB's prefix volume / the ESP. Supplies C:\RETROOS and
-    /// is never a root: its `BOOT/` would otherwise outscore the real C:.
+    /// C: preference: identified data (3), another Unix home (2), plain FAT (1).
+    pub dos: u8,
+    /// Directory within the selected volume, empty for a FAT volume root.
+    pub dos_home: Vec<u8>,
+    /// Root-level runtime files that can supply C:\RETROOS. Independent of
+    /// whether this volume also supplies the Linux root or C: data.
     pub boot: bool,
 }
 
@@ -110,27 +114,47 @@ impl FilesystemVolume {
         let Ok(fs) = self.open(false) else { return Evidence::default() };
         let fs = fs.as_ref();
 
-        // Only a runtime-bearing boot disk fills this role. A Linux root
-        // containing /boot/grub is still a root, not exclusively a boot disk.
-        if has_directory(fs, b"RETROOS") &&
-            (has_directory(fs, b"EFI") || has_directory(fs, b"boot/grub")) {
-            return Evidence { boot: true, ..Default::default() };
-        }
+        let runtime = has_directory(fs, b"RETROOS");
 
-        let home = boot.c_root();
-        let home = home.strip_suffix(b"/").unwrap_or(home);
+        let preferred = self.c_root(boot);
+        let preferred_dir = preferred.strip_suffix(b"/").unwrap_or(preferred);
+        let mut dos_home = preferred.to_vec();
+        let dos = match self.format {
+            Format::Fat => {
+                if [b"CONFIG".as_slice(), b"GAMES", b"ULTRAMID"]
+                    .iter().any(|path| has_directory(fs, path)) {
+                    3
+                } else { 1 }
+            }
+            Format::Ext4 => {
+                if has_directory(fs, preferred_dir) {
+                    3
+                } else if !boot.c_root_explicit() && let Some(home) = other_home(fs) {
+                    dos_home = home;
+                    2
+                } else { 0 }
+            }
+        };
         Evidence {
-            unix: has_directory(fs, b"bin")
-                || has_directory(fs, b"etc")
-                || has_directory(fs, b"usr"),
-            // Either a volume that IS C: (a DOS tree at its root) or one that
-            // CONTAINS C: (the installed-machine ext4, C: in a subdirectory).
-            dos: has_directory(fs, b"RETROOS")
-                || has_directory(fs, b"GAMES")
-                || (!home.is_empty() && has_directory(fs, home)),
-            boot: false,
+            unix: self.format == Format::Ext4 && (has_directory(fs, b"bin")
+                || has_directory(fs, b"etc") || has_directory(fs, b"usr")),
+            dos: if self.is_esp { 0 } else { dos }, dos_home,
+            boot: runtime,
         }
     }
+}
+
+/// Choose a stable existing user home without creating directories during
+/// discovery. Ignore symlinks and dot entries; write grants use this directory.
+fn other_home(fs: &dyn Filesystem) -> Option<Vec<u8>> {
+    if !has_directory(fs, b"home") { return None; }
+    let mut entries = Vec::new();
+    fs.readdir(b"home", 0, &mut entries, usize::MAX);
+    let name = entries.iter().filter(|entry| entry.is_dir && !entry.is_symlink)
+        .map(|entry| &entry.name[..entry.name_len])
+        .filter(|name| !name.starts_with(b"."))
+        .min()?;
+    Some([b"home/".as_slice(), name, b"/"].concat())
 }
 
 /// Root markers use the same exact directory names as the VFS namespace.
@@ -157,9 +181,9 @@ mod tests {
     #[test]
     fn c_drive_mapping_depends_on_mount_type_not_directory_presence() {
         let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
-        let fat = FilesystemVolume { volume, format: Format::Fat };
+        let fat = FilesystemVolume { volume, format: Format::Fat, is_esp: false };
         // The mapping decision does not read the filesystem.
-        let unix = FilesystemVolume { volume, format: Format::Ext4 };
+        let unix = FilesystemVolume { volume, format: Format::Ext4, is_esp: false };
         let mut boot = crate::BootConfig::empty();
         assert_eq!(fat.c_root(&boot), b"");
         assert_eq!(unix.c_root(&boot), b"home/retroos/");
@@ -172,7 +196,7 @@ mod tests {
     #[test]
     fn fat_boot_directory_marks_a_dos_root_not_an_efi_partition() {
         let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
-        let fat = FilesystemVolume { volume, format: Format::Fat };
+        let fat = FilesystemVolume { volume, format: Format::Fat, is_esp: false };
         let boot = crate::BootConfig::empty();
         assert_eq!(fat.root_score(&boot), 0);
         {
@@ -187,4 +211,22 @@ mod tests {
         assert_eq!(fat.root_score(&boot), 2);
         assert_eq!(fat.c_root(&boot), b"");
     }
+    #[test]
+    fn fat_boot_directories_do_not_exclude_data_but_esp_type_does() {
+        for marker in [None, Some(b"CONFIG".as_slice()), Some(b"GAMES"), Some(b"ULTRAMID")] {
+            let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+            let mut fat = FilesystemVolume { volume, format: Format::Fat, is_esp: false };
+            if let Some(marker) = marker {
+                assert_eq!(fat.open(true).unwrap().mkdir(marker), 0);
+            }
+            let evidence = fat.evidence(&crate::BootConfig::empty());
+            assert_eq!(evidence.dos, if marker.is_some() { 3 } else { 1 });
+            assert!(evidence.dos_home.is_empty());
+            assert_eq!(fat.open(true).unwrap().mkdir(b"EFI"), 0);
+            assert_eq!(fat.evidence(&crate::BootConfig::empty()).dos, evidence.dos);
+            fat.is_esp = true;
+            assert_eq!(fat.evidence(&crate::BootConfig::empty()).dos, 0);
+        }
+    }
+
 }

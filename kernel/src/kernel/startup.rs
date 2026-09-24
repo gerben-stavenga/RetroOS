@@ -158,8 +158,16 @@ fn prepare_audio<A: crate::Arch>(
     // Mints the machine's one Sound Blaster, if it has a drivable one. We hold
     // it while reconciling it against BLASTER, then leave it unclaimed for
     // whichever owner the mode selected to take.
-    let sb_card =
-        crate::kernel::platform::apply_audio_mode(machine, mixed, parse_sb_wiring(&sb_audio));
+    // BLASTER is also the resource request for an ISA PnP card.
+    // Once activated, discovery reads the physical wiring back; mixed mode
+    // still keeps its independently emulated guest-card state.
+    let pnp = crate::kernel::dos::config_var(&master_env, b"BLASTER")
+        .and_then(blaster_resources);
+    if boot.isa_lpc_disappointment {
+        crate::kernel::drivers::isa_lpc::setup(machine);
+    }
+    let sb_card = crate::kernel::platform::apply_audio_mode(
+        machine, mixed, parse_sb_wiring(&sb_audio), pnp);
     let platform = crate::kernel::platform::get();
 
     // BLASTER describes THE CARD THE GUEST SEES.
@@ -208,8 +216,10 @@ fn prepare_audio<A: crate::Arch>(
                 card.base
             ),
         }
-        // An SB16's IRQ/DMA are soft-straps (mixer 0x80/0x81) — and NOT just
-        // routing labels: the 0x81 high bits ENABLE the 16-bit DMA channel.
+        // Legacy SB16s can change IRQ/DMA through mixer 0x80/0x81; Creative
+        // PnP boards expose these as read-only and were configured via PnP.
+        // These are not just routing labels: the 0x81 high bits report/enable
+        // the 16-bit DMA channel. Only attempt a change when wiring differs.
         // Bochs's SB16 powers up without one ("DMA 1/0"), so a guest's
         // 16-bit auto-init never moves and its position poll spins for the
         // whole intro (Pinball Fantasies). Strap the card to BLASTER; the
@@ -218,7 +228,8 @@ fn prepare_audio<A: crate::Arch>(
         // irq=5) as permanent relay/remap coverage, and its mixer accepts
         // the strap write without rerouting the actual line. The guest can
         // never undo this: the mixer pair always traps (vsb::trap_mask).
-        if crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu
+        if !card.is_pnp()
+            && crate::kernel::platform::get().host != crate::kernel::platform::Host::Qemu
             && let Some(want) = blaster_wiring(&blaster)
             && card.wiring() != want
         {
@@ -529,7 +540,9 @@ struct MountPlan {
     unix_root: usize,
     /// The volume holding C:. Equal to `unix_root` on an installed machine.
     dos_drive: Option<usize>,
-    /// The boot volume, which supplies C:\RETROOS. Never a root.
+    /// C: backing directory, selected along with its volume.
+    dos_subdir: alloc::vec::Vec<u8>,
+    /// Optional runtime source; may also be a root or data volume.
     boot_support: Option<usize>,
     /// Everything else, read-only at /diskN.
     spares: alloc::vec::Vec<usize>,
@@ -537,9 +550,9 @@ struct MountPlan {
 
 /// Decide the plan from what each volume actually contains.
 ///
-/// Evidence, not partition type and not device order: the same disk set must
-/// come out the same way whichever order the BIOS happens to enumerate it.
-fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> MountPlan {
+/// Prefer physical data markers, then a plain data partition, then RAM.
+/// Equal candidates retain partition discovery order; an explicit UUID wins.
+fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_index: Option<usize>) -> MountPlan {
     if let Some(uuid) = boot.root_uuid {
         let mut matches = volumes.iter().enumerate().filter(|(_, v)| v.uuid() == Some(uuid));
         let root = matches.next().map(|(i, _)| i)
@@ -548,7 +561,7 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> MountP
             lib::compact_panic!("Configured root UUID is ambiguous");
         }
         return MountPlan {
-            unix_root: root, dos_drive: Some(root), boot_support: None,
+            unix_root: root, dos_drive: Some(root), dos_subdir: volumes[root].c_root(boot).to_vec(), boot_support: None,
             spares: (0..volumes.len()).filter(|i| *i != root).collect(),
         };
     }
@@ -559,8 +572,23 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> MountP
     };
 
     let boot_support = find(|e| e.boot);
-    let unix = find(|e| e.unix);
-    let dos = find(|e| e.dos);
+    let unix = evidence.iter().enumerate()
+        .find(|(i, e)| Some(*i) != module_index && !volumes[*i].is_esp && e.unix)
+        .map(|(i, _)| i)
+        .or_else(|| volumes.iter().enumerate().find(|(i, v)|
+            Some(*i) != module_index && !v.is_esp && v.format == crate::kernel::fs::disk::Format::Ext4)
+            .map(|(i, _)| i))
+        .or_else(|| find(|e| e.unix));
+    let dos = evidence.iter().enumerate()
+        .filter(|(i, e)| Some(*i) != module_index && e.dos > 0)
+        .max_by_key(|(i, e)| (e.dos,
+            volumes[*i].format == crate::kernel::fs::disk::Format::Fat,
+            Some(*i) == unix,
+            volumes[*i].volume.sectors,
+            core::cmp::Reverse(*i)))
+        .map(|(i, _)| i)
+        .or(module_index);
+    let dos_subdir = dos.map(|i| evidence[i].dos_home.clone()).unwrap_or_default();
 
     // A root is required. Preferring the Unix tree keeps `/` meaningful for
     // the Linux personality; a DOS-only machine roots on C: instead. If
@@ -584,7 +612,7 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig) -> MountP
             && Some(*i) != boot_support)
         .collect();
 
-    MountPlan { unix_root, dos_drive: dos, boot_support, spares }
+    MountPlan { unix_root, dos_drive: dos, dos_subdir, boot_support, spares }
 }
 
 /// A leaked `&'static [u8]` for a mount prefix built at runtime.
@@ -644,8 +672,11 @@ fn mount_filesystems(
     crate::compact_screenln!(screen, "Filesystems: probing ext4/FAT volumes...");
     let mut volumes: alloc::vec::Vec<_> = parts.iter()
         .filter(|p| p.kind != PartKind::BootBundle)
-        .map(|p| crate::kernel::block::cache::volume(p.volume))
-        .filter_map(FilesystemVolume::probe).collect();
+        .filter_map(|p| {
+            let mut volume = FilesystemVolume::probe(crate::kernel::block::cache::volume(p.volume))?;
+            volume.is_esp = p.kind == PartKind::EfiSystem;
+            Some(volume)
+        }).collect();
     crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
     // Physical data wins the same evidence-based selection used on disk boots.
     // The module root remains available as a fallback and as the boot source.
@@ -671,10 +702,10 @@ fn mount_filesystems(
         crate::compact_screenln!(screen, "hostfs: mounted as root");
         hostfs_is_root = true;
     } else {
-        let plan = plan_mounts(&volumes, boot);
+        let plan = plan_mounts(&volumes, boot, module_index);
         let root = plan.unix_root;
         let root_volume = volumes[root];
-        let fs: &'static dyn vfs::Filesystem = Box::leak(root_volume.open(plan.boot_support != Some(root))
+        let fs: &'static dyn vfs::Filesystem = Box::leak(root_volume.open(!root_volume.is_esp)
             .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error)));
         if module_index == Some(root) {
             crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /",
@@ -690,27 +721,31 @@ fn mount_filesystems(
                 .unwrap_or_else(|error| lib::compact_panic!("C: mount failed: {}", error)))
                 as &'static dyn vfs::Filesystem
         };
-        let data_subdir = dos_volume.c_root(boot);
-        let c_root = if dos == root { prefix(&[data_subdir]) } else {
-            prefix(&[if boot.c_root().is_empty() { b"home/retroos/" } else { boot.c_root() }])
-        };
+        let data_subdir = if plan.dos_drive.is_some() { plan.dos_subdir.as_slice() }
+            else { dos_volume.c_root(boot) };
+        // C: has one canonical place in the Unix namespace, regardless of
+        // whether its data comes from a FAT root or an ext4 home directory.
+        let c_root = prefix(&[boot.c_root()]);
         crate::kernel::dos::set_c_root(c_root);
-        if plan.boot_support == Some(root) {
+        if root_volume.is_esp {
             vfs::mount_readonly(b"", fs);
         } else {
-            root_volume.mount_writable(b"", fs, root_volume.c_root(boot));
+            root_volume.mount_writable(b"", fs, if dos == root { data_subdir } else { root_volume.c_root(boot) });
         }
-        if plan.boot_support == Some(dos) {
+        if dos_volume.is_esp {
             vfs::mount_readonly(b"dosfs/", dos_fs);
         } else {
             dos_volume.mount_writable(b"dosfs/", dos_fs, data_subdir);
         }
         let data_home = prefix(&[b"dosfs/", data_subdir]);
-        if dos != root { vfs::bind(c_root, data_home); }
+        if dos != root || c_root != data_subdir { vfs::bind(c_root, data_home); }
         crate::screenln!(screen, "{} C: ({} MB) from {} → /{}",
             dos_volume.name(), dos_volume.volume.sectors / 2048,
             if module_index == Some(dos) { "RAM" } else { "disk" },
             core::str::from_utf8(c_root).unwrap_or("?"));
+
+        crate::screenln!(screen, "C: backing volume {} ({}) directory /{}",
+            dos, dos_volume.volume.disk().name(), core::str::from_utf8(data_subdir).unwrap_or("?"));
 
         // Explicit installed runtime wins; otherwise RAM and EFI boot sources
         // provide identical RETROOS + CONFIG roles.
@@ -748,7 +783,7 @@ fn mount_filesystems(
                 volume.name(), volume.volume.sectors / 2048,
                 core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?"));
         }
-        mount_boot_directories(c_root, (plan.boot_support != Some(dos)).then_some(data_home), boot_source, screen);
+        mount_boot_directories(c_root, (!dos_volume.is_esp).then_some(data_home), boot_source, screen);
 
         let mut disk_number = 0;
         for (i, volume) in volumes.iter().enumerate() {
@@ -855,12 +890,26 @@ fn blaster_base(v: &[u8]) -> Option<u16> {
         if tok[0].eq_ignore_ascii_case(&b'A') {
             let mut n: u16 = 0;
             for &c in &tok[1..] {
-                n = n * 16 + (c as char).to_digit(16)? as u16;
+                n = n.checked_mul(16)?.checked_add((c as char).to_digit(16)? as u16)?;
             }
             return Some(n);
         }
     }
     None
+}
+
+/// BLASTER resources requested when configuring an ISA PnP card.
+fn blaster_resources(value: &[u8]) -> Option<crate::kernel::drivers::isapnp::SbResources> {
+    let mut mpu = 0x330;
+    for token in value.split(|b| b.is_ascii_whitespace()).filter(|t| !t.is_empty()) {
+        if token[0].eq_ignore_ascii_case(&b'P') {
+            mpu = token[1..].iter().try_fold(0u16, |n, &b|
+                n.checked_mul(16)?.checked_add((b as char).to_digit(16)? as u16))?;
+        }
+    }
+    Some(crate::kernel::drivers::isapnp::SbResources {
+        base: blaster_base(value)?, mpu, wiring: blaster_wiring(value)?,
+    })
 }
 
 /// BLASTER's I/D/H tokens as a wiring triple — what the owner wants the card
@@ -962,6 +1011,36 @@ fn run<A: crate::Arch>(
     mut sb: Option<crate::kernel::drivers::sb16::Sb16>,
     mut sink: Option<crate::kernel::sound::Sink>,
 ) -> ! {
+    if boot.boot_log_only {
+        // Snapshot before replaying selected lines so the replay cannot feed
+        // back into itself or overwrite the original boot evidence.
+        let mut log = alloc::vec![0; klog::byte_len() as usize];
+        let len = klog::read(0, &mut log);
+        log.truncate(len);
+        let saved = crate::kernel::klog::save_boot_snapshot(machine);
+        lib::term::term().clear();
+        crate::compact_screenln!(&mut screen, "RetroOS boot diagnostics (startup disabled)");
+        for line in log.split(|&byte| byte == b'\n') {
+            if [b"xHCI:".as_slice(), b"IRQ: no i8042", b"Storage:",
+                b"Filesystems:", b"C: backing", b"DOS C:", b"ISA LPC:", b"ISA PnP:", b"sb:"]
+                .iter().any(|prefix| line.starts_with(prefix)) {
+                crate::compact_screenln!(&mut screen,
+                    "{}", core::str::from_utf8(line).unwrap_or("?"));
+            }
+        }
+        match saved {
+            Ok(()) => crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT"),
+            Err(error) => crate::compact_screenln!(&mut screen,
+                "Boot log: could not save C:\\KLOG.TXT (error {})", error),
+        }
+        if boot.ram_overlay {
+            crate::compact_screenln!(&mut screen, "Protected disk: log writes stay in RAM.");
+        }
+        crate::compact_screenln!(&mut screen, "Stopped for photo. Restart to boot normally.");
+        screen.present(machine, bios_workspace);
+        machine.halt_forever();
+    }
+
     // What to run headlessly, from whichever channel the backend has. QEMU and
     // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
     // Bochs have NO such channel — `--cmd` was silently ignored there, so every
@@ -1036,6 +1115,11 @@ fn run<A: crate::Arch>(
     let (start_path, start_tail) = startup_command(master_env, crate::kernel::dos::c_root());
     crate::compact_screenln!(&mut screen, "Starting {}...",
         core::str::from_utf8(&start_path).unwrap_or("?"));
+    match crate::kernel::klog::save_boot_snapshot(machine) {
+        Ok(()) => crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT"),
+        Err(error) => crate::compact_screenln!(&mut screen,
+            "Boot log: could not save C:\\KLOG.TXT (error {})", error),
+    }
     loop {
         (screen, sb) = run_program_with_screen(
             machine,

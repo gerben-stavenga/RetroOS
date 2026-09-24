@@ -60,6 +60,8 @@ const RATE: u32 = 44_100;
 /// is neither `Copy` nor `Clone`, and moves between native DOS ownership, the
 /// event-loop handoff, and the kernel audio output.
 pub struct Sb16 {
+    /// PnP IRQ/DMA are configured through ISA PnP, never mixer soft-straps.
+    pnp: bool,
     /// The port window the card decodes.
     pub base: u16,
     /// The physical completion IRQ.
@@ -107,15 +109,22 @@ impl Sb16 {
         SbWiring { irq: self.irq, dma8: self.dma8, dma16: self.dma16 }
     }
 
+    pub fn is_pnp(&self) -> bool { self.pnp }
+
     /// Move the card's soft-straps (mixer 0x80/0x81) and adopt whatever it
     /// ACCEPTED — an emulation that pins its wiring reports the old values
     /// back, and the holder must proceed from truth, not intent. Only the
     /// holder can call this, which is the point: the acting wiring is the
     /// card's, so it cannot drift from a copy kept somewhere else.
     ///
+    /// Creative PnP boards expose 0x80/0x81 as read-only: their wiring must
+    /// be assigned through ISA PnP before this path. See Creative's Hardware
+    /// Programming Guide, p. 2-11, and `drivers::isapnp`. Readback keeps an
+    /// ignored mixer write from changing our view of the physical wiring.
     /// Pre-SB16 cards have no such registers; there is nothing to move, and
     /// their declared wiring stands.
     pub fn restrap<A: crate::Arch>(&mut self, machine: &mut A, want: SbWiring) -> SbWiring {
+        if self.pnp { return self.wiring(); }
         let got = strap_wiring(machine, self.base, want);
         self.irq = got.irq;
         self.dma8 = got.dma8;
@@ -140,13 +149,6 @@ pub struct SbWiring {
 /// with 0xAA at exactly one; empty ISA space reads 0xFF.
 const BASES: [u16; 4] = [0x220, 0x240, 0x260, 0x280];
 
-/// Does a Sound Blaster answer anywhere? Presence only — the fact
-/// `platform::probe` needs for its `AudioHw` verdict, long before CONFIG.SYS
-/// is readable and therefore long before a card can be minted.
-pub fn answers<A: crate::Arch>(machine: &mut A) -> bool {
-    BASES.into_iter().any(|b| dsp_reset_at(machine, b))
-}
-
 /// Mint the machine's Sound Blaster capability: sweep the legal bases, ask
 /// what the card is (DSP 0xE1), and settle how it is wired.
 ///
@@ -161,6 +163,16 @@ pub fn answers<A: crate::Arch>(machine: &mut A) -> bool {
 /// owner can reach is exactly a card nobody holds.
 pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Option<Sb16> {
     let base = BASES.into_iter().find(|&b| dsp_reset_at(machine, b))?;
+    identify(machine, base, declared, false)
+}
+
+/// PnP already selected and verified this DSP. Do not sweep other bases and
+/// accidentally bind a different legacy card instead.
+pub(crate) fn from_pnp<A: crate::Arch>(machine: &mut A, base: u16) -> Option<Sb16> {
+    identify(machine, base, None, true)
+}
+
+fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWiring>, pnp: bool) -> Option<Sb16> {
     let dsp_major = dsp_version_major(machine, base);
     let is_sb16 = dsp_major >= 4;
     let Some(w) = (if is_sb16 { Some(read_wiring(machine, base)) } else { declared }) else {
@@ -197,6 +209,7 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
         ),
     }
     Some(Sb16 {
+        pnp,
         base,
         irq: w.irq,
         dma8: w.dma8,
@@ -217,7 +230,7 @@ fn dsp_version_major<A: crate::Arch>(machine: &mut A, base: u16) -> u8 {
 fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
     machine.outb(base + 0x04, 0x80);
     let v = machine.inb(base + 0x05);
-    let irq = if v & 0x01 != 0 { 2 } else if v & 0x02 != 0 { 5 }
+    let irq = if v & 0x01 != 0 { 9 } else if v & 0x02 != 0 { 5 }
         else if v & 0x04 != 0 { 7 } else if v & 0x08 != 0 { 10 } else { 5 };
     machine.outb(base + 0x04, 0x81);
     let d = machine.inb(base + 0x05);
@@ -238,7 +251,7 @@ fn read_wiring<A: crate::Arch>(machine: &mut A, base: u16) -> SbWiring {
 /// proceeds from truth, not intent.
 pub fn strap_wiring<A: crate::Arch>(machine: &mut A, base: u16, want: SbWiring) -> SbWiring {
     let irq_bits: u8 = match want.irq {
-        2 => 0x01,
+        2 | 9 => 0x01,
         5 => 0x02,
         7 => 0x04,
         10 => 0x08,
@@ -263,7 +276,7 @@ pub fn strap_wiring<A: crate::Arch>(machine: &mut A, base: u16, want: SbWiring) 
     read_wiring(machine, base)
 }
 
-fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
+pub(super) fn dsp_reset_at<A: crate::Arch>(machine: &mut A, base: u16) -> bool {
     machine.outb(base + 0x06, 1);
     for _ in 0..1000 {
         core::hint::spin_loop();

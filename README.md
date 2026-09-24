@@ -104,6 +104,60 @@ to choose what starts at boot. The program restarts when it exits. `--cmd` and
 `TEST=` override it for tests. Migrate an existing disk with
 `python3 tools/migrate_dn_state.py --image build/data.bin` while it is offline.
 
+A detected Linux filesystem supplies `/`; otherwise the RAM boot image supplies
+it (or the selected FAT volume for a disk-only boot). C: appears at `/home/retroos`:
+its data comes from either that Linux home directory or a FAT volume mounted
+there. FAT volumes with `CONFIG`, `GAMES`, or `ULTRAMID` are preferred C:
+candidates; otherwise an existing ext4 `/home/retroos` wins, followed by another
+user home under `/home`, then a plain FAT volume. Equally marked FAT volumes
+prefer the larger partition, with partition scan order breaking remaining ties.
+A dedicated ESP (MBR type `0xEF` or GPT EFI System Partition GUID) is excluded
+from automatic C: selection. Merely containing `EFI`, `boot/grub`, or `RETROOS`
+does not exclude a data volume. Runtime discovery is independent: the GRUB RAM
+module still supplies `C:\RETROOS`. An explicit root UUID overrides selection.
+RAM C: is the fallback when no physical data candidate exists. The boot log
+reports the backing volume and directory; selection never formats partitions.
+
+Sound Blaster discovery checks ISA Plug and Play first. A Creative PnP audio
+device, including one already initialized by firmware, is configured using the
+existing `BLASTER` setting in `C:\CONFIG\CONFIG.SYS`, for example
+`BLASTER=A220 I7 D1 H5 P330 T6`. Its A/I/D/H/P fields request the SB port,
+IRQ, 8-bit DMA, optional 16-bit DMA, and MPU port (`P` defaults to `330`).
+RetroOS checks the card's advertised resource alternatives and other active
+ISA PnP devices, activates the audio function, then verifies the DSP and reads
+back its wiring. In mixed mode, BLASTER also continues to describe the
+emulated guest card. Only when no PnP Sound Blaster is found does RetroOS try
+legacy DSP probing and mixer restrapping. A PnP configuration failure does
+not fall through to legacy restrapping. Discovery always logs the IDs of all
+readable ISA PnP logical devices, including non-audio functions.
+
+For dISAppointment hardware, select the USB GRUB **dISAppointment ISA bridge**
+submenu, or append `isa-lpc=disappointment` to the `multiboot` line (press `e`
+in GRUB, edit, then Ctrl-X to boot). This opt-in runs before PnP discovery.
+Currently supported: Intel desktop Z68/P67/H67/Q65 and Z77/H71/Z75/Q77/Q75/B75/H77
+LPC controllers at 00:1f.0, with a Fintek F85226 at 4E/4F. Unknown chipsets or
+missing bridges are logged and skipped; the option is not required for normal
+PnP discovery or cards with working firmware/DOS routing. Setup replaces the
+four generic LPC decode windows with the dISAppointment sound/PnP ranges,
+configures the bridge timing, and resets ISA DMA while preserving PIC masks.
+Readback failure restores previous bridge/decode settings. Physical validation
+is still needed; other chipset generations and a bridge strapped to 2E/2F
+are not supported yet. The diagnostic submenu leaves logs on screen for a photo.
+Inspired by [rasteri's dISAppointment / sapphisa](https://github.com/rasteri/dISAppointment/blob/main/software/sapphisa.c);
+see `THIRD_PARTY_LICENSES.md` for attribution and adaptation licensing.
+Allocation against all legacy/PCI devices and AWE synthesis initialization
+are not implemented.
+
+Before the interactive startup program runs, RetroOS overwrites `C:\KLOG.TXT`
+with a snapshot of the boot log and flushes it. Failure to save is reported
+without stopping startup. The file survives reboot only on a persistent data
+volume; protected-disk and RAM-only boots keep it in RAM. This captures boots
+that reach the startup program even when keyboard input is unavailable, but
+cannot capture an earlier boot hang. The USB GRUB submenu **Boot diagnostics
+(no DN; stop for photo)** saves the log, displays USB/storage discovery results,
+and stops before launching any program. This is also available via the kernel
+argument `boot-log-only`.
+
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 `--host DIR` uses the live host tree with the hosted backend, or exports it as
 HostFS under QEMU. `--cmd` is supported on QEMU and hosted; the launcher does

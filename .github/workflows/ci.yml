@@ -41,7 +41,7 @@ jobs:
       - name: Install test tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs gcc-multilib
+          sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib
 
       # KVM is opportunistic: present on GitHub's standard x86 Linux runners,
       # absent on ARM/container ones. When the device exists the KVM suites are
@@ -99,7 +99,7 @@ jobs:
           python3 test/release.py
           # Later host-platform builds change the bazel-bin symlink.
           mkdir -p build/release
-          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module.iso bazel-bin/SHA256SUMS build/release/
+          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module.iso bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS build/release/
 
       # clippy runs under -D warnings via the rules_rust aspect (--config=clippy),
       # so any diagnostic fails the build. Metal crates lint on the default
@@ -172,6 +172,7 @@ jobs:
             build/release/retroos-vm.tar.gz
             build/release/retroos-machine.tar.gz
             build/release/retroos_grub_module.iso
+            build/release/retroos-usb-diagnostic.zip
             build/release/SHA256SUMS
           if-no-files-found: error
           compression-level: 0

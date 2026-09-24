@@ -13,11 +13,15 @@ pub mod ac97;
 pub mod alc298_amp;
 pub mod hda;
 pub mod sb16;
+pub mod isapnp;
 pub mod sb_guest;
 pub mod vga_hw;
+pub mod nvidia_vga;
 pub mod hdd;
 pub mod nvme;
 pub mod storage;
 pub mod dma;
 pub mod ahci;
 pub mod uart16550;
+
+pub mod isa_lpc;

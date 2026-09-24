@@ -24,6 +24,8 @@ pub enum PartKind {
     Linux,
     /// FAT of some flavour.
     Fat,
+    /// Dedicated EFI System Partition (MBR 0xEF or the GPT ESP type GUID).
+    EfiSystem,
     /// RetroOS's own 0xDA boot bundle — the bootloader's business, never
     /// mounted.
     BootBundle,
@@ -45,6 +47,7 @@ impl PartKind {
             0x83 => PartKind::Linux,
             0x01 | 0x04 | 0x06 | 0x0B | 0x0C | 0x0E => PartKind::Fat,
             0xDA => PartKind::BootBundle,
+            0xEF => PartKind::EfiSystem,
             other => PartKind::Other(other),
         }
     }
@@ -94,8 +97,8 @@ fn self_mbr(disk: Volume, mbr: &[u8; 512]) -> Vec<Partition> {
 /// Walk the GPT. LBA 1 holds the header (signature "EFI PART", then the
 /// partition-array LBA, entry count and entry stride); the array follows.
 ///
-/// Type GUIDs are deliberately not interpreted: an ext partition is one with
-/// an ext superblock at its start, whatever the installer typed it as.
+/// Preserve the ESP role for mount policy; filesystem formats are still probed
+/// from their superblocks rather than inferred from a partition type.
 fn gpt(disk: Volume) -> Vec<Partition> {
     let mut out = Vec::new();
     let mut hdr = [0u8; 512];
@@ -108,7 +111,7 @@ fn gpt(disk: Volume) -> Vec<Partition> {
     let entry_size = u32::from_le_bytes(hdr[0x54..0x58].try_into().unwrap()) as usize;
     // Standard entries are 128 bytes (4 per 512-byte sector) and never straddle
     // a sector. Bail on anything that doesn't divide a sector cleanly.
-    if entry_size == 0 || entry_lba == 0 || 512 % entry_size != 0 {
+    if entry_size < 128 || entry_lba == 0 || 512 % entry_size != 0 {
         return out;
     }
     let per_sector = 512 / entry_size;
@@ -126,12 +129,13 @@ fn gpt(disk: Volume) -> Vec<Partition> {
             if first == 0 || last < first {
                 continue;
             }
-            // GPT type GUIDs are deliberately not interpreted — an ext root is
-            // one with an ext superblock, whatever the installer typed it as,
-            // and only the fs layer can tell.
+            // C12A7328-F81F-11D2-BA4B-00A0C93EC93B in GPT byte order.
+            const ESP_GUID: [u8; 16] = [0x28, 0x73, 0x2a, 0xc1, 0x1f, 0xf8, 0xd2, 0x11,
+                0xba, 0x4b, 0x00, 0xa0, 0xc9, 0x3e, 0xc9, 0x3b];
             out.push(Partition {
                 volume: Volume::new(disk.disk(), first, last - first + 1),
-                kind: PartKind::Other(0),
+                kind: if buf[off..off + 16] == ESP_GUID { PartKind::EfiSystem }
+                    else { PartKind::Other(0) },
             });
         }
     }

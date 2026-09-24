@@ -1,9 +1,9 @@
 # Third-party components & credits
 
-RetroOS's own source is under the WTFPL (see `LICENSE`). It does **not** vendor
-third-party code — the components below are fetched at build time (Bazel
-`http_archive` / `crate.spec`) and linked into the build. This file credits
-their authors and records their licenses.
+RetroOS's own source is under the WTFPL (see `LICENSE`), except for the
+explicitly licensed adaptations below. Dependencies are fetched at build time
+and some derived code is maintained in-tree. This file credits their authors
+and records their licenses.
 
 > **Redistribution note.** Some components are copyleft. In particular, a build
 > that links **unicorn** (GPL-2.0) produces a **GPL-2.0**
@@ -55,3 +55,51 @@ Bazel rulesets used only to build — `rules_rust`, `rules_cc`, `rules_nasm`,
 Licenses above are the projects' documented terms; consult each project's own
 `LICENSE` for the authoritative text. Thanks to all of these authors — RetroOS
 would be a great deal more work without them.
+
+## NVIDIA video-BIOS workarounds
+
+`kernel/src/kernel/drivers/nvidia_vga.rs` and the native BIOS wrapper contain
+workarounds inspired by **EGAFIX 0.08**, by **Gael Cathelin** (the supplied
+`EGAFIX08.zip` / `egafix.asm`), and adapted from **NEWAX**, by **Marco Pistella**
+(https://github.com/Marco-Pistella/NEWAX). EGAFIX is credited for its legacy
+mode substitutions and hardware register recipes; its TSR is not included.
+NEWAX is credited for NVIDIA extended CRTC pitch/start-address programming
+and compatibility detection. Its MIT notice follows:
+
+```text
+MIT License
+
+Copyright (c) 2026 Marco Pistella
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## dISAppointment LPC/ISA setup
+
+`kernel/src/kernel/drivers/isa_lpc.rs` adapts the hardware setup from
+[sapphisa.c by rasteri](https://github.com/rasteri/dISAppointment/blob/main/software/sapphisa.c),
+part of dISAppointment. The upstream project and this adaptation are licensed
+under [Creative Commons Attribution-ShareAlike 4.0 International](https://creativecommons.org/licenses/by-sa/4.0/).
+The upstream license is at https://github.com/rasteri/dISAppointment/blob/main/LICENSE.
+Provided as-is, without warranties; see the linked license for its disclaimer.
+
+RetroOS changes: Rust implementation, explicit GRUB opt-in, Intel chipset and
+Fintek identity checks, register readback with rollback, and standard ISA DMA
+reset/cascade initialization that preserves the kernel's interrupt masks.
+No endorsement by the original author is implied.

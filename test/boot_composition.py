@@ -18,10 +18,10 @@ def file(tree, name, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
-def image(work, name, tree, kind):
+def image(work, name, tree, kind, esp=False, size_mb=32):
     path = work / (name + '.img')
     with path.open('wb') as f:
-        f.truncate(32 * 1024 * 1024)
+        f.truncate(size_mb * 1024 * 1024)
     if kind == 'ext4':
         for entry in [tree, *tree.rglob('*')]:
             entry.chmod(0o775 if entry.is_dir() else 0o664)
@@ -30,7 +30,24 @@ def image(work, name, tree, kind):
         run('mkfs.fat', '-F', '16', path, stdout=subprocess.DEVNULL)
         for entry in tree.iterdir():
             run('mcopy', '-s', '-i', path, entry, '::/')
+    if esp:
+        return partition_image(work, name, path, 'dos', 'ef')
     return path
+
+
+def partition_image(work, name, volume, table, partition_type):
+    """Wrap a filesystem in a real partition table without privileged mounts."""
+    disk = work / (name + '-partitioned.img')
+    size = volume.stat().st_size
+    with disk.open('wb') as stream:
+        stream.truncate(size + 2 * 1024 * 1024)
+    run('sfdisk', disk, input=f'label: {table}\nstart=2048,size={size // 512},type={partition_type}\n',
+        text=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with disk.open('r+b') as stream, volume.open('rb') as source:
+        stream.seek(1024 * 1024)
+        shutil.copyfileobj(source, stream)
+    return disk
+
 
 def boot(work, name, module, disks, protected=False, extra_args=""):
     tree = work / name
@@ -68,6 +85,7 @@ def boot(work, name, module, disks, protected=False, extra_args=""):
     if 'COMPOSITION-OK' not in text or 'PANIC' in text:
         raise AssertionError(name + '\n' + text)
     print('PASS:', name, flush=True)
+    return text
 
 def main():
     run('bazelisk', 'build', '//kernel:kernel_elf')
@@ -84,7 +102,7 @@ def main():
             file(home, 'CONFIG/OVERRIDE.TXT', b'B')
             file(home, 'CONFIG/NESTED/DEFAULT.TXT', b'B')
             (boot_tree / ('bin' if source == 'module' else 'EFI')).mkdir(exist_ok=True)
-            boot_image = image(work, source, boot_tree, 'ext4' if source == 'module' else 'fat')
+            boot_image = image(work, source, boot_tree, 'ext4' if source == 'module' else 'fat', esp=source == 'efi')
             boot_hash = hashlib.sha256(boot_image.read_bytes()).digest()
             for kind in ['ext4', 'fat']:
                 data_tree = work / (source + '-' + kind)
@@ -116,7 +134,7 @@ def main():
             file(home, 'DATA.TXT', b'D')
             file(home, 'CONFIG/OVERRIDE.TXT', b'D')
             file(home, 'TEMP/OLD.TXT', b'D')
-            fallback = image(work, source + '-only', boot_tree, 'ext4' if source == 'module' else 'fat')
+            fallback = image(work, source + '-only', boot_tree, 'ext4' if source == 'module' else 'fat', esp=source == 'efi')
             before = hashlib.sha256(fallback.read_bytes()).digest()
             boot(work, source + '-only', fallback if source == 'module' else None,
                  [] if source == 'module' else [fallback])

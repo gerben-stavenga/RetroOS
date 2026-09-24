@@ -804,7 +804,7 @@ impl Vfs {
             false
         });
 
-        // Synthesize mount/bind-point directories that live directly under `dir`.
+        // Synthesize mount points and missing ancestors beneath `dir`.
         for b in &self.mounts {
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
                 && claim_visible_name(&mut visible_names, name, entries.len()) {
@@ -1480,13 +1480,20 @@ fn split_parent_bytes(path: &[u8]) -> Option<(&[u8], &[u8])> {
     })
 }
 
-/// If a mount prefix is a direct child of `dir`, return the child name.
-/// e.g. mount "boot/" in dir "" → Some("boot"), mount "a/b/" in dir "a/" → Some("b").
+/// Return the next directory component leading from `dir` to a mount point.
+/// Ancestors must be visible even when the backing root lacks those directories.
 fn mount_child_in_dir<'a>(prefix: &'a [u8], dir: &[u8]) -> Option<&'a [u8]> {
     let prefix = prefix.strip_suffix(b"/").unwrap_or(prefix);
     let dir = dir.strip_suffix(b"/").unwrap_or(dir);
-    let (parent, name) = split_parent_bytes(prefix)?;
-    (!name.is_empty() && eq_ignore_case(parent, dir)).then_some(name)
+    let rest = if dir.is_empty() {
+        prefix
+    } else {
+        if prefix.len() <= dir.len() || !eq_ignore_case(&prefix[..dir.len()], dir)
+            || prefix[dir.len()] != b'/' { return None; }
+        &prefix[dir.len() + 1..]
+    };
+    let name = rest.split(|byte| *byte == b'/').next()?;
+    (!name.is_empty()).then_some(name)
 }
 
 // ============================================================================
@@ -2105,6 +2112,10 @@ mod tests {
 
     #[test]
     fn nested_mounts_accept_normalized_directory_paths() {
+        assert_eq!(mount_child_in_dir(b"home/retroos/", b""), Some(&b"home"[..]));
+        assert_eq!(mount_child_in_dir(b"home/retroos/", b"home"), Some(&b"retroos"[..]));
+        assert_eq!(mount_child_in_dir(b"home/retroos/", b"hom"), None);
+        assert_eq!(mount_child_in_dir(b"home/retroos/", b"home/retroos"), None);
         assert_eq!(
             mount_child_in_dir(b"home/retroos/proc/", b"home/retroos"),
             Some(&b"proc"[..]),

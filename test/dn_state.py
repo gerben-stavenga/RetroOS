@@ -93,6 +93,12 @@ def main():
             run("mcopy", "-i", disk, ROOT / f"apps-boot/dn/DN.{ext}", f"::CONFIG/DN/DN.{ext}")
         for first in (True, False):
             session(work, disk, first)
+            boot_log = subprocess.check_output(["mtype", "-i", str(disk), "::KLOG.TXT"])
+            assert b"Interrupts initialized" in boot_log, boot_log
+            assert b"Starting " in boot_log and b"DN.COM" in boot_log, boot_log
+            # Snapshot precedes DN and is not rewritten when DN restarts.
+            assert b"Dos Navigator  Version" not in boot_log, boot_log
+            assert b"Startup program exited" not in boot_log, boot_log
             history = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.HIS"])
             config = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.CFG"])
             assert b"STATECHECK" in history, history

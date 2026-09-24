@@ -111,7 +111,8 @@ if [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
     if [ ! -e "$DATA_IMAGE" ]; then
         SEED=data_disk
         [ ! -d apps-proprietary ] || SEED=data_disk_proprietary
-        "$BAZEL" build "//:$SEED"
+        # The persistent Bazel server must not inherit the data-image lock.
+        "$BAZEL" build "//:$SEED" 9>&-
         # Hard-link publication is atomic and never replaces an existing image.
         STAGED=$(mktemp "$(dirname "$DATA_IMAGE")/.data-seed.XXXXXX")
         cp --reflink=auto "bazel-bin/$SEED.bin" "$STAGED"
@@ -121,7 +122,7 @@ if [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
         STAGED=
     fi
     [ -f "$DATA_IMAGE" ] && [ -w "$DATA_IMAGE" ] || fail "data image is not writable: $DATA_IMAGE"
-    "$BAZEL" build //:boot_disk
+    "$BAZEL" build //:boot_disk 9>&-
     BOOT_IMAGE="$WORK/boot.bin"
     cp --reflink=auto bazel-bin/boot_disk.bin "$BOOT_IMAGE"
     chmod u+rw "$BOOT_IMAGE"

@@ -524,12 +524,19 @@ pub fn apply_audio_mode<A: crate::Arch>(
     machine: &mut A,
     mixed: bool,
     declared: Option<crate::kernel::drivers::sb16::SbWiring>,
+    pnp: Option<crate::kernel::drivers::isapnp::SbResources>,
 ) -> Option<crate::kernel::drivers::sb16::Sb16> {
     let p = unsafe { (&raw mut PLATFORM).as_mut().unwrap().as_mut() }
         .expect("platform::apply_audio_mode before probe");
-    let card = (p.audio_hw == AudioHw::Sb)
-        .then(|| crate::kernel::drivers::sb16::scan(machine, declared))
-        .flatten();
+    // PnP owns discovery and configuration first. Only genuine absence
+    // permits a legacy base sweep; failure on a PnP card is not absence.
+    use crate::kernel::drivers::{isapnp, sb16};
+    let card = match isapnp::probe_sb(machine, pnp) {
+        isapnp::SbProbe::Configured(base) => sb16::from_pnp(machine, base),
+        isapnp::SbProbe::Absent => sb16::scan(machine, declared),
+        isapnp::SbProbe::Failed => None,
+    };
+    if card.is_some() { p.audio_hw = AudioHw::Sb; }
     // The mode is a choice only where there is a card to choose about, and
     // `mixed` additionally needs a card that can BE the sink: the kernel mixer
     // drives 16-bit signed-stereo auto-init, which an SB Pro cannot do at all.
@@ -647,12 +654,8 @@ pub fn get() -> &'static Platform {
 /// with the fact recorded in `Platform`; SB presence is separate because its
 /// wiring and ownership policy cannot be settled until CONFIG.SYS is mounted.
 fn probe_audio<A: crate::Arch>(machine: &mut A) -> (AudioHw, AudioToken) {
-    // Presence only. Minting the card needs its wiring, and a pre-SB16 card's
-    // wiring comes from CONFIG.SYS — unreadable this early — so the capability
-    // is minted later, in `apply_audio_mode`.
-    if crate::kernel::drivers::sb16::answers(machine) {
-        return (AudioHw::Sb, AudioToken::None);
-    }
+    // Defer all Sound Blaster probing until CONFIG.SYS is available, so
+    // ISA PnP discovery precedes the legacy DSP sweep in apply_audio_mode.
     if let Some(device) = crate::kernel::drivers::hda::probe(machine) {
         return (AudioHw::Hda, AudioToken::Hda(device));
     }

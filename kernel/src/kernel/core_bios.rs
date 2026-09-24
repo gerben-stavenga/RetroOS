@@ -374,6 +374,7 @@ struct NativeBiosWorkspace<A: Arch> {
     modes: Vec<crate::kernel::platform::VbeMode>,
     state_bytes: Option<usize>,
     state_probed: bool,
+    nvidia_workarounds: bool,
 }
 
 impl<A: Arch> BiosDisplayWorkspace<A> {
@@ -478,6 +479,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             modes: Vec::new(),
             state_bytes: None,
             state_probed: false,
+            nvidia_workarounds: false,
         }
     }
 
@@ -568,6 +570,57 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
     }
 
+    /// Inspired by NEWAX's Detect_Supported_Nvidia (Marco Pistella): CR3B
+    /// must actually affect the firmware's reported pitch. Restore the register,
+    /// lock and index even if the second firmware call fails. When 4F06 is
+    /// missing, additionally require G80-style register write protection.
+    fn detect_nvidia(&mut self, machine: &mut A, cap: &crate::kernel::platform::VgaCap) -> bool {
+        use crate::kernel::drivers::nvidia_vga as nv;
+        if !nv::primary_nvidia(machine) { return false; }
+        let mut before = Regs::empty();
+        before.rax = 0x4F06;
+        before.rbx = 1;
+        if self.call_buffer(machine, cap, &mut before, BiosTransfer::None).is_err() { return false; }
+        let port = nv::crtc_port(cap);
+        let index = crate::kernel::portio::inb(port);
+        let lock = nv::read(cap, port, 0x3F);
+        nv::write(cap, port, 0x3F, 0x57);
+        let old = nv::read(cap, port, 0x3B);
+        let probe = if old == 1 { 2 } else { 1 };
+        nv::write(cap, port, 0x3F, 0x08);
+        nv::write(cap, port, 0x3B, probe);
+        let protected = nv::read(cap, port, 0x3B) == old;
+        nv::write(cap, port, 0x3F, 0x57);
+        nv::write(cap, port, 0x3B, probe);
+        let writable = nv::read(cap, port, 0x3B) == probe;
+        let supported = if before.rax as u16 == 0x004F {
+            let mut after = Regs::empty();
+            after.rax = 0x4F06;
+            after.rbx = 1;
+            self.call_buffer(machine, cap, &mut after, BiosTransfer::None).is_ok()
+                && after.rax as u16 == 0x004F && after.rbx as u16 != before.rbx as u16
+        } else { protected };
+        nv::write(cap, port, 0x3F, 0x57);
+        nv::write(cap, port, 0x3B, old);
+        nv::write(cap, port, 0x3F, lock);
+        crate::kernel::portio::outb(port, index);
+        supported && writable
+    }
+
+    /// The private firmware BDA must describe EGAFIX's final mode too. The DOS
+    /// personality maintains its own BDA separately, after this operation.
+    fn fix_legacy_bda(&mut self, machine: &mut A, mode: u8) {
+        let caller = machine.activate(core::mem::take(&mut self.bios_vcpu.space),
+            &mut self.fx, core::ptr::null_mut());
+        let mode = match mode & 0x7F { 0 => 1, 2 => 3, 5 => 4, 0x0F => 0x10, m => m };
+        machine.write::<u8>(0x449, mode);
+        machine.write::<u16>(0x44A, if matches!(mode, 1 | 4 | 0x0D) { 40 } else { 80 });
+        machine.write::<u16>(0x44C, match mode { 1 => 0x800, 3 => 0x1000, 0x10 => 0x8000, _ => 0x4000 });
+        machine.write::<u8>(0x484, 24);
+        if mode == 0x10 { machine.write::<u16>(0x485, 14); }
+        self.bios_vcpu.space = machine.activate(caller, &mut self.fx, core::ptr::null_mut());
+    }
+
     /// Set a legacy (00h..FFh) or VBE (100h and above) mode through the
     /// machine's own video BIOS. This is a regular
     /// synchronous Rust call: the stopped guest's address space and FPU state
@@ -592,8 +645,17 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         let number = request & 0x3FFF;
         if number <= 0xFF {
             let mut regs = Regs::empty();
-            regs.rax = u64::from(number);
+            // EGAFIX 0.08 (Gael Cathelin): initialize a working VGA mode,
+            // then reconstruct the requested CGA/EGA mode on affected NVIDIA.
+            use crate::kernel::drivers::nvidia_vga as nv;
+            let fallback = self.nvidia_workarounds.then(|| nv::legacy_base(number as u8)).flatten();
+            regs.rax = u64::from(fallback.map_or(number, u16::from));
             self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
+            if fallback.is_some() {
+                nv::finish_legacy(bios_display, number as u8);
+                self.fix_legacy_bda(machine, number as u8);
+            }
+            if self.nvidia_workarounds { nv::reset_start(bios_display); }
             return Ok(());
         }
         let Some(_mode) = self.mode(number) else {
@@ -605,6 +667,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         self.call_buffer(machine, bios_display, &mut regs, BiosTransfer::None)?;
         let status = regs.rax as u16;
         if status == 0x004F {
+            if self.nvidia_workarounds {
+                crate::kernel::drivers::nvidia_vga::reset_start(bios_display);
+            }
             Ok(())
         } else {
             crate::compact_println!("VBE: physical mode set returned {:#x}", status);
@@ -621,6 +686,9 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         state: &mut PhysicalVbeState,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
+        if self.nvidia_workarounds {
+            return nvidia_display_start(display, state, caller);
+        }
         if caller.rbx as u8 == 1 {
             let (x, y) = state.svga.display_start(None)
                 .ok_or(BiosError::InvalidFrame)?;
@@ -661,6 +729,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         state: &mut PhysicalVbeState,
         caller: &mut Regs,
     ) -> Result<(), BiosError> {
+        if self.nvidia_workarounds {
+            let (next, result) = nvidia_scan_line(state.svga, caller.rbx as u8, caller.rcx as u16)
+                .ok_or(BiosError::InvalidFrame)?;
+            if matches!(caller.rbx as u8, 0 | 2) {
+                use crate::kernel::drivers::nvidia_vga as nv;
+                nv::set_pitch(display, next.logical_pitch);
+                // Our shadow retains X/Y across pitch changes, so the byte
+                // address must move with the pitch as well (including OSD restore).
+                if !nv::set_start(display, next.display_byte_offset() as u32, false) {
+                    return Err(BiosError::InvalidFrame);
+                }
+                state.svga = next;
+            }
+            caller.rax = (caller.rax & !0xFFFF) | 0x004F;
+            caller.rbx = (caller.rbx & !0xFFFF) | u64::from(result.bytes);
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(result.pixels);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(result.lines);
+            return Ok(());
+        }
         if matches!(caller.rbx as u8, 1 | 3) {
             let result = state.svga.scan_line(None)
                 .ok_or(BiosError::InvalidFrame)?;
@@ -1166,6 +1253,10 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         {
             return None;
         }
+        self.nvidia_workarounds = self.detect_nvidia(machine, bios_display);
+        if self.nvidia_workarounds {
+            crate::compact_println!("VGA: NVIDIA EGAFIX legacy modes + NEWAX VBE pitch/panning enabled");
+        }
         self.state_bytes = self.probe_state_size(machine, bios_display);
         self.state_probed = true;
         if let Some(bytes) = self.state_bytes {
@@ -1654,6 +1745,87 @@ fn prepare_bank_call<A: Arch>(
     return_ip
 }
 
+/// NEWAX-inspired scanline service. Keep memory validation in RetroOS and
+/// publish only the aligned, validated pitch to the NVIDIA registers.
+fn nvidia_scan_line(mut next: vga::SvgaState, subfn: u8, value: u16)
+    -> Option<(vga::SvgaState, vga::SvgaScanLine)>
+{
+    let mut query = next;
+    match subfn {
+        0 | 2 => {
+            let requested = next.scan_line(Some((value, subfn == 2)))?.bytes;
+            let pitch = crate::kernel::drivers::nvidia_vga::aligned_pitch(requested)?;
+            next.scan_line(Some((pitch, true)))?;
+            if u32::from(pitch) * u32::from(next.config.height) > next.config.framebuffer_bytes {
+                return None;
+            }
+            next = nvidia_start(next, next.display_start.0, next.display_start.1)?;
+            query = next;
+        }
+        1 => {}
+        3 => {
+            let max = (next.config.framebuffer_bytes / u32::from(next.config.height.max(1)))
+                .min(u32::from(u16::MAX)) & !7;
+            query.scan_line(Some((max as u16, true)))?;
+        }
+        _ => return None,
+    }
+    Some((next, query.scan_line(None)?))
+}
+
+/// Check the entire viewport with wide arithmetic before writing hardware.
+/// A malicious 16-bit X/Y request can overflow the generic u32 calculation.
+fn nvidia_start(mut next: vga::SvgaState, x: u16, y: u16) -> Option<vga::SvgaState> {
+    let pitch = u64::from(next.logical_pitch);
+    let step = u64::from(next.config.bits_per_pixel.div_ceil(8));
+    let start = u64::from(y) * pitch + u64::from(x) * step;
+    let visible = u64::from(next.config.height.saturating_sub(1)) * pitch
+        + u64::from(next.config.width) * step;
+    if start + visible > u64::from(next.config.framebuffer_bytes) { return None; }
+    next.display_start = (x, y);
+    Some(next)
+}
+
+/// NEWAX's display-start replacement: firmware is bypassed, while the same
+/// validated shadow is used for get operations and display-owner handovers.
+fn nvidia_display_start(
+    display: &crate::kernel::platform::VgaCap,
+    state: &mut PhysicalVbeState,
+    caller: &mut Regs,
+) -> Result<(), BiosError> {
+    use crate::kernel::drivers::nvidia_vga as nv;
+    let subfn = caller.rbx as u8;
+    let mut next = state.svga;
+    match subfn {
+        1 => {
+            let (x, y) = next.display_start;
+            caller.rcx = (caller.rcx & !0xFFFF) | u64::from(x);
+            caller.rdx = (caller.rdx & !0xFFFF) | u64::from(y);
+        }
+        4 => { caller.rcx &= !0xFFFF; } // We complete flips synchronously.
+        0 | 0x80 | 2 | 0x82 => {
+            let (x, y) = if matches!(subfn, 2 | 0x82) {
+                let offset = caller.rcx as u32;
+                let pitch = u32::from(next.logical_pitch);
+                let step = u32::from(next.config.bits_per_pixel.div_ceil(8));
+                if pitch == 0 || step == 0 || !(offset % pitch).is_multiple_of(step) {
+                    return Err(BiosError::InvalidFrame);
+                }
+                (u16::try_from(offset % pitch / step).map_err(|_| BiosError::InvalidFrame)?,
+                    u16::try_from(offset / pitch).map_err(|_| BiosError::InvalidFrame)?)
+            } else { (caller.rcx as u16, caller.rdx as u16) };
+            next = nvidia_start(next, x, y).ok_or(BiosError::InvalidFrame)?;
+            if !nv::set_start(display, next.display_byte_offset() as u32, subfn & 0x80 != 0) {
+                return Err(BiosError::InvalidFrame);
+            }
+            state.svga = next;
+        }
+        _ => return Err(BiosError::Rejected(0x014F)),
+    }
+    caller.rax = (caller.rax & !0xFFFF) | 0x004F;
+    Ok(())
+}
+
 fn parse_vbe_mode(
     info: &VbeModeInfo,
     number: u16,
@@ -1744,4 +1916,63 @@ fn parse_vbe_mode(
         framebuffer_bytes,
         window_function,
     })
+}
+
+#[cfg(test)]
+mod nvidia_tests {
+    use super::*;
+
+    fn surface() -> vga::SvgaState {
+        vga::SvgaState::new(0x101, vga::SvgaAccess::Linear, vga::SvgaConfig {
+            width: 640, height: 480, bits_per_pixel: 8,
+            banked_pitch: 640, linear_pitch: 640, framebuffer_bytes: 640 * 480 * 2,
+            palette_capable: true,
+        })
+    }
+
+    #[test]
+    fn pitch_is_aligned_and_bounded_by_complete_visible_frame() {
+        let original = surface();
+        let (next, result) = nvidia_scan_line(original, 2, 641).unwrap();
+        assert_eq!(next.logical_pitch, 648);
+        assert_eq!(result.bytes, 648);
+        assert_eq!(result.lines, 948);
+        assert!(nvidia_scan_line(original, 2, 639).is_none());
+        assert!(nvidia_scan_line(original, 2, 1281).is_none());
+        assert!(nvidia_scan_line(original, 2, 65535).is_none());
+        let mut flipped = original;
+        flipped.display_start = (0, 480);
+        assert!(nvidia_scan_line(flipped, 2, 648).is_none());
+    }
+
+    #[test]
+    fn max_pitch_query_does_not_change_current_pitch() {
+        let (next, result) = nvidia_scan_line(surface(), 3, 0).unwrap();
+        assert_eq!(next.logical_pitch, 640);
+        assert_eq!(result.bytes, 1280);
+        assert_eq!(result.lines, 480);
+        let (_, current) = nvidia_scan_line(next, 1, 0).unwrap();
+        assert_eq!(current.bytes, 640);
+        let mut rgb = surface();
+        rgb.config.bits_per_pixel = 32;
+        rgb.config.framebuffer_bytes *= 4;
+        rgb.logical_pitch = 2560;
+        let (_, result) = nvidia_scan_line(rgb, 0, 641).unwrap();
+        assert_eq!((result.bytes, result.pixels), (2568, 642));
+    }
+
+    #[test]
+    fn page_flip_rejects_offscreen_and_overflow_without_changing_state() {
+        let original = surface();
+        let flipped = nvidia_start(original, 0, 480).unwrap();
+        assert_eq!(flipped.display_byte_offset(), 640 * 480);
+        assert!(nvidia_start(original, 1, 480).is_none());
+        assert!(nvidia_start(original, 0, 481).is_none());
+        let mut huge = original;
+        huge.logical_pitch = 65528;
+        huge.config.bits_per_pixel = 32;
+        huge.config.framebuffer_bytes = u32::MAX;
+        assert!(nvidia_start(huge, u16::MAX, u16::MAX).is_none());
+        assert_eq!(original.display_start, (0, 0));
+    }
 }

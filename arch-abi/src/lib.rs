@@ -197,6 +197,10 @@ pub struct BootConfig {
     /// real install boots through GRUB, whose config its owner controls.
     /// Nothing infers this from the hardware.
     pub ram_overlay: bool,
+    /// Save the boot log and leave diagnostics on screen instead of launching DOS.
+    pub boot_log_only: bool,
+    /// Opt-in dISAppointment LPC/ISA bridge setup.
+    pub isa_lpc_disappointment: bool,
     /// Optional HostFS COM port. `None` leaves HostFS disabled.
     pub hostfs_port: Option<ComPort>,
     /// Optional kernel serial-console port. `None` leaves UART logging disabled.
@@ -224,7 +228,7 @@ impl BootConfig {
             c_root: [0; 128], c_root_len: 0, c_root_explicit: false,
             root_uuid: None, runtime: [0; 128], runtime_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
-            ram_overlay: false,
+            ram_overlay: false, boot_log_only: false, isa_lpc_disappointment: false,
             hostfs_port: None,
             serial_console_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],

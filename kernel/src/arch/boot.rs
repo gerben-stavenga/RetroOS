@@ -374,6 +374,14 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
         .split(|b| b.is_ascii_whitespace())
         .any(|arg| arg.eq_ignore_ascii_case(b"ram-overlay"));
 
+    cfg.boot_log_only = multiboot_cmdline
+        .split(|b| b.is_ascii_whitespace())
+        .any(|arg| arg.eq_ignore_ascii_case(b"boot-log-only"));
+
+    cfg.isa_lpc_disappointment = multiboot_cmdline
+        .split(|b| b.is_ascii_whitespace())
+        .any(|arg| arg.eq_ignore_ascii_case(b"isa-lpc=disappointment"));
+
     select(0x0000); // FW_CFG_SIGNATURE
     let mut sig = [0u8; 4];
     read_bytes(&mut sig);

@@ -2,7 +2,7 @@ launch() {
     local engine= target=retroos-play package=play args=()
     [ "$KVM" = 0 ] || engine=-kvm
     if [ "$HEADLESS" = 1 ]; then package=kernel; target=retroos-host; fi
-    "$BAZEL" build "//$package:$target$engine" --platforms=@platforms//host
+    "$BAZEL" build "//$package:$target$engine" --platforms=@platforms//host 9>&-
     [ -z "$COMMAND" ] || args+=(--cmd "$COMMAND")
     [ -z "$WAV" ] || args+=(--wav "$WAV")
     if [ -n "$SHOT" ]; then

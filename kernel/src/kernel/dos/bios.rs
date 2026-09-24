@@ -1184,7 +1184,7 @@ pub(super) fn int10<A: crate::Arch>(
             let clear = ax & 0x80 == 0;
             if let Some(display) = dos.pc.as_mut().vga.native_mut() {
                 let _ = display.cap_mut().guest_bios_set_mode(
-                    machine, bios_display, u16::from(mode));
+                    machine, bios_display, ax & 0xFF);
             }
             bda_field!(machine, video_mode = mode);
             // Text-grid geometry per mode: 40-column modes (CGA/EGA 320-wide and
