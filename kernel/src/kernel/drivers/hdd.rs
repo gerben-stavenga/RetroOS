@@ -230,8 +230,28 @@ impl Ata {
     }
 
     /// Bounded status polling; an absent or faulted drive must not wedge the
-    /// kernel while a filesystem waits for I/O.
+    /// kernel while a filesystem waits for I/O. A plain spin-count budget,
+    /// not elapsed time: this covers command issue and the per-sector DRQ
+    /// wait in the PIO transfer loop, which normally clears in nanoseconds
+    /// to microseconds — sampling a clock on every spin here is pure
+    /// overhead, and under QEMU/86Box's PIT/HPET clock fallback that
+    /// overhead is a trapped port read per spin, per sector. Only a cache
+    /// flush legitimately takes seconds; see `wait_flush`.
     fn wait(&self, required: u8) -> Result<(), Error> {
+        for _ in 0..1_000_000 {
+            let s = inb(self.base + reg::STATUS);
+            if s == 0 || s == 0xff { return Err(Error::Device(s as u16)); }
+            if s & status::BSY != 0 { continue; }
+            if s & (status::ERR | 0x20) != 0 { return Err(Error::Device(s as u16)); }
+            if s & required == required { return Ok(()); }
+        }
+        Err(Error::Timeout)
+    }
+
+    /// Elapsed-time status polling for a completion that can legitimately
+    /// take seconds (a cache flush waiting on the host's fsync). Poll counts
+    /// vary with CPU speed and cannot bound asynchronous device I/O.
+    fn wait_flush(&self, required: u8) -> Result<(), Error> {
         wait_status(|| inb(self.base + reg::STATUS), now_ns, required)
     }
 
@@ -309,7 +329,7 @@ impl Hardware for Ata {
             self.wait(status::DRDY)?;
             if !self.cache_flush { return Ok(()); }
             outb(self.base + reg::COMMAND, cmd::CACHE_FLUSH);
-            return self.wait(status::DRDY);
+            return self.wait_flush(status::DRDY);
         }
         if let Some(bus_master) = &self.bus_master {
             let command = if c.operation == Operation::Read { 0xc8 } else { 0xca };

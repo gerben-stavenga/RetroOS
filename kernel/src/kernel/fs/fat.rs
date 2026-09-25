@@ -6,20 +6,76 @@ use spin::Mutex;
 use crate::kernel::vfs::{DirEntry, Filesystem, ShortName, Vnode};
 use crate::kernel::block::Volume;
 
+/// A resident copy above this size isn't worth pinning outside the shared
+/// disk cache — 386/4 MB machines only ever format volumes small enough to
+/// stay well under it anyway.
+const FAT_CACHE_CAP: u64 = 2 * 1024 * 1024;
+
 /// Byte-stream I/O over one bounded partition (or a raw GRUB module).
 /// Unaligned FAT metadata writes preserve the rest of their sector.
 pub struct VolumeIo {
     volume: Volume,
     position: u64,
     writable: bool,
+    /// (start byte, length) of the FAT table region(s) — every copy, back to
+    /// back — once computed from the BPB. `None` until the first read/write
+    /// tries to resolve it; `Some(None)` if there's nothing worth caching
+    /// (oversized table, non-512-byte sectors, or a non-FAT boot sector).
+    fat_range: Option<Option<(u64, u64)>>,
+    /// The FAT table region held resident once first touched. Every cluster
+    /// hop that would otherwise round-trip through the shared block cache —
+    /// competing with the data region for the same limited page budget, and
+    /// alternating with it on every single cluster — reads straight from
+    /// here instead. Writes go through `self.volume` as always and are
+    /// mirrored here to stay coherent.
+    fat_cache: Option<Vec<u8>>,
 }
 
 impl VolumeIo {
     pub fn new(volume: Volume, writable: bool) -> Self {
-        Self { volume, position: 0, writable }
+        Self { volume, position: 0, writable, fat_range: None, fat_cache: None }
     }
 
     fn len(&self) -> u64 { self.volume.sectors.saturating_mul(512) }
+
+    /// Locate the FAT table region(s) from the BPB, once. `num_fats` copies
+    /// sit back to back right after the reserved sectors — this covers all
+    /// of them, so a write that lands in the mirror stays coherent too.
+    fn fat_range(&mut self) -> Option<(u64, u64)> {
+        if self.fat_range.is_none() {
+            let mut boot = [0; 512];
+            let computed = if self.volume.read(0, &mut boot) != 1 { None } else {
+                (|| {
+                    if u16::from_le_bytes([boot[11], boot[12]]) != 512 { return None; }
+                    let reserved = u16::from_le_bytes([boot[14], boot[15]]) as u64;
+                    let num_fats = boot[16] as u64;
+                    let fat16 = u16::from_le_bytes([boot[22], boot[23]]) as u64;
+                    let fat32 = u32::from_le_bytes(boot[36..40].try_into().unwrap()) as u64;
+                    let fat_size = if fat16 != 0 { fat16 } else { fat32 };
+                    if num_fats == 0 || fat_size == 0 { return None; }
+                    let start = reserved.checked_mul(512)?;
+                    let len = num_fats.checked_mul(fat_size)?.checked_mul(512)?;
+                    (len != 0 && len <= FAT_CACHE_CAP && start.checked_add(len)? <= self.len())
+                        .then_some((start, len))
+                })()
+            };
+            self.fat_range = Some(computed);
+        }
+        self.fat_range.unwrap()
+    }
+
+    /// Whether `[pos, pos+count)` lies entirely inside the cached FAT region,
+    /// loading that region on first touch.
+    fn fat_hit(&mut self, pos: u64, count: usize) -> Option<(usize, usize)> {
+        let (start, len) = self.fat_range()?;
+        if pos < start || pos + count as u64 > start + len { return None; }
+        if self.fat_cache.is_none() {
+            let mut buf = alloc::vec![0u8; len as usize];
+            if self.volume.read(start / 512, &mut buf) as u64 != len / 512 { return None; }
+            self.fat_cache = Some(buf);
+        }
+        Some(((pos - start) as usize, count))
+    }
 }
 
 impl fatfs::IoBase for VolumeIo { type Error = (); }
@@ -28,6 +84,11 @@ impl fatfs::Read for VolumeIo {
     fn read(&mut self, out: &mut [u8]) -> Result<usize, ()> {
         let count = self.len().saturating_sub(self.position).min(out.len() as u64) as usize;
         if count == 0 { return Ok(0); }
+        if let Some((off, n)) = self.fat_hit(self.position, count) {
+            out[..n].copy_from_slice(&self.fat_cache.as_ref().unwrap()[off..off + n]);
+            self.position += n as u64;
+            return Ok(n);
+        }
         let within = (self.position % 512) as usize;
         let n = if within == 0 && count >= 512 {
             let n = count / 512 * 512;
@@ -68,6 +129,22 @@ impl fatfs::Write for VolumeIo {
             if self.volume.write(self.position / 512, &sector) != 1 { return Err(()); }
             n
         };
+        // Keep the resident copy coherent — it's served straight to fatfs on
+        // the next read, bypassing the shared disk cache entirely. A write
+        // straddling the region's edge (never seen from fatfs in practice —
+        // FAT-table and file-data writes are separate calls — but not ruled
+        // out by anything here) drops the cache instead of going stale.
+        if let Some((start, len)) = self.fat_range()
+            && self.fat_cache.is_some()
+        {
+            let end = self.position + n as u64;
+            if self.position >= start && end <= start + len {
+                let off = (self.position - start) as usize;
+                self.fat_cache.as_mut().unwrap()[off..off + n].copy_from_slice(&data[..n]);
+            } else if self.position < start + len && end > start {
+                self.fat_cache = None;
+            }
+        }
         self.position += n as u64;
         Ok(n)
     }
@@ -105,20 +182,52 @@ pub fn is_fat(volume: &Volume) -> bool {
     FatFs::new(VolumeIo::new(*volume, false)).is_ok()
 }
 
-struct FatState<T: fatfs::ReadWriteSeek> {
+/// `fatfs::File::seek` cannot resume from wherever it last was — a fresh
+/// `open_file` + `seek(offset)` always walks the FAT chain link by link from
+/// the FIRST cluster up to `offset`'s cluster (see fatfs's own `File::seek`:
+/// the only fast paths are "same offset" and "same cluster as before").
+/// Re-opening by path and reseeking on every DOS read call therefore costs
+/// O(path depth + offset / cluster_size) EVERY TIME, even though the block
+/// cache makes each individual sector fetch cheap — a game issuing many
+/// small sequential reads against one growing offset pays for the whole
+/// cluster chain again and again, quadratically. Keeping the `File` object
+/// alive across calls lets fatfs's existing fast paths do their job: seeking
+/// to the position a previous read already left it at is then a no-op.
+type CachedFile<T> = fatfs::File<'static, T, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>;
+
+/// `File` borrows `&FileSystem`, which contains `RefCell`s for its own
+/// internal caching — so `File` is `!Send` on its own (a `&T` is `Send` only
+/// if `T: Sync`, and `RefCell` isn't). That's the right default for a bare
+/// `File`, but this one only ever moves or gets touched from behind
+/// `FatState`'s own `Mutex`, which already serializes every access to both
+/// `media` and this handle — so no two threads can ever reach the same
+/// `File` (or the `FileSystem` it borrows) concurrently. Asserting `Send`
+/// here just tells the compiler what the `Mutex` already guarantees.
+struct SendFile<T: fatfs::ReadWriteSeek + 'static>(CachedFile<T>);
+unsafe impl<T: fatfs::ReadWriteSeek + 'static> Send for SendFile<T> {}
+
+struct FatState<T: fatfs::ReadWriteSeek + 'static> {
     media: fatfs::FileSystem<T>,
     opens: BTreeMap<u32, Vec<u8>>,
+    // SAFETY (the 'static above): every `FatFs<T>` this backs is Box::leak'd
+    // at mount time (see fs/disk.rs, startup.rs) and never moved or dropped
+    // for the life of the kernel, so `&self.state`'s address — and the
+    // `media` field these files borrow from — is permanently stable. Access
+    // is still funneled through `self.state`'s Mutex like everything else.
+    handles: BTreeMap<u32, SendFile<T>>,
     next_handle: u32,
 }
 
-pub struct FatFs<T: fatfs::ReadWriteSeek> {
+pub struct FatFs<T: fatfs::ReadWriteSeek + 'static> {
     state: Mutex<FatState<T>>,
 }
 
-impl<T: fatfs::ReadWriteSeek> FatFs<T> {
+impl<T: fatfs::ReadWriteSeek + 'static> FatFs<T> {
     pub fn new(io: T) -> Result<Self, fatfs::Error<T::Error>> {
         let media = fatfs::FileSystem::new(io, fatfs::FsOptions::new())?;
-        Ok(Self { state: Mutex::new(FatState { media, opens: BTreeMap::new(), next_handle: 1 }) })
+        Ok(Self { state: Mutex::new(FatState {
+            media, opens: BTreeMap::new(), handles: BTreeMap::new(), next_handle: 1,
+        }) })
     }
 
     pub fn geometry(&self) -> Option<(u16, u16, u16, u16)> {
@@ -250,6 +359,38 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fat_table_stays_resident_and_coherent_across_writes() {
+        let (_, volume) = formatted(fatfs::FatType::Fat16, 32768);
+        let cached = crate::kernel::block::cache::volume(volume);
+        let mut io = VolumeIo::new(cached, true);
+        let (start, len) = io.fat_range().expect("FAT16 table fits the resident cap");
+        assert!(len > 0);
+
+        io.seek(SeekFrom::Start(start)).unwrap();
+        let mut first = [0; 4];
+        io.read_exact(&mut first).unwrap();
+        assert!(io.fat_cache.is_some(), "first touch loads the resident copy");
+
+        io.seek(SeekFrom::Start(start + 4)).unwrap();
+        io.write_all(b"\xAA\xBB\xCC\xDD").unwrap();
+        // The resident copy is updated in place, not dropped and reloaded.
+        assert_eq!(&io.fat_cache.as_ref().unwrap()[4..8], b"\xAA\xBB\xCC\xDD");
+
+        io.seek(SeekFrom::Start(start + 4)).unwrap();
+        let mut readback = [0; 4];
+        io.read_exact(&mut readback).unwrap();
+        assert_eq!(&readback, b"\xAA\xBB\xCC\xDD");
+
+        // A second, independent VolumeIo over the same volume sees the write
+        // too — it's not a private, disk-diverging copy.
+        let mut other = VolumeIo::new(cached, false);
+        other.seek(SeekFrom::Start(start + 4)).unwrap();
+        let mut from_disk = [0; 4];
+        other.read_exact(&mut from_disk).unwrap();
+        assert_eq!(&from_disk, b"\xAA\xBB\xCC\xDD");
+    }
+
+    #[test]
     fn fat12_fat16_fat32_read_write_and_remount() {
         for (kind, sectors) in [(fatfs::FatType::Fat12, 2880), (fatfs::FatType::Fat16, 32768), (fatfs::FatType::Fat32, 131072)] {
             let (disk, volume) = formatted(kind, sectors);
@@ -317,7 +458,7 @@ pub(crate) mod tests {
     }
 }
 
-impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
+impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn format_name(&self) -> &'static str { "FAT" }
 
     fn dos_attributes(&self, path: &[u8]) -> Option<u8> {
@@ -369,14 +510,24 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
 
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let mut state = self.state.lock();
-        let media = &state.media;
-        let mut file = media.root_dir().open_file(path_str(path)?).ok()?;
+        let mut file = state.media.root_dir().open_file(path_str(path)?).ok()?;
         let size = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)).ok()?;
         let size = u32::try_from(size).ok()?;
-        drop(file);
+        fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(0)).ok()?;
+        // SAFETY: see the `handles` field comment on `FatState` — `media`
+        // outlives every handle this file borrows from. Transmuting here,
+        // before any further borrow of `state`, also ends `file`'s borrow
+        // of `state.media` as far as the borrow checker is concerned.
+        let file: CachedFile<T> = unsafe {
+            core::mem::transmute::<
+                fatfs::File<'_, T, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+                CachedFile<T>,
+            >(file)
+        };
         let handle = state.next_handle;
         state.next_handle = state.next_handle.checked_add(1).unwrap_or(1);
         state.opens.insert(handle, path.to_vec());
+        state.handles.insert(handle, SendFile(file));
         Some(Vnode {
             handle: handle as u64,
             size,
@@ -386,7 +537,26 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
 
     fn read(&self, handle: u64, offset: u32, buf: &mut [u8], _size: u32) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        // The cached, still-open File carries fatfs's own cluster-position
+        // fast path (see the `handles` field comment): reseeking to wherever
+        // the previous read already left it is then free. A cold miss here
+        // (handle created before this cache existed, or already evicted)
+        // falls back to the always-correct, always-slower open-by-path path.
+        if let Some(file) = state.handles.get_mut(&inner) {
+            if fatfs::Seek::seek(&mut file.0, fatfs::SeekFrom::Start(offset as u64)).is_err() {
+                return -5;
+            }
+            let mut done = 0;
+            while done < buf.len() {
+                match fatfs::Read::read(&mut state.handles.get_mut(&inner).unwrap().0, &mut buf[done..]) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(_) => return if done == 0 { -5 } else { done as i32 },
+                }
+            }
+            return done as i32;
+        }
         let Some(path) = state.opens.get(&inner) else {
             return -9;
         };
@@ -469,12 +639,18 @@ impl<T: fatfs::ReadWriteSeek> Filesystem for FatFs<T> {
         let inner = u32::try_from(handle).unwrap_or(0);
         let mut state = self.state.lock();
         state.opens.remove(&inner);
+        state.handles.remove(&inner);
         0
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {
         let inner = u32::try_from(handle).unwrap_or(0);
-        let state = self.state.lock();
+        let mut state = self.state.lock();
+        // This writes through its own fresh File, independent of any cached
+        // read handle in `state.handles` — drop that cache entry so the next
+        // read reopens and sees the write, instead of the stale size/cluster
+        // position the cached File captured at its own last use.
+        state.handles.remove(&inner);
         let Some(path) = state.opens.get(&inner) else {
             return -9;
         };
