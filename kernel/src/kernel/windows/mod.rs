@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod pe;
 pub mod ne;
+mod extra;
 mod win16;
 
 use crate::Regs;
@@ -18,11 +19,60 @@ const GATE_VECTOR: u8 = 0x83;
 const DLL_BASE_FIRST: u32 = 0x1000_0000;
 const DLL_BASE_STRIDE: u32 = 0x0100_0000;
 const STACK_TOP: u32 = 0xbff0_0000;
-const USER_LIMIT: u32 = 0xc000_0000;
+pub(super) const USER_LIMIT: u32 = 0xc000_0000;
+const TRAMPOLINE: u32 = 0x7ff0_0000;
 const TEB_BASE: u32 = 0x7ffd_e000;
 const PEB_BASE: u32 = 0x7ffd_f000;
 const PROCESS_DATA: u32 = 0x7ffd_c000;
 const HEAP_BASE: u32 = 0x5000_0000;
+
+const RECENT_APIS: usize = 12;
+#[derive(Clone, Copy)]
+struct RecentApi {
+    name: [u8; 40],
+    len: u8,
+}
+static mut RECENT: [RecentApi; RECENT_APIS] = [RecentApi { name: [0; 40], len: 0 }; RECENT_APIS];
+static mut RECENT_AT: usize = 0;
+
+fn note_api(name: &[u8]) {
+    let mut slot = RecentApi { name: [0; 40], len: 0 };
+    let n = name.len().min(slot.name.len());
+    slot.name[..n].copy_from_slice(&name[..n]);
+    slot.len = n as u8;
+    unsafe {
+        let at = core::ptr::read_volatile(&raw const RECENT_AT);
+        core::ptr::write_volatile(
+            core::ptr::addr_of_mut!(RECENT).cast::<RecentApi>().add(at % RECENT_APIS),
+            slot,
+        );
+        core::ptr::write_volatile(&raw mut RECENT_AT, at.wrapping_add(1));
+    }
+}
+
+/// The last Win32 gates entered, oldest first. Printed from the page-fault
+/// path so a jump to a null pointer still names the calls that led there.
+pub fn print_recent_apis() {
+    unsafe {
+        let n = core::ptr::read_volatile(&raw const RECENT_AT);
+        if n == 0 {
+            return;
+        }
+        let start = n.saturating_sub(RECENT_APIS);
+        for i in start..n {
+            let slot = core::ptr::read_volatile(
+                core::ptr::addr_of!(RECENT).cast::<RecentApi>().add(i % RECENT_APIS),
+            );
+            if slot.len == 0 {
+                continue;
+            }
+            crate::compact_println!(
+                "  api {}",
+                core::str::from_utf8(&slot.name[..slot.len as usize]).unwrap_or("?")
+            );
+        }
+    }
+}
 
 const INVALID_HANDLE_VALUE: u32 = 0xffff_ffff;
 const ERROR_FILE_NOT_FOUND: u32 = 2;
@@ -119,6 +169,7 @@ enum Api {
     SetTextColor,
     TextOutW,
     GetTextExtentPoint32W,
+    Extension,
     Stub(u32),
 }
 
@@ -152,7 +203,7 @@ struct Message {
     lparam: u32,
 }
 
-struct Window {
+pub(super) struct Window {
     hwnd: u32,
     parent: u32,
     wndproc: u32,
@@ -198,6 +249,16 @@ pub struct WindowsState {
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
     heap_next: u32,
+    blocks: Vec<extra::Block>,
+    tls: [u32; 64],
+    tls_mask: u64,
+    finds: Vec<extra::Find>,
+    next_find: u32,
+    console: extra::Console,
+    /// Last `SetConsoleMode` value for the three standard handles. S-Lang
+    /// refuses to start the screen if the input handle still has processed
+    /// mode (bit 0) set, which is what a constant mode of 3 reported.
+    std_mode: [u32; 3],
     last_error: u32,
     pub cwd: [u8; 128],
     pub cwd_len: usize,
@@ -206,6 +267,10 @@ pub struct WindowsState {
     command_line_a: u32,
     command_line_w: u32,
     next_object: u32,
+    process_info_out: usize,
+    process_handle: u32,
+    process_tid: u32,
+    process_exit_code: Option<u32>,
     stack_base: u32,
     stack_size: u32,
     classes: Vec<WindowClass>,
@@ -235,6 +300,13 @@ impl WindowsState {
             modules: Vec::new(),
             allocations: Vec::new(),
             heap_next: HEAP_BASE,
+            blocks: Vec::new(),
+            tls: [0; 64],
+            tls_mask: 0,
+            finds: Vec::new(),
+            next_find: 0x30000,
+            console: extra::Console::new(),
+            std_mode: [0; 3],
             last_error: 0,
             cwd: [0; 128],
             cwd_len: 0,
@@ -243,6 +315,10 @@ impl WindowsState {
             command_line_a: 0,
             command_line_w: 0,
             next_object: 0x10000,
+            process_info_out: 0,
+            process_handle: 0,
+            process_tid: 0,
+            process_exit_code: None,
             stack_base: 0,
             stack_size: 0,
             classes: Vec::new(),
@@ -272,6 +348,34 @@ impl WindowsState {
     }
     pub fn on_resume<A: crate::Arch>(&mut self, machine: &mut A) {
         machine.load_ldt(&self.ldt);
+        if self.process_info_out != 0 && self.process_tid != 0 {
+            let out = self.process_info_out;
+            machine.write::<u32>(out, self.process_handle);
+            machine.write::<u32>(out + 4, 0);
+            machine.write::<u32>(out + 8, self.process_tid);
+            machine.write::<u32>(out + 12, self.process_tid);
+            self.process_info_out = 0;
+        }
+    }
+    pub(crate) fn prepare_process(&mut self, process_info_out: usize) -> u32 {
+        let handle = self.next_object;
+        self.next_object = self.next_object.wrapping_add(4);
+        self.process_info_out = process_info_out;
+        self.process_handle = handle;
+        self.process_tid = 0;
+        self.process_exit_code = None;
+        handle
+    }
+    pub(crate) fn process_started(&mut self, tid: u32) {
+        self.process_tid = tid;
+    }
+    pub(crate) fn process_exited(&mut self, tid: u32, code: u32) {
+        if self.process_tid == tid {
+            self.process_exit_code = Some(code);
+        }
+    }
+    pub(crate) fn process_exit_code(&self, handle: u32) -> Option<u32> {
+        (handle == self.process_handle).then_some(self.process_exit_code).flatten()
     }
     pub fn repaint_osd(&mut self) {
         self.cursor_dirty = true;
@@ -289,6 +393,7 @@ impl WindowsState {
             wparam: u32::from(scancode & 0x7f),
             lparam: 0,
         });
+        extra::push_key(&mut self.console, scancode);
         if !pressed {
             return;
         }
@@ -488,6 +593,10 @@ fn load_dependency(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i
             return Ok((path, data));
         }
     }
+    crate::compact_println!(
+        "Windows: missing {}",
+        core::str::from_utf8(&file).unwrap_or("dll")
+    );
     Err(2)
 }
 
@@ -579,14 +688,78 @@ fn apply_imports<A: crate::Arch>(
     machine: &mut A,
     modules: &[Module],
     index: usize,
+    trampolines: &mut Vec<extra::Bound>,
 ) -> Result<(), i32> {
     let image = pe::Image::parse(&modules[index].data).map_err(|_| 8)?;
     for import in image.imports().map_err(|_| 8)? {
         let target_index = find_module(modules, &import.module).ok_or(2)?;
-        let address = resolve_export(&modules[target_index], &import.symbol)?;
+        let address = match resolve_export(&modules[target_index], &import.symbol) {
+            Ok(address) => address,
+            Err(127) => {
+                let name = match &import.symbol {
+                    pe::ImportSymbol::Name(name) => name.clone(),
+                    pe::ImportSymbol::Ordinal(n) => alloc::format!("#{n}").into_bytes(),
+                };
+                let Some(spec) = extra::lookup(&import.module, &name) else {
+                    crate::compact_println!(
+                        "Windows: unresolved {}!{}",
+                        core::str::from_utf8(&import.module).unwrap_or("dll"),
+                        core::str::from_utf8(&name).unwrap_or("symbol")
+                    );
+                    return Err(127);
+                };
+                if trampolines.len() >= 2048 {
+                    return Err(8);
+                }
+                let at = TRAMPOLINE as usize + trampolines.len() * 2;
+                if trampolines.is_empty() {
+                    machine.zero(TRAMPOLINE as usize, 4096);
+                }
+                machine.write::<u8>(at, 0xcd);
+                machine.write::<u8>(at + 1, 0x83);
+                trampolines.push(extra::Bound {
+                    name: spec.name,
+                    address: at as u32,
+                    arg_bytes: spec.arg_bytes,
+                });
+                at as u32
+            }
+            Err(error) => return Err(error),
+        };
         machine.write::<u32>((modules[index].base + import.iat_rva) as usize, address);
     }
     Ok(())
+}
+
+/// Guest code that calls each real DLL entry with DLL_PROCESS_ATTACH, then
+/// jumps to the executable. Each DllMain is stdcall and removes its own
+/// arguments, so the stack the executable sees is unchanged.
+fn dll_startup_stub<A: crate::Arch>(
+    machine: &mut A,
+    dlls: &[(u32, u32)],
+    exe_entry: u32,
+) -> Result<u32, i32> {
+    const STUB: u32 = 0x7ff2_0000;
+    let mut code = Vec::new();
+    for &(base, entry) in dlls {
+        code.extend_from_slice(&[0x68, 0, 0, 0, 0]);
+        code.extend_from_slice(&[0x68, 1, 0, 0, 0]);
+        code.push(0x68);
+        code.extend_from_slice(&base.to_le_bytes());
+        code.push(0xb8);
+        code.extend_from_slice(&entry.to_le_bytes());
+        code.extend_from_slice(&[0xff, 0xd0]);
+    }
+    code.push(0xb8);
+    code.extend_from_slice(&exe_entry.to_le_bytes());
+    code.extend_from_slice(&[0xff, 0xe0]);
+    if code.len() > 4096 {
+        return Err(8);
+    }
+    machine.zero(STUB as usize, 4096);
+    machine.copy_to(STUB as usize, &code);
+    machine.set_page_flags(STUB as usize / 4096, 1, false, true);
+    Ok(STUB)
 }
 
 fn export_address(modules: &[Module], module: &[u8], name: &[u8]) -> Result<u32, i32> {
@@ -594,34 +767,81 @@ fn export_address(modules: &[Module], module: &[u8], name: &[u8]) -> Result<u32,
     resolve_export(&modules[i], &pe::ImportSymbol::Name(name.to_vec()))
 }
 
-fn windows_path(state: &WindowsState, path: &[u8], create: bool) -> Result<Vec<u8>, u32> {
-    if path.len() >= 2 && path[1] == b':' {
-        let mut dos = path.to_vec();
-        for b in &mut dos {
-            if *b == b'/' {
-                *b = b'\\';
-            }
-        }
-        let path = if create {
-            crate::kernel::dos::dos_abs_to_vfs_create(&dos)
-        } else {
-            crate::kernel::dos::dos_abs_to_vfs(&dos)
-        };
-        return path.ok_or(ERROR_FILE_NOT_FOUND);
-    }
-    let mut p = path.to_vec();
-    for b in &mut p {
-        if *b == b'\\' {
-            *b = b'/';
-        }
-    }
-    Ok(join(state.cwd_str(), &p))
+pub(super) fn windows_path(state: &WindowsState, path: &[u8], create: bool) -> Result<Vec<u8>, u32> {
+    let dos = full_windows_path(state, path);
+    crate::kernel::dos::windows_abs_to_vfs(&dos, create).ok_or(ERROR_FILE_NOT_FOUND)
 }
 
-fn guest_windows_path(path: &[u8]) -> Vec<u8> {
+/// Resolve absolute, root-relative, drive-relative, and plain relative paths.
+pub(super) fn full_windows_path(state: &WindowsState, path: &[u8]) -> Vec<u8> {
+    let mut raw = path.to_vec();
+    for b in &mut raw {
+        if *b == b'/' { *b = b'\\'; }
+    }
+    let cwd = if state.cwd_len == 0 { b"C:\\".to_vec() } else { guest_windows_path(state.cwd_str()) };
+    let drive = cwd.first().copied().unwrap_or(b'C');
+    let (prefix, rest) = if raw.len() >= 2 && raw[1] == b':' {
+        if raw.get(2) == Some(&b'\\') {
+            return canonical_windows_path(&raw);
+        }
+        let base = if raw[0].eq_ignore_ascii_case(&drive) { cwd } else { vec![raw[0], b':', b'\\'] };
+        (base, &raw[2..])
+    } else if raw.first() == Some(&b'\\') {
+        (vec![drive, b':', b'\\'], &raw[1..])
+    } else {
+        (cwd, raw.as_slice())
+    };
+    let mut out = prefix;
+    if !rest.is_empty() {
+        if out.last() != Some(&b'\\') { out.push(b'\\'); }
+        out.extend_from_slice(rest);
+    }
+    canonical_windows_path(&out)
+}
+
+fn canonical_windows_path(path: &[u8]) -> Vec<u8> {
+    if path.len() < 3 || path[1] != b':' || path[2] != b'\\' {
+        return path.to_vec();
+    }
+    let mut components: Vec<&[u8]> = Vec::new();
+    for component in path[3..].split(|&b| b == b'\\') {
+        if component.is_empty() || component == b"." {
+            continue;
+        }
+        if component == b".." {
+            components.pop();
+        } else {
+            components.push(component);
+        }
+    }
+    let mut out = path[..3].to_vec();
+    for component in components {
+        if out.len() > 3 { out.push(b'\\'); }
+        out.extend_from_slice(component);
+    }
+    out
+}
+
+pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
     let root = crate::kernel::dos::c_root();
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    let mut out = b"C:\\".to_vec();
+    let root_dir = root.strip_suffix(b"/").unwrap_or(root);
+    let drives: &[(u8, &[u8])] = &[
+        (b'C', root_dir), (b'D', b"cdrom"), (b'H', b"host"),
+        (b'A', b"floppya"), (b'B', b"floppyb"),
+        (b'E', b"disk1"), (b'F', b"disk2"), (b'G', b"disk3"),
+        (b'I', b"disk4"), (b'J', b"disk5"), (b'K', b"disk6"),
+        (b'L', b"disk7"),
+    ];
+    let Some(&(drive, prefix)) = drives.iter().find(|(_, prefix)| {
+        path == *prefix || path.strip_prefix(*prefix).is_some_and(|rest| rest.starts_with(b"/"))
+    }) else {
+        let mut out = b"C:\\".to_vec();
+        out.extend(path.iter().map(|&b| if b == b'/' { b'\\' } else { b }));
+        return out;
+    };
+    let suffix = path.strip_prefix(prefix).unwrap_or(b"");
+    let relative = suffix.strip_prefix(b"/").unwrap_or(suffix);
+    let mut out = vec![drive, b':', b'\\'];
     out.extend(relative.iter().map(|&b| if b == b'/' { b'\\' } else { b }));
     out
 }
@@ -682,8 +902,12 @@ pub fn exec_pe_into<A: crate::Arch>(
     for module in &modules {
         map_module(machine, module)?;
     }
+    let mut trampolines = Vec::new();
     for n in 0..modules.len() {
-        apply_imports(machine, &modules, n)?;
+        apply_imports(machine, &modules, n, &mut trampolines)?;
+    }
+    if !trampolines.is_empty() {
+        machine.set_page_flags(TRAMPOLINE as usize / 4096, 1, false, true);
     }
 
     let stack_size = main_header
@@ -734,6 +958,23 @@ pub fn exec_pe_into<A: crate::Arch>(
         .base
         .checked_add(main_header.entry_rva)
         .ok_or(8)?;
+    // Real DLLs (MSVCRT) allocate their thread data in DllMain. The stub
+    // system libraries have no entry point and are skipped.
+    let mut dlls = Vec::new();
+    for module in modules.iter().skip(1) {
+        let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
+        if image.header.entry_rva != 0 {
+            dlls.push((
+                module.base,
+                module.base.checked_add(image.header.entry_rva).ok_or(8)?,
+            ));
+        }
+    }
+    let entry = if dlls.is_empty() {
+        entry
+    } else {
+        dll_startup_stub(machine, &dlls, entry)?
+    };
     let current = thread::get_thread(threads, tid).ok_or(8)?;
     thread::init_process_thread(current, entry, stack);
 
@@ -950,18 +1191,29 @@ pub fn exec_pe_into<A: crate::Arch>(
             name,
         });
     }
-    state.callback_return = export_address(&modules, b"USER32", b"RetroWndProcReturn")?;
+    for bound in trampolines {
+        state.gates.push(Gate {
+            return_ip: bound.address + 2,
+            api: Api::Extension,
+            arg_bytes: bound.arg_bytes,
+            name: bound.name,
+        });
+    }
+    state.callback_return = export_address(&modules, b"USER32", b"RetroWndProcReturn").unwrap_or(0);
+    if main_header.subsystem == 3 {
+        extra::open_console(&mut state);
+    }
     state.modules = modules;
     state.on_resume(machine);
     current.personality = thread::Personality::Windows(state);
     Ok(())
 }
 
-fn arg<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
+pub(super) fn arg<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
     machine.read::<u32>(regs.sp() as usize + 4 + n * 4)
 }
 
-fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+pub(super) fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
@@ -976,7 +1228,7 @@ fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     Err(ERROR_INVALID_PARAMETER)
 }
 
-fn w_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+pub(super) fn w_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
@@ -995,10 +1247,77 @@ fn w_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
 }
 
 fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
-    let ret = machine.read::<u32>(regs.sp() as usize);
+    let sp = regs.sp() as usize;
+    let ret = machine.read::<u32>(sp);
+    if ret < 0x1000 {
+        let mut below = [0u32; 4];
+        let mut top = [0u32; 8];
+        for (i, word) in below.iter_mut().enumerate() {
+            *word = machine.read::<u32>(sp.wrapping_sub(16) + i * 4);
+        }
+        for (i, word) in top.iter_mut().enumerate() {
+            *word = machine.read::<u32>(sp + i * 4);
+        }
+        crate::compact_println!(
+            "Windows: {} returns to {:#x} esp={:#x} eip={:#x} args={}",
+            core::str::from_utf8(gate.name).unwrap_or("?"),
+            ret,
+            sp,
+            regs.ip32(),
+            gate.arg_bytes
+        );
+        crate::compact_println!(
+            "  below {:08x} {:08x} {:08x} {:08x}",
+            below[0], below[1], below[2], below[3]
+        );
+        crate::compact_println!(
+            "  stack {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+            top[0], top[1], top[2], top[3], top[4], top[5], top[6], top[7]
+        );
+        crate::compact_println!(
+            "  iat peek={:#x} readin={:#x} readfile_slot={:#x}",
+            machine.read::<u32>(0x46d3b8),
+            machine.read::<u32>(0x46d3bc),
+            machine.read::<u32>(0x46d3c0)
+        );
+    }
     regs.rax = result as u64;
     regs.frame.rip = ret as u64;
     regs.frame.rsp += 4 + gate.arg_bytes as u64;
+}
+
+pub(super) fn create_file<A: crate::Arch>(
+    _machine: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    state: &mut WindowsState,
+    raw: &[u8],
+    disposition: u32,
+) -> u32 {
+    let create = matches!(disposition, 1 | 2 | 4 | 5);
+    let path = match windows_path(state, raw, create) {
+        Ok(v) => v,
+        Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
+    };
+    let existed = crate::kernel::vfs::path_exists(&path);
+    let vh = match disposition {
+        1 if existed => return fail(state, 80, INVALID_HANDLE_VALUE),
+        1 | 2 => crate::kernel::vfs::create_to_handle(&path),
+        3 if existed => crate::kernel::vfs::open_to_handle(&path),
+        4 if existed => crate::kernel::vfs::open_to_handle(&path),
+        4 => crate::kernel::vfs::create_to_handle(&path),
+        5 if existed => crate::kernel::vfs::create_to_handle(&path),
+        _ => return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE),
+    };
+    if vh < 0 {
+        return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
+    }
+    let Some(fd) = kt.alloc_fd(3) else {
+        crate::kernel::vfs::close_vfs_handle(vh);
+        return fail(state, 4, INVALID_HANDLE_VALUE);
+    };
+    kt.fds[fd] = thread::FdKind::Vfs(vh);
+    state.last_error = if existed { 183 } else { 0 };
+    fd as u32
 }
 
 fn fail(state: &mut WindowsState, error: u32, result: u32) -> u32 {
@@ -1067,7 +1386,7 @@ fn io_read<A: crate::Arch>(
     1
 }
 
-fn copy_ascii<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text: &[u8]) -> u32 {
+pub(super) fn copy_ascii<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text: &[u8]) -> u32 {
     if cap == 0 {
         return 0;
     }
@@ -1361,7 +1680,17 @@ fn dispatch<A: crate::Arch>(
                 _ => 0,
             }
         }
-        Api::WriteFile | Api::WriteConsoleA => io_write(
+        Api::WriteConsoleA => {
+            let ptr = arg(machine, regs, 1) as usize;
+            let len = arg(machine, regs, 2) as usize;
+            let written = arg(machine, regs, 3) as usize;
+            extra::write_console_text(machine, state, ptr, len);
+            if written != 0 {
+                machine.write::<u32>(written, len as u32);
+            }
+            1
+        }
+        Api::WriteFile => io_write(
             machine,
             kt,
             arg(machine, regs, 0) as usize,
@@ -1378,36 +1707,11 @@ fn dispatch<A: crate::Arch>(
             arg(machine, regs, 3) as usize,
         ),
         Api::CreateFileA => {
-            let disposition = arg(machine, regs, 4);
-            let create = matches!(disposition, 1 | 2 | 4 | 5);
             let raw = match c_string(machine, arg(machine, regs, 0)) {
                 Ok(v) => v,
                 Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
             };
-            let path = match windows_path(state, &raw, create) {
-                Ok(v) => v,
-                Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
-            };
-            let existed = crate::kernel::vfs::path_exists(&path);
-            let vh = match disposition {
-                1 if existed => return fail(state, 80, INVALID_HANDLE_VALUE),
-                1 | 2 => crate::kernel::vfs::create_to_handle(&path),
-                3 if existed => crate::kernel::vfs::open_to_handle(&path),
-                4 if existed => crate::kernel::vfs::open_to_handle(&path),
-                4 => crate::kernel::vfs::create_to_handle(&path),
-                5 if existed => crate::kernel::vfs::create_to_handle(&path),
-                _ => return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE),
-            };
-            if vh < 0 {
-                return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
-            }
-            let Some(fd) = kt.alloc_fd(3) else {
-                crate::kernel::vfs::close_vfs_handle(vh);
-                return fail(state, 4, INVALID_HANDLE_VALUE);
-            };
-            kt.fds[fd] = thread::FdKind::Vfs(vh);
-            state.last_error = if existed { 183 } else { 0 };
-            fd as u32
+            create_file(machine, kt, state, &raw, arg(machine, regs, 4))
         }
         Api::CloseHandle => {
             let h = arg(machine, regs, 0);
@@ -1634,10 +1938,19 @@ fn dispatch<A: crate::Arch>(
             written as u32
         }
         Api::GetConsoleMode => {
-            machine.write::<u32>(arg(machine, regs, 1) as usize, 3);
+            let handle = arg(machine, regs, 0) as usize;
+            let mode = state.std_mode.get(handle).copied().unwrap_or(0);
+            machine.write::<u32>(arg(machine, regs, 1) as usize, mode);
             1
         }
-        Api::SetConsoleMode | Api::SetConsoleCtrlHandler | Api::SetEnvironmentVariableA => 1,
+        Api::SetConsoleMode => {
+            let handle = arg(machine, regs, 0) as usize;
+            if let Some(slot) = state.std_mode.get_mut(handle) {
+                *slot = arg(machine, regs, 1);
+            }
+            1
+        }
+        Api::SetConsoleCtrlHandler | Api::SetEnvironmentVariableA => 1,
         Api::SetUnhandledExceptionFilter => 0,
         Api::UnhandledExceptionFilter => 1,
         Api::CreateEventA => {
@@ -1645,7 +1958,14 @@ fn dispatch<A: crate::Arch>(
             state.next_object += 1;
             h
         }
-        Api::ReadConsoleInputA => fail(state, ERROR_INVALID_HANDLE, 0),
+        Api::ReadConsoleInputA => extra::read_input(
+            machine,
+            state,
+            arg(machine, regs, 1) as usize,
+            arg(machine, regs, 2),
+            arg(machine, regs, 3) as usize,
+            true,
+        ),
         Api::CharUpperA => {
             let p = arg(machine, regs, 0);
             if p <= 0xffff {
@@ -2208,6 +2528,7 @@ fn dispatch<A: crate::Arch>(
             state.dirty = true;
             1
         }
+        Api::Extension => 0,
         Api::Stub(result) => result,
         Api::ExitProcess => unreachable!(),
     }
@@ -2240,6 +2561,7 @@ pub fn handle_event<A: crate::Arch>(
             if gate.api == Api::ExitProcess {
                 return thread::KernelAction::Exit(arg(machine, regs, 0) as i32);
             }
+            note_api(gate.name);
             if crate::kernel::startup::trace_enabled() {
                 crate::compact_dbg_println!("[win32] {}", core::str::from_utf8(gate.name).unwrap_or("?"));
             }
@@ -2264,7 +2586,33 @@ pub fn handle_event<A: crate::Arch>(
                     return thread::KernelAction::Done;
                 }
             }
-            let result = dispatch(machine, kt, state, regs, gate.api);
+            if gate.api == Api::Extension
+                && (gate.name.eq_ignore_ascii_case(b"CreateProcessA")
+                    || gate.name.eq_ignore_ascii_case(b"CreateProcessW"))
+            {
+                match extra::create_process(machine, state, regs, gate.name.ends_with(b"W")) {
+                    Ok(action) => {
+                        finish(machine, regs, gate, 0);
+                        return action;
+                    }
+                    Err(error) => {
+                        state.last_error = error;
+                        finish(machine, regs, gate, 0);
+                        return thread::KernelAction::Done;
+                    }
+                }
+            }
+            let result = if gate.api == Api::Extension {
+                extra::call(machine, kt, state, regs, gate.name)
+            } else {
+                dispatch(machine, kt, state, regs, gate.api)
+            };
+            if extra::take_hold(&mut state.console) {
+                // INT advances EIP past its two-byte gate before the handler
+                // runs. Retry the same call once input becomes available.
+                regs.frame.rip -= 2;
+                return thread::KernelAction::Done;
+            }
             finish(machine, regs, gate, result);
             thread::KernelAction::Done
         }
@@ -2275,5 +2623,35 @@ pub fn handle_event<A: crate::Arch>(
             crate::compact_println!("Windows: unhandled event {:?} at {:#x}", event, regs.ip32());
             thread::KernelAction::Exit(-1)
         }
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{full_windows_path, guest_windows_path, WindowsState};
+
+    #[test]
+    fn resolves_drive_relative_paths() {
+        let mut state = WindowsState::new();
+        assert_eq!(full_windows_path(&state, b"C:MC"), b"C:\\MC");
+        assert_eq!(full_windows_path(&state, b"\\MC"), b"C:\\MC");
+        assert_eq!(full_windows_path(&state, b"MC"), b"C:\\MC");
+        assert_eq!(full_windows_path(&state, b"C:\\MC"), b"C:\\MC");
+        let cwd = [crate::kernel::dos::c_root(), b"MC"].concat();
+        state.cwd[..cwd.len()].copy_from_slice(&cwd);
+        state.cwd_len = cwd.len();
+        assert_eq!(full_windows_path(&state, b"C:FILE"), b"C:\\MC\\FILE");
+        assert_eq!(full_windows_path(&state, b"\\FILE"), b"C:\\FILE");
+        assert_eq!(full_windows_path(&state, b"."), b"C:\\MC");
+        assert_eq!(full_windows_path(&state, b".\\*"), b"C:\\MC\\*");
+        assert_eq!(full_windows_path(&state, b"..\\FILE"), b"C:\\FILE");
+    }
+
+    #[test]
+    fn maps_drive_roots_to_windows_paths() {
+        assert_eq!(guest_windows_path(b"cdrom"), b"D:\\");
+        assert_eq!(guest_windows_path(b"cdrom/GAMES"), b"D:\\GAMES");
+        assert_eq!(guest_windows_path(b"host"), b"H:\\");
+        assert_eq!(guest_windows_path(b"disk1/TOOLS"), b"E:\\TOOLS");
     }
 }

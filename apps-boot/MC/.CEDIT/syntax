@@ -1,0 +1,475 @@
+# syntax rules version 22
+# Allowable colors for mc are
+# (after the slash is a Cooledit color, 0-26 or any of the X colors in rgb.txt)
+# black
+# red
+# green
+# brown
+# blue
+# magenta
+# cyan
+# lightgray
+# gray
+# brightred
+# brightgreen
+# yellow
+# brightblue
+# brightmagenta
+# brightcyan
+# white
+
+###############################################################################
+file ..\*\\.tex$ LaTeX\s2.09\sDocument
+context default
+wholechars left \\
+wholechars right abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ
+
+# type style
+    keyword whole \\tiny yellow/24
+    keyword whole \\scriptsize yellow/24
+    keyword whole \\footnotesize yellow/24
+    keyword whole \\small yellow/24
+    keyword whole \\normalsize yellow/24
+    keyword whole \\large yellow/24
+    keyword whole \\Large yellow/24
+    keyword whole \\LARGE yellow/24
+    keyword whole \\huge yellow/24
+    keyword whole \\Huge yellow/24
+
+# accents and symbols
+    keyword whole \\`{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\'{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\^{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\"{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\~{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\={\[aeiouAEIOU\]} yellow/24
+    keyword whole \\.{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\u{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\v{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\H{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\t{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\c{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\d{\[aeiouAEIOU\]} yellow/24
+    keyword whole \\b{\[aeiouAEIOU\]} yellow/24
+
+    keyword whole \\dag yellow/24
+    keyword whole \\ddag yellow/24
+    keyword whole \\S yellow/24
+    keyword whole \\P yellow/24
+    keyword whole \\copyright yellow/24
+    keyword whole \\pounds yellow/24
+
+# sectioning and table of contents
+    keyword whole \\part[*]{*} brightred/19
+    keyword whole \\part{*} brightred/19
+    keyword whole \\part\*{*} brightred/19
+    keyword whole \\chapter[*]{*} brightred/19
+    keyword whole \\chapter{*} brightred/19
+    keyword whole \\chapter\*{*} brightred/19
+    keyword whole \\section[*]{*} brightred/19
+    keyword whole \\section{*} brightred/19
+    keyword whole \\section\*{*} brightred/19
+    keyword whole \\subsection[*]{*} brightred/19
+    keyword whole \\subsection{*} brightred/19
+    keyword whole \\subsection\*{*} brightred/19
+    keyword whole \\subsubsection[*]{*} brightred/19
+    keyword whole \\subsubsection{*} brightred/19
+    keyword whole \\subsubsection\*{*} brightred/19
+    keyword whole \\paragraph[*]{*} brightred/19
+    keyword whole \\paragraph{*} brightred/19
+    keyword whole \\paragraph\*{*} brightred/19
+    keyword whole \\subparagraph[*]{*} brightred/19
+    keyword whole \\subparagraph{*} brightred/19
+    keyword whole \\subparagraph\*{*} brightred/19
+
+    keyword whole \\appendix brightred/19
+    keyword whole \\tableofcontents brightred/19
+
+# misc
+    keyword whole \\item[*] yellow/24
+    keyword whole \\item yellow/24
+    keyword whole \\\\ yellow/24
+    keyword \\\s yellow/24 black/0
+    keyword %% yellow/24
+
+# docuement and page styles    
+    keyword whole \\documentstyle[*]{*} yellow/20
+    keyword whole \\documentstyle{*} yellow/20
+    keyword whole \\pagestyle{*} yellow/20
+
+# cross references
+    keyword whole \\label{*} yellow/24
+    keyword whole \\ref{*} yellow/24
+
+# bibliography and citations
+    keyword whole \\bibliography{*} yellow/24
+    keyword whole \\bibitem[*]{*} yellow/24
+    keyword whole \\bibitem{*} yellow/24
+    keyword whole \\cite[*]{*} yellow/24
+    keyword whole \\cite{*} yellow/24
+
+# splitting the input
+    keyword whole \\input{*} yellow/20
+    keyword whole \\include{*} yellow/20
+    keyword whole \\includeonly{*} yellow/20
+
+# line breaking
+    keyword whole \\linebreak[\[01234\]] yellow/24
+    keyword whole \\nolinebreak[\[01234\]] yellow/24
+    keyword whole \\linebreak yellow/24
+    keyword whole \\nolinebreak yellow/24
+    keyword whole \\[+] yellow/24
+    keyword whole \\- yellow/24
+    keyword whole \\sloppy yellow/24
+
+# page breaking
+    keyword whole \\pagebreak[\[01234\]] yellow/24
+    keyword whole \\nopagebreak[\[01234\]] yellow/24
+    keyword whole \\pagebreak yellow/24
+    keyword whole \\nopagebreak yellow/24
+    keyword whole \\samepage yellow/24
+    keyword whole \\newpage yellow/24
+    keyword whole \\clearpage yellow/24
+
+# defintiions
+    keyword \\newcommand{*}[*] cyan/5
+    keyword \\newcommand{*} cyan/5
+    keyword \\newenvironment{*}[*]{*} cyan/5
+    keyword \\newenvironment{*}{*} cyan/5
+
+# boxes
+
+# begins and ends
+    keyword \\begin{document} brightred/14
+    keyword \\begin{equation} brightred/14
+    keyword \\begin{eqnarray} brightred/14
+    keyword \\begin{quote} brightred/14
+    keyword \\begin{quotation} brightred/14
+    keyword \\begin{center} brightred/14
+    keyword \\begin{verse} brightred/14
+    keyword \\begin{verbatim} brightred/14
+    keyword \\begin{itemize} brightred/14
+    keyword \\begin{enumerate} brightred/14
+    keyword \\begin{description} brightred/14
+    keyword \\begin{array} brightred/14
+    keyword \\begin{tabular} brightred/14
+    keyword \\begin{thebibliography}{*} brightred/14
+    keyword \\begin{sloppypar} brightred/14
+
+    keyword \\end{document} brightred/14
+    keyword \\end{equation} brightred/14
+    keyword \\end{eqnarray} brightred/14
+    keyword \\end{quote} brightred/14
+    keyword \\end{quotation} brightred/14
+    keyword \\end{center} brightred/14
+    keyword \\end{verse} brightred/14
+    keyword \\end{verbatim} brightred/14
+    keyword \\end{itemize} brightred/14
+    keyword \\end{enumerate} brightred/14
+    keyword \\end{description} brightred/14
+    keyword \\end{array} brightred/14
+    keyword \\end{tabular} brightred/14
+    keyword \\end{thebibliography}{*} brightred/14
+    keyword \\end{sloppypar} brightred/14
+
+    keyword \\begin{*} brightcyan/16
+    keyword \\end{*} brightcyan/16
+
+    keyword \\theorem{*}{*} yellow/24
+
+# if all else fails
+    keyword whole \\+[*]{*}{*}{*} brightcyan/17
+    keyword whole \\+[*]{*}{*} brightcyan/17
+    keyword whole \\+{*}{*}{*}{*} brightcyan/17
+    keyword whole \\+{*}{*}{*} brightcyan/17
+    keyword whole \\+{*}{*} brightcyan/17
+    keyword whole \\+{*} brightcyan/17
+    keyword \\\[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\]\n brightcyan/17
+    keyword \\\[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\]\s brightcyan/17
+    keyword \\\[abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ\]\t brightcyan/17
+
+context \\pagenumbering{ } yellow/20
+    keyword arabic brightcyan/17
+    keyword roman brightcyan/17
+    keyword alph brightcyan/17
+    keyword Roman brightcyan/17
+    keyword Alph brightcyan/17
+
+context % \n brown/22
+
+# mathematical formulas
+context $ $ brightgreen/6
+context exclusive \\begin{equation} \\end{equation} brightgreen/6
+context exclusive \\begin{eqnarray} \\end{eqnarray} brightgreen/6
+
+
+###############################################################################
+file ..\*\\.([chC]|CC|cxx|cc|cpp|CPP|CXX)$ C/C\+\+\sProgram
+context default
+    keyword whole auto yellow/24
+    keyword whole break yellow/24
+    keyword whole case yellow/24
+    keyword whole char yellow/24
+    keyword whole const yellow/24
+    keyword whole continue yellow/24
+    keyword whole default yellow/24
+    keyword whole do yellow/24
+    keyword whole double yellow/24
+    keyword whole else yellow/24
+    keyword whole enum yellow/24
+    keyword whole extern yellow/24
+    keyword whole float yellow/24
+    keyword whole for yellow/24
+    keyword whole goto yellow/24
+    keyword whole if yellow/24
+    keyword whole int yellow/24
+    keyword whole long yellow/24
+    keyword whole register yellow/24
+    keyword whole return yellow/24
+    keyword whole short yellow/24
+    keyword whole signed yellow/24
+    keyword whole sizeof yellow/24
+    keyword whole static yellow/24
+    keyword whole struct yellow/24
+    keyword whole switch yellow/24
+    keyword whole typedef yellow/24
+    keyword whole union yellow/24
+    keyword whole unsigned yellow/24
+    keyword whole void yellow/24
+    keyword whole volatile yellow/24
+    keyword whole while yellow/24
+    keyword whole asm yellow/24
+    keyword whole catch yellow/24
+    keyword whole class yellow/24
+    keyword whole friend yellow/24
+    keyword whole delete yellow/24
+    keyword whole inline yellow/24
+    keyword whole new yellow/24
+    keyword whole operator yellow/24
+    keyword whole private yellow/24
+    keyword whole protected yellow/24
+    keyword whole public yellow/24
+    keyword whole this yellow/24
+    keyword whole throw yellow/24
+    keyword whole template yellow/24
+    keyword whole try yellow/24
+    keyword whole virtual yellow/24
+    keyword whole bool yellow/24
+    keyword whole const_cast yellow/24
+    keyword whole dynamic_cast yellow/24
+    keyword whole explicit yellow/24
+    keyword whole false yellow/24
+    keyword whole mutable yellow/24
+    keyword whole namespace yellow/24
+    keyword whole reinterpret_cast yellow/24
+    keyword whole static_cast yellow/24
+    keyword whole true yellow/24
+    keyword whole typeid yellow/24
+    keyword whole typename yellow/24
+    keyword whole using yellow/24
+    keyword whole wchar_t yellow/24
+    keyword whole ... yellow/24
+
+    keyword /\* brown/22
+    keyword \*/ brown/22
+
+    keyword '\s' brightgreen/16
+    keyword '+' brightgreen/16
+    keyword > yellow/24
+    keyword < yellow/24
+    keyword \+ yellow/24
+    keyword - yellow/24
+    keyword \* yellow/24
+    keyword / yellow/24
+    keyword % yellow/24
+    keyword = yellow/24
+    keyword != yellow/24
+    keyword == yellow/24
+    keyword { brightcyan/14
+    keyword } brightcyan/14
+    keyword ( brightcyan/15
+    keyword ) brightcyan/15
+    keyword [ brightcyan/14
+    keyword ] brightcyan/14
+    keyword , brightcyan/14
+    keyword : brightcyan/14
+    keyword ; brightmagenta/19
+context exclusive /\* \*/ brown/22
+context linestart # \n brightred/18
+    keyword \\\n yellow/24
+    keyword /\**\*/ brown/22
+    keyword "+" red/19
+    keyword <+> red/19
+context " " green/6
+    keyword \\" brightgreen/16
+    keyword %% brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[L\]e brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[L\]E brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[L\]f brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[L\]g brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[L\]G brightgreen/16
+    keyword %\[0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]d brightgreen/16
+    keyword %\[0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]i brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]o brightgreen/16
+    keyword %\[0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]u brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]x brightgreen/16
+    keyword %\[#0\s-\+,\]\[0123456789\]\[.\]\[0123456789\]\[hl\]X brightgreen/16
+    keyword %\[hl\]n brightgreen/16
+    keyword %\[.\]\[0123456789\]s brightgreen/16
+    keyword %[*] brightgreen/16
+    keyword %c brightgreen/16
+    keyword \\\\ brightgreen/16
+
+###############################################################################
+file .\*ChangeLog$ GNU\sDistribution\sChangeLog\sFile
+
+context default
+    keyword \s+() brightmagenta/23
+    keyword \t+() brightmagenta/23
+
+context linestart \t\* : brightcyan/17
+context linestart \s\s\s\s\s\s\s\s\* : brightcyan/17
+
+context linestart 19+-+\s \n            yellow/24
+    keyword <+@+> 			brightred/19
+context linestart 20+-+\s \n            yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Mon\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Tue\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Wed\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Thu\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Fri\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Sat\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+context linestart Sun\s+\s+\s+\s \n     yellow/24
+    keyword <+@+> 			brightred/19
+
+
+###############################################################################
+file .\*Makefile[\\\.a-z]\*$ Makefile
+
+context default
+    keyword $(*) yellow/24
+    keyword ${*} brightgreen/16
+    keyword whole linestart include magenta
+    keyword whole linestart endif magenta
+    keyword whole linestart ifeq magenta
+    keyword whole linestart ifneq magenta
+    keyword whole linestart else magenta
+    keyword linestart \t lightgray/13 red
+    keyword whole .PHONY white/25
+    keyword whole .NOEXPORT white/25
+    keyword = white/25
+    keyword : yellow/24
+    keyword \\\n yellow/24
+# this handles strange cases like @something@@somethingelse@ properly
+    keyword whole @+@ brightmagenta/23 black/0
+    keyword @+@ brightmagenta/23 black/0
+
+context linestart # \n brown/22
+    keyword whole @+@ brightmagenta/23 black/0
+    keyword @+@ brightmagenta/23 black/0
+
+context exclusive = \n brightcyan/17
+    keyword \\\n yellow/24
+    keyword $(*) yellow/24
+    keyword ${*} brightgreen/16
+    keyword linestart \t lightgray/13 red
+    keyword whole @+@ brightmagenta/23 black/0
+    keyword @+@ brightmagenta/23 black/0
+
+context exclusive linestart \t \n
+    keyword \\\n yellow/24
+    keyword $(*) yellow/24
+    keyword ${*} brightgreen/16
+    keyword linestart \t lightgray/13 red
+    keyword whole @+@ brightmagenta/23 black/0
+    keyword @+@ brightmagenta/23 black/0
+
+###############################################################################
+
+file .\*syntax$ Syntax\sHighlighting\sdefinitions
+
+context default
+    keyword whole keyw\ord yellow/24
+    keyword whole whole\[\t\s\]l\inestart brightcyan/17
+    keyword whole whole\[\t\s\]l\inestart brightcyan/17
+    keyword whole wh\oleleft\[\t\s\]l\inestart brightcyan/17
+    keyword whole wh\oleright\[\t\s\]l\inestart brightcyan/17
+    keyword whole l\inestart\[\t\s\]wh\ole
+    keyword whole l\inestart\[\t\s\]wh\ole
+    keyword whole l\inestart\[\t\s\]wh\oleleft
+    keyword whole l\inestart\[\t\s\]wh\oleright
+    keyword wholeleft whole\s brightcyan/17
+    keyword wholeleft whole\t brightcyan/17
+    keyword whole wh\oleleft brightcyan/17
+    keyword whole wh\oleright brightcyan/17
+    keyword whole lin\[e\]start brightcyan/17
+    keyword whole c\ontext\[\t\s\]exclusive brightred/18
+    keyword whole c\ontext\[\t\s\]default brightred/18
+    keyword whole c\ontext brightred/18
+    keyword whole wh\olechars\[\t\s\]left brightcyan/17
+    keyword whole wh\olechars\[\t\s\]right brightcyan/17
+    keyword whole wh\olechars brightcyan/17
+    keyword whole f\ile brightgreen/6
+
+    keyword whole 0 lightgray/0	blue/26
+    keyword whole 1 lightgray/1	blue/26
+    keyword whole 2 lightgray/2	blue/26
+    keyword whole 3 lightgray/3	blue/26
+    keyword whole 4 lightgray/4	blue/26
+    keyword whole 5 lightgray/5	blue/26
+    keyword whole 6 lightgray/6
+    keyword whole 7 lightgray/7
+    keyword whole 8 lightgray/8
+    keyword whole 9 lightgray/9
+    keyword whole 10 lightgray/10
+    keyword whole 11 lightgray/11
+    keyword whole 12 lightgray/12
+    keyword whole 13 lightgray/13
+    keyword whole 14 lightgray/14
+    keyword whole 15 lightgray/15
+    keyword whole 16 lightgray/16
+    keyword whole 17 lightgray/17
+    keyword whole 18 lightgray/18
+    keyword whole 19 lightgray/19
+    keyword whole 20 lightgray/20
+    keyword whole 21 lightgray/21
+    keyword whole 22 lightgray/22
+    keyword whole 23 lightgray/23
+    keyword whole 24 lightgray/24
+    keyword whole 25 lightgray/25
+    keyword whole 26 lightgray/26
+
+    keyword wholeleft black\/ black/0
+    keyword wholeleft red\/ red/DarkRed
+    keyword wholeleft green\/ green/green3
+    keyword wholeleft brown\/ brown/saddlebrown
+    keyword wholeleft blue\/ blue/blue3
+    keyword wholeleft magenta\/ magenta/magenta3
+    keyword wholeleft cyan\/ cyan/cyan3
+    keyword wholeleft lightgray\/ lightgray/lightgray
+    keyword wholeleft gray\/ gray/gray
+    keyword wholeleft brightred\/ brightred/red
+    keyword wholeleft brightgreen\/ brightgreen/green1
+    keyword wholeleft yellow\/ yellow/yellow
+    keyword wholeleft brightblue\/ brightblue/blue1
+    keyword wholeleft brightmagenta\/ brightmagenta/magenta
+    keyword wholeleft brightcyan\/ brightcyan/cyan1
+    keyword wholeleft white\/ white/26
+
+context linestart # \n brown/22
+
+file \.\* Help\ssupport\sother\sfile\stypes
+context default
+file \.\* by\scoding\srules\sin\s~/.cedit/syntax.
+context default
+file \.\* See\sman/syntax\sin\sthe\ssource\sdistribution
+context default
+file \.\* and\sconsult\sthe\sman\spage.
+context default

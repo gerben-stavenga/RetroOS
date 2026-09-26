@@ -144,6 +144,32 @@ impl Term {
         self.cursor_y = row;
     }
 
+    /// Replace the visible grid from a character/attribute cell buffer.
+    /// `cells` is row-major pairs of `(character, attribute)`. This is the
+    /// text screen a DOS session is already showing; a cursor-addressed
+    /// program cannot be drawn there by streaming bytes through [`putchar`].
+    pub fn blit_cells(&mut self, width: usize, height: usize, cells: &[u8], cursor_col: usize, cursor_row: usize) {
+        let w = width.min(WIDTH);
+        let h = height.min(HEIGHT);
+        let blank = (self.attr as u16) << 8 | b' ' as u16;
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let cell = if x < w && y < h {
+                    let at = (y * width + x) * 2;
+                    let ch = cells.get(at).copied().unwrap_or(b' ');
+                    let attr = cells.get(at + 1).copied().unwrap_or(self.attr);
+                    (attr as u16) << 8 | ch as u16
+                } else {
+                    blank
+                };
+                self.put_cell(y * WIDTH + x, cell);
+            }
+        }
+        self.cursor_x = cursor_col.min(WIDTH.saturating_sub(1));
+        self.cursor_y = cursor_row.min(HEIGHT.saturating_sub(1));
+        text_flush();
+    }
+
     pub fn clear(&mut self) {
         let blank = (self.attr as u16) << 8 | b' ' as u16;
         self.grid = [blank; CELLS];

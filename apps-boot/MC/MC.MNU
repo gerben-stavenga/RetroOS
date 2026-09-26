@@ -1,0 +1,8 @@
+1 Fformat 3.05A
+  D:\util\fddutil\fform\fformat.exe
+2 FD format 1.1
+  D:\util\fddutil\fdformat\fdshell.exe
+3 Usb driver
+  \bats\usb.bat
+4 Net driver
+  \bats\msnet.bat

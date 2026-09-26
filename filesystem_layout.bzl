@@ -10,13 +10,9 @@ DOS_SIZE_MB = 3072
 LINUX_SIZE_MB = 512
 
 BOOT_FILES = {
-    # DN program/resources stay versioned with the boot image.
-    "apps-boot/dn/DN.COM": "RETROOS/DN/DN.COM",
-    "apps-boot/dn/DN.PRG": "RETROOS/DN/DN.PRG",
-    "apps-boot/dn/DN.OVR": "RETROOS/DN/DN.OVR",
-    "apps-boot/dn/DN.DLG": "RETROOS/DN/DN.DLG",
-    "apps-boot/dn/DN.LNG": "RETROOS/DN/DN.LNG",
-    "apps-boot/dn/DN.HLP": "RETROOS/DN/DN.HLP",
+    # apps-boot/** is not listed here. BUILD.bazel globs it onto the boot
+    # disk's RETROOS/. TC is not part of that tree or of the data disk.
+    # Writable DN templates stay in DATA_FILES under CONFIG/DN.
 
     "//tools/command:command_com": "RETROOS/COMMAND.COM",
     # Kernel symbols for the stack tracer. kernel.elf itself is stripped, so

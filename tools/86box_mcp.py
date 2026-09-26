@@ -2,7 +2,8 @@
 """Expose RetroOS's COM2 diagnostic-control service as local MCP tools.
 
 RetroOS owns the commands and executes them in its kernel. This process only
-adapts Codex's STDIO MCP transport to 86Box's bidirectional COM pipe.
+adapts a stdio MCP session to the host serial endpoint: an 86Box named-pipe
+pair, or the unix socket QEMU attaches to COM2.
 """
 
 from __future__ import annotations
@@ -12,6 +13,8 @@ import errno
 import json
 import os
 import select
+import socket
+import stat
 import sys
 import time
 from pathlib import Path
@@ -120,41 +123,66 @@ TOOLS = [
 ]
 
 
-def candidate_bases(explicit: str | None) -> list[Path]:
-    if explicit:
-        return [Path(explicit).expanduser()]
+def is_socket(path: Path) -> bool:
+    if path.suffix == ".sock":
+        return True
+    try:
+        return stat.S_ISSOCK(path.stat().st_mode)
+    except OSError:
+        return False
+
+
+def discover_endpoints(pipe: str | None, sock: str | None) -> list[tuple[str, Path]]:
+    """Newest live endpoint first. An explicit path is the only candidate."""
+    if sock:
+        return [("socket", Path(sock).expanduser())]
+    if pipe:
+        return [("pipe", Path(pipe).expanduser())]
     configured = os.environ.get("RETROOS_MCP_SERIAL")
     if configured:
-        return [Path(configured).expanduser()]
+        path = Path(configured).expanduser()
+        return [("socket" if is_socket(path) else "pipe", path)]
+    found: list[tuple[float, str, Path]] = []
+    for path in Path("/tmp").glob("retroos-run.*/mcp.sock"):
+        try:
+            found.append((path.stat().st_mtime, "socket", path))
+        except OSError:
+            continue
     home = Path.home()
-    discovered_outputs = [
-        *home.glob(".var/app/*/data/86Box/RetroOS/mcp-serial.out"),
-        *Path("/tmp").glob("retroos-*/mcp-serial.out"),
-    ]
-    candidates = [
+    pipe_bases = [
         home / ".local/share/86Box/RetroOS/mcp-serial",
-        *(Path(str(output)[:-4]) for output in discovered_outputs),
+        *(Path(str(output)[:-4]) for output in home.glob(".var/app/*/data/86Box/RetroOS/mcp-serial.out")),
+        *(Path(str(output)[:-4]) for output in Path("/tmp").glob("retroos-*/mcp-serial.out")),
     ]
-    return sorted(
-        candidates,
-        key=lambda path: Path(str(path) + ".out").stat().st_mtime
-        if Path(str(path) + ".out").exists() else 0,
-        reverse=True,
-    )
+    seen: set[Path] = set()
+    for base in pipe_bases:
+        if base in seen:
+            continue
+        seen.add(base)
+        outgoing = Path(str(base) + ".out")
+        try:
+            found.append((outgoing.stat().st_mtime, "pipe", base))
+        except OSError:
+            continue
+    found.sort(key=lambda item: item[0], reverse=True)
+    return [(kind, path) for _, kind, path in found]
 
 
 class SerialControl:
-    def __init__(self, explicit: str | None):
-        self.explicit = explicit
+    def __init__(self, pipe: str | None, sock: str | None):
+        self.pipe = pipe
+        self.sock = sock
         self.reader: int | None = None
         self.writer: int | None = None
         self.pending = bytearray()
         self.synced = False
 
     def close(self) -> None:
+        closed: set[int] = set()
         for descriptor in (self.reader, self.writer):
-            if descriptor is not None:
+            if descriptor is not None and descriptor not in closed:
                 os.close(descriptor)
+                closed.add(descriptor)
         self.reader = None
         self.writer = None
         self.pending.clear()
@@ -163,32 +191,58 @@ class SerialControl:
     def connect(self, deadline: float) -> None:
         if self.reader is not None and self.writer is not None:
             return
-        last_error = "no mcp-serial.in/.out pair found"
+        last_error = "no QEMU mcp.sock or 86Box mcp-serial.in/.out pair found"
         while time.monotonic() < deadline:
-            for base in candidate_bases(self.explicit):
-                incoming = Path(str(base) + ".out")
-                outgoing = Path(str(base) + ".in")
-                if not incoming.exists() or not outgoing.exists():
-                    continue
-                reader: int | None = None
+            endpoints = discover_endpoints(self.pipe, self.sock)
+            if not endpoints:
+                last_error = "no QEMU mcp.sock or 86Box mcp-serial.in/.out pair found"
+            for kind, path in endpoints:
                 try:
-                    reader = os.open(incoming, os.O_RDONLY | os.O_NONBLOCK)
-                    writer = os.open(outgoing, os.O_WRONLY | os.O_NONBLOCK)
+                    if kind == "socket":
+                        self._connect_socket(path)
+                    else:
+                        self._connect_pipe(path)
+                    return
                 except OSError as error:
-                    if reader is not None:
-                        os.close(reader)
+                    self.close()
                     last_error = str(error)
-                    if error.errno not in (errno.ENXIO, errno.ENOENT):
+                    if error.errno not in (
+                        errno.ENXIO, errno.ENOENT, errno.ECONNREFUSED, errno.EAGAIN, errno.EWOULDBLOCK,
+                    ):
                         raise
-                    continue
-                self.reader = reader
-                self.writer = writer
-                # A newly attached 86Box pipe reports a transient readable EOF
-                # while its UART endpoint reconnects.
-                time.sleep(0.05)
-                return
             time.sleep(0.05)
         raise RuntimeError(last_error)
+
+    def _connect_socket(self, path: Path) -> None:
+        endpoint = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            endpoint.connect(os.fspath(path))
+            endpoint.setblocking(False)
+            descriptor = endpoint.detach()
+        except OSError:
+            endpoint.close()
+            raise
+        self.reader = descriptor
+        self.writer = descriptor
+
+    def _connect_pipe(self, base: Path) -> None:
+        incoming = Path(str(base) + ".out")
+        outgoing = Path(str(base) + ".in")
+        if not incoming.exists() or not outgoing.exists():
+            raise FileNotFoundError(errno.ENOENT, "mcp-serial pipe is not present", str(base))
+        reader: int | None = None
+        try:
+            reader = os.open(incoming, os.O_RDONLY | os.O_NONBLOCK)
+            writer = os.open(outgoing, os.O_WRONLY | os.O_NONBLOCK)
+        except OSError:
+            if reader is not None:
+                os.close(reader)
+            raise
+        self.reader = reader
+        self.writer = writer
+        # A newly attached 86Box pipe reports a transient readable EOF
+        # while its UART endpoint reconnects.
+        time.sleep(0.05)
 
     def request(self, command: str, timeout: float = 8.0) -> dict[str, Any]:
         final_deadline = time.monotonic() + timeout
@@ -219,7 +273,7 @@ class SerialControl:
             # often than wall-clock baud timing suggests. Pace individual
             # bytes so long commands cannot overrun it.
             for byte in payload:
-                os.write(self.writer, bytes((byte,)))
+                self._write_byte(byte, deadline)
                 time.sleep(0.001)
             while time.monotonic() < deadline:
                 newline = self.pending.find(b"\n")
@@ -231,7 +285,10 @@ class SerialControl:
                 ready, _, _ = select.select([self.reader], [], [], min(0.1, remaining))
                 if not ready:
                     continue
-                chunk = os.read(self.reader, 4096)
+                try:
+                    chunk = os.read(self.reader, 4096)
+                except BlockingIOError:
+                    continue
                 if chunk:
                     self.pending.extend(chunk)
                 else:
@@ -240,6 +297,22 @@ class SerialControl:
         except (OSError, json.JSONDecodeError):
             self.close()
             raise
+
+    def _write_byte(self, byte: int, deadline: float) -> None:
+        if self.writer is None:
+            raise RuntimeError("serial control connection disappeared")
+        data = bytes((byte,))
+        while True:
+            try:
+                written = os.write(self.writer, data)
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("serial control write timed out") from None
+                select.select([], [self.writer], [], 0.05)
+                continue
+            if written == 1:
+                return
+            raise OSError("serial control write made no progress")
 
 
 def text_content(value: Any) -> list[dict[str, Any]]:
@@ -281,8 +354,8 @@ def emit(identifier: Any, result: Any = None, error: dict[str, Any] | None = Non
     sys.stdout.flush()
 
 
-def serve(pipe: str | None) -> None:
-    serial = SerialControl(pipe)
+def serve(pipe: str | None, sock: str | None) -> None:
+    serial = SerialControl(pipe, sock)
     for raw_line in sys.stdin.buffer:
         try:
             request = json.loads(raw_line)
@@ -295,7 +368,7 @@ def serve(pipe: str | None) -> None:
                     "protocolVersion": "2025-06-18",
                     "capabilities": {"tools": {"listChanged": False}},
                     "serverInfo": {"name": "retroos-serial", "version": "1.0.0"},
-                    "instructions": "These tools execute directly in the RetroOS kernel over COM2. Use profile_reads for reliable structured DOS read timings; profile_dump also writes the complete report to COM1.",
+                    "instructions": "These tools execute directly in the RetroOS kernel over COM2, via an 86Box named pipe or the QEMU socket printed as 'MCP control'. Use profile_reads for reliable structured DOS read timings; profile_dump also writes the complete report to the kernel log.",
                 })
             elif method == "ping": emit(identifier, {})
             elif method == "tools/list": emit(identifier, {"tools": TOOLS})
@@ -319,7 +392,11 @@ def serve(pipe: str | None) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pipe", help="86Box COM pipe base (without .in/.out)")
-    serve(parser.parse_args().pipe)
+    parser.add_argument("--socket", help="QEMU COM2 unix socket (run.sh prints this path)")
+    args = parser.parse_args()
+    if args.pipe and args.socket:
+        parser.error("pass only one of --pipe and --socket")
+    serve(args.pipe, args.socket)
 
 
 if __name__ == "__main__":

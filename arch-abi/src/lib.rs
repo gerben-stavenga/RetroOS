@@ -205,10 +205,20 @@ pub struct BootConfig {
     pub hostfs_port: Option<ComPort>,
     /// Optional kernel serial-console port. `None` leaves UART logging disabled.
     pub serial_console_port: Option<ComPort>,
+    /// Optional diagnostic-control port (`mcp=` / fw_cfg `opt/mcp`). `None`
+    /// leaves it to CONFIG.SYS `MCP=`, or disabled when that is absent too.
+    pub mcp_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],
     /// Metal's temporary physical-memory access. Hosted entries leave this empty.
     pub boot_physical_io: Option<BootPhysicalIo>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SerialOwner {
+    HostFs,
+    Log,
+    Mcp,
 }
 
 fn validate_mount_path(path: &[u8]) {
@@ -231,6 +241,7 @@ impl BootConfig {
             ram_overlay: false, boot_log_only: false, isa_lpc_disappointment: false,
             hostfs_port: None,
             serial_console_port: None,
+            mcp_port: None,
             boot_modules: [None; MAX_BOOT_MODULES],
             boot_physical_io: None,
         };
@@ -241,24 +252,53 @@ impl BootConfig {
         cfg.c_root_len = d.len();
         cfg
     }
-    /// Apply `hostfs=com1|com2` and `serial=com1|com2` assignments in command
-    /// line order. Each service owns at most one port and each port has at most
-    /// one owner; assigning a shared port evicts its previous owner.
+    /// Apply `hostfs=`, `serial=`, and `mcp=` assignments in command line order.
+    /// Each service owns at most one port and each port has at most one owner;
+    /// assigning a shared port evicts its previous owner.
     pub fn set_serial_services_from_cmdline(&mut self, s: &[u8]) {
         cmdline::for_each_key_value(s, |key, value| {
             let Some(port) = ComPort::parse_ascii(value) else { return };
             if cmdline::key_eq(key, b"hostfs") {
-                if self.serial_console_port == Some(port) {
-                    self.serial_console_port = None;
-                }
-                self.hostfs_port = Some(port);
+                self.claim_serial_port(SerialOwner::HostFs, port);
             } else if cmdline::key_eq(key, b"serial") {
-                if self.hostfs_port == Some(port) {
-                    self.hostfs_port = None;
-                }
-                self.serial_console_port = Some(port);
+                self.claim_serial_port(SerialOwner::Log, port);
+            } else if cmdline::key_eq(key, b"mcp") {
+                self.claim_serial_port(SerialOwner::Mcp, port);
             }
         });
+    }
+
+    /// Select the diagnostic-control UART from fw_cfg `opt/mcp` (`com1` or
+    /// `com2`). Applied after the launch command line, so it wins over `mcp=`
+    /// there. Returns false when the value is not a supported port.
+    pub fn set_mcp_value(&mut self, value: &[u8]) -> bool {
+        let mut value = value;
+        while value.first().is_some_and(|byte| byte.is_ascii_whitespace() || *byte == 0) {
+            value = &value[1..];
+        }
+        while value.last().is_some_and(|byte| byte.is_ascii_whitespace() || *byte == 0) {
+            value = &value[..value.len() - 1];
+        }
+        let Some(port) = ComPort::parse_ascii(value) else { return false };
+        self.claim_serial_port(SerialOwner::Mcp, port);
+        true
+    }
+
+    fn claim_serial_port(&mut self, owner: SerialOwner, port: ComPort) {
+        if owner != SerialOwner::HostFs && self.hostfs_port == Some(port) {
+            self.hostfs_port = None;
+        }
+        if owner != SerialOwner::Log && self.serial_console_port == Some(port) {
+            self.serial_console_port = None;
+        }
+        if owner != SerialOwner::Mcp && self.mcp_port == Some(port) {
+            self.mcp_port = None;
+        }
+        match owner {
+            SerialOwner::HostFs => self.hostfs_port = Some(port),
+            SerialOwner::Log => self.serial_console_port = Some(port),
+            SerialOwner::Mcp => self.mcp_port = Some(port),
+        }
     }
 
     /// Installed-machine mounts supplied by GRUB. Invalid explicit settings
@@ -425,6 +465,25 @@ mod boot_config_tests {
         config.set_cmdline(b"serial=com2 hostfs=com2");
         assert_eq!(config.serial_console_port, None);
         assert_eq!(config.hostfs_port, Some(ComPort::Com2));
+    }
+
+    #[test]
+    fn mcp_port_follows_the_same_exclusive_assignment_rule() {
+        let mut config = BootConfig::empty();
+        config.set_cmdline(b"serial=com1 mcp=com2;TESTS/X.COM");
+        assert_eq!(config.serial_console_port, Some(ComPort::Com1));
+        assert_eq!(config.mcp_port, Some(ComPort::Com2));
+        assert_eq!(config.hostfs_port, None);
+
+        config.set_cmdline(b"mcp=com1 hostfs=com1");
+        assert_eq!(config.mcp_port, None);
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+
+        assert!(config.set_mcp_value(b" com2\n"));
+        assert_eq!(config.mcp_port, Some(ComPort::Com2));
+        assert_eq!(config.hostfs_port, Some(ComPort::Com1));
+        assert!(!config.set_mcp_value(b"ttyS1"));
+        assert_eq!(config.mcp_port, Some(ComPort::Com2));
     }
 }
 

@@ -3421,6 +3421,8 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
         path_len,
         cmdtail: cmdtail_buf,
         cmdtail_len,
+        cwd: [0; 164],
+        cwd_len: 0,
         personality_name: Some(thread::PersonalityName::Dos),
         policy,
         on_error,

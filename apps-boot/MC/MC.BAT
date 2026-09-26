@@ -1,0 +1,6 @@
+ECHO OFF
+C:
+CD \
+C:\SHELL\mc\HDPMI32.EXE
+CD \
+C:\SHELL\mc\DPMILD32.EXE C:\SHELL\mc\mc.exe

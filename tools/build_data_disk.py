@@ -10,7 +10,7 @@ Layout:
     LBA 0           FreeDOS MBR (bootnorm.asm) + partition table
     p1 @ LBA 63     FAT32, type 0x0C, ACTIVE -- C: in BOTH worlds:
                         KERNEL.SYS, COMMAND.COM, FDCONFIG.SYS   FreeDOS boots it
-                        GAMES/, TC/, BORLANDC/, CD/, ...        the DOS world
+                        GAMES/, BORLANDC/, CD/, ...             the DOS world
     p2              ext4 -- the Linux personality's '/' (busybox userland)
 
 Why one FAT volume for both: FreeDOS has no VFS and reads only FAT, so the

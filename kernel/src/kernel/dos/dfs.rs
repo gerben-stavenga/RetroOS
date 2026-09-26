@@ -530,7 +530,7 @@ impl DfsState {
     /// itself is POSIX-strict.
     pub fn to_vfs_open(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
-        walk_components(rest, out, &mut pos, /*allow_missing_last=*/false)?;
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/false, /*lfn=*/false)?;
         Ok(pos)
     }
 
@@ -540,7 +540,20 @@ impl DfsState {
     /// Use for CREATE / UNLINK / RENAME (destination) / MKDIR.
     pub fn to_vfs_create(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
         let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
-        walk_components(rest, out, &mut pos, /*allow_missing_last=*/true)?;
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/true, /*lfn=*/false)?;
+        Ok(pos)
+    }
+
+    /// Win32 paths accept case-insensitive long names, not only DOS aliases.
+    pub fn to_vfs_open_lfn(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+        let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/false, /*lfn=*/true)?;
+        Ok(pos)
+    }
+
+    pub fn to_vfs_create_lfn(abs_dos: &[u8], out: &mut [u8]) -> Result<usize, i32> {
+        let (mut pos, rest) = strip_drive_prefix(abs_dos, out)?;
+        walk_components(rest, out, &mut pos, /*allow_missing_last=*/true, /*lfn=*/true)?;
         Ok(pos)
     }
 
@@ -658,6 +671,7 @@ fn walk_components(
     out: &mut [u8],
     pos: &mut usize,
     allow_missing_last: bool,
+    lfn: bool,
 ) -> Result<(), i32> {
     if rest.is_empty() { return Ok(()); }
 
@@ -677,7 +691,12 @@ fn walk_components(
         // before the next component. The `out[..*pos]` slice (without the
         // trailing slash) is the cache key.
         let dir_slice = &out[..*pos];
-        match ci::lookup(dir_slice, comp) {
+        let original = if lfn {
+            ci::lookup_lfn(dir_slice, comp).map(|(_, entry)| entry.original.as_slice())
+        } else {
+            ci::lookup(dir_slice, comp)
+        };
+        match original {
             Some(original) => {
                 if *pos > 0 {
                     if *pos >= out.len() { return Err(3); }

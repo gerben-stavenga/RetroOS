@@ -1513,6 +1513,17 @@ pub fn dos_abs_to_vfs_create(dos_abs: &[u8]) -> Option<alloc::vec::Vec<u8>> {
         .map(|n| out[..n].to_vec())
 }
 
+/// Map a Win32 drive-qualified path using case-insensitive long-name lookup.
+pub fn windows_abs_to_vfs(path: &[u8], create: bool) -> Option<alloc::vec::Vec<u8>> {
+    let mut out = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
+    let result = if create {
+        dfs::DfsState::to_vfs_create_lfn(path, &mut out)
+    } else {
+        dfs::DfsState::to_vfs_open_lfn(path, &mut out)
+    };
+    result.ok().map(|n| out[..n].to_vec())
+}
+
 /// Snapshot a DOS env block (variable strings up to and including the
 /// `00 00` terminator) into a heap Vec. Used so the parent's env survives
 /// the COW fork's address-space teardown that happens before `map_psp` runs
@@ -2004,6 +2015,53 @@ fn dos_keep_resident_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A
 }
 
 fn dos_resize_block<A: crate::Arch>(machine: &mut A, dos: &mut DosState<A>, regs: &mut Regs, seg: u16, paras: u16) -> Result<(), (u16, u16)> {
+    // Some DOS programs (including Volkov Commander) relocate themselves by
+    // enlarging their PSP block, then split its trailing portion into a new
+    // MCB themselves before calling AH=4Ah on that child. Accept only a
+    // structurally valid split wholly inside a block owned by this PSP; this
+    // keeps the kernel's allocation ledger authoritative while supporting
+    // that DOS-compatible MCB operation.
+    if !dos.dos_blocks.iter().any(|block| block.seg == seg)
+        && dos.current_psp != 0
+    {
+        let child_mcb = seg.saturating_sub(1);
+        let child_addr = (child_mcb as usize) << 4;
+        let child_sig = machine.read::<u8>(child_addr);
+        let child_owner = machine.read::<u16>(child_addr + 1);
+        let child_paras = machine.read::<u16>(child_addr + 3);
+        let parent = dos.dos_blocks.iter().enumerate().find_map(|(idx, block)| {
+            let end = block.seg as u32 + block.paras as u32;
+            (block.owner == dos.current_psp
+                && seg > block.seg.saturating_add(1)
+                && seg as u32 + child_paras as u32 == end)
+                .then_some((idx, *block))
+        });
+        if let Some((idx, parent)) = parent {
+            let parent_mcb = parent.seg.saturating_sub(1);
+            let parent_addr = (parent_mcb as usize) << 4;
+            let parent_sig = machine.read::<u8>(parent_addr);
+            let parent_owner = machine.read::<u16>(parent_addr + 1);
+            let parent_paras = machine.read::<u16>(parent_addr + 3);
+            let left_paras = seg.saturating_sub(parent.seg).saturating_sub(1);
+            let child_end = seg as u32 + child_paras as u32;
+            let expected_child_sig = if child_end >= 0xA000 { b'Z' } else { b'M' };
+            if parent_sig == b'M'
+                && parent_owner == parent.owner
+                && parent_paras == left_paras
+                && child_sig == expected_child_sig
+                && child_owner == parent.owner
+                && child_paras != 0
+            {
+                dos.dos_blocks[idx].paras = left_paras;
+                insert_dos_block(dos, DosMemBlock {
+                    seg, paras: child_paras, owner: parent.owner,
+                });
+                sync_heap_seg(dos);
+                sync_mcb_chain(machine, dos, regs);
+            }
+        }
+    }
+
     if let Some(idx) = dos.dos_blocks.iter().position(|b| b.seg == seg) {
         // Block resize: data must end before next block's MCB (or at 0xA000
         // if no next block).

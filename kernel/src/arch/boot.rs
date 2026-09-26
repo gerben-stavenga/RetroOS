@@ -403,6 +403,14 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     if let Some(n) = read_named(b"opt/audio", &mut audio) {
         cfg.audio_mixed = audio[..n].starts_with(b"mixed");
     }
+    // Separate from opt/cmdline: a directive-only launch line shuts the
+    // machine down, and an interactive boot still needs the control UART.
+    let mut mcp = [0u8; 16];
+    if let Some(n) = read_named(b"opt/mcp", &mut mcp) {
+        if !cfg.set_mcp_value(&mcp[..n]) {
+            crate::compact_println!("serial-control: invalid opt/mcp value");
+        }
+    }
     cfg
 }
 

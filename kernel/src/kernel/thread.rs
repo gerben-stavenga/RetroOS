@@ -108,6 +108,10 @@ pub enum KernelAction {
         path_len: usize,
         cmdtail: [u8; 128],
         cmdtail_len: usize,
+        /// Optional VFS working directory for the new process. Empty inherits
+        /// the parent cwd.
+        cwd: [u8; 164],
+        cwd_len: usize,
         /// Which personality's namespace `path` is in (the launcher's). `Some(Dos)`
         /// ⇒ `path` is a DOS path (resolved to VFS only for the read; used verbatim
         /// as the program name a DOS extender reopens). `None` ⇒ `path` is VFS-form
@@ -1007,6 +1011,9 @@ pub fn exit_thread<A: crate::Arch>(
             // exit_code from the DOS personality already encodes termination
             // type in bits 8..15 and AL/vector in bits 0..7 — copy verbatim.
             dos.last_child_exit_status = exit_code as u16;
+        }
+        if let Personality::Windows(windows) = &mut parent.personality {
+            windows.process_exited(thread.kernel.tid as u32 + 1, exit_code as u32);
         }
     }
 

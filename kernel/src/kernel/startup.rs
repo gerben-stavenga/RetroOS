@@ -332,9 +332,15 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
     }
 }
 
-/// Enable the command/reply diagnostic UART. It must not share the ambient
-/// log or HostFS port: either stream may contain arbitrary bytes.
+/// Enable the command/reply diagnostic UART. Firmware (`mcp=` on the command
+/// line, or fw_cfg `opt/mcp`) wins over CONFIG.SYS `MCP=`. The port must not
+/// share the ambient log or HostFS UART: either stream may contain arbitrary
+/// bytes.
 fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
+    if let Some(port) = boot.mcp_port {
+        start_serial_control(boot, master_env, port);
+        return;
+    }
     let Some(value) = crate::kernel::dos::config_var(master_env, b"MCP") else {
         return;
     };
@@ -345,12 +351,19 @@ fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
         crate::compact_println!("serial-control: invalid CONFIG.SYS MCP value");
         return;
     };
-    let config_log_port = crate::kernel::dos::config_var(master_env, b"SERIAL")
+    start_serial_control(boot, master_env, port);
+}
+
+fn config_serial_port(master_env: &[u8]) -> Option<arch_abi::ComPort> {
+    crate::kernel::dos::config_var(master_env, b"SERIAL")
         .and_then(|value| value.split(|byte| *byte == b' ').next())
-        .and_then(arch_abi::ComPort::parse_ascii);
+        .and_then(arch_abi::ComPort::parse_ascii)
+}
+
+fn start_serial_control(boot: &crate::BootConfig, master_env: &[u8], port: arch_abi::ComPort) {
     if boot.hostfs_port == Some(port)
         || boot.serial_console_port == Some(port)
-        || config_log_port == Some(port)
+        || config_serial_port(master_env) == Some(port)
     {
         crate::compact_println!("serial-control: {:?} already has another owner", port);
         return;
@@ -1261,9 +1274,15 @@ fn prepare_program<A: crate::Arch>(
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
     // C:-relative one (the common `--cmd GAMES/...` form — C: = c_root, same
     // resolution the DOS personality applies to the program's own file I/O).
-    let buf = exec::load_file_resolved(&launch_path)
-        .or_else(|_| exec::load_file_resolved(&[crate::kernel::dos::c_root(), &launch_path].concat()))
-        .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(&launch_path).unwrap_or("?")));
+    let (buf, loaded_path) = match exec::load_file_resolved(&launch_path) {
+        Ok(buf) => (buf, launch_path.clone()),
+        Err(_) => {
+            let path = [crate::kernel::dos::c_root(), &launch_path].concat();
+            let buf = exec::load_file_resolved(&path)
+                .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(&launch_path).unwrap_or("?")));
+            (buf, path)
+        }
+    };
     // argv = path + the cmdline tail split into words. The ELF/Linux path
     // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
     // dash as ["-c", "echo hi"]); DOS ignores the extra entries and gets the
@@ -1311,7 +1330,7 @@ fn prepare_program<A: crate::Arch>(
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
         exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
-        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &launch_path),
+        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path),
         _ => dos::run_init_program(
             machine,
             dos_template,
@@ -2004,6 +2023,52 @@ fn sound_view<A: crate::Arch>(
     }
 }
 
+/// Guest stack words and the saved-frame chain, for a user fault whose stack
+/// is the Windows stack just below 0xBFF00000. Stops at the first link that
+/// leaves the mapped stack or jumps by more than 64 KiB, so a garbage frame
+/// pointer is not chased into an unmapped page.
+fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
+    let rsp = regs.frame.rsp as u32;
+    if !(0xbf00_0000..0xbff0_0000).contains(&rsp) {
+        return;
+    }
+    let mut words = [0u32; 8];
+    for (i, word) in words.iter_mut().enumerate() {
+        let at = rsp.wrapping_add(i as u32 * 4);
+        if at < rsp || at >= 0xbff0_0000 {
+            break;
+        }
+        *word = machine.read::<u32>(at as usize);
+    }
+    crate::compact_println!(
+        "  stack {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+        words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]
+    );
+    let ebx = regs.rbx as u32;
+    if (0x1000..0xc000_0000).contains(&ebx) {
+        let p34 = machine.read::<u32>(ebx as usize + 0x34);
+        let p40 = machine.read::<u32>(ebx as usize + 0x40);
+        let p1c = machine.read::<u32>(ebx as usize + 0x1c);
+        crate::compact_println!(
+            "  obj {:#x} +1c={:#x} +34={:#x} +40={:#x}",
+            ebx, p1c, p34, p40
+        );
+    }
+    let mut ebp = regs.rbp as u32;
+    for _ in 0..8 {
+        if !(0xbf00_0000..0xbff0_0000).contains(&ebp) || ebp % 4 != 0 {
+            break;
+        }
+        let prev = machine.read::<u32>(ebp as usize);
+        let ret = machine.read::<u32>((ebp as usize).wrapping_add(4));
+        crate::compact_println!("  frame ebp={:#x} ret={:#x}", ebp, ret);
+        if prev <= ebp || prev.wrapping_sub(ebp) > 0x1_0000 || prev >= 0xbff0_0000 {
+            break;
+        }
+        ebp = prev;
+    }
+}
+
 /// Canonicalize a kernel event into the action the scheduler decides on.
 /// Page faults are decided here — an unhandled user fault is a SEGV exit,
 /// and `signal_thread` wants the whole `Thread` for its diagnostics;
@@ -2068,6 +2133,8 @@ fn dispatch<A: crate::Arch>(
             regs.r14,
             regs.r15
         );
+        dump_fault_stack(machine, regs);
+        crate::kernel::windows::print_recent_apis();
         let code = match thread.personality {
             thread::Personality::Dos(_) => 0x020E, // type 02h, vector 0Eh (#PF)
             thread::Personality::Linux(_)
@@ -2289,6 +2356,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     parent_tid: usize,
     path: &[u8],
     cmdtail: &[u8],
+    child_cwd: &[u8],
     personality_name: Option<thread::PersonalityName>,
     policy: crate::kernel::dos::LaunchPolicy,
     on_error: fn(&mut crate::Regs, i32),
@@ -2508,7 +2576,10 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let args = alloc::vec![path.to_vec()];
     let cmdtail = cmdtail.to_vec();
     let env = parent_env_snapshot.unwrap_or_default();
-    let cwd = parent_cwd_buf[..parent_cwd_len].to_vec();
+    let cwd_override = (!child_cwd.is_empty()).then(|| child_cwd.to_vec());
+    let cwd = cwd_override
+        .clone()
+        .unwrap_or_else(|| parent_cwd_buf[..parent_cwd_len].to_vec());
     if exec::init_thread(
         machine,
         threads,
@@ -2624,9 +2695,29 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             crate::kernel::kpipe::add_reader(cpipe);
         }
         thread::Personality::Windows(windows) => {
-            let n = parent_cwd_len.min(windows.cwd.len());
-            windows.cwd[..n].copy_from_slice(&parent_cwd_buf[..n]);
-            windows.cwd_len = n;
+            // DOS stores its cwd as "C:DIR", while WindowsState stores a VFS
+            // path. Translate the inherited directory before replacing the
+            // executable directory selected by exec_pe_into.
+            let inherited = if let Some(cwd) = cwd_override.as_ref() {
+                Some(cwd.clone())
+            } else if parent_is_dos && parent_cwd_len >= 2 {
+                let mut dos_path = alloc::vec![
+                    parent_cwd_buf[0], b':', b'\\',
+                ];
+                dos_path.extend(parent_cwd_buf[2..parent_cwd_len].iter().map(
+                    |&b| if b == b'/' { b'\\' } else { b },
+                ));
+                crate::kernel::dos::windows_abs_to_vfs(&dos_path, false)
+            } else if parent_is_dos {
+                None
+            } else {
+                Some(parent_cwd_buf[..parent_cwd_len].to_vec())
+            };
+            if let Some(cwd) = inherited {
+                let n = cwd.len().min(windows.cwd.len());
+                windows.cwd[..n].copy_from_slice(&cwd[..n]);
+                windows.cwd_len = n;
+            }
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
             child.kernel.fds[1] = thread::FdKind::ConsoleOut;
@@ -2691,6 +2782,11 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         parent_tid
     );
     on_success(vcpu, child_tid as i32);
+    if let thread::Personality::Windows(windows) =
+        &mut thread::get_thread(threads, parent_tid).unwrap().personality
+    {
+        windows.process_started(child_tid as u32 + 1);
+    }
     {
         let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
         parent.kernel.vcpu.regs = *vcpu;

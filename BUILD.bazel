@@ -83,11 +83,24 @@ _BUSYBOX_APPLETS = [
     target = "busybox",
 ) for a in _BUSYBOX_APPLETS]
 
-# Pristine drop-in dirs: contents auto-shipped under the given DOS prefix.
-# Drop files into apps-boot/tc/ or apps/TP70/ and they appear at C:\TC\... or
-# C:\TP70\... in the image on the next build — no per-file wiring.
+# Everything under apps-boot/ except the TC toolchain is C:\RETROOS\<PATH>
+# on the boot disk. TC is not shipped: :tc_tar exists only for //:image_min,
+# the image that runs in-OS TCC while building COMMAND.COM and the DOS stub.
+_APPS_BOOT_SRCS = glob(
+    ["apps-boot/**/*"],
+    exclude = ["apps-boot/tc/**"],
+    allow_empty = True,
+)
 _TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
 _TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
+
+pkg_tar(
+    name = "apps_boot_tar",
+    files = {
+        ":" + src: "RETROOS/" + src[len("apps-boot/"):].upper()
+        for src in _APPS_BOOT_SRCS
+    },
+)
 
 pkg_tar(
     name = "tc_tar",
@@ -107,7 +120,9 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
-# Runtime files are separate from the persistent DN defaults in DATA_FILES.
+# Built runtime (COMMAND.COM, symbols, shell). apps-boot/ is :apps_boot_tar,
+# not this map: those sources are also CONFIG seeds, and one files dict cannot
+# list the same label twice.
 _BOOT_DIR_FILES = dict(BOOT_FILES)
 _BOOT_CONFIG_FILES = {k: v for k, v in DATA_FILES.items() if v.startswith("CONFIG/")}
 
@@ -185,7 +200,7 @@ pkg_tar(
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
 )
 
-# DOS content (everything in _EXTRA_FILES except busybox) + games/TC/TP70,
+# DOS content (everything in _EXTRA_FILES except busybox) + games/TP70,
 # all under C: = /home/retroos.
 _DOS_EXTRA = {k: v for k, v in _EXTRA_FILES.items() if v != "bin/busybox"}
 pkg_tar(
@@ -193,9 +208,9 @@ pkg_tar(
     empty_dirs = ["TEMP"],
     files = _DOS_EXTRA,
     deps = [
+        ":apps_boot_tar",
         ":games_tar",
         ":ultrasnd_tar",
-        ":tc_tar",
         ":tp70_tar",
     ],
     package_dir = "home/retroos",
@@ -208,7 +223,7 @@ pkg_tar(
     name = "root_module_dos_tar",
     empty_dirs = ["TEMP"],
     files = _DOS_EXTRA,
-    deps = [":ultrasnd_tar", ":tc_tar", ":tp70_tar"],
+    deps = [":apps_boot_tar", ":ultrasnd_tar", ":tp70_tar"],
     package_dir = "home/retroos",
 )
 
@@ -237,9 +252,9 @@ pkg_tar(
     empty_dirs = ["TEMP"],
     files = _DOS_EXTRA_PROPRIETARY,
     deps = [
+        ":apps_boot_tar",
         ":games_tar",
         ":ultrasnd_tar",
-        ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
     ],
@@ -257,9 +272,9 @@ pkg_tar(
     files = _BASE_FILES,
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
+        ":apps_boot_tar",
         ":games_tar",
         ":ultrasnd_tar",
-        ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
     ],
@@ -268,7 +283,7 @@ pkg_tar(
 # Disk image layout (used by both image and image_proprietary):
 #   sector 0           bootloader/MBR (with patched partition table)
 #   sector 1..         boot bundle TAR (kernel.elf for the MBR loader only)
-#   sector EXT4_START  ext4 partition: extras + BOOT + TC + games (+ proprietary)
+#   sector EXT4_START  ext4 partition: extras + BOOT + games (+ proprietary)
 # The kernel scans the MBR for the ext4 root; C:\RETROOS is a directory on it.
 #
 # EXT4_START leaves 32 MiB of headroom for the boot bundle. Anything bigger
@@ -509,6 +524,7 @@ pkg_tar(
     name = "diagnostic_dos_tar",
     files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
     empty_dirs = ["TEMP"],
+    deps = [":apps_boot_tar"],
     package_dir = "home/retroos",
 )
 
@@ -633,12 +649,14 @@ sh_binary(
 pkg_tar(
     name = "boot_dir_tar",
     files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
+    deps = [":apps_boot_tar"],
 )
 
 # One build target keeps the installed kernel and all runtime files matched.
 pkg_tar(
     name = "machine_boot_tar",
-    files = BOOT_FILES | _BOOT_CONFIG_FILES | {"//kernel:kernel_elf": "kernel.elf"},
+    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES | {"//kernel:kernel_elf": "kernel.elf"},
+    deps = [":apps_boot_tar"],
 )
 
 # The data manifest declares lifetime explicitly, including any writable
@@ -654,7 +672,6 @@ pkg_tar(
     deps = [
         ":games_tar",
         ":ultrasnd_tar",
-        ":tc_tar",
         ":tp70_tar",
     ],
 )
@@ -674,7 +691,6 @@ pkg_tar(
     deps = [
         ":games_tar",
         ":ultrasnd_tar",
-        ":tc_tar",
         ":tp70_tar",
         "//apps-proprietary:tar",
     ],

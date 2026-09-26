@@ -69,6 +69,14 @@ launch() {
         args+=(-serial none)
         [ -z "$COMMAND" ] || cwd=$(dirname "${COMMAND%% *}")
     fi
+    if [ "$FREEDOS" = 0 ]; then
+        # COM2 is the diagnostic-control UART. opt/mcp is not part of the
+        # launch command line: a directive-only cmdline would shut down.
+        args+=(-chardev "socket,id=mcp,path=$WORK/mcp.sock,server=on,wait=off"
+               -serial chardev:mcp
+               -fw_cfg "name=opt/mcp,string=com2")
+        echo "MCP control: $WORK/mcp.sock"
+    fi
     if [ -n "$directive" ]; then
         printf '%s' "$directive" > "$WORK/cmdline"
         args+=(-fw_cfg "name=opt/cmdline,file=$WORK/cmdline")

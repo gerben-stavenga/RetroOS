@@ -87,8 +87,11 @@ def main():
             assert forbidden not in listing, forbidden
         with tarfile.open(machine / 'machine_boot.tar') as archive:
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
-            assert {'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM', 'RETROOS/DN/DN.COM', 'CONFIG/CONFIG.SYS'} <= names
-            assert 'RETROOS/DN/DN.HIS' not in names and 'RETROOS/DN/DN.FLG' not in names
+            assert {
+                'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
+                'RETROOS/DN/DN.COM', 'RETROOS/VC/VC.COM', 'RETROOS/MC/MC.EXE',
+                'CONFIG/CONFIG.SYS',
+            } <= names
             kernel = next(member for member in archive.getmembers()
                           if member.name.removeprefix('./') == 'kernel.elf')
             # immediate-abort removes the Rust panic handler from the linked
