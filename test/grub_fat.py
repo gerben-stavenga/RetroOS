@@ -116,9 +116,11 @@ def main():
         boot(work, "fat32-module-root", fat32, True, "Multiboot FAT (64 MB, volatile RAM)")
         boot(work, "fat12-module-legacy", fat12, True, "Multiboot FAT (1 MB, volatile RAM)",
              cpu="pentium")
+        # Keep a constrained-RAM FAT12 case. 32 MiB no longer fits the boot
+        # framebuffer, DOS video backing, and the current kernel together.
         for label, image in [("fat12", fat12), ("fat16", fat16), ("fat32", fat32)]:
             boot(work, label + "-lfn", image, True, "Multiboot FAT", "ROOTTEST.BAT", "LFN-ALL-OK",
-                 memory=32 if label == "fat12" else 256)
+                 memory=48 if label == "fat12" else 256)
 
 
 if __name__ == "__main__":
