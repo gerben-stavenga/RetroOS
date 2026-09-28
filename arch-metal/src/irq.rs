@@ -996,6 +996,10 @@ pub fn handle_irq(regs: &mut Regs) {
                 let _ = now(false);
             }
             unsafe { queue_irq0_wakeup(); }
+            // USB HID reports need polling on PIC-only machines too. The
+            // APIC timer path does this above; without it the devices can
+            // enumerate but never deliver keys or mouse movement.
+            crate::xhci::poll();
             None // the IRQ merely returns control to the event loop
         }
         1 => Some(Irq::Key(inb(0x60))),
