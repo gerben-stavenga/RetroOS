@@ -52,18 +52,17 @@ set default=0
 insmod part_msdos
 insmod fat
 
-# Native BIOS boots keep hardware VGA, including planar and Mode X modes.
-if [ "$grub_platform" = "pc" ]; then
-    set gfxpayload=text
-else
-    insmod all_video
-    set gfxmode=auto
-    set gfxpayload=keep
-fi
-
 menuentry "RetroOS" {{
     search --no-floppy --file /kernel.elf --set=root
     multiboot2 /kernel.elf{cmdline}
+    # multiboot2 resets gfxpayload from the kernel header; override it here.
+    if [ "$grub_platform" = "pc" ]; then
+        set gfxpayload=text
+    else
+        insmod all_video
+        set gfxmode=auto
+        set gfxpayload=keep
+    fi
     boot
 }}
 

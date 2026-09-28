@@ -50,6 +50,9 @@ def grub_entries(plan):
     insmod part_gpt
     insmod ext2
     insmod multiboot2
+    search --no-floppy --fs-uuid --set=root {uuid}
+    multiboot2 {release}/kernel.elf {args}{extra}
+    # multiboot2 resets gfxpayload from the kernel header; override it here.
     # Native BIOS boots keep hardware VGA, including planar and Mode X modes.
     if [ "$grub_platform" = "pc" ]; then
         set gfxpayload=text
@@ -58,8 +61,6 @@ def grub_entries(plan):
         set gfxmode=auto
         set gfxpayload=keep
     fi
-    search --no-floppy --fs-uuid --set=root {uuid}
-    multiboot2 {release}/kernel.elf {args}{extra}
     boot
 }}
 ''')
