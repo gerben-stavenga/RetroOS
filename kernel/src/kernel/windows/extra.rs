@@ -905,8 +905,7 @@ fn paint(state: &mut WindowsState) {
                 (color(attr), color(attr >> 4))
             };
             let glyph = &lib::vga_fonts::FONT_8X16[ch.min(255) * 16..ch.min(255) * 16 + 16];
-            for row in 0..16 {
-                let bits = glyph[row];
+            for (row, &bits) in glyph.iter().enumerate().take(16) {
                 for col in 0..8 {
                     let pixel = if bits & (0x80 >> col) != 0 { fg } else { bg };
                     let px = (y * 16 + row) * window.width as usize + x * 8 + col;
@@ -1502,7 +1501,7 @@ fn locale_info<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 
     if dest == 0 || cap == 0 {
         return (text.len() + 1) as u32;
     }
-    if wide { copy_dir_bytes(machine, dest, cap, text) } else { copy_ascii(machine, dest, cap, text) + 0 }
+    if wide { copy_dir_bytes(machine, dest, cap, text) } else { copy_ascii(machine, dest, cap, text) }
 }
 
 fn string_type<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 {

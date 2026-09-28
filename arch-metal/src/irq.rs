@@ -364,9 +364,7 @@ fn init_hpet(physical_base: Option<u64>) -> Option<(u64, u64)> {
         core::ptr::write_volatile((hpet_va + 0x10) as *mut u64, conf | 1);
     }
     let start = hpet_counter(mask);
-    if wait_hpet_delta(start, (hz / 1000).max(1), mask).is_none() {
-        return None;
-    }
+    wait_hpet_delta(start, (hz / 1000).max(1), mask)?;
     Some((hz, mask))
 }
 

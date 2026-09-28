@@ -212,8 +212,8 @@ unsafe fn capture_boot_info_v2(
             14 | 15 if tag_size > 8 => {
                 let bytes = (tag_size - 8).min(acpi_rsdp.len());
                 if tag_type == 15 || acpi_rsdp_len == 0 {
-                    for i in 0..bytes {
-                        acpi_rsdp[i] = unsafe { core::ptr::read_volatile(tag.add(8 + i)) };
+                    for (i, value) in acpi_rsdp.iter_mut().enumerate().take(bytes) {
+                        *value = unsafe { core::ptr::read_volatile(tag.add(8 + i)) };
                     }
                     acpi_rsdp_len = bytes;
                 }
@@ -534,10 +534,9 @@ fn read_boot_config(multiboot_cmdline: &[u8]) -> crate::BootConfig {
     // Separate from opt/cmdline: a directive-only launch line shuts the
     // machine down, and an interactive boot still needs the control UART.
     let mut mcp = [0u8; 16];
-    if let Some(n) = read_named(b"opt/mcp", &mut mcp) {
-        if !cfg.set_mcp_value(&mcp[..n]) {
-            crate::compact_println!("serial-control: invalid opt/mcp value");
-        }
+    if let Some(n) = read_named(b"opt/mcp", &mut mcp)
+        && !cfg.set_mcp_value(&mcp[..n]) {
+        crate::compact_println!("serial-control: invalid opt/mcp value");
     }
     cfg
 }

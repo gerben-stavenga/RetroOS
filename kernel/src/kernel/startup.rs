@@ -2056,7 +2056,7 @@ fn dump_fault_stack<A: crate::Arch>(machine: &A, regs: &Regs) {
     }
     let mut ebp = regs.rbp as u32;
     for _ in 0..8 {
-        if !(0xbf00_0000..0xbff0_0000).contains(&ebp) || ebp % 4 != 0 {
+        if !(0xbf00_0000..0xbff0_0000).contains(&ebp) || !ebp.is_multiple_of(4) {
             break;
         }
         let prev = machine.read::<u32>(ebp as usize);
