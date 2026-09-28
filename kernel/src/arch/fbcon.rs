@@ -168,12 +168,12 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         width, height, pitch, info.framebuffer_bpp, rp, rs, gp, gs, bp, bs, addr
     );
     // Blind-debug signal, painted BEFORE we panic: a machine with no debug port
-    // and no usable console shows nothing at all otherwise. Map the first
-    // stripe of the framebuffer and fill it with 0xFF — white-ish on any
-    // channel order or depth — so "framebuffer handed over but unusable" is
-    // visible even though the panic message below will not be.
-    let blind_signal = || {
-        let stripe_bytes = (pitch * 32).min(1 << 20);
+    // and no usable console cannot show the panic text. Draw one to four white
+    // bars, each four scanlines tall with four black scanlines between them:
+    // 1 = type, 2 = pixel format, 3 = pitch, 4 = console dimensions.
+    // The byte pattern works regardless of the reported RGB channel order.
+    let blind_signal = |bars: usize| {
+        let stripe_bytes = pitch.saturating_mul(32).min(1 << 20);
         let pages = ((addr & (PAGE_SIZE as u64 - 1)) as usize + stripe_bytes).div_ceil(PAGE_SIZE);
         for i in 0..pages {
             paging2::map_user_page_phys(
@@ -184,26 +184,31 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
         }
         let base = paging2::FB_WINDOW_BASE + (addr & (PAGE_SIZE as u64 - 1)) as usize;
         unsafe {
-            core::slice::from_raw_parts_mut(base as *mut u8, stripe_bytes).fill(0xFF);
+            for (row, scanline) in core::slice::from_raw_parts_mut(base as *mut u8, stripe_bytes)
+                .chunks_mut(pitch.max(1))
+                .enumerate()
+            {
+                scanline.fill(if row / 8 < bars && row % 8 < 4 { 0xFF } else { 0 });
+            }
         }
     };
     if info.framebuffer_type != FB_TYPE_RGB {
-        blind_signal();
+        blind_signal(1);
         lib::compact_panic!("fbcon: framebuffer type {} unsupported (need {} = RGB)",
             info.framebuffer_type, FB_TYPE_RGB);
     }
     let bytes_per_pixel = info.framebuffer_bpp.div_ceil(8) as usize;
     let Some(format) = PixelFormat::from_rgb(bytes_per_pixel as u8, info.color_info) else {
-        blind_signal();
+        blind_signal(2);
         lib::compact_panic!("fbcon: unsupported pixel format {}bpp R{}/{} G{}/{} B{}/{} — need packed 16/24/32-bit RGB",
             info.framebuffer_bpp, rp, rs, gp, gs, bp, bs);
     };
     if pitch < width * bytes_per_pixel {
-        blind_signal();
+        blind_signal(3);
         lib::compact_panic!("fbcon: pitch {} smaller than {} packed pixels", pitch, width);
     }
     if width < TEXT_W || height < TEXT_H {
-        blind_signal();
+        blind_signal(4);
         lib::compact_panic!("fbcon: framebuffer {}x{} smaller than the {}x{} text console",
             width, height, TEXT_W, TEXT_H);
     }
