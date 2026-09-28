@@ -39,6 +39,7 @@ fn log_byte(b: u8) {
 
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
 const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
+const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
 
 // Linker symbols
 unsafe extern "C" {
@@ -58,10 +59,19 @@ const PHYS_TO_SEG: usize = paging2::KERNEL_BASE - KERNEL_PHYS;
 /// Pre-paging only; the caller's stack frame holds the copies across the paging
 /// switch (the stack's linked address is mapped identically before and after).
 unsafe fn capture_boot_info(
-    info: *const arch::MultibootInfo,
+    magic: u32,
+    info: *const u8,
     mmap_out: &mut [MultibootMmapEntry; 128],
     cmdline_out: &mut [u8],
-) -> (arch::MultibootInfo, usize, usize, [Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES]) {
+) -> (arch::MultibootInfo, usize, usize, [Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES], [u8; 4096], usize) {
+    assert!(
+        magic == MULTIBOOT_BOOTLOADER_MAGIC || magic == MULTIBOOT2_BOOTLOADER_MAGIC,
+        "Bad Multiboot magic: {:#x} (expected v1 {:#x} or v2 {:#x})",
+        magic, MULTIBOOT_BOOTLOADER_MAGIC, MULTIBOOT2_BOOTLOADER_MAGIC
+    );
+    if magic == MULTIBOOT2_BOOTLOADER_MAGIC {
+        return unsafe { capture_boot_info_v2(info, mmap_out, cmdline_out) };
+    }
     let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const arch::MultibootInfo;
     let inf = unsafe { core::ptr::read_unaligned(src) };
     let mut count = 0;
@@ -105,7 +115,115 @@ unsafe fn capture_boot_info(
             },
         )
     };
-    (inf, count, cmdline_len, modules)
+    (inf, count, cmdline_len, modules, [0; 4096], 0)
+}
+
+/// Normalize GRUB's tagged Multiboot2 block into the legacy fields used by
+/// the rest of early boot. Keep the ACPI RSDP tag as an owned copy because its
+/// embedded root-table pointers remain physical addresses after this handoff.
+unsafe fn capture_boot_info_v2(
+    info: *const u8,
+    mmap_out: &mut [MultibootMmapEntry; 128],
+    cmdline_out: &mut [u8],
+) -> (arch::MultibootInfo, usize, usize, [Option<crate::multiboot::AcceptedModule>; arch_abi::MAX_BOOT_MODULES], [u8; 4096], usize) {
+    let src = (info as usize).wrapping_add(PHYS_TO_SEG) as *const u8;
+    let total_size = unsafe { core::ptr::read_unaligned(src.cast::<u32>()) as usize };
+    assert!((16..=16 * 1024 * 1024).contains(&total_size), "invalid Multiboot2 info size");
+    let mut normalized = arch::MultibootInfo {
+        flags: 0, mem_lower: 0, mem_upper: 0, boot_device: 0, cmdline: 0,
+        mods_count: 0, mods_addr: 0, syms: [0; 4], mmap_length: 0, mmap_addr: 0,
+        drives_length: 0, drives_addr: 0, config_table: 0, boot_loader_name: 0,
+        apm_table: 0, vbe_control_info: 0, vbe_mode_info: 0, vbe_mode: 0,
+        vbe_interface_seg: 0, vbe_interface_off: 0, vbe_interface_len: 0,
+        framebuffer_addr: 0, framebuffer_pitch: 0, framebuffer_width: 0,
+        framebuffer_height: 0, framebuffer_bpp: 0, framebuffer_type: 0,
+        color_pad: [0; 2], color_info: [0; 6],
+    };
+    let mut mmap_count = 0usize;
+    let mut cmdline_len = 0usize;
+    let mut accepted = [None; arch_abi::MAX_BOOT_MODULES];
+    let mut acpi_rsdp = [0u8; 4096];
+    let mut acpi_rsdp_len = 0usize;
+    let mut offset = 8usize;
+
+    while offset.checked_add(8).is_some_and(|end| end <= total_size) {
+        let tag = unsafe { src.add(offset) };
+        let tag_type = unsafe { core::ptr::read_unaligned(tag.cast::<u32>()) };
+        let tag_size = unsafe { core::ptr::read_unaligned(tag.add(4).cast::<u32>()) as usize };
+        assert!(tag_size >= 8 && offset + tag_size <= total_size, "invalid Multiboot2 tag");
+        if tag_type == 0 { break; }
+        match tag_type {
+            1 => {
+                let bytes = (tag_size - 8).min(cmdline_out.len());
+                for i in 0..bytes {
+                    let byte = unsafe { core::ptr::read_volatile(tag.add(8 + i)) };
+                    if byte == 0 { break; }
+                    cmdline_out[cmdline_len] = byte;
+                    cmdline_len += 1;
+                }
+                normalized.flags |= 1 << 2;
+            }
+            3 if tag_size >= 17 => {
+                let start = unsafe { core::ptr::read_unaligned(tag.add(8).cast::<u32>()) };
+                let end = unsafe { core::ptr::read_unaligned(tag.add(12).cast::<u32>()) };
+                let command_bytes = tag_size - 16;
+                let mut command = [0u8; 256];
+                let mut length = 0usize;
+                while length < command.len() && length < command_bytes {
+                    let byte = unsafe { core::ptr::read_volatile(tag.add(16 + length)) };
+                    if byte == 0 { break; }
+                    command[length] = byte;
+                    length += 1;
+                }
+                crate::multiboot::capture_module(start, end, &command[..length], &mut accepted);
+            }
+            6 if tag_size >= 16 => {
+                let entry_size = unsafe { core::ptr::read_unaligned(tag.add(8).cast::<u32>()) as usize };
+                assert!(entry_size >= 24, "invalid Multiboot2 memory map entry size");
+                let mut entry_offset = 16usize;
+                while entry_offset + entry_size <= tag_size && mmap_count < mmap_out.len() {
+                    let entry = unsafe { tag.add(entry_offset) };
+                    mmap_out[mmap_count] = MultibootMmapEntry {
+                        size: 20,
+                        base: unsafe { core::ptr::read_unaligned(entry.cast::<u64>()) },
+                        length: unsafe { core::ptr::read_unaligned(entry.add(8).cast::<u64>()) },
+                        typ: unsafe { core::ptr::read_unaligned(entry.add(16).cast::<u32>()) },
+                    };
+                    mmap_count += 1;
+                    entry_offset += entry_size;
+                }
+                normalized.flags |= 1 << 6;
+                normalized.mmap_length = (mmap_count * core::mem::size_of::<MultibootMmapEntry>()) as u32;
+            }
+            8 if tag_size >= 32 => {
+                normalized.framebuffer_addr = unsafe { core::ptr::read_unaligned(tag.add(8).cast::<u64>()) };
+                normalized.framebuffer_pitch = unsafe { core::ptr::read_unaligned(tag.add(16).cast::<u32>()) };
+                normalized.framebuffer_width = unsafe { core::ptr::read_unaligned(tag.add(20).cast::<u32>()) };
+                normalized.framebuffer_height = unsafe { core::ptr::read_unaligned(tag.add(24).cast::<u32>()) };
+                normalized.framebuffer_bpp = unsafe { core::ptr::read_unaligned(tag.add(28)) };
+                normalized.framebuffer_type = unsafe { core::ptr::read_unaligned(tag.add(29)) };
+                if normalized.framebuffer_type == 1 && tag_size >= 38 {
+                    for (i, value) in normalized.color_info.iter_mut().enumerate() {
+                        *value = unsafe { core::ptr::read_unaligned(tag.add(32 + i)) };
+                    }
+                }
+                normalized.flags |= arch::MULTIBOOT_INFO_FRAMEBUFFER;
+            }
+            14 | 15 if tag_size > 8 => {
+                let bytes = (tag_size - 8).min(acpi_rsdp.len());
+                if tag_type == 15 || acpi_rsdp_len == 0 {
+                    for i in 0..bytes {
+                        acpi_rsdp[i] = unsafe { core::ptr::read_volatile(tag.add(8 + i)) };
+                    }
+                    acpi_rsdp_len = bytes;
+                }
+            }
+            _ => {}
+        }
+        offset = (offset + tag_size + 7) & !7;
+    }
+    assert!(normalized.flags & (1 << 6) != 0, "Multiboot2 memory map missing");
+    (normalized, mmap_count, cmdline_len, accepted, acpi_rsdp, acpi_rsdp_len)
 }
 
 /// boot_kernel - Entry point called by asm boot stub
@@ -117,7 +235,7 @@ unsafe fn capture_boot_info(
 /// `magic` is the Multiboot bootloader magic (EAX on entry).
 /// `info` is a Multiboot info pointer (physical address, in low memory).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInfo) -> ! {
+pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const u8) -> ! {
     let config = unsafe { prepare_boot(magic, info) };
 
     // The arch backend handle, threaded as `&mut` through the kernel from here
@@ -135,7 +253,7 @@ pub unsafe extern "C" fn boot_kernel(magic: u32, info: *const arch::MultibootInf
 #[inline(never)]
 unsafe fn prepare_boot(
     magic: u32,
-    info: *const arch::MultibootInfo,
+    info: *const u8,
 ) -> &'static crate::BootConfig {
     // FIRST life sign, before paging: paint a strip into the framebuffer the
     // loader handed us. On real hardware there is no debug port and no
@@ -146,8 +264,8 @@ unsafe fn prepare_boot(
     // address P is reached at P + (KERNEL_BASE - KERNEL_PHYS), wrapping.
     let mut mmap_buf = [MultibootMmapEntry { size: 0, base: 0, length: 0, typ: 0 }; 128];
     let mut boot_cmdline = [0u8; 512];
-    let (boot_info, mmap_count, boot_cmdline_len, boot_modules_raw) =
-        unsafe { capture_boot_info(info, &mut mmap_buf, &mut boot_cmdline) };
+    let (boot_info, mmap_count, boot_cmdline_len, boot_modules_raw, acpi_rsdp, acpi_rsdp_len) =
+        unsafe { capture_boot_info(magic, info, &mut mmap_buf, &mut boot_cmdline) };
     let info = &boot_info;
 
     let kernel_size =
@@ -208,13 +326,6 @@ unsafe fn prepare_boot(
     let arch_stack_top = (&raw const crate::ARCH_STACK_TOP) as u32 - 16;
     descriptors::setup_descriptor_tables(arch_stack_top);
     descriptors::setup_syscall();
-
-    // Verify the bootloader is Multiboot-compliant before touching info.
-    assert!(
-        magic == MULTIBOOT_BOOTLOADER_MAGIC,
-        "Bad Multiboot magic: {:#x} (expected {:#x})",
-        magic, MULTIBOOT_BOOTLOADER_MAGIC
-    );
 
     // UEFI-class machine (loader handed us a linear framebuffer, there is no
     // VGA text mode): console cells go to a RAM buffer instead of B8000.
@@ -277,7 +388,24 @@ unsafe fn prepare_boot(
     // compat-mode toggle below reuses, so they survive the switch.
     crate::fbcon::init(info, screen);
 
-    irq::init_interrupts();
+    let tagged_hpet_base = if acpi_rsdp_len != 0 {
+        arch::acpi::hpet_base_from_rsdp(&acpi_rsdp[..acpi_rsdp_len])
+    } else {
+        None
+    };
+    let (hpet_base, hpet_discovery) = if let Some(base) = tagged_hpet_base {
+        (Some(base), Some("Multiboot2 ACPI tag"))
+    } else if let Some(base) = arch::acpi::hpet_base_from_legacy_scan() {
+        (Some(base), Some("firmware memory scan"))
+    } else {
+        (None, None)
+    };
+    if let (Some(base), Some(source)) = (hpet_base, hpet_discovery) {
+        lib::compact_screenln!(screen, "HPET: ACPI base {:#x} ({})", base, source);
+    } else {
+        lib::compact_screenln!(screen, "HPET: no ACPI table found; using timer fallback");
+    }
+    irq::init_interrupts(hpet_base);
     lib::compact_screenln!(screen, "Interrupts initialized");
 
     // The compat-mode switch was a test harness to force the experimental

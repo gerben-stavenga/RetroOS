@@ -49,7 +49,7 @@ def grub_entries(plan):
         entries.append(f'''menuentry "RetroOS ({name})" {{
     insmod part_gpt
     insmod ext2
-    insmod multiboot
+    insmod multiboot2
     # Native BIOS boots keep hardware VGA, including planar and Mode X modes.
     if [ "$grub_platform" = "pc" ]; then
         set gfxpayload=text
@@ -59,7 +59,7 @@ def grub_entries(plan):
         set gfxpayload=keep
     fi
     search --no-floppy --fs-uuid --set=root {uuid}
-    multiboot {release}/kernel.elf {args}{extra}
+    multiboot2 {release}/kernel.elf {args}{extra}
     boot
 }}
 ''')
@@ -87,7 +87,7 @@ def prepare(c_root, destination, archive=None):
         original = custom.read_text()
         pattern = r'menuentry "RetroOS \((?:protected disk|writeable disk|writable disk)\)" \{\n[^{}]*\n\}'
         def retire(match):
-            if "multiboot /boot/retroos/kernel.elf" in match[0]:
+            if re.search(r"multiboot2? /boot/retroos/kernel\.elf", match[0]):
                 return "# RetroOS entries are managed by /etc/grub.d/41_retroos."
             return match[0]
         updated = re.sub(pattern, retire, original)

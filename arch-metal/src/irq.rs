@@ -215,9 +215,8 @@ fn unmask_irq(irq: u8) {
 // the "hangs at Starting DN" symptom on an AMD Razer laptop; locally with QEMU
 // `-M q35,pit=off`). The local APIC timer is always present; we run it as the
 // periodic wakeup, returning control to the event loop without manufacturing
-// elapsed time. The HPET (fixed, self-describing frequency at the de-facto-standard
-// base 0xFED00000) is the calibration reference — with no PIT there is no other
-// fixed clock to derive the rate from.
+// elapsed time. The ACPI-described HPET is the calibration reference — with no
+// PIT there is no other fixed clock to derive the rate from.
 
 // xAPIC MMIO register offsets (the x2APIC MSR is 0x800 + offset/16).
 const LAPIC_SVR: u32 = 0xF0;
@@ -250,7 +249,11 @@ const APIC_BASE_X2: u64 = 1 << 10;         // x2APIC mode
 const LAPIC_MMIO_VA: usize = 0xFFF0_0000;
 const LAPIC_PHYS: u64 = 0xFEE0_0000;
 const HPET_MMIO_VA: usize = 0xFFF0_1000;
-const HPET_PHYS: u64 = 0xFED0_0000;
+static mut HPET_REGISTER_OFFSET: usize = 0;
+// A failed/disabled timer must not hang boot while we wait for its counter.
+// At one million volatile polls, even a slow legacy bridge gets ample time to
+// cover the 1 ms probe and 10 ms calibration windows.
+const TIMER_POLL_LIMIT: u32 = 1_000_000;
 
 // false => x2APIC (MSR access); true after we map MMIO for the xAPIC path.
 static mut LAPIC_X2: bool = false;
@@ -291,11 +294,12 @@ fn map_mmio_page(va: usize, phys: u64) {
 
 /// Read the HPET main counter without tearing on this 32-bit kernel.
 fn hpet_counter(mask: u64) -> u64 {
-    let lo = (HPET_MMIO_VA + 0xF0) as *const u32;
+    let offset = unsafe { core::ptr::read_volatile(&raw const HPET_REGISTER_OFFSET) };
+    let lo = (HPET_MMIO_VA + offset + 0xF0) as *const u32;
     if mask == u64::from(u32::MAX) {
         return u64::from(unsafe { core::ptr::read_volatile(lo) });
     }
-    let hi = (HPET_MMIO_VA + 0xF4) as *const u32;
+    let hi = (HPET_MMIO_VA + offset + 0xF4) as *const u32;
     loop {
         let hi0 = unsafe { core::ptr::read_volatile(hi) };
         let low = unsafe { core::ptr::read_volatile(lo) };
@@ -306,12 +310,42 @@ fn hpet_counter(mask: u64) -> u64 {
     }
 }
 
-/// Enable and describe the architectural HPET when the fixed PC mapping
-/// answers. `None` leaves both the clock and LAPIC calibration on PIT paths.
-fn init_hpet() -> Option<(u64, u64)> {
-    map_mmio_page(HPET_MMIO_VA, HPET_PHYS);
+/// Wait for the HPET main counter to advance, with a finite bound. Firmware may
+/// leave HPET disabled or decode it at a different base; a stationary counter
+/// must select the PIT fallback instead of wedging early boot.
+fn wait_hpet_delta(start: u64, target: u64, mask: u64) -> Option<u64> {
+    for _ in 0..TIMER_POLL_LIMIT {
+        let now = hpet_counter(mask);
+        if now.wrapping_sub(start) & mask >= target {
+            return Some(now);
+        }
+    }
+    None
+}
+
+fn wait_pit2_delta(start: u16, target: u16) -> Option<u16> {
+    for _ in 0..TIMER_POLL_LIMIT {
+        let now = pit2_count();
+        if start.wrapping_sub(now) >= target {
+            return Some(now);
+        }
+    }
+    None
+}
+
+/// Enable and describe the architectural HPET at its ACPI-provided base.
+/// `None` leaves both the clock and LAPIC calibration on PIT paths.
+fn init_hpet(physical_base: Option<u64>) -> Option<(u64, u64)> {
+    let physical_base = physical_base?;
+    let page_offset = (physical_base & (crate::paging2::PAGE_SIZE as u64 - 1)) as usize;
+    if page_offset > crate::paging2::PAGE_SIZE - 0x100 {
+        return None;
+    }
+    unsafe { core::ptr::write_volatile(&raw mut HPET_REGISTER_OFFSET, page_offset); }
+    map_mmio_page(HPET_MMIO_VA, physical_base);
+    let hpet_va = HPET_MMIO_VA + page_offset;
     let capabilities = unsafe {
-        core::ptr::read_volatile(HPET_MMIO_VA as *const u64)
+        core::ptr::read_volatile(hpet_va as *const u64)
     };
     let period_fs = (capabilities >> 32) as u32;
     if period_fs == 0 || period_fs > 100_000_000 {
@@ -324,10 +358,14 @@ fn init_hpet() -> Option<(u64, u64)> {
         u64::from(u32::MAX)
     };
     let conf = unsafe {
-        core::ptr::read_volatile((HPET_MMIO_VA + 0x10) as *const u64)
+        core::ptr::read_volatile((hpet_va + 0x10) as *const u64)
     };
     unsafe {
-        core::ptr::write_volatile((HPET_MMIO_VA + 0x10) as *mut u64, conf | 1);
+        core::ptr::write_volatile((hpet_va + 0x10) as *mut u64, conf | 1);
+    }
+    let start = hpet_counter(mask);
+    if wait_hpet_delta(start, (hz / 1000).max(1), mask).is_none() {
+        return None;
     }
     Some((hz, mask))
 }
@@ -350,10 +388,7 @@ fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
         let window = (hpet_hz / 100).max(1);
         let h0 = hpet_counter(mask);
         let t0 = crate::x86::rdtsc();
-        let h1 = loop {
-            let h = hpet_counter(mask);
-            if h.wrapping_sub(h0) & mask >= window { break h; }
-        };
+        let h1 = wait_hpet_delta(h0, window, mask)?;
         let t1 = crate::x86::rdtsc();
         let elapsed = h1.wrapping_sub(h0) & mask;
         return (elapsed != 0).then(||
@@ -367,10 +402,7 @@ fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
     let window = (PIT_INPUT_HZ / 100) as u16;
     let p0 = pit2_count();
     let t0 = crate::x86::rdtsc();
-    let p1 = loop {
-        let p = pit2_count();
-        if p0.wrapping_sub(p) >= window { break p; }
-    };
+    let p1 = wait_pit2_delta(p0, window)?;
     let t1 = crate::x86::rdtsc();
     let elapsed = u64::from(p0.wrapping_sub(p1));
     (elapsed != 0).then(||
@@ -378,10 +410,24 @@ fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
             / u128::from(elapsed)) as u64)
 }
 
-fn init_monotonic_clock() {
+fn init_monotonic_clock(hpet_base: Option<u64>) {
     init_pit2_clock();
-    let hpet = init_hpet();
-    let tsc_hz = stable_tsc().then(|| calibrate_tsc(hpet)).flatten();
+    let mut hpet = init_hpet(hpet_base);
+    let tsc_hz = if stable_tsc() {
+        match calibrate_tsc(hpet) {
+            Some(hz) => Some(hz),
+            None if hpet.is_some() => {
+                // A counter that passed the initial probe but stopped during
+                // calibration is not a usable clock source. Retry against
+                // PIT2 and keep the later LAPIC setup on its PIT fallback too.
+                hpet = None;
+                calibrate_tsc(None)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let (source, hz) = if let Some(hz) = tsc_hz.filter(|&hz| hz != 0) {
         (ClockSource::Tsc, hz)
     } else if let Some((hz, _)) = hpet {
@@ -426,7 +472,10 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     let window = hpet_hz / 100;
     let t0 = hpet_counter(counter_mask);
     let c0 = lapic_read(LAPIC_CUR_COUNT);
-    while (hpet_counter(counter_mask).wrapping_sub(t0) & counter_mask) < window {}
+    if wait_hpet_delta(t0, window, counter_mask).is_none() {
+        lapic_write(LAPIC_INIT_COUNT, 0);
+        return None;
+    }
     let c1 = lapic_read(LAPIC_CUR_COUNT);
     let t1 = hpet_counter(counter_mask);
     lapic_write(LAPIC_INIT_COUNT, 0); // stop
@@ -615,10 +664,10 @@ fn i8042_present() -> bool {
 }
 
 /// Initialize interrupts (PIC + tick source + keyboard/mouse)
-pub fn init_interrupts() {
+pub fn init_interrupts(hpet_base: Option<u64>) {
     lib::compact_println!("IRQ: PIC");
     remap_pic();
-    init_monotonic_clock();
+    init_monotonic_clock(hpet_base);
 
     // Pick the interrupt mode ONCE: LAPIC timer succeeds ⇒ APIC mode (IOAPIC
     // routes device IRQs, LAPIC EOI); else the legacy 8259 path (PIT tick, PIC

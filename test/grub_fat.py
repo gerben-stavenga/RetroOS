@@ -40,10 +40,10 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
     grub.mkdir(parents=True)
     shutil.copyfile(ROOT / "bazel-bin/kernel/kernel.elf", tree / "boot/kernel.elf")
     commands = ["set timeout=0", "set default=0", 'menuentry "FAT root" {',
-                "terminal_output console", "multiboot /boot/kernel.elf"]
+                "terminal_output console", "multiboot2 /boot/kernel.elf"]
     if module:
         shutil.copyfile(image, tree / "boot/root.img")
-        commands.append("module /boot/root.img retroos.mount=/")
+        commands.append("module2 /boot/root.img retroos.mount=/")
     commands.extend(["boot", "}"])
     (grub / "grub.cfg").write_text("\n".join(commands) + "\n")
     iso = work / (name + ".iso")

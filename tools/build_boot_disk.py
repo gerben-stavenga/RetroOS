@@ -11,7 +11,7 @@ Layout:
     p1 @ 1 MiB      FAT32, type 0xEF:
                         /boot/grub/{grub.cfg,i386-pc/*.mod}   BIOS GRUB
                         /EFI/BOOT/BOOTX64.EFI                 UEFI GRUB
-                        /kernel.elf                           multiboot target
+                        /kernel.elf                           Multiboot2 target
                         /RETROOS/...                          mounted at C:\\RETROOS
                         /CONFIG/...                           fallback defaults
 
@@ -63,7 +63,7 @@ fi
 
 menuentry "RetroOS" {{
     search --no-floppy --file /kernel.elf --set=root
-    multiboot /kernel.elf{cmdline}
+    multiboot2 /kernel.elf{cmdline}
     boot
 }}
 
@@ -222,7 +222,7 @@ def build_efi_binary(work, cfg):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--kernel", required=True, help="kernel.elf (multiboot)")
+    ap.add_argument("--kernel", required=True, help="kernel.elf (Multiboot2)")
     ap.add_argument("--boot-tree", help="tree copied to the FAT root; carries RETROOS/")
     ap.add_argument("--grub-lib", default="/usr/lib/grub/i386-pc")
     ap.add_argument("--size-mb", type=int, default=128)

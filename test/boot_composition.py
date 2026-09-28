@@ -55,10 +55,10 @@ def boot(work, name, module, disks, protected=False, extra_args=""):
     grub.mkdir(parents=True)
     shutil.copyfile(ROOT / 'bazel-bin/kernel/kernel.elf', tree / 'boot/kernel.elf')
     cmd = ['set timeout=0', 'menuentry "probe" {',
-           'multiboot /boot/kernel.elf' + (' ram-overlay' if protected else '') + ' ' + extra_args]
+           'multiboot2 /boot/kernel.elf' + (' ram-overlay' if protected else '') + ' ' + extra_args]
     if module:
         shutil.copyfile(module, tree / 'boot/root.img')
-        cmd.append('module /boot/root.img retroos.mount=/')
+        cmd.append('module2 /boot/root.img retroos.mount=/')
     cmd += ['boot', '}']
     (grub / 'grub.cfg').write_text('\n'.join(cmd) + '\n')
     iso = work / (name + '.iso')

@@ -63,6 +63,40 @@ dd 0          ; height
 dd 32         ; depth
 
 ; =============================================================================
+; Multiboot2 header for GRUB. Keep the v1 header above for the in-tree legacy
+; loader, while GRUB's `multiboot2` command supplies tagged boot information,
+; including ACPI RSDP tags 14/15.
+; =============================================================================
+section .multiboot2
+align 8
+multiboot2_header:
+MULTIBOOT2_MAGIC equ 0xE85250D6
+MULTIBOOT2_ARCH  equ 0
+MULTIBOOT2_LENGTH equ multiboot2_end - multiboot2_header
+dd MULTIBOOT2_MAGIC
+dd MULTIBOOT2_ARCH
+dd MULTIBOOT2_LENGTH
+dd -(MULTIBOOT2_MAGIC + MULTIBOOT2_ARCH + MULTIBOOT2_LENGTH)
+    ; Information request: command line, modules, memory map, framebuffer,
+    ; ACPI 1.0 RSDP, and ACPI 2.0+ RSDP. ACPI tags are optional; the kernel
+    ; also searches the standard PC locations if GRUB cannot provide one.
+    dw 1                  ; information request header tag
+    dw 1                  ; optional: boot remains possible without a tag
+    dd 8 + 6 * 4
+    dd 1, 3, 6, 8, 14, 15
+    ; Framebuffer request: any native mode at 32 bpp where firmware supports it.
+    dw 5                  ; framebuffer header tag
+    dw 1                  ; optional; gfxpayload in grub.cfg selects the mode
+    dd 20
+    dd 0, 0, 32
+    dd 0                  ; pad framebuffer tag to the next 8-byte boundary
+    ; End tag.
+    dw 0
+    dw 0
+    dd 8
+multiboot2_end:
+
+; =============================================================================
 ; 32-bit code: boot stub, mode toggle, protected-mode entry, ISR dispatch
 ; =============================================================================
 section .text

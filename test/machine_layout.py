@@ -33,7 +33,7 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
         # Boot entirely from ATA media, leaving the SATA data port unused by
         # GRUB. The kernel must receive its initial FIS before checking SIG.
         entries = entries.replace(f"search --no-floppy --fs-uuid --set=root {UUID}", "")
-        entries = entries.replace("multiboot /boot/retroos/kernel.elf", "multiboot /boot/kernel.elf")
+        entries = entries.replace("multiboot2 /boot/retroos/kernel.elf", "multiboot2 /boot/kernel.elf")
     (grub / "grub.cfg").write_text("set timeout=0\n" + entries)
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)

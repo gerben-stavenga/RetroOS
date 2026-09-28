@@ -19,6 +19,7 @@ pub mod descriptors;
 pub mod irq;
 pub mod monitor;
 pub mod aperture;
+pub mod acpi;
 pub mod paging2;
 pub mod phys_mm;
 mod traps;

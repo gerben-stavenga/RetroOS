@@ -17,8 +17,8 @@ printf '%s\n' \
     'set default=0' \
     'menuentry "RetroOS kernel-only HostFS root probe" {' \
     '    terminal_output console' \
-    '    insmod multiboot' \
-    '    multiboot /boot/kernel.elf' \
+    '    insmod multiboot2' \
+    '    multiboot2 /boot/kernel.elf' \
     '    boot' \
     '}' > "$tmp_dir/iso/boot/grub/grub.cfg"
 grub-mkrescue -o "$tmp_dir/kernel-only.iso" "$tmp_dir/iso" >/dev/null

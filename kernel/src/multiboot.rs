@@ -122,36 +122,38 @@ where
         let Some(len_command) = read_command(descriptor.string, &mut command) else {
             continue;
         };
-        let Some(mount) = parse_mount(&command[..len_command]) else {
-            continue;
-        };
-        assert!(
-            descriptor.mod_end > descriptor.mod_start,
-            "Multiboot module has an empty or wrapped range"
+        capture_module(
+            descriptor.mod_start,
+            descriptor.mod_end,
+            &command[..len_command],
+            &mut accepted,
         );
-        let len = (descriptor.mod_end - descriptor.mod_start) as usize;
-        assert!(
-            len != 0 && len.is_multiple_of(512),
-            "Multiboot module size is not sector-aligned"
-        );
-        for prior in accepted.iter().flatten() {
-            assert!(
-                prior.mount[..prior.mount_len] != mount.bytes[..mount.len],
-                "duplicate retroos.mount path"
-            );
-        }
-        let slot = accepted
-            .iter()
-            .position(Option::is_none)
-            .expect("too many RetroOS Multiboot modules (maximum 4)");
-        accepted[slot] = Some(AcceptedModule {
-            start: descriptor.mod_start as u64,
-            len,
-            mount: mount.bytes,
-            mount_len: mount.len,
-        });
     }
     accepted
+}
+
+pub(crate) fn capture_module(
+    start: u32,
+    end: u32,
+    command: &[u8],
+    accepted: &mut [Option<AcceptedModule>; arch_abi::MAX_BOOT_MODULES],
+) {
+    let Some(mount) = parse_mount(command) else { return };
+    assert!(end > start, "Multiboot module has an empty or wrapped range");
+    let len = (end - start) as usize;
+    assert!(len != 0 && len.is_multiple_of(512), "Multiboot module size is not sector-aligned");
+    for prior in accepted.iter().flatten() {
+        assert!(prior.mount[..prior.mount_len] != mount.bytes[..mount.len],
+            "duplicate retroos.mount path");
+    }
+    let slot = accepted.iter().position(Option::is_none)
+        .expect("too many RetroOS Multiboot modules (maximum 4)");
+    accepted[slot] = Some(AcceptedModule {
+        start: start as u64,
+        len,
+        mount: mount.bytes,
+        mount_len: mount.len,
+    });
 }
 
 #[cfg_attr(not(target_arch = "x86"), allow(dead_code))]
