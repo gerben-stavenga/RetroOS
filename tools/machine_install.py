@@ -59,7 +59,7 @@ def grub_entries(plan):
     else
         insmod all_video
         set gfxmode=auto
-        set gfxpayload=keep
+        set gfxpayload=auto
     fi
     boot
 }}
