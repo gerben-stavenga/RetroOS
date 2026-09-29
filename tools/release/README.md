@@ -100,6 +100,18 @@ Extract into a new directory and run `./run.sh`. Requires Linux, QEMU x86,
 - `./run.sh --headless --sound none --cmd 'TESTS/HELLO.COM'`: smoke test.
 
 Default BIOS mode uses i440FX with IDE disks. UEFI defaults to NVMe data storage. SPICE/VNC is independent of disk-controller selection.
+
+For UniPCemu on Linux, install or build its executable, then run
+`./run.sh --backend unipcemu` (set `UNIPCEMU_BIN=/path/to/UniPCemu` if it is
+not on `PATH`). This uses a BIOS/Pentium i430fx machine with the same
+disposable boot image and persistent data image as QEMU. UniPCemu stores its
+session settings under the launcher's temporary directory and reads the disks
+through its `UNIPCEMU` data directory. It supports `--sound sb|none`, BIOS,
+ATA, and `--arch 686` in this launcher. Its `sb` choice uses Sound Blaster Pro 2
+at IRQ 7. UniPCemu must be installed separately; it is not bundled. See its
+[command line documentation](https://bitbucket.org/superfury/unipcemu/src/default/manual/Command-line%20parameters.md)
+and [disk image documentation](https://bitbucket.org/superfury/unipcemu/src/default/manual/Disk%20images.rst).
+
 For virt-manager, use i440FX with both disks attached as IDE, boot disk first.
 Give the guest at least 128 MiB RAM. The included launcher uses 512 MiB for UEFI.
 

@@ -823,6 +823,7 @@ pkg_tar(
         ":data_disk": "data.img",
         "tools/release/run.sh": "run.sh",
         "tools/run/qemu.sh": "tools/run/qemu.sh",
+        "tools/run/unipcemu.sh": "tools/run/unipcemu.sh",
         "tools/release/README.md": "README.md",
         "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
     },

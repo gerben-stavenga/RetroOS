@@ -112,6 +112,35 @@ def main():
         assert (home / 'CONFIG/DN/DN.MNU').is_file()
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
+        assert (vm / 'tools/run/unipcemu.sh').is_file()
+        fake_unipcemu = work / 'fake-unipcemu'
+        fake_unipcemu.write_text('''#!/usr/bin/env python3
+import configparser
+import os
+from pathlib import Path
+
+root = Path(os.environ['UNIPCEMU'])
+settings = configparser.ConfigParser()
+assert settings.read(root / 'SETTINGS.INI')
+assert settings['machine']['architecture'] == '4'
+assert settings['machine']['executionmode'] == '0'
+assert settings['machine']['cpu'] == '5'
+assert settings['bios']['bootorder'] == '14'
+assert settings['i430fxCMOS']['memory'] == '134217728'
+assert settings['disks']['hdd0'] == 'boot.img'
+assert settings['disks']['hdd1'] == 'data.img'
+assert (root / 'disks/boot.img').resolve().is_file()
+assert (root / 'disks/data.img').resolve() == Path(os.environ['RETROOS_DATA_IMAGE']).resolve()
+assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLASTER']
+''')
+        fake_unipcemu.chmod(0o755)
+        for sound, expected in [('sb', '4'), ('none', '0')]:
+            env = os.environ.copy()
+            env.update(UNIPCEMU_BIN=str(fake_unipcemu), RETROOS_DATA_IMAGE=str(vm / 'data.img'),
+                       EXPECTED_SOUNDBLASTER=expected)
+            subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu', '--sound', sound],
+                           cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
+        print('PASS: packaged UniPCemu launcher configures BIOS, IDE disks, RAM, and sound')
         # No Bazel invocation: this launcher must consume only the release.
         cases = [('bios', cpu, hd) for cpu in ('386', '686') for hd in ('ata', 'ahci', 'nvme')]
         cases += [('uefi', 'x64', hd) for hd in ('ata', 'ahci', 'nvme')]

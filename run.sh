@@ -6,12 +6,12 @@ cd "$SCRIPT_DIR"
 
 usage() {
     cat <<'HELP'
-Usage: ./run.sh [qemu|bochs|86box|rust-dos|rust-dos-games|hosted] [options] [-- emulator arguments]
+Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [options] [-- emulator arguments]
   --data-image PATH       Persistent disk (default: build/data.bin)
   --firmware bios|uefi    Default: UEFI for QEMU, BIOS elsewhere
   --freedos               Boot FreeDOS from the same data disk (BIOS only)
-  --arch 386|686|x64      CPU selection (default: 386)
-  --hd ata|ahci|nvme       QEMU data controller (default: NVMe on UEFI, ATA on BIOS)
+  --arch 386|686|x64      CPU selection (default: 386, UniPCemu: 686)
+  --hd ata|ahci|nvme       QEMU data controller; UniPCemu accepts ATA
   --sound sb|ac97|hda|none QEMU sound (default: hda; other emulators: sb)
   --sb-audio native|mixed QEMU guest audio policy
   --cmd, -c, -r COMMAND   Run a command (QEMU, hosted or rust-dos-games)
@@ -31,12 +31,12 @@ configuration directory. Old -i image modes and --gpt have been removed.
 HELP
 }
 fail() { echo "run.sh: $*" >&2; exit 1; }
-BACKEND=qemu FIRMWARE= SOUND= ARCH=386 FREEDOS=0 HEADLESS=0 KVM=0
+BACKEND=qemu FIRMWARE= SOUND= ARCH=386 ARCH_EXPLICIT=0 FREEDOS=0 HEADLESS=0 KVM=0
 COMMAND= HOST_DIR= WAV= SHOT= TRACE=0 SB_AUDIO= HD=
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/build/data.bin}"
 PASS=()
 case "${1:-}" in
-    qemu|bochs|86box|rust-dos|rust-dos-games|hosted) BACKEND="$1"; shift ;;
+    qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted) BACKEND="$1"; shift ;;
     -h|help) usage; exit 0 ;;
 esac
 while [ $# -gt 0 ]; do
@@ -48,7 +48,7 @@ while [ $# -gt 0 ]; do
                 --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2" ;;
                 --firmware) FIRMWARE="$2" ;;
                 --hd) HD="$2" ;;
-                --arch) ARCH="$2" ;;
+                --arch) ARCH="$2"; ARCH_EXPLICIT=1 ;;
                 --sound) SOUND="$2" ;; --sb-audio) SB_AUDIO="$2" ;;
                 --cmd|-c|-r) COMMAND="$2" ;; --host|-H|-h) HOST_DIR="$2" ;;
                 --wav|-w) WAV="$2" ;; --screenshot|-s) SHOT="$2" ;;
@@ -63,12 +63,13 @@ while [ $# -gt 0 ]; do
         *) fail "unknown option: $1 (pass emulator options after --)" ;;
     esac
 done
-case "$BACKEND" in qemu|bochs|86box|rust-dos|rust-dos-games|hosted) ;; *) fail "unknown backend: $BACKEND" ;; esac
+case "$BACKEND" in qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted) ;; *) fail "unknown backend: $BACKEND" ;; esac
+[ "$BACKEND" != unipcemu ] || [ "$ARCH_EXPLICIT" = 1 ] || ARCH=686
 [ -n "$FIRMWARE" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then FIRMWARE=uefi; else FIRMWARE=bios; fi; }
 [ -n "$SOUND" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then SOUND=hda; else SOUND=sb; fi; }
 case "$FIRMWARE" in bios|uefi) ;; *) fail "unknown firmware: $FIRMWARE" ;; esac
 case "$HD" in ''|ata|ahci|nvme) ;; *) fail "unknown disk controller: $HD" ;; esac
-[ -z "$HD" ] || [ "$BACKEND" = qemu ] || [ "$BACKEND" = rust-dos ] || fail "--hd requires QEMU or Rust-DOS"
+[ -z "$HD" ] || [ "$BACKEND" = qemu ] || [ "$BACKEND" = rust-dos ] || { [ "$BACKEND" = unipcemu ] && [ "$HD" = ata ]; } || fail "--hd requires QEMU or Rust-DOS (UniPCemu accepts ATA)"
 [ -n "$HD" ] || { if [ "$FIRMWARE" = uefi ]; then HD=nvme; else HD=ata; fi; }
 case "$SOUND" in sb|ac97|hda|none) ;; *) fail "unknown sound: $SOUND" ;; esac
 case "$ARCH" in 386|686|x64) ;; *) fail "unknown architecture: $ARCH" ;; esac
@@ -78,12 +79,17 @@ if [ "$FREEDOS" = 1 ]; then
     [ "$FIRMWARE" = bios ] && [ "$BACKEND" != hosted ] || fail "FreeDOS needs a BIOS emulator"
     [ -z "$COMMAND$HOST_DIR" ] || fail "--cmd/--host require RetroOS"
 fi
-if [ "$BACKEND" = bochs ] || [ "$BACKEND" = 86box ]; then
+if [ "$BACKEND" = bochs ] || [ "$BACKEND" = 86box ] || [ "$BACKEND" = unipcemu ]; then
     [ "$KVM$HEADLESS" = 00 ] && [ -z "$COMMAND$HOST_DIR$SB_AUDIO" ] || fail "these options require QEMU or hosted"
     [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 0 ] || fail "serial injection into the persistent disk is not supported"
     case "$SOUND" in sb|none) ;; *) fail "this backend supports sb or none" ;; esac
 fi
 [ "$BACKEND" != 86box ] || [ "$FIRMWARE" = bios ] || fail "86Box requires BIOS"
+if [ "$BACKEND" = unipcemu ]; then
+    [ "$FIRMWARE" = bios ] || fail "UniPCemu requires BIOS"
+    [ "$ARCH" = 686 ] || fail "UniPCemu currently uses its Pentium/i430fx machine (--arch 686)"
+    [ "$HD" = ata ] || fail "UniPCemu requires ATA disks"
+fi
 [ -z "$HOST_DIR" ] || [ -d "$HOST_DIR" ] || fail "host directory does not exist: $HOST_DIR"
 
 BAZEL="${BAZEL:-$(command -v bazelisk || command -v bazel || true)}"

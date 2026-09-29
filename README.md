@@ -41,7 +41,7 @@ while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP
 
 `bazelisk build //:release` produces public bundles in `bazel-bin/`:
 
-- `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and a prebuilt QEMU launcher.
+- `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and prebuilt QEMU and UniPCemu launchers.
 - `retroos-machine.tar.gz` (`//:release_machine`): matched kernel/runtime and installer.
 - `SHA256SUMS` (`//:release_checksums`): checksums for both bundles.
 
@@ -76,6 +76,7 @@ firmware, sound card, and image:
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
+./run.sh unipcemu                    # BIOS/Pentium with two raw IDE disks
 ./run.sh rust-dos                    # experimental: native BIOS loader; kernel currently halts
 ./run.sh rust-dos-games              # Rust-DOS shell with a disposable FAT16 C:
 ```
