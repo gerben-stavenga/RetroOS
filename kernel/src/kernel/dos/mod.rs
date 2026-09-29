@@ -453,6 +453,9 @@ impl Default for DosSearch {
 /// Saved parent state for returning from EXEC'd child.
 /// Chained via `prev` so nested exec works (e.g. DN.COM→DN.PRG→gfx.com).
 pub struct ExecParent {
+    /// PSP loaded by this EXEC. A guest-created AH=55h child may run inside
+    /// it without ending the EXEC relationship when that child terminates.
+    pub child_psp: u16,
     pub ss: u16,
     pub sp: u16,
     pub ds: u16,

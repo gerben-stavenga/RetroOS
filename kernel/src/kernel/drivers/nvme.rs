@@ -8,6 +8,7 @@
 //!
 //! Queues and bounce memory use the shared boot-lifetime DMA allocator.
 
+use alloc::vec::Vec;
 use core::mem::size_of;
 use super::dma::{Mmio, Region};
 use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage, poll};
@@ -130,13 +131,8 @@ fn set_data_prps(c: &mut [u32; 16], dma: &Region, buffer_phys: u64, sectors: u32
     }
 }
 
-/// Probe PCI for an NVMe controller (class 01h / subclass 08h) and bring it
-/// up. `None` when there is no controller (legacy machine, or the
-/// interpreter's absent bus) — not an error, and no side effects.
-fn bring_up<A: crate::Arch>(machine: &mut A) -> Option<(Nvme, u64)> {
-    let Some((bus, dev, func)) = pci::find_class(machine, 0x01, 0x08) else {
-        return None; // no NVMe controller (legacy machine) — not an error
-    };
+/// Bring up one enumerated NVMe PCI function.
+fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Option<(Nvme, u64)> {
 
     // Enable memory space + bus mastering.
     let pcmd = pci::read32(machine, bus, dev, func, 0x04);
@@ -248,13 +244,17 @@ fn wait_csts(regs: Mmio, ready: u32) -> bool {
 }
 
 impl Storage<Nvme> {
-    /// Probe PCI and bring up the controller's namespace 1.
-    pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Self> {
-        let (n, sectors) = bring_up(machine)?;
-        // SAFETY: bring_up exclusively maps this permanently resident DMA
-        // region. The bounce span is disjoint from queues and the PRP list.
-        let buffer = unsafe { n.dma.buffer(BOUNCE_OFF, BOUNCE_PAGES * crate::PAGE_SIZE) };
-        Some(Self::new(n, buffer, sectors, "nvme0n1"))
+    /// Probe every NVMe controller's namespace 1 in PCI scan order.
+    pub fn probe_all<A: crate::Arch>(machine: &mut A) -> Vec<Self> {
+        let mut disks = Vec::new();
+        for (number, (bus, dev, func)) in pci::find_classes(machine, 0x01, 0x08).into_iter().enumerate() {
+            let Some((n, sectors)) = bring_up(machine, bus, dev, func) else { continue };
+            // SAFETY: bring_up exclusively maps this permanently resident DMA
+            // region. The bounce span is disjoint from queues and the PRP list.
+            let buffer = unsafe { n.dma.buffer(BOUNCE_OFF, BOUNCE_PAGES * crate::PAGE_SIZE) };
+            disks.push(Self::new(n, buffer, sectors, &alloc::format!("nvme{number}n1")));
+        }
+        disks
     }
 }
 

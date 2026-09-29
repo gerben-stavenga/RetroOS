@@ -49,7 +49,7 @@ fn packed_rows_match_encoded_words_for_every_vga_mode() {
             dac_mask: 0x7F, font: &lib::vga_fonts::FONT_8X16,
             font_b: &lib::vga_fonts::FONT_8X16, font_maps: None, blink: true, text_cursor: None,
             cga_palette: [0, 0x123456, 0xABCDEF, 0xFFFFFF],
-            start_offset: 8, pixel_pan: 1, line_compare: 1, blank_start: h - 1,
+            start_offset: 8, pixel_pan: 1, split_pixel_pan: 0, line_compare: 1, blank_start: h - 1,
         };
         for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
             PixelFormat::RGB888, PixelFormat::NATIVE]
@@ -90,7 +90,7 @@ fn packed_rows_share_tail_storage_without_corrupting_following_rows() {
             mode: VgaMode::ModeX { w: width, h: 4, row_bytes: 1 },
             vram: &[], planes: &planes, ac: &ac, palette: &palette, dac_mask: 0xFF,
             font: &[], font_b: &[], font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
-            start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: 3,
+            start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: 3,
         };
         for format in [PixelFormat::RGB332, PixelFormat::RGB555, PixelFormat::RGB565,
             PixelFormat::RGB888, PixelFormat::NATIVE]
@@ -142,7 +142,7 @@ fn packed_text_reads_cells_and_font_directly_from_vga_planes() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };
@@ -186,7 +186,7 @@ fn scanout_reads_either_live_plane_layout_without_reordering() {
             mode, plane_layout: VramLayout::PlaneMinor, planes: &minor, vram: &[],
             ac: &ac, palette: &palette, dac_mask: 0xFF, font: &[], font_b: &[], font_maps: None,
             blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 0x4000,
-            pixel_pan: 3, line_compare: 2, blank_start: 3,
+            pixel_pan: 3, split_pixel_pan: 0, line_compare: 2, blank_start: 3,
         };
         let mut pal = vga::Pal::new();
         pal.sync(&palette, 0xFF, PixelFormat::RGB565, &mut [0; 768]);
@@ -527,7 +527,7 @@ fn mode13h_maps_each_index_through_the_palette() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };
@@ -566,7 +566,7 @@ fn mode13h_tolerates_short_vram() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };
@@ -593,7 +593,7 @@ fn packed_indexed_spans_preserve_short_source_and_palette_zero() {
                 vram: &memory[..len], planes: &memory[..len],
                 ac: &ac, palette: &palette, dac_mask: 0x7F, font: &[], font_b: &[], font_maps: None,
                 blink: false, text_cursor: None, cga_palette: [0; 4], start_offset: 3,
-                pixel_pan: 7, line_compare: 2, blank_start: h,
+                pixel_pan: 7, split_pixel_pan: 0, line_compare: 2, blank_start: h,
             };
             for format in [PixelFormat::RGB332, PixelFormat::RGB565,
                 PixelFormat::RGB888, PixelFormat::NATIVE]
@@ -656,7 +656,7 @@ fn text_renders_glyph_pixels_with_fg_bg() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };
@@ -710,7 +710,7 @@ fn text_attribute_bit_three_selects_character_map() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };
@@ -737,7 +737,7 @@ fn text40_keeps_rows_separate_and_doubles_character_dots() {
         mode: TEXT40, vram: &vram, planes: &[],
         ac: &ac, palette: &pal,
         dac_mask: 0xFF, font: &font, font_b: &font, font_maps: None, blink: false, text_cursor: None, cga_palette: [0; 4],
-        start_offset: 0, pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
+        start_offset: 0, pixel_pan: 0, split_pixel_pan: 0, line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let mut out = vec![0u32; 720 * 400];
     vga_render::render(&frame, &mut out);
@@ -827,7 +827,7 @@ fn native_rows_hold_one_output_encoded_word_per_vga_pixel() {
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let formats = [
@@ -924,7 +924,7 @@ fn text_cursor_tracks_page_shape_disable_and_blink_in_both_renderers() {
         ac: &ac, palette: &palette, dac_mask: 0xFF,
         font: &font, font_b: &font, font_maps: None, blink: false,
         text_cursor: vga::TextCursor::from_crtc(&crtc, true),
-        cga_palette: [0; 4], start_offset: 16, pixel_pan: 0,
+        cga_palette: [0; 4], start_offset: 16, pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX, blank_start: usize::MAX,
     };
     let (w, h) = vga::dimensions(mode);

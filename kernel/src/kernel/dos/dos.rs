@@ -351,11 +351,17 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
         0x08 => thread::KernelAction::Done, // timer — handled via VM86 IRQ reflect path
         0x13 => int_13h(machine, regs),
         0x20 => {
-            if let Some(parent) = dos.exec_parent.take() {
+            if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
+                && let Some(parent) = dos.exec_parent.take()
+            {
                 dos.last_child_exit_status = 0x0000;
                 return (exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false), None);
             }
-            thread::KernelAction::Exit(0)
+            if return_to_psp_parent(machine, dos, regs, 0, None) {
+                thread::KernelAction::Done
+            } else {
+                thread::KernelAction::Exit(0)
+            }
         }
         0x21 => int_21h(machine, kt, dos, regs, &mut suspension),
         0x33 => int_33h(machine, dos, regs),
@@ -404,8 +410,16 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
 
     match vector {
         0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
-            let ah_in = (regs.rax >> 8) as u8;
-            let psp_before = dos.current_psp;
+            // DOS keeps the interrupted register frame in the current PSP.
+            // A manually loaded child created with AH=55h returns through
+            // its parent's saved frame when it terminates.
+            if vector == 0x21 && regs.mode() == crate::UserMode::VM86 {
+                let psp_addr = Psp::base(dos.current_psp);
+                if machine.read::<[u8; 2]>(psp_addr) == [0xCD, 0x20] {
+                    let saved = (u32::from(vm86_ss(regs)) << 16) | u32::from(vm86_sp(regs));
+                    machine.write::<u32>(psp_addr + core::mem::offset_of!(Psp, _ss_sp), saved);
+                }
+            }
             // Restore caller FLAGS into regs so handlers may mutate them
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
@@ -420,17 +434,6 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             // saved cpu_state retains the kernel stub address and the
             // thread re-traps on its next slice.
             if matches!(action, thread::KernelAction::Exit(_)) {
-                return action;
-            }
-            // AH=4Ch can return from a child whose PSP was created by the
-            // program with AH=55h. In that case int_21h has already set
-            // CS:IP to the child PSP's INT 22h parent continuation. The
-            // interrupt frame still belongs to the child stack; popping it
-            // here would replace that continuation with the child's stale
-            // caller address.
-            if vector == 0x21 && ah_in == 0x4C && dos.current_psp != psp_before
-                && regs.mode() == crate::UserMode::VM86
-            {
                 return action;
             }
             // Flag-writeback only when we're still in VM86. AH=4C with a
@@ -1482,6 +1485,59 @@ enum DosExit {
     Errno(i32),
 }
 
+/// Return from a PSP created by the guest with AH=55h. DOS uses the parent
+/// PSP's saved INT 21h frame as its return context, replacing that frame's
+/// destination with the child's INT 22h address. Keeping the return in the
+/// ordinary IRET path also restores the parent's stack and flags together.
+fn return_to_psp_parent<A: crate::Arch>(
+    machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, status: u16,
+    resident_paras: Option<u16>,
+) -> bool {
+    if regs.mode() != crate::UserMode::VM86 { return false; }
+    let child_seg = dos.current_psp;
+    let child = machine.read::<Psp>(Psp::base(child_seg));
+    if child.int_20 != [0xCD, 0x20] || child.parent_psp == child_seg
+        || child._terminate_addr == 0
+    {
+        return false;
+    }
+    let parent = machine.read::<Psp>(Psp::base(child.parent_psp));
+    let saved = parent._ss_sp;
+    if parent.int_20 != [0xCD, 0x20] || saved == 0 { return false; }
+
+    // The three DOS process vectors belong to the exiting PSP. A loader may
+    // have supplied its own INT 22h continuation after AH=55h.
+    for (vector, target) in [(0x22usize, child._terminate_addr),
+                             (0x23, child._ctrl_break_addr),
+                             (0x24, child._critical_err)] {
+        machine.write::<u32>(vector * 4, target);
+    }
+    let ss = (saved >> 16) as u16;
+    let sp = saved as u16;
+    write_u16(machine, u32::from(ss), u32::from(sp), child._terminate_addr as u16);
+    write_u16(machine, u32::from(ss), u32::from(sp).wrapping_add(2),
+        (child._terminate_addr >> 16) as u16);
+    write_u16(machine, u32::from(ss), u32::from(sp).wrapping_add(4), 0x0200);
+    regs.set_ss32(u32::from(ss));
+    regs.set_sp32(u32::from(sp));
+    machine::set_vm86_flags(regs, 0x0200);
+    dos.current_psp = child.parent_psp;
+    dos.last_child_exit_status = status;
+
+    // AH=55h does not transfer ownership of its caller-allocated PSP block.
+    // Only blocks the child subsequently allocated belong to the child.
+    if let Some(keep) = resident_paras {
+        if dos.dos_blocks.iter().any(|block| block.seg == child_seg) {
+            let _ = super::dos_resize_block(machine, dos, regs, child_seg, keep.max(6));
+        }
+    } else {
+        dos.dos_blocks.retain(|block| block.owner != child_seg);
+        super::sync_heap_seg(dos);
+        super::sync_mcb_chain(machine, dos, regs);
+    }
+    true
+}
+
 fn int_21h<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
@@ -1925,32 +1981,22 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x4F: Find next matching file
         0x4F => find_matching_file(machine, dos),
-        // AH=0x4C: Terminate with return code (AL)
-        0x4C => {
-            // If we're in an EXEC'd child, return to parent
-            if let Some(parent) = dos.exec_parent.take() {
+        // AH=00h terminates with status zero; AH=4Ch takes its status in AL.
+        0x00 | 0x4C => {
+            let status = if ah == 0 { 0 } else { regs.rax as u8 };
+            // An AH=55h child may be nested inside an EXEC'd program. Only
+            // termination of that EXEC program consumes its saved parent.
+            if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
+                && let Some(parent) = dos.exec_parent.take()
+            {
                 // Termination type 00h (normal) | return code in AL.
-                dos.last_child_exit_status = (regs.rax as u8) as u16;
+                dos.last_child_exit_status = u16::from(status);
                 return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
-            // A program can also load an EXE itself, create its PSP with
-            // AH=55h, and make it current with AH=50h. Its INT 22h address in
-            // the PSP is the continuation in the parent loader. Second
-            // Reality uses this path for its setup and visual modules.
-            let psp = machine.read::<Psp>(Psp::base(dos.current_psp));
-            let parent = psp.parent_psp;
-            let terminate = psp._terminate_addr;
-            if terminate != 0 && parent != dos.current_psp
-                && dos.dos_blocks.iter().any(|block| block.seg == parent)
-            {
-                dos.last_child_exit_status = regs.rax as u8 as u16;
-                dos.current_psp = parent;
-                regs.set_cs32(terminate >> 16);
-                regs.set_ip32(terminate & 0xFFFF);
+            if return_to_psp_parent(machine, dos, regs, u16::from(status), None) {
                 return thread::KernelAction::Done;
             }
-            let code = regs.rax as u8;
-            return thread::KernelAction::Exit(code as i32);
+            return thread::KernelAction::Exit(i32::from(status));
         }
         // AH=0x31: Terminate and Stay Resident (TSR)
         // AL = return code, DX = paragraphs to keep (from child's PSP)
@@ -1960,7 +2006,9 @@ fn int_21h<A: crate::Arch>(
         // remain valid because the IVT is part of the address space and the
         // child's code at heap_seg+offset is still mapped.
         0x31 => {
-            if let Some(parent) = dos.exec_parent.take() {
+            if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
+                && let Some(parent) = dos.exec_parent.take()
+            {
                 let keep = regs.rdx as u16;
                 // DX is paragraphs from the *child's* PSP, not from parent's
                 // heap seg. They differ by the env block + MCB overhead
@@ -1981,7 +2029,12 @@ fn int_21h<A: crate::Arch>(
                 dos_keep_resident_block(machine, dos, regs, child_psp_seg, keep, child_psp_seg);
                 return action;
             }
-            // No exec_parent: cross-thread TSR. Encode termination type 03h
+            let status = 0x0300 | u16::from(regs.rax as u8);
+            let keep = regs.rdx as u16;
+            if return_to_psp_parent(machine, dos, regs, status, Some(keep)) {
+                return thread::KernelAction::Done;
+            }
+            // Cross-thread TSR. Encode termination type 03h
             // | AL into exit_code so the parent's last_child_exit_status
             // (set by exit_thread) carries the TSR marker per AH=4Dh spec.
             let code = regs.rax as u8;
@@ -2889,23 +2942,48 @@ fn int_21h<A: crate::Arch>(
             regs.rbx = (regs.rbx & !0xFFFF) | bx as u64;
             DosExit::Ok
         }
-        // AH=55h: Create a child PSP in a block the caller allocated itself.
-        // DX is the new PSP segment and SI is the segment just past its memory.
-        // Loaders such as Second Reality place a child EXE high in conventional
-        // memory, then create its PSP and switch to it with AH=50h.
+        // AH=55h: create a child PSP in caller-allocated memory. DOS copies
+        // the current PSP, takes INT 22h/23h/24h from the IVT, initializes an
+        // inline inherited handle table, and makes DX the current PSP.
         0x55 => {
             let child = regs.rdx as u16;
             let top = regs.rsi as u16;
-            if child < dos.heap_base_seg || top <= child || top > 0xA000 {
+            let parent_seg = dos.current_psp;
+            let parent = machine.read::<Psp>(Psp::base(parent_seg));
+            let allocated = dos.dos_blocks.iter().any(|block| {
+                block.owner == parent_seg && block.seg <= child
+                    && u32::from(child) + 0x10 <= u32::from(block.seg) + u32::from(block.paras)
+                    && u32::from(top) <= u32::from(block.seg) + u32::from(block.paras)
+            });
+            if parent.int_20 != [0xCD, 0x20] || !allocated
+                || top < child.saturating_add(0x10) || top > 0xA000
+            {
                 DosExit::Error(9)
             } else {
-                let mut psp = machine.read::<Psp>(Psp::base(dos.current_psp));
+                let mut psp = parent;
                 psp.top_of_mem = top;
-                psp.parent_psp = dos.current_psp;
-                if psp.jft_far_off == 0x18 && psp.jft_far_seg == dos.current_psp {
-                    psp.jft_far_seg = child;
+                psp.parent_psp = parent_seg;
+                psp._terminate_addr = machine.read::<u32>(0x22 * 4);
+                psp._ctrl_break_addr = machine.read::<u32>(0x23 * 4);
+                psp._critical_err = machine.read::<u32>(0x24 * 4);
+                psp.max_files = 20;
+                psp.jft_far_off = 0x18;
+                psp.jft_far_seg = child;
+                psp.jft.fill(0xFF);
+                let parent_jft = Psp::jft_addr(machine, parent_seg);
+                let inherited = usize::from(parent.max_files.min(20));
+                if inherited != 0 && parent_jft <= 0x100000 - inherited {
+                    machine.copy_from(parent_jft, &mut psp.jft[..inherited]);
+                }
+                // PSP:38h is the previous-PSP pointer; each child starts
+                // with two empty default FCBs rather than its parent's FCBs.
+                psp._reserved_38[..4].copy_from_slice(&(u32::from(parent_seg) << 16).to_le_bytes());
+                for offset in [0x5C - 0x38, 0x6C - 0x38] {
+                    psp._reserved_38[offset] = 0;
+                    psp._reserved_38[offset + 1..offset + 12].fill(b' ');
                 }
                 Psp::store(machine, child, psp);
+                dos.current_psp = child;
                 DosExit::Ok
             }
         }
@@ -3646,6 +3724,7 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     // Reload LDTR after swapping in the child LDT.
     dos.on_resume(machine);
     dos.exec_parent = Some(ExecParent {
+        child_psp: loaded.psp_seg,
         ss: vm86_ss(regs),
         sp: vm86_sp(regs),
         ds: regs.ds as u16,

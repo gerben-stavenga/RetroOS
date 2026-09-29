@@ -77,6 +77,8 @@ def main():
         for name, dest in [('vm', vm), ('machine', machine)]:
             with tarfile.open(OUTPUT / f'retroos-{name}.tar.gz') as archive:
                 archive.extractall(dest, filter='data')
+        module_installer = machine / 'tools/grub_module_install.py'
+        assert module_installer.is_file(), 'machine bundle is missing the existing-GRUB module installer'
         assert os.access(vm / 'run.sh', os.X_OK)
         assert (vm / 'data.img').stat().st_mode & 0o200
         with (vm / 'data.img').open('rb') as disk:

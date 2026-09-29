@@ -114,21 +114,28 @@ impl Hardware for Ahci {
     }
 }
 
-/// Probe the first AHCI controller and every directly attached SATA disk.
+/// Probe every AHCI controller and every directly attached SATA disk.
 /// ATAPI and port multipliers are not exposed as block disks.
 pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
     let mut disks = Vec::new();
-    let Some((bus, dev, func)) = pci::find_class(machine, 1, 6) else { return disks };
-    if (pci::read32(machine, bus, dev, func, 8) >> 8) as u8 != 1 { return disks; }
+    for (controller, (bus, dev, func)) in pci::find_classes(machine, 1, 6).into_iter().enumerate() {
+        probe_controller(machine, bus, dev, func, controller, &mut disks);
+    }
+    disks
+}
+
+fn probe_controller<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8,
+                                    number: usize, disks: &mut Vec<AhciDisk>) {
+    if (pci::read32(machine, bus, dev, func, 8) >> 8) as u8 != 1 { return; }
     let bar = pci::read32(machine, bus, dev, func, 0x24);
-    if bar & 1 != 0 || bar & 0xfffffff0 == 0 { return disks; }
+    if bar & 1 != 0 || bar & 0xfffffff0 == 0 { return; }
     let command = pci::read32(machine, bus, dev, func, 4);
     pci::write32(machine, bus, dev, func, 4, (command & 0xffff) | 6);
-    let Some(regs) = Mmio::map(machine, (bar & 0xfffffff0) as u64, 0x1100) else { return disks };
+    let Some(regs) = Mmio::map(machine, (bar & 0xfffffff0) as u64, 0x1100) else { return };
     // BIOS/OS handoff before changing any port's DMA addresses.
     if regs.read(0x24) & 1 != 0 {
         regs.write(0x28, regs.read(0x28) | 2);
-        if poll(|| (regs.read(0x28) & 0x11 == 0).then_some(())).is_none() { return disks; }
+        if poll(|| (regs.read(0x28) & 0x11 == 0).then_some(())).is_none() { return; }
     }
     regs.write(4, (regs.read(4) | (1 << 31)) & !2); // AHCI enable, polled interrupts
     let ports = regs.read(0x0c);
@@ -170,11 +177,10 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<AhciDisk> {
         if words[106] & 0xc000 == 0x4000 && words[106] & (1 << 12) != 0 { continue; }
         let sectors = (0..4).fold(0u64, |n, i| n | ((words[100 + i] as u64) << (i * 16)));
         if sectors == 0 || sectors > 1 << 48 { continue; }
-        let name = alloc::format!("ahci0p{index}");
+        let name = alloc::format!("ahci{number}p{index}");
         let buffer = unsafe { controller.dma.buffer(BOUNCE, BOUNCE_PAGES * crate::PAGE_SIZE) };
         disks.push(Storage::new(controller, buffer, sectors, &name));
     }
-    disks
 }
 
 #[cfg(test)]

@@ -567,6 +567,16 @@ struct MountPlan {
 /// Prefer physical data markers, then a plain data partition, then RAM.
 /// Equal candidates retain partition discovery order; an explicit UUID wins.
 fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_index: Option<usize>) -> MountPlan {
+    let selected_c = boot.c_uuid.map(|uuid| {
+        let mut matches = volumes.iter().enumerate()
+            .filter(|(i, volume)| Some(*i) != module_index && !volume.is_esp && volume.c_uuid() == Some(uuid));
+        let selected = matches.next().map(|(i, _)| i)
+            .unwrap_or_else(|| lib::compact_panic!("Configured C: UUID not found"));
+        if matches.next().is_some() {
+            lib::compact_panic!("Configured C: UUID is ambiguous");
+        }
+        selected
+    });
     if let Some(uuid) = boot.root_uuid {
         let mut matches = volumes.iter().enumerate().filter(|(_, v)| v.uuid() == Some(uuid));
         let root = matches.next().map(|(i, _)| i)
@@ -574,9 +584,10 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_in
         if matches.next().is_some() {
             lib::compact_panic!("Configured root UUID is ambiguous");
         }
+        let dos = selected_c.unwrap_or(root);
         return MountPlan {
-            unix_root: root, dos_drive: Some(root), dos_subdir: volumes[root].c_root(boot).to_vec(), boot_support: None,
-            spares: (0..volumes.len()).filter(|i| *i != root).collect(),
+            unix_root: root, dos_drive: Some(dos), dos_subdir: volumes[dos].c_root(boot).to_vec(), boot_support: None,
+            spares: (0..volumes.len()).filter(|i| *i != root && *i != dos).collect(),
         };
     }
     let evidence: alloc::vec::Vec<_> =
@@ -589,11 +600,14 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_in
     let unix = evidence.iter().enumerate()
         .find(|(i, e)| Some(*i) != module_index && !volumes[*i].is_esp && e.unix)
         .map(|(i, _)| i)
+        // A GRUB base module is a safer root than an unrelated ext4 /boot
+        // partition when Linux itself uses an unsupported filesystem.
+        .or(module_index)
         .or_else(|| volumes.iter().enumerate().find(|(i, v)|
             Some(*i) != module_index && !v.is_esp && v.format == crate::kernel::fs::disk::Format::Ext4)
             .map(|(i, _)| i))
         .or_else(|| find(|e| e.unix));
-    let dos = evidence.iter().enumerate()
+    let automatic_dos = evidence.iter().enumerate()
         .filter(|(i, e)| Some(*i) != module_index && e.dos > 0)
         .max_by_key(|(i, e)| (e.dos,
             volumes[*i].format == crate::kernel::fs::disk::Format::Fat,
@@ -602,7 +616,9 @@ fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_in
             core::cmp::Reverse(*i)))
         .map(|(i, _)| i)
         .or(module_index);
-    let dos_subdir = dos.map(|i| evidence[i].dos_home.clone()).unwrap_or_default();
+    let dos = selected_c.or(automatic_dos);
+    let dos_subdir = dos.map(|i| if selected_c.is_some() { volumes[i].c_root(boot).to_vec() }
+        else { evidence[i].dos_home.clone() }).unwrap_or_default();
 
     // A root is required. Preferring the Unix tree keeps `/` meaningful for
     // the Linux personality; a DOS-only machine roots on C: instead. If
@@ -701,6 +717,9 @@ fn mount_filesystems(
     });
     if boot.root_uuid.is_some() && volumes.is_empty() {
         lib::compact_panic!("Configured root UUID not found");
+    }
+    if boot.c_uuid.is_some() && volumes.is_empty() {
+        lib::compact_panic!("Configured C: UUID not found");
     }
     if boot.runtime().is_some() && boot.root_uuid.is_none() {
         lib::compact_panic!("retroos.runtime requires retroos.root");

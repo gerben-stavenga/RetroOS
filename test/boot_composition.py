@@ -18,7 +18,7 @@ def file(tree, name, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(data)
 
-def image(work, name, tree, kind, esp=False, size_mb=32):
+def image(work, name, tree, kind, esp=False, size_mb=32, serial=None):
     path = work / (name + '.img')
     with path.open('wb') as f:
         f.truncate(size_mb * 1024 * 1024)
@@ -27,7 +27,8 @@ def image(work, name, tree, kind, esp=False, size_mb=32):
             entry.chmod(0o775 if entry.is_dir() else 0o664)
         run('mkfs.ext4', '-q', '-F', '-b', '4096', '-d', tree, path)
     else:
-        run('mkfs.fat', '-F', '16', path, stdout=subprocess.DEVNULL)
+        run('mkfs.fat', '-F', '16', *(['-i', serial] if serial else []), path,
+            stdout=subprocess.DEVNULL)
         for entry in tree.iterdir():
             run('mcopy', '-s', '-i', path, entry, '::/')
     if esp:
@@ -130,6 +131,21 @@ def main():
                                          data_image, capture_output=True)
                         assert result.stdout == b'S', (label, result.stdout)
                     assert hashlib.sha256(boot_image.read_bytes()).digest() == boot_hash
+            if source == 'module':
+                # Both FAT disks have C: markers. The explicit UUID must pick
+                # the second disk even though automatic selection picks first.
+                first_tree = work / 'multi-fat-first-tree'
+                file(first_tree, 'DATA.TXT', b'X')
+                file(first_tree, 'CONFIG/OVERRIDE.TXT', b'X')
+                second_tree = work / 'multi-fat-second-tree'
+                file(second_tree, 'DATA.TXT', b'D')
+                file(second_tree, 'CONFIG/OVERRIDE.TXT', b'D')
+                file(second_tree, 'TEMP/OLD.TXT', b'D')
+                first = image(work, 'multi-fat-first', first_tree, 'fat', serial='11111111')
+                second = image(work, 'multi-fat-second', second_tree, 'fat', serial='ABCD1234')
+                text = boot(work, 'multi-fat-c-uuid', boot_image, [first, second],
+                            protected=True, extra_args='retroos.c-uuid=ABCD-1234')
+                assert 'C: backing volume 1 (ata1)' in text, text
             # Without a data disk, the same runtime/config/temp layout still works.
             file(home, 'DATA.TXT', b'D')
             file(home, 'CONFIG/OVERRIDE.TXT', b'D')
@@ -139,6 +155,14 @@ def main():
             boot(work, source + '-only', fallback if source == 'module' else None,
                  [] if source == 'module' else [fallback])
             assert hashlib.sha256(fallback.read_bytes()).digest() == before
+            if source == 'module':
+                # Linux may use Btrfs while a separate ext4 /boot is visible.
+                # That unrelated ext4 volume must not replace the RAM root.
+                empty_boot = work / 'btrfs-host-boot-tree'
+                empty_boot.mkdir()
+                boot_disk = image(work, 'btrfs-host-boot', empty_boot, 'ext4')
+                text = boot(work, 'btrfs-host-ram-c', fallback, [boot_disk])
+                assert 'from RAM' in text, text
 
         # Installed releases use the same composition, selected explicitly by UUID.
         installed = work / 'installed-tree'

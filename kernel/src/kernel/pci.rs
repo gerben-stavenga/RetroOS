@@ -5,6 +5,7 @@
 //! nothing and callers fall back — the same "absent bus reads all-ones"
 //! convention as ISA.
 
+use alloc::vec::Vec;
 
 const PCI_CFG_ADDR: u16 = 0xCF8;
 const PCI_CFG_DATA: u16 = 0xCFC;
@@ -80,7 +81,8 @@ pub fn msi_enable<A: crate::Arch>(
 /// port on a high bus (the dev laptop's xHCI is at 65:00.3 — bus 0x65,
 /// function 3), so a buses-0-3 / function-0-only scan misses it and the device
 /// probes as absent. Empty slots read all-ones (0xFFFF vendor id).
-pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+fn scan_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8,
+                             mut found: impl FnMut((u8, u8, u8)) -> bool) {
     for bus in 0..=255u8 {
         for dev in 0..32u8 {
             for func in 0..8u8 {
@@ -91,8 +93,9 @@ pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> O
                     continue;
                 }
                 let classes = read32(machine, bus, dev, func, 0x08);
-                if (classes >> 24) as u8 == class && (classes >> 16) as u8 == subclass {
-                    return Some((bus, dev, func));
+                if (classes >> 24) as u8 == class && (classes >> 16) as u8 == subclass
+                    && !found((bus, dev, func)) {
+                    return;
                 }
                 // Probe functions 1-7 only on a multi-function device (header
                 // type bit 7, at config offset 0x0C bit 23).
@@ -102,5 +105,17 @@ pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> O
             }
         }
     }
-    None
+}
+
+pub fn find_class<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Option<(u8, u8, u8)> {
+    let mut first = None;
+    scan_class(machine, class, subclass, |address| { first = Some(address); false });
+    first
+}
+
+/// Return every matching PCI function in bus/device/function order.
+pub fn find_classes<A: crate::Arch>(machine: &mut A, class: u8, subclass: u8) -> Vec<(u8, u8, u8)> {
+    let mut matches = Vec::new();
+    scan_class(machine, class, subclass, |address| { matches.push(address); true });
+    matches
 }

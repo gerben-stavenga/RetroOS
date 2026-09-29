@@ -838,6 +838,7 @@ pkg_tar(
         ":machine_boot_tar": "machine_boot.tar",
         "tools/release/install.sh": "install.sh",
         "tools/machine_install.py": "tools/machine_install.py",
+        "tools/grub_module_install.py": "tools/grub_module_install.py",
         "tools/migrate_dn_state.py": "tools/migrate_dn_state.py",
         "//tools/command:LOADFIX.CFG": "tools/command/LOADFIX.CFG",
         "etc/CONFIG.SYS": "etc/CONFIG.SYS",

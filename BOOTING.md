@@ -1,9 +1,149 @@
-# Booting RetroOS on an installed Linux machine
+# Booting RetroOS with GRUB
+
+There are two boot arrangements on a physical machine: boot the standalone
+USB/CD image, or add RetroOS to an existing GRUB installation. For existing
+GRUB, the installer below finds disks and UUIDs with Linux, stages the matching
+kernel and RAM base module, and generates the GRUB entries. Manual deployment
+uses the same boot path. The older ext4 installer later in this document
+remains available for machines that keep the runtime on their Linux root.
+
+## Install into an existing GRUB menu
+
+Use Linux with GRUB 2 installed. The ISO supplies both the kernel and RAM base
+module. Build and prepare as your normal user, review the generated entry, then
+install it as root:
+
+```sh
+tools/install_kernel.sh --module --prepare
+# Review build/grub-module-install/<ISO hash>/grub.cfg
+sudo tools/install_kernel.sh --module
+```
+
+Linux enumerates FAT and ext4 partitions on non-USB disks. If several could be
+C:, preparation prints their paths and UUIDs; rerun with
+`--c-uuid=ABCD-1234` (FAT) or an ext4 UUID. A selected ext4 volume must be
+mounted during preparation and installation. Installation creates its
+`home/retroos` directory and `retroos` group when needed. With no supported
+data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly.
+When Linux `/` is Btrfs, RAM C: is the default; use `--c-uuid` to select a
+separate supported data volume. The RAM module always supplies
+`C:\RETROOS`, even when C: data lives on a physical disk.
+
+For example, with Linux `/boot` on Btrfs and a separate FAT32 data partition,
+find that partition's UUID and prepare the entry with it:
+
+```sh
+lsblk -o NAME,FSTYPE,UUID,PARTTYPE,MOUNTPOINTS
+tools/install_kernel.sh --module --prepare --c-uuid=ABCD-1234
+# Review build/grub-module-install/<ISO hash>/grub.cfg
+sudo tools/install_kernel.sh --module
+```
+
+Replace `ABCD-1234` with the FAT32 data partition's UUID, not the EFI System
+Partition's UUID. The installer stores `kernel.elf` and
+`retroos-base.img.gz` under Linux `/boot/retroos/releases/...`; GRUB reads
+them from Btrfs before starting RetroOS. RetroOS then reads the selected
+FAT32 partition as C:. It cannot read Btrfs itself, so `C:\RETROOS` comes
+from the RAM base module and the Btrfs boot filesystem is not C:.
+
+The installer detects whether `/boot` is separate, including a Btrfs boot
+filesystem, copies versioned files there, and installs two GRUB entries:
+protected disk and persistent disk. It does not partition or format a disk. A prebuilt ISO can be supplied
+with `--iso=/path/to/retroos_grub_module.iso`; preparation then needs no Bazel
+build. The Linux `/` filesystem is used only for discovery. RetroOS cannot
+mount Btrfs yet; with no supported physical root it uses the RAM module for
+its own `/` and C:.
+
+## Manual GRUB deployment
+
+Use this when GRUB is already installed and you want to choose the kernel and
+base files yourself. The kernel and base image must come from the same build.
+The base image holds `C:\RETROOS`, startup defaults, and a RAM fallback C:.
+It is a GRUB Multiboot module, not a partition to extract onto the disk.
+
+Build `//:grub_module_iso` and copy these files from its `/boot` directory
+to a directory on a filesystem GRUB can read:
+
+```text
+kernel.elf
+retroos-base.img.gz
+retroos-games.img.gz       # optional
+```
+
+The ISO is also distributed as `retroos_grub_module.iso`. On Linux, copy from
+the ISO like this:
+
+```sh
+sudo mkdir -p /mnt/retroos-iso /boot/retroos/manual
+sudo mount -o loop,ro retroos_grub_module.iso /mnt/retroos-iso
+sudo cp /mnt/retroos-iso/boot/kernel.elf /mnt/retroos-iso/boot/retroos-base.img.gz /boot/retroos/manual/
+sudo umount /mnt/retroos-iso
+findmnt -no UUID --target /boot/retroos/manual
+```
+
+Keep the kernel and module images together when upgrading. If `/boot`
+is a separate filesystem, GRUB paths start at that filesystem's root; the
+example's `/boot/retroos/manual/` becomes `/retroos/manual/`.
+
+Choose the physical C: volume before editing GRUB. `lsblk -o NAME,FSTYPE,UUID,MOUNTPOINTS`
+shows its filesystem UUID. For FAT, C: is the volume root; existing games and
+other files stay there. For ext4, create `/home/retroos` on that volume and
+put data there. The base module supplies `C:\RETROOS` and default CONFIG files,
+so the data volume does not need a copy of the kernel or runtime. Use the
+chosen volume's UUID for `C_UUID` below. This selects C: even when it is on a
+second AHCI controller or several other disks have `CONFIG` or `GAMES`.
+To keep settings between boots, put `CONFIG/CONFIG.SYS` and the `CONFIG/DN`
+templates on that volume (`etc/CONFIG.SYS` and the `DN.EDT`, `DN.EXT`,
+`DN.HGL`, `DN.MNU`, `DN.VWR`, `DN.XRN` files in `apps-boot/dn/`; the machine
+release also carries the templates). Missing CONFIG
+files use session copies of the base image's defaults, so edits to those
+copies disappear on reboot. Keep `TEMP` empty: RetroOS maps it to RAM.
+
+`BOOT_FS_UUID`, `C_UUID`, and the optional `EXT4_UUID` below are placeholders,
+not shell or GRUB variables. Replace them with the UUID values printed by
+`findmnt` and `lsblk`; do not leave their names in the installed entry.
+Add this entry to GRUB's custom configuration, adjusting the paths if needed.
+On Debian or Ubuntu, use `/etc/grub.d/40_custom` and run
+`sudo update-grub`; on other distributions, regenerate `grub.cfg` with the
+distribution's GRUB command. `grub-script-check` can check the entry first.
+
+```grub
+menuentry "RetroOS (manual, protected disk)" {
+    insmod multiboot2
+    insmod gzio
+    search --no-floppy --fs-uuid --set=root BOOT_FS_UUID
+    multiboot2 /boot/retroos/manual/kernel.elf ram-overlay retroos.c-uuid=C_UUID
+    if [ "$grub_platform" = "pc" ]; then
+        set gfxpayload=text
+    else
+        insmod all_video
+        set gfxmode=auto
+        set gfxpayload=auto
+    fi
+    module2 /boot/retroos/manual/retroos-base.img.gz retroos.mount=/
+    # Optional, for games when C: is backed by RAM:
+    # module2 /boot/retroos/manual/retroos-games.img.gz retroos.mount=/home/retroos/GAMES
+    boot
+}
+```
+
+The example starts with physical writes protected. Once C: is confirmed in the
+boot log, remove `ram-overlay` to persist changes there. For a boot log that
+stays on screen, add `boot-log-only` to the `multiboot2` line. A missing or
+duplicate `C_UUID` stops boot rather than selecting another disk. Remove the
+`retroos.c-uuid` argument to use automatic selection; with no physical data
+volume, the base module supplies a RAM-backed C:. A separate GRUB boot
+filesystem does not select C:. The kernel currently recognizes IDE, AHCI and
+NVMe disks, including disks on multiple controllers, but does not read USB
+mass storage after GRUB hands off.
+If Linux `/` should come from a particular ext4 volume, add
+`retroos.root=EXT4_UUID` to the same `multiboot2` line; it selects `/`
+independently of `retroos.c-uuid`.
+
+## Installer for a Linux ext4 root
 
 The installer uses the existing GRUB and ext4 root. It does not repartition the
 machine or use emulator image files. `/home/retroos` is the persistent DOS C:.
-
-## Install
 
 Run the build/preparation as your normal user, then install the prepared release:
 

@@ -16,6 +16,47 @@ RetroOS. This works for USB boot even though RetroOS itself has no USB
 mass-storage driver. The USB stick is not a persistence destination. Firmware
 chooses BIOS or UEFI before GRUB starts; GRUB cannot change that firmware mode.
 
+To add RetroOS to an existing GRUB menu by hand, copy `/boot/kernel.elf` and
+`/boot/retroos-base.img.gz` from the ISO onto a GRUB-readable filesystem. They
+must come from the same ISO. Add a GRUB `multiboot2` entry for the kernel and
+`module2 ... retroos.mount=/` for the base image. Set `retroos.c-uuid=` to the
+filesystem UUID of the intended FAT or ext4 data volume when several disks are
+present. The full example, including the firmware video policy and disk
+protection, is in
+[BOOTING.md](https://github.com/gerben-stavenga/RetroOS/blob/master/BOOTING.md#manual-grub-deployment).
+
+The machine bundle also has an installer for this ISO. Download both files
+from the same release into one directory, then run:
+
+```sh
+mkdir retroos-install
+tar -xzf retroos-machine.tar.gz -C retroos-install
+cd retroos-install
+./install.sh --module --prepare --iso="$PWD/../retroos_grub_module.iso"
+cat build/grub-module-install/*/grub.cfg
+sudo ./install.sh --module
+```
+
+Preparation discovers GRUB's boot filesystem and supported data volumes. If
+several volumes qualify for C:, rerun the preparation command with
+`--c-uuid=<UUID>`. Use `--c-ram` to select the RAM module for C: explicitly.
+On a Btrfs Linux root, RAM C: is the default because RetroOS does not support
+Btrfs. The module supplies `C:\RETROOS` from RAM in every case.
+
+If `/boot` is on Btrfs and a separate FAT32 data partition should be C:,
+replace the preparation line above with:
+
+```sh
+lsblk -o NAME,FSTYPE,UUID,PARTTYPE,MOUNTPOINTS
+./install.sh --module --prepare --iso="$PWD/../retroos_grub_module.iso" --c-uuid=ABCD-1234
+```
+
+Use the FAT32 data partition's UUID in place of `ABCD-1234`; do not choose the
+EFI System Partition. GRUB reads the kernel and base module from
+`/boot/retroos/releases/...` on Btrfs. After GRUB hands off, RetroOS uses the
+FAT32 partition for C: data and the RAM module for `C:\RETROOS`; RetroOS does
+not need to read Btrfs.
+
 The default entry protects physical disks: reads use their existing contents,
 while writes are diverted to RAM and disappear on reboot. Choose **persistent
 disk** to write to the selected data disk. On BIOS, each choice is available
@@ -65,7 +106,7 @@ apps-proprietary collection is not bundled.
 
 ## Physical machine: retroos-machine.tar.gz
 
-This bundle uses an existing Linux GRUB installation and ext4 root. The boot
+This bundle automates the existing-GRUB setup for a Linux ext4 root. The boot
 runtime and `/home/retroos` must be on that root filesystem; a separate `/boot`
 partition is not supported by this installer yet. It does not repartition disks.
 

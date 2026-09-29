@@ -152,6 +152,7 @@ run unit         -         unit
 run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run boot_composition storage_selection python3 test/boot_composition.py
+run grub_module_install - python3 test/grub_module_install.py
 run disk_selection storage_selection python3 test/disk_selection.py
 run extra_drives storage_selection python3 test/extra_drives.py
 run isapnp_smoke isapnp_tools python3 test/isapnp_smoke.py

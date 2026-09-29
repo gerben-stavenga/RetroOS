@@ -19,6 +19,7 @@ pub mod sched;
 pub mod serial_control;
 pub mod serial_log;
 pub mod startup;
+pub mod boot_filesystems;
 pub mod thread;
 
 // ── Machine policy: what this box is, who owns the console, what it may do ─

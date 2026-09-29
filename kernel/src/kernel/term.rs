@@ -147,7 +147,7 @@ fn render(
         blink: false, text_cursor: None,
         cga_palette: [0; 4],
         start_offset: 0,
-        pixel_pan: 0,
+        pixel_pan: 0, split_pixel_pan: 0,
         line_compare: usize::MAX,
         blank_start: usize::MAX,
     };

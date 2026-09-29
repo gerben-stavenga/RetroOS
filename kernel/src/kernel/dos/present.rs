@@ -41,7 +41,7 @@ fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash:
         core::ptr::write_volatile(&raw mut LAST_DIAG_MODE, Some(mode));
         core::ptr::write_volatile(&raw mut LAST_DIAG_BLACK, Some(black));
     }
-    if DIAG_LINES.fetch_add(1, Ordering::Relaxed) >= 64 {
+    if DIAG_LINES.fetch_add(1, Ordering::Relaxed) >= 512 {
         return;
     }
     let Some(state) = state.legacy() else {
@@ -51,11 +51,17 @@ fn diagnose_shadow(state: &VgaState, mode: ::vga::VgaMode, nonzero: usize, hash:
         );
         return;
     };
+    let (width, height) = ::vga::dimensions(mode);
+    let start = u16::from_be_bytes([state.crtc[0x0C], state.crtc[0x0D]]);
     crate::compact_dbg_println!(
-        "[vgascan] mode={:?} black={} nz={} hash={:08X} seq={:02X?} gc5={:02X} gc6={:02X} acidx={:02X} ac10={:02X} dacmask={:02X}",
-        mode_name(mode), black as u8, nonzero, hash, &state.seq[..],
-        state.gc[5], state.gc[6], state.ac_state.index,
-        state.ac[0x10], state.dac_mask,
+        "[vgascan] mode={:?} {}x{} black={} nz={} hash={:08X} seq={:02X?} gc5={:02X} gc6={:02X} acidx={:02X} ac10={:02X} pan={:02X} start={:04X} offset={:02X} cr17={:02X} compare={:03X} dacmask={:02X}",
+        mode_name(mode), width, height, black as u8, nonzero, hash, &state.seq[..],
+        state.gc[5], state.gc[6], state.ac_state.index, state.ac[0x10],
+        state.ac[0x13], start, state.crtc[0x13], state.crtc[0x17],
+        state.crtc[0x18] as u16
+            | (u16::from(state.crtc[7] & 0x10) << 4)
+            | (u16::from(state.crtc[9] & 0x40) << 3),
+        state.dac_mask,
     );
 }
 
@@ -109,6 +115,7 @@ fn scanout<'a, A: crate::Arch>(
             cga_palette: [0; 4],
             start_offset: 0,
             pixel_pan: 0,
+            split_pixel_pan: 0,
             line_compare: usize::MAX,
             blank_start: usize::MAX,
         });
@@ -129,6 +136,14 @@ fn scanout<'a, A: crate::Arch>(
     // doubleword mode under 13h, so each latch step is 4 linear pixels.
     let planar = matches!(mode, VgaMode::Planar16 { .. } | VgaMode::ModeX { .. });
     let mode13 = matches!(mode, VgaMode::Mode13h);
+    // The 256-colour shift mode uses half-dot clocks: two AC pan counts
+    // advance one logical colour pixel. Planar 16-colour scanout uses the
+    // full three-bit pixel count.
+    let pixel_pan = if matches!(mode, VgaMode::ModeX { .. } | VgaMode::Mode13h) {
+        ((state.ac[0x13] >> 1) & 0x03) as usize
+    } else if planar {
+        (state.ac[0x13] & 0x07) as usize
+    } else { 0 };
     let start_latch = ((state.crtc[0x0C] as usize) << 8) | state.crtc[0x0D] as usize;
     // CGA palettes come from the Mode-Control/Colour-Select registers. The
     // 640×200 2-colour mode's foreground is the Colour-Select low nibble
@@ -154,7 +169,8 @@ fn scanout<'a, A: crate::Arch>(
         text_cursor: ::vga::TextCursor::from_crtc(&state.crtc, (machine.now() / 250_000_000).is_multiple_of(2)),
         cga_palette,
         start_offset: if planar || matches!(mode, VgaMode::Text { .. }) { start_latch } else if mode13 { start_latch * 4 } else { 0 },
-        pixel_pan: if planar || mode13 { (state.ac[0x13] & 0x07) as usize } else { 0 },
+        pixel_pan,
+        split_pixel_pan: if state.ac[0x10] & 0x20 != 0 { 0 } else { pixel_pan },
         line_compare: if planar || mode13 { state.line_compare(h) } else { usize::MAX },
         blank_start: if planar || mode13 { state.vertical_blank_start(h) } else { usize::MAX },
     })

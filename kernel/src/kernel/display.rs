@@ -455,6 +455,8 @@ impl Display {
             _ => None,
         }
     }
+    // Callers keep the existing display when native VGA is unavailable.
+    #[allow(clippy::result_large_err)]
     pub fn into_native_capability<A: crate::Arch>(
         self,
         machine: &mut A,

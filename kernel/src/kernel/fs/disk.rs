@@ -37,6 +37,20 @@ impl FilesystemVolume {
         Some(sector[104..120].try_into().unwrap())
     }
 
+    /// Filesystem UUID used to select C: independently of the Unix root.
+    pub fn c_uuid(&self) -> Option<arch_abi::VolumeUuid> {
+        if self.format == Format::Ext4 {
+            return self.uuid().map(arch_abi::VolumeUuid::Ext4);
+        }
+        let mut boot = [0; 512];
+        if self.volume.read(0, &mut boot) != 1 { return None; }
+        let fat32 = u16::from_le_bytes([boot[22], boot[23]]) == 0;
+        let (signature, serial) = if fat32 { (66, 67) } else { (38, 39) };
+        if boot[signature] != 0x29 { return None; }
+        let id = u32::from_le_bytes(boot[serial..serial + 4].try_into().unwrap());
+        Some(arch_abi::VolumeUuid::Fat(id.to_be_bytes()))
+    }
+
     pub fn name(&self) -> &'static str {
         match self.format { Format::Ext4 => "ext4", Format::Fat => "FAT" }
     }

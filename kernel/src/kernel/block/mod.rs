@@ -118,7 +118,7 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Vec<&'static dyn Disk> {
     for disk in hdd::probe(machine) {
         disks.push(Box::leak(Box::new(disk)));
     }
-    if let Some(d) = NvmeDisk::probe(machine) {
+    for d in NvmeDisk::probe_all(machine) {
         disks.push(Box::leak(Box::new(d)));
     }
     for d in crate::kernel::drivers::ahci::probe(machine) {
