@@ -532,8 +532,8 @@ pub fn planar_read(cur: [u8; 4], gc: &[u8; 9]) -> (u8, [u8; 4]) {
 
 /// The 16 standard CGA/EGA text colours as 6-bit DAC triples (R,G,B each 0..63),
 /// in attribute-index order (0 = black … 15 = white). These occupy DAC entries
-/// 0..15 at every text-mode and 16-colour boot; programs that never touch the
-/// DAC (the common case for text-mode DOS) render correctly from this alone.
+/// 0..15 in the generic 256-colour fallback palette. Text modes use the
+/// full EGA DAC, whose default AC mapping selects scattered entries 0..63.
 #[rustfmt::skip]
 pub const EGA16: [(u8, u8, u8); 16] = [
     ( 0,  0,  0), ( 0,  0, 42), ( 0, 42,  0), ( 0, 42, 42),
@@ -1059,14 +1059,14 @@ impl PixelFormat {
 /// The DAC palette, already converted to the framebuffer's format.
 ///
 /// Every VGA mode ultimately picks a DAC entry — mode 13h and Mode-X directly,
-/// planar through the attribute controller, text through the attribute byte —
+/// planar and text through the attribute controller —
 /// so one table serves them all, and the per-pixel work becomes a single array
 /// index. CGA's fixed colours and direct-colour SVGA are the exceptions and use
 /// `fmt` instead.
 pub struct Pal {
     pub lut: [u32; 256],
-    /// Planar pixel value → Attribute Controller → DAC → packed framebuffer
-    /// pixel. Rebuilt once at the start of a planar frame.
+    /// Planar pixel or text attribute colour → Attribute Controller → DAC →
+    /// packed framebuffer pixel. Rebuilt once at the start of those frames.
     planar: [u32; 16],
     pub fmt: PixelFormat,
     mask: u8,
@@ -1399,8 +1399,8 @@ fn row_text(
             let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
             (ch as usize, attr)
         };
-        let fg = pal.lut[(attr & 0x0F) as usize];
-        let bg = pal.lut[((attr >> 4) & bg_mask) as usize];
+        let fg = pal.planar[(attr & 0x0F) as usize];
+        let bg = pal.planar[((attr >> 4) & bg_mask) as usize];
         if frame.text_cursor.is_some_and(|cursor| cursor.covers(cell / 2, gy)) {
             for _ in 0..cell_w.min(w.saturating_sub(col * cell_w)) { st.put(fg); }
             continue;
@@ -1662,6 +1662,11 @@ fn render_cga2(frame: &Frame, out: &mut [u32], w: usize, h: usize) {
 
 /// The DAC index a 4-bit planar value selects, through the attribute
 /// controller palette and colour-select register.
+pub const VGA_TEXT_AC_PALETTE: [u8; 16] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x14, 0x07,
+    0x38, 0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x3F,
+];
+
 fn planar_dac_index(ac: &[u8; 21], val: u8) -> u8 {
     let pal = ac[(val & 0x0F) as usize] & 0x3F;
     let csel = ac[0x14];
@@ -1811,11 +1816,11 @@ pub fn render_text_cell(frame: &Frame, col: usize, row: usize, out: &mut [u32], 
         let Some((&ch, &attr)) = frame.vram.get(cell).zip(frame.vram.get(cell + 1)) else { return };
         (ch as usize, attr)
     };
-    let fg = pal_rgb(frame.palette, (attr & 0x0F) & frame.dac_mask);
+    let fg = pal_rgb(frame.palette, planar_dac_index(frame.ac, attr & 0x0F) & frame.dac_mask);
     let bg_mask = if frame.blink { 0x07 } else { 0x0F };
     let bg = pal_rgb(
         frame.palette,
-        ((attr >> 4) & bg_mask) & frame.dac_mask,
+        planar_dac_index(frame.ac, (attr >> 4) & bg_mask) & frame.dac_mask,
     );
     let compact_font = if attr & 0x08 != 0 { frame.font } else { frame.font_b };
     let font_map = frame.font_maps
@@ -2597,6 +2602,7 @@ impl LegacyVgaState {
     /// rendered in software or restored directly to a real VGA.
     pub fn new_mode3_boxed() -> alloc::boxed::Box<Self> {
         let mut state = Self::new_boxed();
+        state.dac = ega_dac();
         let regs = bios_mode3_regs();
         state.misc_output = regs.misc;
         state.seq = regs.seq;
@@ -2604,9 +2610,7 @@ impl LegacyVgaState {
         state.crtc = regs.crtc;
         state.planes.resize(4 * 0x10000, 0);
 
-        for i in 0..16 {
-            state.ac[i] = i as u8;
-        }
+        state.ac[..16].copy_from_slice(&VGA_TEXT_AC_PALETTE);
         state.ac[0x10] = 0x0C; // text, line-graphics ninth dot, blink
         state.ac[0x12] = 0x0F; // all colour planes enabled
         state.ac_state = AcState::new();

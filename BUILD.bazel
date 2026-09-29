@@ -724,6 +724,42 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# BIOS-only variant for emulators that cannot execute GRUB's Pentium-era
+# handoff on a 386/486. The native MBR loader reads the same kernel from its
+# TAR partition; a small FAT partition supplies C:\RETROOS at boot.
+genrule(
+    name = "native_boot_disk",
+    srcs = [":boot_bundle_tar", ":boot_dir_tar", "tools/build_native_boot_disk.py"],
+    outs = ["native_boot_disk.bin"],
+    cmd = "python3 $(location tools/build_native_boot_disk.py) " +
+          "--bundle $(location :boot_bundle_tar) " +
+          "--runtime $(location :boot_dir_tar) --out $@",
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+# Rust-DOS's own DOS kernel currently mounts FAT12/16 images, not the shared
+# FAT32 data disk. Build a disposable FAT16 copy of the packaged DOS files.
+genrule(
+    name = "rust_dos_games_disk",
+    srcs = [":boot_dir_tar", ":c_drive_tar", "tools/build_rust_dos_games_disk.py"],
+    outs = ["rust_dos_games_disk.img"],
+    cmd = "python3 $(location tools/build_rust_dos_games_disk.py) " +
+          "--runtime $(location :boot_dir_tar) --data $(location :c_drive_tar) --out $@",
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "rust_dos_games_disk_proprietary",
+    srcs = [":boot_dir_tar", ":c_drive_tar_proprietary", "tools/build_rust_dos_games_disk.py"],
+    outs = ["rust_dos_games_disk_proprietary.img"],
+    cmd = "python3 $(location tools/build_rust_dos_games_disk.py) " +
+          "--runtime $(location :boot_dir_tar) --data $(location :c_drive_tar_proprietary) --out $@",
+    local = True,
+    visibility = ["//visibility:public"],
+)
+
 # $(C_TAR) is the C: content; everything else is identical between the
 # shareware and proprietary data disks.
 _DATA_DISK_CMD = """

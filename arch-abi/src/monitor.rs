@@ -279,6 +279,18 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     advance += 1;
 
     match opcode {
+        // MOV EAX, CR0 is used by some DOS extenders while probing their
+        // execution environment. In VM86 the real instruction #GPs, but the
+        // guest should see a protected, paged 386+ host rather than the
+        // kernel's actual control register. Control-register writes remain
+        // unsupported: they cannot switch the host CPU out of VM86.
+        0x0F if regs.mode() == UserMode::VM86
+            && peek!(advance) == 0x20 && peek!(advance + 1) == 0xC0 => {
+            advance_ip(regs, cs_32, advance + 2);
+            regs.rax = (regs.rax & !0xffff_ffff) | 0x8000_0011;
+            MonitorResult::Resume
+        }
+
         // ----- Flag / stack instructions (fast path) -----
 
         // CLI — clear the guest's virtual IF (VIF). The caller (#GP path or

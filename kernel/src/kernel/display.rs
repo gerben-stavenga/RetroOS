@@ -72,6 +72,7 @@ pub struct Display {
     /// Physical-format staging used only within native-surface presentation.
     /// Retained producers keep their unscaled packed content.
     present_pixels: alloc::vec::Vec<u8>,
+    last_packed_output: Option<(usize, usize)>,
     backend: Backend,
 }
 
@@ -241,6 +242,7 @@ impl Display {
         let (shadow_width, _) = fit_vga(framebuffer.width, framebuffer.height);
         Self { shadow_width, rgb, programmable_ramp: false,
             voodoo_ramp_generation: None, present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Linear(framebuffer) }
     }
 
@@ -273,6 +275,7 @@ impl Display {
             programmable_ramp: false,
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::Mode13 {
@@ -325,6 +328,7 @@ impl Display {
             programmable_ramp: mode.programmable_ramp,
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeLinear { framebuffer, pages },
@@ -352,6 +356,7 @@ impl Display {
             programmable_ramp: mode.programmable_ramp,
             voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank: 0 },
@@ -363,6 +368,7 @@ impl Display {
         Self { shadow_width: 720, rgb: PixelFormat::NATIVE,
             programmable_ramp: false, voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Host }
     }
 
@@ -370,6 +376,7 @@ impl Display {
         Self { shadow_width: 0, rgb: PixelFormat::NATIVE,
             programmable_ramp: false, voodoo_ramp_generation: None,
             present_pixels: alloc::vec::Vec::new(),
+            last_packed_output: None,
             backend: Backend::Headless }
     }
 
@@ -522,6 +529,8 @@ impl Display {
         let format = self.rgb;
         let canvas = self.composition_size(width, height);
         let output = if (width, height) == canvas { canvas } else { self.fit() };
+        let clear_bars = self.last_packed_output != Some(output);
+        self.last_packed_output = Some(output);
         let scratch = &mut self.present_pixels;
         match &mut self.backend {
             Backend::Linear(framebuffer)
@@ -529,10 +538,13 @@ impl Display {
                 scanout: VgaScanout::Mode13 { framebuffer, .. }
                     | VgaScanout::VbeLinear { framebuffer, .. },
                 ..
-            } => blit_packed(
-                framebuffer, format, output,
-                PackedSource { width, height, pixels, row: scratch },
-            ),
+            } => {
+                if clear_bars { clear_packed_bars(framebuffer, format, output); }
+                blit_packed(
+                    framebuffer, format, output,
+                    PackedSource { width, height, pixels, row: scratch },
+                )
+            }
             Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
@@ -876,6 +888,26 @@ fn blit(
 /// Fill a centered physical rectangle from a dense source-sized packed image.
 /// Only one packed destination row is staged; it is stretched once and reused
 /// for every vertical repetition of that source row.
+fn clear_packed_bars(fb: &Framebuffer, format: PixelFormat, output: (usize, usize)) {
+    let (out_w, out_h) = output;
+    if out_w > fb.width || out_h > fb.height { return; }
+    let step = usize::from(format.bytes_per_pixel);
+    let bx = (fb.width - out_w) / 2;
+    let by = (fb.height - out_h) / 2;
+    for y in 0..fb.height {
+        let row = fb.va + y * fb.pitch;
+        unsafe {
+            if y < by || y >= by + out_h {
+                core::ptr::write_bytes(row as *mut u8, 0, fb.width * step);
+            } else {
+                core::ptr::write_bytes(row as *mut u8, 0, bx * step);
+                core::ptr::write_bytes((row + (bx + out_w) * step) as *mut u8, 0,
+                    (fb.width - bx - out_w) * step);
+            }
+        }
+    }
+}
+
 #[optimize(speed)]
 fn blit_packed(
     fb: &Framebuffer,
@@ -1402,7 +1434,7 @@ fn raster_shadow(
     } else {
         s.pal.sync(frame.palette, frame.dac_mask, format, &mut s.pal_cache);
     }
-    if matches!(frame.mode, vga::VgaMode::Planar16 { .. }) {
+    if matches!(frame.mode, vga::VgaMode::Planar16 { .. } | vga::VgaMode::Text { .. }) {
         s.pal.sync_planar(frame.ac);
     }
     for sy in 0..h {

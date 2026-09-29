@@ -169,6 +169,9 @@ pub fn invlpg(addr: usize) {
 /// Read CR4 register
 #[inline]
 pub fn read_cr4() -> u32 {
+    // CR4 was introduced with the Pentium. Some late 486s have CPUID, so
+    // CPUID availability alone does not establish that CR4 exists.
+    if cpuid(0).0 < 1 || ((cpuid(1).0 >> 8) & 0xf) < 5 { return 0; }
     let value: u32;
     unsafe {
         asm!("mov {}, cr4", out(reg) value, options(nomem, nostack));
@@ -203,6 +206,30 @@ pub fn rdtsc() -> u64 {
 /// Execute CPUID instruction
 #[inline]
 pub fn cpuid(leaf: u32) -> (u32, u32, u32, u32) {
+    // A 386 and early 486 have no CPUID. The EFLAGS ID bit is writable only
+    // when CPUID exists; probing it avoids a #UD before the IDT is installed.
+    let id_changed: u32;
+    unsafe {
+        asm!(
+            "pushfd",
+            "pop ecx",
+            "mov eax, ecx",
+            "xor eax, 0x200000",
+            "push eax",
+            "popfd",
+            "pushfd",
+            "pop eax",
+            "push ecx",
+            "popfd",
+            "xor eax, ecx",
+            "and eax, 0x200000",
+            lateout("eax") id_changed,
+            lateout("ecx") _,
+        );
+    }
+    if id_changed == 0 {
+        return (0, 0, 0, 0);
+    }
     let eax: u32;
     let ebx: u32;
     let ecx: u32;

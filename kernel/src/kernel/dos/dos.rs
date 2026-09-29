@@ -404,6 +404,8 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
 
     match vector {
         0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
+            let ah_in = (regs.rax >> 8) as u8;
+            let psp_before = dos.current_psp;
             // Restore caller FLAGS into regs so handlers may mutate them
             // (CF/ZF returns); then write back so normal IRET-style pop
             // restores the handler's result to the caller.
@@ -418,6 +420,17 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             // saved cpu_state retains the kernel stub address and the
             // thread re-traps on its next slice.
             if matches!(action, thread::KernelAction::Exit(_)) {
+                return action;
+            }
+            // AH=4Ch can return from a child whose PSP was created by the
+            // program with AH=55h. In that case int_21h has already set
+            // CS:IP to the child PSP's INT 22h parent continuation. The
+            // interrupt frame still belongs to the child stack; popping it
+            // here would replace that continuation with the child's stale
+            // caller address.
+            if vector == 0x21 && ah_in == 0x4C && dos.current_psp != psp_before
+                && regs.mode() == crate::UserMode::VM86
+            {
                 return action;
             }
             // Flag-writeback only when we're still in VM86. AH=4C with a
@@ -1920,6 +1933,22 @@ fn int_21h<A: crate::Arch>(
                 dos.last_child_exit_status = (regs.rax as u8) as u16;
                 return exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/false);
             }
+            // A program can also load an EXE itself, create its PSP with
+            // AH=55h, and make it current with AH=50h. Its INT 22h address in
+            // the PSP is the continuation in the parent loader. Second
+            // Reality uses this path for its setup and visual modules.
+            let psp = machine.read::<Psp>(Psp::base(dos.current_psp));
+            let parent = psp.parent_psp;
+            let terminate = psp._terminate_addr;
+            if terminate != 0 && parent != dos.current_psp
+                && dos.dos_blocks.iter().any(|block| block.seg == parent)
+            {
+                dos.last_child_exit_status = regs.rax as u8 as u16;
+                dos.current_psp = parent;
+                regs.set_cs32(terminate >> 16);
+                regs.set_ip32(terminate & 0xFFFF);
+                return thread::KernelAction::Done;
+            }
             let code = regs.rax as u8;
             return thread::KernelAction::Exit(code as i32);
         }
@@ -2859,6 +2888,26 @@ fn int_21h<A: crate::Arch>(
             };
             regs.rbx = (regs.rbx & !0xFFFF) | bx as u64;
             DosExit::Ok
+        }
+        // AH=55h: Create a child PSP in a block the caller allocated itself.
+        // DX is the new PSP segment and SI is the segment just past its memory.
+        // Loaders such as Second Reality place a child EXE high in conventional
+        // memory, then create its PSP and switch to it with AH=50h.
+        0x55 => {
+            let child = regs.rdx as u16;
+            let top = regs.rsi as u16;
+            if child < dos.heap_base_seg || top <= child || top > 0xA000 {
+                DosExit::Error(9)
+            } else {
+                let mut psp = machine.read::<Psp>(Psp::base(dos.current_psp));
+                psp.top_of_mem = top;
+                psp.parent_psp = dos.current_psp;
+                if psp.jft_far_off == 0x18 && psp.jft_far_seg == dos.current_psp {
+                    psp.jft_far_seg = child;
+                }
+                Psp::store(machine, child, psp);
+                DosExit::Ok
+            }
         }
         // AH=68h/6Ah: Commit file. VFS writes are synchronous; the backend
         // hook additionally drains any filesystem cache when it has one.

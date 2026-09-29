@@ -714,12 +714,22 @@ fn set_tf_source<A: crate::Arch>(dos: &mut thread::DosState<A>, source: u8, on: 
 }
 
 pub(crate) fn prepare_user_tf<A: crate::Arch>(dos: &thread::DosState<A>, regs: &mut Regs) {
-    regs.set_forced_tf(dos.tf_sources != 0);
+    regs.set_forced_tf(effective_tf_sources(dos, regs) != 0);
     regs.project_tf();
 }
 
+fn effective_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
+    if regs.mode() == crate::UserMode::VM86
+        && !dos.dpmi.as_ref().is_some_and(|d| d.vif.is_carrier_trap(regs))
+    {
+        dos.tf_sources & !TF_LEARNING
+    } else {
+        dos.tf_sources
+    }
+}
+
 fn active_tf_sources<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs) -> u8 {
-    dos.tf_sources | if regs.user_tf() { TF_USER } else { 0 }
+    effective_tf_sources(dos, regs) | if regs.user_tf() { TF_USER } else { 0 }
 }
 
 /// Split the physical TF observed on entry back into guest and kernel state.
@@ -734,7 +744,8 @@ fn enter_kernel_tf<A: crate::Arch>(
     let actual = regs.flags32() & TF_FLAG != 0
         || matches!(event, crate::KernelEvent::DebugTrap | crate::KernelEvent::Exception(1));
     let vif = dos.dpmi.as_ref().is_some_and(|d| {
-        d.vif.owns_db() || d.vif.is_carrier_trap(regs)
+        d.vif.is_carrier_trap(regs)
+            || (regs.mode() != crate::UserMode::VM86 && d.vif.owns_db())
     });
     if actual && vif {
         dos.tf_sources |= TF_LEARNING;
@@ -862,9 +873,12 @@ pub fn handle_event<A: crate::Arch>(
     let action = handle_event_inner(machine, bios_display, kt, dos, regs, kevent);
     // A completed RM call may restore a learning caller. Inspect its next
     // instruction now, before a native POPF/IRET can retire without repair.
-    let sources = sources | if dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning()) {
+    let sources = sources | if regs.mode() != crate::UserMode::VM86
+        && dos.dpmi.as_ref().is_some_and(|d| d.vif.is_learning()) {
         TF_LEARNING
     } else { 0 };
+    let sources = (sources & effective_tf_sources(dos, regs))
+        | if regs.user_tf() { sources & TF_USER } else { 0 };
     if emulated && sources != 0 {
         let debug = handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
         if matches!(debug, thread::KernelAction::Done) { action } else { debug }
@@ -913,7 +927,7 @@ fn handle_event_inner<A: crate::Arch>(
             handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
         }
         KE::EmulatedStep { user_was } => {
-            let sources = dos.tf_sources | if user_was { TF_USER } else { 0 };
+            let sources = effective_tf_sources(dos, regs) | if user_was { TF_USER } else { 0 };
             handle_debug_trap(machine, bios_display, kt, dos, regs, sources)
         }
         // Cooperative focus: HLT means "park me until an IRQ arrives". It
@@ -1001,12 +1015,10 @@ fn handle_event_inner<A: crate::Arch>(
             // boundary (metal: the #GP monitor; interp: the exception path in
             // cpu.rs) — the kernel sees identical events from both backends.
             //
-            // A DPMI virtual-IF learning window can cross onto the client's
-            // VM86 side. Its TF-generated #DB still belongs to `vif`, not to
-            // the client's protected-mode exception table. Conversely, a
-            // bare VM86 program may deliberately hook INT 1 and single-step
-            // itself (ST3's packer). Ownership state, rather than CPU mode,
-            // separates those cases.
+            // PM VIF learning is paused in VM86, where IF is already
+            // virtualized by VME or the instruction monitor. A tagged flags
+            // carrier still owns its completion trap. Bare VM86 programs may
+            // also hook INT 1 and single-step themselves (ST3's packer).
             if n == 1 {
                 let sources = active_tf_sources(dos, regs);
                 return handle_debug_trap(machine, bios_display, kt, dos, regs, sources);
@@ -1102,19 +1114,19 @@ fn handle_event_inner<A: crate::Arch>(
                 let lin = (regs.code_seg() as u32) * 16 + regs.ip32() as u16 as u32;
                 let mut bytes = [0u8; 8];
                 machine.copy_from(lin as usize, &mut bytes);
-                // Dump the surrounding state before panicking: a plain
-                // `push ds` etc. can't #GP in genuine VM86, so SS:SP/flags
-                // and the last IRQ we reflected (vector + the CS:IP/SS:SP it
-                // was delivered against) tell us how the guest got here.
+                // A plain `push ds` etc. cannot #GP in genuine VM86, so
+                // SS:SP/flags and the last reflected IRQ help explain the
+                // fault. Terminate this DOS process, not the whole kernel.
                 let liq = unsafe { mode_transitions::LAST_IRQ };
                 crate::compact_println!("VM86 #GP state: ss:sp={:04x}:{:08x} flags={:#x} vm={} last_irq=vec{:02x} handler={:04x}:{:04x} delivered_at cs:ip={:04x}:{:08x} ss:sp={:04x}:{:08x}",
                     regs.stack_seg(), regs.sp32(), regs.flags32(),
                     regs.mode() == crate::UserMode::VM86,
                     liq.0, liq.1, liq.2 as u16, liq.3, liq.4, liq.5, liq.6);
-                lib::compact_panic!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
+                crate::compact_println!("VM86: unhandled opcode at {:04x}:{:04x} (lin={:#x}) bytes=[{:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x}]",
                     regs.code_seg(), regs.ip32() as u16, lin,
                     bytes[0], bytes[1], bytes[2], bytes[3],
                     bytes[4], bytes[5], bytes[6], bytes[7]);
+                thread::KernelAction::Exit(0x0200 | 13) // #GP
             } else if dos.dpmi.is_some() {
                 log_pm_gp(machine, dos, regs);
                 dpmi::dispatch_dpmi_exception(machine, dos, regs, 13)
@@ -2141,6 +2153,32 @@ fn log_pm_gp<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
         &stack[..], last_irq.0, last_irq.1, last_irq.2, last_irq.3,
         last_irq.4, last_irq.5, last_irq.6,
     );
+    // FF /3 with a disp32 operand is an indirect far call. The instruction
+    // bytes alone do not reveal whether its memory operand names a null,
+    // missing, or otherwise invalid selector.
+    if bytes[0] == 0xFF && bytes[1] == 0x1D {
+        let disp = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let addr = ds_b.wrapping_add(disp) as usize;
+        let target_off = machine.read::<u32>(addr);
+        let target_sel = machine.read::<u16>(addr + 4);
+        let index = (target_sel >> 3) as usize;
+        let raw = if target_sel & 0x04 != 0 {
+            dos.ldt.get(index).copied()
+        } else {
+            None
+        };
+        if let Some(raw) = raw {
+            crate::compact_println!(
+                "[#GP] far-call [{:08X}] = {:04X}:{:08X} ldt[{}]={:016X}",
+                addr, target_sel, target_off, index, raw
+            );
+        } else {
+            crate::compact_println!(
+                "[#GP] far-call [{:08X}] = {:04X}:{:08X} ldt[{}]=unavailable",
+                addr, target_sel, target_off, index
+            );
+        }
+    }
 }
 
 /// Runtime bytes for a protected-mode #UD.  DOS extenders print the selector

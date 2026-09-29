@@ -783,7 +783,7 @@ fn isr_handler_ring3(regs: &mut Regs) {
                         }
                     } else if regs.flags32() & VIF_VIP == VIF_VIP {
                         KE::Irq
-                    } else if stepped {
+                    } else if stepped && (regs.user_tf() || regs.forced_tf()) {
                         KE::EmulatedStep { user_was }
                     } else {
                         return;

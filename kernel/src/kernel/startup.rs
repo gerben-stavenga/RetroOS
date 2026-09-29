@@ -2861,7 +2861,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
             b[7]
         );
         if let Some(d) = dos {
-            dump_virtual_hw(d);
+            dump_virtual_hw(machine, d);
         }
         // Dump VGA hardware register state (which one differs vs working
         // is the first thing to check when buffer paints but screen is
@@ -2977,7 +2977,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
         );
         if let Some(d) = dos {
             crate::kernel::dos::dump_dpmi_state(machine, d, regs);
-            dump_virtual_hw(d);
+            dump_virtual_hw(machine, d);
         }
         crate::kernel::stacktrace::stack_trace_regs(regs);
     }
@@ -2987,7 +2987,7 @@ pub(crate) fn dump_interrupted_thread<A: crate::Arch>(
 /// so hangs that look like "timer stopped" usually show up as a stuck in-
 /// service bit (a higher-priority pending line is blocked by it) or a
 /// requested-but-masked line.
-fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
+fn dump_virtual_hw<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>) {
     let (mirr, misr, mimr, sirr, sisr, simr) = dos.pc.vpic.debug_state();
     crate::compact_dbg_println!(
         "[DBG] vpic master irr={:#04x} isr={:#04x} imr={:#04x}  slave irr={:#04x} isr={:#04x} imr={:#04x}",
@@ -3012,6 +3012,34 @@ fn dump_virtual_hw<A: crate::Arch>(dos: &thread::DosState<A>) {
     );
 
     crate::kernel::dos::dump_if_ring();
+    dos.pc.gus.dump_state();
+    if dos.pc.gus.present && dos.pc.gus.irq < 16 {
+        let vector = if dos.pc.gus.irq < 8 {
+            0x08u8 + dos.pc.gus.irq
+        } else {
+            0x70u8 + dos.pc.gus.irq - 8
+        };
+        let (pm_sel, pm_off) = dos.pm_vectors[vector as usize];
+        let ivt = usize::from(vector) * 4;
+        let rm_off = machine.read::<u16>(ivt);
+        let rm_seg = machine.read::<u16>(ivt + 2);
+        crate::compact_dbg_println!(
+            "[GUSIRQ] irq={} vector={:02X} pm={:04X}:{:08X} rm={:04X}:{:04X}",
+            dos.pc.gus.irq, vector, pm_sel, pm_off, rm_seg, rm_off
+        );
+        // DOS extenders may install a callback on a remapped or chained IRQ
+        // vector. Show the whole legacy IRQ ranges while diagnosing silence.
+        for vec in (0x08usize..0x10).chain(0x70..0x78) {
+            let (sel, off) = dos.pm_vectors[vec];
+            let ivt = vec * 4;
+            let rm_off = machine.read::<u16>(ivt);
+            let rm_seg = machine.read::<u16>(ivt + 2);
+            crate::compact_dbg_println!(
+                "[IRQVEC] {:02X} pm={:04X}:{:08X} rm={:04X}:{:04X}",
+                vec, sel, off, rm_seg, rm_off
+            );
+        }
+    }
     crate::kernel::dos::dump_gus_ring();
 }
 

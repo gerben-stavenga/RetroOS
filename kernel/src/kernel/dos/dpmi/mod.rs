@@ -855,7 +855,8 @@ fn dpmi_api_inner<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>
             regs.rcx = (regs.rcx & !0xFFFF) | dos::ctrl_slot_off(dos::SLOT_SAVE_RESTORE) as u64;
             // Protected-mode save/restore entry in the special-stub segment.
             regs.rsi = (regs.rsi & !0xFFFF) | super::mode_transitions::SPECIAL_STUB_SEL as u64;
-            regs.rdi = (regs.rdi & !0xFFFF) | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u32) as u64;
+            regs.rdi = (regs.rdi & !0xFFFF_FFFF)
+                | (dos::STUB_BASE + dos::slot_offset(dos::SLOT_SAVE_RESTORE) as u32) as u64;
             clear_carry(regs);
         }
         // AX=0306h — Get Raw Mode Switch Addresses

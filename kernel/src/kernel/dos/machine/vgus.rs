@@ -23,12 +23,13 @@ use super::*;
 /// an `Option` inside the card (a program that never probes pays nothing).
 pub struct Gus {
     pub base: u16,   // ULTRASND port base (0x2X0; the GF1 block is base+0x100)
-    pub irq: u8,     // ULTRASND GF1 IRQ (wave/ramp/DMA-TC/timers)
+    pub irq: u8,     // GF1 IRQ, initially from ULTRASND and then from 2XB
     pub dma_ch: u8,  // ULTRASND play DMA channel (sample upload)
     /// `ULTRASND=` seen in this program's env — the device exists. Absent
     /// hardware must stay absent: `owns` gates on this, so probes read 0xFF.
     pub present: bool,
     card: sound::gus::Gf1,
+    irq_raises: u64,
 }
 
 impl Gus {
@@ -40,6 +41,7 @@ impl Gus {
             dma_ch: 3,
             present: false,
             card: sound::gus::Gf1::new(0x240),
+            irq_raises: 0,
         }
     }
 
@@ -52,6 +54,7 @@ impl Gus {
     /// <midiirq>` env string (base in hex, the rest decimal — the format
     /// every real driver and game setup writes). Missing/malformed values
     /// leave the defaults; the var's presence alone makes the card exist.
+    /// A later board IRQ-latch write may select a different GF1 line.
     pub fn configure_from_env(&mut self, env: &[u8]) {
         let Some(val) = env_var(env, b"ULTRASND") else { return };
         self.present = true;
@@ -92,6 +95,7 @@ impl Gus {
         vpic.clear_request(self.irq);
         self.card.power_off();
         self.present = false;
+        self.irq_raises = 0;
     }
 
     /// Latch a GF1 service request into the vPIC. The line is edge-triggered
@@ -100,6 +104,22 @@ impl Gus {
     fn raise(&mut self, vpic: &mut super::vpic::VirtualPic) {
         if !vpic.is_requested(self.irq) {
             vpic.raise(self.irq);
+            self.irq_raises = self.irq_raises.wrapping_add(1);
+        }
+    }
+
+    /// F12 snapshot: distinguish detected hardware, initialized timers, and
+    /// voices that have actually been started by the guest.
+    pub fn dump_state(&self) {
+        if let Some((reset, active, running, timer_enable, t1, t2)) = self.card.debug_state() {
+            crate::compact_dbg_println!(
+                "[GUSSTATE] present={} reset={:02X} active={} running={} timer_enable={:02X} t1={} t2={} irq_raises={}",
+                self.present, reset, active, running, timer_enable, t1, t2, self.irq_raises
+            );
+        } else {
+            crate::compact_dbg_println!(
+                "[GUSSTATE] present={} untouched irq_raises={}", self.present, self.irq_raises
+            );
         }
     }
 
@@ -147,13 +167,21 @@ impl Gus {
     }
 
     /// Guest OUT to a decoded port.
-    pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, p: u16, val: u8) {
+    pub fn io_write<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237, vpic: &mut VirtualPic, p: u16, val: u8) {
         let (reg, voice) = self.card.sel();
         if super::PORT_TRACE {
             crate::compact_dbg_println!("[gus] out {:03X} <- {:02X} (reg {:02X}v{})", p, val, reg, voice);
         }
         gus_ring_record(true, p, val, reg, voice);
         self.card.port_out(p, val);
+        if p == self.base.wrapping_add(0x0B)
+            && let Some(irq) = self.card.programmed_irq()
+            && irq != self.irq
+        {
+            vpic.clear_request(self.irq);
+            crate::compact_dbg_println!("[gus] GF1 IRQ route {} -> {}", self.irq, irq);
+            self.irq = irq;
+        }
         // A completed reg-0x41 write with the enable bit arms an upload; it
         // is serviced here, where the machine and the 8237 live.
         if self.card.dma_armed() {

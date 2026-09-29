@@ -76,12 +76,38 @@ firmware, sound card, and image:
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
+./run.sh rust-dos                    # experimental: native BIOS loader; kernel currently halts
+./run.sh rust-dos-games              # Rust-DOS shell with a disposable FAT16 C:
 ```
 
 `run.sh` defaults to the shared layout on QEMU, Bochs, 86Box and hosted:
 
 - `bazel-bin/boot_disk.bin`: GRUB, kernel and `C:\RETROOS` system files, rebuilt from current sources.
 - `build/data.bin`: one writable disk, shared across backends. FAT32 holds `C:` and ext4 holds the Linux root. Guest writes persist.
+
+For Rust-DOS, clone [dividebysandwich/rust-dos](https://github.com/dividebysandwich/rust-dos)
+into `tmp/rust-dos` and run `cargo build --release` there. The checkout and
+build artifacts are ignored by Git. `./run.sh rust-dos` boots the same BIOS
+data disk as the other emulators, but builds `native_boot_disk.bin` with
+RetroOS's own BIOS MBR loader instead of GRUB. It keeps the current kernel and
+`C:\RETROOS` files on that disposable disk. Use `RUST_DOS_BIN` to select a
+different executable. Rust-DOS supports BIOS disk images here, with
+up to 64 MiB RAM. The default 486 model reaches the RetroOS kernel, but
+Rust-DOS exposes mounted hard disks through BIOS INT 13h only. RetroOS's
+runtime probes ATA/AHCI/NVMe directly and finds no storage, so it halts with
+`No root filesystem available` before DN starts. This is not yet a playable
+setup.
+
+`./run.sh rust-dos-games` runs Rust-DOS itself, with `C:` built from the current
+`c_drive_tar` and `boot_dir_tar` packages. It includes `C:\GAMES` and
+`C:\RETROOS`; when `apps-proprietary/` is present it uses the proprietary game
+package too. The image is FAT16 because Rust-DOS cannot mount the shared
+FAT32 data image as a DOS drive yet. It is copied to a temporary file for
+each launch, so game saves in this mode are discarded on exit. The launcher
+reads `PATH`, `DN`, `DNSWP`, `TEMP` and `START` from `etc/CONFIG.SYS`, matching
+RetroOS's DOS paths; the default `START` opens DN automatically. After DN
+exits, the DOS prompt remains. Rust-DOS's built-in DPMI host uses its default
+enabled setting.
 
 The data disk is seeded only when missing, using proprietary content when
 `apps-proprietary/` exists. Rebuilding a seed never replaces the live disk.

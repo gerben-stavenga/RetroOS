@@ -60,12 +60,14 @@ use super::thread;
 /// first-entry, etc.) update it explicitly when transitioning state.
 pub struct LockedStackState {
     pub other_stack: Option<(u16, u32)>,
+    /// Most recent 32-bit client stack, retained across real-mode callbacks.
+    pub client_pm_stack: Option<(u16, u32)>,
     continuations: Vec<HostContinuation>,
 }
 
 impl LockedStackState {
     pub fn new() -> Self {
-        Self { other_stack: None, continuations: Vec::new() }
+        Self { other_stack: None, client_pm_stack: None, continuations: Vec::new() }
     }
 }
 
@@ -335,6 +337,9 @@ pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &
 pub(super) fn enter_rm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Regs,
                                       rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) {
     let pm_cursor = pm_stack(dos, regs);
+    if pm_cursor.0 != HOST_STACK_PM32_SEL && pm_cursor.0 != HOST_STACK_PM16_SEL {
+        dos.pc.locked_stack.client_pm_stack = Some(pm_cursor);
+    }
     push_continuation(dos, regs, rm_call_struct_addr);
     regs.set_user_tf(false);
     regs.project_tf();
@@ -625,9 +630,25 @@ pub(super) fn deliver_pm_irq<A: crate::Arch>(machine: &mut A, dos: &mut thread::
         push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));
     } else {
-        // First entry or RM→PM toggle: retain the opposite cursor and return
-        // the handler through the common host-resume stub.
-        enter_pm(dos, regs, None);
+        // On a first interrupt from a 32-bit PM client, keep its stack.
+        // Some extenders use EBP-relative operands in their IRQ handlers;
+        // those operands address SS, so switching to the host's small stack
+        // segment makes otherwise valid client data references fault. The
+        // host continuation still restores the pre-interrupt stack cursor.
+        if in_pm && handler_use32 {
+            let cursor = (regs.stack_seg(), regs.sp32());
+            if cursor.0 != HOST_STACK_PM32_SEL && cursor.0 != HOST_STACK_PM16_SEL {
+                dos.pc.locked_stack.client_pm_stack = Some(cursor);
+            }
+            enter_pm_at(dos, regs, None, Some(cursor));
+        } else if !in_pm && handler_use32 && !default_vector {
+            // A PM handler reached from VM86 still uses SS for EBP-relative
+            // client data. Reuse the client's saved PM stack when available.
+            let cursor = dos.pc.locked_stack.client_pm_stack;
+            enter_pm_at(dos, regs, None, cursor);
+        } else {
+            enter_pm(dos, regs, None);
+        }
         let stub_eip = dos::STUB_BASE + dos::slot_offset(dos::SLOT_RESUME_CONTINUATION) as u32;
         push_iret_frame(machine, &dos.ldt[..], regs, handler_use32,
             stub_eip, SPECIAL_STUB_SEL, machine::guest_flags(regs));

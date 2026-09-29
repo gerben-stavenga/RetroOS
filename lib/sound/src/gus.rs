@@ -119,11 +119,11 @@ struct Core {
     active_reg: u8,
     /// 2X0 mix-control latch; bit 6 selects what a 2XB write means.
     mix_ctrl: u8,
-    /// 2XB IRQ- or DMA-control latch. Stored for readback shape only — the
-    /// actual wiring is the host's ULTRASND contract, same policy as the SB's
-    /// BLASTER (the guest telling us differs from what its env said would be a
-    /// driver bug, not a reconfiguration).
+    /// Last 2XB IRQ- or DMA-control latch value.
     irq_dma_latch: u8,
+    /// GF1 IRQ selected by a 2XB write while 2X0 bit 6 selects the IRQ latch.
+    /// None means the board retains the IRQ supplied by its host wiring.
+    programmed_irq: Option<u8>,
     /// AdLib-compatible window (2X8/2X9) index latch. The GF1 exposes its
     /// two rate timers through this OPL-shaped port pair (SBOS and tracker
     /// players clock music off them); index 0x04 is the timer control.
@@ -185,6 +185,7 @@ impl Core {
             active_reg: 13, // hardware default: 14 voices
             mix_ctrl: 0x0B, // line/mic off, latches disabled — power-on value
             irq_dma_latch: 0,
+            programmed_irq: None,
             adlib_index: 0,
             timers: [Timer::default(); 2],
             wave_pending: 0,
@@ -309,6 +310,25 @@ impl Gf1 {
         self.core.as_ref().map_or((0, 0), |c| (c.reg_sel, c.voice_sel))
     }
 
+    /// Read-only F12 snapshot of the playback and timer gates. Port traffic
+    /// alone cannot distinguish an idle player from a running silent voice.
+    pub fn debug_state(&self) -> Option<(u8, u8, usize, u8, bool, bool)> {
+        self.core.as_ref().map(|c| (
+            c.reset_reg,
+            c.engine.active,
+            c.engine.voices.iter().take(c.engine.active as usize)
+                .filter(|v| v.running).count(),
+            c.reg45,
+            c.timers[0].running,
+            c.timers[1].running,
+        ))
+    }
+
+    /// IRQ line selected by the guest's board control latch, if programmed.
+    pub fn programmed_irq(&self) -> Option<u8> {
+        self.core.as_ref().and_then(|c| c.programmed_irq)
+    }
+
     /// The DRAM peek/poke address the register file currently points at —
     /// for host-side access tracing only.
     pub fn dram_addr(&self) -> usize {
@@ -380,7 +400,23 @@ impl Gf1 {
                         }
                     }
                 }
-                0x0B => c.irq_dma_latch = val,
+                0x0B => {
+                    c.irq_dma_latch = val;
+                    if c.mix_ctrl & 0x40 != 0 {
+                        // UltraSound Lowlevel Toolkit, IRQ-control register:
+                        // bits 2:0 select the GF1 line; zero is reserved.
+                        c.programmed_irq = match val & 0x07 {
+                            1 => Some(9), // IRQ2 is cascaded onto IRQ9 on ATs
+                            2 => Some(5),
+                            3 => Some(3),
+                            4 => Some(7),
+                            5 => Some(11),
+                            6 => Some(12),
+                            7 => Some(15),
+                            _ => c.programmed_irq,
+                        };
+                    }
+                }
                 _ => {}
             }
             return;

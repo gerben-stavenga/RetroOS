@@ -833,7 +833,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
             pc.sb.sb_write(machine, &pc.dma, p, val);
         }
         // Gravis UltraSound (GF1) — exists only when ULTRASND declared it.
-        p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, p, val),
+        p if pc.gus.owns(p) => pc.gus.io_write(machine, &pc.dma, &mut pc.vpic, p, val),
         // MPU-401 / General MIDI — exists only when BLASTER declared P<port>.
         p if emulated_mpu(pc, p) => pc.mpu.io_write(p, val),
         // Virtual 8237 DMA controller (generic). After capturing the

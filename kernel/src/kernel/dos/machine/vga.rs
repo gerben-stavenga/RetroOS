@@ -1106,9 +1106,9 @@ pub fn on_set_mode<A: crate::Arch>(
         ::vga::VramTransition::between(old_layout, new_layout).apply(planes);
     }
     // A real VGA BIOS reloads the DAC on every clearing mode set. Which default
-    // depends on the render path: text/CGA/mode 13h index DAC entries directly
-    // and need the 16 CGA colours at entries 0..15; planar 16-colour modes map
-    // pixels through the Attribute Controller first.
+    // depends on the render path: text and planar 16-colour modes map
+    // attribute colours through the AC palette; CGA/mode 13h index the DAC
+    // directly.
     if matches!(mode, 0x0D..=0x12) {
         // Install the planar EGA DAC even on no-clear mode sets: many EGA games
         // never program the DAC, and our fresh process default is the generic
@@ -1121,9 +1121,19 @@ pub fn on_set_mode<A: crate::Arch>(
             ::vga::ega_dac()
         };
     } else if clear {
-        vga.dac = ::vga::fallback_palette();
+        vga.dac = if matches!(mode, 0..=3 | 7) {
+            ::vga::ega_dac()
+        } else {
+            ::vga::fallback_palette()
+        };
     }
     let planar = matches!(mode, 0x0D..=0x12);
+    if matches!(mode, 0..=3 | 7) {
+        vga.ac[..16].copy_from_slice(&::vga::VGA_TEXT_AC_PALETTE);
+        vga.ac[0x10] &= !0x80;
+        vga.ac[0x12] = 0x0F;
+        vga.ac[0x14] = 0;
+    }
     if planar {
         // Standard EGA AC palettes, straight out of the BIOS video parameter
         // table. The 200-line modes are the RGBI-compatibility family: colour

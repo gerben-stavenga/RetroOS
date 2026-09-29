@@ -33,7 +33,7 @@
 //! is invalidated per page when code is written. arch's only job is to reflect
 //! the `#GP`/`#DB` and let us drive `regs` + guest memory.
 
-use arch_abi::{Arch, Regs};
+use arch_abi::{Arch, Regs, UserMode};
 
 // EFLAGS bits.
 const IF_FLAG: u32 = 1 << 9;
@@ -420,11 +420,19 @@ fn looks_like_flags(w: u32) -> bool {
 }
 
 fn stack_base<A: Arch>(regs: &Regs) -> u32 {
-    A::seg_base(regs.stack_seg())
+    if regs.mode() == UserMode::VM86 {
+        (regs.stack_seg() as u32) << 4
+    } else {
+        A::seg_base(regs.stack_seg())
+    }
 }
 fn code_view<A: Arch>(regs: &Regs) -> (u32, bool) {
     let cs = regs.code_seg();
-    (A::seg_base(cs), A::seg_is_32(cs))
+    if regs.mode() == UserMode::VM86 {
+        ((cs as u32) << 4, false)
+    } else {
+        (A::seg_base(cs), A::seg_is_32(cs))
+    }
 }
 
 /// The low 32 bits of a GPR by x86 register index (0=eax..7=edi).

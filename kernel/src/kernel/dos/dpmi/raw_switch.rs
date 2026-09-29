@@ -20,6 +20,11 @@ fn raw_switch_pm_to_real<A: crate::Arch>(_machine: &mut A, dos: &mut thread::Dos
     let new_cs = regs.rsi as u16;
     let new_ip = regs.rdi as u16;
     let outgoing_pm = (regs.stack_seg(), regs.sp32());
+    if outgoing_pm.0 != mode_transitions::HOST_STACK_PM32_SEL
+        && outgoing_pm.0 != mode_transitions::HOST_STACK_PM16_SEL
+    {
+        dos.pc.locked_stack.client_pm_stack = Some(outgoing_pm);
+    }
     let in_locked_chain = dos.pc.locked_stack.other_stack.is_some();
 
     regs.frame.rflags |= machine::VM_FLAG as u64;

@@ -6,15 +6,15 @@ cd "$SCRIPT_DIR"
 
 usage() {
     cat <<'HELP'
-Usage: ./run.sh [qemu|bochs|86box|hosted] [options] [-- emulator arguments]
+Usage: ./run.sh [qemu|bochs|86box|rust-dos|rust-dos-games|hosted] [options] [-- emulator arguments]
   --data-image PATH       Persistent disk (default: build/data.bin)
   --firmware bios|uefi    Default: UEFI for QEMU, BIOS elsewhere
   --freedos               Boot FreeDOS from the same data disk (BIOS only)
-  --arch 386|686|x64      QEMU CPU selection (default: 386)
+  --arch 386|686|x64      CPU selection (default: 386)
   --hd ata|ahci|nvme       QEMU data controller (default: NVMe on UEFI, ATA on BIOS)
   --sound sb|ac97|hda|none QEMU sound (default: hda; other emulators: sb)
   --sb-audio native|mixed QEMU guest audio policy
-  --cmd, -c, -r COMMAND   Run a command (QEMU or hosted)
+  --cmd, -c, -r COMMAND   Run a command (QEMU, hosted or rust-dos-games)
   --host, -H, -h DIR      Host directory (QEMU HostFS or hosted root)
   --headless, -T          No window (QEMU or hosted)
   --kvm                  Use KVM (QEMU or hosted)
@@ -24,6 +24,8 @@ Usage: ./run.sh [qemu|bochs|86box|hosted] [options] [-- emulator arguments]
 
 The boot image is built on every launch. The data image is built and copied
 only when missing; subsequent launches use it directly, preserving writes.
+rust-dos-games instead builds a disposable FAT16 C: from the packaged files;
+changes made in that mode are discarded when it exits.
 RETROOS_DATA_IMAGE also selects the data path. VM_DIR selects the Bochs/86Box
 configuration directory. Old -i image modes and --gpt have been removed.
 HELP
@@ -34,7 +36,7 @@ COMMAND= HOST_DIR= WAV= SHOT= TRACE=0 SB_AUDIO= HD=
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/build/data.bin}"
 PASS=()
 case "${1:-}" in
-    qemu|bochs|86box|hosted) BACKEND="$1"; shift ;;
+    qemu|bochs|86box|rust-dos|rust-dos-games|hosted) BACKEND="$1"; shift ;;
     -h|help) usage; exit 0 ;;
 esac
 while [ $# -gt 0 ]; do
@@ -44,8 +46,9 @@ while [ $# -gt 0 ]; do
             [ $# -ge 2 ] || fail "$1 needs a value"
             case "$1" in
                 --backend) BACKEND="$2" ;; --data-image) DATA_IMAGE="$2" ;;
-                --firmware) FIRMWARE="$2" ;; --arch) ARCH="$2" ;;
+                --firmware) FIRMWARE="$2" ;;
                 --hd) HD="$2" ;;
+                --arch) ARCH="$2" ;;
                 --sound) SOUND="$2" ;; --sb-audio) SB_AUDIO="$2" ;;
                 --cmd|-c|-r) COMMAND="$2" ;; --host|-H|-h) HOST_DIR="$2" ;;
                 --wav|-w) WAV="$2" ;; --screenshot|-s) SHOT="$2" ;;
@@ -60,12 +63,12 @@ while [ $# -gt 0 ]; do
         *) fail "unknown option: $1 (pass emulator options after --)" ;;
     esac
 done
-case "$BACKEND" in qemu|bochs|86box|hosted) ;; *) fail "unknown backend: $BACKEND" ;; esac
+case "$BACKEND" in qemu|bochs|86box|rust-dos|rust-dos-games|hosted) ;; *) fail "unknown backend: $BACKEND" ;; esac
 [ -n "$FIRMWARE" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then FIRMWARE=uefi; else FIRMWARE=bios; fi; }
 [ -n "$SOUND" ] || { if [ "$BACKEND" = qemu ] && [ "$FREEDOS" = 0 ]; then SOUND=hda; else SOUND=sb; fi; }
 case "$FIRMWARE" in bios|uefi) ;; *) fail "unknown firmware: $FIRMWARE" ;; esac
 case "$HD" in ''|ata|ahci|nvme) ;; *) fail "unknown disk controller: $HD" ;; esac
-[ -z "$HD" ] || [ "$BACKEND" = qemu ] || fail "--hd requires QEMU"
+[ -z "$HD" ] || [ "$BACKEND" = qemu ] || [ "$BACKEND" = rust-dos ] || fail "--hd requires QEMU or Rust-DOS"
 [ -n "$HD" ] || { if [ "$FIRMWARE" = uefi ]; then HD=nvme; else HD=ata; fi; }
 case "$SOUND" in sb|ac97|hda|none) ;; *) fail "unknown sound: $SOUND" ;; esac
 case "$ARCH" in 386|686|x64) ;; *) fail "unknown architecture: $ARCH" ;; esac
@@ -88,13 +91,14 @@ BAZEL="${BAZEL:-$(command -v bazelisk || command -v bazel || true)}"
 BAZEL=$(command -v "$BAZEL" || true)
 [ -n "$BAZEL" ] || fail "install bazelisk or set BAZEL"
 WORK=$(mktemp -d -t retroos-run.XXXXXX)
-VM_PID= HOSTFS_PID= STAGED=
+VM_PID= HOSTFS_PID= STAGED= RUST_DOS_IMAGE_LINK=
 cleanup() {
     local pid
     for pid in "$VM_PID" "$HOSTFS_PID"; do
         if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; fi
     done
     [ -z "$STAGED" ] || rm -f "$STAGED"
+    [ -z "$RUST_DOS_IMAGE_LINK" ] || rm -f -- "$RUST_DOS_IMAGE_LINK"
     rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -103,7 +107,14 @@ trap 'exit 143' TERM
 run_vm() { "$@" <&0 & VM_PID=$!; local status=0; wait "$VM_PID" || status=$?; VM_PID=; return "$status"; }
 
 # Build outputs never serve as the writable disk. Publish a complete seed once.
-if [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
+if [ "$BACKEND" = rust-dos-games ]; then
+    GAMES_TARGET=rust_dos_games_disk
+    [ ! -d apps-proprietary ] || GAMES_TARGET=rust_dos_games_disk_proprietary
+    "$BAZEL" build "//:$GAMES_TARGET"
+    GAMES_IMAGE="$WORK/games.img"
+    cp --reflink=auto "bazel-bin/$GAMES_TARGET.img" "$GAMES_IMAGE"
+    chmod u+rw "$GAMES_IMAGE"
+elif [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
     DATA_IMAGE=$(realpath -m "$DATA_IMAGE")
     mkdir -p "$(dirname "$DATA_IMAGE")"
     exec 9>"$DATA_IMAGE.lock"
@@ -122,9 +133,11 @@ if [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
         STAGED=
     fi
     [ -f "$DATA_IMAGE" ] && [ -w "$DATA_IMAGE" ] || fail "data image is not writable: $DATA_IMAGE"
-    "$BAZEL" build //:boot_disk 9>&-
-    BOOT_IMAGE="$WORK/boot.bin"
-    cp --reflink=auto bazel-bin/boot_disk.bin "$BOOT_IMAGE"
+    BOOT_TARGET=boot_disk
+    [ "$BACKEND" != rust-dos ] || BOOT_TARGET=native_boot_disk
+    "$BAZEL" build "//:$BOOT_TARGET" 9>&-
+    BOOT_IMAGE="$WORK/boot.img"
+    cp --reflink=auto "bazel-bin/$BOOT_TARGET.bin" "$BOOT_IMAGE"
     chmod u+rw "$BOOT_IMAGE"
     echo "Persistent data: $DATA_IMAGE"
 fi
