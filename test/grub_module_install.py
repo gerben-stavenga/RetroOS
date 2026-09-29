@@ -61,6 +61,15 @@ class GrubModuleInstallTest(unittest.TestCase):
         self.assertEqual(create.call_args.args[0], Path(temporary) / "home/retroos")
         self.assertEqual(run.call_args_list[1].args[0], ["umount", temporary])
 
+    def test_custom_ext4_c_directory_is_passed_to_grub(self):
+        self.assertEqual(installer.validate_c_dir("/DOS/RETROOS"), "/DOS/RETROOS")
+        with self.assertRaises(ValueError):
+            installer.validate_c_dir("/home/../etc")
+        plan = {"boot_uuid": "AAAA-BBBB", "grub_release": "/retroos/releases/1234",
+                "c_uuid": "ea8c19a0-a2e3-4d14-9fd2-6955c176122c", "c_dir": "/DOS/RETROOS",
+                "root_uuid": None}
+        self.assertIn("retroos.c-root=/DOS/RETROOS", installer.grub_entries(plan))
+
     def test_separate_boot_grub_path_and_ram_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             boot = Path(directory)

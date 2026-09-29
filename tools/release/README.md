@@ -42,6 +42,8 @@ several volumes qualify for C:, rerun the preparation command with
 `--c-uuid=<UUID>`. Use `--c-ram` to select the RAM module for C: explicitly.
 An ext4 C: volume may be unmounted during preparation; installation mounts it
 temporarily to ensure `home/retroos` exists, then unmounts it.
+Use `--c-dir=/path/on/volume` during preparation to choose another directory
+on that ext4 volume; `/home/retroos` is the default.
 On a Btrfs Linux root, RAM C: is the default because RetroOS does not support
 Btrfs. The module supplies `C:\RETROOS` from RAM in every case.
 

@@ -26,6 +26,9 @@ unmounted in Linux: installation temporarily mounts it to check or create
 `home/retroos`, then unmounts it. Installation also creates the `retroos`
 group when needed. With no supported
 data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly.
+For ext4, add `--c-dir=/path/on/volume` during preparation to use a different
+C: directory; the installer creates that directory and passes the same path
+to RetroOS. The default is `/home/retroos` on the selected ext4 volume.
 When Linux `/` is Btrfs, RAM C: is the default; use `--c-uuid` to select a
 separate supported data volume. The RAM module always supplies
 `C:\RETROOS`, even when C: data lives on a physical disk.

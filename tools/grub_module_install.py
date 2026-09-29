@@ -83,6 +83,15 @@ def choose_c_for_host(volumes, requested, c_ram, linux_root_fstype):
     return choose_c_volume(volumes, requested)
 
 
+def validate_c_dir(path):
+    parts = path.split("/")
+    if (len(path) >= 128 or len(parts) < 2 or parts[0] or
+            any(not part or part in {".", ".."} or
+                not re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts[1:])):
+        raise ValueError("--c-dir must be a canonical absolute directory path under the ext4 volume")
+    return path
+
+
 def grub_path(destination, mount):
     """Translate a Linux path to a path relative to GRUB's filesystem root."""
     target = Path(mount["target"]).resolve()
@@ -98,6 +107,8 @@ def grub_entries(plan):
     uuid = plan["boot_uuid"]
     base = plan["grub_release"]
     args = [f"retroos.c-uuid={plan['c_uuid']}"] if plan["c_uuid"] else []
+    if plan.get("c_dir"):
+        args.append(f"retroos.c-root={plan['c_dir']}")
     if plan.get("root_uuid"):
         args.append(f"retroos.root={plan['root_uuid']}")
     entries = []
@@ -135,7 +146,7 @@ def grub_config_path():
     raise ValueError("existing GRUB configuration not found under /boot/grub or /boot/grub2")
 
 
-def c_home(volume):
+def c_home(volume, c_dir="/home/retroos"):
     if volume["fstype"] != "ext4":
         return None
     for mountpoint in volume["mountpoints"]:
@@ -143,7 +154,7 @@ def c_home(volume):
             continue
         mount = filesystem(mountpoint)
         if (mount.get("uuid") or "").lower() == volume["uuid"].lower() and mount.get("fsroot") == "/":
-            return str(Path(mountpoint) / "home/retroos")
+            return str(Path(mountpoint) / c_dir.lstrip("/"))
     return None
 
 
@@ -162,10 +173,10 @@ def create_c_home(home):
     home.chmod(0o2775)
 
 
-def ensure_c_home(volume):
+def ensure_c_home(volume, c_dir="/home/retroos"):
     if volume["fstype"] != "ext4":
         return
-    mounted_home = c_home(volume)
+    mounted_home = c_home(volume, c_dir)
     if mounted_home:
         create_c_home(Path(mounted_home))
         return
@@ -176,12 +187,12 @@ def ensure_c_home(volume):
             mounted = filesystem(temporary)
             if (mounted.get("uuid") or "").lower() != volume["uuid"].lower() or mounted.get("fsroot") != "/":
                 raise ValueError("Mounted C: volume does not match the selected ext4 UUID")
-            create_c_home(Path(temporary) / "home/retroos")
+            create_c_home(Path(temporary) / c_dir.lstrip("/"))
         finally:
             subprocess.run(["umount", temporary], check=True)
 
 
-def prepare(iso, destination, requested_c, requested_root, c_ram=False):
+def prepare(iso, destination, requested_c, requested_root, c_ram=False, requested_dir=None):
     if os.geteuid() == 0:
         raise PermissionError("prepare as a normal user; installation runs as root")
     if not iso.is_file():
@@ -189,7 +200,10 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False):
     volumes = candidates()
     linux_root = filesystem("/")
     c_volume = choose_c_for_host(volumes, requested_c, c_ram, linux_root["fstype"])
-    home = c_home(c_volume) if c_volume else None
+    if requested_dir and (not c_volume or c_volume["fstype"] != "ext4"):
+        raise ValueError("--c-dir requires an ext4 C: volume")
+    c_dir = validate_c_dir(requested_dir or "/home/retroos") if c_volume and c_volume["fstype"] == "ext4" else None
+    home = c_home(c_volume, c_dir) if c_dir else None
     if requested_root:
         if not UUID_FORMAT.fullmatch(requested_root) or len(requested_root) != 36:
             raise ValueError("--root-uuid requires an ext4 UUID")
@@ -213,7 +227,7 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False):
             "grub_release": grub_path(release, boot_fs), "c_uuid": c_volume["uuid"] if c_volume else None,
             "c_device": c_volume["path"] if c_volume else None,
             "c_fstype": c_volume["fstype"] if c_volume else None,
-            "c_home": home, "root_uuid": requested_root,
+            "c_home": home, "c_dir": c_dir, "root_uuid": requested_root,
             "grub_config": str(grub_cfg)}
     stage = STAGE_ROOT / iso_digest[:12]
     stage.mkdir(parents=True, exist_ok=True)
@@ -236,7 +250,7 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False):
         if home:
             print(f"Installation will ensure {home} exists for ext4 C:.")
         else:
-            print("Installation will temporarily mount the selected ext4 volume and ensure home/retroos exists.")
+            print(f"Installation will temporarily mount the selected ext4 volume and ensure {c_dir} exists.")
     print(f"Review {stage / 'grub.cfg'}, then run the installer as root.")
 
 
@@ -266,7 +280,7 @@ def install():
         raise ValueError("GRUB configuration moved; prepare again")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     if plan["c_uuid"]:
-        ensure_c_home(c_volume)
+        ensure_c_home(c_volume, plan["c_dir"] or "/home/retroos")
     release = Path(plan["release"])
     release.parent.mkdir(parents=True, exist_ok=True)
     files = ("kernel.elf", "retroos-base.img.gz")
@@ -315,10 +329,11 @@ def main():
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
     parser.add_argument("--c-uuid", help="C: filesystem UUID; required when several candidates exist")
     parser.add_argument("--c-ram", action="store_true", help="use the RAM module for C:")
+    parser.add_argument("--c-dir", help="directory inside selected ext4 C: volume (default: /home/retroos)")
     parser.add_argument("--root-uuid", help="optional ext4 UUID for Linux /")
     args = parser.parse_args()
     if args.prepare:
-        prepare(args.iso.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram)
+        prepare(args.iso.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram, args.c_dir)
     else:
         install()
 
