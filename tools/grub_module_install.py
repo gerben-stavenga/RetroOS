@@ -144,7 +144,41 @@ def c_home(volume):
         mount = filesystem(mountpoint)
         if (mount.get("uuid") or "").lower() == volume["uuid"].lower() and mount.get("fsroot") == "/":
             return str(Path(mountpoint) / "home/retroos")
-    raise ValueError(f"Mount the selected ext4 C: volume ({volume['path']}) before preparation")
+    return None
+
+
+def create_c_home(home):
+    if home.exists():
+        if not home.is_dir():
+            raise ValueError(f"C: home is not a directory: {home}")
+        return
+    try:
+        group = grp.getgrnam("retroos")
+    except KeyError:
+        subprocess.run(["groupadd", "--system", "retroos"], check=True)
+        group = grp.getgrnam("retroos")
+    home.mkdir(parents=True)
+    os.chown(home, int(os.environ.get("SUDO_UID", "0")), group.gr_gid)
+    home.chmod(0o2775)
+
+
+def ensure_c_home(volume):
+    if volume["fstype"] != "ext4":
+        return
+    mounted_home = c_home(volume)
+    if mounted_home:
+        create_c_home(Path(mounted_home))
+        return
+    with tempfile.TemporaryDirectory(prefix="retroos-c-") as temporary:
+        subprocess.run(["mount", "-t", "ext4", "-o", "rw",
+                        f"UUID={volume['uuid']}", temporary], check=True)
+        try:
+            mounted = filesystem(temporary)
+            if (mounted.get("uuid") or "").lower() != volume["uuid"].lower() or mounted.get("fsroot") != "/":
+                raise ValueError("Mounted C: volume does not match the selected ext4 UUID")
+            create_c_home(Path(temporary) / "home/retroos")
+        finally:
+            subprocess.run(["umount", temporary], check=True)
 
 
 def prepare(iso, destination, requested_c, requested_root, c_ram=False):
@@ -177,7 +211,9 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False):
     plan = {"iso_sha256": iso_digest, "release": str(release),
             "destination": str(destination), "boot_uuid": boot_fs["uuid"],
             "grub_release": grub_path(release, boot_fs), "c_uuid": c_volume["uuid"] if c_volume else None,
-            "c_device": c_volume["path"] if c_volume else None, "c_home": home, "root_uuid": requested_root,
+            "c_device": c_volume["path"] if c_volume else None,
+            "c_fstype": c_volume["fstype"] if c_volume else None,
+            "c_home": home, "root_uuid": requested_root,
             "grub_config": str(grub_cfg)}
     stage = STAGE_ROOT / iso_digest[:12]
     stage.mkdir(parents=True, exist_ok=True)
@@ -196,8 +232,11 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False):
     (STAGE_ROOT / "selected").write_text(str(stage) + "\n")
     selected = f"{c_volume['path']} ({c_volume['uuid']})" if c_volume else "RAM module"
     print(f"Prepared {stage}\nGRUB filesystem: {boot_fs['uuid']}\nC: {selected}")
-    if home and not Path(home).is_dir():
-        print(f"Installation will create {home} for ext4 C:.")
+    if c_volume and c_volume["fstype"] == "ext4":
+        if home:
+            print(f"Installation will ensure {home} exists for ext4 C:.")
+        else:
+            print("Installation will temporarily mount the selected ext4 volume and ensure home/retroos exists.")
     print(f"Review {stage / 'grub.cfg'}, then run the installer as root.")
 
 
@@ -221,24 +260,13 @@ def install():
         raise ValueError("GRUB destination changed; prepare again")
     if plan["c_uuid"]:
         c_volume = choose_c_volume(candidates(), plan["c_uuid"])
-        if c_home(c_volume) != plan["c_home"]:
-            raise ValueError("C: mount changed; prepare again")
+        if c_volume["fstype"] != plan["c_fstype"]:
+            raise ValueError("C: filesystem type changed; prepare again")
     if str(grub_config_path()) != plan["grub_config"]:
         raise ValueError("GRUB configuration moved; prepare again")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
-    if plan["c_home"]:
-        home = Path(plan["c_home"])
-        if not home.exists():
-            try:
-                group = grp.getgrnam("retroos")
-            except KeyError:
-                subprocess.run(["groupadd", "--system", "retroos"], check=True)
-                group = grp.getgrnam("retroos")
-            home.mkdir(parents=True)
-            os.chown(home, int(os.environ.get("SUDO_UID", "0")), group.gr_gid)
-            home.chmod(0o2775)
-        elif not home.is_dir():
-            raise ValueError(f"C: home is not a directory: {home}")
+    if plan["c_uuid"]:
+        ensure_c_home(c_volume)
     release = Path(plan["release"])
     release.parent.mkdir(parents=True, exist_ok=True)
     files = ("kernel.elf", "retroos-base.img.gz")

@@ -21,9 +21,10 @@ sudo tools/install_kernel.sh --module
 
 Linux enumerates FAT and ext4 partitions on non-USB disks. If several could be
 C:, preparation prints their paths and UUIDs; rerun with
-`--c-uuid=ABCD-1234` (FAT) or an ext4 UUID. A selected ext4 volume must be
-mounted during preparation and installation. Installation creates its
-`home/retroos` directory and `retroos` group when needed. With no supported
+`--c-uuid=ABCD-1234` (FAT) or an ext4 UUID. A selected ext4 volume may be
+unmounted in Linux: installation temporarily mounts it to check or create
+`home/retroos`, then unmounts it. Installation also creates the `retroos`
+group when needed. With no supported
 data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly.
 When Linux `/` is Btrfs, RAM C: is the default; use `--c-uuid` to select a
 separate supported data volume. The RAM module always supplies

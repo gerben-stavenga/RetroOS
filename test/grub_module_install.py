@@ -47,6 +47,20 @@ class GrubModuleInstallTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "either --c-ram or --c-uuid"):
             installer.choose_c_for_host([boot], boot["uuid"], True, "btrfs")
 
+    def test_unmounted_ext4_is_mounted_for_home_creation_then_unmounted(self):
+        volume = {"path": "/dev/sdb2", "fstype": "ext4",
+                  "uuid": "ea8c19a0-a2e3-4d14-9fd2-6955c176122c", "mountpoints": []}
+        with patch.object(installer.subprocess, "run") as run, \
+             patch.object(installer, "filesystem", return_value={"uuid": volume["uuid"], "fsroot": "/"}), \
+             patch.object(installer, "create_c_home") as create:
+            installer.ensure_c_home(volume)
+        self.assertEqual(run.call_args_list[0].args[0][:5],
+                         ["mount", "-t", "ext4", "-o", "rw"])
+        self.assertEqual(run.call_args_list[0].args[0][5], "UUID=" + volume["uuid"])
+        temporary = run.call_args_list[0].args[0][6]
+        self.assertEqual(create.call_args.args[0], Path(temporary) / "home/retroos")
+        self.assertEqual(run.call_args_list[1].args[0], ["umount", temporary])
+
     def test_separate_boot_grub_path_and_ram_entry(self):
         with tempfile.TemporaryDirectory() as directory:
             boot = Path(directory)

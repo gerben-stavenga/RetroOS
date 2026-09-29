@@ -40,6 +40,8 @@ sudo ./install.sh --module
 Preparation discovers GRUB's boot filesystem and supported data volumes. If
 several volumes qualify for C:, rerun the preparation command with
 `--c-uuid=<UUID>`. Use `--c-ram` to select the RAM module for C: explicitly.
+An ext4 C: volume may be unmounted during preparation; installation mounts it
+temporarily to ensure `home/retroos` exists, then unmounts it.
 On a Btrfs Linux root, RAM C: is the default because RetroOS does not support
 Btrfs. The module supplies `C:\RETROOS` from RAM in every case.
 
