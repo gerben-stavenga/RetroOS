@@ -70,7 +70,6 @@ def main():
         menu = (work / 'lightweight-grub.cfg').read_text()
         assert 'boot_choices base' in menu and 'isa-lpc=disappointment' in menu
         assert 'boot-log-only isa-lpc=disappointment' in menu
-        assert 'GOP 1024x768 compatibility' in menu
         subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
         print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
         check_usb(work)

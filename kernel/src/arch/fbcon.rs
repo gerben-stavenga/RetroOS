@@ -35,7 +35,8 @@ struct Geom {
 }
 static mut GEOM: Option<Geom> = None;
 
-const TEXT_W: usize = 720;
+// Eight-pixel text cells fit all 80 columns in a 640-pixel framebuffer.
+const TEXT_W: usize = 640;
 const TEXT_H: usize = 400;
 
 fn geom() -> &'static mut Option<Geom> {

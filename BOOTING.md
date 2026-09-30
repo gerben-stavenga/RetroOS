@@ -425,12 +425,12 @@ xHCI USB-HID boot-keyboard driver, which works on real full-speed hardware
 (verified on a Razer Blade — SkyRoads played from USB keyboard input).
 
 Caveats on real hardware (vs the `run_uefi.sh` mock):
-- fbcon accepts 32bpp direct-RGB framebuffers and converts its pixels using the
+- fbcon accepts packed 16/24/32bpp direct-RGB framebuffers and converts its pixels using the
   channel positions and widths reported by GRUB.
 - If boot stops with white bars at the top of an otherwise black screen, count
   the bars: one means unsupported framebuffer type, two means unsupported RGB
   layout, three means pitch smaller than the pixel row, and four means the mode
-  is below the 720x400 boot console minimum. Each bar is four scanlines tall,
+  is below the 640x400 boot console minimum. Each bar is four scanlines tall,
   followed by four black scanlines.
 - ACPI shutdown is wired for QEMU/Bochs/VirtualBox and PIIX4 boards; on a
   modern laptop it falls through to a halt, so power off by holding the button.

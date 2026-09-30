@@ -1,10 +1,11 @@
 //! Publishing the terminal as graphical content.
 //!
 //! The terminal itself — grid, cursor, ANSI parser — is `lib::term`, shared by
-//! every embedder. This module turns that grid into a canonical 720x400 content
-//! buffer, attaches it to a personality-neutral scene node, and composes the
-//! scene into the current display's packed shadow. Legacy boot consoles may
-//! still let a real VGA scan B8000 directly before the event loop takes over.
+//! every embedder. This module turns that grid into 720x400 content (640x400
+//! on a narrow framebuffer), attaches it to a personality-neutral scene node,
+//! and composes the scene into the current display's packed shadow. Legacy
+//! boot consoles may still let a real VGA scan B8000 directly before the event
+//! loop takes over.
 //!
 //! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. No
 //! personality or content producer sees the physical framebuffer format.
@@ -126,6 +127,7 @@ fn render(
             PALETTE = vga::fallback_palette();
         }
     }
+    let cell_w = if display.composition_size(720, 400).0 < 720 { 8 } else { 9 };
     let vram = lib::term::term().cells_bytes();
     let palette_p = &raw const PALETTE;
     let frame = Frame {
@@ -133,7 +135,7 @@ fn render(
         mode: VgaMode::Text {
             cols: 80,
             rows: 25,
-            cell_w: 9,
+            cell_w,
             cell_h: 16,
         },
         vram,
@@ -265,13 +267,15 @@ fn render_frame(
 pub fn surface_buffer() -> Option<crate::kernel::gui::PixelBuffer<'static>> {
     let scanout = &raw const SCANOUT;
     let pixels = unsafe { &(*scanout).content };
+    let width = pixels.len() / 400;
+    if !matches!(width, 640 | 720) || pixels.len() != width * 400 { return None; }
     let bytes = unsafe {
         core::slice::from_raw_parts(pixels.as_ptr().cast::<u8>(), pixels.len() * 4)
     };
     crate::kernel::gui::PixelBuffer::new(
-        720,
+        width,
         400,
-        720 * 4,
+        width * 4,
         vga::PixelFormat::NATIVE,
         bytes,
     ).ok()

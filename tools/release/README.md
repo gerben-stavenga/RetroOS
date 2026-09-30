@@ -67,11 +67,11 @@ disk** to write to the selected data disk. On BIOS, each choice is available
 with native BIOS VGA or a VBE framebuffer; on UEFI it uses GOP. Both framebuffer
 choices use software VGA rendering. VBE is the BIOS equivalent of this display
 path, not GOP running under BIOS.
-If a UEFI machine shows four short bars and stops, RetroOS received a framebuffer
-smaller than its 720×400 text console. Choose **GOP 1024x768 compatibility**
-from the boot menu. The firmware must offer that resolution at 32 bpp; GRUB's
-`videoinfo` command lists available modes. The **Boot diagnostics** submenu has
-a matching compatibility entry that stops with the boot log on screen.
+The framebuffer console accepts 640×400 or larger RGB modes. On a 640-pixel
+mode it uses eight-pixel text cells so all 80 columns remain visible; wider
+modes use nine-pixel cells. Four short bars mean GRUB handed over a mode smaller
+than 640×400. The boot menu's automatic GOP entry keeps the firmware's current
+mode when GRUB can use it; `videoinfo` lists the modes available to GRUB.
 
 ## The same C: layout across boot sources
 
