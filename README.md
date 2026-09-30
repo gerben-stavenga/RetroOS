@@ -76,7 +76,7 @@ firmware, sound card, and image:
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
-./run.sh unipcemu                    # BIOS/Pentium with two raw IDE disks
+UNIPCEMU_ROM_DIR=/path/to/ROM ./run.sh unipcemu # Pentium/i430fx; requires BIOS ROM
 ./run.sh rust-dos                    # experimental: native BIOS loader; kernel currently halts
 ./run.sh rust-dos-games              # Rust-DOS shell with a disposable FAT16 C:
 ```

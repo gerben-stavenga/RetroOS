@@ -67,6 +67,11 @@ disk** to write to the selected data disk. On BIOS, each choice is available
 with native BIOS VGA or a VBE framebuffer; on UEFI it uses GOP. Both framebuffer
 choices use software VGA rendering. VBE is the BIOS equivalent of this display
 path, not GOP running under BIOS.
+If a UEFI machine shows four short bars and stops, RetroOS received a framebuffer
+smaller than its 720×400 text console. Choose **GOP 1024x768 compatibility**
+from the boot menu. The firmware must offer that resolution at 32 bpp; GRUB's
+`videoinfo` command lists available modes. The **Boot diagnostics** submenu has
+a matching compatibility entry that stops with the boot log on screen.
 
 ## The same C: layout across boot sources
 
@@ -101,16 +106,42 @@ Extract into a new directory and run `./run.sh`. Requires Linux, QEMU x86,
 
 Default BIOS mode uses i440FX with IDE disks. UEFI defaults to NVMe data storage. SPICE/VNC is independent of disk-controller selection.
 
-For UniPCemu on Linux, install or build its executable, then run
-`./run.sh --backend unipcemu` (set `UNIPCEMU_BIN=/path/to/UniPCemu` if it is
-not on `PATH`). This uses a BIOS/Pentium i430fx machine with the same
-disposable boot image and persistent data image as QEMU. UniPCemu stores its
-session settings under the launcher's temporary directory and reads the disks
-through its `UNIPCEMU` data directory. It supports `--sound sb|none`, BIOS,
-ATA, and `--arch 686` in this launcher. Its `sb` choice uses Sound Blaster Pro 2
-at IRQ 7. UniPCemu must be installed separately; it is not bundled. See its
-[command line documentation](https://bitbucket.org/superfury/unipcemu/src/default/manual/Command-line%20parameters.md)
-and [disk image documentation](https://bitbucket.org/superfury/unipcemu/src/default/manual/Disk%20images.rst).
+For UniPCemu on Linux, install or build its executable and prepare a `ROM`
+directory containing a motherboard BIOS ROM for its Pentium/i430fx machine,
+such as `BIOSROM.i430fx.BIN`. The emulator and BIOS ROMs are not bundled.
+Its internal BIOS cannot boot the Pentium selected by this launcher.
+Run the prebuilt disk image with:
+
+```sh
+UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM ./run.sh --backend unipcemu
+```
+
+To try the same CD boot and ET4000/W32i configuration discussed by the
+UniPCemu author, download `retroos_grub_module.iso` from the same release
+and run:
+
+```sh
+UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM \
+UNIPCEMU_ISO=/path/to/retroos_grub_module.iso \
+UNIPCEMU_VIDEO=et4000w32 ./run.sh --backend unipcemu
+```
+
+The CD configuration boots the ISO and attaches `data.img` as the first hard
+disk. `UNIPCEMU_VIDEO` defaults to `vga`; `et4000w32` selects UniPCemu's
+ET4000/W32i emulation. The appropriate video option ROM, such as
+`ET4000_W32.BIN`, can also be placed in the ROM directory. Set
+`UNIPCEMU_BIN=/path/to/UniPCemu` if the executable is not on `PATH`.
+The launcher copies the ROM directory into temporary session storage and
+does not modify the originals. UniPCemu may still require its BIOS setup to
+detect disks; its `Set` button opens the emulator settings. The author's
+report of text followed by a few green lines means his setup got as far as
+RetroOS's video switch; these launcher settings alone do not establish the
+cause of that display problem. A guest boot with this ROM configuration has
+not yet been verified here.
+
+See UniPCemu's [getting started guide](https://bitbucket.org/superfury/unipcemu/src/default/manual/Getting%20started.rst),
+[settings and ROM filenames](https://bitbucket.org/superfury/unipcemu/src/default/manual/Settings%20menu.rst),
+and [disk image guide](https://bitbucket.org/superfury/unipcemu/src/default/manual/Disk%20images.rst).
 
 For virt-manager, use i440FX with both disks attached as IDE, boot disk first.
 Give the guest at least 128 MiB RAM. The included launcher uses 512 MiB for UEFI.

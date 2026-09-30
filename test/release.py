@@ -70,6 +70,7 @@ def main():
         menu = (work / 'lightweight-grub.cfg').read_text()
         assert 'boot_choices base' in menu and 'isa-lpc=disappointment' in menu
         assert 'boot-log-only isa-lpc=disappointment' in menu
+        assert 'GOP 1024x768 compatibility' in menu
         subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
         print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
         check_usb(work)
@@ -113,6 +114,9 @@ def main():
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
         assert (vm / 'tools/run/unipcemu.sh').is_file()
+        rom = work / 'ROM'
+        rom.mkdir()
+        (rom / 'BIOSROM.i430fx.BIN').write_bytes(b'test ROM')
         fake_unipcemu = work / 'fake-unipcemu'
         fake_unipcemu.write_text('''#!/usr/bin/env python3
 import configparser
@@ -123,24 +127,43 @@ root = Path(os.environ['UNIPCEMU'])
 settings = configparser.ConfigParser()
 assert settings.read(root / 'SETTINGS.INI')
 assert settings['machine']['architecture'] == '4'
-assert settings['machine']['executionmode'] == '0'
+assert settings['machine']['executionmode'] == '4'
 assert settings['machine']['cpu'] == '5'
-assert settings['bios']['bootorder'] == '14'
+assert settings['bios']['bootorder'] == os.environ['EXPECTED_BOOTORDER']
 assert settings['i430fxCMOS']['memory'] == '134217728'
-assert settings['disks']['hdd0'] == 'boot.img'
-assert settings['disks']['hdd1'] == 'data.img'
-assert (root / 'disks/boot.img').resolve().is_file()
+assert settings['disks']['hdd0'] == os.environ['EXPECTED_HDD0']
+assert settings['disks']['hdd1'] == os.environ['EXPECTED_HDD1']
+assert settings['disks']['cdrom0'] == os.environ['EXPECTED_CDROM']
+assert settings['video']['videocard'] == os.environ['EXPECTED_VIDEO']
+assert settings['video']['ET4000_extensions'] == os.environ['EXPECTED_ET4000']
+assert (root / 'ROM/BIOSROM.i430fx.BIN').read_bytes() == b'test ROM'
 assert (root / 'disks/data.img').resolve() == Path(os.environ['RETROOS_DATA_IMAGE']).resolve()
+if os.environ['EXPECTED_CDROM']:
+    assert (root / 'disks/retroos.iso').resolve() == Path(os.environ['UNIPCEMU_ISO']).resolve()
 assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLASTER']
 ''')
         fake_unipcemu.chmod(0o755)
+        missing_rom = subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
+                                     cwd=vm, env={**os.environ, 'UNIPCEMU_BIN': str(fake_unipcemu),
+                                                 'UNIPCEMU_ROM_DIR': ''},
+                                     capture_output=True, text=True)
+        assert missing_rom.returncode != 0 and 'UNIPCEMU_ROM_DIR' in missing_rom.stderr
         for sound, expected in [('sb', '4'), ('none', '0')]:
             env = os.environ.copy()
             env.update(UNIPCEMU_BIN=str(fake_unipcemu), RETROOS_DATA_IMAGE=str(vm / 'data.img'),
-                       EXPECTED_SOUNDBLASTER=expected)
+                       UNIPCEMU_ROM_DIR=str(rom), EXPECTED_SOUNDBLASTER=expected,
+                       EXPECTED_BOOTORDER='14', EXPECTED_HDD0='boot.img', EXPECTED_HDD1='data.img',
+                       EXPECTED_CDROM='', EXPECTED_VIDEO='0', EXPECTED_ET4000='0')
             subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu', '--sound', sound],
                            cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
-        print('PASS: packaged UniPCemu launcher configures BIOS, IDE disks, RAM, and sound')
+        env.update(UNIPCEMU_ISO=str(OUTPUT / 'retroos_grub_module.iso'),
+                   UNIPCEMU_VIDEO='et4000w32', EXPECTED_BOOTORDER='13',
+                   EXPECTED_HDD0='data.img', EXPECTED_HDD1='',
+                   EXPECTED_CDROM='retroos.iso', EXPECTED_VIDEO='6', EXPECTED_ET4000='1',
+                   EXPECTED_SOUNDBLASTER='4')
+        subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
+                       cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
+        print('PASS: packaged UniPCemu launcher requires a BIOS ROM and configures HDD/CD and video')
         # No Bazel invocation: this launcher must consume only the release.
         cases = [('bios', cpu, hd) for cpu in ('386', '686') for hd in ('ata', 'ahci', 'nvme')]
         cases += [('uefi', 'x64', hd) for hd in ('ata', 'ahci', 'nvme')]
