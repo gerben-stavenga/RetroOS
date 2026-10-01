@@ -189,6 +189,7 @@ fn render_frame(
         content.resize(need, 0);
     }
     pal.sync(frame.palette, frame.dac_mask, content_format, pal_cache);
+    pal.sync_planar(&TEXT_AC);
     for sy in 0..h {
         vga::render_row(frame, sy, pal, &mut content[sy * w..(sy + 1) * w]);
     }

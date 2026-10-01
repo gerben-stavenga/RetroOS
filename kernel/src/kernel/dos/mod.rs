@@ -104,10 +104,12 @@ const TF_DELAY: u8 = 4;
 pub struct LaunchPolicy {
     pub viopl: u8,
     pub xms32k: bool,
+    /// A program forked by the outer COMMAND.COM may run nested /C shells.
+    pub tsr_session: bool,
 }
 
 impl Default for LaunchPolicy {
-    fn default() -> Self { Self { viopl: 1, xms32k: false } }
+    fn default() -> Self { Self { viopl: 1, xms32k: false, tsr_session: false } }
 }
 
 impl LaunchPolicy {
@@ -116,6 +118,7 @@ impl LaunchPolicy {
         Self {
             viopl: match cx as u8 { 2 => 2, 3 => 3, _ => 1 },
             xms32k: cx & 0x0100 != 0,
+            tsr_session: false,
         }
     }
 }
@@ -153,6 +156,10 @@ pub struct DosState<A: crate::Arch> {
     /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
     pub last_child_exit_status: u16,
     pub exec_parent: Option<ExecParent>,
+    /// A DOS session begun by the outer /C or /B shell. Nested interpreters
+    /// EXEC in this address space so resident code and interrupt hooks remain
+    /// visible until the launched program exits.
+    pub tsr_session: bool,
     pub xms: Option<alloc::boxed::Box<xms::XmsState>>,
     pub ems: Option<alloc::boxed::Box<ems::EmsState>>,
     /// One committed extended-memory pool shared by XMS, EMS and every DPMI
@@ -297,6 +304,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).int09_registers).write([0; 11]);
             core::ptr::addr_of_mut!((*p).last_child_exit_status).write(0);
             core::ptr::addr_of_mut!((*p).exec_parent).write(None);
+            core::ptr::addr_of_mut!((*p).tsr_session).write(false);
             core::ptr::addr_of_mut!((*p).xms).write(None);
             core::ptr::addr_of_mut!((*p).ems).write(None);
             core::ptr::addr_of_mut!((*p).memory).write(memory::DosMemory::new());
@@ -1324,6 +1332,7 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         thread::Personality::Dos(d) => d,
         _ => unreachable!("just set Dos personality"),
     };
+    dos_state.tsr_session = policy.tsr_session;
     dos_state.pc.vga.initialize_active_address_space(machine);
     dpmi::install_kernel_ldt_slots(dos_state);
     dos_state.dfs.init_from_vfs(&parent_cwd);

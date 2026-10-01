@@ -298,6 +298,11 @@ pub fn init(info: &arch::MultibootInfo, screen: &mut lib::term::Term) {
             .fill(0x0720);
     }
 
+    // The terminal owns its text grid; mapping its old VGA aperture does not
+    // copy those cells into GOP pixels. Publish the boot backlog immediately
+    // so the cleared framebuffer does not stay black until the first program.
+    panic_present();
+
     // The mapped framebuffer is adopted by `platform::probe`; only the owning
     // `Display` can present into it from this point on.
 }

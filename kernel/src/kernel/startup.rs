@@ -79,6 +79,7 @@ fn prepare_startup<A: crate::Arch>(
     // firmware calls; DOS personalities receive their separate substitute BIOS.
     let mut bios_workspace = crate::kernel::bios_display::BiosDisplayWorkspace::new(machine);
     let mut screen = select_display(machine, &mut bios_workspace, display);
+    screen.present(machine, &mut bios_workspace);
 
     let disks = apply_disk_policy(disks, boot.ram_overlay, &mut screen);
     // The thread table is a plain owned Vec now (fixed MAX_THREADS slots,
@@ -86,6 +87,7 @@ fn prepare_startup<A: crate::Arch>(
     // run_program → event_loop. No global; no `&'static mut`.
     let threads = crate::kernel::thread::init_threading();
     crate::compact_screenln!(&mut screen, "Threading initialized");
+    screen.present(machine, &mut bios_workspace);
 
     prepare_storage(
         machine,
@@ -95,12 +97,14 @@ fn prepare_startup<A: crate::Arch>(
         &mut screen,
         &mut bios_workspace,
     );
+    screen.present(machine, &mut bios_workspace);
 
     let PreparedAudio {
         master_env,
         sb_card,
         sink,
     } = prepare_audio(machine, boot, audio, &mut screen, &mut bios_workspace);
+    screen.present(machine, &mut bios_workspace);
 
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);

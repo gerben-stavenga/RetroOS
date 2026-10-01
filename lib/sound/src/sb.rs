@@ -211,6 +211,8 @@ pub struct Start {
     /// 8 or 16 bits per sample — also which DMA channel the host should read.
     pub bits: u8,
     pub stereo: bool,
+    /// SB16 mode byte bit 4; legacy 8-bit commands use unsigned samples.
+    pub signed: bool,
     /// Single-cycle (play once, IRQ, stop) vs auto-init (loop the ring).
     pub single: bool,
     /// Transfer length carried by the command itself, when it had one.
@@ -247,6 +249,8 @@ pub struct DspState {
     /// 8 or 16 bits per sample — also which DMA channel carries it.
     pub bits: u8,
     pub stereo: bool,
+    /// Sample encoding selected by the last playback command.
+    pub signed: bool,
     /// Single-cycle vs auto-init, as the start command chose.
     pub single: bool,
     /// DSP block size (0x48), in transfers minus one.
@@ -311,6 +315,7 @@ pub struct Sb {
     rate: u32,        // output sample rate (Hz)
     bits: u8,         // 8 or 16
     stereo: bool,     // false = mono, true = interleaved L/R
+    signed: bool,     // SB16 DMA sample encoding
     block_param: u16, // DSP block size set by 0x48 (transfers − 1)
     /// Single-cycle DMA (DSP 0x14/0x91/0xC0/0xB0 without the auto-init bit):
     /// play the buffer ONCE, raise the IRQ at the end, then stop — vs auto-init
@@ -381,7 +386,7 @@ impl Sb {
             mixer_index: 0, mixer: Mixer::new(), irq_status: 0, trigger_irq: 0,
             speaker: false,
             playing: false, paused: false,
-            rate: 22050, bits: 8, stereo: false, block_param: 0,
+            rate: 22050, bits: 8, stereo: false, signed: false, block_param: 0,
             single: false,
             buf_gpa: 0, buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
@@ -599,16 +604,16 @@ impl Sb {
             // 0x14 carries its single-cycle transfer length in the command.
             // 0x91 has no length parameters and falls back to the DMA count.
             0x1C | 0x90 => {
-                return Some(Start { bits: 8, stereo: false, single: false, block_override: None });
+                return Some(Start { bits: 8, stereo: false, signed: false, single: false, block_override: None });
             }
             0x14 => {
                 return Some(Start {
-                    bits: 8, stereo: false, single: true,
+                    bits: 8, stereo: false, signed: false, single: true,
                     block_override: Some((p[0] as u16) | ((p[1] as u16) << 8)),
                 });
             }
             0x91 => {
-                return Some(Start { bits: 8, stereo: false, single: true, block_override: None });
+                return Some(Start { bits: 8, stereo: false, signed: false, single: true, block_override: None });
             }
             // SB16 8-/16-bit output: mode byte + 16-bit length. Opcode bit 2
             // selects auto-init; bit 1 independently enables FIFO. HMI uses
@@ -618,6 +623,7 @@ impl Sb {
                 return Some(Start {
                     bits: 8,
                     stereo: p[0] & 0x20 != 0,
+                    signed: p[0] & 0x10 != 0,
                     single: cmd & 0x04 == 0,
                     block_override: Some((p[1] as u16) | ((p[2] as u16) << 8)),
                 });
@@ -626,6 +632,7 @@ impl Sb {
                 return Some(Start {
                     bits: 16,
                     stereo: p[0] & 0x20 != 0,
+                    signed: p[0] & 0x10 != 0,
                     single: cmd & 0x04 == 0,
                     block_override: Some((p[1] as u16) | ((p[2] as u16) << 8)),
                 });
@@ -643,6 +650,7 @@ impl Sb {
     pub fn begin(&mut self, s: Start, gpa: u32, len_bytes: u32) {
         self.bits = s.bits;
         self.stereo = s.stereo;
+        self.signed = s.signed;
         self.single = s.single;
         self.paused = false;
         if let Some(b) = s.block_override {
@@ -862,6 +870,7 @@ impl Sb {
             rate: self.rate,
             bits: self.bits,
             stereo: self.stereo,
+            signed: self.signed,
             single: self.single,
             block: self.block_param,
             speaker: self.speaker,
@@ -926,8 +935,8 @@ impl Sb {
     }
 
     /// Decode source frame `i` of a fetched window into canonical i16 stereo.
-    /// SB DMA is 8-bit unsigned or 16-bit signed little-endian; mono
-    /// duplicates.
+    /// The SB16 mode byte chooses signed or unsigned PCM at either width;
+    /// legacy 8-bit commands are unsigned. Mono duplicates.
     fn frame(&self, src: &[u8], i: usize) -> (i16, i16) {
         let wide = self.bits == 16;
         let sw = if wide { 2usize } else { 1 };
@@ -936,10 +945,12 @@ impl Sb {
             if wide {
                 let lo = *src.get(b).unwrap_or(&0) as u16;
                 let hi = *src.get(b + 1).unwrap_or(&0) as u16;
-                (lo | (hi << 8)) as i16
+                let sample = lo | (hi << 8);
+                (sample ^ if self.signed { 0 } else { 0x8000 }) as i16
             } else {
-                // 8-bit unsigned (bias 0x80) → signed, scaled to 16-bit.
-                ((*src.get(b).unwrap_or(&128) as i16) - 128) << 8
+                let silence = if self.signed { 0 } else { 128 };
+                let sample = *src.get(b).unwrap_or(&silence);
+                ((sample ^ if self.signed { 0 } else { 0x80 }) as i8 as i16) << 8
             }
         };
         let base = i * stride;
@@ -1090,11 +1101,43 @@ mod tests {
     use super::{Sb, Start};
 
     fn sb16_command(sb: &mut Sb, command: u8) -> Start {
+        sb16_command_mode(sb, command, 0x30)
+    }
+
+    fn sb16_command_mode(sb: &mut Sb, command: u8, mode: u8) -> Start {
         let dsp = sb.io_base + 0x0C;
         assert!(sb.port_write(dsp, command, 0).is_none());
-        assert!(sb.port_write(dsp, 0x30, 0).is_none()); // signed stereo
+        assert!(sb.port_write(dsp, mode, 0).is_none());
         assert!(sb.port_write(dsp, 0xFF, 0).is_none());
         sb.port_write(dsp, 0x03, 0).expect("SB16 start command did not complete")
+    }
+
+    #[test]
+    fn sb16_dma_mode_controls_sample_signedness() {
+        let mut sb = Sb::new();
+        let unsigned16 = sb16_command_mode(&mut sb, 0xB0, 0x00);
+        assert!(!unsigned16.signed);
+        sb.begin(unsigned16, 0x1000, 8);
+        assert_eq!(sb.frame(&[0x00, 0x80], 0), (0, 0));
+        assert_eq!(sb.frame(&[0x00, 0x00], 0), (i16::MIN, i16::MIN));
+        assert_eq!(sb.frame(&[0xFF, 0xFF], 0), (i16::MAX, i16::MAX));
+        assert!(!sb.dsp_state().signed);
+
+        let signed16 = sb16_command_mode(&mut sb, 0xB0, 0x10);
+        assert!(signed16.signed);
+        sb.begin(signed16, 0x1000, 8);
+        assert_eq!(sb.frame(&[0x00, 0x00], 0), (0, 0));
+        assert_eq!(sb.frame(&[0x00, 0x80], 0), (i16::MIN, i16::MIN));
+
+        let signed8 = sb16_command_mode(&mut sb, 0xC0, 0x10);
+        sb.begin(signed8, 0x1000, 8);
+        assert_eq!(sb.frame(&[0x00], 0), (0, 0));
+        assert_eq!(sb.frame(&[0x80], 0), (i16::MIN, i16::MIN));
+
+        let unsigned8 = sb16_command_mode(&mut sb, 0xC0, 0x00);
+        sb.begin(unsigned8, 0x1000, 8);
+        assert_eq!(sb.frame(&[0x80], 0), (0, 0));
+        assert_eq!(sb.frame(&[0x00], 0), (i16::MIN, i16::MIN));
     }
 
     #[test]
@@ -1161,7 +1204,7 @@ mod tests {
         let short = {
             let mut sb = Sb::new();
             // 8237 armed for 256 bytes; DSP command carries length-1 = 0.
-            sb.begin(Start { bits: 8, stereo: false, single: true,
+            sb.begin(Start { bits: 8, stereo: false, signed: false, single: true,
                              block_override: Some(0) }, 0x1000, 256);
             sb.cursor = sb.block_frames as u64; // the DSP's one transfer
             sb.finish_single(1);
@@ -1173,7 +1216,7 @@ mod tests {
 
         // The agreeing case — every real driver — still latches TC.
         let mut whole = Sb::new();
-        whole.begin(Start { bits: 8, stereo: false, single: true,
+        whole.begin(Start { bits: 8, stereo: false, signed: false, single: true,
                             block_override: Some(255) }, 0x1000, 256);
         whole.cursor = whole.block_frames as u64;
         whole.finish_single(1);

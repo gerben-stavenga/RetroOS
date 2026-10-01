@@ -130,13 +130,15 @@ impl NativeSb {
             // opcode; 16-bit ones carry it in a mode byte.
             if st.bits == 16 {
                 dsp_write(machine, base, if st.single { 0xB0 } else { 0xB6 });
-                // bit5 stereo, bit4 signed — 16-bit DMA is always signed.
-                dsp_write(machine, base, 0x10 | if st.stereo { 0x20 } else { 0 });
+                // Preserve the guest's SB16 mode byte across card handoff.
+                dsp_write(machine, base, (if st.signed { 0x10 } else { 0 })
+                    | (if st.stereo { 0x20 } else { 0 }));
                 dsp_write(machine, base, st.block as u8);
                 dsp_write(machine, base, (st.block >> 8) as u8);
             } else {
                 dsp_write(machine, base, if st.single { 0xC0 } else { 0xC6 });
-                dsp_write(machine, base, if st.stereo { 0x20 } else { 0 });
+                dsp_write(machine, base, (if st.signed { 0x10 } else { 0 })
+                    | (if st.stereo { 0x20 } else { 0 }));
                 dsp_write(machine, base, st.block as u8);
                 dsp_write(machine, base, (st.block >> 8) as u8);
             }

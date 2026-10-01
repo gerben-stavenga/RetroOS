@@ -364,6 +364,12 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
             }
         }
         0x21 => int_21h(machine, kt, dos, regs, &mut suspension),
+        // DOS 1.x TSR entry: DX is the byte offset of the first byte after
+        // the resident image, measured from the PSP segment.
+        0x27 => {
+            let keep = (regs.rdx as u16).div_ceil(16).max(0x10);
+            terminate_resident(machine, dos, regs, keep)
+        }
         0x33 => int_33h(machine, dos, regs),
         // INT 25h/26h — Absolute Disk Read/Write — return error
         0x25 | 0x26 => {
@@ -409,7 +415,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
     let vector = ((ip.wrapping_sub(2)) / 2) as u8;
 
     match vector {
-        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
+        0x13 | 0x20 | 0x21 | 0x25 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2E | 0x2F | 0x33 | 0x67 => {
             // DOS keeps the interrupted register frame in the current PSP.
             // A manually loaded child created with AH=55h returns through
             // its parent's saved frame when it terminates.
@@ -831,6 +837,15 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         0x0A => {
             lib::log::debug_byte(regs.rax as u8);
             regs.rax &= !0xFFFF;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
+        // AH=0Bh — SYNTH_TSR_SESSION. AL=0 queries, AL=1 sets.
+        // Forked DOS children start with this mark; /B also sets it when
+        // launched directly. A nested COMMAND.COM uses ordinary DOS EXEC.
+        0x0B => {
+            if regs.rax as u8 == 1 { dos.tsr_session = true; }
+            regs.rax = (regs.rax & !0xFFFF) | u64::from(dos.tsr_session);
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
@@ -1538,6 +1553,44 @@ fn return_to_psp_parent<A: crate::Arch>(
     true
 }
 
+/// Terminate a DOS program while retaining `keep` paragraphs from its PSP.
+/// INT 27h and INT 21h/AH=31h differ only in how that count is supplied.
+fn terminate_resident<A: crate::Arch>(
+    machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs, keep: u16,
+) -> thread::KernelAction {
+    if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
+        && let Some(parent) = dos.exec_parent.take()
+    {
+        // Keep is measured from the *child's* PSP, not from the parent's
+        // heap seg. They differ by the env block + MCB overhead
+        // (ENV_PARAS + 2). Using parent.heap_seg here under-counts
+        // and leaves the gap between (parent.heap_seg + keep) and
+        // the actual resident-block end available for subsequent
+        // allocs — overlapping the still-live TSR's image+stack.
+        let child_psp_seg = dos.current_psp;
+        // Termination type 03h (TSR) | return code in AL.
+        dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
+        // TSR: preserve child's PM env (LDT/dpmi/pm_vectors) so a
+        // DPMI host installer like Borland's dpmiload — which
+        // calls dpmi_enter, sets up host services, switches back
+        // to RM via 0306, then TSRs — leaves the PM session usable
+        // by subsequent programs that enter via the raw-switch
+        // trampoline.
+        let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
+        dos_keep_resident_block(machine, dos, regs, child_psp_seg, keep, child_psp_seg);
+        return action;
+    }
+    let status = 0x0300 | u16::from(regs.rax as u8);
+    if return_to_psp_parent(machine, dos, regs, status, Some(keep)) {
+        return thread::KernelAction::Done;
+    }
+    // Cross-thread TSR. Encode termination type 03h
+    // | AL into exit_code so the parent's last_child_exit_status
+    // (set by exit_thread) carries the TSR marker per AH=4Dh spec.
+    let code = regs.rax as u8;
+    thread::KernelAction::Exit(0x0300 | (code as i32))
+}
+
 fn int_21h<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
@@ -2006,39 +2059,8 @@ fn int_21h<A: crate::Arch>(
         // remain valid because the IVT is part of the address space and the
         // child's code at heap_seg+offset is still mapped.
         0x31 => {
-            if dos.exec_parent.as_ref().is_some_and(|parent| parent.child_psp == dos.current_psp)
-                && let Some(parent) = dos.exec_parent.take()
-            {
-                let keep = regs.rdx as u16;
-                // DX is paragraphs from the *child's* PSP, not from parent's
-                // heap seg. They differ by the env block + MCB overhead
-                // (ENV_PARAS + 2). Using parent.heap_seg here under-counts
-                // and leaves the gap between (parent.heap_seg + keep) and
-                // the actual resident-block end available for subsequent
-                // allocs — overlapping the still-live TSR's image+stack.
-                let child_psp_seg = dos.current_psp;
-                // Termination type 03h (TSR) | return code in AL.
-                dos.last_child_exit_status = 0x0300 | (regs.rax as u8) as u16;
-                // TSR: preserve child's PM env (LDT/dpmi/pm_vectors) so a
-                // DPMI host installer like Borland's dpmiload — which
-                // calls dpmi_enter, sets up host services, switches back
-                // to RM via 0306, then TSRs — leaves the PM session usable
-                // by subsequent programs that enter via the raw-switch
-                // trampoline.
-                let action = exec_return(machine, dos, regs, parent, /*preserve_pm_env=*/true);
-                dos_keep_resident_block(machine, dos, regs, child_psp_seg, keep, child_psp_seg);
-                return action;
-            }
-            let status = 0x0300 | u16::from(regs.rax as u8);
             let keep = regs.rdx as u16;
-            if return_to_psp_parent(machine, dos, regs, status, Some(keep)) {
-                return thread::KernelAction::Done;
-            }
-            // Cross-thread TSR. Encode termination type 03h
-            // | AL into exit_code so the parent's last_child_exit_status
-            // (set by exit_thread) carries the TSR marker per AH=4Dh spec.
-            let code = regs.rax as u8;
-            return thread::KernelAction::Exit(0x0300 | (code as i32));
+            return terminate_resident(machine, dos, regs, keep);
         }
         // AH=0x48: Allocate memory (BX=paragraphs needed)
         0x48 => {
@@ -3504,7 +3526,7 @@ fn dos_open_program<A: crate::Arch>(kt: &mut thread::KernelThread<A>, dos: &mut 
 
 /// Resolve path and return ForkExec action for the event loop to execute.
 /// Synth ABI: on success BX=child_tid, CF=0. On error AX=errno, CF=1.
-fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], policy: super::LaunchPolicy, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
+fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cmdtail: &[u8], mut policy: super::LaunchPolicy, regs: &mut Regs, _kt: &mut thread::KernelThread<A>) -> thread::KernelAction {
     // Verify the file exists (DFS resolve → VFS → would-be open); ENOENT else.
     if dfs_open_existing(dos, prog_name).is_err() {
         regs.rax = (regs.rax & !0xFFFF) | 2; // ENOENT
@@ -3542,6 +3564,9 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
     let mut cmdtail_buf = [0u8; 128];
     let cmdtail_len = cmdtail.len().min(127);
     cmdtail_buf[..cmdtail_len].copy_from_slice(&cmdtail[..cmdtail_len]);
+    // This fork establishes a new DOS session. Its later INT 21h EXEC calls
+    // (including nested COMMAND.COM /C) must share its resident memory.
+    policy.tsr_session = true;
 
     thread::KernelAction::ForkExec {
         path,
@@ -3561,9 +3586,9 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
 /// Loads a .COM or MZ .EXE into a fresh child segment above `heap_seg`,
 /// shares the address space with the parent, and transfers control.
 /// Parent resumes via exec_return on child INT 20h / 4C00.
-/// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C
-/// which interprets BAT itself and uses synth INT 31h AH=01h to
-/// fork+exec+wait each external command in a separate thread.
+/// Non-DOS formats (ELF, BAT) should be routed through COMMAND.COM /C.
+/// A batch shell keeps its DOS children in this address space so resident
+/// drivers remain visible; standalone commands may fork into new threads.
 fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let al = regs.rax as u8;
     match al {

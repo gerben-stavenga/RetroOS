@@ -17,6 +17,7 @@
  *   AH=06h VGA_NEEDS_MODE3   -> AL=0 standard text / AL=1 normalize.
  *   AH=02/03h TRACE_ON/OFF
  *   AH=0Ah LOG_BYTE          AL=byte (kernel log only, never VGA)
+ *   AH=0Bh TSR_SESSION       AL=0 query / AL=1 mark this address space
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in
  * dispatch all live here.
@@ -52,10 +53,10 @@ static union REGS r;
 static struct SREGS s;
 static int echo_on = 1;
 static int should_exit = 0;     /* set by EXIT builtin to break out of BAT */
-/* Nonzero while a .BAT is being interpreted. Batch lines run in THIS address
- * space (in-process EXEC) rather than forking, so a TSR loaded by one line is
- * still resident for the next — see dispatch_external. */
-static int in_batch = 0;
+/* Nonzero while a .BAT is being interpreted, or when this one-shot shell is
+ * EXEC'd inside an existing TSR session. External commands then run in THIS
+ * address space so resident drivers survive nested launches. */
+static int in_session = 0;
 static const char empty_str[] = "";
 
 /* ----- thin INT wrappers ----- */
@@ -436,6 +437,15 @@ static void synth_set_policy(unsigned int policy) {
     int86(0x31, &r, &r);
 }
 
+/* Session mark: 0=query, 1=set. A forked DOS child starts marked, so nested
+ * COMMAND.COM instances use normal DOS EXEC in the child's address space. */
+static int synth_tsr_session(int enable) {
+    r.h.ah = 0x0B;
+    r.h.al = (unsigned char)(enable ? 1 : 0);
+    int86(0x31, &r, &r);
+    return (int)r.h.al;
+}
+
 static int synth_waitpid(int pid) {
     r.h.ah = 0x04;
     r.x.bx = (unsigned)pid;
@@ -591,7 +601,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
          * with all of conventional memory, runs the lines in-process inside
          * it, and takes the TSR down with it when the batch ends. Already
          * inside a batch (nested .BAT) we are that child, so run it inline. */
-        if (in_batch) return run_bat_file(resolved);
+        if (in_session) return run_bat_file(resolved);
         prog_idx -= 2;   /* claim the two scratch slots for the trampoline */
         argv[prog_idx] = command_com_path;
         argv[prog_idx + 1] = "/B";
@@ -642,7 +652,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
         argv[prog_idx] = command_com_path;
         argv[prog_idx + 1] = "/L";
     }
-    /* Inside a .BAT, run the line in OUR address space instead of forking.
+    /* Inside a TSR session, run the line in OUR address space.
      *
      * A batch file is one shell session, and DOS ran each line as an
      * in-process EXEC into the single conventional-memory map. That is what
@@ -658,7 +668,7 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
      * DOS/32A prefixing above still applies — that is just a different
      * program to exec, and it works in-process unchanged.
      */
-    if (in_batch) {
+    if (in_session) {
         char tail[128];
         int rc;
         int start = (flags & LF_F_LOADFIX) ? prog_idx + 2 : prog_idx;
@@ -1228,14 +1238,14 @@ static int run_bat_file(const char *path) {
     int last = 0;
     f = fopen(path, "r");
     if (f == 0) { puts("Cannot open batch file"); return 1; }
-    in_batch++;
+    in_session++;
     while (fgets(line, sizeof(line), f) != 0) {
         int n = (int)strlen(line);
         while (n > 0 && (line[n-1] == '\r' || line[n-1] == '\n')) line[--n] = 0;
         last = run_bat_line(line);
         if (should_exit) break;
     }
-    in_batch--;
+    in_session--;
     fclose(f);
     return last;
 }
@@ -1269,6 +1279,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    in_session = synth_tsr_session(0);
+
     /* /B batfile -- batch trampoline entry. We are a fresh fork with our own
      * address space; interpret the file here so its lines (and any TSR they
      * leave resident) are confined to it. */
@@ -1277,6 +1289,7 @@ int main(int argc, char *argv[]) {
             printf("/B requires a batch file\r\n");
             return 1;
         }
+        synth_tsr_session(1);
         return run_bat_file(argv[2]);
     }
 
@@ -1296,9 +1309,8 @@ int main(int argc, char *argv[]) {
         return dos_exec_inplace(argv[2], tail);
     }
 
-    /* /C path: argv[2] is the program/builtin, argv[3..] are its args.
-     * argv[0] and argv[1] are guaranteed scratch for trampoline prefixes.
-     * Interactive launcher mode -- an OSD switch back to this task releases
-     * the still-running child and returns directly to the caller. */
+    /* /C path: the first shell forks the selected program for DN's task
+     * switching. The forked child is marked as a DOS session at creation;
+     * nested /C shells use INT 21h EXEC and share resident drivers. */
     return run_command(argv, 2, argc, 1);
 }

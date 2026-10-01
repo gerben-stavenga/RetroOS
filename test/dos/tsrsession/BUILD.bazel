@@ -1,0 +1,7 @@
+genrule(
+    name = "tsrsession_com",
+    srcs = ["tsrsession.asm"],
+    outs = ["TSRSESS.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)
