@@ -1,7 +1,7 @@
 # Booting RetroOS with GRUB
 
 There are two boot arrangements on a physical machine: boot the standalone
-USB/CD image, or add RetroOS to an existing GRUB installation. For existing
+USB image, or add RetroOS to an existing GRUB installation. For existing
 GRUB, the installer below finds disks and UUIDs with Linux, stages the matching
 kernel and RAM base module, and generates the GRUB entries. Manual deployment
 uses the same boot path. The older ext4 installer later in this document
@@ -9,13 +9,13 @@ remains available for machines that keep the runtime on their Linux root.
 
 ## Install into an existing GRUB menu
 
-Use Linux with GRUB 2 installed. The ISO supplies both the kernel and RAM base
+Use Linux with GRUB 2 installed. The USB image supplies both the kernel and RAM base
 module. Build and prepare as your normal user, review the generated entry, then
 install it as root:
 
 ```sh
 tools/install_kernel.sh --module --prepare
-# Review build/grub-module-install/<ISO hash>/grub.cfg
+# Review build/grub-module-install/<image hash>/grub.cfg
 sudo tools/install_kernel.sh --module
 ```
 
@@ -39,7 +39,7 @@ find that partition's UUID and prepare the entry with it:
 ```sh
 lsblk -o NAME,FSTYPE,UUID,PARTTYPE,MOUNTPOINTS
 tools/install_kernel.sh --module --prepare --c-uuid=ABCD-1234
-# Review build/grub-module-install/<ISO hash>/grub.cfg
+# Review build/grub-module-install/<image hash>/grub.cfg
 sudo tools/install_kernel.sh --module
 ```
 
@@ -52,8 +52,8 @@ from the RAM base module and the Btrfs boot filesystem is not C:.
 
 The installer detects whether `/boot` is separate, including a Btrfs boot
 filesystem, copies versioned files there, and installs two GRUB entries:
-protected disk and persistent disk. It does not partition or format a disk. A prebuilt ISO can be supplied
-with `--iso=/path/to/retroos_grub_module.iso`; preparation then needs no Bazel
+protected disk and persistent disk. It does not partition or format a disk. A prebuilt USB image can be supplied
+with `--image=/path/to/retroos_grub_module_usb.img`; preparation then needs no Bazel
 build. The Linux `/` filesystem is used only for discovery. RetroOS cannot
 mount Btrfs yet; with no supported physical root it uses the RAM module for
 its own `/` and C:.
@@ -65,7 +65,7 @@ base files yourself. The kernel and base image must come from the same build.
 The base image holds `C:\RETROOS`, startup defaults, and a RAM fallback C:.
 It is a GRUB Multiboot module, not a partition to extract onto the disk.
 
-Build `//:grub_module_iso` and copy these files from its `/boot` directory
+Build `//:grub_module_usb` and copy these files from its `/boot` directory
 to a directory on a filesystem GRUB can read:
 
 ```text
@@ -74,14 +74,15 @@ retroos-base.img.gz
 retroos-games.img.gz       # optional
 ```
 
-The ISO is also distributed as `retroos_grub_module.iso`. On Linux, copy from
-the ISO like this:
+The image is also distributed as `retroos_grub_module_usb.img`. On Linux,
+copy from its first FAT32 partition with mtools like this:
 
 ```sh
-sudo mkdir -p /mnt/retroos-iso /boot/retroos/manual
-sudo mount -o loop,ro retroos_grub_module.iso /mnt/retroos-iso
-sudo cp /mnt/retroos-iso/boot/kernel.elf /mnt/retroos-iso/boot/retroos-base.img.gz /boot/retroos/manual/
-sudo umount /mnt/retroos-iso
+mkdir -p /tmp/retroos-manual
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/kernel.elf /tmp/retroos-manual/
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos-base.img.gz /tmp/retroos-manual/
+sudo mkdir -p /boot/retroos/manual
+sudo cp /tmp/retroos-manual/* /boot/retroos/manual/
 findmnt -no UUID --target /boot/retroos/manual
 ```
 
@@ -317,7 +318,10 @@ the owner says.
 
 ## Booting GRUB Multiboot module images
 
-For a USB/CD boot, build `//:grub_module_iso`. Its GRUB menu contains protected
+For a USB boot, build `//:grub_module_usb` and write
+`bazel-bin/retroos_grub_module_usb.img` to the whole stick. It has an ordinary
+MBR with FAT32 EFI and data partitions; the editable menu is
+`/boot/grub/grub.cfg` on partition 1. The GRUB menu contains protected
 and persistent disk choices for the base-plus-games image, plus a base-only
 submenu with the same choices for framebuffer video (GOP on UEFI,
 VBE on BIOS). BIOS boots also offer native BIOS VGA entries, selected by
@@ -350,11 +354,13 @@ they are not permanently mapped into a size-matched kernel virtual window.
 Reads and writes use a reusable 64 KiB physical aperture immediately below the
 framebuffer. Legacy 32-bit paging and PAE both support module access; available
 physical RAM and the Multiboot address format remain the practical limits.
-Boot directly with QEMU, for example:
+Boot the USB image through QEMU's USB controller, for example:
 
 ```sh
-bazelisk build //:grub_module_iso
-qemu-system-i386 -cdrom bazel-bin/retroos_grub_module.iso
+bazelisk build //:grub_module_usb
+qemu-system-i386 -m 512 -device qemu-xhci,id=usb \
+  -drive if=none,id=stick,file=bazel-bin/retroos_grub_module_usb.img,format=raw,snapshot=on \
+  -device usb-storage,bus=usb.0,drive=stick,bootindex=1
 ```
 
 ## FAT roots

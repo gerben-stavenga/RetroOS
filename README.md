@@ -43,7 +43,9 @@ while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP
 
 - `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and prebuilt QEMU and UniPCemu launchers.
 - `retroos-machine.tar.gz` (`//:release_machine`): matched kernel/runtime and installer.
-- `SHA256SUMS` (`//:release_checksums`): checksums for both bundles.
+- `retroos_grub_module_usb.img` (`//:grub_module_usb`): editable BIOS/UEFI USB image with a fixed FAT32 partition layout.
+- `retroos-usb-diagnostic.zip` (`//:usb_diagnostic_zip`): compact USB image for boot diagnostics.
+- `SHA256SUMS` (`//:release_checksums`): checksums for all release artifacts.
 
 CI tests these artifacts and uploads them on successful runs. The bundles require
 no compiler or Bazel to use. Extract upgrades separately and preserve your existing

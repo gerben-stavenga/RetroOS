@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
-# Run representative DOS programs from the real GRUB Multiboot ISO.
+# Run representative DOS programs from the release GRUB Multiboot USB image.
 #
 # This is intentionally small: the existing hosted and raw-disk tests already
 # cover the device and program matrices.  This test only verifies that the
-# actual ISO supplies the base and games modules to the normal DOS path.
+# actual USB image supplies the base and games modules to the normal DOS path.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 
-bazelisk build //:grub_module_iso >/dev/null
+bazelisk build //:grub_module_usb >/dev/null
 
 run_program() {
     local name="$1" command="$2" log="$tmp_dir/$1.log"
@@ -21,8 +21,10 @@ run_program() {
     # handle SIGTERM promptly.
     timeout --kill-after=5s 35s qemu-system-i386 \
         -m 512 -cpu pentium3 \
-        -cdrom bazel-bin/retroos_grub_module.iso \
-        -boot order=d \
+        -device qemu-xhci,id=usb \
+        -drive if=none,id=stick,file=bazel-bin/retroos_grub_module_usb.img,format=raw,snapshot=on \
+        -device usb-storage,bus=usb.0,drive=stick,bootindex=1 \
+        -boot order=c \
         -fw_cfg "name=opt/cmdline,string=$command" \
         -debugcon "file:$log" \
         -display none -no-reboot >/dev/null 2>&1 || true
@@ -44,4 +46,4 @@ grep -q 'TC-OK' "$tmp_dir/base_probe.log"
 run_program "games_program" 'GAMES/DOOMS/DOOM.EXE'
 grep -q 'Starting GAMES/DOOMS/DOOM.EXE' "$tmp_dir/games_program.log"
 
-echo "PASS: Multiboot ISO executed base and games-module programs"
+echo "PASS: Multiboot USB image executed base and games-module programs"

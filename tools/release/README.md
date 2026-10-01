@@ -3,75 +3,94 @@
 Release builds retain panic diagnostics. Kernel panics display the message,
 source location, and stack trace on the console and mirror them to the log.
 
-## USB / CD boot: retroos_grub_module.iso
+For USB testing, use **`retroos_grub_module_usb.img`**. Its partition
+table is conventional and its GRUB configuration can be edited on the stick.
 
-This hybrid ISO boots through either legacy BIOS or UEFI. Write the ISO as a
-whole-device image using your USB imaging tool (writing it erases that USB
-stick), or attach it as a virtual CD. Merely copying the ISO onto a FAT drive
-does not make the drive bootable. Start with 256 MiB RAM; 512 MiB is recommended
-for the base-plus-games menu. The base-only submenu uses less RAM.
+## Editable USB boot: retroos_grub_module_usb.img
 
-GRUB loads the kernel and filesystem images into RAM before handing control to
-RetroOS. This works for USB boot even though RetroOS itself has no USB
-mass-storage driver. The USB stick is not a persistence destination. Firmware
-chooses BIOS or UEFI before GRUB starts; GRUB cannot change that firmware mode.
+Use this image when you need to edit GRUB settings or inspect partitions on a
+USB stick. It has a fixed MBR: partition 1 is a 128 MiB FAT32 EFI boot
+partition, and partition 2 is a 64 MiB FAT32 data partition. The menu is
+`/boot/grub/grub.cfg` on partition 1; the matching kernel and RAM modules are
+under `/boot` there. The data partition starts with a `CONFIG` directory.
+Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
 
-To add RetroOS to an existing GRUB menu by hand, copy `/boot/kernel.elf` and
-`/boot/retroos-base.img.gz` from the ISO onto a GRUB-readable filesystem. They
-must come from the same ISO. Add a GRUB `multiboot2` entry for the kernel and
-`module2 ... retroos.mount=/` for the base image. Set `retroos.c-uuid=` to the
-filesystem UUID of the intended FAT or ext4 data volume when several disks are
-present. The full example, including the firmware video policy and disk
-protection, is in
-[BOOTING.md](https://github.com/gerben-stavenga/RetroOS/blob/master/BOOTING.md#manual-grub-deployment).
+Write the IMG to the whole USB device with a disk imaging tool. This replaces
+the device's current contents. On Linux, after identifying the device with
+`lsblk`, partition 1 can be mounted as FAT32 and `boot/grub/grub.cfg` edited
+directly. On Windows, the second FAT32 partition is for ordinary files;
+editing the EFI partition requires assigning it a drive letter with an
+administrator tool. No partition resize is required for a GRUB configuration
+change. A machine's firmware still chooses BIOS or UEFI before GRUB starts.
 
-The machine bundle also has an installer for this ISO. Download both files
-from the same release into one directory, then run:
+The default framebuffer entry keeps GRUB's automatic video mode on UEFI. If
+that mode is below 640×400, try the menu's 1024×768 or 800×600 GOP entries.
+Press `c` at this image's GRUB menu and run `videoinfo` to see its modes. For
+a permanent default choice, change
+`set framebuffer_payload=auto` in `boot/grub/grub.cfg` on partition 1 to a
+listed mode such as `set framebuffer_payload=1024x768x32`. This image carries
+its own GRUB; commands missing from a different GRUB installation do not
+affect it.
+
+RetroOS does not yet have a USB mass-storage driver. It loads the kernel and
+RAM images from the stick through GRUB, but RetroOS itself cannot write to
+the USB data partition. A separate supported ATA, AHCI, or NVMe disk is needed
+for persistent RetroOS data; the protected menu entry diverts its writes to
+RAM. The USB data partition is intended for host-side files and testing the
+partition layout.
+
+## Small diagnostic USB image
+
+`retroos-usb-diagnostic.zip` contains `retroos-usb-diagnostic.img`, a base-only
+USB image for forum troubleshooting. Extract it and write the IMG to the whole
+stick. It uses the same fixed MBR and editable GRUB menu as the full image;
+the ZIP stays below the 5 MB attachment limit.
+
+## Install into an existing GRUB menu from the USB image
+
+The same USB image also supplies `/boot/kernel.elf` and
+`/boot/retroos-base.img.gz` for an existing GRUB installation. They must come
+from the same image. GRUB loads the kernel and RAM filesystem before handing
+off to RetroOS, so the source image need not remain attached afterward.
+The full manual entry, including firmware video policy and disk protection,
+is in [BOOTING.md](https://github.com/gerben-stavenga/RetroOS/blob/master/BOOTING.md#manual-grub-deployment).
+
+The machine bundle installer reads those files directly from partition 1 of
+the USB image with `mcopy` (mtools). Download both release files into one
+directory, then run:
 
 ```sh
 mkdir retroos-install
 tar -xzf retroos-machine.tar.gz -C retroos-install
 cd retroos-install
-./install.sh --module --prepare --iso="$PWD/../retroos_grub_module.iso"
+./install.sh --module --prepare --image="$PWD/../retroos_grub_module_usb.img"
 cat build/grub-module-install/*/grub.cfg
 sudo ./install.sh --module
 ```
 
 Preparation discovers GRUB's boot filesystem and supported data volumes. If
-several volumes qualify for C:, rerun the preparation command with
-`--c-uuid=<UUID>`. Use `--c-ram` to select the RAM module for C: explicitly.
-An ext4 C: volume may be unmounted during preparation; installation mounts it
-temporarily to ensure `home/retroos` exists, then unmounts it.
-Use `--c-dir=/path/on/volume` during preparation to choose another directory
-on that ext4 volume; `/home/retroos` is the default.
+several volumes qualify for C:, rerun with `--c-uuid=<UUID>`. Use `--c-ram`
+to select the RAM module for C: explicitly. An ext4 C: volume may be
+unmounted during preparation; installation mounts it temporarily to ensure
+`home/retroos` exists, then unmounts it. Use `--c-dir=/path/on/volume` to
+choose another directory on that ext4 volume; `/home/retroos` is the default.
 On a Btrfs Linux root, RAM C: is the default because RetroOS does not support
 Btrfs. The module supplies `C:\RETROOS` from RAM in every case.
 
 If `/boot` is on Btrfs and a separate FAT32 data partition should be C:,
-replace the preparation line above with:
+prepare with the FAT32 data partition's UUID, not the EFI partition's:
 
 ```sh
 lsblk -o NAME,FSTYPE,UUID,PARTTYPE,MOUNTPOINTS
-./install.sh --module --prepare --iso="$PWD/../retroos_grub_module.iso" --c-uuid=ABCD-1234
+./install.sh --module --prepare --image="$PWD/../retroos_grub_module_usb.img" --c-uuid=ABCD-1234
 ```
 
-Use the FAT32 data partition's UUID in place of `ABCD-1234`; do not choose the
-EFI System Partition. GRUB reads the kernel and base module from
-`/boot/retroos/releases/...` on Btrfs. After GRUB hands off, RetroOS uses the
-FAT32 partition for C: data and the RAM module for `C:\RETROOS`; RetroOS does
-not need to read Btrfs.
-
-The default entry protects physical disks: reads use their existing contents,
-while writes are diverted to RAM and disappear on reboot. Choose **persistent
-disk** to write to the selected data disk. On BIOS, each choice is available
-with native BIOS VGA or a VBE framebuffer; on UEFI it uses GOP. Both framebuffer
-choices use software VGA rendering. VBE is the BIOS equivalent of this display
-path, not GOP running under BIOS.
-The framebuffer console accepts 640×400 or larger RGB modes. On a 640-pixel
-mode it uses eight-pixel text cells so all 80 columns remain visible; wider
-modes use nine-pixel cells. Four short bars mean GRUB handed over a mode smaller
-than 640×400. The boot menu's automatic GOP entry keeps the firmware's current
-mode when GRUB can use it; `videoinfo` lists the modes available to GRUB.
+The default entry protects physical disks by diverting writes to RAM. Choose
+**persistent disk** to keep writes on the selected data disk. On BIOS, the
+menu offers native BIOS VGA and VBE framebuffer entries; on UEFI it uses GOP.
+The framebuffer console accepts 640×400 or larger RGB modes. Four short bars
+mean GRUB handed over a smaller mode. `videoinfo` lists the modes available
+to GRUB.
 
 ## The same C: layout across boot sources
 
@@ -116,17 +135,16 @@ Run the prebuilt disk image with:
 UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM ./run.sh --backend unipcemu
 ```
 
-To try the same CD boot and ET4000/W32i configuration discussed by the
-UniPCemu author, download `retroos_grub_module.iso` from the same release
-and run:
+To try the GRUB module boot with ET4000/W32i video in UniPCemu, use the USB
+image as its first virtual hard disk:
 
 ```sh
 UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM \
-UNIPCEMU_ISO=/path/to/retroos_grub_module.iso \
+UNIPCEMU_USB_IMAGE=/path/to/retroos_grub_module_usb.img \
 UNIPCEMU_VIDEO=et4000w32 ./run.sh --backend unipcemu
 ```
 
-The CD configuration boots the ISO and attaches `data.img` as the first hard
+The image boots as `boot.img`, with `data.img` as the second virtual hard
 disk. `UNIPCEMU_VIDEO` defaults to `vga`; `et4000w32` selects UniPCemu's
 ET4000/W32i emulation. The appropriate video option ROM, such as
 `ET4000_W32.BIN`, can also be placed in the ROM directory. Set

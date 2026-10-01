@@ -17,12 +17,27 @@ OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin'))
 
 
 def check_usb(work):
-    iso = OUTPUT / 'retroos_grub_module.iso'
-    assert iso.is_file()
+    image = OUTPUT / 'retroos_grub_module_usb.img'
+    assert image.is_file()
+    with image.open('rb') as disk:
+        mbr = disk.read(512)
+    assert mbr[510:512] == b'\x55\xaa'
+    assert struct.unpack_from('<I', mbr, 0x1B8)[0] != 0
+    assert mbr[450] == 0xEF and mbr[466] == 0x0C
+    assert struct.unpack_from('<I', mbr, 454)[0] == 2048
+    menu = subprocess.check_output(['mtype', '-i', f'{image}@@1048576',
+                                    '::/boot/grub/grub.cfg']).decode()
+    assert 'GOP 1024x768' in menu and 'GOP 800x600' in menu
+    cfg = work / 'usb-grub.cfg'
+    cfg.write_text(menu)
+    subprocess.run(['grub-script-check', str(cfg)], check=True)
     for firmware in ('bios', 'uefi'):
         log = work / f'usb-{firmware}.log'
-        args = ['qemu-system-x86_64', '-m', '512', '-cdrom', str(iso),
-                '-boot', 'order=d', '-display', 'none', '-no-reboot',
+        args = ['qemu-system-x86_64', '-m', '512',
+                '-device', 'qemu-xhci,id=usb',
+                '-drive', f'if=none,id=usbdisk,file={image},format=raw,snapshot=on',
+                '-device', 'usb-storage,bus=usb.0,drive=usbdisk,bootindex=1',
+                '-boot', 'order=c', '-display', 'none', '-no-reboot',
                 '-debugcon', 'file:' + str(log),
                 '-fw_cfg', 'name=opt/cmdline,string=TESTS/HELLO.COM']
         if firmware == 'bios':
@@ -50,7 +65,7 @@ def check_usb(work):
         assert 'Disk writes: volatile RAM overlay' in text, text
         expected = 'vga_passthrough=true firmware=NativeBios' if firmware == 'bios' else 'vga_passthrough=false firmware=Substitute'
         assert expected in text, text
-        print(f'PASS: published USB/CD ISO {firmware}, protected default, RAM C:')
+        print(f'PASS: published USB image {firmware}, protected default, RAM C:')
 
 
 def main():
@@ -61,15 +76,15 @@ def main():
         work = Path(temp)
         with zipfile.ZipFile(OUTPUT / 'retroos-usb-diagnostic.zip') as archive:
             assert archive.testzip() is None
-            archive.extract('retroos-usb-diagnostic.iso', work)
+            archive.extract('retroos-usb-diagnostic.img', work)
         assert (OUTPUT / 'retroos-usb-diagnostic.zip').stat().st_size < 5_000_000
-        subprocess.run(['xorriso', '-osirrox', 'on', '-indev',
-                        str(work / 'retroos-usb-diagnostic.iso'), '-extract',
-                        '/boot/grub/grub.cfg', str(work / 'lightweight-grub.cfg')],
-                       check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        menu = (work / 'lightweight-grub.cfg').read_text()
+        menu = subprocess.check_output(['mtype', '-i',
+                                        f'{work / "retroos-usb-diagnostic.img"}@@1048576',
+                                        '::/boot/grub/grub.cfg']).decode()
         assert 'boot_choices base' in menu and 'isa-lpc=disappointment' in menu
         assert 'boot-log-only isa-lpc=disappointment' in menu
+        assert 'boot_modules games ' not in menu
+        (work / 'lightweight-grub.cfg').write_text(menu)
         subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
         print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
         check_usb(work)
@@ -79,6 +94,14 @@ def main():
                 archive.extractall(dest, filter='data')
         module_installer = machine / 'tools/grub_module_install.py'
         assert module_installer.is_file(), 'machine bundle is missing the existing-GRUB module installer'
+        spec = importlib.util.spec_from_file_location('module_install', module_installer)
+        module_install = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module_install)
+        usb_image = OUTPUT / 'retroos_grub_module_usb.img'
+        module_install.extract_boot_file(usb_image, 'kernel.elf', work / 'usb-kernel.elf')
+        module_install.extract_boot_file(usb_image, 'retroos-base.img.gz', work / 'usb-base.img.gz')
+        assert (work / 'usb-kernel.elf').read_bytes()[:4] == b'\x7fELF'
+        assert (work / 'usb-base.img.gz').read_bytes()[:2] == b'\x1f\x8b'
         assert os.access(vm / 'run.sh', os.X_OK)
         assert (vm / 'data.img').stat().st_mode & 0o200
         with (vm / 'data.img').open('rb') as disk:
@@ -137,8 +160,8 @@ assert settings['video']['videocard'] == os.environ['EXPECTED_VIDEO']
 assert settings['video']['ET4000_extensions'] == os.environ['EXPECTED_ET4000']
 assert (root / 'ROM/BIOSROM.i430fx.BIN').read_bytes() == b'test ROM'
 assert (root / 'disks/data.img').resolve() == Path(os.environ['RETROOS_DATA_IMAGE']).resolve()
-if os.environ['EXPECTED_CDROM']:
-    assert (root / 'disks/retroos.iso').resolve() == Path(os.environ['UNIPCEMU_ISO']).resolve()
+if os.environ.get('EXPECTED_BOOT_IMAGE'):
+    assert (root / 'disks/boot.img').resolve() == Path(os.environ['EXPECTED_BOOT_IMAGE']).resolve()
 assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLASTER']
 ''')
         fake_unipcemu.chmod(0o755)
@@ -155,14 +178,15 @@ assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLAST
                        EXPECTED_CDROM='', EXPECTED_VIDEO='0', EXPECTED_ET4000='0')
             subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu', '--sound', sound],
                            cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
-        env.update(UNIPCEMU_ISO=str(OUTPUT / 'retroos_grub_module.iso'),
-                   UNIPCEMU_VIDEO='et4000w32', EXPECTED_BOOTORDER='13',
-                   EXPECTED_HDD0='data.img', EXPECTED_HDD1='',
-                   EXPECTED_CDROM='retroos.iso', EXPECTED_VIDEO='6', EXPECTED_ET4000='1',
+        env.update(UNIPCEMU_USB_IMAGE=str(usb_image),
+                   EXPECTED_BOOT_IMAGE=str(usb_image),
+                   UNIPCEMU_VIDEO='et4000w32', EXPECTED_BOOTORDER='14',
+                   EXPECTED_HDD0='boot.img', EXPECTED_HDD1='data.img',
+                   EXPECTED_CDROM='', EXPECTED_VIDEO='6', EXPECTED_ET4000='1',
                    EXPECTED_SOUNDBLASTER='4')
         subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
                        cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
-        print('PASS: packaged UniPCemu launcher requires a BIOS ROM and configures HDD/CD and video')
+        print('PASS: packaged UniPCemu launcher requires a BIOS ROM and configures USB image as HDD and video')
         # No Bazel invocation: this launcher must consume only the release.
         cases = [('bios', cpu, hd) for cpu in ('386', '686') for hd in ('ata', 'ahci', 'nvme')]
         cases += [('uefi', 'x64', hd) for hd in ('ata', 'ahci', 'nvme')]

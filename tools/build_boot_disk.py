@@ -159,7 +159,8 @@ def install_grub_bios(image, work, grub_lib):
 
 
 def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
-                        kernel, boot_tree, efi_binary):
+                        kernel, boot_tree, efi_binary, root_kernel=True,
+                        grub_modules=None):
     """Format p1 in place and populate it with mtools (no mounting)."""
     env = dict(os.environ, MTOOLSRC=mtools_cfg(work))
     at = "%s@@%d" % (image, start * SECTOR)
@@ -178,7 +179,9 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
         mmd(d)
     mcopy(cfg, "/boot/grub/grub.cfg")
     mods = [os.path.join(grub_lib, m) for m in sorted(os.listdir(grub_lib))
-            if m.endswith((".mod", ".lst")) or m == "modinfo.sh"]
+            if m.endswith(".lst") or (m == "modinfo.sh" and grub_modules is None)
+            or (m.endswith(".mod") and
+                (grub_modules is None or m[:-4] in grub_modules))]
     run(["mcopy", "-D", "o", "-i", at] + mods + ["::/boot/grub/i386-pc/"],
         env=env)
 
@@ -187,7 +190,8 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
     mmd("/EFI/BOOT")
     mcopy(efi_binary, "/EFI/BOOT/BOOTX64.EFI")
 
-    mcopy(kernel, "/kernel.elf")
+    if root_kernel:
+        mcopy(kernel, "/kernel.elf")
 
     # The DOS userland published as C:\RETROOS in the dev loop.  The tree is
     # copied at the volume root and already carries its own RETROOS/ prefix, so

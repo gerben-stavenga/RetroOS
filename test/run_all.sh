@@ -29,6 +29,7 @@ qemu_prop() { have qemu-system-i386 && [ -e apps-proprietary ]; }
 bazel_tool() { have bazelisk || have bazel; }
 module_tools() { have bazelisk && have debugfs && have mkfs.ext4; }
 module_qemu() { module_tools && have qemu-system-i386; }
+module_usb_qemu() { module_qemu && have grub-mkstandalone && have mformat && have mcopy && have mmd && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
 python3_test() { have python3; }
 qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
@@ -160,7 +161,7 @@ run machine_layout machine_layout python3 test/machine_layout.py
 run dn_state     dn_state  python3 test/dn_state.py
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh
-run module_program module_qemu   bash test/grub_module_program.sh
+run module_program module_usb_qemu   bash test/grub_module_program.sh
 # --- Hosted TCG: no QEMU / KVM / proprietary needed (CI-safe) ---------------
 run hosted_games -         env ENGINE=tcg bash test/hosted_games.sh
 run lfn          -         env ENGINE=tcg python3 test/lfn.py

@@ -1,7 +1,7 @@
 # UniPCemu uses SETTINGS.INI and images under its UNIPCEMU data directory.
 # The emulator may rewrite settings on exit, so keep its whole directory in WORK.
 launch() {
-    local vm="$WORK/unipcemu" binary rom_dir iso video_card=0 et4000_extensions=0
+    local vm="$WORK/unipcemu" binary rom_dir usb_image video_card=0 et4000_extensions=0
     binary="${UNIPCEMU_BIN:-$(command -v UniPCemu || command -v unipcemu || true)}"
     [ -n "$binary" ] || fail "UniPCemu executable not found; set UNIPCEMU_BIN"
     rom_dir="${UNIPCEMU_ROM_DIR:-}"
@@ -9,10 +9,10 @@ launch() {
     if ! compgen -G "$rom_dir/BIOSROM*.BIN" > /dev/null; then
         fail "no BIOSROM*.BIN in UNIPCEMU_ROM_DIR: $rom_dir"
     fi
-    iso="${UNIPCEMU_ISO:-}"
-    if [ -n "$iso" ]; then
-        [ "$FREEDOS" = 0 ] || fail "UNIPCEMU_ISO cannot be used with --freedos"
-        [ -f "$iso" ] || fail "UniPCemu ISO does not exist: $iso"
+    usb_image="${UNIPCEMU_USB_IMAGE:-}"
+    if [ -n "$usb_image" ]; then
+        [ "$FREEDOS" = 0 ] || fail "UNIPCEMU_USB_IMAGE cannot be used with --freedos"
+        [ -f "$usb_image" ] || fail "UniPCemu USB image does not exist: $usb_image"
     fi
     case "${UNIPCEMU_VIDEO:-vga}" in
         vga) ;;
@@ -24,20 +24,17 @@ launch() {
     if [ "$FREEDOS" = 1 ]; then
         ln -s "$DATA_IMAGE" "$vm/disks/boot.img"
     else
-        ln -s "$BOOT_IMAGE" "$vm/disks/boot.img"
+        if [ -n "$usb_image" ]; then
+            ln -s "$(realpath "$usb_image")" "$vm/disks/boot.img"
+        else
+            ln -s "$BOOT_IMAGE" "$vm/disks/boot.img"
+        fi
         ln -s "$DATA_IMAGE" "$vm/disks/data.img"
     fi
     local second_disk=data.img soundblaster=4
     [ "$FREEDOS" = 0 ] || second_disk=
     [ "$SOUND" = sb ] || soundblaster=0
     local first_disk=boot.img cdrom= boot_order=14
-    if [ -n "$iso" ]; then
-        ln -s "$(realpath "$iso")" "$vm/disks/retroos.iso"
-        first_disk=data.img
-        second_disk=
-        cdrom=retroos.iso
-        boot_order=13
-    fi
     cat > "$vm/SETTINGS.INI" <<CFG
 [general]
 firstrun=0

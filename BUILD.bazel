@@ -500,27 +500,24 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# Conventional USB disk for editing GRUB settings and inspecting partitions
+# with fdisk/Windows, and for the public GRUB module release.
 genrule(
-    name = "grub_module_iso",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
-    outs = ["retroos_grub_module.iso"],
-    cmd = """
-        DIR=$$(mktemp -d)
-        mkdir -p "$$DIR/boot/grub"
-        cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
-        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
-        cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
-        cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
-        cp $(location tools/grub-module.cfg) "$$DIR/boot/grub/grub.cfg"
-        grub-mkrescue -o $@ "$$DIR"
-        rm -rf "$$DIR"
-    """,
+    name = "grub_module_usb",
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    outs = ["retroos_grub_module_usb.img"],
+    cmd = "python3 $(location tools/build_grub_module_usb.py)" +
+          " --kernel $(location //kernel:kernel_elf)" +
+          " --base $(location :root_module_base_gzip)" +
+          " --games $(location :root_module_games_gzip)" +
+          " --grub-cfg $(location tools/grub-module.cfg)" +
+          " --license $(location THIRD_PARTY_LICENSES.md)" +
+          " --out $@",
     visibility = ["//visibility:public"],
 )
 
 # Small forum attachment for boot/input diagnostics. Keep the same kernel and
-# runtime, without games, compilers, or instrument samples. Its GRUB menu uses
-# the text console, so omit the Unicode font to stay below the 5 MB ZIP limit.
+# runtime, without games, compilers, or instrument samples.
 pkg_tar(
     name = "diagnostic_dos_tar",
     files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
@@ -548,28 +545,30 @@ genrule(
 )
 
 genrule(
-    name = "usb_diagnostic_iso",
-    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
-    outs = ["retroos-usb-diagnostic.iso"],
+    name = "usb_diagnostic_image",
+    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    outs = ["retroos-usb-diagnostic.img"],
     cmd = """
-        DIR=$$(mktemp -d)
-        mkdir -p "$$DIR/boot/grub"
-        cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
-        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
-        cp $(location :diagnostic_module) "$$DIR/boot/retroos-base.img.gz"
-        sed 's/^boot_choices games$$/boot_choices base/' \\
-            $(location tools/grub-module.cfg) > "$$DIR/boot/grub/grub.cfg"
-        grub-mkrescue --locales= --themes= --fonts= -o $@ "$$DIR"
-        rm -rf "$$DIR"
+        CFG=$$(mktemp)
+        sed -e 's/^boot_choices games$$/boot_choices base/' \\
+            -e 's/boot_modules games /boot_modules base /' \\
+            $(location tools/grub-module.cfg) > "$$CFG"
+        python3 $(location tools/build_grub_module_usb.py) \\
+            --kernel $(location //kernel:kernel_elf) \\
+            --base $(location :diagnostic_module) \\
+            --grub-cfg "$$CFG" \\
+            --license $(location THIRD_PARTY_LICENSES.md) \\
+            --boot-mb 64 --minimal-grub-modules --out $@
+        rm -f "$$CFG"
     """,
     visibility = ["//visibility:public"],
 )
 
 genrule(
     name = "usb_diagnostic_zip",
-    srcs = [":usb_diagnostic_iso"],
+    srcs = [":usb_diagnostic_image"],
     outs = ["retroos-usb-diagnostic.zip"],
-    cmd = "python3 -c 'import zipfile; z = zipfile.ZipFile(\"$@\", \"w\", compression=zipfile.ZIP_DEFLATED, compresslevel=9); z.write(\"$(location :usb_diagnostic_iso)\", \"retroos-usb-diagnostic.iso\"); z.close()'",
+    cmd = "python3 -c 'import zipfile; z = zipfile.ZipFile(\"$@\", \"w\", compression=zipfile.ZIP_DEFLATED, compresslevel=9); z.write(\"$(location :usb_diagnostic_image)\", \"retroos-usb-diagnostic.img\"); z.close()'",
     visibility = ["//visibility:public"],
 )
 
@@ -853,13 +852,13 @@ pkg_tar(
 
 genrule(
     name = "release_checksums",
-    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":usb_diagnostic_zip"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":usb_diagnostic_zip"],
     outs = ["SHA256SUMS"],
-    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_iso) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_usb) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
 )
 
 filegroup(
     name = "release",
-    srcs = [":release_vm", ":release_machine", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":usb_diagnostic_zip", ":release_checksums"],
     visibility = ["//visibility:public"],
 )

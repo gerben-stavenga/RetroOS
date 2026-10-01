@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -192,11 +193,28 @@ def ensure_c_home(volume, c_dir="/home/retroos"):
             subprocess.run(["umount", temporary], check=True)
 
 
-def prepare(iso, destination, requested_c, requested_root, c_ram=False, requested_dir=None):
+def extract_boot_file(image, name, destination):
+    if image.suffix.lower() == ".iso":
+        subprocess.run(["xorriso", "-osirrox", "on", "-indev", str(image),
+                        "-extract", "/boot/" + name, str(destination)],
+                       stdout=subprocess.DEVNULL, check=True)
+        return
+    with image.open("rb") as disk:
+        mbr = disk.read(512)
+    if mbr[510:512] != b"\x55\xaa" or mbr[450] != 0xEF:
+        raise ValueError("boot image needs an MBR with a FAT32 EFI partition first")
+    start = struct.unpack_from("<I", mbr, 454)[0]
+    if start == 0:
+        raise ValueError("boot image has no EFI partition offset")
+    subprocess.run(["mcopy", "-i", f"{image}@@{start * 512}",
+                    f"::/boot/{name}", str(destination)], check=True)
+
+
+def prepare(image, destination, requested_c, requested_root, c_ram=False, requested_dir=None):
     if os.geteuid() == 0:
         raise PermissionError("prepare as a normal user; installation runs as root")
-    if not iso.is_file():
-        raise FileNotFoundError(f"ISO not found: {iso}")
+    if not image.is_file():
+        raise FileNotFoundError(f"boot image not found: {image}")
     volumes = candidates()
     linux_root = filesystem("/")
     c_volume = choose_c_for_host(volumes, requested_c, c_ram, linux_root["fstype"])
@@ -220,21 +238,19 @@ def prepare(iso, destination, requested_c, requested_root, c_ram=False, requeste
     if not Path("/etc/grub.d").is_dir():
         raise ValueError("/etc/grub.d is missing; install GRUB first")
     grub_cfg = grub_config_path()
-    iso_digest = sha256(iso)
-    release = destination / "releases" / iso_digest[:12]
-    plan = {"iso_sha256": iso_digest, "release": str(release),
+    image_digest = sha256(image)
+    release = destination / "releases" / image_digest[:12]
+    plan = {"image_sha256": image_digest, "release": str(release),
             "destination": str(destination), "boot_uuid": boot_fs["uuid"],
             "grub_release": grub_path(release, boot_fs), "c_uuid": c_volume["uuid"] if c_volume else None,
             "c_device": c_volume["path"] if c_volume else None,
             "c_fstype": c_volume["fstype"] if c_volume else None,
             "c_home": home, "c_dir": c_dir, "root_uuid": requested_root,
             "grub_config": str(grub_cfg)}
-    stage = STAGE_ROOT / iso_digest[:12]
+    stage = STAGE_ROOT / image_digest[:12]
     stage.mkdir(parents=True, exist_ok=True)
     for name in ("kernel.elf", "retroos-base.img.gz"):
-        subprocess.run(["xorriso", "-osirrox", "on", "-indev", str(iso),
-                        "-extract", "/boot/" + name, str(stage / name)],
-                       stdout=subprocess.DEVNULL, check=True)
+        extract_boot_file(image, name, stage / name)
     entries = grub_entries(plan)
     (stage / "grub.cfg").write_text(entries)
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
@@ -325,7 +341,8 @@ def install():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true", help="stage files and GRUB entries for review")
-    parser.add_argument("--iso", type=Path, default=ROOT / "bazel-bin/retroos_grub_module.iso")
+    parser.add_argument("--image", "--iso", dest="image", type=Path,
+                        default=ROOT / "bazel-bin/retroos_grub_module_usb.img")
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
     parser.add_argument("--c-uuid", help="C: filesystem UUID; required when several candidates exist")
     parser.add_argument("--c-ram", action="store_true", help="use the RAM module for C:")
@@ -333,7 +350,7 @@ def main():
     parser.add_argument("--root-uuid", help="optional ext4 UUID for Linux /")
     args = parser.parse_args()
     if args.prepare:
-        prepare(args.iso.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram, args.c_dir)
+        prepare(args.image.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram, args.c_dir)
     else:
         install()
 
