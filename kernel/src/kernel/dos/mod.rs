@@ -155,6 +155,8 @@ pub struct DosState<A: crate::Arch> {
     int09_registers: [u64; 11],
     /// Last child termination status (INT 21h/AH=4Dh): AL = code, AH = type.
     pub last_child_exit_status: u16,
+    /// Most recent failed INT 21h call, returned by AH=59h.
+    pub last_dos_error: u16,
     pub exec_parent: Option<ExecParent>,
     /// A DOS session begun by the outer /C or /B shell. Nested interpreters
     /// EXEC in this address space so resident code and interrupt hooks remain
@@ -303,6 +305,7 @@ impl<A: crate::Arch> DosState<A> {
             core::ptr::addr_of_mut!((*p).dos_pending_char).write(None);
             core::ptr::addr_of_mut!((*p).int09_registers).write([0; 11]);
             core::ptr::addr_of_mut!((*p).last_child_exit_status).write(0);
+            core::ptr::addr_of_mut!((*p).last_dos_error).write(0);
             core::ptr::addr_of_mut!((*p).exec_parent).write(None);
             core::ptr::addr_of_mut!((*p).tsr_session).write(false);
             core::ptr::addr_of_mut!((*p).xms).write(None);

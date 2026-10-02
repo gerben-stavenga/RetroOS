@@ -520,6 +520,11 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
             regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
             thread::KernelAction::Done
         }
+        SLOT_COUNTRY_UPCASE => {
+            let ch = regs.rax as u8;
+            regs.rax = (regs.rax & !0xFF) | country_upcase(ch) as u64;
+            thread::KernelAction::Done
+        }
         SLOT_KBD_INTERCEPT_RETURN => {
             super::bios::int09_intercept_return(machine, dos, regs);
             thread::KernelAction::Done
@@ -543,7 +548,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
     // CS/IP. Mode-switching stubs (DPMI entry, raw switch, callbacks)
     // replace all regs; SLOT_RESUME/SLOT_RESUME_CONTINUATION own their
     // unwind — skip.
-    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE | SLOT_VBE_WINDOW) {
+    if matches!(slot, SLOT_XMS | SLOT_SAVE_RESTORE | SLOT_VBE_WINDOW | SLOT_COUNTRY_UPCASE) {
         let ret_ip = vm86_pop(machine, regs);
         let ret_cs = vm86_pop(machine, regs);
         set_vm86_ip(regs, ret_ip);
@@ -1847,7 +1852,7 @@ fn int_21h<A: crate::Arch>(
             }
             return thread::KernelAction::Done;
         }
-        // AH=0x38: Get country information — return minimal stub
+        // AH=0x38: Get country information
         //
         // DOS 2.x uses a 32-byte buffer; DOS 3.0+ extended it to 34 bytes.
         // Many programs (including NC 2.0) allocate only 32 bytes, so write
@@ -1861,6 +1866,9 @@ fn int_21h<A: crate::Arch>(
             machine.write::<u8>(addr + 9, b'.');     // +09: decimal separator '.\0'
             machine.write::<u8>(addr + 0x0B, b'/');  // +0B: date separator '/\0'
             machine.write::<u8>(addr + 0x0D, b':');  // +0D: time separator ':\0'
+            // DOS programs call the far pointer at +12h to uppercase a byte
+            // in AL. A zero pointer makes callers jump into the IVT.
+            machine.write::<u32>(addr + 0x12, ctrl_slot_off(SLOT_COUNTRY_UPCASE) as u32);
             regs.rbx = (regs.rbx & !0xFFFF) | 1; // country code = 1 (USA)
             DosExit::Ok
         }
@@ -2845,10 +2853,19 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x59: Get Extended Error Information
         0x59 => {
-            // Return "file not found" as default extended error
-            regs.rbx = (regs.rbx & !0xFFFF) | ((1 << 8) | 2); // BH=1 (class: out of resource), BL=2 (action: abort)
-            regs.rcx &= !0xFFFF; // CH=0 (locus: unknown)
-            DosExit::Ax(2) // AX = error code (file not found), but CF clear
+            // Report the most recent failed DOS call. In particular, FindNext
+            // ends with error 18 (no more files); reporting error 2 instead
+            // makes file managers treat a completed listing as a disk fault.
+            let code = dos.last_dos_error;
+            let (class, action, locus) = match code {
+                0 => (0u16, 0u16, 0u16),
+                2 | 3 => (8, 3, 1),   // item not found; correct input
+                18 => (8, 6, 1),      // no more files; informational
+                _ => (12, 4, 1),      // other error; terminate with cleanup
+            };
+            regs.rbx = (regs.rbx & !0xFFFF) | ((class << 8) | action) as u64;
+            regs.rcx = (regs.rcx & !0xFFFF) | (locus << 8) as u64;
+            DosExit::Ax(code)
         }
         // AH=5Ah: Create temporary file. DS:DX names a directory/prefix; DOS
         // appends a unique 8.3 name in the caller's buffer and returns a handle.
@@ -3151,6 +3168,7 @@ fn int_21h<A: crate::Arch>(
         }
     };
     if failed {
+        dos.last_dos_error = regs.rax as u16;
         regs.set_flag32(1);
     } else {
         regs.clear_flag32(1);
@@ -4854,6 +4872,26 @@ pub(crate) const SLOT_MOUSE_CB_RET: u8 = 0x14;
 pub(crate) const SLOT_VBE_WINDOW: u8 = 0x15;
 /// Return point for the INT 15h/AH=4Fh hook invoked by BIOS INT 9.
 pub(crate) const SLOT_KBD_INTERCEPT_RETURN: u8 = 0x16;
+/// INT 21h/AH=38h country-information case-map far-call entry.
+const SLOT_COUNTRY_UPCASE: u8 = 0x17;
+
+/// DOS country-info case map for code page 437. Characters without a
+/// one-byte uppercase equivalent keep their original value.
+fn country_upcase(ch: u8) -> u8 {
+    match ch {
+        0x81 => 0x9A, // ü → Ü
+        0x82 => 0x90, // é → É
+        0x84 => 0x8E, // ä → Ä
+        0x86 => 0x8F, // å → Å
+        0x87 => 0x80, // ç → Ç
+        0x91 => 0x92, // æ → Æ
+        0x94 => 0x99, // ö → Ö
+        0xA4 => 0xA5, // ñ → Ñ
+        0xE5 => 0xE4, // σ → Σ
+        0xED => 0xE8, // φ → Φ
+        _ => ch,
+    }
+}
 
 pub(crate) const fn vbe_window_ptr() -> u32 {
     ctrl_slot_off(SLOT_VBE_WINDOW) as u32
