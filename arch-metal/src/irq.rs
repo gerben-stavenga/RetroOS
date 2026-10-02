@@ -3,6 +3,7 @@
 use lib::pipe::Pipe;
 use crate::x86::{inb, outb};
 use arch_abi::Regs;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// PIC ports
 const MASTER_CMD: u16 = 0x20;
@@ -36,6 +37,19 @@ static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Hw(0));
 /// Coalesce periodic wakeups: IRQ0 says only that the kernel should resample
 /// its clock, never how many milliseconds elapsed.
 static mut IRQ0_QUEUED: bool = false;
+static IRQ0_HANDLED: AtomicU32 = AtomicU32::new(0);
+static mut DRAIN_PROBE_PASSES: u32 = 0;
+static mut IRQ0_GAP_PROBE: Irq0GapProbe = Irq0GapProbe {
+    count: 0,
+    last_ns: 0,
+    warned: false,
+};
+
+struct Irq0GapProbe {
+    count: u32,
+    last_ns: u64,
+    warned: bool,
+}
 
 const PIT_INPUT_HZ: u64 = 1_193_182;
 const PIT_CHANNEL2: u16 = 0x42;
@@ -107,6 +121,58 @@ pub fn drain(mut f: impl FnMut(Irq)) {
     for event in &events[..n] {
         // Every element below `n` was initialized by the pop loop above.
         f(unsafe { event.assume_init_read() });
+    }
+    // Observe a missing hardware tick independently of the kernel's clock
+    // gate. This reports the PIC/IF state; it does not synthesize a wakeup.
+    let probe = unsafe {
+        DRAIN_PROBE_PASSES = DRAIN_PROBE_PASSES.wrapping_add(1);
+        DRAIN_PROBE_PASSES.is_multiple_of(1024)
+    };
+    if probe {
+        diagnose_irq0_gap();
+    }
+}
+
+/// Snapshot the master PIC without leaving its OCW3 selector in IRR mode.
+/// The short IF mask keeps the ISR/IRR/IMR readings in one interrupt epoch.
+fn master_pic_state() -> (u8, u8, u8) {
+    let restore_if = crate::x86::interrupts_enabled();
+    crate::x86::cli();
+    outb(MASTER_CMD, 0x0B);
+    let isr = inb(MASTER_CMD);
+    outb(MASTER_CMD, 0x0A);
+    let irr = inb(MASTER_CMD);
+    outb(MASTER_CMD, 0x0B);
+    let imr = inb(MASTER_DATA);
+    if restore_if { crate::x86::sti(); }
+    (irr, isr, imr)
+}
+
+fn diagnose_irq0_gap() {
+    // PIT2 needs frequent IRQ-side extension and can itself stop reporting
+    // elapsed time when IRQ0 disappears. Only an independent clock can time
+    // this diagnostic reliably.
+    if !matches!(unsafe { CLOCK.source }, ClockSource::Tsc | ClockSource::Hpet) {
+        return;
+    }
+    let now_ns = now(false);
+    let count = IRQ0_HANDLED.load(Ordering::Relaxed);
+    let probe = unsafe { &mut *core::ptr::addr_of_mut!(IRQ0_GAP_PROBE) };
+    if probe.last_ns == 0 || probe.count != count {
+        if probe.warned {
+            lib::compact_println!("IRQ0 delivery resumed: handler_count={}", count);
+        }
+        probe.count = count;
+        probe.last_ns = now_ns;
+        probe.warned = false;
+    } else if !probe.warned && now_ns.saturating_sub(probe.last_ns) >= 250_000_000 {
+        let if_on = crate::x86::interrupts_enabled();
+        let (irr, isr, imr) = master_pic_state();
+        lib::compact_println!(
+            "IRQ0 delivery stalled: count={} IF={} PIC IRR={:02X} ISR={:02X} IMR={:02X}",
+            count, if_on as u8, irr, isr, imr,
+        );
+        probe.warned = true;
     }
 }
 
@@ -910,6 +976,19 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
     }
 }
 
+/// Check the delivery side after `enter_ring1` has set IF. The pre-IRET
+/// self-test sees a PIT request in IRR, but cannot show whether the CPU ever
+/// accepts that request and enters our IRQ0 handler.
+pub fn timer_delivery_selftest(screen: &mut lib::term::Term) {
+    let if_on = crate::x86::interrupts_enabled();
+    let (irr, isr, imr) = master_pic_state();
+    lib::compact_screenln!(
+        screen,
+        "SELFTEST IRQ0 delivery count={} IF={} PIC IRR={:02X} ISR={:02X} IMR={:02X}",
+        IRQ0_HANDLED.load(Ordering::Relaxed), if_on as u8, irr, isr, imr,
+    );
+}
+
 // ============================================================================
 // IRQ dispatch
 // ============================================================================
@@ -928,6 +1007,9 @@ pub fn handle_irq(regs: &mut Regs) {
         return;
     }
     let irq = vector - IRQ_OFFSET;
+    if irq == 0 {
+        IRQ0_HANDLED.fetch_add(1, Ordering::Relaxed);
+    }
 
     // APIC mode: the tick is the LAPIC timer (vector 0x20 from the local APIC)
     // and keyboard/mouse arrive through the I/O APIC — the 8259 is bypassed

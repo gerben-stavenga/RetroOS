@@ -463,6 +463,7 @@ unsafe fn prepare_boot(
     irq::timer_selftest(screen);
 
     descriptors::enter_ring1();
+    irq::timer_delivery_selftest(screen);
 
     lib::compact_screenln!(screen, "Ring1 entered, paging + interrupts + syscall setup complete");
 

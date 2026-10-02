@@ -1614,13 +1614,22 @@ fn event_loop<A: crate::Arch>(
     let mut last_osd_refresh_tick = u64::MAX;
     let mut last_osd_composite_period = u64::MAX;
     let mut last_world_ns = machine.now();
-    // Metal IRQ0 queues Irq::Hw(0); hosted KVM's timer signal returns
-    // KernelEvent::Irq. Either is only permission to resample the real clock.
+    // Metal IRQ0 queues Irq::Hw(0); execute() can also return
+    // KernelEvent::Irq (including other physical or virtual interrupts).
+    // Either is only permission to resample the real clock.
     let mut irq_clock_wakeup = false;
     let mut exiting_display = None;
     let mut audio_clock = crate::kernel::sound::Clock::new();
     let mut execution_profile_on = false;
     let mut pending_events = crate::kernel::irq_dispatch::PendingEvents::default();
+    // Diagnose a running guest whose display/audio never advance because the
+    // event loop stops sampling time. The independent
+    // clock sample is sparse, so port-polling DOS programs keep their usual
+    // fast exit path. A single warning is enough for the persistent klog.
+    let mut clock_diag_last_sample_ns = last_world_ns;
+    let mut clock_diag_passes_since_sample = 0u64;
+    let mut clock_diag_seen_sample = false;
+    let mut clock_diag_warned = false;
     // The event loop is the execution engine and sole owner of window policy.
     // A missing display means the initial DOS window holds the fullscreen
     // direct-scanout lease; otherwise the compositor starts on the desktop.
@@ -1668,7 +1677,9 @@ fn event_loop<A: crate::Arch>(
             dump_interrupted_thread(machine, &ctx.regs, dos);
         }
         stats.part(machine, PROFILE_IRQ);
-        let world_now_ns = if tick_wakeup || irq_clock_wakeup {
+        let execute_irq_exit = irq_clock_wakeup;
+        let clock_wakeup = tick_wakeup || execute_irq_exit;
+        let world_now_ns = if clock_wakeup {
             irq_clock_wakeup = false;
             machine.now()
         } else {
@@ -1692,6 +1703,38 @@ fn event_loop<A: crate::Arch>(
         // which gates clock sampling, so it cannot itself be clock-gated.
         let elapsed_ns = world_now_ns.saturating_sub(last_world_ns);
         last_world_ns = world_now_ns;
+        if clock_wakeup {
+            if !clock_diag_seen_sample {
+                crate::compact_dbg_println!(
+                    "CLOCK: first event-loop clock sample (queued_irq0={} execute_irq={})",
+                    tick_wakeup, execute_irq_exit,
+                );
+                clock_diag_seen_sample = true;
+            }
+            if clock_diag_warned {
+                crate::compact_dbg_println!(
+                    "CLOCK: clock sampling resumed after {} ms ({} loop passes)",
+                    world_now_ns.saturating_sub(clock_diag_last_sample_ns) / 1_000_000,
+                    clock_diag_passes_since_sample,
+                );
+                clock_diag_warned = false;
+            }
+            clock_diag_last_sample_ns = world_now_ns;
+            clock_diag_passes_since_sample = 0;
+        } else {
+            clock_diag_passes_since_sample = clock_diag_passes_since_sample.saturating_add(1);
+            if !clock_diag_warned && clock_diag_passes_since_sample.is_multiple_of(1024) {
+                let raw_now_ns = machine.now();
+                let silent_ms = raw_now_ns.saturating_sub(clock_diag_last_sample_ns) / 1_000_000;
+                if silent_ms >= 250 {
+                    crate::compact_dbg_println!(
+                        "CLOCK: no event-loop clock sample for {} ms ({} loop passes)",
+                        silent_ms, clock_diag_passes_since_sample,
+                    );
+                    clock_diag_warned = true;
+                }
+            }
+        }
 
         {
             let thread = ctx.thread(threads);
