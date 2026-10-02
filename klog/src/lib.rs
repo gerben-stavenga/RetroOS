@@ -14,6 +14,8 @@ struct KLog {
     capacity: usize,
     head: usize,
     len: usize,
+    /// Number of bytes appended since initialization, including evicted bytes.
+    total: usize,
     cur_len: usize,
     dumping: bool,
     dump_head: usize,
@@ -29,6 +31,7 @@ impl KLog {
             capacity: 0,
             head: 0,
             len: 0,
+            total: 0,
             cur_len: 0,
             dumping: false,
             dump_head: 0,
@@ -69,6 +72,7 @@ impl KLog {
         let tail = (self.head + self.len) % self.capacity;
         self.set_byte(tail, b);
         self.len += 1;
+        self.total = self.total.saturating_add(1);
     }
 
     fn start_dump(&mut self) {
@@ -170,6 +174,31 @@ pub fn line(idx: usize, out: &mut [u8]) -> Option<usize> {
 /// Current number of retained bytes, including an unterminated final line.
 pub fn byte_len() -> u32 {
     unsafe { (*core::ptr::addr_of!(LOG)).len as u32 }
+}
+
+/// Monotonic position of the next byte in the stream. Unlike `byte_len`, this
+/// continues advancing when old ring lines are evicted.
+pub fn total_bytes() -> usize {
+    unsafe { (*core::ptr::addr_of!(LOG)).total }
+}
+
+/// Read bytes appended since an absolute stream position. If the ring has
+/// already evicted that position, return its oldest retained position instead.
+/// The caller can then append the returned bytes to a durable log file.
+pub fn read_since(offset: usize, out: &mut [u8]) -> (usize, usize) {
+    unsafe {
+        let log = &*core::ptr::addr_of!(LOG);
+        if log.capacity == 0 {
+            return (offset, 0);
+        }
+        let oldest = log.total - log.len;
+        let start = offset.max(oldest).min(log.total);
+        let n = out.len().min(log.total - start);
+        for (i, byte) in out[..n].iter_mut().enumerate() {
+            *byte = log.byte_at(log.head, start - oldest + i);
+        }
+        (start, n)
+    }
 }
 
 /// Read the ring as a flat byte stream at `offset`.

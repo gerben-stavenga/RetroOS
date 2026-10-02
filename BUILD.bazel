@@ -488,7 +488,7 @@ genrule(
     srcs = [":games_module_tar", "tools/build_module_image.py"],
     outs = ["retroos-games.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :games_module_tar) --size-mb 96 --writable-root --out $@",
+          " --contents $(location :games_module_tar) --size-mb 128 --writable-root --out $@",
     visibility = ["//visibility:public"],
 )
 

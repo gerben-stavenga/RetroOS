@@ -37,6 +37,15 @@ fn log_byte(b: u8) {
     crate::kernel::serial_log::write_byte(b);
 }
 
+fn log_line() {
+    // Hardware interrupt handlers run with IF clear. They may log while a
+    // storage driver is active, so leave their lines in the ring for the next
+    // normal-context line or event-loop pass.
+    if x86::interrupts_enabled() {
+        crate::kernel::klog::sync_live();
+    }
+}
+
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
 const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
@@ -292,6 +301,7 @@ unsafe fn prepare_boot(
 
     // Install the kernel's metal log sink before any normal startup output.
     lib::log::set_debug_sink(log_byte);
+    lib::log::set_line_sink(log_line);
     lib::log::set_fatal_handler(fatal_finish);
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
@@ -571,6 +581,13 @@ fn fatal_finish() -> ! {
     lib::screenln!(screen);
     lib::compact_screenln!(screen, "{}", crate::build_info::VersionBanner);
     crate::kernel::stacktrace::stack_trace(screen);
+
+    // Capture any final partial line as well. A panic can occur while VFS is
+    // locked or in an interrupt; sync_live uses try_lock and this guard avoids
+    // issuing disk I/O from an interrupt handler.
+    if x86::interrupts_enabled() {
+        crate::kernel::klog::sync_live();
+    }
 
     // The normal display owner is somewhere up the dead call chain. Seize the
     // mapped framebuffer for one best-effort publication before stopping.

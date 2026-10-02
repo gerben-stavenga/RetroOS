@@ -178,11 +178,15 @@ Allocation against all legacy/PCI devices and AWE synthesis initialization
 are not implemented.
 
 Before the interactive startup program runs, RetroOS overwrites `C:\KLOG.TXT`
-with a snapshot of the boot log and flushes it. Failure to save is reported
-without stopping startup. The file survives reboot only on a persistent data
-volume; protected-disk and RAM-only boots keep it in RAM. This captures boots
-that reach the startup program even when keyboard input is unavailable, but
-cannot capture an earlier boot hang. The USB GRUB submenu **Boot diagnostics
+with a snapshot of the boot log and flushes it. It then appends and flushes
+new log output after each completed line. If the line is emitted from an
+interrupt or while the filesystem lock is held, the bytes remain in the log
+ring and are flushed at the next safe line or event-loop pass. Failure to save
+does not stop startup. Live appends stop at 16 MiB to avoid filling C:. The file survives
+reboot only on a persistent data volume; protected-disk and RAM-only boots
+keep it in RAM. This captures boots that reach the
+startup program even when keyboard input is unavailable, but cannot capture an
+earlier boot hang. The USB GRUB submenu **Boot diagnostics
 (no DN; stop for photo)** saves the log, displays USB/storage discovery results,
 and stops before launching any program. This is also available via the kernel
 argument `boot-log-only`.

@@ -1,0 +1,2 @@
+Download: ftp://ftp.3drealms.com/freeware/bmfreew.zip
+Launcher: https://github.com/Litude/apogee-launchers/

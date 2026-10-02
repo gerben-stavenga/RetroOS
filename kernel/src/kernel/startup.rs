@@ -1154,7 +1154,12 @@ fn run<A: crate::Arch>(
     crate::compact_screenln!(&mut screen, "Starting {}...",
         core::str::from_utf8(&start_path).unwrap_or("?"));
     match crate::kernel::klog::save_boot_snapshot(machine) {
-        Ok(()) => crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT"),
+        Ok(()) => {
+            crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT");
+            if crate::kernel::klog::start_live_capture().is_ok() {
+                crate::kernel::klog::sync_live();
+            }
+        }
         Err(error) => crate::compact_screenln!(&mut screen,
             "Boot log: could not save C:\\KLOG.TXT (error {})", error),
     }
@@ -1195,7 +1200,11 @@ fn run_program_with_screen<A: crate::Arch>(
     crate::kernel::console::Console,
     Option<crate::kernel::drivers::sb16::Sb16>,
 ) {
+    crate::compact_dbg_println!("boot launch: releasing console");
+    crate::kernel::klog::sync_live();
     let (card, display) = screen.release(machine, bios_workspace);
+    crate::compact_dbg_println!("boot launch: console released");
+    crate::kernel::klog::sync_live();
     let (display, sb) = run_program(
         machine,
         bios_workspace,
@@ -1297,6 +1306,8 @@ fn prepare_program<A: crate::Arch>(
     // A cmdline path is user-facing: accept both a full VFS path and a DOS
     // C:-relative one (the common `--cmd GAMES/...` form — C: = c_root, same
     // resolution the DOS personality applies to the program's own file I/O).
+    crate::compact_dbg_println!("boot launch: loading {}", core::str::from_utf8(&launch_path).unwrap_or("?"));
+    crate::kernel::klog::sync_live();
     let (buf, loaded_path) = match exec::load_file_resolved(&launch_path) {
         Ok(buf) => (buf, launch_path.clone()),
         Err(_) => {
@@ -1306,6 +1317,8 @@ fn prepare_program<A: crate::Arch>(
             (buf, path)
         }
     };
+    crate::compact_dbg_println!("boot launch: file loaded ({} bytes)", buf.len());
+    crate::kernel::klog::sync_live();
     // argv = path + the cmdline tail split into words. The ELF/Linux path
     // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
     // dash as ["-c", "echo hi"]); DOS ignores the extra entries and gets the
@@ -1349,6 +1362,8 @@ fn prepare_program<A: crate::Arch>(
     // everything else is DOS. (The
     // cmdline launcher used to force every program through the DOS loader,
     // which silently load_com'd an ELF and ran its header as VM86 garbage.)
+    crate::compact_dbg_println!("boot launch: constructing program thread");
+    crate::kernel::klog::sync_live();
     let tid = match exec::detect_format(&buf, &launch_path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
@@ -1365,6 +1380,8 @@ fn prepare_program<A: crate::Arch>(
             env,
         ),
     };
+    crate::compact_dbg_println!("boot launch: program thread ready (tid={})", tid);
+    crate::kernel::klog::sync_live();
 
     // The initial program owns the console outright (nothing to repaint) and
     // gets its port permissions from policy, not from boot-time leftovers.
@@ -1375,6 +1392,8 @@ fn prepare_program<A: crate::Arch>(
         t.personality
             .adopt_display(machine, bios_workspace, display)
     };
+    crate::compact_dbg_println!("boot launch: display adopted");
+    crate::kernel::klog::sync_live();
 
     if let Some((addr0, addr1)) = debug_watch {
         machine.set_debug_watch(Some((addr0, addr1)));
@@ -1589,6 +1608,7 @@ fn event_loop<A: crate::Arch>(
     Option<crate::kernel::drivers::sb16::Sb16>,
 ) {
     crate::compact_dbg_println!("event_loop entered, tid={}", first_tid);
+    crate::kernel::klog::sync_live();
     let mut ctx = crate::kernel::exec_ctx::ExecutionContext::seed(threads, first_tid);
     let mut stats = EventStats::new(machine);
     let mut last_osd_refresh_tick = u64::MAX;
@@ -1624,6 +1644,7 @@ fn event_loop<A: crate::Arch>(
         .and_then(|t| t.personality.adopt_sb(machine, sb_card));
 
     loop {
+        crate::kernel::klog::sync_live();
         let requested_profile = profile_enabled();
         if requested_profile != execution_profile_on {
             machine.execution_profile_set(requested_profile);

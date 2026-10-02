@@ -112,6 +112,7 @@ fn main() {
     }
     kernel::kernel::klog::init();
     lib::log::set_debug_sink(host_log_byte);
+    lib::log::set_line_sink(|| kernel::kernel::klog::sync_live());
     // Inject the backend into the (backend-agnostic) kernel: its port I/O for
     // the deep driver call sites (portio), and the host environment facts the
     // platform probe reads (HostStdout debug, no fbcon, not metal).

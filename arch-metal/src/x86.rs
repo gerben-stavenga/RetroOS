@@ -460,7 +460,7 @@ pub(super) fn cli() {
 }
 
 #[inline]
-pub(super) fn interrupts_enabled() -> bool {
+pub fn interrupts_enabled() -> bool {
     let flags: u32;
     unsafe {
         asm!("pushfd", "pop {0:e}", out(reg) flags, options(nomem));

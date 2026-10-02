@@ -2281,6 +2281,17 @@ fn int_21h<A: crate::Arch>(
                 machine.copy_from(addr as usize, &mut data);
                 let n = crate::kernel::vfs::write(machine, handle as i32, &data, &kt.fds);
                 if n >= 0 {
+                    if n > 0 {
+                        let (time, date) = current_dos_timestamp(machine, regs);
+                        if let Some(unix) = dos_to_unix_datetime(time, date) {
+                            // DOS updates a file's modification time after a
+                            // successful write. Keep the backing filesystem
+                            // and directory listings in sync with AH=57h.
+                            let _ = crate::kernel::vfs::set_handle_mtime(
+                                handle as i32, unix, &kt.fds,
+                            );
+                        }
+                    }
                     let size = crate::kernel::vfs::file_size(handle as i32, &kt.fds);
                     sft_set_file(machine, handle, size);
                     DosExit::Ax(n as u16)

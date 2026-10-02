@@ -1264,7 +1264,7 @@ impl Vfs {
         n
     }
 
-    fn write_by_handle<A: crate::Arch>(&mut self, _machine: &mut A, handle: i32, data: &[u8]) -> i32 {
+    fn write_by_handle(&mut self, handle: i32, data: &[u8]) -> i32 {
         if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
         if self.file_table[h].refcount == 0 { return -9; }
@@ -1910,7 +1910,23 @@ pub fn read_by_handle(handle: i32, buf: &mut [u8]) -> i32 {
 
 /// Write to a VFS file table entry by handle index.
 pub fn write_by_handle<A: crate::Arch>(machine: &mut A, handle: i32, data: &[u8]) -> i32 {
-    VFS.lock().write_by_handle(machine, handle, data)
+    let _ = machine;
+    VFS.lock().write_by_handle(handle, data)
+}
+
+/// A log callback may run while VFS already holds its lock. In that case,
+/// leave the bytes in the ring for the next callback or event-loop pass.
+pub fn try_write_by_handle(handle: i32, data: &[u8]) -> Option<i32> {
+    Some(VFS.try_lock()?.write_by_handle(handle, data))
+}
+
+pub fn try_flush_by_handle(handle: i32) -> Option<i32> {
+    Some(VFS.try_lock()?.flush_handle(handle))
+}
+
+/// Persist data and metadata for a kernel-owned VFS handle.
+pub fn flush_by_handle(handle: i32) -> i32 {
+    VFS.lock().flush_handle(handle)
 }
 
 /// Seek on a VFS handle directly.

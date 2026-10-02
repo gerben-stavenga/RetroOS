@@ -32,11 +32,19 @@
 /// bytes dropped). Write-only and panic-safe: an atomic load + indirect call.
 static DEBUG_SINK: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
+static LINE_SINK: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 
 /// Install the platform debug-output sink. Called once, early, by the platform
 /// entry point (metal `boot_kernel`, hosted `main`) before anything logs.
 pub fn set_debug_sink(f: fn(u8)) {
     DEBUG_SINK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// Called after each completed log line. The platform must avoid blocking on
+/// a filesystem lock when this runs from within filesystem code.
+pub fn set_line_sink(f: fn()) {
+    LINE_SINK.store(f as usize, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Emit one byte to the debug-output sink (the DOS console mirror uses this to
@@ -53,6 +61,13 @@ pub fn stream(b: u8) {
     if p != 0 {
         let f: fn(u8) = unsafe { core::mem::transmute(p) };
         f(b);
+    }
+    if b == b'\n' {
+        let p = LINE_SINK.load(core::sync::atomic::Ordering::Relaxed);
+        if p != 0 {
+            let f: fn() = unsafe { core::mem::transmute(p) };
+            f();
+        }
     }
 }
 
