@@ -5,6 +5,9 @@ source location, and stack trace on the console and mirror them to the log.
 
 For USB testing, use **`retroos_grub_module_usb.img`**. Its partition
 table is conventional and its GRUB configuration can be edited on the stick.
+For CD-ROM boot, including UniPCemu setups that cannot boot the USB image,
+use **`retroos_grub_module.iso`**. It contains the same kernel, RAM modules,
+and GRUB menu as the USB image.
 
 ## Editable USB boot: retroos_grub_module_usb.img
 

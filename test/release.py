@@ -68,6 +68,39 @@ def check_usb(work):
         print(f'PASS: published USB image {firmware}, protected default, RAM C:')
 
 
+def check_iso(work):
+    image = OUTPUT / 'retroos_grub_module.iso'
+    assert image.is_file()
+    for firmware in ('bios', 'uefi'):
+        log = work / f'iso-{firmware}.log'
+        args = ['qemu-system-x86_64', '-m', '512', '-cdrom', str(image),
+                '-boot', 'order=d', '-display', 'none', '-no-reboot',
+                '-debugcon', 'file:' + str(log),
+                '-fw_cfg', 'name=opt/cmdline,string=TESTS/HELLO.COM']
+        if firmware == 'uefi':
+            import shutil
+            variables = work / 'iso-vars.fd'
+            shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', variables)
+            args += ['-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd',
+                     '-drive', f'if=pflash,format=raw,file={variables}']
+        proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 60
+            while time.monotonic() < deadline and proc.poll() is None:
+                text = log.read_text(errors='replace') if log.exists() else ''
+                if any(marker in text for marker in ('Hello from HELLO.COM!', 'PANIC')):
+                    break
+                time.sleep(.1)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+            proc.wait(timeout=10)
+        text = log.read_text(errors='replace')
+        assert 'Hello from HELLO.COM!' in text and 'PANIC' not in text, text
+        assert 'Disk writes: volatile RAM overlay' in text, text
+        print(f'PASS: published CD ISO {firmware}, protected default, RAM C:')
+
+
 def main():
     for line in (OUTPUT / 'SHA256SUMS').read_text().splitlines():
         expected, name = line.split()
@@ -88,6 +121,7 @@ def main():
         subprocess.run(['grub-script-check', str(work / 'lightweight-grub.cfg')], check=True)
         print('PASS: lightweight USB ZIP below 5 MB, dISAppointment and photo entries')
         check_usb(work)
+        check_iso(work)
         vm, machine = work / 'vm', work / 'machine'
         for name, dest in [('vm', vm), ('machine', machine)]:
             with tarfile.open(OUTPUT / f'retroos-{name}.tar.gz') as archive:

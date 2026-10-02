@@ -516,6 +516,27 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
+# Optical-disc counterpart of the public USB module image. UniPCemu can boot
+# this through its CD-ROM drive; the same kernel, modules, and GRUB menu are
+# used so the runtime is identical regardless of boot medium.
+genrule(
+    name = "grub_module_iso",
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
+    outs = ["retroos_grub_module.iso"],
+    cmd = """
+        DIR=$$(mktemp -d)
+        mkdir -p "$$DIR/boot/grub"
+        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
+        cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
+        cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
+        cp $(location tools/grub-module.cfg) "$$DIR/boot/grub/grub.cfg"
+        cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
+        grub-mkrescue -o $@ "$$DIR"
+        rm -rf "$$DIR"
+    """,
+    visibility = ["//visibility:public"],
+)
+
 # Small forum attachment for boot/input diagnostics. Keep the same kernel and
 # runtime, without games, compilers, or instrument samples.
 pkg_tar(
@@ -852,13 +873,13 @@ pkg_tar(
 
 genrule(
     name = "release_checksums",
-    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":usb_diagnostic_zip"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":grub_module_iso", ":usb_diagnostic_zip"],
     outs = ["SHA256SUMS"],
-    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_usb) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
+    cmd = "sha256sum $(locations :release_vm) $(locations :release_machine) $(locations :grub_module_usb) $(locations :grub_module_iso) $(locations :usb_diagnostic_zip) | sed 's|  .*/|  |' > $@",
 )
 
 filegroup(
     name = "release",
-    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":usb_diagnostic_zip", ":release_checksums"],
+    srcs = [":release_vm", ":release_machine", ":grub_module_usb", ":grub_module_iso", ":usb_diagnostic_zip", ":release_checksums"],
     visibility = ["//visibility:public"],
 )

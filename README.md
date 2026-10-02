@@ -44,6 +44,7 @@ while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP
 - `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and prebuilt QEMU and UniPCemu launchers.
 - `retroos-machine.tar.gz` (`//:release_machine`): matched kernel/runtime and installer.
 - `retroos_grub_module_usb.img` (`//:grub_module_usb`): editable BIOS/UEFI USB image with a fixed FAT32 partition layout.
+- `retroos_grub_module.iso` (`//:grub_module_iso`): bootable BIOS/UEFI CD image with the same kernel and RAM modules as the USB image.
 - `retroos-usb-diagnostic.zip` (`//:usb_diagnostic_zip`): compact USB image for boot diagnostics.
 - `SHA256SUMS` (`//:release_checksums`): checksums for all release artifacts.
 
