@@ -238,7 +238,10 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
             Some(route) => route,
             None => {
                 REQUESTED_OUTPUT_ROUTE.store(DEFAULT_OUTPUT_ROUTE as u8, Ordering::Relaxed);
-                OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
+                OUTPUT_ROUTE_PENDING.store(
+                    OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed)) != DEFAULT_OUTPUT_ROUTE,
+                    Ordering::Relaxed,
+                );
                 let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
                     "hda: invalid HDA_OUTPUT={}",
                     core::str::from_utf8(value).unwrap_or("<non-UTF8>")
@@ -248,7 +251,13 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
         },
     };
     REQUESTED_OUTPUT_ROUTE.store(route as u8, Ordering::Relaxed);
-    OUTPUT_ROUTE_PENDING.store(false, Ordering::Relaxed);
+    // Platform probing initializes HDA before CONFIG.SYS is mounted. A later
+    // CONFIG value must be applied by the live device on its first start (or
+    // next cursor poll), rather than merely changing the requested atomic.
+    OUTPUT_ROUTE_PENDING.store(
+        route != OutputRoute::from_raw(OUTPUT_ROUTE.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
 }
 
 pub fn output_route_label() -> &'static [u8] {
