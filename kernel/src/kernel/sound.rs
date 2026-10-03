@@ -272,7 +272,13 @@ impl Sink {
     /// Move the SB from HDA's parked slot into the kernel output. On failure,
     /// restore the HDA sink with both device tokens still owned.
     pub fn switch_hda_to_sb<A: crate::Arch>(self, machine: &mut A) -> OutputSwitch {
-        if !self.is_hda() || self.parked_sb.as_ref().is_none_or(|card| card.dma16 != Some(5)) {
+        if !self.is_hda() {
+            return OutputSwitch::Unchanged(self);
+        }
+        if self.parked_sb.as_ref().is_none_or(|card| card.dma16 != Some(5)) {
+            crate::compact_println!(
+                "Audio: Mix through SB unavailable: parked card HDMA={:?} (sink requires DMA5)",
+                self.parked_sb.as_ref().and_then(|card| card.dma16));
             return OutputSwitch::Unchanged(self);
         }
         let Self { inner, parked_sb, .. } = self;

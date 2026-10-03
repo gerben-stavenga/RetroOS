@@ -1072,6 +1072,11 @@ impl Hda {
         AVAILABLE_OUTPUT_ROUTES.store(available, Ordering::Relaxed);
 
         let requested_path = best_by_route[requested as usize];
+        if requested_path.len == 0 {
+            let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
+                "hda: requested {} has no usable path (available routes={:#04x}); trying fallback",
+                core::str::from_utf8(requested.label()).unwrap_or("?"), available);
+        }
         let mut best = if requested_path.len != 0 {
             self.output_route = requested;
             requested_path
@@ -1095,6 +1100,11 @@ impl Hda {
         if let Some(pin) = find_widget(&widgets, count, self.pin) {
             self.pin_def = widgets[pin].def_cfg;
         }
+        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
+            "hda: requested {} selected {} pin={:#x} pin_def={:#x} routes={:#04x}",
+            core::str::from_utf8(requested.label()).unwrap_or("?"),
+            core::str::from_utf8(self.output_route.label()).unwrap_or("?"),
+            self.pin, self.pin_def, available);
         true
     }
 

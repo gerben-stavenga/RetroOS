@@ -37,15 +37,6 @@ fn log_byte(b: u8) {
     crate::kernel::serial_log::write_byte(b);
 }
 
-fn log_line() {
-    // Hardware interrupt handlers run with IF clear. They may log while a
-    // storage driver is active, so leave their lines in the ring for the next
-    // normal-context line or event-loop pass.
-    if x86::interrupts_enabled() {
-        crate::kernel::klog::sync_live();
-    }
-}
-
 /// Magic value the Multiboot bootloader places in EAX before jumping to us.
 const MULTIBOOT_BOOTLOADER_MAGIC: u32 = 0x2BAD_B002;
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36D7_6289;
@@ -301,7 +292,6 @@ unsafe fn prepare_boot(
 
     // Install the kernel's metal log sink before any normal startup output.
     lib::log::set_debug_sink(log_byte);
-    lib::log::set_line_sink(log_line);
     lib::log::set_fatal_handler(fatal_finish);
     // Inject the metal backend into the (backend-agnostic) kernel: port I/O
     // for the deep driver call sites, and the host-environment facts the
@@ -396,8 +386,11 @@ unsafe fn prepare_boot(
     // faults, phys_mm for the frames) — so every later init phase can paint
     // its panics. The mappings land in the dual-use PDPT page that the
     // compat-mode toggle below reuses, so they survive the switch.
+    lib::compact_screenln!(screen, "Boot: framebuffer init");
     crate::fbcon::init(info, screen);
+    lib::compact_screenln!(screen, "Boot: framebuffer ready");
 
+    lib::compact_screenln!(screen, "Boot: ACPI timer search");
     let tagged_hpet_base = if acpi_rsdp_len != 0 {
         arch::acpi::hpet_base_from_rsdp(&acpi_rsdp[..acpi_rsdp_len])
     } else {
@@ -415,6 +408,7 @@ unsafe fn prepare_boot(
     } else {
         lib::compact_screenln!(screen, "HPET: no ACPI table found; using timer fallback");
     }
+    lib::compact_screenln!(screen, "Boot: IRQ init");
     irq::init_interrupts(hpet_base);
     lib::compact_screenln!(screen, "Interrupts initialized");
 

@@ -160,12 +160,15 @@ def install_grub_bios(image, work, grub_lib):
 
 def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
                         kernel, boot_tree, efi_binary, root_kernel=True,
-                        grub_modules=None):
+                        grub_modules=None, volume_serial=None):
     """Format p1 in place and populate it with mtools (no mounting)."""
     env = dict(os.environ, MTOOLSRC=mtools_cfg(work))
     at = "%s@@%d" % (image, start * SECTOR)
 
-    run(["mformat", "-i", at, "-F", "-T", str(sectors), "::"], env=env)
+    format_cmd = ["mformat", "-i", at, "-F", "-T", str(sectors)]
+    if volume_serial is not None:
+        format_cmd.extend(["-N", f"{volume_serial:08x}"])
+    run(format_cmd + ["::"], env=env)
 
     def mmd(path):
         subprocess.run(["mmd", "-D", "s", "-i", at, "::" + path],

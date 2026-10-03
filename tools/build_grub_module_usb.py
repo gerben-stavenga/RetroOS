@@ -21,6 +21,8 @@ from build_boot_disk import (GAP_SECTORS, PART_TYPE_ESP, SECTOR,
 
 PART_TYPE_FAT32_LBA = 0x0C
 DISK_SIGNATURE = 0x5E77_0006
+BOOT_VOLUME_SERIAL = 0x5E77_0001
+DATA_VOLUME_SERIAL = 0x5E77_0002
 BOOT_MIB = 128
 DATA_MIB = 64
 DIAGNOSTIC_GRUB_MODULES = (
@@ -124,13 +126,15 @@ def main():
                         if args.minimal_grub_modules else None)
         build_fat_partition(args.out, GAP_SECTORS, boot_sectors, work,
                             args.grub_lib, cfg, args.kernel, tree, efi,
-                            root_kernel=False, grub_modules=grub_modules)
+                            root_kernel=False, grub_modules=grub_modules,
+                            volume_serial=BOOT_VOLUME_SERIAL)
         set_hidden_sectors(args.out, GAP_SECTORS)
 
         at = f"{args.out}@@{data_start * SECTOR}"
         env = dict(os.environ, MTOOLSRC=mtools_cfg(work))
         subprocess.run(["mformat", "-i", at, "-F", "-T", str(data_sectors),
-                        "-v", "RETRODATA", "::"], check=True, env=env)
+                        "-N", f"{DATA_VOLUME_SERIAL:08x}", "-v", "RETRODATA", "::"],
+                       check=True, env=env)
         subprocess.run(["mmd", "-i", at, "::/CONFIG"], check=True, env=env)
         set_hidden_sectors(args.out, data_start)
 

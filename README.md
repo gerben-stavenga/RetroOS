@@ -48,6 +48,11 @@ while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP
 - `retroos-usb-diagnostic.zip` (`//:usb_diagnostic_zip`): compact USB image for boot diagnostics.
 - `SHA256SUMS` (`//:release_checksums`): checksums for all release artifacts.
 
+The USB image's `RETRODATA` partition is available to a host OS for editing,
+but RetroOS cannot yet access it when the image is booted from USB: the kernel
+does not have a USB mass-storage driver. Persistent C: requires a disk that
+RetroOS can enumerate, such as NVMe or AHCI.
+
 CI tests these artifacts and uploads them on successful runs. The bundles require
 no compiler or Bazel to use. Extract upgrades separately and preserve your existing
 data image; replace only the boot image. See the bundled README for installation.

@@ -109,6 +109,15 @@ impl NativeSb {
     /// the real controller from it.
     pub fn adopt<A: crate::Arch>(machine: &mut A, card: Sb16, st: sound::sb::DspState) -> Self {
         let base = card.base;
+        let mixer = |machine: &mut A, index: u8| {
+            machine.outb(base + 0x04, index);
+            machine.inb(base + 0x05)
+        };
+        crate::compact_println!(
+            "sb: native mixer master={:#04x} voice={:#04x} FM={:#04x} output={:#04x}",
+            mixer(machine, 0x22), mixer(machine, 0x04),
+            mixer(machine, 0x26), mixer(machine, 0x3c));
+        machine.outb(base + 0x04, 0);
         dsp_reset(machine, base);
         dsp_write(machine, base, if st.speaker { 0xD1 } else { 0xD3 });
         // Rate: an SB16 takes it directly; anything older only understands the
@@ -311,6 +320,11 @@ impl NativeSb {
             // kernel found them; nothing else on the machine knows they moved.
             // This filter is why the mixer pair is always in `trap_mask`.
             return;
+        }
+        if p == b.io_base + 0x05
+            && matches!(self.mixer_idx, 0x04 | 0x22 | 0x26 | 0x30..=0x35 | 0x3c)
+        {
+            crate::compact_println!("sb: mixer {:#04x} <- {:#04x}", self.mixer_idx, val);
         }
         machine.outb(self.host_port(b, p), val);
     }

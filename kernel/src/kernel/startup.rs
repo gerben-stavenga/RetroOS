@@ -202,6 +202,11 @@ fn prepare_audio<A: crate::Arch>(
     // "correcting" it would break the games whose own configs agree with
     // CONFIG.SYS.
     let mut sb_card = sb_card;
+    if sb_card.is_some() {
+        crate::compact_println!(
+            "Audio: ISA DMA buffer pages ch1={:#x} ch5={:#x} (0 means unavailable)",
+            machine.dma_channel_buf(1), machine.dma_channel_buf(5));
+    }
     if platform.audio == crate::kernel::platform::Audio::NativeSb
         && let Some(card) = sb_card.as_mut()
     {
@@ -1663,8 +1668,15 @@ fn event_loop<A: crate::Arch>(
         .get_mut(first_tid)
         .and_then(|t| t.personality.adopt_sb(machine, sb_card));
 
+    // Live KLOG writes flush the backing FAT file. DOS programs may issue one
+    // INT 21h call per printed character, so flushing on every loop pass makes
+    // text appear one letter at a time. Keep the ring immediate and persist it
+    // at a bounded interval instead.
+    const KLOG_SYNC_NS: u64 = 500_000_000;
+    let mut next_klog_sync_ns = last_world_ns.saturating_add(KLOG_SYNC_NS);
+    let mut klog_check_passes = 0u32;
+
     loop {
-        crate::kernel::klog::sync_live();
         let requested_profile = profile_enabled();
         if requested_profile != execution_profile_on {
             machine.execution_profile_set(requested_profile);
@@ -1696,6 +1708,14 @@ fn event_loop<A: crate::Arch>(
         } else {
             last_world_ns
         };
+        klog_check_passes = klog_check_passes.wrapping_add(1);
+        if clock_wakeup || klog_check_passes.is_multiple_of(256) {
+            let log_now_ns = if clock_wakeup { world_now_ns } else { machine.now() };
+            if log_now_ns >= next_klog_sync_ns {
+                crate::kernel::klog::sync_live();
+                next_klog_sync_ns = log_now_ns.saturating_add(KLOG_SYNC_NS);
+            }
+        }
         let now_tick = world_now_ns / 1_000_000;
         // Keep the F12 window list fresh while it is open,
         // but not on every port/interrupt exit: millisecond resolution is
