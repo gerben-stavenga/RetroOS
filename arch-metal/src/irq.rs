@@ -281,8 +281,8 @@ fn unmask_irq(irq: u8) {
 // the "hangs at Starting DN" symptom on an AMD Razer laptop; locally with QEMU
 // `-M q35,pit=off`). The local APIC timer is always present; we run it as the
 // periodic wakeup, returning control to the event loop without manufacturing
-// elapsed time. The ACPI-described HPET is the calibration reference — with no
-// PIT there is no other fixed clock to derive the rate from.
+// elapsed time. Calibrate it against HPET where available, or poll PIT channel
+// 2 on machines whose firmware omits HPET but has a working legacy PIT.
 
 // xAPIC MMIO register offsets (the x2APIC MSR is 0x800 + offset/16).
 const LAPIC_SVR: u32 = 0xF0;
@@ -559,8 +559,38 @@ fn calibrate_lapic_via_hpet() -> Option<u32> {
     Some(((lapic_hz / 1000).max(1)) as u32)
 }
 
+/// Calibrate the LAPIC timer against PIT channel 2 when firmware has no HPET
+/// table. Channel 2 is polled, so this works even if PIC IRQ0 cannot reach the
+/// CPU. Keeping the LAPIC timer active avoids disabling a firmware-enabled
+/// APIC and assuming the chipset will reconnect the PIC to direct INTR.
+fn calibrate_lapic_via_pit2() -> Option<u32> {
+    let target = (PIT_INPUT_HZ / 100) as u16; // about 10 ms
+    lapic_write(LAPIC_DIV_CONF, LAPIC_DIV_1);
+    lapic_write(LAPIC_LVT_TIMER, LVT_MASKED);
+    lapic_write(LAPIC_INIT_COUNT, 0xFFFF_FFFF);
+
+    let p0 = pit2_count();
+    let c0 = lapic_read(LAPIC_CUR_COUNT);
+    if wait_pit2_delta(p0, target).is_none() {
+        lapic_write(LAPIC_INIT_COUNT, 0);
+        return None;
+    }
+    let c1 = lapic_read(LAPIC_CUR_COUNT);
+    let p1 = pit2_count();
+    lapic_write(LAPIC_INIT_COUNT, 0);
+
+    let pit_elapsed = u64::from(p0.wrapping_sub(p1));
+    let lapic_elapsed = u64::from(c0.wrapping_sub(c1));
+    if pit_elapsed < u64::from(target) || lapic_elapsed == 0 {
+        return None;
+    }
+    let lapic_hz = (u128::from(lapic_elapsed) * u128::from(PIT_INPUT_HZ)
+        / u128::from(pit_elapsed)) as u64;
+    Some(((lapic_hz / 1000).max(1)) as u32)
+}
+
 /// Bring up the LAPIC timer as the system tick. Returns true on success; false
-/// (no APIC, LAPIC globally disabled, or no HPET to calibrate against) leaves
+/// (no APIC, LAPIC globally disabled, or no usable reference clock) leaves
 /// the caller on the legacy PIT path.
 fn setup_lapic_timer() -> bool {
     // APIC-base MSR is architectural only from P6; a P5-class part #GPs on the
@@ -590,9 +620,12 @@ fn setup_lapic_timer() -> bool {
     lapic_write(LAPIC_SVR, LAPIC_SW_ENABLE | LAPIC_SPURIOUS_VECTOR);
     lapic_write(LAPIC_LVT_LINT0, LVT_DELIVERY_EXTINT);
 
-    let init_count = match calibrate_lapic_via_hpet() {
-        Some(c) => c,
-        None => return false,
+    let (init_count, reference) = if let Some(c) = calibrate_lapic_via_hpet() {
+        (c, "HPET")
+    } else if let Some(c) = calibrate_lapic_via_pit2() {
+        (c, "PIT2")
+    } else {
+        return false;
     };
 
     // Start the periodic timer on vector 0x20.
@@ -600,7 +633,7 @@ fn setup_lapic_timer() -> bool {
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LVT_TIMER_PERIODIC);
     lapic_write(LAPIC_INIT_COUNT, init_count);
     unsafe { core::ptr::write_volatile(&raw mut LAPIC_TIMER_ACTIVE, true); }
-    lib::compact_println!("IRQ: LAPIC timer tick (init_count={})", init_count);
+    lib::compact_println!("IRQ: LAPIC timer tick (init_count={} ref={})", init_count, reference);
     true
 }
 
@@ -739,6 +772,17 @@ pub fn init_interrupts(hpet_base: Option<u64>) {
     // half-state (LAPIC timer but PIC keyboard) is what left modern boxes with
     // a dead keyboard: the tick survived on the LAPIC while IRQ1 rode the PIC
     // whose INTR the firmware had cut.
+    // Record the firmware APIC state before our fallback can disable xAPIC.
+    // CPUID's APIC bit may itself clear after that transition, so the later
+    // self-test alone cannot reveal what the firmware configured.
+    let (sig, _, _, edx) = crate::x86::cpuid(1);
+    if (sig >> 8) & 0xF >= 6 {
+        lib::compact_println!(
+            "IRQ: APIC initial cpuid={} base={:#x}",
+            (edx & (1 << 9) != 0) as u8,
+            crate::x86::rdmsr(IA32_APIC_BASE),
+        );
+    }
     let apic = setup_lapic_timer();
     if !apic {
         legacy_intr_and_pit();
@@ -889,8 +933,8 @@ fn init_mouse() -> bool {
 /// the timer chain directly so a freeze-at-first-IRQ on real hardware becomes
 /// readable on the VGA console instead of a black hang. Isolates the break:
 ///   1. Is the 8254 PIT counting?      (latch + sample channel 0 repeatedly)
-///   2. Does the 8259 master see IRQ0?  (read IRR bit 0 — IRQ0 is unmasked but
-///      IF=0, so the request latches and stays pending, never acked)
+///   2. Does the 8259 master see IRQ0?  (read IRR bit 0; the line is unmasked
+///      only on the legacy PIT path, and IF is still 0)
 ///
 /// If both pass but the kernel still freezes, the break is CPU delivery —
 /// LINT0 / virtual-wire routing through the (x2)APIC, the known UEFI failure.
@@ -913,8 +957,9 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
         samples[4], samples[5], samples[6], samples[7],
     );
 
-    // --- 2. 8259 master IRR — does the PIT pulse reach the PIC? IRQ0 was
-    // unmasked in init_interrupts; with IF=0 the request latches in IRR.
+    // --- 2. 8259 master IRR — does the PIT pulse reach the PIC? The legacy
+    // path unmasks IRQ0; LAPIC mode leaves it masked. With IF=0 a pending
+    // legacy request remains in IRR.
     // OCW3 0x0A selects IRR for the next read; restore ISR mode (0x0B) after,
     // since handle_irq's spurious check relies on the default ISR read.
     let mut irr_seen = 0u8;
@@ -930,21 +975,30 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
         irr_seen, mask, irr_seen & 1, mask & 1,
     );
 
-    // --- 3. APIC routing recap (which delivery path init_interrupts took).
+    // --- 3. APIC routing recap. CPUID may hide the APIC feature even when
+    // IA32_APIC_BASE is readable. setup_lapic_timer() already reads this MSR
+    // on family >= 6, so inspect the actual base and LINT0 state here too.
     let (sig, _, ecx1, edx1) = crate::x86::cpuid(1);
     let family = (sig >> 8) & 0xF;
-    let has_apic = family >= 6 && edx1 & (1 << 9) != 0;
-    if has_apic {
-        let base = crate::x86::rdmsr(0x1B);
-        let mode = if base & (1 << 11) == 0 { "disabled" }
-            else if base & (1 << 10) != 0 { "x2apic" }
-            else { "xapic" };
-        lib::compact_screenln!(screen,
-            "SELFTEST APIC base={:#x} mode={} (LINT0 ExtINT route is what carries IRQ0)",
-            base, mode,
-        );
+    let cpuid_apic = edx1 & (1 << 9) != 0;
+    if family >= 6 {
+        let base = crate::x86::rdmsr(IA32_APIC_BASE);
+        if base & APIC_BASE_ENABLE != 0 {
+            let mode = if base & APIC_BASE_X2 != 0 { "x2apic" } else { "xapic" };
+            lib::compact_screenln!(screen,
+                "SELFTEST APIC cpuid={} base={:#x} mode={} SVR={:#x} LINT0={:#x} timer_active={}",
+                cpuid_apic as u8, base, mode,
+                lapic_read(LAPIC_SVR), lapic_read(LAPIC_LVT_LINT0),
+                lapic_timer_active() as u8,
+            );
+        } else {
+            lib::compact_screenln!(screen,
+                "SELFTEST APIC cpuid={} base={:#x} mode=disabled (PIC needs direct INTR)",
+                cpuid_apic as u8, base,
+            );
+        }
     } else {
-        lib::compact_screenln!(screen, "SELFTEST APIC none (pure-PIC machine, INTR direct)");
+        lib::compact_screenln!(screen, "SELFTEST APIC pre-P6 (PIC needs direct INTR)");
     }
 
     // --- 4. CPU timer capabilities — picks the LAPIC-timer calibration path
@@ -977,8 +1031,8 @@ pub fn timer_selftest(screen: &mut lib::term::Term) {
 }
 
 /// Check the delivery side after `enter_ring1` has set IF. The pre-IRET
-/// self-test sees a PIT request in IRR, but cannot show whether the CPU ever
-/// accepts that request and enters our IRQ0 handler.
+/// self-test cannot show whether the CPU accepts the selected timer interrupt
+/// and enters our IRQ0 handler.
 pub fn timer_delivery_selftest(screen: &mut lib::term::Term) {
     let if_on = crate::x86::interrupts_enabled();
     let (irr, isr, imr) = master_pic_state();
