@@ -840,7 +840,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // intact while retroos.log and the in-memory LOG builtin retain the
         // suppressed command output.
         0x0A => {
-            lib::log::debug_byte(regs.rax as u8);
+            log_dos_byte(regs.rax as u8);
             regs.rax &= !0xFFFF;
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -866,7 +866,8 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log so a
+        // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log as CP437
+        // display text so a
         // booted system with no serial/debug port (real metal) can surface
         // kernel + dbg_println output. BX = line index (0 = oldest retained),
         // ES:DI = >=512-byte buffer. Output: CX = byte length, CF=0; CF=1 once
@@ -877,11 +878,13 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             let mut buf = [0u8; 512];
             match crate::kernel::klog::line(idx, &mut buf) {
                 Some(n) => {
+                    let mut display = [0u8; 512];
+                    let display_len = lib::cp437::display_line(&buf[..n], &mut display);
                     let dest = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
-                    for (i, &b) in buf[..n].iter().enumerate() {
+                    for (i, &b) in display[..display_len].iter().enumerate() {
                         machine.write::<u8>((dest + i as u32) as usize, b);
                     }
-                    regs.rcx = (regs.rcx & !0xFFFF) | (n as u64 & 0xFFFF);
+                    regs.rcx = (regs.rcx & !0xFFFF) | (display_len as u64 & 0xFFFF);
                     regs.clear_flag32(1);
                 }
                 None => regs.set_flag32(1),
@@ -1291,11 +1294,22 @@ fn cdrom_read_resume<A: crate::Arch>(
 
 /// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
 /// cursor see the correct position.
+fn log_dos_byte(c: u8) {
+    if c < 0x80 {
+        lib::log::debug_byte(c);
+    } else {
+        let mut utf8 = [0u8; 4];
+        for &byte in lib::cp437::decode(c).encode_utf8(&mut utf8).as_bytes() {
+            lib::log::debug_byte(byte);
+        }
+    }
+}
+
 fn dos_putchar<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, c: u8) {
     // Mirror to the log stream. This is the half worth keeping: the log is
     // unowned and non-ephemeral, so a program's output survives the scroll and
     // shows up in order next to everything else, whoever holds the screen.
-    lib::log::debug_byte(c);
+    log_dos_byte(c);
     // Render through DOS's own teletype — the same one INT 10h AH=0Eh uses,
     // on the BDA cursor that DOS programs read directly.
     super::bios::teletype(machine, dos, c, 0x07);

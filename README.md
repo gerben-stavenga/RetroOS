@@ -189,9 +189,11 @@ see `THIRD_PARTY_LICENSES.md` for attribution and adaptation licensing.
 Allocation against all legacy/PCI devices and AWE synthesis initialization
 are not implemented.
 
-Before the interactive startup program runs, RetroOS overwrites `C:\KLOG.TXT`
-with a snapshot of the boot log and flushes it. It then appends and flushes
-new log output after each completed line. If the line is emitted from an
+Before the interactive startup program runs, RetroOS saves a boot log snapshot
+to the first unused file on C:, starting with `KLOG.TXT`, then `KLOG0001.TXT`,
+`KLOG0002.TXT`, and so on. Earlier logs are preserved across boots. The file's
+VFS modification time follows the host RTC while the log is written. It then
+appends and flushes new log output after each completed line. If the line is emitted from an
 interrupt or while the filesystem lock is held, the bytes remain in the log
 ring and are flushed at the next safe line or event-loop pass. Failure to save
 does not stop startup. Live appends stop at 16 MiB to avoid filling C:. The file survives
@@ -202,6 +204,10 @@ earlier boot hang. The USB GRUB submenu **Boot diagnostics
 (no DN; stop for photo)** saves the log, displays USB/storage discovery results,
 and stops before launching any program. This is also available via the kernel
 argument `boot-log-only`.
+
+Saved logs use UTF-8, including characters printed by DOS programs in CP437.
+The DOS `LOG` command maps UTF-8 text back to CP437 for display; common Unicode
+punctuation has ASCII fallbacks, and unavailable glyphs show as a square.
 
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 `--host DIR` uses the live host tree with the hosted backend, or exports it as

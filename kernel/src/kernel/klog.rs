@@ -16,6 +16,10 @@ static LIVE_DIRTY: AtomicBool = AtomicBool::new(false);
 // -1: not started, -2: failed and disabled. Only startup/event-loop code uses
 // this handle; the byte logger itself never enters the filesystem.
 static LIVE_HANDLE: AtomicI32 = AtomicI32::new(-1);
+// 0 is KLOG.TXT; later boots use KLOG0001.TXT, etc. Live capture uses the
+// same index as the startup snapshot.
+static ACTIVE_LOG_INDEX: AtomicUsize = AtomicUsize::new(0);
+const MAX_LOG_INDEX: usize = 9999;
 
 pub struct KLogFs;
 
@@ -43,7 +47,7 @@ pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
     let mut bytes = alloc::vec![0; klog::byte_len() as usize];
     let len = klog::read(0, &mut bytes);
     bytes.truncate(len);
-    let path = backing_path();
+    let (index, path) = next_backing_path().ok_or(-28)?;
     let mut fds = [FdKind::None; MAX_FDS];
     let fd = vfs::create(&path, &mut fds);
     if fd < 0 {
@@ -59,23 +63,64 @@ pub fn save_boot_snapshot<A: crate::Arch>(machine: &mut A) -> Result<(), i32> {
             offset += n as usize;
         }
         let status = vfs::flush(fd, &fds);
-        if status < 0 { Err(status) } else { Ok(()) }
+        if status < 0 { return Err(status); }
+        Ok(())
     })();
     let status = vfs::close(fd, &mut fds);
     let result = result.and(if status < 0 { Err(status) } else { Ok(()) });
     if result.is_ok() {
+        ACTIVE_LOG_INDEX.store(index, Ordering::Release);
         SAVED_THROUGH.store(captured_through, Ordering::Release);
     }
     result
 }
 
-fn backing_path() -> Vec<u8> {
+fn filename(index: usize) -> Vec<u8> {
+    if index == 0 {
+        return b"KLOG.TXT".to_vec();
+    }
+    let mut name = b"KLOG0000.TXT".to_vec();
+    let mut number = index;
+    for digit in (4..8).rev() {
+        name[digit] = b'0' + (number % 10) as u8;
+        number /= 10;
+    }
+    name
+}
+
+pub fn saved_filename() -> Vec<u8> {
+    filename(ACTIVE_LOG_INDEX.load(Ordering::Acquire))
+}
+
+fn backing_path(index: usize) -> Vec<u8> {
     let mut path = crate::kernel::dos::c_root().to_vec();
     if !path.ends_with(b"/") {
         path.push(b'/');
     }
-    path.extend_from_slice(b"KLOG.TXT");
+    path.extend_from_slice(&filename(index));
     path
+}
+
+fn next_backing_path() -> Option<(usize, Vec<u8>)> {
+    for index in 0..=MAX_LOG_INDEX {
+        let path = backing_path(index);
+        if !crate::kernel::vfs::path_exists(&path) {
+            return Some((index, path));
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filename;
+
+    #[test]
+    fn numbered_logs_keep_dos_short_names() {
+        assert_eq!(filename(0), b"KLOG.TXT");
+        assert_eq!(filename(1), b"KLOG0001.TXT");
+        assert_eq!(filename(9999), b"KLOG9999.TXT");
+    }
 }
 
 /// Open the boot snapshot for incremental, durable appends. Called only after
@@ -85,7 +130,7 @@ pub fn start_live_capture() -> Result<(), i32> {
     if LIVE_HANDLE.load(Ordering::Acquire) >= 0 {
         return Ok(());
     }
-    let handle = vfs::open_to_handle(&backing_path());
+    let handle = vfs::open_to_handle(&backing_path(ACTIVE_LOG_INDEX.load(Ordering::Acquire)));
     if handle < 0 {
         return Err(handle);
     }
@@ -99,7 +144,7 @@ pub fn start_live_capture() -> Result<(), i32> {
     Ok(())
 }
 
-/// Append new klog bytes to C:\KLOG.TXT and flush them to the backing volume.
+/// Append new klog bytes to the selected boot file and flush them to the backing volume.
 /// Call at safe execution boundaries, not from `log::stream`: a log can be
 /// emitted while the VFS is locked or an interrupt handler is running.
 pub fn sync_live() {

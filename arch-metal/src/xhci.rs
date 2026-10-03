@@ -1018,6 +1018,12 @@ impl Controller {
             (3 + (31 - ep.interval.max(1).leading_zeros())).clamp(3, 10)
         };
         if !self.configure_endpoint(slot, dev.lane, pipe, ep, interval, stride) {
+            let _ = compact_fmt::writeln!(
+                &mut lib::log::DebugCon,
+                "xHCI: port {} {} endpoint setup failed (slot {} iface {} ep {} mps {} interval {})",
+                dev.port, if matches!(role, HidRole::Keyboard) { "keyboard" } else { "mouse" },
+                slot, ep.iface, ep.ep, ep.mps, interval
+            );
             return false;
         }
         {
@@ -1169,7 +1175,13 @@ impl Controller {
         // interrupt endpoint. This also handles a composite keyboard+mouse without
         // resetting its first interface while the second is being prepared.
         let keyboard_device_ready = keyboard.is_some_and(|(slot, dev, _)| {
-            self.control(slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0)
+            let ready = self.control(slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0);
+            if !ready {
+                let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
+                    "xHCI: port {} keyboard SET_CONFIGURATION {} failed (slot {})",
+                    dev.port, dev.cfg_value, slot);
+            }
+            ready
         });
         let mouse_device_ready = mouse.is_some_and(|(slot, dev, _)| {
             if keyboard.is_some_and(|(keyboard_slot, _, _)| keyboard_slot == slot) {

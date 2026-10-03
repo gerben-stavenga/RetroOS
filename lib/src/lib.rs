@@ -8,3 +8,4 @@ pub mod pipe;
 pub mod log;
 pub mod term;
 pub mod vga_fonts;
+pub mod cp437;

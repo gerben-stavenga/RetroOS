@@ -538,7 +538,7 @@ genrule(
 )
 
 # Small forum attachment for boot/input diagnostics. Keep the same kernel and
-# runtime, without games, compilers, or instrument samples.
+# DOS runtime, without games, compilers, Linux userland, or instrument samples.
 pkg_tar(
     name = "diagnostic_dos_tar",
     files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
@@ -549,7 +549,7 @@ pkg_tar(
 
 pkg_tar(
     name = "diagnostic_root_tar",
-    deps = [":bin_tar", ":diagnostic_dos_tar"],
+    deps = [":diagnostic_dos_tar"],
 )
 
 genrule(

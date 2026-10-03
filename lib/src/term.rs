@@ -185,6 +185,25 @@ impl Term {
         self.flush_aperture();
     }
 
+    fn put_display_glyph(&mut self, glyph: u8) {
+        if !self.screen_enabled { return; }
+        if self.cursor_y >= HEIGHT {
+            self.scroll();
+            self.cursor_y = HEIGHT - 1;
+        }
+        let offset = self.cursor_y * WIDTH + self.cursor_x;
+        self.put_cell(offset, (self.attr as u16) << 8 | glyph as u16);
+        self.cursor_x += 1;
+        if self.cursor_x >= WIDTH {
+            self.cursor_x = 0;
+            self.cursor_y += 1;
+        }
+        if self.cursor_y >= HEIGHT {
+            self.scroll();
+            self.cursor_y = HEIGHT - 1;
+        }
+    }
+
     pub fn putchar(&mut self, c: u8) {
         if !self.screen_enabled {
             return;
@@ -238,13 +257,7 @@ impl Term {
                 self.cursor_x = 0;
             }
             _ => {
-                let offset = self.cursor_y * WIDTH + self.cursor_x;
-                self.put_cell(offset, (self.attr as u16) << 8 | (c as u16));
-                self.cursor_x += 1;
-                if self.cursor_x >= WIDTH {
-                    self.cursor_x = 0;
-                    self.cursor_y += 1;
-                }
+                self.put_display_glyph(c);
             }
         }
 
@@ -259,9 +272,16 @@ impl Term {
 
 impl compact_fmt::Write for Term {
     fn write_str(&mut self, text: &str) -> compact_fmt::Result {
-        for byte in text.bytes() {
-            self.putchar(byte);
-            stream(byte);
+        for ch in text.chars() {
+            if ch.is_ascii() {
+                self.putchar(ch as u8);
+            } else {
+                self.put_display_glyph(crate::cp437::encode(ch));
+            }
+            let mut utf8 = [0u8; 4];
+            for &byte in ch.encode_utf8(&mut utf8).as_bytes() {
+                stream(byte);
+            }
         }
         text_flush();
         Ok(())

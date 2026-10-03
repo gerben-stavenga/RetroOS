@@ -1072,9 +1072,13 @@ fn run<A: crate::Arch>(
             }
         }
         match saved {
-            Ok(()) => crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT"),
+            Ok(()) => {
+                let filename = crate::kernel::klog::saved_filename();
+                crate::compact_screenln!(&mut screen, "Boot log saved to C:\\{}",
+                    core::str::from_utf8(&filename).unwrap_or("?"));
+            }
             Err(error) => crate::compact_screenln!(&mut screen,
-                "Boot log: could not save C:\\KLOG.TXT (error {})", error),
+                "Boot log: could not save on C: (error {})", error),
         }
         if boot.ram_overlay {
             crate::compact_screenln!(&mut screen, "Protected disk: log writes stay in RAM.");
@@ -1160,13 +1164,15 @@ fn run<A: crate::Arch>(
         core::str::from_utf8(&start_path).unwrap_or("?"));
     match crate::kernel::klog::save_boot_snapshot(machine) {
         Ok(()) => {
-            crate::compact_screenln!(&mut screen, "Boot log saved to C:\\KLOG.TXT");
+            let filename = crate::kernel::klog::saved_filename();
+            crate::compact_screenln!(&mut screen, "Boot log saved to C:\\{}",
+                core::str::from_utf8(&filename).unwrap_or("?"));
             if crate::kernel::klog::start_live_capture().is_ok() {
                 crate::kernel::klog::sync_live();
             }
         }
         Err(error) => crate::compact_screenln!(&mut screen,
-            "Boot log: could not save C:\\KLOG.TXT (error {})", error),
+            "Boot log: could not save on C: (error {})", error),
     }
     loop {
         (screen, sb) = run_program_with_screen(

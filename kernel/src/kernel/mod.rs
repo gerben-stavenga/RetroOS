@@ -33,6 +33,7 @@ pub mod platform;
 
 // ── Diagnostics ─────────────────────────────────────────────────────────
 pub mod klog;
+pub mod clock;
 pub mod osd;
 pub mod stacktrace;
 

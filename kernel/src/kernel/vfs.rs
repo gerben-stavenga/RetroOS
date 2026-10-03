@@ -297,6 +297,8 @@ pub struct FileEntry {
     /// RetroOS write through this handle? `write` only receives a handle, so
     /// the verdict has to be remembered rather than re-derived.
     pub writable: bool,
+    /// Creation or writes changed the VFS modification time; persist it on flush.
+    pub mtime_dirty: bool,
     pub access: OpenAccess,
     pub share: SharePolicy,
     /// Resolved path retained for path-oriented metadata operations.
@@ -694,6 +696,7 @@ impl Vfs {
             ino,
             mount_idx,
             writable,
+            mtime_dirty: false,
             access: OpenAccess::Read,
             share: SharePolicy::DenyNone,
             path: path.to_vec(),
@@ -719,12 +722,16 @@ impl Vfs {
         if idx < 0 || (idx as usize) >= self.file_table.len() { return -9; }
         let i = idx as usize;
         if self.file_table[i].refcount == 0 { return -9; }
+        let flushed = if self.file_table[i].refcount == 1 && self.file_table[i].mtime_dirty {
+            self.flush_handle(idx)
+        } else { 0 };
         self.file_table[i].refcount -= 1;
         if self.file_table[i].refcount == 0 {
             self.locks.retain(|l| l.owner != idx);
             let handle = self.file_table[i].vnode.handle;
             let midx = self.file_table[i].mount_idx;
-            return self.mount_fs(midx).clunk(handle);
+            let closed = self.mount_fs(midx).clunk(handle);
+            return if flushed < 0 { flushed } else { closed };
         }
         0
     }
@@ -1091,7 +1098,9 @@ impl Vfs {
                 self.claim(midx, subpath);
             }
             self.invalidate_dir_cache();
-            return self.install_handle(path, original_ino, midx, vnode, true);
+            let handle = self.install_handle(path, original_ino, midx, vnode, true);
+            self.touch_handle(handle);
+            return handle;
         }
 
         -13
@@ -1205,7 +1214,26 @@ impl Vfs {
     fn flush_handle(&mut self, handle: i32) -> i32 {
         let Some(object) = self.handle_object(handle) else { return -9 };
         let (fs, subpath) = (object.fs, object.subpath());
-        fs.flush(subpath)
+        let status = fs.flush(subpath);
+        if status < 0 { return status; }
+        if let Some(entry) = self.file_table.get(handle as usize)
+            && entry.mtime_dirty
+        {
+            if let Some(&timestamp) = self.mtimes.get(&entry.path) {
+                let _ = fs.set_mtime(subpath, timestamp);
+                let status = fs.flush(subpath);
+                if status < 0 { return status; }
+            }
+            self.file_table[handle as usize].mtime_dirty = false;
+        }
+        0
+    }
+
+    fn touch_handle(&mut self, handle: i32) {
+        let Some(timestamp) = crate::kernel::clock::rtc_unix_timestamp() else { return };
+        let Some(entry) = self.file_table.get_mut(handle as usize) else { return };
+        self.mtimes.insert(entry.path.clone(), timestamp);
+        entry.mtime_dirty = true;
     }
 
     fn handle_mtime(&self, handle: i32) -> Option<u32> {
@@ -1282,6 +1310,7 @@ impl Vfs {
             e.offset += n as u32;
             if e.offset > e.vnode.size { e.vnode.size = e.offset; }
             self.invalidate_dir_cache();
+            self.touch_handle(handle);
         }
         n
     }
