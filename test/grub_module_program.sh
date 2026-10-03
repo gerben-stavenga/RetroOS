@@ -30,7 +30,7 @@ run_program() {
         -display none -no-reboot >/dev/null 2>&1 || true
 
     grep -q 'Multiboot ext4 (32 MB, volatile RAM) → /$' "$log"
-    grep -q 'Multiboot ext4 (96 MB, volatile RAM) → /home/retroos/GAMES$' "$log"
+    grep -q 'Multiboot ext4 (128 MB, volatile RAM) → /home/retroos/GAMES$' "$log"
     ! grep -q 'KERNEL PANIC' "$log"
 }
 

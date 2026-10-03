@@ -933,6 +933,7 @@ fn text_cursor_tracks_page_shape_disable_and_blink_in_both_renderers() {
     let mut full = vec![0; w * h];
     let mut pal = vga::Pal::new();
     pal.sync(&palette, frame.dac_mask, PixelFormat::NATIVE, &mut [0; 768]);
+    pal.sync_planar(&ac);
     for phase in 0..4 {
         if phase == 1 { frame.text_cursor = vga::TextCursor::from_crtc(&crtc, false); }
         if phase == 2 {

@@ -96,9 +96,9 @@ def main():
             boot_log = subprocess.check_output(["mtype", "-i", str(disk), "::KLOG.TXT"])
             assert b"Interrupts initialized" in boot_log, boot_log
             assert b"Starting " in boot_log and b"DN.COM" in boot_log, boot_log
-            # Snapshot precedes DN and is not rewritten when DN restarts.
-            assert b"Dos Navigator  Version" not in boot_log, boot_log
-            assert b"Startup program exited" not in boot_log, boot_log
+            # KLOG is now synchronized while DN runs and survives its restart.
+            assert b"Dos Navigator  Version" in boot_log, boot_log
+            assert b"Startup program exited" in boot_log, boot_log
             history = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.HIS"])
             config = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.CFG"])
             assert b"STATECHECK" in history, history
