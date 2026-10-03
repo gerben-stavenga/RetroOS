@@ -266,14 +266,10 @@ impl AudioHw {
 /// (`apply_audio_mode`), never probed directly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Audio {
-    /// A real Sound Blaster answered on a LEGACY machine (real VGA scanout —
-    /// the 386/486/Pentium class, and QEMU's BIOS path with `-device sb16`):
-    /// the guest owns the card NATIVELY. DSP traffic forwards straight to the
-    /// hardware, guest 8237 programming is remapped onto the real chip, the
-    /// card's IRQ reaches the guest vPIC — zero kernel mixing, no kernel
-    /// sink, and no GM bank ROM is burned. Old hardware cannot afford the
-    /// emulated stack and does not need it: the machine IS the sound card the
-    /// games were written for.
+    /// The guest owns a real Sound Blaster. DSP traffic reaches the card,
+    /// guest 8237 programming is remapped, and its IRQ reaches the guest
+    /// vPIC. An independently detected HDA controller may still provide a
+    /// kernel sink for other sources and for a later switch to mixing.
     NativeSb,
     /// A real Sound Blaster on a BIOS machine that the owner chose to run
     /// EMULATED (`audio=mixed`): the software SB/GUS/GM are emulated as usual
@@ -284,8 +280,8 @@ pub enum Audio {
     /// software. Not a probe verdict: one card has one owner, so this is a
     /// judgment about CPU budget that only the machine's owner can make.
     SbSink,
-    /// No card; the software SB16 renders through the kernel sound API into an
-    /// Intel HD Audio controller found on PCI (QEMU `intel-hda`, modern metal).
+    /// The software SB16 renders into Intel HD Audio. A real SB may be parked
+    /// for a later switch to native DOS ownership or SB-backed mixing.
     EmulatedHda,
     /// No card; the software SB16 renders through the kernel sound API into
     /// the AC'97 codec found on PCI (UEFI-class metal).
@@ -536,17 +532,17 @@ pub fn apply_audio_mode<A: crate::Arch>(
         isapnp::SbProbe::Absent => sb16::scan(machine, declared),
         isapnp::SbProbe::Failed => None,
     };
+    let kernel_audio = p.audio_hw;
     if card.is_some() { p.audio_hw = AudioHw::Sb; }
-    // The mode is a choice only where there is a card to choose about, and
-    // `mixed` additionally needs a card that can BE the sink: the kernel mixer
-    // drives 16-bit signed-stereo auto-init, which an SB Pro cannot do at all.
-    // Refuse it loudly rather than programming 16-bit commands into a card
-    // that has no 16-bit channel and calling the resulting silence a mode.
+    // When HDA is present it is the kernel mixer's output, leaving the real
+    // SB available for native DOS ownership. Without HDA, mixed mode uses the
+    // SB itself and therefore requires its 16-bit DMA channel.
     p.audio = match (&card, mixed) {
-        (Some(c), true) if c.dma16.is_some() => Audio::SbSink,
+        (Some(_), true) if kernel_audio == AudioHw::Hda => Audio::EmulatedHda,
+        (Some(c), true) if c.dma16 == Some(5) => Audio::SbSink,
         (Some(_), true) => {
             crate::compact_println!(
-                "Audio: SB_AUDIO=mixed needs a 16-bit DMA channel and this card has none — \
+                "Audio: SB_AUDIO=mixed needs SB DMA channel 5 and this card lacks it — \
                  running the card natively instead"
             );
             Audio::NativeSb

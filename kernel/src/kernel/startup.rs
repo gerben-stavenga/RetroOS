@@ -286,7 +286,9 @@ fn prepare_audio<A: crate::Arch>(
     // the card travels — into whichever DOS thread holds the console, and back
     // out when that thread gives up focus or exits, exactly as the display
     // token does.
-    let for_sink = (platform.audio == crate::kernel::platform::Audio::SbSink)
+    let for_sink = matches!(platform.audio,
+        crate::kernel::platform::Audio::SbSink
+            | crate::kernel::platform::Audio::EmulatedHda)
         .then(|| sb_card.take())
         .flatten();
 
@@ -805,17 +807,20 @@ fn mount_filesystems(
             Some((source, prefix(&[home, b"RETROOS/"]), prefix(&[home, b"CONFIG/"])))
         } else { None };
 
-        // RAM content below C: is the diskless fallback; it must not hide
-        // disk games. Explicit modules outside C: keep their declared mounts.
+        // Keep bundled RAM content visible when C: comes from a data disk.
+        // Put the disk subtree above it so installed games and save files win,
+        // while bundled games remain a fallback for names absent on disk.
         for (module, volume) in modules.extra {
-            if module_index != Some(dos) && modules.root.is_some_and(|root|
-                module.mount().starts_with(root.c_root(boot))) {
-                continue;
-            }
             let mount = prefix(&[module.mount()]);
             let extra = Box::leak(volume.open(true)
                 .unwrap_or_else(|error| lib::compact_panic!("module mount failed: {}", error)));
             volume.mount_writable(mount, extra, b"");
+            if module_index != Some(dos)
+                && let Some(relative) = modules.root.as_ref()
+                    .and_then(|root| module.mount().strip_prefix(root.c_root(boot)))
+            {
+                vfs::bind_union(mount, prefix(&[data_home, relative]));
+            }
             crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /{}",
                 volume.name(), volume.volume.sectors / 2048,
                 core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?"));
@@ -2041,7 +2046,7 @@ fn apply_sound_mode_request<A: crate::Arch>(
 
     match request {
         SoundModeRequest::Kernel => {
-            if sink.is_some() {
+            if sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_sb) {
                 return;
             }
             let owned = thread::get_thread(threads, tid)
@@ -2056,6 +2061,11 @@ fn apply_sound_mode_request<A: crate::Arch>(
                     None => return,
                 },
             };
+            if let Some(hda) = sink.as_mut().filter(|sink| sink.is_hda()) {
+                hda.park_sb(card);
+                crate::compact_println!("sound: switched SB to kernel mixing through HDA");
+                return;
+            }
             match crate::kernel::sound::Sink::new_sb(machine, card) {
                 Ok(new_sink) => {
                     *sink = Some(new_sink);
@@ -2070,17 +2080,63 @@ fn apply_sound_mode_request<A: crate::Arch>(
             }
         }
         SoundModeRequest::Native => {
+            if let Some(hda) = sink.as_mut().filter(|sink| sink.is_hda()) {
+                let Some(card) = hda.take_parked_sb() else { return; };
+                machine.route_isa_irq(card.irq);
+                *sb_handoff = match thread::get_thread(threads, tid) {
+                    Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
+                    None => Some(card),
+                };
+                crate::compact_println!("sound: switched SB to native ownership; HDA remains active");
+                return;
+            }
             if !sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_sb) {
+                return;
+            }
+            if sink.as_ref().is_some_and(crate::kernel::sound::Sink::has_parked_hda) {
+                let mut hda = match sink.take().unwrap().switch_sb_to_hda() {
+                    Ok(hda) => hda,
+                    Err(original) => { *sink = Some(original); return; }
+                };
+                let card = hda.take_parked_sb().expect("SB sink carried its card");
+                *sink = Some(hda);
+                machine.route_isa_irq(card.irq);
+                *sb_handoff = match thread::get_thread(threads, tid) {
+                    Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
+                    None => Some(card),
+                };
+                crate::compact_println!("sound: switched SB to native ownership; HDA remains active");
                 return;
             }
             let Some(card) = sink.take().and_then(crate::kernel::sound::Sink::into_sb) else {
                 return;
             };
+            machine.route_isa_irq(card.irq);
             *sb_handoff = match thread::get_thread(threads, tid) {
                 Some(thread) => thread.personality.adopt_sb(machine, Some(card)),
                 None => Some(card),
             };
             crate::compact_println!("sound: switched SB to native ownership");
+        }
+        SoundModeRequest::Hda => {
+            let Some(current) = sink.take() else { return; };
+            *sink = Some(match current.switch_sb_to_hda() {
+                Ok(hda) => {
+                    crate::compact_println!("sound: kernel mixing through HDA");
+                    hda
+                }
+                Err(current) => current,
+            });
+        }
+        SoundModeRequest::Sb => {
+            let Some(current) = sink.take() else { return; };
+            *sink = Some(match current.switch_hda_to_sb(machine) {
+                Ok(sb) => {
+                    crate::compact_println!("sound: kernel mixing through SB");
+                    sb
+                }
+                Err(current) => current,
+            });
         }
     }
 }
@@ -2093,14 +2149,22 @@ fn sound_view<A: crate::Arch>(
     use crate::kernel::osd::SoundView;
     use crate::kernel::platform::Audio;
     match sink.and_then(crate::kernel::sound::Sink::sb_port) {
-        Some(port) => SoundView::KernelSb { port },
+        Some(port) => SoundView::KernelSb {
+            port,
+            can_hda: sink.is_some_and(crate::kernel::sound::Sink::has_parked_hda),
+        },
+        None if let Some(card) = sink.and_then(crate::kernel::sound::Sink::parked_sb) =>
+            SoundView::KernelHda { can_native: true, can_sb: card.dma16 == Some(5) },
         None => match handoff.or_else(|| personality.and_then(thread::Personality::physical_sb)) {
             Some(device) => SoundView::NativeSb {
                 port: device.base,
-                can_mix: device.dma16.is_some(),
+                can_mix: sink.is_some_and(crate::kernel::sound::Sink::is_hda)
+                    || device.dma16 == Some(5),
             },
             None => match crate::kernel::platform::get().audio {
-                Audio::EmulatedHda => SoundView::KernelHda,
+                Audio::EmulatedHda => SoundView::KernelHda { can_native: false, can_sb: false },
+                Audio::NativeSb if sink.is_some_and(crate::kernel::sound::Sink::is_hda) =>
+                    SoundView::KernelHda { can_native: false, can_sb: false },
                 Audio::EmulatedAc97 => SoundView::KernelAc97,
                 Audio::EmulatedPortWindow => SoundView::KernelHost,
                 Audio::EmulatedSilent => SoundView::KernelSilent,

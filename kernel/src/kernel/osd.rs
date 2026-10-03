@@ -47,19 +47,23 @@ enum SoundRow {
     Rate,
     HdaOutput,
     SwitchToNative,
+    SwitchToHda,
+    SwitchToSb,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SoundModeRequest {
     Kernel,
     Native,
+    Hda,
+    Sb,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SoundView {
     NativeSb { port: u16, can_mix: bool },
-    KernelSb { port: u16 },
-    KernelHda,
+    KernelSb { port: u16, can_hda: bool },
+    KernelHda { can_native: bool, can_sb: bool },
     KernelAc97,
     KernelHost,
     KernelSilent,
@@ -275,11 +279,23 @@ fn sound_row_for(sound: SoundView, item: usize) -> Option<SoundRow> {
             &[SoundRow::Status, SoundRow::SwitchToKernel]
         }
         SoundView::NativeSb { can_mix: false, .. } => &[SoundRow::Status],
-        SoundView::KernelSb { .. } => &[
+        SoundView::KernelSb { can_hda: true, .. } => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::SwitchToHda, SoundRow::SwitchToNative,
+        ],
+        SoundView::KernelSb { can_hda: false, .. } => &[
             SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
             SoundRow::SwitchToNative,
         ],
-        SoundView::KernelHda => &[
+        SoundView::KernelHda { can_native: true, can_sb: true } => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::HdaOutput, SoundRow::SwitchToSb, SoundRow::SwitchToNative,
+        ],
+        SoundView::KernelHda { can_native: true, can_sb: false } => &[
+            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::HdaOutput, SoundRow::SwitchToNative,
+        ],
+        SoundView::KernelHda { can_native: false, .. } => &[
             SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
             SoundRow::HdaOutput,
         ],
@@ -294,6 +310,8 @@ pub fn take_sound_mode_request() -> Option<SoundModeRequest> {
     let request = match SOUND_MODE_REQ.swap(0, Ordering::Relaxed) {
         1 => Some(SoundModeRequest::Kernel),
         2 => Some(SoundModeRequest::Native),
+        3 => Some(SoundModeRequest::Hda),
+        4 => Some(SoundModeRequest::Sb),
         _ => None,
     };
     if request.is_some() {
@@ -787,6 +805,8 @@ fn activate<A: crate::Arch>(
             Some(SoundRow::SwitchToNative) => {
                 SOUND_MODE_REQ.store(2, Ordering::Relaxed);
             }
+            Some(SoundRow::SwitchToHda) => SOUND_MODE_REQ.store(3, Ordering::Relaxed),
+            Some(SoundRow::SwitchToSb) => SOUND_MODE_REQ.store(4, Ordering::Relaxed),
             _ => {}
         },
         TAB_DISK => {
@@ -1298,6 +1318,8 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put(crate::kernel::drivers::hda::output_route_label());
             }
             Some(SoundRow::SwitchToNative) => line.put(b"Switch to native SB"),
+            Some(SoundRow::SwitchToHda) => line.put(b"Mix through HDA"),
+            Some(SoundRow::SwitchToSb) => line.put(b"Mix through SB"),
             _ => {}
         },
         TAB_DISK => match disk_row(item) {
@@ -1409,11 +1431,11 @@ fn sound_status_line(line: &mut Line, sound: SoundView) {
             line.put(b"native: SB port ");
             line.put_hex3(u32::from(port));
         }
-        SoundView::KernelSb { port } => {
+        SoundView::KernelSb { port, .. } => {
             line.put(b"kernel: SB port ");
             line.put_hex3(u32::from(port));
         }
-        SoundView::KernelHda => line.put(b"kernel: HDA"),
+        SoundView::KernelHda { .. } => line.put(b"kernel: HDA"),
         SoundView::KernelAc97 => line.put(b"kernel: AC97"),
         SoundView::KernelHost => line.put(b"kernel: host audio"),
         SoundView::KernelSilent => line.put(b"kernel: silent"),
@@ -1538,8 +1560,10 @@ mod tests {
     fn sound_items_reflect_audio_ownership() {
         assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true }), 2);
         assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false }), 1);
-        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220 }), 5);
-        assert_eq!(sound_item_count(SoundView::KernelHda), 5);
+        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: false }), 5);
+        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: true }), 6);
+        assert_eq!(sound_item_count(SoundView::KernelHda { can_native: false, can_sb: false }), 5);
+        assert_eq!(sound_item_count(SoundView::KernelHda { can_native: true, can_sb: true }), 7);
         assert_eq!(sound_item_count(SoundView::KernelAc97), 4);
         assert_eq!(sound_item_count(SoundView::KernelHost), 4);
         assert_eq!(sound_item_count(SoundView::KernelSilent), 4);

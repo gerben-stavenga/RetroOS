@@ -110,8 +110,11 @@ disks still mount read-only there.
 - `C:\TEMP` is always in RAM and starts empty. TEMP and fallback CONFIG share a
   sparse 32 MiB filesystem; memory is allocated as written.
 
-The boot source itself is not changed by config edits. RAM-backed game modules
-are used with RAM-backed C:; they do not cover games on a selected data disk.
+The boot source itself is not changed by config edits. Bundled games remain
+visible under `C:\GAMES` when C: comes from a data disk. Files already on the
+data disk take priority; missing games fall back to the RAM module. Changes to
+fallback game files are volatile, so install a game on the data disk to keep
+its saves and configuration.
 
 ## Virtual machine: retroos-vm.tar.gz
 

@@ -161,18 +161,29 @@ legacy DSP probing and mixer restrapping. A PnP configuration failure does
 not fall through to legacy restrapping. Discovery always logs the IDs of all
 readable ISA PnP logical devices, including non-audio functions.
 
+When both HDA and a real Sound Blaster are present, native mode gives the SB
+to DOS and keeps HDA available for kernel audio. `SB_AUDIO=mixed` starts with
+kernel mixing through HDA and parks the SB so DOS sees an emulated card. The
+Sound tab (F12) can switch among native SB, mixing through HDA, and mixing
+through SB. Mixing through SB requires a 16-bit DMA channel; on systems without
+HDA, the original native SB and SB mixing choices remain available.
+
 For dISAppointment hardware, select the USB GRUB **dISAppointment ISA bridge**
 submenu, or append `isa-lpc=disappointment` to the `multiboot` line (press `e`
 in GRUB, edit, then Ctrl-X to boot). This opt-in runs before PnP discovery.
-Currently supported: Intel desktop Z68/P67/H67/Q65 and Z77/H71/Z75/Q77/Q75/B75/H77
-LPC controllers at 00:1f.0, with a Fintek F85226 at 4E/4F. Unknown chipsets or
+Supported Intel LPC controllers include ICH6/ICH7, 6/7/8/9-series PCH, and
+X99 at 00:1f.0, with a Fintek F85226 at 4E/4F. Unknown chipsets or
 missing bridges are logged and skipped; the option is not required for normal
 PnP discovery or cards with working firmware/DOS routing. Setup replaces the
 four generic LPC decode windows with the dISAppointment sound/PnP ranges,
 configures the bridge timing, and resets ISA DMA while preserving PIC masks.
+It also restores LDRQ1# from GPIO23 mode when GPIO control is unlocked, so
+boards that use this pin for LPC DMA can transfer audio data.
 Readback failure restores previous bridge/decode settings. Physical validation
-is still needed; other chipset generations and a bridge strapped to 2E/2F
-are not supported yet. The diagnostic submenu leaves logs on screen for a photo.
+is still needed; a bridge strapped to 2E/2F is not supported. Some ASUS
+boards reportedly route only ports below 3FFh to LPC, preventing ISA PnP
+configuration through the default A00h window. The diagnostic submenu leaves
+logs on screen for a photo.
 Inspired by [rasteri's dISAppointment / sapphisa](https://github.com/rasteri/dISAppointment/blob/main/software/sapphisa.c);
 see `THIRD_PARTY_LICENSES.md` for attribution and adaptation licensing.
 Allocation against all legacy/PCI devices and AWE synthesis initialization

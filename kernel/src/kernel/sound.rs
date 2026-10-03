@@ -138,6 +138,10 @@ impl sound::sink::Device for Output {
 /// value of this type owns a real device and meaningful hardware cursors.
 pub struct Sink {
     inner: sound::sink::Sink<Output>,
+    /// The real SB is unavailable to DOS while HDA renders its emulated card.
+    parked_sb: Option<crate::kernel::drivers::sb16::Sb16>,
+    /// HDA waits here while the SB is the kernel mixer's output.
+    parked_hda: Option<&'static mut crate::kernel::drivers::hda::Hda>,
     producer: sound::Pacer,
     last_consumed: u64,
     ns_since_cursor: u64,
@@ -146,9 +150,8 @@ pub struct Sink {
 }
 
 impl Sink {
-    /// Build the sink the boot policy chose, taking the Sound Blaster when the
-    /// owner asked for the mixer (`SB_AUDIO=mixed`) — and then holding it,
-    /// which is what makes the sink its owner.
+    /// Build the boot-selected output. HDA may own a parked SB in mixed mode,
+    /// or run alongside a native SB owned by a DOS thread.
     pub fn new<A: crate::Arch>(
         machine: &mut A,
         probed: crate::kernel::platform::AudioToken,
@@ -157,6 +160,7 @@ impl Sink {
         use crate::kernel::platform::{Audio, AudioToken};
         // Probe mints one concrete device capability. The match exists only at
         // composition time; every runtime operation dispatches through it.
+        let mut parked_sb = None;
         let selected: Option<(&'static mut [Frame], Output)> = match (
             crate::kernel::platform::get().audio,
             probed,
@@ -167,7 +171,11 @@ impl Sink {
                 let ring = session.ring();
                 Some((ring, Output::Sb { device, session }))
             }
-            (Audio::EmulatedHda, AudioToken::Hda(dev), _) => {
+            (Audio::EmulatedHda, AudioToken::Hda(dev), card) => {
+                parked_sb = card;
+                Some((dev.ring(), Output::Hda(dev)))
+            }
+            (Audio::NativeSb, AudioToken::Hda(dev), None) => {
                 Some((dev.ring(), Output::Hda(dev)))
             }
             (Audio::EmulatedAc97, AudioToken::Ac97(dev), _) => {
@@ -180,12 +188,13 @@ impl Sink {
             // back as a real canonical audio card, with the host generating
             // the completions.
             (Audio::EmulatedPortWindow, _, _) => return None,
-            // NativeSb: a DOS thread has the card, so the mixer has nothing to
-            // play through. Same for a mixer mode with no card to take.
+            // No usable kernel output for this policy and detected hardware.
             _ => None,
         };
         let (buf, output) = selected?;
-        Some(Self::from_output(buf, output))
+        let mut sink = Self::from_output(buf, output);
+        sink.parked_sb = parked_sb;
+        Some(sink)
     }
 
     pub fn new_sb<A: crate::Arch>(
@@ -204,6 +213,8 @@ impl Sink {
         let rate = inner.rate();
         Sink {
             inner,
+            parked_sb: None,
+            parked_hda: None,
             producer: sound::Pacer::new(rate),
             last_consumed: 0,
             ns_since_cursor: 0,
@@ -221,6 +232,60 @@ impl Sink {
 
     pub fn is_sb(&self) -> bool {
         matches!(self.inner.device_ref(), Output::Sb { .. })
+    }
+
+    pub fn is_hda(&self) -> bool {
+        matches!(self.inner.device_ref(), Output::Hda(_))
+    }
+
+    pub fn has_parked_hda(&self) -> bool { self.parked_hda.is_some() }
+
+    pub fn parked_sb(&self) -> Option<&crate::kernel::drivers::sb16::Sb16> {
+        self.parked_sb.as_ref()
+    }
+
+    pub fn park_sb(&mut self, card: crate::kernel::drivers::sb16::Sb16) {
+        assert!(self.is_hda() && self.parked_sb.is_none());
+        self.parked_sb = Some(card);
+    }
+
+    pub fn take_parked_sb(&mut self) -> Option<crate::kernel::drivers::sb16::Sb16> {
+        self.parked_sb.take()
+    }
+
+    fn with_hda(
+        dev: &'static mut crate::kernel::drivers::hda::Hda,
+        card: Option<crate::kernel::drivers::sb16::Sb16>,
+    ) -> Self {
+        let mut sink = Self::from_output(dev.ring(), Output::Hda(dev));
+        sink.parked_sb = card;
+        sink
+    }
+
+    /// Move the SB from HDA's parked slot into the kernel output. On failure,
+    /// restore the HDA sink with both device tokens still owned.
+    pub fn switch_hda_to_sb<A: crate::Arch>(self, machine: &mut A) -> Result<Self, Self> {
+        if !self.is_hda() || self.parked_sb.as_ref().is_none_or(|card| card.dma16 != Some(5)) {
+            return Err(self);
+        }
+        let Self { inner, parked_sb, .. } = self;
+        let Output::Hda(hda) = inner.into_device() else { unreachable!() };
+        let card = parked_sb.expect("checked above");
+        match Self::new_sb(machine, card) {
+            Ok(mut sink) => {
+                sink.parked_hda = Some(hda);
+                Ok(sink)
+            }
+            Err(card) => Err(Self::with_hda(hda, Some(card))),
+        }
+    }
+
+    /// Return SB kernel output to HDA, parking the SB for a later mode change.
+    pub fn switch_sb_to_hda(self) -> Result<Self, Self> {
+        if !self.is_sb() || self.parked_hda.is_none() { return Err(self); }
+        let Self { inner, parked_hda, .. } = self;
+        let Output::Sb { device, .. } = inner.into_device() else { unreachable!() };
+        Ok(Self::with_hda(parked_hda.expect("checked above"), Some(device)))
     }
 
     pub fn sb_port(&self) -> Option<u16> {

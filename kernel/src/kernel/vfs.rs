@@ -2383,6 +2383,37 @@ mod tests {
     }
 
     #[test]
+    fn bundled_games_fill_gaps_below_persistent_games() {
+        let data = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let bundled = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        assert_eq!(data.mkdir(b"GAMES"), 0);
+        for (fs, name) in [(&*data as &dyn Filesystem, b"GAMES/DOOM.EXE".as_slice()),
+                            (&*bundled as &dyn Filesystem, b"DOOM.EXE".as_slice()),
+                            (&*bundled as &dyn Filesystem, b"DIGGER.EXE".as_slice())] {
+            let file = fs.create(name).unwrap();
+            fs.clunk(file.handle);
+        }
+        let mut vfs = Vfs::new();
+        vfs.mount(b"dosfs/", data);
+        vfs.bind(b"home/retroos/", b"dosfs/", super::MountMode::Replace);
+        vfs.mount(b"home/retroos/GAMES/", bundled);
+        vfs.bind(b"home/retroos/GAMES/", b"dosfs/GAMES/", super::MountMode::Union);
+        assert!(vfs.path_exists(b"home/retroos/GAMES/DIGGER.EXE"));
+        let doom = vfs.open_to_handle(b"home/retroos/GAMES/DOOM.EXE");
+        assert!(doom >= 0);
+        assert_eq!(vfs.file_table[doom as usize].mount_idx, 0);
+        vfs.close_handle(doom);
+
+        let empty_data = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+        let mut empty_vfs = Vfs::new();
+        empty_vfs.mount(b"dosfs/", empty_data);
+        empty_vfs.bind(b"home/retroos/", b"dosfs/", super::MountMode::Replace);
+        empty_vfs.mount(b"home/retroos/GAMES/", bundled);
+        empty_vfs.bind(b"home/retroos/GAMES/", b"dosfs/GAMES/", super::MountMode::Union);
+        assert!(empty_vfs.path_exists(b"home/retroos/GAMES/DIGGER.EXE"));
+    }
+
+    #[test]
     fn adding_a_mount_after_lookup_refreshes_directory_entries() {
         let root = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
         let host = alloc::boxed::Box::leak(crate::kernel::fs::session::new());

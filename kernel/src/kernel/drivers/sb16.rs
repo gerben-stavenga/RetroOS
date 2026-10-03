@@ -41,8 +41,10 @@ const DMA5_PAGE: u16 = 0x8B;
 // single(0x40) | auto-init(0x10) | read/mem→dev(0x08) | channel-local 1 (5−4).
 const DMA5_MODE_AUTO_READ: u8 = 0x59;
 
-// ── ring geometry (shares the stolen low-mem DMA window with ac97/hda) ───────
-const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xC_0000;
+// ── ring geometry ────────────────────────────────────────────────────────────
+// Keep the entire 128 KiB ISA channel alias clear of HDA's BAR at C0000 and
+// its DMA ring at C8000..D1FFF. Both may be live on an SB + HDA machine.
+const DMA_WIN_VA: usize = crate::LOW_MEM_BASE + 0xD_8000;
 const PTE_CACHE_DISABLE: u64 = 1 << 4;
 // ── ring geometry ───────────────────────────────────────────────────────────
 const BUF_BYTES: usize = 0x800;
