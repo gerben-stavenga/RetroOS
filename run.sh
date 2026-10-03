@@ -87,7 +87,7 @@ fi
 [ "$BACKEND" != 86box ] || [ "$FIRMWARE" = bios ] || fail "86Box requires BIOS"
 if [ "$BACKEND" = unipcemu ]; then
     [ "$FIRMWARE" = bios ] || fail "UniPCemu requires BIOS"
-    [ "$ARCH" = 686 ] || fail "UniPCemu currently uses its Pentium/i430fx machine (--arch 686)"
+    [ "$ARCH" = 686 ] || fail "UniPCemu requires --arch 686 for i430fx or i440fx"
     [ "$HD" = ata ] || fail "UniPCemu requires ATA disks"
 fi
 [ -z "$HOST_DIR" ] || [ -d "$HOST_DIR" ] || fail "host directory does not exist: $HOST_DIR"

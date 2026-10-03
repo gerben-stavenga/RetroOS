@@ -173,6 +173,7 @@ def main():
         rom = work / 'ROM'
         rom.mkdir()
         (rom / 'BIOSROM.i430fx.BIN').write_bytes(b'test ROM')
+        (rom / 'BIOSROM.i440fx.BIN').write_bytes(b'test i440fx ROM')
         fake_unipcemu = work / 'fake-unipcemu'
         fake_unipcemu.write_text('''#!/usr/bin/env python3
 import configparser
@@ -182,21 +183,28 @@ from pathlib import Path
 root = Path(os.environ['UNIPCEMU'])
 settings = configparser.ConfigParser()
 assert settings.read(root / 'SETTINGS.INI')
-assert settings['machine']['architecture'] == '4'
+assert settings['machine']['architecture'] == os.environ['EXPECTED_ARCHITECTURE']
 assert settings['machine']['executionmode'] == '4'
-assert settings['machine']['cpu'] == '5'
 assert settings['bios']['bootorder'] == os.environ['EXPECTED_BOOTORDER']
-assert settings['i430fxCMOS']['memory'] == '134217728'
-assert settings['disks']['hdd0'] == os.environ['EXPECTED_HDD0']
-assert settings['disks']['hdd1'] == os.environ['EXPECTED_HDD1']
-assert settings['disks']['cdrom0'] == os.environ['EXPECTED_CDROM']
-assert settings['video']['videocard'] == os.environ['EXPECTED_VIDEO']
-assert settings['video']['ET4000_extensions'] == os.environ['EXPECTED_ET4000']
-assert (root / 'ROM/BIOSROM.i430fx.BIN').read_bytes() == b'test ROM'
+section = settings[os.environ['EXPECTED_CMOS_SECTION']]
+assert section['memory'] == '134217728'
+assert section['cpu'] == os.environ['EXPECTED_CPU']
+assert section['clockingmode'] == '1'
+assert section['hdd0'] == os.environ['EXPECTED_HDD0']
+assert section['hdd1'] == os.environ['EXPECTED_HDD1']
+assert section['cdrom0'] == os.environ['EXPECTED_CDROM']
+assert section['videocard'] == os.environ['EXPECTED_VIDEO']
+assert section['ET4000_extensions'] == os.environ['EXPECTED_ET4000']
+assert section['soundblaster'] == os.environ['EXPECTED_SOUNDBLASTER']
+assert not settings.has_section('disks')
+assert not settings.has_section('sound')
+assert not settings.has_option('machine', 'cpu')
+assert (root / 'ROM' / os.environ['EXPECTED_ROM']).is_file()
 assert (root / 'disks/data.img').resolve() == Path(os.environ['RETROOS_DATA_IMAGE']).resolve()
 if os.environ.get('EXPECTED_BOOT_IMAGE'):
     assert (root / 'disks/boot.img').resolve() == Path(os.environ['EXPECTED_BOOT_IMAGE']).resolve()
-assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLASTER']
+if os.environ.get('EXPECTED_ISO_IMAGE'):
+    assert (root / 'disks/boot.iso').resolve() == Path(os.environ['EXPECTED_ISO_IMAGE']).resolve()
 ''')
         fake_unipcemu.chmod(0o755)
         missing_rom = subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
@@ -207,7 +215,11 @@ assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLAST
         for sound, expected in [('sb', '4'), ('none', '0')]:
             env = os.environ.copy()
             env.update(UNIPCEMU_BIN=str(fake_unipcemu), RETROOS_DATA_IMAGE=str(vm / 'data.img'),
-                       UNIPCEMU_ROM_DIR=str(rom), EXPECTED_SOUNDBLASTER=expected,
+                       UNIPCEMU_ROM_DIR=str(rom), UNIPCEMU_ARCH='i430fx',
+                       UNIPCEMU_ISO_IMAGE='', UNIPCEMU_USB_IMAGE='',
+                       EXPECTED_SOUNDBLASTER=expected,
+                       EXPECTED_ARCHITECTURE='4', EXPECTED_CMOS_SECTION='i430fxCMOS',
+                       EXPECTED_CPU='5', EXPECTED_ROM='BIOSROM.i430fx.BIN',
                        EXPECTED_BOOTORDER='14', EXPECTED_HDD0='boot.img', EXPECTED_HDD1='data.img',
                        EXPECTED_CDROM='', EXPECTED_VIDEO='0', EXPECTED_ET4000='0')
             subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu', '--sound', sound],
@@ -220,7 +232,18 @@ assert settings['i430fxCMOS']['soundblaster'] == os.environ['EXPECTED_SOUNDBLAST
                    EXPECTED_SOUNDBLASTER='4')
         subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
                        cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
-        print('PASS: packaged UniPCemu launcher requires a BIOS ROM and configures USB image as HDD and video')
+        env.update(UNIPCEMU_USB_IMAGE='', UNIPCEMU_ISO_IMAGE=str(OUTPUT / 'retroos_grub_module.iso'),
+                   EXPECTED_BOOTORDER='13', EXPECTED_HDD0='data.img', EXPECTED_HDD1='',
+                   EXPECTED_CDROM='boot.iso', EXPECTED_BOOT_IMAGE='',
+                   EXPECTED_ISO_IMAGE=str(OUTPUT / 'retroos_grub_module.iso'))
+        subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
+                       cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
+        env.update(UNIPCEMU_ARCH='i440fx', EXPECTED_ARCHITECTURE='5',
+                   EXPECTED_CMOS_SECTION='i440fxCMOS', EXPECTED_CPU='7',
+                   EXPECTED_ROM='BIOSROM.i440fx.BIN')
+        subprocess.run([str(vm / 'run.sh'), '--backend', 'unipcemu'],
+                       cwd=vm, env=env, check=True, stdout=subprocess.DEVNULL)
+        print('PASS: packaged UniPCemu launcher configures current CMOS sections, USB HDD, CD ISO, and i440fx')
         # No Bazel invocation: this launcher must consume only the release.
         cases = [('bios', cpu, hd) for cpu in ('386', '686') for hd in ('ata', 'ahci', 'nvme')]
         cases += [('uefi', 'x64', hd) for hd in ('ata', 'ahci', 'nvme')]

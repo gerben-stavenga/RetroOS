@@ -138,6 +138,24 @@ Run the prebuilt disk image with:
 UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM ./run.sh --backend unipcemu
 ```
 
+For CD-ROM boot, download `retroos_grub_module.iso` alongside the VM bundle:
+
+```sh
+UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM \
+UNIPCEMU_ISO_IMAGE=/path/to/retroos_grub_module.iso \
+./run.sh --backend unipcemu
+```
+
+This mounts the ISO as `cdrom0`, boots from CD-ROM, and attaches `data.img` as
+the writable hard disk. To fill the desktop on a high-DPI Wayland display,
+pass UniPCemu's `fullscreenwindow` argument after `--`:
+
+```sh
+UNIPCEMU_ROM_DIR=/path/to/UniPCemu/ROM \
+UNIPCEMU_ISO_IMAGE=/path/to/retroos_grub_module.iso \
+./run.sh --backend unipcemu -- fullscreenwindow
+```
+
 To try the GRUB module boot with ET4000/W32i video in UniPCemu, use the USB
 image as its first virtual hard disk:
 
@@ -147,11 +165,16 @@ UNIPCEMU_USB_IMAGE=/path/to/retroos_grub_module_usb.img \
 UNIPCEMU_VIDEO=et4000w32 ./run.sh --backend unipcemu
 ```
 
-The image boots as `boot.img`, with `data.img` as the second virtual hard
-disk. `UNIPCEMU_VIDEO` defaults to `vga`; `et4000w32` selects UniPCemu's
+The default disk image boots as `boot.img`, with `data.img` as the second
+virtual hard disk. `UNIPCEMU_VIDEO` defaults to `vga`; `et4000w32` selects UniPCemu's
 ET4000/W32i emulation. The appropriate video option ROM, such as
 `ET4000_W32.BIN`, can also be placed in the ROM directory. Set
 `UNIPCEMU_BIN=/path/to/UniPCemu` if the executable is not on `PATH`.
+The launcher writes CPU, clock, video, sound, and disk settings under
+`[i430fxCMOS]`, as required by current UniPCemu. `UNIPCEMU_ARCH=i440fx`
+selects `[i440fxCMOS]` and requires `BIOSROM.i440fx.BIN`. Superfury reports
+an FPU emulation issue with the current i440fx BIOS, so i430fx remains the
+default.
 The launcher copies the ROM directory into temporary session storage and
 does not modify the originals. UniPCemu may still require its BIOS setup to
 detect disks; its `Set` button opens the emulator settings. The author's
