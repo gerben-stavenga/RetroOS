@@ -149,6 +149,13 @@ pub struct Sink {
     census: Census,
 }
 
+/// A mode change returns the one sink value in either case; ownership never
+/// disappears when a requested output cannot be opened.
+pub enum OutputSwitch {
+    Changed(Sink),
+    Unchanged(Sink),
+}
+
 impl Sink {
     /// Build the boot-selected output. HDA may own a parked SB in mixed mode,
     /// or run alongside a native SB owned by a DOS thread.
@@ -264,9 +271,9 @@ impl Sink {
 
     /// Move the SB from HDA's parked slot into the kernel output. On failure,
     /// restore the HDA sink with both device tokens still owned.
-    pub fn switch_hda_to_sb<A: crate::Arch>(self, machine: &mut A) -> Result<Self, Self> {
+    pub fn switch_hda_to_sb<A: crate::Arch>(self, machine: &mut A) -> OutputSwitch {
         if !self.is_hda() || self.parked_sb.as_ref().is_none_or(|card| card.dma16 != Some(5)) {
-            return Err(self);
+            return OutputSwitch::Unchanged(self);
         }
         let Self { inner, parked_sb, .. } = self;
         let Output::Hda(hda) = inner.into_device() else { unreachable!() };
@@ -274,18 +281,18 @@ impl Sink {
         match Self::new_sb(machine, card) {
             Ok(mut sink) => {
                 sink.parked_hda = Some(hda);
-                Ok(sink)
+                OutputSwitch::Changed(sink)
             }
-            Err(card) => Err(Self::with_hda(hda, Some(card))),
+            Err(card) => OutputSwitch::Unchanged(Self::with_hda(hda, Some(card))),
         }
     }
 
     /// Return SB kernel output to HDA, parking the SB for a later mode change.
-    pub fn switch_sb_to_hda(self) -> Result<Self, Self> {
-        if !self.is_sb() || self.parked_hda.is_none() { return Err(self); }
+    pub fn switch_sb_to_hda(self) -> OutputSwitch {
+        if !self.is_sb() || self.parked_hda.is_none() { return OutputSwitch::Unchanged(self); }
         let Self { inner, parked_hda, .. } = self;
         let Output::Sb { device, .. } = inner.into_device() else { unreachable!() };
-        Ok(Self::with_hda(parked_hda.expect("checked above"), Some(device)))
+        OutputSwitch::Changed(Self::with_hda(parked_hda.expect("checked above"), Some(device)))
     }
 
     pub fn sb_port(&self) -> Option<u16> {

@@ -2095,8 +2095,10 @@ fn apply_sound_mode_request<A: crate::Arch>(
             }
             if sink.as_ref().is_some_and(crate::kernel::sound::Sink::has_parked_hda) {
                 let mut hda = match sink.take().unwrap().switch_sb_to_hda() {
-                    Ok(hda) => hda,
-                    Err(original) => { *sink = Some(original); return; }
+                    crate::kernel::sound::OutputSwitch::Changed(hda) => hda,
+                    crate::kernel::sound::OutputSwitch::Unchanged(original) => {
+                        *sink = Some(original); return;
+                    }
                 };
                 let card = hda.take_parked_sb().expect("SB sink carried its card");
                 *sink = Some(hda);
@@ -2121,21 +2123,21 @@ fn apply_sound_mode_request<A: crate::Arch>(
         SoundModeRequest::Hda => {
             let Some(current) = sink.take() else { return; };
             *sink = Some(match current.switch_sb_to_hda() {
-                Ok(hda) => {
+                crate::kernel::sound::OutputSwitch::Changed(hda) => {
                     crate::compact_println!("sound: kernel mixing through HDA");
                     hda
                 }
-                Err(current) => current,
+                crate::kernel::sound::OutputSwitch::Unchanged(current) => current,
             });
         }
         SoundModeRequest::Sb => {
             let Some(current) = sink.take() else { return; };
             *sink = Some(match current.switch_hda_to_sb(machine) {
-                Ok(sb) => {
+                crate::kernel::sound::OutputSwitch::Changed(sb) => {
                     crate::compact_println!("sound: kernel mixing through SB");
                     sb
                 }
-                Err(current) => current,
+                crate::kernel::sound::OutputSwitch::Unchanged(current) => current,
             });
         }
     }
