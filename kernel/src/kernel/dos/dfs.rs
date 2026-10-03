@@ -171,8 +171,12 @@ pub mod ci {
     /// name on hit. Populates the cache on miss.
     pub fn lookup(vfs_dir: &[u8], alias: &[u8]) -> Option<&'static [u8]> {
         let dir = ensure_cached(vfs_dir);
-        let index = *dir.aliases.get(alias)?;
-        Some(dir.entries[index].1.original.as_slice())
+        if let Some(&index) = dir.aliases.get(alias) {
+            return Some(dir.entries[index].1.original.as_slice());
+        }
+        let decoded = lfn::decode_oem(alias);
+        dir.entries.iter().find(|(_, entry)| lfn::equal(&entry.original, &decoded))
+            .map(|(_, entry)| entry.original.as_slice())
     }
 
     /// LFN lookup accepts either namespace spelling; matching policy is DOS
@@ -198,11 +202,19 @@ pub mod ci {
 /// not. Used to decide whether a name fits 8.3 and to filter chars when
 /// generating an alias.
 fn is_dos_legal(b: u8) -> bool {
-    matches!(b,
+    b >= 0x80 || matches!(b,
         b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
         | b'!' | b'#' | b'$' | b'%' | b'&' | b'\''
         | b'(' | b')' | b'-' | b'@' | b'^' | b'_'
         | b'`' | b'{' | b'}' | b'~')
+}
+
+fn oem_upper(byte: u8) -> u8 {
+    lib::codepage::current_codepage().uppercase(byte)
+}
+
+fn upper_oem(name: &[u8]) -> Vec<u8> {
+    name.iter().map(|&byte| oem_upper(byte)).collect()
 }
 
 /// True if the name fits a strict DOS 8.3 (single dot, ≤8 base, ≤3 ext, all
@@ -227,24 +239,25 @@ fn fits_8_3(name: &[u8]) -> bool {
 /// N grown until unique; base shrinks as digits grow so alias stays ≤8 base.
 #[inline(never)]
 fn compute_alias_8_3(name: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> Vec<u8> {
-    if fits_8_3(name) {
-        let alias: Vec<u8> = name.iter().map(|b| b.to_ascii_uppercase()).collect();
+    let (oem_name, replaced) = lfn::encode_oem(name);
+    if !replaced && fits_8_3(&oem_name) {
+        let alias = upper_oem(&oem_name);
         if !alias_taken(&alias, existing) {
             return alias;
         }
     }
 
-    let last_dot = name.iter().rposition(|&b| b == b'.').unwrap_or(name.len());
-    let base_src = &name[..last_dot];
-    let ext_src = if last_dot < name.len() { &name[last_dot + 1..] } else { &b""[..] };
+    let last_dot = oem_name.iter().rposition(|&b| b == b'.').unwrap_or(oem_name.len());
+    let base_src = &oem_name[..last_dot];
+    let ext_src = if last_dot < oem_name.len() { &oem_name[last_dot + 1..] } else { &b""[..] };
 
     let base_clean: Vec<u8> = base_src.iter()
         .filter(|&&b| is_dos_legal(b))
-        .map(|b| b.to_ascii_uppercase())
+        .map(|&b| oem_upper(b))
         .collect();
     let ext_clean: Vec<u8> = ext_src.iter()
         .filter(|&&b| is_dos_legal(b))
-        .map(|b| b.to_ascii_uppercase())
+        .map(|&b| oem_upper(b))
         .take(3)
         .collect();
 
@@ -276,7 +289,7 @@ fn compute_alias_8_3(name: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> Vec<u8
     }
     // Ran out of digits — fall back to a guaranteed-unique key. Shouldn't
     // happen in practice (>1M same-prefix files in one dir).
-    name.iter().map(|b| b.to_ascii_uppercase()).collect()
+    upper_oem(&oem_name)
 }
 
 /// Native aliases are authoritative. Reserve them and real 8.3 filenames
@@ -291,11 +304,16 @@ fn assign_directory_aliases(entries: &[vfs::DirEntry]) -> Vec<Vec<u8>> {
                 let Some(short) = &entry.short_name else { continue };
                 short.as_bytes()
             } else {
-                let name = &entry.name[..entry.name_len];
-                if !fits_8_3(name) { continue; }
-                name
+                let (name, replaced) = lfn::encode_oem(&entry.name[..entry.name_len]);
+                if replaced || !fits_8_3(&name) { continue; }
+                let alias = upper_oem(&name);
+                if !used.contains_key(&alias) {
+                    used.insert(alias.clone(), index);
+                    assigned[index] = Some(alias);
+                }
+                continue;
             };
-            let alias: Vec<u8> = name.iter().map(u8::to_ascii_uppercase).collect();
+            let alias = upper_oem(name);
             if !used.contains_key(&alias) {
                 used.insert(alias.clone(), index);
                 assigned[index] = Some(alias);
@@ -458,7 +476,8 @@ impl DfsState {
     fn store_cwd_slot(&mut self, slot: usize, mut s: &[u8]) {
         while s.first() == Some(&b'/') { s = &s[1..]; }
         while s.last() == Some(&b'/') { s = &s[..s.len()-1]; }
-        self.cwd[slot] = s.iter().map(|&b| if b == b'/' { b'\\' } else { b.to_ascii_uppercase() }).collect();
+        let (name, _) = lfn::encode_oem(s);
+        self.cwd[slot] = name.iter().map(|&b| if b == b'/' { b'\\' } else { oem_upper(b) }).collect();
     }
 
     /// Resolve a DOS input path to absolute DOS form `"X:\UPPER\PATH"`.
@@ -504,7 +523,7 @@ impl DfsState {
 
         for &b in rest {
             if pos >= out.len() { return Err(3); }
-            out[pos] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+            out[pos] = if b == b'/' { b'\\' } else { oem_upper(b) };
             pos += 1;
         }
 
@@ -620,9 +639,10 @@ pub fn vfs_to_dos(vfs: &[u8], out: &mut [u8; DFS_PATH_MAX]) -> usize {
     if pos + 3 > out.len() { return pos; }
     out[pos] = drive; out[pos+1] = b':'; out[pos+2] = b'\\';
     pos += 3;
-    for &b in s {
+    let (name, _) = lfn::encode_oem(s);
+    for &b in &name {
         if pos >= out.len() { break; }
-        out[pos] = if b == b'/' { b'\\' } else { b.to_ascii_uppercase() };
+        out[pos] = if b == b'/' { b'\\' } else { oem_upper(b) };
         pos += 1;
     }
     pos
@@ -713,7 +733,8 @@ fn walk_components(
                         if *pos >= out.len() { return Err(3); }
                         out[*pos] = b'/'; *pos += 1;
                     }
-                    for &b in comp {
+                    let decoded = if lfn { comp.to_vec() } else { lfn::decode_oem(comp) };
+                    for &b in &decoded {
                         if *pos >= out.len() { return Err(3); }
                         out[*pos] = b; *pos += 1;
                     }
@@ -777,7 +798,28 @@ fn canonicalize_components(buf: &mut [u8], len: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{DfsState, DFS_PATH_MAX, compute_alias_8_3, strip_drive_prefix};
+    #[test]
+    fn cp437_short_names_cross_the_utf8_vfs_boundary() {
+        let page = lib::codepage::current_codepage();
+        assert_eq!(page.id, 437);
+        assert!(lib::codepage::codepage(850).is_some());
+        for byte in u8::MIN..=u8::MAX {
+            assert_eq!(page.encode_exact(page.decode(byte)), Some(byte));
+            assert_eq!(page.encode_display(page.decode(byte)), byte);
+        }
+        assert_eq!(page.encode_display('—'), b'-');
+        assert_eq!(page.encode_display('⇒'), 0x1a); // right arrow glyph
+        assert_eq!(page.encode_display('\u{00a0}'), 0xff); // exact beats space lookalike
+        assert_eq!(page.encode_display('🦀'), 0xfe);
+        let dfs = DfsState::new();
+        let mut absolute = [0; DFS_PATH_MAX];
+        let len = dfs.resolve(b"C:\\caf\x82.txt", &mut absolute).unwrap();
+        assert_eq!(&absolute[..len], b"C:\\CAF\x90.TXT");
+        assert_eq!(compute_alias_8_3("café.txt".as_bytes(), &BTreeMap::new()), b"CAF\x90.TXT");
+        assert_eq!(lfn::decode_oem(b"CAF\x90.TXT"), "CAFÉ.TXT".as_bytes());
+    }
+
+    use super::{DfsState, DFS_PATH_MAX, compute_alias_8_3, lfn, strip_drive_prefix};
     use alloc::collections::BTreeMap;
 
     #[test]
@@ -916,5 +958,24 @@ mod tests {
         assert_eq!(&dos[..len], b"B:\\GAME.SAV");
         let (prefix_len, _) = strip_drive_prefix(&dos[..len], &mut vfs).unwrap();
         assert_eq!(&vfs[..prefix_len], b"floppyb");
+    }
+
+    #[test]
+    fn installed_dos_pages_roundtrip_and_have_matching_fonts() {
+        for id in [437, 850, 852, 866] {
+            let page = lib::codepage::codepage(id).unwrap();
+            let fonts = page.fonts();
+            assert_eq!(fonts.h8.len(), 256 * 8);
+            assert_eq!(fonts.h14.len(), 256 * 14);
+            assert_eq!(fonts.h16.len(), 256 * 16);
+            for byte in u8::MIN..=u8::MAX {
+                assert_eq!(page.encode_exact(page.decode(byte)), Some(byte), "page {id} byte {byte:#x}");
+            }
+        }
+        let central = lib::codepage::codepage(852).unwrap();
+        assert_eq!(central.decode(0x9f), 'č');
+        let cyrillic = lib::codepage::codepage(866).unwrap();
+        assert_eq!(cyrillic.decode(0x80), 'А');
+        assert_eq!(cyrillic.uppercase(0xa0), 0x80);
     }
 }

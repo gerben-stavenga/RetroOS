@@ -6,20 +6,20 @@ use crate::kernel::vfs;
 
 pub const PATH_MAX: usize = 260;
 pub const NAME_MAX: usize = 255;
-// Active DOS code page is 437. Bytes below 0x80 retain ASCII semantics.
-const OEM_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+// VFS names are UTF-8; guest names use the active DOS code page.
 
 pub fn decode_oem(name: &[u8]) -> Vec<u8> {
-    name.iter().map(|&b| if b < 128 { b as char } else {
-        OEM_HIGH.chars().nth((b - 128) as usize).unwrap_or('_')
-    }).collect::<String>().into_bytes()
+    let mut result = String::new();
+    let page = lib::codepage::current_codepage();
+    for &byte in name { result.push(page.decode(byte)); }
+    result.into_bytes()
 }
 
 pub fn encode_oem(name: &[u8]) -> (Vec<u8>, bool) {
     let mut replaced = false;
+    let page = lib::codepage::current_codepage();
     let result = String::from_utf8_lossy(name).chars().map(|ch| {
-        if ch.is_ascii() { ch as u8 }
-        else if let Some(index) = OEM_HIGH.chars().position(|c| c == ch) { 128 + index as u8 }
+        if let Some(byte) = page.encode_exact(ch) { byte }
         else { replaced = true; b'_' }
     }).collect();
     (result, replaced)
@@ -234,6 +234,17 @@ mod tests {
         let mut legacy = alloc::vec![0; vfs::PATH_KEY_MAX];
         let len = DfsState::to_vfs_open(&path.short, &mut legacy).unwrap();
         assert_eq!(&legacy[..len], &path.vfs);
+
+        // Legacy INT 21h paths also enter the UTF-8 VFS through CP437.
+        let mut abs = [0; super::super::DFS_PATH_MAX];
+        let len = dfs.resolve(b"H:\\caf\x82.txt", &mut abs).unwrap();
+        let n = DfsState::to_vfs_create(&abs[..len], &mut legacy).unwrap();
+        assert_eq!(&legacy[..n], "host/CAFÉ.TXT".as_bytes());
+        let handle = vfs::create_to_handle(&legacy[..n]);
+        assert!(handle >= 0);
+        vfs::close_vfs_handle(handle);
+        let n = DfsState::to_vfs_open(&abs[..len], &mut legacy).unwrap();
+        assert_eq!(&legacy[..n], "host/CAFÉ.TXT".as_bytes());
     }
     #[test]
     fn lfn_normalization_preserves_spaces_and_case() {
@@ -246,7 +257,7 @@ mod tests {
     #[test]
     fn oem_roundtrip_and_folding() {
         let all: Vec<u8> = (32..=255).collect();
-        assert_eq!(OEM_HIGH.chars().count(), 128);
+        assert_eq!(lib::codepage::current_codepage().glyphs.len(), 256);
         assert_eq!(encode_oem(&decode_oem(&all)), (all, false));
         assert!(equal("Été.txt".as_bytes(), "été.TXT".as_bytes()));
         assert_eq!(encode_oem("snow☃.txt".as_bytes()), (b"snow_.txt".to_vec(), true));

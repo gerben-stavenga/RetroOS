@@ -276,7 +276,7 @@ impl compact_fmt::Write for Term {
             if ch.is_ascii() {
                 self.putchar(ch as u8);
             } else {
-                self.put_display_glyph(crate::cp437::encode(ch));
+                self.put_display_glyph(crate::codepage::current_codepage().encode_display(ch));
             }
             let mut utf8 = [0u8; 4];
             for &byte in ch.encode_utf8(&mut utf8).as_bytes() {

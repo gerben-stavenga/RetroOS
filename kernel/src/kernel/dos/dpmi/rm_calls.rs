@@ -120,7 +120,7 @@ pub(in crate::kernel::dos) fn direct_int21_iret<A: crate::Arch>(
         machine::set_vm86_flags(regs, Transfer::Iret.entry_flags(rm.flags));
 
         let action = super::super::dos::dispatch_synchronous_rm_int21(
-            machine, kt, dos, regs,
+            machine, bios_display, kt, dos, regs,
         );
         let mut result = RmCallStruct::capture(regs);
         // 0302's procedure has returned: its control fields describe the call

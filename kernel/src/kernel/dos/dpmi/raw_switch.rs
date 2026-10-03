@@ -71,7 +71,7 @@ pub(in crate::kernel::dos) fn pm_stub_dispatch<A: crate::Arch>(
             super::super::dosabi::pmdos_int10_handler(machine, bios_display, dos, regs)
         }
         dos::SLOT_PMDOS_INT21 => {
-            super::super::dosabi::pmdos_int21_handler(machine, kt, dos, regs)
+            super::super::dosabi::pmdos_int21_handler(machine, bios_display, kt, dos, regs)
         }
         dos::SLOT_PMDOS_INT33 => {
             super::super::dosabi::pmdos_int33_handler(machine, dos, regs)

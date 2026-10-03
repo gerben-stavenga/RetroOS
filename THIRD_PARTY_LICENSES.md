@@ -5,12 +5,11 @@ explicitly licensed adaptations below. Dependencies are fetched at build time
 and some derived code is maintained in-tree. This file credits their authors
 and records their licenses.
 
-> **Redistribution note.** Some components are copyleft. In particular, a build
-> that links **unicorn** (GPL-2.0) produces a **GPL-2.0**
-> binary. RetroOS is distributed as *source* (you build it yourself), so no
-> combined-work distribution obligation is triggered here — but if you
-> redistribute a compiled binary, that binary is GPL-2.0. RetroOS's own source
-> stays WTFPL regardless.
+> **Redistribution note.** Some components are copyleft. Builds embedding the
+> FreeDOS CPI fonts carry GPL-2.0-or-later terms; hosted builds linking
+> **unicorn** also carry GPL-2.0 terms. RetroOS's own source stays WTFPL,
+> while distribution of a compiled binary must honor the included components'
+> licenses.
 
 ## Copyleft
 
@@ -18,8 +17,15 @@ and records their licenses.
 |---|---|---|---|
 | **unicorn** (`unicorn-engine`, `unicorn-engine-sys`, C core) | CPU emulation (hosted TCG backend) | GPL-2.0 | Unicorn Engine — https://www.unicorn-engine.org |
 | **nuked-opl3** | OPL3 (YMF262) FM synthesis core | LGPL-2.1 | Nuke.YKT et al. — https://github.com/nukeykt/Nuked-OPL3 |
+| **FreeDOS CPI fonts** (`lib/src/fonts`) | VGA 8×8, 8×14, and 8×16 glyphs for CP850, CP852, CP866 | GPL-2.0-or-later | Henrique Peron — https://github.com/FDOS/cpi |
 
 ## Derived work in-tree
+
+The font bitmaps are extracted from FreeDOS CPI's `ega.cpx` and `ega3.cpx`.
+The original CPX files, upstream readme, and GPL text are preserved in
+`third_party/freedos_cpi/`. The Unicode byte mappings in
+`lib/src/codepage_tables.rs` come from the [Unicode Consortium's Microsoft DOS
+mapping files](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/).
 
 | Component | Used for | License | Author / project |
 |---|---|---|---|

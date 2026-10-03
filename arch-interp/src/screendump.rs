@@ -1,7 +1,7 @@
 //! Host-side VGA text-screen snapshot. DOS programs like DN draw their UI
 //! directly into VGA text memory at guest physical `0xB8000` (80x25 cells of
 //! char + attribute), bypassing the `0xE9` debug console — so stdout shows
-//! nothing. This renders that text buffer to a UTF-8 file (CP437 → Unicode,
+//! nothing. This renders that text buffer to a UTF-8 file (active code page → Unicode,
 //! box-drawing intact) so the headless interpreter's screen is inspectable.
 //!
 //! Guest RAM is thread-local to the CPU thread, so the actual read happens in
@@ -11,7 +11,6 @@
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
-use lib::cp437::TABLE as CP437;
 
 /// Guest physical base of VGA text memory (mode 3, color).
 const TEXT_BASE: usize = 0xB8000;
@@ -87,7 +86,7 @@ pub fn maybe_render_live() {
                 let _ = write!(out, "\x1b[0;{};{}m", fg, bg);
                 cur_attr = attr;
             }
-            out.push(CP437[(cell & 0xFF) as usize]);
+            out.push(lib::codepage::current_codepage().decode_glyph(cell as u8));
         }
     }
     out.push_str("\x1b[0m");
@@ -117,7 +116,7 @@ pub fn maybe_dump() {
     }
     let Some(path) = DUMP_PATH.get() else { return };
     // Any graphics mode: dump the latest kernel-rendered frame as a PPM. Text
-    // modes (0x00-0x03, 0x07) fall through to the CP437 character dump below
+    // modes (0x00-0x03, 0x07) fall through to the character dump below
     // (more useful as grep-able text than as pixels). This must cover the EGA
     // 16-colour planar family (0x0D/0x0E/0x10, Commander Keen) and Mode X, not
     // just linear mode 13h — gating on ==0x13 left Keen's screenshot blank.
@@ -140,7 +139,7 @@ pub fn maybe_dump() {
     for row in 0..ROWS {
         for col in 0..COLS {
             let cell: u16 = mem.read(TEXT_BASE + (row * COLS + col) * 2);
-            out.push(CP437[(cell & 0xFF) as usize]);
+            out.push(lib::codepage::current_codepage().decode_glyph(cell as u8));
         }
         out.push('\n');
     }

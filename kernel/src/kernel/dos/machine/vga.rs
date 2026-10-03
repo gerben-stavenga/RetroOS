@@ -1172,7 +1172,7 @@ pub fn on_set_mode<A: crate::Arch>(
             planes,
             vga.layout(),
             0,
-            &lib::vga_fonts::FONT_8X16,
+            lib::codepage::current_codepage().fonts().h16,
             16,
         );
     }
@@ -1398,9 +1398,9 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
         },
     };
     let (cell_h, font): (u32, &[u8]) = match mode {
-        0x0F | 0x10 => (14, &lib::vga_fonts::FONT_8X14),
-        0x11 | 0x12 => (16, &lib::vga_fonts::FONT_8X16),
-        0x04 | 0x05 | 0x06 | 0x0D | 0x0E | 0x13 => (8, &lib::vga_fonts::FONT_8X8),
+        0x0F | 0x10 => (14, lib::codepage::current_codepage().fonts().h14),
+        0x11 | 0x12 => (16, lib::codepage::current_codepage().fonts().h16),
+        0x04 | 0x05 | 0x06 | 0x0D | 0x0E | 0x13 => (8, lib::codepage::current_codepage().fonts().h8),
         _ => return false, // text mode (0..3, 7) — caller writes a char cell
     };
     let base = ch as usize * cell_h as usize;

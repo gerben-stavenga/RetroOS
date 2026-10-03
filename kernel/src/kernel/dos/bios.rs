@@ -318,9 +318,10 @@ fn install_rom_font<A: crate::Arch>(machine: &mut A) {
     let font14 = super::dos::font_8x14_addr();
     let font16 = super::dos::font_8x16_addr();
     machine.copy_to(ROM_FONT_8X8, &lib::vga_fonts::FONT_8X8[..1024]);
-    machine.copy_to(font8 as usize, &lib::vga_fonts::FONT_8X8);
-    machine.copy_to(font14 as usize, &lib::vga_fonts::FONT_8X14);
-    machine.copy_to(font16 as usize, &lib::vga_fonts::FONT_8X16);
+    let fonts = lib::codepage::current_codepage().fonts();
+    machine.copy_to(font8 as usize, fonts.h8);
+    machine.copy_to(font14 as usize, fonts.h14);
+    machine.copy_to(font16 as usize, fonts.h16);
     set_data_vector(machine, 0x1F, font8 + 128 * 8);
     publish_active_font(machine, 16); // POST starts in 80x25, 8x16 mode 3.
 }
@@ -906,9 +907,9 @@ fn font_service<A: crate::Arch>(
             machine.copy_from(src, &mut owned);
             (first, glyph_h, &owned)
         }
-        0x01 | 0x11 => (0, 14, &lib::vga_fonts::FONT_8X14),
-        0x02 | 0x12 => (0, 8, &lib::vga_fonts::FONT_8X8),
-        0x04 | 0x14 => (0, 16, &lib::vga_fonts::FONT_8X16),
+        0x01 | 0x11 => (0, 14, lib::codepage::current_codepage().fonts().h14),
+        0x02 | 0x12 => (0, 8, lib::codepage::current_codepage().fonts().h8),
+        0x04 | 0x14 => (0, 16, lib::codepage::current_codepage().fonts().h16),
         0x03 => {
             if let Some(display) = dos.pc.vga.native_mut() {
                 let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, None);
@@ -943,6 +944,42 @@ fn font_service<A: crate::Arch>(
         sync_cursor_shape(machine, dos);
         sync_cursor_position(machine, dos);
     }
+}
+
+/// Replace RetroOS's BIOS font tables and the active VGA character map.
+/// Called before publishing a new DOS code page so the byte meanings and
+/// displayed glyphs change together.
+pub(super) fn install_codepage_font<A: crate::Arch>(
+    machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    dos: &mut super::DosState<A>,
+    page: &lib::codepage::CodePage,
+) -> bool {
+    let fonts = page.fonts();
+    let cell_height: u16 = bda_field!(machine, cell_height);
+    let height = match cell_height as usize {
+        8 => 8,
+        14 => 14,
+        _ => 16,
+    };
+    let font: &[u8] = match height { 8 => fonts.h8, 14 => fonts.h14, _ => fonts.h16 };
+    let installed = if let Some(display) = dos.pc.vga.native_mut() {
+        let mut call = Regs::empty();
+        call.rax = 0x1100;
+        call.rbx = (height as u64) << 8;
+        call.rcx = 256;
+        display.cap_mut().bios_font_call(machine, bios_display, &mut call, Some(font)).is_ok()
+    } else {
+        super::machine::vga::bios_load_font(machine, &mut dos.pc.vga, 0, 0, font, height);
+        super::machine::vga::bios_load_font(machine, &mut dos.pc.vga, 1, 0, font, height);
+        true
+    };
+    if installed {
+        machine.copy_to(super::dos::font_8x8_addr() as usize, fonts.h8);
+        machine.copy_to(super::dos::font_8x14_addr() as usize, fonts.h14);
+        machine.copy_to(super::dos::font_8x16_addr() as usize, fonts.h16);
+    }
+    installed
 }
 
 /// Linear address of one text cell. A page is 0x1000 bytes in the 80-column
@@ -1215,6 +1252,9 @@ pub(super) fn int10<A: crate::Arch>(
             // Sequencer chain-4 bit, so this is the only place the trap gets
             // armed. (`clear` also blanks the planes.)
             super::machine::vga::on_set_mode(machine, &mut dos.pc, regs, mode, clear);
+            if dos.pc.vga.is_native() && lib::codepage::current_codepage().id != 437 {
+                let _ = install_codepage_font(machine, bios_display, dos, lib::codepage::current_codepage());
+            }
             sync_cursor_shape(machine, dos);
             sync_cursor_position(machine, dos);
             // The IBM BIOS programs the CGA compatibility registers (0x3D8

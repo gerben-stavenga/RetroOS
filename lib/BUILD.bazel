@@ -43,6 +43,7 @@ rust_test(
 rust_library(
     name = "lib",
     srcs = glob(["src/**/*.rs"]),
+    compile_data = glob(["src/fonts/*.bin"]),
     crate_name = "lib",
     edition = "2024",
     rustc_flags = [

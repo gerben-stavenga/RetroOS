@@ -341,6 +341,7 @@ pub(super) fn poll_suspended_call<A: crate::Arch>(
 /// the call (V86 stack pop, PM return-frame restore, etc.).
 fn dispatch_kernel_syscall<A: crate::Arch>(
     machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -363,7 +364,7 @@ fn dispatch_kernel_syscall<A: crate::Arch>(
                 thread::KernelAction::Exit(0)
             }
         }
-        0x21 => int_21h(machine, kt, dos, regs, &mut suspension),
+        0x21 => int_21h(machine, bios_display, kt, dos, regs, &mut suspension),
         // DOS 1.x TSR entry: DX is the byte offset of the first byte after
         // the resident image, measured from the PSP segment.
         0x27 => {
@@ -432,7 +433,7 @@ pub(super) fn rm_vector_dispatch<A: crate::Arch>(machine: &mut A, bios_display: 
             let caller_flags = read_u16(machine, vm86_ss(regs) as u32, (vm86_sp(regs) as u32).wrapping_add(4));
             machine::set_vm86_flags(regs, caller_flags as u32);
             let (action, suspension) =
-                dispatch_kernel_syscall(machine, kt, dos, regs, vector);
+                dispatch_kernel_syscall(machine, bios_display, kt, dos, regs, vector);
             // Exit replaces thread state outright — skip the iret-frame
             // pop entirely. Anything else (Done, ForkExec, Yield, Switch)
             // leaves the issuing thread alive and needs regs.CS:EIP
@@ -567,7 +568,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
 /// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
-pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
+pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // 16-bit DPMI clients issue INT 21h with 16-bit register parameters; the
     // high 16 bits of EAX..EBP are undefined and real (16-bit) DOS never
     // touches them. Zero them for the duration of servicing so every handler's
@@ -593,7 +594,7 @@ pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, kt: &mut thre
 
     let al_in = regs.rax as u8;
     let mut suspension = None;
-    let action = int_21h(machine, kt, dos, regs, &mut suspension);
+    let action = int_21h(machine, bios_display, kt, dos, regs, &mut suspension);
 
     if mask16 {
         // Pointer-returning calls hand a 32-bit LINEAR through LOW_MEM_SEL
@@ -866,7 +867,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             regs.clear_flag32(1);
             thread::KernelAction::Done
         }
-        // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log as CP437
+        // AH=07h — SYNTH_LOG_LINE: read back the in-memory kernel log as DOS
         // display text so a
         // booted system with no serial/debug port (real metal) can surface
         // kernel + dbg_println output. BX = line index (0 = oldest retained),
@@ -879,7 +880,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             match crate::kernel::klog::line(idx, &mut buf) {
                 Some(n) => {
                     let mut display = [0u8; 512];
-                    let display_len = lib::cp437::display_line(&buf[..n], &mut display);
+                    let display_len = lib::codepage::current_codepage().display_line(&buf[..n], &mut display);
                     let dest = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
                     for (i, &b) in display[..display_len].iter().enumerate() {
                         machine.write::<u8>((dest + i as u32) as usize, b);
@@ -1299,7 +1300,7 @@ fn log_dos_byte(c: u8) {
         lib::log::debug_byte(c);
     } else {
         let mut utf8 = [0u8; 4];
-        for &byte in lib::cp437::decode(c).encode_utf8(&mut utf8).as_bytes() {
+        for &byte in lib::codepage::current_codepage().decode(c).encode_utf8(&mut utf8).as_bytes() {
             lib::log::debug_byte(byte);
         }
     }
@@ -1612,6 +1613,7 @@ fn terminate_resident<A: crate::Arch>(
 
 fn int_21h<A: crate::Arch>(
     machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
@@ -2815,6 +2817,27 @@ fn int_21h<A: crate::Arch>(
                 }
             }
         }
+        // AX=6601h/6602h: query or select the global DOS code page. The
+        // display font is installed before byte-to-Unicode conversion changes.
+        0x66 => match regs.rax as u8 {
+            0x01 => {
+                regs.rbx = (regs.rbx & !0xffff) | u64::from(lib::codepage::current_codepage().id);
+                regs.rdx = (regs.rdx & !0xffff) | 437; // boot/system page
+                DosExit::Ok
+            }
+            0x02 => {
+                let id = regs.rbx as u16;
+                match lib::codepage::codepage(id) {
+                    Some(page) if page.id == lib::codepage::current_codepage().id => DosExit::Ok,
+                    Some(page) if super::bios::install_codepage_font(machine, bios_display, dos, page) => {
+                        lib::codepage::select_codepage(id);
+                        DosExit::Ok
+                    }
+                    _ => DosExit::Error(0x26), // code page not prepared
+                }
+            }
+            _ => DosExit::Error(1),
+        },
         // AH=0x67: Set Handle Count
         0x67 => {
             let requested = (regs.rbx as u16) as usize;
@@ -3207,12 +3230,13 @@ pub(super) fn int21_is_synchronous(ah: u8) -> bool {
 /// value, so pointer translation retains real-mode segment semantics.
 pub(super) fn dispatch_synchronous_rm_int21<A: crate::Arch>(
     machine: &mut A,
+    bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
     kt: &mut thread::KernelThread<A>,
     dos: &mut thread::DosState<A>,
     regs: &mut Regs,
 ) -> thread::KernelAction {
     let mut suspension = None;
-    let action = int_21h(machine, kt, dos, regs, &mut suspension);
+    let action = int_21h(machine, bios_display, kt, dos, regs, &mut suspension);
     debug_assert!(suspension.is_none());
     action
 }
@@ -4889,22 +4913,9 @@ pub(crate) const SLOT_KBD_INTERCEPT_RETURN: u8 = 0x16;
 /// INT 21h/AH=38h country-information case-map far-call entry.
 const SLOT_COUNTRY_UPCASE: u8 = 0x17;
 
-/// DOS country-info case map for code page 437. Characters without a
-/// one-byte uppercase equivalent keep their original value.
+/// DOS country-info case map for the active guest code page.
 fn country_upcase(ch: u8) -> u8 {
-    match ch {
-        0x81 => 0x9A, // ü → Ü
-        0x82 => 0x90, // é → É
-        0x84 => 0x8E, // ä → Ä
-        0x86 => 0x8F, // å → Å
-        0x87 => 0x80, // ç → Ç
-        0x91 => 0x92, // æ → Æ
-        0x94 => 0x99, // ö → Ö
-        0xA4 => 0xA5, // ñ → Ñ
-        0xE5 => 0xE4, // σ → Σ
-        0xED => 0xE8, // φ → Φ
-        _ => ch,
-    }
+    lib::codepage::current_codepage().uppercase(ch)
 }
 
 pub(crate) const fn vbe_window_ptr() -> u32 {
