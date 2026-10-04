@@ -175,6 +175,11 @@ kernel mixing through HDA and parks the SB so DOS sees an emulated card. The
 Sound tab (F12) can switch among native SB, mixing through HDA, and mixing
 through SB. Mixing through SB requires a 16-bit DMA channel; on systems without
 HDA, the original native SB and SB mixing choices remain available.
+In native SB16 mode, the Sound tab also adjusts the card's Master, Wave (DSP),
+FM/MIDI, and CD input levels independently in 10% steps. The CD control changes
+the analog CD input on the card; CD-ROM data support does not provide Redbook
+audio playback. These levels are live mixer settings and may be changed by a
+DOS program that reprograms the card.
 
 For dISAppointment hardware, select the USB GRUB **dISAppointment ISA bridge**
 submenu, or append `isa-lpc=disappointment` to the `multiboot` line (press `e`

@@ -11,7 +11,7 @@
 //! syscall-trace gate, Profile live cycle accounting, Dump the register/VGA
 //! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
 //! `Exit` for the focused thread, exactly as the SEGV path does). The Sound tab
-//! controls the kernel mix gain and, when present, the physical SB master mixer.
+//! controls the kernel mix gain and, in native SB16 mode, the card's source mixer.
 //!
 //! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
 //! called from [`console`](crate::kernel::console), which has the `machine`/
@@ -44,6 +44,9 @@ enum SoundRow {
     SwitchToKernel,
     Volume,
     SbMaster,
+    SbWave,
+    SbFm,
+    SbCd,
     Latency,
     Rate,
     HdaOutput,
@@ -58,6 +61,15 @@ pub enum SoundModeRequest {
     Native,
     Hda,
     Sb,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SbSource { Wave, Fm, Cd }
+
+impl SbSource {
+    pub const ALL: [Self; 3] = [Self::Wave, Self::Fm, Self::Cd];
+    pub const fn index(self) -> usize { self as usize }
+    pub const fn left_register(self) -> u8 { 0x32 + self as u8 * 2 }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,6 +143,11 @@ static SB_MASTER_RAW: AtomicU32 = AtomicU32::new(0xcc);
 static SB_MASTER_OVERRIDE: AtomicBool = AtomicBool::new(false);
 /// Pending hardware write, encoded as register value + 1 so zero means none.
 static SB_MASTER_REQ: AtomicU32 = AtomicU32::new(0);
+/// Packed left/right CT1745 levels (register bits 7:3), read from hardware.
+static SB_SOURCE_RAW: [AtomicU32; 3] = [AtomicU32::new(0xf8f8), AtomicU32::new(0xf8f8), AtomicU32::new(0xf8f8)];
+static SB_SOURCE_OVERRIDE: [AtomicBool; 3] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+/// Requested 5-bit level plus one, so zero means no pending write.
+static SB_SOURCE_REQ: [AtomicU32; 3] = [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
 static PRESENTATION_REQ: AtomicBool = AtomicBool::new(false);
@@ -212,6 +229,17 @@ fn sb_master_raw(percent: u32) -> u8 {
     (level << 4) | level
 }
 
+fn sb_source_percent(raw: u32) -> u32 {
+    let left = (raw >> 11) & 31;
+    let right = (raw >> 3) & 31;
+    let percent = ((left + right) * 100 + 31) / 62;
+    ((percent + 5) / VOL_STEP * VOL_STEP).min(VOL_MAX)
+}
+
+fn sb_source_level(percent: u32) -> u8 {
+    ((percent * 31 + 50) / 100) as u8
+}
+
 fn parse_volume_percent(raw: &[u8]) -> Option<u32> {
     let mut value = 0u32;
     if raw.is_empty() {
@@ -286,15 +314,17 @@ fn active_item_count(tab: usize, sound: SoundView) -> usize {
 }
 
 fn sound_item_count(sound: SoundView) -> usize {
-    (0..8).take_while(|&item| sound_row_for(sound, item).is_some()).count()
+    (0..11).take_while(|&item| sound_row_for(sound, item).is_some()).count()
 }
 
 fn sound_row_for(sound: SoundView, item: usize) -> Option<SoundRow> {
     let rows: &[SoundRow] = match sound {
         SoundView::NativeSb { can_mix: true, has_mixer: true, .. } =>
-            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SwitchToKernel],
+            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave, SoundRow::SbFm,
+              SoundRow::SbCd, SoundRow::SwitchToKernel],
         SoundView::NativeSb { can_mix: false, has_mixer: true, .. } =>
-            &[SoundRow::Status, SoundRow::SbMaster],
+            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave, SoundRow::SbFm,
+              SoundRow::SbCd],
         SoundView::NativeSb { can_mix: true, has_mixer: false, .. } =>
             &[SoundRow::Status, SoundRow::SwitchToKernel],
         SoundView::NativeSb { can_mix: false, has_mixer: false, .. } =>
@@ -360,6 +390,33 @@ pub fn observe_sb_master_channel(index: u8, raw: u8) {
 pub fn take_sb_master_request() -> Option<u8> {
     let request = SB_MASTER_REQ.swap(0, Ordering::Relaxed);
     (request != 0).then_some((request - 1) as u8)
+}
+
+pub fn observe_sb_source(index: u8, raw: u8) {
+    let Some(source) = SbSource::ALL.into_iter()
+        .find(|source| (source.left_register()..=source.left_register() + 1).contains(&index))
+    else { return };
+    let slot = &SB_SOURCE_RAW[source.index()];
+    let _ = slot.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(if index == source.left_register() {
+            (old & 0x00ff) | (u32::from(raw) << 8)
+        } else {
+            (old & 0xff00) | u32::from(raw)
+        })
+    });
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+pub fn take_sb_source_request() -> Option<(SbSource, u8)> {
+    SbSource::ALL.into_iter().find_map(|source| {
+        let request = SB_SOURCE_REQ[source.index()].swap(0, Ordering::Relaxed);
+        (request != 0).then_some((source, (request - 1) as u8))
+    })
+}
+
+pub fn sb_source_override(source: SbSource) -> Option<u8> {
+    SB_SOURCE_OVERRIDE[source.index()].load(Ordering::Relaxed)
+        .then_some((SB_SOURCE_RAW[source.index()].load(Ordering::Relaxed) >> 11) as u8)
 }
 
 /// Preserve an explicit OSD level when the card moves into kernel mixing.
@@ -834,6 +891,22 @@ fn adjust(up: bool, sound: SoundView) {
             SB_MASTER_OVERRIDE.store(true, Ordering::Relaxed);
             SB_MASTER_REQ.store(u32::from(raw) + 1, Ordering::Relaxed);
         }
+        Some(SoundRow::SbWave | SoundRow::SbFm | SoundRow::SbCd) => {
+            let source = match sound_row_for(sound, active_sel(TAB_SOUND)) {
+                Some(SoundRow::SbWave) => SbSource::Wave,
+                Some(SoundRow::SbFm) => SbSource::Fm,
+                _ => SbSource::Cd,
+            };
+            let slot = source.index();
+            let cur = sb_source_percent(SB_SOURCE_RAW[slot].load(Ordering::Relaxed));
+            let next = if up { (cur + VOL_STEP).min(VOL_MAX) }
+                else { cur.saturating_sub(VOL_STEP) };
+            let level = sb_source_level(next);
+            let raw = u32::from(level << 3);
+            SB_SOURCE_RAW[slot].store((raw << 8) | raw, Ordering::Relaxed);
+            SB_SOURCE_OVERRIDE[slot].store(true, Ordering::Relaxed);
+            SB_SOURCE_REQ[slot].store(u32::from(level) + 1, Ordering::Relaxed);
+        }
         Some(SoundRow::Latency) => {
             let cur = LATENCY_MS.load(Ordering::Relaxed);
             let next = if up {
@@ -1095,8 +1168,6 @@ pub fn paint(
     }
     let tab = active_tab();
     let count = active_item_count(tab, sound);
-    // The Disk tab is a fixed-height scroller (device sub-tab row + window);
-    // other tabs list all their items.
     let (visible, scroll) = if tab == TAB_DISK {
         (count.min(DISK_VISIBLE), DISK_SCROLL.load(Ordering::Relaxed))
     } else {
@@ -1372,6 +1443,23 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put_num(pct);
                 line.put(b"%");
             }
+            Some(row @ (SoundRow::SbWave | SoundRow::SbFm | SoundRow::SbCd)) => {
+                let (source, label) = match row {
+                    SoundRow::SbWave => (SbSource::Wave, b"SB Wave   " as &[u8]),
+                    SoundRow::SbFm => (SbSource::Fm, b"SB FM     " as &[u8]),
+                    _ => (SbSource::Cd, b"SB CD     " as &[u8]),
+                };
+                let pct = sb_source_percent(SB_SOURCE_RAW[source.index()].load(Ordering::Relaxed));
+                line.put(label);
+                line.put(b"[");
+                let filled = (pct / VOL_STEP) as usize;
+                for i in 0..10 {
+                    line.put(if i < filled { b"#" } else { b"-" });
+                }
+                line.put(b"] ");
+                line.put_num(pct);
+                line.put(b"%");
+            }
             Some(SoundRow::Latency) => {
                 line.put(b"Latency  ");
                 line.put_num(LATENCY_MS.load(Ordering::Relaxed));
@@ -1626,8 +1714,8 @@ mod tests {
 
     #[test]
     fn sound_items_reflect_audio_ownership() {
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true }), 3);
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: true }), 2);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true }), 6);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: true }), 5);
         assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: false }), 1);
         assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: false }), 6);
         assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: true }), 7);
@@ -1646,6 +1734,17 @@ mod tests {
         for pct in (0..=100).step_by(10) {
             assert_eq!(sb_master_percent(u32::from(sb_master_raw(pct))), pct);
         }
+    }
+
+    #[test]
+    fn sb_source_steps_cover_mute_and_full_volume() {
+        for pct in (0..=100).step_by(10) {
+            let raw = u32::from(sb_source_level(pct) << 3);
+            assert_eq!(sb_source_percent((raw << 8) | raw), pct);
+        }
+        assert_eq!(SbSource::Wave.left_register(), 0x32);
+        assert_eq!(SbSource::Fm.left_register(), 0x34);
+        assert_eq!(SbSource::Cd.left_register(), 0x36);
     }
 
     #[test]

@@ -1957,6 +1957,17 @@ fn event_loop<A: crate::Arch>(
                     .is_some_and(|thread| thread.personality.set_physical_sb_master(machine, raw));
             }
         }
+        while let Some((source, level)) = crate::kernel::osd::take_sb_source_request() {
+            let applied = sink.as_ref().is_some_and(|sink| sink.set_sb_source(machine, source, level))
+                || sb_handoff.as_ref().is_some_and(|card| {
+                    card.set_source(machine, source, level);
+                    true
+                });
+            if !applied {
+                let _ = thread::get_thread(threads, ctx.tid)
+                    .is_some_and(|thread| thread.personality.set_physical_sb_source(machine, source, level));
+            }
+        }
         stats.part(machine, PROFILE_INPUT);
 
         // A blocked thread holds the console but not the CPU: wait for input

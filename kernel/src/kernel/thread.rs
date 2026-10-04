@@ -248,6 +248,14 @@ impl<A: crate::Arch> Personality<A> {
         }
     }
 
+    pub fn set_physical_sb_source<A2: crate::Arch>(&self, machine: &mut A2,
+        source: crate::kernel::osd::SbSource, level: u8) -> bool {
+        match self {
+            Self::Dos(dos) => dos.pc.sb.set_physical_source(machine, source, level),
+            Self::Linux(_) | Self::Os2(_) | Self::Windows(_) => false,
+        }
+    }
+
     /// Hand this thread the machine's Sound Blaster, returning whatever it
     /// did not take. Moves with the console, and for the same reason: it is
     /// one piece of machine hardware and the owner is whoever the machine is

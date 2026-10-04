@@ -304,6 +304,17 @@ impl SoundBlaster {
         }
     }
 
+    pub fn set_physical_source<A: crate::Arch>(&self, machine: &mut A,
+        source: crate::kernel::osd::SbSource, level: u8) -> bool {
+        match &self.device {
+            SbDevice::Native { pt, .. } => {
+                pt.set_source(machine, source, level);
+                true
+            }
+            SbDevice::Emulated(_) => false,
+        }
+    }
+
     /// Release any SB-DMA binding this thread holds — exec/exit cleanup.
     /// The per-channel buffers are permanent; this just detaches the guest
     /// alias and clears the re-arm cursor so a reused `SoundBlaster` can't

@@ -94,6 +94,12 @@ impl NativeSb {
         machine.outb(self.card.base + 0x04, self.mixer_idx);
     }
 
+    pub fn set_source<A: crate::Arch>(&self, machine: &mut A,
+        source: crate::kernel::osd::SbSource, level: u8) {
+        self.card.set_source(machine, source, level);
+        machine.outb(self.card.base + 0x04, self.mixer_idx);
+    }
+
     fn new(card: Sb16) -> Self {
         Self {
             card,
@@ -337,10 +343,27 @@ impl NativeSb {
             match self.mixer_idx {
                 0x22 => crate::kernel::osd::observe_sb_master(val),
                 0x30 | 0x31 => crate::kernel::osd::observe_sb_master_channel(self.mixer_idx, val),
+                0x32..=0x37 => crate::kernel::osd::observe_sb_source(self.mixer_idx, val),
                 _ => {}
             }
         }
         machine.outb(self.host_port(b, p), val);
+        if p == b.io_base + 0x05 {
+            let source = match self.mixer_idx {
+                0x04 => Some(crate::kernel::osd::SbSource::Wave),
+                0x26 => Some(crate::kernel::osd::SbSource::Fm),
+                0x28 => Some(crate::kernel::osd::SbSource::Cd),
+                _ => None,
+            };
+            if let Some(source) = source.filter(|_| self.card.has_ct1745()) {
+                for index in source.left_register()..=source.left_register() + 1 {
+                    machine.outb(self.card.base + 0x04, index);
+                    crate::kernel::osd::observe_sb_source(index,
+                        machine.inb(self.card.base + 0x05));
+                }
+                machine.outb(self.card.base + 0x04, self.mixer_idx);
+            }
+        }
     }
 
     /// The 8237 status register, for a guest waiting on terminal count.

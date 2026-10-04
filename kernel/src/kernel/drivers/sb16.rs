@@ -116,6 +116,18 @@ impl Sb16 {
         crate::kernel::osd::observe_sb_master(raw);
     }
 
+    /// Set both CT1745 channels for Voice, MIDI/FM, or analog CD input.
+    pub fn set_source<A: crate::Arch>(&self, machine: &mut A,
+        source: crate::kernel::osd::SbSource, level: u8) {
+        if !self.is_sb16 { return; }
+        let raw = level.min(31) << 3;
+        for index in source.left_register()..=source.left_register() + 1 {
+            machine.outb(self.base + MIX_IDX, index);
+            machine.outb(self.base + MIX_DATA, raw);
+            crate::kernel::osd::observe_sb_source(index, raw);
+        }
+    }
+
     /// This card's own strap view, for comparing against what the guest was
     /// told (`BLASTER`) before deciding whether to restrap.
     pub fn wiring(&self) -> SbWiring {
@@ -214,6 +226,12 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
     if is_sb16 {
         machine.outb(base + MIX_IDX, 0x22);
         crate::kernel::osd::observe_sb_master(machine.inb(base + MIX_DATA));
+        for source in crate::kernel::osd::SbSource::ALL {
+            for index in source.left_register()..=source.left_register() + 1 {
+                machine.outb(base + MIX_IDX, index);
+                crate::kernel::osd::observe_sb_source(index, machine.inb(base + MIX_DATA));
+            }
+        }
         machine.outb(base + MIX_IDX, 0);
     }
     match dma16 {
@@ -395,8 +413,8 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // attenuated.  The kernel sink owns the DAC now, so re-establish a full
     // PCM path; otherwise handoff produces only a faint residual signal.
     card.set_master(machine, crate::kernel::osd::sb_master_override().unwrap_or(0xff));
-    machine.outb(card.base + MIX_IDX, 0x04); // voice/DAC volume index
-    machine.outb(card.base + MIX_DATA, 0xFF); // full
+    card.set_source(machine, crate::kernel::osd::SbSource::Wave,
+        crate::kernel::osd::sb_source_override(crate::kernel::osd::SbSource::Wave).unwrap_or(31));
     dsp_write_at(machine, card.base, CMD_SPEAKER_ON);
 
     crate::compact_println!("sb16: sink on {:#05x}, DMA {}", card.base, DMA_CHANNEL);
