@@ -211,7 +211,7 @@ fn render_frame(
         .expect("create terminal surface");
     let node_width = w;
     let node = desktop
-        .ensure_node(
+        .ensure_window_node(
             endpoint,
             TERMINAL_PRESENTATION,
             crate::kernel::gui::Rect::new(0, 0, node_width as u32, h as u32),

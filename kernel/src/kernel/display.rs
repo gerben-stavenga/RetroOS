@@ -140,6 +140,9 @@ impl DisplayHandoff {
     }
 
     pub fn from_surface<A: crate::Arch>(display: Display, machine: &mut A) -> Self {
+        // The next owner may draw only a centered VGA picture. Clear the old
+        // desktop immediately so its windows cannot remain in the margins.
+        display.clear_visible_framebuffer();
         match display.into_native_capability(machine) {
             Ok(native) => Self::Vga(native),
             Err(display) => Self::Surface(display),
@@ -510,6 +513,13 @@ impl Display {
             _ => None,
         }
     }
+    fn clear_visible_framebuffer(&self) {
+        let Some(fb) = self.framebuffer() else { return };
+        let row_bytes = fb.width * usize::from(self.rgb.bytes_per_pixel);
+        for y in 0..fb.height {
+            unsafe { core::ptr::write_bytes((fb.va + y * fb.pitch) as *mut u8, 0, row_bytes); }
+        }
+    }
     fn fit(&self) -> (usize, usize) {
         if let Backend::Vga { scanout: VgaScanout::VbeBanked { mode, .. }, .. } = &self.backend {
             return fit_vga(usize::from(mode.width), usize::from(mode.height));
@@ -610,13 +620,18 @@ impl Display {
             return self.present_packed(machine, bios, width, height, pixels);
         }
         let format = self.rgb;
+        let clear_bars = self.last_packed_output != Some((width, height));
+        self.last_packed_output = Some((width, height));
         let copied = match &mut self.backend {
             Backend::Linear(framebuffer)
             | Backend::Vga {
                 scanout: VgaScanout::Mode13 { framebuffer, .. }
                     | VgaScanout::VbeLinear { framebuffer, .. },
                 ..
-            } => blit_regions(framebuffer, format, width, height, height, pixels, regions),
+            } => {
+                if clear_bars { clear_packed_bars(framebuffer, format, (width, height)); }
+                blit_regions(framebuffer, format, width, height, height, pixels, regions)
+            }
             Backend::Vga {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },

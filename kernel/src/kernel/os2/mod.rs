@@ -249,7 +249,7 @@ pub fn render<A: crate::Arch>(
     );
     let surface = desktop.ensure_surface(endpoint, PM_SURFACE).expect("create PM surface");
     let node = desktop
-        .ensure_node(
+        .ensure_window_node(
             endpoint,
             PM_PRESENTATION,
             crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),

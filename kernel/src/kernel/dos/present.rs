@@ -277,7 +277,7 @@ fn publish_vga_surface(
         .ensure_surface(endpoint, DOS_SURFACE)
         .expect("create DOS VGA surface");
     let node = desktop
-        .ensure_node(
+        .ensure_window_node(
             endpoint,
             DOS_SCANOUT,
             crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
@@ -318,7 +318,7 @@ pub(super) fn attach_retained_vga_surface(
         .ensure_surface(endpoint, DOS_SURFACE)
         .expect("create retained DOS VGA surface");
     let node = desktop
-        .ensure_node(
+        .ensure_window_node(
             endpoint,
             DOS_SCANOUT,
             crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),

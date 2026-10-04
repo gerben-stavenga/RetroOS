@@ -298,6 +298,7 @@ struct SwitcherComposition {
 struct SwitcherRegions<'a> {
     layout: Option<SwitcherComposition>,
     damage: &'a [Rect],
+    focused: Option<EndpointId>,
 }
 
 pub struct ComposedFrame<'a> {
@@ -362,6 +363,29 @@ impl Desktop {
             node,
         });
         Ok(node)
+    }
+
+    /// Place a new application window in a small cascade. Existing nodes keep
+    /// their position when their producer publishes another frame.
+    pub fn ensure_window_node(
+        &mut self,
+        endpoint: EndpointId,
+        key: PresentationKey,
+        geometry: Rect,
+    ) -> Result<NodeId, SceneError> {
+        if self.bindings.iter().any(|binding| binding.endpoint == endpoint && binding.key == key) {
+            return self.ensure_node(endpoint, key, geometry);
+        }
+        let windows = self.scene.roots.iter().filter(|&&root| {
+            self.scene.node(root).is_some_and(|node| node.visible
+                && node.owner != endpoint && node.owner != EndpointId(u32::MAX))
+        }).count();
+        let step = (windows % 4) as i32;
+        self.ensure_node(endpoint, key, Rect::new(
+            geometry.x.saturating_add(step * 20),
+            geometry.y.saturating_add(step * 16),
+            geometry.width, geometry.height,
+        ))
     }
 
     pub fn geometry(&self, node: NodeId) -> Option<Rect> {
@@ -775,7 +799,7 @@ impl WindowManager {
         }
         desktop.scene.compose_switcher_regions_with(
             &resolve, width, height, format, composed,
-            SwitcherRegions { layout: switcher, damage: &damage },
+            SwitcherRegions { layout: switcher, damage: &damage, focused: desktop.focused() },
         )?;
         if !damage.is_empty()
             && let Some(point) = desktop.pointer
@@ -998,18 +1022,27 @@ impl WindowManager {
             WindowMode::Fullscreen => Presentation::Fullscreen(window),
         };
         let changed = self.presentation != presentation || self.focused != Some(window);
+        if self.presentation != presentation {
+            self.desktop.damage_scene();
+        }
         self.presentation = presentation;
         self.focus(window);
         changed
     }
 
     pub fn enter_fullscreen(&mut self, window: WindowId) {
+        if self.presentation != Presentation::Fullscreen(window) {
+            self.desktop.damage_scene();
+        }
         self.remember_mode(window, WindowMode::Fullscreen);
         self.focus(window);
         self.presentation = Presentation::Fullscreen(window);
     }
 
     pub fn enter_windowed(&mut self, window: WindowId) {
+        if self.presentation != Presentation::Desktop {
+            self.desktop.damage_scene();
+        }
         self.remember_mode(window, WindowMode::Windowed);
         self.focus(window);
         self.presentation = Presentation::Desktop;
@@ -1215,9 +1248,9 @@ impl Scene {
     /// Composite visible content back-to-front into one packed output-format shadow.
     ///
     /// Content buffers remain producer-owned packed pixels. Geometry,
-    /// clipping, stacking, scaling, and global opacity
-    /// are scene mechanisms; decorations and native paint semantics remain in
-    /// the personality that produced the buffers.
+    /// clipping, stacking, scaling, and global opacity are scene mechanisms.
+    /// Personality content keeps its own paint semantics; the window manager
+    /// adds a focus frame when composing the desktop.
     pub fn compose(
         &self,
         contents: &[Content<'_>],
@@ -1303,7 +1336,7 @@ impl Scene {
     where
         F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
     {
-        let SwitcherRegions { layout: switcher, damage } = regions;
+        let SwitcherRegions { layout: switcher, damage, focused } = regions;
         if !valid_format(format) {
             return Err(ComposeError::InvalidOutputFormat);
         }
@@ -1328,12 +1361,12 @@ impl Scene {
                     if root == layout.node || node.owner == layout.highlighted
                         || node.owner == SYSTEM_ENDPOINT
                     { continue; }
-                    self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                    self.compose_window_root(root, clip, None, focused, resolve, &mut target);
                 }
                 if layout.highlighted != layout.active {
                     for &root in &self.roots {
                         if self.node(root).is_some_and(|node| node.owner == layout.highlighted) {
-                            self.compose_node(root, Point::default(), clip, None, resolve,
+                            self.compose_window_root(root, clip, None, focused, resolve,
                                 &mut target);
                         }
                     }
@@ -1342,16 +1375,16 @@ impl Scene {
                 // retained window. Drawing it first lets a large/fullscreen
                 // preview cover the lower-right corner and makes the running
                 // program appear to vanish from the switcher.
-                self.compose_node(layout.node, Point::default(), clip, Some(layout.target),
+                self.compose_window_root(layout.node, clip, Some(layout.target), focused,
                     resolve, &mut target);
                 for &root in &self.roots {
                     if self.node(root).is_some_and(|node| node.owner == SYSTEM_ENDPOINT) {
-                        self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                        self.compose_window_root(root, clip, None, focused, resolve, &mut target);
                     }
                 }
             } else {
                 for &root in &self.roots {
-                    self.compose_node(root, Point::default(), clip, None, resolve, &mut target);
+                    self.compose_window_root(root, clip, None, focused, resolve, &mut target);
                 }
             }
         };
@@ -1517,6 +1550,26 @@ impl Scene {
         })
     }
 
+    fn compose_window_root<'a, F>(
+        &self,
+        id: NodeId,
+        clip: Rect,
+        geometry: Option<Rect>,
+        focused: Option<EndpointId>,
+        resolve: &F,
+        target: &mut Target<'_>,
+    )
+    where
+        F: Fn(SurfaceId) -> Option<PixelBuffer<'a>>,
+    {
+        let Some(node) = self.node(id) else { return };
+        let frame = geometry.unwrap_or(node.geometry);
+        self.compose_node(id, Point::default(), clip, geometry, resolve, target);
+        if node.visible && node.content.is_some() && node.owner != EndpointId(u32::MAX) {
+            draw_window_frame(target, frame, clip, focused == Some(node.owner));
+        }
+    }
+
     fn compose_node<'a, F>(
         &self,
         id: NodeId,
@@ -1574,6 +1627,32 @@ struct Target<'a> {
     height: usize,
     format: vga::PixelFormat,
     pixels: &'a mut [u8],
+}
+
+fn fill_color_rect(target: &mut Target<'_>, rect: Rect, clip: Rect, rgb: u32) {
+    let canvas = Rect::new(0, 0, target.width as u32, target.height as u32);
+    let Some(draw) = intersect(rect, clip).and_then(|rect| intersect(rect, canvas)) else { return };
+    let encoded = target.format.encode(rgb);
+    for y in draw.y as usize..draw.y as usize + draw.height as usize {
+        for x in draw.x as usize..draw.x as usize + draw.width as usize {
+            write_encoded_target(target, x, y, encoded);
+        }
+    }
+}
+
+fn draw_window_frame(target: &mut Target<'_>, rect: Rect, clip: Rect, active: bool) {
+    if rect.width < 32 || rect.height < 24 { return; }
+    let border = if active { 0x57b9f4 } else { 0x70849a };
+    for (inset, color) in [(0, 0x152536), (1, border)] {
+        let x = rect.x.saturating_add(inset);
+        let y = rect.y.saturating_add(inset);
+        let w = rect.width - 2 * inset as u32;
+        let h = rect.height - 2 * inset as u32;
+        fill_color_rect(target, Rect::new(x, y, w, 1), clip, color);
+        fill_color_rect(target, Rect::new(x, y.saturating_add(h as i32 - 1), w, 1), clip, color);
+        fill_color_rect(target, Rect::new(x, y, 1, h), clip, color);
+        fill_color_rect(target, Rect::new(x.saturating_add(w as i32 - 1), y, 1, h), clip, color);
+    }
 }
 
 fn clear_rect(target: &mut Target<'_>, rect: Rect) {
@@ -2331,6 +2410,57 @@ mod tests {
         ).unwrap();
         assert_eq!(frame.damage, vec![Rect::new(1, 0, 2, 1)]);
         assert_eq!(native_pixels(frame.pixels)[1], 0x0000_00ff);
+    }
+
+    #[test]
+    fn windowed_stack_has_offset_and_focus_frame() {
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        let first = manager.desktop.ensure_window_node(
+            WINDOWS, PresentationKey(1), Rect::new(0, 0, 40, 30),
+        ).unwrap();
+        let surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap();
+        let mut transaction = Transaction::new(WINDOWS);
+        transaction.attach(first, Some(surface)).set_visible(first, true);
+        manager.desktop.commit(transaction).unwrap();
+        let second = manager.desktop.ensure_window_node(
+            OS2, PresentationKey(1), Rect::new(0, 0, 40, 30),
+        ).unwrap();
+        assert_eq!(manager.desktop.geometry(second), Some(Rect::new(20, 16, 40, 30)));
+        manager.focus(WindowManager::primary_window(WINDOWS));
+        let red = 0x00ff_0000u32.to_le_bytes();
+        let frame = manager.compose_processes(
+            |_, _| PixelBuffer::new(1, 1, 4, vga::PixelFormat::NATIVE, &red).ok(),
+            64, 48, vga::PixelFormat::NATIVE,
+        ).unwrap();
+        let pixel = |x: usize, y: usize| {
+            let at = (y * 64 + x) * 4;
+            u32::from_le_bytes(frame.pixels[at..at + 4].try_into().unwrap())
+        };
+        assert_eq!(pixel(1, 1), 0x57b9f4);
+        assert_eq!(pixel(10, 10), 0x00ff_0000);
+    }
+
+    #[test]
+    fn returning_from_fullscreen_redraws_the_entire_desktop() {
+        let window = WindowManager::primary_window(WINDOWS);
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        let node = manager.desktop.ensure_node(
+            WINDOWS, PresentationKey(1), Rect::new(0, 0, 2, 1),
+        ).unwrap();
+        let surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap();
+        let mut transaction = Transaction::new(WINDOWS);
+        transaction.attach(node, Some(surface)).set_visible(node, true);
+        manager.desktop.commit(transaction).unwrap();
+        let blue = 0x0000_00ffu32.to_le_bytes();
+        let compose = |manager: &mut WindowManager| manager.compose_processes(
+            |_, _| PixelBuffer::new(1, 1, 4, vga::PixelFormat::NATIVE, &blue).ok(),
+            4, 2, vga::PixelFormat::NATIVE,
+        ).unwrap().damage;
+        assert_eq!(compose(&mut manager), vec![Rect::new(0, 0, 4, 2)]);
+        assert!(compose(&mut manager).is_empty());
+        manager.enter_fullscreen(window);
+        manager.enter_windowed(window);
+        assert_eq!(compose(&mut manager), vec![Rect::new(0, 0, 4, 2)]);
     }
 
     #[test]

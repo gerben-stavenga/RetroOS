@@ -495,7 +495,7 @@ pub fn render<A: crate::Arch>(
         .ensure_surface(endpoint, WINDOW_SURFACE)
         .expect("create Win32 surface");
     let node = desktop
-        .ensure_node(
+        .ensure_window_node(
             endpoint,
             WINDOW_PRESENTATION,
             crate::kernel::gui::Rect::new(0, 0, width as u32, height as u32),
