@@ -51,7 +51,9 @@ SECTIONS
     }
     _edata = .;
 
-    .bss ALIGN(4K) : {
+    /* ISA DMA storage in .bss needs 128 KB alignment in both its virtual and
+     * physical image; the two kernel bases share that alignment. */
+    .bss ALIGN(128K) : {
         *(.bss .bss.*)
         *(COMMON)
         /* ARCH_STACK lives at the END of .bss, preceded by a guard page that

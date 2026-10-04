@@ -78,70 +78,77 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
     }
 }
 
-/// Carve the permanent low-memory DMA regions after loader-owned memory has
-/// been reserved. Recording these addresses during `init_phys_mm` allowed a
-/// pool to select pages later identified as a Multiboot module; HDA would then
-/// DMA directly over the module-backed filesystem.
+/// Locate the kernel-owned ISA DMA buffers after the physical memory map is
+/// initialized. Their storage is part of the kernel image at 1 MB, so GRUB
+/// cannot fill the remaining low 16 MB with modules and starve Sound Blaster
+/// DMA. Kernel pages were marked used by `init_phys_mm` already.
 pub fn reserve_dma_regions() {
     unsafe {
-        let pr = &raw mut PAGE_REFS;
-        DMA_POOL_START = 0;
-        DMA_BUFS_BASE = 0;
         DMA_POOL_BUSY = false;
-
-        // Reserve a low-memory ISA-DMA pool. ISA DMA needs a physically
-        // contiguous, < 16 MB, boundary-non-crossing buffer; the general
-        // allocator walks upward and fragments the whole < 16 MB region
-        // before a game ever plays sound. Carve a fixed 64 KB-aligned,
-        // 64 KB pool now and mark it RESERVED so `alloc_phys_page` skips
-        // it. 64 KB-aligned + ≤ 64 KB ⇒ no 8-bit (64 KB) or 16-bit
-        // (128 KB) DMA-boundary crossing by construction. One SB DMA
-        // buffer is live at a time (foreground thread owns the card).
-        let mut p = 256usize;
-        while p + DMA_POOL_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
-            if !p.is_multiple_of(DMA_POOL_PAGES) { p += 1; continue; } // 64 KB align
-            if (p..p + DMA_POOL_PAGES).all(|i| PAGE_REFS[i] == 0) {
-                for slot in (*pr).iter_mut().skip(p).take(DMA_POOL_PAGES) { *slot = RESERVED; }
-                DMA_POOL_START = p;
-                break;
-            }
-            p += DMA_POOL_PAGES;
-        }
-
-        // Per-channel permanent ISA-DMA buffers (see `dma_channel_buf`):
-        // one 128 KB-aligned, contiguous, < 16 MB block, marked RESERVED.
-        let mut p = 256usize;
-        while p + DMA_BUFS_PAGES <= DMA_MAX_PAGE.min(MAX_PAGES) {
-            if !p.is_multiple_of(DMA_BUF_16BIT_PAGES) { p += 1; continue; }
-            if (p..p + DMA_BUFS_PAGES).all(|i| PAGE_REFS[i] == 0) {
-                for slot in (*pr).iter_mut().skip(p).take(DMA_BUFS_PAGES) { *slot = RESERVED; }
-                DMA_BUFS_BASE = p;
-                break;
-            }
-            p += DMA_BUF_16BIT_PAGES;
-        }
+        let pool_va = core::ptr::addr_of!(DMA_POOL_STORAGE) as usize;
+        let bufs_va = core::ptr::addr_of!(DMA_BUFS_STORAGE) as usize;
+        DMA_POOL_START = kernel_dma_page(
+            pool_va,
+            DMA_POOL_PAGES,
+            DMA_POOL_PAGES,
+        );
+        DMA_BUFS_BASE = kernel_dma_page(
+            bufs_va,
+            DMA_BUFS_PAGES,
+            DMA_BUF_16BIT_PAGES,
+        );
+        // Their normal kernel BSS mapping is write-back. The guest aliases
+        // these same physical pages uncached for coherent ISA DMA; remove the
+        // unused BSS mapping so the CPU never sees conflicting cache types.
+        if DMA_POOL_START != 0 { unmap_dma_storage(pool_va, DMA_POOL_PAGES); }
+        if DMA_BUFS_BASE != 0 { unmap_dma_storage(bufs_va, DMA_BUFS_PAGES); }
     }
+}
+
+fn unmap_dma_storage(va: usize, pages: usize) {
+    for page in 0..pages {
+        crate::paging2::unmap_kernel_page(va + page * PAGE_SIZE);
+    }
+}
+
+fn kernel_dma_page(va: usize, pages: usize, alignment_pages: usize) -> usize {
+    let Some(phys) = va.checked_sub(crate::paging2::KERNEL_BASE)
+        .and_then(|offset| offset.checked_add(crate::paging2::KERNEL_PHYS)) else {
+            return 0;
+        };
+    let page = phys / PAGE_SIZE;
+    if phys % PAGE_SIZE != 0
+        || !page.is_multiple_of(alignment_pages)
+        || page + pages > DMA_MAX_PAGE
+    {
+        return 0;
+    }
+    page
 }
 
 /// Largest physical page usable for ISA DMA (addresses are 24-bit, < 16 MB).
 const DMA_MAX_PAGE: usize = 0x100_0000 / PAGE_SIZE;
-/// Reserved ISA-DMA pool size: 64 KB = 16 pages, 64 KB-aligned.
+/// Kernel-owned ISA-DMA pool size: 64 KB = 16 pages, 64 KB-aligned.
 const DMA_POOL_PAGES: usize = 0x1_0000 / PAGE_SIZE;
+#[repr(align(65536))]
+#[allow(dead_code)] // DMA hardware accesses the backing bytes through physical addresses.
+struct AlignedDmaPool([u8; DMA_POOL_PAGES * PAGE_SIZE]);
+static mut DMA_POOL_STORAGE: AlignedDmaPool = AlignedDmaPool([0; DMA_POOL_PAGES * PAGE_SIZE]);
 /// First page of the reserved DMA pool (0 = not reserved / unavailable).
 static mut DMA_POOL_START: usize = 0;
 /// True while the pool is handed out (single live SB DMA buffer).
 static mut DMA_POOL_BUSY: bool = false;
 
-/// Per-channel permanent ISA-DMA buffers. Each DMA channel gets a fixed,
-/// physically contiguous, boundary-aligned buffer sized to the largest
-/// transfer it can carry: 8-bit channels (0-3) → 64 KB / 64 KB-aligned,
-/// 16-bit channels (4-7) → 128 KB / 128 KB-aligned. A guest SB buffer is
-/// aliased onto its channel's buffer; the buffer is reserved once and
-/// never re-allocated. Layout: the four 128 KB buffers first (so the whole
-/// block needs only 128 KB alignment), then the four 64 KB ones.
+/// Per-channel permanent ISA-DMA buffers. The 128 KB-aligned kernel BSS owns
+/// them before Multiboot modules are loaded. Layout: four 128 KB buffers for
+/// 16-bit channels, then four 64 KB buffers for 8-bit channels.
 const DMA_BUF_8BIT_PAGES: usize = 0x1_0000 / PAGE_SIZE;   // 64 KB
 const DMA_BUF_16BIT_PAGES: usize = 0x2_0000 / PAGE_SIZE;  // 128 KB
 const DMA_BUFS_PAGES: usize = 4 * DMA_BUF_16BIT_PAGES + 4 * DMA_BUF_8BIT_PAGES;
+#[repr(align(131072))]
+#[allow(dead_code)] // Guest mappings and the 8237 access these bytes by physical address.
+struct AlignedDmaBuffers([u8; DMA_BUFS_PAGES * PAGE_SIZE]);
+static mut DMA_BUFS_STORAGE: AlignedDmaBuffers = AlignedDmaBuffers([0; DMA_BUFS_PAGES * PAGE_SIZE]);
 /// First physical page of the per-channel buffer block (0 = unavailable).
 static mut DMA_BUFS_BASE: usize = 0;
 

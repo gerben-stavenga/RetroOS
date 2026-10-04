@@ -361,6 +361,10 @@ unsafe fn prepare_boot(
         phys_mm::mark_reserved(start, end)
     });
     phys_mm::reserve_dma_regions();
+    lib::compact_println!(
+        "ISA DMA: reserved buffer pages ch1={:#x} ch5={:#x}",
+        phys_mm::dma_channel_buf(1), phys_mm::dma_channel_buf(5),
+    );
 
     // VGA framebuffer scanout needs its packed shadow as soon as fbcon is
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
