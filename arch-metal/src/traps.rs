@@ -115,7 +115,7 @@ pub mod arch_call {
     #[allow(dead_code)]
     pub const HASH_PHYS_PAGE: u64 = 0x118; // EDX=phys_page_num. Returns FNV-1a u64 hash of that physical page in EAX.
     pub const SET_DEBUG_WATCH: u64 = 0x119; // EBX=count, EDX/ECX=watched linear addrs
-    pub const ALLOC_PHYS_CONTIG: u64 = 0x11A; // EDX=num_pages, ECX=boundary_log2 -> EAX=start_page (0=fail)
+    pub const ALLOC_PHYS_CONTIG: u64 = 0x11A; // EDX=num_pages -> EAX=start_page (0=fail)
     pub const FREE_PHYS_CONTIG: u64 = 0x11B;  // EDX=start_page, ECX=num_pages
     pub const REARM_IRQ: u64 = 0x11C;         // EDX=irq line — re-unmask a deferred-ack Hw line
     pub const DMA_CHANNEL_BUF: u64 = 0x11D;   // EDX=channel 0-7 -> EAX=phys page of its permanent DMA buffer
@@ -297,8 +297,7 @@ fn arch_dispatch(regs: &mut Regs) {
             regs.rax = crate::aperture::remap(physical_base) as u64;
         }
         arch_call::ALLOC_PHYS_CONTIG => {
-            regs.rax = crate::phys_mm::alloc_phys_contig(
-                regs.rdx as usize, regs.rcx as u32).unwrap_or(0);
+            regs.rax = crate::phys_mm::alloc_phys_contig(regs.rdx as usize).unwrap_or(0);
         }
         arch_call::FREE_PHYS_CONTIG => {
             crate::phys_mm::free_phys_contig(regs.rdx, regs.rcx as usize);

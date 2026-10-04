@@ -155,7 +155,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
     // Map a dedicated PCI DMA buffer into the stolen low-mem window VA so the
     // kernel can write PCM into it; the codec reads it by physical address.
     let pages = (BDL_BYTES + NUM_BUF * BUF_BYTES).div_ceil(0x1000);
-    let phys_page = machine.alloc_phys_contig(pages, 0);
+    let phys_page = machine.alloc_phys_contig(pages);
     if phys_page == 0 {
         return None;
     }

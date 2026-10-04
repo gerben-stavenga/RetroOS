@@ -347,11 +347,9 @@ pub trait Arch: Sized + GuestBytes {
             wide: false,
         }
     }
-    /// Allocate `num_pages` physically contiguous DMA pages. A nonzero
-    /// `boundary_log2` requests an ISA-DMA-safe run (< 16 MB, not crossing the
-    /// specified boundary); zero has no ISA placement constraint. Returns the
+    /// Allocate physically contiguous DMA pages from general RAM. Returns the
     /// starting physical page number, or 0 on failure.
-    fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64;
+    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64;
     /// Free a run previously returned by `alloc_phys_contig`.
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize);
     /// Physical page of DMA channel `ch`'s permanent ISA-DMA buffer (0 = none).

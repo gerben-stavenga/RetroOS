@@ -628,7 +628,7 @@ fn bring_up<A: crate::Arch>(machine: &mut A, bus: u8, dev: u8, func: u8) -> Opti
 
     // PCI bus mastering needs contiguous memory, but has no ISA placement or
     // boundary constraint.
-    let phys_page = machine.alloc_phys_contig(DMA_PAGES, 0);
+    let phys_page = machine.alloc_phys_contig(DMA_PAGES);
     if phys_page == 0 {
         crate::compact_println!("hda: {:02x}:{:02x}.{} failed: no DMA buffer", bus, dev, func);
         return None;

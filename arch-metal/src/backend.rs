@@ -137,8 +137,8 @@ impl Arch for Metal {
     fn framebuffer_map_policy(&self) -> arch_abi::FramebufferMapPolicy {
         super::paging2::framebuffer_map_policy()
     }
-    fn alloc_phys_contig(&mut self, num_pages: usize, boundary_log2: u32) -> u64 {
-        super::calls::arch_alloc_phys_contig(num_pages, boundary_log2)
+    fn alloc_phys_contig(&mut self, num_pages: usize) -> u64 {
+        super::calls::arch_alloc_phys_contig(num_pages)
     }
     fn free_phys_contig(&mut self, start_page: u64, num_pages: usize) {
         super::calls::arch_free_phys_contig(start_page, num_pages)

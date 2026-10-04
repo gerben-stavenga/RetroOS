@@ -84,23 +84,15 @@ pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kern
 /// DMA. Kernel pages were marked used by `init_phys_mm` already.
 pub fn reserve_dma_regions() {
     unsafe {
-        DMA_POOL_BUSY = false;
-        let pool_va = core::ptr::addr_of!(DMA_POOL_STORAGE) as usize;
         let bufs_va = core::ptr::addr_of!(DMA_BUFS_STORAGE) as usize;
-        DMA_POOL_START = kernel_dma_page(
-            pool_va,
-            DMA_POOL_PAGES,
-            DMA_POOL_PAGES,
-        );
         DMA_BUFS_BASE = kernel_dma_page(
             bufs_va,
             DMA_BUFS_PAGES,
             DMA_BUF_16BIT_PAGES,
         );
-        // Their normal kernel BSS mapping is write-back. The guest aliases
-        // these same physical pages uncached for coherent ISA DMA; remove the
+        // The normal kernel BSS mapping is write-back. The guest aliases
+        // these physical pages uncached for coherent ISA DMA; remove the
         // unused BSS mapping so the CPU never sees conflicting cache types.
-        if DMA_POOL_START != 0 { unmap_dma_storage(pool_va, DMA_POOL_PAGES); }
         if DMA_BUFS_BASE != 0 { unmap_dma_storage(bufs_va, DMA_BUFS_PAGES); }
     }
 }
@@ -128,17 +120,6 @@ fn kernel_dma_page(va: usize, pages: usize, alignment_pages: usize) -> usize {
 
 /// Largest physical page usable for ISA DMA (addresses are 24-bit, < 16 MB).
 const DMA_MAX_PAGE: usize = 0x100_0000 / PAGE_SIZE;
-/// Kernel-owned ISA-DMA pool size: 64 KB = 16 pages, 64 KB-aligned.
-const DMA_POOL_PAGES: usize = 0x1_0000 / PAGE_SIZE;
-#[repr(align(65536))]
-#[allow(dead_code)] // DMA hardware accesses the backing bytes through physical addresses.
-struct AlignedDmaPool([u8; DMA_POOL_PAGES * PAGE_SIZE]);
-static mut DMA_POOL_STORAGE: AlignedDmaPool = AlignedDmaPool([0; DMA_POOL_PAGES * PAGE_SIZE]);
-/// First page of the reserved DMA pool (0 = not reserved / unavailable).
-static mut DMA_POOL_START: usize = 0;
-/// True while the pool is handed out (single live SB DMA buffer).
-static mut DMA_POOL_BUSY: bool = false;
-
 /// Per-channel permanent ISA-DMA buffers. The 128 KB-aligned kernel BSS owns
 /// them before Multiboot modules are loaded. Layout: four 128 KB buffers for
 /// 16-bit channels, then four 64 KB buffers for 8-bit channels.
@@ -272,34 +253,17 @@ pub fn dma_channel_buf(ch: usize) -> u64 {
     (base + off) as u64
 }
 
-/// Allocate physically contiguous DMA memory. With no boundary constraint,
-/// use the general pool. A nonzero `boundary_log2` selects the reserved
-/// ISA-DMA pool (≤ `DMA_POOL_PAGES`), whose placement satisfies both the
-/// 64 KB 8-bit and 128 KB 16-bit DMA boundaries by construction.
+/// Allocate physically contiguous DMA memory from the general pool.
 ///
-/// Release with `free_phys_contig`. Pages are NOT zeroed — the DMA-remap
-/// path copies the guest buffer in.
-pub fn alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> Option<u64> {
-    if boundary_log2 == 0 {
-        return alloc_contig(num_pages);
-    }
-    unsafe {
-        if DMA_POOL_START == 0 || DMA_POOL_BUSY
-            || num_pages == 0 || num_pages > DMA_POOL_PAGES {
-            return None;
-        }
-        DMA_POOL_BUSY = true;
-        Some(DMA_POOL_START as u64)
-    }
+/// Release with `free_phys_contig`. Pages are not zeroed.
+pub fn alloc_phys_contig(num_pages: usize) -> Option<u64> {
+    alloc_contig(num_pages)
 }
 
-/// Release a DMA allocation. The ISA pool stays reserved for reuse; ordinary
-/// contiguous pages return to the general allocator.
+/// Return a contiguous DMA allocation to the general allocator.
 pub fn free_phys_contig(start_page: u64, num_pages: usize) {
     unsafe {
-        if start_page as usize == DMA_POOL_START {
-            DMA_POOL_BUSY = false;
-        } else if start_page as usize >= 256
+        if start_page as usize >= 256
             && (start_page as usize).saturating_add(num_pages) <= MAX_PAGES
         {
             let pr = &raw mut PAGE_REFS;
@@ -312,7 +276,7 @@ pub fn free_phys_contig(start_page: u64, num_pages: usize) {
 }
 
 /// Allocate `num_pages` physically-contiguous pages from the GENERAL pool,
-/// marked RESERVED (a permanent driver-owned region — never freed). Returns the
+/// marked RESERVED until explicitly freed. Returns the
 /// start page, or None if no contiguous run is free.
 ///
 /// This backs unconstrained `alloc_phys_contig` requests and direct ring-0

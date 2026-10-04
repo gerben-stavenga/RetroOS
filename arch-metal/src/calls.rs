@@ -246,18 +246,16 @@ pub fn arch_map_phys_range(vpage_start: usize, num_pages: usize, ppage_start: u6
     }
 }
 
-/// Allocate `num_pages` physically contiguous DMA pages. A nonzero
-/// `boundary_log2` requests an ISA-DMA-safe run; zero permits general RAM.
+/// Allocate `num_pages` physically contiguous DMA pages from general RAM.
 /// Returns the starting physical page number, or 0 on failure.
 #[allow(dead_code)]
-pub fn arch_alloc_phys_contig(num_pages: usize, boundary_log2: u32) -> u64 {
+pub fn arch_alloc_phys_contig(num_pages: usize) -> u64 {
     let r: u32;
     unsafe {
         core::arch::asm!(
             "int 0x80",
             inlateout("eax") crate::arch_call::ALLOC_PHYS_CONTIG as u32 => r,
             in("edx") num_pages as u32,
-            in("ecx") boundary_log2,
         );
     }
     r as u64

@@ -47,7 +47,7 @@ pub struct Region { pub va: usize, pub phys: u64, bytes: usize }
 impl Region {
     pub fn allocate<A: crate::Arch>(machine: &mut A, pages: usize, address_bits: u32) -> Option<Self> {
         let bytes = pages.checked_mul(crate::PAGE_SIZE)?;
-        let page = machine.alloc_phys_contig(pages, 0);
+        let page = machine.alloc_phys_contig(pages);
         if page == 0 { return None; }
         let phys = page.checked_mul(crate::PAGE_SIZE as u64)?;
         if address_bits < 64 && phys.checked_add(bytes as u64)? > (1u64 << address_bits) {
