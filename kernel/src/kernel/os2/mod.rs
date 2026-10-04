@@ -360,7 +360,7 @@ fn dll_filename(name: &[u8]) -> Vec<u8> {
 
 fn load_dependency(name: &[u8], importer_path: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = dll_filename(name);
-    let system_dll_dir = join(crate::kernel::dos::c_root(), b"OS2/DLL");
+    let system_dll_dir = join(crate::kernel::dos::c_root(), b"RETROOS/OS2/DLL");
     let candidates = [
         join(dirname(importer_path), &file),
         join(&system_dll_dir, &file),
@@ -613,7 +613,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     machine.write::<u32>((pib + 8) as usize, 1);
     machine.write::<u32>((pib + 12) as usize, cmd);
     machine.write::<u32>((pib + 16) as usize, env);
-    machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0");
+    machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0");
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();

@@ -146,15 +146,30 @@ def main():
         listing = subprocess.check_output(['mdir', '-i', volume, '::/'])
         for forbidden in (b'BUILD~1', b'DOS32A', b'BORLANDC'):
             assert forbidden not in listing, forbidden
+        for system_dir in ('WINDOWS/SYSTEM32', 'WINDOWS/SYSTEM', 'OS2/DLL'):
+            old_dlls = subprocess.run(
+                ['mdir', '-i', volume, f'::/{system_dir}/*.DLL'],
+                capture_output=True,
+            )
+            assert b'.DLL' not in old_dlls.stdout, system_dir
         with tarfile.open(machine / 'machine_boot.tar') as archive:
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
             assert {
                 'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
                 'RETROOS/DN/DN.COM', 'RETROOS/VC/VC.COM', 'RETROOS/MC/MC.EXE',
+                'RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL',
+                'RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL',
+                'RETROOS/WINDOWS/SYSTEM/KERNEL.DLL',
+                'RETROOS/OS2/DLL/DOSCALLS.DLL',
                 'CONFIG/CONFIG.SYS', 'CONFIG/VC/VC.INI', 'CONFIG/VC/VC.HLP',
                 'RETROOS/MC/MC.INI', 'RETROOS/MC/MC.MNU', 'RETROOS/MC/MC.HLP',
                 'CONFIG/MC/.mc/ini', 'CONFIG/MC/.mc/menu',
             } <= names
+            assert not any(
+                name.endswith('.DLL') and name.startswith((
+                    'WINDOWS/SYSTEM32/', 'WINDOWS/SYSTEM/', 'OS2/DLL/',
+                )) for name in names
+            )
             kernel = next(member for member in archive.getmembers()
                           if member.name.removeprefix('./') == 'kernel.elf')
             # immediate-abort removes the Rust panic handler from the linked

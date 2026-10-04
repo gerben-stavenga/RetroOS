@@ -589,7 +589,7 @@ fn find_module(modules: &[Module], name: &[u8]) -> Option<usize> {
 
 fn load_dependency(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_name(name);
-    let system = join(crate::kernel::dos::c_root(), b"WINDOWS/SYSTEM32");
+    let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM32");
     for path in [join(dirname(importer), &file), join(&system, &file)] {
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
             return Ok((path, data));

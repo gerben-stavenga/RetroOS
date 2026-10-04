@@ -17,7 +17,7 @@ DLL: the Rust OS/2 personality consumes the application return address and
 finishes the call.
 
 The packaged DOS filesystem installs the shared OS/2 runtime and C smoke test
-at `C:\OS2\DLL\DOSCALLS.DLL` and `C:\OS2\APPS\HELLO.EXE`. DOS and OS/2
+at `C:\RETROOS\OS2\DLL\DOSCALLS.DLL` and `C:\OS2\APPS\HELLO.EXE`. DOS and OS/2
 therefore see the same drive and directory tree.
 
 Expected output includes `Hello from Open Watcom C`. `watcom_io/watcom_io.c` is the

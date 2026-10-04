@@ -451,7 +451,7 @@ fn canonical_module_name(name: &[u8]) -> Vec<u8> {
 
 fn load_module_file(name: &[u8], importer: &[u8]) -> Result<(Vec<u8>, Vec<u8>), i32> {
     let file = module_file(name);
-    let system = join(crate::kernel::dos::c_root(), b"WINDOWS/SYSTEM");
+    let system = join(crate::kernel::dos::c_root(), b"RETROOS/WINDOWS/SYSTEM");
     for path in [join(dirname(importer), &file), join(&system, &file)] {
         if let Ok(data) = crate::kernel::exec::load_file_resolved(&path) {
             return Ok((path, data));
