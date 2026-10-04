@@ -116,6 +116,9 @@ fn shutdown<A: crate::Arch>(
     use crate::kernel::bios_display::{DosVideo, FullscreenVga};
     use crate::kernel::platform::{Firmware, Host};
 
+    crate::kernel::klog::sync_live();
+    let sync_ok = crate::kernel::vfs::shutdown_all() == 0;
+
     let native_bios = crate::kernel::platform::get().firmware == Firmware::NativeBios;
     if native_bios {
         let cap = match &mut threads[tid].personality {
@@ -138,7 +141,11 @@ fn shutdown<A: crate::Arch>(
 
     let screen = lib::term::term();
     screen.clear();
-    crate::compact_screenln!(screen, "It is now safe to turn off your computer.");
+    if sync_ok {
+        crate::compact_screenln!(screen, "Storage synced. It is now safe to turn off your computer.");
+    } else {
+        crate::compact_screenln!(screen, "Storage sync failed. Check the disk before using it again.");
+    }
     if let thread::Personality::Dos(dos) = &mut threads[tid].personality
         && let DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) = &mut dos.pc.vga
     {

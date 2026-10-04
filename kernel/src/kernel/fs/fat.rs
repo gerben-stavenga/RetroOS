@@ -207,34 +207,45 @@ struct SendFile<T: fatfs::ReadWriteSeek + 'static>(CachedFile<T>);
 unsafe impl<T: fatfs::ReadWriteSeek + 'static> Send for SendFile<T> {}
 
 struct FatState<T: fatfs::ReadWriteSeek + 'static> {
-    media: fatfs::FileSystem<T>,
+    media: Option<fatfs::FileSystem<T>>,
     opens: BTreeMap<u32, Vec<u8>>,
     // SAFETY (the 'static above): every `FatFs<T>` this backs is Box::leak'd
-    // at mount time (see fs/disk.rs, startup.rs) and never moved or dropped
-    // for the life of the kernel, so `&self.state`'s address — and the
-    // `media` field these files borrow from — is permanently stable. Access
+    // at mount time (see fs/disk.rs, startup.rs) and never moved for the life
+    // of the kernel. The `media` field these files borrow from remains stable
+    // until shutdown clears every cached handle before taking it. Access
     // is still funneled through `self.state`'s Mutex like everything else.
     handles: BTreeMap<u32, SendFile<T>>,
     next_handle: u32,
 }
 
+impl<T: fatfs::ReadWriteSeek + 'static> FatState<T> {
+    fn media(&self) -> &fatfs::FileSystem<T> {
+        self.media.as_ref().expect("FAT filesystem is unmounted")
+    }
+}
+
 pub struct FatFs<T: fatfs::ReadWriteSeek + 'static> {
     state: Mutex<FatState<T>>,
+    writable: bool,
 }
 
 impl<T: fatfs::ReadWriteSeek + 'static> FatFs<T> {
     pub fn new(io: T) -> Result<Self, fatfs::Error<T::Error>> {
+        Self::new_with_policy(io, true)
+    }
+
+    pub fn new_with_policy(io: T, writable: bool) -> Result<Self, fatfs::Error<T::Error>> {
         let media = fatfs::FileSystem::new(io, fatfs::FsOptions::new())?;
         Ok(Self { state: Mutex::new(FatState {
-            media, opens: BTreeMap::new(), handles: BTreeMap::new(), next_handle: 1,
-        }) })
+            media: Some(media), opens: BTreeMap::new(), handles: BTreeMap::new(), next_handle: 1,
+        }), writable })
     }
 
     pub fn geometry(&self) -> Option<(u16, u16, u16, u16)> {
         let state = self.state.lock();
-        let stats = state.media.stats().ok()?;
+        let stats = state.media().stats().ok()?;
         Some((
-            u16::try_from((state.media.cluster_size() / 512).max(1)).unwrap_or(1),
+            u16::try_from((state.media().cluster_size() / 512).max(1)).unwrap_or(1),
             512,
             u16::try_from(stats.total_clusters()).unwrap_or(u16::MAX),
             u16::try_from(stats.free_clusters()).unwrap_or(u16::MAX),
@@ -420,6 +431,7 @@ pub(crate) mod tests {
             assert_eq!(&entry.name[..entry.name_len], b"My long document.txt");
             assert!(entry.short_name.is_some());
             assert!(fs.rename(b"Directory/My long document.txt", b"Directory/renamed.txt") == 0);
+            assert_eq!(fs.unmount(), 0);
             drop(fs);
             let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
             let root_file = fs.open(b"ROOT.TXT").unwrap();
@@ -464,12 +476,22 @@ pub(crate) mod tests {
 impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     fn format_name(&self) -> &'static str { "FAT" }
 
+    fn unmount(&self) -> i32 {
+        if !self.writable { return 0; }
+        let mut state = self.state.lock();
+        state.handles.clear();
+        state.opens.clear();
+        let Some(media) = state.media.take() else { return 0 };
+        let unmounted = media.unmount().is_ok();
+        if unmounted { 0 } else { -5 }
+    }
+
     fn dos_attributes(&self, path: &[u8]) -> Option<u8> {
         let state = self.state.lock();
         let text = path_str(path)?;
         let (parent, name) = text.rsplit_once('/').unwrap_or(("", text));
-        let dir = if parent.is_empty() { state.media.root_dir() }
-                  else { state.media.root_dir().open_dir(parent).ok()? };
+        let dir = if parent.is_empty() { state.media().root_dir() }
+                  else { state.media().root_dir().open_dir(parent).ok()? };
         for entry in dir.iter() {
             let entry = entry.ok()?;
             if entry.file_name() == name { return Some(entry.attributes().bits()); }
@@ -480,8 +502,8 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         let state = self.state.lock();
         let text = path_str(path)?;
         let (parent, name) = text.rsplit_once('/').unwrap_or(("", text));
-        let dir = if parent.is_empty() { state.media.root_dir() }
-                  else { state.media.root_dir().open_dir(parent).ok()? };
+        let dir = if parent.is_empty() { state.media().root_dir() }
+                  else { state.media().root_dir().open_dir(parent).ok()? };
         for entry in dir.iter() {
             let entry = entry.ok()?;
             if entry.file_name() == name { return Some(unix_from_datetime(&entry.modified())); }
@@ -503,7 +525,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         if !(1980..=2107).contains(&year) { return false; }
         let state = self.state.lock();
         let Some(path) = path_str(path) else { return false };
-        let Ok(mut file) = state.media.root_dir().open_file(path) else { return false };
+        let Ok(mut file) = state.media().root_dir().open_file(path) else { return false };
         file.set_modified(fatfs::DateTime::new(
             fatfs::Date::new(year as u16, month as u16, day as u16),
             fatfs::Time::new((unix % 86400 / 3600) as u16, (unix % 3600 / 60) as u16, (unix % 60) as u16, 0),
@@ -513,14 +535,14 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let mut state = self.state.lock();
-        let mut file = state.media.root_dir().open_file(path_str(path)?).ok()?;
+        let mut file = state.media().root_dir().open_file(path_str(path)?).ok()?;
         let size = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)).ok()?;
         let size = u32::try_from(size).ok()?;
         fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(0)).ok()?;
         // SAFETY: see the `handles` field comment on `FatState` — `media`
-        // outlives every handle this file borrows from. Transmuting here,
-        // before any further borrow of `state`, also ends `file`'s borrow
-        // of `state.media` as far as the borrow checker is concerned.
+        // outlives every handle this file borrows from. Shutdown drops all
+        // cached handles before taking the media for unmount. Transmuting
+        // here also ends `file`'s borrow of `state.media` for the compiler.
         let file: CachedFile<T> = unsafe {
             core::mem::transmute::<
                 fatfs::File<'_, T, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
@@ -563,7 +585,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         let Some(path) = state.opens.get(&inner) else {
             return -9;
         };
-        let media = &state.media;
+        let media = state.media();
         let Some(path) = path_str(path) else {
             return -5;
         };
@@ -586,7 +608,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn readdir(&self, dir: &[u8], cookie: u64, out: &mut Vec<DirEntry>, max: usize) -> Option<u64> {
         let state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         let root = media.root_dir();
         let listing = if dir.is_empty() {
             root
@@ -631,7 +653,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn dir_exists(&self, path: &[u8]) -> bool {
         let state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         if path.is_empty() {
             return true;
         }
@@ -657,7 +679,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         let Some(path) = state.opens.get(&inner) else {
             return -9;
         };
-        let media = &state.media;
+        let media = state.media();
         let Some(path) = path_str(path) else {
             return -5;
         };
@@ -683,7 +705,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
         let mut state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         let path_text = path_str(path)?;
         let (parent, name) = path_text.rsplit_once('/').unwrap_or(("", path_text));
         let dir = if parent.is_empty() { media.root_dir() }
@@ -716,7 +738,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn remove(&self, path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         let Some(path) = path_str(path) else {
             return -5;
         };
@@ -729,7 +751,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn mkdir(&self, path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         let Some(path) = path_str(path) else {
             return -5;
         };
@@ -754,7 +776,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
 
     fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 {
         let state = self.state.lock();
-        let media = &state.media;
+        let media = state.media();
         let (Some(src), Some(dst)) = (path_str(path), path_str(new_path)) else {
             return -5;
         };

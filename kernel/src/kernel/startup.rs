@@ -1147,6 +1147,10 @@ fn run<A: crate::Arch>(
             );
         }
         crate::compact_screenln!(&mut screen, "All commands done — shutting down.");
+        crate::kernel::klog::sync_live();
+        if crate::kernel::vfs::shutdown_all() < 0 {
+            crate::compact_screenln!(&mut screen, "Storage sync failed before shutdown.");
+        }
         crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
         machine.shutdown();
     }

@@ -673,6 +673,13 @@ impl Filesystem for PortableExt4Fs {
         self.flush_pending().map_or(-5, |_| 0)
     }
 
+    fn sync(&self) -> i32 {
+        if self.flush_pending().is_err() {
+            return -5;
+        }
+        self.mounted.borrow_mut().storage.flush().map_or(-5, |_| 0)
+    }
+
     fn readdir(
         &self,
         path: &[u8],

@@ -124,6 +124,8 @@ http_archive(
     type = "tar.gz",
     strip_prefix = "rust-fatfs-c4b88477b22ca7e5131fbd8891f62a5deaa88e6e",
     build_file = "//stdlib:fatfs.BUILD",
+    patches = ["//stdlib:fatfs-unmount-flush.patch"],
+    patch_args = ["-p1"],
 )
 
 # Register toolchains

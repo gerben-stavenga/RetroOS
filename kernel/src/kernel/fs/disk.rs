@@ -67,7 +67,7 @@ impl FilesystemVolume {
             Format::Ext4 => portable_ext4::PortableExt4Fs::new(self.volume)
                 .map(|fs| Box::new(fs) as Box<dyn Filesystem>)
                 .map_err(|_| "ext4 mount failed"),
-            Format::Fat => fat::FatFs::new(fat::VolumeIo::new(self.volume, writable))
+            Format::Fat => fat::FatFs::new_with_policy(fat::VolumeIo::new(self.volume, writable), writable)
                 .map(|fs| Box::new(fs) as Box<dyn Filesystem>)
                 .map_err(|_| "FAT mount failed"),
         }

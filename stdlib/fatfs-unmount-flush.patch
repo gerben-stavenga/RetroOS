@@ -1,0 +1,9 @@
+--- a/src/fs.rs
++++ b/src/fs.rs
+@@ -576,5 +576,6 @@
+     fn unmount_internal(&self) -> Result<(), Error<IO::Error>> {
+         self.flush_fs_info()?;
+         self.set_dirty_flag(false)?;
++        self.disk.borrow_mut().flush()?;
+         Ok(())
+     }

@@ -168,6 +168,12 @@ pub trait Filesystem {
     fn rename(&self, _path: &[u8], _new_path: &[u8]) -> i32 { -38 }
     fn supports_directory_mutation(&self) -> bool { false }
     fn flush(&self, _path: &[u8]) -> i32 { 0 }
+    /// Persist filesystem-wide buffered data and issue a device barrier.
+    /// Called after open handles are flushed during orderly shutdown.
+    fn sync(&self) -> i32 { 0 }
+    /// Finish filesystem bookkeeping before poweroff. Backends without an
+    /// unmount operation still receive the final sync barrier.
+    fn unmount(&self) -> i32 { self.sync() }
     fn mtime(&self, _path: &[u8]) -> Option<u32> { None }
     fn set_mtime(&self, _path: &[u8], _mtime: u32) -> bool { false }
     /// Optional on-disk DOS attributes, independent of Unix ownership/mode.
@@ -734,6 +740,25 @@ impl Vfs {
             return if flushed < 0 { flushed } else { closed };
         }
         0
+    }
+
+    /// Flush all open handles, then each mounted server. A failing write must
+    /// be reported to the shutdown path rather than called a clean poweroff.
+    fn shutdown_all(&mut self) -> i32 {
+        let mut failed = false;
+        for idx in 0..self.file_table.len() {
+            if self.file_table[idx].refcount != 0 && self.flush_handle(idx as i32) < 0 {
+                failed = true;
+            }
+        }
+        for binding in &self.mounts {
+            if let BindTarget::Server(fs) = binding.target
+                && fs.unmount() < 0
+            {
+                failed = true;
+            }
+        }
+        if failed { -5 } else { 0 }
     }
 
     fn add_ref(&mut self, idx: i32) {
@@ -1417,6 +1442,11 @@ impl Vfs {
 unsafe impl Send for Vfs {}
 
 static VFS: Mutex<Vfs> = Mutex::new(Vfs::new());
+
+/// Drain open files, unmount filesystems, and flush block-device write caches.
+pub fn shutdown_all() -> i32 {
+    VFS.lock().shutdown_all()
+}
 
 // ============================================================================
 // Pure helpers (no VFS state)
