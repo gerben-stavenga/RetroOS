@@ -139,13 +139,10 @@ fn shutdown<A: crate::Arch>(
     let screen = lib::term::term();
     screen.clear();
     crate::compact_screenln!(screen, "It is now safe to turn off your computer.");
-    match &mut threads[tid].personality {
-        thread::Personality::Dos(dos) => {
-            if let DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) = &mut dos.pc.vga {
-                crate::kernel::term::panic_present(surface);
-            }
-        }
-        _ => {}
+    if let thread::Personality::Dos(dos) = &mut threads[tid].personality
+        && let DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) = &mut dos.pc.vga
+    {
+        crate::kernel::term::panic_present(surface);
     }
     if let Some(surface) = display.as_mut() {
         crate::kernel::term::panic_present(surface);
