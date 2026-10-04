@@ -1929,6 +1929,17 @@ fn event_loop<A: crate::Arch>(
                 request,
             );
         }
+        if let Some(raw) = crate::kernel::osd::take_sb_master_request() {
+            let applied = sink.as_ref().is_some_and(|sink| sink.set_sb_master(machine, raw))
+                || sb_handoff.as_ref().is_some_and(|card| {
+                    card.set_master(machine, raw);
+                    true
+                });
+            if !applied {
+                let _ = thread::get_thread(threads, ctx.tid)
+                    .is_some_and(|thread| thread.personality.set_physical_sb_master(machine, raw));
+            }
+        }
         stats.part(machine, PROFILE_INPUT);
 
         // A blocked thread holds the console but not the CPU: wait for input
@@ -2188,6 +2199,7 @@ fn sound_view<A: crate::Arch>(
                 port: device.base,
                 can_mix: sink.is_some_and(crate::kernel::sound::Sink::is_hda)
                     || device.dma16 == Some(5),
+                has_mixer: device.has_ct1745(),
             },
             None => match crate::kernel::platform::get().audio {
                 Audio::EmulatedHda => SoundView::KernelHda { can_native: false, can_sb: false },

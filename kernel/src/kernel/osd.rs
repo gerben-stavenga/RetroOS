@@ -10,8 +10,8 @@
 //! retained fullscreen/windowed modes, and can terminate its task. Trace toggles the shared DOS/DPMI/Linux
 //! syscall-trace gate, Profile live cycle accounting, Dump the register/VGA
 //! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
-//! `Exit` for the focused thread, exactly as the SEGV path does). Volume is the
-//! one new knob: a runtime master gain multiplied into the single mix-out clip.
+//! `Exit` for the focused thread, exactly as the SEGV path does). The Sound tab
+//! controls the kernel mix gain and, when present, the physical SB master mixer.
 //!
 //! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
 //! called from [`console`](crate::kernel::console), which has the `machine`/
@@ -43,6 +43,7 @@ enum SoundRow {
     Status,
     SwitchToKernel,
     Volume,
+    SbMaster,
     Latency,
     Rate,
     HdaOutput,
@@ -61,7 +62,7 @@ pub enum SoundModeRequest {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SoundView {
-    NativeSb { port: u16, can_mix: bool },
+    NativeSb { port: u16, can_mix: bool, has_mixer: bool },
     KernelSb { port: u16, can_hda: bool },
     KernelHda { can_native: bool, can_sb: bool },
     KernelAc97,
@@ -125,6 +126,11 @@ static VIDEO_WIDTH: AtomicU32 = AtomicU32::new(0);
 static VIDEO_HEIGHT: AtomicU32 = AtomicU32::new(0);
 static VIDEO_DETAIL: AtomicU32 = AtomicU32::new(0);
 static VOL_PCT: AtomicU32 = AtomicU32::new(DEFAULT_VOLUME_PCT);
+/// CT1745 compatibility register 0x22: one 4-bit master level per channel.
+static SB_MASTER_RAW: AtomicU32 = AtomicU32::new(0xcc);
+static SB_MASTER_OVERRIDE: AtomicBool = AtomicBool::new(false);
+/// Pending hardware write, encoded as register value + 1 so zero means none.
+static SB_MASTER_REQ: AtomicU32 = AtomicU32::new(0);
 static LATENCY_MS: AtomicU32 = AtomicU32::new(30);
 static KILL_REQ: AtomicBool = AtomicBool::new(false);
 static PRESENTATION_REQ: AtomicBool = AtomicBool::new(false);
@@ -194,6 +200,16 @@ pub fn master_gain_q16() -> i32 {
 fn volume_gain_q16(percent: u32) -> i32 {
     let index = (percent / VOL_STEP) as usize;
     VOLUME_GAIN_Q16[index.min(VOLUME_GAIN_Q16.len() - 1)]
+}
+
+fn sb_master_percent(raw: u32) -> u32 {
+    let sum = ((raw >> 4) & 0x0f) + (raw & 0x0f);
+    ((sum * 100 + 15) / 30 + 5) / 10 * 10
+}
+
+fn sb_master_raw(percent: u32) -> u8 {
+    let level = ((percent * 15 + 50) / 100) as u8;
+    (level << 4) | level
 }
 
 fn parse_volume_percent(raw: &[u8]) -> Option<u32> {
@@ -270,21 +286,25 @@ fn active_item_count(tab: usize, sound: SoundView) -> usize {
 }
 
 fn sound_item_count(sound: SoundView) -> usize {
-    (0..7).take_while(|&item| sound_row_for(sound, item).is_some()).count()
+    (0..8).take_while(|&item| sound_row_for(sound, item).is_some()).count()
 }
 
 fn sound_row_for(sound: SoundView, item: usize) -> Option<SoundRow> {
     let rows: &[SoundRow] = match sound {
-        SoundView::NativeSb { can_mix: true, .. } => {
-            &[SoundRow::Status, SoundRow::SwitchToKernel]
-        }
-        SoundView::NativeSb { can_mix: false, .. } => &[SoundRow::Status],
+        SoundView::NativeSb { can_mix: true, has_mixer: true, .. } =>
+            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SwitchToKernel],
+        SoundView::NativeSb { can_mix: false, has_mixer: true, .. } =>
+            &[SoundRow::Status, SoundRow::SbMaster],
+        SoundView::NativeSb { can_mix: true, has_mixer: false, .. } =>
+            &[SoundRow::Status, SoundRow::SwitchToKernel],
+        SoundView::NativeSb { can_mix: false, has_mixer: false, .. } =>
+            &[SoundRow::Status],
         SoundView::KernelSb { can_hda: true, .. } => &[
-            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::Status, SoundRow::Volume, SoundRow::SbMaster, SoundRow::Latency, SoundRow::Rate,
             SoundRow::SwitchToHda, SoundRow::SwitchToNative,
         ],
         SoundView::KernelSb { can_hda: false, .. } => &[
-            SoundRow::Status, SoundRow::Volume, SoundRow::Latency, SoundRow::Rate,
+            SoundRow::Status, SoundRow::Volume, SoundRow::SbMaster, SoundRow::Latency, SoundRow::Rate,
             SoundRow::SwitchToNative,
         ],
         SoundView::KernelHda { can_native: true, can_sb: true } => &[
@@ -318,6 +338,34 @@ pub fn take_sound_mode_request() -> Option<SoundModeRequest> {
         SOUND_SEL.store(0, Ordering::Relaxed);
     }
     request
+}
+
+/// Track hardware or guest changes to the physical card's master level.
+pub fn observe_sb_master(raw: u8) {
+    SB_MASTER_RAW.store(u32::from(raw), Ordering::Relaxed);
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+/// CT1745 extended left/right master registers map their upper four bits to
+/// the compatibility register displayed by the OSD.
+pub fn observe_sb_master_channel(index: u8, raw: u8) {
+    let nibble = u32::from(raw >> 4);
+    let _ = SB_MASTER_RAW.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+        Some(if index == 0x30 { (old & 0x0f) | (nibble << 4) }
+            else { (old & 0xf0) | nibble })
+    });
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+pub fn take_sb_master_request() -> Option<u8> {
+    let request = SB_MASTER_REQ.swap(0, Ordering::Relaxed);
+    (request != 0).then_some((request - 1) as u8)
+}
+
+/// Preserve an explicit OSD level when the card moves into kernel mixing.
+pub fn sb_master_override() -> Option<u8> {
+    SB_MASTER_OVERRIDE.load(Ordering::Relaxed)
+        .then_some(SB_MASTER_RAW.load(Ordering::Relaxed) as u8)
 }
 
 fn debug_item_count() -> usize {
@@ -776,6 +824,15 @@ fn adjust(up: bool, sound: SoundView) {
                 cur.saturating_sub(VOL_STEP)
             };
             VOL_PCT.store(next, Ordering::Relaxed);
+        }
+        Some(SoundRow::SbMaster) => {
+            let cur = sb_master_percent(SB_MASTER_RAW.load(Ordering::Relaxed));
+            let next = if up { (cur + VOL_STEP).min(VOL_MAX) }
+                else { cur.saturating_sub(VOL_STEP) };
+            let raw = sb_master_raw(next);
+            SB_MASTER_RAW.store(u32::from(raw), Ordering::Relaxed);
+            SB_MASTER_OVERRIDE.store(true, Ordering::Relaxed);
+            SB_MASTER_REQ.store(u32::from(raw) + 1, Ordering::Relaxed);
         }
         Some(SoundRow::Latency) => {
             let cur = LATENCY_MS.load(Ordering::Relaxed);
@@ -1304,6 +1361,17 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put_num(pct);
                 line.put(b"%");
             }
+            Some(SoundRow::SbMaster) => {
+                let pct = sb_master_percent(SB_MASTER_RAW.load(Ordering::Relaxed));
+                line.put(b"SB master [");
+                let filled = (pct / VOL_STEP) as usize;
+                for i in 0..10 {
+                    line.put(if i < filled { b"#" } else { b"-" });
+                }
+                line.put(b"] ");
+                line.put_num(pct);
+                line.put(b"%");
+            }
             Some(SoundRow::Latency) => {
                 line.put(b"Latency  ");
                 line.put_num(LATENCY_MS.load(Ordering::Relaxed));
@@ -1558,15 +1626,26 @@ mod tests {
 
     #[test]
     fn sound_items_reflect_audio_ownership() {
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true }), 2);
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false }), 1);
-        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: false }), 5);
-        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: true }), 6);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true }), 3);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: true }), 2);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: false }), 1);
+        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: false }), 6);
+        assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: true }), 7);
         assert_eq!(sound_item_count(SoundView::KernelHda { can_native: false, can_sb: false }), 5);
         assert_eq!(sound_item_count(SoundView::KernelHda { can_native: true, can_sb: true }), 7);
         assert_eq!(sound_item_count(SoundView::KernelAc97), 4);
         assert_eq!(sound_item_count(SoundView::KernelHost), 4);
         assert_eq!(sound_item_count(SoundView::KernelSilent), 4);
+    }
+
+    #[test]
+    fn sb_master_steps_match_ct1745_compatibility_levels() {
+        assert_eq!(sb_master_percent(0xcc), 80);
+        assert_eq!(sb_master_raw(100), 0xff);
+        assert_eq!(sb_master_raw(0), 0x00);
+        for pct in (0..=100).step_by(10) {
+            assert_eq!(sb_master_percent(u32::from(sb_master_raw(pct))), pct);
+        }
     }
 
     #[test]

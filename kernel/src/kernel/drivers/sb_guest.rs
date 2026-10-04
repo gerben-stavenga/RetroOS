@@ -87,6 +87,13 @@ pub struct NativeSb {
 }
 
 impl NativeSb {
+    /// The OSD briefly selects the master register, then puts the guest's
+    /// mixer index back so its next data-port access still targets its choice.
+    pub fn set_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) {
+        self.card.set_master(machine, raw);
+        machine.outb(self.card.base + 0x04, self.mixer_idx);
+    }
+
     fn new(card: Sb16) -> Self {
         Self {
             card,
@@ -325,6 +332,13 @@ impl NativeSb {
             && matches!(self.mixer_idx, 0x04 | 0x22 | 0x26 | 0x30..=0x35 | 0x3c)
         {
             crate::compact_println!("sb: mixer {:#04x} <- {:#04x}", self.mixer_idx, val);
+        }
+        if p == b.io_base + 0x05 {
+            match self.mixer_idx {
+                0x22 => crate::kernel::osd::observe_sb_master(val),
+                0x30 | 0x31 => crate::kernel::osd::observe_sb_master_channel(self.mixer_idx, val),
+                _ => {}
+            }
         }
         machine.outb(self.host_port(b, p), val);
     }

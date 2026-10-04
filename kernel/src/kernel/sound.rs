@@ -308,6 +308,20 @@ impl Sink {
         }
     }
 
+    pub fn set_sb_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) -> bool {
+        match self.inner.device_ref() {
+            Output::Sb { device, .. } => {
+                device.set_master(machine, raw);
+                true
+            }
+            Output::Hda(_) => self.parked_sb.as_ref().is_some_and(|card| {
+                card.set_master(machine, raw);
+                true
+            }),
+            Output::Ac97(_) => false,
+        }
+    }
+
     /// Stream a block of wide mixed PCM, applying the final Q16 output gain.
     fn play(&mut self, frames: &[(i32, i32)], gain_q16: i32) {
         self.inner.submit(frames, gain_q16);

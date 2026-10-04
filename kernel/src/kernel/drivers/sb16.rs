@@ -64,6 +64,7 @@ const RATE: u32 = 44_100;
 pub struct Sb16 {
     /// PnP IRQ/DMA are configured through ISA PnP, never mixer soft-straps.
     pnp: bool,
+    is_sb16: bool,
     /// The port window the card decodes.
     pub base: u16,
     /// The physical completion IRQ.
@@ -105,6 +106,16 @@ pub struct Sb16Output {
 /// the one path that could have lied about a 16-bit channel is closed where
 /// the truth was known — and it is exactly the mixer sink's precondition.
 impl Sb16 {
+    pub fn has_ct1745(&self) -> bool { self.is_sb16 }
+
+    /// Set the CT1745's stereo master level using its compatibility register.
+    /// Native passthrough restores the guest's mixer index after this write.
+    pub fn set_master<A: crate::Arch>(&self, machine: &mut A, raw: u8) {
+        machine.outb(self.base + MIX_IDX, 0x22);
+        machine.outb(self.base + MIX_DATA, raw);
+        crate::kernel::osd::observe_sb_master(raw);
+    }
+
     /// This card's own strap view, for comparing against what the guest was
     /// told (`BLASTER`) before deciding whether to restrap.
     pub fn wiring(&self) -> SbWiring {
@@ -200,6 +211,11 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
         (_, d) => d,
     };
     let source = if is_sb16 { " (SB16: straps read from the mixer)" } else { " (declared)" };
+    if is_sb16 {
+        machine.outb(base + MIX_IDX, 0x22);
+        crate::kernel::osd::observe_sb_master(machine.inb(base + MIX_DATA));
+        machine.outb(base + MIX_IDX, 0);
+    }
     match dma16 {
         Some(dma16) => crate::compact_println!(
             "sb: DSP {}.x at {:#05x} — IRQ{} DMA{} HDMA{}{}",
@@ -212,6 +228,7 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
     }
     Some(Sb16 {
         pnp,
+        is_sb16,
         base,
         irq: w.irq,
         dma8: w.dma8,
@@ -377,8 +394,7 @@ fn open_ring<A: crate::Arch>(machine: &mut A, card: &Sb16) -> Option<u32> {
     // A native DOS program may have left the CT1745 voice/master levels
     // attenuated.  The kernel sink owns the DAC now, so re-establish a full
     // PCM path; otherwise handoff produces only a faint residual signal.
-    machine.outb(card.base + MIX_IDX, 0x22); // master volume index
-    machine.outb(card.base + MIX_DATA, 0xFF); // full
+    card.set_master(machine, crate::kernel::osd::sb_master_override().unwrap_or(0xff));
     machine.outb(card.base + MIX_IDX, 0x04); // voice/DAC volume index
     machine.outb(card.base + MIX_DATA, 0xFF); // full
     dsp_write_at(machine, card.base, CMD_SPEAKER_ON);
