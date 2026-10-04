@@ -3,7 +3,7 @@
  * Invoked one-shot as `COMMAND.COM /C cmdline` (or `COMMAND.COM cmdline`).
  * Reads its arguments through ANSI `int main(int argc, char *argv[])` (the
  * Borland C startup parses the PSP tail into argv); then either:
- *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/COPY/PAUSE/TRACE/EXIT),
+ *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/COPY/CHCP/PAUSE/TRACE/EXIT),
  *   - interprets a .BAT file line by line,
  *   - or fork+execs an external program and waits for it.
  *
@@ -1066,7 +1066,7 @@ static int strip_redirections(char **argv, int prog_idx, int argc,
 }
 
 /* Run the command at argv[prog_idx] with arguments at argv[prog_idx+1..argc-1].
- * Built-ins (drive switch "X:", REM/ECHO/CD/CLS/TYPE/COPY/LOG/PAUSE/TRACE/EXIT/
+ * Built-ins (drive switch "X:", REM/ECHO/CD/CLS/TYPE/COPY/CHCP/LOG/PAUSE/TRACE/EXIT/
  * SHUTDOWN) are matched first and handled inline; if none match,
  * dispatch_external takes over at the tail.
  * argv[prog_idx-1] and argv[prog_idx-2] (when prog_idx >= 1 / >= 2) must be
@@ -1146,6 +1146,39 @@ static int run_command(char **argv, int prog_idx, int argc, int interactive) {
         rc = copy_cmd(argv, args, argc);
         copy_quiet = 0;
         return rc;
+    }
+    if (stricmp(name, "CHCP") == 0) {
+        unsigned page;
+        if (nargs > 1) {
+            puts("Usage: CHCP [437|850|852|866]");
+            return 1;
+        }
+        if (nargs == 1) {
+            const char *arg = argv[args];
+            const char *p = arg;
+            while (*p && isdigit((unsigned char)*p)) p++;
+            if (*p || p == arg) {
+                puts("Usage: CHCP [437|850|852|866]");
+                return 1;
+            }
+            page = (unsigned)atoi(arg);
+            if (page != 437 && page != 850 && page != 852 && page != 866) {
+                puts("Code page not prepared (437, 850, 852, 866 available)");
+                return 1;
+            }
+            r.x.ax = 0x6602;
+            r.x.bx = page;
+            int86(0x21, &r, &r);
+            if (r.x.cflag) {
+                printf("Cannot select code page %u (DOS error %u)\n", page, r.x.ax);
+                return 1;
+            }
+        }
+        r.x.ax = 0x6601;
+        int86(0x21, &r, &r);
+        if (r.x.cflag) { puts("Cannot query code page"); return 1; }
+        printf("Active code page: %u\n", r.x.bx);
+        return 0;
     }
     if (stricmp(name, "LOG") == 0) {
         /* Dump the in-memory kernel log (INT 31h AH=07h, line by line). On real
