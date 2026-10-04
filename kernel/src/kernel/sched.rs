@@ -87,9 +87,10 @@ fn next_after<A: crate::Arch>(
             crate::kernel::linux::handle_fork(machine, threads, regs, tid, child_stack, on_done)
                 .map(Verdict::Switch)
         }
-        thread::KernelAction::Exec { buffer, path, args, cwd } => {
+        thread::KernelAction::Exec { buffer, path, args, cmdtail, env, cwd, personality_name, policy } => {
             crate::kernel::linux::handle_exec(
-                machine, bios_workspace, threads, regs, tid, buffer, path, args, cwd,
+                machine, bios_workspace, threads, regs, tid, buffer, path, args, cmdtail, env,
+                cwd, personality_name, policy,
                 exiting_display, sb_handoff, display,
             ).map(Verdict::Switch)
         }

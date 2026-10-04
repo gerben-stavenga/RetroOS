@@ -2455,6 +2455,11 @@ fn switch_focus_and_run<A: crate::Arch>(
                     unreachable!("DOS VGA returned to non-DOS parent")
                 };
                 dos.pc.vga.acquire_parent_replace(machine, returned);
+                crate::kernel::dos::snapshot_retained_surface(machine, dos, &new.kernel.vcpu.regs);
+                windows.desktop_mut().damage_surface(
+                    crate::kernel::gui::EndpointId(new_tid as u32),
+                    crate::kernel::gui::SurfaceKey(2),
+                );
             }
             Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
                 if crate::kernel::osd::is_open()
@@ -2524,6 +2529,11 @@ fn switch_focus_and_run<A: crate::Arch>(
                 unreachable!("DOS VGA returned to non-DOS parent")
             };
             dos.pc.vga.acquire_parent_replace(machine, returned);
+            crate::kernel::dos::snapshot_retained_surface(machine, dos, &new.kernel.vcpu.regs);
+            windows.desktop_mut().damage_surface(
+                crate::kernel::gui::EndpointId(new_tid as u32),
+                crate::kernel::gui::SurfaceKey(2),
+            );
         }
         None => assert!(display.is_some(), "zombie lost display"),
     }

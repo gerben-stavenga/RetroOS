@@ -1169,7 +1169,8 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // return (drop symbols, close CLOEXEC, free pages, re-image) is the
     // executor's; until then execve still fails cleanly (the -ENOENT above).
     SyscallResult::act(0, thread::KernelAction::Exec {
-        buffer, path, args, cwd: cwd_snapshot,
+        buffer, path, args, cmdtail: alloc::vec::Vec::new(), env: alloc::vec::Vec::new(),
+        cwd: cwd_snapshot, personality_name: None, policy: Default::default(),
     })
 }
 
@@ -1188,13 +1189,44 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     buffer: alloc::vec::Vec<u8>,
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cmdtail: alloc::vec::Vec<u8>,
+    env: alloc::vec::Vec<u8>,
     cwd: alloc::vec::Vec<u8>,
+    personality_name: Option<thread::PersonalityName>,
+    policy: crate::kernel::dos::LaunchPolicy,
     exiting_display: &mut Option<crate::kernel::display::ExitDisplay>,
     sb_handoff: &mut Option<crate::kernel::drivers::sb16::Sb16>,
     display: &mut Option<crate::kernel::display::Display>,
 ) -> Option<usize> {
     use crate::kernel::exec;
-    let format = exec::detect_format(&buffer, &path);
+    let format = if personality_name == Some(thread::PersonalityName::Dos) {
+        exec::detect_format_for_dos(&buffer, &path)
+    } else {
+        exec::detect_format(&buffer, &path)
+    };
+
+    // A DOS shell started through Win32 CreateProcess owns the display and
+    // Sound Blaster while it replaces itself. Detach those resources before
+    // exec_dos_into drops the old DosState, then bind them to the new image.
+    let replacing_dos = personality_name == Some(thread::PersonalityName::Dos);
+    let focused_dos = replacing_dos && crate::kernel::focus::focused() == tid;
+    let exec_display = if focused_dos {
+        Some(match display.take() {
+            Some(surface) => crate::kernel::display::DisplayHandoff::from_surface(surface, machine),
+            None => thread::get_thread(threads, tid).unwrap()
+                .personality.release_display(machine, bios_workspace),
+        })
+    } else {
+        None
+    };
+    let exec_sb = if focused_dos {
+        thread::get_thread(threads, tid).unwrap().personality.release_sb(machine)
+    } else {
+        None
+    };
+    if exec_sb.is_some() {
+        assert!(sb_handoff.is_none(), "stale SB handoff during DOS exec");
+    }
 
     // Point of no return — drop symbols + close CLOEXEC fds.
     {
@@ -1215,10 +1247,33 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         _ => exec::ExecVga::Dos(crate::kernel::bios_display::DosVideo::Vga(
             crate::kernel::bios_display::EmulatedVga::initial_mode3())),
     };
-    if exec::init_thread(machine, threads, tid, buffer, &path, args, alloc::vec::Vec::new(), alloc::vec::Vec::new(), cwd, None, Default::default(), exec_vga).is_err() {
+    if exec::init_thread(machine, threads, tid, buffer, &path, args, cmdtail, env, cwd,
+        personality_name, policy, exec_vga).is_err() {
+        if let Some(handoff) = exec_display {
+            *display = Some(handoff.into_surface(machine, bios_workspace));
+        }
+        if exec_sb.is_some() {
+            *sb_handoff = exec_sb;
+        }
         return Some(thread::exit_thread(
             threads, machine, bios_workspace, tid, -ENOEXEC, exiting_display, sb_handoff, display,
         ));
+    }
+
+    if let Some(handoff) = exec_display {
+        let new = thread::get_thread(threads, tid).unwrap();
+        if crate::kernel::osd::is_open()
+            || matches!(new.personality, thread::Personality::Linux(_)
+                | thread::Personality::Os2(_) | thread::Personality::Windows(_))
+        {
+            *display = Some(handoff.into_surface(machine, bios_workspace));
+        } else {
+            new.personality.acquire_display_replace(machine, bios_workspace, handoff);
+        }
+    }
+    if focused_dos {
+        *sb_handoff = thread::get_thread(threads, tid).unwrap()
+            .personality.adopt_sb(machine, exec_sb);
     }
 
     // Reload the live frame from the rebuilt stored frame; stay on this thread.

@@ -313,9 +313,9 @@ pub(super) fn create_process<A: crate::Arch>(
             crate::kernel::exec::BinaryFormat::MzExe | crate::kernel::exec::BinaryFormat::Com
         ) {
             // COMMAND.COM owns LOADFIX.CFG parsing and the /L, DOS32A, and
-            // virtual-IF launch paths. Keep it as MC's child so MC's wait
-            // also waits for the DOS program that COMMAND.COM starts.
-            let mut tail = b"/C ".to_vec();
+            // virtual-IF launch paths. /E replaces this child with the DOS
+            // program so MC's process handle tracks the program itself.
+            let mut tail = b"/E ".to_vec();
             tail.extend_from_slice(&full_windows_path(state, &program));
             if !cmdtail.is_empty() {
                 tail.push(b' ');

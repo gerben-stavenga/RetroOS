@@ -133,7 +133,11 @@ pub enum KernelAction {
         buffer: alloc::vec::Vec<u8>,
         path: alloc::vec::Vec<u8>,
         args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+        cmdtail: alloc::vec::Vec<u8>,
+        env: alloc::vec::Vec<u8>,
         cwd: alloc::vec::Vec<u8>,
+        personality_name: Option<PersonalityName>,
+        policy: crate::kernel::dos::LaunchPolicy,
     },
     /// wait4: reap a zombie child (or block until one exists). Run in the
     /// executor so the child-table scan/reap happens off the parent's borrow.

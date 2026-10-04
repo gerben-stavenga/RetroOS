@@ -1,6 +1,7 @@
 /* COMMAND.COM -- minimal DOS shell launcher for RetroOS.
  *
- * Invoked one-shot as `COMMAND.COM /C cmdline` (or `COMMAND.COM cmdline`).
+ * Invoked one-shot as `COMMAND.COM /C cmdline`, or as `/E cmdline` when
+ * CreateProcess gives the shell a process it can replace.
  * Reads its arguments through ANSI `int main(int argc, char *argv[])` (the
  * Borland C startup parses the PSP tail into argv); then either:
  *   - runs a built-in (REM/ECHO/CD/CLS/TYPE/COPY/CHCP/PAUSE/TRACE/EXIT),
@@ -10,7 +11,8 @@
  * The kernel-side INT 31h API is now layer-clean:
  *   AH=01h SYNTH_FORK_EXEC   DS:DX -> ASCIIZ program name
  *                            ES:BX -> ASCIIZ args (use "" for none)
- *                            -> CF=0 AX=0 BX=child_pid; CF=1 AX=errno
+ *                            -> CF=0 AX=0 BX=child_pid; CF=1 AX=errno.
+ *                            CH bit 1 replaces this process instead of forking.
  *   AH=04h SYNTH_WAITPID     BX=pid -> CF=0 AX=0 exited / AX=1 alive
  *                            (peek only; slot stays Zombie until AH=05).
  *   AH=05h SYNTH_REAP        BX=pid -> recycle an exited child.
@@ -57,6 +59,8 @@ static int should_exit = 0;     /* set by EXIT builtin to break out of BAT */
  * EXEC'd inside an existing TSR session. External commands then run in THIS
  * address space so resident drivers survive nested launches. */
 static int in_session = 0;
+/* /E is used when CreateProcess gave this shell its own RetroOS process. */
+static int replace_self = 0;
 static const char empty_str[] = "";
 
 /* ----- thin INT wrappers ----- */
@@ -668,6 +672,16 @@ static int dispatch_external(char **argv, int prog_idx, int argc, int interactiv
      * DOS/32A prefixing above still applies — that is just a different
      * program to exec, and it works in-process unchanged.
      */
+    if (replace_self && !in_session && !(flags & LF_F_LOADFIX)) {
+        char tail[128];
+        join_args(tail, sizeof(tail), argv, prog_idx + 1, argc);
+        /* CH bit 1 selects the existing in-place Exec action. Success does
+         * not return; MC keeps this process ID while the game runs. */
+        if (synth_fork_exec(argv[prog_idx], tail, policy | 0x0200) < 0) {
+            printf("Bad command or file name: '%s'\r\n", argv[prog_idx]);
+            return 255;
+        }
+    }
     if (in_session) {
         char tail[128];
         int rc;
@@ -1299,6 +1313,7 @@ int main(int argc, char *argv[]) {
 
     /* Invocation contract: COMMAND.COM is always called as
      *   COMMAND.COM /L prog [args]   (LOADFIX trampoline)
+     *   COMMAND.COM /E prog [args]   (one-shot process replacement)
      * or
      *   COMMAND.COM /C prog [args]   (one-shot run)
      *
@@ -1307,8 +1322,9 @@ int main(int argc, char *argv[]) {
      * argv[2] (the program) -- exactly what dispatch_external needs to
      * inject trampoline prefixes in place without an extra buffer. */
     if (argc < 2 || (!is_flag(argv[1], 'L') && !is_flag(argv[1], 'C')
+                     && !is_flag(argv[1], 'E')
                      && !is_flag(argv[1], 'B'))) {
-        printf("Usage: COMMAND.COM /C cmdline   (/L LOADFIX, /B batch)\r\n");
+        printf("Usage: COMMAND.COM /C cmdline   (/E replace, /L LOADFIX, /B batch)\r\n");
         return 1;
     }
 
@@ -1342,6 +1358,7 @@ int main(int argc, char *argv[]) {
         return dos_exec_inplace(argv[2], tail);
     }
 
+    replace_self = is_flag(argv[1], 'E');
     /* /C path: the first shell forks the selected program for DN's task
      * switching. The forked child is marked as a DOS session at creation;
      * nested /C shells use INT 21h EXEC and share resident drivers. */

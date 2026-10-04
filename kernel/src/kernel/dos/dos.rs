@@ -736,14 +736,15 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
 pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
-        // AH=01h — SYNTH_FORK_EXEC: fork+exec program. Non-blocking.
+        // AH=01h — launch a program. Normally fork+exec, non-blocking;
+        // CH bit 1 replaces this process for a one-shot shell.
         // Input:  DS:DX -> ASCIIZ program filename (no shell parsing here)
         //         ES:BX -> ASCIIZ command tail (use "" for no args; kernel
         //                  installs it at the child's PSP[0x80] in DOS form
         //                  with length byte and trailing CR).
         // Output on success (CF=0): AX=0, BX = child pid.
         // Output on error   (CF=1): AX = errno.
-        // Caller polls AH=04 (SYNTH_WAITPID) for exit. Shell concerns
+        // Forking caller polls AH=04 (SYNTH_WAITPID) for exit. Shell concerns
         // (parsing, /C, .BAT, built-ins) live entirely in COMMAND.COM.
         0x01 => {
             let mut read_asciiz = |seg: u16, off: u32, dst: &mut [u8; 128]| -> usize {
@@ -780,7 +781,11 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
             // virtual IF sticks at 0, and DOOM deadlocks at DMX_Init spinning on
             // a tick that can never arrive. Anything unknown stays conforming.
             let policy = super::LaunchPolicy::from_synth(regs.rcx as u16);
-            fork_exec(dos, &filename[..flen], &tail[..tlen], policy, regs, kt)
+            if regs.rcx & 0x0200 != 0 {
+                exec_replace(machine, dos, &filename[..flen], &tail[..tlen], policy, regs)
+            } else {
+                fork_exec(dos, &filename[..flen], &tail[..tlen], policy, regs, kt)
+            }
         }
         // AH=04h — SYNTH_WAITPID: non-blocking probe of child status.
         // BX = child pid (from a prior AH=01).
@@ -3635,6 +3640,53 @@ fn fork_exec<A: crate::Arch>(dos: &mut thread::DosState<A>, prog_name: &[u8], cm
         policy,
         on_error,
         on_success,
+    }
+}
+
+/// Replace a one-shot shell's process, retaining its TID for a Win32
+/// CreateProcess caller. DOS INT 21h EXEC is nested and returns to the shell;
+/// it cannot provide this process-level replacement.
+fn exec_replace<A: crate::Arch>(
+    machine: &mut A,
+    dos: &mut thread::DosState<A>,
+    prog_name: &[u8],
+    cmdtail: &[u8],
+    mut policy: super::LaunchPolicy,
+    regs: &mut Regs,
+) -> thread::KernelAction {
+    let fail = |regs: &mut Regs| {
+        regs.rax = (regs.rax & !0xFFFF) | 2;
+        regs.set_flag32(1);
+        thread::KernelAction::Done
+    };
+    let mut dos_abs = [0u8; dfs::DFS_PATH_MAX];
+    let Ok(path_len) = dos.dfs.resolve(prog_name, &mut dos_abs) else {
+        return fail(regs);
+    };
+    let path = dos_abs[..path_len].to_vec();
+    let Some(vfs_path) = super::dos_abs_to_vfs(&path) else {
+        return fail(regs);
+    };
+    let Ok(buffer) = crate::kernel::exec::load_file_resolved(&vfs_path) else {
+        return fail(regs);
+    };
+    let mut cwd = alloc::vec::Vec::with_capacity(66);
+    cwd.push(b'A' + dos.dfs.current_drive_number());
+    cwd.push(b':');
+    cwd.extend(dos.dfs.get_cwd().iter().map(|&c| if c == b'\\' { b'/' } else { c }));
+    let env = super::snapshot_parent_env(machine, regs, dos);
+    // The replaced shell's process is now the DOS session, just as a child
+    // created by fork_exec would be.
+    policy.tsr_session = true;
+    thread::KernelAction::Exec {
+        buffer,
+        path: path.clone(),
+        args: alloc::vec![path],
+        cmdtail: cmdtail.to_vec(),
+        env,
+        cwd,
+        personality_name: Some(thread::PersonalityName::Dos),
+        policy,
     }
 }
 
