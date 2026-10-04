@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build an editable BIOS/UEFI USB disk for the GRUB module release.
 
-Unlike the hybrid ISO, this image has an ordinary MBR with one FAT32 EFI
+Unlike the hybrid ISO, this image has an ordinary MBR with one FAT32
 boot partition containing all release files. GRUB's menu is
 /boot/grub/grub.cfg on partition 1.
 """
@@ -12,7 +12,7 @@ import shutil
 import struct
 import tempfile
 
-from build_boot_disk import (GAP_SECTORS, PART_TYPE_ESP, SECTOR,
+from build_boot_disk import (GAP_SECTORS, SECTOR,
                              build_efi_binary, build_fat_partition,
                              install_grub_bios,
                              write_partition_table)
@@ -20,6 +20,7 @@ from build_boot_disk import (GAP_SECTORS, PART_TYPE_ESP, SECTOR,
 
 DISK_SIGNATURE = 0x5E77_0006
 BOOT_VOLUME_SERIAL = 0x5E77_0001
+PART_TYPE_FAT32_LBA = 0x0C
 BOOT_MIB = 128
 DIAGNOSTIC_GRUB_MODULES = (
     "all_video", "fat", "gzio",
@@ -107,7 +108,7 @@ def main():
         with open(args.out, "wb") as out:
             out.truncate(total_sectors * SECTOR)
         write_partition_table(args.out, [
-            (True, PART_TYPE_ESP, GAP_SECTORS, boot_sectors),
+            (True, PART_TYPE_FAT32_LBA, GAP_SECTORS, boot_sectors),
         ])
         install_grub_bios(args.out, work, args.grub_lib)
         with open(args.out, "r+b") as disk:
@@ -122,7 +123,7 @@ def main():
                             volume_serial=BOOT_VOLUME_SERIAL)
         set_hidden_sectors(args.out, GAP_SECTORS)
 
-    print(f"USB image {args.out}: FAT32 ESP p1 at LBA {GAP_SECTORS}")
+    print(f"USB image {args.out}: FAT32 LBA p1 at LBA {GAP_SECTORS}")
 
 
 if __name__ == "__main__":

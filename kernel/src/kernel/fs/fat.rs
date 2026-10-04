@@ -433,6 +433,14 @@ pub(crate) mod tests {
             assert!(fs.rename(b"Directory/My long document.txt", b"Directory/renamed.txt") == 0);
             assert_eq!(fs.unmount(), 0);
             drop(fs);
+            if kind == fatfs::FatType::Fat32 {
+                let bytes = disk.data.borrow();
+                assert_eq!(bytes[0x41] & 1, 0, "clean FAT32 unmount must clear BPB dirty flag");
+                let reserved = u16::from_le_bytes([bytes[14], bytes[15]]) as usize;
+                let first_fat = reserved * 512;
+                let fat1 = u32::from_le_bytes(bytes[first_fat + 4..first_fat + 8].try_into().unwrap());
+                assert_ne!(fat1 & 0x0800_0000, 0, "FAT32 clean shutdown bit must stay set");
+            }
             let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
             let root_file = fs.open(b"ROOT.TXT").unwrap();
             let mut root_data = [0; 13];

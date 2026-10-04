@@ -12,7 +12,8 @@ and GRUB menu as the USB image.
 ## Editable USB boot: retroos_grub_module_usb.img
 
 Use this image when you need to edit GRUB settings on a USB stick. It has a
-fixed MBR with one 128 MiB FAT32 EFI partition. The menu is
+fixed MBR with one 128 MiB FAT32 partition (type `0x0C`, so Windows can assign
+it a drive letter). The menu is
 `/boot/grub/grub.cfg`; the matching kernel and RAM modules are under `/boot`
 on the same partition.
 Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
@@ -20,10 +21,9 @@ Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
 the device's current contents. On Linux, after identifying the device with
 `lsblk`, the partition can be mounted as FAT32 and `boot/grub/grub.cfg` edited
-directly. On Windows, editing the EFI partition may require assigning it a
-drive letter with an administrator tool. No partition resize is required for
-a GRUB configuration change. A machine's firmware still chooses BIOS or UEFI
-before GRUB starts.
+directly. Windows can mount the FAT32 partition with a drive letter. No
+partition resize is required for a GRUB configuration change. A machine's
+firmware still chooses BIOS or UEFI before GRUB starts.
 
 The default framebuffer entry keeps GRUB's automatic video mode on UEFI. If
 that mode is below 640×400, try the menu's 1024×768 or 800×600 GOP entries.

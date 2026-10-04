@@ -201,11 +201,11 @@ def extract_boot_file(image, name, destination):
         return
     with image.open("rb") as disk:
         mbr = disk.read(512)
-    if mbr[510:512] != b"\x55\xaa" or mbr[450] != 0xEF:
-        raise ValueError("boot image needs an MBR with a FAT32 EFI partition first")
+    if mbr[510:512] != b"\x55\xaa" or mbr[450] not in (0x0C, 0xEF):
+        raise ValueError("boot image needs an MBR with a FAT32 boot partition first")
     start = struct.unpack_from("<I", mbr, 454)[0]
     if start == 0:
-        raise ValueError("boot image has no EFI partition offset")
+        raise ValueError("boot image has no FAT32 partition offset")
     subprocess.run(["mcopy", "-i", f"{image}@@{start * 512}",
                     f"::/boot/{name}", str(destination)], check=True)
 

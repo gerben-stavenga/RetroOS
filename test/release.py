@@ -23,7 +23,7 @@ def check_usb(work):
         mbr = disk.read(512)
     assert mbr[510:512] == b'\x55\xaa'
     assert struct.unpack_from('<I', mbr, 0x1B8)[0] != 0
-    assert mbr[450] == 0xEF
+    assert mbr[450] == 0x0C
     assert mbr[462:510] == bytes(48)
     assert struct.unpack_from('<I', mbr, 454)[0] == 2048
     assert image.stat().st_size == (2048 + struct.unpack_from('<I', mbr, 458)[0]) * 512
