@@ -20,6 +20,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.target_sha }}
+
       - name: Verify CI run
         if: inputs.run_id != ''
         env:
@@ -37,11 +41,6 @@ jobs:
           RUN_ID: ${{ inputs.run_id }}
           TARGET_SHA: ${{ inputs.target_sha }}
         run: gh run download "$RUN_ID" --name "retroos-$TARGET_SHA" --dir release
-
-      - uses: actions/checkout@v4
-        if: inputs.run_id == ''
-        with:
-          ref: ${{ inputs.target_sha }}
 
       - name: Prepare build runner
         if: inputs.run_id == ''
