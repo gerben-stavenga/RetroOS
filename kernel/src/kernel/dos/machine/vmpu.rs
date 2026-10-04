@@ -52,8 +52,8 @@ impl Mpu {
     /// real Sound Blaster is driving real silicon, and whatever answers at
     /// the declared MPU port — an MPU-401, a wavetable daughterboard, an
     /// external module — is the owner's hardware, not ours to intercept.
-    /// (Our synth could not sound anyway: native burns no GM bank.) So the
-    /// caller, which holds the SB device and can therefore see which it is,
+    /// The software bank may already be loaded for a later switch to kernel
+    /// mixing. The caller, which holds the SB device and can see which it is,
     /// decides; this only answers the address question.
     pub fn owns(&self, p: u16) -> bool {
         self.present && self.card.owns(p)

@@ -299,8 +299,7 @@ fn prepare_audio<A: crate::Arch>(
 
     // Burn the GM bank ROM while long work is still legal (no guest yet):
     // the shipped bank lives under the C: root beside the GUS patches. A
-    // native-SB machine has no emulated GM to feed and cannot afford the
-    // ~5 MB; a silent machine has nothing to render it to.
+    // native SB loads the bank on demand when it switches to kernel mixing.
     load_midi_bank(machine, bios_workspace, screen, platform.audio);
     // Take the selected output capability into runtime ownership. `None` is a
     // silent runtime, not a dummy sink.
@@ -447,16 +446,12 @@ fn load_midi_bank<A: crate::Arch>(
     screen: &mut crate::kernel::console::Console,
     audio: crate::kernel::platform::Audio,
 ) {
-    // SB kernel mixing is deliberately PCM-only.  On a slow 86Box machine,
-    // software GM synthesis costs enough to starve the guest, while native SB
-    // mode lets its OPL/MPU hardware handle music.  HDA/AC'97 still render GM
-    // in software because they have no guest-visible FM/MIDI hardware.
-    if !matches!(
-        audio,
+    // Native SB uses the real MPU and only needs this bank if its owner later
+    // switches to kernel mixing. A silent machine has no output for it.
+    if !matches!(audio,
         crate::kernel::platform::Audio::NativeSb
-            | crate::kernel::platform::Audio::SbSink
-            | crate::kernel::platform::Audio::EmulatedSilent
-    ) {
+            | crate::kernel::platform::Audio::EmulatedSilent)
+    {
         crate::screenln!(screen => machine, bios_workspace; "Loading General MIDI bank...");
         crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
         crate::screenln!(screen => machine, bios_workspace; "General MIDI bank load complete");
@@ -2098,6 +2093,10 @@ fn apply_sound_mode_request<A: crate::Arch>(
                     None => return,
                 },
             };
+            if crate::kernel::midi_bank::get().is_none() {
+                crate::compact_println!("Loading General MIDI bank for SB kernel mixing...");
+                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+            }
             if let Some(hda) = sink.as_mut().filter(|sink| sink.is_hda()) {
                 hda.park_sb(card);
                 crate::compact_println!("sound: switched SB to kernel mixing through HDA");

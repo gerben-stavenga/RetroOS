@@ -506,8 +506,8 @@ pub fn probe<A: crate::Arch>(
 /// HDA/AC'97 are PCI codecs no DOS program can address and are always
 /// emulated. `mixed` costs a software mix of every source plus the ~5 MB GM
 /// bank, and buys GUS/GM wavetable music on an SB-only machine; `native`
-/// hands the card over and costs the kernel nothing, which is what a 386/486
-/// (and the 86Box/Bochs emulations of one) can afford.
+/// hands the card over and avoids loading the GM bank until an owner switches
+/// to kernel mixing.
 /// This is also where the machine's Sound Blaster is MINTED, because it is the
 /// first moment its wiring can be known: an SB16 reports its own straps, but a
 /// pre-SB16 card's are physical jumpers that only `SB_AUDIO=native <irq> <dma>`
