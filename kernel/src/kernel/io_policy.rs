@@ -52,7 +52,7 @@ pub(super) fn key<A: crate::Arch>(
             key.native_sb = true;
             key.sb_base = dos.pc.sb.blaster.io_base;
             key.sb_trap_mask = pt.trap_mask(&dos.pc.sb.blaster);
-            if dos.pc.mpu.present {
+            if dos.pc.mpu.present && !crate::kernel::osd::midi_hda_enabled() {
                 key.mpu_base = dos.pc.mpu.base;
             }
         }

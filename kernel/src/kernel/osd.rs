@@ -47,6 +47,7 @@ enum SoundRow {
     SbWave,
     SbFm,
     SbCd,
+    MidiRoute,
     Latency,
     Rate,
     HdaOutput,
@@ -74,7 +75,7 @@ impl SbSource {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SoundView {
-    NativeSb { port: u16, can_mix: bool, has_mixer: bool },
+    NativeSb { port: u16, can_mix: bool, has_mixer: bool, hda_midi: bool },
     KernelSb { port: u16, can_hda: bool },
     KernelHda { can_native: bool, can_sb: bool },
     KernelAc97,
@@ -119,6 +120,9 @@ static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static WINDOWS_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_MODE_REQ: AtomicUsize = AtomicUsize::new(0);
+/// Native SB keeps DSP/OPL direct; this separately selects software MPU on HDA.
+static MIDI_HDA: AtomicBool = AtomicBool::new(false);
+static MIDI_ROUTE_REQ: AtomicBool = AtomicBool::new(false);
 static DISK_SEL: AtomicUsize = AtomicUsize::new(0);
 /// Which media device the Disk tab is showing: 0=A:, 1=B:, 2=CD (◄/►).
 static DISK_DEV: AtomicUsize = AtomicUsize::new(0);
@@ -319,16 +323,21 @@ fn sound_item_count(sound: SoundView) -> usize {
 
 fn sound_row_for(sound: SoundView, item: usize) -> Option<SoundRow> {
     let rows: &[SoundRow] = match sound {
-        SoundView::NativeSb { can_mix: true, has_mixer: true, .. } =>
-            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave, SoundRow::SbFm,
-              SoundRow::SbCd, SoundRow::SwitchToKernel],
-        SoundView::NativeSb { can_mix: false, has_mixer: true, .. } =>
-            &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave, SoundRow::SbFm,
-              SoundRow::SbCd],
-        SoundView::NativeSb { can_mix: true, has_mixer: false, .. } =>
-            &[SoundRow::Status, SoundRow::SwitchToKernel],
-        SoundView::NativeSb { can_mix: false, has_mixer: false, .. } =>
-            &[SoundRow::Status],
+        SoundView::NativeSb { can_mix, has_mixer, hda_midi, .. } =>
+            match (has_mixer, can_mix, hda_midi) {
+                (true, true, true) => &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave,
+                    SoundRow::SbFm, SoundRow::SbCd, SoundRow::MidiRoute, SoundRow::SwitchToKernel],
+                (true, true, false) => &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave,
+                    SoundRow::SbFm, SoundRow::SbCd, SoundRow::SwitchToKernel],
+                (true, false, true) => &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave,
+                    SoundRow::SbFm, SoundRow::SbCd, SoundRow::MidiRoute],
+                (true, false, false) => &[SoundRow::Status, SoundRow::SbMaster, SoundRow::SbWave,
+                    SoundRow::SbFm, SoundRow::SbCd],
+                (false, true, true) => &[SoundRow::Status, SoundRow::MidiRoute, SoundRow::SwitchToKernel],
+                (false, true, false) => &[SoundRow::Status, SoundRow::SwitchToKernel],
+                (false, false, true) => &[SoundRow::Status, SoundRow::MidiRoute],
+                (false, false, false) => &[SoundRow::Status],
+            },
         SoundView::KernelSb { can_hda: true, .. } => &[
             SoundRow::Status, SoundRow::Volume, SoundRow::SbMaster, SoundRow::Latency, SoundRow::Rate,
             SoundRow::SwitchToHda, SoundRow::SwitchToNative,
@@ -368,6 +377,19 @@ pub fn take_sound_mode_request() -> Option<SoundModeRequest> {
         SOUND_SEL.store(0, Ordering::Relaxed);
     }
     request
+}
+
+pub fn midi_hda_enabled() -> bool {
+    MIDI_HDA.load(Ordering::Relaxed)
+}
+
+pub fn set_midi_hda(enabled: bool) {
+    MIDI_HDA.store(enabled, Ordering::Relaxed);
+    REPAINT.store(true, Ordering::Relaxed);
+}
+
+pub fn take_midi_route_request() -> bool {
+    MIDI_ROUTE_REQ.swap(false, Ordering::Relaxed)
 }
 
 /// Track hardware or guest changes to the physical card's master level.
@@ -929,6 +951,9 @@ fn activate<A: crate::Arch>(
 ) {
     match active_tab() {
         TAB_SOUND => match sound_row_for(sound, active_sel(TAB_SOUND)) {
+            Some(SoundRow::MidiRoute) => {
+                MIDI_ROUTE_REQ.store(true, Ordering::Relaxed);
+            }
             Some(SoundRow::SwitchToKernel) => {
                 SOUND_MODE_REQ.store(1, Ordering::Relaxed);
             }
@@ -1421,6 +1446,11 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
         TAB_SOUND => match sound_row_for(sound, item) {
             Some(SoundRow::Status) => sound_status_line(line, sound),
             Some(SoundRow::SwitchToKernel) => line.put(b"Switch to kernel mixing"),
+            Some(SoundRow::MidiRoute) => line.put(if midi_hda_enabled() {
+                b"MIDI: emulated (HDA)"
+            } else {
+                b"MIDI: native MPU-401"
+            }),
             Some(SoundRow::Volume) => {
                 let pct = VOL_PCT.load(Ordering::Relaxed);
                 line.put(b"Volume   [");
@@ -1714,9 +1744,10 @@ mod tests {
 
     #[test]
     fn sound_items_reflect_audio_ownership() {
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true }), 6);
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: true }), 5);
-        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: false }), 1);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true, hda_midi: true }), 7);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: true, has_mixer: true, hda_midi: false }), 6);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: true, hda_midi: false }), 5);
+        assert_eq!(sound_item_count(SoundView::NativeSb { port: 0x220, can_mix: false, has_mixer: false, hda_midi: false }), 1);
         assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: false }), 6);
         assert_eq!(sound_item_count(SoundView::KernelSb { port: 0x220, can_hda: true }), 7);
         assert_eq!(sound_item_count(SoundView::KernelHda { can_native: false, can_sb: false }), 5);

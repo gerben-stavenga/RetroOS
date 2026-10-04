@@ -48,13 +48,9 @@ impl Mpu {
 
     /// Ports this device decodes, once the machine says it exists.
     ///
-    /// Whether it decodes at all is not ours to answer: a guest holding the
-    /// real Sound Blaster is driving real silicon, and whatever answers at
-    /// the declared MPU port — an MPU-401, a wavetable daughterboard, an
-    /// external module — is the owner's hardware, not ours to intercept.
-    /// The software bank may already be loaded for a later switch to kernel
-    /// mixing. The caller, which holds the SB device and can see which it is,
-    /// decides; this only answers the address question.
+    /// The caller decides whether this software device or the physical MPU
+    /// receives a port access. Native SB can keep its DSP and FM hardware
+    /// while MIDI is separately routed to this device for HDA playback.
     pub fn owns(&self, p: u16) -> bool {
         self.present && self.card.owns(p)
     }
@@ -85,6 +81,24 @@ impl Mpu {
         self.synth = None;
         self.mt32.reset();
         self.present = false;
+    }
+
+    /// Begin intercepting an already-running game's MIDI stream. Its UART
+    /// handshake may have gone to the physical MPU before the route changed.
+    /// Start with fresh instruments/voices and accept subsequent data bytes.
+    pub fn start_software_route(&mut self) {
+        if !self.present { return; }
+        self.card.reset();
+        self.card.port_out(self.base + 1, 0x3f);
+        let _ = self.card.port_in(self.base); // discard our synthetic UART ACK
+        self.synth = None;
+        self.mt32.reset();
+    }
+
+    pub fn stop_software_route(&mut self) {
+        self.card.reset();
+        self.synth = None;
+        self.mt32.reset();
     }
 
     pub fn io_read(&mut self, p: u16) -> u8 {

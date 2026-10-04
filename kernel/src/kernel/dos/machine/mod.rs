@@ -570,13 +570,12 @@ pub(super) use vkbd::*;
 const PORT_TRACE: bool = false;
 
 /// Emulate IN from a port using the virtual peripherals.
-/// Whether the *emulated* MPU-401 answers at `p`. Two conditions, and the
-/// interesting one is the SB: a thread holding the real card is driving real
-/// silicon, so whatever sits at the declared MPU port is the owner's hardware
-/// and we must not intercept it. Which card this thread has is the device
-/// variant, matched here — the MPU itself only answers the address question.
+/// Whether the software MPU-401 answers at `p`. It owns MIDI when the SB is
+/// emulated or when the owner explicitly routes MIDI through HDA while keeping
+/// the physical SB's DSP and FM ports native.
 fn emulated_mpu(pc: &PcMachine, p: u16) -> bool {
-    matches!(pc.sb.device, SbDevice::Emulated(_)) && pc.mpu.owns(p)
+    (matches!(pc.sb.device, SbDevice::Emulated(_))
+        || crate::kernel::osd::midi_hda_enabled()) && pc.mpu.owns(p)
 }
 
 /// A PIT read must expose the counter and its IRQ edge at the same instant.

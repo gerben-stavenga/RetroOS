@@ -1946,6 +1946,54 @@ fn event_loop<A: crate::Arch>(
                 request,
             );
         }
+        if crate::kernel::osd::take_midi_route_request()
+            && sink.as_ref().is_some_and(crate::kernel::sound::Sink::is_hda)
+        {
+            let software = !crate::kernel::osd::midi_hda_enabled();
+            if software && crate::kernel::midi_bank::get().is_none() {
+                crate::kernel::midi_bank::load_from_c_root(crate::kernel::dos::c_root());
+            }
+            if software && crate::kernel::midi_bank::get().is_none() {
+                crate::compact_println!("MIDI: HDA synth unavailable: no General MIDI bank");
+            } else {
+                for thread in threads.iter_mut() {
+                    if let thread::Personality::Dos(dos) = &mut thread.personality {
+                        if software {
+                            dos.pc.mpu.start_software_route();
+                        } else {
+                            dos.pc.mpu.stop_software_route();
+                        }
+                    }
+                }
+                crate::kernel::osd::set_midi_hda(software);
+                if !software
+                    && let Some(base) = thread::get_thread(threads, ctx.tid).and_then(|thread| {
+                        if let thread::Personality::Dos(dos) = &thread.personality {
+                            dos.pc.mpu.present.then_some(dos.pc.mpu.base)
+                        } else {
+                            None
+                        }
+                    })
+                    && machine.inb(base + 1) & 0x40 == 0
+                {
+                    // A game started with software MIDI may never have put the
+                    // physical MPU into UART mode. Initialize it before granting
+                    // the ports directly; consume the command ACK ourselves.
+                    machine.outb(base + 1, 0x3f);
+                    for _ in 0..100_000 {
+                        if machine.inb(base + 1) & 0x80 == 0 {
+                            let _ = machine.inb(base);
+                            break;
+                        }
+                    }
+                }
+                crate::compact_println!("MIDI: {}", if software {
+                    "software synth through HDA"
+                } else {
+                    "physical MPU port"
+                });
+            }
+        }
         if let Some(raw) = crate::kernel::osd::take_sb_master_request() {
             let applied = sink.as_ref().is_some_and(|sink| sink.set_sb_master(machine, raw))
                 || sb_handoff.as_ref().is_some_and(|card| {
@@ -2232,6 +2280,7 @@ fn sound_view<A: crate::Arch>(
                 can_mix: sink.is_some_and(crate::kernel::sound::Sink::is_hda)
                     || device.dma16 == Some(5),
                 has_mixer: device.has_ct1745(),
+                hda_midi: sink.is_some_and(crate::kernel::sound::Sink::is_hda),
             },
             None => match crate::kernel::platform::get().audio {
                 Audio::EmulatedHda => SoundView::KernelHda { can_native: false, can_sb: false },
