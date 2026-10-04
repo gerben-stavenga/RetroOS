@@ -87,6 +87,9 @@ pub enum ThreadState {
 pub enum KernelAction {
     /// Nothing to do, continue current thread.
     Done,
+    /// Finish the DOS shutdown request after releasing the personality borrow,
+    /// while the scheduler has the display and BIOS workspace.
+    Shutdown,
     /// Yield current thread to scheduler.
     Yield,
     /// Exit current thread with given code.

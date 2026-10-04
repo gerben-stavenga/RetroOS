@@ -70,6 +70,7 @@ fn next_after<A: crate::Arch>(
 ) -> Option<Verdict> {
     match action {
         thread::KernelAction::Done => None,
+        thread::KernelAction::Shutdown => shutdown(machine, bios_workspace, threads, tid, display),
         thread::KernelAction::Yield => thread::yield_thread(threads, tid, regs).map(Verdict::Switch),
         thread::KernelAction::Exit(code) => Some(Verdict::Switch(thread::exit_thread(
             threads, machine, bios_workspace, tid, code, exiting_display, sb_handoff, display,
@@ -101,6 +102,59 @@ fn next_after<A: crate::Arch>(
                 .map(Verdict::Switch)
         }
     }
+}
+
+/// The DOS syscall cannot publish its farewell while it holds a personality
+/// borrow. Here the active display and native BIOS workspace are both in hand.
+fn shutdown<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    threads: &mut [thread::Thread<A>],
+    tid: usize,
+    display: &mut Option<crate::kernel::display::Display>,
+) -> ! {
+    use crate::kernel::bios_display::{DosVideo, FullscreenVga};
+    use crate::kernel::platform::{Firmware, Host};
+
+    let native_bios = crate::kernel::platform::get().firmware == Firmware::NativeBios;
+    if native_bios {
+        let cap = match &mut threads[tid].personality {
+            thread::Personality::Dos(dos) => match &mut dos.pc.vga {
+                DosVideo::Fullscreen(FullscreenVga::Native(native)) => Some(native.cap_mut()),
+                DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) => surface.vga_capability_mut(),
+                DosVideo::Vga(_) => display.as_mut().and_then(|surface| surface.vga_capability_mut()),
+            },
+            _ => None,
+        };
+        if let Some(cap) = cap {
+            if let Err(error) = cap.guest_bios_set_mode(machine, bios, 3) {
+                crate::compact_println!("SHUTDOWN: BIOS text mode failed: {:?}", error);
+                lib::term::term().set_aperture(None);
+            } else {
+                lib::term::term().set_aperture(Some(crate::LOW_MEM_BASE + 0xB8000));
+            }
+        }
+    }
+
+    let screen = lib::term::term();
+    screen.clear();
+    crate::compact_screenln!(screen, "It is now safe to turn off your computer.");
+    match &mut threads[tid].personality {
+        thread::Personality::Dos(dos) => {
+            if let DosVideo::Fullscreen(FullscreenVga::Emulated(_, surface)) = &mut dos.pc.vga {
+                crate::kernel::term::panic_present(surface);
+            }
+        }
+        _ => {}
+    }
+    if let Some(surface) = display.as_mut() {
+        crate::kernel::term::panic_present(surface);
+    }
+    crate::kernel::drivers::hda::emergency_quiesce();
+    if crate::kernel::platform::get().host == Host::Metal {
+        machine.halt_forever();
+    }
+    machine.shutdown();
 }
 
 /// Honor the F12 window picker's explicit target. This is a pure focus shift:

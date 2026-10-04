@@ -833,7 +833,6 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         &mut self,
         machine: &mut A,
         display: &mut crate::kernel::platform::VgaCap,
-        mode: crate::kernel::platform::VbeMode,
         bank: u16,
     ) -> Result<(), BiosError> {
         let mut regs = self.bios_vcpu.regs;
@@ -842,20 +841,14 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
         let io = crate::kernel::io_policy::bios_display(display);
-        let completed = run_bios_until(machine, &mut regs, return_ip, &io);
+        let completed = call_bank(machine, &mut regs, bank, &io);
         self.bios_vcpu.space = machine.activate(
             caller_space,
             &mut self.fx,
             core::ptr::null_mut(),
         );
-        completed?;
-        let status = regs.rax as u16;
-        if status != 0x004F {
-            return Err(BiosError::Rejected(status));
-        }
-        Ok(())
+        completed
     }
 
     /// RetroOS VBE palette/ramp service. Reads never enter the physical ROM or
@@ -1126,10 +1119,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                     if current_bank != Some(bank) {
                         let bank_sample = crate::kernel::osd_profile::Sample::start(machine);
                         let mut regs = self.bios_vcpu.regs;
-                        let return_ip = prepare_bank_call(machine, &mut regs, mode, bank);
-                        run_bios_until(machine, &mut regs, return_ip, &io)?;
-                        let status = regs.rax as u16;
-                        if status != 0x004F { return Err(BiosError::Rejected(status)); }
+                        call_bank(machine, &mut regs, bank, &io)?;
                         bank_sample.finish(machine, crate::kernel::osd_profile::Stage::Bank, 0);
                         *bank_state = bank;
                         current_bank = Some(bank);
@@ -1541,10 +1531,9 @@ impl crate::kernel::platform::VgaCap {
         &mut self,
         machine: &mut A,
         bios: &mut BiosDisplayWorkspace<A>,
-        mode: crate::kernel::platform::VbeMode,
         bank: u16,
     ) -> Result<(), BiosError> {
-        self.bios(bios)?.set_bank(machine, self, mode, bank)
+        self.bios(bios)?.set_bank(machine, self, bank)
     }
 
     pub fn guest_bios_window<A: Arch>(
@@ -1682,17 +1671,6 @@ fn run_bios_int10<A: Arch>(
     run_bios(machine, regs, io, crate::kernel::dos::bios_int10_returned)
 }
 
-fn run_bios_until<A: Arch>(
-    machine: &mut A,
-    regs: &mut Regs,
-    return_ip: u32,
-    io: &arch_abi::IoPolicy,
-) -> Result<(), BiosError> {
-    run_bios(machine, regs, io, |regs, event| {
-        crate::kernel::dos::bios_thunk_returned(regs, event, return_ip)
-    })
-}
-
 fn run_bios<A: Arch>(
     machine: &mut A,
     regs: &mut Regs,
@@ -1726,23 +1704,19 @@ fn run_bios<A: Arch>(
     }
 }
 
-fn prepare_bank_call<A: Arch>(
+fn call_bank<A: Arch>(
     machine: &mut A,
     regs: &mut Regs,
-    mode: crate::kernel::platform::VbeMode,
     bank: u16,
-) -> u32 {
-    let return_ip = if mode.window_function == 0 {
-        crate::kernel::dos::prepare_bios_int10(machine, regs);
-        // INT 10h; INT 31h occupies two adjacent two-byte vector slots.
-        crate::kernel::dos::bios_int10_return_ip()
-    } else {
-        crate::kernel::dos::prepare_bios_window_call(machine, regs, mode.window_function)
-    };
+    io: &arch_abi::IoPolicy,
+) -> Result<(), BiosError> {
+    crate::kernel::dos::prepare_bios_int10(machine, regs);
     regs.rax = 0x4F05;
     regs.rbx = 0;
     regs.rdx = u64::from(bank);
-    return_ip
+    run_bios_int10(machine, regs, io)?;
+    let status = regs.rax as u16;
+    if status == 0x004F { Ok(()) } else { Err(BiosError::Rejected(status)) }
 }
 
 /// NEWAX-inspired scanline service. Keep memory validation in RetroOS and
@@ -1884,7 +1858,6 @@ fn parse_vbe_mode(
     let window_attributes = info.window_a_attributes;
     let window_granularity_kb = info.window_granularity_kb;
     let window_size_kb = info.window_size_kb;
-    let window_function = info.window_function;
     let banked_image_pages = info.banked_image_pages;
     let linear_image_pages = info.linear_image_pages;
     let banked_bytes = u32::from(banked_pitch)
@@ -1914,7 +1887,6 @@ fn parse_vbe_mode(
         banked_image_pages,
         linear_image_pages,
         framebuffer_bytes,
-        window_function,
     })
 }
 

@@ -895,11 +895,11 @@ fn copy_banked_from_card<A: crate::Arch>(
     let bytes = mode.framebuffer_bytes as usize;
     for offset in (0..bytes).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if display.bios_set_bank(machine, bios, mode, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
         let count = window_bytes.min(bytes - offset);
         copy_vbe_memory(machine, address, SVGA_LFB_BASE + offset, count, scratch);
     }
-    let _ = display.bios_set_bank(machine, bios, mode, current_bank);
+    let _ = display.bios_set_bank(machine, bios, current_bank);
 }
 
 fn copy_banked_to_card<A: crate::Arch>(
@@ -916,11 +916,11 @@ fn copy_banked_to_card<A: crate::Arch>(
     let bytes = mode.framebuffer_bytes as usize;
     for offset in (0..bytes).step_by(window_bytes) {
         let bank = (offset / granularity) as u16;
-        if display.bios_set_bank(machine, bios, mode, bank).is_err() { break; }
+        if display.bios_set_bank(machine, bios, bank).is_err() { break; }
         let count = window_bytes.min(bytes - offset);
         copy_vbe_memory(machine, SVGA_LFB_BASE + offset, address, count, scratch);
     }
-    let _ = display.bios_set_bank(machine, bios, mode, current_bank);
+    let _ = display.bios_set_bank(machine, bios, current_bank);
 }
 
 fn discard_emulated_svga<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {

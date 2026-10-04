@@ -1235,30 +1235,6 @@ pub(crate) fn prepare_bios_int10<A: crate::Arch>(machine: &mut A, regs: &mut Reg
     };
 }
 
-/// Replace the ordinary INT 10h thunk with the VBE ModeInfoBlock.WinFuncPtr
-/// far call. VBE defines this entry precisely so repeated bank changes avoid
-/// the firmware interrupt dispatcher while retaining Function 05h's register
-/// convention and status result.
-pub(crate) fn prepare_bios_window_call<A: crate::Arch>(
-    machine: &mut A,
-    regs: &mut Regs,
-    target: u32,
-) -> u32 {
-    const THUNK_SLOT: u8 = 0xFE;
-    prepare_bios_int10(machine, regs);
-    let offset = target as u16;
-    let segment = (target >> 16) as u16;
-    let thunk_offset = dos::slot_offset(THUNK_SLOT);
-    let thunk = (usize::from(dos::STUB_SEG) << 4) + usize::from(thunk_offset);
-    machine.write::<[u8; 7]>(thunk, [
-        0x9A,
-        offset as u8, (offset >> 8) as u8,
-        segment as u8, (segment >> 8) as u8,
-        0xCD, 0x31,
-    ]);
-    u32::from(thunk_offset) + 7
-}
-
 pub(crate) fn bios_thunk_returned(
     regs: &Regs,
     event: &crate::KernelEvent,

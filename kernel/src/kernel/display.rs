@@ -172,6 +172,25 @@ enum VgaScanout {
     },
 }
 
+/// A failed bank switch leaves the adapter scanning graphics memory while the
+/// panic console writes text cells at B8000. Restore text mode while the BIOS
+/// workspace is still available so the subsequent panic is visible.
+fn banked_present_panic<A: crate::Arch>(
+    machine: &mut A,
+    bios: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
+    native: &mut crate::kernel::platform::VgaCap,
+    error: crate::kernel::bios_display::BiosError,
+) -> ! {
+    if let Err(mode_error) = native.guest_bios_set_mode(machine, bios, 3) {
+        // The card is still scanning graphics pixels. Keep the diagnostic in
+        // the terminal grid and log stream, but stop mirroring text cells to
+        // B8000, which cannot produce a visible panic in this mode.
+        lib::term::term().set_aperture(None);
+        lib::compact_panic!("banked VBE present failed: {:?}; text mode failed: {:?}", error, mode_error)
+    }
+    lib::compact_panic!("banked VBE present failed: {:?}", error)
+}
+
 impl core::fmt::Debug for Display {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("Display")
@@ -455,6 +474,12 @@ impl Display {
             _ => None,
         }
     }
+    pub(crate) fn vga_capability_mut(&mut self) -> Option<&mut crate::kernel::platform::VgaCap> {
+        match &mut self.backend {
+            Backend::Vga { native, .. } => Some(native),
+            _ => None,
+        }
+    }
     // Callers keep the existing display when native VGA is unavailable.
     #[allow(clippy::result_large_err)]
     pub fn into_native_capability<A: crate::Arch>(
@@ -553,7 +578,7 @@ impl Display {
             } => native.bios_present_packed(
                 machine, bios, *mode, current_bank,
                 PackedSource { width, height, pixels, row: scratch },
-            ).unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
+            ).unwrap_or_else(|error| banked_present_panic(machine, bios, native, error)),
             Backend::Host => {
                 present_host_shadow(width, height, format, pixels)
             }
@@ -634,7 +659,7 @@ impl Display {
                 native,
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
             } => native.bios_present(machine, bios, *mode, current_bank, height, shadow)
-                    .unwrap_or_else(|error| lib::compact_panic!("banked VBE present failed: {:?}", error)),
+                    .unwrap_or_else(|error| banked_present_panic(machine, bios, native, error)),
             Backend::Host => present_host_shadow(
                 self.shadow_width, height, format, shadow),
             Backend::Headless => 0,

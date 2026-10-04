@@ -41,9 +41,6 @@ pub struct VbeMode {
     pub linear_image_pages: u8,
     /// Exact byte span occupied by all advertised images at this mode's pitch.
     pub framebuffer_bytes: u32,
-    /// VBE ModeInfoBlock.WinFuncPtr: the firmware's real-mode far entry for
-    /// fast window changes, or zero when only INT 10h Function 05h is offered.
-    pub window_function: u32,
 }
 
 impl VbeMode {

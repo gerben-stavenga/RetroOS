@@ -1679,7 +1679,6 @@ fn substitute_vbe_mode(number: u16) -> Option<crate::kernel::platform::VbeMode> 
         banked_image_pages: image_pages,
         linear_image_pages: image_pages,
         framebuffer_bytes: (image_count * image_bytes) as u32,
-        window_function: 0,
     })
 }
 
