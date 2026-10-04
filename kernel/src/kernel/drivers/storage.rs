@@ -8,7 +8,7 @@
 use alloc::{string::String, vec::Vec};
 use core::sync::atomic::{fence, Ordering};
 use spin::Mutex;
-use crate::kernel::block::Disk;
+use crate::kernel::block::{Disk, FlushError};
 
 /// Shared elapsed-time budget for storage commands, including cache flushes.
 /// Poll counts vary with CPU speed and cannot bound asynchronous device I/O.
@@ -119,7 +119,7 @@ impl<H: Hardware> Storage<H> {
 }
 
 impl<H: Hardware> State<H> {
-    fn execute(&mut self, command: Command) -> bool {
+    fn execute(&mut self, command: Command, name: &str) -> bool {
         if self.failed { return false; }
         // Publish CPU-written data before the controller reads it, and observe
         // controller-written data only after its completion has been consumed.
@@ -132,10 +132,10 @@ impl<H: Hardware> State<H> {
                 Operation::Read => "read", Operation::Write => "write", Operation::Flush => "flush",
             };
             match error {
-                Error::Timeout => lib::compact_println!("Storage: {} timeout (lba={} sectors={})",
-                    operation, command.lba, command.sectors),
-                Error::Device(status) => lib::compact_println!("Storage: {} device error {:#x} (lba={} sectors={})",
-                    operation, status, command.lba, command.sectors),
+                Error::Timeout => lib::compact_println!("Storage: {} {} timeout (lba={} sectors={})",
+                    name, operation, command.lba, command.sectors),
+                Error::Device(status) => lib::compact_println!("Storage: {} {} device error {:#x} (lba={} sectors={})",
+                    name, operation, status, command.lba, command.sectors),
             }
         }
         result.is_ok()
@@ -152,7 +152,7 @@ impl<H: Hardware> Disk for Storage<H> {
         let mut done = 0;
         while done < total {
             let sectors = (total - done).min(max);
-            if !state.execute(Command { operation: Operation::Read, lba: lba + u64::from(done), sectors }) {
+            if !state.execute(Command { operation: Operation::Read, lba: lba + u64::from(done), sectors }, &self.name) {
                 break;
             }
             let bytes = out.len().min(sectors as usize * SECTOR);
@@ -177,7 +177,7 @@ impl<H: Hardware> Disk for Storage<H> {
             let staging = &mut state.buffer.bytes()[..full_bytes];
             staging[..bytes].copy_from_slice(&input[..bytes]);
             staging[bytes..].fill(0);
-            if !state.execute(Command { operation: Operation::Write, lba: lba + u64::from(done), sectors }) {
+            if !state.execute(Command { operation: Operation::Write, lba: lba + u64::from(done), sectors }, &self.name) {
                 break;
             }
             input = &input[bytes..];
@@ -186,12 +186,9 @@ impl<H: Hardware> Disk for Storage<H> {
         done
     }
 
-    fn flush(&self) {
-        // Disk::flush currently has no error channel. Never silently report a
-        // failed durability barrier as success to a filesystem.
-        if !self.state.lock().execute(Command { operation: Operation::Flush, lba: 0, sectors: 0 }) {
-            lib::compact_panic!("storage flush failed: {}", self.name.as_str());
-        }
+    fn flush(&self) -> Result<(), FlushError> {
+        self.state.lock().execute(Command { operation: Operation::Flush, lba: 0, sectors: 0 }, &self.name)
+            .then_some(()).ok_or(FlushError)
     }
 
     fn sectors(&self) -> u64 { self.sectors }
@@ -252,7 +249,7 @@ mod tests {
         let disk = disk(None);
         let input: Vec<_> = (0..(3 * SECTOR + 7)).map(|i| i as u8).collect();
         assert_eq!(disk.write(1, &input), 4);
-        disk.flush();
+        disk.flush().unwrap();
         let mut output = alloc::vec![0; input.len() + 2];
         assert_eq!(disk.read(1, &mut output[1..input.len() + 1]), 4);
         assert_eq!(&output[1..input.len() + 1], &input);
@@ -286,6 +283,7 @@ mod tests {
         assert_eq!(&output[2 * SECTOR..], &[0x11; SECTOR]);
         assert_eq!(disk.write(0, &[2; SECTOR]), 0);
         assert_eq!(disk.read(0, &mut output), 0);
+        assert_eq!(disk.flush(), Err(FlushError));
         let mut state = disk.state.lock();
         assert_eq!(state.hardware.calls.len(), 2);
         assert!(state.buffer.bytes().iter().all(|b| *b == 0xa5));

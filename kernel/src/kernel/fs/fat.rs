@@ -150,7 +150,7 @@ impl fatfs::Write for VolumeIo {
     }
 
     fn flush(&mut self) -> Result<(), ()> {
-        if self.writable { self.volume.flush(); }
+        if self.writable { self.volume.flush().map_err(|_| ())?; }
         Ok(())
     }
 }
@@ -311,7 +311,10 @@ pub(crate) mod tests {
             self.writes.set(self.writes.get() + 1);
             input.len().div_ceil(512) as u32
         }
-        fn flush(&self) { self.flushes.set(self.flushes.get() + 1); }
+        fn flush(&self) -> Result<(), crate::kernel::block::FlushError> {
+            self.flushes.set(self.flushes.get() + 1);
+            Ok(())
+        }
         fn sectors(&self) -> u64 { self.data.borrow().len() as u64 / 512 }
         fn name(&self) -> &str { "fat-test" }
     }

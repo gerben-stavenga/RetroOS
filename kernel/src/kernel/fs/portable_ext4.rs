@@ -28,6 +28,7 @@ pub enum VolumeError {
     OutOfBounds,
     ShortRead,
     ShortWrite,
+    Flush,
     OutOfMemory,
 }
 
@@ -156,7 +157,7 @@ impl Storage for VolumeStorage {
             }
         }
         self.writes.clear();
-        self.volume.flush();
+        self.volume.flush().map_err(|_| StorageError::new(VolumeError::Flush))?;
         Ok(())
     }
 }
@@ -809,7 +810,10 @@ mod tests {
             input.len().div_ceil(512) as u32
         }
 
-        fn flush(&self) { self.flushes.set(self.flushes.get() + 1); }
+        fn flush(&self) -> Result<(), crate::kernel::block::FlushError> {
+            self.flushes.set(self.flushes.get() + 1);
+            Ok(())
+        }
         fn sectors(&self) -> u64 { 1024 }
         fn name(&self) -> &str { "recording" }
     }

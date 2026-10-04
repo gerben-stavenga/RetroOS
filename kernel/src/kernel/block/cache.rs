@@ -5,7 +5,7 @@
 //! composed once above those devices, so filesystem adapters contain no cache
 //! policy and writes remain coherent at the block boundary.
 
-use super::{Disk, Volume};
+use super::{Disk, FlushError, Volume};
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use core::cell::{Cell, RefCell};
@@ -68,8 +68,8 @@ impl Disk for VolumeDisk {
         self.volume.sectors
     }
 
-    fn flush(&self) {
-        self.volume.flush();
+    fn flush(&self) -> Result<(), FlushError> {
+        self.volume.flush()
     }
 
     fn name(&self) -> &str {
@@ -191,8 +191,8 @@ impl Disk for CachedDisk {
         self.inner.write(lba, buffer)
     }
 
-    fn flush(&self) {
-        self.inner.flush();
+    fn flush(&self) -> Result<(), FlushError> {
+        self.inner.flush()
     }
 
     fn sectors(&self) -> u64 {
@@ -208,7 +208,7 @@ impl Disk for CachedDisk {
 mod tests {
     extern crate std;
 
-    use super::{CachedDisk, Disk, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE};
+    use super::{CachedDisk, Disk, FlushError, PAGE_LIMIT, PAGE_SECTORS, PAGE_SIZE};
     use alloc::boxed::Box;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -238,7 +238,10 @@ mod tests {
             buffer.len().div_ceil(512) as u32
         }
 
-        fn flush(&self) { self.flushes.set(self.flushes.get() + 1); }
+        fn flush(&self) -> Result<(), FlushError> {
+            self.flushes.set(self.flushes.get() + 1);
+            Ok(())
+        }
 
         fn sectors(&self) -> u64 { self.bytes.borrow().len().div_ceil(512) as u64 }
         fn name(&self) -> &str { "cache-test" }
@@ -268,7 +271,7 @@ mod tests {
         assert_eq!(cache.read(0, &mut changed), 1);
         assert_eq!(changed, [0xaa; 512]);
         assert_eq!(inner.reads.get(), 3);
-        cache.flush();
+        cache.flush().unwrap();
         assert_eq!(inner.flushes.get(), 1);
     }
 

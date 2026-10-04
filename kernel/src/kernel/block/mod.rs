@@ -16,6 +16,9 @@ pub mod overlay;
 pub mod partition;
 use crate::kernel::drivers::{hdd, nvme::NvmeDisk};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlushError;
+
 /// One block device: a physical disk, an NVMe namespace, or a wrapper around
 /// either (see the RAM overlay). Addressing is 512-byte LBAs throughout.
 pub trait Disk {
@@ -23,8 +26,9 @@ pub trait Disk {
     fn read(&self, lba: u64, buf: &mut [u8]) -> u32;
     /// Write `buf.len().div_ceil(512)` sectors at `lba`. Returns sectors written.
     fn write(&self, lba: u64, buf: &[u8]) -> u32;
-    /// Complete earlier writes before later writes are issued.
-    fn flush(&self) {}
+    /// Complete earlier writes before later writes are issued, reporting a
+    /// failed durability barrier to the filesystem.
+    fn flush(&self) -> Result<(), FlushError> { Ok(()) }
     /// Capacity in 512-byte sectors.
     fn sectors(&self) -> u64;
     /// Stable short name for logs and mount points: "ata0", "nvme0n1".
@@ -101,8 +105,8 @@ impl Volume {
         self.disk.write(self.start + lba, &buf[..n])
     }
 
-    pub fn flush(&self) {
-        self.disk.flush();
+    pub fn flush(&self) -> Result<(), FlushError> {
+        self.disk.flush()
     }
 }
 

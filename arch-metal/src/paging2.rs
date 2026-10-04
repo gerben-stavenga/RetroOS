@@ -916,14 +916,14 @@ pub const fn page_idx(vaddr: usize) -> usize {
     vaddr / PAGE_SIZE
 }
 
-/// Mark a kernel virtual page as not-present and flush its TLB entry.
-/// Used to install a guard page below the kernel stack so overflow
-/// page-faults instead of silently corrupting adjacent .data.
+/// Remove a kernel-image virtual mapping without releasing its physical page.
+/// Both stack guards and DMA storage live in the permanently owned kernel
+/// image; dropping the allocator reference would let another device reuse it.
 pub fn unmap_kernel_page(vaddr: usize) {
     let idx = page_idx(vaddr);
     match entries() {
-        Entries::E32(e) => replace_mapping(&mut e[idx], Entry32(0)),
-        Entries::E64(e) => replace_mapping(&mut e[idx], Entry64(0)),
+        Entries::E32(e) => { let _ = replace_entry(&mut e[idx], Entry32(0)); }
+        Entries::E64(e) => { let _ = replace_entry(&mut e[idx], Entry64(0)); }
     }
     crate::x86::invlpg(vaddr);
 }

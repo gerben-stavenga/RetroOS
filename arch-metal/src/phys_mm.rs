@@ -92,8 +92,13 @@ pub fn reserve_dma_regions() {
         );
         // The normal kernel BSS mapping is write-back. The guest aliases
         // these physical pages uncached for coherent ISA DMA; remove the
-        // unused BSS mapping so the CPU never sees conflicting cache types.
-        if DMA_BUFS_BASE != 0 { unmap_dma_storage(bufs_va, DMA_BUFS_PAGES); }
+        // unused BSS virtual mapping so the CPU never sees conflicting cache
+        // types. The physical pages remain owned by the kernel image.
+        if DMA_BUFS_BASE != 0 {
+            unmap_dma_storage(bufs_va, DMA_BUFS_PAGES);
+            debug_assert!((DMA_BUFS_BASE..DMA_BUFS_BASE + DMA_BUFS_PAGES)
+                .all(|page| PAGE_REFS[page] == 1));
+        }
     }
 }
 
