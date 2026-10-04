@@ -1,8 +1,8 @@
 //! Compact xHCI USB host-controller driver for USB-HID keyboard and mouse input.
-//! Each controller retains at most two addressed root-port devices and two
-//! interrupt-IN endpoints: a keyboard and mouse on separate ports or on one
-//! composite device. Reports feed the same `irq::QUEUE` as i8042 input, so
-//! nothing above the arch boundary depends on the physical input bus.
+//! Each controller retains at most two addressed root-port devices and three
+//! interrupt-IN endpoints: two keyboards and a mouse. Reports feed the same
+//! `irq::QUEUE` as i8042 input, so nothing above the arch boundary depends on
+//! the physical input bus.
 
 use crate::x86::{inl, outl};
 
@@ -90,6 +90,7 @@ fn interrupt_off(pipe: usize) -> usize {
     match pipe {
         0 => INT0_OFF,
         1 => INT1_OFF,
+        2 => INT2_OFF,
         _ => unreachable!(),
     }
 }
@@ -98,6 +99,7 @@ fn report_off(pipe: usize) -> usize {
     match pipe {
         0 => REPORT0_OFF,
         1 => REPORT1_OFF,
+        2 => REPORT2_OFF,
         _ => unreachable!(),
     }
 }
@@ -162,6 +164,7 @@ struct HidPipe {
     report_len: usize,
     enq: usize,
     cycle: u32,
+    prev: [u8; 16],
 }
 
 impl HidPipe {
@@ -174,6 +177,7 @@ impl HidPipe {
             report_len: 0,
             enq: 0,
             cycle: 1,
+            prev: [0; 16],
         }
     }
 }
@@ -282,8 +286,7 @@ struct Controller {
     evt_cycle: u32,
     ep0_enq: [usize; DEVICE_LANES],
     ep0_cycle: [u32; DEVICE_LANES],
-    pipes: [HidPipe; 2],
-    prev: [u8; 16],
+    pipes: [HidPipe; 3],
 }
 
 impl Controller {
@@ -301,8 +304,7 @@ impl Controller {
             evt_cycle: 1,
             ep0_enq: [0; DEVICE_LANES],
             ep0_cycle: [1; DEVICE_LANES],
-            pipes: [HidPipe::empty(0), HidPipe::empty(1)],
-            prev: [0; 16],
+            pipes: [HidPipe::empty(0), HidPipe::empty(1), HidPipe::empty(2)],
         }
     }
     fn map_mmio(&self, phys: u64, pages: usize) {
@@ -727,7 +729,23 @@ impl Controller {
         }
         let inctx_phys = self.dma_phys + INCTX_OFF as u64;
         self.ring_cmd(inctx_phys, 0, (12 << 10) | (slot << 24));
-        matches!(self.wait_event(33), Some((1, _)))
+        match self.wait_event(33) {
+            Some((1, _)) => true,
+            Some((cc, returned_slot)) => {
+                lib::compact_println!(
+                    "xHCI: Configure Endpoint slot {} ep {} failed: completion={} returned_slot={}",
+                    slot, ep.ep, cc, returned_slot
+                );
+                false
+            }
+            None => {
+                lib::compact_println!(
+                    "xHCI: Configure Endpoint slot {} ep {} timed out",
+                    slot, ep.ep
+                );
+                false
+            }
+        }
     }
 
     /// Evaluate Context (TRB type 13): update EP0's Max Packet Size in the device
@@ -796,18 +814,18 @@ impl Controller {
     ///     `[report-id, mods, k1..k14]` — report id at byte 0 (only id 1 is the
     ///     keyboard; consumer/system reports share the endpoint), modifiers at
     ///     byte 1. In both, the keycode array starts at byte 2.
-    fn process_keyboard_report(&mut self, r: &[u8; 16], len: usize) {
+    fn process_keyboard_report(prev: &mut [u8; 16], r: &[u8; 16], len: usize) {
         let id_prefixed = len > 8;
         if id_prefixed && r[0] != 1 {
             return; // not the keyboard report (consumer control, etc.)
         }
         let mod_off = if id_prefixed { 1 } else { 0 };
-        let prev = self.prev;
+        let previous = *prev;
         let keys = &r[2..len];
-        let prev_keys = &prev[2..len];
+        let prev_keys = &previous[2..len];
         // Modifier keys: one make/break per changed bit.
         for (b, &sc) in MOD_SC.iter().enumerate() {
-            let (now, was) = (r[mod_off] & (1 << b), prev[mod_off] & (1 << b));
+            let (now, was) = (r[mod_off] & (1 << b), previous[mod_off] & (1 << b));
             if now != was && sc != 0 {
                 crate::irq::push_key(if now != 0 { sc } else { sc | 0x80 });
             }
@@ -829,7 +847,7 @@ impl Controller {
                 emit_key(sc, ext, true);
             }
         }
-        self.prev = *r;
+        *prev = *r;
     }
 
     fn read_report(&self, index: usize) -> ([u8; 16], usize) {
@@ -859,15 +877,15 @@ impl Controller {
             if ttype != 32 {
                 continue;
             }
-            for index in 0..2 {
+            for index in 0..self.pipes.len() {
                 let pipe = &self.pipes[index];
                 if !pipe.ready || pipe.slot != slot || pipe.dci != dci {
                     continue;
                 }
                 if cc == 1 || cc == 13 {
                     let (report, len) = self.read_report(index);
-                    if index == 0 {
-                        self.process_keyboard_report(&report, len);
+                    if index < 2 {
+                        Self::process_keyboard_report(&mut self.pipes[index].prev, &report, len);
                     } else {
                         process_mouse_report(&report, len);
                     }
@@ -1037,6 +1055,7 @@ impl Controller {
             };
             state.enq = 0;
             state.cycle = 1;
+            state.prev = [0; 16];
         }
         true
     }
@@ -1119,11 +1138,11 @@ impl Controller {
             func
         );
 
-        // Enumerate root ports once. A device that supplies either still-missing HID
-        // role retains its slot and one of our two independent device lanes. Other
-        // devices are disabled and the current probe lane is reused.
-        let mut keyboard: Option<(u32, PortDevice, EpInfo)> = None;
+        // Retain up to two keyboard devices and one mouse. A composite device
+        // can provide both roles while using just one addressed device lane.
+        let mut keyboards: [Option<(u32, PortDevice, EpInfo)>; 2] = [None; 2];
         let mut mouse: Option<(u32, PortDevice, EpInfo)> = None;
+        let mut devices: [Option<(u32, PortDevice)>; DEVICE_LANES] = [None; DEVICE_LANES];
         let mut retained_lanes = 0usize;
         for p in 1..=max_ports {
             let portsc = self.r32(op + OP_PORTSC + (p as usize - 1) * 0x10);
@@ -1149,10 +1168,10 @@ impl Controller {
                 dev.mouse.is_some()
             );
             let mut retained = false;
-            if keyboard.is_none()
-                && let Some(ep) = dev.keyboard
+            if let Some(ep) = dev.keyboard
+                && let Some(index) = keyboards.iter().position(Option::is_none)
             {
-                keyboard = Some((slot, dev, ep));
+                keyboards[index] = Some((slot, dev, ep));
                 retained = true;
             }
             if mouse.is_none()
@@ -1162,62 +1181,53 @@ impl Controller {
                 retained = true;
             }
             if retained {
+                devices[lane] = Some((slot, dev));
                 retained_lanes += 1;
             } else {
                 self.disable_slot(slot);
             }
-            if keyboard.is_some() && mouse.is_some() {
+            if keyboards.iter().all(Option::is_some) && mouse.is_some() {
                 break;
             }
         }
 
-        // Configure each distinct USB device once before adding either xHCI
-        // interrupt endpoint. This also handles a composite keyboard+mouse without
-        // resetting its first interface while the second is being prepared.
-        let keyboard_device_ready = keyboard.is_some_and(|(slot, dev, _)| {
-            let ready = self.control(slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0);
-            if !ready {
-                let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
-                    "xHCI: port {} keyboard SET_CONFIGURATION {} failed (slot {})",
-                    dev.port, dev.cfg_value, slot);
+        // Configure each distinct device once before adding its endpoints.
+        let mut configured = [false; DEVICE_LANES];
+        for (lane, selected) in devices.iter().enumerate() {
+            if let Some((slot, dev)) = selected {
+                configured[lane] = self.control(*slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0);
+                if !configured[lane] {
+                    lib::compact_println!(
+                        "xHCI: port {} SET_CONFIGURATION {} failed (slot {})",
+                        dev.port, dev.cfg_value, *slot
+                    );
+                }
             }
-            ready
-        });
-        let mouse_device_ready = mouse.is_some_and(|(slot, dev, _)| {
-            if keyboard.is_some_and(|(keyboard_slot, _, _)| keyboard_slot == slot) {
-                keyboard_device_ready
-            } else {
-                self.control(slot, dev.lane, 0x00, 0x09, dev.cfg_value, 0, 0)
+        }
+
+        let mut keyboard_count = 0;
+        for (index, selected) in keyboards.iter().enumerate() {
+            if let Some((slot, dev, ep)) = selected
+                && configured[dev.lane]
+                && self.configure_hid(*slot, dev, *ep, HidRole::Keyboard, index, stride)
+            {
+                self.start_pipe(index);
+                keyboard_count += 1;
+                let _ = compact_fmt::writeln!(
+                    &mut lib::log::DebugCon,
+                    "xHCI: keyboard ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
+                    *slot, dev.port, ep.ep, ep.mps, self.pci.0, self.pci.1, self.pci.2
+                );
             }
-        });
-
-        let keyboard_ready = keyboard_device_ready
-            && keyboard.is_some_and(|(slot, dev, ep)| {
-                self.configure_hid(slot, &dev, ep, HidRole::Keyboard, 0, stride)
-            });
-        let mouse_ready = mouse_device_ready
-            && mouse.is_some_and(|(slot, dev, ep)| {
-                self.configure_hid(slot, &dev, ep, HidRole::Mouse, 1, stride)
-            });
-
-        if keyboard_ready && let Some((slot, dev, ep)) = keyboard {
-            self.start_pipe(0);
-            let _ = compact_fmt::writeln!(
-                &mut lib::log::DebugCon,
-                "xHCI: keyboard ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
-                slot,
-                dev.port,
-                ep.ep,
-                ep.mps,
-                self.pci.0,
-                self.pci.1,
-                self.pci.2
-            );
-        } else {
+        }
+        if keyboard_count == 0 {
             lib::compact_println!("xHCI: no keyboard found");
         }
-        if mouse_ready && let Some((slot, dev, ep)) = mouse {
-            self.start_pipe(1);
+        if let Some((slot, dev, ep)) = mouse
+            && configured[dev.lane]
+            && self.configure_hid(slot, &dev, ep, HidRole::Mouse, 2, stride)
+        {
+            self.start_pipe(2);
             let _ = compact_fmt::writeln!(
                 &mut lib::log::DebugCon,
                 "xHCI: mouse ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",

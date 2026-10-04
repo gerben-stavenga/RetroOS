@@ -14,9 +14,11 @@ pub(super) const DEVCTX1_OFF: usize = 0xA000;
 pub(super) const EP0_1_OFF: usize = 0xB000;
 pub(super) const INT1_OFF: usize = 0xC000;
 pub(super) const REPORT1_OFF: usize = 0xD000;
+pub(super) const INT2_OFF: usize = 0xE000;
+pub(super) const REPORT2_OFF: usize = 0xF000;
 // The ten-bit scratchpad count can require 1023 pointers (two pages).
-pub(super) const SCRATCH_OFF: usize = 0xE000;
-pub(super) const DMA_PAGES: usize = 16;
+pub(super) const SCRATCH_OFF: usize = 0x10000;
+pub(super) const DMA_PAGES: usize = 18;
 
 /// Fill the array before publishing it to the controller. Scratchpad pages
 /// need not be contiguous. The allocator returns permanent, zeroed DMA pages;
@@ -61,7 +63,8 @@ mod tests {
         assert_eq!(array[1023], 0);
         let regions = [DCBAA_OFF, CMD_OFF, EVT_OFF, ERST_OFF, INCTX_OFF,
                        DEVCTX0_OFF, EP0_0_OFF, XFER_OFF, INT0_OFF, REPORT0_OFF,
-                       DEVCTX1_OFF, EP0_1_OFF, INT1_OFF, REPORT1_OFF];
+                       DEVCTX1_OFF, EP0_1_OFF, INT1_OFF, REPORT1_OFF,
+                       INT2_OFF, REPORT2_OFF];
         for (i, offset) in regions.iter().enumerate() {
             assert!(offset + 4096 <= SCRATCH_OFF);
             assert_eq!(offset % 4096, 0);
