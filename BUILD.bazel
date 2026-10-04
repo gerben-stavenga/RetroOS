@@ -88,7 +88,9 @@ _BUSYBOX_APPLETS = [
 # the image that runs in-OS TCC while building COMMAND.COM and the DOS stub.
 _APPS_BOOT_SRCS = glob(
     ["apps-boot/**/*"],
-    exclude = ["apps-boot/tc/**"],
+    exclude = ["apps-boot/tc/**"] + [
+        src for src, dest in DATA_FILES.items() if dest.startswith("CONFIG/VC/")
+    ],
     allow_empty = True,
 )
 _TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
@@ -500,8 +502,8 @@ genrule(
     visibility = ["//visibility:public"],
 )
 
-# Conventional USB disk for editing GRUB settings and inspecting partitions
-# with fdisk/Windows, and for the public GRUB module release.
+# Single-partition FAT32 USB disk for editing GRUB settings and for the public
+# GRUB module release.
 genrule(
     name = "grub_module_usb",
     srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
@@ -865,7 +867,10 @@ pkg_tar(
         "etc/CONFIG.SYS": "etc/CONFIG.SYS",
         "tools/release/README.md": "README.md",
         "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
-    } | {src: src for src, dest in DATA_FILES.items() if dest.startswith("CONFIG/DN/")},
+    } | {
+        src: src for src, dest in DATA_FILES.items()
+        if dest.startswith("CONFIG/DN/") or dest.startswith("CONFIG/VC/") or dest.startswith("CONFIG/MC/")
+    },
     modes = {"install.sh": "0755"},
     extension = "tar.gz",
     out = "retroos-machine.tar.gz",

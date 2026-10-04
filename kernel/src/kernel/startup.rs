@@ -106,6 +106,7 @@ fn prepare_startup<A: crate::Arch>(
     } = prepare_audio(machine, boot, audio, &mut screen, &mut bios_workspace);
     screen.present(machine, &mut bios_workspace);
 
+    configure_codepage(&master_env);
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
@@ -881,6 +882,22 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     crate::kernel::dos::parse_config_env(&config)
 }
 
+/// Select the DOS encoding before the template copies its BIOS font tables.
+/// Unsupported values leave the default CP437 in place.
+fn configure_codepage(env: &[u8]) {
+    let Some(raw) = crate::kernel::dos::config_var(env, b"CODEPAGE") else { return };
+    let id = core::str::from_utf8(trim_ascii(raw)).ok()
+        .and_then(|value| value.parse::<u16>().ok());
+    match id.and_then(lib::codepage::codepage) {
+        Some(page) => {
+            lib::codepage::select_codepage(page.id);
+            crate::compact_println!("DOS code page: {}", page.id);
+        }
+        None => crate::compact_println!(
+            "Invalid CONFIG.SYS CODEPAGE (available: 437, 850, 852, 866)"),
+    }
+}
+
 /// START is one executable plus its command tail, with paths relative to C:.
 /// DOS C:\ paths and absolute VFS paths are also accepted.
 fn startup_command(env: &[u8], root: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
@@ -1383,7 +1400,7 @@ fn prepare_program<A: crate::Arch>(
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
         exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
-        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path),
+        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path, &env),
         _ => dos::run_init_program(
             machine,
             dos_template,
@@ -1493,6 +1510,7 @@ fn launch_windows<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
+    env: &[u8],
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
@@ -1504,7 +1522,7 @@ fn launch_windows<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::windows::exec_pe_into(machine, threads, tid, buf, path, b"", None)
+    crate::kernel::windows::exec_pe_into(machine, threads, tid, buf, path, b"", None, env)
         .unwrap_or_else(|e| {
             lib::compact_panic!(
                 "Windows PE exec failed ({}): errno {}",
@@ -2617,7 +2635,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let cwd = windows.cwd_str();
             parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
             parent_cwd_len = cwd.len();
-            parent_env_snapshot = None;
+            parent_env_snapshot = Some(windows.environment.clone());
         }
     }
 

@@ -97,10 +97,9 @@ put data there. The base module supplies `C:\RETROOS` and default CONFIG files,
 so the data volume does not need a copy of the kernel or runtime. Use the
 chosen volume's UUID for `C_UUID` below. This selects C: even when it is on a
 second AHCI controller or several other disks have `CONFIG` or `GAMES`.
-To keep settings between boots, put `CONFIG/CONFIG.SYS` and the `CONFIG/DN`
-templates on that volume (`etc/CONFIG.SYS` and the `DN.EDT`, `DN.EXT`,
-`DN.HGL`, `DN.MNU`, `DN.VWR`, `DN.XRN` files in `apps-boot/dn/`; the machine
-release also carries the templates). Missing CONFIG
+To keep settings between boots, put `CONFIG/CONFIG.SYS` and the `CONFIG/DN`,
+`CONFIG/VC`, and `CONFIG/MC` templates on that volume (the machine release
+carries them). Missing CONFIG
 files use session copies of the base image's defaults, so edits to those
 copies disappear on reboot. Keep `TEMP` empty: RetroOS maps it to RAM.
 
@@ -209,6 +208,8 @@ on the same ext4 filesystem as Linux `/`, as they do on this laptop.
 | --- | --- |
 | `C:\RETROOS` | Matching boot runtime, read-only |
 | `C:\CONFIG\DN` | Persistent DN settings, history, desktop, menus |
+| `C:\CONFIG\VC` | VC settings, menus, extensions, and help selected by `VC=` |
+| `C:\CONFIG\MC\.mc` | MC user settings and editable menu selected by `HOME=` |
 | `C:\CONFIG\LOADFIX.CFG` | Persistent COMMAND.COM launch policy |
 | `C:\TEMP` | RAM-only DN swap/flag/temporary files |
 | `C:\CONFIG\CONFIG.SYS` | Persistent startup command and environment |
@@ -230,6 +231,9 @@ The startup program restarts when it exits; `--cmd` and `TEST=` take precedence
 and still shut down after completion. Relative startup paths are relative to C:.
 The old root `CONFIG.SYS` is read only when the new file is absent. Migration
 copies existing settings to the new location and preserves a custom `START=`.
+Set `CODEPAGE=437`, `850`, `852`, or `866` in the same file to select the DOS
+codepage before startup. If absent, the default is 437; `CHCP` can change it
+for the running session.
 
 DN already supports separate paths; no binary patch is needed. The config sets
 `DNSWP=C:\TEMP`, `TEMP=C:\TEMP`, then `DN=C:\CONFIG\DN`, in that order. DN.COM
@@ -237,6 +241,15 @@ uses the first DNSWP/DN variable for its flag file. DN.PRG uses DN for settings
 and history, while overlays, language/dialog resources and help remain next to
 the executable. See [the DN 1.51 sources](https://github.com/maximmasiutin/Dos-Navigator)
 (`STARTUP.PAS`, `DN.ASM`, `DNUTIL.PAS`, `DNAPP.PAS`).
+
+`VC=C:\CONFIG\VC` moves Volkov Commander's setup, menus, extensions, and
+help into one writable directory; `VC.COM` remains under `C:\RETROOS\VC`.
+`MCHOME=C:\RETROOS\MC` selects Midnight Commander's shared resources, including
+its bundled menu and help. `HOME=C:\CONFIG\MC` gives it a writable home;
+`C:\CONFIG\MC\.mc\ini` and `C:\CONFIG\MC\.mc\menu` are user overrides that can
+be edited and saved. Its executables and DLL also remain under `C:\RETROOS\MC`.
+Both programs use
+`TEMP=C:\TEMP` for temporary files.
 
 Installation backs up CONFIG.SYS and copies old `RETROOS/DN` or `BOOT/DN` state
 without deleting it or replacing existing `CONFIG/DN` files. Defaults are seeded
@@ -320,7 +333,7 @@ the owner says.
 
 For a USB boot, build `//:grub_module_usb` and write
 `bazel-bin/retroos_grub_module_usb.img` to the whole stick. It has an ordinary
-MBR with FAT32 EFI and data partitions; the editable menu is
+MBR with one FAT32 EFI partition; the editable menu is
 `/boot/grub/grub.cfg` on partition 1. The GRUB menu contains protected
 and persistent disk choices for the base-plus-games image, plus a base-only
 submenu with the same choices for framebuffer video (GOP on UEFI,

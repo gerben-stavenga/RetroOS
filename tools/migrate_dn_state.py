@@ -17,6 +17,11 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNTIME = {"COM", "PRG", "OVR", "DLG", "LNG", "HLP"}
 TEMPORARY = {"FLG", "SWP", "TMP", "BAK"}
 DEFAULTS = {"EDT", "EXT", "HGL", "MNU", "VWR", "XRN"}
+APP_DEFAULTS = {
+    "VC": ("VC.INI", "VC.EXT", "VCVIEW.EXT", "VCEDIT.EXT", "VC.MNU",
+           "ARCHIVES.MNU", "FORMAT.MNU", "VC.HLP"),
+}
+MC_USER_DEFAULTS = {"MC.INI": "ini", "MC.MNU": "menu", "mc.hot": "mc.hot"}
 
 
 def migrate(root):
@@ -38,6 +43,34 @@ def migrate(root):
         target = state / source.name
         if source.suffix.lstrip(".") in DEFAULTS and not target.exists():
             shutil.copyfile(source, target)
+    for app, names in APP_DEFAULTS.items():
+        destination = root / "CONFIG" / app
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            target = destination / name.upper()
+            if target.exists():
+                continue
+            sources = [root / legacy / app / spelling
+                       for legacy in ("RETROOS", "BOOT")
+                       for spelling in (name.upper(), name)]
+            sources.append(ROOT / "apps-boot" / ("vc" if app == "VC" else "MC") / name)
+            source = next((path for path in sources if path.is_file()), None)
+            if source is not None:
+                shutil.copyfile(source, target)
+    mc_state = root / "CONFIG" / "MC" / ".mc"
+    mc_state.mkdir(parents=True, exist_ok=True)
+    for name, target_name in MC_USER_DEFAULTS.items():
+        target = mc_state / target_name
+        if target.exists():
+            continue
+        sources = [root / "CONFIG" / "MC" / name.upper()]
+        sources.extend(root / legacy / "MC" / spelling
+                       for legacy in ("RETROOS", "BOOT")
+                       for spelling in (name.upper(), name))
+        sources.append(ROOT / "apps-boot" / "MC" / name)
+        source = next((path for path in sources if path.is_file()), None)
+        if source is not None:
+            shutil.copyfile(source, target)
     # COMMAND.COM's writable launch policy belongs with the other settings.
     loadfix = root / "CONFIG" / "LOADFIX.CFG"
     if not loadfix.exists():
@@ -56,11 +89,21 @@ def migrate(root):
              not in (b"DN", b"DNSWP", b"TEMP")]
     # DN.COM takes the first DN/DNSWP variable as its flag-file directory.
     lines = [b"DNSWP=C:\\TEMP", b"TEMP=C:\\TEMP", b"DN=C:\\CONFIG\\DN"] + lines
+    for key, value in ((b"VC", b"C:\\CONFIG\\VC"),
+                       (b"MCHOME", b"C:\\RETROOS\\MC"),
+                       (b"HOME", b"C:\\CONFIG\\MC")):
+        if not any(line.split(b"=", 1)[0].strip().upper() == key for line in lines):
+            lines.append(key + b"=" + value)
     if not any(line.split(b"=", 1)[0].strip().upper() == b"START" for line in lines):
         lines.append(b"START=C:\\RETROOS\\DN\\DN.COM")
     config.write_bytes(b"\r\n".join(lines) + b"\r\n")
     # The ext4 backend authorizes writes using the C: root's group.
-    for path in [root / "CONFIG", state, root / "TEMP", config, *state.iterdir(), *([loadfix] if loadfix.exists() else [])]:
+    app_state = [root / "CONFIG" / app for app in APP_DEFAULTS] + [root / "CONFIG" / "MC"]
+    writable = [root / "CONFIG", state, root / "TEMP", config, *state.iterdir(),
+                *([loadfix] if loadfix.exists() else [])]
+    for directory in app_state:
+        writable.extend([directory, *directory.rglob("*")])
+    for path in writable:
         shutil.chown(path, group=root.stat().st_gid)
         path.chmod(path.stat().st_mode | 0o020)
 
@@ -85,17 +128,27 @@ def migrate_image(image):
 
         with tempfile.TemporaryDirectory(prefix="retroos-dn-state-") as temp:
             root = Path(temp)
-            for path in ("CONFIG.SYS", "CONFIG", "RETROOS/DN", "BOOT/DN", "RETROOS/LOADFIX.CFG", "BOOT/LOADFIX.CFG"):
+            for path in ("CONFIG.SYS", "CONFIG", "RETROOS/DN", "BOOT/DN",
+                         "RETROOS/VC", "BOOT/VC", "RETROOS/MC", "BOOT/MC",
+                         "RETROOS/LOADFIX.CFG", "BOOT/LOADFIX.CFG"):
                 if exists(path):
                     dest = root / path
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     copy("-s", "::/" + path, dest)
             migrate(root)
-            for path in ("CONFIG", "CONFIG/DN", "TEMP"):
+            for path in ("CONFIG", "CONFIG/DN", "CONFIG/VC", "CONFIG/MC",
+                         "CONFIG/MC/.mc", "TEMP"):
                 if not exists(path):
                     subprocess.run(["mmd", "-i", volume, "::/" + path], check=True)
             for source in (root / "CONFIG" / "DN").iterdir():
                 copy("-o", source, "::/CONFIG/DN/" + source.name)
+            for app in APP_DEFAULTS:
+                for source in (root / "CONFIG" / app).iterdir():
+                    if source.is_file():
+                        copy("-o", source, "::/CONFIG/" + app + "/" + source.name)
+            for source in (root / "CONFIG" / "MC" / ".mc").iterdir():
+                if source.is_file():
+                    copy("-o", source, "::/CONFIG/MC/.mc/" + source.name)
             copy("-o", root / "CONFIG" / "LOADFIX.CFG", "::/CONFIG/LOADFIX.CFG")
             copy("-o", root / "CONFIG" / "CONFIG.SYS", "::/CONFIG/CONFIG.SYS")
 

@@ -11,20 +11,19 @@ and GRUB menu as the USB image.
 
 ## Editable USB boot: retroos_grub_module_usb.img
 
-Use this image when you need to edit GRUB settings or inspect partitions on a
-USB stick. It has a fixed MBR: partition 1 is a 128 MiB FAT32 EFI boot
-partition, and partition 2 is a 64 MiB FAT32 data partition. The menu is
-`/boot/grub/grub.cfg` on partition 1; the matching kernel and RAM modules are
-under `/boot` there. The data partition starts with a `CONFIG` directory.
+Use this image when you need to edit GRUB settings on a USB stick. It has a
+fixed MBR with one 128 MiB FAT32 EFI partition. The menu is
+`/boot/grub/grub.cfg`; the matching kernel and RAM modules are under `/boot`
+on the same partition.
 Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
 
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
 the device's current contents. On Linux, after identifying the device with
-`lsblk`, partition 1 can be mounted as FAT32 and `boot/grub/grub.cfg` edited
-directly. On Windows, the second FAT32 partition is for ordinary files;
-editing the EFI partition requires assigning it a drive letter with an
-administrator tool. No partition resize is required for a GRUB configuration
-change. A machine's firmware still chooses BIOS or UEFI before GRUB starts.
+`lsblk`, the partition can be mounted as FAT32 and `boot/grub/grub.cfg` edited
+directly. On Windows, editing the EFI partition may require assigning it a
+drive letter with an administrator tool. No partition resize is required for
+a GRUB configuration change. A machine's firmware still chooses BIOS or UEFI
+before GRUB starts.
 
 The default framebuffer entry keeps GRUB's automatic video mode on UEFI. If
 that mode is below 640×400, try the menu's 1024×768 or 800×600 GOP entries.
@@ -36,11 +35,10 @@ its own GRUB; commands missing from a different GRUB installation do not
 affect it.
 
 RetroOS does not yet have a USB mass-storage driver. It loads the kernel and
-RAM images from the stick through GRUB, but RetroOS itself cannot write to
-the USB data partition. A separate supported ATA, AHCI, or NVMe disk is needed
-for persistent RetroOS data; the protected menu entry diverts its writes to
-RAM. The USB data partition is intended for host-side files and testing the
-partition layout.
+RAM images from the stick through GRUB, but RetroOS itself cannot read or write
+the USB partition after boot. A separate supported ATA, AHCI, or NVMe disk is
+needed for persistent RetroOS data; the protected menu entry diverts its
+writes to RAM.
 
 ## Small diagnostic USB image
 
@@ -251,10 +249,12 @@ Choosing persistent versus protected inside GRUB only changes disk writes.
 After updating RetroOS's installer, rerun preparation and installation to apply
 the generated video policy to an existing machine's GRUB entries.
 
-C:\RETROOS is read-only runtime. DN settings/history live in C:\CONFIG\DN;
-its temporary files live in RAM at C:\TEMP. Existing BOOT/DN or RETROOS/DN state is
-copied into the new location without overwriting existing settings. C:\CONFIG\CONFIG.SYS selects the startup program with
-START=C:\RETROOS\DN\DN.COM and optional arguments. It also selects DNSWP=C:\TEMP, TEMP=C:\TEMP, and DN=C:\CONFIG\DN in that order.
+C:\RETROOS is read-only runtime. DN, VC, and MC settings live under C:\CONFIG;
+temporary files live in RAM at C:\TEMP. Existing runtime settings are copied
+into the new locations without overwriting user files. C:\CONFIG\CONFIG.SYS
+selects the startup program with START=C:\RETROOS\DN\DN.COM and optional
+arguments. It sets DN and VC to C:\CONFIG, HOME to C:\CONFIG\MC, and MCHOME to
+the shared resources in C:\RETROOS\MC.
 
 The kernel supports legacy IDE, AHCI/SATA, and NVMe storage; USB storage is not supported.
 Bootloader support for a disk does not imply the kernel can access that disk.

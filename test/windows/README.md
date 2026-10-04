@@ -8,6 +8,9 @@ Open Watcom C runtime. `HELLO.EXE` covers PE loading, Watcom startup and stdout.
 RetroOS loads the ordinary PE replacement DLLs from
 `C:\WINDOWS\SYSTEM32`. Their exports are two-byte `INT 83h` gates; Win32 API
 semantics live in the Rust Windows personality.
+The Win32 `GetEnvironmentStrings` API now exposes values parsed from
+`C:\CONFIG\CONFIG.SYS`, including optional `HOME` and `MCHOME` settings.
+`GetTempPathA` uses `TEMP` from that environment (default `C:\TEMP`).
 
 The Win16 side follows the same boundary with real 16-bit NE facade modules
 from `C:\WINDOWS\SYSTEM`. The NE loader resolves ordinal imports through those

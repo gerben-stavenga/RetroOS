@@ -244,6 +244,7 @@ struct Callback {
 }
 
 pub struct WindowsState {
+    pub(crate) environment: Vec<u8>,
     gates: Vec<Gate>,
     ldt: Vec<u64>,
     modules: Vec<Module>,
@@ -295,6 +296,7 @@ pub struct WindowsState {
 impl WindowsState {
     fn new() -> Self {
         Self {
+            environment: extra::windows_environment(&[]),
             gates: Vec::new(),
             ldt: vec![0],
             modules: Vec::new(),
@@ -854,6 +856,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     path: &[u8],
     parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
+    parent_env: &[u8],
 ) -> Result<(), i32> {
     let parsed_main = pe::Image::parse(&data).map_err(|_| 8)?;
     if parsed_main.is_dll() {
@@ -979,6 +982,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     thread::init_process_thread(current, entry, stack);
 
     let mut state = WindowsState::new();
+    state.environment = extra::windows_environment(parent_env);
     state.ldt.push(descriptor(TEB_BASE, 4095));
     current.kernel.vcpu.regs.fs = 0x0f;
     state.command_line_a = cmd_a;

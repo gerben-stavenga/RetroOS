@@ -180,10 +180,13 @@ def populate_fat(image, start, sectors, tree, freedos_dir, work, heads):
         f.write("SHELLHIGH=C:\\COMMAND.COM C:\\ /P /E:512\n")
     mcopy(fdconfig, "/FDCONFIG.SYS")
 
-    # Runtime mount point; writable DN state lives separately in CONFIG/DN.
+    # Runtime mount point; writable app state lives separately in CONFIG.
     mmd("/RETROOS")
     mmd("/CONFIG")
     mmd("/CONFIG/DN")
+    mmd("/CONFIG/VC")
+    mmd("/CONFIG/MC")
+    mmd("/CONFIG/MC/.mc")
     mmd("/TEMP")
 
     if not tree:

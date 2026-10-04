@@ -33,6 +33,21 @@ DATA_FILES = {
     "apps-boot/dn/DN.VWR": "CONFIG/DN/DN.VWR",
     "apps-boot/dn/DN.XRN": "CONFIG/DN/DN.XRN",
 
+    # VC= selects one directory for its writable setup and companion files.
+    "apps-boot/vc/VC.INI": "CONFIG/VC/VC.INI",
+    "apps-boot/vc/VC.EXT": "CONFIG/VC/VC.EXT",
+    "apps-boot/vc/VCVIEW.EXT": "CONFIG/VC/VCVIEW.EXT",
+    "apps-boot/vc/VCEDIT.EXT": "CONFIG/VC/VCEDIT.EXT",
+    "apps-boot/vc/VC.MNU": "CONFIG/VC/VC.MNU",
+    "apps-boot/vc/ARCHIVES.MNU": "CONFIG/VC/ARCHIVES.MNU",
+    "apps-boot/vc/FORMAT.MNU": "CONFIG/VC/FORMAT.MNU",
+    "apps-boot/vc/VC.HLP": "CONFIG/VC/VC.HLP",
+
+    # MC's shared defaults stay with its runtime; HOME selects user copies.
+    "apps-boot/MC/MC.INI": "CONFIG/MC/.mc/ini",
+    "apps-boot/MC/MC.MNU": "CONFIG/MC/.mc/menu",
+    "apps-boot/MC/mc.hot": "CONFIG/MC/.mc/mc.hot",
+
     # User-editable launch settings survive boot rebuilds.
     "//tools/command:LOADFIX.CFG": "CONFIG/LOADFIX.CFG",
     "etc/CONFIG.SYS": "CONFIG/CONFIG.SYS",

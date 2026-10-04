@@ -23,6 +23,13 @@ def main():
         fresh.mkdir()
         migration.migrate(fresh)
         assert b'START=C:\\RETROOS\\DN\\DN.COM' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
+        assert b'VC=C:\\CONFIG\\VC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
+        assert b'MCHOME=C:\\RETROOS\\MC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
+        assert b'HOME=C:\\CONFIG\\MC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
+        assert (fresh / 'CONFIG/VC/VC.INI').is_file()
+        assert (fresh / 'CONFIG/VC/VC.HLP').is_file()
+        assert (fresh / 'CONFIG/MC/.mc/ini').is_file()
+        assert (fresh / 'CONFIG/MC/.mc/menu').is_file()
         legacy = b'CUSTOM=keep\r\nSTART=C:\\CUSTOM.COM arg\r\n'
         (root / 'CONFIG.SYS').write_bytes(legacy)
         migration.migrate(root)
@@ -30,10 +37,14 @@ def main():
         assert b'CUSTOM=keep' in config.read_bytes()
         assert b'START=C:\\CUSTOM.COM arg' in config.read_bytes()
         assert (root / 'CONFIG.SYS').read_bytes() == legacy
+        (root / 'CONFIG/VC/VC.INI').write_bytes(b'custom VC setup')
+        (root / 'CONFIG/MC/.mc/ini').write_bytes(b'custom MC setup')
         config.write_bytes(b'START=BOOT.COM newer\r\nCUSTOM=new\r\n')
         migration.migrate(root)
         assert b'START=BOOT.COM newer' in config.read_bytes()
         assert b'CUSTOM=new' in config.read_bytes()
+        assert (root / 'CONFIG/VC/VC.INI').read_bytes() == b'custom VC setup'
+        assert (root / 'CONFIG/MC/.mc/ini').read_bytes() == b'custom MC setup'
         print('PASS: migration preserves custom settings and prefers the new config')
 
         source = work / 'probe.asm'
@@ -51,10 +62,20 @@ int 21h
 mov dx, newline
 mov ah, 9
 int 21h
+mov ax, 6601h
+int 21h
+jc no_cp850
+cmp bx, 850
+jne no_cp850
+mov dx, cp850
+mov ah, 9
+int 21h
+no_cp850:
 mov ax, 4c00h
 int 21h
 message db 'STARTUP-OK ', '$'
 newline db 13, 10, '$'
+cp850 db 'CP850', 13, 10, '$'
 ''')
         subprocess.run(['nasm', '-f', 'bin', source, '-o', root / 'BOOT.COM'], check=True)
         subprocess.run(['bazelisk', 'build', '//kernel:retroos-host',
@@ -93,6 +114,9 @@ newline db 13, 10, '$'
         (root / 'CONFIG.SYS').write_bytes(b'START=BOOT.COM legacy\n')
         config.write_bytes(b'START=C:\\BOOT.COM configured\n')
         boot('configured')
+        config.write_bytes(b'START=C:\\BOOT.COM cp850\nCODEPAGE=850\n')
+        boot('cp850')
+        assert b'CP850' in (work / 'cp850.log').read_bytes()
         boot('override', ['--cmd', 'BOOT.COM override'], repeated=False)
         config.write_bytes(b'START=MISSING.COM\nTEST=BOOT.COM test\n')
         boot('test', repeated=False)

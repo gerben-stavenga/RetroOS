@@ -205,8 +205,8 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///   dispatch on it. Forcing `args[0] = path` here used to break that.
 /// - `args` is the full argv; `args[0]` is argv[0]. Subsequent entries are
 ///   extra argv for ELF; ignored for DOS.
-/// - `parent_env_data` is the parent DOS env snapshot (DOS-only path);
-///   pass `Vec::new()` for non-DOS execs or initial loads with no parent.
+/// - `parent_env_data` is the DOS or Windows parent environment snapshot;
+///   pass `Vec::new()` for other personalities or initial loads with no parent.
 /// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
 ///   (ignored by ELF, which preserves the caller's LinuxState in-place).
 #[allow(clippy::too_many_arguments)]
@@ -236,7 +236,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
         BinaryFormat::Ne => Err(-8),
         BinaryFormat::Pe if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::windows::exec_pe_into(
-                machine, threads, tid, data, path, &parent_cwd, personality_name)
+                machine, threads, tid, data, path, &parent_cwd, personality_name, &parent_env_data)
         }
         BinaryFormat::Pe => Err(-8),
         fmt => {

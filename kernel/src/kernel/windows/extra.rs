@@ -33,12 +33,14 @@ pub(super) struct Find {
     handle: u32,
     entries: Vec<Entry>,
     index: usize,
+    wide: bool,
 }
 
 struct Entry {
     name: Vec<u8>,
     short: Vec<u8>,
     size: u32,
+    mtime: u32,
     dir: bool,
 }
 
@@ -274,7 +276,7 @@ pub(super) fn push_key(console: &mut Console, scancode: u8) {
 
 /// CreateProcess from the Win32 personality feeds the shared fork/exec
 /// mechanism. MSVCRT's system() passes COMSPEC plus "/c command"; unwrap that
-/// shell request so native Windows binaries start directly as child processes.
+/// request, then restore COMMAND.COM for DOS programs with launch overrides.
 pub(super) fn create_process<A: crate::Arch>(
     machine: &mut A,
     state: &mut WindowsState,
@@ -298,9 +300,30 @@ pub(super) fn create_process<A: crate::Arch>(
     if program.is_empty() {
         return Err(ERROR_INVALID_PARAMETER);
     }
-    let path = windows_path(state, &program, false)?;
+    let mut path = windows_path(state, &program, false)?;
     if !crate::kernel::vfs::path_exists(&path) {
         return Err(ERROR_FILE_NOT_FOUND);
+    }
+    let mut cmdtail = cmdtail;
+    if has_dos_launch_override(state, &program) {
+        let data = crate::kernel::exec::load_file_resolved(&path)
+            .map_err(|_| ERROR_FILE_NOT_FOUND)?;
+        if matches!(
+            crate::kernel::exec::detect_format(&data, &path),
+            crate::kernel::exec::BinaryFormat::MzExe | crate::kernel::exec::BinaryFormat::Com
+        ) {
+            // COMMAND.COM owns LOADFIX.CFG parsing and the /L, DOS32A, and
+            // virtual-IF launch paths. Keep it as MC's child so MC's wait
+            // also waits for the DOS program that COMMAND.COM starts.
+            let mut tail = b"/C ".to_vec();
+            tail.extend_from_slice(&full_windows_path(state, &program));
+            if !cmdtail.is_empty() {
+                tail.push(b' ');
+                tail.extend_from_slice(&cmdtail);
+            }
+            cmdtail = tail;
+            path = windows_path(state, br"C:\RETROOS\COMMAND.COM", false)?;
+        }
     }
     let cwd = if arg(machine, regs, 7) == 0 {
         Vec::new()
@@ -332,6 +355,78 @@ pub(super) fn create_process<A: crate::Arch>(
         on_error: create_process_error,
         on_success: create_process_success,
     })
+}
+
+fn has_dos_launch_override(state: &WindowsState, program: &[u8]) -> bool {
+    let Ok(path) = windows_path(state, br"C:\CONFIG\LOADFIX.CFG", false) else {
+        return false;
+    };
+    let Ok(config) = crate::kernel::exec::load_file_resolved(&path) else {
+        return false;
+    };
+    let name = program.rsplit(|&b| b == b'\\' || b == b'/').next().unwrap_or(program);
+    loadfix_matches(&config, name)
+}
+
+fn loadfix_matches(config: &[u8], name: &[u8]) -> bool {
+    config.split_inclusive(|&b| b == b'\n').any(|line| {
+        // Mirror COMMAND.COM's 80-byte fgets buffer: overlong records are
+        // discarded there and must not select a different launch path here.
+        if line.len() > 79 {
+            return false;
+        }
+        let line = line.trim_ascii_start();
+        if line.is_empty() || line[0] == b'#' || line[0] == b';' {
+            return false;
+        }
+        let end = line.iter().position(u8::is_ascii_whitespace).unwrap_or(line.len());
+        line[..end].eq_ignore_ascii_case(name)
+    })
+}
+
+const FILETIME_EPOCH: u64 = 11_644_473_600;
+
+fn filetime(unix: u32) -> u64 {
+    if unix == 0 { 0 } else { (u64::from(unix) + FILETIME_EPOCH) * 10_000_000 }
+}
+
+fn unix_from_filetime(value: u64) -> Option<i64> {
+    i64::try_from(value / 10_000_000).ok().map(|seconds| seconds - FILETIME_EPOCH as i64)
+}
+
+fn system_time(unix: i64) -> [u16; 8] {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400) as u32;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    [
+        (year + i64::from(month <= 2)) as u16,
+        month as u16,
+        (days + 4).rem_euclid(7) as u16,
+        day as u16,
+        (seconds / 3_600) as u16,
+        ((seconds / 60) % 60) as u16,
+        (seconds % 60) as u16,
+        0,
+    ]
+}
+
+fn write_system_time<A: crate::Arch>(machine: &mut A, out: usize, unix: Option<i64>) -> u32 {
+    let Some(unix) = unix else {
+        machine.zero(out, 16);
+        return 0;
+    };
+    for (index, field) in system_time(unix).iter().enumerate() {
+        machine.write::<u16>(out + index * 2, *field);
+    }
+    1
 }
 
 fn create_process_error(regs: &mut Regs, _error: i32) {
@@ -475,14 +570,24 @@ pub(super) fn call<A: crate::Arch>(
         || name.eq_ignore_ascii_case(b"Sleep")
         || name.eq_ignore_ascii_case(b"Beep")
         || name.eq_ignore_ascii_case(b"ResumeThread")
-        || name.eq_ignore_ascii_case(b"FileTimeToLocalFileTime")
-        || name.eq_ignore_ascii_case(b"FileTimeToSystemTime")
-        || name.eq_ignore_ascii_case(b"LocalFileTimeToFileTime")
         || name.eq_ignore_ascii_case(b"SystemTimeToFileTime")
         || name.eq_ignore_ascii_case(b"FreeEnvironmentStringsA")
         || name.eq_ignore_ascii_case(b"FreeEnvironmentStringsW")
     {
         return 1;
+    }
+    if name.eq_ignore_ascii_case(b"FileTimeToLocalFileTime")
+        || name.eq_ignore_ascii_case(b"LocalFileTimeToFileTime")
+    {
+        let input = arg(machine, regs, 0) as usize;
+        let output = arg(machine, regs, 1) as usize;
+        machine.write::<u64>(output, machine.read::<u64>(input));
+        return 1;
+    }
+    if name.eq_ignore_ascii_case(b"FileTimeToSystemTime") {
+        let input = arg(machine, regs, 0) as usize;
+        let output = arg(machine, regs, 1) as usize;
+        return write_system_time(machine, output, unix_from_filetime(machine.read::<u64>(input)));
     }
     if name.eq_ignore_ascii_case(b"HeapCompact") || name.eq_ignore_ascii_case(b"HeapWalk") {
         return 0;
@@ -658,7 +763,7 @@ pub(super) fn call<A: crate::Arch>(
             Ok(v) => v,
             Err(error) => return fail(state, error, INVALID_HANDLE_VALUE),
         };
-        return find_first(machine, state, &raw, arg(machine, regs, 1) as usize);
+        return find_first(machine, state, &raw, arg(machine, regs, 1) as usize, wide);
     }
     if name.eq_ignore_ascii_case(b"FindNextFileA") || name.eq_ignore_ascii_case(b"FindNextFileW") {
         return find_next(machine, state, arg(machine, regs, 0), arg(machine, regs, 1) as usize);
@@ -694,7 +799,14 @@ pub(super) fn call<A: crate::Arch>(
         return 3;
     }
     if name.eq_ignore_ascii_case(b"GetTempPathA") {
-        return copy_ascii(machine, arg(machine, regs, 1) as usize, arg(machine, regs, 0) as usize, b"C:\\TEMP\\");
+        let mut path = environment_value(&state.environment, b"TEMP")
+            .filter(|value| !value.is_empty())
+            .unwrap_or(b"C:\\TEMP")
+            .to_vec();
+        if !path.ends_with(b"\\") && !path.ends_with(b"/") {
+            path.push(b'\\');
+        }
+        return copy_ascii(machine, arg(machine, regs, 1) as usize, arg(machine, regs, 0) as usize, &path);
     }
     if name.eq_ignore_ascii_case(b"GetDiskFreeSpaceA") {
         for n in 1..5 {
@@ -714,10 +826,10 @@ pub(super) fn call<A: crate::Arch>(
         return 1;
     }
     if name.eq_ignore_ascii_case(b"GetEnvironmentStrings") {
-        return env_block(machine, false);
+        return env_block(machine, &state.environment, false);
     }
     if name.eq_ignore_ascii_case(b"GetEnvironmentStringsW") {
-        return env_block(machine, true);
+        return env_block(machine, &state.environment, true);
     }
     if name.eq_ignore_ascii_case(b"GetVersionExA") {
         return version(machine, arg(machine, regs, 0) as usize);
@@ -726,7 +838,8 @@ pub(super) fn call<A: crate::Arch>(
         || name.eq_ignore_ascii_case(b"SetLocalTime")
     {
         if !name.starts_with(b"Set") {
-            machine.zero(arg(machine, regs, 0) as usize, 16);
+            write_system_time(machine, arg(machine, regs, 0) as usize,
+                crate::kernel::clock::rtc_unix_timestamp().map(i64::from));
         }
         return 1;
     }
@@ -747,9 +860,17 @@ pub(super) fn call<A: crate::Arch>(
         return string_type(machine, regs, name.ends_with(b"W"));
     }
     if name.eq_ignore_ascii_case(b"GetFileInformationByHandle") {
-        machine.zero(arg(machine, regs, 1) as usize, 52);
-        machine.write::<u32>(arg(machine, regs, 1) as usize, 0x20);
-        machine.write::<u32>(arg(machine, regs, 1) as usize + 44, 1);
+        let fd = arg(machine, regs, 0) as i32;
+        let out = arg(machine, regs, 1) as usize;
+        let Some((stat, mtime)) = crate::kernel::vfs::fd_info(fd, &kt.fds) else {
+            return fail(state, ERROR_INVALID_HANDLE, 0);
+        };
+        machine.zero(out, 52);
+        machine.write::<u32>(out, if stat.is_dir { 0x10 } else { 0x20 });
+        machine.write::<u64>(out + 20, filetime(mtime));
+        machine.write::<u32>(out + 36, stat.size);
+        machine.write::<u32>(out + 40, 1);
+        machine.write::<u64>(out + 44, stat.ino);
         return 1;
     }
     if name.eq_ignore_ascii_case(b"GetExitCodeProcess") {
@@ -1277,7 +1398,7 @@ fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     pi == pat.len()
 }
 
-fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[u8], out: usize) -> u32 {
+fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[u8], out: usize, wide: bool) -> u32 {
     let (dir, pattern) = split_pattern(raw);
     let path = match windows_path(state, &dir, false) {
         Ok(path) => path,
@@ -1287,10 +1408,10 @@ fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[
     let dot = pattern == b".";
     let dotdot = pattern == b"..";
     if dot || pattern == b"*" || pattern == b"*.*" {
-        entries.push(Entry { name: b".".to_vec(), short: b".".to_vec(), size: 0, dir: true });
+        entries.push(Entry { name: b".".to_vec(), short: b".".to_vec(), size: 0, mtime: 0, dir: true });
     }
     if dotdot || pattern == b"*" || pattern == b"*.*" {
-        entries.push(Entry { name: b"..".to_vec(), short: b"..".to_vec(), size: 0, dir: true });
+        entries.push(Entry { name: b"..".to_vec(), short: b"..".to_vec(), size: 0, mtime: 0, dir: true });
     }
     if !dot && !dotdot {
         let mut index = 0;
@@ -1303,6 +1424,7 @@ fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[
                 name: item.name,
                 short: item.short_name.map(|s| s.as_bytes().to_vec()).unwrap_or_default(),
                 size: item.size,
+                mtime: item.mtime,
                 dir: item.is_dir,
             });
         }
@@ -1310,10 +1432,10 @@ fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[
     if entries.is_empty() {
         return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
     }
-    write_find(machine, out, &entries[0]);
+    write_find(machine, out, &entries[0], wide);
     let handle = state.next_find;
     state.next_find += 1;
-    state.finds.push(Find { handle, entries, index: 1 });
+    state.finds.push(Find { handle, entries, index: 1, wide });
     handle
 }
 
@@ -1324,20 +1446,30 @@ fn find_next<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, handle: 
     if find.index >= find.entries.len() {
         return fail(state, 18, 0);
     }
-    write_find(machine, out, &find.entries[find.index]);
+    write_find(machine, out, &find.entries[find.index], find.wide);
     find.index += 1;
     1
 }
 
-fn write_find<A: crate::Arch>(machine: &mut A, out: usize, entry: &Entry) {
-    machine.zero(out, 318);
+fn write_find<A: crate::Arch>(machine: &mut A, out: usize, entry: &Entry, wide: bool) {
+    machine.zero(out, if wide { 592 } else { 318 });
     machine.write::<u32>(out, if entry.dir { 0x10 } else { 0x20 });
+    machine.write::<u64>(out + 20, filetime(entry.mtime));
     machine.write::<u32>(out + 32, entry.size);
-    let n = entry.name.len().min(259);
-    machine.copy_to(out + 44, &entry.name[..n]);
-    let s = entry.short.len().min(13);
-    if s != 0 {
-        machine.copy_to(out + 304, &entry.short[..s]);
+    if wide {
+        for (i, &byte) in entry.name.iter().take(259).enumerate() {
+            machine.write::<u16>(out + 44 + i * 2, u16::from(byte));
+        }
+        for (i, &byte) in entry.short.iter().take(13).enumerate() {
+            machine.write::<u16>(out + 564 + i * 2, u16::from(byte));
+        }
+    } else {
+        let n = entry.name.len().min(259);
+        machine.copy_to(out + 44, &entry.name[..n]);
+        let s = entry.short.len().min(13);
+        if s != 0 {
+            machine.copy_to(out + 304, &entry.short[..s]);
+        }
     }
 }
 
@@ -1410,19 +1542,93 @@ fn copy_dir_bytes<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text:
     n as u32
 }
 
-fn env_block<A: crate::Arch>(machine: &mut A, wide: bool) -> u32 {
+fn environment_value<'a>(environment: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
+    environment.split(|&byte| byte == 0)
+        .take_while(|entry| !entry.is_empty())
+        .find_map(|entry| {
+            let eq = entry.iter().position(|&byte| byte == b'=')?;
+            entry[..eq].eq_ignore_ascii_case(key).then_some(&entry[eq + 1..])
+        })
+}
+
+#[cfg(test)]
+mod environment_tests {
+    use super::{command_program, environment_value, filetime, loadfix_matches, system_time,
+                unix_from_filetime, windows_environment};
+
+    #[test]
+    fn windows_process_receives_config_and_inherited_values() {
+        let env = windows_environment(b"temp=D:\\SCRATCH\0MCHOME=C:\\RETROOS\\MC\0HOME=C:\\CONFIG\\MC\0\0");
+        assert_eq!(environment_value(&env, b"TEMP"), Some(&b"D:\\SCRATCH"[..]));
+        assert_eq!(environment_value(&env, b"MCHOME"), Some(&b"C:\\RETROOS\\MC"[..]));
+        assert_eq!(environment_value(&env, b"HOME"), Some(&b"C:\\CONFIG\\MC"[..]));
+        assert_eq!(environment_value(&env, b"COMSPEC"), Some(&b"C:\\RETROOS\\COMMAND.COM"[..]));
+        assert!(env.ends_with(b"\0\0"));
+    }
+
+    #[test]
+    fn windows_dos_launch_recognizes_command_overrides() {
+        let (program, tail) = command_program(
+            br#""C:\RETROOS\COMMAND.COM" /c "C:\GAMES\DOOM\DOOM.EXE" -nomusic"#,
+            br"C:\RETROOS\COMMAND.COM");
+        assert_eq!(program, br"C:\GAMES\DOOM\DOOM.EXE");
+        assert_eq!(tail, b"-nomusic");
+        let cfg = b"# a comment\nDOOM.EXE repair\r\nWOLF3D.EXE iopl3\n";
+        assert!(loadfix_matches(cfg, b"doom.exe"));
+        assert!(loadfix_matches(cfg, b"WOLF3D.EXE"));
+        assert!(!loadfix_matches(cfg, b"DOOM2.EXE"));
+        assert!(!loadfix_matches(b"# DOOM.EXE repair\n", b"DOOM.EXE"));
+        let long = [b'X'; 80];
+        assert!(!loadfix_matches(&long, b"X"));
+    }
+
+    #[test]
+    fn windows_file_times_use_vfs_seconds() {
+        let unix = 1_700_000_000;
+        assert_eq!(unix_from_filetime(filetime(unix)), Some(i64::from(unix)));
+        assert_eq!(system_time(i64::from(unix)), [2023, 11, 2, 14, 22, 13, 20, 0]);
+        assert_eq!(filetime(0), 0);
+        assert_eq!(system_time(unix_from_filetime(0).unwrap()), [1601, 1, 1, 1, 0, 0, 0, 0]);
+    }
+}
+
+/// Merge the DOS startup environment into the Windows process environment.
+/// Windows CRTs read this through GetEnvironmentStrings at process startup.
+pub(super) fn windows_environment(dos: &[u8]) -> Vec<u8> {
+    let mut entries: Vec<Vec<u8>> = [
+        b"COMSPEC=C:\\RETROOS\\COMMAND.COM".to_vec(),
+        b"PATH=C:\\RETROOS;C:\\".to_vec(),
+        b"TEMP=C:\\TEMP".to_vec(),
+    ].into();
+    for entry in dos.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()) {
+        let Some(eq) = entry.iter().position(|&byte| byte == b'=') else { continue };
+        if eq == 0 { continue; }
+        if let Some(old) = entries.iter().position(|old| old[..old.iter().position(|&b| b == b'=').unwrap()]
+            .eq_ignore_ascii_case(&entry[..eq])) {
+            entries[old] = entry.to_vec();
+        } else {
+            entries.push(entry.to_vec());
+        }
+    }
+    let mut out = Vec::new();
+    for entry in entries {
+        if out.len() + entry.len() + 2 > 4096 { break; }
+        out.extend_from_slice(&entry);
+        out.push(0);
+    }
+    out.push(0);
+    out
+}
+
+fn env_block<A: crate::Arch>(machine: &mut A, environment: &[u8], wide: bool) -> u32 {
     const ENV: usize = 0x7ff1_0000;
-    let text = b"COMSPEC=C:\\RETROOS\\COMMAND.COM\0PATH=C:\\RETROOS;C:\\\0TEMP=C:\\TEMP\0\0";
-    if !wide {
-        machine.zero(ENV, 4096);
-        machine.copy_to(ENV, text);
-        machine.set_page_flags(ENV / 4096, 1, true, false);
-        return ENV as u32;
+    machine.zero(ENV, 3 * 4096);
+    machine.copy_to(ENV, environment);
+    for (i, &byte) in environment.iter().enumerate() {
+        machine.write::<u16>(ENV + 4096 + i * 2, u16::from(byte));
     }
-    for (i, &byte) in text.iter().enumerate() {
-        machine.write::<u16>(ENV + 2048 + i * 2, u16::from(byte));
-    }
-    ENV as u32 + 2048
+    machine.set_page_flags(ENV / 4096, 3, true, false);
+    (ENV + if wide { 4096 } else { 0 }) as u32
 }
 
 fn version<A: crate::Arch>(machine: &mut A, out: usize) -> u32 {

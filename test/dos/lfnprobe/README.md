@@ -4,8 +4,9 @@ INT 21h/AH=71h is implemented by `kernel/src/kernel/dos/lfn.rs`, using
 the DFS long-name resolver in `dfs_lfn.rs`. VFS stays exact-case regardless
 of storage format. DFS matches long names and 8.3 aliases case-insensitively;
 it preserves FAT's stored aliases and assigns collision-free aliases on ext4.
-Names are exchanged with DOS in CP437 and with VFS in UTF-8. Unrepresentable
-names in FindData use underscores and set the Unicode-conversion result bit;
+Names are exchanged with DOS in the active codepage (CP437 by default) and
+with VFS in UTF-8. Unrepresentable names in FindData use underscores and set
+the Unicode-conversion result bit;
 their short aliases remain available.
 
 The call layouts follow [RBIL's Windows 95 LFN interface](https://fd.lod.bz/rbil/interrup/dos_kernel/2171.html).
@@ -42,7 +43,7 @@ Overlong or unterminated guest names fail rather than being truncated.
   71A7 conversion supports the full DOS time range. No timezone offset is
   configured, so UTC and the DOS clock use the same time base.
 - Explicit alias hints, ANSI/UTF-16 variants of 71A8, SUBST, and server-specific
-  calls return AX=7100h. The normal 71xx pathname APIs use CP437.
+  calls return AX=7100h. The normal 71xx pathname APIs use the active codepage.
 - Ext4 aliases are derived from directory contents, not persisted. Case-only
   rename is not implemented. Underlying storage limits still apply.
 

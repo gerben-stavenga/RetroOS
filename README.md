@@ -35,7 +35,8 @@ any host (native on the diagonal, interpreted off it).
 For an existing Linux machine, see [BOOTING.md](BOOTING.md). Prepare with
 `tools/install_kernel.sh --prepare`, then install with `sudo tools/install_kernel.sh`.
 GRUB selects the root by UUID; runtime files at `C:\RETROOS` are read-only,
-while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP`.
+while DN, VC, and MC settings live under `C:\CONFIG` and temporary files at
+`C:\TEMP`.
 
 ## Releases
 
@@ -43,15 +44,15 @@ while DN settings/history live at `C:\CONFIG\DN` and temporary files at `C:\TEMP
 
 - `retroos-vm.tar.gz` (`//:release_vm`): boot/data images and prebuilt QEMU and UniPCemu launchers.
 - `retroos-machine.tar.gz` (`//:release_machine`): matched kernel/runtime and installer.
-- `retroos_grub_module_usb.img` (`//:grub_module_usb`): editable BIOS/UEFI USB image with a fixed FAT32 partition layout.
+- `retroos_grub_module_usb.img` (`//:grub_module_usb`): editable BIOS/UEFI USB image with one FAT32 EFI partition.
 - `retroos_grub_module.iso` (`//:grub_module_iso`): bootable BIOS/UEFI CD image with the same kernel and RAM modules as the USB image.
 - `retroos-usb-diagnostic.zip` (`//:usb_diagnostic_zip`): compact USB image for boot diagnostics.
 - `SHA256SUMS` (`//:release_checksums`): checksums for all release artifacts.
 
-The USB image's `RETRODATA` partition is available to a host OS for editing,
-but RetroOS cannot yet access it when the image is booted from USB: the kernel
-does not have a USB mass-storage driver. Persistent C: requires a disk that
-RetroOS can enumerate, such as NVMe or AHCI.
+The USB image's FAT32 partition holds the GRUB menu, kernel, and RAM modules
+and can be edited from a host OS. RetroOS cannot yet access it after boot:
+the kernel does not have a USB mass-storage driver. Persistent C: requires a
+disk that RetroOS can enumerate, such as NVMe or AHCI.
 
 CI tests these artifacts and uploads them on successful runs. The bundles require
 no compiler or Bazel to use. Extract upgrades separately and preserve your existing
@@ -138,6 +139,8 @@ Startup settings live in `C:\CONFIG\CONFIG.SYS`. Change
 to choose what starts at boot. The program restarts when it exits. `--cmd` and
 `TEST=` override it for tests. Migrate an existing disk with
 `python3 tools/migrate_dn_state.py --image build/data.bin` while it is offline.
+Set `CODEPAGE=437`, `850`, `852`, or `866` there to select DOS text and filename
+encoding at boot. The default is 437; `CHCP` can change it during a session.
 
 A detected Linux filesystem supplies `/`; otherwise the RAM boot image supplies
 it (or the selected FAT volume for a disk-only boot). C: appears at `/home/retroos`:
@@ -210,9 +213,10 @@ earlier boot hang. The USB GRUB submenu **Boot diagnostics
 and stops before launching any program. This is also available via the kernel
 argument `boot-log-only`.
 
-Saved logs use UTF-8, including characters printed by DOS programs in CP437.
-The DOS `LOG` command maps UTF-8 text back to CP437 for display; common Unicode
-punctuation has ASCII fallbacks, and unavailable glyphs show as a square.
+Saved logs use UTF-8, including characters printed by DOS programs in the
+active codepage. The DOS `LOG` command maps UTF-8 text back to that codepage
+for display; common Unicode punctuation has ASCII fallbacks, and unavailable
+glyphs show as a square.
 
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 `--host DIR` uses the live host tree with the hosted backend, or exports it as

@@ -1,30 +1,26 @@
 #!/usr/bin/env python3
 """Build an editable BIOS/UEFI USB disk for the GRUB module release.
 
-Unlike the hybrid ISO, this image has an ordinary MBR with two FAT32
-partitions: an EFI boot partition and a separate data partition. GRUB's menu
-is /boot/grub/grub.cfg on partition 1.
+Unlike the hybrid ISO, this image has an ordinary MBR with one FAT32 EFI
+boot partition containing all release files. GRUB's menu is
+/boot/grub/grub.cfg on partition 1.
 """
 
 import argparse
 import os
 import shutil
 import struct
-import subprocess
 import tempfile
 
 from build_boot_disk import (GAP_SECTORS, PART_TYPE_ESP, SECTOR,
                              build_efi_binary, build_fat_partition,
-                             install_grub_bios, mtools_cfg,
+                             install_grub_bios,
                              write_partition_table)
 
 
-PART_TYPE_FAT32_LBA = 0x0C
 DISK_SIGNATURE = 0x5E77_0006
 BOOT_VOLUME_SERIAL = 0x5E77_0001
-DATA_VOLUME_SERIAL = 0x5E77_0002
 BOOT_MIB = 128
-DATA_MIB = 64
 DIAGNOSTIC_GRUB_MODULES = (
     "all_video", "fat", "gzio",
     "multiboot2", "normal", "part_msdos", "search_fs_file", "videoinfo",
@@ -74,16 +70,13 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--grub-lib", default="/usr/lib/grub/i386-pc")
     ap.add_argument("--boot-mb", type=int, default=BOOT_MIB)
-    ap.add_argument("--data-mb", type=int, default=DATA_MIB)
     ap.add_argument("--minimal-grub-modules", action="store_true")
     args = ap.parse_args()
-    if args.boot_mb < 64 or args.data_mb < 64:
-        ap.error("both FAT32 partitions must be at least 64 MiB")
+    if args.boot_mb < 64:
+        ap.error("FAT32 partition must be at least 64 MiB")
 
     boot_sectors = args.boot_mb * 1024 * 1024 // SECTOR
-    data_sectors = args.data_mb * 1024 * 1024 // SECTOR
-    data_start = GAP_SECTORS + boot_sectors
-    total_sectors = data_start + data_sectors
+    total_sectors = GAP_SECTORS + boot_sectors
 
     with tempfile.TemporaryDirectory(prefix="retroos-module-usb.") as work:
         tree = os.path.join(work, "tree")
@@ -115,7 +108,6 @@ def main():
             out.truncate(total_sectors * SECTOR)
         write_partition_table(args.out, [
             (True, PART_TYPE_ESP, GAP_SECTORS, boot_sectors),
-            (False, PART_TYPE_FAT32_LBA, data_start, data_sectors),
         ])
         install_grub_bios(args.out, work, args.grub_lib)
         with open(args.out, "r+b") as disk:
@@ -130,16 +122,7 @@ def main():
                             volume_serial=BOOT_VOLUME_SERIAL)
         set_hidden_sectors(args.out, GAP_SECTORS)
 
-        at = f"{args.out}@@{data_start * SECTOR}"
-        env = dict(os.environ, MTOOLSRC=mtools_cfg(work))
-        subprocess.run(["mformat", "-i", at, "-F", "-T", str(data_sectors),
-                        "-N", f"{DATA_VOLUME_SERIAL:08x}", "-v", "RETRODATA", "::"],
-                       check=True, env=env)
-        subprocess.run(["mmd", "-i", at, "::/CONFIG"], check=True, env=env)
-        set_hidden_sectors(args.out, data_start)
-
-    print(f"USB image {args.out}: FAT32 ESP p1 at LBA {GAP_SECTORS}, "
-          f"FAT32 data p2 at LBA {data_start}")
+    print(f"USB image {args.out}: FAT32 ESP p1 at LBA {GAP_SECTORS}")
 
 
 if __name__ == "__main__":

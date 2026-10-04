@@ -8,7 +8,13 @@ START=C:\RETROOS\DN\DN.COM
 DNSWP=C:\TEMP
 TEMP=C:\TEMP
 DN=C:\CONFIG\DN
+VC=C:\CONFIG\VC
+# MC's shared resources stay with MC.EXE; saved user settings use HOME.
+MCHOME=C:\RETROOS\MC
+HOME=C:\CONFIG\MC
 COMSPEC=C:\RETROOS\COMMAND.COM
+# DOS text and filename encoding: 437, 850, 852, or 866.
+#CODEPAGE=850
 PATH=C:\;C:\RETROOS;C:\TC;C:\BORLANDC\BIN
 # Sound Blaster ownership. native = the guest drives the real card itself
 # (no kernel mixing, no GM bank) — the only thing a 386/486, 86Box or Bochs

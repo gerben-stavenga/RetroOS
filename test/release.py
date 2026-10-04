@@ -23,8 +23,10 @@ def check_usb(work):
         mbr = disk.read(512)
     assert mbr[510:512] == b'\x55\xaa'
     assert struct.unpack_from('<I', mbr, 0x1B8)[0] != 0
-    assert mbr[450] == 0xEF and mbr[466] == 0x0C
+    assert mbr[450] == 0xEF
+    assert mbr[462:510] == bytes(48)
     assert struct.unpack_from('<I', mbr, 454)[0] == 2048
+    assert image.stat().st_size == (2048 + struct.unpack_from('<I', mbr, 458)[0]) * 512
     menu = subprocess.check_output(['mtype', '-i', f'{image}@@1048576',
                                     '::/boot/grub/grub.cfg']).decode()
     assert 'GOP 1024x768' in menu and 'GOP 800x600' in menu
@@ -149,7 +151,9 @@ def main():
             assert {
                 'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
                 'RETROOS/DN/DN.COM', 'RETROOS/VC/VC.COM', 'RETROOS/MC/MC.EXE',
-                'CONFIG/CONFIG.SYS',
+                'CONFIG/CONFIG.SYS', 'CONFIG/VC/VC.INI', 'CONFIG/VC/VC.HLP',
+                'RETROOS/MC/MC.INI', 'RETROOS/MC/MC.MNU', 'RETROOS/MC/MC.HLP',
+                'CONFIG/MC/.mc/ini', 'CONFIG/MC/.mc/menu',
             } <= names
             kernel = next(member for member in archive.getmembers()
                           if member.name.removeprefix('./') == 'kernel.elf')
@@ -167,6 +171,9 @@ def main():
         installer.migrate(home)
         assert b'COMSPEC=C:\\RETROOS\\COMMAND.COM' in (home / 'CONFIG/CONFIG.SYS').read_bytes()
         assert (home / 'CONFIG/DN/DN.MNU').is_file()
+        assert (home / 'CONFIG/VC/VC.INI').is_file()
+        assert (home / 'CONFIG/MC/.mc/ini').is_file()
+        assert (home / 'CONFIG/MC/.mc/menu').is_file()
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
         assert (vm / 'tools/run/unipcemu.sh').is_file()
