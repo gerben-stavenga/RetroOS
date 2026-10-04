@@ -848,6 +848,7 @@ pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn exec_pe_into<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
