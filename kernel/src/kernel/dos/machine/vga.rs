@@ -618,8 +618,8 @@ fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> 
 fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuAperture) {
     match aperture {
         ::vga::CpuAperture::None => {}
-        ::vga::CpuAperture::Direct { range, pages, backing_page } => machine.copy_page_entries(
-            (VGA_VRAM_BASE >> 12) + usize::from(backing_page),
+        ::vga::CpuAperture::Direct { range, pages } => machine.copy_page_entries(
+            VGA_VRAM_BASE >> 12,
             usize::from(range.start_page),
             usize::from(pages.min(range.end_page - range.start_page)),
         ),
@@ -1563,10 +1563,10 @@ mod bios_memory_tests {
                     assert!(!(usize::from(range.start_page) * 4096..usize::from(range.end_page) * 4096)
                         .contains(&addr), "raw BIOS access to trapped VGA at {addr:#x}");
                 }
-                ::vga::CpuAperture::Direct { range, pages, backing_page } => {
+                ::vga::CpuAperture::Direct { range, pages } => {
                     let base = usize::from(range.start_page) * 4096;
                     if (base..base + usize::from(pages) * 4096).contains(&addr) {
-                        return (true, addr - base + usize::from(backing_page) * 4096);
+                        return (true, addr - base);
                     }
                 }
                 _ => {}
@@ -1636,10 +1636,9 @@ mod bios_memory_tests {
             }
             if mode == 6 {
                 // Sequential mode 6 clears only plane 0, not the other maps.
-                let layout = device.emulated().unwrap().state.legacy().unwrap().layout();
                 for off in 0..32768 {
                     for plane in 1..4 {
-                        assert_eq!(memory.planes[layout.index(plane, off)], 0xA5);
+                        assert_eq!(memory.planes[::vga::VramLayout::PlaneMinor.index(plane, off)], 0xA5);
                     }
                 }
             }
