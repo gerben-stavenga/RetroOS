@@ -349,8 +349,13 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
     // Pre-read the instruction (max 15 bytes) into a buffer so decoding doesn't
     // hold a borrow of `regs` while the emulation below mutates it.
     let mut buf = [0u8; 16];
-    for k in 0..16u32 {
-        buf[k as usize] = machine.read::<u8>((cs_base.wrapping_add(ip0).wrapping_add(k)) as usize);
+    let code_addr = cs_base.wrapping_add(ip0);
+    if code_addr <= u32::MAX - 15 {
+        machine.copy_from(code_addr as usize, &mut buf);
+    } else {
+        for (k, byte) in buf.iter_mut().enumerate() {
+            *byte = machine.read::<u8>(code_addr.wrapping_add(k as u32) as usize);
+        }
     }
     let peek = |o: u32| -> u8 { buf[(o & 15) as usize] };
 

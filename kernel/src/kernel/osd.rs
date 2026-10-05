@@ -1583,15 +1583,24 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put_permille(s.parts[7]);
             }
             item if item == debug_vif_base() => {
-                line.put(b"VIF windows/pred ");
-                line.put_num(VIF_WINDOWS.load(Ordering::Relaxed));
-                line.put(b"/");
-                line.put_num(VIF_PREDICTED.load(Ordering::Relaxed));
+                let windows = VIF_WINDOWS.load(Ordering::Relaxed);
+                let predicted = VIF_PREDICTED.load(Ordering::Relaxed);
+                line.put(b"VIF pred/windows ");
+                if windows == 0 {
+                    line.put(b"--");
+                } else {
+                    let thousandths = (u64::from(predicted) * 100_000
+                        / u64::from(windows)).min(100_000) as u32;
+                    line.put_num(thousandths / 1_000);
+                    line.put(b".");
+                    line.put_3digits(thousandths % 1_000);
+                    line.put(b"%");
+                }
             }
             item if item == debug_vif_base() + 1 => {
-                line.put(b"VIF traps/steps  ");
+                line.put(b"VIF T");
                 line.put_num(VIF_DEBUG_TRAPS.load(Ordering::Relaxed));
-                line.put(b"/");
+                line.put(b" S");
                 line.put_num(VIF_STEPS.load(Ordering::Relaxed));
             }
             _ => {}

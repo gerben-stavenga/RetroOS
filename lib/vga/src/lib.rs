@@ -1254,10 +1254,12 @@ fn render_row_into(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, 
         VgaMode::Cga2 => row_cga2(frame, sy, pal, st, w),
         VgaMode::Planar16 { row_bytes, .. } => match frame.plane_layout {
             VramLayout::PlaneMinor => row_planar16::<false>(frame, sy, pal, st, w, row_bytes as usize),
+            VramLayout::PlaneMajor => row_planar16_major(frame, sy, pal, st, w, row_bytes as usize),
             VramLayout::OddEven => row_planar16::<true>(frame, sy, pal, st, w, row_bytes as usize),
         },
         VgaMode::ModeX { row_bytes, .. } => match frame.plane_layout {
             VramLayout::PlaneMinor => row_modex::<false>(frame, sy, pal, st, w, row_bytes as usize),
+            VramLayout::PlaneMajor => row_modex_major(frame, sy, pal, st, w, row_bytes as usize),
             VramLayout::OddEven => row_modex::<true>(frame, sy, pal, st, w, row_bytes as usize),
         },
         VgaMode::LinearSvga { bpp, pitch, .. } => row_svga(frame, sy, pal, st, w, bpp, pitch as usize),
@@ -1338,6 +1340,17 @@ fn row_modex<const ODD_EVEN: bool>(frame: &Frame, sy: usize, pal: &Pal, st: &mut
     }
 }
 
+fn row_modex_major(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize, row_bytes: usize) {
+    let rb = if row_bytes == 0 { w / 4 } else { row_bytes };
+    let (start, pan, ry) = row_origin(frame, sy);
+    for x in 0..w {
+        let sx = x + pan;
+        let off = (start + ry * rb + sx / 4) & (VGA_PLANE_BYTES - 1);
+        let index = VramLayout::PlaneMajor.index(sx & 3, off);
+        st.put(pal.lut[frame.planes.get(index).copied().unwrap_or(0) as usize]);
+    }
+}
+
 fn row_planar16<const ODD_EVEN: bool>(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize, row_bytes: usize) {
     let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
     let (start, pan, ry) = row_origin(frame, sy);
@@ -1352,6 +1365,28 @@ fn row_planar16<const ODD_EVEN: bool>(frame: &Frame, sy: usize, pal: &Pal, st: &
         let p1 = frame.planes.get(plane_index::<ODD_EVEN>(1, off)).copied().unwrap_or(0) as usize;
         let p2 = frame.planes.get(plane_index::<ODD_EVEN>(2, off)).copied().unwrap_or(0) as usize;
         let p3 = frame.planes.get(plane_index::<ODD_EVEN>(3, off)).copied().unwrap_or(0) as usize;
+        let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
+        while bit < 8 && x < w {
+            st.put(pal.planar[((pix >> (4 * bit)) & 0xF) as usize]);
+            bit += 1;
+            x += 1;
+        }
+        bit = 0;
+        sbyte += 1;
+    }
+}
+
+fn row_planar16_major(frame: &Frame, sy: usize, pal: &Pal, st: &mut impl PixelRow, w: usize, row_bytes: usize) {
+    let rb = if row_bytes == 0 { w / 8 } else { row_bytes };
+    let (start, pan, ry) = row_origin(frame, sy);
+    let base = start + ry * rb;
+    let (mut x, mut bit, mut sbyte) = (0usize, pan & 7, pan / 8);
+    while x < w {
+        let off = (base + sbyte) & (VGA_PLANE_BYTES - 1);
+        let p0 = frame.planes.get(VramLayout::PlaneMajor.index(0, off)).copied().unwrap_or(0) as usize;
+        let p1 = frame.planes.get(VramLayout::PlaneMajor.index(1, off)).copied().unwrap_or(0) as usize;
+        let p2 = frame.planes.get(VramLayout::PlaneMajor.index(2, off)).copied().unwrap_or(0) as usize;
+        let p3 = frame.planes.get(VramLayout::PlaneMajor.index(3, off)).copied().unwrap_or(0) as usize;
         let pix = SPREAD[p0] | (SPREAD[p1] << 1) | (SPREAD[p2] << 2) | (SPREAD[p3] << 3);
         while bit < 8 && x < w {
             st.put(pal.planar[((pix >> (4 * bit)) & 0xF) as usize]);
@@ -2443,6 +2478,8 @@ pub enum VramLayout {
     /// `index = 4 * offset + plane`. Chain-4's standard 64K window is the
     /// first 64K of this ordering.
     PlaneMinor,
+    /// Four contiguous 64 KiB planes for direct single-plane CPU aliases.
+    PlaneMajor,
     /// Two complete 128K plane sets. Set 0 interleaves maps 0/1 and set 1
     /// interleaves maps 2/3:
     /// `index = (plane >> 1) * 128K + 2 * offset + (plane & 1)`.
@@ -2454,6 +2491,7 @@ impl VramLayout {
     pub const fn index(self, plane: usize, offset: usize) -> usize {
         match self {
             Self::PlaneMinor => 4 * offset + plane,
+            Self::PlaneMajor => plane * VGA_PLANE_BYTES + offset,
             Self::OddEven => (plane >> 1) * 0x20000 + 2 * offset + (plane & 1),
         }
     }
@@ -2496,7 +2534,7 @@ pub struct ApertureRange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CpuAperture {
     None,
-    Direct { range: ApertureRange, pages: u16 },
+    Direct { range: ApertureRange, pages: u16, backing_page: u16 },
     Trapped { range: ApertureRange },
 }
 
@@ -2701,11 +2739,13 @@ impl LegacyVgaState {
     }
 
     /// Complete physical ordering implied by the sequencer memory-mode
-    /// register. Chain-4 and sequential access use plane-minor storage;
-    /// odd/even access interleaves the selected plane pair into its 128K set.
+    /// register. Chain-4 interleaves planes, sequential access keeps each
+    /// plane contiguous, and odd/even interleaves each selected plane pair.
     pub const fn layout(&self) -> VramLayout {
-        if self.seq[4] & 0x08 != 0 || self.seq[4] & 0x04 != 0 {
+        if self.seq[4] & 0x08 != 0 {
             VramLayout::PlaneMinor
+        } else if self.seq[4] & 0x04 != 0 {
+            VramLayout::PlaneMajor
         } else {
             VramLayout::OddEven
         }
@@ -2767,6 +2807,13 @@ impl LegacyVgaState {
         if self.seq[4] & 0x08 != 0 {
             return (self.seq[2] & 0x0F == 0x0F).then_some(self.layout());
         }
+        if self.seq[4] & 0x04 != 0 {
+            let mask = self.seq[2] & 0x0F;
+            let read_plane = self.gc[4] & 3;
+            let a0000 = ((self.gc[6] >> 2) & 3) <= 1;
+            return (a0000 && self.gc[5] & 0x10 == 0 && mask == 1 << read_plane)
+                .then_some(VramLayout::PlaneMajor);
+        }
         // A direct odd/even alias is valid only for the conventional matched
         // read/write setup, compact word-mode offsets and plane set 0. Other
         // legal combinations remain trapped and use layout-aware indexing.
@@ -2788,10 +2835,17 @@ impl LegacyVgaState {
             Some(VramLayout::PlaneMinor) => CpuAperture::Direct {
                 range,
                 pages: 16.min(range.end_page - range.start_page),
+                backing_page: 0,
+            },
+            Some(VramLayout::PlaneMajor) => CpuAperture::Direct {
+                range,
+                pages: 16.min(range.end_page - range.start_page),
+                backing_page: u16::from(self.gc[4] & 3) * 16,
             },
             Some(VramLayout::OddEven) => CpuAperture::Direct {
                 range,
                 pages: (range.end_page - range.start_page).min(32),
+                backing_page: 0,
             },
             None => CpuAperture::Trapped { range },
         }

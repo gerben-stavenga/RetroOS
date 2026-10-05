@@ -618,8 +618,8 @@ fn aperture_range(aperture: ::vga::CpuAperture) -> Option<::vga::ApertureRange> 
 fn install_aperture<A: crate::Arch>(machine: &mut A, aperture: ::vga::CpuAperture) {
     match aperture {
         ::vga::CpuAperture::None => {}
-        ::vga::CpuAperture::Direct { range, pages } => machine.copy_page_entries(
-            VGA_VRAM_BASE >> 12,
+        ::vga::CpuAperture::Direct { range, pages, backing_page } => machine.copy_page_entries(
+            (VGA_VRAM_BASE >> 12) + usize::from(backing_page),
             usize::from(range.start_page),
             usize::from(pages.min(range.end_page - range.start_page)),
         ),
@@ -636,9 +636,26 @@ fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite
     if write.old_aperture == write.new_aperture {
         return;
     }
-    // Remove the complete old view even when the decoded range did not move.
-    // A direct view can shrink (16 pages to 8), or change into a trap over the
-    // same range; merely installing the new prefix would leave stale aliases.
+    if aperture_range(write.old_aperture) == aperture_range(write.new_aperture) {
+        // Mode X changes its map mask many times per frame. The window is
+        // already device-owned: replace the existing PTEs in place. Allocating
+        // and zeroing fresh RAM for every register write dominated level loads.
+        if let (::vga::CpuAperture::Direct { range, pages: old_pages, .. },
+                ::vga::CpuAperture::Direct { pages: new_pages, .. }) =
+            (write.old_aperture, write.new_aperture)
+        {
+            if old_pages > new_pages {
+                machine.map_phys_range(
+                    usize::from(range.start_page + new_pages),
+                    usize::from(old_pages - new_pages), 0, arch_abi::MAP_MMIO,
+                );
+            }
+        }
+        install_aperture(machine, write.new_aperture);
+        return;
+    }
+    // When the decoded window moves, release the pages outside the new window
+    // before installing its device view.
     if let Some(old) = aperture_range(write.old_aperture) {
         machine.map_fresh_range(
             usize::from(old.start_page),
@@ -1546,10 +1563,10 @@ mod bios_memory_tests {
                     assert!(!(usize::from(range.start_page) * 4096..usize::from(range.end_page) * 4096)
                         .contains(&addr), "raw BIOS access to trapped VGA at {addr:#x}");
                 }
-                ::vga::CpuAperture::Direct { range, pages } => {
+                ::vga::CpuAperture::Direct { range, pages, backing_page } => {
                     let base = usize::from(range.start_page) * 4096;
                     if (base..base + usize::from(pages) * 4096).contains(&addr) {
-                        return (true, addr - base);
+                        return (true, addr - base + usize::from(backing_page) * 4096);
                     }
                 }
                 _ => {}
@@ -1619,9 +1636,10 @@ mod bios_memory_tests {
             }
             if mode == 6 {
                 // Sequential mode 6 clears only plane 0, not the other maps.
+                let layout = device.emulated().unwrap().state.legacy().unwrap().layout();
                 for off in 0..32768 {
                     for plane in 1..4 {
-                        assert_eq!(memory.planes[::vga::VramLayout::PlaneMinor.index(plane, off)], 0xA5);
+                        assert_eq!(memory.planes[layout.index(plane, off)], 0xA5);
                     }
                 }
             }

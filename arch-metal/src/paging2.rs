@@ -1900,6 +1900,44 @@ pub fn map_user_page_phys(vpage: usize, ppage: u64, extra_flags: u64) {
     flush_tlb();
 }
 
+/// Map a contiguous user range with a single TLB flush. VGA bank changes
+/// update many PTEs at once; flushing after every page makes each port write
+/// proportional to the window size in expensive CR3 reloads.
+pub fn map_user_range_phys(vpage: usize, count: usize, ppage: u64, extra_flags: u64) {
+    let mmio = extra_flags & arch_abi::MAP_MMIO != 0;
+    match entries() {
+        Entries::E32(e) => {
+            for i in 0..count {
+                let incoming = if mmio {
+                    let mut x = Entry32::default();
+                    x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                    x
+                } else {
+                    let mut x = Entry32::new(ppage + i as u64, true, true);
+                    x.set_raw(x.raw() | extra_flags);
+                    x
+                };
+                replace_mapping(&mut e[vpage + i], incoming);
+            }
+        }
+        Entries::E64(e) => {
+            for i in 0..count {
+                let incoming = if mmio {
+                    let mut x = Entry64::default();
+                    x.set_raw(flags::CACHE_DISABLE | flags::USER);
+                    x
+                } else {
+                    let mut x = Entry64::new(ppage + i as u64, true, true);
+                    x.set_raw(x.raw() | extra_flags);
+                    x
+                };
+                replace_mapping(&mut e[vpage + i], incoming);
+            }
+        }
+    }
+    if count != 0 { flush_tlb(); }
+}
+
 /// Alias an allocated kernel RAM range into the active guest. The kernel
 /// allocation owns the frames; guest cleanup and COW must leave them alone.
 pub(crate) fn map_shared_pages_user(vpage: usize, kernel_base: usize, count: usize) {

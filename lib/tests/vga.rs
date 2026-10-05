@@ -300,25 +300,24 @@ fn register_writes_move_vram_with_the_cpu_aperture() {
     }
 
     // IT temporarily selects sequential plane access while loading character
-    // maps. Trapping can address the current complete ordering directly, so a
-    // register write does not reorder all VRAM.
+    // maps. The backing changes to contiguous planes for this register mode.
     state.port_write(0x3C4, 4);
     let write = state.port_write(0x3C5, 0x04);
     assert!(matches!(write.new_aperture, vga::CpuAperture::Trapped { .. }));
     assert_eq!(write.vram_transition, Some(VramTransition::between(
         VramLayout::OddEven,
-        VramLayout::PlaneMinor,
+        VramLayout::PlaneMajor,
     )));
     write.vram_transition.unwrap().apply(&mut vram);
-    assert_eq!(state.layout(), VramLayout::PlaneMinor);
+    assert_eq!(state.layout(), VramLayout::PlaneMajor);
 
     // Returning to odd/even addressing is immediately direct again and needs
-    // no representation change because the trapped access preserved layout.
+    // one representation change back to odd/even.
     let mode3_seq4 = vga::bios_mode_regs(3).unwrap().seq[4];
     let write = state.port_write(0x3C5, mode3_seq4);
     assert!(matches!(write.new_aperture, vga::CpuAperture::Direct { pages: 8, .. }));
     assert_eq!(write.vram_transition, Some(VramTransition::between(
-        VramLayout::PlaneMinor,
+        VramLayout::PlaneMajor,
         VramLayout::OddEven,
     )));
 }
@@ -337,12 +336,12 @@ fn trapped_addressing_is_independent_of_backing_layout() {
     assert_eq!(state.cpu_write_address(7), (3, 0x02));
 
     // Sequential plane access traps and changes the register-derived complete
-    // ordering to plane-minor.
+    // ordering to plane-major.
     state.port_write(0x3C4, 4);
     let write = state.port_write(0x3C5, 0x04);
     assert_eq!(write.vram_transition, Some(VramTransition::between(
         VramLayout::OddEven,
-        VramLayout::PlaneMinor,
+        VramLayout::PlaneMajor,
     )));
     write.vram_transition.unwrap().apply(&mut vram);
     assert_eq!(state.cpu_write_address(7), (7, 0x03));
@@ -355,7 +354,9 @@ fn trapped_addressing_is_independent_of_backing_layout() {
     let write = state.port_write(0x3C5, 0x0E);
     assert_eq!(state.cpu_read_address(7), (1, 3));
     assert_eq!(state.cpu_write_address(7), (1, 0x08));
-    assert!(write.vram_transition.is_none());
+    assert_eq!(write.vram_transition, Some(VramTransition::between(
+        VramLayout::PlaneMajor, VramLayout::PlaneMinor,
+    )));
 }
 
 #[test]
@@ -427,8 +428,39 @@ fn odd_even_map_zero_exposes_the_full_128k_aperture() {
         vga::CpuAperture::Direct {
             range: vga::ApertureRange { start_page: 0xA0, end_page: 0xC0 },
             pages: 32,
+            backing_page: 0,
         },
     );
+}
+
+#[test]
+fn unchained_single_plane_alias_tracks_read_and_write_planes() {
+    let mut state = vga::LegacyVgaState::new();
+    state.seq[4] = 0x04;
+    state.seq[2] = 0x04;
+    state.gc[4] = 2;
+    state.gc[6] = 0x04;
+    assert_eq!(state.layout(), VramLayout::PlaneMajor);
+    assert_eq!(state.cpu_aperture(), vga::CpuAperture::Direct {
+        range: vga::ApertureRange { start_page: 0xA0, end_page: 0xB0 },
+        pages: 16,
+        backing_page: 32,
+    });
+    state.gc[4] = 1;
+    assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Trapped { .. }));
+    state.gc[4] = 2;
+    state.seq[2] = 0x0F;
+    assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Trapped { .. }));
+    state.seq[2] = 0x04;
+    state.gc[5] = 0x10;
+    assert!(matches!(state.cpu_aperture(), vga::CpuAperture::Trapped { .. }));
+
+    let mut planes = vec![0u8; 4 * 0x10000];
+    planes[VramLayout::PlaneMinor.index(2, 123)] = 0x7B;
+    vga::VramTransition::between(VramLayout::PlaneMinor, VramLayout::PlaneMajor).apply(&mut planes);
+    assert_eq!(planes[32 * 4096 + 123], 0x7B);
+    vga::VramTransition::between(VramLayout::PlaneMajor, VramLayout::PlaneMinor).apply(&mut planes);
+    assert_eq!(planes[VramLayout::PlaneMinor.index(2, 123)], 0x7B);
 }
 
 #[test]
@@ -438,7 +470,7 @@ fn mode6_is_sequential_plane_zero_and_trapped() {
     state.seq = regs.seq;
     state.gc = regs.gc;
     assert_eq!(state.classify_mode(), Some(VgaMode::Cga2));
-    assert_eq!(state.layout(), VramLayout::PlaneMinor);
+    assert_eq!(state.layout(), VramLayout::PlaneMajor);
     assert_eq!(
         state.cpu_aperture(),
         vga::CpuAperture::Trapped {

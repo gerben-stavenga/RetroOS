@@ -337,7 +337,13 @@ pub(super) fn enter_pm_at<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &
 pub(super) fn enter_rm<A: crate::Arch>(dos: &mut thread::DosState<A>, regs: &mut Regs,
                                       rm_dest: (u16, u32), rm_call_struct_addr: Option<u32>) {
     let pm_cursor = pm_stack(dos, regs);
-    if pm_cursor.0 != HOST_STACK_PM32_SEL && pm_cursor.0 != HOST_STACK_PM16_SEL {
+    // Only a client-level PM stack is a reusable entry point. While a locked
+    // interrupt chain is active, `pm_cursor` can be below a temporary IRET
+    // frame. Caching that cursor makes each later VM86→PM interrupt start one
+    // frame lower and eventually overwrites the client's return stack.
+    if dos.pc.locked_stack.other_stack.is_none()
+        && pm_cursor.0 != HOST_STACK_PM32_SEL && pm_cursor.0 != HOST_STACK_PM16_SEL
+    {
         dos.pc.locked_stack.client_pm_stack = Some(pm_cursor);
     }
     push_continuation(dos, regs, rm_call_struct_addr);

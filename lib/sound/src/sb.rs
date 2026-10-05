@@ -302,6 +302,9 @@ pub struct Sb {
     /// send 0xF2, and keep whichever handler fired — no IRQ means "broken card"
     /// (PoP 1.0 then drops sound entirely, AdLib included).
     trigger_irq: u8,
+    /// DSP 80h output-silence completion time. This command clocks samples
+    /// without DMA and raises the 8-bit completion IRQ when they have elapsed.
+    silence_until_ns: u64,
 
     /// DSP 0xD1/0xD3 speaker-status flag. On the DSP 4.xx we expose it has no
     /// effect on PCM output; D8h merely reports it. It is write-only except
@@ -384,6 +387,7 @@ impl Sb {
             cmd: None, params: [0; 3], param_got: 0, param_need: 0,
             reset_prev: 0, test_reg: 0,
             mixer_index: 0, mixer: Mixer::new(), irq_status: 0, trigger_irq: 0,
+            silence_until_ns: 0,
             speaker: false,
             playing: false, paused: false,
             rate: 22050, bits: 8, stereo: false, signed: false, block_param: 0,
@@ -460,7 +464,7 @@ impl Sb {
             // sample per game frame (1 fps, staccato gate grinding). Idle DSP
             // reads always-ready.
             0x0C => {
-                if self.playing && self.single {
+                if (self.playing && self.single) || self.silence_until_ns != 0 {
                     self.write_busy = self.write_busy.wrapping_add(1);
                     if self.write_busy & 8 != 0 { 0x80 } else { 0x00 }
                 } else {
@@ -509,6 +513,7 @@ impl Sb {
                     self.cmd = None;
                     self.param_got = 0;
                     self.out_len = 0;
+                    self.silence_until_ns = 0;
                     self.push_out(0xAA); // reset acknowledge
                 }
                 self.reset_prev = val;
@@ -600,6 +605,15 @@ impl Sb {
             }
             0x42 => {}                                              // input rate: ignore
             0x48 => self.block_param = (p[0] as u16) | ((p[1] as u16) << 8),
+            0x80 => {
+                // The count is samples minus one, in the DSP's current output
+                // time base. No DMA bytes move, but the normal 8-bit IRQ fires
+                // when the silent interval ends.
+                let samples = u64::from((p[0] as u16) | ((p[1] as u16) << 8)) + 1;
+                let duration = (u128::from(samples) * 1_000_000_000u128)
+                    .div_ceil(u128::from(self.rate.max(1))) as u64;
+                self.silence_until_ns = now.saturating_add(duration.max(1));
+            }
             // Legacy 8-bit mono output. 0x1C/0x90 = auto-init (block from 0x48);
             // 0x14 carries its single-cycle transfer length in the command.
             // 0x91 has no length parameters and falls back to the DMA count.
@@ -703,6 +717,12 @@ impl Sb {
     /// has no bearing on this DMA cursor. Also ends the hangover hold and
     /// completes single-cycle transfers on their CPU-time clock.
     pub fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
+        let mut raise = false;
+        if self.silence_until_ns != 0 && now >= self.silence_until_ns {
+            self.silence_until_ns = 0;
+            raise = self.irq_status & 0x01 == 0;
+            self.irq_status |= 0x01;
+        }
         if !self.playing {
             // Hangover: the host keeps the stream fed (silence + synths) while
             // `stream_hold` keeps `owns_sink` true; effect chains re-trigger
@@ -710,7 +730,7 @@ impl Sb {
             if self.stream_hold && now.saturating_sub(self.done_ns) >= DSP_HANGOVER_NS {
                 self.stream_hold = false;
             }
-            return false;
+            return raise;
         }
         let guest_now = if self.probe {
             // Single-cycle DMA advances continuously on the DSP's virtual
@@ -724,7 +744,6 @@ impl Sb {
         } else {
             produced
         };
-        let mut raise = false;
         while self.playing && guest_now >= self.next_irq {
             raise |= self.block_irq();
             if self.single {
@@ -883,6 +902,7 @@ impl Sb {
         self.paused = false;
         self.stream_hold = false;
         self.out_len = 0;
+        self.silence_until_ns = 0;
         self.cmd = None;
         self.opl = None; // next program gets a power-on-fresh FM chip
     }
@@ -1265,5 +1285,23 @@ mod tests {
         let _ = sb.port_read(ack_port);
         assert_eq!(sb.irq_status & 0x01, 0);
         assert!(sb.advance_clock(30, 30));
+    }
+
+    #[test]
+    fn output_silence_completes_on_the_dsp_clock() {
+        let mut sb = Sb::new();
+        let dsp = sb.io_base + 0x0C;
+        let start = 1_000_000u64;
+        sb.port_write(dsp, 0x40, start);
+        sb.port_write(dsp, 0xC4, start); // 16,666 samples/s
+        sb.port_write(dsp, 0x80, start);
+        sb.port_write(dsp, 0x10, start);
+        sb.port_write(dsp, 0x00, start); // 17 silent samples
+        assert!(!sb.advance_clock(start + 500_000, 0));
+        assert!(sb.advance_clock(start + 2_000_000, 0));
+        assert_eq!(sb.irq_status & 1, 1);
+        assert!(!sb.advance_clock(start + 3_000_000, 0));
+        sb.port_read(sb.io_base + 0x0E);
+        assert_eq!(sb.irq_status & 1, 0);
     }
 }

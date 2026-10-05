@@ -2069,7 +2069,8 @@ fn event_loop<A: crate::Arch>(
         }
 
         // Ask the scheduler.
-        match crate::kernel::sched::verdict(
+        let exiting = matches!(action, thread::KernelAction::Exit(_));
+        let verdict = crate::kernel::sched::verdict(
             machine,
             &mut *bios_workspace,
             threads,
@@ -2079,7 +2080,11 @@ fn event_loop<A: crate::Arch>(
             &mut exiting_display,
             &mut sb_handoff,
             &mut display,
-        ) {
+        );
+        if exiting {
+            windows.remove_endpoint(crate::kernel::gui::EndpointId(ctx.tid as u32));
+        }
+        match verdict {
             crate::kernel::sched::Verdict::Stay => {}
             crate::kernel::sched::Verdict::Switch(next) => {
                 switch_focus_and_run(

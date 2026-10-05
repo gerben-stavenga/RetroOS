@@ -287,9 +287,7 @@ fn arch_dispatch(regs: &mut Regs) {
             // place an NVMe BAR above 4 GB on a wide-MAXPHYADDR CPU).
             let ppage_start = (regs.rbx as u32 as u64) | ((regs.rsi as u32 as u64) << 32);
             let flags = regs.rdi;
-            for i in 0..num_pages {
-                paging2::map_user_page_phys(vpage_start + i, ppage_start + i as u64, flags);
-            }
+            paging2::map_user_range_phys(vpage_start, num_pages, ppage_start, flags);
         }
         arch_call::REMAP_PHYSICAL_APERTURE => {
             let physical_base = (regs.rdx as u32 as u64)

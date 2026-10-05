@@ -456,6 +456,23 @@ impl Desktop {
         self.surfaces.iter().map(|surface| surface.owner)
     }
 
+    /// Retire every presentation and surface owned by a task that has exited.
+    /// A later task may reuse its endpoint number, but must get fresh bindings.
+    pub fn remove_endpoint(&mut self, endpoint: EndpointId) {
+        let roots: Vec<_> = self.scene.roots.iter().copied().filter(|&root| {
+            self.scene.node(root).is_some_and(|node| node.owner == endpoint)
+        }).collect();
+        for root in roots {
+            self.scene.destroy_subtree(root);
+        }
+        self.bindings.retain(|binding| binding.endpoint != endpoint);
+        self.surfaces.retain(|surface| surface.owner != endpoint);
+        if self.keyboard_focus == Some(endpoint) {
+            self.keyboard_focus = None;
+        }
+        self.damage_scene();
+    }
+
     pub fn commit(&mut self, transaction: Transaction) -> Result<(), SceneError> {
         self.scene.commit(transaction)?;
         self.damage_scene();
@@ -712,6 +729,18 @@ impl WindowManager {
 
     pub fn desktop_mut(&mut self) -> &mut Desktop {
         &mut self.desktop
+    }
+
+    pub fn remove_endpoint(&mut self, endpoint: EndpointId) {
+        if self.switcher_active == Some(endpoint) || self.switcher_highlighted == Some(endpoint) {
+            self.finish_task_switcher();
+        }
+        self.desktop.remove_endpoint(endpoint);
+        let window = Self::primary_window(endpoint);
+        self.modes.retain(|(candidate, _)| *candidate != window);
+        if self.focused == Some(window) {
+            self.focused = None;
+        }
     }
 
     pub fn compose<'a>(
@@ -2049,6 +2078,45 @@ mod tests {
         scene.commit(transaction).unwrap();
         assert!(scene.node(parent).is_none());
         assert!(scene.node(child).is_none());
+    }
+
+    #[test]
+    fn exiting_endpoint_removes_its_windows_and_allows_slot_reuse() {
+        let mut manager = WindowManager::new(Presentation::Desktop);
+        let old = manager.desktop.ensure_window_node(
+            WINDOWS, PresentationKey(1), Rect::new(0, 0, 40, 30),
+        ).unwrap();
+        let child = manager.desktop.scene.create(
+            WINDOWS, Some(old), Rect::new(1, 1, 10, 10),
+        ).unwrap();
+        let survivor = manager.desktop.ensure_window_node(
+            OS2, PresentationKey(1), Rect::new(0, 0, 40, 30),
+        ).unwrap();
+        let surface = manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap();
+        let mut transaction = Transaction::new(WINDOWS);
+        transaction.attach(old, Some(surface)).set_visible(old, true);
+        manager.desktop.commit(transaction).unwrap();
+        let mut transaction = Transaction::new(OS2);
+        transaction.set_visible(survivor, true);
+        manager.desktop.commit(transaction).unwrap();
+        manager.focus(WindowManager::primary_window(WINDOWS));
+        manager.enter_fullscreen(WindowManager::primary_window(WINDOWS));
+
+        manager.remove_endpoint(WINDOWS);
+
+        assert!(manager.desktop.node_state(old).is_none());
+        assert!(manager.desktop.node_state(child).is_none());
+        assert!(manager.desktop.node_state(survivor).is_some());
+        assert!(manager.desktop.surface_id(WINDOWS, SurfaceKey(1)).is_none());
+        assert_eq!(manager.desktop.focused(), None);
+        assert_eq!(manager.focused(), None);
+        assert_eq!(manager.mode(WindowManager::primary_window(WINDOWS)), WindowMode::Windowed);
+        let replacement = manager.desktop.ensure_window_node(
+            WINDOWS, PresentationKey(1), Rect::new(0, 0, 40, 30),
+        ).unwrap();
+        assert_ne!(old, replacement);
+        assert_eq!(manager.desktop.geometry(replacement), Some(Rect::new(20, 16, 40, 30)));
+        assert_ne!(surface, manager.desktop.ensure_surface(WINDOWS, SurfaceKey(1)).unwrap());
     }
 
     #[test]
