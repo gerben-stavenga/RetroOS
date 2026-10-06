@@ -80,6 +80,7 @@ pub struct Header {
     pub stack_reserve: u32,
     pub export: Directory,
     pub import: Directory,
+    pub resource: Directory,
     pub reloc: Directory,
     section_table: usize,
 }
@@ -137,7 +138,7 @@ impl<'a> Image<'a> {
             size_headers: u32_at(data, opt + 60)?,
             subsystem: u16_at(data, opt + 68)?,
             stack_reserve: u32_at(data, opt + 72)?,
-            export: directory(0)?, import: directory(1)?, reloc: directory(5)?,
+            export: directory(0)?, import: directory(1)?, resource: directory(2)?, reloc: directory(5)?,
             section_table,
         };
         if header.size_image == 0 || header.size_image >= 0xc000_0000
@@ -195,6 +196,43 @@ impl<'a> Image<'a> {
         let n = tail.iter().position(|&b| b == 0).ok_or(Error::Truncated)?;
         if n > 1024 { return Err(Error::BadTable); }
         Ok(tail[..n].to_vec())
+    }
+
+    /// Read an RT_STRING entry from its length-prefixed UTF-16 bundle.
+    pub fn string_resource(&self, id: u32) -> Result<Vec<u16>, Error> {
+        let directory = self.header.resource;
+        if directory.rva == 0 { return Err(Error::BadTable); }
+        let tree = self.bytes_at_rva(directory.rva, directory.size as usize)?;
+        let mut offset = 0usize;
+        for key in [Some(6), Some((id >> 4) + 1), None] {
+            let named = u16_at(tree, offset + 12)? as usize;
+            let count = named + u16_at(tree, offset + 14)? as usize;
+            let mut next = None;
+            for n in 0..count {
+                let at = offset + 16 + n * 8;
+                let entry = u32_at(tree, at)?;
+                if key.is_none() || key == Some(entry) {
+                    next = Some(u32_at(tree, at + 4)?);
+                    break;
+                }
+            }
+            let next = next.ok_or(Error::BadTable)?;
+            if key.is_some() && next & 0x80000000 == 0 { return Err(Error::BadTable); }
+            if key.is_none() && next & 0x80000000 != 0 { return Err(Error::BadTable); }
+            offset = (next & 0x7fffffff) as usize;
+        }
+        let data = self.bytes_at_rva(u32_at(tree, offset)?, u32_at(tree, offset + 4)? as usize)?;
+        let mut at = 0usize;
+        for slot in 0..16 {
+            let len = u16_at(data, at)? as usize;
+            at += 2;
+            let bytes = data.get(at..at + len * 2).ok_or(Error::Truncated)?;
+            if slot == id & 15 {
+                return Ok(bytes.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]])).collect());
+            }
+            at += len * 2;
+        }
+        Err(Error::BadTable)
     }
 
     pub fn imports(&self) -> Result<Vec<Import>, Error> {
@@ -262,5 +300,45 @@ impl<'a> Image<'a> {
             consumed += size;
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+    use alloc::vec;
+
+    fn fixture() -> Vec<u8> {
+        let mut data = vec![0u8; 1024];
+        data[..4].copy_from_slice(b"PE\0\0");
+        let mut put16 = |at, value: u16| data[at..at+2].copy_from_slice(&value.to_le_bytes());
+        put16(4, 0x14c); put16(20, 224); put16(24, 0x10b);
+        let mut put32 = |at, value: u32| data[at..at+4].copy_from_slice(&value.to_le_bytes());
+        put32(24+32, 4096); put32(24+56, 4096); put32(24+60, 1024);
+        put32(24+92, 16); put32(24+96+16, 512); put32(24+100+16, 128);
+        for (at, value) in [(16,6),(20,0x80000018),(40,2),(44,0x80000030),(64,0x409),(68,72),(72,600),(76,38)] {
+            put32(512+at,value);
+        }
+        for at in [14,38,62] { data[512+at..512+at+2].copy_from_slice(&1u16.to_le_bytes()); }
+        data[602..604].copy_from_slice(&3u16.to_le_bytes());
+        for (n,c) in "abc".encode_utf16().enumerate() { data[604+n*2..606+n*2].copy_from_slice(&c.to_le_bytes()); }
+        data
+    }
+
+    #[test]
+    fn string_bundle_and_missing_id() {
+        let data = fixture(); let image = Image::parse(&data).unwrap();
+        assert_eq!(image.string_resource(17).unwrap(), vec![97,98,99]);
+        assert!(image.string_resource(16).unwrap().is_empty());
+        assert!(image.string_resource(32).is_err());
+    }
+
+    #[test]
+    fn malformed_resource_offsets_and_lengths() {
+        let mut data = fixture();
+        data[532..536].copy_from_slice(&0xfffffff0u32.to_le_bytes());
+        assert!(Image::parse(&data).unwrap().string_resource(17).is_err());
+        let mut data = fixture(); data[602..604].copy_from_slice(&300u16.to_le_bytes());
+        assert!(Image::parse(&data).unwrap().string_resource(17).is_err());
     }
 }

@@ -14,7 +14,7 @@
 
 #[cfg(feature = "tcg")]
 mod imp {
-    pub use crate::cpu::{execute, fpu_pop, fpu_st0, invalidate_code_range};
+    pub use crate::cpu::{execute, fpu_pop, fpu_st0, fx_switch, invalidate_code_range};
     /// Flush all cached translations (context switch / space teardown).
     pub fn flush() {
         crate::cpu::flush_uc()
@@ -25,9 +25,6 @@ mod imp {
     }
     /// All I/O is interpreted; there is no IOPB fast path on this engine.
     pub fn install_io_policy(_policy: &arch_abi::IoPolicy) {}
-    /// FPU state lives inside the software core; cross-switch save/restore
-    /// is not wired on this engine (pre-existing status).
-    pub fn fx_switch(_fx: &mut crate::machine::FxState) {}
 }
 
 #[cfg(feature = "kvm")]

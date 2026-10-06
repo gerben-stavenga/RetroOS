@@ -331,6 +331,58 @@ pub fn fpu_pop() {
     });
 }
 
+/// Exchange the software core's x87/SSE registers using the FXSAVE layout.
+pub fn fx_switch(fx: &mut crate::machine::FxState) {
+    io_with(|uc| {
+        let mut outgoing = crate::machine::clean_fx_template();
+        let scalar = [
+            (RegisterX86::FPCW,0,2),(RegisterX86::FPSW,2,2),
+            (RegisterX86::FOP,6,2),(RegisterX86::FIP,8,4),
+            (RegisterX86::FCS,12,2),(RegisterX86::FDP,16,4),
+            (RegisterX86::FDS,20,2),(RegisterX86::MXCSR,24,4),
+        ];
+        for &(reg,at,len) in &scalar {
+            let value = uc.reg_read(reg).expect("read FPU register").to_le_bytes();
+            outgoing.0[at..at+len].copy_from_slice(&value[..len]);
+        }
+        let tags = uc.reg_read(RegisterX86::FPTAG).expect("read x87 tags");
+        outgoing.0[4] = (0..8).fold(0,|tag,n| tag | (u8::from((tags >> (n*2)) & 3 != 3) << n));
+        for n in 0..8 {
+            let bytes = uc.reg_read_long(RegisterX86::ST0 as i32 + n as i32).expect("read x87 register");
+            outgoing.0[32+n*16..42+n*16].copy_from_slice(&bytes[..10]);
+        }
+        for n in 0..16 {
+            let bytes = uc.reg_read_long(RegisterX86::XMM0 as i32 + n as i32).expect("read SSE register");
+            outgoing.0[160+n*16..176+n*16].copy_from_slice(&bytes[..16]);
+        }
+        for &(reg,at,len) in &scalar {
+            let mut value = [0;8]; value[..len].copy_from_slice(&fx.0[at..at+len]);
+            uc.reg_write(reg,u64::from_le_bytes(value)).expect("write FPU register");
+        }
+        for n in 0..8 {
+            uc.reg_write_long(RegisterX86::ST0 as i32 + n as i32,&fx.0[32+n*16..42+n*16]).expect("write x87 register");
+        }
+        let top = (u16::from_le_bytes([fx.0[2],fx.0[3]]) >> 11) as usize & 7;
+        let mut full_tags = 0u64;
+        for physical in 0..8 {
+            let tag = if fx.0[4] & (1 << physical) == 0 { 3 } else {
+                let at = 32 + ((physical+8-top)&7)*16;
+                let exponent = u16::from_le_bytes([fx.0[at+8],fx.0[at+9]]) & 0x7fff;
+                let significand = u64::from_le_bytes(fx.0[at..at+8].try_into().unwrap());
+                if exponent == 0 && significand == 0 { 1 }
+                else if exponent == 0x7fff || significand >> 63 == 0 { 2 }
+                else { 0 }
+            };
+            full_tags |= tag << (physical*2);
+        }
+        uc.reg_write(RegisterX86::FPTAG,full_tags).expect("write x87 tags");
+        for n in 0..16 {
+            uc.reg_write_long(RegisterX86::XMM0 as i32 + n as i32,&fx.0[160+n*16..176+n*16]).expect("write SSE register");
+        }
+        *fx = outgoing;
+    });
+}
+
 /// Run the current Vcpu (`REGS`) for one slice and return the next event.
 ///
 /// Two execution modes share one Unicorn instance: 32-bit flat protected mode
@@ -522,6 +574,13 @@ pub fn execute() -> KernelEvent {
             // so nothing to add here. A bare `Ok` is either a full-slice retire
             // or a block-hook IRQ stop — both just hand control to the kernel.
             Ok(()) => KernelEvent::Irq,
+            // Unicorn can reject an invalid encoding before the interrupt
+            // hook runs. It is still a CPU #UD, including for real-mode
+            // VM-detection routines that recover through their INT 6 hook.
+            Err(uc_error::INSN_INVALID) => {
+                vcpu.err_code = 0;
+                KernelEvent::Exception(6)
+            }
             Err(_) => KernelEvent::Fault,
         };
     })

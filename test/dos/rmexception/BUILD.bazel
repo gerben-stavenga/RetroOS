@@ -1,0 +1,7 @@
+genrule(
+    name = "rmexception_com",
+    srcs = ["rmexception.asm"],
+    outs = ["RMEXCEPT.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,19 @@
+load("//toolchain:windows_watcom.bzl", "windows_watcom_binary")
+windows_watcom_binary(
+    name = "threads",
+    src = "threads.c",
+    visibility = ["//visibility:public"],
+)
+
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:windows_watcom.bzl", "windows_dll")
+nasm_library(name = "probe_obj", srcs = ["probe.asm"], copts = ["-fwin32"])
+windows_dll(
+    name = "probe_dll",
+    obj = ":probe_obj",
+    out = "PROBE.DLL",
+    module_name = "PROBE",
+    entry = "DllEntry",
+    exports = ["ProbeValue"],
+    visibility = ["//visibility:public"],
+)

@@ -2620,6 +2620,14 @@ fn int_21h<A: crate::Arch>(
             regs.rax = (regs.rax & !0xFF) | dow as u64; // AL = day of week (0=Sun, 6=Sat)
             return thread::KernelAction::Done;
         }
+        // AH=2Bh — Set System Date. Date changes are not supported; DOS
+        // reports failure in AL, rather than through CF/AX. DESQview's
+        // installation probe uses an invalid date (CX='DE', DX='SQ') and
+        // treats any AL other than FFh as an installed multitasker.
+        0x2B => {
+            regs.rax = (regs.rax & !0xFF) | 0xFF;
+            return thread::KernelAction::Done;
+        }
         // AH=2Ch — Get System Time
         0x2C => {
             let (hours, mins, secs, centisecs) = bios_time_of_day(machine);

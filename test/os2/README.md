@@ -8,7 +8,7 @@ Build the LX programs and compatibility DLLs hermetically with Bazel:
 
 ```sh
 bazelisk build \
-  //apps/os2/doscalls:doscalls_dll \
+  //lib/os2/doscalls:doscalls_dll \
   //test/os2/hello:hello_lx
 ```
 

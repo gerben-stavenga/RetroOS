@@ -2,6 +2,8 @@
 //! DLLs. Missing exports become `int 0x83` trampolines; these calls implement
 //! them. The text console is a character buffer painted into a Win32 window.
 
+mod system;
+
 use super::{
     arg, c_string, copy_ascii, fail, full_windows_path, guest_windows_path, w_string, windows_path, Window,
     WindowsState, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_INVALID_PARAMETER,
@@ -44,11 +46,19 @@ struct Entry {
     dir: bool,
 }
 
+pub(super) struct Mapping {
+    handle: u32,
+    name: Vec<u8>,
+    address: u32,
+    size: u32,
+}
+
 struct Key {
     down: bool,
     ascii: u8,
     scan: u16,
     vk: u16,
+    control: u32,
 }
 
 pub(super) struct Console {
@@ -59,6 +69,8 @@ pub(super) struct Console {
     attr: u16,
     cells: Vec<u8>,
     input: Vec<Key>,
+    keys: [u8; 256],
+    extended: bool,
     pub hwnd: u32,
     /// `ReadConsoleInput` found no key. The call stays at the `int 0x83` so
     /// the next entry sees a real event instead of an empty record.
@@ -75,6 +87,8 @@ impl Console {
             attr: 0x07,
             cells: Vec::new(),
             input: Vec::new(),
+            keys: [0; 256],
+            extended: false,
             hwnd: 0,
             hold: false,
         };
@@ -95,6 +109,232 @@ impl Console {
 }
 
 const SPECS: &[Spec] = &[
+    spec(b"ADVAPI32", b"AdjustTokenPrivileges", 24),
+    spec(b"ADVAPI32", b"CheckTokenMembership", 12),
+    spec(b"ADVAPI32", b"CloseServiceHandle", 4),
+    spec(b"ADVAPI32", b"ControlService", 12),
+    spec(b"ADVAPI32", b"DecryptFileA", 8),
+    spec(b"ADVAPI32", b"EncryptFileA", 4),
+    spec(b"ADVAPI32", b"EnumServicesStatusExA", 40),
+    spec(b"ADVAPI32", b"FileEncryptionStatusA", 8),
+    spec(b"ADVAPI32", b"GetFileSecurityA", 20),
+    spec(b"ADVAPI32", b"GetSecurityDescriptorOwner", 12),
+    spec(b"ADVAPI32", b"ImpersonateLoggedOnUser", 4),
+    spec(b"ADVAPI32", b"LogonUserA", 24),
+    spec(b"ADVAPI32", b"LookupAccountSidA", 28),
+    spec(b"ADVAPI32", b"LookupPrivilegeValueA", 12),
+    spec(b"ADVAPI32", b"OpenSCManagerA", 12),
+    spec(b"ADVAPI32", b"OpenServiceA", 12),
+    spec(b"ADVAPI32", b"OpenThreadToken", 16),
+    spec(b"ADVAPI32", b"QueryServiceConfigA", 16),
+    spec(b"ADVAPI32", b"QueryServiceStatus", 8),
+    spec(b"ADVAPI32", b"RegCreateKeyExA", 36),
+    spec(b"ADVAPI32", b"RegOpenKeyA", 12),
+    spec(b"ADVAPI32", b"RegOpenKeyExA", 20),
+    spec(b"ADVAPI32", b"RegQueryValueExA", 24),
+    spec(b"ADVAPI32", b"RegSetValueExA", 24),
+    spec(b"ADVAPI32", b"StartServiceA", 12),
+    spec(b"GDI32", b"GetDCOrgEx", 8),
+    spec(b"GDI32", b"GetDeviceCaps", 8),
+    spec(b"GDIPLUS", b"GdipCreateBitmapFromHBITMAP", 12),
+    spec(b"GDIPLUS", b"GdipDisposeImage", 4),
+    spec(b"GDIPLUS", b"GdipGetImageEncoders", 12),
+    spec(b"GDIPLUS", b"GdipGetImageEncodersSize", 8),
+    spec(b"GDIPLUS", b"GdipSaveImageToFile", 16),
+    spec(b"GDIPLUS", b"GdiplusShutdown", 4),
+    spec(b"GDIPLUS", b"GdiplusStartup", 12),
+    spec(b"IPHLPAPI", b"GetIpNetTable", 12),
+    spec(b"KERNEL32", b"AllocConsole", 0),
+    spec(b"KERNEL32", b"AreFileApisANSI", 0),
+    spec(b"KERNEL32", b"CopyFileA", 12),
+    spec(b"KERNEL32", b"CreateFileMappingA", 24),
+    spec(b"KERNEL32", b"OpenFileMappingA", 12),
+    spec(b"KERNEL32", b"DeviceIoControl", 32),
+    spec(b"KERNEL32", b"DosDateTimeToFileTime", 12),
+    spec(b"KERNEL32", b"FileTimeToDosDateTime", 12),
+    spec(b"KERNEL32", b"FindCloseChangeNotification", 4),
+    spec(b"KERNEL32", b"FindFirstChangeNotificationA", 12),
+    spec(b"KERNEL32", b"FindNextChangeNotification", 4),
+    spec(b"KERNEL32", b"FlushConsoleInputBuffer", 4),
+    spec(b"KERNEL32", b"FormatMessageA", 28),
+    spec(b"KERNEL32", b"GenerateConsoleCtrlEvent", 8),
+    spec(b"KERNEL32", b"GetCompressedFileSizeA", 8),
+    spec(b"KERNEL32", b"GetConsoleCP", 0),
+    spec(b"KERNEL32", b"GetConsoleCursorInfo", 8),
+    spec(b"KERNEL32", b"GetConsoleOutputCP", 0),
+    spec(b"KERNEL32", b"GetExitCodeThread", 8),
+    spec(b"KERNEL32", b"GetFileSizeEx", 8),
+    spec(b"KERNEL32", b"GetFileTime", 16),
+    spec(b"KERNEL32", b"GetLargestConsoleWindowSize", 4),
+    spec(b"KERNEL32", b"GetShortPathNameA", 12),
+    spec(b"KERNEL32", b"GetSystemTimeAsFileTime", 4),
+    spec(b"KERNEL32", b"GetThreadLocale", 0),
+    spec(b"KERNEL32", b"GlobalAlloc", 8),
+    spec(b"KERNEL32", b"GlobalLock", 4),
+    spec(b"KERNEL32", b"GlobalMemoryStatus", 4),
+    spec(b"KERNEL32", b"GlobalSize", 4),
+    spec(b"KERNEL32", b"GlobalUnlock", 4),
+    spec(b"KERNEL32", b"MapViewOfFile", 20),
+    spec(b"KERNEL32", b"UnmapViewOfFile", 4),
+    spec(b"KERNEL32", b"OpenProcess", 12),
+    spec(b"KERNEL32", b"QueryDosDeviceA", 12),
+    spec(b"KERNEL32", b"QueryPerformanceCounter", 4),
+    spec(b"KERNEL32", b"QueryPerformanceFrequency", 4),
+    spec(b"KERNEL32", b"SetConsoleCP", 4),
+    spec(b"KERNEL32", b"SetConsoleCursorInfo", 8),
+    spec(b"KERNEL32", b"SetConsoleIcon", 4),
+    spec(b"KERNEL32", b"SetConsoleOutputCP", 4),
+    spec(b"KERNEL32", b"SetEvent", 4),
+    spec(b"KERNEL32", b"SetFileApisToOEM", 0),
+    spec(b"KERNEL32", b"SetPriorityClass", 8),
+    spec(b"KERNEL32", b"SetProcessShutdownParameters", 8),
+    spec(b"KERNEL32", b"SetVolumeLabelA", 8),
+    spec(b"KERNEL32", b"TerminateThread", 8),
+    spec(b"KERNEL32", b"VirtualProtect", 16),
+    spec(b"KERNEL32", b"WaitForSingleObjectEx", 12),
+    spec(b"MPR", b"WNetAddConnection2A", 16),
+    spec(b"MPR", b"WNetCancelConnection2A", 12),
+    spec(b"MPR", b"WNetCloseEnum", 4),
+    spec(b"MPR", b"WNetEnumResourceA", 16),
+    spec(b"MPR", b"WNetGetConnectionA", 12),
+    spec(b"MPR", b"WNetOpenEnumA", 20),
+    spec(b"MPR", b"WNetGetUniversalNameA", 16),
+    spec(b"NTDLL", b"NtQueryInformationFile", 20),
+    spec(b"NTDLL", b"NtQueryObject", 20),
+    spec(b"NTDLL", b"NtQuerySystemInformation", 16),
+    spec(b"OLE32", b"CoCreateInstance", 20),
+    spec(b"OLE32", b"CoGetMalloc", 8),
+    spec(b"OLE32", b"CoInitialize", 4),
+    spec(b"OLE32", b"OleFlushClipboard", 0),
+    spec(b"OLE32", b"OleInitialize", 4),
+    spec(b"OLE32", b"OleUninitialize", 0),
+    spec(b"SHELL32", b"SHFileOperationA", 4),
+    spec(b"SHELL32", b"SHGetDesktopFolder", 4),
+    spec(b"SHELL32", b"SHGetFileInfoA", 20),
+    spec(b"SHELL32", b"SHGetFolderPathA", 20),
+    spec(b"SHELL32", b"SHGetSpecialFolderLocation", 12),
+    spec(b"SHELL32", b"ShellExecuteA", 24),
+    spec(b"SHELL32", b"Shell_NotifyIcon", 8),
+    spec(b"SHELL32", b"ShellExecuteExA", 4),
+    spec(b"USER32", b"AppendMenuA", 16),
+    spec(b"USER32", b"BroadcastSystemMessage", 20),
+    spec(b"USER32", b"CharLowerBuffA", 8),
+    spec(b"USER32", b"CharToOemA", 8),
+    spec(b"USER32", b"CharToOemBuffA", 12),
+    spec(b"USER32", b"CharToOemW", 8),
+    spec(b"USER32", b"CharUpperBuffA", 8),
+    spec(b"USER32", b"CloseClipboard", 0),
+    spec(b"USER32", b"CloseWindow", 4),
+    spec(b"USER32", b"CreateDialogParamA", 20),
+    spec(b"USER32", b"CreateMenu", 0),
+    spec(b"USER32", b"CreatePopupMenu", 0),
+    spec(b"USER32", b"CreateWindowExA", 48),
+    spec(b"USER32", b"ChangeDisplaySettingsA", 8),
+    spec(b"USER32", b"EnumDisplaySettingsA", 12),
+    spec(b"USER32", b"DefWindowProcA", 16),
+    spec(b"USER32", b"DeleteMenu", 12),
+    spec(b"USER32", b"DestroyMenu", 4),
+    spec(b"USER32", b"DestroyWindow", 4),
+    spec(b"USER32", b"DispatchMessageA", 4),
+    spec(b"USER32", b"DrawAnimatedRects", 16),
+    spec(b"USER32", b"EmptyClipboard", 0),
+    spec(b"USER32", b"EnumClipboardFormats", 4),
+    spec(b"USER32", b"EnumWindows", 8),
+    spec(b"USER32", b"ExitWindowsEx", 8),
+    spec(b"USER32", b"FindWindowA", 8),
+    spec(b"USER32", b"FindWindowExA", 16),
+    spec(b"USER32", b"GetAsyncKeyState", 4),
+    spec(b"USER32", b"GetClassInfoExA", 12),
+    spec(b"USER32", b"GetCursorPos", 4),
+    spec(b"USER32", b"GetDesktopWindow", 0),
+    spec(b"USER32", b"GetForegroundWindow", 0),
+    spec(b"USER32", b"GetKeyState", 4),
+    spec(b"USER32", b"GetKeyboardState", 4),
+    spec(b"USER32", b"GetLastActivePopup", 4),
+    spec(b"USER32", b"GetMenuItemCount", 4),
+    spec(b"USER32", b"GetMenuItemInfoA", 16),
+    spec(b"USER32", b"GetMessageA", 16),
+    spec(b"USER32", b"GetParent", 4),
+    spec(b"USER32", b"GetWindow", 8),
+    spec(b"USER32", b"GetWindowDC", 4),
+    spec(b"USER32", b"GetWindowLongA", 8),
+    spec(b"USER32", b"GetWindowPlacement", 8),
+    spec(b"USER32", b"GetWindowRect", 8),
+    spec(b"USER32", b"GetWindowTextA", 12),
+    spec(b"USER32", b"GetWindowThreadProcessId", 8),
+    spec(b"USER32", b"InsertMenuA", 20),
+    spec(b"USER32", b"IsIconic", 4),
+    spec(b"USER32", b"IsWindow", 4),
+    spec(b"USER32", b"IsWindowVisible", 4),
+    spec(b"USER32", b"IsZoomed", 4),
+    spec(b"USER32", b"LoadIconA", 8),
+    spec(b"USER32", b"LoadStringA", 16),
+    spec(b"USER32", b"MessageBoxA", 16),
+    spec(b"USER32", b"OemToCharA", 8),
+    spec(b"USER32", b"OemToCharBuffA", 12),
+    spec(b"USER32", b"OpenClipboard", 4),
+    spec(b"USER32", b"OpenIcon", 4),
+    spec(b"USER32", b"PeekMessageA", 20),
+    spec(b"USER32", b"PostMessageA", 16),
+    spec(b"USER32", b"PostThreadMessageA", 16),
+    spec(b"USER32", b"RegisterClassExA", 4),
+    spec(b"USER32", b"RegisterWindowMessageA", 4),
+    spec(b"USER32", b"SendMessageA", 16),
+    spec(b"USER32", b"SetClipboardData", 8),
+    spec(b"USER32", b"SetCursorPos", 8),
+    spec(b"USER32", b"SetForegroundWindow", 4),
+    spec(b"USER32", b"SetMenuDefaultItem", 12),
+    spec(b"USER32", b"SetMenuItemInfoA", 16),
+    spec(b"USER32", b"SetWindowLongA", 12),
+    spec(b"USER32", b"SetWindowPlacement", 8),
+    spec(b"USER32", b"ShowWindowAsync", 8),
+    spec(b"USER32", b"SystemParametersInfoA", 16),
+    spec(b"USER32", b"TrackPopupMenu", 28),
+    spec(b"USER32", b"UnregisterClassA", 8),
+    spec(b"USER32", b"keybd_event", 16),
+    spec(b"WININET", b"InternetCloseHandle", 4),
+    spec(b"WININET", b"InternetOpenA", 20),
+    spec(b"WININET", b"InternetOpenUrlA", 24),
+    spec(b"WININET", b"InternetReadFile", 16),
+    spec(b"WINMM", b"mciSendStringA", 16),
+    spec(b"WINMM", b"timeKillEvent", 4),
+    spec(b"WINMM", b"timeSetEvent", 20),
+    spec(b"WSOCK32", b"WSACleanup", 0),
+    spec(b"WSOCK32", b"WSAGetLastError", 0),
+    spec(b"WSOCK32", b"WSASetLastError", 4),
+    spec(b"WSOCK32", b"WSAStartup", 8),
+    spec(b"WSOCK32", b"accept", 12),
+    spec(b"WSOCK32", b"bind", 12),
+    spec(b"WSOCK32", b"closesocket", 4),
+    spec(b"WSOCK32", b"connect", 12),
+    spec(b"WSOCK32", b"gethostbyname", 4),
+    spec(b"WSOCK32", b"getsockname", 12),
+    spec(b"WSOCK32", b"htons", 4),
+    spec(b"WSOCK32", b"inet_addr", 4),
+    spec(b"WSOCK32", b"inet_ntoa", 4),
+    spec(b"WSOCK32", b"listen", 8),
+    spec(b"WSOCK32", b"ntohs", 4),
+    spec(b"WSOCK32", b"recv", 16),
+    spec(b"WSOCK32", b"select", 20),
+    spec(b"WSOCK32", b"send", 16),
+    spec(b"WSOCK32", b"setsockopt", 20),
+    spec(b"WSOCK32", b"shutdown", 8),
+    spec(b"WSOCK32", b"socket", 12),
+    spec(b"MSVCRT", b"__dllonexit", 0),
+    spec(b"MSVCRT", b"_amsg_exit", 0),
+    spec(b"MSVCRT", b"_initterm", 0),
+    spec(b"MSVCRT", b"_lock", 0),
+    spec(b"MSVCRT", b"_onexit", 0),
+    spec(b"MSVCRT", b"_unlock", 0),
+    spec(b"MSVCRT", b"abort", 0),
+    spec(b"MSVCRT", b"calloc", 0),
+    spec(b"MSVCRT", b"free", 0),
+    spec(b"MSVCRT", b"fwrite", 0),
+    spec(b"MSVCRT", b"malloc", 0),
+    spec(b"MSVCRT", b"strcpy", 0),
+    spec(b"MSVCRT", b"strlen", 0),
+    spec(b"MSVCRT", b"strncmp", 0),
+    spec(b"MSVCRT", b"vfprintf", 0),
     spec(b"ADVAPI32", b"AllocateAndInitializeSid", 44),
     spec(b"ADVAPI32", b"EqualSid", 8),
     spec(b"ADVAPI32", b"FreeSid", 4),
@@ -253,7 +493,8 @@ pub(super) fn take_hold(console: &mut Console) -> bool {
 }
 
 pub(super) fn push_key(console: &mut Console, scancode: u8) {
-    if scancode == 0xe0 || console.input.len() >= 64 {
+    if scancode == 0xe0 {
+        console.extended = true;
         return;
     }
     let down = scancode & 0x80 == 0;
@@ -266,12 +507,16 @@ pub(super) fn push_key(console: &mut Console, scancode: u8) {
     if scan == 0x1c {
         ascii = if down { b'\r' } else { 0 };
     }
-    console.input.push(Key {
-        down,
-        ascii,
-        scan,
-        vk: virtual_key(scan, ascii),
-    });
+    let vk = virtual_key(scan, if ascii.is_ascii_control() { 0 } else { ascii });
+    if vk != 0 { console.keys[vk as usize] = if down { 0x80 } else { 0 }; }
+    let control = u32::from(console.keys[0x12] != 0) * 2
+        | u32::from(console.keys[0x11] != 0) * 8
+        | u32::from(console.keys[0x10] != 0) * 16
+        | u32::from(console.extended) * 256;
+    console.extended = false;
+    if console.input.len() < 64 {
+        console.input.push(Key { down, ascii, scan, vk, control });
+    }
 }
 
 /// CreateProcess from the Win32 personality feeds the shared fork/exec
@@ -477,6 +722,12 @@ fn take_word(text: &[u8]) -> Option<(&[u8], &[u8])> {
 
 fn virtual_key(scan: u16, ascii: u8) -> u16 {
     match scan {
+        0x01 => 0x1b,
+        0x0e => 8,
+        0x0f => 9,
+        0x1d => 0x11,
+        0x2a | 0x36 => 0x10,
+        0x38 => 0x12,
         0x1c => 0x0d,
         0x48 => 0x26,
         0x50 => 0x28,
@@ -489,6 +740,9 @@ fn virtual_key(scan: u16, ascii: u8) -> u16 {
         0x53 => 0x2e,
         0x52 => 0x2d,
         0x3b..=0x44 => 0x70 + (scan - 0x3b),
+        0x10..=0x19 => b"QWERTYUIOP"[(scan - 0x10) as usize] as u16,
+        0x1e..=0x26 => b"ASDFGHJKL"[(scan - 0x1e) as usize] as u16,
+        0x2c..=0x32 => b"ZXCVBNM"[(scan - 0x2c) as usize] as u16,
         _ if ascii.is_ascii_alphabetic() => u16::from(ascii.to_ascii_uppercase()),
         _ if ascii != 0 => u16::from(ascii),
         _ => 0,
@@ -499,7 +753,7 @@ pub(super) fn call<A: crate::Arch>(
     machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     state: &mut WindowsState,
-    regs: &Regs,
+    regs: &mut Regs,
     name: &[u8],
 ) -> u32 {
     if name.eq_ignore_ascii_case(b"GetTickCount") {
@@ -905,11 +1159,7 @@ pub(super) fn call<A: crate::Arch>(
     {
         return 0;
     }
-    crate::compact_println!(
-        "Windows: unhandled {}",
-        core::str::from_utf8(name).unwrap_or("api")
-    );
-    0
+    system::call(machine, kt, state, regs, name)
 }
 
 fn tls_alloc(state: &mut WindowsState) -> u32 {
@@ -1261,7 +1511,7 @@ pub(super) fn read_input<A: crate::Arch>(
         machine.write::<u16>(at + 10, key.vk);
         machine.write::<u16>(at + 12, key.scan);
         machine.write::<u16>(at + 14, u16::from(key.ascii));
-        machine.write::<u32>(at + 16, 0);
+        machine.write::<u32>(at + 16, key.control);
     }
     if consume {
         state.console.input.drain(..n);
@@ -1729,3 +1979,7 @@ fn string_type<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 
     }
     1
 }
+
+pub(super) fn thread_stack<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, size: u32) -> u32 { heap_alloc(machine, state, 8, size) }
+
+pub(super) fn thread_stack_free(state: &mut WindowsState, base: u32) { heap_free(state, base); }

@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod pe;
 pub mod ne;
 mod extra;
+mod threads;
 mod win16;
 
 use crate::Regs;
@@ -84,6 +85,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 enum Api {
     CloseHandle,
     CreateEventA,
+    CreateWindowExA,
     CreateFileA,
     ExitProcess,
     FlushFileBuffers,
@@ -241,16 +243,20 @@ struct DeviceContext {
 #[derive(Clone, Copy)]
 struct Callback {
     gate: Gate,
+    module_result: Option<u32>,
 }
 
 pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
     gates: Vec<Gate>,
+    threads: threads::State,
     ldt: Vec<u64>,
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
+    protections: Vec<(u32, u32)>,
     heap_next: u32,
     blocks: Vec<extra::Block>,
+    mappings: Vec<extra::Mapping>,
     tls: [u32; 64],
     tls_mask: u64,
     finds: Vec<extra::Find>,
@@ -277,7 +283,11 @@ pub struct WindowsState {
     classes: Vec<WindowClass>,
     windows: Vec<Window>,
     messages: Vec<Message>,
+    thread_messages: Vec<(u32,Message)>,
+    registered_messages: Vec<(Vec<u8>,u32)>,
+    trampolines: Vec<extra::Bound>,
     callback: Option<Callback>,
+    callback_stack: Vec<Callback>,
     callback_return: u32,
     quit: bool,
     paint_dc: u32,
@@ -298,11 +308,14 @@ impl WindowsState {
         Self {
             environment: extra::windows_environment(&[]),
             gates: Vec::new(),
+            threads: threads::State::default(),
             ldt: vec![0],
             modules: Vec::new(),
             allocations: Vec::new(),
+            protections: Vec::new(),
             heap_next: HEAP_BASE,
             blocks: Vec::new(),
+            mappings: Vec::new(),
             tls: [0; 64],
             tls_mask: 0,
             finds: Vec::new(),
@@ -326,7 +339,11 @@ impl WindowsState {
             classes: Vec::new(),
             windows: Vec::new(),
             messages: Vec::new(),
+            thread_messages: Vec::new(),
+            registered_messages: Vec::new(),
+            trampolines: Vec::new(),
             callback: None,
+            callback_stack: Vec::new(),
             callback_return: 0,
             quit: false,
             paint_dc: 0x20000,
@@ -661,6 +678,66 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
     Ok(())
 }
 
+/// Track explicit protection changes and otherwise use the PE section flags.
+fn memory_protection(state: &WindowsState, address: u32) -> Option<u32> {
+    let page = address & !4095;
+    if let Some(&(_, protection)) = state.protections.iter().find(|&&(p, _)| p == page) {
+        return Some(protection);
+    }
+    for module in &state.modules {
+        let image = pe::Image::parse(&module.data).ok()?;
+        if address >= module.base && address < module.base.checked_add(image.header.size_image)? {
+            for section in image.sections().ok()? {
+                let start = module.base.checked_add(section.rva)?;
+                let end = start.checked_add(section.virtual_size.max(section.raw_size))?;
+                if address >= (start & !4095) && address < end.next_multiple_of(4096) {
+                    let write = section.characteristics & 0x80000000 != 0;
+                    let execute = section.characteristics & 0x20000000 != 0;
+                    return Some(match (write, execute) {
+                        (false, false) => 2, (true, false) => 4,
+                        (false, true) => 0x20, (true, true) => 0x40,
+                    });
+                }
+            }
+            return Some(2);
+        }
+    }
+    if (address >= state.stack_base && address < state.stack_base + state.stack_size)
+        || (address >= HEAP_BASE && address < state.heap_next)
+        || state.allocations.iter().any(|&(base,size)| address >= base && address < base + size)
+    { Some(4) } else { None }
+}
+
+fn protection_flags(protection: u32) -> Option<(bool, bool)> {
+    match protection {
+        2 => Some((false, false)),
+        4 | 8 => Some((true, false)),
+        0x10 | 0x20 => Some((false, true)),
+        0x40 | 0x80 => Some((true, true)),
+        _ => None,
+    }
+}
+
+fn change_protection<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
+                                   address: u32, size: u32, protection: u32) -> Result<u32,u32> {
+    let (write,execute) = protection_flags(protection).ok_or(ERROR_INVALID_PARAMETER)?;
+    let end = address.checked_add(size).filter(|&end| size != 0 && end < USER_LIMIT)
+        .ok_or(ERROR_INVALID_PARAMETER)?;
+    let start = address & !4095;
+    let limit = end.next_multiple_of(4096);
+    let old = memory_protection(state,address).ok_or(487u32)?;
+    for page in (start..limit).step_by(4096) {
+        if memory_protection(state,page).is_none() { return Err(487); }
+    }
+    machine.set_page_flags(start as usize / 4096, ((limit-start)/4096) as usize, write,execute);
+    for page in (start..limit).step_by(4096) {
+        if let Some(entry) = state.protections.iter_mut().find(|entry| entry.0 == page) {
+            entry.1 = protection;
+        } else { state.protections.push((page,protection)); }
+    }
+    Ok(old)
+}
+
 fn resolve_export(module: &Module, symbol: &pe::ImportSymbol) -> Result<u32, i32> {
     let image = pe::Image::parse(&module.data).map_err(|_| 8)?;
     let export = image
@@ -733,6 +810,63 @@ fn apply_imports<A: crate::Arch>(
     Ok(())
 }
 
+/// Map a DLL requested after startup, retaining the process's import gates.
+fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name: &[u8]) -> Result<(u32,Vec<(u32,u32)>),u32> {
+    let file=name.rsplit(|&b|b==b'/' || b==b'\\').next().unwrap_or(name);
+    if let Some(index)=find_module(&state.modules,file) {return Ok((state.modules[index].base,Vec::new()));}
+    let raw=if file.contains(&b'.') {name.to_vec()} else {let mut path=name.to_vec();path.extend_from_slice(b".DLL");path};
+    let path=windows_path(state,&raw,false)?;
+    let (path,data)=match crate::kernel::exec::load_file_resolved(&path) {
+        Ok(data)=>(path,data),
+        Err(_)=>load_dependency(file,&state.modules[0].path).map_err(|_|126u32)?,
+    };
+    let image=pe::Image::parse(&data).map_err(|_|193u32)?;
+    if !image.is_dll() {return Err(193);}
+    let start=state.modules.len();
+    let old_trampolines=state.trampolines.len();
+    let old_gates=state.gates.len();
+    let base=DLL_BASE_FIRST.checked_add((start as u32-1)*DLL_BASE_STRIDE).ok_or(8u32)?;
+    if crate::kernel::startup::trace_enabled() {
+        crate::compact_dbg_println!("[win32-load] {} base={:08x}",core::str::from_utf8(&path).unwrap_or("?"),base);
+    }
+    state.modules.push(Module{name:module_name(file),path,data,base});
+    let result=(|| {
+        let mut index=start;
+        while index<state.modules.len() {
+            let imports=pe::Image::parse(&state.modules[index].data).map_err(|_|193u32)?.imports().map_err(|_|193u32)?;
+            for import in imports {
+                if find_module(&state.modules,&import.module).is_some() {continue;}
+                let (path,data)=load_dependency(&import.module,&state.modules[index].path).map_err(|_|126u32)?;
+                let image=pe::Image::parse(&data).map_err(|_|193u32)?;
+                if !image.is_dll() {return Err(193);}
+                let base=DLL_BASE_FIRST.checked_add((state.modules.len() as u32-1)*DLL_BASE_STRIDE).ok_or(8u32)?;
+                state.modules.push(Module{name:module_name(&import.module),path,data,base});
+            }
+            index+=1;
+        }
+        for module in &state.modules[start..] {map_module(machine,module).map_err(|_|8u32)?;}
+        let old=state.trampolines.len();
+        machine.set_page_flags(TRAMPOLINE as usize/4096,1,true,false);
+        for index in start..state.modules.len() {apply_imports(machine,&state.modules,index,&mut state.trampolines).map_err(|_|127u32)?;}
+        for bound in &state.trampolines[old..] {state.gates.push(Gate{return_ip:bound.address+2,api:Api::Extension,arg_bytes:bound.arg_bytes,name:bound.name});}
+        machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
+        let mut dlls=Vec::new();
+        for module in &state.modules[start..] {
+            protect_module(machine,module).map_err(|_|8u32)?;
+            let image=pe::Image::parse(&module.data).map_err(|_|193u32)?;
+            if image.header.entry_rva!=0 {dlls.push((module.base,module.base+image.header.entry_rva));}
+        }
+        Ok((base,dlls))
+    })();
+    machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
+    if result.is_err() {
+        state.modules.truncate(start);
+        state.trampolines.truncate(old_trampolines);
+        state.gates.truncate(old_gates);
+    }
+    result
+}
+
 /// Guest code that calls each real DLL entry with DLL_PROCESS_ATTACH, then
 /// jumps to the executable. Each DllMain is stdcall and removes its own
 /// arguments, so the stack the executable sees is unchanged.
@@ -741,7 +875,10 @@ fn dll_startup_stub<A: crate::Arch>(
     dlls: &[(u32, u32)],
     exe_entry: u32,
 ) -> Result<u32, i32> {
-    const STUB: u32 = 0x7ff2_0000;
+    dll_startup_stub_at(machine, dlls, exe_entry, 0x7ff2_0000)
+}
+
+fn dll_startup_stub_at<A: crate::Arch>(machine: &mut A, dlls: &[(u32,u32)], exe_entry: u32, stub: u32) -> Result<u32,i32> {
     let mut code = Vec::new();
     for &(base, entry) in dlls {
         code.extend_from_slice(&[0x68, 0, 0, 0, 0]);
@@ -752,16 +889,16 @@ fn dll_startup_stub<A: crate::Arch>(
         code.extend_from_slice(&entry.to_le_bytes());
         code.extend_from_slice(&[0xff, 0xd0]);
     }
-    code.push(0xb8);
+    code.push(0x68);
     code.extend_from_slice(&exe_entry.to_le_bytes());
-    code.extend_from_slice(&[0xff, 0xe0]);
+    code.push(0xc3);
     if code.len() > 4096 {
         return Err(8);
     }
-    machine.zero(STUB as usize, 4096);
-    machine.copy_to(STUB as usize, &code);
-    machine.set_page_flags(STUB as usize / 4096, 1, false, true);
-    Ok(STUB)
+    machine.zero(stub as usize, 4096);
+    machine.copy_to(stub as usize, &code);
+    machine.set_page_flags(stub as usize / 4096, 1, false, true);
+    Ok(stub)
 }
 
 fn export_address(modules: &[Module], module: &[u8], name: &[u8]) -> Result<u32, i32> {
@@ -1196,7 +1333,21 @@ pub fn exec_pe_into<A: crate::Arch>(
             name,
         });
     }
-    for bound in trampolines {
+    // Extension APIs can be ordinary facade exports or import trampolines.
+    // Register facade gates too, so GetProcAddress returns callable exports.
+    for module in &modules {
+        for export in pe::Image::parse(&module.data).map_err(|_| 8)?.exports().map_err(|_| 8)? {
+            if let Some(spec) = extra::lookup(&module.name, &export.name) {
+                state.gates.push(Gate {
+                    return_ip: module.base + export.rva + 2,
+                    api: Api::Extension,
+                    arg_bytes: spec.arg_bytes,
+                    name: spec.name,
+                });
+            }
+        }
+    }
+    for bound in &trampolines {
         state.gates.push(Gate {
             return_ip: bound.address + 2,
             api: Api::Extension,
@@ -1205,9 +1356,17 @@ pub fn exec_pe_into<A: crate::Arch>(
         });
     }
     state.callback_return = export_address(&modules, b"USER32", b"RetroWndProcReturn").unwrap_or(0);
+    if state.callback_return == 0 {
+        state.callback_return=0x7ff6_0000;
+        machine.zero(state.callback_return as usize,4096);
+        machine.copy_to(state.callback_return as usize,&[0xcd,0x83]);
+        machine.set_page_flags(state.callback_return as usize/4096,1,false,true);
+        state.gates.push(Gate{return_ip:state.callback_return+2,api:Api::RetroWndProcReturn,arg_bytes:0,name:b"RetroWndProcReturn"});
+    }
     if main_header.subsystem == 3 {
         extra::open_console(&mut state);
     }
+    state.trampolines = trampolines;
     state.modules = modules;
     state.on_resume(machine);
     current.personality = thread::Personality::Windows(state);
@@ -1449,7 +1608,7 @@ fn begin_wndproc<A: crate::Arch>(
     machine.write::<u32>(sp as usize + 8, message.message);
     machine.write::<u32>(sp as usize + 12, message.wparam);
     machine.write::<u32>(sp as usize + 16, message.lparam);
-    state.callback = Some(Callback { gate });
+    state.callback = Some(Callback { gate, module_result: None });
     regs.frame.rsp = sp;
     regs.frame.rip = window.wndproc as u64;
     true
@@ -1741,13 +1900,17 @@ fn dispatch<A: crate::Arch>(
                 return fail(state, ERROR_INVALID_HANDLE, INVALID_HANDLE_VALUE);
             };
             let high_ptr = arg(machine, regs, 2) as usize;
-            if high_ptr != 0 && machine.read::<u32>(high_ptr) != 0 {
+            let low = arg(machine, regs, 1);
+            let offset = if high_ptr == 0 {
+                i64::from(low as i32)
+            } else {
+                (i64::from(machine.read::<i32>(high_ptr)) << 32) | i64::from(low)
+            };
+            let Ok(offset) = i32::try_from(offset) else {
                 return fail(state, ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE);
-            }
+            };
             let pos = crate::kernel::vfs::seek_by_handle(
-                vh,
-                arg(machine, regs, 1) as i32,
-                arg(machine, regs, 3) as i32,
+                vh, offset, arg(machine, regs, 3) as i32,
             );
             if pos < 0 {
                 fail(state, ERROR_INVALID_PARAMETER, INVALID_HANDLE_VALUE)
@@ -1776,8 +1939,13 @@ fn dispatch<A: crate::Arch>(
                 state.heap_next = end;
             }
             machine.zero(base as usize, size as usize);
-            machine.set_page_flags(base as usize / 4096, size as usize / 4096, true, false);
+            let protection = arg(machine,regs,3);
+            let Some((write,execute)) = protection_flags(protection) else {
+                return fail(state, ERROR_INVALID_PARAMETER, 0);
+            };
+            machine.set_page_flags(base as usize / 4096, size as usize / 4096, write, execute);
             state.allocations.push((base, size));
+            for page in (base..end).step_by(4096) { state.protections.push((page,protection)); }
             base
         }
         Api::VirtualFree => {
@@ -1805,6 +1973,11 @@ fn dispatch<A: crate::Arch>(
                     .find(|&&(base, size)| address >= base && address < base + size)
                 {
                     (base, size)
+                } else if let Some(module) = state.modules.iter().find(|module| {
+                    pe::Image::parse(&module.data).is_ok_and(|image|
+                        address >= module.base && address < module.base + image.header.size_image)
+                }) {
+                    (module.base,pe::Image::parse(&module.data).unwrap().header.size_image)
                 } else {
                     (address & !4095, 4096)
                 };
@@ -1813,7 +1986,7 @@ fn dispatch<A: crate::Arch>(
             machine.write::<u32>(out + 8, 0x04);
             machine.write::<u32>(out + 12, size);
             machine.write::<u32>(out + 16, 0x1000);
-            machine.write::<u32>(out + 20, 0x04);
+            machine.write::<u32>(out + 20, memory_protection(state,address).unwrap_or(0));
             machine.write::<u32>(out + 24, 0x20000);
             28
         }
@@ -1851,7 +2024,35 @@ fn dispatch<A: crate::Arch>(
                     Err(e) => return fail(state, e, 0),
                 }
             };
-            resolve_export(module, &symbol).unwrap_or_else(|_| fail(state, 127, 0))
+            let module_name = module.name.clone();
+            let result = match resolve_export(module, &symbol) {
+                Ok(address) => address,
+                Err(_) => {
+                    let spec = match &symbol {
+                        pe::ImportSymbol::Name(name) => extra::lookup(&module_name,name),
+                        _ => None,
+                    };
+                    if let Some(spec) = spec {
+                        if let Some(bound) = state.trampolines.iter().find(|b| b.name == spec.name) {
+                            bound.address
+                        } else if state.trampolines.len() < 2048 {
+                            let address = TRAMPOLINE + state.trampolines.len() as u32 * 2;
+                            machine.set_page_flags(TRAMPOLINE as usize/4096,1,true,false);
+                            machine.copy_to(address as usize,&[0xcd,0x83]);
+                            machine.set_page_flags(TRAMPOLINE as usize/4096,1,false,true);
+                            state.trampolines.push(extra::Bound{name:spec.name,address,arg_bytes:spec.arg_bytes});
+                            state.gates.push(Gate{return_ip:address+2,api:Api::Extension,name:spec.name,arg_bytes:spec.arg_bytes});
+                            address
+                        } else { fail(state,8,0) }
+                    } else { fail(state,127,0) }
+                }
+            };
+            if crate::kernel::startup::trace_enabled() {
+                if let pe::ImportSymbol::Name(name) = &symbol {
+                    crate::compact_dbg_println!("[win32-proc] {}!{}={:08x}",core::str::from_utf8(&module_name).unwrap_or("?"),core::str::from_utf8(name).unwrap_or("?"),result);
+                }
+            }
+            result
         }
         Api::GetModuleFileNameA => {
             let module = arg(machine, regs, 0);
@@ -2039,12 +2240,12 @@ fn dispatch<A: crate::Arch>(
             }
             state.classes.len() as u32
         }
-        Api::CreateWindowExW => {
+        Api::CreateWindowExW | Api::CreateWindowExA => {
             let class_ptr = arg(machine, regs, 1);
             let class = if class_ptr <= 0xffff {
                 state.classes.first()
             } else {
-                let name = match w_string(machine, class_ptr) {
+                let name = match if api==Api::CreateWindowExA {c_string(machine,class_ptr)} else {w_string(machine, class_ptr)} {
                     Ok(v) => v,
                     Err(_) => return 0,
                 };
@@ -2552,7 +2753,7 @@ pub fn handle_event<A: crate::Arch>(
         return action;
     }
     match event {
-        crate::KernelEvent::Irq => thread::KernelAction::Done,
+        crate::KernelEvent::Irq => { threads::schedule(machine,state,regs); thread::KernelAction::Done },
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = state
                 .gates
@@ -2563,6 +2764,22 @@ pub fn handle_event<A: crate::Arch>(
                 crate::compact_println!("Windows: invalid API gate at {:#x}", regs.ip32());
                 return thread::KernelAction::Exit(-1);
             };
+            if let Some(action) = threads::call(machine,state,regs,gate) { return action; }
+            if gate.api == Api::LoadLibraryA {
+                let name=match c_string(machine,arg(machine,regs,0)) {Ok(name)=>name,Err(error)=>{let result=fail(state,error,0);finish(machine,regs,gate,result);return thread::KernelAction::Done;}};
+                match load_library(machine,state,&name) {
+                    Ok((base,dlls)) if !dlls.is_empty() => {
+                        let stub=0x7ff5_0000 + (state.modules.len() as u32)*4096;
+                        match dll_startup_stub_at(machine,&dlls,state.callback_return,stub) {
+                            Ok(entry)=>{if let Some(outer)=state.callback.take() {state.callback_stack.push(outer);} state.callback=Some(Callback{gate,module_result:Some(base)});regs.set_ip32(entry);},
+                            Err(_)=>{let result=fail(state,8,0);finish(machine,regs,gate,result);},
+                        }
+                    }
+                    Ok((base,_))=>finish(machine,regs,gate,base),
+                    Err(error)=>{let result=fail(state,error,0);finish(machine,regs,gate,result);},
+                }
+                return thread::KernelAction::Done;
+            }
             if gate.api == Api::ExitProcess {
                 return thread::KernelAction::Exit(arg(machine, regs, 0) as i32);
             }
@@ -2575,11 +2792,14 @@ pub fn handle_event<A: crate::Arch>(
                     crate::compact_dbg_println!("Windows: stray WNDPROC return");
                     return thread::KernelAction::Exit(-1);
                 };
-                let result = regs.rax as u32;
+                let result = callback.module_result.map_or(regs.rax as u32, |base| {
+                    if regs.rax == 0 { fail(state,1114,0) } else { base }
+                });
+                state.callback=state.callback_stack.pop();
                 finish(machine, regs, callback.gate, result);
                 return thread::KernelAction::Done;
             }
-            if gate.api == Api::DispatchMessageW {
+            if gate.api == Api::DispatchMessageW || gate.name==b"DispatchMessageA" {
                 let msg = arg(machine, regs, 0) as usize;
                 let message = Message {
                     hwnd: machine.read::<u32>(msg),
@@ -2612,13 +2832,25 @@ pub fn handle_event<A: crate::Arch>(
             } else {
                 dispatch(machine, kt, state, regs, gate.api)
             };
+            if crate::kernel::startup::trace_enabled() && matches!(gate.name,
+                b"CreateFileA" | b"FindFirstFileA" | b"LoadStringA" | b"CreateThread" | b"GetLastError" | b"SetFilePointer") {
+                crate::compact_dbg_println!("[win32-result] {} arg0={:08x} arg1={:08x} result={:08x} error={}",
+                    core::str::from_utf8(gate.name).unwrap_or("?"), arg(machine,regs,0),arg(machine,regs,1),result,state.last_error);
+                if matches!(gate.name,b"CreateFileA" | b"FindFirstFileA") {
+                    if let Ok(path)=c_string(machine,arg(machine,regs,0)) {
+                        crate::compact_dbg_println!("[win32-path] {}",core::str::from_utf8(&path).unwrap_or("?"));
+                    }
+                }
+            }
             if extra::take_hold(&mut state.console) {
                 // INT advances EIP past its two-byte gate before the handler
                 // runs. Retry the same call once input becomes available.
                 regs.frame.rip -= 2;
+                threads::schedule(machine,state,regs);
                 return thread::KernelAction::Done;
             }
             finish(machine, regs, gate, result);
+            threads::schedule(machine,state,regs);
             thread::KernelAction::Done
         }
         crate::KernelEvent::PageFault { .. } => {

@@ -171,6 +171,8 @@ run dpmi_hx      -         env ENGINE=tcg bash test/dpmi_hx.sh
 run xms          -         env ENGINE=tcg bash test/xms.sh
 run ems          -         env ENGINE=tcg python3 test/ems.py
 run dpmi_vif     -         env ENGINE=tcg bash test/dpmi_vif.sh
+run windows_threads hosted_tsr env ENGINE=tcg python3 test/windows_threads.py
+run dpmi_rm_exception hosted_tsr env ENGINE=tcg python3 test/dpmi_rm_exception.py
 run dpmi_hdpmi_pvi freedos_hdd bash test/dpmi_hdpmi_pvi.sh
 run hosted_games_kvm kvm   env ENGINE=kvm bash test/hosted_games.sh
 run lfn_kvm      kvm       env ENGINE=kvm python3 test/lfn.py
@@ -178,6 +180,8 @@ run dpmi_hx_kvm  kvm       env ENGINE=kvm bash test/dpmi_hx.sh
 run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh
 run ems_kvm      kvm       env ENGINE=kvm python3 test/ems.py
 run dpmi_vif_kvm kvm       env ENGINE=kvm bash test/dpmi_vif.sh
+run windows_threads_kvm kvm env ENGINE=kvm python3 test/windows_threads.py
+run dpmi_rm_exception_kvm kvm env ENGINE=kvm python3 test/dpmi_rm_exception.py
 # --- KVM differential: needs /dev/kvm --------------------------------------
 run hosted_diff  kvm       bash test/hosted_diff.sh
 run unit_kvm     kvm       unit_kvm

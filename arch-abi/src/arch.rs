@@ -155,7 +155,7 @@ pub trait Arch: Sized + GuestBytes {
     /// empty placeholder a switch leaves behind in a now-running thread's slot.
     type PageTable: Default;
     /// Backend FPU/SSE save area (FXSAVE blob on metal; host snapshot on interp).
-    type Fx: Copy + Default;
+    type Fx: Copy + Default + 'static;
 
     // ── Port I/O ───────────────────────────────────────────────────────────
 

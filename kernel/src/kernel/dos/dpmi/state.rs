@@ -60,9 +60,8 @@ pub struct DpmiState {
     /// Physical mappings made by INT 31h/0800h and owned by this client.
     pub(super) phys_mappings: [Option<PhysicalMapping>; MAX_PHYS_MAPPINGS],
     /// DPMI 0.9 exception handler vectors (set via INT 31h/0203H).
-    /// A 0.9 handler covers BOTH PM-origin and VM86-origin faults for
-    /// the vector; it serves as the fallback whenever the matching
-    /// 1.0-specific table below has slot (0, 0).
+    /// Applies to protected-mode faults only; serves as the fallback when
+    /// the protected-mode 1.0 table below has slot (0, 0).
     pub(super) exc_vectors: [(u16, u32); NUM_EXCEPTION_VECTORS],
     /// DPMI 1.0 protected-mode exception handler vectors (set via
     /// INT 31h/0212H). Consulted first when a fault originated in PM
@@ -70,7 +69,7 @@ pub struct DpmiState {
     pub(super) pm_exc_vectors: [(u16, u32); NUM_EXCEPTION_VECTORS],
     /// DPMI 1.0 real-mode exception handler vectors (set via INT
     /// 31h/0213H). Consulted first when a fault originated in VM86
-    /// (`from_vm86 == true`); takes precedence over the 0.9 fallback.
+    /// (`from_vm86 == true`); otherwise the real-mode IVT is used.
     /// Per DPMI 1.0 §6.1.4 the handler runs in PM with an implied
     /// mode switch — the selector:offset is a PM target, not a real
     /// segment:offset.

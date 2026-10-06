@@ -1058,10 +1058,8 @@ fn handle_event_inner<A: crate::Arch>(
                 };
             }
 
-            // DPMI session active: route to client's exception handler
-            // regardless of current mode. enter_pm handles the
-            // VM86→PM toggle if needed; save.restore puts us back in
-            // VM86 on the unwind.
+            // DPMI dispatch selects the PM exception handler or the RM
+            // handler/IVT according to the mode where the fault occurred.
             if dos.dpmi.is_some() {
                 // A #GP reflected to a PM client is almost always a segment
                 // limit the client thinks is wider than it is — the Glide
@@ -2182,12 +2180,16 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
         return;
     }
     let selector = regs.code_seg();
-    let (base, limit) = match dpmi::valid_ldt_selector_idx(&dos.ldt_alloc, selector) {
-        Some(idx) => {
-            let descriptor = dos.ldt[idx];
-            (dpmi::desc_base(descriptor), dpmi::desc_limit(descriptor))
+    let (base, limit) = if regs.mode() == crate::UserMode::VM86 {
+        (u32::from(selector) << 4, 0xFFFF)
+    } else {
+        match dpmi::valid_ldt_selector_idx(&dos.ldt_alloc, selector) {
+            Some(idx) => {
+                let descriptor = dos.ldt[idx];
+                (dpmi::desc_base(descriptor), dpmi::desc_limit(descriptor))
+            }
+            None => (A::seg_base(selector), 0),
         }
-        None => (A::seg_base(selector), 0),
     };
     let ip = regs.ip32();
     let linear = base.wrapping_add(ip);
@@ -2196,7 +2198,7 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
     let mut preceding = [0u8; 8];
     machine.copy_from(linear.wrapping_sub(preceding.len() as u32) as usize, &mut preceding);
     crate::compact_println!(
-        "[#UD] cs={:04x}:{:#x} linear={:#x} limit={:#x} bytes={:02x?} before={:02x?}",
-        selector, ip, linear, limit, &bytes[..], &preceding[..]
+        "[#UD] vm86={} cs={:04x}:{:#x} linear={:#x} limit={:#x} bytes={:02x?} before={:02x?}",
+        regs.mode() == crate::UserMode::VM86, selector, ip, linear, limit, &bytes[..], &preceding[..]
     );
 }

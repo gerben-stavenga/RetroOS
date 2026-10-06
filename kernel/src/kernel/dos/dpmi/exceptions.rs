@@ -185,26 +185,32 @@ pub(in crate::kernel::dos) fn dispatch_dpmi_exception<A: crate::Arch>(machine: &
         }
     };
 
-    // Lookup precedence: a DPMI 1.0 mode-specific handler (0212H for
-    // PM-origin, 0213H for VM86-origin) takes priority; the 0.9 0203H
-    // handler is the fallback if no 1.0 handler is installed. The 0.9
-    // handler covers both origins by spec, so this gives 1.0 clients
-    // mode-specific routing without losing 0.9-compat for vectors that
-    // only have the legacy install.
+    // DPMI 0203H handlers cover protected-mode exceptions only. A real-mode
+    // fault uses an explicit 0213H handler or the real-mode IVT, including
+    // when it occurs inside a client's 0300H/0301H/0302H call.
     let from_vm86 = regs.mode() == crate::UserMode::VM86;
     let (handler_sel, handler_off) = if (exc_num as usize) < 32 {
         let n = exc_num as usize;
-        let v10 = if from_vm86 {
+        if from_vm86 {
             dpmi.rm_exc_vectors[n]
         } else {
-            dpmi.pm_exc_vectors[n]
-        };
-        if v10 != (0, 0) { v10 } else { dpmi.exc_vectors[n] }
+            let v10 = dpmi.pm_exc_vectors[n];
+            if v10 != (0, 0) { v10 } else { dpmi.exc_vectors[n] }
+        }
     } else {
         (0, 0)
     };
 
     if handler_sel == 0 && handler_off == 0 {
+        if from_vm86 && matches!(exc_num, 0..=7 | 16 | 17 | 19)
+            && machine.read::<u16>(exc_num as usize * 4 + 2) != dos::STUB_SEG
+        {
+            // A guest-installed RM handler can recover from the fault using
+            // the ordinary 16-bit interrupt frame. NDN probes Virtual PC
+            // with an illegal instruction and advances IP in its INT 6 hook.
+            arch_abi::monitor::sw_reflect_vm86_int(regs, machine, exc_num as u8);
+            return thread::KernelAction::Done;
+        }
         // Per DPMI 0.9: software-INT exceptions (0/3/4 = #DE/#BP/#OF) reflect
         // to the real-mode IVT when the client has not installed a handler —
         // dpmiload uses INT 3 as "halt on error" and expects the real-mode

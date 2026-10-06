@@ -55,7 +55,7 @@ def _windows_dll_impl(ctx):
             "option modname=%s" % ctx.attr.module_name,
             "name %s" % output.path,
             "file %s" % obj.path,
-        ] + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
+        ] + (["option start=%s" % ctx.attr.entry] if ctx.attr.entry else []) + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
     )
     ctx.actions.run(
         executable = ctx.executable._linker,
@@ -75,6 +75,7 @@ windows_dll = rule(
         "out": attr.output(mandatory = True),
         "module_name": attr.string(mandatory = True),
         "exports": attr.string_list(mandatory = True),
+        "entry": attr.string(),
         "_linker": attr.label(
             default = "@open_watcom//:binl64/wlink",
             allow_single_file = True,
