@@ -194,7 +194,7 @@ def _os2_dll_impl(ctx):
             "option modname=%s" % ctx.attr.module_name,
             "name %s" % output.path,
             "file %s" % obj.path,
-        ] + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
+        ] + (["option start=" + ctx.attr.entry] if ctx.attr.entry else []) + ["import %s %s" % (symbol, target) for symbol, target in sorted(ctx.attr.imports.items())] + ["export %s" % symbol for symbol in ctx.attr.exports]) + "\n",
     )
     ctx.actions.run(
         executable = ctx.executable._linker,
@@ -217,6 +217,8 @@ os2_dll = rule(
         "out": attr.output(mandatory = True),
         "module_name": attr.string(mandatory = True),
         "exports": attr.string_list(mandatory = True),
+        "entry": attr.string(),
+        "imports": attr.string_dict(),
         "_linker": attr.label(
             default = "@open_watcom//:binl64/wlink",
             allow_single_file = True,

@@ -1,0 +1,20 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "msg_obj",
+    srcs = ["msg.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "msg_dll",
+    obj = ":msg_obj",
+    out = "MSG.DLL",
+    module_name = "MSG",
+    exports = [
+        "DosTrueGetMessage.6",
+        "DosIQueryMessageCP.8",
+    ],
+    visibility = ["//visibility:public"],
+)

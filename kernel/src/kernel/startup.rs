@@ -2972,9 +2972,25 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             crate::kernel::kpipe::add_reader(cpipe);
         }
         thread::Personality::Os2(os2) => {
-            let n = parent_cwd_len.min(os2.cwd.len());
-            os2.cwd[..n].copy_from_slice(&parent_cwd_buf[..n]);
-            os2.cwd_len = n;
+            // DOS keeps its cwd as "C:DIR"; OS/2 uses canonical VFS paths.
+            let inherited = if let Some(cwd) = cwd_override.as_ref() {
+                Some(cwd.clone())
+            } else if parent_is_dos && parent_cwd_len >= 2 {
+                let mut dos_path = alloc::vec![parent_cwd_buf[0], b':', b'\\'];
+                dos_path.extend(parent_cwd_buf[2..parent_cwd_len].iter().map(
+                    |&b| if b == b'/' { b'\\' } else { b },
+                ));
+                crate::kernel::dos::windows_abs_to_vfs(&dos_path, false)
+            } else if parent_is_dos {
+                None
+            } else {
+                Some(parent_cwd_buf[..parent_cwd_len].to_vec())
+            };
+            if let Some(cwd) = inherited {
+                let n = cwd.len().min(os2.cwd.len());
+                os2.cwd[..n].copy_from_slice(&cwd[..n]);
+                os2.cwd_len = n;
+            }
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
             child.kernel.fds[1] = thread::FdKind::ConsoleOut;

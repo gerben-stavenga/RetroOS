@@ -1,0 +1,21 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "pmwp_obj",
+    srcs = ["pmwp.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "pmwp_dll",
+    obj = ":pmwp_obj",
+    out = "PMWP.DLL",
+    module_name = "PMWP",
+    exports = [
+        "WinQueryObject.252",
+        "WinCreateObject.281",
+        "WinOpenObject.286",
+    ],
+    visibility = ["//visibility:public"],
+)

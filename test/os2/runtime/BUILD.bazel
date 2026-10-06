@@ -1,0 +1,9 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_watcom_binary", "os2_dll")
+os2_watcom_binary(name = "runtime", src = "runtime.c")
+nasm_library(name = "probe_obj", srcs = ["probe.asm"], copts = ["-fobj"])
+os2_dll(
+    name = "probe_dll", obj = ":probe_obj", out = "PROBE.DLL",
+    module_name = "PROBE", entry = "DllEntry", exports = ["Probe.1"],
+    imports = {"DosGetNamedSharedMem": "DOSCALLS.301"},
+)

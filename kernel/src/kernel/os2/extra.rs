@@ -1,0 +1,1003 @@
+//! OS/2 filesystem and mixed 16/32-bit console services.
+use super::*;
+use crate::kernel::vfs;
+
+pub(super) struct Find {
+    pub handle: u32,
+    pub entries: Vec<vfs::DirEntry>,
+    pub next: usize,
+    pub level: u32,
+}
+pub(super) struct Video {
+    pub cols: u16,
+    pub rows: u16,
+    pub cells: Vec<u8>,
+    pub x: u16,
+    pub y: u16,
+    pub cursor: [u16; 4],
+    pub buffer: u32,
+    pub selector: u16,
+    pub hwnd: u32,
+}
+impl Video {
+    pub fn new() -> Self {
+        Self {
+            cols: 80,
+            rows: 25,
+            cells: vec![0; 4000],
+            x: 0,
+            y: 0,
+            cursor: [14, 15, 1, 0],
+            buffer: 0,
+            selector: 0,
+            hwnd: 0,
+        }
+    }
+}
+pub(super) fn shift_state() -> u16 {
+    use crate::kernel::keyboard::key_down;
+    u16::from(key_down(0x36))
+        | (u16::from(key_down(0x2a)) << 1)
+        | (u16::from(key_down(0x1d)) << 2)
+        | (u16::from(key_down(0x38)) << 3)
+}
+fn word<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> u16 {
+    m.read::<u16>(stack_linear(s, r) + 4 + off)
+}
+fn pointer<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> usize {
+    selector_base(s, word(m, s, r, off + 2))
+        .unwrap_or(0)
+        .wrapping_add(word(m, s, r, off) as u32) as usize
+}
+pub(super) fn kbd<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
+    let out = pointer(m, s, r, if ordinal == 4 { 4 } else { 2 });
+    match ordinal {
+        10 => {
+            m.write::<u16>(out, 10);
+            m.write::<u16>(out + 2, s.kbd_mask);
+            m.write::<u16>(out + 4, 13);
+            m.write::<u16>(out + 6, 0);
+            m.write::<u16>(out + 8, shift_state());
+        }
+        11 => {
+            s.kbd_mask = m.read::<u16>(out + 2);
+        }
+        4 | 22 => {
+            if ordinal == 4 && s.keys.is_empty() && word(m, s, r, 2) == 0 {
+                s.wait_key = true;
+                return u32::MAX;
+            }
+            s.wait_key = false;
+            m.zero(out, 10);
+            if let Some(&(ascii, scan, shift)) = s.keys.first() {
+                m.write::<u8>(out, ascii);
+                m.write::<u8>(out + 1, scan);
+                m.write::<u8>(out + 2, 0x40);
+                m.write::<u16>(out + 4, shift);
+                if ordinal == 4 {
+                    s.keys.remove(0);
+                }
+            } else {
+                m.write::<u16>(out + 4, shift_state());
+            }
+        }
+        _ => return ERROR_INVALID_FUNCTION,
+    }
+    NO_ERROR
+}
+fn paint(s: &mut Os2State) {
+    let width = s.video.cols as u32 * 8;
+    let height = s.video.rows as u32 * 16;
+    if s.video.hwnd == 0 {
+        s.video.hwnd = create_pm_window(s, b"", 0, width, height, true);
+    }
+    let window = s
+        .pm_windows
+        .iter_mut()
+        .find(|w| w.hwnd == s.video.hwnd)
+        .unwrap();
+    window.width = width;
+    window.height = height;
+    window
+        .pixels
+        .resize(width as usize * height as usize * 4, 0);
+    const COLORS: [u32; 16] = [
+        0, 0x0000aa, 0x00aa00, 0x00aaaa, 0xaa0000, 0xaa00aa, 0xaa5500, 0xaaaaaa, 0x555555,
+        0x5555ff, 0x55ff55, 0x55ffff, 0xff5555, 0xff55ff, 0xffff55, 0xffffff,
+    ];
+    for y in 0..s.video.rows as usize {
+        for x in 0..s.video.cols as usize {
+            let at = (y * s.video.cols as usize + x) * 2;
+            let character = s.video.cells[at] as usize;
+            let attr = s.video.cells[at + 1];
+            let glyph = &lib::vga_fonts::FONT_8X16[character * 16..character * 16 + 16];
+            for (row, &bits) in glyph.iter().enumerate() {
+                for col in 0..8 {
+                    let color = COLORS[if bits & (0x80 >> col) != 0 {
+                        (attr & 15) as usize
+                    } else {
+                        (attr >> 4) as usize
+                    }];
+                    let pixel = ((y * 16 + row) * width as usize + x * 8 + col) * 4;
+                    window.pixels[pixel..pixel + 4].copy_from_slice(&color.to_le_bytes());
+                }
+            }
+        }
+    }
+    s.pm_dirty = true;
+    crate::term::term().blit_cells(
+        s.video.cols as usize,
+        s.video.rows as usize,
+        &s.video.cells,
+        s.video.x as usize,
+        s.video.y as usize,
+    );
+    crate::kernel::term::mark_dirty();
+}
+fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) -> u32 {
+    let out = pointer(m, s, r, 2);
+    match ordinal {
+        1 => {}
+        9 => {
+            m.write::<u16>(out, s.video.x);
+            let row = pointer(m, s, r, 6);
+            m.write::<u16>(row, s.video.y);
+        }
+        15 => {
+            s.video.x = word(m, s, r, 2);
+            s.video.y = word(m, s, r, 4);
+            paint(s);
+        }
+        21 => {
+            let cb = m.read::<u16>(out) as usize;
+            let mut bytes = [0u8; 34];
+            bytes[..2].copy_from_slice(&34u16.to_le_bytes());
+            bytes[2] = 1;
+            bytes[3] = 4;
+            bytes[4..6].copy_from_slice(&s.video.cols.to_le_bytes());
+            bytes[6..8].copy_from_slice(&s.video.rows.to_le_bytes());
+            bytes[8..10].copy_from_slice(&(s.video.cols * 8).to_le_bytes());
+            bytes[10..12].copy_from_slice(&(s.video.rows * 16).to_le_bytes());
+            bytes[13] = 1;
+            bytes[18..22].copy_from_slice(&(s.video.cells.len() as u32).to_le_bytes());
+            m.copy_to(out, &bytes[..cb.min(bytes.len())]);
+        }
+        22 => {
+            let cols = m.read::<u16>(out + 4);
+            let rows = m.read::<u16>(out + 6);
+            if !(1..=160).contains(&cols) || !(1..=100).contains(&rows) {
+                return ERROR_INVALID_PARAMETER;
+            }
+            s.video.cols = cols;
+            s.video.rows = rows;
+            s.video.cells.resize(cols as usize * rows as usize * 2, 0);
+            paint(s);
+        }
+        27 => {
+            for (i, &value) in s.video.cursor.iter().enumerate() {
+                m.write::<u16>(out + i * 2, value);
+            }
+        }
+        32 => {
+            for i in 0..4 {
+                s.video.cursor[i] = m.read::<u16>(out + i * 2);
+            }
+        }
+        31 => {
+            if s.video.buffer == 0 {
+                let base = s.heap_next;
+                s.heap_next += 0x10000;
+                m.zero(base as usize, 0x10000);
+                m.set_page_flags(base as usize / 4096, 16, true, false);
+                s.video.buffer = base;
+                s.video.selector = push_descriptor(&mut s.ldt, base, 65536, false, false);
+                s.on_resume(m);
+            }
+            let address = pointer(m, s, r, 6);
+            m.write::<u32>(address, (s.video.selector as u32) << 16);
+            m.write::<u16>(out, s.video.cells.len() as u16);
+        }
+        43 => {
+            let off = word(m, s, r, 4) as usize;
+            let length = word(m, s, r, 2) as usize;
+            if off + length > s.video.cells.len() {
+                return ERROR_INVALID_PARAMETER;
+            }
+            m.copy_from(
+                s.video.buffer as usize + off,
+                &mut s.video.cells[off..off + length],
+            );
+            paint(s);
+        }
+        46 => {
+            let out = pointer(m, s, r, 2);
+            let cb = m.read::<u16>(out) as usize;
+            let mut data = [0u8; 32];
+            data[..2].copy_from_slice(&32u16.to_le_bytes());
+            data[2..4].copy_from_slice(&3u16.to_le_bytes());
+            data[4..6].copy_from_slice(&3u16.to_le_bytes());
+            data[6..10].copy_from_slice(&262144u32.to_le_bytes());
+            m.copy_to(out, &data[..cb.min(32)]);
+        }
+        11 => {
+            let status = pointer(m, s, r, 2);
+            m.write::<u16>(status, 0);
+        }
+        19 => {
+            let n = word(m, s, r, 2) as usize;
+            let text = pointer(m, s, r, 4);
+            let mut bytes = vec![0; n];
+            m.copy_from(text, &mut bytes);
+            for b in bytes {
+                crate::term::putchar(b);
+            }
+            crate::kernel::term::mark_dirty();
+        }
+        49 | 51 => return ERROR_INVALID_FUNCTION,
+        26 => {
+            let col = word(m, s, r, 2) as usize;
+            let row = word(m, s, r, 4) as usize;
+            let count = word(m, s, r, 6) as usize;
+            let attribute = m.read::<u8>(pointer(m, s, r, 8));
+            let start = row * s.video.cols as usize + col;
+            let end = (start + count).min(s.video.cells.len() / 2);
+            if start > end {
+                return 87;
+            }
+            for cell in start..end {
+                s.video.cells[cell * 2 + 1] = attribute;
+            }
+            if s.video.buffer != 0 {
+                m.copy_to(s.video.buffer as usize, &s.video.cells);
+            }
+            paint(s);
+        }
+        7 => {
+            let fill = pointer(m, s, r, 2);
+            let cell = m.read::<u16>(fill).to_le_bytes();
+            let count = word(m, s, r, 6) as usize;
+            let right = word(m, s, r, 8).min(s.video.cols - 1) as usize;
+            let bottom = word(m, s, r, 10).min(s.video.rows - 1) as usize;
+            let left = word(m, s, r, 12) as usize;
+            let top = word(m, s, r, 14) as usize;
+            if left > right || top > bottom {
+                return 87;
+            }
+            let cols = s.video.cols as usize;
+            for row in top..=bottom {
+                for col in left..=right {
+                    let dest = (row * cols + col) * 2;
+                    if row + count <= bottom {
+                        let source = ((row + count) * cols + col) * 2;
+                        s.video.cells.copy_within(source..source + 2, dest);
+                    } else {
+                        s.video.cells[dest..dest + 2].copy_from_slice(&cell);
+                    }
+                }
+            }
+            if s.video.buffer != 0 {
+                m.copy_to(s.video.buffer as usize, &s.video.cells);
+            }
+            paint(s);
+        }
+        _ => return ERROR_INVALID_FUNCTION,
+    }
+    NO_ERROR
+}
+pub(super) fn alloc_shared<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs) -> u32 {
+    let name = arg32(m, r, 1);
+    let result = alloc_os2_memory(m, s, arg32(m, r, 0) as usize, arg32(m, r, 2));
+    if result == 0 && name != 0 {
+        if let Ok(mut name) = c_string(m, name) {
+            name.make_ascii_uppercase();
+            s.shared
+                .push((name, m.read::<u32>(arg32(m, r, 0) as usize)));
+        }
+    }
+    result
+}
+pub(super) fn get_shared<A: crate::Arch>(m: &mut A, s: &Os2State, r: &Regs) -> u32 {
+    let Ok(mut name) = c_string(m, arg32(m, r, 1)) else {
+        return ERROR_INVALID_PARAMETER;
+    };
+    name.make_ascii_uppercase();
+    let Some((_, address)) = s.shared.iter().find(|(n, _)| *n == name) else {
+        return ERROR_FILE_NOT_FOUND;
+    };
+    m.write::<u32>(arg32(m, r, 0) as usize, *address);
+    NO_ERROR
+}
+fn copy_string<A: crate::Arch>(m: &mut A, out: usize, cap: usize, bytes: &[u8]) -> u32 {
+    if cap <= bytes.len() {
+        return 111;
+    }
+    m.copy_to(out, bytes);
+    m.write::<u8>(out + bytes.len(), 0);
+    NO_ERROR
+}
+fn current_dos(s: &Os2State) -> Vec<u8> {
+    let root = crate::kernel::dos::c_root();
+    let mut p = s
+        .cwd_str()
+        .strip_prefix(root)
+        .unwrap_or(s.cwd_str())
+        .to_vec();
+    while p.first() == Some(&b'/') {
+        p.remove(0);
+    }
+    for b in &mut p {
+        if *b == b'/' {
+            *b = b'\\';
+        }
+    }
+    p
+}
+fn file_info<A: crate::Arch>(
+    m: &mut A,
+    out: usize,
+    cap: usize,
+    level: u32,
+    size: u32,
+    attr: u32,
+) -> u32 {
+    let need = match level {
+        1 => 24,
+        2 => 28,
+        _ => return 124,
+    };
+    if cap < need {
+        return 111;
+    }
+    m.zero(out, need);
+    m.write::<u32>(out + 12, size);
+    m.write::<u32>(out + 16, size.next_multiple_of(4096));
+    m.write::<u32>(out + 20, attr);
+    if level == 2 {
+        m.write::<u32>(out + 24, 4);
+    }
+    NO_ERROR
+}
+fn find_output<A: crate::Arch>(
+    m: &mut A,
+    find: &mut Find,
+    out: usize,
+    cap: usize,
+    count: usize,
+    actual: usize,
+) -> u32 {
+    let header = if find.level == 1 { 29 } else { 33 };
+    let mut used = 0;
+    let mut written = 0;
+    let mut previous = None;
+    while written < count && find.next < find.entries.len() {
+        let entry = &find.entries[find.next];
+        let name = &entry.name[..entry.name.len().min(255)];
+        let len = (header + name.len() + 1).next_multiple_of(4);
+        if used + len > cap {
+            break;
+        }
+        let dest = out + used;
+        m.zero(dest, len);
+        if let Some(previous) = previous {
+            m.write::<u32>(previous, (dest - previous) as u32);
+        }
+        m.write::<u32>(dest + 16, entry.size);
+        m.write::<u32>(dest + 20, entry.size.next_multiple_of(4096));
+        m.write::<u32>(
+            dest + 24,
+            entry
+                .dos_attributes
+                .unwrap_or(if entry.is_dir { 16 } else { 32 }) as u32,
+        );
+        if find.level == 2 {
+            m.write::<u32>(dest + 28, 4);
+        }
+        m.write::<u8>(dest + header - 1, name.len() as u8);
+        m.copy_to(dest + header, name);
+        previous = Some(dest);
+        used += len;
+        written += 1;
+        find.next += 1;
+    }
+    m.write::<u32>(actual, written as u32);
+    if written != 0 {
+        NO_ERROR
+    } else if find.next >= find.entries.len() {
+        18
+    } else {
+        111
+    }
+}
+fn wildcard(pattern: &[u8], name: &[u8]) -> bool {
+    if pattern == b"*.*" {
+        return true;
+    }
+    let (mut p, mut n, mut retry, mut star) = (0, 0, 0, None);
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == b'?' || pattern[p].eq_ignore_ascii_case(&name[n])) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            retry = n;
+        } else if let Some(s) = star {
+            retry += 1;
+            n = retry;
+            p = s + 1;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+pub(super) fn dispatch<A: crate::Arch>(
+    m: &mut A,
+    kt: &mut thread::KernelThread<A>,
+    s: &mut Os2State,
+    r: &mut Regs,
+    api: Api,
+) -> u32 {
+    let a = |n| arg32(m, r, n);
+    match api {
+        Api::Kbd(n) => kbd(m, s, r, n),
+        Api::Vio(n) => video(m, s, r, n),
+        Api::Mou(17) => {
+            let out = pointer(m, s, r, 0);
+            m.write::<u16>(out, 1);
+            NO_ERROR
+        }
+        Api::Mou(9 | 16 | 18 | 21 | 26) => NO_ERROR,
+        Api::Mou(8 | 13 | 15 | 19) => {
+            let out = pointer(m, s, r, 2);
+            m.write::<u16>(out, if api == Api::Mou(8) { 2 } else { 0 });
+            if matches!(api, Api::Mou(13 | 19)) {
+                m.write::<u16>(out + 2, 0);
+            }
+            NO_ERROR
+        }
+        Api::Mou(20) => {
+            let out = pointer(m, s, r, 6);
+            m.zero(out, 10);
+            232
+        }
+        Api::Base(318) => {
+            let err = a(0) as usize;
+            let cap = a(1) as usize;
+            let name = a(2);
+            let out = a(3) as usize;
+            let Ok(name) = c_string(m, name) else {
+                return 87;
+            };
+            match load_module(m, s, &name) {
+                Ok(h) => {
+                    m.write::<u32>(out, h);
+                    NO_ERROR
+                }
+                Err(e) => {
+                    let _ = copy_string(m, err, cap, &name);
+                    if crate::kernel::startup::trace_enabled() {
+                        crate::compact_println!(
+                            "[os2-load] failed {} error={}",
+                            core::str::from_utf8(&name).unwrap_or("?"),
+                            e
+                        );
+                    }
+                    e
+                }
+            }
+        }
+        Api::Base(322) => {
+            if a(0) > 0 && a(0) as usize <= s.modules.len() {
+                NO_ERROR
+            } else {
+                6
+            }
+        }
+        Api::Base(212) => NO_ERROR,
+        Api::Base(220) => {
+            if a(0) == 3 {
+                NO_ERROR
+            } else {
+                15
+            }
+        }
+        Api::Base(275) => {
+            let disk = a(0) as usize;
+            let map = a(1) as usize;
+            m.write::<u32>(disk, 3);
+            m.write::<u32>(map, 4);
+            NO_ERROR
+        }
+        Api::Base(274) => {
+            let out = a(1) as usize;
+            let len = a(2) as usize;
+            let cap = m.read::<u32>(len) as usize;
+            let path = current_dos(s);
+            if crate::kernel::startup::trace_enabled() {
+                crate::compact_println!("[os2-cwd] {}", core::str::from_utf8(&path).unwrap_or("?"));
+            }
+            let result = copy_string(m, out, cap, &path);
+            m.write::<u32>(len, path.len() as u32 + 1);
+            result
+        }
+        Api::Base(263) => {
+            let h = a(0);
+            let Some(i) = s.find.iter().position(|f| f.handle == h) else {
+                return 6;
+            };
+            s.find.remove(i);
+            NO_ERROR
+        }
+        Api::Base(264) => {
+            let Ok(raw) = c_string(m, a(0)) else {
+                return 87;
+            };
+            let handle = a(1) as usize;
+            let attr = a(2);
+            let out = a(3) as usize;
+            let cap = a(4) as usize;
+            let actual = a(5) as usize;
+            let count = m.read::<u32>(actual) as usize;
+            let level = a(6);
+            if !matches!(level, 1 | 2) {
+                return 124;
+            }
+            if count == 0 {
+                return 87;
+            }
+            let split = raw.iter().rposition(|&b| b == b'\\' || b == b'/');
+            let (dir, pattern) = match split {
+                Some(i) => (
+                    &raw[..if i == 2 && raw[1] == b':' { 3 } else { i }],
+                    &raw[i + 1..],
+                ),
+                None => (&b""[..], raw.as_slice()),
+            };
+            let Ok(dir) = os2_path(s, dir, false) else {
+                return 3;
+            };
+            if !vfs::dir_exists(&dir) {
+                return 3;
+            }
+            let mut entries = Vec::new();
+            let mut index = 0;
+            while let Some(entry) = vfs::readdir(&dir, index) {
+                index += 1;
+                let attributes = entry
+                    .dos_attributes
+                    .unwrap_or(if entry.is_dir { 16 } else { 32 });
+                if wildcard(pattern, &entry.name) && attributes as u32 & 0x16 & !attr == 0 {
+                    entries.push(entry);
+                }
+            }
+            let h = s.next_pm_handle;
+            s.next_pm_handle += 1;
+            let mut find = Find {
+                handle: h,
+                entries,
+                next: 0,
+                level,
+            };
+            let result = find_output(m, &mut find, out, cap, count, actual);
+            if result == 0 {
+                m.write::<u32>(handle, h);
+                s.find.push(find);
+            }
+            result
+        }
+        Api::Base(265) => {
+            let h = a(0);
+            let out = a(1) as usize;
+            let cap = a(2) as usize;
+            let actual = a(3) as usize;
+            let count = m.read::<u32>(actual) as usize;
+            let Some(find) = s.find.iter_mut().find(|f| f.handle == h) else {
+                return 6;
+            };
+            find_output(m, find, out, cap, count, actual)
+        }
+        Api::Base(278) => {
+            let level = a(1);
+            let out = a(2) as usize;
+            let cap = a(3) as usize;
+            match level {
+                1 => {
+                    if cap < 18 {
+                        return 111;
+                    }
+                    m.zero(out, 18);
+                    m.write::<u32>(out + 4, 8);
+                    m.write::<u32>(out + 8, 32768);
+                    m.write::<u32>(out + 12, 24576);
+                    m.write::<u16>(out + 16, 512);
+                    NO_ERROR
+                }
+                2 => {
+                    if cap < 17 {
+                        return 111;
+                    }
+                    m.zero(out, 17);
+                    m.write::<u8>(out + 4, 7);
+                    m.copy_to(out + 5, b"RETROOS");
+                    NO_ERROR
+                }
+                _ => 124,
+            }
+        }
+        Api::Base(277) => {
+            let out = a(3) as usize;
+            let length = a(4) as usize;
+            let cap = m.read::<u32>(length) as usize;
+            let bytes = b"\x03\0\x02\0\x03\0\0\0C:\0FAT\0";
+            m.write::<u32>(length, bytes.len() as u32);
+            if cap < bytes.len() {
+                111
+            } else {
+                m.copy_to(out, bytes);
+                NO_ERROR
+            }
+        }
+        Api::Base(270 | 226 | 259 | 271) => {
+            let ordinal = if let Api::Base(n) = api { n } else { 0 };
+            let Ok(path) = c_string(m, a(0)).and_then(|p| os2_path(s, &p, ordinal == 270)) else {
+                return 2;
+            };
+            let result = match ordinal {
+                270 => vfs::mkdir(&path),
+                226 => vfs::rmdir(&path),
+                259 => vfs::delete(&path),
+                _ => {
+                    let Ok(new) = c_string(m, a(1)).and_then(|p| os2_path(s, &p, true)) else {
+                        return 3;
+                    };
+                    vfs::rename(&path, &new)
+                }
+            };
+            if result < 0 {
+                os2_error(result)
+            } else {
+                NO_ERROR
+            }
+        }
+        Api::Base(323) => {
+            let Ok(path) = c_string(m, a(0)).and_then(|p| os2_path(s, &p, false)) else {
+                return 2;
+            };
+            let out = a(1) as usize;
+            let Ok(data) = crate::kernel::exec::load_file_resolved(&path) else {
+                return 2;
+            };
+            let flags = match crate::kernel::exec::detect_format(&data, &path) {
+                crate::kernel::exec::BinaryFormat::Lx => 2,
+                _ => 0x20,
+            };
+            m.write::<u32>(out, flags);
+            NO_ERROR
+        }
+        Api::Base(255) => {
+            let Ok(path) = c_string(m, a(0)).and_then(|p| os2_path(s, &p, false)) else {
+                return 3;
+            };
+            if !vfs::dir_exists(&path) {
+                return 3;
+            }
+            if path.len() > s.cwd.len() {
+                return 111;
+            }
+            s.cwd[..path.len()].copy_from_slice(&path);
+            s.cwd_len = path.len();
+            NO_ERROR
+        }
+        Api::Base(229) => {
+            let millis = a(0);
+            if millis == 0 {
+                return NO_ERROR;
+            }
+            if s.sleep_ready {
+                s.sleep_ready = false;
+                s.sleep_deadline = None;
+                return NO_ERROR;
+            }
+            if s.sleep_deadline.is_none() {
+                s.sleep_deadline = Some(m.now().saturating_add(millis as u64 * 1_000_000));
+            }
+            u32::MAX
+        }
+        Api::Base(306) => {
+            let address = a(0);
+            let length = a(1) as usize;
+            let flags = a(2) as usize;
+            let Some(&(base, size)) = s
+                .allocations
+                .iter()
+                .find(|&&(base, size)| address >= base && address < base + size)
+            else {
+                return 487;
+            };
+            let cap = m.read::<u32>(length);
+            m.write::<u32>(length, cap.min(base + size - address));
+            m.write::<u32>(flags, 0x13);
+            NO_ERROR
+        }
+        Api::Pm(0, 813) => 1,
+        Api::Pm(0, 817) => 0,
+        Api::Pm(0, 707 | 733 | 793) => 1,
+        Api::Pm(_, _) => 0,
+        Api::Base(305) => {
+            let address = a(0);
+            let size = a(1);
+            let flags = a(2);
+            if crate::kernel::startup::trace_enabled() {
+                crate::compact_println!("[os2-mem] address={:#x} size={:#x} flags={:#x}", address, size, flags);
+            }
+            let Some(end) = address.checked_add(size) else {
+                return 87;
+            };
+            let allocated = s
+                .allocations
+                .iter()
+                .any(|&(base, len)| address >= base && end <= base + len);
+            let mapped = s.modules.iter().any(|module| {
+                lx::Image::parse(&module.data)
+                    .ok()
+                    .and_then(|image| image.objects().ok())
+                    .is_some_and(|objects| {
+                        objects.iter().any(|o| {
+                            let base = module.bias.saturating_add(o.address) & !4095;
+                            let top = module
+                                .bias
+                                .saturating_add(o.address)
+                                .saturating_add(o.size)
+                                .saturating_add(4095)
+                                & !4095;
+                            address >= base && end <= top
+                        })
+                    })
+            });
+            if !allocated && !mapped {
+                return 487;
+            }
+            // Module pages are committed by the loader. Changing protection
+            // or recommitting an existing allocation preserves its contents.
+            m.set_page_flags(
+                address as usize / 4096,
+                (address as usize % 4096 + size as usize).div_ceil(4096),
+                flags & 2 != 0,
+                flags & 4 != 0,
+            );
+            NO_ERROR
+        }
+        Api::Base(320) => {
+            let h = a(0) as usize;
+            let cap = a(1) as usize;
+            let out = a(2) as usize;
+            let Some(module) = s.modules.get(h.wrapping_sub(1)) else {
+                return 6;
+            };
+            let mut p = b"C:\\".to_vec();
+            let root = crate::kernel::dos::c_root();
+            let relative = module.path.strip_prefix(root).unwrap_or(&module.path);
+            p.extend(
+                relative
+                    .iter()
+                    .copied()
+                    .skip_while(|b| *b == b'/')
+                    .map(|b| if b == b'/' { b'\\' } else { b }),
+            );
+            copy_string(m, out, cap, &p)
+        }
+        Api::Base(352) => {
+            let handle = a(0) as usize;
+            let kind = a(1) as u16;
+            let id = a(2) as u16;
+            let out = a(3) as usize;
+            let Some(module) = s.modules.get(handle.wrapping_sub(1)) else {
+                return 6;
+            };
+            let Ok(image) = lx::Image::parse(&module.data) else {
+                return 8;
+            };
+            let Some(resource) = image
+                .resources()
+                .ok()
+                .and_then(|v| v.into_iter().find(|r| r.kind == kind && r.id == id))
+            else {
+                return 1814;
+            };
+            let Ok(address) = object_address(&image, module.bias, resource.object, resource.offset)
+            else {
+                return 8;
+            };
+            m.write::<u32>(out, address);
+            NO_ERROR
+        }
+        Api::Base(353) => NO_ERROR,
+        Api::Base(378) => {
+            let out = a(1) as usize;
+            if out != 0 {
+                m.write::<u32>(out, 0);
+            }
+            NO_ERROR
+        }
+        Api::Base(223) => {
+            let Ok(path) = c_string(m, a(0)).and_then(|p| os2_path(s, &p, false)) else {
+                return 2;
+            };
+            let level = a(1);
+            let out = a(2) as usize;
+            let cap = a(3) as usize;
+            if level == 5 {
+                let mut p = b"C:\\".to_vec();
+                let relative = path
+                    .strip_prefix(crate::kernel::dos::c_root())
+                    .unwrap_or(&path);
+                p.extend(
+                    relative
+                        .iter()
+                        .copied()
+                        .skip_while(|b| *b == b'/')
+                        .map(|b| if b == b'/' { b'\\' } else { b }),
+                );
+                return copy_string(m, out, cap, &p);
+            }
+            let Some(stat) = vfs::stat(&path, true) else {
+                return 2;
+            };
+            file_info(
+                m,
+                out,
+                cap,
+                level,
+                stat.size,
+                vfs::dos_attributes(&path).unwrap_or(if stat.is_dir { 16 } else { 32 }) as u32,
+            )
+        }
+        Api::Base(279) => {
+            let fd = a(0) as usize;
+            let level = a(1);
+            let out = a(2) as usize;
+            let cap = a(3) as usize;
+            if fd >= thread::MAX_FDS {
+                return 6;
+            }
+            let Some((stat, _)) = vfs::fd_info(fd as i32, &kt.fds) else {
+                return 6;
+            };
+            file_info(
+                m,
+                out,
+                cap,
+                level,
+                stat.size,
+                if stat.is_dir { 16 } else { 32 },
+            )
+        }
+        Api::Msg(_) => 317,
+        _ => {
+            let name = alloc::format!("{:?}", api);
+            crate::compact_println!(
+                "OS/2: unsupported {} args={:#x},{:#x},{:#x},{:#x}",
+                name.as_str(),
+                a(0),
+                a(1),
+                a(2),
+                a(3)
+            );
+            ERROR_INVALID_FUNCTION
+        }
+    }
+}
+
+pub(super) fn begin_dll_init<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &mut Regs) {
+    if s.dll_saved.is_some() {
+        return;
+    }
+    let Some((entry, handle)) = s.dll_init.pop() else {
+        return;
+    };
+    s.dll_saved = Some(*r);
+    let stack = (r.sp() as u32).wrapping_sub(12);
+    m.write::<u32>(stack as usize, PROCESS_DATA + 0x300);
+    m.write::<u32>(stack as usize + 4, handle);
+    m.write::<u32>(stack as usize + 8, 0);
+    r.frame.rsp = stack as u64;
+    r.frame.rip = entry as u64;
+}
+fn load_module<A: crate::Arch>(m: &mut A, s: &mut Os2State, path: &[u8]) -> Result<u32, u32> {
+    let name = module_name(
+        path.rsplit(|&b| b == b'/' || b == b'\\')
+            .next()
+            .unwrap_or(path),
+    );
+    if let Some(index) = find_module(&s.modules, &name) {
+        return Ok(index as u32 + 1);
+    }
+    let (resolved, data) = if path.contains(&b'/') || path.contains(&b'\\') || path.contains(&b':')
+    {
+        let resolved = os2_path(s, path, false)?;
+        let data = crate::kernel::exec::load_file_resolved(&resolved).map_err(|_| 2u32)?;
+        (resolved, data)
+    } else {
+        load_dependency(&name, s.exec_path_str()).map_err(|e| e as u32)?
+    };
+    let first = s.modules.len();
+    let ldt_len = s.ldt.len();
+    let result = (|| {
+        let mut pending = vec![(name, resolved, data)];
+        while let Some((name, path, data)) = pending.pop() {
+            if find_module(&s.modules, &name).is_some() {
+                continue;
+            }
+            if s.modules.len() >= MAX_MODULES {
+                return Err(8);
+            }
+            let image = lx::Image::parse(&data).map_err(|_| 193u32)?;
+            if !image.is_dll() {
+                return Err(193);
+            }
+            let bias = DLL_BIAS_FIRST + (s.modules.len() as u32 - 1) * DLL_BIAS_STRIDE;
+            let mut selectors = Vec::new();
+            for o in image.objects().map_err(|_| 8u32)? {
+                selectors.push(push_descriptor(
+                    &mut s.ldt,
+                    bias.checked_add(o.address).ok_or(8u32)?,
+                    o.size,
+                    o.flags & lx::OBJ_EXECUTABLE != 0,
+                    o.flags & lx::OBJ_BIG != 0,
+                ));
+            }
+            let imports = image.import_modules().map_err(|_| 8u32)?;
+            s.modules.push(Module {
+                name,
+                path: path.clone(),
+                data,
+                bias,
+                selectors,
+            });
+            for import in imports {
+                if find_module(&s.modules, &import).is_none() {
+                    let (p, d) = load_dependency(&import, &path).map_err(|e| e as u32)?;
+                    pending.push((module_name(&import), p, d));
+                }
+            }
+        }
+        for module in &s.modules[first..] {
+            map_module(m, module).map_err(|e| e as u32)?;
+        }
+        for i in first..s.modules.len() {
+            apply_fixups(m, &s.modules, i).map_err(|e| e as u32)?;
+        }
+        for module in &s.modules[first..] {
+            protect_module(m, module).map_err(|e| e as u32)?;
+        }
+        Ok(first as u32 + 1)
+    })();
+    if result.is_err() {
+        s.modules.truncate(first);
+        s.ldt.truncate(ldt_len);
+        return result;
+    }
+    let modules = core::mem::take(&mut s.modules);
+    register_gates(s, &modules);
+    s.modules = modules;
+    s.on_resume(m);
+    for i in first..s.modules.len() {
+        let module = &s.modules[i];
+        let image = lx::Image::parse(&module.data).map_err(|_| 8u32)?;
+        if image.header.start_object != 0 {
+            let entry = object_address(
+                &image,
+                module.bias,
+                image.header.start_object as u16,
+                image.header.eip,
+            )
+            .map_err(|e| e as u32)?;
+            s.dll_init.push((entry, i as u32 + 1));
+        }
+    }
+    result
+}

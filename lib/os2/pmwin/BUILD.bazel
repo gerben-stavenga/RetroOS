@@ -13,6 +13,17 @@ os2_dll(
     out = "PMWIN.DLL",
     module_name = "PMWIN",
     exports = [
+        "WinCloseClipbrd.707",
+        "WinEmptyClipbrd.733",
+        "WinOpenClipbrd.793",
+        "WinQueryClipbrdData.806",
+        "WinQueryClipbrdFmtInfo.807",
+        "WinQueryDesktopWindow.813",
+        "WinQueryFocus.817",
+        "WinSetActiveWindow.851",
+        "WinSetClipbrdData.854",
+        "WinSetWindowText.877",
+
         "WinBeginPaint.703",
         "WinCreateMsgQueue.716",
         "WinDestroyMsgQueue.726",

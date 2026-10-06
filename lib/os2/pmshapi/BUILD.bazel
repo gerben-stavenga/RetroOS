@@ -13,6 +13,13 @@ os2_dll(
     out = "PMSHAPI.DLL",
     module_name = "PMSHAPI",
     exports = [
+        "WinChangeSwitchEntry.123",
+        "WinQuerySwitchEntry.124",
+        "WinQuerySwitchHandle.125",
+        "WinQueryTaskTitle.128",
+        "WinSwitchToProgram.131",
+        "WIN16SETTITLEANDICON.97",
+
         "PrfOpenProfile.102",
         "PrfCloseProfile.103",
         "PrfQueryProfileData.117",

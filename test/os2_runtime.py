@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Exercise OS/2 DLL initialization, shared memory, files, 16-bit console calls and waits."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    engine = os.environ.get("ENGINE", "tcg")
+    if engine not in ("tcg", "kvm"):
+        raise SystemExit(f"Unknown ENGINE: {engine}")
+    target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
+    modules = ("doscalls", "kbdcalls", "viocalls", "nls", "moucalls", "msg", "pmwin", "pmshapi", "pmwp")
+    # COMMAND.COM depends on the native boot image, which needs the default
+    # target platform. Save it before changing Bazel's output configuration.
+    subprocess.run(["bazelisk", "build", "//tools/command:command_com"], cwd=ROOT, check=True)
+    command_image = (ROOT / "bazel-bin/tools/command/COMMAND.COM").read_bytes()
+    subprocess.run([
+        "bazelisk", "build", f"//kernel:{target}",
+        "//test/os2/runtime:runtime", "//test/os2/runtime:probe_dll",
+        "//test/os2/hello:hello_lx", "//test/os2/watcom_io:watcom_io",
+        *(f"//lib/os2/{name}:{name}_dll" for name in modules),
+        "--platforms=@platforms//host",
+    ], cwd=ROOT, check=True)
+    with tempfile.TemporaryDirectory(prefix="retroos-os2-runtime-") as directory:
+        root = Path(directory)
+        system = root / "RETROOS/OS2/DLL"
+        apps = root / "OS2/APPS"
+        system.mkdir(parents=True)
+        apps.mkdir(parents=True)
+        (root / "RETROOS/COMMAND.COM").write_bytes(command_image)
+        for name in modules:
+            shutil.copyfile(ROOT / f"bazel-bin/lib/os2/{name}/{name.upper()}.DLL", system / f"{name.upper()}.DLL")
+        for source, name in (
+            ("runtime/runtime.exe", "RUNTIME.EXE"),
+            ("runtime/PROBE.DLL", "PROBE.DLL"),
+            ("hello/hello_lx.exe", "HELLO.EXE"),
+            ("watcom_io/watcom_io.exe", "WATCIO.EXE"),
+        ):
+            shutil.copyfile(ROOT / "bazel-bin/test/os2" / source, apps / name)
+        for command, marker in (
+            ("/OS2/APPS/RUNTIME.EXE", "OS2RUNTIME PASS"),
+            ("/OS2/APPS/HELLO.EXE", "Hello from Open Watcom C"),
+            ("/OS2/APPS/WATCIO.EXE", "Open Watcom file I/O works"),
+            (r"RETROOS/COMMAND.COM /C C:\OS2\APPS\RUNTIME.EXE", "OS2RUNTIME PASS"),
+        ):
+            try:
+                result = subprocess.run([
+                    str(ROOT / "bazel-bin/kernel" / target), "--host", directory,
+                    "--c-root", "/", "--cwd", "OS2/APPS", "--cmd", command,
+                ], cwd=ROOT, capture_output=True, text=True, timeout=30)
+            except subprocess.TimeoutExpired as error:
+                raise SystemExit((error.stdout or b"").decode(errors="replace") +
+                                 (error.stderr or b"").decode(errors="replace") +
+                                 f"\n{command} timed out")
+            log = result.stdout + result.stderr
+            if result.returncode != 0 or marker not in log or any(
+                    bad in log for bad in ("SEGV", "PANIC", "FAIL", "unhandled event", "invalid API gate")):
+                raise SystemExit(log)
+    print(f"PASS: OS/2 CRT, DLL initialization, shared memory, files, 16-bit VIO/KBD and Sleep ({engine})")
+
+
+if __name__ == "__main__":
+    main()

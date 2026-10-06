@@ -1,0 +1,29 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(
+    name = "moucalls_obj",
+    srcs = ["moucalls.asm"],
+    copts = ["-fobj"],
+)
+
+os2_dll(
+    name = "moucalls_dll",
+    obj = ":moucalls_obj",
+    out = "MOUCALLS.DLL",
+    module_name = "MOUCALLS",
+    exports = [
+        "MouGetNumButtons.8",
+        "MouClose.9",
+        "MouGetNumQueEl.13",
+        "MouGetEventMask.15",
+        "MouSetEventMask.16",
+        "MouOpen.17",
+        "MouRemovePtr.18",
+        "MouGetPtrPos.19",
+        "MouReadEventQue.20",
+        "MouSetPtrPos.21",
+        "MouDrawPtr.26",
+    ],
+    visibility = ["//visibility:public"],
+)

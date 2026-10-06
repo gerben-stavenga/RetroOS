@@ -7,6 +7,11 @@ os2_dll(
     obj = ":kbdcalls_obj",
     out = "KBDCALLS.DLL",
     module_name = "KBDCALLS",
-    exports = ["KbdCharIn.4"],
+    exports = [
+        "KbdGetStatus.10",
+        "KbdSetStatus.11",
+        "KbdPeek.22",
+"KbdCharIn.4",
+    ],
     visibility = ["//visibility:public"],
 )

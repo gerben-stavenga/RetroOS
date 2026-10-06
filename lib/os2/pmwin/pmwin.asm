@@ -93,3 +93,23 @@ WinSendMsg:         int 0x82
 WinDlgBox:          int 0x82
 WinRegisterClass:   int 0x82
 RetroWndProcReturn: int 0x82
+global WinCloseClipbrd
+WinCloseClipbrd: int 0x82
+global WinEmptyClipbrd
+WinEmptyClipbrd: int 0x82
+global WinOpenClipbrd
+WinOpenClipbrd: int 0x82
+global WinQueryClipbrdData
+WinQueryClipbrdData: int 0x82
+global WinQueryClipbrdFmtInfo
+WinQueryClipbrdFmtInfo: int 0x82
+global WinQueryDesktopWindow
+WinQueryDesktopWindow: int 0x82
+global WinQueryFocus
+WinQueryFocus: int 0x82
+global WinSetActiveWindow
+WinSetActiveWindow: int 0x82
+global WinSetClipbrdData
+WinSetClipbrdData: int 0x82
+global WinSetWindowText
+WinSetWindowText: int 0x82

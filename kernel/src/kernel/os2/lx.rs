@@ -12,7 +12,9 @@ pub const PAGE_VALID: u16 = 0;
 pub const PAGE_ITERATED: u16 = 1;
 pub const PAGE_INVALID: u16 = 2;
 pub const PAGE_ZEROED: u16 = 3;
+pub const PAGE_COMPRESSED: u16 = 5;
 
+pub const OBJ_READABLE: u32 = 0x0001;
 pub const OBJ_WRITABLE: u32 = 0x0002;
 pub const OBJ_EXECUTABLE: u32 = 0x0004;
 pub const OBJ_ALIAS: u32 = 0x1000;
@@ -65,6 +67,7 @@ pub struct Header {
     pub import_module_count: u32,
     pub import_procedures: u32,
     pub data_pages: u32,
+    pub iterated_pages: u32,
     pub nonresident_names: u32,
     pub nonresident_name_size: u32,
     pub stack_size: u32,
@@ -168,6 +171,7 @@ impl<'a> Image<'a> {
             import_module_count: u32_at(data, at + 0x74)?,
             import_procedures: u32_at(data, at + 0x78)?,
             data_pages: u32_at(data, at + 0x80)?,
+            iterated_pages: u32_at(data, at + 0x4c)?,
             nonresident_names: u32_at(data, at + 0x88)?,
             nonresident_name_size: u32_at(data, at + 0x8c)?,
             stack_size: u32_at(data, at + 0xac)?,
@@ -214,20 +218,83 @@ impl<'a> Image<'a> {
         let at = self.header.rel(self.header.page_map)? + (one_based as usize - 1) * 8;
         let encoded = u32_at(self.data, at)?;
         let relative = encoded.checked_shl(self.header.page_shift).ok_or(Error::BadTable)?;
-        let file_offset = self.header.data_pages.checked_add(relative).ok_or(Error::BadTable)?;
+        let flags = u16_at(self.data, at + 6)?;
+        let section = if matches!(flags, PAGE_ITERATED | PAGE_COMPRESSED) && self.header.iterated_pages != 0 { self.header.iterated_pages } else { self.header.data_pages };
+        let file_offset = section.checked_add(relative).ok_or(Error::BadTable)?;
         Ok(Page {
             file_offset,
             data_size: u16_at(self.data, at + 4)?,
-            flags: u16_at(self.data, at + 6)?,
+            flags,
         })
     }
 
     pub fn page_data(&self, page: Page) -> Result<&'a [u8], Error> {
-        if page.flags != PAGE_VALID {
+        if !matches!(page.flags, PAGE_VALID | PAGE_ITERATED | PAGE_COMPRESSED) {
             return Ok(&[]);
         }
         let at = page.file_offset as usize;
         self.data.get(at..at + page.data_size as usize).ok_or(Error::Truncated)
+    }
+
+    /// Decode one bounded LX storage page, including EXEPACK methods 1 and 2.
+    pub fn expanded_page(&self, page: Page) -> Result<Vec<u8>, Error> {
+        let size = self.header.page_size as usize;
+        if size > 65536 { return Err(Error::Unsupported); }
+        let input = self.page_data(page)?;
+        if page.flags == PAGE_VALID { return Ok(input.to_vec()); }
+        if matches!(page.flags, PAGE_ZEROED | PAGE_INVALID) { return Ok(vec![0; size]); }
+        let mut output = Vec::with_capacity(size);
+        let mut at = 0;
+        while at < input.len() && output.len() < size {
+            if page.flags == PAGE_ITERATED {
+                let repeat = u16_at(input, at)? as usize;
+                if repeat == 0 { break; }
+                let length = u16_at(input, at + 2)? as usize;
+                at += 4;
+                let pattern = input.get(at..at + length).ok_or(Error::Truncated)?;
+                if length == 0 || output.len() + repeat * length > size { return Err(Error::BadTable); }
+                for _ in 0..repeat { output.extend_from_slice(pattern); }
+                at += length;
+                continue;
+            }
+            if page.flags != PAGE_COMPRESSED { return Err(Error::Unsupported); }
+            // EXEPACK:2 token layout; see bitwiseworks/lxlite's format decoder.
+            let token = input[at];
+            if token & 3 == 0 {
+                at += 1;
+                if token == 0 {
+                    let count = *input.get(at).ok_or(Error::Truncated)? as usize;
+                    at += 1;
+                    if count == 0 { break; }
+                    let value = *input.get(at).ok_or(Error::Truncated)?;
+                    at += 1;
+                    if output.len() + count > size { return Err(Error::BadTable); }
+                    output.resize(output.len() + count, value);
+                } else {
+                    let count = (token >> 2) as usize;
+                    let literal = input.get(at..at + count).ok_or(Error::Truncated)?;
+                    if output.len() + count > size { return Err(Error::BadTable); }
+                    output.extend_from_slice(literal);
+                    at += count;
+                }
+                continue;
+            }
+            let word = u16_at(input, at)? as usize;
+            let (literal, count, distance, encoded) = match token & 3 {
+                1 => (((token >> 2) & 3) as usize, ((token >> 4) & 7) as usize + 3, word >> 7, 2),
+                2 => (0, ((token >> 2) & 3) as usize + 3, word >> 4, 2),
+                _ => (((token >> 2) & 15) as usize, (word >> 6) & 63, u16_at(input, at + 1)? as usize >> 4, 3),
+            };
+            at += encoded;
+            let bytes = input.get(at..at + literal).ok_or(Error::Truncated)?;
+            if output.len() + literal + count > size { return Err(Error::BadTable); }
+            output.extend_from_slice(bytes);
+            at += literal;
+            if count != 0 && (distance == 0 || distance > output.len()) { return Err(Error::BadTable); }
+            for _ in 0..count { output.push(output[output.len() - distance]); }
+        }
+        output.resize(size, 0);
+        Ok(output)
     }
 
     pub fn import_modules(&self) -> Result<Vec<Vec<u8>>, Error> {
@@ -270,8 +337,7 @@ impl<'a> Image<'a> {
             let page_in_object = offset / self.header.page_size;
             let within = offset % self.header.page_size;
             let page = self.page(object.map_index + page_in_object)?;
-            if page.flags != PAGE_VALID { return Err(Error::BadTable); }
-            let bytes = self.page_data(page)?;
+            let bytes = self.expanded_page(page)?;
             let available = (bytes.len() as u32).saturating_sub(within);
             let take = available.min(end - offset);
             if take == 0 { return Err(Error::BadTable); }
@@ -389,16 +455,16 @@ impl<'a> Image<'a> {
                 let source = *self.data.get(at).ok_or(Error::Truncated)?;
                 let target_flags = *self.data.get(at + 1).ok_or(Error::Truncated)?;
                 at += 2;
-                if source & 0x20 != 0 { return Err(Error::Unsupported); }
-                let source_offset = i16_at(self.data, at)?;
-                at += 2;
+                let chained = source & 0x20 != 0;
+                let count = if chained { let n = *self.data.get(at).ok_or(Error::Truncated)? as usize; at += 1; n } else { 1 };
+                let source_offset = if chained { 0 } else { let n = i16_at(self.data, at)?; at += 2; n };
                 let wide_index = target_flags & 0x40 != 0;
                 let wide_offset = target_flags & 0x10 != 0;
                 let module_or_object = self.read_index(&mut at, wide_index)?;
                 let target = match target_flags & 0x03 {
                     0 => Target::Internal {
                         object: module_or_object,
-                        offset: self.read_offset(&mut at, wide_offset)?,
+                        offset: if source & 0x0f == 2 { 0 } else { self.read_offset(&mut at, wide_offset)? },
                     },
                     1 => Target::ImportOrdinal {
                         module: module_or_object,
@@ -413,13 +479,16 @@ impl<'a> Image<'a> {
                 let additive = if target_flags & 0x04 != 0 {
                     self.read_offset(&mut at, target_flags & 0x20 != 0)?
                 } else { 0 };
+                for _ in 0..count {
+                let source_offset = if chained { let n = i16_at(self.data, at)?; at += 2; n } else { source_offset };
                 out.push(Fixup {
                     page,
-                    source_type: source & 0x0f,
+                    source_type: source & 0x1f,
                     source_offset,
-                    target,
+                    target: target.clone(),
                     additive,
                 });
+                }
             }
             if at != limit { return Err(Error::BadTable); }
         }
@@ -454,6 +523,48 @@ mod tests {
 
     fn put16(v: &mut [u8], at: usize, n: u16) { v[at..at + 2].copy_from_slice(&n.to_le_bytes()); }
     fn put32(v: &mut [u8], at: usize, n: u32) { v[at..at + 4].copy_from_slice(&n.to_le_bytes()); }
+
+    fn test_image(payload: &[u8], page_kind: u16) -> Vec<u8> {
+        let mut data = vec![0u8; 256 + payload.len()];
+        data[..2].copy_from_slice(b"LX"); put16(&mut data,8,2); put16(&mut data,10,1);
+        put32(&mut data,0x14,1); put32(&mut data,0x28,4096);
+        put32(&mut data,0x40,196); put32(&mut data,0x48,196);
+        put32(&mut data,0x4c,256); put32(&mut data,0x80,256);
+        put16(&mut data,200,payload.len() as u16); put16(&mut data,202,page_kind);
+        data[256..].copy_from_slice(payload); data
+    }
+
+    #[test]
+    fn expands_iterated_and_compressed_lx_pages() {
+        let data=test_image(&[3,0,2,0,b'A',b'B',0,0],PAGE_ITERATED);
+        let image=Image::parse(&data).unwrap();let bytes=image.expanded_page(image.page(1).unwrap()).unwrap();
+        assert_eq!(&bytes[..6],b"ABABAB");assert!(bytes[6..].iter().all(|&b|b==0));
+        // Literal, repeat byte, short match, match with literals, long match.
+        let data=test_image(&[12,b'A',b'B',b'C',0,3,b'X',0x32,0,0x85,0,b'Y',7,0x31,0,b'Z',0,0],PAGE_COMPRESSED);
+        let image=Image::parse(&data).unwrap();let bytes=image.expanded_page(image.page(1).unwrap()).unwrap();
+        assert_eq!(&bytes[..18],b"ABCXXXXXXYYYYZYYZY");
+        assert!(bytes[18..].iter().all(|&b|b==0));
+    }
+
+    #[test]
+    fn rejects_compressed_backrefs_and_truncated_tokens() {
+        for payload in [&[0x12,0][..], &[0,4][..], &[3][..]] {
+            let data=test_image(payload,PAGE_COMPRESSED);let image=Image::parse(&data).unwrap();
+            assert!(image.expanded_page(image.page(1).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn parses_source_lists_and_selector_fixups() {
+        let mut data=test_image(&[],PAGE_VALID);
+        put32(&mut data,0x68,204);put32(&mut data,0x6c,212);
+        let records=[0x27,0x81,2,1,234,0xc8,0,0xfc,0xff,2,0,0x10,0,1,0x13,0,0x20,0,1,0x40,0];
+        put32(&mut data,204,0);put32(&mut data,208,records.len() as u32);data[212..212+records.len()].copy_from_slice(&records);
+        let fixups=Image::parse(&data).unwrap().fixups().unwrap();
+        assert_eq!(fixups.len(),4);assert_eq!(fixups[0].source_offset,200);assert_eq!(fixups[1].source_offset,-4);
+        assert_eq!(fixups[0].target,Target::ImportOrdinal{module:1,ordinal:234});
+        assert_eq!(fixups[2].target,Target::Internal{object:1,offset:0});assert_eq!(fixups[3].source_type,0x13);
+    }
 
     #[test]
     fn rejects_mz_without_lx() {

@@ -55,3 +55,81 @@ DosGetDateTime:         int 0x82
 DosAllocSharedMem:      int 0x82
 DosGetNamedSharedMem:   int 0x82
 DosGetInfoBlocks:       int 0x82
+global DosError
+DosError: int 0x82
+global DosSetFileInfo
+DosSetFileInfo: int 0x82
+global DosSetPathInfo
+DosSetPathInfo: int 0x82
+global DosSetDefaultDisk
+DosSetDefaultDisk: int 0x82
+global DosSetFSInfo
+DosSetFSInfo: int 0x82
+global DosQueryPathInfo
+DosQueryPathInfo: int 0x82
+global DosDeleteDir
+DosDeleteDir: int 0x82
+global DosSleep
+DosSleep: int 0x82
+global DosKillProcess
+DosKillProcess: int 0x82
+global DosSetCurrentDir
+DosSetCurrentDir: int 0x82
+global DosCopy
+DosCopy: int 0x82
+global DosDelete
+DosDelete: int 0x82
+global DosDupHandle
+DosDupHandle: int 0x82
+global DosFindClose
+DosFindClose: int 0x82
+global DosFindFirst
+DosFindFirst: int 0x82
+global DosFindNext
+DosFindNext: int 0x82
+global DosCreateDir
+DosCreateDir: int 0x82
+global DosMove
+DosMove: int 0x82
+global DosSetFileSize
+DosSetFileSize: int 0x82
+global DosQueryCurrentDir
+DosQueryCurrentDir: int 0x82
+global DosQueryCurrentDisk
+DosQueryCurrentDisk: int 0x82
+global DosQueryFSAttach
+DosQueryFSAttach: int 0x82
+global DosQueryFSInfo
+DosQueryFSInfo: int 0x82
+global DosQueryFileInfo
+DosQueryFileInfo: int 0x82
+global DosExecPgm
+DosExecPgm: int 0x82
+global DosDevIOCtl
+DosDevIOCtl: int 0x82
+global DosBeep
+DosBeep: int 0x82
+global DosSetMem
+DosSetMem: int 0x82
+global DosLoadModule
+DosLoadModule: int 0x82
+global DosQueryModuleName
+DosQueryModuleName: int 0x82
+global DosFreeModule
+DosFreeModule: int 0x82
+global DosQueryAppType
+DosQueryAppType: int 0x82
+global DosGetResource
+DosGetResource: int 0x82
+global DosFreeResource
+DosFreeResource: int 0x82
+global DosRaiseException
+DosRaiseException: int 0x82
+global DosUnwindException
+DosUnwindException: int 0x82
+global DosEnumAttribute
+DosEnumAttribute: int 0x82
+global DosSetSignalExceptionFocus
+DosSetSignalExceptionFocus: int 0x82
+global DosQueryMem
+DosQueryMem: int 0x82

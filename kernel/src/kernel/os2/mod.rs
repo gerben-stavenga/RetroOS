@@ -7,6 +7,7 @@
 extern crate alloc;
 
 pub mod lx;
+mod extra;
 
 use alloc::{vec, vec::Vec};
 use crate::Regs;
@@ -30,12 +31,13 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Api {
+    Base(u16), Kbd(u16), Vio(u16), Mou(u16), Msg(u16), Pm(u8, u16), DllReturn, WaitReturn,
     DosQueryHType, DosExit, DosResetBuffer, DosSetFilePtr, DosClose,
     DosOpen, DosRead, DosWrite, DosQueryCp, DosAllocMem, DosFreeMem,
     DosQueryModuleHandle, DosQueryProcAddr, DosQuerySysInfo, DosSetRelMaxFH,
     DosFlatToSel, DosSelToFlat, DosOpenL, DosSetFileLocksL, DosSetFilePtrL,
     DosGetDateTime, DosAllocSharedMem, DosGetNamedSharedMem, DosGetInfoBlocks,
-    DosQueryDBCSEnv, KbdCharIn, VioGetConfig,
+    DosQueryDBCSEnv, KbdCharIn,
     WinInitialize, WinCreateMsgQueue, WinCreateWindow, WinShowWindow,
     WinGetPS, WinReleasePS, WinFillRect, WinPostQueueMsg, WinGetMsg,
     WinDispatchMsg, WinDestroyWindow, WinDestroyMsgQueue, WinTerminate,
@@ -112,6 +114,17 @@ pub struct Os2State {
     pm_windows: Vec<PmWindow>,
     pm_messages: Vec<PmMessage>,
     callback: Option<Callback>,
+    shared: Vec<(Vec<u8>, u32)>,
+    find: Vec<extra::Find>,
+    video: extra::Video,
+    keys: Vec<(u8, u8, u16)>,
+    kbd_mask: u16,
+    dll_init: Vec<(u32, u32)>,
+    dll_saved: Option<Regs>,
+    sleep_deadline: Option<u64>,
+    sleep_ready: bool,
+    wait_key: bool,
+    waiting: Option<Regs>,
     callback_return: u32,
     timer_hwnd: u32,
     timer_id: u32,
@@ -142,6 +155,17 @@ impl Os2State {
             pm_windows: Vec::new(),
             pm_messages: Vec::new(),
             callback: None,
+            shared: Vec::new(),
+            find: Vec::new(),
+            video: extra::Video::new(),
+            keys: Vec::new(),
+            kbd_mask: 0x0006,
+            dll_init: Vec::new(),
+            dll_saved: None,
+            sleep_deadline: None,
+            sleep_ready: false,
+            wait_key: false,
+            waiting: None,
             callback_return: 0,
             timer_hwnd: 0,
             timer_id: 0,
@@ -168,9 +192,12 @@ impl Os2State {
         self.exec_path_len = n;
     }
 
-    pub fn process_key(&self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
+    pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
+        if matches!(scancode & 0x7f, 0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46) {return;}
         let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
+        let shift = extra::shift_state();
+        self.keys.push((c, scancode & 0x7f, shift));
         if c == 0 { return; }
         if let thread::FdKind::PipeRead(idx) = fds[0] {
             crate::kernel::kpipe::write(idx, &[c]);
@@ -197,6 +224,7 @@ impl Os2State {
     }
 
     pub fn advance_timers(&mut self, now: u64) {
+        if self.sleep_deadline.is_some_and(|deadline|now>=deadline) {self.sleep_ready=true;}
         if self.timer_hwnd == 0
             || now < self.timer_deadline_ns
             || self.pm_messages.iter().any(|message| {
@@ -218,7 +246,7 @@ impl Os2State {
     }
 
     pub fn has_pending_message(&self) -> bool {
-        !self.pm_messages.is_empty()
+        !self.pm_messages.is_empty() || self.sleep_ready || (self.wait_key && !self.keys.is_empty())
     }
 
     pub fn repaint_osd(&mut self) {
@@ -322,7 +350,9 @@ fn build_descriptor(base: u32, limit: u32, access: u64, flags: u64) -> u64 {
 fn push_descriptor(ldt: &mut Vec<u64>, base: u32, size: u32, code: bool, big: bool) -> u16 {
     let selector = ((ldt.len() as u16) << 3) | 7;
     let access = if code { 0xfa } else { 0xf2 };
-    ldt.push(build_descriptor(base, size.saturating_sub(1), access, if big { 0x40 } else { 0 }));
+    let limit = size.saturating_sub(1);
+    let granularity = limit > 0xfffff;
+    ldt.push(build_descriptor(base, if granularity {limit >> 12} else {limit}, access, (if big {0x40} else {0}) | (if granularity {0x80} else {0})));
     selector
 }
 
@@ -417,8 +447,8 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
             let page = image.page(object.map_index + n).map_err(|_| 8)?;
             let within = n.checked_mul(image.header.page_size).ok_or(8)?;
             match page.flags {
-                lx::PAGE_VALID => {
-                    let bytes = image.page_data(page).map_err(|_| 8)?;
+                lx::PAGE_VALID | lx::PAGE_ITERATED | lx::PAGE_COMPRESSED => {
+                    let bytes = image.expanded_page(page).map_err(|_| 8)?;
                     // LX page records are page-sized storage units. The last
                     // page of an object may contain linker padding beyond the
                     // object's declared virtual size; map only its live prefix.
@@ -426,7 +456,6 @@ fn map_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<(), i3
                     machine.copy_to(base + within as usize, &bytes[..bytes.len().min(remaining)]);
                 }
                 lx::PAGE_ZEROED | lx::PAGE_INVALID => {}
-                lx::PAGE_ITERATED => return Err(8),
                 _ => return Err(8),
             }
         }
@@ -446,10 +475,13 @@ fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_inde
         let source = source_signed as u32;
         let target = match fixup.target {
             lx::Target::Internal { object, offset } => {
+                let obj = image.object(object as u32).map_err(|_|8)?;
+                let linear = object_address(&image, module.bias, object, offset)?;
+                let flat = obj.flags & lx::OBJ_BIG != 0 && fixup.source_type & 0x10 == 0;
                 ResolvedTarget {
-                    linear: object_address(&image, module.bias, object, offset)?,
-                    selector: *module.selectors.get(object as usize - 1).ok_or(8)?,
-                    offset,
+                    linear,
+                    selector: if flat {if obj.flags & lx::OBJ_EXECUTABLE != 0 {arch_abi::USER_CS} else {arch_abi::USER_DS}} else {*module.selectors.get(object as usize - 1).ok_or(8)?},
+                    offset: if flat {linear} else {offset},
                 }
             }
             lx::Target::ImportOrdinal { module: import_ordinal, ordinal } => {
@@ -466,14 +498,15 @@ fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_inde
         };
         let linear = target.linear.wrapping_add(fixup.additive);
         let offset = target.offset.wrapping_add(fixup.additive);
-        match fixup.source_type {
+        match fixup.source_type & 0x0f {
             0 => machine.write::<u8>(source as usize, linear as u8),
             3 => {
                 machine.write::<u16>(source as usize, offset as u16);
                 machine.write::<u16>(source as usize + 2, target.selector);
             }
             5 => machine.write::<u16>(source as usize, offset as u16),
-            6 => machine.write::<u16>(source as usize, target.selector),
+            2 => machine.write::<u16>(source as usize, target.selector),
+            6 => { machine.write::<u32>(source as usize, offset); machine.write::<u16>(source as usize + 4, target.selector); },
             7 => machine.write::<u32>(source as usize, linear),
             8 => machine.write::<u32>(source as usize, linear.wrapping_sub(source.wrapping_add(4))),
             _ => return Err(8),
@@ -493,7 +526,10 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
                 first,
                 pages,
                 object.flags & lx::OBJ_WRITABLE != 0,
-                object.flags & lx::OBJ_EXECUTABLE != 0,
+                // OS/2's flat 32-bit code selector can execute data pages.
+                // Its original x86 paging has no NX bit; Pascal runtimes put
+                // executable trampolines in objects marked as data.
+                object.flags & (lx::OBJ_READABLE | lx::OBJ_EXECUTABLE) != 0,
             );
         }
     }
@@ -502,7 +538,7 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
 
 fn vfs_image_path(path: &[u8], personality: Option<thread::PersonalityName>, cwd: &[u8]) -> Vec<u8> {
     if personality == Some(thread::PersonalityName::Dos) {
-        crate::kernel::dos::dos_abs_to_vfs(path).unwrap_or_else(|| path.to_vec())
+        crate::kernel::dos::windows_abs_to_vfs(path, false).unwrap_or_else(|| path.to_vec())
     } else {
         let mut buf = [0u8; 164];
         crate::kernel::exec::resolve_path(path, cwd, &mut buf).to_vec()
@@ -523,6 +559,9 @@ pub fn exec_lx_into<A: crate::Arch>(
     let main_image = lx::Image::parse(&data).map_err(|_| 8)?;
     if main_image.is_dll() { return Err(8); }
     let main_path = vfs_image_path(path, launcher, parent_cwd);
+    if crate::kernel::startup::trace_enabled() {
+        crate::compact_println!("[os2-path] image={} root={}", core::str::from_utf8(&main_path).unwrap_or("?"), core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
+    }
     let mut modules = vec![Module {
         name: module_name(main_path.rsplit(|&b| b == b'/').next().unwrap_or(&main_path)),
         path: main_path.clone(),
@@ -605,20 +644,26 @@ pub fn exec_lx_into<A: crate::Arch>(
     let env = tib + 0x100;
     let cmd = tib + 0x200;
     let tib_sel = push_descriptor(&mut ldt, tib, 4096, false, true);
-    machine.write::<u32>((tib + 4) as usize, stack.saturating_sub(main.header.stack_size));
+    machine.write::<u32>((tib + 4) as usize, stack.saturating_sub(main.header.stack_size.max(64 * 1024)));
     machine.write::<u32>((tib + 8) as usize, stack);
+    machine.write::<u32>(tib as usize, 0xffff_ffff);
+    machine.write::<u32>((tib + 16) as usize, 20);
     machine.write::<u32>((tib + 12) as usize, tib2);
     machine.write::<u32>(tib2 as usize, tid as u32 + 1);
     machine.write::<u32>(pib as usize, tid as u32 + 1);
     machine.write::<u32>((pib + 8) as usize, 1);
     machine.write::<u32>((pib + 12) as usize, cmd);
     machine.write::<u32>((pib + 16) as usize, env);
+    machine.write::<u32>((pib + 24) as usize, 2); // windowable VIO session
     machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0");
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();
     let relative = main_path.strip_prefix(croot).unwrap_or(&main_path);
-    os2_name.extend(relative.iter().map(|&b| if b == b'/' { b'\\' } else { b }));
+    os2_name.extend(relative.iter().copied().skip_while(|&b| b == b'/').map(|b| if b == b'/' { b'\\' } else { b }));
+    if crate::kernel::startup::trace_enabled() {
+        crate::compact_println!("[os2-command] {}", core::str::from_utf8(&os2_name).unwrap_or("?"));
+    }
     machine.copy_to(cmd as usize, &os2_name);
     machine.write::<u8>(cmd as usize + os2_name.len(), 0);
     machine.write::<u8>(cmd as usize + os2_name.len() + 1, 0);
@@ -638,7 +683,119 @@ pub fn exec_lx_into<A: crate::Arch>(
     current.kernel.vcpu.regs.fs = tib_sel as u64;
     let mut state = Os2State::new();
     state.ldt = ldt;
+    register_gates(&mut state, &modules);
+    machine.copy_to((PROCESS_DATA + 0x300) as usize, &[0xcd, GATE_VECTOR]);
+    machine.set_page_flags(PROCESS_DATA as usize / 4096, 1, true, true);
+    state.gates.push(Gate { cs: arch_abi::USER_CS, return_ip: PROCESS_DATA+0x302, api: Api::DllReturn, far16_args: 0 });
+    machine.copy_to((PROCESS_DATA+0x310) as usize,&[0xf4,0xcd,GATE_VECTOR]);
+    state.gates.push(Gate {cs:arch_abi::USER_CS,return_ip:PROCESS_DATA+0x313,api:Api::WaitReturn,far16_args:0});
+    state.set_exec_path(&main_path);
+    let cwd = dirname(&main_path);
+    let n = cwd.len().min(state.cwd.len());
+    state.cwd[..n].copy_from_slice(&cwd[..n]);
+    state.cwd_len = n;
+    state.modules = modules;
+    state.callback_return = state.gates.iter()
+        .find(|gate| gate.api == Api::RetroWndProcReturn)
+        .map(|gate| gate.return_ip - 2)
+        .unwrap_or(0);
+    state.on_resume(machine);
+    current.personality = thread::Personality::Os2(state);
+    Ok(())
+}
+
+fn register_gates(state: &mut Os2State, modules: &[Module]) {
     let gate_specs: &[(&[u8], &[u8], Api, u16)] = &[
+        (b"PMWIN", b"WinCloseClipbrd", Api::Pm(0, 707), 0),
+        (b"PMWIN", b"WinEmptyClipbrd", Api::Pm(0, 733), 0),
+        (b"PMWIN", b"WinOpenClipbrd", Api::Pm(0, 793), 0),
+        (b"PMWIN", b"WinQueryClipbrdData", Api::Pm(0, 806), 0),
+        (b"PMWIN", b"WinQueryClipbrdFmtInfo", Api::Pm(0, 807), 0),
+        (b"PMWIN", b"WinQueryDesktopWindow", Api::Pm(0, 813), 0),
+        (b"PMWIN", b"WinQueryFocus", Api::Pm(0, 817), 0),
+        (b"PMWIN", b"WinSetActiveWindow", Api::Pm(0, 851), 0),
+        (b"PMWIN", b"WinSetClipbrdData", Api::Pm(0, 854), 0),
+        (b"PMWIN", b"WinSetWindowText", Api::Pm(0, 877), 0),
+        (b"PMSHAPI", b"WinChangeSwitchEntry", Api::Pm(1, 123), 0),
+        (b"PMSHAPI", b"WinQuerySwitchEntry", Api::Pm(1, 124), 0),
+        (b"PMSHAPI", b"WinQuerySwitchHandle", Api::Pm(1, 125), 0),
+        (b"PMSHAPI", b"WinQueryTaskTitle", Api::Pm(1, 128), 0),
+        (b"PMSHAPI", b"WinSwitchToProgram", Api::Pm(1, 131), 0),
+        (b"PMSHAPI", b"WIN16SETTITLEANDICON", Api::Pm(1, 97), 8),
+        (b"PMWP", b"WinQueryObject", Api::Pm(2, 252), 0),
+        (b"PMWP", b"WinCreateObject", Api::Pm(2, 281), 0),
+        (b"PMWP", b"WinOpenObject", Api::Pm(2, 286), 0),
+        (b"DOSCALLS", b"DosQueryMem", Api::Base(306), 0),
+        (b"DOSCALLS", b"DosError", Api::Base(212), 0),
+        (b"DOSCALLS", b"DosSetFileInfo", Api::Base(218), 0),
+        (b"DOSCALLS", b"DosSetPathInfo", Api::Base(219), 0),
+        (b"DOSCALLS", b"DosSetDefaultDisk", Api::Base(220), 0),
+        (b"DOSCALLS", b"DosSetFSInfo", Api::Base(222), 0),
+        (b"DOSCALLS", b"DosQueryPathInfo", Api::Base(223), 0),
+        (b"DOSCALLS", b"DosDeleteDir", Api::Base(226), 0),
+        (b"DOSCALLS", b"DosSleep", Api::Base(229), 0),
+        (b"DOSCALLS", b"DosKillProcess", Api::Base(235), 0),
+        (b"DOSCALLS", b"DosSetCurrentDir", Api::Base(255), 0),
+        (b"DOSCALLS", b"DosCopy", Api::Base(258), 0),
+        (b"DOSCALLS", b"DosDelete", Api::Base(259), 0),
+        (b"DOSCALLS", b"DosDupHandle", Api::Base(260), 0),
+        (b"DOSCALLS", b"DosFindClose", Api::Base(263), 0),
+        (b"DOSCALLS", b"DosFindFirst", Api::Base(264), 0),
+        (b"DOSCALLS", b"DosFindNext", Api::Base(265), 0),
+        (b"DOSCALLS", b"DosCreateDir", Api::Base(270), 0),
+        (b"DOSCALLS", b"DosMove", Api::Base(271), 0),
+        (b"DOSCALLS", b"DosSetFileSize", Api::Base(272), 0),
+        (b"DOSCALLS", b"DosQueryCurrentDir", Api::Base(274), 0),
+        (b"DOSCALLS", b"DosQueryCurrentDisk", Api::Base(275), 0),
+        (b"DOSCALLS", b"DosQueryFSAttach", Api::Base(277), 0),
+        (b"DOSCALLS", b"DosQueryFSInfo", Api::Base(278), 0),
+        (b"DOSCALLS", b"DosQueryFileInfo", Api::Base(279), 0),
+        (b"DOSCALLS", b"DosExecPgm", Api::Base(283), 0),
+        (b"DOSCALLS", b"DosDevIOCtl", Api::Base(284), 0),
+        (b"DOSCALLS", b"DosBeep", Api::Base(286), 0),
+        (b"DOSCALLS", b"DosSetMem", Api::Base(305), 0),
+        (b"DOSCALLS", b"DosLoadModule", Api::Base(318), 0),
+        (b"DOSCALLS", b"DosQueryModuleName", Api::Base(320), 0),
+        (b"DOSCALLS", b"DosFreeModule", Api::Base(322), 0),
+        (b"DOSCALLS", b"DosQueryAppType", Api::Base(323), 0),
+        (b"DOSCALLS", b"DosGetResource", Api::Base(352), 0),
+        (b"DOSCALLS", b"DosFreeResource", Api::Base(353), 0),
+        (b"DOSCALLS", b"DosRaiseException", Api::Base(356), 0),
+        (b"DOSCALLS", b"DosUnwindException", Api::Base(357), 0),
+        (b"DOSCALLS", b"DosEnumAttribute", Api::Base(372), 0),
+        (b"DOSCALLS", b"DosSetSignalExceptionFocus", Api::Base(378), 0),
+        (b"KBDCALLS", b"KbdGetStatus", Api::Kbd(10), 6),
+        (b"KBDCALLS", b"KbdSetStatus", Api::Kbd(11), 6),
+        (b"KBDCALLS", b"KbdPeek", Api::Kbd(22), 6),
+        (b"VIOCALLS", b"VioEndPopUp", Api::Vio(1), 2),
+        (b"VIOCALLS", b"VioScrollUp", Api::Vio(7), 16),
+        (b"VIOCALLS", b"VioGetCurPos", Api::Vio(9), 10),
+        (b"VIOCALLS", b"VioPopUp", Api::Vio(11), 6),
+        (b"VIOCALLS", b"VioSetCurPos", Api::Vio(15), 6),
+        (b"VIOCALLS", b"VioWrtTTY", Api::Vio(19), 8),
+        (b"VIOCALLS", b"VioGetMode", Api::Vio(21), 6),
+        (b"VIOCALLS", b"VioSetMode", Api::Vio(22), 6),
+        (b"VIOCALLS", b"VioWrtNAttr", Api::Vio(26), 12),
+        (b"VIOCALLS", b"VioGetCurType", Api::Vio(27), 6),
+        (b"VIOCALLS", b"VioGetBuf", Api::Vio(31), 10),
+        (b"VIOCALLS", b"VioSetCurType", Api::Vio(32), 6),
+        (b"VIOCALLS", b"VioShowBuf", Api::Vio(43), 6),
+        (b"VIOCALLS", b"VioGetConfig", Api::Vio(46), 8),
+        (b"VIOCALLS", b"VioGetState", Api::Vio(49), 6),
+        (b"VIOCALLS", b"VioSetState", Api::Vio(51), 6),
+        (b"MOUCALLS", b"MouGetNumButtons", Api::Mou(8), 6),
+        (b"MOUCALLS", b"MouClose", Api::Mou(9), 2),
+        (b"MOUCALLS", b"MouGetNumQueEl", Api::Mou(13), 6),
+        (b"MOUCALLS", b"MouGetEventMask", Api::Mou(15), 6),
+        (b"MOUCALLS", b"MouSetEventMask", Api::Mou(16), 6),
+        (b"MOUCALLS", b"MouOpen", Api::Mou(17), 8),
+        (b"MOUCALLS", b"MouRemovePtr", Api::Mou(18), 6),
+        (b"MOUCALLS", b"MouGetPtrPos", Api::Mou(19), 6),
+        (b"MOUCALLS", b"MouReadEventQue", Api::Mou(20), 10),
+        (b"MOUCALLS", b"MouSetPtrPos", Api::Mou(21), 6),
+        (b"MOUCALLS", b"MouDrawPtr", Api::Mou(26), 2),
+        (b"MSG", b"DosTrueGetMessage", Api::Msg(6), 0),
+        (b"MSG", b"DosIQueryMessageCP", Api::Msg(8), 0),
         (b"DOSCALLS", b"DosQueryHType", Api::DosQueryHType, 0),
         (b"DOSCALLS", b"DosExit", Api::DosExit, 0),
         (b"DOSCALLS", b"DosResetBuffer", Api::DosResetBuffer, 0),
@@ -664,8 +821,8 @@ pub fn exec_lx_into<A: crate::Arch>(
         (b"DOSCALLS", b"DosGetNamedSharedMem", Api::DosGetNamedSharedMem, 0),
         (b"DOSCALLS", b"DosGetInfoBlocks", Api::DosGetInfoBlocks, 0),
         (b"NLS", b"DosQueryDBCSEnv", Api::DosQueryDBCSEnv, 0),
-        (b"KBDCALLS", b"KbdCharIn", Api::KbdCharIn, 6),
-        (b"VIOCALLS", b"VioGetConfig", Api::VioGetConfig, 6),
+        (b"KBDCALLS", b"KbdCharIn", Api::KbdCharIn, 8),
+
         (b"PMWIN", b"WinInitialize", Api::WinInitialize, 0),
         (b"PMWIN", b"WinCreateMsgQueue", Api::WinCreateMsgQueue, 0),
         (b"PMWIN", b"WinCreateWindow", Api::WinCreateWindow, 0),
@@ -722,8 +879,9 @@ pub fn exec_lx_into<A: crate::Arch>(
         // A process only needs gates for DLLs in its own import closure. For
         // example, a small stdio program imports DOSCALLS but no KBD/VIO/NLS
         // module; those absent optional modules are not a load failure.
-        let Some(mi) = find_module(&modules, module_name) else { continue; };
-        let Ok(target) = resolve_export(&modules, mi, None, Some(export_name)) else { continue; };
+        let Some(mi) = find_module(modules, module_name) else { continue; };
+        let Ok(target) = resolve_export(modules, mi, None, Some(export_name)) else { continue; };
+        if state.gates.iter().any(|g|g.api == api) { continue; }
         state.gates.push(Gate {
             cs: if far16_args == 0 { arch_abi::USER_CS } else { target.selector },
             return_ip: if far16_args == 0 { target.linear + 2 } else { target.offset + 2 },
@@ -731,19 +889,6 @@ pub fn exec_lx_into<A: crate::Arch>(
             far16_args,
         });
     }
-    state.set_exec_path(&main_path);
-    let cwd = dirname(&main_path);
-    let n = cwd.len().min(state.cwd.len());
-    state.cwd[..n].copy_from_slice(&cwd[..n]);
-    state.cwd_len = n;
-    state.modules = modules;
-    state.callback_return = state.gates.iter()
-        .find(|gate| gate.api == Api::RetroWndProcReturn)
-        .map(|gate| gate.return_ip - 2)
-        .unwrap_or(0);
-    state.on_resume(machine);
-    current.personality = thread::Personality::Os2(state);
-    Ok(())
 }
 
 fn gate_from_event(state: &Os2State, cs: u16, ip: u32) -> Option<Gate> {
@@ -760,11 +905,11 @@ fn finish_call<A: crate::Arch>(machine: &A, regs: &mut Regs, result: u32) {
     regs.frame.rsp = regs.frame.rsp.wrapping_add(4);
 }
 
-fn finish_gate<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
+fn finish_gate<A: crate::Arch>(machine: &A, state: &Os2State, regs: &mut Regs, gate: Gate, result: u32) {
     if gate.far16_args == 0 {
         finish_call(machine, regs, result);
     } else {
-        let sp = regs.sp() as usize;
+        let sp = stack_linear(state, regs);
         regs.rax = (regs.rax & !0xffff) | result as u16 as u64;
         regs.frame.rip = machine.read::<u16>(sp) as u64;
         regs.frame.cs = machine.read::<u16>(sp + 2) as u64;
@@ -792,9 +937,9 @@ fn os2_path(state: &Os2State, path: &[u8], create: bool) -> Result<Vec<u8>, u32>
         let mut dos = path.to_vec();
         for b in &mut dos { if *b == b'/' { *b = b'\\'; } }
         let resolved = if create {
-            crate::kernel::dos::dos_abs_to_vfs_create(&dos)
+            crate::kernel::dos::windows_abs_to_vfs(&dos, true)
         } else {
-            crate::kernel::dos::dos_abs_to_vfs(&dos)
+            crate::kernel::dos::windows_abs_to_vfs(&dos, false)
         };
         return resolved.ok_or(ERROR_FILE_NOT_FOUND);
     }
@@ -907,7 +1052,12 @@ fn dos_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     NO_ERROR
 }
 
+fn stack_linear(state: &Os2State, regs: &Regs) -> usize {
+    selector_base(state, regs.frame.ss as u16).unwrap_or(0) as usize + regs.sp() as usize
+}
+
 fn selector_base(state: &Os2State, selector: u16) -> Option<u32> {
+    if selector & 4 == 0 { return (selector == arch_abi::USER_DS).then_some(0); }
     let desc = *state.ldt.get((selector >> 3) as usize)?;
     Some((((desc >> 16) & 0xffff) | (((desc >> 32) & 0xff) << 16) | (((desc >> 56) & 0xff) << 24)) as u32)
 }
@@ -999,7 +1149,7 @@ fn begin_wndproc<A: crate::Arch>(
 }
 
 fn alloc_os2_memory<A: crate::Arch>(machine: &mut A, state: &mut Os2State, out: usize, requested: u32) -> u32 {
-    let size = requested.max(1).next_multiple_of(4096);
+    let Some(size) = requested.max(1).checked_add(4095).map(|n|n & !4095) else {return ERROR_NOT_ENOUGH_MEMORY;};
     let Some(end) = state.heap_next.checked_add(size) else { return ERROR_NOT_ENOUGH_MEMORY; };
     if end >= USER_LIMIT { return ERROR_NOT_ENOUGH_MEMORY; }
     let base = state.heap_next;
@@ -1119,6 +1269,7 @@ fn dispatch_api<A: crate::Arch>(
     regs: &mut Regs, api: Api,
 ) -> u32 {
     match api {
+        Api::Base(_) | Api::Kbd(_) | Api::Vio(_) | Api::Mou(_) | Api::Msg(_) | Api::Pm(_, _) => extra::dispatch(machine, kt, state, regs, api),
         Api::DosOpen => dos_open(machine, kt, state, regs),
         Api::DosOpenL => dos_open_l(machine, kt, state, regs),
         Api::DosSetFileLocksL => NO_ERROR,
@@ -1183,13 +1334,13 @@ fn dispatch_api<A: crate::Arch>(
                 NO_ERROR
             }
         }
-        Api::DosAllocMem | Api::DosAllocSharedMem => alloc_os2_memory(
-            machine, state, arg32(machine, regs, 0) as usize, arg32(machine, regs, 1),
-        ),
+        Api::DosAllocMem => alloc_os2_memory(machine, state, arg32(machine, regs, 0) as usize, arg32(machine, regs, 1)),
+        Api::DosAllocSharedMem => extra::alloc_shared(machine, state, regs),
         Api::DosFreeMem => {
             let address = arg32(machine, regs, 0);
             if let Some(i) = state.allocations.iter().position(|&(a, _)| a == address) {
                 state.allocations.swap_remove(i);
+                state.shared.retain(|(_,base)|*base != address);
                 NO_ERROR
             } else { ERROR_INVALID_PARAMETER }
         }
@@ -1205,6 +1356,8 @@ fn dispatch_api<A: crate::Arch>(
             if handle == 0 || handle > state.modules.len() { return 126; }
             let ordinal = arg32(machine, regs, 1);
             let name_ptr = arg32(machine, regs, 2);
+            if crate::kernel::startup::trace_enabled() { let proc_name = c_string(machine,name_ptr).unwrap_or_default();
+            crate::compact_println!("[os2-proc] handle={} ordinal={} name={}",handle,ordinal,core::str::from_utf8(&proc_name).unwrap_or("?")); }
             let target = if ordinal != 0 {
                 resolve_export(&state.modules, handle - 1, Some(ordinal as u16), None)
             } else {
@@ -1249,7 +1402,7 @@ fn dispatch_api<A: crate::Arch>(
             machine.write::<u16>(out + 6, 1996);
             NO_ERROR
         }
-        Api::DosGetNamedSharedMem => ERROR_FILE_NOT_FOUND,
+        Api::DosGetNamedSharedMem => extra::get_shared(machine, state, regs),
         Api::DosGetInfoBlocks => {
             machine.write::<u32>(arg32(machine, regs, 0) as usize, PROCESS_DATA);
             machine.write::<u32>(arg32(machine, regs, 1) as usize, PROCESS_DATA + 0x80);
@@ -1262,23 +1415,20 @@ fn dispatch_api<A: crate::Arch>(
             NO_ERROR
         }
         Api::DosFlatToSel => {
-            // In RetroOS all 32-bit user objects are flat; return a canonical
-            // data selector while preserving the flat offset in EAX.
-            arch_abi::USER_DS as u32
+            let flat = regs.rax as u32;
+            let base = flat & !0xffff;
+            let selector = state.ldt.iter().enumerate().skip(1).find_map(|(i,_)| {
+                let selector = (i as u16 * 8) | 7;
+                (selector_base(state, selector) == Some(base)).then_some(selector)
+            }).unwrap_or_else(||push_descriptor(&mut state.ldt,base,65536,false,false));
+            state.on_resume(machine);
+            ((selector as u32) << 16) | (flat & 0xffff)
         }
-        Api::DosSelToFlat => arg32(machine, regs, 0),
-        Api::KbdCharIn => NO_ERROR,
-        Api::VioGetConfig => {
-            // 16-bit Pascal args: id, far pointer, hvio. Fill the common
-            // leading length/adapter/display fields conservatively.
-            let sp = regs.sp() as usize;
-            let offset = machine.read::<u16>(sp + 6) as u32;
-            let selector = machine.read::<u16>(sp + 8);
-            if let Some(base) = selector_base(state, selector) {
-                machine.write::<u16>((base + offset) as usize, 10);
-            }
-            NO_ERROR
+        Api::DosSelToFlat => {
+            let far = regs.rax as u32;
+            selector_base(state,(far >> 16) as u16).unwrap_or(0).wrapping_add(far & 0xffff)
         }
+        Api::KbdCharIn => extra::kbd(machine, state, regs, 4),
         Api::WinInitialize => 1,
         Api::WinCreateMsgQueue => 2,
         Api::WinCreateWindow => {
@@ -1478,7 +1628,7 @@ fn dispatch_api<A: crate::Arch>(
         Api::PrfOpenProfile => 1,
         Api::PrfQueryProfileData => 0,
         Api::WinCreateHelpInstance => 1,
-        Api::DosExit => unreachable!(),
+        Api::DosExit | Api::DllReturn | Api::WaitReturn => unreachable!(),
     }
 }
 
@@ -1495,18 +1645,34 @@ pub fn handle_event<A: crate::Arch>(
         // task-selection request: keep the PM window focused and wake it when
         // input or a timer message arrives.
         crate::KernelEvent::Hlt => {
-            kt.state = thread::ThreadState::Blocked;
+            if state.waiting.is_none() {kt.state = thread::ThreadState::Blocked;}
             thread::KernelAction::Done
         }
         crate::KernelEvent::SoftInt(GATE_VECTOR) => {
             let Some(gate) = gate_from_event(state, regs.frame.cs as u16, regs.ip32()) else {
-                crate::compact_println!("OS/2: invalid API gate at {:#x}", regs.ip32());
+                crate::compact_println!("OS/2: invalid API gate at cs={:#x} ip={:#x} ss={:#x} sp={:#x}", regs.frame.cs, regs.ip32(), regs.frame.ss, regs.sp());
                 return thread::KernelAction::Exit(-1);
             };
+            if crate::kernel::startup::trace_enabled() { let name = alloc::format!("{:?}", gate.api); crate::compact_println!("[os2-api] {} sp={:#x}", name.as_str(), regs.sp()); }
             match gate.api {
                 Api::DosExit => {
                     let result = machine.read::<u32>(regs.sp() as usize + 8);
                     thread::KernelAction::Exit(result as i32)
+                }
+                Api::WaitReturn => {
+                    state.advance_timers(machine.now());
+                    if state.sleep_ready || (state.wait_key && !state.keys.is_empty()) {
+                        if let Some(saved)=state.waiting.take() {*regs=saved;regs.frame.rip-=2;}
+                    } else {regs.frame.rip=(PROCESS_DATA+0x310) as u64;}
+                    thread::KernelAction::Done
+                }
+                Api::DllReturn => {
+                    let Some(saved) = state.dll_saved.take() else {return thread::KernelAction::Exit(-1);};
+                    let success = regs.rax != 0;
+                    *regs = saved;
+                    if !success { regs.rax = 193; state.dll_init.clear(); }
+                    extra::begin_dll_init(machine, state, regs);
+                    thread::KernelAction::Done
                 }
                 Api::RetroWndProcReturn => {
                     let Some(callback) = state.callback.take() else {
@@ -1530,14 +1696,19 @@ pub fn handle_event<A: crate::Arch>(
                     if begin_wndproc(machine, regs, state, gate, message) {
                         thread::KernelAction::Done
                     } else {
-                        finish_gate(machine, regs, gate, 0);
+                        finish_gate(machine, state, regs, gate, 0);
                         thread::KernelAction::Done
                     }
                 }
                 api => {
                     let result = dispatch_api(machine, kt, state, regs, api);
-                    if api != Api::WinGetMsg || result != u32::MAX {
-                        finish_gate(machine, regs, gate, result);
+                    if result == u32::MAX && api != Api::WinGetMsg {
+                        state.waiting=Some(*regs);
+                        regs.frame.cs=arch_abi::USER_CS as u64;
+                        regs.frame.rip=(PROCESS_DATA+0x310) as u64;
+                    } else if api != Api::WinGetMsg || result != u32::MAX {
+                        finish_gate(machine, state, regs, gate, result);
+                        extra::begin_dll_init(machine, state, regs);
                     }
                     thread::KernelAction::Done
                 }

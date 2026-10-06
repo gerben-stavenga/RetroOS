@@ -73,7 +73,7 @@ const KBD_US_SHIFT: [i8; 128] = [
 /// Per-key up/down state (128 keys, 1 bit each = 16 bytes)
 static mut KEY_STATE: [u8; 16] = [0; 16];
 
-fn key_down(key: u8) -> bool {
+pub(crate) fn key_down(key: u8) -> bool {
     unsafe { KEY_STATE[(key >> 3) as usize] & (1 << (key & 7)) != 0 }
 }
 
