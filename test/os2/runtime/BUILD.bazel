@@ -7,3 +7,7 @@ os2_dll(
     module_name = "PROBE", entry = "DllEntry", exports = ["Probe.1"],
     imports = {"DosGetNamedSharedMem": "DOSCALLS.301"},
 )
+
+os2_watcom_binary(
+    name = "exec_child", src = "exec_child.c", visibility = ["//visibility:public"],
+)

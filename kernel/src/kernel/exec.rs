@@ -226,7 +226,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
         BinaryFormat::Elf => Err(-8),
         BinaryFormat::Lx if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::os2::exec_lx_into(
-                machine, threads, tid, data, path, &parent_cwd, personality_name)
+                machine, threads, tid, data, path, &parent_cwd, personality_name, &parent_env_data, &cmdtail)
         }
         BinaryFormat::Lx => Err(-8),
         BinaryFormat::Ne if matches!(exec_vga, ExecVga::None) => {

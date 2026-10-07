@@ -1000,7 +1000,7 @@ pub fn exec_pe_into<A: crate::Arch>(
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
-    parent_cwd: &[u8],
+    _parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
     parent_env: &[u8],
 ) -> Result<(), i32> {
@@ -1013,7 +1013,9 @@ pub fn exec_pe_into<A: crate::Arch>(
         crate::kernel::dos::dos_abs_to_vfs(path).unwrap_or_else(|| path.to_vec())
     } else {
         let mut b = [0u8; 164];
-        crate::kernel::exec::resolve_path(path, parent_cwd, &mut b).to_vec()
+        // The launch boundary already resolved the VFS image name. Cwd
+        // belongs to the child process, not to DLL/image path resolution.
+        crate::kernel::exec::resolve_path(path, b"", &mut b).to_vec()
     };
     let mut modules = vec![Module {
         name: b"MAIN.EXE".to_vec(),

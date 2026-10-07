@@ -690,6 +690,15 @@ fn create_process_success(regs: &mut Regs, _child_tid: i32) {
 }
 
 fn command_program(command: &[u8], app: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    // CreateProcess may take its executable from argv[0] when
+    // lpApplicationName is NULL. Recognize shell /c requests in either form
+    // so their target reaches the native loader instead of DOS EXEC.
+    let app = if app.is_empty() {
+        take_word(command).map(|(first, _)| first).filter(|first| {
+            first.rsplit(|&b| b == b'\\' || b == b'/').next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"COMMAND.COM") || name.eq_ignore_ascii_case(b"CMD.EXE"))
+        }).unwrap_or(app)
+    } else { app };
     let shell = app.rsplit(|&b| b == b'\\' || b == b'/').next()
         .is_some_and(|name| name.eq_ignore_ascii_case(b"COMMAND.COM") || name.eq_ignore_ascii_case(b"CMD.EXE"));
     let mut text = command;
@@ -730,6 +739,24 @@ fn take_word(text: &[u8]) -> Option<(&[u8], &[u8])> {
 fn virtual_key(scan: u16, ascii: u8) -> u16 {
     match scan {
         0x01 => 0x1b,
+        0x02..=0x0b => b"1234567890"[(scan - 0x02) as usize] as u16,
+        // OEM keys describe the physical key, independently of its current
+        // character. ASCII '.' (0x2e) would collide with VK_DELETE.
+        0x0c => 0xbd,
+        0x0d => 0xbb,
+        0x1a => 0xdb,
+        0x1b => 0xdd,
+        0x27 => 0xba,
+        0x28 => 0xde,
+        0x29 => 0xc0,
+        0x2b => 0xdc,
+        0x33 => 0xbc,
+        0x34 => 0xbe,
+        0x35 => 0xbf,
+        0x37 => 0x6a,
+        0x39 => 0x20,
+        0x4a => 0x6d,
+        0x4e => 0x6b,
         0x0e => 8,
         0x0f => 9,
         0x1d => 0x11,
@@ -1838,11 +1865,18 @@ fn copy_dir_bytes<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text:
     n as u32
 }
 
+// Windows permits a leading '=' for hidden entries such as '=C:', which
+// CRTs use to remember each drive's current directory. The separator is the
+// next '='; treating the leading one as a separator loses the variable name.
+fn environment_separator(entry: &[u8]) -> Option<usize> {
+    entry.iter().enumerate().skip(1).find_map(|(i, &byte)| (byte == b'=').then_some(i))
+}
+
 fn environment_value<'a>(environment: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
     environment.split(|&byte| byte == 0)
         .take_while(|entry| !entry.is_empty())
         .find_map(|entry| {
-            let eq = entry.iter().position(|&byte| byte == b'=')?;
+            let eq = environment_separator(entry)?;
             entry[..eq].eq_ignore_ascii_case(key).then_some(&entry[eq + 1..])
         })
 }
@@ -1851,7 +1885,7 @@ pub(super) fn set_environment<A: crate::Arch>(machine: &mut A, state: &mut Windo
     regs: &Regs, wide: bool) -> u32 {
     let read = |ptr| if wide { w_string(machine, ptr) } else { c_string(machine, ptr) };
     let key = match read(arg(machine, regs, 0)) {
-        Ok(key) if !key.is_empty() && !key.contains(&b'=') => key,
+        Ok(key) if !key.is_empty() && !key[1..].contains(&b'=') => key,
         _ => return fail(state, ERROR_INVALID_PARAMETER, 0),
     };
     let value_ptr = arg(machine, regs, 1);
@@ -1863,7 +1897,7 @@ pub(super) fn set_environment<A: crate::Arch>(machine: &mut A, state: &mut Windo
     };
     let mut environment = Vec::new();
     for entry in state.environment.split(|&b| b == 0).take_while(|entry| !entry.is_empty()) {
-        if entry.iter().position(|&b| b == b'=').is_some_and(|eq| entry[..eq].eq_ignore_ascii_case(&key)) {
+        if environment_separator(entry).is_some_and(|eq| entry[..eq].eq_ignore_ascii_case(&key)) {
             continue;
         }
         environment.extend_from_slice(entry);
@@ -1899,12 +1933,27 @@ mod environment_tests {
     }
 
     #[test]
+    fn inherited_hidden_drive_entries_have_distinct_names() {
+        let env = windows_environment(b"=C:=C:\\one\0=D:=D:\\two\0=c:=C:\\three\0\0");
+        assert_eq!(environment_value(&env, b"=C:"), Some(&b"C:\\three"[..]));
+        assert_eq!(environment_value(&env, b"=d:"), Some(&b"D:\\two"[..]));
+        assert_eq!(env.split(|&b| b == 0).filter(|entry| entry.starts_with(b"=c:") || entry.starts_with(b"=C:")).count(), 1);
+        assert_eq!(environment_value(&env, b""), None);
+    }
+
+    #[test]
     fn windows_dos_launch_recognizes_command_overrides() {
         let (program, tail) = command_program(
             br#""C:\RETROOS\COMMAND.COM" /c "C:\GAMES\DOOM\DOOM.EXE" -nomusic"#,
             br"C:\RETROOS\COMMAND.COM");
         assert_eq!(program, br"C:\GAMES\DOOM\DOOM.EXE");
         assert_eq!(tail, b"-nomusic");
+        let command = br#""C:\RETROOS\COMMAND.COM" /c "C:\TOOLS\WINAPP.EXE" argument"#;
+        let expected = (br"C:\TOOLS\WINAPP.EXE".to_vec(), b"argument".to_vec());
+        assert_eq!(command_program(command, br"C:\RETROOS\COMMAND.COM"), expected);
+        assert_eq!(command_program(command, b""), expected);
+        assert_eq!(command_program(br#"cmd.exe /C "C:\TOOLS\OS2APP.EXE""#, b""),
+            (br"C:\TOOLS\OS2APP.EXE".to_vec(), alloc::vec::Vec::new()));
         let cfg = b"# a comment\nDOOM.EXE repair\r\nWOLF3D.EXE iopl3\n";
         assert!(loadfix_matches(cfg, b"doom.exe"));
         assert!(loadfix_matches(cfg, b"WOLF3D.EXE"));
@@ -1924,6 +1973,41 @@ mod environment_tests {
     }
 }
 
+#[cfg(test)]
+mod keyboard_tests {
+    use super::{Console, push_key, virtual_key};
+
+    #[test]
+    fn console_period_is_not_a_delete_or_backspace_event() {
+        let mut console = Console::new();
+        push_key(&mut console, 0x34);
+        push_key(&mut console, 0xb4);
+        assert_eq!(console.input.len(), 2);
+        assert!(console.input[0].down);
+        assert_eq!(console.input[0].ascii, b'.');
+        assert_eq!(console.input[0].vk, 0xbe);
+        assert!(!console.input[1].down);
+        assert_eq!(console.input[1].vk, 0xbe);
+        assert_eq!(console.keys[0xbe], 0);
+        push_key(&mut console, 0x0e);
+        push_key(&mut console, 0xe0);
+        push_key(&mut console, 0x53);
+        assert_eq!(console.input[2].ascii, 8);
+        assert_eq!(console.input[2].vk, 8);
+        assert_eq!(console.input[3].vk, 0x2e);
+        assert_ne!(console.input[3].control & 256, 0);
+    }
+
+    #[test]
+    fn shifted_punctuation_keeps_the_same_virtual_key() {
+        for (scan, plain, shifted) in [(0x34, b'.', b'>'), (0x33, b',', b'<'),
+            (0x0c, b'-', b'_'), (0x0d, b'=', b'+'), (0x02, b'1', b'!')] {
+            assert_eq!(virtual_key(scan, plain), virtual_key(scan, shifted));
+            assert_eq!(virtual_key(scan, plain), virtual_key(scan, 0));
+        }
+    }
+}
+
 /// Merge the DOS startup environment into the Windows process environment.
 /// Windows CRTs read this through GetEnvironmentStrings at process startup.
 pub(super) fn windows_environment(dos: &[u8]) -> Vec<u8> {
@@ -1933,9 +2017,8 @@ pub(super) fn windows_environment(dos: &[u8]) -> Vec<u8> {
         b"TEMP=C:\\TEMP".to_vec(),
     ].into();
     for entry in dos.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()) {
-        let Some(eq) = entry.iter().position(|&byte| byte == b'=') else { continue };
-        if eq == 0 { continue; }
-        if let Some(old) = entries.iter().position(|old| old[..old.iter().position(|&b| b == b'=').unwrap()]
+        let Some(eq) = environment_separator(entry) else { continue };
+        if let Some(old) = entries.iter().position(|old| old[..environment_separator(old).unwrap()]
             .eq_ignore_ascii_case(&entry[..eq])) {
             entries[old] = entry.to_vec();
         } else {

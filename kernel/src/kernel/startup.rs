@@ -1492,7 +1492,7 @@ fn launch_os2<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None).unwrap_or_else(
+    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None, b"", b"").unwrap_or_else(
         |e| {
             lib::compact_panic!(
                 "OS/2 LX exec failed ({}): errno {}",
@@ -2653,6 +2653,14 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
 ) -> Option<usize> {
     use crate::kernel::exec;
 
+    // Synchronous and discard-result OS/2 children have already returned
+    // their status. Recycle them with the parent's address space active.
+    let completed = match &mut thread::get_thread(threads, parent_tid).unwrap().personality {
+        thread::Personality::Os2(os2) => os2.take_completed_children(),
+        _ => alloc::vec::Vec::new(),
+    };
+    for child in completed { thread::reap(threads, machine, child); }
+
     let parent = thread::get_thread(threads, parent_tid).expect("fork_exec: invalid parent");
     let parent_was_focused = crate::kernel::focus::focused() == parent_tid;
 
@@ -2669,7 +2677,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let parent_env_snapshot: Option<alloc::vec::Vec<u8>>;
     let parent_is_dos: bool;
     let parent_fds = parent.kernel.fds;
-    match &parent.personality {
+    match &mut parent.personality {
         thread::Personality::Dos(dos) => {
             parent_is_dos = true;
             // Drive-qualified ("D:", "C:BOOT"): the child inherits the
@@ -2703,7 +2711,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             let cwd = os2.cwd_str();
             parent_cwd_buf[..cwd.len()].copy_from_slice(cwd);
             parent_cwd_len = cwd.len();
-            parent_env_snapshot = None;
+            parent_env_snapshot = Some(os2.child_environment());
         }
         thread::Personality::Windows(windows) => {
             parent_is_dos = false;
@@ -3076,20 +3084,24 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         crate::kernel::focus::adopt(child_tid);
     }
 
-    // Switch focus to child. Parent stays Ready; it'll poll SYNTH_WAITPID
-    // when focus returns to it. No kernel-side blocking — the focused thread
-    // runs continuously, so polling is just a status query.
-    crate::compact_dbg_println!(
-        "  child tid={}, parent tid={} continues without blocking",
-        child_tid,
-        parent_tid
-    );
     on_success(vcpu, child_tid as i32);
     if let thread::Personality::Windows(windows) =
         &mut thread::get_thread(threads, parent_tid).unwrap().personality
     {
         windows.process_started(child_tid as u32 + 1);
     }
+    {
+        let parent = thread::get_thread(threads, parent_tid).unwrap();
+        if let thread::Personality::Os2(os2) = &mut parent.personality {
+            if os2.child_started(child_tid as u32 + 1) {
+                parent.kernel.state = thread::ThreadState::Blocked;
+            }
+        }
+    }
+    let parent = thread::get_thread(threads, parent_tid).unwrap();
+    crate::compact_dbg_println!("  child tid={}, parent tid={} {}", child_tid, parent_tid,
+        if parent.kernel.state == thread::ThreadState::Blocked { "waits for child" }
+        else { "continues without blocking" });
     {
         let (parent, child) = thread::get_two_threads(threads, parent_tid, child_tid);
         parent.kernel.vcpu.regs = *vcpu;

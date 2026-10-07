@@ -45,7 +45,10 @@ int main(void)
     DWORD (WINAPI *probe)(void);
     DWORD (WINAPI *console_cp)(void);
     BOOL (WINAPI *set_security)(LPCSTR, DWORD, void *);
-    char env[16];
+    char env[128];
+    char cwd[128];
+    int (__cdecl *crt_chdir)(const char *);
+    char *(__cdecl *crt_getcwd)(char *, int);
     WCHAR wide_env[16];
     if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) return 18;
     if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) return 19;
@@ -60,6 +63,54 @@ int main(void)
     if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", NULL)) return 24;
     if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 0 ||
         GetLastError() != 203) return 25;
+    /* MSVCRT _chdir records drive paths in hidden '=C:' environment entries. */
+    if (!SetEnvironmentVariableA("=C:", "C:\\first") ||
+        !SetEnvironmentVariableW(L"=D:", L"D:\\other")) return 70;
+    if (GetEnvironmentVariableA("=c:", env, sizeof(env)) != 8 ||
+        strcmp(env, "C:\\first")) return 71;
+    if (!SetEnvironmentVariableW(L"=c:", L"C:\\second") ||
+        GetEnvironmentVariableA("=C:", env, sizeof(env)) != 9 ||
+        strcmp(env, "C:\\second")) return 72;
+    if (!SetEnvironmentVariableA("=C:", NULL) ||
+        GetEnvironmentVariableA("=C:", env, sizeof(env)) != 0 ||
+        GetLastError() != 203) return 73;
+    if (GetEnvironmentVariableA("=D:", env, sizeof(env)) != 8 ||
+        strcmp(env, "D:\\other")) return 74;
+    if (SetEnvironmentVariableA("bad=name", "value") ||
+        GetLastError() != ERROR_INVALID_PARAMETER) return 75;
+    SetEnvironmentVariableW(L"=D:", NULL);
+    if (!GetCurrentDirectoryA(sizeof(cwd), cwd)) return 76;
+    module = LoadLibraryA("MSVCRT.DLL");
+    crt_chdir = (int (__cdecl *)(const char *))GetProcAddress(module, "_chdir");
+    crt_getcwd = (char *(__cdecl *)(char *, int))GetProcAddress(module, "_getcwd");
+    if (!crt_chdir || !crt_getcwd) return 77;
+    if (crt_chdir("C:\\RETROOS\\WINDOWS\\SYSTEM32") != 0 ||
+        crt_getcwd(env, sizeof(env)) != env ||
+        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) return 78;
+    if (GetEnvironmentVariableA("=C:", env, sizeof(env)) != 27 ||
+        strcmp(env, "C:\\RETROOS\\WINDOWS\\SYSTEM32")) return 79;
+    if (crt_chdir(cwd) != 0 || crt_getcwd(env, sizeof(env)) != env ||
+        strcmp(env, cwd)) return 80;
+    FreeLibrary(module);
+    {
+        STARTUPINFOA startup;
+        PROCESS_INFORMATION child;
+        char command[128];
+        const char *programs[] = {"WINCHILD.EXE", "OS2CHILD.EXE"};
+        if (!SetCurrentDirectoryA("C:\\WORK")) return 83;
+        memset(&startup, 0, sizeof(startup));
+        startup.cb = sizeof(startup);
+        for (i = 0; i < 4; ++i) {
+            sprintf(command, "C:\\RETROOS\\COMMAND.COM /c C:\\APPS\\%s", programs[i % 2]);
+            if (!CreateProcessA(i < 2 ? "C:\\RETROOS\\COMMAND.COM" : NULL,
+                    command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &child)) return 81;
+            if (WaitForSingleObject(child.hProcess, 5000) != WAIT_OBJECT_0 ||
+                !GetExitCodeProcess(child.hProcess, &code) || code != 0) return 82;
+            CloseHandle(child.hThread);
+            CloseHandle(child.hProcess);
+        }
+    }
+    if (!SetCurrentDirectoryA(cwd)) return 84;
     module = LoadLibraryA("ADVAPI32.DLL");
     set_security = (BOOL (WINAPI *)(LPCSTR, DWORD, void *))GetProcAddress(module, "SetFileSecurityA");
     if (!set_security) { printf("Security export missing, module %lu error %lu\n", (DWORD)module, GetLastError()); return 26; }

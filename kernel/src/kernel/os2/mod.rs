@@ -95,9 +95,14 @@ struct PmBitmap {
 #[derive(Clone, Copy)]
 struct Callback { dispatch_sp: u32 }
 
-/// OS/2-specific process state. The first implementation intentionally keeps
-/// process state small; TIB/PIB, threads and asynchronous operations grow here
-/// rather than leaking into the generic LX loader.
+struct ExecProcess {
+    result_out: usize,
+    synchronous: bool,
+    pid: u32,
+    exit_code: Option<i32>,
+}
+
+/// OS/2 process data, runtime services and pending child-process results.
 pub struct Os2State {
     gates: Vec<Gate>,
     ldt: Vec<u64>,
@@ -125,6 +130,10 @@ pub struct Os2State {
     sleep_ready: bool,
     wait_key: bool,
     waiting: Option<Regs>,
+    exec_process: Option<ExecProcess>,
+    environment: Vec<u8>,
+    exec_environment: Option<Vec<u8>>,
+    completed_children: Vec<i32>,
     callback_return: u32,
     timer_hwnd: u32,
     timer_id: u32,
@@ -166,6 +175,10 @@ impl Os2State {
             sleep_ready: false,
             wait_key: false,
             waiting: None,
+            exec_process: None,
+            environment: Vec::new(),
+            exec_environment: None,
+            completed_children: Vec::new(),
             callback_return: 0,
             timer_hwnd: 0,
             timer_id: 0,
@@ -184,6 +197,45 @@ impl Os2State {
 
     pub fn on_resume<A: crate::Arch>(&mut self, machine: &mut A) {
         machine.load_ldt(&self.ldt);
+        if self.exec_process.as_ref().is_some_and(|process|
+            process.pid == 0 || !process.synchronous || process.exit_code.is_some()) {
+            let process = self.exec_process.take().unwrap();
+            if process.pid != 0 {
+                let (termination, result) = if process.synchronous {
+                    let code = process.exit_code.unwrap();
+                    (if code < 0 { 4 } else { 0 }, code as u32)
+                } else { (process.pid, 0) };
+                machine.write::<u32>(process.result_out, termination);
+                machine.write::<u32>(process.result_out + 4, result);
+            }
+        }
+    }
+
+    pub(crate) fn child_started(&mut self, pid: u32) -> bool {
+        if let Some(process) = self.exec_process.as_mut() {
+            process.pid = pid;
+            process.synchronous
+        } else { false }
+    }
+
+    pub(crate) fn waiting_for_child(&self) -> Option<u32> {
+        self.exec_process.as_ref().filter(|process| process.synchronous && process.exit_code.is_none())
+            .map(|process| process.pid)
+    }
+
+    pub(crate) fn child_exited(&mut self, pid: u32, code: i32) {
+        self.completed_children.push(pid as i32 - 1);
+        if let Some(process) = self.exec_process.as_mut().filter(|process| process.pid == pid) {
+            process.exit_code = Some(code);
+        }
+    }
+
+    pub(crate) fn take_completed_children(&mut self) -> Vec<i32> {
+        core::mem::take(&mut self.completed_children)
+    }
+
+    pub(crate) fn child_environment(&mut self) -> Vec<u8> {
+        self.exec_environment.take().unwrap_or_else(|| self.environment.clone())
     }
 
     fn set_exec_path(&mut self, path: &[u8]) {
@@ -195,7 +247,8 @@ impl Os2State {
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
         if matches!(scancode & 0x7f, 0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46) {return;}
-        let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
+        let c = if scancode & 0x7f == 0x1c { b'\r' }
+            else { crate::kernel::keyboard::scancode_to_ascii(scancode) };
         let shift = extra::shift_state();
         self.keys.push((c, scancode & 0x7f, shift));
         if c == 0 { return; }
@@ -246,6 +299,7 @@ impl Os2State {
     }
 
     pub fn has_pending_message(&self) -> bool {
+        if self.waiting_for_child().is_some() { return false; }
         !self.pm_messages.is_empty() || self.sleep_ready || (self.wait_key && !self.keys.is_empty())
     }
 
@@ -551,12 +605,13 @@ fn protect_module<A: crate::Arch>(machine: &mut A, module: &Module) -> Result<()
     Ok(())
 }
 
-fn vfs_image_path(path: &[u8], personality: Option<thread::PersonalityName>, cwd: &[u8]) -> Vec<u8> {
+fn vfs_image_path(path: &[u8], personality: Option<thread::PersonalityName>) -> Vec<u8> {
     if personality == Some(thread::PersonalityName::Dos) {
         crate::kernel::dos::windows_abs_to_vfs(path, false).unwrap_or_else(|| path.to_vec())
     } else {
         let mut buf = [0u8; 164];
-        crate::kernel::exec::resolve_path(path, cwd, &mut buf).to_vec()
+        // ForkExec and boot launch supply an already-resolved VFS image.
+        crate::kernel::exec::resolve_path(path, b"", &mut buf).to_vec()
     }
 }
 
@@ -568,12 +623,14 @@ pub fn exec_lx_into<A: crate::Arch>(
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
-    parent_cwd: &[u8],
+    _parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
+    parent_env: &[u8],
+    cmdtail: &[u8],
 ) -> Result<(), i32> {
     let main_image = lx::Image::parse(&data).map_err(|_| 8)?;
     if main_image.is_dll() { return Err(8); }
-    let main_path = vfs_image_path(path, launcher, parent_cwd);
+    let main_path = vfs_image_path(path, launcher);
     if crate::kernel::startup::trace_enabled() {
         crate::compact_println!("[os2-path] image={} root={}", core::str::from_utf8(&main_path).unwrap_or("?"), core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
     }
@@ -651,13 +708,13 @@ pub fn exec_lx_into<A: crate::Arch>(
 
     // OS/2 loader process data: a TIB selected by FS, followed by TIB2, PIB,
     // environment and the two-string command block expected by Open Watcom.
-    machine.zero(PROCESS_DATA as usize, 4096);
-    machine.set_page_flags(PROCESS_DATA as usize / 4096, 1, true, false);
+    machine.zero(PROCESS_DATA as usize, 8192);
+    machine.set_page_flags(PROCESS_DATA as usize / 4096, 2, true, false);
     let tib = PROCESS_DATA;
     let tib2 = tib + 0x40;
     let pib = tib + 0x80;
-    let env = tib + 0x100;
-    let cmd = tib + 0x200;
+    let env = tib + 4096;
+    let cmd = tib + 0x400;
     let tib_sel = push_descriptor(&mut ldt, tib, 4096, false, true);
     machine.write::<u32>((tib + 4) as usize, stack.saturating_sub(main.header.stack_size.max(64 * 1024)));
     machine.write::<u32>((tib + 8) as usize, stack);
@@ -670,7 +727,11 @@ pub fn exec_lx_into<A: crate::Arch>(
     machine.write::<u32>((pib + 12) as usize, cmd);
     machine.write::<u32>((pib + 16) as usize, env);
     machine.write::<u32>((pib + 24) as usize, 2); // windowable VIO session
-    machine.copy_to(env as usize, b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0");
+    let environment = if parent_env.is_empty() {
+        b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0".to_vec()
+    } else { parent_env.to_vec() };
+    if environment.len() > 4096 { return Err(8); }
+    machine.copy_to(env as usize, &environment);
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();
@@ -681,7 +742,9 @@ pub fn exec_lx_into<A: crate::Arch>(
     }
     machine.copy_to(cmd as usize, &os2_name);
     machine.write::<u8>(cmd as usize + os2_name.len(), 0);
-    machine.write::<u8>(cmd as usize + os2_name.len() + 1, 0);
+    machine.copy_to(cmd as usize + os2_name.len() + 1, cmdtail);
+    machine.write::<u8>(cmd as usize + os2_name.len() + 1 + cmdtail.len(), 0);
+    machine.write::<u8>(cmd as usize + os2_name.len() + 2 + cmdtail.len(), 0);
 
     // The CRT entry sees an OS/2 loader frame, not a C CALL frame.
     stack = stack.checked_sub(20).ok_or(8)?;
@@ -704,6 +767,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     state.gates.push(Gate { cs: arch_abi::USER_CS, return_ip: PROCESS_DATA+0x302, api: Api::DllReturn, far16_args: 0 });
     machine.copy_to((PROCESS_DATA+0x310) as usize,&[0xf4,0xcd,GATE_VECTOR]);
     state.gates.push(Gate {cs:arch_abi::USER_CS,return_ip:PROCESS_DATA+0x313,api:Api::WaitReturn,far16_args:0});
+    state.environment = environment;
     state.set_exec_path(&main_path);
     let cwd = dirname(&main_path);
     let n = cwd.len().min(state.cwd.len());
@@ -950,19 +1014,35 @@ fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
 }
 
 fn os2_path(state: &Os2State, path: &[u8], create: bool) -> Result<Vec<u8>, u32> {
-    if path.len() >= 2 && path[1] == b':' {
-        let mut dos = path.to_vec();
-        for b in &mut dos { if *b == b'/' { *b = b'\\'; } }
-        let resolved = if create {
-            crate::kernel::dos::windows_abs_to_vfs(&dos, true)
-        } else {
-            crate::kernel::dos::windows_abs_to_vfs(&dos, false)
-        };
-        return resolved.ok_or(ERROR_FILE_NOT_FOUND);
+    let absolute = os2_absolute_path(&extra::current_dos(state), path);
+    crate::kernel::dos::windows_abs_to_vfs(&absolute, create).ok_or(ERROR_FILE_NOT_FOUND)
+}
+
+/// Form a drive-rooted OS/2 path before case-insensitive VFS lookup. The
+/// stored cwd belongs to C:, the personality's current drive. Root-relative
+/// paths reset it; parent components never escape the selected drive root.
+fn os2_absolute_path(cwd: &[u8], path: &[u8]) -> Vec<u8> {
+    let (drive, rest) = if path.len() >= 2 && path[1] == b':' {
+        (path[0].to_ascii_uppercase(), &path[2..])
+    } else { (b'C', path) };
+    let separator = |b: &u8| *b == b'/' || *b == b'\\';
+    let mut components = Vec::new();
+    if drive == b'C' && !rest.first().is_some_and(separator) {
+        components.extend(cwd.split(separator).filter(|part| !part.is_empty()));
     }
-    let mut normalized = path.to_vec();
-    for b in &mut normalized { if *b == b'\\' { *b = b'/'; } }
-    Ok(join(state.cwd_str(), &normalized))
+    for part in rest.split(separator) {
+        match part {
+            b"" | b"." => {},
+            b".." => { components.pop(); },
+            _ => components.push(part),
+        }
+    }
+    let mut absolute = vec![drive, b':', b'\\'];
+    for (index, component) in components.iter().enumerate() {
+        if index != 0 { absolute.push(b'\\'); }
+        absolute.extend_from_slice(component);
+    }
+    absolute
 }
 
 fn os2_error(error: i32) -> u32 {
@@ -1672,6 +1752,15 @@ pub fn handle_event<A: crate::Arch>(
             };
             if crate::kernel::startup::trace_enabled() { let name = alloc::format!("{:?}", gate.api); crate::compact_println!("[os2-api] {} sp={:#x}", name.as_str(), regs.sp()); }
             match gate.api {
+                Api::Base(283) => {
+                    match extra::exec_program(machine, state, regs) {
+                        Ok(action) => { finish_gate(machine, state, regs, gate, 0); action },
+                        Err(error) => {
+                            finish_gate(machine, state, regs, gate, error);
+                            thread::KernelAction::Done
+                        }
+                    }
+                }
                 Api::DosExit => {
                     let result = machine.read::<u32>(regs.sp() as usize + 8);
                     thread::KernelAction::Exit(result as i32)
@@ -1750,6 +1839,34 @@ pub fn handle_event<A: crate::Arch>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolved_vfs_image_names_are_not_relative_to_the_process_directory() {
+        assert_eq!(vfs_image_path(b"home/retroos/NDN-OS32/NDN.EXE", None), b"home/retroos/NDN-OS32/NDN.EXE");
+        assert_eq!(vfs_image_path(b"/OS2/APPS/RUNTIME.EXE", None), b"OS2/APPS/RUNTIME.EXE");
+    }
+
+    #[test]
+    fn os2_paths_resolve_parents_and_root_relative_names() {
+        let cwd = br"NDN-OS32\PLUGINS";
+        assert_eq!(os2_absolute_path(cwd, br"..\\\"), br"C:\NDN-OS32");
+        assert_eq!(os2_absolute_path(cwd, br"..\..\..\"), br"C:\");
+        assert_eq!(os2_absolute_path(cwd, br"\CONFIG\\.\"), br"C:\CONFIG");
+        assert_eq!(os2_absolute_path(cwd, br"C:..\Mixed Name"), br"C:\NDN-OS32\Mixed Name");
+        assert_eq!(os2_absolute_path(cwd, br"c:\..\CONFIG"), br"C:\CONFIG");
+        assert_eq!(os2_absolute_path(cwd, b".././README"), br"C:\NDN-OS32\README");
+    }
+
+    #[test]
+    fn keyboard_enter_is_a_carriage_return_and_release_is_not_queued() {
+        let mut state = Os2State::new();
+        let fds = [thread::FdKind::None; thread::MAX_FDS];
+        state.process_key(&fds, 0x1c);
+        state.process_key(&fds, 0x9c);
+        assert_eq!(state.keys.len(), 1);
+        assert_eq!(state.keys[0].0, b'\r');
+        assert_eq!(state.keys[0].1, 0x1c);
+    }
 
     #[test]
     fn pm_timer_wakes_an_idle_queue_without_bursting() {

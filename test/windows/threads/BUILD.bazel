@@ -17,3 +17,7 @@ windows_dll(
     exports = ["ProbeValue"],
     visibility = ["//visibility:public"],
 )
+
+windows_watcom_binary(
+    name = "spawn_child", src = "child.c", visibility = ["//visibility:public"],
+)

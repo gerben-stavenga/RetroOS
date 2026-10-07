@@ -28,12 +28,35 @@ int main(void) {
     EXCEPTIONREGISTRATIONRECORD first = {NULL, exception_handler};
     EXCEPTIONREGISTRATIONRECORD second = {NULL, exception_handler};
     PVOID old_chain;
+    RESULTCODES child;
     CHECK(((int (*)(void))execute_buffer)()==42);
     CHECK(DosSetMem((PVOID)((ULONG)execute_buffer & ~4095UL),4096,PAG_READ|PAG_WRITE|PAG_EXECUTE|PAG_COMMIT)==0);
     CHECK(((int (*)(void))execute_buffer)()==42);
     CHECK(DosQueryCurrentDisk(&disk, &map) == 0 && disk == 3 && (map & 4));
     size = sizeof(cwd);
     CHECK(DosQueryCurrentDir(0, cwd, &size) == 0 && strcmp(cwd, "OS2\\APPS") == 0);
+    /* Changing directories must store the resolved directory, not the input
+       spelling: repeated parent/root operations must not grow separators. */
+    for (count = 0; count < 4; ++count) {
+        CHECK(DosSetCurrentDir("..\\\\") == 0);
+        size = sizeof(cwd);
+        CHECK(DosQueryCurrentDir(0, cwd, &size) == 0 && strcmp(cwd, "OS2") == 0);
+        CHECK(DosSetCurrentDir(".\\apps\\\\") == 0);
+        size = sizeof(cwd);
+        CHECK(DosQueryCurrentDir(3, cwd, &size) == 0 && strcmp(cwd, "OS2\\APPS") == 0);
+    }
+    CHECK(DosSetCurrentDir("\\\\OS2\\\\APPS\\.") == 0);
+    CHECK(DosSetCurrentDir("C:..") == 0);
+    CHECK(DosSetCurrentDir("C:apps") == 0);
+    CHECK(DosSetCurrentDir("..\\..\\..") == 0);
+    size = sizeof(cwd);
+    CHECK(DosQueryCurrentDir(0, cwd, &size) == 0 && cwd[0] == 0);
+    CHECK(DosQueryPathInfo(".", FIL_QUERYFULLNAME, error, sizeof(error)) == 0 && strcmp(error, "C:\\") == 0);
+    CHECK(DosSetCurrentDir("OS2") == 0);
+    size = sizeof(cwd);
+    CHECK(DosQueryCurrentDir(0, cwd, &size) == 0 && strcmp(cwd, "OS2") == 0);
+    CHECK(DosSetCurrentDir("APPS") == 0);
+    CHECK(DosSetCurrentDir("C:\\OS2\\APPS") == 0);
     CHECK(DosGetInfoBlocks(&tib, &pib) == 0 && pib->pib_ultype == 2);
     old_chain = tib->tib_pexchain;
     CHECK(DosSetExceptionHandler(&first) == 0 && tib->tib_pexchain == &first);

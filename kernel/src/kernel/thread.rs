@@ -1005,7 +1005,9 @@ pub fn exit_thread<A: crate::Arch>(
     let mut woke_parent = false;
     if parent_tid >= 0 && (parent_tid as usize) < MAX_THREADS && parent_tid as usize != tid {
         let (thread, parent) = get_two_threads(threads, tid, parent_tid as usize);
-        let was_waiting = parent.kernel.state == ThreadState::Blocked;
+        let was_waiting = parent.kernel.state == ThreadState::Blocked
+            && !matches!(&parent.personality, Personality::Os2(os2)
+                if os2.waiting_for_child().is_some_and(|pid| pid != thread.kernel.tid as u32 + 1));
         if was_waiting {
             parent.kernel.state = ThreadState::Ready;
             match &mut parent.personality {
@@ -1019,8 +1021,8 @@ pub fn exit_thread<A: crate::Arch>(
                     // during thread switch when parent's address space is loaded.
                     linux.wait_exit_code = exit_code;
                 }
-                Personality::Os2(_) => {
-                    parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
+                Personality::Os2(os2) => {
+                    parent.kernel.vcpu.regs.rax = if os2.waiting_for_child().is_some() { 0 } else { thread.kernel.tid as u64 };
                 }
                 Personality::Windows(_) => {
                     parent.kernel.vcpu.regs.rax = thread.kernel.tid as u64;
@@ -1033,6 +1035,9 @@ pub fn exit_thread<A: crate::Arch>(
             // exit_code from the DOS personality already encodes termination
             // type in bits 8..15 and AL/vector in bits 0..7 — copy verbatim.
             dos.last_child_exit_status = exit_code as u16;
+        }
+        if let Personality::Os2(os2) = &mut parent.personality {
+            os2.child_exited(thread.kernel.tid as u32 + 1, exit_code);
         }
         if let Personality::Windows(windows) = &mut parent.personality {
             windows.process_exited(thread.kernel.tid as u32 + 1, exit_code as u32);

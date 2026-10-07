@@ -315,23 +315,40 @@ fn copy_string<A: crate::Arch>(m: &mut A, out: usize, cap: usize, bytes: &[u8]) 
     m.write::<u8>(out + bytes.len(), 0);
     NO_ERROR
 }
-fn current_dos(s: &Os2State) -> Vec<u8> {
-    let root = crate::kernel::dos::c_root();
-    let mut p = s
-        .cwd_str()
-        .strip_prefix(root)
-        .unwrap_or(s.cwd_str())
-        .to_vec();
-    while p.first() == Some(&b'/') {
-        p.remove(0);
-    }
-    for b in &mut p {
-        if *b == b'/' {
-            *b = b'\\';
-        }
-    }
-    p
+/// Convert a VFS path to a path relative to C:. C_ROOT has a trailing slash,
+/// while canonical directory paths omit it, including at the drive root.
+fn drive_relative(path: &[u8], root: &[u8]) -> Vec<u8> {
+    let root_dir = root.strip_suffix(b"/").unwrap_or(root);
+    let relative = if path == root_dir {
+        &b""[..]
+    } else {
+        path.strip_prefix(root_dir)
+            .filter(|rest| root_dir.is_empty() || rest.starts_with(b"/"))
+            .unwrap_or(path)
+    };
+    relative.iter().copied().skip_while(|&b| b == b'/')
+        .map(|b| if b == b'/' { b'\\' } else { b }).collect()
 }
+
+pub(super) fn current_dos(s: &Os2State) -> Vec<u8> {
+    drive_relative(s.cwd_str(), crate::kernel::dos::c_root())
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::drive_relative;
+
+    #[test]
+    fn drive_root_does_not_expose_its_vfs_mount_prefix() {
+        assert_eq!(drive_relative(b"home/retroos", b"home/retroos/"), b"");
+        assert_eq!(drive_relative(b"home/retroos/", b"home/retroos/"), b"");
+        assert_eq!(drive_relative(b"home/retroos/NDN-OS32", b"home/retroos/"), br"NDN-OS32");
+        assert_eq!(drive_relative(b"home/retroos/NDN-OS32/plugins", b"home/retroos/"), br"NDN-OS32\plugins");
+        assert_eq!(drive_relative(b"home/retroos-other", b"home/retroos/"), br"home\retroos-other");
+        assert_eq!(drive_relative(b"OS2/APPS", b""), br"OS2\APPS");
+    }
+}
+
 fn file_info<A: crate::Arch>(
     m: &mut A,
     out: usize,
@@ -434,6 +451,67 @@ fn wildcard(pattern: &[u8], name: &[u8]) -> bool {
     }
     p == pattern.len()
 }
+/// DosExecPgm uses two NUL-terminated argument strings (argv[0], then tail).
+/// The shared launcher owns the address-space transition; no DOS stub is run
+/// for a native PE/LX child.
+pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs)
+    -> Result<thread::KernelAction, u32> {
+    let flags = arg32(m, r, 2);
+    // Debug and asynchronous-result modes need DosWaitChild/trace support.
+    if flags > 1 { return Err(ERROR_INVALID_FUNCTION); }
+    let result_out = arg32(m, r, 5) as usize;
+    if result_out == 0 { return Err(ERROR_INVALID_PARAMETER); }
+    let name = c_string(m, arg32(m, r, 6))?;
+    let path = os2_path(s, &name, false).or_else(|error| {
+        if name.iter().any(|&b| matches!(b, b':' | b'/' | b'\\')) { return Err(error); }
+        let path_value = s.environment.split(|&b| b == 0).find_map(|entry| {
+            let eq = entry.iter().position(|&b| b == b'=')?;
+            entry[..eq].eq_ignore_ascii_case(b"PATH").then_some(&entry[eq + 1..])
+        }).unwrap_or(b"");
+        for dir in path_value.split(|&b| b == b';').filter(|dir| !dir.is_empty()) {
+            let mut candidate = dir.to_vec(); candidate.push(b'\\'); candidate.extend_from_slice(&name);
+            if let Ok(path) = os2_path(s, &candidate, false) { return Ok(path); }
+        }
+        Err(error)
+    }).map_err(|error| {
+        let out = arg32(m, r, 0) as usize;
+        if out != 0 { let _ = copy_string(m, out, arg32(m, r, 1) as usize, &name); }
+        error
+    })?;
+    let args = arg32(m, r, 3);
+    let tail = if args == 0 { Vec::new() } else {
+        let first = c_string(m, args)?;
+        c_string(m, args.checked_add(first.len() as u32 + 1).ok_or(ERROR_INVALID_PARAMETER)?)?
+    };
+    let env_ptr = arg32(m, r, 4);
+    let environment = if env_ptr == 0 { None } else {
+        let mut env = Vec::new();
+        for i in 0..4096 {
+            let byte = m.read::<u8>(env_ptr as usize + i);
+            env.push(byte);
+            if env.len() >= 2 && env[env.len() - 2..] == [0, 0] { break; }
+        }
+        if !env.ends_with(&[0, 0]) { return Err(ERROR_INVALID_PARAMETER); }
+        Some(env)
+    };
+    if path.len() > 164 || tail.len() > 127 { return Err(ERROR_INVALID_PARAMETER); }
+    let mut path_buf = [0; 164]; path_buf[..path.len()].copy_from_slice(&path);
+    let mut tail_buf = [0; 128]; tail_buf[..tail.len()].copy_from_slice(&tail);
+    s.exec_process = Some(super::ExecProcess { result_out, synchronous: flags == 0, pid: 0, exit_code: None });
+    s.exec_environment = environment;
+    let out = arg32(m, r, 0) as usize;
+    if out != 0 && arg32(m, r, 1) != 0 { m.write::<u8>(out, 0); }
+    Ok(thread::KernelAction::ForkExec {
+        path: path_buf, path_len: path.len(), cmdtail: tail_buf, cmdtail_len: tail.len(),
+        cwd: [0; 164], cwd_len: 0, personality_name: None,
+        policy: crate::kernel::dos::LaunchPolicy::default(),
+        on_error: exec_error, on_success: exec_success,
+    })
+}
+
+fn exec_error(regs: &mut Regs, error: i32) { regs.rax = error.unsigned_abs() as u64; }
+fn exec_success(regs: &mut Regs, _tid: i32) { regs.rax = 0; }
+
 pub(super) fn dispatch<A: crate::Arch>(
     m: &mut A,
     kt: &mut thread::KernelThread<A>,
@@ -497,6 +575,7 @@ pub(super) fn dispatch<A: crate::Arch>(
                 6
             }
         }
+        Api::Base(284) => ERROR_INVALID_FUNCTION,
         Api::Base(212) => NO_ERROR,
         Api::Base(220) => {
             if a(0) == 3 {
@@ -858,16 +937,7 @@ pub(super) fn dispatch<A: crate::Arch>(
             let cap = a(3) as usize;
             if level == 5 {
                 let mut p = b"C:\\".to_vec();
-                let relative = path
-                    .strip_prefix(crate::kernel::dos::c_root())
-                    .unwrap_or(&path);
-                p.extend(
-                    relative
-                        .iter()
-                        .copied()
-                        .skip_while(|b| *b == b'/')
-                        .map(|b| if b == b'/' { b'\\' } else { b }),
-                );
+                p.extend(drive_relative(&path, crate::kernel::dos::c_root()));
                 return copy_string(m, out, cap, &p);
             }
             let Some(stat) = vfs::stat(&path, true) else {

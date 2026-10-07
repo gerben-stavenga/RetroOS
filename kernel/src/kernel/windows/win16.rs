@@ -596,7 +596,7 @@ pub(super) fn exec<A: crate::Arch>(
     tid: usize,
     data: Vec<u8>,
     path: &[u8],
-    parent_cwd: &[u8],
+    _parent_cwd: &[u8],
     launcher: Option<thread::PersonalityName>,
 ) -> Result<(), i32> {
     let image = ne::Image::parse(&data).map_err(|_| -8)?;
@@ -621,7 +621,9 @@ pub(super) fn exec<A: crate::Arch>(
         crate::kernel::dos::dos_abs_to_vfs(path).unwrap_or_else(|| path.to_vec())
     } else {
         let mut b = [0u8; 164];
-        crate::kernel::exec::resolve_path(path, parent_cwd, &mut b).to_vec()
+        // The launch boundary already resolved the VFS image name. Cwd
+        // belongs to the child process, not to DLL/image path resolution.
+        crate::kernel::exec::resolve_path(path, b"", &mut b).to_vec()
     };
     // Build the complete dependency closure before applying any fixups. Real
     // Win16 libraries (for example an application's COMMDLG.DLL) contain code
