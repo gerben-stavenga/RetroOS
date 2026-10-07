@@ -1,0 +1,211 @@
+D3XX / NDN DOS64 investigation
+=============================
+
+Status: investigated, not implemented. NDN DOS64 does not yet run on RetroOS.
+These are observations from the specific binaries below, not a DPMI standard
+or a complete specification. Unknown fields must not be treated as reserved.
+
+Sources and versions
+--------------------
+
+CandyMan's D3XX thread and downloadable packages:
+  https://board.flatassembler.net/topic.php?p=152154
+  https://board.flatassembler.net/download.php?id=7859  (source)
+  https://board.flatassembler.net/download.php?id=7858  (runtime/examples)
+
+The source archive contains the 32-bit D3X foundation, including D3X.ASM,
+EXTAPI.INC, and the Adam loader. It does not contain the additional long-mode
+stage examined here. The runtime archive includes HELLO64.EXE and loaders.
+Absence from these archives does not establish that the 64-bit source is
+unavailable elsewhere.
+
+Analyzed user archive: ndn_3_00_0010_d64.zip.
+SHA256:
+  LOADER.BIN:
+    745413e3319c456964039f2aed68217925433d0603f1350b68720e6ce9c377f6
+  NDN.PRG:
+    3530224419def4bb75d655fda60e746944a18dc2a047bfce580613119203a2a1
+  Source archive (attachment 7859):
+    9a079d170c04dde144826f766629300aff264bdc94d8efaa265d6143041f0f6a
+
+Unless otherwise specified, host offsets below refer to the decompressed Adam
+payload of LOADER.BIN, with its code origin at zero. They are analysis offsets,
+not addresses to hardcode into RetroOS.
+
+Execution model and current failure
+-----------------------------------
+
+NDN.COM launches NDN.PRG. The small MZ stub in NDN.PRG executes LOADER.BIN.
+LOADER.BIN consists of a packed D3X MZ stage (declared extent 0x2bb0), followed
+by an Adam payload. That payload initially executes 32-bit code and unpacks
+the additional long-mode host.
+
+The host entry at 0x4ea5 calls INT 31h AX=EEFFh. The D3X foundation implements
+this private query in D3X.ASM, DPMI_EEFF:
+  EAX = 0x00583344 ('D3X'), EBX = 0xffffffff;
+  CL = CPU family, CH = platform.
+The source declares cpu_id and platform as adjacent bytes; MOV CX,[cpu_id]
+returns both. Platform values include 1=XMS, 2=VCPI, 3=external DPMI.
+The long-mode stage rejects CH>2; CH=2 requires an additional VCPI capability
+test through DOS AX=FF88h. It also rejects CH bits 2 and 3. This produces
+"DX64 fatal: dpmi or vcpi detected." under RetroOS's existing DPMI host.
+
+The additional host writes CR0/CR3/CR4, EFER, STAR/LSTAR/CSTAR, FS/GS base
+MSRs, and installs its own GDT/IDT. Simply returning a different EEFF result
+would allow privileged operations to execute in a ring-3 client; it would not
+provide a working 64-bit DPMI host.
+
+Hosted results after preserving NT on VM86 backend entry:
+  LOADER.BIN:   DX64 fatal: dpmi or vcpi detected. (KVM and TCG)
+  LOADERA.BIN:  D3X: error 0xFB: V86 mode          (KVM)
+  LOADERB.BIN:  DX64 fatal: dpmi or vcpi detected. (KVM)
+  LOADERBB.BIN: DX64 fatal: dpmi or vcpi detected. (KVM)
+
+Before that fix the D3X CPU probe reported "need 386+ CPU". It toggles NT
+(FLAGS bit 14) through POPF/PUSHF. Both instructions trap in VM86 at IOPL=1,
+so the flag must survive backend re-entry between them. Protected-mode NT
+masking is still retained. The KVM proof includes this exact probe; both
+arch-interp test suites and test/dpmi_rm_exception.py pass.
+
+Adam image layout
+-----------------
+
+The public source defines an 0x2c-byte header:
+  +00 u32 signature = 'Adam'
+  +04 u16 linker version
+  +06 u16 minimum version
+  +08 u32 executable size
+  +0c u32 image start, relative to Adam signature
+  +10 u32 image size
+  +14 u32 initial memory size
+  +18 u32 entry offset
+  +1c u32 initial stack offset
+  +20 u32 fixup count
+  +24 u32 flags
+  +28 u32 relocation section size
+
+D3X.ASM TARGET=3 reads the image and then the relocation section. Each u32
+relocation entry gives the end offset of a dword to adjust: add image base
+to the dword at image_base + entry - 4. Source checks 4 <= entry <= image size.
+Zero or 0xffffffff relocation size follows special paths in that source;
+these need separate handling in any implementation.
+
+NDN.PRG Adam starts at file offset 0xf0, code at 0x11c:
+  image size 0x3ede10, memory/stack 0x92ada0, entry 0x7e0,
+  relocation section size 0x17908.
+The entry is a 32-bit call/pop/far-return thunk to CS=0x28; 64-bit code starts
+at image offset 0x7ed. HELLO64.EXE instead starts with a 32-bit far jump to
+CS=0x28, image offset 0x1c. Both require a host that translates the initial
+mode transition or supplies compatible selectors.
+
+Adam is also used by the 32-bit host stage. The magic alone does not identify
+a 64-bit application. A format detector needs an explicit mode policy or a
+validated entry thunk; it must not classify every Adam image as 64-bit.
+
+64-bit service channels
+-----------------------
+
+Interrupt bridges:
+  INT A1h -> legacy INT 21h (DOS), AH/AX function.
+  INT B1h -> legacy INT 31h (DPMI), AX function.
+  INT B3h -> legacy INT 33h (mouse); used by HELLO64.EXE.
+
+The bridge at 0x2180 saves the 64-bit registers, switches to compatibility
+mode, executes a patched legacy INT at 0x22a5, then returns to long mode.
+The return at 0x21fa writes the low dwords of EAX/EBX/ECX/EDX/ESI/EDI/EBP into
+the saved qword slots and merges arithmetic flags into the IRETQ frame.
+Upper register halves remain from the saved frame. Thus these forwarded
+interfaces retain their 32-bit pointer limitations; they are not implicitly
+64-bit variants of all standard DPMI calls. Native routines provide the
+separate 64-bit heap interface described below.
+
+EXTAPI.INC confirms DOS/32A extensions used by NDN:
+  AX=FF90h: EAX = largest free extended-memory block.
+  AX=FF91h: EBX=size -> EBX=linear address, ESI=handle.
+  AX=FF92h: ESI=handle -> free block.
+  AX=FF93h: EBX=new size, ESI=handle -> resize block.
+  AX=FF9Bh: BX=selector -> EDX=base, ECX=limit.
+Carry indicates failure. NDN uses these through INT A1h during startup.
+
+SYSCALL is a private interface, with its function number on the stack:
+  push function_number
+  syscall
+
+The host entry at 0x11f0 exchanges RCX (the hardware return RIP) with [RSP],
+checks the function number in RCX, and dispatches through a 14-entry table at
+0x1208. Handlers finish with RET, consuming that stack slot. This differs
+from the usual Linux register-based syscall ABI. Hardware also places the
+saved flags in R11; several helpers use them with PUSH R11 / POPFQ.
+
+Observed dispatch table:
+  #   target   behavior
+  0   0x1240   Return loader information and callable helper pointers.
+  1   0x12db   Get interrupt handler: BL=vector -> RAX=handler.
+  2   0x139c   Set interrupt handler: BL=vector, RAX=handler.
+  3   0x12a1   Write 32-bit FS descriptor base from EAX (GDT offset 0x48).
+  4   0x12be   Write 32-bit GS descriptor base from EAX (GDT offset 0x50).
+  5   0x1713   Get exception handler: BL<32 -> RAX=handler, CF validation.
+  6   0x1728   Set exception handler: BL<32, RAX=handler, CF validation.
+  7   0x173d   Store RAX callback pointer; exact lifecycle not established.
+  8   0x2adc   Invoke DOS/32A allocate: AX=FF91h, INT A1h.
+  9   0x1745   Return EAX=0; higher-level meaning not established.
+  10  0x1748   Return helper pointers RAX=0x2300, RDX=0x2380.
+  11  0x1755   Return RAX=0x106e, RDX=0x10ad, RCX=0x10f6.
+  12  0x1768   Return RAX=0x232b, RDX=0x3548, RCX=0.
+  13  0x1777   Return RAX=0x1172, RDX=0x11ba.
+
+Helpers 10..13 need individual calling conventions, not just pointer values.
+Some point into mixed code/data regions. Their complete semantics remain
+unresolved; they must not be replaced with arbitrary success stubs.
+
+SYS0 returns (addresses relative to this particular unpacked host):
+  RAX = qword [0x5260]; RCX = qword [0x527c];
+  RDX = &0x529c; RDI = 0x0a95 (native heap dispatcher);
+  RSI = &0x2c70; R8 = 0x2b11 (termination routine);
+  R9 = &0x52bf; R10 = 0; R11 = &0x2260;
+  BH = byte [0x51ac] (VCPI capability path);
+  BL = byte [0x530a] (additional memory-policy flag);
+  R12 = &0x5260; R13 = &0x1160; R14 = &0x2bc8; R15 = &0x2b64.
+Several are pointers to mutable loader state, not merely scalar queries.
+
+Native 64-bit heap
+------------------
+
+NDN has a local heap dispatcher at image offset 0x10a20. The host also exposes
+a native heap dispatcher through SYS0.RDI (used by HELLO64). Observed NDN calls:
+  AX=0500h: query largest free block -> RAX.
+  AX=0501h: RBX=size -> RBX=allocation.
+  AX=0502h: RSI=allocation -> free.
+  AX=0503h: RSI=old allocation, RBX=new size -> RBX=new allocation.
+  AX=050Ah: RSI=allocation -> RBX=size.
+  AX=05FFh: RBX=arena base, RCX=arena length -> initialize heap.
+CF reports failure. These are ordinary function calls with private register
+conventions, not evidence that INT 31h AX=0501h accepts 64-bit addresses.
+
+NDN startup calls SYS0 and examines BH and BL. With both zero it constructs
+page tables for memory above 4GB and accesses CR3. Nonzero BH selects a path
+that bypasses this startup mapping code. This suggests a host-managed memory
+path is possible, but later dependencies and helper semantics still need
+validation before advertising such a mode.
+
+Implementation work required
+----------------------------
+
+1. Load and relocate validated Adam client images, retaining DOS PSP,
+   environment, cwd, and file handles. Translate supported entry thunks to
+   RetroOS's existing Mode64 user selector; do not execute the ring-0 loader.
+2. Add per-client 64-bit state under the DOS/DPMI implementation. Route the
+   interrupt aliases and stack-number SYSCALL convention before existing
+   16/32-bit dispatch. Supply actual callable helpers and mutable SYS0 state.
+3. Establish the remaining helper, exception, interrupt, callback and exit
+   conventions. Validate with a minimal independent 64-bit probe before NDN.
+4. Begin with a bounded low-address arena and the host-managed startup path.
+   The present DPMI allocation and real-mode interfaces use u32; supporting
+   memory above 4GB requires additional changes and cannot be inferred from
+   having a Mode64 execution backend.
+5. Use KVM and native long-mode execution for initial tests. The current TCG
+   backend explicitly runs Mode64 slices as flat 32-bit smoke paths, so it
+   cannot validate a real 64-bit client yet.
+
+System runtime code belongs in kernel/src/kernel/dos/dpmi (and lib/ if
+client-side system helpers are needed), rather than apps/.

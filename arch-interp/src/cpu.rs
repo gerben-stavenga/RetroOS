@@ -803,7 +803,7 @@ fn configure(uc: &mut Unicorn<'static, Ctx>, r: &Regs, mode: UserMode) -> u64 {
             // interrupt state. NEVER IOPL=3: that lets the guest toggle the real
             // IF behind the kernel's back and bypasses the per-swap-in IO bitmap.
             // Project VIF (bit 19) into the bit-9 IF slot the guest runs with.
-            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32) & !NT_FLAG) | (VM_FLAG as u32) | (1 << 12) | 2);
+            let flags = vif_to_if((r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2);
             let frame = [
                 r.ip32() & 0xFFFF,
                 r.code_seg() as u32,

@@ -8,6 +8,10 @@
 #define CHECK(test) do { if (!(test)) { printf("OS2RUNTIME FAIL %u\n", __LINE__); return 1; } } while (0)
 typedef ULONG (APIENTRY *PROBE)(void);
 static unsigned char execute_buffer[] = {0xb8,42,0,0,0,0xc3};
+static ULONG APIENTRY exception_handler(PEXCEPTIONREPORTRECORD report,
+    PEXCEPTIONREGISTRATIONRECORD registration, PCONTEXTRECORD context, PVOID dispatcher) {
+    return XCPT_CONTINUE_SEARCH;
+}
 int main(void) {
     ULONG disk, map, size, count, action, written;
     char cwd[260], error[260], text[16];
@@ -21,6 +25,9 @@ int main(void) {
     VIOMODEINFO mode;
     KBDINFO keyboard;
     TIB *tib; PIB *pib;
+    EXCEPTIONREGISTRATIONRECORD first = {NULL, exception_handler};
+    EXCEPTIONREGISTRATIONRECORD second = {NULL, exception_handler};
+    PVOID old_chain;
     CHECK(((int (*)(void))execute_buffer)()==42);
     CHECK(DosSetMem((PVOID)((ULONG)execute_buffer & ~4095UL),4096,PAG_READ|PAG_WRITE|PAG_EXECUTE|PAG_COMMIT)==0);
     CHECK(((int (*)(void))execute_buffer)()==42);
@@ -28,6 +35,12 @@ int main(void) {
     size = sizeof(cwd);
     CHECK(DosQueryCurrentDir(0, cwd, &size) == 0 && strcmp(cwd, "OS2\\APPS") == 0);
     CHECK(DosGetInfoBlocks(&tib, &pib) == 0 && pib->pib_ultype == 2);
+    old_chain = tib->tib_pexchain;
+    CHECK(DosSetExceptionHandler(&first) == 0 && tib->tib_pexchain == &first);
+    CHECK(DosSetExceptionHandler(&second) == 0 && tib->tib_pexchain == &second);
+    CHECK(DosSetExceptionHandler(&second) == 87);
+    CHECK(DosUnsetExceptionHandler(&first) == 0 && tib->tib_pexchain == &second);
+    CHECK(DosUnsetExceptionHandler(&second) == 0 && tib->tib_pexchain == old_chain);
     CHECK(DosAllocMem(&memory, 8192, PAG_READ|PAG_WRITE|PAG_COMMIT) == 0);
     strcpy(memory, "committed");
     CHECK(DosSetMem(memory, 8192, PAG_READ|PAG_WRITE|PAG_COMMIT) == 0 && strcmp(memory, "committed") == 0);

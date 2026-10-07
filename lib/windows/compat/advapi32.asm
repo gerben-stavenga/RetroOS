@@ -8,3 +8,5 @@ gate RegCloseKey
 gate RegCreateKeyExW
 gate RegQueryValueExW
 gate RegSetValueExW
+gate SetFileSecurityA
+gate SetFileSecurityW

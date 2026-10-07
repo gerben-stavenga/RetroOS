@@ -49,6 +49,8 @@ os2_dll(
         "DosQueryAppType.323",
         "DosGetResource.352",
         "DosFreeResource.353",
+        "DosSetExceptionHandler.354",
+        "DosUnsetExceptionHandler.355",
         "DosRaiseException.356",
         "DosUnwindException.357",
         "DosEnumAttribute.372",

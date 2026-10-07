@@ -17,12 +17,10 @@ pub(crate) const IF_FLAG: u32 = 1 << 9;
 /// as dead.
 #[cfg(feature = "kvm")]
 pub(crate) const TF_FLAG: u32 = 1 << 8;
-/// NT (Nested Task, EFLAGS bit 14). A real `INT` clears NT on entry, so DOS/DPMI
-/// guests never legitimately run with it set; the interp's software INT
-/// reflection doesn't clear it, so a once-set NT would persist and turn the
-/// guest's next `IRET` into a task-switch return (wild fault). We strip it on
-/// every guest entry so the interp matches metal (NT=0). Without this, Dos
-/// Navigator's launch path faults with Borland RTE 204.
+/// NT (Nested Task, EFLAGS bit 14). Strip it on protected-mode entry to avoid
+/// a native IRET attempting a task-switch return (Borland RTE 204 in DN).
+/// VM86 must retain NT: DOS CPU probes toggle it through emulated POPF/PUSHF
+/// to distinguish a 386 from a 286. VM86 IRET is also emulated at IOPL=1.
 pub(crate) const NT_FLAG: u32 = 1 << 14;
 /// VIF (EFLAGS bit 19) — the kernel's canonical store for the guest's virtual
 /// interrupt flag, shared with arch-metal. Both engines run the guest with its

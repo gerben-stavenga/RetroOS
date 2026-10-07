@@ -182,7 +182,7 @@ fn enter(k: &mut KvmCpu, r: &Regs, mode: UserMode) {
             regs.rip = (r.ip32() & 0xFFFF) as u64;
             regs.rsp = (r.sp32() & 0xFFFF) as u64;
             regs.rflags = vif_to_if(
-                (r.flags32() & !(IOPL_MASK as u32) & !NT_FLAG) | (VM_FLAG as u32) | (1 << 12) | 2,
+                (r.flags32() & !(IOPL_MASK as u32)) | (VM_FLAG as u32) | (1 << 12) | 2,
             ) as u64;
         }
         UserMode::Mode32 => {

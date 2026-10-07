@@ -124,6 +124,10 @@ DosGetResource: int 0x82
 global DosFreeResource
 DosFreeResource: int 0x82
 global DosRaiseException
+global DosSetExceptionHandler
+DosSetExceptionHandler: int 0x82
+global DosUnsetExceptionHandler
+DosUnsetExceptionHandler: int 0x82
 DosRaiseException: int 0x82
 global DosUnwindException
 DosUnwindException: int 0x82

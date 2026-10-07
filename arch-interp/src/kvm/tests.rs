@@ -91,6 +91,27 @@ fn kvm_engine_proofs() {
     assert_eq!(regs().rax as u16 & 0x8202, 0x0202);
     assert_eq!(regs().ip32(), 0x7D09);
 
+    // D3X detects a 386 by toggling NT with POPF and reading it with PUSHF.
+    // Both instructions trap in VM86, so NT must survive backend re-entry
+    // between them. Restore the original flags before returning to DOS.
+    mem.copy_to(0x7D20, &[
+        0x9C, 0x59,             // pushf; pop cx
+        0x89, 0xC8,             // mov ax,cx
+        0x35, 0x00, 0x40,       // xor ax,0x4000
+        0x50, 0x9D,             // push ax; popf
+        0x9C, 0x58,             // pushf; pop ax
+        0x51, 0x9D,             // push cx; popf
+        0x31, 0xC8,             // xor ax,cx
+        0xCD, 0x31,
+    ]);
+    let mut probe = r;
+    probe.set_ip32(0x7D20);
+    set_regs(probe);
+    let event = run_to_event();
+    assert!(matches!(event, KernelEvent::SoftInt(0x31)), "D3X CPU probe: {event:?}");
+    assert_eq!(regs().rax as u16, 0x4000, "NT must be writable in VM86");
+    assert_eq!(regs().flags32() & 0x4000, 0, "probe restored NT");
+
     // Both IRET widths must normalize the stacked FLAGS before re-entry.
     // Return to 0100:6e10, then PUSHF/POP AX reads what the guest observes.
     for op32 in [false, true] {

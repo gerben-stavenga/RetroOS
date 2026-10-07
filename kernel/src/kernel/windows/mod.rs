@@ -815,7 +815,9 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
     let file=name.rsplit(|&b|b==b'/' || b==b'\\').next().unwrap_or(name);
     if let Some(index)=find_module(&state.modules,file) {return Ok((state.modules[index].base,Vec::new()));}
     let raw=if file.contains(&b'.') {name.to_vec()} else {let mut path=name.to_vec();path.extend_from_slice(b".DLL");path};
-    let path=windows_path(state,&raw,false)?;
+    // A bare DLL name may exist only in SYSTEM32. Resolve the prospective
+    // local path first, then let the dependency search handle a missing file.
+    let path=windows_path(state,&raw,true)?;
     let (path,data)=match crate::kernel::exec::load_file_resolved(&path) {
         Ok(data)=>(path,data),
         Err(_)=>load_dependency(file,&state.modules[0].path).map_err(|_|126u32)?,
@@ -854,6 +856,12 @@ fn load_library<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, name:
         for module in &state.modules[start..] {
             protect_module(machine,module).map_err(|_|8u32)?;
             let image=pe::Image::parse(&module.data).map_err(|_|193u32)?;
+            for export in image.exports().map_err(|_|193u32)? {
+                if let Some(spec) = extra::lookup(&module.name, &export.name) {
+                    state.gates.push(Gate { return_ip: module.base + export.rva + 2,
+                        api: Api::Extension, arg_bytes: spec.arg_bytes, name: spec.name });
+                }
+            }
             if image.header.entry_rva!=0 {dlls.push((module.base,module.base+image.header.entry_rva));}
         }
         Ok((base,dlls))
@@ -2156,7 +2164,8 @@ fn dispatch<A: crate::Arch>(
             }
             1
         }
-        Api::SetConsoleCtrlHandler | Api::SetEnvironmentVariableA => 1,
+        Api::SetConsoleCtrlHandler => 1,
+        Api::SetEnvironmentVariableA => extra::set_environment(machine, state, regs, false),
         Api::SetUnhandledExceptionFilter => 0,
         Api::UnhandledExceptionFilter => 1,
         Api::CreateEventA => {

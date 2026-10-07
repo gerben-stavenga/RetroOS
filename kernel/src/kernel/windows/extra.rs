@@ -118,6 +118,8 @@ const SPECS: &[Spec] = &[
     spec(b"ADVAPI32", b"EnumServicesStatusExA", 40),
     spec(b"ADVAPI32", b"FileEncryptionStatusA", 8),
     spec(b"ADVAPI32", b"GetFileSecurityA", 20),
+    spec(b"ADVAPI32", b"SetFileSecurityA", 12),
+    spec(b"ADVAPI32", b"SetFileSecurityW", 12),
     spec(b"ADVAPI32", b"GetSecurityDescriptorOwner", 12),
     spec(b"ADVAPI32", b"ImpersonateLoggedOnUser", 4),
     spec(b"ADVAPI32", b"LogonUserA", 24),
@@ -145,7 +147,9 @@ const SPECS: &[Spec] = &[
     spec(b"GDIPLUS", b"GdiplusStartup", 12),
     spec(b"IPHLPAPI", b"GetIpNetTable", 12),
     spec(b"KERNEL32", b"AllocConsole", 0),
+    spec(b"KERNEL32", b"FreeConsole", 0),
     spec(b"KERNEL32", b"AreFileApisANSI", 0),
+    spec(b"KERNEL32", b"SetFileApisToANSI", 0),
     spec(b"KERNEL32", b"CopyFileA", 12),
     spec(b"KERNEL32", b"CreateFileMappingA", 24),
     spec(b"KERNEL32", b"OpenFileMappingA", 12),
@@ -238,6 +242,7 @@ const SPECS: &[Spec] = &[
     spec(b"USER32", b"DispatchMessageA", 4),
     spec(b"USER32", b"DrawAnimatedRects", 16),
     spec(b"USER32", b"EmptyClipboard", 0),
+    spec(b"USER32", b"IsClipboardFormatAvailable", 4),
     spec(b"USER32", b"EnumClipboardFormats", 4),
     spec(b"USER32", b"EnumWindows", 8),
     spec(b"USER32", b"ExitWindowsEx", 8),
@@ -381,6 +386,8 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"GetDriveTypeW", 4),
     spec(b"KERNEL32", b"GetEnvironmentStrings", 0),
     spec(b"KERNEL32", b"GetEnvironmentStringsW", 0),
+    spec(b"KERNEL32", b"GetEnvironmentVariableA", 12),
+    spec(b"KERNEL32", b"GetEnvironmentVariableW", 12),
     spec(b"KERNEL32", b"GetExitCodeProcess", 8),
     spec(b"KERNEL32", b"GetFileAttributesA", 4),
     spec(b"KERNEL32", b"GetFileAttributesW", 4),
@@ -764,6 +771,18 @@ pub(super) fn call<A: crate::Arch>(
     {
         return 0xffff_ffff;
     }
+    if name.eq_ignore_ascii_case(b"FreeConsole") {
+        // This personality keeps its console state per process; detaching
+        // does not release the process's inherited file descriptors.
+        state.console.hwnd = 0;
+        return 1;
+    }
+    if name.eq_ignore_ascii_case(b"SetFileApisToANSI") {
+        return 0; // File APIs already use the ANSI process encoding.
+    }
+    if name.eq_ignore_ascii_case(b"IsClipboardFormatAvailable") {
+        return 0; // This personality does not publish clipboard formats yet.
+    }
     if name.eq_ignore_ascii_case(b"GetCurrentProcessId") {
         return (kt.tid + 1) as u32;
     }
@@ -1084,6 +1103,33 @@ pub(super) fn call<A: crate::Arch>(
     }
     if name.eq_ignore_ascii_case(b"GetEnvironmentStringsW") {
         return env_block(machine, &state.environment, true);
+    }
+    if name.eq_ignore_ascii_case(b"GetEnvironmentVariableA")
+        || name.eq_ignore_ascii_case(b"GetEnvironmentVariableW") {
+        let wide = name.ends_with(b"W");
+        let key = match if wide { w_string(machine, arg(machine, regs, 0)) }
+            else { c_string(machine, arg(machine, regs, 0)) } {
+            Ok(key) => key,
+            Err(error) => return fail(state, error, 0),
+        };
+        let Some(value) = environment_value(&state.environment, &key) else {
+            return fail(state, 203, 0); // ERROR_ENVVAR_NOT_FOUND
+        };
+        let capacity = arg(machine, regs, 2) as usize;
+        if capacity <= value.len() { return (value.len() + 1) as u32; }
+        let output = arg(machine, regs, 1) as usize;
+        if output == 0 { return fail(state, ERROR_INVALID_PARAMETER, 0); }
+        return if wide { copy_dir_bytes(machine, output, capacity, value) }
+        else { copy_ascii(machine, output, capacity, value) };
+    }
+    if name.eq_ignore_ascii_case(b"SetEnvironmentVariableW") {
+        return set_environment(machine, state, regs, true);
+    }
+    if name.eq_ignore_ascii_case(b"SetFileSecurityA")
+        || name.eq_ignore_ascii_case(b"SetFileSecurityW") {
+        // The VFS has no Windows security-descriptor storage. Resolve the
+        // import but report failure rather than pretend an ACL was changed.
+        return fail(state, 50, 0); // ERROR_NOT_SUPPORTED
     }
     if name.eq_ignore_ascii_case(b"GetVersionExA") {
         return version(machine, arg(machine, regs, 0) as usize);
@@ -1799,6 +1845,42 @@ fn environment_value<'a>(environment: &'a [u8], key: &[u8]) -> Option<&'a [u8]> 
             let eq = entry.iter().position(|&byte| byte == b'=')?;
             entry[..eq].eq_ignore_ascii_case(key).then_some(&entry[eq + 1..])
         })
+}
+
+pub(super) fn set_environment<A: crate::Arch>(machine: &mut A, state: &mut WindowsState,
+    regs: &Regs, wide: bool) -> u32 {
+    let read = |ptr| if wide { w_string(machine, ptr) } else { c_string(machine, ptr) };
+    let key = match read(arg(machine, regs, 0)) {
+        Ok(key) if !key.is_empty() && !key.contains(&b'=') => key,
+        _ => return fail(state, ERROR_INVALID_PARAMETER, 0),
+    };
+    let value_ptr = arg(machine, regs, 1);
+    let value = if value_ptr == 0 { None } else {
+        match read(value_ptr) {
+            Ok(value) => Some(value),
+            Err(error) => return fail(state, error, 0),
+        }
+    };
+    let mut environment = Vec::new();
+    for entry in state.environment.split(|&b| b == 0).take_while(|entry| !entry.is_empty()) {
+        if entry.iter().position(|&b| b == b'=').is_some_and(|eq| entry[..eq].eq_ignore_ascii_case(&key)) {
+            continue;
+        }
+        environment.extend_from_slice(entry);
+        environment.push(0);
+    }
+    if let Some(value) = value {
+        environment.extend_from_slice(&key);
+        environment.push(b'=');
+        environment.extend_from_slice(&value);
+        environment.push(0);
+    }
+    environment.push(0);
+    if environment.len() == 1 { environment.push(0); }
+    // env_block reserves one page for ANSI and two for the wide view.
+    if environment.len() > 4096 { return fail(state, 8, 0); }
+    state.environment = environment;
+    1
 }
 
 #[cfg(test)]

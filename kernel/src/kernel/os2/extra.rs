@@ -816,6 +816,32 @@ pub(super) fn dispatch<A: crate::Arch>(
             NO_ERROR
         }
         Api::Base(353) => NO_ERROR,
+        Api::Base(354 | 355) => {
+            let record = a(0);
+            if record == 0 || record >= USER_LIMIT.saturating_sub(8) {
+                return ERROR_INVALID_PARAMETER;
+            }
+            let mut link = PROCESS_DATA;
+            for _ in 0..1024 {
+                let current = m.read::<u32>(link as usize);
+                if current == record {
+                    if api == Api::Base(354) { return ERROR_INVALID_PARAMETER; }
+                    m.write::<u32>(link as usize, m.read::<u32>(record as usize));
+                    return NO_ERROR;
+                }
+                if current == 0xffff_ffff {
+                    if api == Api::Base(355) { return ERROR_INVALID_PARAMETER; }
+                    m.write::<u32>(record as usize, m.read::<u32>(PROCESS_DATA as usize));
+                    m.write::<u32>(PROCESS_DATA as usize, record);
+                    return NO_ERROR;
+                }
+                if current == 0 || current >= USER_LIMIT.saturating_sub(8) {
+                    return ERROR_INVALID_PARAMETER;
+                }
+                link = current;
+            }
+            ERROR_INVALID_PARAMETER
+        }
         Api::Base(378) => {
             let out = a(1) as usize;
             if out != 0 {

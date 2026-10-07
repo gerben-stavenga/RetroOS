@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdio.h>
+#include <string.h>
 
 static DWORD slot;
 static HANDLE event;
@@ -43,6 +44,28 @@ int main(void)
     HMODULE module;
     DWORD (WINAPI *probe)(void);
     DWORD (WINAPI *console_cp)(void);
+    BOOL (WINAPI *set_security)(LPCSTR, DWORD, void *);
+    char env[16];
+    WCHAR wide_env[16];
+    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) return 18;
+    if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) return 19;
+    env[0] = '!';
+    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, 5) != 6 || env[0] != '!') return 20;
+    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 5 ||
+        strcmp(env, "value")) return 21;
+    if (GetEnvironmentVariableW(L"RETRO_ENV_PROBE", wide_env, 16) != 5 ||
+        wide_env[0] != 'v' || wide_env[5] != 0) return 22;
+    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "") ||
+        GetEnvironmentVariableA("RETRO_ENV_PROBE", NULL, 0) != 1) return 23;
+    if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", NULL)) return 24;
+    if (GetEnvironmentVariableA("RETRO_ENV_PROBE", env, sizeof(env)) != 0 ||
+        GetLastError() != 203) return 25;
+    module = LoadLibraryA("ADVAPI32.DLL");
+    set_security = (BOOL (WINAPI *)(LPCSTR, DWORD, void *))GetProcAddress(module, "SetFileSecurityA");
+    if (!set_security) { printf("Security export missing, module %lu error %lu\n", (DWORD)module, GetLastError()); return 26; }
+    if (set_security("WINTHREAD.EXE", 4, NULL) || GetLastError() != 50) {
+        printf("Security result mismatch, error %lu\n", GetLastError()); return 26;
+    }
     if (!VirtualProtect(thunk, sizeof(thunk), PAGE_EXECUTE_READ, &old) ||
         old != PAGE_READWRITE) return 10;
     execute_thunk = (DWORD (*)(void))thunk;

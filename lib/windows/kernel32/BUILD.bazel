@@ -16,6 +16,7 @@ windows_dll(
         "CloseHandle", "CreateEventA", "CreateFileA", "ExitProcess",
         "FlushFileBuffers", "GetACP", "GetCPInfo", "GetCommandLineA",
         "GetCommandLineW", "GetConsoleMode", "GetCurrentThreadId",
+        "GetEnvironmentVariableA", "GetEnvironmentVariableW",
         "GetFileType", "GetLastError", "GetModuleFileNameA",
         "GetModuleFileNameW", "GetModuleHandleA", "GetModuleHandleW", "GetOEMCP",
         "GetProcAddress", "GetStartupInfoA", "GetStdHandle", "GetTickCount64",

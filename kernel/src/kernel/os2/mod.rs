@@ -425,6 +425,14 @@ fn resolve_export(modules: &[Module], module_index: usize, ordinal: Option<u16>,
             || name.is_some_and(|n| eq_name(&e.name, n))
     });
     let Some(export) = export else {
+        if let Some(ordinal) = ordinal {
+            crate::compact_println!("OS/2: unresolved {} ordinal {}",
+                core::str::from_utf8(&module.name).unwrap_or("?"), ordinal);
+        } else {
+            crate::compact_println!("OS/2: unresolved {}!{}",
+                core::str::from_utf8(&module.name).unwrap_or("?"),
+                core::str::from_utf8(name.unwrap_or(&[])).unwrap_or("?"));
+        }
         return Err(127); // ERROR_PROC_NOT_FOUND
     };
     Ok(ResolvedTarget {
@@ -467,7 +475,14 @@ fn apply_fixups<A: crate::Arch>(machine: &mut A, modules: &[Module], module_inde
     let module = modules.get(module_index).ok_or(8)?;
     let image = lx::Image::parse(&module.data).map_err(|_| 8)?;
     let imports = image.import_modules().map_err(|_| 8)?;
-    for fixup in image.fixups().map_err(|_| 8)? {
+    for fixup in image.fixups().map_err(|error| {
+        let reason = match error {
+            lx::Error::Truncated => "truncated", lx::Error::BadMagic => "bad magic",
+            lx::Error::Unsupported => "unsupported record", lx::Error::BadTable => "bad table",
+        };
+        crate::compact_println!("OS/2: invalid LX fixups: {}", reason);
+        8
+    })? {
         let (source_object, page_offset) = image.page_location(fixup.page).map_err(|_| 8)?;
         let source_base = object_address(&image, module.bias, source_object as u16, page_offset)?;
         let source_signed = source_base as i64 + fixup.source_offset as i64;
@@ -760,6 +775,8 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"DOSCALLS", b"DosQueryAppType", Api::Base(323), 0),
         (b"DOSCALLS", b"DosGetResource", Api::Base(352), 0),
         (b"DOSCALLS", b"DosFreeResource", Api::Base(353), 0),
+        (b"DOSCALLS", b"DosSetExceptionHandler", Api::Base(354), 0),
+        (b"DOSCALLS", b"DosUnsetExceptionHandler", Api::Base(355), 0),
         (b"DOSCALLS", b"DosRaiseException", Api::Base(356), 0),
         (b"DOSCALLS", b"DosUnwindException", Api::Base(357), 0),
         (b"DOSCALLS", b"DosEnumAttribute", Api::Base(372), 0),

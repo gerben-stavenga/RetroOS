@@ -17,6 +17,8 @@ gate GetCPInfo
 gate GetCommandLineA
 gate GetCommandLineW
 gate GetConsoleMode
+gate GetEnvironmentVariableA
+gate GetEnvironmentVariableW
 gate GetCurrentThreadId
 gate GetFileType
 gate GetLastError
