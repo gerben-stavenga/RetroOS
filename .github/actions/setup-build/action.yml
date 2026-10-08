@@ -48,7 +48,7 @@ runs:
     run: |
       cat >> "$HOME/.bazelrc" <<'EOF'
 
-      # --- CI overrides (appended by .github/workflows/ci.yml) ---
+      # CI caches live outside the checkout to keep release build IDs clean.
       build --disk_cache=~/.cache/bazel-disk
       build --repository_cache=~/.cache/bazel-repo
       build --keep_going
