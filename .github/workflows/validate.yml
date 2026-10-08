@@ -112,7 +112,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: integration-log-${{ inputs.commit }}-${{ matrix.suite }}
+        name: integration-log-${{ inputs.commit }}-${{ matrix.suite }}-${{ github.run_attempt }}
         path: build/ci/*.log
         if-no-files-found: ignore
         retention-days: 14
@@ -143,6 +143,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: retroos-${{ inputs.commit }}
+        overwrite: true
         path: |
           build/release/retroos-vm.tar.gz
           build/release/retroos-machine.tar.gz

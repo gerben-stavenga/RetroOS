@@ -10,6 +10,9 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 - RC integration waits for directory changes and selections to finish before
   sending the next key, preventing navigation races in the test harness.
 
+- CI retries retain integration logs per attempt and can replace rebuilt
+  release artifacts.
+
 ## [0.8.0] - 2026-10-08
 
 This is the first numbered RetroOS release. It records the current DOS-focused
