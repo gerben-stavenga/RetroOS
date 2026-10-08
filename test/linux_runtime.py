@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise 64-bit musl TLS, shared threads, futexes, epoll/eventfd and timed poll."""
+"""Exercise UTF-8 locale/files, 64-bit musl threads, epoll/eventfd and timed poll."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -21,7 +21,7 @@ def main():
         log = result.stdout + result.stderr
         if result.returncode or "LINUX RUNTIME PASS" not in log or any(s in log for s in ("SEGV", "PANIC", "panicked", "fatal Exception")):
             raise SystemExit(log)
-    print("PASS: Linux x86_64 musl threads, TLS, synchronization, epoll/eventfd, poll timeout, file operations and DOS subprocess execution (KVM)")
+    print("PASS: Linux UTF-8 locale and filenames, x86_64 musl threads, TLS, synchronization, epoll/eventfd, poll timeout and DOS subprocess execution (KVM)")
 
 if __name__ == "__main__":
     main()

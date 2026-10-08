@@ -14,6 +14,8 @@ struct Event {
     data: u64,
 }
 unsafe extern "C" {
+    fn setlocale(category: i32, locale: *const std::ffi::c_char) -> *mut std::ffi::c_char;
+    fn mbrtowc(character: *mut u32, bytes: *const std::ffi::c_char, count: usize, state: *mut u8) -> usize;
     fn epoll_create1(flags: i32) -> i32;
     fn eventfd(init: u32, flags: i32) -> i32;
     fn epoll_ctl(ep: i32, op: i32, fd: i32, event: *const Event) -> i32;
@@ -26,6 +28,14 @@ unsafe extern "C" {
     fn poll(ptr: *mut u8, count: usize, timeout: i32) -> i32;
 }
 fn main() {
+    assert_eq!(std::env::var("LANG").unwrap(), "C.UTF-8");
+    unsafe {
+        assert!(!setlocale(0, c"".as_ptr()).is_null()); // LC_CTYPE from the environment.
+        let mut scalar = 0;
+        assert_eq!(mbrtowc(&mut scalar, c"Ж".as_ptr(), 2, std::ptr::null_mut()), 2);
+        assert_eq!(scalar, 'Ж' as u32);
+    }
+    println!("Unicode terminal: café Ж € ─");
     assert_eq!(MARKER.with(Cell::get), 13);
     MARKER.with(|m| m.set(17));
     let mut parent_name = *b"parent-thread-name-too-long\0";
@@ -116,6 +126,9 @@ fn main() {
         assert!(start.elapsed() >= Duration::from_millis(10));
     }
     std::fs::create_dir("probe").unwrap();
+    std::fs::write("probe/café-Ж.txt", "Unicode filename and contents: Ж€").unwrap();
+    assert_eq!(std::fs::read_to_string("probe/café-Ж.txt").unwrap(), "Unicode filename and contents: Ж€");
+    std::fs::remove_file("probe/café-Ж.txt").unwrap();
     std::fs::write("probe/file.txt", b"Linux runtime works").unwrap();
     assert_eq!(
         std::fs::read("probe/file.txt").unwrap(),

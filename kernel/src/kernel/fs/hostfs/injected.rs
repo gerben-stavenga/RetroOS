@@ -21,6 +21,7 @@ pub struct HostBackendHooks {
     pub dir_exists: fn(&[u8]) -> bool,
     pub create: fn(&[u8]) -> (i32, u64),
     pub write: fn(u64, u32, &[u8]) -> i32,
+    pub resize: fn(u64, u32) -> i32,
     pub clunk: fn(u64),
     pub remove: fn(&[u8]) -> i32,
     pub mkdir: fn(&[u8]) -> i32,
@@ -113,6 +114,10 @@ impl Filesystem for InjectedHostFs {
             size: 0,
             mode: 0o644,
         })
+    }
+
+    fn resize(&self, handle: u64, size: u32) -> i32 {
+        (backend().resize)(handle, size)
     }
 
     fn write(&self, handle: u64, offset: u32, data: &[u8]) -> i32 {

@@ -50,6 +50,93 @@ int main(void)
     int (__cdecl *crt_chdir)(const char *);
     char *(__cdecl *crt_getcwd)(char *, int);
     WCHAR wide_env[16];
+    {
+        const WCHAR unicode[] = {0x00e9, 0x0416, 0xd83d, 0xde00, 0};
+        const char utf8[] = "\xc3\xa9\xd0\x96\xf0\x9f\x98\x80";
+        const WCHAR path[] = {'C',':','\\','A','P','P','S','\\',0x00e9,0x0416,0xd83d,0xde00,'.','t','x','t',0};
+        const unsigned char binary[] = {0,0xff,0x82,0xc3,0x28};
+        WCHAR wide[32];
+        WORD types[6];
+        char converted[32], saved_cwd[128];
+        BOOL used;
+        DWORD n;
+        HANDLE file, search;
+        WIN32_FIND_DATAW found;
+        CHAR_INFO cell;
+        COORD one = {1,1}, origin = {0,0};
+        SMALL_RECT rect = {0,0,0,0};
+        if (MultiByteToWideChar(65001, 8, utf8, -1, NULL, 0) != 5 ||
+            MultiByteToWideChar(65001, 8, utf8, -1, wide, 32) != 5 ||
+            memcmp(wide, unicode, sizeof(unicode))) return 100;
+        memset(converted, '!', sizeof(converted));
+        if (WideCharToMultiByte(65001, 0, unicode, -1, converted, 8, NULL, NULL) ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || converted[0] != '!') return 101;
+        if (WideCharToMultiByte(65001, 0, unicode, -1, converted, 32, NULL, NULL) != 9 ||
+            strcmp(converted, utf8)) return 102;
+        if (MultiByteToWideChar(1252, 0, "\xe9\x80", 2, wide, 32) != 2 ||
+            wide[0] != 0xe9 || wide[1] != 0x20ac) return 103;
+        if (MultiByteToWideChar(1251, 0, "\xc6", 1, wide, 32) != 1 || wide[0] != 0x0416) return 104;
+        if (MultiByteToWideChar(65001, 8, "\xff", 1, wide, 32) || GetLastError() != 1113) return 105;
+        if (WideCharToMultiByte(1252, 0, unicode, 2, converted, 32, NULL, &used) != 2 ||
+            (unsigned char)converted[0] != 0xe9 || converted[1] != '?' || !used) return 106;
+        memset(types, 0xcc, sizeof(types));
+        if (!GetStringTypeW(CT_CTYPE1, unicode, 4, types) ||
+            !(types[0] & C1_LOWER) || !(types[1] & C1_UPPER) || types[4] != 0xcccc) return 117;
+        if (!GetStringTypeA(LOCALE_USER_DEFAULT, CT_CTYPE1, "\xe9", 1, types) ||
+            !(types[0] & C1_LOWER) || types[1] != (C1_UPPER|C1_ALPHA)) return 118;
+        if (!OemToCharBuffA("caf\x82", converted, 4) || memcmp(converted, "caf\xe9", 4) ||
+            !CharToOemBuffA("caf\xe9", converted, 4) || memcmp(converted, "caf\x82", 4)) return 119;
+        if (!SetEnvironmentVariableW(L"UNICODE_PROBE", unicode) ||
+            GetEnvironmentVariableW(L"UNICODE_PROBE", NULL, 0) != 5 ||
+            GetEnvironmentVariableW(L"UNICODE_PROBE", wide, 32) != 4 ||
+            memcmp(wide, unicode, sizeof(unicode))) return 107;
+        file = CreateFileW(path, GENERIC_READ|GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (file == INVALID_HANDLE_VALUE || !WriteFile(file, binary, sizeof(binary), &n, NULL) ||
+            n != sizeof(binary) || !CloseHandle(file)) return 108;
+        if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return 109;
+        search = FindFirstFileW(path, &found);
+        if (search == INVALID_HANDLE_VALUE || memcmp(found.cFileName, path+8, 9*sizeof(WCHAR))) return 110;
+        FindClose(search);
+        if (!GetCurrentDirectoryA(sizeof(saved_cwd), saved_cwd) ||
+            !CreateDirectoryA("C:\\APPS\\caf\xe9", NULL) ||
+            !SetCurrentDirectoryW(L"C:\\APPS\\caf\x00e9") ||
+            GetCurrentDirectoryA(sizeof(converted), converted) != 12 ||
+            strcmp(converted, "C:\\APPS\\caf\xe9") || !SetCurrentDirectoryA(saved_cwd)) return 111;
+        file = CreateFileA("C:\\APPS\\caf\xe9\\x.txt", GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (file == INVALID_HANDLE_VALUE || !CloseHandle(file)) return 112;
+        SetFileApisToOEM();
+        if (AreFileApisANSI() || GetFileAttributesA("C:\\APPS\\caf\x82\\x.txt") == INVALID_FILE_ATTRIBUTES) return 113;
+        SetFileApisToANSI();
+        if (!AreFileApisANSI()) return 114;
+        if (!SetConsoleOutputCP(1251) || GetConsoleOutputCP() != 1251 ||
+            !SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), origin) ||
+            !WriteConsoleA(GetStdHandle(STD_OUTPUT_HANDLE), "\xc6", 1, &n, NULL) || n != 1 ||
+            !ReadConsoleOutputW(GetStdHandle(STD_OUTPUT_HANDLE), &cell, one, origin, &rect) ||
+            cell.Char.UnicodeChar != 0x0416) return 115;
+        if (!SetConsoleOutputCP(GetOEMCP())) return 116;
+    }
+    {
+        const DWORD kinds[] = {LOCALE_IDATE, LOCALE_ITIME, LOCALE_SDATE, LOCALE_STIME,
+            LOCALE_STHOUSAND, LOCALE_SDECIMAL, LOCALE_ICURRDIGITS, LOCALE_SCURRENCY};
+        const char *values[] = {"0", "0", "/", ":", ",", ".", "2", "$"};
+        DWORD number;
+        WCHAR wide[8];
+        for (i = 0; i < sizeof(kinds) / sizeof(kinds[0]); ++i) {
+            memset(env, 0xcc, sizeof(env));
+            if (GetLocaleInfoA(LOCALE_USER_DEFAULT, kinds[i], env, sizeof(env)) != 2 ||
+                strcmp(env, values[i]) || (unsigned char)env[2] != 0xcc) return 85;
+        }
+        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SSHORTDATE, NULL, 0) != 9) return 86;
+        env[0] = '!';
+        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_SDATE, env, 1) != 0 ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || env[0] != '!') return 87;
+        if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_STIME, wide, 8) != 2 ||
+            wide[0] != ':' || wide[1] != 0) return 88;
+        if (GetLocaleInfoA(LOCALE_USER_DEFAULT, LOCALE_ILANGUAGE | LOCALE_RETURN_NUMBER,
+                (char *)&number, sizeof(number)) != 4 || number != 0x0409) return 89;
+        if (GetLocaleInfoW(LOCALE_USER_DEFAULT, LOCALE_ICURRDIGITS | LOCALE_RETURN_NUMBER,
+                (WCHAR *)&number, 2) != 2 || number != 2) return 90;
+    }
     if (!SetEnvironmentVariableA("RETRO_ENV_PROBE", "value")) return 18;
     if (GetEnvironmentVariableA("retro_env_probe", NULL, 0) != 6) return 19;
     env[0] = '!';

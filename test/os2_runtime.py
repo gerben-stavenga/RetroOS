@@ -68,6 +68,8 @@ def main():
                 if result.returncode != 0 or marker not in log or any(
                         bad in log for bad in ("SEGV", "PANIC", "FAIL", "unhandled event", "invalid API gate")):
                     raise SystemExit(log)
+            if (apps / "café.dat").read_bytes() != bytes([0, 255, 130, 195, 40]):
+                raise SystemExit("OS/2 OEM path or raw file contents did not cross the UTF-8 VFS boundary")
     print(f"PASS: OS/2 CRT, DLL initialization, shared memory, files, 16-bit VIO/KBD, DosExecPgm and Sleep ({engine})")
 
 

@@ -1186,7 +1186,7 @@ pub fn on_set_mode<A: crate::Arch>(
             planes,
             vga.layout(),
             0,
-            lib::codepage::current_codepage().fonts().h16,
+            &lib::codepage::current_codepage().fonts().h16,
             16,
         );
     }
@@ -1411,14 +1411,14 @@ pub fn bios_draw_glyph<A: arch_abi::GuestBytes>(
             },
         },
     };
-    let (cell_h, font): (u32, &[u8]) = match mode {
-        0x0F | 0x10 => (14, lib::codepage::current_codepage().fonts().h14),
-        0x11 | 0x12 => (16, lib::codepage::current_codepage().fonts().h16),
-        0x04 | 0x05 | 0x06 | 0x0D | 0x0E | 0x13 => (8, lib::codepage::current_codepage().fonts().h8),
-        _ => return false, // text mode (0..3, 7) — caller writes a char cell
+    let page = lib::codepage::current_codepage();
+    let (cell_h, glyph_rows): (u32, &[u8]) = match mode {
+        0x0F | 0x10 => (14, &page.font14()[ch as usize * 14..ch as usize * 14 + 14]),
+        0x11 | 0x12 => (16, lib::unicode_font::glyph16(page.decode_glyph(ch))),
+        0x04 | 0x05 | 0x06 | 0x0D | 0x0E | 0x13 => (8, &page.font8()[ch as usize * 8..ch as usize * 8 + 8]),
+        _ => return false,
     };
-    let base = ch as usize * cell_h as usize;
-    let glyph = |gy: u32| -> u8 { font[base + gy as usize] };
+    let glyph = |gy: u32| -> u8 { glyph_rows[gy as usize] };
     let (px0, py0) = (col * 8, row * cell_h);
 
     match mode {

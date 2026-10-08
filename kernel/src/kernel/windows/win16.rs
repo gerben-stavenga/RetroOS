@@ -1525,8 +1525,8 @@ fn dispatch<A: crate::Arch>(
             let color = windows.dcs.iter().find(|context| context.handle == dc)
                 .map_or(0, |context| context.text);
             for n in 0..count {
-                let ch = usize::from(machine.read::<u8>(text + n));
-                let glyph = &lib::vga_fonts::FONT_8X16[ch * 16..ch * 16 + 16];
+                let ch = super::encoding::ansi().decode(&[machine.read::<u8>(text + n)], false).unwrap();
+                let glyph = crate::kernel::text::glyph16(ch.chars().next().unwrap());
                 for (gy, &bits) in glyph.iter().enumerate() {
                     for gx in 0..8 {
                         if bits & (0x80 >> gx) != 0 {

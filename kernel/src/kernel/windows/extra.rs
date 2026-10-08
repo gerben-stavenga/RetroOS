@@ -3,6 +3,7 @@
 //! them. The text console is a character buffer painted into a Win32 window.
 
 mod system;
+use super::encoding;
 
 use super::{
     arg, c_string, copy_ascii, fail, full_windows_path, guest_windows_path, w_string, windows_path, Window,
@@ -11,7 +12,7 @@ use super::{
 };
 use crate::Regs;
 use crate::kernel::thread;
-use alloc::{vec, vec::Vec};
+use alloc::{string::ToString, vec, vec::Vec};
 
 pub(super) struct Spec {
     pub module: &'static [u8],
@@ -36,6 +37,7 @@ pub(super) struct Find {
     entries: Vec<Entry>,
     index: usize,
     wide: bool,
+    page: crate::kernel::text::Encoding,
 }
 
 struct Entry {
@@ -67,7 +69,9 @@ pub(super) struct Console {
     cursor_x: u16,
     cursor_y: u16,
     attr: u16,
-    cells: Vec<u8>,
+    cells: Vec<u32>,
+    pub(super) input_cp: u32,
+    pub(super) output_cp: u32,
     input: Vec<Key>,
     keys: [u8; 256],
     extended: bool,
@@ -86,6 +90,8 @@ impl Console {
             cursor_y: 0,
             attr: 0x07,
             cells: Vec::new(),
+            input_cp: u32::from(lib::codepage::current_codepage().id),
+            output_cp: u32::from(lib::codepage::current_codepage().id),
             input: Vec::new(),
             keys: [0; 256],
             extended: false,
@@ -101,8 +107,8 @@ impl Console {
         self.cells
             .resize(self.cols as usize * self.rows as usize * 2, 0);
         for cell in self.cells.chunks_exact_mut(2) {
-            cell[0] = b' ';
-            cell[1] = self.attr as u8;
+            cell[0] = u32::from(b' ');
+            cell[1] = u32::from(self.attr);
         }
     }
 
@@ -469,6 +475,9 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"UnlockFile", 20),
     spec(b"KERNEL32", b"WaitForSingleObject", 8),
     spec(b"KERNEL32", b"WriteConsoleOutputA", 20),
+    spec(b"KERNEL32", b"WriteConsoleOutputW", 20),
+    spec(b"KERNEL32", b"ReadConsoleOutputW", 20),
+    spec(b"KERNEL32", b"WriteConsoleW", 20),
     spec(b"KERNEL32", b"WriteConsoleOutputAttribute", 20),
     spec(b"KERNEL32", b"WriteConsoleOutputCharacterA", 20),
 ];
@@ -804,9 +813,7 @@ pub(super) fn call<A: crate::Arch>(
         state.console.hwnd = 0;
         return 1;
     }
-    if name.eq_ignore_ascii_case(b"SetFileApisToANSI") {
-        return 0; // File APIs already use the ANSI process encoding.
-    }
+    if name.eq_ignore_ascii_case(b"SetFileApisToANSI") { state.file_oem = false; return 0; }
     if name.eq_ignore_ascii_case(b"IsClipboardFormatAvailable") {
         return 0; // This personality does not publish clipboard formats yet.
     }
@@ -945,10 +952,10 @@ pub(super) fn call<A: crate::Arch>(
     {
         return u32::from(arg(machine, regs, 0) == 0);
     }
-    if name.eq_ignore_ascii_case(b"IsValidCodePage") || name.eq_ignore_ascii_case(b"IsValidLocale")
-    {
-        return 1;
+    if name.eq_ignore_ascii_case(b"IsValidCodePage") {
+        return u32::from(encoding::page(arg(machine, regs, 0)).is_some());
     }
+    if name.eq_ignore_ascii_case(b"IsValidLocale") { return 1; }
     if name.eq_ignore_ascii_case(b"SetHandleCount") {
         return arg(machine, regs, 0).max(3);
     }
@@ -1012,11 +1019,25 @@ pub(super) fn call<A: crate::Arch>(
     if name.eq_ignore_ascii_case(b"FillConsoleOutputAttribute") {
         return fill_cells(machine, state, arg(machine, regs, 1) as u8, arg(machine, regs, 2), arg(machine, regs, 3), arg(machine, regs, 4) as usize, true);
     }
-    if name.eq_ignore_ascii_case(b"WriteConsoleOutputA") {
-        return console_block(machine, state, regs, false);
+    if name.eq_ignore_ascii_case(b"WriteConsoleW") {
+        let len = arg(machine, regs, 2) as i32;
+        if len < 0 { return fail(state, ERROR_INVALID_PARAMETER, 0); }
+        if len > 0 {
+            let units = match encoding::units(machine, arg(machine, regs, 1), len) {
+                Ok(units) => units, Err(e) => return fail(state, e, 0),
+            };
+            let text = crate::kernel::text::from_utf16(&units, false).unwrap();
+            write_console_utf8(state, &text);
+        }
+        let actual = arg(machine, regs, 3) as usize;
+        if actual != 0 { machine.write::<u32>(actual, len as u32); }
+        return 1;
     }
-    if name.eq_ignore_ascii_case(b"ReadConsoleOutputA") {
-        return console_block(machine, state, regs, true);
+    if name.eq_ignore_ascii_case(b"WriteConsoleOutputA") || name.eq_ignore_ascii_case(b"WriteConsoleOutputW") {
+        return console_block(machine, state, regs, false, name.ends_with(b"W"));
+    }
+    if name.eq_ignore_ascii_case(b"ReadConsoleOutputA") || name.eq_ignore_ascii_case(b"ReadConsoleOutputW") {
+        return console_block(machine, state, regs, true, name.ends_with(b"W"));
     }
     if name.eq_ignore_ascii_case(b"GetCurrentDirectoryA") {
         return copy_dir(machine, state, arg(machine, regs, 0) as usize, arg(machine, regs, 1) as usize, false);
@@ -1030,7 +1051,7 @@ pub(super) fn call<A: crate::Arch>(
         let raw = if wide {
             w_string(machine, arg(machine, regs, 0))
         } else {
-            c_string(machine, arg(machine, regs, 0))
+            encoding::file_string(machine, state, arg(machine, regs, 0), false)
         };
         let raw = match raw {
             Ok(v) => v,
@@ -1044,7 +1065,7 @@ pub(super) fn call<A: crate::Arch>(
         let raw = if wide {
             w_string(machine, arg(machine, regs, 0))
         } else {
-            c_string(machine, arg(machine, regs, 0))
+            encoding::file_string(machine, state, arg(machine, regs, 0), false)
         };
         let raw = match raw {
             Ok(v) => v,
@@ -1057,7 +1078,7 @@ pub(super) fn call<A: crate::Arch>(
         let raw = if wide {
             w_string(machine, arg(machine, regs, 0))
         } else {
-            c_string(machine, arg(machine, regs, 0))
+            encoding::file_string(machine, state, arg(machine, regs, 0), false)
         };
         let raw = match raw {
             Ok(v) => v,
@@ -1081,7 +1102,7 @@ pub(super) fn call<A: crate::Arch>(
     }
     if name.eq_ignore_ascii_case(b"MoveFileA") || name.eq_ignore_ascii_case(b"MoveFileW") {
         let wide = name.ends_with(b"W");
-        let read = |n| if wide { w_string(machine, arg(machine, regs, n)) } else { c_string(machine, arg(machine, regs, n)) };
+        let read = |n| if wide { w_string(machine, arg(machine, regs, n)) } else { encoding::file_string(machine, state, arg(machine, regs, n), false) };
         let from = match read(0) { Ok(v) => v, Err(e) => return fail(state, e, 0) };
         let to = match read(1) { Ok(v) => v, Err(e) => return fail(state, e, 0) };
         let from = match windows_path(state, &from, false) { Ok(v) => v, Err(e) => return fail(state, e, 0) };
@@ -1143,7 +1164,7 @@ pub(super) fn call<A: crate::Arch>(
             return fail(state, 203, 0); // ERROR_ENVVAR_NOT_FOUND
         };
         let capacity = arg(machine, regs, 2) as usize;
-        if capacity <= value.len() { return (value.len() + 1) as u32; }
+        if capacity <= encoding::encode(value, wide).len() { return (encoding::encode(value, wide).len() + 1) as u32; }
         let output = arg(machine, regs, 1) as usize;
         if output == 0 { return fail(state, ERROR_INVALID_PARAMETER, 0); }
         return if wide { copy_dir_bytes(machine, output, capacity, value) }
@@ -1181,7 +1202,7 @@ pub(super) fn call<A: crate::Arch>(
         return map_string(machine, regs, name.ends_with(b"W"));
     }
     if name.eq_ignore_ascii_case(b"GetLocaleInfoA") || name.eq_ignore_ascii_case(b"GetLocaleInfoW") {
-        return locale_info(machine, regs, name.ends_with(b"W"));
+        return locale_info(machine, state, regs, name.ends_with(b"W"));
     }
     if name.eq_ignore_ascii_case(b"GetStringTypeA") || name.eq_ignore_ascii_case(b"GetStringTypeW") {
         return string_type(machine, regs, name.ends_with(b"W"));
@@ -1341,14 +1362,14 @@ fn paint(state: &mut WindowsState) {
     for y in 0..rows {
         for x in 0..cols {
             let at = (y * cols + x) * 2;
-            let ch = cells[at] as usize;
-            let attr = cells[at + 1];
+            let ch = char::from_u32(cells[at]).unwrap_or('\u{fffd}');
+            let attr = cells[at + 1] as u8;
             let (fg, bg) = if cursor == (x, y) {
                 (color(attr >> 4), color(attr))
             } else {
                 (color(attr), color(attr >> 4))
             };
-            let glyph = &lib::vga_fonts::FONT_8X16[ch.min(255) * 16..ch.min(255) * 16 + 16];
+            let glyph = crate::kernel::text::glyph16(ch);
             for (row, &bits) in glyph.iter().enumerate().take(16) {
                 for col in 0..8 {
                     let pixel = if bits & (0x80 >> col) != 0 { fg } else { bg };
@@ -1362,10 +1383,14 @@ fn paint(state: &mut WindowsState) {
         }
     }
     state.dirty = true;
-    crate::term::term().blit_cells(
+    let display: Vec<lib::term::Cell> = cells.chunks_exact(2).map(|cell| lib::term::Cell {
+        character: char::from_u32(cell[0]).unwrap_or('�'),
+        attribute: cell[1] as u8,
+    }).collect();
+    crate::term::term().blit_unicode_cells(
         cols,
         rows,
-        &cells,
+        &display,
         cursor.0,
         cursor.1,
     );
@@ -1404,6 +1429,7 @@ fn console_block<A: crate::Arch>(
     state: &mut WindowsState,
     regs: &Regs,
     read: bool,
+    wide: bool,
 ) -> u32 {
     let buffer = arg(machine, regs, 1) as usize;
     let size = arg(machine, regs, 2);
@@ -1443,11 +1469,20 @@ fn console_block<A: crate::Arch>(
                 let guest = buffer + (sy as usize * buf_w as usize + sx as usize) * 4;
                 let screen = (row as usize * cols as usize + col as usize) * 2;
                 if read {
-                    machine.write::<u16>(guest, u16::from(state.console.cells[screen]));
-                    machine.write::<u16>(guest + 2, u16::from(state.console.cells[screen + 1]));
+                    let ch = char::from_u32(state.console.cells[screen]).unwrap_or('?');
+                    let unit = if wide { u16::try_from(ch as u32).unwrap_or(0xfffd) }
+                        else { u16::from(encoding::page(state.console.output_cp).unwrap().encode(&ch.to_string(), b'?').0[0]) };
+                    machine.write::<u16>(guest, unit);
+                    machine.write::<u16>(guest + 2, state.console.cells[screen + 1] as u16);
                 } else {
-                    state.console.cells[screen] = machine.read::<u16>(guest) as u8;
-                    state.console.cells[screen + 1] = machine.read::<u16>(guest + 2) as u8;
+                    let byte = machine.read::<u8>(guest);
+                    let ch = if wide { char::from_u32(u32::from(machine.read::<u16>(guest))).unwrap_or('\u{fffd}') }
+                    else { match encoding::page(state.console.output_cp).unwrap() {
+                        crate::kernel::text::Encoding::SingleByte(page) => page.decode_glyph(byte),
+                        crate::kernel::text::Encoding::Utf8 => char::from(byte),
+                    } };
+                    state.console.cells[screen] = ch as u32;
+                    state.console.cells[screen + 1] = u32::from(machine.read::<u16>(guest + 2));
                 }
             }
         }
@@ -1468,33 +1503,31 @@ pub(super) fn write_console_text<A: crate::Arch>(
     src: usize,
     len: usize,
 ) {
+    let bytes: Vec<u8> = (0..len).map(|i| machine.read::<u8>(src + i)).collect();
+    let text = encoding::page(state.console.output_cp).unwrap().decode(&bytes, false).unwrap();
+    write_console_utf8(state, &text);
+}
+
+pub(super) fn write_console_utf8(state: &mut WindowsState, text: &str) {
     ensure_window(state);
-    for i in 0..len {
-        let byte = machine.read::<u8>(src + i);
-        match byte {
-            b'\r' => state.console.cursor_x = 0,
-            b'\n' => {
+    for ch in text.chars() {
+        match ch {
+            '\r' => state.console.cursor_x = 0,
+            '\n' => {
                 state.console.cursor_x = 0;
-                if state.console.cursor_y + 1 < state.console.rows {
-                    state.console.cursor_y += 1;
-                }
+                if state.console.cursor_y + 1 < state.console.rows { state.console.cursor_y += 1; }
             }
             ch => {
-                let x = state.console.cursor_x;
-                let y = state.console.cursor_y;
-                let cols = state.console.cols;
-                let at = (y as usize * cols as usize + x as usize) * 2;
+                let at = (state.console.cursor_y as usize * state.console.cols as usize
+                    + state.console.cursor_x as usize) * 2;
                 if at + 1 < state.console.cells.len() {
-                    state.console.cells[at] = ch;
-                    state.console.cells[at + 1] = state.console.attr as u8;
+                    state.console.cells[at] = ch as u32;
+                    state.console.cells[at + 1] = u32::from(state.console.attr);
                 }
-                if x + 1 < cols {
-                    state.console.cursor_x = x + 1;
-                } else {
+                state.console.cursor_x += 1;
+                if state.console.cursor_x >= state.console.cols {
                     state.console.cursor_x = 0;
-                    if y + 1 < state.console.rows {
-                        state.console.cursor_y = y + 1;
-                    }
+                    state.console.cursor_y = (state.console.cursor_y + 1).min(state.console.rows - 1);
                 }
             }
         }
@@ -1520,9 +1553,12 @@ fn write_chars<A: crate::Arch>(
     for i in 0..n {
         let at = (start + i) * 2;
         if attrs {
-            state.console.cells[at + 1] = machine.read::<u16>(src + i * 2) as u8;
+            state.console.cells[at + 1] = u32::from(machine.read::<u16>(src + i * 2));
         } else {
-            state.console.cells[at] = machine.read::<u8>(src + i);
+            state.console.cells[at] = match encoding::page(state.console.output_cp).unwrap() {
+                crate::kernel::text::Encoding::SingleByte(page) => page.decode(machine.read::<u8>(src + i)) as u32,
+                crate::kernel::text::Encoding::Utf8 => u32::from(machine.read::<u8>(src + i)),
+            };
         }
     }
     if written != 0 {
@@ -1550,9 +1586,12 @@ fn fill_cells<A: crate::Arch>(
     for i in 0..n {
         let at = (start + i) * 2;
         if attrs {
-            state.console.cells[at + 1] = value;
+            state.console.cells[at + 1] = u32::from(value);
         } else {
-            state.console.cells[at] = value;
+            state.console.cells[at] = match encoding::page(state.console.output_cp).unwrap() {
+                crate::kernel::text::Encoding::SingleByte(page) => page.decode_glyph(value) as u32,
+                crate::kernel::text::Encoding::Utf8 => u32::from(value),
+            };
         }
     }
     if written != 0 {
@@ -1629,22 +1668,7 @@ fn current_dos(state: &WindowsState) -> Vec<u8> {
 }
 
 fn copy_dir<A: crate::Arch>(machine: &mut A, state: &WindowsState, cap: usize, out: usize, wide: bool) -> u32 {
-    let text = current_dos(state);
-    if wide {
-        if out == 0 {
-            return (text.len() + 1) as u32;
-        }
-        let n = text.len().min(cap.saturating_sub(1));
-        for (i, &byte) in text[..n].iter().enumerate() {
-            machine.write::<u16>(out + i * 2, u16::from(byte));
-        }
-        machine.write::<u16>(out + n * 2, 0);
-        n as u32
-    } else if out == 0 {
-        (text.len() + 1) as u32
-    } else {
-        copy_ascii(machine, out, cap, &text)
-    }
+    encoding::copy_with(machine, out, cap, &current_dos(state), wide, encoding::file_page(state))
 }
 
 fn set_directory(state: &mut WindowsState, raw: &[u8]) -> u32 {
@@ -1691,34 +1715,7 @@ fn split_pattern(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
-    if pattern == b"*" || pattern == b"*.*" {
-        return true;
-    }
-    let mut pi = 0;
-    let mut ni = 0;
-    let mut star = None;
-    let mut mark = 0;
-    let pat = pattern;
-    while ni < name.len() {
-        if pi < pat.len() && (pat[pi] == b'?' || pat[pi].eq_ignore_ascii_case(&name[ni])) {
-            pi += 1;
-            ni += 1;
-        } else if pi < pat.len() && pat[pi] == b'*' {
-            star = Some(pi);
-            pi += 1;
-            mark = ni;
-        } else if let Some(at) = star {
-            pi = at + 1;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < pat.len() && pat[pi] == b'*' {
-        pi += 1;
-    }
-    pi == pat.len()
+    crate::kernel::text::wildcard(pattern, name)
 }
 
 fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[u8], out: usize, wide: bool) -> u32 {
@@ -1755,10 +1752,11 @@ fn find_first<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, raw: &[
     if entries.is_empty() {
         return fail(state, ERROR_FILE_NOT_FOUND, INVALID_HANDLE_VALUE);
     }
-    write_find(machine, out, &entries[0], wide);
+    let page = encoding::file_page(state);
+    write_find(machine, out, &entries[0], wide, page);
     let handle = state.next_find;
     state.next_find += 1;
-    state.finds.push(Find { handle, entries, index: 1, wide });
+    state.finds.push(Find { handle, entries, index: 1, wide, page });
     handle
 }
 
@@ -1769,31 +1767,18 @@ fn find_next<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, handle: 
     if find.index >= find.entries.len() {
         return fail(state, 18, 0);
     }
-    write_find(machine, out, &find.entries[find.index], find.wide);
+    write_find(machine, out, &find.entries[find.index], find.wide, find.page);
     find.index += 1;
     1
 }
 
-fn write_find<A: crate::Arch>(machine: &mut A, out: usize, entry: &Entry, wide: bool) {
+fn write_find<A: crate::Arch>(machine: &mut A, out: usize, entry: &Entry, wide: bool, page: crate::kernel::text::Encoding) {
     machine.zero(out, if wide { 592 } else { 318 });
     machine.write::<u32>(out, if entry.dir { 0x10 } else { 0x20 });
     machine.write::<u64>(out + 20, filetime(entry.mtime));
     machine.write::<u32>(out + 32, entry.size);
-    if wide {
-        for (i, &byte) in entry.name.iter().take(259).enumerate() {
-            machine.write::<u16>(out + 44 + i * 2, u16::from(byte));
-        }
-        for (i, &byte) in entry.short.iter().take(13).enumerate() {
-            machine.write::<u16>(out + 564 + i * 2, u16::from(byte));
-        }
-    } else {
-        let n = entry.name.len().min(259);
-        machine.copy_to(out + 44, &entry.name[..n]);
-        let s = entry.short.len().min(13);
-        if s != 0 {
-            machine.copy_to(out + 304, &entry.short[..s]);
-        }
-    }
+    encoding::copy_with(machine, out + 44, 260, &entry.name, wide, page);
+    encoding::copy_with(machine, out + if wide { 564 } else { 304 }, 14, &entry.short, wide, page);
 }
 
 fn mutate_path<A: crate::Arch>(
@@ -1806,7 +1791,7 @@ fn mutate_path<A: crate::Arch>(
     let raw = if wide {
         w_string(machine, arg(machine, regs, 0))
     } else {
-        c_string(machine, arg(machine, regs, 0))
+        encoding::file_string(machine, state, arg(machine, regs, 0), false)
     };
     let raw = match raw {
         Ok(v) => v,
@@ -1831,7 +1816,7 @@ fn full_path<A: crate::Arch>(machine: &mut A, state: &WindowsState, regs: &Regs,
     let raw = if wide {
         w_string(machine, arg(machine, regs, 0))
     } else {
-        c_string(machine, arg(machine, regs, 0))
+        encoding::file_string(machine, state, arg(machine, regs, 0), false)
     };
     let raw = match raw {
         Ok(v) => v,
@@ -1844,25 +1829,13 @@ fn full_path<A: crate::Arch>(machine: &mut A, state: &WindowsState, regs: &Regs,
     let file = absolute.iter().rposition(|&b| b == b'\\').map(|n| n + 1).unwrap_or(0);
     if part != 0 && buf != 0 {
         let width = if wide { 2 } else { 1 };
-        machine.write::<u32>(part, buf as u32 + (file * width) as u32);
+        machine.write::<u32>(part, buf as u32 + (encoding::encode_with(&absolute[..file], wide, encoding::file_page(state)).len() * width) as u32);
     }
-    if wide {
-        copy_dir_bytes(machine, buf, cap, &absolute)
-    } else {
-        copy_ascii(machine, buf, cap, &absolute)
-    }
+    encoding::copy_with(machine, buf, cap, &absolute, wide, encoding::file_page(state))
 }
 
 fn copy_dir_bytes<A: crate::Arch>(machine: &mut A, out: usize, cap: usize, text: &[u8]) -> u32 {
-    if cap == 0 || out == 0 {
-        return (text.len() + 1) as u32;
-    }
-    let n = text.len().min(cap - 1);
-    for (i, &byte) in text[..n].iter().enumerate() {
-        machine.write::<u16>(out + i * 2, u16::from(byte));
-    }
-    machine.write::<u16>(out + n * 2, 0);
-    n as u32
+    encoding::copy(machine, out, cap, text, true)
 }
 
 // Windows permits a leading '=' for hidden entries such as '=C:', which
@@ -2008,15 +1981,15 @@ mod keyboard_tests {
     }
 }
 
-/// Merge the DOS startup environment into the Windows process environment.
+/// Merge the shared UTF-8 environment into the Windows process environment.
 /// Windows CRTs read this through GetEnvironmentStrings at process startup.
-pub(super) fn windows_environment(dos: &[u8]) -> Vec<u8> {
+pub(super) fn windows_environment(inherited: &[u8]) -> Vec<u8> {
     let mut entries: Vec<Vec<u8>> = [
         b"COMSPEC=C:\\RETROOS\\COMMAND.COM".to_vec(),
         b"PATH=C:\\RETROOS;C:\\".to_vec(),
         b"TEMP=C:\\TEMP".to_vec(),
     ].into();
-    for entry in dos.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()) {
+    for entry in inherited.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()) {
         let Some(eq) = environment_separator(entry) else { continue };
         if let Some(old) = entries.iter().position(|old| old[..environment_separator(old).unwrap()]
             .eq_ignore_ascii_case(&entry[..eq])) {
@@ -2038,9 +2011,13 @@ pub(super) fn windows_environment(dos: &[u8]) -> Vec<u8> {
 fn env_block<A: crate::Arch>(machine: &mut A, environment: &[u8], wide: bool) -> u32 {
     const ENV: usize = 0x7ff1_0000;
     machine.zero(ENV, 3 * 4096);
-    machine.copy_to(ENV, environment);
-    for (i, &byte) in environment.iter().enumerate() {
-        machine.write::<u16>(ENV + 4096 + i * 2, u16::from(byte));
+    let text = alloc::string::String::from_utf8_lossy(environment);
+    let ansi = encoding::ansi().encode(&text, b'?').0;
+    let wide_units = crate::kernel::text::to_utf16(&text);
+    if ansi.len() > 4096 || wide_units.len() > 4096 { return 0; }
+    machine.copy_to(ENV, &ansi);
+    for (i, &unit) in wide_units.iter().enumerate() {
+        machine.write::<u16>(ENV + 4096 + i * 2, unit);
     }
     machine.set_page_flags(ENV / 4096, 3, true, false);
     (ENV + if wide { 4096 } else { 0 }) as u32
@@ -2061,13 +2038,14 @@ fn taken<A: crate::Arch>(machine: &A, ptr: u32, count: i32, wide: bool) -> Vec<u
     if count < 0 {
         return if wide { w_string(machine, ptr).unwrap_or_default() } else { c_string(machine, ptr).unwrap_or_default() };
     }
-    let n = count as usize;
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let byte = if wide { machine.read::<u16>(ptr as usize + i * 2) as u8 } else { machine.read::<u8>(ptr as usize + i) };
-        out.push(byte);
+    if count == 0 { return Vec::new(); }
+    if wide {
+        encoding::units(machine, ptr, count).ok()
+            .and_then(|v| crate::kernel::text::from_utf16(&v, false).ok()).unwrap_or_default().into_bytes()
+    } else {
+        encoding::bytes(machine, ptr, count).ok()
+            .and_then(|v| encoding::ansi().decode(&v, false).ok()).unwrap_or_default().into_bytes()
     }
-    out
 }
 
 fn compare<A: crate::Arch>(machine: &A, regs: &Regs, wide: bool) -> u32 {
@@ -2075,9 +2053,8 @@ fn compare<A: crate::Arch>(machine: &A, regs: &Regs, wide: bool) -> u32 {
     let mut left = taken(machine, arg(machine, regs, 2), arg(machine, regs, 3) as i32, wide);
     let mut right = taken(machine, arg(machine, regs, 4), arg(machine, regs, 5) as i32, wide);
     if flags & 1 != 0 {
-        for byte in left.iter_mut().chain(right.iter_mut()) {
-            *byte = byte.to_ascii_uppercase();
-        }
+        left = alloc::string::String::from_utf8_lossy(&left).to_uppercase().into_bytes();
+        right = alloc::string::String::from_utf8_lossy(&right).to_uppercase().into_bytes();
     }
     match left.cmp(&right) {
         core::cmp::Ordering::Less => 1,
@@ -2089,40 +2066,83 @@ fn compare<A: crate::Arch>(machine: &A, regs: &Regs, wide: bool) -> u32 {
 fn map_string<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 {
     let flags = arg(machine, regs, 1);
     let mut text = taken(machine, arg(machine, regs, 2), arg(machine, regs, 3) as i32, wide);
-    if flags & 0x200 != 0 {
-        for byte in &mut text { *byte = byte.to_ascii_uppercase(); }
-    } else if flags & 0x100 != 0 {
-        for byte in &mut text { *byte = byte.to_ascii_lowercase(); }
-    }
+    let value = alloc::string::String::from_utf8_lossy(&text);
+    if flags & 0x200 != 0 { text = value.to_uppercase().into_bytes(); }
+    else if flags & 0x100 != 0 { text = value.to_lowercase().into_bytes(); }
+    if arg(machine, regs, 3) as i32 == -1 { text.push(0); }
+    let value = encoding::encode(&text, wide);
     let dest = arg(machine, regs, 4) as usize;
     let cap = arg(machine, regs, 5) as usize;
-    if dest == 0 || cap == 0 {
-        return (text.len() + 1) as u32;
+    if cap == 0 { return value.len() as u32; }
+    if dest == 0 || cap < value.len() { return 0; }
+    for (i, &unit) in value.iter().enumerate() {
+        if wide { machine.write::<u16>(dest + i * 2, unit); }
+        else { machine.write::<u8>(dest + i, unit as u8); }
     }
-    let n = text.len().min(cap);
-    for (i, &byte) in text[..n].iter().enumerate() {
-        if wide { machine.write::<u16>(dest + i * 2, u16::from(byte)); }
-        else { machine.write::<u8>(dest + i, byte); }
-    }
-    n as u32
+    value.len() as u32
 }
 
-fn locale_info<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 {
-    let kind = arg(machine, regs, 1) & 0xffff;
-    let text: &[u8] = match kind {
-        0x1004 => b"1252",
-        0x1001 | 0x0001 => b"English",
-        _ => b"",
-    };
-    if text.is_empty() {
-        return 0;
+fn locale_value(kind: u32) -> Option<&'static [u8]> {
+    // US English matches GetUserDefaultLCID and the personality's UTC clock.
+    Some(match kind {
+        0x0001 => b"0409", // ILANGUAGE (hexadecimal)
+        0x0002 => b"English (United States)",
+        0x0005 => b"1", // ICOUNTRY
+        0x0006 => b"United States",
+        0x000b => b"437", // IDEFAULTCODEPAGE (OEM)
+        0x000e | 0x0016 => b".", // decimal / monetary decimal
+        0x000f | 0x0017 => b",", // thousands / monetary thousands
+        0x0010 | 0x0018 => b"3;0", // grouping
+        0x0011 | 0x0019 => b"2", // IDIGITS / ICURRDIGITS
+        0x0012 => b"1", // ILZERO
+        0x0014 => b"$", // SCURRENCY
+        0x0015 => b"USD", // SINTLSYMBOL
+        0x001b | 0x001c => b"0", // ICURRENCY / INEGCURR
+        0x001d => b"/", // SDATE
+        0x001e => b":", // STIME
+        0x001f => b"M/d/yyyy", // SSHORTDATE
+        0x0020 => b"dddd, MMMM dd, yyyy", // SLONGDATE
+        0x0021 | 0x0022 | 0x0023 | 0x0025 | 0x0026 => b"0",
+        0x0024 => b"1", // ICENTURY
+        0x0028 => b"AM",
+        0x0029 => b"PM",
+        0x1001 => b"English", // SENGLANGUAGE
+        0x1003 => b"h:mm:ss tt", // STIMEFORMAT
+        0x1004 => b"1252", // IDEFAULTANSICODEPAGE
+        _ => return None,
+    })
+}
+
+fn locale_info<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, regs: &Regs, wide: bool) -> u32 {
+    let locale = arg(machine, regs, 0);
+    if !matches!(locale, 0 | 0x0400 | 0x0800 | 0x0409) {
+        return fail(state, ERROR_INVALID_PARAMETER, 0);
     }
+    let flags = arg(machine, regs, 1);
+    if flags & !0xe000_ffff != 0 { return fail(state, 1004, 0); } // ERROR_INVALID_FLAGS
+    let kind = flags & 0xffff;
+    let Some(text) = locale_value(kind) else { return fail(state, 1004, 0); };
     let dest = arg(machine, regs, 2) as usize;
-    let cap = arg(machine, regs, 3) as usize;
-    if dest == 0 || cap == 0 {
-        return (text.len() + 1) as u32;
+    let cap = arg(machine, regs, 3) as i32;
+    if cap < 0 { return fail(state, ERROR_INVALID_PARAMETER, 0); }
+    let numeric = flags & 0x2000_0000 != 0;
+    let value = if numeric {
+        let radix = if kind == 1 { 16 } else { 10 };
+        let value = core::str::from_utf8(text).ok().and_then(|s| u32::from_str_radix(s, radix).ok());
+        let Some(value) = value else { return fail(state, 1004, 0); };
+        Some(value)
+    } else { None };
+    let required = if numeric { if wide { 2 } else { 4 } } else { (text.len() + 1) as u32 };
+    if cap == 0 { return required; }
+    if dest == 0 || (cap as u32) < required { return fail(state, 122, 0); } // ERROR_INSUFFICIENT_BUFFER
+    if let Some(value) = value {
+        machine.write::<u32>(dest, value);
+    } else if wide {
+        copy_dir_bytes(machine, dest, cap as usize, text);
+    } else {
+        copy_ascii(machine, dest, cap as usize, text);
     }
-    if wide { copy_dir_bytes(machine, dest, cap, text) } else { copy_ascii(machine, dest, cap, text) }
+    required // GetLocaleInfo includes the terminating NUL in its return count.
 }
 
 fn string_type<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 {
@@ -2131,16 +2151,26 @@ fn string_type<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 
     } else {
         (arg(machine, regs, 2), arg(machine, regs, 3) as i32, arg(machine, regs, 4) as usize)
     };
-    let text = taken(machine, src, count, wide);
-    for (i, &byte) in text.iter().enumerate() {
+    let mut text = taken(machine, src, count, wide);
+    if count == -1 { text.push(0); }
+    let text = alloc::string::String::from_utf8_lossy(&text);
+    let mut i = 0;
+    for ch in text.chars() {
         let mut kind = 0u16;
-        if byte.is_ascii_uppercase() { kind |= 0x0001 | 0x0100; }
-        if byte.is_ascii_lowercase() { kind |= 0x0002 | 0x0100; }
-        if byte.is_ascii_digit() { kind |= 0x0004 | 0x0200; }
-        if byte.is_ascii_whitespace() { kind |= 0x0008 | 0x0800; }
-        if byte.is_ascii_punctuation() { kind |= 0x0010 | 0x0400; }
-        if byte.is_ascii_control() { kind |= 0x0020; }
-        machine.write::<u16>(dest + i * 2, kind);
+        if ch.is_uppercase() { kind |= 0x0001; }
+        if ch.is_lowercase() { kind |= 0x0002; }
+        if ch.is_alphabetic() { kind |= 0x0100; }
+        if ch.is_ascii_digit() { kind |= 0x0004; }
+        if ch.is_ascii_hexdigit() { kind |= 0x0080; }
+        if ch.is_whitespace() { kind |= 0x0008; }
+        if ch == ' ' || ch == '\t' { kind |= 0x0040; }
+        if ch.is_ascii_punctuation() { kind |= 0x0010; }
+        if ch.is_control() { kind |= 0x0020; }
+        // Win32 returns one WORD per source UTF-16 unit, not UTF-8 byte.
+        for _ in 0..if wide { ch.len_utf16() } else { 1 } {
+            machine.write::<u16>(dest + i * 2, kind);
+            i += 1;
+        }
     }
     1
 }

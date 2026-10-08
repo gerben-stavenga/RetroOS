@@ -30,11 +30,30 @@ enum EscState {
     OscEscape,
 }
 
+/// One terminal cell, independent of an OEM page or framebuffer format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cell {
+    pub character: char,
+    pub attribute: u8,
+}
+
+impl Cell {
+    const fn blank(attribute: u8) -> Self { Self { character: ' ', attribute } }
+}
+
+struct SavedScreen {
+    grid: [Cell; CELLS],
+    cursor: (usize, usize),
+    attr: u8,
+    wrap_pending: bool,
+    saved_cursor: (usize, usize),
+}
+
 /// A terminal: its grid, its cursor, and where (if anywhere) the cells are
 /// mirrored to hardware.
 ///
-/// The grid is 4000 bytes, so nothing here tracks which cells changed — a
-/// renderer that wants the screen simply draws all of it.
+/// Cells retain Unicode scalars. The VGA byte grid is an output projection;
+/// framebuffer renderers read the Unicode cells directly.
 ///
 /// The grid is the terminal's own and is the source of truth. That sounds
 /// obvious and was not the case: this used to keep no storage at all and write
@@ -44,18 +63,10 @@ enum EscState {
 /// character, a hosted machine had to fabricate an aperture for writes nothing
 /// would ever read, and nothing could repaint, because after the pixels were
 /// overwritten the text was simply gone.
-struct SavedScreen {
-    grid: [u16; CELLS],
-    cursor: (usize, usize),
-    attr: u8,
-    wrap_pending: bool,
-    saved_cursor: (usize, usize),
-}
-
 pub struct Term {
-    /// 80x25 cells, `attr << 8 | char` — the VGA text encoding, which is this
-    /// terminal's format because it is the one hardware wants verbatim.
-    grid: [u16; CELLS],
+    vga_grid: [u16; CELLS],
+    /// Authoritative Unicode cells. Byte conversion belongs to VGA output.
+    grid: [Cell; CELLS],
     /// A VGA text aperture to mirror cells into as they are written, when the
     /// machine has one. `None` on a framebuffer or hosted machine, which
     /// render from the grid instead.
@@ -69,6 +80,7 @@ pub struct Term {
     esc_private: bool,
     utf8_value: u32,
     utf8_remaining: u8,
+    utf8_min: u32,
     wrap_pending: bool,
     saved_cursor: (usize, usize),
     primary_screen: Option<SavedScreen>,
@@ -81,7 +93,8 @@ pub struct Term {
 impl Term {
     pub const fn new(aperture: Option<usize>) -> Self {
         Self {
-            grid: [0x0720; CELLS],
+            grid: [Cell::blank(0x07); CELLS],
+            vga_grid: [0x0720; CELLS],
             aperture,
             cursor_x: 0,
             cursor_y: 0,
@@ -92,6 +105,7 @@ impl Term {
             esc_private: false,
             utf8_value: 0,
             utf8_remaining: 0,
+            utf8_min: 0,
             wrap_pending: false,
             saved_cursor: (0, 0),
             primary_screen: None,
@@ -127,37 +141,36 @@ impl Term {
         }
     }
 
-    /// Write one cell into the grid and, if the machine has one, through to
-    /// the VGA aperture. Marks the row dirty for whoever renders.
-    fn put_cell(&mut self, offset: usize, cell: u16) {
-        if offset >= CELLS {
-            return;
-        }
+    fn put_unicode_cell(&mut self, offset: usize, cell: Cell) {
+        if offset >= CELLS { return; }
         self.grid[offset] = cell;
+        let byte = crate::codepage::current_codepage().encode_display(cell.character);
+        let vga = u16::from(cell.attribute) << 8 | u16::from(byte);
+        self.vga_grid[offset] = vga;
         if let Some(base) = self.aperture {
-            unsafe { core::ptr::write_volatile((base as *mut u16).add(offset), cell) };
+            unsafe { core::ptr::write_volatile((base as *mut u16).add(offset), vga) };
         }
     }
 
-    /// Copy the whole grid through to the aperture — after a scroll or clear,
-    /// where every cell moved.
+    /// Refresh the derived VGA grid after moving or clearing Unicode cells.
     fn flush_aperture(&mut self) {
-        if let Some(base) = self.aperture {
-            for (i, &cell) in self.grid.iter().enumerate() {
-                unsafe { core::ptr::write_volatile((base as *mut u16).add(i), cell) };
+        let page = crate::codepage::current_codepage();
+        for (i, cell) in self.grid.iter().enumerate() {
+            let vga = u16::from(cell.attribute) << 8 | u16::from(page.encode_display(cell.character));
+            self.vga_grid[i] = vga;
+            if let Some(base) = self.aperture {
+                unsafe { core::ptr::write_volatile((base as *mut u16).add(i), vga) };
             }
         }
     }
 
-    /// The grid, for a renderer that draws it.
-    pub fn cells(&self) -> &[u16; CELLS] {
-        &self.grid
-    }
+    pub fn unicode_cells(&self) -> &[Cell; CELLS] { &self.grid }
 
-    /// The grid as bytes, in the VGA text layout a renderer expects.
+    /// Compatibility projection for VGA consumers; never used for Unicode rendering.
+    pub fn cells(&self) -> &[u16; CELLS] { &self.vga_grid }
+
     pub fn cells_bytes(&self) -> &[u8] {
-        // `[u16; N]` to `[u8; 2N]`: same allocation, looser alignment.
-        unsafe { core::slice::from_raw_parts(self.grid.as_ptr() as *const u8, CELLS * 2) }
+        unsafe { core::slice::from_raw_parts(self.vga_grid.as_ptr().cast::<u8>(), CELLS * 2) }
     }
 
     /// Point the terminal at a VGA text aperture (or at nothing), mirroring the
@@ -191,30 +204,47 @@ impl Term {
         cursor_col: usize,
         cursor_row: usize,
     ) {
+        let page = crate::codepage::current_codepage();
+        let attribute = self.attr;
+        self.blit_screen(width, height, |index| Cell {
+            character: page.decode_glyph(cells.get(index * 2).copied().unwrap_or(b' ')),
+            attribute: cells.get(index * 2 + 1).copied().unwrap_or(attribute),
+        }, cursor_col, cursor_row);
+    }
+
+    /// Import an already decoded screen without an OEM round trip.
+    pub fn blit_unicode_cells(
+        &mut self,
+        width: usize,
+        height: usize,
+        cells: &[Cell],
+        cursor_col: usize,
+        cursor_row: usize,
+    ) {
+        let blank = Cell::blank(self.attr);
+        self.blit_screen(width, height, |index| cells.get(index).copied().unwrap_or(blank), cursor_col, cursor_row);
+    }
+
+    fn blit_screen(
+        &mut self, width: usize, height: usize,
+        mut cell_at: impl FnMut(usize) -> Cell,
+        cursor_col: usize, cursor_row: usize,
+    ) {
         let w = width.min(WIDTH);
         let h = height.min(HEIGHT);
-        let blank = (self.attr as u16) << 8 | b' ' as u16;
+        let blank = Cell::blank(self.attr);
         for y in 0..HEIGHT {
             for x in 0..WIDTH {
-                let cell = if x < w && y < h {
-                    let at = (y * width + x) * 2;
-                    let ch = cells.get(at).copied().unwrap_or(b' ');
-                    let attr = cells.get(at + 1).copied().unwrap_or(self.attr);
-                    (attr as u16) << 8 | ch as u16
-                } else {
-                    blank
-                };
-                self.put_cell(y * WIDTH + x, cell);
+                let cell = if x < w && y < h { cell_at(y * width + x) } else { blank };
+                self.put_unicode_cell(y * WIDTH + x, cell);
             }
         }
-        self.wrap_pending = false;
-        self.cursor_x = cursor_col.min(WIDTH.saturating_sub(1));
-        self.cursor_y = cursor_row.min(HEIGHT.saturating_sub(1));
+        self.set_cursor_pos(cursor_col, cursor_row);
         text_flush();
     }
 
     pub fn clear(&mut self) {
-        let blank = (self.attr as u16) << 8 | b' ' as u16;
+        let blank = Cell::blank(self.attr);
         self.grid = [blank; CELLS];
         self.flush_aperture();
         self.cursor_x = 0;
@@ -223,13 +253,13 @@ impl Term {
     }
 
     fn scroll(&mut self) {
-        let blank = (self.attr as u16) << 8 | b' ' as u16;
+        let blank = Cell::blank(self.attr);
         self.grid.copy_within(WIDTH.., 0);
         self.grid[CELLS - WIDTH..].fill(blank);
         self.flush_aperture();
     }
 
-    fn put_display_glyph(&mut self, glyph: u8) {
+    fn put_unicode_glyph(&mut self, character: char) {
         if !self.screen_enabled {
             return;
         }
@@ -243,7 +273,7 @@ impl Term {
             self.cursor_y = HEIGHT - 1;
         }
         let offset = self.cursor_y * WIDTH + self.cursor_x;
-        self.put_cell(offset, (self.attr as u16) << 8 | glyph as u16);
+        self.put_unicode_cell(offset, Cell { character, attribute: self.attr });
         if self.cursor_x == WIDTH - 1 {
             self.wrap_pending = true;
         } else {
@@ -263,27 +293,38 @@ impl Term {
                 self.utf8_value = (self.utf8_value << 6) | u32::from(byte & 0x3f);
                 self.utf8_remaining -= 1;
                 if self.utf8_remaining == 0 {
-                    let ch = char::from_u32(self.utf8_value).unwrap_or('�');
-                    self.put_display_glyph(crate::codepage::current_codepage().encode_display(ch));
+                    let ch = if self.utf8_value >= self.utf8_min { char::from_u32(self.utf8_value) } else { None }.unwrap_or('�');
+                    self.put_unicode_glyph(ch);
                 }
                 return;
             }
             self.utf8_remaining = 0;
-            self.put_display_glyph(b'?');
+            self.put_unicode_glyph('�');
         }
         match byte {
             0xc2..=0xdf => {
                 self.utf8_value = u32::from(byte & 0x1f);
                 self.utf8_remaining = 1;
+                self.utf8_min = 0x80;
             }
             0xe0..=0xef => {
                 self.utf8_value = u32::from(byte & 0x0f);
                 self.utf8_remaining = 2;
+                self.utf8_min = 0x800;
             }
             0xf0..=0xf4 => {
                 self.utf8_value = u32::from(byte & 7);
                 self.utf8_remaining = 3;
+                self.utf8_min = 0x10000;
             }
+            0x80..=0xff => self.put_unicode_glyph('�'),
+            8 => { self.wrap_pending = false; self.cursor_x = self.cursor_x.saturating_sub(1); }
+            9 => {
+                self.wrap_pending = false;
+                self.cursor_x = ((self.cursor_x / 8 + 1) * 8).min(WIDTH - 1);
+            }
+            0..=31 if !matches!(byte, 0x1b | b'\n' | b'\r') => {}
+            0x7f => {}
             _ => self.putchar(byte),
         }
     }
@@ -334,7 +375,7 @@ impl Term {
             }
             return;
         } // Unsupported DEC modes have no text payload.
-        let blank = u16::from(self.attr) << 8 | u16::from(b' ');
+        let blank = Cell::blank(self.attr);
         if matches!(
             command,
             b'H' | b'f' | b'A' | b'B' | b'C' | b'D' | b'G' | b'd'
@@ -518,7 +559,7 @@ impl Term {
                 self.cursor_x = 0;
             }
             _ => {
-                self.put_display_glyph(c);
+                self.put_unicode_glyph(crate::codepage::current_codepage().decode_glyph(c));
             }
         }
 
@@ -570,7 +611,7 @@ impl compact_fmt::Write for Term {
             if ch.is_ascii() {
                 self.putchar(ch as u8);
             } else {
-                self.put_display_glyph(crate::codepage::current_codepage().encode_display(ch));
+                self.put_unicode_glyph(ch);
             }
             let mut utf8 = [0u8; 4];
             for &byte in ch.encode_utf8(&mut utf8).as_bytes() {

@@ -2719,7 +2719,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
             }
             parent_cwd_len = 2 + n;
 
-            parent_env_snapshot = Some(crate::kernel::dos::snapshot_parent_env(machine, vcpu, dos));
+            let guest_env = crate::kernel::dos::snapshot_parent_env(machine, vcpu, dos);
+            parent_env_snapshot = Some(crate::kernel::text::Encoding::oem().decode(&guest_env, false).unwrap().into_bytes());
         }
         thread::Personality::Linux(lin) => {
             parent_is_dos = false;
@@ -2891,7 +2892,9 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
 
     let args = alloc::vec![path.to_vec()];
-    let cmdtail = cmdtail.to_vec();
+    let cmdtail = if parent_is_dos {
+        crate::kernel::text::Encoding::oem().decode(cmdtail, false).unwrap().into_bytes()
+    } else { cmdtail.to_vec() };
     let env = parent_env_snapshot.unwrap_or_default();
     let cwd_override = (!child_cwd.is_empty()).then(|| child_cwd.to_vec());
     let cwd = cwd_override

@@ -489,6 +489,15 @@ pub(crate) mod tests {
             let mut out = alloc::vec![0; data.len()];
             assert_eq!(fs.read(node.handle, 0, &mut out, node.size), 9000);
             assert_eq!(out, data);
+            assert_eq!(fs.resize(node.handle, 3), 0);
+            assert_eq!(fs.resize(node.handle, 8193), 0);
+            let mut resized = [0xcc; 8];
+            assert_eq!(fs.read(node.handle, 0, &mut resized, 8193), 8);
+            assert_eq!(&resized[..3], &data[..3]);
+            assert_eq!(&resized[3..], &[0; 5]);
+            assert_eq!(fs.read(node.handle, 8192, &mut resized, 8193), 1);
+            assert_eq!(resized[0], 0);
+            assert_eq!(fs.resize(node.handle, 0), 0);
             fs.clunk(node.handle);
             let truncated = fs.create(b"Directory/renamed.txt").unwrap();
             assert_eq!(truncated.size, 0);
@@ -748,6 +757,34 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
             return -5;
         }
         done as i32
+    }
+
+    fn resize(&self, handle: u64, size: u32) -> i32 {
+        let inner = u32::try_from(handle).unwrap_or(0);
+        let mut state = self.state.lock();
+        // Cached File objects retain the previous size and cluster chain,
+        // including other open handles to the same file.
+        state.handles.clear();
+        let Some(path) = state.opens.get(&inner) else { return -9; };
+        let Some(path) = path_str(path) else { return -5; };
+        let media = state.media();
+        let Ok(mut file) = media.root_dir().open_file(path) else { return -5; };
+        let Ok(length) = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)) else { return -5; };
+        if u64::from(size) < length {
+            if fatfs::Seek::seek(&mut file, fatfs::SeekFrom::Start(u64::from(size))).is_err()
+                || file.truncate().is_err() { return -5; }
+        } else {
+            let zeros = [0; 4096];
+            let mut remaining = u64::from(size) - length;
+            while remaining != 0 {
+                let count = remaining.min(zeros.len() as u64) as usize;
+                match fatfs::Write::write(&mut file, &zeros[..count]) {
+                    Ok(0) | Err(_) => return -28,
+                    Ok(written) => remaining -= written as u64,
+                }
+            }
+        }
+        fatfs::Write::flush(&mut file).map_or(-5, |_| 0)
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {

@@ -328,6 +328,15 @@ pub fn host_create(path: &[u8]) -> (i32, u64) {
 pub fn host_write(handle: u64, offset: u32, data: &[u8]) -> i32 {
     NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or(-5, |fs| fs.n_write(handle, offset, data)))
 }
+pub fn host_resize(handle: u64, size: u32) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-5, |fs| {
+        let Some(path) = fs.handles.get(&(handle as u32)) else { return -9; };
+        fs::OpenOptions::new().write(true).open(path)
+            .and_then(|file| file.set_len(u64::from(size)))
+            .map_or_else(|error| -error.raw_os_error().unwrap_or(5), |_| 0)
+    }))
+}
+
 pub fn host_clunk(handle: u64) {
     NATIVE_HOSTFS.with(|n| { if let Some(fs) = n.borrow_mut().as_mut() { fs.n_clunk(handle) } });
 }

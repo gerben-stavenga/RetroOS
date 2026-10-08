@@ -223,6 +223,15 @@ active codepage. The DOS `LOG` command maps UTF-8 text back to that codepage
 for display; common Unicode punctuation has ASCII fallbacks, and unavailable
 glyphs show as a square.
 
+The shared Uni-VGA 8×16 atlas contains 2,899 Unicode glyphs (about 57 KiB).
+Linux terminal cells retain Unicode scalars and render directly from the atlas;
+Linux defaults to `LANG=C.UTF-8`. Windows and OS/2 window text also looks up
+Unicode glyphs directly; DOS VGA fonts
+are assembled from the selected OEM page's Unicode mapping. Missing glyphs
+render as `?`; CJK, emoji and text shaping are not included. The existing
+8×8 and 8×14 fonts are retained for those video modes. Source attribution and
+regeneration instructions are in [lib/fonts/uni-vga](lib/fonts/uni-vga/README.md).
+
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
 `--host DIR` uses the live host tree with the hosted backend, or exports it as
 HostFS under QEMU. `--cmd` is supported on QEMU and hosted; the launcher does

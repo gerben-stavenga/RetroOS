@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod lx;
 mod extra;
+mod nls;
 
 use alloc::{vec, vec::Vec};
 use crate::Regs;
@@ -37,7 +38,7 @@ enum Api {
     DosQueryModuleHandle, DosQueryProcAddr, DosQuerySysInfo, DosSetRelMaxFH,
     DosFlatToSel, DosSelToFlat, DosOpenL, DosSetFileLocksL, DosSetFilePtrL,
     DosGetDateTime, DosAllocSharedMem, DosGetNamedSharedMem, DosGetInfoBlocks,
-    DosQueryDBCSEnv, KbdCharIn,
+    DosQueryDBCSEnv, DosMapCase, DosQueryCtryInfo, DosQueryCollate, KbdCharIn,
     WinInitialize, WinCreateMsgQueue, WinCreateWindow, WinShowWindow,
     WinGetPS, WinReleasePS, WinFillRect, WinPostQueueMsg, WinGetMsg,
     WinDispatchMsg, WinDestroyWindow, WinDestroyMsgQueue, WinTerminate,
@@ -122,7 +123,8 @@ pub struct Os2State {
     shared: Vec<(Vec<u8>, u32)>,
     find: Vec<extra::Find>,
     video: extra::Video,
-    keys: Vec<(u8, u8, u16)>,
+    keys: Vec<(u8, u8, u16, u32)>,
+    key_press_times: [u32; 128],
     kbd_mask: u16,
     dll_init: Vec<(u32, u32)>,
     dll_saved: Option<Regs>,
@@ -168,6 +170,7 @@ impl Os2State {
             find: Vec::new(),
             video: extra::Video::new(),
             keys: Vec::new(),
+            key_press_times: [0; 128],
             kbd_mask: 0x0006,
             dll_init: Vec::new(),
             dll_saved: None,
@@ -244,13 +247,19 @@ impl Os2State {
         self.exec_path_len = n;
     }
 
-    pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
+    pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8, milliseconds: u32) {
+        let scan = scancode & 0x7f;
+        let held = crate::kernel::keyboard::key_down(scan);
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
         if matches!(scancode & 0x7f, 0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46) {return;}
-        let c = if scancode & 0x7f == 0x1c { b'\r' }
-            else { crate::kernel::keyboard::scancode_to_ascii(scancode) };
         let shift = extra::shift_state();
-        self.keys.push((c, scancode & 0x7f, shift));
+        let c = if shift & 8 != 0 { 0 }
+            else if scancode & 0x7f == 0x1c { b'\r' }
+            else { crate::kernel::keyboard::scancode_to_ascii(scancode) };
+        // Typematic events retain the original press time; Peek and CharIn
+        // must also return the same timestamp for a queued event.
+        if !held { self.key_press_times[scan as usize] = milliseconds; }
+        self.keys.push((c, scan, shift, self.key_press_times[scan as usize]));
         if c == 0 { return; }
         if let thread::FdKind::PipeRead(idx) = fds[0] {
             crate::kernel::kpipe::write(idx, &[c]);
@@ -715,7 +724,7 @@ pub fn exec_lx_into<A: crate::Arch>(
     let tib2 = tib + 0x40;
     let pib = tib + 0x80;
     let env = tib + 4096;
-    let cmd = tib + 0x400;
+    let image_name = tib + 0x400;
     let tib_sel = push_descriptor(&mut ldt, tib, 4096, false, true);
     machine.write::<u32>((tib + 4) as usize, stack.saturating_sub(main.header.stack_size.max(64 * 1024)));
     machine.write::<u32>((tib + 8) as usize, stack);
@@ -725,14 +734,16 @@ pub fn exec_lx_into<A: crate::Arch>(
     machine.write::<u32>(tib2 as usize, tid as u32 + 1);
     machine.write::<u32>(pib as usize, tid as u32 + 1);
     machine.write::<u32>((pib + 8) as usize, 1);
-    machine.write::<u32>((pib + 12) as usize, cmd);
     machine.write::<u32>((pib + 16) as usize, env);
     machine.write::<u32>((pib + 24) as usize, 2); // windowable VIO session
     let environment = if parent_env.is_empty() {
         b"PATH=C:\\OS2\\APPS;C:\\RETROOS\\OS2\\DLL\0COMSPEC=C:\\RETROOS\\COMMAND.COM\0\0".to_vec()
     } else { parent_env.to_vec() };
     if environment.len() > 4096 { return Err(8); }
-    machine.copy_to(env as usize, &environment);
+    let guest_environment = crate::kernel::text::Encoding::oem().encode(
+        &alloc::string::String::from_utf8_lossy(&environment), b'?').0;
+    if guest_environment.len() > 4096 { return Err(8); }
+    machine.copy_to(env as usize, &guest_environment);
     let mut os2_name = Vec::with_capacity(main_path.len() + 4);
     os2_name.extend_from_slice(b"C:\\");
     let croot = crate::kernel::dos::c_root();
@@ -741,9 +752,20 @@ pub fn exec_lx_into<A: crate::Arch>(
     if crate::kernel::startup::trace_enabled() {
         crate::compact_println!("[os2-command] {}", core::str::from_utf8(&os2_name).unwrap_or("?"));
     }
+    // OS/2 puts the fully qualified image name immediately before the
+    // argument block. PIB.pchcmd and the loader frame point at the argument
+    // block (argv[0]\0tail\0), not at that preceding image name. Virtual
+    // Pascal obtains ParamStr(0) by walking backwards from pchcmd - 2.
+    let os2_name = crate::kernel::text::Encoding::oem().encode(&alloc::string::String::from_utf8_lossy(&os2_name), b'?').0;
+    machine.copy_to(image_name as usize, &os2_name);
+    machine.write::<u8>(image_name as usize + os2_name.len(), 0);
+    let cmd = image_name + os2_name.len() as u32 + 1;
+    machine.write::<u32>((pib + 12) as usize, cmd);
     machine.copy_to(cmd as usize, &os2_name);
     machine.write::<u8>(cmd as usize + os2_name.len(), 0);
-    machine.copy_to(cmd as usize + os2_name.len() + 1, cmdtail);
+    let cmdtail = crate::kernel::text::Encoding::oem().encode(
+        &alloc::string::String::from_utf8_lossy(cmdtail), b'?').0;
+    machine.copy_to(cmd as usize + os2_name.len() + 1, &cmdtail);
     machine.write::<u8>(cmd as usize + os2_name.len() + 1 + cmdtail.len(), 0);
     machine.write::<u8>(cmd as usize + os2_name.len() + 2 + cmdtail.len(), 0);
 
@@ -786,6 +808,10 @@ pub fn exec_lx_into<A: crate::Arch>(
 
 fn register_gates(state: &mut Os2State, modules: &[Module]) {
     let gate_specs: &[(&[u8], &[u8], Api, u16)] = &[
+        (b"DOSCALLS", b"DosKillThread", Api::Base(111), 0),
+        (b"DOSCALLS", b"DOS16MEMAVAIL", Api::Base(127), 4),
+        (b"DOSCALLS", b"DosSearchPath", Api::Base(228), 0),
+        (b"DOSCALLS", b"DosCreateThread", Api::Base(311), 0),
         (b"PMWIN", b"WinCloseClipbrd", Api::Pm(0, 707), 0),
         (b"PMWIN", b"WinEmptyClipbrd", Api::Pm(0, 733), 0),
         (b"PMWIN", b"WinOpenClipbrd", Api::Pm(0, 793), 0),
@@ -825,6 +851,7 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"DOSCALLS", b"DosCreateDir", Api::Base(270), 0),
         (b"DOSCALLS", b"DosMove", Api::Base(271), 0),
         (b"DOSCALLS", b"DosSetFileSize", Api::Base(272), 0),
+        (b"DOSCALLS", b"DosSetFileSizeL", Api::Base(989), 0),
         (b"DOSCALLS", b"DosQueryCurrentDir", Api::Base(274), 0),
         (b"DOSCALLS", b"DosQueryCurrentDisk", Api::Base(275), 0),
         (b"DOSCALLS", b"DosQueryFSAttach", Api::Base(277), 0),
@@ -903,6 +930,9 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"DOSCALLS", b"DosGetNamedSharedMem", Api::DosGetNamedSharedMem, 0),
         (b"DOSCALLS", b"DosGetInfoBlocks", Api::DosGetInfoBlocks, 0),
         (b"NLS", b"DosQueryDBCSEnv", Api::DosQueryDBCSEnv, 0),
+        (b"NLS", b"DosMapCase", Api::DosMapCase, 0),
+        (b"NLS", b"DosQueryCtryInfo", Api::DosQueryCtryInfo, 0),
+        (b"NLS", b"DosQueryCollate", Api::DosQueryCollate, 0),
         (b"KBDCALLS", b"KbdCharIn", Api::KbdCharIn, 8),
 
         (b"PMWIN", b"WinInitialize", Api::WinInitialize, 0),
@@ -1004,6 +1034,10 @@ fn arg32<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
 }
 
 fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+    Ok(crate::kernel::text::Encoding::oem().decode(&raw_string(machine, address)?, false).unwrap().into_bytes())
+}
+
+fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 { return Err(ERROR_INVALID_PARAMETER); }
     let mut out = Vec::new();
     for i in 0..1024 {
@@ -1049,7 +1083,7 @@ fn os2_absolute_path(cwd: &[u8], path: &[u8]) -> Vec<u8> {
 fn os2_error(error: i32) -> u32 {
     match -error {
         2 => 2, 9 => ERROR_INVALID_HANDLE, 12 => ERROR_NOT_ENOUGH_MEMORY,
-        13 => 5, 17 => 80, 22 => ERROR_INVALID_PARAMETER, 24 => 4,
+        13 | 30 => 5, 17 => 80, 22 => ERROR_INVALID_PARAMETER, 24 => 4, 28 => 112,
         _ => ERROR_INVALID_FUNCTION,
     }
 }
@@ -1091,6 +1125,9 @@ fn dos_open_l<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
     let actions = arg32(machine, regs, 6);
     let path = match c_string(machine, arg32(machine, regs, 0))
         .and_then(|p| os2_path(state, &p, actions & 0x10 != 0)) { Ok(p) => p, Err(e) => return e };
+    if crate::kernel::startup::trace_enabled() {
+        crate::compact_println!("[os2-open] {} actions={:#x}", core::str::from_utf8(&path).unwrap_or("?"), actions);
+    }
     let existed = crate::kernel::vfs::path_exists(&path);
     let handle = if existed {
         match actions & 3 {
@@ -1137,7 +1174,8 @@ fn dos_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     machine.copy_from(buffer, &mut bytes);
     let written = match kt.fds[handle] {
         thread::FdKind::ConsoleOut => {
-            for &b in &bytes { crate::term::putchar(b); }
+            let text = crate::kernel::text::Encoding::oem().decode(&bytes, false).unwrap();
+            for &b in text.as_bytes() { crate::term::putchar(b); }
             crate::kernel::term::mark_dirty();
             length as i32
         }
@@ -1427,7 +1465,7 @@ fn dispatch_api<A: crate::Arch>(
             let list = arg32(machine, regs, 1) as usize;
             let actual = arg32(machine, regs, 2) as usize;
             if cb < 4 { ERROR_INVALID_PARAMETER } else {
-                machine.write::<u32>(list, 437);
+                machine.write::<u32>(list, u32::from(lib::codepage::current_codepage().id));
                 machine.write::<u32>(actual, 4);
                 NO_ERROR
             }
@@ -1512,6 +1550,7 @@ fn dispatch_api<A: crate::Arch>(
             if cb != 0 { machine.zero(out, cb); }
             NO_ERROR
         }
+        Api::DosMapCase | Api::DosQueryCtryInfo | Api::DosQueryCollate => nls::dispatch(machine, regs, api),
         Api::DosFlatToSel => {
             let flat = regs.rax as u32;
             let base = flat & !0xffff;
@@ -1859,14 +1898,35 @@ mod tests {
     }
 
     #[test]
-    fn keyboard_enter_is_a_carriage_return_and_release_is_not_queued() {
+    fn keyboard_preserves_enter_alt_chords_and_arrow_scan_codes() {
         let mut state = Os2State::new();
         let fds = [thread::FdKind::None; thread::MAX_FDS];
-        state.process_key(&fds, 0x1c);
-        state.process_key(&fds, 0x9c);
-        assert_eq!(state.keys.len(), 1);
+        state.process_key(&fds, 0x1c, 100);
+        state.process_key(&fds, 0x9c, 100);
+        state.process_key(&fds, 0x38, 100); // Alt down
+        state.process_key(&fds, 0x2d, 100); // X down
+        state.process_key(&fds, 0xad, 100);
+        state.process_key(&fds, 0xb8, 100); // Alt up
+        state.process_key(&fds, 0x2d, 100);
+        state.process_key(&fds, 0xad, 100);
+        state.process_key(&fds, 0xe0, 100);
+        state.process_key(&fds, 0x50, 100); // Down arrow
+        state.process_key(&fds, 0xe0, 100);
+        state.process_key(&fds, 0xd0, 100);
+        state.process_key(&fds, 0xe0, 200);
+        state.process_key(&fds, 0x50, 200);
+        state.process_key(&fds, 0xe0, 300);
+        state.process_key(&fds, 0x50, 300); // held: same press timestamp
+        state.process_key(&fds, 0xe0, 400);
+        state.process_key(&fds, 0xd0, 400);
+        assert_eq!(state.keys.len(), 6);
         assert_eq!(state.keys[0].0, b'\r');
         assert_eq!(state.keys[0].1, 0x1c);
+        assert_eq!(state.keys[1], (0, 0x2d, 8, 100));
+        assert_eq!(state.keys[2], (b'x', 0x2d, 0, 100));
+        assert_eq!(state.keys[3], (0, 0x50, 0, 100));
+        assert_eq!(state.keys[4], (0, 0x50, 0, 200));
+        assert_eq!(state.keys[5], state.keys[4]);
     }
 
     #[test]

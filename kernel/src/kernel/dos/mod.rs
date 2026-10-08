@@ -58,6 +58,7 @@ pub(crate) use machine::vga::release_fullscreen;
 pub(crate) use machine::vga::reserve_live_vram;
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
 pub use dos::parse_config_env;
+pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{c_root, set_c_root, set_hostfs_enabled};
@@ -1317,6 +1318,10 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 
     // Parent: env snapshot with sys's PSP as the segment, since the actual
     // parent is not in this address space (or doesn't exist, e.g. boot).
+    let parent_env_data = crate::kernel::text::Encoding::oem().encode(
+        &alloc::string::String::from_utf8_lossy(&parent_env_data), b'?').0;
+    let cmdtail = crate::kernel::text::Encoding::oem().encode(
+        &alloc::string::String::from_utf8_lossy(&cmdtail), b'?').0;
     let parent = dos::boot_parent_with_env(&parent_env_data);
     let loaded = if is_exe && dos::is_mz_exe(&data) {
         dos::load_exe(machine, regs, dos_state, &parent, &data, dos_name).expect("Invalid MZ EXE")

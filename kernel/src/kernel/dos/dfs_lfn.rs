@@ -9,25 +9,15 @@ pub const NAME_MAX: usize = 255;
 // VFS names are UTF-8; guest names use the active DOS code page.
 
 pub fn decode_oem(name: &[u8]) -> Vec<u8> {
-    let mut result = String::new();
-    let page = lib::codepage::current_codepage();
-    for &byte in name { result.push(page.decode(byte)); }
-    result.into_bytes()
+    crate::kernel::text::Encoding::oem().decode(name, false).unwrap().into_bytes()
 }
 
 pub fn encode_oem(name: &[u8]) -> (Vec<u8>, bool) {
-    let mut replaced = false;
-    let page = lib::codepage::current_codepage();
-    let result = String::from_utf8_lossy(name).chars().map(|ch| {
-        if let Some(byte) = page.encode_exact(ch) { byte }
-        else { replaced = true; b'_' }
-    }).collect();
-    (result, replaced)
+    crate::kernel::text::Encoding::oem().encode(&String::from_utf8_lossy(name), b'_')
 }
 
 pub fn equal(a: &[u8], b: &[u8]) -> bool {
-    String::from_utf8_lossy(a).chars().flat_map(char::to_uppercase)
-        .eq(String::from_utf8_lossy(b).chars().flat_map(char::to_uppercase))
+    crate::kernel::text::equal_folded(a, b)
 }
 
 pub struct Path {

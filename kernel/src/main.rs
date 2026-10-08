@@ -184,6 +184,7 @@ fn main() {
             dir_exists: arch::host_dir_exists,
             create: arch::host_create,
             write: arch::host_write,
+            resize: arch::host_resize,
             clunk: arch::host_clunk,
             remove: arch::host_remove,
             mkdir: arch::host_mkdir,

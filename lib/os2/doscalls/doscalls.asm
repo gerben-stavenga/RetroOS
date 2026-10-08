@@ -93,6 +93,8 @@ global DosMove
 DosMove: int 0x82
 global DosSetFileSize
 DosSetFileSize: int 0x82
+global DosSetFileSizeL
+DosSetFileSizeL: int 0x82
 global DosQueryCurrentDir
 DosQueryCurrentDir: int 0x82
 global DosQueryCurrentDisk
@@ -137,3 +139,13 @@ global DosSetSignalExceptionFocus
 DosSetSignalExceptionFocus: int 0x82
 global DosQueryMem
 DosQueryMem: int 0x82
+global DosKillThread
+DosKillThread: int 0x82
+global DosSearchPath
+DosSearchPath: int 0x82
+global DosCreateThread
+DosCreateThread: int 0x82
+bits 16
+section _TEXT16 use16 class=CODE
+global DOS16MEMAVAIL
+DOS16MEMAVAIL: int 0x82

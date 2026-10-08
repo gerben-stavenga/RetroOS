@@ -21,6 +21,7 @@ pub mod serial_log;
 pub mod startup;
 pub mod boot_filesystems;
 pub mod thread;
+pub mod text;
 
 // ── Machine policy: what this box is, who owns the console, what it may do ─
 pub mod focus;

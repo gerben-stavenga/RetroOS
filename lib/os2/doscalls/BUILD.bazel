@@ -13,6 +13,10 @@ os2_dll(
     out = "DOSCALLS.DLL",
     module_name = "DOSCALLS",
     exports = [
+        "DosKillThread.111",
+        "DOS16MEMAVAIL.127",
+        "DosSearchPath.228",
+        "DosCreateThread.311",
         "DosQueryMem.306",
 
         "DosError.212",
@@ -34,6 +38,7 @@ os2_dll(
         "DosCreateDir.270",
         "DosMove.271",
         "DosSetFileSize.272",
+        "DosSetFileSizeL.989",
         "DosQueryCurrentDir.274",
         "DosQueryCurrentDisk.275",
         "DosQueryFSAttach.277",

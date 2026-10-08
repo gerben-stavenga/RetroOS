@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod pe;
 pub mod ne;
 mod extra;
+mod encoding;
 mod threads;
 mod win16;
 
@@ -248,6 +249,7 @@ struct Callback {
 
 pub struct WindowsState {
     pub(crate) environment: Vec<u8>,
+    file_oem: bool,
     gates: Vec<Gate>,
     threads: threads::State,
     ldt: Vec<u64>,
@@ -307,6 +309,7 @@ impl WindowsState {
     fn new() -> Self {
         Self {
             environment: extra::windows_environment(&[]),
+            file_oem: false,
             gates: Vec::new(),
             threads: threads::State::default(),
             ldt: vec![0],
@@ -1092,13 +1095,9 @@ pub fn exec_pe_into<A: crate::Arch>(
 
     let win_path = guest_windows_path(&main_path);
     let cmd_a = PROCESS_DATA + 0x200;
-    machine.copy_to(cmd_a as usize, &win_path);
-    machine.write::<u8>((cmd_a + win_path.len() as u32) as usize, 0);
+    encoding::copy(machine, cmd_a as usize, 512, &win_path, false);
     let cmd_w = PROCESS_DATA + 0x400;
-    for (n, &b) in win_path.iter().enumerate() {
-        machine.write::<u16>(cmd_w as usize + n * 2, b as u16);
-    }
-    machine.write::<u16>(cmd_w as usize + win_path.len() * 2, 0);
+    encoding::copy(machine, cmd_w as usize, 512, &win_path, true);
 
     for module in &modules {
         protect_module(machine, module)?;
@@ -1388,6 +1387,10 @@ pub(super) fn arg<A: crate::Arch>(machine: &A, regs: &Regs, n: usize) -> u32 {
 }
 
 pub(super) fn c_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
+    Ok(encoding::ansi().decode(&raw_string(machine, address)?, false).unwrap().into_bytes())
+}
+
+pub(super) fn raw_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<u8>, u32> {
     if address == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
@@ -1406,18 +1409,9 @@ pub(super) fn w_string<A: crate::Arch>(machine: &A, address: u32) -> Result<Vec<
     if address == 0 {
         return Err(ERROR_INVALID_PARAMETER);
     }
-    let mut out = Vec::new();
-    for i in 0..32768 {
-        let c = machine.read::<u16>(address as usize + i * 2);
-        if c == 0 {
-            return Ok(out);
-        }
-        if c > 0x7f {
-            return Err(ERROR_INVALID_PARAMETER);
-        }
-        out.push(c as u8);
-    }
-    Err(ERROR_INVALID_PARAMETER)
+    let mut units = encoding::units(machine, address, -1)?;
+    units.pop();
+    crate::kernel::text::from_utf16(&units, true).map(|s| s.into_bytes()).map_err(|_| 1113)
 }
 
 fn finish<A: crate::Arch>(machine: &A, regs: &mut Regs, gate: Gate, result: u32) {
@@ -1506,6 +1500,7 @@ fn io_write<A: crate::Arch>(
     ptr: usize,
     len: usize,
     actual: usize,
+    output_cp: u32,
 ) -> u32 {
     if handle >= thread::MAX_FDS {
         return 0;
@@ -1514,9 +1509,8 @@ fn io_write<A: crate::Arch>(
     machine.copy_from(ptr, &mut data);
     let n = match kt.fds[handle] {
         thread::FdKind::ConsoleOut => {
-            for &b in &data {
-                crate::term::putchar(b);
-            }
+            let text = encoding::page(output_cp).unwrap().decode(&data, false).unwrap();
+            for &b in text.as_bytes() { crate::term::putchar(b); }
             crate::kernel::term::mark_dirty();
             len as i32
         }
@@ -1564,8 +1558,9 @@ pub(super) fn copy_ascii<A: crate::Arch>(machine: &mut A, out: usize, cap: usize
     if cap == 0 {
         return 0;
     }
-    let n = text.len().min(cap - 1);
-    machine.copy_to(out, &text[..n]);
+    let encoded = encoding::ansi().encode(&alloc::string::String::from_utf8_lossy(text), b'?').0;
+    let n = encoded.len().min(cap - 1);
+    machine.copy_to(out, &encoded[..n]);
     machine.write::<u8>(out + n, 0);
     n as u32
 }
@@ -1816,7 +1811,7 @@ fn dispatch<A: crate::Arch>(
     match api {
         Api::GetLastError => state.last_error,
         Api::GetACP => 1252,
-        Api::GetOEMCP => 437,
+        Api::GetOEMCP => u32::from(lib::codepage::current_codepage().id),
         Api::GetVersion => 0x0000_0004,
         Api::GetCurrentThreadId => (kt.tid + 1) as u32,
         Api::GetCommandLineA => state.command_line_a,
@@ -1865,12 +1860,9 @@ fn dispatch<A: crate::Arch>(
             1
         }
         Api::WriteFile => io_write(
-            machine,
-            kt,
-            arg(machine, regs, 0) as usize,
-            arg(machine, regs, 1) as usize,
-            arg(machine, regs, 2) as usize,
-            arg(machine, regs, 3) as usize,
+            machine, kt, arg(machine, regs, 0) as usize,
+            arg(machine, regs, 1) as usize, arg(machine, regs, 2) as usize,
+            arg(machine, regs, 3) as usize, state.console.output_cp,
         ),
         Api::ReadFile => io_read(
             machine,
@@ -1881,7 +1873,7 @@ fn dispatch<A: crate::Arch>(
             arg(machine, regs, 3) as usize,
         ),
         Api::CreateFileA => {
-            let raw = match c_string(machine, arg(machine, regs, 0)) {
+            let raw = match encoding::file_string(machine, state, arg(machine, regs, 0), false) {
                 Ok(v) => v,
                 Err(e) => return fail(state, e, INVALID_HANDLE_VALUE),
             };
@@ -2090,67 +2082,21 @@ fn dispatch<A: crate::Arch>(
                 }
             };
             let text = guest_windows_path(path);
-            let out = arg(machine, regs, 1) as usize;
-            let cap = arg(machine, regs, 2) as usize;
-            if cap == 0 {
-                return 0;
-            }
-            let n = text.len().min(cap - 1);
-            for (i, &b) in text[..n].iter().enumerate() {
-                machine.write::<u16>(out + i * 2, b as u16);
-            }
-            machine.write::<u16>(out + n * 2, 0);
-            n as u32
+            encoding::copy(machine, arg(machine, regs, 1) as usize,
+                arg(machine, regs, 2) as usize, &text, true)
         }
         Api::GetCPInfo => {
+            let Some(page) = encoding::page(arg(machine, regs, 0)) else {
+                return fail(state, ERROR_INVALID_PARAMETER, 0);
+            };
             let out = arg(machine, regs, 1) as usize;
             machine.zero(out, 20);
-            machine.write::<u32>(out, 1);
+            machine.write::<u32>(out, if matches!(page, crate::kernel::text::Encoding::Utf8) { 4 } else { 1 });
             machine.write::<u8>(out + 4, b'?');
             1
         }
-        Api::MultiByteToWideChar => {
-            let input = arg(machine, regs, 2) as usize;
-            let count = arg(machine, regs, 3) as i32;
-            let out = arg(machine, regs, 4) as usize;
-            let cap = arg(machine, regs, 5) as usize;
-            let n = if count < 0 {
-                c_string(machine, input as u32).map_or(0, |v| v.len() + 1)
-            } else {
-                count as usize
-            };
-            if out == 0 {
-                return n as u32;
-            }
-            let written = n.min(cap);
-            for i in 0..written {
-                machine.write::<u16>(out + i * 2, machine.read::<u8>(input + i) as u16);
-            }
-            written as u32
-        }
-        Api::WideCharToMultiByte => {
-            let input = arg(machine, regs, 2) as usize;
-            let count = arg(machine, regs, 3) as i32;
-            let out = arg(machine, regs, 4) as usize;
-            let cap = arg(machine, regs, 5) as usize;
-            let n = if count < 0 {
-                let mut n = 0;
-                while n < 32768 && machine.read::<u16>(input + n * 2) != 0 {
-                    n += 1;
-                }
-                n + 1
-            } else {
-                count as usize
-            };
-            if out == 0 {
-                return n as u32;
-            }
-            let written = n.min(cap);
-            for i in 0..written {
-                machine.write::<u8>(out + i, machine.read::<u16>(input + i * 2) as u8);
-            }
-            written as u32
-        }
+        Api::MultiByteToWideChar => encoding::multi_to_wide(machine, state, regs),
+        Api::WideCharToMultiByte => encoding::wide_to_multi(machine, state, regs),
         Api::GetConsoleMode => {
             let handle = arg(machine, regs, 0) as usize;
             let mode = state.std_mode.get(handle).copied().unwrap_or(0);
@@ -2184,7 +2130,7 @@ fn dispatch<A: crate::Arch>(
         Api::CharUpperA => {
             let p = arg(machine, regs, 0);
             if p <= 0xffff {
-                (p as u8).to_ascii_uppercase() as u32
+                u32::from(lib::codepage::encoding_page(1252).unwrap().uppercase(p as u8))
             } else {
                 let mut at = p as usize;
                 loop {
@@ -2192,7 +2138,7 @@ fn dispatch<A: crate::Arch>(
                     if b == 0 {
                         break;
                     }
-                    machine.write::<u8>(at, b.to_ascii_uppercase());
+                    machine.write::<u8>(at, lib::codepage::encoding_page(1252).unwrap().uppercase(b));
                     at += 1;
                 }
                 p
@@ -2669,9 +2615,15 @@ fn dispatch<A: crate::Arch>(
             }
         }
         Api::GetTextExtentPoint32W => {
-            let count = arg(machine, regs, 2);
+            let count = arg(machine, regs, 2) as i32;
+            let text = if count == 0 { alloc::string::String::new() } else {
+                let units = match encoding::units(machine, arg(machine, regs, 1), count) {
+                    Ok(units) => units, Err(e) => return fail(state, e, 0),
+                };
+                crate::kernel::text::from_utf16(&units, false).unwrap()
+            };
             let out = arg(machine, regs, 3) as usize;
-            machine.write::<u32>(out, count * 8);
+            machine.write::<u32>(out, text.chars().count() as u32 * 8);
             machine.write::<u32>(out + 4, 16);
             1
         }
@@ -2686,12 +2638,10 @@ fn dispatch<A: crate::Arch>(
                 .iter()
                 .find(|d| d.handle == dc)
                 .map_or(0, |d| d.text);
-            for n in 0..count {
-                let ch = machine.read::<u16>(text + n * 2) as usize;
-                if ch >= 256 {
-                    continue;
-                }
-                let glyph = &lib::vga_fonts::FONT_8X16[ch * 16..ch * 16 + 16];
+            let units: Vec<u16> = (0..count).map(|n| machine.read::<u16>(text + n * 2)).collect();
+            let text = crate::kernel::text::from_utf16(&units, false).unwrap();
+            for (n, ch) in text.chars().enumerate() {
+                let glyph = crate::kernel::text::glyph16(ch);
                 for (gy, &bits) in glyph.iter().enumerate() {
                     for gx in 0..8 {
                         if bits & (0x80 >> gx) != 0 {

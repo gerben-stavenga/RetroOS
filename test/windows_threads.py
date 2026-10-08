@@ -69,6 +69,10 @@ def main():
                              (error.stderr or b"").decode(errors="replace") +
                              "\nWin32 thread test timed out")
         log = result.stdout + result.stderr
+        if (root / "APPS/éЖ😀.txt").read_bytes() != bytes([0, 255, 130, 195, 40]):
+            raise SystemExit("Win32 UTF-16 path or raw file contents did not cross the UTF-8 VFS boundary")
+        if not (root / "APPS/café/x.txt").is_file():
+            raise SystemExit("Win32 ANSI/OEM path did not reach the UTF-8 VFS")
         if ndn_directory:
             for name in ("SCRRES.DLL", "DESCSS.DLL", "NDNPASS.DLL", "TETRIS.DLL"):
                 if f"{name} LOAD PASS" not in log:

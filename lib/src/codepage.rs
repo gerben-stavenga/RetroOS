@@ -13,16 +13,34 @@ pub struct CodePage {
 pub struct Fonts {
     pub h8: &'static [u8; 2048],
     pub h14: &'static [u8; 3584],
-    pub h16: &'static [u8; 4096],
+    pub h16: [u8; 4096],
 }
 
 impl CodePage {
-    pub fn fonts(&self) -> Fonts {
+    pub fn font8(&self) -> &'static [u8; 2048] {
         match self.id {
-            850 => Fonts { h8: include_bytes!("fonts/cp850_8x8.bin"), h14: include_bytes!("fonts/cp850_8x14.bin"), h16: include_bytes!("fonts/cp850_8x16.bin") },
-            852 => Fonts { h8: include_bytes!("fonts/cp852_8x8.bin"), h14: include_bytes!("fonts/cp852_8x14.bin"), h16: include_bytes!("fonts/cp852_8x16.bin") },
-            866 => Fonts { h8: include_bytes!("fonts/cp866_8x8.bin"), h14: include_bytes!("fonts/cp866_8x14.bin"), h16: include_bytes!("fonts/cp866_8x16.bin") },
-            _ => Fonts { h8: &crate::vga_fonts::FONT_8X8, h14: &crate::vga_fonts::FONT_8X14, h16: &crate::vga_fonts::FONT_8X16 },
+            850 => include_bytes!("fonts/cp850_8x8.bin"),
+            852 => include_bytes!("fonts/cp852_8x8.bin"),
+            866 => include_bytes!("fonts/cp866_8x8.bin"),
+            _ => &crate::vga_fonts::FONT_8X8,
+        }
+    }
+
+    pub fn font14(&self) -> &'static [u8; 3584] {
+        match self.id {
+            850 => include_bytes!("fonts/cp850_8x14.bin"),
+            852 => include_bytes!("fonts/cp852_8x14.bin"),
+            866 => include_bytes!("fonts/cp866_8x14.bin"),
+            _ => &crate::vga_fonts::FONT_8X14,
+        }
+    }
+
+    /// Build the 8×16 character generator when installing a VGA font.
+    pub fn fonts(&self) -> Fonts {
+        Fonts {
+            h8: self.font8(),
+            h14: self.font14(),
+            h16: crate::unicode_font::codepage_font(self),
         }
     }
 }
@@ -91,6 +109,9 @@ static CP437: CodePage = CodePage {
 static CP850: CodePage = CodePage { id: 850, glyphs: &crate::codepage_tables::CP850, replacement: b'?' };
 static CP852: CodePage = CodePage { id: 852, glyphs: &crate::codepage_tables::CP852, replacement: b'?' };
 static CP866: CodePage = CodePage { id: 866, glyphs: &crate::codepage_tables::CP866, replacement: b'?' };
+static CP1250: CodePage = CodePage { id: 1250, glyphs: &crate::ansi_tables::CP1250, replacement: b'?' };
+static CP1251: CodePage = CodePage { id: 1251, glyphs: &crate::ansi_tables::CP1251, replacement: b'?' };
+static CP1252: CodePage = CodePage { id: 1252, glyphs: &crate::ansi_tables::CP1252, replacement: b'?' };
 static CURRENT: AtomicU16 = AtomicU16::new(437);
 
 pub fn current_codepage() -> &'static CodePage {
@@ -99,6 +120,14 @@ pub fn current_codepage() -> &'static CodePage {
 
 pub fn codepage(id: u16) -> Option<&'static CodePage> {
     match id { 437 => Some(&CP437), 850 => Some(&CP850), 852 => Some(&CP852), 866 => Some(&CP866), _ => None }
+}
+
+/// Encoding tables also include Windows ANSI pages, which have no DOS font.
+pub fn encoding_page(id: u16) -> Option<&'static CodePage> {
+    match id {
+        1250 => Some(&CP1250), 1251 => Some(&CP1251), 1252 => Some(&CP1252),
+        _ => codepage(id),
+    }
 }
 
 /// Callers must install the matching VGA font before publishing the new page.

@@ -4260,7 +4260,7 @@ fn unix_to_dos_datetime(unix: u32) -> (u16, u16) {
     (dos_time as u16, dos_date as u16)
 }
 
-fn dos_to_unix_datetime(time: u16, date: u16) -> Option<u32> {
+pub(crate) fn dos_to_unix_datetime(time: u16, date: u16) -> Option<u32> {
     let year = 1980u32 + ((date >> 9) & 0x7F) as u32;
     let month = ((date >> 5) & 0x0F) as u32;
     let day = (date & 0x1F) as u32;

@@ -500,6 +500,14 @@ impl Filesystem for PortableExt4Fs {
         ) as i32
     }
 
+    fn resize(&self, handle: u64, size: u32) -> i32 {
+        let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else { return -9; };
+        if self.flush_pending().is_err() { return -5; }
+        let mut mounted = self.mounted.borrow_mut();
+        let (filesystem, storage) = mounted.parts();
+        filesystem.resize(storage, blob, u64::from(size)).map_or(-5, |_| 0)
+    }
+
     fn write(&self, handle: u64, offset: u32, input: &[u8]) -> i32 {
         let Some(Object::Blob(blob)) = self.open.borrow().get(handle) else {
             return -9;

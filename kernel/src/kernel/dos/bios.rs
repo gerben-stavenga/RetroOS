@@ -321,7 +321,7 @@ fn install_rom_font<A: crate::Arch>(machine: &mut A) {
     let fonts = lib::codepage::current_codepage().fonts();
     machine.copy_to(font8 as usize, fonts.h8);
     machine.copy_to(font14 as usize, fonts.h14);
-    machine.copy_to(font16 as usize, fonts.h16);
+    machine.copy_to(font16 as usize, &fonts.h16);
     set_data_vector(machine, 0x1F, font8 + 128 * 8);
     publish_active_font(machine, 16); // POST starts in 80x25, 8x16 mode 3.
 }
@@ -895,6 +895,7 @@ fn font_service<A: crate::Arch>(
     let map = usize::from(regs.rbx as u8 & 7);
     let set_geometry = matches!(subfn, 0x10 | 0x11 | 0x12 | 0x14);
 
+    let fonts = lib::codepage::current_codepage().fonts();
     let mut owned = alloc::vec::Vec::new();
     let (first, glyph_h, font): (usize, usize, &[u8]) = match subfn {
         0x00 | 0x10 => {
@@ -907,9 +908,9 @@ fn font_service<A: crate::Arch>(
             machine.copy_from(src, &mut owned);
             (first, glyph_h, &owned)
         }
-        0x01 | 0x11 => (0, 14, lib::codepage::current_codepage().fonts().h14),
-        0x02 | 0x12 => (0, 8, lib::codepage::current_codepage().fonts().h8),
-        0x04 | 0x14 => (0, 16, lib::codepage::current_codepage().fonts().h16),
+        0x01 | 0x11 => (0, 14, fonts.h14),
+        0x02 | 0x12 => (0, 8, fonts.h8),
+        0x04 | 0x14 => (0, 16, &fonts.h16),
         0x03 => {
             if let Some(display) = dos.pc.vga.native_mut() {
                 let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, None);
@@ -922,8 +923,19 @@ fn font_service<A: crate::Arch>(
     };
 
     if let Some(display) = dos.pc.vga.native_mut() {
-        let buffer = matches!(subfn, 0x00 | 0x10).then_some(font);
-        let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, buffer);
+        if matches!(subfn, 0x00 | 0x10) {
+            let _ = display.cap_mut().bios_font_call(machine, bios_display, regs, Some(font));
+        } else {
+            // Native ROM font calls would reload the firmware's CP437 font.
+            // Load our selected page through the BIOS user-font interface.
+            let mut call = *regs;
+            call.rax = if set_geometry { 0x1110 } else { 0x1100 };
+            call.rbx = ((glyph_h as u64) << 8) | map as u64;
+            call.rcx = 256;
+            call.rdx = 0;
+            let _ = display.cap_mut().bios_font_call(machine, bios_display, &mut call, Some(font));
+            regs.rax = call.rax;
+        }
     } else {
         super::machine::vga::bios_load_font(
             machine, &mut dos.pc.vga, map, first, font, glyph_h,
@@ -962,7 +974,7 @@ pub(super) fn install_codepage_font<A: crate::Arch>(
         14 => 14,
         _ => 16,
     };
-    let font: &[u8] = match height { 8 => fonts.h8, 14 => fonts.h14, _ => fonts.h16 };
+    let font: &[u8] = match height { 8 => fonts.h8, 14 => fonts.h14, _ => &fonts.h16 };
     let installed = if let Some(display) = dos.pc.vga.native_mut() {
         let mut call = Regs::empty();
         call.rax = 0x1100;
@@ -977,7 +989,7 @@ pub(super) fn install_codepage_font<A: crate::Arch>(
     if installed {
         machine.copy_to(super::dos::font_8x8_addr() as usize, fonts.h8);
         machine.copy_to(super::dos::font_8x14_addr() as usize, fonts.h14);
-        machine.copy_to(super::dos::font_8x16_addr() as usize, fonts.h16);
+        machine.copy_to(super::dos::font_8x16_addr() as usize, &fonts.h16);
     }
     installed
 }

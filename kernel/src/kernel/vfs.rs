@@ -152,6 +152,9 @@ pub trait Filesystem {
     /// Create (or truncate) a file. Returns vnode on success. Default = R/O.
     fn create(&self, _path: &[u8]) -> Option<Vnode> { None }
 
+    /// Change length without changing the open file position.
+    fn resize(&self, _handle: u64, _size: u32) -> i32 { -38 }
+
     /// Does this backend implement `create` at all?
     ///
     /// Distinguishes an unsupported operation from a supported create that
@@ -1340,6 +1343,23 @@ impl Vfs {
         n
     }
 
+    fn resize_by_handle(&mut self, handle: i32, size: u32) -> i32 {
+        let Some(entry) = self.file_table.get(handle as usize) else { return -9; };
+        if entry.refcount == 0 { return -9; }
+        if !entry.writable { return -30; }
+        let (mount, fid, ino) = (entry.mount_idx, entry.vnode.handle, entry.ino);
+        let result = self.mount_fs(mount).resize(fid, size);
+        if result < 0 { return result; }
+        for entry in &mut self.file_table {
+            if entry.refcount != 0 && entry.mount_idx == mount && entry.ino == ino {
+                entry.vnode.size = size;
+            }
+        }
+        self.invalidate_dir_cache();
+        self.touch_handle(handle);
+        0
+    }
+
     fn seek_by_handle(&mut self, handle: i32, offset: i32, whence: i32) -> i32 {
         if handle < 0 || (handle as usize) >= self.file_table.len() { return -9; }
         let h = handle as usize;
@@ -1994,6 +2014,10 @@ pub fn seek_by_handle(handle: i32, offset: i32, whence: i32) -> i32 {
 }
 
 /// Get file size by VFS handle.
+pub fn resize_by_handle(handle: i32, size: u32) -> i32 {
+    VFS.lock().resize_by_handle(handle, size)
+}
+
 pub fn file_size_by_handle(handle: i32) -> u32 {
     VFS.lock().file_size_by_handle(handle)
 }

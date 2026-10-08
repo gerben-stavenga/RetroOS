@@ -7,6 +7,52 @@ fn write(term: &mut Term, bytes: &[u8]) {
 }
 
 #[test]
+fn unicode_cells_survive_alternate_screen_scroll_and_erase() {
+    let mut term = Term::new(None);
+    write(&mut term, "Ж€😀".as_bytes());
+    let cells = term.unicode_cells();
+    assert_eq!(cells[..3].iter().map(|cell| cell.character).collect::<String>(), "Ж€😀");
+    write(&mut term, b"\x1b[?1049hother\x1b[?1049l");
+    assert_eq!(term.unicode_cells()[0].character, 'Ж');
+    assert_eq!(term.unicode_cells()[2].character, '😀');
+    write(&mut term, b"\x1b[25;1H\n");
+    assert_eq!(term.unicode_cells()[0].character, ' ');
+    write(&mut term, "\x1b[25;1HЖ".as_bytes());
+    write(&mut term, b"\n");
+    assert_eq!(term.unicode_cells()[23 * 80].character, 'Ж');
+    write(&mut term, b"\x1b[24;1H\x1b[K");
+    assert_eq!(term.unicode_cells()[23 * 80].character, ' ');
+}
+
+#[test]
+fn invalid_utf8_cannot_become_an_oem_character_or_an_overlong_control() {
+    let mut term = Term::new(None);
+    write(&mut term, b"\xc0\x80\xe0\x80\x80\xed\xa0\x80\xf4\x90\x80\x80");
+    assert!(term.unicode_cells()[..5].iter().all(|cell| cell.character == '�'));
+    write(&mut term, b"\xc3");
+    write(&mut term, b"\xa9");
+    assert_eq!(term.unicode_cells()[5].character, 'é');
+    write(&mut term, b"\xe2A");
+    assert_eq!(term.unicode_cells()[6].character, '�');
+    assert_eq!(term.unicode_cells()[7].character, 'A');
+}
+
+#[test]
+fn unicode_output_and_legacy_byte_output_have_explicit_boundaries() {
+    let mut term = Term::new(None);
+    term.blit_cells(1, 1, &[0x82, 0x17], 0, 0);
+    assert_eq!(term.unicode_cells()[0], lib::term::Cell { character: 'é', attribute: 0x17 });
+    term.blit_unicode_cells(1, 1, &[lib::term::Cell { character: 'Ж', attribute: 0x27 }], 0, 0);
+    assert_eq!(term.unicode_cells()[0].character, 'Ж');
+    write(&mut term, "Ω\tX\x08Y".as_bytes());
+    assert_eq!(term.unicode_cells()[0].character, 'Ω');
+    assert_eq!(term.unicode_cells()[8].character, 'Y');
+    write(&mut term, b"\x1b[1;5HZZ\x1b[1;1H\t");
+    assert_eq!(term.cursor_pos(), (8, 0));
+    assert_eq!(term.unicode_cells()[4].character, 'Z'); // HT moves without erasing.
+}
+
+#[test]
 fn full_screen_defers_wrap_until_next_printable_character() {
     let mut term = Term::new(None);
     write(&mut term, &vec![b'A'; 2000]);

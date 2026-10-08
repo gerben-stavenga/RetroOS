@@ -56,7 +56,7 @@ pub fn dispatch<A: crate::Arch>(
             for evt in guest_events {
                 match evt {
                     crate::Irq::Key(scancode) => {
-                        os2.process_key(&kt.fds, scancode);
+                        os2.process_key(&kt.fds, scancode, machine.get_ticks().wrapping_mul(10) as u32);
                         wake = true;
                     }
                     crate::Irq::Mouse { dx, dy, buttons } => {

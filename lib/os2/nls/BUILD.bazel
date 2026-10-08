@@ -7,6 +7,6 @@ os2_dll(
     obj = ":nls_obj",
     out = "NLS.DLL",
     module_name = "NLS",
-    exports = ["DosQueryDBCSEnv.6"],
+    exports = ["DosQueryCtryInfo.5", "DosQueryDBCSEnv.6", "DosMapCase.7", "DosQueryCollate.8"],
     visibility = ["//visibility:public"],
 )

@@ -7,15 +7,13 @@
 //! boot consoles may still let a real VGA scan B8000 directly before the event
 //! loop takes over.
 //!
-//! Rendering reads the terminal's own grid — 4000 bytes, drawn whole. No
+//! Rendering reads the terminal's Unicode cells, drawn whole. No
 //! personality or content producer sees the physical framebuffer format.
 
 pub use lib::term::{Term, putchar, term};
 
 use crate::kernel::display::Display;
 use core::sync::atomic::{AtomicBool, Ordering};
-use lib::vga_fonts::FONT_8X16;
-use vga::{Frame, VgaMode};
 
 /// VGA text palette used to turn terminal attributes into canonical RGB.
 static mut PALETTE: [u8; 768] = [0; 768];
@@ -53,18 +51,6 @@ static DIRTY: AtomicBool = AtomicBool::new(true);
 pub fn mark_dirty() {
     DIRTY.store(true, Ordering::Release);
 }
-
-/// Identity Attribute-Controller palette. Text rendering consumes the first
-/// sixteen entries; mode control remains zero for normal text semantics.
-static TEXT_AC: [u8; 21] = {
-    let mut ac = [0u8; 21];
-    let mut i = 0;
-    while i < 16 {
-        ac[i] = i as u8;
-        i += 1;
-    }
-    ac
-};
 
 /// Render the terminal into its back buffer, commit it to the retained surface,
 /// and pass the completed desktop shadow to the display boundary.
@@ -128,47 +114,19 @@ fn render(
         }
     }
     let cell_w = if display.composition_size(720, 400).0 < 720 { 8 } else { 9 };
-    let vram = lib::term::term().cells_bytes();
-    let palette_p = &raw const PALETTE;
-    let frame = Frame {
-        plane_layout: vga::VramLayout::PlaneMinor,
-        mode: VgaMode::Text {
-            cols: 80,
-            rows: 25,
-            cell_w,
-            cell_h: 16,
-        },
-        vram,
-        planes: &[],
-        ac: &TEXT_AC,
-        palette: unsafe { &*palette_p },
-        dac_mask: 0xFF,
-        font: &FONT_8X16,
-        font_b: &FONT_8X16,
-        font_maps: None,
-        blink: false, text_cursor: None,
-        cga_palette: [0; 4],
-        start_offset: 0,
-        pixel_pan: 0, split_pixel_pan: 0,
-        line_compare: usize::MAX,
-        blank_start: usize::MAX,
-    };
-    render_frame(display, &frame, desktop)
+    render_grid(display, cell_w, desktop)
 }
 
-fn render_frame(
+fn render_grid(
     display: &mut Display,
-    frame: &Frame<'_>,
+    cell_w: usize,
     desktop: Option<(
         &mut crate::kernel::gui::Desktop,
         crate::kernel::gui::EndpointId,
     )>,
 ) -> Option<(usize, usize, &'static mut [u8])> {
     let managed = desktop.is_some();
-    let (w, h) = vga::dimensions(frame.mode);
-    if w == 0 || h == 0 || display.shadow_width == 0 {
-        return None;
-    }
+    let (w, h) = (80 * cell_w, 400);
 
     // The terminal is a content producer, not an output renderer. Keep its
     // native 720x400 XRGB8888 pixels independent of the physical display;
@@ -188,11 +146,10 @@ fn render_frame(
     if content.len() != need {
         content.resize(need, 0);
     }
-    pal.sync(frame.palette, frame.dac_mask, content_format, pal_cache);
-    pal.sync_planar(&TEXT_AC);
-    for sy in 0..h {
-        vga::render_row(frame, sy, pal, &mut content[sy * w..(sy + 1) * w]);
-    }
+    let palette_p = &raw const PALETTE;
+    pal.sync(unsafe { &*palette_p }, 0xff, content_format, pal_cache);
+    let cells = lib::term::term().unicode_cells();
+    lib::unicode_font::render_terminal(cells, 80, cell_w, &pal.lut, content);
 
     const TERMINAL_SURFACE: crate::kernel::gui::SurfaceKey = crate::kernel::gui::SurfaceKey(1);
     const TERMINAL_PRESENTATION: crate::kernel::gui::PresentationKey =

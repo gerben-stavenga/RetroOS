@@ -132,3 +132,11 @@ rust_test(
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
     deps = [":lib"],
 )
+
+rust_test(
+    name = "unicode_font_test",
+    srcs = ["tests/unicode_font.rs"],
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+    deps = [":lib"],
+)

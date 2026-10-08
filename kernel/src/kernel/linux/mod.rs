@@ -623,7 +623,7 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
     // 1. Write NUL-terminated string data at top of stack
     // Environment strings first (they end up at higher addresses)
-    let env_strings: &[&[u8]] = &[b"PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"HOME=/", b"TERM=linux"];
+    let env_strings: &[&[u8]] = &[b"PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"HOME=/", b"TERM=linux", b"LANG=C.UTF-8"];
     let mut env_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(env_strings.len());
     for &env in env_strings.iter().rev() {
         sp -= env.len() + 1;

@@ -183,10 +183,8 @@ pub(super) fn call<A: crate::Arch>(
                 machine.write::<u8>(a(2) as usize, 0);
                 return fail(state, 1814, 0);
             };
-            let bytes: Vec<u8> = text
-                .iter()
-                .map(|&c| u8::try_from(c).unwrap_or(b'?'))
-                .collect();
+            let text = crate::kernel::text::from_utf16(&text, false).unwrap();
+            let bytes = encoding::ansi().encode(&text, b'?').0;
             let n = bytes.len().min(a(3) as usize - 1);
             machine.copy_to(a(2) as usize, &bytes[..n]);
             machine.write::<u8>(a(2) as usize + n, 0);
@@ -196,15 +194,21 @@ pub(super) fn call<A: crate::Arch>(
             open_console(state);
             1
         }
-        b"GetConsoleCP" | b"GetConsoleOutputCP" => 437,
+        b"GetConsoleCP" => state.console.input_cp,
+        b"GetConsoleOutputCP" => state.console.output_cp,
+        b"SetConsoleCP" | b"SetConsoleOutputCP" => {
+            if encoding::page(a(0)).is_none() { return fail(state, ERROR_INVALID_PARAMETER, 0); }
+            if name == b"SetConsoleCP" { state.console.input_cp = a(0); }
+            else { state.console.output_cp = a(0); }
+            1
+        },
         b"GetThreadLocale" => 0x409,
-        b"AreFileApisANSI" => 1,
-        b"SetConsoleCP"
-        | b"SetConsoleOutputCP"
-        | b"SetConsoleIcon"
+        b"AreFileApisANSI" => u32::from(!state.file_oem),
+        b"SetFileApisToANSI" => { state.file_oem = false; 0 },
+        b"SetConsoleIcon"
         | b"SetPriorityClass"
         | b"SetProcessShutdownParameters" => 1,
-        b"SetFileApisToOEM" => 0,
+        b"SetFileApisToOEM" => { state.file_oem = true; 0 },
         b"FlushConsoleInputBuffer" => {
             state.console.input.clear();
             1
@@ -414,29 +418,35 @@ pub(super) fn call<A: crate::Arch>(
                 machine.write::<u8>(
                     at,
                     if name == b"CharUpperBuffA" {
-                        ch.to_ascii_uppercase()
+                        lib::codepage::encoding_page(1252).unwrap().uppercase(ch)
                     } else {
-                        ch.to_ascii_lowercase()
+                        { let page = lib::codepage::encoding_page(1252).unwrap();
+                        let mut lower = page.decode(ch).to_lowercase();
+                        let value = lower.next().and_then(|c| page.encode_exact(c)).unwrap_or(ch);
+                        if lower.next().is_none() { value } else { ch }
+                    }
                     },
                 );
             }
             a(1)
         }
-        b"OemToCharBuffA" | b"CharToOemBuffA" => {
-            for i in 0..a(2) as usize {
-                machine.write::<u8>(a(1) as usize + i, machine.read::<u8>(a(0) as usize + i));
-            }
-            1
-        }
-        b"OemToCharA" | b"CharToOemA" => {
-            if let Ok(text) = c_string(machine, a(0)) {
-                copy_ascii(machine, a(1) as usize, text.len() + 1, &text);
-            }
+        b"OemToCharBuffA" | b"CharToOemBuffA" | b"OemToCharA" | b"CharToOemA" => {
+            let data = if name.ends_with(b"BuffA") {
+                (0..a(2) as usize).map(|i| machine.read::<u8>(a(0) as usize + i)).collect()
+            } else {
+                let Ok(mut data) = super::super::raw_string(machine, a(0)) else { return fail(state, ERROR_INVALID_PARAMETER, 0); };
+                data.push(0); data
+            };
+            let (from, to) = if name.starts_with(b"OemToChar") {
+                (crate::kernel::text::Encoding::oem(), encoding::ansi())
+            } else { (encoding::ansi(), crate::kernel::text::Encoding::oem()) };
+            let text = from.decode(&data, false).unwrap();
+            machine.copy_to(a(1) as usize, &to.encode(&text, b'?').0);
             1
         }
         b"strcpy" => {
-            if let Ok(text) = c_string(machine, a(1)) {
-                copy_ascii(machine, a(0) as usize, text.len() + 1, &text);
+            if let Ok(mut data) = super::super::raw_string(machine, a(1)) {
+                data.push(0); machine.copy_to(a(0) as usize, &data);
             }
             a(0)
         }
@@ -446,7 +456,7 @@ pub(super) fn call<A: crate::Arch>(
             heap_free(state, a(0));
             0
         }
-        b"strlen" => c_string(machine, a(0)).map_or(0, |s| s.len() as u32),
+        b"strlen" => super::super::raw_string(machine, a(0)).map_or(0, |s| s.len() as u32),
         b"_lock" | b"_unlock" | b"_initterm" => 0,
         _ => fail(state, 120, 0),
     }
