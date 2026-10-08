@@ -1,0 +1,171 @@
+name: Validate RetroOS
+'on':
+  workflow_call:
+    inputs:
+      commit:
+        required: true
+        type: string
+      package_release:
+        default: false
+        type: boolean
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  quality:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.commit }}
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/setup-build
+    - name: Validate workflow syntax
+      run: |
+        curl -fsSL https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz -o "$RUNNER_TEMP/actionlint.tar.gz"
+        tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP" actionlint
+        "$RUNNER_TEMP/actionlint" -shellcheck="" -color
+        bash -n test/run_all.sh tools/workspace_status.sh
+    - name: Clippy (metal crates)
+      run: |
+        bazel build --config=clippy \
+          //kernel:kernel //lib:lib //lib:sound \
+          //arch-abi:arch-abi //arch-metal:arch-metal
+    - name: Clippy (host crates)
+      run: |
+        bazel build --config=clippy --platforms=@platforms//host \
+          //kernel:kernel //kernel:retroos-host \
+          //kernel:retroos-host-kvm //arch-interp:arch-interp-kvm \
+          //arch-interp:arch-interp //lib:lib //lib:sound //arch-abi:arch-abi
+    - name: Unit tests
+      env:
+        RETRO_TEST_ONLY: unit
+      run: test/run_all.sh
+    - name: Release tooling tests
+      run: python3 -m unittest discover -s test -p release_notes_test.py
+    - name: Trim build cache
+      if: always()
+      uses: ./.github/actions/trim-cache
+  runtime:
+    name: Personality and hardware tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.commit }}
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/setup-build
+    - name: Build hosted runners
+      run: bazel build //kernel:retroos-host //kernel:retroos-host-kvm --platforms=@platforms//host
+    - name: Hosted ELF smoke
+      env:
+        RUST_BACKTRACE: '1'
+      run: |
+        for src in hello outlive_composite; do
+          gcc -m32 -static -nostdlib -no-pie -fno-pic -O2 -e _start \
+            -o "/tmp/$src.elf" "test/hosted/$src.c"
+        done
+        # The program prints its greeting then exit(0)s; cap with timeout.
+        runners=retroos-host
+        [ "$RETRO_REQUIRE_KVM" = 1 ] && runners="$runners retroos-host-kvm"
+        for runner in $runners; do
+         for guest in hello outlive_composite; do
+          echo "== $runner $guest"
+          # Print what the runner said BEFORE asserting on it. Under `bash -e`
+          # a failing command substitution ends the step with the output still
+          # inside $out, which is how a SIGABRT here first showed up as a bare
+          # "exit code 134" with no message to diagnose.
+          set +e
+          out=$(timeout 30 "bazel-bin/kernel/$runner" "/tmp/$guest.elf" 2>&1)
+          rc=$?
+          set -e
+          echo "$out"
+          if [ "$rc" != 0 ]; then
+            echo "$runner exited $rc on $guest"
+            exit 1
+          fi
+          echo "$out" | grep -q "Hello from an interpreted 32-bit Linux ELF!"
+          if echo "$out" | grep -q "panicked"; then echo "kernel panicked on the bare-ELF path"; exit 1; fi
+         done
+        done
+    - name: Personality and hardware integration tests
+      env:
+        RETRO_REQUIRE_PUBLIC: '1'
+        RETRO_TEST_EXCLUDE: unit
+      run: |-
+        mkdir -p build/ci
+        test/run_all.sh 2>&1 | tee build/ci/integration.log
+    - name: Preserve integration log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: integration-log-${{ inputs.commit }}
+        path: build/ci/integration.log
+        if-no-files-found: ignore
+        retention-days: 14
+    - name: Trim build cache
+      if: always()
+      uses: ./.github/actions/trim-cache
+  package:
+    name: Release images and boot checks
+    if: inputs.package_release
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.commit }}
+        fetch-depth: 0
+        persist-credentials: false
+    - uses: ./.github/actions/setup-build
+    - name: Build public release bundles
+      run: bazel build //:release
+    - name: Validate release packaging and launcher
+      run: |
+        python3 test/release.py
+        # Later host-platform builds change the bazel-bin symlink.
+        mkdir -p build/release
+        cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz bazel-bin/retroos_grub_module_usb.img bazel-bin/retroos_grub_module.iso bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS build/release/
+    - name: Upload tested public releases
+      uses: actions/upload-artifact@v4
+      with:
+        name: retroos-${{ inputs.commit }}
+        path: |
+          build/release/retroos-vm.tar.gz
+          build/release/retroos-machine.tar.gz
+          build/release/retroos_grub_module_usb.img
+          build/release/retroos_grub_module.iso
+          build/release/retroos-usb-diagnostic.zip
+          build/release/SHA256SUMS
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 30
+    - name: Trim build cache
+      if: always()
+      uses: ./.github/actions/trim-cache
+  required:
+    name: Required checks
+    if: always()
+    needs:
+    - quality
+    - runtime
+    - package
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check all results
+      env:
+        QUALITY: ${{ needs.quality.result }}
+        RUNTIME: ${{ needs.runtime.result }}
+        PACKAGE: ${{ needs.package.result }}
+        PACKAGE_REQUIRED: ${{ inputs.package_release }}
+      run: |-
+        test "$QUALITY" = success
+        test "$RUNTIME" = success
+        if [ "$PACKAGE_REQUIRED" = true ]; then test "$PACKAGE" = success; fi

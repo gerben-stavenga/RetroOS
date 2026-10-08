@@ -1,101 +1,60 @@
 name: Publish rolling release
-
-on:
+permissions:
+  actions: read
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.target_sha }}
+    - name: Verify CI run
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_ID: ${{ inputs.run_id }}
+        TARGET_SHA: ${{ inputs.target_sha }}
+      run: |
+        test "$(gh run view "$RUN_ID" --json workflowName --jq .workflowName)" = CI
+        test "$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)" = success
+        test "$(gh run view "$RUN_ID" --json headSha --jq .headSha)" = "$TARGET_SHA"
+    - name: Download tested assets
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_ID: ${{ inputs.run_id }}
+        TARGET_SHA: ${{ inputs.target_sha }}
+      run: gh run download "$RUN_ID" --name "retroos-$TARGET_SHA" --dir release
+    - name: Verify checksums
+      run: cd release && sha256sum -c SHA256SUMS
+    - name: Upload release assets
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload retroos \
+          release/retroos-vm.tar.gz \
+          release/retroos-machine.tar.gz \
+          release/retroos_grub_module_usb.img \
+          release/retroos_grub_module.iso \
+          release/retroos-usb-diagnostic.zip \
+          release/SHA256SUMS --clobber
+    - name: Point rolling tag at tested commit
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TARGET_SHA: ${{ inputs.target_sha }}
+      run: |
+        gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/retroos" \
+          -f sha="$TARGET_SHA" -F force=true
+'on':
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful CI run containing tested assets; leave blank to build now
-        required: false
+        description: Successful CI run containing tested release assets
+        required: true
         type: string
       target_sha:
         description: Commit tested by that CI run
         required: true
         type: string
-
-permissions:
-  actions: read
-  contents: write
-
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.target_sha }}
-
-      - name: Verify CI run
-        if: inputs.run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          TARGET_SHA: ${{ inputs.target_sha }}
-        run: |
-          test "$(gh run view "$RUN_ID" --json conclusion --jq .conclusion)" = success
-          test "$(gh run view "$RUN_ID" --json headSha --jq .headSha)" = "$TARGET_SHA"
-
-      - name: Download tested assets
-        if: inputs.run_id != ''
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RUN_ID: ${{ inputs.run_id }}
-          TARGET_SHA: ${{ inputs.target_sha }}
-        run: gh run download "$RUN_ID" --name "retroos-$TARGET_SHA" --dir release
-
-      - name: Prepare build runner
-        if: inputs.run_id == ''
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
-            /usr/local/share/boost /opt/hostedtoolcache/CodeQL
-          sudo apt-get update
-          sudo apt-get install -y nasm grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib
-          sudo curl -fsSL -o /usr/local/bin/bazelisk \
-            https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-amd64
-          sudo chmod +x /usr/local/bin/bazelisk
-
-      - name: Cache build dependencies
-        if: inputs.run_id == ''
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/bazel-disk
-            ~/.cache/bazel-repo
-          key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'Cargo.lock', '.bazelrc', 'toolchain/**') }}
-          restore-keys: bazel-${{ runner.os }}-
-
-      - name: Build committed release
-        if: inputs.run_id == ''
-        run: |
-          cat >> .bazelrc <<'EOF'
-          build --disk_cache=~/.cache/bazel-disk
-          build --repository_cache=~/.cache/bazel-repo
-          build --keep_going
-          EOF
-          bazelisk build //:release
-          mkdir -p release
-          cp bazel-bin/retroos-vm.tar.gz bazel-bin/retroos-machine.tar.gz \
-            bazel-bin/retroos_grub_module_usb.img bazel-bin/retroos_grub_module.iso \
-            bazel-bin/retroos-usb-diagnostic.zip bazel-bin/SHA256SUMS release/
-
-      - name: Verify checksums
-        run: cd release && sha256sum -c SHA256SUMS
-
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release upload retroos \
-            release/retroos-vm.tar.gz \
-            release/retroos-machine.tar.gz \
-            release/retroos_grub_module_usb.img \
-            release/retroos_grub_module.iso \
-            release/retroos-usb-diagnostic.zip \
-            release/SHA256SUMS --clobber
-
-      - name: Point rolling tag at tested commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ inputs.target_sha }}
-        run: |
-          gh api --method PATCH "repos/$GITHUB_REPOSITORY/git/refs/tags/retroos" \
-            -f sha="$TARGET_SHA" -F force=true
+concurrency:
+  group: publish-rolling-release
+  cancel-in-progress: false

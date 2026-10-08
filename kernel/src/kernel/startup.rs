@@ -3112,10 +3112,8 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     }
     {
         let parent = thread::get_thread(threads, parent_tid).unwrap();
-        if let thread::Personality::Os2(os2) = &mut parent.personality {
-            if os2.child_started(child_tid as u32 + 1) {
-                parent.kernel.state = thread::ThreadState::Blocked;
-            }
+        if let thread::Personality::Os2(os2) = &mut parent.personality && os2.child_started(child_tid as u32 + 1) {
+            parent.kernel.state = thread::ThreadState::Blocked;
         }
     }
     let parent = thread::get_thread(threads, parent_tid).unwrap();

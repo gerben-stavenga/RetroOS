@@ -1,0 +1,11 @@
+name: Trim Bazel cache
+description: Keep the newest 3 GiB before saving the build cache.
+runs:
+  using: composite
+  steps:
+  - name: Trim bazel disk cache
+    run: "if [ -d ~/.cache/bazel-disk ]; then\n  du -sh ~/.cache/bazel-disk || true\n  # Cache entries are content-hash filenames\
+      \ \u2014 no spaces, plain text safe.\n  find ~/.cache/bazel-disk -type f -printf '%A@ %s %p\\n' 2>/dev/null | \\\n \
+      \   sort -rn | \\\n    awk -v budget=$((3*1024*1024*1024)) '{tot+=$2; if (tot>budget) print $3}' | \\\n    xargs -r\
+      \ rm -f\n  du -sh ~/.cache/bazel-disk || true\nfi\ndf -h /\n"
+    shell: bash

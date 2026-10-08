@@ -1,0 +1,107 @@
+name: Versioned release
+
+on:
+  push:
+    tags: ['v[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing version tag, for example v0.8.0 or v0.9.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: versioned-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: Validate version and release notes
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate tag and committed notes
+        id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor HEAD origin/master
+          python3 tools/release_notes.py "$TAG" --output release-notes.md --github-output "$GITHUB_OUTPUT"
+          printf 'sha=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          cat release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+  checks:
+    name: Release validation
+    needs: metadata
+    uses: ./.github/workflows/validate.yml
+    with:
+      commit: ${{ needs.metadata.outputs.sha }}
+      package_release: true
+
+  publish:
+    name: Publish tested version
+    needs: [metadata, checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: retroos-${{ needs.metadata.outputs.sha }}
+          path: release
+      - name: Verify downloaded artifacts
+        run: cd release && sha256sum -c SHA256SUMS
+      - name: Create or resume unpublished draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+          TESTED_SHA: ${{ needs.metadata.outputs.sha }}
+        run: |
+          test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)" = "$TESTED_SHA"
+          python3 tools/release_notes.py "$TAG" --output release-notes.md
+          if gh release view "$TAG" --json isDraft > existing-release.json 2>/dev/null; then
+            python3 -c 'import json; assert json.load(open("existing-release.json"))["isDraft"], "A published version must never be overwritten"'
+          else
+            flags=()
+            [ "$PRERELEASE" = false ] || flags+=(--prerelease)
+            gh release create "$TAG" --verify-tag --draft --title "RetroOS $VERSION" --notes-file release-notes.md "${flags[@]}"
+          fi
+      - name: Upload assets and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.metadata.outputs.tag }}
+          VERSION: ${{ needs.metadata.outputs.version }}
+          PRERELEASE: ${{ needs.metadata.outputs.prerelease }}
+        run: |
+          gh release upload "$TAG" release/retroos-vm.tar.gz release/retroos-machine.tar.gz \
+            release/retroos_grub_module_usb.img release/retroos_grub_module.iso \
+            release/retroos-usb-diagnostic.zip release/SHA256SUMS --clobber
+          flags=(--draft=false --title "RetroOS $VERSION" --notes-file release-notes.md)
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease --latest=false)
+          else
+            flags+=(--prerelease=false --latest=true)
+          fi
+          gh release edit "$TAG" "${flags[@]}"
+          printf 'Published [%s](https://github.com/%s/releases/tag/%s)\n' "$TAG" "$GITHUB_REPOSITORY" "$TAG" >> "$GITHUB_STEP_SUMMARY"

@@ -323,15 +323,13 @@ impl Term {
                         saved_cursor: self.saved_cursor,
                     });
                     self.clear();
-                } else if command == b'l' {
-                    if let Some(saved) = self.primary_screen.take() {
-                        self.grid = saved.grid;
-                        (self.cursor_x, self.cursor_y) = saved.cursor;
-                        self.attr = saved.attr;
-                        self.wrap_pending = saved.wrap_pending;
-                        self.saved_cursor = saved.saved_cursor;
-                        self.flush_aperture();
-                    }
+                } else if command == b'l' && let Some(saved) = self.primary_screen.take() {
+                    self.grid = saved.grid;
+                    (self.cursor_x, self.cursor_y) = saved.cursor;
+                    self.attr = saved.attr;
+                    self.wrap_pending = saved.wrap_pending;
+                    self.saved_cursor = saved.saved_cursor;
+                    self.flush_aperture();
                 }
             }
             return;
@@ -393,7 +391,7 @@ impl Term {
                 let mut i = 0;
                 while i <= self.esc_index {
                     let p = self.esc_params[i];
-                    if matches!(p, 38 | 48) && i + 1 <= self.esc_index {
+                    if matches!(p, 38 | 48) && i < self.esc_index {
                         let mode = self.esc_params[i + 1];
                         let rgb = if mode == 2 && i + 4 <= self.esc_index {
                             let rgb = [

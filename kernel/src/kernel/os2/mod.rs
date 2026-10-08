@@ -617,6 +617,7 @@ fn vfs_image_path(path: &[u8], personality: Option<thread::PersonalityName>) -> 
 
 /// Load an LX program and all of its DLL imports into the active address
 /// space, relocate them, and initialize `tid` as an OS/2 process.
+#[allow(clippy::too_many_arguments)]
 pub fn exec_lx_into<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],

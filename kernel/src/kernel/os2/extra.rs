@@ -287,12 +287,10 @@ fn video<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs, ordinal: u16) ->
 pub(super) fn alloc_shared<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs) -> u32 {
     let name = arg32(m, r, 1);
     let result = alloc_os2_memory(m, s, arg32(m, r, 0) as usize, arg32(m, r, 2));
-    if result == 0 && name != 0 {
-        if let Ok(mut name) = c_string(m, name) {
-            name.make_ascii_uppercase();
-            s.shared
-                .push((name, m.read::<u32>(arg32(m, r, 0) as usize)));
-        }
+    if result == 0 && name != 0 && let Ok(mut name) = c_string(m, name) {
+        name.make_ascii_uppercase();
+        s.shared
+            .push((name, m.read::<u32>(arg32(m, r, 0) as usize)));
     }
     result
 }
@@ -473,10 +471,9 @@ pub(super) fn exec_program<A: crate::Arch>(m: &mut A, s: &mut Os2State, r: &Regs
             if let Ok(path) = os2_path(s, &candidate, false) { return Ok(path); }
         }
         Err(error)
-    }).map_err(|error| {
+    }).inspect_err(|_error| {
         let out = arg32(m, r, 0) as usize;
         if out != 0 { let _ = copy_string(m, out, arg32(m, r, 1) as usize, &name); }
-        error
     })?;
     let args = arg32(m, r, 3);
     let tail = if args == 0 { Vec::new() } else {

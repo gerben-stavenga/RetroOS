@@ -642,14 +642,11 @@ fn apply_aperture_write<A: crate::Arch>(machine: &mut A, write: ::vga::PortWrite
         // and zeroing fresh RAM for every register write dominated level loads.
         if let (::vga::CpuAperture::Direct { range, pages: old_pages, .. },
                 ::vga::CpuAperture::Direct { pages: new_pages, .. }) =
-            (write.old_aperture, write.new_aperture)
-        {
-            if old_pages > new_pages {
-                machine.map_phys_range(
-                    usize::from(range.start_page + new_pages),
-                    usize::from(old_pages - new_pages), 0, arch_abi::MAP_MMIO,
-                );
-            }
+            (write.old_aperture, write.new_aperture) && old_pages > new_pages {
+            machine.map_phys_range(
+                usize::from(range.start_page + new_pages),
+                usize::from(old_pages - new_pages), 0, arch_abi::MAP_MMIO,
+            );
         }
         install_aperture(machine, write.new_aperture);
         return;

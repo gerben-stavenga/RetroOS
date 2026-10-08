@@ -275,7 +275,7 @@ pub fn handle_event<A: crate::Arch>(
 /// Complete a blocked thread's pending pipe read or poll, making it Ready
 /// when data arrived. Called from the event loop slice (the thread is not
 /// running; `regs` is its live frame).
-pub fn complete_pending_io<A: crate::Arch>(machine: &mut A, 
+pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
     kt: &mut thread::KernelThread<A>,
     linux: &mut LinuxState,
     regs: &mut Regs,
@@ -937,8 +937,8 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
 fn terminal_responses<A: crate::Arch>(kt: &thread::KernelThread<A>) {
     let mut reply = [0; 64];
     let n = lib::term::take_response(&mut reply);
-    if let FdKind::PipeRead(pipe) = kt.fds[0] {
-        if n > 0 { crate::kernel::kpipe::write(pipe, &reply[..n]); }
+    if let FdKind::PipeRead(pipe) = kt.fds[0] && n > 0 {
+        crate::kernel::kpipe::write(pipe, &reply[..n]);
     }
 }
 
@@ -1262,22 +1262,20 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // keep direct DOS loading available on minimal systems without a shell.
     if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
         let launcher = [crate::kernel::dos::c_root(), b"RETROOS/COMMAND.COM"].concat();
-        if !args[0].eq_ignore_ascii_case(&launcher) {
-            if let Ok(shell) = exec::load_file_resolved(&launcher) {
-                let mut dos_path = [0; crate::kernel::dos::DFS_PATH_MAX];
-                let n = crate::kernel::dos::vfs_to_dos(&args[0], &mut dos_path);
-                let mut tail = b"/E ".to_vec();
-                let quoted = dos_path[..n].contains(&b' ');
-                if quoted { tail.push(b'"'); }
-                tail.extend_from_slice(&dos_path[..n]);
-                if quoted { tail.push(b'"'); }
-                if !cmdtail.is_empty() { tail.push(b' '); tail.extend_from_slice(&cmdtail); }
-                if tail.len() > 126 { return SyscallResult::val(-7); }
-                cmdtail = tail;
-                args = alloc::vec![launcher.clone()];
-                path = launcher;
-                buffer = shell;
-            }
+        if !args[0].eq_ignore_ascii_case(&launcher) && let Ok(shell) = exec::load_file_resolved(&launcher) {
+            let mut dos_path = [0; crate::kernel::dos::DFS_PATH_MAX];
+            let n = crate::kernel::dos::vfs_to_dos(&args[0], &mut dos_path);
+            let mut tail = b"/E ".to_vec();
+            let quoted = dos_path[..n].contains(&b' ');
+            if quoted { tail.push(b'"'); }
+            tail.extend_from_slice(&dos_path[..n]);
+            if quoted { tail.push(b'"'); }
+            if !cmdtail.is_empty() { tail.push(b' '); tail.extend_from_slice(&cmdtail); }
+            if tail.len() > 126 { return SyscallResult::val(-7); }
+            cmdtail = tail;
+            args = alloc::vec![launcher.clone()];
+            path = launcher;
+            buffer = shell;
         }
     }
 
@@ -1387,8 +1385,10 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         ));
     }
 
-    if let Some(inherited) = inherited_async {
-        if let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality { linux.async_io = inherited; }
+    if let Some(inherited) = inherited_async
+        && let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality
+    {
+        linux.async_io = inherited;
     }
     if let Some(handoff) = exec_display {
         let new = thread::get_thread(threads, tid).unwrap();

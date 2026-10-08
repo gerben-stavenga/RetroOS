@@ -843,7 +843,7 @@ fn socket_read<A: crate::Arch>(
 fn close_virtual(s: &mut State, fd: i32) {
     if let Some(i) = object(s, fd) {
         s.handles[(fd - FIRST_FD) as usize] = None;
-        if !s.handles.iter().any(|h| *h == Some(i)) {
+        if !s.handles.contains(&Some(i)) {
             s.descriptors[i] = None;
         }
     }

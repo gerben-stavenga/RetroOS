@@ -2057,10 +2057,8 @@ fn dispatch<A: crate::Arch>(
                     } else { fail(state,127,0) }
                 }
             };
-            if crate::kernel::startup::trace_enabled() {
-                if let pe::ImportSymbol::Name(name) = &symbol {
-                    crate::compact_dbg_println!("[win32-proc] {}!{}={:08x}",core::str::from_utf8(&module_name).unwrap_or("?"),core::str::from_utf8(name).unwrap_or("?"),result);
-                }
+            if crate::kernel::startup::trace_enabled() && let pe::ImportSymbol::Name(name) = &symbol {
+                crate::compact_dbg_println!("[win32-proc] {}!{}={:08x}",core::str::from_utf8(&module_name).unwrap_or("?"),core::str::from_utf8(name).unwrap_or("?"),result);
             }
             result
         }
@@ -2847,10 +2845,8 @@ pub fn handle_event<A: crate::Arch>(
                 b"CreateFileA" | b"FindFirstFileA" | b"LoadStringA" | b"CreateThread" | b"GetLastError" | b"SetFilePointer") {
                 crate::compact_dbg_println!("[win32-result] {} arg0={:08x} arg1={:08x} result={:08x} error={}",
                     core::str::from_utf8(gate.name).unwrap_or("?"), arg(machine,regs,0),arg(machine,regs,1),result,state.last_error);
-                if matches!(gate.name,b"CreateFileA" | b"FindFirstFileA") {
-                    if let Ok(path)=c_string(machine,arg(machine,regs,0)) {
-                        crate::compact_dbg_println!("[win32-path] {}",core::str::from_utf8(&path).unwrap_or("?"));
-                    }
+                if matches!(gate.name,b"CreateFileA" | b"FindFirstFileA") && let Ok(path)=c_string(machine,arg(machine,regs,0)) {
+                    crate::compact_dbg_println!("[win32-path] {}",core::str::from_utf8(&path).unwrap_or("?"));
                 }
             }
             if extra::take_hold(&mut state.console) {

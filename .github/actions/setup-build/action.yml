@@ -1,0 +1,56 @@
+name: Set up RetroOS build
+description: Install the build/test tools and restore bounded Bazel caches.
+runs:
+  using: composite
+  steps:
+  - name: Free runner disk space
+    run: |
+      sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+        /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+      df -h /
+    shell: bash
+  - name: Install test tools
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib
+    shell: bash
+  - name: Detect hardware virtualization
+    run: |
+      # Record the host so vendor-specific KVM failures can be compared.
+      uname -a
+      lscpu
+      if [ -c /dev/kvm ] && sudo chown "$(id -u)" /dev/kvm; then
+        echo "KVM available; hosted-engine KVM tests are required"
+        echo "(qemu -accel kvm is probed separately: nested virt here cannot boot a firmware guest)"
+        echo "RETRO_REQUIRE_KVM=1" >> "$GITHUB_ENV"
+      else
+        echo "::warning::no /dev/kvm on this runner; KVM backend tests will be skipped"
+        echo "RETRO_REQUIRE_KVM=0" >> "$GITHUB_ENV"
+      fi
+    shell: bash
+  - name: Install bazelisk
+    run: |
+      sudo curl -fsSL -o /usr/local/bin/bazelisk \
+        https://github.com/bazelbuild/bazelisk/releases/download/v1.20.0/bazelisk-linux-amd64
+      sudo chmod +x /usr/local/bin/bazelisk
+      sudo ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel
+    shell: bash
+  - name: Cache bazel
+    uses: actions/cache@v4
+    with:
+      path: |
+        ~/.cache/bazel-disk
+        ~/.cache/bazel-repo
+      key: bazel-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'Cargo.lock', '.bazelrc', 'toolchain/**') }}
+      restore-keys: |
+        bazel-${{ runner.os }}-
+  - name: CI bazelrc (disk + repository cache)
+    run: |
+      cat >> "$HOME/.bazelrc" <<'EOF'
+
+      # --- CI overrides (appended by .github/workflows/ci.yml) ---
+      build --disk_cache=~/.cache/bazel-disk
+      build --repository_cache=~/.cache/bazel-repo
+      build --keep_going
+      EOF
+    shell: bash

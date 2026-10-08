@@ -263,8 +263,7 @@ pub(super) fn call<A: crate::Arch>(
         }
         b"CreateThread" => {
             let size = arg(machine, regs, 1)
-                .max(64 * 1024)
-                .min(16 * 1024 * 1024)
+                .clamp(64 * 1024, 16 * 1024 * 1024)
                 .next_multiple_of(4096);
             let stack = super::extra::thread_stack(machine, state, size);
             if stack == 0 || arg(machine, regs, 2) == 0 {

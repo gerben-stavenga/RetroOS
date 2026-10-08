@@ -516,10 +516,10 @@ pub(super) fn push_key(console: &mut Console, scancode: u8) {
     }
     let vk = virtual_key(scan, if ascii.is_ascii_control() { 0 } else { ascii });
     if vk != 0 { console.keys[vk as usize] = if down { 0x80 } else { 0 }; }
-    let control = u32::from(console.keys[0x12] != 0) * 2
-        | u32::from(console.keys[0x11] != 0) * 8
-        | u32::from(console.keys[0x10] != 0) * 16
-        | u32::from(console.extended) * 256;
+    let control = (u32::from(console.keys[0x12] != 0) * 2)
+        | (u32::from(console.keys[0x11] != 0) * 8)
+        | (u32::from(console.keys[0x10] != 0) * 16)
+        | (u32::from(console.extended) * 256);
     console.extended = false;
     if console.input.len() < 64 {
         console.input.push(Key { down, ascii, scan, vk, control });

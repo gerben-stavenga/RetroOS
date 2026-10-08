@@ -13,6 +13,7 @@
 # Exits non-zero if a test fails or a required prerequisite is missing.
 # Set RETRO_TEST_ONLY to a
 # space-separated name list to run a subset (e.g. RETRO_TEST_ONLY="dpmi_hx").
+# RETRO_TEST_EXCLUDE skips named suites (CI runs unit tests in a separate job).
 # RETRO_REQUIRE_KVM=1 makes missing KVM a failure instead of an optional skip.
 # RETRO_REQUIRE_PUBLIC=1 requires every non-proprietary, non-desktop suite; the
 # KVM-gated ones stay optional under it unless RETRO_REQUIRE_KVM=1 too, so a
@@ -121,6 +122,9 @@ unit_kvm() { bz test --platforms=@platforms//host --test_env=RETRO_REQUIRE_KVM=1
 run() {
     local name="$1" gate="$2"; shift 2
     if [ -n "${RETRO_TEST_ONLY:-}" ] && [[ " $RETRO_TEST_ONLY " != *" $name "* ]]; then
+        return
+    fi
+    if [[ " ${RETRO_TEST_EXCLUDE:-} " == *" $name "* ]]; then
         return
     fi
     if [ "$gate" != "-" ] && ! "$gate"; then
