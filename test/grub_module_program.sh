@@ -29,7 +29,8 @@ run_program() {
         -debugcon "file:$log" \
         -display none -no-reboot >/dev/null 2>&1 || true
 
-    grep -q 'Multiboot ext4 (32 MB, volatile RAM) → /$' "$log"
+    local base_mb=$(( $(stat -c %s bazel-bin/retroos-base.img) / 1024 / 1024 ))
+    grep -q "Multiboot ext4 ($base_mb MB, volatile RAM) → /$" "$log"
     grep -q 'Multiboot ext4 (128 MB, volatile RAM) → /home/retroos/GAMES$' "$log"
     ! grep -q 'KERNEL PANIC' "$log"
 }

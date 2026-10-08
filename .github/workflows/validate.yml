@@ -52,7 +52,11 @@ jobs:
       if: always()
       uses: ./.github/actions/trim-cache
   runtime:
-    name: Personality and hardware tests
+    name: Integration (${{ matrix.suite }})
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [boot, dos, personalities, devices]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -65,6 +69,7 @@ jobs:
     - name: Build hosted runners
       run: bazel build //kernel:retroos-host //kernel:retroos-host-kvm --platforms=@platforms//host
     - name: Hosted ELF smoke
+      if: matrix.suite == 'dos'
       env:
         RUST_BACKTRACE: '1'
       run: |
@@ -99,6 +104,7 @@ jobs:
       env:
         RETRO_REQUIRE_PUBLIC: '1'
         RETRO_TEST_EXCLUDE: unit
+        RETRO_TEST_GROUP: ${{ matrix.suite }}
       run: |-
         mkdir -p build/ci
         test/run_all.sh 2>&1 | tee build/ci/integration.log
@@ -106,7 +112,7 @@ jobs:
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: integration-log-${{ inputs.commit }}
+        name: integration-log-${{ inputs.commit }}-${{ matrix.suite }}
         path: build/ci/integration.log
         if-no-files-found: ignore
         retention-days: 14

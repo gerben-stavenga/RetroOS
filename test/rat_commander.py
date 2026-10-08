@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Drive the shipped upstream file manager/editor on the Linux KVM personality."""
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -29,20 +30,40 @@ def main():
                     raise AssertionError("Rat Commander exited before input completed")
                 process.stdin.write(keys)
                 process.stdin.flush()
+            def wait_for(description, predicate, timeout=20):
+                deadline = time.monotonic() + timeout
+                while time.monotonic() < deadline:
+                    if predicate():
+                        return
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                output = (root / "guest.log").read_text(errors="replace")
+                raise AssertionError(f"Timed out waiting for {description}:\n{output[-6000:]}")
+
+            def terminal_text():
+                output = (root / "guest.log").read_text(errors="replace")
+                return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+
             try:
                 # Enter a child and return through '..', then create a folder.
                 send(b"\x1b[B\r", 3)
                 send(b"\r")
                 send(b"\x1b[18~")  # F7
                 send(b"created\r")
+                wait_for("created directory", lambda: (work / "created").is_dir())
                 # Copy note.txt under a new name; the destination starts selected.
                 send(b"\x1b[F\x1b[15~")  # End, F5
                 send(b"/work/copied.txt\r")
+                wait_for("completed copy", lambda: (work / "copied.txt").exists() and (work / "copied.txt").read_text() == "Original text\n")
                 # Edit note.txt. Period and Enter must insert.
-                send(b"\x1b[F\x1bOS", 2.5)  # End, F4 after transfer completion
+                send(b"\x1b[F")  # End: select note.txt after the copy refresh.
+                send(b"\x1bOS")  # F4
+                wait_for("editor contents", lambda: "Original text" in terminal_text())
                 send(b"\x1b[H.x\r", 1.5)
                 send(b"\x1bOQ")  # F2: save
                 send(b"\r")  # Confirm save if configured.
+                wait_for("saved editor contents", lambda: (work / "note.txt").read_text().startswith(".x\n"))
                 send(b"\x1b[21~")  # Close editor.
                 send(b"/TEST.COM\r")  # Launch DOS through Rust -> shell -> exec.
                 send(b" ", 2)  # Return from the foreground command to panels.

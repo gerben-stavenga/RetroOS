@@ -6,7 +6,8 @@
 has independent jobs for lint/unit tests, personality/hardware integration, and
 release-image packaging and BIOS/UEFI boot checks. Packaging runs for master
 and versioned releases. Require the `Required checks` status in branch rules.
-Integration logs remain available even when a test fails. KVM suites are
+Integration runs as separate boot, DOS, personality and device jobs; every
+suite remains included. Logs remain available even when a test fails. KVM suites are
 required when the runner exposes KVM; unavailable emulators or proprietary
 assets follow the existing test runner's explicit skip rules.
 

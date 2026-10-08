@@ -54,12 +54,14 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
             "-debugcon", "file:" + str(log), "-fw_cfg", "name=opt/cmdline,string=" + command]
     if not module:
         args.extend(["-drive", f"file={image},format=raw,snapshot=on"])
+    # Linux stdout belongs to the terminal; use the probe's checked exit status.
+    success = "[mem] exit tid=1 code=0" if command == "PROBE.ELF" else marker
     process = subprocess.Popen(args, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 25
         while process.poll() is None and time.monotonic() < deadline:
             output = log.read_text(errors="replace") if log.exists() else ""
-            if marker in output or any(error in output for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL"]):
+            if success in output or any(error in output for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL"]):
                 break
             time.sleep(0.1)
         if process.poll() is None:
@@ -70,7 +72,7 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
             process.kill()
             process.wait()
     text = log.read_text(errors="replace")
-    if expected not in text or marker not in text or "DOS C: maps to /home/retroos/\n" not in text or any(
+    if expected not in text or success not in text or "DOS C: maps to /home/retroos/\n" not in text or any(
         error in text for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL", "panicked"]
     ):
         raise AssertionError(f"{name} failed:\n{text}")

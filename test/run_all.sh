@@ -14,11 +14,17 @@
 # Set RETRO_TEST_ONLY to a
 # space-separated name list to run a subset (e.g. RETRO_TEST_ONLY="dpmi_hx").
 # RETRO_TEST_EXCLUDE skips named suites (CI runs unit tests in a separate job).
+# RETRO_TEST_GROUP selects boot, dos, personalities, or devices for parallel CI.
 # RETRO_REQUIRE_KVM=1 makes missing KVM a failure instead of an optional skip.
 # RETRO_REQUIRE_PUBLIC=1 requires every non-proprietary, non-desktop suite; the
 # KVM-gated ones stay optional under it unless RETRO_REQUIRE_KVM=1 too, so a
 # host without the device is not a failure.
 set -u
+
+case "${RETRO_TEST_GROUP:-}" in
+    ""|boot|dos|personalities|devices) ;;
+    *) printf 'Invalid RETRO_TEST_GROUP: %s\n' "$RETRO_TEST_GROUP" >&2; exit 2 ;;
+esac
 cd "$(dirname "$0")/.."
 
 pass=0 fail=0 skip=0
@@ -125,6 +131,16 @@ run() {
         return
     fi
     if [[ " ${RETRO_TEST_EXCLUDE:-} " == *" $name "* ]]; then
+        return
+    fi
+    # Every suite belongs to one group; new unclassified suites remain in DOS.
+    local group=dos
+    case "$name" in
+        xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_layout|dn_state|module_*) group=boot ;;
+        os2_*|windows_*|linux_*|rat_commander_*) group=personalities ;;
+        shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
+    esac
+    if [ -n "${RETRO_TEST_GROUP:-}" ] && [ "$RETRO_TEST_GROUP" != "$group" ]; then
         return
     fi
     if [ "$gate" != "-" ] && ! "$gate"; then

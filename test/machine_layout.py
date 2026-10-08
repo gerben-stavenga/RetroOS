@@ -63,12 +63,16 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
     else:
         for disk in disks:
             args += ["-drive", f"file={disk},format=raw"]
+    # Distinct exit codes identify first-write and persistence checks without
+    # relying on terminal output being copied into the kernel debug log.
+    success = {"LAYOUT-WROTE": "[mem] exit tid=1 code=0",
+               "LAYOUT-PERSISTED": "[mem] exit tid=1 code=2"}.get(expected, expected)
     process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         deadline = time.monotonic() + 40
         while process.poll() is None and time.monotonic() < deadline:
             text = log.read_text(errors="replace") if log.exists() else ""
-            if expected in text or "LAYOUT-FAIL" in text:
+            if success in text or "[mem] exit tid=1 code=1" in text:
                 break
             time.sleep(.1)
     finally:
@@ -76,7 +80,7 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
             process.terminate()
         process.wait(timeout=5)
     text = log.read_text(errors="replace")
-    assert expected in text and "LAYOUT-FAIL" not in text, text
+    assert success in text and "[mem] exit tid=1 code=1" not in text, text
     if ata_dma:
         assert "ATA: ata0 LBA28 DMA" in text and "ATA: ata1 LBA28 DMA" in text, text
     firmware = "Substitute" if uefi else "NativeBios"
@@ -122,7 +126,7 @@ void _start(void) {
  call(6,f,0,0);
  if(b[0]=='P') say("LAYOUT-PERSISTED\n",17);
  else say("LAYOUT-WROTE\n",13);
- call(1,0,0,0); for(;;){}
+ call(1,b[0]=='P'?2:0,0,0); for(;;){}
 fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
 }
 ''')
