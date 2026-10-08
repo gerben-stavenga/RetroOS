@@ -56,15 +56,30 @@ def main():
                 pyte.Stream(screen).feed(output)
                 return "\n".join(screen.display)
 
+            def left_directory():
+                # RC normalizes the trailing slash after navigating upwards.
+                title = terminal_text().splitlines()[1][:40].split()
+                return title[1].rstrip("/") if len(title) > 1 else ""
+
             try:
-                # Enter a child and return through '..', then create a folder.
-                send(b"\x1b[B\r", 3)
+                # Directory changes reload the panel asynchronously. Drive the
+                # next key only after its target directory/selection is visible.
+                wait_for("initial panels", lambda: left_directory() == "/work")
+                send(b"\x1b[B")
+                wait_for("child selection", lambda: "child" in terminal_text().splitlines()[21][:40])
                 send(b"\r")
+                wait_for("child directory", lambda: left_directory() == "/work/child"
+                         and ".." in terminal_text().splitlines()[21][:40])
+                send(b"\r")
+                wait_for("parent directory", lambda: left_directory() == "/work")
                 send(b"\x1b[18~")  # F7
                 send(b"created\r")
                 wait_for("created directory", lambda: (work / "created").is_dir())
+                wait_for("created selection", lambda: "created" in terminal_text().splitlines()[21][:40])
                 # Copy note.txt under a new name; the destination starts selected.
-                send(b"\x1b[F\x1b[15~")  # End, F5
+                send(b"\x1b[F")  # End
+                wait_for("copy source selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
+                send(b"\x1b[15~")  # F5
                 send(b"/work/copied.txt\r")
                 wait_for("completed copy", lambda: (work / "copied.txt").exists() and (work / "copied.txt").read_text() == "Original text\n")
                 # TaskDone reloads the panels and focuses the copied file after
@@ -80,7 +95,9 @@ def main():
                 send(b"\r")  # Confirm save if configured.
                 wait_for("saved editor contents", lambda: (work / "note.txt").read_text().startswith(".x\n"))
                 send(b"\x1b[21~")  # Close editor.
+                wait_for("manager after editor", lambda: "Name" in terminal_text().splitlines()[2][:40])
                 send(b"/TEST.COM\r")  # Launch DOS through Rust -> shell -> exec.
+                wait_for("DOS child output", lambda: "RC DOS CHILD PASS" in (root / "guest.log").read_text(errors="replace"))
                 send(b" ", 2)  # Return from the foreground command to panels.
                 send(b"\x1b[21~")  # Quit manager.
                 send(b"\r")  # Confirm quit.
