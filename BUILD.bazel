@@ -560,10 +560,19 @@ genrule(
 # Small forum attachment for boot/input diagnostics. Keep the same kernel and
 # DOS runtime, without games, compilers, Linux userland, or instrument samples.
 pkg_tar(
+    name = "diagnostic_apps_boot_tar",
+    files = {
+        ":" + src: "RETROOS/" + src[len("apps-boot/"):].upper()
+        for src in _APPS_BOOT_SRCS
+        if not src.startswith("apps-boot/rc/")
+    },
+)
+
+pkg_tar(
     name = "diagnostic_dos_tar",
     files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
     empty_dirs = ["TEMP"],
-    deps = [":apps_boot_tar"],
+    deps = [":diagnostic_apps_boot_tar"],
     package_dir = "home/retroos",
 )
 
