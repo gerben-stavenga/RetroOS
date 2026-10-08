@@ -17,9 +17,14 @@ SECTIONS
          * Both must remain at the start of the image for the GRUB scanners. */
         KEEP(*(.multiboot))
         KEEP(*(.multiboot2))
+        /* Boot entry and paging toggle must precede Rust text regardless of
+         * the order rustc passes native objects to the linker. */
+        KEEP(*(.text.boot))
         *(.text .text.*)
         KEEP(*(.note*))
     }
+    ASSERT(toggle_prot_compat >= KERNEL_BASE && toggle_prot_compat_end <= KERNEL_BASE + 4K,
+           "paging toggle must remain in the kernel's first physical page")
 
     . = ALIGN(4K);
     _etext = .;

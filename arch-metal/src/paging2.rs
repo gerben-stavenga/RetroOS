@@ -1729,11 +1729,8 @@ static mut TRAMPOLINE_PT: PageTable64 = PageTable64(RawPage([0; PAGE_SIZE]));
 
 /// Identity-map the page holding `toggle_prot_compat` so the function can run
 /// at its physical address while paging is briefly disabled during a mode
-/// toggle. The page is COMPUTED from the symbol — an old version hardcoded
-/// "first page of .text" (KERNEL_PHYS), but the linker long since stopped
-/// placing the stub there, so the identity fetch landed on an unmapped page,
-/// the arch demand-fault mapped it as NX data, and the retried fetch panicked
-/// with a present+NX #PF (first 64-bit exec on metal was the reproducer).
+/// toggle. The linker places the boot section in the first physical page and
+/// asserts the toggle fits there. Compute its page from the symbol as well.
 /// Returns the previous PDPT[0] value to pass back to `clear_trampoline()`.
 pub fn ensure_trampoline_mapped() -> u64 {
     unsafe extern "fastcall" {
@@ -1743,7 +1740,7 @@ pub fn ensure_trampoline_mapped() -> u64 {
     let page = stub_phys / PAGE_SIZE;
     // One PT covers 2 MiB; the stub is a few dozen bytes but map its neighbor
     // too in case it straddles a page boundary.
-    debug_assert!(page + 1 < PAGE_SIZE / 8, "toggle stub beyond the trampoline PT's 2 MiB reach");
+    assert!(page + 1 < PAGE_SIZE / 8, "toggle stub beyond the trampoline PT's 2 MiB reach");
     if let Entries::E64(e) = entries() {
         let root = root_base();
         let saved = e[root].0;

@@ -1,82 +1,133 @@
-//! Physical memory allocator
-//!
-//! Tracks physical page usage with reference counts.
-//! - 0 = free
-//! - 255 = reserved (never allocatable)
-//! - 1-254 = reference count (for copy-on-write sharing)
-
+//! Physical RAM allocator: a one-bit RAM bitmap and sparse shared refcounts.
 use crate::paging2::PAGE_SIZE;
 use crate::MultibootMmapEntry;
+use alloc::alloc::{alloc_zeroed, dealloc};
+use core::alloc::Layout;
+#[path = "phys_mm/pool.rs"]
+mod pool;
+use pool::{Pool, REF_BLOCK_PAGES};
 
-/// Check if a page is the zero page (always shared, never freed)
+// One bootstrap page covers 128 MiB of usable RAM; address holes and boot
+// modules are excluded before allocation. Full metadata is sized to real RAM.
+const BOOTSTRAP_BYTES: usize = PAGE_SIZE;
+static mut BOOTSTRAP_STATES: [u8; BOOTSTRAP_BYTES] = [0; BOOTSTRAP_BYTES];
+static mut POOL: Pool = Pool::new();
+static mut KERNEL_RANGE: (u64, u64) = (0, 0);
+fn pool_ptr() -> *mut Pool { &raw mut POOL }
+
 pub fn is_zero_page(page: u64) -> bool {
     page == crate::paging2::physical_page(&crate::ZERO_PAGE as *const _ as usize)
 }
 
-/// Maximum number of physical pages we track (64K pages = 256MB)
-/// Limited to keep kernel under 1MB for now
-const MAX_PAGES: usize = 64 * 1024;
+fn physical_page_limit() -> u64 {
+    if crate::paging2::cpu_mode() == crate::paging2::CpuMode::Legacy {
+        return (1u64 << 32) / PAGE_SIZE as u64;
+    }
+    let (max, _, _, _) = crate::x86::cpuid(0x8000_0000);
+    let bits = if max >= 0x8000_0008 {
+        crate::x86::cpuid(0x8000_0008).0 & 255
+    } else { 36 };
+    (1u64 << bits.clamp(32, 52)) / PAGE_SIZE as u64
+}
 
-/// Reserved page marker (never allocatable)
-const RESERVED: u8 = 255;
-
-/// Reference counts for each physical page
-static mut PAGE_REFS: [u8; MAX_PAGES] = [0; MAX_PAGES];
-
-/// Next page to check when allocating (simple optimization)
-static mut NEXT_FREE: usize = 0;
-
-/// Initialize physical memory allocator from memory map
-///
-/// # Safety
-/// Must be called once during kernel init with valid memory map.
+/// Track whole usable pages; overlapping firmware reservations take precedence.
 pub fn init_phys_mm(mmap_entries: &[MultibootMmapEntry], mmap_count: usize, kernel_low: u64, kernel_high: u64) {
+    let limit = physical_page_limit();
+    let entries = &mmap_entries[..mmap_count.min(mmap_entries.len())];
     unsafe {
-        // Mark all pages as reserved initially
-        let pr = &raw mut PAGE_REFS;
-        for slot in (*pr).iter_mut() {
-            *slot = RESERVED;
+        let pool = &mut *pool_ptr();
+        *pool = Pool::new();
+        KERNEL_RANGE = (kernel_low, kernel_high);
+        for entry in entries {
+            if entry.typ != 1 { continue; }
+            let first = entry.base.div_ceil(PAGE_SIZE as u64).min(limit);
+            let end = (entry.base.saturating_add(entry.length) / PAGE_SIZE as u64).min(limit);
+            pool.include(first, end);
         }
-
-        // Mark available regions from memory map
-        for i in 0..mmap_count {
-            if i >= mmap_entries.len() {
-                break;
-            }
-            let entry = &mmap_entries[i];
-
-            // Type 1 = available memory
-            if entry.typ != 1 {
-                continue;
-            }
-
-            let start_page = entry.base.div_ceil(PAGE_SIZE as u64);
-            let end_page = (entry.base + entry.length) / PAGE_SIZE as u64;
-
-            for page in start_page..end_page {
-                if (page as usize) < MAX_PAGES {
-                    PAGE_REFS[page as usize] = 0; // Free
-                }
-            }
+        for entry in entries {
+            if entry.typ == 1 { continue; }
+            let first = (entry.base / PAGE_SIZE as u64).min(limit);
+            let end = entry.base.saturating_add(entry.length).div_ceil(PAGE_SIZE as u64).min(limit);
+            pool.exclude(first, end);
         }
-
-        // Mark first 1MB as reserved (BIOS, video memory, etc)
-        for slot in (*pr).iter_mut().take(256) {
-            *slot = RESERVED;
-        }
-
-        // Mark kernel pages as used
-        for page in kernel_low..kernel_high {
-            if (page as usize) < MAX_PAGES {
-                PAGE_REFS[page as usize] = 1;
-            }
-        }
-
-        // Start searching after kernel
-        NEXT_FREE = kernel_high as usize;
-
+        pool.exclude(0, 0x100000 / PAGE_SIZE as u64);
+        reset_bootstrap(pool);
     }
 }
+
+unsafe fn reset_bootstrap(pool: &mut Pool) {
+    unsafe {
+        pool.bootstrap((&raw mut BOOTSTRAP_STATES).cast(), BOOTSTRAP_BYTES);
+        let (first, end) = KERNEL_RANGE;
+        pool.mark(first, end);
+    }
+}
+
+/// Allocate full metadata after the heap is enabled. No mutable pool borrow
+/// survives an allocation: backing metadata pages recursively calls this pool.
+pub fn complete_initialization() {
+    let pages = unsafe { (*pool_ptr()).pages };
+    assert!(pages != 0, "firmware supplied no usable RAM");
+    let state_layout = Layout::array::<u8>(pages.div_ceil(8)).expect("page state size overflow");
+    let block_layout = Layout::array::<*mut u8>(pages.div_ceil(REF_BLOCK_PAGES))
+        .expect("refcount directory size overflow");
+    unsafe {
+        let states = alloc_zeroed(state_layout);
+        assert!(!states.is_null(), "cannot allocate physical page states");
+        let blocks = alloc_zeroed(block_layout).cast::<*mut u8>();
+        assert!(!blocks.is_null(), "cannot allocate physical refcount directory");
+        (*pool_ptr()).expand(states, blocks);
+    }
+}
+
+/// Before allocation, omit boot reservations from metadata altogether.
+pub fn mark_reserved(low_page: u64, high_page: u64) {
+    unsafe {
+        let pool = &mut *pool_ptr();
+        if !pool.started {
+            pool.exclude(low_page, high_page);
+            reset_bootstrap(pool);
+        } else { panic!("boot reservation after physical allocation started"); }
+    }
+}
+
+#[allow(dead_code)]
+pub fn mark_used(low_page: u64, high_page: u64) {
+    unsafe { (*pool_ptr()).mark(low_page, high_page); }
+}
+
+pub fn alloc_phys_page() -> Option<u64> { unsafe { (*pool_ptr()).allocate() } }
+
+pub fn free_phys_page(page: u64) {
+    if is_zero_page(page) { return; }
+    let unused = unsafe { (*pool_ptr()).release(page) };
+    if let Some(data) = unused {
+        unsafe { dealloc(data, Layout::array::<u8>(REF_BLOCK_PAGES).unwrap()); }
+    }
+}
+
+pub fn inc_shared_count(page: u64) -> bool {
+    if is_zero_page(page) { return true; }
+    let missing = unsafe { (*pool_ptr()).missing_ref_block(page) };
+    if let Some(block) = missing {
+        let data = unsafe { alloc_zeroed(Layout::array::<u8>(REF_BLOCK_PAGES).unwrap()) };
+        assert!(!data.is_null(), "cannot allocate shared physical refcounts");
+        // Allocation can reenter the pool. A nested retain may have installed
+        // this block in the meantime; keep its counts and discard ours.
+        if !unsafe { (*pool_ptr()).install_ref_block(block, data) } {
+            unsafe { dealloc(data, Layout::array::<u8>(REF_BLOCK_PAGES).unwrap()); }
+        }
+    }
+    unsafe { (*pool_ptr()).retain(page) }
+}
+
+pub fn get_ref_count(page: u64) -> u8 {
+    if is_zero_page(page) { return 255; }
+    unsafe { (*pool_ptr()).refs(page) }
+}
+
+#[allow(dead_code)]
+pub fn is_shared(page: u64) -> bool { matches!(get_ref_count(page), 2..=254) }
 
 /// Locate the kernel-owned ISA DMA buffers after the physical memory map is
 /// initialized. Their storage is part of the kernel image at 1 MB, so GRUB
@@ -97,7 +148,7 @@ pub fn reserve_dma_regions() {
         if DMA_BUFS_BASE != 0 {
             unmap_dma_storage(bufs_va, DMA_BUFS_PAGES);
             debug_assert!((DMA_BUFS_BASE..DMA_BUFS_BASE + DMA_BUFS_PAGES)
-                .all(|page| PAGE_REFS[page] == 1));
+                .all(|page| get_ref_count(page as u64) == 1));
         }
     }
 }
@@ -138,113 +189,6 @@ static mut DMA_BUFS_STORAGE: AlignedDmaBuffers = AlignedDmaBuffers([0; DMA_BUFS_
 /// First physical page of the per-channel buffer block (0 = unavailable).
 static mut DMA_BUFS_BASE: usize = 0;
 
-/// Mark a range of pages as reserved
-#[allow(dead_code)]
-pub fn mark_reserved(low_page: u64, high_page: u64) {
-    for page in low_page..high_page {
-        if (page as usize) < MAX_PAGES {
-            unsafe { PAGE_REFS[page as usize] = RESERVED; }
-        }
-    }
-}
-
-/// Mark a range of pages as used (reference count = 1)
-#[allow(dead_code)]
-pub fn mark_used(low_page: u64, high_page: u64) {
-    for page in low_page..high_page {
-        if (page as usize) < MAX_PAGES {
-            unsafe { PAGE_REFS[page as usize] = 1; }
-        }
-    }
-}
-
-/// Allocate a physical page
-/// Returns page number or None if out of memory
-pub fn alloc_phys_page() -> Option<u64> {
-    unsafe {
-        let start = NEXT_FREE;
-        let mut page = start;
-
-        loop {
-            if page >= MAX_PAGES {
-                page = 256; // Skip first 1MB
-            }
-
-            if PAGE_REFS[page] == 0 {
-                PAGE_REFS[page] = 1;
-                NEXT_FREE = page + 1;
-                return Some(page as u64);
-            }
-
-            page += 1;
-            if page == start {
-                // Wrapped around, no free pages
-                return None;
-            }
-        }
-    }
-}
-
-/// Free a physical page (decrement reference count)
-/// Returns true if the page is now free
-pub fn free_phys_page(page: u64) {
-    assert!((page as usize) < MAX_PAGES , "invalid page to free: {:#x}", page);
-
-    if is_zero_page(page) { return; }
-    unsafe {
-        let count = PAGE_REFS[page as usize];
-        assert!(count > 0, "double free or invalid page: {:#x}", page);
-        if count == RESERVED {
-            return;
-        }
-        let count = count - 1;
-        PAGE_REFS[page as usize] = count;
-    }
-}
-
-/// Increment shared count for a page (for copy-on-write sharing)
-/// Returns true if successful
-pub fn inc_shared_count(page: u64) -> bool {
-    if is_zero_page(page) { return true; }
-    if page as usize >= MAX_PAGES {
-        return false;
-    }
-
-    unsafe {
-        let count = PAGE_REFS[page as usize];
-        if count == 0 || count == RESERVED {
-            return false;
-        }
-        if count + 1 == RESERVED {
-            lib::compact_panic!("refcount overflow: page {:#x} count {}", page, count);
-        }
-
-        PAGE_REFS[page as usize] = count + 1;
-        true
-    }
-}
-
-/// Get the reference count for a page
-pub fn get_ref_count(page: u64) -> u8 {
-    if is_zero_page(page) { return RESERVED; }
-    if page as usize >= MAX_PAGES {
-        return RESERVED;
-    }
-    unsafe { PAGE_REFS[page as usize] }
-}
-
-/// Check if a page is shared (ref count > 1)
-#[allow(dead_code)]
-pub fn is_shared(page: u64) -> bool {
-    if page as usize >= MAX_PAGES {
-        return false;
-    }
-    unsafe {
-        let count = PAGE_REFS[page as usize];
-        count > 1 && count != RESERVED
-    }
-}
-
 /// Physical page number of DMA channel `ch`'s permanent buffer (0 = none).
 /// 16-bit channels (4-7) occupy the front of the block, 8-bit (0-3) after.
 pub fn dma_channel_buf(ch: usize) -> u64 {
@@ -265,64 +209,15 @@ pub fn alloc_phys_contig(num_pages: usize) -> Option<u64> {
     alloc_contig(num_pages)
 }
 
-/// Return a contiguous DMA allocation to the general allocator.
+/// Return a contiguous allocation to RAM.
 pub fn free_phys_contig(start_page: u64, num_pages: usize) {
-    unsafe {
-        if start_page as usize >= 256
-            && (start_page as usize).saturating_add(num_pages) <= MAX_PAGES
-        {
-            let pr = &raw mut PAGE_REFS;
-            for slot in (*pr).iter_mut().skip(start_page as usize).take(num_pages) {
-                debug_assert_eq!(*slot, RESERVED);
-                *slot = 0;
-            }
-        }
-    }
+    unsafe { (*pool_ptr()).free_contiguous(start_page, num_pages); }
 }
 
-/// Allocate `num_pages` physically-contiguous pages from the GENERAL pool,
-/// marked RESERVED until explicitly freed. Returns the
-/// start page, or None if no contiguous run is free.
-///
-/// This backs unconstrained `alloc_phys_contig` requests and direct ring-0
-/// users such as xHCI. PCI bus-master devices have no ISA boundary constraint
-/// and each get an independent block here.
+/// PCI allocations remain below 4 GiB for devices with 32-bit DMA addresses.
+/// This constraint does not apply to the general physical page allocator.
 pub fn alloc_contig(num_pages: usize) -> Option<u64> {
-    if num_pages == 0 {
-        return None;
-    }
-    unsafe {
-        let mut start = 256; // skip the first 1 MiB (BIOS/IVT/VGA)
-        while start + num_pages <= MAX_PAGES {
-            if (start..start + num_pages).all(|i| PAGE_REFS[i] == 0) {
-                let pr = &raw mut PAGE_REFS;
-                for slot in (*pr).iter_mut().skip(start).take(num_pages) {
-                    *slot = RESERVED;
-                }
-                return Some(start as u64);
-            }
-            start += 1;
-        }
-        None
-    }
+    unsafe { (*pool_ptr()).allocate_contiguous(num_pages, (1u64 << 32) / PAGE_SIZE as u64) }
 }
-
-/// Get free page count (for debugging)
-pub fn free_page_count() -> usize {
-    let mut count = 0;
-    unsafe {
-        let pr = &raw const PAGE_REFS;
-        for &c in (*pr).iter() {
-            if c == 0 {
-                count += 1;
-            }
-        }
-    }
-    count
-}
-
-/// Frames managed by the allocator, including allocated kernel/user frames.
-pub fn total_page_count() -> usize {
-    let pr = &raw const PAGE_REFS;
-    unsafe { (*pr).iter().filter(|&&n| n != RESERVED).count() }
-}
+pub fn free_page_count() -> usize { unsafe { (*pool_ptr()).free_pages() } }
+pub fn total_page_count() -> usize { unsafe { (*pool_ptr()).managed_pages() } }

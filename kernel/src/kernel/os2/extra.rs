@@ -557,7 +557,7 @@ pub(super) fn dispatch<A: crate::Arch>(
     match api {
         Api::Base(127) => {
             let out = pointer(m, s, r, 0);
-            m.write::<u32>(out, (m.free_page_count() * 4096).min(u32::MAX as usize) as u32);
+            m.write::<u32>(out, m.free_page_count().saturating_mul(4096).min(u32::MAX as usize) as u32);
             NO_ERROR
         }
         // Thread exports are present so clients can handle an unsupported

@@ -1014,7 +1014,7 @@ fn demand_page<E: paging2::Entry>(
 /// Demand-page a kernel heap page: allocate a real writable physical page.
 fn demand_page_kernel(fault_addr: usize) {
     let phys = crate::phys_mm::alloc_phys_page()
-        .expect("Arch: OOM during kernel heap demand paging");
+        .unwrap_or_else(|| panic!("Arch: OOM during kernel heap demand paging at {fault_addr:#x}; managed pages={}", crate::phys_mm::total_page_count()));
     let page_index = paging2::page_idx(fault_addr);
     match paging2::entries() {
         paging2::Entries::E32(e) => {

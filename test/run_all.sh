@@ -102,6 +102,7 @@ grub_fat() { have bazelisk && have qemu-system-i386 && have grub-mkrescue && hav
 machine_layout() { grub_fat && have qemu-system-x86_64 && have mkfs.ext4 && have e2fsck && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/share/OVMF/OVMF_VARS_4M.fd ]; }
 storage_selection() { machine_layout && have nasm && have sfdisk; }
 isapnp_tools() { qemu_hostfs_grub && have nasm; }
+physical_memory_tools() { have bazelisk && have qemu-system-x86_64 && have nasm && have ld && have mkfs.fat && have mmd && have mcopy && have python3; }
 dn_state() { have bazelisk && have qemu-system-i386 && have mkfs.fat && have mmd && have mcopy && have mtype && have mdir && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
@@ -117,7 +118,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 # so a machine without /dev/kvm still runs the rest.
 unit() {
     bz test --platforms=@platforms//host \
-        //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //kernel:kernel_unit_test \
+        //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //arch-metal:phys_mm_test //kernel:kernel_unit_test \
         //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test \
         //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
@@ -136,7 +137,7 @@ run() {
     # Every suite belongs to one group; new unclassified suites remain in DOS.
     local group=dos
     case "$name" in
-        xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_layout|dn_state|module_*) group=boot ;;
+        physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_layout|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
         shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
@@ -172,6 +173,7 @@ run() {
 # --- Rust unit tests: pure host builds, no devices at all (CI-safe) --------
 run unit         -         unit
 run xhci_smoke   qemu_hostfs python3 test/xhci_smoke.py
+run physical_memory physical_memory_tools python3 test/physical_memory.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run boot_composition storage_selection python3 test/boot_composition.py
 run grub_module_install - python3 test/grub_module_install.py

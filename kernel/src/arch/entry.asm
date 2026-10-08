@@ -99,7 +99,7 @@ multiboot2_end:
 ; =============================================================================
 ; 32-bit code: boot stub, mode toggle, protected-mode entry, ISR dispatch
 ; =============================================================================
-section .text
+section .text.boot
 [bits 32]
 
 ; -----------------------------------------------------------------------------
@@ -154,7 +154,7 @@ boot_gdtr:
 ; toggle_prot_compat — switch between PAE and long/compat mode
 ; fastcall: ECX = new CR3
 ;
-; Placed early in .text so it lands in the first page (physical KERNEL_PHYS).
+; The linker places .text.boot first so this lands in the first physical page.
 ; The caller (paging2::ensure_trampoline_mapped) installs an identity PTE
 ; for that page; we jmp from the virtual linked address to the physical
 ; address, toggle paging off, flip EFER.LME, load new CR3, re-enable paging,
@@ -180,12 +180,15 @@ toggle_prot_compat:
     mov cr0, eax
 
     ret
+global toggle_prot_compat_end
+toggle_prot_compat_end:
 
 ; =============================================================================
 ; Mode-agnostic entry: int_vector + common_dispatch. Every instruction below
 ; has the same encoding under 32-bit and 64-bit CS, so the same table serves
 ; both IDT32 and IDT64. CS low byte distinguishes 0x08 vs 0x10.
 ; =============================================================================
+section .text
 
 ; -----------------------------------------------------------------------------
 ; Unified interrupt vector table.

@@ -66,6 +66,7 @@ const MAX_CONTROLLERS: usize = 4;
 // block, mapped at a fixed VA, cache-disabled (simple + coherent, as NVMe does).
 
 mod dma;
+mod handoff;
 use dma::*;
 const RING_TRBS: usize = 256;
 const DEVICE_LANES: usize = 2;
@@ -1120,6 +1121,23 @@ impl Controller {
         }
         self.rt = rt;
         self.db = db;
+
+        if let Err(error) = handoff::acquire(
+            self.r32(0x10),
+            |offset| self.r32(offset),
+            |offset| unsafe {
+                let byte = (self.mmio_va + offset) as *mut u8;
+                core::ptr::write_volatile(byte, core::ptr::read_volatile(byte) | 1);
+            },
+            |offset, value| self.w32(offset, value),
+            || crate::irq::now(false),
+        ) {
+            lib::compact_println!("xHCI: firmware handoff failed ({}) - skipping", match error {
+                handoff::Error::InvalidCapability => "invalid capability chain",
+                handoff::Error::BiosOwned => "BIOS retains ownership",
+            });
+            return;
+        }
 
         if !self.bringup(op, rt, max_slots) {
             let _ = compact_fmt::writeln!(

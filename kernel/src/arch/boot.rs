@@ -370,6 +370,7 @@ unsafe fn prepare_boot(
     // attached below. Paging, phys_mm, and the #PF page-backing are now ready,
     // so the demand-paged heap can safely be enabled here.
     ALLOCATOR.init_with_release(arch::heap_base(), arch::HEAP_END, Some(arch::release_heap_pages));
+    phys_mm::complete_initialization();
     arch::aperture::init();
 
     let boot_modules = crate::multiboot::handoff_modules(boot_modules_raw);
@@ -413,7 +414,9 @@ unsafe fn prepare_boot(
         lib::compact_screenln!(screen, "HPET: no ACPI table found; using timer fallback");
     }
     lib::compact_screenln!(screen, "Boot: IRQ init");
-    irq::init_interrupts(hpet_base);
+    irq::init_interrupts(hpet_base, |stage| {
+        lib::compact_screenln!(screen, "Boot: IRQ {}", stage);
+    });
     lib::compact_screenln!(screen, "Interrupts initialized");
 
     // The compat-mode switch was a test harness to force the experimental

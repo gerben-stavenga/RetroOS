@@ -20,7 +20,7 @@ rust_library(
 # Exercise DMA allocation policy without executing privileged metal code.
 rust_test(
     name = "xhci_dma_test_host",
-    srcs = ["xhci_test.rs", "src/xhci/dma.rs"],
+    srcs = ["xhci_test.rs", "src/xhci/dma.rs", "src/xhci/handoff.rs"],
     crate_root = "xhci_test.rs",
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
@@ -29,4 +29,18 @@ rust_test(
 host_platform_test(
     name = "xhci_dma_test",
     test = ":xhci_dma_test_host",
+)
+
+rust_test(
+    name = "phys_mm_test_host",
+    srcs = ["phys_mm_test.rs", "src/phys_mm.rs", "src/phys_mm/pool.rs"],
+    crate_root = "phys_mm_test.rs",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
+    deps = ["//lib", "//lib:compact_fmt"],
+)
+
+host_platform_test(
+    name = "phys_mm_test",
+    test = ":phys_mm_test_host",
 )

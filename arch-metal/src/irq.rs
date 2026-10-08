@@ -761,9 +761,11 @@ fn i8042_present() -> bool {
 }
 
 /// Initialize interrupts (PIC + tick source + keyboard/mouse)
-pub fn init_interrupts(hpet_base: Option<u64>) {
+pub fn init_interrupts(hpet_base: Option<u64>, mut progress: impl FnMut(&str)) {
+    progress("PIC setup");
     lib::compact_println!("IRQ: PIC");
     remap_pic();
+    progress("clock calibration (PIT/HPET/TSC)");
     init_monotonic_clock(hpet_base);
 
     // Pick the interrupt mode ONCE: LAPIC timer succeeds ⇒ APIC mode (IOAPIC
@@ -783,6 +785,7 @@ pub fn init_interrupts(hpet_base: Option<u64>) {
             crate::x86::rdmsr(IA32_APIC_BASE),
         );
     }
+    progress("local APIC timer");
     let apic = setup_lapic_timer();
     if !apic {
         legacy_intr_and_pit();
@@ -790,7 +793,9 @@ pub fn init_interrupts(hpet_base: Option<u64>) {
 
     // Probe xHCI for USB-HID keyboard and mouse input. It feeds the same typed
     // event queue as i8042 and is polled from the timer top half below.
+    progress("USB controller initialization");
     crate::xhci::init();
+    progress("PS/2 keyboard and mouse");
 
     // Keyboard/mouse SOURCE is a separate axis from delivery: PROBE the i8042
     // rather than guessing "no keyboard" from x2APIC. A real controller (many

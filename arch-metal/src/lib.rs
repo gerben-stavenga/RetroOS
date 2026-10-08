@@ -153,8 +153,7 @@ pub use irq::{now, drain};
 #[inline]
 pub fn set_irq_line(_asserted: bool) {}
 
-/// Physical free-page count, for diagnostic logging. Walks PAGE_REFS;
-/// O(MAX_PAGES) but small (~64 KB scan) and only called from instrumentation.
+/// Physical free-page count, maintained by the RAM pool in constant time.
 pub fn free_page_count() -> usize {
     phys_mm::free_page_count()
 }
