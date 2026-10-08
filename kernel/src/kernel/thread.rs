@@ -549,12 +549,33 @@ pub struct KernelThread<A: crate::Arch> {
     /// path the way Linux's `exec_path` does). Set from the launch path's
     /// basename at fork-exec; empty until then. NUL-padded.
     pub comm: [u8; 16],
+    /// Root DOS PSP acting only as a command-launch helper. An EXEC child
+    /// has a different PSP and may present its own window.
+    pub launcher_psp: u16,
 }
 
 /// Thread control block = kernel state + OS personality
 pub struct Thread<A: crate::Arch> {
     pub kernel: KernelThread<A>,
     pub personality: Personality<A>,
+}
+
+impl<A: crate::Arch> Thread<A> {
+    /// Linux processes currently share one console and stdin endpoint. Its
+    /// presentation identity stays stable across shell fork/exec and exit.
+    pub fn window_endpoint(&self) -> crate::kernel::gui::EndpointId {
+        if matches!(self.personality, Personality::Linux(_)) {
+            crate::kernel::linux::CONSOLE_ENDPOINT
+        } else {
+            crate::kernel::gui::EndpointId(self.kernel.tid as u32)
+        }
+    }
+
+    pub fn has_primary_window(&self) -> bool {
+        !matches!(&self.personality, Personality::Dos(dos)
+            if self.kernel.launcher_psp != 0
+                && dos.current_psp == self.kernel.launcher_psp)
+    }
 }
 
 /// FNV-1a hash of a Regs struct (raw byte view).
@@ -594,6 +615,7 @@ impl<A: crate::Arch> KernelThread<A> {
             fds: [FdKind::None; MAX_FDS],
             cloexec: 0,
             comm: [0; 16],
+            launcher_psp: 0,
         }
     }
 
@@ -993,7 +1015,8 @@ pub fn exit_thread<A: crate::Arch>(
         match &mut thread.personality {
             Personality::Dos(dos) => dos.on_exit(
                 machine, &mut thread.kernel.vcpu, !return_dos_vga),
-            Personality::Linux(_) | Personality::Os2(_) | Personality::Windows(_) => {}
+            Personality::Linux(linux) => linux.close_virtual_fds(),
+            Personality::Os2(_) | Personality::Windows(_) => {}
         }
         thread.kernel.close_all_fds();
         thread.kernel.exit_code = exit_code;

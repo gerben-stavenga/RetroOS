@@ -33,6 +33,14 @@ fn host_log_byte(b: u8) {
     let _ = std::io::stderr().write_all(&[b]);
 }
 
+/// Linux stdout on a headless host is terminal output, not a kernel log.
+fn host_console_byte(b: u8) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(&[b]);
+    let _ = out.flush();
+}
+
 fn main() {
 
     let mut host_dir: Option<String> = None;
@@ -81,6 +89,7 @@ fn main() {
     }
     let input = positional.first().cloned();
 
+    let raw_console = !live_console && shot.is_none();
     // Arm VGA-screen snapshotting: a watcher thread flips the request flag every
     // second; the CPU thread renders at its next slice boundary.
     let shot_armed = shot.is_some();
@@ -112,6 +121,9 @@ fn main() {
     }
     kernel::kernel::klog::init();
     lib::log::set_debug_sink(host_log_byte);
+    if raw_console {
+        lib::term::set_console_sink(host_console_byte);
+    }
     // Inject the backend into the (backend-agnostic) kernel: its port I/O for
     // the deep driver call sites (portio), and the host environment facts the
     // platform probe reads (HostStdout debug, no fbcon, not metal).
@@ -175,6 +187,8 @@ fn main() {
             clunk: arch::host_clunk,
             remove: arch::host_remove,
             mkdir: arch::host_mkdir,
+            rmdir: arch::host_rmdir,
+            rename: arch::host_rename,
         });
     }
     if let Some(path) = wav {

@@ -129,6 +129,8 @@ fn main() {
                 clunk: arch::host_clunk,
                 remove: arch::host_remove,
                 mkdir: arch::host_mkdir,
+                rmdir: arch::host_rmdir,
+                rename: arch::host_rename,
             });
         }
         if let Some(path) = &wav {

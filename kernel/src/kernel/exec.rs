@@ -124,8 +124,15 @@ fn is_pe(data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{BinaryFormat, detect_format, detect_format_for_dos};
+    use super::{BinaryFormat, detect_format, detect_format_for_dos, absolute_dos_cwd};
     use alloc::vec;
+
+    #[test]
+    fn inherited_dos_cwd_becomes_an_absolute_dos_path_before_vfs_translation() {
+        assert_eq!(absolute_dos_cwd(b"C:"), b"C:\\");
+        assert_eq!(absolute_dos_cwd(b"C:/RETROOS/RC"), b"C:\\RETROOS\\RC");
+        assert_eq!(absolute_dos_cwd(b"D:\\GAMES"), b"D:\\GAMES");
+    }
 
     fn mz_pe(subsystem: u16) -> alloc::vec::Vec<u8> {
         let mut data = vec![0; 256];
@@ -207,13 +214,13 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 ///   extra argv for ELF; ignored for DOS.
 /// - `parent_env_data` is the DOS or Windows parent environment snapshot;
 ///   pass `Vec::new()` for other personalities or initial loads with no parent.
-/// - `parent_cwd` is the parent's cwd in VFS form; used to seed DFS for DOS
-///   (ignored by ELF, which preserves the caller's LinuxState in-place).
+/// - `parent_cwd` is the parent's cwd in VFS form, inherited by each personality.
 #[allow(clippy::too_many_arguments)]
 pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, policy: crate::kernel::dos::LaunchPolicy, exec_vga: ExecVga) -> Result<(), i32> {
     // Name the thread for the F12 switch picker — the one path every launch
     // (boot init and fork-exec) flows through, so every task is named.
     threads[tid].kernel.set_comm(path);
+    threads[tid].kernel.launcher_psp = 0;
     let format = if personality_name == Some(crate::kernel::thread::PersonalityName::Dos) {
         detect_format_for_dos(&data, path)
     } else {
@@ -221,7 +228,17 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
     };
     match format {
         BinaryFormat::Elf if matches!(exec_vga, ExecVga::None) => {
-            crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)
+            crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)?;
+            if let crate::kernel::thread::Personality::Linux(linux) = &mut threads[tid].personality {
+                // DOS launchers preserve the current drive as C:/directory;
+                // Linux needs the corresponding path in the VFS namespace.
+                let cwd = if parent_cwd.get(1) == Some(&b':') {
+                    crate::kernel::dos::dos_abs_to_vfs(&absolute_dos_cwd(&parent_cwd)).ok_or(-2)?
+                } else { parent_cwd };
+                linux.cwd_len = cwd.len().min(linux.cwd.len());
+                linux.cwd[..linux.cwd_len].copy_from_slice(&cwd[..linux.cwd_len]);
+            }
+            Ok(())
         }
         BinaryFormat::Elf => Err(-8),
         BinaryFormat::Lx if matches!(exec_vga, ExecVga::None) => {
@@ -253,6 +270,15 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
 }
 
 // ── Path utilities ──────────────────────────────────────────────────────
+
+fn absolute_dos_cwd(cwd: &[u8]) -> Vec<u8> {
+    let mut path = cwd[..2].to_vec();
+    path.push(b'\\');
+    path.extend(cwd[2..].iter().copied()
+        .skip_while(|&b| matches!(b, b'/' | b'\\'))
+        .map(|b| if b == b'/' { b'\\' } else { b }));
+    path
+}
 
 /// Resolve a path against a working directory. Absolute paths ignore cwd.
 /// Normalizes `.`/`./` and `..`/`../` segments. Returns a slice of `buf`

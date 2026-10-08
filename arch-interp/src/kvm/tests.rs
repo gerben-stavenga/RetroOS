@@ -296,4 +296,33 @@ fn kvm_engine_proofs() {
         0x1122_3344,
         "thread A's XMM0 restored across the switch"
     );
+
+    // A timer interrupt may switch 64-bit contexts only after KVM has
+    // delivered any pending syscall #UD to the trap shim. Repeatedly switch
+    // between distinct code addresses at both timer and syscall boundaries;
+    // a stale queued exception at the new MOV/JMP must never escape as #UD.
+    let entries = [0x0060_0000usize, 0x0060_1000];
+    for &entry in &entries {
+        mem.copy_to(entry, &[0xb8, 24, 0, 0, 0, 0x0f, 0x05, 0xeb, 0xf7]);
+    }
+    let mut contexts = [Regs::empty(); 2];
+    for (i, context) in contexts.iter_mut().enumerate() {
+        context.init_user_process_64(entries[i] as u64, stack as u64);
+    }
+    let mut active = 0;
+    let mut syscalls = 0;
+    let start = std::time::Instant::now();
+    set_regs(contexts[active]);
+    while start.elapsed() < std::time::Duration::from_millis(100) {
+        match execute() {
+            KernelEvent::Irq => {},
+            KernelEvent::Syscall => { syscalls += 1; },
+            event => panic!("64-bit context switch yielded {event:?}"),
+        }
+        contexts[active] = regs();
+        active ^= 1;
+        set_regs(contexts[active]);
+    }
+    assert!(syscalls > 100, "64-bit syscall contexts made progress");
+
 }

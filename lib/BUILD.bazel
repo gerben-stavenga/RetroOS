@@ -123,3 +123,12 @@ rust_test(
         "-Crelocation-model=static",
     ],
 )
+
+rust_test(
+    name = "term_test",
+    srcs = ["tests/term.rs"],
+    crate_name = "term_test",
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+    deps = [":lib"],
+)

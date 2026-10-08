@@ -18,11 +18,12 @@ macro_rules! linux_trace {
     };
 }
 
+mod async_io;
+
 use crate::kernel::elf;
 use crate::kernel::thread;
 use crate::kernel::thread::{FdKind, PendingRead, PendingPoll, MAX_FDS};
 use crate::kernel::vfs;
-use crate::term;
 use crate::Regs;
 use crate::compact_println;
 
@@ -47,6 +48,26 @@ const ENOSYS: i32 = 38;
 
 pub fn repaint_console() { crate::kernel::term::mark_dirty(); }
 
+/// One terminal presentation, independent of which Linux process runs in it.
+pub const CONSOLE_ENDPOINT: crate::kernel::gui::EndpointId =
+    crate::kernel::gui::EndpointId(u32::MAX - 1);
+static CONSOLE_FOREGROUND: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn console_foreground<A: crate::Arch>(threads: &[thread::Thread<A>]) -> Option<usize> {
+    let live_linux = |t: &thread::Thread<A>| matches!(t.personality, thread::Personality::Linux(_))
+        && matches!(t.kernel.state, thread::ThreadState::Running
+            | thread::ThreadState::Ready | thread::ThreadState::Blocked);
+    let tid = CONSOLE_FOREGROUND.load(core::sync::atomic::Ordering::Relaxed);
+    if threads.get(tid).is_some_and(live_linux) { return Some(tid); }
+    threads.iter().enumerate().skip(1).rev()
+        .find(|(_, t)| live_linux(t)).map(|(tid, _)| tid)
+}
+
+pub fn foreground_console(tid: usize) {
+    CONSOLE_FOREGROUND.store(tid, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Render the shared terminal into its packed shadow, composite the OSD, and
 /// publish that completed frame through the focused Linux display.
 pub fn render<A: crate::Arch>(
@@ -61,6 +82,8 @@ pub fn render<A: crate::Arch>(
 
 /// Linux-specific thread state
 pub struct LinuxState {
+    async_io: async_io::State,
+    termios: [u8; 36],
     pub heap_base: usize,
     pub heap_end: usize,
     pub mmap_cursor: usize,
@@ -95,6 +118,8 @@ impl Default for LinuxState {
 impl LinuxState {
     pub fn new() -> Self {
         LinuxState {
+            async_io: async_io::State::default(),
+            termios: { let mut bytes = [0; 36]; bytes[1] = 1; bytes },
             heap_base: 0,
             heap_end: 0,
             mmap_cursor: crate::kernel::elf::USER_STACK_TOP - 0x0100_0000,
@@ -112,6 +137,8 @@ impl LinuxState {
             exec_path_len: 0,
         }
     }
+
+    pub fn close_virtual_fds(&mut self) { self.async_io = async_io::State::default(); }
 
     pub fn cwd_str(&self) -> &[u8] { &self.cwd[..self.cwd_len] }
 
@@ -150,10 +177,23 @@ impl LinuxState {
     /// would produce doubled characters on screen.
     pub fn process_key<A: crate::Arch>(&self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_key_state(scancode) { return; }
-        let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
-        if c == 0 { return; }
+        let sequence: &[u8] = match scancode {
+            0x48 => b"\x1b[A", 0x50 => b"\x1b[B", 0x4d => b"\x1b[C", 0x4b => b"\x1b[D",
+            0x47 => b"\x1b[H", 0x4f => b"\x1b[F", 0x49 => b"\x1b[5~", 0x51 => b"\x1b[6~",
+            0x52 => b"\x1b[2~", 0x53 => b"\x1b[3~",
+            0x3b => b"\x1bOP", 0x3c => b"\x1bOQ", 0x3d => b"\x1bOR", 0x3e => b"\x1bOS",
+            0x3f => b"\x1b[15~", 0x40 => b"\x1b[17~", 0x41 => b"\x1b[18~", 0x42 => b"\x1b[19~",
+            0x43 => b"\x1b[20~", 0x44 => b"\x1b[21~", 0x57 => b"\x1b[23~", 0x58 => b"\x1b[24~",
+            0x0f if crate::kernel::keyboard::key_down(0x2a) || crate::kernel::keyboard::key_down(0x36) => b"\x1b[Z",
+            _ => b"",
+        };
         if let FdKind::PipeRead(idx) = fds[0] {
-            crate::kernel::kpipe::write(idx, &[c]);
+            if !sequence.is_empty() { crate::kernel::kpipe::write(idx, sequence); return; }
+            let mut c = crate::kernel::keyboard::scancode_to_ascii(scancode);
+            // Raw-mode consumers need physical Enter as CR. ICRNL is a TTY
+            // input transformation, configured by tcsetattr(), not the key map.
+            if c == b'\n' && self.termios[1] & 1 == 0 { c = b'\r'; }
+            if c != 0 { crate::kernel::kpipe::write(idx, &[c]); }
         }
     }
 }
@@ -220,7 +260,7 @@ pub fn handle_event<A: crate::Arch>(
 ) -> thread::KernelAction {
     use crate::KernelEvent as KE;
     match kevent {
-        KE::Irq => thread::KernelAction::Done,
+        KE::Irq => { async_io::schedule(machine, kt, linux, regs); thread::KernelAction::Done },
         // 32-bit user uses INT 0x80 (lands as SoftInt); 64-bit user uses the
         // SYSCALL instruction (lands as Syscall). Both reach the same dispatch.
         KE::SoftInt(0x80) | KE::Syscall => dispatch_action(machine, kt, linux, regs),
@@ -277,7 +317,7 @@ pub fn dispatch_action<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
         nr, args.a0, args.a1, args.a2, kt.tid);
 
     let result = if regs.mode() == crate::UserMode::Mode64 {
-        dispatch_nr_64(machine, kt, linux, nr, &args, regs)
+        if let Some(result) = async_io::call(machine, kt, linux, regs, nr, &args) { result } else { dispatch_nr_64(machine, kt, linux, nr, &args, regs) }
     } else {
         dispatch_nr(machine, kt, linux, nr, &args, regs)
     };
@@ -289,6 +329,7 @@ pub fn dispatch_action<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
     if let Some(action) = result.action {
         return action;
     }
+    async_io::schedule(machine, kt, linux, regs);
     match result.switch_to {
         Some(next) => thread::KernelAction::Switch(next),
         None => thread::KernelAction::Done,
@@ -326,7 +367,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         33  => sys_access(machine, &mut kt.vcpu, linux, a),
         42  => sys_pipe(machine, kt, a, false),
         45  => sys_brk(linux, a),
-        54  => sys_ioctl(machine, kt, a),
+        54  => sys_ioctl(machine, kt, linux, a),
         180 => sys_pread64(machine, kt, a),
         55  => sys_fcntl(kt, a),
         63  => sys_dup2(kt, a),
@@ -337,7 +378,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         106 => sys_stat_old(machine, &mut kt.vcpu, linux, a, true),
         107 => sys_stat_old(machine, &mut kt.vcpu, linux, a, false),
         108 => sys_fstat_old(machine, kt, a),
-        91  => sys_munmap(linux, a),
+        91  => sys_munmap(machine, linux, a),
         114 => sys_wait4(machine, kt, a, regs),
         120 => sys_clone(machine, kt, linux, a, regs),
         190 => sys_fork(machine, kt, linux, a, regs), // vfork → COW fork
@@ -394,11 +435,11 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         8   => sys_lseek(kt, a),
         9   => sys_mmap2(machine, kt, linux, a, a.a5 as usize), // mmap: offset in bytes
         10  => SyscallResult::val(0),
-        11  => sys_munmap(linux, a),
+        11  => sys_munmap(machine, linux, a),
         12  => sys_brk(linux, a),
         13  => SyscallResult::val(0),
         14  => SyscallResult::val(0),
-        16  => sys_ioctl(machine, kt, a),
+        16  => sys_ioctl(machine, kt, linux, a),
         17  => sys_pread64(machine, kt, a),
         20  => sys_writev(machine, kt, a, true),
         21  => sys_access(machine, &mut kt.vcpu, linux, a),
@@ -425,6 +466,17 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
+        82 => {
+            let mut old = [0; 256]; let old_n = machine.copy_cstr(a.a0 as usize, &mut old);
+            let mut new = [0; 256]; let new_n = machine.copy_cstr(a.a1 as usize, &mut new);
+            let mut old_buf = [0; 256]; let mut new_buf = [0; 256];
+            SyscallResult::val(vfs::rename(resolve_path(&old[..old_n], linux.cwd_str(), &mut old_buf), resolve_path(&new[..new_n], linux.cwd_str(), &mut new_buf)))
+        },
+        83 | 84 | 87 => {
+            let mut raw = [0; 256]; let n = machine.copy_cstr(a.a0 as usize, &mut raw);
+            let mut buf = [0; 256]; let path = resolve_path(&raw[..n], linux.cwd_str(), &mut buf);
+            SyscallResult::val(match nr { 83 => vfs::mkdir(path), 84 => vfs::rmdir(path), _ => vfs::delete(path) })
+        },
         89  => sys_readlink(machine, linux, a),
         96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
@@ -451,6 +503,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         269 => sys_faccessat(machine, linux, a),
         273 => SyscallResult::val(0),       // set_robust_list — no threads share
         293 => sys_pipe(machine, kt, a, true),
+        294 => SyscallResult::val(-ENOSYS), // inotify_init1: no filesystem event queue yet
         334 => SyscallResult::val(-ENOSYS), // rseq — glibc falls back cleanly
         439 => sys_faccessat(machine, linux, a),
         302 => SyscallResult::val(0),
@@ -602,7 +655,7 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
     // entries (AT_PHDR/PHENT/PHNUM/BASE/ENTRY + the id/cap tags) in
     // `extra_auxv`; we append the ones needing stack-internal addresses
     // (AT_PAGESZ, AT_RANDOM, AT_EXECFN) and the AT_NULL terminator. A static
-    // exec passes `&[]`, preserving the minimal PAGESZ/RANDOM vector.
+    // exec also supplies its program headers so libc can discover PT_TLS.
     let mut auxv: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
     auxv.extend_from_slice(extra_auxv);
     auxv.push((6, 4096));         // AT_PAGESZ
@@ -676,9 +729,11 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 
     let current = thread::get_thread(threads, tid).unwrap();
 
-    // Dynamically-linked PIE → load at PIE_BASE; fixed ET_EXEC (and static
-    // ET_DYN, which we keep at bias 0 as before) → no bias.
-    let main_bias = if is_pie && interp_path.is_some() { PIE_BASE } else { 0 };
+    foreground_console(tid);
+
+    // Both static and dynamic PIE must stay clear of the low BIOS/VGA and
+    // hosted trap-workspace mappings. Static musl relocates itself using auxv.
+    let main_bias = if is_pie { PIE_BASE } else { 0 };
     let loaded = elf::load_elf(machine, data, main_bias).map_err(|_| 8)?;
     let want_64 = loaded.class == elf::ElfClass::Elf64;
 
@@ -706,7 +761,12 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         ];
         (interp_loaded.entry, aux)
     } else {
-        (loaded.entry, alloc::vec::Vec::new())
+        // Static libc also uses the program headers to discover PT_TLS.
+        // Omitting these silently gives pthreads undersized TLS blocks.
+        (loaded.entry, alloc::vec![
+            (3, loaded.phdr_vaddr), (4, loaded.phentsize), (5, loaded.phnum),
+            (9, loaded.entry as usize),
+        ])
     };
 
     let sp = setup_user_stack(machine, &mut current.kernel.vcpu, args, want_64, &extra_auxv);
@@ -786,6 +846,10 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         child.kernel.vcpu.regs.frame.rsp = child_stack as u64;
     }
 
+    let mut snapshot = machine.clean_fx_template();
+    machine.switch_fx(&mut snapshot);
+    child.kernel.fx_state = snapshot;
+    machine.switch_fx(&mut snapshot);
     parent.kernel.dup_all_fds(&mut child.kernel);
     if let (thread::Personality::Linux(pl), thread::Personality::Linux(cl)) =
         (&parent.personality, &mut child.personality)
@@ -799,9 +863,14 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         cl.tls_limit_in_pages = pl.tls_limit_in_pages;
         cl.cwd = pl.cwd;
         cl.cwd_len = pl.cwd_len;
+        cl.exec_path = pl.exec_path;
+        cl.exec_path_len = pl.exec_path_len;
+        cl.termios = pl.termios;
+        cl.async_io = async_io::fork_state(&pl.async_io);
     }
 
     parent.kernel.state = thread::ThreadState::Ready;
+    foreground_console(child_tid);
     on_done(vcpu, child_tid as i32);
     Some(child_tid)
 }
@@ -864,6 +933,15 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     }
 }
 
+/// Terminal queries reply through the same input endpoint as keyboard bytes.
+fn terminal_responses<A: crate::Arch>(kt: &thread::KernelThread<A>) {
+    let mut reply = [0; 64];
+    let n = lib::term::take_response(&mut reply);
+    if let FdKind::PipeRead(pipe) = kt.fds[0] {
+        if n > 0 { crate::kernel::kpipe::write(pipe, &reply[..n]); }
+    }
+}
+
 /// write(4)
 fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
@@ -878,8 +956,9 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             let mut tmp = alloc::vec![0u8; len];
             machine.copy_from(buf, &mut tmp);
             for &b in &tmp {
-                term::putchar(b);
+                lib::term::put_utf8(b);
             }
+            terminal_responses(kt);
             crate::kernel::term::mark_dirty();
             SyscallResult::val(len as i32)
         }
@@ -936,12 +1015,18 @@ fn sys_open<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
         };
     }
 
-    let handle = vfs::open_to_handle(resolved);
+    let flags = a.a1 as u32;
+    let exists = vfs::path_exists(resolved);
+    if flags & 0xc0 == 0xc0 && exists { return SyscallResult::val(-17); } // O_CREAT|O_EXCL
+    if !exists && flags & 0x40 == 0 { return SyscallResult::val(-ENOENT); }
+    if flags & 0x10000 != 0 { return SyscallResult::val(-20); } // O_DIRECTORY
+    let handle = if flags & 0x200 != 0 || !exists { vfs::create_to_handle(resolved) } else { vfs::open_to_handle(resolved) };
     if handle < 0 { return SyscallResult::val(handle); }
 
     match kt.alloc_fd(3) {
         Some(fd) => {
             kt.fds[fd] = thread::FdKind::Vfs(handle);
+            if flags & 0x80000 != 0 { kt.cloexec |= 1u64 << fd; }
             SyscallResult::val(fd as i32)
         }
         None => {
@@ -1127,7 +1212,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // mode re-execs itself that way, and we have no real /proc. Copy to the
     // kernel heap: `raw_path` borrows user memory that arch_user_clean() below
     // unmaps, and we use `path` after that (format detection + init_thread).
-    let path: alloc::vec::Vec<u8> = if raw_path == b"/proc/self/exe" {
+    let mut path: alloc::vec::Vec<u8> = if raw_path == b"/proc/self/exe" {
         linux.exec_path_str().to_vec()
     } else {
         raw_path.to_vec()
@@ -1148,7 +1233,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     let cwd_snapshot: alloc::vec::Vec<u8> = linux.cwd_str().into();
 
     // Load file (resolves path against cwd)
-    let buffer = match exec::load_file(&path, &cwd_snapshot) {
+    let mut buffer = match exec::load_file(&path, &cwd_snapshot) {
         Ok(b) => b,
         Err(_) => return SyscallResult::val(-ENOENT),
     };
@@ -1163,13 +1248,46 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
         return SyscallResult::val(-ENOEXEC);
     }
 
+    let format = exec::detect_format(&buffer, &path);
+    let mut cmdtail = if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
+        let tail = dos_command_tail(&args);
+        if tail.len() > 126 { return SyscallResult::val(-7); } // E2BIG: PSP command tail capacity.
+        let mut resolved = [0; 164];
+        args[0] = exec::resolve_path(&path, &cwd_snapshot, &mut resolved).to_vec();
+        tail
+    } else { alloc::vec::Vec::new() };
+
+    // COMMAND owns LOADFIX.CFG interpretation, DOS/32A wrapping and game
+    // launch policy. Use the same process-replacing entry as CreateProcess;
+    // keep direct DOS loading available on minimal systems without a shell.
+    if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
+        let launcher = [crate::kernel::dos::c_root(), b"RETROOS/COMMAND.COM"].concat();
+        if !args[0].eq_ignore_ascii_case(&launcher) {
+            if let Ok(shell) = exec::load_file_resolved(&launcher) {
+                let mut dos_path = [0; crate::kernel::dos::DFS_PATH_MAX];
+                let n = crate::kernel::dos::vfs_to_dos(&args[0], &mut dos_path);
+                let mut tail = b"/E ".to_vec();
+                let quoted = dos_path[..n].contains(&b' ');
+                if quoted { tail.push(b'"'); }
+                tail.extend_from_slice(&dos_path[..n]);
+                if quoted { tail.push(b'"'); }
+                if !cmdtail.is_empty() { tail.push(b' '); tail.extend_from_slice(&cmdtail); }
+                if tail.len() > 126 { return SyscallResult::val(-7); }
+                cmdtail = tail;
+                args = alloc::vec![launcher.clone()];
+                path = launcher;
+                buffer = shell;
+            }
+        }
+    }
+
     // File loaded — hand teardown + rebuild to the executor (`handle_exec`),
     // which runs off this handler's borrow so its in-place
     // init_thread/exit_thread/reg-reload don't alias `kt`. The point of no
     // return (drop symbols, close CLOEXEC, free pages, re-image) is the
     // executor's; until then execve still fails cleanly (the -ENOENT above).
     SyscallResult::act(0, thread::KernelAction::Exec {
-        buffer, path, args, cmdtail: alloc::vec::Vec::new(), env: alloc::vec::Vec::new(),
+        buffer, path, args, cmdtail, env: alloc::vec::Vec::new(),
         cwd: cwd_snapshot, personality_name: None, policy: Default::default(),
     })
 }
@@ -1209,7 +1327,8 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     // Sound Blaster while it replaces itself. Detach those resources before
     // exec_dos_into drops the old DosState, then bind them to the new image.
     let replacing_dos = personality_name == Some(thread::PersonalityName::Dos);
-    let focused_dos = replacing_dos && crate::kernel::focus::focused() == tid;
+    let starting_dos = matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com);
+    let focused_dos = (replacing_dos || starting_dos) && crate::kernel::focus::focused() == tid;
     let exec_display = if focused_dos {
         Some(match display.take() {
             Some(surface) => crate::kernel::display::DisplayHandoff::from_surface(surface, machine),
@@ -1232,7 +1351,15 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     {
         let cur = thread::get_thread(threads, tid).unwrap();
         cur.kernel.close_cloexec();
+        if let thread::Personality::Linux(linux) = &mut cur.personality { async_io::close_cloexec(&mut linux.async_io); }
     }
+
+    let inherited_async = if matches!(format, exec::BinaryFormat::Elf) {
+        match &thread::get_thread(threads, tid).unwrap().personality {
+            thread::Personality::Linux(linux) => Some(async_io::exec_state(&linux.async_io)),
+            _ => None,
+        }
+    } else { None };
 
     // Native protected-mode images need a clean address space; DOS handles
     // its own setup inside exec_dos_into.
@@ -1260,6 +1387,9 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         ));
     }
 
+    if let Some(inherited) = inherited_async {
+        if let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality { linux.async_io = inherited; }
+    }
     if let Some(handoff) = exec_display {
         let new = thread::get_thread(threads, tid).unwrap();
         if crate::kernel::osd::is_open()
@@ -1268,7 +1398,11 @@ pub(crate) fn handle_exec<A: crate::Arch>(
         {
             *display = Some(handoff.into_surface(machine, bios_workspace));
         } else {
-            new.personality.acquire_display_replace(machine, bios_workspace, handoff);
+            if starting_dos && !replacing_dos {
+                new.personality.acquire_display_restore(machine, bios_workspace, handoff);
+            } else {
+                new.personality.acquire_display_replace(machine, bios_workspace, handoff);
+            }
         }
     }
     if focused_dos {
@@ -1315,9 +1449,9 @@ fn sys_lseek<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
 /// ioctl(54 i386 / 16 x86_64) — minimal TTY support so isatty() returns
 /// true on console fds, otherwise sh drops into silent non-interactive
 /// mode (no prompt). We only implement enough for ash to consider stdin a
-/// terminal: TCGETS returns a zeroed termios on stdin/stdout/stderr,
+/// terminal: TCGETS/TCSETS preserve the console termios on stdin/stdout/stderr,
 /// everything else returns ENOTTY.
-fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, a: &Args) -> SyscallResult {
+fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     const TCGETS: u32 = 0x5401;
     const TCSETS: u32 = 0x5402;
     const TIOCGWINSZ: u32 = 0x5413;
@@ -1341,14 +1475,14 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 
     match cmd {
         TCGETS => {
-            // struct termios is ~36 bytes on i386. Zero is fine — what
-            // matters for isatty() is just that the call succeeds.
+            // The Linux kernel termios ABI is 36 bytes for both client sizes.
             if arg != 0 {
-                machine.zero(arg, 36);
+                machine.copy_to(arg, &linux.termios);
             }
             SyscallResult::val(0)
         }
-        TCSETS | TIOCSWINSZ | TIOCSPGRP => SyscallResult::val(0), // accept and discard
+        TCSETS | 0x5403 | 0x5404 => { if arg == 0 { return SyscallResult::val(-EFAULT); } machine.copy_from(arg, &mut linux.termios); SyscallResult::val(0) },
+        TIOCSWINSZ | TIOCSPGRP => SyscallResult::val(0), // accept and discard
         TIOCGWINSZ => {
             // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel — 4×u16.
             if arg != 0 {
@@ -1536,21 +1670,15 @@ fn sys_fcntl<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
 }
 
 /// munmap(91)
-fn sys_munmap(_linux: &mut LinuxState, a: &Args) -> SyscallResult {
+fn sys_munmap<A: crate::Arch>(machine: &mut A, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     let addr = a.a0 as usize;
     let length = a.a1 as usize;
-    if addr & 0xFFF != 0 { return SyscallResult::val(-EINVAL); }
-    let num_pages = length.div_ceil(0x1000);
-    let start_page = addr / 0x1000;
-    // Clear page table entries — pages get freed via refcount
-    for i in 0..num_pages {
-        let vpage = start_page + i;
-        // Use arch_set_page_flags to mark not-present (flags=0 doesn't help — we need real unmap)
-        // For now: zero out the page table entry by mapping to zero page read-only then freeing
-        // This is approximate — full unmap needs an arch call
-        // TODO: add arch_unmap_user_range call
-        let _ = vpage;
-    }
+    if addr & 0xfff != 0 || length == 0 { return SyscallResult::val(-EINVAL); }
+    let Some(end) = addr.checked_add(length).and_then(|v| v.checked_add(4095)).map(|v| v & !4095) else { return SyscallResult::val(-EINVAL); };
+    if end > elf::USER_STACK_TOP { return SyscallResult::val(-EINVAL); }
+    machine.unmap_range(addr / 4096, (end - addr) / 4096);
+    // Reuse a just-freed region at the current downward allocation frontier.
+    if addr == linux.mmap_cursor { linux.mmap_cursor = end; }
     SyscallResult::val(0)
 }
 
@@ -1675,8 +1803,9 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
         match fd_kind {
             thread::FdKind::ConsoleOut => {
                 for &b in &iov {
-                    term::putchar(b);
+                    lib::term::put_utf8(b);
                 }
+                terminal_responses(kt);
                 crate::kernel::term::mark_dirty();
                 total += iov_len as i32;
             }
@@ -2394,4 +2523,17 @@ fn sys_dup2<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysca
     kt.cloexec &= !(1 << newfd);
 
     SyscallResult::val(newfd as i32)
+}
+
+/// DOS PSP command lines omit argv[0]; quote arguments containing whitespace.
+fn dos_command_tail(args: &[alloc::vec::Vec<u8>]) -> alloc::vec::Vec<u8> {
+    let mut tail = alloc::vec::Vec::new();
+    for arg in args.iter().skip(1) {
+        if !tail.is_empty() { tail.push(b' '); }
+        let quoted = arg.is_empty() || arg.iter().any(|b| b.is_ascii_whitespace());
+        if quoted { tail.push(b'"'); }
+        tail.extend_from_slice(arg);
+        if quoted { tail.push(b'"'); }
+    }
+    tail
 }

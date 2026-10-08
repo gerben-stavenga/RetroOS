@@ -7,9 +7,9 @@
 //! metal, stderr or a file when hosted).
 //!
 //! Being unowned is the point, not an oversight. Any owner may mirror its
-//! output here without taking anyone's display: a DOS program's INT 21h
-//! output, a Linux process's stdout and the kernel's own diagnostics all land
-//! in one stream, in order, regardless of who currently holds the screen. It
+//! output here without taking anyone's display: DOS INT 21h output and the
+//! kernel's own diagnostics land in one stream, regardless of who holds the
+//! screen. Linux terminal redraws use a separate console path. This stream
 //! also has to work mid-panic, when there is no owner left to ask — hence the
 //! atomic function-pointer sink and no allocation anywhere on this path.
 //!

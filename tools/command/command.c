@@ -20,6 +20,7 @@
  *   AH=02/03h TRACE_ON/OFF
  *   AH=0Ah LOG_BYTE          AL=byte (kernel log only, never VGA)
  *   AH=0Bh TSR_SESSION       AL=0 query / AL=1 mark this address space
+ *   AH=0Ch LAUNCH_HELPER     omit this root PSP's window from the task picker
  *
  * No shell logic in the kernel: filename parsing, .BAT, /C, and built-in
  * dispatch all live here.
@@ -1329,6 +1330,14 @@ int main(int argc, char *argv[]) {
     }
 
     in_session = synth_tsr_session(0);
+
+    /* One-shot launch helpers have no independent interactive console.
+     * /B owns a batch session and its output; keep that session visible.
+     * The kernel also keeps an outer DOS EXEC caller (e.g. DN) selectable. */
+    if (!is_flag(argv[1], 'B')) {
+        r.h.ah = 0x0C;
+        int86(0x31, &r, &r);
+    }
 
     /* /B batfile -- batch trampoline entry. We are a fresh fork with our own
      * address space; interpret the file here so its lines (and any TSR they

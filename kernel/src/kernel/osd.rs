@@ -629,13 +629,14 @@ const MAX_LIST: usize = thread::MAX_THREADS - 1;
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct WindowEntry {
     tid: u16,
+    endpoint: crate::kernel::gui::EndpointId,
     focused: bool,
     name: [u8; 16],
     name_len: u8,
 }
 
 impl WindowEntry {
-    const EMPTY: WindowEntry = WindowEntry { tid: 0, focused: false, name: [0; 16], name_len: 0 };
+    const EMPTY: WindowEntry = WindowEntry { tid: 0, endpoint: crate::kernel::gui::EndpointId(0), focused: false, name: [0; 16], name_len: 0 };
 }
 
 /// The picker's snapshot, rebuilt once per timer tick while the monitor is
@@ -707,11 +708,16 @@ pub fn refresh_windows<A: crate::Arch>(
         changed = true;
     }
     let mut count = 0;
+    let console_foreground = crate::kernel::linux::console_foreground(threads);
     for (i, t) in threads.iter().enumerate().skip(1) {
         if count >= MAX_LIST {
             break;
         }
         let k = &t.kernel;
+        if !t.has_primary_window()
+            || (matches!(t.personality, thread::Personality::Linux(_))
+                && console_foreground != Some(i))
+        { continue; }
         match k.state {
             thread::ThreadState::Running
             | thread::ThreadState::Ready
@@ -733,6 +739,7 @@ pub fn refresh_windows<A: crate::Arch>(
             let p = &mut (*core::ptr::addr_of_mut!(WINDOWS))[count];
             let mut entry = WindowEntry::EMPTY;
             entry.tid = i as u16;
+            entry.endpoint = t.window_endpoint();
             entry.focused = i == focused;
             entry.name[..n].copy_from_slice(&name[..n]);
             entry.name_len = n as u8;
@@ -767,6 +774,17 @@ pub fn picker_preview_tid() -> Option<usize> {
     let selected = PICK_SEL.load(Ordering::Relaxed);
     (selected < WINDOW_COUNT.load(Ordering::Relaxed))
         .then(|| window_at(selected).tid as usize)
+}
+
+pub fn picker_preview_endpoint() -> Option<crate::kernel::gui::EndpointId> {
+    picker_preview_tid()?;
+    Some(window_at(PICK_SEL.load(Ordering::Relaxed)).endpoint)
+}
+
+pub fn window_endpoint_for_tid(tid: usize) -> Option<crate::kernel::gui::EndpointId> {
+    (0..WINDOW_COUNT.load(Ordering::Relaxed))
+        .map(window_at).find(|entry| entry.tid as usize == tid)
+        .map(|entry| entry.endpoint)
 }
 
 // ── Input ────────────────────────────────────────────────────────────────────

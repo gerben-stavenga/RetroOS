@@ -736,6 +736,15 @@ fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A
 pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let ah = (regs.rax >> 8) as u8;
     match ah {
+        // AH=0Ch — a one-shot command interpreter announces that it is a
+        // launch helper, rather than an independently selectable console.
+        // In-process EXEC inside DN must keep DN's outer window selectable.
+        0x0C => {
+            if dos.exec_parent.is_none() { kt.launcher_psp = dos.current_psp; }
+            regs.rax &= !0xFFFF;
+            regs.clear_flag32(1);
+            thread::KernelAction::Done
+        }
         // AH=01h — launch a program. Normally fork+exec, non-blocking;
         // CH bit 1 replaces this process for a one-shot shell.
         // Input:  DS:DX -> ASCIIZ program filename (no shell parsing here)

@@ -338,6 +338,29 @@ pub fn host_mkdir(path: &[u8]) -> i32 {
     NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-5, |fs| fs.n_mkdir(path)))
 }
 
+/// Directory mutations preserve the host OS errno, including ENOTEMPTY.
+pub fn host_rmdir(path: &[u8]) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow().as_ref().map_or(-5, |fs| {
+        std::fs::remove_dir(fs.resolve(path)).map_or_else(|e| -e.raw_os_error().unwrap_or(5), |_| 0)
+    }))
+}
+pub fn host_rename(path: &[u8], new_path: &[u8]) -> i32 {
+    NATIVE_HOSTFS.with(|n| n.borrow_mut().as_mut().map_or(-5, |fs| {
+        let old = fs.resolve(path);
+        let new = fs.resolve(new_path);
+        match std::fs::rename(&old, &new) {
+            Err(e) => -e.raw_os_error().unwrap_or(5),
+            Ok(()) => {
+                // Open handles continue referring to the renamed file/tree.
+                for value in fs.handles.values_mut() {
+                    if let Ok(suffix) = value.strip_prefix(&old) { *value = new.join(suffix); }
+                }
+                0
+            }
+        }
+    }))
+}
+
 /// Return the `index`-th directory entry as `(name_bytes, size, is_dir, mtime)`.
 fn nth_entry(dir: &Path, index: usize) -> Option<(Vec<u8>, u32, bool, u32)> {
     let entry = fs::read_dir(dir).ok()?.flatten().nth(index)?;

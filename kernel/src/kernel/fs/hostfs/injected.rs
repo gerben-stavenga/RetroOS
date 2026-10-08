@@ -24,6 +24,8 @@ pub struct HostBackendHooks {
     pub clunk: fn(u64),
     pub remove: fn(&[u8]) -> i32,
     pub mkdir: fn(&[u8]) -> i32,
+    pub rmdir: fn(&[u8]) -> i32,
+    pub rename: fn(&[u8], &[u8]) -> i32,
 }
 
 static mut HOST_BACKEND: Option<HostBackendHooks> = None;
@@ -132,6 +134,12 @@ impl Filesystem for InjectedHostFs {
     fn mkdir(&self, path: &[u8]) -> i32 {
         (backend().mkdir)(path)
     }
+
+    fn rmdir(&self, path: &[u8]) -> i32 { (backend().rmdir)(path) }
+
+    fn rename(&self, path: &[u8], new_path: &[u8]) -> i32 { (backend().rename)(path, new_path) }
+
+    fn supports_directory_mutation(&self) -> bool { true }
 
     fn supports_mkdir(&self) -> bool {
         true

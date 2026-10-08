@@ -111,7 +111,7 @@ bz()        { if have bazelisk; then bazelisk "$@"; else bazel "$@"; fi; }
 unit() {
     bz test --platforms=@platforms//host \
         //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //kernel:kernel_unit_test \
-        //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test \
+        //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test \
         //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
@@ -182,6 +182,8 @@ run xms_kvm      kvm       env ENGINE=kvm bash test/xms.sh
 run ems_kvm      kvm       env ENGINE=kvm python3 test/ems.py
 run dpmi_vif_kvm kvm       env ENGINE=kvm bash test/dpmi_vif.sh
 run os2_runtime_kvm kvm env ENGINE=kvm python3 test/os2_runtime.py
+run linux_runtime_kvm kvm python3 test/linux_runtime.py
+run rat_commander_kvm kvm python3 test/rat_commander.py
 run windows_threads_kvm kvm env ENGINE=kvm python3 test/windows_threads.py
 run dpmi_rm_exception_kvm kvm env ENGINE=kvm python3 test/dpmi_rm_exception.py
 # --- KVM differential: needs /dev/kvm --------------------------------------

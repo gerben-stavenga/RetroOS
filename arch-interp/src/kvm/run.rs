@@ -588,6 +588,15 @@ pub fn execute() -> KernelEvent {
             match kind {
                 Kind::Intr | Kind::Debug if in_shim(k) => continue,
                 Kind::Intr => {
+                    // A host timer can interrupt KVM after a fault is queued
+                    // but before its IDT delivery. Let that delivery reach the
+                    // shim before scheduling another guest context; otherwise
+                    // the queued exception is injected at the new context's IP.
+                    let events = k.vcpu.get_vcpu_events().expect("KVM_GET_VCPU_EVENTS");
+                    if events.exception.injected != 0 || events.exception.pending != 0 {
+                        if trace_on() { eprintln!("[kvm] draining queued exception {}", events.exception.nr); }
+                        continue;
+                    }
                     sync_out(k, vcpu, mode);
                     break Some(KernelEvent::Irq);
                 }

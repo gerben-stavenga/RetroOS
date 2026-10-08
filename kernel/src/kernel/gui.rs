@@ -931,8 +931,7 @@ impl WindowManager {
         canvas_width: usize,
         canvas_height: usize,
     ) {
-        let highlighted = crate::kernel::osd::picker_preview_tid()
-            .map(|tid| EndpointId(tid as u32));
+        let highlighted = crate::kernel::osd::picker_preview_endpoint();
         self.sync_task_switcher_preview(active, highlighted, canvas_width, canvas_height);
     }
 

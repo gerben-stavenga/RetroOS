@@ -11,6 +11,17 @@ use crate::kernel::block::Volume;
 /// stay well under it anyway.
 const FAT_CACHE_CAP: u64 = 2 * 1024 * 1024;
 
+/// FAT stores DOS attributes rather than Unix permissions. DOS executable
+/// suffixes supply the execute bits, so Unix file managers can recognize them
+/// without changing the files or requiring application-specific rules.
+fn unix_mode(name: &[u8], is_dir: bool, read_only: bool) -> u16 {
+    if is_dir { return 0o777; }
+    let mode = if read_only { 0o444 } else { 0o666 };
+    let suffix = &name[name.len().saturating_sub(4)..];
+    if suffix.eq_ignore_ascii_case(b".exe") || suffix.eq_ignore_ascii_case(b".com")
+    { mode | 0o111 } else { mode }
+}
+
 /// Byte-stream I/O over one bounded partition (or a raw GRUB module).
 /// Unaligned FAT metadata writes preserve the rest of their sector.
 pub struct VolumeIo {
@@ -300,6 +311,33 @@ pub(crate) mod tests {
     use crate::kernel::block::Disk;
     use fatfs::{Read, Seek, SeekFrom, Write};
 
+    #[test]
+    fn dos_executables_have_consistent_unix_execute_permissions() {
+        assert_eq!(unix_mode(b"READONLY.EXE", false, true), 0o555);
+        assert_eq!(unix_mode(b"readonly.txt", false, true), 0o444);
+        assert_eq!(unix_mode(b"exe", false, false), 0o666);
+        assert_eq!(unix_mode(b"directory.exe", true, true), 0o777);
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fs = FatFs::new(VolumeIo::new(volume, true)).unwrap();
+        for (name, mode) in [
+            (b"NDN.EXE".as_slice(), 0o777),
+            (b"mixed.CoM".as_slice(), 0o777),
+            (b"PLUGIN.DLL".as_slice(), 0o666),
+            (b"notes.exe.txt".as_slice(), 0o666),
+        ] {
+            let created = fs.create(name).unwrap();
+            assert_eq!(created.mode, mode);
+            fs.clunk(created.handle);
+            let opened = fs.open(name).unwrap();
+            assert_eq!(opened.mode, mode);
+            fs.clunk(opened.handle);
+            let mut entries = Vec::new();
+            fs.readdir(b"", 0, &mut entries, 8);
+            let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+            assert_eq!(entry.mode, mode);
+        }
+    }
+
     pub struct MemoryDisk {
         data: RefCell<Vec<u8>>,
         writes: Cell<usize>,
@@ -542,6 +580,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     }
 
     fn open(&self, path: &[u8]) -> Option<Vnode> {
+        let mode = unix_mode(path, false, self.dos_attributes(path).unwrap_or(0) & 1 != 0);
         let mut state = self.state.lock();
         let mut file = state.media().root_dir().open_file(path_str(path)?).ok()?;
         let size = fatfs::Seek::seek(&mut file, fatfs::SeekFrom::End(0)).ok()?;
@@ -564,7 +603,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         Some(Vnode {
             handle: handle as u64,
             size,
-            mode: 0o644,
+            mode,
         })
     }
 
@@ -646,7 +685,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
                 size: entry.len().min(u32::MAX as u64) as u32,
                 is_dir: entry.is_dir(),
                 is_symlink: false,
-                mode: if entry.is_dir() { 0o777 } else if entry.attributes().contains(fatfs::FileAttributes::READ_ONLY) { 0o444 } else { 0o666 },
+                mode: unix_mode(name.as_bytes(), entry.is_dir(), entry.attributes().contains(fatfs::FileAttributes::READ_ONLY)),
                 dos_attributes: Some(entry.attributes().bits()),
                 mtime: unix_from_datetime(&entry.modified()),
                 node: 0,
@@ -712,6 +751,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     }
 
     fn create(&self, path: &[u8]) -> Option<Vnode> {
+        let mode = unix_mode(path, false, self.dos_attributes(path).unwrap_or(0) & 1 != 0);
         let mut state = self.state.lock();
         let media = state.media();
         let path_text = path_str(path)?;
@@ -736,7 +776,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
         Some(Vnode {
             handle: handle as u64,
             size: 0,
-            mode: 0o644,
+            mode,
         })
     }
 

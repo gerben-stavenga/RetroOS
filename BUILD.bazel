@@ -98,6 +98,11 @@ _TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
 
 pkg_tar(
     name = "apps_boot_tar",
+    modes = {
+        "RETROOS/RC/RC.EXE": "0755",
+        "RETROOS/RC/LICENSE": "0644",
+        "RETROOS/RC/README.MD": "0644",
+    },
     files = {
         ":" + src: "RETROOS/" + src[len("apps-boot/"):].upper()
         for src in _APPS_BOOT_SRCS
@@ -192,19 +197,32 @@ pkg_tar(
 )
 
 # FS-layout convention (see BootConfig.c_root): the Linux root holds only the
-# busybox userland at /bin; everything DOS lives under C: = /home/retroos. The
+# Linux userland at /bin; everything DOS lives under C: = /home/retroos. The
 # shared _EXTRA_FILES / dep tars stay root-relative (the FreeDOS flat disk wants
 # that); the home/retroos/ prefix is applied here via package_dir.
-# busybox + applet shims at /bin (the Linux side, NOT under home/retroos).
+# Linux binaries and applet/editor symlinks at /bin.
 pkg_tar(
     name = "bin_tar",
     files = LINUX_FILES,
-    srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
+    srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS] + [":lnk_bin_rc", ":lnk_bin_rcedit"],
 )
 
-# DOS content (everything in _EXTRA_FILES except busybox) + games/TP70,
+# The executable lives on the rebuilt boot disk; Linux PATH gets aliases only.
+pkg_mklink(
+    name = "lnk_bin_rc",
+    link_name = "bin/rc",
+    target = "/home/retroos/RETROOS/RC/RC.EXE",
+)
+
+pkg_mklink(
+    name = "lnk_bin_rcedit",
+    link_name = "bin/rcedit",
+    target = "rc",
+)
+
+# DOS content (everything in _EXTRA_FILES except Linux files) + games/TP70,
 # all under C: = /home/retroos.
-_DOS_EXTRA = {k: v for k, v in _EXTRA_FILES.items() if v != "bin/busybox"}
+_DOS_EXTRA = {k: v for k, v in _EXTRA_FILES.items() if k not in LINUX_FILES}
 pkg_tar(
     name = "dos_extras_tar",
     empty_dirs = ["TEMP"],

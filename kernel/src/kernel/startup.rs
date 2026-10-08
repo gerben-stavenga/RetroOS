@@ -1397,7 +1397,7 @@ fn prepare_program<A: crate::Arch>(
     crate::compact_dbg_println!("boot launch: constructing program thread");
     crate::kernel::klog::sync_live();
     let tid = match exec::detect_format(&buf, &launch_path) {
-        exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args),
+        exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args, &cwd),
         exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
         exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path, &env),
@@ -1452,6 +1452,7 @@ fn launch_elf<A: crate::Arch>(
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
+    cwd: &[u8],
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
@@ -1472,6 +1473,10 @@ fn launch_elf<A: crate::Arch>(
             )
         },
     );
+    if let thread::Personality::Linux(linux) = &mut threads[tid].personality {
+        let status = crate::kernel::linux::do_chdir(cwd, &mut linux.cwd, &mut linux.cwd_len);
+        if status < 0 { lib::compact_panic!("ELF initial cwd failed: errno {}", status); }
+    }
     tid
 }
 
@@ -1591,7 +1596,7 @@ fn present_desktop<A: crate::Arch>(
     // task: its retained surface is composed above the stack while the active
     // endpoint remains the only live producer, drawn in the corner.
     windows.sync_task_switcher(
-        crate::kernel::gui::EndpointId(crate::kernel::focus::focused() as u32),
+        threads[crate::kernel::focus::focused()].window_endpoint(),
         canvas_width,
         canvas_height,
     );
@@ -1606,6 +1611,10 @@ fn present_desktop<A: crate::Arch>(
     osd_sample.finish(machine, crate::kernel::osd_profile::Stage::Osd, 0);
     let resolve = |endpoint: crate::kernel::gui::EndpointId,
                    key: crate::kernel::gui::SurfaceKey| {
+        if endpoint == crate::kernel::linux::CONSOLE_ENDPOINT {
+            return (key == crate::kernel::gui::SurfaceKey(1))
+                .then(crate::kernel::term::surface_buffer).flatten();
+        }
         threads
             .get(endpoint.0 as usize)?
             .personality
@@ -1667,7 +1676,7 @@ fn event_loop<A: crate::Arch>(
     // A missing display means the initial DOS window holds the fullscreen
     // direct-scanout lease; otherwise the compositor starts on the desktop.
     let initial_window = crate::kernel::gui::WindowManager::primary_window(
-        crate::kernel::gui::EndpointId(first_tid as u32),
+        threads[first_tid].window_endpoint(),
     );
     let initial_presentation = if display.is_some() {
         crate::kernel::gui::Presentation::Desktop
@@ -1823,9 +1832,10 @@ fn event_loop<A: crate::Arch>(
             }
             stats.mark(machine, PROFILE_AUDIO);
             if elapsed_ns != 0
+                && thread.has_primary_window()
                 && let Some(display) = display.as_mut()
             {
-                let endpoint = crate::kernel::gui::EndpointId(thread.kernel.tid as u32);
+                let endpoint = thread.window_endpoint();
                 thread.personality.render(
                     machine,
                     &mut *bios_workspace,
@@ -1902,7 +1912,8 @@ fn event_loop<A: crate::Arch>(
             if let Some(tid) = crate::kernel::osd::take_window_request() {
                 windows.finish_task_switcher();
                 let window = crate::kernel::gui::WindowManager::primary_window(
-                    crate::kernel::gui::EndpointId(tid as u32),
+                    crate::kernel::osd::window_endpoint_for_tid(tid)
+                        .unwrap_or(crate::kernel::gui::EndpointId(tid as u32)),
                 );
                 windows.select_window(window);
                 crate::kernel::osd::finish_presentation_change();
@@ -1919,7 +1930,7 @@ fn event_loop<A: crate::Arch>(
             }
             if crate::kernel::osd::take_presentation_request() {
                 let window = crate::kernel::gui::WindowManager::primary_window(
-                    crate::kernel::gui::EndpointId(ctx.tid as u32),
+                    thread.window_endpoint(),
                 );
                 windows.toggle_presentation(window);
                 crate::kernel::osd::finish_presentation_change();
@@ -2050,7 +2061,10 @@ fn event_loop<A: crate::Arch>(
         }
         stats.post_run(machine, &kevent, &ctx.regs);
         let event_dispatch = event_sample.returned(machine, &kevent, &ctx.regs, &thread.personality);
+        let had_window = thread.has_primary_window();
         let action = dispatch(machine, &mut *bios_workspace, thread, &mut ctx.regs, kevent);
+        let hide_window = had_window && !thread.has_primary_window();
+        let old_endpoint = thread.window_endpoint();
         event_dispatch.finish(machine);
         stats.after_dispatch(machine);
 
@@ -2081,8 +2095,14 @@ fn event_loop<A: crate::Arch>(
             &mut sb_handoff,
             &mut display,
         );
-        if exiting {
-            windows.remove_endpoint(crate::kernel::gui::EndpointId(ctx.tid as u32));
+        if hide_window {
+            // Keep launch presentation policy for the child to inherit,
+            // while removing the helper's actual scene nodes and surfaces.
+            windows.desktop_mut().remove_endpoint(old_endpoint);
+        }
+        if exiting && (old_endpoint != crate::kernel::linux::CONSOLE_ENDPOINT
+            || crate::kernel::linux::console_foreground(threads).is_none()) {
+            windows.remove_endpoint(old_endpoint);
         }
         match verdict {
             crate::kernel::sched::Verdict::Stay => {}
@@ -2100,7 +2120,8 @@ fn event_loop<A: crate::Arch>(
                 );
             }
             crate::kernel::sched::Verdict::ContinueAs(next) => {
-                if let thread::Personality::Dos(parent) = &threads[ctx.tid].personality {
+                if threads[ctx.tid].has_primary_window()
+                    && let thread::Personality::Dos(parent) = &threads[ctx.tid].personality {
                     crate::kernel::dos::attach_retained_surface(
                         parent,
                         windows.desktop_mut(),
@@ -2108,10 +2129,10 @@ fn event_loop<A: crate::Arch>(
                     );
                 }
                 let old_window = crate::kernel::gui::WindowManager::primary_window(
-                    crate::kernel::gui::EndpointId(ctx.tid as u32),
+                    threads[ctx.tid].window_endpoint(),
                 );
                 let new_window = crate::kernel::gui::WindowManager::primary_window(
-                    crate::kernel::gui::EndpointId(next as u32),
+                    threads[next].window_endpoint(),
                 );
                 windows.inherit_mode(old_window, new_window);
                 ctx.continue_as(threads, machine, next);
@@ -2470,7 +2491,7 @@ fn switch_focus_and_run<A: crate::Arch>(
             *sb_handoff = card;
         }
         let new = thread::get_thread(threads, new_tid).expect("focus handoff: new owner");
-        select_window_for_tid(windows, new_tid);
+        select_window_for_thread(windows, new);
         if crate::kernel::osd::is_open()
             || windows.uses_desktop()
             || matches!(
@@ -2502,7 +2523,7 @@ fn switch_focus_and_run<A: crate::Arch>(
         let transfer = exiting_display.take();
         ctx.switch_to(threads, machine, new_tid);
         let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-        select_window_for_tid(windows, new_tid);
+        select_window_for_thread(windows, new);
         match transfer {
             Some(crate::kernel::display::ExitDisplay::DosReplace(returned)) => {
                 let thread::Personality::Dos(dos) = &mut new.personality else {
@@ -2559,7 +2580,7 @@ fn switch_focus_and_run<A: crate::Arch>(
     };
     ctx.switch_to(threads, machine, new_tid);
     let new = thread::get_thread(threads, new_tid).expect("switch: invalid new thread");
-    select_window_for_tid(windows, new_tid);
+    select_window_for_thread(windows, new);
     match transfer {
         Some(crate::kernel::display::ExitDisplay::Restore(handoff)) => {
             if crate::kernel::osd::is_open()
@@ -2604,10 +2625,11 @@ fn switch_focus_and_run<A: crate::Arch>(
     *sb_handoff = new.personality.adopt_sb(machine, sb_handoff.take());
 }
 
-fn select_window_for_tid(windows: &mut crate::kernel::gui::WindowManager, tid: usize) {
-    let window = crate::kernel::gui::WindowManager::primary_window(
-        crate::kernel::gui::EndpointId(tid as u32),
-    );
+fn select_window_for_thread<A: crate::Arch>(windows: &mut crate::kernel::gui::WindowManager, thread: &thread::Thread<A>) {
+    if matches!(thread.personality, thread::Personality::Linux(_)) {
+        crate::kernel::linux::foreground_console(thread.kernel.tid as usize);
+    }
+    let window = crate::kernel::gui::WindowManager::primary_window(thread.window_endpoint());
     windows.select_window(window);
 }
 
@@ -2968,11 +2990,9 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     let child = thread::get_thread(threads, child_tid).unwrap();
 
     match &mut child.personality {
-        thread::Personality::Linux(lin) => {
-            // Inherit cwd from parent. (DOS path seeds DfsState inside
-            // init_process_thread_vm86; Linux child stores cwd in LinuxState.)
-            lin.cwd[..parent_cwd_len].copy_from_slice(&parent_cwd_buf[..parent_cwd_len]);
-            lin.cwd_len = parent_cwd_len;
+        thread::Personality::Linux(_) => {
+            // init_thread already translated the inherited cwd into Linux's
+            // VFS namespace. Only connect the child's terminal descriptors.
             let cpipe = thread::console_pipe();
             child.kernel.fds[0] = thread::FdKind::PipeRead(cpipe);
             child.kernel.fds[1] = thread::FdKind::ConsoleOut;

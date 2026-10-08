@@ -89,11 +89,18 @@ pub fn load_elf<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usi
     max_vaddr = (max_vaddr + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
 
     let (phoff, phentsize, phnum) = elf.ph_table_info();
+    let phdr_vaddr = elf.segments().find_map(|seg| {
+        let bytes = seg.data?;
+        let file_offset = bytes.as_ptr() as usize - elf_data.as_ptr() as usize;
+        if phoff >= file_offset && phoff + phentsize * phnum <= file_offset + bytes.len() {
+            Some(load_bias + seg.vaddr + phoff - file_offset)
+        } else { None }
+    }).unwrap_or(0);
     Ok(LoadedElf {
         entry: elf.entry() + load_bias as u64,
         class: elf.class(),
         max_vaddr,
-        phdr_vaddr: load_bias + phoff,
+        phdr_vaddr,
         phentsize,
         phnum,
     })
