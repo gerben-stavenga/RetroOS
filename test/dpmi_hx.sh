@@ -30,9 +30,20 @@ timeout 40 "$HOST_BIN" --cmd "TESTS/DPMI.EXE -r" bazel-bin/image.bin \
 fail() { echo "FAIL: $1"; echo "----- last 30 log lines -----"; tail -30 "$LOG"; exit 1; }
 
 grep -qiE "KERNEL PANIC|panicked|SEGV|Segmentation" "$LOG" && fail "kernel/DPMI crash during probe"
-grep -qi "DPMI v0.90 host found"  "$LOG" || fail "DPMI 0.90 host not detected (dump missing)"
-grep -qi "raw jump to real-mode"  "$LOG" || fail "raw real<->protected mode-switch entries not reported"
-grep -qi "GDTR:"                  "$LOG" || fail "descriptor-table state (GDTR/IDTR/LDTR) not reported"
+# The shared hosted debug stream can interrupt DOS text between INT 21h
+# writes. Remove only the informational clock-start line from content checks;
+# crash checks above and failure diagnostics retain the complete raw log.
+python3 - "$LOG" "$LOG.probe" <<'PYTHON'
+from pathlib import Path
+import re
+import sys
+text = Path(sys.argv[1]).read_text(errors="replace")
+text = re.sub(r"CLOCK: first event-loop clock sample \([^\r\n]*\)\r?\n", "", text)
+Path(sys.argv[2]).write_text(text)
+PYTHON
+grep -qi "DPMI v0.90 host found"  "$LOG.probe" || fail "DPMI 0.90 host not detected (dump missing)"
+grep -qi "raw jump to real-mode"  "$LOG.probe" || fail "raw real<->protected mode-switch entries not reported"
+grep -qi "GDTR:"                  "$LOG.probe" || fail "descriptor-table state (GDTR/IDTR/LDTR) not reported"
 grep -q  "All commands done"      "$LOG" || fail "DPMI.EXE did not run to completion"
 
 echo "PASS: HX DPMI probe completed; DPMI 0.90 host reported full state, no crash"

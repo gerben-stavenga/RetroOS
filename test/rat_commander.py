@@ -23,8 +23,8 @@ def main():
         work = root / "work"
         (work / "child").mkdir(parents=True)
         (work / "note.txt").write_text("Original text\n")
-        with (root / "guest.log").open("wb") as log:
-            process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=log, stderr=log)
+        with (root / "guest.log").open("wb") as log, (root / "terminal.log").open("wb") as terminal:
+            process = subprocess.Popen([str(ROOT / "bazel-bin/kernel/retroos-host-kvm"), "--host", directory, "--cmd", "/bin/rc", "--cwd", "/work"], stdin=subprocess.PIPE, stdout=terminal, stderr=log)
             def send(keys, delay=0.8):
                 time.sleep(delay)
                 if process.poll() is not None:
@@ -43,10 +43,13 @@ def main():
                 artifacts = ROOT / "build/ci"
                 artifacts.mkdir(parents=True, exist_ok=True)
                 (artifacts / "rat-commander.log").write_text(output)
+                shutil.copyfile(root / "terminal.log", artifacts / "rat-commander-terminal.log")
                 raise AssertionError(f"Timed out waiting for {description}:\n{terminal_text()[-6000:]}")
 
             def terminal_text():
-                output = (root / "guest.log").read_text(errors="replace")
+                # The hosted runner sends the terminal to stdout and KLOG to
+                # stderr. Feeding KLOG diagnostics into the VT model corrupts it.
+                output = (root / "terminal.log").read_text(errors="replace")
                 # Cursor-based redraws omit cells that are already correct.
                 # Reconstruct the screen instead of stripping escape sequences.
                 screen = pyte.Screen(80, 25)
@@ -64,8 +67,12 @@ def main():
                 send(b"\x1b[F\x1b[15~")  # End, F5
                 send(b"/work/copied.txt\r")
                 wait_for("completed copy", lambda: (work / "copied.txt").exists() and (work / "copied.txt").read_text() == "Original text\n")
+                # TaskDone reloads the panels and focuses the copied file after
+                # the bytes are written. Wait for that visible refresh first.
+                wait_for("copy panel refresh", lambda: "copied.txt" in terminal_text().splitlines()[21][:40])
                 # Edit note.txt. Period and Enter must insert.
                 send(b"\x1b[F")  # End: select note.txt after the copy refresh.
+                wait_for("note.txt selection", lambda: "note.txt" in terminal_text().splitlines()[21][:40])
                 send(b"\x1bOS")  # F4
                 wait_for("editor contents", lambda: "Original text" in terminal_text())
                 send(b"\x1b[H.x\r", 1.5)
@@ -82,7 +89,7 @@ def main():
                 if process.poll() is None:
                     process.terminate()
                     process.wait(timeout=3)
-        output = (root / "guest.log").read_text(errors="replace")
+        output = (root / "guest.log").read_text(errors="replace") + (root / "terminal.log").read_text(errors="replace")
         if process.returncode or any(s in output for s in ("SEGV", "PANIC", "panicked", "fatal Exception")):
             raise AssertionError(output[-6000:])
         assert "RC DOS CHILD PASS" in output, output[-6000:]
