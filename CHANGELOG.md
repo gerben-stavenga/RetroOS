@@ -5,14 +5,6 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
-### CI
-
-- RC integration waits for directory changes and selections to finish before
-  sending the next key, preventing navigation races in the test harness.
-
-- CI retries retain integration logs per attempt and can replace rebuilt
-  release artifacts.
-
 ## [0.8.0] - 2026-10-08
 
 This is the first numbered RetroOS release. It records the current DOS-focused
@@ -43,6 +35,8 @@ Earlier downloads used the moving `retroos` tag.
 - The GRUB base image has room for RC; the small diagnostic download omits RC.
 - Separate CI checks for lint/unit tests, personality and hardware integration,
   and release packaging. Numbered releases publish only after those checks pass.
+- CI retries retain integration logs per attempt and support rebuilt artifacts.
+- RC integration checks wait for directory changes and selections to finish.
 
 ### Downloads and upgrades
 
