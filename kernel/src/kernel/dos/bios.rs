@@ -550,9 +550,6 @@ enum Parked {
     No,
 }
 
-/// BDA 40:96 bit 1 — "the last scancode was E0". The BIOS's own scratch bit
-/// between the prefix byte's INT 09 and the next one's.
-const KB3_LAST_E0: u8 = 0x02;
 /// BDA 40:96 bit 4 — an enhanced (101/102-key) keyboard is installed. A real
 /// POST sets it; software reads it to decide between the conventional
 /// (AH=00/01) and enhanced (AH=10/11) INT 16h calls.
@@ -641,10 +638,6 @@ fn int16<A: crate::Arch>(machine: &mut A, regs: &mut Regs, stub_ip: u16) -> Park
 // INT 09h: keyboard IRQ1
 // ============================================================================
 
-/// Scancode→ASCII, lower/upper case (set 1, keys 0..0x39).
-const KB_LC: [u8; 58] = *b"\x00\x1b1234567890-=\x08\tqwertyuiop[]\x0d\x00asdfghjkl;'`\x00\\zxcvbnm,./\x00*\x00 ";
-const KB_UC: [u8; 58] = *b"\x00\x1b!@#$%^&*()_+\x08\tQWERTYUIOP{}\x0d\x00ASDFGHJKL:\"~\x00|ZXCVBNM<>?\x00*\x00 ";
-
 /// The kernel raises IRQ1 with a scancode readable at port 0x60 (the
 /// virtual 8042 on interp, the real one on metal). Translate to ASCII,
 /// track shift/ctrl/alt in the BDA flag byte, push (scancode:ascii) into the
@@ -709,74 +702,40 @@ fn finish_int09<A: crate::Arch>(
         emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
         return;
     }
-    // The E0 prefix arrives as its own byte with its own IRQ1 (real 8042, and
-    // `vkbd` queues it the same way). It is not a keystroke — latch it in the
-    // BDA flag that exists for exactly this and wait for the code it prefixes.
-    let flags3: u8 = bda_field!(machine, kb_flags3);
-    if sc == 0xE0 {
-        bda_field!(machine, kb_flags3 = flags3 | KB3_LAST_E0);
-        emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
+    let event = dos.bios_keyboard.feed(lib::keyboard::current(),sc);
+    let keyboard = &dos.bios_keyboard;
+    let flags = u8::from(keyboard.down(0x36,false))
+        | (u8::from(keyboard.down(0x2a,false)) << 1)
+        | (u8::from(keyboard.ctrl()) << 2) | (u8::from(keyboard.alt()) << 3)
+        | (u8::from(keyboard.scroll) << 4) | (u8::from(keyboard.num) << 5)
+        | (u8::from(keyboard.caps) << 6);
+    bda_field!(machine, kb_flags = flags);
+    // Enhanced keyboard flags: retain the installed bit, expose right modifiers.
+    let flags3: u8 = bda_field!(machine,kb_flags3);
+    bda_field!(machine,kb_flags3 = (flags3 & !0x0c)
+        | (u8::from(keyboard.down(0x1d,true)) << 2)
+        | (u8::from(keyboard.down(0x38,true)) << 3));
+    if !event.pressed || matches!(event.scan,0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46)
+        || (event.dead && event.length == 0) {
+        emulate_outb(machine,&mut dos.pc,regs,0x20,0x20);
         return;
     }
-    let e0 = flags3 & KB3_LAST_E0 != 0;
-    if e0 {
-        bda_field!(machine, kb_flags3 = flags3 & !KB3_LAST_E0);
-    }
-    let key = sc & 0x7F;
-    let mut flags: u8 = bda_field!(machine, kb_flags);
-
-    // Shift / Ctrl / Alt are modifiers: update the BDA flag byte, don't
-    // enqueue. These are the conventional INT 16h AH=02h flag bits.
-    let modifier_bit = match key {
-        0x2A => Some(0x02u8), // left shift
-        0x36 => Some(0x01),   // right shift
-        0x1D => Some(0x04),   // ctrl
-        0x38 => Some(0x08),   // alt (left Alt, or E0-prefixed right Alt)
-        _ => None,
-    };
-    if let Some(bit) = modifier_bit {
-        flags = if sc & 0x80 != 0 { flags & !bit } else { flags | bit };
-        bda_field!(machine, kb_flags = flags);
-        emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
-        return;
-    }
-    if sc & 0x80 != 0 {
-        emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20); // other key releases
-        return;
-    }
-
-    let mut asc = 0u8;
-    if (key as usize) < KB_LC.len() {
-        let tab = if flags & 0x03 != 0 { &KB_UC } else { &KB_LC };
-        asc = tab[key as usize];
-        if flags & 0x04 != 0 && (asc | 0x20).is_ascii_lowercase() {
-            asc &= 0x1F; // Ctrl-letter
+    let alt_shortcut = keyboard.alt() && !keyboard.altgr();
+    for index in 0..event.length.max(1) {
+        let asc = if event.length == 0 { 0 } else {
+            let character = if event.text[index] == '\n' { '\r' } else { event.text[index] };
+            crate::kernel::keyboard::oem_character(character)
+        };
+        let word = if alt_shortcut { alt_key_word(event.scan,event.extended) }
+            else if event.extended { enhanced_key_word(event.scan) }
+            else { (u16::from(event.scan) << 8) | u16::from(asc) };
+        let tail: u16 = bda_field!(machine,kb_tail);
+        let next = if tail + 2 >= KB_RING_END { KB_RING_FIRST } else { tail + 2 };
+        let head: u16 = bda_field!(machine,kb_head);
+        if next != head {
+            machine.write::<u16>(Bda::BASE + tail as usize,word);
+            bda_field!(machine,kb_tail = next);
         }
-    }
-
-    // The buffer word. An E0-prefixed key is an *enhanced* keystroke: the gray
-    // duplicates report AL=0xE0 in place of an ASCII code (that marker is how
-    // software tells the gray cursor block from the keypad keys that share its
-    // scancodes), and the two gray keys that do have an ASCII code — Enter and
-    // `/` — put the 0xE0 in the scancode slot instead. `int16` folds all of
-    // this back for the conventional AH=00/01 reads.
-    let word = if flags & 0x08 != 0 {
-        alt_key_word(key, e0)
-    } else if e0 {
-        enhanced_key_word(key)
-    } else {
-        ((key as u16) << 8) | asc as u16
-    };
-    let tail: u16 = bda_field!(machine, kb_tail);
-    let mut next = tail + 2;
-    if next >= KB_RING_END {
-        next = KB_RING_FIRST;
-    }
-    let head: u16 = bda_field!(machine, kb_head);
-    if next != head {
-        // ring not full
-        machine.write::<u16>(Bda::BASE + tail as usize, word);
-        bda_field!(machine, kb_tail = next);
     }
     emulate_outb(machine, &mut dos.pc, regs, 0x20, 0x20);
 }

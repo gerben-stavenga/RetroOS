@@ -1,21 +1,5 @@
-//! Single-byte NLS services for the personality's US country settings.
+//! Single-byte NLS services backed by shared regional profiles.
 use super::*;
-
-fn country_info(page: u16) -> [u8; 44] {
-    // OS/2 COUNTRYINFO is packed: its character arrays must not introduce
-    // Rust/C alignment padding before the later USHORT fields.
-    let mut info = [0; 44];
-    info[..4].copy_from_slice(&1u32.to_le_bytes());
-    info[4..8].copy_from_slice(&u32::from(page).to_le_bytes());
-    info[12] = b'$';
-    info[17] = b',';
-    info[19] = b'.';
-    info[21] = b'/';
-    info[23] = b':';
-    info[26] = 2;
-    info[32] = b',';
-    info
-}
 
 pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, regs: &Regs, api: Api) -> u32 {
     let length = arg32(machine, regs, 0) as usize;
@@ -23,7 +7,9 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, regs: &Regs, api: Api) -
     let buffer = arg32(machine, regs, 2) as usize;
     if country == 0 || (length != 0 && buffer == 0) { return ERROR_INVALID_PARAMETER; }
     let country_id = machine.read::<u32>(country);
-    if country_id != 0 && country_id != 1 { return 398; } // ERROR_NLS_NO_CTRY_CODE
+    let profile = if country_id == 0 { Some(lib::locale::current()) }
+        else { u16::try_from(country_id).ok().and_then(lib::locale::by_country) };
+    let Some(profile) = profile else { return 398; }; // ERROR_NLS_NO_CTRY_CODE
     let page = machine.read::<u32>(country + 4);
     let page = if page == 0 { u32::from(lib::codepage::current_codepage().id) } else { page };
     let Some(page) = u16::try_from(page).ok().and_then(lib::codepage::codepage) else {
@@ -44,7 +30,7 @@ pub(super) fn dispatch<A: crate::Arch>(machine: &mut A, regs: &Regs, api: Api) -
             let size = if api == Api::DosQueryCtryInfo { 44 } else { 256 };
             let copied = length.min(size);
             if api == Api::DosQueryCtryInfo {
-                machine.copy_to(buffer, &country_info(page.id)[..copied]);
+                machine.copy_to(buffer, &crate::kernel::locale::os2_country(profile, page.id)[..copied]);
             } else {
                 // A case-insensitive OEM ordering: equivalent upper/lower
                 // characters share a weight, as they do in DOS file lookup.

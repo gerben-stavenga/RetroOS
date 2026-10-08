@@ -28,7 +28,20 @@ unsafe extern "C" {
     fn poll(ptr: *mut u8, count: usize, timeout: i32) -> i32;
 }
 fn main() {
-    assert_eq!(std::env::var("LANG").unwrap(), "C.UTF-8");
+    let mode = std::env::args().nth(1);
+    if mode.as_deref() == Some("--environment-child") {
+        assert_eq!(std::env::var("LANG").unwrap(), "it_IT.UTF-8");
+        assert_eq!(std::env::var("LC_ALL").unwrap(), "de_DE.UTF-8");
+        assert_eq!(std::env::vars().count(), 2);
+        println!("LINUX ENVIRONMENT PASS");
+        return;
+    }
+    if mode.as_deref() == Some("--empty-environment-child") {
+        assert_eq!(std::env::vars().count(), 0);
+        return;
+    }
+    let expected_locale = std::env::args().nth(1).unwrap_or_else(|| "en_US.UTF-8".into());
+    assert_eq!(std::env::var("LANG").unwrap(), expected_locale);
     unsafe {
         assert!(!setlocale(0, c"".as_ptr()).is_null()); // LC_CTYPE from the environment.
         let mut scalar = 0;
@@ -155,6 +168,13 @@ fn main() {
     }
     // Rust's pre_exec launch uses fork + SOCK_SEQPACKET and CLOEXEC EOF.
     use std::os::unix::process::CommandExt;
+    for mode in ["--environment-child", "--empty-environment-child"] {
+        let mut child = std::process::Command::new("/proc/self/exe");
+        child.arg(mode).env_clear();
+        if mode == "--environment-child" { child.env("LANG", "it_IT.UTF-8").env("LC_ALL", "de_DE.UTF-8"); }
+        unsafe { child.pre_exec(|| Ok(())); }
+        assert!(child.status().unwrap().success());
+    }
     let mut command = std::process::Command::new("/TEST.COM");
     command.arg("hello world");
     unsafe {

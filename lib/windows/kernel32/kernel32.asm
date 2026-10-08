@@ -51,3 +51,14 @@ gate WriteConsoleA
 gate WriteFile
 gate lstrcpyW
 gate lstrlenW
+gate GetLocaleInfoA
+gate GetLocaleInfoW
+gate GetThreadLocale
+gate GetUserDefaultLCID
+gate GetSystemDefaultLCID
+gate GetUserDefaultLangID
+gate GetSystemDefaultLangID
+gate ReadConsoleInputW
+gate PeekConsoleInputW
+gate ReadConsoleW
+gate SetConsoleCP

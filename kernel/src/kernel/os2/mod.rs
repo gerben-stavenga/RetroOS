@@ -125,6 +125,7 @@ pub struct Os2State {
     video: extra::Video,
     keys: Vec<(u8, u8, u16, u32)>,
     key_press_times: [u32; 128],
+    keyboard: lib::keyboard::State,
     kbd_mask: u16,
     dll_init: Vec<(u32, u32)>,
     dll_saved: Option<Regs>,
@@ -171,6 +172,7 @@ impl Os2State {
             video: extra::Video::new(),
             keys: Vec::new(),
             key_press_times: [0; 128],
+            keyboard: lib::keyboard::State::new(),
             kbd_mask: 0x0006,
             dll_init: Vec::new(),
             dll_saved: None,
@@ -249,20 +251,24 @@ impl Os2State {
 
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8, milliseconds: u32) {
         let scan = scancode & 0x7f;
-        let held = crate::kernel::keyboard::key_down(scan);
-        if !crate::kernel::keyboard::update_key_state(scancode) { return; }
+        let held = self.keyboard.down(scan,false) || self.keyboard.down(scan,true);
+        if !crate::kernel::keyboard::update_console(&mut self.keyboard,scancode) { return; }
         if matches!(scancode & 0x7f, 0x1d | 0x2a | 0x36 | 0x38 | 0x3a | 0x45 | 0x46) {return;}
         let shift = extra::shift_state();
-        let c = if shift & 8 != 0 { 0 }
-            else if scancode & 0x7f == 0x1c { b'\r' }
-            else { crate::kernel::keyboard::scancode_to_ascii(scancode) };
-        // Typematic events retain the original press time; Peek and CharIn
-        // must also return the same timestamp for a queued event.
+        let event = crate::kernel::keyboard::event();
+        if event.dead && event.length == 0 { return; }
+        // Typematic events retain the original press time for KbdCharIn.
         if !held { self.key_press_times[scan as usize] = milliseconds; }
-        self.keys.push((c, scan, shift, self.key_press_times[scan as usize]));
-        if c == 0 { return; }
-        if let thread::FdKind::PipeRead(idx) = fds[0] {
-            crate::kernel::kpipe::write(idx, &[c]);
+        let count = event.length.max(1);
+        for index in 0..count {
+            let c = if event.length == 0 || (self.keyboard.down(0x38,false) && !self.keyboard.altgr()) { 0 } else {
+                let character = if event.text[index] == '\n' { '\r' } else { event.text[index] };
+                crate::kernel::keyboard::oem_character(character)
+            };
+            self.keys.push((c, scan, shift, self.key_press_times[scan as usize]));
+            if c != 0 && let thread::FdKind::PipeRead(idx) = fds[0] {
+                crate::kernel::kpipe::write(idx, &[c]);
+            }
         }
     }
 

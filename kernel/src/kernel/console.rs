@@ -97,12 +97,13 @@ fn dispatch_dos<A: crate::Arch>(
         if let crate::Irq::Key(sc) = evt {
             if blocked {
                 if crate::kernel::keyboard::update_key_state(sc) {
-                    let c = crate::kernel::keyboard::scancode_to_ascii(sc);
-                    if c != 0 {
-                        crate::term::putchar(c);
+                    for &character in crate::kernel::keyboard::event().characters() {
+                        let mut bytes = [0;4];
+                        let text = character.encode_utf8(&mut bytes);
+                        for &byte in text.as_bytes() { lib::term::put_utf8(byte); }
                         crate::kernel::term::mark_dirty();
                         let cpipe = thread::console_pipe();
-                        crate::kernel::kpipe::write(cpipe, &[c]);
+                        crate::kernel::kpipe::write(cpipe,text.as_bytes());
                     }
                 }
             } else {

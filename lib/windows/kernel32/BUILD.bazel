@@ -27,6 +27,18 @@ windows_dll(
         "UnhandledExceptionFilter", "VirtualAlloc", "VirtualFree",
         "VirtualQuery", "WideCharToMultiByte", "WriteConsoleA", "WriteFile",
         "lstrcpyW", "lstrlenW",
+        "GetLocaleInfoA",
+        "GetLocaleInfoW",
+        "GetThreadLocale",
+        "GetUserDefaultLCID",
+        "GetSystemDefaultLCID",
+        "GetUserDefaultLangID",
+        "GetSystemDefaultLangID",
+        "ReadConsoleInputW",
+        "PeekConsoleInputW",
+        "ReadConsoleW",
+        "SetConsoleCP",
+
     ],
     visibility = ["//visibility:public"],
 )

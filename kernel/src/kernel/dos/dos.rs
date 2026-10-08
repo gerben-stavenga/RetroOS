@@ -1876,19 +1876,19 @@ fn int_21h<A: crate::Arch>(
         // DOS 2.x uses a 32-byte buffer; DOS 3.0+ extended it to 34 bytes.
         // Many programs (including NC 2.0) allocate only 32 bytes, so write
         // field-by-field rather than blindly zeroing 34 bytes.
-        0x38 => {
+        0x38 => 'country: {
+            if regs.rdx as u16 == 0xffff { break 'country DosExit::Error(1); } // Setting a country is not implemented.
+            let country = match regs.rax as u8 { 0xff => regs.rbx as u16, n => u16::from(n) };
+            let profile = if country == 0 { Some(lib::locale::current()) } else { lib::locale::by_country(country) };
+            let Some(profile) = profile else { break 'country DosExit::Error(2); };
             let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
-            machine.zero(addr, 24); // zero first 24 bytes (through case-map)
-            // +00: date format (0 = USA: mm/dd/yy)
-            machine.write::<u8>(addr + 2, b'$');     // +02: currency symbol '$\0\0\0\0'
-            machine.write::<u8>(addr + 7, b',');     // +07: thousands separator ',\0'
-            machine.write::<u8>(addr + 9, b'.');     // +09: decimal separator '.\0'
-            machine.write::<u8>(addr + 0x0B, b'/');  // +0B: date separator '/\0'
-            machine.write::<u8>(addr + 0x0D, b':');  // +0D: time separator ':\0'
+            let data = crate::kernel::locale::dos_country(profile, lib::codepage::current_codepage().id);
+            machine.copy_to(addr, &data);
             // DOS programs call the far pointer at +12h to uppercase a byte
             // in AL. A zero pointer makes callers jump into the IVT.
             machine.write::<u32>(addr + 0x12, ctrl_slot_off(SLOT_COUNTRY_UPCASE) as u32);
-            regs.rbx = (regs.rbx & !0xFFFF) | 1; // country code = 1 (USA)
+            regs.rbx = (regs.rbx & !0xFFFF) | u64::from(profile.country);
+            regs.rax = (regs.rax & !0xFFFF) | u64::from(profile.country);
             DosExit::Ok
         }
         // AH=0x39: Create directory (DS:DX=ASCIIZ path)
@@ -2833,7 +2833,7 @@ fn int_21h<A: crate::Arch>(
         0x66 => match regs.rax as u8 {
             0x01 => {
                 regs.rbx = (regs.rbx & !0xffff) | u64::from(lib::codepage::current_codepage().id);
-                regs.rdx = (regs.rdx & !0xffff) | 437; // boot/system page
+                regs.rdx = (regs.rdx & !0xffff) | u64::from(lib::locale::system_oem());
                 DosExit::Ok
             }
             0x02 => {

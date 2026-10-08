@@ -139,8 +139,36 @@ Startup settings live in `C:\CONFIG\CONFIG.SYS`. Change
 to choose what starts at boot. The program restarts when it exits. `--cmd` and
 `TEST=` override it for tests. Migrate an existing disk with
 `python3 tools/migrate_dn_state.py --image build/data.bin` while it is offline.
-Set `CODEPAGE=437`, `850`, `852`, or `866` there to select DOS text and filename
-encoding at boot. The default is 437; `CHCP` can change it during a session.
+`LOCALE=`, `KEYBOARD=` and `CODEPAGE=` are RetroOS configuration directives,
+not guest environment variables. `LOCALE=` selects shared regional settings
+for DOS, Windows, OS/2 and Linux:
+
+| Locale | OEM code page | Windows ANSI | Keyboard |
+| --- | --- | --- | --- |
+| `en-US` (default) | 437 | 1252 | `us` |
+| `de-DE` | 850 | 1252 | `de` |
+| `it-IT` | 850 | 1252 | `it` |
+| `nl-NL` | 850 | 1252 | `us` |
+| `pl-PL` | 852 | 1250 | `pl` (programmer) |
+| `ru-RU` | 866 | 1251 | `ru` |
+
+For example, `LOCALE=it-IT` selects Italian country/date/number settings and
+keyboard input. `KEYBOARD=us`, `de`, `it`, `pl` or `ru` overrides the keyboard
+independently. Right Alt selects AltGr characters; German dead keys compose
+accents; Caps Lock changes letter case. Russian input switches between Cyrillic
+and Latin with Left Alt+Shift. Dutch defaults to a US keyboard.
+
+`CODEPAGE=437`, `850`, `852`, or `866` overrides the locale's OEM encoding;
+`CHCP` can change the active OEM page during a session. Neither changes the
+regional settings or Windows ANSI page. DOS and OS/2 receive OEM input bytes,
+Windows console W APIs receive UTF-16 and A APIs use the console input page,
+and Linux receives UTF-8. DOS programs that hook IRQ1 or read the keyboard
+controller directly still receive the original scancodes and own their mapping.
+
+DOS/OS/2 country structures use the ISO currency code when their OEM page
+cannot encode the Unicode symbol (for example, `EUR` on page 850).
+Linux starts with the locale's UTF-8 `LANG`; userspace libraries remain
+responsible for their own locale data and formatting.
 
 A detected Linux filesystem supplies `/`; otherwise the RAM boot image supplies
 it (or the selected FAT volume for a disk-only boot). C: appears at `/home/retroos`:
@@ -225,7 +253,8 @@ glyphs show as a square.
 
 The shared Uni-VGA 8×16 atlas contains 2,899 Unicode glyphs (about 57 KiB).
 Linux terminal cells retain Unicode scalars and render directly from the atlas;
-Linux defaults to `LANG=C.UTF-8`. Windows and OS/2 window text also looks up
+Linux defaults to `LANG=en_US.UTF-8`, selected by `LOCALE=`. Windows and OS/2
+window text also looks up
 Unicode glyphs directly; DOS VGA fonts
 are assembled from the selected OEM page's Unicode mapping. Missing glyphs
 render as `?`; CJK, emoji and text shaping are not included. The existing

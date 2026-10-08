@@ -229,7 +229,10 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
     };
     match format {
         BinaryFormat::Elf if matches!(exec_vga, ExecVga::None) => {
-            crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args)?;
+            let environment = if personality_name == Some(crate::kernel::thread::PersonalityName::Linux) {
+                Some(parent_env_data.as_slice())
+            } else { None };
+            crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args, environment)?;
             if let crate::kernel::thread::Personality::Linux(linux) = &mut threads[tid].personality {
                 // DOS launchers preserve the current drive as C:/directory;
                 // Linux needs the corresponding path in the VFS namespace.

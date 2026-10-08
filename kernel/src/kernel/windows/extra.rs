@@ -55,9 +55,11 @@ pub(super) struct Mapping {
     size: u32,
 }
 
+#[derive(Clone, Copy)]
 struct Key {
     down: bool,
-    ascii: u8,
+    character: char,
+    offset: usize,
     scan: u16,
     vk: u16,
     control: u32,
@@ -71,10 +73,10 @@ pub(super) struct Console {
     attr: u16,
     cells: Vec<u32>,
     pub(super) input_cp: u32,
+    pub(super) keyboard: lib::keyboard::State,
     pub(super) output_cp: u32,
     input: Vec<Key>,
     keys: [u8; 256],
-    extended: bool,
     pub hwnd: u32,
     /// `ReadConsoleInput` found no key. The call stays at the `int 0x83` so
     /// the next entry sees a real event instead of an empty record.
@@ -90,11 +92,11 @@ impl Console {
             cursor_y: 0,
             attr: 0x07,
             cells: Vec::new(),
+            keyboard: lib::keyboard::State::new(),
             input_cp: u32::from(lib::codepage::current_codepage().id),
             output_cp: u32::from(lib::codepage::current_codepage().id),
             input: Vec::new(),
             keys: [0; 256],
-            extended: false,
             hwnd: 0,
             hold: false,
         };
@@ -413,6 +415,9 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"GetTickCount", 0),
     spec(b"KERNEL32", b"GetTimeZoneInformation", 4),
     spec(b"KERNEL32", b"GetUserDefaultLCID", 0),
+    spec(b"KERNEL32", b"GetSystemDefaultLCID", 0),
+    spec(b"KERNEL32", b"GetUserDefaultLangID", 0),
+    spec(b"KERNEL32", b"GetSystemDefaultLangID", 0),
     spec(b"KERNEL32", b"GetVersionExA", 4),
     spec(b"KERNEL32", b"GetVolumeInformationA", 32),
     spec(b"KERNEL32", b"HeapAlloc", 12),
@@ -443,6 +448,9 @@ const SPECS: &[Spec] = &[
     spec(b"KERNEL32", b"PeekNamedPipe", 24),
     spec(b"KERNEL32", b"RaiseException", 16),
     spec(b"KERNEL32", b"ReadConsoleA", 20),
+    spec(b"KERNEL32", b"ReadConsoleW", 20),
+    spec(b"KERNEL32", b"ReadConsoleInputW", 16),
+    spec(b"KERNEL32", b"PeekConsoleInputW", 16),
     spec(b"KERNEL32", b"ReadConsoleOutputA", 20),
     spec(b"KERNEL32", b"ReleaseMutex", 4),
     spec(b"KERNEL32", b"RemoveDirectoryA", 4),
@@ -508,30 +516,26 @@ pub(super) fn take_hold(console: &mut Console) -> bool {
     held
 }
 
-pub(super) fn push_key(console: &mut Console, scancode: u8) {
-    if scancode == 0xe0 {
-        console.extended = true;
-        return;
-    }
+pub(super) fn push_key(console: &mut Console, scancode: u8, event: lib::keyboard::Event, control: u32) {
+    if matches!(scancode,0xe0 | 0xe1) { return; }
     let down = scancode & 0x80 == 0;
     let scan = u16::from(scancode & 0x7f);
-    let mut ascii = if down {
-        crate::kernel::keyboard::scancode_to_ascii(scancode)
-    } else {
-        0
-    };
-    if scan == 0x1c {
-        ascii = if down { b'\r' } else { 0 };
+    let mut vk = virtual_key(scan,0);
+    // German Z/Y exchange changes the logical virtual key as well as text.
+    if lib::keyboard::current() == lib::keyboard::Layout::De {
+        if scan == 0x15 { vk = u16::from(b'Z'); }
+        if scan == 0x2c { vk = u16::from(b'Y'); }
     }
-    let vk = virtual_key(scan, if ascii.is_ascii_control() { 0 } else { ascii });
     if vk != 0 { console.keys[vk as usize] = if down { 0x80 } else { 0 }; }
-    let control = (u32::from(console.keys[0x12] != 0) * 2)
-        | (u32::from(console.keys[0x11] != 0) * 8)
-        | (u32::from(console.keys[0x10] != 0) * 16)
-        | (u32::from(console.extended) * 256);
-    console.extended = false;
-    if console.input.len() < 64 {
-        console.input.push(Key { down, ascii, scan, vk, control });
+    console.keys[0x14] = (console.keys[0x14] & 0x80) | ((control >> 7) as u8 & 1);
+    console.keys[0x90] = (console.keys[0x90] & 0x80) | ((control >> 5) as u8 & 1);
+    console.keys[0x91] = (console.keys[0x91] & 0x80) | ((control >> 6) as u8 & 1);
+    let control = control | (u32::from(event.extended) << 8);
+    for index in 0..event.length.max(1) {
+        let character = if event.length == 0 { '\0' } else if event.text[index] == '\n' { '\r' } else { event.text[index] };
+        if console.input.len() < 64 {
+            console.input.push(Key { down, character, offset: 0, scan, vk, control });
+        }
     }
 }
 
@@ -763,6 +767,10 @@ fn virtual_key(scan: u16, ascii: u8) -> u16 {
         0x34 => 0xbe,
         0x35 => 0xbf,
         0x37 => 0x6a,
+        0x3a => 0x14,
+        0x45 => 0x90,
+        0x46 => 0x91,
+        0x56 => 0xe2,
         0x39 => 0x20,
         0x4a => 0x6d,
         0x4e => 0x6b,
@@ -820,8 +828,8 @@ pub(super) fn call<A: crate::Arch>(
     if name.eq_ignore_ascii_case(b"GetCurrentProcessId") {
         return (kt.tid + 1) as u32;
     }
-    if name.eq_ignore_ascii_case(b"GetUserDefaultLCID") {
-        return 0x0409;
+    if matches!(name, b"GetUserDefaultLCID" | b"GetSystemDefaultLCID" | b"GetUserDefaultLangID" | b"GetSystemDefaultLangID") {
+        return lib::locale::current().lcid;
     }
     if name.eq_ignore_ascii_case(b"GetLogicalDrives") {
         return 1 << 2;
@@ -1000,12 +1008,13 @@ pub(super) fn call<A: crate::Arch>(
         return 1;
     }
     if name.eq_ignore_ascii_case(b"PeekConsoleInputA") || name.eq_ignore_ascii_case(b"ReadConsoleInputA")
+        || name.eq_ignore_ascii_case(b"PeekConsoleInputW") || name.eq_ignore_ascii_case(b"ReadConsoleInputW")
     {
-        let consume = name.eq_ignore_ascii_case(b"ReadConsoleInputA");
-        return read_input(machine, state, arg(machine, regs, 1) as usize, arg(machine, regs, 2), arg(machine, regs, 3) as usize, consume);
+        let consume = name.eq_ignore_ascii_case(b"ReadConsoleInputA") || name.eq_ignore_ascii_case(b"ReadConsoleInputW");
+        return read_input(machine, state, arg(machine, regs, 1) as usize, arg(machine, regs, 2), arg(machine, regs, 3) as usize, consume, name.ends_with(b"W"));
     }
-    if name.eq_ignore_ascii_case(b"ReadConsoleA") {
-        return read_console_text(machine, state, arg(machine, regs, 1) as usize, arg(machine, regs, 2), arg(machine, regs, 3) as usize);
+    if name.eq_ignore_ascii_case(b"ReadConsoleA") || name.eq_ignore_ascii_case(b"ReadConsoleW") {
+        return read_console_text(machine, state, arg(machine, regs, 1) as usize, arg(machine, regs, 2), arg(machine, regs, 3) as usize, name.ends_with(b"W"));
     }
     if name.eq_ignore_ascii_case(b"WriteConsoleOutputCharacterA") {
         return write_chars(machine, state, arg(machine, regs, 1) as usize, arg(machine, regs, 2), arg(machine, regs, 3), arg(machine, regs, 4) as usize, false);
@@ -1601,62 +1610,71 @@ fn fill_cells<A: crate::Arch>(
     1
 }
 
-pub(super) fn read_input<A: crate::Arch>(
-    machine: &mut A,
-    state: &mut WindowsState,
-    buf: usize,
-    count: u32,
-    read: usize,
-    consume: bool,
-) -> u32 {
-    if consume && state.console.input.is_empty() {
-        state.console.hold = true;
-        return 0;
+fn key_units(key: &Key, wide: bool, cp: u32) -> Vec<u16> {
+    if wide {
+        let mut units = [0;2];
+        key.character.encode_utf16(&mut units).to_vec()
+    } else {
+        let mut bytes = [0;4];
+        encoding::page(cp).unwrap().encode(key.character.encode_utf8(&mut bytes),b'?').0
+            .into_iter().map(u16::from).collect()
     }
-    let n = (count as usize).min(state.console.input.len()).min(16);
-    for i in 0..n {
-        let key = &state.console.input[i];
-        let at = buf + i * 20;
-        machine.write::<u16>(at, 1);
-        machine.write::<u32>(at + 4, u32::from(key.down));
-        machine.write::<u16>(at + 8, 1);
-        machine.write::<u16>(at + 10, key.vk);
-        machine.write::<u16>(at + 12, key.scan);
-        machine.write::<u16>(at + 14, u16::from(key.ascii));
-        machine.write::<u32>(at + 16, key.control);
+}
+
+pub(super) fn read_input<A: crate::Arch>(
+    machine: &mut A, state: &mut WindowsState, buf: usize, count: u32,
+    read: usize, consume: bool, wide: bool,
+) -> u32 {
+    if consume && state.console.input.is_empty() { state.console.hold = true; return 0; }
+    let mut n = 0;
+    let mut complete = 0;
+    let mut partial = 0;
+    for key in &state.console.input {
+        let units = key_units(key,wide,state.console.input_cp);
+        for (index,&unit) in units.iter().enumerate().skip(key.offset) {
+            if n >= (count as usize).min(16) { break; }
+            let at = buf + n * 20;
+            machine.zero(at,20);
+            machine.write::<u16>(at,1);
+            machine.write::<u32>(at+4,u32::from(key.down));
+            machine.write::<u16>(at+8,1);
+            machine.write::<u16>(at+10,key.vk);
+            machine.write::<u16>(at+12,key.scan);
+            machine.write::<u16>(at+14,unit);
+            machine.write::<u32>(at+16,key.control);
+            n += 1;
+            partial = index+1;
+        }
+        if partial == units.len() { complete += 1; partial = 0; }
+        else { break; }
     }
     if consume {
-        state.console.input.drain(..n);
+        state.console.input.drain(..complete);
+        if partial != 0 && let Some(key) = state.console.input.first_mut() { key.offset = partial; }
     }
-    if read != 0 {
-        machine.write::<u32>(read, n as u32);
-    }
+    if read != 0 { machine.write::<u32>(read,n as u32); }
     1
 }
 
 fn read_console_text<A: crate::Arch>(
-    machine: &mut A,
-    state: &mut WindowsState,
-    buf: usize,
-    cap: u32,
-    read: usize,
+    machine: &mut A, state: &mut WindowsState, buf: usize, cap: u32, read: usize, wide: bool,
 ) -> u32 {
     let mut n = 0;
     while n < cap as usize {
-        let Some(pos) = state.console.input.iter().position(|key| key.down && key.ascii != 0) else {
-            break;
-        };
-        let ascii = state.console.input[pos].ascii;
+        let Some(pos) = state.console.input.iter().position(|key| key.down && key.character != '\0') else { break; };
+        let key = state.console.input[pos];
+        let units = key_units(&key,wide,state.console.input_cp);
+        let length = units.len().saturating_sub(key.offset);
+        if n + length > cap as usize { break; }
         state.console.input.remove(pos);
-        machine.write::<u8>(buf + n, ascii);
-        n += 1;
-        if ascii == b'\r' || ascii == b'\n' {
-            break;
+        for unit in &units[key.offset..] {
+            if wide { machine.write::<u16>(buf+n*2,*unit); }
+            else { machine.write::<u8>(buf+n,*unit as u8); }
+            n += 1;
         }
+        if matches!(key.character,'\r' | '\n') { break; }
     }
-    if read != 0 {
-        machine.write::<u32>(read, n as u32);
-    }
+    if read != 0 { machine.write::<u32>(read,n as u32); }
     1
 }
 
@@ -1948,16 +1966,21 @@ mod environment_tests {
 
 #[cfg(test)]
 mod keyboard_tests {
-    use super::{Console, push_key, virtual_key};
+    use super::{Console, virtual_key};
 
     #[test]
     fn console_period_is_not_a_delete_or_backspace_event() {
         let mut console = Console::new();
+        let mut keyboard = lib::keyboard::State::new();
+        let mut push_key = |console: &mut Console, byte| {
+            let event = keyboard.feed(lib::keyboard::Layout::Us,byte);
+            super::push_key(console,byte,event,0);
+        };
         push_key(&mut console, 0x34);
         push_key(&mut console, 0xb4);
         assert_eq!(console.input.len(), 2);
         assert!(console.input[0].down);
-        assert_eq!(console.input[0].ascii, b'.');
+        assert_eq!(console.input[0].character, '.');
         assert_eq!(console.input[0].vk, 0xbe);
         assert!(!console.input[1].down);
         assert_eq!(console.input[1].vk, 0xbe);
@@ -1965,7 +1988,7 @@ mod keyboard_tests {
         push_key(&mut console, 0x0e);
         push_key(&mut console, 0xe0);
         push_key(&mut console, 0x53);
-        assert_eq!(console.input[2].ascii, 8);
+        assert_eq!(console.input[2].character, '\x08');
         assert_eq!(console.input[2].vk, 8);
         assert_eq!(console.input[3].vk, 0x2e);
         assert_ne!(console.input[3].control & 256, 0);
@@ -2082,65 +2105,79 @@ fn map_string<A: crate::Arch>(machine: &mut A, regs: &Regs, wide: bool) -> u32 {
     value.len() as u32
 }
 
-fn locale_value(kind: u32) -> Option<&'static [u8]> {
-    // US English matches GetUserDefaultLCID and the personality's UTC clock.
+fn locale_value(profile: &lib::locale::Locale, kind: u32) -> Option<Vec<u8>> {
+    let numeric = match kind {
+        0x0001 | 0x0009 => return Some(alloc::format!("{:04x}", profile.lcid).into_bytes()),
+        0x0005 | 0x000a => Some(u32::from(profile.country)),
+        0x000b => Some(u32::from(if profile.lcid == lib::locale::current().lcid { lib::locale::system_oem() } else { profile.oem })),
+        0x000d => Some(u32::from(profile.country == 1)),
+        0x0011 | 0x0019 => Some(2),
+        0x0012 | 0x0024 => Some(1),
+        0x001b => Some(u32::from(profile.currency_format)),
+        0x001c => Some(u32::from(profile.negative_currency)),
+        0x0021 | 0x0022 => Some(u32::from(profile.date_order)),
+        0x0023 => Some(u32::from(profile.time24)),
+        0x0025 => Some(u32::from(profile.time_format.starts_with("HH"))),
+        0x0026 => Some(u32::from(profile.short_date.starts_with("dd"))),
+        0x0027 => Some(u32::from(profile.short_date.contains("MM"))),
+        0x1004 => Some(u32::from(profile.ansi)),
+        _ => None,
+    };
+    if let Some(value) = numeric { return Some(alloc::format!("{}", value).into_bytes()); }
     Some(match kind {
-        0x0001 => b"0409", // ILANGUAGE (hexadecimal)
-        0x0002 => b"English (United States)",
-        0x0005 => b"1", // ICOUNTRY
-        0x0006 => b"United States",
-        0x000b => b"437", // IDEFAULTCODEPAGE (OEM)
-        0x000e | 0x0016 => b".", // decimal / monetary decimal
-        0x000f | 0x0017 => b",", // thousands / monetary thousands
-        0x0010 | 0x0018 => b"3;0", // grouping
-        0x0011 | 0x0019 => b"2", // IDIGITS / ICURRDIGITS
-        0x0012 => b"1", // ILZERO
-        0x0014 => b"$", // SCURRENCY
-        0x0015 => b"USD", // SINTLSYMBOL
-        0x001b | 0x001c => b"0", // ICURRENCY / INEGCURR
-        0x001d => b"/", // SDATE
-        0x001e => b":", // STIME
-        0x001f => b"M/d/yyyy", // SSHORTDATE
-        0x0020 => b"dddd, MMMM dd, yyyy", // SLONGDATE
-        0x0021 | 0x0022 | 0x0023 | 0x0025 | 0x0026 => b"0",
-        0x0024 => b"1", // ICENTURY
-        0x0028 => b"AM",
-        0x0029 => b"PM",
-        0x1001 => b"English", // SENGLANGUAGE
-        0x1003 => b"h:mm:ss tt", // STIMEFORMAT
-        0x1004 => b"1252", // IDEFAULTANSICODEPAGE
+        0x0002 => profile.native_name,
+        0x0004 => profile.native_language,
+        0x0006 => profile.native_country,
+        0x000c => profile.list_separator,
+        0x000e | 0x0016 => profile.decimal,
+        0x000f | 0x0017 => profile.thousands,
+        0x0010 | 0x0018 => "3;0",
+        0x0013 => "0123456789",
+        0x0014 => profile.currency,
+        0x0015 => profile.currency_iso,
+        0x001d => profile.date_separator,
+        0x001e => ":",
+        0x001f => profile.short_date,
+        0x0020 => profile.long_date,
+        0x0028 => if profile.time24 { "" } else { "AM" },
+        0x0029 => if profile.time24 { "" } else { "PM" },
+        0x0059 => profile.iso_language,
+        0x005a => profile.iso_country,
+        0x005c => profile.tag,
+        0x1001 => profile.language,
+        0x1002 => profile.english_country,
+        0x1003 => profile.time_format,
         _ => return None,
-    })
+    }.as_bytes().to_vec())
 }
 
 fn locale_info<A: crate::Arch>(machine: &mut A, state: &mut WindowsState, regs: &Regs, wide: bool) -> u32 {
-    let locale = arg(machine, regs, 0);
-    if !matches!(locale, 0 | 0x0400 | 0x0800 | 0x0409) {
+    let Some(profile) = lib::locale::by_lcid(arg(machine, regs, 0)) else {
         return fail(state, ERROR_INVALID_PARAMETER, 0);
-    }
+    };
     let flags = arg(machine, regs, 1);
     if flags & !0xe000_ffff != 0 { return fail(state, 1004, 0); } // ERROR_INVALID_FLAGS
     let kind = flags & 0xffff;
-    let Some(text) = locale_value(kind) else { return fail(state, 1004, 0); };
+    let Some(text) = locale_value(profile, kind) else { return fail(state, 1004, 0); };
     let dest = arg(machine, regs, 2) as usize;
     let cap = arg(machine, regs, 3) as i32;
     if cap < 0 { return fail(state, ERROR_INVALID_PARAMETER, 0); }
+    let page = if flags & 0x4000_0000 != 0 { encoding::ansi() }
+        else { crate::kernel::text::Encoding::for_codepage(u32::from(profile.ansi)).unwrap() };
     let numeric = flags & 0x2000_0000 != 0;
     let value = if numeric {
-        let radix = if kind == 1 { 16 } else { 10 };
-        let value = core::str::from_utf8(text).ok().and_then(|s| u32::from_str_radix(s, radix).ok());
+        let radix = if matches!(kind, 1 | 9) { 16 } else { 10 };
+        let value = core::str::from_utf8(&text).ok().and_then(|s| u32::from_str_radix(s, radix).ok());
         let Some(value) = value else { return fail(state, 1004, 0); };
         Some(value)
     } else { None };
-    let required = if numeric { if wide { 2 } else { 4 } } else { (text.len() + 1) as u32 };
+    let required = if numeric { if wide { 2 } else { 4 } } else { (encoding::encode_with(&text, wide, page).len() + 1) as u32 };
     if cap == 0 { return required; }
     if dest == 0 || (cap as u32) < required { return fail(state, 122, 0); } // ERROR_INSUFFICIENT_BUFFER
     if let Some(value) = value {
         machine.write::<u32>(dest, value);
-    } else if wide {
-        copy_dir_bytes(machine, dest, cap as usize, text);
     } else {
-        copy_ascii(machine, dest, cap as usize, text);
+        encoding::copy_with(machine, dest, cap as usize, &text, wide, page);
     }
     required // GetLocaleInfo includes the terminating NUL in its return count.
 }

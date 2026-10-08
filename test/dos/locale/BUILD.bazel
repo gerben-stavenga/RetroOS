@@ -1,0 +1,12 @@
+genrule(
+    name = "locale",
+    srcs = ["locale.asm"],
+    outs = ["LOCALE.COM"],
+    cmd = "nasm -f bin $(location locale.asm) -o $@",
+    visibility = ["//visibility:public"],
+)
+
+genrule(
+    name = "keyboard", srcs = ["keyboard.asm"], outs = ["KEYBOARD.COM"],
+    cmd = "nasm -f bin $(location keyboard.asm) -o $@", visibility = ["//visibility:public"],
+)

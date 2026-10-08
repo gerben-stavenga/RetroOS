@@ -202,7 +202,7 @@ pub(super) fn call<A: crate::Arch>(
             else { state.console.output_cp = a(0); }
             1
         },
-        b"GetThreadLocale" => 0x409,
+        b"GetThreadLocale" => lib::locale::current().lcid,
         b"AreFileApisANSI" => u32::from(!state.file_oem),
         b"SetFileApisToANSI" => { state.file_oem = false; 0 },
         b"SetConsoleIcon"
@@ -395,11 +395,11 @@ pub(super) fn call<A: crate::Arch>(
             1
         }
         b"GetAsyncKeyState" | b"GetKeyState" => {
-            if a(0) < 256 && state.console.keys[a(0) as usize] & 0x80 != 0 {
-                0xffff8000
-            } else {
-                0
-            }
+            if a(0) < 256 {
+                let bits = state.console.keys[a(0) as usize];
+                let down = if bits & 0x80 != 0 { 0xffff8000 } else { 0 };
+                down | if name == b"GetKeyState" { u32::from(bits & 1) } else { 0 }
+            } else { 0 }
         }
         b"GetMenuItemCount" => u32::MAX,
         b"MessageBoxA" => {
@@ -418,9 +418,9 @@ pub(super) fn call<A: crate::Arch>(
                 machine.write::<u8>(
                     at,
                     if name == b"CharUpperBuffA" {
-                        lib::codepage::encoding_page(1252).unwrap().uppercase(ch)
+                        lib::codepage::encoding_page(lib::locale::current().ansi).unwrap().uppercase(ch)
                     } else {
-                        { let page = lib::codepage::encoding_page(1252).unwrap();
+                        { let page = lib::codepage::encoding_page(lib::locale::current().ansi).unwrap();
                         let mut lower = page.decode(ch).to_lowercase();
                         let value = lower.next().and_then(|c| page.encode_exact(c)).unwrap_or(ch);
                         if lower.next().is_none() { value } else { ch }

@@ -1,7 +1,7 @@
-# RetroOS boot config -- read by the kernel before the first DOS program
-# runs. Each non-comment line is KEY=VALUE; lines override or extend the
-# kernel's built-in master env (PATH only). Edit freely -- this file
-# lives at C:\CONFIG\CONFIG.SYS on the writable data disk.
+# RetroOS configuration -- read before the first program starts.
+# Each non-comment line is KEY=VALUE. Locale, keyboard and codepage are
+# system settings; ordinary environment entries follow guest conventions.
+# This file lives at C:\CONFIG\CONFIG.SYS on the writable data disk.
 # Startup executable and optional arguments; restarted when it exits.
 START=C:\RETROOS\DN\DN.COM
 
@@ -13,8 +13,12 @@ VC=C:\CONFIG\VC
 MCHOME=C:\RETROOS\MC
 HOME=C:\CONFIG\MC
 COMSPEC=C:\RETROOS\COMMAND.COM
-# DOS text and filename encoding: 437, 850, 852, or 866.
-#CODEPAGE=850
+# System locale: en-US, de-DE, it-IT, nl-NL, pl-PL, or ru-RU.
+LOCALE=en-US
+# Optional keyboard override: us, de, it, pl (programmer), or ru.
+#KEYBOARD=us
+# Optional OEM codepage override: 437, 850, 852, or 866.
+#CODEPAGE=437
 PATH=C:\;C:\RETROOS;C:\TC;C:\BORLANDC\BIN
 # Sound Blaster ownership. native = the guest drives the real card itself
 # (no kernel mixing, no GM bank) — the only thing a 386/486, 86Box or Bochs

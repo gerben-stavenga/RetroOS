@@ -106,7 +106,7 @@ fn prepare_startup<A: crate::Arch>(
     } = prepare_audio(machine, boot, audio, &mut screen, &mut bios_workspace);
     screen.present(machine, &mut bios_workspace);
 
-    configure_codepage(&master_env);
+    configure_locale(&master_env);
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
@@ -882,15 +882,27 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     crate::kernel::dos::parse_config_env(&config)
 }
 
-/// Select the DOS encoding before the template copies its BIOS font tables.
-/// Unsupported values leave the default CP437 in place.
-fn configure_codepage(env: &[u8]) {
+/// Select shared regional policy and OEM encoding before building DOS fonts.
+fn configure_locale(env: &[u8]) {
+    if let Some(raw) = crate::kernel::dos::config_var(env, b"LOCALE") {
+        let valid = core::str::from_utf8(trim_ascii(raw)).ok().is_some_and(lib::locale::select);
+        if !valid { crate::compact_println!("Invalid CONFIG.SYS LOCALE (available: en-US, ru-RU, pl-PL, de-DE, it-IT, nl-NL)"); }
+    }
+    let profile = lib::locale::current();
+    lib::locale::set_system_oem(profile.oem);
+    crate::compact_println!("Locale: {} (ANSI {}, OEM {})", profile.tag, profile.ansi, profile.oem);
+    lib::keyboard::select(profile.keyboard);
+    if let Some(raw) = crate::kernel::dos::config_var(env, b"KEYBOARD") {
+        let valid = core::str::from_utf8(trim_ascii(raw)).ok().is_some_and(lib::keyboard::select);
+        if !valid { crate::compact_println!("Invalid CONFIG.SYS KEYBOARD (available: us, de, it, ru, pl)"); }
+    }
+    crate::compact_println!("Keyboard: {}", lib::keyboard::current().name());
     let Some(raw) = crate::kernel::dos::config_var(env, b"CODEPAGE") else { return };
     let id = core::str::from_utf8(trim_ascii(raw)).ok()
         .and_then(|value| value.parse::<u16>().ok());
     match id.and_then(lib::codepage::codepage) {
         Some(page) => {
-            lib::codepage::select_codepage(page.id);
+            lib::locale::set_system_oem(page.id);
             crate::compact_println!("DOS code page: {}", page.id);
         }
         None => crate::compact_println!(
@@ -1378,7 +1390,7 @@ fn prepare_program<A: crate::Arch>(
     }
     let cmdline_tail = launch_tail;
     let cwd = cwd.to_vec();
-    let env = env.to_vec();
+    let env = crate::kernel::locale::process_environment(env);
 
     // No screen handoff bookkeeping: on-screen kernel text requires the
     // `Console` value, which our caller holds and does not touch until this
@@ -1398,7 +1410,7 @@ fn prepare_program<A: crate::Arch>(
     crate::kernel::klog::sync_live();
     let tid = match exec::detect_format(&buf, &launch_path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args, &cwd),
-        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path),
+        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path, &cwd, &env, &cmdline_tail),
         exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
         exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path, &env),
         _ => dos::run_init_program(
@@ -1464,7 +1476,7 @@ fn launch_elf<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args).unwrap_or_else(
+    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args, None).unwrap_or_else(
         |e| {
             lib::compact_panic!(
                 "ELF exec failed ({}): errno {}",
@@ -1486,6 +1498,9 @@ fn launch_os2<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     buf: alloc::vec::Vec<u8>,
     path: &[u8],
+    cwd: &[u8],
+    env: &[u8],
+    cmdtail: &[u8],
 ) -> usize {
     let cpipe = thread::console_pipe();
     let tid = {
@@ -1497,7 +1512,7 @@ fn launch_os2<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, b"", None, b"", b"").unwrap_or_else(
+    crate::kernel::os2::exec_lx_into(machine, threads, tid, buf, path, cwd, None, env, cmdtail).unwrap_or_else(
         |e| {
             lib::compact_panic!(
                 "OS/2 LX exec failed ({}): errno {}",

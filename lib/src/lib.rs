@@ -11,6 +11,8 @@ pub mod vga_fonts;
 pub mod unicode_font;
 pub mod cp437;
 pub mod codepage;
+pub mod locale;
+pub mod keyboard;
 mod ansi_tables;
 mod codepage_tables;
 pub mod unicode_lookalike;

@@ -2,7 +2,7 @@
 use super::*;
 use crate::kernel::text::{Encoding, from_utf16, to_utf16};
 
-pub(super) fn ansi() -> Encoding { Encoding::for_codepage(1252).unwrap() }
+pub(super) fn ansi() -> Encoding { Encoding::for_codepage(u32::from(lib::locale::current().ansi)).unwrap() }
 
 pub(super) fn file_page(state: &WindowsState) -> Encoding {
     if state.file_oem { Encoding::oem() } else { ansi() }

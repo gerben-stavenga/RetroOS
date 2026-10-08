@@ -40,6 +40,9 @@ pub(super) fn shift_state() -> u16 {
         | (u16::from(key_down(0x2a)) << 1)
         | (u16::from(key_down(0x1d)) << 2)
         | (u16::from(key_down(0x38)) << 3)
+        | (((crate::kernel::keyboard::control_state() >> 6) as u16 & 1) << 4)
+        | (((crate::kernel::keyboard::control_state() >> 5) as u16 & 1) << 5)
+        | (((crate::kernel::keyboard::control_state() >> 7) as u16 & 1) << 6)
 }
 fn word<A: crate::Arch>(m: &A, s: &Os2State, r: &Regs, off: usize) -> u16 {
     m.read::<u16>(stack_linear(s, r) + 4 + off)

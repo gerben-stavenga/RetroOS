@@ -403,7 +403,8 @@ impl WindowsState {
         self.cursor_dirty = true;
     }
     pub fn process_key(&mut self, fds: &[thread::FdKind; thread::MAX_FDS], scancode: u8) {
-        let pressed = crate::kernel::keyboard::update_key_state(scancode);
+        let pressed = crate::kernel::keyboard::update_console(&mut self.console.keyboard,scancode);
+        if crate::kernel::keyboard::event().scan == 0 { return; }
         let hwnd = self
             .windows
             .iter()
@@ -415,15 +416,18 @@ impl WindowsState {
             wparam: u32::from(scancode & 0x7f),
             lparam: 0,
         });
-        extra::push_key(&mut self.console, scancode);
+        extra::push_key(&mut self.console, scancode, crate::kernel::keyboard::event(), crate::kernel::keyboard::control_state());
         if !pressed {
             return;
         }
-        let c = crate::kernel::keyboard::scancode_to_ascii(scancode);
-        if c != 0
-            && let thread::FdKind::PipeRead(p) = fds[0]
-        {
-            crate::kernel::kpipe::write(p, &[c]);
+        if let thread::FdKind::PipeRead(p) = fds[0] {
+            let event = crate::kernel::keyboard::event();
+            for &character in event.characters() {
+                let mut bytes = [0;4];
+                let text = character.encode_utf8(&mut bytes);
+                let bytes = encoding::page(self.console.input_cp).unwrap().encode(text,b'?').0;
+                crate::kernel::kpipe::write(p,&bytes);
+            }
         }
     }
 
@@ -1810,7 +1814,7 @@ fn dispatch<A: crate::Arch>(
 ) -> u32 {
     match api {
         Api::GetLastError => state.last_error,
-        Api::GetACP => 1252,
+        Api::GetACP => u32::from(lib::locale::current().ansi),
         Api::GetOEMCP => u32::from(lib::codepage::current_codepage().id),
         Api::GetVersion => 0x0000_0004,
         Api::GetCurrentThreadId => (kt.tid + 1) as u32,
@@ -2126,11 +2130,12 @@ fn dispatch<A: crate::Arch>(
             arg(machine, regs, 2),
             arg(machine, regs, 3) as usize,
             true,
+            false,
         ),
         Api::CharUpperA => {
             let p = arg(machine, regs, 0);
             if p <= 0xffff {
-                u32::from(lib::codepage::encoding_page(1252).unwrap().uppercase(p as u8))
+                u32::from(lib::codepage::encoding_page(lib::locale::current().ansi).unwrap().uppercase(p as u8))
             } else {
                 let mut at = p as usize;
                 loop {
@@ -2138,7 +2143,7 @@ fn dispatch<A: crate::Arch>(
                     if b == 0 {
                         break;
                     }
-                    machine.write::<u8>(at, lib::codepage::encoding_page(1252).unwrap().uppercase(b));
+                    machine.write::<u8>(at, lib::codepage::encoding_page(lib::locale::current().ansi).unwrap().uppercase(b));
                     at += 1;
                 }
                 p

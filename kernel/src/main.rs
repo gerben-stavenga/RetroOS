@@ -285,7 +285,7 @@ fn install_socket_backend_hosted() {
 
 /// Spawn the stdin → keyboard pump: read host terminal bytes, translate each to
 /// a PC scancode make/break sequence, and post it as an `Irq::Key` for the
-/// kernel event loop (which does scancode→ASCII and feeds the guest's stdin).
+/// kernel event loop (which translates to Unicode and feeds guest input).
 /// Ctrl-] quits the host. Runs forever on its own thread.
 fn spawn_keyboard() {
     use std::io::Read;
@@ -324,7 +324,14 @@ fn spawn_keyboard() {
                     arch::post_irq(arch::Irq::Key(sc | 0x80));
                     continue;
                 }
-            for sc in byte_to_scancodes(b) {
+            let character = if b.is_ascii() { char::from(b) } else {
+                let length = match b { 0xc2..=0xdf => 2, 0xe0..=0xef => 3, 0xf0..=0xf4 => 4, _ => continue };
+                let mut bytes = [0;4]; bytes[0] = b;
+                if stdin.read_exact(&mut bytes[1..length]).is_err() { break; }
+                let Ok(text) = std::str::from_utf8(&bytes[..length]) else { continue; };
+                text.chars().next().unwrap()
+            };
+            for sc in character_to_scancodes(character) {
                 arch::post_irq(arch::Irq::Key(sc));
                 std::thread::sleep(TAP_GAP);
             }
@@ -396,59 +403,8 @@ fn read_escape_seq(stdin: &mut std::io::Stdin) -> Option<u8> {
     }
 }
 
-/// US-layout key table: (scancode, unshifted ASCII, shifted ASCII). Mirrors the
-/// kernel's KBD_US/KBD_US_SHIFT tables (kept arch-side per the layer-isolation
-/// rule — small duplicated primitive, not a cross-layer call).
-#[rustfmt::skip]
-const KEYS: &[(u8, u8, u8)] = &[
-    (0x02,b'1',b'!'),(0x03,b'2',b'@'),(0x04,b'3',b'#'),(0x05,b'4',b'$'),(0x06,b'5',b'%'),
-    (0x07,b'6',b'^'),(0x08,b'7',b'&'),(0x09,b'8',b'*'),(0x0A,b'9',b'('),(0x0B,b'0',b')'),
-    (0x0C,b'-',b'_'),(0x0D,b'=',b'+'),
-    (0x10,b'q',b'Q'),(0x11,b'w',b'W'),(0x12,b'e',b'E'),(0x13,b'r',b'R'),(0x14,b't',b'T'),
-    (0x15,b'y',b'Y'),(0x16,b'u',b'U'),(0x17,b'i',b'I'),(0x18,b'o',b'O'),(0x19,b'p',b'P'),
-    (0x1A,b'[',b'{'),(0x1B,b']',b'}'),
-    (0x1E,b'a',b'A'),(0x1F,b's',b'S'),(0x20,b'd',b'D'),(0x21,b'f',b'F'),(0x22,b'g',b'G'),
-    (0x23,b'h',b'H'),(0x24,b'j',b'J'),(0x25,b'k',b'K'),(0x26,b'l',b'L'),(0x27,b';',b':'),
-    (0x28,b'\'',b'"'),(0x29,b'`',b'~'),(0x2B,b'\\',b'|'),
-    (0x2C,b'z',b'Z'),(0x2D,b'x',b'X'),(0x2E,b'c',b'C'),(0x2F,b'v',b'V'),(0x30,b'b',b'B'),
-    (0x31,b'n',b'N'),(0x32,b'm',b'M'),(0x33,b',',b'<'),(0x34,b'.',b'>'),(0x35,b'/',b'?'),
-];
-
-const LSHIFT: u8 = 0x2A;
-const LCTRL: u8 = 0x1D;
-
-fn lookup(c: u8) -> Option<(u8, bool)> {
-    for &(sc, un, sh) in KEYS {
-        if c == un { return Some((sc, false)); }
-        if c == sh { return Some((sc, true)); }
-    }
-    None
-}
-
-/// One terminal byte → the scancode make/break sequence the kernel keyboard
-/// path expects. Modifier-wrapped: shift for shifted glyphs, ctrl for C0 control
-/// bytes (so the kernel's `scancode_to_ascii` recovers the same char).
-fn byte_to_scancodes(b: u8) -> Vec<u8> {
-    let tap = |sc: u8| vec![sc, sc | 0x80];
-    match b {
-        b'\r' | b'\n' => return tap(0x1C), // Enter
-        0x08 | 0x7F => return tap(0x0E),    // Backspace
-        b'\t' => return tap(0x0F),          // Tab
-        0x1B => return tap(0x01),           // Esc
-        b' ' => return tap(0x39),           // Space
-        _ => {}
-    }
-    // C0 control bytes (Ctrl-A..Z, excluding the specials matched above).
-    if (0x01..=0x1A).contains(&b)
-        && let Some((sc, _)) = lookup(b + 0x60) {
-            return vec![LCTRL, sc, sc | 0x80, LCTRL | 0x80];
-        }
-    if let Some((sc, shift)) = lookup(b) {
-        return if shift {
-            vec![LSHIFT, sc, sc | 0x80, LSHIFT | 0x80]
-        } else {
-            tap(sc)
-        };
-    }
-    Vec::new()
+/// Host text injection uses the same selected layout as the guest.
+fn character_to_scancodes(character: char) -> Vec<u8> {
+    let (sequence,length) = lib::keyboard::sequence(lib::keyboard::current(),character);
+    sequence[..length].to_vec()
 }

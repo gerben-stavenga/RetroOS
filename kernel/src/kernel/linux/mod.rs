@@ -82,6 +82,7 @@ pub fn render<A: crate::Arch>(
 
 /// Linux-specific thread state
 pub struct LinuxState {
+    keyboard: lib::keyboard::State,
     async_io: async_io::State,
     termios: [u8; 36],
     pub heap_base: usize,
@@ -118,6 +119,7 @@ impl Default for LinuxState {
 impl LinuxState {
     pub fn new() -> Self {
         LinuxState {
+            keyboard: lib::keyboard::State::new(),
             async_io: async_io::State::default(),
             termios: { let mut bytes = [0; 36]; bytes[1] = 1; bytes },
             heap_base: 0,
@@ -175,9 +177,11 @@ impl LinuxState {
     /// Echo is the userspace shell's responsibility (busybox-ash handles it
     /// itself based on its termios state); echoing in the kernel as well
     /// would produce doubled characters on screen.
-    pub fn process_key<A: crate::Arch>(&self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
-        if !crate::kernel::keyboard::update_key_state(scancode) { return; }
-        let sequence: &[u8] = match scancode {
+    pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
+        if !crate::kernel::keyboard::update_console(&mut self.keyboard,scancode) { return; }
+        let event = crate::kernel::keyboard::event();
+        let navigation = !((0x47..=0x53).contains(&event.scan) && event.length != 0);
+        let sequence: &[u8] = match if navigation { scancode } else { 0 } {
             0x48 => b"\x1b[A", 0x50 => b"\x1b[B", 0x4d => b"\x1b[C", 0x4b => b"\x1b[D",
             0x47 => b"\x1b[H", 0x4f => b"\x1b[F", 0x49 => b"\x1b[5~", 0x51 => b"\x1b[6~",
             0x52 => b"\x1b[2~", 0x53 => b"\x1b[3~",
@@ -189,11 +193,15 @@ impl LinuxState {
         };
         if let FdKind::PipeRead(idx) = fds[0] {
             if !sequence.is_empty() { crate::kernel::kpipe::write(idx, sequence); return; }
-            let mut c = crate::kernel::keyboard::scancode_to_ascii(scancode);
-            // Raw-mode consumers need physical Enter as CR. ICRNL is a TTY
-            // input transformation, configured by tcsetattr(), not the key map.
-            if c == b'\n' && self.termios[1] & 1 == 0 { c = b'\r'; }
-            if c != 0 { crate::kernel::kpipe::write(idx, &[c]); }
+            if self.keyboard.down(0x38,false) && !self.keyboard.altgr() && event.length != 0 {
+                crate::kernel::kpipe::write(idx,b"\x1b");
+            }
+            for &character in event.characters() {
+                // ICRNL is a TTY transformation, separate from the Unicode map.
+                let character = if character == '\n' && self.termios[1] & 1 == 0 { '\r' } else { character };
+                let mut bytes = [0;4];
+                crate::kernel::kpipe::write(idx,character.encode_utf8(&mut bytes).as_bytes());
+            }
         }
     }
 }
@@ -606,11 +614,11 @@ fn read_c_argv<A: crate::Arch>(machine: &mut A, ptr: usize, wide: bool) -> alloc
 // =============================================================================
 
 /// Set up the initial user stack in the SysV-i386 layout:
-///   [argc] [argv[0]..argv[N-1]] [NULL] [envp: NULL] [auxv...] [AT_NULL]
+///   [argc] [argv[0]..argv[N-1]] [NULL] [envp[0]..envp[M-1]] [NULL] [auxv...] [AT_NULL]
 ///   [16 random bytes] [string pool]
 ///
 /// For 64-bit: same layout with 8-byte slots.
-pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)]) -> usize {
+pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, args: &[alloc::vec::Vec<u8>], want_64: bool, extra_auxv: &[(usize, usize)], environment: Option<&[u8]>) -> usize {
     // Write one machine word (4 or 8 bytes, per client bitness) to the stack.
     fn write_word<A: crate::Arch>(machine: &mut A, addr: usize, val: usize, want_64: bool) {
         if want_64 { machine.write::<u64>(addr, val as u64); }
@@ -623,7 +631,13 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
     // 1. Write NUL-terminated string data at top of stack
     // Environment strings first (they end up at higher addresses)
-    let env_strings: &[&[u8]] = &[b"PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"HOME=/", b"TERM=linux", b"LANG=C.UTF-8"];
+    let lang = ["LANG=", lib::locale::current().posix].concat();
+    let defaults: &[&[u8]] = &[b"PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"HOME=/", b"TERM=linux", lang.as_bytes()];
+    // execve supplies the caller's environment exactly, including an empty
+    // one. Boot/cross-personality launches synthesize Linux conventions.
+    let inherited: alloc::vec::Vec<&[u8]> = environment.map(|block|
+        block.split(|&byte| byte == 0).take_while(|entry| !entry.is_empty()).collect()).unwrap_or_default();
+    let env_strings = if environment.is_some() { inherited.as_slice() } else { defaults };
     let mut env_addrs: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(env_strings.len());
     for &env in env_strings.iter().rev() {
         sp -= env.len() + 1;
@@ -709,7 +723,7 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>]) -> Result<(), i32> {
+pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
     // PIE main + dynamic linker load bases. Kept in the low user region
     // (< USER_STACK_TOP) so they don't need the high 64-bit VA range; ld.so
     // mmaps the shared libraries between these and the stack.
@@ -769,7 +783,7 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         ])
     };
 
-    let sp = setup_user_stack(machine, &mut current.kernel.vcpu, args, want_64, &extra_auxv);
+    let sp = setup_user_stack(machine, &mut current.kernel.vcpu, args, want_64, &extra_auxv, environment);
     if want_64 {
         thread::init_process_thread_64(current, cpu_entry, sp as u64);
     } else {
@@ -1202,7 +1216,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
 
     let path_ptr = a.a0 as usize;
     let argv_ptr = a.a1 as usize;
-    let _envp_ptr = a.a2 as usize;
+    let envp_ptr = a.a2 as usize;
 
     let mut raw_path_buf = [0u8; 256];
     let raw_path_len = machine.copy_cstr(path_ptr, &mut raw_path_buf);
@@ -1226,6 +1240,13 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // passed an empty argv.
     let wide = regs.mode() == crate::UserMode::Mode64;
     let mut args = read_c_argv(machine, argv_ptr, wide);
+    let entries = read_c_argv(machine,envp_ptr,wide);
+    let mut environment = alloc::vec::Vec::new();
+    for entry in entries { environment.extend_from_slice(&entry); environment.push(0); }
+    if environment.is_empty() { environment.push(0); }
+    environment.push(0);
+    if environment.len() > 32 * 1024 { return SyscallResult::val(-7); } // E2BIG
+
     if args.is_empty() { args.push(path.clone()); }
 
     // Snapshot cwd up front — execve preserves it across the address-space
@@ -1285,8 +1306,8 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     // return (drop symbols, close CLOEXEC, free pages, re-image) is the
     // executor's; until then execve still fails cleanly (the -ENOENT above).
     SyscallResult::act(0, thread::KernelAction::Exec {
-        buffer, path, args, cmdtail, env: alloc::vec::Vec::new(),
-        cwd: cwd_snapshot, personality_name: None, policy: Default::default(),
+        buffer, path, args, cmdtail, env: environment,
+        cwd: cwd_snapshot, personality_name: Some(thread::PersonalityName::Linux), policy: Default::default(),
     })
 }
 

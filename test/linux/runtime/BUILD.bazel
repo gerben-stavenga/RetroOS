@@ -13,3 +13,9 @@ musl64_binary(
     binary = ":runtime_bin",
     visibility = ["//visibility:public"],
 )
+
+rust_binary(
+    name = "keyboard_bin", srcs = ["src/keyboard.rs"], edition = "2024",
+    rustc_flags = ["-Cstrip=symbols", "-Clinker-flavor=ld.lld", "-Clinker=rust-lld", "-Crelocation-model=static"],
+)
+musl64_binary(name = "keyboard", binary = ":keyboard_bin", visibility = ["//visibility:public"])
