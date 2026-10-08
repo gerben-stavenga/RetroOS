@@ -14,6 +14,12 @@ runs:
       sudo apt-get update
       sudo apt-get install -y nasm qemu-system-x86 ovmf bochs bochs-sdl bochsbios vgabios grub-pc-bin grub-efi-amd64-bin grub-common xorriso mtools dosfstools e2fsprogs fdisk gcc-multilib
     shell: bash
+  - uses: actions/setup-python@v5
+    with:
+      python-version: '3.12'
+  - name: Install Python test dependencies
+    shell: bash
+    run: python3 -m pip install -r test/requirements.txt
   - name: Detect hardware virtualization
     run: |
       # Record the host so vendor-specific KVM failures can be compared.

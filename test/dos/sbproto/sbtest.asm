@@ -243,6 +243,8 @@ startblk:
                                ; cannot clobber (see below)
         mov al, 0x05
         out 0x0A, al           ; mask ch1
+        in al, 0x08            ; clear prior transfers' terminal-count latches
+                               ; before arming this block (8237A status read)
         mov al, 0x49
         out 0x0B, al           ; mode: single, read (mem->card), ch1
         xor al, al

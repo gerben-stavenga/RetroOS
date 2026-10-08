@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """Drive the shipped upstream file manager/editor on the Linux KVM personality."""
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
 import time
+
+import pyte
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -39,11 +40,18 @@ def main():
                         break
                     time.sleep(0.05)
                 output = (root / "guest.log").read_text(errors="replace")
-                raise AssertionError(f"Timed out waiting for {description}:\n{output[-6000:]}")
+                artifacts = ROOT / "build/ci"
+                artifacts.mkdir(parents=True, exist_ok=True)
+                (artifacts / "rat-commander.log").write_text(output)
+                raise AssertionError(f"Timed out waiting for {description}:\n{terminal_text()[-6000:]}")
 
             def terminal_text():
                 output = (root / "guest.log").read_text(errors="replace")
-                return re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+                # Cursor-based redraws omit cells that are already correct.
+                # Reconstruct the screen instead of stripping escape sequences.
+                screen = pyte.Screen(80, 25)
+                pyte.Stream(screen).feed(output)
+                return "\n".join(screen.display)
 
             try:
                 # Enter a child and return through '..', then create a folder.

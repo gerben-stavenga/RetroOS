@@ -113,7 +113,7 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: integration-log-${{ inputs.commit }}-${{ matrix.suite }}
-        path: build/ci/integration.log
+        path: build/ci/*.log
         if-no-files-found: ignore
         retention-days: 14
     - name: Trim build cache

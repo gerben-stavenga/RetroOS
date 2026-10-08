@@ -11,6 +11,10 @@ suite remains included. Logs remain available even when a test fails. KVM suites
 required when the runner exposes KVM; unavailable emulators or proprietary
 assets follow the existing test runner's explicit skip rules.
 
+For local Python integration tests, use a virtual environment and install
+`test/requirements.txt` (`python3 -m pip install -r test/requirements.txt`).
+CI uses Python 3.12 with the same pinned test dependencies.
+
 ## Numbered releases
 
 1. Update `CHANGELOG.md` with `## [0.8.0] - YYYY-MM-DD` (use the new version).

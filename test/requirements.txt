@@ -1,0 +1,3 @@
+# Terminal reconstruction for Rat Commander integration checks.
+pyte==0.8.2
+wcwidth==0.2.13
