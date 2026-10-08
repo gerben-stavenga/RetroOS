@@ -491,7 +491,7 @@ genrule(
     srcs = [":root_module_base_tar", "tools/build_module_image.py"],
     outs = ["retroos-base.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :root_module_base_tar) --size-mb 32 --out $@",
+          " --contents $(location :root_module_base_tar) --size-mb 96 --out $@",
     visibility = ["//visibility:public"],
 )
 
