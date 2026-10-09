@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise OS/2 DLL initialization, shared memory, files, 16-bit console calls, process launches and waits."""
+"""Exercise OS/2 DLL initialization, shared memory, files, 16-bit console calls, process launches, Unicode conversion and PM fallbacks."""
 import os
 from pathlib import Path
 import shutil
@@ -14,7 +14,7 @@ def main():
     if engine not in ("tcg", "kvm"):
         raise SystemExit(f"Unknown ENGINE: {engine}")
     target = "retroos-host-kvm" if engine == "kvm" else "retroos-host"
-    modules = ("doscalls", "kbdcalls", "viocalls", "nls", "moucalls", "msg", "pmwin", "pmshapi", "pmwp")
+    modules = ("doscalls", "kbdcalls", "viocalls", "nls", "uconv", "moucalls", "msg", "pmwin", "pmshapi", "pmwp")
     # COMMAND.COM depends on the native boot image, which needs the default
     # target platform. Save it before changing Bazel's output configuration.
     subprocess.run(["bazelisk", "build", "//tools/command:command_com"], cwd=ROOT, check=True)
@@ -22,7 +22,7 @@ def main():
     subprocess.run([
         "bazelisk", "build", f"//kernel:{target}",
         "//test/os2/runtime:runtime", "//test/os2/runtime:probe_dll",
-        "//test/os2/runtime:exec_child",
+        "//test/os2/runtime:exec_child", "//test/os2/runtime:uconv",
         "//test/os2/hello:hello_lx", "//test/os2/watcom_io:watcom_io",
         *(f"//lib/os2/{name}:{name}_dll" for name in modules),
         "--platforms=@platforms//host",
@@ -41,6 +41,7 @@ def main():
                 shutil.copyfile(ROOT / f"bazel-bin/lib/os2/{name}/{name.upper()}.DLL", system / f"{name.upper()}.DLL")
             for source, name in (
                 ("runtime/runtime.exe", "RUNTIME.EXE"),
+                ("runtime/uconv.exe", "UCONV.EXE"),
                 ("runtime/PROBE.DLL", "PROBE.DLL"),
                 ("runtime/exec_child.exe", "EXECCHILD.EXE"),
                 ("hello/hello_lx.exe", "HELLO.EXE"),
@@ -49,6 +50,7 @@ def main():
                 shutil.copyfile(ROOT / "bazel-bin/test/os2" / source, apps / name)
             for command, marker in (
                 ("/OS2/APPS/RUNTIME.EXE", "OS2RUNTIME PASS"),
+                ("/OS2/APPS/UCONV.EXE", "OS2UCONV PASS"),
                 ("/OS2/APPS/HELLO.EXE", "Hello from Open Watcom C"),
                 ("/OS2/APPS/WATCIO.EXE", "Open Watcom file I/O works"),
                 (r"RETROOS/COMMAND.COM /C C:\OS2\APPS\RUNTIME.EXE", "OS2RUNTIME PASS"),
@@ -70,7 +72,7 @@ def main():
                     raise SystemExit(log)
             if (apps / "café.dat").read_bytes() != bytes([0, 255, 130, 195, 40]):
                 raise SystemExit("OS/2 OEM path or raw file contents did not cross the UTF-8 VFS boundary")
-    print(f"PASS: OS/2 CRT, DLL initialization, shared memory, files, 16-bit VIO/KBD, DosExecPgm and Sleep ({engine})")
+    print(f"PASS: OS/2 CRT, DLL initialization, shared memory, files, 16-bit VIO/KBD, DosExecPgm, Sleep, UCONV and PM fallbacks ({engine})")
 
 
 if __name__ == "__main__":

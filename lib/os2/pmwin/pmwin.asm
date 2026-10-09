@@ -2,6 +2,9 @@ bits 32
 
 section _TEXT use32 class=CODE
 
+global WinAlarm
+WinAlarm: int 0x82
+
 global WinInitialize
 global WinCreateMsgQueue
 global WinCreateWindow

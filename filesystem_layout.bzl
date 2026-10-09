@@ -52,6 +52,7 @@ BOOT_FILES = {
     "//lib/os2/moucalls:moucalls_dll": "RETROOS/OS2/DLL/MOUCALLS.DLL",
     "//lib/os2/msg:msg_dll": "RETROOS/OS2/DLL/MSG.DLL",
     "//lib/os2/pmwp:pmwp_dll": "RETROOS/OS2/DLL/PMWP.DLL",
+    "//lib/os2/uconv:uconv_dll":         "RETROOS/OS2/DLL/UCONV.DLL",
     "//lib/os2/nls:nls_dll":             "RETROOS/OS2/DLL/NLS.DLL",
     "//lib/os2/pmwin:pmwin_dll":         "RETROOS/OS2/DLL/PMWIN.DLL",
     "//lib/os2/pmgpi:pmgpi_dll":         "RETROOS/OS2/DLL/PMGPI.DLL",

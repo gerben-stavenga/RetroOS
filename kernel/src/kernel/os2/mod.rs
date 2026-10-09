@@ -9,6 +9,7 @@ extern crate alloc;
 pub mod lx;
 mod extra;
 mod nls;
+mod uconv;
 
 use alloc::{vec, vec::Vec};
 use crate::Regs;
@@ -32,7 +33,7 @@ const ERROR_INVALID_PARAMETER: u32 = 87;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Api {
-    Base(u16), Kbd(u16), Vio(u16), Mou(u16), Msg(u16), Pm(u8, u16), DllReturn, WaitReturn,
+    Base(u16), Kbd(u16), Vio(u16), Mou(u16), Msg(u16), Uconv(u16), Pm(u8, u16), DllReturn, WaitReturn,
     DosQueryHType, DosExit, DosResetBuffer, DosSetFilePtr, DosClose,
     DosOpen, DosRead, DosWrite, DosQueryCp, DosAllocMem, DosFreeMem,
     DosQueryModuleHandle, DosQueryProcAddr, DosQuerySysInfo, DosSetRelMaxFH,
@@ -43,13 +44,14 @@ enum Api {
     WinGetPS, WinReleasePS, WinFillRect, WinPostQueueMsg, WinGetMsg,
     WinDispatchMsg, WinDestroyWindow, WinDestroyMsgQueue, WinTerminate,
     WinBeginPaint, WinDismissDlg, WinDrawBitmap, WinDrawBorder, WinEndPaint,
-    WinInvalidateRect, WinLoadString, WinMessageBox, WinPtInRect,
+    WinInvalidateRect, WinLoadString, WinMessageBox, WinAlarm, WinPtInRect,
     WinQueryDlgItemText, WinQuerySysValue, WinQueryWindow, WinQueryWindowPos,
     WinQueryWindowRect, WinSetDlgItemText, WinSetWindowPos, WinStartTimer,
     WinStopTimer, WinWindowFromId, WinSendDlgItemMsg, WinCreateStdWindow,
     WinDefDlgProc, WinDefWindowProc, WinSendMsg, WinDlgBox, WinRegisterClass,
     RetroWndProcReturn, GpiBox, GpiDeleteBitmap, GpiLoadBitmap, GpiMove,
     PrfOpenProfile, PrfCloseProfile, PrfQueryProfileData, PrfWriteProfileData,
+    PrfQueryProfileInt, PrfQueryProfileString,
     WinCreateHelpInstance, WinDestroyHelpInstance, WinAssociateHelpInstance,
 }
 
@@ -110,6 +112,8 @@ pub struct Os2State {
     modules: Vec<Module>,
     allocations: Vec<(u32, u32)>,
     heap_next: u32,
+    converters: Vec<(u32, uconv::Converter)>,
+    next_converter: u32,
     pub cwd: [u8; 64],
     pub cwd_len: usize,
     exec_path: [u8; 128],
@@ -157,6 +161,8 @@ impl Os2State {
             modules: Vec::new(),
             allocations: Vec::new(),
             heap_next: HEAP_BASE,
+            converters: Vec::new(),
+            next_converter: 1,
             cwd: [0; 64],
             cwd_len: 0,
             exec_path: [0; 128],
@@ -909,6 +915,11 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"MOUCALLS", b"MouReadEventQue", Api::Mou(20), 10),
         (b"MOUCALLS", b"MouSetPtrPos", Api::Mou(21), 6),
         (b"MOUCALLS", b"MouDrawPtr", Api::Mou(26), 2),
+        (b"UCONV", b"UniCreateUconvObject", Api::Uconv(1), 0),
+        (b"UCONV", b"UniUconvToUcs", Api::Uconv(2), 0),
+        (b"UCONV", b"UniUconvFromUcs", Api::Uconv(3), 0),
+        (b"UCONV", b"UniFreeUconvObject", Api::Uconv(4), 0),
+        (b"UCONV", b"UniMapCpToUcsCp", Api::Uconv(10), 0),
         (b"MSG", b"DosTrueGetMessage", Api::Msg(6), 0),
         (b"MSG", b"DosIQueryMessageCP", Api::Msg(8), 0),
         (b"DOSCALLS", b"DosQueryHType", Api::DosQueryHType, 0),
@@ -961,6 +972,7 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"PMWIN", b"WinEndPaint", Api::WinEndPaint, 0),
         (b"PMWIN", b"WinInvalidateRect", Api::WinInvalidateRect, 0),
         (b"PMWIN", b"WinLoadString", Api::WinLoadString, 0),
+        (b"PMWIN", b"WinAlarm", Api::WinAlarm, 0),
         (b"PMWIN", b"WinMessageBox", Api::WinMessageBox, 0),
         (b"PMWIN", b"WinPtInRect", Api::WinPtInRect, 0),
         (b"PMWIN", b"WinQueryDlgItemText", Api::WinQueryDlgItemText, 0),
@@ -987,6 +999,8 @@ fn register_gates(state: &mut Os2State, modules: &[Module]) {
         (b"PMGPI", b"GpiMove", Api::GpiMove, 0),
         (b"PMSHAPI", b"PrfOpenProfile", Api::PrfOpenProfile, 0),
         (b"PMSHAPI", b"PrfCloseProfile", Api::PrfCloseProfile, 0),
+        (b"PMSHAPI", b"PrfQueryProfileInt", Api::PrfQueryProfileInt, 0),
+        (b"PMSHAPI", b"PrfQueryProfileString", Api::PrfQueryProfileString, 0),
         (b"PMSHAPI", b"PrfQueryProfileData", Api::PrfQueryProfileData, 0),
         (b"PMSHAPI", b"PrfWriteProfileData", Api::PrfWriteProfileData, 0),
         (b"HELPMGR", b"WinCreateHelpInstance", Api::WinCreateHelpInstance, 0),
@@ -1411,6 +1425,7 @@ fn dispatch_api<A: crate::Arch>(
     regs: &mut Regs, api: Api,
 ) -> u32 {
     match api {
+        Api::Uconv(n) => uconv::dispatch(machine, state, regs, n),
         Api::Base(_) | Api::Kbd(_) | Api::Vio(_) | Api::Mou(_) | Api::Msg(_) | Api::Pm(_, _) => extra::dispatch(machine, kt, state, regs, api),
         Api::DosOpen => dos_open(machine, kt, state, regs),
         Api::DosOpenL => dos_open_l(machine, kt, state, regs),
@@ -1536,12 +1551,22 @@ fn dispatch_api<A: crate::Arch>(
         }
         Api::DosGetDateTime => {
             let out = arg32(machine, regs, 0) as usize;
+            if out == 0 { return ERROR_INVALID_PARAMETER; }
+            let Some(unix) = crate::kernel::clock::rtc_unix_timestamp() else { return 13; }; // ERROR_INVALID_DATA
+            let [year, month, weekday, day, hour, minute, second, milliseconds] =
+                crate::kernel::clock::calendar_from_unix(i64::from(unix));
             machine.zero(out, 12);
-            machine.write::<u8>(out, 12);
-            machine.write::<u8>(out + 1, 0);
-            machine.write::<u8>(out + 4, 1);
-            machine.write::<u8>(out + 5, 1);
-            machine.write::<u16>(out + 6, 1996);
+            machine.write::<u8>(out, hour as u8);
+            machine.write::<u8>(out + 1, minute as u8);
+            machine.write::<u8>(out + 2, second as u8);
+            machine.write::<u8>(out + 3, (milliseconds / 10) as u8);
+            machine.write::<u8>(out + 4, day as u8);
+            machine.write::<u8>(out + 5, month as u8);
+            machine.write::<u16>(out + 6, year);
+            // RTC follows the firmware's local-time convention; no timezone
+            // policy is configured, so OS/2's unknown-offset sentinel applies.
+            machine.write::<i16>(out + 8, -1);
+            machine.write::<u8>(out + 10, weekday as u8);
             NO_ERROR
         }
         Api::DosGetNamedSharedMem => extra::get_shared(machine, state, regs),
@@ -1760,6 +1785,11 @@ fn dispatch_api<A: crate::Arch>(
             if length != 0 { machine.write::<u8>(out, 0); }
             0
         }
+        Api::WinAlarm => {
+            crate::compact_println!("OS/2: WinAlarm not implemented (desktop={:#x}, type={})",
+                arg32(machine, regs, 0), arg32(machine, regs, 1));
+            0 // FALSE: no alarm was played.
+        }
         Api::WinMessageBox => 1,
         Api::WinSendDlgItemMsg | Api::WinSendMsg | Api::WinDefDlgProc | Api::WinDefWindowProc => 0,
         Api::WinDlgBox => 1,
@@ -1770,6 +1800,33 @@ fn dispatch_api<A: crate::Arch>(
         Api::GpiMove | Api::GpiBox => 1,
         Api::PrfOpenProfile => 1,
         Api::PrfQueryProfileData => 0,
+        Api::PrfQueryProfileInt => {
+            crate::compact_println!("OS/2: PrfQueryProfileInt profile storage not implemented; using default");
+            arg32(machine, regs, 3)
+        }
+        Api::PrfQueryProfileString => {
+            crate::compact_println!("OS/2: PrfQueryProfileString profile storage not implemented; using default");
+            let app = arg32(machine, regs, 1);
+            let key = arg32(machine, regs, 2);
+            let default = arg32(machine, regs, 3);
+            let out = arg32(machine, regs, 4) as usize;
+            let capacity = arg32(machine, regs, 5) as usize;
+            if out == 0 || capacity == 0 { return 0; }
+            // NULL application/key enumerates an empty profile, rather than
+            // returning the default as if it were an application or key name.
+            if app == 0 || key == 0 {
+                machine.write::<u8>(out, 0);
+                if capacity > 1 { machine.write::<u8>(out + 1, 0); }
+                return 0;
+            }
+            let value = if default == 0 { Vec::new() } else {
+                match raw_string(machine, default) { Ok(value) => value, Err(_) => return 0 }
+            };
+            let copied = value.len().min(capacity - 1);
+            machine.copy_to(out, &value[..copied]);
+            machine.write::<u8>(out + copied, 0);
+            (copied + 1) as u32 // OS/2 counts the terminating NUL.
+        },
         Api::WinCreateHelpInstance => 1,
         Api::DosExit | Api::DllReturn | Api::WaitReturn => unreachable!(),
     }

@@ -1,0 +1,12 @@
+load("@rules_nasm//nasm:defs.bzl", "nasm_library")
+load("//toolchain:os2_watcom.bzl", "os2_dll")
+
+nasm_library(name = "uconv_obj", srcs = ["uconv.asm"], copts = ["-fobj"])
+os2_dll(
+    name = "uconv_dll",
+    obj = ":uconv_obj",
+    out = "UCONV.DLL",
+    module_name = "UCONV",
+    exports = ["UniCreateUconvObject.1", "UniUconvToUcs.2", "UniUconvFromUcs.3", "UniFreeUconvObject.4", "UniMapCpToUcsCp.10"],
+    visibility = ["//visibility:public"],
+)

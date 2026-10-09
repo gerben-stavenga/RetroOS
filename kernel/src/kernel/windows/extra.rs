@@ -660,27 +660,7 @@ fn unix_from_filetime(value: u64) -> Option<i64> {
 }
 
 fn system_time(unix: i64) -> [u16; 8] {
-    let days = unix.div_euclid(86_400);
-    let seconds = unix.rem_euclid(86_400) as u32;
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = mp + if mp < 10 { 3 } else { -9 };
-    [
-        (year + i64::from(month <= 2)) as u16,
-        month as u16,
-        (days + 4).rem_euclid(7) as u16,
-        day as u16,
-        (seconds / 3_600) as u16,
-        ((seconds / 60) % 60) as u16,
-        (seconds % 60) as u16,
-        0,
-    ]
+    crate::kernel::clock::calendar_from_unix(unix)
 }
 
 fn write_system_time<A: crate::Arch>(machine: &mut A, out: usize, unix: Option<i64>) -> u32 {

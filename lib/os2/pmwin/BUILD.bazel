@@ -13,6 +13,8 @@ os2_dll(
     out = "PMWIN.DLL",
     module_name = "PMWIN",
     exports = [
+        "WinAlarm.701",
+
         "WinCloseClipbrd.707",
         "WinEmptyClipbrd.733",
         "WinOpenClipbrd.793",

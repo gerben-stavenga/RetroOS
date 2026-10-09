@@ -5,6 +5,40 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-08
+
+### Fixes and improvements
+
+- Physical page allocation uses compact metadata and can address all available
+  RAM, removing the previous 256 MiB physical-address ceiling. Shared-page
+  reference counts are stored separately.
+- Boot diagnostics identify IRQ initialization stages. USB controller firmware
+  handoff and low-memory boot setup have been hardened.
+- ELF programs load their segments directly from the filesystem instead of
+  retaining a full executable copy during process creation. Repeated Rat
+  Commander launches were tested in a 128 MiB BIOS VM.
+- ESS1868/ESS1869 AudioDrive cards are recognized through ISA PnP, with their
+  configured ports, IRQ and 8-bit DMA passed to the Sound Blaster probe.
+  Physical ESS hardware still needs validation.
+- Sound underrun log messages are suppressed; underrun counting and recovery
+  remain active.
+- OS/2 UCONV supplies the conversion APIs used by DN/2, using the shared Unicode
+  and codepage tables. This fixes its missing-library and country setup errors.
+- OS/2 exports now include WinAlarm and the string/integer profile queries.
+  Unsupported calls warn at runtime: alarms return failure and profile queries
+  use the caller's defaults. Persistent OS/2 profile storage is not implemented.
+- DosGetDateTime uses the shared RTC clock instead of returning a fixed noon
+  timestamp from 1996. Windows and OS/2 share calendar conversion.
+
+### Verification and limitations
+
+- OS/2 runtime checks cover conversion buffers, codepage round trips, default
+  profile values and the alarm fallback. DN/2 startup and exit were tested in
+  native QEMU.
+- Windows, OS/2 and Linux personalities remain experimental. USB mass storage
+  remains unsupported after boot; GRUB loading from USB does not provide
+  persistent kernel access to the stick.
+
 ## [0.8.0] - 2026-10-08
 
 This is the first numbered RetroOS release. It records the current DOS-focused

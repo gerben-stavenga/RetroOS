@@ -78,3 +78,29 @@ pub fn rtc_unix_timestamp() -> Option<u32> {
         + minute as i64 * 60 + second as i64;
     u32::try_from(seconds).ok()
 }
+
+/// Calendar fields: year, month, weekday (Sunday = 0), day, hour, minute,
+/// second and milliseconds. Shared by the Windows and OS/2 time APIs.
+pub(crate) fn calendar_from_unix(unix: i64) -> [u16; 8] {
+    let days = unix.div_euclid(86_400);
+    let seconds = unix.rem_euclid(86_400) as u32;
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = mp + if mp < 10 { 3 } else { -9 };
+    [
+        (year + i64::from(month <= 2)) as u16,
+        month as u16,
+        (days + 4).rem_euclid(7) as u16,
+        day as u16,
+        (seconds / 3_600) as u16,
+        ((seconds / 60) % 60) as u16,
+        (seconds % 60) as u16,
+        0,
+    ]
+}

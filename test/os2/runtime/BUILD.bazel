@@ -11,3 +11,5 @@ os2_dll(
 os2_watcom_binary(
     name = "exec_child", src = "exec_child.c", visibility = ["//visibility:public"],
 )
+
+os2_watcom_binary(name = "uconv", src = "uconv.c")

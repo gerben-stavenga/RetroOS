@@ -2,6 +2,12 @@ bits 32
 
 section _TEXT use32 class=CODE
 
+global PrfQueryProfileInt
+PrfQueryProfileInt: int 0x82
+global PrfQueryProfileString
+PrfQueryProfileString: int 0x82
+
+
 global PrfOpenProfile
 global PrfCloseProfile
 global PrfQueryProfileData
