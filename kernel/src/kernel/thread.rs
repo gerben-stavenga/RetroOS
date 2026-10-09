@@ -130,7 +130,7 @@ pub enum KernelAction {
     /// handler reads path/argv from the (still-live) old address space and loads
     /// the file; the executor tears down + rebuilds, off the handler's borrow.
     Exec {
-        buffer: alloc::vec::Vec<u8>,
+        buffer: crate::kernel::exec::ExecutableImage,
         path: alloc::vec::Vec<u8>,
         args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
         cmdtail: alloc::vec::Vec<u8>,

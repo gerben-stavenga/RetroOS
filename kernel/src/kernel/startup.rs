@@ -1352,16 +1352,16 @@ fn prepare_program<A: crate::Arch>(
     // resolution the DOS personality applies to the program's own file I/O).
     crate::compact_dbg_println!("boot launch: loading {}", core::str::from_utf8(&launch_path).unwrap_or("?"));
     crate::kernel::klog::sync_live();
-    let (buf, loaded_path) = match exec::load_file_resolved(&launch_path) {
+    let (buf, loaded_path) = match exec::load_executable_resolved(&launch_path) {
         Ok(buf) => (buf, launch_path.clone()),
         Err(_) => {
             let path = [crate::kernel::dos::c_root(), &launch_path].concat();
-            let buf = exec::load_file_resolved(&path)
+            let buf = exec::load_executable_resolved(&path)
                 .unwrap_or_else(|_| lib::compact_panic!("{} not found", core::str::from_utf8(&launch_path).unwrap_or("?")));
             (buf, path)
         }
     };
-    crate::compact_dbg_println!("boot launch: file loaded ({} bytes)", buf.len());
+    crate::compact_dbg_println!("boot launch: file loaded ({} bytes)", buf.file_size());
     crate::kernel::klog::sync_live();
     // argv = path + the cmdline tail split into words. The ELF/Linux path
     // consumes the full argv (`--cmd "/usr/bin/dash -c 'echo hi'"` must reach
@@ -1410,14 +1410,14 @@ fn prepare_program<A: crate::Arch>(
     crate::kernel::klog::sync_live();
     let tid = match exec::detect_format(&buf, &launch_path) {
         exec::BinaryFormat::Elf => launch_elf(machine, threads, buf, &launch_path, args, &cwd),
-        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf, &launch_path, &cwd, &env, &cmdline_tail),
-        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf, &launch_path),
-        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf, &loaded_path, &env),
+        exec::BinaryFormat::Lx => launch_os2(machine, threads, buf.into_bytes(), &launch_path, &cwd, &env, &cmdline_tail),
+        exec::BinaryFormat::Ne => launch_win16(machine, threads, buf.into_bytes(), &launch_path),
+        exec::BinaryFormat::Pe => launch_windows(machine, threads, buf.into_bytes(), &loaded_path, &env),
         _ => dos::run_init_program(
             machine,
             dos_template,
             threads,
-            buf,
+            buf.into_bytes(),
             args,
             cmdline_tail,
             cwd,
@@ -1461,7 +1461,7 @@ fn prepare_program<A: crate::Arch>(
 fn launch_elf<A: crate::Arch>(
     machine: &mut A,
     threads: &mut [thread::Thread<A>],
-    buf: alloc::vec::Vec<u8>,
+    buf: crate::kernel::exec::ExecutableImage,
     path: &[u8],
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cwd: &[u8],
@@ -1476,7 +1476,7 @@ fn launch_elf<A: crate::Arch>(
         t.kernel.tid as usize
     };
     crate::kernel::kpipe::add_reader(cpipe);
-    crate::kernel::linux::exec_elf_into(machine, threads, tid, &buf, path, &args, None).unwrap_or_else(
+    crate::kernel::linux::exec_elf_image_into(machine, threads, tid, &buf, path, &args, None).unwrap_or_else(
         |e| {
             lib::compact_panic!(
                 "ELF exec failed ({}): errno {}",
@@ -1718,6 +1718,9 @@ fn event_loop<A: crate::Arch>(
     let mut klog_check_passes = 0u32;
 
     loop {
+        if display.is_none() {
+            windows.release_output_buffers();
+        }
         let requested_profile = profile_enabled();
         if requested_profile != execution_profile_on {
             machine.execution_profile_set(requested_profile);
@@ -2773,7 +2776,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
         },
         _ => path.to_vec(),
     };
-    let buf = match exec::load_file_resolved(&read_path) {
+    let buf = match exec::load_executable_resolved(&read_path) {
         Ok(b) => b,
         Err(_) => {
             on_error(vcpu, 2);
@@ -2789,7 +2792,7 @@ pub(crate) fn handle_fork_exec<A: crate::Arch>(
     crate::compact_dbg_println!(
         "handle_fork_exec: {:?} size={} format={} free_pages={}",
         core::str::from_utf8(path).unwrap_or("<non-UTF-8>"),
-        buf.len(),
+        buf.file_size(),
         match format {
             exec::BinaryFormat::Elf => "elf",
             exec::BinaryFormat::Lx => "lx",

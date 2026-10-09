@@ -196,6 +196,12 @@ emulated guest card. Only when no PnP Sound Blaster is found does RetroOS try
 legacy DSP probing and mixer restrapping. A PnP configuration failure does
 not fall through to legacy restrapping. Discovery always logs the IDs of all
 readable ISA PnP logical devices, including non-audio functions.
+ESS ES1868/ES1869 audio functions are also activated as SB-compatible devices.
+Their FM/MPU port order follows the ESS resource layout, and their verified
+PnP IRQ/8-bit DMA settings supply the native card's wiring. SB16 `H` requests
+are ignored for ESS; its second DMA engine is disabled for SB compatibility.
+Select Sound Blaster Pro in DOS games (for example, `BLASTER=A220 I7 D1 P330 T5`);
+ESS extended audio and kernel mixing through the ESS card are not implemented.
 
 When both HDA and a real Sound Blaster are present, native mode gives the SB
 to DOS and keeps HDA available for kernel audio. `SB_AUDIO=mixed` starts with

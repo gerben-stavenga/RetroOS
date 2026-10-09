@@ -723,7 +723,12 @@ pub(crate) fn setup_user_stack<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs
 
 /// Load an ELF binary into the current address space and initialize the thread.
 /// Caller must have already cleaned/prepared the address space.
-pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &[u8], path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
+pub(crate) fn exec_elf_image_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &crate::kernel::exec::ExecutableImage, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
+    exec_elf_source_into(machine, threads, tid, data, data.source.as_ref(), path, args, environment)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exec_elf_source_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thread<A>], tid: usize, data: &[u8], source: Option<&crate::kernel::exec::ExecutableFile>, path: &[u8], args: &[alloc::vec::Vec<u8>], environment: Option<&[u8]>) -> Result<(), i32> {
     // PIE main + dynamic linker load bases. Kept in the low user region
     // (< USER_STACK_TOP) so they don't need the high 64-bit VA range; ld.so
     // mmaps the shared libraries between these and the stack.
@@ -748,7 +753,7 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
     // Both static and dynamic PIE must stay clear of the low BIOS/VGA and
     // hosted trap-workspace mappings. Static musl relocates itself using auxv.
     let main_bias = if is_pie { PIE_BASE } else { 0 };
-    let loaded = elf::load_elf(machine, data, main_bias).map_err(|_| 8)?;
+    let loaded = elf::load_elf_source(machine, data, main_bias, source).map_err(|_| 8)?;
     let want_64 = loaded.class == elf::ElfClass::Elf64;
 
     // Dynamic: load the interpreter (ld.so) at INTERP_BASE and build the full
@@ -760,8 +765,8 @@ pub fn exec_elf_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
         // "/lib64/ld-linux-x86-64.so.2" → VFS "lib64/ld-linux-x86-64.so.2".
         let mut s: &[u8] = ip;
         while s.first() == Some(&b'/') { s = &s[1..]; }
-        let interp_data = crate::kernel::exec::load_file_resolved(s).map_err(|_| 8)?;
-        let interp_loaded = elf::load_elf(machine, &interp_data, INTERP_BASE).map_err(|_| 8)?;
+        let interp_data = crate::kernel::exec::load_executable_resolved(s).map_err(|_| 8)?;
+        let interp_loaded = elf::load_elf_source(machine, &interp_data, INTERP_BASE, interp_data.source.as_ref()).map_err(|_| 8)?;
         let aux = alloc::vec![
             (3usize, loaded.phdr_vaddr),  // AT_PHDR
             (4, loaded.phentsize),        // AT_PHENT
@@ -1254,7 +1259,8 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
     let cwd_snapshot: alloc::vec::Vec<u8> = linux.cwd_str().into();
 
     // Load file (resolves path against cwd)
-    let mut buffer = match exec::load_file(&path, &cwd_snapshot) {
+    let mut resolved = [0; 164];
+    let mut buffer = match exec::load_executable_resolved(exec::resolve_path(&path, &cwd_snapshot, &mut resolved)) {
         Ok(b) => b,
         Err(_) => return SyscallResult::val(-ENOENT),
     };
@@ -1296,7 +1302,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
             cmdtail = tail;
             args = alloc::vec![launcher.clone()];
             path = launcher;
-            buffer = shell;
+            buffer = shell.into();
         }
     }
 
@@ -1323,7 +1329,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     threads: &mut [thread::Thread<A>],
     vcpu: &mut Regs,
     tid: usize,
-    buffer: alloc::vec::Vec<u8>,
+    buffer: crate::kernel::exec::ExecutableImage,
     path: alloc::vec::Vec<u8>,
     args: alloc::vec::Vec<alloc::vec::Vec<u8>>,
     cmdtail: alloc::vec::Vec<u8>,

@@ -352,8 +352,7 @@ impl Sink {
     }
 }
 
-/// Say out loud what the sink reported. The library has no console, and
-/// whether an underrun is worth printing is a property of the machine.
+/// Report sink startup and count underruns without logging each occurrence.
 fn say(report: sound::sink::Report) {
     if report.first_frame {
         // The difference between "armed" and "the DAC is actually consuming" —
@@ -361,12 +360,8 @@ fn say(report: sound::sink::Report) {
         // only reports problems.
         crate::compact_println!("sink: first frame played");
     }
-    if let Some(u) = report.underrun {
-        let n = UNDERRUNS.fetch_add(1, Ordering::Relaxed) + 1;
-        let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
-            "WARNING: sound underrun #{} written_frames={} consumed_frames={}",
-            n, u.written_frames, u.consumed_frames
-        );
+    if report.underrun.is_some() {
+        UNDERRUNS.fetch_add(1, Ordering::Relaxed);
     }
 }
 

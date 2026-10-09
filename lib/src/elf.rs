@@ -366,6 +366,14 @@ impl<'a> Elf<'a> {
     /// `/lib64/ld-linux-x86-64.so.2`), without the trailing NUL. `None` for
     /// static / non-dynamic objects.
     pub fn interp(&self) -> Option<&'a [u8]> {
+        let (off, filesz) = self.interp_file_range()?;
+        let mut s = self.data.get(off..off.checked_add(filesz)?)?;
+        while s.last() == Some(&0) { s = &s[..s.len() - 1]; }
+        Some(s)
+    }
+
+    /// File range of the interpreter path, also available to streaming loaders.
+    pub fn interp_file_range(&self) -> Option<(usize, usize)> {
         let (offset, size, count) = self.ph_table();
         for i in 0..count {
             let ph_start = offset + i * size;
@@ -381,10 +389,8 @@ impl<'a> Elf<'a> {
                     (ph.typ, ph.off as usize, ph.filesz as usize)
                 }
             };
-            if typ == PT_INTERP && filesz > 0 && off + filesz <= self.data.len() {
-                let mut s = &self.data[off..off + filesz];
-                while s.last() == Some(&0) { s = &s[..s.len() - 1]; }
-                return Some(s);
+            if typ == PT_INTERP && filesz > 0 {
+                return Some((off, filesz));
             }
         }
         None

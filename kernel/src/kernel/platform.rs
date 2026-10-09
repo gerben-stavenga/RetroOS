@@ -525,7 +525,7 @@ pub fn apply_audio_mode<A: crate::Arch>(
     // permits a legacy base sweep; failure on a PnP card is not absence.
     use crate::kernel::drivers::{isapnp, sb16};
     let card = match isapnp::probe_sb(machine, pnp) {
-        isapnp::SbProbe::Configured(base) => sb16::from_pnp(machine, base),
+        isapnp::SbProbe::Configured(base, wiring) => sb16::from_pnp(machine, base, wiring),
         isapnp::SbProbe::Absent => sb16::scan(machine, declared),
         isapnp::SbProbe::Failed => None,
     };

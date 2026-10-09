@@ -3696,7 +3696,7 @@ fn exec_replace<A: crate::Arch>(
     // created by fork_exec would be.
     policy.tsr_session = true;
     thread::KernelAction::Exec {
-        buffer,
+        buffer: buffer.into(),
         path: path.clone(),
         args: alloc::vec![path],
         cmdtail: cmdtail.to_vec(),

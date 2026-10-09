@@ -1,4 +1,4 @@
-//! Minimal ISA Plug and Play support for activating Creative SB16 audio.
+//! Minimal ISA Plug and Play support for activating Creative SB16 and ESS SB-compatible audio.
 //!
 //! Inspired by Linux's pnp_activate_dev / ISA PnP backend (Jaroslav Kysela,
 //! Adam Belay and contributors):
@@ -191,7 +191,22 @@ enum Resource {
     Dma(u8),
     Unsupported,
 }
-struct Device { id: [u8; 4], csn: u8, ldn: u8, supported: bool, resources: Vec<(Option<usize>, Resource)>, alternatives: usize }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AudioKind { Creative, Ess }
+
+impl AudioKind {
+    fn name(self) -> &'static str {
+        match self { Self::Creative => "Creative", Self::Ess => "ESS AudioDrive" }
+    }
+    fn resources(self, mut want: SbResources) -> SbResources {
+        // ESS AudioDrive's SB compatibility DMA is an 8-bit ISA channel.
+        // The second descriptor belongs to its extended engine, not SB16 HDMA.
+        if self == Self::Ess { want.wiring.dma16 = None; }
+        want
+    }
+}
+
+struct Device { id: [u8; 4], csn: u8, ldn: u8, audio: Option<AudioKind>, resources: Vec<(Option<usize>, Resource)>, alternatives: usize }
 
 fn creative_audio(id: &[u8]) -> bool {
     // Compressed EISA manufacturer "CTL" plus logical audio IDs listed by
@@ -199,6 +214,16 @@ fn creative_audio(id: &[u8]) -> bool {
     id.len() >= 4 && id[..2] == [0x0E, 0x8C]
         && matches!(u16::from_be_bytes([id[2], id[3]]),
             0x0001 | 0x0031 | 0x0041 | 0x0042 | 0x0043 | 0x0044 | 0x0045)
+}
+
+fn audio_kind(id: &[u8]) -> Option<AudioKind> {
+    if creative_audio(id) { return Some(AudioKind::Creative); }
+    // ES1868/ES1869 datasheets: the audio+FM+MPU function, not the
+    // ESS0000/ESS0006 configuration function or joystick/CD-ROM siblings.
+    // https://www.alsa-project.org/files/pub/manuals/ess/DS1869.pdf (Appendix A)
+    if id.len() >= 4 && id[..2] == [0x16, 0x73]
+        && matches!(u16::from_be_bytes([id[2], id[3]]), 0x1868 | 0x1869)
+    { Some(AudioKind::Ess) } else { None }
 }
 
 fn parse_devices(csn: u8, bytes: &[u8]) -> Option<Vec<Device>> {
@@ -217,7 +242,7 @@ fn parse_devices(csn: u8, bytes: &[u8]) -> Option<Vec<Device>> {
         if kind == 0x0F { return (size == 1 && alternative.is_none()).then_some(result); }
         if kind == 2 {
             if size < 5 || alternative.is_some() || result.len() >= 32 { return None; }
-            result.push(Device { id: data[..4].try_into().ok()?, csn, ldn: result.len() as u8, supported: creative_audio(data),
+            result.push(Device { id: data[..4].try_into().ok()?, csn, ldn: result.len() as u8, audio: audio_kind(data),
                 resources: Vec::new(), alternatives: 0 });
             ended_group = false;
             continue;
@@ -255,7 +280,9 @@ fn parse_devices(csn: u8, bytes: &[u8]) -> Option<Vec<Device>> {
 }
 
 fn requested_registers(dev: &Device, want: SbResources) -> Option<Vec<(u8, u8)>> {
-    if !dev.supported || !matches!(want.base, 0x220 | 0x240 | 0x260 | 0x280)
+    let kind = dev.audio?;
+    let want = kind.resources(want);
+    if !matches!(want.base, 0x220 | 0x240 | 0x260 | 0x280)
         || !matches!(want.wiring.irq, 5 | 7 | 9 | 10)
         || !matches!(want.wiring.dma8, 0 | 1 | 3)
         || !want.wiring.dma16.is_none_or(|d| matches!(d, 5..=7)) { return None; }
@@ -267,7 +294,11 @@ fn requested_registers(dev: &Device, want: SbResources) -> Option<Vec<(u8, u8)>>
             if group.is_some_and(|n| n != alt) { continue; }
             match resource {
                 Resource::Port { min, max, align, len } => {
-                    let Some(&value) = [want.base, want.mpu, 0x388].get(ports) else { valid = false; break };
+                    let order = match kind {
+                        AudioKind::Creative => [want.base, want.mpu, 0x388],
+                        AudioKind::Ess => [want.base, 0x388, want.mpu],
+                    };
+                    let Some(&value) = order.get(ports) else { valid = false; break };
                     if value < min || value > max || len == 0
                         || !(value - min).is_multiple_of(u16::from(align.max(1))) { valid = false; break; }
                     registers.push((0x60 + ports as u8 * 2, (value >> 8) as u8));
@@ -288,6 +319,8 @@ fn requested_registers(dev: &Device, want: SbResources) -> Option<Vec<(u8, u8)>>
             }
         }
         if valid && ports > 0 && irqs == 1 && dmas > 0 && (want.wiring.dma16.is_none() || dmas == 2) {
+            // ESS's secondary audio IRQ is unused in SB compatibility mode.
+            if kind == AudioKind::Ess { registers.push((0x72, 0)); }
             return Some(registers);
         }
     }
@@ -299,13 +332,13 @@ struct Snapshot { active: u8, registers: Vec<(u8, u8)> }
 /// Absence permits legacy probing. Finding a PnP SB but failing to configure
 /// it must not send that same card through legacy mixer restrapping.
 #[derive(Debug, PartialEq, Eq)]
-pub enum SbProbe { Absent, Configured(u16), Failed }
+pub enum SbProbe { Absent, Configured(u16, SbWiring), Failed }
 
 fn configure_devices<I: Io>(
     bus: &mut Bus<I>, devices: &[Device], want: Option<SbResources>,
     mut verify: impl FnMut(&mut I, u16) -> bool,
 ) -> SbProbe {
-    if !devices.iter().any(|dev| dev.supported) {
+    if !devices.iter().any(|dev| dev.audio.is_some()) {
         crate::compact_println!("ISA PnP: no Sound Blaster found; trying legacy DSP discovery");
         return SbProbe::Absent;
     }
@@ -314,6 +347,8 @@ fn configure_devices<I: Io>(
         return SbProbe::Failed;
     };
     for dev in devices {
+        let Some(kind) = dev.audio else { continue };
+        let want = kind.resources(want);
         let Some(registers) = requested_registers(dev, want) else { continue };
         // An already-active target is ours to reconfigure; every other
         // active device (including sibling functions) keeps its resources.
@@ -322,9 +357,9 @@ fn configure_devices<I: Io>(
         let Some(old) = bus.activate(dev, &registers) else { continue };
         bus.wait();
         if verify(&mut bus.io, want.base) {
-            crate::compact_println!("ISA PnP: configured Creative audio CSN{} LDN{} at {:#x}, IRQ{} DMA{} HDMA{:?}",
-                dev.csn, dev.ldn, want.base, want.wiring.irq, want.wiring.dma8, want.wiring.dma16);
-            return SbProbe::Configured(want.base);
+            crate::compact_println!("ISA PnP: configured {} audio CSN{} LDN{} at {:#x}, IRQ{} DMA{} HDMA{:?}",
+                kind.name(), dev.csn, dev.ldn, want.base, want.wiring.irq, want.wiring.dma8, want.wiring.dma16);
+            return SbProbe::Configured(want.base, want.wiring);
         }
         bus.key();
         bus.restore(dev, &old);
@@ -335,7 +370,7 @@ fn configure_devices<I: Io>(
 }
 
 /// Discover PnP first, including cards already enabled by firmware/UNISOUND.
-/// Configure a Creative audio device from BLASTER, then let the caller use
+/// Configure a supported audio device from BLASTER, then let the caller use
 /// the ordinary DSP initialization at that exact base. LPC routing must work.
 pub fn probe_sb<A: crate::Arch>(machine: &mut A, want: Option<SbResources>) -> SbProbe {
     let mut bus = Bus { io: Hardware(machine), rdp: READ_PORTS[0] };
@@ -353,7 +388,7 @@ pub fn probe_sb<A: crate::Arch>(machine: &mut A, want: Option<SbResources>) -> S
             let vendor = [((a >> 2) & 31) + 64, (((a & 3) << 3) | (b >> 5)) + 64, (b & 31) + 64];
             crate::compact_println!("ISA PnP: CSN{} LDN{} {}{}{}{:02X}{:02X}{}",
                 dev.csn, dev.ldn, vendor[0] as char, vendor[1] as char, vendor[2] as char, c, d,
-                if dev.supported { " Sound Blaster" } else { "" });
+                if dev.audio.is_some() { " Sound Blaster" } else { "" });
         }
         devices.append(&mut found);
     }
@@ -385,6 +420,64 @@ mod tests {
             0x79, 0,
         ]
     }
+    // ES1869 datasheet Appendix A, audio LDN's basic alternatives 0000/0001:
+    // DMA, DMA, IRQ, SB ports, FM ports, MPU ports (in that order).
+    fn ess_fixture(product: u8) -> Vec<u8> {
+        vec![
+            0x15, 0x16, 0x73, 0x18, product, 0,
+            0x31, 0,
+            0x2A, 2, 8, 0x2A, 9, 8, 0x22, 0x20, 0,
+            0x47, 1, 0x20, 2, 0x20, 2, 0, 16,
+            0x47, 1, 0x88, 3, 0x88, 3, 0, 4,
+            0x47, 1, 0x30, 3, 0x30, 3, 0, 2,
+            0x31, 1,
+            0x2A, 2, 8, 0x2A, 9, 8, 0x22, 0xA0, 6,
+            0x47, 1, 0x20, 2, 0x40, 2, 0x20, 16,
+            0x47, 1, 0x88, 3, 0x88, 3, 0, 4,
+            0x47, 1, 0, 3, 0x30, 3, 0x30, 2,
+            0x38, 0x79, 0,
+        ]
+    }
+
+    #[test]
+    fn ess_audio_ids_and_datasheet_resource_order() {
+        for product in [0x68, 0x69] {
+            let dev = parse_devices(2, &ess_fixture(product)).unwrap().remove(0);
+            assert_eq!(dev.audio, Some(AudioKind::Ess));
+            let regs = requested_registers(&dev, request()).unwrap();
+            for reg in [(0x60, 2), (0x61, 0x20), (0x62, 3), (0x63, 0x88),
+                        (0x64, 3), (0x65, 0x30), (0x70, 7), (0x71, 2),
+                        (0x72, 0), (0x74, 1), (0x75, 4)] {
+                assert!(regs.contains(&reg), "missing {reg:?}");
+            }
+            let mut bad = request(); bad.wiring.dma8 = 3;
+            assert!(requested_registers(&dev, bad).is_none());
+        }
+        for product in [0x0000u16, 0x0006, 0x0001, 0x0002] {
+            let [hi, lo] = product.to_be_bytes();
+            assert_eq!(audio_kind(&[0x16, 0x73, hi, lo]), None);
+        }
+    }
+
+    #[test]
+    fn ess_activation_returns_verified_8bit_wiring_and_rolls_back_failure() {
+        let devices = parse_devices(2, &ess_fixture(0x69)).unwrap();
+        let want = request(); // Default SB16 H5 must not become ESS's second DMA.
+        let wiring = SbWiring { dma16: None, ..want.wiring };
+        let mut bus = Bus { io: Fake::new(), rdp: 0x213 };
+        assert_eq!(configure_devices(&mut bus, &devices, Some(want), |_, base| base == 0x220),
+            SbProbe::Configured(0x220, wiring));
+        assert_eq!(bus.io.regs[0x75], 4);
+        assert_eq!(bus.io.regs[0x30], 1);
+        let mut changed = want; changed.base = 0x240;
+        assert_eq!(configure_devices(&mut bus, &devices, Some(changed), |_, _| false), SbProbe::Failed);
+        assert_eq!(bus.io.regs[0x61], 0x20);
+        assert_eq!(bus.io.regs[0x63], 0x88);
+        assert_eq!(bus.io.regs[0x65], 0x30);
+        assert_eq!(bus.io.regs[0x75], 4);
+        assert_eq!(bus.io.regs[0x30], 1);
+    }
+
     #[test]
     fn validates_resources_and_ignores_non_audio_ids() {
         let mut devices = parse_devices(3, &fixture()).unwrap();
@@ -396,7 +489,7 @@ mod tests {
         assert!(requested_registers(&devices[0], bad).is_none());
         bad = request(); bad.wiring.irq = 10;
         assert!(requested_registers(&devices[0], bad).is_none());
-        devices[0].supported = creative_audio(&[0x0E, 0x8C, 0, 0x21]); // wavetable
+        devices[0].audio = audio_kind(&[0x0E, 0x8C, 0, 0x21]); // wavetable
         assert!(requested_registers(&devices[0], request()).is_none());
     }
     #[test]
@@ -504,7 +597,7 @@ mod tests {
         bus.io.regs[0x60] = 2; bus.io.regs[0x61] = 0x40;
         bus.io.regs[0x70] = 5;
         assert_eq!(configure_devices(&mut bus, &devices, Some(request()), |_, base| base == 0x220),
-            SbProbe::Configured(0x220));
+            SbProbe::Configured(0x220, request().wiring));
         assert_eq!(bus.io.regs[0x61], 0x20);
         assert_eq!(bus.io.regs[0x70], 7);
         assert_eq!(bus.io.regs[0x30], 1);

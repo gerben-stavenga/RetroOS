@@ -193,8 +193,8 @@ pub fn scan<A: crate::Arch>(machine: &mut A, declared: Option<SbWiring>) -> Opti
 
 /// PnP already selected and verified this DSP. Do not sweep other bases and
 /// accidentally bind a different legacy card instead.
-pub(crate) fn from_pnp<A: crate::Arch>(machine: &mut A, base: u16) -> Option<Sb16> {
-    identify(machine, base, None, true)
+pub(crate) fn from_pnp<A: crate::Arch>(machine: &mut A, base: u16, wiring: SbWiring) -> Option<Sb16> {
+    identify(machine, base, Some(wiring), true)
 }
 
 fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWiring>, pnp: bool) -> Option<Sb16> {
@@ -222,7 +222,8 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
         }
         (_, d) => d,
     };
-    let source = if is_sb16 { " (SB16: straps read from the mixer)" } else { " (declared)" };
+    let source = if is_sb16 { " (SB16: straps read from the mixer)" }
+        else if pnp { " (ISA PnP: verified resources)" } else { " (declared)" };
     if is_sb16 {
         machine.outb(base + MIX_IDX, 0x22);
         crate::kernel::osd::observe_sb_master(machine.inb(base + MIX_DATA));

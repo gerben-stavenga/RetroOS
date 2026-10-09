@@ -40,6 +40,84 @@ pub fn load_file_resolved(path: &[u8]) -> Result<Vec<u8>, i32> {
     Ok(buf)
 }
 
+/// An executable keeps only ELF metadata in memory. Its open file supplies
+/// segment bytes during loading; other formats retain their existing buffers.
+pub struct ExecutableImage {
+    bytes: Vec<u8>,
+    pub(crate) source: Option<ExecutableFile>,
+}
+
+pub(crate) struct ExecutableFile {
+    handle: i32,
+    size: usize,
+}
+
+impl Drop for ExecutableFile {
+    fn drop(&mut self) { vfs::close_vfs_handle(self.handle); }
+}
+
+impl ExecutableFile {
+    pub(crate) fn read_exact(&self, offset: usize, mut bytes: &mut [u8]) -> Result<(), i32> {
+        let end = offset.checked_add(bytes.len()).ok_or(8)?;
+        if end > self.size || offset > i32::MAX as usize { return Err(8); }
+        if vfs::seek_by_handle(self.handle, offset as i32, 0) < 0 { return Err(5); }
+        while !bytes.is_empty() {
+            let count = vfs::read_by_handle(self.handle, bytes);
+            if count <= 0 { return Err(5); }
+            bytes = &mut bytes[count as usize..];
+        }
+        Ok(())
+    }
+}
+
+impl core::ops::Deref for ExecutableImage {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] { &self.bytes }
+}
+
+impl From<Vec<u8>> for ExecutableImage {
+    fn from(bytes: Vec<u8>) -> Self { Self { bytes, source: None } }
+}
+
+impl ExecutableImage {
+    pub fn into_bytes(self) -> Vec<u8> { self.bytes }
+
+    pub fn file_size(&self) -> usize {
+        self.source.as_ref().map_or(self.bytes.len(), |f| f.size)
+    }
+}
+
+pub fn load_executable_resolved(path: &[u8]) -> Result<ExecutableImage, i32> {
+    let handle = vfs::open_to_handle(path);
+    if handle < 0 { return Err(2); }
+    let file = ExecutableFile { handle, size: vfs::file_size_by_handle(handle) as usize };
+    let mut bytes = alloc::vec![0; file.size.min(64)];
+    file.read_exact(0, &mut bytes)?;
+    if bytes.starts_with(b"\x7fELF") {
+        let elf = lib::elf::Elf::parse(&bytes).map_err(|_| 8)?;
+        let (off, stride, count) = elf.ph_table_info();
+        let minimum = if elf.class() == lib::elf::ElfClass::Elf64 { 56 } else { 32 };
+        if stride < minimum { return Err(8); }
+        let end = off.checked_add(stride.checked_mul(count).ok_or(8)?).ok_or(8)?;
+        // Bound metadata allocation separately from executable payload size.
+        if end > file.size || end > 1024 * 1024 { return Err(8); }
+        bytes.resize(end.max(bytes.len()), 0);
+        file.read_exact(0, &mut bytes)?;
+        let elf = lib::elf::Elf::parse(&bytes).map_err(|_| 8)?;
+        if let Some((off, len)) = elf.interp_file_range() {
+            let end = off.checked_add(len).ok_or(8)?;
+            if end > file.size || end > 1024 * 1024 { return Err(8); }
+            bytes.resize(end.max(bytes.len()), 0);
+            file.read_exact(0, &mut bytes)?;
+        }
+        Ok(ExecutableImage { bytes, source: Some(file) })
+    } else {
+        bytes.resize(file.size, 0);
+        file.read_exact(0, &mut bytes)?;
+        Ok(bytes.into())
+    }
+}
+
 // ── Format detection ────────────────────────────────────────────────────
 
 /// Binary format detected from magic bytes and file extension.
@@ -126,6 +204,27 @@ fn is_pe(data: &[u8]) -> bool {
 mod tests {
     use super::{BinaryFormat, detect_format, detect_format_for_dos, absolute_dos_cwd};
     use alloc::vec;
+
+    #[test]
+    fn elf_interpreter_range_survives_metadata_only_buffers() {
+        // ELF64 with an interpreter path outside the buffered program headers.
+        let mut bytes = vec![0u8; 120];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&3u32.to_le_bytes());
+        bytes[72..80].copy_from_slice(&4096u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&10u64.to_le_bytes());
+        let elf = lib::elf::Elf::parse(&bytes).unwrap();
+        assert_eq!(elf.interp_file_range(), Some((4096, 10)));
+        assert_eq!(elf.interp(), None);
+        bytes.resize(4106, 0);
+        bytes[4096..4106].copy_from_slice(b"/lib/ld.so");
+        assert_eq!(lib::elf::Elf::parse(&bytes).unwrap().interp(), Some(&b"/lib/ld.so"[..]));
+    }
 
     #[test]
     fn inherited_dos_cwd_becomes_an_absolute_dos_path_before_vfs_translation() {
@@ -217,7 +316,8 @@ fn has_ext(path: &[u8], ext: &[u8; 3]) -> bool {
 /// - `cmdtail` is UTF-8; legacy loaders encode it for their guest command block.
 /// - `parent_cwd` is the parent's cwd in VFS form, inherited by each personality.
 #[allow(clippy::too_many_arguments)]
-pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: Vec<u8>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, policy: crate::kernel::dos::LaunchPolicy, exec_vga: ExecVga) -> Result<(), i32> {
+pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel::thread::Thread<A>], tid: usize, data: impl Into<ExecutableImage>, path: &[u8], args: Vec<Vec<u8>>, cmdtail: Vec<u8>, parent_env_data: Vec<u8>, parent_cwd: Vec<u8>, personality_name: Option<crate::kernel::thread::PersonalityName>, policy: crate::kernel::dos::LaunchPolicy, exec_vga: ExecVga) -> Result<(), i32> {
+    let data = data.into();
     // Name the thread for the F12 switch picker — the one path every launch
     // (boot init and fork-exec) flows through, so every task is named.
     threads[tid].kernel.set_comm(path);
@@ -232,7 +332,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
             let environment = if personality_name == Some(crate::kernel::thread::PersonalityName::Linux) {
                 Some(parent_env_data.as_slice())
             } else { None };
-            crate::kernel::linux::exec_elf_into(machine, threads, tid, &data, path, &args, environment)?;
+            crate::kernel::linux::exec_elf_image_into(machine, threads, tid, &data, path, &args, environment)?;
             if let crate::kernel::thread::Personality::Linux(linux) = &mut threads[tid].personality {
                 // DOS launchers preserve the current drive as C:/directory;
                 // Linux needs the corresponding path in the VFS namespace.
@@ -247,17 +347,17 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
         BinaryFormat::Elf => Err(-8),
         BinaryFormat::Lx if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::os2::exec_lx_into(
-                machine, threads, tid, data, path, &parent_cwd, personality_name, &parent_env_data, &cmdtail)
+                machine, threads, tid, data.bytes, path, &parent_cwd, personality_name, &parent_env_data, &cmdtail)
         }
         BinaryFormat::Lx => Err(-8),
         BinaryFormat::Ne if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::windows::exec_ne_into(
-                machine, threads, tid, data, path, &parent_cwd, personality_name)
+                machine, threads, tid, data.bytes, path, &parent_cwd, personality_name)
         }
         BinaryFormat::Ne => Err(-8),
         BinaryFormat::Pe if matches!(exec_vga, ExecVga::None) => {
             crate::kernel::windows::exec_pe_into(
-                machine, threads, tid, data, path, &parent_cwd, personality_name, &parent_env_data)
+                machine, threads, tid, data.bytes, path, &parent_cwd, personality_name, &parent_env_data)
         }
         BinaryFormat::Pe => Err(-8),
         fmt => {
@@ -267,7 +367,7 @@ pub fn init_thread<A: crate::Arch>(machine: &mut A, threads: &mut [crate::kernel
             // (personality_name == Some(Dos)); otherwise it's VFS and exec_dos_into
             // dosifies it (the cross-personality / boot fallback).
             let args0_is_dos = personality_name == Some(crate::kernel::thread::PersonalityName::Dos);
-            crate::kernel::dos::exec_dos_into(machine, threads, tid, data, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, policy, vga);
+            crate::kernel::dos::exec_dos_into(machine, threads, tid, data.bytes, is_exe, args, cmdtail, parent_env_data, parent_cwd, args0_is_dos, policy, vga);
             Ok(())
         }
     }

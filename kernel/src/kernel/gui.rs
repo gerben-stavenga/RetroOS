@@ -731,6 +731,14 @@ impl WindowManager {
         &mut self.desktop
     }
 
+    /// Native fullscreen VGA bypasses composition. Keep the scene and process
+    /// surfaces, but release output scratch storage while there is no sink.
+    pub fn release_output_buffers(&mut self) {
+        self.composed = Vec::new();
+        self.osd_pixels = Vec::new();
+        self.osd_geometry = None;
+    }
+
     pub fn remove_endpoint(&mut self, endpoint: EndpointId) {
         if self.switcher_active == Some(endpoint) || self.switcher_highlighted == Some(endpoint) {
             self.finish_task_switcher();
@@ -2526,6 +2534,10 @@ mod tests {
         assert_eq!(compose(&mut manager), vec![Rect::new(0, 0, 4, 2)]);
         assert!(compose(&mut manager).is_empty());
         manager.enter_fullscreen(window);
+        manager.release_output_buffers();
+        assert_eq!(manager.composed.capacity(), 0);
+        assert_eq!(manager.osd_pixels.capacity(), 0);
+        assert_eq!(manager.desktop.geometry(node), Some(Rect::new(0, 0, 2, 1)));
         manager.enter_windowed(window);
         assert_eq!(compose(&mut manager), vec![Rect::new(0, 0, 4, 2)]);
     }

@@ -47,7 +47,7 @@ pub struct LoadedElf {
 /// modern distro binary or the dynamic linker itself). Relocations are NOT
 /// applied here — for dynamically-linked images the interpreter (ld.so) does
 /// that; `load_bias` only places the segments.
-pub fn load_elf<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usize) -> Result<LoadedElf, ElfError> {
+pub(crate) fn load_elf_source<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usize, source: Option<&crate::kernel::exec::ExecutableFile>) -> Result<LoadedElf, ElfError> {
     let elf = lib::elf::Elf::parse(elf_data)?;
 
     let mut max_vaddr = 0usize;
@@ -58,15 +58,28 @@ pub fn load_elf<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usi
     // keeps this loader backend-agnostic: on metal the guest VA is a valid
     // kernel pointer, while on the interpreter it indexes the software MMU's
     // address space.
+    let mut scratch = source.map(|_| alloc::vec![0u8; 16 * 1024]);
     for seg in elf.segments() {
-        let vaddr = seg.vaddr + load_bias;
-        let end = vaddr + seg.memsz;
+        let vaddr = seg.vaddr.checked_add(load_bias).ok_or(ElfError::InvalidType)?;
+        let end = vaddr.checked_add(seg.memsz).ok_or(ElfError::InvalidType)?;
+        if seg.filesz > seg.memsz { return Err(ElfError::InvalidType); }
         if end > max_vaddr { max_vaddr = end; }
-        if let Some(data) = seg.data {
-            machine.copy_to(vaddr, data);
-            if seg.memsz > data.len() {
-                machine.zero(vaddr + data.len(), seg.memsz - data.len());
+        if let Some(source) = source {
+            let scratch = scratch.as_mut().unwrap();
+            let mut copied = 0;
+            while copied < seg.filesz {
+                let count = (seg.filesz - copied).min(scratch.len());
+                let offset = seg.file_offset.checked_add(copied).ok_or(ElfError::InvalidType)?;
+                source.read_exact(offset, &mut scratch[..count]).map_err(|_| ElfError::InvalidType)?;
+                machine.copy_to(vaddr + copied, &scratch[..count]);
+                copied += count;
             }
+        } else if seg.filesz > 0 {
+            let data = seg.data.ok_or(ElfError::InvalidType)?;
+            machine.copy_to(vaddr, data);
+        }
+        if seg.memsz > seg.filesz {
+            machine.zero(vaddr + seg.filesz, seg.memsz - seg.filesz);
         }
     }
 
@@ -90,9 +103,8 @@ pub fn load_elf<A: crate::Arch>(machine: &mut A, elf_data: &[u8], load_bias: usi
 
     let (phoff, phentsize, phnum) = elf.ph_table_info();
     let phdr_vaddr = elf.segments().find_map(|seg| {
-        let bytes = seg.data?;
-        let file_offset = bytes.as_ptr() as usize - elf_data.as_ptr() as usize;
-        if phoff >= file_offset && phoff + phentsize * phnum <= file_offset + bytes.len() {
+        let file_offset = seg.file_offset;
+        if phoff >= file_offset && phoff + phentsize * phnum <= file_offset + seg.filesz {
             Some(load_bias + seg.vaddr + phoff - file_offset)
         } else { None }
     }).unwrap_or(0);
