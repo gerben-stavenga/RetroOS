@@ -56,8 +56,9 @@ def main():
     assert (ROOT / 'bazel-bin/retroos-base.img').stat().st_size == 16 * 1024 * 1024
     with tarfile.open(ROOT / 'bazel-bin/machine_boot_tar.tar') as archive:
         names = {m.name.removeprefix('./') for m in archive.getmembers()}
-    assert {'COMMANDER/DN2D214/DN.COM', 'COMMANDER/DN2D214/DN.PRG', 'COMMANDER/DN2W214/DN.EXE', 'COMMANDER/DN2O214/DN.EXE',
-            'COMMANDER/NDN-D32/NDN.COM', 'COMMANDER/NDN-W32/NDN.EXE', 'COMMANDER/NDN-O32/NDN.EXE'} <= names
+    assert 'DN/DN.COM' in names and 'RETROOS/COMMAND.COM' in names
+    assert 'RETROOS/BOOT.INI' not in names
+    assert not any(n.startswith(('COMMANDER/', 'GAMES/', 'TC/', 'ULTRASND/')) for n in names)
     with tempfile.TemporaryDirectory(prefix='retroos-showcase-') as folder:
         work = Path(folder)
         original = ROOT / 'bazel-bin/retroos_grub_module_usb.img'

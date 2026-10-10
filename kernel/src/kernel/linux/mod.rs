@@ -2109,8 +2109,7 @@ fn at_base<'a, A: crate::Arch>(
         && (dirfd as usize) < thread::MAX_FDS
         && let thread::FdKind::Dir { handle, .. } = kt.fds[dirfd as usize]
     {
-        let n = vfs::dir_handle_path(handle, buf);
-        if n > 0 {
+        if let Some(n) = vfs::dir_handle_path(handle, buf) {
             return &buf[..n];
         }
     }
@@ -2359,11 +2358,13 @@ fn sys_getdents64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
     // The fd's recorded directory; a dead/unknown handle falls back to cwd
     // (the pre-table behavior for opendir(".")).
     let mut dir_buf = [0u8; vfs::DIR_PATH_MAX];
-    let dir_len = vfs::dir_handle_path(handle, &mut dir_buf);
-    let cwd: &[u8] = if dir_len > 0 { &dir_buf[..dir_len] } else { linux.cwd_str() };
+    let directory: &[u8] = match vfs::dir_handle_path(handle, &mut dir_buf) {
+        Some(len) => &dir_buf[..len],
+        None => linux.cwd_str(),
+    };
 
     let mut offset = 0usize;
-    while let Some(entry) = vfs::readdir(cwd, index) {
+    while let Some(entry) = vfs::readdir(directory, index) {
         index += 1;
 
         let name = &entry.name[..entry.name_len];

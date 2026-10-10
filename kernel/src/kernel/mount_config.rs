@@ -625,13 +625,15 @@ pub fn apply(
             path.extend_from_slice(b"RETROOS/RETROOS.INI");
             Box::leak(path.into_boxed_slice()) as &'static [u8]
         });
-    // Bundle runtime and applications have stable views irrespective of C:'s
-    // backing store. Both permit RW opens; edits stay in the boot overlay.
+    // An external C: owns its applications and data. Only the matched runtime
+    // and default shell come from the boot bundle; edits stay in RAM.
+    let external_c = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
     let mut entries = Vec::new();
     bootfs.readdir(bundle_home.strip_suffix(b"/").unwrap_or(bundle_home), 0, &mut entries, usize::MAX);
     for entry in entries {
         let name = &entry.name[..entry.name_len];
         if !entry.is_dir || entry.is_symlink || matches!(name, b"." | b".." | b"bin" | b"TEMP" | b"lost+found") { continue; }
+        if external_c && !matches!(name, b"RETROOS" | b"DN") { continue; }
         let directory: &'static [u8] = Box::leak([name, b"/"].concat().into_boxed_slice());
         let source = [b"bootbundle/".as_slice(), bundle_home, directory].concat();
         let exposed = [c, directory].concat();

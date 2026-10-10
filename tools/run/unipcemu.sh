@@ -2,13 +2,34 @@
 # The emulator may rewrite settings on exit, so keep its whole directory in WORK.
 launch() {
     local vm="$WORK/unipcemu" binary rom_dir usb_image iso_image
-    local machine_arch cmos_section cpu video_card=0 et4000_extensions=0
-    binary="${UNIPCEMU_BIN:-$(command -v UniPCemu || command -v unipcemu || true)}"
+    local machine_arch cmos_section cpu cmos_seed= video_card=0 et4000_extensions=0
+    binary="${UNIPCEMU_BIN:-}"
+    if [ -z "$binary" ] && [ -x "$SCRIPT_DIR/build/unipcemu-bitbucket/UniPCemu-apm-fixed" ]; then
+        binary="$SCRIPT_DIR/build/unipcemu-bitbucket/UniPCemu-apm-fixed"
+    fi
+    [ -n "$binary" ] || binary="$(command -v UniPCemu || command -v unipcemu || true)"
     [ -n "$binary" ] || fail "UniPCemu executable not found; set UNIPCEMU_BIN"
-    rom_dir="${UNIPCEMU_ROM_DIR:-}"
-    [ -n "$rom_dir" ] && [ -d "$rom_dir" ] || fail "UniPCemu needs a motherboard BIOS ROM; set UNIPCEMU_ROM_DIR to its ROM directory"
+    rom_dir="${UNIPCEMU_ROM_DIR:-$SCRIPT_DIR/build/unipcemu-bitbucket/ROM}"
+    [ -d "$rom_dir" ] || fail "UniPCemu needs a motherboard BIOS ROM; set UNIPCEMU_ROM_DIR to its ROM directory"
     case "${UNIPCEMU_ARCH:-i430fx}" in
-        i430fx) machine_arch=4; cmos_section=i430fxCMOS; cpu=5 ;;
+        i430fx)
+            machine_arch=4; cmos_section=i430fxCMOS; cpu=5
+            # 640K base + 31M extended, with a matching CMOS checksum.
+            cmos_seed='gotCMOS=1
+RAM0D=128
+RAM0E=0
+RAM15=128
+RAM16=2
+RAM17=0
+RAM18=124
+RAM2E=0
+RAM2F=254
+RAM30=0
+RAM31=124
+RAM33=129
+RAM35=240
+RAM36=1'
+            ;;
         i440fx) machine_arch=5; cmos_section=i440fxCMOS; cpu=7 ;;
         *) fail "UNIPCEMU_ARCH must be i430fx or i440fx" ;;
     esac
@@ -68,8 +89,9 @@ executionmode=4
 bootorder=$boot_order
 
 [$cmos_section]
-memory=134217728
+memory=33554432
 cpu=$cpu
+$cmos_seed
 clockingmode=1
 videocard=$video_card
 ET4000_extensions=$et4000_extensions

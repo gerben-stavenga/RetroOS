@@ -690,8 +690,8 @@ pkg_tar(
 # One build target keeps the installed kernel and all runtime files matched.
 pkg_tar(
     name = "machine_boot_tar",
-    files = _BOOT_DIR_FILES | {"//kernel:kernel_elf": "kernel.elf"},
-    deps = [":apps_boot_tar", ":showcase_module_tar", ":bin_tar"],
+    files = {src: dst for src, dst in _BOOT_DIR_FILES.items() if dst != "RETROOS/BOOT.INI"} | {"//kernel:kernel_elf": "kernel.elf"},
+    deps = [":apps_boot_tar", ":bin_tar"],
 )
 
 # The data manifest declares lifetime explicitly, including any writable
@@ -864,6 +864,7 @@ pkg_tar(
     mode = "0644",
     files = {
         ":machine_boot_tar": "machine_boot.tar",
+        ":showcase_module_tar": "showcase.tar",
         "tools/release/install.sh": "install.sh",
         "tools/machine_install.py": "tools/machine_install.py",
         "tools/grub_module_install.py": "tools/grub_module_install.py",

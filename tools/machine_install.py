@@ -47,8 +47,8 @@ def validate(c_root, destination):
             existing = existing.parent
         if filesystem(existing) != root:
             raise ValueError(f"{path} must be on the Linux root filesystem (separate /boot is not supported yet)")
-    if not c_root.is_dir():
-        raise ValueError(f"C: root does not exist: {c_root}")
+    if c_root.exists() and not c_root.is_dir():
+        raise ValueError(f"C: root is not a directory: {c_root}")
     return root["uuid"]
 
 
@@ -82,7 +82,34 @@ def grub_entries(plan):
     return "\n".join(entries)
 
 
-def prepare(c_root, destination, archive=None):
+def copy_showcase_tree(source, destination, owner=None):
+    """Seed ordinary C: files, preserving existing files and symlink trees."""
+    if destination.is_symlink() or (destination.exists() and not destination.is_dir()):
+        return 0
+    if not destination.exists():
+        destination.mkdir()
+        destination.chmod(0o2775)
+        if owner is not None:
+            os.chown(destination, *owner)
+    copied = 0
+    for entry in sorted(source.iterdir()):
+        target = destination / entry.name
+        if entry.is_dir():
+            copied += copy_showcase_tree(entry, target, owner)
+        elif not target.exists() and not target.is_symlink():
+            try:
+                with entry.open('rb') as src, target.open('xb') as dst:
+                    shutil.copyfileobj(src, dst)
+            except FileExistsError:
+                continue
+            target.chmod((entry.stat().st_mode & 0o777) | 0o660)
+            if owner is not None:
+                os.chown(target, *owner)
+            copied += 1
+    return copied
+
+
+def prepare(c_root, destination, archive=None, copy_showcase=False, showcase_archive=None):
     uuid = validate(c_root, destination)
     archive = archive or ROOT / "bazel-bin" / "machine_boot_tar.tar"
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -90,10 +117,19 @@ def prepare(c_root, destination, archive=None):
     if len(str(release / "RETROOS")) >= 128 or len(str(c_root)) >= 128:
         raise ValueError("installed paths exceed the kernel's 127-byte limit")
     # Versioned directories keep the previous kernel/runtime pair available.
-    stage = STAGE / digest[:12]
+    stage_id = digest[:12]
+    if copy_showcase:
+        showcase_archive = showcase_archive or (ROOT / 'showcase.tar' if (ROOT / 'showcase.tar').exists()
+                                               else ROOT / 'bazel-bin/showcase_module_tar.tar')
+        showcase_digest = hashlib.sha256(showcase_archive.read_bytes()).hexdigest()
+        stage_id = hashlib.sha256((digest + showcase_digest).encode()).hexdigest()[:12]
+    stage = STAGE / stage_id
     stage.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive) as tar:
         tar.extractall(stage / "runtime", filter=runtime_filter)
+    if copy_showcase:
+        with tarfile.open(showcase_archive) as tar:
+            tar.extractall(stage / 'showcase', filter='data')
     # User settings have one permanent location and are never overwritten.
     user_ini = c_root / "RETROOS" / "RETROOS.INI"
     settings = user_ini.read_text() if user_ini.exists() else (stage / "runtime" / "RETROOS" / "RETROOS.INI").read_text()
@@ -111,7 +147,10 @@ def prepare(c_root, destination, archive=None):
             raise ValueError(f"{existing_boot} has no [bundle] section")
         boot_ini = re.sub(r'(?ms)^\[bundle\]\s*\n.*?(?=^\[|\Z)', lambda _: bundle, previous, count=1)
     (stage / "BOOT.INI").write_text(boot_ini)
+    owner = c_root.stat() if c_root.exists() else None
     plan = dict(uuid=uuid, c_root=str(c_root), destination=str(destination),
+                c_owner=[owner.st_uid, owner.st_gid] if owner else [os.getuid(), os.getgid()],
+                copy_showcase=copy_showcase,
                 release=str(release), boot_ini=str(destination / "BOOT.INI"), archive_sha256=digest,
                 user_ini_sha256=hashlib.sha256(user_ini.read_bytes()).hexdigest() if user_ini.exists() else None,
                 boot_ini_sha256=hashlib.sha256(existing_boot.read_bytes()).hexdigest() if existing_boot.exists() else None)
@@ -140,6 +179,7 @@ def prepare(c_root, destination, archive=None):
         checksum(p) for p in files}, indent=2) + "\n")
     (STAGE / "selected").write_text(str(stage) + "\n")
     print(f"Prepared {stage}\nRoot UUID: {uuid}\nC: {c_root}\nRuntime: {release}/RETROOS")
+    print('Showcase: copy missing files into C:' if copy_showcase else 'Showcase: skip; use existing C: files')
     print("Review grub.cfg, then run the installer as root without --prepare.")
 
 
@@ -155,6 +195,10 @@ def install():
     c_root = Path(plan["c_root"])
     if validate(c_root, Path(plan["destination"])) != plan["uuid"]:
         raise ValueError("root UUID changed; prepare again")
+    if not c_root.exists():
+        c_root.mkdir(parents=True)
+        c_root.chmod(0o2775)
+        os.chown(c_root, *plan['c_owner'])
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     release = Path(plan["release"])
     if not release.exists():
@@ -228,6 +272,10 @@ def install():
         else:
             managed.write_bytes(old_managed)
         raise
+    if plan.get('copy_showcase'):
+        owner = c_root.stat()
+        copied = copy_showcase_tree(stage / 'showcase', c_root, (owner.st_uid, owner.st_gid))
+        print(f'Copied {copied} showcase files into {c_root}; existing files and links preserved.')
     print(f"Installed {release}. Select 'RetroOS (current, persistent)' to keep changes.")
     print("Other GRUB entries and previous releases are retained. No reboot performed.")
 
@@ -238,9 +286,19 @@ def main():
     parser.add_argument("--archive", type=Path, help="prebuilt matched kernel/runtime tar")
     parser.add_argument("--c-root", type=Path, default=Path("/home/retroos"))
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
+    parser.add_argument('--copy-showcase', action=argparse.BooleanOptionalAction, default=None,
+                        help='seed C: with showcase files, preserving existing files (default: ask on a terminal only when creating C:, otherwise skip)')
+    parser.add_argument('--showcase-archive', type=Path, help='optional showcase tar to copy into C:')
     args = parser.parse_args()
     if args.prepare:
-        prepare(args.c_root.resolve(), args.destination.resolve(), args.archive)
+        copy_showcase = args.copy_showcase
+        if copy_showcase is None:
+            import sys
+            copy_showcase = not args.c_root.exists() and not args.c_root.is_symlink() and sys.stdin.isatty() and input(
+                f'Copy showcase (games, commanders and assets) into {args.c_root}, preserving existing files? [y/N] '
+            ).strip().lower() in ('y', 'yes')
+        prepare(args.c_root.resolve(), args.destination.resolve(), args.archive,
+                copy_showcase, args.showcase_archive)
     else:
         install()
 

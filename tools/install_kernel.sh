@@ -18,6 +18,6 @@ if [ "${1:-}" = --module ]; then
 fi
 if [ "${1:-}" = --prepare ]; then
     [ "$(id -u)" != 0 ] || { echo 'Prepare as your normal user, not root.' >&2; exit 1; }
-    bazelisk build //:machine_boot_tar
+    bazelisk build //:machine_boot_tar //:showcase_module_tar
 fi
 exec python3 tools/machine_install.py "$@"

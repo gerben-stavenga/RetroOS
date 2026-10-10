@@ -472,3 +472,9 @@ Caveats on real hardware (vs the `run_uefi.sh` mock):
   it gets there (no journal recovery), so this looks like a device-handoff
   problem — RetroOS parks the HDA codec on the way out but not storage or USB.
   Under investigation.
+
+Disk installer preparation asks whether to copy the showcase only when the C:
+directory does not yet exist. Existing C: directories skip copying by default.
+Use `--copy-showcase` or `--no-copy-showcase` for scripted preparation.
+Copying adds missing ordinary files and preserves existing files and symlink
+directories. These are disk files, with no showcase mount or RAM image.

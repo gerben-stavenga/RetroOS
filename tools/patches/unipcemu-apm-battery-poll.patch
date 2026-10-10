@@ -1,0 +1,41 @@
+diff --git a/UniPCemu/hardware/apm.c b/UniPCemu/hardware/apm.c
+index 8643daa..9556d35 100644
+--- a/UniPCemu/hardware/apm.c
++++ b/UniPCemu/hardware/apm.c
+@@ -485,9 +485,13 @@ byte APM_updateLowBattery()
+ 
+ void tickAPM() //APM base timing handler!
+ {
+-	//result of low battery: 0: no low battery, 1: low battery set, 2: low battery still set, 3: low low battery set, 4: low low battery still set
+-	switch (APM_updateLowBattery()) //What event?
++	++i82347_basetimer; //Base timer tick!
++	if (i82347_basetimer >= 4096) //Ticked 1/8th of a second?
+ 	{
++		i82347_basetimer -= 4096; //Ticking!
++		//result of low battery: 0: no low battery, 1: low battery set, 2: low battery still set, 3: low low battery set, 4: low low battery still set
++		switch (APM_updateLowBattery()) //What event?
++		{
+ 	default:
+ 	case 0: //No event!
+ 		//Reset low battery timers!
+@@ -518,12 +522,7 @@ void tickAPM() //APM base timing handler!
+ 		break;
+ 	case 4: //LLB still set?
+ 		break;
+-	}
+-	//TODO: APM timers! Base 32KHz.
+-	++i82347_basetimer; //Base timer tick!
+-	if (i82347_basetimer >= 4096) //Ticked 1/8th of a second?
+-	{
+-		i82347_basetimer -= 4096; //Ticking!
++		}
+ 		//Ticked 1/8th of a second!
+ 		i82347_ticktimercounter(0); //Tick timer 0!
+ 		i82347_ticktimercounter(1); //Tick timer 1!
+@@ -856,4 +855,4 @@ void initAPM()
+ 
+ void doneAPM()
+ {
+-}
+\ No newline at end of file
++}

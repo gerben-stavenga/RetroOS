@@ -5,6 +5,28 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-10
+
+### Fixes and improvements
+
+- Boot configuration now separates `BOOT.INI` filesystem mounts from
+  `RETROOS.INI` startup, locale, keyboard and sound settings. Mounts support
+  UUID selection, file-backed images and explicit access modes; unlisted
+  physical partitions remain unmounted.
+- PCI IDE discovery uses controller modes and BARs to select channels.
+- Boot essentials and DN are separated from the optional showcase of games
+  and commanders. USB and CD-ROM boots load the showcase by default and
+  offer a core-only option to reduce RAM use.
+- Disk installations use applications on their C: filesystem. The installer
+  can create C: and optionally copy missing showcase files while preserving
+  existing files and symlink directories. Only the matched runtime and DN
+  receive boot-bundle overlays on an external C:.
+- Linux directory handles distinguish the root directory from invalid
+  handles, fixing root listings and relative operations through root handles.
+- UniPCemu launch settings include initialized i430fx CMOS memory values,
+  a 32 MiB configuration and automatic discovery of the local emulator and
+  ROM directory. A battery-poll timing patch is supplied for UniPCemu.
+
 ## [0.8.1] - 2026-10-08
 
 ### Fixes and improvements

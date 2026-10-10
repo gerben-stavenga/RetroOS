@@ -44,7 +44,8 @@ is not supported yet. The core contains DN, BusyBox and runtime libraries;
 VC, MC, RC, NDN (DOS/Windows/OS/2), DN/2 (DOS/Windows/OS/2), and games
 live directly under `showcase-bundle/`, which mirrors their `C:` paths and is
 packaged with one recursive glob into a single showcase image. USB loads it by default; the GRUB “Core only
-(less RAM)” choice omits it. Disk installations read showcase files on demand.
+(less RAM)” choice omits it. Disk installations use the games and apps already on their C: filesystem;
+the installer supplies only the core runtime and DN.
 
 Runtime files and DN have writable session views; `C:\TEMP` is RAM. A mounted
 Linux root keeps its own `/bin` and `/usr/bin`. Bundled BusyBox serves the RAM
@@ -414,3 +415,9 @@ RETROOS.INI selects which filesystems are exposed and their DOS drive letters.
 Unlisted physical partitions stay unmounted. **H:** is reserved for HostFS;
 **A:** and **B:** are floppy drives. Use F12 **Disk → HD** to see active mappings
 or **Disk → Mnt** to stage and export a mount profile.
+
+Disk installer preparation asks whether to copy the showcase only when the C:
+directory does not yet exist. Existing C: directories skip copying by default.
+Use `--copy-showcase` or `--no-copy-showcase` for scripted preparation.
+Copying adds missing ordinary files and preserves existing files and symlink
+directories. These are disk files, with no showcase mount or RAM image.

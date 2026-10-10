@@ -131,6 +131,14 @@ def main():
         runtime = root / "boot/retroos/RETROOS/TEST.DAT"
         runtime.write_bytes(b"BOOT")
         runtime.chmod(0o666)
+        # An older installed release may still contain showcase directories.
+        # They must not replace real C: data or appear as automatic mounts.
+        (home / "GAMES").mkdir()
+        (home / "GAMES/OWN.DAT").write_bytes(b"OWN!")
+        (root / "boot/retroos/GAMES").mkdir()
+        (root / "boot/retroos/GAMES/SHOW.DAT").write_bytes(b"SHOW")
+        (root / "boot/retroos/COMMANDER").mkdir()
+        (root / "boot/retroos/COMMANDER/SHOW.DAT").write_bytes(b"SHOW")
         source = work / "probe.c"
         source.write_text(r'''
 static int call(int n,int a,int b,int c) { int r;
@@ -144,6 +152,13 @@ void _start(void) {
  f=call(5,(int)"/bin/sh",0,0);
  if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='L' || b[1]!='N') goto fail;
  call(6,f,0,0);
+ f=call(5,(int)"/home/retroos/GAMES/OWN.DAT",0,0);
+ if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='O') goto fail;
+ call(6,f,0,0);
+ f=call(5,(int)"/home/retroos/GAMES/SHOW.DAT",0,0);
+ if(f>=0) goto fail;
+ f=call(5,(int)"/home/retroos/COMMANDER/SHOW.DAT",0,0);
+ if(f>=0) goto fail;
  f=call(5,(int)"/home/retroos/RETROOS/TEST.DAT",0,0);
  if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='B') goto fail;
  call(6,f,0,0);

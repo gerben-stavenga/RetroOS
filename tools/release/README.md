@@ -261,3 +261,9 @@ at `C:\TEMP`.
 
 The kernel supports legacy IDE, AHCI/SATA, and NVMe storage; USB storage is not supported.
 Bootloader support for a disk does not imply the kernel can access that disk.
+
+Disk installer preparation asks whether to copy the showcase only when the C:
+directory does not yet exist. Existing C: directories skip copying by default.
+Use `--copy-showcase` or `--no-copy-showcase` for scripted preparation.
+Copying adds missing ordinary files and preserves existing files and symlink
+directories. These are disk files, with no showcase mount or RAM image.

@@ -72,6 +72,26 @@ def main():
                          and ".." in terminal_text().splitlines()[21][:40])
                 send(b"\r")
                 wait_for("parent directory", lambda: left_directory() == "/work")
+                # RC keeps its process cwd at /work while browsing /. A root
+                # directory fd must list/stat root, rather than fall back to cwd.
+                send(b"\x1b[H")  # Home: select ..
+                wait_for("parent selection", lambda: ".." in terminal_text().splitlines()[21][:40])
+                send(b"\r")
+                wait_for("root listing", lambda: left_directory() == ""
+                         and "bin" in "\n".join(line[:40] for line in terminal_text().splitlines()[3:21])
+                         and "work" in "\n".join(line[:40] for line in terminal_text().splitlines()[3:21]))
+                root_entries = [line[:40].split("│")[1].strip()
+                                for line in terminal_text().splitlines()[3:20]]
+                work_index = root_entries.index("/work")
+                def selected_name():
+                    return terminal_text().splitlines()[21][:40].split("│")[1].strip()
+                send(b"\x1b[H")
+                wait_for("root first entry", lambda: selected_name() == root_entries[0])
+                for entry in root_entries[1:work_index + 1]:
+                    send(b"\x1b[B")
+                    wait_for("root selection " + entry, lambda: selected_name() == entry)
+                send(b"\r")
+                wait_for("work after root", lambda: left_directory() == "/work")
                 send(b"\x1b[18~")  # F7
                 send(b"created\r")
                 wait_for("created directory", lambda: (work / "created").is_dir())
@@ -115,7 +135,7 @@ def main():
         assert (work / "copied.txt").read_text() == "Original text\n"
         contents = (work / "note.txt").read_text()
         assert contents.startswith(".x\n"), repr(contents)
-    print("PASS: Rat Commander navigation, mkdir, copy, editor period/Enter/save, DOS child execution and clean quit (KVM)")
+    print("PASS: Rat Commander root browsing, navigation, mkdir, copy, editor period/Enter/save, DOS child execution and clean quit (KVM)")
 
 
 if __name__ == "__main__":

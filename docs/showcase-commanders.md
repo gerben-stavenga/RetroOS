@@ -1,6 +1,7 @@
 # Showcase commanders
 
-Disk installs read these programs on demand. USB boots load one showcase
+On disk, copy the desired programs to your C: filesystem. The disk installer
+supplies only the core runtime and DN. USB boots load one showcase
 module containing all commanders and games by default. Choose “Core only
 (less RAM)” in GRUB to omit it. DN remains the startup commander. The directories below live under
 `showcase-bundle/COMMANDER/` and appear at `C:\COMMANDER\`.

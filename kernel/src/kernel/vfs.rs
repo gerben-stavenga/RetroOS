@@ -1974,19 +1974,19 @@ pub fn open_dir_handle(path: &[u8]) -> i32 {
     -24
 }
 
-/// Copy the handle's directory path into `buf`; returns its length (0 for a
-/// dead/invalid handle — the caller falls back to cwd, the pre-table behavior).
-pub fn dir_handle_path(idx: i32, buf: &mut [u8; DIR_PATH_MAX]) -> usize {
+/// Copy a live handle's directory path into `buf`. Root has length zero;
+/// `None` identifies a dead/invalid handle without confusing it with root.
+pub fn dir_handle_path(idx: i32, buf: &mut [u8; DIR_PATH_MAX]) -> Option<usize> {
     if !(0..DIR_HANDLES as i32).contains(&idx) {
-        return 0;
+        return None;
     }
     let t = DIR_TABLE.lock();
     let e = &t[idx as usize];
     if e.refcount == 0 {
-        return 0;
+        return None;
     }
     buf[..e.len as usize].copy_from_slice(&e.path[..e.len as usize]);
-    e.len as usize
+    Some(e.len as usize)
 }
 
 /// Increment a dir handle's refcount (Linux fork/dup).
@@ -2188,6 +2188,20 @@ mod tests {
     static READDIR_CALLS: AtomicUsize = AtomicUsize::new(0);
     static PATH_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
     static NODE_OPEN_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn root_directory_handle_is_distinct_from_invalid_handle() {
+        let handle = super::open_dir_handle(b"");
+        assert!(handle >= 0);
+        let mut path = [0; super::DIR_PATH_MAX];
+        assert_eq!(super::dir_handle_path(handle, &mut path), Some(0));
+        assert_eq!(super::dir_handle_path(-1, &mut path), None);
+        super::add_dir_ref(handle);
+        super::close_dir_handle(handle);
+        assert_eq!(super::dir_handle_path(handle, &mut path), Some(0));
+        super::close_dir_handle(handle);
+        assert_eq!(super::dir_handle_path(handle, &mut path), None);
+    }
 
     #[test]
     fn fat_root_keeps_exact_vfs_names_and_aliases_as_metadata() {
