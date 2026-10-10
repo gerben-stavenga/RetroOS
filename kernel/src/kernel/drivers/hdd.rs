@@ -14,6 +14,7 @@ use super::storage::{Buffer, Command, Error, Hardware, Operation, Storage, poll,
 use super::storage::COMMAND_TIMEOUT_NS;
 use crate::kernel::portio::{inb, insw, outb, outl, outsw, now_ns};
 use super::dma::Region;
+use alloc::sync::Arc;
 use crate::kernel::pci;
 
 /// ATA register offsets from base port
@@ -46,9 +47,67 @@ mod cmd {
     pub const INITIALIZE_PARAMETERS: u8 = 0x91;
 }
 
-/// The two legacy ISA channels: (base, control). Every PC has these at fixed
-/// ports; anything beyond them is PCI-configured and out of scope here.
+/// Compatibility-mode and ISA channels: (command base, device control).
 pub const CHANNELS: [(u16, u16); 2] = [(0x1F0, 0x3F6), (0x170, 0x376)];
+
+/// One taskfile shared by master and slave. Keep PCI ownership with the
+/// channel so DMA setup cannot accidentally configure another controller.
+struct Channel {
+    base: u16,
+    ctrl: u16,
+    pci: Option<(u8, u8, u8)>,
+    secondary: bool,
+    lock: spin::Mutex<()>,
+}
+
+/// Native IDE control BARs describe a four-port block; device control is +2.
+/// Reject unassigned, memory, and out-of-range BARs rather than truncating them.
+fn channel_ports(interface: u8, secondary: bool, command: u32, control: u32)
+    -> Option<(u16, u16)>
+{
+    let native = if secondary { 4 } else { 1 };
+    if interface & native == 0 { return Some(CHANNELS[usize::from(secondary)]); }
+    fn io_bar(bar: u32, last_offset: u32) -> Option<u16> {
+        let base = bar & !3;
+        (bar & 1 != 0 && base != 0 && base <= 0xffff - last_offset)
+            .then_some(base as u16)
+    }
+    Some((io_bar(command, 7)?, io_bar(control, 3)? + 2))
+}
+
+fn channels<A: crate::Arch>(machine: &mut A) -> alloc::vec::Vec<Arc<Channel>> {
+    let mut channels = alloc::vec::Vec::<Arc<Channel>>::new();
+    for (bus, dev, func) in pci::find_classes(machine, 1, 1) {
+        let interface = (pci::read32(machine, bus, dev, func, 8) >> 8) as u8;
+        for secondary in [false, true] {
+            let bar = if secondary { 0x18 } else { 0x10 };
+            let command = pci::read32(machine, bus, dev, func, bar);
+            let control = pci::read32(machine, bus, dev, func, bar + 4);
+            let Some((base, ctrl)) = channel_ports(interface, secondary, command, control) else {
+                lib::compact_println!("ATA: PCI {}:{}:{} {} invalid I/O BARs {:#x}/{:#x}",
+                    bus, dev, func, if secondary { "secondary" } else { "primary" }, command, control);
+                continue;
+            };
+            if channels.iter().any(|channel| channel.base == base) { continue; }
+            // Only enable I/O decoding. Preserve firmware's channel mode and
+            // timings, and do not write back PCI status (write-one-to-clear).
+            let command = pci::read32(machine, bus, dev, func, 4) & 0xffff;
+            pci::write32(machine, bus, dev, func, 4, command | 1);
+            lib::compact_println!("ATA: PCI {}:{}:{} {} ports={:#x}/{:#x}",
+                bus, dev, func, if secondary { "secondary" } else { "primary" }, base, ctrl);
+            channels.push(Arc::new(Channel { base, ctrl, pci: Some((bus, dev, func)),
+                secondary, lock: spin::Mutex::new(()) }));
+        }
+    }
+    // ISA-only machines have no PCI IDE function. Probe each remaining legacy
+    // taskfile once; a native PCI channel must not be reset a second time.
+    for (index, (base, ctrl)) in CHANNELS.into_iter().enumerate() {
+        if channels.iter().any(|channel| channel.base == base) { continue; }
+        channels.push(Arc::new(Channel { base, ctrl, pci: None,
+            secondary: index == 1, lock: spin::Mutex::new(()) }));
+    }
+    channels
+}
 
 /// The LBA28 addressing ceiling — this driver cannot reach past it.
 const LBA28_MAX: u64 = 1 << 28;
@@ -129,11 +188,10 @@ fn needs_cache_flush(words: &[u16; 256]) -> bool {
 /// One ATA drive: a channel plus a master/slave select.
 pub struct Ata {
     base: u16,
+    channel: Arc<Channel>,
     /// 0 = master, 1 = slave. Shifted into bit 4 of the drive/head register.
     drive: u8,
     addressing: Addressing,
-    /// Always 4 bytes ("ata0".."ata3"); copied into the common disk wrapper.
-    name: [u8; 4],
     mwdma2: bool,
     cache_flush: bool,
     bus_master: Option<BusMaster>,
@@ -148,7 +206,8 @@ impl Ata {
     /// SLAVE answers DRDY because the master drives the bus on its behalf, so
     /// a status check alone invents a phantom disk. A drive that won't
     /// IDENTIFY (no device, or ATAPI, which we don't support) is not a disk.
-    fn probe(base: u16, drive: u8) -> Option<Self> {
+    fn probe(channel: Arc<Channel>, drive: u8) -> Option<Self> {
+        let base = channel.base;
         let select = 0xA0 | (drive << 4);
 
         outb(base + reg::LBA_24_27_FLAGS, select);
@@ -168,11 +227,7 @@ impl Ata {
             return None;
         }
 
-        // Channel 0 master is "ata0", channel 0 slave "ata1", and so on.
-        let index = if base == CHANNELS[1].0 { 2 } else { 0 } + drive;
-        let name = [b'a', b't', b'a', b'0' + index];
-
-        let mut disk = Ata { base, drive, addressing: Addressing::Lba28(0), name, mwdma2: false,
+        let mut disk = Ata { base, channel, drive, addressing: Addressing::Lba28(0), mwdma2: false,
                              cache_flush: true, bus_master: None };
         disk.addressing = disk.identify_addressing()?;
         if let Addressing::Chs { heads, sectors, .. } = disk.addressing {
@@ -281,21 +336,21 @@ impl Ata {
 pub type AtaDisk = Storage<Ata>;
 
 impl Storage<Ata> {
-    fn probe<A: crate::Arch>(machine: &mut A, base: u16, drive: u8) -> Option<Self> {
-        let mut ata = Ata::probe(base, drive)?;
+    fn probe<A: crate::Arch>(machine: &mut A, channel: Arc<Channel>, index: usize, drive: u8) -> Option<Self> {
+        let mut ata = Ata::probe(channel, drive)?;
         let sectors = ata.addressing.capacity();
-        let name = ata.name;
+        let name = alloc::format!("ata{}", index * 2 + usize::from(drive));
         let buffer = if ata.mwdma2 {
             if let Some((controller, buffer)) = BusMaster::probe(machine, &ata) {
                 ata.bus_master = Some(controller);
                 buffer
             } else { Buffer::pio(256) }
         } else { Buffer::pio(256) };
-        lib::compact_println!("ATA: {} {} {}", core::str::from_utf8(&name).unwrap_or("ata?"),
+        lib::compact_println!("ATA: {} {} {}", name.as_str(),
             if matches!(ata.addressing, Addressing::Chs { .. }) { "CHS" } else { "LBA28" },
             if ata.bus_master.is_some() { "DMA" } else { "PIO" });
         Some(Self::new(ata, buffer, sectors,
-            core::str::from_utf8(&name).unwrap_or("ata?")))
+            name.as_str()))
     }
 }
 
@@ -303,27 +358,25 @@ impl Storage<Ata> {
 /// the slave probe would undo the master's newly selected DMA mode.
 pub fn probe<A: crate::Arch>(machine: &mut A) -> alloc::vec::Vec<AtaDisk> {
     let mut disks = alloc::vec::Vec::new();
-    for (base, ctrl) in CHANNELS {
-        outb(ctrl, 0x04);
+    for (index, channel) in channels(machine).into_iter().enumerate() {
+        let ctrl = channel.ctrl;
+        // Transfers are polled, including native channels without an IRQ handler.
+        outb(ctrl, 0x06);
         // SRST must be asserted for at least 5 us. Port reads also provide
         // ordering on legacy machines whose clocks cannot yet be calibrated.
         for _ in 0..256 { inb(ctrl); }
-        outb(ctrl, 0);
+        outb(ctrl, 0x02);
         for _ in 0..256 { inb(ctrl); }
         for drive in 0..2 {
-            if let Some(disk) = AtaDisk::probe(machine, base, drive) { disks.push(disk); }
+            if let Some(disk) = AtaDisk::probe(machine, channel.clone(), index, drive) { disks.push(disk); }
         }
     }
     disks
 }
 
-// Both devices on one legacy channel share a taskfile and data port.
-static CHANNEL_LOCKS: [spin::Mutex<()>; 2] = [spin::Mutex::new(()), spin::Mutex::new(())];
-
 impl Hardware for Ata {
     fn execute(&mut self, c: Command, buffer: &mut Buffer) -> Result<(), Error> {
-        let channel = usize::from(self.base == CHANNELS[1].0);
-        let _channel = CHANNEL_LOCKS[channel].lock();
+        let _channel = self.channel.lock.lock();
         if c.operation == Operation::Flush {
             self.select();
             self.wait(status::DRDY)?;
@@ -361,13 +414,13 @@ struct BusMaster { base: u16, dma: Region }
 
 impl BusMaster {
     fn probe<A: crate::Arch>(machine: &mut A, ata: &Ata) -> Option<(Self, Buffer)> {
-        let (bus, dev, func) = pci::find_class(machine, 1, 1)?;
+        let (bus, dev, func) = ata.channel.pci?;
         // IDE bus-master registers are standard; transfer timings are not.
         // PIIX3/PIIX4 provide independent master/slave MWDMA2 timings.
         let id = pci::read32(machine, bus, dev, func, 0);
         if !matches!(id, 0x7010_8086 | 0x7111_8086) { return None; }
         let interface = (pci::read32(machine, bus, dev, func, 8) >> 8) as u8;
-        let secondary = ata.base == CHANNELS[1].0;
+        let secondary = ata.channel.secondary;
         let native = if secondary { 4 } else { 1 };
         if interface & 0x80 == 0 || interface & native != 0 { return None; }
         let bar = pci::read32(machine, bus, dev, func, 0x20);
@@ -399,6 +452,10 @@ impl BusMaster {
         outb(ata.base + reg::COMMAND, 0xef); // SET FEATURES
         for _ in 0..4 { inb(ata.base + reg::STATUS); }
         ata.wait(status::DRDY).ok()?;
+        // Bus-master completion uses the controller's latched IDE interrupt
+        // bit, so DMA needs INTRQ even though we poll that latch. PIO-only
+        // native channels keep nIEN set to avoid unhandled PCI interrupts.
+        outb(ata.channel.ctrl, 0);
         // Advertise DMA capability for the selected drive in BMIDE status.
         outb(base + 2, inb(base + 2) | (1 << (5 + ata.drive)) | 6);
         let buffer = unsafe { dma.buffer(4096, 256 * 512) };
@@ -465,6 +522,25 @@ fn ide_prds(mut phys: u32, mut bytes: u32) -> [u32; 6] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pci_ide_channel_modes_and_control_offset() {
+        // Compatibility BARs are allowed to be unimplemented. Each channel
+        // has its own mode bit, so mixed compatibility/native is valid.
+        assert_eq!(channel_ports(0x80, false, 0, 0), Some((0x1f0, 0x3f6)));
+        assert_eq!(channel_ports(0x80, true, 0, 0), Some((0x170, 0x376)));
+        assert_eq!(channel_ports(0x81, false, 0xc001, 0xc009), Some((0xc000, 0xc00a)));
+        assert_eq!(channel_ports(0x81, true, 0, 0), Some((0x170, 0x376)));
+        assert_eq!(channel_ports(0x84, false, 0, 0), Some((0x1f0, 0x3f6)));
+        assert_eq!(channel_ports(0x84, true, 0xd001, 0xd009), Some((0xd000, 0xd00a)));
+        assert_eq!(channel_ports(0x85, false, 0xfff9, 0xfffd), Some((0xfff8, 0xfffe)));
+        for (command, control) in [(0, 0xc009), (1, 0xc009), (0xc000, 0xc009),
+                                   (0xc001, 0xc008), (0x10001, 0xc009),
+                                   (0xc001, 0x10001), (0xffff, 0xc009),
+                                   (0xffffffff, 0xffffffff)] {
+            assert_eq!(channel_ports(0x85, false, command, control), None);
+        }
+    }
+
     fn legacy_identify() -> [u16; 256] {
         let mut words = [0; 256];
         words[1] = 615;
