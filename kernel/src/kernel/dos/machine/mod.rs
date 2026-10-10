@@ -32,7 +32,7 @@ pub const IOPL_MASK: u32 = 3 << 12;
 /// real run IOPL — every ring-3 exit pins the real IOPL to 1; this only rides
 /// the saved flags as "the level the client is treated as having", read by the
 /// PM gate (`virtual_if_stepping`). Non-conforming clients that re-enable IF via
-/// POPF/IRET (DOOM/DOOM2/HEXEN, marked in LOADFIX.CFG) are launched at IOPL=3 so
+/// POPF/IRET (DOOM/DOOM2/HEXEN, marked in RETROOS.INI [launch]) are launched at IOPL=3 so
 /// the monitor steps those re-enables. VM86 is unaffected (the gate is PM-only).
 pub const IOPL_DEFAULT: u32 = 1 << 12;
 pub const VM_FLAG: u32 = 1 << 17;

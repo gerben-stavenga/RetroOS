@@ -363,7 +363,7 @@ mod tests {
     /// error that happens to be self-consistent.
     #[test]
     fn parses_a_real_shipped_instrument() {
-        let raw = include_bytes!("../../../apps/ultrasnd/MIDI/acpiano.pat");
+        let raw = include_bytes!("../../../showcase-bundle/ULTRASND/MIDI/ACPIANO.PAT");
         let p = Patch::parse(raw).expect("acpiano.pat must parse");
         assert_eq!(&p.name[..14], b"Acoustic Piano");
         assert_eq!(p.samples.len(), 7, "acpiano is a 7-way keyboard split");

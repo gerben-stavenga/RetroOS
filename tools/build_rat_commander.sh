@@ -14,5 +14,5 @@ git -C "$work/source" checkout --detach "$revision"
 command -v x86_64-linux-musl-gcc >/dev/null
 rustup target add x86_64-unknown-linux-musl
 (cd "$work/source" && cargo build --locked --release --no-default-features --target x86_64-unknown-linux-musl)
-install -m 755 "$work/source/target/x86_64-unknown-linux-musl/release/rc" "$repo_root/apps-boot/rc/RC.EXE"
-install -m 644 "$work/source/LICENSE" "$repo_root/apps-boot/rc/LICENSE"
+install -m 755 "$work/source/target/x86_64-unknown-linux-musl/release/rc" "$repo_root/showcase-bundle/COMMANDER/RC/RC.EXE"
+install -m 644 "$work/source/LICENSE" "$repo_root/showcase-bundle/COMMANDER/RC/LICENSE"

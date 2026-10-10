@@ -49,8 +49,11 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
     ident = [value for kind, value in volumes(image) if kind == "fat"][-1]
     base = (work / "RETROOS.INI").read_text()
     source = "bundle" if module else "UUID=" + ident
-    base += f'[mount "root"]\nsource={source}\npath=/\ndrive=C\naccess={"ram" if module else "rw"}\n'
+    mounts = f'[mount "root"]\nsource={source}\npath=/\ndrive=C\naccess={"ram" if module else "rw"}\n'
     (tree / "boot/RETROOS.INI").write_text(base)
+    bundle = "module" if module else "UUID=" + ident
+    (tree / "boot/BOOT.INI").write_text(f'[bundle]\nsource={bundle}\nsubdir=/\n' + mounts)
+    commands.append("module2 /boot/BOOT.INI retroos.config=boot")
     commands.append("module2 /boot/RETROOS.INI retroos.config=ini")
     commands.extend(["boot", "}"])
     (grub / "grub.cfg").write_text("\n".join(commands) + "\n")

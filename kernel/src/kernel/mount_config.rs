@@ -32,10 +32,18 @@ pub struct Mount {
     pub grant: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct Bundle {
+    pub source: String,
+    pub subdir: String,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Config {
+    pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
     pub environment: Vec<u8>,
+    pub launch: Vec<(String, String)>,
 }
 
 fn canonical(path: &str) -> bool {
@@ -87,7 +95,10 @@ impl Config {
                     .and_then(|s| s.strip_suffix(']'))
                     .ok_or("invalid section")?
                     .trim();
-                if let Some(name) = section.strip_prefix("mount ") {
+                if section == "bundle" {
+                    if config.bundle.is_some() { return Err("duplicate bundle section"); }
+                    config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
+                } else if let Some(name) = section.strip_prefix("mount ") {
                     let name = name
                         .strip_prefix('"')
                         .and_then(|s| s.strip_suffix('"'))
@@ -109,7 +120,8 @@ impl Config {
                         subdir: "/".to_string(),
                         grant: "/".to_string(),
                     });
-                } else if !matches!(section, "system" | "locale" | "sound" | "environment") {
+                } else if !section.eq_ignore_ascii_case("launch")
+                    && !matches!(section, "system" | "locale" | "sound" | "environment") {
                     return Err("unknown section");
                 }
                 continue;
@@ -119,7 +131,30 @@ impl Config {
             if key.is_empty() || value.as_bytes().contains(&0) {
                 return Err("invalid key/value");
             }
-            if section.starts_with("mount ") {
+            if section == "bundle" {
+                let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
+                match key {
+                    "source" => bundle.source = value.into(),
+                    "subdir" => bundle.subdir = value.into(),
+                    _ => return Err("unknown bundle key"),
+                }
+            } else if section.eq_ignore_ascii_case("launch") {
+                if key.len() >= 16 || key.contains([' ', '\t', '/', '\\', ':']) {
+                    return Err("launch key must be a DOS basename under 16 bytes");
+                }
+                if line.len() > 78 {
+                    return Err("launch entry too long");
+                }
+                if value.split_ascii_whitespace().any(|flag|
+                    !["loadfix", "dos32a", "repair", "iopl3", "xms32k"]
+                        .iter().any(|known| flag.eq_ignore_ascii_case(known))) {
+                    return Err("unknown launch flag");
+                }
+                if config.launch.len() == 32 {
+                    return Err("too many launch entries");
+                }
+                config.launch.push((key.to_string(), value.to_string()));
+            } else if section.starts_with("mount ") {
                 let mount = config.mounts.last_mut().ok_or("missing mount section")?;
                 match key {
                     "source" => mount.source = value.to_string(),
@@ -174,6 +209,14 @@ impl Config {
             }
         }
         config.environment.push(0);
+        if let Some(bundle) = &mut config.bundle {
+            if !canonical(&bundle.subdir) { return Err("bundle subdir must be canonical"); }
+            if let Some(id) = bundle.source.strip_prefix("UUID=") {
+                bundle.source = alloc::format!("UUID={}", uuid_text(uuid(id)?));
+            } else if bundle.source != "module" {
+                return Err("bundle source must be module or UUID=...");
+            }
+        }
         for mount in &mut config.mounts {
             if let Some(id) = mount.source.strip_prefix("UUID=") {
                 mount.source = alloc::format!("UUID={}", uuid_text(uuid(id)?));
@@ -183,7 +226,7 @@ impl Config {
             if !canonical(&mount.path) || !canonical(&mount.subdir) || !canonical(&mount.grant) {
                 return Err("mount paths must be canonical absolute paths");
             }
-            if ["/bootbundle", "/mountfs", "/sessionfs", "/mount-export", "/dos-root"]
+            if ["/bootbundle", "/mountfs", "/sessionfs", "/userconfig", "/mount-export", "/dos-root"]
                 .iter().any(|path| contains(path, &mount.path)) {
                 return Err("internal mount path is reserved");
             }
@@ -222,6 +265,40 @@ impl Config {
         // Reject cycles before any filesystem is opened writable.
         config.order()?;
         Ok(config)
+    }
+
+    /// BOOT.INI owns storage policy; RETROOS.INI owns user settings.
+    pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
+        let config = Self::parse(bytes)?;
+        if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
+        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() {
+            return Err("user settings belong in RETROOS.INI");
+        }
+        Ok(config)
+    }
+
+    pub fn parse_user(bytes: &[u8]) -> Result<Self, &'static str> {
+        let config = Self::parse(bytes)?;
+        if config.bundle.is_some() || !config.mounts.is_empty() {
+            return Err("bundle and mounts belong in BOOT.INI");
+        }
+        Ok(config)
+    }
+
+    pub fn select_bundle(&self, module: Option<FilesystemVolume>, volumes: &[FilesystemVolume])
+        -> Result<(FilesystemVolume, &'static [u8]), &'static str>
+    {
+        let bundle = self.bundle.as_ref().ok_or("missing bundle configuration")?;
+        let volume = if bundle.source == "module" {
+            module.ok_or("BOOT.INI requires a bundle module")?
+        } else {
+            let id = uuid(bundle.source.strip_prefix("UUID=").ok_or("invalid bundle source")?)?;
+            let mut matches = volumes.iter().filter(|v| v.c_uuid() == Some(id));
+            let selected = *matches.next().ok_or("bundle UUID not found")?;
+            if matches.next().is_some() { return Err("bundle UUID is ambiguous"); }
+            selected
+        };
+        Ok((volume, prefix(&bundle.subdir)))
     }
 
     fn dependency(&self, index: usize) -> Option<usize> {
@@ -277,7 +354,7 @@ pub fn read(fs: &dyn vfs::Filesystem, path: &[u8]) -> Result<Option<Config>, &'s
     };
     if node.size > 64 * 1024 {
         fs.clunk(node.handle);
-        return Err("RETROOS.INI exceeds 64 KiB");
+        return Err("BOOT.INI exceeds 64 KiB");
     }
     let mut bytes = alloc::vec![0; node.size as usize];
     let mut offset = 0;
@@ -286,12 +363,12 @@ pub fn read(fs: &dyn vfs::Filesystem, path: &[u8]) -> Result<Option<Config>, &'s
         let n = fs.read(node.handle, offset as u32, &mut bytes[offset..], size);
         if n <= 0 {
             fs.clunk(node.handle);
-            return Err("cannot read RETROOS.INI");
+            return Err("cannot read BOOT.INI");
         }
         offset += n as usize;
     }
     fs.clunk(node.handle);
-    Config::parse(&bytes).map(Some)
+    Config::parse_boot(&bytes).map(Some)
 }
 
 /// Keep a sector overlay above a partition, rather than duplicating a whole disk.
@@ -338,7 +415,7 @@ pub fn read_bundle(
 ) -> Result<Option<(Config, &'static [u8])>, &'static str> {
     let source = volume.open(false)?;
     for home in [b"".as_slice(), b"home/retroos/"] {
-        if let Some(config) = read(source.as_ref(), &[home, b"RETROOS/RETROOS.INI"].concat())? {
+        if let Some(config) = read(source.as_ref(), &[home, b"RETROOS/BOOT.INI"].concat())? {
             return Ok(Some((config, home)));
         }
     }
@@ -539,9 +616,23 @@ pub fn apply(
         crate::kernel::dos::set_c_root(b"dos-root/");
     }
     let c = crate::kernel::dos::c_root();
+    let settings_source = config.mounts.iter().position(|m| m.drive == Some(b'C') && m.source != "bundle")
+        .map(|index| {
+            let mount = &config.mounts[index];
+            let mut path = prefix(&alloc::format!("/mountfs/{}", index)).to_vec();
+            let subdir = mount.subdir.trim_start_matches('/');
+            if !subdir.is_empty() { path.extend_from_slice(subdir.as_bytes()); path.push(b'/'); }
+            path.extend_from_slice(b"RETROOS/RETROOS.INI");
+            Box::leak(path.into_boxed_slice()) as &'static [u8]
+        });
     // Bundle runtime and applications have stable views irrespective of C:'s
     // backing store. Both permit RW opens; edits stay in the boot overlay.
-    for directory in [b"RETROOS/".as_slice(), b"DN/", b"VC/", b"MC/", b"RC/"] {
+    let mut entries = Vec::new();
+    bootfs.readdir(bundle_home.strip_suffix(b"/").unwrap_or(bundle_home), 0, &mut entries, usize::MAX);
+    for entry in entries {
+        let name = &entry.name[..entry.name_len];
+        if !entry.is_dir || entry.is_symlink || matches!(name, b"." | b".." | b"bin" | b"TEMP" | b"lost+found") { continue; }
+        let directory: &'static [u8] = Box::leak([name, b"/"].concat().into_boxed_slice());
         let source = [b"bootbundle/".as_slice(), bundle_home, directory].concat();
         let exposed = [c, directory].concat();
         if config
@@ -565,6 +656,10 @@ pub fn apply(
                 Box::leak(source.into_boxed_slice()),
             );
         }
+    }
+    if let Some(source) = settings_source {
+        vfs::bind(Box::leak([c, b"RETROOS/RETROOS.INI"].concat().into_boxed_slice()), source);
+        if !c.is_empty() { vfs::bind(b"RETROOS/RETROOS.INI", source); }
     }
     let external_root = config.mounts.iter().any(|m| m.path == "/" && m.source != "bundle");
     let explicit_bin = config.mounts.iter().find(|m| m.path == "/bin");
@@ -599,6 +694,21 @@ pub fn apply(
         let fs = Box::leak(open(volume, Access::Ram, false)?);
         let target = Box::leak(module.mount().to_vec().into_boxed_slice());
         vfs::mount(target, fs);
+        if module.mount() == b"showcase/" {
+            let mut entries = Vec::new();
+            fs.readdir(b"", 0, &mut entries, usize::MAX);
+            for entry in entries {
+                let name = &entry.name[..entry.name_len];
+                if !entry.is_dir || entry.is_symlink || matches!(name, b"." | b".." | b"lost+found") { continue; }
+                let directory: &'static [u8] = Box::leak([name, b"/"].concat().into_boxed_slice());
+                if config.mounts.iter().any(|m| prefix_bytes(&m.path) == [c, directory].concat()) { continue; }
+                let source = Box::leak([target, directory].concat().into_boxed_slice());
+                vfs::bind(Box::leak([c, directory].concat().into_boxed_slice()), source);
+                if !c.is_empty() { vfs::bind(directory, source); }
+            }
+        }
+        crate::compact_println!("Optional module: /{} ({} MiB)",
+            core::str::from_utf8(module.mount()).unwrap_or("?"), module.len / (1024 * 1024));
         if crate::kernel::dos::extra_drive_prefix(b'G').is_none() {
             crate::kernel::dos::configure_drive(b'G', target);
         }
@@ -656,6 +766,18 @@ pub fn uuid_text(id: arch_abi::VolumeUuid) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn boot_and_user_configuration_have_distinct_responsibilities() {
+        let boot = Config::parse_boot(b"[bundle]\nsource=UUID=ABCD-1234\nsubdir=/boot/release\n[mount \"session\"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n").unwrap();
+        assert_eq!(boot.bundle.unwrap().subdir, "/boot/release");
+        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[system]\nstart=DN.COM\n").is_err());
+        assert!(Config::parse_boot(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
+        assert!(Config::parse_user(b"[bundle]\nsource=module\n").is_err());
+        assert!(Config::parse_user(b"[mount \"session\"]\nsource=bundle\npath=/\n").is_err());
+        let user = Config::parse_user(b"[locale]\nlanguage=it-IT\n[launch]\nALADDIN.EXE=xms32k\n").unwrap();
+        assert_eq!(user.launch, [("ALADDIN.EXE".into(), "xms32k".into())]);
+    }
+
+    #[test]
     fn orders_image_after_its_container() {
         let c = Config::parse(b"[mount \"data\"]\nsource=file:/home/user/data.bin\npath=/dos\ndrive=C\naccess=rw\n[ mount ]");
         assert!(c.is_err());
@@ -678,5 +800,20 @@ mod tests {
             b"LOCALE=it-IT\0KEYBOARD=us\0START=C:\\DN\\DN.COM\0\0"
         );
         assert!(Config::parse(b"[mount \"bad\"]\nsource=UUID=ABCD-X234\npath=/\n").is_err());
+    }
+
+    #[test]
+    fn launch_overrides_are_preserved_separately_from_environment() {
+        let c = Config::parse(
+            b"[environment]\nHOME=C:\\MC\n[launch]\nDOOM.EXE=repair\nALADDIN.EXE=xms32k\nCHESS.EXE=\n[locale]\nlanguage=en-US\n",
+        ).unwrap();
+        assert_eq!(c.environment, b"HOME=C:\\MC\0LOCALE=en-US\0\0");
+        assert_eq!(c.launch, alloc::vec![
+            ("DOOM.EXE".to_string(), "repair".to_string()),
+            ("ALADDIN.EXE".to_string(), "xms32k".to_string()),
+            ("CHESS.EXE".to_string(), "".to_string()),
+        ]);
+        assert!(Config::parse(b"[launch]\nDOOM.EXE=typo\n").is_err());
+        assert!(Config::parse(b"[launch]\nC:\\DOOM.EXE=repair\n").is_err());
     }
 }

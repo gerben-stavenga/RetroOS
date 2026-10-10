@@ -56,6 +56,7 @@ insmod fat
 menuentry "RetroOS" {{
     search --no-floppy --file /kernel.elf --set=root
     multiboot2 /kernel.elf{cmdline}
+    module2 /RETROOS/BOOT.INI retroos.config=boot
     if [ -f /RETROOS/RETROOS.INI ]; then
         module2 /RETROOS/RETROOS.INI retroos.config=ini
     fi
@@ -276,7 +277,12 @@ def main():
                                           part_start, part_sectors)])
         core_sectors = install_grub_bios(args.out, work, args.grub_lib)
         build_fat_partition(args.out, part_start, part_sectors, work,
-                            args.grub_lib, cfg, args.kernel, args.boot_tree, efi)
+                            args.grub_lib, cfg, args.kernel, args.boot_tree, efi,
+                            volume_serial=0x5E770002)
+        ini = os.path.join(work, "BOOT.INI")
+        with open(ini, "w") as stream:
+            stream.write('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n[mount "session"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n')
+        run(["mcopy", "-o", "-i", args.out + "@@1048576", ini, "::RETROOS/BOOT.INI"])
 
         print("boot disk %s: %d MiB, core.img %d sectors, FAT32 p1 at LBA %d"
               % (args.out, args.size_mb, core_sectors, part_start))

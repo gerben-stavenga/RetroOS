@@ -4,7 +4,7 @@
 # (It used to be self-built at every boot from SRC/COMMAND.C; the source is
 # still exported for in-OS tinkering.)
 exports_files(
-    ["command.c", "LOADFIX.CFG"],
+    ["command.c"],
     visibility = ["//visibility:public"],
 )
 

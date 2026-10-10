@@ -1,0 +1,5 @@
+FreeDOS package: DOS Navigator 2, 2.14 beta (rev A)
+Based on Dos Navigator by RIT Research Labs.
+https://www.ibiblio.org/pub/micro/pc-stuff/freedos/files/repositories/1.3/apps/dn2.zip
+SHA256: 01f3401d7b24d82bd59f66d9edb65d4d18aeecade7654825eca07ffdec8b3946
+The package includes source in SOURCE/DN2/SOURCES.ZIP.

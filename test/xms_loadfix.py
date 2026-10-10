@@ -21,8 +21,10 @@ def main():
         shutil.copyfile('bazel-bin/tools/command/COMMAND.COM', root / 'COMMAND.COM')
         for name in ('LIMITED', 'NORMAL', 'WRAPPED'):
             shutil.copyfile('bazel-bin/test/dos/xmsprobe/XMSPROBE.COM', root / (name + '.COM'))
-        (root / 'RETROOS/LOADFIX.CFG').write_text(
-            'LIMITED.COM xms32k repair\nWRAPPED.COM loadfix xms32k\n')
+        (root / 'RETROOS/RETROOS.INI').write_text(
+            '[environment]\nNORMAL.COM=loadfix xms32k\n'
+            '[launch]\nLIMITED.COM=xms32k repair\nWRAPPED.COM=loadfix xms32k\n'
+            '[environment]\nNORMAL.COM=loadfix xms32k\n')
         # The second program must not inherit the first one's report limit.
         (root / 'CHECK.BAT').write_bytes(b'LIMITED.COM L\r\nNORMAL.COM U\r\n')
         for command, passes in (

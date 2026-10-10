@@ -19,7 +19,6 @@ pub mod sched;
 pub mod serial_control;
 pub mod serial_log;
 pub mod startup;
-pub mod boot_filesystems;
 pub mod thread;
 pub mod text;
 pub mod locale;

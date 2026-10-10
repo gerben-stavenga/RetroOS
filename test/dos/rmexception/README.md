@@ -7,7 +7,7 @@ probe used to detect DESQview, a real-mode INT 6 hook called through DPMI
 
 ## NDN DPMI32 smoke test
 
-The NDN distribution in `apps-boot/NDN-D32` is packaged under
+The NDN distribution in `showcase-bundle/COMMANDER/NDN-D32` is packaged under
 `C:\RETROOS\NDN-D32` on the read-only runtime volume. Its plugin loader
 opens DLLs with read/write access (INT 21h AX=716Ch, BX=0042h, falling
 back to AX=3D42h). Running there produces a `Cannot load module ...

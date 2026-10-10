@@ -121,7 +121,7 @@ pub enum KernelAction {
         /// (the generic default). Keeps this generic action free of DOS specifics —
         /// it's a tag, not a DOS path field.
         personality_name: Option<PersonalityName>,
-        /// DOS launch overrides supplied by COMMAND.COM from LOADFIX.CFG.
+        /// DOS launch overrides supplied by COMMAND.COM from RETROOS.INI [launch].
         policy: crate::kernel::dos::LaunchPolicy,
         on_error: fn(&mut crate::Regs, i32),
         on_success: fn(&mut crate::Regs, child_tid: i32),

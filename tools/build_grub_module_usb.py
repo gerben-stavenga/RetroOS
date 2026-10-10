@@ -7,6 +7,7 @@ boot partition containing all release files. GRUB's menu is
 """
 
 import argparse
+import hashlib
 import os
 import shutil
 import struct
@@ -65,8 +66,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--kernel", required=True)
     ap.add_argument("--base", required=True)
-    ap.add_argument("--games", help="optional games RAM module")
+    ap.add_argument("--showcase", help="optional games and commanders RAM module")
     ap.add_argument("--grub-cfg", required=True)
+    ap.add_argument("--boot-ini", required=True, help="editable boot storage policy")
     ap.add_argument("--ini", help="editable RetroOS configuration alongside the modules")
     ap.add_argument("--license", required=True)
     ap.add_argument("--out", required=True)
@@ -82,13 +84,18 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="retroos-module-usb.") as work:
         tree = os.path.join(work, "tree")
-        boot = os.path.join(tree, "boot")
-        os.makedirs(boot)
+        boot = os.path.join(tree, "boot", "retroos")
+        with open(args.kernel, "rb") as stream:
+            version = hashlib.file_digest(stream, "sha256").hexdigest()[:12]
+        release = "/boot/retroos/releases/" + version
+        runtime = os.path.join(tree, release.lstrip("/"))
+        os.makedirs(runtime)
         for source, name in ((args.kernel, "kernel.elf"),
                              (args.base, "retroos-base.img.gz")):
-            shutil.copyfile(source, os.path.join(boot, name))
-        if args.games:
-            shutil.copyfile(args.games, os.path.join(boot, "retroos-games.img.gz"))
+            shutil.copyfile(source, os.path.join(runtime, name))
+        if args.showcase:
+            shutil.copyfile(args.showcase, os.path.join(runtime, "retroos-showcase.img.gz"))
+        shutil.copyfile(args.boot_ini, os.path.join(boot, "BOOT.INI"))
         if args.ini:
             shutil.copyfile(args.ini, os.path.join(boot, "RETROOS.INI"))
         shutil.copyfile(args.license, os.path.join(tree, "THIRD_PARTY_LICENSES.md"))
@@ -96,7 +103,8 @@ def main():
         cfg = os.path.join(work, "grub.cfg")
         with open(cfg, "w") as out, open(args.grub_cfg) as source:
             out.write("insmod part_msdos\ninsmod fat\ninsmod search_fs_file\n")
-            out.write("search --no-floppy --file /boot/kernel.elf --set=root\n")
+            out.write("search --no-floppy --file /boot/retroos/BOOT.INI --set=root\n")
+            out.write("set retroos_release=" + release + "\n")
             out.write(source.read())
 
         # The UEFI executable needs only enough embedded configuration to find
@@ -105,7 +113,7 @@ def main():
         with open(bootstrap, "w") as out:
             out.write("insmod part_msdos\ninsmod fat\ninsmod search_fs_file\n")
             out.write("insmod normal\ninsmod configfile\n")
-            out.write("search --no-floppy --file /boot/kernel.elf --set=root\n")
+            out.write("search --no-floppy --file /boot/retroos/BOOT.INI --set=root\n")
             out.write("configfile /boot/grub/grub.cfg\n")
 
         with open(args.out, "wb") as out:

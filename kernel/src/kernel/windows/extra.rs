@@ -577,7 +577,7 @@ pub(super) fn create_process<A: crate::Arch>(
             crate::kernel::exec::detect_format(&data, &path),
             crate::kernel::exec::BinaryFormat::MzExe | crate::kernel::exec::BinaryFormat::Com
         ) {
-            // COMMAND.COM owns LOADFIX.CFG parsing and the /L, DOS32A, and
+            // COMMAND.COM owns RETROOS.INI [launch] parsing and the /L, DOS32A, and
             // virtual-IF launch paths. /E replaces this child with the DOS
             // program so MC's process handle tracks the program itself.
             let mut tail = b"/E ".to_vec();
@@ -623,7 +623,7 @@ pub(super) fn create_process<A: crate::Arch>(
 }
 
 fn has_dos_launch_override(state: &WindowsState, program: &[u8]) -> bool {
-    let config = windows_path(state, br"C:\RETROOS\LOADFIX.CFG", false).ok()
+    let config = windows_path(state, br"C:\RETROOS\RETROOS.INI", false).ok()
         .and_then(|path| crate::kernel::exec::load_file_resolved(&path).ok());
     let Some(config) = config else {
         return false;
@@ -633,19 +633,33 @@ fn has_dos_launch_override(state: &WindowsState, program: &[u8]) -> bool {
 }
 
 fn loadfix_matches(config: &[u8], name: &[u8]) -> bool {
-    config.split_inclusive(|&b| b == b'\n').any(|line| {
-        // Mirror COMMAND.COM's 80-byte fgets buffer: overlong records are
-        // discarded there and must not select a different launch path here.
+    let mut in_launch = false;
+    for line in config.split_inclusive(|&b| b == b'\n') {
+        // Match COMMAND.COM's fixed-size line reader, including section exits.
         if line.len() > 79 {
-            return false;
+            if line.trim_ascii_start().starts_with(b"[") { in_launch = false; }
+            continue;
         }
-        let line = line.trim_ascii_start();
+        let line = line.trim_ascii();
         if line.is_empty() || line[0] == b'#' || line[0] == b';' {
-            return false;
+            continue;
         }
-        let end = line.iter().position(u8::is_ascii_whitespace).unwrap_or(line.len());
-        line[..end].eq_ignore_ascii_case(name)
-    })
+        if line[0] == b'[' {
+            in_launch = line.strip_prefix(b"[")
+                .and_then(|s| s.strip_suffix(b"]"))
+                .is_some_and(|s| s.trim_ascii().eq_ignore_ascii_case(b"launch"));
+            continue;
+        }
+        if !in_launch { continue; }
+        let Some(end) = line.iter().position(|&b| b == b'=') else { continue; };
+        let key = line[..end].trim_ascii();
+        if !key.is_empty() && key.len() < 16
+            && !key.iter().any(|b| b.is_ascii_whitespace() || b"\\/:".contains(b))
+            && key.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
 }
 
 const FILETIME_EPOCH: u64 = 11_644_473_600;
@@ -1924,13 +1938,17 @@ mod environment_tests {
         assert_eq!(command_program(command, b""), expected);
         assert_eq!(command_program(br#"cmd.exe /C "C:\TOOLS\OS2APP.EXE""#, b""),
             (br"C:\TOOLS\OS2APP.EXE".to_vec(), alloc::vec::Vec::new()));
-        let cfg = b"# a comment\nDOOM.EXE repair\r\nWOLF3D.EXE iopl3\n";
+        let cfg = b"[environment]\nDOOM2.EXE=repair\n[ Launch ]\n# a comment\nDOOM.EXE = repair\r\nWOLF3D.EXE=iopl3\n[system]\nHOCUS.EXE=repair\n";
         assert!(loadfix_matches(cfg, b"doom.exe"));
         assert!(loadfix_matches(cfg, b"WOLF3D.EXE"));
         assert!(!loadfix_matches(cfg, b"DOOM2.EXE"));
+        assert!(!loadfix_matches(cfg, b"HOCUS.EXE"));
+        assert!(!loadfix_matches(b"DOOM.EXE=repair\n", b"DOOM.EXE"));
         assert!(!loadfix_matches(b"# DOOM.EXE repair\n", b"DOOM.EXE"));
-        let long = [b'X'; 80];
-        assert!(!loadfix_matches(&long, b"X"));
+        let mut long = b"[launch]\nDOOM.EXE=".to_vec();
+        long.extend_from_slice(&[b' '; 80]);
+        long.extend_from_slice(b"repair\n");
+        assert!(!loadfix_matches(&long, b"DOOM.EXE"));
     }
 
     #[test]

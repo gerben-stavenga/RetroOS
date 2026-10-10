@@ -174,12 +174,6 @@ pub struct BootConfig {
     c_root: [u8; 128],
     c_root_len: usize,
     c_root_explicit: bool,
-    /// Explicit installed-machine ext4 root. No autodetection when supplied.
-    pub root_uuid: Option<[u8; 16]>,
-    /// Explicit DOS C: filesystem. Missing or duplicate UUIDs fail closed.
-    pub c_uuid: Option<VolumeUuid>,
-    runtime: [u8; 128],
-    runtime_len: usize,
     /// Debug write-watch addresses (metal QEMU `opt/debug-watch`), if any.
     pub debug_watch: Option<(u32, u32)>,
     /// Host is QEMU-like: fabricate the synthetic 0x3DA vtrace etc. (vs Bochs /
@@ -236,7 +230,6 @@ impl BootConfig {
             cmdline: [0; 4096], cmdline_len: None,
             cwd: [0; 256], cwd_len: None,
             c_root: [0; 128], c_root_len: 0, c_root_explicit: false,
-            root_uuid: None, c_uuid: None, runtime: [0; 128], runtime_len: 0,
             debug_watch: None, is_qemu: false, audio_mixed: false,
             ram_overlay: false, boot_log_only: false, isa_lpc_disappointment: false,
             hostfs_port: None,
@@ -299,18 +292,6 @@ impl BootConfig {
             SerialOwner::Log => self.serial_console_port = Some(port),
             SerialOwner::Mcp => self.mcp_port = Some(port),
         }
-    }
-
-    /// Store a validated VFS path supplied by kernel boot policy.
-    pub fn set_runtime_path(&mut self, path: &[u8]) {
-        self.runtime[..path.len()].copy_from_slice(path);
-        self.runtime[path.len()] = b'/';
-        self.runtime_len = path.len() + 1;
-    }
-
-    /// Path within the selected root, with the VFS trailing slash convention.
-    pub fn runtime(&self) -> Option<&[u8]> {
-        (self.runtime_len != 0).then_some(&self.runtime[..self.runtime_len])
     }
 
     /// Record the headless command line (semicolon-separated program list).

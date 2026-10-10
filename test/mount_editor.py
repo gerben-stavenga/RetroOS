@@ -86,13 +86,13 @@ def testcase(shared):
                     process.terminate()
                 process.wait(timeout=5)
         if shared:
-            text = subprocess.check_output(['debugfs', '-R', 'cat /home/retroos/RETROOS.INI', str(data)],
+            text = subprocess.check_output(['debugfs', '-R', 'cat /home/retroos/BOOT.INI', str(data)],
                                            stderr=subprocess.DEVNULL).decode()
-            assert text.count('source=UUID=') == 2 and 'path=/\n' in text, text
+            assert text.count('source=UUID=') == 3 and 'path=/\n' in text, text
         else:
-            text = subprocess.check_output(['mtype', '-i', str(data), '::RETROOS.INI']).decode()
+            text = subprocess.check_output(['mtype', '-i', str(data), '::BOOT.INI']).decode()
         assert 'source=UUID=' in text and 'drive=C' in text and 'access=rw' in text, text
-        assert 'START=C:\\DN\\DN.COM' in text, text
+        assert '[bundle]' in text and '[launch]' not in text and '[environment]' not in text, text
         assert 'Mount setup: Saved' in log.read_text(errors='replace')
         print(f'PASS: default DN boot and OSD mount setup export (shared root/C={shared})', flush=True)
 

@@ -2,7 +2,7 @@
 """Boot the unified config through GRUB modules and the VM data-disk profile.
 
 Uses private images only. Verifies BIOS/UEFI config overrides, BusyBox startup,
-and the shared rc executable alias when C: is an independently mounted disk.
+and the BusyBox executable alias when C: is an independently mounted disk.
 """
 from pathlib import Path
 import shutil
@@ -50,13 +50,9 @@ def main():
         (tree/'boot/RETROOS.INI').write_text('''[locale]
 language=it-IT
 [environment]
-TEST=/bin/busybox true
-[mount "session"]
-source=bundle
-path=/
-drive=C
-access=ram
+TEST=/bin/busybox grep -q language=it-IT /RETROOS/RETROOS.INI
 ''')
+        (tree/'boot/BOOT.INI').write_text('[bundle]\nsource=module\nsubdir=/\n[mount "session"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n')
         (tree/'boot/grub/grub.cfg').write_text('''set timeout=0
 menuentry test {
  multiboot2 /boot/kernel.elf ram-overlay
@@ -68,6 +64,7 @@ menuentry test {
   set gfxpayload=auto
  fi
  module2 /boot/base.img retroos.mount=/
+ module2 /boot/BOOT.INI retroos.config=boot
  module2 /boot/RETROOS.INI retroos.config=ini
  boot
 }
@@ -95,11 +92,11 @@ menuentry test {
                         '--boot-image', str(disk), '--data-image', str(data)], check=True)
         assert data.read_bytes() == original, 'VM profile helper modified the data image'
         generated = subprocess.check_output(['mtype', '-i', str(disk)+'@@1048576',
-                                             '::RETROOS/RETROOS.INI']).decode()
+                                             '::RETROOS/BOOT.INI']).decode()
         assert 'source=UUID=' in generated and 'drive=C' in generated
         assert 'source=bundle' not in generated
         config = work/'RETROOS.INI'
-        config.write_text(generated.replace('[environment]', '[environment]\nTEST=/bin/busybox test -s /bin/rc'))
+        config.write_text('[environment]\nTEST=/bin/busybox test -s /bin/busybox\n')
         subprocess.run(['mcopy', '-o', '-i', str(disk)+'@@1048576', str(config),
                         '::RETROOS/RETROOS.INI'], check=True)
         log = work/'vm.log'
@@ -108,7 +105,7 @@ menuentry test {
                                 '-device', f'VGA,romfile={ROOT}/third_party/vgabios/vgabios-stdvga.bin'],
                     log, work/'vm.stderr')
         assert 'Mount: data -> /home/retroos (rw)' in text and 'starting a RAM session' not in text, text
-        print('PASS: generated VM UUID profile and /bin/rc resolves to bundled executable', flush=True)
+        print('PASS: generated VM UUID profile and bundled BusyBox', flush=True)
 
         # A user's persistent app mount must also be selected by /bin/rc.
         subprocess.run(['mmd', '-i', str(data), '::CUSTOMRC'], check=True)
@@ -117,10 +114,13 @@ menuentry test {
         subprocess.run(['mcopy', '-i', str(data), str(marker), '::CUSTOMRC/RC.EXE'], check=True)
         from boot_fixture import volumes
         ident = volumes(data)[0][1]
-        custom = generated.replace('[environment]', '[environment]\nTEST=/bin/busybox grep -q RC-OVERRIDE /bin/rc')
+        custom = generated
         custom += (f'[mount "rc"]\nsource=UUID={ident}\nsubdir=/CUSTOMRC\n'
                    'path=/home/retroos/RC\naccess=rw\n')
         config.write_text(custom)
+        subprocess.run(['mcopy', '-o', '-i', str(disk)+'@@1048576', str(config),
+                        '::RETROOS/BOOT.INI'], check=True)
+        config.write_text('[environment]\nTEST=/bin/busybox grep -q RC-OVERRIDE /bin/rc\n')
         subprocess.run(['mcopy', '-o', '-i', str(disk)+'@@1048576', str(config),
                         '::RETROOS/RETROOS.INI'], check=True)
         log = work/'custom-app.log'

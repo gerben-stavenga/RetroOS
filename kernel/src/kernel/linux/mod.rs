@@ -976,6 +976,10 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
             machine.copy_from(buf, &mut tmp);
             for &b in &tmp {
                 lib::term::put_utf8(b);
+                // Keep startup errors after a DOS launch restores its screen.
+                if fd == 2 {
+                    lib::log::debug_byte(b);
+                }
             }
             terminal_responses(kt);
             crate::kernel::term::mark_dirty();
@@ -1284,7 +1288,7 @@ fn sys_execve<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThread<A>
         tail
     } else { alloc::vec::Vec::new() };
 
-    // COMMAND owns LOADFIX.CFG interpretation, DOS/32A wrapping and game
+    // COMMAND owns RETROOS.INI [launch] interpretation, DOS/32A wrapping and game
     // launch policy. Use the same process-replacing entry as CreateProcess;
     // keep direct DOS loading available on minimal systems without a shell.
     if matches!(format, exec::BinaryFormat::MzExe | exec::BinaryFormat::Com) {
@@ -1831,6 +1835,9 @@ fn sys_writev<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
             thread::FdKind::ConsoleOut => {
                 for &b in &iov {
                     lib::term::put_utf8(b);
+                    if fd == 2 {
+                        lib::log::debug_byte(b);
+                    }
                 }
                 terminal_responses(kt);
                 crate::kernel::term::mark_dirty();

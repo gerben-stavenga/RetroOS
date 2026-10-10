@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
-from vm_mount_config import configure, volumes
+from vm_mount_config import boot_configuration, split_configuration, volumes
 
 
 def prepare_boot(work, data, config=None):
@@ -22,10 +22,12 @@ def prepare_boot(work, data, config=None):
         result = subprocess.run(["mtype", "-i", f"{data}@@{start * 512}",
                                  "::RETROOS/RETROOS.INI"], capture_output=True)
         config = result.stdout.decode() if result.returncode == 0 else (ROOT / "etc/RETROOS.INI").read_text()
-    generated = config if '[mount "data"]' in config else configure(config, volumes(data))
+    generated = boot_configuration(config, volumes(data))
+    _, settings = split_configuration(config)
     with tempfile.TemporaryDirectory(prefix="retroos-fixture-ini-") as temp:
-        ini = Path(temp) / "RETROOS.INI"
-        ini.write_text(generated)
-        subprocess.run(["mcopy", "-o", "-i", f"{boot}@@1048576", ini,
-                        "::RETROOS/RETROOS.INI"], check=True)
+        for name, text in [("BOOT.INI", generated), ("RETROOS.INI", settings)]:
+            ini = Path(temp) / name
+            ini.write_text(text)
+            subprocess.run(["mcopy", "-o", "-i", f"{boot}@@1048576", ini,
+                            "::RETROOS/" + name], check=True)
     return boot

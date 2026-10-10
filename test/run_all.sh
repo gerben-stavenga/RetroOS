@@ -41,6 +41,7 @@ python3_test() { have python3; }
 hosted_tsr() { have bazelisk && have python3 && have nasm; }
 qemu_hostfs() { bazel_tool && have qemu-system-i386 && have python3 && have timeout; }
 qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have mkfs.ext4; }
+rat_ext4() { kvm && bazel_tool && have qemu-system-x86_64 && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
 # /dev/kvm opening is NOT the same as "qemu can boot THIS guest with -accel
@@ -155,7 +156,7 @@ run() {
         [ "$gate" = kvm ] && needs_kvm=1
         if { [ "${RETRO_REQUIRE_PUBLIC:-0}" = 1 ] && [ "$needs_kvm" = 0 ] \
                 && [[ "$gate" != qemu_prop && "$gate" != box86 \
-                      && "$gate" != qemu_audio_kvm && "$gate" != freedos_hdd ]]; } \
+                      && "$gate" != qemu_audio_kvm && "$gate" != rat_ext4 && "$gate" != freedos_hdd ]]; } \
             || { [ "${RETRO_REQUIRE_KVM:-0}" = 1 ] && [ "$needs_kvm" = 1 ]; }; then
             printf 'FAIL  %-14s (required prerequisite: %s)\n' "$name" "$gate"
             fail=$((fail + 1)); failed+=("$name"); return
@@ -177,6 +178,7 @@ run physical_memory physical_memory_tools python3 test/physical_memory.py
 run grub_fat     grub_fat  python3 test/grub_fat.py
 run boot_composition storage_selection python3 test/boot_composition.py
 run grub_module_install - python3 test/grub_module_install.py
+run showcase_boot rat_ext4 python3 test/showcase_boot.py
 run disk_selection storage_selection python3 test/disk_selection.py
 run extra_drives storage_selection python3 test/extra_drives.py
 run isapnp_smoke isapnp_tools python3 test/isapnp_smoke.py
@@ -208,6 +210,7 @@ run linux_runtime_kvm kvm python3 test/linux_runtime.py
 run locales_kvm kvm python3 test/locales.py
 run keyboards_kvm kvm python3 test/keyboards.py
 run rat_commander_kvm kvm python3 test/rat_commander.py
+run rat_commander_ext4 rat_ext4 python3 test/rat_commander_ext4.py
 run windows_threads_kvm kvm env ENGINE=kvm python3 test/windows_threads.py
 run dpmi_rm_exception_kvm kvm env ENGINE=kvm python3 test/dpmi_rm_exception.py
 # --- KVM differential: needs /dev/kvm --------------------------------------

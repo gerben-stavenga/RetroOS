@@ -1339,8 +1339,8 @@ pub fn exec_dos_into<A: crate::Arch>(machine: &mut A, threads: &mut [thread::Thr
 
     init_process_thread_vm86_state(machine, current, psp_seg, cs, ip, ss, sp);
     // Virtual IOPL passed in by the exec caller: COMMAND.COM reads the `iopl3`
-    // flag from LOADFIX.CFG and passes 3 via SYNTH_FORK_EXEC; every other caller
-    // passes 1 (spec-conforming). The kernel never reads LOADFIX.CFG itself.
+    // flag from RETROOS.INI [launch] and passes 3 via SYNTH_FORK_EXEC; every other caller
+    // passes 1 (spec-conforming). The DOS dispatcher does not look up launch entries itself.
     // The real run IOPL is pinned to 1 at the arch exit; this is the virtual
     // level the PM gate reads. (Literal mask: `machine` is the arch param here.)
     let viopl = policy.viopl;
@@ -1470,7 +1470,7 @@ pub fn run_init_program<A: crate::Arch>(machine: &mut A, dos_template: &mut DosT
     let cs = loaded.cs; let ip = loaded.ip; let ss = loaded.ss; let sp = loaded.sp;
 
     init_process_thread_vm86_state(machine, t, psp_seg, cs, ip, ss, sp);
-    // Direct launches (--cmd, boot init) bypass COMMAND.COM, so no LOADFIX.CFG
+    // Direct launches (--cmd, boot init) bypass COMMAND.COM, so no RETROOS.INI [launch]
     // policy applies — seed `IfMode::Repair` (vIOPL=2) rather than the strict
     // conforming default. The launcher cannot know whether the program is a
     // non-conforming DPMI client (DOOM re-enables IF via POPF and HANGS at

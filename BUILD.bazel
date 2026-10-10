@@ -4,21 +4,18 @@ load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
 exports_files(["i686-retro-none.json", "hostfs.py"])
 
-# ── Content packaged out of apps/ ────────────────────────────────────────────
-#
-# apps/ holds shipped CONTENT only and carries no BUILD files of its own, so
-# every file under it belongs to this package and is globbed from here. Things
-# built from source live in test/, tools/, shell/ instead.
+# Static optional content lives in showcase-bundle/, in its C: layout.
+# The single showcase glob includes every added file or directory.
 
 # The standard Gravis UltraSound instrument patches (.PAT), as originally
 # distributed with the GUS drivers and long redistributed as dgguspat.zip
-# (idgames /music/dgguspat, packaged by Simon Howard — see dgguspat.txt).
+# (idgames /music/dgguspat, packaged by Simon Howard — see DGGUSPAT.TXT).
 # Ships at C:\ULTRASND\MIDI, the ULTRADIR default every GUS-native game and
 # driver (Doom's DMX, AIL, ULTRAMID) loads instrument data from — without
 # these, games detect the emulated GUS but silently disable music.
-_ULTRASND_PREFIX = "apps/ultrasnd/"
+_ULTRASND_PREFIX = "showcase-bundle/ULTRASND/"
 
-_PATS = glob([_ULTRASND_PREFIX + "MIDI/*.pat"])
+_PATS = glob([_ULTRASND_PREFIX + "MIDI/*.PAT"])
 
 pkg_tar(
     name = "ultrasnd_tar",
@@ -26,40 +23,27 @@ pkg_tar(
         ":" + p: "ULTRASND/" + p[len(_ULTRASND_PREFIX):].upper()
         for p in _PATS
     } | {
-        ":" + _ULTRASND_PREFIX + "dgguspat.txt": "ULTRASND/DGGUSPAT.TXT",
+        ":" + _ULTRASND_PREFIX + "DGGUSPAT.TXT": "ULTRASND/DGGUSPAT.TXT",
     },
     visibility = ["//visibility:public"],
 )
 
-# All files under apps/games are auto-included with their paths uppercased and
-# prefixed with "GAMES/" (e.g. doom/DOOM.EXE → GAMES/DOOM/DOOM.EXE). Drop a
-# game's files into a subdirectory and they ship on next build — no per-file
-# wiring.
-_GAMES_PREFIX = "apps/games/"
-
-_GAME_SRCS = glob(
-    [_GAMES_PREFIX + "**/*"],
-    # A direct/hosted game run can write state into this source directory.
-    exclude = ["apps/games/skyroads/SKYROADS.CFG"],
-)
-
+# Compatibility target name; all optional content uses the canonical
+# showcase package below, shared by USB and disk.
 pkg_tar(
     name = "games_tar",
-    files = {
-        ":" + s: "GAMES/" + s[len(_GAMES_PREFIX):].upper()
-        for s in _GAME_SRCS
-    },
+    deps = [":showcase_module_tar"],
     visibility = ["//visibility:public"],
 )
 
 # Static-linked busybox 1.31 (i686-uclibc) — single-binary userland for the
 # Linux personality. Provides sh + coreutils via the standalone-shell-mode
 # applet dispatch (basename(argv[0]) -> applet).
-exports_files(["apps/busybox/busybox"])
+exports_files(["boot-bundle/bin/busybox"])
 
 # One real GUS instrument, compiled into //lib:sound_test so the .PAT parser
 # is checked against a shipped file and not only synthetic fixtures.
-exports_files(["apps/ultrasnd/MIDI/acpiano.pat"])
+exports_files(["showcase-bundle/ULTRASND/MIDI/ACPIANO.PAT"])
 
 
 # Convenient applet shims for busybox: each is a tar symlink "bin/<name>"
@@ -83,16 +67,17 @@ _BUSYBOX_APPLETS = [
     target = "busybox",
 ) for a in _BUSYBOX_APPLETS]
 
-# Bundled applications live at C:\<APP>, alongside the RETROOS system directory.
+# Bundled DOS applications live at C:\<APP>, alongside RETROOS/.
+# Unix bin/ content is packaged separately by :bin_tar to preserve its case.
 # TC is not shipped: :tc_tar exists only for //:image_min,
 # the image that runs in-OS TCC while building COMMAND.COM and the DOS stub.
 _APPS_BOOT_SRCS = glob(
-    ["apps-boot/**/*"],
-    exclude = ["apps-boot/tc/**"],
+    ["boot-bundle/**/*"],
+    exclude = ["boot-bundle/bin/**"],
     allow_empty = True,
 )
-_TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
-_TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
+_TC_SRCS = glob(["showcase-bundle/TC/**/*"], allow_empty = True)
+_TP70_SRCS = glob(["showcase-bundle/TP70/**/*"], allow_empty = True)
 
 pkg_tar(
     name = "apps_boot_tar",
@@ -102,19 +87,19 @@ pkg_tar(
         "RC/README.MD": "0644",
     },
     files = {
-        ":" + src: src[len("apps-boot/"):].upper()
+        ":" + src: src[len("boot-bundle/"):].upper()
         for src in _APPS_BOOT_SRCS
     },
 )
 
 pkg_tar(
     name = "tc_tar",
-    files = {":" + s: "TC/" + s[len("apps-boot/tc/"):].upper() for s in _TC_SRCS},
+    files = {":" + s: "TC/" + s[len("showcase-bundle/TC/"):].upper() for s in _TC_SRCS},
 )
 
 pkg_tar(
     name = "tp70_tar",
-    files = {":" + s: "TP70/" + s[len("apps/TP70/"):].upper() for s in _TP70_SRCS},
+    files = {":" + s: "TP70/" + s[len("showcase-bundle/TP70/"):].upper() for s in _TP70_SRCS},
 )
 
 # Compute MD5 of kernel ELF
@@ -125,7 +110,7 @@ genrule(
     cmd = "md5sum $< | cut -d' ' -f1 | xxd -r -p > $@",
 )
 
-# Built runtime (COMMAND.COM, symbols, shell). apps-boot/ is :apps_boot_tar,
+# Built runtime (COMMAND.COM, symbols, shell). boot-bundle/ is :apps_boot_tar,
 # not this map: keep bundled applications separate from generated runtime files.
 _BOOT_DIR_FILES = dict(BOOT_FILES)
 
@@ -160,6 +145,7 @@ _EXTRA_FILES.update(_BOOT_DIR_FILES)
 # otherwise force a separate `dosrt_tar` indirection.
 _MIN_EXTRA_FILES = {
     "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
+    "etc/BOOT.INI": "RETROOS/BOOT.INI",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
 }
@@ -207,7 +193,7 @@ pkg_tar(
 pkg_mklink(
     name = "lnk_bin_rc",
     link_name = "bin/rc",
-    target = "/RC/RC.EXE",
+    target = "/COMMANDER/RC/RC.EXE",
 )
 
 pkg_mklink(
@@ -225,9 +211,7 @@ pkg_tar(
     files = _DOS_EXTRA,
     deps = [
         ":apps_boot_tar",
-        ":games_tar",
-        ":ultrasnd_tar",
-        ":tp70_tar",
+        ":showcase_module_tar",
     ],
     package_dir = "home/retroos",
 )
@@ -247,9 +231,13 @@ pkg_tar(
     deps = [":bin_tar", ":root_module_dos_tar"],
 )
 
+# Everything below showcase-bundle/ has exactly its C: path. Adding a directory
+# requires no app list, path remapping, or separate image target.
 pkg_tar(
-    name = "games_module_tar",
-    files = {":" + s: s[len(_GAMES_PREFIX):].upper() for s in _GAME_SRCS},
+    name = "showcase_module_tar",
+    srcs = glob(["showcase-bundle/**/*"]),
+    strip_prefix = "showcase-bundle",
+    modes = {"COMMANDER/RC/RC.EXE": "0755"},
 )
 
 # Extras populated into the ext4 partition: the /bin busybox userland plus the
@@ -267,9 +255,7 @@ pkg_tar(
     files = _DOS_EXTRA_PROPRIETARY,
     deps = [
         ":apps_boot_tar",
-        ":games_tar",
-        ":ultrasnd_tar",
-        ":tp70_tar",
+        ":showcase_module_tar",
         "//apps-proprietary:tar",
     ],
     package_dir = "home/retroos",
@@ -287,9 +273,7 @@ pkg_tar(
     srcs = [":lnk_bin_" + a for a in _BUSYBOX_APPLETS],
     deps = [
         ":apps_boot_tar",
-        ":games_tar",
-        ":ultrasnd_tar",
-        ":tp70_tar",
+        ":showcase_module_tar",
         "//apps-proprietary:tar",
     ],
 )
@@ -485,7 +469,7 @@ genrule(
     srcs = [":root_module_base_tar", "tools/build_module_image.py"],
     outs = ["retroos-base.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :root_module_base_tar) --size-mb 96 --out $@",
+          " --contents $(location :root_module_base_tar) --size-mb 16 --out $@",
     visibility = ["//visibility:public"],
 )
 
@@ -498,19 +482,19 @@ genrule(
 )
 
 genrule(
-    name = "root_module_games_image",
-    srcs = [":games_module_tar", "tools/build_module_image.py"],
-    outs = ["retroos-games.img"],
+    name = "root_module_showcase_image",
+    srcs = [":showcase_module_tar", "tools/build_module_image.py"],
+    outs = ["retroos-showcase.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :games_module_tar) --size-mb 128 --writable-root --out $@",
+          " --contents $(location :showcase_module_tar) --size-mb 256 --writable-root --out $@",
     visibility = ["//visibility:public"],
 )
 
 genrule(
-    name = "root_module_games_gzip",
-    srcs = [":root_module_games_image"],
-    outs = ["retroos-games.img.gz"],
-    cmd = "gzip -9 -n -c $(location :root_module_games_image) > $@",
+    name = "root_module_showcase_gzip",
+    srcs = [":root_module_showcase_image"],
+    outs = ["retroos-showcase.img.gz"],
+    cmd = "gzip -9 -n -c $(location :root_module_showcase_image) > $@",
     visibility = ["//visibility:public"],
 )
 
@@ -518,14 +502,15 @@ genrule(
 # GRUB module release.
 genrule(
     name = "grub_module_usb",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "etc/RETROOS.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_showcase_gzip", "etc/RETROOS.INI", "etc/BOOT.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos_grub_module_usb.img"],
     cmd = "python3 $(location tools/build_grub_module_usb.py)" +
           " --kernel $(location //kernel:kernel_elf)" +
           " --base $(location :root_module_base_gzip)" +
-          " --games $(location :root_module_games_gzip)" +
+          " --showcase $(location :root_module_showcase_gzip)" +
           " --grub-cfg $(location tools/grub-module.cfg)" +
           " --ini $(location etc/RETROOS.INI)" +
+          " --boot-ini $(location etc/BOOT.INI)" +
           " --license $(location THIRD_PARTY_LICENSES.md)" +
           " --out $@",
     visibility = ["//visibility:public"],
@@ -536,16 +521,20 @@ genrule(
 # used so the runtime is identical regardless of boot medium.
 genrule(
     name = "grub_module_iso",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "etc/RETROOS.INI", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_showcase_gzip", "etc/RETROOS.INI", "etc/BOOT.INI", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos_grub_module.iso"],
     cmd = """
         DIR=$$(mktemp -d)
-        mkdir -p "$$DIR/boot/grub"
-        cp $(location //kernel:kernel_elf) "$$DIR/boot/kernel.elf"
-        cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
-        cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
-        cp $(location tools/grub-module.cfg) "$$DIR/boot/grub/grub.cfg"
-        cp $(location etc/RETROOS.INI) "$$DIR/boot/RETROOS.INI"
+        VERSION=$$(sha256sum $(location //kernel:kernel_elf) | cut -c1-12)
+        RELEASE=/boot/retroos/releases/$$VERSION
+        mkdir -p "$$DIR/boot/grub" "$$DIR$$RELEASE"
+        cp $(location //kernel:kernel_elf) "$$DIR$$RELEASE/kernel.elf"
+        cp $(location :root_module_base_gzip) "$$DIR$$RELEASE/retroos-base.img.gz"
+        cp $(location :root_module_showcase_gzip) "$$DIR$$RELEASE/retroos-showcase.img.gz"
+        printf 'set retroos_release=%s\n' "$$RELEASE" > "$$DIR/boot/grub/grub.cfg"
+        cat $(location tools/grub-module.cfg) >> "$$DIR/boot/grub/grub.cfg"
+        cp $(location etc/RETROOS.INI) "$$DIR/boot/retroos/RETROOS.INI"
+        cp $(location etc/BOOT.INI) "$$DIR/boot/retroos/BOOT.INI"
         cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
         grub-mkrescue -o $@ "$$DIR"
         rm -rf "$$DIR"
@@ -558,9 +547,8 @@ genrule(
 pkg_tar(
     name = "diagnostic_apps_boot_tar",
     files = {
-        ":" + src: src[len("apps-boot/"):].upper()
+        ":" + src: src[len("boot-bundle/"):].upper()
         for src in _APPS_BOOT_SRCS
-        if not src.startswith("apps-boot/rc/")
     },
 )
 
@@ -591,7 +579,7 @@ genrule(
 
 genrule(
     name = "usb_diagnostic_image",
-    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "etc/RETROOS.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "etc/RETROOS.INI", "etc/BOOT.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos-usb-diagnostic.img"],
     cmd = """
         CFG=$$(mktemp)
@@ -602,6 +590,7 @@ genrule(
             --kernel $(location //kernel:kernel_elf) \\
             --base $(location :diagnostic_module) \\
             --ini $(location etc/RETROOS.INI) \\
+            --boot-ini $(location etc/BOOT.INI) \\
             --grub-cfg "$$CFG" \\
             --license $(location THIRD_PARTY_LICENSES.md) \\
             --boot-mb 64 --minimal-grub-modules --out $@
@@ -702,7 +691,7 @@ pkg_tar(
 pkg_tar(
     name = "machine_boot_tar",
     files = _BOOT_DIR_FILES | {"//kernel:kernel_elf": "kernel.elf"},
-    deps = [":apps_boot_tar", ":bin_tar"],
+    deps = [":apps_boot_tar", ":showcase_module_tar", ":bin_tar"],
 )
 
 # The data manifest declares lifetime explicitly, including any writable
@@ -716,9 +705,7 @@ pkg_tar(
     empty_dirs = ["TEMP"],
     files = _C_DRIVE_FILES,
     deps = [
-        ":games_tar",
-        ":ultrasnd_tar",
-        ":tp70_tar",
+        ":showcase_module_tar",
     ],
 )
 
@@ -731,9 +718,7 @@ pkg_tar(
     empty_dirs = ["TEMP"],
     files = _C_DRIVE_FILES_PROPRIETARY,
     deps = [
-        ":games_tar",
-        ":ultrasnd_tar",
-        ":tp70_tar",
+        ":showcase_module_tar",
         "//apps-proprietary:tar",
     ],
 )
@@ -882,8 +867,8 @@ pkg_tar(
         "tools/release/install.sh": "install.sh",
         "tools/machine_install.py": "tools/machine_install.py",
         "tools/grub_module_install.py": "tools/grub_module_install.py",
-        "//tools/command:LOADFIX.CFG": "tools/command/LOADFIX.CFG",
-                "etc/RETROOS.INI": "etc/RETROOS.INI",
+        "etc/RETROOS.INI": "etc/RETROOS.INI",
+        "etc/BOOT.INI": "etc/BOOT.INI",
         "tools/release/README.md": "README.md",
         "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
     },

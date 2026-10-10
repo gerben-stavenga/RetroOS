@@ -339,9 +339,10 @@ impl PortableExt4Fs {
     }
 
     fn open_info(&self, info: ObjectInfo) -> Option<Vnode> {
-        if info.node().is_some() || Self::is_symlink(info) {
-            return None;
-        }
+        // Device inodes, FIFOs and sockets are not disk-backed files. In
+        // particular, opening an on-disk /dev/tty as a file prevents terminal
+        // libraries from falling back to the process's console descriptors.
+        graph_blob(info)?;
         Some(Vnode {
             handle: self.open.borrow_mut().insert(info.object),
             size: info.size.min(u64::from(u32::MAX)) as u32,
@@ -790,7 +791,7 @@ impl Filesystem for PortableExt4Fs {
 
 fn graph_blob(info: ObjectInfo) -> Option<Blob> {
     info.blob()
-        .filter(|_| info.format & TYPE_MASK != TYPE_SYMLINK)
+        .filter(|_| info.format & TYPE_MASK == TYPE_BLOB)
 }
 
 #[cfg(test)]

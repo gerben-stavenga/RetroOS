@@ -1,0 +1,24 @@
+                 ÄÍÍ "Amnesia" MegaDemo! - Renaissance 11/4/92 ÍÍÄ
+         ÄÍÍ Demo Coded By Tran þ Awesome Music By Mosaic & C.C.Catch ÍÍÄ
+
+Requirements:
+
+      - 386 Processor Or Better
+      - VGA Graphics
+      - SoundBlaster/SoundBlaster Pro (Optional)
+
+
+IMPORTANT!! - You Must NOT Have Any Expanded/Extended Memory Managers Loaded
+              In Order To Run This Demo. This includes QEMM, EMM386, 386^MAX,
+              and HIMEM. This is not bad coding, this is due to the fact that
+              only one program can take hold of 386 32-bit Protected mode at
+              one time.
+
+This demo will attempt to automatically reboot if already in V86 Mode to save
+you some time. It will reboot your computer with a clean CONFIG.SYS and
+AUTOEXEC.BAT then you can reboot and your PC will be back to normal. If it does
+not work, then just resort back to a plain old DOS boot disk.
+
+      Check Out REN-92.NFO for information about Renaissance.... Later.
+
+                                                -- Daredevil

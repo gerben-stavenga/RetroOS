@@ -36,7 +36,7 @@ mformat -i "$OUTPUT" -c 32 -h 16 -s 63 -T $((IMG_SIZE * 2048)) ::
 echo "Copying proprietary apps..."
 copy_dir() {
     local src="$1" dst="$2" img="$3"
-    # Create dst only if absent (dir-exists is the one benign case — apps/games
+    # Create dst only if absent (dir-exists is the one benign case — showcase
     # and apps-proprietary/games both map to ::GAMES); a real mmd failure aborts.
     mdir -i "$img" "::$dst" >/dev/null 2>&1 || mmd -i "$img" "::$dst"
     while IFS= read -r f; do

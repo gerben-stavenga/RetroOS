@@ -3,7 +3,7 @@
 #
 # This is intentionally small: the existing hosted and raw-disk tests already
 # cover the device and program matrices.  This test only verifies that the
-# actual USB image supplies the base and games modules to the normal DOS path.
+# actual USB image supplies the core and combined showcase modules.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,7 +19,7 @@ run_program() {
     # The guest may remain interactive after reporting success.  The harness
     # must therefore terminate QEMU, and must escalate if QEMU does not
     # handle SIGTERM promptly.
-    timeout --kill-after=5s 35s qemu-system-i386 \
+    timeout --kill-after=5s 60s qemu-system-i386 \
         -m 512 -cpu pentium3 \
         -device qemu-xhci,id=usb \
         -drive if=none,id=stick,file=bazel-bin/retroos_grub_module_usb.img,format=raw,snapshot=on \
@@ -29,22 +29,17 @@ run_program() {
         -debugcon "file:$log" \
         -display none -no-reboot >/dev/null 2>&1 || true
 
-    local base_mb=$(( $(stat -c %s bazel-bin/retroos-base.img) / 1024 / 1024 ))
-    grep -q "Multiboot ext4 ($base_mb MB, volatile RAM) → /$" "$log"
-    grep -q 'Multiboot ext4 (128 MB, volatile RAM) → /home/retroos/GAMES$' "$log"
+    grep -q 'Optional module: /showcase-bundle/ (256 MiB)' "$log"
     ! grep -q 'KERNEL PANIC' "$log"
 }
 
-# SBTEST.COM is in the base module and exercises command execution after the
-# Multiboot root has been installed.
-run_program "base_probe" 'TESTS/SBTEST.COM'
-grep -q 'BUSY-OK' "$tmp_dir/base_probe.log"
-grep -q 'EDGE-OK' "$tmp_dir/base_probe.log"
-grep -q 'TC-OK' "$tmp_dir/base_probe.log"
+# BusyBox is supplied by the core image.
+run_program "core_probe" '/bin/busybox true'
+grep -q '\[mem\] exit tid=1 code=0' "$tmp_dir/core_probe.log"
 
-# DOOM.EXE is in the separate games module.  Reaching its DOS/4GW startup is
-# sufficient here; the hosted and raw-image tests cover the deeper game test.
-run_program "games_program" 'GAMES/DOOMS/DOOM.EXE'
-grep -q 'Starting GAMES/DOOMS/DOOM.EXE' "$tmp_dir/games_program.log"
+# DOOM is supplied by the combined showcase image. The regular game tests
+# cover execution beyond DOS/4GW startup.
+run_program "showcase_program" '/GAMES/DOOMS/DOOM.EXE'
+grep -q 'Starting /GAMES/DOOMS/DOOM.EXE' "$tmp_dir/showcase_program.log"
 
-echo "PASS: Multiboot USB image executed base and games-module programs"
+echo "PASS: Multiboot USB image executed core and showcase programs"

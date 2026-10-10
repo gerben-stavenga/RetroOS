@@ -16,8 +16,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="retroos-rat-") as directory:
         root = Path(directory)
         (root / "bin").mkdir()
-        shutil.copyfile(ROOT / "apps-boot/rc/RC.EXE", root / "bin/rc")
-        shutil.copyfile(ROOT / "apps/busybox/busybox", root / "bin/busybox")
+        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/RC/RC.EXE", root / "bin/rc")
+        shutil.copyfile(ROOT / "boot-bundle/bin/busybox", root / "bin/busybox")
         (root / "bin/sh").symlink_to("busybox")
         (root / "TEST.COM").write_bytes(bytes.fromhex("ba0c01b409cd21b8004ccd21") + b"RC DOS CHILD PASS$")
         work = root / "work"

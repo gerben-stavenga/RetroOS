@@ -152,7 +152,15 @@ path=/cdrom
 drive=D
 access=ro
 ''')
+            import sys
+            sys.path.insert(0, str(ROOT/'tools'))
+            from vm_mount_config import split_configuration
+            mounts, settings = split_configuration(config.read_text())
+            config.write_text(settings)
+            boot_ini = case/'BOOT.INI'
+            boot_ini.write_text('[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n' + mounts)
             run('mcopy', '-o', '-i', str(boot)+'@@1048576', config, '::RETROOS/RETROOS.INI')
+            run('mcopy', '-o', '-i', str(boot)+'@@1048576', boot_ini, '::RETROOS/BOOT.INI')
             log = case/'klog'
             argv = ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-m', '256',
                     '-display', 'none', '-serial', 'none', '-audiodev', 'none,id=snd0',

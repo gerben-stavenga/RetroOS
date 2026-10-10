@@ -107,6 +107,7 @@ def grub_path(destination, mount):
 def grub_entries(plan):
     uuid = plan["boot_uuid"]
     base = plan["grub_release"]
+    home = plan.get("grub_destination", str(Path(base).parent.parent))
     entries = []
     for label, overlay in (("protected disk", " ram-overlay"), ("persistent disk", "")):
         kernel_args = "ram-overlay" if overlay else ""
@@ -129,7 +130,8 @@ def grub_entries(plan):
         set gfxpayload=auto
     fi
     module2 {base}/retroos-base.img.gz retroos.mount=/
-    module2 {base}/RETROOS.INI retroos.config=ini
+    module2 {home}/BOOT.INI retroos.config=boot
+    module2 {home}/RETROOS.INI retroos.config=ini
     boot
 }}
 ''')
@@ -138,13 +140,6 @@ def grub_entries(plan):
 
 def mount_configuration(plan):
     """Mount policy is a reviewable INI file, independent of GRUB write mode."""
-    template = ROOT / "etc" / "RETROOS.INI"
-    if not template.is_file():
-        template = ROOT / "RETROOS.INI"
-    text = template.read_text()
-    # Keep defaults and comments, replace only the default session mount.
-    begin = text.index('[mount "session"]')
-    end = text.index("\n# To use", begin)
     mounts = []
     if plan.get("root_uuid"):
         home = plan.get("c_dir") or "/home/retroos"
@@ -156,7 +151,7 @@ def mount_configuration(plan):
         mounts.append('[mount "session"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\n')
     if not mounts:
         mounts.append('[mount "session"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n')
-    return text[:begin] + "\n".join(mounts) + text[end:]
+    return '[bundle]\nsource=module\nsubdir=/\n\n' + "\n".join(mounts)
 
 
 def grub_config_path():
@@ -214,9 +209,16 @@ def ensure_c_home(volume, c_dir="/home/retroos"):
 
 def extract_boot_file(image, name, destination):
     if image.suffix.lower() == ".iso":
-        subprocess.run(["xorriso", "-osirrox", "on", "-indev", str(image),
-                        "-extract", "/boot/" + name, str(destination)],
-                       stdout=subprocess.DEVNULL, check=True)
+        with tempfile.TemporaryDirectory(prefix="retroos-extract-") as work:
+            menu = Path(work) / "grub.cfg"
+            subprocess.run(["xorriso", "-osirrox", "on", "-indev", str(image),
+                            "-extract", "/boot/grub/grub.cfg", str(menu)],
+                           stdout=subprocess.DEVNULL, check=True)
+            release = re.search(r"^set retroos_release=(\S+)$", menu.read_text(), re.M)
+            if not release: raise ValueError("image has no selected RetroOS release")
+            subprocess.run(["xorriso", "-osirrox", "on", "-indev", str(image),
+                            "-extract", release[1] + "/" + name, str(destination)],
+                           stdout=subprocess.DEVNULL, check=True)
         return
     with image.open("rb") as disk:
         mbr = disk.read(512)
@@ -225,8 +227,12 @@ def extract_boot_file(image, name, destination):
     start = struct.unpack_from("<I", mbr, 454)[0]
     if start == 0:
         raise ValueError("boot image has no FAT32 partition offset")
-    subprocess.run(["mcopy", "-i", f"{image}@@{start * 512}",
-                    f"::/boot/{name}", str(destination)], check=True)
+    filesystem = f"{image}@@{start * 512}"
+    menu = subprocess.check_output(["mtype", "-i", filesystem, "::/boot/grub/grub.cfg"]).decode()
+    release = re.search(r"^set retroos_release=(\S+)$", menu, re.M)
+    if not release: raise ValueError("image has no selected RetroOS release")
+    subprocess.run(["mcopy", "-i", filesystem,
+                    f"::{release[1]}/{name}", str(destination)], check=True)
 
 
 def prepare(image, destination, requested_c, requested_root, c_ram=False, requested_dir=None):
@@ -261,7 +267,8 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
     release = destination / "releases" / image_digest[:12]
     plan = {"image_sha256": image_digest, "release": str(release),
             "destination": str(destination), "boot_uuid": boot_fs["uuid"],
-            "grub_release": grub_path(release, boot_fs), "c_uuid": c_volume["uuid"] if c_volume else None,
+            "grub_release": grub_path(release, boot_fs),
+            "grub_destination": grub_path(destination, boot_fs), "c_uuid": c_volume["uuid"] if c_volume else None,
             "c_device": c_volume["path"] if c_volume else None,
             "c_fstype": c_volume["fstype"] if c_volume else None,
             "c_home": home, "c_dir": c_dir, "root_uuid": requested_root,
@@ -272,11 +279,14 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
         extract_boot_file(image, name, stage / name)
     entries = grub_entries(plan)
     (stage / "grub.cfg").write_text(entries)
-    (stage / "RETROOS.INI").write_text(mount_configuration(plan))
+    (stage / "BOOT.INI").write_text(mount_configuration(plan))
+    template = ROOT / "etc" / "RETROOS.INI"
+    user_ini = destination / "RETROOS.INI"
+    shutil.copyfile(user_ini if user_ini.exists() else template, stage / "RETROOS.INI")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     (stage / "42_retroos_module").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
     (stage / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-    names = ("kernel.elf", "retroos-base.img.gz", "RETROOS.INI", "grub.cfg", "42_retroos_module", "plan.json")
+    names = ("kernel.elf", "retroos-base.img.gz", "BOOT.INI", "RETROOS.INI", "grub.cfg", "42_retroos_module", "plan.json")
     (stage / "checksums.json").write_text(json.dumps({name: sha256(stage / name) for name in names}, indent=2) + "\n")
     STAGE_ROOT.mkdir(parents=True, exist_ok=True)
     (STAGE_ROOT / "selected").write_text(str(stage) + "\n")
@@ -319,7 +329,7 @@ def install():
         ensure_c_home(c_volume, plan["c_dir"] or "/home/retroos")
     release = Path(plan["release"])
     release.parent.mkdir(parents=True, exist_ok=True)
-    files = ("kernel.elf", "retroos-base.img.gz", "RETROOS.INI")
+    files = ("kernel.elf", "retroos-base.img.gz")
     if release.exists():
         for name in files:
             if not (release / name).is_file() or sha256(release / name) != sums[name]:
@@ -334,10 +344,18 @@ def install():
     for name in files:
         os.chown(release / name, 0, 0)
         (release / name).chmod(0o644)
+    user_ini = destination / "RETROOS.INI"
+    if not user_ini.exists():
+        shutil.copyfile(stage / "RETROOS.INI", user_ini)
+        user_ini.chmod(0o644)
+    boot_ini = destination / "BOOT.INI"
+    old_boot = boot_ini.read_bytes() if boot_ini.exists() else None
     old_managed = MANAGED.read_bytes() if MANAGED.exists() else None
     if old_managed is not None:
         Path(str(MANAGED) + ".previous").write_bytes(old_managed)
     try:
+        shutil.copyfile(stage / "BOOT.INI", boot_ini)
+        boot_ini.chmod(0o644)
         shutil.copyfile(stage / "42_retroos_module", MANAGED)
         MANAGED.chmod(0o755)
         if shutil.which("update-grub"):
@@ -348,6 +366,8 @@ def install():
                 raise ValueError("grub-mkconfig is missing")
             subprocess.run([command, "-o", plan["grub_config"]], check=True)
     except Exception:
+        if old_boot is None: boot_ini.unlink(missing_ok=True)
+        else: boot_ini.write_bytes(old_boot)
         if old_managed is None:
             MANAGED.unlink(missing_ok=True)
         else:

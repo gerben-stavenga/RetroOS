@@ -1,13 +1,39 @@
 # Booting RetroOS with GRUB
 
-There are two boot arrangements on a physical machine: boot the standalone
-USB image, or add RetroOS to an existing GRUB installation. For existing
-GRUB, the installer below finds disks and UUIDs with Linux, stages the matching
-kernel and RAM base module, generates `RETROOS.INI`, and creates the GRUB entries. Manual deployment
-uses the same boot path. The older ext4 installer later in this document
-remains available for machines that keep the runtime on their Linux root.
+GRUB supplies the kernel and two ordinary configuration files: `BOOT.INI`
+for bundle backing and mounts, and `RETROOS.INI` for user settings.
 
-## Install into an existing GRUB menu
+## Disk-backed installation (ext4)
+
+```sh
+tools/install_kernel.sh --prepare
+# Review build/machine-install/<release>/BOOT.INI and grub.cfg
+sudo tools/install_kernel.sh
+```
+
+The installer keeps kernel/runtime files under `/boot/retroos/releases/<version>/`,
+mount policy at `/boot/retroos/BOOT.INI`, and user settings permanently at
+`/home/retroos/RETROOS/RETROOS.INI` (`C:\RETROOS\RETROOS.INI`).
+GRUB loads both INIs separately. RetroOS opens the bundle directory by the UUID
+and `subdir` in `[bundle]`, so no filesystem image is loaded into RAM and no
+RAM-to-disk handoff is needed. Runtime writes use a sparse session overlay;
+user settings and C: data persist in the persistent entry. Upgrades preserve
+user settings and existing mount choices. The installer currently requires
+`/boot` and C: on the ext4 Linux root.
+
+## USB and optical boot
+
+The boot partition contains `/boot/grub/grub.cfg`, editable
+`/boot/retroos/BOOT.INI` and `/boot/retroos/RETROOS.INI`, and versioned boot files
+under `/boot/retroos/releases/<version>/`. GRUB loads the core image as a module
+because RetroOS cannot read USB storage yet. `[bundle] source=module` selects
+that image. Default boot loads the 16 MiB core (runtime libraries, DN and
+BusyBox) plus one 256 MiB showcase module with VC, MC, RC, NDN
+(DOS/Windows/OS/2), DN/2 (DOS/Windows/OS/2) and games. The “Core only
+(less RAM)” choice omits the showcase module. The user INI is exposed at `C:\RETROOS\RETROOS.INI` as session content;
+edit the ordinary USB file from another OS for persistent changes.
+
+## Module installation for filesystems RetroOS cannot read
 
 Use Linux with GRUB 2 installed. The USB image supplies both the kernel and RAM base
 module. Build and prepare as your normal user, review the generated entry, then
@@ -45,7 +71,8 @@ sudo tools/install_kernel.sh --module
 
 Replace `ABCD-1234` with the FAT32 data partition's UUID, not the EFI System
 Partition's UUID. The installer stores `kernel.elf` and
-`retroos-base.img.gz` and `RETROOS.INI` under Linux `/boot/retroos/releases/...`; GRUB reads
+`retroos-base.img.gz` under Linux `/boot/retroos/releases/...`, with both INIs
+at `/boot/retroos/`; GRUB reads
 them from Btrfs before starting RetroOS. RetroOS then reads the selected
 FAT32 partition as C:. It cannot read Btrfs itself, so `C:\RETROOS` comes
 from the RAM base module and the Btrfs boot filesystem is not C:.
@@ -65,23 +92,28 @@ base files yourself. The kernel and base image must come from the same build.
 The base image holds `C:\RETROOS`, startup defaults, and a RAM fallback C:.
 It is a GRUB Multiboot module, not a partition to extract onto the disk.
 
-Build `//:grub_module_usb` and copy these files from its `/boot` directory
+Build `//:grub_module_usb` and copy the selected version from `/boot/retroos/releases/<version>/` and both
+INI files from `/boot/retroos/`
 to a directory on a filesystem GRUB can read:
 
 ```text
 kernel.elf
 retroos-base.img.gz
-RETROOS.INI               # optional editable configuration override
-retroos-games.img.gz       # optional showcase content
+BOOT.INI                  # bundle backing and mounts
+RETROOS.INI               # editable user settings
+retroos-showcase.img.gz       # optional showcase content
 ```
 
 The image is also distributed as `retroos_grub_module_usb.img`. On Linux,
-copy from its first FAT32 partition with mtools like this:
+replace `VERSION` with the selected release directory and copy from the first
+FAT32 partition with mtools:
 
 ```sh
 mkdir -p /tmp/retroos-manual
-mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/kernel.elf /tmp/retroos-manual/
-mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos-base.img.gz /tmp/retroos-manual/
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos/releases/VERSION/kernel.elf /tmp/retroos-manual/
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos/releases/VERSION/retroos-base.img.gz /tmp/retroos-manual/
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos/BOOT.INI /tmp/retroos-manual/
+mcopy -i retroos_grub_module_usb.img@@1048576 ::/boot/retroos/RETROOS.INI /tmp/retroos-manual/
 sudo mkdir -p /boot/retroos/manual
 sudo cp /tmp/retroos-manual/* /boot/retroos/manual/
 findmnt -no UUID --target /boot/retroos/manual
@@ -92,11 +124,11 @@ is a separate filesystem, GRUB paths start at that filesystem's root; the
 example's `/boot/retroos/manual/` becomes `/retroos/manual/`.
 
 Choose physical filesystems with `lsblk -o NAME,FSTYPE,UUID,MOUNTPOINTS`.
-Copy [etc/RETROOS.INI](etc/RETROOS.INI) alongside the kernel, replace its
-session mount with your UUID mounts, and set their paths and access modes.
+Copy [etc/BOOT.INI](etc/BOOT.INI) and [etc/RETROOS.INI](etc/RETROOS.INI)
+alongside the kernel, replace the BOOT.INI session mount with your UUID mounts, and set their paths and access modes.
 A FAT C: normally uses `path=/home/retroos`, `drive=C`, and `subdir=/`.
 An ext4 C: can use `subdir=/home/retroos` with a matching `grant` directory.
-The base module supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` independently.
+The base module supplies `C:\RETROOS`, `C:\DN`, and `/bin` independently.
 For persistent DN settings, explicitly mount a writable directory at the
 C: namespace's `DN` path; the default bundled DN stores changes in RAM.
 `C:\TEMP` is always RAM-backed.
@@ -122,9 +154,10 @@ menuentry "RetroOS (manual, protected disk)" {
         set gfxpayload=auto
     fi
     module2 /boot/retroos/manual/retroos-base.img.gz retroos.mount=/
+    module2 /boot/retroos/manual/BOOT.INI retroos.config=boot
     module2 /boot/retroos/manual/RETROOS.INI retroos.config=ini
     # Optional showcase content, separate from physical game directories:
-    # module2 /boot/retroos/manual/retroos-games.img.gz retroos.mount=/games
+    # module2 /boot/retroos/manual/retroos-showcase.img.gz retroos.mount=/showcase
     boot
 }
 ```
@@ -132,7 +165,7 @@ menuentry "RetroOS (manual, protected disk)" {
 The example starts with physical writes protected. Remove `ram-overlay` to
 persist writes on mounts configured `access=rw`. For a boot log that stays
 on screen, add `boot-log-only`. Missing or ambiguous data UUIDs produce a
-mount diagnostic and a RAM recovery session; no other partition is selected.
+diagnostic and stop boot; no other partition is selected.
 Unlisted physical filesystems remain unmounted. RetroOS does not read USB
 mass storage after GRUB hands off.
 
@@ -233,7 +266,7 @@ There is one configuration format: `RETROOS.INI`. Startup arguments go in
 variables in `[environment]`. `--cmd` and `[environment] TEST=` override
 normal startup for command execution and tests.
 
-The boot bundle supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` as writable RAM
+The boot bundle supplies `C:\RETROOS`, `C:\DN`, and `/bin` as writable RAM
 content. When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
 Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
 
@@ -328,7 +361,7 @@ the Multiboot handoff:
 ```text
 multiboot /boot/kernel.elf
 module /boot/retroos-base.img.gz retroos.mount=/
-module /boot/retroos-games.img.gz retroos.mount=/games
+module /boot/retroos-showcase.img.gz retroos.mount=/showcase
 boot
 ```
 
@@ -412,9 +445,9 @@ packaged. It needs `grub-mkimage` plus the i386-pc modules (`grub-pc-bin`).
 
 GOP text console (the kernel renders into the framebuffer GRUB hands over —
 `kernel/src/arch/fbcon.rs`), then storage discovery. RetroOS walks MBR or GPT
-partitions and applies RETROOS.INI to FAT/ext4 volumes and file images. The
+partitions and applies BOOT.INI to FAT/ext4 volumes and file images. The
 bundle supplies writable RAM views of `C:\DN`, `C:\RETROOS` and `/bin`. Writes
-on rw data mounts persist unless `ram-overlay` was passed. Disk boots require RETROOS.INI; unlisted physical partitions stay unmounted.
+on rw data mounts persist unless `ram-overlay` was passed. Disk boots require both INI modules; unlisted physical partitions stay unmounted.
 
 Keyboard: the i8042 path (most laptops expose one via EC emulation) feeds
 the personality BIOS's INT 09. Machines with USB-only input are handled by the

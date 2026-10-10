@@ -99,7 +99,7 @@ def main():
             run("mmd", "-i", disk, "::/" + directory)
         run("mcopy", "-i", disk, ROOT / "etc/RETROOS.INI", "::RETROOS/RETROOS.INI")
         for ext in ("COM", "PRG", "OVR", "DLG", "LNG", "HLP", "EDT", "EXT", "HGL", "MNU", "VWR", "XRN"):
-            run("mcopy", "-i", disk, ROOT / f"apps-boot/dn/DN.{ext}", f"::DN/DN.{ext}")
+            run("mcopy", "-i", disk, ROOT / f"boot-bundle/dn/DN.{ext}", f"::DN/DN.{ext}")
         for first in (True, False):
             session(work, disk, first)
             boot_log = subprocess.check_output(["mtype", "-i", str(disk), "::KLOG.TXT"])

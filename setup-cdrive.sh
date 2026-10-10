@@ -18,9 +18,14 @@ mkdir -p "$C/GAMES"
 mkdir -p "$C/OS2/DLL" "$C/OS2/APPS" "$C/WINDOWS/SYSTEM" \
     "$C/WINDOWS/SYSTEM32" "$C/WINDOWS/APPS"
 
-# Games: one symlink per game directory, shareware + proprietary, merged into
-# C:\GAMES (the */ glob skips loose files like BUILD.bazel).
-for d in "$REPO"/apps/games/*/ "$REPO"/apps-proprietary/games/*/; do
+# Showcase directories mirror the C: root directly.
+for d in "$REPO"/showcase-bundle/*/; do
+    [ -d "$d" ] || continue
+    ln -sfn "${d%/}" "$C/$(basename "$d")"
+done
+
+# Proprietary games retain their existing C:\GAMES layout.
+for d in "$REPO"/apps-proprietary/games/*/; do
     [ -d "$d" ] || continue
     ln -sfn "${d%/}" "$C/GAMES/$(basename "$d")"
 done
@@ -29,7 +34,7 @@ done
 ln -sfn "$REPO/apps-proprietary/BORLANDC" "$C/BORLANDC"
 ln -sfn "$REPO/apps-proprietary/BP"       "$C/BP"
 ln -sfn "$REPO/apps-proprietary/nc"       "$C/NC"
-ln -sfn "$REPO/apps-boot/tc"              "$C/TC"
+ln -sfn "$REPO/showcase-bundle/TC"            "$C/TC"
 
 # Native OS/2 system DLLs and smoke applications share the DOS C: tree.
 bazelisk build \
@@ -90,15 +95,15 @@ cp -f "$REPO/bazel-bin/test/windows/watcom_io/watcom_io.exe" "$C/WINDOWS/APPS/WA
 # every lookup goes through DFS's case-folding cache, which derives the 8.3
 # alias (ACBASS.PAT) from whatever the real name is. 196 links to spell the
 # names differently bought nothing.
-ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
+ln -sfn "$REPO/showcase-bundle/ULTRASND" "$C/ULTRASND"
 
-# C:\RETROOS — the DOS system directory (DN, COMMAND.COM, LOADFIX.CFG,
+# C:\RETROOS — the DOS system directory (DN, COMMAND.COM, RETROOS.INI,
 # SHELL.ELF). Ordinary content on C:, exactly like the packaged ext4 images
 # carry it; the kernel embeds nothing, so without this there is no shell.
 # A copy, not a symlink: these are build outputs under bazel-bin.
 "$REPO/tools/install_boot_dir.sh" "$C"
 
-# Startup, regional settings and mount policy are in RETROOS/RETROOS.INI.
+# User settings are in RETROOS/RETROOS.INI; mounts are in BOOT.INI.
 
 echo
 echo "Done. C: layout:"

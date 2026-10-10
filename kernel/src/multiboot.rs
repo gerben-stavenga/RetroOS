@@ -46,10 +46,14 @@ struct ParsedMount {
 fn parse_mount(command: &[u8]) -> Option<ParsedMount> {
     let (key, path) = arch_abi::cmdline::parse_key_value(command)?;
     if arch_abi::cmdline::key_eq(key, b"retroos.config") {
-        assert_eq!(path, b"ini", "retroos.config accepts ini only");
+        let reserved: &[u8] = match path {
+            b"ini" => b"__config/",
+            b"boot" => b"__boot/",
+            _ => panic!("retroos.config accepts boot or ini"),
+        };
         let mut bytes = [0; arch_abi::BOOT_MODULE_MOUNT_MAX];
-        bytes[..9].copy_from_slice(b"__config/");
-        return Some(ParsedMount { bytes, len: 9 });
+        bytes[..reserved.len()].copy_from_slice(reserved);
+        return Some(ParsedMount { bytes, len: reserved.len() });
     }
     if !arch_abi::cmdline::key_eq(key, b"retroos.mount") {
         return None;
@@ -63,7 +67,7 @@ fn parse_mount(command: &[u8]) -> Option<ParsedMount> {
 
     let mut out = [0u8; arch_abi::BOOT_MODULE_MOUNT_MAX];
     let path = &path[1..];
-    assert_ne!(path, b"__config", "configuration module path is reserved");
+    assert!(!matches!(path, b"__config" | b"__boot"), "configuration module path is reserved");
     if path.is_empty() {
         return Some(ParsedMount { bytes: out, len: 0 });
     }
@@ -148,7 +152,7 @@ pub(crate) fn capture_module(
     let Some(mount) = parse_mount(command) else { return };
     assert!(end > start, "Multiboot module has an empty or wrapped range");
     let len = (end - start) as usize;
-    if mount.bytes[..mount.len] == *b"__config/" {
+    if matches!(&mount.bytes[..mount.len], b"__config/" | b"__boot/") {
         assert!(len <= 64 * 1024, "RETROOS.INI exceeds 64 KiB");
     } else {
         assert!(len != 0 && len.is_multiple_of(512), "Multiboot module size is not sector-aligned");
@@ -265,6 +269,7 @@ impl Disk for ModuleDisk {
 pub struct ModuleVolumes {
     pub root: Option<FilesystemVolume>,
     pub config: Option<Vec<u8>>,
+    pub boot_config: Option<Vec<u8>>,
     pub extra: Vec<(arch_abi::BootModule, FilesystemVolume)>,
 }
 
@@ -276,12 +281,13 @@ pub fn module_volumes(boot: &crate::BootConfig) -> ModuleVolumes {
             assert!(a.mount() != b.mount(), "duplicate retroos.mount path");
         }
     }
-    let mut result = ModuleVolumes { root: None, config: None, extra: Vec::new() };
+    let mut result = ModuleVolumes { root: None, config: None, boot_config: None, extra: Vec::new() };
     for module in modules {
-        if module.mount() == b"__config/" {
+        if matches!(module.mount(), b"__config/" | b"__boot/") {
             let mut bytes = alloc::vec![0; module.len];
             assert!((boot.boot_physical_io.expect("module physical I/O").read)(module.physical_start, &mut bytes), "config module read failed");
-            result.config = Some(bytes);
+            if module.mount() == b"__boot/" { result.boot_config = Some(bytes); }
+            else { result.config = Some(bytes); }
             continue;
         }
         let disk = ModuleDisk::from_boot_module(module, boot.boot_physical_io
@@ -303,6 +309,15 @@ pub fn module_volumes(boot: &crate::BootConfig) -> ModuleVolumes {
 #[cfg(test)]
 mod tests {
     use super::{Disk, ModuleDisk, capture_modules, handoff_modules, parse_mount};
+    #[test]
+    fn boot_and_user_ini_modules_have_separate_slots() {
+        let mut accepted = [None; arch_abi::MAX_BOOT_MODULES];
+        super::capture_module(0x2000, 0x2003, b"retroos.config=boot", &mut accepted);
+        super::capture_module(0x3000, 0x3005, b"retroos.config=ini", &mut accepted);
+        assert_eq!(&accepted[0].unwrap().mount[..7], b"__boot/");
+        assert_eq!(&accepted[1].unwrap().mount[..9], b"__config/");
+    }
+
     #[test]
     fn config_module_is_not_a_sector_aligned_filesystem() {
         let mut accepted = [None; arch_abi::MAX_BOOT_MODULES];

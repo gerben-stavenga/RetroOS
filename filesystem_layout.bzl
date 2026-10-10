@@ -1,7 +1,7 @@
 """Filesystem layout: paths are relative to their destination volume.
 
-BOOT_FILES is rebuilt with the kernel. DATA_FILES and LINUX_FILES seed
-one writable data disk once; editing these mappings never updates a live disk.
+BOOT_FILES and LINUX_FILES are rebuilt with the kernel. DATA_FILES seed
+one writable data disk once; editing that mapping never updates a live disk.
 RETROOS/ and bin/ are kernel/runtime contracts, not arbitrary mount names.
 """
 
@@ -11,8 +11,8 @@ LINUX_SIZE_MB = 512
 
 BOOT_FILES = {
     "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
-    "//tools/command:LOADFIX.CFG": "RETROOS/LOADFIX.CFG",
-    # apps-boot/** is not listed here. BUILD.bazel globs it onto the boot
+    "etc/BOOT.INI": "RETROOS/BOOT.INI",
+    # boot-bundle/** is not listed here. BUILD.bazel globs it onto the boot
     # disk: DN/ is the default shell; system files live under RETROOS/.
 
     "//tools/command:command_com": "RETROOS/COMMAND.COM",
@@ -91,11 +91,6 @@ DATA_FILES = {
     "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
     "//test/os2/pm_smoke:pm_smoke":      "OS2/APPS/PMSMOKE.EXE",
     "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
-    "//apps/os2/sweeper:SWEEPER.EXE":    "OS2/APPS/SWEEPER/SWEEPER.EXE",
-    "//apps/os2/sweeper:SWEEPER.HLP":    "OS2/APPS/SWEEPER/SWEEPER.HLP",
-    "//apps/os2/sweeper:README.DOC":     "OS2/APPS/SWEEPER/README.DOC",
-    "//apps/os2/sweeper:SWEEPER.DOC":    "OS2/APPS/SWEEPER/SWEEPER.DOC",
-    "//apps/windows/minesweeper:MINESWPR.EXE": "WINDOWS/APPS/MINESWPR.EXE",
     "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
     "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
@@ -130,5 +125,5 @@ LINUX_FILES = {
     # Static i686 busybox — single-binary Unix userland (sh + coreutils).
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.
-    "//:apps/busybox/busybox":               "bin/busybox",
+    "//:boot-bundle/bin/busybox":               "bin/busybox",
 }

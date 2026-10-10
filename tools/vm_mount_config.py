@@ -33,6 +33,30 @@ def volumes(path):
     return result
 
 
+def split_configuration(text):
+    """Separate user settings from storage sections, preserving text and comments."""
+    boot, user = [], []
+    target = user
+    for line in text.splitlines(keepends=True):
+        section = line.strip()
+        if section.startswith('['):
+            target = boot if section == '[bundle]' or section.startswith('[mount ') else user
+        target.append(line)
+    return ''.join(boot), ''.join(user)
+
+
+def boot_configuration(text, detected):
+    mounts, _ = split_configuration(text)
+    if '[bundle]' in mounts:
+        # The VM's runtime is always on its separately attached boot disk.
+        begin = mounts.index('[bundle]')
+        end = mounts.find('[', begin + 1)
+        mounts = mounts[:begin] + (mounts[end:] if end >= 0 else '')
+    if '[mount "data"]' not in mounts:
+        mounts = configure('', detected)
+    return '[bundle]\nsource=UUID=5E77-0002\nsubdir=/\n\n' + mounts
+
+
 def configure(text, detected):
     root = next((ident for kind, ident in detected if kind == 'ext4'), None)
     data = next(((kind, ident) for kind, ident in detected if kind == 'fat'), None)
@@ -60,11 +84,14 @@ def main():
         if any(c in args.command for c in '\r\n\0'):
             raise ValueError('Startup command must be one line')
         text = text.split('[mount \"session\"]', 1)[0] + '[environment]\nTEST=' + args.command + '\n'
-    generated = configure(text, volumes(args.data_image))
+    generated = boot_configuration('', volumes(args.data_image))
+    _, settings = split_configuration(text)
     with tempfile.TemporaryDirectory(prefix='retroos-vm-config-') as work:
-        path = Path(work)/'RETROOS.INI'
-        path.write_text(generated)
-        subprocess.run(['mcopy', '-o', '-i', boot, str(path), '::RETROOS/RETROOS.INI'], check=True)
+        for name, content in [('BOOT.INI', generated), ('RETROOS.INI', settings)]:
+            path = Path(work)/name
+            path.write_text(content)
+            subprocess.run(['mcopy', '-o', '-i', boot, str(path), '::RETROOS/' + name], check=True)
+
 
 
 if __name__ == '__main__': main()

@@ -49,7 +49,7 @@ def main():
         ]:
             shutil.copyfile(ROOT / "bazel-bin" / source, destination)
         # Exercise the actual CRT shipped with Win32 MC, including _chdir.
-        shutil.copyfile(ROOT / "apps-boot/MC/MSVCRT.DLL", root / "MSVCRT.DLL")
+        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/MC/MSVCRT.DLL", root / "MSVCRT.DLL")
         ndn_directory = os.environ.get("NDN_DIR")
         if ndn_directory:
             for name in ("SCRRES.DLL", "DESCSS.DLL", "NDNPASS.DLL", "TETRIS.DLL"):

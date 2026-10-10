@@ -27,14 +27,22 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
     # Boot the actual installer entries, including their firmware/video policy.
     entries = grub_entries({
         "release": "/boot/retroos", "uuid": uuid, "c_root": "/home/retroos",
+        "boot_ini": "/boot/retroos/BOOT.INI",
     }).replace(f"search --no-floppy --fs-uuid --set=root {uuid}",
                f"search --no-floppy --fs-uuid --set=root {UUID}")
+    # Load the actual split configuration through GRUB even when the target
+    # UUID is deliberately missing; the kernel must fail without autodetection.
+    (tree / "boot/BOOT.INI").write_text((work / "root/boot/retroos/BOOT.INI").read_text().replace(UUID, uuid))
+    (tree / "boot/RETROOS.INI").write_text((work / "root/home/retroos/RETROOS/RETROOS.INI").read_text())
+    entries = entries.replace("module2 /boot/retroos/BOOT.INI", "module2 ($bootiso)/boot/BOOT.INI")
+    entries = entries.replace("module2 /home/retroos/RETROOS/RETROOS.INI", "module2 ($bootiso)/boot/RETROOS.INI")
+    assert 'retroos.root=' not in entries and 'retroos.mount=' not in entries
     if storage == "ahci":
         # Boot entirely from ATA media, leaving the SATA data port unused by
         # GRUB. The kernel must receive its initial FIS before checking SIG.
         entries = entries.replace(f"search --no-floppy --fs-uuid --set=root {UUID}", "")
         entries = entries.replace("multiboot2 /boot/retroos/kernel.elf", "multiboot2 /boot/kernel.elf")
-    (grub / "grub.cfg").write_text("set timeout=0\n" + entries)
+    (grub / "grub.cfg").write_text("set timeout=0\nset bootiso=$root\n" + entries)
     iso = work / (name + ".iso")
     run("grub-mkrescue", "-o", iso, tree)
     log = work / (name + ".log")
@@ -81,6 +89,8 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
         process.wait(timeout=5)
     text = log.read_text(errors="replace")
     assert success in text and "[mem] exit tid=1 code=1" not in text, text
+    if expected != "bundle UUID not found":
+        assert "Locale: it-IT" in text, text
     if ata_dma:
         assert "ATA: ata0 LBA28 DMA" in text and "ATA: ata1 LBA28 DMA" in text, text
     firmware = "Substitute" if uefi else "NativeBios"
@@ -105,10 +115,15 @@ def main():
         (root / "usr/bin/sh").symlink_to("busybox")
         with tarfile.open(ROOT / "bazel-bin/machine_boot_tar.tar") as archive:
             archive.extractall(root / "boot/retroos", filter=runtime_filter)
-        config = root / "boot/retroos/RETROOS/RETROOS.INI"
-        config.write_text(config.read_text().split('[mount "session"]', 1)[0] +
+        shutil.copyfile(root / "boot/retroos/RETROOS/RETROOS.INI", home / "RETROOS/RETROOS.INI")
+        config = root / "boot/retroos/BOOT.INI"
+        config.write_text(f'[bundle]\nsource=UUID={UUID}\nsubdir=/boot/retroos\n'
                           f'[mount "linux"]\nsource=UUID={UUID}\npath=/\naccess=rw\ngrant=/home/retroos\n'
                           f'[mount "dos"]\nsource=UUID={UUID}\nsubdir=/home/retroos\npath=/home/retroos\ndrive=C\naccess=rw\ngrant=/home/retroos\n')
+        user_ini = home / "RETROOS/RETROOS.INI"
+        user_ini.write_text(user_ini.read_text().replace("language=en-US", "language=it-IT"))
+        user_ini.chmod(0o666)
+        (home / "RETROOS").chmod(0o775)
         (home / "STATE.DAT").write_bytes(b"INIT")
         (home / "STATE.DAT").chmod(0o664)
         home.chmod(0o2775)
@@ -134,6 +149,12 @@ void _start(void) {
  call(6,f,0,0);
  f=call(5,(int)"/home/retroos/RETROOS/TEST.DAT",2,0);
  if(f<0 || call(4,f,(int)"RAM!",4)!=4) goto fail; call(6,f,0,0);
+ f=call(5,(int)"/home/retroos/RETROOS/RETROOS.INI",2,0);
+ if(f<0) goto fail;
+ call(19,f,0,2);
+ char setting[]="\n[environment]\nLAYOUT_SETTING=preserved\n";
+ if(call(4,f,(int)setting,sizeof(setting)-1)!=sizeof(setting)-1) goto fail;
+ call(6,f,0,0);
  f=call(5,(int)"/home/retroos/STATE.DAT",2,0);
  if(f<0 || call(3,f,(int)b,4)!=4) goto fail;
  call(19,f,0,0);
@@ -160,7 +181,7 @@ fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
         boot(work, "explicit-root", image, decoy, UUID, "LAYOUT-WROTE", ata_dma=True)
         boot(work, "reordered-disks", image, decoy, UUID, "LAYOUT-PERSISTED", reverse=True)
         boot(work, "missing-root", image, decoy, "00000000-0000-0000-0000-000000000001",
-             "No boot bundle with RETROOS.INI available")
+             "bundle UUID not found")
         boot(work, "uefi-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED", uefi=True)
         boot(work, "ahci-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED",
              uefi=True, storage="ahci")
@@ -169,6 +190,10 @@ fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
         state = work / "state.dat"
         run("debugfs", "-R", f"dump /home/retroos/STATE.DAT {state}", image)
         assert state.read_bytes() == b"PRSS", state.read_bytes()  # INIT + four writes
+        settings = work / "settings.ini"
+        run("debugfs", "-R", f"dump /home/retroos/RETROOS/RETROOS.INI {settings}", image)
+        assert settings.read_text().count("LAYOUT_SETTING=preserved") == 4
+        assert "LAYOUT_SETTING" not in (root / "boot/retroos/RETROOS/RETROOS.INI").read_text()
         run("e2fsck", "-fn", image)
 
 

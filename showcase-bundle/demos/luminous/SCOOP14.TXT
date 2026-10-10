@@ -1,0 +1,670 @@
+ษอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ                       SCOOP Info 1st of April 1995                          บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+
+
+				    ฐฐฐฐฐฐฐฐฐ
+				 ฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐ
+			       ฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐ
+			      ฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐ
+			     ฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐฐ
+			     ฐฐฐฐฐ    ฐฐฐฐฐ    ฐฐฐฐฐ
+			    ฐฐฐฐฐฐ ÛÛ ฐฐฐฐฐ ÛÛ ฐฐฐฐฐฐ
+				   ÛÛ ฐฐฐฐฐ ÛÛ
+			    ÛÛÛÛÛÛÛÛÛ ฐฐฐฐฐ ÛÛÛÛÛÛÛÛÛ
+			    ÛÛÛÛÛÛÛÛÛ ฐฐฐฐฐ ÛÛÛÛÛÛÛÛÛ
+			     ÛÛÛÛÛÛÛÛ ฐฐÛฐฐ ÛÛÛÛÛÛÛÛ
+			     ÛÛÛÛÛÛÛÛÛ ฐฐฐ ÛÛÛÛÛÛÛÛÛ
+			      ÛÛÛÛÛÛÛÛÛ   ÛÛÛÛÛÛÛÛÛ
+			       ÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛ
+				 ÛÛÛÛÛÛÛÛÛÛÛÛÛÛÛ
+				    ÛÛÛÛÛÛÛÛÛ
+
+
+		Following subjects are included in this file:
+		0  : What's new in this file?
+		1  : About SCOOP
+		2  : SCOOP BBS
+		3  : What has happened lately
+		4  : RENOVATIVE  (Withdrawn by author)
+		5  : SCOOP Music System
+		6  : Current member status
+		7  : SCOOP growing
+		8  : Games .. And all that stuff ...(Withdrawn by author)
+		9  : Demonstrations for commercial purposes
+		10 : Gathering'95 (Old info)
+		11 : Gathering'95 - Finished -
+		12 : Detailed info about our members
+		13 : How to get in touch with SCOOP
+		14 : Greetings
+		15 : Final words
+
+				***********
+				* WARNING *
+				***********
+  This text has been written with a full-screen ASCII editor, not like the one
+	in DOS or PASCAL, and might not look right in other editors.
+	     I would like to take this time to apologize in front.
+		Some of the chapters may contain bad english.
+
+ษอออป
+บ 0 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ What's new in this file?                                                    บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Some of the chapters has probably changed name since the last time this text
+was released. And we have 'improved' the look a bit.
+
+The updated chapters in this file are the numbers :
+10, 11, 12, 13, 14, 15
+
+Removed chapters in this file :
+4, 8
+
+
+ษอออป
+บ 1 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ About SCOOP                                                                 บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+As most of you allready know, SCOOP was founded around 1985/86 by Charles
+Deenen. The SCOOP existing today, is not the same SCOOP Charles founded.
+The SCOOP you know now, was refounded in 1992 by Adept and Predator. After
+some years fiddeling around with the C64 and the AMIGA, we bought ourselves
+a couple of PC's and started assembly programming at once.At the 'Gathering 93'
+we came up with a demo for the demo-competition, called 'X&Renovated'. This
+demo was due to be released at that party. But the music player failed its
+ultimate test. And as you allready know, it wasn't released.
+Gathering'94, was a failure for us, from the beginning to the very end.
+We came to the party with a demo that only needed linking and fixing of the
+music player. Well.. Was that all? I guess not. We found the party to be
+VERY boring, so we didnt excactly spend alot of time at the party.
+Until we suddenly found out that the deadline was on Friday, instead of
+Saturday.. (Ehm..) That gave us about 24 hours to do the linking. Well,well.
+We sure didn't make the deadline. This year as last year, the demo-compo was
+quite a mess for us. But we released 'Renovative' 2 months later(A BIT LATE..).
+
+Today SCOOP consists of 2 musicians, 1 designer, 4 graphicians, 8 coders,
+2 comercial developers and 1 BBS-man. Some of these guys comes from different
+platforms and different arenas. To mention but a few groups: SHAPE,
+LEGION DESIGN, RIFFS, Beyond Force, The Suppliers, Panoramic Design, CRYPT
+and so on... Almost all the members has been fiddeling around on both C64 and
+AMIGA, and some of us on the Atari ST(e) too.
+Today the programmers are specialized in Visual Basic, Turbo Pascal, C/C++ and
+assembly on the IBM/PC, C64 and AMIGA.
+SCOOP consists actually of two separate teams, one team that is dedicated
+to demos(SCOOP Design), and another that is specialized in making comercial
+software(SCOOP Development). Even though the two teams are almost the same, we
+have people who only do either thing.
+If you want individual information about each member, look at chapter 11.
+
+
+ษอออป
+บ 2 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ SCOOP BBS                                                                   บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Another very important subject for SCOOP, is our BBS, run by one man
+'The Mercenary'. The BBS started up in late 92, and was called at that time
+'Maggis BBS'. At that time, the BBS was a local chatter BBS, and has grown
+to be an attractive demo-based BBS today. Because of good support from the
+users, the BBS has had the possibility to grow into a well liked BBS.
+By arranging a time-limit payment system, people started to pay us to
+make the BBS even greater. Thanx to this, we have now the money it takes to
+open a second BBS, related to programming and demos only. The two systems
+will be linked together twice a day, to exchange information.
+
+
+ษอออป
+บ 3 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ What has happened lately                                                    บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+We have been colaborating with several people. Jogeir Liljedahl is one of
+them. He has begun making some music for several of our projects, and will
+hopefully be a PC / SCOOP member soon. We are also colaborating with
+SpaceBalls in making the Gathering invitation demo. Which you have probably
+been sitting and waiting for, for like several months.
+
+
+ษอออป
+บ 4 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ RENOVATIVE (Withdrawn by author)                                            บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+
+
+ษอออป
+บ 5 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ SCOOP Music System                                                          บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+The name will probably be changed, since Heatseeker/Cryptoburners has
+joined in to make it a more flexible system to be used on AMIGA/PC/UNIX/MAC.
+
+The system is an independent sequencer/track system. Which has a variable
+length of the sequences. The sequences are independent blocks of notes and
+effects, which you put into a track table for each voice. This track table
+contains events for the sequences and information on how to play the track.
+A track zero contains the information about the whole music and the effects
+to follow it.
+The player itself generates 32 voices of multitimbrality for the SB/SBPRO/SB16
+16 in each speaker. The principal for the player, is to generate sound at
+a low CPU-demand, but with a high quality. By using the DMA, we can do so.
+'SCOOP DMA Double Buffer' is the method being used for this. It builds upon
+a system with 2 buffers at the same size as the frequency of the playback, and
+a timer running at 70 Hz to update the buffers. If you know what I am talking
+about, you'll find out that the CPU time needed for such a player is almost at
+the same level as an FM-player for Adlib.
+At this moment in time, actually 2 of the four players for this system has
+been finished, and the editor is way over half-finished. You will probably
+see a BETA version at a BBS near you around October/November(I hope).
+
+
+ษอออป
+บ 6 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Current member status                                                       บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Real-name                      Alias                   Status
+---------                      -----                   ------
+Einar Ingebrigtsen             Adept                   Coder
+Frode Gjerde                   The Plastic Priest      Coder
+John Stian Langvik             Shamen                  Coder
+Bent Ivar Helland              Uzul                    Coder
+dne Hetlelid                  Wizdom                  Coder
+Morten Salthe                  Jammer                  Coder
+Nils Andersen                                          Coder
+yvind Stiauren                Nosferatu               Coder
+Rune Kvam		       Norx		       Coder
+Geir Tjelta                    Predator                Musician
+Svein Fossdal                  WAM                     Musician
+Sveinung Eie		       The Ancient Mariner     Musician
+Jogeir Liljedahl	                               Musician
+Kjell Inge Alsvik              Byte Prisoner           Designer
+Sigurd NK                      Sauron                  Graphician
+Glenn Kristoffersen	       Diamondback	       Graphician
+Andr Nergrd                  Andy                    Graphician
+Bjrn Morten Figved            GrafX                   Graphician
+Ivar Jensen                    AvA                     Graphician
+Bjrnar Bolsy                                         Graphician
+Magnus Wooldridge              The Mercenary           BBS
+Iivo Henriksen                 Dr. Kashiko             Developer
+
+That gives us a total of 22 members....
+
+
+ษอออป
+บ 7 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ SCOOP Growing                                                               บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+After some months of releasing this text, and purely nothing else, and because
+of the Gathering thing. SCOOP seems to have been known alot, we thank everyone
+that has been helping us in this process. And because of that, we have
+5-6 new members. Welcome to the gang.
+
+
+
+ษอออป
+บ 8 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Games and all that stuff (Withdrawn by author)                              บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+
+
+ษอออป
+บ 9 บ
+ฬอออสอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Demonstrations for commercial purposes                                      บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+As you allready know, it's expensive to live a computer life. You always has
+to buy the latest of the latest. For you guys out there who wants to support
+us by, either just giving us money(yeah, right) or wants a demonstration
+made for you. Get in touch with us. Write a letter where you specifically
+write what you want, and how the demo should appear(if you know..).
+
+
+
+ษออออป
+บ 10 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Gathering'95                                                                บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Detailed information about Gathering 95, should be in an own file in this
+package.
+
+
+ษออออป
+บ 11 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Gathering'95 - Finished -                                                   บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+
+
+
+
+
+ษออออป
+บ 12 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Detailed info about our members                                             บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Name            :       Einar Ingebrigtsen
+Alias           :       Adept
+Computer(s)     :       i-Pentium-S90: 540 Mb Conner SCSI HD
+				       350 Mb Conner SCSI HD
+				       350 Mb Conner IDE HD
+				       130 Mb IBM IDE HD
+				       80 Mb IBM SCSI HD
+				       Toshiba 3401 SCSI CD-ROM
+				       ET4000 64 Bit Graphics Adapter
+				       16 Mb RAM
+				       Soundblaster 16 ASP
+				       Advanded Gravis UltraSound MAX
+				       Roland SCC-1
+			Amiga 1000 : Extended PHOENIX main board
+				     2 Mb RAM
+				     80 Mb IBM SCSI HD
+			Amiga 500  : With nothing
+			CBM 64 * 3 : 1581 3.5" Drive
+				     1541II 5.25" Drive
+			Atari 520STFM : With nothing
+			Atari LYNX
+			Super Nintendo
+Occupation      :       Programmer at Funcom productions
+Status          :       Coder, Graphician, Designer and Musician
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Coder on C-64, about 9-10 years.
+			AMIGA and Atari ST(e) for about 2 years.
+Group Status    :       The Suppliers, Errors, 3D, SHAPE, Legion Design
+			RIFFS, Reflex, Whiz Kids.
+
+
+Name            :       Frode Gjerde
+Alias           :       The Plastic Priest
+Computer(s)     :       a486 DX4 100 : 250 Mb Conner HD
+				       520 Mb HD
+				       8 Mb RAM
+				       Soundblaster 16 ASP
+				       9600/19200 BPS Trailblazer Modem
+Occupation      :       None
+Status          :       Coder, Designer
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Programmer on AMIGA and C-64 for about 7 years.
+Group Status    :       CRYPT
+
+
+Name            :       Geir Tjelta
+Alias           :       The Predator
+Computer(s)     :       i-PENTIUM-S90 : 1024 Mb HD Space
+				      	32 Mb RAM
+				      	Roland SCC-1
+				      	Soundblaster 16 ASP
+Occupation      :       Musician at Funcom productions
+Status          :       Coder, Musician
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Coder and musician on the C-64 for 6-7 years, and coder
+			on the AMIGA for 1/2 a year
+Group Status    :       The Suppliers, SHAPE, Panoramic Design, Beyond Force,
+			Whiz Kids, Paradize.
+
+
+Name		:	Jogeir Liljedahl
+Alias		:	None
+Computer(s)	:	AMIGA 4000-030 : 12 Mb RAM
+					 340 Mb HD
+Occupation	:	Musician at Funcom Productions
+Status		:	Musician
+Division(s)	:	SCOOP Design
+Background	:	Is a member of Noiseless & Virtual Dreams on the AMIGA
+			Has also been fiddeling around with the C64.
+Group Status	:	Noiseless, SpaceBalls, Virtual Dreams
+
+
+Name            :       John Stian Langvik
+Alias           :       Shamen
+Computer(s)     :       i486 DX2 66 : 420 MB Conner HD
+				      8 Mb RAM
+				      Ultravision Pro Audio Spectrum 16
+				      S3 SVGA
+Occupation      :       Currently 'doing time' in the military.
+Status          :       Coder
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Coder on the AMIGA
+Group Status    :       CRYPT
+
+
+Name            :       Magnus Wooldridge
+Alias           :       The Mercenary (irc: kurgan)
+Computer(s)     :       i486 DX2 66: speeded to 80Mhz
+				     345 Mb HD Space
+				     8 Mb RAM
+				     Cirrus Logic VL 2MB
+				     Rascal Interlan 16
+				     Soundblaster 16
+Occupation      :       None
+Status          :       BBS, soon coder
+Division(s)     :       SCOOP Design
+Background      :       None
+Group Status    :       None
+
+
+Name            :       Kjell Inge Alsvik
+Alias           :       Byte Prisoner
+Computer(s)     :       i486 DX 33 : 420 Mb HD Space
+				     4 Mb RAM
+				     9600 / 19200 BPS Trailblazer Modem
+Occupation      :       Working at a local steel-work
+Status          :       Design, BBS
+Division(s)     :       SCOOP Design
+Background      :       Designer on the AMIGA
+Group Status    :       CRYPT
+
+
+Name		:	Sveinung
+Alias		:
+Computer(s)	:	486 DX 33 : 250 Mb HD Space
+				    4 Mb RAM
+				    Soundblaster PRO
+Occupation	:	Pupil, and making real music. Have just released an
+			album.
+Status		:	Musician
+Division(s)	:	SCOOP Design
+Background	:	Musician on the AMIGA
+Group Status	:	CRYPT
+
+
+Name            :       Bent Ivar Helland
+Alias           :	Uzul
+Computer(s)     :       a486 DX2 66 : 250 Mb Conner HD
+				      4 Mb RAM
+				      Soundblaster AWE 32
+				      Cirrus Logic
+Occupation      :       Studying electronics & computers
+Status          :       Coder
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Coder on C-64 for about 2.5 years
+Group Status    :       Disksoft, MM, PCCA
+
+
+Name            :       Aadne Hetlelid
+Alias           :	Wizdom
+Computer(s)     :       i486 SX 33 : 420 Mb Conner HD
+				     4 Mb RAM
+				     S3 Gfx. Card
+Occupation      :       Programmer at Funcom productions
+Status          :       Coder
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       None
+Group Status    :       None
+
+
+Name            :       Morten Salthe
+Alias           :       Jammer
+Computer(s)     :       i486 SX 33 : 240 Mb HD
+				     8 Mb RAM
+				     Soundblaster 2.0
+			i286 - 12  : 40 Mb HD
+			      	     1 Mb RAM
+Occupation      :       Studying Computers
+Status          :       Coder, Designer, Musician
+Division(s)     :       SCOOP Design
+Background      :       Coder on the C-64 for 5-6 years
+Group Status    :       SHAPE, Panoramic Design, Legion Design
+
+
+Name            :       Iivo Henriksen
+Alias           :       Dr. Kashiko
+Computer(s)     :       a386 SX 25 : 290 Mb HD Space
+				     6 Mb RAM
+				     Soundblaster PRO
+				     14400 BPS Modem
+Occupation      :       Pupil
+Status          :       Developer, Organizer
+Division(s)     :       SCOOP Development
+Background      :       None
+Group Status    :       None
+
+
+Name		:	Sigurd NK
+Alias		:	Sauron
+Computer(s)	:	AMIGA 4000-040 : 16 Mb RAM
+					 340 Mb HD
+Occupation	:	Graphician at Funcom Productions A/S
+Division(s)	:	SCOOP Design
+Background	:	Graphician on the AMIGA Scene
+Group Status	:
+
+
+Name		:	Glenn Kristoffersen
+Alias		:	Diamondback
+Computer(s)	:	486 DX2 66 : 8 Mb RAM
+			      	     210 Mb HD
+Occupation	: 	Graphician at Funcom Productions A/S
+Division(s)	:	SCOOP Design
+Background	:	Graphician on the AMIGA Scene
+Group Status	:	Spaceballs
+
+
+Name            :       Bjornar Bolsoy
+Alias           :
+Computer(s)     :       Amiga 4000-50 68040, with Emplant: 250 Mb WD HD
+							   420 Mb Conner HD
+							   12 Mb RAM
+							   Extended 16Bit Audio
+							   Dual Monitor System
+Occupation      :       Insurance sales-man for VESTA Insurance
+Status          :       Graphician, Designer
+Division(s)     :       SCOOP Design and SCOOP Development
+Background      :       Graphician on the AMIGA for some years.
+Group Status    :       None
+
+
+Name            :       Bjorn Morten Figved
+Alias           :       GrafX
+Computer(s)     :       a486 DX4 100 : ca. 900 Mb HD Space
+					   12 Mb RAM
+					   Soundblaster Pro 2
+					   Gravis Ultrasound 1Mb
+					   9600 BPS Modem
+					   HP Deskjet 500-C
+					   Canon Laserprinter
+					   Canon ION Camera
+					   Microtech Flatbed Scanner
+					   Cirrus Logic 2Mb
+Occupation      :       None
+Status          :       Graphician, Designer
+Division(s)     :       SCOOP Design
+Background      :       None
+Group Status    :       None
+
+
+Name            :       Ivar Jensen
+Alias           :       AVA
+Computer(s)     :       i486 DX 33 : 420 Mb Conner HD
+				     12 Mb RAM
+				     Soundblaster 2.0
+				     Cirrus Logic Gfx. Card
+Occupation      :       Studying economy
+Status          :       Artist, Graphician, Designer
+Division(s)     :       SCOOP Design
+Background      :       Graphician and designer on the C-64 and the Atari
+Group Status    :       SHAPE, REFLEX, 3D, Legion Design
+
+
+Name            :       Svein Fossdal
+Alias           :       WAM
+Computer(s)     :       i486 SX 25: 700 Mb Conner HD
+				    4 Mb RAM
+				    Soundwave 32 audiocard
+Occupation      :       Student
+Status          :       Musician
+Division(s)     :       SCOOP Design
+Background      :       Making music on AMIGA
+Group Status    :       None
+
+
+Name            :       Nils Andersen
+Alias           :
+Computer(s)     :       486 DX2 66 : 250 Mb HD
+				      4 Mb RAM
+				      Cirrus Logic SVGA
+				      2400 BPS Modem
+Occupation      :       Student at university
+Status          :       Coder
+Division(s)     :       SCOOP Design
+Background      :       None
+Group Status    :       None
+
+
+Name            :       yvind Stiauren
+Alias           :       Nosferatu
+Computer(s)     :       c486 DLC 40 : 16 Mb RAM
+				      130 Mb Seagate HD
+				      250 Mb Seagate HD
+				      ET 4000 Gfx. Card.
+				      Sounblaster 16 ASP
+			AMIGA 500 : 1.5 MB RAM
+			     	    1084S Monitor
+			     	    Extra Disk Drive
+			SX64 : Portable C-64
+			CBM128 : 1571 Disk Drive
+Occupation      :       Studying electronics
+Status          :       Coder
+Division(s)     :       SCOOP Design
+Background      :       Coder on AMIGA
+Group Status    :       None
+
+
+Name            :       Andr Nergrd
+Alias           :       Andy
+Computer(s)     :       i486 SX 25 : 120 Mb + 170 Mb Hd
+				     4 Mb RAM
+				     Gravis Ultrasound
+				     AVGA 2
+				     CANON BJ-10
+			AMIGA 500 : 1 Mb RAM
+				    1084S Monitor
+Occupation      :       Student
+Status          :       Graphician
+Division(s)     :       SCOOP Design
+Background      :       Graphician on the AMIGA
+Group Status    :       None
+
+
+Name            :       Rune Kvam
+Alias           :       Norx
+Computer(s)     :       i486 DX 33 : 420 Mb + 540 Mb Hd
+				     Pioneer SCSI-II 4xSpeed
+				     22 Mb RAM
+				     Gravis Ultrasound 1mb
+				     Cirrus Logic VGA
+				     Conner QIC 80
+			i386 SX 16 : 250 Mb HD
+			i386 SX 16 : 85+45 Mb HD
+Occupation      :       Student
+Status          :       Coder
+Division(s)     :       SCOOP Design
+Background      :       None
+Group Status    :       None
+
+
+
+
+ษออออป
+บ 13 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Contact SCOOP                                                               บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+Einar - Adept / SCOOP / Funcom    Int.code + 47 224-20102
+			         Cellular phone 9010-6930
+Geir - Predator / SCOOP / Funcom  Int.code + 47 224-20102
+Frode - TPP / SCOOP               Int.code + 47 517-18166
+Bjorn Morten - Grafx / SCOOP	  Int.code + 47 516-70116
+
+SCOOP WHQ BBS               Node1:Int.code + 47 517-48535
+			    Node2:Int.code + 47 517-48572
+SCOOP WHQ SYSOP Voice             Int.code + 47 517-49134 (Ask for Magnus)
+				 Cellular phone 9010-1121
+
+SCOOP Dist. Site(s):
+Gollum WHQ - Sidewalk Cafe BBS	: Int.code + 47 355-12227
+Discovery BBS                 	: Int.code + 47 670-77861
+Bitstream BBS		       	: Int.code + 358 21-438-3244
+Alten BBS		       	: Int.code + 47 784-42326
+HD BBS			       	: Int.code + 47 527-29520
+Point Break		       	: Int.code + 321 143-6925
+Action BBS		       	: Int.code + 47 748-07766
+Starport BBS(Internet)	       	: FTP.MPOLI.FI or
+			 	  FTP.FUNET.FI
+
+You can get the latest information about Gathering through Internet at:
+http://www.powertech.no/~mawo/
+
+
+E-MAIL (Internet):
+adept@bigblue.no
+magnus-w@hsr.no
+m-salthe@gribb.hsr.no
+nils-a@gribb.hsr.no
+grafx@norway.bbs.no
+benti-h@hsr.no
+norx@norway.bbs.no
+
+
+Snailmail:
+
+Funcom Productions      SCOOP WHQ BBS           Funcom Productions
+co/ Einar Ingebrigtsen  Box 38                  co/ Geir Tjelta
+Havnelageret,Langkaia 1 4100 Joerpeland         Havnelageret, Langkaia 1
+0100 Oslo               Norway                  0100 Oslo
+Norway						Norway
+
+Svein Fossdal           Frode / SCOOP           Iivo Henriksen
+Fjellsvn                Box 78                  Box 27
+4100 Joerpeland         4100 Joerpeland         4110 Forsand
+Norway                  Norway                  Norway
+
+	     	 	Andr Nergrd
+			Gml. Hestnesvei 46
+			4370 Egersund
+			Norway
+
+
+ษออออป
+บ 14 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Greetings                                                                   บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+We'd like to send our best regards to:
+
+GoLLuM, DarkZone, Avalanche, Future Crew, Twilight Zone, PMC, Alive, Shape,
+Noiseless, Panoramic Design, Vibrants, SpaceBalls, Andromeda, PORNOS, Scoopex,
+Crusaders, Cryptoburners, 5 and then some, Bit Killers, Proxima.
+
+The greetings above includes the IBM/PC and the AMIGA scene.
+
+
+
+ษออออป
+บ 15 บ
+ฬออออสออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออป
+บ Final words                                                                 บ
+ศอออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออออผ
+First of all, I would like to take the time to thank all the people who have
+been standing by us. Thanx for your support, without the support we probably
+wouldn't excist. Another big thank you goes to Strand Data, for sponsoring our
+BBS and our group with hardware, big round of applause to you Rudi.
+
+The purpose of this text-file, is to let the world know who SCOOP is, and
+what they are doing at every given time.
+
+All the text in this file was written by Adept. And might contain some
+information that might be wrong. The information I am talking about, is
+mostly the information about each member, since that's the hardest part
+to keep track on.
+
+Thanx for taking your time to read this...
+
+Adept / SCOOP 

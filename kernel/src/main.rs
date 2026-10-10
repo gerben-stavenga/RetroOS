@@ -8,7 +8,7 @@
 //!   retroos-host --host DIR disk.img       # ...with /host = DIR
 //!   retroos-host --cmd "PROG ARGS" disk.img  # boot straight into PROG, then halt
 //!   retroos-host program.elf [args...]     # run one 32-bit Linux ELF directly
-//!   retroos-host apps/busybox/busybox sh   # ...e.g. an interactive BusyBox shell
+//!   retroos-host boot-bundle/bin/busybox sh   # ...e.g. an interactive BusyBox shell
 //!   retroos-host                           # arch-boundary demo
 //! (build: bazelisk build //kernel:retroos-host --platforms=@platforms//host)
 
@@ -154,7 +154,7 @@ fn main() {
     // A bare executable is not a second way to boot: serve its directory over
     // the native host-fs punch-through and let the ordinary path name it, so
     // the kernel is entered once, through `startup()`, with the machine
-    // probed. argv = the positional tail (so `… apps/busybox/busybox sh` runs
+    // probed. argv = the positional tail (so `… boot-bundle/bin/busybox sh` runs
     // BusyBox's `sh` applet).
     let elf = magic == *b"\x7fELF";
     if elf {

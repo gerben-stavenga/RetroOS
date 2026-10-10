@@ -1,9 +1,0 @@
-exports_files(
-    [
-        "README.DOC",
-        "SWEEPER.DOC",
-        "SWEEPER.EXE",
-        "SWEEPER.HLP",
-    ],
-    visibility = ["//visibility:public"],
-)

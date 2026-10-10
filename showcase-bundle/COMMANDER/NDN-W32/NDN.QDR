@@ -1,0 +1,35 @@
+; Necromancer's Dos Navigator: External Quick Directories ³
+; ÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÄÙ
+;
+; Format: One directory on one line, environment variables are allowed.
+;         No duplicate directories will be displayed.
+;
+; "?" at first position: Only add the directory if it exists.
+; "-" on a single line: Add a menu line to the displayed list.
+; "*" as a separator between a path and a description string
+; {GUID} : identify standard folders registered with the system.
+; Doc: https://docs.microsoft.com/en-us/windows/desktop/shell/knownfolderid
+; Example:
+{B4BFCC3A-DB2C-424C-B029-7FE99A87C641} * Desktop
+{FDD39AD0-238F-46AF-ADB4-6C85480369C7} * Documents
+{374DE290-123F-4565-9164-39C4925E467B} * Downloads
+
+; Temporary directories
+?%TMP%
+?%TEMP%
+
+; Windows NT+
+?%SystemRoot%
+?%ProgramFiles%
+?%CommonProgramFiles%
+?%ALLUSERSPROFILE%
+?%HomeDrive%%HomePath%
+?%APPDATA%
+?%UserProfile%
+; Language specific
+?%UserProfile%\Eigene Dateien\
+?%UserProfile%\My Documents\
+
+; Windows 9x
+?%WinDir%
+?%WinBootDir%

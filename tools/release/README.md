@@ -14,12 +14,14 @@ and GRUB menu as the USB image.
 Use this image when you need to edit GRUB settings on a USB stick. It has a
 fixed MBR with one 128 MiB FAT32 partition (type `0x0C`, so Windows can assign
 it a drive letter). The menu is
-`/boot/grub/grub.cfg`; the matching kernel and RAM modules are under `/boot`
-on the same partition. `/boot/RETROOS.INI` is the editable mount, locale,
-keyboard, sound and startup configuration; GRUB loads it before RetroOS
-probes physical storage. Unlisted physical partitions remain unmounted.
+`/boot/grub/grub.cfg`; the matching kernel and RAM modules are under
+`/boot/retroos/releases/<version>/` on the same partition.
+`/boot/retroos/BOOT.INI` describes mounts and bundle backing;
+`/boot/retroos/RETROOS.INI` contains locale, keyboard, sound, launch and startup
+settings. Both are ordinary editable files loaded separately by GRUB. Unlisted physical partitions remain unmounted.
 The bundled DN and system files have writable RAM views.
-Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
+The default loads the 16 MiB core plus one 256 MiB showcase module containing
+games and commanders. Choose “Core only (less RAM)” to omit the showcase.
 
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
 the device's current contents. On Linux, after identifying the device with
@@ -98,11 +100,11 @@ to GRUB.
 
 ## Filesystem layout
 
-`RETROOS/RETROOS.INI` selects mounts by UUID or image path. Unlisted disks stay
+`BOOT.INI` selects mounts by UUID or image path. Unlisted disks stay
 unmounted. The VM launcher supplies a UUID profile for its attached data disk;
 a standalone bundle defaults to a RAM session.
 
-The bundle supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` as writable RAM content.
+The bundle supplies `C:\RETROOS`, `C:\DN`, and `/bin` as writable RAM content.
 When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
 Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
 
@@ -131,6 +133,8 @@ For UniPCemu on Linux, install or build its executable and prepare a `ROM`
 directory containing a motherboard BIOS ROM for its Pentium/i430fx machine,
 such as `BIOSROM.i430fx.BIN`. The emulator and BIOS ROMs are not bundled.
 Its internal BIOS cannot boot the Pentium selected by this launcher.
+In a development checkout, the launcher uses `build/unipcemu-bitbucket/UniPCemu-apm-fixed`
+and `build/unipcemu-bitbucket/ROM` automatically when they exist.
 Run the prebuilt disk image with:
 
 ```sh
@@ -247,10 +251,11 @@ Choosing persistent versus protected inside GRUB only changes disk writes.
 After updating RetroOS's installer, rerun preparation and installation to apply
 the generated video policy to an existing machine's GRUB entries.
 
-`RETROOS/RETROOS.INI` controls startup, locale, sound and mounts. The bundle
-provides applications at `C:\DN`, `C:\VC`, `C:\MC`, and `C:\RC`,
-system libraries under `C:\RETROOS`, and BusyBox under
-`/bin`. Bundled files are writable RAM content; configure an explicit writable
+`RETROOS/RETROOS.INI` controls startup, locale, sound and launch overrides;
+`BOOT.INI` describes storage. DN is core; the optional showcase provides
+games at `C:\GAMES`, commanders at `C:\COMMANDER`, demos, toolchains
+and game assets. System libraries under `C:\RETROOS` and BusyBox under
+`/bin` belong to the core. Bundled files are writable RAM content; configure an explicit writable
 directory mount to persist application settings. Temporary files are in RAM
 at `C:\TEMP`.
 

@@ -783,7 +783,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                 tlen, &tail[..tlen.min(8)]);
             // CH bit 0 enables the per-launch classic XMS reporting limit.
             // CL carries the child's virtual IOPL — the `IfMode` COMMAND.COM
-            // looked up in LOADFIX.CFG. It must accept EVERY mode: this used to
+            // looked up in RETROOS.INI [launch]. It must accept EVERY mode: this used to
             // read `== 3 { 3 } else { 1 }`, from when there were only two, so a
             // `repair` client (2) was silently demoted to spec-strict (1). That
             // is not a slow path, it is a HANG — POPF/IRET stop being honored,

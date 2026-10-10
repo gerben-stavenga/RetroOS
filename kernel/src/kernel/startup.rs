@@ -64,13 +64,12 @@ fn prepare_startup<A: crate::Arch>(
 
     // GRUB config is available before physical storage discovery.
     let modules = crate::multiboot::module_volumes(boot);
-    let early_config = if let Some(ref bytes) = modules.config {
-        Some((crate::kernel::mount_config::Config::parse(bytes)
-            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)), b"".as_slice()))
-    } else {
-        modules.root.and_then(|v| crate::kernel::mount_config::read_bundle(v)
-            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)))
-    };
+    if modules.boot_config.is_none() && (modules.root.is_some() || modules.config.is_some()) {
+        lib::compact_panic!("GRUB must supply BOOT.INI");
+    }
+    let early_config = modules.boot_config.as_ref().map(|bytes|
+        crate::kernel::mount_config::Config::parse_boot(bytes)
+            .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI: {}", e)));
     let disks = discover_disks(machine);
 
     // Probe the machine ONCE and freeze the result; all hardware policy
@@ -498,7 +497,7 @@ fn apply_disk_policy(
 
 struct BootMounts {
     modules: crate::multiboot::ModuleVolumes,
-    config: Option<(crate::kernel::mount_config::Config, &'static [u8])>,
+    config: Option<crate::kernel::mount_config::Config>,
 }
 
 /// Establish the complete mount namespace. Disk and partition discovery are
@@ -572,7 +571,7 @@ fn mount_filesystems(
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     modules: crate::multiboot::ModuleVolumes,
-    early_config: Option<(crate::kernel::mount_config::Config, &'static [u8])>,
+    early_config: Option<crate::kernel::mount_config::Config>,
     boot: &crate::BootConfig,
 ) -> bool {
     use crate::kernel::block::partition::PartKind;
@@ -585,49 +584,36 @@ fn mount_filesystems(
             Some(volume)
         }).collect();
     crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
-    let installed = boot.runtime().and_then(|_| volumes.iter().find(|v| v.uuid() == boot.root_uuid).copied());
-    let boot_source = installed.or(modules.root).or_else(|| volumes.iter().find(|v| crate::kernel::mount_config::read_bundle(**v)
-            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)).is_some()).copied());
-    if let Some(bundle) = boot_source {
-        let installed_config = if let Some(runtime) = boot.runtime().filter(|_| installed.is_some()) {
-            let fs = bundle.open(false).unwrap_or_else(|e| lib::compact_panic!("{}", e));
-            let path = [runtime, b"RETROOS.INI"].concat();
-            let directory = runtime.strip_suffix(b"/").unwrap_or(runtime);
-            let home = directory.iter().rposition(|b| *b == b'/').map_or(b"".as_slice(), |i| &directory[..i + 1]);
-            crate::kernel::mount_config::read(fs.as_ref(), &path)
-                .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e))
-                .map(|config| (config, prefix(&[home])))
-        } else { None };
-        let configuration = early_config.or(installed_config).or_else(|| crate::kernel::mount_config::read_bundle(bundle)
-            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)));
-        if let Some((mut config, home)) = configuration {
-            crate::kernel::mount_editor::init_editor(&volumes, &config, boot);
-            if let Err(error) = crate::kernel::mount_config::apply(&config, bundle, home, &volumes, boot.ram_overlay, modules.extra.clone()) {
-                crate::compact_screenln!(screen, "RETROOS.INI mounts: {} — starting a RAM session", error);
-                vfs::reset_boot_mounts();
-                crate::kernel::mount_editor::clear_active_mounts();
-                crate::kernel::dos::reset_configured_drives();
-                let mut fallback = crate::kernel::mount_config::Config::parse(
-                    b"[system]\nstart=C:\\DN\\DN.COM\n[mount \"session\"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n")
-                    .expect("built-in RAM mount configuration");
-                for item in config.environment.split(|b| *b == 0).filter(|s| !s.is_empty()) {
-                    if item.starts_with(b"START=") || item.starts_with(b"TEST=") { continue; }
-                    fallback.environment.pop();
-                    fallback.environment.extend_from_slice(item);
-                    fallback.environment.extend_from_slice(b"\0\0");
-                }
-                crate::kernel::mount_config::apply(&fallback, bundle, home, &[], true, modules.extra)
-                    .unwrap_or_else(|e| lib::compact_panic!("RAM session: {}", e));
-                config.environment = fallback.environment;
-
-            }
-            *BOOT_ENV.lock() = Some(config.environment);
-            if hostfs { vfs::mount(b"host/", host_fs()); }
-            mount_kernel_log_fs();
-            return false;
+    // GRUB supplies explicit storage policy. The older native bootloader has
+    // no INI module transport; retain its directory-backed development images.
+    let selected = if let Some(config) = early_config {
+        let (bundle, home) = config.select_bundle(modules.root, &volumes)
+            .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI: {}", e));
+        Some((bundle, config, home))
+    } else {
+        let source = modules.root.or_else(|| volumes.iter().find(|v|
+            crate::kernel::mount_config::read_bundle(**v).ok().flatten().is_some()).copied());
+        source.and_then(|bundle| crate::kernel::mount_config::read_bundle(bundle)
+            .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI: {}", e))
+            .map(|(config, home)| (bundle, config, home)))
+    };
+    if let Some((bundle, config, home)) = selected {
+        crate::kernel::mount_editor::init_editor(&volumes, &config, boot);
+        crate::kernel::mount_config::apply(&config, bundle, home, &volumes, boot.ram_overlay, modules.extra)
+            .unwrap_or_else(|e| lib::compact_panic!("BOOT.INI mounts: {}", e));
+        if hostfs { vfs::mount(b"host/", host_fs()); }
+        mount_kernel_log_fs();
+        if let Some(bytes) = modules.config.as_ref() {
+            let user = crate::kernel::mount_config::Config::parse_user(bytes)
+                .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e));
+            let disk_settings = config.bundle.as_ref().is_some_and(|b| b.source != "module")
+                && config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
+            expose_user_config(bytes, disk_settings);
+            *BOOT_ENV.lock() = Some(user.environment);
         }
+        return false;
     }
-    if !hostfs { lib::compact_panic!("No boot bundle with RETROOS.INI available"); }
+    if !hostfs { lib::compact_panic!("No boot bundle with BOOT.INI available"); }
     // Hosted execution exposes the explicitly supplied host directory. It
     // still reads RETROOS/RETROOS.INI for startup and personality settings.
     vfs::mount(b"", host_fs());
@@ -641,6 +627,22 @@ fn mount_filesystems(
     mount_kernel_log_fs();
     crate::kernel::stacktrace::init_from_vfs();
     true
+}
+
+/// The supplied user INI is visible to COMMAND.COM and application launch policy.
+/// A persistent C: file keeps its original backing; USB uses an editable RAM copy.
+fn expose_user_config(bytes: &[u8], disk_settings: bool) {
+    let path = [crate::kernel::dos::c_root(), b"RETROOS/RETROOS.INI"].concat();
+    if disk_settings {
+        if let Some(file) = vfs::open_backing(&path) { file.close(); return; }
+    }
+    let fs = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+    let node = fs.create(b"RETROOS.INI").expect("user configuration file");
+    assert_eq!(fs.write(node.handle, 0, bytes), bytes.len() as i32);
+    fs.clunk(node.handle);
+    vfs::mount(b"userconfig/", fs);
+    vfs::hide_mount(b"userconfig/");
+    vfs::bind(alloc::boxed::Box::leak(path.into_boxed_slice()), b"userconfig/RETROOS.INI");
 }
 
 fn mount_kernel_log_fs() {
@@ -663,7 +665,7 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     let root = crate::kernel::dos::c_root();
     let path = [root, b"RETROOS/RETROOS.INI"].concat();
     match crate::kernel::exec::load_file_resolved(&path) {
-        Ok(bytes) => crate::kernel::mount_config::Config::parse(&bytes)
+        Ok(bytes) => crate::kernel::mount_config::Config::parse_user(&bytes)
             .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error)).environment,
         Err(_) => alloc::vec![0, 0],
     }

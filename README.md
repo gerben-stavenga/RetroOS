@@ -32,16 +32,23 @@ See [DESIGN.md](DESIGN.md) for the architecture and [OUTLOOK.md](OUTLOOK.md) for
 where it is heading — one safe-Rust core running code for any OS, any ISA, on
 any host (native on the diagonal, interpreted off it).
 
-For an existing Linux machine, see [BOOTING.md](BOOTING.md). Prepare with
-`tools/install_kernel.sh --module --prepare`, then install with
-`sudo tools/install_kernel.sh --module`.
-New boot bundles read `RETROOS/RETROOS.INI` before mounting physical volumes.
-The bundle supplies writable RAM views of `C:\RETROOS`, apps at `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and BusyBox
-at `/bin`; `C:\TEMP` is RAM. When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
-Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
+For an existing ext4 Linux machine, see [BOOTING.md](BOOTING.md). Prepare with
+`tools/install_kernel.sh --prepare`, then install with
+`sudo tools/install_kernel.sh`.
 
-Mounts explicitly select filesystem UUIDs or
-existing disk-image files. Disk boots require RETROOS.INI.
+GRUB supplies two ordinary INI files. `BOOT.INI` selects the boot bundle and
+filesystem mounts; `RETROOS.INI` holds user settings. Disk installations open
+bundle files directly from the configured filesystem, without a RAM bundle
+module. USB boots use a small GRUB bundle module because kernel USB storage
+is not supported yet. The core contains DN, BusyBox and runtime libraries;
+VC, MC, RC, NDN (DOS/Windows/OS/2), DN/2 (DOS/Windows/OS/2), and games
+live directly under `showcase-bundle/`, which mirrors their `C:` paths and is
+packaged with one recursive glob into a single showcase image. USB loads it by default; the GRUB “Core only
+(less RAM)” choice omits it. Disk installations read showcase files on demand.
+
+Runtime files and DN have writable session views; `C:\TEMP` is RAM. A mounted
+Linux root keeps its own `/bin` and `/usr/bin`. Bundled BusyBox serves the RAM
+root or an explicit bundle mount at `/bin`. Unlisted partitions remain unmounted.
 
 ## Releases
 
@@ -90,7 +97,7 @@ firmware, sound card, and image:
 ./run.sh qemu --kvm                   # run on the host CPU (near-metal semantics)
 ./run.sh hosted --cmd GAMES/SKYROADS  # interp backend: DOSBox-style hosted run
 ./run.sh bochs | ./run.sh 86box       # other emulators, same flags
-UNIPCEMU_ROM_DIR=/path/to/ROM ./run.sh unipcemu # Pentium/i430fx; requires BIOS ROM
+./run.sh unipcemu                    # Pentium/i430fx; uses local UniPCemu build and ROM when present
 ./run.sh rust-dos                    # experimental: native BIOS loader; kernel currently halts
 ./run.sh rust-dos-games              # Rust-DOS shell with a disposable FAT16 C:
 ```
@@ -131,22 +138,28 @@ persistent disk. A launcher lock prevents simultaneous use of the same disk.
 
 Edit [filesystem_layout.bzl](filesystem_layout.bzl) for packaged file destinations
 and partition sizes. Size/seed changes apply to newly created data images;
-existing disks retain their contents and layout. `C:\RETROOS\LOADFIX.CFG`
-contains COMMAND.COM launch policy, including Aladdin's `xms32k` setting.
+existing disks retain their contents and layout. `C:\RETROOS\RETROOS.INI`
+contains COMMAND.COM launch policy in `[launch]`, including Aladdin's `xms32k` setting.
 The runtime bundle and DN have writable RAM views, including shipped files;
 changes disappear on reboot. Persistent settings can use explicit writable
 mounts at the appropriate application directory.
 
-The boot bundle's `RETROOS/RETROOS.INI` contains system, locale, sound,
-environment and mount sections. `[system] start=C:\DN\DN.COM` selects the
-startup program; `[locale] language=it-IT` selects shared regional settings.
-`keyboard=us` and `codepage=850` override the locale's defaults. Regional
-policy is shared by DOS, Windows, OS/2 and Linux, not a guest environment.
+`RETROOS.INI` contains system, locale, sound, environment and launch sections.
+`[system] start=C:\DN\DN.COM` selects the startup program; `[locale]
+language=it-IT` selects shared regional settings. `keyboard=us` and
+`codepage=850` override the locale defaults. Regional policy is shared by DOS,
+Windows, OS/2 and Linux.
 
-GRUB module boots also accept `/boot/RETROOS.INI` as an editable override.
-GRUB loads it with `module2 /boot/RETROOS.INI retroos.config=ini`; no compressed
-base-image rebuild is needed. The installer places this override alongside
-its kernel and base image.
+USB keeps editable `BOOT.INI` and `RETROOS.INI` under `/boot/retroos/`, outside
+`releases/<version>/`. GRUB loads them as `retroos.config=boot` and
+`retroos.config=ini` modules. RetroOS exposes the supplied user settings as an
+editable session copy at `C:\RETROOS\RETROOS.INI`; persistent USB edits require
+another OS until kernel USB storage works.
+
+Disk installation keeps `/boot/retroos/BOOT.INI` separate from versioned runtime
+files. User settings remain permanently at `/home/retroos/RETROOS/RETROOS.INI`
+(`C:\RETROOS\RETROOS.INI`). GRUB loads that file from its permanent location.
+The installer preserves it and existing mount choices across upgrades.
 
 | Locale | OEM code page | Windows ANSI | Keyboard |
 | --- | --- | --- | --- |
@@ -175,11 +188,15 @@ cannot encode the Unicode symbol (for example, `EUR` on page 850).
 Linux starts with the locale's UTF-8 `LANG`; userspace libraries remain
 responsible for their own locale data and formatting.
 
-Mounts are explicit in new bundles; unlisted physical partitions remain
+Mounts are explicit in `BOOT.INI`; unlisted physical partitions remain
 unmounted. The default is a self-contained RAM C:. For example, the existing
 workspace disk image can supply C: on bare metal without copying it:
 
 ```ini
+[bundle]
+source=UUID=<ext4-filesystem-UUID>
+subdir=/boot/retroos/releases/<version>
+
 [mount "linux"]
 source=UUID=<ext4-filesystem-UUID>
 path=/
@@ -204,16 +221,16 @@ The current file interface limits images to less than 4 GiB.
 Mount access modes are `ro` (reject writes), `rw` (persist writes), and `ram`
 (accept writes into a sector overlay). GRUB's **Protected Disk** boot forces
 physical `rw` mounts into RAM without editing the INI. Missing configured
-sources produce a diagnostic and fall back to the RAM session.
+sources stop boot with a diagnostic; another partition is never selected silently.
 
 ISO images use `source=file:/path/game.iso`, `format=iso9660`, `path=/cdrom`,
-`drive=D`, `access=ro`. Optional games modules mount separately at `/games`,
+`drive=D`, `access=ro`. The optional showcase module mounts separately at `/showcase`,
 normally G:, without merging physical game directories. Explicit mount paths
 and drive assignments win over the optional module defaults.
 
 F12 **Disk → Mnt** stages physical partition mappings. On a partition row,
 left/right changes its drive; on its access row it selects ro/rw/ram. Choose an
-export destination and **Export RETROOS.INI** to save the proposed configuration.
+export destination and **Export BOOT.INI** to save the proposed configuration.
 Changes take effect on the next boot after copying the export to the boot medium
 from another OS. Exporting in Protected Disk mode is RAM-only. RetroOS still
 cannot write USB storage. The full partition UUIDs are also printed in KLOG.
@@ -325,7 +342,7 @@ is independent of PIO/DMA transfers.
 For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOTING.md).
 
 New standalone bundles mount physical filesystems only when listed in
-RETROOS.INI. `access=rw` persists permitted writes; `access=ro` rejects them;
+BOOT.INI. `access=rw` persists permitted writes; `access=ro` rejects them;
 `access=ram` keeps changes in memory. The GRUB `ram-overlay` option protects
 all physical writes for that boot. Unlisted physical partitions stay unmounted. See
 [BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
@@ -386,8 +403,9 @@ RetroOS/
 ├── kernel/         # Ring-1 kernel: scheduler, syscalls, VFS, DOS/DPMI, VGA, sound
 ├── play/           # retroos-play windowed host emulator
 ├── lib/            # Shared freestanding library (VGA render, ELF, TAR, MD5)
-├── apps/           # Userspace ELF binaries and DOS programs
-├── apps-boot/      # Programs shipped in the boot filesystem (DN, RC, MC)
+├── boot-bundle/    # Core static files (DN and BusyBox)
+├── showcase-bundle/ # Optional programs and assets in their C: layout
+├── boot-bundle/    # Programs shipped in the boot filesystem (DN, VC, MC, RC, BusyBox)
 ├── stdlib/         # core + compiler_builtins from rust-src
 └── toolchain/      # Bazel toolchain definitions
 ```

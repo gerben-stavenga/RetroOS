@@ -71,6 +71,8 @@ class GrubModuleInstallTest(unittest.TestCase):
         self.assertIn("subdir=/DOS/RETROOS", installer.mount_configuration(plan))
         self.assertNotIn("retroos.c-root=", installer.grub_entries(plan))
         self.assertIn("RETROOS.INI retroos.config=ini", installer.grub_entries(plan))
+        self.assertIn("BOOT.INI retroos.config=boot", installer.grub_entries(plan))
+        self.assertNotIn("[environment]", installer.mount_configuration(plan))
 
     def test_separate_boot_grub_path_and_ram_entry(self):
         with tempfile.TemporaryDirectory() as directory:

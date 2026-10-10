@@ -71,7 +71,7 @@ static void trace(int on) {
     int86(0x31, &r, &r);
 }
 
-/* ----- per-program launch overrides (LOADFIX.CFG) -----
+/* ----- per-program launch overrides (RETROOS.INI [launch]) -----
  *
  * Launch overrides are wired through here:
  *
@@ -90,7 +90,7 @@ static void trace(int on) {
  *     command tail; DOS/32A is a near-drop-in DOS/4GW replacement that
  *     follows DPMI 0.9 more strictly.
  *
- * LOADFIX.CFG format: BASENAME [keyword [keyword...]]. Keywords:
+ * RETROOS.INI [launch] format: BASENAME=keyword [keyword...]. Keywords:
  *   loadfix (default if none), dos32a, iopl3, repair, xms32k. Combinable.
  *
  * COMMAND.COM reads the config; kernel policies travel in synth syscall CX.
@@ -131,12 +131,13 @@ static unsigned char parse_flag(const char *tok) {
     return 0;
 }
 
-static void load_loadfix_cfg(void) {
+static void load_launch_config(void) {
     FILE *f;
     char line[80];
+    int in_launch = 0;
     /* Embedded bootfs (always present, always mounted at C:\RETROOS) -- robust
      * vs the ext4 root mounting at C:\DISK1 instead of C:\ on real installs. */
-    f = fopen("C:\\RETROOS\\LOADFIX.CFG", "r");
+    f = fopen("C:\\RETROOS\\RETROOS.INI", "r");
     if (!f) return;
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");
@@ -152,16 +153,37 @@ static void load_loadfix_cfg(void) {
          * line's overflow become a record: drop the whole line. */
         if (overlong) {
             int c;
+            if (*p == '[') in_launch = 0;
             while ((c = fgetc(f)) != EOF && c != '\n') { }
             continue;
         }
         if (*p == 0 || *p == ';' || *p == '#' || *p == '\r' || *p == '\n') continue;
         /* Strip CR/LF terminator but leave inline whitespace for tokenising. */
         p[strcspn(p, "\r\n")] = 0;
+        if (*p == '[') {
+            char *end = strchr(p, ']');
+            in_launch = 0;
+            if (end) {
+                char *section = p + 1;
+                char *tail = end + 1;
+                *end = 0;
+                section += strspn(section, " \t");
+                while (end > section && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+                tail += strspn(tail, " \t");
+                in_launch = *tail == 0 && stricmp(section, "launch") == 0;
+            }
+            continue;
+        }
+        if (!in_launch) continue;
         name = p;
-        while (*p && *p != ' ' && *p != '\t') p++;
-        if (*p) { *p++ = 0; }
-        if (strlen(name) == 0 || strlen(name) >= LF_NAME_LEN) continue;
+        p = strchr(p, '=');
+        if (!p) continue;
+        *p++ = 0;
+        {
+            char *end = name + strlen(name);
+            while (end > name && (end[-1] == ' ' || end[-1] == '\t')) *--end = 0;
+        }
+        if (strlen(name) == 0 || strlen(name) >= LF_NAME_LEN || strpbrk(name, " \t\\/:") != 0) continue;
         for (;;) {
             p += strspn(p, " \t");
             if (*p == 0) break;
@@ -1310,7 +1332,7 @@ static int is_flag(const char *arg, char letter) {
 
 int main(int argc, char *argv[]) {
     init_command_path(argc > 0 ? argv[0] : 0);
-    load_loadfix_cfg();
+    load_launch_config();
 
     /* Invocation contract: COMMAND.COM is always called as
      *   COMMAND.COM /L prog [args]   (LOADFIX trampoline)
@@ -1352,7 +1374,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* /L progname [args] -- LOADFIX trampoline entry. The interactive
-     * COMMAND.COM forks us with this when it sees a name in loadfix.cfg;
+     * COMMAND.COM forks us with this when it sees a name in RETROOS.INI [launch];
      * we EXEC the program in-process so its PSP lands above segment
      * 0x1000 (dodging EXEPACK's load-low bug). */
     if (is_flag(argv[1], 'L')) {

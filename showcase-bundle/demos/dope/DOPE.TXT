@@ -1,0 +1,35 @@
+
+        DOPE by COMPLEX
+
+        requires:
+                550k of base memory
+                600k of extended memory
+                512k of gus memory (for music)
+
+        sorry... we ran out of time so this is "a bit" unfinished :)
+        demo was supposed to have end scroll but we didnt have time to
+        make graphics for it :-)  so here's the full credits:
+
+        code                    jmagic
+        graphics                jugi
+        music                   jugi
+        music replay routine    phantom/sonic pc (gus unit raped by jmagic)
+        routine boxes sketch    jugi
+        boxes pixelled by       reward
+        media labs logo         reward
+
+        3d objects:
+
+        credits part            jugi
+        7800 polys              m.hakulinen
+        environment map         jugi
+        shadow volume           cat figure found from some cdrom...
+        world domination        m.hakulinen
+
+        m. hakulinen is a friend of mine and can be reached by email
+        from mhakuli@cs.joensuu.fi
+
+
+
+        complex@hut.fi
+
