@@ -62,6 +62,15 @@ fn prepare_startup<A: crate::Arch>(
 
     crate::compact_println!("{}", crate::build_info::VersionBanner);
 
+    // GRUB config is available before physical storage discovery.
+    let modules = crate::multiboot::module_volumes(boot);
+    let early_config = if let Some(ref bytes) = modules.config {
+        Some((crate::kernel::mount_config::Config::parse(bytes)
+            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)), b"".as_slice()))
+    } else {
+        modules.root.and_then(|v| crate::kernel::mount_config::read_bundle(v)
+            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)))
+    };
     let disks = discover_disks(machine);
 
     // Probe the machine ONCE and freeze the result; all hardware policy
@@ -93,6 +102,7 @@ fn prepare_startup<A: crate::Arch>(
         machine,
         boot,
         disks,
+        BootMounts { modules, config: early_config },
         platform.hostfs,
         &mut screen,
         &mut bios_workspace,
@@ -137,7 +147,7 @@ fn prepare_audio<A: crate::Arch>(
     screen: &mut crate::kernel::console::Console,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
 ) -> PreparedAudio {
-    // CONFIG.SYS is readable now: apply its sound-mode policy before anything
+    // RETROOS.INI is readable now: apply its sound-mode policy before anything
     // consumes the verdict (IOPB grants, the bank burn, the first guest).
     // `SB_AUDIO=native|mixed`; QEMU's `-fw_cfg opt/audio=mixed` overrides it
     // for testing without editing the disk.
@@ -178,7 +188,7 @@ fn prepare_audio<A: crate::Arch>(
 
     // BLASTER describes THE CARD THE GUEST SEES.
     //
-    //   mixed  — that card is our emulated SB16, so CONFIG.SYS's BLASTER
+    //   mixed  — that card is our emulated SB16, so RETROOS.INI's BLASTER
     //            stands verbatim: the owner picks whatever settings their
     //            games are configured for. (The real card's own wiring is
     //            the sink driver's business, read from its mixer.)
@@ -201,7 +211,7 @@ fn prepare_audio<A: crate::Arch>(
     // are remapped onto the card's), so those stay free. We verify rather
     // than rewrite: a mismatch is the owner's to fix, and silently
     // "correcting" it would break the games whose own configs agree with
-    // CONFIG.SYS.
+    // RETROOS.INI.
     let mut sb_card = sb_card;
     if sb_card.is_some() {
         crate::compact_println!(
@@ -313,9 +323,9 @@ fn prepare_audio<A: crate::Arch>(
     }
 }
 
-/// Enable a late kernel serial mirror requested by CONFIG.SYS. Firmware-free
+/// Enable a late kernel serial mirror requested by RETROOS.INI. Firmware-free
 /// launchers such as 86Box cannot supply a Multiboot or fw_cfg command line,
-/// but CONFIG.SYS is available before the first DOS personality starts. Early
+/// but RETROOS.INI is available before the first DOS personality starts. Early
 /// boot messages remain in klog; all subsequent diagnostics are mirrored to
 /// the selected UART.
 fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
@@ -329,7 +339,7 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
         return;
     };
     let Some(port) = arch_abi::ComPort::parse_ascii(value) else {
-        crate::compact_println!("serial: invalid CONFIG.SYS SERIAL value");
+        crate::compact_println!("serial: invalid RETROOS.INI SERIAL value");
         return;
     };
     if boot.hostfs_port == Some(port) {
@@ -337,14 +347,14 @@ fn configure_config_serial(boot: &crate::BootConfig, master_env: &[u8]) {
         return;
     }
     if crate::kernel::serial_log::init(port) {
-        crate::compact_println!("serial: {:?} logging enabled from CONFIG.SYS", port);
+        crate::compact_println!("serial: {:?} logging enabled from RETROOS.INI", port);
     } else {
         crate::compact_println!("serial: {:?} unavailable", port);
     }
 }
 
 /// Enable the command/reply diagnostic UART. Firmware (`mcp=` on the command
-/// line, or fw_cfg `opt/mcp`) wins over CONFIG.SYS `MCP=`. The port must not
+/// line, or fw_cfg `opt/mcp`) wins over RETROOS.INI `MCP=`. The port must not
 /// share the ambient log or HostFS UART: either stream may contain arbitrary
 /// bytes.
 fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
@@ -359,7 +369,7 @@ fn configure_serial_control(boot: &crate::BootConfig, master_env: &[u8]) {
         return;
     };
     let Some(port) = arch_abi::ComPort::parse_ascii(value) else {
-        crate::compact_println!("serial-control: invalid CONFIG.SYS MCP value");
+        crate::compact_println!("serial-control: invalid RETROOS.INI MCP value");
         return;
     };
     start_serial_control(boot, master_env, port);
@@ -486,6 +496,11 @@ fn apply_disk_policy(
     disks
 }
 
+struct BootMounts {
+    modules: crate::multiboot::ModuleVolumes,
+    config: Option<(crate::kernel::mount_config::Config, &'static [u8])>,
+}
+
 /// Establish the complete mount namespace. Disk and partition discovery are
 /// boot temporaries and are dropped before audio and guest construction.
 #[inline(never)]
@@ -493,6 +508,7 @@ fn prepare_storage<A: crate::Arch>(
     machine: &mut A,
     boot: &crate::BootConfig,
     disks: alloc::vec::Vec<&'static dyn crate::kernel::block::Disk>,
+    bundle: BootMounts,
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     bios_workspace: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>,
@@ -518,8 +534,7 @@ fn prepare_storage<A: crate::Arch>(
     }
     crate::compact_screenln!(screen, "Filesystems: {} partition(s) found", parts.len());
 
-    let modules = crate::multiboot::module_volumes(boot);
-    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, modules, boot);
+    let hostfs_is_root = mount_filesystems(&parts, hostfs, screen, bundle.modules, bundle.config, boot);
     screen.present(machine, bios_workspace);
     if hostfs_is_root && !crate::kernel::fs::hostfs::is_ready() {
         lib::compact_panic!("hostfs: mounted as root but its server is unavailable");
@@ -545,153 +560,9 @@ fn host_fs() -> &'static dyn vfs::Filesystem {
     }
 }
 
-/// Keep the boot-time mount namespace in the single-digit `/diskN` range.
-const MAX_DISK_MOUNTS: usize = crate::kernel::dos::EXTRA_DRIVES.len() + 1;
-
-/// Which volume does which job.
-///
-/// A job may be unfilled, and one volume may hold several jobs: an installed
-/// machine has ONE ext4 that is both the Unix root and C:, while the dev loop
-/// has a boot disk, a FAT C: and an ext4 `/` on separate volumes. Both are
-/// this same plan with different slots filled — which is precisely what keeps
-/// the two arrangements from turning into two code paths.
-#[derive(Default)]
-struct MountPlan {
-    /// `/` — the Unix tree the Linux personality needs.
-    unix_root: usize,
-    /// The volume holding C:. Equal to `unix_root` on an installed machine.
-    dos_drive: Option<usize>,
-    /// C: backing directory, selected along with its volume.
-    dos_subdir: alloc::vec::Vec<u8>,
-    /// Optional runtime source; may also be a root or data volume.
-    boot_support: Option<usize>,
-    /// Everything else, read-only at /diskN.
-    spares: alloc::vec::Vec<usize>,
-}
-
-/// Decide the plan from what each volume actually contains.
-///
-/// Prefer physical data markers, then a plain data partition, then RAM.
-/// Equal candidates retain partition discovery order; an explicit UUID wins.
-fn plan_mounts(volumes: &[FilesystemVolume], boot: &crate::BootConfig, module_index: Option<usize>) -> MountPlan {
-    let selected_c = boot.c_uuid.map(|uuid| {
-        let mut matches = volumes.iter().enumerate()
-            .filter(|(i, volume)| Some(*i) != module_index && !volume.is_esp && volume.c_uuid() == Some(uuid));
-        let selected = matches.next().map(|(i, _)| i)
-            .unwrap_or_else(|| lib::compact_panic!("Configured C: UUID not found"));
-        if matches.next().is_some() {
-            lib::compact_panic!("Configured C: UUID is ambiguous");
-        }
-        selected
-    });
-    if let Some(uuid) = boot.root_uuid {
-        let mut matches = volumes.iter().enumerate().filter(|(_, v)| v.uuid() == Some(uuid));
-        let root = matches.next().map(|(i, _)| i)
-            .unwrap_or_else(|| lib::compact_panic!("Configured root UUID not found"));
-        if matches.next().is_some() {
-            lib::compact_panic!("Configured root UUID is ambiguous");
-        }
-        let dos = selected_c.unwrap_or(root);
-        return MountPlan {
-            unix_root: root, dos_drive: Some(dos), dos_subdir: volumes[dos].c_root(boot).to_vec(), boot_support: None,
-            spares: (0..volumes.len()).filter(|i| *i != root && *i != dos).collect(),
-        };
-    }
-    let evidence: alloc::vec::Vec<_> =
-        volumes.iter().map(|volume| volume.evidence(boot)).collect();
-    let find = |pick: fn(&crate::kernel::fs::disk::Evidence) -> bool| {
-        evidence.iter().position(pick)
-    };
-
-    let boot_support = find(|e| e.boot);
-    let unix = evidence.iter().enumerate()
-        .find(|(i, e)| Some(*i) != module_index && !volumes[*i].is_esp && e.unix)
-        .map(|(i, _)| i)
-        // A GRUB base module is a safer root than an unrelated ext4 /boot
-        // partition when Linux itself uses an unsupported filesystem.
-        .or(module_index)
-        .or_else(|| volumes.iter().enumerate().find(|(i, v)|
-            Some(*i) != module_index && !v.is_esp && v.format == crate::kernel::fs::disk::Format::Ext4)
-            .map(|(i, _)| i))
-        .or_else(|| find(|e| e.unix));
-    let automatic_dos = evidence.iter().enumerate()
-        .filter(|(i, e)| Some(*i) != module_index && e.dos > 0)
-        .max_by_key(|(i, e)| (e.dos,
-            volumes[*i].format == crate::kernel::fs::disk::Format::Fat,
-            Some(*i) == unix,
-            volumes[*i].volume.sectors,
-            core::cmp::Reverse(*i)))
-        .map(|(i, _)| i)
-        .or(module_index);
-    let dos = selected_c.or(automatic_dos);
-    let dos_subdir = dos.map(|i| if selected_c.is_some() { volumes[i].c_root(boot).to_vec() }
-        else { evidence[i].dos_home.clone() }).unwrap_or_default();
-
-    // A root is required. Preferring the Unix tree keeps `/` meaningful for
-    // the Linux personality; a DOS-only machine roots on C: instead. If
-    // nothing identified itself, fall back to the first readable volume
-    // rather than refusing to boot -- but say so, because a root chosen
-    // without evidence is a root that may be wrong.
-    let unix_root = match unix.or(dos) {
-        Some(index) => index,
-        None => {
-            crate::compact_println!(
-                "Filesystems: no volume carries Unix or DOS markers; \
-                 rooting on the first readable one"
-            );
-            0
-        }
-    };
-
-    let spares = (0..volumes.len())
-        .filter(|i| Some(*i) != Some(unix_root)
-            && Some(*i) != dos
-            && Some(*i) != boot_support)
-        .collect();
-
-    MountPlan { unix_root, dos_drive: dos, dos_subdir, boot_support, spares }
-}
-
 /// A leaked `&'static [u8]` for a mount prefix built at runtime.
 fn prefix(parts: &[&[u8]]) -> &'static [u8] {
     alloc::boxed::Box::leak(parts.concat().into_boxed_slice())
-}
-
-/// Compose the same C: layout for a RAM boot image, an EFI/FAT boot volume,
-/// and an installed runtime. Data CONFIG wins per file; boot defaults are
-/// copied into session RAM so editing a fallback never changes the boot media.
-fn mount_boot_directories(
-    c_root: &'static [u8],
-    data_home: Option<&'static [u8]>,
-    boot_source: Option<(&'static dyn vfs::Filesystem, &'static [u8], &'static [u8])>,
-    screen: &mut crate::kernel::console::Console,
-) {
-    let session: &'static dyn vfs::Filesystem =
-        alloc::boxed::Box::leak(crate::kernel::fs::session::new());
-    assert_eq!(session.mkdir(b"TEMP"), 0);
-    assert_eq!(session.mkdir(b"CONFIG"), 0);
-    if let Some((fs, runtime, config)) = boot_source {
-        vfs::mount_readonly(b"bootfs/", fs);
-        vfs::bind(prefix(&[c_root, b"RETROOS/"]), prefix(&[b"bootfs/", runtime]));
-        if !crate::kernel::fs::session::copy_defaults(
-            fs, config.strip_suffix(b"/").unwrap_or(config), session, b"CONFIG") {
-            crate::compact_screenln!(screen, "Boot CONFIG defaults could not be copied completely");
-        }
-        crate::compact_screenln!(screen, "boot runtime → C:\\RETROOS (read-only)");
-    }
-    vfs::mount(b"sessionfs/", session);
-    vfs::bind(prefix(&[c_root, b"TEMP/"]), b"sessionfs/TEMP/");
-    let config = prefix(&[c_root, b"CONFIG/"]);
-    vfs::bind(config, b"sessionfs/CONFIG/");
-    // The alias goes through the data mount's normal write grants and avoids
-    // recursively resolving back through C:\CONFIG itself.
-    if let Some(home) = data_home {
-        let source = prefix(&[home, b"CONFIG/"]);
-        if vfs::stat(source, true).is_some_and(|stat| stat.is_dir) {
-            vfs::bind_union(config, source);
-        }
-    }
-    crate::compact_screenln!(screen, "C:\\CONFIG: disk files before boot defaults; C:\\TEMP: RAM");
 }
 
 /// Build one namespace from physical volumes and optional RAM boot content.
@@ -701,13 +572,12 @@ fn mount_filesystems(
     hostfs: bool,
     screen: &mut crate::kernel::console::Console,
     modules: crate::multiboot::ModuleVolumes,
+    early_config: Option<(crate::kernel::mount_config::Config, &'static [u8])>,
     boot: &crate::BootConfig,
 ) -> bool {
     use crate::kernel::block::partition::PartKind;
-    use alloc::boxed::Box;
-
     crate::compact_screenln!(screen, "Filesystems: probing ext4/FAT volumes...");
-    let mut volumes: alloc::vec::Vec<_> = parts.iter()
+    let volumes: alloc::vec::Vec<_> = parts.iter()
         .filter(|p| p.kind != PartKind::BootBundle)
         .filter_map(|p| {
             let mut volume = FilesystemVolume::probe(crate::kernel::block::cache::volume(p.volume))?;
@@ -715,148 +585,62 @@ fn mount_filesystems(
             Some(volume)
         }).collect();
     crate::compact_screenln!(screen, "Filesystems: {} supported partition(s)", volumes.len());
-    // Physical data wins the same evidence-based selection used on disk boots.
-    // The module root remains available as a fallback and as the boot source.
-    let module_index = modules.root.map(|volume| {
-        let index = volumes.len();
-        volumes.push(volume);
-        index
-    });
-    if boot.root_uuid.is_some() && volumes.is_empty() {
-        lib::compact_panic!("Configured root UUID not found");
-    }
-    if boot.c_uuid.is_some() && volumes.is_empty() {
-        lib::compact_panic!("Configured C: UUID not found");
-    }
-    if boot.runtime().is_some() && boot.root_uuid.is_none() {
-        lib::compact_panic!("retroos.runtime requires retroos.root");
-    }
-    let mut hostfs_is_root = false;
-    if volumes.is_empty() {
-        if !hostfs { lib::compact_panic!("No root filesystem available"); }
-        vfs::mount(b"", host_fs());
-        vfs::mount(b"host/", host_fs());
-        vfs::mount(b"dosfs/", host_fs());
-        let c_root = prefix(&[boot.c_root()]);
-        mount_boot_directories(c_root, Some(prefix(&[b"dosfs/", c_root])), None, screen);
-        crate::compact_screenln!(screen, "hostfs: mounted as root");
-        hostfs_is_root = true;
-    } else {
-        let plan = plan_mounts(&volumes, boot, module_index);
-        let root = plan.unix_root;
-        let root_volume = volumes[root];
-        let fs: &'static dyn vfs::Filesystem = Box::leak(root_volume.open(!root_volume.is_esp)
-            .unwrap_or_else(|error| lib::compact_panic!("root mount failed: {}", error)));
-        if module_index == Some(root) {
-            crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /",
-                root_volume.name(), root_volume.volume.sectors / 2048);
-        } else {
-            crate::screenln!(screen, "Mounting {} root ({} MB)...",
-                root_volume.name(), root_volume.volume.sectors / 2048);
-        }
-        let dos = plan.dos_drive.unwrap_or(root);
-        let dos_volume = volumes[dos];
-        let dos_fs = if dos == root { fs } else {
-            Box::leak(dos_volume.open(true)
-                .unwrap_or_else(|error| lib::compact_panic!("C: mount failed: {}", error)))
-                as &'static dyn vfs::Filesystem
-        };
-        let data_subdir = if plan.dos_drive.is_some() { plan.dos_subdir.as_slice() }
-            else { dos_volume.c_root(boot) };
-        // C: has one canonical place in the Unix namespace, regardless of
-        // whether its data comes from a FAT root or an ext4 home directory.
-        let c_root = prefix(&[boot.c_root()]);
-        crate::kernel::dos::set_c_root(c_root);
-        if root_volume.is_esp {
-            vfs::mount_readonly(b"", fs);
-        } else {
-            root_volume.mount_writable(b"", fs, if dos == root { data_subdir } else { root_volume.c_root(boot) });
-        }
-        if dos_volume.is_esp {
-            vfs::mount_readonly(b"dosfs/", dos_fs);
-        } else {
-            dos_volume.mount_writable(b"dosfs/", dos_fs, data_subdir);
-        }
-        let data_home = prefix(&[b"dosfs/", data_subdir]);
-        if dos != root || c_root != data_subdir { vfs::bind(c_root, data_home); }
-        crate::screenln!(screen, "{} C: ({} MB) from {} → /{}",
-            dos_volume.name(), dos_volume.volume.sectors / 2048,
-            if module_index == Some(dos) { "RAM" } else { "disk" },
-            core::str::from_utf8(c_root).unwrap_or("?"));
-
-        crate::screenln!(screen, "C: backing volume {} ({}) directory /{}",
-            dos, dos_volume.volume.disk().name(), core::str::from_utf8(data_subdir).unwrap_or("?"));
-
-        // Explicit installed runtime wins; otherwise RAM and EFI boot sources
-        // provide identical RETROOS + CONFIG roles.
-        let boot_source = if let Some(runtime) = boot.runtime() {
-            let directory = &runtime[..runtime.len() - 1];
-            let data_directory = data_subdir.strip_suffix(b"/").unwrap_or(data_subdir);
-            if !fs.dir_exists(directory) || !dos_fs.dir_exists(data_directory) {
-                lib::compact_panic!("Configured runtime or C: directory is missing");
-            }
-            let parent = directory.iter().rposition(|b| *b == b'/').map_or(b"".as_slice(), |i| &directory[..i + 1]);
-            Some((fs, prefix(&[runtime]), prefix(&[parent, b"CONFIG/"])))
-        } else if let Some(index) = module_index.or(plan.boot_support) {
-            let volume = volumes[index];
-            let source = if index == root { fs } else if index == dos { dos_fs } else {
-                Box::leak(volume.open(false)
-                    .unwrap_or_else(|error| lib::compact_panic!("boot source mount failed: {}", error)))
-                    as &'static dyn vfs::Filesystem
-            };
-            let home = if Some(index) == module_index { volume.c_root(boot) } else { b"" };
-            Some((source, prefix(&[home, b"RETROOS/"]), prefix(&[home, b"CONFIG/"])))
+    let installed = boot.runtime().and_then(|_| volumes.iter().find(|v| v.uuid() == boot.root_uuid).copied());
+    let boot_source = installed.or(modules.root).or_else(|| volumes.iter().find(|v| crate::kernel::mount_config::read_bundle(**v)
+            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)).is_some()).copied());
+    if let Some(bundle) = boot_source {
+        let installed_config = if let Some(runtime) = boot.runtime().filter(|_| installed.is_some()) {
+            let fs = bundle.open(false).unwrap_or_else(|e| lib::compact_panic!("{}", e));
+            let path = [runtime, b"RETROOS.INI"].concat();
+            let directory = runtime.strip_suffix(b"/").unwrap_or(runtime);
+            let home = directory.iter().rposition(|b| *b == b'/').map_or(b"".as_slice(), |i| &directory[..i + 1]);
+            crate::kernel::mount_config::read(fs.as_ref(), &path)
+                .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e))
+                .map(|config| (config, prefix(&[home])))
         } else { None };
-
-        // Keep bundled RAM content visible when C: comes from a data disk.
-        // Put the disk subtree above it so installed games and save files win,
-        // while bundled games remain a fallback for names absent on disk.
-        for (module, volume) in modules.extra {
-            let mount = prefix(&[module.mount()]);
-            let extra = Box::leak(volume.open(true)
-                .unwrap_or_else(|error| lib::compact_panic!("module mount failed: {}", error)));
-            volume.mount_writable(mount, extra, b"");
-            if module_index != Some(dos)
-                && let Some(relative) = modules.root.as_ref()
-                    .and_then(|root| module.mount().strip_prefix(root.c_root(boot)))
-            {
-                vfs::bind_union(mount, prefix(&[data_home, relative]));
-            }
-            crate::screenln!(screen, "Multiboot {} ({} MB, volatile RAM) → /{}",
-                volume.name(), volume.volume.sectors / 2048,
-                core::str::from_utf8(&mount[..mount.len() - 1]).unwrap_or("?"));
-        }
-        mount_boot_directories(c_root, (!dos_volume.is_esp).then_some(data_home), boot_source, screen);
-
-        let mut disk_number = 0;
-        for (i, volume) in volumes.iter().enumerate() {
-            if !plan.spares.contains(&i) || Some(i) == module_index { continue; }
-            disk_number += 1;
-            if disk_number >= MAX_DISK_MOUNTS {
-                crate::compact_println!("Filesystems: further partitions not mounted (limit {})", MAX_DISK_MOUNTS);
-                break;
-            }
-            let mount = prefix(&[b"disk", &[b'0' + disk_number as u8], b"/"]);
-            match volume.open(false) {
-                Ok(fs) => {
-                    vfs::mount_readonly(mount, Box::leak(fs));
-                    crate::screenln!(screen, "DOS {}: → /disk{} ({} partition, {} MB, read-only)",
-                        crate::kernel::dos::EXTRA_DRIVES[disk_number - 1].0 as char,
-                        disk_number, volume.name(), volume.volume.sectors / 2048);
+        let configuration = early_config.or(installed_config).or_else(|| crate::kernel::mount_config::read_bundle(bundle)
+            .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e)));
+        if let Some((mut config, home)) = configuration {
+            crate::kernel::mount_editor::init_editor(&volumes, &config, boot);
+            if let Err(error) = crate::kernel::mount_config::apply(&config, bundle, home, &volumes, boot.ram_overlay, modules.extra.clone()) {
+                crate::compact_screenln!(screen, "RETROOS.INI mounts: {} — starting a RAM session", error);
+                vfs::reset_boot_mounts();
+                crate::kernel::mount_editor::clear_active_mounts();
+                crate::kernel::dos::reset_configured_drives();
+                let mut fallback = crate::kernel::mount_config::Config::parse(
+                    b"[system]\nstart=C:\\DN\\DN.COM\n[mount \"session\"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n")
+                    .expect("built-in RAM mount configuration");
+                for item in config.environment.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+                    if item.starts_with(b"START=") || item.starts_with(b"TEST=") { continue; }
+                    fallback.environment.pop();
+                    fallback.environment.extend_from_slice(item);
+                    fallback.environment.extend_from_slice(b"\0\0");
                 }
-                Err(error) => crate::compact_screenln!(screen, "{} partition skipped: {}", volume.name(), error),
+                crate::kernel::mount_config::apply(&fallback, bundle, home, &[], true, modules.extra)
+                    .unwrap_or_else(|e| lib::compact_panic!("RAM session: {}", e));
+                config.environment = fallback.environment;
+
             }
-        }
-        if hostfs {
-            vfs::mount(b"host/", host_fs());
-            crate::compact_screenln!(screen, "hostfs: mounted at /host");
+            *BOOT_ENV.lock() = Some(config.environment);
+            if hostfs { vfs::mount(b"host/", host_fs()); }
+            mount_kernel_log_fs();
+            return false;
         }
     }
-    crate::compact_screenln!(screen, "DOS C: maps to /{}",
-        core::str::from_utf8(crate::kernel::dos::c_root()).unwrap_or("?"));
+    if !hostfs { lib::compact_panic!("No boot bundle with RETROOS.INI available"); }
+    // Hosted execution exposes the explicitly supplied host directory. It
+    // still reads RETROOS/RETROOS.INI for startup and personality settings.
+    vfs::mount(b"", host_fs());
+    vfs::mount(b"host/", host_fs());
+    crate::compact_screenln!(screen, "hostfs: mounted as root");
+    let session = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
+    assert_eq!(session.mkdir(b"TEMP"), 0);
+    vfs::mount(b"sessionfs/", session);
+    vfs::hide_mount(b"sessionfs/");
+    vfs::bind(prefix(&[boot.c_root(), b"TEMP/"]), b"sessionfs/TEMP/");
     mount_kernel_log_fs();
     crate::kernel::stacktrace::init_from_vfs();
-    hostfs_is_root
+    true
 }
 
 fn mount_kernel_log_fs() {
@@ -870,23 +654,26 @@ fn mount_kernel_log_fs() {
     }
 }
 
-/// C:\CONFIG\CONFIG.SYS supplies startup policy and the master DOS environment.
-/// Read the old root location only when the new file is absent, so existing
-/// installations retain their settings until migrated.
+/// Startup policy is parsed once from RETROOS.INI before guest construction.
+static BOOT_ENV: spin::Mutex<Option<alloc::vec::Vec<u8>>> = spin::Mutex::new(None);
+
 fn load_master_env() -> alloc::vec::Vec<u8> {
+    if let Some(env) = BOOT_ENV.lock().as_ref() { return env.clone(); }
+    // Directory-backed and hosted boots use the same INI format.
     let root = crate::kernel::dos::c_root();
-    let user_cfg = [root, b"CONFIG/CONFIG.SYS"].concat();
-    let config = crate::kernel::exec::load_file_resolved(&user_cfg)
-        .or_else(|_| crate::kernel::exec::load_file_resolved(&[root, b"CONFIG.SYS"].concat()))
-        .unwrap_or_default();
-    crate::kernel::dos::parse_config_env(&config)
+    let path = [root, b"RETROOS/RETROOS.INI"].concat();
+    match crate::kernel::exec::load_file_resolved(&path) {
+        Ok(bytes) => crate::kernel::mount_config::Config::parse(&bytes)
+            .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error)).environment,
+        Err(_) => alloc::vec![0, 0],
+    }
 }
 
 /// Select shared regional policy and OEM encoding before building DOS fonts.
 fn configure_locale(env: &[u8]) {
     if let Some(raw) = crate::kernel::dos::config_var(env, b"LOCALE") {
         let valid = core::str::from_utf8(trim_ascii(raw)).ok().is_some_and(lib::locale::select);
-        if !valid { crate::compact_println!("Invalid CONFIG.SYS LOCALE (available: en-US, ru-RU, pl-PL, de-DE, it-IT, nl-NL)"); }
+        if !valid { crate::compact_println!("Invalid RETROOS.INI LOCALE (available: en-US, ru-RU, pl-PL, de-DE, it-IT, nl-NL)"); }
     }
     let profile = lib::locale::current();
     lib::locale::set_system_oem(profile.oem);
@@ -894,7 +681,7 @@ fn configure_locale(env: &[u8]) {
     lib::keyboard::select(profile.keyboard);
     if let Some(raw) = crate::kernel::dos::config_var(env, b"KEYBOARD") {
         let valid = core::str::from_utf8(trim_ascii(raw)).ok().is_some_and(lib::keyboard::select);
-        if !valid { crate::compact_println!("Invalid CONFIG.SYS KEYBOARD (available: us, de, it, ru, pl)"); }
+        if !valid { crate::compact_println!("Invalid RETROOS.INI KEYBOARD (available: us, de, it, ru, pl)"); }
     }
     crate::compact_println!("Keyboard: {}", lib::keyboard::current().name());
     let Some(raw) = crate::kernel::dos::config_var(env, b"CODEPAGE") else { return };
@@ -906,7 +693,7 @@ fn configure_locale(env: &[u8]) {
             crate::compact_println!("DOS code page: {}", page.id);
         }
         None => crate::compact_println!(
-            "Invalid CONFIG.SYS CODEPAGE (available: 437, 850, 852, 866)"),
+            "Invalid RETROOS.INI CODEPAGE (available: 437, 850, 852, 866)"),
     }
 }
 
@@ -915,7 +702,7 @@ fn configure_locale(env: &[u8]) {
 fn startup_command(env: &[u8], root: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
     let raw = crate::kernel::dos::config_var(env, b"START")
         .map(trim_ascii).filter(|v| !v.is_empty())
-        .unwrap_or(b"C:\\RETROOS\\DN\\DN.COM");
+        .unwrap_or(b"C:\\DN\\DN.COM");
     let end = raw.iter().position(u8::is_ascii_whitespace).unwrap_or(raw.len());
     let program = &raw[..end];
     let tail = trim_ascii(&raw[end..]).to_vec();
@@ -1054,7 +841,7 @@ mod launch_directive_tests {
     fn startup_command_defaults_to_dn_when_absent_or_empty() {
         for env in [b"".as_slice(), b"START=   \0".as_slice()] {
             assert_eq!(super::startup_command(env, b"/home/retroos/"),
-                (b"/home/retroos/RETROOS/DN/DN.COM".to_vec(), alloc::vec::Vec::new()));
+                (b"/home/retroos/DN/DN.COM".to_vec(), alloc::vec::Vec::new()));
         }
     }
 
@@ -1121,7 +908,7 @@ fn run<A: crate::Arch>(
     // the hosted interpreter pass a cmdline through `opt/cmdline`; 86Box and
     // Bochs have NO such channel — `--cmd` was silently ignored there, so every
     // "probe run" on the one backend that models a real SB16 faithfully booted
-    // the normal image and sat at DN. `TEST=` in CONFIG.SYS is the channel that
+    // the normal image and sat at DN. `TEST=` in RETROOS.INI is the channel that
     // needs no hypervisor cooperation: it travels in the image, so it works on
     // every backend and on real metal too. Same sequence, same shutdown after.
     let cmdline = boot

@@ -203,7 +203,7 @@ fn identify<A: crate::Arch>(machine: &mut A, base: u16, declared: Option<SbWirin
     let Some(w) = (if is_sb16 { Some(read_wiring(machine, base)) } else { declared }) else {
         let _ = compact_fmt::writeln!(&mut lib::log::DebugCon,
             "sb: DSP {}.x at {:#05x} — pre-SB16 straps are invisible to software; declare them as \
-             `SB_AUDIO=native <irq> <dma>` in CONFIG.SYS. Running without the card.",
+             `SB_AUDIO=native <irq> <dma>` in RETROOS.INI. Running without the card.",
             dsp_major, base
         );
         return None;

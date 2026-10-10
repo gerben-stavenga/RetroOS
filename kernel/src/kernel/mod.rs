@@ -63,3 +63,7 @@ pub mod dos;
 pub mod linux;
 pub mod os2;
 pub mod windows;
+
+pub mod mount_config;
+
+pub mod mount_editor;

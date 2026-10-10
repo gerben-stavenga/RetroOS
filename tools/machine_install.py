@@ -11,10 +11,22 @@ import subprocess
 import tarfile
 import tempfile
 
-from migrate_dn_state import migrate
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGE = ROOT / "build" / "machine-install"
+
+
+def runtime_filter(member, destination):
+    # This guest link is absolute in RetroOS, not in the installing host.
+    guest_links = {'bin/rc': '/RC/RC.EXE', 'bin/rcedit': 'rc'}
+    if member.issym() and guest_links.get(member.name.removeprefix('./')) == member.linkname:
+        return tarfile.tar_filter(member, destination)
+    return tarfile.data_filter(member, destination)
+
+
+def checksum(path):
+    data = os.readlink(path).encode() if path.is_symlink() else path.read_bytes()
+    return hashlib.sha256(data).hexdigest()
 
 
 def filesystem(path):
@@ -78,7 +90,14 @@ def prepare(c_root, destination, archive=None):
     stage = STAGE / digest[:12]
     stage.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive) as tar:
-        tar.extractall(stage / "runtime", filter="data")
+        tar.extractall(stage / "runtime", filter=runtime_filter)
+    # Freeze regional/startup settings with the matching release, and select
+    # the installed filesystem explicitly through the same INI mount policy.
+    template = (stage / "runtime" / "RETROOS" / "RETROOS.INI").read_text()
+    template = template.split('[mount "session"]', 1)[0]
+    template += (f'[mount "linux"]\nsource=UUID={uuid}\npath=/\naccess=rw\ngrant={c_root}\n'
+                 f'[mount "dos"]\nsource=UUID={uuid}\nsubdir={c_root}\npath={c_root}\ndrive=C\naccess=rw\ngrant={c_root}\n')
+    (stage / "runtime" / "RETROOS" / "RETROOS.INI").write_text(template)
     plan = dict(uuid=uuid, c_root=str(c_root), destination=str(destination),
                 release=str(release), archive_sha256=digest)
     # Retire only the two old RetroOS entries that load the obsolete location.
@@ -101,9 +120,9 @@ def prepare(c_root, destination, archive=None):
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     (stage / "41_retroos").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
     # Record the exact staged files; install checks them before changing anything.
-    files = [p for p in stage.rglob("*") if p.is_file() and p.name != "checksums.json"]
+    files = [p for p in stage.rglob("*") if (p.is_file() or p.is_symlink()) and p.name != "checksums.json"]
     (stage / "checksums.json").write_text(json.dumps({str(p.relative_to(stage)):
-        hashlib.sha256(p.read_bytes()).hexdigest() for p in files}, indent=2) + "\n")
+        checksum(p) for p in files}, indent=2) + "\n")
     (STAGE / "selected").write_text(str(stage) + "\n")
     print(f"Prepared {stage}\nRoot UUID: {uuid}\nC: {c_root}\nRuntime: {release}/RETROOS")
     print("Review grub.cfg, then run the installer as root without --prepare.")
@@ -115,7 +134,7 @@ def install():
     stage = Path((STAGE / "selected").read_text().strip())
     sums = json.loads((stage / "checksums.json").read_text())
     for name, expected in sums.items():
-        if hashlib.sha256((stage / name).read_bytes()).hexdigest() != expected:
+        if checksum(stage / name) != expected:
             raise ValueError(f"staged file changed: {name}; prepare again")
     plan = json.loads((stage / "plan.json").read_text())
     c_root = Path(plan["c_root"])
@@ -127,28 +146,26 @@ def install():
         release.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".install-", dir=release.parent) as temp:
             pending = Path(temp) / "runtime"
-            shutil.copytree(stage / "runtime", pending)
+            shutil.copytree(stage / "runtime", pending, symlinks=True)
             pending.rename(release)
     else:
         for source in (stage / "runtime").rglob("*"):
-            if source.is_file():
+            if source.is_symlink():
+                target = release / source.relative_to(stage / "runtime")
+                if not target.is_symlink() or os.readlink(target) != os.readlink(source):
+                    raise ValueError(f"existing release link changed: {target}")
+            elif source.is_file():
                 target = release / source.relative_to(stage / "runtime")
                 if not target.is_file() or target.read_bytes() != source.read_bytes():
                     raise ValueError(f"existing release is incomplete or changed: {target}")
     for path in [release, *release.rglob("*")]:
-        os.chown(path, 0, 0)
+        os.chown(path, 0, 0, follow_symlinks=False)
+        if path.is_symlink():
+            continue
         path.chmod(0o755 if path.is_dir() else 0o644)
     custom = Path("/etc/grub.d/40_custom")
     if "custom_sha256" in plan and hashlib.sha256(custom.read_bytes()).hexdigest() != plan["custom_sha256"]:
         raise ValueError("40_custom changed since preparation; prepare again")
-    # Back up the user's startup settings before the one-time path migration.
-    config = c_root / "CONFIG" / "CONFIG.SYS"
-    backup = c_root / "CONFIG" / "CONFIG.SYS.before-dn-state"
-    if config.exists() and not backup.exists():
-        shutil.copy2(config, backup)
-    old_config = config.read_bytes() if config.exists() else None
-    migrate(c_root)
-    (c_root / "RETROOS").mkdir(exist_ok=True)
     managed = Path("/etc/grub.d/41_retroos")
     old_managed = managed.read_bytes() if managed.exists() else None
     old_custom = custom.read_bytes() if "custom_sha256" in plan else None
@@ -164,10 +181,6 @@ def install():
             shutil.copyfile(stage / "40_custom", custom)
         subprocess.run(["update-grub"], check=True)
     except Exception:
-        if old_config is not None:
-            config.write_bytes(old_config)
-        else:
-            config.unlink(missing_ok=True)
         if old_custom is not None:
             custom.write_bytes(old_custom)
         if old_managed is None:

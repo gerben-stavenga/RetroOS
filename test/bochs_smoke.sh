@@ -41,10 +41,10 @@ run_probe() {
     # overflow detected ***", taking the probe with it. These probes are XMS,
     # DPMI and VBE — sound plays no part — so point every lowlevel driver at
     # 'dummy'. SDL_* keeps SDL itself off the host's devices as well.
-    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$work/$name/data.bin" --command "$command"
+    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$work/$name/data.bin"
     VM_DIR="$work/$name" BOCHS_DISPLAY=sdl2 SDL_VIDEODRIVER=dummy \
         SDL_AUDIODRIVER=dummy \
-        setsid ./run.sh bochs --data-image "$work/$name/data.bin" -- \
+        setsid ./run.sh bochs --data-image "$work/$name/data.bin" --cmd "$command" -- \
         'panic: action=fatal' 'speaker: enabled=0' \
         'sound: waveoutdrv=dummy, waveindrv=dummy, midioutdrv=dummy' >"$log" 2>&1 &
     pid=$!

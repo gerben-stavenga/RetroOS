@@ -27,7 +27,7 @@ improvements:
 
 - **HDA output and volume controls.**
   [PR #45](https://github.com/gerben-stavenga/RetroOS/pull/45) added codec-aware
-  speaker, jack, and headphone output selection, CONFIG.SYS
+  speaker, jack, and headphone output selection, RETROOS.INI
   defaults, live OSD controls, and logarithmic volume scaling. It also improved
   QEMU and 86Box test-launch determinism.
 

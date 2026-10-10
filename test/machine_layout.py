@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot an installed-machine layout: explicit UUID, read-only runtime, persistent C:."""
+"""Boot an installed-machine layout: explicit UUID, RAM runtime, persistent C:."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -10,7 +10,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
-from machine_install import grub_entries
+from machine_install import grub_entries, runtime_filter
 
 UUID = "ea8c19a0-a2e3-4d14-9fd2-6955c176122c"
 
@@ -97,12 +97,22 @@ def main():
         home = root / "home/retroos"
         for name in ("home/retroos/RETROOS", "boot/grub", "etc", "usr"):
             (root / name).mkdir(parents=True, exist_ok=True)
+        # Model a Linux root with merged /usr. Its commands must take
+        # precedence over the BusyBox provided by the RetroOS release.
+        (root / "usr/bin").mkdir(parents=True)
+        (root / "bin").symlink_to("usr/bin")
+        (root / "usr/bin/busybox").write_bytes(b"LNX!")
+        (root / "usr/bin/sh").symlink_to("busybox")
         with tarfile.open(ROOT / "bazel-bin/machine_boot_tar.tar") as archive:
-            archive.extractall(root / "boot/retroos", filter="data")
+            archive.extractall(root / "boot/retroos", filter=runtime_filter)
+        config = root / "boot/retroos/RETROOS/RETROOS.INI"
+        config.write_text(config.read_text().split('[mount "session"]', 1)[0] +
+                          f'[mount "linux"]\nsource=UUID={UUID}\npath=/\naccess=rw\ngrant=/home/retroos\n'
+                          f'[mount "dos"]\nsource=UUID={UUID}\nsubdir=/home/retroos\npath=/home/retroos\ndrive=C\naccess=rw\ngrant=/home/retroos\n')
         (home / "STATE.DAT").write_bytes(b"INIT")
         (home / "STATE.DAT").chmod(0o664)
         home.chmod(0o2775)
-        # Deliberately writable underneath: the runtime mount must deny writes.
+        # Runtime edits must stay in RAM, while C: data persists.
         runtime = root / "boot/retroos/RETROOS/TEST.DAT"
         runtime.write_bytes(b"BOOT")
         runtime.chmod(0o666)
@@ -113,11 +123,17 @@ static int call(int n,int a,int b,int c) { int r;
 static void say(char *s,int n) {call(4,1,(int)s,n);}
 void _start(void) {
  char b[4];
- int f=call(5,(int)"/home/retroos/RETROOS/TEST.DAT",0,0);
+ int f=call(5,(int)"/bin/busybox",0,0);
+ if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='L' || b[1]!='N') goto fail;
+ call(6,f,0,0);
+ f=call(5,(int)"/bin/sh",0,0);
+ if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='L' || b[1]!='N') goto fail;
+ call(6,f,0,0);
+ f=call(5,(int)"/home/retroos/RETROOS/TEST.DAT",0,0);
  if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='B') goto fail;
  call(6,f,0,0);
  f=call(5,(int)"/home/retroos/RETROOS/TEST.DAT",2,0);
- if(f>=0) { if(call(4,f,(int)"FAIL",4)>=0) goto fail; call(6,f,0,0); }
+ if(f<0 || call(4,f,(int)"RAM!",4)!=4) goto fail; call(6,f,0,0);
  f=call(5,(int)"/home/retroos/STATE.DAT",2,0);
  if(f<0 || call(3,f,(int)b,4)!=4) goto fail;
  call(19,f,0,0);
@@ -144,7 +160,7 @@ fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
         boot(work, "explicit-root", image, decoy, UUID, "LAYOUT-WROTE", ata_dma=True)
         boot(work, "reordered-disks", image, decoy, UUID, "LAYOUT-PERSISTED", reverse=True)
         boot(work, "missing-root", image, decoy, "00000000-0000-0000-0000-000000000001",
-             "Configured root UUID not found")
+             "No boot bundle with RETROOS.INI available")
         boot(work, "uefi-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED", uefi=True)
         boot(work, "ahci-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED",
              uefi=True, storage="ahci")

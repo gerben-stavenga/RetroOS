@@ -13,7 +13,8 @@ Layout:
                         /EFI/BOOT/BOOTX64.EFI                 UEFI GRUB
                         /kernel.elf                           Multiboot2 target
                         /RETROOS/...                          mounted at C:\\RETROOS
-                        /CONFIG/...                           fallback defaults
+                        /DN/...                               bundled shell
+                        /bin/...                              BusyBox userland
 
 One FAT partition does three jobs: it is GRUB's prefix volume on BIOS, the EFI
 System Partition on UEFI, and the source of C:\\RETROOS in the dev loop.  Type
@@ -55,6 +56,9 @@ insmod fat
 menuentry "RetroOS" {{
     search --no-floppy --file /kernel.elf --set=root
     multiboot2 /kernel.elf{cmdline}
+    if [ -f /RETROOS/RETROOS.INI ]; then
+        module2 /RETROOS/RETROOS.INI retroos.config=ini
+    fi
     # multiboot2 resets gfxpayload from the kernel header; override it here.
     if [ "$grub_platform" = "pc" ]; then
         set gfxpayload=text
@@ -200,6 +204,7 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
     # copied at the volume root and already carries its own RETROOS/ prefix, so
     # the layout on the partition mirrors the layout in the tar exactly.
     if boot_tree:
+        unix_links = []
         for root, dirs, files in os.walk(boot_tree):
             rel = os.path.relpath(root, boot_tree)
             prefix = "" if rel == "." else "/" + rel.replace(os.sep, "/")
@@ -207,9 +212,18 @@ def build_fat_partition(image, start, sectors, work, grub_lib, cfg,
                 mmd(prefix + "/" + d)
             for name in sorted(files):
                 src = os.path.join(root, name)
-                if os.path.islink(src) or not os.path.isfile(src):
+                if os.path.islink(src):
+                    if prefix == "/bin":
+                        unix_links.append(name + "\t" + os.readlink(src) + "\n")
+                    continue
+                if not os.path.isfile(src):
                     continue
                 mcopy(src, prefix + "/" + name)
+        if unix_links:
+            manifest = os.path.join(work, "UNIXLINK.LST")
+            with open(manifest, "w", encoding="utf-8") as stream:
+                stream.writelines(unix_links)
+            mcopy(manifest, "/RETROOS/UNIXLINK.LST")
 
 
 def build_efi_binary(work, cfg):

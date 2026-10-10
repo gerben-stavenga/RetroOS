@@ -17,11 +17,11 @@ def main():
                     '--platforms=@platforms//host'], check=True)
     with tempfile.TemporaryDirectory(prefix='retroos-xms-loadfix-') as tmp:
         root = Path(tmp) / 'home/retroos'
-        (root / 'CONFIG').mkdir(parents=True)
+        (root / 'RETROOS').mkdir(parents=True)
         shutil.copyfile('bazel-bin/tools/command/COMMAND.COM', root / 'COMMAND.COM')
         for name in ('LIMITED', 'NORMAL', 'WRAPPED'):
             shutil.copyfile('bazel-bin/test/dos/xmsprobe/XMSPROBE.COM', root / (name + '.COM'))
-        (root / 'CONFIG/LOADFIX.CFG').write_text(
+        (root / 'RETROOS/LOADFIX.CFG').write_text(
             'LIMITED.COM xms32k repair\nWRAPPED.COM loadfix xms32k\n')
         # The second program must not inherit the first one's report limit.
         (root / 'CHECK.BAT').write_bytes(b'LIMITED.COM L\r\nNORMAL.COM U\r\n')

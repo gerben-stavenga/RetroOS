@@ -16,6 +16,7 @@ pub mod hostfs;
 pub mod iso9660;
 pub mod portable_ext4;
 pub mod session;
+pub mod unix_links;
 
 use alloc::vec::Vec;
 

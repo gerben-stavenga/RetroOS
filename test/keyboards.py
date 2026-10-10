@@ -25,7 +25,7 @@ def main():
                                     "--platforms=@platforms//host", "--output=files"], cwd=ROOT, text=True).strip()
     with tempfile.TemporaryDirectory(prefix="retroos-keyboard-") as directory:
         root = Path(directory)
-        for folder in ["CONFIG", "RETROOS/WINDOWS/SYSTEM32", "RETROOS/OS2/DLL"]:
+        for folder in ["RETROOS/WINDOWS/SYSTEM32", "RETROOS/OS2/DLL"]:
             (root / folder).mkdir(parents=True)
         for source, destination in [
             ("test/dos/locale/KEYBOARD.COM", "DOS.COM"),
@@ -49,7 +49,7 @@ def main():
             ("LOCALE=it-IT\nKEYBOARD=unknown\n", "è@é\\", 850, "it"),
         ]
         for config, text, cp, layout in cases:
-            (root / "CONFIG/CONFIG.SYS").write_text(config)
+            (root / "RETROOS/RETROOS.INI").write_text("[locale]\n" + config.replace("LOCALE=", "language=").replace("KEYBOARD=", "keyboard=").replace("CODEPAGE=", "codepage="))
             encoded = text.encode(f"cp{cp}", errors="replace") + b"\r"
             markers = {
                 "/DOS.COM": "KEYBOARD DOS " + " ".join(f"{b:02X}" for b in encoded),

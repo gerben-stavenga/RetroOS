@@ -5,9 +5,9 @@ Upstream: https://github.com/dividebysandwich/rat-commander
 This is the unmodified upstream source at commit
 `90627f7cd70833cbcdaa883ca9506524d9986c24` (unreleased Cargo version 1.9.8), built as a
 static x86_64 Linux musl ELF. It ships on the boot disk as
-`C:\RETROOS\RC\RC.EXE` and can be started directly from DN. The `.EXE` suffix
+`C:\RC\RC.EXE` and can be started directly from DN. The `.EXE` suffix
 is DOS friendly; the loader recognizes its ELF contents and uses the Linux
-personality. New Linux data images provide `/bin/rc` and `/bin/rcedit` symlinks
+personality. The boot bundle provides `/bin/rc` and `/bin/rcedit` symlinks
 to this boot copy. `C:\RETROOS\SHELL.ELF` opens the Linux shell from DOS.
 
 The build uses `--no-default-features`: audio playback, RAR and SQLite support
@@ -26,6 +26,3 @@ The upstream Cargo.lock pins dependencies. Upstream source is GPL-2.0-only;
 see LICENSE and the pinned upstream repository for the corresponding source.
 
 Rebuilding the boot disk updates Rat Commander without rebuilding `data.bin`.
-An existing data disk may still contain the earlier `/bin/rc` binary: start
-`C:\RETROOS\RC\RC.EXE` to use the boot copy, or replace that old file with a
-symlink to `/home/retroos/RETROOS/RC/RC.EXE` from the Linux shell.

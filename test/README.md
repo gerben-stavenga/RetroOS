@@ -64,7 +64,8 @@ below 4 GiB, so the probe must use high physical RAM.
 `python3 test/shared_disks.py` checks that the shared data disk is seeded once,
 preserves guest changes across launches, rejects concurrent launchers, and checks
 backend disk attachments. `test/private_data_disk.py` prepares disposable copies
-for probes that need a `CONFIG/CONFIG.SYS` command; normal launches never inject it.
+for probes. Startup commands are set in the disposable boot INI with `--cmd`;
+the data disk is never edited to inject commands.
 
 `python3 test/machine_layout.py` boots an ext4 laptop-style layout containing
 `/boot/grub`, checks UUID selection with reordered disks, read-only runtime files,

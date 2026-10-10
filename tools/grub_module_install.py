@@ -107,14 +107,9 @@ def grub_path(destination, mount):
 def grub_entries(plan):
     uuid = plan["boot_uuid"]
     base = plan["grub_release"]
-    args = [f"retroos.c-uuid={plan['c_uuid']}"] if plan["c_uuid"] else []
-    if plan.get("c_dir"):
-        args.append(f"retroos.c-root={plan['c_dir']}")
-    if plan.get("root_uuid"):
-        args.append(f"retroos.root={plan['root_uuid']}")
     entries = []
     for label, overlay in (("protected disk", " ram-overlay"), ("persistent disk", "")):
-        kernel_args = " ".join(args + (["ram-overlay"] if overlay else []))
+        kernel_args = "ram-overlay" if overlay else ""
         kernel_line = f"    multiboot2 {base}/kernel.elf" + (f" {kernel_args}" if kernel_args else "")
         entries.append(f'''menuentry "RetroOS ({label})" {{
     insmod part_gpt
@@ -134,10 +129,34 @@ def grub_entries(plan):
         set gfxpayload=auto
     fi
     module2 {base}/retroos-base.img.gz retroos.mount=/
+    module2 {base}/RETROOS.INI retroos.config=ini
     boot
 }}
 ''')
     return "\n".join(entries)
+
+
+def mount_configuration(plan):
+    """Mount policy is a reviewable INI file, independent of GRUB write mode."""
+    template = ROOT / "etc" / "RETROOS.INI"
+    if not template.is_file():
+        template = ROOT / "RETROOS.INI"
+    text = template.read_text()
+    # Keep defaults and comments, replace only the default session mount.
+    begin = text.index('[mount "session"]')
+    end = text.index("\n# To use", begin)
+    mounts = []
+    if plan.get("root_uuid"):
+        home = plan.get("c_dir") or "/home/retroos"
+        mounts.append(f'[mount "linux"]\nsource=UUID={plan["root_uuid"]}\npath=/\naccess=rw\ngrant={home}\n')
+    if plan.get("c_uuid"):
+        home = plan.get("c_dir") or "/"
+        mounts.append(f'[mount "data"]\nsource=UUID={plan["c_uuid"]}\npath=/home/retroos\nsubdir={home}\ndrive=C\naccess=rw\ngrant={home}\n')
+    elif plan.get("root_uuid"):
+        mounts.append('[mount "session"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\n')
+    if not mounts:
+        mounts.append('[mount "session"]\nsource=bundle\npath=/\ndrive=C\naccess=ram\n')
+    return text[:begin] + "\n".join(mounts) + text[end:]
 
 
 def grub_config_path():
@@ -253,10 +272,11 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
         extract_boot_file(image, name, stage / name)
     entries = grub_entries(plan)
     (stage / "grub.cfg").write_text(entries)
+    (stage / "RETROOS.INI").write_text(mount_configuration(plan))
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     (stage / "42_retroos_module").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
     (stage / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-    names = ("kernel.elf", "retroos-base.img.gz", "grub.cfg", "42_retroos_module", "plan.json")
+    names = ("kernel.elf", "retroos-base.img.gz", "RETROOS.INI", "grub.cfg", "42_retroos_module", "plan.json")
     (stage / "checksums.json").write_text(json.dumps({name: sha256(stage / name) for name in names}, indent=2) + "\n")
     STAGE_ROOT.mkdir(parents=True, exist_ok=True)
     (STAGE_ROOT / "selected").write_text(str(stage) + "\n")
@@ -299,7 +319,7 @@ def install():
         ensure_c_home(c_volume, plan["c_dir"] or "/home/retroos")
     release = Path(plan["release"])
     release.parent.mkdir(parents=True, exist_ok=True)
-    files = ("kernel.elf", "retroos-base.img.gz")
+    files = ("kernel.elf", "retroos-base.img.gz", "RETROOS.INI")
     if release.exists():
         for name in files:
             if not (release / name).is_file() or sha256(release / name) != sums[name]:

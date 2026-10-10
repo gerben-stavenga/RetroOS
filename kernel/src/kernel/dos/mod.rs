@@ -57,14 +57,13 @@ pub use machine::vga::physical_vga_present;
 pub(crate) use machine::vga::release_fullscreen;
 pub(crate) use machine::vga::reserve_live_vram;
 use crate::kernel::bios_display::{DosVideo, EmulatedVga};
-pub use dos::parse_config_env;
 pub(crate) use dos::dos_to_unix_datetime;
 /// FS-layout policy: DOS C: → this VFS subtree. Set once at boot from
 /// BootConfig.c_root; read by the DN/CONFIG launch paths.
 pub use dfs::{c_root, set_c_root, set_hostfs_enabled};
-pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, EXTRA_DRIVES, extra_drive_prefix};
+pub(crate) use dfs::{DFS_PATH_MAX, vfs_to_dos, extra_drive_prefix};
 
-/// Look up `KEY` in a DOS environment block (the parsed CONFIG.SYS master
+/// Look up `KEY` in a DOS environment block (the RETROOS.INI master
 /// env). Startup reads boot policy out of it — `SB_AUDIO=` — before any
 /// guest exists.
 pub fn config_var<'a>(env: &'a [u8], key: &[u8]) -> Option<&'a [u8]> {
@@ -2209,3 +2208,5 @@ fn log_pm_ud<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &
         regs.mode() == crate::UserMode::VM86, selector, ip, linear, limit, &bytes[..], &preceding[..]
     );
 }
+
+pub use dfs::{configure_drive, reset_configured_drives};

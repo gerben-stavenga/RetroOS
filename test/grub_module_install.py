@@ -68,7 +68,9 @@ class GrubModuleInstallTest(unittest.TestCase):
         plan = {"boot_uuid": "AAAA-BBBB", "grub_release": "/retroos/releases/1234",
                 "c_uuid": "ea8c19a0-a2e3-4d14-9fd2-6955c176122c", "c_dir": "/DOS/RETROOS",
                 "root_uuid": None}
-        self.assertIn("retroos.c-root=/DOS/RETROOS", installer.grub_entries(plan))
+        self.assertIn("subdir=/DOS/RETROOS", installer.mount_configuration(plan))
+        self.assertNotIn("retroos.c-root=", installer.grub_entries(plan))
+        self.assertIn("RETROOS.INI retroos.config=ini", installer.grub_entries(plan))
 
     def test_separate_boot_grub_path_and_ram_entry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -84,6 +86,11 @@ class GrubModuleInstallTest(unittest.TestCase):
         self.assertIn("multiboot2 /retroos/releases/1234/kernel.elf ram-overlay", entries)
         self.assertIn("module2 /retroos/releases/1234/retroos-base.img.gz retroos.mount=/", entries)
         self.assertNotIn("retroos.c-uuid=", entries)
+
+    def test_ram_c_with_physical_linux_root_is_explicit(self):
+        text = installer.mount_configuration({"root_uuid": "12345678-1234-1234-1234-123456789abc", "c_uuid": None})
+        self.assertIn('source=UUID=12345678-1234-1234-1234-123456789abc\npath=/\naccess=rw', text)
+        self.assertIn('source=bundle\npath=/home/retroos\ndrive=C\naccess=ram', text)
 
 
 if __name__ == "__main__":

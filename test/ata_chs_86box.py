@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import time
 
+from boot_fixture import prepare_boot
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -58,12 +60,14 @@ def main():
             stream.truncate(10 * 1024 * 1024)
         payload = bytes((i * 37 + (i >> 9)) & 255 for i in range(256 * 1024))
         (work / "PROBE.DAT").write_bytes(payload)
-        (work / "CONFIG.SYS").write_text("TEST=PROBE.ELF\nSERIAL=COM1\n")
+        (work / "RETROOS.INI").write_text("[environment]\nTEST=PROBE.ELF\nSERIAL=COM1\n")
         for name in ("PADDING.BIN", "PROBE.DAT", "PROBE.ELF"):
             run("mcopy", "-i", data, work / name, "::/" + name)
-        run("mmd", "-i", data, "::/CONFIG")
-        run("mcopy", "-i", data, work / "CONFIG.SYS", "::/CONFIG/CONFIG.SYS")
-        # Early serial logs verify discovery/addressing, before CONFIG.SYS.
+        run("mcopy", "-i", data, work / "RETROOS.INI", "::/RETROOS/RETROOS.INI")
+        boot = prepare_boot(work, data)
+        with boot.open("r+b") as stream:
+            stream.truncate(1024 * 16 * 63 * 512)
+        # Early serial logs verify discovery/addressing, before RETROOS.INI.
         (work / "grub.cfg").write_text('set timeout=0\nmenuentry "CHS test" {\n'
                                       'multiboot /kernel.elf serial=com1\nboot\n}\n')
         run("mcopy", "-o", "-i", str(boot) + "@@1048576", work / "grub.cfg", "::/boot/grub/grub.cfg")

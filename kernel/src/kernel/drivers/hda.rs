@@ -211,7 +211,7 @@ impl OutputRoute {
 
 /// Route which is known to be programmed successfully and may be displayed.
 static OUTPUT_ROUTE: AtomicU8 = AtomicU8::new(DEFAULT_OUTPUT_ROUTE as u8);
-/// Route requested by CONFIG.SYS or the OSD, committed only after programming.
+/// Route requested by RETROOS.INI or the OSD, committed only after programming.
 static REQUESTED_OUTPUT_ROUTE: AtomicU8 = AtomicU8::new(DEFAULT_OUTPUT_ROUTE as u8);
 /// Routes backed by a usable pin-to-DAC path on the active codec.
 static AVAILABLE_OUTPUT_ROUTES: AtomicU8 = AtomicU8::new(0);
@@ -251,7 +251,7 @@ pub fn configure_output_route(raw: Option<&[u8]>) {
         },
     };
     REQUESTED_OUTPUT_ROUTE.store(route as u8, Ordering::Relaxed);
-    // Platform probing initializes HDA before CONFIG.SYS is mounted. A later
+    // Platform probing initializes HDA before RETROOS.INI is mounted. A later
     // CONFIG value must be applied by the live device on its first start (or
     // next cursor poll), rather than merely changing the requested atomic.
     OUTPUT_ROUTE_PENDING.store(

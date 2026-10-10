@@ -135,7 +135,7 @@ impl FilesystemVolume {
         let mut dos_home = preferred.to_vec();
         let dos = match self.format {
             Format::Fat => {
-                if [b"CONFIG".as_slice(), b"GAMES", b"ULTRAMID"]
+                if [b"DN".as_slice(), b"GAMES", b"ULTRAMID"]
                     .iter().any(|path| has_directory(fs, path)) {
                     3
                 } else { 1 }
@@ -227,7 +227,7 @@ mod tests {
     }
     #[test]
     fn fat_boot_directories_do_not_exclude_data_but_esp_type_does() {
-        for marker in [None, Some(b"CONFIG".as_slice()), Some(b"GAMES"), Some(b"ULTRAMID")] {
+        for marker in [None, Some(b"DN".as_slice()), Some(b"GAMES"), Some(b"ULTRAMID")] {
             let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
             let mut fat = FilesystemVolume { volume, format: Format::Fat, is_esp: false };
             if let Some(marker) = marker {

@@ -11,7 +11,7 @@ launch() {
     local binary="${RUST_DOS_BIN:-$SCRIPT_DIR/tmp/rust-dos/target/release/rust-dos}"
     [ -x "$binary" ] || fail "Rust-DOS binary missing: $binary (build it with cd tmp/rust-dos && cargo build --release)"
     binary=$(realpath "$binary")
-    local cpu=486 sbtype=sb16 startup='C:\RETROOS\DN\DN.COM'
+    local cpu=486 sbtype=sb16 startup='C:\DN\DN.COM'
     [ "$ARCH" != 686 ] || cpu=pentium
     [ "$SOUND" != none ] || sbtype=none
 
@@ -19,15 +19,14 @@ launch() {
         printf '[emulator]\nmemsize=64\ncpu=%s\nmachine=svga\n' "$cpu"
         printf '[sound]\nsbtype=%s\n' "$sbtype"
         printf '[autoexec]\nIMGMOUNT C "%s" -t hdd\nC:\n' "$GAMES_IMAGE"
-        # Use RetroOS's own DOS settings, keeping PATH and DN's writable
-        # directories in step with the packaged CONFIG.SYS.
+        # Consume the environment/startup settings from the bundled INI.
         while IFS= read -r setting; do
             case "$setting" in
                 PATH=*) printf 'PATH %s\n' "${setting#PATH=}" ;;
                 DN=*|DNSWP=*|TEMP=*) printf 'SET %s\n' "$setting" ;;
-                START=*) startup="${setting#START=}" ;;
+                start=*) startup="${setting#start=}" ;;
             esac
-        done < "$SCRIPT_DIR/etc/CONFIG.SYS"
+        done < "$SCRIPT_DIR/etc/RETROOS.INI"
         [ -z "$COMMAND" ] || printf '%s\n' "$COMMAND"
         printf '%s\n' "$startup"
     } > "$WORK/rust-dos.conf"

@@ -10,9 +10,10 @@ DOS_SIZE_MB = 3072
 LINUX_SIZE_MB = 512
 
 BOOT_FILES = {
+    "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
+    "//tools/command:LOADFIX.CFG": "RETROOS/LOADFIX.CFG",
     # apps-boot/** is not listed here. BUILD.bazel globs it onto the boot
-    # disk's RETROOS/. TC is not part of that tree or of the data disk.
-    # Writable DN templates stay in DATA_FILES under CONFIG/DN.
+    # disk: DN/ is the default shell; system files live under RETROOS/.
 
     "//tools/command:command_com": "RETROOS/COMMAND.COM",
     # Kernel symbols for the stack tracer. kernel.elf itself is stripped, so
@@ -23,7 +24,7 @@ BOOT_FILES = {
     # /bin/busybox as `sh`.
     "//shell:shell_elf": "RETROOS/SHELL.ELF",
     # Personality DLL facades travel with the matched kernel. All supported
-    # boot sources mount RETROOS/ read-only at the same C: path.
+    # boot sources expose RETROOS/ through a writable session overlay.
     "//lib/windows/kernel32:kernel32_dll": "RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL",
     "//lib/windows/user32:user32_dll":     "RETROOS/WINDOWS/SYSTEM32/USER32.DLL",
     "//lib/windows/compat:advapi32_dll":   "RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL",
@@ -61,32 +62,6 @@ BOOT_FILES = {
 }
 
 DATA_FILES = {
-    # DN= selects this writable directory; history/desktop are created at runtime.
-    "apps-boot/dn/DN.EDT": "CONFIG/DN/DN.EDT",
-    "apps-boot/dn/DN.EXT": "CONFIG/DN/DN.EXT",
-    "apps-boot/dn/DN.HGL": "CONFIG/DN/DN.HGL",
-    "apps-boot/dn/DN.MNU": "CONFIG/DN/DN.MNU",
-    "apps-boot/dn/DN.VWR": "CONFIG/DN/DN.VWR",
-    "apps-boot/dn/DN.XRN": "CONFIG/DN/DN.XRN",
-
-    # VC= selects one directory for its writable setup and companion files.
-    "apps-boot/vc/VC.INI": "CONFIG/VC/VC.INI",
-    "apps-boot/vc/VC.EXT": "CONFIG/VC/VC.EXT",
-    "apps-boot/vc/VCVIEW.EXT": "CONFIG/VC/VCVIEW.EXT",
-    "apps-boot/vc/VCEDIT.EXT": "CONFIG/VC/VCEDIT.EXT",
-    "apps-boot/vc/VC.MNU": "CONFIG/VC/VC.MNU",
-    "apps-boot/vc/ARCHIVES.MNU": "CONFIG/VC/ARCHIVES.MNU",
-    "apps-boot/vc/FORMAT.MNU": "CONFIG/VC/FORMAT.MNU",
-    "apps-boot/vc/VC.HLP": "CONFIG/VC/VC.HLP",
-
-    # MC's shared defaults stay with its runtime; HOME selects user copies.
-    "apps-boot/MC/MC.INI": "CONFIG/MC/.mc/ini",
-    "apps-boot/MC/MC.MNU": "CONFIG/MC/.mc/menu",
-    "apps-boot/MC/mc.hot": "CONFIG/MC/.mc/mc.hot",
-
-    # User-editable launch settings survive boot rebuilds.
-    "//tools/command:LOADFIX.CFG": "CONFIG/LOADFIX.CFG",
-    "etc/CONFIG.SYS": "CONFIG/CONFIG.SYS",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
     # COMMAND.COM is not here: it lives at C:\RETROOS\COMMAND.COM (see

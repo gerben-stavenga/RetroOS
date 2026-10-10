@@ -15,7 +15,10 @@ Use this image when you need to edit GRUB settings on a USB stick. It has a
 fixed MBR with one 128 MiB FAT32 partition (type `0x0C`, so Windows can assign
 it a drive letter). The menu is
 `/boot/grub/grub.cfg`; the matching kernel and RAM modules are under `/boot`
-on the same partition.
+on the same partition. `/boot/RETROOS.INI` is the editable mount, locale,
+keyboard, sound and startup configuration; GRUB loads it before RetroOS
+probes physical storage. Unlisted physical partitions remain unmounted.
+The bundled DN and system files have writable RAM views.
 Start with 256 MiB RAM; 512 MiB is recommended for the base-plus-games menu.
 
 Write the IMG to the whole USB device with a disk imaging tool. This replaces
@@ -93,26 +96,21 @@ The framebuffer console accepts 640×400 or larger RGB modes. Four short bars
 mean GRUB handed over a smaller mode. `videoinfo` lists the modes available
 to GRUB.
 
-## The same C: layout across boot sources
+## Filesystem layout
 
-A selected ext4 `/home/retroos` or FAT data volume supplies C:. With no data
-volume, the RAM image supplies C: instead. Booting from a USB RAM image no
-longer relegates the data disk to a read-only `/disk1` mount. Unselected extra
-disks still mount read-only there.
+`RETROOS/RETROOS.INI` selects mounts by UUID or image path. Unlisted disks stay
+unmounted. The VM launcher supplies a UUID profile for its attached data disk;
+a standalone bundle defaults to a RAM session.
 
-- `C:\RETROOS` comes from the matching RAM image, EFI/FAT boot volume, or installed
-  release, and is read-only.
-- `C:\CONFIG` prefers files on the data disk. Missing files fall back to editable
-  RAM copies of the boot source's CONFIG defaults. Edits to fallback files last
-  for the session; existing data-disk files follow the chosen disk-write policy.
-- `C:\TEMP` is always in RAM and starts empty. TEMP and fallback CONFIG share a
-  sparse 32 MiB filesystem; memory is allocated as written.
+The bundle supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` as writable RAM content.
+When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
+Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
 
-The boot source itself is not changed by config edits. Bundled games remain
-visible under `C:\GAMES` when C: comes from a data disk. Files already on the
-data disk take priority; missing games fall back to the RAM module. Changes to
-fallback game files are volatile, so install a game on the data disk to keep
-its saves and configuration.
+`C:\TEMP` is RAM-backed and starts empty. Mount an application directory with
+`access=rw` to persist its settings.
+
+Optional packaged games are a separate `/games` module, normally `G:`.
+They are not merged with games on physical disks.
 
 ## Virtual machine: retroos-vm.tar.gz
 
@@ -249,12 +247,12 @@ Choosing persistent versus protected inside GRUB only changes disk writes.
 After updating RetroOS's installer, rerun preparation and installation to apply
 the generated video policy to an existing machine's GRUB entries.
 
-C:\RETROOS is read-only runtime. DN, VC, and MC settings live under C:\CONFIG;
-temporary files live in RAM at C:\TEMP. Existing runtime settings are copied
-into the new locations without overwriting user files. C:\CONFIG\CONFIG.SYS
-selects the startup program with START=C:\RETROOS\DN\DN.COM and optional
-arguments. It sets DN and VC to C:\CONFIG, HOME to C:\CONFIG\MC, and MCHOME to
-the shared resources in C:\RETROOS\MC.
+`RETROOS/RETROOS.INI` controls startup, locale, sound and mounts. The bundle
+provides applications at `C:\DN`, `C:\VC`, `C:\MC`, and `C:\RC`,
+system libraries under `C:\RETROOS`, and BusyBox under
+`/bin`. Bundled files are writable RAM content; configure an explicit writable
+directory mount to persist application settings. Temporary files are in RAM
+at `C:\TEMP`.
 
 The kernel supports legacy IDE, AHCI/SATA, and NVMe storage; USB storage is not supported.
 Bootloader support for a disk does not imply the kernel can access that disk.

@@ -136,7 +136,7 @@ static void load_loadfix_cfg(void) {
     char line[80];
     /* Embedded bootfs (always present, always mounted at C:\RETROOS) -- robust
      * vs the ext4 root mounting at C:\DISK1 instead of C:\ on real installs. */
-    f = fopen("C:\\CONFIG\\LOADFIX.CFG", "r");
+    f = fopen("C:\\RETROOS\\LOADFIX.CFG", "r");
     if (!f) return;
     while (loadfix_count < LF_MAX_NAMES && fgets(line, sizeof(line), f) != 0) {
         char *p = line + strspn(line, " \t");

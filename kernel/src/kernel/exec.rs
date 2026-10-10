@@ -229,7 +229,7 @@ mod tests {
     #[test]
     fn inherited_dos_cwd_becomes_an_absolute_dos_path_before_vfs_translation() {
         assert_eq!(absolute_dos_cwd(b"C:"), b"C:\\");
-        assert_eq!(absolute_dos_cwd(b"C:/RETROOS/RC"), b"C:\\RETROOS\\RC");
+        assert_eq!(absolute_dos_cwd(b"C:/RC"), b"C:\\RC");
         assert_eq!(absolute_dos_cwd(b"D:\\GAMES"), b"D:\\GAMES");
     }
 

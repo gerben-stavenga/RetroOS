@@ -22,7 +22,7 @@
 //! The wiring comes from `ULTRASND` in the environment — base, play DMA and
 //! GF1 IRQ — the same string the kernel configures the emulated card from.
 //! Nothing here is hardcoded, so the probe follows whatever the image ships
-//! and cannot drift out of step with CONFIG.SYS. Both PIC halves are handled:
+//! and cannot drift out of step with RETROOS.INI. Both PIC halves are handled:
 //! an IRQ above 7 vectors through 0x70+, unmasks on the slave, needs master
 //! IR2 (the cascade) open, and EOIs both chips.
 //!

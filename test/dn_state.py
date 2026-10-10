@@ -7,6 +7,8 @@ import subprocess
 import tempfile
 import time
 
+from boot_fixture import prepare_boot
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -15,12 +17,19 @@ def run(*args):
 
 
 def session(work, disk, save_config):
+    ini = (ROOT / "etc/RETROOS.INI").read_text().split('[mount "session"]', 1)[0]
+    # A persistent DN directory is an explicit mount, including its runtime.
+    from vm_mount_config import volumes
+    ident = volumes(disk)[0][1]
+    ini += (f'[mount "data"]\nsource=UUID={ident}\npath=/home/retroos\ndrive=C\naccess=rw\n'
+            f'[mount "dn"]\nsource=UUID={ident}\nsubdir=/DN\npath=/home/retroos/DN\naccess=rw\n')
+    boot = prepare_boot(work, disk, ini)
     sock = work / "qmp"
     sock.unlink(missing_ok=True)
     log = work / "boot.log"
     process = subprocess.Popen([
         "qemu-system-i386", "-m", "128", "-display", "none", "-serial", "none",
-        "-drive", f"file={ROOT / 'bazel-bin/boot_disk.bin'},format=raw,snapshot=on",
+        "-drive", f"file={boot},format=raw,snapshot=on",
         "-drive", f"file={disk},format=raw", "-debugcon", f"file:{log}",
         "-qmp", f"unix:{sock},server=on,wait=off", "-no-reboot"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -86,11 +95,11 @@ def main():
         with disk.open("wb") as stream:
             stream.truncate(64 * 1024 * 1024)
         run("mkfs.fat", "-F", "32", disk)
-        for directory in ("RETROOS", "CONFIG", "CONFIG/DN", "TEMP"):
+        for directory in ("RETROOS", "DN", "TEMP"):
             run("mmd", "-i", disk, "::/" + directory)
-        run("mcopy", "-i", disk, ROOT / "etc/CONFIG.SYS", "::CONFIG/CONFIG.SYS")
-        for ext in ("EDT", "EXT", "HGL", "MNU", "VWR", "XRN"):
-            run("mcopy", "-i", disk, ROOT / f"apps-boot/dn/DN.{ext}", f"::CONFIG/DN/DN.{ext}")
+        run("mcopy", "-i", disk, ROOT / "etc/RETROOS.INI", "::RETROOS/RETROOS.INI")
+        for ext in ("COM", "PRG", "OVR", "DLG", "LNG", "HLP", "EDT", "EXT", "HGL", "MNU", "VWR", "XRN"):
+            run("mcopy", "-i", disk, ROOT / f"apps-boot/dn/DN.{ext}", f"::DN/DN.{ext}")
         for first in (True, False):
             session(work, disk, first)
             boot_log = subprocess.check_output(["mtype", "-i", str(disk), "::KLOG.TXT"])
@@ -99,8 +108,8 @@ def main():
             # KLOG is now synchronized while DN runs and survives its restart.
             assert b"Dos Navigator  Version" in boot_log, boot_log
             assert b"Startup program exited" in boot_log, boot_log
-            history = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.HIS"])
-            config = subprocess.check_output(["mtype", "-i", str(disk), "::CONFIG/DN/DN.CFG"])
+            history = subprocess.check_output(["mtype", "-i", str(disk), "::DN/DN.HIS"])
+            config = subprocess.check_output(["mtype", "-i", str(disk), "::DN/DN.CFG"])
             assert b"STATECHECK" in history, history
             assert len(config) > 1000
             temporary = subprocess.check_output(["mdir", "-i", str(disk), "::TEMP/"])

@@ -83,14 +83,12 @@ _BUSYBOX_APPLETS = [
     target = "busybox",
 ) for a in _BUSYBOX_APPLETS]
 
-# Everything under apps-boot/ except the TC toolchain is C:\RETROOS\<PATH>
-# on the boot disk. TC is not shipped: :tc_tar exists only for //:image_min,
+# Bundled applications live at C:\<APP>, alongside the RETROOS system directory.
+# TC is not shipped: :tc_tar exists only for //:image_min,
 # the image that runs in-OS TCC while building COMMAND.COM and the DOS stub.
 _APPS_BOOT_SRCS = glob(
     ["apps-boot/**/*"],
-    exclude = ["apps-boot/tc/**"] + [
-        src for src, dest in DATA_FILES.items() if dest.startswith("CONFIG/VC/")
-    ],
+    exclude = ["apps-boot/tc/**"],
     allow_empty = True,
 )
 _TC_SRCS = glob(["apps-boot/tc/**/*"], allow_empty = True)
@@ -99,12 +97,12 @@ _TP70_SRCS = glob(["apps/TP70/**/*"], allow_empty = True)
 pkg_tar(
     name = "apps_boot_tar",
     modes = {
-        "RETROOS/RC/RC.EXE": "0755",
-        "RETROOS/RC/LICENSE": "0644",
-        "RETROOS/RC/README.MD": "0644",
+        "RC/RC.EXE": "0755",
+        "RC/LICENSE": "0644",
+        "RC/README.MD": "0644",
     },
     files = {
-        ":" + src: "RETROOS/" + src[len("apps-boot/"):].upper()
+        ":" + src: src[len("apps-boot/"):].upper()
         for src in _APPS_BOOT_SRCS
     },
 )
@@ -128,10 +126,8 @@ genrule(
 )
 
 # Built runtime (COMMAND.COM, symbols, shell). apps-boot/ is :apps_boot_tar,
-# not this map: those sources are also CONFIG seeds, and one files dict cannot
-# list the same label twice.
+# not this map: keep bundled applications separate from generated runtime files.
 _BOOT_DIR_FILES = dict(BOOT_FILES)
-_BOOT_CONFIG_FILES = {k: v for k, v in DATA_FILES.items() if v.startswith("CONFIG/")}
 
 # Boot bundle (small TAR, partition 1): the LEGACY BOOTLOADER's kernel
 # source only — the MBR stage reads kernel.elf (+ md5) from it. The kernel
@@ -158,12 +154,12 @@ _EXTRA_FILES.update(_BOOT_DIR_FILES)
 
 # Minimum extras needed for the stub-build image (//tools/dosrt:stub_exe
 # boots //:image_min and runs in-OS TCC from ext4 /TC;
-# CONFIG.SYS supplies the PATH
+# RETROOS.INI supplies the PATH
 # (= C:\;C:\RETROOS\TC;C:\BORLANDC\BIN) so TCC can find TLINK.EXE. Keeping
 # this tiny avoids the image→modplay→stub_exe→image cycle that would
 # otherwise force a separate `dosrt_tar` indirection.
 _MIN_EXTRA_FILES = {
-    "etc/CONFIG.SYS": "CONFIG/CONFIG.SYS",
+    "etc/RETROOS.INI": "RETROOS/RETROOS.INI",
     # In-OS tinkering source for COMMAND.COM (used to ride the boot TAR).
     "//tools/command:command.c": "SRC/COMMAND.C",
 }
@@ -187,7 +183,7 @@ pkg_tar(
     files = _BOOT_FILES_MIN,
 )
 
-# Just enough on ext4 for the stub-build image: CONFIG.SYS (for TCC's
+# Just enough on ext4 for the stub-build image: RETROOS.INI (for TCC's
 # PATH) and the TC toolchain itself (the boot TAR is bootloader-only now).
 # Used only by image_min; keeps the build acyclic.
 pkg_tar(
@@ -211,7 +207,7 @@ pkg_tar(
 pkg_mklink(
     name = "lnk_bin_rc",
     link_name = "bin/rc",
-    target = "/home/retroos/RETROOS/RC/RC.EXE",
+    target = "/RC/RC.EXE",
 )
 
 pkg_mklink(
@@ -242,9 +238,8 @@ pkg_tar(
 pkg_tar(
     name = "root_module_dos_tar",
     empty_dirs = ["TEMP"],
-    files = _DOS_EXTRA,
-    deps = [":apps_boot_tar", ":ultrasnd_tar", ":tp70_tar"],
-    package_dir = "home/retroos",
+    files = _BOOT_DIR_FILES,
+    deps = [":apps_boot_tar"],
 )
 
 pkg_tar(
@@ -264,9 +259,8 @@ pkg_tar(
     deps = [":bin_tar", ":dos_extras_tar"],
 )
 
-# Same, plus the proprietary game/tooling drop. CONFIG.SYS is dropped from the
-# DOS file map so apps-proprietary's CONFIG/CONFIG.SYS is the only one.
-_DOS_EXTRA_PROPRIETARY = {k: v for k, v in _DOS_EXTRA.items() if k != "etc/CONFIG.SYS"}
+# Same, plus the proprietary game/tooling drop.
+_DOS_EXTRA_PROPRIETARY = dict(_DOS_EXTRA)
 pkg_tar(
     name = "dos_extras_tar_proprietary",
     empty_dirs = ["TEMP"],
@@ -346,7 +340,7 @@ _DISK_CMD = """
     # read-only and every savegame would fail with "access denied". Extraction
     # as the build user already gives the whole tree one consistent gid, which
     # IS the retroos group by definition.
-    # (image_min carries no home/retroos -- only CONFIG.SYS -- so guard it.)
+    # (image_min carries no home/retroos -- only RETROOS.INI -- so guard it.)
     if [ -d "$$EXTRACT_DIR/home/retroos" ]; then
         chmod -R g+w "$$EXTRACT_DIR/home/retroos"
     fi
@@ -375,7 +369,7 @@ with open('$@', 'r+b') as f:
     "
 """
 
-# Stub-build image: the boot bundle + just CONFIG.SYS and TC. Pulls NO dosrt
+# Stub-build image: the boot bundle + just RETROOS.INI and TC. Pulls NO dosrt
 # artifacts, so image→modplay→stub_exe→image_min is not a cycle.
 genrule(
     name = "image_min",
@@ -524,13 +518,14 @@ genrule(
 # GRUB module release.
 genrule(
     name = "grub_module_usb",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "etc/RETROOS.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos_grub_module_usb.img"],
     cmd = "python3 $(location tools/build_grub_module_usb.py)" +
           " --kernel $(location //kernel:kernel_elf)" +
           " --base $(location :root_module_base_gzip)" +
           " --games $(location :root_module_games_gzip)" +
           " --grub-cfg $(location tools/grub-module.cfg)" +
+          " --ini $(location etc/RETROOS.INI)" +
           " --license $(location THIRD_PARTY_LICENSES.md)" +
           " --out $@",
     visibility = ["//visibility:public"],
@@ -541,7 +536,7 @@ genrule(
 # used so the runtime is identical regardless of boot medium.
 genrule(
     name = "grub_module_iso",
-    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":root_module_base_gzip", ":root_module_games_gzip", "etc/RETROOS.INI", "tools/grub-module.cfg", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos_grub_module.iso"],
     cmd = """
         DIR=$$(mktemp -d)
@@ -550,6 +545,7 @@ genrule(
         cp $(location :root_module_base_gzip) "$$DIR/boot/retroos-base.img.gz"
         cp $(location :root_module_games_gzip) "$$DIR/boot/retroos-games.img.gz"
         cp $(location tools/grub-module.cfg) "$$DIR/boot/grub/grub.cfg"
+        cp $(location etc/RETROOS.INI) "$$DIR/boot/RETROOS.INI"
         cp $(location THIRD_PARTY_LICENSES.md) "$$DIR/THIRD_PARTY_LICENSES.md"
         grub-mkrescue -o $@ "$$DIR"
         rm -rf "$$DIR"
@@ -562,7 +558,7 @@ genrule(
 pkg_tar(
     name = "diagnostic_apps_boot_tar",
     files = {
-        ":" + src: "RETROOS/" + src[len("apps-boot/"):].upper()
+        ":" + src: src[len("apps-boot/"):].upper()
         for src in _APPS_BOOT_SRCS
         if not src.startswith("apps-boot/rc/")
     },
@@ -570,10 +566,9 @@ pkg_tar(
 
 pkg_tar(
     name = "diagnostic_dos_tar",
-    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
+    files = _BOOT_DIR_FILES,
     empty_dirs = ["TEMP"],
     deps = [":diagnostic_apps_boot_tar"],
-    package_dir = "home/retroos",
 )
 
 pkg_tar(
@@ -596,7 +591,7 @@ genrule(
 
 genrule(
     name = "usb_diagnostic_image",
-    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
+    srcs = ["//kernel:kernel_elf", ":diagnostic_module", "etc/RETROOS.INI", "tools/grub-module.cfg", "tools/build_grub_module_usb.py", "tools/build_boot_disk.py", "THIRD_PARTY_LICENSES.md"],
     outs = ["retroos-usb-diagnostic.img"],
     cmd = """
         CFG=$$(mktemp)
@@ -606,6 +601,7 @@ genrule(
         python3 $(location tools/build_grub_module_usb.py) \\
             --kernel $(location //kernel:kernel_elf) \\
             --base $(location :diagnostic_module) \\
+            --ini $(location etc/RETROOS.INI) \\
             --grub-cfg "$$CFG" \\
             --license $(location THIRD_PARTY_LICENSES.md) \\
             --boot-mb 64 --minimal-grub-modules --out $@
@@ -698,19 +694,19 @@ sh_binary(
 # kernel, so it belongs with the kernel. Paths already carry the RETROOS/ prefix.
 pkg_tar(
     name = "boot_dir_tar",
-    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES,
-    deps = [":apps_boot_tar"],
+    files = _BOOT_DIR_FILES,
+    deps = [":apps_boot_tar", ":bin_tar"],
 )
 
 # One build target keeps the installed kernel and all runtime files matched.
 pkg_tar(
     name = "machine_boot_tar",
-    files = _BOOT_DIR_FILES | _BOOT_CONFIG_FILES | {"//kernel:kernel_elf": "kernel.elf"},
-    deps = [":apps_boot_tar"],
+    files = _BOOT_DIR_FILES | {"//kernel:kernel_elf": "kernel.elf"},
+    deps = [":apps_boot_tar", ":bin_tar"],
 )
 
 # The data manifest declares lifetime explicitly, including any writable
-# configuration under RETROOS/. Do not infer ownership from path prefixes.
+# configuration under RETROOS/.
 _C_DRIVE_FILES = dict(DATA_FILES)
 
 # Flat at the volume root -- a FAT volume IS C:, so there is no home/retroos
@@ -726,13 +722,9 @@ pkg_tar(
     ],
 )
 
-# Same, plus the proprietary drop. Its own CONFIG.SYS wins, so ours is dropped
+# Same, plus the proprietary drop. Its own RETROOS.INI wins, so ours is dropped
 # rather than shadowed (see dos_extras_tar_proprietary).
-_C_DRIVE_FILES_PROPRIETARY = {
-    k: v
-    for k, v in _C_DRIVE_FILES.items()
-    if k != "etc/CONFIG.SYS"
-}
+_C_DRIVE_FILES_PROPRIETARY = dict(_C_DRIVE_FILES)
 
 pkg_tar(
     name = "c_drive_tar_proprietary",
@@ -872,6 +864,7 @@ pkg_tar(
         ":data_disk": "data.img",
         "tools/release/run.sh": "run.sh",
         "tools/run/qemu.sh": "tools/run/qemu.sh",
+        "tools/vm_mount_config.py": "tools/vm_mount_config.py",
         "tools/run/unipcemu.sh": "tools/run/unipcemu.sh",
         "tools/release/README.md": "README.md",
         "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
@@ -889,14 +882,10 @@ pkg_tar(
         "tools/release/install.sh": "install.sh",
         "tools/machine_install.py": "tools/machine_install.py",
         "tools/grub_module_install.py": "tools/grub_module_install.py",
-        "tools/migrate_dn_state.py": "tools/migrate_dn_state.py",
         "//tools/command:LOADFIX.CFG": "tools/command/LOADFIX.CFG",
-        "etc/CONFIG.SYS": "etc/CONFIG.SYS",
+                "etc/RETROOS.INI": "etc/RETROOS.INI",
         "tools/release/README.md": "README.md",
         "THIRD_PARTY_LICENSES.md": "THIRD_PARTY_LICENSES.md",
-    } | {
-        src: src for src, dest in DATA_FILES.items()
-        if dest.startswith("CONFIG/DN/") or dest.startswith("CONFIG/VC/") or dest.startswith("CONFIG/MC/")
     },
     modes = {"install.sh": "0755"},
     extension = "tar.gz",

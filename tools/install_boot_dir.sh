@@ -6,6 +6,5 @@ cd "$(dirname "$0")/.."
 C_ROOT="${1:-/home/retroos}"
 [ -d "$C_ROOT" ] || { echo "C: root does not exist: $C_ROOT" >&2; exit 1; }
 bazelisk build //:boot_dir_tar
-python3 tools/migrate_dn_state.py "$C_ROOT"
 tar xf bazel-bin/boot_dir_tar.tar -C "$C_ROOT"
-echo "Runtime refreshed at $C_ROOT/RETROOS; state is in $C_ROOT/CONFIG/DN"
+echo "Runtime refreshed at $C_ROOT/RETROOS; shell is at $C_ROOT/DN"

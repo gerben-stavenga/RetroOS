@@ -462,7 +462,7 @@ fn debug_vif_base() -> usize {
 /// vanished). An empty device lists its catalogue (insert on Enter); a
 /// loaded device lists "Eject <name>" first, then the OTHER images as swap
 /// targets — the in-use image is not offered.
-const DISK_DEVICES: usize = 4;
+const DISK_DEVICES: usize = 5;
 /// Rows of the Disk scroller visible at once — derived from the panel's
 /// character budget (see `MAX_ROWS`): everything but title, tab bar,
 /// device sub-tabs, and footer.
@@ -477,7 +477,8 @@ fn disk_device_label(dev: usize) -> &'static [u8] {
         0 => b"A:",
         1 => b"B:",
         2 => b"CD",
-        _ => b"HD",
+        3 => b"HD",
+        _ => b"Mnt",
     }
 }
 
@@ -534,14 +535,16 @@ enum DiskRow {
     NoImages,
     Partition(u8, &'static [u8]),
     NoPartitions,
+    MountSetup(usize),
 }
 
 fn disk_row(item: usize) -> DiskRow {
     let dev = disk_device();
+    if dev == 4 { return DiskRow::MountSetup(item); }
     if dev == 3 {
-        return crate::kernel::dos::EXTRA_DRIVES.iter()
-            .filter(|&&(drive, _)| crate::kernel::dos::extra_drive_prefix(drive).is_some())
-            .nth(item).map_or(DiskRow::NoPartitions, |&(drive, prefix)| DiskRow::Partition(drive, prefix));
+        return (b'E'..=b'Z')
+            .filter_map(|drive| crate::kernel::dos::extra_drive_prefix(drive).map(|prefix| (drive, prefix)))
+            .nth(item).map_or(DiskRow::NoPartitions, |(drive, prefix)| DiskRow::Partition(drive, prefix));
     }
     if dev == 2 && item == 0 {
         return DiskRow::Speed;
@@ -567,9 +570,10 @@ fn disk_row(item: usize) -> DiskRow {
 
 fn disk_item_count() -> usize {
     let dev = disk_device();
+    if dev == 4 { return 4 + crate::kernel::mount_editor::editor_count() * 2; }
     if dev == 3 {
-        return crate::kernel::dos::EXTRA_DRIVES.iter()
-            .filter(|&&(drive, _)| crate::kernel::dos::extra_drive_prefix(drive).is_some()).count().max(1);
+        return (b'E'..=b'Z')
+            .filter(|&drive| crate::kernel::dos::extra_drive_prefix(drive).is_some()).count().max(1);
     }
     let catalog = disk_catalog_count(dev);
     let media_rows = if disk_inserted(dev) {
@@ -898,6 +902,10 @@ fn move_sel(up: bool, sound: SoundView) {
 /// cycle the device sub-tab (A: / B: / CD).
 fn adjust(up: bool, sound: SoundView) {
     if active_tab() == TAB_DISK {
+        if disk_device() == 4 && active_sel(TAB_DISK) != 0 {
+            crate::kernel::mount_editor::editor_adjust(active_sel(TAB_DISK), up);
+            return;
+        }
         if disk_device() == 2 && matches!(disk_row(active_sel(TAB_DISK)), DiskRow::Speed) {
             crate::kernel::fs::cdrom::cycle_speed(up);
             return;
@@ -1001,6 +1009,10 @@ fn activate<A: crate::Arch>(
                     } else if let Err(error) = crate::kernel::fs::floppy::insert(dev, index) {
                         crate::compact_println!("Floppy: insert failed: {:?}", error);
                     }
+                }
+                DiskRow::MountSetup(item) => {
+                    if item == 2 + crate::kernel::mount_editor::editor_count() * 2 { crate::kernel::mount_editor::editor_export(); }
+                    else { crate::kernel::mount_editor::editor_adjust(item, true); }
                 }
                 DiskRow::NoImages | DiskRow::Partition(..) | DiskRow::NoPartitions => {}
             }
@@ -1544,13 +1556,16 @@ fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
                 line.put(&name[..len]);
             }
             DiskRow::NoImages => line.put(b"(no images)"),
+            DiskRow::MountSetup(item) => line.put(crate::kernel::mount_editor::editor_line(item).as_bytes()),
             DiskRow::NoPartitions => line.put(b"(no additional partitions)"),
             DiskRow::Partition(drive, prefix) => {
                 line.put(&[drive, b':', b' ', b'/']);
                 line.put(&prefix[..prefix.len() - 1]);
                 line.put(b" ");
-                line.put(crate::kernel::vfs::mount_format_name(prefix).unwrap_or("unknown").as_bytes());
-                line.put(b" (read-only)");
+                let (format, access) = crate::kernel::vfs::mount_description(prefix).unwrap_or(("unknown", "unknown"));
+                line.put(format.as_bytes());
+                line.put(b" ");
+                line.put(access.as_bytes());
             }
         },
         TAB_DEBUG => match item {

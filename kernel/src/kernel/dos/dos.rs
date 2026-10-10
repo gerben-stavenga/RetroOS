@@ -4884,38 +4884,6 @@ pub(super) fn rm_stack_align_offset() -> u16 {
 /// time, not baked into a static struct.
 pub(super) const ENV_PARAS: u16 = 32;       // = 512 bytes (DOS5 typical /E:512)
 
-/// Bootstrap env defaults — copied into the freshly-allocated env block of
-/// the very first program loaded (boot path). For subsequent children,
-/// inheritance comes from the actual parent's env block, not from here.
-/// Parse a CONFIG.SYS-style KEY=VALUE config (with `#`/`;` comments) into
-/// a DOS env block (NUL-terminated entries, doubly-NUL-terminated). Used
-/// by startup to build the master env handed to the first DOS programs.
-pub fn parse_config_env(config: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut out = alloc::vec::Vec::with_capacity(256);
-    for line in config.split(|&b| b == b'\n') {
-        let line = trim_ws(line);
-        if line.is_empty() || line[0] == b'#' || line[0] == b';' { continue; }
-        let eq = match line.iter().position(|&b| b == b'=') { Some(i) => i, None => continue };
-        let key = trim_ws(&line[..eq]);
-        if key.is_empty() { continue; }
-        let val = trim_ws(&line[eq + 1..]);
-        out.extend_from_slice(key);
-        out.push(b'=');
-        out.extend_from_slice(val);
-        out.push(0);
-    }
-    out.push(0);
-    out
-}
-
-fn trim_ws(s: &[u8]) -> &[u8] {
-    let mut start = 0;
-    let mut end = s.len();
-    while start < end && matches!(s[start], b' ' | b'\t' | b'\r') { start += 1; }
-    while end > start && matches!(s[end-1], b' ' | b'\t' | b'\r') { end -= 1; }
-    &s[start..end]
-}
-
 /// What a child inherits from its parent: PSP segment (for child's PSP[0x16])
 /// and env block (copied into the child's fresh env arena, then the DOS 3+
 /// suffix appended). The env borrow can point at a live `Program::env`

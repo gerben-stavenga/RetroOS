@@ -98,22 +98,7 @@ ln -sfn "$REPO/apps/ultrasnd" "$C/ULTRASND"
 # A copy, not a symlink: these are build outputs under bazel-bin.
 "$REPO/tools/install_boot_dir.sh" "$C"
 
-# C:\CONFIG\CONFIG.SYS contains startup policy and the DOS environment. COMSPEC points at
-# C:\RETROOS\COMMAND.COM; PATH covers DN/COMMAND (C:\RETROOS), Turbo C, Borland C,
-# Borland Pascal.
-mkdir -p "$C/CONFIG"
-cat > "$C/CONFIG/CONFIG.SYS" <<'CFG'
-START=C:\RETROOS\DN\DN.COM
-DNSWP=C:\TEMP
-TEMP=C:\TEMP
-DN=C:\CONFIG\DN
-COMSPEC=C:\RETROOS\COMMAND.COM
-PATH=C:\;C:\RETROOS;C:\TC;C:\BORLANDC\BIN;C:\BP\BIN
-ADLIB=A388
-BLASTER=A220 I7 D1 H5 P330 T6
-ULTRASND=240,3,3,5,5
-ULTRADIR=C:\ULTRASND
-CFG
+# Startup, regional settings and mount policy are in RETROOS/RETROOS.INI.
 
 echo
 echo "Done. C: layout:"

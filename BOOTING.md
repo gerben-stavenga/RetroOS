@@ -3,7 +3,7 @@
 There are two boot arrangements on a physical machine: boot the standalone
 USB image, or add RetroOS to an existing GRUB installation. For existing
 GRUB, the installer below finds disks and UUIDs with Linux, stages the matching
-kernel and RAM base module, and generates the GRUB entries. Manual deployment
+kernel and RAM base module, generates `RETROOS.INI`, and creates the GRUB entries. Manual deployment
 uses the same boot path. The older ext4 installer later in this document
 remains available for machines that keep the runtime on their Linux root.
 
@@ -28,7 +28,7 @@ group when needed. With no supported
 data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly.
 For ext4, add `--c-dir=/path/on/volume` during preparation to use a different
 C: directory; the installer creates that directory and passes the same path
-to RetroOS. The default is `/home/retroos` on the selected ext4 volume.
+through the INI mount configuration. The default is `/home/retroos` on the selected ext4 volume.
 When Linux `/` is Btrfs, RAM C: is the default; use `--c-uuid` to select a
 separate supported data volume. The RAM module always supplies
 `C:\RETROOS`, even when C: data lives on a physical disk.
@@ -45,7 +45,7 @@ sudo tools/install_kernel.sh --module
 
 Replace `ABCD-1234` with the FAT32 data partition's UUID, not the EFI System
 Partition's UUID. The installer stores `kernel.elf` and
-`retroos-base.img.gz` under Linux `/boot/retroos/releases/...`; GRUB reads
+`retroos-base.img.gz` and `RETROOS.INI` under Linux `/boot/retroos/releases/...`; GRUB reads
 them from Btrfs before starting RetroOS. RetroOS then reads the selected
 FAT32 partition as C:. It cannot read Btrfs itself, so `C:\RETROOS` comes
 from the RAM base module and the Btrfs boot filesystem is not C:.
@@ -71,7 +71,8 @@ to a directory on a filesystem GRUB can read:
 ```text
 kernel.elf
 retroos-base.img.gz
-retroos-games.img.gz       # optional
+RETROOS.INI               # optional editable configuration override
+retroos-games.img.gz       # optional showcase content
 ```
 
 The image is also distributed as `retroos_grub_module_usb.img`. On Linux,
@@ -90,22 +91,18 @@ Keep the kernel and module images together when upgrading. If `/boot`
 is a separate filesystem, GRUB paths start at that filesystem's root; the
 example's `/boot/retroos/manual/` becomes `/retroos/manual/`.
 
-Choose the physical C: volume before editing GRUB. `lsblk -o NAME,FSTYPE,UUID,MOUNTPOINTS`
-shows its filesystem UUID. For FAT, C: is the volume root; existing games and
-other files stay there. For ext4, create `/home/retroos` on that volume and
-put data there. The base module supplies `C:\RETROOS` and default CONFIG files,
-so the data volume does not need a copy of the kernel or runtime. Use the
-chosen volume's UUID for `C_UUID` below. This selects C: even when it is on a
-second AHCI controller or several other disks have `CONFIG` or `GAMES`.
-To keep settings between boots, put `CONFIG/CONFIG.SYS` and the `CONFIG/DN`,
-`CONFIG/VC`, and `CONFIG/MC` templates on that volume (the machine release
-carries them). Missing CONFIG
-files use session copies of the base image's defaults, so edits to those
-copies disappear on reboot. Keep `TEMP` empty: RetroOS maps it to RAM.
+Choose physical filesystems with `lsblk -o NAME,FSTYPE,UUID,MOUNTPOINTS`.
+Copy [etc/RETROOS.INI](etc/RETROOS.INI) alongside the kernel, replace its
+session mount with your UUID mounts, and set their paths and access modes.
+A FAT C: normally uses `path=/home/retroos`, `drive=C`, and `subdir=/`.
+An ext4 C: can use `subdir=/home/retroos` with a matching `grant` directory.
+The base module supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` independently.
+For persistent DN settings, explicitly mount a writable directory at the
+C: namespace's `DN` path; the default bundled DN stores changes in RAM.
+`C:\TEMP` is always RAM-backed.
 
-`BOOT_FS_UUID`, `C_UUID`, and the optional `EXT4_UUID` below are placeholders,
-not shell or GRUB variables. Replace them with the UUID values printed by
-`findmnt` and `lsblk`; do not leave their names in the installed entry.
+`BOOT_FS_UUID` below is the UUID of the filesystem containing the kernel,
+base image and INI. Physical data UUIDs belong in the INI.
 Add this entry to GRUB's custom configuration, adjusting the paths if needed.
 On Debian or Ubuntu, use `/etc/grub.d/40_custom` and run
 `sudo update-grub`; on other distributions, regenerate `grub.cfg` with the
@@ -116,7 +113,7 @@ menuentry "RetroOS (manual, protected disk)" {
     insmod multiboot2
     insmod gzio
     search --no-floppy --fs-uuid --set=root BOOT_FS_UUID
-    multiboot2 /boot/retroos/manual/kernel.elf ram-overlay retroos.c-uuid=C_UUID
+    multiboot2 /boot/retroos/manual/kernel.elf ram-overlay
     if [ "$grub_platform" = "pc" ]; then
         set gfxpayload=text
     else
@@ -125,26 +122,62 @@ menuentry "RetroOS (manual, protected disk)" {
         set gfxpayload=auto
     fi
     module2 /boot/retroos/manual/retroos-base.img.gz retroos.mount=/
-    # Optional, for games when C: is backed by RAM:
-    # module2 /boot/retroos/manual/retroos-games.img.gz retroos.mount=/home/retroos/GAMES
+    module2 /boot/retroos/manual/RETROOS.INI retroos.config=ini
+    # Optional showcase content, separate from physical game directories:
+    # module2 /boot/retroos/manual/retroos-games.img.gz retroos.mount=/games
     boot
 }
 ```
 
-The example starts with physical writes protected. Once C: is confirmed in the
-boot log, remove `ram-overlay` to persist changes there. For a boot log that
-stays on screen, add `boot-log-only` to the `multiboot2` line. A missing or
-duplicate `C_UUID` stops boot rather than selecting another disk. Remove the
-`retroos.c-uuid` argument to use automatic selection; with no physical data
-volume, the base module supplies a RAM-backed C:. A separate GRUB boot
-filesystem does not select C:. The kernel currently recognizes IDE, AHCI and
-NVMe disks, including disks on multiple controllers, but does not read USB
+The example starts with physical writes protected. Remove `ram-overlay` to
+persist writes on mounts configured `access=rw`. For a boot log that stays
+on screen, add `boot-log-only`. Missing or ambiguous data UUIDs produce a
+mount diagnostic and a RAM recovery session; no other partition is selected.
+Unlisted physical filesystems remain unmounted. RetroOS does not read USB
 mass storage after GRUB hands off.
-If Linux `/` should come from a particular ext4 volume, add
-`retroos.root=EXT4_UUID` to the same `multiboot2` line; it selects `/`
-independently of `retroos.c-uuid`.
 
-## Installer for a Linux ext4 root
+## Mount setup and file images
+
+F12 → Disk → Mnt lists detected FAT/ext4 partitions and their UUIDs. Use
+Left/Right on the drive and access rows to stage choices. Select an export
+destination, then **Export RETROOS.INI**. The export follows the destination's
+active write permissions and the Protected Disk setting. Copy the exported
+file onto the GRUB boot medium from another OS, next to the base image, and
+load it with `retroos.config=ini`. Staging does not change active mounts.
+
+An image on a mounted filesystem can itself supply a drive without copying:
+
+```ini
+[mount "linux"]
+source=UUID=<ext4-filesystem-UUID>
+path=/
+access=rw
+grant=/home/priv-gerben
+
+[mount "data"]
+source=file:/home/priv-gerben/project/RetroOS/build/data.bin
+partition=1
+path=/home/retroos
+drive=C
+access=rw
+
+[mount "cd"]
+source=file:/home/priv-gerben/game.iso
+format=iso9660
+path=/cdrom
+drive=D
+access=ro
+```
+
+Image dependencies determine mount order. `partition` is numbered from 1;
+raw filesystem images need no partition selector. With multiple supported
+partitions, select one explicitly. File images currently must be smaller
+than 4 GiB, matching the VFS file-offset limit. ISO9660 is read-only.
+`access=ram` overlays a disk or image with session writes. `access=ro`
+rejects write opens and mutations. Bundle content always has a RAM overlay,
+so applications can open bundled DLLs or settings for writing safely.
+
+## Legacy installer for a Linux ext4 root
 
 The installer uses the existing GRUB and ext4 root. It does not repartition the
 machine or use emulator image files. `/home/retroos` is the persistent DOS C:.
@@ -190,84 +223,32 @@ Choosing persistent versus protected inside GRUB only changes disk writes.
 After updating RetroOS's installer, rerun preparation and installation to apply
 the generated video policy to an existing machine's GRUB entries.
 
-The generated Multiboot arguments explicitly specify:
+The directory installer locates its matched release using Multiboot arguments.
+The release's `RETROOS/RETROOS.INI` selects Linux `/` and DOS `C:` by UUID,
+with writes granted to the chosen C: directory. The module installer supplies
+that same policy as a GRUB configuration module.
 
-```text
-retroos.root=<ext4-filesystem-UUID>
-retroos.c-root=/home/retroos
-retroos.runtime=/boot/retroos/releases/<release>/RETROOS
-```
+There is one configuration format: `RETROOS.INI`. Startup arguments go in
+`[system] start=`, regional settings in `[locale]`, and guest environment
+variables in `[environment]`. `--cmd` and `[environment] TEST=` override
+normal startup for command execution and tests.
 
-The UUID selects the filesystem independently of device order or directory
-markers. Missing/duplicate UUIDs fail instead of choosing another writable disk.
-The runtime directory is exposed read-only at `C:\RETROOS`; this is a replacement
-binding, not a union. The current installer requires `/boot` and C: to reside
-on the same ext4 filesystem as Linux `/`, as they do on this laptop.
+The boot bundle supplies `C:\RETROOS`, `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and `/bin` as writable RAM
+content. When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
+Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
 
-| Guest path | Location/lifetime |
-| --- | --- |
-| `C:\RETROOS` | Matching boot runtime, read-only |
-| `C:\CONFIG\DN` | Persistent DN settings, history, desktop, menus |
-| `C:\CONFIG\VC` | VC settings, menus, extensions, and help selected by `VC=` |
-| `C:\CONFIG\MC\.mc` | MC user settings and editable menu selected by `HOME=` |
-| `C:\CONFIG\LOADFIX.CFG` | Persistent COMMAND.COM launch policy |
-| `C:\TEMP` | RAM-only DN swap/flag/temporary files |
-| `C:\CONFIG\CONFIG.SYS` | Persistent startup command and environment |
+Application settings stay with the application unless its own
+configuration selects another directory. To persist application settings,
+configure an explicit writable directory mount. `C:\TEMP` is RAM-backed.
 
-All boot sources use the same composition. The selected ext4 `/home/retroos`
-or FAT root supplies `C:`. A RAM boot image, EFI/FAT boot volume, or installed
-release supplies read-only `C:\RETROOS` and optional `CONFIG` defaults.
-Disk config files take precedence by filename; missing files come from a
-writable RAM copy of the boot defaults. Changes to those fallback files last
-for the session; files already on the data disk follow its persistent or
-`ram-overlay` policy. Boot defaults are never overwritten.
-`C:\TEMP` is always empty at boot and RAM-backed. TEMP and fallback CONFIG
-share a sparse 32 MiB session filesystem, allocating memory as written.
-
-`C:\CONFIG\CONFIG.SYS` selects the startup program with
-`START=C:\RETROOS\DN\DN.COM`. Set another executable and optional arguments
-(for example `START=C:\RETROOS\COMMAND.COM /P`) to choose a different shell.
-The startup program restarts when it exits; `--cmd` and `TEST=` take precedence
-and still shut down after completion. Relative startup paths are relative to C:.
-The old root `CONFIG.SYS` is read only when the new file is absent. Migration
-copies existing settings to the new location and preserves a custom `START=`.
-Set `CODEPAGE=437`, `850`, `852`, or `866` in the same file to select the DOS
-codepage before startup. If absent, the default is 437; `CHCP` can change it
-for the running session.
-
-DN already supports separate paths; no binary patch is needed. The config sets
-`DNSWP=C:\TEMP`, `TEMP=C:\TEMP`, then `DN=C:\CONFIG\DN`, in that order. DN.COM
-uses the first DNSWP/DN variable for its flag file. DN.PRG uses DN for settings
-and history, while overlays, language/dialog resources and help remain next to
-the executable. See [the DN 1.51 sources](https://github.com/maximmasiutin/Dos-Navigator)
-(`STARTUP.PAS`, `DN.ASM`, `DNUTIL.PAS`, `DNAPP.PAS`).
-
-`VC=C:\CONFIG\VC` moves Volkov Commander's setup, menus, extensions, and
-help into one writable directory; `VC.COM` remains under `C:\RETROOS\VC`.
-`MCHOME=C:\RETROOS\MC` selects Midnight Commander's shared resources, including
-its bundled menu and help. `HOME=C:\CONFIG\MC` gives it a writable home;
-`C:\CONFIG\MC\.mc\ini` and `C:\CONFIG\MC\.mc\menu` are user overrides that can
-be edited and saved. Its executables and DLL also remain under `C:\RETROOS\MC`.
-Both programs use
-`TEMP=C:\TEMP` for temporary files.
-
-Installation backs up CONFIG.SYS and copies old `RETROOS/DN` or `BOOT/DN` state
-without deleting it or replacing existing `CONFIG/DN` files. Defaults are seeded
-only when absent. To migrate an existing emulator disk, stop its emulator first:
-
-```sh
-python3 tools/migrate_dn_state.py --image build/data.bin
-```
-
-For a direct/hosted C: directory, `tools/install_boot_dir.sh /path/to/c-root`
-refreshes the runtime and migrates state. This is distinct from physical-machine
-installation, which keeps runtime files under `/boot/retroos`.
+For a direct hosted C: directory, `tools/install_boot_dir.sh /path/to/c-root`
+installs the same flat bundle layout and `RETROOS/RETROOS.INI`.
 
 ## Disk writes and `ram-overlay`
 
-**RetroOS writes to its disk.** That is the default, on every backend
-including real hardware: a DOS program saves its game, a test leaves its
-verdict behind, and the changes are still there next boot.
+Mounts configured `access=rw` persist writes. The VM launcher generates rw
+mounts for its explicitly attached data disk. The default standalone bundle
+uses RAM and leaves physical partitions unmounted.
 
 Add the Multiboot argument `ram-overlay` and every write to a physical disk
 goes into volatile RAM instead. Writes appear to work for the whole session
@@ -288,8 +269,7 @@ Disk writes: PERSISTENT — physical devices are writable        (in red)
 ### Which disk is at stake
 
 The installed-machine entries select the ext4 filesystem by UUID. `C:` is
-`/home/retroos` on that filesystem. Emulator/legacy entries without an explicit
-UUID still use directory evidence to select volumes. Without `ram-overlay`,
+`/home/retroos` on that filesystem. INI layouts mount only their listed sources. Without `ram-overlay`,
 permitted writes persist on the selected filesystem.
 
 What it can and cannot reach:
@@ -340,27 +320,25 @@ submenu with the same choices for framebuffer video (GOP on UEFI,
 VBE on BIOS). BIOS boots also offer native BIOS VGA entries, selected by
 default; the framebuffer entries explicitly select software VGA rendering.
 UEFI boots default to GOP. Disk protection (`ram-overlay`) is the default in
-both firmware modes; select persistent disk to keep changes on the data disk. The module artifacts are raw ext4
+both firmware modes. To persist changes, configure rw data mounts in the INI
+and select persistent disk. The module artifacts are raw ext4
 images, not partitioned disks; GRUB expands the reproducible gzip files before
 the Multiboot handoff:
 
 ```text
 multiboot /boot/kernel.elf
 module /boot/retroos-base.img.gz retroos.mount=/
-module /boot/retroos-games.img.gz retroos.mount=/home/retroos/GAMES
+module /boot/retroos-games.img.gz retroos.mount=/games
 boot
 ```
 
-The only module declaration is `retroos.mount=<absolute-vfs-path>`. Modules
-use replacement mounts, and the boot log derives the displayed volume identity
-from that path. Raw FAT12/16/32 images are accepted through exactly the same
-`retroos.mount=` declaration; there is no filesystem-type boot option.
-Each module is writable directly in its resident RAM. The base module supplies
-boot runtime and config defaults; physical ext4/FAT data volumes participate
-in the normal C: selection and follow the disk-write policy. Without a data
-disk, the base module supplies C: too. Extra modules such as GAMES mount only
-for this RAM-backed C:, so they cannot hide games on the selected data disk.
-Unselected physical filesystems remain read-only at `/disk1`, `/disk2`, and so on.
+Filesystem modules use `retroos.mount=<absolute-vfs-path>` and replacement
+mounts. Raw FAT12/16/32 images are also accepted. Plain-text configuration uses
+`retroos.config=ini`. The base module supplies system files, DN, BusyBox and the
+bundled RETROOS.INI. Module filesystems have writable RAM overlays; physical
+filesystems are selected explicitly by the INI and follow its access modes.
+Optional game modules remain separate even with a physical C:.
+Unlisted physical filesystems remain unmounted.
 
 Module images remain resident in the physical RAM where GRUB loaded them, but
 they are not permanently mapped into a size-matched kernel virtual window.
@@ -434,9 +412,9 @@ packaged. It needs `grub-mkimage` plus the i386-pc modules (`grub-pc-bin`).
 
 GOP text console (the kernel renders into the framebuffer GRUB hands over —
 `kernel/src/arch/fbcon.rs`), then storage discovery. RetroOS walks MBR or GPT
-partitions and mounts the selected ext4 or FAT root. DN and COMMAND.COM come from the read-only runtime binding at
-`C:\RETROOS`. Block writes reach the physical device
-unless `ram-overlay` was passed.
+partitions and applies RETROOS.INI to FAT/ext4 volumes and file images. The
+bundle supplies writable RAM views of `C:\DN`, `C:\RETROOS` and `/bin`. Writes
+on rw data mounts persist unless `ram-overlay` was passed. Disk boots require RETROOS.INI; unlisted physical partitions stay unmounted.
 
 Keyboard: the i8042 path (most laptops expose one via EC emulation) feeds
 the personality BIOS's INT 09. Machines with USB-only input are handled by the

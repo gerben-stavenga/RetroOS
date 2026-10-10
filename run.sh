@@ -14,7 +14,7 @@ Usage: ./run.sh [qemu|bochs|86box|unipcemu|rust-dos|rust-dos-games|hosted] [opti
   --hd ata|ahci|nvme       QEMU data controller; UniPCemu accepts ATA
   --sound sb|ac97|hda|none QEMU sound (default: hda; other emulators: sb)
   --sb-audio native|mixed QEMU guest audio policy
-  --cmd, -c, -r COMMAND   Run a command (QEMU, hosted or rust-dos-games)
+  --cmd, -c, -r COMMAND   Run a startup command
   --host, -H, -h DIR      Host directory (QEMU HostFS or hosted root)
   --headless, -T          No window (QEMU or hosted)
   --kvm                  Use KVM (QEMU or hosted)
@@ -80,7 +80,7 @@ if [ "$FREEDOS" = 1 ]; then
     [ -z "$COMMAND$HOST_DIR" ] || fail "--cmd/--host require RetroOS"
 fi
 if [ "$BACKEND" = bochs ] || [ "$BACKEND" = 86box ] || [ "$BACKEND" = unipcemu ]; then
-    [ "$KVM$HEADLESS" = 00 ] && [ -z "$COMMAND$HOST_DIR$SB_AUDIO" ] || fail "these options require QEMU or hosted"
+    [ "$KVM$HEADLESS" = 00 ] && [ -z "$HOST_DIR$SB_AUDIO" ] || fail "these options require QEMU or hosted"
     [ "${RETROOS_86BOX_KERNEL_LOG:-0}" = 0 ] || fail "serial injection into the persistent disk is not supported"
     case "$SOUND" in sb|none) ;; *) fail "this backend supports sb or none" ;; esac
 fi
@@ -145,6 +145,9 @@ elif [ "$BACKEND" != hosted ] || [ -z "$HOST_DIR" ]; then
     BOOT_IMAGE="$WORK/boot.img"
     cp --reflink=auto "bazel-bin/$BOOT_TARGET.bin" "$BOOT_IMAGE"
     chmod u+rw "$BOOT_IMAGE"
+    if [ "$FREEDOS" = 0 ] && [ "$BACKEND" != rust-dos ]; then
+        python3 "$SCRIPT_DIR/tools/vm_mount_config.py" --boot-image "$BOOT_IMAGE" --data-image "$DATA_IMAGE" --command "$COMMAND"
+    fi
     echo "Persistent data: $DATA_IMAGE"
 fi
 source "$SCRIPT_DIR/tools/run/$BACKEND.sh"

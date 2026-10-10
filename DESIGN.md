@@ -520,9 +520,8 @@ The kernel boots unchanged on a UEFI x86-64 laptop, with no RetroOS-specific
 firmware:
 
 - **Boot**: `kernel.elf` is multiboot-loadable by the machine's existing GRUB
-  (see [BOOTING.md](BOOTING.md)); it is self-contained — DN, COMMAND.COM and a
-  fallback CONFIG.SYS are embedded, so a diskless boot mounts `/boot` from the
-  embedded bootfs. RetroOS's own MBR bootloader remains the path on legacy/BIOS.
+  (see [BOOTING.md](BOOTING.md)); GRUB supplies the filesystem bundle containing DN,
+  COMMAND.COM, BusyBox and RETROOS.INI. The kernel embeds no filesystem.
 - **Console**: when GRUB hands over a GOP linear framebuffer, `arch/fbcon.rs`
   renders the emulated VGA into it.
 - **No-ROM firmware**: machines without a real BIOS get a personality Rust BIOS

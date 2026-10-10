@@ -460,6 +460,7 @@ impl Iso9660Fs {
 }
 
 impl Filesystem for Iso9660Fs {
+    fn format_name(&self) -> &'static str { "iso9660" }
     fn open(&self, path: &[u8]) -> Option<Vnode> {
         let entry = self.find(path)?;
         if !entry.is_file() || entry.total_size() > u32::MAX as u64 {

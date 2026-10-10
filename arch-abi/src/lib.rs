@@ -215,7 +215,7 @@ pub struct BootConfig {
     /// Optional kernel serial-console port. `None` leaves UART logging disabled.
     pub serial_console_port: Option<ComPort>,
     /// Optional diagnostic-control port (`mcp=` / fw_cfg `opt/mcp`). `None`
-    /// leaves it to CONFIG.SYS `MCP=`, or disabled when that is absent too.
+    /// leaves it to RETROOS.INI `MCP=`, or disabled when that is absent too.
     pub mcp_port: Option<ComPort>,
     /// Loader-supplied Multiboot module images. Hosted entries leave these empty.
     pub boot_modules: [Option<BootModule>; MAX_BOOT_MODULES],

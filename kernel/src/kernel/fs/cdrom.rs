@@ -180,7 +180,7 @@ static CATALOG: Mutex<Vec<CatalogEntry>> = Mutex::new(Vec::new());
 /// Install the permanent, initially empty slot. Called after the ordinary
 /// startup mount tree is complete.
 pub fn init() {
-    vfs::mount(SLOT_PREFIX, &CD_SLOT);
+    if !vfs::is_mounted(SLOT_PREFIX) { vfs::mount(SLOT_PREFIX, &CD_SLOT); }
 }
 
 fn catalog_dir() -> Vec<u8> {

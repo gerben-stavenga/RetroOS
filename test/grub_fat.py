@@ -20,7 +20,6 @@ def make_fat(work, name, bits, size, root):
         stream.truncate(size)
     run("mkfs.fat", "-F", bits, image)
     if root:
-        run("mmd", "-i", image, "::CONFIG")
         run("mmd", "-i", image, "::RETROOS")
         run("mcopy", "-i", image, work / "probe.elf", "::PROBE.ELF")
         run("mcopy", "-i", image, work / "payload", "::Mixed case filename.txt")
@@ -28,7 +27,7 @@ def make_fat(work, name, bits, size, root):
         run("mcopy", "-i", image, ROOT / "bazel-bin/test/dos/lfnprobe/LFNPROBE.COM", "::RETROOS/LFNPROBE.COM")
         run("mcopy", "-i", image, ROOT / "bazel-bin/tools/command/COMMAND.COM", "::RETROOS/COMMAND.COM")
         run("mcopy", "-i", image, work / "ROOTTEST.BAT", "::ROOTTEST.BAT")
-        run("mcopy", "-i", image, work / "CONFIG.SYS", "::CONFIG/CONFIG.SYS")
+        run("mcopy", "-i", image, work / "RETROOS.INI", "::RETROOS/RETROOS.INI")
     else:
         run("mmd", "-i", image, "::EFI")
     return image
@@ -44,6 +43,15 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
     if module:
         shutil.copyfile(image, tree / "boot/root.img")
         commands.append("module2 /boot/root.img retroos.mount=/")
+    import sys
+    sys.path.insert(0, str(ROOT / "tools"))
+    from vm_mount_config import volumes
+    ident = [value for kind, value in volumes(image) if kind == "fat"][-1]
+    base = (work / "RETROOS.INI").read_text()
+    source = "bundle" if module else "UUID=" + ident
+    base += f'[mount "root"]\nsource={source}\npath=/\ndrive=C\naccess={"ram" if module else "rw"}\n'
+    (tree / "boot/RETROOS.INI").write_text(base)
+    commands.append("module2 /boot/RETROOS.INI retroos.config=ini")
     commands.extend(["boot", "}"])
     (grub / "grub.cfg").write_text("\n".join(commands) + "\n")
     iso = work / (name + ".iso")
@@ -72,7 +80,7 @@ def boot(work, name, image, module, expected, command="PROBE.ELF", marker="FAT-R
             process.kill()
             process.wait()
     text = log.read_text(errors="replace")
-    if expected not in text or success not in text or "DOS C: maps to /home/retroos/\n" not in text or any(
+    if "Mount: root -> /" not in text or success not in text or any(
         error in text for error in ["FAT-PROBE-FAILED", "LFN-FAIL", "FATAL", "panicked"]
     ):
         raise AssertionError(f"{name} failed:\n{text}")
@@ -90,7 +98,7 @@ def main():
         # Top-level batch launch must find the real C:\RETROOS\COMMAND.COM,
         # which then opens the probe through its drive-qualified DOS path.
         (work / "ROOTTEST.BAT").write_bytes(b"@echo off\r\nC:\\RETROOS\\LFNPROBE.COM\r\n")
-        (work / "CONFIG.SYS").write_bytes(b"COMSPEC=C:\\RETROOS\\COMMAND.COM\r\nPATH=C:\\RETROOS\r\n")
+        (work / "RETROOS.INI").write_bytes(b"[environment]\nCOMSPEC=C:\\RETROOS\\COMMAND.COM\r\nPATH=C:\\RETROOS\r\n")
         fat12 = make_fat(work, "fat12.img", 12, 1440 * 1024, True)
         fat16 = make_fat(work, "fat16.img", 16, 16 * 1024 * 1024, True)
         fat32 = make_fat(work, "fat32.img", 32, 64 * 1024 * 1024, True)

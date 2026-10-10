@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check CONFIG.SYS locale policy through DOS, Win32, OS/2 and Linux guest APIs."""
+"""Check RETROOS.INI locale policy through DOS, Win32, OS/2 and Linux guest APIs."""
 from pathlib import Path
 import shutil
 import subprocess
@@ -22,7 +22,7 @@ def main():
     ], cwd=ROOT, text=True).strip()
     with tempfile.TemporaryDirectory(prefix="retroos-locale-") as directory:
         root = Path(directory)
-        for folder in ["CONFIG", "RETROOS/WINDOWS/SYSTEM32", "RETROOS/OS2/DLL"]:
+        for folder in ["RETROOS/WINDOWS/SYSTEM32", "RETROOS/OS2/DLL"]:
             (root / folder).mkdir(parents=True)
         for source, dest in [
             ("test/dos/locale/LOCALE.COM", "DOS.COM"),
@@ -50,7 +50,7 @@ def main():
             ("LOCALE=unknown\nCODEPAGE=9999\n", "en_US.UTF-8", 1, 437, 0, 0x2e, 0),
         ]
         for config, lang, country, page, order, decimal, currency in cases:
-            (root / "CONFIG/CONFIG.SYS").write_text(config)
+            (root / "RETROOS/RETROOS.INI").write_text("[locale]\n" + config.replace("LOCALE=", "language=").replace("KEYBOARD=", "keyboard=").replace("CODEPAGE=", "codepage="))
             profile = lang.split(".")[0].replace("_", "-")
             (root / "EXPECT.TXT").write_text(f"{profile} {page}\n")
             dos = (f"LOCALE DOS PASS country={country:04X} oem={page:04X} system={page:04X} "

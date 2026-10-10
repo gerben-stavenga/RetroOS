@@ -56,7 +56,7 @@ impl Mpu {
     }
 
     /// Apply the guest's environment: the MPU port comes from `BLASTER`'s
-    /// `P<port>` token (our CONFIG.SYS ships `P330`).
+    /// `P<port>` token (our RETROOS.INI ships `P330`).
     pub fn configure_from_env(&mut self, env: &[u8], bank: Option<&'static sound::midi::Bank>) {
         self.bank = bank;
         let Some(blaster) = env_var(env, b"BLASTER") else { return };

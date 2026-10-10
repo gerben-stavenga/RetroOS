@@ -5,6 +5,8 @@ import subprocess
 import tempfile
 import time
 
+from boot_fixture import prepare_boot
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -13,11 +15,12 @@ def run(*args):
 
 
 def session(work, disk, name, cpu, machine, accel):
+    boot = prepare_boot(work, disk)
     log = work / (name + '.log')
     process = subprocess.Popen([
         'qemu-system-x86_64', '-accel', accel, '-cpu', cpu, '-machine', machine,
         '-m', '512', '-display', 'none', '-serial', 'none', '-no-reboot',
-        '-drive', f'file={ROOT / "bazel-bin/boot_disk.bin"},format=raw,snapshot=on',
+        '-drive', f'file={boot},format=raw,snapshot=on',
         '-drive', f'file={disk},format=raw,snapshot=on',
         '-debugcon', f'file:{log}'],
         cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -51,9 +54,9 @@ def main():
     with disk.open('wb') as out:
         out.truncate(32 * 1024 * 1024)
     run('mkfs.fat', '-F', '16', disk)
-    run('mmd', '-i', disk, '::CONFIG')
-    (work / 'CONFIG.SYS').write_text('TEST=MEMORY.ELF\n')
-    run('mcopy', '-i', disk, work / 'CONFIG.SYS', '::CONFIG/CONFIG.SYS')
+    run('mmd', '-i', disk, '::RETROOS')
+    (work / 'RETROOS.INI').write_text('[environment]\nTEST=MEMORY.ELF\n')
+    run('mcopy', '-i', disk, work / 'RETROOS.INI', '::RETROOS/RETROOS.INI')
     run('mcopy', '-i', disk, work / 'MEMORY.ELF', '::MEMORY.ELF')
     session(work, disk, 'legacy-32', 'pentium', 'pc', 'tcg')
     session(work, disk, 'pae-high-ram', 'max', 'pc,max-ram-below-4g=128M', 'tcg')

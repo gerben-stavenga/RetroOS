@@ -12,6 +12,7 @@
 use alloc::{boxed::Box, vec::Vec};
 
 pub mod cache;
+pub mod file;
 pub mod overlay;
 pub mod partition;
 use crate::kernel::drivers::{hdd, nvme::NvmeDisk};

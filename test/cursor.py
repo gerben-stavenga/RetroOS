@@ -9,6 +9,8 @@ import tempfile
 import time
 from PIL import Image, ImageChops
 
+from boot_fixture import prepare_boot
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -21,7 +23,7 @@ def session(work, data, firmware):
     log = work / (firmware + '.log')
     args = ['qemu-system-x86_64', '-m', '256', '-display', 'none', '-serial', 'none',
             '-debugcon', 'file:' + str(log), '-qmp', f'unix:{sock},server=on,wait=off', '-no-reboot']
-    boot = ROOT / 'bazel-bin/boot_disk.bin'
+    boot = prepare_boot(work, data)
     if firmware == 'uefi':
         shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', work / 'vars.fd')
         args += ['-M', 'q35', '-nodefaults', '-device', 'bochs-display',
@@ -118,8 +120,8 @@ def main():
         run('mmd', '-i', data, '::' + name)
     run('nasm', '-f', 'bin', ROOT / 'test/cursor_probe.asm', '-o', work / 'CURSOR.COM')
     run('mcopy', '-i', data, work / 'CURSOR.COM', '::CURSOR.COM')
-    (work / 'CONFIG.SYS').write_text('TEST=CURSOR.COM\n')
-    run('mcopy', '-i', data, work / 'CONFIG.SYS', '::CONFIG/CONFIG.SYS')
+    (work / 'RETROOS.INI').write_text('[environment]\nTEST=CURSOR.COM\n')
+    run('mcopy', '-i', data, work / 'RETROOS.INI', '::RETROOS/RETROOS.INI')
     for firmware in ('bios', 'uefi'):
         session(work, data, firmware)
 

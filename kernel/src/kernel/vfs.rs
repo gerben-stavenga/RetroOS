@@ -365,6 +365,9 @@ struct Binding {
     /// never by a driver, and never by a wrapper a mount site could forget.
     access: crate::kernel::fs::grant::WriteAccess,
     mode: MountMode,
+    /// Private composition bindings remain addressable by aliases but do
+    /// not create synthetic directories in application directory listings.
+    listed: bool,
 }
 
 struct ResolvedObject {
@@ -663,6 +666,7 @@ impl Vfs {
             target,
             mode,
             access: WriteAccess::Delegated,
+            listed: true,
         });
         // Startup may inspect CONFIG before adding runtime/host mounts.
         // Cached directory entries also carry mount indices, which Replace
@@ -844,6 +848,7 @@ impl Vfs {
 
         // Synthesize mount points and missing ancestors beneath `dir`.
         for b in &self.mounts {
+            if !b.listed { continue; }
             if let Some(name) = mount_child_in_dir(b.prefix, dir)
                 && claim_visible_name(&mut visible_names, name, entries.len()) {
                 let name_len = name.len();
@@ -880,7 +885,20 @@ impl Vfs {
             self.populate_dir_cache(parent);
         }
         let cached = self.dir_cache.iter().find(|cached| cached.dir == parent)?;
-        Some(clone_dir_entry(cached.entries.get(*cached.names.get(name)?)?))
+        if let Some(index) = cached.names.get(name) {
+            return Some(clone_dir_entry(cached.entries.get(*index)?));
+        }
+        // Private mount points are omitted from listings, but direct lookup
+        // still walks their synthetic ancestors (e.g. mountfs/1/file).
+        let name = self.mounts.iter().find_map(|binding| {
+            mount_child_in_dir(binding.prefix, parent)
+                .filter(|child| eq_ignore_case(child, name))
+        })?;
+        Some(DirEntry {
+            name: name.to_vec(), name_len: name.len(), short_name: None,
+            size: 0, is_dir: true, is_symlink: false, mode: 0o755,
+            dos_attributes: Some(0x10), mtime: 0, node: 0, mount_idx: 0,
+        })
     }
 
     fn readlink_entry(&self, path: &[u8], entry: &DirEntry, out: &mut [u8]) -> Option<usize> {
@@ -1594,13 +1612,28 @@ pub(crate) fn is_mounted(prefix: &[u8]) -> bool {
     VFS.lock().mounts.iter().any(|binding| binding.prefix == prefix)
 }
 
-/// Filesystem format of an exact mount; do not probe disk contents while painting.
-pub(crate) fn mount_format_name(prefix: &[u8]) -> Option<&'static str> {
-    VFS.lock().mounts.iter().find(|binding| binding.prefix == prefix)
-        .and_then(|binding| match binding.target {
-            BindTarget::Server(fs) => Some(fs.format_name()),
-            BindTarget::Alias { .. } => None,
-        })
+pub(crate) fn hide_mount(prefix: &[u8]) {
+    let mut vfs = VFS.lock();
+    if let Some(binding) = vfs.mounts.iter_mut().find(|b| b.prefix == prefix) {
+        binding.listed = false;
+        vfs.invalidate_dir_cache();
+    }
+}
+
+/// Resolve mount aliases without accessing disk contents while painting.
+pub(crate) fn mount_description(prefix: &[u8]) -> Option<(&'static str, &'static str)> {
+    let vfs = VFS.lock();
+    let mut description = None;
+    vfs.visit_layers(prefix, ALIAS_DEPTH, &mut |index, fs, _| {
+        let access = match vfs.mounts[index as usize].access {
+            WriteAccess::None => "ro",
+            WriteAccess::Granted(_) => "rw (grant)",
+            WriteAccess::Delegated => "writable",
+        };
+        description = Some((fs.format_name(), access));
+        true
+    });
+    description
 }
 
 /// Explicitly deny mutations on a secondary filesystem. Ordinary mounts
@@ -1633,6 +1666,12 @@ pub fn mount_writable(prefix: &'static [u8], fs: &'static dyn Filesystem, home: 
 /// (Plan 9 MBEFORE). Lookups try it first; `readdir` merges the layers.
 pub fn mount_union(prefix: &'static [u8], fs: &'static dyn Filesystem) {
     VFS.lock().mount_union(prefix, fs);
+}
+
+pub(crate) fn mount_union_readonly(prefix: &'static [u8], fs: &'static dyn Filesystem) {
+    let mut vfs = VFS.lock();
+    vfs.mount_union(prefix, fs);
+    vfs.mounts.last_mut().unwrap().access = WriteAccess::None;
 }
 
 /// Bind: make the subtree at `src_prefix` also appear at `prefix` (a path
@@ -2036,6 +2075,7 @@ pub fn file_size_by_handle(handle: i32) -> u32 {
 /// this seam.
 #[derive(Clone, Copy)]
 pub struct BackingFile {
+    writable: bool,
     fs: &'static dyn Filesystem,
     handle: u64,
     size: u32,
@@ -2056,11 +2096,22 @@ unsafe impl Sync for BackingFile {}
 /// run under the lock already.
 pub struct FsSerial(#[allow(dead_code)] spin::MutexGuard<'static, Vfs>);
 
+/// Reset a failed boot composition before any guest owns VFS handles.
+pub(crate) fn reset_boot_mounts() {
+    let mut vfs = VFS.lock();
+    assert!(vfs.file_table.iter().all(|entry| entry.refcount == 0));
+    *vfs = Vfs::new();
+}
+
 pub fn serialize_fs() -> FsSerial {
     FsSerial(VFS.lock())
 }
 
 impl BackingFile {
+    #[cfg(test)]
+    pub(crate) fn test_file(fs: &'static dyn Filesystem, node: Vnode, writable: bool) -> Self {
+        Self { fs, handle: node.handle, size: node.size, writable }
+    }
     pub fn size(&self) -> u32 {
         self.size
     }
@@ -2070,8 +2121,14 @@ impl BackingFile {
         self.fs.read(self.handle, offset, buf, buf.len() as u32)
     }
 
+    /// Permission captured from the resolved backing mount.
+    pub fn writable(&self) -> bool { self.writable }
+
+    pub fn flush(&self) -> i32 { self.fs.sync() }
+
     /// Write at an absolute offset. Returns bytes written or negative errno.
     pub fn write_at(&self, offset: u32, data: &[u8]) -> i32 {
+        if !self.writable { return -13; }
         self.fs.write(self.handle, offset, data)
     }
 
@@ -2087,17 +2144,11 @@ impl BackingFile {
 pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
     let mut vfs = VFS.lock();
     let resolved = vfs.resolve_symlinks(path, true)?;
-    if let Some((mount_idx, vnode, _)) = vfs.open_cached_node(&resolved) {
-        return Some(BackingFile {
-            fs: vfs.mount_fs(mount_idx),
-            handle: vnode.handle,
-            size: vnode.size,
-        });
-    }
     let object = vfs.resolve_object(&resolved, ALIAS_DEPTH)?;
     let fs = object.fs;
     let vnode = fs.open(object.subpath())?;
-    Some(BackingFile { fs, handle: vnode.handle, size: vnode.size })
+    let writable = vfs.may_write(object.mount_idx, object.subpath());
+    Some(BackingFile { writable, fs, handle: vnode.handle, size: vnode.size })
 }
 
 /// Mount prefix of the filesystem behind an open fd — `b"cdrom/"` for the CD
@@ -2400,6 +2451,21 @@ mod tests {
     /// is bound over a path that already lives inside the mounted C: volume,
     /// so the bind's prefix is the longest match and the alias is the only
     /// binding at that length.
+    #[test]
+    fn private_mounts_resolve_through_aliases_without_appearing_in_root_listings() {
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", &ANY_FS);
+        vfs.mount(b"private/1/", &ANY_FS);
+        vfs.mounts[1].listed = false;
+        vfs.bind(b"shell/", b"private/1/RETROOS/DN/", super::MountMode::Replace);
+        assert!(vfs.path_exists(b"shell/DN.COM"));
+        assert!(vfs.resolve_symlinks(b"private/1/RETROOS/DN/DN.COM", true).is_some());
+        vfs.populate_dir_cache(b"");
+        let names = &vfs.dir_cache[0].names;
+        assert!(names.contains_key(b"shell".as_slice()));
+        assert!(!names.contains_key(b"private".as_slice()));
+    }
+
     #[test]
     fn a_bind_deeper_than_the_mount_it_overlays_resolves() {
         let mut vfs = Vfs::new();

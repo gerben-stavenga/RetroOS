@@ -623,10 +623,9 @@ pub(super) fn create_process<A: crate::Arch>(
 }
 
 fn has_dos_launch_override(state: &WindowsState, program: &[u8]) -> bool {
-    let Ok(path) = windows_path(state, br"C:\CONFIG\LOADFIX.CFG", false) else {
-        return false;
-    };
-    let Ok(config) = crate::kernel::exec::load_file_resolved(&path) else {
+    let config = windows_path(state, br"C:\RETROOS\LOADFIX.CFG", false).ok()
+        .and_then(|path| crate::kernel::exec::load_file_resolved(&path).ok());
+    let Some(config) = config else {
         return false;
     };
     let name = program.rsplit(|&b| b == b'\\' || b == b'/').next().unwrap_or(program);
@@ -1895,10 +1894,10 @@ mod environment_tests {
 
     #[test]
     fn windows_process_receives_config_and_inherited_values() {
-        let env = windows_environment(b"temp=D:\\SCRATCH\0MCHOME=C:\\RETROOS\\MC\0HOME=C:\\CONFIG\\MC\0\0");
+        let env = windows_environment(b"temp=D:\\SCRATCH\0MCHOME=C:\\MC\0HOME=D:\\USERMC\0\0");
         assert_eq!(environment_value(&env, b"TEMP"), Some(&b"D:\\SCRATCH"[..]));
-        assert_eq!(environment_value(&env, b"MCHOME"), Some(&b"C:\\RETROOS\\MC"[..]));
-        assert_eq!(environment_value(&env, b"HOME"), Some(&b"C:\\CONFIG\\MC"[..]));
+        assert_eq!(environment_value(&env, b"MCHOME"), Some(&b"C:\\MC"[..]));
+        assert_eq!(environment_value(&env, b"HOME"), Some(&b"D:\\USERMC"[..]));
         assert_eq!(environment_value(&env, b"COMSPEC"), Some(&b"C:\\RETROOS\\COMMAND.COM"[..]));
         assert!(env.ends_with(b"\0\0"));
     }

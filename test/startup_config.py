@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check startup config migration, precedence, arguments, and restart behavior."""
+"""Check INI startup arguments, overrides, locale and restart behavior."""
 from pathlib import Path
 import importlib.util
 import sys
@@ -11,42 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    sys.path.insert(0, str(ROOT / 'tools'))
-    spec = importlib.util.spec_from_file_location('installer', ROOT / 'tools/machine_install.py')
-    migration = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(migration)
     with tempfile.TemporaryDirectory(prefix='retroos-start-config-') as tmp:
         work = Path(tmp)
         root = work / 'home/retroos'
-        root.mkdir(parents=True)
-        fresh = work / 'fresh'
-        fresh.mkdir()
-        migration.migrate(fresh)
-        assert b'START=C:\\RETROOS\\DN\\DN.COM' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
-        assert b'VC=C:\\CONFIG\\VC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
-        assert b'MCHOME=C:\\RETROOS\\MC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
-        assert b'HOME=C:\\CONFIG\\MC' in (fresh / 'CONFIG/CONFIG.SYS').read_bytes()
-        assert (fresh / 'CONFIG/VC/VC.INI').is_file()
-        assert (fresh / 'CONFIG/VC/VC.HLP').is_file()
-        assert (fresh / 'CONFIG/MC/.mc/ini').is_file()
-        assert (fresh / 'CONFIG/MC/.mc/menu').is_file()
-        legacy = b'CUSTOM=keep\r\nSTART=C:\\CUSTOM.COM arg\r\n'
-        (root / 'CONFIG.SYS').write_bytes(legacy)
-        migration.migrate(root)
-        config = root / 'CONFIG/CONFIG.SYS'
-        assert b'CUSTOM=keep' in config.read_bytes()
-        assert b'START=C:\\CUSTOM.COM arg' in config.read_bytes()
-        assert (root / 'CONFIG.SYS').read_bytes() == legacy
-        (root / 'CONFIG/VC/VC.INI').write_bytes(b'custom VC setup')
-        (root / 'CONFIG/MC/.mc/ini').write_bytes(b'custom MC setup')
-        config.write_bytes(b'START=BOOT.COM newer\r\nCUSTOM=new\r\n')
-        migration.migrate(root)
-        assert b'START=BOOT.COM newer' in config.read_bytes()
-        assert b'CUSTOM=new' in config.read_bytes()
-        assert (root / 'CONFIG/VC/VC.INI').read_bytes() == b'custom VC setup'
-        assert (root / 'CONFIG/MC/.mc/ini').read_bytes() == b'custom MC setup'
-        print('PASS: migration preserves custom settings and prefers the new config')
-
+        (root / 'RETROOS').mkdir(parents=True)
+        config = root / 'RETROOS/RETROOS.INI'
         source = work / 'probe.asm'
         source.write_text('''bits 16
 org 100h
@@ -111,17 +80,14 @@ cp850 db 'CP850', 13, 10, '$'
                 assert proc.returncode == 0 and b'All commands done' in data, data[-4000:]
             print('PASS:', label)
 
-        (root / 'CONFIG.SYS').write_bytes(b'START=BOOT.COM legacy\n')
-        config.write_bytes(b'START=C:\\BOOT.COM configured\n')
+        config.write_bytes(b'[system]\nstart=C:\\BOOT.COM configured\n')
         boot('configured')
-        config.write_bytes(b'START=C:\\BOOT.COM cp850\nCODEPAGE=850\n')
+        config.write_bytes(b'[system]\nstart=C:\\BOOT.COM cp850\n[locale]\ncodepage=850\n')
         boot('cp850')
         assert b'CP850' in (work / 'cp850.log').read_bytes()
         boot('override', ['--cmd', 'BOOT.COM override'], repeated=False)
-        config.write_bytes(b'START=MISSING.COM\nTEST=BOOT.COM test\n')
+        config.write_bytes(b'[system]\nstart=MISSING.COM\n[environment]\nTEST=BOOT.COM test\n')
         boot('test', repeated=False)
-        config.unlink()
-        boot('legacy')
 
 
 if __name__ == '__main__':

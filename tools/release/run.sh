@@ -52,6 +52,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 cp --reflink=auto "$SCRIPT_DIR/boot.img" "$WORK/boot.img"
 BOOT_IMAGE="$WORK/boot.img"
+python3 "$SCRIPT_DIR/tools/vm_mount_config.py" --boot-image "$BOOT_IMAGE" --data-image "$DATA_IMAGE"
 run_vm() { "$@" <&0 & VM_PID=$!; local status=0; wait "$VM_PID" || status=$?; VM_PID=; return "$status"; }
 source "$SCRIPT_DIR/tools/run/$BACKEND.sh"
 launch

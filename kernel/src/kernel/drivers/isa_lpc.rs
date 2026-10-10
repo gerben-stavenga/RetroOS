@@ -159,7 +159,7 @@ fn configure(io: &mut impl Io, ranges: &[(u16, u8, u8); 4]) -> &'static str {
     "configured Intel LPC + Fintek F85226; ISA DMA initialized"
 }
 
-/// `config_ranges` is CONFIG.SYS's `LPC_RANGES` value, if present; an
+/// `config_ranges` is RETROOS.INI's `LPC_RANGES` value, if present; an
 /// unparseable override falls back to the sapphisa defaults rather than
 /// aborting setup.
 pub fn setup<A: crate::Arch>(machine: &mut A, config_ranges: Option<&[u8]>) {

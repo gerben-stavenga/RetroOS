@@ -2,6 +2,8 @@
 """Repeat RC in a private 128 MiB BIOS VM to check ELF load memory use."""
 import json, socket, subprocess, time, tempfile, re
 from pathlib import Path
+from boot_fixture import prepare_boot
+
 root=Path(__file__).resolve().parents[1]
 subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=root, check=True)
 work=Path(tempfile.mkdtemp(prefix='retroos-rc-repeat-'))
@@ -9,12 +11,13 @@ print(work,flush=True)
 disk=work/'data.img'; disk.write_bytes(b''); disk.open('r+b').truncate(32*1024*1024)
 def run(*a): subprocess.run(list(map(str,a)),check=True,stdout=subprocess.DEVNULL)
 run('mkfs.fat','-F','16',disk)
-run('mmd','-i',disk,'::CONFIG')
-config=(root/'etc/CONFIG.SYS').read_bytes()
-(work/'CONFIG.SYS').write_bytes(config)
-run('mcopy','-i',disk,work/'CONFIG.SYS','::CONFIG/CONFIG.SYS')
+run('mmd','-i',disk,'::RETROOS')
+config=(root/'etc/RETROOS.INI').read_bytes()
+(work/'RETROOS.INI').write_bytes(config)
+run('mcopy','-i',disk,work/'RETROOS.INI','::RETROOS/RETROOS.INI')
+boot=prepare_boot(work,disk)
 log=work/'boot.log'; sock=work/'qmp'
-p=subprocess.Popen(['qemu-system-x86_64','-accel','kvm','-cpu','host','-m','128','-display','none','-serial','none','-drive',f'file={root}/bazel-bin/boot_disk.bin,format=raw,snapshot=on','-drive',f'file={disk},format=raw,snapshot=on','-device',f'VGA,romfile={root}/third_party/vgabios/vgabios-stdvga.bin','-audiodev','none,id=snd0','-device','intel-hda','-device','hda-duplex,audiodev=snd0','-debugcon',f'file:{log}','-qmp',f'unix:{sock},server=on,wait=off','-no-reboot'],stdout=subprocess.DEVNULL,stderr=(work/'stderr').open('w'))
+p=subprocess.Popen(['qemu-system-x86_64','-accel','kvm','-cpu','host','-m','128','-display','none','-serial','none','-drive',f'file={boot},format=raw,snapshot=on','-drive',f'file={disk},format=raw,snapshot=on','-device',f'VGA,romfile={root}/third_party/vgabios/vgabios-stdvga.bin','-audiodev','none,id=snd0','-device','intel-hda','-device','hda-duplex,audiodev=snd0','-debugcon',f'file:{log}','-qmp',f'unix:{sock},server=on,wait=off','-no-reboot'],stdout=subprocess.DEVNULL,stderr=(work/'stderr').open('w'))
 def text(): return log.read_text(errors='replace') if log.exists() else ''
 def wait(pred,timeout=40):
  end=time.monotonic()+timeout
@@ -40,7 +43,7 @@ try:
  keys={':':'shift-semicolon','\\':'backslash','.':'dot',' ':'spc'}
  time.sleep(2)
  for cycle in range(8):
-  for ch in 'c:\\retroos\\rc\\rc.exe':key(keys.get(ch,ch))
+  for ch in 'c:\\rc\\rc.exe':key(keys.get(ch,ch))
   key('ret')
   wait(lambda t:t.count('parent tid=1 continues without blocking')>=cycle+1)
   time.sleep(5)

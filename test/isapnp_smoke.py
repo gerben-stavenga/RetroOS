@@ -28,8 +28,8 @@ def main():
         run('nasm', '-f', 'bin', '-o', probe, asm)
         tree = work / 'root'
         file(tree, 'home/retroos/RETROOS/PROBE.COM', probe.read_bytes())
-        file(tree, 'home/retroos/CONFIG/CONFIG.SYS',
-             b'SB_AUDIO=native\nBLASTER=A220 I7 D1 H5 P330 T6\n')
+        file(tree, 'home/retroos/RETROOS/RETROOS.INI',
+             b'[environment]\nSB_AUDIO=native\nBLASTER=A220 I7 D1 H5 P330 T6\n')
         (tree / 'bin').mkdir()
         module = image(work, 'root', tree, 'ext4')
         text = boot(work, 'no-pnp-card', module, [])

@@ -33,10 +33,15 @@ where it is heading — one safe-Rust core running code for any OS, any ISA, on
 any host (native on the diagonal, interpreted off it).
 
 For an existing Linux machine, see [BOOTING.md](BOOTING.md). Prepare with
-`tools/install_kernel.sh --prepare`, then install with `sudo tools/install_kernel.sh`.
-GRUB selects the root by UUID; runtime files at `C:\RETROOS` are read-only,
-while DN, VC, and MC settings live under `C:\CONFIG` and temporary files at
-`C:\TEMP`.
+`tools/install_kernel.sh --module --prepare`, then install with
+`sudo tools/install_kernel.sh --module`.
+New boot bundles read `RETROOS/RETROOS.INI` before mounting physical volumes.
+The bundle supplies writable RAM views of `C:\RETROOS`, apps at `C:\DN`, `C:\VC`, `C:\MC`, `C:\RC`, and BusyBox
+at `/bin`; `C:\TEMP` is RAM. When a Linux filesystem supplies `/`, its `/bin` and `/usr/bin` are used.
+Bundled BusyBox serves the RAM root, or an explicit bundle mount at `/bin`.
+
+Mounts explicitly select filesystem UUIDs or
+existing disk-image files. Disk boots require RETROOS.INI.
 
 ## Releases
 
@@ -114,7 +119,7 @@ setup.
 package too. The image is FAT16 because Rust-DOS cannot mount the shared
 FAT32 data image as a DOS drive yet. It is copied to a temporary file for
 each launch, so game saves in this mode are discarded on exit. The launcher
-reads `PATH`, `DN`, `DNSWP`, `TEMP` and `START` from `etc/CONFIG.SYS`, matching
+reads `PATH`, `DN`, `DNSWP`, `TEMP` and `start` from `etc/RETROOS.INI`, matching
 RetroOS's DOS paths; the default `START` opens DN automatically. After DN
 exits, the DOS prompt remains. Rust-DOS's built-in DPMI host uses its default
 enabled setting.
@@ -126,22 +131,22 @@ persistent disk. A launcher lock prevents simultaneous use of the same disk.
 
 Edit [filesystem_layout.bzl](filesystem_layout.bzl) for packaged file destinations
 and partition sizes. Size/seed changes apply to newly created data images;
-existing disks retain their contents and layout. `C:\CONFIG\LOADFIX.CFG` is
-seeded as writable data. Add `ALADDIN.EXE xms32k` there to cap Aladdin's classic
-XMS free-memory report at 32767 KiB; the actual pool and XMS 3.0 query stay
-unchanged. Launch through COMMAND.COM (including from DN) to apply the policy.
-The boot volume is read-only:
-new state files beside shipped files go to the data disk, while shipped files
-cannot be overwritten through that binding.
+existing disks retain their contents and layout. `C:\RETROOS\LOADFIX.CFG`
+contains COMMAND.COM launch policy, including Aladdin's `xms32k` setting.
+The runtime bundle and DN have writable RAM views, including shipped files;
+changes disappear on reboot. Persistent settings can use explicit writable
+mounts at the appropriate application directory.
 
-Startup settings live in `C:\CONFIG\CONFIG.SYS`. Change
-`START=C:\RETROOS\DN\DN.COM` to another program (with optional arguments)
-to choose what starts at boot. The program restarts when it exits. `--cmd` and
-`TEST=` override it for tests. Migrate an existing disk with
-`python3 tools/migrate_dn_state.py --image build/data.bin` while it is offline.
-`LOCALE=`, `KEYBOARD=` and `CODEPAGE=` are RetroOS configuration directives,
-not guest environment variables. `LOCALE=` selects shared regional settings
-for DOS, Windows, OS/2 and Linux:
+The boot bundle's `RETROOS/RETROOS.INI` contains system, locale, sound,
+environment and mount sections. `[system] start=C:\DN\DN.COM` selects the
+startup program; `[locale] language=it-IT` selects shared regional settings.
+`keyboard=us` and `codepage=850` override the locale's defaults. Regional
+policy is shared by DOS, Windows, OS/2 and Linux, not a guest environment.
+
+GRUB module boots also accept `/boot/RETROOS.INI` as an editable override.
+GRUB loads it with `module2 /boot/RETROOS.INI retroos.config=ini`; no compressed
+base-image rebuild is needed. The installer places this override alongside
+its kernel and base image.
 
 | Locale | OEM code page | Windows ANSI | Keyboard |
 | --- | --- | --- | --- |
@@ -152,13 +157,13 @@ for DOS, Windows, OS/2 and Linux:
 | `pl-PL` | 852 | 1250 | `pl` (programmer) |
 | `ru-RU` | 866 | 1251 | `ru` |
 
-For example, `LOCALE=it-IT` selects Italian country/date/number settings and
-keyboard input. `KEYBOARD=us`, `de`, `it`, `pl` or `ru` overrides the keyboard
+For example, `[locale] language=it-IT` selects Italian country/date/number
+settings and keyboard input. `keyboard=us`, `de`, `it`, `pl` or `ru` overrides the keyboard
 independently. Right Alt selects AltGr characters; German dead keys compose
 accents; Caps Lock changes letter case. Russian input switches between Cyrillic
 and Latin with Left Alt+Shift. Dutch defaults to a US keyboard.
 
-`CODEPAGE=437`, `850`, `852`, or `866` overrides the locale's OEM encoding;
+`codepage=437`, `850`, `852`, or `866` overrides the locale's OEM encoding;
 `CHCP` can change the active OEM page during a session. Neither changes the
 regional settings or Windows ANSI page. DOS and OS/2 receive OEM input bytes,
 Windows console W APIs receive UTF-16 and A APIs use the console input page,
@@ -170,23 +175,57 @@ cannot encode the Unicode symbol (for example, `EUR` on page 850).
 Linux starts with the locale's UTF-8 `LANG`; userspace libraries remain
 responsible for their own locale data and formatting.
 
-A detected Linux filesystem supplies `/`; otherwise the RAM boot image supplies
-it (or the selected FAT volume for a disk-only boot). C: appears at `/home/retroos`:
-its data comes from either that Linux home directory or a FAT volume mounted
-there. FAT volumes with `CONFIG`, `GAMES`, or `ULTRAMID` are preferred C:
-candidates; otherwise an existing ext4 `/home/retroos` wins, followed by another
-user home under `/home`, then a plain FAT volume. Equally marked FAT volumes
-prefer the larger partition, with partition scan order breaking remaining ties.
-A dedicated ESP (MBR type `0xEF` or GPT EFI System Partition GUID) is excluded
-from automatic C: selection. Merely containing `EFI`, `boot/grub`, or `RETROOS`
-does not exclude a data volume. Runtime discovery is independent: the GRUB RAM
-module still supplies `C:\RETROOS`. An explicit root UUID overrides selection.
-RAM C: is the fallback when no physical data candidate exists. The boot log
-reports the backing volume and directory; selection never formats partitions.
+Mounts are explicit in new bundles; unlisted physical partitions remain
+unmounted. The default is a self-contained RAM C:. For example, the existing
+workspace disk image can supply C: on bare metal without copying it:
+
+```ini
+[mount "linux"]
+source=UUID=<ext4-filesystem-UUID>
+path=/
+access=rw
+grant=/home/priv-gerben
+
+[mount "data"]
+source=file:/home/priv-gerben/project/RetroOS/build/data.bin
+partition=1
+path=/home/retroos
+drive=C
+access=rw
+```
+
+`grant` identifies the home directory whose group grants ext4 writes; existing
+inode ownership and group-write permissions still apply. `subdir` exposes a
+subtree of a volume. Image mounts are ordered after their containing mount;
+cycles are rejected. Partitioned images with several supported partitions
+require `partition=`, numbered from 1. Raw filesystem images need no selector.
+The current file interface limits images to less than 4 GiB.
+
+Mount access modes are `ro` (reject writes), `rw` (persist writes), and `ram`
+(accept writes into a sector overlay). GRUB's **Protected Disk** boot forces
+physical `rw` mounts into RAM without editing the INI. Missing configured
+sources produce a diagnostic and fall back to the RAM session.
+
+ISO images use `source=file:/path/game.iso`, `format=iso9660`, `path=/cdrom`,
+`drive=D`, `access=ro`. Optional games modules mount separately at `/games`,
+normally G:, without merging physical game directories. Explicit mount paths
+and drive assignments win over the optional module defaults.
+
+F12 **Disk → Mnt** stages physical partition mappings. On a partition row,
+left/right changes its drive; on its access row it selects ro/rw/ram. Choose an
+export destination and **Export RETROOS.INI** to save the proposed configuration.
+Changes take effect on the next boot after copying the export to the boot medium
+from another OS. Exporting in Protected Disk mode is RAM-only. RetroOS still
+cannot write USB storage. The full partition UUIDs are also printed in KLOG.
+
+The VM launchers generate this mount policy from the explicitly attached data
+disk's UUIDs in their disposable boot copy, preserving the shared `build/data.bin`
+workflow without modifying the persistent disk or relying on discovery order.
+
 
 Sound Blaster discovery checks ISA Plug and Play first. A Creative PnP audio
 device, including one already initialized by firmware, is configured using the
-existing `BLASTER` setting in `C:\CONFIG\CONFIG.SYS`, for example
+`BLASTER` setting in `[environment]` in RETROOS.INI, for example
 `BLASTER=A220 I7 D1 H5 P330 T6`. Its A/I/D/H/P fields request the SB port,
 IRQ, 8-bit DMA, optional 16-bit DMA, and MPU port (`P` defaults to `330`).
 RetroOS checks the card's advertised resource alternatives and other active
@@ -285,13 +324,11 @@ is independent of PIO/DMA transfers.
 
 For booting on a real UEFI machine via its installed GRUB, see [BOOTING.md](BOOTING.md).
 
-> **On real hardware, RetroOS writes to your disk.** It mounts the machine's
-> Linux root (it probes for `/etc` + `/usr`) and takes `C:` from
-> `/home/retroos` there, so guest writes land on the filesystem you boot Linux
-> from. Pass the Multiboot argument `ram-overlay` to divert every physical
-> write into volatile RAM instead — recommended for a machine you care about.
-> The boot banner tells you which mode you got. See
-> [BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
+New standalone bundles mount physical filesystems only when listed in
+RETROOS.INI. `access=rw` persists permitted writes; `access=ro` rejects them;
+`access=ram` keeps changes in memory. The GRUB `ram-overlay` option protects
+all physical writes for that boot. Unlisted physical partitions stay unmounted. See
+[BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
 
 ## Architecture
 
@@ -350,16 +387,12 @@ RetroOS/
 ├── play/           # retroos-play windowed host emulator
 ├── lib/            # Shared freestanding library (VGA render, ELF, TAR, MD5)
 ├── apps/           # Userspace ELF binaries and DOS programs
-├── apps-boot/      # Programs embedded into kernel.elf (DN, COMMAND.COM)
+├── apps-boot/      # Programs shipped in the boot filesystem (DN, RC, MC)
 ├── stdlib/         # core + compiler_builtins from rust-src
 └── toolchain/      # Bazel toolchain definitions
 ```
 
-Additional detected filesystems mounted at `/disk1` through `/disk7` are also
-available to DOS as **E:, F:, G:, I:, J:, K:, L:** respectively. **H:** stays
-reserved for HostFS. These partitions are read-only even in persistent mode;
-the aliases let DOS Navigator and programs browse/read the existing mounts.
-Use the F12 **Disk → HD** view to see the mappings and filesystem names
-(FAT or ext4), or switch drives in DOS
-Navigator. Only successfully mounted partitions receive a usable drive letter.
-These aliases do not add USB mass-storage support.
+RETROOS.INI selects which filesystems are exposed and their DOS drive letters.
+Unlisted physical partitions stay unmounted. **H:** is reserved for HostFS;
+**A:** and **B:** are floppy drives. Use F12 **Disk → HD** to see active mappings
+or **Disk → Mnt** to stage and export a mount profile.

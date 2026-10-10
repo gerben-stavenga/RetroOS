@@ -67,6 +67,7 @@ def main():
     ap.add_argument("--base", required=True)
     ap.add_argument("--games", help="optional games RAM module")
     ap.add_argument("--grub-cfg", required=True)
+    ap.add_argument("--ini", help="editable RetroOS configuration alongside the modules")
     ap.add_argument("--license", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--grub-lib", default="/usr/lib/grub/i386-pc")
@@ -88,6 +89,8 @@ def main():
             shutil.copyfile(source, os.path.join(boot, name))
         if args.games:
             shutil.copyfile(args.games, os.path.join(boot, "retroos-games.img.gz"))
+        if args.ini:
+            shutil.copyfile(args.ini, os.path.join(boot, "RETROOS.INI"))
         shutil.copyfile(args.license, os.path.join(tree, "THIRD_PARTY_LICENSES.md"))
 
         cfg = os.path.join(work, "grub.cfg")

@@ -21,8 +21,8 @@ letter a permanent commitment, so C: must be C: on both sides -- which it is,
 because FreeDOS letters the first DOS-typed primary partition and the boot
 disk's ESP is type 0xEF, which DOS skips.
 
-FreeDOS uses FDCONFIG.SYS; RetroOS keeps its key=value startup settings
-in CONFIG/CONFIG.SYS.
+FreeDOS uses FDCONFIG.SYS; RetroOS keeps its INI startup settings
+in RETROOS/RETROOS.INI.
 """
 
 import argparse
@@ -171,7 +171,7 @@ def populate_fat(image, start, sectors, tree, freedos_dir, work, heads):
         mcopy(os.path.join(freedos_dir, name), "/" + name)
 
     # FreeDOS reads FDCONFIG.SYS in preference to CONFIG.SYS, which is what
-    # keeps FreeDOS startup separate from RetroOS CONFIG/CONFIG.SYS.
+    # keeps FreeDOS startup separate from RetroOS RETROOS/RETROOS.INI.
     fdconfig = os.path.join(work, "FDCONFIG.SYS")
     with open(fdconfig, "w", newline="\r\n") as f:
         f.write("DOS=HIGH\n")
@@ -180,13 +180,8 @@ def populate_fat(image, start, sectors, tree, freedos_dir, work, heads):
         f.write("SHELLHIGH=C:\\COMMAND.COM C:\\ /P /E:512\n")
     mcopy(fdconfig, "/FDCONFIG.SYS")
 
-    # Runtime mount point; writable app state lives separately in CONFIG.
+    # Runtime mount point. Application state stays with its application.
     mmd("/RETROOS")
-    mmd("/CONFIG")
-    mmd("/CONFIG/DN")
-    mmd("/CONFIG/VC")
-    mmd("/CONFIG/MC")
-    mmd("/CONFIG/MC/.mc")
     mmd("/TEMP")
 
     if not tree:

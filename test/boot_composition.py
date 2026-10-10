@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Boot sources supply runtime/defaults; ext4 or FAT supplies C: data."""
+"""Boot fixture helpers and unified INI composition checks."""
 import hashlib
 import pathlib
 import shutil
@@ -89,100 +89,13 @@ def boot(work, name, module, disks, protected=False, extra_args=""):
     return text
 
 def main():
-    run('bazelisk', 'build', '//kernel:kernel_elf')
-    with tempfile.TemporaryDirectory(prefix='retroos-composition-') as scratch:
-        work = pathlib.Path(scratch)
-        probe = work / 'probe.com'
-        run('nasm', '-f', 'bin', '-o', probe, 'test/boot_composition_probe.asm')
-        for source in ['module', 'efi']:
-            boot_tree = work / (source + '-tree')
-            home = boot_tree / 'home/retroos' if source == 'module' else boot_tree
-            file(home, 'RETROOS/RUNTIME.TXT', b'B')
-            file(home, 'RETROOS/PROBE.COM', probe.read_bytes())
-            file(home, 'CONFIG/DEFAULT.TXT', b'B')
-            file(home, 'CONFIG/OVERRIDE.TXT', b'B')
-            file(home, 'CONFIG/NESTED/DEFAULT.TXT', b'B')
-            (boot_tree / ('bin' if source == 'module' else 'EFI')).mkdir(exist_ok=True)
-            boot_image = image(work, source, boot_tree, 'ext4' if source == 'module' else 'fat', esp=source == 'efi')
-            boot_hash = hashlib.sha256(boot_image.read_bytes()).digest()
-            for kind in ['ext4', 'fat']:
-                data_tree = work / (source + '-' + kind)
-                data_home = data_tree / 'home/retroos' if kind == 'ext4' else data_tree
-                file(data_home, 'DATA.TXT', b'D')
-                file(data_home, 'RETROOS/RUNTIME.TXT', b'D')
-                file(data_home, 'CONFIG/OVERRIDE.TXT', b'D')
-                file(data_home, 'TEMP/OLD.TXT', b'D')
-                for protected in [False, True]:
-                    # Also exercise a physical Unix root beside the RAM boot source.
-                    if protected and kind == 'ext4':
-                        (data_tree / 'bin').mkdir(exist_ok=True)
-                    label = source + '-' + kind + ('-protected' if protected else '-persistent')
-                    data_image = image(work, label, data_tree, kind)
-                    before = hashlib.sha256(data_image.read_bytes()).digest()
-                    boot(work, label, boot_image if source == 'module' else None,
-                         ([boot_image] if source == 'efi' else []) + [data_image], protected)
-                    if protected:
-                        assert hashlib.sha256(data_image.read_bytes()).digest() == before
-                    else:
-                        if kind == 'fat':
-                            result = run('mtype', '-i', data_image, '::CONFIG/OVERRIDE.TXT', capture_output=True)
-                        else:
-                            result = run('debugfs', '-R', 'cat /home/retroos/CONFIG/OVERRIDE.TXT',
-                                         data_image, capture_output=True)
-                        assert result.stdout == b'S', (label, result.stdout)
-                    assert hashlib.sha256(boot_image.read_bytes()).digest() == boot_hash
-            if source == 'module':
-                # Both FAT disks have C: markers. The explicit UUID must pick
-                # the second disk even though automatic selection picks first.
-                first_tree = work / 'multi-fat-first-tree'
-                file(first_tree, 'DATA.TXT', b'X')
-                file(first_tree, 'CONFIG/OVERRIDE.TXT', b'X')
-                second_tree = work / 'multi-fat-second-tree'
-                file(second_tree, 'DATA.TXT', b'D')
-                file(second_tree, 'CONFIG/OVERRIDE.TXT', b'D')
-                file(second_tree, 'TEMP/OLD.TXT', b'D')
-                first = image(work, 'multi-fat-first', first_tree, 'fat', serial='11111111')
-                second = image(work, 'multi-fat-second', second_tree, 'fat', serial='ABCD1234')
-                text = boot(work, 'multi-fat-c-uuid', boot_image, [first, second],
-                            protected=True, extra_args='retroos.c-uuid=ABCD-1234')
-                assert 'C: backing volume 1 (ata1)' in text, text
-            # Without a data disk, the same runtime/config/temp layout still works.
-            file(home, 'DATA.TXT', b'D')
-            file(home, 'CONFIG/OVERRIDE.TXT', b'D')
-            file(home, 'TEMP/OLD.TXT', b'D')
-            fallback = image(work, source + '-only', boot_tree, 'ext4' if source == 'module' else 'fat', esp=source == 'efi')
-            before = hashlib.sha256(fallback.read_bytes()).digest()
-            boot(work, source + '-only', fallback if source == 'module' else None,
-                 [] if source == 'module' else [fallback])
-            assert hashlib.sha256(fallback.read_bytes()).digest() == before
-            if source == 'module':
-                # Linux may use Btrfs while a separate ext4 /boot is visible.
-                # That unrelated ext4 volume must not replace the RAM root.
-                empty_boot = work / 'btrfs-host-boot-tree'
-                empty_boot.mkdir()
-                boot_disk = image(work, 'btrfs-host-boot', empty_boot, 'ext4')
-                text = boot(work, 'btrfs-host-ram-c', fallback, [boot_disk])
-                assert 'from RAM' in text, text
+    # Composition is now explicit INI policy. Exercise its boot transports
+    # and storage semantics rather than the retired automatic CONFIG overlay.
+    from boot_config import main as boot_configuration
+    from mount_config import main as storage_configuration
+    boot_configuration()
+    storage_configuration()
 
-        # Installed releases use the same composition, selected explicitly by UUID.
-        installed = work / 'installed-tree'
-        for directory in ['RETROOS', 'CONFIG']:
-            shutil.copytree(home / directory, installed / 'boot/release' / directory)
-        data_home = installed / 'home/retroos'
-        file(data_home, 'DATA.TXT', b'D')
-        file(data_home, 'RETROOS/RUNTIME.TXT', b'D')
-        file(data_home, 'CONFIG/OVERRIDE.TXT', b'D')
-        file(data_home, 'TEMP/OLD.TXT', b'D')
-        disk = image(work, 'installed', installed, 'ext4')
-        with disk.open('rb') as stream:
-            stream.seek(1024 + 104)
-            root_uuid = uuid.UUID(bytes=stream.read(16))
-        boot(work, 'installed', None, [disk], extra_args=
-             f'retroos.root={root_uuid} retroos.c-root=/home/retroos retroos.runtime=/boot/release/RETROOS')
-        result = run('debugfs', '-R', 'cat /home/retroos/CONFIG/OVERRIDE.TXT', disk, capture_output=True)
-        assert result.stdout == b'S'
-        result = run('debugfs', '-R', 'cat /boot/release/RETROOS/RUNTIME.TXT', disk, capture_output=True)
-        assert result.stdout == b'B'
 
 if __name__ == '__main__':
     main()

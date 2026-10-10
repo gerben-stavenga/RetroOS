@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import time
 
+from boot_fixture import prepare_boot
+
 ROOT = Path(__file__).resolve().parent.parent
 
 # Wait for an 'a' key plus mouse motion and a left click, then exit normally.
@@ -65,11 +67,12 @@ passed db 'USB INPUT PASS',13,10,'$'
 def session(work, disk, name, controllers, keyboard, mouse, uefi=False):
     log = work / (name + '.log')
     qmp = work / (name + '.sock')
+    boot = prepare_boot(work, disk)
     args = [
         'qemu-system-i386', '-machine', 'pc,i8042=off', '-m', '256',
         '-display', 'none', '-serial', 'none', '-no-reboot',
         '-debugcon', 'file:' + str(log),
-        '-drive', f'file={ROOT}/bazel-bin/boot_disk.bin,format=raw,snapshot=on',
+        '-drive', f'file={boot},format=raw,snapshot=on',
         '-drive', f'file={disk},format=raw,snapshot=on',
         '-qmp', f'unix:{qmp},server=on,wait=off',
         '-fw_cfg', 'name=opt/cmdline,string=INPUT.COM',
@@ -153,8 +156,8 @@ def main():
             stream.truncate(64 * 1024 * 1024)
         subprocess.run(['mkfs.fat', '-F', '32', str(disk)], check=True, stdout=subprocess.DEVNULL)
         subprocess.run(['mcopy', '-i', str(disk), str(probe), '::INPUT.COM'], check=True)
-        subprocess.run(['mmd', '-i', str(disk), '::CONFIG', '::RETROOS'], check=True)
-        subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/CONFIG.SYS'), '::CONFIG/CONFIG.SYS'], check=True)
+        subprocess.run(['mmd', '-i', str(disk), '::RETROOS'], check=True)
+        subprocess.run(['mcopy', '-i', str(disk), str(ROOT / 'etc/RETROOS.INI'), '::RETROOS/RETROOS.INI'], check=True)
         session(work, disk, 'shared', 1, 0, 0)
         session(work, disk, 'split', 2, 0, 1)
         session(work, disk, 'empty-first', 3, 1, 2)

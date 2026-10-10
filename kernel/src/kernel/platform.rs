@@ -468,7 +468,7 @@ pub fn probe<A: crate::Arch>(
             voodoo_emulation: false,
             vga_readback,
             audio_hw,
-            // Policy comes later, when CONFIG.SYS is readable
+            // Policy comes later, when RETROOS.INI is readable
             // (`apply_audio_mode`); until then, the hardware's default.
             audio: audio_hw.default_verdict(),
             hostfs,
@@ -497,7 +497,7 @@ pub fn probe<A: crate::Arch>(
 /// The frozen platform description. Panics if `probe` has not run — an init
 /// ordering bug that should be loud.
 /// Apply the boot config's sound-mode policy to the frozen probe. Called
-/// exactly once by `startup`, after the mounts make CONFIG.SYS readable and
+/// exactly once by `startup`, after the mounts make RETROOS.INI readable and
 /// before anything reads `audio` (io_policy's IOPB build, the bank burn, the
 /// first guest).
 ///
@@ -645,9 +645,9 @@ pub fn get() -> &'static Platform {
 
 /// Probe audio once. PCI drivers return their initialized capability together
 /// with the fact recorded in `Platform`; SB presence is separate because its
-/// wiring and ownership policy cannot be settled until CONFIG.SYS is mounted.
+/// wiring and ownership policy cannot be settled until RETROOS.INI is mounted.
 fn probe_audio<A: crate::Arch>(machine: &mut A) -> (AudioHw, AudioToken) {
-    // Defer all Sound Blaster probing until CONFIG.SYS is available, so
+    // Defer all Sound Blaster probing until RETROOS.INI is available, so
     // ISA PnP discovery precedes the legacy DSP sweep in apply_audio_mode.
     if let Some(device) = crate::kernel::drivers::hda::probe(machine) {
         return (AudioHw::Hda, AudioToken::Hda(device));

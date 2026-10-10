@@ -30,6 +30,8 @@ def check_usb(work):
     menu = subprocess.check_output(['mtype', '-i', f'{image}@@1048576',
                                     '::/boot/grub/grub.cfg']).decode()
     assert 'GOP 1024x768' in menu and 'GOP 800x600' in menu
+    ini = subprocess.check_output(['mtype', '-i', f'{image}@@1048576', '::/boot/RETROOS.INI']).decode()
+    assert 'source=bundle' in ini and 'start=C:\\DN\\DN.COM' in ini
     cfg = work / 'usb-grub.cfg'
     cfg.write_text(menu)
     subprocess.run(['grub-script-check', str(cfg)], check=True)
@@ -41,7 +43,7 @@ def check_usb(work):
                 '-device', 'usb-storage,bus=usb.0,drive=usbdisk,bootindex=1',
                 '-boot', 'order=c', '-display', 'none', '-no-reboot',
                 '-debugcon', 'file:' + str(log),
-                '-fw_cfg', 'name=opt/cmdline,string=TESTS/HELLO.COM']
+                '-fw_cfg', 'name=opt/cmdline,string=/bin/busybox true']
         if firmware == 'bios':
             args += ['-cpu', 'pentium3']
         else:
@@ -55,7 +57,7 @@ def check_usb(work):
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and proc.poll() is None:
                 text = log.read_text(errors='replace') if log.exists() else ''
-                if any(marker in text for marker in ('Hello from HELLO.COM!', 'PANIC')):
+                if any(marker in text for marker in ('[mem] exit tid=1 code=0', 'PANIC')):
                     break
                 time.sleep(.1)
         finally:
@@ -63,7 +65,7 @@ def check_usb(work):
                 proc.terminate()
             proc.wait(timeout=10)
         text = log.read_text(errors='replace')
-        assert 'Hello from HELLO.COM!' in text and 'PANIC' not in text, text
+        assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text
         assert 'Disk writes: volatile RAM overlay' in text, text
         expected = 'vga_passthrough=true firmware=NativeBios' if firmware == 'bios' else 'vga_passthrough=false firmware=Substitute'
         assert expected in text, text
@@ -78,7 +80,7 @@ def check_iso(work):
         args = ['qemu-system-x86_64', '-m', '512', '-cdrom', str(image),
                 '-boot', 'order=d', '-display', 'none', '-no-reboot',
                 '-debugcon', 'file:' + str(log),
-                '-fw_cfg', 'name=opt/cmdline,string=TESTS/HELLO.COM']
+                '-fw_cfg', 'name=opt/cmdline,string=/bin/busybox true']
         if firmware == 'uefi':
             import shutil
             variables = work / 'iso-vars.fd'
@@ -90,7 +92,7 @@ def check_iso(work):
             deadline = time.monotonic() + 60
             while time.monotonic() < deadline and proc.poll() is None:
                 text = log.read_text(errors='replace') if log.exists() else ''
-                if any(marker in text for marker in ('Hello from HELLO.COM!', 'PANIC')):
+                if any(marker in text for marker in ('[mem] exit tid=1 code=0', 'PANIC')):
                     break
                 time.sleep(.1)
         finally:
@@ -98,7 +100,7 @@ def check_iso(work):
                 proc.terminate()
             proc.wait(timeout=10)
         text = log.read_text(errors='replace')
-        assert 'Hello from HELLO.COM!' in text and 'PANIC' not in text, text
+        assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text
         assert 'Disk writes: volatile RAM overlay' in text, text
         print(f'PASS: published CD ISO {firmware}, protected default, RAM C:')
 
@@ -156,14 +158,14 @@ def main():
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
             assert {
                 'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
-                'RETROOS/DN/DN.COM', 'RETROOS/VC/VC.COM', 'RETROOS/MC/MC.EXE',
+                'DN/DN.COM', 'VC/VC.COM', 'MC/MC.EXE',
                 'RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL',
                 'RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL',
                 'RETROOS/WINDOWS/SYSTEM/KERNEL.DLL',
                 'RETROOS/OS2/DLL/DOSCALLS.DLL',
-                'CONFIG/CONFIG.SYS', 'CONFIG/VC/VC.INI', 'CONFIG/VC/VC.HLP',
-                'RETROOS/MC/MC.INI', 'RETROOS/MC/MC.MNU', 'RETROOS/MC/MC.HLP',
-                'CONFIG/MC/.mc/ini', 'CONFIG/MC/.mc/menu',
+                'RETROOS/RETROOS.INI', 'VC/VC.INI', 'VC/VC.HLP',
+                'MC/MC.INI', 'MC/MC.MNU', 'MC/MC.HLP',
+                'RC/RC.EXE', 'bin/busybox', 'bin/sh',
             } <= names
             assert not any(
                 name.endswith('.DLL') and name.startswith((
@@ -183,12 +185,6 @@ def main():
         spec.loader.exec_module(installer)
         home = work / 'croot'
         home.mkdir()
-        installer.migrate(home)
-        assert b'COMSPEC=C:\\RETROOS\\COMMAND.COM' in (home / 'CONFIG/CONFIG.SYS').read_bytes()
-        assert (home / 'CONFIG/DN/DN.MNU').is_file()
-        assert (home / 'CONFIG/VC/VC.INI').is_file()
-        assert (home / 'CONFIG/MC/.mc/ini').is_file()
-        assert (home / 'CONFIG/MC/.mc/menu').is_file()
         installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
         assert (vm / 'tools/run/unipcemu.sh').is_file()

@@ -22,7 +22,7 @@
 # verdict to a file on C: and this script reads it back out of the disk image
 # afterwards with mtools — no screen scraping, no root. Three things had to
 # be true for that to work at all, and none of them were until now: the probe
-# needs a command channel (CONFIG/CONFIG.SYS TEST=, since 86Box has no fw_cfg), the
+# needs a command channel (RETROOS.INI TEST=, since 86Box has no fw_cfg), the
 # guest's writes need to reach the image rather than the volatile RAM overlay,
 # and the VM has to power off so those writes are flushed.
 #
@@ -106,7 +106,7 @@ if [ "${1:-}" = "--learn" ]; then
     echo "sweep needs:"
     echo
     python3 test/private_data_disk.py bazel-bin/data_disk.bin "$IMG" || exit 1
-    ./run.sh 86box --data-image "$IMG" || true
+    ./run.sh 86box --data-image "$IMG" --cmd "$prog" || true
     echo
     echo "--- per-device sections found in $VM_DIR/86box.cfg ---"
     awk '/^\[/{p=0} /Sound Blaster|SB16|sb16/{p=1} p' "$VM_DIR/86box.cfg" 2>/dev/null
@@ -162,7 +162,7 @@ PROBE_TIMEOUT="${PROBE_TIMEOUT:-240}"
 
 # $1 = probe .COM path on C:, $2 = verdict filename, $3.. = required markers.
 #
-# The test injects CONFIG/CONFIG.SYS TEST= into its own disposable data disk. 86Box takes
+# The launcher sets RETROOS.INI TEST= on its disposable boot image. 86Box takes
 # no fw_cfg and no command line.
 #
 # We poll for the verdict file rather than wait for the process to exit,
@@ -174,8 +174,8 @@ run_probe() {
     local prog="$1" log="$2"; shift 2
     echo "=== $prog ==="
 
-    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$IMG" --command "$prog" || return 1
-    setsid ./run.sh 86box --data-image "$IMG" >/dev/null 2>&1 &
+    python3 test/private_data_disk.py bazel-bin/data_disk.bin "$IMG" || return 1
+    setsid ./run.sh 86box --data-image "$IMG" --cmd "$prog" >/dev/null 2>&1 &
     local pid=$! waited=0 verdict=""
     VM_PGID="$pid"
     while [ "$waited" -lt "$PROBE_TIMEOUT" ]; do

@@ -339,10 +339,25 @@ pub const EXTRA_DRIVES: [(u8, &[u8]); 7] = [
     (b'I', b"disk4/"), (b'J', b"disk5/"), (b'K', b"disk6/"), (b'L', b"disk7/"),
 ];
 
+static CONFIGURED_LAYOUT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static CONFIG_DRIVES: spin::Mutex<Vec<(u8, &'static [u8])>> = spin::Mutex::new(Vec::new());
+
+pub fn reset_configured_drives() { CONFIG_DRIVES.lock().clear(); CONFIGURED_LAYOUT.store(false, core::sync::atomic::Ordering::Relaxed); set_c_root(b""); }
+
+pub fn configure_drive(drive: u8, prefix: &'static [u8]) {
+    CONFIGURED_LAYOUT.store(true, core::sync::atomic::Ordering::Relaxed);
+    if drive == b'C' { set_c_root(prefix); return; }
+    CONFIG_DRIVES.lock().push((drive, prefix));
+}
+
 pub fn extra_drive_prefix(drive: u8) -> Option<&'static [u8]> {
+    let drive = drive.to_ascii_uppercase();
+    if let Some((_, prefix)) = CONFIG_DRIVES.lock().iter().find(|&&(d, _)| d == drive) {
+        return Some(*prefix);
+    }
+    if CONFIGURED_LAYOUT.load(core::sync::atomic::Ordering::Relaxed) { return None; }
     EXTRA_DRIVES.iter().find(|&&(letter, prefix)|
-        letter == drive.to_ascii_uppercase() && vfs::is_mounted(prefix))
-        .map(|&(_, prefix)| prefix)
+        letter == drive && vfs::is_mounted(prefix)).map(|&(_, prefix)| prefix)
 }
 
 pub fn drive_available(drive: u8, hostfs: bool) -> bool {
@@ -354,12 +369,13 @@ pub fn drive_available(drive: u8, hostfs: bool) -> bool {
 }
 
 pub fn last_drive(hostfs: bool) -> u8 {
-    (b'A'..=b'L').rev().find(|&drive| drive_available(drive, hostfs)).unwrap_or(b'D') - b'A' + 1
+    (b'A'..=b'Z').rev().find(|&drive| drive_available(drive, hostfs)).unwrap_or(b'D') - b'A' + 1
 }
 
 /// Return the drive and relative path for an additional mounted partition.
 fn extra_vfs_path(path: &[u8]) -> Option<(u8, &[u8])> {
-    EXTRA_DRIVES.iter().find_map(|&(drive, prefix)| {
+    let configured = CONFIG_DRIVES.lock();
+    configured.iter().chain(EXTRA_DRIVES.iter().filter(|_| !CONFIGURED_LAYOUT.load(core::sync::atomic::Ordering::Relaxed))).find_map(|&(drive, prefix)| {
         let root = &prefix[..prefix.len() - 1];
         if vfs::is_mounted(prefix) {
             if path == root { return Some((drive, &path[path.len()..])); }
