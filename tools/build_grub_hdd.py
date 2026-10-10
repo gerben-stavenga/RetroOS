@@ -101,10 +101,10 @@ def main():
         run(["cp", args.grub_cfg, os.path.join(root, "boot", "grub", "grub.cfg")])
 
         # Same rule as the legacy image: RetroOS writes a file only when it
-        # belongs to the C: root's group AND carries g+w.
+        # belongs to the C: root's owner UID AND carries u+w.
         retroos = os.path.join(root, "home", "retroos")
         if os.path.isdir(retroos):
-            run(["chmod", "-R", "g+w", retroos])
+            run(["chmod", "-R", "u+w", retroos])
 
         ext4 = os.path.join(tmp, "ext4.img")
         with open(ext4, "wb") as f:

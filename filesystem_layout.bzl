@@ -1,7 +1,8 @@
 """Filesystem layout: paths are relative to their destination volume.
 
-BOOT_FILES and LINUX_FILES are rebuilt with the kernel. DATA_FILES seed
-one writable data disk once; editing that mapping never updates a live disk.
+BOOT_FILES and LINUX_FILES are rebuilt with the kernel. DATA_FILES and
+SHOWCASE_FILES ship in the showcase archive and seed writable C: files;
+editing those mappings never updates a live disk automatically.
 RETROOS/ and bin/ are kernel/runtime contracts, not arbitrary mount names.
 """
 
@@ -86,13 +87,6 @@ DATA_FILES = {
     "//test/dos/trexec:trexec_com":       "TESTS/TREXEC.COM",
     "//test/dos/hello32_linux:hello32_linux": "TESTS/HI.ELF",
     "//test/dos/hello64_linux:hello64_linux": "TESTS/HI64.ELF",
-    # DOS and OS/2 share C:. The OS/2 personality changes the executable/API
-    # environment, not the filesystem namespace.
-    "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
-    "//test/os2/pm_smoke:pm_smoke":      "OS2/APPS/PMSMOKE.EXE",
-    "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
-    "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
-    "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
     # DPMI smoke-test fixture (compiled by BCC in test/dpmi_smoke.sh).
     "test/dpmi/hello.c":                    "TESTS/DPMIHI.C",
     # Japheth's HX DPMI conformance probe (freeware; see test/dpmi/HX-CREDITS.txt).
@@ -126,4 +120,15 @@ LINUX_FILES = {
     # Standalone-shell mode dispatches applets via basename(argv[0]); the
     # binary's compiled-in re-exec path is /bin/busybox, hence the location.
     "//:boot-bundle/bin/busybox":               "bin/busybox",
+}
+
+# Optional sample applications share C: with DOS and ship with the showcase.
+SHOWCASE_FILES = {
+    # DOS and OS/2 share C:. The OS/2 personality changes the executable/API
+    # environment, not the filesystem namespace.
+    "//test/os2/hello:hello_lx":         "OS2/APPS/HELLO.EXE",
+    "//test/os2/pm_smoke:pm_smoke":      "OS2/APPS/PMSMOKE.EXE",
+    "//test/os2/watcom_io:watcom_io":    "OS2/APPS/WATCIO.EXE",
+    "//test/windows/hello:hello":            "WINDOWS/APPS/HELLO.EXE",
+    "//test/windows/watcom_io:watcom_io":    "WINDOWS/APPS/WATCIO.EXE",
 }

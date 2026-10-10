@@ -17,6 +17,9 @@ def main():
         shutil.copy(ROOT / "run.sh", root)
         shutil.copytree(ROOT / "tools/run", root / "tools/run")
         shutil.copy(ROOT / "tools/configure_shared_86box.py", root / "tools")
+        # The fixture uses synthetic disks; emulate the UUID profile helper.
+        # Its real filesystem behavior is covered by boot_config.py.
+        (root / "tools/vm_mount_config.py").write_text("import sys\n")
         (root / "bazel-bin").mkdir()
         mock = root / "bazel"
         mock.write_text('''#!/usr/bin/env python3

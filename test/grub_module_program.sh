@@ -29,7 +29,7 @@ run_program() {
         -debugcon "file:$log" \
         -display none -no-reboot >/dev/null 2>&1 || true
 
-    grep -q 'Optional module: /showcase-bundle/ (256 MiB)' "$log"
+    grep -q 'Optional module: /showcase/ (256 MiB)' "$log"
     ! grep -q 'KERNEL PANIC' "$log"
 }
 

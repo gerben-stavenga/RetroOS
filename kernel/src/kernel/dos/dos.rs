@@ -2162,8 +2162,8 @@ fn int_21h<A: crate::Arch>(
                                 b"floppyb/" => 1,
                                 b"cdrom/" => 0x8000 | 3,
                                 b"host/" => 0x8000 | 7,
-                                _ => dfs::EXTRA_DRIVES.iter().find(|&&(_, root)| root == prefix)
-                                    .map_or(2, |&(letter, _)| u64::from(letter - b'A')),
+                                _ => (b'E'..=b'Z').find(|&letter| dfs::extra_drive_prefix(letter) == Some(prefix))
+                                    .map_or(2, |letter| u64::from(letter - b'A')),
                             });
                         regs.rdx = (regs.rdx & !0xFFFF) | 0x0040 | info;
                         DosExit::Ok

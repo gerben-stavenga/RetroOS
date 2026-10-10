@@ -267,3 +267,10 @@ directory does not yet exist. Existing C: directories skip copying by default.
 Use `--copy-showcase` or `--no-copy-showcase` for scripted preparation.
 Copying adds missing ordinary files and preserves existing files and symlink
 directories. These are disk files, with no showcase mount or RAM image.
+
+The machine release includes `showcase.tar` alongside `machine_boot.tar`.
+It supplies `ULTRASND` instrument patches, OS/2 and Windows samples under
+`OS2/APPS` and `WINDOWS/APPS`, and the `SRC` and `TESTS` folders. Compatibility
+DLLs live under `RETROOS/` and ship with the matching kernel. To add missing
+showcase files to an existing persistent C:, prepare with `--copy-showcase`
+and then install; existing files are preserved. No image extraction is needed.

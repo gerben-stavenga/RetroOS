@@ -88,8 +88,6 @@ def run(*args, **kwargs):
 
 
 def main():
-    if not os.access('/dev/kvm', os.R_OK | os.W_OK):
-        raise SystemExit('This native regression requires KVM')
     subprocess.run(['bazelisk', 'build', '//:boot_disk'], cwd=ROOT, check=True)
     boot_source = (ROOT / 'bazel-bin/boot_disk.bin').resolve()
     with tempfile.TemporaryDirectory(prefix='retroos-file-mount-') as directory:
@@ -162,7 +160,7 @@ access=ro
             run('mcopy', '-o', '-i', str(boot)+'@@1048576', config, '::RETROOS/RETROOS.INI')
             run('mcopy', '-o', '-i', str(boot)+'@@1048576', boot_ini, '::RETROOS/BOOT.INI')
             log = case/'klog'
-            argv = ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-m', '256',
+            argv = ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', '256',
                     '-display', 'none', '-serial', 'none', '-audiodev', 'none,id=snd0',
                     '-drive', f'file={boot},format=raw,snapshot=on',
                     '-drive', f'file={outer},format=raw',

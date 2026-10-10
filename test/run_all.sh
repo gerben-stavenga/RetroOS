@@ -211,7 +211,7 @@ run linux_runtime_kvm kvm python3 test/linux_runtime.py
 run locales_kvm kvm python3 test/locales.py
 run keyboards_kvm kvm python3 test/keyboards.py
 run rat_commander_kvm kvm python3 test/rat_commander.py
-run rat_commander_ext4 rat_ext4 python3 test/rat_commander_ext4.py
+run rat_commander_ext4 storage_selection python3 test/rat_commander_ext4.py
 run windows_threads_kvm kvm env ENGINE=kvm python3 test/windows_threads.py
 run dpmi_rm_exception_kvm kvm env ENGINE=kvm python3 test/dpmi_rm_exception.py
 # --- KVM differential: needs /dev/kvm --------------------------------------

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check automatic C: selection and writes on the actual selected data volume."""
+"""Explicit C: UUID/home selection writes only to the configured data volume."""
 import pathlib
 import subprocess
 import tempfile
@@ -75,6 +75,7 @@ def main():
         ]
         for label, layouts, selected, home in cases:
             disks = []
+            identifiers = []
             for i, (kind, directories, *size) in enumerate(layouts):
                 tree = work / f'{label}-{i}-tree'
                 tree.mkdir()
@@ -82,14 +83,17 @@ def main():
                     (tree / directory).mkdir(parents=True, exist_ok=True)
                 volume = image(work, f'{label}-{i}', tree, 'fat' if kind.startswith('esp') else kind,
                                size_mb=size[0] if size else 32)
+                identifiers.append(subprocess.check_output(['blkid', '-p', '-s', 'UUID', '-o', 'value', str(volume)]).decode().strip())
                 if kind.startswith('esp'):
                     table, typ = ('dos', 'ef') if kind == 'esp-mbr' else ('gpt', 'U')
                     volume = partition_image(work, f'{label}-{i}', volume, table, typ)
                 disks.append(volume)
-            text = boot(work, label, module, disks)
-            assert 'DOS C: maps to /home/retroos/' in text, text
-            if label.startswith('linux-root'):
-                assert 'Mounting ext4 root' in text and 'Multiboot ext4' not in text, text
+            directory = '/' + home.rstrip('/')
+            config = (f'[bundle]\nsource=module\nsubdir=/home/retroos\n'
+                      f'[mount "data"]\nsource=UUID={identifiers[selected]}\n'
+                      f'subdir={directory}\npath=/home/retroos\ndrive=C\naccess=rw\ngrant={directory}\n')
+            text = boot(work, label, module, disks, config=config)
+            assert 'Mount: data -> /home/retroos (rw)' in text, text
             for i, (kind, *_) in enumerate(layouts):
                 path = '/' + (home if i == selected else '') + 'SELECT.OK'
                 if kind == 'fat' or kind.startswith('esp'):
@@ -98,7 +102,7 @@ def main():
                 else:
                     result = run('debugfs', '-R', 'cat ' + path, disks[i], capture_output=True)
                 assert (result.stdout == b'S') == (i == selected), (label, i, result.stdout, result.stderr)
-        print('PASS: C: selection writes reach the chosen physical FAT/ext4 volume')
+        print('PASS: explicit C: UUID/home selection writes reach the chosen physical FAT/ext4 volume')
 
 
 if __name__ == '__main__':

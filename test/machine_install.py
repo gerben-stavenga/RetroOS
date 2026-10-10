@@ -20,6 +20,7 @@ class ShowcaseTests(unittest.TestCase):
             (source / 'GAMES/OWN').mkdir(parents=True)
             (source / 'GAMES/OWN/CFG').write_text('default')
             (source / 'GAMES/OWN/NEW').write_text('new')
+            (source / 'GAMES/OWN/NEW').chmod(0o444)
             (source / 'GAMES/LINK').mkdir()
             (source / 'GAMES/LINK/NEW').write_text('do not write through')
             target = root / 'C'
@@ -32,6 +33,7 @@ class ShowcaseTests(unittest.TestCase):
             self.assertEqual((target / 'GAMES/OWN/CFG').read_text(), 'user settings')
             self.assertEqual((target / 'GAMES/OWN/NEW').read_text(), 'new')
             self.assertFalse((other / 'NEW').exists())
+            self.assertEqual((target / 'GAMES/OWN/NEW').stat().st_mode & 0o777, 0o644)
             self.assertEqual(installer.copy_showcase_tree(source, target), 0)
 
     def test_prepare_stages_optional_files_outside_runtime(self):

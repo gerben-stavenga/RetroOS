@@ -2,7 +2,6 @@
 """Stage and install a matched RetroOS GRUB module boot on an existing Linux system."""
 
 import argparse
-import grp
 import hashlib
 import json
 import os
@@ -178,14 +177,10 @@ def create_c_home(home):
         if not home.is_dir():
             raise ValueError(f"C: home is not a directory: {home}")
         return
-    try:
-        group = grp.getgrnam("retroos")
-    except KeyError:
-        subprocess.run(["groupadd", "--system", "retroos"], check=True)
-        group = grp.getgrnam("retroos")
     home.mkdir(parents=True)
-    os.chown(home, int(os.environ.get("SUDO_UID", "0")), group.gr_gid)
-    home.chmod(0o2775)
+    os.chown(home, int(os.environ.get("SUDO_UID", str(os.getuid()))),
+             int(os.environ.get("SUDO_GID", str(os.getgid()))))
+    home.chmod(0o755)
 
 
 def ensure_c_home(volume, c_dir="/home/retroos"):

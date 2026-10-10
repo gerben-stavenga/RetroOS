@@ -23,11 +23,10 @@ def main():
         work = Path(directory)
         root = work / "root"
         runtime = root / "boot/retroos"
-        for name in ("RETROOS", "RC"):
-            (runtime / name).mkdir(parents=True)
-        (root / "home/retroos").mkdir(parents=True)
+        (runtime / "RETROOS").mkdir(parents=True)
+        (root / "home/retroos/RC").mkdir(parents=True)
         (root / "dev").mkdir()
-        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/RC/RC.EXE", runtime / "RC/RC.EXE")
+        shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/RC/RC.EXE", root / "home/retroos/RC/RC.EXE")
         (runtime / "RETROOS/BOOT.INI").write_text(
             f'[bundle]\nsource=UUID={UUID}\nsubdir=/boot/retroos\n[mount "linux"]\nsource=UUID={UUID}\npath=/\naccess=ram\n'
             f'[mount "dos"]\nsource=UUID={UUID}\nsubdir=/home/retroos\n'
@@ -59,7 +58,7 @@ def main():
         log = work / "guest.log"
         qmp = work / "qmp.sock"
         process = subprocess.Popen([
-            "qemu-system-x86_64", "-accel", "kvm", "-cpu", "host", "-m", "512",
+            "qemu-system-x86_64", "-accel", "tcg", "-cpu", "max", "-m", "512",
             "-cdrom", str(iso), "-boot", "order=d",
             "-drive", f"file={image},format=raw", "-display", "none", "-serial", "none",
             "-debugcon", f"file:{log}", "-no-reboot",
@@ -112,7 +111,7 @@ def main():
             if process.poll() is None:
                 process.terminate()
             process.wait(timeout=5)
-    print("PASS: Rat Commander starts and quits with an ext4 /dev/tty device inode (KVM)")
+    print("PASS: Rat Commander starts and quits with an ext4 /dev/tty device inode (TCG)")
 
 
 if __name__ == "__main__":

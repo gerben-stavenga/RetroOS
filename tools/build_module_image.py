@@ -22,11 +22,11 @@ def main():
         os.mkdir(root)
         run(["tar", "xf", args.contents, "-C", root])
         if args.writable_root:
-            run(["chmod", "-R", "g+w", root])
+            run(["chmod", "-R", "u+w", root])
         else:
             retroos = os.path.join(root, "home", "retroos")
             if os.path.isdir(retroos):
-                run(["chmod", "-R", "g+w", retroos])
+                run(["chmod", "-R", "u+w", retroos])
         run(["truncate", "-s", f"{args.size_mb}M", args.out])
         mkfs = ["mkfs.ext4", "-q", "-F", "-b", "4096", "-L", "RetroOS"]
         if args.writable_root:

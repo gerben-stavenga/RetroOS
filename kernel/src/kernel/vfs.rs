@@ -641,8 +641,19 @@ impl Vfs {
         let WriteAccess::Granted(grant) = self.mounts[midx as usize].access else { return };
         let fs = self.mount_fs(midx);
         if let Some(m) = fs.meta(subpath) {
-            fs.set_meta(subpath, m.uid, grant.gid(), grant.claim_mode(m.mode));
+            fs.set_meta(subpath, grant.uid(), m.gid, grant.claim_mode(m.mode));
         }
+    }
+
+    fn mount_prefix_by_handle(&self, handle: i32) -> Option<&'static [u8]> {
+        let entry = self.file_table.get(usize::try_from(handle).ok()?)?;
+        if entry.refcount == 0 { return None; }
+        // Handles retain the public path even when a bind resolves onto a
+        // hidden mountfs server. DOS drive identity follows that public view.
+        self.mounts.iter()
+            .filter(|mount| mount.listed && match_prefix(mount.prefix, &entry.path).is_some())
+            .max_by_key(|mount| mount.prefix.len())
+            .map(|mount| mount.prefix)
     }
 
     fn mount_fs(&self, idx: u8) -> &'static dyn Filesystem {
@@ -1646,7 +1657,7 @@ pub(crate) fn mount_readonly(prefix: &'static [u8], fs: &'static dyn Filesystem)
     }
 }
 
-/// Mount `fs` and give it a write grant derived from the group owning `home`
+/// Mount `fs` and give it a write grant derived from the user owning `home`
 /// (a path within the new mount). Failure to derive the grant makes this
 /// mount read-only. Filesystems without ownership use a delegated mount.
 pub fn mount_writable(prefix: &'static [u8], fs: &'static dyn Filesystem, home: &[u8]) {
@@ -1654,7 +1665,7 @@ pub fn mount_writable(prefix: &'static [u8], fs: &'static dyn Filesystem, home: 
     v.mount(prefix, fs);
     let access = match crate::kernel::fs::grant::Grant::from_home(fs, home) {
         Some(g) => WriteAccess::Granted(g),
-        // Unreadable identity ⇒ no grant at all, rather than a guessed gid.
+        // Unreadable identity ⇒ no grant at all, rather than a guessed uid.
         None => WriteAccess::None,
     };
     if let Some(b) = v.mounts.iter_mut().find(|b| b.prefix == prefix) {
@@ -1768,7 +1779,7 @@ pub fn path_mode(path: &[u8]) -> Option<(u32, bool)> { VFS.lock().path_mode(path
 pub fn set_path_mode(path: &[u8], mode: u32) -> i32 { VFS.lock().set_path_mode(path, mode) }
 
 /// DOS attributes are session metadata until backends offer a setter. They
-/// never rewrite Unix group/mode permissions (the independent write grant).
+/// never rewrite Unix owner/mode permissions (the independent write grant).
 pub fn dos_attributes(path: &[u8]) -> Option<u8> {
     let mut v = VFS.lock();
     let path = v.resolve_symlinks(path, true)?;
@@ -2096,13 +2107,6 @@ unsafe impl Sync for BackingFile {}
 /// run under the lock already.
 pub struct FsSerial(#[allow(dead_code)] spin::MutexGuard<'static, Vfs>);
 
-/// Reset a failed boot composition before any guest owns VFS handles.
-pub(crate) fn reset_boot_mounts() {
-    let mut vfs = VFS.lock();
-    assert!(vfs.file_table.iter().all(|entry| entry.refcount == 0));
-    *vfs = Vfs::new();
-}
-
 pub fn serialize_fs() -> FsSerial {
     FsSerial(VFS.lock())
 }
@@ -2151,19 +2155,14 @@ pub fn open_backing(path: &[u8]) -> Option<BackingFile> {
     Some(BackingFile { writable, fs, handle: vnode.handle, size: vnode.size })
 }
 
-/// Mount prefix of the filesystem behind an open fd — `b"cdrom/"` for the CD
+/// Public mount prefix used to open an fd — `b"cdrom/"` for the CD
 /// slot, `b"floppya/"`/`b"floppyb/"` for the floppy slots, `b""` for the root
 /// mount. The DOS layer maps this to the drive number IOCTL 4400h reports;
 /// installers verify a just-opened file really lives on the drive they are
 /// probing (Tomb Raider's CD check).
 pub fn mount_prefix(fd: i32, fds: &[FdKind; MAX_FDS]) -> Option<&'static [u8]> {
     let handle = vfs_handle(fds, fd).ok()?;
-    let vfs = VFS.lock();
-    let entry = vfs.file_table.get(handle as usize)?;
-    if entry.refcount == 0 {
-        return None;
-    }
-    Some(vfs.mounts.get(entry.mount_idx as usize)?.prefix)
+    VFS.lock().mount_prefix_by_handle(handle)
 }
 
 /// Stable inode for an open handle — fstat's st_ino (dynamic-linker dedup).
@@ -2247,6 +2246,78 @@ mod tests {
         let handle = vfs.create_to_handle(b"HOME/RETROOS/ALLOWED.TXT");
         assert!(handle >= 0);
         vfs.close_handle(handle);
+    }
+
+    #[test]
+    fn file_mount_prefix_uses_public_bind_instead_of_hidden_server() {
+        use crate::kernel::fs::fat::{FatFs, VolumeIo, tests::formatted};
+        let (_, volume) = formatted(fatfs::FatType::Fat12, 2880);
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(
+            FatFs::new(VolumeIo::new(volume, true)).unwrap()));
+        let node = fs.create(b"FILE.TXT").unwrap();
+        fs.clunk(node.handle);
+        let mut vfs = Vfs::new();
+        vfs.mount(b"mountfs/0/", fs);
+        vfs.mounts[0].listed = false;
+        vfs.bind(b"disk1/", b"mountfs/0/", super::MountMode::Replace);
+        let handle = vfs.open_to_handle(b"disk1/FILE.TXT");
+        assert!(handle >= 0);
+        assert_eq!(vfs.file_table[handle as usize].mount_idx, 0);
+        assert_eq!(vfs.mount_prefix_by_handle(handle), Some(b"disk1/".as_slice()));
+        vfs.close_handle(handle);
+        assert_eq!(vfs.mount_prefix_by_handle(handle), None);
+    }
+
+    struct OwnedFs {
+        file: spin::Mutex<super::Meta>,
+    }
+
+    impl Filesystem for OwnedFs {
+        fn open(&self, _path: &[u8]) -> Option<Vnode> { None }
+        fn read(&self, _handle: u64, _offset: u32, _buf: &mut [u8], _size: u32) -> i32 { -5 }
+        fn readdir(&self, _dir: &[u8], _cookie: u64, _out: &mut Vec<DirEntry>, _max: usize) -> Option<u64> { None }
+        fn dir_exists(&self, path: &[u8]) -> bool { path == b"home" }
+        fn meta(&self, path: &[u8]) -> Option<super::Meta> {
+            match path {
+                b"home" => Some(super::Meta { uid: 1000, gid: 1001, mode: 0o755 }),
+                b"home/file" => Some(*self.file.lock()),
+                _ => None,
+            }
+        }
+        fn set_meta(&self, path: &[u8], uid: u32, gid: u32, mode: u32) -> bool {
+            if path != b"home/file" { return false; }
+            *self.file.lock() = super::Meta { uid, gid, mode };
+            true
+        }
+    }
+
+    #[test]
+    fn ext4_grant_uses_home_uid_and_owner_write_and_claims_new_files() {
+        use crate::kernel::fs::grant::Grant;
+        let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(OwnedFs {
+            file: spin::Mutex::new(super::Meta { uid: 1000, gid: 999, mode: 0o644 }),
+        }));
+        let grant = Grant::from_home(fs, b"home/").unwrap();
+        assert!(Grant::from_home(fs, b"missing").is_none());
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", fs);
+        vfs.mounts[0].access = WriteAccess::Granted(grant);
+        // Ordinary Linux copies work even with a different group.
+        assert!(vfs.may_write(0, b"home/file"));
+        assert!(vfs.may_write_parent(0, b"home/new"));
+        assert!(!vfs.may_write(0, b"missing"));
+        // A matching group or world-write does not grant another owner access.
+        *fs.file.lock() = super::Meta { uid: 2000, gid: 1001, mode: 0o666 };
+        assert!(!vfs.may_write(0, b"home/file"));
+        *fs.file.lock() = super::Meta { uid: 1000, gid: 1001, mode: 0o464 };
+        assert!(!vfs.may_write(0, b"home/file"));
+        // Drivers may create files with a default UID. Claiming them stamps
+        // the home UID, preserves their group, and makes them reopenable.
+        *fs.file.lock() = super::Meta { uid: 0, gid: 999, mode: 0o444 };
+        vfs.claim(0, b"home/file");
+        let meta = fs.meta(b"home/file").unwrap();
+        assert_eq!((meta.uid, meta.gid, meta.mode), (1000, 999, 0o644));
+        assert!(vfs.may_write(0, b"home/file"));
     }
 
     struct FailingCreateFs;

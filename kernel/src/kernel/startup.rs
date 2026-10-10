@@ -633,8 +633,9 @@ fn mount_filesystems(
 /// A persistent C: file keeps its original backing; USB uses an editable RAM copy.
 fn expose_user_config(bytes: &[u8], disk_settings: bool) {
     let path = [crate::kernel::dos::c_root(), b"RETROOS/RETROOS.INI"].concat();
-    if disk_settings {
-        if let Some(file) = vfs::open_backing(&path) { file.close(); return; }
+    if disk_settings && let Some(file) = vfs::open_backing(&path) {
+        file.close();
+        return;
     }
     let fs = alloc::boxed::Box::leak(crate::kernel::fs::session::new());
     let node = fs.create(b"RETROOS.INI").expect("user configuration file");

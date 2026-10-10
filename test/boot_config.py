@@ -34,7 +34,7 @@ def boot(args, log, stderr):
 
 
 def qemu(log):
-    return ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-m', '384',
+    return ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', '384',
             '-display', 'none', '-serial', 'none', '-debugcon', f'file:{log}',
             '-audiodev', 'none,id=snd0', '-no-reboot']
 
@@ -116,7 +116,7 @@ menuentry test {
         ident = volumes(data)[0][1]
         custom = generated
         custom += (f'[mount "rc"]\nsource=UUID={ident}\nsubdir=/CUSTOMRC\n'
-                   'path=/home/retroos/RC\naccess=rw\n')
+                   'path=/home/retroos/COMMANDER/RC\naccess=rw\n')
         config.write_text(custom)
         subprocess.run(['mcopy', '-o', '-i', str(disk)+'@@1048576', str(config),
                         '::RETROOS/BOOT.INI'], check=True)
@@ -128,7 +128,7 @@ menuentry test {
                                 '-drive', f'file={data},format=raw,snapshot=on',
                                 '-device', f'VGA,romfile={ROOT}/third_party/vgabios/vgabios-stdvga.bin'],
                     log, work/'custom-app.stderr')
-        assert 'Mount: rc -> /home/retroos/RC (rw)' in text, text
+        assert 'Mount: rc -> /home/retroos/COMMANDER/RC (rw)' in text, text
         print('PASS: /bin/rc follows an explicit persistent application mount', flush=True)
 
 

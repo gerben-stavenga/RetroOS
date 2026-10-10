@@ -24,7 +24,7 @@ def image(work, name, tree, kind, esp=False, size_mb=32, serial=None):
         f.truncate(size_mb * 1024 * 1024)
     if kind == 'ext4':
         for entry in [tree, *tree.rglob('*')]:
-            entry.chmod(0o775 if entry.is_dir() else 0o664)
+            entry.chmod(0o755 if entry.is_dir() else 0o644)
         run('mkfs.ext4', '-q', '-F', '-b', '4096', '-d', tree, path)
     else:
         run('mkfs.fat', '-F', '16', *(['-i', serial] if serial else []), path,
@@ -50,7 +50,7 @@ def partition_image(work, name, volume, table, partition_type):
     return disk
 
 
-def boot(work, name, module, disks, protected=False, extra_args=""):
+def boot(work, name, module, disks, protected=False, extra_args="", config=None):
     tree = work / name
     grub = tree / 'boot/grub'
     grub.mkdir(parents=True)
@@ -60,6 +60,11 @@ def boot(work, name, module, disks, protected=False, extra_args=""):
     if module:
         shutil.copyfile(module, tree / 'boot/root.img')
         cmd.append('module2 /boot/root.img retroos.mount=/')
+    if config is None:
+        config = ('[bundle]\nsource=module\nsubdir=/home/retroos\n'
+                  '[mount "session"]\nsource=bundle\npath=/home/retroos\ndrive=C\naccess=ram\n')
+    (tree / 'boot/BOOT.INI').write_text(config)
+    cmd.append('module2 /boot/BOOT.INI retroos.config=boot')
     cmd += ['boot', '}']
     (grub / 'grub.cfg').write_text('\n'.join(cmd) + '\n')
     iso = work / (name + '.iso')

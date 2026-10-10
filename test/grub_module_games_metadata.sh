@@ -10,7 +10,10 @@ tmp_dir=$(mktemp -d)
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/root/DOOMS"
 printf '%s\n' 'synthetic game payload' > "$tmp_dir/root/DOOMS/README.TXT"
+chmod 444 "$tmp_dir/root/DOOMS/README.TXT"
+chmod 555 "$tmp_dir/root/DOOMS"
 tar -cf "$tmp_dir/games.tar" -C "$tmp_dir/root" .
+chmod u+w "$tmp_dir/root/DOOMS"
 python3 tools/build_module_image.py \
     --contents "$tmp_dir/games.tar" \
     --size-mb 1 \
@@ -25,21 +28,34 @@ for image in "$base" "$games"; do
 done
 
 stat_field() {
-    local path=$1 field=$2
-    debugfs -R "stat $path" "$games" 2>/dev/null \
+    local path=$1 field=$2 image=${3:-$games}
+    debugfs -R "stat $path" "$image" 2>/dev/null \
         | awk -v field="$field:" '{ for (i = 1; i <= NF; i++) if ($i == field) { print $(i + 1); exit } }'
 }
 
-root_gid=$(stat_field / Group)
-game_gid=$(stat_field /DOOMS Group)
+root_uid=$(stat_field / User)
+game_uid=$(stat_field /DOOMS User)
 game_mode=$(stat_field /DOOMS Mode)
-if [[ -z "$root_gid" || "$root_gid" != "$game_gid" ]]; then
-    echo "FAIL: games root GID ($root_gid) differs from game directory GID ($game_gid)" >&2
+if [[ -z "$root_uid" || "$root_uid" != "$game_uid" ]]; then
+    echo "FAIL: games root UID ($root_uid) differs from game directory UID ($game_uid)" >&2
     exit 1
 fi
 mode_value=$((8#$game_mode))
-if (( (mode_value & 16) == 0 )); then
-    echo "FAIL: game directory is not group-writable (mode $game_mode)" >&2
+if (( (mode_value & 128) == 0 )); then
+    echo "FAIL: game directory is not owner-writable (mode $game_mode)" >&2
+    exit 1
+fi
+
+file_mode=$(stat_field /DOOMS/README.TXT Mode)
+[[ "$file_mode" == "0644" ]]
+[[ "$game_mode" == "0755" ]]
+# The flat core module must use the same owner-write policy as the showcase.
+base_uid=$(stat_field / User "$base")
+core_uid=$(stat_field /RETROOS/COMMAND.COM User "$base")
+core_mode=$(stat_field /RETROOS/COMMAND.COM Mode "$base")
+[[ -n "$base_uid" && "$base_uid" == "$core_uid" ]]
+if (( (8#$core_mode & 128) == 0 )); then
+    echo "FAIL: base runtime is not owner-writable (mode $core_mode)" >&2
     exit 1
 fi
 

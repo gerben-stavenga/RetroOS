@@ -663,6 +663,26 @@ pub fn apply(
         vfs::bind(Box::leak([c, b"RETROOS/RETROOS.INI"].concat().into_boxed_slice()), source);
         if !c.is_empty() { vfs::bind(b"RETROOS/RETROOS.INI", source); }
     }
+    // /bin/rc points at /COMMANDER/RC/RC.EXE. A persistent C: owns that
+    // application tree; expose its Unix spelling only when it exists.
+    let commanders = [c, b"COMMANDER/"].concat();
+    if external_c && !c.is_empty()
+        && (vfs::dir_exists(&commanders)
+            || config.mounts.iter().any(|m| prefix_bytes(&m.path).starts_with(&commanders)))
+        && !config.mounts.iter().any(|m| m.path == "/COMMANDER")
+    {
+        vfs::bind(b"COMMANDER/", Box::leak(commanders.into_boxed_slice()));
+        // Mirror explicit child mounts so their virtual ancestors are also
+        // enumerable through the Unix alias.
+        for mount in &config.mounts {
+            let target = prefix_bytes(&mount.path);
+            if let Some(relative) = target.strip_prefix(c)
+                && relative.starts_with(b"COMMANDER/")
+            {
+                vfs::bind(Box::leak(relative.to_vec().into_boxed_slice()), Box::leak(target.into_boxed_slice()));
+            }
+        }
+    }
     let external_root = config.mounts.iter().any(|m| m.path == "/" && m.source != "bundle");
     let explicit_bin = config.mounts.iter().find(|m| m.path == "/bin");
     let bin = [bundle_home, b"bin"].concat();

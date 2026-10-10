@@ -316,10 +316,15 @@ What it can and cannot reach:
   in the ext4 write path could therefore leave Linux unbootable until you fsck
   it from a live USB. Recoverable, not catastrophic, but plan for it.
 
-A second gate limits ordinary ext4 file writes: a file is writable only if its group
-matches the `C:`-root's group **and** it is group-writable (`chgrp retroos` +
-`chmod g+w`). FAT has no such ownership gate. That bounds deliberate ext4
+A second gate limits ordinary ext4 file writes: a file is writable only if its owner UID
+matches the `C:`-root's owner **and** it is owner-writable (`chown <C:-owner>` +
+`chmod u+w`). FAT has no such ownership gate. That bounds deliberate ext4
 writes; it does not bound a metadata bug.
+
+No host `retroos` account is required. New C: directories belong to the installing
+user; their numeric owner UID supplies the grant. Ordinary owner-writable copies
+work without changing their group. Files from older images that have only the
+group-write bit need `chmod u+w` before they can be written with this policy.
 
 ### Status
 
@@ -478,3 +483,10 @@ directory does not yet exist. Existing C: directories skip copying by default.
 Use `--copy-showcase` or `--no-copy-showcase` for scripted preparation.
 Copying adds missing ordinary files and preserves existing files and symlink
 directories. These are disk files, with no showcase mount or RAM image.
+
+The machine release includes `showcase.tar` alongside `machine_boot.tar`.
+It supplies `ULTRASND` instrument patches, OS/2 and Windows samples under
+`OS2/APPS` and `WINDOWS/APPS`, and the `SRC` and `TESTS` folders. Compatibility
+DLLs live under `RETROOS/` and ship with the matching kernel. To add missing
+showcase files to an existing persistent C:, prepare with `--copy-showcase`
+and then install; existing files are preserved. No image extraction is needed.

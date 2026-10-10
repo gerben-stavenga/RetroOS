@@ -2,6 +2,7 @@
 """Real DOS drive/CDS enumeration, per-drive cwd and read-only spare partitions."""
 import hashlib
 import pathlib
+import subprocess
 import tempfile
 from boot_composition import run, file, image, boot
 
@@ -145,12 +146,14 @@ def main():
         (tree / 'bin').mkdir()
         module = image(work, 'module', tree, 'ext4')
         volumes = []
+        identifiers = []
         for letter in 'CEFGI':
             tree = work / letter
             file(tree, 'DIR/TEST.TXT', letter.encode())
             if letter == 'C':
                 (tree / 'CONFIG').mkdir()
             volumes.append(image(work, letter, tree, 'fat'))
+            identifiers.append(subprocess.check_output(['blkid', '-p', '-s', 'UUID', '-o', 'value', str(volumes[-1])]).decode().strip())
         disk = work / 'partitions.img'
         sectors = volumes[0].stat().st_size // 512
         with disk.open('wb') as out:
@@ -164,9 +167,14 @@ def main():
                 out.seek((2048 + i * sectors) * 512)
                 out.write(volume.read_bytes())
         before = hashlib.sha256(disk.read_bytes()).digest()
-        text = boot(work, 'extra-partition-drives', module, [disk])
-        for letter, number in zip('EFGI', range(1, 5)):
-            assert f'DOS {letter}: → /disk{number}' in text, text
+        config = '[bundle]\nsource=module\nsubdir=/home/retroos\n'
+        for index, (letter, ident) in enumerate(zip('CEFGI', identifiers)):
+            path = '/home/retroos' if letter == 'C' else f'/disk{index}'
+            config += (f'[mount "volume{index}"]\nsource=UUID={ident}\npath={path}\n'
+                       f'drive={letter}\naccess=ro\n')
+        text = boot(work, 'extra-partition-drives', module, [disk], config=config)
+        for number in range(1, 5):
+            assert f'Mount: volume{number} -> /disk{number} (ro)' in text, text
         assert hashlib.sha256(disk.read_bytes()).digest() == before
         print('PASS: E/F/G/I CDS, selection, per-drive cwd, read/find, handle drive, read-only; H reserved')
 

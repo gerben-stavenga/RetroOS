@@ -1,4 +1,4 @@
-load(":filesystem_layout.bzl", "BOOT_FILES", "DATA_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
+load(":filesystem_layout.bzl", "BOOT_FILES", "DATA_FILES", "SHOWCASE_FILES", "LINUX_FILES", "BOOT_SIZE_MB", "DOS_SIZE_MB", "LINUX_SIZE_MB")
 load("@rules_pkg//pkg:tar.bzl", "pkg_tar")
 load("@rules_pkg//pkg:mappings.bzl", "pkg_mklink")
 
@@ -131,10 +131,9 @@ _BOOT_FILES = {
 _BOOT_FILES_MIN = dict(_BOOT_FILES)
 
 # Extras (live on ext4 in the boot+ext4 image, or alongside boot files in the
-# monolithic open-source image). Linux-personality binaries, test programs,
-# and busybox.
-_EXTRA_FILES = dict(DATA_FILES)
-_EXTRA_FILES.update(LINUX_FILES)
+# monolithic open-source image). Linux userland and matched runtime files;
+# sample programs and sources arrive through the showcase dependency.
+_EXTRA_FILES = dict(LINUX_FILES)
 _EXTRA_FILES.update(_BOOT_DIR_FILES)
 
 # Minimum extras needed for the stub-build image (//tools/dosrt:stub_exe
@@ -231,10 +230,11 @@ pkg_tar(
     deps = [":bin_tar", ":root_module_dos_tar"],
 )
 
-# Everything below showcase-bundle/ has exactly its C: path. Adding a directory
-# requires no app list, path remapping, or separate image target.
+# Static files below showcase-bundle/ keep their C: paths. Generated samples,
+# diagnostic programs and sources join them through the data manifests.
 pkg_tar(
     name = "showcase_module_tar",
+    files = DATA_FILES | SHOWCASE_FILES,
     srcs = glob(["showcase-bundle/**/*"]),
     strip_prefix = "showcase-bundle",
     modes = {"COMMANDER/RC/RC.EXE": "0755"},
@@ -317,16 +317,12 @@ _DISK_CMD = """
     EXTRACT_DIR=$$(mktemp -d)
     tar xf $(EXTRAS_TAR) -C "$$EXTRACT_DIR"
 
-    # RetroOS writes a file only when it belongs to RetroOS's group (the gid of
-    # its own C: root) AND carries the group-write bit -- ordinary Unix
-    # permissions, checked against the ext4 inode. The
-    # tar arrives 0555/0755, so without this the image would be honestly
-    # read-only and every savegame would fail with "access denied". Extraction
-    # as the build user already gives the whole tree one consistent gid, which
-    # IS the retroos group by definition.
-    # (image_min carries no home/retroos -- only RETROOS.INI -- so guard it.)
+    # ext4 writes require the C: root's owner UID and the owner-write bit.
+    # Extraction gives the tree one owner; restore owner-write on the
+    # read-only files from the package so saves and ordinary copies work.
+    # image_min carries no home/retroos, so guard it.
     if [ -d "$$EXTRACT_DIR/home/retroos" ]; then
-        chmod -R g+w "$$EXTRACT_DIR/home/retroos"
+        chmod -R u+w "$$EXTRACT_DIR/home/retroos"
     fi
     truncate -s $$(( EXT4_SECTORS * 512 )) "$$EXT4_IMG"
     mkfs.ext4 -q -b 4096 -L "RetroOS" -d "$$EXTRACT_DIR" "$$EXT4_IMG"
@@ -469,7 +465,7 @@ genrule(
     srcs = [":root_module_base_tar", "tools/build_module_image.py"],
     outs = ["retroos-base.img"],
     cmd = "python3 $(location tools/build_module_image.py)" +
-          " --contents $(location :root_module_base_tar) --size-mb 16 --out $@",
+          " --contents $(location :root_module_base_tar) --size-mb 16 --writable-root --out $@",
     visibility = ["//visibility:public"],
 )
 
@@ -694,16 +690,11 @@ pkg_tar(
     deps = [":apps_boot_tar", ":bin_tar"],
 )
 
-# The data manifest declares lifetime explicitly, including any writable
-# configuration under RETROOS/.
-_C_DRIVE_FILES = dict(DATA_FILES)
-
 # Flat at the volume root -- a FAT volume IS C:, so there is no home/retroos
 # prefix to apply here (contrast dos_extras_tar, which prefixes for ext4).
 pkg_tar(
     name = "c_drive_tar",
     empty_dirs = ["TEMP"],
-    files = _C_DRIVE_FILES,
     deps = [
         ":showcase_module_tar",
     ],
@@ -711,12 +702,9 @@ pkg_tar(
 
 # Same, plus the proprietary drop. Its own RETROOS.INI wins, so ours is dropped
 # rather than shadowed (see dos_extras_tar_proprietary).
-_C_DRIVE_FILES_PROPRIETARY = dict(_C_DRIVE_FILES)
-
 pkg_tar(
     name = "c_drive_tar_proprietary",
     empty_dirs = ["TEMP"],
-    files = _C_DRIVE_FILES_PROPRIETARY,
     deps = [
         ":showcase_module_tar",
         "//apps-proprietary:tar",

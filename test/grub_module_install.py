@@ -61,6 +61,18 @@ class GrubModuleInstallTest(unittest.TestCase):
         self.assertEqual(create.call_args.args[0], Path(temporary) / "home/retroos")
         self.assertEqual(run.call_args_list[1].args[0], ["umount", temporary])
 
+    def test_new_home_uses_installing_users_uid_and_gid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory) / "retroos"
+            with patch.dict(installer.os.environ, {"SUDO_UID": "1000", "SUDO_GID": "1001"}), \
+                 patch.object(installer.os, "chown") as chown:
+                installer.create_c_home(home)
+            chown.assert_called_once_with(home, 1000, 1001)
+            self.assertEqual(home.stat().st_mode & 0o7777, 0o755)
+            with patch.object(installer.os, "chown") as chown:
+                installer.create_c_home(home)
+            chown.assert_not_called()
+
     def test_custom_ext4_c_directory_is_passed_to_grub(self):
         self.assertEqual(installer.validate_c_dir("/DOS/RETROOS"), "/DOS/RETROOS")
         with self.assertRaises(ValueError):

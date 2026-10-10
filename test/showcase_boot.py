@@ -58,6 +58,7 @@ def main():
         names = {m.name.removeprefix('./') for m in archive.getmembers()}
     assert 'DN/DN.COM' in names and 'RETROOS/COMMAND.COM' in names
     assert 'RETROOS/BOOT.INI' not in names
+    assert not any(n.startswith(('OS2/APPS/', 'WINDOWS/APPS/', 'SRC/', 'TESTS/')) for n in names)
     assert not any(n.startswith(('COMMANDER/', 'GAMES/', 'TC/', 'ULTRASND/')) for n in names)
     with tempfile.TemporaryDirectory(prefix='retroos-showcase-') as folder:
         work = Path(folder)
@@ -76,12 +77,20 @@ def main():
         with tarfile.open(ROOT / 'bazel-bin/showcase_module_tar.tar') as archive:
             names = {m.name.removeprefix('./') for m in archive.getmembers()}
         assert {'COMMANDER/DN2D214/DN.COM', 'COMMANDER/NDN-D32/NDN.COM', 'COMMANDER/RC/RC.EXE', 'GAMES/DOOMS/DOOM.EXE', 'TC/TC.EXE', 'ULTRASND/MIDI/ACPIANO.PAT',
-                'WINDOWS/APPS/MINESWPR.EXE', 'OS2/APPS/SWEEPER/SWEEPER.EXE'} <= names
+                'WINDOWS/APPS/MINESWPR.EXE', 'OS2/APPS/SWEEPER/SWEEPER.EXE',
+                'WINDOWS/APPS/HELLO.EXE', 'WINDOWS/APPS/WATCIO.EXE',
+                'OS2/APPS/HELLO.EXE', 'OS2/APPS/PMSMOKE.EXE',
+                'OS2/APPS/WATCIO.EXE', 'SRC/COMMAND.C',
+                'TESTS/HELLO.COM', 'TESTS/DOSRT.EXE', 'TESTS/MODPLAY.EXE'} <= names
         with tarfile.open(ROOT / 'bazel-bin/showcase_module_tar.tar') as archive:
             packaged = {m.name.removeprefix('./') for m in archive.getmembers() if m.isfile()}
         source = {str(p.relative_to(ROOT / 'showcase-bundle'))
                   for p in (ROOT / 'showcase-bundle').rglob('*') if p.is_file()}
-        assert packaged == source, (source - packaged, packaged - source)
+        generated = {'OS2/APPS/HELLO.EXE', 'OS2/APPS/PMSMOKE.EXE',
+                     'OS2/APPS/WATCIO.EXE', 'WINDOWS/APPS/HELLO.EXE',
+                     'WINDOWS/APPS/WATCIO.EXE'}
+        generated |= {name for name in packaged if name.startswith(('SRC/', 'TESTS/'))}
+        assert packaged == source | generated, ((source | generated) - packaged, packaged - source - generated)
         assert 'showcase_commander' not in menu and 'boot_choices showcase' in menu
         settings = work / 'RETROOS.INI'
         settings.write_text(user.replace('language=en-US', 'language=it-IT'))
@@ -90,7 +99,7 @@ def main():
             shutil.copyfile(original, image)
             run('mcopy', '-o', '-i', str(image) + '@@1048576', settings, '::/boot/retroos/RETROOS.INI')
             text = boot(work, image, 'showcase-' + firmware, firmware,
-                        '/bin/busybox sh -c "test -s /COMMANDER/DN2D214/DN.COM && test -s /GAMES/DOOMS/DOOM.EXE"')
+                        '/bin/busybox sh -c "test -d /SRC && test -d /TESTS && test -d /OS2 && test -d /WINDOWS"')
             assert text.count('Optional module:') == 1 and '/showcase/ (256 MiB)' in text, text
             assert 'Locale: it-IT' in text, text
             print('PASS: USB', firmware, 'defaults to one showcase image with games and commanders', flush=True)

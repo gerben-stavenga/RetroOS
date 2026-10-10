@@ -13,7 +13,7 @@ import time
 import zipfile
 
 ROOT = Path(__file__).resolve().parent.parent
-OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin'))
+OUTPUT = Path(os.environ.get('RETROOS_RELEASE_DIR', ROOT / 'bazel-bin')).resolve()
 
 
 def check_usb(work):
@@ -161,14 +161,12 @@ def main():
             names = {member.name.removeprefix('./') for member in archive.getmembers()}
             assert {
                 'kernel.elf', 'RETROOS/COMMAND.COM', 'RETROOS/KERNEL.SYM',
-                'DN/DN.COM', 'VC/VC.COM', 'MC/MC.EXE',
+                'DN/DN.COM',
                 'RETROOS/WINDOWS/SYSTEM32/ADVAPI32.DLL',
                 'RETROOS/WINDOWS/SYSTEM32/KERNEL32.DLL',
                 'RETROOS/WINDOWS/SYSTEM/KERNEL.DLL',
                 'RETROOS/OS2/DLL/DOSCALLS.DLL',
-                'RETROOS/RETROOS.INI', 'VC/VC.INI', 'VC/VC.HLP',
-                'MC/MC.INI', 'MC/MC.MNU', 'MC/MC.HLP',
-                'RC/RC.EXE', 'bin/busybox', 'bin/sh',
+                'RETROOS/RETROOS.INI', 'bin/busybox', 'bin/sh',
             } <= names
             assert not any(
                 name.endswith('.DLL') and name.startswith((
@@ -180,6 +178,15 @@ def main():
             # immediate-abort removes the Rust panic handler from the linked
             # kernel. Check the shipped binary retains its diagnostic path.
             assert b'!!! KERNEL PANIC !!!' in archive.extractfile(kernel).read()
+        with tarfile.open(machine / 'showcase.tar') as archive:
+            names = {member.name.removeprefix('./') for member in archive.getmembers()}
+            assert {
+                'COMMANDER/VC/VC.COM', 'COMMANDER/MC/MC.EXE', 'COMMANDER/RC/RC.EXE',
+                'COMMANDER/VC/VC.INI', 'COMMANDER/VC/VC.HLP',
+                'COMMANDER/MC/MC.INI', 'COMMANDER/MC/MC.MNU', 'COMMANDER/MC/MC.HLP',
+                'ULTRASND/MIDI/ACPIANO.PAT', 'OS2/APPS/HELLO.EXE',
+                'WINDOWS/APPS/HELLO.EXE', 'SRC/COMMAND.C', 'TESTS/HELLO.COM',
+            } <= names
         # Exercise the shipped installer/defaults without assuming CI's host
         # root is ext4 or writing to its /boot and /home directories.
         sys.path.insert(0, str(machine / 'tools'))
@@ -208,7 +215,7 @@ assert settings['machine']['architecture'] == os.environ['EXPECTED_ARCHITECTURE'
 assert settings['machine']['executionmode'] == '4'
 assert settings['bios']['bootorder'] == os.environ['EXPECTED_BOOTORDER']
 section = settings[os.environ['EXPECTED_CMOS_SECTION']]
-assert section['memory'] == '134217728'
+assert section['memory'] == '33554432'
 assert section['cpu'] == os.environ['EXPECTED_CPU']
 assert section['clockingmode'] == '1'
 assert section['hdd0'] == os.environ['EXPECTED_HDD0']

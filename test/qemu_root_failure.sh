@@ -39,7 +39,7 @@ case "$qemu_status" in
     *) echo "FAIL: QEMU exited with status $qemu_status" >&2; exit 1 ;;
 esac
 
-if ! grep -q 'No root filesystem available' "$log"; then
+if ! grep -q 'No boot bundle with BOOT.INI available' "$log"; then
     echo 'FAIL: expected no-root panic was not observed' >&2
     tail -80 "$log" >&2 || true
     exit 1

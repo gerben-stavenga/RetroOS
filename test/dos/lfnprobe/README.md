@@ -36,7 +36,7 @@ Overlong or unterminated guest names fail rather than being truncated.
 - DOS attributes are shared session metadata; setters do not yet persist them
   into FAT directory entries or ext4 extended attributes. Existing FAT flags
   are read from disk. DOS read-only is independent of, and cannot relax,
-  RetroOS's ext4 group-write grant. Legacy AH=43 and LFN AH=7143 share this view.
+  RetroOS's ext4 owner-write grant. Legacy AH=43 and LFN AH=7143 share this view.
 - Creation/access timestamps are returned as zero (unsupported). Compressed
   size queries and creation/access timestamp setters return AX=7100h.
 - Last-write metadata uses VFS's existing 32-bit Unix seconds; the standalone

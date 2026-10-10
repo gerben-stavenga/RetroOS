@@ -212,8 +212,8 @@ drive=C
 access=rw
 ```
 
-`grant` identifies the home directory whose group grants ext4 writes; existing
-inode ownership and group-write permissions still apply. `subdir` exposes a
+`grant` identifies the home directory whose owner UID grants ext4 writes; existing
+inode ownership and owner-write permissions still apply. `subdir` exposes a
 subtree of a volume. Image mounts are ordered after their containing mount;
 cycles are rejected. Partitioned images with several supported partitions
 require `partition=`, numbered from 1. Raw filesystem images need no selector.

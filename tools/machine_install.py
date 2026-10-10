@@ -88,7 +88,7 @@ def copy_showcase_tree(source, destination, owner=None):
         return 0
     if not destination.exists():
         destination.mkdir()
-        destination.chmod(0o2775)
+        destination.chmod(0o755)
         if owner is not None:
             os.chown(destination, *owner)
     copied = 0
@@ -102,7 +102,7 @@ def copy_showcase_tree(source, destination, owner=None):
                     shutil.copyfileobj(src, dst)
             except FileExistsError:
                 continue
-            target.chmod((entry.stat().st_mode & 0o777) | 0o660)
+            target.chmod((entry.stat().st_mode & 0o777) | 0o600)
             if owner is not None:
                 os.chown(target, *owner)
             copied += 1
@@ -197,7 +197,7 @@ def install():
         raise ValueError("root UUID changed; prepare again")
     if not c_root.exists():
         c_root.mkdir(parents=True)
-        c_root.chmod(0o2775)
+        c_root.chmod(0o755)
         os.chown(c_root, *plan['c_owner'])
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     release = Path(plan["release"])
@@ -235,7 +235,7 @@ def install():
         owner = c_root.stat()
         os.chown(user_ini.parent, owner.st_uid, owner.st_gid)
         os.chown(user_ini, owner.st_uid, owner.st_gid)
-        user_ini.chmod(0o664)
+        user_ini.chmod(0o644)
     custom = Path("/etc/grub.d/40_custom")
     if "custom_sha256" in plan and hashlib.sha256(custom.read_bytes()).hexdigest() != plan["custom_sha256"]:
         raise ValueError("40_custom changed since preparation; prepare again")

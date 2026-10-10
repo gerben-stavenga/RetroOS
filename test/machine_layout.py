@@ -122,11 +122,11 @@ def main():
                           f'[mount "dos"]\nsource=UUID={UUID}\nsubdir=/home/retroos\npath=/home/retroos\ndrive=C\naccess=rw\ngrant=/home/retroos\n')
         user_ini = home / "RETROOS/RETROOS.INI"
         user_ini.write_text(user_ini.read_text().replace("language=en-US", "language=it-IT"))
-        user_ini.chmod(0o666)
-        (home / "RETROOS").chmod(0o775)
+        user_ini.chmod(0o644)
+        (home / "RETROOS").chmod(0o755)
         (home / "STATE.DAT").write_bytes(b"INIT")
-        (home / "STATE.DAT").chmod(0o664)
-        home.chmod(0o2775)
+        (home / "STATE.DAT").chmod(0o644)
+        home.chmod(0o755)
         # Runtime edits must stay in RAM, while C: data persists.
         runtime = root / "boot/retroos/RETROOS/TEST.DAT"
         runtime.write_bytes(b"BOOT")
