@@ -2,7 +2,6 @@
 """Boot real USB menus and verify that the default showcase and explicit core-only choice."""
 from pathlib import Path
 import configparser
-import os
 import shutil
 import subprocess
 import tarfile
@@ -18,7 +17,7 @@ def run(*args, **kwargs):
 
 def boot(work, image, name, firmware, command):
     log = work / (name + '.log')
-    args = ['qemu-system-x86_64', '-accel', 'kvm', '-cpu', 'host', '-m', '512',
+    args = ['qemu-system-x86_64', '-accel', 'tcg', '-cpu', 'max', '-m', '512',
             '-device', 'qemu-xhci,id=usb',
             '-drive', f'if=none,id=stick,file={image},format=raw,snapshot=on',
             '-device', 'usb-storage,bus=usb.0,drive=stick,bootindex=1',
@@ -29,7 +28,9 @@ def boot(work, image, name, firmware, command):
         shutil.copyfile('/usr/share/OVMF/OVMF_VARS_4M.fd', variables)
         args += ['-drive', 'if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd',
                  '-drive', f'if=pflash,format=raw,file={variables}']
-    process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    stderr = work / (name + '.stderr')
+    errors = stderr.open('w')
+    process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=errors)
     try:
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
@@ -37,17 +38,17 @@ def boot(work, image, name, firmware, command):
             if '[mem] exit tid=1 code=' in text or 'PANIC' in text or process.poll() is not None:
                 break
             time.sleep(.1)
-        assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text[-8000:]
+        assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, (
+            text[-8000:] + '\nQEMU stderr:\n' + stderr.read_text(errors='replace'))
         return text
     finally:
         if process.poll() is None:
             process.terminate()
         process.wait(timeout=5)
+        errors.close()
 
 
 def main():
-    if not os.access('/dev/kvm', os.R_OK | os.W_OK):
-        raise SystemExit('This regression requires KVM')
     run('bazelisk', 'build', '//:grub_module_usb', '//:machine_boot_tar')
     with tarfile.open(ROOT / 'bazel-bin/root_module_base_tar.tar') as archive:
         names = {m.name.removeprefix('./') for m in archive.getmembers()}

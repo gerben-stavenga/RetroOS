@@ -25,7 +25,8 @@ def boot(args, log, stderr):
                 if process.poll() is not None:
                     break
                 time.sleep(.1)
-            assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, text[-8000:]
+            assert '[mem] exit tid=1 code=0' in text and 'PANIC' not in text, (
+                text[-8000:] + '\nQEMU stderr:\n' + stderr.read_text(errors='replace'))
             return text
         finally:
             if process.poll() is None:
@@ -101,8 +102,7 @@ menuentry test {
                         '::RETROOS/RETROOS.INI'], check=True)
         log = work/'vm.log'
         text = boot(qemu(log) + ['-drive', f'file={disk},format=raw,snapshot=on',
-                                '-drive', f'file={data},format=raw',
-                                '-device', f'VGA,romfile={ROOT}/third_party/vgabios/vgabios-stdvga.bin'],
+                                '-drive', f'file={data},format=raw'],
                     log, work/'vm.stderr')
         assert 'Mount: data -> /home/retroos (rw)' in text and 'starting a RAM session' not in text, text
         print('PASS: generated VM UUID profile and bundled BusyBox', flush=True)
@@ -125,8 +125,7 @@ menuentry test {
                         '::RETROOS/RETROOS.INI'], check=True)
         log = work/'custom-app.log'
         text = boot(qemu(log) + ['-drive', f'file={disk},format=raw,snapshot=on',
-                                '-drive', f'file={data},format=raw,snapshot=on',
-                                '-device', f'VGA,romfile={ROOT}/third_party/vgabios/vgabios-stdvga.bin'],
+                                '-drive', f'file={data},format=raw,snapshot=on'],
                     log, work/'custom-app.stderr')
         assert 'Mount: rc -> /home/retroos/COMMANDER/RC (rw)' in text, text
         print('PASS: /bin/rc follows an explicit persistent application mount', flush=True)

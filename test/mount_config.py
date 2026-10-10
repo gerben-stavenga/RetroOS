@@ -164,7 +164,6 @@ access=ro
                     '-display', 'none', '-serial', 'none', '-audiodev', 'none,id=snd0',
                     '-drive', f'file={boot},format=raw,snapshot=on',
                     '-drive', f'file={outer},format=raw',
-                    '-device', f'VGA,romfile={ROOT}/third_party/vgabios/vgabios-stdvga.bin',
                     '-debugcon', f'file:{log}', '-no-reboot']
             if protected:
                 grub = case/'grub.cfg'
