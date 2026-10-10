@@ -67,6 +67,7 @@ const MAX_CONTROLLERS: usize = 4;
 
 mod dma;
 mod handoff;
+mod port;
 use dma::*;
 const RING_TRBS: usize = 256;
 const DEVICE_LANES: usize = 2;
@@ -586,15 +587,15 @@ impl Controller {
         }
     }
 
-    /// Reset a root-hub port so the attached device enters the Default state and
-    /// the port enables (USB2 needs the reset; USB3 auto-enables, but it's
-    /// harmless). Preserves the port's RW1C change bits. The controller owns the
-    /// reset timing and signals completion via Port-Enabled — we just wait.
-    fn reset_port(&self, op: usize, port: u32) {
+    /// Reset and allow recovery before addressing, using Linux's PORTSC write
+    /// mask and completion rules. Return the negotiated post-reset port status.
+    fn reset_port(&self, op: usize, port: u32) -> Option<u32> {
         let off = op + OP_PORTSC + (port as usize - 1) * 0x10;
-        let rw1c = 0x00FE_0000; // CSC/PEC/WRC/OCC/PRC/PLC/CEC — write-1-to-clear
-        self.w32(off, (self.r32(off) & !rw1c) | (1 << 4)); // PR = Port Reset
-        wait(|| self.r32(off) & (1 << 1) != 0); // PED (Port Enabled)
+        let state = port::reset(|| self.r32(off), |v| self.w32(off, v), || crate::irq::now(false));
+        if state.is_none() {
+            lib::compact_println!("xHCI: port {} reset failed (portsc={:#x})", port, self.r32(off));
+        }
+        state
     }
 
     /// Initialise the default-control-endpoint (EP0) transfer ring: zeroed, with a
@@ -906,18 +907,27 @@ impl Controller {
     }
 
     /// Reset the port, enable a slot, address the device, and correct EP0's max
-    /// packet size for full-speed devices. Returns the slot id, or None on failure.
+    /// packet size for full-speed devices. Returns slot id and negotiated speed.
     fn address_port(
         &mut self,
         op: usize,
         lane: usize,
         port: u32,
-        speed: u32,
         stride: usize,
-    ) -> Option<u32> {
-        self.reset_port(op, port);
-        let slot = self.enable_slot()?;
+    ) -> Option<(u32, u32)> {
+        let off = op + OP_PORTSC + (port as usize - 1) * 0x10;
+        if !port::debounce(|| self.r32(off), |v| self.w32(off, v), || crate::irq::now(false)) {
+            lib::compact_println!("xHCI: port {} connection unstable (portsc={:#x})", port, self.r32(off));
+            return None;
+        }
+        let state = self.reset_port(op, port)?;
+        let speed = (state >> 10) & 0xf;
+        let Some(slot) = self.enable_slot() else {
+            lib::compact_println!("xHCI: port {} Enable Slot failed", port);
+            return None;
+        };
         if !self.address_device(slot, lane, port, speed, stride) {
+            lib::compact_println!("xHCI: port {} Address Device failed (slot {} speed {})", port, slot, speed);
             self.disable_slot(slot);
             return None;
         }
@@ -925,16 +935,18 @@ impl Controller {
         // 8-byte packet) and, if larger, update EP0 before any bigger transfer or a
         // full-speed config read babbles. High-speed is always 64.
         if !self.control(slot, lane, 0x80, 0x06, 0x0100, 0, 8) {
+            lib::compact_println!("xHCI: port {} device descriptor failed (slot {})", port, slot);
             self.disable_slot(slot);
             return None;
         }
         let mps0 =
             unsafe { core::ptr::read_volatile((self.dma_va + XFER_OFF + 7) as *const u8) } as u32;
         if mps0 > 8 && !self.evaluate_ep0_mps(slot, lane, mps0, stride) {
+            lib::compact_println!("xHCI: port {} EP0 packet size update failed (slot {} mps {})", port, slot, mps0);
             self.disable_slot(slot);
             return None;
         }
-        Some(slot)
+        Some((slot, speed))
     }
 
     /// Read the configuration descriptor of an ALREADY-ADDRESSED device (its slot
@@ -999,6 +1011,8 @@ impl Controller {
                 }
                 i += blen;
             }
+        } else {
+            lib::compact_println!("xHCI: port {} configuration descriptor failed (slot {})", port, slot);
         }
         dev
     }
@@ -1066,7 +1080,7 @@ impl Controller {
         self.arm_report(index);
     }
 
-    /// Probe for an xHCI controller, retain at most one keyboard and one mouse,
+    /// Probe for an xHCI controller, retain at most two keyboards and one mouse,
     /// configure their interrupt endpoints, and arm their first reports. `self.poll()`
     /// (driven by the timer IRQ) then streams input into the shared IRQ queue.
     fn init(&mut self) {
@@ -1156,6 +1170,18 @@ impl Controller {
             func
         );
 
+        // Like Linux's root-hub power-on path, power every port before reading
+        // CCS and allow at least 100 ms for power-good/device connection. A
+        // firmware handoff must not depend on firmware having left PP set.
+        for p in 1..=max_ports {
+            let off = op + OP_PORTSC + (p as usize - 1) * 0x10;
+            self.w32(off, port::neutral(self.r32(off)) | (1 << 9));
+        }
+        if !port::delay(100_000_000, || crate::irq::now(false)) {
+            lib::compact_println!("xHCI: port power-on wait failed - skipping");
+            return;
+        }
+
         // Retain up to two keyboard devices and one mouse. A composite device
         // can provide both roles while using just one addressed device lane.
         let mut keyboards: [Option<(u32, PortDevice, EpInfo)>; 2] = [None; 2];
@@ -1167,12 +1193,11 @@ impl Controller {
             if portsc & 1 == 0 {
                 continue; // CCS = 0: nothing connected
             }
-            let speed = (portsc >> 10) & 0xF; // 1=full 2=low 3=high 4=super
             if retained_lanes == DEVICE_LANES {
                 break;
             }
             let lane = retained_lanes;
-            let Some(slot) = self.address_port(op, lane, p, speed, stride) else {
+            let Some((slot, speed)) = self.address_port(op, lane, p, stride) else {
                 continue;
             };
             let dev = self.classify_addressed(slot, lane, p, speed);

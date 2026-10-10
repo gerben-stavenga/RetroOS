@@ -5,6 +5,12 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+- xHCI root-port initialization powers ports before discovery and uses Linux's
+  safe PORTSC write mask, connection debounce, reset checks and recovery delay. Failed
+  enumeration stages are logged. Real-hardware keyboard recovery for issue #60
+  still needs validation; older USB host controllers and external hubs remain
+  unsupported.
+
 ## [0.8.2] - 2026-10-10
 
 ### Fixes and improvements
