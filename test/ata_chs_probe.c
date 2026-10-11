@@ -1,4 +1,7 @@
-/* Linux i386 program for the 86Box CHS disk integration test. */
+/* Linux i386 file read/write probe for ATA integration tests. */
+#ifndef PROBE_NAME
+#define PROBE_NAME "CHS"
+#endif
 static unsigned char buffer[8192];
 static int call(int nr, int a, int b, int c) {
     int result;
@@ -6,8 +9,8 @@ static int call(int nr, int a, int b, int c) {
     return result;
 }
 static void finish(int ok) {
-    const char *text = ok ? "CHS-RW-OK\n" : "CHS-RW-FAILED\n";
-    call(4, 1, (int)text, ok ? 10 : 14);
+    const char *text = ok ? PROBE_NAME "-RW-OK\n" : PROBE_NAME "-RW-FAILED\n";
+    call(4, 1, (int)text, ok ? sizeof(PROBE_NAME "-RW-OK\n") - 1 : sizeof(PROBE_NAME "-RW-FAILED\n") - 1);
     call(1, !ok, 0, 0);
     for (;;) {}
 }

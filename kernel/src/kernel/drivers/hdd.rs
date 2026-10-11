@@ -1,6 +1,6 @@
 //! ATA/IDE transport: bus-master DMA, with PIO fallback.
 //!
-//! Polled LBA28 or legacy CHS commands. PIIX3/PIIX4 controllers and
+//! Polled LBA48, LBA28 or legacy CHS commands. PIIX3/PIIX4 controllers and
 //! MWDMA2-capable drives use DMA; older controllers retain PIO access.
 //!
 //! One [`AtaDisk`] value per drive: it owns its controller ports and drive
@@ -42,7 +42,14 @@ mod status {
 mod cmd {
     pub const READ_SECTORS: u8 = 0x20;
     pub const WRITE_SECTORS: u8 = 0x30;
+    pub const READ_SECTORS_EXT: u8 = 0x24;
+    pub const WRITE_SECTORS_EXT: u8 = 0x34;
+    pub const READ_DMA: u8 = 0xC8;
+    pub const WRITE_DMA: u8 = 0xCA;
+    pub const READ_DMA_EXT: u8 = 0x25;
+    pub const WRITE_DMA_EXT: u8 = 0x35;
     pub const CACHE_FLUSH: u8 = 0xE7;
+    pub const CACHE_FLUSH_EXT: u8 = 0xEA;
     pub const IDENTIFY: u8 = 0xEC;
     pub const INITIALIZE_PARAMETERS: u8 = 0x91;
 }
@@ -109,18 +116,27 @@ fn channels<A: crate::Arch>(machine: &mut A) -> alloc::vec::Vec<Arc<Channel>> {
     channels
 }
 
-/// The LBA28 addressing ceiling — this driver cannot reach past it.
+/// ATA addressing ceilings, in 512-byte sectors.
 const LBA28_MAX: u64 = 1 << 28;
+const LBA48_MAX: u64 = 1 << 48;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Addressing {
     Lba28(u64),
+    Lba48(u64),
     Chs { cylinders: u16, heads: u8, sectors: u8 },
 }
 
 impl Addressing {
     fn identify(words: &[u16; 256]) -> Option<Self> {
         if words[49] & (1 << 9) != 0 {
+            // Word 83 is valid only when bits 15:14 are 01. Bit 10
+            // advertises EXT commands and the capacity in words 100-103.
+            if words[83] & 0xc400 == 0x4400 {
+                let sectors = words[100..104].iter().enumerate()
+                    .fold(0u64, |total, (index, word)| total | (u64::from(*word) << (index * 16)));
+                if sectors > 0 && sectors <= LBA48_MAX { return Some(Self::Lba48(sectors)); }
+            }
             let sectors = u64::from(words[60]) | (u64::from(words[61]) << 16);
             return (sectors > 0).then_some(Self::Lba28(sectors.min(LBA28_MAX)));
         }
@@ -136,7 +152,7 @@ impl Addressing {
 
     fn capacity(self) -> u64 {
         match self {
-            Self::Lba28(sectors) => sectors,
+            Self::Lba28(sectors) | Self::Lba48(sectors) => sectors,
             Self::Chs { cylinders, heads, sectors } =>
                 u64::from(cylinders) * u64::from(heads) * u64::from(sectors),
         }
@@ -144,13 +160,16 @@ impl Addressing {
 
     /// Drive/head, sector number, cylinder low, cylinder high (LBA uses the
     /// same registers). CHS sectors are one-based; heads/cylinders are not.
-    fn taskfile(self, drive: u8, lba: u32) -> [u8; 4] {
-        assert!(u64::from(lba) < self.capacity());
+    fn taskfile(self, drive: u8, lba: u64) -> [u8; 4] {
+        assert!(lba < self.capacity());
         let device = 0xa0 | (drive << 4);
         match self {
-            Self::Lba28(_) => [device | 0x40 | ((lba >> 24) as u8 & 0xf),
-                              lba as u8, (lba >> 8) as u8, (lba >> 16) as u8],
+            Self::Lba28(_) | Self::Lba48(_) => {
+                let head = if matches!(self, Self::Lba28(_)) { (lba >> 24) as u8 & 0xf } else { 0 };
+                [device | 0x40 | head, lba as u8, (lba >> 8) as u8, (lba >> 16) as u8]
+            }
             Self::Chs { heads, sectors, .. } => {
+                let lba = lba as u32; // CHS capacity fits in 28 bits.
                 let track = lba / u32::from(sectors);
                 let cylinder = track / u32::from(heads);
                 [device | (track % u32::from(heads)) as u8,
@@ -158,6 +177,39 @@ impl Addressing {
                  cylinder as u8, (cylinder >> 8) as u8]
             }
         }
+    }
+
+    /// Load the same taskfile for either transport. EXT commands latch the
+    /// upper bytes first; the low byte phase is shared with LBA28 and CHS.
+    fn load_taskfile(self, drive: u8, lba: u64, batch: u32, mut write: impl FnMut(u16, u8)) {
+        assert!(batch > 0 && batch <= 256);
+        assert!(lba < self.capacity() && u64::from(batch) <= self.capacity() - lba);
+        let [device, sector, low, high] = self.taskfile(drive, lba);
+        write(reg::LBA_24_27_FLAGS, device);
+        if matches!(self, Self::Lba48(_)) {
+            write(reg::FEATURES, 0);
+            write(reg::SECTOR_COUNT, (batch >> 8) as u8);
+            write(reg::LBA_0_7, (lba >> 24) as u8);
+            write(reg::LBA_8_15, (lba >> 32) as u8);
+            write(reg::LBA_16_23, (lba >> 40) as u8);
+        }
+        write(reg::FEATURES, 0);
+        // 256 is 00h for legacy commands and 0100h for EXT commands.
+        write(reg::SECTOR_COUNT, batch as u8);
+        write(reg::LBA_0_7, sector);
+        write(reg::LBA_8_15, low);
+        write(reg::LBA_16_23, high);
+    }
+
+    fn command(self, operation: Operation, dma: bool) -> u8 {
+        let (legacy, extended) = match (operation, dma) {
+            (Operation::Read, false) => (cmd::READ_SECTORS, cmd::READ_SECTORS_EXT),
+            (Operation::Write, false) => (cmd::WRITE_SECTORS, cmd::WRITE_SECTORS_EXT),
+            (Operation::Read, true) => (cmd::READ_DMA, cmd::READ_DMA_EXT),
+            (Operation::Write, true) => (cmd::WRITE_DMA, cmd::WRITE_DMA_EXT),
+            (Operation::Flush, _) => unreachable!(),
+        };
+        if matches!(self, Self::Lba48(_)) { extended } else { legacy }
     }
 }
 
@@ -181,7 +233,7 @@ fn needs_cache_flush(words: &[u16; 256]) -> bool {
     // when the flush capability is missing: silently succeeding would lose
     // the filesystem's durability guarantee.
     let write_cache = words[82] & (1 << 5) != 0;
-    let flush = words[83] & 0xc000 == 0x4000 && words[83] & (1 << 12) != 0;
+    let flush = words[83] & 0xc000 == 0x4000 && words[83] & ((1 << 12) | (1 << 13)) != 0;
     write_cache || flush
 }
 
@@ -194,6 +246,7 @@ pub struct Ata {
     addressing: Addressing,
     mwdma2: bool,
     cache_flush: bool,
+    flush_command: u8,
     bus_master: Option<BusMaster>,
 }
 
@@ -228,7 +281,7 @@ impl Ata {
         }
 
         let mut disk = Ata { base, channel, drive, addressing: Addressing::Lba28(0), mwdma2: false,
-                             cache_flush: true, bus_master: None };
+                             cache_flush: true, flush_command: cmd::CACHE_FLUSH, bus_master: None };
         disk.addressing = disk.identify_addressing()?;
         if let Addressing::Chs { heads, sectors, .. } = disk.addressing {
             disk.select();
@@ -264,6 +317,9 @@ impl Ata {
                 insw(self.base + reg::DATA, &mut words);
                 self.mwdma2 = words[49] & (1 << 8) != 0 && words[63] & 4 != 0;
                 self.cache_flush = needs_cache_flush(&words);
+                self.flush_command = if words[83] & 0xe000 == 0x6000 {
+                    cmd::CACHE_FLUSH_EXT
+                } else { cmd::CACHE_FLUSH };
                 return Addressing::identify(&words);
             }
         }
@@ -315,18 +371,12 @@ impl Ata {
     /// Select BEFORE waiting: the channel may still be pointed at the other
     /// drive from a previous probe or transfer, and `wait_ready` against an
     /// absent drive never returns.
-    fn issue(&self, lba: u32, batch: u32, command: u8) -> Result<(), Error> {
+    fn issue(&self, c: Command, dma: bool) -> Result<(), Error> {
         self.select();
         self.wait(status::DRDY)?;
-        let [device, sector, low, high] = self.addressing.taskfile(self.drive, lba);
-        outb(self.base + reg::LBA_24_27_FLAGS, device);
-        outb(self.base + reg::FEATURES, 0);
-        // A sector count of 0 means 256 — the maximum one command can carry.
-        outb(self.base + reg::SECTOR_COUNT, if batch == 256 { 0 } else { batch as u8 });
-        outb(self.base + reg::LBA_0_7, sector);
-        outb(self.base + reg::LBA_8_15, low);
-        outb(self.base + reg::LBA_16_23, high);
-        outb(self.base + reg::COMMAND, command);
+        self.addressing.load_taskfile(self.drive, c.lba, c.sectors,
+            |register, value| outb(self.base + register, value));
+        outb(self.base + reg::COMMAND, self.addressing.command(c.operation, dma));
         Ok(())
     }
 }
@@ -347,7 +397,11 @@ impl Storage<Ata> {
             } else { Buffer::pio(256) }
         } else { Buffer::pio(256) };
         lib::compact_println!("ATA: {} {} {}", name.as_str(),
-            if matches!(ata.addressing, Addressing::Chs { .. }) { "CHS" } else { "LBA28" },
+            match ata.addressing {
+                Addressing::Chs { .. } => "CHS",
+                Addressing::Lba28(_) => "LBA28",
+                Addressing::Lba48(_) => "LBA48",
+            },
             if ata.bus_master.is_some() { "DMA" } else { "PIO" });
         Some(Self::new(ata, buffer, sectors,
             name.as_str()))
@@ -381,21 +435,15 @@ impl Hardware for Ata {
             self.select();
             self.wait(status::DRDY)?;
             if !self.cache_flush { return Ok(()); }
-            outb(self.base + reg::COMMAND, cmd::CACHE_FLUSH);
+            outb(self.base + reg::COMMAND, self.flush_command);
             return self.wait_flush(status::DRDY);
         }
         if let Some(bus_master) = &self.bus_master {
-            let command = if c.operation == Operation::Read { 0xc8 } else { 0xca };
             let direction = bus_master.prepare(c, buffer);
-            self.issue(c.lba as u32, c.sectors, command)?;
+            self.issue(c, true)?;
             return bus_master.complete(self.base, direction);
         }
-        let command = match c.operation {
-            Operation::Read => cmd::READ_SECTORS,
-            Operation::Write => cmd::WRITE_SECTORS,
-            Operation::Flush => unreachable!(),
-        };
-        self.issue(c.lba as u32, c.sectors, command)?;
+        self.issue(c, false)?;
         for words in buffer.words()[..c.sectors as usize * 256].chunks_exact_mut(256) {
             self.wait(status::DRQ)?;
             match c.operation {
@@ -584,10 +632,66 @@ mod tests {
         assert_eq!(chs.taskfile(1, 256 * 68), [0xb0, 1, 0, 1]);
         assert_eq!(chs.taskfile(1, 41819), [0xb3, 17, 0x66, 2]);
         let largest = Addressing::Chs { cylinders: 65535, heads: 16, sectors: 255 };
-        assert_eq!(largest.taskfile(1, largest.capacity() as u32 - 1),
+        assert_eq!(largest.taskfile(1, largest.capacity() - 1),
                    [0xbf, 255, 0xfe, 0xff]);
         assert_eq!(Addressing::Lba28(LBA28_MAX).taskfile(1, 0x0abcdef0),
                    [0xfa, 0xf0, 0xde, 0xbc]);
+    }
+
+    #[test]
+    fn identify_prefers_valid_lba48_capacity() {
+        let mut words = legacy_identify();
+        words[49] = 1 << 9;
+        words[60] = 0xffff;
+        words[61] = 0x0fff;
+        let capacity = (1u64 << 32) + 0x123456;
+        for index in 0..4 { words[100 + index] = (capacity >> (index * 16)) as u16; }
+        words[83] = 0x4400;
+        assert_eq!(Addressing::identify(&words), Some(Addressing::Lba48(capacity)));
+        for invalid in [0, 0x0400, 0x8400, 0xc400, 0x4000] {
+            words[83] = invalid;
+            assert_eq!(Addressing::identify(&words), Some(Addressing::Lba28(0x0fffffff)));
+        }
+        words[83] = 0x4400;
+        words[100..104].fill(0);
+        assert_eq!(Addressing::identify(&words), Some(Addressing::Lba28(0x0fffffff)));
+        words[103] = 2; // unaddressable capacity, not a truncated 48-bit value
+        assert_eq!(Addressing::identify(&words), Some(Addressing::Lba28(0x0fffffff)));
+    }
+
+    #[test]
+    fn lba48_taskfile_preserves_upper_bytes_and_256_sector_count() {
+        let addressing = Addressing::Lba48(LBA48_MAX);
+        let mut writes = alloc::vec::Vec::new();
+        addressing.load_taskfile(1, 0x123456789abc, 256, |register, value| writes.push((register, value)));
+        assert_eq!(writes, [
+            (6, 0xf0), // slave, LBA; no LBA bits in the device register
+            (1, 0), (2, 1), (3, 0x56), (4, 0x34), (5, 0x12),
+            (1, 0), (2, 0), (3, 0xbc), (4, 0x9a), (5, 0x78),
+        ]);
+        writes.clear();
+        addressing.load_taskfile(0, LBA28_MAX, 1, |register, value| writes.push((register, value)));
+        assert_eq!(writes, [(6, 0xe0), (1, 0), (2, 0), (3, 0x10), (4, 0), (5, 0),
+                           (1, 0), (2, 1), (3, 0), (4, 0), (5, 0)]);
+        writes.clear();
+        Addressing::Lba28(LBA28_MAX).load_taskfile(0, LBA28_MAX - 256, 256,
+            |register, value| writes.push((register, value)));
+        assert_eq!(writes, [(6, 0xef), (1, 0), (2, 0), (3, 0), (4, 0xff), (5, 0xff)]);
+    }
+
+    #[test]
+    fn addressing_selects_commands_for_both_transports() {
+        let legacy = Addressing::Lba28(LBA28_MAX);
+        let extended = Addressing::Lba48(LBA48_MAX);
+        for (operation, dma, old, new) in [
+            (Operation::Read, false, 0x20, 0x24),
+            (Operation::Write, false, 0x30, 0x34),
+            (Operation::Read, true, 0xc8, 0x25),
+            (Operation::Write, true, 0xca, 0x35),
+        ] {
+            assert_eq!(legacy.command(operation, dma), old);
+            assert_eq!(extended.command(operation, dma), new);
+        }
     }
 
     #[test]
