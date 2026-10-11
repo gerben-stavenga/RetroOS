@@ -105,6 +105,7 @@ storage_selection() { machine_layout && have nasm && have sfdisk; }
 isapnp_tools() { qemu_hostfs_grub && have nasm; }
 physical_memory_tools() { have bazelisk && have qemu-system-x86_64 && have nasm && have ld && have mkfs.fat && have mmd && have mcopy && have python3; }
 dn_state() { have bazelisk && have qemu-system-i386 && have mkfs.fat && have mmd && have mcopy && have mtype && have mdir && have python3; }
+ata_lba48_tools() { have bazelisk && have qemu-system-x86_64 && have gcc && have mkfs.fat && have mmd && have mcopy && have mtype && have python3; }
 # 86Box is a GUI app: it needs the emulator installed AND somewhere to draw.
 box86()     { [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && { [ -x "$HOME/bin/86Box.AppImage" ] \
                 || have 86box || { have flatpak && flatpak list --app --columns=application \
@@ -140,7 +141,7 @@ run() {
     case "$name" in
         physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_layout|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
-        shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
+        ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
     if [ -n "${RETRO_TEST_GROUP:-}" ] && [ "$RETRO_TEST_GROUP" != "$group" ]; then
         return
@@ -220,6 +221,7 @@ run unit_kvm     kvm       unit_kvm
 # --- HostFS launcher and protocol tests -------------------------------------
 
 run shared_disks python3_test python3 test/shared_disks.py
+run ata_lba48 ata_lba48_tools python3 test/ata_lba48_qemu.py
 run hostfs_protocol python3_test python3 test/hostfs_protocol.py
 run hostfs_socket python3_test python3 test/hostfs_socket_reconnect.py
 run audio_pcm_unit python3_test python3 test/audio_steady_unit.py

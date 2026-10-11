@@ -114,9 +114,11 @@ def main():
             assert len(config) > 1000
             temporary = subprocess.check_output(["mdir", "-i", str(disk), "::TEMP/"])
             assert b"0 bytes" in temporary, temporary
-            listing = subprocess.check_output(["mdir", "-i", str(disk), "::RETROOS/"])
-            assert b"0 bytes" in listing, listing
-        print("PASS: real DN saves and reloads config/history separately; runtime and TEMP directories stay empty on data disk")
+            listing = subprocess.check_output(["mdir", "-b", "-i", str(disk), "::RETROOS/"])
+            assert listing.splitlines() == [b"::/RETROOS/RETROOS.INI"], listing
+            settings = subprocess.check_output(["mtype", "-i", str(disk), "::RETROOS/RETROOS.INI"])
+            assert settings == (ROOT / "etc/RETROOS.INI").read_bytes(), settings
+        print("PASS: DN saves/reloads config and history; user INI stays intact, runtime stays off disk, TEMP stays empty")
 
 
 if __name__ == "__main__":

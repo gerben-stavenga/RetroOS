@@ -92,7 +92,7 @@ def boot(work, name, image, decoy, uuid, expected, reverse=False, uefi=False, st
     if expected != "bundle UUID not found":
         assert "Locale: it-IT" in text, text
     if ata_dma:
-        assert "ATA: ata0 LBA28 DMA" in text and "ATA: ata1 LBA28 DMA" in text, text
+        assert "ATA: ata0 LBA48 DMA" in text and "ATA: ata1 LBA48 DMA" in text, text
     firmware = "Substitute" if uefi else "NativeBios"
     assert f"firmware={firmware}" in text, text
     assert f"vga_passthrough={str(not uefi).lower()}" in text, text
