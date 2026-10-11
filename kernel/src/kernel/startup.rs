@@ -116,6 +116,10 @@ fn prepare_startup<A: crate::Arch>(
     screen.present(machine, &mut bios_workspace);
 
     configure_locale(&master_env);
+    crate::kernel::clock::configure(
+        crate::kernel::dos::config_var(&master_env, b"RTC"),
+        crate::kernel::dos::config_var(&master_env, b"UTC_OFFSET"),
+    ).unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 

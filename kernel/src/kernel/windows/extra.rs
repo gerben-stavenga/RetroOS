@@ -889,7 +889,11 @@ pub(super) fn call<A: crate::Arch>(
     {
         let input = arg(machine, regs, 0) as usize;
         let output = arg(machine, regs, 1) as usize;
-        machine.write::<u64>(output, machine.read::<u64>(input));
+        let offset = i128::from(crate::kernel::clock::utc_offset_minutes()) * 60 * 10_000_000;
+        let offset = if name.eq_ignore_ascii_case(b"FileTimeToLocalFileTime") { offset } else { -offset };
+        let value = i128::from(machine.read::<u64>(input)) + offset;
+        let Ok(value) = u64::try_from(value) else { return fail(state, ERROR_INVALID_PARAMETER, 0); };
+        machine.write::<u64>(output, value);
         return 1;
     }
     if name.eq_ignore_ascii_case(b"FileTimeToSystemTime") {
@@ -1188,13 +1192,20 @@ pub(super) fn call<A: crate::Arch>(
         || name.eq_ignore_ascii_case(b"SetLocalTime")
     {
         if !name.starts_with(b"Set") {
+            let unix = crate::kernel::clock::rtc_unix_timestamp().map(|unix| {
+                if name.eq_ignore_ascii_case(b"GetLocalTime") {
+                    i64::from(crate::kernel::clock::unix_to_local(unix))
+                } else { i64::from(unix) }
+            });
             write_system_time(machine, arg(machine, regs, 0) as usize,
-                crate::kernel::clock::rtc_unix_timestamp().map(i64::from));
+                unix);
         }
         return 1;
     }
     if name.eq_ignore_ascii_case(b"GetTimeZoneInformation") {
         machine.zero(arg(machine, regs, 0) as usize, 172);
+        machine.write::<i32>(arg(machine, regs, 0) as usize,
+            -crate::kernel::clock::utc_offset_minutes());
         return 0;
     }
     if name.eq_ignore_ascii_case(b"CompareStringA") || name.eq_ignore_ascii_case(b"CompareStringW") {

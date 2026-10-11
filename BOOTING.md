@@ -21,6 +21,24 @@ user settings and C: data persist in the persistent entry. Upgrades preserve
 user settings and existing mount choices. The installer currently requires
 `/boot` and C: on the ext4 Linux root.
 
+## Clock settings
+
+`RETROOS.INI` can interpret the hardware clock as UTC and present local time:
+
+```ini
+[clock]
+rtc=utc
+utc_offset=-07:00
+```
+
+`rtc=local` (the default) uses the hardware clock directly for local time.
+`utc_offset` defaults to `+00:00` and accepts signed `HH:MM` offsets up to
+14 hours, including partial hours. It also converts between local dates and
+UTC filesystem timestamps. DOS/BIOS and Windows/OS/2 local time calls use
+the local clock; Windows system time and Unix file timestamps use UTC.
+The offset is fixed: update it yourself when daylight saving time changes.
+Settings take effect after reboot and do not alter the hardware clock.
+
 ## USB and optical boot
 
 The boot partition contains `/boot/grub/grub.cfg`, editable

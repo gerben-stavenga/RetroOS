@@ -1553,6 +1553,7 @@ fn dispatch_api<A: crate::Arch>(
             let out = arg32(machine, regs, 0) as usize;
             if out == 0 { return ERROR_INVALID_PARAMETER; }
             let Some(unix) = crate::kernel::clock::rtc_unix_timestamp() else { return 13; }; // ERROR_INVALID_DATA
+            let unix = crate::kernel::clock::unix_to_local(unix);
             let [year, month, weekday, day, hour, minute, second, milliseconds] =
                 crate::kernel::clock::calendar_from_unix(i64::from(unix));
             machine.zero(out, 12);
@@ -1563,9 +1564,8 @@ fn dispatch_api<A: crate::Arch>(
             machine.write::<u8>(out + 4, day as u8);
             machine.write::<u8>(out + 5, month as u8);
             machine.write::<u16>(out + 6, year);
-            // RTC follows the firmware's local-time convention; no timezone
-            // policy is configured, so OS/2's unknown-offset sentinel applies.
-            machine.write::<i16>(out + 8, -1);
+            // OS/2 reports minutes west of UTC (the opposite of our offset).
+            machine.write::<i16>(out + 8, -crate::kernel::clock::utc_offset_minutes() as i16);
             machine.write::<u8>(out + 10, weekday as u8);
             NO_ERROR
         }

@@ -121,7 +121,7 @@ impl Config {
                         grant: "/".to_string(),
                     });
                 } else if !section.eq_ignore_ascii_case("launch")
-                    && !matches!(section, "system" | "locale" | "sound" | "environment") {
+                    && !matches!(section, "system" | "locale" | "clock" | "sound" | "environment") {
                     return Err("unknown section");
                 }
                 continue;
@@ -196,6 +196,8 @@ impl Config {
                     ("locale", "language") => "LOCALE".to_string(),
                     ("locale", "keyboard") => "KEYBOARD".to_string(),
                     ("locale", "codepage") => "CODEPAGE".to_string(),
+                    ("clock", "rtc") => "RTC".to_string(),
+                    ("clock", "utc_offset") => "UTC_OFFSET".to_string(),
                     ("sound", "sb_audio") => "SB_AUDIO".to_string(),
                     ("sound", "hda_output") => "HDA_OUTPUT".to_string(),
                     ("sound", "volume") => "AUDIO_VOLUME".to_string(),
@@ -822,6 +824,14 @@ mod tests {
             b"LOCALE=it-IT\0KEYBOARD=us\0START=C:\\DN\\DN.COM\0\0"
         );
         assert!(Config::parse(b"[mount \"bad\"]\nsource=UUID=ABCD-X234\npath=/\n").is_err());
+    }
+
+    #[test]
+    fn clock_settings_are_user_policy() {
+        let user = Config::parse_user(b"[clock]\nrtc=utc\nutc_offset=-07:00\n").unwrap();
+        assert_eq!(user.environment, b"RTC=utc\0UTC_OFFSET=-07:00\0\0");
+        assert!(Config::parse_boot(b"[bundle]\nsource=module\n[clock]\nrtc=utc\n").is_err());
+        assert!(Config::parse_user(b"[clock]\ntimezone=invalid\n").is_err());
     }
 
     #[test]

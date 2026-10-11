@@ -266,14 +266,14 @@ impl<T: fatfs::ReadWriteSeek + 'static> FatFs<T> {
 
 /// DOS datetime (as rust-fatfs reports it) → seconds since the Unix epoch.
 fn unix_from_datetime(dt: &fatfs::DateTime) -> u32 {
-    unix_from_ymd_hms(
+    crate::kernel::clock::local_to_unix(unix_from_ymd_hms(
         dt.date.year,
         dt.date.month,
         dt.date.day,
         dt.time.hour,
         dt.time.min,
         dt.time.sec,
-    )
+    ))
 }
 
 /// Days-from-civil-date, branchless. fatfs decodes stored timestamp fields
@@ -567,6 +567,7 @@ impl<T: fatfs::ReadWriteSeek + 'static> Filesystem for FatFs<T> {
     }
 
     fn set_mtime(&self, path: &[u8], unix: u32) -> bool {
+        let unix = crate::kernel::clock::unix_to_local(unix);
         // Gregorian civil date from Unix days, independent of DOS lookup policy.
         let z = i64::from(unix / 86400) + 719468;
         let era = z.div_euclid(146097);

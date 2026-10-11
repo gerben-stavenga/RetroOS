@@ -2141,6 +2141,19 @@ fn int1a<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
             regs.rdx = (regs.rdx & !0xFFFF) | ((bcd(sec) as u64) << 8);
             set_iret_cf(machine, regs, false);
         }
+        0x04 => {
+            // Read RTC date: CH=century CL=year DH=month DL=day,
+            // all BCD, CF clear on success, even when CMOS stores binary.
+            let (year, month, day, _) = super::dos::cmos_date(machine);
+            let bcd = |v: u8| ((v / 10) << 4) | (v % 10);
+            regs.rcx = (regs.rcx & !0xFFFF)
+                | ((bcd((year / 100) as u8) as u64) << 8)
+                | bcd((year % 100) as u8) as u64;
+            regs.rdx = (regs.rdx & !0xFFFF)
+                | ((bcd(month) as u64) << 8)
+                | bcd(day) as u64;
+            set_iret_cf(machine, regs, false);
+        }
         _ => {}
     }
 }

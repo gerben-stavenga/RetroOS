@@ -101,7 +101,7 @@ fn day_of_week(mut year: u16, mut month: u8, day: u8) -> u8 {
     ((y + y / 4 - y / 100 + y / 400 + OFFSETS[month as usize - 1] as u32 + day as u32) % 7) as u8
 }
 
-fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
+fn raw_cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
     for _ in 0..10_000 {
         if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
@@ -133,7 +133,7 @@ fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
 /// RTC time of day as binary (hour, minute, second), handling BCD/binary and
 /// 12/24-hour CMOS formats. Implausible values collapse to midnight — a
 /// wrong-but-sane clock beats letting firmware garbage through.
-pub(super) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
+fn raw_rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
     for _ in 0..10_000 {
         if cmos_read(machine, 0x0A) & 0x80 == 0 {
             break;
@@ -156,6 +156,22 @@ pub(super) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
         return (0, 0, 0);
     }
     (hour, min, sec)
+}
+
+/// Local date and time derived together so UTC offsets carry across midnight.
+fn local_rtc<A: crate::Arch>(machine: &mut A) -> ((u16, u8, u8), (u8, u8, u8)) {
+    let (year, month, day, _) = raw_cmos_date(machine);
+    let time = raw_rtc_time(machine);
+    crate::kernel::clock::rtc_to_local((year, month, day), time)
+}
+
+pub(super) fn cmos_date<A: crate::Arch>(machine: &mut A) -> (u16, u8, u8, u8) {
+    let ((year, month, day), _) = local_rtc(machine);
+    (year, month, day, day_of_week(year, month, day))
+}
+
+pub(super) fn rtc_time<A: crate::Arch>(machine: &mut A) -> (u8, u8, u8) {
+    local_rtc(machine).1
 }
 
 /// BIOS tick-of-day counter value for "now", read from the RTC — what a real
@@ -1935,6 +1951,10 @@ fn int_21h<A: crate::Arch>(
                     Ok((path, len)) => crate::kernel::vfs::open(&path[..len], &mut kt.fds),
                     Err(e) => -e,
                 };
+                if super::should_trace() {
+                    crate::compact_println!("[DOS FILE] open {:?} mode={:02X} fd={}",
+                        core::str::from_utf8(&name[..i]).unwrap_or("<non-utf8>"), open_mode, fd);
+                }
                 match accept_open_file(machine, kt, dos, fd, open_mode) {
                     Ok(handle) => DosExit::Ax(handle),
                     Err(err) => DosExit::Errno(err),
@@ -1990,10 +2010,17 @@ fn int_21h<A: crate::Arch>(
                 let cdrom = crate::kernel::vfs::mount_prefix(handle, &kt.fds)
                     == Some(b"cdrom/" as &[u8]);
                 let mut buf = alloc::vec![0u8; count];
+                let read_offset = super::should_trace()
+                    .then(|| crate::kernel::vfs::seek(handle, 0, 1, &kt.fds));
                 let read_started = machine.now();
                 let fetch_started = crate::kernel::startup::profile_enabled()
                     .then(|| machine.rdtsc());
                 let n = crate::kernel::vfs::read(handle, &mut buf, &kt.fds);
+                if let Some(offset) = read_offset {
+                    let prefix = (n.max(0) as usize).min(buf.len()).min(16);
+                    crate::compact_println!("[DOS FILE] read fd={} offset={:08X} requested={} returned={} data={:02X?}",
+                        handle, offset, count, n, &buf[..prefix]);
+                }
                 if let Some(start) = fetch_started {
                     crate::kernel::event_profile::record_dos_read_fetch(
                         count as u16,
@@ -4232,6 +4259,7 @@ fn alloc_search_slot<A: crate::Arch>(dos: &mut thread::DosState<A>) -> usize {
 /// `(0, 0)`. A zero date renders as blank rather than as a plausible-looking
 /// 1980-01-01, so an unknown time never masquerades as a real one.
 fn unix_to_dos_datetime(unix: u32) -> (u16, u16) {
+    let unix = crate::kernel::clock::unix_to_local(unix);
     const DOS_EPOCH: u32 = 315_532_800; // 1980-01-01T00:00:00Z
     if unix < DOS_EPOCH {
         return (0, 0);
@@ -4275,8 +4303,9 @@ pub(crate) fn dos_to_unix_datetime(time: u16, date: u16) -> Option<u32> {
     let max_day = MONTH_DAYS[month as usize - 1] + u32::from(month == 2 && leap(year));
     if day > max_day { return None; }
     let days = epoch_days_fast(year, month, day);
-    days.checked_mul(86_400)?
-        .checked_add(hour * 3_600 + minute * 60 + second)
+    let local = days.checked_mul(86_400)?
+        .checked_add(hour * 3_600 + minute * 60 + second)?;
+    Some(crate::kernel::clock::local_to_unix(local))
 }
 
 /// Branchless Gregorian Y/M/D -> days since 1970-01-01. This is the
