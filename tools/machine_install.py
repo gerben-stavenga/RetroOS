@@ -20,7 +20,15 @@ def runtime_filter(member, destination):
     # This guest link is absolute in RetroOS, not in the installing host.
     guest_links = {'bin/rc': '/COMMANDER/RC/RC.EXE', 'bin/rcedit': 'rc'}
     if member.issym() and guest_links.get(member.name.removeprefix('./')) == member.linkname:
-        return tarfile.tar_filter(member, destination)
+        # Repeated preparation encounters these links from the first extract.
+        # tar_filter follows the existing final link and treats its guest
+        # target as a host extraction destination. Only the parent must stay
+        # inside the staging tree: tarfile replaces the final symlink itself.
+        root = Path(destination).resolve()
+        parent = (root / member.name).parent.resolve()
+        if not parent.is_relative_to(root):
+            raise tarfile.OutsideDestinationError(member, str(parent))
+        return member.replace(mode=None, uid=None, gid=None, uname=None, gname=None)
     return tarfile.data_filter(member, destination)
 
 

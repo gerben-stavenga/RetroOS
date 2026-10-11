@@ -13,6 +13,39 @@ import machine_install as installer
 
 
 class ShowcaseTests(unittest.TestCase):
+    def test_runtime_guest_links_can_be_extracted_repeatedly(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            archive = root / 'runtime.tar'
+            with tarfile.open(archive, 'w') as tar:
+                for name, target in [('bin/rc', '/COMMANDER/RC/RC.EXE'), ('bin/rcedit', 'rc')]:
+                    member = tarfile.TarInfo(name)
+                    member.type = tarfile.SYMTYPE
+                    member.linkname = target
+                    tar.addfile(member)
+            for _ in range(2):
+                with tarfile.open(archive) as tar:
+                    tar.extractall(root / 'runtime', filter=installer.runtime_filter)
+                self.assertEqual((root / 'runtime/bin/rc').readlink(), Path('/COMMANDER/RC/RC.EXE'))
+                self.assertEqual((root / 'runtime/bin/rcedit').readlink(), Path('rc'))
+
+    def test_runtime_guest_links_reject_escaping_parent_and_other_targets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            runtime = root / 'runtime'
+            runtime.mkdir()
+            outside = root / 'outside'
+            outside.mkdir()
+            (runtime / 'bin').symlink_to(outside)
+            member = tarfile.TarInfo('bin/rc')
+            member.type = tarfile.SYMTYPE
+            member.linkname = '/COMMANDER/RC/RC.EXE'
+            with self.assertRaises(tarfile.OutsideDestinationError):
+                installer.runtime_filter(member, runtime)
+            member.name = 'other'
+            with self.assertRaises(tarfile.AbsoluteLinkError):
+                installer.runtime_filter(member, runtime)
+
     def test_seed_preserves_files_and_links_and_can_repeat(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
