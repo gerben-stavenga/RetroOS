@@ -5,6 +5,10 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-12
+
+- Fix release packaging validation to import the shipped installer and model
+  the host filesystem independently of the CI runner's mounts.
 - New ext4 files and directories inherit their parent's ownership. Granted
   mounts reject creation if ownership cannot be claimed, and Linux directory
   symlink handling uses the correct `statx` flags.

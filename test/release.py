@@ -135,6 +135,9 @@ def main():
                 archive.extractall(dest, filter='data')
         module_installer = machine / 'tools/grub_module_install.py'
         assert module_installer.is_file(), 'machine bundle is missing the existing-GRUB module installer'
+        # Resolve sibling imports from the extracted release, before the test
+        # directory's machine_install.py can shadow the shipped installer.
+        sys.path.insert(0, str(machine / 'tools'))
         spec = importlib.util.spec_from_file_location('module_install', module_installer)
         module_install = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module_install)
@@ -189,13 +192,15 @@ def main():
             } <= names
         # Exercise the shipped installer/defaults without assuming CI's host
         # root is ext4 or writing to its /boot and /home directories.
-        sys.path.insert(0, str(machine / 'tools'))
         spec = importlib.util.spec_from_file_location('release_install', machine / 'tools/machine_install.py')
         installer = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(installer)
         home = work / 'croot'
         home.mkdir()
-        installer.validate = lambda *_: '00000000-0000-0000-0000-000000000001'
+        installer.filesystem = lambda *_: {
+            'uuid': '00000000-0000-0000-0000-000000000001',
+            'fstype': 'ext4', 'fsroot': '/', 'target': '/',
+        }
         installer.prepare(home, Path('/boot/retroos'), machine / 'machine_boot.tar')
         assert (vm / 'tools/run/unipcemu.sh').is_file()
         rom = work / 'ROM'
