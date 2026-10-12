@@ -9,6 +9,11 @@ if [[ ! -d "$work/source/.git" ]]; then
     git clone https://github.com/dividebysandwich/rat-commander.git "$work/source"
 fi
 git -C "$work/source" checkout --detach "$revision"
+# Keep the shipped upstream revision reproducible with our navigation fix.
+patch_file="$repo_root/tools/rat_commander_symlink_dirs.patch"
+if ! git -C "$work/source" apply --reverse --check "$patch_file" 2>/dev/null; then
+    git -C "$work/source" apply "$patch_file"
+fi
 # Add a musl cross compiler's bin directory to PATH before running this script.
 # x86_64-linux-musl-gcc is needed by aws-lc, liblzma and zstd.
 command -v x86_64-linux-musl-gcc >/dev/null

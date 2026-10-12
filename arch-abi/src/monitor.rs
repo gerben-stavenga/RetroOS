@@ -243,6 +243,36 @@ pub fn monitor<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     monitor_rs::<A>(arch, regs)
 }
 
+// A fixed environment value, never the host's actual CR0. The ET bit is
+// fixed at one on a 486+: Bytekiss's CPU probe sets it, reads it back and
+// restores CR0 through EBX. Accept those idempotent writes, but continue to
+// fault any request to change CPU modes, paging or FPU control.
+const VM86_CR0: u32 = 0x8000_0011;
+
+fn vm86_cr0(regs: &mut Regs, opcode: u8, modrm: u8) -> bool {
+    if regs.mode() != UserMode::VM86 || !matches!(opcode, 0x20 | 0x22)
+        || !(0xC0..=0xC7).contains(&modrm)
+    {
+        return false;
+    }
+    let register = match modrm & 7 {
+        0 => &mut regs.rax,
+        1 => &mut regs.rcx,
+        2 => &mut regs.rdx,
+        3 => &mut regs.rbx,
+        4 => &mut regs.frame.rsp,
+        5 => &mut regs.rbp,
+        6 => &mut regs.rsi,
+        _ => &mut regs.rdi,
+    };
+    if opcode == 0x20 {
+        *register = (*register & !0xffff_ffff) | u64::from(VM86_CR0);
+        true
+    } else {
+        *register as u32 == VM86_CR0
+    }
+}
+
 /// The decode body, in split `(regs, memory)` form — `step_virtual_if` drives
 /// it with the same two borrows. `A` is used only for its static segment/int
 /// resolution (`A::seg_base` etc.); memory is the `A::PageTable` handle.
@@ -279,15 +309,11 @@ fn monitor_rs<A: Arch>(arch: &mut A, regs: &mut Regs) -> MonitorResult {
     advance += 1;
 
     match opcode {
-        // MOV EAX, CR0 is used by some DOS extenders while probing their
-        // execution environment. In VM86 the real instruction #GPs, but the
-        // guest should see a protected, paged 386+ host rather than the
-        // kernel's actual control register. Control-register writes remain
-        // unsupported: they cannot switch the host CPU out of VM86.
-        0x0F if regs.mode() == UserMode::VM86
-            && peek!(advance) == 0x20 && peek!(advance + 1) == 0xC0 => {
+        // MOV to/from CR0 always uses a 32-bit general register, regardless
+        // of the operand-size prefix. Only reads and unchanged writes are
+        // emulated; genuine mode switches remain unsupported.
+        0x0F if vm86_cr0(regs, peek!(advance), peek!(advance + 1)) => {
             advance_ip(regs, cs_32, advance + 2);
-            regs.rax = (regs.rax & !0xffff_ffff) | 0x8000_0011;
             MonitorResult::Resume
         }
 
@@ -483,6 +509,35 @@ pub fn stepping(regs: &Regs) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytekiss_cpu_probe_reads_and_restores_cr0() {
+        let mut r = Regs::empty();
+        r.set_flags32(VM_FLAG | IF_FLAG | VIF_FLAG | 2);
+        r.rax = 0x1234_5678_0000_0000;
+        let flags = r.flags32();
+        assert!(vm86_cr0(&mut r, 0x20, 0xC0)); // mov eax,cr0
+        assert_eq!(r.rax, 0x1234_5678_8000_0011);
+        r.rbx = r.rax;                        // mov ebx,eax
+        r.rax |= 0x10;                        // or al,10h (ET fixed at one)
+        assert!(vm86_cr0(&mut r, 0x22, 0xC0)); // mov cr0,eax
+        assert!(vm86_cr0(&mut r, 0x20, 0xC0)); // mov eax,cr0
+        assert_eq!(r.rax as u32, r.rbx as u32);
+        assert!(vm86_cr0(&mut r, 0x22, 0xC3)); // mov cr0,ebx
+        assert_eq!(r.flags32(), flags);
+
+        // Writes that actually change CR0 must fault, without modifying the
+        // registers or silently pretending a mode/FPU change succeeded.
+        for mask in [1, 2, 4, 8, 0x10, 0x8000_0000] {
+            r.rax = u64::from(VM86_CR0 ^ mask);
+            assert!(!vm86_cr0(&mut r, 0x22, 0xC0));
+            assert_eq!(r.rax as u32, VM86_CR0 ^ mask);
+        }
+        assert!(!vm86_cr0(&mut r, 0x20, 0xD8)); // CR3
+        assert!(!vm86_cr0(&mut r, 0x20, 0x00)); // invalid memory encoding
+        r.set_flags32(2);
+        assert!(!vm86_cr0(&mut r, 0x20, 0xC0)); // protected-mode caller
+    }
 
     #[test]
     fn popped_reserved_flags_do_not_stick() {

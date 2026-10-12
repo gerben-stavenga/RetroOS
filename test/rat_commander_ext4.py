@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""RC must fall back to console stdio when ext4 contains a Linux /dev/tty inode."""
+"""RC console fallback and Enter navigation through ext4 directory symlinks."""
 from pathlib import Path
 import json
 import shutil
@@ -25,12 +25,15 @@ def main():
         runtime = root / "boot/retroos"
         (runtime / "RETROOS").mkdir(parents=True)
         (root / "home/retroos/RC").mkdir(parents=True)
+        (root / "home/retroos/GAMES/ALLEY").mkdir(parents=True)
+        (root / "home/retroos/RC/Alleycat").symlink_to("/home/retroos/GAMES/ALLEY")
+        (root / "home/retroos/RC/Belmont").symlink_to("../GAMES/ALLEY")
         (root / "dev").mkdir()
         shutil.copyfile(ROOT / "showcase-bundle/COMMANDER/RC/RC.EXE", root / "home/retroos/RC/RC.EXE")
         (runtime / "RETROOS/BOOT.INI").write_text(
-            f'[bundle]\nsource=UUID={UUID}\nsubdir=/boot/retroos\n[mount "linux"]\nsource=UUID={UUID}\npath=/\naccess=ram\n'
+            f'[bundle]\nsource=UUID={UUID}\nsubdir=/boot/retroos\n[mount "linux"]\nsource=UUID={UUID}\npath=/\naccess=rw\ngrant=/home/retroos\n'
             f'[mount "dos"]\nsource=UUID={UUID}\nsubdir=/home/retroos\n'
-            'path=/home/retroos\ndrive=C\naccess=ram\n')
+            'path=/home/retroos\ndrive=C\naccess=rw\ngrant=/home/retroos\n')
         image = work / "root.img"
         with image.open("wb") as stream:
             stream.truncate(128 * 1024 * 1024)
@@ -103,6 +106,34 @@ def main():
                                 return
 
                     call("qmp_capabilities")
+                    def key(name):
+                        call("human-monitor-command", **{"command-line": "sendkey " + name})
+                        time.sleep(.5)
+
+                    def mkdir(name):
+                        key("f7")
+                        for letter in name:
+                            key(letter)
+                        key("ret")
+                        time.sleep(1)
+
+                    # Sorted listing: .., @Alleycat, @Belmont, RC.EXE.
+                    # Create markers only after entering each link; their on-disk
+                    # location proves that Enter reached the target directory.
+                    key("home")
+                    key("down")
+                    key("ret")
+                    time.sleep(2)
+                    mkdir("absolute")
+                    key("home")
+                    key("ret")  # .. back to RC
+                    time.sleep(2)
+                    key("home")
+                    key("down")
+                    key("down")
+                    key("ret")
+                    time.sleep(2)
+                    mkdir("relative")
                     call("human-monitor-command", **{"command-line": "sendkey f10"})
                     time.sleep(.5)
                     call("human-monitor-command", **{"command-line": "sendkey ret"})
@@ -111,7 +142,12 @@ def main():
             if process.poll() is None:
                 process.terminate()
             process.wait(timeout=5)
-    print("PASS: Rat Commander starts and quits with an ext4 /dev/tty device inode (TCG)")
+        for name in ("absolute", "relative"):
+            inode = subprocess.check_output(
+                ["debugfs", "-R", f"stat /home/retroos/GAMES/ALLEY/{name}", str(image)],
+                stderr=subprocess.DEVNULL)
+            assert b"Type: directory" in inode, f"RC did not enter the {name} directory symlink: {inode!r}"
+    print("PASS: RC console fallback and Enter through absolute/relative ext4 directory symlinks (TCG)")
 
 
 if __name__ == "__main__":

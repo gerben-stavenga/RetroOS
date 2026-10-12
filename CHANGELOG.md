@@ -5,6 +5,12 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+- VM86 emulates unchanged CR0 writes used by the Bytekiss CPU probe; the demo
+  is included in the showcase.
+- Rat Commander can enter local directory symlinks. The bundled binary,
+  reproducible build patch, and ext4 navigation checks include the fix.
+- Guest DOS executables carry executable permissions in the source tree.
+
 ## [0.9.1] - 2026-10-12
 
 - Fix release packaging validation to import the shipped installer and model

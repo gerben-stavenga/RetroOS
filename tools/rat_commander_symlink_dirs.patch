@@ -1,0 +1,62 @@
+diff --git a/src/panel/mod.rs b/src/panel/mod.rs
+index 838f479..7c7932a 100644
+--- a/src/panel/mod.rs
++++ b/src/panel/mod.rs
+@@ -659,7 +659,11 @@ impl Panel {
+                 self.cwd.file_name()
+             };
+             self.cwd.parent().map(|p| (p, Some(from)))
+-        } else if e.kind == VfsKind::Dir {
++        } else if e.kind == VfsKind::Dir
++            || (e.kind == VfsKind::Symlink
++                && self.cwd.is_plain_local()
++                && self.cwd.join(&e.name).path.is_dir())
++        {
+             Some((self.cwd.join(&e.name), None))
+         } else {
+             None
+@@ -718,6 +722,44 @@ fn parent_entry() -> VfsEntry {
+ mod tests {
+     use super::*;
+ 
++    #[cfg(unix)]
++    #[tokio::test]
++    async fn entering_local_directory_symlinks_preserves_link_identity() {
++        let nanos =
++            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
++        let root = std::env::temp_dir().join(format!("rc-links-{}-{nanos}", std::process::id()));
++        std::fs::create_dir_all(root.join("games")).unwrap();
++        std::fs::write(root.join("games/marker.txt"), b"target").unwrap();
++        std::fs::write(root.join("file.txt"), b"file").unwrap();
++        for (name, target) in [
++            ("absolute", root.join("games")),
++            ("relative", std::path::PathBuf::from("games")),
++            ("file-link", std::path::PathBuf::from("file.txt")),
++            ("broken", std::path::PathBuf::from("missing")),
++            ("cycle", std::path::PathBuf::from("cycle")),
++        ] {
++            std::os::unix::fs::symlink(target, root.join(name)).unwrap();
++        }
++        let backend = crate::vfs::registry::Registry::default().local();
++        let mut panel = Panel::new(backend.clone(), VfsPath::local(&root));
++        for name in ["absolute", "relative", "file-link", "broken", "cycle"] {
++            panel.cwd = VfsPath::local(&root);
++            panel.reload().await.unwrap();
++            panel.cursor = panel.entries.iter().position(|e| e.name == name).unwrap();
++            assert_eq!(panel.current_entry().unwrap().kind, VfsKind::Symlink);
++            let target = panel.target_dir_under_cursor();
++            if name == "absolute" || name == "relative" {
++                let (target, focus) = target.expect("directory link must be enterable");
++                assert_eq!(target.path, root.join(name));
++                assert!(panel.try_enter(target, backend.clone(), focus.as_deref()).await);
++                assert!(panel.entries.iter().any(|e| e.name == "marker.txt"));
++            } else {
++                assert!(target.is_none(), "file, broken and cyclic links are not directories");
++            }
++        }
++        std::fs::remove_dir_all(root).unwrap();
++    }
++
+     /// Entering a directory starts at the top of its listing: a file inside that
+     /// happens to share the directory's name must not inherit the cursor.
+     #[tokio::test]
