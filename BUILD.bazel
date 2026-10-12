@@ -852,8 +852,11 @@ pkg_tar(
     mode = "0644",
     files = {
         ":machine_boot_tar": "machine_boot.tar",
+        "//kernel:kernel_elf": "kernel.elf",
+        ":root_module_base_gzip": "retroos-base.img.gz",
         ":showcase_module_tar": "showcase.tar",
         "tools/release/install.sh": "install.sh",
+        "tools/install_machine.py": "tools/install_machine.py",
         "tools/machine_install.py": "tools/machine_install.py",
         "tools/grub_module_install.py": "tools/grub_module_install.py",
         "etc/RETROOS.INI": "etc/RETROOS.INI",

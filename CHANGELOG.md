@@ -5,11 +5,49 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-11
+
+### Installation and storage
+
+- The normal machine installer supports disk-backed runtimes on FAT and ext4
+  with the same C: layout. Runtime versions, `BOOT.INI` and `RETROOS.INI` live
+  beneath `C:\RETROOS`; GRUB loads the kernel and settings, and RetroOS reads
+  the runtime from disk. An ext4 Linux-root installation keeps Linux's Unix
+  root; a separate data volume uses the bundled BusyBox root.
+- Separate and Btrfs boot filesystems work with a supported disk runtime.
+  RAM-module boot remains available for USB/ISO, explicit `--module`, and
+  installations without a supported disk C:.
+- A single eligible data volume is selected automatically. Preparation records
+  the installer strategy, and installation preserves settings and existing
+  showcase files. `--copy-showcase` also works with module installation.
+- Both INIs on persistent C: remain editable from RetroOS. Upgrades migrate
+  old boot-directory settings, refresh the matched runtime path, and retire
+  stale managed GRUB entries. File bindings retain file metadata in directory
+  listings instead of appearing as directories.
+- ATA LBA48 uses the shared PIO/DMA transfer path, enabling full disk sizes
+  and partitions beyond the LBA28 limit. QEMU checks cover persistent reads
+  and writes beyond 2 TiB with both transports.
+
+### Audio and time
+
+- Sound Blaster and GUS libraries expose pull-based DMA actions: `advance`
+  consumes the previous transfer result and returns work for the host. Cards
+  receive neither a DMA controller nor guest-memory access. SB guest addresses
+  remain in the kernel, and GUS supports partial uploads and download actions.
+  Existing SB producer-clock and interrupt timing is retained.
+- BIOS RTC date calls and shared local/UTC clock configuration support
+  `rtc=local` or `rtc=utc` with a fixed UTC offset. DOS, Windows and OS/2 use
+  the shared date/time conversions, including local filesystem timestamps.
+
+### Hardware and verification
+
 - xHCI root-port initialization powers ports before discovery and uses Linux's
-  safe PORTSC write mask, connection debounce, reset checks and recovery delay. Failed
-  enumeration stages are logged. Real-hardware keyboard recovery for issue #60
-  still needs validation; older USB host controllers and external hubs remain
-  unsupported.
+  safe PORTSC write mask, connection debounce, reset checks and recovery delay.
+  Failed enumeration stages are logged. Older USB host controllers and
+  external hubs remain unsupported.
+- Tests cover FAT and ext4 disk-runtime boots, BusyBox command aliases,
+  configuration persistence across reboot, protected-disk behavior, audio
+  device probes and sustained HDA playback.
 
 ## [0.8.2] - 2026-10-10
 

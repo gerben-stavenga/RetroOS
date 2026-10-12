@@ -139,7 +139,7 @@ run() {
     # Every suite belongs to one group; new unclassified suites remain in DOS.
     local group=dos
     case "$name" in
-        physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_layout|dn_state|module_*) group=boot ;;
+        physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
         ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
@@ -185,6 +185,7 @@ run disk_selection storage_selection python3 test/disk_selection.py
 run extra_drives storage_selection python3 test/extra_drives.py
 run isapnp_smoke isapnp_tools python3 test/isapnp_smoke.py
 run machine_layout machine_layout python3 test/machine_layout.py
+run machine_fat grub_fat python3 test/machine_fat.py
 run dn_state     dn_state  python3 test/dn_state.py
 run module_games_metadata module_tools bash test/grub_module_games_metadata.sh
 run module_disk   module_qemu   bash test/grub_module_physical_fallback.sh

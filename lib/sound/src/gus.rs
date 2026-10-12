@@ -19,11 +19,10 @@
 //!
 //! Passive, per the crate contract: the chip never reads a clock, never
 //! touches an interrupt controller, and never learns where its DMA channel
-//! points. [`Gf1::advance`] is handed elapsed time, [`Gf1::take_irq`] reports that
-//! the line went active, and [`Gf1::dma_write`] takes bytes the host already
-//! fetched. Which port base, IRQ and DMA channel the card is strapped to is
-//! host configuration (the guest's `ULTRASND=` contract); only `base` is
-//! needed here, to decode.
+//! points. [`Gf1::advance`] consumes elapsed time and the preceding DMA
+//! result, then returns the next action for the host to execute.
+//! [`Gf1::take_irq`] reports timer/transfer edges. Wiring belongs to the host
+//! (the guest's `ULTRASND=` contract); only the port base is needed here.
 
 use crate::{Engine, LoopMode, volume};
 use alloc::boxed::Box;
@@ -435,13 +434,36 @@ impl Gf1 {
         }
     }
 
-    /// Advance the rate timers by `dt_ns` monotonic nanoseconds.
-    ///
-    /// The GF1's two timers are rate generators: T1 counts 80 µs units, T2
-    /// 320 µs, and the count register holds 256 − n. Multiple expiries inside
-    /// one tick coalesce — an unserviced edge-latched line coalesces on
-    /// hardware too.
-    pub fn advance(&mut self, dt_ns: u64) {
+    /// Consume the preceding DMA result, advance timers by elapsed nanoseconds,
+    /// and return the next transfer action. A zero-time step executes only the
+    /// transfer protocol. Asking for an action never moves bytes or completes
+    /// a transfer; partial results leave the remaining transfer armed.
+    pub fn advance(
+        &mut self,
+        dt_ns: u64,
+        completion: Option<crate::dma::Completion<'_>>,
+    ) -> Option<crate::dma::Request<'_>> {
+        if let Some(completion) = completion {
+            self.complete_transfer(completion);
+        }
+        self.advance_timers(dt_ns);
+        let c = self.core.as_ref()?;
+        if !c.dma_armed {
+            return None;
+        }
+        if c.reg41 & 0x02 == 0 {
+            Some(crate::dma::Request::Read {
+                offset: 0,
+                bytes: DRAM_LEN.saturating_sub(c.dma_dest),
+                wrap_bytes: None,
+            })
+        } else {
+            Some(crate::dma::Request::Write { bytes: &c.dram[c.dma_dest..] })
+        }
+    }
+
+    // T1 counts 80 µs units, T2 320 µs; unserviced expiries coalesce.
+    fn advance_timers(&mut self, dt_ns: u64) {
         let Some(c) = self.core.as_mut() else { return };
         // A long background gap coalesces rather than synthesizing a backlog.
         let dt_ns = dt_ns.min(100_000_000);
@@ -505,59 +527,39 @@ impl Gf1 {
 
     // ── sample upload (the card end of a DMA cycle) ──────────────────────
 
-    /// A guest-programmed upload is armed and waiting for bytes. The card
-    /// knows a transfer was kicked and what to do with the data; it does not
-    /// know which channel it sits on or where that points — the host holds
-    /// the DMA controller and the guest's memory.
-    pub fn dma_armed(&self) -> bool {
-        self.core.as_ref().is_some_and(|c| c.dma_armed)
-    }
-
-    /// Direction of the armed transfer: `true` = host memory → card DRAM (a
-    /// sample upload, the only direction that carries data here). `false` is
-    /// the GF1's DRAM→host record path, which completes without data.
-    pub fn dma_to_card(&self) -> bool {
-        self.core.as_ref().is_some_and(|c| c.reg41 & 0x02 == 0)
-    }
-
-    /// Hand the card `bytes` the host moved on its DMA channel, applying the
-    /// reg-0x41 transforms on the way into DRAM — bit7 = invert MSB
-    /// (unsigned→signed samples; bit6 picks 8- vs 16-bit sample width). The
-    /// 16-bit-channel address doubling (bit2) was applied to the destination
-    /// when the transfer armed. Returns bytes accepted, which is short of
-    /// `bytes.len()` only when the upload would run off the end of DRAM.
-    ///
-    /// `tc` marks the controller reaching terminal count with this chunk: it
-    /// completes the transfer, latches the poll-visible TC state, and (when
-    /// reg-0x41 bit 5 is set) arms the completion IRQ for the next tick.
-    /// Feed in one chunk or a hundred — the card counts what it received.
-    pub fn dma_write(&mut self, bytes: &[u8], tc: bool) -> usize {
-        let Some(c) = self.core.as_mut() else { return 0 };
+    /// Consume the actual transfer result. Upload transforms use cumulative
+    /// byte parity, so a partial transfer is identical to a single long one.
+    fn complete_transfer(&mut self, completion: crate::dma::Completion<'_>) {
+        let Some(c) = self.core.as_mut() else { return };
         if !c.dma_armed {
-            return 0;
+            return;
         }
-        let mut n = 0;
-        if c.reg41 & 0x02 == 0 {
-            n = bytes.len().min(DRAM_LEN.saturating_sub(c.dma_dest));
-            // Sixteen-bit sample data inverts only the high byte of each
-            // frame; eight-bit data inverts every byte. The parity is taken
-            // from the running transfer offset, not this chunk's, so a
-            // chunked feed lands identically to a single-shot one.
-            let invert = c.reg41 & 0x80 != 0;
-            let wide = c.reg41 & 0x40 != 0;
-            for (i, &b) in bytes[..n].iter().enumerate() {
-                let flip = invert && (!wide || (c.dma_done + i) & 1 == 1);
-                c.dram[c.dma_dest + i] = if flip { b ^ 0x80 } else { b };
+        let tc = match completion {
+            crate::dma::Completion::Read { bytes, terminal_count } if c.reg41 & 0x02 == 0 => {
+                let n = bytes.len().min(DRAM_LEN.saturating_sub(c.dma_dest));
+                let invert = c.reg41 & 0x80 != 0;
+                let wide = c.reg41 & 0x40 != 0;
+                for (i, &b) in bytes[..n].iter().enumerate() {
+                    let flip = invert && (!wide || (c.dma_done + i) & 1 == 1);
+                    c.dram[c.dma_dest + i] = if flip { b ^ 0x80 } else { b };
+                }
+                c.dma_dest += n;
+                c.dma_done += n;
+                terminal_count
             }
-            c.dma_dest += n;
-            c.dma_done += n;
-        }
+            crate::dma::Completion::Write { bytes, terminal_count } if c.reg41 & 0x02 != 0 => {
+                let n = bytes.min(DRAM_LEN.saturating_sub(c.dma_dest));
+                c.dma_dest += n;
+                c.dma_done += n;
+                terminal_count
+            }
+            _ => return,
+        };
         if tc {
             c.dma_armed = false;
             c.dma_tc = true;
             c.dma_irq_latch = c.reg41 & 0x20 != 0;
         }
-        n
     }
 
     // ── PCM ──────────────────────────────────────────────────────────────
@@ -899,5 +901,84 @@ impl Core {
         } else {
             word as u8
         }
+    }
+}
+
+#[cfg(test)]
+mod dma_tests {
+    use super::*;
+    use crate::dma::{Completion, Request};
+
+    fn armed(control: u8) -> Gf1 {
+        let mut card = Gf1::new(0x240);
+        card.core = Some(Core::new_boxed());
+        let c = card.core.as_mut().unwrap();
+        c.reg41 = control;
+        c.reset_reg = 0x04;
+        c.dma_armed = true;
+        card
+    }
+
+    #[test]
+    fn asking_for_dma_does_not_complete_or_move_bytes() {
+        let mut card = armed(0x21);
+        for _ in 0..2 {
+            assert_eq!(card.advance(0, None), Some(Request::Read {
+                offset: 0, bytes: DRAM_LEN, wrap_bytes: None,
+            }));
+        }
+        let c = card.core.as_ref().unwrap();
+        assert_eq!(c.dma_done, 0);
+        assert!(!c.dma_tc);
+        assert!(!card.take_irq());
+    }
+
+    #[test]
+    fn partial_upload_preserves_word_parity_and_waits_for_terminal_count() {
+        let mut card = armed(0xE1); // invert high sample bytes, DMA IRQ enabled
+        let request = card.advance(0, Some(Completion::Read {
+            bytes: &[1, 2, 3], terminal_count: false,
+        }));
+        assert_eq!(request, Some(Request::Read {
+            offset: 0, bytes: DRAM_LEN - 3, wrap_bytes: None,
+        }));
+        assert!(!card.core.as_ref().unwrap().dma_tc);
+        assert_eq!(card.advance(0, Some(Completion::Read {
+            bytes: &[4, 5], terminal_count: true,
+        })), None);
+        let c = card.core.as_ref().unwrap();
+        assert_eq!(&c.dram[..5], &[1, 0x82, 3, 0x84, 5]);
+        assert_eq!(c.dma_done, 5);
+        assert!(c.dma_tc);
+        assert!(!card.take_irq(), "DMA edge is delivered on the next timer tick");
+        let _ = card.advance(1, None);
+        assert!(card.take_irq());
+        assert!(!card.take_irq());
+    }
+
+    #[test]
+    fn download_exposes_card_bytes_and_advances_only_by_actual_writes() {
+        let mut card = armed(0x03);
+        card.core.as_mut().unwrap().dram[..4].copy_from_slice(&[10, 20, 30, 40]);
+        let Some(Request::Write { bytes }) = card.advance(0, None) else { panic!("download request") };
+        assert_eq!(&bytes[..4], &[10, 20, 30, 40]);
+        let Some(Request::Write { bytes }) = card.advance(0, Some(Completion::Write {
+            bytes: 2, terminal_count: false,
+        })) else { panic!("remaining download") };
+        assert_eq!(&bytes[..2], &[30, 40]);
+        assert_eq!(card.advance(0, Some(Completion::Write { bytes: 2, terminal_count: true })), None);
+        assert_eq!(card.core.as_ref().unwrap().dma_done, 4);
+    }
+
+    #[test]
+    fn upload_is_bounded_by_card_ram_and_rejects_wrong_direction() {
+        let mut card = armed(1);
+        card.core.as_mut().unwrap().dma_dest = DRAM_LEN - 1;
+        let _ = card.advance(0, Some(Completion::Write { bytes: 10, terminal_count: true }));
+        assert_eq!(card.core.as_ref().unwrap().dma_done, 0);
+        let _ = card.advance(0, Some(Completion::Read { bytes: &[7, 8], terminal_count: true }));
+        let c = card.core.as_ref().unwrap();
+        assert_eq!(c.dram[DRAM_LEN - 1], 7);
+        assert_eq!(c.dma_done, 1);
     }
 }

@@ -3,7 +3,7 @@
 GRUB supplies the kernel and two ordinary configuration files: `BOOT.INI`
 for bundle backing and mounts, and `RETROOS.INI` for user settings.
 
-## Disk-backed installation (ext4)
+## Machine installation (ext4 or FAT)
 
 ```sh
 tools/install_kernel.sh --prepare
@@ -11,15 +11,38 @@ tools/install_kernel.sh --prepare
 sudo tools/install_kernel.sh
 ```
 
-The installer keeps kernel/runtime files under `/boot/retroos/releases/<version>/`,
-mount policy at `/boot/retroos/BOOT.INI`, and user settings permanently at
-`/home/retroos/RETROOS/RETROOS.INI` (`C:\RETROOS\RETROOS.INI`).
-GRUB loads both INIs separately. RetroOS opens the bundle directory by the UUID
-and `subdir` in `[bundle]`, so no filesystem image is loaded into RAM and no
-RAM-to-disk handoff is needed. Runtime writes use a sparse session overlay;
-user settings and C: data persist in the persistent entry. Upgrades preserve
-user settings and existing mount choices. The installer currently requires
-`/boot` and C: on the ext4 Linux root.
+The same installer accepts a FAT data volume without `--module`:
+
+```sh
+tools/install_kernel.sh --prepare --c-uuid=ABCD-1234 --copy-showcase
+sudo tools/install_kernel.sh
+```
+
+Use the filesystem UUID of the data volume, not the EFI partition. A mounted
+FAT volume can instead be selected with `--c-root=/mnt/data`. Nothing is
+formatted. The installer remembers the prepared layout, so the installation
+command needs no storage flags. The release bundle uses the same commands
+with `./install.sh`.
+
+FAT and ext4 use the same disk-backed C: layout. Both INIs live under
+`C:\RETROOS`, and the matched runtime is versioned beneath
+`C:\RETROOS\releases\<version>`. GRUB loads only the kernel and INIs;
+RetroOS reads the runtime directly from the selected disk. Kernel files live
+under `/boot/retroos/releases/<version>/` (or `--destination`). `/boot` may
+be separate or Btrfs because only GRUB needs to read those kernel files.
+
+On the default ext4 Linux-root installation, C: is `/home/retroos` and the
+Linux filesystem supplies `/`, `/bin` and `/usr/bin`. A separate FAT or
+ext4 data volume uses the bundled BusyBox root unless a Linux root is
+explicitly selected with `--root-uuid`. The RetroOS C: tree is identical.
+Unix command aliases use the same link manifest on both filesystems.
+
+User settings and C: data persist in the persistent entry. Runtime edits use
+a session overlay. Upgrades preserve existing user settings and extra mount
+choices while updating the matched runtime path. Protected-disk edits remain
+session-only. `--module` explicitly selects the RAM-core alternative; it is
+also used when there is no supported disk C: or when `--image` supplies a
+USB/ISO core.
 
 ## Clock settings
 
@@ -48,8 +71,9 @@ because RetroOS cannot read USB storage yet. `[bundle] source=module` selects
 that image. Default boot loads the 16 MiB core (runtime libraries, DN and
 BusyBox) plus one 256 MiB showcase module with VC, MC, RC, NDN
 (DOS/Windows/OS/2), DN/2 (DOS/Windows/OS/2) and games. The “Core only
-(less RAM)” choice omits the showcase module. The user INI is exposed at `C:\RETROOS\RETROOS.INI` as session content;
-edit the ordinary USB file from another OS for persistent changes.
+(less RAM)” choice omits the showcase module. With RAM C:, the user INI is session content; edit the ordinary USB file
+from another OS for persistent changes. An existing INI on a selected disk C:
+keeps its disk backing.
 
 ## Module installation for filesystems RetroOS cannot read
 
@@ -73,9 +97,12 @@ data volume, the RAM module supplies C:. Use `--c-ram` to choose this explicitly
 For ext4, add `--c-dir=/path/on/volume` during preparation to use a different
 C: directory; the installer creates that directory and passes the same path
 through the INI mount configuration. The default is `/home/retroos` on the selected ext4 volume.
-When Linux `/` is Btrfs, RAM C: is the default; use `--c-uuid` to select a
-separate supported data volume. The RAM module always supplies
-`C:\RETROOS`, even when C: data lives on a physical disk.
+With one eligible FAT/ext4 volume, it is selected automatically, including
+on Btrfs hosts. Multiple candidates require `--c-uuid` or `--c-root`. With
+no supported volume, C: uses RAM. Existing RetroOS files are not required. The RAM module supplies the runtime in `C:\RETROOS`; user and boot INIs on
+physical C: keep their disk backing. Upgrading an older installation copies
+the boot-directory settings into C: once, preserving existing C: settings.
+Add `--copy-showcase` to copy missing games and commanders into physical C:.
 
 For example, with Linux `/boot` on Btrfs and a separate FAT32 data partition,
 find that partition's UUID and prepare the entry with it:
@@ -89,9 +116,9 @@ sudo tools/install_kernel.sh --module
 
 Replace `ABCD-1234` with the FAT32 data partition's UUID, not the EFI System
 Partition's UUID. The installer stores `kernel.elf` and
-`retroos-base.img.gz` under Linux `/boot/retroos/releases/...`, with both INIs
-at `/boot/retroos/`; GRUB reads
-them from Btrfs before starting RetroOS. RetroOS then reads the selected
+`retroos-base.img.gz` under Linux `/boot/retroos/releases/...`. With physical
+C:, both INIs live in its `RETROOS/` directory; GRUB loads them directly from
+that data volume. With RAM C:, the INIs stay under `/boot/retroos/`. RetroOS then reads the selected
 FAT32 partition as C:. It cannot read Btrfs itself, so `C:\RETROOS` comes
 from the RAM base module and the Btrfs boot filesystem is not C:.
 

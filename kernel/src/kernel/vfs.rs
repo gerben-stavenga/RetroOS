@@ -877,6 +877,29 @@ impl Vfs {
             }
         }
 
+        // An exact file bind may be absent from the backing directory, or
+        // replace a file with different metadata. Resolve its target before
+        // caching: synthetic mount ancestors are directories, file binds are
+        // not. In particular, a bound BOOT.INI must not become a directory fd.
+        for entry in &mut entries {
+            let mut child = dir.to_vec();
+            if !child.is_empty() && !child.ends_with(b"/") { child.push(b'/'); }
+            child.extend_from_slice(&entry.name[..entry.name_len]);
+            if self.mounts.iter().any(|binding| {
+                eq_ignore_case(binding.prefix.strip_suffix(b"/").unwrap_or(binding.prefix), &child)
+            }) && let Some(object) = self.resolve_object(&child, ALIAS_DEPTH) {
+                entry.size = object.stat.size;
+                entry.mode = self.modes.get(&child).copied().unwrap_or(u32::from(object.stat.mode)) as u16;
+                entry.is_dir = object.stat.is_dir;
+                entry.is_symlink = object.stat.is_symlink;
+                entry.mtime = self.mtimes.get(&child).copied().or_else(|| object.fs.mtime(object.subpath())).unwrap_or(0);
+                entry.dos_attributes = self.dos_attributes.get(&child).copied().or_else(|| object.fs.dos_attributes(object.subpath()));
+                entry.mount_idx = object.mount_idx;
+                // The original directory's node belongs to the shadowed fs.
+                entry.node = 0;
+            }
+        }
+
         self.dir_cache.push(DirCache::new(dir, entries, visible_names));
     }
 
@@ -2318,6 +2341,38 @@ mod tests {
         let meta = fs.meta(b"home/file").unwrap();
         assert_eq!((meta.uid, meta.gid, meta.mode), (1000, 999, 0o644));
         assert!(vfs.may_write(0, b"home/file"));
+    }
+
+    #[test]
+    fn bound_files_use_target_metadata_even_when_missing_from_the_parent() {
+        use crate::kernel::fs::session;
+        let runtime = alloc::boxed::Box::leak(session::new());
+        let backing = alloc::boxed::Box::leak(session::new());
+        let old = runtime.create(b"USER.INI").unwrap();
+        assert_eq!(runtime.write(old.handle, 0, b"old"), 3);
+        runtime.clunk(old.handle);
+        for name in [b"settings".as_slice(), b"mounts".as_slice()] {
+            let file = backing.create(name).unwrap();
+            assert_eq!(backing.write(file.handle, 0, b"disk settings"), 13);
+            backing.clunk(file.handle);
+        }
+        let mut vfs = Vfs::new();
+        vfs.mount(b"", runtime);
+        vfs.mount(b"backing/", backing);
+        vfs.bind(b"USER.INI", b"backing/settings", super::MountMode::Replace);
+        vfs.bind(b"BOOT.INI", b"backing/mounts", super::MountMode::Replace);
+        for name in [b"USER.INI".as_slice(), b"BOOT.INI".as_slice()] {
+            assert!(!vfs.dir_exists(name), "file bind must not synthesize a directory");
+            let stat = vfs.stat(name, true).unwrap();
+            assert_eq!(stat.size, 13);
+            assert!(!stat.is_dir);
+            let handle = vfs.open_to_handle(name);
+            assert!(handle >= 0);
+            let mut bytes = [0; 13];
+            assert_eq!(vfs.read_by_handle(handle, &mut bytes), 13);
+            assert_eq!(&bytes, b"disk settings");
+            vfs.close_handle(handle);
+        }
     }
 
     struct FailingCreateFs;

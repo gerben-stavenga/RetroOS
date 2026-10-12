@@ -10,15 +10,14 @@
 //!    discipline [`Engine::mix_frame`] already uses for its rate.
 //!  - **IRQ** — the card reports that it wants service; the host owns the
 //!    interrupt controller and decides what that means.
-//!  - **sample bytes** — a card names its *own* memory and the DMA registers
-//!    the guest programmed into it, and nothing else. No guest physical
-//!    address, no 8237, no page register: it knows a transfer is armed, never
-//!    where the bytes live. The host moves them.
+//!  - **DMA** — `advance` returns an action and consumes the preceding
+//!    completion. No guest physical address, no 8237, no page register:
+//!    the host resolves relative source windows and moves the sample bytes.
 //!
 //! That is the whole contract. A host with a completely different memory
 //! model, clock, or interrupt path hooks a card up by calling these and
-//! supplying bytes — there is no trait to implement and no callback to
-//! register. See `SOUND_LIB_DESIGN.md` at the repo root for why each of those
+//! feeding transfer results back — there is no trait to implement and no
+//! callback to register. See `SOUND_LIB_DESIGN.md` at the repo root for why each of those
 //! lines sits where it does.
 //!
 //! The same discipline covers the OUTPUT side ([`sink`]): a ring of PCM plus
@@ -36,6 +35,7 @@
 extern crate alloc;
 
 pub mod sink;
+pub mod dma;
 pub mod pacer;
 pub mod engine;
 pub mod gus;

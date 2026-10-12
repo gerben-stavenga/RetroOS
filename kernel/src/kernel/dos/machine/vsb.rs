@@ -39,7 +39,7 @@
 //! The ring is the interesting one. The GUS files samples into its own DRAM
 //! and mixes from memory it owns; the SB DSP streams the guest's DMA ring
 //! straight to its DAC and owns nothing. So at mix time the card names the
-//! window it needs ([`sound::sb::Sb::dsp_fetch`]) and *we* move those bytes —
+//! window it needs ([`sound::sb::Sb::advance`]) and *we* move those bytes —
 //! the guest's address space is ours to reach, never the card's.
 
 use crate::Regs;
@@ -217,6 +217,8 @@ impl SbDevice {
 pub struct EmulatedSb {
     /// The library card: DSP register file + command FSM, CT1745 mixer, OPL.
     core: sound::sb::Sb,
+    /// Guest address belongs to the machine, never the card model.
+    dma_base: u32,
     /// Incremental DSP source position in Q32.32 frames. The output mix rate
     /// may change to regulate physical pipe depth, so reconstructing this from
     /// an absolute output frame and the latest rate would warp its history.
@@ -265,6 +267,7 @@ impl EmulatedSb {
     fn new() -> Box<Self> {
         Box::new(Self {
             core: sound::sb::Sb::new(),
+            dma_base: 0,
             mix_pos_q32: 0,
             est_frames: 0, est_tsc: 0, est_cap: 0, est_slope: 0, est_served: 0,
             probe_steps: 0,
@@ -580,7 +583,8 @@ impl EmulatedSb {
         }
         let prog = dma.ch[chan].prog;
         let (gpa, len) = chan_gpa_len(&prog, is16);
-        self.core.begin(start, gpa, len);
+        self.dma_base = gpa;
+        self.core.begin(start, len);
         self.probe_steps = if self.core.short_probe_active() {
             PROBE_DELAY_STEPS
         } else {
@@ -647,45 +651,33 @@ impl EmulatedSb {
         let step_q32 = ((u64::from(self.core.rate().max(1))) << 32)
             / u64::from(rate.max(1));
         let start_q32 = self.mix_pos_q32;
-        let last = if block.is_empty() {
-            start_q32 >> 32
-        } else {
-            start_q32
-                .wrapping_add(step_q32.wrapping_mul(block.len() as u64 - 1))
-                >> 32
+        let step = sound::sb::Step::Mix {
+            rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
         };
-        if let Some(f) = self.core.dsp_fetch(start_q32 >> 32, last) {
-            let fb = f.frame_bytes as usize;
-            let need = f.source_frames * fb;
-            let Some(scratch) = self.dsp_scratch.get_mut(..need) else {
-                debug_assert!(false, "SB fetch exceeds fixed mixer block");
-                self.core.mix_fm(rate, block);
+        let request = self.core.advance(step, None).dma;
+        if let Some(sound::dma::Request::Read { offset, bytes, wrap_bytes }) = request {
+            let Some(scratch) = self.dsp_scratch.get_mut(..bytes) else {
+                debug_assert!(false, "SB DMA request exceeds fixed mixer block");
+                self.core.advance(sound::sb::Step::Mix {
+                    rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+                }, Some(sound::dma::Completion::Read { bytes: &[], terminal_count: false }));
                 return;
             };
-            let mut copied = 0usize;
-            while copied < f.source_frames {
-                let abs = f.first + copied as u64;
-                let pos = (abs % f.buf_frames as u64) as usize;
-                let run = (f.source_frames - copied).min(f.buf_frames as usize - pos);
-                let addr = f.gpa as usize + pos * fb;
-                let lo = copied * fb;
-                machine.copy_from(addr, &mut scratch[lo..lo + run * fb]);
+            let ring = wrap_bytes.expect("SB source is cyclic");
+            let mut copied = 0;
+            while copied < bytes {
+                let pos = (offset + copied) % ring;
+                let run = (bytes - copied).min(ring - pos);
+                machine.copy_from(self.dma_base as usize + pos, &mut scratch[copied..copied + run]);
                 copied += run;
             }
-            if physical_sb {
-                self.core.mix_dsp_physical(start_q32, step_q32, scratch, &f, block);
-            } else {
-                self.core.mix_dsp(start_q32, step_q32, scratch, &f, block);
-            }
+            self.core.advance(sound::sb::Step::Mix {
+                rate, position_q32: start_q32, step_q32, block, physical: physical_sb,
+            }, Some(sound::dma::Completion::Read { bytes: scratch, terminal_count: false }));
         }
         if self.core.playing() {
             self.mix_pos_q32 = self.mix_pos_q32
                 .wrapping_add(step_q32.wrapping_mul(block.len() as u64));
-        }
-        if physical_sb {
-            self.core.mix_fm_physical(rate, block);
-        } else {
-            self.core.mix_fm(rate, block);
         }
     }
 
@@ -700,7 +692,7 @@ impl EmulatedSb {
     ) {
         let produced = self.mix_pos_q32 >> 32;
         if self.probe_steps == 0
-            && self.core.advance_clock(now_ns, produced)
+            && self.core.advance(sound::sb::Step::Clock { now: now_ns, produced }, None).irq
             && !vpic.is_requested(irq)
         {
             vpic.raise(irq);

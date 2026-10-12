@@ -52,7 +52,32 @@ USB image for forum troubleshooting. Extract it and write the IMG to the whole
 stick. It uses the same fixed MBR and editable GRUB menu as the full image;
 the ZIP stays below the 5 MB attachment limit.
 
-## Install into an existing GRUB menu from the USB image
+## Machine installation alongside Linux
+
+The machine bundle contains the matched disk runtime, kernel and RAM core.
+For a standard ext4 Linux installation:
+
+```sh
+./install.sh --prepare --copy-showcase
+sudo ./install.sh
+```
+
+To use a FAT data volume for C:, pass its filesystem UUID during preparation:
+
+```sh
+./install.sh --prepare --c-uuid=ABCD-1234 --copy-showcase
+sudo ./install.sh
+```
+
+FAT and ext4 use the same disk-backed layout: runtime versions and both
+INIs live beneath `C:\RETROOS`. GRUB loads the kernel and INIs; RetroOS
+reads the runtime from disk. A separate or Btrfs `/boot` works because GRUB
+reads the kernel there. On an ext4 Linux-root installation, Linux supplies
+the Unix root; a separate data volume uses the bundled BusyBox root.
+The installer remembers the prepared layout and does not format partitions. Existing settings and showcase files are preserved. Select
+the persistent entry to keep edits; protected-disk changes stay in RAM.
+
+## Optional: use a core from a USB/ISO image
 
 The same USB image also supplies `/boot/kernel.elf` and
 `/boot/retroos-base.img.gz` for an existing GRUB installation. They must come
@@ -61,17 +86,18 @@ off to RetroOS, so the source image need not remain attached afterward.
 The full manual entry, including firmware video policy and disk protection,
 is in [BOOTING.md](https://github.com/gerben-stavenga/RetroOS/blob/master/BOOTING.md#manual-grub-deployment).
 
-The machine bundle installer reads those files directly from partition 1 of
-the USB image with `mcopy` (mtools). Download both release files into one
-directory, then run:
+An explicit `--image` selects the core from a USB image instead of the
+matched core already in the machine bundle. The installer reads its boot
+files with `mcopy` (mtools). For this optional path, place both releases
+together and run:
 
 ```sh
 mkdir retroos-install
 tar -xzf retroos-machine.tar.gz -C retroos-install
 cd retroos-install
-./install.sh --module --prepare --image="$PWD/../retroos_grub_module_usb.img"
+./install.sh --prepare --image="$PWD/../retroos_grub_module_usb.img"
 cat build/grub-module-install/*/grub.cfg
-sudo ./install.sh --module
+sudo ./install.sh
 ```
 
 Preparation discovers GRUB's boot filesystem and supported data volumes. If
@@ -80,15 +106,17 @@ to select the RAM module for C: explicitly. An ext4 C: volume may be
 unmounted during preparation; installation mounts it temporarily to ensure
 `home/retroos` exists, then unmounts it. Use `--c-dir=/path/on/volume` to
 choose another directory on that ext4 volume; `/home/retroos` is the default.
-On a Btrfs Linux root, RAM C: is the default because RetroOS does not support
-Btrfs. The module supplies `C:\RETROOS` from RAM in every case.
+A single eligible FAT/ext4 volume is selected automatically, including on
+Btrfs hosts. Multiple candidates require a selection; with none, C: uses
+RAM. Runtime files use RAM, while the two INIs on physical C: retain their
+disk backing. Older boot-directory INIs seed C: once during installation.
 
 If `/boot` is on Btrfs and a separate FAT32 data partition should be C:,
 prepare with the FAT32 data partition's UUID, not the EFI partition's:
 
 ```sh
 lsblk -o NAME,FSTYPE,UUID,PARTTYPE,MOUNTPOINTS
-./install.sh --module --prepare --image="$PWD/../retroos_grub_module_usb.img" --c-uuid=ABCD-1234
+./install.sh --prepare --image="$PWD/../retroos_grub_module_usb.img" --c-uuid=ABCD-1234
 ```
 
 The default entry protects physical disks by diverting writes to RAM. Choose

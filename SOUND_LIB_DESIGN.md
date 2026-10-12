@@ -1,5 +1,47 @@
 # Sound cards as a host-agnostic library
 
+## Current pull interface
+
+`//lib:sound` uses explicit DMA requests and completions (`sound::dma`).
+Neither card receives a controller, a guest address, a memory callback, or an
+architecture handle. The host executes a returned request and feeds the
+actual result back through `advance`; there is no separate request polling
+or completion method.
+
+```rust
+// GF1: elapsed timer time plus the preceding transfer result.
+fn advance(&mut self, dt_ns: u64, completion: Option<dma::Completion<'_>>)
+    -> Option<dma::Request<'_>>;
+
+// SB: either a device-clock step or a rendering step, plus transfer result.
+fn advance(&mut self, step: sb::Step<'_>, completion: Option<dma::Completion<'_>>)
+    -> sb::Effects<'_>;
+```
+
+A GF1 read action requests sample-upload bytes, bounded by remaining onboard
+RAM. A write action borrows the onboard bytes to download; the host reports
+how many it actually wrote. Partial transfers retain byte parity and only a
+reported terminal count completes the upload/download. Timer and voice IRQ
+cadences remain separate.
+
+An SB mix step specifies the output rate, source phase and output block. The
+first call returns a read action without touching that block. The host
+linearizes the requested source window, then repeats the same mix step with
+the completion to render exactly once. Missing or partial source frames
+contribute no audio. Requests contain relative byte offsets and cyclic
+geometry, never guest addresses. The host retains the ring base address.
+
+SB clock steps retain producer-clock IRQ/cursor accounting independently of
+rendering. This interface change does not replace that existing timing model
+with a cycle-level DMA simulation. The reported source length still bounds
+single-cycle playback and controller readback.
+
+A convenience adapter can execute the returned actions against `&mut Dma`
+and RAM, but the primitive API imposes neither representation.
+
+The following sections record the original extraction design and its
+subsequent revisions; the interface above supersedes their API sketches.
+
 Design for lifting the emulated sound cards (`vgus.rs`, `vsb.rs`, `opl.rs`)
 out of `kernel/src/kernel/dos/machine/` into a standalone library, so that a
 card is a passive state machine any emulator can drive — and so AWE32 and

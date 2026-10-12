@@ -2,8 +2,11 @@
 """Stage and install a matched RetroOS GRUB module boot on an existing Linux system."""
 
 import argparse
+import configparser
+from contextlib import contextmanager
 import hashlib
 import json
+import io
 import os
 from pathlib import Path
 import re
@@ -11,10 +14,14 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import tarfile
+
+from machine_install import copy_showcase_tree, retire_managed
 
 ROOT = Path(__file__).resolve().parent.parent
 STAGE_ROOT = ROOT / "build" / "grub-module-install"
 MANAGED = Path("/etc/grub.d/42_retroos_module")
+OTHER_MANAGED = Path("/etc/grub.d/41_retroos")
 ESP_TYPES = {"0xef", "ef", "c12a7328-f81f-11d2-ba4b-00a0c93ec93b"}
 UUID_FORMAT = re.compile(r"(?:[0-9a-fA-F]{4}-[0-9a-fA-F]{4}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\Z")
 
@@ -71,10 +78,10 @@ def choose_c_volume(volumes, requested):
     raise ValueError(f"Select one C: volume with --c-uuid. Candidates:\n{listing}")
 
 
-def choose_c_for_host(volumes, requested, c_ram, linux_root_fstype):
+def choose_c_for_host(volumes, requested, c_ram):
     if c_ram and requested:
         raise ValueError("Choose either --c-ram or --c-uuid")
-    if c_ram or (not requested and linux_root_fstype == "btrfs"):
+    if c_ram:
         return None
     if not volumes:
         if requested:
@@ -107,6 +114,13 @@ def grub_entries(plan):
     uuid = plan["boot_uuid"]
     base = plan["grub_release"]
     home = plan.get("grub_destination", str(Path(base).parent.parent))
+    if plan.get("c_uuid"):
+        config_home = (plan.get("c_dir") or "").rstrip("/") + "/RETROOS"
+        config_root = f"    search --no-floppy --fs-uuid --set=retroos_config {plan['c_uuid']}\n"
+        config_prefix = "($retroos_config)" + config_home
+    else:
+        config_root = ""
+        config_prefix = home
     entries = []
     for label, overlay in (("protected disk", " ram-overlay"), ("persistent disk", "")):
         kernel_args = "ram-overlay" if overlay else ""
@@ -129,8 +143,8 @@ def grub_entries(plan):
         set gfxpayload=auto
     fi
     module2 {base}/retroos-base.img.gz retroos.mount=/
-    module2 {home}/BOOT.INI retroos.config=boot
-    module2 {home}/RETROOS.INI retroos.config=ini
+{config_root}    module2 {config_prefix}/BOOT.INI retroos.config=boot
+    module2 {config_prefix}/RETROOS.INI retroos.config=ini
     boot
 }}
 ''')
@@ -153,6 +167,24 @@ def mount_configuration(plan):
     return '[bundle]\nsource=module\nsubdir=/\n\n' + "\n".join(mounts)
 
 
+def migrate_boot_configuration(plan, previous):
+    """Keep custom mounts, but make the selected C: and module backing explicit."""
+    config = configparser.ConfigParser(interpolation=None)
+    config.read_string(previous)
+    for section in list(config.sections()):
+        if section == "bundle" or config[section].get("drive", "").upper() == "C":
+            config.remove_section(section)
+    generated = configparser.ConfigParser(interpolation=None)
+    generated.read_string(mount_configuration(plan))
+    config["bundle"] = dict(generated["bundle"])
+    for section in generated.sections():
+        if generated[section].get("drive", "").upper() == "C":
+            config[section] = dict(generated[section])
+    text = io.StringIO()
+    config.write(text, space_around_delimiters=False)
+    return text.getvalue()
+
+
 def grub_config_path():
     for path in (Path("/boot/grub/grub.cfg"), Path("/boot/grub2/grub.cfg")):
         if path.is_file():
@@ -172,6 +204,18 @@ def c_home(volume, c_dir="/home/retroos"):
     return None
 
 
+def visible_c_home(volume, c_dir):
+    if volume["fstype"] == "ext4":
+        return c_home(volume, c_dir)
+    for mountpoint in volume["mountpoints"]:
+        if mountpoint:
+            mount = filesystem(mountpoint)
+            if ((mount.get("uuid") or "").lower() == volume["uuid"].lower()
+                    and mount.get("fsroot") == "/"):
+                return mountpoint
+    return None
+
+
 def create_c_home(home):
     if home.exists():
         if not home.is_dir():
@@ -183,26 +227,72 @@ def create_c_home(home):
     home.chmod(0o755)
 
 
-def ensure_c_home(volume, c_dir="/home/retroos"):
-    if volume["fstype"] != "ext4":
-        return
-    mounted_home = c_home(volume, c_dir)
-    if mounted_home:
-        create_c_home(Path(mounted_home))
-        return
+@contextmanager
+def mounted_c_home(volume, c_dir="/home/retroos"):
+    """Expose the selected C: tree, including unmounted FAT data volumes."""
+    for mountpoint in volume["mountpoints"]:
+        if not mountpoint:
+            continue
+        mounted = filesystem(mountpoint)
+        if ((mounted.get("uuid") or "").lower() == volume["uuid"].lower()
+                and mounted.get("fsroot") == "/"):
+            home = Path(mountpoint) / c_dir.lstrip("/") if volume["fstype"] == "ext4" else Path(mountpoint)
+            if not home.resolve().is_relative_to(Path(mountpoint).resolve()):
+                raise ValueError("C: directory escapes the selected volume")
+            create_c_home(home)
+            yield home
+            return
     with tempfile.TemporaryDirectory(prefix="retroos-c-") as temporary:
-        subprocess.run(["mount", "-t", "ext4", "-o", "rw",
+        subprocess.run(["mount", "-t", volume["fstype"], "-o", "rw",
                         f"UUID={volume['uuid']}", temporary], check=True)
         try:
             mounted = filesystem(temporary)
             if (mounted.get("uuid") or "").lower() != volume["uuid"].lower() or mounted.get("fsroot") != "/":
-                raise ValueError("Mounted C: volume does not match the selected ext4 UUID")
-            create_c_home(Path(temporary) / c_dir.lstrip("/"))
+                raise ValueError("Mounted C: volume does not match the selected UUID")
+            home = Path(temporary) / c_dir.lstrip("/") if volume["fstype"] == "ext4" else Path(temporary)
+            if not home.resolve().is_relative_to(Path(temporary).resolve()):
+                raise ValueError("C: directory escapes the selected volume")
+            create_c_home(home)
+            yield home
         finally:
             subprocess.run(["umount", temporary], check=True)
 
 
+def ensure_c_home(volume, c_dir="/home/retroos"):
+    with mounted_c_home(volume, c_dir):
+        pass
+
+
+def seed_c_files(home, stage, copy_showcase=False):
+    """Install writable settings once; upgrades preserve disk-owned settings."""
+    settings = home / "RETROOS"
+    if settings.is_symlink() or (settings.exists() and not settings.is_dir()):
+        raise ValueError(f"configuration directory must be an ordinary directory: {settings}")
+    settings.mkdir(exist_ok=True)
+    owner = home.stat()
+    os.chown(settings, owner.st_uid, owner.st_gid)
+    settings.chmod(0o755)
+    for name in ("BOOT.INI", "RETROOS.INI"):
+        target = settings / name
+        if target.is_symlink() or (target.exists() and not target.is_file()):
+            raise ValueError(f"configuration must be an ordinary file: {target}")
+        if not target.exists():
+            with target.open("xb") as output, (stage / name).open("rb") as source:
+                shutil.copyfileobj(source, output)
+        target.chmod(0o644)
+        os.chown(target, owner.st_uid, owner.st_gid)
+    if copy_showcase:
+        return copy_showcase_tree(stage / "showcase", home, (owner.st_uid, owner.st_gid))
+    return 0
+
+
 def extract_boot_file(image, name, destination):
+    if image.is_dir():
+        source = image / name
+        if name == "kernel.elf" and not source.exists():
+            source = image / "kernel/kernel.elf"
+        shutil.copyfile(source, destination)
+        return
     if image.suffix.lower() == ".iso":
         with tempfile.TemporaryDirectory(prefix="retroos-extract-") as work:
             menu = Path(work) / "grub.cfg"
@@ -230,18 +320,19 @@ def extract_boot_file(image, name, destination):
                     f"::{release[1]}/{name}", str(destination)], check=True)
 
 
-def prepare(image, destination, requested_c, requested_root, c_ram=False, requested_dir=None):
+def prepare(image, destination, requested_c, requested_root, c_ram=False, requested_dir=None, copy_showcase=False, showcase_archive=None):
     if os.geteuid() == 0:
         raise PermissionError("prepare as a normal user; installation runs as root")
-    if not image.is_file():
-        raise FileNotFoundError(f"boot image not found: {image}")
+    if not image.is_file() and not image.is_dir():
+        raise FileNotFoundError(f"boot image or core directory not found: {image}")
     volumes = candidates()
-    linux_root = filesystem("/")
-    c_volume = choose_c_for_host(volumes, requested_c, c_ram, linux_root["fstype"])
+    c_volume = choose_c_for_host(volumes, requested_c, c_ram)
+    if copy_showcase and not c_volume:
+        raise ValueError("--copy-showcase requires a physical C: volume")
     if requested_dir and (not c_volume or c_volume["fstype"] != "ext4"):
         raise ValueError("--c-dir requires an ext4 C: volume")
     c_dir = validate_c_dir(requested_dir or "/home/retroos") if c_volume and c_volume["fstype"] == "ext4" else None
-    home = c_home(c_volume, c_dir) if c_dir else None
+    home = visible_c_home(c_volume, c_dir) if c_volume else None
     if requested_root:
         if not UUID_FORMAT.fullmatch(requested_root) or len(requested_root) != 36:
             raise ValueError("--root-uuid requires an ext4 UUID")
@@ -258,7 +349,13 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
     if not Path("/etc/grub.d").is_dir():
         raise ValueError("/etc/grub.d is missing; install GRUB first")
     grub_cfg = grub_config_path()
-    image_digest = sha256(image)
+    if image.is_dir():
+        kernel = image / "kernel.elf"
+        if not kernel.exists():
+            kernel = image / "kernel/kernel.elf"
+        image_digest = hashlib.sha256((sha256(kernel) + sha256(image / "retroos-base.img.gz")).encode()).hexdigest()
+    else:
+        image_digest = sha256(image)
     release = destination / "releases" / image_digest[:12]
     plan = {"image_sha256": image_digest, "release": str(release),
             "destination": str(destination), "boot_uuid": boot_fs["uuid"],
@@ -268,20 +365,41 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
             "c_fstype": c_volume["fstype"] if c_volume else None,
             "c_home": home, "c_dir": c_dir, "root_uuid": requested_root,
             "grub_config": str(grub_cfg)}
-    stage = STAGE_ROOT / image_digest[:12]
+    stage_id = image_digest[:12]
+    if copy_showcase:
+        showcase = showcase_archive or ROOT / "showcase.tar"
+        if showcase_archive is None and not showcase.exists():
+            showcase = ROOT / "bazel-bin/showcase_module_tar.tar"
+        stage_id = hashlib.sha256((image_digest + sha256(showcase)).encode()).hexdigest()[:12]
+    stage = STAGE_ROOT / stage_id
     stage.mkdir(parents=True, exist_ok=True)
     for name in ("kernel.elf", "retroos-base.img.gz"):
         extract_boot_file(image, name, stage / name)
+    plan["copy_showcase"] = copy_showcase
+    if copy_showcase:
+        with tarfile.open(showcase) as archive:
+            archive.extractall(stage / "showcase", filter="data")
     entries = grub_entries(plan)
     (stage / "grub.cfg").write_text(entries)
-    (stage / "BOOT.INI").write_text(mount_configuration(plan))
+    legacy_boot = destination / "BOOT.INI"
+    # Preserve customized module mount policy when migrating an older install.
+    disk_boot = Path(home) / "RETROOS/BOOT.INI" if home else None
+    if disk_boot and disk_boot.exists():
+        boot_text = disk_boot.read_text()
+    else:
+        boot_text = migrate_boot_configuration(plan, legacy_boot.read_text()) if legacy_boot.exists() else mount_configuration(plan)
+    (stage / "BOOT.INI").write_text(boot_text)
     template = ROOT / "etc" / "RETROOS.INI"
     user_ini = destination / "RETROOS.INI"
+    disk_ini = Path(home) / "RETROOS/RETROOS.INI" if home else None
+    if disk_ini and disk_ini.exists():
+        user_ini = disk_ini
     shutil.copyfile(user_ini if user_ini.exists() else template, stage / "RETROOS.INI")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     (stage / "42_retroos_module").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
     (stage / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-    names = ("kernel.elf", "retroos-base.img.gz", "BOOT.INI", "RETROOS.INI", "grub.cfg", "42_retroos_module", "plan.json")
+    names = [str(path.relative_to(stage)) for path in stage.rglob("*")
+             if path.is_file() and path.name != "checksums.json"]
     (stage / "checksums.json").write_text(json.dumps({name: sha256(stage / name) for name in names}, indent=2) + "\n")
     STAGE_ROOT.mkdir(parents=True, exist_ok=True)
     (STAGE_ROOT / "selected").write_text(str(stage) + "\n")
@@ -292,6 +410,12 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
             print(f"Installation will ensure {home} exists for ext4 C:.")
         else:
             print(f"Installation will temporarily mount the selected ext4 volume and ensure {c_dir} exists.")
+    if c_volume:
+        config_home = (c_dir or "").rstrip("/") + "/RETROOS"
+        print(f"INIs: C:{config_home}; edits persist in the persistent disk entry.")
+    else:
+        print("INIs: RAM session; edit the boot copies from Linux for persistent changes.")
+    print("Showcase: copy missing files into C:" if copy_showcase else "Showcase: skip")
     print(f"Review {stage / 'grub.cfg'}, then run the installer as root.")
 
 
@@ -320,8 +444,6 @@ def install():
     if str(grub_config_path()) != plan["grub_config"]:
         raise ValueError("GRUB configuration moved; prepare again")
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
-    if plan["c_uuid"]:
-        ensure_c_home(c_volume, plan["c_dir"] or "/home/retroos")
     release = Path(plan["release"])
     release.parent.mkdir(parents=True, exist_ok=True)
     files = ("kernel.elf", "retroos-base.img.gz")
@@ -339,6 +461,12 @@ def install():
     for name in files:
         os.chown(release / name, 0, 0)
         (release / name).chmod(0o644)
+    if plan["c_uuid"]:
+        with mounted_c_home(c_volume, plan["c_dir"] or "/home/retroos") as home:
+            copied = seed_c_files(home, stage, plan.get("copy_showcase", False))
+            print(f"Configuration: {home}/RETROOS (persistent C:)")
+            if plan.get("copy_showcase"):
+                print(f"Copied {copied} missing showcase files into C:.")
     user_ini = destination / "RETROOS.INI"
     if not user_ini.exists():
         shutil.copyfile(stage / "RETROOS.INI", user_ini)
@@ -348,7 +476,9 @@ def install():
     old_managed = MANAGED.read_bytes() if MANAGED.exists() else None
     if old_managed is not None:
         Path(str(MANAGED) + ".previous").write_bytes(old_managed)
+    other_mode = None
     try:
+        other_mode = retire_managed(OTHER_MANAGED)
         shutil.copyfile(stage / "BOOT.INI", boot_ini)
         boot_ini.chmod(0o644)
         shutil.copyfile(stage / "42_retroos_module", MANAGED)
@@ -361,6 +491,8 @@ def install():
                 raise ValueError("grub-mkconfig is missing")
             subprocess.run([command, "-o", plan["grub_config"]], check=True)
     except Exception:
+        if other_mode is not None:
+            OTHER_MANAGED.chmod(other_mode)
         if old_boot is None: boot_ini.unlink(missing_ok=True)
         else: boot_ini.write_bytes(old_boot)
         if old_managed is None:
@@ -377,15 +509,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true", help="stage files and GRUB entries for review")
     parser.add_argument("--image", "--iso", dest="image", type=Path,
-                        default=ROOT / "bazel-bin/retroos_grub_module_usb.img")
+                        default=ROOT if (ROOT / "retroos-base.img.gz").exists() else ROOT / "bazel-bin")
     parser.add_argument("--destination", type=Path, default=Path("/boot/retroos"))
     parser.add_argument("--c-uuid", help="C: filesystem UUID; required when several candidates exist")
     parser.add_argument("--c-ram", action="store_true", help="use the RAM module for C:")
     parser.add_argument("--c-dir", help="directory inside selected ext4 C: volume (default: /home/retroos)")
+    parser.add_argument("--copy-showcase", action=argparse.BooleanOptionalAction, default=False,
+                        help="copy missing showcase files into the selected physical C: volume")
     parser.add_argument("--root-uuid", help="optional ext4 UUID for Linux /")
     args = parser.parse_args()
     if args.prepare:
-        prepare(args.image.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram, args.c_dir)
+        prepare(args.image.resolve(), args.destination.resolve(), args.c_uuid, args.root_uuid, args.c_ram, args.c_dir, args.copy_showcase)
     else:
         install()
 

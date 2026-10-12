@@ -148,7 +148,7 @@ impl Gus {
         dt_ns: u64,
         vpic: &mut super::vpic::VirtualPic,
     ) {
-        self.card.advance(dt_ns);
+        let _ = self.card.advance(dt_ns, None);
         if self.card.take_irq() {
             self.raise(vpic);
         }
@@ -184,9 +184,7 @@ impl Gus {
         }
         // A completed reg-0x41 write with the enable bit arms an upload; it
         // is serviced here, where the machine and the 8237 live.
-        if self.card.dma_armed() {
-            self.service_dma(machine, dma);
-        }
+        self.service_dma(machine, dma);
     }
 
     /// Perform the DMA cycle the chip is waiting on: read the guest buffer
@@ -198,24 +196,34 @@ impl Gus {
     /// and what guest-physical address the controller holds. The chip supplies
     /// the destination and the sample transforms, and counts what it received.
     ///
-    /// We move the transfer in one go and declare terminal count with it: a
-    /// GF1 upload is bounded and the driver waits for TC anyway. A host that
-    /// wanted per-DRQ granularity would loop here with `tc` false until the
-    /// last chunk — the card does not care which.
+    /// This host moves a controller-sized transfer in one go, bounded by the
+    /// returned card window. Terminal count is reported only if that whole
+    /// transfer moved. Other hosts can feed partial completions into advance.
     fn service_dma<A: crate::Arch>(&mut self, machine: &mut A, dma: &Dma8237) {
         let ch = self.dma_ch as usize;
+        let Some(request) = self.card.advance(0, None) else { return };
         if ch >= 8 {
-            self.card.dma_write(&[], true); // nowhere to read from; complete it
-            return;
-        }
-        if !self.card.dma_to_card() {
-            self.card.dma_write(&[], true); // DRAM→host: completes without data
+            // Invalid wiring is not a completed transfer.
             return;
         }
         let (gpa, len) = chan_gpa_len(&dma.ch[ch].prog, /*is16=*/ ch >= 4);
-        let mut buf = alloc::vec![0u8; len as usize];
-        machine.copy_from(gpa as usize, &mut buf);
-        self.card.dma_write(&buf, true);
+        let completion = match request {
+            sound::dma::Request::Read { bytes, .. } => {
+                let n = bytes.min(len as usize);
+                let mut buf = alloc::vec![0u8; n];
+                machine.copy_from(gpa as usize, &mut buf);
+                let _ = self.card.advance(0, Some(sound::dma::Completion::Read {
+                    bytes: &buf, terminal_count: n == len as usize,
+                }));
+                return;
+            }
+            sound::dma::Request::Write { bytes } => {
+                let n = bytes.len().min(len as usize);
+                machine.copy_to(gpa as usize, &bytes[..n]);
+                sound::dma::Completion::Write { bytes: n, terminal_count: n == len as usize }
+            }
+        };
+        let _ = self.card.advance(0, Some(completion));
     }
 }
 

@@ -11,16 +11,10 @@
 //! straight to its DAC, so at mix time it needs bytes that live in *guest*
 //! memory, which a passive card cannot reach.
 //!
-//! The resolution is a borrow, not a fetch: [`Sb::dsp_fetch`] says which
-//! window of the ring the next mix block needs, the host moves those bytes
-//! (it owns the 8237 and the guest's address space), and [`Sb::mix_dsp`]
-//! resamples from the slice it is handed. The card reads it and forgets it —
-//! sample bytes are never stored here. That is the same `&[u8]` the voice
-//! engine already takes; only the owner differs.
-//!
-//! Everything else follows the usual rules: the clock arrives as an argument,
-//! interrupts are *reported* rather than raised, and the DMA channel is a
-//! number the card is told about for readback, never one it dereferences.
+//! `advance` is a pull interface: a mix step returns a DMA read action, and
+//! the host feeds its result back into the same step. The card borrows those
+//! bytes to render; it never stores or dereferences a guest address. Clock
+//! steps report IRQ edges and retain the existing producer-clock pacing.
 
 use crate::opl;
 use alloc::boxed::Box;
@@ -219,21 +213,33 @@ pub struct Start {
     pub block_override: Option<u16>,
 }
 
-/// The window of the guest's DMA ring the next mix block needs. The host
-/// copies these frames (wrapping at `buf_frames`) into a linear buffer and
-/// hands it to [`Sb::mix_dsp`].
-#[derive(Clone, Copy)]
-pub struct Fetch {
-    /// Guest-physical base of the ring, as the host reported it at start.
-    pub gpa: u32,
-    pub frame_bytes: u32,
-    /// Ring length, for the host's wrap arithmetic.
-    pub buf_frames: u32,
-    /// Absolute DSP frame the window starts at, and one past its end.
-    pub first: u64,
-    pub end: u64,
-    /// `end - first`, the number of frames the host must supply.
-    pub source_frames: usize,
+/// Explicit inputs to one card transition. Rendering and device time are
+/// separate clocks: generating a buffered frame must not deliver its IRQ.
+pub enum Step<'a> {
+    Clock { now: u64, produced: u64 },
+    Mix {
+        rate: u32,
+        position_q32: u64,
+        step_q32: u64,
+        block: &'a mut [(i32, i32)],
+        physical: bool,
+    },
+}
+
+/// External actions from a transition. The host delivers IRQ edges and runs
+/// DMA itself, then passes the completion back with the same mix step.
+pub struct Effects<'a> {
+    pub irq: bool,
+    pub dma: Option<crate::dma::Request<'a>>,
+}
+
+/// Source-frame coordinates, internal to the renderer. No guest address.
+struct Window {
+    frame_bytes: u32,
+    buf_frames: u32,
+    first: u64,
+    end: u64,
+    source_frames: usize,
 }
 
 /// The DSP state a real Sound Blaster will not tell you.
@@ -327,7 +333,6 @@ pub struct Sb {
     single: bool,
 
     /// Ring geometry, as the host reported it at `begin`.
-    buf_gpa: u32,      // guest-physical base of the ring
     buf_frames: u32,   // ring length in frames
     block_frames: u32, // frames between SB IRQs (one DMA block)
     /// Guest-visible frames produced since playback start (monotonic). The DMA
@@ -392,7 +397,7 @@ impl Sb {
             playing: false, paused: false,
             rate: 22050, bits: 8, stereo: false, signed: false, block_param: 0,
             single: false,
-            buf_gpa: 0, buf_frames: 0, block_frames: 0,
+            buf_frames: 0, block_frames: 0,
             cursor: 0, next_irq: 0,
             restarted: false, probe: false, start_ns: 0,
             blocks_done: 0, blocks_acked: 0,
@@ -659,9 +664,8 @@ impl Sb {
     /// Answer a [`Start`]: begin playback over the ring the host just read out
     /// of the guest's DMA controller.
     ///
-    /// `gpa`/`len_bytes` are that controller's programming — the card is told
-    /// them, it does not go looking.
-    pub fn begin(&mut self, s: Start, gpa: u32, len_bytes: u32) {
+    /// `len_bytes` bounds the source geometry; only the host knows its address.
+    pub fn begin(&mut self, s: Start, len_bytes: u32) {
         self.bits = s.bits;
         self.stereo = s.stereo;
         self.signed = s.signed;
@@ -672,7 +676,6 @@ impl Sb {
         }
         let channels = if s.stereo { 2u32 } else { 1 };
         let frame_bytes = (s.bits as u32 / 8) * channels;
-        self.buf_gpa = gpa;
         self.buf_frames = len_bytes.checked_div(frame_bytes).unwrap_or(0);
         // The DSP command's length is authoritative when it supplied one;
         // the 8237 count remains the physical ceiling (terminal count).
@@ -707,6 +710,54 @@ impl Sb {
         }
     }
 
+    /// Perform one transition without external effects. A mix with no
+    /// completion returns a read request and leaves its output untouched.
+    /// Feed the actual bytes back with the same step to render once. Short
+    /// reads render only complete source frames; missing data contributes zero.
+    pub fn advance(
+        &mut self,
+        step: Step<'_>,
+        completion: Option<crate::dma::Completion<'_>>,
+    ) -> Effects<'_> {
+        match step {
+            Step::Clock { now, produced } => Effects {
+                irq: self.advance_clock(now, produced), dma: None,
+            },
+            Step::Mix { rate, position_q32, step_q32, block, physical } => {
+                if !block.is_empty() {
+                    let last = position_q32.wrapping_add(step_q32.wrapping_mul(block.len() as u64 - 1)) >> 32;
+                    if let Some(mut window) = self.source_window(position_q32 >> 32, last) {
+                        match completion {
+                            None => return Effects { irq: false, dma: Some(crate::dma::Request::Read {
+                                offset: (window.first % u64::from(window.buf_frames)) as usize * window.frame_bytes as usize,
+                                bytes: window.source_frames * window.frame_bytes as usize,
+                                wrap_bytes: Some(window.buf_frames as usize * window.frame_bytes as usize),
+                            }) },
+                            // This is a borrowed render window, not playback:
+                            // TC/cursor readback follows the device clock below,
+                            // independently of the final sink's buffered audio.
+                            Some(crate::dma::Completion::Read { bytes, .. }) => {
+                                window.end = window.end.min(window.first + (bytes.len() / window.frame_bytes as usize) as u64);
+                                if physical {
+                                    self.mix_dsp_physical(position_q32, step_q32, bytes, &window, block);
+                                } else {
+                                    self.mix_dsp(position_q32, step_q32, bytes, &window, block);
+                                }
+                            }
+                            Some(crate::dma::Completion::Write { .. }) => return Effects { irq: false, dma: None },
+                        }
+                    }
+                }
+                if physical {
+                    self.mix_fm_physical(rate, block);
+                } else {
+                    self.mix_fm(rate, block);
+                }
+                Effects { irq: false, dma: None }
+            }
+        }
+    }
+
     // ── clock & interrupts ───────────────────────────────────────────────
 
     /// Advance the DSP's guest-visible clock and report whether the card wants
@@ -716,7 +767,7 @@ impl Sb {
     /// consumed. The final HDA/AC'97/SB sink trails behind by its pipe depth and
     /// has no bearing on this DMA cursor. Also ends the hangover hold and
     /// completes single-cycle transfers on their CPU-time clock.
-    pub fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
+    fn advance_clock(&mut self, now: u64, produced: u64) -> bool {
         let mut raise = false;
         if self.silence_until_ns != 0 && now >= self.silence_until_ns {
             self.silence_until_ns = 0;
@@ -931,7 +982,7 @@ impl Sb {
     /// The card cannot fetch this itself; see the module note. The host copies
     /// `source_frames` frames starting at `first`, wrapping at `buf_frames`,
     /// and passes the linear result to [`mix_dsp`](Self::mix_dsp).
-    pub fn dsp_fetch(&self, first: u64, last: u64) -> Option<Fetch> {
+    fn source_window(&self, first: u64, last: u64) -> Option<Window> {
         if !self.playing {
             return None; // idle or hangover: the pump's zeros are our silence
         }
@@ -944,8 +995,7 @@ impl Sb {
         if first >= end {
             return None; // starved: leave the pump's silence
         }
-        Some(Fetch {
-            gpa: self.buf_gpa,
+        Some(Window {
             frame_bytes,
             buf_frames: self.buf_frames,
             first,
@@ -994,7 +1044,7 @@ impl Sb {
         mut position_q32: u64,
         step_q32: u64,
         src: &[u8],
-        f: &Fetch,
+        f: &Window,
         block: &mut [(i32, i32)],
         gain: (i32, i32),
     ) {
@@ -1011,11 +1061,11 @@ impl Sb {
         }
     }
 
-    pub fn mix_dsp(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Fetch, block: &mut [(i32, i32)]) {
+    fn mix_dsp(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Window, block: &mut [(i32, i32)]) {
         self.mix_dsp_gain(position_q32, step_q32, src, f, block, self.mixer.voice_gain_q16());
     }
 
-    pub fn mix_dsp_physical(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Fetch, block: &mut [(i32, i32)]) {
+    fn mix_dsp_physical(&self, position_q32: u64, step_q32: u64, src: &[u8], f: &Window, block: &mut [(i32, i32)]) {
         self.mix_dsp_gain(position_q32, step_q32, src, f, block, self.mixer.voice_gain_q16_physical());
     }
 
@@ -1118,7 +1168,38 @@ pub fn new_boxed() -> Box<Sb> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Sb, Start};
+    use super::{Sb, Start, Step};
+
+    #[test]
+    fn advance_returns_a_wrapped_read_and_renders_only_supplied_frames() {
+        use super::Step;
+        use crate::dma::{Completion, Request};
+        let mut sb = Sb::new();
+        sb.begin(Start { bits: 16, stereo: false, signed: true, single: false,
+                         block_override: Some(3) }, 8);
+        sb.blocks_acked = 1; // the driver has made the next ring lap available
+        let mut block = [(0, 0); 3];
+        // Start at the ring's final source frame and request three frames.
+        fn step(block: &mut [(i32, i32)]) -> Step<'_> {
+            Step::Mix { rate: 22050, position_q32: 3 << 32, step_q32: 1 << 32,
+                        block, physical: false }
+        }
+        for _ in 0..2 {
+            assert_eq!(sb.advance(step(&mut block), None).dma, Some(Request::Read {
+                offset: 6, bytes: 6, wrap_bytes: Some(8),
+            }));
+            assert_eq!(block, [(0, 0); 3]);
+            assert_eq!(sb.cursor_frames(), 0, "asking is not playback");
+        }
+        // A short completion supplies two whole frames plus a partial one.
+        assert!(sb.advance(step(&mut block), Some(Completion::Read {
+            bytes: &[0xFF, 0x7F, 0x00, 0x80, 0xFF], terminal_count: false,
+        })).dma.is_none());
+        assert!(block[0].0 > 0);
+        assert!(block[1].0 < 0);
+        assert_eq!(block[2], (0, 0), "partial samples must not become sound");
+        assert_eq!(sb.cursor_frames(), 0, "rendering is independent of the device clock");
+    }
 
     fn sb16_command(sb: &mut Sb, command: u8) -> Start {
         sb16_command_mode(sb, command, 0x30)
@@ -1137,7 +1218,7 @@ mod tests {
         let mut sb = Sb::new();
         let unsigned16 = sb16_command_mode(&mut sb, 0xB0, 0x00);
         assert!(!unsigned16.signed);
-        sb.begin(unsigned16, 0x1000, 8);
+        sb.begin(unsigned16, 8);
         assert_eq!(sb.frame(&[0x00, 0x80], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00, 0x00], 0), (i16::MIN, i16::MIN));
         assert_eq!(sb.frame(&[0xFF, 0xFF], 0), (i16::MAX, i16::MAX));
@@ -1145,17 +1226,17 @@ mod tests {
 
         let signed16 = sb16_command_mode(&mut sb, 0xB0, 0x10);
         assert!(signed16.signed);
-        sb.begin(signed16, 0x1000, 8);
+        sb.begin(signed16, 8);
         assert_eq!(sb.frame(&[0x00, 0x00], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00, 0x80], 0), (i16::MIN, i16::MIN));
 
         let signed8 = sb16_command_mode(&mut sb, 0xC0, 0x10);
-        sb.begin(signed8, 0x1000, 8);
+        sb.begin(signed8, 8);
         assert_eq!(sb.frame(&[0x00], 0), (0, 0));
         assert_eq!(sb.frame(&[0x80], 0), (i16::MIN, i16::MIN));
 
         let unsigned8 = sb16_command_mode(&mut sb, 0xC0, 0x00);
-        sb.begin(unsigned8, 0x1000, 8);
+        sb.begin(unsigned8, 8);
         assert_eq!(sb.frame(&[0x80], 0), (0, 0));
         assert_eq!(sb.frame(&[0x00], 0), (i16::MIN, i16::MIN));
     }
@@ -1179,7 +1260,7 @@ mod tests {
     fn hmi_16_bit_pause_and_continue_preserve_the_stream() {
         let mut sb = Sb::new();
         let start = sb16_command(&mut sb, 0xB4);
-        sb.begin(start, 0x1000, 4096);
+        sb.begin(start, 4096);
         assert!(sb.playing());
 
         let dsp = sb.io_base + 0x0C;
@@ -1190,7 +1271,7 @@ mod tests {
 
         // DSP 4.xx keeps producing PCM while its legacy speaker-status flag
         // is off. Tomb's HMI driver starts its B4h stream before a later D1h.
-        let fetch = sb.dsp_fetch(0, 0).expect("running stream must fetch");
+        let fetch = sb.source_window(0, 0).expect("running stream must fetch");
         let mut mixed = [(0, 0)];
         sb.mix_dsp(
             0,
@@ -1225,7 +1306,7 @@ mod tests {
             let mut sb = Sb::new();
             // 8237 armed for 256 bytes; DSP command carries length-1 = 0.
             sb.begin(Start { bits: 8, stereo: false, signed: false, single: true,
-                             block_override: Some(0) }, 0x1000, 256);
+                             block_override: Some(0) }, 256);
             sb.cursor = sb.block_frames as u64; // the DSP's one transfer
             sb.finish_single(1);
             sb
@@ -1237,7 +1318,7 @@ mod tests {
         // The agreeing case — every real driver — still latches TC.
         let mut whole = Sb::new();
         whole.begin(Start { bits: 8, stereo: false, signed: false, single: true,
-                            block_override: Some(255) }, 0x1000, 256);
+                            block_override: Some(255) }, 256);
         whole.cursor = whole.block_frames as u64;
         whole.finish_single(1);
         assert!(whole.at_terminal_count(), "a full-length transfer must reach TC");
@@ -1271,12 +1352,12 @@ mod tests {
         sb.single = false;
         sb.bits = 8;
 
-        assert!(sb.advance_clock(10, 10));
+        assert!(sb.advance(Step::Clock { now: 10, produced: 10 }, None).irq);
         assert_eq!(sb.irq_status & 0x01, 0x01);
 
         // A second completed block advances all accounting, but the DSP's
         // interrupt latch is still pending and therefore produces no new edge.
-        assert!(!sb.advance_clock(20, 20));
+        assert!(!sb.advance(Step::Clock { now: 20, produced: 20 }, None).irq);
         assert_eq!(sb.blocks_done, 2);
 
         // Reading the 8-bit acknowledge port clears the latch. The following
@@ -1284,7 +1365,7 @@ mod tests {
         let ack_port = sb.io_base + 0x0E;
         let _ = sb.port_read(ack_port);
         assert_eq!(sb.irq_status & 0x01, 0);
-        assert!(sb.advance_clock(30, 30));
+        assert!(sb.advance(Step::Clock { now: 30, produced: 30 }, None).irq);
     }
 
     #[test]
@@ -1297,10 +1378,10 @@ mod tests {
         sb.port_write(dsp, 0x80, start);
         sb.port_write(dsp, 0x10, start);
         sb.port_write(dsp, 0x00, start); // 17 silent samples
-        assert!(!sb.advance_clock(start + 500_000, 0));
-        assert!(sb.advance_clock(start + 2_000_000, 0));
+        assert!(!sb.advance(Step::Clock { now: start + 500_000, produced: 0 }, None).irq);
+        assert!(sb.advance(Step::Clock { now: start + 2_000_000, produced: 0 }, None).irq);
         assert_eq!(sb.irq_status & 1, 1);
-        assert!(!sb.advance_clock(start + 3_000_000, 0));
+        assert!(!sb.advance(Step::Clock { now: start + 3_000_000, produced: 0 }, None).irq);
         sb.port_read(sb.io_base + 0x0E);
         assert_eq!(sb.irq_status & 1, 0);
     }

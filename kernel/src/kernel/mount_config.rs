@@ -624,8 +624,8 @@ pub fn apply(
             let mut path = prefix(&alloc::format!("/mountfs/{}", index)).to_vec();
             let subdir = mount.subdir.trim_start_matches('/');
             if !subdir.is_empty() { path.extend_from_slice(subdir.as_bytes()); path.push(b'/'); }
-            path.extend_from_slice(b"RETROOS/RETROOS.INI");
-            Box::leak(path.into_boxed_slice()) as &'static [u8]
+            path.extend_from_slice(b"RETROOS/");
+            path
         });
     // An external C: owns its applications and data. Only the matched runtime
     // and default shell come from the boot bundle; edits stay in RAM.
@@ -662,8 +662,16 @@ pub fn apply(
         }
     }
     if let Some(source) = settings_source {
-        vfs::bind(Box::leak([c, b"RETROOS/RETROOS.INI"].concat().into_boxed_slice()), source);
-        if !c.is_empty() { vfs::bind(b"RETROOS/RETROOS.INI", source); }
+        for name in [b"RETROOS.INI".as_slice(), b"BOOT.INI".as_slice()] {
+            let target = [b"RETROOS/".as_slice(), name].concat();
+            let backing = Box::leak([source.as_slice(), name].concat().into_boxed_slice());
+            if name == b"BOOT.INI" {
+                let Some(file) = vfs::open_backing(backing) else { continue };
+                file.close();
+            }
+            vfs::bind(Box::leak([c, target.as_slice()].concat().into_boxed_slice()), backing);
+            if !c.is_empty() { vfs::bind(Box::leak(target.into_boxed_slice()), backing); }
+        }
     }
     // /bin/rc points at /COMMANDER/RC/RC.EXE. A persistent C: owns that
     // application tree; expose its Unix spelling only when it exists.

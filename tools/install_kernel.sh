@@ -1,23 +1,25 @@
 #!/bin/bash
-# Prepare as yourself; install the reviewed, matched release as root.
-#   tools/install_kernel.sh --prepare
-#   sudo tools/install_kernel.sh
+# Prepare as yourself; install the reviewed machine plan as root.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-if [ "${1:-}" = --module ]; then
-    shift
-    if [ "${1:-}" = --prepare ]; then
-        [ "$(id -u)" != 0 ] || { echo 'Prepare as your normal user, not root.' >&2; exit 1; }
-        supplied_image=0
-        for argument in "$@"; do
-            case "$argument" in --image|--image=*|--iso|--iso=*) supplied_image=1 ;; esac
-        done
-        if [ "$supplied_image" = 0 ]; then bazelisk build //:grub_module_usb; fi
-    fi
-    exec python3 tools/grub_module_install.py "$@"
-fi
-if [ "${1:-}" = --prepare ]; then
+prepare=0
+supplied_image=0
+copy_showcase=0
+supplied_showcase=0
+for argument in "$@"; do
+    case "$argument" in
+        --prepare) prepare=1 ;;
+        --image|--image=*|--iso|--iso=*) supplied_image=1 ;;
+        --copy-showcase) copy_showcase=1 ;;
+        --showcase-archive|--showcase-archive=*) supplied_showcase=1 ;;
+    esac
+done
+if [ "$prepare" = 1 ]; then
     [ "$(id -u)" != 0 ] || { echo 'Prepare as your normal user, not root.' >&2; exit 1; }
-    bazelisk build //:machine_boot_tar //:showcase_module_tar
+    if [ "$supplied_image" = 0 ]; then
+        bazelisk build //:machine_boot_tar //:root_module_base_gzip //:showcase_module_tar
+    elif [ "$copy_showcase" = 1 ] && [ "$supplied_showcase" = 0 ] && [ ! -f showcase.tar ]; then
+        bazelisk build //:showcase_module_tar
+    fi
 fi
-exec python3 tools/machine_install.py "$@"
+exec python3 tools/install_machine.py "$@"

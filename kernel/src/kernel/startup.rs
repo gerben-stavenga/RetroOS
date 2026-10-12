@@ -610,8 +610,7 @@ fn mount_filesystems(
         if let Some(bytes) = modules.config.as_ref() {
             let user = crate::kernel::mount_config::Config::parse_user(bytes)
                 .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e));
-            let disk_settings = config.bundle.as_ref().is_some_and(|b| b.source != "module")
-                && config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
+            let disk_settings = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
             expose_user_config(bytes, disk_settings);
             *BOOT_ENV.lock() = Some(user.environment);
         }
