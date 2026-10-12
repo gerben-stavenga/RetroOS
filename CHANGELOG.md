@@ -5,6 +5,10 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+- New ext4 files and directories inherit their parent's ownership. Granted
+  mounts reject creation if ownership cannot be claimed, and Linux directory
+  symlink handling uses the correct `statx` flags.
+
 ## [0.9.0] - 2026-10-11
 
 ### Installation and storage

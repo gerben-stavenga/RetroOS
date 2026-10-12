@@ -570,7 +570,8 @@ impl Filesystem for PortableExt4Fs {
             return self.open_info(info);
         }
         let (parent_path, name) = Self::split_parent(path)?;
-        let parent = self.resolve(parent_path).ok()?.node()?;
+        let parent_info = self.resolve(parent_path).ok()?;
+        let parent = parent_info.node()?;
         let mut mounted = self.mounted.borrow_mut();
         let (filesystem, storage) = mounted.parts();
         let object = filesystem
@@ -580,6 +581,8 @@ impl Filesystem for PortableExt4Fs {
                 name,
                 AttributeUpdate {
                     format: Some(TYPE_BLOB | 0o664),
+                    owner: Some(parent_info.owner),
+                    group: Some(parent_info.group),
                     ..AttributeUpdate::default()
                 },
             )
@@ -600,10 +603,10 @@ impl Filesystem for PortableExt4Fs {
         let Some((parent_path, name)) = Self::split_parent(path) else {
             return -22;
         };
-        let Ok(parent) = self
-            .resolve(parent_path)
-            .and_then(|info| info.node().ok_or(Error::NotDirectory))
-        else {
+        let Ok(parent_info) = self.resolve(parent_path) else {
+            return -5;
+        };
+        let Some(parent) = parent_info.node() else {
             return -5;
         };
         let mut mounted = self.mounted.borrow_mut();
@@ -615,6 +618,8 @@ impl Filesystem for PortableExt4Fs {
                 name,
                 AttributeUpdate {
                     format: Some(TYPE_NODE | 0o775),
+                    owner: Some(parent_info.owner),
+                    group: Some(parent_info.group),
                     ..AttributeUpdate::default()
                 },
             )

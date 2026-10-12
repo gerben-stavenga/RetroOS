@@ -2,6 +2,7 @@
 """Boot an installed-machine layout: explicit UUID, RAM runtime, persistent C:."""
 from pathlib import Path
 import shutil
+import re
 import subprocess
 import sys
 import tarfile
@@ -135,6 +136,8 @@ def main():
         # They must not replace real C: data or appear as automatic mounts.
         (home / "GAMES").mkdir()
         (home / "GAMES/OWN.DAT").write_bytes(b"OWN!")
+        (home / "Alleycat").symlink_to("/home/retroos/GAMES")
+        (home / "relative-games").symlink_to("GAMES")
         (root / "boot/retroos/GAMES").mkdir()
         (root / "boot/retroos/GAMES/SHOW.DAT").write_bytes(b"SHOW")
         (root / "boot/retroos/COMMANDER").mkdir()
@@ -144,8 +147,33 @@ def main():
 static int call(int n,int a,int b,int c) { int r;
  __asm__ volatile("int $0x80":"=a"(r):"0"(n),"b"(a),"c"(b),"d"(c):"memory"); return r; }
 static void say(char *s,int n) {call(4,1,(int)s,n);}
+static int statx(char *path, int flags, int mask, void *buf) { int r;
+ __asm__ volatile("int $0x80":"=a"(r):"0"(383),"b"(-100),"c"(path),
+                  "d"(flags),"S"(mask),"D"(buf):"memory"); return r; }
 void _start(void) {
  char b[4];
+ unsigned char st[256];
+ /* STATX_BASIC_STATS includes 0x100, which is also AT_SYMLINK_NOFOLLOW.
+    Only the flags argument controls whether the final link is followed. */
+ if(statx("/home/retroos/Alleycat",0,0x7ff,st) ||
+    (*(unsigned short *)(st+28)&0170000)!=0040000) goto fail;
+ if(statx("/home/retroos/relative-games",0,0x7ff,st) ||
+    (*(unsigned short *)(st+28)&0170000)!=0040000) goto fail;
+ if(statx("/home/retroos/Alleycat",0x100,1,st) ||
+    (*(unsigned short *)(st+28)&0170000)!=0120000) goto fail;
+ if(call(12,(int)"/home/retroos/Alleycat",0,0)) goto fail;
+ int linked=call(5,(int)"OWN.DAT",0,0);
+ if(linked<0 || call(3,linked,(int)b,4)!=4 || b[0]!='O') goto fail;
+ call(6,linked,0,0);
+ linked=call(5,(int)"CREATED.DAT",0x241,0644);
+ if(linked<0 || call(4,linked,(int)"UID!",4)!=4) goto fail;
+ call(6,linked,0,0);
+ int made=call(39,(int)"CREATED",0755,0);
+ if(made<0 && made!=-17) goto fail;
+ linked=call(5,(int)"CREATED/NESTED.DAT",0x241,0644);
+ if(linked<0 || call(4,linked,(int)"UID!",4)!=4) goto fail;
+ call(6,linked,0,0);
+ if(call(12,(int)"/",0,0)) goto fail;
  int f=call(5,(int)"/bin/busybox",0,0);
  if(f<0 || call(3,f,(int)b,4)!=4 || b[0]!='L' || b[1]!='N') goto fail;
  call(6,f,0,0);
@@ -200,6 +228,15 @@ fail: say("LAYOUT-FAIL\n",12);call(1,1,0,0);for(;;){}
         boot(work, "uefi-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED", uefi=True)
         boot(work, "ahci-installed-root", image, decoy, UUID, "LAYOUT-PERSISTED",
              uefi=True, storage="ahci")
+        # Creation through both a directory symlink and a new subdirectory
+        # must retain the configured user's identity on the Linux disk.
+        owner = (home.stat().st_uid, (home / "GAMES").stat().st_gid)
+        for name in ("CREATED.DAT", "CREATED", "CREATED/NESTED.DAT"):
+            metadata = subprocess.check_output(
+                ["debugfs", "-R", f"stat /home/retroos/GAMES/{name}", str(image)],
+                stderr=subprocess.DEVNULL).decode()
+            ids = re.search(r"User:\s+(\d+)\s+Group:\s+(\d+)", metadata)
+            assert ids and tuple(map(int, ids.groups())) == owner, metadata
         # Every successful boot must change persistent bytes, including the
         # final AHCI boot. Rewriting the same value could hide a dropped write.
         state = work / "state.dat"

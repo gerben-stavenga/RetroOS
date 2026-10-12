@@ -637,12 +637,14 @@ impl Vfs {
 
     /// Stamp a newly created object as RetroOS's own, so it can be reopened
     /// for writing later.
-    fn claim(&self, midx: u8, subpath: &[u8]) {
-        let WriteAccess::Granted(grant) = self.mounts[midx as usize].access else { return };
+    fn claim(&self, midx: u8, subpath: &[u8]) -> bool {
+        let WriteAccess::Granted(grant) = self.mounts[midx as usize].access else { return true };
         let fs = self.mount_fs(midx);
-        if let Some(m) = fs.meta(subpath) {
-            fs.set_meta(subpath, grant.uid(), m.gid, grant.claim_mode(m.mode));
-        }
+        fs.meta(subpath).is_some_and(|m| {
+            let mode = grant.claim_mode(m.mode);
+            (m.uid == grant.uid() && m.mode == mode)
+                || fs.set_meta(subpath, grant.uid(), m.gid, mode)
+        })
     }
 
     fn mount_prefix_by_handle(&self, handle: i32) -> Option<&'static [u8]> {
@@ -1108,7 +1110,11 @@ impl Vfs {
         if !self.may_write_parent(midx, subpath) { return -13; }
         let rc = fs.mkdir(subpath);
         if rc < 0 { return rc; }
-        self.claim(midx, subpath);
+        if !self.claim(midx, subpath) {
+            fs.rmdir(subpath);
+            self.invalidate_dir_cache();
+            return -5;
+        }
         self.invalidate_dir_cache();
         0
     }
@@ -1174,8 +1180,11 @@ impl Vfs {
             return -13; // EACCES
         }
         if let Some(vnode) = fs.create(subpath) {
-            if !existed {
-                self.claim(midx, subpath);
+            if !existed && !self.claim(midx, subpath) {
+                fs.clunk(vnode.handle);
+                fs.remove(subpath);
+                self.invalidate_dir_cache();
+                return -5;
             }
             self.invalidate_dir_cache();
             let handle = self.install_handle(path, original_ino, midx, vnode, true);
@@ -2293,6 +2302,7 @@ mod tests {
 
     struct OwnedFs {
         file: spin::Mutex<super::Meta>,
+        fail_set_meta: core::sync::atomic::AtomicBool,
     }
 
     impl Filesystem for OwnedFs {
@@ -2308,7 +2318,7 @@ mod tests {
             }
         }
         fn set_meta(&self, path: &[u8], uid: u32, gid: u32, mode: u32) -> bool {
-            if path != b"home/file" { return false; }
+            if path != b"home/file" || self.fail_set_meta.load(Ordering::Relaxed) { return false; }
             *self.file.lock() = super::Meta { uid, gid, mode };
             true
         }
@@ -2319,6 +2329,7 @@ mod tests {
         use crate::kernel::fs::grant::Grant;
         let fs = alloc::boxed::Box::leak(alloc::boxed::Box::new(OwnedFs {
             file: spin::Mutex::new(super::Meta { uid: 1000, gid: 999, mode: 0o644 }),
+            fail_set_meta: core::sync::atomic::AtomicBool::new(false),
         }));
         let grant = Grant::from_home(fs, b"home/").unwrap();
         assert!(Grant::from_home(fs, b"missing").is_none());
@@ -2337,10 +2348,17 @@ mod tests {
         // Drivers may create files with a default UID. Claiming them stamps
         // the home UID, preserves their group, and makes them reopenable.
         *fs.file.lock() = super::Meta { uid: 0, gid: 999, mode: 0o444 };
-        vfs.claim(0, b"home/file");
+        assert!(vfs.claim(0, b"home/file"));
         let meta = fs.meta(b"home/file").unwrap();
         assert_eq!((meta.uid, meta.gid, meta.mode), (1000, 999, 0o644));
         assert!(vfs.may_write(0, b"home/file"));
+        // Missing metadata or a failed ownership update must not be accepted.
+        assert!(!vfs.claim(0, b"missing"));
+        *fs.file.lock() = super::Meta { uid: 0, gid: 999, mode: 0o664 };
+        fs.fail_set_meta.store(true, Ordering::Relaxed);
+        assert!(!vfs.claim(0, b"home/file"));
+        assert_eq!(fs.meta(b"home/file").unwrap().uid, 0);
+        assert!(!vfs.may_write(0, b"home/file"));
     }
 
     #[test]

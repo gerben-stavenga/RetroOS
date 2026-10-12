@@ -373,6 +373,12 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         // single-process job model, return our tid as session/group.
         57 | 66 | 65 | 132 | 147 => SyscallResult::val(kt.tid),
         33  => sys_access(machine, &mut kt.vcpu, linux, a),
+        39 => {
+            let mut raw = [0; 256];
+            let n = machine.copy_cstr(a.a0 as usize, &mut raw);
+            let mut buf = [0; 256];
+            SyscallResult::val(vfs::mkdir(resolve_path(&raw[..n], linux.cwd_str(), &mut buf)))
+        },
         42  => sys_pipe(machine, kt, a, false),
         45  => sys_brk(linux, a),
         54  => sys_ioctl(machine, kt, linux, a),
@@ -420,6 +426,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         331 => sys_pipe(machine, kt, a, true),
         340 => SyscallResult::val(0),
         355 => sys_getrandom(machine, &mut kt.vcpu, a),
+        383 => sys_statx(machine, kt, linux, a),
         102 => sys_socketcall(machine, kt, a),
         _ => {
             compact_println!("unimplemented syscall {}", nr);
@@ -2171,7 +2178,7 @@ fn sys_statx<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     let mut pbuf = [0u8; 164];
     let resolved = resolve_path(path, base, &mut pbuf);
     const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
-    let stat = if a.a3 & AT_SYMLINK_NOFOLLOW == 0 {
+    let stat = if a.a2 & AT_SYMLINK_NOFOLLOW == 0 {
         stat_lookup(resolved)
     } else {
         lstat_lookup(resolved)
