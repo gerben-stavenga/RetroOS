@@ -192,6 +192,17 @@ def grub_config_path():
     raise ValueError("existing GRUB configuration not found under /boot/grub or /boot/grub2")
 
 
+def update_grub(config_path=None):
+    if shutil.which("update-grub"):
+        subprocess.run(["update-grub"], check=True)
+        return
+    command = shutil.which("grub-mkconfig") or shutil.which("grub2-mkconfig")
+    if not command:
+        raise ValueError("grub-mkconfig is missing")
+    destination = config_path if config_path is not None else grub_config_path()
+    subprocess.run([command, "-o", str(destination)], check=True)
+
+
 def c_home(volume, c_dir="/home/retroos"):
     if volume["fstype"] != "ext4":
         return None
@@ -483,13 +494,7 @@ def install():
         boot_ini.chmod(0o644)
         shutil.copyfile(stage / "42_retroos_module", MANAGED)
         MANAGED.chmod(0o755)
-        if shutil.which("update-grub"):
-            subprocess.run(["update-grub"], check=True)
-        else:
-            command = shutil.which("grub-mkconfig") or shutil.which("grub2-mkconfig")
-            if not command:
-                raise ValueError("grub-mkconfig is missing")
-            subprocess.run([command, "-o", plan["grub_config"]], check=True)
+        update_grub(plan["grub_config"])
     except Exception:
         if other_mode is not None:
             OTHER_MANAGED.chmod(other_mode)

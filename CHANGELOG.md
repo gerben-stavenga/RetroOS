@@ -5,6 +5,9 @@ primary target. Windows, OS/2 and Linux personalities remain experimental.
 
 ## [Unreleased]
 
+- Disk and module installers share GRUB regeneration, supporting distributions
+  that provide `grub-mkconfig` or `grub2-mkconfig` instead of `update-grub`.
+
 - VM86 emulates unchanged CR0 writes used by the Bytekiss CPU probe; the demo
   is included in the showcase.
 - Rat Commander can enter local directory symlinks. The bundled binary,

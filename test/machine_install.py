@@ -130,8 +130,11 @@ class ShowcaseTests(unittest.TestCase):
                      patch.object(installer, 'CUSTOM', root / 'custom'), \
                      patch.object(installer, 'OTHER_MANAGED', root / 'inactive'), \
                      patch.object(installer.os, 'chown'), \
-                     patch.object(installer.subprocess, 'run'):
+                     patch.object(unified.module.shutil, 'which', side_effect=lambda name: '/usr/bin/grub-mkconfig' if name == 'grub-mkconfig' else None), \
+                     patch.object(unified.module, 'grub_config_path', return_value=root / 'grub.cfg'), \
+                     patch.object(installer.subprocess, 'run') as update:
                     installer.install_into(stage, plan, home)
+                    update.assert_called_with(['/usr/bin/grub-mkconfig', '-o', str(root / 'grub.cfg')], check=True)
                     release = home / 'RETROOS/releases' / ('a'*12)
                     self.assertEqual((root / 'inactive').stat().st_mode & 0o777, 0o644)
                     self.assertTrue((root / 'inactive.previous').is_file())

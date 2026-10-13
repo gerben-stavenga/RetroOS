@@ -18,6 +18,33 @@ spec.loader.exec_module(installer)
 
 
 class GrubModuleInstallTest(unittest.TestCase):
+    def test_grub_update_commands(self):
+        for available, expected in [
+            ({"update-grub": "/usr/sbin/update-grub", "grub-mkconfig": "/usr/bin/grub-mkconfig"},
+             ["update-grub"]),
+            ({"grub-mkconfig": "/usr/bin/grub-mkconfig"},
+             ["/usr/bin/grub-mkconfig", "-o", "/boot/grub/grub.cfg"]),
+            ({"grub2-mkconfig": "/usr/sbin/grub2-mkconfig"},
+             ["/usr/sbin/grub2-mkconfig", "-o", "/boot/grub/grub.cfg"]),
+        ]:
+            with self.subTest(available=available), \
+                 patch.object(installer.shutil, "which", side_effect=available.get), \
+                 patch.object(installer.subprocess, "run") as run, \
+                 patch.object(installer, "grub_config_path", return_value=Path("/boot/grub/grub.cfg")):
+                installer.update_grub()
+                run.assert_called_once_with(expected, check=True)
+                run.reset_mock()
+                installer.update_grub("/boot/grub2/grub.cfg")
+                override = expected if expected == ["update-grub"] else expected[:2] + ["/boot/grub2/grub.cfg"]
+                run.assert_called_once_with(override, check=True)
+
+    def test_grub_update_requires_installed_tools(self):
+        with patch.object(installer.shutil, "which", return_value=None), \
+             patch.object(installer.subprocess, "run") as run:
+            with self.assertRaisesRegex(ValueError, "grub-mkconfig is missing"):
+                installer.update_grub()
+            run.assert_not_called()
+
     def test_enumerates_supported_non_usb_non_esp_volumes(self):
         devices = {"blockdevices": [
             {"type": "disk", "tran": "sata", "children": [

@@ -325,6 +325,7 @@ def install():
 
 
 def install_into(stage, plan, c_root):
+    import grub_module_install as grub
     settings = c_root / "RETROOS"
     for path in (settings, settings / "releases"):
         if path.is_symlink() or (path.exists() and not path.is_dir()):
@@ -413,7 +414,7 @@ def install_into(stage, plan, c_root):
         managed.chmod(0o755)
         if old_custom is not None:
             shutil.copyfile(stage / "40_custom", custom)
-        subprocess.run(["update-grub"], check=True)
+        grub.update_grub()
     except Exception:
         if other_mode is not None:
             OTHER_MANAGED.chmod(other_mode)

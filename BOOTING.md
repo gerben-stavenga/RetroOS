@@ -271,7 +271,8 @@ sudo tools/install_kernel.sh
 Preparation builds one `//:machine_boot_tar` containing the matching kernel,
 symbols, COMMAND.COM, SHELL.ELF, and DN program/resources. Installation puts that
 release under `/boot/retroos/releases/<release>/`, installs managed entries in
-`/etc/grub.d/41_retroos`, and runs `update-grub`. No reboot is performed. Previous
+`/etc/grub.d/41_retroos`, and regenerates GRUB using `update-grub` or, when it
+is absent, `grub-mkconfig`/`grub2-mkconfig`. No reboot is performed. Previous
 releases and unrelated GRUB entries remain. The obsolete RetroOS entries are
 backed up and replaced by managed entries named
 **RetroOS (current, persistent)** and **RetroOS (current, protected disk)**.

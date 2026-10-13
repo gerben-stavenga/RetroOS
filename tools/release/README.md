@@ -228,9 +228,9 @@ apps-proprietary collection is not bundled.
 
 ## Physical machine: retroos-machine.tar.gz
 
-This bundle automates the existing-GRUB setup for a Linux ext4 root. The boot
-runtime and `/home/retroos` must be on that root filesystem; a separate `/boot`
-partition is not supported by this installer yet. It does not repartition disks.
+This bundle automates installation through the existing Linux GRUB. The disk
+runtime can live on FAT or ext4; the default C: is `/home/retroos` on an ext4
+Linux root. A separate `/boot` is supported. It does not repartition disks.
 
 For a new installation, first create the writable C: directory (as your ordinary
 user, invoking sudo only for these setup commands):
@@ -249,10 +249,23 @@ sudo ./install.sh
 ```
 
 Requires Python 3.12+, `findmnt`, and the installed GRUB tools. No compilation
-is performed. The installer places a matched release under `/boot/retroos`,
-updates managed GRUB entries, and retains old files and configuration backups.
+is performed. The installer places the kernel under `/boot/retroos` and the
+matched runtime beneath `C:\RETROOS\releases`, updates managed GRUB entries,
+and retains old files and configuration backups. It runs `update-grub` when
+available; otherwise it uses `grub-mkconfig` or `grub2-mkconfig` with the existing
+`/boot/grub/grub.cfg` or `/boot/grub2/grub.cfg`.
 Choose **RetroOS (current, persistent)** for normal use; the protected entry
 uses a volatile RAM overlay. Installation does not reboot the machine.
+
+To upgrade, extract the new machine release into a new directory and repeat
+the preparation and installation commands above, selecting the same C: volume
+and destination as before. The installer adds a new matched kernel/runtime
+pair and points the managed entry and `BOOT.INI` runtime path at it. Existing
+`RETROOS.INI` settings, custom mounts, and C: data are preserved; old release
+directories remain. Prepare again if either INI changes before installation.
+`--copy-showcase` only adds missing files, so it preserves existing game saves,
+configuration, and showcase programs. Replace individual showcase programs
+explicitly when you want to upgrade those too.
 
 Both disk-protection entries use the same video policy. When GRUB boots through
 legacy BIOS (`grub_platform=pc`), it hands over text mode (`gfxpayload=text`),
