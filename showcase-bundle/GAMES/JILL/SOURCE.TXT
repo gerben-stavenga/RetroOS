@@ -1,0 +1,12 @@
+Jill of the Jungle, episode 1 shareware
+Entry point: C:\GAMES\JILL\JILL.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/JillOfTheJungle/jill.ZIP
+SHA256: 123ea8e7a485a98980a88031aa3acb6fd7f1edcfa04fcdf9882d1055f5648d10
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.

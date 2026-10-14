@@ -1,0 +1,15 @@
+Descent shareware
+Entry point: C:\GAMES\DESCENT\DESCENT.BAT
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/mbcd9495/dcnt14-1.zip
+SHA256: dfbb7d9e21f9580d49f3958212bc5853cb1d63334147b1f9c01bf6daad2677c4
+
+https://archive.org/download/mbcd9495/dcnt14-2.zip
+SHA256: bbcb3ded1d053ee0e7f8a18aba929a226b5f12b319a4ab66993cacbc4357f2f8
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.

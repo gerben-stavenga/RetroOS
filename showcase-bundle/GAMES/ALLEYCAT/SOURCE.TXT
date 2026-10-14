@@ -1,0 +1,12 @@
+Alley Cat
+Entry point: C:\GAMES\ALLEYCAT\CAT.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/msdos_Alley_Cat_1984/Alley_Cat_1984.zip
+SHA256: 7fadfa306416ce2a6b57da6d6fc44a3f11ee70180c50ab2f34e69b3c4e23bc09
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.

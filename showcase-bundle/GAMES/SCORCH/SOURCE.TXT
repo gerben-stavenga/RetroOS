@@ -1,0 +1,12 @@
+Scorched Earth 1.5 shareware
+Entry point: C:\GAMES\SCORCH\SCORCH.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/mbcd9495/scorch15.zip
+SHA256: 002117403b50071639e293a9005658e4a51c0b0740965fb157a03db38caca395
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.

@@ -1,0 +1,12 @@
+Rogue
+Entry point: C:\GAMES\ROGUE\10ROGUE.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/msdos_Rogue_1983/Rogue_1983.zip
+SHA256: 1e1da7322963d92ad0a3968aad0263db2d0fa85575f150f6a537d7ad99fddd2a
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.
