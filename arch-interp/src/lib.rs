@@ -73,6 +73,8 @@ mod vga;
 
 pub use backend::Interp;
 pub use calls::*;
+pub mod suite_control;
+
 pub use machine::{
     clean_fx_template, drain, free_page_count, halt_forever, inb, inl, insw, inw, now, outb, outl,
     outsw, outw, post_irq, rdtsc, set_irq_line, shutdown, FxState,
@@ -114,7 +116,7 @@ pub use net::{
 // Host-side VGA text-screen snapshotting (headless inspection of the guest's
 // 0xB8000 text buffer): `set_dump_path` arms it, `request_vga_dump` flips the
 // flag from a watcher thread, the CPU thread renders at the next slice boundary.
-pub use screendump::{enable_live as enable_live_console, request as request_vga_dump, set_dump_path};
+pub use screendump::{enable_live as enable_live_console, request as request_vga_dump, set_dump_path, write_suite_frame};
 // Display frame mailbox: the kernel emulates the VGA and renders (single-VGA
 // design); this backend only carries pixels. The hosted `main` publishes
 // frames from the kernel's present sink; retroos-play takes them and blits;

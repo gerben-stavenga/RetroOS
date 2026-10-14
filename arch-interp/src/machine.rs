@@ -84,6 +84,11 @@ pub fn rdtsc() -> u64 {
 
 /// Power off — exit the host process.
 pub fn shutdown() -> ! {
+    if crate::suite_control::enabled() {
+        if let Some((w, h, pixels)) = crate::vga::peek_frame() {
+            crate::screendump::write_suite_frame(w, h, &pixels);
+        }
+    }
     std::process::exit(0)
 }
 
@@ -131,12 +136,14 @@ static VIRT_CYCLES: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "tcg")]
 pub fn advance_virtual_time(instructions: u64) {
     VIRT_CYCLES.fetch_add(instructions, Ordering::Relaxed);
+    crate::suite_control::advance(instructions);
 }
 
 /// High-resolution deterministic time derived directly from retired guest
 /// instructions. The rational conversion avoids quantizing TCG to 1 ms.
 #[cfg(feature = "tcg")]
 pub fn now() -> u64 {
+    if crate::suite_control::enabled() { return crate::suite_control::now(); }
     let cycles = VIRT_CYCLES.load(Ordering::Relaxed);
     (u128::from(cycles) * 1_000_000 / u128::from(VIRT_INSTR_PER_MS)) as u64
 }

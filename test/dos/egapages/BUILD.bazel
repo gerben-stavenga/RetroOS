@@ -1,0 +1,7 @@
+genrule(
+    name = "egapages_com",
+    srcs = ["egapages.asm"],
+    outs = ["EGAPAGES.COM"],
+    cmd = "nasm -f bin -o $@ $<",
+    visibility = ["//visibility:public"],
+)

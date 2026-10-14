@@ -114,6 +114,9 @@ fn reflect_vm86_inline<'a>(uc: &mut Unicorn<'a, Ctx>, vector: u8) {
 fn build() -> Unicorn<'static, Ctx> {
     let mut uc = Unicorn::new_with_data(Arch::X86, Mode::MODE_32, Ctx::default())
         .expect("unicorn init");
+    if let Some(model) = crate::suite_control::cpu_model() {
+        uc.ctl_set_cpu_model(model).expect("suite CPU model");
+    }
 
     // The single guest-physical region: [0, PHYS_SIZE) backed by the memfd view.
     // With paging on, unicorn walks our tables and indexes here.

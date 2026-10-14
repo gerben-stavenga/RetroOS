@@ -11,6 +11,15 @@ MIB = 1024 * 1024
 CLUSTER = 64 * 512
 
 
+def extract_dos_files(archive, destination):
+    # The shared bundles also carry Unix command symlinks (including absolute
+    # targets). FAT cannot represent links, and the packing pass excludes them.
+    # Skip them before extraction so tar's data filter can still validate the
+    # paths of the ordinary files and directories that will go on C:.
+    members = (member for member in archive if member.isfile() or member.isdir())
+    archive.extractall(destination, members=members, filter="data")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", required=True)
@@ -24,7 +33,7 @@ def main():
         # Data CONFIG files override the boot bundle's defaults.
         for source in (args.runtime, args.data):
             with tarfile.open(source) as archive:
-                archive.extractall(tree, filter="data")
+                extract_dos_files(archive, tree)
 
         occupied = 0
         for root, dirs, files in os.walk(tree):

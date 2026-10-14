@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "Shot",
+    "label": "scores",
+    "sha256": "04886adb4c8b5ecc8df97c324ca9cb324fb1e657dae7620ab8be77dd237dec70"
+  },
+  {
+    "kind": "Shot",
+    "label": "level",
+    "sha256": "ad273dfeeca9cdb2df93f57d2221b23cd0a11c5ae541d3d9c61762a271ffdc20"
+  },
+  {
+    "kind": "Shot",
+    "label": "dug",
+    "sha256": "4a22e138334b8b6ed7362cf11c492fc337418f4d4222ebaf3ff747a6b53e2fdb"
+  },
+  {
+    "kind": "Record",
+    "label": "sound",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]

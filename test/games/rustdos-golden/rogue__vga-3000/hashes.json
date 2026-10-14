@@ -1,0 +1,17 @@
+[
+  {
+    "kind": "Shot",
+    "label": "title",
+    "sha256": "6141ea1225bf7b11d2d245424a19226bff6dabb099fe789855098dbc893b5597"
+  },
+  {
+    "kind": "Shot",
+    "label": "dungeon",
+    "sha256": "eb4bed85840cdb66d81be4c8a72be8d3212a7382037ea2208656be3ef80ad067"
+  },
+  {
+    "kind": "Shot",
+    "label": "moved",
+    "sha256": "7f3216bbaaa0b02945f6bb7b4a11370364c7e5b2418f393dd6f1b0908fe869a6"
+  }
+]

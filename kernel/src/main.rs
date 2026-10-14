@@ -51,6 +51,7 @@ fn main() {
     let mut shot: Option<String> = None;
     let mut wav: Option<String> = None;
     let mut live_console = false;
+    let mut suite_control = false;
     // Positional args: [0] = program/disk, [1..] = the program's own argv tail.
     let mut positional: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -75,6 +76,14 @@ fn main() {
             // offline (no real card on the host). Without this flag the audio
             // ports are unpopulated and the kernel sound path is inert.
             "--wav" => wav = args.next(),
+            "--suite-control" => suite_control = true,
+            "--suite-cpu" => {
+                let name = args.next().unwrap_or_default();
+                if !arch::suite_control::set_cpu_model(&name) {
+                    eprintln!("--suite-cpu supports 486 or pentium");
+                    std::process::exit(2);
+                }
+            },
             // The live window moved to its own binary: retroos-play.
             "--window" => {
                 eprintln!("retroos-host is headless; use `./run.sh hosted` (retroos-play) for the window");
@@ -96,7 +105,7 @@ fn main() {
     if let Some(path) = shot {
         arch::set_dump_path(&path);
         let ppm_path = format!("{path}.ppm");
-        std::thread::spawn(move || loop {
+        if !suite_control { std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(1000));
             arch::request_vga_dump();
             if let Some((w, h, px)) = arch::take_frame() {
@@ -107,7 +116,7 @@ fn main() {
                 let _ = std::fs::write(&ppm_path, out);
                 arch::recycle_frame(px);
             }
-        });
+        }); }
     }
 
     // Install the kernel debug-log sink (a host stream, not the arch port bus):
@@ -218,7 +227,12 @@ fn main() {
     // stdin→keyboard pump. Keys reach the guest via the kernel's IRQ1 path and
     // the C BIOS INT 9/16h. Harmless headless (raw mode skips a non-TTY).
     arch::enter_raw_mode();
-    spawn_keyboard();
+    if suite_control {
+        arch::suite_control::enable();
+        spawn_suite_control();
+    } else {
+        spawn_keyboard();
+    }
 
     // Build the boot config from our CLI args directly — the interpreter is
     // QEMU-like (it must fabricate 0x3DA etc.), and we already know the headless
@@ -287,6 +301,51 @@ fn install_socket_backend_hosted() {
 /// a PC scancode make/break sequence, and post it as an `Irq::Key` for the
 /// kernel event loop (which translates to Unicode and feeds guest input).
 /// Ctrl-] quits the host. Runs forever on its own thread.
+fn spawn_suite_control() {
+    std::thread::spawn(|| {
+        use std::io::{BufRead, Write};
+        arch::suite_control::wait_paused();
+        println!("READY");
+        std::io::stdout().flush().unwrap();
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break; };
+            let mut words = line.split_whitespace();
+            match words.next() {
+                Some("run") => match words.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(ms) => arch::suite_control::run(ms),
+                    None => { println!("ERROR invalid run"); continue; }
+                },
+                Some("cycles") => match words.next().and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) if n > 0 => arch::suite_control::cycles(n),
+                    _ => { println!("ERROR invalid cycles"); continue; }
+                },
+                Some("scan") => {
+                    for word in words {
+                        match u8::from_str_radix(word, 16) {
+                            Ok(code) => arch::post_irq(arch::Irq::Key(code)),
+                            Err(_) => { println!("ERROR invalid scancode"); std::process::exit(2); }
+                        }
+                    }
+                },
+                Some("snapshot") => {
+                    arch::suite_control::snapshot();
+                    if let Some((w, h, px)) = arch::take_frame() {
+                        // The control client names its capture with `--screenshot`.
+                        // Write through the same backend helper as ordinary captures.
+                        arch::write_suite_frame(w, h, &px);
+                        arch::recycle_frame(px);
+                    }
+                },
+                _ => { println!("ERROR unknown command"); continue; }
+            }
+            println!("OK {}", arch::suite_control::now());
+            std::io::stdout().flush().unwrap();
+        }
+        arch::suite_control::disable();
+        std::process::exit(0);
+    });
+}
+
 fn spawn_keyboard() {
     use std::io::Read;
     std::thread::spawn(|| {

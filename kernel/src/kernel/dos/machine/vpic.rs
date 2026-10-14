@@ -227,6 +227,27 @@ mod tests {
     use super::VirtualPic;
 
     #[test]
+    fn timer_and_keyboard_eois_leave_sound_irq_in_service() {
+        let mut pic = VirtualPic::new();
+        pic.raise(5);
+        pic.ack(5);
+        assert_eq!(pic.master_ocw2(0x60), None);
+        assert_eq!(pic.master_ocw2(0x61), None);
+        assert!(pic.in_service(5));
+
+        pic.raise(1);
+        pic.ack(1);
+        pic.raise(0);
+        pic.ack(0);
+        assert_eq!(pic.master_ocw2(0x61), Some(1));
+        assert!(pic.in_service(0));
+        assert!(pic.in_service(5));
+        assert_eq!(pic.master_ocw2(0x60), Some(0));
+        assert!(pic.in_service(5));
+        assert_eq!(pic.master_ocw2(0x65), Some(5));
+    }
+
+    #[test]
     fn ocw2_accepts_specific_and_rotated_eois() {
         let mut pic = VirtualPic::new();
 

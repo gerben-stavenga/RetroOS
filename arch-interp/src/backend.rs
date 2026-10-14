@@ -42,6 +42,7 @@ impl Arch for Interp {
 
     #[allow(clippy::deref_addrof)]
     fn execute(&mut self, regs: &mut Regs, io: &arch_abi::IoPolicy) -> KernelEvent {
+        crate::suite_control::gate();
         crate::engine::install_io_policy(io);
         // Bridge the loop-owned registers to the backend's live frame for the
         // run (the active SPACE already lives in `REGS.space`), then read them
