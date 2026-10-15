@@ -1,0 +1,12 @@
+Sopwith
+Entry point: C:\GAMES\SOPWITH\SOPWITH.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/msdos_Sopwith_1985/Sopwith_1985.zip
+SHA256: eecc217462932d2fcecccbd7751c84c4df3bf38da8b2544d33fe6a000664eac4
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.

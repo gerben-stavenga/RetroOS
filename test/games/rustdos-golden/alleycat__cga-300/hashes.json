@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "Shot",
+    "label": "title",
+    "sha256": "786d883b760a4d977895efd3ce2e231605c0e6a942957d6ed227a1b5078c3817"
+  },
+  {
+    "kind": "Record",
+    "label": "title-sound",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "kind": "Shot",
+    "label": "alley",
+    "sha256": "9b6f440067d21e8316d2cdfc5262d07eb9400ce09a9561e9bba51f80d7bb5cb4"
+  },
+  {
+    "kind": "Shot",
+    "label": "moved",
+    "sha256": "730ebf53bbe201a1e13974fffef261c5e34dadefcdf7bf185221eb3750e0d72c"
+  }
+]

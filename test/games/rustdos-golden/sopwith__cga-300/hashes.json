@@ -1,0 +1,22 @@
+[
+  {
+    "kind": "Shot",
+    "label": "menu",
+    "sha256": "fd6bb6744237b3d867d11a0fa05b36a6e0defe374c66b49097334c89e7f7b299"
+  },
+  {
+    "kind": "Shot",
+    "label": "runway",
+    "sha256": "5d0801dfe9a9c6abdbfa61ce81d6260e54346383e4b63f2e537e17e3f5b06a31"
+  },
+  {
+    "kind": "Shot",
+    "label": "flying",
+    "sha256": "bb398755471d25f8bde38104912b06d4ddd45e7d71ccc9bbf51080759089d409"
+  },
+  {
+    "kind": "Record",
+    "label": "engine",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]

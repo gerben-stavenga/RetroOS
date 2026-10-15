@@ -974,6 +974,7 @@ fn run<A: crate::Arch>(
             crate::compact_screenln!(&mut screen, "Storage sync failed before shutdown.");
         }
         crate::kernel::drivers::hda::emergency_quiesce(); // codec must not ride into poweroff unparked
+        screen.present(machine, bios_workspace);
         machine.shutdown();
     }
 

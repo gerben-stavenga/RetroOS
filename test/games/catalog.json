@@ -1,0 +1,72 @@
+[
+  {
+    "id": "digger-play",
+    "description": "Real-mode Digger: title, start, keyboard input, gameplay",
+    "directory": "GAMES/DIGGER",
+    "executable": "DIGGER.EXE",
+    "timeout": 45,
+    "steps": [
+      {"op": "wait", "seconds": 3},
+      {"op": "shot", "name": "title", "size": [640, 400]},
+      {"op": "key", "key": "F1"},
+      {"op": "wait", "seconds": 3},
+      {"op": "key", "key": "RIGHT", "repeat": 8},
+      {"op": "shot", "name": "played", "size": [640, 400], "different_from": "title", "reference": false}
+    ]
+  },
+  {
+    "id": "keen1-play",
+    "description": "EGA Commander Keen: title, menu, world map, movement",
+    "directory": "GAMES/KEEN1",
+    "executable": "KEEN1.EXE",
+    "timeout": 60,
+    "steps": [
+      {"op": "wait", "seconds": 13},
+      {"op": "shot", "name": "title", "size": [320, 200]},
+      {"op": "key", "key": "ENTER"},
+      {"op": "wait", "seconds": 2},
+      {"op": "shot", "name": "menu", "different_from": "title"},
+      {"op": "key", "key": "ENTER"},
+      {"op": "wait", "seconds": 4},
+      {"op": "key", "key": "RIGHT", "repeat": 8},
+      {"op": "shot", "name": "world", "size": [320, 200], "different_from": "menu", "reference": false}
+    ]
+  },
+  {
+    "id": "doom-demo-silent",
+    "description": "DOS/4GW Doom: prerecorded gameplay with sound disabled",
+    "directory": "GAMES/DOOMS",
+    "executable": "DOOM.EXE",
+    "arguments": "-playdemo demo1",
+    "files": {
+      "DEFAULT.CFG": "mouse_sensitivity 5\nsfx_volume 8\nmusic_volume 8\nshow_messages 1\nuse_mouse 0\nuse_joystick 0\nscreenblocks 9\ndetaillevel 0\nsnd_channels 3\nsnd_musicdevice 0\nsnd_sfxdevice 0\nsnd_sbport 544\nsnd_sbirq 7\nsnd_sbdma 1\nsnd_mport -1\nusegamma 0\n"
+    },
+    "timeout": 75,
+    "steps": [
+      {"op": "log", "contains": "ST_Init: Init status bar.", "timeout": 30},
+      {"op": "wait", "seconds": 8},
+      {"op": "shot", "name": "demo-start", "size": [320, 200], "min_colours": 32, "reference": false},
+      {"op": "wait", "seconds": 5},
+      {"op": "shot", "name": "demo-playing", "size": [320, 200], "min_colours": 32, "different_from": "demo-start", "reference": false}
+    ]
+  },
+  {
+    "id": "doom-demo-sb16",
+    "description": "DOS/4GW Doom: prerecorded gameplay and non-silent SB audio",
+    "directory": "GAMES/DOOMS",
+    "executable": "DOOM.EXE",
+    "arguments": "-playdemo demo1",
+    "expect_failure": "demo-sound: missing audio or silence",
+    "files": {
+      "DEFAULT.CFG": "mouse_sensitivity 5\nsfx_volume 8\nmusic_volume 8\nshow_messages 1\nuse_mouse 0\nuse_joystick 0\nscreenblocks 9\ndetaillevel 0\nsnd_channels 3\nsnd_musicdevice 3\nsnd_sfxdevice 3\nsnd_sbport 544\nsnd_sbirq 7\nsnd_sbdma 1\nsnd_mport -1\nusegamma 0\n"
+    },
+    "timeout": 75,
+    "steps": [
+      {"op": "log", "contains": "ST_Init: Init status bar.", "timeout": 30},
+      {"op": "wait", "seconds": 8},
+      {"op": "shot", "name": "demo-start", "size": [320, 200], "min_colours": 32, "reference": false},
+      {"op": "listen", "name": "demo-sound", "seconds": 3, "min_peak": 32},
+      {"op": "shot", "name": "demo-playing", "size": [320, 200], "min_colours": 32, "different_from": "demo-start", "reference": false}
+    ]
+  }
+]

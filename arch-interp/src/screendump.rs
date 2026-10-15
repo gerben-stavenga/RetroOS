@@ -103,6 +103,14 @@ pub fn set_dump_path(path: &str) {
     let _ = DUMP_PATH.set(path.to_string());
 }
 
+pub fn write_suite_frame(width: usize, height: usize, pixels: &[u32]) {
+    if let Some(path) = DUMP_PATH.get() {
+        let mut data = format!("P6\n{width} {height}\n255\n").into_bytes();
+        for p in pixels { data.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]); }
+        let _ = std::fs::write(format!("{path}.ppm"), data);
+    }
+}
+
 /// Request a snapshot at the next CPU slice boundary (called off-thread).
 pub fn request() {
     DUMP_REQ.store(true, Ordering::Relaxed);
@@ -115,6 +123,8 @@ pub fn maybe_dump() {
         return;
     }
     let Some(path) = DUMP_PATH.get() else { return };
+    let _ = std::fs::write(format!("{path}.mode"),
+        crate::vcpu::mem().read::<u8>(0x449).to_string());
     // Any graphics mode: dump the latest kernel-rendered frame as a PPM. Text
     // modes (0x00-0x03, 0x07) fall through to the character dump below
     // (more useful as grep-able text than as pixels). This must cover the EGA

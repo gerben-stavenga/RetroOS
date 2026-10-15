@@ -50,6 +50,14 @@ rust_library(
 )
 
 # ---- tests (bazelisk test //arch-interp:all --platforms=@platforms//host) ----
+rust_test(
+    name = "suite-control-test",
+    srcs = ["tests/suite_control.rs", "src/suite_control.rs"],
+    crate_root = "tests/suite_control.rs",
+    crate_features = ["tcg"],
+    edition = "2021",
+)
+
 # In-crate unit tests per engine. The kvm proofs run for real when /dev/kvm is
 # accessible and skip with a message otherwise; force with
 # --test_env=RETRO_REQUIRE_KVM=1.

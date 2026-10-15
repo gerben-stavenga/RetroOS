@@ -1,0 +1,27 @@
+[
+  {
+    "kind": "Shot",
+    "label": "title",
+    "sha256": "2c0ac0c7c3e2629a627d7df3f3980ec970c32d9c92fb8ffb12f4bdc962bf7b1f"
+  },
+  {
+    "kind": "Shot",
+    "label": "menu",
+    "sha256": "755340e26cb40bfa167fc323db0c2f0be6445b66946a221687467b50cc737656"
+  },
+  {
+    "kind": "Shot",
+    "label": "map",
+    "sha256": "ce2fc4a3fab461ca47705cdb6f944f60a25a419418445f90b1e189877074f275"
+  },
+  {
+    "kind": "Shot",
+    "label": "walked",
+    "sha256": "feefeac6d4c17a3ac4ec01595db38a43b20e35775f2c2a1817070c4d2047edb9"
+  },
+  {
+    "kind": "Record",
+    "label": "sound",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  }
+]

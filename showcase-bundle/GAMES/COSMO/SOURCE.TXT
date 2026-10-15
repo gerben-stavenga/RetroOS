@@ -1,0 +1,12 @@
+Cosmo's Cosmic Adventure, episode 1 shareware
+Entry point: C:\GAMES\COSMO\COSMO1.EXE
+
+Source archives from the RustDOS game regression catalog:
+https://github.com/dividebysandwich/rust-dos/blob/81076c73d85c55abf8e6b0229291adf729f134c5/tests/gamesuite/catalog.rs
+
+https://archive.org/download/mbcd9495/%231cosmo.zip
+SHA256: 6947fae305c0ebc2a5c5700576fb393790f80489ce6f586268886dadb01022cd
+
+Installed with the pinned upstream suite; the installed game directory
+is copied intact here. Original documentation and notices are preserved.
+Packaging does not imply that all game features work in RetroOS.
