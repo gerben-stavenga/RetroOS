@@ -47,6 +47,13 @@ packaged with one recursive glob into a single showcase image. USB loads it by d
 (less RAM)” choice omits it. Disk installations use the games and apps already on their C: filesystem;
 the installer supplies only the core runtime and DN.
 
+The showcase also includes Alley Cat (`GAMES/ALLEYCAT/CAT.EXE`), Cosmo
+(`GAMES/COSMO/COSMO1.EXE`), Descent (`GAMES/DESCENT/DESCENT.BAT`), Duke Nukum
+(`GAMES/DUKE1/DN1.EXE`), Jill of the Jungle (`GAMES/JILL/JILL.EXE`), Rogue
+(`GAMES/ROGUE/10ROGUE.EXE`), Scorched Earth (`GAMES/SCORCH/SCORCH.EXE`), and
+Sopwith (`GAMES/SOPWITH/SOPWITH.EXE`). Each directory preserves the original
+distribution files and records its archive sources and checksums in `SOURCE.TXT`.
+
 Runtime files and DN have writable session views; `C:\TEMP` is RAM. A mounted
 Linux root keeps its own `/bin` and `/usr/bin`. Bundled BusyBox serves the RAM
 root or an explicit bundle mount at `/bin`. Unlisted partitions remain unmounted.
@@ -108,9 +115,13 @@ firmware, sound card, and image:
 - `bazel-bin/boot_disk.bin`: GRUB, kernel and `C:\RETROOS` system files, rebuilt from current sources.
 - `build/data.bin`: one writable disk, shared across backends. FAT32 holds `C:` and ext4 holds the Linux root. Guest writes persist.
 
-For Rust-DOS, clone [dividebysandwich/rust-dos](https://github.com/dividebysandwich/rust-dos)
-into `tmp/rust-dos` and run `cargo build --release` there. The checkout and
-build artifacts are ignored by Git. `./run.sh rust-dos` boots the same BIOS
+Install the pinned [Rust-DOS](https://github.com/dividebysandwich/rust-dos)
+build with `bash tools/install_rust_dos.sh`. It installs a standalone executable
+at `~/.local/bin/rust-dos`, with provenance under `~/.local/share/retroos/rust-dos`.
+Its managed source lives under `~/.local/share/retroos/rust-dos/source` and its
+build cache under `~/.cache/retroos/rust-dos-build`. Neither launcher uses a
+`tmp/` checkout. Set `RUST_DOS_PREFIX` to change the installation prefix, or
+`RUST_DOS_BIN` to select another executable. `./run.sh rust-dos` boots the same BIOS
 data disk as the other emulators, but builds `native_boot_disk.bin` with
 RetroOS's own BIOS MBR loader instead of GRUB. It keeps the current kernel and
 `C:\RETROOS` files on that disposable disk. Use `RUST_DOS_BIN` to select a
@@ -131,6 +142,13 @@ reads `PATH`, `DN`, `DNSWP`, `TEMP` and `start` from `etc/RETROOS.INI`, matching
 RetroOS's DOS paths; the default `START` opens DN automatically. After DN
 exits, the DOS prompt remains. Rust-DOS's built-in DPMI host uses its default
 enabled setting.
+
+To start a game directly, use
+`./run.sh rust-dos-games --cmd GAMES/KEEN1/KEEN1.EXE`. The launcher accepts
+DOS or Unix path separators, changes into the game's directory, and leaves
+the DOS prompt visible when the game exits. This mode uses Rust-DOS's own
+`COMMAND.COM`, the dynamic CPU core, VGA and automatic speed with a 20000-cycle
+minimum; override with `-- --cycles N --core normal` when needed.
 
 The data disk is seeded only when missing, using proprietary content when
 `apps-proprietary/` exists. Rebuilding a seed never replaces the live disk.
@@ -347,6 +365,21 @@ BOOT.INI. `access=rw` persists permitted writes; `access=ro` rejects them;
 `access=ram` keeps changes in memory. The GRUB `ram-overlay` option protects
 all physical writes for that boot. Unlisted physical partitions stay unmounted. See
 [BOOTING.md](BOOTING.md#disk-writes-and-ram-overlay).
+
+## Game regression tests
+
+`python3 test/rustdos_suite.py --list` lists the complete pinned RustDOS suite:
+15 games, 16 installations and 72 scenarios. Use `--fetch-only` to install its
+verified archives and `--native-profile` to replay single-machine scripts on
+RetroOS while recording hardware differences. Unsupported variants and actual
+game failures remain visible. See [the suite guide](docs/game-suite.md).
+
+`python3 test/game_suite.py --compare` plays bundled Digger, Commander Keen,
+and Doom on isolated hosted kernels, checks graphics and progress, and saves
+screenshots, audio and logs. It builds the hosted kernel and requires
+`mkfs.ext4`; it is opt-in and does not modify the main disk or game assets.
+See [the game suite guide](docs/game-suite.md) for filtering, KVM, reference
+pictures, and the currently known hosted audio failure.
 
 ## Architecture
 

@@ -8,8 +8,8 @@ launch() {
     [ -z "$COMMAND$HOST_DIR$WAV$SHOT$SB_AUDIO" ] && [ "$TRACE" = 0 ] ||
         fail "--cmd, --host, --wav, --screenshot, --trace and --sb-audio are unavailable with Rust-DOS"
 
-    local binary="${RUST_DOS_BIN:-$SCRIPT_DIR/tmp/rust-dos/target/release/rust-dos}"
-    [ -x "$binary" ] || fail "Rust-DOS binary missing: $binary (build it with cd tmp/rust-dos && cargo build --release)"
+    local binary="${RUST_DOS_BIN:-${RUST_DOS_PREFIX:-$HOME/.local}/bin/rust-dos}"
+    [ -x "$binary" ] || fail "Rust-DOS binary missing: $binary (install it with bash tools/install_rust_dos.sh)"
     binary=$(realpath "$binary")
     local cpu=486 sbtype=sb16
     [ "$ARCH" != 686 ] || cpu=pentium
