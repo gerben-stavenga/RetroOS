@@ -60,9 +60,6 @@ pub(super) fn cdrom_read_resume<A: crate::Arch>(
     }))
 }
 
-/// position at 0040:0050 so BIOS and programs (like DN) that read the BDA
-/// cursor see the correct position.
-
 /// Copy a guest ASCIIZ string while reserving the output's last byte for its
 /// implicit terminator. Callers use the returned length and never need to
 /// materialize that terminator.
@@ -78,6 +75,7 @@ pub(super) fn read_asciiz<A: crate::Arch>(machine: &mut A, address: u32, output:
     len
 }
 
+/// First handle AH=45h may hand out (0-2 are the std slots).
 pub(super) const FIRST_USER_HANDLE: usize = 3;
 
 /// What a DOS handle refers to, for AH=45h/46h duplication. The std handles'
