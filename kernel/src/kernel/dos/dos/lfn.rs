@@ -1,7 +1,15 @@
-//! INT 21h/71xx: Windows 95 DOS long-filename API.
-//! Register layouts: RBIL 61, INT 21/7139..71A8. Namespace policy lives in
-//! DFS, never in the backing filesystem or the generic VFS.
-use super::*;
+//! INT 21h/71xx long-filename services.
+
+use crate::Regs;
+use crate::kernel::thread;
+use crate::kernel::dos::{dfs, seg_offset};
+use super::super::files::{
+    accept_open_file, dos_error_from_errno, immutable_media_path, open_policies,
+};
+use super::super::clock::{dos_to_unix_datetime, epoch_days_fast, unix_to_dos_datetime};
+use super::super::int21::DosExit;
+use super::super::lowmem::{Psp, psp_struct_seg, sft_clear};
+
 use alloc::vec::Vec;
 use crate::kernel::vfs;
 use dfs::lfn::{self as names, Found, PATH_MAX};
