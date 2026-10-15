@@ -896,7 +896,7 @@ pub(super) fn reflect_int_to_real_mode<A: crate::Arch>(machine: &mut A,
     // through unchanged — RM-side BIOS/DOS code that would dereference
     // them gets nonsense paragraphs (the spec's "undefined"), which is
     // fine since none does. Our own DOS handlers route buffer addressing
-    // through `linear()` which is PM-aware, or via the dedicated
+    // through `seg_offset()` which is PM-aware, or via the dedicated
     // pmdos_int21_handler short-circuit for 16-bit clients (`pm_dos`).
     let rm_dest = rm_stack(dos, regs);
     enter_rm(dos, regs, rm_dest, None);

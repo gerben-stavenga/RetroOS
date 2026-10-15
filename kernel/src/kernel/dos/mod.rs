@@ -533,7 +533,7 @@ pub struct ExecParent {
 /// base+limit. Downstream the linear is used with the flat `regs.read/write/
 /// slice` memory API.
 #[inline]
-fn linear<A: crate::Arch>(_machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
+fn seg_offset<A: crate::Arch>(dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> u32 {
     if regs.mode() == crate::UserMode::VM86 {
         let lin = ((seg as u32) << 4).wrapping_add(off & 0xFFFF);
         // A20 is permanently wrapped (force line 20 low): the HMA

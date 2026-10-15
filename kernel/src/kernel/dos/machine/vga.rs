@@ -6,6 +6,7 @@
 //! backends only supply a framebuffer.
 
 use crate::Regs;
+use crate::kernel::dos::bios::{bda_field, Bda};
 use super::*;
 use crate::kernel::bios_display::{DosVideo, FullscreenVga, EmulatedVga};
 
@@ -24,14 +25,6 @@ pub fn physical_vga_present() -> bool {
 }
 
 impl EmulatedVga {
-    fn materialize<A: crate::Arch>(&mut self, machine: &mut A) {
-        materialize_emulated_aperture(self, machine);
-    }
-
-    fn suspend<A: crate::Arch>(&mut self, machine: &A) {
-        self.save_vram(live_vram(machine));
-    }
-
     fn save_vram(&mut self, live: &[u8]) {
         match &mut self.state {
             VgaState::Legacy(state) if state.planes.is_empty() => {
@@ -59,10 +52,6 @@ impl EmulatedVga {
             }
             _ => {}
         }
-    }
-
-    fn resume_vram<A: crate::Arch>(&mut self, machine: &mut A) {
-        self.materialize(machine);
     }
 
     /// The single native-to-emulated transition. Legacy VGA state is captured
@@ -228,7 +217,7 @@ impl FullscreenVga {
     pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
         match self {
             Self::Emulated(vga, _) => {
-                vga.materialize(machine);
+                materialize_emulated_aperture(vga, machine);
             }
             Self::Native(_) => machine.map_phys_range(0xA0000 >> 12, 0x20, 0xA0000 >> 12, 0),
         }
@@ -266,14 +255,14 @@ impl DosVideo {
 
     pub fn initialize_active_address_space<A: crate::Arch>(&mut self, machine: &mut A) {
         match self {
-            Self::Vga(vga) => vga.materialize(machine),
+            Self::Vga(vga) => materialize_emulated_aperture(vga, machine),
             Self::Fullscreen(vga) => vga.initialize_active_address_space(machine),
         }
     }
 
     pub fn clone_detached_for_child<A: crate::Arch>(&mut self, machine: &mut A) -> Option<Self> {
         let Self::Vga(vga) = self else { return None };
-        vga.suspend(machine);
+        vga.save_vram(live_vram(machine));
         let child = vga.clone_for_fork();
         // Fork took a snapshot, but the parent still owns live VRAM until the
         // actual execution handoff. Keep its allocation, not a stale image.
@@ -284,20 +273,20 @@ impl DosVideo {
 
     pub fn capture_address_space_vram<A: crate::Arch>(&mut self, machine: &mut A) {
         if let Some(vga) = self.emulated_mut() {
-            vga.suspend(machine);
+            vga.save_vram(live_vram(machine));
         }
     }
 
     pub fn resume_vram<A: crate::Arch>(&mut self, machine: &mut A) {
         if let Some(vga) = self.emulated_mut() {
-            vga.resume_vram(machine);
+            materialize_emulated_aperture(vga, machine);
         }
     }
 
     pub fn release_for_parent_replace<A: crate::Arch>(&mut self, machine: &mut A) -> Self {
         self.map(|mut returned| {
             if let Some(vga) = returned.emulated_mut() {
-                vga.suspend(machine);
+                vga.save_vram(live_vram(machine));
             }
             (Self::Vga(EmulatedVga::initial_mode3()), returned)
         })
@@ -312,11 +301,11 @@ impl DosVideo {
                 Self::Fullscreen(FullscreenVga::Native(native)) =>
                     Self::Fullscreen(saved.attach_native_replace(machine, native)),
                 Self::Fullscreen(FullscreenVga::Emulated(mut child, display)) => {
-                    child.materialize(machine);
+                    materialize_emulated_aperture(&mut child, machine);
                     Self::Fullscreen(FullscreenVga::Emulated(child, display))
                 }
                 Self::Vga(mut child) => {
-                    child.materialize(machine);
+                    materialize_emulated_aperture(&mut child, machine);
                     Self::Vga(child)
                 }
             };
@@ -716,7 +705,7 @@ pub fn bios_set_text_height(device: &mut DosVideo, glyph_h: u8) {
 
 /// BIOS text services program the same registers as direct guest port I/O.
 pub fn bios_write_crtc<A: crate::Arch>(
-    machine: &mut A, device: &mut DosVideo, port: u16, index: u8, value: u8,
+    machine: &mut A, device: &mut DosVideo, index: u8, value: u8,
 ) {
     if let Some(dev) = device.emulated_mut() {
         if let Some(state) = dev.state.legacy_mut() {
@@ -724,6 +713,7 @@ pub fn bios_write_crtc<A: crate::Arch>(
             state.crtc[usize::from(index)] = value;
         }
     } else if device.is_native() {
+        let port: u16 = bda_field!(machine, crtc_base);
         machine.outb(port, index);
         machine.outb(port + 1, value);
     }
@@ -1012,8 +1002,8 @@ pub fn svga_set_curated_mode<A: crate::Arch>(
     mode: crate::kernel::platform::VbeMode,
     request: u16,
 ) {
-    svga_leave(machine, pc);
     let Some(dev) = pc.vga.emulated_mut() else { return };
+    svga_leave(machine, dev);
     let pages = (mode.framebuffer_bytes as usize).div_ceil(crate::PAGE_SIZE);
     let base = initialize_live_vram(machine, pages);
     unsafe {
@@ -1063,8 +1053,7 @@ pub fn svga_set_bank<A: crate::Arch>(
 
 /// Leave SVGA for a standard VGA mode: detach the window alias and free the
 /// framebuffer region.
-pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
-    let Some(dev) = pc.vga.emulated_mut() else { return };
+fn svga_leave<A: crate::Arch>(machine: &mut A, dev: &mut EmulatedVga) {
     if dev.state.svga().is_none() {
         return;
     }
@@ -1079,25 +1068,15 @@ pub fn svga_leave<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine) {
     dev.svga_vram.clear();
 }
 
-/// React to a BIOS INT 10h AH=00 video mode set. Register programming and VRAM
-/// layout are committed as one operation: first normalize the old CPU view,
-/// then install the new register file, then ask the card model for the new CPU
-/// view and aperture mapping. `clear` (AL bit 7 clear) zeroes the planes.
-pub fn on_set_mode<A: crate::Arch>(
+/// Set an emulated VGA mode, replacing its registers, palette, font and CPU
+/// aperture. Clearing mode sets also zero the backing planes.
+pub fn set_emulated_mode<A: crate::Arch>(
     machine: &mut A,
-    pc: &mut PcMachine,
-    _regs: &mut Regs,
+    dev: &mut EmulatedVga,
     mode: u8,
     clear: bool,
 ) {
-    // A standard mode-set leaves any active VESA SVGA mode.
-    svga_leave(machine, pc);
-    // A real card draws its own planes from its own register file.
-    let Some(dev) = pc.vga.emulated_mut() else { return };
-    // A BIOS mode set while the VGA is detached (OSD/background execution)
-    // starts a new hardware state. The opaque 4F04 image belongs to the old
-    // mode; the canonical register file and VRAM below become the complete
-    // restore authority.
+    svga_leave(machine, dev);
     let Some(vga) = dev.state.legacy_mut() else { return };
     let planes = live_planes_mut(machine);
     let old_layout = vga.layout();
@@ -1349,7 +1328,7 @@ fn read_guest_byte<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVid
 }
 
 /// BIOS mode-set clearing after the new aperture has been installed. EGA/VGA
-/// planar modes were already cleared in on_set_mode; the other modes use their
+/// planar modes were already cleared in set_emulated_mode; the other modes use their
 /// CPU-visible windows, which may be direct or trapped (notably CGA mode 6).
 pub fn bios_clear_framebuffer<A: arch_abi::GuestBytes>(machine: &mut A, device: &mut DosVideo, mode: u8) {
     if matches!(mode, 0x0D..=0x12) { return; }

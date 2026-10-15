@@ -596,10 +596,6 @@ fn pit_io<R>(
 }
 
 pub fn emulate_inb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
-    emulate_inb_non_vga(machine, pc, port)
-}
-
-fn emulate_inb_non_vga<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, port: u16) -> u8 {
     match port {
         // VGA Input Status Register 1: bit 3 (vertical retrace) and bit 0
         // (blanking). An EMULATED card has no raster, so the value is
@@ -765,26 +761,7 @@ pub fn emulate_outb<A: crate::Arch>(machine: &mut A, pc: &mut PcMachine, regs: &
         // Master PIC command
         0x20 => {
             if let Some(retired_irq) = pc.vpic.master_ocw2(val) {
-                // EOI (specific or non-specific). No keyboard coupling here:
-                // a scancode arriving mid-handler already latched its own IRR
-                // edge when it surfaced (vkbd::try_surface), and the PIC
-                // delivers it once the EOI clears the in-service bit — plain
-                // 8259 behavior, no device knowledge required.
-                //
-                // Re-arm the passthrough card's HOST line, which `handle_irq`
-                // masked when it queued the completion and which stays masked
-                // until the guest EOIs. It is the card's OWN line — the same
-                // value the relay matches on — NOT the guest's BLASTER line
-                // and not a constant: a
-                // restrapped card (86Box moves to IRQ 7) would otherwise have
-                // its real line masked forever after the first completion, and
-                // every later block would silently never arrive. The emulated
-                // SB has no host line — its IRQ is purely virtual — so there is
-                // nothing to rearm there (`feedback_no_half_modelled_devices`).
-                let guest_irq = pc.sb.blaster.irq;
-                if retired_irq == guest_irq && let SbDevice::Native { pt, .. } = &pc.sb.device {
-                    machine.rearm_irq(pt.card.irq);
-                }
+                pc.sb.acknowledge_irq(machine, retired_irq);
             }
         }
         // Gameport one-shot trigger: no card is present on this ISA window.
@@ -1377,6 +1354,24 @@ pub fn vm86_pop<A: crate::Arch>(machine: &mut A, regs: &mut Regs) -> u16 {
     let val = read_u16(machine, regs.ss32(), sp as u32);
     set_vm86_sp(regs, sp.wrapping_add(2));
     val
+}
+
+/// Set or clear a flag in the caller's saved VM86 interrupt frame.
+/// IRET restores this FLAGS word; changing live flags would be overwritten.
+pub fn vm86_set_return_flag<A: crate::Arch>(machine: &mut A, regs: &Regs, mask: u16, enabled: bool) {
+    let address = (usize::from(vm86_ss(regs)) << 4) + usize::from(vm86_sp(regs)) + 4;
+    let flags = machine.read::<u16>(address);
+    machine.write::<u16>(address, if enabled { flags | mask } else { flags & !mask });
+}
+
+/// Return from a 16-bit VM86 interrupt, restoring IP, CS and virtual FLAGS.
+pub fn vm86_iret<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
+    let ip = vm86_pop(machine, regs);
+    let cs = vm86_pop(machine, regs);
+    let flags = vm86_pop(machine, regs);
+    set_vm86_ip(regs, ip);
+    set_vm86_cs(regs, cs);
+    set_vm86_flags(regs, u32::from(flags));
 }
 
 
