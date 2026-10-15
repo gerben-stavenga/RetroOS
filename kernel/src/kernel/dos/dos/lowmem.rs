@@ -10,7 +10,6 @@ pub(super) fn psp_struct_seg<A: crate::Arch>(dos: &thread::DosState<A>) -> u16 {
     dos.current_psp
 }
 
-/// First handle AH=45h may hand out (0-2 are the std slots).
 // /// Prepare the VM86 IVT for a new process.
 // ///
 // /// The BIOS IVT at 0x0000-0x03FF is preserved from the COW copy of page 0,
