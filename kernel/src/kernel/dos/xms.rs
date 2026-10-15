@@ -5,7 +5,7 @@
 //! extended-memory pool.
 
 use crate::Regs;
-use crate::kernel::dos::linear;
+use crate::kernel::dos::seg_offset;
 use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
 use crate::compact_dbg_println;
 use crate::kernel::thread;
@@ -421,7 +421,7 @@ pub(crate) fn xms_dispatch<A: crate::Arch>(machine: &mut A, dos: &mut thread::Do
 ///   +0A: u16 dest handle (0=conventional)
 ///   +0C: u32 dest offset (or seg:off if handle=0)
 fn xms_move<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
-    let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
+    let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
 
     let length = machine.read::<u32>((addr) as usize) as usize;
     let src_handle = machine.read::<u16>((addr + 4) as usize);

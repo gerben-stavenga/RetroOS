@@ -190,11 +190,3 @@ pub(super) fn flat_addr(ldt: &[u64], seg: u16, offset: u32, cs_32: bool) -> u32 
     let offset = if cs_32 { offset } else { offset & 0xFFFF };
     seg_base(ldt, seg).wrapping_add(offset)
 }
-
-pub(super) fn set_carry(regs: &mut Regs) {
-    regs.set_flag32(1); // CF
-}
-
-pub(super) fn clear_carry(regs: &mut Regs) {
-    regs.clear_flag32(1); // CF
-}

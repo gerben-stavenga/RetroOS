@@ -12,7 +12,7 @@ fn errno(rc: i32) -> Result<(), u16> {
 }
 
 fn string<A: crate::Arch>(machine: &mut A, dos: &thread::DosState<A>, regs: &Regs, seg: u16, off: u32) -> Result<Vec<u8>, u16> {
-    let address = linear(machine, dos, regs, seg, off) as usize;
+    let address = seg_offset(dos, regs, seg, off) as usize;
     let mut name = Vec::new();
     for i in 0..=PATH_MAX {
         let byte = machine.read::<u8>(address + i);
@@ -139,7 +139,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             if dl > 26 { return Err(15); }
             let drive = if dl == 0 { b'A' + dos.dfs.current_drive_number() } else { b'A' + dl - 1 };
             let cwd = dos.dfs.cwd_lfn(drive)?;
-            let address = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
+            let address = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
             put_string(machine, address, &cwd);
         }
         0x4e | 0x4f => {
@@ -158,7 +158,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
                 (handle, dos.dfs.lfn_searches.next(handle)?)
             };
             let output = find_data(&found, format)?;
-            let address = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32) as usize;
+            let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
             machine.copy_to(address, &output);
             word(&mut regs.rcx, found.conversion);
             return Ok(Some(if first { handle } else { 0x4f00 | (handle & 0xff) }));
@@ -180,7 +180,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
                 2 => dos.dfs.lfn_path(&name, false)?.long,
                 _ => return Err(1),
             };
-            let address = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32) as usize;
+            let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
             put_string(machine, address, &output);
         }
         0x6c => return open(machine, kt, dos, regs).map(Some),
@@ -191,7 +191,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             // Report the DOS namespace, not the underlying disk format.
             let filesystem = b"RetroOS";
             if regs.rcx as u16 as usize <= filesystem.len() { return Err(122); }
-            let address = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32) as usize;
+            let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
             put_string(machine, address, filesystem);
             word(&mut regs.rbx, 0x4002); // LFN + case-preserving; never case-sensitive
             word(&mut regs.rcx, names::NAME_MAX as u16);
@@ -209,14 +209,14 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             out[40..44].copy_from_slice(&1u32.to_le_bytes());
             out[44..48].copy_from_slice(&((stat.ino >> 32) as u32).to_le_bytes());
             out[48..52].copy_from_slice(&(stat.ino as u32).to_le_bytes());
-            let address = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
+            let address = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
             machine.copy_to(address, &out);
         }
         // The clock currently has no configurable timezone: DOS timestamps
         // and UTC use the same clock, as in the existing AH=57h implementation.
         0xa7 => match regs.rbx as u8 {
             0 => {
-                let address = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
+                let address = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 let ft = machine.read::<u64>(address);
                 let (time, date, hundredths) = filetime_to_dos(ft).ok_or(13u16)?;
                 word(&mut regs.rcx, time); word(&mut regs.rdx, date);
@@ -224,7 +224,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             }
             1 => {
                 let ft = dos_to_filetime(regs.rcx as u16, regs.rdx as u16, (regs.rbx >> 8) as u8).ok_or(13u16)?;
-                let address = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32) as usize;
+                let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
                 machine.write::<u64>(address, ft);
             }
             _ => return Err(1),
@@ -234,7 +234,7 @@ fn call<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: 
             if regs.rdx as u8 != 0x11 { return Err(0x7100); }
             let name = string(machine, dos, regs, regs.ds as u16, regs.rsi as u32)?;
             let output = short_without_tail(&name, (regs.rdx >> 8) as u8)?;
-            let address = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32) as usize;
+            let address = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32) as usize;
             if regs.rdx & 0xff00 == 0 { machine.copy_to(address, &output); }
             else { put_string(machine, address, &output); }
         }

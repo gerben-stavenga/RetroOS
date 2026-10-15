@@ -405,6 +405,32 @@ static mut IDT64: Idt64 = Idt64 {
     entries: [IdtEntry64::null(); IDT_ENTRIES],
 };
 
+/// Replace both native IDT entries, preserving gate policy, and return their
+/// previous addresses. Both tables change in one interrupt-disabled operation.
+///
+/// # Safety
+/// Run at ring 0 with interrupts disabled and exclusive access to the IDTs.
+/// Each assembly entry must obey its mode's native interrupt-frame and return
+/// conventions, including whether the CPU pushes an error code.
+pub unsafe fn replace_interrupt_handlers(vector: u8, handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
+    unsafe {
+        let entry32 = &mut IDT32.entries[usize::from(vector)];
+        let entry64 = &mut IDT64.entries[usize::from(vector)];
+        let previous = arch_abi::InterruptHandlers {
+            entry32: u32::from(entry32.offset_low) | (u32::from(entry32.offset_high) << 16),
+            entry64: u64::from(entry64.offset_low)
+                | (u64::from(entry64.offset_mid) << 16)
+                | (u64::from(entry64.offset_high) << 32),
+        };
+        entry32.offset_low = handlers.entry32 as u16;
+        entry32.offset_high = (handlers.entry32 >> 16) as u16;
+        entry64.offset_low = handlers.entry64 as u16;
+        entry64.offset_mid = (handlers.entry64 >> 16) as u16;
+        entry64.offset_high = (handlers.entry64 >> 32) as u32;
+        previous
+    }
+}
+
 pub static mut TSS32: Tss = Tss::new();
 pub static mut TSS64: Tss = Tss::new();
 

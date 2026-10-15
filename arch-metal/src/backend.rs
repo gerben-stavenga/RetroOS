@@ -58,6 +58,10 @@ impl Arch for Metal {
         super::exec_profile::time(ExecutionProfileStage::Decode);
         ev
     }
+    unsafe fn replace_interrupt_handlers(&mut self, vector: u8, handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
+        super::calls::arch_replace_interrupt_handlers(vector, handlers)
+    }
+
     #[allow(clippy::deref_addrof)] // `&raw const REGS`-first form; see `execute`
     fn activate(&mut self, incoming: RootPageTable, fx_ptr: *mut Self::Fx, hash_ptr: *mut u64) -> RootPageTable {
         // `activate` moves only the SPACE (registers are managed by `execute`).

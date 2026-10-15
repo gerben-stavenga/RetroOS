@@ -277,6 +277,13 @@ impl EmulatedSb {
 }
 
 impl SoundBlaster {
+    /// Complete the guest IRQ acknowledgement on a passed-through card.
+    pub fn acknowledge_irq<A: crate::Arch>(&self, machine: &mut A, irq: u8) {
+        if irq == self.blaster.irq && let SbDevice::Native { pt, .. } = &self.device {
+            machine.rearm_irq(pt.card.irq);
+        }
+    }
+
     /// Defaults: A220 I7 D1 H5 (guest sees SB IRQ 7; the host chip stays
     /// on its real line and the IRQ relay maps host→guest, so the two are
     /// intentionally decoupled). Overridden by the guest's `BLASTER=` env.
