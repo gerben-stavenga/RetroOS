@@ -39,6 +39,36 @@ listed mode such as `set framebuffer_payload=1024x768x32`. This image carries
 its own GRUB; commands missing from a different GRUB installation do not
 affect it.
 
+### Configure USB mounts from Linux
+
+After flashing the USB image, mount its FAT32 partition. The installer from
+`retroos-machine.tar.gz` can generate a custom BOOT.INI on that stick:
+
+```sh
+lsblk -o NAME,FSTYPE,UUID,TRAN,MOUNTPOINTS
+./install.sh --usb=/media/$USER/RETROOS --c-uuid=ABCD-1234 --prepare
+./install.sh --usb=/media/$USER/RETROOS --c-uuid=ABCD-1234
+```
+
+Replace the mountpoint and C: filesystem UUID with your values. For USB,
+`--prepare` prints the proposed BOOT.INI without writing anything; repeat
+the same command without `--prepare` to apply it. Use `sudo` for the write
+if your USB mount requires it. From a source checkout, use
+`./tools/install_kernel.sh` with the same arguments; this requires no build.
+
+This updates only `/boot/retroos/BOOT.INI` on the already-flashed stick and
+saves the previous file as `BOOT.INI.previous`. It retains additional mounts
+and leaves the host's GRUB configuration and data partitions untouched.
+The kernel, RAM modules and RETROOS.INI already on the stick are retained.
+
+Without `--c-uuid`, a single eligible internal FAT/ext4 volume is selected;
+multiple candidates require an explicit UUID. `--c-ram` selects session-only
+C:. Physical C: defaults to the selected partition's root; use
+`--c-dir=/existing/directory` to select a subdirectory on ext4.
+`--root-uuid=<ext4-UUID>` additionally mounts a Linux filesystem at `/`.
+The generated physical C: mount uses `/home/retroos` as its Unix path.
+Select the USB menu's **persistent disk** entry to retain changes on C:.
+
 RetroOS does not yet have a USB mass-storage driver. It loads the kernel and
 RAM images from the stick through GRUB, but RetroOS itself cannot read or write
 the USB partition after boot. A separate supported ATA, AHCI, or NVMe disk is

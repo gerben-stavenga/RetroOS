@@ -47,7 +47,11 @@ jobs:
         RETRO_TEST_ONLY: unit
       run: test/run_all.sh
     - name: Release tooling tests
-      run: python3 -m unittest discover -s test -p release_notes_test.py
+      run: |
+        python3 -m unittest discover -s test -p release_notes_test.py
+        python3 test/grub_module_install.py
+        python3 test/machine_install.py
+        python3 test/usb_install.py
     - name: Trim build cache
       if: always()
       uses: ./.github/actions/trim-cache
