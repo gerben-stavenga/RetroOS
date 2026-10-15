@@ -18,7 +18,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 
 use super::{
     ExecParent,
-    linear, snapshot_env,
+    seg_offset, snapshot_env,
     dos_alloc_block, dos_free_block, dos_resize_block,
     dos_set_program_block_owner, dos_keep_resident_block,
 };
@@ -531,7 +531,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
             thread::KernelAction::Done
         }
         SLOT_VBE_WINDOW => {
-            let ok = super::bios::vbe_window_entry(
+            let ok = super::bios::vbe::vbe_window(
                 machine, bios_display, dos, regs,
             );
             regs.rax = (regs.rax & !0xFFFF) | if ok { 0x004F } else { 0x014F };
@@ -543,7 +543,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
             thread::KernelAction::Done
         }
         SLOT_KBD_INTERCEPT_RETURN => {
-            super::bios::int09_intercept_return(machine, dos, regs);
+            super::bios::keyboard::int09_intercept_return(machine, dos, regs);
             thread::KernelAction::Done
         }
         SLOT_MOUSE_CB_RET => {
@@ -581,7 +581,7 @@ pub(super) fn rm_ctrl_dispatch<A: crate::Arch>(
 /// which `dpmi_enter` installs when `client_use32 == false`.
 ///
 /// We service the call directly with PM regs — no `enter_rm`,
-/// no mode flip, no bounce buffer. `int_21h` reaches `linear()` which
+/// no mode flip, no bounce buffer. `int_21h` reaches `seg_offset()` which
 /// sees `regs.mode() == PM` and resolves DS:DX through the LDT base.
 /// On exit `finish_dos_call` does the mode-aware iret-frame pop.
 pub(super) fn pmdos_int21_handler<A: crate::Arch>(machine: &mut A, bios_display: &mut crate::kernel::bios_display::BiosDisplayWorkspace<A>, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
@@ -678,7 +678,7 @@ pub(super) fn pmdos_int10_handler<A: crate::Arch>(
     regs: &mut Regs,
 ) -> thread::KernelAction {
     let ax = regs.rax as u16;
-    super::bios::int10(machine, bios_display, dos, regs);
+    super::bios::video::int10(machine, bios_display, dos, regs);
     // DPMI default reflection does not transfer segment registers between
     // modes. Pointer-bearing BIOS APIs therefore belong to this API translator,
     // not to the real-mode BIOS implementation. AX=1130h returns ES:BP as a
@@ -711,7 +711,7 @@ mod pmdos_translation_tests {
 /// restores parent which may be VM86 or PM), so check `regs.mode()`
 /// post-handler rather than assuming.
 ///
-///   - VM86: standard `vm86_pop` ×3 — pops FLAGS/CS/IP off regs.SS:SP
+///   - VM86: `vm86_iret` restores IP/CS/FLAGS from regs.SS:SP
 ///     (which is either the child's stack with the entry frame from
 ///     `exec_program`, or a VM86 parent's stack with the original INT
 ///     21 frame).
@@ -719,12 +719,7 @@ mod pmdos_translation_tests {
 ///     stack and merge DOS status flags so CF/AX results survive.
 fn finish_dos_call<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
     if regs.mode() == crate::UserMode::VM86 {
-        let ret_ip = vm86_pop(machine, regs);
-        let ret_cs = vm86_pop(machine, regs);
-        let ret_flags = vm86_pop(machine, regs);
-        set_vm86_ip(regs, ret_ip);
-        set_vm86_cs(regs, ret_cs);
-        machine::set_vm86_flags(regs, ret_flags as u32);
+        machine::vm86_iret(machine, regs);
     } else {
         let post_handler_status = regs.flags32() & DOS_STATUS_MASK;
         let client_use32 = dos.dpmi.as_ref().is_some_and(|d| d.client_use32);
@@ -772,8 +767,8 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
         // Forking caller polls AH=04 (SYNTH_WAITPID) for exit. Shell concerns
         // (parsing, /C, .BAT, built-ins) live entirely in COMMAND.COM.
         0x01 => {
-            let mut read_asciiz = |seg: u16, off: u32, dst: &mut [u8; 128]| -> usize {
-                let base = linear(machine, dos, regs, seg, off);
+            let read_asciiz = |seg: u16, off: u32, dst: &mut [u8; 128]| -> usize {
+                let base = seg_offset(dos, regs, seg, off);
                 let mut n = 0;
                 while n < 127 {
                     let c = machine.read::<u8>((base + n as u32) as usize);
@@ -911,7 +906,7 @@ pub(super) fn rm_native_syscall<A: crate::Arch>(machine: &mut A, kt: &mut thread
                 Some(n) => {
                     let mut display = [0u8; 512];
                     let display_len = lib::codepage::current_codepage().display_line(&buf[..n], &mut display);
-                    let dest = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
+                    let dest = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32);
                     for (i, &b) in display[..display_len].iter().enumerate() {
                         machine.write::<u8>((dest + i as u32) as usize, b);
                     }
@@ -1332,7 +1327,7 @@ fn dos_putchar<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, c
     log_dos_byte(c);
     // Render through DOS's own teletype — the same one INT 10h AH=0Eh uses,
     // on the BDA cursor that DOS programs read directly.
-    super::bios::teletype(machine, dos, c, 0x07);
+    super::bios::video::teletype(machine, dos, c, 0x07);
 }
 
 /// Copy a guest ASCIIZ string while reserving the output's last byte for its
@@ -1488,7 +1483,7 @@ fn resolve_guest_path<A: crate::Arch>(
     target: PathTarget,
 ) -> Result<VfsPath, i32> {
     let mut raw = [0; dfs::DFS_PATH_MAX];
-    let address = linear(machine, dos, regs, segment, offset);
+    let address = seg_offset(dos, regs, segment, offset);
     let len = read_asciiz(machine, address, &mut raw);
     let (bytes, len) = match target {
         PathTarget::Existing => dfs_open_existing(dos, &raw[..len])?,
@@ -1697,7 +1692,7 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x09: Display $-terminated string at DS:DX
         0x09 => {
-            let start = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let start = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut addr = start;
             loop {
                 let ch = machine.read::<u8>((addr) as usize);
@@ -1718,7 +1713,7 @@ fn int_21h<A: crate::Arch>(
         // prompt is the canonical reason this needs to exist — without it the
         // game spins forever asking for input.
         0x0A => {
-            let buf_lin = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let buf_lin = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let max_chars = machine.read::<u8>((buf_lin) as usize);
             if max_chars == 0 {
                 machine.write::<u8>((buf_lin + 1) as usize, 0);
@@ -1806,7 +1801,7 @@ fn int_21h<A: crate::Arch>(
                     regs.set_flag32(1);
                     return thread::KernelAction::Done;
                 }
-                let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
+                let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32) as usize;
                 machine.copy_to(addr, cwd);
                 machine.write::<u8>(addr + cwd.len(), 0);
                 DosExit::Ok
@@ -1841,7 +1836,7 @@ fn int_21h<A: crate::Arch>(
         // AH=0x1A: Set DTA (Disk Transfer Area) address to DS:DX
         0x1A => {
             // Store DTA address — NC needs this for FindFirst/FindNext
-            let dta = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let dta = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             dos.dta = dta;
             return thread::KernelAction::Done;
         }
@@ -1897,7 +1892,7 @@ fn int_21h<A: crate::Arch>(
             let country = match regs.rax as u8 { 0xff => regs.rbx as u16, n => u16::from(n) };
             let profile = if country == 0 { Some(lib::locale::current()) } else { lib::locale::by_country(country) };
             let Some(profile) = profile else { break 'country DosExit::Error(2); };
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32) as usize;
             let data = crate::kernel::locale::dos_country(profile, lib::codepage::current_codepage().id);
             machine.copy_to(addr, &data);
             // DOS programs call the far pointer at +12h to uppercase a byte
@@ -1931,7 +1926,7 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x3B: Change directory (DS:DX=ASCIIZ path)
         0x3B => {
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut path = [0u8; dfs::DFS_PATH_MAX];
             let i = read_asciiz(machine, addr, &mut path);
             let err = dos.dfs.chdir(&path[..i]);
@@ -1940,7 +1935,7 @@ fn int_21h<A: crate::Arch>(
         // AH=0x3D: Open file (DS:DX=ASCIIZ filename, AL=access mode)
         0x3D => {
             let open_mode = regs.rax as u8;
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut name = [0u8; dfs::DFS_PATH_MAX];
             let i = read_asciiz(machine, addr, &mut name);
             // Check for device names (before normalization)
@@ -1993,7 +1988,7 @@ fn int_21h<A: crate::Arch>(
         0x3F => {
             let handle = regs.rbx as u16 as i32;
             let count = regs.rcx as u16 as usize;
-            let buf_addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let buf_addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             // A std handle redirected to a file (AH=46h) reads the file.
             let vfs_backed = (handle as usize) < thread::MAX_FDS
                 && matches!(kt.fds[handle as usize], thread::FdKind::Vfs(_));
@@ -2065,7 +2060,7 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x4E: Find first matching file (CX=attr, DS:DX=filespec)
         0x4E => 'find: {
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut raw = [0u8; 80];
             let raw_len = read_asciiz(machine, addr, &mut raw);
             let mut composed = alloc::vec![0u8; crate::kernel::vfs::PATH_KEY_MAX];
@@ -2321,7 +2316,7 @@ fn int_21h<A: crate::Arch>(
                 && (handle == 1 || handle == 2
                     || (hidx < thread::MAX_FDS && kt.fds[hidx] == thread::FdKind::ConsoleOut));
             if console {
-                let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+                let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 for i in 0..count as u32 {
                     let ch = machine.read::<u8>((addr + i) as usize);
                     dos_putchar(machine, dos, ch);
@@ -2330,7 +2325,7 @@ fn int_21h<A: crate::Arch>(
             } else if handle == NULL_FILE_HANDLE {
                 DosExit::Ax(count)
             } else {
-                let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+                let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let mut data = alloc::vec![0u8; count as usize];
                 machine.copy_from(addr as usize, &mut data);
                 let n = crate::kernel::vfs::write(machine, handle as i32, &data, &kt.fds);
@@ -2434,7 +2429,7 @@ fn int_21h<A: crate::Arch>(
                 // FindFirst: parse FCB → compose DOS path → seed
                 // dos.find_path / dos.find_idx, then drop into the
                 // shared scan loop below.
-                let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+                let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
                 let (is_ext, fcb_off) = if machine.read::<u8>(addr as usize) == 0xFF { (true, 7) } else { (false, 0) };
                 let fcb_base = addr.wrapping_add(fcb_off);
                 let drive_byte = machine.read::<u8>((fcb_base) as usize);
@@ -2564,9 +2559,9 @@ fn int_21h<A: crate::Arch>(
                 dos: &mut thread::DosState<A>,
                 regs: &mut Regs,
             ) -> thread::KernelAction {
-            let ds_base = linear(machine, dos, regs, regs.ds as u16, 0);
+            let ds_base = seg_offset(dos, regs, regs.ds as u16, 0);
             let mut si = regs.rsi as u16;
-            let fcb = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
+            let fcb = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32);
 
             // Skip leading whitespace/separators if bit 0 set
             let flags = regs.rax as u8;
@@ -2712,8 +2707,8 @@ fn int_21h<A: crate::Arch>(
         }
         // AH=0x60: Canonicalize path (DS:SI=input, ES:DI=output buffer)
         0x60 => {
-            let src = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
-            let dst = linear(machine, dos, regs, regs.es as u16, regs.rdi as u32);
+            let src = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
+            let dst = seg_offset(dos, regs, regs.es as u16, regs.rdi as u32);
             // Read input path
             let mut name = [0u8; 128];
             let len = read_asciiz(machine, src, &mut name);
@@ -2867,7 +2862,7 @@ fn int_21h<A: crate::Arch>(
                 let id = regs.rbx as u16;
                 match lib::codepage::codepage(id) {
                     Some(page) if page.id == lib::codepage::current_codepage().id => DosExit::Ok,
-                    Some(page) if super::bios::install_codepage_font(machine, bios_display, dos, page) => {
+                    Some(page) if super::bios::video::install_codepage_font(machine, bios_display, dos, page) => {
                         lib::codepage::select_codepage(id);
                         DosExit::Ok
                     }
@@ -2945,7 +2940,7 @@ fn int_21h<A: crate::Arch>(
         // AH=5Ah: Create temporary file. DS:DX names a directory/prefix; DOS
         // appends a unique 8.3 name in the caller's buffer and returns a handle.
         0x5A => {
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
             let mut prefix = [0u8; dfs::DFS_PATH_MAX];
             let plen_limit = dfs::DFS_PATH_MAX - 12;
             let mut plen = read_asciiz(machine, addr, &mut prefix[..plen_limit]);
@@ -3133,7 +3128,7 @@ fn int_21h<A: crate::Arch>(
             ) -> DosExit {
             let action = regs.rdx as u16;
             let open_mode = regs.rbx as u16;
-            let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
+            let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
             let mut name = [0u8; dfs::DFS_PATH_MAX];
             let i = read_asciiz(machine, addr, &mut name);
             let open_exists = action & 0x01 != 0;
@@ -3290,7 +3285,7 @@ pub(super) fn dispatch_synchronous_rm_int21<A: crate::Arch>(
 fn int_2eh<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // DS:SI = pointer to command-line length byte + text (same as PSP:80h format)
     // Treat as COMMAND.COM /C — fork-exec the program in a fresh address space.
-    let addr = linear(machine, dos, regs, regs.ds as u16, regs.rsi as u32);
+    let addr = seg_offset(dos, regs, regs.ds as u16, regs.rsi as u32);
     let len = machine.read::<u8>((addr) as usize) as usize;
     let mut cmd = [0u8; 128];
     let copy = len.min(127);
@@ -3340,7 +3335,7 @@ fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs:
         // far address of its DOS device header. Some installers use this
         // header, rather than 150Bh, to verify their current drive is a CD.
         0x1501 => {
-            let dest = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32) as usize;
+            let dest = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32) as usize;
             let header = LOW_MEM_BASE + core::mem::offset_of!(LowMem, cdrom_header) as u32;
             let far_ptr = ((header >> 4) << 16) | (header & 0xF);
             machine.write::<u8>(dest, 0); // driver subunit zero
@@ -3366,7 +3361,7 @@ fn int_2fh<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs:
         }
         // AX=150Dh — return one byte per installed CD-ROM drive at ES:BX.
         0x150D => {
-            let dest = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32);
+            let dest = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
             machine.write::<u8>(dest as usize, 3); // D: (A:=0)
             regs.clear_flag32(1);
             thread::KernelAction::Done
@@ -3756,18 +3751,18 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
     }
 
     // Read ASCIIZ filename from DS:DX
-    let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+    let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
     let flen = read_asciiz(machine, addr, &mut filename);
 
     // Read parameter block at ES:BX
-    let pb = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32);
+    let pb = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
     let cmdtail_off = machine.read::<u16>((pb + 2) as usize) as u32;
     let cmdtail_seg = machine.read::<u16>((pb + 4) as usize);
     // The embedded (segment, offset) far pointer is a PM selector:offset
     // when the caller is in PM, an RM paragraph:offset in VM86 — same
-    // discriminator linear() uses for buffer addresses elsewhere.
-    let cmdtail_addr = linear(machine, dos, regs, cmdtail_seg, cmdtail_off);
+    // discriminator seg_offset() uses for buffer addresses elsewhere.
+    let cmdtail_addr = seg_offset(dos, regs, cmdtail_seg, cmdtail_off);
     let tail_len = machine.read::<u8>((cmdtail_addr) as usize) as usize;
     let mut tail = [0u8; 128];
     let copy_len = tail_len.min(127);
@@ -3957,13 +3952,13 @@ fn exec_program<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A
 /// the caller, e.g. Borland C passes the segment of the overlay frame).
 fn exec_load_overlay<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     // ASCIIZ filename at DS:DX
-    let addr = linear(machine, dos, regs, regs.ds as u16, regs.rdx as u32);
+    let addr = seg_offset(dos, regs, regs.ds as u16, regs.rdx as u32);
     let mut filename = [0u8; 128];
     let flen = read_asciiz(machine, addr, &mut filename);
     let prog_name: &[u8] = &filename[..flen];
 
     // Parameter block at ES:BX — two WORDs.
-    let pb = linear(machine, dos, regs, regs.es as u16, regs.rbx as u32);
+    let pb = seg_offset(dos, regs, regs.es as u16, regs.rbx as u32);
     let load_seg = machine.read::<u16>((pb) as usize);
     let reloc_factor = machine.read::<u16>((pb + 2) as usize);
 
@@ -5001,7 +4996,7 @@ pub(crate) const SLOT_PM_TO_REAL: u8 = 0xFF;
 /// clients by default), `pm_vectors[0x21]` points here instead of the
 /// generic vector stub. The CD 31 traps to `pmdos_int21_handler` which
 /// runs the DOS INT 21 dispatcher with PM regs intact (no mode switch),
-/// then pops the frame `deliver_pm_int` planted on the client's PM stack. `linear()` sees `regs.mode() == PM` and resolves DS:DX via
+/// then pops the frame `deliver_pm_int` planted on the client's PM stack. `seg_offset()` sees `regs.mode() == PM` and resolves DS:DX via
 /// LDT base lookup — so high-memory PM-block buffers (the case Borland's
 /// `dpmiload` hits) are addressed correctly without bounce buffering.
 pub(crate) const SLOT_PMDOS_INT21: u8 = 0xFC;
@@ -5043,7 +5038,7 @@ pub(super) fn setup_ivt<A: crate::Arch>(machine: &mut A, regs: &mut Regs) {
     // DOS always sees the Rust substitute BIOS. Native firmware is a private
     // implementation detail of BiosDisplayWorkspace and is never entered in
     // a personality's address space.
-    super::bios::install(machine, regs);
+    super::bios::install(machine);
 
     // HW IRQ vectors are substitute-BIOS entries too. `raise_pending` delivers
     // through the PM vector table when required; real-mode delivery reaches
