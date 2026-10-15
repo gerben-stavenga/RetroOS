@@ -6,15 +6,17 @@ prepare=0
 supplied_image=0
 copy_showcase=0
 supplied_showcase=0
+usb=0
 for argument in "$@"; do
     case "$argument" in
         --prepare) prepare=1 ;;
         --image|--image=*|--iso|--iso=*) supplied_image=1 ;;
         --copy-showcase) copy_showcase=1 ;;
         --showcase-archive|--showcase-archive=*) supplied_showcase=1 ;;
+        --usb|--usb=*) usb=1 ;;
     esac
 done
-if [ "$prepare" = 1 ]; then
+if [ "$prepare" = 1 ] && [ "$usb" = 0 ]; then
     [ "$(id -u)" != 0 ] || { echo 'Prepare as your normal user, not root.' >&2; exit 1; }
     if [ "$supplied_image" = 0 ]; then
         bazelisk build //:machine_boot_tar //:root_module_base_gzip //:showcase_module_tar
