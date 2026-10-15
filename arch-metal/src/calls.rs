@@ -24,6 +24,18 @@ pub fn do_arch_execute_raw() -> (u32, u32) {
     (event, extra)
 }
 
+pub fn arch_replace_interrupt_handlers(vector: u8, mut handlers: arch_abi::InterruptHandlers) -> arch_abi::InterruptHandlers {
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            in("eax") crate::arch_call::REPLACE_INTERRUPT_HANDLERS as u32,
+            in("edx") &mut handlers as *mut arch_abi::InterruptHandlers as u32,
+            in("ecx") u32::from(vector),
+        );
+    }
+    handlers
+}
+
 /// Switch threads: swap live state with pointed-to state.
 /// On entry: ptrs hold incoming state. On exit: ptrs hold saved outgoing state.
 /// hash_ptr: null = no hashing. Non-null: on entry = expected hash (0=don't check),

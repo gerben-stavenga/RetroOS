@@ -236,6 +236,7 @@ common_dispatch:
 ; address as the native frame, so no duplicate return frame exists.
 ; =============================================================================
 
+global entry_wrapper_32
 entry_wrapper_32:
     ; CPU pushed (lowest-up): err_code (or none), eip, cs, eflags
     ; cross-priv adds: esp, ss; VM86 adds: es, ds, fs, gs.
@@ -382,6 +383,7 @@ exit_interrupt_32:
 ; Entered via common_dispatch (below KERNEL_CS64 branch). int_num/err_code
 ; (both 8 bytes) have already been pushed by the vector table + dispatch.
 ; -----------------------------------------------------------------------------
+global entry_wrapper_64
 entry_wrapper_64:
     ; Stack: int_num, err_code, rip, cs, rflags, rsp, ss (all 64-bit)
     ; Frame64 is 40 bytes, no padding needed (unlike Frame32 which has 20-byte _pad)

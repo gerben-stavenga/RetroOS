@@ -20,6 +20,14 @@
 mod arch;
 pub use arch::{Arch, GuestBytes, Vcpu};
 
+/// Native interrupt entries for protected mode and long mode.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct InterruptHandlers {
+    pub entry32: u32,
+    pub entry64: u64,
+}
+
 /// Flat, exclusive cycle totals for one guest-entry path. Each elapsed
 /// interval belongs to exactly one field, so the phase values may be summed.
 /// Hosted backends may leave them zero.

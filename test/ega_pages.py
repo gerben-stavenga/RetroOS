@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import socket
@@ -18,6 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--no-build', action='store_true')
+    parser.add_argument('--boot-image', type=Path,
+                        help='Test a saved kernel image, for throughput comparisons')
     args = parser.parse_args()
     if not args.no_build:
         subprocess.run(['bazelisk', 'build', '//:boot_disk',
@@ -40,6 +43,25 @@ def main():
     command = ['./run.sh', 'qemu', '--kvm', '--headless', '--sound', 'none',
                '--data-image', str(disk), '--cmd', 'EGAPAGES.COM', '--',
                '-qmp', f'unix:{qmp},server=on,wait=off']
+    if args.boot_image:
+        boot = work / 'boot.img'
+        subprocess.run(['cp', '--reflink=auto', '--sparse=always',
+                        str(args.boot_image), str(boot)], check=True)
+        boot.chmod(boot.stat().st_mode | 0o200)
+        subprocess.run(['python3', 'tools/vm_mount_config.py', '--boot-image', str(boot),
+                        '--data-image', str(disk), '--command', 'EGAPAGES.COM'],
+                       cwd=ROOT, check=True)
+        # Reuse the launcher's devices without rebuilding the saved kernel.
+        command = ['bash', '-c', '''
+SCRIPT_DIR=$PWD
+WORK=$1 BOOT_IMAGE=$2 DATA_IMAGE=$3
+ARCH=386 FIRMWARE=uefi HEADLESS=1 KVM=1 SOUND=none HD=nvme FREEDOS=0
+COMMAND=EGAPAGES.COM HOST_DIR= SB_AUDIO=
+PASS=(-qmp "unix:$WORK/qmp.sock,server=on,wait=off")
+run_vm() { "$@"; }
+source tools/run/qemu.sh
+launch
+''', 'ega-pages', str(work), str(boot), str(disk)]
     with log.open('wb') as f:
         process = subprocess.Popen(command, cwd=ROOT, stdout=f, stderr=f,
                                    stdin=subprocess.DEVNULL, start_new_session=True)
@@ -83,6 +105,10 @@ def main():
                 call('quit')
         process.wait(timeout=5)
         print(f'PASS: EGA page size, BDA offset, page selection and hidden-page redraw ({work})')
+        timing = re.search(r'EGA-MOV-CYCLES=([0-9A-F]{16})', content)
+        if timing:
+            cycles = int(timing[1], 16)
+            print(f'MOV stores: {cycles} TSC ticks / 32768 = {cycles / 32768:.1f} ticks/store')
     finally:
         if process.poll() is None:
             import signal

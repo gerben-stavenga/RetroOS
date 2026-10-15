@@ -21,6 +21,7 @@
 //! devices themselves, and travels with them.
 
 use crate::Regs;
+use super::super::planar::FastWrites;
 use super::vga::{self, LegacyVgaState};
 use super::{set_string_index, step_string_index, string_index};
 
@@ -32,6 +33,33 @@ use super::{set_string_index, step_string_index, string_index};
 /// Width of the data a string/mov op moves (bytes).
 fn opsize(op32: bool, byte_op: bool) -> u32 {
     if byte_op { 1 } else if op32 { 4 } else { 2 }
+}
+
+/// Operand of an already-admitted deferred store. The normal decoder admits
+/// only these MOV encodings; the fast handler merely records the raw GPR.
+pub(in crate::kernel::dos) fn deferred_store(code: &[u8], default32: bool, reg: u32) -> (u32, u8) {
+    let mut i = 0;
+    let mut p66 = false;
+    loop {
+        match code[i] {
+            0x66 => { p66 = true; i += 1; }
+            0x67 | 0x26 | 0x2e | 0x36 | 0x3e | 0x64 | 0x65 => i += 1,
+            _ => break,
+        }
+    }
+    let opcode = code[i];
+    let bytes = opsize(default32 ^ p66, opcode & 1 == 0) as u8;
+    let value = match opcode {
+        0x88 if code[i + 1] & 0x20 != 0 => reg >> 8, // AH/CH/DH/BH
+        0x88 | 0x89 | 0xa2 | 0xa3 => reg,
+        0xc6 | 0xc7 => {
+            let mut raw = [0; 4];
+            raw[..usize::from(bytes)].copy_from_slice(&code[code.len() - usize::from(bytes)..]);
+            u32::from_le_bytes(raw)
+        }
+        _ => unreachable!("instruction was not admitted as a deferred store"),
+    };
+    (value, bytes)
 }
 
 /// Read/write an integer GP register by encoding `idx` and size `sz` (bytes).
@@ -293,7 +321,7 @@ fn modrm_len(modrm: u8, addr32: bool, peek: impl Fn(u32) -> u8, after: u32) -> u
 pub enum MmioTarget<'a> {
     /// The VGA planar aperture selected by GC[6], through the graphics
     /// controller. Text-font access commonly selects B8000 rather than A0000.
-    Planar { vga: &'a mut LegacyVgaState, base: u32, len: u32 },
+    Planar { vga: &'a mut LegacyVgaState, base: u32, len: u32, allow: &'a mut FastWrites },
     /// The Voodoo's PCI aperture: registers, LFB and texture download.
     Voodoo(&'a mut super::vvoodoo::VVoodoo),
 }
@@ -391,6 +419,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
     let opcode = peek(i);
     i += 1;
 
+    let mut store = None;
     match opcode {
         // mov r/m8, r8  — store AL-style
         0x88 => {
@@ -398,6 +427,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let val = gpr(regs, (modrm >> 3) & 7, 1) as u8;
             i += modrm_len(modrm, addr32, peek, i);
             target.write8(machine, off, val);
+            if modrm >> 6 != 3 { store = Some((modrm >> 3) & 3); }
         }
         // mov r/m16/32, r
         0x89 => {
@@ -406,6 +436,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let val = gpr(regs, (modrm >> 3) & 7, sz);
             i += modrm_len(modrm, addr32, peek, i);
             for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
+            if modrm >> 6 != 3 { store = Some((modrm >> 3) & 7); }
         }
         // mov r8, r/m8 — load
         0x8A => {
@@ -440,6 +471,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let val = gpr(regs, 0, sz);
             for b in 0..sz { target.write8(machine, off + b, (val >> (b * 8)) as u8); }
             i += if addr32 { 4 } else { 2 };
+            store = Some(0);
         }
         // mov r/m8, imm8
         0xC6 => {
@@ -448,6 +480,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             let imm = peek(i + l);
             i += l + 1;
             target.write8(machine, off, imm);
+            if modrm & 0x38 == 0 && modrm >> 6 != 3 { store = Some(255); }
         }
         // mov r/m16/32, imm16/32 — Keen clears VRAM with `mov word es:[di],0`.
         0xC7 => {
@@ -458,6 +491,7 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
             for b in 0..sz { imm |= (peek(i + l + b) as u32) << (b * 8); }
             i += l + sz;
             for b in 0..sz { target.write8(machine, off + b, (imm >> (b * 8)) as u8); }
+            if modrm & 0x38 == 0 && modrm >> 6 != 3 { store = Some(255); }
         }
         // xchg r/m8, r8 — Keen 4's Galaxy engine does `xchg es:[di], al` to
         // touch planar VRAM: the read half loads the GC latches, the write half
@@ -842,6 +876,12 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
         }
     }
 
+    if !rep && i <= 8 {
+        if let (Some(gpr_index), MmioTarget::Planar { allow, .. }) = (store, &mut *target) {
+            allow.remember(regs, cs_base, def32, buf[..8].try_into().unwrap(), gpr_index, i as u8);
+        }
+    }
+
     // Commit anything the target buffered across this instruction (the Voodoo
     // gathers bytes into whole register dwords).
     target.end_instruction();
@@ -859,9 +899,21 @@ pub fn handle_mmio_fault<A: crate::Arch>(machine: &mut A, regs: &mut Regs, targe
 
 #[cfg(test)]
 mod tests {
+    use super::deferred_store;
     use super::inc_dec;
     use super::super::{set_string_index, step_string_index, string_index};
     use crate::Regs;
+
+    #[test]
+    fn deferred_mov_uses_captured_register_or_instruction_immediate() {
+        assert_eq!(deferred_store(&[0x88, 0x27], false, 0x12345678), (0x123456, 1)); // AH
+        assert_eq!(deferred_store(&[0x26, 0x89, 7], false, 0x12345678), (0x12345678, 2));
+        assert_eq!(deferred_store(&[0x66, 0x89, 7], false, 0x12345678), (0x12345678, 4));
+        assert_eq!(deferred_store(&[0x66, 0x89, 7], true, 0x12345678), (0x12345678, 2));
+        assert_eq!(deferred_store(&[0xc6, 7, 0xab], false, 0), (0xab, 1));
+        assert_eq!(deferred_store(&[0xc7, 7, 0x34, 0x12], false, 0), (0x1234, 2));
+        assert_eq!(deferred_store(&[0x66, 0xc7, 7, 0x78, 0x56, 0x34, 0x12], false, 0), (0x12345678, 4));
+    }
 
     #[test]
     fn interpreted_string_indices_obey_address_width() {

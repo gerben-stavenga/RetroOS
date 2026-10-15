@@ -50,6 +50,7 @@ use self::raw_switch::flat_addr;
 /// Switch from VM86 to protected mode.
 /// Called from rm_int31_dispatch when the DPMI entry stub executes.
 pub(in crate::kernel::dos) fn dpmi_enter<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) {
+    dos.planar_writes.clear();
     let client_type = regs.rax as u16; // AX: 0=16-bit, 1=32-bit
     // DPMI entry is a FAR CALL; the real-mode stack holds the PM return CS:IP.
     let ret_ip = machine::vm86_pop(machine, regs);
@@ -203,6 +204,7 @@ fn scrub_freed_selector(regs: &mut Regs, sel: u16) {
 #[inline(never)]
 pub(super) fn dpmi_api<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState<A>, regs: &mut Regs) -> thread::KernelAction {
     let action = dpmi_api_inner(machine, dos, regs);
+    dos.planar_writes.clear();
     machine.on_ldt_changed();
     action
 }

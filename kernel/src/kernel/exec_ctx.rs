@@ -65,7 +65,7 @@ impl<A: crate::Arch> ExecutionContext<A> {
         &mut self,
         machine: &mut A,
         bios: &crate::kernel::bios_display::BiosDisplayWorkspace<A>,
-        personality: &thread::Personality<A>,
+        personality: &mut thread::Personality<A>,
     ) -> crate::KernelEvent {
         machine.execution_profile_begin();
         let key = crate::kernel::io_policy::key(personality, bios);
@@ -74,6 +74,10 @@ impl<A: crate::Arch> ExecutionContext<A> {
             self.io_key = Some(key);
         }
         machine.execution_profile_time(arch_abi::ExecutionProfileStage::PolicyLookup);
+        if let thread::Personality::Dos(dos) = personality {
+            return crate::kernel::dos::execute_planar(machine, dos, &mut self.regs,
+                &self.io_policy);
+        }
         machine.execute(&mut self.regs, &self.io_policy)
     }
 

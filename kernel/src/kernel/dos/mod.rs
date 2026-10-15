@@ -41,6 +41,7 @@ mod dpmi;
 mod dfs;
 mod machine;
 mod present;
+pub(crate) mod planar;
 mod xms;
 mod ems;
 mod memory;
@@ -140,6 +141,7 @@ pub struct DosState<A: crate::Arch> {
     /// and `DosState` is built by value on the 64 KB kernel stack every time a
     /// program is exec'd. Inline, construction alone hits the guard page.
     pub pc: alloc::boxed::Box<machine::PcMachine>,
+    planar_writes: alloc::boxed::Box<planar::FastWrites>,
 
     pub dta: u32,
     pub heap_seg: u16,
@@ -297,6 +299,7 @@ impl<A: crate::Arch> DosState<A> {
         let p = state.as_mut_ptr();
         unsafe {
             core::ptr::addr_of_mut!((*p).pc).write(machine::PcMachine::new_boxed(machine, vga));
+            core::ptr::addr_of_mut!((*p).planar_writes).write(alloc::boxed::Box::new(planar::FastWrites::new()));
             core::ptr::addr_of_mut!((*p).dta).write(0);
             core::ptr::addr_of_mut!((*p).heap_seg).write(0xA000);
             core::ptr::addr_of_mut!((*p).heap_base_seg).write(0xA000);
@@ -378,6 +381,7 @@ impl<A: crate::Arch> DosState<A> {
     /// module — external code never touches `self.ldt`.
     pub fn on_resume(&mut self, machine: &mut A) {
         self.pc.vga.resume_vram(machine);
+        self.planar_writes.clear();
         machine.load_ldt(&self.ldt[..]);
     }
 
@@ -663,6 +667,25 @@ pub fn syscall<A: crate::Arch>(
     }
 }
 
+/// Keep queued planar stores within one CPU loan. Every normal return is a
+/// barrier before reads, register changes, scanout, or ownership changes.
+pub(in crate::kernel) fn execute_planar<A: crate::Arch>(machine: &mut A,
+    dos: &mut DosState<A>, regs: &mut Regs, io: &arch_abi::IoPolicy) -> crate::KernelEvent {
+    let enabled = dos.pc.vga.emulated().and_then(|dev| dev.state.legacy())
+        .and_then(machine::vga::trapped_aperture)
+        .is_some_and(|range| range.start == 0xa0 && range.end >= 0xb0);
+    if !enabled { return machine.execute(regs, io); }
+    #[cfg(target_arch = "x86")]
+    let previous = unsafe { planar::install(machine, &mut dos.planar_writes) };
+    let event = machine.execute(regs, io);
+    #[cfg(target_arch = "x86")]
+    unsafe { planar::uninstall(machine, previous); }
+    let state = dos.pc.vga.emulated_mut().and_then(|dev| dev.state.legacy_mut())
+        .expect("planar VGA changed during CPU execution");
+    machine::vga::flush_write_batch(machine, state, &mut dos.planar_writes);
+    event
+}
+
 /// Page-fault hook for the planar VGA trap: when a guest unchained-graphics
 /// access to the A0000 window faults (the window is left unmapped so the planar
 /// write/read logic runs), decode the faulting store/load and emulate it. Pure
@@ -699,7 +722,7 @@ pub fn try_vga_fault<A: crate::Arch>(machine: &mut A, dos: &mut thread::DosState
         return false;
     }
     let off = addr - base;
-    let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len };
+    let mut target = machine::mmio::MmioTarget::Planar { vga: state, base, len, allow: &mut dos.planar_writes };
     machine::mmio::handle_mmio_fault(machine, regs, &mut target, cs_base, def32, ds_base, es_base, off)
 }
 

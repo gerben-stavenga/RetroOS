@@ -64,6 +64,7 @@ pub(in crate::kernel::dos) fn get_or_alloc_psp_sel<A: crate::Arch>(
         None => return 0,
     };
     let psp_base = (segment as u32) * 16;
+    dos.planar_writes.clear();
     dos.ldt[idx] = make_data_desc_ex(psp_base, 0xFF, false);
     let sel = idx_to_sel(idx);
     if let Some(dpmi) = dos.dpmi.as_mut() {
