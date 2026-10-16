@@ -505,6 +505,18 @@ the personality BIOS's INT 09. Machines with USB-only input are handled by the
 xHCI USB-HID boot-keyboard driver, which works on real full-speed hardware
 (verified on a Razer Blade — SkyRoads played from USB keyboard input).
 
+USB input currently supports xHCI controllers and directly attached HID boot
+keyboards and mice, including composite devices that expose both interfaces
+(such as some KVMs). Boot interfaces are switched to boot protocol; a legacy
+report-ID keyboard layout is also supported for certain gaming keyboards.
+Each of up to four controllers can retain two devices with at most two keyboard
+endpoints and one mouse endpoint. Input devices must be connected at boot.
+External USB hubs and their downstream devices, hotplug, EHCI/OHCI/UHCI,
+USB game controllers, and general HID report-descriptor parsing are not yet
+supported. A KVM that exposes a hub may therefore need a dedicated keyboard
+or mouse emulation port. In KLOG, `keyboard ready` / `mouse ready` means
+endpoint setup succeeded; it does not confirm that input reports arrived.
+
 Caveats on real hardware (vs the `run_uefi.sh` mock):
 - fbcon accepts packed 16/24/32bpp direct-RGB framebuffers and converts its pixels using the
   channel positions and widths reported by GRUB.

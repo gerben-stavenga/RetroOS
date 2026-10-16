@@ -17,11 +17,12 @@ rust_library(
     deps = ["//arch-abi", "//lib", "//lib:compact_fmt"],
 )
 
-# Exercise DMA allocation policy without executing privileged metal code.
+# Exercise xHCI enumeration helpers and input rings without privileged code.
 rust_test(
     name = "xhci_dma_test_host",
-    srcs = ["xhci_test.rs", "src/xhci/dma.rs", "src/xhci/handoff.rs", "src/xhci/port.rs"],
+    srcs = ["xhci_test.rs", "src/xhci.rs"] + glob(["src/xhci/*.rs"]),
     crate_root = "xhci_test.rs",
+    deps = ["//lib", "//lib:compact_fmt"],
     edition = "2024",
     rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests"],
 )
