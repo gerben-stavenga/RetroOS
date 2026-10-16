@@ -65,8 +65,11 @@ const MAX_CONTROLLERS: usize = 4;
 // ── DMA region: DCBAA + command ring + event ring + ERST in one contiguous
 // block, mapped at a fixed VA, cache-disabled (simple + coherent, as NVMe does).
 
+#[path = "xhci/dma.rs"]
 mod dma;
+#[path = "xhci/handoff.rs"]
 mod handoff;
+#[path = "xhci/port.rs"]
 mod port;
 use dma::*;
 const RING_TRBS: usize = 256;
@@ -164,6 +167,7 @@ struct HidPipe {
     dci: u32,
     pipe: usize,
     report_len: usize,
+    keyboard_report_id: bool,
     enq: usize,
     cycle: u32,
     prev: [u8; 16],
@@ -177,6 +181,7 @@ impl HidPipe {
             dci: 0,
             pipe,
             report_len: 0,
+            keyboard_report_id: false,
             enq: 0,
             cycle: 1,
             prev: [0; 16],
@@ -235,6 +240,7 @@ fn decode_mouse_report(r: &[u8; 16], len: usize) -> Option<(i16, i16, u8)> {
 #[derive(Clone, Copy)]
 struct EpInfo {
     iface: u32,
+    boot: bool,
     ep: u32,
     mps: u32,
     interval: u32,
@@ -256,17 +262,8 @@ struct PortDevice {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::decode_mouse_report;
-
-    #[test]
-    fn boot_mouse_report_preserves_signed_motion_and_buttons() {
-        let mut report = [0u8; 16];
-        report[..4].copy_from_slice(&[0b101, 0xfe, 0x7f, 1]);
-        assert_eq!(decode_mouse_report(&report, 4), Some((-2, 127, 0b101)));
-        assert_eq!(decode_mouse_report(&report, 2), None);
-    }
-}
+#[path = "xhci/tests.rs"]
+mod tests;
 
 #[derive(Clone, Copy)]
 enum HidRole {
@@ -357,8 +354,8 @@ impl Controller {
     }
 
     /// Non-blocking: if an event TRB is ready, dequeue it (advancing ERDP) and
-    /// return (trb_type, completion_code, slot_id, endpoint_id); else None.
-    fn try_event(&mut self) -> Option<(u32, u32, u32, u32)> {
+    /// return (trb_type, completion_code, slot_id, endpoint_id, residual); else None.
+    fn try_event(&mut self) -> Option<(u32, u32, u32, u32, u32)> {
         unsafe {
             let trb = (self.dma_va + EVT_OFF + self.evt_deq * 16) as *const u32;
             let ctrl = core::ptr::read_volatile(trb.add(3));
@@ -366,7 +363,9 @@ impl Controller {
                 return None;
             }
             let ttype = (ctrl >> 10) & 0x3F;
-            let cc = core::ptr::read_volatile(trb.add(2)) >> 24;
+            let status = core::ptr::read_volatile(trb.add(2));
+            let cc = status >> 24;
+            let residual = status & 0x00ff_ffff;
             let slot = ctrl >> 24;
             let endpoint = (ctrl >> 16) & 0x1f;
             self.evt_deq += 1;
@@ -379,12 +378,12 @@ impl Controller {
                 self.rt + IR0_ERDP,
                 (self.dma_phys + (EVT_OFF + self.evt_deq * 16) as u64) | (1 << 3),
             );
-            Some((ttype, cc, slot, endpoint))
+            Some((ttype, cc, slot, endpoint, residual))
         }
     }
 
     /// Dequeue one event TRB (bounded wait). None on timeout.
-    fn poll_event(&mut self) -> Option<(u32, u32, u32, u32)> {
+    fn poll_event(&mut self) -> Option<(u32, u32, u32, u32, u32)> {
         for _ in 0..50_000_000u64 {
             if let Some(e) = self.try_event() {
                 return Some(e);
@@ -399,7 +398,7 @@ impl Controller {
     /// Status Change from a reset). Returns (completion_code, slot_id).
     fn wait_event(&mut self, want: u32) -> Option<(u32, u32)> {
         for _ in 0..64 {
-            let (ttype, cc, slot, _) = self.poll_event()?;
+            let (ttype, cc, slot, _, _) = self.poll_event()?;
             if ttype == want {
                 return Some((cc, slot));
             }
@@ -810,21 +809,27 @@ impl Controller {
     /// Diff a HID keyboard report against the previous one and push make/break
     /// scancodes into the shared IRQ queue, just like the i8042 IRQ1 handler.
     ///
-    /// Two layouts, distinguished by `len`:
-    ///   - 8 (boot keyboard): `[mods, reserved, k1..k6]` — modifiers at byte 0.
-    ///   - \>8 (report-ID keyboard, e.g. the Razer's interface 1, 16 bytes):
+    /// The interface protocol selects the layout independently of packet length:
+    ///   - Boot keyboard: `[mods, reserved, k1..k6]` — modifiers at byte 0.
+    ///   - Legacy report-ID keyboard (e.g. the Razer's subclass-0 interface):
     ///     `[report-id, mods, k1..k14]` — report id at byte 0 (only id 1 is the
     ///     keyboard; consumer/system reports share the endpoint), modifiers at
     ///     byte 1. In both, the keycode array starts at byte 2.
-    fn process_keyboard_report(prev: &mut [u8; 16], r: &[u8; 16], len: usize) {
-        let id_prefixed = len > 8;
+    fn process_keyboard_report(prev: &mut [u8; 16], r: &[u8; 16], len: usize, id_prefixed: bool) {
+        let minimum = if id_prefixed { 2 } else { 8 };
+        if len < minimum || len > r.len() {
+            return; // truncated reports must not release previously held keys
+        }
         if id_prefixed && r[0] != 1 {
             return; // not the keyboard report (consumer control, etc.)
         }
         let mod_off = if id_prefixed { 1 } else { 0 };
         let previous = *prev;
-        let keys = &r[2..len];
-        let prev_keys = &previous[2..len];
+        let keys = &r[2..if id_prefixed { len } else { 8 }];
+        let prev_keys = &previous[2..if id_prefixed { 16 } else { 8 }];
+        if keys.iter().any(|k| (1..=3).contains(k)) {
+            return; // rollover/error reports do not describe released keys
+        }
         // Modifier keys: one make/break per changed bit.
         for (b, &sc) in MOD_SC.iter().enumerate() {
             let (now, was) = (r[mod_off] & (1 << b), previous[mod_off] & (1 << b));
@@ -873,7 +878,7 @@ impl Controller {
         }
         // Bound IRQ work per controller so one busy ring cannot starve the others.
         for _ in 0..RING_TRBS {
-            let Some((ttype, cc, slot, dci)) = self.try_event() else {
+            let Some((ttype, cc, slot, dci, residual)) = self.try_event() else {
                 break;
             };
             if ttype != 32 {
@@ -885,9 +890,16 @@ impl Controller {
                     continue;
                 }
                 if cc == 1 || cc == 13 {
-                    let (report, len) = self.read_report(index);
+                    let (report, requested) = self.read_report(index);
+                    let Some(len) = requested.checked_sub(residual as usize) else {
+                        self.arm_report(index);
+                        break;
+                    };
                     if index < 2 {
-                        Self::process_keyboard_report(&mut self.pipes[index].prev, &report, len);
+                        let id_prefixed = self.pipes[index].keyboard_report_id;
+                        Self::process_keyboard_report(
+                            &mut self.pipes[index].prev, &report, len, id_prefixed,
+                        );
                     } else {
                         process_mouse_report(&report, len);
                     }
@@ -972,7 +984,7 @@ impl Controller {
         if self.control(slot, lane, 0x80, 0x06, 0x0200, 0, 255) {
             dev.cfg_value = rd(5);
             let total = ((rd(2) | (rd(3) << 8)) as usize).min(255);
-            let (mut cur_iface, mut is_kbd, mut is_mouse) = (0u32, false, false);
+            let (mut cur_iface, mut is_kbd, mut is_boot_kbd, mut is_mouse) = (0u32, false, false, false);
             let mut i = rd(0) as usize;
             while i + 2 <= total {
                 let (blen, btype) = (rd(i) as usize, rd(i + 1));
@@ -993,11 +1005,13 @@ impl Controller {
                     cur_iface = rd(i + 2);
                     let (cls, subclass, proto) = (rd(i + 5), rd(i + 6), rd(i + 7));
                     is_kbd = cls == 3 && proto == 1;
+                    is_boot_kbd = is_kbd && subclass == 1;
                     is_mouse = cls == 3 && subclass == 1 && proto == 2;
                 } else if btype == 5 && blen >= 7 && rd(i + 2) & 0x80 != 0 && rd(i + 3) & 0x3 == 3 {
                     // interrupt-IN endpoint — attribute it to the current role
                     let ep = EpInfo {
                         iface: cur_iface,
+                        boot: is_mouse || is_boot_kbd,
                         ep: rd(i + 2) & 0x0F,
                         mps: rd(i + 4) | (rd(i + 5) << 8),
                         interval: rd(i + 6),
@@ -1029,16 +1043,19 @@ impl Controller {
         pipe: usize,
         stride: usize,
     ) -> bool {
-        if matches!(role, HidRole::Mouse) {
-            // A protocol-2 HID interface guarantees the standard boot report only
-            // after SET_PROTOCOL(boot). Report-protocol mice may prepend an ID or
-            // use wider axes that the compact decoder intentionally does not parse.
+        if ep.boot {
+            // Boot-subclass interfaces guarantee the standard keyboard/mouse
+            // layout only after SET_PROTOCOL(boot). Packet size alone cannot
+            // tell whether report protocol prepends an ID or uses wider fields.
             if !self.control(slot, dev.lane, 0x21, 0x0B, 0, ep.iface, 0) {
+                lib::compact_println!("xHCI: port {} SET_PROTOCOL(boot) failed (slot {} iface {})",
+                    dev.port, slot, ep.iface);
                 return false;
             }
         }
-        // Do not force boot protocol for keyboards: some gaming keyboards expose a
-        // boot-class interface but go silent when switched out of report protocol.
+        // Keep the existing subclass-0 gaming-keyboard report-ID layout. Such
+        // interfaces do not support SET_PROTOCOL; a general report-descriptor
+        // parser is needed before accepting arbitrary report-protocol devices.
         self.control(slot, dev.lane, 0x21, 0x0A, 0, ep.iface, 0); // SET_IDLE = 0
         // xHCI Interval (period = 2^Interval × 125µs). High/super speed: the
         // descriptor's bInterval is already the exponent+1. Full/low speed: bInterval
@@ -1064,6 +1081,7 @@ impl Controller {
             state.slot = slot;
             state.dci = ep.ep * 2 + 1;
             state.pipe = pipe;
+            state.keyboard_report_id = matches!(role, HidRole::Keyboard) && !ep.boot && ep.mps > 8;
             state.report_len = match role {
                 HidRole::Keyboard => (ep.mps as usize).clamp(8, 16),
                 HidRole::Mouse => (ep.mps as usize).clamp(3, 16),
@@ -1075,9 +1093,15 @@ impl Controller {
         true
     }
 
-    fn start_pipe(&mut self, index: usize) {
-        self.pipes[index].ready = true;
-        self.arm_report(index);
+    /// Publish transfers only after all synchronous setup has finished. A
+    /// completed report consumed by wait_event() would otherwise never be
+    /// dispatched/rearmed, permanently silencing that pipe.
+    fn start_pipes(&mut self) {
+        for index in 0..self.pipes.len() {
+            if self.pipes[index].ready {
+                self.arm_report(index);
+            }
+        }
     }
 
     /// Probe for an xHCI controller, retain at most two keyboards and one mouse,
@@ -1210,6 +1234,9 @@ impl Controller {
                 dev.keyboard.is_some(),
                 dev.mouse.is_some()
             );
+            if dev.dev_class == 9 {
+                lib::compact_println!("xHCI: port {} USB hub unsupported; downstream devices not enumerated", p);
+            }
             let mut retained = false;
             if let Some(ep) = dev.keyboard
                 && let Some(index) = keyboards.iter().position(Option::is_none)
@@ -1254,7 +1281,7 @@ impl Controller {
                 && configured[dev.lane]
                 && self.configure_hid(*slot, dev, *ep, HidRole::Keyboard, index, stride)
             {
-                self.start_pipe(index);
+                self.pipes[index].ready = true;
                 keyboard_count += 1;
                 let _ = compact_fmt::writeln!(
                     &mut lib::log::DebugCon,
@@ -1270,7 +1297,7 @@ impl Controller {
             && configured[dev.lane]
             && self.configure_hid(slot, &dev, ep, HidRole::Mouse, 2, stride)
         {
-            self.start_pipe(2);
+            self.pipes[2].ready = true;
             let _ = compact_fmt::writeln!(
                 &mut lib::log::DebugCon,
                 "xHCI: mouse ready (slot {} port {} ep {} mps {}) at {:02x}:{:02x}.{}",
@@ -1285,6 +1312,7 @@ impl Controller {
         } else {
             lib::compact_println!("xHCI: no mouse found");
         }
+        self.start_pipes();
     }
 }
 
