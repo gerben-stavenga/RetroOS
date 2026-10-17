@@ -1012,6 +1012,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             shadow_height,
             BankedSource::Packed(shadow),
             None,
+            false,
         )
     }
 
@@ -1022,6 +1023,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         mode: crate::kernel::platform::VbeMode,
         bank_state: &mut u16,
         source: crate::kernel::display::PackedSource<'_>,
+        clear_bars: bool,
     ) -> Result<usize, BiosError> {
         let crate::kernel::display::PackedSource { width, height, pixels, row } = source;
         self.present_banked_source(
@@ -1032,6 +1034,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             height,
             BankedSource::Sized { width, pixels, row },
             None,
+            clear_bars,
         )
     }
 
@@ -1056,6 +1059,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
             height,
             BankedSource::Sized { width, pixels, row: &mut row },
             Some(regions),
+            false,
         )
     }
 
@@ -1069,6 +1073,7 @@ impl<A: Arch> NativeBiosWorkspace<A> {
         shadow_height: usize,
         mut source: BankedSource<'_>,
         regions: Option<&[crate::kernel::gui::Rect]>,
+        clear_bars: bool,
     ) -> Result<usize, BiosError> {
         let crate::kernel::display::FormatSpec::Packed(rgb) = mode.format else {
             return Err(BiosError::InvalidFrame);
@@ -1137,6 +1142,25 @@ impl<A: Arch> NativeBiosWorkspace<A> {
                     Ok(())
                 })
             };
+
+            // Geometry changes can expose pixels left by a larger picture.
+            // Clear only the margins, staging one black row rather than a
+            // panel-sized image, and keep all bank changes in this workspace.
+            if clear_bars && (out_w, out_h) != (panel_w, panel_h) {
+                let black = alloc::vec![0u8; panel_w * step];
+                for y in 0..panel_h {
+                    if y < by || y >= by + out_h {
+                        write_span(machine, y * pitch, &black)?;
+                    } else {
+                        if bx != 0 { write_span(machine, y * pitch, &black[..bx * step])?; }
+                        let right = bx + out_w;
+                        if right < panel_w {
+                            write_span(machine, y * pitch + right * step,
+                                &black[..(panel_w - right) * step])?;
+                        }
+                    }
+                }
+            }
 
             // A compositor canvas already matches the selected mode. Copy
             // only its changed row spans; `banked_span` splits a row if it
@@ -1624,6 +1648,7 @@ impl crate::kernel::platform::VgaCap {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn bios_present_packed<A: Arch>(
         &mut self,
         machine: &mut A,
@@ -1631,9 +1656,10 @@ impl crate::kernel::platform::VgaCap {
         mode: crate::kernel::platform::VbeMode,
         current_bank: &mut u16,
         source: crate::kernel::display::PackedSource<'_>,
+        clear_bars: bool,
     ) -> Result<usize, BiosError> {
         self.bios(bios)?.present_banked_packed(
-            machine, self, mode, current_bank, source,
+            machine, self, mode, current_bank, source, clear_bars,
         )
     }
 

@@ -11,6 +11,32 @@
 
 pub use vga::PixelFormat;
 
+/// Runtime policy for standalone DOS framebuffer images. Native desktop
+/// canvases and hardware VGA scanout do not pass through this scaler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DosScaling {
+    OriginalAspect,
+    FillScreen,
+    SharpPixels,
+    SquarePixels,
+}
+
+static DOS_SCALING: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+
+pub fn dos_scaling() -> DosScaling {
+    match DOS_SCALING.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => DosScaling::FillScreen,
+        2 => DosScaling::SharpPixels,
+        3 => DosScaling::SquarePixels,
+        _ => DosScaling::OriginalAspect,
+    }
+}
+
+pub fn set_dos_scaling(mode: DosScaling) {
+    DOS_SCALING.store(mode as usize, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Encoding of a kernel display surface.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FormatSpec {
@@ -546,7 +572,7 @@ impl Display {
     }
     pub fn slow(&self) -> bool { self.framebuffer().is_some_and(|fb| fb.slow) }
 
-    /// Present a mode-sized desktop 1:1, or fit a standalone VGA image to 4:3.
+    /// Present a mode-sized desktop 1:1, or scale a standalone DOS image.
     /// Pixels already have this display's encoding and byte layout.
     /// Only scaling, when required, happens here. At most one packed row
     /// is staged; there is no scaled retained frame.
@@ -565,7 +591,13 @@ impl Display {
         }
         let format = self.rgb;
         let canvas = self.composition_size(width, height);
-        let output = if (width, height) == canvas { canvas } else { self.fit() };
+        let output = if (width, height) == canvas
+            || matches!(self.backend, Backend::Vga { scanout: VgaScanout::Mode13 { .. }, .. })
+        {
+            canvas
+        } else {
+            native_output_size(canvas.0, canvas.1, width, height)
+        };
         let clear_bars = self.last_packed_output != Some(output);
         self.last_packed_output = Some(output);
         let scratch = &mut self.present_pixels;
@@ -587,7 +619,7 @@ impl Display {
                 scanout: VgaScanout::VbeBanked { mode, current_bank },
             } => native.bios_present_packed(
                 machine, bios, *mode, current_bank,
-                PackedSource { width, height, pixels, row: scratch },
+                PackedSource { width, height, pixels, row: scratch }, clear_bars,
             ).unwrap_or_else(|error| banked_present_panic(machine, bios, native, error)),
             Backend::Host => {
                 present_host_shadow(width, height, format, pixels)
@@ -1059,16 +1091,76 @@ fn blit_regions(
     copied
 }
 
-/// A desktop matching the physical mode must not be aspect-fitted. Smaller
-/// standalone VGA images retain the fullscreen 4:3 presentation policy.
+/// A desktop matching the physical mode is always presented 1:1.
 pub(crate) fn native_output_size(
     panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
 ) -> (usize, usize) {
+    dos_output_size(panel_w, panel_h, source_w, source_h, dos_scaling())
+}
+
+fn dos_output_size(
+    panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
+    mode: DosScaling,
+) -> (usize, usize) {
     if (source_w, source_h) == (panel_w, panel_h) {
-        (panel_w, panel_h)
-    } else {
-        fit_vga(panel_w, panel_h)
+        return (panel_w, panel_h);
     }
+    match mode {
+        DosScaling::OriginalAspect => fit_vga(panel_w, panel_h),
+        DosScaling::FillScreen => (panel_w, panel_h),
+        DosScaling::SharpPixels => sharp_output_size(panel_w, panel_h, source_w, source_h)
+            .unwrap_or_else(|| fit_vga(panel_w, panel_h)),
+        DosScaling::SquarePixels => square_output_size(panel_w, panel_h, source_w, source_h),
+    }
+}
+
+/// Equal whole-number replication on both axes, without 4:3 correction.
+/// An oversized source must shrink; preserve its pixel aspect in that case.
+fn square_output_size(
+    panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
+) -> (usize, usize) {
+    if source_w == 0 || source_h == 0 { return (0, 0); }
+    let scale = (panel_w / source_w).min(panel_h / source_h);
+    if scale != 0 { return (source_w * scale, source_h * scale); }
+    if panel_w as u128 * source_h as u128 <= panel_h as u128 * source_w as u128 {
+        (panel_w, (panel_w as u128 * source_h as u128 / source_w as u128) as usize)
+    } else {
+        ((panel_h as u128 * source_w as u128 / source_h as u128) as usize, panel_h)
+    }
+}
+
+/// Choose integer pixel replication closest to 4:3, then the largest area
+/// among equal aspect errors. Exact 4:3 wins even over a larger approximation.
+/// If no pair is within 10% of 4:3, use ordinary aspect fitting instead of
+/// severely distorting text or cropping a source larger than the panel.
+fn sharp_output_size(
+    panel_w: usize, panel_h: usize, source_w: usize, source_h: usize,
+) -> Option<(usize, usize)> {
+    if source_w == 0 || source_h == 0 { return None; }
+    let max_x = panel_w / source_w;
+    let max_y = panel_h / source_h;
+    if max_x == 0 || max_y == 0 { return None; }
+    let mut best: Option<(u128, u128, usize, usize)> = None;
+    for sy in 1..=max_y {
+        let height = source_h * sy;
+        let target = 4 * height as u128;
+        let unit = 3 * source_w as u128;
+        // Check both neighbours: relative aspect error is measured against
+        // the same target for a fixed vertical scale.
+        let floor = (target / unit).min(max_x as u128) as usize;
+        for sx in [floor.clamp(1, max_x), floor.saturating_add(1).clamp(1, max_x)] {
+            let width = source_w * sx;
+            let error = (3 * width as u128).abs_diff(target);
+            if error * 10 > target { continue; }
+            let better = best.is_none_or(|(old_error, old_target, old_w, old_h)| {
+                error * old_target < old_error * target
+                    || (error * old_target == old_error * target
+                        && width as u128 * height as u128 > old_w as u128 * old_h as u128)
+            });
+            if better { best = Some((error, target, width, height)); }
+        }
+    }
+    best.map(|(_, _, w, h)| (w, h))
 }
 
 /// Largest centered 4:3 VGA picture that fits a physical framebuffer.
@@ -1552,6 +1644,104 @@ pub fn dac_for(fmt: PixelFormat) -> voodoo::Dac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dos_scaling_preserves_default_and_bounds_sharp_aspect_error() {
+        use DosScaling::*;
+        assert_eq!(dos_output_size(1920, 1080, 320, 200, OriginalAspect), (1440, 1080));
+        assert_eq!(dos_output_size(1920, 1080, 320, 200, FillScreen), (1920, 1080));
+        assert_eq!(dos_output_size(1920, 1080, 320, 200, SharpPixels), (1280, 1000));
+        assert_eq!(dos_output_size(1280, 800, 320, 200, SharpPixels), (960, 800));
+        assert_eq!(dos_output_size(1920, 1200, 320, 200, SharpPixels), (1600, 1200));
+        assert_eq!(dos_output_size(3840, 2160, 320, 200, SharpPixels), (1600, 1200));
+        assert_eq!(dos_output_size(3840, 2400, 320, 200, SharpPixels), (3200, 2400));
+        // Text modes may have no close integer aspect on a small panel.
+        assert_eq!(dos_output_size(1920, 1080, 720, 400, SharpPixels), (1440, 1080));
+        assert_eq!(dos_output_size(320, 200, 640, 480, SharpPixels), (266, 200));
+        assert_eq!(sharp_output_size(800, 600, 0, 200), None);
+        for mode in [OriginalAspect, FillScreen, SharpPixels, SquarePixels] {
+            assert_eq!(dos_output_size(1280, 720, 1280, 720, mode), (1280, 720));
+        }
+    }
+
+    #[test]
+    fn square_pixels_use_the_largest_equal_integer_scale_without_aspect_correction() {
+        use DosScaling::SquarePixels;
+        for (panel_w, panel_h, sw, sh, expected) in [
+            (1920, 1080, 320, 200, (1600, 1000)),
+            (1280, 800, 320, 200, (1280, 800)),
+            (3840, 2160, 320, 200, (3200, 2000)),
+            (1920, 1080, 720, 400, (1440, 800)),
+            (800, 600, 640, 480, (640, 480)),
+            (320, 200, 640, 480, (266, 200)),
+            (200, 320, 640, 480, (200, 150)),
+        ] {
+            assert_eq!(dos_output_size(panel_w, panel_h, sw, sh, SquarePixels), expected);
+            if sw <= panel_w && sh <= panel_h {
+                assert_eq!(expected.0 % sw, 0);
+                assert_eq!(expected.1 % sh, 0);
+                assert_eq!(expected.0 / sw, expected.1 / sh);
+            }
+        }
+    }
+
+    #[test]
+    fn sharp_scaling_matches_exhaustive_integer_pairs() {
+        for (sw, sh) in [(320usize, 200usize), (720, 400), (640, 480), (640, 350), (360, 240)] {
+            for max_x in 1..=12 {
+                for max_y in 1..=12 {
+                    let mut expected: Option<(usize, usize)> = None;
+                    for sx in 1..=max_x {
+                        for sy in 1..=max_y {
+                            let (w, h) = (sw * sx, sh * sy);
+                            let error = (3 * w).abs_diff(4 * h);
+                            if error * 10 > 4 * h { continue; }
+                            if expected.is_none_or(|(bw, bh)| {
+                                let previous = (3 * bw).abs_diff(4 * bh);
+                                error * bh < previous * h
+                                    || (error * bh == previous * h && w * h > bw * bh)
+                            }) {
+                                expected = Some((w, h));
+                            }
+                        }
+                    }
+                    assert_eq!(sharp_output_size(sw * max_x, sh * max_y, sw, sh), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switching_scaling_clears_borders_and_keeps_uniform_pixel_blocks() {
+        let format = PixelFormat::RGB332;
+        let (width, height, pitch) = (19, 12, 23);
+        let mut output = alloc::vec![0xEE; pitch * height + 2];
+        let framebuffer = Framebuffer {
+            va: output.as_mut_ptr() as usize + 1, pitch, width, height,
+            slow: false, wide: false,
+        };
+        let source: alloc::vec::Vec<u8> = (1..=16).collect();
+        let mut row = alloc::vec::Vec::new();
+        for mode in [DosScaling::FillScreen, DosScaling::SharpPixels,
+            DosScaling::SquarePixels, DosScaling::OriginalAspect] {
+            let size = dos_output_size(width, height, 4, 4, mode);
+            clear_packed_bars(&framebuffer, format, size);
+            assert_eq!(blit_packed(&framebuffer, format, size,
+                PackedSource { width: 4, height: 4, pixels: &source, row: &mut row }), size.0 * size.1);
+            let (bx, by) = ((width - size.0) / 2, (height - size.1) / 2);
+            for y in 0..height {
+                for x in 0..width {
+                    let expected = if x >= bx && x < bx + size.0 && y >= by && y < by + size.1 {
+                        source[((y - by) * 4 / size.1) * 4 + (x - bx) * 4 / size.0]
+                    } else { 0 };
+                    assert_eq!(output[1 + y * pitch + x], expected);
+                }
+                assert!(output[1 + y * pitch + width..1 + (y + 1) * pitch].iter().all(|&v| v == 0xEE));
+            }
+        }
+        assert_eq!(output[0], 0xEE);
+        assert_eq!(*output.last().unwrap(), 0xEE);
+    }
 
     #[test]
     fn desktop_canvas_uses_mode_dimensions_not_window_extents() {

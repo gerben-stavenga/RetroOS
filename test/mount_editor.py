@@ -62,12 +62,13 @@ def testcase(shared):
 
                         call('qmp_capabilities')
                         time.sleep(2)
-                        # OSD starts on Sound; CD's speed row uses Left/Right,
+                        # OSD starts on Sound; Tab passes Display to Disk.
+                        # CD's speed row uses Left/Right,
                         # so move down before cycling past CD to HD and Mnt.
-                        keys = ['f12', 'tab', 'right', 'right', 'down', 'right', 'right',
+                        keys = ['f12', 'tab', 'tab', 'right', 'right', 'down', 'right', 'right',
                                 'down', 'right', 'down', 'right', 'down', 'down', 'ret']
                         if shared:
-                            keys = ['f12', 'tab', 'right', 'right', 'down', 'right', 'right',
+                            keys = ['f12', 'tab', 'tab', 'right', 'right', 'down', 'right', 'right',
                                     'down', 'down', 'down', 'down', 'ret']
                         for key in keys:
                             call('send-key', keys=[{'type': 'qcode', 'data': key}], **{'hold-time': 50})

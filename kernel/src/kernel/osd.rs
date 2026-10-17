@@ -12,6 +12,7 @@
 //! dump, and Disk lists the CD images shipped in `C:\CD`. Kill uses the ordinary exit path (a pending flag the event loop turns into
 //! `Exit` for the focused thread, exactly as the SEGV path does). The Sound tab
 //! controls the kernel mix gain and, in native SB16 mode, the card's source mixer.
+//! Display selects the fullscreen DOS framebuffer scaling policy.
 //!
 //! State is a handful of single-threaded atomics. Input handling ([`key`]) lives here but is
 //! called from [`console`](crate::kernel::console), which has the `machine`/
@@ -29,9 +30,17 @@ use crate::kernel::thread;
 
 const TAB_WINDOWS: usize = 0;
 const TAB_SOUND: usize = 1;
-const TAB_DISK: usize = 2;
-const TAB_DEBUG: usize = 3;
-const NUM_TABS: usize = 4;
+const TAB_DISPLAY: usize = 2;
+const TAB_DISK: usize = 3;
+const TAB_DEBUG: usize = 4;
+const NUM_TABS: usize = 5;
+const TAB_ROWS: usize = 2;
+const DISPLAY_MODES: [crate::kernel::display::DosScaling; 4] = [
+    crate::kernel::display::DosScaling::OriginalAspect,
+    crate::kernel::display::DosScaling::FillScreen,
+    crate::kernel::display::DosScaling::SharpPixels,
+    crate::kernel::display::DosScaling::SquarePixels,
+];
 
 const WINDOWS_ITEM_SELECT: usize = 0;
 const WINDOWS_ITEM_PRESENTATION: usize = 1;
@@ -119,6 +128,7 @@ static REPAINT: AtomicBool = AtomicBool::new(false);
 static ACTIVE_TAB: AtomicUsize = AtomicUsize::new(TAB_SOUND);
 static WINDOWS_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_SEL: AtomicUsize = AtomicUsize::new(0);
+static DISPLAY_SEL: AtomicUsize = AtomicUsize::new(0);
 static SOUND_MODE_REQ: AtomicUsize = AtomicUsize::new(0);
 /// Native SB keeps DSP/OPL direct; this separately selects software MPU on HDA.
 static MIDI_HDA: AtomicBool = AtomicBool::new(false);
@@ -169,6 +179,7 @@ pub fn open(borrowed_fullscreen: bool) {
     ACTIVE_TAB.store(TAB_SOUND, Ordering::Relaxed);
     WINDOWS_SEL.store(0, Ordering::Relaxed);
     SOUND_SEL.store(0, Ordering::Relaxed);
+    DISPLAY_SEL.store(crate::kernel::display::dos_scaling() as usize, Ordering::Relaxed);
     DISK_SEL.store(0, Ordering::Relaxed);
     DISK_SCROLL.store(0, Ordering::Relaxed);
     DEBUG_SEL.store(0, Ordering::Relaxed);
@@ -293,6 +304,7 @@ fn set_active_tab(tab: usize) {
 fn active_sel(tab: usize) -> usize {
     match tab {
         TAB_SOUND => SOUND_SEL.load(Ordering::Relaxed),
+        TAB_DISPLAY => DISPLAY_SEL.load(Ordering::Relaxed),
         TAB_DISK => DISK_SEL.load(Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.load(Ordering::Relaxed),
         _ => WINDOWS_SEL.load(Ordering::Relaxed),
@@ -302,6 +314,7 @@ fn active_sel(tab: usize) -> usize {
 fn set_active_sel(tab: usize, sel: usize, sound: SoundView) {
     match tab {
         TAB_SOUND => SOUND_SEL.store(sel.min(sound_item_count(sound) - 1), Ordering::Relaxed),
+        TAB_DISPLAY => DISPLAY_SEL.store(sel.min(DISPLAY_MODES.len() - 1), Ordering::Relaxed),
         TAB_DISK => DISK_SEL.store(sel.min(disk_item_count() - 1), Ordering::Relaxed),
         TAB_DEBUG => DEBUG_SEL.store(sel.min(debug_item_count() - 1), Ordering::Relaxed),
         _ => WINDOWS_SEL.store(sel.min(WINDOWS_NUM_ITEMS - 1), Ordering::Relaxed),
@@ -311,6 +324,7 @@ fn set_active_sel(tab: usize, sel: usize, sound: SoundView) {
 fn active_item_count(tab: usize, sound: SoundView) -> usize {
     match tab {
         TAB_SOUND => sound_item_count(sound),
+        TAB_DISPLAY => DISPLAY_MODES.len(),
         TAB_DISK => disk_item_count(),
         TAB_DEBUG => debug_item_count(),
         _ => WINDOWS_NUM_ITEMS,
@@ -466,7 +480,7 @@ const DISK_DEVICES: usize = 5;
 /// Rows of the Disk scroller visible at once — derived from the panel's
 /// character budget (see `MAX_ROWS`): everything but title, tab bar,
 /// device sub-tabs, and footer.
-const DISK_VISIBLE: usize = MAX_ROWS - 4;
+const DISK_VISIBLE: usize = MAX_ROWS - TAB_ROWS - 3;
 
 fn disk_device() -> usize {
     DISK_DEV.load(Ordering::Relaxed)
@@ -605,6 +619,7 @@ fn disk_follow_scroll() {
 fn active_tab_name(tab: usize) -> &'static [u8] {
     match tab {
         TAB_SOUND => b"Sound",
+        TAB_DISPLAY => b"Display",
         TAB_DISK => b"Disk",
         TAB_DEBUG => b"Debug",
         _ => b"Windows",
@@ -901,6 +916,13 @@ fn move_sel(up: bool, sound: SoundView) {
 /// ◄/► adjust the selected continuous setting — and on the Disk tab,
 /// cycle the device sub-tab (A: / B: / CD).
 fn adjust(up: bool, sound: SoundView) {
+    if active_tab() == TAB_DISPLAY {
+        let current = crate::kernel::display::dos_scaling() as usize;
+        let next = (current + if up { 1 } else { DISPLAY_MODES.len() - 1 }) % DISPLAY_MODES.len();
+        DISPLAY_SEL.store(next, Ordering::Relaxed);
+        crate::kernel::display::set_dos_scaling(DISPLAY_MODES[next]);
+        return;
+    }
     if active_tab() == TAB_DISK {
         if disk_device() == 4 && active_sel(TAB_DISK) != 0 {
             crate::kernel::mount_editor::editor_adjust(active_sel(TAB_DISK), up);
@@ -976,6 +998,9 @@ fn activate<A: crate::Arch>(
     sound: SoundView,
 ) {
     match active_tab() {
+        TAB_DISPLAY => {
+            crate::kernel::display::set_dos_scaling(DISPLAY_MODES[active_sel(TAB_DISPLAY)]);
+        }
         TAB_SOUND => match sound_row_for(sound, active_sel(TAB_SOUND)) {
             Some(SoundRow::MidiRoute) => {
                 MIDI_ROUTE_REQ.store(true, Ordering::Relaxed);
@@ -1183,7 +1208,7 @@ fn panel_rows(sound: SoundView) -> usize {
         let tab = active_tab();
         let count = active_item_count(tab, sound);
         let visible = if tab == TAB_DISK { count.min(DISK_VISIBLE) } else { count };
-        visible + usize::from(tab == TAB_DISK) + 3
+        visible + usize::from(tab == TAB_DISK) + TAB_ROWS + 2
     }
 }
 
@@ -1229,8 +1254,8 @@ pub fn paint(
         (count, 0)
     };
     let subtab_rows = usize::from(tab == TAB_DISK);
-    // Title + tab bar + (device sub-tabs) + items + footer.
-    let rows = visible + subtab_rows + 3;
+    // Title + two tab rows + (device sub-tabs) + items + footer.
+    let rows = visible + subtab_rows + TAB_ROWS + 2;
     let (cw, sy) = paint_scales(scale_y, canvas_width, canvas_height, rows);
     // Tight box: a two-glyph-pixel margin, just enough to keep strokes
     // off the panel edge (a glyph pixel is cw/8 wide, sy rows tall).
@@ -1264,7 +1289,7 @@ pub fn paint(
     ty += CELL_H * sy;
 
     paint_tabs(out, stride, w, h, logical_w, tx, ty, tab, cw, sy, fmt);
-    ty += CELL_H * sy;
+    ty += TAB_ROWS * CELL_H * sy;
 
     if tab == TAB_DISK {
         paint_disk_subtabs(out, stride, w, h, logical_w, tx, ty, cw, sy, fmt);
@@ -1357,23 +1382,29 @@ fn paint_tabs(
     fmt: PixelFormat,
 ) {
     let mut x = tx;
+    let mut y = ty;
     for &(tab, label) in &[
         (TAB_WINDOWS, b"Windows" as &[u8]),
         (TAB_SOUND, b"Sound" as &[u8]),
+        (TAB_DISPLAY, b"Display" as &[u8]),
         (TAB_DISK, b"Disk" as &[u8]),
         (TAB_DEBUG, b"Debug" as &[u8]),
     ] {
+        if tab == TAB_DISK {
+            x = tx;
+            y += CELL_H * sy;
+        }
         let selected = tab == active;
         let label_w = (label.len() + 1) * cw;
         if selected {
             vga::overlay_fill_xscaled(
-                out, stride, w, h, logical_w, x, ty,
+                out, stride, w, h, logical_w, x, y,
                 label_w, CELL_H * sy, SEL_BG, fmt,
             );
         }
         let (fg, bg) = if selected { (SEL_FG, SEL_BG) } else { (ITEM_FG, PANEL_BG) };
         paint_text(
-            out, stride, w, h, logical_w, x + cw / 2, ty,
+            out, stride, w, h, logical_w, x + cw / 2, y,
             cw, sy, label, fg, bg, fmt,
         );
         x += label_w + cw;
@@ -1470,9 +1501,21 @@ fn window_line(idx: usize, line: &mut Line) {
     }
 }
 
+fn display_mode_line(line: &mut Line, item: usize, selected: crate::kernel::display::DosScaling) {
+    let Some(&mode) = DISPLAY_MODES.get(item) else { return };
+    line.put(if mode == selected { b"(*) " } else { b"( ) " });
+    line.put(match mode {
+        crate::kernel::display::DosScaling::OriginalAspect => b"Fit (4:3)",
+        crate::kernel::display::DosScaling::FillScreen => b"Fill screen",
+        crate::kernel::display::DosScaling::SharpPixels => b"Integer (near 4:3)",
+        crate::kernel::display::DosScaling::SquarePixels => b"Integer (square pixels)",
+    });
+}
+
 /// Compose one tab row's text into `line`.
 fn item_line(tab: usize, item: usize, line: &mut Line, sound: SoundView) {
     match tab {
+        TAB_DISPLAY => display_mode_line(line, item, crate::kernel::display::dos_scaling()),
         TAB_SOUND => match sound_row_for(sound, item) {
             Some(SoundRow::Status) => sound_status_line(line, sound),
             Some(SoundRow::SwitchToKernel) => line.put(b"Switch to kernel mixing"),
@@ -1783,6 +1826,39 @@ impl Line {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_choices_show_active_mode_and_fit_panel() {
+        for selected in DISPLAY_MODES {
+            for item in 0..DISPLAY_MODES.len() {
+                let mut line = Line::new();
+                display_mode_line(&mut line, item, selected);
+                assert!(line.as_bytes().len() <= COLS);
+                assert_eq!(&line.as_bytes()[..4],
+                    if DISPLAY_MODES[item] == selected { b"(*) " } else { b"( ) " });
+            }
+        }
+        assert_eq!(active_tab_name(TAB_DISPLAY), b"Display");
+        assert_eq!(active_item_count(TAB_DISPLAY, SoundView::KernelSilent), 4);
+    }
+
+    #[test]
+    fn all_five_tabs_fit_two_rows_in_the_smallest_mode() {
+        let width = COLS * CELL_W + 16;
+        let height = TAB_ROWS * CELL_H;
+        let mut output = alloc::vec![0; width * height * 4];
+        paint_tabs(&mut output, width * 4, width, height, width,
+            0, 0, TAB_DISPLAY, CELL_W, 1, PixelFormat::NATIVE);
+        for y in 0..height {
+            assert!(output[(y * width + COLS * CELL_W) * 4..(y + 1) * width * 4]
+                .iter().all(|&v| v == 0), "tabs overflow the panel");
+        }
+        for row in 0..TAB_ROWS {
+            assert!(output[row * CELL_H * width * 4..(row + 1) * CELL_H * width * 4]
+                .iter().any(|&v| v != 0));
+        }
+        assert!(DISK_VISIBLE + TAB_ROWS + 3 <= MAX_ROWS);
+    }
 
     #[test]
     fn sound_items_reflect_audio_ownership() {

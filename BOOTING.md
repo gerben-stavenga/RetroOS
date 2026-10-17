@@ -62,6 +62,28 @@ the local clock; Windows system time and Unix file timestamps use UTC.
 The offset is fixed: update it yourself when daylight saving time changes.
 Settings take effect after reboot and do not alter the hardware clock.
 
+## DOS display scaling
+
+Press **F12**, then **Tab** to **Display**. Select an option with Up/Down
+and Enter, or cycle the setting with Left/Right:
+
+- **Fit (4:3)** is the default: fit the largest centered 4:3
+  image, with black borders and nearest-neighbor scaling.
+- **Fill screen** fills the framebuffer, allowing aspect distortion.
+- **Integer (near 4:3)** repeats every source pixel a whole number of
+  times horizontally and vertically. It prefers the closest 4:3 aspect,
+  then the largest picture with that aspect. For 320x200, exact 4:3 first
+  fits at 1600x1200. If no integer pair fits within 10% of 4:3, it falls
+  back to Fit (4:3) rather than severely distorting the image.
+- **Integer (square pixels)** uses the largest equal whole-number scale on
+  both axes, without correcting to 4:3. For example, 320x200 becomes
+  1600x1000 on a 1920x1080 framebuffer. If the source is too large to fit
+  at 1x, it shrinks while preserving the source's width-to-height ratio.
+
+The selection applies when DOS resumes fullscreen framebuffer output after
+closing the OSD. It lasts for the current boot. Native hardware VGA and the
+desktop are unaffected; this setting does not change the framebuffer resolution.
+
 ## USB and optical boot
 
 The boot partition contains `/boot/grub/grub.cfg`, editable
