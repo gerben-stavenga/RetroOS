@@ -5,8 +5,8 @@ launch() {
     [ "$ARCH" != x64 ] || fail "Rust-DOS does not emulate an x64 CPU"
     [ "$SOUND" = sb ] || [ "$SOUND" = none ] || fail "Rust-DOS supports sb or none"
     [ "$HEADLESS$KVM" = 00 ] || fail "Rust-DOS does not support --headless or --kvm"
-    [ -z "$COMMAND$HOST_DIR$WAV$SHOT$SB_AUDIO" ] && [ "$TRACE" = 0 ] ||
-        fail "--cmd, --host, --wav, --screenshot, --trace and --sb-audio are unavailable with Rust-DOS"
+    [ -z "$COMMAND$WAV$SHOT$SB_AUDIO" ] && [ "$TRACE" = 0 ] ||
+        fail "--cmd, --wav, --screenshot, --trace and --sb-audio are unavailable with Rust-DOS"
 
     local binary="${RUST_DOS_BIN:-${RUST_DOS_PREFIX:-$HOME/.local}/bin/rust-dos}"
     [ -x "$binary" ] || fail "Rust-DOS binary missing: $binary (install it with bash tools/install_rust_dos.sh)"

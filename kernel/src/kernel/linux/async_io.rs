@@ -160,6 +160,7 @@ fn ready<A: crate::Arch>(kt: &thread::KernelThread<A>, s: &State, fd: i32) -> u3
         }
         FdKind::ConsoleOut | FdKind::PipeWrite(_) => 4,
         FdKind::Vfs(_) | FdKind::Dir { .. } => 5,
+        FdKind::Socket(handle) => super::socket::readiness(handle, 0x1D) as u32,
         _ => 0,
     }
 }
@@ -515,6 +516,9 @@ pub(super) fn call<A: crate::Arch>(
             _ => -EINVAL,
         },
         72 if fd >= 0 && (fd as usize) < thread::MAX_FDS && a.a1 == 4 => {
+            if let FdKind::Socket(handle) = kt.fds[fd as usize] {
+                crate::kernel::net::set_nonblocking(handle, a.a2 & 0x800 != 0);
+            }
             if a.a2 & 0x800 != 0 {
                 s.nonblock |= 1u64 << fd;
             } else {

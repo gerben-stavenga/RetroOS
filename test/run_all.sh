@@ -44,6 +44,8 @@ qemu_hostfs_grub() { qemu_hostfs && have grub-mkrescue && have debugfs && have m
 rat_ext4() { kvm && bazel_tool && have qemu-system-x86_64 && have grub-mkrescue && have debugfs && have mkfs.ext4; }
 qemu_serial() { bazel_tool && have qemu-system-i386 && have timeout; }
 qemu_audio() { bazel_tool && have qemu-system-x86_64 && have grub-mkstandalone && have mformat && have mmd && have mcopy && have timeout && have python3 && [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ] && [ -f /usr/lib/grub/x86_64-efi/modinfo.sh ]; }
+random_tools() { qemu_audio && have gcc && have mkfs.fat; }
+smb_tools() { qemu_audio && have gcc && have nasm && have mkfs.fat && have "${SMB_TEST_SMBD:-smbd}" && have "${SMB_TEST_PDBEDIT:-pdbedit}"; }
 # /dev/kvm opening is NOT the same as "qemu can boot THIS guest with -accel
 # kvm". Under a GitHub runner's nested virtualization qemu accepts -accel kvm
 # and then resets the guest before the BIOS emits a byte; -no-reboot renders
@@ -122,7 +124,7 @@ unit() {
     bz test --platforms=@platforms//host \
         //arch-abi:arch_abi_test //arch-metal:xhci_dma_test //arch-metal:phys_mm_test //kernel:kernel_unit_test \
         //lib:sound_test //lib:vga_test //lib:heap_test //lib:compact_fmt_test //lib:term_test \
-        //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test \
+        //ext4:ext4_test //ext4:modern_image_test //third_party/voodoo:voodoo_test //third_party/smb2-core:protocol_test \
         //arch-interp:arch-interp-test //arch-interp:mmu-test
 }
 unit_kvm() { bz test --platforms=@platforms//host --test_env=RETRO_REQUIRE_KVM=1 //arch-interp:arch-interp-kvm-test; }
@@ -141,7 +143,7 @@ run() {
     case "$name" in
         physical_memory|xhci_smoke|grub_*|boot_composition|disk_selection|extra_drives|isapnp_smoke|machine_*|dn_state|module_*) group=boot ;;
         os2_*|windows_*|linux_*|rat_commander_*|locales_*|keyboards_*) group=personalities ;;
-        ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
+        random_interrupts|smb|virtio_net|ata_lba48|shared_disks|hostfs_*|audio_*|qemu_*|bochs_smoke|sb_86box) group=devices ;;
     esac
     if [ -n "${RETRO_TEST_GROUP:-}" ] && [ "$RETRO_TEST_GROUP" != "$group" ]; then
         return
@@ -232,6 +234,9 @@ run qemu_hostfs_lifecycle_com1 qemu_hostfs bash test/qemu_hostfs_lifecycle.sh co
 run qemu_root_policy qemu_hostfs_grub bash test/qemu_root_failure.sh
 run qemu_serial_logging qemu_serial bash test/qemu_serial_logging.sh
 run audio_matrix qemu_audio bash test/audio_matrix.sh
+run virtio_net qemu_audio python3 test/virtio_net.py
+run smb smb_tools python3 test/smb.py
+run random_interrupts random_tools python3 test/random_interrupts.py
 run audio_matrix_kvm qemu_audio_kvm bash test/audio_matrix.sh --kvm
 # Only under KVM: this one measures sustained real-time PCM, and a host that
 # cannot run the guest at real time loses PIT ticks, which crawls the music and

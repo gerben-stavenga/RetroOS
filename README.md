@@ -343,9 +343,12 @@ render as `?`; CJK, emoji and text shaping are not included. The existing
 regeneration instructions are in [lib/fonts/uni-vga](lib/fonts/uni-vga/README.md).
 
 `--freedos` boots FreeDOS directly from the same data disk on a BIOS emulator.
-`--host DIR` uses the live host tree with the hosted backend, or exports it as
-HostFS under QEMU. `--cmd` is supported on QEMU and hosted; the launcher does
-not inject temporary commands or serial settings into the persistent disk.
+Host-directory sharing uses authenticated SMB mounts configured in
+`RETROOS/RETROOS.INI`; see [SMB network mounts](BOOTING.md#smb-network-mounts).
+The deprecated `--host DIR` launcher shortcut and automatic serial HostFS
+setup have been removed. Both QEMU and hosted launches use the disk images.
+`--cmd` is supported on QEMU and hosted; the launcher does not inject
+temporary commands or serial settings into the persistent disk.
 The old `-i` image modes, installer flow, and `--gpt` assembly are removed.
 
 `run.sh` owns the build/data lifecycle; `tools/run/` contains only backend
@@ -445,8 +448,8 @@ RetroOS/
 ```
 
 RETROOS.INI selects which filesystems are exposed and their DOS drive letters.
-Unlisted physical partitions stay unmounted. **H:** is reserved for HostFS;
-**A:** and **B:** are floppy drives. Use F12 **Disk → HD** to see active mappings
+Unlisted physical partitions stay unmounted. An SMB mount can expose **H:**
+with `drive=H` and `path=/host`; **A:** and **B:** are floppy drives. Use F12 **Disk → HD** to see active mappings
 or **Disk → Mnt** to stage and export a mount profile.
 
 Disk installer preparation asks whether to copy the showcase only when the C:

@@ -214,8 +214,11 @@ pub trait Arch: Sized + GuestBytes {
     /// Millisecond compatibility view for devices not yet converted to the
     /// high-resolution timeline.
     fn get_ticks(&self) -> u64 { self.now() / 1_000_000 }
-    /// Drain queued hardware-IRQ events, calling `f` for each.
-    fn drain(&mut self, f: &mut dyn FnMut(Irq));
+    /// Drain hardware events with their arrival timestamps in nanoseconds.
+    /// Capture time at interrupt entry (host input: at posting), before queueing.
+    /// This sampling clock need not share the guest/scheduler clock's epoch;
+    /// it must advance independently of guest instruction execution.
+    fn drain(&mut self, f: &mut dyn FnMut(Irq, u64));
     /// Read the CPU timestamp counter.
     fn rdtsc(&self) -> u64;
 

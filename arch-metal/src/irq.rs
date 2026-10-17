@@ -32,8 +32,9 @@ pub const MSI_VECTOR_BASE: u8 = 0xF8;
 pub const MSI_SOURCE_COUNT: u8 = 8;
 
 /// Global IRQ event queue for discrete events (keyboard and device IRQs).
-/// Timer wakeups carry no event: the interrupt itself returns to the loop.
-static mut QUEUE: Pipe<Irq, 256> = Pipe::new(Irq::Hw(0));
+/// Timer wakeups are coalesced; all entries retain their arrival timestamp.
+/// Hashing and entropy estimation happen later in the kernel event loop.
+static mut QUEUE: Pipe<(Irq, u64), 256> = Pipe::new((Irq::Hw(0), 0));
 /// Coalesce periodic wakeups: IRQ0 says only that the kernel should resample
 /// its clock, never how many milliseconds elapsed.
 static mut IRQ0_QUEUED: bool = false;
@@ -92,14 +93,14 @@ static mut MOUSE_PACKET: [u8; 3] = [0; 3];
 static mut MOUSE_PACKET_IDX: u8 = 0;
 
 /// Drain all queued IRQ events, calling f for each.
-pub fn drain(mut f: impl FnMut(Irq)) {
+pub fn drain(mut f: impl FnMut(Irq, u64)) {
     // The ring-0 interrupt top half writes QUEUE while the ring-1 kernel drains
     // it. Move into a local under a short interrupt mask, then restore IF before
     // invoking arbitrary kernel callbacks. Keep the scratch uninitialized:
     // this path runs after every guest exit, while the queue is almost always
     // empty. Initializing 256 fake entries per exit made a polling guest
     // write gigabytes of dead stack traffic per second.
-    let mut events = [core::mem::MaybeUninit::<Irq>::uninit(); 256];
+    let mut events = [core::mem::MaybeUninit::<(Irq, u64)>::uninit(); 256];
     let restore_if = crate::x86::interrupts_enabled();
     crate::x86::cli();
     let q = &raw mut QUEUE;
@@ -120,7 +121,8 @@ pub fn drain(mut f: impl FnMut(Irq)) {
     }
     for event in &events[..n] {
         // Every element below `n` was initialized by the pop loop above.
-        f(unsafe { event.assume_init_read() });
+        let (irq, timestamp_ns) = unsafe { event.assume_init_read() };
+        f(irq, timestamp_ns);
     }
     // Observe a missing hardware tick independently of the kernel's clock
     // gate. This reports the PIC/IF state; it does not synthesize a wakeup.
@@ -177,21 +179,22 @@ fn diagnose_irq0_gap() {
 }
 
 /// Queue one coalesced clock-resample request from IRQ0.
-unsafe fn queue_irq0_wakeup() {
+unsafe fn queue_irq0_wakeup(timestamp_ns: u64) {
     if !unsafe { core::ptr::read_volatile(&raw const IRQ0_QUEUED) } {
         unsafe {
-            (&raw mut QUEUE).as_mut().unwrap().push(Irq::Hw(0));
+            (&raw mut QUEUE).as_mut().unwrap().push((Irq::Hw(0), timestamp_ns));
             core::ptr::write_volatile(&raw mut IRQ0_QUEUED, true);
         }
     }
 }
 
 /// Push a keyboard scancode into the queue from a non-IRQ source — the xHCI
-/// USB-HID keyboard `poll()`. Same sink the i8042 IRQ1 handler feeds, so the
-/// kernel sees one uniform key-event stream regardless of the source.
+/// USB-HID keyboard `poll()`. Polled reports carry observation time: the
+/// controller cannot recover when the USB report originally arrived. This is
+/// the same sink as i8042 IRQ1, so the kernel sees one uniform key stream.
 pub fn push_key(sc: u8) {
     let q = &raw mut QUEUE;
-    unsafe { (*q).push(Irq::Key(sc)); }
+    unsafe { (*q).push((Irq::Key(sc), now(false))); }
 }
 
 /// Push one already-decoded pointing-device report. USB HID and i8042 use the
@@ -199,7 +202,7 @@ pub fn push_key(sc: u8) {
 /// not depend on which physical bus supplied the mouse.
 pub fn push_mouse(dx: i16, dy: i16, buttons: u8) {
     let q = &raw mut QUEUE;
-    unsafe { (*q).push(Irq::Mouse { dx, dy, buttons }); }
+    unsafe { (*q).push((Irq::Mouse { dx, dy, buttons }, now(false))); }
 }
 
 // ============================================================================
@@ -444,7 +447,10 @@ fn invariant_tsc() -> bool {
 /// it against HPET just like an invariant hardware TSC, even when the virtual
 /// CPU model neglects to advertise CPUID.80000007H:EDX.invariant_tsc.
 fn stable_tsc() -> bool {
-    invariant_tsc() || crate::x86::cpuid(1).2 & (1 << 31) != 0
+    let (_, _, ecx, edx) = crate::x86::cpuid(1);
+    // Hypervisor presence says nothing about instruction availability. Old
+    // CPUs (and deliberately restricted VM models) must use HPET/PIT instead.
+    edx & (1 << 4) != 0 && (invariant_tsc() || ecx & (1 << 31) != 0)
 }
 
 fn calibrate_tsc(hpet: Option<(u64, u64)>) -> Option<u64> {
@@ -1054,12 +1060,13 @@ pub fn timer_delivery_selftest(screen: &mut lib::term::Term) {
 
 /// Handle an IRQ: PIC ACK, read hardware data, push typed event to queue.
 pub fn handle_irq(regs: &mut Regs) {
+    let timestamp_ns = now(false);
     let vector = regs.int_num as u8;
     if vector >= MSI_VECTOR_BASE {
         let source = vector - MSI_VECTOR_BASE;
         unsafe {
             let q = &raw mut QUEUE;
-            (*q).push(Irq::Msi(source));
+            (*q).push((Irq::Msi(source), timestamp_ns));
         }
         // MSI is LAPIC-delivered and edge-triggered.
         lapic_write(LAPIC_EOI, 0);
@@ -1086,22 +1093,18 @@ pub fn handle_irq(regs: &mut Regs) {
         }
         match irq {
             0 => {
-                // The interrupt is a wakeup, not a unit of time. Extend the
-                // fallback clock while we are guaranteed to run at 1 kHz.
-                if matches!(unsafe { CLOCK.source }, ClockSource::Pit2) {
-                    let _ = now(false);
-                }
-                unsafe { queue_irq0_wakeup(); }
+                // Entry sampling already extended the fallback PIT clock.
+                unsafe { queue_irq0_wakeup(timestamp_ns); }
                 // Poll the USB-HID keyboard (if any) into the same key queue.
                 crate::xhci::poll();
             }
-            1 => unsafe { let q = &raw mut QUEUE; (*q).push(Irq::Key(inb(0x60))); },
+            1 => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Key(inb(0x60)), timestamp_ns)); },
             12 => {
                 if let Some(e) = mouse_packet_byte(inb(0x60)) {
-                    unsafe { let q = &raw mut QUEUE; (*q).push(e); }
+                    unsafe { let q = &raw mut QUEUE; (*q).push((e, timestamp_ns)); }
                 }
             }
-            _ => unsafe { let q = &raw mut QUEUE; (*q).push(Irq::Hw(irq)); },
+            _ => unsafe { let q = &raw mut QUEUE; (*q).push((Irq::Hw(irq), timestamp_ns)); },
         }
         lapic_write(LAPIC_EOI, 0);
         return;
@@ -1133,10 +1136,8 @@ pub fn handle_irq(regs: &mut Regs) {
     // path re-arms the line.
     let event = match irq {
         0 => {
-            if matches!(unsafe { CLOCK.source }, ClockSource::Pit2) {
-                let _ = now(false);
-            }
-            unsafe { queue_irq0_wakeup(); }
+            // Entry sampling already extended the fallback PIT clock.
+            unsafe { queue_irq0_wakeup(timestamp_ns); }
             // USB HID reports need polling on PIC-only machines too. The
             // APIC timer path does this above; without it the devices can
             // enumerate but never deliver keys or mouse movement.
@@ -1150,7 +1151,7 @@ pub fn handle_irq(regs: &mut Regs) {
 
     if let Some(e) = event {
         let q = &raw mut QUEUE;
-        unsafe { (*q).push(e); }
+        unsafe { (*q).push((e, timestamp_ns)); }
     }
 
     // Re-unmask only lines whose device was acked inline above. Generic
@@ -1231,9 +1232,9 @@ pub fn route_isa_irq(line: u8) {
     }
 }
 
-/// High-resolution monotonic time in nanoseconds. TSC and HPET have no IRQ-side
-/// writer; only PIT2 shares extension state with IRQ0 and needs the single-CPU
-/// interrupt-masked critical section.
+/// High-resolution monotonic time in nanoseconds, also sampled at IRQ entry.
+/// TSC/64-bit HPET are read-only; PIT2 and 32-bit HPET extension state needs
+/// an interrupt-masked critical section on this single-CPU backend.
 pub fn now(init: bool) -> u64 {
     static mut PIT2_LAST_COUNT: u16 = 0;
     static mut PIT2_CYCLES: u64 = 0;
@@ -1265,12 +1266,20 @@ pub fn now(init: bool) -> u64 {
         ClockSource::Tsc => crate::x86::rdtsc().wrapping_sub(clock.epoch),
         ClockSource::Hpet if clock.hpet_mask == u64::MAX =>
             hpet_counter(clock.hpet_mask).wrapping_sub(clock.epoch),
-        ClockSource::Hpet => unsafe {
-            let count = hpet_counter(clock.hpet_mask);
-            let elapsed = count.wrapping_sub(HPET_LAST_COUNTER) & clock.hpet_mask;
-            HPET_LAST_COUNTER = count;
-            HPET_CYCLES = HPET_CYCLES.wrapping_add(elapsed);
-            HPET_CYCLES
+        ClockSource::Hpet => {
+            // Interrupt entry now reads this clock too. Protect the shared
+            // 32-bit HPET extension just like the PIT extension below.
+            let restore_if = crate::x86::interrupts_enabled();
+            crate::x86::cli();
+            let total = unsafe {
+                let count = hpet_counter(clock.hpet_mask);
+                let elapsed = count.wrapping_sub(HPET_LAST_COUNTER) & clock.hpet_mask;
+                HPET_LAST_COUNTER = count;
+                HPET_CYCLES = HPET_CYCLES.wrapping_add(elapsed);
+                HPET_CYCLES
+            };
+            if restore_if { crate::x86::sti(); }
+            total
         },
         ClockSource::Pit2 => {
             let restore_if = crate::x86::interrupts_enabled();

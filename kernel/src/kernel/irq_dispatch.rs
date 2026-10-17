@@ -13,7 +13,10 @@ impl PendingEvents {
     pub fn drain<A: crate::Arch>(&mut self, machine: &mut A) {
         self.events.clear();
         self.tick_wakeup = false;
-        machine.drain(&mut |event| self.push(event));
+        machine.drain(&mut |event, timestamp_ns| {
+            crate::kernel::random::interrupt_event(&event, timestamp_ns);
+            self.push(event);
+        });
     }
 
     fn push(&mut self, event: crate::Irq) {

@@ -34,7 +34,7 @@ jobs:
     - name: Clippy (metal crates)
       run: |
         bazel build --config=clippy \
-          //kernel:kernel //lib:lib //lib:sound \
+          //kernel:kernel //lib:lib //lib:sound //third_party/smb2-core \
           //arch-abi:arch-abi //arch-metal:arch-metal
     - name: Clippy (host crates)
       run: |

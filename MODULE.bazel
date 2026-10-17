@@ -189,6 +189,19 @@ crate.spec(
 )
 
 # Kernel (hosted).
+crate.spec(
+    package = "smoltcp",
+    version = "=0.12.0",
+    default_features = False,
+    features = ["alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4"],
+)
+crate.spec(package = "num_enum", version = "0.7", default_features = False)
+crate.spec(package = "log", version = "0.4", default_features = False)
+crate.spec(package = "digest", version = "0.11", default_features = False)
+crate.spec(package = "hmac", version = "0.13", default_features = False)
+crate.spec(package = "md4", version = "0.11", default_features = False)
+crate.spec(package = "md-5", version = "0.11", default_features = False)
+crate.spec(package = "sha2", version = "0.11", default_features = False)
 crate.spec(package = "rustc-demangle", version = "0.1.24")
 crate.spec(
     package = "spin",
@@ -246,3 +259,20 @@ crate.annotation(
     gen_build_script = "off",
 )
 use_repo(crate, "crates", "crates__bytemuck-1.25.2")
+crate.annotation(
+    crate = "heapless",
+    # Its build script only probes ARM atomics; our targets are x86.
+    gen_build_script = "off",
+    patch_args = ["-p1"],
+    patches = ["//toolchain:heapless-x86-atomics.patch"],
+)
+crate.annotation(
+    crate = "smoltcp",
+    # Use upstream's fixed default capacities, avoiding a Cargo target probe
+    # with stable rustc against the custom bare-metal target JSON.
+    gen_build_script = "off",
+    patch_args = ["-p1"],
+    patches = ["//toolchain:smoltcp-fixed-config.patch"],
+)
+# The freestanding kernel does not expose OS CPU-feature detection/SIMD state.
+crate.annotation(crate = "sha2", rustc_flags = ['--cfg=sha2_backend="soft"'])

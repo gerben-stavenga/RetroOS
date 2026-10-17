@@ -116,10 +116,12 @@ fn prepare_startup<A: crate::Arch>(
     screen.present(machine, &mut bios_workspace);
 
     configure_locale(&master_env);
+    crate::kernel::net::init(machine);
     crate::kernel::clock::configure(
         crate::kernel::dos::config_var(&master_env, b"RTC"),
         crate::kernel::dos::config_var(&master_env, b"UTC_OFFSET"),
     ).unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
+    crate::kernel::fs::smb::mount_configured();
     // DOS worlds are cloned from their substitute-BIOS template.
     let dos_template = crate::kernel::dos::DosTemplate::new(machine);
 
@@ -1540,6 +1542,7 @@ fn event_loop<A: crate::Arch>(
         stats.part(machine, PROFILE_IRQ);
         let execute_irq_exit = irq_clock_wakeup;
         let clock_wakeup = tick_wakeup || execute_irq_exit;
+        if clock_wakeup { crate::kernel::net::poll(); }
         let world_now_ns = if clock_wakeup {
             irq_clock_wakeup = false;
             machine.now()

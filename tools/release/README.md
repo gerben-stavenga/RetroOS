@@ -17,6 +17,11 @@ it a drive letter). The menu is
 `/boot/grub/grub.cfg`; the matching kernel and RAM modules are under
 `/boot/retroos/releases/<version>/` on the same partition.
 `/boot/retroos/BOOT.INI` describes mounts and bundle backing;
+The QEMU launcher enables VirtIO user networking by default (`--net none`
+disables it). RetroOS obtains IPv4, gateway and DNS settings by DHCP. Linux
+programs can use TCP/UDP sockets; the host is normally `10.0.2.2`. DOS and
+Windows network APIs and other NIC drivers are not yet implemented.
+
 `/boot/retroos/RETROOS.INI` contains locale, keyboard, sound, launch and startup
 settings. Both are ordinary editable files loaded separately by GRUB. Unlisted physical partitions remain unmounted.
 The bundled DN and system files have writable RAM views.
@@ -255,6 +260,10 @@ When upgrading, extract the new release separately and copy only its `boot.img`
 over the old boot image while the VM is stopped. Keep your existing `data.img`.
 Never overwrite a persistent data disk with a fresh release seed. Data images use the repository's public content targets; the optional
 apps-proprietary collection is not bundled.
+
+Host-directory sharing uses authenticated `[smb]` mounts in
+`RETROOS/RETROOS.INI`. The deprecated `--host` shortcut is unavailable; the
+launcher does not start an SMB server or automatically assign H:.
 
 ## Physical machine: retroos-machine.tar.gz
 

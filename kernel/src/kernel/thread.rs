@@ -62,6 +62,7 @@ pub struct PendingPoll {
     pub fds_ptr: usize,    // user-space pointer to pollfd[]
     pub nfds: usize,
     pub timeout_ms: i32,   // -1 = infinite
+    pub deadline_ns: Option<u64>,
 }
 
 /// Thread state
@@ -695,9 +696,7 @@ impl<A: crate::Arch> KernelThread<A> {
                 FdKind::PipeWrite(idx) => {
                     crate::kernel::kpipe::add_writer(idx);
                 }
-                // TODO: refcount for fork/dup socket sharing — for now the child
-                // inherits the same backend handle; the first close frees it.
-                FdKind::Socket(_) => {}
+                FdKind::Socket(h) => crate::kernel::net::add_ref(h),
                 FdKind::Dir { handle, .. } => {
                     crate::kernel::vfs::add_dir_ref(handle);
                 }

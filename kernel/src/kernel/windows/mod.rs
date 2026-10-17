@@ -986,7 +986,11 @@ pub(super) fn guest_windows_path(path: &[u8]) -> Vec<u8> {
         (b'I', b"disk4"), (b'J', b"disk5"), (b'K', b"disk6"),
         (b'L', b"disk7"),
     ];
-    let Some(&(drive, prefix)) = drives.iter().find(|(_, prefix)| {
+    let configured = (b'E'..=b'L').filter_map(|drive| {
+        crate::kernel::dos::extra_drive_prefix(drive)
+            .map(|prefix| (drive, prefix.strip_suffix(b"/").unwrap_or(prefix)))
+    });
+    let Some((drive, prefix)) = configured.chain(drives.iter().copied()).find(|(_, prefix)| {
         path == *prefix || path.strip_prefix(*prefix).is_some_and(|rest| rest.starts_with(b"/"))
     }) else {
         let mut out = b"C:\\".to_vec();

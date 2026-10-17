@@ -25,3 +25,5 @@ pub mod ahci;
 pub mod uart16550;
 
 pub mod isa_lpc;
+pub mod virtio_net;
+pub mod rdrand;

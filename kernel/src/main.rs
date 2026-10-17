@@ -276,8 +276,8 @@ fn install_hosted_backend() {
 }
 
 /// Install the native socket backend (hosted "punch-through" → host std::net).
-/// Networking is always available on hosted; metal installs nothing here (its
-/// NIC + smoltcp path is a future follow-up). Must run on the CPU/kernel thread
+/// Networking is always available on hosted; bare metal installs its NIC/IP
+/// backend during startup. Must run on the CPU/kernel thread
 /// (the native socket table is thread-local), before `startup`.
 fn install_socket_backend_hosted() {
     arch::install_native_sockets();

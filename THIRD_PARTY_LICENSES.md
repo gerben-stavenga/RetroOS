@@ -42,7 +42,12 @@ GPL-carrying DOSBox glue (threading, SDL, `PIC_`/`RENDER_` calls) is present.
 
 | Component | Used for | License |
 |---|---|---|
+| `smb2-core` (adapted vdavid/smb2) | SMB packet codecs and NTLMv2 authentication | MIT OR Apache-2.0 |
+| `digest`, `hmac`, `md4`, `md-5`, `sha2`, `crypto-common`, `block-buffer`, `hybrid-array`, `typenum`, `cmov`, `ctutils`, `cpufeatures` | SMB authentication and signing | MIT OR Apache-2.0 |
+| `num_enum`, `num_enum_derive`, `log` | SMB protocol enums and logging | MIT OR Apache-2.0 |
 | `spin` | spinlocks (no_std) | MIT |
+| `smoltcp`, `managed` | bare-metal IPv4, DHCP, TCP, UDP and buffer ownership | 0BSD |
+| `heapless`, `hash32` | fixed-capacity network tables | MIT OR Apache-2.0 |
 | `bitflags` | bitflag types | MIT OR Apache-2.0 |
 | `crc`, `crc_catalog` | CRC (image/MD5 verify) | MIT OR Apache-2.0 |
 | `rustc-demangle` | symbol demangling (backtraces) | MIT OR Apache-2.0 |

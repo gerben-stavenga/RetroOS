@@ -62,6 +62,58 @@ the local clock; Windows system time and Unix file timestamps use UTC.
 The offset is fixed: update it yourself when daylight saving time changes.
 Settings take effect after reboot and do not alter the hardware clock.
 
+## QEMU networking
+
+The QEMU launchers enable **VirtIO user networking** by default. No TAP
+device or host bridge is needed. Use `--net none` to disable it:
+
+```sh
+./run.sh qemu --net virtio
+./run.sh qemu --net none
+```
+
+RetroOS discovers a VirtIO 1.0+ PCI Ethernet interface and obtains its IPv4
+address, default gateway and DNS servers by DHCP. QEMU normally assigns
+`10.0.2.15`, with the host reachable at `10.0.2.2`. DHCP supplies a volatile
+`/etc/resolv.conf` when the user has not supplied one. The initial lease gets
+up to three seconds during startup; discovery and renewal continue afterward.
+
+The socket table, TCP/UDP/IP stack, DHCP and Ethernet drivers are common
+RetroOS infrastructure. The typed socket API uses personality-independent
+endpoints, options, errors and readiness; each personality translates its own
+ABI and waiting rules. Linux is the first adapter; OS/2 sockets and Windows
+Winsock adapters are not implemented yet.
+
+Networking is available through the Linux personality's IPv4 TCP and UDP
+socket calls, including blocking/nonblocking I/O, poll, bind/listen/accept,
+and shared descriptors. For example, serve a file on the host with
+`python3 -m http.server 8000`, then download it with the bundled BusyBox:
+
+```sh
+./run.sh qemu --cmd '/bin/busybox wget -O /home/retroos/download.txt http://10.0.2.2:8000/example.txt'
+```
+
+For incoming connections, supply a QEMU port forward. Disable the default
+network first so the custom transport is the only one:
+
+```sh
+./run.sh qemu --net none -- \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:8080-:8080 \
+  -device virtio-net-pci,netdev=net0
+```
+
+Both default transitional and modern-only VirtIO devices are supported through
+their modern PCI interface. Legacy-only VirtIO, other NIC drivers, IPv6,
+static addressing, raw sockets, and DOS/OS2/Windows network APIs are not implemented.
+The first interface is used, with up to 64 live/closing sockets. Each listener
+holds one pending connection; UDP payloads are limited to 1472 bytes because
+IP fragmentation is disabled. Hardware queues are polled from the event loop.
+
+Run `python3 test/virtio_net.py` to check BIOS/UEFI DHCP, TCP transfers, UDP,
+incoming connections, poll timeouts, descriptor sharing and a BusyBox HTTP
+download against local servers. Tests retain packet captures and boot logs
+in their printed temporary directory and do not depend on internet access.
+
 ## DOS display scaling
 
 Press **F12**, then **Tab** to **Display**. Select an option with Up/Down
@@ -570,3 +622,89 @@ It supplies `ULTRASND` instrument patches, OS/2 and Windows samples under
 DLLs live under `RETROOS/` and ship with the matching kernel. To add missing
 showcase files to an existing persistent C:, prepare with `--copy-showcase`
 and then install; existing files are preserved. No image extraction is needed.
+
+## SMB network mounts
+
+RetroOS can mount an authenticated SMB 2.0.2/2.1 share through its common VFS.
+All personalities use the same mount through their ordinary file APIs.
+Add a section to `RETROOS/RETROOS.INI` (repeat `[smb]` for additional shares):
+
+```ini
+[smb]
+server=10.0.2.2
+port=445
+share=data
+username=retroos
+password=your-password
+domain=WORKGROUP
+path=/home/retroos/NET
+```
+
+`server` is an IPv4 address; `port` defaults to 445 and `domain` may be omitted.
+`path` must be an absolute non-root VFS path. With the normal C: mapping, this
+example appears as `C:\NET` to DOS/OS2/Windows and `/home/retroos/NET` to Linux.
+To give a share its own DOS/OS2/Windows drive, add `drive=H` and use
+`path=/host`; Linux then accesses the same share at `/host`. Explicit network
+drive letters E through L are supported; letters already used by storage
+mounts are rejected. Omitting `drive` keeps the path-only mount behavior.
+The password is a kernel mount setting, not an exported guest environment
+variable; configuration debug output omits credentials.
+
+The server must permit SMB2 and NTLMv2. Signing is mandatory; invalid
+signatures, guest/anonymous fallback, and encryption-required shares are
+rejected. File permissions remain the server's responsibility. Create,
+read/write, close/flush, directory enumeration, rename, delete, mkdir/rmdir,
+and truncate are supported. Directory enumeration keeps server cursors
+between batches. File sizes and offsets currently follow the VFS's 32-bit
+limit. SMB3/encryption, Kerberos, DFS, leases and automatic reconnect are not
+implemented.
+
+NTLM challenges and signing keys use the shared kernel random service:
+a software HMAC-DRBG/SHA-256 generator seeded by an optional entropy source
+or irregular input/disk interrupt timing. RDRAND is the current optional
+hardware source; it is no longer required once timing has seeded the pool.
+Hardware events retain the nanosecond timestamp sampled at interrupt entry
+through queued delivery, using TSC, HPET, or the PIT on older CPUs. Hosted
+input is timestamped on arrival using a real clock, independently of the
+interpreter's deterministic guest clock. Polled USB HID reports carry their
+observation timestamp, since original USB arrival time is unavailable.
+
+Typematic repeats, key releases, and periodic timer interrupts do not earn
+entropy credit. The collector credits irregular keyboard, mouse, and legacy
+IDE IRQ14/15 timing separately. Unknown/shared device IRQs and MSI sources are
+mixed without entropy credit. It waits for 256 estimated bits (at most one per
+irregular eligible event) before seeding; it logs
+`random: seeded from interrupt timing` when ready. This estimate is heuristic:
+scripted or observable input must not be treated as a secret entropy source.
+
+An unattended early-boot mount still needs an available entropy source: input
+normally arrives after boot-time mounts are attempted. The default QEMU UEFI
+launcher uses `-cpu max`; for BIOS, pass `-- -cpu max` for immediate hardware
+seeding. An unseeded pool fails the mount rather than using the guest PRNG.
+There is no automatic retry of a failed boot-time SMB mount.
+
+This first implementation uses synchronous VFS operations and pumps the
+network while waiting, with a three-second request timeout. VFS operations
+remain serialized, so a slow server can pause other guest work until the
+operation completes or times out. Failed connections are closed; reboot to
+reconnect. SMB is not currently a boot-root filesystem.
+
+The deprecated `run.sh --host DIR` shortcut and its QEMU serial HostFS bridge
+have been removed. Configure `[smb]` mounts explicitly; the launcher does not
+start an SMB server or automatically assign H:. Low-level hosted binaries
+retain their native-directory option for test fixtures and build tooling;
+it is separate from network filesystem support.
+
+For QEMU's host-directory SMB export, the server is normally `10.0.2.4` and
+the share is `qemu`. Samba must be installed on the host. For example, select
+the custom network instead of the default one:
+
+```sh
+./run.sh qemu --net none -- \
+  -netdev user,id=net0,smb=/path/to/shared-directory \
+  -device virtio-net-pci,netdev=net0
+```
+
+The share must allow the configured authenticated account; RetroOS does not
+accept a guest-only export. An explicitly configured Samba share on the host
+at `10.0.2.2` is suitable for normal authenticated mounts.

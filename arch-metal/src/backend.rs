@@ -76,7 +76,7 @@ impl Arch for Metal {
 
     // ── Timer ──
     fn now(&self) -> u64 { super::irq::now(false) }
-    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { super::irq::drain(f) }
+    fn drain(&mut self, f: &mut dyn FnMut(Irq, u64)) { super::irq::drain(f) }
     fn rdtsc(&self) -> u64 { super::x86::rdtsc() }
     fn execution_profile_set(&mut self, enabled: bool) { super::exec_profile::set(enabled) }
     fn execution_profile_begin(&mut self) { super::exec_profile::begin() }

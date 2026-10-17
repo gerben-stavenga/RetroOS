@@ -4,23 +4,26 @@ set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 fail() { echo "run.sh: $*" >&2; exit 1; }
 BACKEND=qemu FIRMWARE=bios ARCH=686 SOUND=hda SOUND_EXPLICIT=0 HEADLESS=0 KVM=0 FREEDOS=0
-HD= COMMAND= HOST_DIR= SB_AUDIO= HOSTFS_PID= VM_PID=
+HD= COMMAND= SB_AUDIO= VM_PID=
+NETWORK=
 DATA_IMAGE="${RETROOS_DATA_IMAGE:-$SCRIPT_DIR/data.img}"
 PASS=()
 while [ $# -gt 0 ]; do
     case "$1" in
-        --backend|--firmware|--sound|--arch|--hd|--data-image|--cmd)
+        --backend|--firmware|--sound|--net|--arch|--hd|--data-image|--cmd)
             [ $# -ge 2 ] || fail "$1 needs a value"
             case "$1" in
                 --backend) BACKEND="$2" ;; --firmware) FIRMWARE="$2" ;;
                 --sound) SOUND="$2"; SOUND_EXPLICIT=1 ;;
+                --net) NETWORK="$2" ;;
                 --arch) ARCH="$2" ;; --hd) HD="$2" ;; --data-image) DATA_IMAGE="$2" ;; --cmd) COMMAND="$2" ;;
             esac
             shift 2 ;;
+        --host|-H|-h) fail "$1 is deprecated and removed; configure an [smb] mount in RETROOS.INI" ;;
         --headless) HEADLESS=1; shift ;;
         --kvm) KVM=1; shift ;;
         --help)
-            echo 'Usage: ./run.sh [--backend qemu|unipcemu] [--firmware bios|uefi] [--hd ata|ahci|nvme] [--sound hda|ac97|sb|none] [--arch 386|686|x64] [--headless] [--kvm] [--data-image PATH] [--cmd COMMAND] [-- emulator arguments]'
+            echo 'Usage: ./run.sh [--backend qemu|unipcemu] [--firmware bios|uefi] [--hd ata|ahci|nvme] [--sound hda|ac97|sb|none] [--net virtio|none] [--arch 386|686|x64] [--headless] [--kvm] [--data-image PATH] [--cmd COMMAND] [-- emulator arguments]'
             exit 0 ;;
         --) shift; PASS=("$@"); break ;;
         *) fail "unknown option: $1" ;;
@@ -30,6 +33,9 @@ case "$BACKEND" in qemu|unipcemu) ;; *) fail 'invalid backend' ;; esac
 [ "$BACKEND" != unipcemu ] || [ "$SOUND_EXPLICIT" = 1 ] || SOUND=sb
 case "$FIRMWARE" in bios|uefi) ;; *) fail 'invalid firmware' ;; esac
 case "$SOUND" in hda|ac97|sb|none) ;; *) fail 'invalid sound device' ;; esac
+case "$NETWORK" in ''|virtio|none) ;; *) fail 'invalid network' ;; esac
+[ -z "$NETWORK" ] || [ "$BACKEND" = qemu ] || fail '--net requires QEMU'
+[ -n "$NETWORK" ] || { if [ "$BACKEND" = qemu ]; then NETWORK=virtio; else NETWORK=none; fi; }
 case "$ARCH" in 386|686|x64) ;; *) fail 'invalid architecture' ;; esac
 case "$HD" in ''|ata|ahci|nvme) ;; *) fail 'invalid disk controller' ;; esac
 [ -n "$HD" ] || { if [ "$FIRMWARE" = uefi ]; then HD=nvme; else HD=ata; fi; }

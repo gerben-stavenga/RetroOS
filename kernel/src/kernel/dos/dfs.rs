@@ -333,7 +333,7 @@ fn alias_taken(alias: &[u8], existing: &BTreeMap<Vec<u8>, usize>) -> bool {
     existing.contains_key(alias)
 }
 
-/// Additional boot-mounted partitions. H: remains reserved for HostFS.
+/// Additional boot-mounted partitions. H: is assigned explicitly to network shares.
 pub const EXTRA_DRIVES: [(u8, &[u8]); 7] = [
     (b'E', b"disk1/"), (b'F', b"disk2/"), (b'G', b"disk3/"),
     (b'I', b"disk4/"), (b'J', b"disk5/"), (b'K', b"disk6/"), (b'L', b"disk7/"),
@@ -363,7 +363,7 @@ pub fn extra_drive_prefix(drive: u8) -> Option<&'static [u8]> {
 pub fn drive_available(drive: u8, hostfs: bool) -> bool {
     match drive.to_ascii_uppercase() {
         b'A'..=b'D' => true,
-        b'H' => hostfs,
+        b'H' => extra_drive_prefix(b'H').is_some() || hostfs,
         drive => extra_drive_prefix(drive).is_some(),
     }
 }
@@ -679,7 +679,7 @@ fn strip_drive_prefix<'a>(abs_dos: &'a [u8], out: &mut [u8])
         b'B' => b"floppyb/",
         b'C' => c_root(),
         b'D' => b"cdrom/",
-        b'H' => b"host/",
+        b'H' => extra_drive_prefix(b'H').unwrap_or(b"host/"),
         drive => extra_drive_prefix(drive).ok_or(15)?,
     };
     // c_root carries a trailing slash (for path concat); the component walk

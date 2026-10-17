@@ -1,0 +1,32 @@
+load("@rules_rust//rust:defs.bzl", "rust_library", "rust_binary", "rust_test")
+load("//toolchain:host_transition.bzl", "host_platform_test")
+load("//toolchain:panic.bzl", "panic_strategy")
+rust_library(
+    name = "smb2-core",
+    crate_name = "smb2_core",
+    srcs = glob(["src/**/*.rs"]),
+    edition = "2024",
+    rustc_flags = ["-Crelocation-model=static"] + panic_strategy(),
+    visibility = ["//visibility:public"],
+    deps = ["@crates//:num_enum", "@crates//:log", "@crates//:digest", "@crates//:hmac", "@crates//:md4", "@crates//:md_5", "@crates//:sha2"],
+)
+
+rust_binary(
+    name = "smb-probe",
+    srcs = ["probe.rs"],
+    target_compatible_with = ["@platforms//os:linux"],
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Crelocation-model=static"],
+    deps = [":smb2-core"],
+    visibility = ["//visibility:public"],
+)
+
+rust_test(
+    name = "protocol_test_host",
+    srcs = ["protocol_test.rs"],
+    target_compatible_with = ["@platforms//os:linux"],
+    edition = "2024",
+    rustc_flags = ["-Cpanic=abort", "-Zpanic_abort_tests", "-Crelocation-model=static"],
+    deps = [":smb2-core"],
+)
+host_platform_test(name = "protocol_test", test = ":protocol_test_host")

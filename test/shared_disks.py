@@ -67,6 +67,10 @@ if os.environ.get("HOLD_VM"):
         assert f"file={data},if=none,id=data,format=raw" in args
         assert "ide-hd,drive=data,bus=ide.0,unit=1" in args
         assert not any("snapshot=" in arg for arg in args)
+        assert 'virtio-net-pci,netdev=net0' in args and 'user,id=net0' in args
+        good(run(command + ['--net', 'none']))
+        args = json.loads((root / 'arguments').read_text())
+        assert args[args.index('-nic') + 1] == 'none' and not any('netdev=' in arg for arg in args)
         holder = subprocess.Popen(command, env=env | {"HOLD_VM": "1"}, stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         try:

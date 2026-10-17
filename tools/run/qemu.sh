@@ -39,6 +39,10 @@ launch() {
         esac
     fi
     qemu="${RETROOS_QEMU_BIN:-$qemu}"
+    args+=(-nic none)
+    if [ "$NETWORK" = virtio ]; then
+        args+=(-netdev user,id=net0 -device virtio-net-pci,netdev=net0)
+    fi
     [ "$KVM" = 0 ] || cpu=(-accel kvm -cpu host)
     if [ "$FIRMWARE" = bios ]; then
         local rom="${VGABIOS_ROM:-$SCRIPT_DIR/third_party/vgabios/vgabios-stdvga.bin}"
@@ -57,18 +61,9 @@ launch() {
         esac
     fi
     local directive="$COMMAND" cwd=
-    if [ -n "$HOST_DIR" ]; then
-        args+=(-serial chardev:hostfs -chardev "socket,id=hostfs,path=$WORK/hostfs.sock,server=on,wait=on")
-        "$SCRIPT_DIR/hostfs.py" "$HOST_DIR" "$WORK/hostfs.sock" & HOSTFS_PID=$!
-        sleep 0.1
-        kill -0 "$HOSTFS_PID" 2>/dev/null || fail "HostFS server exited during startup"
-        directive="hostfs=com1${COMMAND:+;$COMMAND}"
-        cwd=H:
-    else
-        # Avoid exposing a disconnected COM1 as a phantom HostFS peer.
-        args+=(-serial none)
-        [ -z "$COMMAND" ] || cwd=$(dirname "${COMMAND%% *}")
-    fi
+    # Host-directory mounts use SMB over the NIC. COM1 has no HostFS bridge.
+    args+=(-serial none)
+    [ -z "$COMMAND" ] || cwd=$(dirname "${COMMAND%% *}")
     if [ "$FREEDOS" = 0 ]; then
         # COM2 is the diagnostic-control UART. opt/mcp is not part of the
         # launch command line: a directive-only cmdline would shut down.

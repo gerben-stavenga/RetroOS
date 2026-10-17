@@ -86,7 +86,7 @@ impl Arch for Interp {
 
     // ── Timer ──
     fn now(&self) -> u64 { crate::machine::now() }
-    fn drain(&mut self, f: &mut dyn FnMut(Irq)) { crate::machine::drain(f) }
+    fn drain(&mut self, f: &mut dyn FnMut(Irq, u64)) { crate::machine::drain(f) }
     fn rdtsc(&self) -> u64 { crate::machine::rdtsc() }
 
     // ── IRQ lines ──

@@ -94,6 +94,7 @@ pub struct LinuxState {
     pub tls_limit_in_pages: bool,
     pub pending_read: Option<PendingRead>,  // Blocked read on any fd kind
     pub pending_poll: Option<PendingPoll>,  // Blocked poll on a pollfd array
+    pending_socket: Option<PendingSocket>,
     pub wait_status_ptr: usize,            // Deferred wait4 status write
     pub wait_exit_code: i32,
     /// VFS-form cwd (lowercase, forward-slash, no leading/trailing slash).
@@ -131,6 +132,7 @@ impl LinuxState {
             tls_limit_in_pages: false,
             pending_read: None,
             pending_poll: None,
+            pending_socket: None,
             wait_status_ptr: 0,
             wait_exit_code: 0,
             cwd: [0; 64],
@@ -210,6 +212,7 @@ impl LinuxState {
 // Extracted syscall arguments (mode-independent)
 // =============================================================================
 
+#[derive(Clone, Copy)]
 struct Args {
     a0: u64,
     a1: u64,
@@ -217,6 +220,42 @@ struct Args {
     a3: u64,
     a4: u64,
     a5: u64,
+}
+
+struct PendingSocket {
+    nr: u32,
+    args: Args,
+    mode64: bool,
+    deadline: Option<u64>,
+}
+
+/// Only native socket operations are retried here. Hosted sockets keep their
+/// existing backend behavior; MSG_DONTWAIT and O_NONBLOCK return immediately.
+fn blocking_socket_call<A: crate::Arch>(
+    machine: &mut A, kt: &thread::KernelThread<A>, nr: u32, args: Args, mode64: bool,
+) -> Option<bool> {
+    if !net::native_backend() { return None; }
+    let (fd, flags, connect) = if !mode64 && nr == 102 {
+        let mut raw = [0; 24];
+        machine.copy_from(args.a1 as usize, &mut raw);
+        let word = |i: usize| u32::from_le_bytes(raw[i * 4..i * 4 + 4].try_into().unwrap());
+        match args.a0 {
+            3 => (word(0) as usize, 0, true),
+            5 | 18 => (word(0) as usize, 0, false),
+            9..=12 => (word(0) as usize, word(3), false),
+            _ => return None,
+        }
+    } else {
+        match (mode64, nr) {
+            (false, 3 | 4) | (true, 0 | 1 | 43 | 288) => (args.a0 as usize, 0, false),
+            (true, 42) => (args.a0 as usize, 0, true),
+            (true, 44 | 45) => (args.a0 as usize, args.a3 as u32, false),
+            _ => return None,
+        }
+    };
+    let thread::FdKind::Socket(h) = *kt.fds.get(fd)? else { return None };
+    if net::nonblocking(h) || flags & 0x40 != 0 { return None; }
+    Some(connect)
 }
 
 /// Extract args from regs based on caller mode.
@@ -288,6 +327,22 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
     linux: &mut LinuxState,
     regs: &mut Regs,
 ) {
+    if let Some(pending) = linux.pending_socket.take() {
+        let result = if pending.deadline.is_some_and(|end| crate::kernel::portio::now_ns() >= end) {
+            SyscallResult::val(-110)
+        } else if pending.mode64 {
+            dispatch_nr_64(machine, kt, linux, pending.nr, &pending.args, regs)
+        } else {
+            dispatch_nr(machine, kt, linux, pending.nr, &pending.args, regs)
+        };
+        if result.retval == -11 {
+            linux.pending_socket = Some(pending);
+        } else {
+            regs.rax = result.retval as u64;
+            kt.state = thread::ThreadState::Ready;
+        }
+        return;
+    }
     if let Some(ref pr) = linux.pending_read {
         if let thread::FdKind::PipeRead(idx) = pr.fd_kind {
             let (buf_ptr, buf_len) = (pr.buf_ptr, pr.buf_len);
@@ -308,7 +363,7 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
         }
     } else if let Some(ref pp) = linux.pending_poll {
         let ready = run_poll(machine, kt, pp.fds_ptr, pp.nfds);
-        if ready > 0 {
+        if ready > 0 || pp.deadline_ns.is_some_and(|end| crate::kernel::portio::now_ns() >= end) {
             regs.rax = ready as u64;
             linux.pending_poll = None;
             kt.state = thread::ThreadState::Ready;
@@ -330,6 +385,16 @@ pub fn dispatch_action<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
         dispatch_nr(machine, kt, linux, nr, &args, regs)
     };
 
+    if result.retval == -11
+        && let Some(connect) = blocking_socket_call(machine, kt, nr, args, regs.mode() == crate::UserMode::Mode64)
+    {
+        linux.pending_socket = Some(PendingSocket { nr, args,
+            mode64: regs.mode() == crate::UserMode::Mode64,
+            deadline: connect.then(|| crate::kernel::portio::now_ns().saturating_add(30_000_000_000)),
+        });
+        kt.state = thread::ThreadState::Blocked;
+        return thread::KernelAction::Done;
+    }
     linux_trace!("[LINUX] syscall {} => {}", nr, result.retval);
     regs.rax = result.retval as u64;
     // A lifecycle action (if the handler asked for one) is executed by the loop
@@ -354,6 +419,9 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         4   => sys_write(machine, kt, a),
         5   => sys_open(machine, kt, linux, a),
         6   => sys_close(kt, a),
+        10 | 40 => sys_path_mutation(machine,linux,a,nr),
+        38 => sys_rename(machine,linux,a),
+        93 => if (a.a1 as i32) < 0 { SyscallResult::val(-EINVAL) } else { sys_ftruncate(kt,a) },
         11  => sys_execve(machine, kt, linux, a, regs),
         12  => sys_chdir(machine, &mut kt.vcpu, linux, a),
         13  => sys_time(machine, &mut kt.vcpu, a),
@@ -481,12 +549,8 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         72  => sys_fcntl(kt, a),
         79  => sys_getcwd(machine, &mut kt.vcpu, linux, a),
         80  => sys_chdir(machine, &mut kt.vcpu, linux, a),
-        82 => {
-            let mut old = [0; 256]; let old_n = machine.copy_cstr(a.a0 as usize, &mut old);
-            let mut new = [0; 256]; let new_n = machine.copy_cstr(a.a1 as usize, &mut new);
-            let mut old_buf = [0; 256]; let mut new_buf = [0; 256];
-            SyscallResult::val(vfs::rename(resolve_path(&old[..old_n], linux.cwd_str(), &mut old_buf), resolve_path(&new[..new_n], linux.cwd_str(), &mut new_buf)))
-        },
+        77 => sys_ftruncate(kt,a),
+        82 => sys_rename(machine,linux,a),
         83 | 84 | 87 => {
             let mut raw = [0; 256]; let n = machine.copy_cstr(a.a0 as usize, &mut raw);
             let mut buf = [0; 256]; let path = resolve_path(&raw[..n], linux.cwd_str(), &mut buf);
@@ -535,7 +599,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         51  => sys_getsockname(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, false),
         52  => sys_getsockname(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, true),
         54  => sys_setsockopt(machine, kt, a.a0, a.a1, a.a2, a.a3 as usize, a.a4 as usize),
-        55  => SyscallResult::val(0), // getsockopt — report success (SO_ERROR = 0)
+        55  => sys_getsockopt(machine, kt, a.a0, a.a1, a.a2, a.a3 as usize, a.a4 as usize),
         288 => sys_accept(machine, kt, a.a0, a.a1 as usize, a.a2 as usize), // accept4
         _ => {
             compact_println!("unimplemented x86_64 syscall {}", nr);
@@ -945,10 +1009,9 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
             SyscallResult::val(n)
         }
         thread::FdKind::Socket(h) => {
-            // read() on a socket == recv() with no flags. Blocking (host
-            // socket blocks the kernel thread) — fine for a single client.
-            let mut tmp = alloc::vec![0u8; len];
-            let n = crate::kernel::net::recvfrom(h, &mut tmp, 0, &mut []);
+            // Native EAGAIN is suspended by dispatch_action until ready.
+            let mut tmp = alloc::vec![0u8; len.min(65536)];
+            let n = net::recvfrom(h, &mut tmp, 0, &mut []);
             if n > 0 { machine.copy_to(buf, &tmp[..n as usize]); }
             SyscallResult::val(n)
         }
@@ -1009,9 +1072,9 @@ fn sys_write<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
         }
         thread::FdKind::Socket(h) => {
             // write() on a socket == send() with no flags.
-            let mut tmp = alloc::vec![0u8; len];
+            let mut tmp = alloc::vec![0u8; len.min(65536)];
             machine.copy_from(buf, &mut tmp);
-            SyscallResult::val(crate::kernel::net::sendto(h, &tmp, 0, &[]))
+            SyscallResult::val(net::sendto(h, &tmp, 0, &[]))
         }
         thread::FdKind::PipeRead(_) | thread::FdKind::None | thread::FdKind::Dir { .. } => {
             SyscallResult::val(-EBADF)
@@ -1076,15 +1139,12 @@ fn sys_close<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
 }
 
 // =============================================================================
-// Sockets — the injected socket layer (hosted std::net punch-through).
-//
-// Blocking is acceptable for this slice: a host socket call blocks the kernel
-// thread, which is fine for a single-threaded client (wget/curl). TODO:
-// non-blocking + integrate with the event loop's PendingPoll so concurrent
-// guests don't stall each other.
+// Sockets — hosted std::net or the native Ethernet/IP stack. Native blocking
+// calls suspend through pending_socket while the event loop services the NIC.
 // =============================================================================
 
-use crate::kernel::net;
+mod socket;
+use socket as net;
 
 /// The i386 `socketcall(2)` multiplexer (nr 102): `a0` = subcall, `a1` = a
 /// pointer to a packed array of native-word (32-bit here) arguments. x86-64
@@ -1109,7 +1169,7 @@ fn sys_socketcall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         12 => sys_recvfrom(machine, kt, g(0), g(1) as usize, g(2) as usize, g(3), g(4) as usize, g(5) as usize),
         13 => sys_shutdown(kt, g(0), g(1)),
         14 => sys_setsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
-        15 => SyscallResult::val(0), // getsockopt — report success (SO_ERROR = 0)
+        15 => sys_getsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
         18 => sys_accept(machine, kt, g(0), g(1) as usize, g(2) as usize), // accept4
         _  => SyscallResult::val(-ENOSYS),
     }
@@ -1138,7 +1198,11 @@ fn sys_socket<A: crate::Arch>(kt: &mut thread::KernelThread<A>, domain: u64, ty:
     let h = net::socket(domain as i32, ty as i32, proto as i32);
     if h < 0 { return SyscallResult::val(h); }
     match kt.alloc_fd(3) {
-        Some(fd) => { kt.fds[fd] = thread::FdKind::Socket(h); SyscallResult::val(fd as i32) }
+        Some(fd) => {
+            kt.fds[fd] = thread::FdKind::Socket(h);
+            if ty & 0x80000 != 0 { kt.cloexec |= 1 << fd; }
+            SyscallResult::val(fd as i32)
+        }
         None => { net::close(h); SyscallResult::val(-EMFILE) }
     }
 }
@@ -1175,7 +1239,7 @@ fn sys_accept<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
 #[allow(clippy::too_many_arguments)]
 fn sys_sendto<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, fd: u64, buf_ptr: usize, len: usize, flags: u64, addr_ptr: usize, addr_len: usize) -> SyscallResult {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
-    let mut data = alloc::vec![0u8; len];
+    let mut data = alloc::vec![0u8; len.min(65536)];
     machine.copy_from(buf_ptr, &mut data);
     let (addr, n) = read_sockaddr(machine, addr_ptr, addr_len);
     SyscallResult::val(net::sendto(h, &data, flags as i32, &addr[..n]))
@@ -1184,7 +1248,7 @@ fn sys_sendto<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>,
 #[allow(clippy::too_many_arguments)]
 fn sys_recvfrom<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, fd: u64, buf_ptr: usize, len: usize, flags: u64, addr_ptr: usize, addrlen_ptr: usize) -> SyscallResult {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
-    let mut data = alloc::vec![0u8; len];
+    let mut data = alloc::vec![0u8; len.min(65536)];
     let mut addr = [0u8; 16];
     let n = net::recvfrom(h, &mut data, flags as i32, &mut addr);
     if n < 0 { return SyscallResult::val(n); }
@@ -1212,6 +1276,20 @@ fn sys_getsockname<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThrea
 fn sys_shutdown<A: crate::Arch>(kt: &mut thread::KernelThread<A>, fd: u64, how: u64) -> SyscallResult {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
     SyscallResult::val(net::shutdown(h, how as i32))
+}
+
+fn sys_getsockopt<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>, fd: u64,
+    level: u64, name: u64, value: usize, length: usize) -> SyscallResult
+{
+    let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
+    if level != 1 || name != 4 { return SyscallResult::val(-92); }
+    if value == 0 || length == 0 { return SyscallResult::val(-14); }
+    let capacity = machine.read::<u32>(length) as usize;
+    let error = net::socket_error(h);
+    if error < 0 { return SyscallResult::val(error); }
+    machine.copy_to(value, &error.to_le_bytes()[..capacity.min(4)]);
+    machine.write::<u32>(length, capacity.min(4) as u32);
+    SyscallResult::val(0)
 }
 
 /// Write a 16-byte `sockaddr_in` back to the caller's `addr`/`addrlen`
@@ -1472,6 +1550,25 @@ fn sys_time<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> Sysc
 }
 
 /// lseek(19)
+fn sys_rename<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
+    let mut old = [0; 256]; let old_n = machine.copy_cstr(a.a0 as usize, &mut old);
+    let mut new = [0; 256]; let new_n = machine.copy_cstr(a.a1 as usize, &mut new);
+    let mut old_buf = [0; 256]; let mut new_buf = [0; 256];
+    SyscallResult::val(vfs::rename(resolve_path(&old[..old_n], linux.cwd_str(), &mut old_buf), resolve_path(&new[..new_n], linux.cwd_str(), &mut new_buf)))
+}
+fn sys_path_mutation<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args, nr: u32) -> SyscallResult {
+    let mut raw = [0; 256]; let n = machine.copy_cstr(a.a0 as usize, &mut raw);
+    let mut buf = [0; 256]; let path = resolve_path(&raw[..n], linux.cwd_str(), &mut buf);
+    SyscallResult::val(match nr {39 => vfs::mkdir(path),40 => vfs::rmdir(path),_ => vfs::delete(path)})
+}
+fn sys_ftruncate<A: crate::Arch>(kt: &thread::KernelThread<A>, a: &Args) -> SyscallResult {
+    if a.a1 > u64::from(u32::MAX) {return SyscallResult::val(-22);}
+    match kt.fds.get(a.a0 as usize) {
+        Some(thread::FdKind::Vfs(handle)) => SyscallResult::val(vfs::resize_by_handle(*handle,a.a1 as u32)),
+        _ => SyscallResult::val(-EBADF),
+    }
+}
+
 fn sys_lseek<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> SyscallResult {
     let fd = a.a0 as usize;
     let offset = a.a1 as i32;
@@ -1503,6 +1600,12 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
 
     if fd >= thread::MAX_FDS { return SyscallResult::val(-EBADF); }
     let kind = kt.fds[fd];
+
+    if cmd == 0x5421 && let thread::FdKind::Socket(h) = kind {
+        if arg == 0 { return SyscallResult::val(-14); }
+        net::set_nonblocking(h, machine.read::<u32>(arg) != 0);
+        return SyscallResult::val(0);
+    }
 
     // Only console-attached fds are "ttys" for our purposes.
     let is_tty = matches!(kind,
@@ -1678,7 +1781,7 @@ fn sys_fcntl<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
                 thread::FdKind::Vfs(handle) => vfs::add_vfs_ref(handle),
                 thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
                 thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
-                thread::FdKind::Socket(_) => {} // TODO: socket dup refcount
+                thread::FdKind::Socket(h) => net::add_ref(h),
                 thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir { .. } => {}
             }
             kt.fds[newfd] = kind;
@@ -1702,7 +1805,14 @@ fn sys_fcntl<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
             }
             SyscallResult::val(0)
         }
-        F_GETFL | F_SETFL => SyscallResult::val(0), // stub
+        F_GETFL => SyscallResult::val(match kt.fds[fd] {
+            thread::FdKind::Socket(h) => 2 | if net::nonblocking(h) { 0x800 } else { 0 },
+            _ => 0,
+        }),
+        F_SETFL => {
+            if let thread::FdKind::Socket(h) = kt.fds[fd] { net::set_nonblocking(h, a.a2 & 0x800 != 0); }
+            SyscallResult::val(0)
+        }
         _ => SyscallResult::val(-EINVAL),
     }
 }
@@ -1911,12 +2021,10 @@ pub(crate) fn run_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
                     if (events & POLLIN) != 0 { revents |= POLLIN; }
                     if (events & POLLOUT) != 0 { revents |= POLLOUT; }
                 }
-                // Sockets: optimistically report ready for whatever was asked.
-                // Host sockets are blocking, so a following recv/send blocks
-                // until it actually completes. TODO: real readiness via a
-                // non-blocking poll on the host socket.
-                thread::FdKind::Socket(_) => {
-                    revents |= events & (POLLIN | POLLOUT);
+                // The native backend reports actual buffers/connection state;
+                // hosted sockets retain their blocking backend behavior.
+                thread::FdKind::Socket(h) => {
+                    revents |= net::readiness(h, events);
                 }
                 thread::FdKind::None => {}
             }
@@ -1944,7 +2052,9 @@ fn sys_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     // thread's pipe.
     kt.vcpu.regs = *regs;
     kt.state = thread::ThreadState::Blocked;
-    linux.pending_poll = Some(thread::PendingPoll { fds_ptr, nfds, timeout_ms: timeout });
+    linux.pending_poll = Some(thread::PendingPoll { fds_ptr, nfds, timeout_ms: timeout,
+        deadline_ns: (timeout >= 0).then(|| crate::kernel::portio::now_ns().saturating_add(timeout as u64 * 1_000_000)),
+    });
     SyscallResult { retval: 0, switch_to: None, action: None }
 }
 
@@ -2557,7 +2667,7 @@ fn sys_dup2<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysca
         thread::FdKind::Vfs(handle) => vfs::add_vfs_ref(handle),
         thread::FdKind::PipeRead(idx) => crate::kernel::kpipe::add_reader(idx),
         thread::FdKind::PipeWrite(idx) => crate::kernel::kpipe::add_writer(idx),
-        thread::FdKind::Socket(_) => {} // TODO: socket dup refcount
+        thread::FdKind::Socket(h) => net::add_ref(h),
         thread::FdKind::ConsoleOut | thread::FdKind::None | thread::FdKind::Dir { .. } => {}
     }
     kt.fds[newfd] = kind;

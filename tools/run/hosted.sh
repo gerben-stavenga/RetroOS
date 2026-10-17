@@ -10,10 +10,6 @@ launch() {
         args+=(--screenshot "$SHOT")
     fi
     [ "$TRACE" = 0 ] || export RETRO_TRACE=1
-    if [ -n "$HOST_DIR" ]; then
-        args+=(--host "$HOST_DIR")
-    else
-        args+=(--boot-disk "$BOOT_IMAGE" "$DATA_IMAGE")
-    fi
+    args+=(--boot-disk "$BOOT_IMAGE" "$DATA_IMAGE")
     run_vm "bazel-bin/$package/$target$engine" "${args[@]}" "${PASS[@]}"
 }

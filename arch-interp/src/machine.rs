@@ -166,7 +166,7 @@ pub fn now() -> u64 {
 // keyboard IRQ pushes into. The hosted `main` owns the *source* (a stdin reader
 // that translates terminal bytes to PC scancodes); arch just provides the queue
 // + `drain`, so the kernel sees identical `Irq::Key` events on both backends.
-static INPUT_QUEUE: std::sync::Mutex<std::collections::VecDeque<Irq>> =
+static INPUT_QUEUE: std::sync::Mutex<std::collections::VecDeque<(Irq, u64)>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 
 // The CPU's INTR line — our `cpu->interrupt_request`. The CPU core's block hook
@@ -197,8 +197,13 @@ pub(crate) fn irq_line() -> bool {
 /// queue the event and raise the input line so the CPU bails out to service it.
 /// The flag is set under the queue lock so it stays consistent with `drain`.
 pub fn post_irq(irq: Irq) {
+    // Entropy samples must use real arrival time, including under TCG where
+    // the guest clock deliberately follows deterministic instruction counts.
+    static INPUT_EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let timestamp_ns = INPUT_EPOCH.get_or_init(std::time::Instant::now).elapsed()
+        .as_nanos().min(u128::from(u64::MAX)) as u64;
     if let Ok(mut q) = INPUT_QUEUE.lock() {
-        q.push_back(irq);
+        q.push_back((irq, timestamp_ns));
         INPUT_PENDING.store(true, Ordering::Relaxed);
     }
 }
@@ -206,8 +211,8 @@ pub fn post_irq(irq: Irq) {
 /// Drain queued input events into the kernel event loop. Collect under the lock
 /// then dispatch unlocked, so `f` (kernel keyboard handling) can't deadlock the
 /// poster.
-pub fn drain(mut f: impl FnMut(Irq)) {
-    let events: std::vec::Vec<Irq> = match INPUT_QUEUE.lock() {
+pub fn drain(mut f: impl FnMut(Irq, u64)) {
+    let events: std::vec::Vec<(Irq, u64)> = match INPUT_QUEUE.lock() {
         Ok(mut q) => {
             let v = q.drain(..).collect();
             // Clear under the lock, atomically with emptying the queue, so a
@@ -217,11 +222,37 @@ pub fn drain(mut f: impl FnMut(Irq)) {
         }
         Err(_) => return,
     };
-    for e in events {
-        f(e);
+    for (event, timestamp_ns) in events {
+        f(event, timestamp_ns);
     }
 }
 
 /// Physical free-page count, for diagnostic logging only. The interpreter has
 /// no physical frame allocator yet (M3); report 0.
 pub fn free_page_count() -> usize { crate::phys::free_page_count() }
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn queued_input_retains_arrival_times_and_callbacks_can_post() {
+        post_irq(Irq::Key(0x1e));
+        post_irq(Irq::Key(0x9e));
+        let expected: std::vec::Vec<_> = INPUT_QUEUE.lock().unwrap()
+            .iter().map(|(_, timestamp)| *timestamp).collect();
+        assert_eq!(expected.len(), 2);
+        let mut received = std::vec::Vec::new();
+        drain(|event, timestamp| {
+            received.push(timestamp);
+            // The queue lock must be released before calling the kernel.
+            if matches!(event, Irq::Key(0x9e)) { post_irq(Irq::Hw(5)); }
+        });
+        assert_eq!(received, expected);
+        assert!(INPUT_PENDING.load(Ordering::Relaxed));
+        let mut next = 0;
+        drain(|event, _| { assert!(matches!(event, Irq::Hw(5))); next += 1; });
+        assert_eq!(next, 1);
+        assert!(!INPUT_PENDING.load(Ordering::Relaxed));
+    }
+}

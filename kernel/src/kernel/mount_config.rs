@@ -38,8 +38,26 @@ pub struct Bundle {
     pub subdir: String,
 }
 
+#[derive(Clone)]
+pub struct SmbMount {
+    pub drive: Option<u8>,
+    pub server: [u8; 4],
+    pub port: u16,
+    pub share: String,
+    pub path: String,
+    pub username: String,
+    pub password: String,
+    pub domain: String,
+}
+impl core::fmt::Debug for SmbMount {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SmbMount").field("path", &self.path).finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct Config {
+    pub smb: Vec<SmbMount>,
     pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
     pub environment: Vec<u8>,
@@ -95,7 +113,11 @@ impl Config {
                     .and_then(|s| s.strip_suffix(']'))
                     .ok_or("invalid section")?
                     .trim();
-                if section == "bundle" {
+                if section == "smb" {
+                    if config.smb.len() >= 8 { return Err("too many SMB mounts"); }
+                    config.smb.push(SmbMount { drive: None, server: [0;4], port: 445, share: String::new(), path: String::new(),
+                        username: String::new(), password: String::new(), domain: String::new() });
+                } else if section == "bundle" {
                     if config.bundle.is_some() { return Err("duplicate bundle section"); }
                     config.bundle = Some(Bundle { source: String::new(), subdir: "/".into() });
                 } else if let Some(name) = section.strip_prefix("mount ") {
@@ -131,7 +153,27 @@ impl Config {
             if key.is_empty() || value.as_bytes().contains(&0) {
                 return Err("invalid key/value");
             }
-            if section == "bundle" {
+            if section == "smb" {
+                let mount = config.smb.last_mut().ok_or("missing SMB section")?;
+                match key {
+                    "drive" => {
+                        let bytes = value.as_bytes();
+                        if bytes.len() != 1 || !(b'E'..=b'L').contains(&bytes[0].to_ascii_uppercase()) {
+                            return Err("SMB drive must be E through L");
+                        }
+                        mount.drive = Some(bytes[0].to_ascii_uppercase());
+                    }
+                    "server" => {
+                        let octets: Vec<_> = value.split('.').map(|v| v.parse::<u8>()).collect();
+                        if octets.len()!=4 || octets.iter().any(|v|v.is_err()) { return Err("SMB server must be IPv4"); }
+                        for (i,octet) in octets.into_iter().enumerate() { mount.server[i] = octet.unwrap(); }
+                    }
+                    "port" => mount.port = value.parse().map_err(|_|"invalid SMB port")?,
+                    "share" => mount.share = value.into(), "path" => mount.path = value.into(),
+                    "username" => mount.username = value.into(), "password" => mount.password = value.into(),
+                    "domain" => mount.domain = value.into(), _ => return Err("unknown SMB key"),
+                }
+            } else if section == "bundle" {
                 let bundle = config.bundle.as_mut().ok_or("missing bundle section")?;
                 match key {
                     "source" => bundle.source = value.into(),
@@ -210,6 +252,17 @@ impl Config {
                 config.environment.push(0);
             }
         }
+        for (i, mount) in config.smb.iter().enumerate() {
+            if mount.server == [0; 4] || mount.port == 0
+                || mount.username.is_empty() || mount.share.is_empty()
+                || mount.share.contains(['/', '\\', ':'])
+                || !canonical(&mount.path) || mount.path == "/"
+                || config.smb[..i].iter().any(|s| s.path == mount.path
+                    || mount.drive.is_some() && s.drive == mount.drive)
+            {
+                return Err("invalid SMB mount");
+            }
+        }
         config.environment.push(0);
         if let Some(bundle) = &mut config.bundle {
             if !canonical(&bundle.subdir) { return Err("bundle subdir must be canonical"); }
@@ -273,7 +326,7 @@ impl Config {
     pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
         if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
-        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() {
+        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() {
             return Err("user settings belong in RETROOS.INI");
         }
         Ok(config)
@@ -855,5 +908,36 @@ mod tests {
         ]);
         assert!(Config::parse(b"[launch]\nDOOM.EXE=typo\n").is_err());
         assert!(Config::parse(b"[launch]\nC:\\DOOM.EXE=repair\n").is_err());
+    }
+}
+
+#[cfg(test)]
+mod smb_config_tests {
+    use super::Config;
+    const MOUNT: &str = "[smb]\nserver=10.0.2.2\nshare=data\nusername=retroos\npassword=secret-test-value\npath=/SMB\n";
+    #[test]
+    fn smb_credentials_stay_out_of_guest_environment_and_debug_output() {
+        let c=Config::parse_user(MOUNT.as_bytes()).unwrap();
+        assert_eq!(c.smb.len(),1); assert_eq!(c.smb[0].port,445);
+        assert!(!c.environment.windows(6).any(|w|w==b"secret"));
+        assert!(!alloc::format!("{:?}",c).contains("secret-test-value"));
+        assert!(Config::parse_boot(MOUNT.as_bytes()).is_err());
+    }
+    #[test]
+    fn smb_drive_letters_are_explicit_and_unique() {
+        let config = [MOUNT, "drive=h\n"].concat();
+        assert_eq!(Config::parse_user(config.as_bytes()).unwrap().smb[0].drive, Some(b'H'));
+        for letter in ["A", "B", "C", "D", "M", "HH"] {
+            assert!(Config::parse_user([MOUNT, "drive=", letter, "\n"].concat().as_bytes()).is_err());
+        }
+        let duplicate = [config.as_str(), &config.replace("path=/SMB", "path=/OTHER")].concat();
+        assert!(Config::parse_user(duplicate.as_bytes()).is_err());
+    }
+    #[test]
+    fn smb_rejects_invalid_addresses_paths_and_duplicate_mounts() {
+        for (old,new) in [("10.0.2.2","10.0.2.999"),("path=/SMB","path=/"),("path=/SMB","path=/net/../SMB"),("share=data","share=../data")] {
+            assert!(Config::parse_user(MOUNT.replace(old,new).as_bytes()).is_err());
+        }
+        assert!(Config::parse_user([MOUNT,MOUNT].concat().as_bytes()).is_err());
     }
 }

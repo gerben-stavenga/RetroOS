@@ -69,8 +69,12 @@ rust_library(
         "//lib:vga",
         "//lib:sound",
         "//third_party/voodoo",
+        "//third_party/smb2-core",
         "@crates//:hadris-iso",
         "@crates//:spin",
+        "@crates//:smoltcp",
+        "@crates//:hmac",
+        "@crates//:sha2",
         # no_std-patched http_archive (not @crates): one flavour serves both
         # platforms — the synth core is pure integer math with zero deps.
         "@nuked_opl3//:nuked_opl3",

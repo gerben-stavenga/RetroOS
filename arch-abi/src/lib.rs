@@ -79,6 +79,7 @@ pub enum ExecutionProfileStage {
 pub mod cmdline;
 pub mod monitor;
 pub mod serial;
+pub mod net;
 pub use serial::ComPort;
 
 /// Number of scalar x86 I/O ports covered by the guest TSS bitmap. Ports at

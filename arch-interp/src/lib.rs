@@ -105,7 +105,7 @@ pub use hostfs::{
     host_readdir, host_remove, host_resize, host_rmdir, host_rename, host_write, install_native_hostfs,
 };
 // Native socket backend (hosted "punch-through"): `install_native_sockets`
-// enables it; the `host_sock_*` fns are the primitive hooks the kernel's
+// enables it; the `host_sock_*` fns implement the typed hooks the kernel's
 // `install_socket_backend` points at (direct std::net).
 pub use net::{
     host_sock_accept, host_sock_bind, host_sock_close, host_sock_connect,
