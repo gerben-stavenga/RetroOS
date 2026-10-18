@@ -202,6 +202,11 @@ crate.spec(package = "hmac", version = "0.13", default_features = False)
 crate.spec(package = "md4", version = "0.11", default_features = False)
 crate.spec(package = "md-5", version = "0.11", default_features = False)
 crate.spec(package = "sha2", version = "0.11", default_features = False)
+crate.spec(package = "sha1", version = "0.11", default_features = False)
+crate.spec(package = "pbkdf2", version = "0.13", default_features = False, features = ["hmac"])
+crate.spec(package = "aes-kw", version = "0.3", default_features = False, features = ["zeroize"])
+crate.spec(package = "zeroize", version = "1", default_features = False, features = ["alloc"])
+crate.spec(package = "subtle", version = "2", default_features = False)
 crate.spec(package = "rustc-demangle", version = "0.1.24")
 crate.spec(
     package = "spin",
@@ -276,3 +281,5 @@ crate.annotation(
 )
 # The freestanding kernel does not expose OS CPU-feature detection/SIMD state.
 crate.annotation(crate = "sha2", rustc_flags = ['--cfg=sha2_backend="soft"'])
+crate.annotation(crate = "sha1", rustc_flags = ['--cfg=sha1_backend="soft"'])
+crate.annotation(crate = "aes", rustc_flags = ['--cfg=aes_backend="soft"'])

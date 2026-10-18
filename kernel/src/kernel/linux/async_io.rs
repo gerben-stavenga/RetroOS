@@ -18,6 +18,7 @@ enum Wait {
     Epoll(i32, usize, usize, u64),
     Sleep(u64),
     Poll(usize, usize, u64),
+    Select(super::select::Request),
     Read(u8, usize, usize),
     Socket(i32, usize, usize),
     Exited,
@@ -423,6 +424,17 @@ pub(super) fn call<A: crate::Arch>(
                 n
             }
         }
+        270 => match super::select::Request::read(machine, a, true) {
+            Err(e) => e,
+            Ok(request) => match request.step(machine, kt) {
+                Some(n) => n,
+                None => {
+                    ensure(machine, kt, s, regs);
+                    s.contexts[s.active].wait = Wait::Select(request);
+                    0
+                }
+            },
+        },
         232 | 281 => {
             if a.a2 == 0 || a.a2 > i32::MAX as u64 {
                 -EINVAL
@@ -529,18 +541,15 @@ pub(super) fn call<A: crate::Arch>(
         0 if fd >= 0 && (fd as usize) < thread::MAX_FDS && !s.contexts.is_empty() => {
             if let FdKind::PipeRead(i) = kt.fds[fd as usize] {
                 let mut data = alloc::vec![0; a.a2 as usize];
-                let n = crate::kernel::kpipe::read(i, &mut data);
-                if n == 0 && crate::kernel::kpipe::has_writers(i) {
-                    if s.nonblock & (1u64 << fd) != 0 {
-                        -11
-                    } else {
-                        s.contexts[s.active].wait = Wait::Read(i, a.a1 as usize, a.a2 as usize);
-                        0
-                    }
-                } else {
+                if let Some(n) = crate::kernel::kpipe::read_event(i, &mut data) {
                     machine.copy_to(a.a1 as usize, &data[..n]);
                     reset_edge(s, fd);
                     n as i32
+                } else if s.nonblock & (1u64 << fd) != 0 {
+                    -11
+                } else {
+                    s.contexts[s.active].wait = Wait::Read(i, a.a1 as usize, a.a2 as usize);
+                    0
                 }
             } else {
                 return None;
@@ -708,20 +717,6 @@ pub(super) fn call<A: crate::Arch>(
             });
             0
         }
-        228 | 96 => {
-            let out = if nr == 96 { a.a0 } else { a.a1 } as usize;
-            let ns = machine.now();
-            machine.write::<u64>(out, ns / 1_000_000_000);
-            machine.write::<u64>(
-                out + 8,
-                if nr == 96 {
-                    ns % 1_000_000_000 / 1000
-                } else {
-                    ns % 1_000_000_000
-                },
-            );
-            0
-        }
         204 => {
             if a.a1 < 8 {
                 -EINVAL
@@ -781,14 +776,14 @@ pub(super) fn schedule<A: crate::Arch>(
                 let n = poll(machine, kt, s, ptr, count);
                 if n != 0 || now >= end { Some(n) } else { None }
             }
+            Wait::Select(request) => request.step(machine, kt),
             Wait::Socket(fd, out, count) => match descriptor(s, fd) {
                 Some(Descriptor::Socket(end)) => socket_read(machine, end, out, count),
                 _ => Some(-EBADF),
             },
             Wait::Read(pipe, out, count) => {
                 let mut data = alloc::vec![0; count];
-                let n = crate::kernel::kpipe::read(pipe, &mut data);
-                if n > 0 || !crate::kernel::kpipe::has_writers(pipe) {
+                if let Some(n) = crate::kernel::kpipe::read_event(pipe, &mut data) {
                     machine.copy_to(out, &data[..n]);
                     Some(n as i32)
                 } else {

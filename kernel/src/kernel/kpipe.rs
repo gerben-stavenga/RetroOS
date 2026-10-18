@@ -19,7 +19,8 @@ const PIPE_BUF_SIZE: usize = 1024;
 
 /// A kernel pipe with refcounted endpoints
 struct KernelPipe {
-    buffer: Pipe<u8, PIPE_BUF_SIZE>,
+    buffer: Pipe<u16, PIPE_BUF_SIZE>,
+    pending_eof: bool,
     readers: u16,
     writers: u16,
 }
@@ -28,6 +29,7 @@ impl KernelPipe {
     const fn empty() -> Self {
         Self {
             buffer: Pipe::new(0),
+            pending_eof: false,
             readers: 0,
             writers: 0,
         }
@@ -51,6 +53,7 @@ pub fn alloc() -> Option<u8> {
         if pipes[i].is_free() {
             pipes[i] = KernelPipe {
                 buffer: Pipe::new(0),
+                pending_eof: false,
                 readers: 1,
                 writers: 1,
             };
@@ -63,7 +66,7 @@ pub fn alloc() -> Option<u8> {
 /// Read up to `buf.len()` bytes from pipe. Returns bytes read.
 /// Returns 0 if empty and no writers (EOF).
 pub fn read(idx: u8, buf: &mut [u8]) -> usize {
-    PIPES.lock()[idx as usize].buffer.read(buf)
+    read_event(idx, buf).unwrap_or(0)
 }
 
 /// Write bytes to pipe. Returns bytes written, or -1 if no readers (EPIPE).
@@ -74,7 +77,7 @@ pub fn write(idx: u8, data: &[u8]) -> i32 {
         return -1; // EPIPE
     }
     for &b in data {
-        p.buffer.push(b);
+        p.buffer.push(u16::from(b));
     }
     data.len() as i32
 }
@@ -87,7 +90,9 @@ pub fn pop_back(idx: u8) -> bool {
 
 /// Check if pipe has data available for reading.
 pub fn has_data(idx: u8) -> bool {
-    !PIPES.lock()[idx as usize].buffer.is_empty()
+    let pipes = PIPES.lock();
+    let p = &pipes[idx as usize];
+    p.pending_eof || !p.buffer.is_empty()
 }
 
 /// Check if pipe has any writers remaining.
@@ -120,5 +125,78 @@ pub fn close_writer(idx: u8) {
     let p = &mut pipes[idx as usize];
     if p.writers > 0 {
         p.writers -= 1;
+    }
+}
+
+/// A canonical terminal EOF is a single completed zero-byte read, not a closed pipe.
+pub fn write_eof(idx: u8) {
+    PIPES.lock()[idx as usize].buffer.push(256);
+}
+
+/// None means blocked; Some(0) means EOF (or a zero-length read).
+pub fn read_event(idx: u8, buf: &mut [u8]) -> Option<usize> {
+    let mut pipes = PIPES.lock();
+    let p = &mut pipes[idx as usize];
+    if buf.is_empty() {
+        return Some(0);
+    }
+    if p.pending_eof {
+        p.pending_eof = false;
+        return Some(0);
+    }
+    let mut n = 0;
+    while n < buf.len() {
+        match p.buffer.pop() {
+            Some(256) => {
+                p.pending_eof = n != 0;
+                return Some(n);
+            }
+            Some(byte) => {
+                buf[n] = byte as u8;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    if n != 0 || p.writers == 0 {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Discard queued terminal input for TCSETSF.
+pub fn discard(idx: u8) {
+    let mut pipes = PIPES.lock();
+    let p = &mut pipes[idx as usize];
+    p.buffer.clear();
+    p.pending_eof = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn console_eof_is_ordered_and_does_not_close_the_writer() {
+        let pipe = alloc().unwrap();
+        let mut bytes = [0; 8];
+        assert_eq!(read_event(pipe, &mut bytes), None);
+        write(pipe, b"hi");
+        write_eof(pipe);
+        write(pipe, b"later");
+        assert_eq!(read_event(pipe, &mut bytes), Some(2));
+        assert_eq!(&bytes[..2], b"hi");
+        assert!(has_data(pipe));
+        assert_eq!(read_event(pipe, &mut bytes), Some(0));
+        assert_eq!(read_event(pipe, &mut bytes), Some(5));
+        assert_eq!(&bytes[..5], b"later");
+        assert_eq!(read_event(pipe, &mut bytes), None);
+        write_eof(pipe);
+        discard(pipe);
+        assert!(!has_data(pipe));
+        assert_eq!(read_event(pipe, &mut bytes), None);
+        close_writer(pipe);
+        assert_eq!(read_event(pipe, &mut bytes), Some(0));
+        close_reader(pipe);
     }
 }

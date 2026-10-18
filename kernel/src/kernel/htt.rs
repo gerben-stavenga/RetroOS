@@ -15,6 +15,7 @@ pub fn version_request() -> Vec<u8> {
 #[derive(Default)]
 pub struct State {
     pub version: Option<(u8, u8)>,
+    pub peer: Option<([u8; 6], u16, u16)>,
 }
 impl State {
     pub fn receive(&mut self, bytes: &[u8]) -> Result<()> {
@@ -28,6 +29,22 @@ impl State {
                 return Err(Error::State);
             }
             self.version = Some(version);
+        }
+        if matches!(kind, 3 | 0x1e | 0x2b) && (info >> 8) & 255 == 0 {
+            if bytes.len() < 16 {
+                return Err(Error::Packet);
+            }
+            let lo = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+            let hi = u32::from_le_bytes(bytes[12..16].try_into().unwrap());
+            let mut mac = [0; 6];
+            mac[..4].copy_from_slice(&bytes[4..8]);
+            mac[4..].copy_from_slice(&bytes[8..10]);
+            let (index, hash) = if kind == 0x2b {
+                (hi as u16, (hi >> 16) as u16)
+            } else {
+                ((lo >> 16) as u16, hi as u16)
+            };
+            self.peer = Some((mac, index, hash));
         }
         Ok(())
     }

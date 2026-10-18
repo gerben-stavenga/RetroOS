@@ -136,6 +136,8 @@ pub struct Receive<M> {
     next_buffer: usize,
     producer: usize,
     active: bool,
+    live: Vec<bool>,
+    recycled: alloc::collections::VecDeque<usize>,
 }
 impl<M: Memory> Receive<M> {
     pub fn required_bytes(config: Config) -> Result<usize> {
@@ -170,6 +172,8 @@ impl<M: Memory> Receive<M> {
             next_buffer: 0,
             producer: 0,
             active: false,
+            live: alloc::vec![false;config.buffers],
+            recycled: alloc::collections::VecDeque::new(),
         })
     }
     pub fn start(&mut self) -> Result<()> {
@@ -206,14 +210,28 @@ impl<M: Memory> Receive<M> {
         if head != self.producer {
             return Err(Error::Pointer);
         }
-        while self.next_buffer < self.config.buffers {
+        while self.next_buffer < self.config.buffers || !self.recycled.is_empty() {
             let next = (self.producer + 1) % ring.config.entries;
             if next == tail {
                 break;
             }
-            let address = self.memory.physical()
-                + (self.pool + self.next_buffer * self.config.buffer_bytes) as u64;
-            let cookie = self.cookie_base + self.next_buffer as u32;
+            let slot = if let Some(slot) = self.recycled.pop_front() {
+                slot
+            } else {
+                let slot = self.next_buffer;
+                self.next_buffer += 1;
+                slot
+            };
+            if self.live[slot] {
+                return Err(Error::Pointer);
+            }
+            self.live[slot] = true;
+            let start = self.pool + slot * self.config.buffer_bytes;
+            for at in (start..start + self.config.buffer_bytes).step_by(4) {
+                self.memory.write32(at, 0);
+            }
+            let address = self.memory.physical() + start as u64;
+            let cookie = self.cookie_base + slot as u32;
             let at = ring.base + self.producer * 8;
             self.memory.write32(at, address as u32);
             self.memory.write32(
@@ -223,12 +241,26 @@ impl<M: Memory> Receive<M> {
                     | (cookie << 12),
             );
             self.producer = next;
-            self.next_buffer += 1;
         }
         fence(Ordering::Release);
         self.memory
             .write32(ring.head, (self.producer * ring.config.words) as u32);
         Ok(())
+    }
+    /// A validated host destination-ring completion transfers buffer ownership.
+    /// The returned descriptor and packet are CPU copies; recycling happens on poll.
+    pub fn complete(&mut self, cookie: u32) -> Result<Vec<u8>> {
+        let slot = cookie.checked_sub(self.cookie_base).ok_or(Error::Pointer)? as usize;
+        if slot >= self.live.len() || !self.live[slot] {
+            return Err(Error::Completion);
+        }
+        let bytes = self.memory.copy_out(
+            self.pool + slot * self.config.buffer_bytes,
+            self.config.buffer_bytes,
+        );
+        self.live[slot] = false;
+        self.recycled.push_back(slot);
+        Ok(bytes)
     }
     pub fn log_state(&self) {
         if !self.active {
@@ -315,5 +347,43 @@ mod tests {
         assert_eq!(rx.poll(), Err(Error::Pointer));
         memory.clone().write32(rx.rings[0].tail, 8);
         assert_eq!(rx.poll(), Err(Error::Pointer));
+    }
+}
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+    use crate::kernel::drivers::qca_dp::tests::Ram;
+    use alloc::{rc::Rc, vec};
+    use core::cell::RefCell;
+    #[test]
+    fn only_a_posted_buffer_can_complete_and_recycling_waits_for_refill_space() {
+        const CFG: Config = Config {
+            rings: &[RingConfig {
+                id: 5,
+                pdev: 0,
+                direction: 2,
+                role: Role::Refill,
+                entries: 4,
+                words: 2,
+            }],
+            buffers: 4,
+            buffer_bytes: 2048,
+            return_manager: 6,
+        };
+        let n = Receive::<Ram>::required_bytes(CFG).unwrap();
+        let mut ram = Ram(Rc::new(RefCell::new(vec![0; n])));
+        let mut rx = Receive::new(CFG, ram.clone(), n, 100..104).unwrap();
+        rx.start().unwrap();
+        assert!(rx.complete(99).is_err());
+        assert!(rx.complete(103).is_err());
+        ram.copy_in(rx.pool, b"packet");
+        assert_eq!(&rx.complete(100).unwrap()[..6], b"packet");
+        assert!(rx.complete(100).is_err());
+        rx.poll().unwrap();
+        assert!(!rx.live[0]);
+        ram.write32(rx.rings[0].tail, 2);
+        rx.poll().unwrap();
+        assert!(rx.live[0]);
+        assert_eq!(ram.read32(rx.pool), 0);
     }
 }

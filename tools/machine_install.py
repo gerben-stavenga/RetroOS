@@ -254,7 +254,11 @@ def prepare(c_root, destination, archive=None, copy_showcase=False, showcase_arc
     settings = source_ini.read_text()
     if re.search(r'^\s*\[(?:mount |bundle\])', settings, re.M):
         raise ValueError("RETROOS.INI contains storage policy; move mounts to BOOT.INI")
-    (stage / "RETROOS.INI").write_text(settings)
+    settings_path=stage / "RETROOS.INI"
+    # User configuration can contain Wi-Fi and SMB credentials.
+    settings_path.touch(mode=0o600, exist_ok=True)
+    settings_path.chmod(0o600)
+    settings_path.write_text(settings)
     existing_boot = c_root / "RETROOS/BOOT.INI" if c_root else None
     policy = existing_boot if existing_boot and existing_boot.exists() else destination / "BOOT.INI"
     owner = c_root.stat() if c_root and c_root.exists() else None
@@ -380,11 +384,11 @@ def install_into(stage, plan, c_root):
         owner = c_root.stat()
         os.chown(user_ini.parent, owner.st_uid, owner.st_gid)
         os.chown(user_ini, owner.st_uid, owner.st_gid)
-        user_ini.chmod(0o644)
+        user_ini.chmod(0o600)
     owner = c_root.stat()
     os.chown(user_ini.parent, owner.st_uid, owner.st_gid)
     os.chown(user_ini, owner.st_uid, owner.st_gid)
-    user_ini.chmod(0o644)
+    user_ini.chmod(0o600)
     custom = CUSTOM
     if "custom_sha256" in plan and hashlib.sha256(custom.read_bytes()).hexdigest() != plan["custom_sha256"]:
         raise ValueError("40_custom changed since preparation; prepare again")

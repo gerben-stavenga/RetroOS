@@ -19,6 +19,10 @@ macro_rules! linux_trace {
 }
 
 mod async_io;
+mod tty;
+mod time;
+mod message;
+mod select;
 
 use crate::kernel::elf;
 use crate::kernel::thread;
@@ -84,7 +88,7 @@ pub fn render<A: crate::Arch>(
 pub struct LinuxState {
     keyboard: lib::keyboard::State,
     async_io: async_io::State,
-    termios: [u8; 36],
+    tty: alloc::sync::Arc<spin::Mutex<tty::Console>>,
     pub heap_base: usize,
     pub heap_end: usize,
     pub mmap_cursor: usize,
@@ -95,6 +99,7 @@ pub struct LinuxState {
     pub pending_read: Option<PendingRead>,  // Blocked read on any fd kind
     pub pending_poll: Option<PendingPoll>,  // Blocked poll on a pollfd array
     pending_socket: Option<PendingSocket>,
+    pending_select:Option<select::Request>,
     pub wait_status_ptr: usize,            // Deferred wait4 status write
     pub wait_exit_code: i32,
     /// VFS-form cwd (lowercase, forward-slash, no leading/trailing slash).
@@ -122,7 +127,7 @@ impl LinuxState {
         LinuxState {
             keyboard: lib::keyboard::State::new(),
             async_io: async_io::State::default(),
-            termios: { let mut bytes = [0; 36]; bytes[1] = 1; bytes },
+            tty: alloc::sync::Arc::new(spin::Mutex::new(tty::Console::new())),
             heap_base: 0,
             heap_end: 0,
             mmap_cursor: crate::kernel::elf::USER_STACK_TOP - 0x0100_0000,
@@ -133,6 +138,7 @@ impl LinuxState {
             pending_read: None,
             pending_poll: None,
             pending_socket: None,
+            pending_select:None,
             wait_status_ptr: 0,
             wait_exit_code: 0,
             cwd: [0; 64],
@@ -174,11 +180,7 @@ impl LinuxState {
         }
     }
 
-    /// Process a raw PS/2 scancode — the Linux TTY line discipline.
-    /// Updates key state, converts to ASCII, writes to stdin pipe.
-    /// Echo is the userspace shell's responsibility (busybox-ash handles it
-    /// itself based on its termios state); echoing in the kernel as well
-    /// would produce doubled characters on screen.
+    /// Feed console input through the terminal settings shared by forked processes.
     pub fn process_key<A: crate::Arch>(&mut self, _machine: &mut A, fds: &[FdKind; MAX_FDS], scancode: u8) {
         if !crate::kernel::keyboard::update_console(&mut self.keyboard,scancode) { return; }
         let event = crate::kernel::keyboard::event();
@@ -194,15 +196,20 @@ impl LinuxState {
             _ => b"",
         };
         if let FdKind::PipeRead(idx) = fds[0] {
-            if !sequence.is_empty() { crate::kernel::kpipe::write(idx, sequence); return; }
+            let mut tty = self.tty.lock();
+            tty.set_column(lib::term::term().cursor_pos().0);
+            let mut feed = |bytes: &[u8]| tty.input(bytes, |data| { crate::kernel::kpipe::write(idx, data); }, || crate::kernel::kpipe::write_eof(idx), |data| {
+                for &byte in data { lib::term::put_utf8(byte); }
+                crate::kernel::term::mark_dirty();
+            });
+            if !sequence.is_empty() { feed(sequence); return; }
             if self.keyboard.down(0x38,false) && !self.keyboard.altgr() && event.length != 0 {
-                crate::kernel::kpipe::write(idx,b"\x1b");
+                feed(b"\x1b");
             }
             for &character in event.characters() {
-                // ICRNL is a TTY transformation, separate from the Unicode map.
-                let character = if character == '\n' && self.termios[1] & 1 == 0 { '\r' } else { character };
                 let mut bytes = [0;4];
-                crate::kernel::kpipe::write(idx,character.encode_utf8(&mut bytes).as_bytes());
+                let character = if character == '\n' { '\r' } else { character };
+                feed(character.encode_utf8(&mut bytes).as_bytes());
             }
         }
     }
@@ -242,14 +249,16 @@ fn blocking_socket_call<A: crate::Arch>(
         match args.a0 {
             3 => (word(0) as usize, 0, true),
             5 | 18 => (word(0) as usize, 0, false),
-            9..=12 => (word(0) as usize, word(3), false),
+            9..=12 | 20 => (word(0) as usize, word(3), false),
+            16 => (word(0) as usize,word(2),false),
             _ => return None,
         }
     } else {
         match (mode64, nr) {
             (false, 3 | 4) | (true, 0 | 1 | 43 | 288) => (args.a0 as usize, 0, false),
             (true, 42) => (args.a0 as usize, 0, true),
-            (true, 44 | 45) => (args.a0 as usize, args.a3 as u32, false),
+            (true, 44 | 45 | 307) | (false,345) => (args.a0 as usize, args.a3 as u32, false),
+            (true,46)=>(args.a0 as usize,args.a2 as u32,false),
             _ => return None,
         }
     };
@@ -327,6 +336,10 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
     linux: &mut LinuxState,
     regs: &mut Regs,
 ) {
+    if let Some(request)=linux.pending_select {
+        if let Some(result)=request.step(machine,kt) {regs.rax=result as i64 as u64;linux.pending_select=None;kt.state=thread::ThreadState::Ready;}
+        return;
+    }
     if let Some(pending) = linux.pending_socket.take() {
         let result = if pending.deadline.is_some_and(|end| crate::kernel::portio::now_ns() >= end) {
             SyscallResult::val(-110)
@@ -353,8 +366,7 @@ pub fn complete_pending_io<A: crate::Arch>(machine: &mut A,
             // host heap on the hosted backends — dash, which blocks inside
             // read() (busybox polls first), was the reproducer.
             let mut tmp = alloc::vec![0u8; buf_len];
-            let n = crate::kernel::kpipe::read(idx, &mut tmp);
-            if n > 0 {
+            if let Some(n) = crate::kernel::kpipe::read_event(idx, &mut tmp) {
                 machine.copy_to(buf_ptr, &tmp[..n]);
                 regs.rax = n as u64;
                 linux.pending_read = None;
@@ -424,7 +436,7 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         93 => if (a.a1 as i32) < 0 { SyscallResult::val(-EINVAL) } else { sys_ftruncate(kt,a) },
         11  => sys_execve(machine, kt, linux, a, regs),
         12  => sys_chdir(machine, &mut kt.vcpu, linux, a),
-        13  => sys_time(machine, &mut kt.vcpu, a),
+        13  => time::time(machine,a,false),
         19  => sys_lseek(kt, a),
         20  => SyscallResult::val(kt.tid),
         // getuid/geteuid/getgid/getegid (16-bit uid variants) — pretend root.
@@ -486,13 +498,20 @@ fn dispatch_nr<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>
         243 => sys_set_thread_area(machine, kt, linux, a),
         252 => sys_exit(machine, tid, a),
         258 => SyscallResult::val(kt.tid),
-        265 => sys_clock_gettime(machine, &mut kt.vcpu, a),
+        265 => time::clock_gettime(machine,a,false),
+        266 => time::clock_getres(machine,a,false),
+        403 => time::clock_gettime(machine,a,true),
+        406 => time::clock_getres(machine,a,true),
+        78  => time::gettimeofday(machine,a,false),
         270 => sys_exit(machine, tid, a),
         295 => sys_openat(machine, kt, linux, a),
         300 => sys_fstatat64(machine, kt, linux, a, false),
         305 => SyscallResult::val(-ENOENT),
         331 => sys_pipe(machine, kt, a, true),
         340 => SyscallResult::val(0),
+        308 => select::call(machine,kt,linux,a,regs,false),
+        413 => select::call(machine,kt,linux,a,regs,true),
+        345 => message::sendmmsg(machine,kt,a,false),
         355 => sys_getrandom(machine, &mut kt.vcpu, a),
         383 => sys_statx(machine, kt, linux, a),
         102 => sys_socketcall(machine, kt, a),
@@ -557,7 +576,7 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
             SyscallResult::val(match nr { 83 => vfs::mkdir(path), 84 => vfs::rmdir(path), _ => vfs::delete(path) })
         },
         89  => sys_readlink(machine, linux, a),
-        96  => sys_clock_gettime(machine, &mut kt.vcpu, a),
+        96  => time::gettimeofday(machine,a,true),
         102 | 104 | 107 | 108 => SyscallResult::val(0),
         110 => SyscallResult::val(kt.tid),
         // setpgid(109)/getpgrp(111)/setsid(112)/getpgid(121)/getsid(124):
@@ -569,11 +588,12 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         131 => SyscallResult::val(0),
         158 => sys_arch_prctl(machine, kt, linux, a, regs),
         200 => sys_exit(machine, tid, a),
-        201 => sys_time(machine, &mut kt.vcpu, a),
+        201 => time::time(machine,a,true),
         202 => sys_futex(machine, kt, a),
         217 => sys_getdents64(machine, kt, linux, a),
         218 => SyscallResult::val(kt.tid),
-        228 => sys_clock_gettime(machine, &mut kt.vcpu, a),
+        228 => time::clock_gettime(machine,a,true),
+        229 => time::clock_getres(machine,a,true),
         231 => sys_exit(machine, tid, a),
         234 => sys_exit(machine, tid, a),
         257 => sys_openat(machine, kt, linux, a),
@@ -592,6 +612,9 @@ fn dispatch_nr_64<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         42  => sys_connect(machine, kt, a.a0, a.a1 as usize, a.a2 as usize),
         43  => sys_accept(machine, kt, a.a0, a.a1 as usize, a.a2 as usize),
         44  => sys_sendto(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, a.a3, a.a4 as usize, a.a5 as usize),
+        46 => message::sendmsg(machine,kt,a,true),
+        270 => select::call(machine,kt,linux,a,regs,true),
+        307 => message::sendmmsg(machine,kt,a,true),
         45  => sys_recvfrom(machine, kt, a.a0, a.a1 as usize, a.a2 as usize, a.a3, a.a4 as usize, a.a5 as usize),
         48  => sys_shutdown(kt, a.a0, a.a1),
         49  => sys_bind(machine, kt, a.a0, a.a1 as usize, a.a2 as usize),
@@ -955,7 +978,7 @@ pub(crate) fn handle_fork<A: crate::Arch>(
         cl.cwd_len = pl.cwd_len;
         cl.exec_path = pl.exec_path;
         cl.exec_path_len = pl.exec_path_len;
-        cl.termios = pl.termios;
+        cl.tty = pl.tty.clone();
         cl.async_io = async_io::fork_state(&pl.async_io);
     }
 
@@ -977,9 +1000,8 @@ fn sys_read<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, l
     match fd_kind {
         thread::FdKind::PipeRead(idx) => {
             let mut tmp = alloc::vec![0u8; len];
-            let n = crate::kernel::kpipe::read(idx, &mut tmp);
-            if n > 0 {
-                machine.copy_to(buf, &tmp[..n as usize]);
+            if let Some(n) = crate::kernel::kpipe::read_event(idx, &mut tmp) {
+                machine.copy_to(buf, &tmp[..n]);
                 return SyscallResult::val(n as i32);
             }
             // No data — check if writers exist
@@ -1170,6 +1192,9 @@ fn sys_socketcall<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread
         13 => sys_shutdown(kt, g(0), g(1)),
         14 => sys_setsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
         15 => sys_getsockopt(machine, kt, g(0), g(1), g(2), g(3) as usize, g(4) as usize),
+        16 | 20 => {let args=Args {a0:g(0),a1:g(1),a2:g(2),a3:g(3),a4:0,a5:0};
+            if a.a0==16 {message::sendmsg(machine,kt,&args,false)}else{message::sendmmsg(machine,kt,&args,false)}
+        },
         18 => sys_accept(machine, kt, g(0), g(1) as usize, g(2) as usize), // accept4
         _  => SyscallResult::val(-ENOSYS),
     }
@@ -1282,10 +1307,10 @@ fn sys_getsockopt<A: crate::Arch>(machine: &mut A, kt: &thread::KernelThread<A>,
     level: u64, name: u64, value: usize, length: usize) -> SyscallResult
 {
     let h = match sock_handle(kt, fd) { Ok(h) => h, Err(e) => return SyscallResult::val(e) };
-    if level != 1 || name != 4 { return SyscallResult::val(-92); }
+    if !matches!((level,name),(1,4)|(0,11)) { return SyscallResult::val(-92); }
     if value == 0 || length == 0 { return SyscallResult::val(-14); }
     let capacity = machine.read::<u32>(length) as usize;
-    let error = net::socket_error(h);
+    let error=if level==0 {net::receive_errors(h)}else{net::socket_error(h)};
     if error < 0 { return SyscallResult::val(error); }
     machine.copy_to(value, &error.to_le_bytes()[..capacity.min(4)]);
     machine.write::<u32>(length, capacity.min(4) as u32);
@@ -1470,7 +1495,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
 
     let inherited_async = if matches!(format, exec::BinaryFormat::Elf) {
         match &thread::get_thread(threads, tid).unwrap().personality {
-            thread::Personality::Linux(linux) => Some(async_io::exec_state(&linux.async_io)),
+            thread::Personality::Linux(linux) => Some((async_io::exec_state(&linux.async_io), linux.tty.clone())),
             _ => None,
         }
     } else { None };
@@ -1504,7 +1529,7 @@ pub(crate) fn handle_exec<A: crate::Arch>(
     if let Some(inherited) = inherited_async
         && let thread::Personality::Linux(linux) = &mut thread::get_thread(threads, tid).unwrap().personality
     {
-        linux.async_io = inherited;
+        (linux.async_io, linux.tty) = inherited;
     }
     if let Some(handoff) = exec_display {
         let new = thread::get_thread(threads, tid).unwrap();
@@ -1540,15 +1565,6 @@ fn sys_chdir<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, linux: &mut Linu
     SyscallResult::val(do_chdir(path, &mut linux.cwd, &mut linux.cwd_len))
 }
 
-/// time(13) — stub
-fn sys_time<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
-    let ptr = a.a0 as usize;
-    if ptr != 0 {
-        machine.write::<u32>(ptr, 0);
-    }
-    SyscallResult::val(0)
-}
-
 /// lseek(19)
 fn sys_rename<A: crate::Arch>(machine: &mut A, linux: &LinuxState, a: &Args) -> SyscallResult {
     let mut old = [0; 256]; let old_n = machine.copy_cstr(a.a0 as usize, &mut old);
@@ -1581,11 +1597,7 @@ fn sys_lseek<A: crate::Arch>(kt: &mut thread::KernelThread<A>, a: &Args) -> Sysc
     }
 }
 
-/// ioctl(54 i386 / 16 x86_64) — minimal TTY support so isatty() returns
-/// true on console fds, otherwise sh drops into silent non-interactive
-/// mode (no prompt). We only implement enough for ash to consider stdin a
-/// terminal: TCGETS/TCSETS preserve the console termios on stdin/stdout/stderr,
-/// everything else returns ENOTTY.
+/// Console terminal settings use the same 36-byte Linux ABI for both client sizes.
 fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, linux: &mut LinuxState, a: &Args) -> SyscallResult {
     const TCGETS: u32 = 0x5401;
     const TCSETS: u32 = 0x5402;
@@ -1617,12 +1629,21 @@ fn sys_ioctl<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, 
     match cmd {
         TCGETS => {
             // The Linux kernel termios ABI is 36 bytes for both client sizes.
-            if arg != 0 {
-                machine.copy_to(arg, &linux.termios);
-            }
+            if arg == 0 { return SyscallResult::val(-EFAULT); }
+            machine.copy_to(arg, &linux.tty.lock().termios);
             SyscallResult::val(0)
         }
-        TCSETS | 0x5403 | 0x5404 => { if arg == 0 { return SyscallResult::val(-EFAULT); } machine.copy_from(arg, &mut linux.termios); SyscallResult::val(0) },
+        TCSETS | 0x5403 | 0x5404 => {
+            if arg == 0 { return SyscallResult::val(-EFAULT); }
+            let mut settings = [0; 36];
+            machine.copy_from(arg, &mut settings);
+            let pipe = match kt.fds[0] { FdKind::PipeRead(i) => Some(i), _ => None };
+            if cmd == 0x5404 && let Some(pipe) = pipe { crate::kernel::kpipe::discard(pipe); }
+            linux.tty.lock().configure(settings, cmd == 0x5404, |data| {
+                if let Some(pipe) = pipe { crate::kernel::kpipe::write(pipe, data); }
+            });
+            SyscallResult::val(0)
+        },
         TIOCSWINSZ | TIOCSPGRP => SyscallResult::val(0), // accept and discard
         TIOCGWINSZ => {
             // struct winsize: ws_row, ws_col, ws_xpixel, ws_ypixel — 4×u16.
@@ -1992,19 +2013,10 @@ fn sys_nanosleep() -> SyscallResult {
     SyscallResult::val(0)
 }
 
-/// Evaluate a pollfd[] array once, writing revents and returning the
-/// number of fds with non-zero revents. Used by both sys_poll's first try
-/// and the event-loop's pending-poll retry.
-pub(crate) fn run_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, fds_ptr: usize, nfds: usize) -> i32 {
-    const POLLIN: i16 = 1;
-    const POLLOUT: i16 = 4;
-    let mut ready = 0i32;
-    for i in 0..nfds {
-        let base = fds_ptr + i * 8;
-        let fd = machine.read::<i32>(base) as usize;
-        let events = machine.read::<i16>(base + 4);
-        let mut revents: i16 = 0;
-        if fd < thread::MAX_FDS {
+pub(super) fn fd_readiness<A:crate::Arch>(kt:&thread::KernelThread<A>,fd:usize,events:i16)->i16 {
+    const POLLIN:i16=1;const POLLOUT:i16=4;
+    let mut revents=0;
+    if fd < thread::MAX_FDS {
             match kt.fds[fd] {
                 thread::FdKind::PipeRead(idx) => {
                     if (events & POLLIN) != 0 && crate::kernel::kpipe::has_data(idx) {
@@ -2026,9 +2038,25 @@ pub(crate) fn run_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelT
                 thread::FdKind::Socket(h) => {
                     revents |= net::readiness(h, events);
                 }
-                thread::FdKind::None => {}
+                thread::FdKind::None => {revents|=32;}
             }
         }
+    else {revents|=32;}
+    revents
+}
+
+/// Evaluate a pollfd[] array once, writing revents and returning the
+/// number of fds with non-zero revents. Used by both sys_poll's first try
+/// and the event-loop's pending-poll retry.
+pub(crate) fn run_poll<A: crate::Arch>(machine: &mut A, kt: &mut thread::KernelThread<A>, fds_ptr: usize, nfds: usize) -> i32 {
+    let mut ready = 0i32;
+    for i in 0..nfds {
+        let base = fds_ptr + i * 8;
+        let fd = machine.read::<i32>(base) as usize;
+        if fd>i32::MAX as usize {machine.write::<i16>(base+6,0);continue;}
+        let events = machine.read::<i16>(base + 4);
+        let mut revents: i16 = 0;
+        revents |= fd_readiness(kt,fd,events);
         machine.write::<i16>(base + 6, revents);
         if revents != 0 { ready += 1; }
     }
@@ -2565,21 +2593,6 @@ fn sys_arch_prctl<A: crate::Arch>(machine: &mut A, _kt: &mut thread::KernelThrea
         }
         _ => SyscallResult::val(-EINVAL),
     }
-}
-
-/// clock_gettime(265) — monotonic from the backend clock
-fn sys_clock_gettime<A: crate::Arch>(machine: &mut A, _vcpu: &mut Regs, a: &Args) -> SyscallResult {
-    let _clock_id = a.a0 as u32;
-    let tp = a.a1 as usize;
-    if tp != 0 {
-        let ticks = machine.get_ticks();
-        // PIT ticks at ~1193182 Hz, timer IRQ at ~100 Hz (div=11932)
-        let secs = ticks / 100;
-        let nsecs = (ticks % 100) * 10_000_000;
-        machine.write::<u32>(tp, secs as u32);        // tv_sec
-        machine.write::<u32>(tp + 4, nsecs as u32);   // tv_nsec
-    }
-    SyscallResult::val(0)
 }
 
 /// openat(295) — treat AT_FDCWD as cwd-relative, else EBADF

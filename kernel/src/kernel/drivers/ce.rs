@@ -29,6 +29,8 @@ pub struct Config {
 struct Tx {
     ring: Ring,
     buffers: usize,
+    sensitive: Vec<bool>,
+    reaped: usize,
 }
 struct Rx {
     post: Ring,
@@ -119,6 +121,8 @@ fn plan(config: Config) -> Result<(usize, Vec<Queue>)> {
         let tx = tx_ring
             .map(|ring| -> Result<Tx> {
                 Ok(Tx {
+                    sensitive: alloc::vec![false;ring.entries],
+                    reaped: 0,
                     ring,
                     buffers: span(&mut cursor, cfg.tx * cfg.buffer_bytes, 4096)?,
                 })
@@ -193,6 +197,23 @@ impl<M: Memory> Engine<M> {
         Ok(())
     }
     pub fn send(&mut self, io: &mut impl Registers, pipe: u8, bytes: &[u8]) -> Result<()> {
+        self.send_inner(io, pipe, bytes, false)
+    }
+    pub fn send_sensitive(
+        &mut self,
+        io: &mut impl Registers,
+        pipe: u8,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.send_inner(io, pipe, bytes, true)
+    }
+    fn send_inner(
+        &mut self,
+        io: &mut impl Registers,
+        pipe: u8,
+        bytes: &[u8],
+        sensitive: bool,
+    ) -> Result<()> {
         if !self.started {
             return Err(Error::State);
         }
@@ -205,12 +226,26 @@ impl<M: Memory> Engine<M> {
         if bytes.is_empty() || bytes.len() > queue.bytes {
             return Err(Error::Packet);
         }
+        let done = tx.ring.hardware(&self.memory)?;
+        while tx.reaped != done {
+            if tx.sensitive[tx.reaped] {
+                for at in (tx.buffers + tx.reaped * queue.bytes
+                    ..tx.buffers + (tx.reaped + 1) * queue.bytes)
+                    .step_by(4)
+                {
+                    self.memory.write32(at, 0);
+                }
+                tx.sensitive[tx.reaped] = false;
+            }
+            tx.reaped = (tx.reaped + 1) % tx.ring.entries;
+        }
         let next = (tx.ring.position + 1) % tx.ring.entries;
         if next == tx.ring.hardware(&self.memory)? {
             return Err(Error::Full);
         }
         let buffer = tx.buffers + tx.ring.position * queue.bytes;
         self.memory.copy_in(buffer, bytes);
+        tx.sensitive[tx.ring.position] = sensitive;
         let desc = tx.ring.offset + tx.ring.position * 16;
         self.memory
             .write32(desc, (self.memory.physical() + buffer as u64) as u32);
@@ -226,6 +261,19 @@ impl<M: Memory> Engine<M> {
         }
         let mut budget = 64;
         for queue in &mut self.queues {
+            if let Some(tx) = &mut queue.tx {
+                let done = tx.ring.hardware(&self.memory)?;
+                while tx.reaped != done {
+                    if tx.sensitive[tx.reaped] {
+                        let at = tx.buffers + tx.reaped * queue.bytes;
+                        for offset in (at..at + queue.bytes).step_by(4) {
+                            self.memory.write32(offset, 0);
+                        }
+                        tx.sensitive[tx.reaped] = false;
+                    }
+                    tx.reaped = (tx.reaped + 1) % tx.ring.entries;
+                }
+            }
             let Some(rx) = &mut queue.rx else { continue };
             let hardware = rx.status.hardware(&self.memory)?;
             let mut pipe_budget = 16;
@@ -266,7 +314,18 @@ impl<M: Memory> Engine<M> {
     /// This does not access device registers or reconfigure any queue.
     pub fn snapshot(&self) -> (u64, Vec<u8>) {
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        (self.memory.physical(), self.memory.copy_out(0, self.bytes))
+        let mut bytes = self.memory.copy_out(0, self.bytes);
+        for queue in &self.queues {
+            if let Some(tx) = &queue.tx {
+                for (slot, sensitive) in tx.sensitive.iter().enumerate() {
+                    if *sensitive {
+                        let at = tx.buffers + slot * queue.bytes;
+                        bytes[at..at + queue.bytes].fill(0);
+                    }
+                }
+            }
+        }
+        (self.memory.physical(), bytes)
     }
     pub fn log_state(&mut self, io: &mut impl Registers) {
         for queue in &self.queues {

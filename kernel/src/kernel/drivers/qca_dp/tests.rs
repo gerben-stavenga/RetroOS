@@ -45,6 +45,7 @@ fn config() -> Config {
         reo_count: 2,
         common: &[],
         reo_setup: None,
+        data: None,
     }
 }
 
@@ -200,4 +201,123 @@ fn packet_engine_rejects_invalid_sizes_and_truncated_dma() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn data_completion_validates_cookie_token_and_releases_only_the_matching_frame() {
+    const COMMON: &[RingConfig] = &[
+        RingConfig {
+            r0: 0xa44900,
+            r2: 0xa46000,
+            id: 24,
+            entries: 4,
+            words: 8,
+            destination: false,
+            command_numbers: false,
+        },
+        RingConfig {
+            r0: 0xa34e08,
+            r2: 0xa370c8,
+            id: 128,
+            entries: 4,
+            words: 8,
+            destination: true,
+            command_numbers: false,
+        },
+        RingConfig {
+            r0: 0xa34f70,
+            r2: 0xa370e0,
+            id: 131,
+            entries: 4,
+            words: 8,
+            destination: true,
+            command_numbers: false,
+        },
+    ];
+    let cfg = Config {
+        common: COMMON,
+        data: Some(DataConfig {
+            tx: 24,
+            tx_completion: 128,
+            rx_error: 131,
+            bank: 0xa4408c,
+            return_manager: 5,
+            pdev: 0,
+        }),
+        ..config()
+    };
+    let n = Bootstrap::<Ram>::required_bytes(cfg).unwrap();
+    let mut ram = Ram(Rc::new(RefCell::new(vec![0; n])));
+    let mut dp = Bootstrap::new(cfg, ram.clone(), n).unwrap();
+    let mut io = Io::default();
+    dp.start(&mut io).unwrap();
+    let cc = cookie::Config {
+        reo: 0xa38050,
+        wbm: 0xa34000,
+        wbm_rings: 0x3a,
+        tx_pages: 256,
+        rx_pages: 1,
+    };
+    let cn = cookie::Table::<Ram>::required_bytes(cc).unwrap();
+    let memory = Ram(Rc::new(RefCell::new(vec![0; cn])));
+    let cookies = cookie::Table::new(cc, memory, cn, (0xb00000, 4096)).unwrap();
+    dp.install_cookies(&mut io, cookies).unwrap();
+    dp.start_receive(&mut io).unwrap();
+    const RX: rx::Config = rx::Config {
+        rings: &[rx::RingConfig {
+            id: 5,
+            pdev: 0,
+            direction: 2,
+            role: rx::Role::Refill,
+            entries: 4,
+            words: 2,
+        }],
+        buffers: 4,
+        buffer_bytes: 2048,
+        return_manager: 6,
+    };
+    let rn = rx::Receive::<Ram>::required_bytes(RX).unwrap();
+    let memory = Ram(Rc::new(RefCell::new(vec![0; rn])));
+    let mut receive = rx::Receive::new(RX, memory, rn, 131072..131584).unwrap();
+    receive.start().unwrap();
+    dp.transmit(&mut io, &[8; 100], Some(42), (17, 9)).unwrap();
+    assert!(!dp.transmit_idle());
+    let cookie = dp.tx_pending[0].unwrap().0;
+    let token = 0x100000 + (257 * 4096) + u64::from(cookie) * 32;
+    let ring = dp.common.iter().find(|r| r.id == 128).unwrap();
+    let at = ring.offset;
+    let shadow = ring.shadow;
+    ram.write64(at, token);
+    ram.write32(at + 8, 3 | (1 << 30) | ((cookie & 0xfff) << 18));
+    ram.write32(at + 28, ((cookie >> 12) & 255) << 20);
+    ram.write32(shadow, 8);
+    let done = dp.packets(&mut io, &mut receive).unwrap();
+    assert_eq!(done.transmitted, [(42, true)]);
+    assert!(dp.transmit_idle());
+    assert_eq!(ram.read32(dp.tx_pool), 0);
+    // A repeated hardware completion is not ownership of a new buffer.
+    ram.write64(at + 32, token);
+    ram.write32(at + 40, (1 << 30) | ((cookie & 0xfff) << 18));
+    ram.write32(at + 60, ((cookie >> 12) & 255) << 20);
+    ram.write32(shadow, 16);
+    assert!(matches!(
+        dp.packets(&mut io, &mut receive),
+        Err(Error::Completion)
+    ));
+}
+
+#[test]
+fn firmware_htt_success_and_tqm_ack_are_delivery_but_drops_and_unknown_sources_are_not() {
+    assert!(tx_acked(0));
+    assert!(tx_acked(3));
+    for source in [0, 3] {
+        for status in 1..16 {
+            assert!(!tx_acked(source | (status << 13)));
+        }
+    }
+    for source in [1, 2, 4, 5, 6, 7] {
+        assert!(!tx_acked(source));
+    }
+    // Cookie-conversion flags and cookie bits do not belong to the status.
+    assert!(tx_acked(3 | (1 << 30) | (0xa55 << 18)));
 }

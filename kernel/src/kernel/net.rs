@@ -39,6 +39,12 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
     }
 }
 
+pub(crate) fn install_wifi(device: alloc::boxed::Box<dyn EthernetDevice>) {
+    if !stack::installed() {
+        config::mount();
+        stack::install(device);
+    }
+}
 pub fn poll() {
     crate::kernel::wifi::poll();
     stack::poll();
@@ -54,6 +60,9 @@ pub fn set_nonblocking(h: i32, value: bool) {
 }
 pub fn add_ref(h: i32) {
     stack::add_ref(h);
+}
+pub fn receive_errors(h: i32) -> Result<bool> {
+    stack::receive_errors(h)
 }
 pub fn socket_error(h: i32) -> Result<Option<Error>> {
     if native_backend() {

@@ -75,7 +75,10 @@ device or host bridge is needed. Use `--net none` to disable it:
 RetroOS discovers a VirtIO 1.0+ PCI Ethernet interface and obtains its IPv4
 address, default gateway and DNS servers by DHCP. QEMU normally assigns
 `10.0.2.15`, with the host reachable at `10.0.2.2`. DHCP supplies a volatile
-`/etc/resolv.conf` when the user has not supplied one. The initial lease gets
+`/etc/resolv.conf` when no direct resolver is configured. Inherited loopback
+DNS stubs such as Linux systemd-resolved at `127.0.0.53` are replaced in the
+RetroOS namespace; the host file is untouched. Explicit direct DNS servers
+retain precedence. The initial lease gets
 up to three seconds during startup; discovery and renewal continue afterward.
 
 The socket table, TCP/UDP/IP stack, DHCP and Ethernet drivers are common
@@ -622,6 +625,56 @@ It supplies `ULTRASND` instrument patches, OS/2 and Windows samples under
 DLLs live under `RETROOS/` and ship with the matching kernel. To add missing
 showcase files to an existing persistent C:, prepare with `--copy-showcase`
 and then install; existing files are preserved. No image extraction is needed.
+
+## Native Wi-Fi connection settings
+
+Add a profile to your existing `RETROOS/RETROOS.INI`:
+
+```ini
+[wifi]
+ssid=MyNetwork
+password=your-password
+autoconnect=true
+```
+
+The kernel scans at boot, selects the strongest compatible BSSID with that
+SSID, and retries failed connections. `autoconnect=false` leaves the radio
+available for discovery without joining. The initial connection mode is
+WPA2-Personal with CCMP-128 on 2.4/5 GHz, using legacy 20-MHz rates. WPA3,
+enterprise authentication and networks requiring protected management frames
+are not supported yet. Native WCN7850 boot autoconnect is confirmed on hardware:
+KLOG0010 (build `b0e150579408`) completes association and WPA2, authorizes the
+encrypted link, and receives DHCP address `192.168.1.160/24` with DNS server
+`192.168.1.254`. KLOG0011 exposed missing Linux resolver/socket calls in GNU wget. The follow-up
+adds UDP error-reporting registration, `sendmsg`/`sendmmsg` and `pselect6`, plus
+clock resolution and ABI-correct time structures. GNU wget now resolves
+`example.com` and downloads its HTTP page with exit code 0 in an isolated
+QEMU ext4 fixture; that application check still needs confirmation over Wi-Fi.
+The stack currently registers UDP error-reporting interest without generating
+ICMP auxiliary error records. GNU wget's optional alarm timer and setting a
+remote file timestamp can still report unsupported calls; the tested HTTP
+transfer itself completes successfully.
+KLOG0007 confirms profile loading, selecting `gmc`,
+channel-start requests, stop/delete cleanup and automatic rescans on hardware;
+it stops before 802.11 authentication. The follow-up uses Linux's zero
+requestor field and accepts the single pending vdev-start reply, logging its
+requestor and firmware status instead of silently ignoring a differing ID. KLOG0008
+confirms successful channel start, 802.11 authentication/association, validated
+WPA2 message 3 and firmware acknowledgement of pairwise/group keys. Final-link
+confirmation was blocked by classifying firmware HTT completions as failures;
+the follow-up accepts HTT OK alongside TQM ACKED and logs their source/status.
+KLOG0010 confirms that both EAPOL completions use firmware source 3/status 0,
+followed by successful link authorization and DHCP.
+
+Authentication, key derivation, replay handling, association policy and retries
+live in the common Wi-Fi service. Radio drivers supply channel, frame and
+key-install operations. All guest personalities use the existing common
+Ethernet/IP/DHCP stack once the encrypted link is authorized. `/proc/wifi`
+(`C:\proc\wifi`) and the automatic kernel log show connection progress;
+DHCP address assignments appear in the kernel log. Credentials are kernel settings,
+excluded from guest environment blocks and diagnostic debug output. The INI
+itself contains the password, so keep its host file private. Installer staging
+copies are created with mode 0600.
 
 ## SMB network mounts
 

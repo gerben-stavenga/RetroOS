@@ -68,6 +68,7 @@ struct Entry {
     listening: bool,
     nonblocking: bool,
     read_shutdown: bool,
+    receive_errors: bool,
     references: usize,
 }
 
@@ -340,6 +341,7 @@ fn socket(kind: Kind, nonblocking: bool) -> Result<i32, Error> {
             listening: false,
             nonblocking,
             read_shutdown: false,
+            receive_errors: false,
             references: 1,
         })
     })
@@ -614,6 +616,13 @@ fn setsockopt(h: i32, option: SocketOption) -> Result<i32, Error> {
         match option {
             // No TIME_WAIT port retention in this implementation.
             SocketOption::ReuseAddress(_) => Ok(0),
+            // The transport currently delivers no auxiliary ICMP records;
+            // retain registration so UDP clients can request them without
+            // losing ordinary send/receive and timeout behavior.
+            SocketOption::ReceiveErrors(value) if n.entries[i].kind == Kind::Udp => {
+                n.entries[i].receive_errors = value;
+                Ok(0)
+            }
             SocketOption::TcpNoDelay(value) if n.entries[i].kind == Kind::Tcp => {
                 n.sockets
                     .get_mut::<tcp::Socket>(n.entries[i].handle)
@@ -622,6 +631,15 @@ fn setsockopt(h: i32, option: SocketOption) -> Result<i32, Error> {
             }
             _ => Err(Error::UnsupportedOption),
         }
+    })
+}
+pub(super) fn receive_errors(h: i32) -> Result<bool, Error> {
+    with(|n| {
+        let i = n.index(h)?;
+        if n.entries[i].kind != Kind::Udp {
+            return Err(Error::UnsupportedOption);
+        }
+        Ok(n.entries[i].receive_errors)
     })
 }
 fn getsockname(h: i32, addr: &mut Option<Endpoint>) -> Result<i32, Error> {

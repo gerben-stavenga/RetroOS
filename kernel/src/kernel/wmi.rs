@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 pub mod radio;
 pub mod regulatory;
 pub mod scan;
+pub mod station;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Packet,
@@ -141,7 +142,7 @@ impl State {
     pub fn receive(&mut self, bytes: &[u8]) -> Result<()> {
         let id = word(bytes, 0)? & 0x00ff_ffff;
         let values = tlvs(&bytes[4..])?;
-        if id != 0x7001 {
+        if !matches!(id, 0x7001 | 0x1d011) {
             crate::compact_println!("WiFi: WMI event={:06x} bytes={}", id, bytes.len());
         }
         if !self.ready {
@@ -152,6 +153,12 @@ impl State {
                     value.len()
                 );
             }
+        }
+        if let Some(event) = station::event(id, &values)? {
+            if self.events.len() >= 64 {
+                return Err(Error::State);
+            }
+            self.events.push_back(scan::Event::Station(event));
         }
         match id {
             0x1e004 => {
@@ -195,6 +202,15 @@ impl State {
                             value.len()
                         );
                     }
+                }
+                if let Ok(Some((frame, _, _))) = scan::management_frame(&values)
+                    && matches!(frame.first(), Some(0xb0 | 0x10 | 0xa0 | 0xc0))
+                    && self.events.len() < 64
+                {
+                    self.events
+                        .push_back(scan::Event::Station(station::Event::Management(
+                            frame.to_vec(),
+                        )));
                 }
                 match scan::management(&values) {
                     Ok(Some(network)) => {

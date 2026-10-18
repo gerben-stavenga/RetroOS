@@ -57,6 +57,7 @@ impl core::fmt::Debug for SmbMount {
 
 #[derive(Clone, Default, Debug)]
 pub struct Config {
+    pub wifi: Option<crate::kernel::wifi::config::Profile>,
     pub smb: Vec<SmbMount>,
     pub bundle: Option<Bundle>,
     pub mounts: Vec<Mount>,
@@ -113,7 +114,12 @@ impl Config {
                     .and_then(|s| s.strip_suffix(']'))
                     .ok_or("invalid section")?
                     .trim();
-                if section == "smb" {
+                if section == "wifi" {
+                    if config.wifi.is_some() {
+                        return Err("duplicate Wi-Fi section");
+                    }
+                    config.wifi = Some(crate::kernel::wifi::config::Profile::default());
+                } else if section == "smb" {
                     if config.smb.len() >= 8 { return Err("too many SMB mounts"); }
                     config.smb.push(SmbMount { drive: None, server: [0;4], port: 445, share: String::new(), path: String::new(),
                         username: String::new(), password: String::new(), domain: String::new() });
@@ -153,7 +159,15 @@ impl Config {
             if key.is_empty() || value.as_bytes().contains(&0) {
                 return Err("invalid key/value");
             }
-            if section == "smb" {
+            if section == "wifi" {
+                let profile=config.wifi.as_mut().ok_or("missing Wi-Fi section")?;
+                match key {
+                    "ssid"=>{if !profile.ssid.is_empty() {return Err("duplicate Wi-Fi SSID");}profile.ssid=value.as_bytes().to_vec();},
+                    "password"=>{if !profile.password.is_empty() {return Err("duplicate Wi-Fi password");}profile.password=zeroize::Zeroizing::new(value.as_bytes().to_vec());},
+                    "autoconnect"=>profile.auto_connect=match value {"true"|"yes"|"1"=>true,"false"|"no"|"0"=>false,_=>return Err("Wi-Fi autoconnect must be true or false")},
+                    _=>return Err("unknown Wi-Fi setting"),
+                }
+            } else if section == "smb" {
                 let mount = config.smb.last_mut().ok_or("missing SMB section")?;
                 match key {
                     "drive" => {
@@ -319,6 +333,7 @@ impl Config {
         // A file depends on the most specific configured mount containing it.
         // Reject cycles before any filesystem is opened writable.
         config.order()?;
+        if let Some(profile)=&config.wifi { profile.validate()?; }
         Ok(config)
     }
 
@@ -326,7 +341,7 @@ impl Config {
     pub fn parse_boot(bytes: &[u8]) -> Result<Self, &'static str> {
         let config = Self::parse(bytes)?;
         if config.bundle.is_none() { return Err("BOOT.INI requires [bundle]"); }
-        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() {
+        if config.environment.iter().any(|b| *b != 0) || !config.launch.is_empty() || !config.smb.is_empty() || config.wifi.is_some() {
             return Err("user settings belong in RETROOS.INI");
         }
         Ok(config)
@@ -948,5 +963,27 @@ mod smb_config_tests {
             assert!(Config::parse_user(MOUNT.replace(old,new).as_bytes()).is_err());
         }
         assert!(Config::parse_user([MOUNT,MOUNT].concat().as_bytes()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wifi_config_tests {
+    use super::Config;
+    const PROFILE:&[u8]=b"[wifi]\nssid=test-ap\npassword=private-test-pass\nautoconnect=true\n";
+    #[test]
+    fn wifi_boot_profile_is_private_and_not_storage_policy() {
+        let c=Config::parse_user(PROFILE).unwrap();let p=c.wifi.as_ref().unwrap();
+        assert_eq!(p.ssid,b"test-ap");assert!(p.auto_connect);
+        assert!(!c.environment.windows(7).any(|b|b==b"private"));
+        assert!(!alloc::format!("{c:?}").contains("private-test-pass"));
+        assert!(Config::parse_boot(PROFILE).is_err());
+        let disabled=Config::parse_user(b"[wifi]\nssid=test\npassword=password\nautoconnect=false\n").unwrap();
+        assert!(!disabled.wifi.unwrap().auto_connect);
+    }
+    #[test]
+    fn wifi_configuration_rejects_missing_duplicate_and_invalid_fields() {
+        for bytes in [b"[wifi]\nssid=test\n".as_slice(), b"[wifi]\nssid=test\npassword=short\n", b"[wifi]\nssid=a\nssid=b\npassword=password\n",b"[wifi]\nssid=test\npassword=password\nunknown=1\n",b"[wifi]\nssid=test\npassword=password\nautoconnect=maybe\n"] {
+            assert!(Config::parse_user(bytes).is_err());
+        }
     }
 }

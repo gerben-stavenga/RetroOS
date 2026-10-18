@@ -614,6 +614,7 @@ fn mount_filesystems(
                 .unwrap_or_else(|e| lib::compact_panic!("RETROOS.INI: {}", e));
             let disk_settings = config.mounts.iter().any(|m| m.drive == Some(b'C') && m.source != "bundle");
             expose_user_config(bytes, disk_settings);
+            crate::kernel::wifi::configure(user.wifi);
             *BOOT_ENV.lock() = Some(user.environment);
         }
         return false;
@@ -671,8 +672,12 @@ fn load_master_env() -> alloc::vec::Vec<u8> {
     let root = crate::kernel::dos::c_root();
     let path = [root, b"RETROOS/RETROOS.INI"].concat();
     match crate::kernel::exec::load_file_resolved(&path) {
-        Ok(bytes) => crate::kernel::mount_config::Config::parse_user(&bytes)
-            .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error)).environment,
+        Ok(bytes) => {
+            let user=crate::kernel::mount_config::Config::parse_user(&bytes)
+                .unwrap_or_else(|error| lib::compact_panic!("RETROOS.INI: {}", error));
+            crate::kernel::wifi::configure(user.wifi);
+            user.environment
+        },
         Err(_) => alloc::vec![0, 0],
     }
 }

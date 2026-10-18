@@ -44,6 +44,8 @@ GPL-carrying DOSBox glue (threading, SDL, `PIC_`/`RENDER_` calls) is present.
 |---|---|---|
 | `smb2-core` (adapted vdavid/smb2) | SMB packet codecs and NTLMv2 authentication | MIT OR Apache-2.0 |
 | `digest`, `hmac`, `md4`, `md-5`, `sha2`, `crypto-common`, `block-buffer`, `hybrid-array`, `typenum`, `cmov`, `ctutils`, `cpufeatures` | SMB authentication and signing | MIT OR Apache-2.0 |
+| `aes`, `aes-kw`, `sha1`, `pbkdf2`, `zeroize` | Native WPA2-Personal authentication and key protection | MIT OR Apache-2.0 |
+| `subtle` | Constant-time WPA2 MIC and key comparison | BSD-3-Clause |
 | `num_enum`, `num_enum_derive`, `log` | SMB protocol enums and logging | MIT OR Apache-2.0 |
 | `spin` | spinlocks (no_std) | MIT |
 | `smoltcp`, `managed` | bare-metal IPv4, DHCP, TCP, UDP and buffer ownership | 0BSD |
@@ -156,6 +158,14 @@ reference Linux v7.0 ath12k `dp_htt.c`/`dp_htt.h`, `dp_rx.c`, `hal.c`/`hal.h`,
 `wifi7/dp_rx.c`, `wifi7/hal_wcn7850.c` and `wifi7/hal_rx_desc.h`. Shared radio
 configuration in `kernel/src/kernel/wmi/radio.rs` additionally references
 its `mac.c` and `wmi.c`/`wmi.h`, under the same BSD-3-Clause-Clear license.
+Station command/event layouts in `kernel/src/kernel/wmi/station.rs` and
+packet descriptors in `kernel/src/kernel/drivers/qca_dp.rs` and
+`kernel/src/kernel/drivers/wcn785x/packets.rs` additionally reference Linux
+v7.0 ath12k `wmi.c`/`wmi.h`, `wifi7/dp_tx.c`, `wifi7/dp_rx.c`,
+`wifi7/hal_tx.c`, `wifi7/hal_desc.h` and `wifi7/hal_rx_desc.h` under the same
+BSD-3-Clause-Clear license. The independent shared WPA2 supplicant consults
+IEEE RSN/EAPOL layouts and hostap's `src/rsn_supp/wpa.c` and
+`src/common/wpa_common.c` as protocol references; it uses RustCrypto primitives.
 The MHI/QRTR/QMI
 transport (`kernel/src/kernel/drivers/mhi`, `kernel/src/kernel/qrtr.rs`, and
 `kernel/src/kernel/qmi.rs`)

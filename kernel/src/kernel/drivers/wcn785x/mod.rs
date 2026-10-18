@@ -7,6 +7,7 @@
 //! DMA remains resident for the boot lifetime, including on failure.
 mod control;
 mod hardware;
+mod packets;
 mod reset;
 mod wlanfw;
 use super::mhi::dma::{Dma, Image};
@@ -304,12 +305,16 @@ pub fn probe<A: crate::Arch>(machine: &mut A) -> Option<Device> {
                 needed,
                 chip.cookies.rx_range()?,
             )?;
+            stage = "station frame DMA allocation";
+            let frames = Dma::allocate(machine, super::qca_dp::frames::BYTES, chip.dma_bits)
+                .ok_or(mhi::Error::Allocation)?;
+            let frames = super::qca_dp::frames::Frames::new(frames);
             control::Control::start(
                 &mut transport,
                 &mut router,
                 &mut ce,
                 &mut packet_engine,
-                receive,
+                control::Buffers { receive, frames },
                 chip,
                 &mut stage,
             )
@@ -388,6 +393,7 @@ impl Device {
             self.transport.reset();
             pci::disable_bus_master(self.address);
             self.failed = true;
+            crate::kernel::wifi::event(crate::kernel::wifi::link::Event::Disconnected);
             let message = error.message();
             crate::compact_println!("WiFi: control transport stopped: {}", message.as_str());
             crate::kernel::wifi::report("WCN785x control transport failed; see kernel log");
@@ -395,11 +401,58 @@ impl Device {
     }
     fn poll_inner(&mut self) -> core::result::Result<(), wlanfw::Error> {
         self.control
-            .poll(&mut self.transport, &mut self.router, &mut self.ce)
+            .poll(&mut self.transport, &mut self.router, &mut self.ce)?;
+        self.control
+            .packet_poll(&mut self.packet_engine, &mut self.transport.io)
     }
 }
 
 impl crate::kernel::wifi::Radio for Device {
+    fn transmit(&mut self, frame: &[u8]) -> bool {
+        !self.failed
+            && self
+                .control
+                .ethernet(&mut self.packet_engine, &mut self.transport.io, frame, None)
+                .is_ok()
+    }
+    fn mac_address(&self) -> Option<[u8; 6]> {
+        (!self.failed).then(|| self.control.mac_address())
+    }
+    fn action(&mut self, action: crate::kernel::wifi::link::Action) -> Result<(), i32> {
+        if self.failed {
+            return Err(-19);
+        }
+        if matches!(&action, crate::kernel::wifi::link::Action::StartChannel(_))
+            && !self.packet_engine.transmit_idle()
+        {
+            return Err(-16);
+        }
+        if let crate::kernel::wifi::link::Action::Eapol { id, bytes } = action {
+            let Some(peer) = self.control.peer_address() else {
+                return Err(-107);
+            };
+            let mut frame = peer.to_vec();
+            frame.extend_from_slice(&self.control.mac_address());
+            frame.extend_from_slice(&[0x88, 0x8e]);
+            frame.extend_from_slice(&bytes);
+            return self
+                .control
+                .ethernet(
+                    &mut self.packet_engine,
+                    &mut self.transport.io,
+                    &frame,
+                    Some(id),
+                )
+                .map_err(|_| -5);
+        }
+        self.control
+            .action(action, &mut self.transport, &mut self.router, &mut self.ce)
+            .map_err(|e| {
+                let message = e.message();
+                crate::compact_println!("WiFi: station command failed: {}", message.as_str());
+                -5
+            })
+    }
     fn poll(&mut self) {
         Device::poll(self);
     }

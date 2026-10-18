@@ -22,6 +22,8 @@ pub enum Shutdown {
 pub enum SocketOption {
     ReuseAddress(bool),
     TcpNoDelay(bool),
+    /// Register interest in asynchronous datagram network errors.
+    ReceiveErrors(bool),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {

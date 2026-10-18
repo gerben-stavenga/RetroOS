@@ -20,6 +20,8 @@ static int call(int number, u32 a, u32 b, u32 c) {
         case 6: nr = 3; break;
         case 55: nr = 72; break;
         case 168: nr = 7; break;
+        case 265: nr = 228; break;
+        case 266: nr = 229; break;
         default: return -38;
     }
     return direct(nr, a, b, c, 0, 0, 0);
@@ -35,6 +37,9 @@ static int socketcall(int op, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f) {
         case 7: nr = 52; break;
         case 9: case 11: nr = 44; break;
         case 10: case 12: nr = 45; break;
+        case 14: nr = 54; break;
+        case 16: nr = 46; break;
+        case 20: nr = 307; break;
         case 15: nr = 55; break;
         default: return -38;
     }
@@ -51,6 +56,16 @@ static int socketcall(int op, u32 a, u32 b, u32 c, u32 d, u32 e, u32 f) {
     return call(102, op, (u32)args, 0);
 }
 #endif
+static int select_call(u32 nfds, u32 readset, u32 writeset, u32 exceptset, u32 timeout) {
+#if defined(__x86_64__)
+    return direct(270, nfds, readset, writeset, exceptset, timeout, 0);
+#else
+    int result;
+    __asm__ volatile("push %%ebp; xor %%ebp, %%ebp; int $0x80; pop %%ebp"
+        : "=a"(result) : "a"(308), "b"(nfds), "c"(readset), "d"(writeset), "S"(exceptset), "D"(timeout) : "memory");
+    return result;
+#endif
+}
 static void finish(int code) { call(1, code, 0, 0); for (;;) {} }
 static void check(int ok, int code) { if (!ok) finish(code); }
 static void address(unsigned char *a, int port) {
@@ -62,6 +77,14 @@ static unsigned char data[128 * 1024];
 static unsigned char reply[128 * 1024];
 /* ELF entry has no caller-pushed return address; align GCC's local frame. */
 void __attribute__((force_align_arg_pointer)) _start(void) {
+    u32 ts[2] = {~0UL, ~0UL};
+    check(call(265, 1, (u32)ts, 0) == 0, 50);
+    check(ts[0] < 86400 && ts[1] < 1000000000, 51);
+    ts[0] = ts[1] = ~0UL;
+    check(call(266, 1, (u32)ts, 0) == 0, 52);
+    check(ts[0] == 0 && ts[1] == 10000000, 53);
+    check(call(266, 1, 0, 0) == 0, 54);
+    check(call(266, ~0UL, (u32)ts, 0) == -22, 55);
     int fd = socketcall(1, 2, 1, 0, 0, 0, 0);
 #ifdef NO_NIC
     check(fd == -38, 2);
@@ -96,6 +119,12 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
 
     fd = socketcall(1, 2, 2, 0, 0, 0, 0);
     check(fd >= 0, 12);
+    int receive_errors = 1;
+    check(socketcall(14, fd, 0, 11, (u32)&receive_errors, 4, 0) == 0, 56);
+    receive_errors = 0; size = 4;
+    check(socketcall(15, fd, 0, 11, (u32)&receive_errors, (u32)&size, 0) == 0 && receive_errors == 1 && size == 4, 57);
+    receive_errors = 0;
+    check(socketcall(14, fd, 0, 11, (u32)&receive_errors, 4, 0) == 0, 58);
     address(sa, UDP_PORT);
     check(socketcall(11, fd, (u32)data, 257, 0, (u32)sa, 16) == 257, 13);
     size = 16;
@@ -112,6 +141,30 @@ void __attribute__((force_align_arg_pointer)) _start(void) {
     struct { int fd; short events, revents; } pollfd = {fd, 1, 0};
     check(call(168, (u32)&pollfd, 1, 10000) == 1 && pollfd.revents == 1, 24);
     check(socketcall(10, fd, (u32)reply, 31, 0, 0, 0) == 31, 25);
+    struct Iovec { void *base; u32 length; } a_iov[2] = {{data, 4}, {data + 4, 5}}, b_iov[2] = {{data, 2}, {data + 2, 3}};
+    struct Message { void *name; unsigned namelen; struct Iovec *iov; u32 iovlen; void *control; u32 controllen; int flags; };
+    struct Batch {struct Message message; unsigned length;} batch[2] = {
+        {{0, 0, a_iov, 2, 0, 0, 0}, 0xdead}, {{0, 0, b_iov, 2, 0, 0, 0}, 0xbeef}
+    };
+    check(socketcall(20, fd, (u32)batch, 2, 0, 0, 0) == 2, 59);
+    check(batch[0].length == 9 && batch[1].length == 5, 60);
+    for (int length = 9; length >= 5; length -= 4) {
+        u32 readset = 1UL << fd;
+        u32 deadline[2] = {10, 0};
+        check(select_call(fd + 1, (u32)&readset, 0, 0, (u32)deadline) == 1 && readset == (1UL << fd), 61);
+        u32 writeset = 1UL << fd;
+        check(select_call(fd + 1, (u32)&readset, (u32)&writeset, 0, (u32)deadline) == 2, 67);
+        check(socketcall(10, fd, (u32)reply, 32, 0, 0, 0) == length, 62);
+        for (int i = 0; i < length; ++i) check(reply[i] == data[i], 63);
+    }
+    batch[1].message.iovlen = 1025; batch[1].length = 0xbeef;
+    check(socketcall(20, fd, (u32)batch, 2, 0, 0, 0) == 1 && batch[1].length == 0xbeef, 64);
+    check(call(168, (u32)&pollfd, 1, 10000) == 1, 65);
+    check(socketcall(10, fd, (u32)reply, 32, 0, 0, 0) == 9, 66);
+    u32 readset = 1UL << fd, timeout[2] = {0, 20000000};
+    check(select_call(fd + 1, (u32)&readset, 0, 0, (u32)timeout) == 0 && readset == 0, 68);
+    readset = 1UL << 31;
+    check(select_call(32, (u32)&readset, 0, 0, (u32)timeout) == -9, 69);
     pollfd.revents = -1;
     check(call(168, (u32)&pollfd, 1, 20) == 0 && pollfd.revents == 0, 31);
     check(call(6, fd, 0, 0) == 0, 26);

@@ -127,6 +127,7 @@ pub fn setsockopt(h: i32, level: i32, name: i32, value: &[u8]) -> i32 {
     let option = match (level, name) {
         (1, 2) => SocketOption::ReuseAddress(enabled),
         (6, 1) => SocketOption::TcpNoDelay(enabled),
+        (0, 11) => SocketOption::ReceiveErrors(enabled), // IP_RECVERR, required by glibc DNS
         _ => return -92,
     };
     result(net::setsockopt(h, option))
@@ -157,6 +158,11 @@ pub fn shutdown(h: i32, how: i32) -> i32 {
         _ => return -22,
     };
     result(net::shutdown(h, how))
+}
+pub fn receive_errors(h: i32) -> i32 {
+    net::receive_errors(h)
+        .map(i32::from)
+        .unwrap_or_else(|e| -errno(e))
 }
 pub fn socket_error(h: i32) -> i32 {
     match net::socket_error(h) {

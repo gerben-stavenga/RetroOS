@@ -242,6 +242,20 @@ impl ScanEvent {
     }
 }
 pub(super) fn management(values: &[(u16, &[u8])]) -> Result<Option<Network>> {
+    let Some((frame, frequency, signal)) = management_frame(values)? else {
+        return Ok(None);
+    };
+    if !matches!(frame.first(), Some(0x80 | 0x50)) {
+        return Ok(None); // other management subtypes are not discovery results
+    }
+    Network::from_management(frame, frequency, signal)
+        .map(Some)
+        .ok_or(Error::Packet)
+}
+
+pub(super) fn management_frame<'a>(
+    values: &[(u16, &'a [u8])],
+) -> Result<Option<(&'a [u8], u32, i32)>> {
     let header = required(values, 44)?;
     // ath12k_wmi_mgmt_rx_params has four rssi_ctl words: 17 words
     // total, with chan_freq at word 16. Accept additive trailing fields.
@@ -270,17 +284,13 @@ pub(super) fn management(values: &[(u16, &[u8])]) -> Result<Option<Network>> {
     let signal = i32::try_from(word(header, 4)?)
         .unwrap_or(0)
         .saturating_sub(95);
-    if !matches!(frame.first(), Some(0x80 | 0x50)) {
-        return Ok(None); // other management subtypes are not discovery results
-    }
-    Network::from_management(frame, frequency, signal)
-        .map(Some)
-        .ok_or(Error::Packet)
+    Ok(Some((frame, frequency, signal)))
 }
 
 pub enum Event {
     Scan(ScanEvent),
     Network(Network),
+    Station(super::station::Event),
 }
 
 #[cfg(test)]

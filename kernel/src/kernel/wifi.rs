@@ -4,11 +4,129 @@ use crate::kernel::vfs::{self, DirEntry, Filesystem, Vnode};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
+pub mod auth;
+pub mod config;
+pub mod link;
 pub mod scan;
+static CONNECTION: spin::Mutex<Manager> = spin::Mutex::new(Manager::new());
+static EVENTS: spin::Mutex<alloc::collections::VecDeque<link::Event>> =
+    spin::Mutex::new(alloc::collections::VecDeque::new());
+pub fn configure(profile: Option<config::Profile>) {
+    CONNECTION.lock().profile = profile;
+}
+pub fn event(event: link::Event) {
+    let mut events = EVENTS.lock();
+    if events.len() < 128 {
+        events.push_back(event);
+    } else {
+        events.clear();
+        events.push_back(link::Event::Disconnected);
+    }
+}
+struct Manager {
+    profile: Option<config::Profile>,
+    connection: Option<link::Connection>,
+    retry: u64,
+    last: Option<link::Phase>,
+}
+impl Manager {
+    const fn new() -> Self {
+        Self {
+            profile: None,
+            connection: None,
+            retry: 0,
+            last: None,
+        }
+    }
+    fn poll(&mut self, device: &mut dyn Radio) {
+        let now = crate::kernel::portio::now_ns();
+        let mut actions = Vec::new();
+        if let Some(connection) = &mut self.connection {
+            while let Some(event) = EVENTS.lock().pop_front() {
+                actions.extend(connection.event(event, now));
+            }
+            actions.extend(connection.tick(now));
+            if connection.phase == link::Phase::Idle {
+                self.connection = None;
+                self.last = None;
+                self.retry = now + 5_000_000_000;
+                SCAN_REQUEST.store(true, Ordering::Release);
+            }
+        } else {
+            EVENTS.lock().clear();
+            if now >= self.retry && self.profile.as_ref().is_some_and(|p| p.auto_connect) {
+                let profile = self.profile.as_ref().unwrap();
+                let survey = SCAN.lock();
+                if matches!(survey.phase, scan::Phase::Failed(_) | scan::Phase::Idle) {
+                    self.retry = now + 15_000_000_000;
+                    SCAN_REQUEST.store(true, Ordering::Release);
+                }
+                if matches!(survey.phase, scan::Phase::Complete) {
+                    let found = survey
+                        .networks
+                        .iter()
+                        .filter(|n| n.ssid == profile.ssid)
+                        .filter(|n| {
+                            auth::Security::negotiate(&n.rsn).is_ok()
+                                && link::legacy_rates(n).is_ok()
+                        })
+                        .max_by_key(|n| n.signal_dbm)
+                        .cloned();
+                    drop(survey);
+                    if let Some(network) = found {
+                        let mut nonce = [0; 32];
+                        if let Some(mac) = device.mac_address()
+                            && crate::kernel::random::fill(&mut nonce).is_ok()
+                            && let Ok(pmk) = profile.pmk()
+                            && let Ok(connection) =
+                                link::Connection::new(network, mac, pmk, nonce, now)
+                        {
+                            actions.push(connection.first());
+                            self.connection = Some(connection);
+                        } else {
+                            report("waiting for secure random source and radio");
+                            self.retry = now + 5_000_000_000;
+                        }
+                    } else {
+                        report("configured network absent or unsupported security; retrying scan");
+                        self.retry = now + 15_000_000_000;
+                        SCAN_REQUEST.store(true, Ordering::Release);
+                    }
+                }
+            }
+        }
+        for action in actions {
+            if let Err(error) = device.action(action) {
+                crate::compact_println!("WiFi: station action failed: {}", error);
+                if let Some(c) = &mut self.connection {
+                    for a in c.fail(now) {
+                        let _ = device.action(a);
+                    }
+                }
+                break;
+            }
+        }
+        if let Some(c) = &self.connection
+            && self.last != Some(c.phase)
+        {
+            self.last = Some(c.phase);
+            report(c.status());
+        }
+    }
+}
 
 /// Native radio lifecycle, shared by guest personalities and chip drivers.
 pub trait Radio: Send {
     fn poll(&mut self);
+    fn transmit(&mut self, _frame: &[u8]) -> bool {
+        false
+    }
+    fn mac_address(&self) -> Option<[u8; 6]> {
+        None
+    }
+    fn action(&mut self, _action: link::Action) -> Result<(), i32> {
+        Err(-95)
+    }
     fn scan(&mut self) -> Result<(), i32> {
         Err(-95)
     }
@@ -43,7 +161,11 @@ pub fn scan_observe(network: scan::Network) {
 }
 
 fn status_text() -> Vec<u8> {
-    let mut text = STATUS.0.lock().clone();
+    let mut text = if let Some(connection) = CONNECTION.lock().connection.as_ref() {
+        [connection.status().as_bytes(), b"\n"].concat()
+    } else {
+        STATUS.0.lock().clone()
+    };
     text.extend_from_slice(SCAN.lock().text().as_bytes());
     text
 }
@@ -70,13 +192,85 @@ pub fn init<A: crate::Arch>(machine: &mut A) {
     SCAN_REQUEST.store(DEVICE.lock().is_some(), Ordering::Release);
 }
 pub fn poll() {
+    let mut attach = None;
     if let Some(device) = DEVICE.lock().as_mut() {
         device.poll();
-        if SCAN_REQUEST.swap(false, Ordering::AcqRel)
+        CONNECTION.lock().poll(device.as_mut());
+        let connected = CONNECTION
+            .lock()
+            .connection
+            .as_ref()
+            .is_some_and(|c| c.phase == link::Phase::Connected);
+        let mut ethernet = ETHERNET.lock();
+        if !connected {
+            ethernet.rx.clear();
+            ethernet.tx.clear();
+        }
+        ethernet.connected = connected;
+        if connected && !ethernet.attached {
+            ethernet.attached = true;
+            attach = device.mac_address();
+        }
+        if connected {
+            for _ in 0..16 {
+                let Some(frame) = ethernet.tx.front() else {
+                    break;
+                };
+                if !device.transmit(frame) {
+                    break;
+                }
+                ethernet.tx.pop_front();
+            }
+        }
+        drop(ethernet);
+        if CONNECTION.lock().connection.is_none()
+            && SCAN_REQUEST.swap(false, Ordering::AcqRel)
             && let Err(error) = device.scan()
         {
             crate::compact_println!("WiFi: scan request rejected: {}", error);
         }
+    }
+    if let Some(mac) = attach {
+        crate::kernel::net::install_wifi(Box::new(Adapter(mac)));
+    }
+}
+struct Ethernet {
+    rx: alloc::collections::VecDeque<Vec<u8>>,
+    tx: alloc::collections::VecDeque<Vec<u8>>,
+    connected: bool,
+    attached: bool,
+}
+static ETHERNET: spin::Mutex<Ethernet> = spin::Mutex::new(Ethernet {
+    rx: alloc::collections::VecDeque::new(),
+    tx: alloc::collections::VecDeque::new(),
+    connected: false,
+    attached: false,
+});
+pub fn ethernet_receive(frame: Vec<u8>) {
+    let mut q = ETHERNET.lock();
+    if q.connected && q.rx.len() < 64 {
+        q.rx.push_back(frame);
+    }
+}
+struct Adapter([u8; 6]);
+impl crate::kernel::net::EthernetDevice for Adapter {
+    fn mac_address(&self) -> [u8; 6] {
+        self.0
+    }
+    fn receive(&mut self) -> Option<Vec<u8>> {
+        ETHERNET.lock().rx.pop_front()
+    }
+    fn can_transmit(&mut self) -> bool {
+        let q = ETHERNET.lock();
+        q.connected && q.tx.len() < 64
+    }
+    fn transmit(&mut self, frame: &[u8]) -> bool {
+        let mut q = ETHERNET.lock();
+        if !q.connected || q.tx.len() >= 64 {
+            return false;
+        }
+        q.tx.push_back(frame.to_vec());
+        true
     }
 }
 
@@ -156,6 +350,9 @@ impl Filesystem for Status {
         }
         if DEVICE.lock().is_none() {
             return -19;
+        }
+        if CONNECTION.lock().connection.is_some() {
+            return -16;
         }
         if matches!(
             SCAN.lock().phase,

@@ -183,3 +183,21 @@ fn malformed_dma_pointers_lengths_and_profiles_are_rejected() {
     let memory = Ram(Rc::new(RefCell::new(vec![0; 8192])));
     assert!(Engine::new(CONFIG, memory, 1).is_err());
 }
+#[test]
+fn sensitive_commands_are_redacted_and_cleared_only_after_dma_completion() {
+    let (mut engine, mut ram, mut io) = engine();
+    let buffer = engine.queues[0].tx.as_ref().unwrap().buffers;
+    let shadow = engine.queues[0].tx.as_ref().unwrap().ring.shadow;
+    engine
+        .send_sensitive(&mut io, 0, b"private-test-key")
+        .unwrap();
+    assert_eq!(ram.copy_out(buffer, 16), b"private-test-key");
+    assert_eq!(engine.snapshot().1[buffer..buffer + 32], [0; 32]);
+    engine.poll(&mut io).unwrap();
+    assert_eq!(ram.copy_out(buffer, 16), b"private-test-key");
+    ram.write32(shadow, 4);
+    engine.poll(&mut io).unwrap();
+    assert_eq!(ram.copy_out(buffer, 32), [0; 32]);
+    engine.send(&mut io, 0, b"normal").unwrap();
+    assert_eq!(&engine.snapshot().1[buffer + 32..buffer + 38], b"normal");
+}

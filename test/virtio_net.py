@@ -97,7 +97,7 @@ def session(work, name, device, uefi=False, bits=32):
 
     def udp_server():
         try:
-            for length in (257, 31):
+            for length in (257, 31, 9, 5, 9):
                 data, peer = udp.recvfrom(2048)
                 assert len(data) == length
                 udp.sendto(data, peer)

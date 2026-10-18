@@ -405,7 +405,10 @@ def prepare(image, destination, requested_c, requested_root, c_ram=False, reques
     disk_ini = Path(home) / "RETROOS/RETROOS.INI" if home else None
     if disk_ini and disk_ini.exists():
         user_ini = disk_ini
-    shutil.copyfile(user_ini if user_ini.exists() else template, stage / "RETROOS.INI")
+    settings_path=stage / "RETROOS.INI"
+    settings_path.touch(mode=0o600, exist_ok=True)
+    settings_path.chmod(0o600)
+    shutil.copyfile(user_ini if user_ini.exists() else template, settings_path)
     subprocess.run(["grub-script-check", str(stage / "grub.cfg")], check=True)
     (stage / "42_retroos_module").write_text('#!/bin/sh\nexec tail -n +3 "$0"\n' + entries)
     (stage / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
@@ -481,7 +484,7 @@ def install():
     user_ini = destination / "RETROOS.INI"
     if not user_ini.exists():
         shutil.copyfile(stage / "RETROOS.INI", user_ini)
-        user_ini.chmod(0o644)
+        user_ini.chmod(0o600)
     boot_ini = destination / "BOOT.INI"
     old_boot = boot_ini.read_bytes() if boot_ini.exists() else None
     old_managed = MANAGED.read_bytes() if MANAGED.exists() else None

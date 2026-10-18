@@ -9,6 +9,10 @@ const TIMEOUT: u64 = 10_000_000_000;
 const MAX_SPINS: usize = 5_000_000;
 type Result<T> = core::result::Result<T, Error>;
 
+pub(super) struct Buffers {
+    pub receive: qca_dp::rx::Receive<Dma>,
+    pub frames: qca_dp::frames::Frames<Dma>,
+}
 pub(super) struct Control {
     htc: htc::State,
     htt: htt::State,
@@ -19,6 +23,18 @@ pub(super) struct Control {
     station_created: bool,
     scan: Option<wmi::scan::Session>,
     scan_sequence: u32,
+    frames: qca_dp::frames::Frames<Dma>,
+    pub(super) authorized: bool,
+    replay: wifi::auth::Replay,
+    pending_keys: alloc::vec::Vec<(wifi::auth::KeyId, u64)>,
+    data_sequence: u16,
+    peer: Option<[u8; 6]>,
+    aid: u16,
+    starting: bool,
+    associating: bool,
+    stopping: bool,
+    running: bool,
+    station_events: alloc::collections::VecDeque<wmi::station::Event>,
 }
 impl Control {
     pub(super) fn start<R: Registers>(
@@ -26,10 +42,11 @@ impl Control {
         router: &mut qrtr::Router,
         ce: &mut ce::Engine<Dma>,
         packet_engine: &mut crate::kernel::drivers::qca_dp::Bootstrap<Dma>,
-        receive: qca_dp::rx::Receive<Dma>,
+        buffers: Buffers,
         chip: &Chip,
         stage: &mut &'static str,
     ) -> Result<Self> {
+        let Buffers { receive, frames } = buffers;
         let mut this = Self {
             htc: htc::State::new(),
             htt: htt::State::default(),
@@ -40,6 +57,18 @@ impl Control {
             station_created: false,
             scan: None,
             scan_sequence: 0,
+            frames,
+            authorized: false,
+            replay: wifi::auth::Replay::default(),
+            pending_keys: alloc::vec::Vec::new(),
+            data_sequence: 0,
+            peer: None,
+            aid: 0,
+            starting: false,
+            associating: false,
+            stopping: false,
+            running: false,
+            station_events: alloc::collections::VecDeque::new(),
         };
         *stage = "HTC target ready";
         this.wait(transport, router, ce, |this| this.htc.ready)?;
@@ -193,6 +222,7 @@ impl Control {
                 }
             }
         }
+        self.station_poll(transport, router, ce)?;
         if self
             .scan
             .as_ref()
@@ -210,10 +240,18 @@ impl Control {
         Ok(())
     }
     fn radio_event(&mut self, event: wmi::scan::Event) {
+        let event = match event {
+            wmi::scan::Event::Station(event) => {
+                self.station_events.push_back(event);
+                return;
+            }
+            other => other,
+        };
         let Some(session) = &self.scan else {
             return;
         };
         match event {
+            wmi::scan::Event::Station(_) => unreachable!(),
             wmi::scan::Event::Network(network) => wifi::scan_observe(network),
             wmi::scan::Event::Scan(event) => {
                 let Some(phase) = session.phase(event) else {
@@ -290,6 +328,293 @@ impl Control {
         }
         Ok(true)
     }
+    pub(super) fn packet_poll<R: Registers>(
+        &mut self,
+        engine: &mut qca_dp::Bootstrap<Dma>,
+        io: &mut R,
+    ) -> Result<()> {
+        let packets = engine.packets(io, &mut self.receive)?;
+        for (id, success) in packets.transmitted {
+            crate::compact_println!("WiFi: EAPOL TX completed id={} success={}", id, success);
+            wifi::event(wifi::link::Event::EapolSent { id, success });
+        }
+        for bytes in packets.frames {
+            let Some(peer) = self.peer else {
+                continue;
+            };
+            let Some(packet) = super::packets::decode(&bytes, self.wmi.mac, peer) else {
+                continue;
+            };
+            let frame = packet.ethernet;
+            if packet.protected {
+                let id = wifi::auth::KeyId {
+                    pairwise: frame[0] & 1 == 0,
+                    index: packet.key,
+                };
+                if !self.replay.accept(id, packet.pn) {
+                    continue;
+                }
+            }
+            if frame[12..14] == [0x88, 0x8e] && frame[6..12] == peer {
+                crate::compact_println!(
+                    "WiFi: EAPOL RX bytes={} encrypted={}",
+                    frame.len() - 14,
+                    packet.protected
+                );
+                wifi::event(wifi::link::Event::Eapol {
+                    source: peer,
+                    bytes: frame[14..].to_vec(),
+                });
+            } else if self.authorized && packet.protected {
+                wifi::ethernet_receive(frame);
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn ethernet<R: Registers>(
+        &mut self,
+        engine: &mut qca_dp::Bootstrap<Dma>,
+        io: &mut R,
+        frame: &[u8],
+        completion: Option<u64>,
+    ) -> Result<()> {
+        if !self.running || self.stopping || (completion.is_none() && !self.authorized) {
+            return Err(Error::State);
+        }
+        let peer = self.peer.ok_or(Error::State)?;
+        let Some((mac, index, hash)) = self.htt.peer else {
+            return Err(Error::State);
+        };
+        if mac != peer {
+            return Err(Error::State);
+        }
+        self.data_sequence = self.data_sequence.wrapping_add(1);
+        let bytes = super::packets::encapsulate(
+            frame,
+            self.wmi.mac,
+            peer,
+            self.data_sequence,
+            completion.is_none(),
+        )
+        .ok_or(Error::State)?;
+        engine.transmit(io, &bytes, completion, (index, hash))?;
+        Ok(())
+    }
+    pub(super) fn peer_address(&self) -> Option<[u8; 6]> {
+        self.peer
+    }
+    pub(super) fn mac_address(&self) -> [u8; 6] {
+        self.wmi.mac
+    }
+    fn station_poll<R: Registers>(
+        &mut self,
+        transport: &mut mhi::Transport<R, Dma>,
+        router: &mut qrtr::Router,
+        ce: &mut ce::Engine<Dma>,
+    ) -> Result<()> {
+        use wmi::station::Event;
+        while let Some(event) = self.station_events.pop_front() {
+            match event {
+                Event::Management(frame) if self.peer.is_some() => {
+                    wifi::event(wifi::link::Event::Management(frame))
+                }
+                Event::ManagementSent { id, status } => {
+                    self.frames.complete(id)?;
+                    if status != 0 {
+                        crate::compact_println!("WiFi: management TX failed status={}", status);
+                    }
+                }
+                Event::Started { request, status } if self.starting => {
+                    // Only one start can be outstanding on vdev 0. Stop and
+                    // peer-delete completion gate reuse; requestor is not a
+                    // firmware-guaranteed sequence echo (Linux sends zero).
+                    crate::compact_println!(
+                        "WiFi: station start response requestor={} status={}",
+                        request,
+                        status
+                    );
+                    self.starting = false;
+                    if status == 0 {
+                        self.running = true;
+                        wifi::event(wifi::link::Event::ChannelReady);
+                    } else {
+                        crate::compact_println!("WiFi: station start rejected status={}", status);
+                        wifi::event(wifi::link::Event::Disconnected);
+                    }
+                }
+                Event::Associated { peer } if self.associating && self.peer == Some(peer) => {
+                    self.associating = false;
+                    self.send_wmi(transport, router, ce, &wmi::station::up(0, peer, self.aid)?)?;
+                    wifi::event(wifi::link::Event::Associated);
+                }
+                Event::Key {
+                    peer,
+                    index,
+                    flags,
+                    status,
+                } if self.peer == Some(peer) && index <= 3 && flags <= 1 => {
+                    crate::compact_println!(
+                        "WiFi: key ACK index={} flags={} status={}",
+                        index,
+                        flags,
+                        status
+                    );
+                    let id = wifi::auth::KeyId {
+                        pairwise: flags == 0,
+                        index: index as u8,
+                    };
+                    if let Some(at) = self.pending_keys.iter().position(|(k, _)| *k == id) {
+                        let (_, counter) = self.pending_keys.remove(at);
+                        if status == 0 {
+                            self.replay.install(id, counter);
+                        }
+                    } else {
+                        continue;
+                    }
+                    wifi::event(wifi::link::Event::KeyInstalled {
+                        id: wifi::auth::KeyId {
+                            pairwise: flags == 0,
+                            index: index as u8,
+                        },
+                        success: status == 0,
+                    });
+                }
+                Event::Stopped if self.stopping => {
+                    self.running = false;
+                    self.send_wmi(transport, router, ce, &wmi::station::down(0)?)?;
+                    if let Some(peer) = self.peer {
+                        self.send_wmi(transport, router, ce, &wmi::station::peer(0, peer, false)?)?;
+                    }
+                }
+                Event::PeerDeleted { peer } if self.stopping && self.peer == Some(peer) => {
+                    self.peer = None;
+                    self.stopping = false;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+    pub(super) fn action<R: Registers>(
+        &mut self,
+        action: wifi::link::Action,
+        transport: &mut mhi::Transport<R, Dma>,
+        router: &mut qrtr::Router,
+        ce: &mut ce::Engine<Dma>,
+    ) -> Result<()> {
+        use wifi::link::Action;
+        match action {
+            Action::StartChannel(network) => {
+                if self.scan.is_some() || self.peer.is_some() || self.stopping || self.frames.busy()
+                {
+                    return Err(mhi::Error::Full.into());
+                }
+                let report = self
+                    .wmi
+                    .regulatory
+                    .iter()
+                    .find(|r| r.phy == self.radio.regulatory_phy)
+                    .ok_or(Error::State)?;
+                let channel = wmi::scan::channels(report)
+                    .into_iter()
+                    .find(|c| c.frequency == network.frequency)
+                    .ok_or(Error::State)?;
+                let start = wmi::station::start(0, &network, &channel)?;
+                self.htt.peer = None;
+                self.peer = Some(network.bssid);
+                self.starting = true;
+                self.send_wmi(
+                    transport,
+                    router,
+                    ce,
+                    &wmi::station::peer(0, network.bssid, true)?,
+                )?;
+                for param in [48u32, 91u32] {
+                    let mut cmd = 0x5008u32.to_le_bytes().to_vec();
+                    let body: alloc::vec::Vec<_> = [0, param, 1]
+                        .into_iter()
+                        .flat_map(u32::to_le_bytes)
+                        .collect();
+                    wmi::tlv(&mut cmd, 95, &body)?;
+                    self.send_wmi(transport, router, ce, &cmd)?;
+                }
+                self.send_wmi(transport, router, ce, &start)?;
+            }
+            Action::Management(frame) => {
+                if !self.running || self.stopping {
+                    return Err(Error::State);
+                }
+                let (id, address) = self.frames.insert(&frame)?;
+                self.send_wmi(
+                    transport,
+                    router,
+                    ce,
+                    &wmi::station::management(0, id, address, &frame)?,
+                )?;
+            }
+            Action::Associate { network, aid } => {
+                if self.peer != Some(network.bssid) || !self.running {
+                    return Err(Error::State);
+                }
+                self.aid = aid;
+                self.associating = true;
+                self.send_wmi(
+                    transport,
+                    router,
+                    ce,
+                    &wmi::station::associate(0, &network, aid)?,
+                )?;
+            }
+            Action::InstallKey(key) => {
+                if self.peer.is_none() || self.stopping {
+                    return Err(Error::State);
+                }
+                let mut counter = [0; 8];
+                counter[..6].copy_from_slice(&key.receive_counter);
+                self.pending_keys
+                    .push((key.id, u64::from_le_bytes(counter)));
+                let command = wmi::station::key(0, &key)?;
+                self.send_wmi(transport, router, ce, &command)?;
+            }
+            Action::Authorize => {
+                let peer = self.peer.ok_or(Error::State)?;
+                self.send_wmi(
+                    transport,
+                    router,
+                    ce,
+                    &wmi::station::authorize(0, peer, true)?,
+                )?;
+                self.authorized = true;
+                wifi::event(wifi::link::Event::Authorized);
+            }
+            Action::Disconnect => {
+                self.authorized = false;
+                self.replay = wifi::auth::Replay::default();
+                self.pending_keys.clear();
+                if !self.stopping
+                    && let Some(peer) = self.peer
+                {
+                    let stop = self.running || self.starting;
+                    self.stopping = true;
+                    self.associating = false;
+                    self.starting = false;
+                    self.send_wmi(
+                        transport,
+                        router,
+                        ce,
+                        &wmi::station::authorize(0, peer, false)?,
+                    )?;
+                    if stop {
+                        self.send_wmi(transport, router, ce, &wmi::station::stop(0)?)?;
+                    } else {
+                        self.send_wmi(transport, router, ce, &wmi::station::peer(0, peer, false)?)?;
+                    }
+                }
+            }
+            Action::Eapol { .. } => return Err(Error::State),
+        }
+        Ok(())
+    }
     fn wait<R: Registers>(
         &mut self,
         transport: &mut mhi::Transport<R, Dma>,
@@ -353,14 +678,27 @@ impl Control {
         let deadline = transport.io.now().saturating_add(TIMEOUT);
         for _ in 0..MAX_SPINS {
             match self.htc.prepare(service, bytes) {
-                Ok(packet) => match ce.send(&mut transport.io, pipe, &packet.bytes) {
-                    Ok(()) => {
-                        self.htc.commit(&packet)?;
-                        return Ok(());
+                Ok(mut packet) => {
+                    let sensitive = service == htc::WMI_CONTROL
+                        && bytes.get(..4) == Some(&0x5009u32.to_le_bytes());
+                    let result = if sensitive {
+                        ce.send_sensitive(&mut transport.io, pipe, &packet.bytes)
+                    } else {
+                        ce.send(&mut transport.io, pipe, &packet.bytes)
+                    };
+                    if sensitive {
+                        use zeroize::Zeroize;
+                        packet.bytes.zeroize();
                     }
-                    Err(mhi::Error::Full) => {}
-                    Err(error) => return Err(error.into()),
-                },
+                    match result {
+                        Ok(()) => {
+                            self.htc.commit(&packet)?;
+                            return Ok(());
+                        }
+                        Err(mhi::Error::Full) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 Err(htc::Error::Full) => {}
                 Err(error) => return Err(error.into()),
             }

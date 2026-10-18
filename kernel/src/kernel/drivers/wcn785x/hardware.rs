@@ -292,6 +292,14 @@ pub(super) const SUPPORTED: &[Chip] = &[Chip {
         rx_pages: 24,    // 12288 slots / 512 entries per page
     },
     packet_engine: qca_dp::Config {
+        data: Some(qca_dp::DataConfig {
+            tx: 24,
+            tx_completion: 128,
+            rx_error: 131,
+            bank: 0xa4408c,
+            return_manager: 5,
+            pdev: 0,
+        }),
         idle_r0: 0x00a3_4000 + 0xd3c,
         idle_r2: 0x00a3_4000 + 0x30b8,
         reo_r0: 0x00a3_8000 + 0x4e4,
